@@ -383,6 +383,54 @@ impl DecisionStore {
         rows.into_iter().map(decode).collect()
     }
 
+    /// The newest decisions since `since_us` that mention any of `words`
+    /// in their subject, kind, reason or summary (all of them when `words`
+    /// is empty), newest first.
+    ///
+    /// # Errors
+    /// The driver's, mapped.
+    pub async fn search<Q: Queryable + Send>(
+        &self,
+        q: &mut Q,
+        words: &[String],
+        since_us: i64,
+        limit: u32,
+    ) -> Result<Vec<DecisionRow>> {
+        let mut conds = Vec::new();
+        let mut params: Vec<Value> = vec![Value::from(since_us)];
+        for w in words.iter().take(8) {
+            let like = format!(
+                "%{}%",
+                w.replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            );
+            conds.push(
+                "(subject_id LIKE ? OR kind LIKE ? OR reason_code LIKE ? OR summary LIKE ?)"
+                    .to_owned(),
+            );
+            for _ in 0..4 {
+                params.push(Value::from(like.as_str()));
+            }
+        }
+        let filter = if conds.is_empty() {
+            String::new()
+        } else {
+            format!(" AND ({})", conds.join(" OR "))
+        };
+        params.push(Value::from(limit));
+        let sql = format!(
+            "SELECT {COLUMNS} FROM {} WHERE decided_at >= {AT}{filter} \
+             ORDER BY decided_at DESC, decision_id DESC LIMIT ?",
+            self.table()
+        );
+        let rows: Vec<Row> = q
+            .exec(sql, mysql_async::Params::Positional(params))
+            .await
+            .map_err(map_err)?;
+        rows.into_iter().map(decode).collect()
+    }
+
     /// The retention job: deletes rows decided before `before_us`, in
     /// batches of [`PURGE_BATCH`] (index `by_time`); returns how many.
     ///
@@ -661,6 +709,25 @@ impl CatalogDecisionLog {
         let mut conn = ep.pool.get_conn().await.map_err(map_err)?;
         DecisionStore::new(ep.store.schema())
             .get(&mut conn, id)
+            .await
+    }
+
+    /// `tenant`'s newest decisions since `since_us` that mention any of
+    /// `words` ([`DecisionStore::search`]).
+    ///
+    /// # Errors
+    /// The catalog's.
+    pub async fn search(
+        &self,
+        tenant: TenantId,
+        words: &[String],
+        since_us: i64,
+        limit: u32,
+    ) -> Result<Vec<DecisionRow>> {
+        let ep = self.locator.reader(tenant).await?;
+        let mut conn = ep.pool.get_conn().await.map_err(map_err)?;
+        DecisionStore::new(ep.store.schema())
+            .search(&mut conn, words, since_us, limit)
             .await
     }
 

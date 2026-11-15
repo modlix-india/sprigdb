@@ -20,6 +20,7 @@
 //! | `ai.admin.enabled` | `false` | global |
 //! | `ai.admin.max_advice_hour` | `10` | global |
 //! | `ai.admin.max_triage_hour` | `60` | global |
+//! | `ai.admin.check_interval` | `1h` | global |
 //!
 //! Values are read through [`Lookup`], which the gateway implements over a
 //! caller's tenant (and database) context; [`TurnSettings::read`] reads
@@ -165,13 +166,13 @@ key!(
 key!(
     /// `ai.admin.enabled`.
     ADMIN_ENABLED: bool = "ai.admin.enabled", false, GLOBAL, HardBounds::NONE, true,
-    "Turn on the administration agent: processes report error counts (codes, components, spans; never names or data), and new or rising errors get triage and advice in the approvals inbox. Needs ai.model.admin"
+    "Turn on the administration agent: processes report error counts (codes, components, spans; never names or data), new or rising errors get triage and advice, the DC leader keeps a metric history and runs health checks, and failovers get write-ups, all as advice in the approvals inbox. Needs ai.model.admin to word them"
 );
 key!(
     /// `ai.admin.max_advice_hour`.
     ADMIN_MAX_ADVICE_HOUR: u64 = "ai.admin.max_advice_hour", 10, GLOBAL,
     HardBounds::range(0, 1000), true,
-    "Advice items the administration agent may file per hour in each DC; repeats of an incident only update its counts"
+    "Advice items the administration agent may file per hour in each DC, counted apart for incident advice, health warnings and write-ups; repeats only update their counts"
 );
 key!(
     /// `ai.admin.max_triage_hour`.
@@ -179,6 +180,29 @@ key!(
     HardBounds::range(0, 10_000), true,
     "Incidents the administration agent may send to triage per hour in each DC; the rest wait for the next hour"
 );
+
+/// The values `ai.admin.check_interval` takes.
+pub const CHECK_INTERVALS: &[&str] = &["15m", "30m", "1h", "2h", "3h", "6h", "12h", "24h"];
+
+key!(
+    /// `ai.admin.check_interval`.
+    ADMIN_CHECK_INTERVAL: Text = "ai.admin.check_interval", Cow::Borrowed("1h"), GLOBAL,
+    HardBounds::one_of(CHECK_INTERVALS), true,
+    "How often the administration agent's health checks run over the metric history in each DC: 15m, 30m, 1h, 2h, 3h, 6h, 12h or 24h"
+);
+
+/// `ai.admin.check_interval`'s value as a duration (1 hour for anything
+/// else).
+#[must_use]
+pub fn check_interval(v: &str) -> Duration {
+    let v = v.trim();
+    let (n, unit) = v.split_at(v.len().saturating_sub(1));
+    match (n.parse::<u64>(), unit) {
+        (Ok(n), "m") if n > 0 => Duration::from_secs(n * 60),
+        (Ok(n), "h") if n > 0 => Duration::from_secs(n * 3600),
+        _ => Duration::from_secs(3600),
+    }
+}
 
 /// What the administration agent's intake reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,6 +213,8 @@ pub struct AdminSettings {
     pub max_advice_hour: u64,
     /// `ai.admin.max_triage_hour`.
     pub max_triage_hour: u64,
+    /// `ai.admin.check_interval`.
+    pub check_interval: Duration,
 }
 
 impl AdminSettings {
@@ -199,6 +225,7 @@ impl AdminSettings {
             enabled: l.flag(&ADMIN_ENABLED),
             max_advice_hour: l.number(&ADMIN_MAX_ADVICE_HOUR),
             max_triage_hour: l.number(&ADMIN_MAX_TRIAGE_HOUR),
+            check_interval: check_interval(&l.text(&ADMIN_CHECK_INTERVAL)),
         }
     }
 }
@@ -389,6 +416,11 @@ mod tests {
         let admin = AdminSettings::read(&Defaults);
         assert!(!admin.enabled, "the administration agent is off by default");
         assert_eq!((admin.max_advice_hour, admin.max_triage_hour), (10, 60));
+        assert_eq!(admin.check_interval, Duration::from_secs(3600));
+        for v in CHECK_INTERVALS {
+            assert!(check_interval(v) >= Duration::from_secs(900), "{v}");
+        }
+        assert_eq!(check_interval("30m"), Duration::from_secs(1800));
         let reg = sprig_settings::Registry::global().unwrap();
         for k in [
             "ai.enabled",
@@ -403,6 +435,7 @@ mod tests {
             "ai.admin.enabled",
             "ai.admin.max_advice_hour",
             "ai.admin.max_triage_hour",
+            "ai.admin.check_interval",
         ] {
             assert!(reg.get(k).is_some(), "{k}");
         }

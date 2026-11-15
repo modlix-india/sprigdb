@@ -152,6 +152,10 @@ fn routes(app: Arc<App>) -> Router {
             post(pin_tenant_cluster).delete(unpin_tenant_cluster),
         )
         .route(
+            "/admin/v1/tenants/{name}/decisions",
+            get(search_decisions),
+        )
+        .route(
             "/admin/v1/tenants/{name}/decisions/{id}",
             get(explain_decision),
         )
@@ -1225,6 +1229,30 @@ async fn explain_decision(
             .parse()
             .map_err(|_| invalid(format!("decision id {id:?} is not a number")))?;
         app.svc.explain_decision(&name, id).await
+    };
+    respond(r.await)
+}
+
+/// `GET /admin/v1/tenants/{name}/decisions?subject=&days=`.
+async fn search_decisions(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    UrlPath(name): UrlPath<String>,
+    uri: axum::http::Uri,
+) -> Response {
+    let r = async {
+        authorize_gateway(&app, &headers)?;
+        let q = uri.query().unwrap_or("");
+        let get = |k: &str| {
+            q.split('&')
+                .filter_map(|kv| kv.split_once('='))
+                .find(|(a, _)| *a == k)
+                .map(|(_, v)| crate::ai_health::pct_decode(v))
+        };
+        let days = get("days").and_then(|d| d.parse().ok()).unwrap_or(30);
+        app.svc
+            .search_decisions(&name, &get("subject").unwrap_or_default(), days)
+            .await
     };
     respond(r.await)
 }

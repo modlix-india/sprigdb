@@ -32,7 +32,7 @@ pub mod record;
 #[cfg(test)]
 mod tests;
 
-pub use advise::{Advisor, Case, INCIDENTS, Model, Report};
+pub use advise::{Advisor, Case, INCIDENTS, Model, Report, Writing, Written};
 pub use brief::{Advice, ClusterShape, Names, Topology, Verdict};
 pub use intake::{Flusher, IntakeRecord, Merger};
 pub use record::{IncidentRecord, IncidentStore, Status, Why, fingerprint};

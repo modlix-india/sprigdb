@@ -500,7 +500,14 @@ async fn mongo_commands_match_the_driver() {
         false,
     )
     .await;
-    assert_eq!(s, 400, "$where must be refused: {v}");
+    // mongo.server_js is on by default: $where runs (server-side
+    // JavaScript, sprig-doc's serverjs) and "true" matches every document.
+    assert_eq!(s, 200, "$where runs: {v}");
+    assert_eq!(
+        v["results"][0]["rows"].as_array().map(Vec::len),
+        Some(250),
+        "$where true matches all"
+    );
     let (s, v) = rest(&e, &auth, DB, &m(json!({"saslStart": 1})), false).await;
     assert_eq!((s, code(&v)), (400, 39794), "{v}");
     let (s, v) = rest(

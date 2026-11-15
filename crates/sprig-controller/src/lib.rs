@@ -117,6 +117,7 @@ pub mod workload_rollup;
 pub mod write_load;
 // AI providers in the Admin API and the payload purge.
 pub mod ai_admin;
+pub mod ai_health;
 pub mod ai_incidents;
 pub mod ai_system;
 
@@ -613,6 +614,32 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             .budget("ai_incidents", 1),
             Some((settings.live.clone(), dc.clone())),
         )?);
+    // The administration agent's metric history, health checks,
+    // write-ups and upgrade checks.
+    let ai_health = Arc::new(ai_health::HealthLoop::new(
+        dc.clone(),
+        &stores.dc,
+        ai_incidents::Knobs::Live(settings.live.clone(), dc.clone()),
+        Arc::clone(approvals.hub()),
+        Arc::clone(&incident_env),
+        Arc::new(ai_health::ControllerHealth::new(ai_health::HealthSources {
+            dc: dc.clone(),
+            dc_store: Arc::clone(&stores.dc),
+            global: Arc::clone(&stores.global),
+            registry: ClusterRegistry::new(Arc::clone(&stores.global), Arc::clone(&stores.dc))?,
+            monitor: Arc::clone(&monitor),
+            balancer: Arc::clone(&balancer),
+            sizes: sharding.sharding().ai_sizes.clone(),
+            live: Some((settings.live.clone(), dc.clone())),
+            locator: Arc::new(locator.clone()),
+            pools: RegistryPools::new(
+                ClusterRegistry::new(Arc::clone(&stores.global), Arc::clone(&stores.dc))?,
+                Some(Arc::clone(&monitor)),
+            )
+            .budget("ai_health", 1),
+            clock: Arc::clone(&clock),
+        })),
+    ));
     let rt = Runtime::new(stores.clone(), Arc::clone(&clock), me)
         .with_settings(settings.control.clone())
         .with_loop(Loop::new(dispatch::Dispatch))
@@ -679,6 +706,8 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             )),
             Some((settings.live.clone(), dc.clone())),
         )))
+        // The administration agent's health checks and write-ups.
+        .with_loop(Loop::from_arc(Arc::clone(&ai_health)))
         // The administration agent's incident intake: triage and advice.
         .with_loop(Loop::new(ai_incidents::IncidentLoop::new(
             dc.clone(),
@@ -868,6 +897,7 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             .merge(ai_incidents::router(Arc::new(
                 ai_incidents::IncidentsApi::new(Arc::clone(&reg_store), incident_env),
             )))
+            .merge(ai_health::router(ai_health))
             .layer(axum::middleware::from_fn_with_state(
                 guard,
                 operators::guard::layer,

@@ -54,6 +54,10 @@ pub struct GatewayHost {
     core: Arc<Core>,
     caller: Caller,
     share_data: bool,
+    /// The assistant the tools run for: the administration assistant's
+    /// `decision_log` and `metrics_trend` read the DC's, the DBA's its
+    /// tenant's.
+    role: Option<sprig_ai::Role>,
 }
 
 impl std::fmt::Debug for GatewayHost {
@@ -180,7 +184,19 @@ impl GatewayHost {
             core,
             caller,
             share_data,
+            role: None,
         }
+    }
+
+    /// The same host for `role`'s turns.
+    #[must_use]
+    pub fn for_role(mut self, role: sprig_ai::Role) -> Self {
+        self.role = Some(role);
+        self
+    }
+
+    fn admin(&self) -> bool {
+        self.role == Some(sprig_ai::Role::Admin)
     }
 
     async fn sql(&self, db: &str, sql: String) -> Result<ExecuteResponse> {
@@ -666,6 +682,68 @@ impl GatewayHost {
         })
     }
 
+    /// `decision_log`: the DC's log for the administration assistant, the
+    /// tenant's own for the DBA.
+    async fn decision_log(&self, input: &Value) -> Result<ToolOutput> {
+        let subject = s(input, "subject").trim();
+        let days = input["days"].as_u64().unwrap_or(30).clamp(1, 90);
+        let path = if self.admin() {
+            format!(
+                "/admin/v1/ai/decisions?subject={}&days={days}",
+                super::pct(subject)
+            )
+        } else {
+            let t = self.tenant_name()?;
+            if subject.parse::<u64>().is_ok() {
+                format!("/admin/v1/tenants/{t}/decisions/{subject}")
+            } else {
+                format!(
+                    "/admin/v1/tenants/{t}/decisions?subject={}&days={days}",
+                    super::pct(subject)
+                )
+            }
+        };
+        let v = self.forward(&path).await?;
+        let mut sources: Vec<Source> = v["entries"]
+            .as_array()
+            .or_else(|| v["decisions"].as_array())
+            .into_iter()
+            .flatten()
+            .take(10)
+            .map(|e| {
+                let id = e["id"]
+                    .as_str()
+                    .map_or_else(|| e["decision_id"].to_string(), str::to_owned);
+                source("decision", e["kind"].as_str().unwrap_or("decision"), id)
+            })
+            .collect();
+        if v.get("decision_id").is_some() {
+            sources.push(source("decision", subject, subject));
+        }
+        Ok(ToolOutput {
+            body: ToolBody::Json(v),
+            sources,
+        })
+    }
+
+    /// `metrics_trend`: the controller's metric history.
+    async fn metrics_trend(&self, input: &Value) -> Result<ToolOutput> {
+        let mut q = format!(
+            "name={}&days={}",
+            super::pct(s(input, "name")),
+            input["days"].as_u64().unwrap_or(7).clamp(1, 30)
+        );
+        for l in input["labels"].as_array().into_iter().flatten() {
+            if let Some(l) = l.as_str() {
+                let _ = write!(q, "&label={}", super::pct(l));
+            }
+        }
+        Ok(ToolOutput {
+            body: ToolBody::Json(self.forward(&format!("/admin/v1/ai/metrics?{q}")).await?),
+            sources: vec![source("metric", s(input, "name"), "metrics_trend")],
+        })
+    }
+
     async fn compile_logic(&self, input: &Value) -> Result<ToolOutput> {
         let db = s(input, "db");
         let r = super::super::logic::compile(
@@ -799,24 +877,10 @@ impl ToolHost for GatewayHost {
             "run_query" => self.run_query(input).await,
             "test_policy" => self.test_policy(input).await,
             "compile_logic" => self.compile_logic(input).await,
-            "decision_log" => {
-                let t = self.tenant_name()?;
-                let subject = s(input, "subject");
-                if !safe(subject) {
-                    return Err(tool_error(
-                        "decision_log takes a decision id, as the approvals inbox or a shard move names it",
-                    ));
-                }
-                Ok(ToolOutput {
-                    body: ToolBody::Json(
-                        self.forward(&format!("/admin/v1/tenants/{t}/decisions/{subject}"))
-                            .await?,
-                    ),
-                    sources: vec![source("decision", subject, subject)],
-                })
-            }
+            "decision_log" => self.decision_log(input).await,
+            "metrics_trend" if self.admin() => self.metrics_trend(input).await,
             "metrics_trend" => Err(tool_error(
-                "the controller's metric history isn't available in this release; ask the operator to check the metrics in their monitoring system",
+                "the metric history is for the administration assistant",
             )),
             other => Err(tool_error(format!("{other} isn't a read tool"))),
         }

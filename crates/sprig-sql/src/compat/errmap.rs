@@ -326,10 +326,7 @@ pub fn dup_key_table(sql: &[u8], opts: &crate::lex::LexOptions) -> Option<String
 /// DATA`: its database, when the statement names one, and its name.
 /// `None` for other statements and multi-table updates.
 #[must_use]
-pub fn dml_target(
-    sql: &[u8],
-    opts: &crate::lex::LexOptions,
-) -> Option<(Option<String>, String)> {
+pub fn dml_target(sql: &[u8], opts: &crate::lex::LexOptions) -> Option<(Option<String>, String)> {
     use crate::lex::{self, TokenKind};
     let head = sql.trim_ascii_start();
     let starts = |w: &[u8]| head.len() >= w.len() && head[..w.len()].eq_ignore_ascii_case(w);

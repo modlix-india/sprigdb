@@ -892,8 +892,8 @@ fn logins(
             // External tokens (chapter 14): issuers' JWTs over MySQL,
             // Redis, MongoDB and HTTP, with just-in-time accounts written
             // to the tenants' catalogs.
-            let tokens = sprig_auth::oidc::ExternalTokens::default()
-                .with_catalog(tenants.catalog.clone());
+            let tokens =
+                sprig_auth::oidc::ExternalTokens::default().with_catalog(tenants.catalog.clone());
             let svc = LoginService::new(LoginSource::Catalog(catalogs), fast_cache)
                 .with_clock(clock)
                 .with_login_state(Arc::new(state))

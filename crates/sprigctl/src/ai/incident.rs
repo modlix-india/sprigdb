@@ -1,10 +1,13 @@
-//! `sprigctl ai incident list|show`: the administration agent's incidents,
-//! over the Admin API's `/admin/v1/ai/incidents`.
+//! `sprigctl ai incident list|show|writeups|writeup`: the administration
+//! agent's incidents and write-ups, over the Admin API's
+//! `/admin/v1/ai/incidents` and `/admin/v1/ai/writeups`.
 //!
 //! ```text
 //! sprigctl ai incident list
 //! sprigctl ai incident show 3f09a1c2b7de
 //! sprigctl ai incident show 3f09a1c2b7de --payload
+//! sprigctl ai incident writeups
+//! sprigctl ai incident writeup cf-1a2b3c4d-7 [--draft]
 //! ```
 //!
 //! `show` prints the incident, the intake text exactly as it was sent, the
@@ -43,6 +46,80 @@ pub(super) fn command() -> Command {
                         .help("Also print every exact payload sent to the AI provider"),
                 ),
         )
+        .subcommand(
+            Command::new("writeups")
+                .about("Write-ups of failovers, failed moves and incidents, newest first"),
+        )
+        .subcommand(
+            Command::new("writeup")
+                .about("One write-up: timeline, cause, effects and follow-ups, and what was sent")
+                .arg(
+                    Arg::new("id")
+                        .required(true)
+                        .help("An event id (cf-..., df-..., mv-...) or an incident fingerprint"),
+                )
+                .arg(
+                    Arg::new("draft")
+                        .long("draft")
+                        .action(ArgAction::SetTrue)
+                        .help("Draft it now (again), with the administration model"),
+                ),
+        )
+}
+
+/// A write-up as text.
+pub(super) fn writeup_text(v: &Value) -> String {
+    let w = &v["writeup"];
+    let mut t = String::new();
+    let _ = writeln!(
+        t,
+        "Write-up {} ({}), {}",
+        s(w, "id"),
+        s(w, "kind"),
+        s(w, "status")
+    );
+    for (label, k) in [("Advice id", "advice_id"), ("Error", "error")] {
+        let x = s(w, k);
+        if !x.is_empty() {
+            let _ = writeln!(t, "{:<10} {x}", format!("{label}:"));
+        }
+    }
+    let text = s(w, "text");
+    if !text.is_empty() {
+        let _ = writeln!(t, "\n{text}");
+    }
+    let intake = s(w, "intake");
+    if !intake.is_empty() {
+        let _ = writeln!(t, "\nWhat was sent:\n{intake}");
+    }
+    if let Some(sent) = w["sent"].as_array().filter(|a| !a.is_empty()) {
+        let _ = writeln!(t, "\nPayloads sent (SHA-256):");
+        for h in sent {
+            let _ = writeln!(t, "  {}", h.as_str().unwrap_or_default());
+        }
+    }
+    t
+}
+
+fn writeups_table(v: &Value) -> String {
+    let rows: Vec<[String; 5]> = v["writeups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|w| {
+            [
+                s(w, "id"),
+                s(w, "kind"),
+                s(w, "at"),
+                s(w, "status"),
+                s(w, "advice_id"),
+            ]
+        })
+        .collect();
+    if rows.is_empty() {
+        return "no write-ups\n".to_owned();
+    }
+    table(["ID", "KIND", "AT", "STATUS", "ADVICE"], &rows)
 }
 
 fn s(v: &Value, k: &str) -> String {
@@ -188,7 +265,29 @@ pub(super) async fn run(c: &AdminClient, m: &ArgMatches, out: Output) -> Result<
                 .await?;
             print(out, &r, |r| show_text(r, payloads));
         }
-        _ => return Err(Failed("sprigctl ai incident list|show".into())),
+        Some(("writeups", _)) => {
+            let r: Value = c.get("/admin/v1/ai/writeups").await?;
+            print(out, &r, writeups_table);
+        }
+        Some(("writeup", sub)) => {
+            let id = sub.get_one::<String>("id").cloned().unwrap_or_default();
+            let r: Value = if sub.get_flag("draft") {
+                c.post(
+                    &format!("/admin/v1/ai/writeups/{}:draft", escape(&id)),
+                    &serde_json::json!({}),
+                )
+                .await?
+            } else {
+                c.get(&format!("/admin/v1/ai/writeups/{}", escape(&id)))
+                    .await?
+            };
+            print(out, &r, writeup_text);
+        }
+        _ => {
+            return Err(Failed(
+                "sprigctl ai incident list|show|writeups|writeup".into(),
+            ));
+        }
     }
     Ok(())
 }

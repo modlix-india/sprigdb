@@ -21,6 +21,7 @@ use std::io::{IsTerminal, Read};
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use serde_json::{Value, json};
 
+mod health;
 mod incident;
 
 use crate::client::AdminClient;
@@ -36,7 +37,7 @@ pub(crate) fn group() -> Command {
             .help("The provider's name: 1 to 64 of a-z, 0-9, _ and -")
     };
     Command::new("ai")
-        .about("The AI assistants: providers, and the administration agent's incidents")
+        .about("The AI assistants: providers, and the administration agent's incidents, health checks, write-ups and upgrade checks")
         .subcommand_required(true)
         .arg_required_else_help(true)
         .subcommand(
@@ -121,6 +122,10 @@ pub(crate) fn group() -> Command {
                 ),
         )
         .subcommand(incident::command())
+        .subcommand(health::health_command())
+        .subcommand(health::metrics_command())
+        .subcommand(health::decisions_command())
+        .subcommand(health::upgrade_command())
 }
 
 fn key_from(m: &ArgMatches) -> Result<Option<String>, Failed> {
@@ -232,8 +237,12 @@ pub(crate) async fn run(
     dry_run: bool,
     out: Output,
 ) -> Result<(), Failed> {
-    if let Some(("incident", m)) = group.subcommand() {
-        return incident::run(c, m, out).await;
+    match group.subcommand() {
+        Some(("incident", m)) => return incident::run(c, m, out).await,
+        Some((cmd @ ("health" | "metrics" | "decisions" | "upgrade-check"), m)) => {
+            return health::run(c, cmd, m, out).await;
+        }
+        _ => {}
     }
     let Some(("provider", p)) = group.subcommand() else {
         return Err(Failed("sprigctl ai provider add|list|test|remove".into()));

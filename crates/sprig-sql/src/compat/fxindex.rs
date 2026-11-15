@@ -1268,7 +1268,10 @@ mod tests {
             "{out}"
         );
         let out = rw("CREATE TABLE f6 (c0 INT, INDEX ((RAND())))").unwrap();
-        assert!(out.contains(" DOUBLE GENERATED ALWAYS AS (RAND())"), "{out}");
+        assert!(
+            out.contains(" DOUBLE GENERATED ALWAYS AS (RAND())"),
+            "{out}"
+        );
         let out = rw("CREATE TABLE f3 (c0 INT, INDEX k ((EXISTS (SELECT 1))))").unwrap();
         assert!(
             out.contains(" BIGINT GENERATED ALWAYS AS (EXISTS (SELECT 1))"),
@@ -1279,9 +1282,8 @@ mod tests {
             out.contains(" BIGINT GENERATED ALWAYS AS (NOT EXISTS (SELECT 1))"),
             "{out}"
         );
-        let known: BTreeMap<String, String> = [("c0".to_owned(), "int".to_owned())]
-            .into_iter()
-            .collect();
+        let known: BTreeMap<String, String> =
+            [("c0".to_owned(), "int".to_owned())].into_iter().collect();
         let out = rewrite_with(
             b"CREATE INDEX i2 ON t0((c0 + RAND()))",
             &LexOptions::mysql84(),
@@ -1289,7 +1291,10 @@ mod tests {
         )
         .map(|v| String::from_utf8(v).unwrap())
         .unwrap();
-        assert!(out.contains(" DOUBLE GENERATED ALWAYS AS (c0 + RAND())"), "{out}");
+        assert!(
+            out.contains(" DOUBLE GENERATED ALWAYS AS (c0 + RAND())"),
+            "{out}"
+        );
         // Still untyped: a function the translator doesn't know.
         assert_eq!(rw("CREATE TABLE f10 (c0 INT, INDEX ((c0 + FOO())))"), None);
     }

@@ -448,7 +448,7 @@ impl std::fmt::Debug for Knobs {
 }
 
 impl Knobs {
-    fn with<R>(&self, f: impl FnOnce(&dyn Lookup) -> R) -> R {
+    pub(crate) fn with<R>(&self, f: impl FnOnce(&dyn Lookup) -> R) -> R {
         match self {
             Knobs::Live(l, dc) => f(&sprig_ai::settings::Live {
                 snap: l.snapshot(),
@@ -809,46 +809,88 @@ impl IncidentLoop {
     async fn raise(&self, rec: &IncidentRecord, now_ms: u64) -> Result<String> {
         #[allow(clippy::cast_precision_loss)]
         let last = rec.last_hour(now_ms) as f64;
-        let p = Proposal {
-            kind: Kind::AiIncidentAdvice,
-            subject: Subject {
-                dc: Some(self.dc.clone()),
-                ..Subject::default()
-            },
-            target: format!("incident/{}", rec.fingerprint),
-            action: Action {
+        raise_advisory(
+            &self.hub,
+            &self.dc,
+            Advisory {
+                kind: Kind::AiIncidentAdvice,
+                target: format!("incident/{}", rec.fingerprint),
                 text: format!(
                     "{}\n\nAdvice only: nothing is changed. What was sent: sprigctl ai incident show {} --payload",
                     rec.advice.as_deref().unwrap_or(""),
                     rec.fingerprint
                 ),
                 machine: json!({"fingerprint": rec.fingerprint}),
+                evidence: json!({
+                    "fingerprint": rec.fingerprint,
+                    "code": rec.code,
+                    "code_name": rec.code_name,
+                    "component": rec.component,
+                    "span": rec.span,
+                    "last_hour": rec.last_hour(now_ms),
+                    "baseline_per_hour": rec.baseline(now_ms),
+                    "total": rec.total,
+                    "versions": rec.versions,
+                    "severity": rec.severity,
+                    "conversation": rec.conversation.map(|c| format!("a{c}")),
+                    "sent_sha256": rec.sent,
+                }),
+                score: last,
+                summary: rec.summary.clone().unwrap_or_default(),
             },
-            evidence: json!({
-                "fingerprint": rec.fingerprint,
-                "code": rec.code,
-                "code_name": rec.code_name,
-                "component": rec.component,
-                "span": rec.span,
-                "last_hour": rec.last_hour(now_ms),
-                "baseline_per_hour": rec.baseline(now_ms),
-                "total": rec.total,
-                "versions": rec.versions,
-                "severity": rec.severity,
-                "conversation": rec.conversation.map(|c| format!("a{c}")),
-                "sent_sha256": rec.sent,
-            }),
-            score: last,
-            summary: rec.summary.clone().unwrap_or_default(),
-            emergency: false,
-        };
-        let policy = Policy::fixed(Mode::Recommend, Level::Dc);
-        match self.hub.check(&p, &policy, &[]).await? {
-            Verdict::Advice(id) | Verdict::Suppressed(id) | Verdict::Wait(id) => Ok(id.to_string()),
-            v => Err(SprigError::internal(format!(
-                "incident advice: the approvals gate answered {v:?}"
-            ))),
-        }
+        )
+        .await
+    }
+}
+
+/// An advisory item of the administration agent.
+#[derive(Debug, Clone)]
+pub struct Advisory {
+    /// `ai_incident_advice` or `ai_health_warning`.
+    pub kind: Kind,
+    /// What it is about (`incident/<fingerprint>`, `health/<key>`,
+    /// `writeup/<id>`): the same target refreshes the same item.
+    pub target: String,
+    /// The whole text.
+    pub text: String,
+    /// What a machine needs to find the record again.
+    pub machine: Value,
+    /// Counts and ids, never names.
+    pub evidence: Value,
+    /// Ranks items in the inbox.
+    pub score: f64,
+    /// One line.
+    pub summary: String,
+}
+
+/// Files `a` as a dc-level advisory item of `dc` (advice only, no timers),
+/// or refreshes the live item with the same kind and target; its id.
+///
+/// # Errors
+/// The approvals hub's; internal when it answers anything but advice.
+pub async fn raise_advisory(hub: &Approvals, dc: &DcId, a: Advisory) -> Result<String> {
+    let p = Proposal {
+        kind: a.kind,
+        subject: Subject {
+            dc: Some(dc.clone()),
+            ..Subject::default()
+        },
+        target: a.target,
+        action: Action {
+            text: a.text,
+            machine: a.machine,
+        },
+        evidence: a.evidence,
+        score: a.score,
+        summary: a.summary,
+        emergency: false,
+    };
+    let policy = Policy::fixed(Mode::Recommend, Level::Dc);
+    match hub.check(&p, &policy, &[]).await? {
+        Verdict::Advice(id) | Verdict::Suppressed(id) | Verdict::Wait(id) => Ok(id.to_string()),
+        v => Err(SprigError::internal(format!(
+            "advisory item: the approvals gate answered {v:?}"
+        ))),
     }
 }
 

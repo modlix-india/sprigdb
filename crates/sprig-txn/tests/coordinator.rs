@@ -431,7 +431,11 @@ impl sprig_txn::lookup::DistConn for FakeConn {
             .push((self.cluster.clone(), sql.to_owned()));
         Ok(())
     }
-    async fn query(&mut self, sql: &str, _: mysql_async::Params) -> DbResult<Vec<mysql_async::Row>> {
+    async fn query(
+        &mut self,
+        sql: &str,
+        _: mysql_async::Params,
+    ) -> DbResult<Vec<mysql_async::Row>> {
         self.run(sql).await.map(|()| Vec::new())
     }
 }

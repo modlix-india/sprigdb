@@ -9,7 +9,7 @@ source: the settings registry (sprig-settings)
 
 Every setting SprigDB declares, with its default, the scopes that may set it, hard bounds and when a change applies. Settings resolve from the most specific scope: object, database, tenant and its ancestors, cluster, data center, global, then the built-in default. Read them with `SHOW SPRIG SETTINGS`, change them with `ALTER TENANT|DATABASE|TABLE … SPRIG SET (key = value)` or `sprigctl settings`.
 
-713 settings in 61 groups.
+715 settings in 60 groups.
 
 ## `advisor`
 
@@ -34,6 +34,9 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 
 | Key | Type | Default | Scopes | Bounds | Applies | Description |
 |---|---|---|---|---|---|---|
+| `ai.admin.enabled` | bool | `false` | global (operator only) | - | live | Turn on the administration agent: processes report error counts (codes, components, spans; never names or data), and new or rising errors get triage and advice in the approvals inbox. Needs ai.model.admin |
+| `ai.admin.max_advice_hour` | int | `10` | global (operator only) | 0 to 1000 | live | Advice items the administration agent may file per hour in each DC; repeats of an incident only update its counts |
+| `ai.admin.max_triage_hour` | int | `60` | global (operator only) | 0 to 10000 | live | Incidents the administration agent may send to triage per hour in each DC; the rest wait for the next hour |
 | `ai.audit_payload_days` | int | `30` | tenant, global | 0 to 3650 | live | Days the exact payloads sent to the AI provider are kept with the conversation; 0 keeps only their hashes |
 | `ai.budget.tenant_tokens_day` | int | `2000000` | tenant, global | 0 to 1000000000000 | live | Tokens all of a tenant's assistant turns may use per UTC day before they stop; 0 allows none |
 | `ai.budget.user_tokens_day` | int | `200000` | tenant, global | 0 to 1000000000000 | live | Tokens one user's assistant turns may use per UTC day before they stop; 0 allows none |
@@ -154,6 +157,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `auth.impersonation_max_minutes` | int | `60` | tenant, dc, global | 1 to 1440 | live | Longest impersonation session |
 | `auth.ip_block_seconds` | int | `300` | dc, global | 1 to 86400 | live | How long an address with too many failed logins is refused |
 | `auth.ip_failures_per_minute` | int | `30` | dc, global | 0 to 1000000 | live | Failed logins per source address per minute before it is refused; 0 never |
+| `auth.jwks_refresh_seconds` | int | `3600` | tenant, dc, global | 60 to 604800 | live | Refresh period of issuers' key sets; cached keys serve twice as long while the issuer fails |
 | `auth.mfa_challenge_seconds` | int | `300` | tenant, dc, global | 30 to 3600 | live | Life of a second-factor challenge |
 | `auth.mfa_required` | text | `off` | tenant, dc, global | off, admins, all | live | Second factor for HTTP logins: off, admins or all |
 | `auth.mysql_native_password` | bool | `false` | tenant, dc, global | - | live | Store and accept mysql_native_password verifiers |
@@ -168,6 +172,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `auth.require_tls` | bool | `false` | tenant, dc, global | - | live | Refuse users who connected without TLS |
 | `auth.scram_sha256_iterations` | int | `15000` | tenant, dc, global | 5000 to 1000000 | live | PBKDF2 iterations of new SCRAM-SHA-256 verifiers |
 | `auth.scram_sha512_iterations` | int | `15000` | tenant, dc, global | 5000 to 1000000 | live | PBKDF2 iterations of new SCRAM-SHA-512 verifiers |
+| `auth.token_clock_skew_seconds` | int | `60` | tenant, dc, global | 0 to 600 | live | Clock skew allowed on external tokens' exp, nbf and iat |
 | `auth.token_key_rotation_days` | int | `30` | dc, global (operator only) | 1 to 365 | live | Signing-key rotation |
 | `auth.token_ttl_seconds` | int | `900` | tenant, dc, global | 60 to 86400 | live | Access-token lifetime |
 | `auth.unsafe_privilege_action` | text | `warn` | tenant, dc, global | warn, error | live | warn (drop server-wide privileges with 39350) or error (refuse with 1227) |
@@ -601,6 +606,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `lookup.backfill_chunk_rows` | int | `1000` | tenant, dc, global | 10 to 100000 | live | Owner rows per back-fill and verification chunk |
 | `lookup.build_lease_seconds` | int | `30` | tenant, dc, global | 5 to 3600 | live | A lookup build untouched this long is taken over |
 | `lookup.lock_wait_seconds` | int | `5` | object, database, tenant, global | 1 to 3600 | live | Lock wait for claims and owner checks |
+| `lookup.orphan_scan_hours` | int | `24` | tenant, dc, global | 0 to 8760 | live | Hours between orphan scans of each lookup (0: off) |
 | `lookup.publish_timeout_ms` | int | `10000` | tenant, dc, global | 100 to 600000 | live | Wait for every gateway to acknowledge a lookup state change |
 
 ## `meta`
@@ -965,15 +971,6 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `tls.bundles.default.key_path` | text | `` | dc, global | - | live | PEM private key of the default bundle; watched for changes |
 | `tls.min_version` | text | `1.2` | dc, global | 1.2, 1.3 | rebind | Lowest TLS version client listeners accept |
 
-## `tuning`
-
-| Key | Type | Default | Scopes | Bounds | Applies | Description |
-|---|---|---|---|---|---|---|
-| `tuning.interval_minutes` | int | `15` | cluster, dc, global (operator only) | 1 to 10080 | live | Tuning pass period |
-| `tuning.memory_budget_pct` | int | `10` | cluster, dc, global (operator only) | 1 to 90 | live | Server memory the table and routine caches may use |
-| `tuning.min_change_pct` | int | `20` | cluster, dc, global (operator only) | 0 to 1000 | live | Smallest change worth applying or recommending |
-| `tuning.table_open_cache_mode` | text | `auto` | cluster, dc, global (operator only) | auto, recommend, off | live | auto, recommend or off |
-
 ## `txn`
 
 | Key | Type | Default | Scopes | Bounds | Applies | Description |
@@ -1013,16 +1010,16 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | Key | Type | Default | Scopes | Bounds | Applies | Description |
 |---|---|---|---|---|---|---|
 | `workload.bucket_minutes` | int | `60` | dc, global | 1 to 1440 | live | Statistics bucket size |
-| `workload.capture_samples` | bool | `true` | object, database, tenant, global | - | live | Parameter capture switch |
+| `workload.capture_samples` | bool | `true` | database, tenant, global | - | live | Parameter capture switch |
 | `workload.examined_sample_rate` | float | `0.02` | dc, global | 0 to 1 | live | Probe rate for watched fingerprints |
 | `workload.flush_seconds` | int | `900` | dc, global | 1 to 86400 | live | Partial flush period |
 | `workload.full_probe_ms` | int | `100` | dc, global | 0 to 3600000 | live | Mean latency from which every execution is probed |
-| `workload.max_fingerprints_per_tenant` | int | `10000` | tenant, global | 10 to 10000000 | live | Cap; the rest count as other |
+| `workload.max_fingerprints_per_tenant` | int | `10000` | dc, global | 10 to 10000000 | live | Cap; the rest count as other |
 | `workload.max_in_list_values` | int | `1000` | dc, global | 1 to 1000000 | live | IN values kept in a sample |
 | `workload.max_memory_mb` | int | `128` | dc, global | 1 to 65536 | live | Recorder memory per gateway |
 | `workload.max_samples_per_fingerprint` | int | `50` | dc, global | 0 to 10000 | live | Stored samples kept |
 | `workload.max_text_bytes` | int | `4096` | dc, global | 64 to 1048576 | live | Longest normalized text |
-| `workload.retention_days` | int | `30` | tenant, global | 1 to 3650 | live | Stats retention |
+| `workload.retention_days` | int | `30` | dc, global | 1 to 3650 | live | Stats retention |
 | `workload.rollup_delay_minutes` | int | `10` | dc, global | 0 to 1440 | live | Wait after a bucket closes |
 | `workload.sample_rate` | float | `0.01` | dc, global | 0 to 1 | live | Capture rate for watched fingerprints |
 | `workload.sample_retention_days` | int | `7` | dc, global | 1 to 365 | live | Sample lifetime |

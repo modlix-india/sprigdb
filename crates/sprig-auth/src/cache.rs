@@ -309,9 +309,11 @@ impl TenantAuth {
             return self;
         };
         let old = self.issuers.len();
-        let new: Vec<Arc<Issuer>> = specs.into_iter().map(|s| Arc::new(Issuer::new(s))).collect();
-        self.bytes =
-            self.bytes.saturating_sub(old * ISSUER_BYTES) + new.len() * ISSUER_BYTES;
+        let new: Vec<Arc<Issuer>> = specs
+            .into_iter()
+            .map(|s| Arc::new(Issuer::new(s)))
+            .collect();
+        self.bytes = self.bytes.saturating_sub(old * ISSUER_BYTES) + new.len() * ISSUER_BYTES;
         self.issuers = Arc::new(new);
         self
     }

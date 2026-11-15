@@ -167,3 +167,41 @@ pub fn incident_held(reason: &'static str) {
 pub fn intake_flush(result: &'static str) {
     metrics::counter!("sprig_ai_intake_flushes_total", "result" => result).increment(1);
 }
+
+/// One sampling pass of the metric history; `result` is `ok` or `error`.
+pub fn history_sample(result: &'static str) {
+    metrics::counter!("sprig_ai_history_samples_total", "result" => result).increment(1);
+}
+
+/// One finding of a health check rule.
+pub fn health_finding(rule: &str) {
+    let rule = [
+        "shard_split",
+        "cluster_full",
+        "replica_lag",
+        "cluster_health",
+        "connections",
+        "backup_age",
+        "mover_backlog",
+    ]
+    .iter()
+    .find(|r| **r == rule)
+    .copied()
+    .unwrap_or("other");
+    metrics::counter!("sprig_ai_health_findings_total", "rule" => rule).increment(1);
+}
+
+/// One health warning filed; `worded` is `model` or `rules` (no model).
+pub fn health_warning(worded: &'static str) {
+    metrics::counter!("sprig_ai_health_warnings_total", "worded" => worded).increment(1);
+}
+
+/// One incident write-up; `result` is `drafted`, `held` or `failed`.
+pub fn writeup(result: &'static str) {
+    metrics::counter!("sprig_ai_writeups_total", "result" => result).increment(1);
+}
+
+/// One upgrade readiness check; `result` is `ok` or `error`.
+pub fn upgrade_check(result: &'static str) {
+    metrics::counter!("sprig_ai_upgrade_checks_total", "result" => result).increment(1);
+}

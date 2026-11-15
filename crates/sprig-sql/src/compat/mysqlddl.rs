@@ -950,7 +950,9 @@ pub fn renamed_columns(sql: &[u8], opts: &LexOptions) -> Option<(String, Vec<Str
 /// Whether a generated column (by name) is a column of the user's own:
 /// not a functional key part's hidden column, nor another internal one.
 fn user_generated(name: &str) -> bool {
-    !name.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("_sprig"))
+    !name
+        .get(..6)
+        .is_some_and(|p| p.eq_ignore_ascii_case("_sprig"))
 }
 
 /// MySQL's refusal to rename or drop `columns` (statement order) that

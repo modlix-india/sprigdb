@@ -223,6 +223,9 @@ pub struct ShardingLoop {
     pub approvals: std::sync::OnceLock<Arc<crate::approvals::ControllerApprovals>>,
     /// When each tenant's workload was last read for lookup proposals.
     lookup_runs: Mutex<HashMap<TenantId, Instant>>,
+    /// Each table group's largest shard against its split size, for the
+    /// administration agent's metric history.
+    pub ai_sizes: crate::ai_health::ShardSizes,
 }
 
 impl std::fmt::Debug for ShardingLoop {
@@ -284,6 +287,7 @@ impl ShardingLoop {
             published: Mutex::new(BTreeSet::new()),
             approvals: std::sync::OnceLock::new(),
             lookup_runs: Mutex::new(HashMap::new()),
+            ai_sizes: crate::ai_health::ShardSizes::default(),
         }
     }
 
@@ -1137,6 +1141,12 @@ impl ShardingLoop {
                 busy: r.state == RangeState::Held || busy_shards.contains(&r.shard.0),
             });
         }
+        self.ai_sizes.record(
+            tenant,
+            group.0,
+            stats.iter().map(|s| s.size_bytes).fold(0.0, f64::max),
+            ts.sharding.split_bytes,
+        );
         let gs = GroupStat {
             tenant,
             group: group.0,

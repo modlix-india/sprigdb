@@ -417,11 +417,12 @@ impl sprig_router::ShardBackend for GwBackend<'_> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         if let Some(cat) = cat {
-            self.coord.set_lock_wait(crate::tenant::lookups_sql::lock_wait_in(
-                &self.factory.svc,
-                &cat,
-                c.lookup.index.owner,
-            ));
+            self.coord
+                .set_lock_wait(crate::tenant::lookups_sql::lock_wait_in(
+                    &self.factory.svc,
+                    &cat,
+                    c.lookup.index.owner,
+                ));
         }
         let owner = OwnerRef {
             pk: c.owner_pk.clone(),

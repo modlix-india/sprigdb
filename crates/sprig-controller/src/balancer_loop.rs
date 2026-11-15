@@ -576,6 +576,21 @@ impl BalancerLoop {
         Ok(report)
     }
 
+    /// How full each cluster was in the last run, 0 to 1, with its
+    /// bottleneck dimension: `(cluster, dimension, value)`.
+    pub async fn fullness(&self) -> Vec<(String, String, f64)> {
+        let g = self.inner.lock().await;
+        g.last_report
+            .as_ref()
+            .map(|r| {
+                r.fullness
+                    .iter()
+                    .map(|(c, f)| (c.to_string(), f.bottleneck.to_string(), f.value))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The tenant's storage in the last fleet view (for the
     /// `migration.auto_size_limit_gb` guard); `None` before a run or for a
     /// tenant not homed here.
@@ -654,6 +669,76 @@ impl BalancerLoop {
                     format!("tenant {tenant} has no decision {id}"),
                 )
             })
+    }
+
+    /// `tenant`'s newest decisions of the last `days` days about
+    /// `subject`: a decision id, or words matched against the subject,
+    /// kind, reason and summary. With no match, the newest decisions and a
+    /// note saying so.
+    ///
+    /// # Errors
+    /// An unknown tenant; the catalog's; a timeout.
+    pub async fn search_decisions(
+        &self,
+        tenant: &str,
+        subject: &str,
+        days: u64,
+    ) -> Result<(Vec<DecisionRow>, Option<String>)> {
+        let t = self.tenant_id(tenant).await?;
+        if let Ok(id) = subject.trim().parse::<u64>() {
+            let one = tokio::time::timeout(CALL_TIMEOUT, self.log.get(t, id))
+                .await
+                .unwrap_or_else(|_| Err(timed_out("decision read")))?;
+            return Ok((one.into_iter().collect(), None));
+        }
+        let now_us = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_micros()),
+        )
+        .unwrap_or(i64::MAX);
+        let since = now_us - i64::try_from(days.clamp(1, 90)).unwrap_or(30) * 86_400_000_000;
+        let words: Vec<String> = subject
+            .to_lowercase()
+            .split(|c: char| c.is_whitespace() || matches!(c, ',' | '?' | '!' | '\'' | '"'))
+            .filter(|w| {
+                w.len() >= 3
+                    && !matches!(
+                        *w,
+                        "why"
+                            | "did"
+                            | "does"
+                            | "the"
+                            | "and"
+                            | "for"
+                            | "what"
+                            | "when"
+                            | "how"
+                            | "recent"
+                            | "all"
+                            | "this"
+                            | "that"
+                            | "decision"
+                            | "decisions"
+                    )
+            })
+            .map(str::to_owned)
+            .collect();
+        let hits = tokio::time::timeout(CALL_TIMEOUT, self.log.search(t, &words, since, 50))
+            .await
+            .unwrap_or_else(|_| Err(timed_out("decision search")))?;
+        if !hits.is_empty() || words.is_empty() {
+            return Ok((hits, None));
+        }
+        let recent = tokio::time::timeout(CALL_TIMEOUT, self.log.search(t, &[], since, 50))
+            .await
+            .unwrap_or_else(|_| Err(timed_out("decision search")))?;
+        Ok((
+            recent,
+            Some(format!(
+                "nothing matched {subject:?}; the newest decisions of the last {days} days follow"
+            )),
+        ))
     }
 
     async fn tenant_id(&self, name: &str) -> Result<TenantId> {

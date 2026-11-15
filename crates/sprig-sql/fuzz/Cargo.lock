@@ -486,6 +486,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "geographiclib-rs"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5a7f08910fd98737a6eda7568e7c5e645093e073328eeef49758cfe8b0489c7"
+dependencies = [
+ "libm",
+]
+
+[[package]]
 name = "gethostname"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -880,6 +889,12 @@ dependencies = [
  "arbitrary",
  "cc",
 ]
+
+[[package]]
+name = "libm"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "linkme"
@@ -1659,9 +1674,17 @@ version = "0.0.1"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "base64",
+ "bytes",
  "getrandom 0.3.4",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "metrics",
  "mysql_async",
+ "regex",
+ "ring",
+ "rustls",
  "serde",
  "serde_json",
  "sha1",
@@ -1672,10 +1695,13 @@ dependencies = [
  "sprig-proto-mysql",
  "sprig-provision",
  "sprig-settings",
+ "stringprep",
  "subtle",
  "tokio",
  "toml",
  "tracing",
+ "uuid",
+ "webpki-roots",
  "zeroize",
 ]
 
@@ -1686,10 +1712,13 @@ dependencies = [
  "crc32fast",
  "flate2",
  "metrics",
+ "rustls",
  "sha1",
  "sprig-common",
  "tokio",
+ "tokio-rustls",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -1717,15 +1746,20 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "futures",
+ "getrandom 0.3.4",
  "metrics",
  "mysql_async",
+ "ring",
+ "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "sprig-binlog",
  "sprig-common",
  "sprig-meta",
  "sprig-settings",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "twox-hash",
 ]
@@ -1734,19 +1768,36 @@ dependencies = [
 name = "sprig-common"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "axum",
+ "bytes",
  "gethostname",
+ "getrandom 0.3.4",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "metrics",
  "metrics-exporter-prometheus",
+ "rustls",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "toml",
  "tonic",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "sprig-geo"
+version = "0.0.1"
+dependencies = [
+ "geographiclib-rs",
 ]
 
 [[package]]
@@ -1756,6 +1807,9 @@ dependencies = [
  "async-trait",
  "etcd-client",
  "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "metrics",
  "serde",
  "serde_json",
@@ -1795,13 +1849,16 @@ name = "sprig-provision"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "metrics",
  "mysql_async",
  "serde",
+ "sha2",
  "sprig-cluster",
  "sprig-common",
  "sprig-meta",
  "toml",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1822,9 +1879,11 @@ name = "sprig-sql"
 version = "0.0.1"
 dependencies = [
  "bytes",
+ "serde_json",
  "sprig-auth",
  "sprig-catalog",
  "sprig-common",
+ "sprig-geo",
  "sprig-proto-mysql",
  "sprig-settings",
  "sqlparser",
@@ -1869,6 +1928,17 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "stringprep"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b4df3d392d81bd458a8a621b8bffbd2302a12ffe288a9d931670948749463b1"
+dependencies = [
+ "unicode-bidi",
+ "unicode-normalization",
+ "unicode-properties",
+]
 
 [[package]]
 name = "subtle"
@@ -1966,6 +2036,12 @@ dependencies = [
  "displaydoc",
  "zerovec",
 ]
+
+[[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokio"
@@ -2269,10 +2345,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
 
 [[package]]
+name = "unicode-bidi"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
+name = "unicode-properties"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "993ad287eb20e8ba755312801cfe1413e0f25d604075863acaddca10b04c1833"
 
 [[package]]
 name = "untrusted"

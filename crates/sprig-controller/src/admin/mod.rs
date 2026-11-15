@@ -274,6 +274,24 @@ impl AdminService {
         self.placement()?.decision(tenant, id).await
     }
 
+    /// A tenant's decisions about a subject (an id, or words), newest
+    /// first, for the DBA assistant's `decision_log`.
+    ///
+    /// # Errors
+    /// As `BalancerLoop::search_decisions`.
+    pub async fn search_decisions(
+        &self,
+        tenant: &str,
+        subject: &str,
+        days: u64,
+    ) -> Result<serde_json::Value> {
+        let (rows, note) = self
+            .placement()?
+            .search_decisions(tenant, subject, days)
+            .await?;
+        Ok(serde_json::json!({"decisions": rows, "note": note.unwrap_or_default(), "days": days}))
+    }
+
     /// The same service with the tenant calls.
     #[must_use]
     pub fn with_tenants(mut self, tenants: Arc<dyn TenantAdmin>) -> Self {

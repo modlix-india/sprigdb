@@ -31,12 +31,15 @@
 //! - [`glossary`]: the tenant's business terms;
 //! - [`incidents`]: the administration agent's error intake, triage and
 //!   advice;
+//! - [`admin`]: its metric history, health rules, upgrade readiness and
+//!   incident write-ups;
 //! - [`mcp`]: the MCP server's tools and calls, without the transport;
 //! - [`turn`]: one chat turn, provider and tools in a loop;
 //! - [`mod@metrics`]: the `sprig_ai_*` metrics;
 //! - `eval` (feature `eval`, and in tests): the evaluation sets and their
 //!   runner.
 
+pub mod admin;
 pub mod audit;
 pub mod budget;
 pub mod egress;

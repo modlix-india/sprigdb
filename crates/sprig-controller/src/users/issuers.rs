@@ -151,8 +151,7 @@ impl TenantUsers {
         sprig_common::audit::check_available()?;
         let id = self.migrated(tenant).await?;
         let host = req.host.clone().unwrap_or_else(|| "%".into());
-        let c =
-            issuers::set_token_method(&self.catalog, id, &req.user, &host, req.enabled).await?;
+        let c = issuers::set_token_method(&self.catalog, id, &req.user, &host, req.enabled).await?;
         sprig_common::audit::record(
             sprig_common::audit::AuditStream::Tenant(id),
             "admin.token_login_changed",

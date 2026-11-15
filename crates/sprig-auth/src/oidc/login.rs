@@ -69,7 +69,10 @@ fn denied(ip: IpAddr) -> ErrPacket {
 fn unavailable() -> ErrPacket {
     ErrPacket::from_error(
         Persona::MySql84,
-        &SprigError::new(SprigCode::AuthUnavailable, "authentication unavailable; retry"),
+        &SprigError::new(
+            SprigCode::AuthUnavailable,
+            "authentication unavailable; retry",
+        ),
     )
 }
 
@@ -120,7 +123,11 @@ impl LoginService {
         &self,
         req: &TokenLogin<'_>,
     ) -> Result<(Principal, VerifiedToken), TokenDenied> {
-        let mut ev = AuditEvent::new(audit::events::LOGIN_SUCCEEDED, req.label, self.clock().wall());
+        let mut ev = AuditEvent::new(
+            audit::events::LOGIN_SUCCEEDED,
+            req.label,
+            self.clock().wall(),
+        );
         ev.client_ip = Some(req.client_ip);
         ev.mechanism = Some("jwt");
         ev.tenant_name = Some(req.tenant.to_owned());
@@ -207,43 +214,41 @@ impl LoginService {
             return Err(bad(ev, Some(Refusal::NoUser)));
         };
         ev.user = Some(name.clone());
-        let found = TenantAuth::of(&catalog).and_then(|a| a.match_account(&name, req.client_ip).cloned());
-        let user: Arc<AuthUser> = match found {
-            Some(u) => u,
-            None => {
-                let Some(cat) = tokens.catalog().filter(|_| verified.jit_users) else {
-                    return Err(bad(ev, Some(Refusal::NoAccount)));
-                };
-                match super::store::create_jit_user(cat, tenant.id, &name, self.clock().wall())
-                    .await
-                {
-                    Ok(c) => {
-                        let mut e = AuditEvent::new(
-                            audit::events::USER_CREATED_JIT,
-                            req.label,
-                            self.clock().wall(),
-                        );
-                        e.tenant = Some(tenant.id);
-                        e.tenant_name = Some(tenant.name.clone());
-                        e.user = Some(name.clone());
-                        e.host = Some("%".into());
-                        e.user_id = Some(c.user_id);
-                        e.client_ip = Some(req.client_ip);
-                        e.detail = Some(format!("issuer {}", verified.issuer));
-                        self.audit().emit(&e);
-                    }
-                    // Created meanwhile by another login: use it.
-                    Err(e) if matches!(e.kind, ErrorKind::Backend { errno: 1396, .. }) => {}
-                    Err(e) => {
-                        tracing::warn!(tenant = %tenant.name, user = %name, error = %e, "just-in-time account not created");
-                        return Err(gone());
-                    }
+        let found =
+            TenantAuth::of(&catalog).and_then(|a| a.match_account(&name, req.client_ip).cloned());
+        let user: Arc<AuthUser> = if let Some(u) = found {
+            u
+        } else {
+            let Some(cat) = tokens.catalog().filter(|_| verified.jit_users) else {
+                return Err(bad(ev, Some(Refusal::NoAccount)));
+            };
+            match super::store::create_jit_user(cat, tenant.id, &name, self.clock().wall()).await {
+                Ok(c) => {
+                    let mut e = AuditEvent::new(
+                        audit::events::USER_CREATED_JIT,
+                        req.label,
+                        self.clock().wall(),
+                    );
+                    e.tenant = Some(tenant.id);
+                    e.tenant_name = Some(tenant.name.clone());
+                    e.user = Some(name.clone());
+                    e.host = Some("%".into());
+                    e.user_id = Some(c.user_id);
+                    e.client_ip = Some(req.client_ip);
+                    e.detail = Some(format!("issuer {}", verified.issuer));
+                    self.audit().emit(&e);
                 }
-                catalog = cl.catalogs().catalog(tenant.id).await.map_err(|_| gone())?;
-                TenantAuth::of(&catalog)
-                    .and_then(|a| a.match_account(&name, req.client_ip).cloned())
-                    .ok_or_else(|| bad(ev, Some(Refusal::NoAccount)))?
+                // Created meanwhile by another login: use it.
+                Err(e) if matches!(e.kind, ErrorKind::Backend { errno: 1396, .. }) => {}
+                Err(e) => {
+                    tracing::warn!(tenant = %tenant.name, user = %name, error = %e, "just-in-time account not created");
+                    return Err(gone());
+                }
             }
+            catalog = cl.catalogs().catalog(tenant.id).await.map_err(|_| gone())?;
+            TenantAuth::of(&catalog)
+                .and_then(|a| a.match_account(&name, req.client_ip).cloned())
+                .ok_or_else(|| bad(ev, Some(Refusal::NoAccount)))?
         };
         let row = &user.row;
         ev.host = Some(row.host.clone());

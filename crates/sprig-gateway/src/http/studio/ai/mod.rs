@@ -446,11 +446,10 @@ async fn chat_route(
         }
     };
     let cfg = TurnConfig::from_settings(role, &settings, model);
-    let host = Arc::new(host::GatewayHost::new(
-        Arc::clone(core),
-        caller.clone(),
-        settings.share_data,
-    ));
+    let host = Arc::new(
+        host::GatewayHost::new(Arc::clone(core), caller.clone(), settings.share_data)
+            .for_role(role),
+    );
     let turn = chat::Turn {
         agent: Agent::new(provider, ToolRegistry::builtin(), audit),
         cfg,

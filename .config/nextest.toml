@@ -1,0 +1,324 @@
+# cargo-nextest configuration.
+#
+# nextest runs every test in its own process, and runs tests of one binary in
+# parallel with each other and with other binaries. Live tests written for
+# `cargo test -- --test-threads 1` (fixed database names, fixed ports, an
+# in-process `static` lock) need that serialization spelled out here: each
+# such binary gets a test group of one thread. Groups only limit tests
+# within the group; other tests keep running beside them.
+#
+# Profiles:
+# - default: S0 unit tests (no SPRIG_TEST_* variables, live tests skip).
+# - ci-s1: CI's "S1 integration (Compose, one DC)" job, first pass:
+#   everything but the exclusions below and the exclusive tests.
+# - ci-s1-exclusive: the same job's second pass, one test at a time, after
+#   the first: tests that disturb the shared Compose servers for everyone
+#   (a Galera partition, a desynced node) or measure timings that other
+#   tests' load spoils.
+
+# --- Test groups: one thread each ---------------------------------------
+[test-groups]
+# Automatic-index builds: the driver counts every build on a cluster's
+# writer against max_builds_per_cluster (1); the in-process lock
+# (rollout/live_tests.rs SERIAL) doesn't reach other processes.
+advisor-rollout = { max-threads = 1 }
+# Binaries whose tests share fixed names, ports or servers within the
+# binary (their doc comments ask for --test-threads 1).
+serial-advisor-replay = { max-threads = 1 }
+serial-agent-relay-fence = { max-threads = 1 }
+serial-cluster-compose = { max-threads = 1 }
+serial-cluster-fence = { max-threads = 1 }
+serial-controller-dc-failover = { max-threads = 1 }
+serial-controller-bins = { max-threads = 1 }
+serial-gateway-authfix2 = { max-threads = 1 }
+serial-gateway-authjwt = { max-threads = 1 }
+serial-gateway-autoindex = { max-threads = 1 }
+serial-gateway-disconnect = { max-threads = 1 }
+serial-gateway-exec = { max-threads = 1 }
+serial-gateway-feed-cancel = { max-threads = 1 }
+serial-gateway-http = { max-threads = 1 }
+serial-gateway-inherit-dropdb = { max-threads = 1 }
+serial-gateway-inherit-newshare = { max-threads = 1 }
+serial-gateway-language = { max-threads = 1 }
+serial-gateway-logic = { max-threads = 1 }
+serial-gateway-lookup-ddl = { max-threads = 1 }
+serial-gateway-lost-conn = { max-threads = 1 }
+serial-gateway-m03 = { max-threads = 1 }
+serial-gateway-mongo-point = { max-threads = 1 }
+serial-gateway-processlist = { max-threads = 1 }
+serial-gateway-rls = { max-threads = 1 }
+# groups_live and hier_live share the tenant tree ig-a > ig-b > ig-c
+# (integration.sh); run together they refused each other's shares (39885).
+serial-inherit-tree = { max-threads = 1 }
+serial-queues-live = { max-threads = 1 }
+serial-queues-relay = { max-threads = 1 }
+serial-router-differential = { max-threads = 1 }
+serial-search = { max-threads = 1 }
+serial-sinks-db = { max-threads = 1 }
+serial-sinks-kafka = { max-threads = 1 }
+serial-txn-sprig2pc = { max-threads = 1 }
+serial-txn-live = { max-threads = 1 }
+serial-types = { max-threads = 1 }
+# The binlog scratch servers: tests change their globals
+# (log_bin_compress, binlog_row_event_fragment_threshold).
+binlog-scratch = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-advisor) & test(/^autoindex::rollout::live_tests::/)'
+test-group = 'advisor-rollout'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-advisor::replay_live)'
+test-group = 'serial-advisor-replay'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-agent::live_relay_fence)'
+test-group = 'serial-agent-relay-fence'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-cluster::compose)'
+test-group = 'serial-cluster-compose'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-cluster::fence)'
+test-group = 'serial-cluster-fence'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-controller::live_dc_failover)'
+test-group = 'serial-controller-dc-failover'
+
+# The real-binary tests: each starts its own etcd, MariaDB containers and
+# about a dozen sprigdb processes on fixed ports, so even two of them at
+# once is too much for one runner.
+[[profile.default.overrides]]
+filter = '''
+binary_id(sprig-controller::live_cluster_failover_bins)
+| binary_id(sprig-controller::live_dc_failover_bins)
+| binary_id(sprig-controller::live_r2harden_bins)
+| binary_id(sprig-controller::live_r2last_bins)
+| binary_id(sprig-controller::live_residency_bins)
+| binary_id(sprig-controller::live_standby_bins)
+| binary_id(sprig-controller::live_node_rebuild)
+'''
+test-group = 'serial-controller-bins'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-gateway::authfix2_live)'
+test-group = 'serial-gateway-authfix2'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-gateway::authjwt_live)'
+test-group = 'serial-gateway-authjwt'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-gateway::autoindex_live)'
+test-group = 'serial-gateway-autoindex'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-gateway::disconnect_live)'
+test-group = 'serial-gateway-disconnect'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-gateway::exec_live) | binary_id(sprig-gateway::collation_live)'
+test-group = 'serial-gateway-exec'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-gateway::feed_cancel_live)'
+test-group = 'serial-gateway-feed-cancel'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-gateway::http_live)'
+test-group = 'serial-gateway-http'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-gateway::inherit_dropdb_live)'
+test-group = 'serial-gateway-inherit-dropdb'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-gateway::inherit_newshare_live)'
+test-group = 'serial-gateway-inherit-newshare'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-gateway::language_live)'
+test-group = 'serial-gateway-language'
+
+# logic_live, logic_follow_live and logic_js_bound_live share the login
+# and create users in it.
+[[profile.default.overrides]]
+filter = '''
+binary_id(sprig-gateway::logic_live)
+| binary_id(sprig-gateway::logic_follow_live)
+| binary_id(sprig-gateway::logic_js_bound_live)
+| binary_id(sprig-gateway::logic_protocols_live)
+'''
+test-group = 'serial-gateway-logic'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-gateway::lookup_ddl_live)'
+test-group = 'serial-gateway-lookup-ddl'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-gateway::lost_conn_live)'
+test-group = 'serial-gateway-lost-conn'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-gateway::m03_live)'
+test-group = 'serial-gateway-m03'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-gateway::mongo_point_live)'
+test-group = 'serial-gateway-mongo-point'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-gateway::processlist_secrets_live)'
+test-group = 'serial-gateway-processlist'
+
+[[profile.default.overrides]]
+filter = '''
+binary_id(sprig-gateway::rls_live)
+| binary_id(sprig-gateway::rls_prepared_live)
+| binary_id(sprig-gateway::rls_definer_live)
+| binary_id(sprig-gateway::rls_inherit_live)
+'''
+test-group = 'serial-gateway-rls'
+
+# typed_tables_in_groups: a subtype a declares late can show at b for a
+# moment without its parent's columns (1054), which names_become doesn't
+# wait out (15 Nov, once in two runs). One retry, reported as flaky, until
+# the inheritance code or the test settles it.
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-inherit::groups_live)'
+test-group = 'serial-inherit-tree'
+retries = 1
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-inherit::hier_live)'
+test-group = 'serial-inherit-tree'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-queues::live)'
+test-group = 'serial-queues-live'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-queues::live_relay)'
+test-group = 'serial-queues-relay'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-router::differential_live)'
+test-group = 'serial-router-differential'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-search::search_live)'
+test-group = 'serial-search'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-sinks::db_live)'
+test-group = 'serial-sinks-db'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-sinks::kafka_live)'
+test-group = 'serial-sinks-kafka'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-txn::live_sprig2pc)'
+test-group = 'serial-txn-sprig2pc'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-txn::live_txn)'
+test-group = 'serial-txn-live'
+
+[[profile.default.overrides]]
+filter = 'binary_id(sprig-types::types_live)'
+test-group = 'serial-types'
+
+[[profile.default.overrides]]
+filter = '''
+binary_id(sprig-binlog::live_stream)
+| (test(/scratch/) & (binary_id(sprig-binlog::live_groups) | binary_id(sprig-binlog::live_types)
+   | binary_id(sprig-cluster::dump_probe)))
+'''
+test-group = 'binlog-scratch'
+
+# --- CI S1 integration ---------------------------------------------------
+#
+# The job's first pass runs everything except two sets.
+#
+# The exclusive tests, which ci-s1-exclusive runs afterwards, one at a time:
+# - live_failover's galera_repicks_writers_and_heals cuts a node of the
+#   shared Compose Galera off for 15 s (faultd);
+# - replay_live desyncs a Galera node (RSU) and measures replay noise.
+#
+# Tests that need a setup the job doesn't build. Each says which job covers
+# it; none does yet, so they run only by hand. Keep this list in step with
+# .github/workflows/ci.yml's integration job.
+# - The real-binary multi-DC tests (*_bins, live_node_rebuild): each starts
+#   its own etcd, MariaDB containers and 10 to 13 sprigdb processes for 2 to
+#   3 minutes, over half an hour together. Covered nowhere.
+# - ask_live: a data assistant pointing at a stub model provider. Covered
+#   nowhere.
+# - operators_live: a controller with admin_token_file and break-glass.
+#   Covered nowhere.
+# - large_statement_live: a private cluster with max_allowed_packet of at
+#   least 64 MiB. Covered nowhere.
+# - shard_disconnect_live: a table split into shards first (advisor and
+#   sprigctl shard split). Covered nowhere.
+# - soak_live and drain_live: the m07 harness (deploy/compose/m07: two
+#   gateways, its own cluster). Covered nowhere (the soak runs by hand).
+# - triggers_live, inherit_live (gateway) and sink_test_live: private
+#   deployments with worker and controller restart commands, AMQP, and for
+#   sinks PostgreSQL, Kafka and MinIO. Covered nowhere.
+# - inherit_live (sprig-inherit): a tenant tree on a deployment without a
+#   worker process. Covered nowhere.
+# - docs_live and docs_loader_live: the docs pack built (sprig-docs-gen,
+#   release) and loaded on the clusters first. Covered nowhere.
+# - binlog live_tls and live_resume's promoted-replica case: a TLS-only
+#   scratch server with its CA and a second CA, and a scratch primary and
+#   replica pair. Covered nowhere.
+# - exec_live, lost_conn_live and collation_live: a gateway in
+#   accounts_file login mode (the raw clusters' logins app, app_repl,
+#   app_galera), which needs a second deployment on its own etcd. Covered
+#   nowhere.
+[profile.ci-s1]
+fail-fast = false
+# A hung live test shows as such instead of eating the job's timeout.
+slow-timeout = { period = "60s", terminate-after = 10 }
+default-filter = '''
+not (
+  (binary_id(sprig-controller::live_failover) & test(=galera_repicks_writers_and_heals))
+  | binary_id(sprig-advisor::replay_live)
+  | binary_id(sprig-controller::live_cluster_failover_bins)
+  | binary_id(sprig-controller::live_dc_failover_bins)
+  | binary_id(sprig-controller::live_r2harden_bins)
+  | binary_id(sprig-controller::live_r2last_bins)
+  | binary_id(sprig-controller::live_residency_bins)
+  | binary_id(sprig-controller::live_standby_bins)
+  | binary_id(sprig-controller::live_node_rebuild)
+  | binary_id(sprig-gateway::ask_live)
+  | binary_id(sprig-gateway::operators_live)
+  | binary_id(sprig-gateway::large_statement_live)
+  | binary_id(sprig-gateway::shard_disconnect_live)
+  | binary_id(sprig-gateway::soak_live)
+  | binary_id(sprig-gateway::drain_live)
+  | binary_id(sprig-gateway::triggers_live)
+  | binary_id(sprig-gateway::inherit_live)
+  | binary_id(sprig-gateway::sink_test_live)
+  | binary_id(sprig-inherit::inherit_live)
+  | binary_id(sprig-gateway::docs_live)
+  | binary_id(sprig-controller::docs_loader_live)
+  | binary_id(sprig-binlog::live_tls)
+  | (binary_id(sprig-binlog::live_resume) & test(=follow_a_promoted_replica_and_refuse_a_lost_position))
+  | binary_id(sprig-gateway::exec_live)
+  | binary_id(sprig-gateway::lost_conn_live)
+  | binary_id(sprig-gateway::collation_live)
+)
+'''
+
+# The job's second pass: the exclusive tests above, one at a time.
+[profile.ci-s1-exclusive]
+fail-fast = false
+test-threads = 1
+slow-timeout = { period = "60s", terminate-after = 10 }
+default-filter = '''
+(binary_id(sprig-controller::live_failover) & test(=galera_repicks_writers_and_heals))
+| binary_id(sprig-advisor::replay_live)
+'''

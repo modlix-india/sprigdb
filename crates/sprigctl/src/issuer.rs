@@ -149,9 +149,7 @@ pub(crate) async fn run_issuer(
             let which = m.get_one::<String>("issuer").cloned().unwrap_or_default();
             let list: ListIssuersResponse = c.get(&path).await?;
             let Some(mut spec) = list.issuers.into_iter().find(|i| i.issuer == which) else {
-                return Err(Failed(format!(
-                    "tenant {tenant} has no issuer {which}"
-                )));
+                return Err(Failed(format!("tenant {tenant} has no issuer {which}")));
             };
             spec.active = false;
             if dry_run {

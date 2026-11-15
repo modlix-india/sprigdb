@@ -3855,7 +3855,7 @@ async fn inherited_change_exchange_exactly_once() {
         eprintln!("no SPRIG_TEST_INHERIT_AMQP: skipped");
         return;
     };
-    let rows: u64 = var("SPRIG_TEST_INHERIT_CX_ROWS").map_or(600, |v| v.parse().unwrap());
+    let rows: i64 = var("SPRIG_TEST_INHERIT_CX_ROWS").map_or(600, |v| v.parse().unwrap());
     let mut sys = conn(&e.addr, &e.system).await;
     let _leftovers = Leftovers::dbs(&e, &["cxi"]);
     let members: Vec<String> = e.members.iter().take(2).cloned().collect();
@@ -3956,7 +3956,8 @@ async fn inherited_change_exchange_exactly_once() {
                     }
                 }
                 None if Instant::now() > end
-                    || (ids.len() as u64 >= rows && last.elapsed() > Duration::from_secs(5)) =>
+                    || (i64::try_from(ids.len()).unwrap() >= rows
+                        && last.elapsed() > Duration::from_secs(5)) =>
                 {
                     break;
                 }
@@ -3968,7 +3969,7 @@ async fn inherited_change_exchange_exactly_once() {
             *seen.entry(*id).or_default() += 1;
         }
         let twice = seen.values().filter(|n| **n > 1).count();
-        let missing = (0..rows as i64).filter(|i| !seen.contains_key(i)).count();
+        let missing = (0..rows).filter(|i| !seen.contains_key(i)).count();
         println!(
             "{m}: {} changes for {rows} inserts: {missing} missing, {twice} more than once, \
              {unstamped} not stamped with {m}",

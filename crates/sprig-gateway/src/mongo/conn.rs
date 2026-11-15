@@ -481,7 +481,10 @@ impl Conn {
             d.insert("saslSupportedMechs", vec!["SCRAM-SHA-256"]);
         }
         if let Ok(spec) = cmd.get_document("speculativeAuthenticate")
-            && matches!(spec.get_str("mechanism"), Ok("SCRAM-SHA-256" | "MONGODB-OIDC"))
+            && matches!(
+                spec.get_str("mechanism"),
+                Ok("SCRAM-SHA-256" | "MONGODB-OIDC")
+            )
             && let Ok(r) = self.sasl_start(spec).await
         {
             d.insert("speculativeAuthenticate", r);

@@ -90,12 +90,14 @@ impl Default for HttpFetcher {
             rustls::crypto::ring::default_provider(),
         ))
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-        .map(|b| b.with_root_certificates(roots).with_no_client_auth())
-        .unwrap_or_else(|_| {
-            rustls::ClientConfig::builder()
-                .with_root_certificates(rustls::RootCertStore::empty())
-                .with_no_client_auth()
-        });
+        .map_or_else(
+            |_| {
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(rustls::RootCertStore::empty())
+                    .with_no_client_auth()
+            },
+            |b| b.with_root_certificates(roots).with_no_client_auth(),
+        );
         cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
         Self { tls: Arc::new(cfg) }
     }

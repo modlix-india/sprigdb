@@ -621,9 +621,9 @@ pub fn session_client(authorization: Option<&str>) -> Option<String> {
 #[must_use]
 pub fn session_claims(authorization: Option<&str>) -> Option<Value> {
     let b = bearer(authorization)?;
-    let t = b.strip_prefix(ACCESS_PREFIX).or_else(|| {
-        sprig_auth::oidc::Jws::looks_like(b.as_bytes()).then_some(b)
-    })?;
+    let t = b
+        .strip_prefix(ACCESS_PREFIX)
+        .or_else(|| sprig_auth::oidc::Jws::looks_like(b.as_bytes()).then_some(b))?;
     let payload = t.split('.').nth(1)?;
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload)

@@ -50,10 +50,10 @@ pub use self::jwks::{Fetcher, HttpFetcher, JwksCache, Source};
 pub use self::jwt::{Alg, Jws};
 pub use self::login::{TokenDenied, TokenLogin};
 pub use self::mapping::Mapped;
+use self::mapping::Mapping;
 pub use self::store::{
     ClaimMapping, IssuerKind, IssuerSpec, MappingKind, MatchKind, TokenProtocol,
 };
-use self::mapping::Mapping;
 
 /// `auth.token_clock_skew_seconds`: clock skew allowed on token times.
 pub static TOKEN_CLOCK_SKEW_SECONDS: Setting<u64> = Setting {
@@ -97,7 +97,11 @@ impl Issuer {
     /// doesn't compile are left out (both are refused when written).
     #[must_use]
     pub fn new(spec: IssuerSpec) -> Self {
-        let algs = spec.algorithms.iter().filter_map(|a| Alg::parse(a)).collect();
+        let algs = spec
+            .algorithms
+            .iter()
+            .filter_map(|a| Alg::parse(a))
+            .collect();
         let mappings = spec
             .mappings
             .iter()
@@ -239,6 +243,10 @@ pub const TOKEN_CACHE_TTL: Duration = Duration::from_secs(60);
 /// Verified tokens kept at most.
 const TOKEN_CACHE_MAX: usize = 10_000;
 
+/// A verified token's cache key: tenant, auth version, the token's
+/// SHA-256 and the protocol.
+type CacheKey = (TenantId, u64, [u8; 32], TokenProtocol);
+
 struct Cached {
     token: VerifiedToken,
     until: Instant,
@@ -249,7 +257,7 @@ struct Cached {
 /// 60 s, per tenant and auth version).
 pub struct ExternalTokens {
     jwks: JwksCache,
-    cache: Mutex<HashMap<(TenantId, u64, [u8; 32], TokenProtocol), Cached>>,
+    cache: Mutex<HashMap<CacheKey, Cached>>,
     /// The catalog writer, for just-in-time accounts; `None`: an issuer's
     /// `jit_users` creates nothing (the login is refused).
     catalog: Option<sprig_catalog::MariaCatalog>,
@@ -379,7 +387,10 @@ impl ExternalTokens {
         if now > exp.saturating_add(skew) {
             return Err(Refusal::Expired);
         }
-        if jws.time_claim("nbf").is_some_and(|n| n > now.saturating_add(skew)) {
+        if jws
+            .time_claim("nbf")
+            .is_some_and(|n| n > now.saturating_add(skew))
+        {
             return Err(Refusal::NotYetValid);
         }
         let iat = jws.time_claim("iat");

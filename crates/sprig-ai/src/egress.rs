@@ -505,6 +505,20 @@ pub enum NameKind {
 }
 
 impl NameKind {
+    /// Every kind.
+    pub const ALL: &'static [NameKind] = &[
+        NameKind::Tenant,
+        NameKind::Database,
+        NameKind::Table,
+        NameKind::Column,
+        NameKind::User,
+        NameKind::Host,
+        NameKind::Value,
+        NameKind::Statement,
+        NameKind::Address,
+        NameKind::Name,
+    ];
+
     /// The placeholder's prefix.
     #[must_use]
     pub const fn label(self) -> &'static str {

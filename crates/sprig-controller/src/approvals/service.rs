@@ -602,40 +602,41 @@ impl RecommendationsService {
     #[allow(clippy::too_many_lines)] // the two kinds' paths
     pub async fn gate(&self, req: GateRequest) -> Result<GateReply> {
         use sprig_approvals::{Action, Mode, Proposal, Verdict};
-        let (kind, tenant, db, target, action, machine, evidence, summary, score, object) = match req {
-            GateRequest::Finished { ticket, ok, detail } => {
-                self.ctl.finished(&ticket, ok, &detail).await;
-                return Ok(GateReply {
-                    go: ok,
-                    ticket: None,
-                    why: None,
-                });
-            }
-            GateRequest::Check {
-                kind,
-                tenant,
-                db,
-                target,
-                action,
-                machine,
-                evidence,
-                summary,
-                score,
-                object,
-                object_name,
-            } => (
-                kind,
-                tenant,
-                db,
-                target,
-                action,
-                machine,
-                evidence,
-                summary,
-                score,
-                (object, object_name),
-            ),
-        };
+        let (kind, tenant, db, target, action, machine, evidence, summary, score, object) =
+            match req {
+                GateRequest::Finished { ticket, ok, detail } => {
+                    self.ctl.finished(&ticket, ok, &detail).await;
+                    return Ok(GateReply {
+                        go: ok,
+                        ticket: None,
+                        why: None,
+                    });
+                }
+                GateRequest::Check {
+                    kind,
+                    tenant,
+                    db,
+                    target,
+                    action,
+                    machine,
+                    evidence,
+                    summary,
+                    score,
+                    object,
+                    object_name,
+                } => (
+                    kind,
+                    tenant,
+                    db,
+                    target,
+                    action,
+                    machine,
+                    evidence,
+                    summary,
+                    score,
+                    (object, object_name),
+                ),
+            };
         // A lookup build's duplicates, which only a person can fix.
         let duplicates = target.ends_with(sprig_shard::lookup::admin::DUPLICATES_TARGET_SUFFIX);
         let kind = Kind::parse(&kind)

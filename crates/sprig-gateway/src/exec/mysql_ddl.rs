@@ -349,10 +349,8 @@ impl PassSession {
             }
             None => None,
         };
-        let m = mysqlddl::functional_index_value(
-            index.as_deref().unwrap_or("functional_index"),
-            &v,
-        );
+        let m =
+            mysqlddl::functional_index_value(index.as_deref().unwrap_or("functional_index"), &v);
         let mut out = match e.kind {
             sprig_common::ErrorKind::Backend { .. } => {
                 SprigError::backend(m.code, m.sqlstate, m.message)

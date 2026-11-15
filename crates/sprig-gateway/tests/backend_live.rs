@@ -313,9 +313,19 @@ async fn pool_reuse_replays_session_state() {
     assert_eq!(r.cell(0, 1), Some(db.as_str()));
     assert_eq!(r.cell(0, 2), None);
     assert_eq!(r.cell(0, 3), Some("0"));
+    // The MySQL persona's backend sql_mode: MySQL 8.4's, run without
+    // ONLY_FULL_GROUP_BY (the gateway checks it) and with
+    // TIME_ROUND_FRACTIONAL; the client's view is the gateway's.
+    let mode = r.cell(0, 4).unwrap();
     assert!(
-        r.cell(0, 4).unwrap().contains("ONLY_FULL_GROUP_BY"),
-        "MySQL persona baseline"
+        mode.contains("NO_ZERO_DATE")
+            && mode.contains("TIME_ROUND_FRACTIONAL")
+            && !mode.contains("ONLY_FULL_GROUP_BY"),
+        "MySQL persona baseline: {mode}"
+    );
+    assert_eq!(
+        b.vars().client_sql_mode.as_deref(),
+        Some(sprig_gateway::backend::state::persona::MYSQL84_SQL_MODE)
     );
     assert_eq!(r.cell(0, 5), Some("utf8mb4"));
     assert_eq!(r.cell(0, 6), Some("0"));
@@ -461,8 +471,10 @@ async fn writer_selection_per_topology() {
         assert_eq!(w.node.as_str(), "n1");
     }
     if let Some(u) = urls(skip::MARIADB_REPLICATION) {
-        // Replicas first in the record: the checks must still find the primary.
-        let addrs = vec![u[1].addr.clone(), u[0].addr.clone(), u[2].addr.clone()];
+        // The registered writer (the record's first node) is the writer
+        // while nothing is published; the checks may only veto it
+        // (backend/writer.rs, the 9 November replica-1 incident).
+        let addrs = vec![u[0].addr.clone(), u[1].addr.clone(), u[2].addr.clone()];
         let rig = rig(
             TopologyKind::PrimaryReplica,
             &u[0].user,
@@ -472,7 +484,7 @@ async fn writer_selection_per_topology() {
         );
         let mut s = rig.session(Persona::MariaDb);
         ok(&mut s, "SELECT 1").await; // starts the monitor
-        rig.wait_roles(&[NodeRole::Replica, NodeRole::Writer, NodeRole::Replica])
+        rig.wait_roles(&[NodeRole::Writer, NodeRole::Replica, NodeRole::Replica])
             .await;
         let w = rig
             .backends
@@ -483,7 +495,29 @@ async fn writer_selection_per_topology() {
         let r = run_as(&mut s, &StmtInfo::write(), "SELECT @@server_id")
             .await
             .unwrap();
-        assert_eq!(r.out.node.node.as_str(), "n2", "writes go to the primary");
+        assert_eq!(r.out.node.node.as_str(), "n1", "writes go to the primary");
+        s.close().await;
+
+        // A replica registered first: the gateway never nominates another
+        // node, so writes are refused (39100) instead of guessed.
+        let addrs = vec![u[1].addr.clone(), u[0].addr.clone(), u[2].addr.clone()];
+        let rig2 = crate::rig(
+            TopologyKind::PrimaryReplica,
+            &u[0].user,
+            &u[0].pass,
+            &addrs,
+            fast_settings(),
+        );
+        let mut s = rig2.session(Persona::MariaDb);
+        ok(&mut s, "SELECT 1").await;
+        rig2.wait_roles(&[NodeRole::Replica, NodeRole::Writer, NodeRole::Replica])
+            .await;
+        let e = rig2
+            .backends
+            .writer(&rig2.target.cluster, ShardId(0))
+            .await
+            .unwrap_err();
+        assert_eq!(e.protocol().mysql_errno, 39100, "{e}");
         s.close().await;
     }
     if let Some(u) = urls(skip::MARIADB_GALERA) {

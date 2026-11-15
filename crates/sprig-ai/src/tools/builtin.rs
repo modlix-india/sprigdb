@@ -323,12 +323,17 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "decision_log",
-            "SprigDB's own decisions about a subject (placement, moves, failovers, approvals history), with their reasons. Call it to explain why SprigDB did something.",
+            "SprigDB's own decision log, with each decision's reason and evidence: shard splits, merges and moves, index changes and placement for a tenant; cluster and DC failovers, incidents, health findings and write-ups for operators. Call it to explain why SprigDB did something, and cite the entries (their ids) you use.",
             obj(
-                &[(
-                    "subject",
-                    s("What the decisions are about, such as a table or cluster"),
-                )],
+                &[
+                    (
+                        "subject",
+                        s(
+                            "A decision id, or what the decisions are about: a table, a shard such as t42/g1/s3, a cluster, an incident fingerprint, a kind such as shard.move or failover, or recent for the newest",
+                        ),
+                    ),
+                    ("days", int("Days to look back, 1 to 90; 30 when absent")),
+                ],
                 &["subject"],
             ),
             Read,
@@ -337,11 +342,11 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "metrics_trend",
-            "A metric's history from the controller, by day, for up to 30 days.",
+            "A series from the controller's metric history: daily mean, min and max for up to 30 days, and the last 24 hourly points. It keeps sprig_shard_split_ratio, sprig_balancer_cluster_full_ratio, sprig_backend_replica_lag_seconds, sprig_cluster_health_state, sprig_gateway_connections, sprig_backup_last_success_timestamp_seconds, sprig_mover_jobs_waiting and sprig_mover_oldest_waiting_seconds.",
             obj(
                 &[
-                    ("name", s("The metric, such as sprig_shard_bytes")),
-                    ("labels", strs("label=value filters")),
+                    ("name", s("The series, one of those listed")),
+                    ("labels", strs("label=value filters, such as cluster=<id>")),
                     ("days", int("Days to look back, 1 to 30")),
                 ],
                 &["name", "days"],
@@ -470,6 +475,7 @@ pub fn check_input(name: &str, input: &Value) -> Result<(), String> {
     match name {
         "workload" => range(input, "hours", 1, 168),
         "metrics_trend" => range(input, "days", 1, 30),
+        "decision_log" => range(input, "days", 1, 90),
         "generate_rows" => range(input, "n", 1, 100_000),
         "run_query" => {
             range(input, "limit", 1, 1000)?;

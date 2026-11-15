@@ -348,10 +348,7 @@ fn renaming_or_dropping_what_a_functional_index_uses() {
     assert_eq!(generated_dependency_of(&cols(&["c5"]), &generated), None);
     // Other internal generated columns aren't the user's.
     assert_eq!(
-        generated_dependency_of(
-            &cols(&["a"]),
-            &[("_sprig_x".to_owned(), "`a`".to_owned())]
-        ),
+        generated_dependency_of(&cols(&["a"]), &[("_sprig_x".to_owned(), "`a`".to_owned())]),
         None
     );
     // `ALTER TABLE d3 DROP COLUMN b, DROP COLUMN a` with `INDEX fx ((a + 1))`:
@@ -410,7 +407,9 @@ fn values_that_dont_fit_a_functional_index() {
         )
     );
     for code in [1265, 1406] {
-        assert!(fx_value_error(code, &format!("Data truncated for column '{c}' at row 1")).is_some());
+        assert!(
+            fx_value_error(code, &format!("Data truncated for column '{c}' at row 1")).is_some()
+        );
     }
     // A user's column, another code, or a hidden column named elsewhere.
     assert_eq!(
@@ -427,10 +426,19 @@ fn values_that_dont_fit_a_functional_index() {
     );
     // The index: its own name, or MySQL's for unnamed ones in key order.
     let parts = vec![
-        ("_sprig_fx_00000001".to_owned(), "_sprig_fx_00000001".to_owned()),
+        (
+            "_sprig_fx_00000001".to_owned(),
+            "_sprig_fx_00000001".to_owned(),
+        ),
         ("named".to_owned(), "_sprig_fx_00000002".to_owned()),
-        ("_sprig_fx_00000003".to_owned(), "_sprig_fx_00000003".to_owned()),
-        ("_sprig_fx_00000003".to_owned(), "_sprig_fx_00000004".to_owned()),
+        (
+            "_sprig_fx_00000003".to_owned(),
+            "_sprig_fx_00000003".to_owned(),
+        ),
+        (
+            "_sprig_fx_00000003".to_owned(),
+            "_sprig_fx_00000004".to_owned(),
+        ),
     ];
     assert_eq!(
         fx_index_name(&parts, "_sprig_fx_00000001").as_deref(),

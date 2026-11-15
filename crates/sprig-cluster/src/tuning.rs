@@ -44,7 +44,7 @@ use sprig_settings::{Apply, HardBounds, MemSettings, Scopes, Setting, SettingCtx
 use crate::probe::parse::TableCacheInfo;
 
 /// `tuning.table_open_cache_mode`: `auto`, `recommend` or `off`.
-pub static MODE: Setting<std::borrow::Cow<'static, str>> = Setting {
+pub static TABLE_OPEN_CACHE_MODE: Setting<std::borrow::Cow<'static, str>> = Setting {
     key: "tuning.table_open_cache_mode",
     default: std::borrow::Cow::Borrowed("auto"),
     scopes: Scopes::OPERATIONAL,
@@ -54,7 +54,7 @@ pub static MODE: Setting<std::borrow::Cow<'static, str>> = Setting {
     owner: 9,
     doc: "auto, recommend or off",
 };
-sprig_settings::register!(MODE);
+sprig_settings::register!(TABLE_OPEN_CACHE_MODE);
 
 macro_rules! ops_key {
     ($(#[$doc:meta])* $name:ident: $t:ty = $key:literal, $default:expr, $min:expr, $max:expr, $text:literal) => {
@@ -130,7 +130,7 @@ impl TuningSettings {
     #[must_use]
     pub fn resolve(s: &MemSettings<'_>, ctx: &SettingCtx<'_>) -> Self {
         Self {
-            mode: match &*s.get(&MODE, ctx) {
+            mode: match &*s.get(&TABLE_OPEN_CACHE_MODE, ctx) {
                 "auto" => TuningMode::Auto,
                 "recommend" => TuningMode::Recommend,
                 _ => TuningMode::Off,

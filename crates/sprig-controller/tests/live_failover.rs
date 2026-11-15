@@ -90,10 +90,22 @@ fn ms(d: Duration) -> u128 {
 /// Where each key's transactions go.
 type Route = Arc<dyn Fn(u64) -> String + Send + Sync>;
 
+/// Acknowledged append value -> where and when it committed.
+type Detail = Arc<std::sync::Mutex<BTreeMap<u64, String>>>;
+
+/// The acknowledged appends `(key, value)`, and where each committed.
+struct Acked {
+    list: Vec<(u64, u64)>,
+    detail: BTreeMap<u64, String>,
+}
+
 struct Workload {
     history: Arc<History>,
     stop: Arc<AtomicBool>,
     acked: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+    /// Where and when each acknowledged append committed, by value: for
+    /// the failure message of a lost one.
+    detail: Detail,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -111,13 +123,16 @@ fn start_workload(route: Route, processes: u32, isolation: &'static str, galera:
     let history = Arc::new(History::new());
     let stop = Arc::new(AtomicBool::new(false));
     let acked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let detail: Detail = Arc::default();
+    let t0 = Instant::now();
     let next = Arc::new(AtomicU64::new(1));
     let mut tasks = Vec::new();
     for p in 0..processes {
-        let (history, stop, acked, next, route) = (
+        let (history, stop, acked, detail, next, route) = (
             Arc::clone(&history),
             Arc::clone(&stop),
             Arc::clone(&acked),
+            Arc::clone(&detail),
             Arc::clone(&next),
             Arc::clone(&route),
         );
@@ -184,16 +199,29 @@ fn start_workload(route: Route, processes: u32, isolation: &'static str, galera:
                     }
                 }
                 history.record(p, OpKind::Invoke, "txn", Value::Array(invoke.clone()));
-                let Some((_, c)) = conn.as_mut() else {
+                let Some((node, c)) = conn.as_mut() else {
                     continue;
                 };
+                let sent = t0.elapsed();
                 let r = tokio::time::timeout(Duration::from_secs(4), txn(c, &mops)).await;
                 match r {
                     Ok(Ok(done)) => {
                         let mut a = acked.lock().expect("lock");
+                        let mut d = detail.lock().expect("lock");
+                        let port = node.rsplit(':').next().unwrap_or_default().to_owned();
                         for (app, k, v) in &mops {
                             if *app {
                                 a.push((*k, *v));
+                                d.insert(
+                                    *v,
+                                    format!(
+                                        "process {p} on :{port} (connection {}), sent {} ms, acknowledged {} ms after the workload began; txn {}",
+                                        c.id(),
+                                        ms(sent),
+                                        ms(t0.elapsed()),
+                                        Value::Array(done.clone())
+                                    ),
+                                );
                             }
                         }
                         history.record(p, OpKind::Ok, "txn", Value::Array(done));
@@ -233,6 +261,7 @@ fn start_workload(route: Route, processes: u32, isolation: &'static str, galera:
         history,
         stop,
         acked,
+        detail,
         tasks,
     }
 }
@@ -268,13 +297,14 @@ async fn txn(
 }
 
 impl Workload {
-    async fn stop(self) -> (Arc<History>, Vec<(u64, u64)>) {
+    async fn stop(self) -> (Arc<History>, Acked) {
         self.stop.store(true, Ordering::SeqCst);
         for t in self.tasks {
             let _ = t.await;
         }
-        let acked = self.acked.lock().expect("lock").clone();
-        (self.history, acked)
+        let list = self.acked.lock().expect("lock").clone();
+        let detail = std::mem::take(&mut *self.detail.lock().expect("lock"));
+        (self.history, Acked { list, detail })
     }
 }
 
@@ -290,12 +320,21 @@ async fn final_lists(url: &str) -> BTreeMap<u64, Vec<u64>> {
         .collect()
 }
 
-fn check_acked(lists: &BTreeMap<u64, Vec<u64>>, acked: &[(u64, u64)]) {
+fn check_acked(lists: &BTreeMap<u64, Vec<u64>>, acked: &Acked) {
     let mut lost = Vec::new();
-    for (k, v) in acked {
+    for (k, v) in &acked.list {
         if !lists.get(k).is_some_and(|l| l.contains(v)) {
             lost.push((k, v));
         }
+    }
+    for (k, v) in &lost {
+        let l = &lists.get(k).map(Vec::as_slice).unwrap_or_default();
+        let pos = l.iter().position(|x| x > v).unwrap_or(l.len());
+        eprintln!(
+            "lost ({k}, {v}): {}; key {k} around it: {:?}",
+            acked.detail.get(v).map_or("?", String::as_str),
+            &l[pos.saturating_sub(5)..(pos + 5).min(l.len())]
+        );
     }
     assert!(lost.is_empty(), "acknowledged appends lost: {lost:?}");
     for (k, l) in lists {
@@ -640,7 +679,7 @@ async fn primary_replicas_promote_with_after_sync() {
     eprintln!(
         "history {}; {} acknowledged appends",
         summarize(&history),
-        acked.len()
+        acked.list.len()
     );
 
     // The old primary returns: fenced (read_only), diverged reported.
@@ -665,7 +704,7 @@ async fn primary_replicas_promote_with_after_sync() {
                 "every diverged GTID found in the binlog"
             );
             // No acknowledged write may be among them.
-            for (k, v) in &acked {
+            for (k, v) in &acked.list {
                 assert!(
                     !report
                         .statements
@@ -708,18 +747,31 @@ async fn primary_replicas_promote_with_after_sync() {
 
 // ---- Galera ---------------------------------------------------------------
 
-const GALERA: [&str; 3] = [
-    "sprigdb-dev-galera-1-1",
-    "sprigdb-dev-galera-2-1",
-    "sprigdb-dev-galera-3-1",
-];
-const FAULTD: &str = "sprigdb-dev-faultd-1";
+/// The Galera nodes' container names, in `SPRIG_TEST_MARIADB_GALERA`'s
+/// order: `SPRIG_TEST_GALERA_CONTAINERS` (comma-separated), or the dev
+/// stack's. A private Galera (its own Compose project) sets it.
+fn galera_containers() -> Vec<String> {
+    skip::var("SPRIG_TEST_GALERA_CONTAINERS").map_or_else(
+        || {
+            (1..=3)
+                .map(|i| format!("sprigdb-dev-galera-{i}-1"))
+                .collect()
+        },
+        |v| skip::urls(&v),
+    )
+}
 
-/// Heals faultd's rules in a dev Galera node, also when the test panics.
-struct Cut(&'static str);
+/// The faultd container: `SPRIG_TEST_FAULTD`, or the dev stack's.
+fn faultd_container() -> String {
+    skip::var(skip::FAULTD).unwrap_or_else(|| "sprigdb-dev-faultd-1".to_owned())
+}
+
+/// Heals faultd's rules in a Galera node, also when the test panics.
+struct Cut(String);
 
 fn faultd(args: &[&str]) -> sprig_common::Result<String> {
-    let mut a = vec!["exec", FAULTD, "/bin/sh", "/usr/local/bin/faultd.sh"];
+    let f = faultd_container();
+    let mut a = vec!["exec", f.as_str(), "/bin/sh", "/usr/local/bin/faultd.sh"];
     a.extend_from_slice(args);
     docker(&a)
 }
@@ -743,9 +795,9 @@ fn ip(container: &str) -> String {
 }
 
 impl Cut {
-    fn new(target: &'static str, peers: &[&str]) -> Self {
+    fn new(target: &str, peers: &[String]) -> Self {
         let p = pid(target);
-        let cut = Self(target);
+        let cut = Self(target.to_owned());
         for peer in peers {
             faultd(&["partition", &p, &ip(peer)]).expect("partition");
         }
@@ -755,7 +807,7 @@ impl Cut {
 
 impl Drop for Cut {
     fn drop(&mut self) {
-        let _ = faultd(&["heal", &pid(self.0)]);
+        let _ = faultd(&["heal", &pid(&self.0)]);
     }
 }
 
@@ -868,7 +920,9 @@ async fn galera_repicks_writers_and_heals() {
     let wl = start_workload(route, 6, "REPEATABLE READ", true);
     tokio::time::sleep(Duration::from_secs(5)).await;
     let cut_at = Instant::now();
-    let cut = Cut::new(GALERA[2], &GALERA[..2]);
+    let galera = galera_containers();
+    assert_eq!(galera.len(), 3, "three Galera containers");
+    let cut = Cut::new(&galera[2], &galera[..2]);
     eprintln!("galera-3 cut from galera-1 and galera-2");
     // The isolated node refuses work once it leaves the primary component.
     let mut refused = None;
@@ -941,7 +995,7 @@ async fn galera_repicks_writers_and_heals() {
     eprintln!(
         "history {}; {} acknowledged appends; writer changes {:?}",
         summarize(&history),
-        acked.len(),
+        acked.list.len(),
         changes
             .lock()
             .expect("lock")
@@ -954,4 +1008,65 @@ async fn galera_repicks_writers_and_heals() {
     elle_check(&history, &["read-committed"]);
     exec(&urls[0], &[&format!("DROP DATABASE IF EXISTS {SCHEMA}")]).await;
     assert!(synced_3(&urls).await, "Synced 3/3 at the end");
+}
+
+/// What a session sees when Galera aborts its open transaction (a
+/// brute-force abort by another node's write set) while the session is
+/// idle between statements, and its next statement is a prepared one
+/// (COM_STMT_EXECUTE). Probe for the lost acknowledged append.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn galera_bf_abort_probe() {
+    if !enabled("galera_bf_abort_probe") {
+        return;
+    }
+    let Some(urls) = skip::var(skip::MARIADB_GALERA).map(|v| skip::urls(&v)) else {
+        skip::report_missing(skip::MARIADB_GALERA, "galera_bf_abort_probe");
+        return;
+    };
+    const S: &str = "r2failover_bf";
+    exec(&urls[0], &[&format!("DROP DATABASE IF EXISTS {S}"), &format!("CREATE DATABASE {S}"),
+        &format!("CREATE TABLE {S}.t (k INT PRIMARY KEY, v TEXT NOT NULL) ENGINE=InnoDB"),
+        &format!("INSERT INTO {S}.t VALUES (1, 'a'), (2, 'b')")]).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for (round, next) in ["select", "insert", "text-select"].iter().enumerate() {
+        let mut a = mysql_async::Conn::new(opts(&urls[0])).await.expect("a");
+        let mut b = mysql_async::Conn::new(opts(&urls[1])).await.expect("b");
+        a.query_drop("BEGIN").await.expect("begin");
+        a.exec_drop(format!("UPDATE {S}.t SET v = CONCAT(v, ?) WHERE k = 1"), (format!("A{round}"),))
+            .await
+            .expect("a's update");
+        let st = |c: &mysql_async::Conn| {
+            c.last_ok_packet().map(|p| {
+                p.status_flags()
+                    .contains(mysql_async::consts::StatusFlags::SERVER_STATUS_IN_TRANS)
+            })
+        };
+        eprintln!("round {round} ({next}): a in_trans after its update: {:?}", st(&a));
+        b.exec_drop(format!("UPDATE {S}.t SET v = CONCAT(v, ?) WHERE k = 1"), (format!("B{round}"),))
+            .await
+            .expect("b's update");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let r: Result<String, mysql_async::Error> = match *next {
+            "select" => a
+                .exec_first::<String, _, _>(format!("SELECT v FROM {S}.t WHERE k = ?"), (1,))
+                .await
+                .map(|v| format!("{v:?}")),
+            "insert" => a
+                .exec_drop(format!("UPDATE {S}.t SET v = CONCAT(v, ?) WHERE k = 2"), (format!("A{round}"),))
+                .await
+                .map(|()| format!("affected {}", a.affected_rows())),
+            _ => a
+                .query_first::<String, _>(format!("SELECT v FROM {S}.t WHERE k = 1"))
+                .await
+                .map(|v| format!("{v:?}")),
+        };
+        eprintln!("round {round} ({next}): a's next statement -> {r:?}; in_trans {:?}", st(&a));
+        let c = a.query_drop("COMMIT").await;
+        eprintln!("round {round} ({next}): COMMIT -> {c:?}");
+        let rows: Vec<(u64, String)> = b.query(format!("SELECT k, v FROM {S}.t ORDER BY k")).await.expect("rows");
+        eprintln!("round {round} ({next}): rows now {rows:?}");
+        let _ = a.disconnect().await;
+        let _ = b.disconnect().await;
+    }
+    exec(&urls[0], &[&format!("DROP DATABASE IF EXISTS {S}")]).await;
 }

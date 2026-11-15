@@ -33,7 +33,7 @@ Commands:
   space            Spaces and shares
   inherit          Inherited tables, shares, tree-wide ids and the references that refuse deletes
   txn              In-doubt distributed transactions
-  ai               The AI assistants: providers
+  ai               The AI assistants: providers, and the administration agent's incidents
   sink             Sinks: list, show, pause, resume, reset, dead letters, connections
   graph            Graphs
   search           Search indexes and their copies on workers
@@ -508,24 +508,26 @@ Tenants
 Usage: sprigctl tenant [OPTIONS] <COMMAND>
 
 Commands:
-  create     Create a tenant and bootstrap its catalog (returns once active)
-  list       List tenants
-  show       Show a tenant: state, ancestry, catalog cluster and versions
-  delete     Delete a leaf tenant and drop its catalog
-  user       A tenant's users, created by an operator (inside the tenant, CREATE USER does the same)
-  export     Export a tenant: schemas, rows, users and grants, settings
-  import     Load a tenant export into a tenant and verify checksums and grants
-  settings   The tenant's own setting rows (tenant, database and object scope)
-  pin        Pin a tenant to its cluster and DC: the balancer won't move it; drains and residency changes report it as blocked
-  unpin      Let the balancer manage a pinned tenant again
-  suspend    Suspend a tenant and its subtree: logins fail with 39303, open sessions close (auth.close_sessions_on_revoke), triggers, sinks and schedules wait
-  resume     Resume a suspended tenant: logins and background work start again
-  move       Move a tenant to another data center, online
-  traffic    A tenant's traffic by client data center, and the move it suggests
-  failover   Fail a tenant over to its standby in another data center
-  standby    Record a standby of a tenant: a cluster in another data center that replicates its home cluster
-  residency  Show or set a tenant's data residency
-  help       Print this message or the help of the given subcommand(s)
+  create       Create a tenant and bootstrap its catalog (returns once active)
+  list         List tenants
+  show         Show a tenant: state, ancestry, catalog cluster and versions
+  delete       Delete a leaf tenant and drop its catalog
+  user         A tenant's users, created by an operator (inside the tenant, CREATE USER does the same)
+  export       Export a tenant: schemas, rows, users and grants, settings
+  import       Load a tenant export into a tenant and verify checksums and grants
+  settings     The tenant's own setting rows (tenant, database and object scope)
+  pin          Pin a tenant to its cluster and DC: the balancer won't move it; drains and residency changes report it as blocked
+  unpin        Let the balancer manage a pinned tenant again
+  suspend      Suspend a tenant and its subtree: logins fail with 39303, open sessions close (auth.close_sessions_on_revoke), triggers, sinks and schedules wait
+  resume       Resume a suspended tenant: logins and background work start again
+  issuer       The tenant's token issuers: OIDC providers whose JWTs log in, and their claim mappings
+  token-login  Let an account log in with an issuer's token over MySQL and Redis (its token method)
+  move         Move a tenant to another data center, online
+  traffic      A tenant's traffic by client data center, and the move it suggests
+  failover     Fail a tenant over to its standby in another data center
+  standby      Record a standby of a tenant: a cluster in another data center that replicates its home cluster
+  residency    Show or set a tenant's data residency
+  help         Print this message or the help of the given subcommand(s)
 
 Options:
       --endpoint <endpoint>        Admin API endpoint [default: http://127.0.0.1:7480] [env: SPRIGCTL_ENDPOINT=]
@@ -852,6 +854,129 @@ Arguments:
 
 Options:
       --endpoint <endpoint>        Admin API endpoint [default: http://127.0.0.1:7480] [env: SPRIGCTL_ENDPOINT=]
+      --token-file <token-file>    A file holding the Admin API bearer token [env: SPRIGCTL_TOKEN_FILE=]
+      --ca-file <ca-file>          For an https:// endpoint: the CA (PEM) its certificate is checked against [env: SPRIGCTL_CA_FILE=]
+      --client-cert <client-cert>  For an https:// endpoint that requires one: a client certificate (PEM) [env: SPRIGCTL_CLIENT_CERT=]
+      --client-key <client-key>    The private key (PEM) of --client-cert [env: SPRIGCTL_CLIENT_KEY=]
+      --dc <dc>                    Data center to act in
+  -o, --output <output>            Output format [default: table] [possible values: table, json, yaml]
+      --dry-run                    Show what would change
+      --yes                        Don't ask for confirmation
+  -h, --help                       Print help
+```
+
+#### `sprigctl tenant issuer`
+
+```text
+The tenant's token issuers: OIDC providers whose JWTs log in, and their claim mappings
+
+Usage: sprigctl tenant issuer [OPTIONS] <COMMAND>
+
+Commands:
+  list     List the issuers
+  put      Create or replace an issuer (by its issuer URL) with its mappings
+  disable  Disable an issuer: its tokens are refused
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --endpoint <endpoint>        Admin API endpoint [default: http://127.0.0.1:7480] [env: SPRIGCTL_ENDPOINT=]
+      --token-file <token-file>    A file holding the Admin API bearer token [env: SPRIGCTL_TOKEN_FILE=]
+      --ca-file <ca-file>          For an https:// endpoint: the CA (PEM) its certificate is checked against [env: SPRIGCTL_CA_FILE=]
+      --client-cert <client-cert>  For an https:// endpoint that requires one: a client certificate (PEM) [env: SPRIGCTL_CLIENT_CERT=]
+      --client-key <client-key>    The private key (PEM) of --client-cert [env: SPRIGCTL_CLIENT_KEY=]
+      --dc <dc>                    Data center to act in
+  -o, --output <output>            Output format [default: table] [possible values: table, json, yaml]
+      --dry-run                    Show what would change
+      --yes                        Don't ask for confirmation
+  -h, --help                       Print help
+```
+
+##### `sprigctl tenant issuer list`
+
+```text
+List the issuers
+
+Usage: sprigctl tenant issuer list [OPTIONS] <name>
+
+Arguments:
+  <name>  The tenant
+
+Options:
+      --endpoint <endpoint>        Admin API endpoint [default: http://127.0.0.1:7480] [env: SPRIGCTL_ENDPOINT=]
+      --token-file <token-file>    A file holding the Admin API bearer token [env: SPRIGCTL_TOKEN_FILE=]
+      --ca-file <ca-file>          For an https:// endpoint: the CA (PEM) its certificate is checked against [env: SPRIGCTL_CA_FILE=]
+      --client-cert <client-cert>  For an https:// endpoint that requires one: a client certificate (PEM) [env: SPRIGCTL_CLIENT_CERT=]
+      --client-key <client-key>    The private key (PEM) of --client-cert [env: SPRIGCTL_CLIENT_KEY=]
+      --dc <dc>                    Data center to act in
+  -o, --output <output>            Output format [default: table] [possible values: table, json, yaml]
+      --dry-run                    Show what would change
+      --yes                        Don't ask for confirmation
+  -h, --help                       Print help
+```
+
+##### `sprigctl tenant issuer put`
+
+```text
+Create or replace an issuer (by its issuer URL) with its mappings
+
+Usage: sprigctl tenant issuer put [OPTIONS] --spec <spec> <name>
+
+Arguments:
+  <name>  The tenant
+
+Options:
+      --endpoint <endpoint>        Admin API endpoint [default: http://127.0.0.1:7480] [env: SPRIGCTL_ENDPOINT=]
+      --spec <spec>                The issuer as JSON: a file, or - for standard input
+      --token-file <token-file>    A file holding the Admin API bearer token [env: SPRIGCTL_TOKEN_FILE=]
+      --ca-file <ca-file>          For an https:// endpoint: the CA (PEM) its certificate is checked against [env: SPRIGCTL_CA_FILE=]
+      --client-cert <client-cert>  For an https:// endpoint that requires one: a client certificate (PEM) [env: SPRIGCTL_CLIENT_CERT=]
+      --client-key <client-key>    The private key (PEM) of --client-cert [env: SPRIGCTL_CLIENT_KEY=]
+      --dc <dc>                    Data center to act in
+  -o, --output <output>            Output format [default: table] [possible values: table, json, yaml]
+      --dry-run                    Show what would change
+      --yes                        Don't ask for confirmation
+  -h, --help                       Print help
+```
+
+##### `sprigctl tenant issuer disable`
+
+```text
+Disable an issuer: its tokens are refused
+
+Usage: sprigctl tenant issuer disable [OPTIONS] <name> <issuer>
+
+Arguments:
+  <name>    The tenant
+  <issuer>  The issuer (its iss value)
+
+Options:
+      --endpoint <endpoint>        Admin API endpoint [default: http://127.0.0.1:7480] [env: SPRIGCTL_ENDPOINT=]
+      --token-file <token-file>    A file holding the Admin API bearer token [env: SPRIGCTL_TOKEN_FILE=]
+      --ca-file <ca-file>          For an https:// endpoint: the CA (PEM) its certificate is checked against [env: SPRIGCTL_CA_FILE=]
+      --client-cert <client-cert>  For an https:// endpoint that requires one: a client certificate (PEM) [env: SPRIGCTL_CLIENT_CERT=]
+      --client-key <client-key>    The private key (PEM) of --client-cert [env: SPRIGCTL_CLIENT_KEY=]
+      --dc <dc>                    Data center to act in
+  -o, --output <output>            Output format [default: table] [possible values: table, json, yaml]
+      --dry-run                    Show what would change
+      --yes                        Don't ask for confirmation
+  -h, --help                       Print help
+```
+
+#### `sprigctl tenant token-login`
+
+```text
+Let an account log in with an issuer's token over MySQL and Redis (its token method)
+
+Usage: sprigctl tenant token-login [OPTIONS] <name> <user>
+
+Arguments:
+  <name>  The tenant
+  <user>  The user name, without the tenant prefix
+
+Options:
+      --endpoint <endpoint>        Admin API endpoint [default: http://127.0.0.1:7480] [env: SPRIGCTL_ENDPOINT=]
+      --host <host>                The host pattern (default %)
+      --off                        Remove the token method instead
       --token-file <token-file>    A file holding the Admin API bearer token [env: SPRIGCTL_TOKEN_FILE=]
       --ca-file <ca-file>          For an https:// endpoint: the CA (PEM) its certificate is checked against [env: SPRIGCTL_CA_FILE=]
       --client-cert <client-cert>  For an https:// endpoint that requires one: a client certificate (PEM) [env: SPRIGCTL_CLIENT_CERT=]
@@ -3065,12 +3190,13 @@ Options:
 ### `sprigctl ai`
 
 ```text
-The AI assistants: providers
+The AI assistants: providers, and the administration agent's incidents
 
 Usage: sprigctl ai [OPTIONS] <COMMAND>
 
 Commands:
   provider  AI providers the assistants call
+  incident  Incidents the administration agent counted, triaged and advised on
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -3220,6 +3346,75 @@ Arguments:
 
 Options:
       --endpoint <endpoint>        Admin API endpoint [default: http://127.0.0.1:7480] [env: SPRIGCTL_ENDPOINT=]
+      --token-file <token-file>    A file holding the Admin API bearer token [env: SPRIGCTL_TOKEN_FILE=]
+      --ca-file <ca-file>          For an https:// endpoint: the CA (PEM) its certificate is checked against [env: SPRIGCTL_CA_FILE=]
+      --client-cert <client-cert>  For an https:// endpoint that requires one: a client certificate (PEM) [env: SPRIGCTL_CLIENT_CERT=]
+      --client-key <client-key>    The private key (PEM) of --client-cert [env: SPRIGCTL_CLIENT_KEY=]
+      --dc <dc>                    Data center to act in
+  -o, --output <output>            Output format [default: table] [possible values: table, json, yaml]
+      --dry-run                    Show what would change
+      --yes                        Don't ask for confirmation
+  -h, --help                       Print help
+```
+
+#### `sprigctl ai incident`
+
+```text
+Incidents the administration agent counted, triaged and advised on
+
+Usage: sprigctl ai incident [OPTIONS] <COMMAND>
+
+Commands:
+  list  This DC's incidents, newest first
+  show  One incident: what was sent, triage and the advice
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+      --endpoint <endpoint>        Admin API endpoint [default: http://127.0.0.1:7480] [env: SPRIGCTL_ENDPOINT=]
+      --token-file <token-file>    A file holding the Admin API bearer token [env: SPRIGCTL_TOKEN_FILE=]
+      --ca-file <ca-file>          For an https:// endpoint: the CA (PEM) its certificate is checked against [env: SPRIGCTL_CA_FILE=]
+      --client-cert <client-cert>  For an https:// endpoint that requires one: a client certificate (PEM) [env: SPRIGCTL_CLIENT_CERT=]
+      --client-key <client-key>    The private key (PEM) of --client-cert [env: SPRIGCTL_CLIENT_KEY=]
+      --dc <dc>                    Data center to act in
+  -o, --output <output>            Output format [default: table] [possible values: table, json, yaml]
+      --dry-run                    Show what would change
+      --yes                        Don't ask for confirmation
+  -h, --help                       Print help
+```
+
+##### `sprigctl ai incident list`
+
+```text
+This DC's incidents, newest first
+
+Usage: sprigctl ai incident list [OPTIONS]
+
+Options:
+      --endpoint <endpoint>        Admin API endpoint [default: http://127.0.0.1:7480] [env: SPRIGCTL_ENDPOINT=]
+      --token-file <token-file>    A file holding the Admin API bearer token [env: SPRIGCTL_TOKEN_FILE=]
+      --ca-file <ca-file>          For an https:// endpoint: the CA (PEM) its certificate is checked against [env: SPRIGCTL_CA_FILE=]
+      --client-cert <client-cert>  For an https:// endpoint that requires one: a client certificate (PEM) [env: SPRIGCTL_CLIENT_CERT=]
+      --client-key <client-key>    The private key (PEM) of --client-cert [env: SPRIGCTL_CLIENT_KEY=]
+      --dc <dc>                    Data center to act in
+  -o, --output <output>            Output format [default: table] [possible values: table, json, yaml]
+      --dry-run                    Show what would change
+      --yes                        Don't ask for confirmation
+  -h, --help                       Print help
+```
+
+##### `sprigctl ai incident show`
+
+```text
+One incident: what was sent, triage and the advice
+
+Usage: sprigctl ai incident show [OPTIONS] <fingerprint>
+
+Arguments:
+  <fingerprint>  The incident's fingerprint (12 hex digits)
+
+Options:
+      --endpoint <endpoint>        Admin API endpoint [default: http://127.0.0.1:7480] [env: SPRIGCTL_ENDPOINT=]
+      --payload                    Also print every exact payload sent to the AI provider
       --token-file <token-file>    A file holding the Admin API bearer token [env: SPRIGCTL_TOKEN_FILE=]
       --ca-file <ca-file>          For an https:// endpoint: the CA (PEM) its certificate is checked against [env: SPRIGCTL_CA_FILE=]
       --client-cert <client-cert>  For an https:// endpoint that requires one: a client certificate (PEM) [env: SPRIGCTL_CLIENT_CERT=]

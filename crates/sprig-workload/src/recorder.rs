@@ -861,22 +861,24 @@ impl Recorder {
         {
             let mut m = lock(self.shard(&key));
             if let Some(existing) = m.get_mut(&key) {
-                // Another thread inserted it (or this is "other").
+                // Another thread inserted it (or this is "other"). It may
+                // have done so after this call claimed the first sighting
+                // (`is_new`), so the sighting is still reported below.
                 if existing.bucket_start != bucket {
                     self.roll(tenant, existing, bucket);
                 }
                 self.add(existing, fp, ex, secs);
                 existing.digest.add(ex, wall);
-                return;
+            } else {
+                self.add(&mut e, fp, ex, secs);
+                e.digest.add(ex, wall);
+                e.bytes = e.heap_bytes();
+                let bytes = e.bytes;
+                m.insert(key, e);
+                self.memory.fetch_add(bytes, Ordering::Relaxed);
+                self.entries.fetch_add(1, Ordering::Relaxed);
+                lock(&self.tenants).entry(tenant).or_default().bytes += bytes;
             }
-            self.add(&mut e, fp, ex, secs);
-            e.digest.add(ex, wall);
-            e.bytes = e.heap_bytes();
-            let bytes = e.bytes;
-            m.insert(key, e);
-            self.memory.fetch_add(bytes, Ordering::Relaxed);
-            self.entries.fetch_add(1, Ordering::Relaxed);
-            lock(&self.tenants).entry(tenant).or_default().bytes += bytes;
         }
         if is_new {
             lock(&self.new).push(NewFingerprint {

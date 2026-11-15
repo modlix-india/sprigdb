@@ -2,7 +2,12 @@
 //! the test itself, the refusals, key rotation and outages, mappings, and
 //! the logins over MySQL, HTTP and MongoDB against a prebuilt catalog.
 
-#![allow(clippy::unwrap_used, clippy::too_many_lines, clippy::expect_used)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::too_many_lines,
+    clippy::expect_used,
+    clippy::many_single_char_names
+)]
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
@@ -143,7 +148,10 @@ impl Key {
     }
 
     fn sign(&self, claims: &Value) -> String {
-        self.sign_with(&json!({"alg": self.alg, "kid": self.kid, "typ": "JWT"}), claims)
+        self.sign_with(
+            &json!({"alg": self.alg, "kid": self.kid, "typ": "JWT"}),
+            claims,
+        )
     }
 }
 
@@ -279,7 +287,7 @@ fn claims(now: SystemTime, user: &str) -> Value {
            "groups": ["staff", "admins"], "org": "o-7", "iat": n, "exp": n + 600})
 }
 
-fn check<'a>(issuers: &'a [Arc<Issuer>], now: SystemTime) -> Check<'a> {
+fn check(issuers: &[Arc<Issuer>], now: SystemTime) -> Check<'_> {
     Check {
         issuers,
         protocol: TokenProtocol::Http,
@@ -300,7 +308,10 @@ fn tokens() -> ExternalTokens {
 async fn every_algorithm_verifies_with_a_local_jwks() {
     let (rsa, ec, ed) = (Key::rsa("r1"), Key::ec("e1"), Key::ed("d1"));
     let idp = Idp::start(&[&rsa, &ec, &ed]).await;
-    let issuers = vec![Arc::new(Issuer::new(spec(&idp, &["RS256", "ES256", "EdDSA"])))];
+    let issuers = vec![Arc::new(Issuer::new(spec(
+        &idp,
+        &["RS256", "ES256", "EdDSA"],
+    )))];
     let t = tokens();
     let now = SystemTime::now();
     for k in [&rsa, &ec, &ed] {
@@ -332,23 +343,64 @@ async fn bad_tokens_are_refused_with_their_reason() {
         rsa.sign(&c)
     };
     let cases: Vec<(&str, String, Refusal)> = vec![
-        ("expired", with(&|c| {
-            c["iat"] = json!(n - 1000);
-            c["exp"] = json!(n - 100);
-        }), Refusal::Expired),
-        ("wrong audience", with(&|c| c["aud"] = json!("someone-else")), Refusal::Audience),
-        ("audience list", with(&|c| c["aud"] = json!(["x", "y"])), Refusal::Audience),
-        ("wrong issuer", with(&|c| c["iss"] = json!("https://evil.test")), Refusal::UnknownIssuer),
-        ("not yet valid", with(&|c| c["nbf"] = json!(n + 600)), Refusal::NotYetValid),
-        ("issued in the future", with(&|c| c["iat"] = json!(n + 600)), Refusal::NotYetValid),
-        ("too long", with(&|c| c["exp"] = json!(n + 7200)), Refusal::Lifetime),
-        ("no exp", with(&|c| {
-            c.as_object_mut().unwrap().remove("exp");
-        }), Refusal::Malformed("no exp".into())),
-        ("another key, same kid", other.sign_with(
-            &json!({"alg": "ES256", "kid": "r1"}), &claims(now, "alice")), Refusal::Algorithm),
-        ("unknown kid", rsa.sign_with(
-            &json!({"alg": "RS256", "kid": "nope"}), &claims(now, "alice")), Refusal::UnknownKey),
+        (
+            "expired",
+            with(&|c| {
+                c["iat"] = json!(n - 1000);
+                c["exp"] = json!(n - 100);
+            }),
+            Refusal::Expired,
+        ),
+        (
+            "wrong audience",
+            with(&|c| c["aud"] = json!("someone-else")),
+            Refusal::Audience,
+        ),
+        (
+            "audience list",
+            with(&|c| c["aud"] = json!(["x", "y"])),
+            Refusal::Audience,
+        ),
+        (
+            "wrong issuer",
+            with(&|c| c["iss"] = json!("https://evil.test")),
+            Refusal::UnknownIssuer,
+        ),
+        (
+            "not yet valid",
+            with(&|c| c["nbf"] = json!(n + 600)),
+            Refusal::NotYetValid,
+        ),
+        (
+            "issued in the future",
+            with(&|c| c["iat"] = json!(n + 600)),
+            Refusal::NotYetValid,
+        ),
+        (
+            "too long",
+            with(&|c| c["exp"] = json!(n + 7200)),
+            Refusal::Lifetime,
+        ),
+        (
+            "no exp",
+            with(&|c| {
+                c.as_object_mut().unwrap().remove("exp");
+            }),
+            Refusal::Malformed("no exp".into()),
+        ),
+        (
+            "another key, same kid",
+            other.sign_with(&json!({"alg": "ES256", "kid": "r1"}), &claims(now, "alice")),
+            Refusal::Algorithm,
+        ),
+        (
+            "unknown kid",
+            rsa.sign_with(
+                &json!({"alg": "RS256", "kid": "nope"}),
+                &claims(now, "alice"),
+            ),
+            Refusal::UnknownKey,
+        ),
     ];
     for (what, tok, want) in cases {
         let got = t.verify(&tok, &check(&issuers, now)).await;
@@ -503,25 +555,73 @@ fn mappings_template_match_and_order() {
         .unwrap()
     };
     let maps = vec![
-        m(30, MappingKind::User, "email", MatchKind::Any, None, "{email}"),
-        m(10, MappingKind::User, "azp", MatchKind::Equals, Some("svc-app"), "app-{azp}"),
-        m(20, MappingKind::User, "email", MatchKind::Regex, Some(".*@corp\\.test"), "corp-{sub}"),
-        m(5, MappingKind::Role, "realm_access.roles", MatchKind::Equals, Some("dev"), "developer"),
-        m(6, MappingKind::Role, "realm_access.roles", MatchKind::Regex, Some("ad.*"), "admin"),
-        m(7, MappingKind::Role, "missing", MatchKind::Any, None, "never"),
+        m(
+            30,
+            MappingKind::User,
+            "email",
+            MatchKind::Any,
+            None,
+            "{email}",
+        ),
+        m(
+            10,
+            MappingKind::User,
+            "azp",
+            MatchKind::Equals,
+            Some("svc-app"),
+            "app-{azp}",
+        ),
+        m(
+            20,
+            MappingKind::User,
+            "email",
+            MatchKind::Regex,
+            Some(".*@corp\\.test"),
+            "corp-{sub}",
+        ),
+        m(
+            5,
+            MappingKind::Role,
+            "realm_access.roles",
+            MatchKind::Equals,
+            Some("dev"),
+            "developer",
+        ),
+        m(
+            6,
+            MappingKind::Role,
+            "realm_access.roles",
+            MatchKind::Regex,
+            Some("ad.*"),
+            "admin",
+        ),
+        m(
+            7,
+            MappingKind::Role,
+            "missing",
+            MatchKind::Any,
+            None,
+            "never",
+        ),
     ];
     let c = json!({"sub": "42", "email": "a@corp.test", "azp": "web",
                    "realm_access": {"roles": ["dev", "admin", "dev"]}});
     let r = mapping::map(&maps, &c);
     assert_eq!(r.user.as_deref(), Some("corp-42"));
     assert_eq!(r.roles, vec!["developer".to_owned(), "admin".to_owned()]);
-    let r = mapping::map(&maps, &json!({"sub": "1", "azp": "svc-app", "email": "x@y"}));
+    let r = mapping::map(
+        &maps,
+        &json!({"sub": "1", "azp": "svc-app", "email": "x@y"}),
+    );
     assert_eq!(r.user.as_deref(), Some("app-svc-app"));
     let r = mapping::map(&maps, &json!({"sub": "1", "email": "x@y"}));
     assert_eq!(r.user.as_deref(), Some("x@y"));
     // A template naming a missing claim doesn't match; nothing else does.
     assert_eq!(mapping::map(&maps, &json!({"sub": "1"})).user, None);
-    assert_eq!(mapping::expand("u-{n}", &json!({"n": 7})).as_deref(), Some("u-7"));
+    assert_eq!(
+        mapping::expand("u-{n}", &json!({"n": 7})).as_deref(),
+        Some("u-7")
+    );
     assert_eq!(mapping::expand("u-{n", &json!({"n": 7})), None);
     assert_eq!(mapping::expand("u-}", &json!({})), None);
 }
@@ -545,28 +645,37 @@ fn specs_refuse_what_never_verifies() {
     };
     base().validate().unwrap();
     for (what, f) in [
-        ("none", &(|s: &mut IssuerSpec| s.algorithms = vec!["none".into()]) as &dyn Fn(&mut IssuerSpec)),
+        (
+            "none",
+            &(|s: &mut IssuerSpec| s.algorithms = vec!["none".into()]) as &dyn Fn(&mut IssuerSpec),
+        ),
         ("HS256", &|s| s.algorithms = vec!["HS256".into()]),
         ("no audience", &|s| s.audiences.clear()),
-        ("plain http", &|s| s.jwks_url = Some("http://idp.example/jwks".into())),
+        ("plain http", &|s| {
+            s.jwks_url = Some("http://idp.example/jwks".into());
+        }),
         ("no protocol", &|s| s.protocols.clear()),
         ("zero lifetime", &|s| s.max_lifetime_s = 0),
-        ("bad regex", &|s| s.mappings.push(ClaimMapping {
-            priority: 1,
-            kind: MappingKind::User,
-            claim: "sub".into(),
-            match_kind: MatchKind::Regex,
-            match_value: Some("(".into()),
-            target: "{sub}".into(),
-        })),
-        ("value for any", &|s| s.mappings.push(ClaimMapping {
-            priority: 1,
-            kind: MappingKind::User,
-            claim: "sub".into(),
-            match_kind: MatchKind::Any,
-            match_value: Some("x".into()),
-            target: "{sub}".into(),
-        })),
+        ("bad regex", &|s| {
+            s.mappings.push(ClaimMapping {
+                priority: 1,
+                kind: MappingKind::User,
+                claim: "sub".into(),
+                match_kind: MatchKind::Regex,
+                match_value: Some("(".into()),
+                target: "{sub}".into(),
+            });
+        }),
+        ("value for any", &|s| {
+            s.mappings.push(ClaimMapping {
+                priority: 1,
+                kind: MappingKind::User,
+                claim: "sub".into(),
+                match_kind: MatchKind::Any,
+                match_value: Some("x".into()),
+                target: "{sub}".into(),
+            });
+        }),
     ] {
         let mut s = base();
         f(&mut s);
@@ -576,10 +685,9 @@ fn specs_refuse_what_never_verifies() {
     s.jwks_url = Some("http://127.0.0.1:9/jwks".into());
     s.validate().unwrap();
     // The Admin API's body: defaults for everything but issuer and audiences.
-    let s: IssuerSpec = serde_json::from_value(
-        json!({"issuer": "https://idp.example", "audiences": ["a"]}),
-    )
-    .unwrap();
+    let s: IssuerSpec =
+        serde_json::from_value(json!({"issuer": "https://idp.example", "audiences": ["a"]}))
+            .unwrap();
     assert_eq!(s.algorithms, vec!["RS256".to_owned()]);
     assert_eq!(s.protocols.len(), 4);
     assert!(s.active);
@@ -590,7 +698,7 @@ fn jwt_shape_and_parse() {
     assert!(!Jws::looks_like(b"hunter2"));
     assert!(!Jws::looks_like(b"eyJhbGciOiJSUzI1NiJ9.e30"));
     assert!(Jws::looks_like(b"eyJhbGciOiJSUzI1NiJ9.e30.c2ln"));
-    assert!(!Jws::looks_like(&[b'e'; jwt::MAX_TOKEN_BYTES + 1]));
+    assert!(!Jws::looks_like(&vec![b'e'; jwt::MAX_TOKEN_BYTES + 1]));
     let crit = format!(
         "{}.{}.c2ln",
         URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","crit":["exp"]}"#),
@@ -645,9 +753,10 @@ async fn world() -> World {
         suspended: false,
     }]));
     let mut policy = FixedPolicy::default();
-    policy
-        .0
-        .insert(crate::settings::DELAY_AFTER_FAILURES.key, sprig_settings::Value::Int(0));
+    policy.0.insert(
+        crate::settings::DELAY_AFTER_FAILURES.key,
+        sprig_settings::Value::Int(0),
+    );
     let logins = CatalogLogins::new(
         tenants,
         catalogs,
@@ -719,10 +828,16 @@ async fn mysql_takes_a_token_as_the_password_of_its_account() {
     assert_eq!(last.mechanism, Some("jwt"));
     // Another account's token: refused, with the reason in the audit.
     let (v, _) = mysql_login(&w, "acme.tok", &w.key.sign(&claims(now, "pw"))).await;
-    assert!(matches!(v, AuthVerdict::Refuse(ref e) if e.code == 1045), "{v:?}");
+    assert!(
+        matches!(v, AuthVerdict::Refuse(ref e) if e.code == 1045),
+        "{v:?}"
+    );
     let last = w.audit.events().last().cloned().unwrap();
     assert_eq!(last.event, "auth.login_failed");
-    assert_eq!(last.detail.as_deref(), Some("token: no claim mapping names this account"));
+    assert_eq!(
+        last.detail.as_deref(),
+        Some("token: no claim mapping names this account")
+    );
     // Expired.
     let mut c = claims(now, "tok");
     c["exp"] = json!(unix(now) - 3600);
@@ -740,7 +855,10 @@ async fn mysql_takes_a_token_as_the_password_of_its_account() {
     assert!(t.is_none());
     // ACCOUNT LOCK applies to token logins.
     let (v, _) = mysql_login(&w, "acme.lockd", &w.key.sign(&claims(now, "lockd"))).await;
-    assert!(matches!(v, AuthVerdict::Refuse(ref e) if e.code == 3118), "{v:?}");
+    assert!(
+        matches!(v, AuthVerdict::Refuse(ref e) if e.code == 3118),
+        "{v:?}"
+    );
 }
 
 #[tokio::test]
@@ -766,16 +884,22 @@ async fn http_bearer_tokens_name_tenant_and_account() {
     };
     let tok = w.key.sign(&claims(now, "tok"));
     let p = call(format!("Bearer {tok}"), Some("acme")).await.unwrap();
-    assert_eq!((p.tenant, p.user_id, p.user.as_str()), (Some(ACME), Some(UserId(1)), "tok"));
+    assert_eq!(
+        (p.tenant, p.user_id, p.user.as_str()),
+        (Some(ACME), Some(UserId(1)), "tok")
+    );
     // No tenant named: 39786.
     let e = call(format!("Bearer {tok}"), None).await.unwrap_err();
     assert_eq!((e.status, e.error.code), (401, 39786));
     // The mapped account lacks the token method; an unknown account
     // without jit_users.
     for user in ["pw", "nobody"] {
-        let e = call(format!("Bearer {}", w.key.sign(&claims(now, user))), Some("acme"))
-            .await
-            .unwrap_err();
+        let e = call(
+            format!("Bearer {}", w.key.sign(&claims(now, user))),
+            Some("acme"),
+        )
+        .await
+        .unwrap_err();
         assert_eq!((e.status, e.error.code), (401, 1045), "{user}");
     }
     let mut c = claims(now, "tok");
@@ -789,9 +913,12 @@ async fn http_bearer_tokens_name_tenant_and_account() {
         Some("token: wrong audience")
     );
     // A locked account: 3118.
-    let e = call(format!("Bearer {}", w.key.sign(&claims(now, "lockd"))), Some("acme"))
-        .await
-        .unwrap_err();
+    let e = call(
+        format!("Bearer {}", w.key.sign(&claims(now, "lockd"))),
+        Some("acme"),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(e.error.code, 3118);
     assert!(w.idp.hits("/jwks") >= 1);
 }
@@ -799,10 +926,16 @@ async fn http_bearer_tokens_name_tenant_and_account() {
 #[tokio::test]
 async fn mongo_logins_find_the_tenant_and_its_issuer() {
     let w = world().await;
-    assert_eq!(w.svc.tenant_named(Some("acme.x"), None).as_deref(), Some("acme"));
+    assert_eq!(
+        w.svc.tenant_named(Some("acme.x"), None).as_deref(),
+        Some("acme")
+    );
     assert_eq!(w.svc.tenant_named(None, None), None);
     let i = w.svc.mongo_issuer("acme").await.unwrap();
-    assert_eq!((i.issuer.as_str(), i.client_id.as_deref()), (ISS, Some("sprig-cli")));
+    assert_eq!(
+        (i.issuer.as_str(), i.client_id.as_deref()),
+        (ISS, Some("sprig-cli"))
+    );
     assert!(w.svc.mongo_issuer("nope").await.is_none());
     let now = w.clock.wall();
     let tok = w.key.sign(&claims(now, "tok"));
@@ -823,5 +956,8 @@ async fn mongo_logins_find_the_tenant_and_its_issuer() {
     assert_eq!(p.user, "tok");
     assert_eq!(v.roles, vec!["app_admin".to_owned()]);
     let ev = w.audit.events();
-    assert!(ev.iter().any(|e| e.event == "auth.login_succeeded" && e.protocol == "mongo"));
+    assert!(
+        ev.iter()
+            .any(|e| e.event == "auth.login_succeeded" && e.protocol == "mongo")
+    );
 }

@@ -279,4 +279,106 @@ impl Advisor {
         report.sources = r.sources;
         Ok(report)
     }
+
+    /// One turn of the admin model for the agent's other work (a health
+    /// warning, a write-up, an upgrade report's explanation): `w.text`
+    /// through the scrubber, `w.rules` after the administration prompt,
+    /// `w.tools` offered, stored as one administration conversation.
+    ///
+    /// # Errors
+    /// The turn's (39992, 39993, 39994, 39990); internal for a turn that
+    /// ended without an answer.
+    pub async fn write(&self, w: &Writing<'_>, admin: &Model) -> Result<Written> {
+        let scrubber = Arc::new(w.names.scrubber());
+        let gate = crate::egress::EgressGate::new(
+            crate::egress::EgressPolicy {
+                role: Role::Admin,
+                share_data: false,
+            },
+            Some(Arc::clone(&scrubber)),
+        );
+        let text = gate.user_text(&w.text);
+        let conv = if self.stored {
+            match self.audit.create(UserId(0), Role::Admin, &w.title).await {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "the administration agent runs unstored: the system store can't be reached");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let cfg = TurnConfig::from_settings(Role::Admin, &admin.settings, admin.model.clone());
+        let agent = Agent::new(
+            Arc::clone(&admin.provider),
+            Arc::clone(&w.tools),
+            Arc::clone(&self.audit),
+        );
+        let mut system = crate::prompt::base(Role::Admin);
+        system.push(Block::text(w.rules));
+        let r = self
+            .turn(&agent, &cfg, conv, system, &text, &scrubber)
+            .await?;
+        if let Some(e) = r.refusal() {
+            return Err(e);
+        }
+        let mut answer = r.text();
+        if answer.trim().is_empty() {
+            return Err(SprigError::internal(format!(
+                "the administration agent's turn ended without an answer ({})",
+                r.stop.label()
+            )));
+        }
+        // The operators' copy names what the placeholders stand for.
+        for id in &w.restore {
+            for kind in crate::egress::NameKind::ALL {
+                let ph = scrubber.placeholder(*kind, id);
+                if answer.contains(&ph) {
+                    answer = answer.replace(&ph, id);
+                }
+            }
+        }
+        Ok(Written {
+            intake: text,
+            text: answer.trim().to_owned(),
+            sources: r.sources,
+            conversation: conv,
+            sent: r.sent,
+        })
+    }
+}
+
+/// What [`Advisor::write`] is asked to do.
+#[derive(Debug)]
+pub struct Writing<'a> {
+    /// The conversation's title (ids only; it stays in the system store).
+    pub title: String,
+    /// The text sent, before the scrubber.
+    pub text: String,
+    /// What the model is told after the administration prompt.
+    pub rules: &'static str,
+    /// The tools offered.
+    pub tools: Arc<ToolRegistry>,
+    /// Every name that could appear.
+    pub names: &'a Names,
+    /// Ids put back into the answer where the model wrote their
+    /// placeholders, for the operators' copy (what was sent stays
+    /// scrubbed).
+    pub restore: Vec<String>,
+}
+
+/// What [`Advisor::write`] produced.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Written {
+    /// The text exactly as sent (after the scrubber).
+    pub intake: String,
+    /// The model's answer, with the ids of [`Writing::restore`] put back.
+    pub text: String,
+    /// What it drew on.
+    pub sources: Vec<Source>,
+    /// The conversation in the system store.
+    pub conversation: Option<ConvId>,
+    /// SHA-256 of each payload sent, hexadecimal.
+    pub sent: Vec<String>,
 }

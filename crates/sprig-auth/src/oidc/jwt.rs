@@ -292,7 +292,7 @@ impl Jws {
     pub fn looks_like(s: &[u8]) -> bool {
         s.starts_with(b"eyJ")
             && s.len() <= MAX_TOKEN_BYTES
-            && s.iter().filter(|&&b| b == b'.').count() == 2
+            && s.split(|&b| b == b'.').count() == 3
             && s.iter()
                 .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
     }
@@ -308,11 +308,16 @@ impl Jws {
             return Err(format!("longer than {MAX_TOKEN_BYTES} bytes"));
         }
         let mut parts = token.split('.');
-        let (Some(h), Some(p), Some(s), None) = (parts.next(), parts.next(), parts.next(), parts.next())
+        let (Some(h), Some(p), Some(s), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
         else {
             return Err("not a compact JWS".into());
         };
-        let dec = |x: &str| URL_SAFE_NO_PAD.decode(x).map_err(|_| "bad base64url".to_owned());
+        let dec = |x: &str| {
+            URL_SAFE_NO_PAD
+                .decode(x)
+                .map_err(|_| "bad base64url".to_owned())
+        };
         let header: Value =
             serde_json::from_slice(&dec(h)?).map_err(|_| "header isn't JSON".to_owned())?;
         let claims: Value =
@@ -333,7 +338,7 @@ impl Jws {
             alg,
             kid,
             claims,
-            signed: token[..h.len() + 1 + p.len()].as_bytes().to_vec(),
+            signed: token.as_bytes()[..h.len() + 1 + p.len()].to_vec(),
             signature: dec(s)?,
         })
     }
@@ -344,7 +349,7 @@ impl Jws {
         self.claims.get(k).and_then(Value::as_str)
     }
 
-    /// A NumericDate claim (seconds; fractions dropped).
+    /// A `NumericDate` claim (seconds; fractions dropped).
     #[must_use]
     pub fn time_claim(&self, k: &str) -> Option<i64> {
         let v = self.claims.get(k)?;

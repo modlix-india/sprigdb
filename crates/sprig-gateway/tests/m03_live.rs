@@ -221,8 +221,12 @@ async fn ddl_happy_paths_and_refusals() {
         .await
         .unwrap_err();
     assert_eq!(errno(&e), 39050);
-    let e = a.query_drop("CREATE USER bob").await.unwrap_err();
-    assert_eq!(errno(&e), 1227);
+    // gateway-dev.sh's app is the tenant's administrator (ALL PRIVILEGES
+    // WITH GRANT OPTION), so it may create users.
+    a.query_drop("CREATE USER m03_bob IDENTIFIED BY 'sprig-dev-app'")
+        .await
+        .unwrap();
+    a.query_drop("DROP USER m03_bob").await.unwrap();
     // Temporary tables stay on the session's connection.
     a.query_drop("CREATE TEMPORARY TABLE tmp (a INT)")
         .await
@@ -247,7 +251,9 @@ async fn settings_at_object_scope_apply_live_and_bounds_hold() {
     };
     let addr = &eps[0];
     let db = unique_ident("m03set");
-    let key = "reads.max_replica_lag_ms";
+    // An int setting with object scope (reads.max_replica_lag_ms, used
+    // before, is cluster-scoped now): default 100, hard bounds 0 to 60000.
+    let key = "reads.gtid_wait_timeout_ms";
     let mut a = conn(addr, A, None).await;
     let mut observer = conn(addr, A, None).await;
     a.query_drop(format!("CREATE DATABASE {db}")).await.unwrap();
@@ -261,7 +267,7 @@ async fn settings_at_object_scope_apply_live_and_bounds_hold() {
          WHERE TABLE_SCHEMA = '{db}' AND TABLE_NAME = 'hot' AND SETTING_NAME = '{key}'"
     );
     let start = Instant::now();
-    while strings(&mut observer, &read).await != ["1000|default"] {
+    while strings(&mut observer, &read).await != ["100|default"] {
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "the table didn't reach the observer"
@@ -291,7 +297,7 @@ async fn settings_at_object_scope_apply_live_and_bounds_hold() {
     assert!(show[0].contains("|4321|object|"), "{show:?}");
     // Outside the hard bounds: 39080, the value stays.
     let e = a
-        .query_drop(format!("ALTER TABLE {db}.hot SPRIG SET ({key} = 86400001)"))
+        .query_drop(format!("ALTER TABLE {db}.hot SPRIG SET ({key} = 60001)"))
         .await
         .unwrap_err();
     assert_eq!(errno(&e), 39080);

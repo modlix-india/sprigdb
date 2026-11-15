@@ -102,7 +102,11 @@ async fn stores() -> (Arc<dyn MetaStore>, Arc<dyn MetaStore>) {
             let cfg = EtcdConfig::new(vec![url]);
             (
                 Arc::new(EtcdStore::connect(unique_tier(), &cfg).await.unwrap()),
-                Arc::new(EtcdStore::connect(unique_tier(), &cfg).await.unwrap()),
+                // The global tier has one fixed root (`/sprig/g/`) on any
+                // etcd, and DC records, the tenant directory and least-busy
+                // placement require it; a shared etcd's global tier mustn't
+                // be written or wiped by a test, so it stays in memory.
+                Arc::new(MemStore::new(Tier::Global)),
             )
         }
         _ => (
@@ -742,8 +746,11 @@ async fn live_bootstrap_tree_settings_and_delete() {
         // c's catalog lists a live database: cleanup waits.
         assert_eq!(e.unwrap().state, "deleting");
         assert!(env.service.directory().get(idc).await.unwrap().is_some());
-        let e = env.service.cleanup(idc, &[]).await.unwrap_err();
-        assert_eq!(code(&e), 39072);
+        // (No dropper is set here, so the database stays.)
+        assert_eq!(
+            env.service.cleanup(idc, &[]).await.unwrap(),
+            Cleanup::WaitingForDatabases(1)
+        );
         let mut conn = pool.get_conn().await.unwrap();
         conn.query_drop(format!(
             "UPDATE `{}`.`databases` SET state = 'dropped'",

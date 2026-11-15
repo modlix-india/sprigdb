@@ -11,6 +11,8 @@ The administration agent watches the errors SprigDB reports. When an error is ne
 
 It sends the provider the **problem, never data**: error codes, where they happened, counts, versions and a summary of the topology. It is **off by default**.
 
+The same agent also runs health checks, drafts write-ups of failovers and checks upgrade readiness: see [AI health checks, write-ups and upgrade checks](ai-health-checks.md).
+
 ## Turning it on
 
 1. Add a provider and set the models (see [AI assistants](../tools/assistants.md#setting-up)):

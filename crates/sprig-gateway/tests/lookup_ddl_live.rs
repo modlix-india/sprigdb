@@ -1637,7 +1637,11 @@ async fn blocked_claim(a: &mut Conn, b: &mut Conn, holder: &str, waiter: &str) -
     let r = b.query_drop(waiter).await;
     let waited = started.elapsed();
     a.query_drop("ROLLBACK").await.unwrap();
-    assert_eq!(errno_of(r), Some(1205), "{waiter}: a claim blocked by another");
+    assert_eq!(
+        errno_of(r),
+        Some(1205),
+        "{waiter}: a claim blocked by another"
+    );
     waited
 }
 
@@ -1646,7 +1650,7 @@ async fn blocked_claim(a: &mut Conn, b: &mut Conn, holder: &str, waiter: &str) -
 /// - `lookup.lock_wait_seconds` at a table's scope: 1 s on `dups` with the
 ///   tenant at 6 s. A claim blocked by another session's uncommitted claim
 ///   of the same value fails with 1205 after about 1 s on `dups`, and after
-///   about 6 s on `members`.
+///   about 6 s on `accounts` (its two-column key).
 /// - The controller's scheduled orphan scan (`lookup.orphan_scan_hours` 1):
 ///   orphans planted in `uk_code`'s lookup table, with its last scan moved
 ///   two hours back, are removed at a sharding tick, and `last_scan_at`
@@ -1692,23 +1696,23 @@ async fn lock_wait_and_orphan_scan(e: &Env, ctl_metrics: Option<&str>) {
         "INSERT INTO dups VALUES (9002, 'lw1')",
     )
     .await;
-    let on_members = blocked_claim(
+    let on_accounts = blocked_claim(
         &mut a,
         &mut b,
-        "INSERT INTO members VALUES (9001, 'lw@x.org', 'a')",
-        "INSERT INTO members VALUES (9002, 'LW@x.org', 'b')",
+        "INSERT INTO accounts VALUES (9001, 1, 'lwx', 'a')",
+        "INSERT INTO accounts VALUES (9002, 1, 'LWX', 'b')",
     )
     .await;
     println!(
-        "7. a blocked claim waited {on_dups:?} on dups (table: 1 s), {on_members:?} on members (tenant: 6 s)"
+        "7. a blocked claim waited {on_dups:?} on dups (table: 1 s), {on_accounts:?} on accounts (tenant: 6 s)"
     );
     assert!(
         on_dups >= Duration::from_millis(800) && on_dups < Duration::from_secs(4),
         "{on_dups:?}"
     );
     assert!(
-        on_members >= Duration::from_secs(5) && on_members < Duration::from_secs(12),
-        "{on_members:?}"
+        on_accounts >= Duration::from_secs(5) && on_accounts < Duration::from_secs(12),
+        "{on_accounts:?}"
     );
     reset("lookup.lock_wait_seconds", &dups_scope);
     reset("lookup.lock_wait_seconds", &tenant_scope);
@@ -1776,7 +1780,15 @@ async fn lock_wait_and_orphan_scan(e: &Env, ctl_metrics: Option<&str>) {
         started.elapsed()
     );
     if let (Some(m), Some(r0)) = (ctl_metrics, removed0) {
-        let r1 = metric(m, "sprig_lookup_orphans_removed_total");
+        // Counted when the scan ends, after its last delete.
+        let mut r1 = metric(m, "sprig_lookup_orphans_removed_total");
+        for _ in 0..30 {
+            if r1 - r0 >= f64::from(planted) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            r1 = metric(m, "sprig_lookup_orphans_removed_total");
+        }
         println!("   sprig_lookup_orphans_removed_total: {r0} -> {r1}");
         assert!(r1 - r0 >= f64::from(planted), "{r0} -> {r1}");
     }
