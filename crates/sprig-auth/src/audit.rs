@@ -75,6 +75,9 @@ pub mod events {
     /// An issuer's verified token named an account that didn't exist, and
     /// the issuer creates them (`jit_users`): it was created.
     pub const USER_CREATED_JIT: &str = "auth.user_created_jit";
+    /// A token login's role mappings named roles the tenant doesn't
+    /// define: they were ignored, never created (`detail` names them).
+    pub const TOKEN_ROLES_IGNORED: &str = "auth.token_roles_ignored";
     /// Another account attribute changed (`detail` names it).
     pub const ACCOUNT_CHANGED: &str = "auth.account_changed";
     /// A login was handed to another DC (residency).

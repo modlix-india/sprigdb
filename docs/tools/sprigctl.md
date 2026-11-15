@@ -174,6 +174,10 @@ sprigctl tenant list
 sprigctl tenant show acme              # state, ancestry, catalog cluster, versions
 sprigctl tenant delete acme            # a leaf tenant; drops its catalog
 sprigctl tenant user add acme admin --password 's3cret-Passw0rd' [--host '%'] [--native] [--if-not-exists]
+sprigctl tenant issuer put acme --spec issuer.json   # register or replace an identity provider issuer
+sprigctl tenant issuer list acme
+sprigctl tenant issuer disable acme https://login.example.com/realms/acme
+sprigctl tenant token-login acme billing [--host '%'] [--off]   # the account's token login method
 sprigctl tenant settings acme [--all]  # its own setting rows; --all adds its ancestors'
 sprigctl tenant suspend acme --reason "invoice overdue"   # it and its subtree: logins 39303, sessions closed
 sprigctl tenant resume acme
@@ -181,6 +185,7 @@ sprigctl tenant resume acme
 
 - `create` without `--cluster` homes the tenant in the least busy DC its parent's residency allows; with `--cluster`, on that cluster of the controller's DC.
 - `user add` creates a user in the tenant's catalog; the user logs in as `acme.admin`. `--native` also stores a `mysql_native_password` verifier, used where the tenant's `auth.mysql_native_password` is on. Inside a tenant, administrators can also use `CREATE USER`; see [Accounts and logins](../security/accounts-and-logins.md).
+- `issuer` registers the OIDC providers and other JWT issuers whose tokens log in to the tenant, with the claim mappings that name accounts; `token-login` lets an account log in with their tokens. See [Logins with identity provider tokens](../security/external-tokens.md).
 - `delete` refuses a tenant with children (39362).
 - `suspend` needs a reason. Logins to the tenant and every tenant below it fail with 39303, open sessions get 39306 at their next statement, and triggers, sinks and scheduled runs wait until `resume`; housekeeping such as TTL expiry goes on. See [Tenant administration](../security/tenant-administration.md#suspension).
 

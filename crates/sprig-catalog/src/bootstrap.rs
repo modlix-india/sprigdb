@@ -105,6 +105,13 @@ pub async fn catalog_owner(pool: &Pool, schema: &str) -> Result<Option<String>> 
 /// there for a new tenant is an earlier tenant's (left by a deletion that
 /// didn't finish, or by a directory whose id counter was lost).
 ///
+/// A schema seen with no mark is read again before it is judged
+/// ([`settled_owner`]): MariaDB makes the schema's directory before it
+/// writes the comment, so a second bootstrap of the same tenant (the
+/// Admin API call and the `tenant_bootstrap` loop) could read an empty
+/// mark from the first one's `CREATE DATABASE` and refuse the tenant's own
+/// catalog.
+///
 /// # Errors
 /// 39070 or a backend error.
 pub async fn claim_catalog(pool: &Pool, schema: &str, owner: &str) -> Result<CatalogClaim> {
@@ -116,7 +123,7 @@ pub async fn claim_catalog(pool: &Pool, schema: &str, owner: &str) -> Result<Cat
         }
     };
     if let Some(found) = catalog_owner(pool, schema).await? {
-        return Ok(judge(found));
+        return Ok(judge(settled_owner(pool, schema, found).await?));
     }
     let mut conn = pool.get_conn().await.map_err(map_err)?;
     let created = conn
@@ -130,11 +137,37 @@ pub async fn claim_catalog(pool: &Pool, schema: &str, owner: &str) -> Result<Cat
     match created {
         Ok(()) => Ok(CatalogClaim::Created),
         // 1007: another run created it first; judge its mark.
-        Err(mysql_async::Error::Server(e)) if e.code == 1007 => Ok(judge(
-            catalog_owner(pool, schema).await?.unwrap_or_default(),
-        )),
+        Err(mysql_async::Error::Server(e)) if e.code == 1007 => {
+            let found = catalog_owner(pool, schema).await?.unwrap_or_default();
+            Ok(judge(settled_owner(pool, schema, found).await?))
+        }
         Err(e) => Err(map_err(e)),
     }
+}
+
+/// How long an empty mark is read again before it counts ([`settled_owner`]).
+pub const EMPTY_MARK_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// `found`, or, when it is empty, the schema's mark read again every 50 ms
+/// for up to [`EMPTY_MARK_SETTLE`]: a schema being created right now shows
+/// its comment within microseconds (measured on MariaDB 11.8: 1 in 300
+/// first sightings had none), while a schema made without a mark (by a
+/// migrator's `CREATE DATABASE IF NOT EXISTS`, or by hand) keeps none.
+async fn settled_owner(pool: &Pool, schema: &str, found: String) -> Result<String> {
+    if !found.is_empty() {
+        return Ok(found);
+    }
+    let end = tokio::time::Instant::now() + EMPTY_MARK_SETTLE;
+    while tokio::time::Instant::now() < end {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        match catalog_owner(pool, schema).await? {
+            Some(m) if !m.is_empty() => return Ok(m),
+            Some(_) => {}
+            // Dropped meanwhile: no one's.
+            None => return Ok(String::new()),
+        }
+    }
+    Ok(String::new())
 }
 
 /// The tenant id in a schema name shaped like a tenant's: the catalog

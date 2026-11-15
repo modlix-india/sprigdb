@@ -303,8 +303,13 @@ async fn ensure_for(
         } else {
             Vec::new()
         };
+        // The account and the deploy take catalog connections of their own
+        // from the same pool (4 per cluster); this one isn't held across
+        // them (with the stream's, a first publish needed 3 at once, fetfix).
+        drop(conn);
         let run_as = ensure_run_as(svc, t, &g, binding.is_none(), &extra).await?;
         let deployed = deploy(svc, t, &g, &text, src, run_as).await?;
+        let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
         // A new stream trigger's position.
         if let Some(si) = src.stream {
             stream_positions(svc, &mut conn, &schema, &g, si, deployed.binding_id).await?;

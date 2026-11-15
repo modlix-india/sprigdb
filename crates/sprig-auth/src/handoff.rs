@@ -57,6 +57,7 @@ use zeroize::Zeroizing;
 use crate::accounts::BackendTarget;
 use crate::audit::{self, AuditEvent};
 use crate::mysql::{LoginRequest, LoginService, MysqlLogin, Principal, max_user_len};
+use crate::oidc::{IssuerKind, TokenLogin, TokenProtocol, VerifiedToken};
 use crate::store::AccountLimits;
 
 /// Where a login is decided.
@@ -109,6 +110,34 @@ pub struct HandoffStart {
     pub can_handle_expired_password: bool,
     /// The source DC, for the target's audit event.
     pub source_dc: DcId,
+    /// A token login that names its account (HTTP bearer tokens,
+    /// `MONGODB-OIDC`): the password is the token. Absent for MySQL and
+    /// MariaDB logins, whose token, if any, is the password itself. A
+    /// target from before token hand-offs reads a MySQL login with an
+    /// empty login name, and refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_login: Option<TokenStart>,
+}
+
+/// A handed-off token login's request ([`HandoffStart::token_login`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenStart {
+    /// `http` or `mongodb`.
+    pub protocol: TokenProtocol,
+    /// The tenant's name.
+    pub tenant: String,
+}
+
+impl TokenStart {
+    /// The `protocol` label of the target's metrics and audit events.
+    fn label(&self) -> &'static str {
+        match self.protocol {
+            TokenProtocol::Mongodb => "mongo",
+            TokenProtocol::Redis => "redis",
+            TokenProtocol::Mysql => "mysql",
+            TokenProtocol::Http => "http",
+        }
+    }
 }
 
 impl std::fmt::Debug for HandoffStart {
@@ -160,15 +189,37 @@ impl HandoffStart {
             client_issuer: req.client_dn.as_ref().map(|d| d.issuer.clone()),
             can_handle_expired_password: req.can_handle_expired_password,
             source_dc,
+            token_login: None,
+        }
+    }
+
+    /// The start of a handed-off token login (see [`Self::token_login`]).
+    pub(crate) fn of_token(req: &TokenLogin<'_>, source_dc: DcId) -> Self {
+        Self {
+            persona: "mysql".into(),
+            login_name: Vec::new(),
+            sni: None,
+            client_ip: req.client_ip,
+            tls: req.tls,
+            client_cert: req.client_cert,
+            client_subject: req.client_dn.map(|d| d.subject.clone()),
+            client_issuer: req.client_dn.map(|d| d.issuer.clone()),
+            can_handle_expired_password: false,
+            source_dc,
+            token_login: Some(TokenStart {
+                protocol: req.protocol,
+                tenant: req.tenant.to_owned(),
+            }),
         }
     }
 }
 
 /// The target's decision.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum HandoffResult {
-    /// Accepted: the principal's fields.
-    Accepted(Box<Principal>),
+    /// Accepted: the principal's fields, and the issuer's token the login
+    /// used, as the target verified it (its claims and roles).
+    Accepted(Box<Principal>, Option<Box<VerifiedToken>>),
     /// Refused with this packet.
     Refused(ErrPacket),
 }
@@ -197,6 +248,9 @@ pub async fn serve_handoff(
     start: HandoffStart,
     password: &[u8],
 ) -> HandoffResult {
+    if let Some(t) = start.token_login.clone() {
+        return serve_token_handoff(svc, start, t, password).await;
+    }
     let req = start.request();
     if !matches!(svc.route_of(&req, false).await, Route::Local) {
         metrics::counter!("sprig_auth_handoffs_total", "outcome" => "misrouted").increment(1);
@@ -231,7 +285,7 @@ pub async fn serve_handoff(
                 e.tenant_name.clone_from(&p.tenant_name);
                 e.user_id = p.user_id;
                 svc.audit().emit(&e);
-                HandoffResult::Accepted(Box::new(p))
+                HandoffResult::Accepted(Box::new(p), login.token().cloned().map(Box::new))
             }
             None => HandoffResult::Refused(ErrPacket::from_error(
                 Persona::MySql84,
@@ -243,6 +297,74 @@ pub async fn serve_handoff(
             e.reason = login.refusal_reason();
             svc.audit().emit(&e);
             HandoffResult::Refused(p)
+        }
+    }
+}
+
+/// The target side of a token login's hand-off: refused (39301) outside
+/// the tenant's allowed DCs, else an ordinary token login here, whose
+/// verified token goes back with the principal.
+async fn serve_token_handoff(
+    svc: &Arc<LoginService>,
+    start: HandoffStart,
+    t: TokenStart,
+    token: &[u8],
+) -> HandoffResult {
+    if !matches!(svc.token_route(&t.tenant).await, Route::Local) {
+        metrics::counter!("sprig_auth_handoffs_total", "outcome" => "misrouted").increment(1);
+        return HandoffResult::Refused(ErrPacket::from_error(
+            Persona::MySql84,
+            &SprigError::new(
+                SprigCode::AuthUnavailable,
+                "this data center isn't allowed to decide the tenant's logins",
+            ),
+        ));
+    }
+    let Ok(token) = std::str::from_utf8(token) else {
+        return HandoffResult::Refused(ErrPacket::access_denied(
+            Persona::MySql84,
+            "",
+            &start.client_ip.to_string(),
+            true,
+        ));
+    };
+    let dn = match (&start.client_subject, &start.client_issuer) {
+        (Some(subject), Some(issuer)) => Some(crate::mysql::ClientDn {
+            subject: subject.clone(),
+            issuer: issuer.clone(),
+        }),
+        _ => None,
+    };
+    let r = svc
+        .token_login_here(&TokenLogin {
+            protocol: t.protocol,
+            label: t.label(),
+            tenant: &t.tenant,
+            token,
+            client_ip: start.client_ip,
+            tls: start.tls,
+            client_cert: start.client_cert,
+            client_dn: dn.as_ref(),
+        })
+        .await;
+    let mut e = AuditEvent::new(audit::events::HANDOFF, t.label(), svc.clock().wall());
+    e.client_ip = Some(start.client_ip);
+    e.tenant_name = Some(t.tenant.clone());
+    e.mechanism = Some("jwt");
+    e.detail = Some(format!("from {}", start.source_dc));
+    match r {
+        Ok((p, v)) => {
+            e.tenant = p.tenant;
+            e.user = Some(p.user.clone());
+            e.user_id = p.user_id;
+            svc.audit().emit(&e);
+            HandoffResult::Accepted(Box::new(p), Some(Box::new(v)))
+        }
+        Err(d) => {
+            e.outcome = "refused";
+            e.reason = Some(d.reason);
+            svc.audit().emit(&e);
+            HandoffResult::Refused(d.error)
         }
     }
 }
@@ -343,7 +465,7 @@ impl RelayLogin {
     /// An accepted principal with this gateway's backend target; a refusal
     /// (39301) when none can be had.
     fn localize(&self, r: HandoffResult) -> HandoffResult {
-        let HandoffResult::Accepted(mut p) = r else {
+        let HandoffResult::Accepted(mut p, token) = r else {
             return r;
         };
         match self.rebackend.as_ref().and_then(|f| f(&p)) {
@@ -363,14 +485,24 @@ impl RelayLogin {
             }
             None => {}
         }
-        HandoffResult::Accepted(p)
+        HandoffResult::Accepted(p, token)
     }
 
     /// The principal, once accepted.
     #[must_use]
     pub fn principal(&self) -> Option<&Principal> {
         match &self.result {
-            Some(HandoffResult::Accepted(p)) => Some(p),
+            Some(HandoffResult::Accepted(p, _)) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// The issuer's token the accepted login used, as the deciding DC
+    /// verified it.
+    #[must_use]
+    pub fn token(&self) -> Option<&VerifiedToken> {
+        match &self.result {
+            Some(HandoffResult::Accepted(_, t)) => t.as_deref(),
             _ => None,
         }
     }
@@ -405,7 +537,7 @@ impl LoginFlow for RelayLogin {
                     let r = self.localize(r);
                     metrics::counter!("sprig_auth_handoffs_total", "outcome" => "decided")
                         .increment(1);
-                    let ok = matches!(r, HandoffResult::Accepted(_));
+                    let ok = matches!(r, HandoffResult::Accepted(..));
                     self.result = Some(r);
                     return ok;
                 }
@@ -422,7 +554,7 @@ impl LoginFlow for RelayLogin {
     async fn decide(&mut self, outcome: Outcome, _path: AuthPath) -> AuthVerdict {
         let persona = self.req.persona;
         match (&self.result, outcome) {
-            (Some(HandoffResult::Accepted(_)), Outcome::Verified) => AuthVerdict::Accept,
+            (Some(HandoffResult::Accepted(..)), Outcome::Verified) => AuthVerdict::Accept,
             (Some(HandoffResult::Refused(p)), _) => AuthVerdict::Refuse(p.clone()),
             (None, Outcome::WrongCredentials | Outcome::Verified)
                 if self.used_password && !self.dcs.is_empty() =>
@@ -590,6 +722,18 @@ impl ResidentLogin {
         }
     }
 
+    /// The issuer's token the accepted login used (its claims are the
+    /// session's `SPRIG_CLAIM()` values, and give its token roles), whether
+    /// decided here or in the DC it was handed to.
+    #[must_use]
+    pub fn token(&self) -> Option<&VerifiedToken> {
+        match self {
+            Self::Local(l) => l.token(),
+            Self::Relay(r) => r.token(),
+            Self::Deny(_) => None,
+        }
+    }
+
     /// The local login, if decided here (its file account, its refusal
     /// reason).
     #[must_use]
@@ -685,6 +829,77 @@ pub struct PrincipalWire {
     pub backend_user: String,
     /// The backend credential's reference.
     pub backend_credentials: String,
+    /// The issuer's token the login used, as the deciding DC verified it.
+    /// A target from before token hand-offs sends none: the session then
+    /// has no claims and no token roles, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<TokenWire>,
+}
+
+/// A verified token on the wire: what the deciding DC verified, for the
+/// source's session (`SPRIG_CLAIM()` and token roles). The source can't
+/// verify it again (the tenant's issuers and their keys stay in its
+/// allowed DCs' logins), so it takes it, like the principal, from the
+/// mutually authenticated peer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenWire {
+    /// The issuer's id.
+    pub issuer_id: u32,
+    /// `iss`.
+    pub issuer: String,
+    /// OIDC provider or end-user layer.
+    pub kind: IssuerKind,
+    /// Whether the issuer creates mapped accounts.
+    pub jit_users: bool,
+    /// Every verified claim, as JSON text.
+    pub claims: String,
+    /// The account its user mapping named.
+    pub user: Option<String>,
+    /// The roles its role mappings gave at the deciding DC.
+    pub roles: Vec<String>,
+    /// `exp`, in seconds since the Unix epoch.
+    pub expires: u64,
+}
+
+impl TokenWire {
+    /// The wire form of `t`.
+    #[must_use]
+    pub fn of(t: &VerifiedToken) -> Self {
+        Self {
+            issuer_id: t.issuer_id,
+            issuer: t.issuer.clone(),
+            kind: t.kind,
+            jit_users: t.jit_users,
+            claims: t.claims.to_string(),
+            user: t.user.clone(),
+            roles: t.roles.clone(),
+            expires: t
+                .expires
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+        }
+    }
+
+    /// The token.
+    ///
+    /// # Errors
+    /// Internal when the claims aren't a JSON object.
+    pub fn token(&self) -> Result<VerifiedToken> {
+        let claims: serde_json::Value = serde_json::from_str(&self.claims)
+            .ok()
+            .filter(serde_json::Value::is_object)
+            .ok_or_else(|| SprigError::internal("handoff token: claims aren't an object"))?;
+        Ok(VerifiedToken {
+            issuer_id: self.issuer_id,
+            issuer: self.issuer.clone(),
+            kind: self.kind,
+            jit_users: self.jit_users,
+            claims: Arc::new(claims),
+            user: self.user.clone(),
+            roles: self.roles.clone(),
+            expires: std::time::UNIX_EPOCH + std::time::Duration::from_secs(self.expires),
+        })
+    }
 }
 
 impl PrincipalWire {
@@ -712,7 +927,26 @@ impl PrincipalWire {
                 sprig_provision::credentials::SecretSource::Resolved(_) => UNRESOLVED.to_owned(),
                 _ => p.backend.credentials.to_string(),
             },
+            token: None,
         }
+    }
+
+    /// The wire form of an accepted hand-off: the principal and the
+    /// token it used.
+    #[must_use]
+    pub fn accepted(p: &Principal, token: Option<&VerifiedToken>) -> Self {
+        Self {
+            token: token.map(TokenWire::of),
+            ..Self::of(p)
+        }
+    }
+
+    /// The token, if one crossed.
+    ///
+    /// # Errors
+    /// Internal for malformed claims.
+    pub fn verified_token(&self) -> Result<Option<VerifiedToken>> {
+        self.token.as_ref().map(TokenWire::token).transpose()
     }
 
     /// The principal.

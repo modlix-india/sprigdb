@@ -1160,10 +1160,6 @@ impl SprigCode {
             "Reserved: a geographic SRID other than 4326; not raised in this version.",
         ),
         (
-            SprigCode::TenantAmbiguous,
-            "Reserved: a token whose issuer several tenants trust, with no SNI or x-sprig-tenant to pick one; token logins aren't offered in this version.",
-        ),
-        (
             SprigCode::SearchNoPlacement,
             "Reserved: no worker in an allowed data center can hold a search index's copies; not raised in this version.",
         ),

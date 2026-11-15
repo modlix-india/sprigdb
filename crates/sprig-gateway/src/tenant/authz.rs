@@ -566,6 +566,9 @@ pub struct SessionAuthz {
     /// The engine, from the first compile on (`None` before, and for an
     /// unknown `auth.authorizer`).
     engine: std::sync::OnceLock<Option<Arc<dyn Authorizer>>>,
+    /// The token roles at an auth version: what the role mappings of the
+    /// session's token give it ([`token_roles`]).
+    token: Mutex<Option<(u64, Vec<RoleId>)>>,
 }
 
 impl SessionAuthz {
@@ -585,6 +588,31 @@ impl SessionAuthz {
     pub fn active(&self) -> Vec<RoleId> {
         lock(&self.active).clone().unwrap_or_default()
     }
+
+    /// Forgets the token roles (the session's claims changed).
+    pub fn forget_token_roles(&self) {
+        *lock(&self.token) = None;
+        self.invalidate();
+    }
+}
+
+/// The session's token roles at `cat` (chapter 29, "Token roles"): the role
+/// mappings of its verified token's issuer, evaluated on its claims at
+/// each auth version, as roles the tenant defines. Empty without a token.
+#[must_use]
+pub fn token_roles(ts: &TenantSession, cat: &TenantCatalog) -> Vec<RoleId> {
+    let Some(claims) = ts.rls.claims.as_deref() else {
+        return Vec::new();
+    };
+    let mut t = lock(&ts.authz.token);
+    if let Some((v, roles)) = &*t
+        && *v == cat.auth_version
+    {
+        return roles.clone();
+    }
+    let roles = sprig_auth::oidc::roles::session_roles(cat, claims);
+    *t = Some((cat.auth_version, roles.clone()));
+    roles
 }
 
 /// `CURRENT_ROLE()` for the session: the active roles, as MySQL 8.4 prints
@@ -644,6 +672,9 @@ pub fn privileges(ts: &TenantSession, cat: &TenantCatalog) -> Arc<dyn SessionGra
     let Some(engine) = session_engine(ts, cat) else {
         return nothing();
     };
+    // Token roles are granted for the session's life and active from
+    // login with the default roles; SET ROLE may drop them.
+    let token = token_roles(ts, cat);
     let active = {
         let mut a = lock(&ts.authz.active);
         let all = || {
@@ -654,9 +685,22 @@ pub fn privileges(ts: &TenantSession, cat: &TenantCatalog) -> Arc<dyn SessionGra
             )
         };
         if a.is_none() {
-            *a = Some(engine.active_roles(cat, user, None, all()));
+            let mut at_login = engine.active_roles(cat, user, None, all());
+            for r in &token {
+                if !at_login.contains(r) {
+                    at_login.push(*r);
+                }
+            }
+            *a = Some(at_login);
         }
-        engine.active_roles(cat, user, a.as_deref(), false)
+        let chosen = a.as_deref().unwrap_or_default();
+        let mut active = engine.active_roles(cat, user, Some(chosen), false);
+        for r in chosen {
+            if token.contains(r) && !active.contains(r) {
+                active.push(*r);
+            }
+        }
+        active
     };
     let mut g = lock(&ts.authz.compiled);
     if let Some((a, c, roles, p)) = &*g
@@ -779,6 +823,7 @@ pub async fn account_statement(
     let client_host = ts.principal.client_ip.to_string();
     let lctn = ts.lower_case_table_names();
     let active = ts.authz.active();
+    let token = token_roles(ts, cat);
     let policy = sprig_auth::SettingsPolicy::new(svc.settings.clone(), svc.dc.clone());
     let audit = sprig_auth::audit::LogAudit::default();
     let tenant_name = ts.principal.tenant_name.clone();
@@ -799,6 +844,7 @@ pub async fn account_statement(
             lower_case_table_names: lctn,
             privileges: &*compiled,
             active_roles: &active,
+            token_roles: &token,
             hashing,
             unsafe_error,
             partial_revokes,

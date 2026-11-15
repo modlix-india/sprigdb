@@ -66,6 +66,21 @@ impl Scanner {
                 i = text[i + 2..].find("*/").map_or(b.len(), |p| i + 2 + p + 2);
                 continue;
             }
+            if let Some(end) = raw_string_end(b, i) {
+                i = end;
+                continue;
+            }
+            // A quote as a char literal ('"', '\"', b'"') starts no string.
+            if b[i] == b'\'' {
+                if b[i + 1..].starts_with(b"\"'") {
+                    i += 3;
+                    continue;
+                }
+                if b[i + 1..].starts_with(b"\\\"'") {
+                    i += 4;
+                    continue;
+                }
+            }
             if b[i] == b'"' {
                 i = string_end(b, i);
                 continue;
@@ -128,6 +143,36 @@ fn memchr(b: &[u8], from: usize, c: u8) -> usize {
         .iter()
         .position(|&x| x == c)
         .map_or(b.len(), |p| from + p)
+}
+
+/// The index just past the raw string literal (`r"..."`, `r#"..."#`,
+/// `br"..."`) whose `r` is at `start`; `None` when none starts there.
+fn raw_string_end(b: &[u8], start: usize) -> Option<usize> {
+    if b[start] != b'r' {
+        return None;
+    }
+    let before = |k: usize| start.checked_sub(k).map(|j| b[j]);
+    let prefix_ok = match before(1) {
+        None => true,
+        Some(b'b') => before(2).is_none_or(|c| !is_ident(c)),
+        Some(c) => !is_ident(c),
+    };
+    if !prefix_ok {
+        return None;
+    }
+    let hashes = b[start + 1..].iter().take_while(|&&c| c == b'#').count();
+    let open = start + 1 + hashes;
+    if b.get(open) != Some(&b'"') {
+        return None;
+    }
+    let mut close = Vec::with_capacity(hashes + 1);
+    close.push(b'"');
+    close.extend(std::iter::repeat_n(b'#', hashes));
+    let end = b[open + 1..]
+        .windows(close.len())
+        .position(|w| w == close.as_slice())
+        .map_or(b.len(), |p| open + 1 + p + close.len());
+    Some(end)
 }
 
 /// The index just past the string literal starting at `start` (a `"`).
@@ -232,5 +277,28 @@ mod tests {
             "/// p95 4.2 s → ~40 ms · é\nlet x = \"ä\"; counter!(\"sprig_ok_total\", \"kind\" => \"π\");",
         );
         assert_eq!(s.metrics()[0].name, "sprig_ok_total");
+    }
+
+    #[test]
+    fn a_quote_char_literal_starts_no_string() {
+        let mut s = Scanner::default();
+        s.scan(
+            "sprig-z",
+            "let q = matches!(c, '\\'' | '\"'); let e = b'\"'; let f = '\\\"';\n\
+             histogram!(\"sprig_after_quotes_seconds\").record(1.0);",
+        );
+        assert_eq!(s.metrics()[0].name, "sprig_after_quotes_seconds");
+    }
+
+    #[test]
+    fn raw_strings_are_skipped() {
+        let mut s = Scanner::default();
+        s.scan(
+            "sprig-z",
+            "let a = r#\"histogram!(\"sprig_in_raw\") \\\"#; let b = br\"x\\\";\n\
+             counter!(\"sprig_after_raw_total\").increment(1);",
+        );
+        let names: Vec<_> = s.metrics().into_iter().map(|m| m.name).collect();
+        assert_eq!(names, ["sprig_after_raw_total"]);
     }
 }

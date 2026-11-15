@@ -3995,3 +3995,126 @@ async fn inherited_change_exchange_exactly_once() {
     clean_db(&mut sys, "cxi").await;
     assert!(failed.is_empty(), "{failed:#?}");
 }
+
+const POOL_TRIGGER: &str = r"
+CREATE TRIGGER fpool.on_pool ON STREAM fpool.pool_events
+  FOR EACH TENANT GRANTS (INSERT ON fpool_app.seen)
+  LANGUAGE javascript AS $$
+export default function (ctx) {
+  db.exec('INSERT INTO fpool_app.seen (k) VALUES (?)', [String(ctx.record.key)]);
+}
+$$";
+
+/// A first `FOR TENANT` publish while two of the cluster's four catalog
+/// connections are busy elsewhere (fetfix, after r9feed5's 39070 "catalog
+/// begin timed out after 5000 ms" in `for_each_tenant_end_to_end`): the
+/// member's instance, its settings and its trigger with `GRANTS` are made
+/// with at most one catalog connection held while another is asked for.
+/// Before, the stream's connection and the trigger's were both held while
+/// the account and the deploy took a third, so two busy ones made it time
+/// out. Two DDL sessions of another member wait on its catalog version row,
+/// locked from a root session, holding a connection each.
+#[tokio::test]
+async fn first_publish_with_the_catalog_pool_half_busy() {
+    let Some(e) = env("first_publish_with_the_catalog_pool_half_busy") else {
+        return;
+    };
+    let (Some(root), Some(busy_id)) = (
+        var("SPRIG_TEST_INHERIT_ROOT"),
+        e.members.get(2).and_then(|m| tenant_id_of(m)),
+    ) else {
+        eprintln!(
+            "needs SPRIG_TEST_INHERIT_ROOT, SPRIG_TEST_INHERIT_IDS and three members: skipped"
+        );
+        return;
+    };
+    let mut sys = conn(&e.addr, &e.system).await;
+    let _leftovers = Leftovers::dbs(&e, &["fpool"]);
+    let (m0, busy) = (e.members[0].clone(), e.members[2].clone());
+    let mut c0 = conn(&e.addr, &m0).await;
+    let _ = sql(&mut sys, "DROP TRIGGER fpool.on_pool").await;
+    let _ = sql(&mut sys, "DROP STREAM fpool.pool_events IMMEDIATE CASCADE").await;
+    clean_db(&mut sys, "fpool").await;
+    for q in [
+        "DROP DATABASE IF EXISTS fpool",
+        "DROP DATABASE IF EXISTS fpool_app",
+        "CREATE DATABASE fpool_app",
+        "CREATE TABLE fpool_app.seen (k VARCHAR(20) PRIMARY KEY)",
+    ] {
+        ok(&mut c0, q).await;
+    }
+    ok(&mut sys, "CREATE DATABASE fpool").await;
+    // RETENTION: the member's instance gets its own setting (a catalog change).
+    ok(
+        &mut sys,
+        "CREATE STREAM fpool.pool_events FOR EACH TENANT PARTITIONS 1 RETENTION '2 days'",
+    )
+    .await;
+    ok(&mut sys, POOL_TRIGGER).await;
+    let mut cb = conn(&e.addr, &busy).await;
+    ok(&mut cb, "CREATE DATABASE IF NOT EXISTS fpool_hold").await;
+
+    // Two busy catalog connections.
+    let mut r = Conn::from_url(&root).await.unwrap();
+    ok(&mut r, "START TRANSACTION").await;
+    ok(
+        &mut r,
+        &format!(
+            "SELECT value FROM t{busy_id}_sprig.settings WHERE scope_kind = 'tenant' AND \
+             scope_id = 0 AND setting_key = 'sprig.catalog_version' FOR UPDATE"
+        ),
+    )
+    .await;
+    let mut held = Vec::new();
+    for i in 0..2 {
+        let (addr, busy) = (e.addr.clone(), busy.clone());
+        held.push(tokio::spawn(async move {
+            let mut c = conn(&addr, &busy).await;
+            let r = sql(&mut c, &format!("CREATE TABLE fpool_hold.h{i} (a INT)")).await;
+            let _ = c.disconnect().await;
+            r.err()
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let waiting = count(
+        &mut r,
+        "SELECT COUNT(*) FROM information_schema.processlist WHERE info LIKE \
+         '%setting_key%FOR UPDATE%' AND id <> CONNECTION_ID()",
+    )
+    .await;
+    let t0 = Instant::now();
+    let got = sql(
+        &mut sys,
+        &format!("INSERT INTO fpool.pool_events FOR TENANT {m0} (key, value) VALUES ('k1', 'v1')"),
+    )
+    .await;
+    let took = t0.elapsed();
+    ok(&mut r, "ROLLBACK").await;
+    let _ = r.disconnect().await;
+    let mut held_errs = Vec::new();
+    for h in held {
+        held_errs.push(h.await.unwrap());
+    }
+    println!(
+        "first publish with {waiting} catalog connections busy: {:?} in {took:?}; the busy \
+         sessions' DDL: {held_errs:?}",
+        got.as_ref().map(|_| "ok")
+    );
+    assert!(
+        waiting >= 2,
+        "two DDL sessions should wait on the version row: {waiting}"
+    );
+    assert!(got.is_ok(), "{got:?}");
+    assert_eq!(
+        wait_count(&mut c0, "SELECT COUNT(*) FROM fpool_app.seen", 1, 60).await,
+        1,
+        "the member's trigger ran"
+    );
+
+    let _ = sql(&mut cb, "DROP DATABASE IF EXISTS fpool_hold").await;
+    ok(&mut sys, "DROP TRIGGER fpool.on_pool").await;
+    ok(&mut sys, "DROP STREAM fpool.pool_events IMMEDIATE CASCADE").await;
+    clean_db(&mut sys, "fpool").await;
+    let _ = sql(&mut c0, "DROP DATABASE IF EXISTS fpool").await;
+    ok(&mut c0, "DROP DATABASE fpool_app").await;
+}

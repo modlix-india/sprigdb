@@ -64,6 +64,8 @@ WRONGPASS invalid username-password pair or user is disabled.
 
 The login runs the same checks as on the other protocols: account locks, expired passwords, `REQUIRE SSL`, `auth.require_tls`, failure delays and the per-address limit. Accounts with `REQUIRE X509`, `REQUIRE SUBJECT` or `REQUIRE ISSUER` need a matching client certificate on the connection (`redis-cli --tls --cert client.pem --key client-key.pem`) and `listener.redis.client_cert` set. A Redis login gives no reason for a refusal; every refusal is `WRONGPASS`. `AUTH` again on the same connection switches to the new user, after ending the old user's subscriptions.
 
+An account with the `token` login method can send a token from the tenant's identity provider as the password: `AUTH acme.billing <token>`. See [Logins with identity provider tokens](../security/external-tokens.md#redis).
+
 Redis `ACL` users don't exist separately: `ACL WHOAMI`, `ACL LIST`, `ACL USERS`, `ACL GETUSER` and `ACL CAT` answer, but `ACL SETUSER`, `ACL DELUSER` and the other changes fail with 39842. Manage users with SQL instead. See [Accounts and logins](../security/accounts-and-logins.md).
 
 ### Naming the client's data centre

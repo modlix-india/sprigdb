@@ -50,13 +50,14 @@ A request whose `content-type` starts with `application/grpc` goes to gRPC; anyt
 
 ## Authenticate
 
-Every data call carries an `Authorization` header (gRPC: `authorization` metadata). Three credentials work:
+Every data call carries an `Authorization` header (gRPC: `authorization` metadata). Four credentials work:
 
 | Credential | Header | Notes |
 |---|---|---|
 | Password | `Authorization: Basic base64(acme.app:<password>)` | Checked like a MySQL login of the same user, on every request; after the first, a request costs two SHA-256 hashes |
 | API key | `Authorization: Bearer sprig_acme_<key-id>_<secret>` | The key names its tenant and user |
 | Session token | `Authorization: Bearer sprigat_...` | From `POST /v1/auth/login`, short-lived |
+| Identity provider token | `Authorization: Bearer eyJ...` | A JWT from an issuer the tenant registered; name the tenant with its host name or `x-sprig-tenant`. See [Identity provider tokens](#identity-provider-tokens) |
 
 With Basic, the user name names the tenant: `acme.app` is user `app` of tenant `acme`. Alternatively send the plain user name with the header `x-sprig-tenant: acme`.
 
@@ -67,6 +68,7 @@ Client-certificate requirements are checked too, on Basic, on API keys and on th
 | Refusal | Status | Body `code` |
 |---|---|---|
 | Wrong or missing credentials, locked or expired account | 401, with `WWW-Authenticate: Basic realm="sprigdb", Bearer` | 1045, 3118, 3955 or 1862 |
+| An identity provider's token, with no tenant host name or `x-sprig-tenant` | 401 | 39786 |
 | Tenant suspended | 403 | 39303 |
 | Too many failed logins from your address | 429, with `Retry-After` | 39300 |
 | Credentials can't be checked right now | 503, with `Retry-After` | 39301 |
@@ -109,6 +111,18 @@ curl https://db.example.com:8443/v1/auth/login -H 'content-type: application/jso
 ```
 
 With `"refresh_transport": "body"` the refresh token comes in the body; otherwise it is set as an `HttpOnly` cookie, and later cookie calls need the `X-Sprig-CSRF` header. `POST /v1/auth/refresh` rotates it and `POST /v1/auth/logout` ends the session. When the tenant requires a second factor (`auth.mfa_required`), the login answers with a challenge that `POST /v1/auth/mfa` completes. A password login over plain HTTP from another host is refused with 403 (39921), unless `studio.allow_insecure_http` is on.
+
+### Identity provider tokens
+
+A tenant can register OIDC providers and other JWT issuers whose tokens log in. Send the token as a bearer token, and name the tenant with the `x-sprig-tenant` header (or connect to the tenant's endpoint, `acme.db.example.com`):
+
+```sh
+curl -s https://db.example.com:8443/v1/databases/shop/sql:query \
+  -H "Authorization: Bearer $TOKEN" -H 'x-sprig-tenant: acme' \
+  -H 'content-type: application/json' -d '{"sql": "SELECT COUNT(*) FROM orders"}'
+```
+
+The token's claims name the account, and row-level security policies read them with `SPRIG_CLAIM`. A refused token gets 401 with 1045; the reason is in the audit log. See [Logins with identity provider tokens](../security/external-tokens.md#rest-and-grpc).
 
 ## Run SQL
 
@@ -269,7 +283,7 @@ Responses with 429 and 503 carry `Retry-After`. An error after a streamed answer
 |---|---|---|
 | 400 | 39785 | A `sql:execute` result over `api.rest.max_buffered_bytes`; use `sql:query` |
 | 400 | 39794 | An unknown `language`, or a graph or MongoDB statement with a transaction handle or `multi_statements` |
-| 401 | 1045 and others | See [Authenticate](#authenticate) |
+| 401 | 1045, 39786 and others | See [Authenticate](#authenticate) |
 | 403 | 39783 | Another principal's transaction handle |
 | 409 | 39781, 39782 | An unknown or expired transaction handle |
 | 413 | 39787 | A request over `api.max_request_bytes` |

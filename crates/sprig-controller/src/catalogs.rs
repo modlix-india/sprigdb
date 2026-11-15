@@ -624,7 +624,8 @@ pub async fn migrate_catalog(
         .run(
             conn,
             schema,
-            &sprig_catalog::migrate::MigrateOpts::default(),
+            // Never made here: only bootstrap creates a catalog, marked.
+            &sprig_catalog::migrate::MigrateOpts::existing(),
         )
         .await?;
     Ok(())

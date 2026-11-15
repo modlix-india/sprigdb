@@ -77,6 +77,8 @@ The database in the connection (`shop` above, or `CONNECT_WITH_DB` from a driver
 
 The same user and password work on every SprigDB protocol. See [Connect to SprigDB](overview.md#one-user-every-protocol).
 
+An account with the `token` login method can also log in with a token from the tenant's identity provider: send the token as the password, over TLS, with the default plugin or `mysql_clear_password`. The token's claims are then available to row-level security policies through `SPRIG_CLAIM`. See [Logins with identity provider tokens](../security/external-tokens.md#mysql-and-mariadb).
+
 ### Authentication plugins
 
 | Plugin | Supported | Notes |

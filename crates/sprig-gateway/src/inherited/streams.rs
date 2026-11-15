@@ -186,16 +186,22 @@ pub async fn ensure(
     let ep = svc.locator.writer(t).await?;
     let schema = ep.store.schema().to_owned();
     let store = MsgStore::new(&schema);
-    let mut conn = ep.pool.get_conn().await.map_err(|e| {
-        SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-    })?;
     let deadline = Instant::now() + Duration::from_millis(wait_ms);
     let key = def.key();
     let mut created = false;
     loop {
+        // A catalog connection for this round's reads and claim only,
+        // dropped before the creation and the triggers, which take their
+        // own from the same pool (4 per cluster). Held across them, one
+        // publish needed 3 at once and failed with 39070 ("catalog begin
+        // timed out") whenever two were busy elsewhere (fetfix).
+        let mut conn = ep.pool.get_conn().await.map_err(|e| {
+            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
+        })?;
         let row = store.instance(&mut conn, key).await?;
         match row {
             Some(i) if i.state == InstanceState::Active => {
+                drop(conn);
                 // Committed; wait for this gateway's snapshot to have it.
                 loop {
                     cat = catalog(svc, t).await?;
@@ -220,7 +226,9 @@ pub async fn ensure(
                 }
             }
             Some(i) if i.state == InstanceState::Creating => {
-                if store.take_over(&mut conn, key, 30_000).await? {
+                let mine = store.take_over(&mut conn, key, 30_000).await?;
+                drop(conn);
+                if mine {
                     create(svc, t, def, i.instance_id).await?;
                     created = true;
                     continue;
@@ -264,7 +272,9 @@ pub async fn ensure(
                     physical: Some(json!({"db": def.db_name, "name": def.name})),
                     created_at_ms: 0,
                 };
-                if store.claim(&mut conn, &row).await? {
+                let claimed = store.claim(&mut conn, &row).await?;
+                drop(conn);
+                if claimed {
                     let started = Instant::now();
                     if let Err(e) = create_retrying(svc, t, def, id).await {
                         tracing::warn!(tenant = %t, def = %key, error = %e, "inherited stream instance not created; the next use retries");
@@ -659,6 +669,8 @@ async fn create(svc: &Arc<TenantServices>, t: TenantId, def: &Definition, id: u6
                         &def.definition,
                     )
                     .await?;
+                // The change takes its own connection.
+                drop(conn);
                 // Every gateway reloads the member at its next version.
                 let c = svc.catalog.change(t, VersionKind::Catalog).await?;
                 c.commit().await?;

@@ -198,9 +198,23 @@ struct Current {
     /// `finish` drops the statement. A light child of the request's span,
     /// not a `tracing` span.
     span: Option<sprig_common::telemetry::trace::ChildSpan>,
+    /// A plain `SELECT`, `INSERT`, `UPDATE`, `DELETE` or `REPLACE` inside
+    /// a transaction on Galera: it can't end the transaction, so an answer
+    /// saying the transaction is gone means Galera aborted it silently
+    /// (decision HD27).
+    galera_dml_in_trx: bool,
 }
 
 impl Current {
+    /// Whether `p` ends this statement saying no transaction is open, for
+    /// a statement that can't end one (see `galera_dml_in_trx`).
+    fn ended_silently(&self, p: &RespPacket) -> bool {
+        self.galera_dml_in_trx
+            && p.status().is_some_and(|s| {
+                !s.contains(StatusFlags::IN_TRANS) && !s.contains(StatusFlags::MORE_RESULTS_EXISTS)
+            })
+    }
+
     fn observe(&mut self, p: &RespPacket) {
         match &p.kind {
             PacketKind::Ok(ok) => {
@@ -330,6 +344,82 @@ fn backend_err(e: &ErrPacket) -> SprigError {
 }
 
 /// Server errors after which the server closes the connection.
+/// Whether a transaction state (`session_track_transaction_info =
+/// STATE`, such as `T___W___`) says the transaction wrote transactional
+/// tables.
+fn trx_wrote(state: &str) -> bool {
+    state.as_bytes().get(4) == Some(&b'W')
+}
+
+/// Whether a Galera COMMIT answered `ok` produced no GTID: the transaction
+/// that wrote was rolled back without an error (decision HD27). Galera can
+/// abort a transaction for another node's conflicting write set while it
+/// runs a statement that doesn't wait for locks, answer that statement
+/// normally, and then answer COMMIT with OK: nothing was written. The OK
+/// of a commit that wrote reports its GTID (`last_gtid`); without one, the
+/// GTID is read, since MariaDB 11.8 can report `timestamp` in its place.
+/// A GTID that can't be read counts as written: only a known non-commit is
+/// turned into an error.
+async fn commit_wrote_nothing(cur: &mut Current, ok: &RespPacket, before: Option<&str>) -> bool {
+    if let Some(g) = ok.tracked.gtid.as_deref() {
+        return gtid_unchanged(before, g);
+    }
+    match cur.lease.conn().capture_last_gtid().await {
+        Ok(g) => gtid_unchanged(before, &g),
+        Err(e) => {
+            tracing::debug!(error = %e, "reading last_gtid after a Galera commit failed");
+            false
+        }
+    }
+}
+
+/// Whether `sql` is a plain `SELECT`, `INSERT`, `UPDATE`, `DELETE`,
+/// `REPLACE` or `WITH`: a statement that can't end a transaction (stored
+/// functions and triggers can't commit). Leading comments make it `false`.
+fn plain_dml(sql: &[u8]) -> bool {
+    let s = sql.trim_ascii_start();
+    let word = s
+        .iter()
+        .position(|b| !b.is_ascii_alphabetic())
+        .map_or(s, |n| &s[..n]);
+    ["SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE", "WITH"]
+        .iter()
+        .any(|k| word.eq_ignore_ascii_case(k.as_bytes()))
+}
+
+/// Logs and counts a transaction Galera rolled back while answering OK
+/// (`what`: the statement whose answer showed it).
+fn note_silent_abort(cluster: &sprig_common::ids::ClusterId, node: &NodeKey, what: &str) {
+    tracing::warn!(
+        node = %node,
+        "Galera answered {what} with OK, but the transaction was rolled back and wrote nothing; answering 1213"
+    );
+    metrics::counter!("sprig_backend_silent_aborts_total", "cluster" => cluster.to_string())
+        .increment(1);
+}
+
+/// Whether the connection's GTID after a commit (`after`, empty for none)
+/// is the one it had before (`before`): the commit wrote nothing.
+fn gtid_unchanged(before: Option<&str>, after: &str) -> bool {
+    after.is_empty() || before == Some(after)
+}
+
+/// The answer to a COMMIT that wrote nothing: MariaDB's own deadlock error,
+/// which tells the client the transaction was rolled back and may be
+/// retried.
+fn silent_abort_packet(caps: Caps) -> RespPacket {
+    let e = ErrPacket::new(
+        1213,
+        *b"40001",
+        "Deadlock found when trying to get lock; try restarting transaction",
+    );
+    RespPacket {
+        payload: e.encode(caps),
+        kind: PacketKind::Err(e),
+        tracked: TrackedChanges::default(),
+    }
+}
+
 fn conn_fatal(code: u16) -> bool {
     // 1927 ER_CONNECTION_KILLED, 1053 ER_SERVER_SHUTDOWN, 1152
     // ER_ABORTING_CONNECTION, 4031 (idle disconnect).
@@ -772,7 +862,12 @@ impl BackendSession {
         let packet = cur.lease.conn().client.next_packet().await;
         crate::observe::backend_time(waited.elapsed());
         match packet {
-            Ok(Some(p)) => {
+            Ok(Some(mut p)) => {
+                if cur.ended_silently(&p) {
+                    let node = cur.lease.key().node_key();
+                    note_silent_abort(&self.target.cluster, &node, "a statement");
+                    p = silent_abort_packet(cur.lease.conn().client.caps());
+                }
                 cur.observe(&p);
                 cur.relayed = true;
                 Ok(Some(p))
@@ -1619,6 +1714,13 @@ impl BackendSession {
         let mut sync_retried = false;
         let mut io_retried = false;
         let text = matches!(req, Req::Text(_));
+        let galera_dml_in_trx = view.topology == TopologyKind::Galera
+            && in_trx_before
+            && info.effects.is_empty()
+            && match &req {
+                Req::Text(sql) | Req::Binary { sql, .. } => plain_dml(sql),
+                _ => false,
+            };
         // `USE x` sets the schema itself, so any pooled connection serves
         // it, including one that already has a default schema.
         let sets_schema = matches!(req, Req::Text(sql) if is_use(sql));
@@ -1656,6 +1758,18 @@ impl BackendSession {
             let node_key = lease.key().node_key();
             self.inflight = Some((node_key.clone(), lease.conn_ref().thread_id));
             let conn = lease.conn();
+            // A Galera COMMIT of a transaction that wrote must produce a
+            // GTID: the connection's last one, to compare (decision HD27).
+            let commit_check = (view.topology == TopologyKind::Galera
+                && in_trx_before
+                && info.effects.contains(&Effect::Commit)
+                && !self
+                    .pins
+                    .reasons()
+                    .iter()
+                    .any(|r| matches!(r, PinReason::TempTables(_)))
+                && conn.client.tracker().trx_state().is_some_and(trx_wrote))
+            .then(|| conn.client.tracker().last_gtid().map(str::to_owned));
             if self.vars.schema.is_none()
                 && conn.applied.schema.is_some()
                 && route != RouteKind::Pinned
@@ -1964,6 +2078,7 @@ impl BackendSession {
                 sets_schema,
                 explicit_ids,
                 span: None,
+                galera_dml_in_trx,
             };
             let first = match outgoing {
                 // A prepare has no response beyond what prepare_cached read.
@@ -2004,7 +2119,26 @@ impl BackendSession {
                 continue;
             }
             match first {
-                Ok(first) => {
+                Ok(mut first) => {
+                    let silent = match &first {
+                        Some(p) if cur.ended_silently(p) => Some("a statement"),
+                        Some(p) => match &commit_check {
+                            Some(before)
+                                if matches!(p.kind, PacketKind::Ok(_))
+                                    && !p.more_results()
+                                    && commit_wrote_nothing(&mut cur, p, before.as_deref())
+                                        .await =>
+                            {
+                                Some("COMMIT")
+                            }
+                            _ => None,
+                        },
+                        None => None,
+                    };
+                    if let Some(what) = silent {
+                        note_silent_abort(&cluster, &node_key, what);
+                        first = Some(silent_abort_packet(cur.lease.conn().client.caps()));
+                    }
                     cur.done = first.is_none();
                     if let Some(p) = &first {
                         cur.observe(p);
@@ -2308,6 +2442,72 @@ mod stmt_metrics {
                 })
                 .clone()
         })
+    }
+}
+
+#[cfg(test)]
+mod silent_abort_tests {
+    use sprig_proto_mysql::Caps;
+    use sprig_proto_mysql::client::PacketKind;
+
+    use super::{gtid_unchanged, plain_dml, silent_abort_packet, trx_wrote};
+
+    #[test]
+    fn only_plain_dml_counts_as_unable_to_end_a_transaction() {
+        for sql in [
+            "SELECT v FROM t WHERE k = ?",
+            "  insert into t values (1)",
+            "UPDATE t SET v = 1",
+            "delete from t",
+            "REPLACE INTO t VALUES (1)",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+        ] {
+            assert!(plain_dml(sql.as_bytes()), "{sql}");
+        }
+        for sql in [
+            "COMMIT",
+            "CALL p()",
+            "SET autocommit = 1",
+            "LOCK TABLES t WRITE",
+            "/* c */ SELECT 1",
+            "SELECTED",
+            "",
+        ] {
+            assert!(!plain_dml(sql.as_bytes()), "{sql}");
+        }
+    }
+
+    #[test]
+    fn only_a_transactional_write_counts_as_writing() {
+        assert!(trx_wrote("T___W___"));
+        assert!(trx_wrote("T_R_W_S_"));
+        // Reads, non-transactional writes, nothing.
+        assert!(!trx_wrote("T_R___S_"));
+        assert!(!trx_wrote("T__w____"));
+        assert!(!trx_wrote("________"));
+        assert!(!trx_wrote(""));
+    }
+
+    #[test]
+    fn a_commit_that_wrote_moves_the_gtid() {
+        // A new GTID: written.
+        assert!(!gtid_unchanged(Some("3-301-5081"), "3-301-5090"));
+        assert!(!gtid_unchanged(None, "3-301-5090"));
+        // The GTID it had before, or none at all: nothing was written (the
+        // 15 November CI loss and its local reproductions).
+        assert!(gtid_unchanged(Some("3-301-5081"), "3-301-5081"));
+        assert!(gtid_unchanged(None, ""));
+        assert!(gtid_unchanged(Some("3-301-5081"), ""));
+    }
+
+    #[test]
+    fn a_silent_abort_answers_mariadbs_deadlock_error() {
+        let p = silent_abort_packet(Caps::PROTOCOL_41);
+        let PacketKind::Err(e) = &p.kind else {
+            panic!("an ERR packet: {p:?}");
+        };
+        assert_eq!((e.code, &e.sqlstate), (1213, b"40001"));
+        assert_eq!(p.payload, e.encode(Caps::PROTOCOL_41));
     }
 }
 

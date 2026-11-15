@@ -9,7 +9,7 @@ source: the settings registry (sprig-settings)
 
 Every setting SprigDB declares, with its default, the scopes that may set it, hard bounds and when a change applies. Settings resolve from the most specific scope: object, database, tenant and its ancestors, cluster, data center, global, then the built-in default. Read them with `SHOW SPRIG SETTINGS`, change them with `ALTER TENANT|DATABASE|TABLE … SPRIG SET (key = value)` or `sprigctl settings`.
 
-715 settings in 60 groups.
+716 settings in 60 groups.
 
 ## `advisor`
 
@@ -34,8 +34,9 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 
 | Key | Type | Default | Scopes | Bounds | Applies | Description |
 |---|---|---|---|---|---|---|
-| `ai.admin.enabled` | bool | `false` | global (operator only) | - | live | Turn on the administration agent: processes report error counts (codes, components, spans; never names or data), and new or rising errors get triage and advice in the approvals inbox. Needs ai.model.admin |
-| `ai.admin.max_advice_hour` | int | `10` | global (operator only) | 0 to 1000 | live | Advice items the administration agent may file per hour in each DC; repeats of an incident only update its counts |
+| `ai.admin.check_interval` | text | `1h` | global (operator only) | 15m, 30m, 1h, 2h, 3h, 6h, 12h, 24h | live | How often the administration agent's health checks run over the metric history in each DC: 15m, 30m, 1h, 2h, 3h, 6h, 12h or 24h |
+| `ai.admin.enabled` | bool | `false` | global (operator only) | - | live | Turn on the administration agent: processes report error counts (codes, components, spans; never names or data), new or rising errors get triage and advice, the DC leader keeps a metric history and runs health checks, and failovers get write-ups, all as advice in the approvals inbox. Needs ai.model.admin to word them |
+| `ai.admin.max_advice_hour` | int | `10` | global (operator only) | 0 to 1000 | live | Advice items the administration agent may file per hour in each DC, counted apart for incident advice, health warnings and write-ups; repeats only update their counts |
 | `ai.admin.max_triage_hour` | int | `60` | global (operator only) | 0 to 10000 | live | Incidents the administration agent may send to triage per hour in each DC; the rest wait for the next hour |
 | `ai.audit_payload_days` | int | `30` | tenant, global | 0 to 3650 | live | Days the exact payloads sent to the AI provider are kept with the conversation; 0 keeps only their hashes |
 | `ai.budget.tenant_tokens_day` | int | `2000000` | tenant, global | 0 to 1000000000000 | live | Tokens all of a tenant's assistant turns may use per UTC day before they stop; 0 allows none |

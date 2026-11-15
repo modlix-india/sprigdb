@@ -142,7 +142,8 @@ URL-encode the password if it contains `@`, `:`, `/` or `%`.
 | SCRAM-SHA-256 | yes | Including speculative authentication in `hello` and `saslSupportedMechs` |
 | SCRAM-SHA-1 | no | It needs a verifier format SprigDB doesn't store |
 | MONGODB-X509 | no | A client certificate can be required in addition to SCRAM; see below |
-| PLAIN (LDAP), GSSAPI, MONGODB-AWS, MONGODB-OIDC | no | |
+| MONGODB-OIDC | yes | A token from an identity provider the tenant registered; the human flow and, on a tenant endpoint, the machine flow. See [Logins with identity provider tokens](../security/external-tokens.md#mongodb) |
+| PLAIN (LDAP), GSSAPI, MONGODB-AWS | no | |
 
 A login that fails for any reason answers 18 `AuthenticationFailed`, "Authentication failed.". A second `saslStart` on a connection that is already logged in answers 20 `IllegalOperation`. Commands other than the handshake and `saslStart` before a login answer 13 `Unauthorized`, "Command ... requires authentication".
 
@@ -253,7 +254,7 @@ Multi-document transactions work through the drivers' session API, across collec
 
 | Feature | What happens |
 |---|---|
-| SCRAM-SHA-1, MONGODB-X509, LDAP, Kerberos, AWS and OIDC logins | Authentication fails |
+| SCRAM-SHA-1, MONGODB-X509, LDAP, Kerberos and AWS logins | Authentication fails |
 | Views, time-series collections, clustered collections, Queryable Encryption | 39662 `SprigDocFeatureUnsupported` |
 | `mapReduce`, `eval`, the `geoNear` command | 115 `CommandNotSupported` |
 | Multikey, wildcard and `2d` indexes; sparse and partial semantics | See [Indexes](#indexes) |
@@ -278,7 +279,7 @@ MongoDB clients receive MongoDB's codes and `codeName`s, and SprigDB's own error
 | Code | `codeName` | When |
 |---|---|---|
 | 13 | `Unauthorized` | A command before logging in, or your grants don't cover the collection; a change stream on a collection without `WATCH` |
-| 18 | `AuthenticationFailed` | Wrong credentials, unknown tenant, a missing or wrong client certificate for the account, or any other refused login |
+| 18 | `AuthenticationFailed` | Wrong credentials, unknown tenant, a missing or wrong client certificate for the account, a refused `MONGODB-OIDC` token (the reason is in the audit log), or any other refused login |
 | 43 | `CursorNotFound` | The cursor idled past `mongo.cursor_timeout_ms`, was killed, or was opened on another gateway |
 | 59 | `CommandNotFound` | A command SprigDB doesn't have |
 | 115 | `CommandNotSupported` | `mapReduce`, `eval`, `geoNear` |

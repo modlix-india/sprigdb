@@ -32,6 +32,7 @@ pub mod jwks;
 pub mod jwt;
 pub mod login;
 pub mod mapping;
+pub mod roles;
 pub mod store;
 
 #[cfg(test)]

@@ -22,7 +22,9 @@ All of them are sent the same way:
 Authorization: Bearer <api-key or access token>
 ```
 
-API keys and tokens work on the HTTP listeners only. MySQL, MongoDB, Redis, Bolt, Kafka and AMQP clients log in with a password; see [Accounts and logins](accounts-and-logins.md).
+API keys and SprigDB's tokens work on the HTTP listeners only. MySQL, MongoDB, Redis, Bolt, Kafka and AMQP clients log in with a password; see [Accounts and logins](accounts-and-logins.md).
+
+Tokens from an identity provider (OIDC providers and other JWT issuers that a tenant registers) are a separate credential: they log in over MySQL, MariaDB, Redis, MongoDB, REST and gRPC, and their claims reach row-level security. See [Logins with identity provider tokens](external-tokens.md).
 
 ## API keys
 
@@ -161,7 +163,7 @@ An access token is a compact JWS signed with Ed25519 (`EdDSA`), prefixed with `s
 
 Studio's export tickets (`POST /v1/exports:ticket`, valid `studio.export_ticket_seconds`, 60) and second-factor challenge tickets are signed the same way.
 
-Tokens from external identity providers (OIDC and other JWT issuers) aren't accepted yet.
+Tokens from an identity provider are verified differently: against the keys the provider publishes, by the rules of the issuer the tenant registered. See [Logins with identity provider tokens](external-tokens.md).
 
 ## Operator tokens
 
@@ -200,11 +202,11 @@ An expired operator token fails with `ER_SPRIG_OPERATOR_TOKEN_EXPIRED` (39316). 
 
 - Scopes on API keys narrower than the user's own privileges, and creating keys with SQL statements.
 - API keys and tokens on the MySQL, MongoDB, Redis, Bolt, Kafka and AMQP listeners.
-- External JWT and OIDC tokens.
 
 ## Related
 
 - [Accounts and logins](accounts-and-logins.md)
+- [Logins with identity provider tokens](external-tokens.md)
 - [Tenant administration](tenant-administration.md)
 - [REST and gRPC](../connect/rest-and-grpc.md)
 - [REST API reference](../reference/api.md)

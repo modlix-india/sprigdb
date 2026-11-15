@@ -480,6 +480,42 @@ async fn live_a_crash_between_statements_and_record_reruns_safely() {
     .await;
 }
 
+/// `MigrateOpts::existing()` (fetfix): a missing catalog schema is 39072
+/// and isn't made. A loop migrating a catalog that cleanup had just dropped
+/// made it again without an owner mark; only bootstrap makes a catalog,
+/// with its mark.
+#[tokio::test]
+async fn live_existing_only_never_creates_the_schema() {
+    with_schema("live_existing_only", |pool, schema| async move {
+        let mut conn = pool.get_conn().await.unwrap();
+        let e = Migrator::new(&[])
+            .unwrap()
+            .run(&mut conn, &schema, &MigrateOpts::existing())
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Some(SprigCode::TenantNotReady), "{e}");
+        let n: Option<i64> = conn
+            .exec_first(
+                "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?",
+                (schema.clone(),),
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, Some(0), "the schema wasn't made");
+        // Once it exists, the same options migrate it.
+        conn.query_drop(format!("CREATE DATABASE `{schema}`"))
+            .await
+            .unwrap();
+        let r = Migrator::new(&[])
+            .unwrap()
+            .run(&mut conn, &schema, &MigrateOpts::existing())
+            .await
+            .unwrap();
+        assert!(!r.applied.is_empty());
+    })
+    .await;
+}
+
 /// Found in a live tenant move: a migration run
 /// against a catalog whose tables a rename fence moved away must not
 /// recreate them empty; it waits (39070) until the catalog is unfenced.

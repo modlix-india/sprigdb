@@ -106,7 +106,7 @@ It may not use `?` parameters, user or system variables (`@v`, `@@v`), non-deter
 | `SPRIG_TENANT_IN_SUBTREE(expr)` | True when `expr` is the id of the home tenant or one of its descendants |
 | `SPRIG_TENANT_MANAGED(expr)` | True when `expr` is the id of a tenant the user administers |
 | `SPRIG_USER_ATTR('key')` | The user's attribute `key`, set with `CREATE USER` or `ALTER USER ... ATTRIBUTE '{json}'` (see [Tenants and accounts](tenants-and-accounts.md#create-user)), or `NULL` |
-| `SPRIG_CLAIM('key')` | Claim `key` of the SprigDB session token (from `POST /v1/auth/login` or Studio) that authenticated the statement over REST, gRPC or Studio: `sub` (`<tenant id>:<user id>`), `ten` (the tenant's name), `sid` (the session id), `amr` (the login methods, an array), `cli` (`studio`, `api` or `cli`), `iat` and `exp` (Unix seconds), `act` while an administrator impersonates the user, and `iss` and `aud` (always `sprigdb`). A claim the token doesn't have is `NULL`. `NULL` in sessions without a session token, such as MySQL logins, HTTP Basic and API keys. Custom claims aren't available |
+| `SPRIG_CLAIM('key')` | Top-level claim `key` of the token the session logged in with. For a token from a registered identity provider (on MySQL, MariaDB, Redis, MongoDB, REST and gRPC), any of its claims: strings and numbers as they are, booleans as `TRUE` or `FALSE`, arrays and objects as JSON text; see [Logins with identity provider tokens](../security/external-tokens.md#claims-in-row-level-security). For SprigDB's session token (from `POST /v1/auth/login` or Studio, over REST, gRPC or Studio): `sub` (`<tenant id>:<user id>`), `ten` (the tenant's name), `sid` (the session id), `amr` (the login methods, an array), `cli` (`studio`, `api` or `cli`), `iat` and `exp` (Unix seconds), `act` while an administrator impersonates the user, and `iss` and `aud` (always `sprigdb`). A claim the token doesn't have is `NULL`, and so is every claim in sessions without a token, such as password logins, HTTP Basic and API keys |
 | `SPRIG_SESSION_SPACE()` | The session's space id (see [Inheritance](inheritance.md)), or `NULL` |
 
 `SPRIG_USER_ATTR` and `SPRIG_CLAIM` take a string literal. Up to `rls.inline_subtree_max` tenant ids (default 1000) are written into the statement for `SPRIG_TENANT_IN_SUBTREE` and `SPRIG_TENANT_MANAGED`; beyond that, SprigDB reads them from a table.
@@ -331,8 +331,8 @@ Some statements can't carry the rewrite. On a table that binds the session, thes
 
 ## Not supported yet
 
-- **Custom claims.** SprigDB doesn't accept JWT or OIDC tokens from an external identity provider, so `SPRIG_CLAIM` reads only the fixed claims of SprigDB's own session tokens. Put per-user values in account attributes and read them with `SPRIG_USER_ATTR`.
-- **Claims on other logins.** MySQL, MariaDB and the other wire protocols, HTTP Basic and API keys carry no token, so `SPRIG_CLAIM` returns `NULL` there.
+- **Claims without a token.** Password logins, HTTP Basic and API keys carry no token, so `SPRIG_CLAIM` returns `NULL` there; put per-user values in account attributes and read them with `SPRIG_USER_ATTR`.
+- **Claims after a residency hand-off.** A token login decided in another data centre because of the tenant's residency has no claims, and neither do MongoDB-language calls over HTTP (`language: mongo`).
 
 ## Related
 

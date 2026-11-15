@@ -112,6 +112,10 @@ pub struct AccountCtx<'a> {
     pub privileges: &'a dyn super::authorizer::SessionGrants,
     /// The session's active roles.
     pub active_roles: &'a [RoleId],
+    /// The roles the session's token gives it for its life (chapter 29,
+    /// "Token roles"): `SET ROLE` may name them, and `DEFAULT` and `ALL`
+    /// include them.
+    pub token_roles: &'a [RoleId],
     /// The tenant's name, for audit events.
     pub tenant_name: Option<&'a str>,
     /// Resolution of the `auth.*` keys (the password rules).
@@ -1169,9 +1173,17 @@ pub async fn execute(cx: &AccountCtx<'_>, stmt: &AccountStmt) -> Result<Outcome>
             version = apply(cx, ops).await?;
         }
         AccountStmt::SetRole(choice) => {
-            let granted = state.granted_roles(cx.user);
+            let with_token = |mut v: Vec<RoleId>| {
+                for r in cx.token_roles {
+                    if !v.contains(r) {
+                        v.push(*r);
+                    }
+                }
+                v
+            };
+            let granted = with_token(state.granted_roles(cx.user));
             let chosen = match choice {
-                RoleChoice::Default => state.default_roles(cx.user),
+                RoleChoice::Default => with_token(state.default_roles(cx.user)),
                 c => choose(cx, &state, c, &granted, &cx.me())?,
             };
             return Ok(Outcome::SetRole(chosen));

@@ -319,6 +319,26 @@ pub struct MigrateOpts {
     pub default_ceiling: Ceiling,
     /// Recorded in the history, such as `controller:mum1/ctl-2`.
     pub applied_by: String,
+    /// Whether a missing schema is created (without an owner mark).
+    /// `false` for a tenant's catalog outside bootstrap
+    /// ([`existing`](Self::existing)): only bootstrap creates a catalog,
+    /// with its mark. A loop migrating a catalog that was just dropped
+    /// (a deleted tenant) or isn't claimed yet (a new tenant, after its
+    /// placement) made an unmarked schema, which bootstrap then refused
+    /// as another tenant's (39072, fetfix).
+    pub create_schema: bool,
+}
+
+impl MigrateOpts {
+    /// The defaults, for a schema that must already exist: a missing
+    /// one is 39072, not created.
+    #[must_use]
+    pub fn existing() -> Self {
+        Self {
+            create_schema: false,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for MigrateOpts {
@@ -331,6 +351,7 @@ impl Default for MigrateOpts {
             ceilings: BTreeMap::new(),
             default_ceiling: Ceiling::EXPAND_ONLY,
             applied_by: "system".to_owned(),
+            create_schema: true,
         }
     }
 }
@@ -537,6 +558,15 @@ impl Migrator {
             .await
             .map_err(map_err)?;
         if exists.unwrap_or(0) == 0 {
+            if !opts.create_schema {
+                return Err(SprigError::new(
+                    SprigCode::TenantNotReady,
+                    format!(
+                        "the catalog schema {schema} doesn't exist (not bootstrapped yet, or \
+                         dropped); migrations don't create it"
+                    ),
+                ));
+            }
             exec_text(
                 conn,
                 opts,

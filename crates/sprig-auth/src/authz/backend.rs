@@ -26,7 +26,9 @@
 //!
 //! **Roles.** A user's account gets its own privileges plus those of
 //! every role granted to it, active or not; the gateway enforces which
-//! roles are active. MariaDB roles and combined roles (one active role per
+//! roles are active. A user with the `token` method also gets those of
+//! every role an active issuer's role mapping can name (its token roles,
+//! [`crate::oidc::roles`]), held the same way. MariaDB roles and combined roles (one active role per
 //! MariaDB session) are not used yet.
 //!
 //! **Credentials.** Accounts have a password derived from a secret
@@ -394,6 +396,9 @@ pub fn desired_on(
     };
     let mut out = BackendState::new();
     let tenant_pattern = format!("t{tenant}\\_d%");
+    // Token roles: a user taking tokens may be given any role an active
+    // issuer's role mapping can name (chapter 29, "Token roles").
+    let token_roles = crate::oidc::roles::possible_roles(auth.issuers(), state);
     for u in auth.users() {
         let uid = u.row.user_id;
         let mut grants: BTreeMap<BackendTarget, ActionSet> = BTreeMap::new();
@@ -406,7 +411,14 @@ pub fn desired_on(
         };
         let compiled_tenant;
         if state.is_migrated() {
-            let roles = state.closure(&state.granted_roles(uid));
+            let mut direct = state.granted_roles(uid);
+            if u.row
+                .auth_methods
+                .contains(crate::store::AuthMethods::TOKEN)
+            {
+                direct.extend(token_roles.iter().copied());
+            }
+            let roles = state.closure(&direct);
             let grantees: Vec<Grantee> = std::iter::once(Grantee::User(uid))
                 .chain(roles.into_iter().map(Grantee::Role))
                 .collect();

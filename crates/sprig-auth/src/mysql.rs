@@ -1800,10 +1800,20 @@ impl MysqlLogin {
             {
                 e.detail = Some("sandbox mode: the password expired".into());
             }
-            if let Some(t) = &self.token {
-                e.detail = Some(format!("issuer {}", t.issuer));
-            }
+            let ignored = match (&self.token, &self.target) {
+                (Some(t), Target::Catalog(c)) => {
+                    crate::oidc::roles::audit_login(&mut e, t, &c.catalog)
+                }
+                (Some(t), _) => {
+                    e.detail = Some(format!("issuer {}", t.issuer));
+                    None
+                }
+                (None, _) => None,
+            };
             svc.audit.emit(&e);
+            if let Some(i) = ignored {
+                svc.audit.emit(&i);
+            }
             return;
         }
         let reason = self.reason.unwrap_or("refused");

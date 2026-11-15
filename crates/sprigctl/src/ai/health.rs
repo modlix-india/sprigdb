@@ -148,6 +148,7 @@ fn check_text(v: &Value) -> String {
     t
 }
 
+#[allow(clippy::many_single_char_names)] // v, r, f, t, w: the reply, record, finding, text, warning
 fn finding_text(v: &Value) -> String {
     let r = &v["finding"];
     let f = &r["finding"];

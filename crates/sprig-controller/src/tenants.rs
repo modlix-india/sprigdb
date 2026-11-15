@@ -204,6 +204,10 @@ where
     /// When this controller first found each deleted tenant still holding
     /// databases.
     waiting_dbs: Mutex<HashMap<TenantId, Instant>>,
+    /// One bootstrap per tenant at a time in this controller: the Admin
+    /// API call and the `tenant_bootstrap` loop both start one for a new
+    /// tenant ([`bootstrap`](Self::bootstrap)).
+    bootstrapping: Mutex<HashMap<TenantId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl<B: SettingsBackend> std::fmt::Debug for TenantService<B>
@@ -316,6 +320,7 @@ where
             live,
             dropper: std::sync::OnceLock::new(),
             waiting_dbs: Mutex::new(HashMap::new()),
+            bootstrapping: Mutex::new(HashMap::new()),
         })
     }
 
@@ -616,6 +621,36 @@ where
     /// no cluster can take the catalog; 39504 off the leader; catalog
     /// errors (retryable ones are retried by the loop).
     pub async fn bootstrap(&self, id: TenantId, guard: &[Cmp]) -> Result<Bootstrapped> {
+        // The Admin API call runs it inline while the `tenant_bootstrap`
+        // loop, woken by the new directory entry, starts it too. Run
+        // together, the second one's claim could read the first one's
+        // schema in the middle of its `CREATE DATABASE`, with no mark yet,
+        // and refuse the tenant's own catalog (39072; found by r9feed5).
+        // Taking turns, the second finds the first's work done.
+        let turn = Arc::clone(
+            self.bootstrapping
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(id)
+                .or_default(),
+        );
+        let r = {
+            let _held = turn.lock().await;
+            self.bootstrap_once(id, guard).await
+        };
+        let mut running = self
+            .bootstrapping
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // The map's and ours: nobody else waits.
+        if Arc::strong_count(&turn) == 2 {
+            running.remove(&id);
+        }
+        r
+    }
+
+    /// [`bootstrap`](Self::bootstrap), with this tenant's turn held.
+    async fn bootstrap_once(&self, id: TenantId, guard: &[Cmp]) -> Result<Bootstrapped> {
         let entry =
             self.directory.get(id).await?.ok_or_else(|| {
                 SprigError::new(SprigCode::TenantNotReady, format!("no tenant {id}"))

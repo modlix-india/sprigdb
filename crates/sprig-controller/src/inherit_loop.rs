@@ -239,7 +239,7 @@ impl<H: crate::tenants::BootstrapHooks> crate::tenants::BootstrapHooks for WithM
         }
         let opts = sprig_catalog::migrate::MigrateOpts {
             applied_by: "controller:inherit".to_owned(),
-            ..sprig_catalog::migrate::MigrateOpts::default()
+            ..sprig_catalog::migrate::MigrateOpts::existing()
         };
         let run = async {
             let mut c = catalog.pool.get_conn().await.map_err(|e| {

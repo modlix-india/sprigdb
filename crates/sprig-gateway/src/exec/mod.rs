@@ -1282,8 +1282,10 @@ impl SessionExec for PassSession {
 
     fn set_claims(&mut self, claims: Option<std::sync::Arc<serde_json::Value>>) {
         // SPRIG_CLAIM() reads the caller's verified token.
+        // Its role mappings give the session's token roles.
         if let Some(ts) = self.tenant.as_deref_mut() {
             ts.rls.claims = claims;
+            ts.authz.forget_token_roles();
         }
     }
 

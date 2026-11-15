@@ -992,8 +992,8 @@ meaning = "A buffered REST result is larger than `api.rest.max_buffered_bytes`."
 what_to_do = "Stream the result with `sql:query` and `Accept: application/x-ndjson`, or page through it with `LIMIT`."
 
 [ER_SPRIG_TENANT_AMBIGUOUS]
-meaning = "The credential doesn't name exactly one tenant. Declared for this case; no current path raises it."
-what_to_do = "Name the tenant in the login (`acme.app`) or the `x-sprig-tenant` header."
+meaning = "A REST or gRPC request carries an identity provider's token (a JWT bearer token) but doesn't say which tenant it is for: it reached no tenant host name under `listener.tenant_sni_suffixes`, and has no `x-sprig-tenant` header. The tenant must be known before the token can be checked against its issuers."
+what_to_do = "Send the header `x-sprig-tenant: <tenant>` (gRPC: metadata), or call the tenant's endpoint (`acme.db.example.com`)."
 
 [ER_SPRIG_REQUEST_TOO_LARGE]
 meaning = "The request body is larger than `api.max_request_bytes`, or a Studio text is longer than its limit."

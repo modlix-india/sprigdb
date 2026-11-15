@@ -17,7 +17,7 @@ use serde_json::Value;
 use super::store::{ClaimMapping, MappingKind, MatchKind};
 
 /// The largest compiled expression accepted.
-const REGEX_SIZE_LIMIT: usize = 1 << 16;
+pub(crate) const REGEX_SIZE_LIMIT: usize = 1 << 16;
 
 /// Compiles a mapping's expression, anchored so it matches whole values.
 ///

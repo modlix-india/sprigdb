@@ -25,10 +25,12 @@ use sprig_proto_mysql::{ErrPacket, Persona};
 use super::{Check, Refusal, TokenProtocol, VerifiedToken};
 use crate::audit::{self, AuditEvent};
 use crate::cache::{AuthUser, TenantAuth};
+use crate::handoff::{HandoffResult, HandoffStart, Route, remote_access_denied, route};
 use crate::mysql::{
     ClientDn, LoginService, LoginSource, Principal, certificate_ok, locked, temp_locked,
 };
 use crate::store::{AuthMethods, RequireTls};
+use zeroize::Zeroizing;
 
 /// One token login's request.
 #[derive(Debug, Clone, Copy)]
@@ -113,13 +115,125 @@ impl LoginService {
             .map(|i| i.spec.clone())
     }
 
+    /// Where a token login for `tenant` is decided: the tenant's residency
+    /// as for a MySQL login (`Local` without a hand-off configuration, an
+    /// unpinned tenant, or an unreadable directory).
+    pub async fn token_route(&self, tenant: &str) -> Route {
+        let (Some(h), LoginSource::Catalog(c)) = (self.handoff(), self.source()) else {
+            return Route::Local;
+        };
+        match c.tenants().residency(tenant).await {
+            Ok(Some(r)) if r.allowed_dcs.is_empty() => Route::Deny,
+            Ok(Some(r)) => route(Some(&r.allowed_dcs), &h.here, r.deny_remote_access),
+            Ok(None) => Route::Local,
+            Err(e) => {
+                tracing::warn!(error = %e, "residency unreadable; the token login decides locally");
+                Route::Local
+            }
+        }
+    }
+
     /// Logs in with an issuer's token that names its account (see the
-    /// module docs). Emits `auth.login_succeeded` or `auth.login_failed`
-    /// with mechanism `jwt`.
+    /// module docs), routed by the tenant's residency: decided here, handed
+    /// to an allowed DC (whose verified token comes back with the
+    /// principal), or refused with 39302. A login decided here emits
+    /// `auth.login_succeeded` or `auth.login_failed` with mechanism `jwt`;
+    /// a handed-off one is audited by the deciding DC.
     ///
     /// # Errors
     /// [`TokenDenied`].
     pub async fn token_login(
+        &self,
+        req: &TokenLogin<'_>,
+    ) -> Result<(Principal, VerifiedToken), TokenDenied> {
+        match self.token_route(req.tenant).await {
+            Route::Local => self.token_login_here(req).await,
+            Route::Deny => {
+                metrics::counter!("sprig_auth_handoffs_total", "outcome" => "denied").increment(1);
+                Err(TokenDenied {
+                    reason: "remote_denied",
+                    error: remote_access_denied(Persona::MySql84),
+                })
+            }
+            Route::HandOff(dcs) => self.relay_token_login(req, &dcs).await,
+        }
+    }
+
+    /// The source side of a token login's hand-off: each allowed DC in
+    /// order until one answers; the principal gets this gateway's backend
+    /// target.
+    async fn relay_token_login(
+        &self,
+        req: &TokenLogin<'_>,
+        dcs: &[sprig_common::ids::DcId],
+    ) -> Result<(Principal, VerifiedToken), TokenDenied> {
+        let (Some(h), LoginSource::Catalog(c)) = (self.handoff(), self.source()) else {
+            return Err(TokenDenied {
+                reason: "unavailable",
+                error: unavailable(),
+            });
+        };
+        let start = HandoffStart::of_token(req, h.here.clone());
+        for dc in dcs {
+            let r = h
+                .peers
+                .login(
+                    dc,
+                    start.clone(),
+                    Zeroizing::new(req.token.as_bytes().to_vec()),
+                )
+                .await;
+            match r {
+                Ok(HandoffResult::Accepted(mut p, token)) => {
+                    metrics::counter!("sprig_auth_handoffs_total", "outcome" => "decided")
+                        .increment(1);
+                    let Some(token) = token else {
+                        // A target from before token hand-offs.
+                        return Err(TokenDenied {
+                            reason: "unavailable",
+                            error: unavailable(),
+                        });
+                    };
+                    match c.local_backend(&p) {
+                        Some(Ok(b)) => p.backend = b,
+                        Some(Err(e)) => {
+                            tracing::warn!(error = %e, "no backend for a handed-off token login");
+                            return Err(TokenDenied {
+                                reason: "no_backend",
+                                error: ErrPacket::from_error(Persona::MySql84, &e),
+                            });
+                        }
+                        None => {}
+                    }
+                    return Ok((*p, *token));
+                }
+                Ok(HandoffResult::Refused(e)) => {
+                    metrics::counter!("sprig_auth_handoffs_total", "outcome" => "decided")
+                        .increment(1);
+                    return Err(TokenDenied {
+                        reason: "bad_credentials",
+                        error: e,
+                    });
+                }
+                Err(e) => {
+                    metrics::counter!("sprig_auth_handoffs_total", "outcome" => "unreachable")
+                        .increment(1);
+                    tracing::warn!(%dc, error = %e, "token login handoff target unreachable; trying the next");
+                }
+            }
+        }
+        Err(TokenDenied {
+            reason: "unavailable",
+            error: unavailable(),
+        })
+    }
+
+    /// [`Self::token_login`] decided here, whatever the residency (the
+    /// hand-off target's side checks it first).
+    ///
+    /// # Errors
+    /// [`TokenDenied`].
+    pub async fn token_login_here(
         &self,
         req: &TokenLogin<'_>,
     ) -> Result<(Principal, VerifiedToken), TokenDenied> {
@@ -131,10 +245,10 @@ impl LoginService {
         ev.client_ip = Some(req.client_ip);
         ev.mechanism = Some("jwt");
         ev.tenant_name = Some(req.tenant.to_owned());
-        let r = self.token_login_checked(req, &mut ev).await;
+        let mut ignored = None;
+        let r = self.token_login_checked(req, &mut ev, &mut ignored).await;
         match &r {
-            Ok((_, v)) => {
-                ev.detail = Some(format!("issuer {}", v.issuer));
+            Ok(_) => {
                 metrics::counter!("sprig_auth_logins_total", "protocol" => req.label,
                     "mechanism" => "jwt", "outcome" => "ok")
                 .increment(1);
@@ -152,6 +266,9 @@ impl LoginService {
             }
         }
         self.audit().emit(&ev);
+        if let Some(i) = ignored {
+            self.audit().emit(&i);
+        }
         r
     }
 
@@ -160,6 +277,7 @@ impl LoginService {
         &self,
         req: &TokenLogin<'_>,
         ev: &mut AuditEvent,
+        ignored: &mut Option<AuditEvent>,
     ) -> Result<(Principal, VerifiedToken), TokenDenied> {
         let bad = |ev: &mut AuditEvent, r: Option<Refusal>| {
             if let Some(r) = r {
@@ -304,6 +422,7 @@ impl LoginService {
                 error: ErrPacket::from_error(Persona::MySql84, &e),
             }
         })?;
+        *ignored = super::roles::audit_login(ev, &verified, &catalog);
         Ok((
             Principal {
                 tenant: Some(tenant.id),

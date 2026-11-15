@@ -53,7 +53,7 @@ pub(crate) fn add_cmds(g: Command) -> Command {
     )
     .subcommand(
         Command::new("token-login")
-            .about("Let an account log in with an issuer's token over MySQL and Redis (its token method)")
+            .about("Let an account log in with an issuer's tokens: its token method, needed on every protocol")
             .arg(tenant())
             .arg(Arg::new("user").required(true).help("The user name, without the tenant prefix"))
             .arg(Arg::new("host").long("host").help("The host pattern (default %)"))

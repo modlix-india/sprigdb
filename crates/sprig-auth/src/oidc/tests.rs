@@ -20,7 +20,7 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use ring::rand::SystemRandom;
 use ring::signature::{self, EcdsaKeyPair, Ed25519KeyPair, KeyPair, RsaKeyPair};
 use serde_json::{Value, json};
-use sprig_common::ids::{ClusterId, TenantId, UserId};
+use sprig_common::ids::{ClusterId, RoleId, TenantId, UserId};
 use sprig_common::time::{Clock, ManualClock};
 use sprig_proto_mysql::Persona;
 use sprig_proto_mysql::auth::{AuthPath, AuthVerdict, LoginFlow, Outcome};
@@ -32,7 +32,7 @@ use crate::account::{StaticTenants, TenantInfo};
 use crate::accounts::BackendTarget;
 use crate::cache::TenantAuth;
 use crate::cache::tests::row;
-use crate::mysql::tests::{Catalogs, snapshot};
+use crate::mysql::tests::Catalogs;
 use crate::mysql::{
     CatalogLogins, FixedPolicy, LoginRequest, LoginService, LoginSource, StaticBackends,
 };
@@ -723,12 +723,31 @@ struct World {
     audit: Arc<crate::audit::MemoryAudit>,
     idp: Idp,
     key: Key,
+    tenants: Arc<StaticTenants>,
+    catalogs: Arc<Catalogs>,
 }
 
 /// Tenant `acme` (42): 1 tok@% with the token method (and a password),
 /// 2 pw@% password only, 3 lockd@% token, account locked; issuer
 /// [`ISS`] (RS256) mapping `preferred_username`.
 async fn world() -> World {
+    world_in(None, false).await
+}
+
+/// Roles of [`world_in`]'s tenant with `roles`.
+const APP_ADMIN: RoleId = RoleId(7);
+const DEPT_SALES: RoleId = RoleId(8);
+const UNRELATED: RoleId = RoleId(9);
+
+/// [`world`] in DC `here` handing off through `peers`; with `roles`, the
+/// tenant defines roles `app_admin` (7), `dept_sales` (8) and `unrelated`
+/// (9), and the issuer also maps `groups` `staff` to the undefined role
+/// `ghost` and claim `dept` to `dept_{dept}`. The RSA key is the same in
+/// every world.
+async fn world_in(
+    here: Option<(&str, Arc<dyn crate::handoff::HandoffTarget>)>,
+    roles: bool,
+) -> World {
     let key = Key::rsa("r1");
     let idp = Idp::start(&[&key]).await;
     let clock = Arc::new(ManualClock::new());
@@ -738,14 +757,53 @@ async fn world() -> World {
     let mut lockd = row(3, "lockd", "%", 1);
     lockd.auth_methods = AuthMethods::TOKEN;
     lockd.account_locked = true;
-    let auth = TenantAuth::build(vec![tok, pw, lockd], &[], Vec::new())
-        .with_issuers(Some(vec![spec(&idp, &["RS256"])]));
+    let mut issuer = spec(&idp, &["RS256"]);
+    let mut more: Vec<(&'static str, Arc<dyn sprig_catalog::ExtState>)> = Vec::new();
+    if roles {
+        for (priority, claim, kind, value, target) in [
+            (30, "groups", MatchKind::Equals, Some("staff"), "ghost"),
+            (40, "dept", MatchKind::Any, None, "dept_{dept}"),
+        ] {
+            issuer.mappings.push(ClaimMapping {
+                priority,
+                kind: MappingKind::Role,
+                claim: claim.into(),
+                match_kind: kind,
+                match_value: value.map(str::to_owned),
+                target: target.into(),
+            });
+        }
+        let role = |id: RoleId, name: &str| crate::authz::store::RoleRow {
+            role_id: id,
+            name: name.into(),
+            host: "%".into(),
+        };
+        let state = crate::authz::state::AuthzState::new(crate::authz::store::AuthzRows {
+            roles: vec![
+                role(APP_ADMIN, "app_admin"),
+                role(DEPT_SALES, "dept_sales"),
+                role(UNRELATED, "unrelated"),
+            ],
+            edges: Vec::new(),
+            // dept_sales may read the whole tenant.
+            privileges: vec![crate::authz::store::PrivRow {
+                priv_id: 1,
+                grantee: crate::authz::store::Grantee::Role(DEPT_SALES),
+                target: crate::authz::store::PrivTarget::Tenant,
+                actions: crate::authz::privilege::ActionSet::of(&[
+                    crate::authz::privilege::Action::Select,
+                ]),
+            }],
+        });
+        more.push((crate::authz::store::MODULE, Arc::new(state)));
+    }
+    let auth =
+        TenantAuth::build(vec![tok, pw, lockd], &[], Vec::new()).with_issuers(Some(vec![issuer]));
     let catalogs = Arc::new(Catalogs::default());
-    catalogs
-        .map
-        .lock()
-        .unwrap()
-        .insert(ACME, snapshot(ACME, auth, 3));
+    catalogs.map.lock().unwrap().insert(
+        ACME,
+        crate::mysql::tests::snapshot_with(ACME, auth, 3, more),
+    );
     let tenants = Arc::new(StaticTenants::new([TenantInfo {
         id: ACME,
         name: "acme".into(),
@@ -758,8 +816,8 @@ async fn world() -> World {
         sprig_settings::Value::Int(0),
     );
     let logins = CatalogLogins::new(
-        tenants,
-        catalogs,
+        Arc::clone(&tenants) as Arc<dyn crate::account::TenantDirectory>,
+        Arc::clone(&catalogs) as _,
         Arc::new(StaticBackends::new(Some(BackendTarget {
             cluster: ClusterId::new("dc-a-c1").unwrap(),
             user: "sprig_t42".into(),
@@ -778,12 +836,21 @@ async fn world() -> World {
     .with_clock(Arc::clone(&clock) as Arc<dyn Clock>)
     .with_audit(Arc::clone(&audit) as Arc<dyn crate::audit::AuditSink>)
     .with_external_tokens(Arc::new(tokens()));
+    let svc = match here {
+        Some((dc, peers)) => svc.with_handoff(Arc::new(crate::handoff::HandoffConfig {
+            here: sprig_common::ids::DcId::new(dc).unwrap(),
+            peers,
+        })),
+        None => svc,
+    };
     World {
         svc: Arc::new(svc),
         clock,
         audit,
         idp,
         key,
+        tenants,
+        catalogs,
     }
 }
 
@@ -959,5 +1026,240 @@ async fn mongo_logins_find_the_tenant_and_its_issuer() {
     assert!(
         ev.iter()
             .any(|e| e.event == "auth.login_succeeded" && e.protocol == "mongo")
+    );
+}
+
+// ---- token roles (chapter 29) and the residency hand-off ----
+
+fn token_req<'a>(protocol: TokenProtocol, label: &'static str, token: &'a str) -> TokenLogin<'a> {
+    TokenLogin {
+        protocol,
+        label,
+        tenant: "acme",
+        token,
+        client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        tls: true,
+        client_cert: false,
+        client_dn: None,
+    }
+}
+
+fn acme_catalog(w: &World) -> Arc<sprig_catalog::TenantCatalog> {
+    w.catalogs.map.lock().unwrap().get(&ACME).cloned().unwrap()
+}
+
+#[tokio::test]
+async fn token_roles_resolve_by_name_and_undefined_ones_are_audited() {
+    let w = world_in(None, true).await;
+    let now = w.clock.wall();
+    let mut c = claims(now, "tok");
+    c["dept"] = json!("sales");
+    let (v, seen) = mysql_login(&w, "acme.tok", &w.key.sign(&c)).await;
+    assert_eq!(v, AuthVerdict::Accept);
+    let ev = w.audit.events();
+    let ok = ev
+        .iter()
+        .position(|e| e.event == "auth.login_succeeded")
+        .unwrap();
+    assert_eq!(
+        ev[ok].detail.as_deref(),
+        Some(format!("issuer {ISS}; token roles app_admin, dept_sales").as_str())
+    );
+    // The undefined role: ignored, never created, audited after the login.
+    let ign = ev
+        .iter()
+        .position(|e| e.event == "auth.token_roles_ignored")
+        .unwrap();
+    assert!(ign > ok);
+    assert_eq!(ev[ign].reason, Some("undefined_role"));
+    assert_eq!(ev[ign].user.as_deref(), Some("tok"));
+    assert_eq!(
+        ev[ign].detail.as_deref(),
+        Some(format!("issuer {ISS}: roles the tenant doesn't define, ignored: ghost").as_str())
+    );
+    let cat = acme_catalog(&w);
+    let state = crate::authz::state::AuthzState::of(&cat).unwrap();
+    assert!(state.role_named("ghost", "%").is_none(), "never created");
+    // The session's token roles: from its claims, at the snapshot.
+    let seen = seen.unwrap();
+    assert_eq!(
+        roles::session_roles(&cat, &seen),
+        vec![APP_ADMIN, DEPT_SALES]
+    );
+    // Without the claims that map them: none.
+    let mut bare = claims(now, "tok");
+    bare["groups"] = json!(["staff"]);
+    assert!(roles::session_roles(&cat, &bare).is_empty());
+    // SprigDB's own session tokens, and other issuers, give none.
+    for iss in [crate::token::ISSUER, "https://other.test"] {
+        let mut x = (*seen).clone();
+        x["iss"] = json!(iss);
+        assert!(roles::session_roles(&cat, &x).is_empty(), "{iss}");
+    }
+    // Names: `name` is `name@%`; repeats count once.
+    assert_eq!(roles::resolve(state, "app_admin@%"), Some(APP_ADMIN));
+    assert_eq!(
+        roles::of_names(
+            state,
+            &["app_admin".into(), "app_admin@%".into(), "ghost".into()]
+        ),
+        (vec![APP_ADMIN], vec!["ghost".to_owned()])
+    );
+    // The backend: a token-taking user holds what its possible token roles
+    // give (the template `dept_{dept}` matches `dept_sales`, not
+    // `unrelated`); a password-only user doesn't.
+    let auth = TenantAuth::of(&cat).unwrap();
+    let mut possible = roles::possible_roles(auth.issuers(), state);
+    possible.sort();
+    assert_eq!(possible, vec![APP_ADMIN, DEPT_SALES]);
+    let want = crate::authz::backend::desired(&cat, state, auth);
+    let select = crate::authz::privilege::ActionSet::of(&[crate::authz::privilege::Action::Select]);
+    let tenant_row = crate::authz::backend::BackendTarget::Db("t42\\_d%".into());
+    let holds = |account: &str| {
+        want.get(account)
+            .and_then(|g| g.get(&tenant_row))
+            .is_some_and(|a| a.contains(select))
+    };
+    assert!(holds("t42_u1"), "{want:?}");
+    assert!(!holds("t42_u2"), "{want:?}");
+    // HTTP and MongoDB token logins audit the same way.
+    let tok = w.key.sign(&c);
+    let (_, v) = w
+        .svc
+        .token_login(&token_req(TokenProtocol::Http, "http", &tok))
+        .await
+        .unwrap();
+    assert_eq!(v.roles, ["app_admin", "ghost", "dept_sales"]);
+    let last = w.audit.events().last().cloned().unwrap();
+    assert_eq!(
+        (last.event, last.protocol),
+        ("auth.token_roles_ignored", "http")
+    );
+}
+
+fn pinned(dcs: &[&str], deny: bool) -> Option<crate::account::TenantResidency> {
+    Some(crate::account::TenantResidency {
+        allowed_dcs: dcs
+            .iter()
+            .map(|d| sprig_common::ids::DcId::new(*d).unwrap())
+            .collect(),
+        deny_remote_access: deny,
+    })
+}
+
+/// A token login arriving outside the tenant's allowed DCs is decided there
+/// and keeps its verified claims and roles: MySQL's token as password
+/// (relayed by `begin`), and HTTP and MongoDB token logins (handed off by
+/// `token_login`). The source never loads the tenant's catalog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handed_off_token_login_keeps_its_claims_and_roles() {
+    use crate::handoff::{
+        HandoffResult, HandoffStart, HandoffTarget, LocalPeers, PrincipalWire, ResidentLogin,
+        serve_handoff,
+    };
+    let dc = |d: &str| sprig_common::ids::DcId::new(d).unwrap();
+    let fra = world_in(Some(("fra1", Arc::new(LocalPeers::default()))), true).await;
+    fra.tenants.set_residency("acme", pinned(&["fra1"], false));
+    let peers: Arc<dyn HandoffTarget> =
+        Arc::new(LocalPeers::default().with(dc("fra1"), Arc::clone(&fra.svc)));
+    let nyc = world_in(Some(("nyc1", peers)), true).await;
+    nyc.tenants.set_residency("acme", pinned(&["fra1"], false));
+    nyc.catalogs.map.lock().unwrap().clear();
+    let now = fra.clock.wall();
+    let mut c = claims(now, "tok");
+    c["dept"] = json!("sales");
+    let tok = fra.key.sign(&c);
+    let want_roles = ["app_admin", "ghost", "dept_sales"];
+
+    // MySQL: the token as the password, relayed to fra1.
+    let mut l = nyc.svc.begin(req("acme.tok")).await;
+    assert!(matches!(l, ResidentLogin::Relay(_)), "{l:?}");
+    assert!(
+        l.check_password(Zeroizing::new(tok.as_bytes().to_vec()))
+            .await
+    );
+    assert_eq!(
+        l.decide(Outcome::Verified, AuthPath::Full).await,
+        AuthVerdict::Accept
+    );
+    let t = l.token().cloned().unwrap();
+    assert_eq!(t.claims["org"], json!("o-7"));
+    assert_eq!(t.claims["dept"], json!("sales"));
+    assert_eq!(t.roles, want_roles);
+    assert_eq!(t.issuer, ISS);
+    // The wire form round-trips with its token.
+    let wire = PrincipalWire::accepted(l.principal().unwrap(), Some(&t));
+    let back: PrincipalWire = serde_json::from_str(&serde_json::to_string(&wire).unwrap()).unwrap();
+    assert_eq!(back.verified_token().unwrap().as_ref(), Some(&t));
+    assert_eq!(&back.principal().unwrap(), l.principal().unwrap());
+    // Without a token (a password login, or a target from before): none.
+    let old = serde_json::to_value(PrincipalWire::of(l.principal().unwrap())).unwrap();
+    assert!(old.get("token").is_none(), "{old}");
+    // The source's session derives the same roles from the claims.
+    assert_eq!(
+        roles::session_roles(&acme_catalog(&fra), &t.claims),
+        vec![APP_ADMIN, DEPT_SALES]
+    );
+    // fra1 decided and audited, the ignored role too.
+    let names = fra.audit.names();
+    assert!(names.contains(&"auth.handoff"), "{names:?}");
+    assert!(names.contains(&"auth.token_roles_ignored"), "{names:?}");
+
+    // HTTP bearer and MONGODB-OIDC: handed off too.
+    for (protocol, label) in [
+        (TokenProtocol::Http, "http"),
+        (TokenProtocol::Mongodb, "mongo"),
+    ] {
+        let (p, v) = nyc
+            .svc
+            .token_login(&token_req(protocol, label, &tok))
+            .await
+            .unwrap();
+        assert_eq!((p.user.as_str(), p.tenant), ("tok", Some(ACME)), "{label}");
+        assert_eq!(v.claims["org"], json!("o-7"), "{label}");
+        assert_eq!(v.roles, want_roles, "{label}");
+    }
+    let handoffs = fra
+        .audit
+        .events()
+        .iter()
+        .filter(|e| e.event == "auth.handoff" && e.mechanism == Some("jwt"))
+        .count();
+    assert_eq!(handoffs, 2);
+    // A bad token: fra1's 1045.
+    let mut forged = c.clone();
+    forged["org"] = json!("o-1");
+    let parts: Vec<&str> = tok.split('.').collect();
+    let bad = format!(
+        "{}.{}.{}",
+        parts[0],
+        URL_SAFE_NO_PAD.encode(forged.to_string()),
+        parts[2]
+    );
+    let e = nyc
+        .svc
+        .token_login(&token_req(TokenProtocol::Http, "http", &bad))
+        .await
+        .unwrap_err();
+    assert_eq!(e.error.code, 1045, "{e:?}");
+    assert!(
+        nyc.catalogs.map.lock().unwrap().is_empty(),
+        "the source never loads the tenant's catalog"
+    );
+    // deny_remote_access: 39302.
+    nyc.tenants.set_residency("acme", pinned(&["fra1"], true));
+    let e = nyc
+        .svc
+        .token_login(&token_req(TokenProtocol::Http, "http", &tok))
+        .await
+        .unwrap_err();
+    assert_eq!(e.error.code, 39302);
+    // A token hand-off reaching a DC that isn't allowed: 39301 there.
+    fra.tenants.set_residency("acme", pinned(&["ams1"], false));
+    let start = HandoffStart::of_token(&token_req(TokenProtocol::Http, "http", &tok), dc("nyc1"));
+    let r = serve_handoff(&fra.svc, start, tok.as_bytes()).await;
+    assert!(
+        matches!(r, HandoffResult::Refused(ref p) if p.code == 39301),
+        "{r:?}"
     );
 }

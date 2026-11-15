@@ -33,7 +33,7 @@ Commands:
   space            Spaces and shares
   inherit          Inherited tables, shares, tree-wide ids and the references that refuse deletes
   txn              In-doubt distributed transactions
-  ai               The AI assistants: providers, and the administration agent's incidents
+  ai               The AI assistants: providers, and the administration agent's incidents, health checks, write-ups and upgrade checks
   sink             Sinks: list, show, pause, resume, reset, dead letters, connections
   graph            Graphs
   search           Search indexes and their copies on workers
@@ -521,7 +521,7 @@ Commands:
   suspend      Suspend a tenant and its subtree: logins fail with 39303, open sessions close (auth.close_sessions_on_revoke), triggers, sinks and schedules wait
   resume       Resume a suspended tenant: logins and background work start again
   issuer       The tenant's token issuers: OIDC providers whose JWTs log in, and their claim mappings
-  token-login  Let an account log in with an issuer's token over MySQL and Redis (its token method)
+  token-login  Let an account log in with an issuer's tokens: its token method, needed on every protocol
   move         Move a tenant to another data center, online
   traffic      A tenant's traffic by client data center, and the move it suggests
   failover     Fail a tenant over to its standby in another data center
@@ -965,7 +965,7 @@ Options:
 #### `sprigctl tenant token-login`
 
 ```text
-Let an account log in with an issuer's token over MySQL and Redis (its token method)
+Let an account log in with an issuer's tokens: its token method, needed on every protocol
 
 Usage: sprigctl tenant token-login [OPTIONS] <name> <user>
 
@@ -3190,14 +3190,18 @@ Options:
 ### `sprigctl ai`
 
 ```text
-The AI assistants: providers, and the administration agent's incidents
+The AI assistants: providers, and the administration agent's incidents, health checks, write-ups and upgrade checks
 
 Usage: sprigctl ai [OPTIONS] <COMMAND>
 
 Commands:
-  provider  AI providers the assistants call
-  incident  Incidents the administration agent counted, triaged and advised on
-  help      Print this message or the help of the given subcommand(s)
+  provider       AI providers the assistants call
+  incident       Incidents the administration agent counted, triaged and advised on
+  health         Findings of the administration agent's health checks
+  metrics        A series of the administration agent's metric history
+  decisions      The DC's decision log: failovers, data moves, incidents, findings and write-ups
+  upgrade-check  What upgrading to a version changes or breaks, given how this deployment is used
+  help           Print this message or the help of the given subcommand(s)
 
 Options:
       --endpoint <endpoint>        Admin API endpoint [default: http://127.0.0.1:7480] [env: SPRIGCTL_ENDPOINT=]
@@ -3365,9 +3369,11 @@ Incidents the administration agent counted, triaged and advised on
 Usage: sprigctl ai incident [OPTIONS] <COMMAND>
 
 Commands:
-  list  This DC's incidents, newest first
-  show  One incident: what was sent, triage and the advice
-  help  Print this message or the help of the given subcommand(s)
+  list      This DC's incidents, newest first
+  show      One incident: what was sent, triage and the advice
+  writeups  Write-ups of failovers, failed moves and incidents, newest first
+  writeup   One write-up: timeline, cause, effects and follow-ups, and what was sent
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
       --endpoint <endpoint>        Admin API endpoint [default: http://127.0.0.1:7480] [env: SPRIGCTL_ENDPOINT=]
@@ -3417,6 +3423,211 @@ Options:
       --payload                    Also print every exact payload sent to the AI provider
       --token-file <token-file>    A file holding the Admin API bearer token [env: SPRIGCTL_TOKEN_FILE=]
       --ca-file <ca-file>          For an https:// endpoint: the CA (PEM) its certificate is checked against [env: SPRIGCTL_CA_FILE=]
+      --client-cert <client-cert>  For an https:// endpoint that requires one: a client certificate (PEM) [env: SPRIGCTL_CLIENT_CERT=]
+      --client-key <client-key>    The private key (PEM) of --client-cert [env: SPRIGCTL_CLIENT_KEY=]
+      --dc <dc>                    Data center to act in
+  -o, --output <output>            Output format [default: table] [possible values: table, json, yaml]
+      --dry-run                    Show what would change
+      --yes                        Don't ask for confirmation
+  -h, --help                       Print help
+```
+
+##### `sprigctl ai incident writeups`
+
+```text
+Write-ups of failovers, failed moves and incidents, newest first
+
+Usage: sprigctl ai incident writeups [OPTIONS]
+
+Options:
+      --endpoint <endpoint>        Admin API endpoint [default: http://127.0.0.1:7480] [env: SPRIGCTL_ENDPOINT=]
+      --token-file <token-file>    A file holding the Admin API bearer token [env: SPRIGCTL_TOKEN_FILE=]
+      --ca-file <ca-file>          For an https:// endpoint: the CA (PEM) its certificate is checked against [env: SPRIGCTL_CA_FILE=]
+      --client-cert <client-cert>  For an https:// endpoint that requires one: a client certificate (PEM) [env: SPRIGCTL_CLIENT_CERT=]
+      --client-key <client-key>    The private key (PEM) of --client-cert [env: SPRIGCTL_CLIENT_KEY=]
+      --dc <dc>                    Data center to act in
+  -o, --output <output>            Output format [default: table] [possible values: table, json, yaml]
+      --dry-run                    Show what would change
+      --yes                        Don't ask for confirmation
+  -h, --help                       Print help
+```
+
+##### `sprigctl ai incident writeup`
+
+```text
+One write-up: timeline, cause, effects and follow-ups, and what was sent
+
+Usage: sprigctl ai incident writeup [OPTIONS] <id>
+
+Arguments:
+  <id>  An event id (cf-..., df-..., mv-...) or an incident fingerprint
+
+Options:
+      --draft                      Draft it now (again), with the administration model
+      --endpoint <endpoint>        Admin API endpoint [default: http://127.0.0.1:7480] [env: SPRIGCTL_ENDPOINT=]
+      --token-file <token-file>    A file holding the Admin API bearer token [env: SPRIGCTL_TOKEN_FILE=]
+      --ca-file <ca-file>          For an https:// endpoint: the CA (PEM) its certificate is checked against [env: SPRIGCTL_CA_FILE=]
+      --client-cert <client-cert>  For an https:// endpoint that requires one: a client certificate (PEM) [env: SPRIGCTL_CLIENT_CERT=]
+      --client-key <client-key>    The private key (PEM) of --client-cert [env: SPRIGCTL_CLIENT_KEY=]
+      --dc <dc>                    Data center to act in
+  -o, --output <output>            Output format [default: table] [possible values: table, json, yaml]
+      --dry-run                    Show what would change
+      --yes                        Don't ask for confirmation
+  -h, --help                       Print help
+```
+
+#### `sprigctl ai health`
+
+```text
+Findings of the administration agent's health checks
+
+Usage: sprigctl ai health [OPTIONS] <COMMAND>
+
+Commands:
+  list   Findings, newest first
+  show   One finding: what the rules found, the warning and what was sent
+  check  Run the health rules now and print what they find; nothing is filed
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+      --endpoint <endpoint>        Admin API endpoint [default: http://127.0.0.1:7480] [env: SPRIGCTL_ENDPOINT=]
+      --token-file <token-file>    A file holding the Admin API bearer token [env: SPRIGCTL_TOKEN_FILE=]
+      --ca-file <ca-file>          For an https:// endpoint: the CA (PEM) its certificate is checked against [env: SPRIGCTL_CA_FILE=]
+      --client-cert <client-cert>  For an https:// endpoint that requires one: a client certificate (PEM) [env: SPRIGCTL_CLIENT_CERT=]
+      --client-key <client-key>    The private key (PEM) of --client-cert [env: SPRIGCTL_CLIENT_KEY=]
+      --dc <dc>                    Data center to act in
+  -o, --output <output>            Output format [default: table] [possible values: table, json, yaml]
+      --dry-run                    Show what would change
+      --yes                        Don't ask for confirmation
+  -h, --help                       Print help
+```
+
+##### `sprigctl ai health list`
+
+```text
+Findings, newest first
+
+Usage: sprigctl ai health list [OPTIONS]
+
+Options:
+      --endpoint <endpoint>        Admin API endpoint [default: http://127.0.0.1:7480] [env: SPRIGCTL_ENDPOINT=]
+      --token-file <token-file>    A file holding the Admin API bearer token [env: SPRIGCTL_TOKEN_FILE=]
+      --ca-file <ca-file>          For an https:// endpoint: the CA (PEM) its certificate is checked against [env: SPRIGCTL_CA_FILE=]
+      --client-cert <client-cert>  For an https:// endpoint that requires one: a client certificate (PEM) [env: SPRIGCTL_CLIENT_CERT=]
+      --client-key <client-key>    The private key (PEM) of --client-cert [env: SPRIGCTL_CLIENT_KEY=]
+      --dc <dc>                    Data center to act in
+  -o, --output <output>            Output format [default: table] [possible values: table, json, yaml]
+      --dry-run                    Show what would change
+      --yes                        Don't ask for confirmation
+  -h, --help                       Print help
+```
+
+##### `sprigctl ai health show`
+
+```text
+One finding: what the rules found, the warning and what was sent
+
+Usage: sprigctl ai health show [OPTIONS] <key>
+
+Arguments:
+  <key>  The finding's key
+
+Options:
+      --endpoint <endpoint>        Admin API endpoint [default: http://127.0.0.1:7480] [env: SPRIGCTL_ENDPOINT=]
+      --token-file <token-file>    A file holding the Admin API bearer token [env: SPRIGCTL_TOKEN_FILE=]
+      --ca-file <ca-file>          For an https:// endpoint: the CA (PEM) its certificate is checked against [env: SPRIGCTL_CA_FILE=]
+      --client-cert <client-cert>  For an https:// endpoint that requires one: a client certificate (PEM) [env: SPRIGCTL_CLIENT_CERT=]
+      --client-key <client-key>    The private key (PEM) of --client-cert [env: SPRIGCTL_CLIENT_KEY=]
+      --dc <dc>                    Data center to act in
+  -o, --output <output>            Output format [default: table] [possible values: table, json, yaml]
+      --dry-run                    Show what would change
+      --yes                        Don't ask for confirmation
+  -h, --help                       Print help
+```
+
+##### `sprigctl ai health check`
+
+```text
+Run the health rules now and print what they find; nothing is filed
+
+Usage: sprigctl ai health check [OPTIONS]
+
+Options:
+      --endpoint <endpoint>        Admin API endpoint [default: http://127.0.0.1:7480] [env: SPRIGCTL_ENDPOINT=]
+      --token-file <token-file>    A file holding the Admin API bearer token [env: SPRIGCTL_TOKEN_FILE=]
+      --ca-file <ca-file>          For an https:// endpoint: the CA (PEM) its certificate is checked against [env: SPRIGCTL_CA_FILE=]
+      --client-cert <client-cert>  For an https:// endpoint that requires one: a client certificate (PEM) [env: SPRIGCTL_CLIENT_CERT=]
+      --client-key <client-key>    The private key (PEM) of --client-cert [env: SPRIGCTL_CLIENT_KEY=]
+      --dc <dc>                    Data center to act in
+  -o, --output <output>            Output format [default: table] [possible values: table, json, yaml]
+      --dry-run                    Show what would change
+      --yes                        Don't ask for confirmation
+  -h, --help                       Print help
+```
+
+#### `sprigctl ai metrics`
+
+```text
+A series of the administration agent's metric history
+
+Usage: sprigctl ai metrics [OPTIONS] <name>
+
+Arguments:
+  <name>  The series, such as sprig_backend_replica_lag_seconds
+
+Options:
+      --endpoint <endpoint>        Admin API endpoint [default: http://127.0.0.1:7480] [env: SPRIGCTL_ENDPOINT=]
+      --label <label>              Only series with this label=value (repeat for more)
+      --days <days>                Days to show, 1 to 30 [default: 7]
+      --token-file <token-file>    A file holding the Admin API bearer token [env: SPRIGCTL_TOKEN_FILE=]
+      --ca-file <ca-file>          For an https:// endpoint: the CA (PEM) its certificate is checked against [env: SPRIGCTL_CA_FILE=]
+      --client-cert <client-cert>  For an https:// endpoint that requires one: a client certificate (PEM) [env: SPRIGCTL_CLIENT_CERT=]
+      --client-key <client-key>    The private key (PEM) of --client-cert [env: SPRIGCTL_CLIENT_KEY=]
+      --dc <dc>                    Data center to act in
+  -o, --output <output>            Output format [default: table] [possible values: table, json, yaml]
+      --dry-run                    Show what would change
+      --yes                        Don't ask for confirmation
+  -h, --help                       Print help
+```
+
+#### `sprigctl ai decisions`
+
+```text
+The DC's decision log: failovers, data moves, incidents, findings and write-ups
+
+Usage: sprigctl ai decisions [OPTIONS] [subject]
+
+Arguments:
+  [subject]  Words to match (an id, a cluster, a kind); the newest when absent
+
+Options:
+      --days <days>                Days to look back, 1 to 90 [default: 30]
+      --endpoint <endpoint>        Admin API endpoint [default: http://127.0.0.1:7480] [env: SPRIGCTL_ENDPOINT=]
+      --token-file <token-file>    A file holding the Admin API bearer token [env: SPRIGCTL_TOKEN_FILE=]
+      --ca-file <ca-file>          For an https:// endpoint: the CA (PEM) its certificate is checked against [env: SPRIGCTL_CA_FILE=]
+      --client-cert <client-cert>  For an https:// endpoint that requires one: a client certificate (PEM) [env: SPRIGCTL_CLIENT_CERT=]
+      --client-key <client-key>    The private key (PEM) of --client-cert [env: SPRIGCTL_CLIENT_KEY=]
+      --dc <dc>                    Data center to act in
+  -o, --output <output>            Output format [default: table] [possible values: table, json, yaml]
+      --dry-run                    Show what would change
+      --yes                        Don't ask for confirmation
+  -h, --help                       Print help
+```
+
+#### `sprigctl ai upgrade-check`
+
+```text
+What upgrading to a version changes or breaks, given how this deployment is used
+
+Usage: sprigctl ai upgrade-check [OPTIONS] --to <to>
+
+Options:
+      --endpoint <endpoint>        Admin API endpoint [default: http://127.0.0.1:7480] [env: SPRIGCTL_ENDPOINT=]
+      --to <to>                    The target version
+      --pack <pack>                The target version's docs pack file (else the controller looks for it)
+      --token-file <token-file>    A file holding the Admin API bearer token [env: SPRIGCTL_TOKEN_FILE=]
+      --ca-file <ca-file>          For an https:// endpoint: the CA (PEM) its certificate is checked against [env: SPRIGCTL_CA_FILE=]
+      --explain                    Also ask the administration model to explain the report (needs ai.model.admin)
       --client-cert <client-cert>  For an https:// endpoint that requires one: a client certificate (PEM) [env: SPRIGCTL_CLIENT_CERT=]
       --client-key <client-key>    The private key (PEM) of --client-cert [env: SPRIGCTL_CLIENT_KEY=]
       --dc <dc>                    Data center to act in

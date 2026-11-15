@@ -10,6 +10,12 @@
 //!   with its reason in the gateway's audit log;
 //! - a row policy on `SPRIG_CLAIM('org')` filters rows by the token's claim;
 //! - a just-in-time account over HTTP (`auth.user_created_jit`);
+//! - token roles (chapter 29): a role mapping on the `groups` claim gives
+//!   the session role `ajgate`, the only way `tok` reads table `gated`;
+//!   without the claim, or with a password, 1142; a mapped role the tenant
+//!   doesn't define is ignored with `auth.token_roles_ignored`, never
+//!   created; `SET ROLE NONE`, `DEFAULT` and the role by name; MySQL,
+//!   MariaDB, HTTP and `COM_CHANGE_USER`;
 //! - key rotation: a token signed with a new key is accepted after the
 //!   gateway refetches the key set (at most once a minute).
 //!
@@ -123,6 +129,21 @@ fn claims(user: &str, org: &str) -> Value {
     let n = now();
     json!({"iss": ISS, "aud": AUD, "sub": format!("s-{user}"), "preferred_username": user,
            "org": org, "iat": n, "exp": n + 600})
+}
+
+/// [`claims`] with a `groups` claim.
+fn claims_in(user: &str, groups: &[&str]) -> Value {
+    let mut c = claims(user, "o-1");
+    c["groups"] = json!(groups);
+    c
+}
+
+/// The rows of `gated` the session reads, or the error's code.
+async fn gated(s: &mut Conn) -> Result<usize, u16> {
+    s.query::<i32, _>(format!("SELECT id FROM {DB}.gated"))
+        .await
+        .map(|v| v.len())
+        .map_err(|e| code(&e))
 }
 
 /// The key set, served on 127.0.0.1 by the test.
@@ -340,7 +361,14 @@ async fn jwt_logins_live() {
         format!("INSERT INTO {DB}.docs VALUES (1, 'o-1', 'a'), (2, 'o-1', 'b'), (3, 'o-2', 'c')"),
         "DROP USER IF EXISTS tok".into(),
         "CREATE USER tok IDENTIFIED BY 'Tok-pass-1'".into(),
-        format!("GRANT SELECT ON {DB}.* TO tok"),
+        // tok reads docs; gated only through the token role ajgate.
+        format!("GRANT SELECT ON {DB}.docs TO tok"),
+        format!("CREATE TABLE {DB}.gated (id INT PRIMARY KEY)"),
+        format!("INSERT INTO {DB}.gated VALUES (1), (2)"),
+        "DROP ROLE IF EXISTS ajgate".into(),
+        "DROP ROLE IF EXISTS ajghost".into(),
+        "CREATE ROLE ajgate".into(),
+        format!("GRANT SELECT ON {DB}.gated TO ajgate"),
         format!("CREATE POLICY byorg ON {DB}.docs USING (org = SPRIG_CLAIM('org'))"),
         format!("ALTER TABLE {DB}.docs ENABLE ROW LEVEL SECURITY"),
     ] {
@@ -352,7 +380,11 @@ async fn jwt_logins_live() {
         "issuer": ISS, "jwks_url": idp.url, "audiences": [AUD], "algorithms": ["ES256"],
         "jit_users": true, "max_lifetime_s": 3600,
         "mappings": [{"priority": 1, "kind": "user", "claim": "preferred_username",
-                      "match_kind": "any", "target": "{preferred_username}"}]
+                      "match_kind": "any", "target": "{preferred_username}"},
+                     {"priority": 2, "kind": "role", "claim": "groups",
+                      "match_kind": "equals", "match_value": "gate", "target": "ajgate"},
+                     {"priority": 3, "kind": "role", "claim": "groups",
+                      "match_kind": "equals", "match_value": "ghost", "target": "ajghost"}]
     });
     let (st, b) = http(
         admin,
@@ -549,6 +581,160 @@ async fn jwt_logins_live() {
         format!("{r:?}")
     });
 
+    // Token roles (chapter 29): the claim gives ajgate for the session.
+    let with = k1.sign(&claims_in("tok", &["gate"]));
+    let without = k1.sign(&claims_in("tok", &["staff"]));
+    let ghost = k1.sign(&claims_in("tok", &["gate", "ghost"]));
+    for (proto, p) in [("mysql", mysql), ("mariadb", mariadb)] {
+        match my(p, "acme.tok", &with).await {
+            Ok(mut s) => {
+                let r = gated(&mut s).await;
+                c.ok(
+                    &format!("{proto}: the mapped role reads the gated table"),
+                    r == Ok(2),
+                    || format!("{r:?}"),
+                );
+                let role: Option<String> = s.query_first("SELECT CURRENT_ROLE()").await.unwrap();
+                c.ok(
+                    &format!("{proto}: CURRENT_ROLE() names ajgate"),
+                    role.as_deref().is_some_and(|r| r.contains("ajgate")),
+                    || format!("{role:?}"),
+                );
+                if proto == "mysql" {
+                    s.query_drop("SET ROLE NONE").await.unwrap();
+                    let r = gated(&mut s).await;
+                    c.ok(
+                        "mysql: SET ROLE NONE drops it: 1142",
+                        r == Err(1142),
+                        || format!("{r:?}"),
+                    );
+                    s.query_drop("SET ROLE DEFAULT").await.unwrap();
+                    let r = gated(&mut s).await;
+                    c.ok("mysql: SET ROLE DEFAULT includes it", r == Ok(2), || {
+                        format!("{r:?}")
+                    });
+                    s.query_drop("SET ROLE NONE").await.unwrap();
+                    let r = s.query_drop("SET ROLE ajgate").await;
+                    let g = gated(&mut s).await;
+                    c.ok("mysql: SET ROLE names it", r.is_ok() && g == Ok(2), || {
+                        format!("{r:?} {g:?}")
+                    });
+                }
+            }
+            Err(e) => c.ok(&format!("{proto}: token with the role"), false, || {
+                e.to_string()
+            }),
+        }
+        match my(p, "acme.tok", &without).await {
+            Ok(mut s) => {
+                let r = gated(&mut s).await;
+                c.ok(
+                    &format!("{proto}: without the claim: 1142"),
+                    r == Err(1142),
+                    || format!("{r:?}"),
+                );
+                let r = s.query_drop("SET ROLE ajgate").await;
+                c.ok(
+                    &format!("{proto}: without the claim SET ROLE ajgate is refused"),
+                    r.is_err(),
+                    String::new,
+                );
+            }
+            Err(e) => c.ok(&format!("{proto}: token without the role"), false, || {
+                e.to_string()
+            }),
+        }
+    }
+    match my(mysql, "acme.tok", "Tok-pass-1").await {
+        Ok(mut s) => {
+            let r = gated(&mut s).await;
+            c.ok("mysql: password login: 1142", r == Err(1142), || {
+                format!("{r:?}")
+            });
+            // COM_CHANGE_USER to a token with the claim, then without.
+            let r = s
+                .change_user(
+                    mysql_async::ChangeUserOpts::default()
+                        .with_user(Some("acme.tok".into()))
+                        .with_pass(Some(with.clone())),
+                )
+                .await;
+            let g = gated(&mut s).await;
+            c.ok(
+                "change_user: to a token with the claim reads gated",
+                r.is_ok() && g == Ok(2),
+                || format!("{r:?} {g:?}"),
+            );
+            let r = s
+                .change_user(
+                    mysql_async::ChangeUserOpts::default()
+                        .with_user(Some("acme.tok".into()))
+                        .with_pass(Some(without.clone())),
+                )
+                .await;
+            let g = gated(&mut s).await;
+            c.ok(
+                "change_user: to a token without it: 1142",
+                r.is_ok() && g == Err(1142),
+                || format!("{r:?} {g:?}"),
+            );
+        }
+        Err(e) => c.ok("mysql: password login for change_user", false, || {
+            e.to_string()
+        }),
+    }
+    let (st, b) = http_sql(&with, Some("acme"), &format!("SELECT id FROM {DB}.gated")).await;
+    c.ok("http: the mapped role reads gated", st == 200, || {
+        format!("{st} {b}")
+    });
+    let (st, b) = http_sql(
+        &without,
+        Some("acme"),
+        &format!("SELECT id FROM {DB}.gated"),
+    )
+    .await;
+    c.ok(
+        "http: without the claim: 1142",
+        st != 200 && b.contains("1142"),
+        || format!("{st} {b}"),
+    );
+    // A mapped role the tenant doesn't define: ignored, audited, not made.
+    match my(mysql, "acme.tok", &ghost).await {
+        Ok(mut s) => {
+            let r = gated(&mut s).await;
+            c.ok(
+                "undefined role: the login works, ajgate still applies",
+                r == Ok(2),
+                || format!("{r:?}"),
+            );
+            let role: Option<String> = s.query_first("SELECT CURRENT_ROLE()").await.unwrap();
+            c.ok(
+                "undefined role: not active",
+                role.as_deref().is_some_and(|r| !r.contains("ajghost")),
+                || format!("{role:?}"),
+            );
+        }
+        Err(e) => c.ok("undefined role: login", false, || e.to_string()),
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    c.ok(
+        "audit: auth.token_roles_ignored names ajghost",
+        log_has(&["auth.token_roles_ignored", "ajghost"]),
+        String::new,
+    );
+    c.ok(
+        "audit: the login names its token role",
+        log_has(&["auth.login_succeeded", "token roles ajgate"]),
+        String::new,
+    );
+    let r = app.query_drop("CREATE ROLE ajghost").await;
+    c.ok(
+        "undefined role: never created (CREATE ROLE succeeds)",
+        r.is_ok(),
+        || format!("{r:?}"),
+    );
+    let _ = app.query_drop("DROP ROLE IF EXISTS ajghost").await;
+
     // Key rotation: the issuer adds k2. A k2 token is accepted once the
     // gateway refetches (an unknown kid refetches at most once a minute).
     let before = idp.hits();
@@ -589,6 +775,8 @@ async fn jwt_logins_live() {
         format!("DROP DATABASE IF EXISTS {DB}"),
         "DROP USER IF EXISTS tok".into(),
         "DROP USER IF EXISTS ajnew".into(),
+        "DROP ROLE IF EXISTS ajgate".into(),
+        "DROP ROLE IF EXISTS ajghost".into(),
     ] {
         let _ = app.query_drop(&s).await;
     }

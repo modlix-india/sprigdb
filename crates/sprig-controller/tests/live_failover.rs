@@ -19,6 +19,12 @@
 //!   other two with faultd for 15 s; it leaves the primary component, its
 //!   shards' writers are re-picked among the two left (rendezvous), a write
 //!   sent to it gets 1047; the cut heals and the test waits for Synced 3/3.
+//!   A commit counts as acknowledged only if the connection's `@@last_gtid`
+//!   moved: Galera can answer OK to the COMMIT of a transaction it rolled
+//!   back (decision HD27). `SPRIG_TEST_GALERA_CONTAINERS` and
+//!   `SPRIG_TEST_FAULTD` point it at a private Galera;
+//!   `SPRIG_TEST_LA_TEXT=1` sends text statements instead of prepared ones.
+//! - [`galera_aborts_report_1213`]: the aborts MariaDB does report.
 
 // Test code: long scenario functions, short names for record fields, and
 // locks held across awaits on purpose (a one-at-a-time guard; the
@@ -97,6 +103,11 @@ type Detail = Arc<std::sync::Mutex<BTreeMap<u64, String>>>;
 struct Acked {
     list: Vec<(u64, u64)>,
     detail: BTreeMap<u64, String>,
+    /// Galera: transactions rolled back without an error, counted as
+    /// failed.
+    silent: u64,
+    /// Of those, the ones where a later write committed on its own.
+    partial: u64,
 }
 
 struct Workload {
@@ -106,6 +117,10 @@ struct Workload {
     /// Where and when each acknowledged append committed, by value: for
     /// the failure message of a lost one.
     detail: Detail,
+    /// Galera: transactions rolled back without an error (see `txn`).
+    silent: Arc<AtomicU64>,
+    /// Of those, the ones where a write then ran outside the transaction.
+    partial: Arc<AtomicU64>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -124,20 +139,29 @@ fn start_workload(route: Route, processes: u32, isolation: &'static str, galera:
     let stop = Arc::new(AtomicBool::new(false));
     let acked = Arc::new(std::sync::Mutex::new(Vec::new()));
     let detail: Detail = Arc::default();
+    let silent = Arc::new(AtomicU64::new(0));
+    let partial = Arc::new(AtomicU64::new(0));
+    // Text statements instead of prepared ones (an experiment switch).
+    let text = skip::flag("SPRIG_TEST_LA_TEXT");
     let t0 = Instant::now();
     let next = Arc::new(AtomicU64::new(1));
     let mut tasks = Vec::new();
     for p in 0..processes {
-        let (history, stop, acked, detail, next, route) = (
+        let (history, stop, acked, detail, silent, partial, next, route) = (
             Arc::clone(&history),
             Arc::clone(&stop),
             Arc::clone(&acked),
             Arc::clone(&detail),
+            Arc::clone(&silent),
+            Arc::clone(&partial),
             Arc::clone(&next),
             Arc::clone(&route),
         );
         tasks.push(tokio::spawn(async move {
             let mut conn: Option<(String, mysql_async::Conn)> = None;
+            // The connection's `@@last_gtid` after its last commit that
+            // wrote (a new connection has none).
+            let mut last_gtid = String::new();
             let mut seed = u64::from(p) * 7919 + 13;
             let mut rnd = move |n: u64| {
                 seed ^= seed << 13;
@@ -190,6 +214,7 @@ fn start_workload(route: Route, processes: u32, isolation: &'static str, galera:
                                 let _ = c.query_drop("SET SESSION wsrep_sync_wait = 1").await;
                             }
                             conn = Some((target, c));
+                            last_gtid.clear();
                         }
                         _ => {
                             // Never invoked: nothing to record.
@@ -203,7 +228,54 @@ fn start_workload(route: Route, processes: u32, isolation: &'static str, galera:
                     continue;
                 };
                 let sent = t0.elapsed();
-                let r = tokio::time::timeout(Duration::from_secs(4), txn(c, &mops)).await;
+                let mut ended = None;
+                let mut r = tokio::time::timeout(
+                    Duration::from_secs(4),
+                    txn(c, &mops, text, &mut ended),
+                )
+                .await;
+                if let Some(e) = ended {
+                    silent.fetch_add(1, Ordering::SeqCst);
+                    if e.write {
+                        partial.fetch_add(1, Ordering::SeqCst);
+                    }
+                    eprintln!(
+                        "silent abort seen at operation {} ({}): process {p}, connection {}, {} ms; txn {invoke:?}",
+                        e.at,
+                        if e.write { "a write, which committed on its own" } else { "a read" },
+                        c.id(),
+                        ms(t0.elapsed())
+                    );
+                }
+                // Galera can roll back a transaction (a brute-force abort by
+                // another node's write set) and still answer OK to every
+                // statement and to COMMIT: the commit then wrote nothing
+                // (decision HD27). A commit that wrote has a new GTID, so a
+                // writing transaction counts as committed only if
+                // `@@last_gtid` moved; one whose GTID can't be read is
+                // indeterminate.
+                let writes = mops.iter().any(|(a, _, _)| *a);
+                if galera && writes && matches!(r, Ok(Ok(_))) {
+                    match tokio::time::timeout(
+                        Duration::from_secs(2),
+                        c.query_first::<String, _>("SELECT @@last_gtid"),
+                    )
+                    .await
+                    {
+                        Ok(Ok(Some(g))) if g != last_gtid => last_gtid = g,
+                        Ok(Ok(_)) => {
+                            silent.fetch_add(1, Ordering::SeqCst);
+                            eprintln!(
+                                "silent abort seen at COMMIT (no new GTID): process {p}, connection {}, {} ms; txn {invoke:?}",
+                                c.id(),
+                                ms(t0.elapsed())
+                            );
+                            r = Ok(Err(silent_abort()));
+                        }
+                        Ok(Err(e)) => r = Ok(Err(e)),
+                        Err(e) => r = Err(e),
+                    }
+                }
                 match r {
                     Ok(Ok(done)) => {
                         let mut a = acked.lock().expect("lock");
@@ -262,6 +334,8 @@ fn start_workload(route: Route, processes: u32, isolation: &'static str, galera:
         stop,
         acked,
         detail,
+        silent,
+        partial,
         tasks,
     }
 }
@@ -269,21 +343,32 @@ fn start_workload(route: Route, processes: u32, isolation: &'static str, galera:
 async fn txn(
     c: &mut mysql_async::Conn,
     mops: &[(bool, u64, u64)],
+    text: bool,
+    ended: &mut Option<Ended>,
 ) -> Result<Vec<Value>, mysql_async::Error> {
     c.query_drop("BEGIN").await?;
     let mut done = Vec::new();
-    for (append, k, v) in mops {
+    for (i, (append, k, v)) in mops.iter().enumerate() {
         if *append {
-            c.exec_drop(
-                format!("INSERT INTO `{SCHEMA}`.la (k, v) VALUES (?, ?) ON DUPLICATE KEY UPDATE v = CONCAT(v, ',', VALUES(v))"),
-                (k, v.to_string()),
-            )
-            .await?;
+            if text {
+                c.query_drop(format!("INSERT INTO `{SCHEMA}`.la (k, v) VALUES ({k}, '{v}') ON DUPLICATE KEY UPDATE v = CONCAT(v, ',', VALUES(v))"))
+                    .await?;
+            } else {
+                c.exec_drop(
+                    format!("INSERT INTO `{SCHEMA}`.la (k, v) VALUES (?, ?) ON DUPLICATE KEY UPDATE v = CONCAT(v, ',', VALUES(v))"),
+                    (k, v.to_string()),
+                )
+                .await?;
+            }
             done.push(json!(["append", k, v]));
         } else {
-            let cur: Option<String> = c
-                .exec_first(format!("SELECT v FROM `{SCHEMA}`.la WHERE k = ?"), (k,))
-                .await?;
+            let cur: Option<String> = if text {
+                c.query_first(format!("SELECT v FROM `{SCHEMA}`.la WHERE k = {k}"))
+                    .await?
+            } else {
+                c.exec_first(format!("SELECT v FROM `{SCHEMA}`.la WHERE k = ?"), (k,))
+                    .await?
+            };
             let list: Vec<u64> = cur
                 .unwrap_or_default()
                 .split(',')
@@ -291,9 +376,47 @@ async fn txn(
                 .collect();
             done.push(json!(["r", k, list]));
         }
+        // A plain read or write can't end a transaction: an answer saying
+        // none is open means Galera rolled it back without an error
+        // (decision HD27). Stop, as the gateway does.
+        if !in_trans(c) {
+            *ended = Some(Ended {
+                at: i,
+                write: *append,
+            });
+            return Err(silent_abort());
+        }
     }
     c.query_drop("COMMIT").await?;
     Ok(done)
+}
+
+/// Where a transaction's statements showed it had been rolled back.
+#[derive(Debug, Clone, Copy)]
+struct Ended {
+    /// The operation whose answer showed it.
+    at: usize,
+    /// That operation was a write, which then ran outside the transaction
+    /// and committed on its own.
+    write: bool,
+}
+
+/// The 1213 a silently rolled-back transaction gets in place of OK.
+fn silent_abort() -> mysql_async::Error {
+    mysql_async::Error::Server(mysql_async::ServerError {
+        code: 1213,
+        message: "Galera rolled the transaction back without an error (silent abort)".into(),
+        state: "40001".into(),
+    })
+}
+
+/// `SERVER_STATUS_IN_TRANS` in the connection's last OK packet (true when
+/// there is none to read).
+fn in_trans(c: &mysql_async::Conn) -> bool {
+    c.last_ok_packet().is_none_or(|p| {
+        p.status_flags()
+            .contains(mysql_async::consts::StatusFlags::SERVER_STATUS_IN_TRANS)
+    })
 }
 
 impl Workload {
@@ -304,7 +427,17 @@ impl Workload {
         }
         let list = self.acked.lock().expect("lock").clone();
         let detail = std::mem::take(&mut *self.detail.lock().expect("lock"));
-        (self.history, Acked { list, detail })
+        let silent = self.silent.load(Ordering::SeqCst);
+        let partial = self.partial.load(Ordering::SeqCst);
+        (
+            self.history,
+            Acked {
+                list,
+                detail,
+                silent,
+                partial,
+            },
+        )
     }
 }
 
@@ -993,9 +1126,11 @@ async fn galera_repicks_writers_and_heals() {
     stop.store(true, Ordering::SeqCst);
     let _ = watch.await;
     eprintln!(
-        "history {}; {} acknowledged appends; writer changes {:?}",
+        "history {}; {} acknowledged appends; {} silent aborts ({} with a later write committed on its own); writer changes {:?}",
         summarize(&history),
         acked.list.len(),
+        acked.silent,
+        acked.partial,
         changes
             .lock()
             .expect("lock")
@@ -1010,63 +1145,146 @@ async fn galera_repicks_writers_and_heals() {
     assert!(synced_3(&urls).await, "Synced 3/3 at the end");
 }
 
-/// What a session sees when Galera aborts its open transaction (a
-/// brute-force abort by another node's write set) while the session is
-/// idle between statements, and its next statement is a prepared one
-/// (COM_STMT_EXECUTE). Probe for the lost acknowledged append.
+/// The schema of [`galera_aborts_report_1213`].
+const BF_SCHEMA: &str = "r2failover_bf";
+
+/// Galera aborts a session's open transaction for another node's write set
+/// (a brute-force abort). In these five cases MariaDB reports it: the
+/// session's next statement gets 1213, text or prepared, whether the abort
+/// came while the session was idle or while its statement ran (`SLEEP`).
+/// The gateway relies on that; it catches only the silent case
+/// (decision HD27, `backend::session`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn galera_bf_abort_probe() {
-    if !enabled("galera_bf_abort_probe") {
+async fn galera_aborts_report_1213() {
+    if !enabled("galera_aborts_report_1213") {
         return;
     }
     let Some(urls) = skip::var(skip::MARIADB_GALERA).map(|v| skip::urls(&v)) else {
-        skip::report_missing(skip::MARIADB_GALERA, "galera_bf_abort_probe");
+        skip::report_missing(skip::MARIADB_GALERA, "galera_aborts_report_1213");
         return;
     };
-    const S: &str = "r2failover_bf";
-    exec(&urls[0], &[&format!("DROP DATABASE IF EXISTS {S}"), &format!("CREATE DATABASE {S}"),
-        &format!("CREATE TABLE {S}.t (k INT PRIMARY KEY, v TEXT NOT NULL) ENGINE=InnoDB"),
-        &format!("INSERT INTO {S}.t VALUES (1, 'a'), (2, 'b')")]).await;
+    let s = BF_SCHEMA;
+    exec(
+        &urls[0],
+        &[
+            &format!("DROP DATABASE IF EXISTS {s}"),
+            &format!("CREATE DATABASE {s}"),
+            &format!("CREATE TABLE {s}.t (k INT PRIMARY KEY, v TEXT NOT NULL) ENGINE=InnoDB"),
+            &format!("INSERT INTO {s}.t VALUES (1, 'a'), (2, 'b')"),
+        ],
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    for (round, next) in ["select", "insert", "text-select"].iter().enumerate() {
+    let rounds = [
+        "select",
+        "insert",
+        "text-select",
+        "select-sleep",
+        "text-select-sleep",
+    ];
+    for (round, next) in rounds.iter().enumerate() {
         let mut a = mysql_async::Conn::new(opts(&urls[0])).await.expect("a");
         let mut b = mysql_async::Conn::new(opts(&urls[1])).await.expect("b");
-        a.query_drop("BEGIN").await.expect("begin");
-        a.exec_drop(format!("UPDATE {S}.t SET v = CONCAT(v, ?) WHERE k = 1"), (format!("A{round}"),))
+        // Prepared (and cached) before the abort: the next statement is a
+        // plain COM_STMT_EXECUTE.
+        let _: Option<String> = a
+            .exec_first(format!("SELECT v FROM {s}.t WHERE k = ?"), (1,))
             .await
-            .expect("a's update");
+            .expect("warm select");
+        let _: Option<(String, i64)> = a
+            .exec_first(format!("SELECT v, SLEEP(?) FROM {s}.t WHERE k = 2"), (0,))
+            .await
+            .expect("warm sleep");
+        a.exec_drop(
+            format!("UPDATE {s}.t SET v = CONCAT(v, ?) WHERE k = 2"),
+            (String::new(),),
+        )
+        .await
+        .expect("warm update");
+        a.query_drop("BEGIN").await.expect("begin");
+        a.exec_drop(
+            format!("UPDATE {s}.t SET v = CONCAT(v, ?) WHERE k = 1"),
+            (format!("A{round}"),),
+        )
+        .await
+        .expect("a's update");
         let st = |c: &mysql_async::Conn| {
             c.last_ok_packet().map(|p| {
                 p.status_flags()
                     .contains(mysql_async::consts::StatusFlags::SERVER_STATUS_IN_TRANS)
             })
         };
-        eprintln!("round {round} ({next}): a in_trans after its update: {:?}", st(&a));
-        b.exec_drop(format!("UPDATE {S}.t SET v = CONCAT(v, ?) WHERE k = 1"), (format!("B{round}"),))
+        // The other node's write: before a's next statement, or (the
+        // sleep rounds) while it runs.
+        let sleepy = next.ends_with("sleep");
+        let other = async {
+            tokio::time::sleep(Duration::from_millis(if sleepy { 500 } else { 0 })).await;
+            b.exec_drop(
+                format!("UPDATE {s}.t SET v = CONCAT(v, ?) WHERE k = 1"),
+                (format!("B{round}"),),
+            )
             .await
             .expect("b's update");
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let r: Result<String, mysql_async::Error> = match *next {
-            "select" => a
-                .exec_first::<String, _, _>(format!("SELECT v FROM {S}.t WHERE k = ?"), (1,))
-                .await
-                .map(|v| format!("{v:?}")),
-            "insert" => a
-                .exec_drop(format!("UPDATE {S}.t SET v = CONCAT(v, ?) WHERE k = 2"), (format!("A{round}"),))
-                .await
-                .map(|()| format!("affected {}", a.affected_rows())),
-            _ => a
-                .query_first::<String, _>(format!("SELECT v FROM {S}.t WHERE k = 1"))
-                .await
-                .map(|v| format!("{v:?}")),
         };
-        eprintln!("round {round} ({next}): a's next statement -> {r:?}; in_trans {:?}", st(&a));
-        let c = a.query_drop("COMMIT").await;
-        eprintln!("round {round} ({next}): COMMIT -> {c:?}");
-        let rows: Vec<(u64, String)> = b.query(format!("SELECT k, v FROM {S}.t ORDER BY k")).await.expect("rows");
-        eprintln!("round {round} ({next}): rows now {rows:?}");
+        let mine = async {
+            if !sleepy {
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+            }
+            match *next {
+                "select" => a
+                    .exec_first::<String, _, _>(format!("SELECT v FROM {s}.t WHERE k = ?"), (1,))
+                    .await
+                    .map(|v| format!("{v:?}")),
+                "insert" => a
+                    .exec_drop(
+                        format!("UPDATE {s}.t SET v = CONCAT(v, ?) WHERE k = 2"),
+                        (format!("A{round}"),),
+                    )
+                    .await
+                    .map(|()| format!("affected {}", a.affected_rows())),
+                "select-sleep" => a
+                    .exec_first::<(String, i64), _, _>(
+                        format!("SELECT v, SLEEP(?) FROM {s}.t WHERE k = 2"),
+                        (2,),
+                    )
+                    .await
+                    .map(|v| format!("{v:?}")),
+                "text-select-sleep" => a
+                    .query_first::<(String, i64), _>(format!(
+                        "SELECT v, SLEEP(2) FROM {s}.t WHERE k = 2"
+                    ))
+                    .await
+                    .map(|v| format!("{v:?}")),
+                _ => a
+                    .query_first::<String, _>(format!("SELECT v FROM {s}.t WHERE k = 1"))
+                    .await
+                    .map(|v| format!("{v:?}")),
+            }
+        };
+        let ((), r) = tokio::join!(other, mine);
+        eprintln!(
+            "round {round} ({next}): a's next statement -> {r:?}; in_trans {:?}",
+            st(&a)
+        );
+        assert!(
+            matches!(&r, Err(mysql_async::Error::Server(e)) if e.code == 1213),
+            "round {round} ({next}): the aborted session's next statement got {r:?}"
+        );
+        a.query_drop("ROLLBACK").await.expect("rollback");
+        let rows: Vec<(u64, String)> = b
+            .query(format!("SELECT k, v FROM {s}.t ORDER BY k"))
+            .await
+            .expect("rows");
+        assert!(
+            !rows[0].1.contains(&format!("A{round}")),
+            "round {round} ({next}): the aborted update is in {rows:?}"
+        );
+        assert!(
+            rows[0].1.contains(&format!("B{round}")),
+            "round {round} ({next}): the other node's update is missing from {rows:?}"
+        );
         let _ = a.disconnect().await;
         let _ = b.disconnect().await;
     }
-    exec(&urls[0], &[&format!("DROP DATABASE IF EXISTS {S}")]).await;
+    exec(&urls[0], &[&format!("DROP DATABASE IF EXISTS {s}")]).await;
 }

@@ -180,9 +180,12 @@ pub trait PeerHost: Send + Sync + 'static {
 /// A handoff's result as the reply carries it.
 fn reply_of(r: &HandoffResult) -> HandoffLoginReply {
     match r {
-        HandoffResult::Accepted(p) => HandoffLoginReply {
+        HandoffResult::Accepted(p, token) => HandoffLoginReply {
             accepted: true,
-            principal_json: serde_json::to_string(&PrincipalWire::of(p)).unwrap_or_default(),
+            // The verified token (claims and roles) crosses with the
+            // principal.
+            principal_json: serde_json::to_string(&PrincipalWire::accepted(p, token.as_deref()))
+                .unwrap_or_default(),
             ..HandoffLoginReply::default()
         },
         HandoffResult::Refused(e) => HandoffLoginReply {
@@ -203,7 +206,10 @@ fn result_of(r: &HandoffLoginReply) -> Result<HandoffResult> {
     if r.accepted {
         let w: PrincipalWire = serde_json::from_str(&r.principal_json)
             .map_err(|e| SprigError::internal(format!("handoff reply: {e}")))?;
-        return Ok(HandoffResult::Accepted(Box::new(w.principal()?)));
+        return Ok(HandoffResult::Accepted(
+            Box::new(w.principal()?),
+            w.verified_token()?.map(Box::new),
+        ));
     }
     let mut sqlstate = *b"HY000";
     if r.sql_state.len() == 5 {
@@ -699,7 +705,25 @@ mod tests {
             password: Zeroizing<Vec<u8>>,
         ) -> HandoffResult {
             self.seen.lock().unwrap().push(start.source_dc.clone());
-            if password.as_slice() != b"pw" {
+            // A MySQL login with a token as its password, or a token login
+            // naming its account: the verified token crosses back.
+            let token =
+                (start.token_login.is_some() || password.as_slice() == b"pw-token").then(|| {
+                    Box::new(sprig_auth::oidc::VerifiedToken {
+                        issuer_id: 3,
+                        issuer: "https://idp.example".into(),
+                        kind: sprig_auth::oidc::IssuerKind::Oidc,
+                        jit_users: false,
+                        claims: Arc::new(serde_json::json!({
+                            "iss": "https://idp.example", "sub": "alice",
+                            "org": "o-1", "groups": ["gate"]
+                        })),
+                        user: Some("alice".into()),
+                        roles: vec!["r_gate".into()],
+                        expires: std::time::UNIX_EPOCH + Duration::from_secs(4_000_000_000),
+                    })
+                });
+            if token.is_none() && password.as_slice() != b"pw" {
                 return HandoffResult::Refused(ErrPacket::access_denied(
                     Persona::MySql84,
                     "acme.alice",
@@ -707,22 +731,25 @@ mod tests {
                     true,
                 ));
             }
-            HandoffResult::Accepted(Box::new(Principal {
-                tenant: Some(TenantId(42)),
-                tenant_name: Some("acme".into()),
-                user_id: Some(sprig_common::ids::UserId(1)),
-                user: "alice".into(),
-                host: "%".into(),
-                client_ip: start.client_ip,
-                must_change_password: false,
-                limits: sprig_auth::store::AccountLimits::default(),
-                auth_version: 7,
-                backend: BackendTarget {
-                    cluster: sprig_common::ids::ClusterId::new("fra1-c1").unwrap(),
-                    user: "t42_u1".into(),
-                    credentials: "file:/etc/sprigdb/creds/fra1.toml".parse().unwrap(),
-                },
-            }))
+            HandoffResult::Accepted(
+                Box::new(Principal {
+                    tenant: Some(TenantId(42)),
+                    tenant_name: Some("acme".into()),
+                    user_id: Some(sprig_common::ids::UserId(1)),
+                    user: "alice".into(),
+                    host: "%".into(),
+                    client_ip: start.client_ip,
+                    must_change_password: false,
+                    limits: sprig_auth::store::AccountLimits::default(),
+                    auth_version: 7,
+                    backend: BackendTarget {
+                        cluster: sprig_common::ids::ClusterId::new("fra1-c1").unwrap(),
+                        user: "t42_u1".into(),
+                        credentials: "file:/etc/sprigdb/creds/fra1.toml".parse().unwrap(),
+                    },
+                }),
+                token,
+            )
         }
     }
 
@@ -792,9 +819,10 @@ mod tests {
             .login(&dc("fra1"), start(ip), Zeroizing::new(b"pw".to_vec()))
             .await
             .unwrap();
-        let HandoffResult::Accepted(p) = r else {
+        let HandoffResult::Accepted(p, none) = r else {
             panic!("refused: {r:?}");
         };
+        assert!(none.is_none(), "a password login carries no token");
         assert_eq!(
             (p.user.as_str(), p.tenant, p.client_ip),
             ("alice", Some(TenantId(42)), ip)
@@ -803,6 +831,35 @@ mod tests {
             p.backend.credentials.to_string(),
             "file:/etc/sprigdb/creds/fra1.toml"
         );
+        // A token login (MySQL's token as password, and an HTTP bearer
+        // token handed off) keeps its verified claims and roles.
+        let mut token_start = start(ip);
+        token_start.login_name = Vec::new();
+        token_start.token_login = Some(sprig_auth::handoff::TokenStart {
+            protocol: sprig_auth::oidc::TokenProtocol::Http,
+            tenant: "acme".into(),
+        });
+        for (s, pw) in [
+            (start(ip), b"pw-token".to_vec()),
+            (token_start, b"eyJ.token".to_vec()),
+        ] {
+            let r = target
+                .login(&dc("fra1"), s, Zeroizing::new(pw))
+                .await
+                .unwrap();
+            let HandoffResult::Accepted(p, Some(t)) = r else {
+                panic!("no token: {r:?}");
+            };
+            assert_eq!(p.user, "alice");
+            assert_eq!(t.claims["org"], "o-1");
+            assert_eq!(t.claims["groups"][0], "gate");
+            assert_eq!(t.roles, ["r_gate"]);
+            assert_eq!(t.issuer, "https://idp.example");
+            assert_eq!(
+                t.expires,
+                std::time::UNIX_EPOCH + Duration::from_secs(4_000_000_000)
+            );
+        }
         let r = target
             .login(&dc("fra1"), start(ip), Zeroizing::new(b"no".to_vec()))
             .await
@@ -813,7 +870,7 @@ mod tests {
         );
         assert_eq!(
             host.seen.lock().unwrap().as_slice(),
-            [dc("nyc1"), dc("nyc1")]
+            [dc("nyc1"), dc("nyc1"), dc("nyc1"), dc("nyc1")]
         );
         // No ready gateway in the DC: an error, so the source tries the
         // next allowed DC (and 39301 when none answers).

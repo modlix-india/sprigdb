@@ -87,13 +87,15 @@ Verifiers live in the tenant's catalog, which no tenant account can read. Changi
 
 | Protocol | Mechanisms |
 |---|---|
-| MySQL (3306), MariaDB (3307) | `caching_sha2_password` (default), `mysql_native_password` when enabled, `mysql_clear_password` over TLS only |
-| HTTP (8080, 8443) | `Authorization: Basic`, `Bearer <api-key>`, `Bearer <sprig token>`; the browser login at `POST /v1/auth/login` |
-| MongoDB (27017) | SCRAM-SHA-256 |
-| Redis (6379) | `AUTH user password` |
+| MySQL (3306), MariaDB (3307) | `caching_sha2_password` (default), `mysql_native_password` when enabled, `mysql_clear_password` over TLS only; an identity provider's token as the password, over TLS |
+| HTTP (8080, 8443) | `Authorization: Basic`, `Bearer <api-key>`, `Bearer <sprig token>`, `Bearer <identity provider token>`; the browser login at `POST /v1/auth/login` |
+| MongoDB (27017) | SCRAM-SHA-256; `MONGODB-OIDC` with an identity provider's token |
+| Redis (6379) | `AUTH user password`, or `AUTH user <identity provider token>` |
 | Bolt (7687) | The `basic` scheme |
 | Kafka (9092) | SASL SCRAM-SHA-512, SCRAM-SHA-256, and `PLAIN` over TLS only |
 | AMQP (5672, 5671) | SASL `PLAIN` and `AMQPLAIN`; `EXTERNAL` (a client-certificate login) for accounts that require a certificate, on connections that presented a verified one |
+
+Logins with tokens from an identity provider need an issuer registered for the tenant and the account's `token` login method; see [Logins with identity provider tokens](external-tokens.md).
 
 ### caching_sha2_password needs TLS for a full login
 
@@ -255,6 +257,7 @@ Operators have their own second factor, required by default; see [Tenant adminis
 | 39302 `ER_SPRIG_REMOTE_ACCESS_DENIED` | The tenant can't be reached from this data centre (see [Residency](residency.md)) |
 | 39303 `ER_SPRIG_TENANT_SUSPENDED` | The tenant or an ancestor is suspended; reported only after the password checked out |
 | 39306 `ER_SPRIG_SESSION_REVOKED` | The session was closed by an account change |
+| 39786 `ER_SPRIG_TENANT_AMBIGUOUS` | An identity provider's token over HTTP, with neither a tenant host name nor `x-sprig-tenant` |
 
 ## Settings
 
@@ -295,6 +298,7 @@ All accept the tenant, data-centre and global scopes, except `auth.ip_failures_p
 
 - [Grants and roles](grants-and-roles.md)
 - [API keys and tokens](api-keys-and-tokens.md)
+- [Logins with identity provider tokens](external-tokens.md)
 - [TLS](tls.md)
 - [Audit](audit.md)
 - [Tenants and accounts in SQL](../sql/tenants-and-accounts.md)
