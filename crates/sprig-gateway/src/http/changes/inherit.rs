@@ -8,14 +8,27 @@
 //!   a parent tenant's layer row (its feed is tailed from the stream's
 //!     start, along the edges into this tenant): only its root space's
 //!     rows, of a table this tenant inherits, as from above the root
-//!   a copy row (__sprig_ih_<object>, a materialized edge into the tenant)
-//!     → an event of the object
+//!   a copy row (__sprig_ih_<object>, a materialized edge into the tenant;
+//!     the stream's feed keeps these tables, and decodes a tombstone as a
+//!     delete) → an event of the object
+//!   a parent tenant's copy row of its own tenant edge (its feed keeps
+//!     copy tables too) → an event of the object, as from above
+//!   a change of a tenant edge's source or copy (a parent tenant's root or
+//!     copy row, the tenant's own edge copy): the edges' copies' handovers
+//!     decide whether this change or the copy's sends it (decision RL71,
+//!     `sprig_inherit::handover`), read after the batch arrived; held while
+//!     an edge's first seed runs
+//!   any other change the subscriber's view doesn't read now (a space
+//!     above a serving copy inside the tenant, a copy of a share inside it
+//!     being seeded) → nothing: the change that reaches its view comes as
+//!     its own event (decision RL69)
 //!   read the record in s now, through the subscriber's session (its space,
 //!     privileges and row-level security; path columns hidden), with
 //!     SPRIG_ORIGIN()
 //!   present:
 //!     an update at an ancestor whose changed fields are all overridden
 //!       nearer to s, or that changed no visible field  → nothing
+//!     an insert of a record the subscriber could see  → update
 //!     an insert whose fields come from s' or below    → insert
 //!     else                                            → update (after: the
 //!                                                       merged record)
@@ -45,6 +58,7 @@ use sprig_common::ids::{ObjectId, TenantId};
 use sprig_feed::{
     ChangeEvent, Clusters, FeedItem, Op, PlacementView, StartAt, TailOptions, TenantTail,
 };
+use sprig_inherit::handover::{self, Gtid, Handover, Verdict};
 use sprig_inherit::{InheritState, SpaceId};
 use tokio::sync::mpsc;
 
@@ -64,6 +78,32 @@ pub(super) struct Mapped {
     pub space: Option<SpaceId>,
     /// A copy row's `_sprig_share`.
     pub share: Option<Value>,
+    /// Where the changed row is, for the copies' handover (RL71).
+    pub origin: Origin,
+    /// The change's GTID: domain, server, sequence number.
+    pub gtid: Gtid,
+}
+
+/// Where an inheritable object's changed row is, for the handover of the
+/// copies on the tenant edges (RL71).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Origin {
+    /// A layer row of a space of the subscriber's tenant, or a copy of a
+    /// share inside it: decided by what the view reads now (RL69).
+    Inside,
+    /// The subscriber's tenant's copy of its tenant edge.
+    OwnCopy,
+    /// A parent tenant's root row; the tenant's place in the line (root
+    /// first).
+    Above(usize),
+    /// A parent tenant's copy of its own tenant edge; its place.
+    AboveCopy(usize),
+    /// A parent tenant's row from a tenant the line doesn't know.
+    Unknown,
+}
+
+fn gtid_of(e: &ChangeEvent) -> Gtid {
+    (e.txn.domain, e.txn.server, e.txn.seq)
 }
 
 /// How an event is handled.
@@ -81,6 +121,9 @@ pub(super) struct Mapper {
     cat: std::sync::Arc<TenantCatalog>,
     space: SpaceId,
     tenant_name: String,
+    /// The tenant's ancestors, root first, then the tenant (only the
+    /// tenant when an ancestor's catalog can't be read).
+    line: Vec<Arc<TenantCatalog>>,
 }
 
 impl Mapper {
@@ -104,10 +147,25 @@ impl Mapper {
             .tenant_name
             .clone()
             .unwrap_or_else(|| tenant.to_string());
+        let mut line = Vec::new();
+        for a in cat.ancestry.iter() {
+            if let Ok(c) = svc
+                .cache
+                .get(a.id, Freshness::Cached { min_version: 0 })
+                .await
+            {
+                line.push(c);
+            } else {
+                line.clear();
+                break;
+            }
+        }
+        line.push(Arc::clone(&cat));
         Some(Self {
             cat,
             space,
             tenant_name,
+            line,
         })
     }
 
@@ -195,29 +253,56 @@ impl Mapper {
             }
         }
         e.table.clone_from(&obj.table);
+        let share = copy.and(share);
+        let origin = match &share {
+            Some(v) if copy_share(v) == Some(sprig_inherit::copy::UPSTREAM) => Origin::OwnCopy,
+            _ => Origin::Inside,
+        };
         Class::Inherit(Mapped {
             key,
             space,
-            share: copy.and(share),
+            share,
+            origin,
+            gtid: gtid_of(e),
         })
     }
 
     /// A parent tenant's event: its root space's layer rows of a table this
-    /// tenant inherits.
+    /// tenant inherits, and the rows of its copy of its own tenant edge
+    /// (RL71), renamed to the table.
     #[allow(clippy::wrong_self_convention)] // "from" the parent tenants
-    fn from_above(&self, st: &InheritState, e: &ChangeEvent) -> Class {
-        if matches!(e.op, Op::Ddl(_) | Op::Truncate) || e.table.starts_with("__sprig") {
+    fn from_above(&self, st: &InheritState, e: &mut ChangeEvent) -> Class {
+        if matches!(e.op, Op::Ddl(_) | Op::Truncate) {
             return Class::Drop;
         }
+        let at = self.line.iter().position(|c| c.tenant == e.tenant);
+        let copy = e
+            .table
+            .strip_prefix("__sprig_ih_")
+            .and_then(|n| n.parse::<u64>().ok());
+        let table = match copy {
+            Some(id) => {
+                // Its copy's object, in that tenant's catalog.
+                let Some(o) = at
+                    .and_then(|j| self.line[j].ext.get::<InheritState>(sprig_inherit::MODULE))
+                    .and_then(|s| s.object(ObjectId(id)))
+                else {
+                    return Class::Drop;
+                };
+                o.table.clone()
+            }
+            None if e.table.starts_with("__sprig") => return Class::Drop,
+            None => e.table.clone(),
+        };
         let Some(db) = self
             .cat
             .database(&sprig_catalog::ddl::database_key(&e.db_name, false))
         else {
             return Class::Drop;
         };
-        if st.object_named_ci(db.db_id, &e.table).is_none() {
+        let Some(obj) = st.object_named_ci(db.db_id, &table) else {
             return Class::Drop;
-        }
+        };
         let mut key = Map::new();
         for (n, v) in &e.key.0 {
             let Value::Object(m) = sprig_streams::envelope::image_json(&sprig_feed::Image(vec![(
@@ -232,14 +317,114 @@ impl Mapper {
                 }
                 continue;
             }
+            if n == "_sprig_share" {
+                // Only the copy of the tenant edge: a copy of a share
+                // inside that tenant feeds one of its spaces.
+                if m.get(n).and_then(copy_share) != Some(sprig_inherit::copy::UPSTREAM) {
+                    return Class::Drop;
+                }
+                continue;
+            }
             if !LAYER_KEYS.contains(&n.as_str()) {
                 key.extend(m);
             }
         }
+        if copy.is_some() {
+            e.table.clone_from(&obj.table);
+        }
+        let origin = match (at, copy) {
+            (Some(j), None) => Origin::Above(j),
+            (Some(j), Some(_)) => Origin::AboveCopy(j),
+            (None, _) => Origin::Unknown,
+        };
         Class::Inherit(Mapped {
             key,
             space: None,
             share: None,
+            origin,
+            gtid: gtid_of(e),
+        })
+    }
+
+    /// The copies' handovers on the tenant edges into the line's tenants
+    /// for `db`.`table` (RL71), by place in the line: `None` for an edge
+    /// without a materialized copy, or whose copy has no state yet (a seed
+    /// that hasn't begun reads later than any change the stream has).
+    /// Read now, after the batch's changes arrived.
+    pub(super) async fn handovers(
+        &self,
+        svc: &crate::tenant::TenantServices,
+        db: &str,
+        table: &str,
+    ) -> Vec<Option<Handover>> {
+        let mut out = vec![None; self.line.len()];
+        for (k, pair) in self.line.windows(2).enumerate() {
+            let k = k + 1;
+            let (parent, child) = (&pair[0], &pair[1]);
+            let materialized = matches!(
+                sprig_inherit::plan::tenant_edge(parent, child, db, table, false),
+                Ok(Some(up)) if up.share.mode == sprig_inherit::model::MergeMode::Materialized
+            );
+            if !materialized {
+                continue;
+            }
+            let Some(st) = child.ext.get::<InheritState>(sprig_inherit::MODULE) else {
+                continue;
+            };
+            let Some(o) = child
+                .database(&sprig_catalog::ddl::database_key(db, false))
+                .and_then(|d| st.object_named_ci(d.db_id, table))
+            else {
+                continue;
+            };
+            let Ok(schema) = sprig_inherit::plan::physical_schema(child, db, false) else {
+                continue;
+            };
+            let read = async {
+                let cluster = svc.locator.cluster(child.tenant).await?;
+                let pool = svc.locator.ctl_pool(&cluster).await?;
+                let mut conn = pool.get_conn().await.map_err(|e| {
+                    sprig_common::SprigError::new(
+                        sprig_common::SprigCode::BackendUnavailable,
+                        e.to_string(),
+                    )
+                })?;
+                sprig_inherit::copy::load_states(&mut conn, child.tenant, &schema).await
+            };
+            match read.await {
+                Ok(rows) => {
+                    out[k] = rows
+                        .into_iter()
+                        .find(|(key, _)| {
+                            key.object == o.object_id && key.share == sprig_inherit::copy::UPSTREAM
+                        })
+                        .map(|(_, info)| info.handover);
+                }
+                Err(e) => {
+                    // Unknown: the line's verdicts fall back to RL69.
+                    tracing::warn!(tenant = %child.tenant, error = %e, "a copy's handover wasn't read for a change stream");
+                    out[k] = Some(Handover::At {
+                        source: String::new(),
+                        child: String::new(),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether `m`'s change counts (RL71), given [`Self::handovers`] of its
+    /// table; `None` for a change inside the tenant (RL69 decides).
+    pub(super) fn verdict(&self, m: &Mapped, edges: &[Option<Handover>]) -> Option<Verdict> {
+        let n = self.line.len() - 1;
+        let at = |k: usize| edges.get(k).and_then(Option::as_ref);
+        let below = |j: usize| ((j + 1)..=n).map(at).collect::<Vec<_>>();
+        Some(match m.origin {
+            Origin::Inside => return None,
+            Origin::OwnCopy => handover::along(Some(at(n)), &[], m.gtid),
+            Origin::Above(j) if j < n => handover::along(None, &below(j), m.gtid),
+            Origin::AboveCopy(j) if j < n => handover::along(Some(at(j)), &below(j), m.gtid),
+            Origin::Unknown | Origin::Above(_) | Origin::AboveCopy(_) => Verdict::Unknown,
         })
     }
 
@@ -282,6 +467,12 @@ impl Mapper {
         }
         out
     }
+}
+
+/// A copy row's `_sprig_share` value as a number.
+fn copy_share(v: &Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
 /// A merged record: its columns as JSON, and each field's origin.
@@ -481,10 +672,14 @@ pub(super) fn decide(
         }
         Op::Insert => {
             let above = mapper.above(m.space);
-            let inherited = m.space.is_some()
-                && row
-                    .keys()
-                    .any(|f| origin(f).is_some_and(|o| above.contains(&o)));
+            // A record the subscriber already saw (a copy row made while
+            // its own row or a nearer override showed the record) isn't
+            // new to it.
+            let inherited = was_visible
+                || (m.space.is_some()
+                    && row
+                        .keys()
+                        .any(|f| origin(f).is_some_and(|o| above.contains(&o))));
             if inherited {
                 out.op = "update".into();
                 out.update = Value::Object(row.clone()).to_string();
@@ -569,6 +764,8 @@ pub(super) fn probe_item(e: &ChangeEvent, m: &Mapped) -> crate::exec::inherit_pr
         share: m.share.clone(),
         before,
         columns,
+        reads_only: false,
+        counted: false,
     }
 }
 
@@ -679,6 +876,8 @@ pub(super) async fn ancestor_tails(
             Arc::clone(names),
             TailOptions {
                 progress_every: std::time::Duration::from_millis(500),
+                // The parents' copies of their own tenant edges (RL71).
+                keep_internal: vec!["__sprig_ih_".to_owned()],
                 ..TailOptions::default()
             },
         )

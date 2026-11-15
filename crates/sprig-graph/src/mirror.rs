@@ -75,6 +75,20 @@ pub trait MirrorGate: Send + Sync {
     /// `true` once the applier has applied what the reader must see,
     /// waiting up to the gate's bound; `false` to scatter instead.
     async fn fresh(&self, layout: &GraphShards) -> bool;
+
+    /// The positions an earlier gate of `graph` found fresh, their ages as
+    /// of now: a reader that reads its cluster's binlog position in the
+    /// same round trip as its data, and finds these past it, may use the
+    /// mirrors without waiting for [`Self::fresh`].
+    fn last_fresh(&self, _graph: u64) -> Option<Vec<PosRow>> {
+        None
+    }
+
+    /// The session's causal targets (cluster to GTID set), which a reader
+    /// using [`Self::last_fresh`] must also see reached.
+    fn targets(&self) -> BTreeMap<String, String> {
+        BTreeMap::new()
+    }
 }
 
 /// One shard's applied position.

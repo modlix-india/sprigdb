@@ -11,6 +11,9 @@
 //! small  restrictive all  PUBLIC  using {n: {$lt: 15}}
 //! ```
 //!
+//! The users hold `SELECT, INSERT, UPDATE, DELETE, WATCH` on the
+//! database: a change stream needs `WATCH`.
+//!
 //! ```sh
 //! export SPRIG_TEST_RLS_SQL=127.0.0.1:33306
 //! export SPRIG_TEST_RLS_MONGO=127.0.0.1:33737
@@ -185,7 +188,7 @@ async fn row_level_security_on_collections() {
             .unwrap();
         admin_sql
             .query_drop(format!(
-                "GRANT SELECT, INSERT, UPDATE, DELETE ON {DB}.* TO '{u}'@'%'"
+                "GRANT SELECT, INSERT, UPDATE, DELETE, WATCH ON {DB}.* TO '{u}'@'%'"
             ))
             .await
             .unwrap();
@@ -511,7 +514,9 @@ async fn row_level_security_on_collections() {
         .await
         .unwrap();
     admin_sql
-        .query_drop(format!("GRANT SELECT ON {DB}.notes TO 'rlsm_carol'@'%'"))
+        .query_drop(format!(
+            "GRANT SELECT, WATCH ON {DB}.notes TO 'rlsm_carol'@'%'"
+        ))
         .await
         .unwrap();
     adb.collection::<Document>("other")

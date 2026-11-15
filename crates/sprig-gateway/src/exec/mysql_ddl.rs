@@ -11,7 +11,10 @@
 //! - After a DDL statement failed ([`PassSession::mysql_ddl_error`]):
 //!   MariaDB's 1005 for a foreign key becomes MySQL's 1824 when a
 //!   referenced table doesn't exist, or 1826 when a constraint name is
-//!   taken in the database.
+//!   taken in the database. Errors naming a functional key part's hidden
+//!   column (`_sprig_fx_..`) become MySQL's: 1901 is 3758 with the index's
+//!   name, and a `DROP COLUMN`'s 1054 `in 'GENERATED ALWAYS AS'` is 3837
+//!   (a functional index uses the column) or 3108 (a generated column).
 
 use bytes::Bytes;
 use sprig_common::SprigError;
@@ -129,6 +132,10 @@ impl PassSession {
         else {
             return e;
         };
+        // Functional key parts: errors naming their hidden columns.
+        if let Some(m) = Box::pin(self.fx_ddl_error(cx, original, code, &e.message)).await {
+            return SprigError::standard(m.code, m.sqlstate, m.message);
+        }
         let formed = mysqlddl::is_fk_formed_error(code, &e.message);
         let duplicate = mysqlddl::is_fk_duplicate_error(code, &e.message);
         if !formed && !duplicate {
@@ -183,5 +190,40 @@ impl PassSession {
             }
         }
         e
+    }
+
+    /// MySQL's error for a DDL error that MariaDB raised through a
+    /// functional key part's hidden column (`_sprig_fx_..`): 1901 becomes
+    /// 3758 naming the index; 1054 `in 'GENERATED ALWAYS AS'` from a
+    /// `DROP COLUMN` becomes 3108 when one of the table's own generated
+    /// columns uses the column, else 3837 (only hidden columns are left,
+    /// and the session doesn't show them). `None` otherwise, or when the
+    /// lookup fails.
+    async fn fx_ddl_error(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        original: &[u8],
+        code: u16,
+        message: &str,
+    ) -> Option<WireError> {
+        let (lex, _) = self.lex_opts();
+        if let Some(m) = mysqlddl::functional_index_error(code, message, original, &lex) {
+            return Some(m);
+        }
+        let column = mysqlddl::generated_dependency_column(code, message)?;
+        let (table, _, _) = mysqlddl::dropped_columns(original, &lex)?;
+        let (schema, name) = self.table_literals(&table)?;
+        let q = format!(
+            "SELECT GENERATION_EXPRESSION FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = {schema} AND TABLE_NAME = {name} \
+             AND GENERATION_EXPRESSION IS NOT NULL"
+        );
+        let got = self.run_checked(cx, &q, false).await.ok()?;
+        let user_column = got
+            .rows
+            .iter()
+            .filter_map(|r| col(r, 0))
+            .any(|x| mysqlddl::expression_uses(&x, column));
+        Some(mysqlddl::generated_dependency(column, user_column))
     }
 }

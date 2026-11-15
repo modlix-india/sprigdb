@@ -46,6 +46,7 @@ use sprig_common::{Result, SprigCode, SprigError};
 use sprig_feed::{
     Clusters, FeedItem, Op, PlacementView, ResumeToken, StartAt, TailOptions, TenantTail,
 };
+use sprig_inherit::handover::{Handover, Verdict};
 use tokio::sync::mpsc;
 
 use super::Core;
@@ -366,6 +367,9 @@ pub async fn open(
         Arc::clone(&names),
         TailOptions {
             progress_every: Duration::from_millis(500),
+            // Materialized copies of inherited tables (`__sprig_ih_<id>`):
+            // what a child reads through them changes there (RL69).
+            keep_internal: vec!["__sprig_ih_".to_owned()],
             ..TailOptions::default()
         },
     )
@@ -445,6 +449,62 @@ struct Pending {
     probe: Option<usize>,
     /// An inheritable object's event, mapped to the subscriber's space.
     mapped: Option<inherit::Mapped>,
+    /// Sent by its copy's handover (RL71), whatever the view reads now.
+    counted: bool,
+}
+
+/// Changes held while a copy's first seed runs (RL71), at most; past it
+/// the oldest are decided as before RL71.
+const HOLD_MAX: usize = 10_000;
+
+/// Puts event `e` (classified as `inherited`) into the batch's image
+/// check and pending list.
+fn add_pending(
+    req: &mut ImagesRequest,
+    tables: &mut HashMap<String, usize>,
+    pending: &mut Vec<Pending>,
+    e: Box<sprig_feed::ChangeEvent>,
+    inherited: Option<inherit::Mapped>,
+) {
+    let k = e.table.to_lowercase();
+    let t = *tables.entry(k).or_insert_with(|| {
+        req.tables.push(TableImages {
+            db: e.db_name.clone(),
+            table: e.table.clone(),
+            images: Vec::new(),
+        });
+        req.tables.len() - 1
+    });
+    let mut push = |img: Option<serde_json::Map<String, Value>>| {
+        let imgs = &mut req.tables[t].images;
+        imgs.push(img);
+        imgs.len() - 1
+    };
+    let (mut before, mut after, mut probe) = (None, None, None);
+    // An inheritable object's layer images aren't its records: they aren't
+    // checked (RL64).
+    match e.op {
+        _ if inherited.is_some() => {}
+        Op::Insert => after = image(e.after.as_ref()).map(|m| push(Some(m))),
+        Op::Delete => before = image(e.before.as_ref()).map(|m| push(Some(m))),
+        Op::Update => {
+            before = image(e.before.as_ref()).map(|m| push(Some(m)));
+            after = image(e.after.as_ref()).map(|m| push(Some(m)));
+        }
+        Op::Ddl(_) | Op::Truncate => probe = Some(push(None)),
+    }
+    if inherited.is_some() {
+        probe = Some(push(None));
+    }
+    pending.push(Pending {
+        event: e,
+        table: t,
+        before,
+        after,
+        probe,
+        mapped: inherited,
+        counted: false,
+    });
 }
 
 /// The event `p` becomes as the caller may see it (`None`: hidden).
@@ -611,10 +671,20 @@ async fn run(
     let mut quiet = tokio::time::Instant::now();
     // What the stream last knew of inherited records' visibility (RL64).
     let mut known = inherit::Seen::default();
+    // Changes waiting for a copy's first seed to end (RL71).
+    let mut held: Vec<(Box<sprig_feed::ChangeEvent>, inherit::Mapped)> = Vec::new();
     loop {
-        let until = quiet + heartbeat;
+        let mut until = quiet + heartbeat;
+        if !held.is_empty() {
+            until = until.min(tokio::time::Instant::now() + Duration::from_millis(250));
+        }
         let items = match gather(&mut tail, &mut above, until, tx).await? {
             Batch::Closed => return Ok(()),
+            Batch::Heartbeat
+                if !held.is_empty() && tokio::time::Instant::now() < quiet + heartbeat =>
+            {
+                Vec::new()
+            }
             Batch::Heartbeat => {
                 let hb = WatchEvent {
                     resume_token: last.clone(),
@@ -637,11 +707,27 @@ async fn run(
         let mut tables: HashMap<String, usize> = HashMap::new();
         let mut pending: Vec<Pending> = Vec::new();
         // Inheritable objects' events become the subscriber's space's.
-        let mapper = if items.iter().any(|(_, i)| matches!(i, FeedItem::Event(_))) {
-            inherit::Mapper::load(core, caller).await
-        } else {
-            None
-        };
+        let mapper =
+            if !held.is_empty() || items.iter().any(|(_, i)| matches!(i, FeedItem::Event(_))) {
+                inherit::Mapper::load(core, caller).await
+            } else {
+                None
+            };
+        // What was held first: it came before this batch.
+        let overflow = held.len().saturating_sub(HOLD_MAX);
+        if overflow > 0 {
+            tracing::warn!(
+                held = held.len(),
+                "a change stream held too many changes for a copy's first seed; the oldest are \
+                 decided by what the view reads now"
+            );
+        }
+        for (i, (e, mut m)) in std::mem::take(&mut held).into_iter().enumerate() {
+            if i < overflow {
+                m.origin = inherit::Origin::Unknown;
+            }
+            add_pending(&mut req, &mut tables, &mut pending, e, Some(m));
+        }
         for (own, it) in items {
             match it {
                 FeedItem::Event(mut e) => {
@@ -668,44 +754,7 @@ async fn run(
                     if !wanted(spec, &e) {
                         continue;
                     }
-                    let k = e.table.to_lowercase();
-                    let t = *tables.entry(k).or_insert_with(|| {
-                        req.tables.push(TableImages {
-                            db: e.db_name.clone(),
-                            table: e.table.clone(),
-                            images: Vec::new(),
-                        });
-                        req.tables.len() - 1
-                    });
-                    let mut push = |img: Option<serde_json::Map<String, Value>>| {
-                        let imgs = &mut req.tables[t].images;
-                        imgs.push(img);
-                        imgs.len() - 1
-                    };
-                    let (mut before, mut after, mut probe) = (None, None, None);
-                    // An inheritable object's layer images aren't its
-                    // records: they aren't checked (RL64).
-                    match e.op {
-                        _ if inherited.is_some() => {}
-                        Op::Insert => after = image(e.after.as_ref()).map(|m| push(Some(m))),
-                        Op::Delete => before = image(e.before.as_ref()).map(|m| push(Some(m))),
-                        Op::Update => {
-                            before = image(e.before.as_ref()).map(|m| push(Some(m)));
-                            after = image(e.after.as_ref()).map(|m| push(Some(m)));
-                        }
-                        Op::Ddl(_) | Op::Truncate => probe = Some(push(None)),
-                    }
-                    if inherited.is_some() {
-                        probe = Some(push(None));
-                    }
-                    pending.push(Pending {
-                        event: e,
-                        table: t,
-                        before,
-                        after,
-                        probe,
-                        mapped: inherited,
-                    });
+                    add_pending(&mut req, &mut tables, &mut pending, e, inherited);
                 }
                 FeedItem::TxnEnd { token } | FeedItem::Progress { token } => {
                     if own {
@@ -713,6 +762,42 @@ async fn run(
                     }
                 }
             }
+        }
+        // Changes of a tenant edge's source or copy: the copies' handovers
+        // decide which side sends each (RL71), read now that the batch is
+        // here.
+        if let (Some(m), Some(svc)) = (&mapper, core.engine.tenants.as_ref()) {
+            let mut edges: HashMap<String, Vec<Option<Handover>>> = HashMap::new();
+            let mut keep = Vec::with_capacity(pending.len());
+            for mut p in std::mem::take(&mut pending) {
+                let Some(mp) = &p.mapped else {
+                    keep.push(p);
+                    continue;
+                };
+                if mp.origin == inherit::Origin::Inside {
+                    keep.push(p);
+                    continue;
+                }
+                let t = p.event.table.to_lowercase();
+                if !edges.contains_key(&t) {
+                    let h = m.handovers(svc, &spec.database, &p.event.table).await;
+                    edges.insert(t.clone(), h);
+                }
+                match m.verdict(mp, &edges[&t]) {
+                    Some(Verdict::Drop) => {}
+                    Some(Verdict::Hold) => {
+                        if let Some(mp) = p.mapped.take() {
+                            held.push((p.event, mp));
+                        }
+                    }
+                    Some(Verdict::Count) => {
+                        p.counted = true;
+                        keep.push(p);
+                    }
+                    Some(Verdict::Unknown) | None => keep.push(p),
+                }
+            }
+            pending = keep;
         }
         if pending.is_empty() {
             continue;
@@ -734,8 +819,10 @@ async fn run(
             inherit::read(core, caller, &spec.database, &keys).await?
         };
         // Records gone from the subscriber's view whose key the stream
-        // doesn't know: were they visible before the change (RL64)? A
-        // probe per event (by its index in `pending`).
+        // doesn't know: were they visible before the change (RL64)? Every
+        // other event: does the subscriber's view read the changed row now
+        // (RL69)? A probe per event (by its index in `pending`, and
+        // whether it asks only that).
         let readable = |p: &Pending| {
             p.probe
                 .is_some_and(|i| seen[p.table].get(i).copied().unwrap_or(false))
@@ -747,15 +834,18 @@ async fn run(
             db: spec.database.clone(),
             probes: Vec::new(),
         };
-        let mut probe_of: HashMap<usize, usize> = HashMap::new();
+        let mut probe_of: HashMap<usize, (usize, bool)> = HashMap::new();
         for (j, p) in pending.iter().enumerate() {
             let Some(m) = &p.mapped else { continue };
-            let id = inherit::key_id(&p.event.table, &m.key);
-            if !readable(p) || records.contains_key(&id) || known.get(&id).is_some() {
+            if !readable(p) {
                 continue;
             }
-            probe_of.insert(j, probes.probes.len());
-            probes.probes.push(inherit::probe_item(&p.event, m));
+            let id = inherit::key_id(&p.event.table, &m.key);
+            let mut item = inherit::probe_item(&p.event, m);
+            item.reads_only = records.contains_key(&id) || known.get(&id).is_some();
+            item.counted = p.counted;
+            probe_of.insert(j, (probes.probes.len(), item.reads_only));
+            probes.probes.push(item);
         }
         let before = if probes.probes.is_empty() {
             Vec::new()
@@ -774,16 +864,17 @@ async fn run(
                 (Some(m), Some(mapper)) if readable(p) => {
                     let id = inherit::key_id(&p.event.table, &m.key);
                     let now = records.contains_key(&id);
-                    // Known, else probed; a change the subscriber's view
-                    // doesn't read leaves the key unknown and sends no
-                    // delete (the change it reads comes as its own event).
-                    let was = match known.get(&id) {
-                        Some(v) => Some(v),
-                        None if now => Some(false),
-                        None => probe_of
-                            .get(&j)
-                            .and_then(|i| before.get(*i).copied())
-                            .unwrap_or(Some(false)),
+                    // A change the subscriber's view doesn't read sends
+                    // nothing and leaves the key as it was (the change it
+                    // reads comes as its own event); else known, else
+                    // probed, else (present now) not visible before.
+                    let asked = probe_of
+                        .get(&j)
+                        .map(|(i, only)| (before.get(*i).copied().unwrap_or(Some(false)), *only));
+                    let was = match asked {
+                        Some((None, _)) => None,
+                        Some((Some(v), false)) => Some(v),
+                        _ => Some(known.get(&id).unwrap_or(false)),
                     };
                     match was {
                         Some(was) => {

@@ -24,7 +24,7 @@ use tokio::sync::oneshot;
 use crate::engine::{ConsumerRec, LocalSink, TopoChange, VShared, lock};
 use crate::msg;
 use crate::owner::{Cmd, ConsumerSpec, Holder, Incoming};
-use crate::store::{DelayedRow, new_msg_id};
+use crate::store::{DelayedRow, MsgId, new_msg_id};
 use crate::topology::{
     BindingDef, EQUIVALENCE_ARGS, ExKind, ExchangeDef, ExclusiveOwner, QType, QueueDef, arg_text,
 };
@@ -165,6 +165,128 @@ impl ConnVhost {
     /// Routes and enqueues one message; the confirm resolves after every
     /// destination committed.
     fn route_and_enqueue(&self, m: Message) -> Result<Published, MqError> {
+        self.route_and_enqueue_as(m, None)
+    }
+
+    /// Publishes `msgs` in order, each as [`ConnVhost::publish`] does and
+    /// as its message id: each destination queue skips a message whose id
+    /// it has, or ever enqueued (the forward ledger), as for an outbox
+    /// forward. The messages for one queue go to its owner in one command,
+    /// in order, so the owner checks their ids in one lookup and writes
+    /// them in one batch. A change exchange's publishes (R9 r9feed4): a
+    /// replay after a restart is a no-op.
+    ///
+    /// The answer has one entry per message, in order, up to the first
+    /// that failed (refused, or not confirmed): the queues it reached, or
+    /// its error. Messages after a refused one aren't sent.
+    pub(crate) async fn publish_batch_once(
+        &self,
+        cx: &OpCtx,
+        msgs: Vec<(Message, MsgId)>,
+    ) -> Vec<Result<u32, MqError>> {
+        let mut confirms = Vec::with_capacity(msgs.len());
+        let mut per_queue: Vec<(
+            Arc<QueueDef>,
+            Vec<(Incoming, Option<crate::owner::Reply<()>>)>,
+        )> = Vec::new();
+        let mut refused = None;
+        for (m, id) in msgs {
+            let routed = self
+                .check(cx, Perm::Write, "exchange", &m.exchange)
+                .and_then(|()| self.route_one(m));
+            match routed {
+                Err(e) => {
+                    refused = Some(e);
+                    break;
+                }
+                Ok(Routed::Delayed(p)) => confirms.push(p),
+                Ok(Routed::Queues {
+                    msg,
+                    targets,
+                    timeout,
+                }) => {
+                    let mut waits = Vec::with_capacity(targets.len());
+                    for q in &targets {
+                        let (tx, rx) = oneshot::channel();
+                        waits.push(rx);
+                        let item = (
+                            Incoming {
+                                msg: Arc::clone(&msg),
+                                msg_id: id,
+                                dedup: true,
+                                deaths: None,
+                            },
+                            Some(tx),
+                        );
+                        match per_queue.iter_mut().find(|(d, _)| d.id == q.id) {
+                            Some((_, items)) => items.push(item),
+                            None => per_queue.push((Arc::clone(q), vec![item])),
+                        }
+                    }
+                    confirms.push(Published {
+                        routed: u32::try_from(targets.len()).unwrap_or(u32::MAX),
+                        confirm: confirm_of(waits, timeout),
+                    });
+                }
+            }
+        }
+        for (q, items) in per_queue {
+            // A closed slot drops the replies: their confirms fail below.
+            let _ = self.v.slot(&q).send(Cmd::Enqueue(items));
+        }
+        let mut out = Vec::with_capacity(confirms.len() + 1);
+        for p in confirms {
+            match p.confirm.await {
+                Ok(()) => out.push(Ok(p.routed)),
+                Err(e) => {
+                    out.push(Err(e));
+                    return out;
+                }
+            }
+        }
+        if let Some(e) = refused {
+            out.push(Err(e));
+        }
+        out
+    }
+
+    /// Routes and enqueues one message; `id`: the message's id, checked
+    /// against each queue's messages and ledger first (`None`: a new id,
+    /// no check).
+    fn route_and_enqueue_as(&self, m: Message, id: Option<MsgId>) -> Result<Published, MqError> {
+        let (msg, targets, timeout) = match self.route_one(m)? {
+            Routed::Delayed(p) => return Ok(p),
+            Routed::Queues {
+                msg,
+                targets,
+                timeout,
+            } => (msg, targets, timeout),
+        };
+        let mut waits = Vec::with_capacity(targets.len());
+        for q in &targets {
+            let (tx, rx) = oneshot::channel();
+            let h = self.v.slot(q);
+            let _ = h.send(Cmd::Enqueue(vec![(
+                Incoming {
+                    msg: Arc::clone(&msg),
+                    msg_id: id.unwrap_or_else(new_msg_id),
+                    dedup: id.is_some(),
+                    deaths: None,
+                },
+                Some(tx),
+            )]));
+            waits.push(rx);
+        }
+        Ok(Published {
+            routed: u32::try_from(targets.len()).unwrap_or(u32::MAX),
+            confirm: confirm_of(waits, timeout),
+        })
+    }
+
+    /// Where message `m` goes: a delayed exchange's message is stored
+    /// (always as a new id) and its confirm returned; any other is routed
+    /// to its queues (none: unroutable).
+    fn route_one(&self, m: Message) -> Result<Routed, MqError> {
         let e = self.engine()?;
         let topo = e.deps.catalog.topology(&self.v.r);
         let Some(x) = topo.exchanges.get(&m.exchange).cloned() else {
@@ -205,7 +327,7 @@ impl ConnVhost {
             let r = self.v.r.clone();
             let wake = Arc::clone(&self.v.wake);
             metrics::counter!("sprig_queue_published_total", "path" => "delayed").increment(1);
-            return Ok(Published {
+            return Ok(Routed::Delayed(Published {
                 routed: 1,
                 confirm: Box::pin(async move {
                     let store = cat.store(&r).await?;
@@ -216,55 +338,16 @@ impl ConnVhost {
                     wake.notify_one();
                     Ok(())
                 }),
-            });
+            }));
         }
         let targets = self
             .v
             .with_view(|v| v.route(&m.exchange, &m.routing_key, &m.info.headers))
             .unwrap_or_default();
-        if targets.is_empty() {
-            return Ok(Published::done(0));
-        }
-        let msg = Arc::new(m);
-        let mut waits = Vec::with_capacity(targets.len());
-        for q in &targets {
-            let (tx, rx) = oneshot::channel();
-            let h = self.v.slot(q);
-            let _ = h.send(Cmd::Enqueue(vec![(
-                Incoming {
-                    msg: Arc::clone(&msg),
-                    msg_id: new_msg_id(),
-                    dedup: false,
-                    deaths: None,
-                },
-                Some(tx),
-            )]));
-            waits.push(rx);
-        }
-        let timeout = Duration::from_millis(s.publish_timeout_ms);
-        Ok(Published {
-            routed: u32::try_from(targets.len()).unwrap_or(u32::MAX),
-            confirm: Box::pin(async move {
-                let all = join_all(waits);
-                match tokio::time::timeout(timeout, all).await {
-                    Err(_) => Err(MqError::new(
-                        MqCode::ConfirmTimeout,
-                        "not committed within amqp.publish_timeout_ms",
-                    )),
-                    Ok(rs) => {
-                        for r in rs {
-                            match r {
-                                Ok(Ok(())) => {}
-                                Ok(Err(e)) => return Err(e),
-                                Err(_) => {
-                                    return Err(MqError::new(MqCode::OwnerMoved, "owner stopped"));
-                                }
-                            }
-                        }
-                        Ok(())
-                    }
-                }
-            }),
+        Ok(Routed::Queues {
+            msg: Arc::new(m),
+            targets,
+            timeout: Duration::from_millis(s.publish_timeout_ms),
         })
     }
 
@@ -305,6 +388,47 @@ impl ConnVhost {
             });
         }
     }
+}
+
+/// Where [`ConnVhost::route_one`] sends a message.
+enum Routed {
+    /// A delayed exchange's message, stored by its confirm.
+    Delayed(Published),
+    /// The queues it goes to (none: unroutable).
+    Queues {
+        msg: Arc<Message>,
+        targets: Vec<Arc<QueueDef>>,
+        timeout: Duration,
+    },
+}
+
+/// The confirm of a message sent to owners: every one of `waits`
+/// committed within `timeout`.
+fn confirm_of(
+    waits: Vec<oneshot::Receiver<Result<(), MqError>>>,
+    timeout: Duration,
+) -> futures::future::BoxFuture<'static, Result<(), MqError>> {
+    Box::pin(async move {
+        if waits.is_empty() {
+            return Ok(());
+        }
+        match tokio::time::timeout(timeout, join_all(waits)).await {
+            Err(_) => Err(MqError::new(
+                MqCode::ConfirmTimeout,
+                "not committed within amqp.publish_timeout_ms",
+            )),
+            Ok(rs) => {
+                for r in rs {
+                    match r {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => return Err(e),
+                        Err(_) => return Err(MqError::new(MqCode::OwnerMoved, "owner stopped")),
+                    }
+                }
+                Ok(())
+            }
+        }
+    })
 }
 
 #[async_trait]

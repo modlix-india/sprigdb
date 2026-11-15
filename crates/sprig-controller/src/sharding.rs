@@ -14,6 +14,7 @@
 //! Every proposal and advisor run is a decision in the tenant's log.
 
 mod graphs;
+mod lookups;
 mod ops;
 mod rekey;
 pub use graphs::{GraphIndexRow, GraphPartition, GraphRow, GraphShardRow, GraphView};
@@ -66,6 +67,10 @@ pub struct TenantSettings {
     pub hold_grace: Duration,
     /// `mover.copy_chunk_rows`.
     pub chunk_rows: usize,
+    /// `lookup.*`: lookup builds, recovery and publishing.
+    pub lookup: sprig_shard::lookup::settings::LookupSettings,
+    /// `advisor.lookup_*`: the advisor's lookup proposals.
+    pub lookup_advice: sprig_advisor::sharding::settings::LookupAdvice,
 }
 
 impl Default for TenantSettings {
@@ -78,6 +83,8 @@ impl Default for TenantSettings {
             txn_grace: m.txn_grace,
             hold_grace: m.hold_grace,
             chunk_rows: m.copy_chunk_rows,
+            lookup: sprig_shard::lookup::settings::LookupSettings::default(),
+            lookup_advice: sprig_advisor::sharding::settings::LookupAdvice::default(),
         }
     }
 }
@@ -203,6 +210,8 @@ pub struct ShardingLoop {
     published: Mutex<BTreeSet<TenantId>>,
     /// `sharding.mode = approve` holds jobs for approval.
     pub approvals: std::sync::OnceLock<Arc<crate::approvals::ControllerApprovals>>,
+    /// When each tenant's workload was last read for lookup proposals.
+    lookup_runs: Mutex<HashMap<TenantId, Instant>>,
 }
 
 impl std::fmt::Debug for ShardingLoop {
@@ -263,6 +272,7 @@ impl ShardingLoop {
             publish: None,
             published: Mutex::new(BTreeSet::new()),
             approvals: std::sync::OnceLock::new(),
+            lookup_runs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -558,6 +568,14 @@ impl ShardingLoop {
                 &mut report,
             )
             .await?;
+        }
+        // Global lookup indexes: stopped builds, and the advisor's
+        // proposals for reads that scatter by a unique column. The tick's
+        // own connection goes back first: the jobs take their own from
+        // the loop's small pools.
+        drop(c);
+        if let Err(e) = self.lookup_tick(tenant, &home, &ts).await {
+            tracing::warn!(tenant = %tenant, error = %e, "lookup indexes: the tick failed");
         }
         Ok(report)
     }

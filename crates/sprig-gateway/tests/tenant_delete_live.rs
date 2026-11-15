@@ -77,10 +77,11 @@ fn env() -> Option<Env> {
         prefix: std::env::var("SPRIG_TEST_TENANT_DELETE_PREFIX")
             .unwrap_or_else(|_| "tdel".to_owned()),
         sprigctl: std::env::var("SPRIG_TEST_TENANT_DELETE_SPRIGCTL").ok()?,
+        // The node's MySQL port: no default, so a private deployment's
+        // run never reads the shared dev node (R9 r9feed4).
         node: std::env::var("SPRIG_TEST_TENANT_DELETE_NODE")
             .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(13301),
+            .and_then(|v| v.parse().ok())?,
         kill: std::env::var("SPRIG_TEST_TENANT_DELETE_KILL").ok(),
         secs: std::env::var("SPRIG_TEST_TENANT_DELETE_SECS")
             .ok()
@@ -198,7 +199,10 @@ fn tenant_id(e: &Env, name: &str) -> u64 {
 #[tokio::test]
 async fn deleted_tenants_finish_and_close_their_connections() {
     let Some(e) = env() else {
-        eprintln!("skipped: set SPRIG_TEST_TENANT_DELETE and SPRIG_TEST_TENANT_DELETE_SPRIGCTL");
+        eprintln!(
+            "skipped: set SPRIG_TEST_TENANT_DELETE, SPRIG_TEST_TENANT_DELETE_SPRIGCTL and \
+             SPRIG_TEST_TENANT_DELETE_NODE"
+        );
         return;
     };
     let decl = format!("{}-decl", e.prefix);

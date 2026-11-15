@@ -24,7 +24,9 @@
 //!     offered to each subscription of its tenants that started before it
 //!   a subscription whose buffer is full is detached, never waited for:
 //!     the others go on
-//!   at most every second: the position to every subscription (idle)
+//!   at most every second: the position to every subscription (idle);
+//!     a view may ask for it sooner, down to every 200 ms (the graph
+//!     mirror's, r9feed3)
 //!   a broken stream reconnects from the hub's position; a lost history
 //!     (39800) ends every subscription with that error
 //!   no subscriptions for 30 s: the hub stops and closes its dump
@@ -67,8 +69,13 @@ use crate::source::{Clusters, DumpScope, RawTxn, SourceItem, TxnSource, XaMark};
 
 /// Items a subscription buffers before it is detached.
 pub const SUB_CHANNEL: usize = 256;
-/// Idle positions go to every subscription at most this often.
+/// Idle positions go to a subscription at most this often, unless its
+/// view asks for them sooner ([`SharedFeed::view_every`]).
 pub const IDLE_FANOUT: Duration = Duration::from_secs(1);
+/// How often the hub looks for subscriptions due an idle position: the
+/// soonest a view can ask for them, as often as a dump of its own sends
+/// them ([`crate::binlog::IDLE_EVERY`]).
+pub const IDLE_TICK: Duration = crate::binlog::IDLE_EVERY;
 /// A hub without subscriptions stops after this long.
 pub const HUB_LINGER: Duration = Duration::from_secs(30);
 
@@ -292,6 +299,10 @@ struct Sub {
     from: GtidPos,
     tx: mpsc::Sender<Item>,
     detached: Arc<AtomicBool>,
+    /// Its view's idle cadence, and when it last got an idle position
+    /// (`None`: never, so one is due).
+    idle_every: Duration,
+    idle_at: Option<Instant>,
 }
 
 /// One group of the ring.
@@ -385,7 +396,7 @@ impl HubState {
     }
 
     /// Sends the hub's position `pos` to every subscription it has given
-    /// everything up to it. Not while a move back is pending: a
+    /// everything up to it and that is due one (its view's cadence). Not while a move back is pending: a
     /// subscription registered behind `pos` for it hasn't had the groups
     /// before `pos` yet, and an idle position would make its tail skip
     /// them (found in r9feed's live run).
@@ -394,12 +405,14 @@ impl HubState {
             return;
         }
         for s in self.subs.values_mut() {
-            if pos.reached(&s.from)
+            if s.idle_at.is_none_or(|t| t.elapsed() >= s.idle_every)
+                && pos.reached(&s.from)
                 && s.tx
                     .try_send(Ok(SourceItem::Idle { pos: pos.clone() }))
                     .is_ok()
             {
                 s.from = pos.clone();
+                s.idle_at = Some(Instant::now());
             }
         }
     }
@@ -462,7 +475,7 @@ impl HubState {
     fn register(
         &mut self,
         tenant: TenantId,
-        kept: Kept,
+        (kept, idle_every): (Kept, Duration),
         from: GtidPos,
         tx: mpsc::Sender<Item>,
         detached: Arc<AtomicBool>,
@@ -477,6 +490,8 @@ impl HubState {
                 from,
                 tx,
                 detached,
+                idle_every,
+                idle_at: None,
             },
         );
         self.by_tenant.entry(tenant).or_default().push(id);
@@ -541,7 +556,7 @@ impl Hub {
     fn attach(
         self: &Arc<Self>,
         tenant: TenantId,
-        kept: &Kept,
+        (kept, idle_every): (&Kept, Duration),
         from: &GtidPos,
         first: bool,
     ) -> Attach {
@@ -563,7 +578,7 @@ impl Hub {
             st.scope_whole.clear();
             st.register(
                 tenant,
-                kept.clone(),
+                (kept.clone(), idle_every),
                 from.clone(),
                 tx,
                 Arc::clone(&detached),
@@ -588,7 +603,7 @@ impl Hub {
         if from.reached(&pos) {
             st.register(
                 tenant,
-                kept.clone(),
+                (kept.clone(), idle_every),
                 from.clone(),
                 tx,
                 Arc::clone(&detached),
@@ -610,7 +625,13 @@ impl Hub {
             let backlog = st.backlog(tenant, kept, from, &pos);
             if backlog.len() <= opts.max_backlog {
                 metrics::counter!("sprig_feed_resumes_total", "tier" => "ring").increment(1);
-                st.register(tenant, kept.clone(), pos, tx, Arc::clone(&detached));
+                st.register(
+                    tenant,
+                    (kept.clone(), idle_every),
+                    pos,
+                    tx,
+                    Arc::clone(&detached),
+                );
                 return Attach::Live {
                     rx,
                     backlog,
@@ -631,7 +652,7 @@ impl Hub {
             self.wake.notify_one();
             st.register(
                 tenant,
-                kept.clone(),
+                (kept.clone(), idle_every),
                 from.clone(),
                 tx,
                 Arc::clone(&detached),
@@ -660,7 +681,7 @@ impl Hub {
             self.wake.notify_one();
             st.register(
                 tenant,
-                kept.clone(),
+                (kept.clone(), idle_every),
                 from.clone(),
                 tx,
                 Arc::clone(&detached),
@@ -981,7 +1002,7 @@ impl Hub {
                     continue;
                 }
             }
-            if last_idle.elapsed() >= IDLE_FANOUT {
+            if last_idle.elapsed() >= IDLE_TICK {
                 last_idle = Instant::now();
                 let mut st = self.lock();
                 st.idle_fanout(&pos);
@@ -1078,6 +1099,8 @@ struct SubSource {
     hub: Arc<Hub>,
     tenant: TenantId,
     kept: Kept,
+    /// Its view's idle cadence.
+    idle_every: Duration,
     /// The position after the last item returned.
     pos: GtidPos,
     mode: Mode,
@@ -1139,7 +1162,9 @@ impl SubSource {
             .await
             .map_err(|_| SprigError::internal("the shared reader's catch-up slots are gone"))?;
         // Another catch-up may have moved the ring meanwhile.
-        let a = self.hub.attach(self.tenant, &self.kept, &self.pos, false);
+        let a = self
+            .hub
+            .attach(self.tenant, (&self.kept, self.idle_every), &self.pos, false);
         if self.live(a) {
             return Ok(());
         }
@@ -1196,7 +1221,12 @@ impl TxnSource for SubSource {
                     }
                 }
                 Mode::Out => {
-                    let a = self.hub.attach(self.tenant, &self.kept, &self.pos, false);
+                    let a = self.hub.attach(
+                        self.tenant,
+                        (&self.kept, self.idle_every),
+                        &self.pos,
+                        false,
+                    );
                     if !self.live(a) {
                         self.catch_up().await?;
                     }
@@ -1221,7 +1251,12 @@ impl TxnSource for SubSource {
                         }
                     };
                     if rejoin {
-                        let a = self.hub.attach(self.tenant, &self.kept, &self.pos, false);
+                        let a = self.hub.attach(
+                            self.tenant,
+                            (&self.kept, self.idle_every),
+                            &self.pos,
+                            false,
+                        );
                         if self.live(a) {
                             tracing::debug!(cluster = %self.hub.cluster, tenant = %self.tenant, pos = %self.pos, "shared feed reader: caught up");
                         }
@@ -1262,10 +1297,22 @@ impl SharedFeed {
         })
     }
 
-    /// A view keeping `kept` of its tenants. New tables widen every
+    /// A view keeping `kept` of its tenants, with an idle position to each
+    /// subscription at most every [`IDLE_FANOUT`]. New tables widen every
     /// running hub's dump.
     #[must_use]
     pub fn view(self: &Arc<Self>, kept: Kept) -> Arc<SharedClusters> {
+        self.view_every(kept, IDLE_FANOUT)
+    }
+
+    /// [`Self::view`], with idle positions at most every `idle_every` (at
+    /// least [`IDLE_TICK`]): for a consumer that must reach the cluster's
+    /// position soon after others' writes, as the graph mirror does (a
+    /// mirror read waits for it to reach the cluster's position now; R9,
+    /// r9feed3). A dump of its own sends them after
+    /// [`crate::binlog::IDLE_EVERY`] without the tenant's rows.
+    #[must_use]
+    pub fn view_every(self: &Arc<Self>, kept: Kept, idle_every: Duration) -> Arc<SharedClusters> {
         if let Kept::Tables(t) = &kept {
             let mut tables = self
                 .shared
@@ -1295,6 +1342,7 @@ impl SharedFeed {
         Arc::new(SharedClusters {
             feed: Arc::clone(self),
             kept,
+            idle_every: idle_every.max(IDLE_TICK),
         })
     }
 
@@ -1324,6 +1372,8 @@ impl SharedFeed {
 pub struct SharedClusters {
     feed: Arc<SharedFeed>,
     kept: Kept,
+    /// Idle positions to each subscription at most this often.
+    idle_every: Duration,
 }
 
 impl std::fmt::Debug for SharedClusters {
@@ -1346,6 +1396,7 @@ impl SharedClusters {
         Self {
             feed,
             kept: v.kept.clone(),
+            idle_every: IDLE_FANOUT,
         }
     }
 
@@ -1378,10 +1429,11 @@ impl Clusters for SharedClusters {
             hub: Arc::clone(&hub),
             tenant,
             kept: self.kept.clone(),
+            idle_every: self.idle_every,
             pos: from.clone(),
             mode: Mode::Out,
         };
-        let a = hub.attach(tenant, &self.kept, from, true);
+        let a = hub.attach(tenant, (&self.kept, self.idle_every), from, true);
         s.live(a);
         Ok(Box::new(s))
     }

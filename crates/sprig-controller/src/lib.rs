@@ -117,6 +117,7 @@ pub mod workload_rollup;
 pub mod write_load;
 // AI providers in the Admin API and the payload purge.
 pub mod ai_admin;
+pub mod ai_system;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -625,6 +626,19 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             Some((settings.live.clone(), dc.clone())),
             docs_loader::PackSource::Settings,
         )))
+        // The administration assistant's conversations on the system
+        // cluster: the schema, and their payloads' retention.
+        .with_loop(Loop::new(ai_system::AiSystemLoop::new(
+            Arc::new(ai_system::RegistrySystem::new(
+                ClusterRegistry::new(Arc::clone(&stores.global), Arc::clone(&stores.dc))?,
+                RegistryPools::new(
+                    ClusterRegistry::new(Arc::clone(&stores.global), Arc::clone(&stores.dc))?,
+                    Some(Arc::clone(&monitor)),
+                )
+                .budget("ai_system", 1),
+            )),
+            Some((settings.live.clone(), dc.clone())),
+        )))
         // Approvals: escalation, auto-apply, appliers, expiry, gauges.
         .with_loop(Loop::new(
             approvals::ApprovalsLoop::new(Arc::clone(&approvals)).with_notifier(Arc::clone(&notifier)),
@@ -734,8 +748,10 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
     let ai_admin = Arc::new(ai_admin::AiAdmin::new(
         Arc::clone(&stores.global),
         match &cfg.controller.workload_key_file {
-            Some(p) => Some(Arc::new(sprig_workload::keyring::MasterKeyring::from_file(p)?)
-                as Arc<dyn sprig_ai::keys::AiKeyring>),
+            Some(p) => Some(
+                Arc::new(sprig_workload::keyring::MasterKeyring::from_file(p)?)
+                    as Arc<dyn sprig_ai::keys::AiKeyring>,
+            ),
             None => None,
         },
     )?);

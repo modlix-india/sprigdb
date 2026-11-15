@@ -1669,6 +1669,34 @@ impl BackendSession {
                 drop(lease);
                 continue;
             }
+            // User variables the last statement assigned on this held
+            // connection are captured before this statement's sync, which
+            // would otherwise write the session's older value over them: a
+            // pinned session's `SET @v = ...` and then a read of `@v`, on a
+            // pooled connection that held `@v` for an earlier session, read
+            // NULL (found by rlsprep, S163).
+            if route == RouteKind::Pinned && !self.pending_capture.is_empty() {
+                let names = std::mem::take(&mut self.pending_capture);
+                match conn.capture_user_vars(&names).await {
+                    Ok(vals) => {
+                        for (n, v) in vals {
+                            conn.applied.user_vars.insert(n.clone(), v.clone());
+                            self.vars.user_vars.insert(n, v);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(node = %node_key, error = %e, "user-variable capture failed");
+                        self.pending_capture = names;
+                        if e.is_connection_lost() {
+                            drop(lease);
+                            if self.pins.in_transaction() || self.pins.holds_state() {
+                                return Err(self.lost_unsent(&node_key));
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
             // The probe's first reading, on a connection that will be free
             // again after the statement (see `probe_next_statement`).
             let probe_before = if probe && route != RouteKind::Pinned && self.pins.is_empty() {

@@ -31,8 +31,9 @@ use crate::tree::{Directory, DirectoryEntry, TenantState};
 use crate::write_load::GatewayWriteLoad;
 
 /// Connections per cluster the loop may hold (size dives, the advisor's
-/// apply and its back-fill).
-pub const POOL_MAX: usize = 4;
+/// apply and its back-fill, lookup builds: a build holds up to three, its
+/// catalog connection and a claim's two, and two tenants may build at once).
+pub const POOL_MAX: usize = 8;
 
 /// The sharding loop's view of the controller's cluster pools.
 pub struct WriterPools(pub Arc<dyn CatalogPools>);
@@ -90,6 +91,16 @@ impl SettingsSource for LiveSource {
             txn_grace: m.txn_grace,
             hold_grace: m.hold_grace,
             chunk_rows: m.copy_chunk_rows,
+            lookup: sprig_shard::lookup::settings::LookupSettings::resolve_with(
+                s,
+                rows.as_deref(),
+                &ctx,
+            ),
+            lookup_advice: sprig_advisor::sharding::settings::LookupAdvice::resolve_with(
+                s,
+                rows.as_deref(),
+                &ctx,
+            ),
         }
     }
 
@@ -292,5 +303,16 @@ impl sprig_advisor::sharding::apply::Publish for VersionPublish {
             .await?;
         tracing::info!(tenant = %tenant, version = v, "table groups published");
         Ok(())
+    }
+
+    async fn catalog_changed_to(&self, tenant: TenantId) -> Result<Option<u64>> {
+        let v = self
+            .0
+            .change(tenant, sprig_catalog::VersionKind::Catalog)
+            .await?
+            .commit()
+            .await?;
+        tracing::info!(tenant = %tenant, version = v, "catalog change published");
+        Ok(Some(v))
     }
 }

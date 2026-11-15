@@ -21,7 +21,9 @@ Every assistant follows the same rules:
 - What leaves SprigDB passes **one gate**: by default, schema and statistics only, never rows.
 - Every call is **audited and budgeted**, and you can see exactly what was sent.
 
-Nothing is sent anywhere until an operator configures a provider and a tenant administrator turns the assistants on. SprigDB doesn't host models: you use a provider you choose. Studio's chat panel isn't part of this release; the assistants are reached through the API described here.
+Nothing is sent anywhere until an operator configures a provider and a tenant administrator turns the assistants on. SprigDB doesn't host models: you use a provider you choose. Studio's chat panel isn't part of this release; the assistants are reached through the API described here, the [`ASK` statement](#ask-in-sql) and [`sprig ask`](sprig.md#sprig-ask).
+
+Outside AI agents, such as Claude Code, can use the same tools as you through the [MCP server](mcp.md).
 
 ## Setting up
 
@@ -135,6 +137,42 @@ The tools each assistant may call, all as you:
 
 A tool call outside the assistant's role, or with invalid input, is refused; three refusals in one turn stop it with 39996.
 
+## ASK in SQL
+
+`ASK` puts a question to an assistant from any SQL client, on the MySQL and MariaDB ports or through `Sql.Query` over REST and gRPC. It returns the proposed query and an explanation, and **never runs the query**.
+
+```sql
+ASK 'question' [IN DATABASE db_name] [ROLE data | dba]
+```
+
+- The data specialist answers unless you say `ROLE dba`.
+- The assistant works with the session's current database, or the one `IN DATABASE` names.
+- `IN DATABASE` and `ROLE` may come in either order. Adjacent string literals are joined.
+- `ASK` is recognized only when a string literal follows the word, so a table, column or variable named `ask` works as before.
+- Run `ASK` as a plain statement: a server-side prepared statement can't carry it.
+
+```sql
+ASK 'top 10 customers by revenue this year';
+ASK 'why is SELECT * FROM orders WHERE total > 100 slow?' IN DATABASE shop ROLE dba;
+```
+
+The answer has one row for each proposed statement:
+
+| Column | Holds |
+|---|---|
+| `query` | One statement, without a trailing `;`. `NULL` when the assistant answered in words |
+| `database` | The database the assistant meant it for, or `NULL` |
+| `explanation` | Why, in a few sentences; the whole answer when there is no query |
+| `notes` | `Reads only.`, or a reminder to review a statement that changes things; the estimate; `Statement 1 of 2 in one proposal.` when one proposal held several statements; a note when the answer was cut off at `ai.max_output_tokens` |
+| `sources` | What the answer drew on, such as `table: shop.orders` or a docs page |
+| `conversation_id` | The stored conversation |
+
+`ASK` is one chat turn as you, with the same checks in the same order as the chat API: `ai.enabled` (39991), a tenant login (39792), the assistant's model (39990), and the budgets (39992). It uses the same tools, egress rules, budgets and audit. The conversation is kept like a chat's, so `GET /v1/ai/conversations/{conversation_id}` shows what was sent. A refusal is 39994, and a provider failure is 39993.
+
+The query comes from the assistant's SQL proposals. When it made none, it comes from the SQL code blocks in its answer. A proposal holding several statements becomes several rows, so `query` always holds exactly one statement. Tile and glossary proposals aren't shown by `ASK`.
+
+To run an answer, copy the query, or use [`sprig ask --run`](sprig.md#sprig-ask). In the TUI, press Ctrl-K and type `?` and your question: the `ASK` statement goes into the editor, and you run it like any other statement.
+
 ## Conversations and what was sent
 
 `dba` and `data` conversations are kept in your tenant's catalog, and only you can read yours:
@@ -143,6 +181,16 @@ A tool call outside the assistant's role, or with invalid input, is refused; thr
 - `GET /v1/ai/conversations/{id}` returns one with every message: your messages, answers, tool calls, tool results as the model got them, proposals, and a note for each model call with the SHA-256 of the exact payload sent and, while it is kept, the payload itself. Add `?payloads=false` to leave the payloads out.
 
 **Retention.** Payloads are kept for `ai.audit_payload_days` (30); every hour the controller drops older ones and keeps their hashes. With 0, only hashes are kept. Each turn also writes one `ai.turn` event to the tenant's audit stream: the user, the role, the tools called and the payload hashes.
+
+### Administration conversations
+
+`admin` conversations belong to no tenant, so they are kept at the system level: in the `__sprig_ai` schema on the data center's system cluster, which is its lowest-numbered cluster that is active, draining or drained. The controller creates the schema. No tenant account can read it.
+
+- **Who sees them.** Only the operator who had them, and only while their login is a platform operator (in `studio.operator_logins`, with operator mode on). Operators are told apart by login (`tenant.user`).
+- **The same routes.** For an operator, `GET /v1/ai/conversations` lists their tenant conversations and their administration conversations together, newest first. Administration ids start with `a` (`a12`), as do their message ids, so `GET /v1/ai/conversations/a12` opens one with what was sent, `"conversation": "a12"` continues it, and `{"message_id": "a40", "vote": "up"}` rates an answer in it.
+- **Retention.** The global `ai.audit_payload_days`; the controller purges them hourly like the tenants' payloads. Each turn also writes its `ai.turn` event to the platform audit stream.
+- **The grant.** `sprig_ctl` needs ``GRANT ALL ON `__sprig_ai`.* TO 'sprig_ctl'@'%'`` on the system cluster; registration lists it as an advisory when it is missing. Until it is given, or while the system cluster can't be reached, `admin` turns still run but aren't stored, and the listing says why in `admin_unavailable`.
+- **Moving.** If the system cluster is retired, the next one in service takes over with an empty history.
 
 ## Budgets
 
@@ -155,6 +203,8 @@ A tool call outside the assistant's role, or with invalid input, is refused; thr
 | `ai.timeout_seconds` | 120 | Wall time per turn |
 
 Budgets count input read or written uncached, and output; cached input isn't counted. They are checked before every model call: a spent budget stops the turn with 39992 before anything is sent.
+
+`admin` turns use the budgets' global values: `ai.budget.tenant_tokens_day` caps all administration turns in the data center, and `ai.budget.user_tokens_day` each operator.
 
 ## Glossary
 
@@ -178,7 +228,7 @@ POST /v1/ai/feedback
 {"proposal_id": "0193…", "outcome": "accepted"}
 ```
 
-Rate an answer up or down with an optional note (up to 500 characters), or report what became of a proposal: `accepted`, `dismissed` or `failed`. You can rate only your own conversations. The latest 20 outcomes and notes in the tenant are added to every `dba` and `data` prompt: the proposal's kind and a short label, and your note, never an answer's text. Feedback changes prompts, never a model.
+Rate an answer up or down with an optional note (up to 500 characters), or report what became of a proposal: `accepted`, `dismissed` or `failed`. You can rate only your own conversations, administration ones included. The latest 20 outcomes and notes in the tenant are added to every `dba` and `data` prompt: the proposal's kind and a short label, and your note, never an answer's text. Feedback changes prompts, never a model.
 
 ## Errors
 

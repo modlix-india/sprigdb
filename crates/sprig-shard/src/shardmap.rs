@@ -315,6 +315,12 @@ impl ShardMapStore {
         Self { dc }
     }
 
+    /// The DC tier the maps live in (its gateways register there too).
+    #[must_use]
+    pub fn store(&self) -> &Arc<dyn MetaStore> {
+        &self.dc
+    }
+
     /// A group's map and its `mod_revision`, linearizably.
     ///
     /// # Errors

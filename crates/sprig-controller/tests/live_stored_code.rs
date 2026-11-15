@@ -73,8 +73,10 @@ fn env() -> Option<Env> {
             .unwrap_or_else(|_| "storedcode".to_owned()),
         move_to: std::env::var("SPRIG_TEST_STORED_CODE_MOVE_TO")
             .unwrap_or_else(|_| "dc-a-c2".to_owned()),
+        // The clusters' writers: no default, so a private deployment's
+        // run never reaches the shared dev nodes (R9 r9feed4).
         nodes: std::env::var("SPRIG_TEST_STORED_CODE_NODES")
-            .unwrap_or_else(|_| "13301,13311".to_owned())
+            .ok()?
             .split(',')
             .filter_map(|p| p.trim().parse().ok())
             .collect(),
@@ -342,7 +344,10 @@ async fn round(c: &mut mysql_async::Conn, id: u64) -> Result<(), mysql_async::Er
 #[tokio::test]
 async fn stored_code_survives_regroups_splits_merges_and_moves() {
     let Some(e) = env() else {
-        eprintln!("skipped: set SPRIG_TEST_STORED_CODE and SPRIG_TEST_STORED_CODE_SPRIGCTL");
+        eprintln!(
+            "skipped: set SPRIG_TEST_STORED_CODE, SPRIG_TEST_STORED_CODE_SPRIGCTL and \
+             SPRIG_TEST_STORED_CODE_NODES"
+        );
         return;
     };
     let created = ctl_retry(&e, &["tenant", "create", &e.tenant, "--cluster", "dc-a-c1"]).await;

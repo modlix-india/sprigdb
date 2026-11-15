@@ -506,7 +506,16 @@ pub(crate) struct ReadConns {
     /// to end (an auto-commit read at `READ COMMITTED`, whose statements
     /// each see the latest commits either way).
     pub(crate) autocommit: bool,
+    /// Auto-commit reads: the pools [`ShardConns::spare`] takes more
+    /// connections from, per cluster (none on a replica, whose spares
+    /// would need the causal wait too).
+    pub(crate) pools: HashMap<String, mysql_async::Pool>,
+    /// Spare connections taken (idle ones, and how many in all).
+    pub(crate) spares: HashMap<String, (Vec<Conn>, usize)>,
 }
+
+/// Spare connections one auto-commit read takes per cluster.
+const SPARES_MAX: usize = 3;
 
 impl std::fmt::Debug for ReadConns {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -514,6 +523,11 @@ impl std::fmt::Debug for ReadConns {
             .field("clusters", &self.conns.keys().collect::<Vec<_>>())
             .field("implicit", &self.implicit)
             .field("autocommit", &self.autocommit)
+            .field(
+                "spares",
+                &self.spares.values().map(|(_, n)| n).sum::<usize>(),
+            )
+            .field("pools", &self.pools.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -564,6 +578,35 @@ impl ShardConns for ReadConns {
 
     async fn end_batch(&mut self, _ok: bool) -> Result<()> {
         Ok(())
+    }
+
+    async fn spare(&mut self, at: &ShardLoc) -> Result<Option<Conn>> {
+        if !self.autocommit {
+            return Ok(None);
+        }
+        let Some(pool) = self.pools.get(&at.cluster) else {
+            return Ok(None);
+        };
+        let (idle, made) = self.spares.entry(at.cluster.clone()).or_default();
+        if let Some(c) = idle.pop() {
+            return Ok(Some(c));
+        }
+        if *made >= SPARES_MAX {
+            return Ok(None);
+        }
+        *made += 1;
+        pool.get_conn()
+            .await
+            .map(Some)
+            .map_err(sprig_graph::catalog::backend_error)
+    }
+
+    fn put_back(&mut self, at: &ShardLoc, conn: Conn) {
+        self.spares
+            .entry(at.cluster.clone())
+            .or_default()
+            .0
+            .push(conn);
     }
 }
 

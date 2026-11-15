@@ -12,7 +12,46 @@ use crate::ast::{BinOp, Expr, MapItem, UnOp};
 use crate::value::{Value, fmt_float, type_error};
 
 /// One binding row: variable name to value.
-pub type Row = HashMap<String, Value>;
+pub type Row = HashMap<String, Value, RowState>;
+
+/// The hasher of [`Row`]s' keys: variable names of the statement, short
+/// and the statement's own, so a multiply-rotate hash (as rustc's `FxHash`)
+/// instead of `SipHash`, which the gateway spent a tenth of a large read's
+/// time in.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RowHasher(u64);
+
+impl std::hash::Hasher for RowHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        const K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        let mut h = self.0;
+        let mut it = bytes.chunks_exact(8);
+        for c in &mut it {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(c);
+            h = (h.rotate_left(5) ^ u64::from_le_bytes(w)).wrapping_mul(K);
+        }
+        for &b in it.remainder() {
+            h = (h.rotate_left(5) ^ u64::from(b)).wrapping_mul(K);
+        }
+        self.0 = h;
+    }
+
+    fn write_u8(&mut self, i: u8) {
+        self.write(&[i]);
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        self.write(&i.to_le_bytes());
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// [`RowHasher`]'s builder.
+pub type RowState = std::hash::BuildHasherDefault<RowHasher>;
 
 /// Statement parameters.
 pub type Params = BTreeMap<String, Value>;
@@ -984,8 +1023,12 @@ mod tests {
     use crate::parser::parse_expr;
 
     fn ev(s: &str) -> Value {
-        eval(&parse_expr(s).expect("parse"), &Row::new(), &Params::new())
-            .unwrap_or_else(|e| panic!("{s}: {e}"))
+        eval(
+            &parse_expr(s).expect("parse"),
+            &Row::default(),
+            &Params::new(),
+        )
+        .unwrap_or_else(|e| panic!("{s}: {e}"))
     }
 
     #[test]
@@ -1030,14 +1073,14 @@ mod tests {
         assert_eq!(ev("{a: 1, b: [1, 2]}.b[0]"), Value::Int(1));
         let e = eval(
             &parse_expr("1 / 0").expect("p"),
-            &Row::new(),
+            &Row::default(),
             &Params::new(),
         )
         .expect_err("div");
         assert_eq!(e.code(), Some(SprigCode::GraphPropertyType));
         let e = eval(
             &parse_expr("9223372036854775807 + 1").expect("p"),
-            &Row::new(),
+            &Row::default(),
             &Params::new(),
         )
         .expect_err("overflow");
@@ -1059,7 +1102,7 @@ mod tests {
         assert_eq!(ev("range(0, 10, 5)"), ev("[0, 5, 10]"));
         let e = eval(
             &parse_expr("nope(1)").expect("p"),
-            &Row::new(),
+            &Row::default(),
             &Params::new(),
         )
         .expect_err("unknown");

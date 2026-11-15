@@ -8,7 +8,8 @@
 //!   reference-table and unrouted writes: one on their cluster
 //! registry write, when a minute completed (or the lease is new):
 //!   put gateway-load/<gateway_id> = LoadReport{sketches, cluster_writes}
-//!   under the registration lease
+//!   under the registration lease, in its own transaction after the
+//!   registration record's, trimmed to fit one record (LoadReport::encode_within)
 //! ```
 //!
 //! The accumulator is process-wide, as the router's other state is: two
@@ -21,12 +22,12 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sprig_balancer::load::{LoadAccumulator, report_key};
+use sprig_balancer::load::{LoadAccumulator, REPORT_MAX_BYTES, report_key};
 use sprig_balancer::model::ShardKey;
 use sprig_balancer::shards::HashRange;
 use sprig_common::Result;
 use sprig_common::ids::{ClusterId, TenantId};
-use sprig_meta::{LeaseId, MetaStore, Op, Record};
+use sprig_meta::{LeaseId, MetaStore, Op};
 use sprig_router::Plan;
 use sprig_router::write_notes::{self, Note};
 
@@ -182,7 +183,20 @@ pub fn report_op(
     }
     let report = acc.report(gateway, now);
     let key = store.tier().key(&report_key(gateway))?;
-    let value = Record::new(report).encode()?;
+    // Bounded: a report over the record limit used to fail the whole
+    // registration write (`sprig_balancer::load::fit`).
+    let (value, trimmed) = report.encode_within(REPORT_MAX_BYTES)?;
+    if trimmed.any() {
+        metrics::counter!("sprig_gateway_load_report_trimmed_total").increment(1);
+        tracing::debug!(
+            %gateway,
+            slimmed = trimmed.slimmed,
+            dropped = trimmed.dropped,
+            shards_dropped = trimmed.shards_dropped,
+            bytes = value.len(),
+            "load report trimmed to fit its record"
+        );
+    }
     Ok(Some((
         Op::Put {
             key,

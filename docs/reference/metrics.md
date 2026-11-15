@@ -9,7 +9,7 @@ source: the metric macros in the source tree, and docs/metrics-help.toml
 
 Every metric SprigDB records, as exported on each process's telemetry port (`/metrics`, Prometheus text) and through OTLP. Counters end in `_total`; durations are histograms in seconds.
 
-460 metrics in 53 groups.
+466 metrics in 53 groups.
 
 ## `sprig_advisor_*`
 
@@ -38,6 +38,8 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_ai_budget_stops_total` | counter | - | sprig-ai | AI assistant turns stopped because the tenant's or the user's daily token budget was used up (`ER_SPRIG_AI_BUDGET_EXCEEDED`). Unit: count. |
 | `sprig_ai_egress_reduced_total` | counter | `role` | sprig-ai | Tool results the AI egress gate reduced before they reached the provider: rows or values withheld because `ai.share_data` is off, or a result cut at 200 rows or 64 KiB; `role` is the assistant. Unit: count. |
 | `sprig_ai_feedback_total` | counter | `role`, `vote` | sprig-ai | Thumbs up or down users gave AI assistant answers (`POST /v1/ai/feedback`); `role` is the assistant, `vote` is `up` or `down`. Unit: count. |
+| `sprig_ai_mcp_requests_total` | counter | `method`, `result` | sprig-ai | Requests to the MCP server (`/v1/mcp`); `method` is `initialize`, `server/discover`, `tools/list`, `tools/call`, `ping`, `notification`, `delete` or `other`, `result` is `ok`, `error` (a JSON-RPC error after sign-in) or `refused` (signed out, turned off, malformed or from another origin). Unit: count. |
+| `sprig_ai_mcp_tool_calls_total` | counter | `result`, `role`, `tool` | sprig-ai | Tool calls MCP clients made; `role` is `data` or `dba`, `tool` is the tool (`other` for a name not offered), `result` is `ok`, `error`, `denied` (not offered, or invalid input), `proposed` or `limited` (over `ai.mcp.calls_per_minute`). Unit: count. |
 | `sprig_ai_payloads_purged_total` | counter | - | sprig-ai | Exact payloads sent to AI providers that the controller dropped from conversations after `ai.audit_payload_days`; their SHA-256 hashes stay. Unit: count. |
 | `sprig_ai_proposals_total` | counter | `kind`, `outcome` | sprig-ai | Proposals the AI assistants made, and what became of them; `kind` is `sql`, `recommendation`, `tile`, `glossary` or `generate_rows`, `outcome` is `shown` when made, then `accepted`, `dismissed` or `failed` as users report it with `POST /v1/ai/feedback`. Unit: count. |
 | `sprig_ai_requests_total` | counter | `model`, `provider`, `result`, `role` | sprig-ai | Calls to an AI provider; `role` is the assistant, `provider` and `model` as configured in `ai.model.<role>`, `result` is `ok`, `refused` or `error` (after retries). Unit: count. |
@@ -297,6 +299,7 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 
 | Metric | Type | Labels | Recorded by | Description |
 |---|---|---|---|---|
+| `sprig_gateway_ack_lease_lapses_total` | counter | - | sprig-gateway | Times this gateway's acknowledgement lease ran out or failed to renew (for example, after a pause or a lost connection to the DC's store). Until the lease is renewed, the gateway reloads each tenant's catalog from the writer before that tenant's next statement, so it never plans with a stale catalog. Unit: count. |
 | `sprig_gateway_admission_backoffs_total` | counter | `protocol` | sprig-gateway | New connections turned away with `ER_SPRIG_ADMISSION_BACKOFF` while the data centre returns from an outage; `protocol` is the front end. Unit: count. |
 | `sprig_gateway_admission_rate` | gauge | - | sprig-gateway | New connections per second this gateway admits while its data centre returns from an outage; 0 when no limit applies. Unit: connections per second. |
 | `sprig_gateway_admission_wait_seconds` | histogram | - | sprig-gateway | Time statements waited for an admission slot (`limits.tenant_active_statements`, `limits.user_active_statements`) before running or timing out. Unit: seconds. |
@@ -317,6 +320,7 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_gateway_lease_lost_total` | counter | - | sprig-gateway | Times this gateway lost its registration lease in the control plane and re-registered. Unit: count. |
 | `sprig_gateway_listener_generation` | gauge | `listener` | sprig-gateway | Configuration generation of each listener; it rises whenever the listener's bind address, TLS or certificate changes. `listener` is the listener. Unit: count. |
 | `sprig_gateway_listener_plaintext_public` | gauge | `listener` | sprig-gateway | Whether a listener accepts plaintext connections on a non-loopback address; `listener` is the listener. Unit: 0 or 1. |
+| `sprig_gateway_load_report_trimmed_total` | counter | - | sprig-gateway | Load reports this gateway trimmed to fit the registration record's size limit, keeping the cluster totals and the newest, most-written index sketches and dropping the rest, so the report still registers. Unit: count. |
 | `sprig_gateway_load_reports_total` | counter | - | sprig-gateway | Write-load reports this gateway sent for placement and hot-shard detection. Unit: count. |
 | `sprig_gateway_long_polls_total` | counter | - | sprig-gateway | Single polls of a request that held an async worker of the gateway for 250 ms or more. Unit: count. |
 | `sprig_gateway_offloaded_steps_total` | counter | - | sprig-common | Large synchronous steps (such as sorting or hashing) moved off the gateway's async workers. Unit: count. |
@@ -440,6 +444,8 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | Metric | Type | Labels | Recorded by | Description |
 |---|---|---|---|---|
 | `sprig_lookup_claims_total` | counter | `result` | sprig-gateway | Values claimed in unique lookup indexes by inserts; `result` is `inserted`, `own`, `reclaimed` or `duplicate`. Unit: count. |
+| `sprig_lookup_publish_fenced_total` | counter | - | sprig-shard | Gateways fenced because they didn't acknowledge a lookup change within `lookup.publish_timeout_ms`: their leases were revoked, so they reload the tenant's catalog before their next statement of it. Unit: gateways. |
+| `sprig_lookup_publish_seconds` | histogram | - | sprig-shard | How long a lookup change waited for every gateway of the DC to load the new catalog version (fenced gateways included). Unit: seconds. |
 
 ## `sprig_meta_*`
 
@@ -552,7 +558,7 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | Metric | Type | Labels | Recorded by | Description |
 |---|---|---|---|---|
 | `sprig_rls_feed_events_filtered_total` | counter | `protocol` | sprig-gateway, sprig-sinks, sprig-worker | Change events withheld from a reader by row-level security; `protocol` is where they were read, such as `kafka` or `trigger`. Unit: count. |
-| `sprig_rls_merged_reads_total` | counter | - | sprig-gateway | - |
+| `sprig_rls_merged_reads_total` | counter | - | sprig-gateway | Statements that read a table with row-level security merged with a parent's shared rows (inheritance): the policy views let the shared layers through for that statement only. Unit: count. |
 | `sprig_rls_reprepares_total` | counter | - | sprig-gateway | Prepared statements prepared again because the row-level security policies they depend on changed. Unit: count. |
 | `sprig_rls_rewrites_total` | counter | `protocol` | sprig-gateway | Statements rewritten to apply row-level security policies; `protocol` is the front end. Unit: count. |
 

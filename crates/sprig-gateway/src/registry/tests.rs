@@ -97,3 +97,88 @@ async fn state_changes_are_written_at_once() {
     stop.cancel();
     task.await.unwrap();
 }
+
+/// r1diff (GR7): a gateway writing to many shards made a load report over
+/// the 64 KiB record limit, and every registration write failed with it.
+#[tokio::test]
+async fn a_large_load_report_never_fails_the_registration() {
+    use sprig_balancer::load::{LoadReport, report_key};
+    use sprig_balancer::model::ShardKey;
+    use sprig_balancer::shards::HashRange;
+    use sprig_common::ids::ClusterId;
+
+    // 64 shards in each of the last completed minutes, hashes spread
+    // over the whole range: about twice the record limit unbounded.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let now = u64::try_from(now).unwrap();
+    let c = ClusterId::new("dc-t-c1").unwrap();
+    let range = HashRange::new(0, None);
+    for back in 1..=3u64 {
+        for s in 0..64u32 {
+            let key = ShardKey::new(4242, 1, s);
+            let writes: Vec<_> = (0..40u64)
+                .map(|i| {
+                    let h = (i + 1)
+                        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                        .wrapping_add(u64::from(s));
+                    (key, &c, Some((range, h)))
+                })
+                .collect();
+            crate::write_load::accumulator()
+                .sketches()
+                .record(now - back * 60_000, writes);
+        }
+    }
+    let unbounded = crate::write_load::accumulator().report("gw-big", now);
+    assert!(
+        Record::new(unbounded).encode().is_err(),
+        "the workload must exceed the record limit"
+    );
+
+    let store = store();
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let stop = CancellationToken::new();
+    let r = Registrar::new(record("gw-big"));
+    let sessions = Arc::new(SessionTable::new(clock.clone()));
+    let task = r
+        .start(
+            store.clone(),
+            clock.clone(),
+            sessions,
+            || Duration::from_secs(5),
+            stop.clone(),
+        )
+        .await;
+    // Registered, and the report written beside the record, within the limit.
+    assert!(get(store.as_ref(), "gw-big").await.unwrap().is_some());
+    let key = store.tier().key(&report_key("gw-big")).unwrap();
+    let kv = store
+        .get(&key, Consistency::Linearizable)
+        .await
+        .unwrap()
+        .expect("load report written");
+    assert!(kv.value.len() <= sprig_meta::record::MAX_VALUE_BYTES);
+    let report = Record::<LoadReport>::decode(&kv.value).unwrap().body;
+    assert!(report.sketches.len() >= 64, "{}", report.sketches.len());
+    // Refreshes keep succeeding: a state change reaches the record.
+    r.set_state(GatewayState::Ready);
+    let mut ok = false;
+    for _ in 0..50 {
+        if get(store.as_ref(), "gw-big")
+            .await
+            .unwrap()
+            .map(|g| g.state)
+            == Some(GatewayState::Ready)
+        {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ok, "the record was refreshed");
+    stop.cancel();
+    task.await.unwrap();
+}

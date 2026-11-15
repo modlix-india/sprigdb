@@ -55,7 +55,9 @@ pub fn listed(logins: &str, login: &str) -> bool {
         .any(|l| !l.is_empty() && l.eq_ignore_ascii_case(login))
 }
 
-fn login_of(c: &Caller) -> String {
+/// The login operator mode knows `c` by: `tenant.user`, or the user name
+/// alone without a tenant.
+pub(crate) fn login_of(c: &Caller) -> String {
     match &c.principal.tenant_name {
         Some(t) => format!("{t}.{}", c.principal.user),
         None => c.principal.user.clone(),

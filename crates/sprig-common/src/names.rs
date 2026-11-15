@@ -52,6 +52,11 @@ pub const DOCS_DATABASE: &str = "sprig_docs";
 /// (`sprig_ctl` owns it; tenants read it as [`DOCS_DATABASE`]).
 pub const DOCS_SCHEMA: &str = "__sprig_docs";
 
+/// The system schema that keeps the administration assistant's
+/// conversations, on one cluster of each DC (`sprig_ctl` owns it; no
+/// tenant account has any grant there).
+pub const AI_SCHEMA: &str = "__sprig_ai";
+
 /// Grant pattern covering every tenant schema, for `sprig_ctl`.
 pub const TENANT_SCHEMAS_GRANT_PATTERN: &str = "t%";
 
@@ -267,6 +272,19 @@ impl FromStr for AccountName {
 #[must_use]
 pub fn tenant_account_like(tenant: TenantId) -> String {
     format!("t{tenant}\\_%")
+}
+
+/// The suffix of [`share_definer_account`] after `t<tenant>_`.
+pub const SHARE_DEFINER_SUFFIX: &str = "sprig_share";
+
+/// The account a tenant's cross-tenant share views run as, in its
+/// children's schemas: `t<tenant>_sprig_share` (host `%`), created locked
+/// by SprigDB and granted `SELECT` only on what those views read
+/// (chapter 42, decision RL70). It belongs to no user, so dropping or
+/// renaming a user never breaks a child's view.
+#[must_use]
+pub fn share_definer_account(tenant: TenantId) -> String {
+    format!("t{tenant}_{SHARE_DEFINER_SUFFIX}")
 }
 
 /// SprigDB's system accounts.

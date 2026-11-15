@@ -125,11 +125,43 @@ pub enum SqlOp {
     /// A change exchange's publishes, each
     /// a `CALL sprig.mq_publish(...)` (39235 otherwise), autocommit, in
     /// order, in one session of the setting's user; each statement's error
-    /// is its own result's.
+    /// is its own result's. (Workers before R9 r9feed4; now
+    /// [`SqlOp::PublishBatch`].)
     Publish {
         /// The calls.
         statements: Vec<String>,
     },
+    /// A change exchange's publishes (R9 r9feed4), as the request's user,
+    /// whose write permission on the exchange applies: each message, in
+    /// order, as its message id. Each queue takes a message of an id only
+    /// once (its messages and its forward ledger), so a publish repeated
+    /// after a restart is a no-op; the messages for one queue reach its
+    /// owner in one command. The reply has one result per message, in
+    /// order, up to the first that failed (its error is its result's);
+    /// `affected` is the number of queues reached. A retry from the first
+    /// failed one keeps the order.
+    PublishBatch {
+        /// The vhost (the table's database).
+        vhost: String,
+        /// The exchange.
+        exchange: String,
+        /// The messages.
+        messages: Vec<PublishMessage>,
+    },
+}
+
+/// One message of [`SqlOp::PublishBatch`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishMessage {
+    /// The routing key.
+    pub routing_key: String,
+    /// The body (UTF-8: a change envelope's JSON).
+    pub body: String,
+    /// The properties, a JSON object as `sprig.mq_publish` takes them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub properties: Option<String>,
+    /// The message id, 32 hex digits ([`publish_id`]).
+    pub id: String,
 }
 
 /// One table's images for [`SqlOp::Images`].
@@ -158,6 +190,20 @@ pub fn images_answer(tables: &[ImageTable], reply: &SqlReply) -> Vec<Vec<bool>> 
         }
     }
     out
+}
+
+/// A message id of [`SqlOp::PublishBatch`]: 32 hex digits, as 16 bytes.
+/// `None` for anything else.
+#[must_use]
+pub fn publish_id(hex: &str) -> Option<[u8; 16]> {
+    if hex.len() != 32 || !hex.is_ascii() {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 /// Checks [`SqlOp::Publish`]'s statements: each one `CALL
@@ -639,6 +685,19 @@ mod tests {
                 queue: "jobs".into(),
                 tag: "sink/7/0/3".into(),
             },
+            SqlOp::Publish {
+                statements: vec!["CALL sprig.mq_publish('x', 'k', '{}', NULL, 0, 'shop')".into()],
+            },
+            SqlOp::PublishBatch {
+                vhost: "shop".into(),
+                exchange: "x".into(),
+                messages: vec![PublishMessage {
+                    routing_key: "shop.orders.c".into(),
+                    body: "{}".into(),
+                    properties: Some("{\"delivery_mode\":2}".into()),
+                    id: "0123456789abcdef0123456789ABCDEF".into(),
+                }],
+            },
         ] {
             let req = r.request(op);
             let j = serde_json::to_string(&req).unwrap();
@@ -670,6 +729,22 @@ mod tests {
         );
         assert_eq!(SqlResult::bytes(&back.results[0].rows[0], 1), None);
         assert_eq!(back.results[0].col("BODY"), Some(0));
+    }
+
+    #[test]
+    fn publish_ids_parse() {
+        assert_eq!(
+            publish_id("000102030405060708090a0b0c0d0eFF"),
+            Some([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 255])
+        );
+        for bad in [
+            "",
+            "00",
+            "0g0102030405060708090a0b0c0d0e0f",
+            "é0102030405060708090a0b0c0d0e0f",
+        ] {
+            assert_eq!(publish_id(bad), None, "{bad}");
+        }
     }
 
     #[test]

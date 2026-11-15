@@ -743,6 +743,110 @@ pub fn rewrite_with(
     None
 }
 
+/// For a key element at `a` (as [`key_element`]): its name, if written,
+/// and the index of its `(` part list.
+fn named_key_element(s: &Sig<'_>, a: usize) -> Option<(Option<String>, usize)> {
+    let list = key_element(s, a)?;
+    // The name, if any, is the identifier before the list or before `USING t`.
+    let mut j = list.checked_sub(1)?;
+    if j >= 2 && s.word(j - 1, b"USING") {
+        j -= 2;
+    }
+    let keyword = s.word(j, b"KEY") || s.word(j, b"INDEX") || s.word(j, b"UNIQUE");
+    if !keyword {
+        return Some((s.ident(j), list));
+    }
+    // `CONSTRAINT c UNIQUE (...)`: the index is named `c`.
+    let constraint = (s.word(a, b"CONSTRAINT") && !s.word(a + 1, b"UNIQUE"))
+        .then(|| s.ident(a + 1))
+        .flatten();
+    Some((constraint, list))
+}
+
+/// The hidden columns behind the parts of the part list at `open`: a
+/// functional part's [`fx_column`], or a hidden column named as a part
+/// (a statement already rewritten).
+fn fx_columns_of(s: &Sig<'_>, open: usize) -> Vec<String> {
+    let Some(close) = s.matching(open) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (a, b) in s.split(open + 1, close) {
+        if s.punct(a, b'(') {
+            if let Some(pc) = s.matching(a).filter(|pc| *pc < b && *pc > a + 1) {
+                out.push(fx_column(&s.text(a + 1, pc - 1)));
+            }
+        } else if let Some(name) = s.ident(a).filter(|n| is_fx_column(n)) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// The index whose functional key part is the hidden column `column`, in
+/// the `CREATE TABLE`, `CREATE INDEX` or `ALTER TABLE ... ADD INDEX` the
+/// client wrote: its name, or the name MySQL gives an unnamed functional
+/// index (`functional_index`, then `functional_index_2`, ...). For MySQL's
+/// errors that name the index where MariaDB names the column.
+#[must_use]
+pub fn index_of_fx_column(sql: &[u8], opts: &LexOptions, column: &str) -> Option<String> {
+    let tokens = lex::lex(sql, opts).ok()?;
+    let s = Sig {
+        sql,
+        t: tokens.into_iter().filter(|t| !t.kind.is_trivia()).collect(),
+    };
+    let mut keys: Vec<(Option<String>, usize)> = Vec::new();
+    if s.word(0, b"CREATE")
+        && (s.word(1, b"TABLE") || (s.word(1, b"TEMPORARY") && s.word(2, b"TABLE")))
+    {
+        let open = (0..s.t.len()).find(|&j| s.punct(j, b'('))?;
+        let close = s.matching(open)?;
+        keys.extend(
+            s.split(open + 1, close)
+                .into_iter()
+                .filter_map(|(a, _)| named_key_element(&s, a)),
+        );
+    } else if s.word(0, b"CREATE") {
+        let j = if s.word(1, b"UNIQUE") { 2 } else { 1 };
+        if !s.word(j, b"INDEX") {
+            return None;
+        }
+        let on = (j + 2..s.t.len()).find(|&k| s.word(k, b"ON"))?;
+        let list = (on + 1..s.t.len()).find(|&k| s.punct(k, b'('))?;
+        keys.push((s.ident(j + 1), list));
+    } else if s.word(0, b"ALTER") && s.word(1, b"TABLE") {
+        for (a, _) in s.split(2, s.t.len()) {
+            let Some(add) = (a..s.t.len()).find(|&k| s.word(k, b"ADD")) else {
+                continue;
+            };
+            if add != a && a != 2 {
+                continue;
+            }
+            keys.extend(named_key_element(&s, add + 1));
+        }
+    } else {
+        return None;
+    }
+    let mut unnamed = 0;
+    for (name, list) in keys {
+        let cols = fx_columns_of(&s, list);
+        let generated = name.is_none() && !cols.is_empty();
+        if generated {
+            unnamed += 1;
+        }
+        if cols.iter().any(|c| c.eq_ignore_ascii_case(column)) {
+            return Some(name.unwrap_or_else(|| {
+                if unnamed == 1 {
+                    "functional_index".to_owned()
+                } else {
+                    format!("functional_index_{unnamed}")
+                }
+            }));
+        }
+    }
+    None
+}
+
 /// `DROP INDEX i ON t` or `ALTER TABLE t DROP {INDEX | KEY} i` alone
 /// (Django's `remove_index` and `remove_constraint`): the table as
 /// written and the index's name (see [`fk_indexes_kept`]).
@@ -1081,5 +1185,65 @@ mod tests {
                 "CREATE TABLE t (a INT, b BIGINT UNSIGNED, KEY (`{c}`), `{c}` BIGINT GENERATED ALWAYS AS (a + b * 2) VIRTUAL INVISIBLE)"
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod index_name_tests {
+    #![allow(clippy::many_single_char_names)]
+
+    use super::*;
+
+    fn of(sql: &str, column: &str) -> Option<String> {
+        index_of_fx_column(sql.as_bytes(), &LexOptions::mysql84(), column)
+    }
+
+    // The statements SQLancer wrote (r1diff, GR8), and MySQL 8.4.11's names
+    // for unnamed functional indexes (captured 15 November 2026).
+    #[test]
+    fn the_index_behind_a_hidden_column() {
+        let e = "( EXISTS (SELECT 1 wHERE FALSE)) IS NOT FALSE";
+        let c = fx_column(e);
+        assert_eq!(
+            of(&format!("CREATE UNIQUE INDEX i1 ON t0(({e}))"), &c).as_deref(),
+            Some("i1")
+        );
+        assert_eq!(
+            of(
+                &format!("CREATE INDEX i0 USING BTREE ON t0(({e}) DESC)"),
+                &c
+            )
+            .as_deref(),
+            Some("i0")
+        );
+        let a = fx_column("a + 1");
+        let b = fx_column("a + 2");
+        let t = "CREATE TABLE t7 (a INT, INDEX ((a + 1)), INDEX ((a + 2)), KEY named ((a * 3)))";
+        assert_eq!(of(t, &a).as_deref(), Some("functional_index"));
+        assert_eq!(of(t, &b).as_deref(), Some("functional_index_2"));
+        assert_eq!(of(t, &fx_column("a * 3")).as_deref(), Some("named"));
+        assert_eq!(
+            of("CREATE TABLE t (a INT, CONSTRAINT uq UNIQUE ((a + 1)))", &a).as_deref(),
+            Some("uq")
+        );
+        assert_eq!(
+            of(
+                "ALTER TABLE t9 ADD COLUMN z INT, ADD INDEX fy ((a + 1))",
+                &a
+            )
+            .as_deref(),
+            Some("fy")
+        );
+        assert_eq!(
+            of("ALTER TABLE t9 ADD UNIQUE KEY fk USING HASH ((a + 2))", &b).as_deref(),
+            Some("fk")
+        );
+        // An already rewritten statement names the hidden column itself.
+        assert_eq!(
+            of(&format!("ALTER TABLE t ADD INDEX i2 (`{a}`)"), &a).as_deref(),
+            Some("i2")
+        );
+        assert_eq!(of("CREATE INDEX i ON t ((a + 2))", &a), None);
+        assert_eq!(of("SELECT 1", &a), None);
     }
 }

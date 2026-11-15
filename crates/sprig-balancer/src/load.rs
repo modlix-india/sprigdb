@@ -79,6 +79,9 @@ pub fn report_key(gateway: &str) -> String {
 /// The prefix of [`report_key`].
 pub const REPORT_PREFIX: &str = "gateway-load/";
 
+mod fit;
+pub use fit::{REPORT_MAX_BYTES, Trimmed};
+
 /// The gateway side: counters per shard, read every report period.
 #[derive(Debug, Default)]
 pub struct LoadAccumulator {

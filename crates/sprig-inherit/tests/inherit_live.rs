@@ -18,10 +18,16 @@
 //! its own worker (R6 round 5: both tests fail that way,
 //! deterministically, and pass without one). They check that themselves
 //! (R6 round 6, decision T1): when the deployment's etcd
-//! (`SPRIG_TEST_ETCD`, default `http://127.0.0.1:2379`) has a live worker
+//! (`SPRIG_TEST_ETCD`; no default) has a live worker
 //! that takes `other` jobs, or the tree has an `inherit_copy` job that
 //! isn't finished, they say so and skip (and fail under
 //! `SPRIG_TEST_STRICT=1`).
+//!
+//! The tests with an in-process copy worker also need `SPRIG_TEST_ETCD`,
+//! and `prepare_phase_sees_a_share_the_snapshot_missed` a root login on
+//! the tenant's node (`SPRIG_TEST_R6I_ROOT_DSN=mysql://root:...@host:port`).
+//! Neither has a default, so a run against a private deployment never
+//! reaches the shared dev stack.
 //!
 //! Without the variable every test reports what it needs and passes (or
 //! fails under `SPRIG_TEST_STRICT=1`). Each test uses its own database
@@ -63,6 +69,23 @@ fn endpoints(test: &str) -> Option<Vec<String>> {
             None
         }
     }
+}
+
+/// Variable `var`, or `None` after saying the test skips (fails under
+/// `SPRIG_TEST_STRICT=1`). For a test's connections outside the gateway
+/// (its etcd, a root login on the node): they have no default, so a run
+/// against a private deployment never reaches the shared dev stack
+/// (R9 r9feed4).
+fn needs(test: &str, var: &str) -> Option<String> {
+    let v = std::env::var(var).ok().filter(|v| !v.trim().is_empty());
+    if v.is_none() {
+        assert!(
+            std::env::var("SPRIG_TEST_STRICT").ok().as_deref() != Some("1"),
+            "{test}: {var} is not set"
+        );
+        eprintln!("{test}: skipped, set {var}");
+    }
+    v
 }
 
 fn tenants() -> Vec<String> {
@@ -658,6 +681,14 @@ async fn materialized_views_converge_to_the_model() {
     {
         return;
     }
+    if needs(
+        "materialized_views_converge_to_the_model",
+        "SPRIG_TEST_ETCD",
+    )
+    .is_none()
+    {
+        return;
+    }
     let mut w = copyw::Worker::new(&tenants()[0]).await;
     model_run(&eps, Some(&mut w)).await;
     w.stop().await;
@@ -1041,10 +1072,17 @@ async fn prepare_phase_sees_a_share_the_snapshot_missed() {
     let Some(eps) = endpoints("prepare_phase_sees_a_share_the_snapshot_missed") else {
         return;
     };
+    let test = "prepare_phase_sees_a_share_the_snapshot_missed";
+    // A root login on the tenant's node, and the deployment's etcd: no
+    // defaults (R9 r9feed4; before, root on the shared dev node 13301).
+    let (Some(dsn), Some(_)) = (
+        needs(test, "SPRIG_TEST_R6I_ROOT_DSN"),
+        needs(test, "SPRIG_TEST_ETCD"),
+    ) else {
+        return;
+    };
     let t = tenants();
     let w = copyw::Worker::new(&t[0]).await;
-    let dsn = std::env::var("SPRIG_TEST_R6I_ROOT_DSN")
-        .unwrap_or_else(|_| "mysql://root:sprig-dev-root@127.0.0.1:13301".into());
     let mut root = Conn::new(mysql_async::Opts::from_url(&dsn).unwrap())
         .await
         .unwrap();
@@ -1149,7 +1187,10 @@ mod copyw {
     pub(crate) async fn tree_copier(root_name: &str) -> Result<Option<String>, String> {
         let meta = MetaConfig {
             dc_seeds: vec![
-                std::env::var("SPRIG_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:2379".into()),
+                std::env::var("SPRIG_TEST_ETCD")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .ok_or("SPRIG_TEST_ETCD is not set")?,
             ],
             global_seeds: Vec::new(),
             deployment_id: "sprigdb-dev".into(),
@@ -1214,7 +1255,7 @@ mod copyw {
             let meta = MetaConfig {
                 dc_seeds: vec![
                     std::env::var("SPRIG_TEST_ETCD")
-                        .unwrap_or_else(|_| "http://127.0.0.1:2379".into()),
+                        .expect("SPRIG_TEST_ETCD (checked by the test)"),
                 ],
                 global_seeds: Vec::new(),
                 deployment_id: "sprigdb-dev".into(),
@@ -1247,6 +1288,11 @@ mod copyw {
                 registry,
                 Arc::clone(&pools),
             ));
+            // Through a shared reader, as the worker reads (R9, r9feed3).
+            let shared = sprig_feed::shared::SharedFeed::new(
+                Arc::clone(&clusters) as Arc<dyn sprig_feed::Clusters>,
+                sprig_feed::shared::SharedOpts::default(),
+            );
             let env = Arc::new(
                 LiveEnv::new(
                     Arc::clone(&dc),
@@ -1255,7 +1301,8 @@ mod copyw {
                     pools,
                     clusters,
                 )
-                .unwrap(),
+                .unwrap()
+                .with_feed(shared.view(sprig_feed::shared::Kept::All)),
             );
             let entries = sprig_controller::tree::Directory::new(global)
                 .list()

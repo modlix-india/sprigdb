@@ -91,6 +91,28 @@ fn words(text: &[u8], lex_opts: &LexOptions) -> Vec<(TokenKind, String)> {
         .unwrap_or_default()
 }
 
+/// What [`PassSession::rls_refused_names`] finds: the names a statement may
+/// not name, the tainted views and code among them, and the code pointed at
+/// the policy views.
+type RefusedNames = (
+    Vec<String>,
+    std::collections::HashSet<String>,
+    Vec<crate::tenant::rls::TaintedCode>,
+);
+
+/// Whether words `w` name one of `names` (lower case): as an identifier,
+/// or inside a string (the text of `PREPARE ... FROM '...'`).
+fn names_any(w: &[(TokenKind, String)], names: &[String]) -> bool {
+    w.iter().any(|(k, v)| {
+        let v = v.to_lowercase();
+        match k {
+            TokenKind::Word | TokenKind::QuotedIdent => names.contains(&v),
+            TokenKind::String => names.iter().any(|n| v.contains(n.as_str())),
+            _ => false,
+        }
+    })
+}
+
 fn class(w: &[(TokenKind, String)]) -> Class {
     let up = |i: usize| {
         w.get(i)
@@ -886,6 +908,87 @@ impl PassSession {
         sprig_sql::rls::Resolver::predicate(&r, k, cmds, qual).map(Some)
     }
 
+    /// The names a statement of the session may not name under its
+    /// row-level security: the protected tables that bind it, and views and
+    /// stored code over them that aren't pointed at the policy views (also
+    /// returned on their own), and the code pointed at the policy views.
+    /// Pointing fixable code is done here, as for any statement.
+    async fn rls_refused_names(
+        &mut self,
+        cat: &Arc<sprig_catalog::TenantCatalog>,
+        rls: &sprig_auth::authz::rls::SessionRls,
+    ) -> Result<RefusedNames> {
+        let Some(ts) = self.tenant.as_deref_mut() else {
+            return Ok((Vec::new(), std::collections::HashSet::new(), Vec::new()));
+        };
+        let mut names: Vec<String> = rls
+            .tables
+            .keys()
+            .filter_map(|o| cat.objects.get(*o))
+            .map(|o| o.name.to_lowercase())
+            .collect();
+        let mut tainted = crate::tenant::rls::tainted(ts, cat, &names).await?;
+        // Under policy views, views and stored code reading protected
+        // tables read the views instead, and then apply the session's
+        // policies in MariaDB; dynamic SQL stays refused.
+        let svc2 = Arc::clone(ts.services());
+        let fixable: Vec<crate::tenant::rls::TaintedCode> = tainted
+            .code
+            .iter()
+            .filter(|c| {
+                !c.dynamic
+                    && matches!(
+                        c.kind,
+                        ObjectKind::View
+                            | ObjectKind::Procedure
+                            | ObjectKind::Function
+                            | ObjectKind::Trigger
+                    )
+                    && crate::tenant::rls::enforcement(&svc2, cat, c.db) == "views"
+            })
+            .cloned()
+            .collect();
+        if !fixable.is_empty() {
+            let pointed = Box::pin(self.repoint(cat, &fixable)).await;
+            tainted.without(&pointed);
+        }
+        let tainted = tainted.names;
+        names.extend(tainted.iter().cloned());
+        Ok((names, tainted, fixable))
+    }
+
+    /// Whether `text`, the text of a SQL-level prepared statement, names a
+    /// table the session's row-level security binds (or code over one), so
+    /// that `PREPARE ... FROM` it would be refused (39366). An `EXECUTE` of a
+    /// statement MariaDB holds is checked with it: the statement may have
+    /// been prepared before the policy, or from a variable (S163).
+    pub(super) async fn rls_names_protected(
+        &mut self,
+        cx: &ExecCtx<'_>,
+        text: &[u8],
+    ) -> Result<bool> {
+        let (lex_opts, _) = self.lex_opts();
+        let Some(ts) = self.tenant.as_deref() else {
+            return Ok(false);
+        };
+        let Some(cat) = ts.catalog().cloned() else {
+            return Ok(false);
+        };
+        if !RlsState::of(&cat).is_some_and(RlsState::any_enabled)
+            || crate::tenant::rls::is_exempt(cx.session.id)
+        {
+            return Ok(false);
+        }
+        let Some(rls) = crate::tenant::authz::privileges(ts, &cat).row_policies() else {
+            return Ok(false);
+        };
+        if rls.is_empty() {
+            return Ok(false);
+        }
+        let (names, _, _) = self.rls_refused_names(&cat, &rls).await?;
+        Ok(names_any(&words(text, &lex_opts), &names))
+    }
+
     /// The rewrite before planning (see the module docs): the text to plan
     /// instead, if it changed.
     ///
@@ -1040,52 +1143,13 @@ impl PassSession {
             ));
         }
         let lctn = ts.lower_case_table_names();
-        let mut names: Vec<String> = rls
-            .tables
-            .keys()
-            .filter_map(|o| cat.objects.get(*o))
-            .map(|o| o.name.to_lowercase())
-            .collect();
-        let mut tainted = crate::tenant::rls::tainted(ts, &cat, &names).await?;
-        // Under policy views, views and stored code reading protected
-        // tables read the views instead, and then apply the session's
-        // policies in MariaDB; dynamic SQL stays refused.
-        let svc2 = Arc::clone(ts.services());
-        let fixable: Vec<crate::tenant::rls::TaintedCode> = tainted
-            .code
-            .iter()
-            .filter(|c| {
-                !c.dynamic
-                    && matches!(
-                        c.kind,
-                        ObjectKind::View
-                            | ObjectKind::Procedure
-                            | ObjectKind::Function
-                            | ObjectKind::Trigger
-                    )
-                    && crate::tenant::rls::enforcement(&svc2, &cat, c.db) == "views"
-            })
-            .cloned()
-            .collect();
-        if !fixable.is_empty() {
-            let pointed = Box::pin(self.repoint(&cat, &fixable)).await;
-            tainted.without(&pointed);
-        }
+        let (names, tainted, fixable) = self.rls_refused_names(&cat, &rls).await?;
         let Some(ts) = self.tenant.as_deref_mut() else {
             return Ok(None);
         };
-        let tainted = tainted.names;
-        names.extend(tainted.iter().cloned());
         // A protected name as an identifier, or inside a string (the text
         // of PREPARE ... FROM '...').
-        let named = w.iter().any(|(k, v)| {
-            let v = v.to_lowercase();
-            match k {
-                TokenKind::Word | TokenKind::QuotedIdent => names.contains(&v),
-                TokenKind::String => names.iter().any(|n| v.contains(n.as_str())),
-                _ => false,
-            }
-        });
+        let named = names_any(&w, &names);
         let c = class(&w);
         match c {
             Class::Skip => return Ok(same(text)),

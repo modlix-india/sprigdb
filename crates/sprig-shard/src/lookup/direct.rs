@@ -238,6 +238,80 @@ pub struct BuildReport {
     pub repaired: u64,
 }
 
+/// Values of a unique lookup that repeat across shards, found by a
+/// build's verification. The 1062 a failed build returns carries it as its
+/// source ([`Duplicates::of`]), so the caller can tell people which values
+/// to fix.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Duplicates {
+    /// Distinct values held by more than one row (counted up to
+    /// [`Duplicates::COUNT_LIMIT`]; more are reported as that many).
+    pub values: u64,
+    /// Rows whose value another live row already held.
+    pub rows: u64,
+    /// Up to [`Duplicates::SAMPLE`] of the values, as text (`-` between
+    /// the parts of a value of several columns).
+    pub sample: Vec<String>,
+}
+
+impl Duplicates {
+    /// Values kept as a sample.
+    pub const SAMPLE: usize = 10;
+    /// Distinct values counted at most.
+    pub const COUNT_LIMIT: usize = 1_000_000;
+
+    /// The duplicates a failed build's error carries, if any.
+    #[must_use]
+    pub fn of(e: &SprigError) -> Option<&Duplicates> {
+        e.source
+            .as_deref()
+            .and_then(|s| s.downcast_ref::<Duplicates>())
+    }
+
+    /// The 1062 a build fails with: the first value, and how many.
+    #[must_use]
+    pub fn error(self, key: &str) -> SprigError {
+        let first = self.sample.first().cloned().unwrap_or_default();
+        let more = if self.values > 1 {
+            format!(" (and {} more values)", self.values - 1)
+        } else {
+            String::new()
+        };
+        SprigError::standard(
+            1062,
+            *b"23000",
+            format!("Duplicate entry '{first}' for key '{key}'{more}"),
+        )
+        .with_source(self)
+    }
+}
+
+impl std::fmt::Display for Duplicates {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} values repeat across shards ({} rows); for example {}",
+            self.values,
+            self.rows,
+            self.sample.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for Duplicates {}
+
+/// A value read back from MariaDB as people read it.
+fn shown(vals: &[Value]) -> String {
+    vals.iter()
+        .map(|v| match v {
+            Value::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+            Value::NULL => "NULL".to_owned(),
+            other => other.as_sql(true).trim_matches('\'').to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 /// `innodb_lock_wait_timeout` of the back-fill's locking reads.
 const BACKFILL_LOCK_WAIT_SECS: u64 = 10;
 /// Attempts of one back-fill chunk on 1205 or 1213.
@@ -338,7 +412,12 @@ where
             l.state.as_str()
         )));
     }
+    tracing::info!(lookup = %l.index_name, "lookup back-fill starts");
     let mut report = backfill(pools, catalog, p, l, chunk).await?;
+    tracing::info!(
+        lookup = %l.index_name, rows = report.rows, inserted = report.inserted,
+        "lookup back-fill done; verifying"
+    );
     match verify(pools, catalog, p, l, chunk).await {
         Ok(n) => report.repaired = n,
         Err(e) if errno(&e) == Some(1062) => {
@@ -391,7 +470,8 @@ async fn locked_chunk(oc: &mut Conn, sql: &str, prm: Vec<Value>) -> Result<Vec<R
     let mut tries = 0;
     loop {
         oc.query_drop("BEGIN").await.map_err(db_err)?;
-        let r: std::result::Result<Vec<Row>, _> = oc.exec(sql, Params::Positional(prm.clone())).await;
+        let r: std::result::Result<Vec<Row>, _> =
+            oc.exec(sql, Params::Positional(prm.clone())).await;
         match r {
             Ok(rows) => {
                 oc.query_drop("COMMIT").await.map_err(db_err)?;
@@ -459,17 +539,20 @@ async fn backfill(
                 .map(|r| (nv..nv + np).map(|i| r[i].clone()).collect());
             for (t, batch) in batches {
                 let mut c = conn(pools, &t.cluster).await?;
-                let sql = l.insert_sql(&t.schema, true);
-                for ins in batch {
-                    c.exec_drop(&sql, Params::Positional(ins))
-                        .await
-                        .map_err(db_err)?;
-                    if c.affected_rows() == 1 {
-                        report.inserted += 1;
-                    } else {
-                        report.skipped += 1;
-                    }
-                }
+                // One multi-row INSERT IGNORE per lookup shard and chunk.
+                let one = l.insert_sql(&t.schema, true);
+                let (head, tuple) = one
+                    .rsplit_once(" VALUES ")
+                    .ok_or_else(|| SprigError::internal("lookup insert without VALUES"))?;
+                let n = batch.len() as u64;
+                let sql = format!("{head} VALUES {}", vec![tuple; batch.len()].join(", "));
+                let prm: Vec<Value> = batch.into_iter().flatten().collect();
+                c.exec_drop(&sql, Params::Positional(prm))
+                    .await
+                    .map_err(db_err)?;
+                let inserted = c.affected_rows();
+                report.inserted += inserted;
+                report.skipped += n.saturating_sub(inserted);
             }
             LookupCatalog.touch(catalog, l.id).await?;
         }
@@ -550,8 +633,9 @@ fn hash_values(
 /// current routing hash. Rows that don't are claimed now, as a writer
 /// would: a missing lookup row is inserted, an orphan or our own row under
 /// an old hash is taken over, and a value another live owner holds (the
-/// claim's locking owner check) is a real duplicate: 1062. Returns the rows
-/// repaired.
+/// claim's locking owner check) is a real duplicate. Duplicates are
+/// counted to the end; then the verification fails with 1062 carrying
+/// [`Duplicates`]. Returns the rows repaired.
 async fn verify(
     pools: &Pools,
     catalog: &mut Conn,
@@ -564,6 +648,8 @@ async fn verify(
     let nv = l.columns.len();
     let np = l.owner_pk.len();
     let mut repaired = 0;
+    let mut dups = Duplicates::default();
+    let mut dup_seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let pk_cols: Vec<String> = l
         .owner_pk
         .iter()
@@ -571,12 +657,15 @@ async fn verify(
         .collect();
     let vcols: Vec<String> = l.columns.iter().map(|c| quote(&c.name)).collect();
     for o in p.owner_shards() {
-        let mut oc = conn(pools, &o.cluster).await?;
         let mut after: Option<Vec<Value>> = None;
         loop {
             let (cond, prm) = after_cond(l, after.as_ref());
-            let rows: Vec<Row> = oc
-                .exec(owner_select(l, &o, &cond, chunk, false), Params::Positional(prm))
+            let rows: Vec<Row> = conn(pools, &o.cluster)
+                .await?
+                .exec(
+                    owner_select(l, &o, &cond, chunk, false),
+                    Params::Positional(prm),
+                )
                 .await
                 .map_err(db_err)?;
             if rows.is_empty() {
@@ -586,8 +675,7 @@ async fn verify(
                 .last()
                 .map(|r| (nv..nv + np).map(|i| r[i].clone()).collect());
             // Owner rows by lookup shard: (values, primary key, hash).
-            let mut by_shard: BTreeMap<Target, Vec<(Vec<Value>, Vec<Value>, Value)>> =
-                BTreeMap::new();
+            let mut by_shard: BTreeMap<Target, Vec<OwnerRow>> = BTreeMap::new();
             for r in &rows {
                 let vals: Vec<Value> = (0..nv).map(|i| r[i].clone()).collect();
                 if vals.contains(&Value::NULL) {
@@ -627,6 +715,8 @@ async fn verify(
                     )
                     .await
                     .map_err(db_err)?;
+                // The claims below take two connections of their own.
+                drop(c);
                 let have: std::collections::HashSet<String> = found
                     .into_iter()
                     .map(|r| {
@@ -660,17 +750,19 @@ async fn verify(
                         let r = super::claim(&mut txn, p, l, &value, &owner).await;
                         match r {
                             Ok(super::ClaimResult::ConflictCounted) => {
+                                // A real duplicate: counted, and the
+                                // verification goes on, so the failure
+                                // can name every value to fix.
                                 txn.rollback().await;
-                                let shown = vals
-                                    .iter()
-                                    .map(|v| v.as_sql(true))
-                                    .collect::<Vec<_>>()
-                                    .join("-");
-                                return Err(SprigError::standard(
-                                    1062,
-                                    *b"23000",
-                                    format!("Duplicate entry {shown} for key '{}'", l.index_name),
-                                ));
+                                dups.rows += 1;
+                                let h = hash_values(&spec, l, &vals)?.0;
+                                if dup_seen.len() < Duplicates::COUNT_LIMIT && dup_seen.insert(h) {
+                                    dups.values += 1;
+                                    if dups.sample.len() < Duplicates::SAMPLE {
+                                        dups.sample.push(shown(&vals));
+                                    }
+                                }
+                                continue;
                             }
                             Ok(_) => {
                                 txn.commit().await?;
@@ -690,7 +782,9 @@ async fn verify(
                             "{} ON DUPLICATE KEY UPDATE owner_rk = VALUES(owner_rk), prev_rk = NULL",
                             l.insert_sql(&t.schema, false)
                         );
-                        c.exec_drop(sql, Params::Positional(ins))
+                        conn(pools, &t.cluster)
+                            .await?
+                            .exec_drop(sql, Params::Positional(ins))
                             .await
                             .map_err(db_err)?;
                     }
@@ -700,8 +794,14 @@ async fn verify(
             LookupCatalog.touch(catalog, l.id).await?;
         }
     }
+    if dups.rows > 0 {
+        return Err(dups.error(&l.index_name));
+    }
     Ok(repaired)
 }
+
+/// An owner row a verification reads: values, primary key, routing hash.
+type OwnerRow = (Vec<Value>, Vec<Value>, Value);
 
 /// An owner's primary key and hash as one comparable text.
 fn owner_key(pk: &[Value], rk: u64) -> String {

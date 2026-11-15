@@ -544,8 +544,11 @@ pub struct LiveEnv {
     pub locator: Arc<ShardMapLocator>,
     /// `sprig_ctl` pools per cluster.
     pub pools: Arc<dyn ClusterPools>,
-    /// Binlog sources.
+    /// Binlog sources (positions).
     pub clusters: Arc<RegistryClusters>,
+    /// The tails' sources: `clusters`, or the worker's shared reader
+    /// ([`Self::with_feed`]).
+    feed: Arc<dyn Clusters>,
     source: MariaSource,
 }
 
@@ -578,9 +581,19 @@ impl LiveEnv {
             global,
             locator,
             pools,
+            feed: Arc::clone(&clusters) as Arc<dyn Clusters>,
             clusters,
             source,
         })
+    }
+
+    /// Tails read through `feed`: the worker's shared reader keeping each
+    /// tenant whole, one binlog dump per cluster however many trees and
+    /// members (R9, r9feed3).
+    #[must_use]
+    pub fn with_feed(mut self, feed: Arc<dyn Clusters>) -> Self {
+        self.feed = feed;
+        self
     }
 }
 
@@ -670,7 +683,7 @@ impl Feeds for LiveEnv {
         let tail = TenantTail::start(
             tenant,
             StartAt::After(cp.resume_token()?),
-            Arc::clone(&self.clusters) as Arc<dyn Clusters>,
+            Arc::clone(&self.feed),
             Arc::new(MetaPlacement::new(Arc::clone(&self.dc))),
             Arc::new(CatalogResolver::new(Arc::new(Catalogs(Arc::clone(
                 &self.locator,

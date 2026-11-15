@@ -388,18 +388,26 @@ impl FeedbackStore for CatalogAudit {
             .into_iter()
             .map(|(vote, outcome, note, body)| {
                 let p: Option<Value> = body.and_then(|b| serde_json::from_str(&b).ok());
-                Note {
-                    vote,
-                    outcome: outcome.as_deref().and_then(Outcome::parse),
-                    proposal_kind: p
-                        .as_ref()
-                        .and_then(|b| b["kind"].as_str())
-                        .map(str::to_owned),
-                    label: p.as_ref().and_then(label_of),
-                    note,
-                }
+                note_of(vote, outcome.as_deref(), note, p.as_ref())
             })
             .collect())
+    }
+}
+
+/// A feedback row as a [`Note`]: its vote, outcome and note, and the
+/// stored proposal body it is about, if any.
+pub(crate) fn note_of(
+    vote: Option<i8>,
+    outcome: Option<&str>,
+    note: Option<String>,
+    proposal: Option<&Value>,
+) -> Note {
+    Note {
+        vote,
+        outcome: outcome.and_then(Outcome::parse),
+        proposal_kind: proposal.and_then(|b| b["kind"].as_str()).map(str::to_owned),
+        label: proposal.and_then(label_of),
+        note,
     }
 }
 

@@ -21,6 +21,8 @@ cargo deny check          # needs `cargo install cargo-deny`
 
 CI (`.github/workflows/ci.yml`) runs the same checks on every push.
 
+The `sprigdb` binary allocates memory with mimalloc by default. To use the platform allocator instead (glibc on Linux), build with `cargo build -p sprigdb --features system-alloc`. With glibc, the gateway's systemd unit sets no `MALLOC_ARENA_MAX`; add it in a unit drop-in if you want the cap.
+
 ## Run a role
 
 The server is one binary; the role is a subcommand (`gateway`, `controller`, `worker`, `agent`, `operator`). Each role serves `/healthz`, `/readyz` and `/metrics` on port 9180 and drains on SIGTERM. The controller connects to etcd, bootstraps or verifies the deployment, elects a DC leader and runs the job scheduler (below).

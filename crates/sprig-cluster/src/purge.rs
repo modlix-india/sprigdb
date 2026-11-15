@@ -52,10 +52,11 @@ pub fn owns_account(tenant: TenantId, user: &str) -> bool {
         .is_ok_and(|a| a.tenant() == tenant)
 }
 
-/// The roles SprigDB itself makes per tenant, by suffix: `t<id>_<suffix>`
-/// (the stream offsets role, granted to accounts that commit offsets in
-/// a transaction).
-pub const INTERNAL_ROLES: &[&str] = &["sprig_offsets"];
+/// The roles and accounts SprigDB itself makes per tenant, by suffix:
+/// `t<id>_<suffix>` (the stream offsets role, granted to accounts that
+/// commit offsets in a transaction; the share views' definer,
+/// [`sprig_common::names::share_definer_account`]).
+pub const INTERNAL_ROLES: &[&str] = &["sprig_offsets", sprig_common::names::SHARE_DEFINER_SUFFIX];
 
 /// Whether `user` is exactly one of `tenant`'s internal roles.
 #[must_use]
@@ -452,6 +453,8 @@ mod tests {
                 "t30_sprig_offsets",
                 "t3_sprig_offsetsx",
                 "t3_sprig",
+                "t3_sprig_share",
+                "t30_sprig_share",
             ]
             .iter()
             .map(|u| Account {
@@ -464,7 +467,7 @@ mod tests {
         };
         let p = plan(t, &found, &Known::default());
         let users: Vec<&str> = p.drop_accounts.iter().map(|a| a.user.as_str()).collect();
-        assert_eq!(users, ["t3_sprig_offsets"]);
+        assert_eq!(users, ["t3_sprig_offsets", "t3_sprig_share"]);
         assert!(
             p.statements()
                 .contains(&"DROP ROLE IF EXISTS 't3_sprig_offsets'".to_owned())

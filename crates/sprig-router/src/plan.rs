@@ -361,11 +361,17 @@ pub struct Release {
     pub set: Option<LookupSet>,
 }
 
-/// The value an `UPDATE` gives a lookup's column.
+/// The value an `UPDATE` gives a lookup's columns.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LookupSet {
     /// The new value, one part per value column (`NULL` claims nothing).
+    /// A part the statement doesn't assign is a placeholder: each row
+    /// keeps its own (`keep`).
     pub value: Vec<KeyValueOwned>,
+    /// Per value column, whether each row keeps its old value there (a
+    /// lookup of several columns whose `UPDATE` sets only some). Empty:
+    /// every part is assigned.
+    pub keep: Vec<bool>,
     /// The table's group: each row's key column, read last, hashes to its
     /// routing hash here.
     pub group: Arc<Group>,
@@ -373,6 +379,22 @@ pub struct LookupSet {
 
 // Key values hold no NaN: literals only.
 impl Eq for LookupSet {}
+
+impl LookupSet {
+    /// The new value of a row whose old value is `old`: assigned parts
+    /// from the statement, the rest the row's own.
+    #[must_use]
+    pub fn value_for(&self, old: &[KeyValueOwned]) -> Vec<KeyValueOwned> {
+        self.value
+            .iter()
+            .enumerate()
+            .map(|(i, v)| match (self.keep.get(i), old.get(i)) {
+                (Some(true), Some(o)) => o.clone(),
+                _ => v.clone(),
+            })
+            .collect()
+    }
+}
 
 /// The values a statement's equality on a lookup column names.
 #[derive(Debug, Clone, PartialEq)]

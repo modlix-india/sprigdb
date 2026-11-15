@@ -318,9 +318,19 @@ pub struct Pending {
     fp: Fingerprint,
     plan: ProbePlan,
     started: Instant,
+    /// The router's fan-out: shards visited and whether that was every
+    /// shard of the table's group (`None`: one backend, as before).
+    fanout: Option<(u32, bool)>,
 }
 
 impl Pending {
+    /// Records the router's fan-out for this statement: `shards` visited,
+    /// `scatter` when that was every shard of the table's group
+    /// (`workload_stats.shards_sum` and `scatter_count`).
+    pub fn set_fanout(&mut self, shards: u32, scatter: bool) {
+        self.fanout = Some((shards, scatter));
+    }
+
     /// Probe the statement's rows examined.
     #[must_use]
     pub fn probe(&self) -> bool {
@@ -421,6 +431,7 @@ impl SessionCapture {
             fp,
             plan,
             started: Instant::now(),
+            fanout: None,
         }
     }
 
@@ -436,9 +447,9 @@ impl SessionCapture {
             error: done.error,
             rows_returned: done.rows_returned,
             rows_affected: done.rows_affected,
-            shards: 1,
+            shards: p.fanout.map_or(1, |f| f.0),
             clusters: 1,
-            scatter: false,
+            scatter: p.fanout.is_some_and(|f| f.1),
             in_list_max: 0,
             examined: done.examined,
             session,

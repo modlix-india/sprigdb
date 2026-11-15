@@ -25,6 +25,7 @@ Commands:
   queue      Queues
   top        Live dashboards; --once prints one poll
   approvals  The approvals inbox: recommendations waiting for a decision
+  ask        Ask an AI assistant for a query (ASK); nothing runs without --run
   admin      Every sprigctl command: sprig admin <sprigctl arguments>
   help       Print this message or the help of the given subcommand(s)
 
@@ -597,6 +598,29 @@ Options:
   -h, --help                 Print help
 ```
 
+### `sprig ask`
+
+```text
+Ask an AI assistant for a query (ASK); nothing runs without --run
+
+Usage: sprig ask [OPTIONS] <question>...
+
+Arguments:
+  <question>...  The question, in plain words
+
+Options:
+  -p, --profile <profile>    Connection profile
+      --role <role>          Which assistant answers [default: data] [possible values: data, dba]
+      --run                  Run the proposed queries (anything but a read asks first)
+      --url <url>            Gateway URL (overrides the profile)
+  -u, --user <user>          Login name
+  -d, --database <database>  Database (USE)
+      --tenant <tenant>      Tenant to act in (USE TENANT)
+  -o, --format <format>      Output [default: table on a terminal, else tsv] [possible values: table, json, ndjson, csv, tsv]
+  -y, --yes                  Run destructive statements without asking
+  -h, --help                 Print help
+```
+
 ### `sprig admin`
 
 ```text
@@ -621,6 +645,7 @@ Commands:
   space            Spaces and shares
   inherit          Inherited tables, shares, tree-wide ids and the references that refuse deletes
   txn              In-doubt distributed transactions
+  ai               The AI assistants: providers
   sink             Sinks: list, show, pause, resume, reset, dead letters, connections
   graph            Graphs
   search           Search indexes and their copies on workers

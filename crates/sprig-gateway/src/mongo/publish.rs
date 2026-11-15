@@ -24,6 +24,16 @@
 //! A gateway that dies leaves `doc-gw/` with its lease, so a crash stalls
 //! a publication for at most the lease's time. Gateways of other DCs are
 //! not waited for (a tenant's documents are served from its home DC).
+//!
+//! Lookup index jobs wait on the same keys for their state changes
+//! (`sprig_shard::lookup::publish`), and fence a gateway that doesn't
+//! acknowledge in time by revoking its lease. So a gateway whose lease
+//! lapsed (it was paused, lost the DC tier, or was fenced) may have missed
+//! a change: [`stale`] says so for each tenant until the session layer has
+//! reloaded that tenant's catalog from the writer ([`reloaded`]). The
+//! lease counts as lapsed once [`LEASE_TTL`] has passed since the last
+//! renewal was sent, measured here, so a paused process knows on resuming
+//! before any renewal runs.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -54,7 +64,75 @@ pub static PATH_PUBLISH_TIMEOUT_MS: Setting<u64> = Setting {
 sprig_settings::register!(PATH_PUBLISH_TIMEOUT_MS);
 
 /// Lease of this gateway's presence and acknowledgements.
-const LEASE_TTL: Duration = Duration::from_secs(10);
+const LEASE_TTL: Duration = sprig_shard::lookup::publish::ACK_LEASE_TTL;
+/// The lease counts as lapsed this long before its TTL runs out.
+const LAPSE_MARGIN: Duration = Duration::from_secs(1);
+
+/// The process's lease validity and lapses (one publisher per gateway).
+#[derive(Default)]
+struct Fence {
+    /// The lease is good until then; `None` before the first lease.
+    valid_until: Option<Instant>,
+    /// Lapses so far.
+    seq: u64,
+    /// The lapse seen most recently was counted.
+    lapsed: bool,
+    /// Per tenant, the lapse its catalog was reloaded after.
+    reloaded: HashMap<u64, u64>,
+}
+
+static FENCE: Mutex<Option<Fence>> = Mutex::new(None);
+
+fn fence<T>(f: impl FnOnce(&mut Fence) -> T) -> T {
+    let mut g = lock(&FENCE);
+    f(g.get_or_insert_with(Fence::default))
+}
+
+/// A renewal sent at `sent` succeeded.
+fn renewed(sent: Instant) {
+    fence(|f| {
+        f.valid_until = Some(sent + LEASE_TTL.saturating_sub(LAPSE_MARGIN));
+        f.lapsed = false;
+    });
+}
+
+/// The lease is gone (a renewal failed, or it ran out).
+fn lapse() {
+    fence(|f| {
+        if !f.lapsed {
+            f.lapsed = true;
+            f.seq += 1;
+            metrics::counter!("sprig_gateway_ack_lease_lapses_total").increment(1);
+            tracing::warn!(
+                lapse = f.seq,
+                "the gateway's acknowledgement lease lapsed; tenants' catalogs are reloaded before their next statements"
+            );
+        }
+        f.valid_until = None;
+    });
+}
+
+/// `Some(lapse)` when this gateway's lease lapsed since `tenant`'s catalog
+/// was last reloaded: a lookup state change may have gone by without this
+/// gateway's acknowledgement, so the session layer reloads the tenant's
+/// catalog from the writer before using it, then calls [`reloaded`].
+#[must_use]
+pub fn stale(tenant: TenantId) -> Option<u64> {
+    let now = Instant::now();
+    let expired = fence(|f| f.valid_until.is_some_and(|u| now > u));
+    if expired {
+        lapse();
+    }
+    fence(|f| (f.seq > 0 && f.reloaded.get(&tenant.0).is_none_or(|r| *r < f.seq)).then_some(f.seq))
+}
+
+/// `tenant`'s catalog was reloaded after lapse `seq`.
+pub fn reloaded(tenant: TenantId, seq: u64) {
+    fence(|f| {
+        let e = f.reloaded.entry(tenant.0).or_insert(0);
+        *e = (*e).max(seq);
+    });
+}
 /// How often a waiting writer looks at the acknowledgements.
 const PUBLISH_POLL: Duration = Duration::from_millis(5);
 
@@ -132,8 +210,10 @@ impl Publisher {
         if let Some(l) = lock(&self.state).lease {
             return Some(l);
         }
+        let sent = Instant::now();
         let l = self.store.grant_lease(LEASE_TTL).await.ok()?;
         lock(&self.state).lease = Some(l);
+        renewed(sent);
         Some(l)
     }
 
@@ -232,10 +312,16 @@ impl Publisher {
                         () = tokio::time::sleep(LEASE_TTL / 3) => {}
                     }
                     let l = lock(&me.state).lease;
+                    let sent = Instant::now();
                     let alive = match l {
                         Some(l) => matches!(me.store.keep_alive(l).await, Ok(Some(_))),
                         None => false,
                     };
+                    if alive {
+                        renewed(sent);
+                    } else {
+                        lapse();
+                    }
                     if !alive {
                         // A new lease: presence and acknowledgements again.
                         let acked: Vec<(u64, u64)> = {
@@ -411,5 +497,38 @@ mod tests {
     fn records_round_trip() {
         assert_eq!(decode(&encode(913)), Some(913));
         assert_eq!(decode(b"{}"), None);
+        // The lookup jobs' waiter reads the same records.
+        assert_eq!(sprig_shard::lookup::publish::decode(&encode(7)), Some(7));
+    }
+
+    #[test]
+    fn a_lapsed_lease_makes_each_tenant_stale_until_reloaded() {
+        let (t1, t2) = (TenantId(901), TenantId(902));
+        // Renewed just now: nothing stale (lapses before this test are
+        // reloaded first).
+        renewed(Instant::now());
+        for t in [t1, t2] {
+            if let Some(s) = stale(t) {
+                reloaded(t, s);
+            }
+            assert_eq!(stale(t), None);
+        }
+        // A renewal sent longer than the lease ago: lapsed on the next
+        // look, once.
+        renewed(
+            Instant::now()
+                .checked_sub(LEASE_TTL)
+                .unwrap_or_else(Instant::now),
+        );
+        let s = stale(t1).unwrap_or_else(|| unreachable!("lapsed"));
+        assert_eq!(stale(t2), Some(s));
+        reloaded(t1, s);
+        assert_eq!(stale(t1), None);
+        assert_eq!(stale(t2), Some(s), "another tenant still reloads");
+        // A new lease doesn't clear what wasn't reloaded.
+        renewed(Instant::now());
+        assert_eq!(stale(t2), Some(s));
+        reloaded(t2, s);
+        assert_eq!(stale(t2), None);
     }
 }

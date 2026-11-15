@@ -95,6 +95,10 @@ pub fn account_sql(ctl_password: &str, repl_password: &str) -> Vec<String> {
         // The docs pack's schema: the controller loads it and grants the
         // docs-reader account SELECT on it.
         sprig_provision::docs_account::CTL_GRANT.into(),
+        // The administration assistant's conversations, on the DC's
+        // system cluster: the controller creates the schema, and the
+        // gateways keep operators' conversations there.
+        "GRANT ALL PRIVILEGES ON `__sprig_ai`.* TO 'sprig_ctl'@'%'".into(),
         "GRANT SUPER, CREATE USER, PROCESS, CONNECTION ADMIN, BINLOG MONITOR, SLAVE MONITOR, \
          RELOAD, READ_ONLY ADMIN, BINLOG ADMIN, SET USER ON *.* TO 'sprig_ctl'@'%'"
             .into(),
@@ -298,6 +302,10 @@ mod tests {
         assert!(sql.iter().any(|s| s.contains("SELECT ON mysql.db")));
         assert!(sql.iter().any(|s| s
             == "GRANT ALL PRIVILEGES ON `__sprig_docs`.* TO 'sprig_ctl'@'%' WITH GRANT OPTION"));
+        assert!(
+            sql.iter()
+                .any(|s| s == "GRANT ALL PRIVILEGES ON `__sprig_ai`.* TO 'sprig_ctl'@'%'")
+        );
         // The docs-reader account is the docs loader's to create.
         assert!(!sql.iter().any(|s| s.contains("sprig_docs_r")));
         assert!(

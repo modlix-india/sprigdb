@@ -3,33 +3,44 @@
 //! | Route | Does |
 //! |---|---|
 //! | `POST /v1/ai/chat` | One turn `{role, message, conversation?, database?, context?}`, streamed as NDJSON ([`chat`]) |
-//! | `GET /v1/ai/conversations?limit=` | The caller's conversations, newest first |
+//! | `GET /v1/ai/conversations?limit=` | The caller's conversations, newest first: their tenant's, and for a platform operator their administration conversations too |
 //! | `GET /v1/ai/conversations/{id}?payloads=` | One of them with its messages, including what was sent to the provider (`payloads=false` leaves the payloads out) |
 //! | `POST /v1/ai/feedback` | `{message_id, vote: up\|down, note?}` on an answer, or `{proposal_id, outcome: accepted\|dismissed\|failed, note?}` |
 //! | `GET /v1/ai/glossary?status=` | The tenant glossary (`accepted`, `proposed` or `all`) |
 //! | `POST /v1/ai/glossary` | Adds or replaces an accepted term `{term, definition, sql?, tables?}` (tenant administrators) |
 //! | `POST /v1/ai/glossary/{term}:accept`, `:reject`, `:delete` | Decides a proposal, or deletes a term (tenant administrators) |
+//! | `POST`, `DELETE /v1/mcp` | The MCP server: the tenant assistants' tools for outside agents ([`mcp`]) |
 //!
 //! **Who.** Every route runs as the signed-in caller (a Studio session,
 //! Basic or an API key). `dba` and `data` turns need a tenant login and
 //! keep their conversations in the tenant's catalog, readable only by
 //! their owner; `admin` turns need a platform operator (a login in
-//! `studio.operator_logins` with operator mode on) and keep nothing but
-//! the audit event. Tools run with the caller's rights ([`host`]).
+//! `studio.operator_logins` with operator mode on) and keep their
+//! conversations in the system store, `__sprig_ai` on the DC's system
+//! cluster ([`system`]), readable only by that operator while they are one.
+//! Its ids carry an `a` prefix (`a12`). When the system store can't be
+//! reached, an `admin` turn still runs, unstored, with a warning. Tools
+//! run with the caller's rights ([`host`]).
 //!
 //! **Before a turn**, in this order: `ai.enabled` (39991), the role
-//! (1227 or 39790), context that would send rows with `ai.share_data` off
+//! (1227 or 39792), context that would send rows with `ai.share_data` off
 //! (39995), the role's model and provider (39990), and the daily budgets
 //! (39992). These are plain HTTP errors; anything later is an `error`
-//! line in the stream.
+//! line in the stream. An `admin` turn reads its settings at the global
+//! scope, so its budgets are the global `ai.budget.tenant_tokens_day` for
+//! all administration turns of the DC and `ai.budget.user_tokens_day` for
+//! each operator.
 //!
 //! **Prompts.** Each turn's system prompt is the role's base prompt, then
 //! for tenant roles the tenant's accepted glossary terms and its users'
 //! recent feedback ([`sprig_ai::glossary::prompt`],
 //! [`sprig_ai::feedback::prompt`]).
 
+pub mod ask;
 pub mod chat;
 pub mod host;
+pub mod mcp;
+pub mod system;
 
 #[cfg(test)]
 mod tests;
@@ -281,23 +292,27 @@ fn id_of(v: &Value, k: &str) -> Option<String> {
 }
 
 /// The conversation a turn continues (the caller's, with the same
-/// assistant), or a new one titled by the message.
+/// assistant), or a new one titled by the message. An administration
+/// conversation's id may carry its `a` prefix.
 async fn open_conversation(
-    st: &Stores,
+    audit: &dyn AuditStore,
+    user: UserId,
     role: Role,
     b: &Value,
     message: &str,
 ) -> Result<(ConvId, Vec<sprig_ai::Message>), SprigError> {
     let Some(id) = id_of(b, "conversation") else {
         let title = sprig_ai::egress::redact_secrets(message);
-        return Ok((st.audit.create(st.user, role, &title).await?, Vec::new()));
+        return Ok((audit.create(user, role, &title).await?, Vec::new()));
     };
-    let id = id
-        .parse::<u64>()
-        .map_err(|_| invalid("conversation is a conversation id"))?;
-    let c = st
-        .audit
-        .get(st.user, ConvId(id))
+    let id = match system::parse(&id) {
+        Some(n) if !role.is_tenant() => n,
+        _ => id
+            .parse::<u64>()
+            .map_err(|_| invalid("conversation is a conversation id"))?,
+    };
+    let c = audit
+        .get(user, ConvId(id))
         .await?
         .ok_or_else(|| invalid(format!("you have no conversation {id}")))?;
     if c.role != role {
@@ -306,7 +321,7 @@ async fn open_conversation(
             c.role
         )));
     }
-    let msgs = st.audit.messages(c.id).await?;
+    let msgs = audit.messages(c.id).await?;
     Ok((c.id, sprig_ai::audit::history(&msgs)))
 }
 
@@ -379,7 +394,7 @@ async fn chat_route(
         // 5. The budgets, before the stream starts.
         let spent = st.audit.usage_today(st.user).await?;
         settings.budget.check(spent, 0)?;
-        let (conv, history) = open_conversation(&st, role, b, &message).await?;
+        let (conv, history) = open_conversation(&*st.audit, st.user, role, b, &message).await?;
         if let Ok(terms) = st.glossary.list(Some(Status::Accepted)).await
             && let Some(p) = glossary::prompt(&terms)
         {
@@ -397,12 +412,38 @@ async fn chat_route(
             history,
         )
     } else {
-        (
-            Arc::new(sprig_ai::MemoryAudit::default()) as Arc<dyn AuditStore>,
-            None,
-            None,
-            Vec::new(),
-        )
+        // The administration assistant: its conversations in the system
+        // store; unstored (as before it existed) when that can't be reached.
+        let sys = match system::store(core, &caller).await {
+            Ok(s) => {
+                let s = Arc::new(s);
+                match s.usage_today(user).await {
+                    Ok(spent) => Some((s, spent)),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "an administration turn runs unstored");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "an administration turn runs unstored");
+                None
+            }
+        };
+        match sys {
+            Some((s, spent)) => {
+                // 5. The budgets, before the stream starts.
+                settings.budget.check(spent, 0)?;
+                let (conv, history) = open_conversation(&*s, user, role, b, &message).await?;
+                (s as Arc<dyn AuditStore>, None, Some(conv), history)
+            }
+            None => (
+                Arc::new(sprig_ai::MemoryAudit::system()) as Arc<dyn AuditStore>,
+                None,
+                None,
+                Vec::new(),
+            ),
+        }
     };
     let cfg = TurnConfig::from_settings(role, &settings, model);
     let host = Arc::new(host::GatewayHost::new(
@@ -431,8 +472,104 @@ async fn chat_route(
         glossary,
         author: caller.principal.user.clone(),
     };
-    let (rx, cancel) = chat::start(turn, conv);
+    let shown = conv.map(|c| {
+        if role.is_tenant() {
+            c.0.to_string()
+        } else {
+            system::label(c.0)
+        }
+    });
+    let (rx, cancel) = chat::start_as(turn, shown.as_deref());
     Ok(chat::response(rx, cancel))
+}
+
+/// Conversations and feedback in one store.
+pub(crate) trait ConvStore: AuditStore + FeedbackStore {}
+
+impl<T: AuditStore + FeedbackStore> ConvStore for T {}
+
+/// A store opened for the caller, and their user id.
+type Opened = (Arc<dyn ConvStore>, UserId);
+
+/// The stores a caller's conversations are in: their tenant's catalog
+/// (a tenant login) and the system store (a platform operator; its error
+/// when it can't be opened).
+pub(crate) struct Views {
+    /// The tenant's store and the caller's user id there.
+    pub tenant: Option<Opened>,
+    /// The administration conversations, and the caller's user id (which
+    /// the system store doesn't need: it is opened for the operator).
+    pub admin: Option<Result<Opened, SprigError>>,
+}
+
+async fn views(core: &Arc<Core>, caller: &Caller) -> Result<Views, SprigError> {
+    let operator = !super::ops::roles(core, caller).is_empty();
+    let tenant_login = caller.principal.tenant.is_some() && caller.principal.user_id.is_some();
+    let tenant = if tenant_login || !operator {
+        let st = stores(core, caller).await?;
+        Some((st.audit as Arc<dyn ConvStore>, st.user))
+    } else {
+        None
+    };
+    let admin = if operator {
+        let user = caller.principal.user_id.unwrap_or(UserId(0));
+        Some(
+            system::store(core, caller)
+                .await
+                .map(|s| (Arc::new(s) as Arc<dyn ConvStore>, user)),
+        )
+    } else {
+        None
+    };
+    Ok(Views { tenant, admin })
+}
+
+fn conv_json(c: &sprig_ai::audit::Conversation, id: &str) -> Value {
+    json!({
+        "id": id, "role": c.role, "title": c.title,
+        "created_ms": c.created_ms, "updated_ms": c.updated_ms,
+    })
+}
+
+/// `GET /v1/ai/conversations`: the tenant's and the administration
+/// conversations together, newest first, at most `limit`. A system store
+/// that can't be reached leaves its conversations out and says why in
+/// `admin_unavailable`.
+pub(crate) async fn list_json(v: &Views, limit: u32) -> Result<Value, SprigError> {
+    // (updated, 0 tenant / 1 administration, id, the entry)
+    type Row = (i64, u8, u64, Value);
+    let mut all: Vec<Row> = Vec::new();
+    if let Some((st, user)) = &v.tenant {
+        for c in st.list(*user, limit).await? {
+            all.push((c.updated_ms, 0, c.id.0, conv_json(&c, &c.id.0.to_string())));
+        }
+    }
+    let mut out = json!({});
+    match &v.admin {
+        Some(Ok((st, user))) => match st.list(*user, limit).await {
+            Ok(convs) => {
+                for c in convs {
+                    all.push((
+                        c.updated_ms,
+                        1,
+                        c.id.0,
+                        conv_json(&c, &system::label(c.id.0)),
+                    ));
+                }
+            }
+            Err(e) => out["admin_unavailable"] = json!(e.message),
+        },
+        Some(Err(e)) => out["admin_unavailable"] = json!(e.message),
+        None => {}
+    }
+    all.sort_by(|a, b| (b.0, b.1, b.2).cmp(&(a.0, a.1, a.2)));
+    out["conversations"] = Value::Array(
+        all.into_iter()
+            .take(limit as usize)
+            .map(|(_, _, _, j)| j)
+            .collect(),
+    );
+    Ok(out)
 }
 
 async fn list(
@@ -440,19 +577,12 @@ async fn list(
     caller: &Caller,
     query: &str,
 ) -> Result<Response<Body>, SprigError> {
-    let st = stores(core, caller).await?;
+    let v = views(core, caller).await?;
     let limit = query_value(query, "limit")
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(50)
         .clamp(1, MAX_LIST);
-    let convs = st.audit.list(st.user, limit).await?;
-    Ok(json_response(
-        200,
-        &json!({"conversations": convs.into_iter().map(|c| json!({
-            "id": c.id.0.to_string(), "role": c.role, "title": c.title,
-            "created_ms": c.created_ms, "updated_ms": c.updated_ms,
-        })).collect::<Vec<_>>()}),
-    ))
+    Ok(json_response(200, &list_json(&v, limit).await?))
 }
 
 fn hex(h: &[u8; 32]) -> String {
@@ -463,23 +593,46 @@ fn hex(h: &[u8; 32]) -> String {
     s
 }
 
-async fn show(
-    core: &Arc<Core>,
-    caller: &Caller,
-    id: &str,
-    query: &str,
-) -> Result<Response<Body>, SprigError> {
-    let st = stores(core, caller).await?;
-    let id: u64 = id
-        .parse()
-        .map_err(|_| invalid("conversations/{id} takes a conversation id"))?;
+/// The administration store, or why the caller can't use it.
+fn admin_of<'a>(v: &'a Views, id: &str) -> Result<(&'a Arc<dyn ConvStore>, UserId), SprigError> {
+    match &v.admin {
+        Some(Ok((st, user))) => Ok((st, *user)),
+        Some(Err(e)) => Err(SprigError::new(
+            e.code().unwrap_or(SprigCode::CatalogUnavailable),
+            e.message.clone(),
+        )),
+        None => Err(invalid(format!("you have no conversation {id}"))),
+    }
+}
+
+/// `GET /v1/ai/conversations/{id}`: an `a`-prefixed id is an
+/// administration conversation, any other the tenant's.
+pub(crate) async fn show_json(v: &Views, id: &str, payloads: bool) -> Result<Value, SprigError> {
+    let (st, user, n, admin): (&Arc<dyn ConvStore>, UserId, u64, bool) =
+        if let Some(n) = system::parse(id) {
+            let (st, user) = admin_of(v, id)?;
+            (st, user, n, true)
+        } else {
+            let n: u64 = id
+                .parse()
+                .map_err(|_| invalid("conversations/{id} takes a conversation id"))?;
+            let Some((st, user)) = &v.tenant else {
+                return Err(invalid(format!("you have no conversation {id}")));
+            };
+            (st, *user, n, false)
+        };
     let c = st
-        .audit
-        .get(st.user, ConvId(id))
+        .get(user, ConvId(n))
         .await?
         .ok_or_else(|| invalid(format!("you have no conversation {id}")))?;
-    let payloads = query_value(query, "payloads") != Some("false");
-    let msgs = st.audit.messages(c.id).await?;
+    let label = |n: u64| {
+        if admin {
+            system::label(n)
+        } else {
+            n.to_string()
+        }
+    };
+    let msgs = st.messages(c.id).await?;
     let messages: Vec<Value> = msgs
         .into_iter()
         .map(|m| {
@@ -488,21 +641,26 @@ async fn show(
                 o.remove("payload");
             }
             json!({
-                "id": m.id.to_string(), "kind": m.kind, "body": body,
+                "id": label(m.id), "kind": m.kind, "body": body,
                 "sent_hash": m.sent_hash.as_ref().map(hex), "created_ms": m.created_ms,
             })
         })
         .collect();
-    Ok(json_response(
-        200,
-        &json!({
-            "conversation": {
-                "id": c.id.0.to_string(), "role": c.role, "title": c.title,
-                "created_ms": c.created_ms, "updated_ms": c.updated_ms,
-            },
-            "messages": messages,
-        }),
-    ))
+    Ok(json!({
+        "conversation": conv_json(&c, &label(c.id.0)),
+        "messages": messages,
+    }))
+}
+
+async fn show(
+    core: &Arc<Core>,
+    caller: &Caller,
+    id: &str,
+    query: &str,
+) -> Result<Response<Body>, SprigError> {
+    let v = views(core, caller).await?;
+    let payloads = query_value(query, "payloads") != Some("false");
+    Ok(json_response(200, &show_json(&v, id, payloads).await?))
 }
 
 fn proposal_kind(k: &str) -> &'static str {
@@ -516,12 +674,11 @@ fn proposal_kind(k: &str) -> &'static str {
     }
 }
 
-async fn feedback_route(
-    core: &Arc<Core>,
-    caller: &Caller,
-    b: &Value,
-) -> Result<Response<Body>, SprigError> {
-    let st = stores(core, caller).await?;
+/// `POST /v1/ai/feedback`: a vote on an answer (an `a`-prefixed message
+/// id is in an administration conversation), or a proposal's outcome
+/// (looked up in the tenant's conversations, then the administration
+/// ones).
+pub(crate) async fn feedback_json(v: &Views, b: &Value) -> Result<Value, SprigError> {
     let note = b.get("note").and_then(Value::as_str);
     if note.is_some_and(|n| n.chars().count() > feedback::MAX_NOTE) {
         return Err(invalid(format!(
@@ -538,18 +695,21 @@ async fn feedback_route(
                 Some(Value::Number(n)) if n.as_i64() == Some(-1) => -1,
                 _ => return Err(invalid("vote is up or down")),
             };
-            let id: u64 = m
-                .parse()
-                .map_err(|_| invalid("message_id is a message id"))?;
-            let role = st
-                .audit
-                .vote(st.user, id, vote, note)
-                .await?
-                .ok_or_else(|| {
-                    invalid(format!(
-                        "message {id} isn't an answer in your conversations"
-                    ))
-                })?;
+            let not_found =
+                || invalid(format!("message {m} isn't an answer in your conversations"));
+            let role = if let Some(n) = system::parse(&m) {
+                let (st, user) = admin_of(v, &m).map_err(|_| not_found())?;
+                st.vote(user, n, vote, note).await?
+            } else {
+                let id: u64 = m
+                    .parse()
+                    .map_err(|_| invalid("message_id is a message id"))?;
+                match &v.tenant {
+                    Some((st, user)) => st.vote(*user, id, vote, note).await?,
+                    None => None,
+                }
+            }
+            .ok_or_else(not_found)?;
             sprig_ai::metrics::feedback(role, if vote > 0 { "up" } else { "down" });
         }
         (None, Some(p)) => {
@@ -558,10 +718,16 @@ async fn feedback_route(
                 .and_then(Value::as_str)
                 .and_then(Outcome::parse)
                 .ok_or_else(|| invalid("outcome is accepted, dismissed or failed"))?;
-            let (_, kind) = st
-                .audit
-                .outcome(st.user, &p, outcome, note)
-                .await?
+            let mut found = match &v.tenant {
+                Some((st, user)) => st.outcome(*user, &p, outcome, note).await?,
+                None => None,
+            };
+            if found.is_none()
+                && let Some(Ok((st, user))) = &v.admin
+            {
+                found = st.outcome(*user, &p, outcome, note).await?;
+            }
+            let (_, kind) = found
                 .ok_or_else(|| invalid(format!("proposal {p} isn't in your conversations")))?;
             sprig_ai::metrics::proposal(proposal_kind(&kind), outcome.as_str());
         }
@@ -571,7 +737,16 @@ async fn feedback_route(
             ));
         }
     }
-    Ok(json_response(200, &json!({"recorded": true})))
+    Ok(json!({"recorded": true}))
+}
+
+async fn feedback_route(
+    core: &Arc<Core>,
+    caller: &Caller,
+    b: &Value,
+) -> Result<Response<Body>, SprigError> {
+    let v = views(core, caller).await?;
+    Ok(json_response(200, &feedback_json(&v, b).await?))
 }
 
 async fn glossary_list(

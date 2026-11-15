@@ -427,9 +427,21 @@ fn no_idle_position_while_a_move_back_is_pending() {
     let mut st = HubState::default();
     let (tx_a, mut rx_a) = mpsc::channel(4);
     let (tx_b, mut rx_b) = mpsc::channel(4);
-    st.register(TenantId(1), Kept::All, at(5), tx_a, Arc::default());
+    st.register(
+        TenantId(1),
+        (Kept::All, IDLE_FANOUT),
+        at(5),
+        tx_a,
+        Arc::default(),
+    );
     // B started at 0 behind the hub at 5: registered at 0, move back asked.
-    st.register(TenantId(2), Kept::All, at(0), tx_b, Arc::default());
+    st.register(
+        TenantId(2),
+        (Kept::All, IDLE_FANOUT),
+        at(0),
+        tx_b,
+        Arc::default(),
+    );
     st.rewind = Some(at(0));
     st.idle_fanout(&at(5));
     assert!(rx_a.try_recv().is_err() && rx_b.try_recv().is_err());
@@ -686,4 +698,62 @@ async fn a_replayed_tenant_detached_later_returns_through_the_ring() {
     assert_eq!(seqs, (6..=20).collect::<Vec<_>>());
     assert!(quiet(&mut w, 300).await);
     assert_eq!(fake.catchup_opens(), 0, "the ring served the return");
+}
+
+/// Idle positions a subscription gets within `dur`.
+async fn idles(src: &mut Box<dyn TxnSource>, dur: Duration) -> Vec<GtidPos> {
+    let mut out = Vec::new();
+    let end = Instant::now() + dur;
+    while let Ok(i) = tokio::time::timeout_at(end, src.next()).await {
+        if let SourceItem::Idle { pos } = i.unwrap() {
+            out.push(pos);
+        }
+    }
+    out
+}
+
+/// r9feed3: a view may ask for idle positions sooner than every second
+/// (the graph mirror's: a mirror read waits for it to reach the cluster's
+/// position now, so others' writes mustn't hold it a second behind); the
+/// other views keep one a second.
+#[tokio::test(start_paused = true)]
+async fn a_view_gets_idle_positions_as_often_as_it_asks() {
+    let fake = Fake::default();
+    let feed = SharedFeed::new(Arc::new(fake.clone()), SharedOpts::default());
+    let fast = feed.view_every(Kept::All, IDLE_TICK);
+    let slow = feed.view(Kept::All);
+    // Tenant 2 writes a group every 50 ms for 3 s; tenants 1 and 3 never.
+    let mut other = slow.open(&cluster(), TenantId(2), &at(0)).await.unwrap();
+    let mut f = fast.open(&cluster(), TenantId(1), &at(0)).await.unwrap();
+    let mut s = slow.open(&cluster(), TenantId(3), &at(0)).await.unwrap();
+    let w = fake.clone();
+    let writer = tokio::spawn(async move {
+        for seq in 1..=60 {
+            w.push(txn(seq, &["t2_d1_g1_s1"]));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    let span = Duration::from_millis(3_000);
+    let (got, fi, si) = tokio::join!(
+        take(&mut other, 60),
+        idles(&mut f, span),
+        idles(&mut s, span)
+    );
+    writer.await.unwrap();
+    assert_eq!(got.len(), 60);
+    assert!(
+        fi.len() >= 10,
+        "the fast view got {} idle positions",
+        fi.len()
+    );
+    assert!(
+        si.len() <= 4,
+        "the default view got {} idle positions",
+        si.len()
+    );
+    // Each position only grows, and the fast view's last is within a
+    // tick or two of the writer's last group.
+    assert!(fi.windows(2).all(|p| p[1].reached(&p[0])));
+    let last = fi.last().unwrap().get(0).unwrap().seq;
+    assert!(last >= 54, "the fast view's last position is {last}");
 }

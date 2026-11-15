@@ -349,15 +349,12 @@ impl Registrar {
         let store = session.store();
         let rec = self.record();
         let key = store.tier().key(&format!("gateways/{}", rec.gateway_id))?;
-        // The write sketches, when a minute completed.
-        let load = crate::write_load::report_op(store.as_ref(), &rec.gateway_id, session.lease())?;
         let id = rec.gateway_id.clone();
         let mut then = vec![Op::Put {
             key,
             value: Record::new(rec).encode()?,
             lease: Some(session.lease()),
         }];
-        then.extend(load.as_ref().map(|(op, _)| op.clone()));
         // This process's token under the same lease, so another
         // gateway can tell its DDL jobs were abandoned once it is gone.
         then.push(Op::Put {
@@ -375,8 +372,24 @@ impl Registrar {
                 otherwise: vec![],
             })
             .await?;
-        if let Some((_, mark)) = load {
-            crate::write_load::written(&id, mark);
+        // The write sketches, when a minute completed, in a transaction of
+        // their own: the report can never hold up the record or the token.
+        match crate::write_load::report_op(store.as_ref(), &id, session.lease()) {
+            Ok(Some((op, mark))) => {
+                let put = store
+                    .txn(Txn {
+                        when: vec![],
+                        then: vec![op],
+                        otherwise: vec![],
+                    })
+                    .await;
+                match put {
+                    Ok(_) => crate::write_load::written(&id, mark),
+                    Err(e) => tracing::warn!(error = %e, "can't write the gateway's load report"),
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(error = %e, "can't encode the gateway's load report"),
         }
         Ok(())
     }

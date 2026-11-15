@@ -163,6 +163,45 @@ pub struct FarRead<'a> {
     pub rel_keys: Option<&'a [String]>,
     /// Numeric comparisons of the relationships' properties.
     pub rel_filter: &'a [(String, CmpOp, f64)],
+    /// With `join`: at least the links to the first `n` far nodes by
+    /// property `key` (ascending when `true`) in Cypher's order, ties
+    /// kept (a store may give more).
+    pub top: Option<(&'a str, bool, usize)>,
+    /// At most this many links per shard statement, in id order (a
+    /// caller that gets this many reads on with `after`, or its own way).
+    pub limit: Option<usize>,
+    /// Only links with ids above this one.
+    pub after: Option<u64>,
+    /// With `limit`: in link id order (for a later `after`).
+    pub ordered: bool,
+}
+
+/// [`GraphStore::scan_links`]'s answer: the scan's nodes, the links from
+/// them (`true`: outgoing; `None` when the store read them through mirrors
+/// that turned out stale, so the hop reads them again), and, for a capped
+/// joined read, the same links unjoined (at most [`FUSED_PLAIN_MAX`] per
+/// shard statement).
+pub type ScanLinks = (
+    Vec<NodeRow>,
+    Option<Vec<(FarLink, bool)>>,
+    Option<Vec<(FarLink, bool)>>,
+);
+
+/// The unjoined links a capped start read brings along (per shard
+/// statement): a start with more reads them in its hop.
+pub const FUSED_PLAIN_MAX: usize = 2000;
+
+/// [`GraphStore::links_deep`]'s answer.
+#[derive(Debug, Default)]
+pub struct DeepLinks {
+    /// The outgoing links of the nodes asked about.
+    pub first: Vec<Link>,
+    /// Outgoing links of their far nodes.
+    pub second: Vec<Link>,
+    /// The far nodes all of whose outgoing links are in `second`.
+    pub complete: std::collections::HashSet<u64>,
+    /// Far nodes read with the links (both levels), when asked.
+    pub nodes: Vec<NodeRow>,
 }
 
 /// A link [`GraphStore::links_far`] gives: the link, its far node when
@@ -291,6 +330,54 @@ pub trait GraphStore: Send {
     fn late_props(&self) -> bool {
         false
     }
+
+    /// Outgoing links of `from` of `types`, and of their far nodes too
+    /// where the store can read them in the same statement (the next
+    /// level of a walk): [`DeepLinks::complete`] names the far nodes whose
+    /// own outgoing links of `types` are all in [`DeepLinks::second`].
+    /// With `keys`, the far nodes of both levels with those properties
+    /// ([`DeepLinks::nodes`], where the store can).
+    ///
+    /// # Errors
+    /// The store's.
+    async fn links_deep(
+        &mut self,
+        from: &[u64],
+        types: &[u32],
+        _keys: Option<&[String]>,
+    ) -> Result<DeepLinks> {
+        Ok(DeepLinks {
+            first: self.links(from, types, Dir::Out).await?,
+            ..DeepLinks::default()
+        })
+    }
+
+    /// A pattern's start scan and its first hop in one round trip: the
+    /// nodes `s` finds, and the links of `types` from them in `dir` (with
+    /// far nodes as `far` says). `None`: the store can't (the caller
+    /// scans, then hops).
+    ///
+    /// # Errors
+    /// The store's.
+    async fn scan_links(
+        &mut self,
+        _s: &Scan,
+        _types: &[u32],
+        _dir: Dir,
+        _far: &FarRead<'_>,
+    ) -> Result<Option<ScanLinks>> {
+        Ok(None)
+    }
+
+    /// Nodes `ids` with properties `keys` will be read: a store may read
+    /// them with its next statement (in the same round trip) and answer
+    /// [`GraphStore::nodes_part`] for them from that. Read-only statements
+    /// only.
+    fn queue_nodes(&mut self, _ids: &[u64], _keys: &[String]) {}
+
+    /// The statement will read incoming links: a store whose mirrors need
+    /// a freshness check may start it now, alongside the first reads.
+    fn warm_mirrors(&mut self) {}
 
     /// Nodes by id with only `keys` of their properties (`Some(&[])`:
     /// none, just ids and labels; `None`: all). A node without one of

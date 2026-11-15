@@ -7,7 +7,7 @@
 //! inheritable with the same key, the child's top level reads the view
 //!
 //! ```sql
-//! CREATE OR REPLACE DEFINER = 't<parent>_u<share creator>'@'%'
+//! CREATE OR REPLACE DEFINER = 't<parent>_sprig_share'@'%'
 //!   SQL SECURITY DEFINER VIEW `<child schema>`.`__sprig_share_<id>` AS
 //!   SELECT <shared columns> FROM (<the parent root's merged view>) v
 //!   WHERE <share filter>;
@@ -15,8 +15,15 @@
 //!
 //! The view lives in the child's schema, so the child's accounts can
 //! select it with the grants they already have, and runs as the parent's
-//! account, so MariaDB itself limits it to the parent's data; its text is
-//! the share's subset. A client can't name it (`__sprig_` objects are
+//! **share definer** `t<parent>_sprig_share` (decision RL70): an account
+//! SprigDB creates locked (nobody logs in as it) and grants `SELECT` only
+//! on what the parent's share views read, the parent's layer table and,
+//! in a chain, the parent's own share view of its parent. MariaDB itself
+//! thus limits the view to the parent's shared tables; its text is the
+//! share's subset. No user owns the account, so dropping or renaming the
+//! user who made the share (before RL70 the definer, `t<parent>_u<id>`)
+//! no longer breaks every child's view with 1449, and no policy of the
+//! parent binds it. A client can't name the view (`__sprig_` objects are
 //! reserved and hidden). The parent's merged view reads the parent's own
 //! upstream view the same way, so a chain of tenants is a chain of views.
 //!
@@ -31,6 +38,8 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
 
 use sprig_catalog::TenantCatalog;
+use sprig_common::ids::TenantId;
+use sprig_common::names::share_definer_account;
 use sprig_common::{Result, SprigCode, SprigError};
 
 use crate::Runner;
@@ -49,7 +58,43 @@ pub fn view_name(share: &Share) -> String {
     format!("__sprig_share_{}", share.id)
 }
 
-/// The statement creating the share view of `up` in `child`'s schema.
+/// The account the share views of `parent`'s shares run as
+/// ([`sprig_common::names::share_definer_account`]), quoted for SQL.
+#[must_use]
+pub fn definer(parent: TenantId) -> String {
+    format!("'{}'@'%'", share_definer_account(parent))
+}
+
+/// The statements making the share view of `up` in `lineage[j]`'s
+/// schema, in order: the parent's share definer (created locked when
+/// missing), its `SELECT` on what the view reads, the view.
+///
+/// # Errors
+/// 39889 for sharded databases.
+pub fn statements(
+    lineage: &[&TenantCatalog],
+    j: usize,
+    db_name: &str,
+    table: &str,
+    up: &UpEdge,
+    lctn: bool,
+) -> Result<Vec<String>> {
+    let (create, reads) = build(lineage, j, db_name, table, up, lctn)?;
+    let who = definer(lineage[j - 1].tenant);
+    let mut out = vec![format!("CREATE USER IF NOT EXISTS {who} ACCOUNT LOCK")];
+    for (schema, name) in reads {
+        out.push(format!(
+            "GRANT SELECT ON {}.{} TO {who}",
+            q(&schema),
+            q(&name)
+        ));
+    }
+    out.push(create);
+    Ok(out)
+}
+
+/// The statement creating the share view of `up` in `child`'s schema
+/// (without its definer's account and grants: [`statements`]).
 ///
 /// # Errors
 /// 39889 for sharded databases.
@@ -61,12 +106,27 @@ pub fn create_sql(
     up: &UpEdge,
     lctn: bool,
 ) -> Result<String> {
+    build(lineage, j, db_name, table, up, lctn).map(|(sql, _)| sql)
+}
+
+/// The view's statement and the parent's relations it reads (schema,
+/// name).
+fn build(
+    lineage: &[&TenantCatalog],
+    j: usize,
+    db_name: &str,
+    table: &str,
+    up: &UpEdge,
+    lctn: bool,
+) -> Result<(String, Vec<(String, String)>)> {
     let parent = lineage[j - 1];
     let ps = physical_schema(parent, db_name, lctn)?;
     let cs = physical_schema(lineage[j], db_name, lctn)?;
+    let mut reads = vec![(ps.clone(), up.parent_obj.table.clone())];
     let top = if j >= 2
         && let Some(u2) = tenant_edge(lineage[j - 2], parent, db_name, table, lctn)?
     {
+        reads.push((ps.clone(), view_name(&u2.share)));
         Top::Upstream {
             from: format!("{}.{}", q(&ps), q(&view_name(&u2.share))),
             columns: u2.columns,
@@ -99,18 +159,18 @@ pub fn create_sql(
         .map(|c| q(c))
         .collect::<Vec<_>>()
         .join(", ");
-    Ok(format!(
-        "CREATE OR REPLACE DEFINER = 't{}_u{}'@'%' SQL SECURITY DEFINER VIEW {}.{} AS SELECT \
-         {cols} FROM ({body}) AS `__sprig_v` WHERE {}",
-        parent.tenant,
-        up.share.created_by,
+    let sql = format!(
+        "CREATE OR REPLACE DEFINER = {} SQL SECURITY DEFINER VIEW {}.{} AS SELECT {cols} FROM \
+         ({body}) AS `__sprig_v` WHERE {}",
+        definer(parent.tenant),
         q(&cs),
         q(&view_name(&up.share)),
         up.share
             .filter
             .as_deref()
             .map_or_else(|| "TRUE".to_owned(), |f| format!("({f})"))
-    ))
+    );
+    Ok((sql, reads))
 }
 
 /// Makes sure every share view `r`'s merged view reads exists and is
@@ -161,9 +221,9 @@ pub async fn ensure(ctx: &Ctx<'_>, run: &mut dyn Runner, r: &Resolved) -> Result
         j -= 1;
     }
     for (j, up) in edges.into_iter().rev() {
-        let sql = create_sql(&lineage, j, &r.db_name, &table, &up, ctx.lctn)?;
+        let sqls = statements(&lineage, j, &r.db_name, &table, &up, ctx.lctn)?;
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        sql.hash(&mut h);
+        sqls.hash(&mut h);
         // The parent's catalog version too: a parent's `DROP SHARE` drops
         // the view on every child (bugfix-44), and share ids are reused
         // (`MAX + 1`), so a view this gateway made for a dropped share of
@@ -175,16 +235,18 @@ pub async fn ensure(ctx: &Ctx<'_>, run: &mut dyn Runner, r: &Resolved) -> Result
         if known == Some(sig) {
             continue;
         }
-        run.ctl(&sql).await.map_err(|e| {
-            SprigError::new(
-                SprigCode::ShareResidencyConflict,
-                format!(
-                    "the share view of {}.{table} could not be created (are both tenants on \
-                     one cluster?): {}",
-                    r.db_name, e.message
-                ),
-            )
-        })?;
+        for sql in &sqls {
+            run.ctl(sql).await.map_err(|e| {
+                SprigError::new(
+                    SprigCode::ShareResidencyConflict,
+                    format!(
+                        "the share view of {}.{table} could not be created (are both tenants on \
+                         one cluster?): {}",
+                        r.db_name, e.message
+                    ),
+                )
+            })?;
+        }
         if let Ok(mut c) = cache().lock() {
             c.insert(key, sig);
         }

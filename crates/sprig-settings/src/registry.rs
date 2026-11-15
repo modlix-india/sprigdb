@@ -240,11 +240,6 @@ pub const MARKED: &[(&str, Mark, &str)] = &[
         "auto-indexing's field-column class rule",
     ),
     (
-        "auto_index.lookup_scatter_pct",
-        Mark::Unbuilt,
-        "auto-indexing's lookup-scatter rule",
-    ),
-    (
         "auto_index.wildcard_recommend_paths",
         Mark::Unbuilt,
         "auto-indexing's wildcard advice",

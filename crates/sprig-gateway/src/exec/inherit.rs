@@ -182,11 +182,14 @@ fn limits(ts: &TenantSession, cat: &TenantCatalog) -> Limits {
 /// The copies of `cat`'s objects and their states (chapter 42,
 /// "Materialized copies"), read as the provisioning account at most once
 /// a second per tenant and catalog version (a schema change that keeps a
-/// copy serving, decision T20, is seen by the next statement).
+/// copy serving, decision T20, is seen by the next statement). `fresh`:
+/// read them now (a change stream's probe, which must see a copy that just
+/// started serving and its grants, RL71).
 async fn copy_states(
     ts: &TenantSession,
     cat: &TenantCatalog,
     ancestors: &[Arc<TenantCatalog>],
+    fresh: bool,
 ) -> sprig_inherit::copy::CopyStates {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -202,7 +205,8 @@ async fn copy_states(
     if schemas.is_empty() {
         return sprig_inherit::copy::CopyStates::default();
     }
-    if let Ok(c) = cache.lock()
+    if !fresh
+        && let Ok(c) = cache.lock()
         && let Some((at, v, st)) = c.get(&cat.tenant.0)
         && at.elapsed() < Duration::from_secs(1)
         && *v == cat.version
@@ -222,12 +226,17 @@ async fn copy_states(
         }
     }
     // A copy appeared: accounts row-level security narrowed to single
-    // relations need SELECT on its table (rlsinherit).
+    // relations need SELECT on its table (rlsinherit). Also a copy seeded
+    // again: its table may have been dropped and made again (a share
+    // dropped and made again, rlsinherit4), and a reconcile while it was
+    // missing took the grants back.
     let known = match cache.lock() {
         Ok(mut c) => {
-            let known = c
-                .get(&cat.tenant.0)
-                .is_some_and(|(_, _, st)| out.0.keys().all(|k| st.0.contains_key(k)));
+            let known = c.get(&cat.tenant.0).is_some_and(|(_, _, st)| {
+                out.0
+                    .iter()
+                    .all(|(k, i)| st.0.get(k).is_some_and(|was| was.seeded_ms == i.seeded_ms))
+            });
             c.insert(cat.tenant.0, (Instant::now(), cat.version, out.clone()));
             known
         }
@@ -366,7 +375,7 @@ impl PassSession {
         let privileges = GwPrivileges(crate::tenant::authz::privileges(ts, cat));
         let lctn = ts.lower_case_table_names();
         let lim = limits(ts, cat);
-        let copies = copy_states(ts, cat, &ancestors).await;
+        let copies = copy_states(ts, cat, &ancestors, probe.is_some()).await;
         let current = self.current_logical();
         let (lex, _) = self.lex_opts();
         let ctx = sprig_inherit::Ctx {

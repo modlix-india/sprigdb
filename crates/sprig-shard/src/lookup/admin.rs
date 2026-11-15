@@ -18,21 +18,26 @@
 //!   orphan scan, public
 //! drop(L): dropping, publish, tables, row, publish
 //! resume(): every lookup in building, write_only, backfilling or
-//!   dropping that no job touched for BUILD_LEASE is taken over (one taker
-//!   wins): building is rolled back (no writer used it), write_only and
-//!   backfilling are built on, dropping is finished
+//!   dropping that no job touched for the lease (`lookup.build_lease_seconds`)
+//!   is taken over (one taker wins): building is rolled back (no writer
+//!   used it), write_only and backfilling are built on, dropping is
+//!   finished; a lookup whose owner table is gone is dropped
+//! drop_owned(owners), after DROP TABLE or DROP DATABASE: every lookup of
+//!   those tables goes dropping (one publish), its tables and row go, publish
+//! a build that fails on values repeating across shards tells the host
+//!   (LookupHost::duplicates), which raises an approvals item
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use mysql_async::prelude::Queryable;
 use mysql_async::Conn;
+use mysql_async::prelude::Queryable;
 use sprig_common::ids::{ClusterId, DbId, GroupId, ObjectId, TenantId};
 use sprig_common::{Result, SprigCode, SprigError};
 
-use super::direct::{self, BuildReport, Pools};
+use super::direct::{self, BuildReport, Duplicates, Pools};
 use super::{
     LookupCatalog, LookupColumn, LookupId, LookupIndex, LookupOrigin, LookupPlacement,
     LookupRecord, LookupState, MapPlacement, propose_auto_lookup,
@@ -43,7 +48,120 @@ use crate::shardmap::{ShardMap, ShardMapStore};
 
 /// A job that hasn't touched its lookup for this long has stopped (its
 /// process died); another may take it over. Builds touch it every chunk.
+/// The default of `lookup.build_lease_seconds` ([`Admin::lease`]).
 pub const BUILD_LEASE: Duration = Duration::from_secs(30);
+
+/// The end of an approvals item's target that reports a failed build's
+/// duplicates: `t<tenant>/o<owner>/lookup/<key>/duplicates`.
+pub const DUPLICATES_TARGET_SUFFIX: &str = "/duplicates";
+
+/// A unique lookup whose build failed because its values repeat across
+/// shards: what the host tells people ([`LookupHost::duplicates`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateReport {
+    /// The owner's database.
+    pub db: DbId,
+    /// The owner table.
+    pub owner: ObjectId,
+    /// Its name.
+    pub table: String,
+    /// The key's name.
+    pub key: String,
+    /// The key's columns.
+    pub columns: Vec<String>,
+    /// What the verification found.
+    pub found: Duplicates,
+}
+
+impl DuplicateReport {
+    /// The approvals item's target.
+    #[must_use]
+    pub fn target(&self, tenant: TenantId) -> String {
+        format!(
+            "t{tenant}/o{}/lookup/{}{DUPLICATES_TARGET_SUFFIX}",
+            self.owner.0, self.key
+        )
+    }
+
+    /// The statement that builds the lookup once the values are fixed.
+    #[must_use]
+    pub fn action_text(&self, db_name: &str) -> String {
+        let q = |s: &str| format!("`{}`", s.replace('`', "``"));
+        format!(
+            "SPRIG REBUILD LOOKUP INDEX {} ON {}.{}",
+            q(&self.key),
+            q(db_name),
+            q(&self.table)
+        )
+    }
+
+    /// The `ALTER TABLE` that adds the key (and builds its lookup) again,
+    /// for a failure of `ADD UNIQUE`, which dropped the shards' key.
+    #[must_use]
+    pub fn ddl_text(&self, db_name: &str) -> String {
+        let q = |s: &str| format!("`{}`", s.replace('`', "``"));
+        format!(
+            "ALTER TABLE {}.{} ADD UNIQUE KEY {} ({})",
+            q(db_name),
+            q(&self.table),
+            q(&self.key),
+            self.columns
+                .iter()
+                .map(|c| q(c))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+
+    /// The machine form of the action: what to build.
+    #[must_use]
+    pub fn machine(&self) -> serde_json::Value {
+        serde_json::json!({
+            "object": self.owner.0,
+            "db": self.db.0,
+            "key": self.key,
+            "columns": self.columns,
+            "duplicates": true,
+        })
+    }
+
+    /// The evidence: how many values and rows repeat, and a sample.
+    #[must_use]
+    pub fn evidence(&self) -> serde_json::Value {
+        serde_json::json!({
+            "duplicate_values": self.found.values,
+            "duplicate_rows": self.found.rows,
+            "sample": self.found.sample,
+        })
+    }
+
+    /// One line for people; `ddl` when the shards' key was dropped again
+    /// (a failed `ADD UNIQUE`), so the statement must run again.
+    #[must_use]
+    pub fn summary(&self, db_name: &str, ddl: bool) -> String {
+        format!(
+            "unique key {} on {}.{} ({}) isn't unique across shards: {} values repeat in {} \
+             rows, for example {}; fix them, then {}",
+            self.key,
+            db_name,
+            self.table,
+            self.columns.join(", "),
+            self.found.values,
+            self.found.rows,
+            self.found
+                .sample
+                .iter()
+                .map(|v| format!("'{v}'"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if ddl {
+                "run the ALTER TABLE again (it builds the global lookup index)"
+            } else {
+                "approve to build its global lookup index"
+            }
+        )
+    }
+}
 
 /// The name of the tenant's lookup group in `table_groups`.
 pub const LOOKUP_GROUP_NAME: &str = "__sprig_lookups";
@@ -71,6 +189,13 @@ pub trait LookupHost: Send + Sync {
     /// # Errors
     /// The catalog's.
     async fn publish(&self) -> Result<()>;
+
+    /// A unique lookup's build failed because its values repeat across
+    /// shards: tell people (an approvals item). Errors are the host's to
+    /// log; the default does nothing.
+    async fn duplicates(&self, report: &DuplicateReport) {
+        let _ = report;
+    }
 }
 
 /// A table's shape as a lookup needs it, from one shard's
@@ -124,8 +249,8 @@ pub async fn owner_shape(c: &mut Conn, schema: &str, table: &str) -> Result<Owne
             continue;
         }
         let sql_type = match &collation {
-            Some(coll) if matches!(class, crate::key::KeyClass::String { .. }) => {
-                format!("{column_type} COLLATE {coll}")
+            Some(collation_name) if matches!(class, crate::key::KeyClass::String { .. }) => {
+                format!("{column_type} COLLATE {collation_name}")
             }
             _ => column_type,
         };
@@ -151,7 +276,9 @@ pub async fn owner_shape(c: &mut Conn, schema: &str, table: &str) -> Result<Owne
     let mut keys: BTreeMap<String, (bool, bool, Vec<String>)> = BTreeMap::new();
     for (index, non_unique, column, sub_part) in stats {
         out.indexes.insert(index.to_ascii_lowercase());
-        let e = keys.entry(index).or_insert((non_unique == 0, false, Vec::new()));
+        let e = keys
+            .entry(index)
+            .or_insert((non_unique == 0, false, Vec::new()));
         e.1 |= sub_part.is_some();
         e.2.push(column.to_ascii_lowercase());
     }
@@ -205,8 +332,10 @@ pub struct Admin<'a> {
     pub maps: &'a ShardMapStore,
     /// The catalog, pools and publishing.
     pub host: &'a dyn LookupHost,
-    /// Back-fill chunk rows (`mover.copy_chunk_rows`).
+    /// Back-fill chunk rows (`lookup.backfill_chunk_rows`).
     pub chunk: usize,
+    /// A job untouched this long has stopped (`lookup.build_lease_seconds`).
+    pub lease: Duration,
 }
 
 impl std::fmt::Debug for Admin<'_> {
@@ -214,6 +343,7 @@ impl std::fmt::Debug for Admin<'_> {
         f.debug_struct("Admin")
             .field("tenant", &self.tenant)
             .field("chunk", &self.chunk)
+            .field("lease", &self.lease)
             .finish_non_exhaustive()
     }
 }
@@ -235,7 +365,11 @@ impl Admin<'_> {
     ///
     /// # Errors
     /// Catalog and etcd errors.
-    pub async fn lookup_group(&self, cat: &mut Conn, owner_map: &ShardMap) -> Result<Arc<ShardMap>> {
+    pub async fn lookup_group(
+        &self,
+        cat: &mut Conn,
+        owner_map: &ShardMap,
+    ) -> Result<Arc<ShardMap>> {
         for _ in 0..5 {
             let found: Option<u32> = cat
                 .query_first(
@@ -253,18 +387,16 @@ impl Admin<'_> {
                     Err(e) => return Err(e),
                 },
             };
-            match self.maps.load(self.tenant, g).await {
-                Ok((m, _)) => return Ok(Arc::new(m)),
-                Err(_) => {
-                    let clusters = clusters_of(&[owner_map]);
-                    let n = u32::try_from(clusters.len()).unwrap_or(1).max(1);
-                    let m = ShardMap::presplit(self.tenant, g, 0, n, &clusters)?;
-                    // A concurrent creator's map wins; read it back.
-                    let _ = self.maps.create(&m).await;
-                    let (m, _) = self.maps.load(self.tenant, g).await?;
-                    return Ok(Arc::new(m));
-                }
+            if let Ok((m, _)) = self.maps.load(self.tenant, g).await {
+                return Ok(Arc::new(m));
             }
+            let clusters = clusters_of(&[owner_map]);
+            let n = u32::try_from(clusters.len()).unwrap_or(1).max(1);
+            let m = ShardMap::presplit(self.tenant, g, 0, n, &clusters)?;
+            // A concurrent creator's map wins; read it back.
+            let _ = self.maps.create(&m).await;
+            let (m, _) = self.maps.load(self.tenant, g).await?;
+            return Ok(Arc::new(m));
         }
         Err(SprigError::internal("the lookup group couldn't be made"))
     }
@@ -426,11 +558,39 @@ impl Admin<'_> {
             owner_map: Arc::clone(&n.owner_map),
         };
         let host = self.host;
-        let report = direct::build(&pools, &mut cat, &placement, &mut l, self.chunk, || {
+        let built = direct::build(&pools, &mut cat, &placement, &mut l, self.chunk, || {
             host.publish()
         })
-        .await?;
-        Ok((l, report))
+        .await;
+        match built {
+            Ok(report) => Ok((l, report)),
+            Err(e) => {
+                self.report_duplicates(n.db, &l, &e).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Tells the host when `e` is a build's failure on values that repeat
+    /// across shards.
+    async fn report_duplicates(&self, db: DbId, l: &LookupIndex, e: &SprigError) {
+        let Some(found) = Duplicates::of(e) else {
+            return;
+        };
+        tracing::warn!(
+            tenant = %self.tenant, table = %l.owner_table, lookup = %l.index_name,
+            values = found.values, rows = found.rows, "lookup index build: values repeat across shards"
+        );
+        self.host
+            .duplicates(&DuplicateReport {
+                db,
+                owner: l.owner,
+                table: l.owner_table.clone(),
+                key: l.index_name.clone(),
+                columns: l.columns.iter().map(|c| c.name.clone()).collect(),
+                found: found.clone(),
+            })
+            .await;
     }
 
     /// The lookup a catalog row describes, with its placement: the owner's
@@ -464,9 +624,7 @@ impl Admin<'_> {
             .host
             .pools(&clusters_of(&[&owner_map, &lookup_map]))
             .await?;
-        let shape = self
-            .shape_of(&pools, DbId(db), &owner_map, &table)
-            .await?;
+        let shape = self.shape_of(&pools, DbId(db), &owner_map, &table).await?;
         let col = |c: &str| {
             shape
                 .columns
@@ -537,7 +695,12 @@ impl Admin<'_> {
         let (mut l, placement, pools) = self.load(&mut cat, &rec).await?;
         if l.state == LookupState::Public {
             if !LookupCatalog
-                .set_state(&mut cat, l.id, LookupState::Public, LookupState::Backfilling)
+                .set_state(
+                    &mut cat,
+                    l.id,
+                    LookupState::Public,
+                    LookupState::Backfilling,
+                )
                 .await?
             {
                 return Err(SprigError::new(
@@ -548,7 +711,7 @@ impl Admin<'_> {
             l.state = LookupState::Backfilling;
             self.host.publish().await?;
         } else if LookupCatalog
-            .take_over(&mut cat, l.id, BUILD_LEASE.as_secs())
+            .take_over(&mut cat, l.id, self.lease.as_secs())
             .await?
         {
             // A stopped build: carry on from its state.
@@ -569,10 +732,17 @@ impl Admin<'_> {
             return Err(no_lookup(name, table));
         }
         let host = self.host;
-        let report = direct::build(&pools, &mut cat, &placement, &mut l, self.chunk, || {
+        let built = direct::build(&pools, &mut cat, &placement, &mut l, self.chunk, || {
             host.publish()
         })
-        .await?;
+        .await;
+        let report = match built {
+            Ok(r) => r,
+            Err(e) => {
+                self.report_duplicates(placement.db, &l, &e).await;
+                return Err(e);
+            }
+        };
         let removed = direct::orphan_scan(&pools, &placement, &l, 5).await?;
         tracing::info!(
             tenant = %self.tenant, lookup = %l.index_name, rows = report.rows,
@@ -595,6 +765,77 @@ impl Admin<'_> {
     }
 
     async fn drop_record(&self, cat: &mut Conn, rec: &LookupRecord) -> Result<()> {
+        cat.exec_drop(
+            "UPDATE lookup_indexes SET state = 'dropping', updated_at = UTC_TIMESTAMP(6) \
+             WHERE lookup_id = ?",
+            (rec.id.0,),
+        )
+        .await
+        .map_err(db_err)?;
+        self.host.publish().await?;
+        self.drop_tables(rec).await?;
+        cat.exec_drop(
+            "DELETE FROM lookup_indexes WHERE lookup_id = ?",
+            (rec.id.0,),
+        )
+        .await
+        .map_err(db_err)?;
+        self.host.publish().await
+    }
+
+    /// Drops every lookup of the tables in `owners` (after `DROP TABLE` or
+    /// `DROP DATABASE` removed them): all go `dropping` in one change and
+    /// one publish, then their tables and rows go, then one more publish.
+    /// A crash in between leaves them `dropping` (or public with their
+    /// owner gone), which [`Admin::resume`] finishes. Returns the dropped
+    /// lookups' names.
+    ///
+    /// # Errors
+    /// Catalog, etcd and MariaDB errors.
+    pub async fn drop_owned(&self, owners: &[ObjectId]) -> Result<Vec<String>> {
+        if owners.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut cat = self.host.catalog().await?;
+        if !has_lookup_table(&mut cat).await? {
+            return Ok(Vec::new());
+        }
+        let recs: Vec<LookupRecord> = LookupCatalog
+            .rows(&mut cat)
+            .await?
+            .into_iter()
+            .filter(|r| owners.contains(&r.owner))
+            .collect();
+        if recs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = recs
+            .iter()
+            .map(|r| r.id.0.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        cat.query_drop(format!(
+            "UPDATE lookup_indexes SET state = 'dropping', updated_at = UTC_TIMESTAMP(6) \
+             WHERE lookup_id IN ({ids})"
+        ))
+        .await
+        .map_err(db_err)?;
+        self.host.publish().await?;
+        for rec in &recs {
+            self.drop_tables(rec).await?;
+            cat.exec_drop(
+                "DELETE FROM lookup_indexes WHERE lookup_id = ?",
+                (rec.id.0,),
+            )
+            .await
+            .map_err(db_err)?;
+        }
+        self.host.publish().await?;
+        Ok(recs.into_iter().map(|r| r.index_name).collect())
+    }
+
+    /// `rec`'s table in every schema of the lookup group that holds it.
+    async fn drop_tables(&self, rec: &LookupRecord) -> Result<()> {
         let (lookup_map, _) = self.maps.load(self.tenant, rec.group).await?;
         let pools = self.host.pools(&clusters_of(&[&lookup_map])).await?;
         // The placement's owner map is unused by a drop.
@@ -607,28 +848,6 @@ impl Admin<'_> {
         };
         // Every database's schemas of the lookup group hold the table under
         // its name: drop it in each that exists.
-        let mut l = LookupIndex {
-            id: rec.id,
-            owner: rec.owner,
-            owner_table: String::new(),
-            index_name: rec.index_name.clone(),
-            columns: Vec::new(),
-            owner_pk: Vec::new(),
-            unique: rec.unique,
-            origin: rec.origin,
-            group: rec.group,
-            state: rec.state,
-            auto_index_id: rec.auto_index_id,
-        };
-        cat.exec_drop(
-            "UPDATE lookup_indexes SET state = 'dropping', updated_at = UTC_TIMESTAMP(6) \
-             WHERE lookup_id = ?",
-            (rec.id.0,),
-        )
-        .await
-        .map_err(db_err)?;
-        l.state = LookupState::Dropping;
-        self.host.publish().await?;
         let prefix = format!("t{}\\_d%\\_g{}\\_s%", self.tenant.0, rec.group.0);
         for t in placement.lookup_shards() {
             let pool = pools.get(&t.cluster).ok_or_else(|| {
@@ -656,13 +875,7 @@ impl Admin<'_> {
                 .map_err(db_err)?;
             }
         }
-        cat.exec_drop(
-            "DELETE FROM lookup_indexes WHERE lookup_id = ?",
-            (rec.id.0,),
-        )
-        .await
-        .map_err(db_err)?;
-        self.host.publish().await
+        Ok(())
     }
 
     /// Takes over every lookup job that stopped (no touch for
@@ -674,28 +887,32 @@ impl Admin<'_> {
     /// The catalog's; a failing job is reported in the result instead.
     pub async fn resume(&self) -> Result<Vec<(LookupId, String)>> {
         let mut cat = self.host.catalog().await?;
-        let has: Option<u64> = cat
-            .query_first(
-                "SELECT COUNT(*) FROM information_schema.TABLES \
-                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'lookup_indexes'",
-            )
-            .await
-            .map_err(db_err)?;
-        if has.unwrap_or(0) == 0 {
+        if !has_lookup_table(&mut cat).await? {
             return Ok(Vec::new());
         }
         let mut done = Vec::new();
-        for rec in LookupCatalog.rows(&mut cat).await? {
-            if rec.state == LookupState::Public || rec.idle_secs < BUILD_LEASE.as_secs() {
+        let rows = LookupCatalog.rows(&mut cat).await?;
+        let live = live_owners(&mut cat, &rows).await?;
+        let lease = self.lease.as_secs();
+        for rec in rows {
+            // An owner `DROP TABLE` (or `DROP DATABASE`) removed while its
+            // gateway died before the lookup went with it.
+            let gone = !live.contains(&rec.owner);
+            if (rec.state == LookupState::Public && !gone) || rec.idle_secs < lease {
                 continue;
             }
-            if !LookupCatalog
-                .take_over(&mut cat, rec.id, BUILD_LEASE.as_secs())
-                .await?
-            {
+            if !LookupCatalog.take_over(&mut cat, rec.id, lease).await? {
                 continue;
             }
+            tracing::info!(
+                tenant = %self.tenant, lookup = %rec.index_name, state = rec.state.as_str(),
+                idle_secs = rec.idle_secs, owner_gone = gone, "taking over a stopped lookup job"
+            );
             let outcome = match rec.state {
+                _ if gone => self
+                    .drop_record(&mut cat, &rec)
+                    .await
+                    .map(|()| "dropped (its table is gone)".to_owned()),
                 LookupState::Building | LookupState::Dropping => {
                     self.drop_record(&mut cat, &rec).await.map(|()| {
                         if rec.state == LookupState::Building {
@@ -709,10 +926,15 @@ impl Admin<'_> {
                     let r = async {
                         let (mut l, placement, pools) = self.load(&mut cat, &rec).await?;
                         let host = self.host;
-                        direct::build(&pools, &mut cat, &placement, &mut l, self.chunk, || {
-                            host.publish()
-                        })
-                        .await
+                        let built =
+                            direct::build(&pools, &mut cat, &placement, &mut l, self.chunk, || {
+                                host.publish()
+                            })
+                            .await;
+                        if let Err(e) = &built {
+                            self.report_duplicates(placement.db, &l, e).await;
+                        }
+                        built
                     }
                     .await;
                     r.map(|rep| {
@@ -738,6 +960,39 @@ impl Admin<'_> {
     }
 }
 
+/// Whether the catalog (the connection's database) has `lookup_indexes`.
+async fn has_lookup_table(cat: &mut Conn) -> Result<bool> {
+    let has: Option<u64> = cat
+        .query_first(
+            "SELECT COUNT(*) FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'lookup_indexes'",
+        )
+        .await
+        .map_err(db_err)?;
+    Ok(has.unwrap_or(0) > 0)
+}
+
+/// The owners of `rows` the catalog still has (an `objects` row that
+/// isn't `dropped`).
+async fn live_owners(cat: &mut Conn, rows: &[LookupRecord]) -> Result<BTreeSet<ObjectId>> {
+    let ids: BTreeSet<u64> = rows.iter().map(|r| r.owner.0).collect();
+    if ids.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let list = ids
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let live: Vec<u64> = cat
+        .query(format!(
+            "SELECT object_id FROM objects WHERE object_id IN ({list}) AND state <> 'dropped'"
+        ))
+        .await
+        .map_err(db_err)?;
+    Ok(live.into_iter().map(ObjectId).collect())
+}
+
 /// The lookups of each owner, by owner (for statements listing them).
 #[must_use]
 pub fn by_owner(rows: &[LookupRecord]) -> HashMap<ObjectId, Vec<&LookupRecord>> {
@@ -748,17 +1003,16 @@ pub fn by_owner(rows: &[LookupRecord]) -> HashMap<ObjectId, Vec<&LookupRecord>> 
     m
 }
 
-/// The single-column unique keys of `shape` that don't hold `key` (the
-/// distribution key): what a unique lookup can make unique across shards.
+/// The unique keys of `shape` (of one column or several) that don't hold
+/// `key` (the distribution key): what a unique lookup can make unique
+/// across shards. Every column must be one a lookup can hold.
 #[must_use]
-pub fn lookup_keys(shape: &OwnerShape, key: &[String]) -> Vec<(String, String)> {
+pub fn lookup_keys(shape: &OwnerShape, key: &[String]) -> Vec<(String, Vec<String>)> {
     shape
         .unique
         .iter()
         .filter(|(_, cols)| !cols.iter().any(|c| key.contains(c)))
-        .filter_map(|(name, cols)| match cols.as_slice() {
-            [c] if shape.columns.contains_key(c) => Some((name.clone(), c.clone())),
-            _ => None,
-        })
+        .filter(|(_, cols)| !cols.is_empty() && cols.iter().all(|c| shape.columns.contains_key(c)))
+        .map(|(name, cols)| (name.clone(), cols.clone()))
         .collect()
 }

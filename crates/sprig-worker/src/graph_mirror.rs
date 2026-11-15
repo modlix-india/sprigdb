@@ -30,8 +30,15 @@
 //!
 //! **Readers of every cluster.** A shard can move to any cluster, and its
 //! writes there must be read from before the move's cutover, so the job
-//! reads every cluster of the DC all the time (one binlog dump per
-//! cluster and tenant), not only those holding the graph now.
+//! reads every cluster of the DC all the time, not only those holding the
+//! graph now. Each reader is a subscription to the worker's shared reader
+//! (R9, r9feed3; [`sprig_feed::shared`]): one binlog dump per cluster and
+//! worker, however many tenants have mirrors. Its view ([`shared_view`])
+//! keeps the edge tables only, so the job isn't handed the rest of its
+//! tenant's writes (a whole-tenant view had it detached from the reader
+//! under load), and sends idle positions every 200 ms, as a dump of its
+//! own did, not every second: a mirror read waits for the positions to
+//! reach the cluster's position now, which others' writes move on.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -48,6 +55,7 @@ use sprig_common::names::quote;
 use sprig_common::{CancellationToken, Result, SprigError};
 use sprig_controller::catalogs::{ClusterPools, ShardMapLocator};
 use sprig_controller::dispatch::JobClass;
+use sprig_feed::shared::{IDLE_TICK, Kept, SharedClusters, SharedFeed};
 use sprig_feed::source::{RawRow, RowKind, XaMark};
 use sprig_feed::{Clusters, SourceItem, TxnSource};
 use sprig_graph::catalog::Tables;
@@ -70,7 +78,7 @@ pub struct GraphMirrorEnv {
     pub pools: Arc<dyn ClusterPools>,
     /// Tenant catalogs.
     pub locator: Arc<ShardMapLocator>,
-    /// Binlog sources.
+    /// Binlog sources: the worker's shared reader ([`shared_view`]).
     pub clusters: Arc<dyn Clusters>,
 }
 
@@ -78,6 +86,17 @@ impl std::fmt::Debug for GraphMirrorEnv {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GraphMirrorEnv").finish_non_exhaustive()
     }
+}
+
+/// Graphs' edge tables, in every tenant's shard schemas.
+const EDGE_TABLES: &str = "__sprig_ge_*";
+
+/// The job's view of the worker's shared reader: the edge tables of
+/// every tenant (XA marks and the mover's applier marks come with them),
+/// and an idle position every [`IDLE_TICK`] (see the module docs).
+#[must_use]
+pub fn shared_view(feed: &Arc<SharedFeed>) -> Arc<SharedClusters> {
+    feed.view_every(Kept::Tables(vec![EDGE_TABLES.to_owned()].into()), IDLE_TICK)
 }
 
 /// `graph_mirror` (see the module docs).

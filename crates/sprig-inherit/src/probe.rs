@@ -29,8 +29,8 @@ use serde_json::{Map, Value};
 use sprig_common::Result;
 
 use crate::grammar::Name;
-use crate::plan::Ctx;
-use crate::view::{C as LAYER, Top, ViewSql, q};
+use crate::plan::{Ctx, Cut};
+use crate::view::{C as LAYER, Chain, Top, ViewSql, q};
 use crate::{RowCmd, Runner, SpaceId};
 
 /// Where the changed row is.
@@ -59,6 +59,11 @@ pub struct Probe {
     pub before: Option<Map<String, Value>>,
     /// The changed row's columns, for a change without a before image.
     pub columns: Vec<String>,
+    /// The stream counts this change by its copy's handover
+    /// ([`crate::handover`], RL71), whatever the view reads now: the
+    /// record before is taken through the tenant edge as its copy holds
+    /// or its share view reads it, the copy taken as serving.
+    pub counted: bool,
 }
 
 /// A column's MariaDB type, as `information_schema.COLUMNS` gives it.
@@ -219,6 +224,77 @@ async fn column_types(
         .collect()
 }
 
+/// Whether `chain` reads `source`: a layer row of a space on it, a row of
+/// the copy (of the share) it starts from, a parent tenant's row through
+/// its share view.
+fn reads_in(chain: &Chain, source: &Source) -> bool {
+    let copy = |from: &str| from.contains("__sprig_ih_");
+    match (source, &chain.top) {
+        (Source::Layer(space), _) => chain.levels.iter().any(|l| l.space == *space),
+        (Source::Copy(share), Top::Upstream { from, filter, .. }) if copy(from) => {
+            // `copy::read_sql`'s condition names the share it reads.
+            share.as_u64().is_none_or(|k| {
+                filter
+                    .as_deref()
+                    .is_none_or(|f| f.starts_with(&format!("`_sprig_share` = {k} ")))
+            })
+        }
+        (Source::Above, Top::Upstream { from, .. }) => !copy(from),
+        _ => false,
+    }
+}
+
+/// Whether the session's merged view of `table` reaches the parent tenant
+/// through its tenant edge (the edge's copy, serving or not, or its share
+/// view), with no materialized share inside the tenant cutting it first:
+/// the changes a copy's handover decides (RL71). `db`: the logical
+/// database.
+///
+/// # Errors
+/// The chain's.
+pub fn through_tenant_edge(ctx: &Ctx<'_>, db: &str, table: &str) -> Result<bool> {
+    let name = Name {
+        db: Some(db.to_owned()),
+        name: table.to_owned(),
+    };
+    let Some(res) = ctx.resolve(&name)? else {
+        return Ok(false);
+    };
+    let chain = ctx.chain_with(&res.obj, ctx.space, &res.prefix, Cut::Declared)?;
+    Ok(match &chain.top {
+        Top::Upstream { from, filter, .. } if from.contains("__sprig_ih_") => {
+            filter.as_deref().is_some_and(|f| {
+                f.starts_with(&format!("`_sprig_share` = {} ", crate::copy::UPSTREAM))
+            })
+        }
+        Top::Upstream { .. } => chain
+            .levels
+            .first()
+            .is_some_and(|l| l.space == crate::ROOT_SPACE),
+        Top::Base => false,
+    })
+}
+
+/// Whether the session's merged view of `table` reads `source` now (the
+/// cases [`visible_before`] answers `None` for, without its query): a
+/// change stream sends nothing for a change its subscriber's view doesn't
+/// read, such as a parent tenant's change while a copy serves it, or a
+/// copy's while it is seeded (decision RL69). `db`: the logical database.
+///
+/// # Errors
+/// The chain's.
+pub fn reads(ctx: &Ctx<'_>, db: &str, table: &str, source: &Source) -> Result<bool> {
+    let name = Name {
+        db: Some(db.to_owned()),
+        name: table.to_owned(),
+    };
+    let Some(res) = ctx.resolve(&name)? else {
+        return Ok(false);
+    };
+    let chain = ctx.chain(&res.obj, ctx.space, &res.prefix)?;
+    Ok(reads_in(&chain, source))
+}
+
 /// Whether the record of `p` was in the session's merged view, as its
 /// `SELECT` policies filter it, just before the change (module docs).
 /// `None` when the session's view doesn't read the changed row (a space
@@ -243,7 +319,24 @@ pub async fn visible_before(
     };
     let o = &res.obj;
     let nbe = ctx.lex.no_backslash_escapes;
-    let mut chain = ctx.chain(o, ctx.space, &res.prefix)?;
+    let mut chain = match (p.counted, &p.source) {
+        // A source change counted by the handover happened while the view
+        // read through the edge (or no copy existed): the edge's top is
+        // replaced by the row below, and a copy, perhaps not readable yet,
+        // is never read.
+        (true, Source::Above) => ctx.chain_with(o, ctx.space, &res.prefix, Cut::Never)?,
+        // The copy, serving or not (a reseed keeps it the source).
+        (true, _) => ctx.chain_with(o, ctx.space, &res.prefix, Cut::Declared)?,
+        _ => ctx.chain(o, ctx.space, &res.prefix)?,
+    };
+    // A space the chain doesn't read (above a serving copy), a copy that
+    // isn't serving, a parent's row reaching the session through a copy:
+    // the change didn't reach the subscriber's view this way. A counted
+    // parent's row reaches it through the edge whatever the edge's top.
+    let counted_above = p.counted && p.source == Source::Above;
+    if !counted_above && !reads_in(&chain, &p.source) {
+        return Ok(None);
+    }
     let mut layer = res.layer.clone();
     // The key, in the object's key order, and as a condition on `alias`.
     let key_types = column_types(ctx, r, &res.db_name, &o.table).await;
@@ -278,41 +371,31 @@ pub async fn visible_before(
     };
     match &p.source {
         Source::Layer(space) => {
-            // A space the chain doesn't read (above a serving copy): the
-            // change didn't reach the subscriber's view this way.
-            if !chain.levels.iter().any(|l| l.space == *space) {
-                return Ok(None);
+            let mut cols: Vec<String> = o.columns.clone();
+            for c in ["_sprig_space", "_sprig_state", "_sprig_ovr"] {
+                cols.push(c.to_owned());
             }
-            {
-                let mut cols: Vec<String> = o.columns.clone();
-                for c in ["_sprig_space", "_sprig_state", "_sprig_ovr"] {
-                    cols.push(c.to_owned());
-                }
-                let keep = format!(
-                    "SELECT {} FROM {} AS {LAYER} WHERE {} AND NOT ({LAYER}.`_sprig_space` <=> {})",
-                    cols.iter()
-                        .map(|c| format!("{LAYER}.{}", q(c)))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    res.layer,
-                    key_match(LAYER),
-                    space.0
-                );
-                let add = p
-                    .before
-                    .as_ref()
-                    .map(|b| format!(" UNION ALL {}", row_select(&cols, b, &key_types, nbe)))
-                    .unwrap_or_default();
-                layer = format!("({keep}{add})");
-            }
+            let keep = format!(
+                "SELECT {} FROM {} AS {LAYER} WHERE {} AND NOT ({LAYER}.`_sprig_space` <=> {})",
+                cols.iter()
+                    .map(|c| format!("{LAYER}.{}", q(c)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                res.layer,
+                key_match(LAYER),
+                space.0
+            );
+            let add = p
+                .before
+                .as_ref()
+                .map(|b| format!(" UNION ALL {}", row_select(&cols, b, &key_types, nbe)))
+                .unwrap_or_default();
+            layer = format!("({keep}{add})");
         }
         Source::Copy(share) => {
-            let Top::Upstream { from, .. } = &mut chain.top else {
+            let Top::Upstream { from, columns, .. } = &mut chain.top else {
                 return Ok(None);
             };
-            if !from.contains("__sprig_ih_") {
-                return Ok(None);
-            }
             {
                 let copy = from
                     .rsplit('.')
@@ -321,21 +404,37 @@ pub async fn visible_before(
                     .trim_matches('`')
                     .to_owned();
                 let types = column_types(ctx, r, &res.db_name, &copy).await;
-                let cols = image_columns(p.before.as_ref());
+                // Columns the image lacks (a hierarchy's paths) read as
+                // NULL in the row put back.
+                let mut cols = image_columns(p.before.as_ref());
+                for c in columns.iter() {
+                    if !cols.iter().any(|x| x.eq_ignore_ascii_case(c)) {
+                        cols.push(c.clone());
+                    }
+                }
                 let src = "`__sprig_src`";
+                let share_lit = sql_value(share, None, nbe);
+                // The copy's own columns too: the view's condition reads
+                // them (`copy::read_sql`), and change images leave them
+                // out. A before image is a live row (a tombstone has none).
                 let keep = format!(
-                    "SELECT {} FROM {from} AS {src} WHERE {} AND NOT ({src}.`_sprig_share` <=> {})",
+                    "SELECT {}, {src}.`_sprig_share`, {src}.`_sprig_live` FROM {from} AS {src} \
+                     WHERE {} AND NOT ({src}.`_sprig_share` <=> {share_lit})",
                     cols.iter()
                         .map(|c| format!("{src}.{}", q(c)))
                         .collect::<Vec<_>>()
                         .join(", "),
                     key_match(src),
-                    sql_value(share, None, nbe)
                 );
                 let add = p
                     .before
                     .as_ref()
-                    .map(|b| format!(" UNION ALL {}", row_select(&cols, b, &types, nbe)))
+                    .map(|b| {
+                        format!(
+                            " UNION ALL {}, {share_lit} AS `_sprig_share`, TRUE AS `_sprig_live`",
+                            row_select(&cols, b, &types, nbe)
+                        )
+                    })
                     .unwrap_or_default();
                 *from = format!("({keep}{add}) AS {src}");
             }
@@ -345,9 +444,16 @@ pub async fn visible_before(
             let Top::Upstream { from, columns, .. } = &mut chain.top else {
                 return Ok(None);
             };
-            if from.contains("__sprig_ih_") {
-                return Ok(None);
-            }
+            // Through the edge's copy (a counted change, RL71): the row put
+            // back is a live copy row of the edge, as its condition reads.
+            let copy_cols = if from.contains("__sprig_ih_") {
+                format!(
+                    ", {} AS `_sprig_share`, TRUE AS `_sprig_live`",
+                    crate::copy::UPSTREAM
+                )
+            } else {
+                String::new()
+            };
             {
                 let src = "`__sprig_src`";
                 let shared = columns
@@ -375,12 +481,20 @@ pub async fn visible_before(
                             }
                         }
                         format!(
-                            "SELECT {shared} FROM ({}) AS {src} WHERE TRUE{}",
+                            "SELECT {shared}{copy_cols} FROM ({}) AS {src} WHERE TRUE{}",
                             row_select(&cols, b, &key_types, nbe),
                             filter.map(|f| format!(" AND ({f})")).unwrap_or_default()
                         )
                     }
-                    None => format!("SELECT {shared} FROM {from} AS {src} WHERE FALSE"),
+                    // No record before: no row (and no relation read).
+                    None => format!(
+                        "SELECT {}{copy_cols} FROM DUAL WHERE FALSE",
+                        columns
+                            .iter()
+                            .map(|c| format!("NULL AS {}", q(c)))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
                 };
                 *from = format!("({body}) AS {src}");
             }
@@ -412,6 +526,52 @@ pub async fn visible_before(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::view::Level;
+
+    #[test]
+    fn a_chain_reads_only_its_own_sources() {
+        let level = |s: u64| Level {
+            space: SpaceId(s),
+            name: String::new(),
+            edge: None,
+        };
+        let top = |from: &str, filter: Option<&str>| Top::Upstream {
+            from: from.into(),
+            columns: Vec::new(),
+            take: None,
+            origin: String::new(),
+            filter: filter.map(Into::into),
+        };
+        let copy = Chain {
+            top: top(
+                "`__sprig_ih_9`",
+                Some("`_sprig_share` = 0 AND `_sprig_live` AND (x > 1)"),
+            ),
+            levels: vec![level(1), level(4)],
+        };
+        assert!(reads_in(&copy, &Source::Copy(Value::from(0))));
+        assert!(!reads_in(&copy, &Source::Copy(Value::from(3))));
+        assert!(
+            !reads_in(&copy, &Source::Above),
+            "a parent's row reaches it as a copy row"
+        );
+        assert!(reads_in(&copy, &Source::Layer(SpaceId(4))));
+        assert!(!reads_in(&copy, &Source::Layer(SpaceId(2))));
+        let through = Chain {
+            top: top("`__sprig_share_3`", None),
+            levels: vec![level(1)],
+        };
+        assert!(reads_in(&through, &Source::Above));
+        assert!(
+            !reads_in(&through, &Source::Copy(Value::from(0))),
+            "a copy being seeded"
+        );
+        let base = Chain {
+            top: Top::Base,
+            levels: vec![level(1)],
+        };
+        assert!(!reads_in(&base, &Source::Above));
+    }
 
     #[test]
     fn values_as_change_records_carry_them() {
