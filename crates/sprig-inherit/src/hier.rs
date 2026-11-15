@@ -1,10 +1,10 @@
-//! Record hierarchies on inheritable tables (decision T22): chapter 32's
-//! stored paths across chapter 42's spaces.
+//! Record hierarchies on inheritable tables: the type layer's stored paths
+//! across the inheritance layer's spaces.
 //!
 //! A row's path (`_sprig_hpath`, with `_sprig_hdepth` and `_sprig_rk`) is
 //! computed from its ancestors, and each space sees its own ancestors: a
 //! space may override a row's parent, add rows, or hide them. So each
-//! space keeps its own paths, stored the way chapter 42 stores any field:
+//! space keeps its own paths, stored the way a layer stores any field:
 //!
 //! - the three path columns are fields of the object, with slots;
 //! - a space stores a **path override** (an `ovr` row with the three
@@ -13,7 +13,7 @@
 //! - a space that only consumes the tree stores nothing and is never
 //!   written when its parent moves things.
 //!
-//! Chapter 32's plans run in the session's space as before (their
+//! The type layer's plans run in the session's space as before (their
 //! statements go through the merged view of that space). They tell this
 //! module of each structural change with `ALTER TABLE t SPRIG RECONCILE
 //! HIERARCHY ...` ([`sprig_types::HierChange`]), inside the plan's
@@ -23,7 +23,7 @@
 //! LOCK               before the plan's first statement: one structural
 //!                    change of the object at a time (a row of
 //!                    __sprig_hlock, FOR UPDATE, taken by the system on a
-//!                    provisioning connection: decision T27)
+//!                    provisioning connection)
 //! CHANGED (k, ...)   rows inserted or moved in space s: reconcile(x, keys)
 //!                    for every space x below s that inherits through s,
 //!                    top first; from the root space, the child tenants'
@@ -49,7 +49,7 @@
 //!     a path override is upserted
 //! ```
 //!
-//! Across tenants (decision T27, T22's piece 7): a child tenant's levels
+//! Across tenants: a child tenant's levels
 //! keep their own paths the same way. A structural change in a tenant's
 //! root space locks the child tenants below it (as the system), checks
 //! their structure against the new tree (39711, 39712, 39714) and commits;
@@ -75,7 +75,7 @@ use crate::view::{ViewSql, q};
 
 pub mod tenants;
 
-/// The path columns, as chapter 32 names them.
+/// The path columns, as the type layer names them.
 pub const PATH_COLUMNS: [&str; 3] = [HPATH, HDEPTH, RK];
 
 /// The table holding one lock row per hierarchical inheritable object, in
@@ -322,9 +322,8 @@ pub async fn follow(
 
 /// Serializes structural changes of the object: its row of
 /// [`LOCK_TABLE`], `FOR UPDATE`, made on first use, taken by the system on
-/// a provisioning connection until the session's transaction ends
-/// (decision T27), so a user whose grants name single tables is
-/// serialized too.
+/// a provisioning connection until the session's transaction ends,
+/// so a user whose grants name single tables is serialized too.
 ///
 /// # Errors
 /// The backend's (1205 after the lock wait).
@@ -648,8 +647,7 @@ pub(crate) async fn reconcile(
     if differ.is_empty() {
         return Ok((walked, 0));
     }
-    // One reconcile rewrites at most `hierarchy.max_move_rows` rows
-    // (decision T29).
+    // One reconcile rewrites at most `hierarchy.max_move_rows` rows.
     let n = differ.len() as u64;
     if n > ctx.limits.max_move_rows {
         return Err(err_in(
@@ -813,7 +811,7 @@ async fn write(
 }
 
 /// The copy worker's reconcile of a child tenant's paths of `keys` after
-/// a change above it committed (decision T28): one transaction on `r` (a
+/// a change above it committed: one transaction on `r` (a
 /// provisioning connection, physical names) under the tenant's lock, the
 /// root space first, then every space below it that inherits through it.
 /// Returns the rows written.
@@ -834,7 +832,7 @@ pub async fn reconcile_tenant(
     let (row, lock) = lock_sql(schema, res.obj.object_id.0);
     r.exec(&lock_ddl(schema)).await?;
     r.exec(&row).await?;
-    // READ COMMITTED, as a plan's own transaction (T17): the path writes'
+    // READ COMMITTED, as a plan's own transaction: the path writes'
     // INSERT ... SELECT then reads the levels above without share locks,
     // which a writer above holding this tenant's lock could wait behind.
     r.exec(sprig_types::exec::PLAN_ISOLATION).await?;
@@ -926,7 +924,7 @@ pub(crate) async fn after_reset(
 
 /// `ADD HIERARCHY` on an inheritable table (its `ALTER TABLE` adding the
 /// path columns): only from the space that owns every row, inside one
-/// tenant (decision T22, piece 6).
+/// tenant.
 ///
 /// # Errors
 /// 39891.
@@ -997,9 +995,9 @@ pub(crate) async fn before_drop(ctx: &Ctx<'_>, r: &mut dyn Runner, res: &Resolve
 
 /// `ADD HIERARCHY` (`what`) or `DROP HIERARCHY` on an object received
 /// from a parent tenant or shared to child tenants: refused, since child
-/// tenants would hold rows without paths, or paths without a hierarchy
-/// (decision T28). The hierarchy is the top tenant's, declared before the
-/// table is shared to child tenants.
+/// tenants would hold rows without paths, or paths without a hierarchy.
+/// The hierarchy is the top tenant's, declared before the table is shared
+/// to child tenants.
 ///
 /// # Errors
 /// 39891.
@@ -1024,9 +1022,9 @@ pub(crate) fn refuse_tenants(ctx: &Ctx<'_>, o: &InheritableObject, what: &str) -
     Ok(())
 }
 
-/// Whether a share of `o` may be created or changed this way (decisions
-/// T22 and T28): without filters or column lists, which would cut rows or
-/// the path columns out of a space's tree. Child tenants may receive it.
+/// Whether a share of `o` may be created or changed this way: without
+/// filters or column lists, which would cut rows or the path columns out
+/// of a space's tree. Child tenants may receive it.
 ///
 /// # Errors
 /// 39891.

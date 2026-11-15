@@ -69,8 +69,7 @@ mod inherit_types;
 mod inherit_msg;
 // FOR EACH TENANT connections and sinks.
 mod inherit_sinks;
-// Change streams: was an inherited record visible before a change
-// (decision RL64).
+// Change streams: was an inherited record visible before a change.
 pub(crate) mod inherit_probe;
 pub(crate) mod types;
 // Event streams.

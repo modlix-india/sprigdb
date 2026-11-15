@@ -167,15 +167,15 @@ impl LoginService {
         req: &TokenLogin<'_>,
         dcs: &[sprig_common::ids::DcId],
     ) -> Result<(Principal, VerifiedToken), TokenDenied> {
-        let (Some(h), LoginSource::Catalog(c)) = (self.handoff(), self.source()) else {
+        let (Some(handoff), LoginSource::Catalog(logins)) = (self.handoff(), self.source()) else {
             return Err(TokenDenied {
                 reason: "unavailable",
                 error: unavailable(),
             });
         };
-        let start = HandoffStart::of_token(req, h.here.clone());
+        let start = HandoffStart::of_token(req, handoff.here.clone());
         for dc in dcs {
-            let r = h
+            let reply = handoff
                 .peers
                 .login(
                     dc,
@@ -183,8 +183,8 @@ impl LoginService {
                     Zeroizing::new(req.token.as_bytes().to_vec()),
                 )
                 .await;
-            match r {
-                Ok(HandoffResult::Accepted(mut p, token)) => {
+            match reply {
+                Ok(HandoffResult::Accepted(mut principal, token)) => {
                     metrics::counter!("sprig_auth_handoffs_total", "outcome" => "decided")
                         .increment(1);
                     let Some(token) = token else {
@@ -194,8 +194,8 @@ impl LoginService {
                             error: unavailable(),
                         });
                     };
-                    match c.local_backend(&p) {
-                        Some(Ok(b)) => p.backend = b,
+                    match logins.local_backend(&principal) {
+                        Some(Ok(b)) => principal.backend = b,
                         Some(Err(e)) => {
                             tracing::warn!(error = %e, "no backend for a handed-off token login");
                             return Err(TokenDenied {
@@ -205,14 +205,14 @@ impl LoginService {
                         }
                         None => {}
                     }
-                    return Ok((*p, *token));
+                    return Ok((*principal, *token));
                 }
-                Ok(HandoffResult::Refused(e)) => {
+                Ok(HandoffResult::Refused(packet)) => {
                     metrics::counter!("sprig_auth_handoffs_total", "outcome" => "decided")
                         .increment(1);
                     return Err(TokenDenied {
                         reason: "bad_credentials",
-                        error: e,
+                        error: packet,
                     });
                 }
                 Err(e) => {

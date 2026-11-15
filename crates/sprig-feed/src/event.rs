@@ -1,4 +1,4 @@
-//! Change events and feed items (chapter 38, "Interfaces").
+//! Change events and feed items.
 //!
 //! Events name what clients see: the tenant, the logical database and
 //! table names and ids, the shard ids. They never carry physical schema
@@ -37,7 +37,7 @@ pub enum DdlKind {
     Other,
 }
 
-/// The operation of an event (R1: tables only).
+/// The operation of an event (tables only so far).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Op {
     /// A row was inserted.
@@ -110,8 +110,8 @@ pub struct ChangeEvent {
     /// For DDL: the statement with logical names, when it could be
     /// rewritten.
     pub ddl: Option<String>,
-    /// The operation hint of the row's statement (chapter 38, "Statement
-    /// comments"), when its writer sent one: `Replace` on an `Update` is a
+    /// The operation hint of the row's statement comment, when its writer
+    /// sent one: `Replace` on an `Update` is a
     /// whole-document replacement (a MongoDB `replace` event).
     pub hint: Option<sprig_binlog::OpHint>,
 }

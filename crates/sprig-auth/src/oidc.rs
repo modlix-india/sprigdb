@@ -25,8 +25,8 @@
 //! mapping names the account (created when the issuer has `jit_users`);
 //! MongoDB as `MONGODB-OIDC`, like HTTP.
 //!
-//! The verified claims become the session's `SPRIG_CLAIM()` values
-//! (chapter 29), unchanged.
+//! The verified claims become the session's `SPRIG_CLAIM()` values,
+//! unchanged.
 
 pub mod jwks;
 pub mod jwt;

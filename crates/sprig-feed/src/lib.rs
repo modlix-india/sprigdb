@@ -1,9 +1,9 @@
 //! `sprig-feed`: the change feed: change events decoded from the binlog,
 //! merging, resume tokens and subscriptions.
 //!
-//! Layer: 2 operations. Design: [chapter 38](https://github.com/serialcoder13/sprigdb-plan/blob/main/lld/chapters/38-change-feed.md) (Change feed) of the SprigDB low-level design.
+//! Layer: 2 operations.
 //!
-//! R1 serves internal consumers (chapter 48, R1 order 8):
+//! The feed serves internal consumers:
 //!
 //! - [`source`] and [`binlog`]: one cluster's committed transactions for one
 //!   tenant, assembled from `sprig-binlog`'s dump (the mover's reader),
@@ -18,12 +18,12 @@
 //! - [`shared`]: one binlog dump per cluster shared by every tenant's
 //!   tail, for consumers of internal tables (the queue forwarder);
 //! - [`pump`]: a tail read by a task of its own, so a consumer's timers
-//!   can't cancel a read half-way (decision r9-131);
+//!   can't cancel a read half-way;
 //! - [`subs`]: subscriptions and acknowledged positions;
 //! - [`requirements`]: the binlog settings the feed needs (`feed_source`);
 //! - [`hlc`]: stamps and clamps.
 //!
-//! Not yet (later R1 build steps and R5): the shared per-cluster reader
+//! Not yet: the shared per-cluster reader
 //! with its ring and spool, catch-up reader limits, the archive, snapshots,
 //! per-shard subscriptions, `FeedReader/Tail` on 7401, `sprigctl feed`, and
 //! the application transports.

@@ -250,11 +250,10 @@ impl TriggerSpec<'_> {
     }
 
     /// [`TriggerSpec::statements`] for a table whose rows may be layer
-    /// rows of an inheritable table (`layered`, chapter 42). A layer row
-    /// isn't always a new record: writing an override (`_sprig_state =
-    /// 'ovr'`) is an update of an inherited record, and writing a hide
-    /// marker (`'hide'`) is its delete, so they are checked as such
-    /// (decision RL65):
+    /// rows of an inheritable table (`layered`). A layer row isn't always a
+    /// new record: writing an override (`_sprig_state = 'ovr'`) is an update
+    /// of an inherited record, and writing a hide marker (`'hide'`) is its
+    /// delete, so they are checked as such:
     ///
     /// ```text
     /// INSERT of an ovr row              → CHECK(UPDATE)(NEW)
@@ -606,7 +605,7 @@ mod tests {
     }
 
     /// An inheritable table's triggers: overrides and hide markers are
-    /// checked as the update and the delete they are (RL65).
+    /// checked as the update and the delete they are.
     #[test]
     fn layered_triggers_check_markers_as_updates_and_deletes() {
         let pols = [

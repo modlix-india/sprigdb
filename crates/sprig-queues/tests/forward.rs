@@ -142,7 +142,7 @@ async fn forwards_in_the_order_given_and_never_twice() {
     conn.close(0, "done".into()).await.unwrap();
 }
 
-/// A change exchange's publishes (R9 r9feed4): a batch of messages, each
+/// A change exchange's publishes: a batch of messages, each
 /// as its message id, reaches a queue in order and each id once, while the
 /// message waits and after it was consumed (the forward ledger), within a
 /// batch too; a refused message ends the batch; a publish without an id is
@@ -186,7 +186,7 @@ async fn a_batch_of_messages_with_ids_reaches_a_queue_once_each() {
     conn.close(0, "done".into()).await.unwrap();
 }
 
-/// R9 r9feed5: a change exchange's ids (version 8) stay in the forward
+/// A change exchange's ids (version 8) stay in the forward
 /// ledger longer than other ids, so a forwarder that comes back late still
 /// publishes its last changes once: a purge with the general cutoff past
 /// takes the others only, and the change ids still keep their consumed

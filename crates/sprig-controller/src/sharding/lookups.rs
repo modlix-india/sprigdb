@@ -1,5 +1,5 @@
-//! Global lookup indexes in the sharding loop (chapters 13, 16 and 19):
-//! the advisor's proposals and the recovery of stopped builds.
+//! Global lookup indexes in the sharding loop: the advisor's proposals and
+//! the recovery of stopped builds.
 //!
 //! ```text
 //! lookup_tick(tenant), after the groups' ticks:

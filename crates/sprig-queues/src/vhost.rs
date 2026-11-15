@@ -173,8 +173,8 @@ impl ConnVhost {
     /// it has, or ever enqueued (the forward ledger), as for an outbox
     /// forward. The messages for one queue go to its owner in one command,
     /// in order, so the owner checks their ids in one lookup and writes
-    /// them in one batch. A change exchange's publishes (R9 r9feed4): a
-    /// replay after a restart is a no-op.
+    /// them in one batch. A change exchange's publishes: a replay after a
+    /// restart is a no-op.
     ///
     /// The answer has one entry per message, in order, up to the first
     /// that failed (refused, or not confirmed): the queues it reached, or

@@ -1,18 +1,16 @@
-//! Subscriptions and consumer positions (chapter 38, "Subscriptions and
-//! delivery").
+//! Subscriptions and consumer positions.
 //!
 //! An internal consumer registers a named subscription, reads the tenant's
 //! feed, makes a batch's effects durable, then acks the batch's last token.
 //! After a crash it starts after its last ack: delivery is at least once,
 //! and exactly once for a consumer that acks only what it made durable.
 //!
-//! **As built, against the book:** subscriptions and checkpoints live in
-//! the DC tier of etcd (`feed/subs/<tenant>/<name>`,
+//! Subscriptions and checkpoints live in the DC tier of etcd (`feed/subs/<tenant>/<name>`,
 //! `feed/checkpoints/<tenant>/<name>`), not in the tenant catalog's
 //! `feed_subscriptions` and `feed_checkpoints`: acks then keep working
 //! through a move's hold (whose fence renames the catalog), and the tenant
-//! needs no catalog migration. R1 subscriptions are merged, one partition
-//! per tenant.
+//! needs no catalog migration. Subscriptions are merged for now, one
+//! partition per tenant.
 
 use std::sync::Arc;
 
@@ -32,7 +30,7 @@ pub struct Subscription {
     pub name: String,
     /// `ref_follow`, `mover`, `search`, `logic`, `inherit`, `redis`, `sink`.
     pub kind: String,
-    /// `merged` (R1 has no per-shard subscriptions yet).
+    /// `merged` (there are no per-shard subscriptions yet).
     pub ordering: String,
     /// The job, index or function that owns it.
     #[serde(default)]
@@ -127,7 +125,7 @@ impl Subscriptions {
 
     /// Registers a subscription.
     ///
-    /// Residency (chapter 26): the consumers of a DC tier's subscriptions
+    /// Residency: the consumers of a DC tier's subscriptions
     /// decode the tenant's feed in that DC, so a tier whose DC the tenant's
     /// residency doesn't allow refuses the subscription (39507). The
     /// directory is read through this store's etcd (single-etcd mode); a
@@ -161,8 +159,8 @@ impl Subscriptions {
         }
     }
 
-    /// Registers a subscription with its first checkpoint, `token` (R9,
-    /// r9fanin): a consumer that starts later reads from `token`, not from
+    /// Registers a subscription with its first checkpoint, `token`: a
+    /// consumer that starts later reads from `token`, not from
     /// its own start. A subscription made before its first event commits
     /// then misses none of them.
     ///
@@ -344,7 +342,7 @@ impl Subscriptions {
     }
 
     /// Sets a subscription's state (`active` or `paused`); `false` when
-    /// there is none. Chapter 26's residency loop pauses subscriptions in
+    /// there is none. The residency loop pauses subscriptions in
     /// DCs the tenant may no longer be read in.
     ///
     /// # Errors
@@ -458,7 +456,7 @@ mod tests {
         assert!(subs.ack(t, "search:1:a", &tok, 1, 13).await.is_err());
     }
 
-    /// r9fanin: a subscription registered with its start position has that
+    /// A subscription registered with its start position has that
     /// checkpoint at once (before, a consumer started "now", after the
     /// first events); a second registration changes nothing.
     #[tokio::test]

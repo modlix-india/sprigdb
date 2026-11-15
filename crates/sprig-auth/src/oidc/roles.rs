@@ -163,16 +163,20 @@ pub fn audit_login(
         return None;
     };
     let unknown = of_names(state, &token.roles).1;
-    let taken: Vec<&str> = token
+    let defined: Vec<&str> = token
         .roles
         .iter()
         .filter(|n| !unknown.contains(n))
         .map(String::as_str)
         .collect();
-    success.detail = Some(if taken.is_empty() {
+    success.detail = Some(if defined.is_empty() {
         format!("issuer {}", token.issuer)
     } else {
-        format!("issuer {}; token roles {}", token.issuer, taken.join(", "))
+        format!(
+            "issuer {}; token roles {}",
+            token.issuer,
+            defined.join(", ")
+        )
     });
     if unknown.is_empty() {
         return None;

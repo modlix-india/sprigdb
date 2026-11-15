@@ -634,7 +634,7 @@ mod tests {
     }
 
     // Captured from MySQL 8.4.11 and MariaDB 11.8 on 15 November 2026
-    // (SQLancer found it, r1diff GR8): `CREATE UNIQUE INDEX i0 ON t1(c0)
+    // (SQLancer found it): `CREATE UNIQUE INDEX i0 ON t1(c0)
     // INVISIBLE` where `c0` is NOT NULL and t1 has no primary key.
     #[test]
     fn an_invisible_primary_key_reads_mysql() {

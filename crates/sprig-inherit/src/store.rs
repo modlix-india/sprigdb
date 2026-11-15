@@ -1,19 +1,18 @@
-//! The `inherit` catalog module (chapter 42, "Catalog tables"; build step
-//! 1): `spaces`, `inheritable_objects`, `shares` and `space_homes` in
-//! `t<tenant>_sprig`, their migration, the snapshot loader
-//! ([`InheritExtension`]) and the writes the extension statements make
+//! The `inherit` catalog module: `spaces`, `inheritable_objects`, `shares`
+//! and `space_homes` in `t<tenant>_sprig`, their migration, the snapshot
+//! loader ([`InheritExtension`]) and the writes the extension statements make
 //! ([`InheritChange`]).
 //!
-//! Like chapter 32's `types` module, the tables are versioned with the
+//! Like the type layer's `types` module, the tables are versioned with the
 //! catalog version and reloaded whole into every snapshot (they are small).
 //! A catalog bootstrapped before the module has no tables; the first
 //! extension statement migrates it ([`migrate`]).
 //!
-//! Differences from the chapter's tables, all additive: `shares.name`
+//! Beyond the core columns, all additive: `shares.name`
 //! (shares are named in SQL), `inheritable_objects.columns` (the column
 //! order of the merged view) and `unique_keys` (the user `UNIQUE` keys as
 //! declared, before `_sprig_space` widened them), and `space_homes` for
-//! chapter 14's `users.home_space_id`, which the auth catalog doesn't have
+//! `users.home_space_id`, which the auth catalog doesn't have
 //! yet.
 
 use std::collections::BTreeMap;
@@ -37,7 +36,7 @@ use crate::model::{
 /// The module name.
 pub const MODULE: &str = "inherit";
 
-/// `spaces` (chapter 42).
+/// `spaces`.
 pub const DDL_SPACES: &str = "CREATE TABLE IF NOT EXISTS spaces (
   space_id          BIGINT UNSIGNED NOT NULL,
   name              VARCHAR(64)     NOT NULL,
@@ -56,7 +55,7 @@ pub const DDL_SPACES: &str = "CREATE TABLE IF NOT EXISTS spaces (
   KEY k_path (path)
 ) ENGINE=InnoDB";
 
-/// `inheritable_objects` (chapter 42).
+/// `inheritable_objects`.
 pub const DDL_OBJECTS: &str = "CREATE TABLE IF NOT EXISTS inheritable_objects (
   object_id         BIGINT UNSIGNED NOT NULL,
   model             ENUM('table','collection','kv') NOT NULL,
@@ -75,7 +74,7 @@ pub const DDL_OBJECTS: &str = "CREATE TABLE IF NOT EXISTS inheritable_objects (
   PRIMARY KEY (object_id)
 ) ENGINE=InnoDB";
 
-/// `shares` (chapter 42).
+/// `shares`.
 pub const DDL_SHARES: &str = "CREATE TABLE IF NOT EXISTS shares (
   share_id          BIGINT UNSIGNED NOT NULL,
   role              ENUM('granted','received') NOT NULL,
@@ -103,7 +102,7 @@ pub const DDL_SHARES: &str = "CREATE TABLE IF NOT EXISTS shares (
   KEY k_from (object_id, from_space_id)
 ) ENGINE=InnoDB";
 
-/// `space_homes`: users' home spaces (chapter 14's `home_space_id`).
+/// `space_homes`: users' home spaces (`home_space_id`).
 pub const DDL_HOMES: &str = "CREATE TABLE IF NOT EXISTS space_homes (
   user_id           INT UNSIGNED    NOT NULL,
   space_id          BIGINT UNSIGNED NOT NULL,
@@ -111,7 +110,7 @@ pub const DDL_HOMES: &str = "CREATE TABLE IF NOT EXISTS space_homes (
   PRIMARY KEY (user_id)
 ) ENGINE=InnoDB";
 
-/// `inherit_ext` (format 2, Kiran's decisions of 11 November 2026): per
+/// `inherit_ext` (format 2): per
 /// object, the `AUTO_INCREMENT` column, the foreign keys the gateway keeps
 /// and whether SprigDB created the object from its parent tenant's, as
 /// JSON ([`crate::model::ObjectExt`]).

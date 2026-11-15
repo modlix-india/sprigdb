@@ -1,8 +1,8 @@
-//! The keys of inherited messaging objects (chapter 42, "Configuration",
-//! the R9 rows), and the cross-tenant publishing keys of chapters 45, 50
-//! and 26 that the same code reads: `stream.descendant_publish`,
-//! `stream.descendant_key`, `queue.descendant_publish`,
-//! `queue.descendant_key` and `residency.cross_tenant_messaging_strict`.
+//! The keys of inherited messaging objects, and the cross-tenant publishing
+//! keys of streams, queues and data residency that the same code reads:
+//! `stream.descendant_publish`, `stream.descendant_key`,
+//! `queue.descendant_publish`, `queue.descendant_key` and
+//! `residency.cross_tenant_messaging_strict`.
 
 use std::borrow::Cow;
 

@@ -1,5 +1,5 @@
-//! `ViewBuilder` for tables (chapter 42, "The merged view"; build step 4):
-//! the SQL of a space's merged view of an object, one CTE level per edge.
+//! `ViewBuilder` for tables: the SQL of a space's merged view of an object, one
+//! CTE level per edge.
 //!
 //! ```text
 //! level 0, no upstream:   own and orphan rows of the top space
@@ -13,7 +13,7 @@
 //! ```
 //!
 //! MariaDB has no `FULL OUTER JOIN`, so the overlay is a `LEFT JOIN` plus a
-//! `NOT EXISTS` branch, as in the chapter. Key predicates (writes, orphaning)
+//! `NOT EXISTS` branch. Key predicates (writes, orphaning)
 //! are pushed into every level, because the key is the same at all levels.
 //! Share filters apply to the parent level's merged values, before the
 //! child's layer; unshared fields come down as `NULL`.
@@ -134,7 +134,7 @@ const ORIGIN: &str = "`_sprig_o`";
 
 /// The alias of every layer-table reference inside a merged view. The gateway's row-level
 /// security rewrite leaves references under it alone and filters the merged
-/// records instead (chapter 29, "Data inheritance"): a filter on each layer
+/// records instead: a filter on each layer
 /// row would drop an override or a hide marker and show the parent's values.
 /// Clients can't write it: a statement naming a `__sprig_` name never
 /// reaches the inheritance layer, so a reference under this alias in a
@@ -380,8 +380,8 @@ impl ViewSql<'_> {
     }
 
     /// The names of [`ViewSql::view`]'s columns, quoted and listed (a
-    /// query over the view names them rather than `*`: chapter 29's swap
-    /// refuses `*` beside an all-columns policy view).
+    /// query over the view names them rather than `*`: the row-level
+    /// security swap refuses `*` beside an all-columns policy view).
     #[must_use]
     pub fn output_columns(&self) -> String {
         let mut cols = self.o.columns.iter().map(|c| q(c)).collect::<Vec<_>>();
@@ -488,7 +488,7 @@ mod tests {
             derived: Vec::new(),
         };
         let sql = v.view(&chain());
-        // Every layer reference is under LAYER_ALIAS (the chapter's `c`).
+        // Every layer reference is under LAYER_ALIAS (`c`).
         let golden = |s: &str| {
             s.replace("c.`", "`__sprig_lyr`.`")
                 .replace("`products` c ", "`products` `__sprig_lyr` ")

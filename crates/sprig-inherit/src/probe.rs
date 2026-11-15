@@ -1,5 +1,5 @@
 //! Whether a change stream's subscriber could see a record just before a
-//! change (decision RL64): a change stream sends a `delete` for a record
+//! change: a change stream sends a `delete` for a record
 //! that left the subscriber's view only when the record was in it before.
 //!
 //! A change touches one row: a layer row of a space on the subscriber's
@@ -60,7 +60,7 @@ pub struct Probe {
     /// The changed row's columns, for a change without a before image.
     pub columns: Vec<String>,
     /// The stream counts this change by its copy's handover
-    /// ([`crate::handover`], RL71), whatever the view reads now: the
+    /// ([`crate::handover`]), whatever the view reads now: the
     /// record before is taken through the tenant edge as its copy holds
     /// or its share view reads it, the copy taken as serving.
     pub counted: bool,
@@ -247,7 +247,7 @@ fn reads_in(chain: &Chain, source: &Source) -> bool {
 /// Whether the session's merged view of `table` reaches the parent tenant
 /// through its tenant edge (the edge's copy, serving or not, or its share
 /// view), with no materialized share inside the tenant cutting it first:
-/// the changes a copy's handover decides (RL71). `db`: the logical
+/// the changes a copy's handover decides. `db`: the logical
 /// database.
 ///
 /// # Errors
@@ -279,7 +279,7 @@ pub fn through_tenant_edge(ctx: &Ctx<'_>, db: &str, table: &str) -> Result<bool>
 /// cases [`visible_before`] answers `None` for, without its query): a
 /// change stream sends nothing for a change its subscriber's view doesn't
 /// read, such as a parent tenant's change while a copy serves it, or a
-/// copy's while it is seeded (decision RL69). `db`: the logical database.
+/// copy's while it is seeded. `db`: the logical database.
 ///
 /// # Errors
 /// The chain's.
@@ -444,7 +444,7 @@ pub async fn visible_before(
             let Top::Upstream { from, columns, .. } = &mut chain.top else {
                 return Ok(None);
             };
-            // Through the edge's copy (a counted change, RL71): the row put
+            // Through the edge's copy (a counted change): the row put
             // back is a live copy row of the edge, as its condition reads.
             let copy_cols = if from.contains("__sprig_ih_") {
                 format!(

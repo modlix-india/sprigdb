@@ -32,7 +32,7 @@
 //! writes there must be read from before the move's cutover, so the job
 //! reads every cluster of the DC all the time, not only those holding the
 //! graph now. Each reader is a subscription to the worker's shared reader
-//! (R9, r9feed3; [`sprig_feed::shared`]): one binlog dump per cluster and
+//! ([`sprig_feed::shared`]): one binlog dump per cluster and
 //! worker, however many tenants have mirrors. Its view ([`shared_view`])
 //! keeps the edge tables only, so the job isn't handed the rest of its
 //! tenant's writes (a whole-tenant view had it detached from the reader

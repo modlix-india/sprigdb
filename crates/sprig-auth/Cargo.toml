@@ -20,7 +20,7 @@ async-trait.workspace = true
 base64.workspace = true
 bytes.workspace = true
 getrandom.workspace = true
-# External tokens (chapter 14 step 16): issuers' key sets are fetched with
+# External tokens: issuers' key sets are fetched with
 # hyper over HTTP/1.1, rustls and the Mozilla roots (webpki-roots 1.x, as
 # sprig-ai and sprig-approvals use; CDLA-Permissive-2.0), and claim mappings
 # match with regex (MIT or Apache-2.0). All already in the tree.

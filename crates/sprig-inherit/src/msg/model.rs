@@ -14,19 +14,19 @@ use sprig_common::ids::TenantId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DefKind {
-    /// A stream (chapter 45).
+    /// A stream.
     Stream,
-    /// An exchange (chapter 50).
+    /// An exchange.
     Exchange,
-    /// A queue (chapter 50).
+    /// A queue.
     Queue,
-    /// A binding between two inherited objects (chapter 50).
+    /// A binding between two inherited objects.
     Binding,
-    /// A trigger on an inherited stream or queue (chapter 41).
+    /// A trigger on an inherited stream or queue.
     Trigger,
-    /// A connection (chapter 51).
+    /// A connection.
     Connection,
-    /// A sink (chapter 51).
+    /// A sink.
     Sink,
 }
 
@@ -457,7 +457,7 @@ impl MsgState {
 
     /// The definitions still `active` in database `db` (every kind), by
     /// kind and name: what keeps `DROP DATABASE db` refused in the
-    /// declarer (39895; the lead's choice on r9fet3's question 1). A
+    /// declarer (39895). A
     /// definition in its drop grace doesn't count: it is already dropped
     /// for its declarer.
     #[must_use]
@@ -585,8 +585,8 @@ impl Chain {
     }
 
     /// The effective value of `what` (and settings key `key`) for the
-    /// member's instance of `def`, nearest level first (chapter 42,
-    /// "Overrides: nearest level wins"):
+    /// member's instance of `def`, nearest level first (the
+    /// nearest level wins):
     ///
     /// 1. an override targeting the member alone, or the member's own
     ///    subtree override: the member's own catalog first, then the
@@ -715,8 +715,7 @@ pub fn grant_items(v: Option<&Value>) -> Vec<GrantItem> {
         .unwrap_or_default()
 }
 
-/// Kind-specific declaration of an exchange definition (chapter 50,
-/// "Inherited exchanges, queues and bindings").
+/// Kind-specific declaration of an exchange definition.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ExchangeSpec {
     /// `direct`, `fanout`, `topic`, `headers` or `x-delayed-message`.
@@ -773,8 +772,8 @@ fn yes() -> bool {
     true
 }
 
-/// The queue arguments a member may override (chapter 42, "What can be
-/// overridden"; the ones a policy of the vhost could set).
+/// The queue arguments a member may override (the ones a policy of the
+/// vhost could set).
 pub const QUEUE_OVERRIDABLE: &[&str] = &[
     "x-message-ttl",
     "x-expires",

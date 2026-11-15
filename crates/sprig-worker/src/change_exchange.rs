@@ -6,9 +6,9 @@
 //! ```text
 //! the subscription's owner_ref: {db, table, object, exchange, user}
 //! tail the tenant's feed from the subscription's checkpoint, through the
-//!   worker's shared reader (one binlog dump per cluster, R9 r9feed3)
+//!   worker's shared reader (one binlog dump per cluster)
 //! each round: the first item waited for (up to 1 s), then every item
-//!   already read, up to ROUND (R9 r9feed4: batches)
+//!   already read, up to ROUND
 //!   the round's changes of the table (insert, update, delete; DDL and
 //!   truncate too): the user who set the exchange (`user`) may see them?
 //!     its policies don't bind the user: SELECT on the table decides
@@ -31,7 +31,7 @@
 //!   ledger, as an outbox forward), so a change published again after a
 //!   restart (the checkpoint moves after what was published, at most every
 //!   second) or a retried publish that went through is a no-op: exactly
-//!   once, in commit order (R9 r9feed4, decision 152)
+//!   once, in commit order
 //! the tail is read by a task of its own (sprig_feed::pump), so the loop's
 //!   1 s housekeeping wait never cancels a read half-way
 //! the job ends when the subscription is dropped (checked every 5 s)
@@ -337,7 +337,7 @@ fn feed_of(tail: TenantTail) -> Feed {
 const AHEAD: usize = ROUND;
 
 /// Feed items in one round at most: the first one waited for, the rest
-/// already read (R9 r9feed4).
+/// already read.
 const ROUND: usize = 4096;
 
 /// Publishes in one `SinkSql` request at most.
@@ -375,7 +375,7 @@ async fn round(
 /// check: 100 ms more each time, at most 1 s. Retries are safe (each
 /// change's message id is taken once), and a forwarder that waits long
 /// after its gateway came back falls behind the shared reader far enough
-/// to need a catch-up dump (R9 r9feed4).
+/// to need a catch-up dump.
 fn retry_wait(attempt: u32) -> Duration {
     Duration::from_millis(100 * u64::from(attempt.clamp(1, 10)))
 }
@@ -590,7 +590,7 @@ async fn serve(env: &LogicEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
     let tail = TenantTail::start(
         tenant,
         start,
-        // R9 (r9feed3): through the worker's shared reader.
+        // Through the worker's shared reader.
         Arc::clone(&env.feed),
         Arc::new(MetaPlacement::new(Arc::clone(&env.dc))),
         Arc::new(CatalogResolver::new(Arc::new(crate::logic::Catalogs(

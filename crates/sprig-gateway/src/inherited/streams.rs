@@ -194,7 +194,7 @@ pub async fn ensure(
         // dropped before the creation and the triggers, which take their
         // own from the same pool (4 per cluster). Held across them, one
         // publish needed 3 at once and failed with 39070 ("catalog begin
-        // timed out") whenever two were busy elsewhere (fetfix).
+        // timed out") whenever two were busy elsewhere.
         let mut conn = ep.pool.get_conn().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;

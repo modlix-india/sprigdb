@@ -589,7 +589,7 @@ impl LiveEnv {
 
     /// Tails read through `feed`: the worker's shared reader keeping each
     /// tenant whole, one binlog dump per cluster however many trees and
-    /// members (R9, r9feed3).
+    /// members.
     #[must_use]
     pub fn with_feed(mut self, feed: Arc<dyn Clusters>) -> Self {
         self.feed = feed;

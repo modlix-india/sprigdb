@@ -1,4 +1,4 @@
-//! Chapter 42 through a running gateway (R6 order 2, read-through, single
+//! Data inheritance through a running gateway (read-through, single
 //! cluster): a three-level tenant tree with spaces inside each tenant,
 //! random writes at random layers checked against the Rust reference model
 //! after every statement, schema changes while an object is shared
@@ -15,9 +15,8 @@
 //! controller's `inherit` loop would give the tree a copy worker, which
 //! orphans overrides across tenants while the read-through model expects
 //! them hidden, and keeps copying while the materialized test has stopped
-//! its own worker (R6 round 5: both tests fail that way,
-//! deterministically, and pass without one). They check that themselves
-//! (R6 round 6, decision T1): when the deployment's etcd
+//! its own worker (both tests fail that way, deterministically, and pass
+//! without one). They check that themselves: when the deployment's etcd
 //! (`SPRIG_TEST_ETCD`; no default) has a live worker
 //! that takes `other` jobs, or the tree has an `inherit_copy` job that
 //! isn't finished, they say so and skip (and fail under
@@ -74,8 +73,7 @@ fn endpoints(test: &str) -> Option<Vec<String>> {
 /// Variable `var`, or `None` after saying the test skips (fails under
 /// `SPRIG_TEST_STRICT=1`). For a test's connections outside the gateway
 /// (its etcd, a root login on the node): they have no default, so a run
-/// against a private deployment never reaches the shared dev stack
-/// (R9 r9feed4).
+/// against a private deployment never reaches the shared dev stack.
 fn needs(test: &str, var: &str) -> Option<String> {
     let v = std::env::var(var).ok().filter(|v| !v.trim().is_empty());
     if v.is_none() {
@@ -376,7 +374,7 @@ async fn teardown(conns: &mut [Conn], db: &str, p: &str, t: &[String]) {
 }
 
 /// Skips (`true`) when a worker process could copy the tree (module
-/// docs, decision T1).
+/// docs).
 async fn worker_copies_the_tree(test: &str) -> bool {
     match Box::pin(copyw::tree_copier(&tenants()[0])).await {
         Ok(None) => false,
@@ -410,7 +408,7 @@ async fn merged_views_match_the_model() {
     model_run(&eps, None).await;
 }
 
-/// Chapter 42's reference-model workload. With a worker, every share is
+/// The reference-model workload. With a worker, every share is
 /// materialized (`inherit.merge = materialized`), the copy worker runs in
 /// this process, and after each write the test waits until every space's
 /// view equals the model (the copies converged), measuring how long that
@@ -1061,9 +1059,9 @@ async fn schema_metadata() {
     }
 }
 
-/// Decision I7 moved: a share the gateway's snapshot doesn't show yet (one
+/// A share the gateway's snapshot doesn't show yet (one
 /// committed by another session an instant earlier) still blocks a
-/// destructive change, because chapter 21's prepare phase checks the
+/// destructive change, because the DDL engine's prepare phase checks the
 /// catalog under its lock. The "other session" here writes the share row
 /// straight into the catalog, so no version moves and the gateway's
 /// snapshot (and its early check) can't see it.
@@ -1074,7 +1072,7 @@ async fn prepare_phase_sees_a_share_the_snapshot_missed() {
     };
     let test = "prepare_phase_sees_a_share_the_snapshot_missed";
     // A root login on the tenant's node, and the deployment's etcd: no
-    // defaults (R9 r9feed4; before, root on the shared dev node 13301).
+    // defaults (before, root on the shared dev node 13301).
     let (Some(dsn), Some(_)) = (
         needs(test, "SPRIG_TEST_R6I_ROOT_DSN"),
         needs(test, "SPRIG_TEST_ETCD"),
@@ -1155,7 +1153,7 @@ async fn prepare_phase_sees_a_share_the_snapshot_missed() {
     eprintln!("{checked} destructive statements refused in the prepare phase (39895)");
 }
 
-/// The copy worker in this process (chapter 42, "Materialized copies"):
+/// The copy worker for materialized copies, in this process:
 /// sprig-worker's `serve` loop over the live feeds, catalogs and clusters,
 /// with the same etcd and clusters as the gateway under test.
 mod copyw {
@@ -1181,7 +1179,7 @@ mod copyw {
     }
 
     /// Why a worker process could copy the tree rooted at `root_name`, or
-    /// `None` (decision T1): a live worker of the DC with slots for
+    /// `None`: a live worker of the DC with slots for
     /// `other` jobs (the class of `inherit_copy`), or an `inherit_copy` job
     /// of the tree that isn't finished.
     pub(crate) async fn tree_copier(root_name: &str) -> Result<Option<String>, String> {
@@ -1288,7 +1286,7 @@ mod copyw {
                 registry,
                 Arc::clone(&pools),
             ));
-            // Through a shared reader, as the worker reads (R9, r9feed3).
+            // Through a shared reader, as the worker reads.
             let shared = sprig_feed::shared::SharedFeed::new(
                 Arc::clone(&clusters) as Arc<dyn sprig_feed::Clusters>,
                 sprig_feed::shared::SharedOpts::default(),

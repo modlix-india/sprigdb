@@ -1,5 +1,4 @@
-//! Children receive the tables their parent shares (Kiran's decisions 1
-//! and 2, 11 November 2026; decision IG3).
+//! Children receive the tables their parent shares.
 //!
 //! A child tenant no longer declares the tables it inherits. Before a
 //! statement of a tenant whose parent shares it anything, the gateway
@@ -129,8 +128,8 @@ pub fn wanted(parent: &TenantCatalog, child: &TenantCatalog, lctn: bool) -> Vec<
 }
 
 /// Columns and indexes a child's table keeps from its parent's: the
-/// layer columns, and a record hierarchy's paths and their index (decision
-/// T28; `_sprig_rk` is both).
+/// layer columns, and a record hierarchy's paths and their index
+/// (`_sprig_rk` is both).
 fn is_layer_column(name: &str) -> bool {
     matches!(
         name,

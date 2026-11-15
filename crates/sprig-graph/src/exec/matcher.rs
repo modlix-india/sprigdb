@@ -3216,7 +3216,7 @@ const JOIN_ROWS_MAX: usize = 160;
 /// messages: 5.3 ms in MariaDB against 2.4 ms for the plain join and the
 /// gateway's 0.8 ms; IC9's 128-friend chunks: 0.6 s against 0.2 s), as
 /// it orders by JSON values twice joined. Answers are the same either way
-/// (`tests/check.sh` of r8perf: 180 mixed-type top-k queries).
+/// (checked with 180 mixed-type top-k queries).
 const SQL_TOP_K: bool = false;
 
 /// [`JOIN_FAR_MAX`] for a hop that reads only the best far nodes of a

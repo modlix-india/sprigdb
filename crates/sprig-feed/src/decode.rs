@@ -1,19 +1,19 @@
-//! Table decoding (chapter 38, "Decoding", "Filtering" rule 4).
+//! Table decoding (the tail's filter rule 4).
 //!
 //! A row change becomes a key, a full before and after image and, for
 //! updates, the changed columns. Internal columns (`_sprig_*`, `_v`, and
 //! `my_row_id` unless it is the only key) are removed first; an update
 //! whose remaining images are equal is dropped, so back-fills of internal
-//! columns produce no events, unless it changed chapter 42's layer
+//! columns produce no events, unless it changed the inheritance layer
 //! columns (`_sprig_state`, `_sprig_ovr`), which change what descendant
 //! spaces see.
 //!
-//! A row of a materialized copy (chapter 42: a table with a `_sprig_live`
+//! A row of a materialized copy (a table with a `_sprig_live`
 //! column, `__sprig_ih_<object>`) is decoded by its liveness, since a
 //! tombstone is a removed record: a row becoming live is an insert, a live
 //! row becoming a tombstone a delete (with the live row as its before
 //! image), a live row changing an update, and a tombstone written, changed
-//! or purged nothing (decision RL69).
+//! or purged nothing.
 
 use sprig_binlog::RowImage;
 use sprig_common::names::is_internal_column;
@@ -70,7 +70,7 @@ fn key(shape: &TableShape, img: &RowImage) -> Image {
 }
 
 /// Whether an update changed an inheritable object's layer columns
-/// (`_sprig_state`, `_sprig_ovr`; chapter 42): a hide marker or an orphan
+/// (`_sprig_state`, `_sprig_ovr`): a hide marker or an orphan
 /// can change what descendants see without changing a visible value, so
 /// such an update is kept (with an empty delta) for the copy worker.
 fn layer_changed(row: &RawRow) -> bool {
@@ -85,7 +85,7 @@ fn layer_changed(row: &RawRow) -> bool {
         .any(|(i, _)| b.get(i) != a.get(i))
 }
 
-/// A materialized copy's liveness column (chapter 42).
+/// A materialized copy's liveness column.
 const LIVE: &str = "_sprig_live";
 
 /// Whether `img`'s `_sprig_live` (column `i`) is true.
@@ -255,7 +255,7 @@ mod tests {
             hint: None,
         };
         assert_eq!(decode_row(&upd).unwrap().delta, Some(vec!["v".to_owned()]));
-        // Chapter 42: a hide marker over an override with the same values.
+        // A hide marker over an override with the same values.
         let layer = Arc::new(TableShape {
             schema: "t1_d1_g1_s1".into(),
             table: "p".into(),

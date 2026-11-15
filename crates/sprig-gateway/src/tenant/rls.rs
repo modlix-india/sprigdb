@@ -24,7 +24,7 @@
     clippy::too_many_arguments,
     clippy::format_push_string,
     clippy::too_many_lines
-)] // pedantic style: names follow the chapter's pseudocode
+)] // pedantic style lints
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};

@@ -27,10 +27,10 @@
 //! ```
 //!
 //! Optional: `SPRIG_TEST_RLSI_WORKER_PID` (materialized mode: the worker
-//! is stopped for a few seconds, so a copy lags; RL69), and
+//! is stopped for a few seconds, so a copy lags), and
 //! `SPRIG_TEST_RLSI_RESTART`, a command taking `kill9`, `term` or `all`
 //! that restarts the gateway (`kill -9`, a clean stop) or every process,
-//! for [`share_views_survive_restarts`] (RL68), with
+//! for [`share_views_survive_restarts`], with
 //! `SPRIG_TEST_RLSI_RAW` (`host:port` of the tenants' MariaDB, user
 //! `root`, password `SPRIG_TEST_RLSI_RAW_PW`) and
 //! `SPRIG_TEST_RLSI_TENANT_IDS` (`a,b,c`) to check the views' definers and
@@ -205,7 +205,7 @@ fn policies(t: usize) -> Vec<&'static str> {
         "CREATE POLICY p_alice ON docs FOR SELECT, UPDATE, DELETE TO alice USING (owner = 'alice')",
         // No INSERT policy: an UPDATE or DELETE of an inherited record
         // writes an override or a hide marker, which MariaDB's triggers
-        // check with UPDATE's and DELETE's policies (RL65).
+        // check with UPDATE's and DELETE's policies.
         "CREATE POLICY p_bob ON docs FOR SELECT, UPDATE, DELETE TO bob USING (owner = 'bob')",
     ];
     match t {
@@ -750,9 +750,9 @@ async fn no_read_path_returns_an_inherited_row_a_policy_hides() {
         let view = &views[level];
         for user in USERS.iter().copied().chain(["app"]) {
             for (p, must) in PATHS {
-                // The REST API doesn't take a space (chapter 42's
-                // `Sprig-Space` isn't built): it reads the home space's
-                // view, `b`'s root at `b1`.
+                // The REST API doesn't take a space (`Sprig-Space` isn't
+                // built): it reads the home space's view, `b`'s root at
+                // `b1`.
                 let view = if matches!(p, Path::Http) && level == 2 {
                     &views[1]
                 } else {
@@ -805,7 +805,7 @@ async fn no_read_path_returns_an_inherited_row_a_policy_hides() {
     );
     assert!(wrong.is_empty(), "wrong answers:\n{}", wrong.join("\n"));
 
-    // RL66: a DELETE inside a transaction on the shared record hierarchy
+    // A DELETE inside a transaction on the shared record hierarchy
     // (it failed with 1305, `SAVEPOINT sprig_types does not exist`, with or
     // without policies).
     for (level, user, id) in [
@@ -830,7 +830,7 @@ async fn no_read_path_returns_an_inherited_row_a_policy_hides() {
         );
     }
 
-    // RL65: an UPDATE or DELETE of an inherited record is governed by the
+    // An UPDATE or DELETE of an inherited record is governed by the
     // UPDATE and DELETE policies, never INSERT's. `wdocs` in b, shared to
     // b1; alice writes at b1, where every record is inherited.
     write_combinations(&f, &mut app[1], &format!("rlsi_{tag}{pid}_wb")).await;
@@ -936,7 +936,7 @@ async fn no_read_path_returns_an_inherited_row_a_policy_hides() {
 
     drop((s_alice, s_eve, s_bob_b));
 
-    // RL64: a delete reaches a subscriber only for a record it could see.
+    // A delete reaches a subscriber only for a record it could see.
     // In a, alice's records 60-63; c gives 60 to bob and hides 61, then a
     // deletes 60, 61 and 62 and c gives 63 to bob. alice at c saw 62 and 63
     // only, so she gets their deletes and nothing of 60 or 61 (before,
@@ -994,7 +994,7 @@ async fn no_read_path_returns_an_inherited_row_a_policy_hides() {
         "alice@c got events of records she never saw: {ka:?}"
     );
     // Materialized, c reads a's records through its copy: the delete of
-    // 62 comes from the copy's tombstone (RL69), a's own event while the
+    // 62 comes from the copy's tombstone, a's own event while the
     // copy serves sending nothing.
     assert_eq!(
         deleted,
@@ -1004,7 +1004,7 @@ async fn no_read_path_returns_an_inherited_row_a_policy_hides() {
     assert!(ke.is_empty(), "eve@c got events: {ke:?}");
     drop((s_alice, s_eve));
 
-    // RL69: with materialized edges, the copy's changes reach change
+    // With materialized edges, the copy's changes reach change
     // streams, and a's own changes, which c's view doesn't read while the
     // copy serves, send nothing. The worker (which keeps the copies) is
     // stopped while a deletes 70, updates 71 and inserts 73, so the copy
@@ -1058,7 +1058,7 @@ fn ops_by_key(v: &[(String, i64)]) -> BTreeMap<i64, Vec<String>> {
     out
 }
 
-/// RL69's lagging copy (materialized mode); needs the worker's pid in
+/// A lagging copy (materialized mode); needs the worker's pid in
 /// `SPRIG_TEST_RLSI_WORKER_PID` (it is stopped with `SIGSTOP` for a few
 /// seconds), else skipped.
 async fn lagging_copy(f: &Fixture<'_>, app_a: &mut mysql_async::Conn) {
@@ -1146,7 +1146,7 @@ async fn materialized(c: &mut mysql_async::Conn, sql: &str) {
     must(c, "SPRIG RESET inherit.merge").await;
 }
 
-/// RL71: exactly once across a copy's flips. Table `fdocs` is shared
+/// Exactly once across a copy's flips. Table `fdocs` is shared
 /// `a > b > c`, both edges materialized, and `alice` at `c` watches it.
 /// Each cycle flips a copy while `a` and `b` write, every 200 ms for 4 s:
 /// `a` inserts a new record, updates one of its first 20 and deletes one
@@ -1334,8 +1334,9 @@ async fn flips(f: &Fixture<'_>, app: &mut [mysql_async::Conn]) {
     );
 }
 
-/// RL65's policy combinations: `alice` at `b1` updates and deletes records
-/// she inherits from `b`, under each set of policies on `wdocs`.
+/// Policy combinations for inherited records: `alice` at `b1` updates and
+/// deletes records she inherits from `b`, under each set of policies on
+/// `wdocs`.
 async fn write_combinations(f: &Fixture<'_>, app_b: &mut mysql_async::Conn, share: &str) {
     for q in [
         "CREATE TABLE wdocs (id INT PRIMARY KEY, owner VARCHAR(20) NOT NULL, body VARCHAR(20) \
@@ -1514,8 +1515,8 @@ impl Raw {
         out
     }
 
-    /// Every share view of `b` and `c` runs as its parent's share definer
-    /// (RL70), which may read only the parent's relations.
+    /// Every share view of `b` and `c` runs as its parent's share definer,
+    /// which may read only the parent's relations.
     async fn check_definers(&mut self, when: &str) {
         for t in [1, 2] {
             let views = self.share_views(t).await;
@@ -1559,7 +1560,7 @@ impl Raw {
         }
     }
 
-    /// What a build before RL68 did: `c`'s share views run as one of `c`'s
+    /// What older builds did: `c`'s share views run as one of `c`'s
     /// accounts.
     async fn move_to_child(&mut self) {
         let child: String = self
@@ -1659,15 +1660,14 @@ async fn read_inherited(e: &Env, db: &str) -> Result<(), Vec<String>> {
     Err(errs)
 }
 
-/// RL68 and RL70: read-through share views keep working across gateway
-/// restarts (`kill -9`, a clean stop) and a restart of every process, and
-/// when the users who made the shares are dropped: they run as the
-/// parent's share definer, never a user's account. A share view an older
-/// build left with another definer (the share's dropped creator: every
-/// read failing with 1449; the child's account: 1356) is re-pointed at the
-/// gateway's start, and by the drift sweep while it runs
-/// (`SPRIG_TEST_RLSI_SWEEP_SECS`: the deployment's
-/// `auth.reconcile_interval_seconds`).
+/// Read-through share views keep working across gateway restarts
+/// (`kill -9`, a clean stop) and a restart of every process, and when the
+/// users who made the shares are dropped: they run as the parent's share
+/// definer, never a user's account. A share view an older build left with
+/// another definer (the share's dropped creator: every read failing with
+/// 1449; the child's account: 1356) is re-pointed at the gateway's start,
+/// and by the drift sweep while it runs (`SPRIG_TEST_RLSI_SWEEP_SECS`:
+/// the deployment's `auth.reconcile_interval_seconds`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn share_views_survive_restarts() {
     let Some(e) = env() else {
@@ -1699,8 +1699,7 @@ async fn share_views_survive_restarts() {
         "INSERT INTO docs (id, owner) VALUES (1, 'alice'), (2, 'bob'), (3, 'alice'), (4, 'bob')",
     )
     .await;
-    // The shares are made by users `sharer` of `a` and `b`, dropped below
-    // (RL70).
+    // The shares are made by users `sharer` of `a` and `b`, dropped below.
     for (t, c) in app.iter_mut().enumerate().take(2) {
         let _ = try_exec(c, "DROP USER IF EXISTS 'sharer'@'%'").await;
         must(c, &format!("CREATE USER 'sharer'@'%' IDENTIFIED BY '{PW}'")).await;
@@ -1747,8 +1746,8 @@ async fn share_views_survive_restarts() {
     if let Some(raw) = &mut raw {
         raw.check_definers("before any restart").await;
     }
-    // The users who made the shares go (RL70): the children's reads don't
-    // depend on them.
+    // The users who made the shares go: the children's reads don't depend
+    // on them.
     {
         let mut a = conn(&e.mysql, &e.t[0], "app").await;
         let mut b = conn(&e.mysql, &e.t[1], "app").await;
@@ -1761,14 +1760,14 @@ async fn share_views_survive_restarts() {
         raw.check_definers("after the shares' creators were dropped")
             .await;
     }
-    // A user id no tenant has: what a view made before RL70 runs as once
-    // the user who made its share is dropped.
+    // A user id no tenant has: what a view an older build made runs as
+    // once the user who made its share is dropped.
     let gone = raw.as_ref().map(|r| format!("t{}_u999999", r.ids[1]));
     for how in ["kill9", "term", "all"] {
         if how == "kill9"
             && let (Some(raw), Some(gone)) = (&mut raw, &gone)
         {
-            // A view made before RL70 whose share's creator was dropped:
+            // A view an older build made, whose share's creator was dropped:
             // reads fail until the gateway starts: 1449, or 1045 naming the
             // reader (MariaDB's answer to an account without `SET USER`).
             raw.move_c_to(gone).await;

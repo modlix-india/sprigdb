@@ -1,5 +1,4 @@
-//! [`TxnSource`] and [`Clusters`] on `sprig-binlog` (chapter 38, "The
-//! cluster reader").
+//! [`TxnSource`] and [`Clusters`] on `sprig-binlog`.
 //!
 //! A [`BinlogTxns`] is one dump connection (`sprig_repl`) asking for
 //! `ANNOTATE_ROWS` events, decoding rows only for one tenant's schemas and
@@ -29,7 +28,7 @@ use crate::source::{
 
 /// The internal schema.
 pub const SYS_SCHEMA: &str = "__sprig_sys";
-/// The applier position tables (filter rule 2).
+/// The applier position tables (the tail's filter rule 2).
 pub const APPLY_TABLES: [&str; 2] = ["__sprig_mover_pos", "__sprig_ref_pos"];
 /// How often groups without the tenant's changes surface as progress.
 pub const IDLE_EVERY: Duration = Duration::from_millis(200);
@@ -165,7 +164,7 @@ struct Group {
 }
 
 /// One open binlog dump in `sprig_feed_binlog_dumps` (node, kind): +1
-/// while it lives (R9, r9feed: "dumps per node").
+/// while it lives ("dumps per node").
 struct DumpGauge {
     node: String,
     kind: &'static str,
@@ -501,7 +500,7 @@ pub struct StaticClusters {
     next_server_id: Arc<AtomicU32>,
 }
 
-/// The first binlog client server id the feed presents (chapter 10's
+/// The first binlog client server id the feed presents (the mover's
 /// `mover.server_id_base` is 4000000000; the feed takes the range above
 /// 4100000000).
 pub const SERVER_ID_BASE: u32 = 4_100_000_000;

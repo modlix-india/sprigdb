@@ -1,5 +1,5 @@
-//! Live checks of logins with an issuer's JWT (chapter 14's external
-//! tokens), against a running private deployment, with a key set the test
+//! Live checks of logins with an issuer's JWT (an external token),
+//! against a running private deployment, with a key set the test
 //! serves itself on 127.0.0.1 (no identity provider, nothing downloaded):
 //!
 //! - an issuer and its claim mapping through the Admin API, and an
@@ -10,7 +10,7 @@
 //!   with its reason in the gateway's audit log;
 //! - a row policy on `SPRIG_CLAIM('org')` filters rows by the token's claim;
 //! - a just-in-time account over HTTP (`auth.user_created_jit`);
-//! - token roles (chapter 29): a role mapping on the `groups` claim gives
+//! - token roles: a role mapping on the `groups` claim gives
 //!   the session role `ajgate`, the only way `tok` reads table `gated`;
 //!   without the claim, or with a password, 1142; a mapped role the tenant
 //!   doesn't define is ignored with `auth.token_roles_ignored`, never
@@ -581,7 +581,7 @@ async fn jwt_logins_live() {
         format!("{r:?}")
     });
 
-    // Token roles (chapter 29): the claim gives ajgate for the session.
+    // Token roles: the claim gives ajgate for the session.
     let with = k1.sign(&claims_in("tok", &["gate"]));
     let without = k1.sign(&claims_in("tok", &["staff"]));
     let ghost = k1.sign(&claims_in("tok", &["gate", "ghost"]));

@@ -227,8 +227,8 @@ mod tests {
 
     #[test]
     fn a_report_of_many_shards_fits_and_keeps_every_share() {
-        // 64 shards a minute, well over 64 KiB unbounded (r1diff saw a
-        // report of 83,638 bytes).
+        // 64 shards a minute, well over 64 KiB unbounded (a live gateway
+        // once sent a report of 83,638 bytes).
         let (acc, now) = busy(64);
         let r = acc.report("gw-1", now);
         assert_eq!(r.sketches.len(), 192);

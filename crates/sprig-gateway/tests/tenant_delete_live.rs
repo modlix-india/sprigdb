@@ -78,7 +78,7 @@ fn env() -> Option<Env> {
             .unwrap_or_else(|_| "tdel".to_owned()),
         sprigctl: std::env::var("SPRIG_TEST_TENANT_DELETE_SPRIGCTL").ok()?,
         // The node's MySQL port: no default, so a private deployment's
-        // run never reads the shared dev node (R9 r9feed4).
+        // run never reads the shared dev node.
         node: std::env::var("SPRIG_TEST_TENANT_DELETE_NODE")
             .ok()
             .and_then(|v| v.parse().ok())?,

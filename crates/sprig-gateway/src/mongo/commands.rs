@@ -1488,7 +1488,7 @@ async fn exec(
                     .insert("changeStreamPreAndPostImages", doc! {"enabled": enabled});
                 engine.catalog.save_indexes(sql, &ns, &m).await?;
             }
-            // TTL (wireup): `index: {name | keyPattern, expireAfterSeconds}`;
+            // TTL: `index: {name | keyPattern, expireAfterSeconds}`;
             // the worker's next pass uses the new value.
             let mut reply = doc! {};
             if let Some(ix) = body.get("index") {

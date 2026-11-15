@@ -17,7 +17,7 @@ use super::jwt::Alg;
 use crate::admin::{Changed, MAX_NAME};
 use crate::store::{AuthMethods, AuthStore, UserRow, UserSource, map_err};
 
-/// `oidc_issuers`, exactly as chapter 14 defines it.
+/// The `oidc_issuers` table: one row per token issuer.
 pub const DDL_OIDC_ISSUERS: &str = "CREATE TABLE IF NOT EXISTS oidc_issuers (
   issuer_id       INT UNSIGNED    NOT NULL,
   kind            ENUM('oidc','end_user_layer') NOT NULL DEFAULT 'oidc',

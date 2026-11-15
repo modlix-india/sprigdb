@@ -127,7 +127,17 @@ enum Sent {
     /// The Galera check didn't finish in time; the connection is still
     /// busy with it and must be dropped.
     WaitTimedOut,
+    /// [`TRX_GUARD`] failed: the transaction is gone and the statement
+    /// wasn't run; the connection is idle and reusable.
+    TrxGone,
 }
+
+/// Run before a write inside a Galera transaction: fails with 1242, and
+/// stops the statement after it, when no transaction is open. Galera can
+/// roll a transaction back without an error; the write would then run,
+/// and commit, on its own.
+const TRX_GUARD: &str = "SET @__sprig_t = (SELECT CASE WHEN @@in_transaction = 1 THEN 1 \
+                         ELSE (SELECT 1 UNION SELECT 2) END)";
 
 /// What the gateway answers itself after a release.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -200,8 +210,7 @@ struct Current {
     span: Option<sprig_common::telemetry::trace::ChildSpan>,
     /// A plain `SELECT`, `INSERT`, `UPDATE`, `DELETE` or `REPLACE` inside
     /// a transaction on Galera: it can't end the transaction, so an answer
-    /// saying the transaction is gone means Galera aborted it silently
-    /// (decision HD27).
+    /// saying the transaction is gone means Galera aborted it silently.
     galera_dml_in_trx: bool,
 }
 
@@ -352,9 +361,9 @@ fn trx_wrote(state: &str) -> bool {
 }
 
 /// Whether a Galera COMMIT answered `ok` produced no GTID: the transaction
-/// that wrote was rolled back without an error (decision HD27). Galera can
-/// abort a transaction for another node's conflicting write set while it
-/// runs a statement that doesn't wait for locks, answer that statement
+/// that wrote was rolled back without an error. Galera can abort a
+/// transaction for another node's conflicting write set while it runs a
+/// statement that doesn't wait for locks, answer that statement
 /// normally, and then answer COMMIT with OK: nothing was written. The OK
 /// of a commit that wrote reports its GTID (`last_gtid`); without one, the
 /// GTID is read, since MariaDB 11.8 can report `timestamp` in its place.
@@ -404,15 +413,20 @@ fn gtid_unchanged(before: Option<&str>, after: &str) -> bool {
     after.is_empty() || before == Some(after)
 }
 
-/// The answer to a COMMIT that wrote nothing: MariaDB's own deadlock error,
-/// which tells the client the transaction was rolled back and may be
+/// MariaDB's own deadlock error, the answer for a transaction Galera rolled
+/// back silently: it tells the client the transaction is gone and may be
 /// retried.
-fn silent_abort_packet(caps: Caps) -> RespPacket {
-    let e = ErrPacket::new(
+fn silent_abort_err() -> ErrPacket {
+    ErrPacket::new(
         1213,
         *b"40001",
         "Deadlock found when trying to get lock; try restarting transaction",
-    );
+    )
+}
+
+/// [`silent_abort_err`] as a response packet, in place of an OK.
+fn silent_abort_packet(caps: Caps) -> RespPacket {
+    let e = silent_abort_err();
     RespPacket {
         payload: e.encode(caps),
         kind: PacketKind::Err(e),
@@ -1721,6 +1735,9 @@ impl BackendSession {
                 Req::Text(sql) | Req::Binary { sql, .. } => plain_dml(sql),
                 _ => false,
             };
+        // A write in such a transaction runs only if the transaction is
+        // still open (`TRX_GUARD`).
+        let guard = galera_dml_in_trx && info.class == StmtClass::Write;
         // `USE x` sets the schema itself, so any pooled connection serves
         // it, including one that already has a default schema.
         let sets_schema = matches!(req, Req::Text(sql) if is_use(sql));
@@ -1759,7 +1776,7 @@ impl BackendSession {
             self.inflight = Some((node_key.clone(), lease.conn_ref().thread_id));
             let conn = lease.conn();
             // A Galera COMMIT of a transaction that wrote must produce a
-            // GTID: the connection's last one, to compare (decision HD27).
+            // GTID: the connection's last one, to compare.
             let commit_check = (view.topology == TopologyKind::Galera
                 && in_trx_before
                 && info.effects.contains(&Effect::Commit)
@@ -1788,7 +1805,7 @@ impl BackendSession {
             // would otherwise write the session's older value over them: a
             // pinned session's `SET @v = ...` and then a read of `@v`, on a
             // pooled connection that held `@v` for an earlier session, read
-            // NULL (found by rlsprep, S163).
+            // NULL.
             if route == RouteKind::Pinned && !self.pending_capture.is_empty() {
                 let names = std::mem::take(&mut self.pending_capture);
                 match conn.capture_user_vars(&names).await {
@@ -1860,6 +1877,10 @@ impl BackendSession {
                         all.extend_from_slice(p.as_bytes());
                         all.extend_from_slice(b"; ");
                     }
+                    if guard {
+                        all.extend_from_slice(TRX_GUARD.as_bytes());
+                        all.extend_from_slice(b"; ");
+                    }
                     match &wait {
                         Wait::Replica(t) => {
                             all.extend_from_slice(
@@ -1891,6 +1912,9 @@ impl BackendSession {
                             return Ok(Sent::SyncErr(e));
                         }
                     }
+                    if guard && consume_statement(conn).await?.is_some() {
+                        return Ok(Sent::TrxGone);
+                    }
                     return Ok(match &wait {
                         Wait::None => Sent::Ready,
                         Wait::Replica(_) => match consume_statement(conn).await? {
@@ -1915,6 +1939,13 @@ impl BackendSession {
                     match conn.client.query(&prefix.join("; ")).await {
                         Ok(_) => {}
                         Err(ClientError::Server(e)) => return Ok(Sent::SyncErr(e)),
+                        Err(e) => return Err(e),
+                    }
+                }
+                if guard {
+                    match conn.client.query_drop(TRX_GUARD).await {
+                        Ok(()) => {}
+                        Err(ClientError::Server(_)) => return Ok(Sent::TrxGone),
                         Err(e) => return Err(e),
                     }
                 }
@@ -1953,6 +1984,21 @@ impl BackendSession {
             let waited = !matches!(wait, Wait::None);
             match sent {
                 Ok(Sent::Ready) => {}
+                Ok(Sent::TrxGone) => {
+                    // The sync statements before the guard ran.
+                    conn.applied = next_applied;
+                    conn.client.take_changes();
+                    note_silent_abort(&cluster, &node_key, "a write's transaction check");
+                    self.pins.after_statement(StatusFlags::empty());
+                    if route == RouteKind::Pinned {
+                        self.held = Some((lease, route));
+                    } else {
+                        let limits = self.backends.limits(&cluster);
+                        self.backends.pools.release(lease, Release::Reuse, limits);
+                    }
+                    self.inflight = None;
+                    return Err(backend_err(&silent_abort_err()));
+                }
                 Ok(Sent::WaitFailed | Sent::WaitTimedOut) => {
                     // The read reruns on the writer (the replica, or the
                     // Galera node, was too slow).

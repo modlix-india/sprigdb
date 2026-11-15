@@ -305,7 +305,7 @@ async fn ensure_for(
         };
         // The account and the deploy take catalog connections of their own
         // from the same pool (4 per cluster); this one isn't held across
-        // them (with the stream's, a first publish needed 3 at once, fetfix).
+        // them (with the stream's, a first publish needed 3 at once).
         drop(conn);
         let run_as = ensure_run_as(svc, t, &g, binding.is_none(), &extra).await?;
         let deployed = deploy(svc, t, &g, &text, src, run_as).await?;

@@ -95,7 +95,7 @@ pub(crate) enum Lit {
 }
 
 /// 39366 for a SQL-level prepared statement whose text names a table the
-/// session's row-level security binds (S163).
+/// session's row-level security binds.
 fn rls_refused() -> SprigError {
     sprig_sql::rls::unsupported(
         "a prepared statement whose text names a protected table (PREPARE ... FROM, \

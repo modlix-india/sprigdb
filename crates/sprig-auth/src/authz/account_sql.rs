@@ -112,8 +112,8 @@ pub struct AccountCtx<'a> {
     pub privileges: &'a dyn super::authorizer::SessionGrants,
     /// The session's active roles.
     pub active_roles: &'a [RoleId],
-    /// The roles the session's token gives it for its life (chapter 29,
-    /// "Token roles"): `SET ROLE` may name them, and `DEFAULT` and `ALL`
+    /// The roles the session's token gives it for its life (its
+    /// issuer's role mapping): `SET ROLE` may name them, and `DEFAULT` and `ALL`
     /// include them.
     pub token_roles: &'a [RoleId],
     /// The tenant's name, for audit events.

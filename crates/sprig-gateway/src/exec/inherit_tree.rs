@@ -1,12 +1,11 @@
-//! What the inheritance layer needs beyond the session (Kiran's decisions
-//! of 11 November 2026, chapter 42): the tree-wide id sequences, the
-//! reference index, reads as the provisioning account, the tenants of a
-//! tree, and bringing a child tenant's tables up to its parent's
-//! ([`adopt`]).
+//! What the inheritance layer needs beyond the session: the tree-wide id
+//! sequences, the reference index, reads as the provisioning account, the
+//! tenants of a tree, and bringing a child tenant's tables up to its
+//! parent's ([`adopt`]).
 //!
 //! ```text
 //! tree sequence  t<root>_sprig.sequences, seq_id = root object | 1<<62,
-//!                chapter 19's ID blocks (one allocator per root tenant
+//!                global ID blocks (one allocator per root tenant
 //!                in this gateway); created at first use above every
 //!                tenant's MAX(id) and AUTO_INCREMENT in the root's subtree
 //! inherit_refs   t<root>_sprig.inherit_refs (created at first use)
@@ -489,7 +488,7 @@ async fn sync_one(
     }
     let t = child.tenant;
     let mut ver = child.version;
-    // Types the parent widened (inheritance round 2): MODIFY COLUMN.
+    // Types the parent widened: MODIFY COLUMN.
     for (i, clauses, _) in &widen {
         let w = &wants[*i];
         let cschema = sprig_inherit::plan::physical_schema(child, &w.db, lctn)?;
@@ -700,7 +699,7 @@ fn remember_widened(t: TenantId, widen: &[(usize, Vec<String>, (u64, u64))]) {
 }
 
 /// The `MODIFY COLUMN` clauses giving `child`'s inherited tables the
-/// types their parent widened since (decision IG5's gap): per want, its
+/// types their parent widened since: per want, its
 /// clauses and (parent object, schema version) to remember once applied.
 /// Only tables whose parent definition changed since this gateway last
 /// compared them are read (two `SHOW CREATE TABLE`s).

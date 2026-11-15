@@ -1,15 +1,14 @@
-//! Shard ownership history: the handoff records moves write (chapter 38,
-//! "Catalog tables", `feed_ownership`; chapter 10, "The feed handoff").
+//! Shard ownership history: the handoff records moves write.
 //!
 //! Every committed move of a tenant's range writes one [`Handoff`]: every
 //! change on the source up to `fence_pos` (`G`) belongs to the old owner,
 //! every change on the target after `start_pos` (`H`) to the new one;
 //! between them the target's binlog holds only the mover's own writes.
 //!
-//! **As built, against the book:** the record lives in the DC tier of
-//! etcd, at `feed/ownership/<tenant>/<group>/<map version>`, and the mover
-//! writes it in the same etcd transaction as the map flip, not as a
-//! post-cutover step into a catalog table. A feed can therefore never see
+//! The record lives in the DC tier of etcd, at
+//! `feed/ownership/<tenant>/<group>/<map version>`, and the mover writes it
+//! in the same etcd transaction as the map flip, not as a post-cutover step
+//! into a catalog table. A feed can therefore never see
 //! the new owner without the handoff, and can read it while the move's
 //! fence still renames the catalog.
 
@@ -21,13 +20,13 @@ use sprig_common::ids::{ClusterId, TenantId};
 use sprig_common::{Result, SprigError};
 use sprig_meta::{Key, ListOpts, MetaStore, Op, Record, Tier, Versioned};
 
-/// One committed move of a range (R1: a whole tenant, group 0).
+/// One committed move of a range (for now: a whole tenant, group 0).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Handoff {
     /// The tenant.
     pub tenant: TenantId,
-    /// The table group (0: the catalog map, which R0 and R1 route the
-    /// whole tenant by).
+    /// The table group (0: the catalog map, which the whole tenant is
+    /// routed by for now).
     pub group: u32,
     /// The shard map version after the flip.
     pub map_version: u64,

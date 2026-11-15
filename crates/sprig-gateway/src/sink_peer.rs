@@ -18,13 +18,13 @@
 //! Images {tables}       which row images the user may see: rows
 //!                       (t, i, v) of crate::exec::rls_images
 //! Publish {statements}  a change exchange's CALL sprig.mq_publish
-//!                       calls, autocommit, in order (workers before r9feed4)
+//!                       calls, autocommit, in order (older workers)
 //! PublishBatch {vhost, exchange, messages}
 //!                       a change exchange's messages, each as its message
 //!                       id, through the queue engine as the user, in order,
-//!                       up to the first that fails (R9 r9feed4); to an
+//!                       up to the first that fails; to an
 //!                       exchange inherited from a declarer, into the
-//!                       tenant's own instance, stamped (r9feed5)
+//!                       tenant's own instance, stamped
 //! ```
 
 use std::net::SocketAddr;
@@ -269,10 +269,9 @@ async fn publish_batch(
         s.retryable = true;
         s
     };
-    // An exchange inherited from a declarer (chapter 42): the messages go
-    // into this tenant's own instance, stamped as `sprig.mq_publish` does
-    // there, each as its id (R9, r9feed5). A batch with a message that
-    // names another tenant, or that `sprig.mq_publish` would refuse, takes
+    // An exchange inherited from a declarer: the messages go into this
+    // tenant's own instance, stamped as `sprig.mq_publish` does there,
+    // each as its id. A batch with a message that names another tenant, or that `sprig.mq_publish` would refuse, takes
     // the statement path as before: at least once.
     let my_name = caller.principal.tenant_name.clone().unwrap_or_default();
     let own = match inherited_exchange(&svc, (tenant, &my_name), vhost, exchange, &messages).await?

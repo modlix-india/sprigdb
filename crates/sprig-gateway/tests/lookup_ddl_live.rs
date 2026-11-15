@@ -1,6 +1,5 @@
-//! Global lookup indexes through the gateway (chapter 19's DDL path,
-//! chapter 21's `ADD UNIQUE` on a sharded table), live on a private
-//! deployment:
+//! Global lookup indexes through the gateway (the DDL path, `ADD UNIQUE`
+//! on a sharded table), live on a private deployment:
 //!
 //! 1. `customers (id PK, email, name)` with 20,000 rows, pinned
 //!    `SHARD KEY (id)`, made a group by the advisor and split into 4 shards.
@@ -35,7 +34,7 @@
 //!
 //! Without `SPRIG_TEST_LKD_GATEWAY` the test says what it needs and passes.
 //!
-//! `lookup_followups_live` (agent lookupddl2) needs a fresh tenant too
+//! `lookup_followups_live` needs a fresh tenant too
 //! (`SPRIG_TEST_LKD_TENANT`, `_TENANT_ID`) and a second gateway on the same
 //! deployment (`SPRIG_TEST_LKD_GW2=127.0.0.1:<port>`,
 //! `SPRIG_TEST_LKD_GW2_PIDFILE`):
@@ -809,7 +808,7 @@ async fn lookup_ddl_live() {
     c.query_drop(format!("DROP DATABASE {DB}")).await.unwrap();
 }
 
-// ---- lookupddl2: the follow-ups ------------------------------------------
+// ---- the follow-ups -----------------------------------------------------
 
 const DB2: &str = "lk2_db";
 const DB3: &str = "lk2_db2";
@@ -1496,7 +1495,7 @@ async fn lookup_followups_live() {
         "--scope",
         &format!("tenant:{}", e.tenant),
         "--reason",
-        "lookupddl2 test",
+        "lookup follow-ups test",
     ]);
     // Both up: a build's publishes are acknowledged at once.
     let mut c2 = login(&gw2, &e.tenant, "app", "sprig-dev-app", Some(DB2))
@@ -1613,7 +1612,7 @@ async fn lookup_followups_live() {
         "--scope",
         &format!("tenant:{}", e.tenant),
         "--reason",
-        "lookupddl2 test",
+        "lookup follow-ups test",
     ]);
     let started = Instant::now();
     let mut c = loop {
@@ -1645,7 +1644,7 @@ async fn blocked_claim(a: &mut Conn, b: &mut Conn, holder: &str, waiter: &str) -
     waited
 }
 
-/// `lookup_followups_live`'s step 7 (agent smallfix3):
+/// `lookup_followups_live`'s step 7:
 ///
 /// - `lookup.lock_wait_seconds` at a table's scope: 1 s on `dups` with the
 ///   tenant at 6 s. A claim blocked by another session's uncommitted claim
@@ -1666,7 +1665,7 @@ async fn lock_wait_and_orphan_scan(e: &Env, ctl_metrics: Option<&str>) {
             "--scope",
             scope,
             "--reason",
-            "smallfix3 test",
+            "lookup lock wait test",
         ]);
     };
     let reset = |key: &str, scope: &str| {
@@ -1677,7 +1676,7 @@ async fn lock_wait_and_orphan_scan(e: &Env, ctl_metrics: Option<&str>) {
             "--scope",
             scope,
             "--reason",
-            "smallfix3 test",
+            "lookup lock wait test",
         ]);
     };
     let tenant_scope = format!("tenant:{}", e.tenant);

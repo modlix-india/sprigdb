@@ -1,5 +1,5 @@
-//! Global lookup indexes on the DDL path (chapter 19, chapter 21's
-//! `ADD UNIQUE` on a sharded table).
+//! Global lookup indexes on the DDL path (including `ADD UNIQUE` on a
+//! sharded table).
 //!
 //! A unique key on a sharded table that doesn't hold the distribution key
 //! is unique only within each shard until a lookup index makes it unique

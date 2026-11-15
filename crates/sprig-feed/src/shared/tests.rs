@@ -304,7 +304,7 @@ async fn a_slow_subscription_is_detached_and_comes_back_without_stalling_the_oth
     assert_eq!(fake.catchup_opens(), 0, "the ring served the slow one");
 }
 
-/// R9 r9feed5: a subscription that comes back further behind than
+/// A subscription that comes back further behind than
 /// `max_backlog` but inside the ring reads its groups from the ring in
 /// parts, while the hub reads on, and listens once it is close: no
 /// catch-up dump, every group once and in order.
@@ -436,7 +436,7 @@ async fn a_whole_tenant_view_gets_its_tables_and_ddl_and_widens_the_dump() {
     }
     assert_eq!(seen, vec![(1, 2, false), (2, 0, true)]);
     // The hub reopens with tenant 1 kept whole, from where `w` started
-    // (r9feed2: a replay, not a catch-up dump).
+    // (a replay, not a catch-up dump).
     assert!(quiet(&mut w, 500).await);
     let scopes = fake.opens();
     assert!(
@@ -460,7 +460,7 @@ async fn a_whole_tenant_view_gets_its_tables_and_ddl_and_widens_the_dump() {
     assert_eq!(take(&mut q, 1).await, vec![(3, 1)]);
 }
 
-/// Regression (r9feed's live run 2): a subscription registered behind a
+/// Regression: a subscription registered behind a
 /// gathering hub, waiting for it to move back, gets no idle position ahead
 /// of the groups it hasn't had (its tail would skip them).
 #[test]
@@ -501,7 +501,7 @@ fn no_idle_position_while_a_move_back_is_pending() {
     assert!(rx_a.try_recv().is_err(), "A is at 5: nothing before it");
 }
 
-/// r9feed2: a new whole-tenant subscription a little behind the hub (it
+/// A new whole-tenant subscription a little behind the hub (it
 /// read the cluster's position, or its checkpoint, just before the hub
 /// read on) makes the hub read those groups again with the wider scope,
 /// instead of opening a catch-up dump. Nobody gets a group twice, and the
@@ -552,7 +552,7 @@ async fn a_new_whole_tenant_just_behind_the_hub_is_replayed_without_a_catch_up_d
     assert_eq!(feed.stats(&c).unwrap().catchups, 0);
 }
 
-/// r9feed2: change streams resuming together after a gateway's restart,
+/// Change streams resuming together after a gateway's restart,
 /// each a little behind the hub, before the ring's start too: replays
 /// chain (one under way is extended), and each subscription gets every
 /// group of its tenant once, in order, with no catch-up dump.
@@ -622,7 +622,7 @@ impl Lcg {
     }
 }
 
-/// r9feed2: whole-tenant subscriptions start at random points a little
+/// Whole-tenant subscriptions start at random points a little
 /// behind a busy hub (replays, chained), read slowly (detached, back
 /// through the ring or a catch-up dump), with a small ring. Each gets every
 /// group of its tenant after its start once, in order.
@@ -713,7 +713,7 @@ async fn whole_tenants_starting_behind_a_busy_hub_get_every_group_once() {
     }
 }
 
-/// r9feed2: a replay fills the new tenant's parts into the ring, so its
+/// A replay fills the new tenant's parts into the ring, so its
 /// subscription, detached later as a slow reader, comes back through the
 /// ring, not a catch-up dump.
 #[tokio::test]
@@ -761,7 +761,7 @@ async fn idles(src: &mut Box<dyn TxnSource>, dur: Duration) -> Vec<GtidPos> {
     out
 }
 
-/// r9feed3: a view may ask for idle positions sooner than every second
+/// A view may ask for idle positions sooner than every second
 /// (the graph mirror's: a mirror read waits for it to reach the cluster's
 /// position now, so others' writes mustn't hold it a second behind); the
 /// other views keep one a second.

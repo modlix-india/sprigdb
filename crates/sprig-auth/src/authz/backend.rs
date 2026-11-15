@@ -397,7 +397,7 @@ pub fn desired_on(
     let mut out = BackendState::new();
     let tenant_pattern = format!("t{tenant}\\_d%");
     // Token roles: a user taking tokens may be given any role an active
-    // issuer's role mapping can name (chapter 29, "Token roles").
+    // issuer's role mapping can name.
     let token_roles = crate::oidc::roles::possible_roles(auth.issuers(), state);
     for u in auth.users() {
         let uid = u.row.user_id;

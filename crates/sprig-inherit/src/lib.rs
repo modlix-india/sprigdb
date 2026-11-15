@@ -1,48 +1,46 @@
 //! `sprig-inherit`: spaces, shares, layers and merged views.
 //!
-//! Layer: 2 data layer. Design: [chapter 42](https://github.com/serialcoder13/sprigdb-plan/blob/main/lld/chapters/42-data-inheritance.md) (Data inheritance) of the SprigDB low-level design.
+//! Layer: 2 data layer.
 //!
-//! What exists (R6 order 2, SQL on single-shard tenants, read-through):
+//! What exists (SQL on single-shard tenants, read-through):
 //!
 //! - [`model`] and [`store`]: spaces, inheritable objects, shares and home
 //!   spaces in the tenant catalog, loaded into every snapshot by
-//!   [`InheritExtension`] (build step 1);
+//!   [`InheritExtension`];
 //! - [`grammar`]: the extension statements;
-//! - [`ddl`]: spaces, shares, home spaces and `SPRIG INHERITABLE` (steps 1-3);
+//! - [`ddl`]: spaces, shares, home spaces and `SPRIG INHERITABLE`;
 //! - [`view`] and [`rewrite`]: the merged view and statements reading it,
-//!   with `SPRIG_ORIGIN()` (step 4);
+//!   with `SPRIG_ORIGIN()`;
 //! - [`write`](mod@write): layer writes, resets, parent deletes and
-//!   synchronous orphaning (steps 5 and 6);
+//!   synchronous orphaning;
 //! - [`upstream`]: cross-tenant read-through edges, through share views
-//!   in the child's schema defined by the parent's account (step 9, the
-//!   read-through half);
+//!   in the child's schema defined by the parent's account;
 //! - [`copy`]: materialized copies and asynchronous orphaning across
 //!   tenants, kept by one worker per tenant tree from the change feed
-//!   (step 8 and step 9's other half; the job is `sprig-worker::inherit`);
+//!   (the job is `sprig-worker::inherit`);
 //! - [`links`]: foreign keys between inheritable tables, checked against
-//!   merged views, and refused deletes of referenced rows (Kiran's
-//!   decisions 1 and 4 of 11 November 2026);
-//! - [`ids`]: one id sequence per table for the whole tree (decision 3);
+//!   merged views, and refused deletes of referenced rows;
+//! - [`ids`]: one id sequence per table for the whole tree;
 //! - [`adopt`]: what a child tenant must create or change so it holds
-//!   every table its parent shares to it (decisions 1 and 2);
+//!   every table its parent shares to it;
 //! - [`moves`]: the tenant-move check for shares (39361);
 //! - [`guard`]: "Schema changes while an object is shared" (39895);
 //! - [`show`]: what schema tools see;
 //! - [`reference`]: the merged view as a Rust model, for tests;
-//! - [`msg`]: inherited messaging objects (`FOR EACH TENANT`, R9): the
+//! - [`msg`]: inherited messaging objects (`FOR EACH TENANT`): the
 //!   definitions, overrides and instances every kind shares.
 //!
 //! [`handle`] is the entry point: the gateway calls it for each statement
-//! of a tenant session before chapter 32's type layer and chapter 07's name
-//! plan, with a [`Runner`] that sends the plan's statements back through
-//! the session (logical names, chapter 29's checks, chapter 17's router).
+//! of a tenant session before the type layer and the name plan, with a
+//! [`Runner`] that sends the plan's statements back through the session
+//! (logical names, access checks, the router).
 //!
 //! Not built: federated edges (Spider), collections and key-value
-//! namespaces. `ViewMapper` is the gateway's (`http::changes`, decision
-//! T30): change streams carry each subscriber's merged records.
+//! namespaces. `ViewMapper` is the gateway's (`http::changes`): change
+//! streams carry each subscriber's merged records.
 
-// The plans read best as the chapter's steps in order, over SQL text built
-// with format!; short names (o, s, r, k) follow the chapter's pseudocode.
+// The plans read best as their steps in order, over SQL text built with
+// format!; short names (o, s, r, k) keep the plans compact.
 #![allow(
     clippy::too_many_lines,
     clippy::many_single_char_names,
@@ -84,15 +82,15 @@ use sprig_types::{Done, Rows};
 
 pub use model::{InheritState, InheritableObject, LayerState, ROOT_SPACE, Share, Space, SpaceId};
 pub use plan::{Ctx, Limits, Privileges};
-/// Chapter 32's catalog module: the copy worker reads child tenants'
-/// record hierarchies from it (decision T28).
+/// The type layer's catalog module: the copy worker reads child tenants'
+/// record hierarchies from it.
 pub use sprig_types::TypesExtension;
 pub use store::{INHERIT_MODULE, InheritChange, InheritExtension, InheritStore, MODULE};
 
 use crate::grammar::Stmt;
 
-/// What the inheritance layer needs from the executor, beyond chapter
-/// 32's [`sprig_types::Runner`].
+/// What the inheritance layer needs from the executor, beyond the type
+/// layer's [`sprig_types::Runner`].
 #[async_trait::async_trait]
 pub trait Runner: sprig_types::Runner {
     /// Commits `change` to the tenant's `inherit` module in one versioned
@@ -118,12 +116,11 @@ pub trait Runner: sprig_types::Runner {
     /// A user of this tenant by name.
     fn user_id(&self, name: &str) -> Option<u32>;
 
-    /// Asks for the copy worker of this tenant's tree (chapter 42,
-    /// "Materialized copies"): registers its feed subscription on this
-    /// tenant and its ancestors, from their current positions, unless it
-    /// exists. Called when a share needs the worker (a materialized share,
-    /// or one that reaches child tenants, which are orphaned
-    /// asynchronously).
+    /// Asks for the copy worker of this tenant's tree: registers its feed
+    /// subscription on this tenant and its ancestors, from their current
+    /// positions, unless it exists. Called when a share needs the worker (a
+    /// materialized share, or one that reaches child tenants, which are
+    /// orphaned asynchronously).
     ///
     /// # Errors
     /// The directory's and the feed's.
@@ -196,7 +193,7 @@ pub trait Runner: sprig_types::Runner {
 
     /// Takes the record-hierarchy lock of `object` (its row of
     /// [`hier::LOCK_TABLE`] in `schema`, made on first use) on tenant `t`'s
-    /// cluster as the system, never with the user's grants (decision T27):
+    /// cluster as the system, never with the user's grants:
     /// `FOR UPDATE` on a provisioning connection that holds it until the
     /// session's transaction ends. Taking a lock the session holds is a
     /// no-op.
@@ -211,11 +208,10 @@ pub trait Runner: sprig_types::Runner {
     }
 
     /// The session's row-level security condition on the merged records of
-    /// `db.table` (chapter 29, "Data inheritance": the reader's own
-    /// policies filter its merged view, inherited rows included; decision
-    /// rlsinherit), columns qualified with `qual` and session values bound;
-    /// `None` when the table's policies don't bind the session. `cmd`
-    /// adds the write's policies to the `SELECT` ones, as for any table.
+    /// `db.table` (the reader's own policies filter its merged view, inherited
+    /// rows included), columns qualified with `qual` and session values bound;
+    /// `None` when the table's policies don't bind the session. `cmd` adds the
+    /// write's policies to the `SELECT` ones, as for any table.
     ///
     /// # Errors
     /// The policy's (39364), 39366.
@@ -259,7 +255,7 @@ pub enum Handled {
     Rows(Rows),
     /// `USE SPACE`: the session's new space.
     Space(SpaceId),
-    /// The statement names a typed table: chapter 32 plans it first, and
+    /// The statement names a typed table: the type layer plans it first, and
     /// its statements come back here ([`Ctx::from_types`]).
     Typed,
 }
@@ -280,11 +276,11 @@ pub fn maybe_inherit(sql: &[u8], state: Option<&InheritState>) -> bool {
 /// Handles one statement of a tenant session (see the crate docs).
 ///
 /// # Errors
-/// The chapter's errors (39880-39895), 1062, 1142 and the steps' errors
+/// The inheritance errors (39880-39895), 1062, 1142 and the steps' errors
 /// with logical names.
 pub async fn handle(sql: &str, ctx: &Ctx<'_>, r: &mut dyn Runner) -> Result<Handled> {
     // Reserved names are SprigDB's own, except a type plan's statements on
-    // a record hierarchy's path columns, which are fields (decision T22).
+    // a record hierarchy's path columns, which are fields.
     if !maybe_inherit(sql.as_bytes(), Some(ctx.state))
         || (grammar::names_reserved(sql.as_bytes(), &ctx.lex)
             && !(ctx.from_types && hier::names_only_paths(sql, &ctx.lex)))
@@ -394,14 +390,14 @@ pub async fn handle(sql: &str, ctx: &Ctx<'_>, r: &mut dyn Runner) -> Result<Hand
     }
     if !ctx.from_types && plan::touches_typed(sql, ctx) {
         // A drop on an inheritable type tree meets the rules of shared and
-        // received tables first (decision T18); chapter 32 then drops this
+        // received tables first; the type layer then drops this
         // tenant's own tables, every space's rows included. A tree is one
         // group, so the named tables decide for a CASCADE's subtypes.
         if let Stmt::DropTable(names) = &stmt {
             guard::drop_tables(names, ctx)?;
         }
         // A tree's discriminator is its top tenant's: below, the tree
-        // follows the parent's at the next statement (decision T19).
+        // follows the parent's at the next statement.
         if let Stmt::AlterTable(n) = &stmt
             && grammar::identifiers(sql.as_bytes(), &ctx.lex)
                 .iter()
@@ -415,7 +411,7 @@ pub async fn handle(sql: &str, ctx: &Ctx<'_>, r: &mut dyn Runner) -> Result<Hand
     // A type plan's DDL (type columns, extension tables) is the type
     // layer's; it makes new tables of an inheritable tree inheritable
     // itself (`SPRIG INHERITABLE`, above).
-    // A client's ADD | DROP HIERARCHY is chapter 32's; its own ALTERs of
+    // A client's ADD | DROP HIERARCHY is the type layer's; its own ALTERs of
     // the path columns come back below.
     if !ctx.from_types
         && let Stmt::AlterTable(_) = &stmt

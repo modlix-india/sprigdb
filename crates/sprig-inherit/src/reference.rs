@@ -1,9 +1,9 @@
-//! The merged view as a Rust model (chapter 42, "Testing": the reference
-//! model). Spaces of one tree, across tenants, with integer keys and text
-//! fields; the live suites run random writes at random layers through a
-//! gateway and compare every space's reads with this model.
+//! The merged view as a Rust reference model. Spaces of one tree, across
+//! tenants, with integer keys and text fields; the live suites run random
+//! writes at random layers through a gateway and compare every space's reads
+//! with this model.
 //!
-//! The model follows the chapter's semantics. A parent delete orphans
+//! The model follows the inheritance layer's semantics. A parent delete orphans
 //! overrides synchronously only inside a tenant. Across tenants, without
 //! the copy worker the override is kept but becomes invisible; with it
 //! ([`Model::async_orphans`], the state once the feed drains) an override
@@ -449,7 +449,8 @@ mod tests {
         v.iter().map(|s| Some((*s).to_owned())).collect()
     }
 
-    /// The chapter's worked example: name 0, colour 1, price 2, region 3.
+    /// A platform, a tenant filtered to India and one below it: name 0,
+    /// colour 1, price 2, region 3.
     #[test]
     fn worked_example() {
         let mut m = Model::new(4);

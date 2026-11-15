@@ -1,6 +1,6 @@
-//! Spaces, inheritable objects and shares in memory (chapter 42, "Data
-//! structures and storage"): one tenant's [`InheritState`], loaded into
-//! every catalog snapshot by [`crate::store::InheritExtension`].
+//! Spaces, inheritable objects and shares in memory: one tenant's
+//! [`InheritState`], loaded into every catalog snapshot by
+//! [`crate::store::InheritExtension`].
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -118,7 +118,7 @@ pub struct UniqueKey {
     pub columns: Vec<String>,
 }
 
-/// An inheritable object (a table in R6).
+/// An inheritable object (for now, always a table).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InheritableObject {
     /// `objects.object_id`.
@@ -145,12 +145,11 @@ pub struct InheritableObject {
     /// The foreign keys the gateway keeps for it ([`crate::links`]).
     pub links: Vec<Link>,
     /// Created by SprigDB in this tenant because its parent tenant shares
-    /// it (Kiran's decision 1, 11 November 2026), rather than declared here.
+    /// it, rather than declared here.
     pub adopted: bool,
-    /// The root table of the type tree this table belongs to (chapter 32,
-    /// `INHERITS`): the tables of one tree inherit together, like a
-    /// foreign-key group, without links (the type layer keeps their rows
-    /// in step itself).
+    /// The root table of the type tree this table belongs to (`INHERITS`):
+    /// the tables of one tree inherit together, like a foreign-key group,
+    /// without links (the type layer keeps their rows in step itself).
     pub type_root: Option<String>,
 }
 
@@ -315,7 +314,7 @@ pub struct Share {
     /// How the edges of this share are computed (`shares.merge_mode`).
     pub mode: MergeMode,
     /// Set on a share SprigDB derives for another table of the shared
-    /// table's foreign-key group (Kiran's decision 1): the id of the share
+    /// table's foreign-key group: the id of the share
     /// the user created. Derived shares are never stored.
     pub via: Option<u64>,
 }
@@ -418,7 +417,7 @@ impl InheritState {
     }
 
     /// The objects linked to `o` by foreign keys, either way, through the
-    /// closure (`o` included): its foreign-key group (Kiran's decision 1).
+    /// closure (`o` included): its foreign-key group.
     #[must_use]
     pub fn group_of(&self, o: ObjectId) -> Vec<ObjectId> {
         let Some(start) = self.objects.get(&o) else {
@@ -467,8 +466,7 @@ impl InheritState {
     /// Adds, for every stored share of an object, a derived share of each
     /// other object of its foreign-key group that has no stored share of
     /// its own from the same space to the same target: sharing one table
-    /// shares the group, unfiltered and with every column (Kiran's
-    /// decision 1).
+    /// shares the group, unfiltered and with every column.
     fn derive_group_shares(&mut self) {
         let stored: Vec<Arc<Share>> = self.shares.clone();
         let mut add = Vec::new();
@@ -710,7 +708,7 @@ impl InheritState {
 
 #[cfg(test)]
 pub(crate) mod fixtures {
-    //! The chapter's worked example: `platform` (1) → `acme` (7) → `pune`
+    //! A three-level fixture: `platform` (1) → `acme` (7) → `pune`
     //! (12); share 31 (1→7) filters `region = 'IN'`, share 32 (7→12) has
     //! no filter.
 
@@ -873,7 +871,7 @@ mod tests {
         );
         let t2 = st.tenant_edge(ObjectId(2), TenantId(77)).unwrap();
         assert_eq!(t2.via, Some(5));
-        assert_eq!(t2.filter, None, "a group member comes whole (Q1)");
+        assert_eq!(t2.filter, None, "a group member comes whole");
         assert_eq!(t2.id, derived_share_id(5, ObjectId(2)));
         assert!(st.tenant_edge(ObjectId(3), TenantId(77)).is_some());
         assert!(st.tenant_edge(ObjectId(9), TenantId(77)).is_none());

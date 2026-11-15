@@ -435,8 +435,8 @@ impl Auth for GatewayAuth {
                 can_handle_expired_password: false,
             })
             .await;
-        // The password may be an issuer's token (chapter 14's external
-        // tokens) for an account with the `token` method.
+        // The password may be an issuer's token (an external token) for
+        // an account with the `token` method.
         login.allow_tokens(sprig_auth::oidc::TokenProtocol::Redis);
         let password = pass.to_vec();
         let (outcome, path) = if login.check_clear_fast(&password) {

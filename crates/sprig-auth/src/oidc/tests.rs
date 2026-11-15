@@ -1029,7 +1029,7 @@ async fn mongo_logins_find_the_tenant_and_its_issuer() {
     );
 }
 
-// ---- token roles (chapter 29) and the residency hand-off ----
+// ---- token roles and the residency hand-off ----
 
 fn token_req<'a>(protocol: TokenProtocol, label: &'static str, token: &'a str) -> TokenLogin<'a> {
     TokenLogin {
@@ -1137,6 +1137,7 @@ async fn token_roles_resolve_by_name_and_undefined_ones_are_audited() {
     );
 }
 
+#[allow(clippy::unnecessary_wraps)] // reads as set_residency's argument
 fn pinned(dcs: &[&str], deny: bool) -> Option<crate::account::TenantResidency> {
     Some(crate::account::TenantResidency {
         allowed_dcs: dcs

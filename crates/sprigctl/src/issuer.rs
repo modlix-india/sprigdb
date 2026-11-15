@@ -1,4 +1,4 @@
-//! A tenant's token issuers (chapter 14's external tokens):
+//! A tenant's token issuers (for external tokens):
 //!
 //! - `sprigctl tenant issuer list <tenant>`: `GET /admin/v1/tenants/{name}/issuers`;
 //! - `sprigctl tenant issuer put <tenant> --spec <file|->`: `POST` the same

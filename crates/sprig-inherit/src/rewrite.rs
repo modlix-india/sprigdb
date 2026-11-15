@@ -1,7 +1,7 @@
-//! Statements reading inheritable objects (chapter 42, "The merged view";
-//! build step 4): every reference to an inheritable object becomes the
-//! session space's merged view, as a derived table under the name the
-//! statement used, and `SPRIG_ORIGIN()` becomes the view's origin column.
+//! Statements reading inheritable objects: every reference to an inheritable
+//! object becomes the session space's merged view, as a derived table under the
+//! name the statement used, and `SPRIG_ORIGIN()` becomes the view's origin
+//! column.
 //!
 //! The statement is parsed with sqlparser-rs; each reference is replaced by
 //! a placeholder name before printing and the placeholder by the view's SQL
@@ -308,11 +308,10 @@ const MERGED: &str = "`__sprig_m`";
 /// `view` (a merged view of `res`, whose columns are `columns`) as the
 /// session may see it:
 /// its records filtered by the session's row-level security policies on
-/// `res`'s table, evaluated on the merged values (chapter 29, "Data
-/// inheritance"; decision rlsinherit). Inherited rows, from a parent space,
-/// a parent tenant's share view or a materialized copy, pass the same
-/// policies as the space's own. The layer references inside are left to
-/// this filter ([`crate::view::LAYER_ALIAS`]).
+/// `res`'s table, evaluated on the merged values. Inherited rows, from a parent
+/// space, a parent tenant's share view or a materialized copy, pass the same
+/// policies as the space's own. The layer references inside are left to this
+/// filter ([`crate::view::LAYER_ALIAS`]).
 ///
 /// # Errors
 /// The runner's; [`replace_refs`]'s for a policy's subqueries.
@@ -333,7 +332,7 @@ pub(crate) async fn filtered(
     // A policy's subqueries on inheritable objects read the session space's
     // merged views, not every space's layer rows; unfiltered by their own
     // policies, since policies never recurse (MariaDB's policy views still
-    // apply theirs, decision RL23).
+    // apply theirs).
     let names_inheritable = crate::grammar::identifiers(p.as_bytes(), &ctx.lex)
         .iter()
         .any(|i| ctx.state.objects().any(|o| o.table.eq_ignore_ascii_case(i)));
@@ -373,7 +372,7 @@ fn names_column(e: &Expr, alias: &str, col: &str) -> bool {
 
 /// Literal key values a single-table `SELECT` restricts the reference to
 /// (`key = v` or `key IN (v, ...)` among the top-level `AND`s), pushed
-/// into every level of the view (chapter 42, "Key predicates"). MariaDB
+/// into every level of the view. MariaDB
 /// pushes the outer predicate into the `UNION` branches itself, but not
 /// into the `NOT EXISTS` branch's reference to the parent level.
 fn pushed_keys(stmt: &Statement, rf: &Ref) -> Option<Vec<String>> {
@@ -480,8 +479,8 @@ async fn replace_refs_with(
         return Ok(None);
     }
     // A record hierarchy's path columns: in the view only when the
-    // statement names them (a type plan's), and never in `*` (decision
-    // T22; a derived table has no invisible columns).
+    // statement names them (a type plan's), and never in `*` (a
+    // derived table has no invisible columns).
     let paths_named = crate::grammar::identifiers(stmt.to_string().as_bytes(), &ctx.lex)
         .iter()
         .any(|i| crate::hier::is_path_column(i));

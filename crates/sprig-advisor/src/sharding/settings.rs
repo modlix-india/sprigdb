@@ -86,7 +86,7 @@ key! {
 key! {
     /// `advisor.lookup_min_runs`: equality reads of one column (`=`, `IN`)
     /// in the window before the advisor proposes a global lookup index on
-    /// it (chapter 19).
+    /// it.
     LOOKUP_MIN_RUNS: u64 = "advisor.lookup_min_runs", 100, 1, 1_000_000_000, "Reads of a column before a lookup index is proposed"
 }
 key! {
@@ -100,7 +100,7 @@ key! {
     LOOKUP_EVAL_MINUTES: u64 = "advisor.lookup_eval_minutes", 5, 1, 1440, "Period of the lookup proposals"
 }
 
-/// The advisor's lookup proposals for one tenant (chapter 19):
+/// The advisor's lookup proposals for one tenant:
 /// `advisor.lookup_*` and `auto_index.lookup_scatter_pct`.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LookupAdvice {

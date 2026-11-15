@@ -476,7 +476,7 @@ impl SqlVhost {
     /// messages and its forward ledger, as for an outbox forward), and the
     /// messages for one queue reach its owner in one command. A change
     /// exchange's forwarder gives each change a fixed id, so a publish
-    /// repeated after a restart is a no-op (R9 r9feed4).
+    /// repeated after a restart is a no-op.
     ///
     /// One entry per message, in order, up to the first that failed: the
     /// queues it reached (0: unroutable, not an error), or its error

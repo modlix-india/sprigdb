@@ -480,7 +480,7 @@ async fn live_a_crash_between_statements_and_record_reruns_safely() {
     .await;
 }
 
-/// `MigrateOpts::existing()` (fetfix): a missing catalog schema is 39072
+/// `MigrateOpts::existing()`: a missing catalog schema is 39072
 /// and isn't made. A loop migrating a catalog that cleanup had just dropped
 /// made it again without an owner mark; only bootstrap makes a catalog,
 /// with its mark.

@@ -1,4 +1,4 @@
-//! Global lookup indexes in SQL (chapter 19): the gateway's side of
+//! Global lookup indexes in SQL: the gateway's side of
 //! `sprig_shard::lookup::admin`.
 //!
 //! - **`SPRIG SHOW LOOKUP INDEXES [FROM t]`** (also `SHOW SPRIG LOOKUP
@@ -78,7 +78,7 @@ pub fn settings(svc: &TenantServices, tenant: TenantId) -> LookupSettings {
 }
 
 /// `lookup.lock_wait_seconds` for claims and owner checks on `owner`'s
-/// lookups, at the owner table's scope (chapter 19), with `cat`'s rows.
+/// lookups, at the owner table's scope, with `cat`'s rows.
 #[must_use]
 pub fn lock_wait_in(svc: &TenantServices, cat: &TenantCatalog, owner: ObjectId) -> u64 {
     let ctx = cat.object_ctx(&svc.dc, owner);
@@ -571,7 +571,7 @@ fn schema_db(tenant: TenantId, schema: &str) -> Option<DbId> {
 }
 
 /// Grants on the lookup tables of the tables accounts hold table or
-/// column grants on (Q50): a user granted only some tables reaches their
+/// column grants on: a user granted only some tables reaches their
 /// lookups the way a database-wide grant does, and no others.
 ///
 /// - `SELECT` on the owner gives `SELECT` on its lookup tables (routing

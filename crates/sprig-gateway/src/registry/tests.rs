@@ -98,7 +98,7 @@ async fn state_changes_are_written_at_once() {
     task.await.unwrap();
 }
 
-/// r1diff (GR7): a gateway writing to many shards made a load report over
+/// Regression: a gateway writing to many shards made a load report over
 /// the 64 KiB record limit, and every registration write failed with it.
 #[tokio::test]
 async fn a_large_load_report_never_fails_the_registration() {

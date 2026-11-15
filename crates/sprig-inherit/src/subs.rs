@@ -1,5 +1,4 @@
-//! The copy worker's feed subscriptions (chapter 42, "Materialized
-//! copies"; chapter 38, "Subscriptions and delivery").
+//! The copy worker's feed subscriptions, which keep materialized copies.
 //!
 //! One worker job keeps every copy of a tenant tree and orphans across its
 //! tenants. It reads the feed of each tenant of the tree through a

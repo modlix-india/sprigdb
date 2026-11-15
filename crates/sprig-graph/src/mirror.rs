@@ -262,7 +262,7 @@ pub async fn write_pos<Q: Queryable + Send>(
 /// the binlog position when it starts; were the applier's own position
 /// writes logged, that position would always be one transaction past the
 /// applier's latest row, so every read with an incoming hop waited for its
-/// next write (about half a second, G84). The rows are read only on the
+/// next write (about half a second). The rows are read only on the
 /// catalog's writer; a new writer after a failover has older rows (or
 /// none) until the applier's next write, and reads scatter meanwhile.
 const NO_BINLOG: &str = "SET STATEMENT sql_log_bin = 0 FOR ";

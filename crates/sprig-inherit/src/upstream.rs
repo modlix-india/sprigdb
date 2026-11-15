@@ -1,5 +1,4 @@
-//! Cross-tenant read-through edges (chapter 42, "Cross-tenant
-//! read-through"; the read-through half of build step 9).
+//! Cross-tenant read-through edges.
 //!
 //! A tenant's root space hangs below its parent tenant's root. When the
 //! parent shares object `db.t` with the child (`TO SPACE <child tenant>` or
@@ -15,13 +14,13 @@
 //!
 //! The view lives in the child's schema, so the child's accounts can
 //! select it with the grants they already have, and runs as the parent's
-//! **share definer** `t<parent>_sprig_share` (decision RL70): an account
+//! **share definer** `t<parent>_sprig_share`: an account
 //! SprigDB creates locked (nobody logs in as it) and grants `SELECT` only
 //! on what the parent's share views read, the parent's layer table and,
 //! in a chain, the parent's own share view of its parent. MariaDB itself
 //! thus limits the view to the parent's shared tables; its text is the
 //! share's subset. No user owns the account, so dropping or renaming the
-//! user who made the share (before RL70 the definer, `t<parent>_u<id>`)
+//! user who made the share (once the definer, `t<parent>_u<id>`)
 //! no longer breaks every child's view with 1449, and no policy of the
 //! parent binds it. A client can't name the view (`__sprig_` objects are
 //! reserved and hidden). The parent's merged view reads the parent's own
@@ -225,7 +224,7 @@ pub async fn ensure(ctx: &Ctx<'_>, run: &mut dyn Runner, r: &Resolved) -> Result
         let mut h = std::collections::hash_map::DefaultHasher::new();
         sqls.hash(&mut h);
         // The parent's catalog version too: a parent's `DROP SHARE` drops
-        // the view on every child (bugfix-44), and share ids are reused
+        // the view on every child, and share ids are reused
         // (`MAX + 1`), so a view this gateway made for a dropped share of
         // the same id and text must be made again.
         lineage[j - 1].version.hash(&mut h);

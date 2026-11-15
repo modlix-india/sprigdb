@@ -1019,7 +1019,7 @@ impl VShared {
                 // The lease holder trims the forward ledger: rows whose
                 // outbox row is gone, older than the longest a forward
                 // that read the row before its delete may still run; a
-                // change exchange's ids after a day (R9, r9feed5). Up to
+                // change exchange's ids after a day. Up to
                 // `LEDGER_PURGE_ROUNDS` batches a pass, so a busy queue's
                 // ledger doesn't outgrow one batch every 30 s.
                 if release && now >= next_purge {
@@ -1147,7 +1147,7 @@ pub const FORWARDER_OBJECT: u64 = 1 << 62;
 pub const LEDGER_KEEP_MS: i64 = 900_000;
 
 /// How long a forward-ledger row of a change exchange's message id
-/// ([`crate::store::is_change_id`]) stays (R9, r9feed5). Its forwarder
+/// ([`crate::store::is_change_id`]) stays. Its forwarder
 /// checkpoints at most every second, after what it published, and after a
 /// restart publishes again what came after the checkpoint; the ledger
 /// keeps those publishes no-ops, even when the messages were consumed

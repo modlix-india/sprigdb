@@ -1,5 +1,5 @@
-//! Kiran's example of 11 November 2026 through a running gateway (chapter
-//! 42, "Foreign keys, groups and tree-wide ids"): tenants `a → b → c`, `a`'s
+//! Foreign keys, groups and tree-wide ids through a running gateway:
+//! tenants `a → b → c`, `a`'s
 //! `t1` references `t2` by foreign key.
 //!
 //! - Only `a` declares anything: `b` and `c` receive `t1` and `t2` (the
@@ -487,7 +487,7 @@ async fn kirans_example() {
         );
 
         // 6. Refusals.
-        // Q3: a column a descendant already has.
+        // A column a descendant already has.
         exec(&mut c[2], "ALTER TABLE t1 ADD COLUMN c_own INT NULL").await;
         fails(&mut c[1], "ALTER TABLE t1 ADD COLUMN c_own INT NULL", 39897).await;
         // Leaving the group while shared.
@@ -681,11 +681,10 @@ async fn passes_after(c: &mut Conn, sql: &str, code: u16) -> u64 {
     }
 }
 
-/// Inheritance round 2 (decision IG7's gaps): an override in a child
-/// tenant that the copy worker makes an orphan holds its references as
-/// its own, so it gets a claim, and the values its view showed when the
-/// parent's record went (not the ones stored when it was written); until
-/// the worker has done that, the parent's delete hands the references
+/// An override in a child tenant that the copy worker makes an orphan holds its
+/// references as its own, so it gets a claim, and the values its view showed
+/// when the parent's record went (not the ones stored when it was written);
+/// until the worker has done that, the parent's delete hands the references
 /// over. `SPRIG RESET` of an orphan is checked like a delete. Needs the
 /// deployment's worker process (it orphans across tenants).
 #[tokio::test]
@@ -900,10 +899,10 @@ async fn orphans_keep_their_references() {
     }
 }
 
-/// Inheritance round 2 (decision IG5's gap): a type the parent widens
-/// while shared (`VARCHAR(10)` → `VARCHAR(60)`) reaches its children and
-/// grandchildren at their next statement, so their overrides and own rows
-/// can hold the longer values (before: 1406 in the child).
+/// A type the parent widens while shared (`VARCHAR(10)` → `VARCHAR(60)`)
+/// reaches its children and grandchildren at their next statement, so their
+/// overrides and own rows can hold the longer values (before: 1406 in the
+/// child).
 #[tokio::test]
 async fn widened_types_reach_children() {
     let Some(eps) = endpoints("widened_types_reach_children") else {
@@ -1042,15 +1041,14 @@ async fn names_become(c: &mut Conn, sql: &str, want: &[&str]) {
     }
 }
 
-/// Kiran's example with a typed table (inheritance plan step 6b and Q2):
-/// `a`'s `vehicle` with subtype `truck` (`WHERE vtype = 'TRUCK'`, single
-/// table and joined) and `trip` referencing `vehicle` by foreign key, made
-/// inheritable and shared. `b` and `c` receive the tables and the types;
-/// `b` adds a row with a value no type declares (`'SMALLTRUCK'`) and
-/// overrides a truck's payload; `c` declares its own subtype `smalltruck`
-/// and so sees `b`'s row as a smalltruck (and a truck), which `a` and `b`
-/// don't; ids come from the tree's sequence; `c`'s trip referencing `a`'s
-/// truck refuses `a`'s delete (1451) until it is gone.
+/// The same example with a typed table: `a`'s `vehicle` with subtype `truck`
+/// (`WHERE vtype = 'TRUCK'`, single table and joined) and `trip` referencing
+/// `vehicle` by foreign key, made inheritable and shared. `b` and `c` receive
+/// the tables and the types; `b` adds a row with a value no type declares
+/// (`'SMALLTRUCK'`) and overrides a truck's payload; `c` declares its own
+/// subtype `smalltruck` and so sees `b`'s row as a smalltruck (and a truck),
+/// which `a` and `b` don't; ids come from the tree's sequence; `c`'s trip
+/// referencing `a`'s truck refuses `a`'s delete (1451) until it is gone.
 #[tokio::test]
 async fn typed_tables_in_groups() {
     let Some(eps) = endpoints("typed_tables_in_groups") else {
@@ -1145,7 +1143,7 @@ async fn typed_tables_in_groups() {
                 &["a-truck", "a-truck2", "a-van"],
             )
             .await;
-            // b adds an undeclared value (open values, Q2) and a truck, and
+            // b adds an undeclared value (open values) and a truck, and
             // overrides a's truck's payload.
             exec(
                 &mut c[1],
@@ -1216,7 +1214,7 @@ async fn typed_tables_in_groups() {
             )
             .await;
             // Every table of the tree serves at c (across clusters each
-            // copy must, IG9) before c's own subtype reads them.
+            // copy must) before c's own subtype reads them.
             names_become(
                 &mut c[2],
                 "SELECT payload_kg FROM truck WHERE name = 'a-truck'",
@@ -1340,8 +1338,8 @@ async fn typed_tables_in_groups() {
     }
 }
 
-/// Round 3 (`groups_live::orphans_keep_their_references` failing with 1020
-/// on the MariaDB persona): a child's write plan reads the merged view and
+/// Regression (`groups_live::orphans_keep_their_references` failing with
+/// 1020 on the MariaDB persona): a child's write plan reads the merged view and
 /// then writes from it in one gateway transaction. While its parent (or
 /// the copy worker) changes the same records, MariaDB 11.8's snapshot
 /// isolation failed the plan's second statement with 1020 ("Record has
@@ -1353,7 +1351,7 @@ async fn concurrent_parent_writes_never_1020() {
     race_never_1020("concurrent_parent_writes_never_1020", false).await;
 }
 
-/// bugfix-54 (T17's leftover): the same race with `b`'s writes inside its
+/// Regression: the same race with `b`'s writes inside its
 /// own transactions, two statements each, so the second plan writes from
 /// the snapshot the first one's read opened. A plan inside a client's
 /// transaction can't run at READ COMMITTED, and a retry can't help: on
@@ -1494,15 +1492,14 @@ async fn race_never_1020(test: &str, in_txn: bool) {
     }
 }
 
-/// Round 3 (decision T16's refusals lifted, T18 and T20): drops on an
-/// inheritable type tree follow the rules of any inheritable table. `c`
-/// declares its own subtype under the tree it receives (across clusters
-/// its copy keeps serving: read at once, no 39889) and drops it again; its
-/// row of that type becomes a plain `vehicle`. Nobody may drop a table it
-/// receives (39897), and `a` may not drop a subtype while the tree is
-/// shared (39895); once the shares are gone it may, and the rows stay as
-/// vehicles. Inside one tenant, a drop changes every space's rows (a
-/// `_type` tree in joined storage).
+/// Drops on an inheritable type tree follow the rules of any inheritable table.
+/// `c` declares its own subtype under the tree it receives (across clusters its
+/// copy keeps serving: read at once, no 39889) and drops it again; its row of
+/// that type becomes a plain `vehicle`. Nobody may drop a table it receives
+/// (39897), and `a` may not drop a subtype while the tree is shared (39895);
+/// once the shares are gone it may, and the rows stay as vehicles. Inside one
+/// tenant, a drop changes every space's rows (a `_type` tree in joined
+/// storage).
 #[tokio::test]
 async fn drops_on_inheritable_type_trees() {
     let Some(eps) = endpoints("drops_on_inheritable_type_trees") else {
@@ -1575,7 +1572,7 @@ async fn drops_on_inheritable_type_trees() {
             names_become(&mut c[2], "SELECT name FROM truck", &["a-truck"]).await;
             names_become(&mut c[2], "SELECT name FROM vehicle", &["a-truck", "a-van"]).await;
             // c's own subtype: in single-table storage a column on the root
-            // it receives. Its reads work at once (T20).
+            // it receives. Its reads work at once.
             exec(
                 &mut c[2],
                 "CREATE TABLE smalltruck (axles INT NULL) INHERITS (truck) WHERE vtype = \
@@ -1708,14 +1705,13 @@ async fn drops_on_inheritable_type_trees() {
     }
 }
 
-/// Round 3 (decision T19): `ADD | DROP DISCRIMINATOR` on an inheritable
-/// type tree (joined storage, typed by `_type` first). `a` adds the
-/// discriminator while sharing the tree; `b` and `c` follow at their next
-/// statement, `c` keeping its own subtype with the value its rows hold:
-/// a row inserted with a value then takes that value's type at every
-/// level. Below the top only the parent's discriminator counts (39897).
-/// `a`'s `DROP DISCRIMINATOR` goes back the same way, every row keeping
-/// its type.
+/// `ADD | DROP DISCRIMINATOR` on an inheritable type tree (joined storage,
+/// typed by `_type` first). `a` adds the discriminator while sharing the tree;
+/// `b` and `c` follow at their next statement, `c` keeping its own subtype with
+/// the value its rows hold: a row inserted with a value then takes that value's
+/// type at every level. Below the top only the parent's discriminator counts
+/// (39897). `a`'s `DROP DISCRIMINATOR` goes back the same way, every row
+/// keeping its type.
 #[tokio::test]
 async fn discriminators_on_inheritable_type_trees() {
     let Some(eps) = endpoints("discriminators_on_inheritable_type_trees") else {
@@ -1827,7 +1823,7 @@ async fn discriminators_on_inheritable_type_trees() {
         )
         .await;
         // (Across clusters c's copy is seeded again after the change of
-        // its columns: 39889 until then, IG9.)
+        // its columns: 39889 until then.)
         settled(
             &mut c[2],
             "INSERT INTO kart (kind, name) VALUES ('PEDAL', 'c-pedal2')",
@@ -1851,7 +1847,7 @@ async fn discriminators_on_inheritable_type_trees() {
         .await;
         assert_eq!(names(&mut c[0], "SELECT name FROM gokart").await, ["a-go"]);
         // (Across clusters c's copy is seeded again after the change of
-        // its columns: 39889 until then, IG9.)
+        // its columns: 39889 until then.)
         settled(
             &mut c[2],
             "INSERT INTO kart (kind, name) VALUES ('PEDAL', 'c-plain')",

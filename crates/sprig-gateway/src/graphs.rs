@@ -1990,12 +1990,12 @@ async fn delete_group<Q: Queryable + Send>(q: &mut Q, cat: &str, group: u32) -> 
     Ok(())
 }
 
-/// 39908 when mapped-graph source `table` (object `o`) is inheritable
-/// (chapter 42): a mapped graph reads the table's rows as they are stored,
-/// which for an inheritable table are every space's layer rows (overrides,
-/// hide markers, other spaces' records), not a space's merged records, so
+/// 39908 when mapped-graph source `table` (object `o`) is inheritable: a
+/// mapped graph reads the table's rows as they are stored, which for an
+/// inheritable table are every space's layer rows (overrides, hide
+/// markers, other spaces' records), not a space's merged records, so
 /// neither inheritance nor the reader's row-level security would apply to
-/// them (decision rlsinherit). Checked when the graph is made and at every
+/// them. Checked when the graph is made and at every
 /// read, since a table can become inheritable later.
 fn inheritable_source(cat: &TenantCatalog, table: &str, o: u64) -> Result<()> {
     let inheritable = cat

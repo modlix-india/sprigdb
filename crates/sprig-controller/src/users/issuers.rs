@@ -1,5 +1,4 @@
-//! A tenant's token issuers through the Admin API (chapter 14's external
-//! tokens):
+//! A tenant's token issuers (for external tokens) through the Admin API:
 //!
 //! - `GET /admin/v1/tenants/{name}/issuers`: the issuers with their claim
 //!   mappings;

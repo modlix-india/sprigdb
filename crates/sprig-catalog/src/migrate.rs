@@ -325,7 +325,7 @@ pub struct MigrateOpts {
     /// with its mark. A loop migrating a catalog that was just dropped
     /// (a deleted tenant) or isn't claimed yet (a new tenant, after its
     /// placement) made an unmarked schema, which bootstrap then refused
-    /// as another tenant's (39072, fetfix).
+    /// as another tenant's (39072).
     pub create_schema: bool,
 }
 
@@ -342,8 +342,8 @@ impl MigrateOpts {
 }
 
 impl Default for MigrateOpts {
-    /// Expands only, as far as this binary knows: contracts need step
-    /// 12's delay and reader checks, so they never run by default.
+    /// Expands only, as far as this binary knows: contracts need the
+    /// contract delay and the reader checks, so they never run by default.
     fn default() -> Self {
         Self {
             lock_timeout: Duration::from_secs(30),

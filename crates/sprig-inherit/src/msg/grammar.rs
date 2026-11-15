@@ -1,6 +1,5 @@
-//! The statements and clauses of inherited messaging objects (chapter 42,
-//! "Syntax"; chapter 45, "Inherited streams"), recognized on chapter 07's
-//! lexer:
+//! The statements and clauses of inherited messaging objects, recognized
+//! on the SQL lexer:
 //!
 //! ```text
 //! CREATE ... name FOR EACH TENANT [CHILDREN | DESCENDANTS] [UNDER t]
@@ -15,7 +14,7 @@
 //! SHOW INHERITED BROADCASTS FOR kind [db.]name
 //! ```
 //!
-//! The kind-specific rest of a `CREATE` is parsed by its own chapter's
+//! The kind-specific rest of a `CREATE` is parsed by its kind's own
 //! grammar once the clause is cut out ([`ForEach::range`]).
 
 use std::ops::Range;
@@ -598,9 +597,8 @@ pub fn statement(sql: &str, opts: &LexOptions) -> Result<Option<Stmt>> {
     })))
 }
 
-/// An AMQP topology statement (chapter 50, "SQL, logic, MongoDB and
-/// HTTP"), as `FOR EACH TENANT` definitions use it (the clause cut out
-/// first).
+/// An AMQP topology statement, as `FOR EACH TENANT` definitions use it (the
+/// clause cut out first).
 #[derive(Debug, Clone, PartialEq)]
 pub enum MqDecl {
     /// `CREATE EXCHANGE [IF NOT EXISTS] [db.]e [TYPE] t [INTERNAL] [WITH (...)]`.

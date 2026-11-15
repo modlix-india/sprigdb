@@ -230,7 +230,7 @@ fn foreign_keys_and_their_errors() {
 
 // MariaDB 11.8.9's errors through the hidden columns, and MySQL 8.4.11's
 // answers to the same statements (captured 15 November 2026; SQLancer
-// found the first two, r1diff GR8).
+// found the first two).
 #[test]
 fn functional_index_errors_name_the_index() {
     let e = "( EXISTS (SELECT 1 wHERE FALSE)) IS NOT FALSE";
@@ -295,10 +295,10 @@ fn dropping_a_column_something_generated_uses() {
     );
 }
 
-// GR12: MySQL 8.4.11's answers (captured 15 November 2026 in
-// `smallfix3-mysql84`) to renaming, and to dropping every visible column,
-// where a functional index uses the column; MariaDB 11.8 renames inside
-// the hidden column's expression, and answers the drop with 1113.
+// MySQL 8.4.11's answers (captured 15 November 2026) to renaming, and to
+// dropping every visible column, where a functional index uses the column;
+// MariaDB 11.8 renames inside the hidden column's expression, and answers
+// the drop with 1113.
 #[test]
 fn renaming_or_dropping_what_a_functional_index_uses() {
     let r = |sql: &str| renamed_columns(sql.as_bytes(), &my());
@@ -364,7 +364,7 @@ fn renaming_or_dropping_what_a_functional_index_uses() {
     assert_eq!(fx_drop_all(1054, &cols(&["a"]), &g), None);
 }
 
-// GR12: MariaDB's errors for a value that doesn't fit a hidden column, and
+// MariaDB's errors for a value that doesn't fit a hidden column, and
 // MySQL 8.4.11's 3752 and 3751 naming the index.
 #[test]
 fn values_that_dont_fit_a_functional_index() {

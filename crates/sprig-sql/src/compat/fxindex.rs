@@ -1310,7 +1310,7 @@ mod index_name_tests {
         index_of_fx_column(sql.as_bytes(), &LexOptions::mysql84(), column)
     }
 
-    // The statements SQLancer wrote (r1diff, GR8), and MySQL 8.4.11's names
+    // The statements SQLancer wrote, and MySQL 8.4.11's names
     // for unnamed functional indexes (captured 15 November 2026).
     #[test]
     fn the_index_behind_a_hidden_column() {

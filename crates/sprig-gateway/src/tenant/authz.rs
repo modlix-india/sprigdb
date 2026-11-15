@@ -343,7 +343,7 @@ impl AuthzServices {
             }
         }
         // Accounts with table-level grants reach those tables' global
-        // lookup indexes (chapter 19, Q50).
+        // lookup indexes.
         if let Err(e) = super::lookups_sql::add_lookup_grants(svc, cat, cluster, &mut want).await {
             tracing::warn!(tenant = %cat.tenant, %cluster, error = %e, "lookup tables' grants not placed; table-level users' writes to tables with lookups fail until the next reconcile");
         }
@@ -382,8 +382,8 @@ impl AuthzServices {
         })?;
         let started = std::time::Instant::now();
         let rep = backend::reconcile(&mut conn, cat.tenant, &want, &per_user.key, full).await?;
-        // Share views run as their parent's share definer (RL68, RL70): a
-        // full reconcile moves other stored code off non-tenant definers;
+        // Share views run as their parent's share definer: a full
+        // reconcile moves other stored code off non-tenant definers;
         // it and the drift sweep re-point share views with another definer
         // (an older build's) and give the definer what it lacks.
         if full || sweep {
@@ -596,9 +596,9 @@ impl SessionAuthz {
     }
 }
 
-/// The session's token roles at `cat` (chapter 29, "Token roles"): the role
-/// mappings of its verified token's issuer, evaluated on its claims at
-/// each auth version, as roles the tenant defines. Empty without a token.
+/// The session's token roles at `cat`: the role mappings of its verified
+/// token's issuer, evaluated on its claims at each auth version, as roles
+/// the tenant defines. Empty without a token.
 #[must_use]
 pub fn token_roles(ts: &TenantSession, cat: &TenantCatalog) -> Vec<RoleId> {
     let Some(claims) = ts.rls.claims.as_deref() else {
@@ -1287,7 +1287,7 @@ fn rls_context_now(ts: &TenantSession, cat: &TenantCatalog) -> Option<String> {
     ))
 }
 
-/// MySQL's 1615: the gateway prepares the client's text again (RL24).
+/// MySQL's 1615: the gateway prepares the client's text again.
 fn needs_reprepare() -> SprigError {
     SprigError::standard(
         1615,
@@ -1336,7 +1336,7 @@ pub fn recheck(ts: &TenantSession, persona: Persona, rc: &Recheck) -> Result<()>
     let r = check_text(&cx, rc.kind, &rc.text, rc.lex);
     // A table whose policies bind the session since the prepare (a policy
     // created or row security enabled): the text has no predicates for it.
-    // Prepared again, it takes the rewrite as a fresh prepare does (S161).
+    // Prepared again, it takes the rewrite as a fresh prepare does.
     // An engine without the gateway's rewrite keeps 39366.
     if r.as_ref()
         .is_err_and(|e| e.code() == Some(sprig_common::SprigCode::RlsUnsupported))

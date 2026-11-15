@@ -777,8 +777,8 @@ fn shape(seen: &[Vec<u8>]) -> Vec<(u8, usize)> {
     seen.iter().map(|p| (p[0], p.len())).collect()
 }
 
-/// Unknown users of a tenant look like its accounts on every plugin path
-/// (loginerr): with `auth.mysql_native_password` on, a client asking for
+/// Unknown users of a tenant look like its accounts on every plugin path:
+/// with `auth.mysql_native_password` on, a client asking for
 /// native gets native from an unknown user, as from an account whose
 /// password was set with both verifiers; with it off, both get
 /// `caching_sha2_password`. Also for libmysqlclient's empty placeholder

@@ -124,7 +124,7 @@ fn deletes_and_replay_are_idempotent() {
     assert_eq!(ix.payloads().unwrap(), vec![Some("p2".to_owned()); 2]);
 }
 
-/// Found live (r9feed2): a copy that applied updates again after a
+/// Found live: a copy that applied updates again after a
 /// worker's `kill -9` holds deleted documents until a merge; they count in
 /// a term's `doc_freq`, so global BM25 statistics must count them in the
 /// documents too, or Tantivy's `doc_count >= doc_freq` assertion panics.

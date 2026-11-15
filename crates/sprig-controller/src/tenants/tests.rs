@@ -991,8 +991,8 @@ async fn live_tenant_ids_stay_in_the_deployments_range() {
     .await;
 }
 
-/// A create that half happened, then its retry (fetfix, after r9feed5's
-/// 39072 "its mark is ''" for a fresh id):
+/// A create that half happened, then its retry (a regression: it failed
+/// with 39072 "its mark is ''" for a fresh id):
 ///
 /// 1. The first try's bootstrap stopped after the catalog and its
 ///    migrations (a client timeout, a crash): the same request again

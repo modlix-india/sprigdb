@@ -1,11 +1,11 @@
-//! The `lookup.*` keys (chapter 19) and [`LookupSettings`], what lookup
-//! writers and lookup jobs read for one tenant. The gateway (DDL, `SPRIG
+//! The `lookup.*` keys and [`LookupSettings`], what lookup writers and
+//! lookup jobs read for one tenant. The gateway (DDL, `SPRIG
 //! ... LOOKUP INDEX`, the router's claims) and the controller (recovery,
 //! the advisor's builds) resolve the same keys.
 //!
-//! Scopes follow chapter 19's table: `lookup.lock_wait_seconds` takes every
-//! data scope (its object is the owner table, resolved per claim); the job
-//! keys take tenant, dc and global, as does `lookup.orphan_scan_hours`.
+//! Scopes: `lookup.lock_wait_seconds` takes every data scope (its object
+//! is the owner table, resolved per claim); the job keys take tenant, dc
+//! and global, as does `lookup.orphan_scan_hours`.
 
 use std::time::Duration;
 

@@ -1,12 +1,12 @@
-//! Exactly once in change streams across a copy's first seed (decision
-//! RL71): which feed delivers a change of an inherited record to a
-//! subscriber whose tenant reads it through a materialized copy.
+//! Exactly once in change streams across a copy's first seed: which feed
+//! delivers a change of an inherited record to a subscriber whose tenant
+//! reads it through a materialized copy.
 //!
 //! Before a copy's first seed ends, the child reads its parent through
 //! (the share view), and a change stream maps the parent's changes. After
 //! it, the copy is the stream's source: its rows' changes are mapped, the
 //! parent's are not. A change made around that moment could come twice
-//! (once from each side) or not at all (RL69's "not exact"). Now the
+//! (once from each side) or not at all. Now the
 //! worker records the **handover** atomically with the flip to `serving`
 //! (`copy::STATE_TABLE`'s `handover_source` and `handover_child`):
 //!
@@ -28,7 +28,7 @@
 //! of the seed is at or before `child`, every later write of the copy
 //! after it. So:
 //!
-//! | change | no copy | first seed running | handover `(s, c)` | before RL71 |
+//! | change | no copy | first seed running | handover `(s, c)` | served before handovers |
 //! |---|---|---|---|---|
 //! | the source's row, GTID `g` | counts | held | counts iff `g <= s` | dropped |
 //! | the copy's row, GTID `w` | — | dropped | counts iff `w > c` | counts |
@@ -40,11 +40,11 @@
 //! filter changed, a schema change) keeps the handover: the copy stays the
 //! source, and its seed's writes are the changes the stream hasn't sent
 //! yet. A copy that served before handovers were recorded counts as
-//! handed over before every change ("before RL71").
+//! handed over before every change (the last column).
 //!
 //! GTIDs compare within one domain and server (one cluster's primary, with
 //! `gtid_strict_mode`); an event from another server isn't comparable and
-//! the caller falls back to RL69's rule (the view's sources now).
+//! the caller falls back to the view's current sources.
 
 /// When a copy became its subscribers' source.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]

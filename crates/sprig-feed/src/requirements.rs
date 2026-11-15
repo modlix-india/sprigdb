@@ -1,5 +1,4 @@
-//! Binlog requirements and `feed_source` (chapter 38, "Binlog
-//! requirements"; build step 1).
+//! Binlog requirements and `feed_source`.
 
 use std::collections::HashMap;
 

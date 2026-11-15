@@ -44,18 +44,18 @@
 //!   dump per node, or any dump of kind `tenant`. Catch-up dumps are
 //!   reported (sampled, and each process's
 //!   `sprig_feed_resumes_total{tier="binlog"}` at the end, which counts
-//!   since its last start; R9 r9feed4), and fail the test under
+//!   since its last start), and fail the test under
 //!   `SPRIG_SFC_NO_CATCHUP=1`: after the kills, a trigger, search copy or
 //!   copy worker that falls far behind may still take one. The node's own count is
 //!   reported (samples above `SPRIG_SFC_EXPECT_DUMPS`, 2): it also holds,
 //!   for a moment, dumps a killed process or a reopened hub left behind.
 //!
-//! The worker's other feed consumers (R9, r9feed3), each optional:
+//! The worker's other feed consumers, each optional:
 //!
 //! - `SPRIG_SFC_AMQP=127.0.0.1:37672`: a change exchange on each tenant's
 //!   `ord` (`queue.change_exchange = 'ord.x'`, a queue bound with `#` in
 //!   vhost `sfc`). Every committed row's insert is published exactly once
-//!   (R9 r9feed4: each change's message id is taken by a queue once, so a
+//!   (each change's message id is taken by a queue once, so a
 //!   killed worker's or a retried publish is a no-op), no rolled-back one.
 //! - `SPRIG_SFC_HTTP=127.0.0.1:37080` and `SPRIG_SFC_SPRIGCTL=<sprigctl>`
 //!   (with `SPRIGCTL_ENDPOINT`): a graph `sfc.g` in each tenant over two
@@ -157,8 +157,7 @@ async fn dump_gauges(addr: &str) -> BTreeMap<(String, String), f64> {
 }
 
 /// The catch-up dumps one process opened since it started, by consumer:
-/// `sprig_feed_resumes_total{tier="binlog"}` (the `consumer` label, R9
-/// r9feed5).
+/// `sprig_feed_resumes_total{tier="binlog"}` (the `consumer` label).
 async fn catchups(addr: &str) -> BTreeMap<String, f64> {
     let mut out = BTreeMap::new();
     for ((tier, consumer), v) in metric(addr, "sprig_feed_resumes_total", "tier", "consumer").await
@@ -679,7 +678,7 @@ async fn triggers_search_and_change_streams_share_one_dump_per_process() {
                 "sharding.min_shards",
                 "2",
                 "--reason",
-                "r9feed3 shared feed live test",
+                "shared feed live test",
             ])
             .expect("sharding.min_shards");
             c.query_drop(format!("CREATE GRAPH {graph}")).await.unwrap();
@@ -1393,7 +1392,7 @@ async fn triggers_search_and_change_streams_share_one_dump_per_process() {
             failures.push(format!("{process}: {v} {kind} dumps on {node} at once"));
         }
     }
-    // Catch-up dumps (R9 r9feed4: the change exchange publishes in
+    // Catch-up dumps (the change exchange publishes in
     // batches and keeps up after a worker's restart; a failure under
     // SPRIG_SFC_NO_CATCHUP=1).
     let allow_catchup = var("SPRIG_SFC_NO_CATCHUP").as_deref() != Some("1");

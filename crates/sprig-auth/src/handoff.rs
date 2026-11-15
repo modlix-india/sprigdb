@@ -248,8 +248,8 @@ pub async fn serve_handoff(
     start: HandoffStart,
     password: &[u8],
 ) -> HandoffResult {
-    if let Some(t) = start.token_login.clone() {
-        return serve_token_handoff(svc, start, t, password).await;
+    if let Some(t) = &start.token_login {
+        return serve_token_handoff(svc, &start, t, password).await;
     }
     let req = start.request();
     if !matches!(svc.route_of(&req, false).await, Route::Local) {
@@ -306,11 +306,11 @@ pub async fn serve_handoff(
 /// verified token goes back with the principal.
 async fn serve_token_handoff(
     svc: &Arc<LoginService>,
-    start: HandoffStart,
-    t: TokenStart,
+    start: &HandoffStart,
+    req: &TokenStart,
     token: &[u8],
 ) -> HandoffResult {
-    if !matches!(svc.token_route(&t.tenant).await, Route::Local) {
+    if !matches!(svc.token_route(&req.tenant).await, Route::Local) {
         metrics::counter!("sprig_auth_handoffs_total", "outcome" => "misrouted").increment(1);
         return HandoffResult::Refused(ErrPacket::from_error(
             Persona::MySql84,
@@ -335,11 +335,11 @@ async fn serve_token_handoff(
         }),
         _ => None,
     };
-    let r = svc
+    let decided = svc
         .token_login_here(&TokenLogin {
-            protocol: t.protocol,
-            label: t.label(),
-            tenant: &t.tenant,
+            protocol: req.protocol,
+            label: req.label(),
+            tenant: &req.tenant,
             token,
             client_ip: start.client_ip,
             tls: start.tls,
@@ -347,24 +347,24 @@ async fn serve_token_handoff(
             client_dn: dn.as_ref(),
         })
         .await;
-    let mut e = AuditEvent::new(audit::events::HANDOFF, t.label(), svc.clock().wall());
-    e.client_ip = Some(start.client_ip);
-    e.tenant_name = Some(t.tenant.clone());
-    e.mechanism = Some("jwt");
-    e.detail = Some(format!("from {}", start.source_dc));
-    match r {
-        Ok((p, v)) => {
-            e.tenant = p.tenant;
-            e.user = Some(p.user.clone());
-            e.user_id = p.user_id;
-            svc.audit().emit(&e);
-            HandoffResult::Accepted(Box::new(p), Some(Box::new(v)))
+    let mut ev = AuditEvent::new(audit::events::HANDOFF, req.label(), svc.clock().wall());
+    ev.client_ip = Some(start.client_ip);
+    ev.tenant_name = Some(req.tenant.clone());
+    ev.mechanism = Some("jwt");
+    ev.detail = Some(format!("from {}", start.source_dc));
+    match decided {
+        Ok((principal, verified)) => {
+            ev.tenant = principal.tenant;
+            ev.user = Some(principal.user.clone());
+            ev.user_id = principal.user_id;
+            svc.audit().emit(&ev);
+            HandoffResult::Accepted(Box::new(principal), Some(Box::new(verified)))
         }
-        Err(d) => {
-            e.outcome = "refused";
-            e.reason = Some(d.reason);
-            svc.audit().emit(&e);
-            HandoffResult::Refused(d.error)
+        Err(denied) => {
+            ev.outcome = "refused";
+            ev.reason = Some(denied.reason);
+            svc.audit().emit(&ev);
+            HandoffResult::Refused(denied.error)
         }
     }
 }

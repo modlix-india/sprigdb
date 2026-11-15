@@ -1,6 +1,4 @@
-//! The shared per-cluster reader (chapter 38, "The cluster reader";
-//! chapter 50, "Publishing inside a database transaction"; R9, r9cluster
-//! and r9feed).
+//! The shared per-cluster reader.
 //!
 //! A [`SharedFeed`] holds one **hub** per cluster. A hub reads that
 //! cluster's binlog once ([`Clusters::open_scope`]) and splits each
@@ -26,7 +24,7 @@
 //!     the others go on
 //!   at most every second: the position to every subscription (idle);
 //!     a view may ask for it sooner, down to every 200 ms (the graph
-//!     mirror's, r9feed3)
+//!     mirror's)
 //!   a broken stream reconnects from the hub's position; a lost history
 //!     (39800) ends every subscription with that error
 //!   no subscriptions for 30 s: the hub stops and closes its dump
@@ -35,15 +33,15 @@
 //!   from at or after the hub's position → listen
 //!   from inside the ring → the ring's groups after from, then listen;
 //!     more than max_backlog of them → max_backlog now, attach again after
-//!     them (r9feed5: a consumer that fell behind after a restart catches
-//!     up from the ring, not a catch-up dump)
+//!     them (a consumer that fell behind after a restart catches up from
+//!     the ring, not a catch-up dump)
 //!   the hub started under `gather` ago and delivered nothing → it moves
 //!     its start back to from (a worker's restart: every sequencer comes
 //!     back at once, each from its own checkpoint)
 //!   a new subscription keeping its tenant whole, up to REPLAY_GROUPS
 //!     behind → the dump reopens wider at from and reads those groups
 //!     again (a replay under way is extended); everyone skips what they
-//!     had, the ring keeps what it held (r9feed2: a stream or trigger that
+//!     had, the ring keeps what it held (a stream or trigger that
 //!     read the cluster's position a moment before the hub read on, or a
 //!     gateway's streams resuming after its restart)
 //!   else → a private catch-up dump for the tenant alone (at most
@@ -52,9 +50,9 @@
 //! ```
 //!
 //! One dump per cluster and process, however many tenants and stream
-//! instances: the 1,000-tenant run of R9 item 84 had 25 dumps (one per
-//! tenant with queues) fill a node's connections, and item 127 counted 76
-//! dumps for 75 stream instances.
+//! instances: with a dump per reader, 25 dumps (one per tenant with queues)
+//! filled a node's connections in a 1,000-tenant run, and 75 stream
+//! instances opened 76 dumps.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -93,19 +91,18 @@ pub struct SharedOpts {
     pub sub_channel: usize,
     /// Groups the ring keeps at most.
     pub ring_groups: usize,
-    /// Bytes (estimated) the ring keeps at most (chapter 38's
-    /// `feed.ring_mb`).
+    /// Bytes (estimated) the ring keeps at most (`feed.ring_mb`).
     pub ring_bytes: usize,
-    /// Private catch-up dumps per cluster at once (chapter 38's
-    /// `feed.max_catchup_readers_per_cluster`).
+    /// Private catch-up dumps per cluster at once
+    /// (`feed.max_catchup_readers_per_cluster`).
     pub max_catchup: usize,
     /// For this long after it starts, while it has delivered no group, a
     /// hub moves its start back for a subscription behind it.
     pub gather: Duration,
     /// A return through the ring hands over at most this many groups at a
     /// time; with more, the subscription reads them in parts of this size
-    /// from the ring and listens only once it is this close (R9, r9feed5:
-    /// before, it took a catch-up dump).
+    /// from the ring and listens only once it is this close, instead of
+    /// taking a catch-up dump.
     pub max_backlog: usize,
 }
 
@@ -359,7 +356,7 @@ struct HubState {
     /// Tenants the open dump keeps whole, and since when.
     scope_whole: HashMap<TenantId, GtidPos>,
     /// A new subscription keeping a tenant whole started a little behind
-    /// `pos`: the wider dump reopens here instead (r9feed2), and reads the
+    /// `pos`: the wider dump reopens here instead, and reads the
     /// groups up to `pos` again.
     replay: Option<GtidPos>,
     /// Reading groups again up to here: each subscription skips what it
@@ -407,7 +404,7 @@ impl HubState {
     /// everything up to it and that is due one (its view's cadence). Not while a move back is pending: a
     /// subscription registered behind `pos` for it hasn't had the groups
     /// before `pos` yet, and an idle position would make its tail skip
-    /// them (found in r9feed's live run).
+    /// them (found in a live run).
     fn idle_fanout(&mut self, pos: &GtidPos) {
         if self.rewind.is_some() || self.replay.is_some() || self.reopen != Reopen::No {
             return;
@@ -546,7 +543,7 @@ enum Attach {
         detached: Arc<AtomicBool>,
     },
     /// The next `max_backlog` of its groups from the ring, not listening
-    /// yet: it attaches again after them (r9feed5).
+    /// yet: it attaches again after them.
     Ring(VecDeque<SourceItem>),
     /// Its own dump until the ring covers it, and why.
     CatchUp(Why),
@@ -659,7 +656,7 @@ impl Hub {
             if backlog.len() > opts.max_backlog {
                 // Further behind than one hand-over: a part from the ring
                 // now, the rest on its next attach, while the ring still
-                // covers it (r9feed5; before, a catch-up dump).
+                // covers it, rather than a catch-up dump.
                 backlog.truncate(opts.max_backlog.max(1));
                 tracing::debug!(cluster = %self.cluster, %tenant, consumer = who.consumer, "shared feed reader: a return through the ring, in parts");
                 return Attach::Ring(backlog);
@@ -695,7 +692,7 @@ impl Hub {
         // before the hub read on; or a gateway's change streams resuming
         // after a restart): the dump reopens wider anyway, so it reopens
         // at `from` and reads those groups again instead of opening a
-        // catch-up dump (r9feed2). Up to `REPLAY_GROUPS` groups back; a
+        // catch-up dump. Up to `REPLAY_GROUPS` groups back; a
         // replay under way is extended (each subscription skips what it
         // had).
         if first && whole && st.rewind.is_none() && behind(from, &pos) <= REPLAY_GROUPS {
@@ -1110,7 +1107,7 @@ enum Mode {
         detached: Arc<AtomicBool>,
     },
     CatchUp(CatchUp),
-    /// A part of a long return through the ring (r9feed5): attach again
+    /// A part of a long return through the ring: attach again
     /// after it.
     Ring(VecDeque<SourceItem>),
     /// Detached, or not served yet: attach again.
@@ -1334,8 +1331,7 @@ impl SharedFeed {
     /// [`Self::view`], with idle positions at most every `idle_every` (at
     /// least [`IDLE_TICK`]): for a consumer that must reach the cluster's
     /// position soon after others' writes, as the graph mirror does (a
-    /// mirror read waits for it to reach the cluster's position now; R9,
-    /// r9feed3). A dump of its own sends them after
+    /// mirror read waits for it to reach the cluster's position now). A dump of its own sends them after
     /// [`crate::binlog::IDLE_EVERY`] without the tenant's rows.
     #[must_use]
     pub fn view_every(self: &Arc<Self>, kept: Kept, idle_every: Duration) -> Arc<SharedClusters> {
@@ -1402,7 +1398,7 @@ pub struct SharedClusters {
     /// Idle positions to each subscription at most this often.
     idle_every: Duration,
     /// The consumer reading through it: the `consumer` label of the
-    /// reader's detach and catch-up logs and metrics (R9, r9feed5).
+    /// reader's detach and catch-up logs and metrics.
     consumer: &'static str,
 }
 
@@ -1419,8 +1415,8 @@ impl std::fmt::Debug for SharedClusters {
 }
 
 impl SharedClusters {
-    /// A reader of its own over `inner`, keeping rows of `tables` (R9,
-    /// r9cluster's form: one view).
+    /// A reader of its own over `inner`, keeping rows of `tables` (one
+    /// view).
     #[must_use]
     pub fn new(inner: Arc<dyn Clusters>, tables: &[&str]) -> Self {
         let feed = SharedFeed::new(inner, SharedOpts::default());

@@ -1,5 +1,4 @@
-//! The queue forwarder's heartbeat (chapter 50, "Publishing inside a
-//! database transaction"; bugfix-42).
+//! The queue forwarder's heartbeat.
 //!
 //! The worker's `queue_forwarder` job of a cluster writes
 //! `queue-forwarder-beats/<cluster>` in its DC's tier every 2 s while it runs

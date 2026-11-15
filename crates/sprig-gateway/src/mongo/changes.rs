@@ -1,11 +1,9 @@
-//! Change streams (chapter 30 step 9; chapter 38 step 14; chapter 31
-//! step 14, "Sharding, SQL reads and change events").
+//! Change streams.
 //!
 //! An `aggregate` whose first stage is `$changeStream` (what drivers'
 //! `watch()` sends) opens a tailable `awaitData` cursor over the tenant's
-//! change feed: a [`TenantTail`] (chapter 38, "As built in R1") read by a
-//! task of its own, which keeps the stream's events and progress tokens
-//! in a bounded queue. `getMore` waits up to its `maxTimeMS` (default
+//! change feed: a [`TenantTail`] read by a task of its own, which keeps
+//! the stream's events and progress tokens in a bounded queue. `getMore` waits up to its `maxTimeMS` (default
 //! 1 s) for events and answers with the batch and `postBatchResumeToken`.
 //!
 //! - **Rendering.** A row change of a collection's table becomes
@@ -28,24 +26,24 @@
 //!   `$replaceRoot`, `$replaceWith`) run on each batch.
 //!
 //! - **Replacements.** The document engine sends a replacement's `UPDATE`
-//!   with chapter 38's statement comment (`o=r`), which the feed keeps as
+//!   with the feed's statement comment (`o=r`), which the feed keeps as
 //!   the row's operation hint, so it shows as a `replace` event with the
-//!   new document (`decisions/r5-interim.md` D14).
+//!   new document.
 //!
-//! - **`showExpandedEvents`** (R5 round 4): `create`, `createIndexes`,
+//! - **`showExpandedEvents`**: `create`, `createIndexes`,
 //!   `dropIndexes` and `modify` (a `collMod` sets a table comment) from
 //!   the feed's DDL statements, with `collectionUUID` and
 //!   `operationDescription`; `rename` carries `to`.
-//! - **Pre- and post-images** (R5 round 4): `whenAvailable` and
+//! - **Pre- and post-images**: `whenAvailable` and
 //!   `required` follow the collection's `changeStreamPreAndPostImages`
 //!   option (`null`, or the stream fails with 280, when it is off).
-//! - **One dump per cluster** (R9, r9feed2): every stream's tail reads
+//! - **One dump per cluster**: every stream's tail reads
 //!   through the gateway's shared reader ([`feed_parts`]), not a binlog
 //!   dump of its own.
 //!
 //! Not built: `startAtOperationTime` (the feed can't position by time yet),
-//! `shardCollection` events, and the k-way merge across clusters (R1 keeps
-//! a tenant on one cluster at a time).
+//! `shardCollection` events, and the k-way merge across clusters (a
+//! tenant lives on one cluster at a time).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -281,9 +279,8 @@ pub(crate) type FeedParts = (Arc<dyn Clusters>, Arc<dyn PlacementView>, Arc<dyn 
 /// The gateway's feed parts, one set per process, for every change
 /// consumer in it: MongoDB change streams, the HTTP, gRPC and WebSocket
 /// change streams, Redis keyspace notifications, the change exchange and
-/// chapter 39's search runtimes. Their tails read through one shared
-/// reader (R9, r9feed2: `sprig_feed::shared`, a view keeping each tenant
-/// whole), so the gateway keeps one binlog dump per cluster however many
+/// search runtimes. Their tails read through one shared reader
+/// (`sprig_feed::shared`, a view keeping each tenant whole), so the gateway keeps one binlog dump per cluster however many
 /// streams it serves. The first call's stores are the process's.
 ///
 /// # Errors
@@ -363,9 +360,9 @@ pub struct StreamSpec {
     /// `dropIndexes`, `modify`) and the fields MongoDB 6.0 added
     /// (`collectionUUID`, `operationDescription`).
     pub expanded: bool,
-    /// Chapter 29 (RL34): the documents the stream's session may see, by
-    /// its row-level security policies when the stream opened. `None`: no
-    /// row event shows.
+    /// The documents the stream's session may see, by its row-level
+    /// security policies when the stream opened. `None`: no row event
+    /// shows.
     pub visibility: Option<Arc<crate::tenant::rls::DocViews>>,
 }
 
@@ -447,8 +444,8 @@ pub struct ChangeStream {
     pub token: String,
     pipeline: Vec<Document>,
     done: bool,
-    /// Chapter 29 (RL41): the digest of the row-level security views the
-    /// stream opened with ([`crate::tenant::rls::DocViews::fingerprint`]).
+    /// The digest of the row-level security views the stream opened with
+    /// ([`crate::tenant::rls::DocViews::fingerprint`]).
     pub policies: u64,
 }
 
@@ -477,7 +474,7 @@ fn parse_token(v: &Bson, tenant: TenantId) -> std::result::Result<ResumeToken, M
     Ok(t)
 }
 
-/// Chapter 38's codes in MongoDB's terms: a lost history is 286
+/// The feed's error codes in MongoDB's terms: a lost history is 286
 /// `ChangeStreamHistoryLost`, a bad token 260 `InvalidResumeToken`.
 fn feed_error(e: &SprigError) -> MongoError {
     match e.kind {
@@ -694,7 +691,7 @@ async fn render_inner(
             },
         );
     }
-    // Chapter 29 (RL34): events of documents the session may not see
+    // Row-level security: events of documents the session may not see
     // are dropped; an update that hides a document arrives as a delete,
     // one that shows it as an insert (`rls.stream_visibility_events`).
     let mut op = e.op;
@@ -904,8 +901,8 @@ async fn run(
     loop {
         // The tail is raced only against the stream's end, which drops it
         // for good (a resumed stream starts from the client's token), so a
-        // half-read item is never lost here (decision r9-131). The
-        // client's waits are on the channel.
+        // half-read item is never lost here. The client's waits are on the
+        // channel.
         let item = tokio::select! {
             () = stop.cancelled() => break,
             () = tx.closed() => break,

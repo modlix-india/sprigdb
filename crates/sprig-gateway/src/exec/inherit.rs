@@ -1,14 +1,14 @@
-//! Hierarchical data inheritance in a tenant session (chapter 42, R6
-//! order 2: read-through, single-shard tenants).
+//! Hierarchical data inheritance in a tenant session (read-through,
+//! single-shard tenants).
 //!
-//! Before chapter 32's type layer, each statement of a tenant text goes to
+//! Before the type layer, each statement of a tenant text goes to
 //! [`sprig_inherit::handle`] with the tenant's `inherit` state, its
 //! ancestors' snapshots (cross-tenant edges) and the session's space. A
 //! statement that isn't the inheritance layer's goes on unchanged.
 //! Otherwise its plan's statements run through this same session, as the
-//! type layer's do ([`super::types::GwRunner`]): logical names, chapter
-//! 29's checks, the session's backend connection and transaction, in
-//! *internal* mode so the `_sprig_` columns pass chapter 07's reserved-name
+//! type layer's do ([`super::types::GwRunner`]): logical names,
+//! authorization checks, the session's backend connection and transaction,
+//! in *internal* mode so the `_sprig_` columns pass the reserved-name
 //! check. A rewritten statement streams to the client the same way.
 //!
 //! The share views of cross-tenant edges are created as the provisioning
@@ -47,12 +47,12 @@ pub struct InheritSession {
     /// The statement running is one this layer generated (a rewritten read
     /// or a plan's statement): only then are references under
     /// [`sprig_inherit::view::LAYER_ALIAS`] the layers of merged views it
-    /// filtered (chapter 29, "Data inheritance").
+    /// filtered.
     pub generated: bool,
 }
 
-/// The record-hierarchy locks the session's transaction holds (decision
-/// T27): each a provisioning connection inside a transaction holding a row
+/// The record-hierarchy locks the session's transaction holds: each a
+/// provisioning connection inside a transaction holding a row
 /// of `__sprig_hlock` `FOR UPDATE`, so the system takes them whatever the
 /// user's grants. Released when the session's transaction ends
 /// ([`PassSession::release_hier_locks`]) or the session goes.
@@ -106,7 +106,7 @@ impl Drop for HierLocks {
 
 impl PassSession {
     /// Releases the record-hierarchy locks once the session's transaction
-    /// has ended (decision T27).
+    /// has ended.
     pub(super) async fn release_hier_locks(&mut self) {
         if self.status().contains(StatusFlags::IN_TRANS) {
             return;
@@ -179,12 +179,11 @@ fn limits(ts: &TenantSession, cat: &TenantCatalog) -> Limits {
     }
 }
 
-/// The copies of `cat`'s objects and their states (chapter 42,
-/// "Materialized copies"), read as the provisioning account at most once
-/// a second per tenant and catalog version (a schema change that keeps a
-/// copy serving, decision T20, is seen by the next statement). `fresh`:
-/// read them now (a change stream's probe, which must see a copy that just
-/// started serving and its grants, RL71).
+/// The copies of `cat`'s objects and their states, read as the
+/// provisioning account at most once a second per tenant and catalog
+/// version (a schema change that keeps a copy serving is seen by the next
+/// statement). `fresh`: read them now (a change stream's probe, which must
+/// see a copy that just started serving and its grants).
 async fn copy_states(
     ts: &TenantSession,
     cat: &TenantCatalog,
@@ -277,14 +276,14 @@ pub(super) fn prepare_refusal(
 }
 
 impl PassSession {
-    /// Chapter 42's step of [`PassSession::tenant_text`]: `None` when the
-    /// statement isn't the inheritance layer's.
+    /// The inheritance step of [`PassSession::tenant_text`]: `None` when
+    /// the statement isn't the inheritance layer's.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     ///
-    /// A statement naming a typed table goes to chapter 32 first (its
+    /// A statement naming a typed table goes to the type layer first (its
     /// plan's statements come back here, [`TypesSession::typed_plan`]):
     /// `deferred` is set, and the caller calls again with `after_types`
-    /// when chapter 32 doesn't take it.
+    /// when the type layer doesn't take it.
     ///
     /// [`TypesSession::typed_plan`]: super::types::TypesSession::typed_plan
     pub(super) async fn tenant_inherit(
@@ -307,7 +306,7 @@ impl PassSession {
             return Ok(None);
         }
         let state = cat.ext.get::<InheritState>(sprig_inherit::MODULE);
-        // A change stream's visibility probe (RL64; `inherit_probe`).
+        // A change stream's visibility probe (`inherit_probe`).
         let probe = super::inherit_probe::parse(text);
         if probe == super::inherit_probe::Parsed::Forged {
             let e = SprigError::standard(
@@ -519,7 +518,7 @@ impl PassSession {
     }
 }
 
-/// The inheritance layer's runner: chapter 32's, plus the catalog commit,
+/// The inheritance layer's runner: the type layer's, plus the catalog commit,
 /// the provisioning account and the directory.
 struct InhRunner<'s, 'c, 'x> {
     gw: GwRunner<'s, 'c, 'x>,
@@ -846,7 +845,7 @@ impl sprig_inherit::Runner for InhRunner<'_, '_, '_> {
         let root = cat.ancestry.first().map_or(me, |a| a.id);
         let mut tenants: Vec<TenantId> = cat.ancestry.iter().map(|a| a.id).collect();
         tenants.push(me);
-        // R6: a tree's tenants share the session's cluster.
+        // A tree's tenants share the session's cluster.
         let cluster = ts.principal.backend.cluster.clone();
         let pool = svc.locator.ctl_pool(&cluster).await?;
         let mut conn = pool.get_conn().await.map_err(|e| {

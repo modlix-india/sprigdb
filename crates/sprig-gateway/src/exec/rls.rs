@@ -326,7 +326,7 @@ impl PassSession {
         let tenant = ts.tenant;
         let svc = Arc::clone(ts.services());
         // An inheritable table's rows are layer rows: overrides and hide
-        // markers are checked as updates and deletes (RL65).
+        // markers are checked as updates and deletes.
         let layered = cat
             .ext
             .get::<sprig_inherit::InheritState>(sprig_inherit::MODULE)
@@ -690,7 +690,7 @@ impl PassSession {
                 }
             }
             // Then whether the insert trigger checks layer rows by their
-            // state (RL65), and last whether the visible-columns view has
+            // state, and last whether the visible-columns view has
             // the merged-layer term.
             extra.push_str(&format!(
                 ", (SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = {s} \
@@ -793,7 +793,7 @@ impl PassSession {
             let merged_term = cell(7 + element_tables.len() * 5)
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
-            // Triggers from before RL65 check an override as an insert.
+            // Triggers made by older builds check an override as an insert.
             let triggers_ok = triggers_ok && (!triggers || inheritable == (layer_checks > 0));
             let views_ok = views_ok && elements_ok && (!views || !inheritable || merged_term > 0);
             if !triggers_ok || !views_ok {
@@ -961,7 +961,7 @@ impl PassSession {
     /// table the session's row-level security binds (or code over one), so
     /// that `PREPARE ... FROM` it would be refused (39366). An `EXECUTE` of a
     /// statement MariaDB holds is checked with it: the statement may have
-    /// been prepared before the policy, or from a variable (S163).
+    /// been prepared before the policy, or from a variable.
     pub(super) async fn rls_names_protected(
         &mut self,
         cx: &ExecCtx<'_>,

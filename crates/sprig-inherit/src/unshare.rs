@@ -1,6 +1,4 @@
-//! What a parent tenant's `DROP SHARE` does to the children the share
-//! served (bugfix-44; the lead's choice of 12 November 2026, chapter 42,
-//! "Parent deletes and orphans").
+//! What a parent tenant's `DROP SHARE` does to the children the share served.
 //!
 //! After the share's catalog change commits, for every tenant edge the
 //! share carried (its table, and the tables of its foreign-key group
@@ -22,8 +20,7 @@
 //! of the table would otherwise come with them still hidden. Below a cut
 //! child, a grandchild's hides of records nobody from that child down
 //! still holds go too. A materialized edge's copy (`__sprig_ih_<object>`)
-//! and its state row go with the view; the copy worker only emptied it
-//! (bugfix-55).
+//! and its state row go with the view; the copy worker only emptied it.
 //!
 //! Before, a child's override was hidden from the moment of the drop (its
 //! level-0 view no longer had an upstream, and reads `own` and `orphan`
@@ -34,7 +31,7 @@
 //! The work runs as the provisioning account on each tenant's cluster.
 //! The share is already dropped when it runs, so a failure isn't
 //! returned: every step can run again, and the drop runs the whole
-//! cleanup up to [`ATTEMPTS`] times ([`Retry`], bugfix-55) before it
+//! cleanup up to [`ATTEMPTS`] times ([`Retry`]) before it
 //! logs and counts the failure; the overrides then stay hidden (the
 //! behaviour before).
 
@@ -207,7 +204,7 @@ pub async fn after_drop(
         }
     }
     // The parent's share definer reads a table only while a share to a
-    // child tenant carries it (decision RL70).
+    // child tenant carries it.
     let after = state_of(&fresh);
     for c in carried {
         let still = after.is_some_and(|st| {
@@ -508,7 +505,7 @@ async fn lost_keys(
 mod tests {
     use super::*;
 
-    /// bugfix-55: a failed cleanup runs again, [`ATTEMPTS`] times in all,
+    /// Regression: a failed cleanup runs again, [`ATTEMPTS`] times in all,
     /// with growing pauses.
     #[test]
     fn cleanup_retries() {

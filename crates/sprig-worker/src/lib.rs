@@ -224,7 +224,7 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         )),
         clusters: registry_clusters,
         // Each consumer reads through a view named for it: the reader's
-        // detach and catch-up logs and metrics say whose (R9, r9feed5).
+        // detach and catch-up logs and metrics say whose.
         feed: shared_feed
             .view(sprig_feed::shared::Kept::All)
             .named("trigger"),
@@ -234,7 +234,7 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         gateways: None,
     };
     // The copy worker: one job per tenant tree, through the shared
-    // reader (R9, r9feed3).
+    // reader.
     let inherit_env = Arc::new(
         inherit::LiveEnv::new(
             dc_logic.clone(),
@@ -250,7 +250,7 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         ),
     );
     // The graph mirror applier: one job per tenant, through the shared
-    // reader's view of the edge tables (R9, r9feed3).
+    // reader's view of the edge tables.
     let graph_mirror_env = graph_mirror::GraphMirrorEnv {
         dc: dc_logic.clone(),
         pools: Arc::clone(&env.pools),

@@ -762,6 +762,38 @@ mod tests {
         .unwrap()
     }
 
+    /// A token login (MySQL's token as password, and an HTTP bearer token
+    /// handed off) keeps its verified claims and roles over `HandoffLogin`.
+    async fn token_handoffs_keep_claims_and_roles(target: &PeerHandoff, ip: IpAddr) {
+        let mut token_start = start(ip);
+        token_start.login_name = Vec::new();
+        token_start.token_login = Some(sprig_auth::handoff::TokenStart {
+            protocol: sprig_auth::oidc::TokenProtocol::Http,
+            tenant: "acme".into(),
+        });
+        for (s, pw) in [
+            (start(ip), b"pw-token".to_vec()),
+            (token_start, b"eyJ.token".to_vec()),
+        ] {
+            let r = target
+                .login(&dc("fra1"), s, Zeroizing::new(pw))
+                .await
+                .unwrap();
+            let HandoffResult::Accepted(p, Some(t)) = r else {
+                panic!("no token: {r:?}");
+            };
+            assert_eq!(p.user, "alice");
+            assert_eq!(t.claims["org"], "o-1");
+            assert_eq!(t.claims["groups"][0], "gate");
+            assert_eq!(t.roles, ["r_gate"]);
+            assert_eq!(t.issuer, "https://idp.example");
+            assert_eq!(
+                t.expires,
+                std::time::UNIX_EPOCH + Duration::from_secs(4_000_000_000)
+            );
+        }
+    }
+
     /// `HandoffLogin` over real gRPC on loopback: nyc1's `PeerHandoff`
     /// finds fra1's ready gateway in fra1's tier, and only the decision
     /// and the principal's fields come back.
@@ -831,35 +863,7 @@ mod tests {
             p.backend.credentials.to_string(),
             "file:/etc/sprigdb/creds/fra1.toml"
         );
-        // A token login (MySQL's token as password, and an HTTP bearer
-        // token handed off) keeps its verified claims and roles.
-        let mut token_start = start(ip);
-        token_start.login_name = Vec::new();
-        token_start.token_login = Some(sprig_auth::handoff::TokenStart {
-            protocol: sprig_auth::oidc::TokenProtocol::Http,
-            tenant: "acme".into(),
-        });
-        for (s, pw) in [
-            (start(ip), b"pw-token".to_vec()),
-            (token_start, b"eyJ.token".to_vec()),
-        ] {
-            let r = target
-                .login(&dc("fra1"), s, Zeroizing::new(pw))
-                .await
-                .unwrap();
-            let HandoffResult::Accepted(p, Some(t)) = r else {
-                panic!("no token: {r:?}");
-            };
-            assert_eq!(p.user, "alice");
-            assert_eq!(t.claims["org"], "o-1");
-            assert_eq!(t.claims["groups"][0], "gate");
-            assert_eq!(t.roles, ["r_gate"]);
-            assert_eq!(t.issuer, "https://idp.example");
-            assert_eq!(
-                t.expires,
-                std::time::UNIX_EPOCH + Duration::from_secs(4_000_000_000)
-            );
-        }
+        token_handoffs_keep_claims_and_roles(&target, ip).await;
         let r = target
             .login(&dc("fra1"), start(ip), Zeroizing::new(b"no".to_vec()))
             .await

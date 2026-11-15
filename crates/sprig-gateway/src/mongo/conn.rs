@@ -1,5 +1,5 @@
 //! One MongoDB connection: framing and compression, the handshake as a
-//! `mongos`, SCRAM-SHA-256, `MONGODB-OIDC` (chapter 14's external tokens)
+//! `mongos`, SCRAM-SHA-256, `MONGODB-OIDC` (external identity tokens)
 //! and command dispatch.
 
 #![allow(clippy::too_many_lines)]

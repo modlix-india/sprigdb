@@ -1,6 +1,5 @@
-//! `FOR EACH TENANT` connections and sinks in a tenant session (chapter
-//! 51, "Inherited sinks and connections"; chapter 42; R9, r9more). These
-//! statements are taken in chapter 51's step, before chapter 12's capture
+//! `FOR EACH TENANT` connections and sinks in a tenant session. These
+//! statements are taken in the sink step, before the workload capture
 //! point, so credentials are sealed and never logged:
 //!
 //! ```text
@@ -102,7 +101,7 @@ impl PassSession {
     }
 
     /// The `FOR EACH TENANT` connection and sink statements; `None` for
-    /// any other statement (it goes on to chapter 51's own handling).
+    /// any other statement (it goes on to the sink layer's own handling).
     #[allow(clippy::too_many_lines, clippy::many_single_char_names)] // one arm per statement
     pub(super) async fn inherit_sinks(
         &mut self,
@@ -380,7 +379,7 @@ impl PassSession {
             ));
         }
         let db = self.db_or_current(cs.name.db.as_deref())?;
-        // A FOR EACH TENANT stream, or (R9, r9fanin) queue: each member's
+        // A FOR EACH TENANT stream, or queue: each member's
         // sink reads its own instance.
         let (q, src_kind) = match &cs.source {
             SourceAst::Stream(q) => (q, DefKind::Stream),
@@ -518,7 +517,7 @@ impl PassSession {
             .collect();
         let mut members = crate::inherited::sinks::members_of(svc, &chain, d).await?;
         // Members that detached their source instance keep their sink
-        // instance; the source's index no longer lists them (bugfix-52).
+        // instance; the source's index no longer lists them.
         let detached = crate::inherited::sinks::unindexed_members(svc, d, &members).await?;
         if !detached.is_empty() {
             tracing::info!(def = %d.key(), members = ?detached, "dropping detached members' sink instances too");

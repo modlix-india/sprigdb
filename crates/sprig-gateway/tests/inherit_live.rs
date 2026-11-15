@@ -3840,7 +3840,7 @@ async fn fan_in_queue_sink_after_a_crash() {
     clean_db(&mut sys, "r9fiq").await;
 }
 
-/// R9 r9feed5: a member's change exchange to an exchange inherited from
+/// A member's change exchange to an exchange inherited from
 /// the declarer (`queue.change_exchange` naming a `FOR EACH TENANT`
 /// exchange) publishes each committed change exactly once into the
 /// member's own instance, stamped with the member's name, through a
@@ -4006,7 +4006,7 @@ export default function (ctx) {
 $$";
 
 /// A first `FOR TENANT` publish while two of the cluster's four catalog
-/// connections are busy elsewhere (fetfix, after r9feed5's 39070 "catalog
+/// connections are busy elsewhere (it once failed with 39070 "catalog
 /// begin timed out after 5000 ms" in `for_each_tenant_end_to_end`): the
 /// member's instance, its settings and its trigger with `GRANTS` are made
 /// with at most one catalog connection held while another is asked for.

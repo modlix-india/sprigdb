@@ -625,7 +625,7 @@ where
         // loop, woken by the new directory entry, starts it too. Run
         // together, the second one's claim could read the first one's
         // schema in the middle of its `CREATE DATABASE`, with no mark yet,
-        // and refuse the tenant's own catalog (39072; found by r9feed5).
+        // and refuse the tenant's own catalog (39072).
         // Taking turns, the second finds the first's work done.
         let turn = Arc::clone(
             self.bootstrapping

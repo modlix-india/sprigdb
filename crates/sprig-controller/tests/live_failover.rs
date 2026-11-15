@@ -21,7 +21,7 @@
 //!   sent to it gets 1047; the cut heals and the test waits for Synced 3/3.
 //!   A commit counts as acknowledged only if the connection's `@@last_gtid`
 //!   moved: Galera can answer OK to the COMMIT of a transaction it rolled
-//!   back (decision HD27). `SPRIG_TEST_GALERA_CONTAINERS` and
+//!   back. `SPRIG_TEST_GALERA_CONTAINERS` and
 //!   `SPRIG_TEST_FAULTD` point it at a private Galera;
 //!   `SPRIG_TEST_LA_TEXT=1` sends text statements instead of prepared ones.
 //! - [`galera_aborts_report_1213`]: the aborts MariaDB does report.
@@ -249,10 +249,9 @@ fn start_workload(route: Route, processes: u32, isolation: &'static str, galera:
                 }
                 // Galera can roll back a transaction (a brute-force abort by
                 // another node's write set) and still answer OK to every
-                // statement and to COMMIT: the commit then wrote nothing
-                // (decision HD27). A commit that wrote has a new GTID, so a
-                // writing transaction counts as committed only if
-                // `@@last_gtid` moved; one whose GTID can't be read is
+                // statement and to COMMIT: the commit then wrote nothing. A
+                // commit that wrote has a new GTID, so a writing transaction
+                // counts as committed only if `@@last_gtid` moved; one whose GTID can't be read is
                 // indeterminate.
                 let writes = mops.iter().any(|(a, _, _)| *a);
                 if galera && writes && matches!(r, Ok(Ok(_))) {
@@ -349,6 +348,28 @@ async fn txn(
     c.query_drop("BEGIN").await?;
     let mut done = Vec::new();
     for (i, (append, k, v)) in mops.iter().enumerate() {
+        // A write runs only inside the transaction, as through the gateway
+        // (`TRX_GUARD` in `sprig-gateway`'s backend session): after a
+        // silent abort it would commit on its own. Before the first
+        // statement the transaction holds no locks and can't be aborted.
+        if *append && i > 0 {
+            match c
+                .query_drop(
+                    "SET @__sprig_t = (SELECT CASE WHEN @@in_transaction = 1 THEN 1 \
+                     ELSE (SELECT 1 UNION SELECT 2) END)",
+                )
+                .await
+            {
+                Err(mysql_async::Error::Server(e)) if e.code == 1242 => {
+                    *ended = Some(Ended {
+                        at: i,
+                        write: false,
+                    });
+                    return Err(silent_abort());
+                }
+                r => r?,
+            }
+        }
         if *append {
             if text {
                 c.query_drop(format!("INSERT INTO `{SCHEMA}`.la (k, v) VALUES ({k}, '{v}') ON DUPLICATE KEY UPDATE v = CONCAT(v, ',', VALUES(v))"))
@@ -377,8 +398,8 @@ async fn txn(
             done.push(json!(["r", k, list]));
         }
         // A plain read or write can't end a transaction: an answer saying
-        // none is open means Galera rolled it back without an error
-        // (decision HD27). Stop, as the gateway does.
+        // none is open means Galera rolled it back without an error.
+        // Stop, as the gateway does.
         if !in_trans(c) {
             *ended = Some(Ended {
                 at: i,
@@ -1153,7 +1174,7 @@ const BF_SCHEMA: &str = "r2failover_bf";
 /// session's next statement gets 1213, text or prepared, whether the abort
 /// came while the session was idle or while its statement ran (`SLEEP`).
 /// The gateway relies on that; it catches only the silent case
-/// (decision HD27, `backend::session`).
+/// (`backend::session`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn galera_aborts_report_1213() {
     if !enabled("galera_aborts_report_1213") {

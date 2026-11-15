@@ -686,8 +686,8 @@ impl LoginService {
         }
     }
 
-    /// The same service verifying issuers' tokens with `tokens` (chapter
-    /// 14's external tokens; see [`crate::oidc`]).
+    /// The same service verifying issuers' tokens with `tokens` (external
+    /// tokens; see [`crate::oidc`]).
     #[must_use]
     pub fn with_external_tokens(mut self, tokens: Arc<crate::oidc::ExternalTokens>) -> Self {
         self.tokens = Some(tokens);

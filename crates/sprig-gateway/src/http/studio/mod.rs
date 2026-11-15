@@ -614,8 +614,8 @@ pub fn session_client(authorization: Option<&str>) -> Option<String> {
     v.get("cli").and_then(Value::as_str).map(str::to_owned)
 }
 
-/// Every claim of the session token, or of the issuer's token (chapter
-/// 14's external tokens), in `authorization`, read without checking the
+/// Every claim of the session token, or of the issuer's token (an
+/// external token), in `authorization`, read without checking the
 /// signature: only for a caller already verified with that header. What
 /// `SPRIG_CLAIM('k')` reads in that caller's statements.
 #[must_use]

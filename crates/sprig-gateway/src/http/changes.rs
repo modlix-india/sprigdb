@@ -368,7 +368,7 @@ pub async fn open(
         TailOptions {
             progress_every: Duration::from_millis(500),
             // Materialized copies of inherited tables (`__sprig_ih_<id>`):
-            // what a child reads through them changes there (RL69).
+            // what a child reads through them changes there.
             keep_internal: vec!["__sprig_ih_".to_owned()],
             ..TailOptions::default()
         },
@@ -449,12 +449,12 @@ struct Pending {
     probe: Option<usize>,
     /// An inheritable object's event, mapped to the subscriber's space.
     mapped: Option<inherit::Mapped>,
-    /// Sent by its copy's handover (RL71), whatever the view reads now.
+    /// Sent by its copy's handover, whatever the view reads now.
     counted: bool,
 }
 
-/// Changes held while a copy's first seed runs (RL71), at most; past it
-/// the oldest are decided as before RL71.
+/// Changes held while a copy's first seed runs, at most; past it the
+/// oldest are decided by what the view reads now.
 const HOLD_MAX: usize = 10_000;
 
 /// Puts event `e` (classified as `inherited`) into the batch's image
@@ -482,7 +482,7 @@ fn add_pending(
     };
     let (mut before, mut after, mut probe) = (None, None, None);
     // An inheritable object's layer images aren't its records: they aren't
-    // checked (RL64).
+    // checked.
     match e.op {
         _ if inherited.is_some() => {}
         Op::Insert => after = image(e.after.as_ref()).map(|m| push(Some(m))),
@@ -575,8 +575,7 @@ fn shown(p: &Pending, seen: &[Vec<bool>], full: bool) -> Option<WatchEvent> {
 }
 
 /// An inheritable object's event `p` as the subscriber sees it
-/// ([`inherit::decide`]); `was_visible`: its record just before the change
-/// (RL64).
+/// ([`inherit::decide`]); `was_visible`: its record just before the change.
 fn mapped_event(
     p: &Pending,
     m: &inherit::Mapped,
@@ -669,9 +668,9 @@ async fn run(
     let mut tail = own_feed(tail);
     let mut last = first;
     let mut quiet = tokio::time::Instant::now();
-    // What the stream last knew of inherited records' visibility (RL64).
+    // What the stream last knew of inherited records' visibility.
     let mut known = inherit::Seen::default();
-    // Changes waiting for a copy's first seed to end (RL71).
+    // Changes waiting for a copy's first seed to end.
     let mut held: Vec<(Box<sprig_feed::ChangeEvent>, inherit::Mapped)> = Vec::new();
     loop {
         let mut until = quiet + heartbeat;
@@ -764,8 +763,7 @@ async fn run(
             }
         }
         // Changes of a tenant edge's source or copy: the copies' handovers
-        // decide which side sends each (RL71), read now that the batch is
-        // here.
+        // decide which side sends each, read now that the batch is here.
         if let (Some(m), Some(svc)) = (&mapper, core.engine.tenants.as_ref()) {
             let mut edges: HashMap<String, Vec<Option<Handover>>> = HashMap::new();
             let mut keep = Vec::with_capacity(pending.len());
@@ -819,10 +817,10 @@ async fn run(
             inherit::read(core, caller, &spec.database, &keys).await?
         };
         // Records gone from the subscriber's view whose key the stream
-        // doesn't know: were they visible before the change (RL64)? Every
-        // other event: does the subscriber's view read the changed row now
-        // (RL69)? A probe per event (by its index in `pending`, and
-        // whether it asks only that).
+        // doesn't know: were they visible before the change? Every other
+        // event: does the subscriber's view read the changed row now? A
+        // probe per event (by its index in `pending`, and whether it asks
+        // only that).
         let readable = |p: &Pending| {
             p.probe
                 .is_some_and(|i| seen[p.table].get(i).copied().unwrap_or(false))

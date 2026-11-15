@@ -1,5 +1,5 @@
 //! Every registered setting is honoured as declared, as far as the source
-//! shows it mechanically (bugfix "setfix", 13 Nov 2026):
+//! shows it mechanically:
 //!
 //! - **read**: something besides its declaration and registration names
 //!   the setting's static or its key, so a value someone sets does

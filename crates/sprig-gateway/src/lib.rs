@@ -889,7 +889,7 @@ fn logins(
             // Failure counters and temporary locks in the tenants'
             // catalogs, audit events in the log (target sprig_audit).
             let state = sprig_auth::policy::CatalogLoginState::new(tenants.catalog.clone());
-            // External tokens (chapter 14): issuers' JWTs over MySQL,
+            // External tokens: issuers' JWTs over MySQL,
             // Redis, MongoDB and HTTP, with just-in-time accounts written
             // to the tenants' catalogs.
             let tokens =

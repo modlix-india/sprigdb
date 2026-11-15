@@ -77,7 +77,7 @@ fn reconcile_statement_parses() {
         b"ALTER TABLE cats SPRIG RECONCILE HIERARCHY LOCK",
         &l
     ));
-    // What chapter 32 sends round-trips.
+    // What the type layer sends round-trips.
     let ch = HierChange::Deleted(vec!["'x'".into(), "2".into()]);
     let sql = format!("ALTER TABLE t SPRIG RECONCILE HIERARCHY {}", ch.clause());
     assert!(matches!(c(&sql), Stmt::Reconcile { change, .. } if change == ch));
@@ -97,7 +97,7 @@ fn only_path_columns_pass_for_type_plans() {
 
 #[test]
 fn shares_of_trees_stay_whole() {
-    // Child tenants may receive a tree (decision T28); a filter, a column
+    // Child tenants may receive a tree; a filter, a column
     // list or a TAKE would cut rows or paths out of it.
     let o = tree();
     assert!(check_share(&o, false).is_ok());

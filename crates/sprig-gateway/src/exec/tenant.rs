@@ -1919,7 +1919,7 @@ impl PassSession {
             .map(|ts| crate::tenant::authz::dropped_objects(ts, &stmt, current.as_deref()))
             .unwrap_or_default();
         // The global lookup indexes of the tables a DROP removes go with
-        // them once it succeeded (chapter 19).
+        // them once it succeeded.
         let lookup_owners = self
             .tenant
             .as_deref()

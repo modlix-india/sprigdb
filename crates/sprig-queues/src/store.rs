@@ -16,9 +16,9 @@ use bytes::Bytes;
 pub type MsgId = [u8; 16];
 
 /// Whether `id` is a change exchange's message id: a version-8 UUID
-/// (chapter 50, "Change feed to an exchange"; outboxes' ids are version 7).
-/// Its forward-ledger row stays [`crate::engine::CHANGE_LEDGER_KEEP_MS`],
-/// not [`crate::engine::LEDGER_KEEP_MS`] (R9, r9feed5).
+/// (outboxes' ids are version 7). Its forward-ledger row stays
+/// [`crate::engine::CHANGE_LEDGER_KEEP_MS`], not
+/// [`crate::engine::LEDGER_KEEP_MS`].
 #[must_use]
 pub fn is_change_id(id: &MsgId) -> bool {
     id[6] >> 4 == 8

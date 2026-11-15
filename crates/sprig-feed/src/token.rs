@@ -1,4 +1,4 @@
-//! Resume tokens (chapter 38, "Resume tokens").
+//! Resume tokens.
 //!
 //! A token names a point in a tenant's feed: the cluster and the binlog
 //! position to read from, the transaction and row already delivered, the
@@ -14,10 +14,8 @@
 //!   position: count u8, then count x (domain u32 | server u32 | seq u64)
 //! ```
 //!
-//! **As built, against the book's layout:** the book's token carries one
-//! GTID and finds the other GTID domains through cluster checkpoints. This
-//! one carries the whole position to restart the dump from, so a resume
-//! needs no checkpoint lookup; `until` names the last delivered row, and
+//! The token carries the whole position to restart the dump from (every
+//! GTID domain, not one GTID), so a resume needs no checkpoint lookup; `until` names the last delivered row, and
 //! everything up to it is skipped on the re-read. The position can lie
 //! before `until` while an XA transaction is prepared but not committed,
 //! so the re-read sees the prepare again.

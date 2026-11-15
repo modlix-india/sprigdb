@@ -1,6 +1,4 @@
-//! Materialized copies and asynchronous orphaning (chapter 42,
-//! "Materialized copies" and "Parent deletes and orphans"; build step 8
-//! and the asynchronous half of step 9).
+//! Materialized copies and asynchronous orphaning across tenants.
 //!
 //! A materialized edge keeps the rows its parent shares in a **copy**, a
 //! table `__sprig_ih_<object id>` in the child's physical schema, next to
@@ -35,7 +33,7 @@
 //!     below t: read the source's merged view of K now (writer), filtered by
 //!     the share and cut to its columns; upsert what is there, tombstone
 //!     what isn't, each write guarded by _sprig_src_v
-//!   hierarchy pass, parents first (decision T28): for each tenant x below
+//!   hierarchy pass, parents first: for each tenant x below
 //!     t that inherits db.table with a record hierarchy: under x's lock,
 //!     reconcile x's root space and the spaces below it for K
 //! seed(copy): create the tables; read the source's whole view; upsert it;
@@ -56,7 +54,7 @@
 //! Orphaning across tenants doesn't know why a record left the parent's
 //! view. It orphans an override when the record no longer exists above
 //! (deleted, hidden, or an orphan reset), and only hides it when the
-//! record is merely filtered out, as the chapter wants for filter changes.
+//! record is merely filtered out, as a filter change should.
 //! The override keeps the values stored when it was written; only the
 //! `keep` policy is applied.
 
@@ -114,7 +112,7 @@ pub struct CopyInfo {
     /// When it was seeded (ms).
     pub seeded_ms: u64,
     /// When it became its subscribers' source in change streams
-    /// ([`crate::handover`], decision RL71).
+    /// ([`crate::handover`]).
     pub handover: Handover,
 }
 
@@ -216,7 +214,7 @@ pub fn read_sql(
 }
 
 /// `ALTER TABLE` adding the handover columns to a state table made
-/// before RL71.
+/// before copies recorded their handover.
 #[must_use]
 pub fn state_upgrade_ddl(schema: &str) -> String {
     format!(
@@ -251,7 +249,7 @@ pub async fn load_states<Q: Queryable + Send>(
     };
     let mut r: std::result::Result<Vec<Row>, _> = c.query(read(true)).await;
     if matches!(&r, Err(mysql_async::Error::Server(s)) if s.code == 1054) {
-        // A state table the worker hasn't upgraded yet (RL71).
+        // A state table the worker hasn't upgraded yet.
         r = c.query(read(false)).await;
     }
     let rows = match r {
@@ -810,7 +808,7 @@ impl Maintainer {
                     .await
                     .map_err(exec_err)?;
                     // The table too, once no copy of the object is left
-                    // in it (bugfix-55: it stayed, empty, for ever).
+                    // in it (it used to stay, empty, for ever).
                     let left: Option<u64> = c
                         .query_first(format!(
                             "SELECT COUNT(*) FROM {}.{} WHERE object_id = {}",
@@ -1071,7 +1069,7 @@ impl Maintainer {
     }
 
     /// Writes `e`'s state row in one statement: with `serving`, the flip
-    /// and its handover together (RL71).
+    /// and its handover together.
     async fn set_state(&mut self, e: &CopyEdge, serving: bool, handover: &Handover) -> Result<()> {
         let now = self.env.now_ms();
         let mut c = self.env.conn(e.key.tenant).await?;
@@ -1304,7 +1302,7 @@ impl Maintainer {
         Ok(())
     }
 
-    /// The hierarchy pass of [`Self::on_keys`] (decision T28): every tenant
+    /// The hierarchy pass of [`Self::on_keys`]: every tenant
     /// below `tenant` that inherits `db.table` through unbroken tenant
     /// edges and has its record hierarchy brings its paths of `keys` up to
     /// date, parents first, each in one transaction under its lock. A
@@ -1374,7 +1372,7 @@ impl Maintainer {
                 continue;
             };
             // Paths here must follow the committed change whatever its
-            // size (decision T29); the size is reported instead.
+            // size; the size is reported instead.
             ctx.limits.max_move_rows = u64::MAX;
             let Some(h) = crate::hier::hierarchy_of(&ctx, &xo) else {
                 continue;
@@ -1500,7 +1498,7 @@ impl Maintainer {
             };
             let mut c = self.env.conn(x).await?;
             // A record hierarchy's path-only overrides go with their
-            // records (decision T26), never orphaned.
+            // records, never orphaned.
             if crate::hier::has_paths(&xo) {
                 c.query_drop(format!(
                     "DELETE FROM {}.{} WHERE `_sprig_space` = {} AND `_sprig_state` = 'ovr' AND \
@@ -1797,7 +1795,7 @@ impl Maintainer {
     }
 
     /// Claims for the references `x`'s new orphans `lost` now hold as
-    /// their own (decision IG7's index), so a delete of a referenced key
+    /// their own (in the `inherit_refs` index), so a delete of a referenced key
     /// anywhere above sees them.
     async fn claim_orphans(
         &mut self,
@@ -1949,7 +1947,7 @@ impl Maintainer {
 }
 
 /// A child's own columns added to an object it receives through a
-/// serving materialized copy (decision T20): the copy gets the same
+/// serving materialized copy: the copy gets the same
 /// columns, `NULL` (the parent has no values for them), and its state
 /// moves to the object's new version, so reads keep using it instead of
 /// failing with 39889 until the worker reseeds (across clusters, read

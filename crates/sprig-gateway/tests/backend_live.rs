@@ -2037,8 +2037,8 @@ async fn probes_measure_rows_examined_on_the_same_connection() {
     ok(&mut a, &format!("DROP DATABASE {db}")).await;
 }
 
-/// Every COMMIT a Galera node answers OK has its writes in the table
-/// (decision HD27). Two sessions per node append to four shared rows
+/// Every COMMIT a Galera node answers OK has its writes in the table.
+/// Two sessions per node append to four shared rows
 /// (`INSERT … ON DUPLICATE KEY UPDATE`) and read another row in the same
 /// transaction, so other nodes' write sets keep aborting transactions
 /// mid-statement. Galera sometimes answers such a transaction's statements

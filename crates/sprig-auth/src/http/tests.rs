@@ -166,8 +166,8 @@ async fn refusals_map_to_statuses() {
     check(Some(&basic("acme.expired", "pw")), 401, 1862).await;
     check(Some(&basic("susp.carol", "pw")), 403, 39303).await;
     // A JWT-shaped bearer names its tenant by host or x-sprig-tenant;
-    // without either, 39786 (an issuer's token is chapter 14's external
-    // tokens, tested in crate::oidc).
+    // without either, 39786 (an issuer's token is an external
+    // token, tested in crate::oidc).
     check(Some("Bearer eyJhbGciOi.x.y"), 401, 39786).await;
     check(Some("Digest abc"), 401, 1045).await;
     w.catalogs

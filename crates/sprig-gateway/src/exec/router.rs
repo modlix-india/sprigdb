@@ -237,7 +237,7 @@ pub(crate) struct RouterState {
     sql_ps: HashMap<String, sql_prepare::Held>,
     /// The texts of SQL-level prepared statements MariaDB holds (tenants
     /// without shards), by folded name: an `EXECUTE` is checked against
-    /// the session's row-level security of the moment (S163).
+    /// the session's row-level security of the moment.
     sql_texts: HashMap<String, bytes::Bytes>,
 }
 
@@ -1229,7 +1229,7 @@ impl PassSession {
         {
             return Box::pin(self.load_data(cx, ld, more, mapper, map, out)).await;
         }
-        // Workload capture (chapter 17): the statement with the shards it
+        // Workload capture: the statement with the shards it
         // visited, so the advisor sees reads that scatter.
         let mut wl_pending = self.wl_start(original);
         loop {

@@ -1,7 +1,6 @@
-//! Inherited messaging objects in a tenant session (chapter 42,
-//! "Inherited messaging objects (`FOR EACH TENANT`)"; chapters 45 and 41;
-//! R9). Runs before the stream layer ([`PassSession::tenant_streams`]) and
-//! chapter 41's declarations:
+//! Inherited messaging objects (`FOR EACH TENANT`) in a tenant session.
+//! Runs before the stream layer ([`PassSession::tenant_streams`]) and the
+//! logic layer's declarations:
 //!
 //! ```text
 //! CREATE STREAM s FOR EACH TENANT [scope] ...      a definition: inherited_defs
@@ -10,7 +9,7 @@
 //!   [GRANTS (...)] LANGUAGE ... AS ...            a trigger definition; existing
 //!                                                 instances get it in the background
 //! ALTER STREAM s PARTITIONS n | SET (...)          changes the definition
-//! DROP STREAM s [IMMEDIATE] | DROP TRIGGER g        drops it (chapter 42, "Dropping")
+//! DROP STREAM s [IMMEDIATE] | DROP TRIGGER g        drops it
 //! INSERT INTO s ...                  in a member: into its own instance (created
 //!                                    on first publish); headers stamped
 //! INSERT INTO s FOR TENANT t ...     in an ancestor: into t's instance
@@ -265,8 +264,8 @@ enum Dest {
 }
 
 impl PassSession {
-    /// Chapter 42's step of [`PassSession::tenant_text`]: `None` when the
-    /// statement isn't about inherited messaging objects.
+    /// The inherited-messaging step of [`PassSession::tenant_text`]: `None`
+    /// when the statement isn't about inherited messaging objects.
     #[allow(clippy::too_many_lines)]
     pub(super) async fn tenant_inherit_msg(
         &mut self,
@@ -700,7 +699,7 @@ impl PassSession {
                     ),
                 )
             })?;
-        // Chapter 41's checks: code in the trigger's database, reading the
+        // The trigger checks: code in the trigger's database, reading the
         // stream; GRANTS are down-tree grants in every member.
         let lctn = ts.lower_case_table_names();
         let grants = crate::tenant::authz::privileges(ts, cat);
@@ -851,8 +850,8 @@ impl PassSession {
             .filter_map(|j| word(j).map(|w| w.to_ascii_lowercase()))
             .collect();
         // A member's instance: only ALTER INHERITED changes it. Not the
-        // declarer's own instance of an `INCLUDING SELF` definition
-        // (bugfix-39): there the statement names the definition, which
+        // declarer's own instance of an `INCLUDING SELF` definition:
+        // there the statement names the definition, which
         // the declarer could otherwise never drop (nor, by the 39895
         // guard, its database).
         if own.def(&db, kind, &name).is_none()
@@ -967,8 +966,7 @@ impl PassSession {
         )))
     }
 
-    /// `DROP STREAM | TRIGGER` of a definition (chapter 42, "Dropping a
-    /// definition"). A stream: refused while trigger definitions read it
+    /// `DROP STREAM | TRIGGER` of a definition. A stream: refused while trigger definitions read it
     /// (unless `CASCADE`); with `IMMEDIATE` every instance goes now, else
     /// the definition is `dropping` until `inherit.drop_grace_hours`.
     /// A trigger: its instances' jobs stop and it goes now (it holds no
@@ -1199,14 +1197,14 @@ pub(super) async fn next_object_id(svc: &TenantServices, t: TenantId) -> Result<
 
 /// Every member holding an instance of stream definition `def` re-applies
 /// its derived state (settings, triggers, sinks) now, in the background;
-/// for a queue definition, its sinks (r9fanin). The number of instances.
+/// for a queue definition, its sinks. The number of instances.
 pub(super) async fn rollout(svc: &Arc<TenantServices>, def: DefKey) -> Result<usize> {
     let entries = inherited::instances_of(svc, def).await?;
     let n = entries.len();
     let svc = Arc::clone(svc);
     tokio::spawn(async move {
         for e in entries {
-            // A stream's derived state, or (R9, r9fanin) a queue's sinks.
+            // A stream's derived state, or a queue's sinks.
             let r = Box::pin(crate::inherited::sinks::reapply_source(&svc, e.tenant, def))
                 .await
                 .and_then(|reached| {
@@ -1578,7 +1576,7 @@ impl PassSession {
                 }
                 if in_txn {
                     // Through this tenant's cross-tenant outbox: the record
-                    // exists only if the transaction commits (chapter 42).
+                    // exists only if the transaction commits.
                     let strict = svc.settings.get(
                         &sprig_inherit::msg::settings::CROSS_TENANT_MESSAGING_STRICT,
                         &cat.setting_ctx(&svc.dc),
@@ -1670,7 +1668,7 @@ impl PassSession {
         Ok(Reply::Ok(total, notes))
     }
 
-    /// `ALTER INHERITED ...` (chapter 42, "Overrides: nearest level wins").
+    /// `ALTER INHERITED ...`: overrides, the nearest level wins.
     #[allow(clippy::too_many_lines)]
     async fn inherit_alter(
         &mut self,
@@ -2126,7 +2124,7 @@ impl PassSession {
                                             p.get("waiting_config").is_some()
                                                 || p.get("error").is_some()
                                         }) {
-                                            // R9 (r9more): an inherited sink waiting for its
+                                            // An inherited sink waiting for its
                                             // member's configuration (39241), or not deployable.
                                             if p.get("waiting_config").is_some() {
                                                 "waiting_config".to_owned()
@@ -2269,8 +2267,8 @@ impl PassSession {
 
 impl PassSession {
     /// `INSERT INTO db.s IN TENANT a ...`: a descendant's session publishes
-    /// into an ancestor's ordinary stream (chapter 45, "One platform
-    /// stream for every client"): only when the stream's owner set
+    /// into an ancestor's ordinary stream (one platform stream for every
+    /// client): only when the stream's owner set
     /// `stream.descendant_publish = on`; with `stream.descendant_key =
     /// origin` every record's key is the publishing tenant's name (39957
     /// for another); `x-sprig-origin-tenant` is stamped; under
@@ -2521,8 +2519,7 @@ impl PassSession {
 
 impl PassSession {
     /// `CREATE EXCHANGE | QUEUE ... FOR EACH TENANT`, `BIND QUEUE |
-    /// EXCHANGE ... FOR EACH TENANT` (chapter 50, "Inherited exchanges,
-    /// queues and bindings"): definitions in this tenant; members make
+    /// EXCHANGE ... FOR EACH TENANT`: definitions in this tenant; members make
     /// their instances on first use.
     #[allow(clippy::too_many_lines)]
     async fn define_mq(
@@ -2632,8 +2629,8 @@ impl PassSession {
                 arguments,
             } => {
                 let db = db_of(db)?;
-                // Both ends are definitions of this tenant (chapter 50: a
-                // binding between two inherited objects is inherited).
+                // Both ends are definitions of this tenant (a binding
+                // between two inherited objects is inherited).
                 let dk = if dest_kind == "exchange" {
                     DefKind::Exchange
                 } else {
@@ -2799,7 +2796,7 @@ impl PassSession {
 
     /// A `sprig.mq_publish` in this session naming an inherited exchange
     /// (or, through the default exchange, an inherited queue) of vhost
-    /// database `db` (chapter 50, "Publishing by target tenant"):
+    /// database `db` (publishing by target tenant):
     /// `Some(routed)` when it was handled here (a targeted publish, or a
     /// refusal), `None` to go on with the ordinary path, with `m` stamped
     /// when it goes into this tenant's own instance.
@@ -2960,8 +2957,7 @@ impl PassSession {
 
 impl PassSession {
     /// `INSERT INTO s FOR ALL TENANTS [WITH INSTANCE] [UNDER t] ...` (or
-    /// `FOR TENANT '*'`): each row is one broadcast (chapter 42,
-    /// "Broadcast"): its log row now, or, inside a transaction, a row of
+    /// `FOR TENANT '*'`): each row is one broadcast: its log row now, or, inside a transaction, a row of
     /// this tenant's cross-tenant outbox that becomes it at commit.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn inherit_broadcast(
@@ -3082,7 +3078,7 @@ impl PassSession {
 }
 
 impl PassSession {
-    /// `SELECT ... FROM s FAN IN ...` (chapter 42, "Fan-in"): the members'
+    /// `SELECT ... FROM s FAN IN ...`: the members'
     /// instances as one derived table (see [`inherited::fanin`]).
     async fn fan_in_select(
         &mut self,
@@ -3194,8 +3190,8 @@ async fn mq_rollout(
 const NO_INSTANCE: u64 = u64::MAX - 42;
 
 /// A read naming an inherited stream the member has no instance of yet:
-/// the statement with that stream as an empty table (chapter 42: reads
-/// never create an instance; an instance not created yet has no records).
+/// the statement with that stream as an empty table (reads never create
+/// an instance; an instance not created yet has no records).
 /// `None` when the read names none.
 fn empty_reads(
     sql: &str,

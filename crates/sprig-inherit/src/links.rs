@@ -1,5 +1,4 @@
-//! Foreign keys between inheritable tables (Kiran's decisions of 11
-//! November 2026, chapter 42 "Foreign keys and groups").
+//! Foreign keys between inheritable tables, and the groups they form.
 //!
 //! A foreign key whose either end is an inheritable table is kept by the
 //! gateway, never by MariaDB: the referenced row may live in an ancestor's
@@ -26,7 +25,7 @@
 //! delete in `s` is refused (1451) while a row of `s`'s view or of any
 //! space or tenant below `s` still references a deleted key. The second
 //! uses an index of references per referenced key, `inherit_refs`, in the
-//! catalog of the referenced table's tree root (decision IG4), so a delete
+//! catalog of the referenced table's tree root, so a delete
 //! reads one index range instead of every descendant's table:
 //!
 //! ```text
@@ -437,8 +436,7 @@ pub fn cascade_refused(action: &str) -> SprigError {
 }
 
 /// 39897: a descendant tenant already has `what`, which the parent's
-/// change would bring down to it (Kiran's question Q3; the lead's default:
-/// refuse the parent's change).
+/// change would bring down to it: the parent's change is refused.
 #[must_use]
 pub fn clash(what: &str, named: Option<&str>) -> SprigError {
     SprigError::new(
@@ -1991,8 +1989,8 @@ pub async fn convert_native(
     let mut group: Vec<String> = vec![table.name.clone()];
     loop {
         let before = group.len();
-        // A typed table's whole type tree inherits with it (chapter 32's
-        // tables of one tree hold one record's parts).
+        // A typed table's whole type tree inherits with it (the
+        // tables of one type tree hold one record's parts).
         for g in group.clone() {
             if let Some((_, tree)) = ctx.type_tree(db, &g) {
                 for t in tree {
@@ -2153,7 +2151,7 @@ pub async fn create_table(
         ));
     }
     // A descendant tenant with its own table of this name would receive
-    // this one too (question Q3: refused).
+    // this one too: refused.
     let probe = Resolved {
         db,
         db_name: db_name.clone(),
