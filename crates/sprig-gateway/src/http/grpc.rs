@@ -787,6 +787,9 @@ admin_service!(TenantsSvc, tenants_server::Tenants, TenantsServer, "Tenants", {
 });
 admin_service!(UsersSvc, users_server::Users, UsersServer, "Users", {
     create_user: NameRequest => "CreateUser",
+    set_token_login: NameRequest => "SetTokenLogin",
+    list_issuers: NameRequest => "ListIssuers",
+    put_issuer: NameRequest => "PutIssuer",
 });
 admin_service!(SettingsSvc, settings_server::Settings, SettingsServer, "Settings", {
     list_setting_keys: ListRequest => "ListSettingKeys",

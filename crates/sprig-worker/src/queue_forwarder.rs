@@ -153,6 +153,7 @@ pub fn shared_reader(clusters: Arc<dyn Clusters>) -> Arc<SharedClusters> {
 #[must_use]
 pub fn shared_view(feed: &Arc<SharedFeed>) -> Arc<SharedClusters> {
     feed.view(Kept::Tables(vec![QO.to_owned(), XO.to_owned()].into()))
+        .named("queue_forwarder")
 }
 
 /// How often the cluster job looks for tenants.

@@ -542,6 +542,7 @@ impl SqlEngine {
             tls: caller.tls.clone(),
             principal: Some(caller.principal.clone()),
             scram: None,
+            oidc: None,
             client_meta: None,
             compressors: Vec::new(),
             sql: None,

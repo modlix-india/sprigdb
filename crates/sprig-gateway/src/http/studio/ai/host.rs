@@ -439,6 +439,44 @@ impl GatewayHost {
         }
         let r = self.sql("-", sql).await?;
         let mut rows = objects(&r);
+        // `SHOW SPRIG SETTINGS` lists the keys a tenant may set; the
+        // process-wide ones (`backend.*`, `gateway.*`, ...) come from this
+        // gateway's live settings, without operator-only keys.
+        if !key.is_empty()
+            && let super::super::StudioSource::Live { live, dc } = &self.core.studio.source
+            && let Ok(reg) = sprig_settings::Registry::global()
+        {
+            let pat = if key.ends_with('.') || !key.contains('.') {
+                format!("{key}%")
+            } else {
+                key.to_owned()
+            };
+            let snap = live.snapshot();
+            let ctx = sprig_settings::SettingCtx::process(dc);
+            let mut process: Vec<_> = reg
+                .iter()
+                .filter(|d| {
+                    !d.operator_only()
+                        && !d.scopes().contains(sprig_settings::ScopeKind::Tenant)
+                        && sprig_sql::settings_stmt::like_matches(&pat, d.key())
+                })
+                .collect();
+            process.sort_by_key(|d| d.key());
+            for d in process {
+                if let Ok(res) = snap.resolve(d.key(), &ctx) {
+                    let mut m = Map::new();
+                    m.insert("SETTING_SCOPE".into(), json!("process"));
+                    m.insert("SETTING_NAME".into(), json!(d.key()));
+                    m.insert(
+                        "VALUE".into(),
+                        json!(sprig_settings::show_value(&res.value)),
+                    );
+                    m.insert("SOURCE_SCOPE".into(), json!(res.source.to_string()));
+                    m.insert("DOC".into(), json!(d.doc()));
+                    rows.push(m);
+                }
+            }
+        }
         let more = rows.len() > 200;
         rows.truncate(200);
         Ok(ToolOutput {

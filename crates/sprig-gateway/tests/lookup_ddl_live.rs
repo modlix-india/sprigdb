@@ -45,7 +45,10 @@
 //! 2. A unique key of two columns without the distribution key: built,
 //!    routed (1 shard per read), unique across shards, updates of one part.
 //! 3. `ADD UNIQUE` over values that repeat across shards: 1062, and an
-//!    `advisor.lookup` approvals item naming 10 of the 12 values.
+//!    `advisor.lookup` approvals item naming 10 of the 12 values, raised
+//!    through the controller so that it notifies (with
+//!    `SPRIG_TEST_LKD_CTL_METRICS=127.0.0.1:<controller telemetry port>`,
+//!    the controller's `sprig_approvals_notifications_total` must grow).
 //! 4. A user with table-level grants only: claims, releases and routed
 //!    reads work; its backend account holds that table's lookup tables only.
 //! 5. `DROP TABLE` and `DROP DATABASE` remove their tables' lookups (rows
@@ -56,6 +59,9 @@
 //!    second gateway's old session reloads its catalog first, so it claims
 //!    (a duplicate fails with 1062). A `kill -9` of the first gateway while
 //!    a `DROP TABLE`'s lookup is `dropping`: the controller finishes it.
+//! 7. `lookup.lock_wait_seconds` at a table's scope applies to that table's
+//!    claims only; the controller's scheduled orphan scan
+//!    (`lookup.orphan_scan_hours`) removes planted orphans once due.
 
 #![allow(
     clippy::unwrap_used,
@@ -1261,6 +1267,11 @@ async fn lookup_followups_live() {
     );
 
     // ---- 3. duplicates: 1062 and an approvals item ----------------------
+    // Raised through the controller, the item notifies: its hook counts
+    // every channel it tries (email is `skipped` without SMTP).
+    let ctl_metrics = var("SPRIG_TEST_LKD_CTL_METRICS");
+    let notified = |addr: &str| metric(addr, "sprig_approvals_notifications_total");
+    let notified0 = ctl_metrics.as_deref().map(notified);
     let r = c
         .query_drop("ALTER TABLE dups ADD UNIQUE KEY uk_code (code)")
         .await;
@@ -1300,6 +1311,18 @@ async fn lookup_followups_live() {
         action.starts_with("ALTER TABLE `lk2_db`.`dups` ADD UNIQUE KEY `uk_code`"),
         "{action}"
     );
+    if let (Some(addr), Some(n0)) = (ctl_metrics.as_deref(), notified0) {
+        let mut n = notified(addr);
+        for _ in 0..20 {
+            if n > n0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            n = notified(addr);
+        }
+        println!("   notifications tried by the controller: {n0} -> {n}");
+        assert!(n > n0, "the gateway's duplicates item didn't notify");
+    }
     // Again, still duplicated: the same item is refreshed, not a second one.
     let _ = c
         .query_drop("ALTER TABLE dups ADD UNIQUE KEY uk_code (code)")
@@ -1600,6 +1623,167 @@ async fn lookup_followups_live() {
         assert!(started.elapsed() < Duration::from_secs(120));
         tokio::time::sleep(Duration::from_secs(1)).await;
     };
+    lock_wait_and_orphan_scan(&e, ctl_metrics.as_deref()).await;
     c.query_drop(format!("DROP DATABASE {DB2}")).await.unwrap();
     println!("[{:?}] done", t0.elapsed());
+}
+
+/// How long `waiter` on `b` waited before its 1205, while `holder` on `a`
+/// held the same value's claim in an open transaction.
+async fn blocked_claim(a: &mut Conn, b: &mut Conn, holder: &str, waiter: &str) -> Duration {
+    a.query_drop("BEGIN").await.unwrap();
+    a.query_drop(holder).await.unwrap();
+    let started = Instant::now();
+    let r = b.query_drop(waiter).await;
+    let waited = started.elapsed();
+    a.query_drop("ROLLBACK").await.unwrap();
+    assert_eq!(errno_of(r), Some(1205), "{waiter}: a claim blocked by another");
+    waited
+}
+
+/// `lookup_followups_live`'s step 7 (agent smallfix3):
+///
+/// - `lookup.lock_wait_seconds` at a table's scope: 1 s on `dups` with the
+///   tenant at 6 s. A claim blocked by another session's uncommitted claim
+///   of the same value fails with 1205 after about 1 s on `dups`, and after
+///   about 6 s on `members`.
+/// - The controller's scheduled orphan scan (`lookup.orphan_scan_hours` 1):
+///   orphans planted in `uk_code`'s lookup table, with its last scan moved
+///   two hours back, are removed at a sharding tick, and `last_scan_at`
+///   moves to now.
+async fn lock_wait_and_orphan_scan(e: &Env, ctl_metrics: Option<&str>) {
+    let t0 = Instant::now();
+    let set = |key: &str, value: &str, scope: &str| {
+        e.sprigctl(&[
+            "settings",
+            "set",
+            key,
+            value,
+            "--scope",
+            scope,
+            "--reason",
+            "smallfix3 test",
+        ]);
+    };
+    let reset = |key: &str, scope: &str| {
+        e.sprigctl(&[
+            "settings",
+            "reset",
+            key,
+            "--scope",
+            scope,
+            "--reason",
+            "smallfix3 test",
+        ]);
+    };
+    let tenant_scope = format!("tenant:{}", e.tenant);
+    let dups_scope = format!("object:{}.{DB2}.dups", e.tenant);
+    set("lookup.lock_wait_seconds", "6", &tenant_scope);
+    set("lookup.lock_wait_seconds", "1", &dups_scope);
+    // The gateway reads the rows with its next catalog snapshot.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let app = || login(&e.gateway, &e.tenant, "app", "sprig-dev-app", Some(DB2));
+    let mut a = app().await.unwrap();
+    let mut b = app().await.unwrap();
+    let on_dups = blocked_claim(
+        &mut a,
+        &mut b,
+        "INSERT INTO dups VALUES (9001, 'lw1')",
+        "INSERT INTO dups VALUES (9002, 'lw1')",
+    )
+    .await;
+    let on_members = blocked_claim(
+        &mut a,
+        &mut b,
+        "INSERT INTO members VALUES (9001, 'lw@x.org', 'a')",
+        "INSERT INTO members VALUES (9002, 'LW@x.org', 'b')",
+    )
+    .await;
+    println!(
+        "7. a blocked claim waited {on_dups:?} on dups (table: 1 s), {on_members:?} on members (tenant: 6 s)"
+    );
+    assert!(
+        on_dups >= Duration::from_millis(800) && on_dups < Duration::from_secs(4),
+        "{on_dups:?}"
+    );
+    assert!(
+        on_members >= Duration::from_secs(5) && on_members < Duration::from_secs(12),
+        "{on_members:?}"
+    );
+    reset("lookup.lock_wait_seconds", &dups_scope);
+    reset("lookup.lock_wait_seconds", &tenant_scope);
+
+    // ---- the scheduled orphan scan ----
+    set("lookup.orphan_scan_hours", "1", &tenant_scope);
+    let name = "__sprig_lk_dups__uk_code";
+    let (_, before) = lookup_tables(e, name).await;
+    let mut planted = 0;
+    for i in 0..e.clusters.len() {
+        let mut r = e.root(i).await;
+        let schemas: Vec<String> = r
+            .exec(
+                "SELECT TABLE_SCHEMA FROM information_schema.TABLES WHERE TABLE_NAME = ? \
+                 AND TABLE_SCHEMA LIKE ?",
+                (name, format!("t{}\\_d%", e.tenant_id)),
+            )
+            .await
+            .unwrap();
+        for s in schemas {
+            planted += 1;
+            r.query_drop(format!(
+                "INSERT INTO `{s}`.`{name}` (code, owner_id, owner_rk) \
+                 VALUES ('orphan-{planted}', {}, {})",
+                990_000 + planted,
+                planted * 7919
+            ))
+            .await
+            .unwrap();
+        }
+        r.disconnect().await.unwrap();
+    }
+    assert!(planted > 0);
+    let removed0 = ctl_metrics.map(|m| metric(m, "sprig_lookup_orphans_removed_total"));
+    let mut cat = e.root(0).await;
+    cat.query_drop(format!(
+        "UPDATE t{}_sprig.lookup_indexes SET last_scan_at = UTC_TIMESTAMP(6) - INTERVAL 2 HOUR \
+         WHERE index_name = 'uk_code'",
+        e.tenant_id
+    ))
+    .await
+    .unwrap();
+    let started = Instant::now();
+    loop {
+        let (_, rows) = lookup_tables(e, name).await;
+        let recent: Option<i64> = cat
+            .query_first(format!(
+                "SELECT TIMESTAMPDIFF(SECOND, last_scan_at, UTC_TIMESTAMP(6)) \
+                 FROM t{}_sprig.lookup_indexes WHERE index_name = 'uk_code'",
+                e.tenant_id
+            ))
+            .await
+            .unwrap();
+        if rows == before && recent.is_some_and(|s| s < 600) {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(240),
+            "the orphan scan never ran: {rows} lookup rows (want {before}), last scan {recent:?} s ago"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    println!(
+        "7. the controller's orphan scan removed {planted} planted orphans {:?} after they were due",
+        started.elapsed()
+    );
+    if let (Some(m), Some(r0)) = (ctl_metrics, removed0) {
+        let r1 = metric(m, "sprig_lookup_orphans_removed_total");
+        println!("   sprig_lookup_orphans_removed_total: {r0} -> {r1}");
+        assert!(r1 - r0 >= f64::from(planted), "{r0} -> {r1}");
+    }
+    cat.disconnect().await.unwrap();
+    reset("lookup.orphan_scan_hours", &tenant_scope);
+    println!(
+        "[{:?}] 7. per-table lock wait and the scheduled orphan scan",
+        t0.elapsed()
+    );
 }

@@ -42,6 +42,9 @@
 //! - [`audit`]: audit events;
 //! - [`http`] and [`apikey`]: HTTP Basic and API keys, as a
 //!   library for the HTTP front end;
+//! - [`oidc`]: external tokens from a tenant's registered issuers (JWKS,
+//!   signature and claim checks, claim mappings, just-in-time accounts)
+//!   over MySQL, Redis, MongoDB and HTTP;
 //! - [`accounts`]: the TOML-file account source, kept
 //!   behind [`LoginMode`] until the gateway is rewired;
 //! - `testing` (feature `testing`): helpers for other crates' tests.
@@ -62,6 +65,7 @@ pub mod handoff;
 pub mod http;
 pub mod mfa;
 pub mod mysql;
+pub mod oidc;
 pub mod operator;
 pub mod policy;
 pub mod portable;

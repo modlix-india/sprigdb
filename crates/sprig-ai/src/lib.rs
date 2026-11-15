@@ -29,6 +29,8 @@
 //! - [`feedback`]: votes on answers and proposal outcomes, and the prompt
 //!   notes made of them;
 //! - [`glossary`]: the tenant's business terms;
+//! - [`incidents`]: the administration agent's error intake, triage and
+//!   advice;
 //! - [`mcp`]: the MCP server's tools and calls, without the transport;
 //! - [`turn`]: one chat turn, provider and tools in a loop;
 //! - [`mod@metrics`]: the `sprig_ai_*` metrics;
@@ -43,6 +45,7 @@ pub mod error;
 pub mod eval;
 pub mod feedback;
 pub mod glossary;
+pub mod incidents;
 pub mod keys;
 pub mod mcp;
 pub mod metrics;

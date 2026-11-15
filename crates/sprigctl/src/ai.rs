@@ -1,5 +1,6 @@
 //! `sprigctl ai provider add|list|test|remove`, over the Admin API's
-//! `/admin/v1/ai/providers`.
+//! `/admin/v1/ai/providers`, and `sprigctl ai incident list|show` over
+//! `/admin/v1/ai/incidents` ([`incident`]).
 //!
 //! ```text
 //! sprigctl ai provider add anthropic --kind anthropic --key-file ~/.anthropic-key
@@ -20,6 +21,8 @@ use std::io::{IsTerminal, Read};
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use serde_json::{Value, json};
 
+mod incident;
+
 use crate::client::AdminClient;
 use crate::render::table;
 use crate::settings::escape;
@@ -33,7 +36,7 @@ pub(crate) fn group() -> Command {
             .help("The provider's name: 1 to 64 of a-z, 0-9, _ and -")
     };
     Command::new("ai")
-        .about("The AI assistants: providers")
+        .about("The AI assistants: providers, and the administration agent's incidents")
         .subcommand_required(true)
         .arg_required_else_help(true)
         .subcommand(
@@ -67,6 +70,12 @@ pub(crate) fn group() -> Command {
                             Arg::new("query")
                                 .long("query")
                                 .help("openai only: a query string for every call, such as api-version=2024-10-21"),
+                        )
+                        .arg(
+                            Arg::new("max-tokens-field")
+                                .long("max-tokens-field")
+                                .value_parser(["max_tokens", "max_completion_tokens"])
+                                .help("openai only: the output limit's field (default max_completion_tokens for api.openai.com, which refuses max_tokens on current models; else max_tokens)"),
                         )
                         .arg(
                             Arg::new("provider-ca-file")
@@ -111,6 +120,7 @@ pub(crate) fn group() -> Command {
                         .arg(name()),
                 ),
         )
+        .subcommand(incident::command())
 }
 
 fn key_from(m: &ArgMatches) -> Result<Option<String>, Failed> {
@@ -159,6 +169,18 @@ fn settings_of(m: &ArgMatches) -> Value {
         if let Some(q) = m.get_one::<String>("query") {
             s["query"] = json!(q);
         }
+        // OpenAI's own API refuses max_tokens on its current models.
+        let base = m.get_one::<String>("base-url").map(String::as_str);
+        let field = match m.get_one::<String>("max-tokens-field") {
+            Some(f) => Some(f.as_str()),
+            None if base.is_none_or(|u| u.contains("://api.openai.com")) => {
+                Some("max_completion_tokens")
+            }
+            None => None,
+        };
+        if let Some(f) = field {
+            s["max_tokens_field"] = json!(f);
+        }
     }
     s
 }
@@ -190,6 +212,16 @@ fn providers_table(v: &Value) -> String {
     table(["NAME", "KIND", "BASE URL", "KEY"], &rows)
 }
 
+/// The provider name a subcommand was given; empty for `list`, which takes
+/// none (`get_one` panics on an argument the subcommand doesn't define).
+fn name_of(m: &ArgMatches) -> String {
+    m.try_get_one::<String>("name")
+        .ok()
+        .flatten()
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// Runs `sprigctl ai ...`.
 ///
 /// # Errors
@@ -200,13 +232,16 @@ pub(crate) async fn run(
     dry_run: bool,
     out: Output,
 ) -> Result<(), Failed> {
+    if let Some(("incident", m)) = group.subcommand() {
+        return incident::run(c, m, out).await;
+    }
     let Some(("provider", p)) = group.subcommand() else {
         return Err(Failed("sprigctl ai provider add|list|test|remove".into()));
     };
     let Some((cmd, m)) = p.subcommand() else {
         return Err(Failed("sprigctl ai provider add|list|test|remove".into()));
     };
-    let name = m.get_one::<String>("name").cloned().unwrap_or_default();
+    let name = name_of(m);
     match cmd {
         "add" => {
             let settings = settings_of(m);
@@ -307,5 +342,53 @@ mod tests {
             {"name": "ollama", "kind": "open_ai_chat", "settings": {"base_url": "http://x"}, "has_key": false}
         ]}));
         assert!(table.contains("ollama") && table.contains("no"));
+    }
+
+    #[test]
+    fn openai_itself_gets_max_completion_tokens() {
+        let add = |args: &[&str]| {
+            let mut all = vec!["ai", "provider", "add", "p", "--kind"];
+            all.extend_from_slice(args);
+            let matches = group().get_matches_from(all);
+            let (_, provider) = matches.subcommand().unwrap();
+            settings_of(provider.subcommand().unwrap().1)
+        };
+        assert_eq!(
+            add(&["openai"])["max_tokens_field"],
+            "max_completion_tokens"
+        );
+        assert_eq!(
+            add(&["openai", "--base-url", "https://api.openai.com/v1"])["max_tokens_field"],
+            "max_completion_tokens"
+        );
+        assert!(
+            add(&["openai", "--base-url", "https://api.deepseek.com"])
+                .get("max_tokens_field")
+                .is_none()
+        );
+        assert_eq!(
+            add(&[
+                "openai",
+                "--base-url",
+                "http://127.0.0.1:8000/v1",
+                "--max-tokens-field",
+                "max_completion_tokens"
+            ])["max_tokens_field"],
+            "max_completion_tokens"
+        );
+        assert!(add(&["anthropic"]).get("max_tokens_field").is_none());
+    }
+
+    #[test]
+    fn list_has_no_name_and_does_not_panic() {
+        let matches = group().get_matches_from(["ai", "provider", "list"]);
+        let (_, provider) = matches.subcommand().unwrap();
+        let (cmd, list) = provider.subcommand().unwrap();
+        assert_eq!(cmd, "list");
+        assert_eq!(name_of(list), "");
+        let matches = group().get_matches_from(["ai", "provider", "remove", "ollama"]);
+        let (_, provider) = matches.subcommand().unwrap();
+        let (_, remove) = provider.subcommand().unwrap();
+        assert_eq!(name_of(remove), "ollama");
     }
 }

@@ -23,7 +23,8 @@
 //!
 //! A unique lookup whose build fails because its values repeat across
 //! shards raises an `advisor.lookup` approvals item naming the table, the
-//! key and up to 10 of the values ([`raise_duplicates`]); approving it
+//! key and up to 10 of the values, through the controller so that it
+//! notifies ([`raise_duplicates`]); approving it
 //! once the values are fixed builds the lookup (the controller's sharding
 //! loop applies it).
 
@@ -73,6 +74,30 @@ pub fn settings(svc: &TenantServices, tenant: TenantId) -> LookupSettings {
     } else {
         let ctx = sprig_settings::SettingCtx::process(&svc.dc).for_tenant(tenant, &[]);
         LookupSettings::resolve(&ctx, |k, c| svc.settings.get(k, c, None))
+    }
+}
+
+/// `lookup.lock_wait_seconds` for claims and owner checks on `owner`'s
+/// lookups, at the owner table's scope (chapter 19), with `cat`'s rows.
+#[must_use]
+pub fn lock_wait_in(svc: &TenantServices, cat: &TenantCatalog, owner: ObjectId) -> u64 {
+    let ctx = cat.object_ctx(&svc.dc, owner);
+    svc.settings
+        .get(
+            &sprig_shard::lookup::settings::LOCK_WAIT_SECONDS,
+            &ctx,
+            Some(&cat.settings),
+        )
+        .max(1)
+}
+
+/// [`lock_wait_in`] with `tenant`'s cached catalog; without it, the
+/// tenant's value from the etcd scopes.
+#[must_use]
+pub fn lock_wait_seconds(svc: &TenantServices, tenant: TenantId, owner: ObjectId) -> u64 {
+    match svc.cache.cached(tenant) {
+        Some(cat) => lock_wait_in(svc, &cat, owner),
+        None => settings(svc, tenant).lock_wait_seconds,
     }
 }
 
@@ -168,6 +193,10 @@ impl LookupHost for GwHost {
         Ok(())
     }
 
+    fn lock_wait_seconds(&self, _db: DbId, owner: ObjectId) -> u64 {
+        lock_wait_seconds(&self.svc, self.tenant, owner)
+    }
+
     async fn duplicates(&self, report: &DuplicateReport) {
         if let Err(e) = raise_duplicates(&self.svc, self.tenant, report, self.ddl).await {
             tracing::warn!(tenant = %self.tenant, table = %report.table, key = %report.key,
@@ -181,6 +210,12 @@ impl LookupHost for GwHost {
 /// for an approval with no timers: approving it after the values are
 /// fixed builds the lookup. A live item for the same target is refreshed
 /// with the new evidence instead of a second one.
+///
+/// The item is raised through the controller's approval gate
+/// (`/admin/v1/recommendations:gate`), whose hooks notify, as for the
+/// controller's own items. When the controller can't be reached (or
+/// refuses), the gateway writes the item into the tenant's catalog itself:
+/// it is there for people, but no notification goes out.
 ///
 /// # Errors
 /// The catalog's.
@@ -212,6 +247,53 @@ pub async fn raise_duplicates(
         (r.action_text(&db_name), r.machine())
     };
     machine["ddl"] = serde_json::Value::Bool(ddl);
+    let summary = r.summary(&db_name, ddl);
+    if let Some(admin) = crate::tenant::rec_sql::admin() {
+        // The gate prefixes `t<tenant>/`.
+        let target = r.target(tenant);
+        let target = target
+            .strip_prefix(&format!("t{tenant}/"))
+            .unwrap_or(&target);
+        let body = serde_json::json!({
+            "op": "check",
+            "kind": Kind::AdvisorLookup.as_str(),
+            "tenant": tenant.0,
+            "db": db_name,
+            "target": target,
+            "action": text,
+            "machine": machine,
+            "evidence": r.evidence(),
+            "summary": summary,
+            "score": score,
+            "object": r.owner.0,
+            "object_name": r.table,
+        });
+        match admin
+            .forward_internal(
+                &hyper::Method::POST,
+                "/admin/v1/recommendations:gate",
+                Bytes::from(body.to_string()),
+            )
+            .await
+        {
+            Ok(reply) if reply.status < 300 => {
+                let v: serde_json::Value = serde_json::from_slice(&reply.body).unwrap_or_default();
+                tracing::info!(tenant = %tenant, table = %r.table, key = %r.key,
+                    values = r.found.values, why = %v.get("why").and_then(serde_json::Value::as_str).unwrap_or(""),
+                    "approvals item raised for a lookup's duplicates, through the controller");
+                return Ok(());
+            }
+            Ok(reply) => {
+                tracing::warn!(tenant = %tenant, status = reply.status,
+                    body = %String::from_utf8_lossy(&reply.body),
+                    "the controller refused a lookup's duplicates item; writing it without a notification");
+            }
+            Err(e) => {
+                tracing::warn!(tenant = %tenant, error = %e,
+                    "the controller is unreachable; writing a lookup's duplicates item without a notification");
+            }
+        }
+    }
     let p = Proposal {
         kind: Kind::AdvisorLookup,
         subject,
@@ -219,7 +301,7 @@ pub async fn raise_duplicates(
         action: Action { text, machine },
         evidence: r.evidence(),
         score,
-        summary: r.summary(&db_name, ddl),
+        summary,
         emergency: false,
     };
     let locator: Arc<dyn sprig_catalog::CatalogLocator> = svc.locator.clone();

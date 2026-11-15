@@ -9,7 +9,8 @@
 //! |---|---|
 //! | `Basic` base64(`user:password`) | Like Redis `AUTH`: the fast cache (`SHA256(SHA256(password))`), else the `caching_sha2_password` verifiers on a hashing slot; then the MySQL login's policy order (temporary lock, credentials, suspension, `ACCOUNT LOCK`, TLS requirement, expiry: HTTP has no sandbox mode, so an expired password is refused with 1862) |
 //! | `Bearer sprig_<tenant>_<key_id>_<secret>` | API key ([`crate::apikey`]): `SHA256(secret)` in constant time; revocation, expiry, `allowed_cidrs`; the user live, with the `api_key` method; temporary lock, `ACCOUNT LOCK`, TLS requirement, suspension |
-//! | `Bearer` anything else | 401 (SprigDB tokens and external JWTs are not checked here) |
+//! | `Bearer` an issuer's JWT | [`crate::oidc`]: the tenant from the `Host` header (or TLS SNI) under `listener.tenant_sni_suffixes`, else `x-sprig-tenant`, else 39786; the token verified against the tenant's issuers for `http`; its user mapping names the account (created when the issuer has `jit_users`); the account's `token` method, temporary lock, suspension, `ACCOUNT LOCK` and TLS requirement |
+//! | `Bearer` anything else | 401 (SprigDB session tokens are checked by the HTTP front end) |
 //!
 //! **The tenant.** For Basic: the `Host` header (or TLS SNI) under
 //! `listener.tenant_sni_suffixes` names it, then the user is the whole
@@ -130,7 +131,7 @@ enum Credential {
         password: Zeroizing<Vec<u8>>,
     },
     ApiKey(String),
-    OtherBearer,
+    OtherBearer(String),
 }
 
 fn parse_authorization(h: &str) -> Option<Credential> {
@@ -147,7 +148,7 @@ fn parse_authorization(h: &str) -> Option<Credential> {
         return Some(if rest.starts_with("sprig_") {
             Credential::ApiKey(rest.to_owned())
         } else {
-            Credential::OtherBearer
+            Credential::OtherBearer(rest.to_owned())
         });
     }
     None
@@ -215,7 +216,10 @@ impl HttpAuth {
         match parse_authorization(h) {
             Some(Credential::Basic { user, password }) => self.basic(req, &user, &password).await,
             Some(Credential::ApiKey(k)) => self.api_key(req, &k).await,
-            Some(Credential::OtherBearer) | None => {
+            Some(Credential::OtherBearer(t)) if crate::oidc::Jws::looks_like(t.as_bytes()) => {
+                self.bearer_token(req, &t).await
+            }
+            Some(Credential::OtherBearer(_)) | None => {
                 self.refuse_unparsed(req);
                 Err(HttpAuthError::denied("", req.client_ip, true))
             }
@@ -282,6 +286,45 @@ impl HttpAuth {
                 .ok_or_else(|| HttpAuthError::from_error(&SprigError::internal("no principal"))),
             AuthVerdict::Refuse(p) => Err(HttpAuthError::from_packet(p)),
         }
+    }
+
+    /// An issuer's token as the bearer: the tenant from the host, else
+    /// `x-sprig-tenant`, else 39786.
+    async fn bearer_token(
+        &self,
+        req: &HttpRequest<'_>,
+        token: &str,
+    ) -> Result<Principal, HttpAuthError> {
+        let host = req
+            .sni
+            .or(req.host)
+            .map(|h| h.rsplit_once(':').map_or(h, |(name, _)| name));
+        let Some(tenant) = self.svc.tenant_named(None, host).or_else(|| {
+            req.tenant_header
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned)
+        }) else {
+            self.refuse_unparsed(req);
+            return Err(HttpAuthError::from_error(&SprigError::new(
+                SprigCode::TenantAmbiguous,
+                "a bearer token names no tenant: use the tenant's host name or the x-sprig-tenant header",
+            )));
+        };
+        let r = self
+            .svc
+            .token_login(&crate::oidc::TokenLogin {
+                protocol: crate::oidc::TokenProtocol::Http,
+                label: "http",
+                tenant: &tenant,
+                token,
+                client_ip: req.client_ip,
+                tls: req.tls,
+                client_cert: req.client_cert,
+                client_dn: req.client_dn,
+            })
+            .await;
+        r.map(|(p, _)| p)
+            .map_err(|d| HttpAuthError::from_packet(d.error))
     }
 
     async fn api_key(&self, req: &HttpRequest<'_>, key: &str) -> Result<Principal, HttpAuthError> {

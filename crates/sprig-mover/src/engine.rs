@@ -298,6 +298,7 @@ impl Engine {
         let c = code(&e);
         tracing::warn!(job = %self.job.0, state = %self.claim.rec.state, error = %e, "mover step failed");
         metrics::counter!("sprig_mover_errors_total", "code" => c.map_or("backend", SprigCode::name)).increment(1);
+        sprig_common::incidents::record(&e, &format!("mover.{}", self.claim.rec.state));
         self.drop_stream();
         match c {
             Some(SprigCode::JobLeaseLost) => return Err(e),

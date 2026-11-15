@@ -421,3 +421,78 @@ async fn max_branches_is_enforced() {
     assert_eq!(e.protocol().mysql_errno, 39444);
     t.rollback().await.unwrap();
 }
+
+#[async_trait::async_trait]
+impl sprig_txn::lookup::DistConn for FakeConn {
+    async fn run(&mut self, sql: &str) -> DbResult<()> {
+        self.log
+            .lock()
+            .unwrap()
+            .push((self.cluster.clone(), sql.to_owned()));
+        Ok(())
+    }
+    async fn query(&mut self, sql: &str, _: mysql_async::Params) -> DbResult<Vec<mysql_async::Row>> {
+        self.run(sql).await.map(|()| Vec::new())
+    }
+}
+
+/// One Pre statement on `a`.
+async fn pre(d: &mut sprig_txn::lookup::DistTxn<Fake>, a: &sprig_shard::lookup::Target) {
+    use sprig_shard::lookup::LookupSessions as _;
+    d.pre(a, "INSERT 1", mysql_async::Params::Empty)
+        .await
+        .unwrap();
+}
+
+// `lookup.lock_wait_seconds` per owner table: each claim sets its table's
+// value, and a Pre session already open on the cluster sets it again only
+// when it changes.
+#[tokio::test]
+async fn pre_sessions_take_each_claims_lock_wait() {
+    use sprig_shard::lookup::Target;
+    let (t, log, _, _) = setup(NonXaPolicy::Reject, true);
+    let backend = Arc::new(Fake {
+        log: log.clone(),
+        script: Arc::default(),
+        admin: Arc::default(),
+    });
+    let anchor: sprig_txn::lookup::AnchorOf = Arc::new(|_: &Target| shard(1));
+    let mut d = sprig_txn::lookup::DistTxn::new(t, backend, anchor, 5);
+    let a = Target {
+        cluster: c("a"),
+        schema: "s".into(),
+    };
+    pre(&mut d, &a).await;
+    pre(&mut d, &a).await;
+    d.set_lock_wait(12);
+    pre(&mut d, &a).await;
+    d.set_lock_wait(12);
+    pre(&mut d, &a).await;
+    d.set_lock_wait(0);
+    pre(&mut d, &a).await;
+    assert_eq!(
+        on(&log, "a"),
+        [
+            "SET SESSION innodb_lock_wait_timeout = 5",
+            "START TRANSACTION",
+            "INSERT 1",
+            "INSERT 1",
+            "SET SESSION innodb_lock_wait_timeout = 12",
+            "INSERT 1",
+            "INSERT 1",
+            "SET SESSION innodb_lock_wait_timeout = 1",
+            "INSERT 1",
+        ]
+    );
+    d.rollback().await.unwrap();
+    // The next transaction's Pre session starts with the value now set.
+    log.lock().unwrap().clear();
+    pre(&mut d, &a).await;
+    assert_eq!(
+        on(&log, "a")[..2],
+        [
+            "SET SESSION innodb_lock_wait_timeout = 1",
+            "START TRANSACTION"
+        ]
+    );
+}

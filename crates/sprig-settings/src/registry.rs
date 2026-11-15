@@ -346,6 +346,26 @@ pub const MARKED: &[(&str, Mark, &str)] = &[
         "the tenant-copy descendant cap",
     ),
     (
+        "tuning.interval_minutes",
+        Mark::Unbuilt,
+        "the cache-tuning pass isn't scheduled; its rules exist as a library",
+    ),
+    (
+        "tuning.memory_budget_pct",
+        Mark::Unbuilt,
+        "the cache-tuning pass isn't scheduled; its rules exist as a library",
+    ),
+    (
+        "tuning.min_change_pct",
+        Mark::Unbuilt,
+        "the cache-tuning pass isn't scheduled; its rules exist as a library",
+    ),
+    (
+        "tuning.table_open_cache_mode",
+        Mark::Unbuilt,
+        "the cache-tuning pass isn't scheduled; its rules exist as a library",
+    ),
+    (
         "redis.sharded_pubsub_hubs",
         Mark::Restart,
         "the hub mesh is built when the gateway starts, and every gateway must agree on the count",

@@ -6,8 +6,14 @@
 //! ```sh
 //! export SPRIG_TEST_RLS_SQL=127.0.0.1:37306
 //! export SPRIG_TEST_RLS_TENANT=acme
-//! cargo test -p sprig-gateway --test rls_definer_live -- --nocapture
+//! cargo test -p sprig-gateway --test rls_definer_live -- --nocapture --test-threads 1
 //! ```
+//!
+//! Run the tests one at a time (`--test-threads 1`). They log in as the
+//! same tenant's `app` user, whose backend account the gateway reconciles
+//! as each test changes grants, policies and settings (tenant-scope
+//! `sprigctl settings set`, `rls.backend_enforcement`), so tests running
+//! side by side see grants and settings change under them and fail.
 
 #![allow(
     clippy::unwrap_used,

@@ -279,13 +279,28 @@ impl MsgStore for MemStore {
             .collect())
     }
 
-    async fn purge_ledger(&self, before_ms: i64) -> Result<u64, StoreError> {
+    async fn purge_ledger(
+        &self,
+        before_ms: i64,
+        changes_before_ms: i64,
+    ) -> Result<u64, StoreError> {
         let mut g = self.lock();
         let g = &mut *g;
         let n = g.ledger.len();
         let outbox = &g.outbox;
-        g.ledger
-            .retain(|(_, id), at| *at >= before_ms || outbox.contains_key(id));
+        let mut left = crate::store::LEDGER_PURGE_BATCH;
+        g.ledger.retain(|(_, id), at| {
+            let before = if crate::store::is_change_id(id) {
+                changes_before_ms
+            } else {
+                before_ms
+            };
+            let keep = *at >= before || outbox.contains_key(id) || left == 0;
+            if !keep {
+                left -= 1;
+            }
+            keep
+        });
         Ok((n - g.ledger.len()) as u64)
     }
 

@@ -115,6 +115,28 @@ impl SettingsSource for LiveSource {
             .with_db(db);
         ShardingSettings::resolve_with(s, self.rows(tenant).as_deref(), &ctx).min_shards
     }
+
+    fn lookup_lock_wait(
+        &self,
+        tenant: TenantId,
+        db: sprig_common::ids::DbId,
+        object: sprig_common::ids::ObjectId,
+    ) -> u64 {
+        let Some(live) = &self.live else {
+            return sprig_shard::lookup::settings::LOCK_WAIT_SECONDS.default;
+        };
+        let snap = live.snapshot();
+        let s: &MemSettings<'_> = &snap;
+        let ctx = SettingCtx::process(&self.dc)
+            .for_tenant(tenant, &[])
+            .with_db(db)
+            .with_object(object);
+        sprig_shard::lookup::settings::LookupSettings::lock_wait_with(
+            s,
+            self.rows(tenant).as_deref(),
+            &ctx,
+        )
+    }
 }
 
 /// The loop (module docs).

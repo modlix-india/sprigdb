@@ -12,7 +12,7 @@ SprigDB has two assistants for a tenant's users, reached through one chat API:
 - **The data specialist** (`data`) explains your data, writes and runs read-only queries, and proposes charts and glossary terms.
 - **The DBA assistant** (`dba`) helps with plans, indexes, workload, settings, shards, row-level security and logic.
 
-Operators also have an **administration assistant** (`admin`), which sees no tenant data.
+Operators also have an **administration assistant** (`admin`), which sees no tenant data. It also advises on SprigDB's own errors, through the approvals inbox: see [AI incident advice](../operate/ai-incident-advice.md).
 
 Every assistant follows the same rules:
 
@@ -32,7 +32,7 @@ Outside AI agents, such as Claude Code, can use the same tools as you through th
 SprigDB speaks two provider APIs:
 
 - **anthropic**: the Anthropic Messages API;
-- **openai**: OpenAI-compatible Chat Completions, which also covers Azure OpenAI, Ollama, vLLM, Mistral and Groq.
+- **openai**: OpenAI-compatible Chat Completions, which also covers Azure OpenAI, DeepSeek (`--base-url https://api.deepseek.com`), Ollama, vLLM, Mistral and Groq.
 
 ```sh
 # A hosted provider: the key is read without echo, or from a file
@@ -51,6 +51,7 @@ sprigctl ai provider remove ollama
 - **Gateways** open the key with the same master key file (`[gateway] workload_key_file`), only when they call the provider.
 - **`test`** makes one tiny call (at most 16 output tokens) and prints the answer, or the error that says why the call failed.
 - **Other options:** `--key-header api_key` for Azure OpenAI, `--query api-version=…` for a query string on every call, and `--provider-ca-file` for a TLS-inspecting proxy.
+- **The output limit:** for OpenAI itself, `add` names it `max_completion_tokens`, because `api.openai.com` refuses `max_tokens` on its current models; every other `openai` server gets `max_tokens`. `--max-tokens-field` chooses either.
 - **Who:** changing providers needs a platform operator. Every change is audited on the platform audit stream, without the key.
 
 Then choose a model for each assistant, as `provider/model`:
@@ -84,7 +85,7 @@ ALTER DATABASE shop SPRIG SET (ai.share_data = TRUE);
 
 - **Secrets** are always masked, in your messages and in every tool result: strings after `IDENTIFIED BY`, `PASSWORD`, `TOKEN` and similar words, words that look like API keys, and `Bearer` credentials.
 - **Tool results are marked untrusted**, and the model is told that text inside them is data, never instructions. Text stored in your tables can't steer the assistant into doing anything, because the assistant can't change anything anyway.
-- **The administration assistant** never receives tenant data: names in its input are replaced by stable placeholders such as `table#kqzmfa`.
+- **The administration assistant** never receives tenant data: names in its input are replaced by stable placeholders such as `table#kqzmfa`. SprigDB's own documentation reaches it as written, except for names the scrubber knows.
 
 ## The chat API
 
@@ -111,7 +112,7 @@ The stream:
 | `type` | Fields | Meaning |
 |---|---|---|
 | `start` | `conversation`, `role`, `model`, `share_data` | The turn started; keep `conversation` to continue it |
-| `text` | `text` | More of the answer |
+| `text` | `text` | More of the answer. A turn that calls tools can stream text from several model calls, with no break between them: start a new paragraph after a `tool_start` or `usage` line |
 | `thinking` | `text` | The model's reasoning, when the provider shows it |
 | `tool_start` | `id`, `name`, `input` | A tool call started |
 | `tool_end` | `id`, `name`, `ok`, `reduced` | It ended; `reduced` means rows or values were withheld or cut |

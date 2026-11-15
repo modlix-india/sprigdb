@@ -435,6 +435,9 @@ impl Auth for GatewayAuth {
                 can_handle_expired_password: false,
             })
             .await;
+        // The password may be an issuer's token (chapter 14's external
+        // tokens) for an account with the `token` method.
+        login.allow_tokens(sprig_auth::oidc::TokenProtocol::Redis);
         let password = pass.to_vec();
         let (outcome, path) = if login.check_clear_fast(&password) {
             (Outcome::Verified, AuthPath::Fast)
@@ -456,7 +459,7 @@ impl Auth for GatewayAuth {
             .tenant
             .map_or_else(String::new, |t| t.0.to_string());
         let user_name = principal.user.clone();
-        let sql = SqlSession::open(
+        let mut sql = SqlSession::open(
             &self.d.sessions,
             &self.d.executor,
             &principal,
@@ -466,6 +469,9 @@ impl Auth for GatewayAuth {
             self.tls.clone(),
         )
         .map_err(|e| Frame::err(&e.message))?;
+        // SPRIG_CLAIM(): the claims of the issuer's token the login used.
+        sql.exec
+            .set_claims(login.token().map(|t| std::sync::Arc::clone(&t.claims)));
         Ok(Login {
             sql: Box::new(sql),
             scope,

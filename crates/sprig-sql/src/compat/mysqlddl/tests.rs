@@ -294,3 +294,155 @@ fn dropping_a_column_something_generated_uses() {
         )
     );
 }
+
+// GR12: MySQL 8.4.11's answers (captured 15 November 2026 in
+// `smallfix3-mysql84`) to renaming, and to dropping every visible column,
+// where a functional index uses the column; MariaDB 11.8 renames inside
+// the hidden column's expression, and answers the drop with 1113.
+#[test]
+fn renaming_or_dropping_what_a_functional_index_uses() {
+    let r = |sql: &str| renamed_columns(sql.as_bytes(), &my());
+    assert_eq!(
+        r("ALTER TABLE r1 RENAME COLUMN c1 TO c9"),
+        Some(("r1".to_owned(), vec!["c1".to_owned()]))
+    );
+    assert_eq!(
+        r("alter table d.`r1` change c1 c8 INT, RENAME COLUMN c0 TO c7"),
+        Some(("d.`r1`".to_owned(), vec!["c1".to_owned(), "c0".to_owned()]))
+    );
+    assert_eq!(
+        r("ALTER TABLE r1 CHANGE COLUMN IF EXISTS c1 c2 BIGINT"),
+        Some(("r1".to_owned(), vec!["c1".to_owned()]))
+    );
+    // Same name (a type change only), MODIFY, a table rename: none.
+    assert_eq!(r("ALTER TABLE r1 CHANGE COLUMN c1 C1 BIGINT"), None);
+    assert_eq!(r("ALTER TABLE r1 MODIFY c1 BIGINT"), None);
+    assert_eq!(r("ALTER TABLE r1 RENAME TO r2"), None);
+    assert_eq!(
+        renamed_columns(
+            b"ALTER TABLE r1 RENAME COLUMN c1 TO c9",
+            &LexOptions::mariadb()
+        ),
+        None
+    );
+    let fx = super::super::fxindex::fx_column("c0 + c1");
+    let generated = vec![
+        (fx.clone(), "`c0` + `c1`".to_owned()),
+        ("g".to_owned(), "`c2` * 2".to_owned()),
+    ];
+    let cols = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    let m = generated_dependency_of(&cols(&["c5", "c1", "c0"]), &generated).unwrap();
+    assert_eq!(
+        (m.code, m.sqlstate, m.message.as_str()),
+        (
+            3837,
+            *b"HY000",
+            "Column 'c1' has a functional index dependency and cannot be dropped or renamed."
+        )
+    );
+    let m = generated_dependency_of(&cols(&["c2"]), &generated).unwrap();
+    assert_eq!(
+        (m.code, m.message.as_str()),
+        (3108, "Column 'c2' has a generated column dependency.")
+    );
+    assert_eq!(generated_dependency_of(&cols(&["c5"]), &generated), None);
+    // Other internal generated columns aren't the user's.
+    assert_eq!(
+        generated_dependency_of(
+            &cols(&["a"]),
+            &[("_sprig_x".to_owned(), "`a`".to_owned())]
+        ),
+        None
+    );
+    // `ALTER TABLE d3 DROP COLUMN b, DROP COLUMN a` with `INDEX fx ((a + 1))`:
+    // MariaDB's 1113, MySQL's 3837 naming `a`.
+    let fa = super::super::fxindex::fx_column("a + 1");
+    let g = vec![(fa, "`a` + 1".to_owned())];
+    let m = fx_drop_all(1113, &cols(&["b", "a"]), &g).unwrap();
+    assert_eq!(
+        m.message,
+        "Column 'a' has a functional index dependency and cannot be dropped or renamed."
+    );
+    assert_eq!(fx_drop_all(1113, &cols(&["b"]), &g), None);
+    assert_eq!(fx_drop_all(1054, &cols(&["a"]), &g), None);
+}
+
+// GR12: MariaDB's errors for a value that doesn't fit a hidden column, and
+// MySQL 8.4.11's 3752 and 3751 naming the index.
+#[test]
+fn values_that_dont_fit_a_functional_index() {
+    let c = "_sprig_fx_0a1b2c3d";
+    let e = fx_value_error(
+        1264,
+        &format!("Out of range value for column '{c}' at row 2"),
+    )
+    .unwrap();
+    assert_eq!(
+        e,
+        FxValueError {
+            column: c.to_owned(),
+            row: 2,
+            out_of_range: true
+        }
+    );
+    let m = functional_index_value("ix", &e);
+    assert_eq!(
+        (m.code, m.sqlstate, m.message.as_str()),
+        (
+            3752,
+            *b"22003",
+            "Value is out of range for functional index 'ix' at row 2"
+        )
+    );
+    let e = fx_value_error(
+        1366,
+        &format!("Incorrect integer value: 'abc' for column `d`.`t`.`{c}` at row 1"),
+    )
+    .unwrap();
+    assert!(!e.out_of_range);
+    let m = functional_index_value("functional_index", &e);
+    assert_eq!(
+        (m.code, m.sqlstate, m.message.as_str()),
+        (
+            3751,
+            *b"01000",
+            "Data truncated for functional index 'functional_index' at row 1"
+        )
+    );
+    for code in [1265, 1406] {
+        assert!(fx_value_error(code, &format!("Data truncated for column '{c}' at row 1")).is_some());
+    }
+    // A user's column, another code, or a hidden column named elsewhere.
+    assert_eq!(
+        fx_value_error(1264, "Out of range value for column 'c0' at row 1"),
+        None
+    );
+    assert_eq!(
+        fx_value_error(1062, &format!("Duplicate entry '1' for key '{c}'")),
+        None
+    );
+    assert_eq!(
+        fx_value_error(1264, "Out of range value for column '(null)' at row 1"),
+        None
+    );
+    // The index: its own name, or MySQL's for unnamed ones in key order.
+    let parts = vec![
+        ("_sprig_fx_00000001".to_owned(), "_sprig_fx_00000001".to_owned()),
+        ("named".to_owned(), "_sprig_fx_00000002".to_owned()),
+        ("_sprig_fx_00000003".to_owned(), "_sprig_fx_00000003".to_owned()),
+        ("_sprig_fx_00000003".to_owned(), "_sprig_fx_00000004".to_owned()),
+    ];
+    assert_eq!(
+        fx_index_name(&parts, "_sprig_fx_00000001").as_deref(),
+        Some("functional_index")
+    );
+    assert_eq!(
+        fx_index_name(&parts, "_SPRIG_FX_00000002").as_deref(),
+        Some("named")
+    );
+    assert_eq!(
+        fx_index_name(&parts, "_sprig_fx_00000004").as_deref(),
+        Some("functional_index_2")
+    );
+    assert_eq!(fx_index_name(&parts, "_sprig_fx_00000009"), None);
+}

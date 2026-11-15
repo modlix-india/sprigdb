@@ -288,6 +288,12 @@ impl SqlSession {
         self.session.client_dc = dc;
     }
 
+    /// The verified claims of the issuer's token the connection logged in
+    /// with (`MONGODB-OIDC`): what `SPRIG_CLAIM()` reads.
+    pub fn set_claims(&mut self, claims: Option<std::sync::Arc<serde_json::Value>>) {
+        self.exec.set_claims(claims);
+    }
+
     /// The gateway session's id (for internal row-level security
     /// exemptions).
     #[must_use]

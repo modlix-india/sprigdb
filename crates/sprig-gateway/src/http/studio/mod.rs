@@ -614,12 +614,16 @@ pub fn session_client(authorization: Option<&str>) -> Option<String> {
     v.get("cli").and_then(Value::as_str).map(str::to_owned)
 }
 
-/// Every claim of the session token in `authorization`, read without
-/// checking the signature: only for a caller already verified. What
+/// Every claim of the session token, or of the issuer's token (chapter
+/// 14's external tokens), in `authorization`, read without checking the
+/// signature: only for a caller already verified with that header. What
 /// `SPRIG_CLAIM('k')` reads in that caller's statements.
 #[must_use]
 pub fn session_claims(authorization: Option<&str>) -> Option<Value> {
-    let t = bearer(authorization)?.strip_prefix(ACCESS_PREFIX)?;
+    let b = bearer(authorization)?;
+    let t = b.strip_prefix(ACCESS_PREFIX).or_else(|| {
+        sprig_auth::oidc::Jws::looks_like(b.as_bytes()).then_some(b)
+    })?;
     let payload = t.split('.').nth(1)?;
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload)

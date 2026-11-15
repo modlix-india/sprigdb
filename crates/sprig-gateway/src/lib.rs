@@ -393,6 +393,23 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         Arc::clone(&stores.global),
         ctx.config.gateway.workload_key_file.as_deref(),
     );
+    // The administration agent: this gateway's error counts, written to
+    // the DC tier while `ai.admin.enabled` is on.
+    let _intake = {
+        let (live, dc) = (live.clone(), dc.clone());
+        sprig_ai::incidents::intake::spawn(
+            Arc::clone(&stores.dc),
+            "gateway",
+            &gateway_id,
+            Arc::new(move || {
+                live.get(
+                    &sprig_ai::settings::ADMIN_ENABLED,
+                    &SettingCtx::process(&dc),
+                )
+            }),
+            stop.clone(),
+        )
+    };
     // `ASK` in SQL runs its turn and tools through the HTTP core.
     http::studio::ai::ask::install(Arc::clone(&core));
     let http_fe = Arc::new(http::HttpFrontend::new(Arc::clone(&core)));
@@ -872,11 +889,17 @@ fn logins(
             // Failure counters and temporary locks in the tenants'
             // catalogs, audit events in the log (target sprig_audit).
             let state = sprig_auth::policy::CatalogLoginState::new(tenants.catalog.clone());
+            // External tokens (chapter 14): issuers' JWTs over MySQL,
+            // Redis, MongoDB and HTTP, with just-in-time accounts written
+            // to the tenants' catalogs.
+            let tokens = sprig_auth::oidc::ExternalTokens::default()
+                .with_catalog(tenants.catalog.clone());
             let svc = LoginService::new(LoginSource::Catalog(catalogs), fast_cache)
                 .with_clock(clock)
                 .with_login_state(Arc::new(state))
                 .with_audit(audit)
-                .with_handoff(handoff);
+                .with_handoff(handoff)
+                .with_external_tokens(Arc::new(tokens));
             Ok((Arc::new(svc), Some(tenants), vec![sni]))
         }
     }

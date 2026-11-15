@@ -528,6 +528,13 @@ async fn login_phase(
         principal: principal.clone(),
         persona,
     });
+    // SPRIG_CLAIM(): the claims of the issuer's token the login used.
+    exec.set_claims(
+        login
+            .local()
+            .and_then(sprig_auth::MysqlLogin::token)
+            .map(|t| std::sync::Arc::clone(&t.claims)),
+    );
     let db = resp
         .database
         .as_ref()

@@ -28,7 +28,7 @@ use sprig_common::{Result, SprigError};
 
 use crate::provider::{Block, ChatRequest, MsgRole};
 use crate::role::Role;
-use crate::tools::{ColumnStats, ResultSet, ToolBody, ToolOutput, ToolSpec};
+use crate::tools::{ColumnStats, ResultSet, Shares, ToolBody, ToolOutput, ToolSpec};
 
 /// Rows a shared result may carry.
 pub const MAX_RESULT_ROWS: usize = 200;
@@ -125,6 +125,26 @@ impl EgressGate {
         self.user_text(s)
     }
 
+    /// Public text (the docs): secrets masked, and for the administration
+    /// roles only what the scrubber knows replaced ([`Scrubber::known`]).
+    fn docs(&self, v: &Value) -> Value {
+        let text = |s: &str| {
+            let t = redact_secrets(s);
+            match &self.scrubber {
+                Some(sc) => sc.known(&t),
+                None => t,
+            }
+        };
+        match v {
+            Value::String(s) => Value::String(text(s)),
+            Value::Array(a) => Value::Array(a.iter().map(|x| self.docs(x)).collect()),
+            Value::Object(m) => {
+                Value::Object(m.iter().map(|(k, x)| (text(k), self.docs(x))).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
     fn strings(&self, v: &Value) -> Value {
         match v {
             Value::String(s) => Value::String(self.string(s)),
@@ -142,6 +162,10 @@ impl EgressGate {
     #[must_use]
     pub fn tool_result(&self, spec: &ToolSpec, out: &ToolOutput) -> Gated {
         let (mut stored, mut reduced) = match &out.body {
+            // The docs are public: scrubbing their names (every `code`
+            // span, every example statement) would leave the
+            // administration assistant docs it can't read.
+            ToolBody::Json(v) if spec.shares == Shares::Docs => (self.docs(v), false),
             ToolBody::Json(v) => (self.strings(v), false),
             ToolBody::Rows(rs) => self.rows(spec, rs),
             ToolBody::Stats(st) => self.stats(st),
@@ -554,7 +578,7 @@ const VALUE_DIGITS: usize = 7;
 /// from it.
 pub struct Scrubber {
     key: hmac::Key,
-    names: Vec<(String, NameKind)>,
+    names: std::collections::HashMap<String, NameKind>,
 }
 
 impl std::fmt::Debug for Scrubber {
@@ -632,7 +656,7 @@ impl Scrubber {
     pub fn new(key: &[u8; 32]) -> Self {
         Self {
             key: hmac::Key::new(hmac::HMAC_SHA256, key),
-            names: Vec::new(),
+            names: std::collections::HashMap::new(),
         }
     }
 
@@ -655,12 +679,29 @@ impl Scrubber {
     /// part (`orders`, `shop.orders`). Case doesn't matter.
     pub fn add(&mut self, kind: NameKind, name: &str) {
         let n = name.trim().to_lowercase();
-        if n.is_empty() || self.names.iter().any(|(x, _)| *x == n) {
+        if n.is_empty() {
             return;
         }
-        self.names.push((n, kind));
-        self.names
-            .sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.0.cmp(&b.0)));
+        self.names.entry(n).or_insert(kind);
+    }
+
+    /// Adds many names of one kind, as [`Scrubber::add`] does.
+    pub fn extend<'a>(&mut self, kind: NameKind, names: impl IntoIterator<Item = &'a str>) {
+        for n in names {
+            self.add(kind, n);
+        }
+    }
+
+    /// How many names are registered.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    /// Whether no name is registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
     }
 
     /// The placeholder of `name` as a `kind`.
@@ -679,8 +720,7 @@ impl Scrubber {
     }
 
     fn registered(&self, word: &str) -> Option<NameKind> {
-        let w = word.to_lowercase();
-        self.names.iter().find(|(n, _)| *n == w).map(|(_, k)| *k)
+        self.names.get(&word.to_lowercase()).copied()
     }
 
     /// `text` with every name, value, statement and address replaced.
@@ -750,12 +790,30 @@ impl Scrubber {
         self.tokens(line)
     }
 
+    /// `text` with only what the scrubber knows replaced: registered
+    /// names, tenant schemas, long numbers and addresses, inside quotes
+    /// and statements too. Quoted literals and statements as such stay,
+    /// so public text (SprigDB's docs, with their `code` spans and
+    /// example statements) stays readable. Idempotent.
+    #[must_use]
+    pub fn known(&self, text: &str) -> String {
+        text.split('\n')
+            .map(|line| self.tokens_with(line, false))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn tokens(&self, text: &str) -> String {
+        self.tokens_with(text, true)
+    }
+
+    fn tokens_with(&self, text: &str, literals: bool) -> String {
         let mut out = String::with_capacity(text.len());
         let mut prev_word = String::new();
         let mut it = text.char_indices().peekable();
         while let Some((i, c)) = it.next() {
-            if matches!(c, '\'' | '"' | '`')
+            if literals
+                && matches!(c, '\'' | '"' | '`')
                 && opens_literal(text, i)
                 && let Some(end) = literal_end(text, i)
             {

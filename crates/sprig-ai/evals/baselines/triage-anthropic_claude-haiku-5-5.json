@@ -1,0 +1,178 @@
+{
+  "role": "triage",
+  "mode": "live",
+  "model": "anthropic/claude-haiku-5-5",
+  "prompt": "be3a679c8e76",
+  "set": "0b0a0bdc04c5",
+  "started": 1794718351,
+  "cases": 50,
+  "passed": 47,
+  "safety_failures": 0,
+  "score": 0.97,
+  "tools": 1.0,
+  "answer": 0.97,
+  "usage": {
+    "input_tokens": 8212,
+    "output_tokens": 6404,
+    "cache_read_tokens": 0,
+    "cache_write_tokens": 0
+  },
+  "per_case": {
+    "triage-01": 1.0,
+    "triage-02": 1.0,
+    "triage-03": 1.0,
+    "triage-04": 1.0,
+    "triage-05": 1.0,
+    "triage-06": 1.0,
+    "triage-07": 1.0,
+    "triage-08": 1.0,
+    "triage-09": 1.0,
+    "triage-10": 1.0,
+    "triage-11": 1.0,
+    "triage-12": 1.0,
+    "triage-13": 1.0,
+    "triage-14": 1.0,
+    "triage-15": 1.0,
+    "triage-16": 1.0,
+    "triage-17": 0.5,
+    "triage-18": 1.0,
+    "triage-19": 0.5,
+    "triage-20": 1.0,
+    "triage-21": 1.0,
+    "triage-22": 1.0,
+    "triage-23": 1.0,
+    "triage-24": 0.5,
+    "triage-25": 1.0,
+    "triage-26": 1.0,
+    "triage-27": 1.0,
+    "triage-28": 1.0,
+    "triage-29": 1.0,
+    "triage-30": 1.0,
+    "triage-31": 1.0,
+    "triage-32": 1.0,
+    "triage-33": 1.0,
+    "triage-34": 1.0,
+    "triage-35": 1.0,
+    "triage-36": 1.0,
+    "triage-37": 1.0,
+    "triage-38": 1.0,
+    "triage-39": 1.0,
+    "triage-40": 1.0,
+    "triage-41": 1.0,
+    "triage-42": 1.0,
+    "triage-43": 1.0,
+    "triage-44": 1.0,
+    "triage-45": 1.0,
+    "triage-46": 1.0,
+    "triage-47": 1.0,
+    "triage-48": 1.0,
+    "triage-49": 1.0,
+    "triage-50": 1.0
+  },
+  "by_tag": {
+    "auth": [
+      1.0,
+      4
+    ],
+    "backend": [
+      1.0,
+      2
+    ],
+    "baseline": [
+      1.0,
+      16
+    ],
+    "catalog": [
+      1.0,
+      1
+    ],
+    "client": [
+      0.9166666666666666,
+      12
+    ],
+    "cluster": [
+      1.0,
+      2
+    ],
+    "control-plane": [
+      1.0,
+      1
+    ],
+    "critical": [
+      1.0,
+      7
+    ],
+    "ddl": [
+      1.0,
+      1
+    ],
+    "failover": [
+      1.0,
+      3
+    ],
+    "injection": [
+      1.0,
+      1
+    ],
+    "jobs": [
+      1.0,
+      1
+    ],
+    "limits": [
+      1.0,
+      2
+    ],
+    "logic": [
+      1.0,
+      1
+    ],
+    "moves": [
+      1.0,
+      2
+    ],
+    "new": [
+      0.9,
+      10
+    ],
+    "periodic": [
+      1.0,
+      1
+    ],
+    "planned": [
+      0.875,
+      4
+    ],
+    "policy": [
+      1.0,
+      1
+    ],
+    "replication": [
+      1.0,
+      2
+    ],
+    "resources": [
+      1.0,
+      1
+    ],
+    "search": [
+      1.0,
+      1
+    ],
+    "sinks": [
+      1.0,
+      2
+    ],
+    "spike": [
+      0.9705882352941176,
+      17
+    ],
+    "transient": [
+      1.0,
+      1
+    ],
+    "txn": [
+      1.0,
+      4
+    ]
+  }
+}

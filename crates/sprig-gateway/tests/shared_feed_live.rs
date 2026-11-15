@@ -156,15 +156,35 @@ async fn dump_gauges(addr: &str) -> BTreeMap<(String, String), f64> {
     metric(addr, "sprig_feed_binlog_dumps", "kind", "node").await
 }
 
-/// The catch-up dumps one process opened since it started:
-/// `sprig_feed_resumes_total{tier="binlog"}`.
-async fn catchups(addr: &str) -> f64 {
-    metric(addr, "sprig_feed_resumes_total", "tier", "tier")
-        .await
-        .iter()
-        .filter(|((t, _), _)| t == "binlog")
-        .map(|(_, v)| v)
-        .sum()
+/// The catch-up dumps one process opened since it started, by consumer:
+/// `sprig_feed_resumes_total{tier="binlog"}` (the `consumer` label, R9
+/// r9feed5).
+async fn catchups(addr: &str) -> BTreeMap<String, f64> {
+    let mut out = BTreeMap::new();
+    for ((tier, consumer), v) in metric(addr, "sprig_feed_resumes_total", "tier", "consumer").await
+    {
+        if tier == "binlog" {
+            *out.entry(consumer).or_default() += v;
+        }
+    }
+    out
+}
+
+/// Slow subscriptions the shared reader detached, by consumer:
+/// `sprig_feed_shared_detached_total`.
+async fn detaches(addr: &str) -> BTreeMap<String, f64> {
+    let mut out = BTreeMap::new();
+    for ((consumer, _), v) in metric(
+        addr,
+        "sprig_feed_shared_detached_total",
+        "consumer",
+        "consumer",
+    )
+    .await
+    {
+        *out.entry(consumer).or_default() += v;
+    }
+    out
 }
 
 /// Series `name` of one process's `/metrics`, summed by labels `a` and `b`.
@@ -1378,8 +1398,12 @@ async fn triggers_search_and_change_streams_share_one_dump_per_process() {
     // SPRIG_SFC_NO_CATCHUP=1).
     let allow_catchup = var("SPRIG_SFC_NO_CATCHUP").as_deref() != Some("1");
     for m in &metrics {
-        let n = catchups(m).await;
-        println!("  {m}: catch-up dumps since its last start: {n}");
+        let by = catchups(m).await;
+        let n: f64 = by.values().sum();
+        println!(
+            "  {m}: catch-up dumps since its last start: {n} {by:?}; detached: {:?}",
+            detaches(m).await
+        );
         if n > 0.0 && !allow_catchup {
             failures.push(format!("{m}: {n} catch-up dumps since its last start"));
         }

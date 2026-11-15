@@ -99,6 +99,17 @@ pub trait SettingsSource: Send + Sync {
     fn min_shards(&self, tenant: TenantId, _db: DbId) -> u32 {
         self.settings(tenant).sharding.min_shards
     }
+
+    /// `lookup.lock_wait_seconds` at owner table `object`'s scope (in
+    /// database `db`). The default is the tenant's value.
+    fn lookup_lock_wait(
+        &self,
+        tenant: TenantId,
+        _db: DbId,
+        _object: sprig_common::ids::ObjectId,
+    ) -> u64 {
+        self.settings(tenant).lookup.lock_wait_seconds
+    }
 }
 
 /// When a shard was born, for the merge cooldown: the commit of the job

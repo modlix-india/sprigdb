@@ -2,7 +2,7 @@
 //!
 //! | Tool | Roles | Effect | Shares |
 //! |---|---|---|---|
-//! | `search_docs` | admin, dba, data | read | schema |
+//! | `search_docs` | admin, dba, data | read | docs |
 //! | `catalog`, `describe` | dba, data | read | schema |
 //! | `workload`, `fingerprint` | dba | read | stats |
 //! | `explain` | dba, data | read | stats |
@@ -139,7 +139,7 @@ pub fn specs() -> Vec<ToolSpec> {
             ),
             Read,
             ALL,
-            Shares::Schema,
+            Shares::Docs,
         ),
         spec(
             "catalog",

@@ -9,7 +9,9 @@
 //! - [`telemetry`]: tracing setup, metrics and health endpoints;
 //! - [`names`]: physical MariaDB schema, account and internal names;
 //! - [`audit`]: the audit spool, shipper and sinks;
-//! - [`https`]: the Admin API over TLS.
+//! - [`https`]: the Admin API over TLS;
+//! - [`incidents`]: the process's error counts for the administration
+//!   agent's intake.
 //!
 //! Not here yet: `certwatch`.
 
@@ -19,6 +21,7 @@ pub mod cpu;
 pub mod error;
 pub mod https;
 pub mod ids;
+pub mod incidents;
 pub mod names;
 pub mod net;
 pub mod secret_file;

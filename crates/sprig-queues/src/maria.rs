@@ -800,15 +800,27 @@ impl MsgStore for MariaStore {
         Ok(rows.into_iter().filter_map(outbox_of).collect())
     }
 
-    async fn purge_ledger(&self, before_ms: i64) -> Result<u64, StoreError> {
+    async fn purge_ledger(
+        &self,
+        before_ms: i64,
+        changes_before_ms: i64,
+    ) -> Result<u64, StoreError> {
         let mut c = self.conn().await?;
+        // Byte 7's high nibble is the UUID version: 8 marks a change
+        // exchange's id (`store::is_change_id`), kept longer.
         c.exec_drop(
             format!(
-                "DELETE FROM {} WHERE at_ms < ? AND out_id NOT IN (SELECT out_id FROM {}) LIMIT 5000",
+                "DELETE FROM {} WHERE at_ms < ? AND out_id NOT IN (SELECT out_id FROM {}) \
+                 AND IF(ASCII(SUBSTRING(out_id, 7, 1)) >> 4 = 8, at_ms < ?, at_ms < ?) LIMIT {}",
                 self.t("__sprig_qf"),
-                self.t("__sprig_qo")
+                self.t("__sprig_qo"),
+                crate::store::LEDGER_PURGE_BATCH
             ),
-            (before_ms,),
+            (
+                before_ms.max(changes_before_ms),
+                changes_before_ms,
+                before_ms,
+            ),
         )
         .await
         .map_err(|e| self.fail(&e))?;

@@ -84,6 +84,7 @@ use crate::settings::{
     FAILURE_DELAY_MS, IP_BLOCK_SECONDS, IP_FAILURES_PER_MINUTE, MYSQL_NATIVE_PASSWORD, REQUIRE_TLS,
 };
 use crate::store::{AccountLimits, AuthMethods, RequireTls, Slot, TempLock, UNBOUNDED_LOCK_MICROS};
+use crate::oidc::{Check, Jws, Refusal, TokenProtocol, VerifiedToken};
 use crate::verifier::{FastCacheValue, decoy_verify, verify_native_scramble, verify_scramble};
 
 /// How long a full-path hash waits for a CPU slot before 39301.
@@ -480,6 +481,24 @@ impl CatalogLogins {
         policy_bool(&*self.policy, &REQUIRE_TLS, catalog)
     }
 
+    /// The tenant's `auth.token_clock_skew_seconds` and
+    /// `auth.jwks_refresh_seconds`, for external tokens.
+    #[must_use]
+    pub fn token_times(&self, catalog: &TenantCatalog) -> (Duration, Duration) {
+        (
+            Duration::from_secs(policy_u64(
+                &*self.policy,
+                &crate::oidc::TOKEN_CLOCK_SKEW_SECONDS,
+                catalog,
+            )),
+            Duration::from_secs(policy_u64(
+                &*self.policy,
+                &crate::oidc::JWKS_REFRESH_SECONDS,
+                catalog,
+            )),
+        )
+    }
+
     /// The backend target of a verified `user` of `tenant`.
     ///
     /// # Errors
@@ -631,6 +650,8 @@ pub struct LoginService {
     handoff: Option<Arc<crate::handoff::HandoffConfig>>,
     /// Users whose SCRAM verifiers are being backfilled here.
     backfilling: Arc<std::sync::Mutex<std::collections::HashSet<(TenantId, UserId)>>>,
+    /// External tokens (issuers' JWTs); `None`: refused.
+    tokens: Option<Arc<crate::oidc::ExternalTokens>>,
 }
 
 impl std::fmt::Debug for LoginService {
@@ -661,7 +682,22 @@ impl LoginService {
             audit: Arc::new(NoAudit),
             handoff: None,
             backfilling: Arc::default(),
+            tokens: None,
         }
+    }
+
+    /// The same service verifying issuers' tokens with `tokens` (chapter
+    /// 14's external tokens; see [`crate::oidc`]).
+    #[must_use]
+    pub fn with_external_tokens(mut self, tokens: Arc<crate::oidc::ExternalTokens>) -> Self {
+        self.tokens = Some(tokens);
+        self
+    }
+
+    /// The external-token verifier, if configured.
+    #[must_use]
+    pub fn external_tokens(&self) -> Option<&Arc<crate::oidc::ExternalTokens>> {
+        self.tokens.as_ref()
     }
 
     /// The same service handing logins of tenants pinned elsewhere to an
@@ -991,6 +1027,9 @@ impl LoginService {
             reason: None,
             front,
             backfill: None,
+            token_protocol: (front == Front::Mysql).then_some(TokenProtocol::Mysql),
+            token: None,
+            token_refusal: None,
         }
     }
 }
@@ -1086,6 +1125,13 @@ pub struct MysqlLogin {
     front: Front,
     /// SCRAM verifiers to store once the login is accepted.
     backfill: Option<Backfill>,
+    /// Whether a clear-text password may be an issuer's token, and over
+    /// which protocol (MySQL always; Redis when its front end asks).
+    token_protocol: Option<TokenProtocol>,
+    /// The verified token this login used.
+    token: Option<VerifiedToken>,
+    /// Why a presented token was refused.
+    token_refusal: Option<Refusal>,
 }
 
 impl std::fmt::Debug for MysqlLogin {
@@ -1111,6 +1157,21 @@ impl MysqlLogin {
     #[must_use]
     pub fn principal(&self) -> Option<&Principal> {
         self.principal.as_ref()
+    }
+
+    /// Lets a clear-text password be an issuer's token over `protocol`
+    /// (Redis `AUTH`; MySQL logins allow it from the start): an account
+    /// with the `token` method then logs in with a token its issuer's
+    /// user mapping names it by.
+    pub fn allow_tokens(&mut self, protocol: TokenProtocol) {
+        self.token_protocol = Some(protocol);
+    }
+
+    /// The issuer's token the accepted login used: its claims are the
+    /// session's `SPRIG_CLAIM()` values.
+    #[must_use]
+    pub fn token(&self) -> Option<&VerifiedToken> {
+        self.token.as_ref().filter(|_| self.principal.is_some())
     }
 
     /// The catalog account this login resolved to (tenant and user id),
@@ -1228,6 +1289,49 @@ impl MysqlLogin {
         }
     }
 
+    /// The token branch of a clear-text password: `None` when the password
+    /// isn't taken as a token (no protocol allows it, no verifier, not a
+    /// catalog account with the `token` method, not shaped like a JWT), so
+    /// the verifiers decide; else whether it verified, its issuer's user
+    /// mapping naming this account.
+    async fn check_token(&mut self, password: &[u8]) -> Option<bool> {
+        let protocol = self.token_protocol?;
+        let tokens = Arc::clone(self.svc.tokens.as_ref()?);
+        let (Target::Catalog(c), LoginSource::Catalog(cl)) = (&self.target, &self.svc.source)
+        else {
+            return None;
+        };
+        if !c.user.row.auth_methods.contains(AuthMethods::TOKEN) || !Jws::looks_like(password) {
+            return None;
+        }
+        let token = std::str::from_utf8(password).ok()?;
+        let auth = TenantAuth::of(&c.catalog)?;
+        let (skew, jwks_refresh) = cl.token_times(&c.catalog);
+        let check = Check {
+            issuers: auth.issuers(),
+            protocol,
+            skew,
+            jwks_refresh,
+            now: self.svc.clock.wall(),
+            cache: Some((c.tenant.id, c.catalog.auth_version)),
+        };
+        let name = c.user.row.name.clone();
+        match tokens.verify(token, &check).await {
+            Ok(v) if v.user.as_deref() == Some(name.as_str()) => {
+                self.token = Some(v);
+                Some(true)
+            }
+            Ok(_) => {
+                self.token_refusal = Some(Refusal::NoUser);
+                Some(false)
+            }
+            Err(r) => {
+                self.token_refusal = Some(r);
+                Some(false)
+            }
+        }
+    }
+
     fn denied(&self) -> ErrPacket {
         ErrPacket::access_denied(
             self.req.persona,
@@ -1311,8 +1415,14 @@ impl MysqlLogin {
             let e = temp_locked(persona, &row.name, &row.host, &lock, now);
             return self.refuse("temp_locked", path, e);
         }
-        // b. Credentials (and the password method).
-        if outcome != Outcome::Verified || !row.auth_methods.contains(AuthMethods::PASSWORD) {
+        // b. Credentials (and the method: a verified token was checked
+        // against the `token` method).
+        let method = if self.token.is_some() {
+            AuthMethods::TOKEN
+        } else {
+            AuthMethods::PASSWORD
+        };
+        if outcome != Outcome::Verified || !row.auth_methods.contains(method) {
             let mut e = self.denied();
             if outcome == Outcome::NeedsTls {
                 e = needs_tls_hint(&e);
@@ -1353,7 +1463,9 @@ impl MysqlLogin {
             && now
                 .duration_since(changed)
                 .is_ok_and(|age| age >= Duration::from_secs(lifetime_days.saturating_mul(86_400)));
-        let expired = row.password_expired || aged;
+        // A token login doesn't use the password, so its expiry doesn't
+        // apply.
+        let expired = (row.password_expired || aged) && self.token.is_none();
         if expired && !self.req.can_handle_expired_password {
             return self.refuse("expired", path, must_change(persona));
         }
@@ -1468,6 +1580,9 @@ impl LoginFlow for MysqlLogin {
             Decoy,
         }
         self.used_password |= !password.is_empty();
+        if let Some(verified) = self.check_token(&password).await {
+            return verified;
+        }
         let native = self.native_allowed();
         let work = match &self.target {
             Target::Catalog(c) => Work::Catalog(Arc::clone(&c.user), c.tenant.id, native),
@@ -1651,6 +1766,13 @@ impl MysqlLogin {
         let mut e = AuditEvent::new(audit::events::LOGIN_SUCCEEDED, protocol, now);
         e.client_ip = Some(self.req.client_ip);
         e.mechanism = Some(path.as_str());
+        let token_tried = self.token.is_some() || self.token_refusal.is_some();
+        if token_tried {
+            e.mechanism = Some("jwt");
+        }
+        if let Some(r) = &self.token_refusal {
+            e.detail = Some(r.detail());
+        }
         match &self.target {
             Target::Catalog(c) => {
                 e.tenant = Some(c.tenant.id);
@@ -1678,6 +1800,9 @@ impl MysqlLogin {
             {
                 e.detail = Some("sandbox mode: the password expired".into());
             }
+            if let Some(t) = &self.token {
+                e.detail = Some(format!("issuer {}", t.issuer));
+            }
             svc.audit.emit(&e);
             return;
         }
@@ -1689,7 +1814,10 @@ impl MysqlLogin {
         if !matches!(reason, "bad_credentials" | "temp_locked") {
             return;
         }
+        // A refused token doesn't count toward the account's lockout (it
+        // isn't a password, as API keys aren't), only toward the address.
         if reason == "bad_credentials"
+            && !token_tried
             && let Target::Catalog(c) = &self.target
         {
             svc.count_failure(&c.tenant, &c.user, &c.catalog, protocol, self.req.client_ip)

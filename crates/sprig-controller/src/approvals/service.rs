@@ -530,7 +530,10 @@ impl RecommendationsService {
 
 /// `POST /admin/v1/recommendations:gate`: a gateway asks the approval
 /// gate for a decision it makes itself (`vector.ann`: an automatic ANN
-/// graph), or reports the action it was let through.
+/// graph), or reports the action it was let through. A gateway also raises
+/// a lookup build's duplicates here (`advisor.lookup` with a
+/// `.../duplicates` target, after `ADD UNIQUE` or `SPRIG REBUILD`), so the
+/// item notifies like the controller's own.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)] // one request, read once
@@ -558,6 +561,12 @@ pub enum GateRequest {
         /// Grows with the evidence.
         #[serde(default)]
         score: f64,
+        /// The table the item is about, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        object: Option<u64>,
+        /// Its name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        object_name: Option<String>,
     },
     /// The action a `Check` let through finished.
     Finished {
@@ -590,9 +599,10 @@ impl RecommendationsService {
     /// # Errors
     /// 39792 for a kind gateways don't decide, or an unknown database;
     /// catalog errors.
+    #[allow(clippy::too_many_lines)] // the two kinds' paths
     pub async fn gate(&self, req: GateRequest) -> Result<GateReply> {
         use sprig_approvals::{Action, Mode, Proposal, Verdict};
-        let (kind, tenant, db, target, action, machine, evidence, summary, score) = match req {
+        let (kind, tenant, db, target, action, machine, evidence, summary, score, object) = match req {
             GateRequest::Finished { ticket, ok, detail } => {
                 self.ctl.finished(&ticket, ok, &detail).await;
                 return Ok(GateReply {
@@ -611,15 +621,82 @@ impl RecommendationsService {
                 evidence,
                 summary,
                 score,
+                object,
+                object_name,
             } => (
-                kind, tenant, db, target, action, machine, evidence, summary, score,
+                kind,
+                tenant,
+                db,
+                target,
+                action,
+                machine,
+                evidence,
+                summary,
+                score,
+                (object, object_name),
             ),
         };
+        // A lookup build's duplicates, which only a person can fix.
+        let duplicates = target.ends_with(sprig_shard::lookup::admin::DUPLICATES_TARGET_SUFFIX);
         let kind = Kind::parse(&kind)
-            .filter(|k| *k == Kind::VectorAnn)
-            .ok_or_else(|| invalid(format!("{kind}: gateways ask the gate for vector.ann only")))?;
+            .filter(|k| *k == Kind::VectorAnn || (*k == Kind::AdvisorLookup && duplicates))
+            .ok_or_else(|| {
+                invalid(format!(
+                    "{kind}: gateways ask the gate for vector.ann, and raise advisor.lookup \
+                     duplicates"
+                ))
+            })?;
         let t = TenantId(tenant);
         let db_id = self.db_id(t, &db).await?;
+        if kind == Kind::AdvisorLookup {
+            // Held for an approval with no timers whatever `advisor.mode`
+            // says, as the sharding loop raises its own; the hub's hooks
+            // notify.
+            let mut subject = self.ctl.subject(t).await;
+            subject.db = Some(db_id);
+            subject.db_name = Some(db);
+            subject.object = object.0.map(sprig_common::ids::ObjectId);
+            subject.object_name = object.1;
+            let p = Proposal {
+                kind,
+                subject,
+                target: sprig_approvals::model::clip(&format!("t{tenant}/{target}"), 255),
+                action: Action {
+                    text: action,
+                    machine,
+                },
+                evidence,
+                score,
+                summary,
+                emergency: false,
+            };
+            let policy = sprig_approvals::Policy::fixed(
+                Mode::Approve,
+                sprig_approvals::model::Level::Database,
+            );
+            let mut v = self.ctl.gate(&p, &policy).await;
+            if let Verdict::Proceed(ticket) = &v
+                && ticket.id.is_some()
+            {
+                // Approved meanwhile, and the values still repeat: that
+                // item failed; a new one waits.
+                self.ctl
+                    .finished(ticket, false, "the values still repeat across shards")
+                    .await;
+                v = self.ctl.gate(&p, &policy).await;
+            }
+            let why = match v {
+                Verdict::Wait(id) => Some(format!("held for approval as {id}")),
+                Verdict::Advice(id) => Some(format!("recommended as {id}")),
+                Verdict::Suppressed(id) => Some(format!("ignored ({id})")),
+                Verdict::Proceed(_) | Verdict::Off => None,
+            };
+            return Ok(GateReply {
+                go: false,
+                ticket: None,
+                why,
+            });
+        }
         // A gateway asks once an index is due, at most once a minute: read
         // the tenant's rows as of now, so an `approve` set a moment ago
         // isn't answered with the old `on`.

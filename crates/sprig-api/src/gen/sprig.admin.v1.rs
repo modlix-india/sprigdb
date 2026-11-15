@@ -1761,6 +1761,74 @@ pub mod users_client {
                 .insert(GrpcMethod::new("sprig.admin.v1.Users", "CreateUser"));
             self.inner.unary(req, path, codec).await
         }
+        /// Adds or removes an account's `token` method (logins with an issuer's
+        /// token over MySQL and Redis). The body is {"user", "host", "enabled"}.
+        pub async fn set_token_login(
+            &mut self,
+            request: impl tonic::IntoRequest<super::NameRequest>,
+        ) -> std::result::Result<tonic::Response<super::JsonReply>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sprig.admin.v1.Users/SetTokenLogin",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("sprig.admin.v1.Users", "SetTokenLogin"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// The tenant's token issuers (OIDC providers, the end-user layer) with
+        /// their claim mappings.
+        pub async fn list_issuers(
+            &mut self,
+            request: impl tonic::IntoRequest<super::NameRequest>,
+        ) -> std::result::Result<tonic::Response<super::JsonReply>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sprig.admin.v1.Users/ListIssuers",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("sprig.admin.v1.Users", "ListIssuers"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Creates or replaces an issuer (by its `issuer`) with its mappings.
+        pub async fn put_issuer(
+            &mut self,
+            request: impl tonic::IntoRequest<super::NameRequest>,
+        ) -> std::result::Result<tonic::Response<super::JsonReply>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sprig.admin.v1.Users/PutIssuer",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("sprig.admin.v1.Users", "PutIssuer"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1777,6 +1845,23 @@ pub mod users_server {
     #[async_trait]
     pub trait Users: std::marker::Send + std::marker::Sync + 'static {
         async fn create_user(
+            &self,
+            request: tonic::Request<super::NameRequest>,
+        ) -> std::result::Result<tonic::Response<super::JsonReply>, tonic::Status>;
+        /// Adds or removes an account's `token` method (logins with an issuer's
+        /// token over MySQL and Redis). The body is {"user", "host", "enabled"}.
+        async fn set_token_login(
+            &self,
+            request: tonic::Request<super::NameRequest>,
+        ) -> std::result::Result<tonic::Response<super::JsonReply>, tonic::Status>;
+        /// The tenant's token issuers (OIDC providers, the end-user layer) with
+        /// their claim mappings.
+        async fn list_issuers(
+            &self,
+            request: tonic::Request<super::NameRequest>,
+        ) -> std::result::Result<tonic::Response<super::JsonReply>, tonic::Status>;
+        /// Creates or replaces an issuer (by its `issuer`) with its mappings.
+        async fn put_issuer(
             &self,
             request: tonic::Request<super::NameRequest>,
         ) -> std::result::Result<tonic::Response<super::JsonReply>, tonic::Status>;
@@ -1886,6 +1971,135 @@ pub mod users_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = CreateUserSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sprig.admin.v1.Users/SetTokenLogin" => {
+                    #[allow(non_camel_case_types)]
+                    struct SetTokenLoginSvc<T: Users>(pub Arc<T>);
+                    impl<T: Users> tonic::server::UnaryService<super::NameRequest>
+                    for SetTokenLoginSvc<T> {
+                        type Response = super::JsonReply;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::NameRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Users>::set_token_login(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SetTokenLoginSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sprig.admin.v1.Users/ListIssuers" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListIssuersSvc<T: Users>(pub Arc<T>);
+                    impl<T: Users> tonic::server::UnaryService<super::NameRequest>
+                    for ListIssuersSvc<T> {
+                        type Response = super::JsonReply;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::NameRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Users>::list_issuers(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListIssuersSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sprig.admin.v1.Users/PutIssuer" => {
+                    #[allow(non_camel_case_types)]
+                    struct PutIssuerSvc<T: Users>(pub Arc<T>);
+                    impl<T: Users> tonic::server::UnaryService<super::NameRequest>
+                    for PutIssuerSvc<T> {
+                        type Response = super::JsonReply;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::NameRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Users>::put_issuer(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PutIssuerSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

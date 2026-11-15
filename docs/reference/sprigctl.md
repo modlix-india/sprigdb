@@ -3142,18 +3142,20 @@ Options:
           openai only: a query string for every call, such as api-version=2024-10-21
       --client-key <client-key>
           The private key (PEM) of --client-cert [env: SPRIGCTL_CLIENT_KEY=]
-      --provider-ca-file <provider-ca-file>
-          A CA file to trust instead of the public roots (a TLS-inspecting proxy)
+      --max-tokens-field <max-tokens-field>
+          openai only: the output limit's field (default max_completion_tokens for api.openai.com, which refuses max_tokens on current models; else max_tokens) [possible values: max_tokens, max_completion_tokens]
       --dc <dc>
           Data center to act in
+      --provider-ca-file <provider-ca-file>
+          A CA file to trust instead of the public roots (a TLS-inspecting proxy)
       --key-file <key-file>
           Read the API key from this file; - reads standard input
-      --no-key
-          The provider takes no key (a local server such as Ollama)
   -o, --output <output>
           Output format [default: table] [possible values: table, json, yaml]
       --dry-run
           Show what would change
+      --no-key
+          The provider takes no key (a local server such as Ollama)
       --keep-key
           Replacing a provider: keep the key it has
       --yes

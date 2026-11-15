@@ -39,6 +39,7 @@ use sprig_common::ids::UserId;
 
 use crate::account::HostPattern;
 use crate::apikey::{ApiKey, ApiKeyRow};
+use crate::oidc::{Issuer, IssuerSpec};
 use crate::scram::{ScramKind, ScramVerifier};
 use crate::store::{
     AUTH_MIGRATIONS, AuthStore, MODULE, Slot, TempLock, UserRow, VerifierKind, VerifierRow,
@@ -178,6 +179,8 @@ pub struct TenantAuth {
     api_keys: Arc<HashMap<String, Arc<ApiKey>>>,
     /// Live token sessions by id ([`crate::token`]).
     sessions: Arc<HashMap<[u8; 16], Arc<TokenSession>>>,
+    /// Registered issuers with their claim mappings ([`crate::oidc`]).
+    issuers: Arc<Vec<Arc<Issuer>>>,
     bytes: usize,
 }
 
@@ -207,6 +210,11 @@ impl PartialEq for TenantAuth {
             && self.locks == other.locks
             && self.api_keys == other.api_keys
             && self.sessions == other.sessions
+            && self
+                .issuers
+                .iter()
+                .map(|i| &i.spec)
+                .eq(other.issuers.iter().map(|i| &i.spec))
     }
 }
 
@@ -289,8 +297,29 @@ impl TenantAuth {
             locks: Arc::new(locks),
             api_keys: Arc::clone(&self.api_keys),
             sessions: Arc::clone(&self.sessions),
+            issuers: Arc::clone(&self.issuers),
             bytes,
         }
+    }
+
+    /// The same state with `issuers` replacing every issuer (`None`: kept).
+    #[must_use]
+    pub fn with_issuers(mut self, issuers: Option<Vec<IssuerSpec>>) -> Self {
+        let Some(specs) = issuers else {
+            return self;
+        };
+        let old = self.issuers.len();
+        let new: Vec<Arc<Issuer>> = specs.into_iter().map(|s| Arc::new(Issuer::new(s))).collect();
+        self.bytes =
+            self.bytes.saturating_sub(old * ISSUER_BYTES) + new.len() * ISSUER_BYTES;
+        self.issuers = Arc::new(new);
+        self
+    }
+
+    /// The registered issuers (active and disabled), with their mappings.
+    #[must_use]
+    pub fn issuers(&self) -> &[Arc<Issuer>] {
+        &self.issuers
     }
 
     /// The same state with `changed` API keys replacing their entries
@@ -408,6 +437,7 @@ impl TenantAuth {
 const LOCK_BYTES: usize = 64;
 const KEY_BYTES: usize = 256;
 const SESSION_BYTES: usize = 160;
+const ISSUER_BYTES: usize = 2048;
 
 /// `sprig-auth`'s catalog module: the auth tables' migrations, and
 /// [`TenantAuth`] in every snapshot.
@@ -452,17 +482,25 @@ impl CatalogExtension for AuthExtension {
             let keys = crate::apikey::keys_since(&store, conn, Some(since)).await?;
             let sessions =
                 crate::token::sessions::sessions_since(&store, conn, Some(since)).await?;
+            let issuers = if crate::oidc::store::changed_since(&store, conn, since).await? {
+                Some(crate::oidc::store::read_issuers(&store, conn).await?)
+            } else {
+                None
+            };
             prev.apply(users, &verifiers, locks)
                 .with_api_keys(keys, false)
                 .with_sessions(sessions, false)
+                .with_issuers(issuers)
         } else {
             let users = store.users_since(conn, None).await?;
             let verifiers = store.all_verifiers(conn).await?;
             let keys = crate::apikey::keys_since(&store, conn, None).await?;
             let sessions = crate::token::sessions::sessions_since(&store, conn, None).await?;
+            let issuers = crate::oidc::store::read_issuers(&store, conn).await?;
             TenantAuth::build(users, &verifiers, locks)
                 .with_api_keys(keys, true)
                 .with_sessions(sessions, true)
+                .with_issuers(Some(issuers))
         };
         Ok(Arc::new(state))
     }

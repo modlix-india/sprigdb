@@ -18,7 +18,18 @@ arc-swap.workspace = true
 async-trait.workspace = true
 # Token signatures and refresh tokens are base64url.
 base64.workspace = true
+bytes.workspace = true
 getrandom.workspace = true
+# External tokens (chapter 14 step 16): issuers' key sets are fetched with
+# hyper over HTTP/1.1, rustls and the Mozilla roots (webpki-roots 1.x, as
+# sprig-ai and sprig-approvals use; CDLA-Permissive-2.0), and claim mappings
+# match with regex (MIT or Apache-2.0). All already in the tree.
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+regex = "1.11"
+rustls.workspace = true
+webpki-roots = "1"
 metrics.workspace = true
 mysql_async.workspace = true
 # SCRAM verifiers: PBKDF2, HMAC and SHA-256/512.
@@ -46,7 +57,6 @@ uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-bytes.workspace = true
 futures.workspace = true
 sprig-meta = { workspace = true, features = ["conformance"] }
 tokio = { workspace = true, features = ["test-util", "io-util"] }

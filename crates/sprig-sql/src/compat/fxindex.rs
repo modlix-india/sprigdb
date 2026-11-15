@@ -19,7 +19,10 @@
 //! `SIGNED` as `BIGINT`, ...); a string function of one column (`lower`,
 //! `upper`, `trim`, `left`, `substring`, ...) the column's type when the
 //! same `CREATE TABLE` defines it; date parts `INT`; `date()` `DATE`;
-//! `md5()` `CHAR(32)`; arithmetic on integer columns `BIGINT`. Any other
+//! `md5()` `CHAR(32)`; arithmetic on integer columns `BIGINT` (`BIGINT
+//! UNSIGNED` when one is unsigned, as MySQL types it). `RAND()` and `EXISTS
+//! (...)` are typed too (`DOUBLE`, `BIGINT`), only so that MariaDB refuses
+//! them by name (1901) and the gateway answers MySQL's 3758. Any other
 //! expression leaves the statement as it is (MariaDB's 1064 stands), as do
 //! `CREATE INDEX` and `ALTER TABLE ... ADD INDEX` on expressions whose
 //! type needs a column's definition.
@@ -322,9 +325,19 @@ fn infer(s: &Sig<'_>, a: usize, b: usize, cols: &BTreeMap<String, String>) -> Op
             "length" | "char_length" | "character_length" | "octet_length" | "bit_length" => {
                 Some("BIGINT".to_owned())
             }
-            "abs" => first_col
-                .filter(|t| is_integer_type(t))
-                .map(|_| "BIGINT".to_owned()),
+            "abs" => first_col.filter(|t| is_integer_type(t)).map(|t| {
+                if is_unsigned_type(&t) {
+                    "BIGINT UNSIGNED"
+                } else {
+                    "BIGINT"
+                }
+                .to_owned()
+            }),
+            // Typed only so that MariaDB refuses them by name (1901), which
+            // the gateway answers with MySQL's 3758: `RAND()` and a
+            // subquery can't be indexed on either server.
+            "rand" => Some("DOUBLE".to_owned()),
+            "exists" => Some("BIGINT".to_owned()),
             // String columns and literals, `VARCHAR` of their lengths' sum
             // (`CONCAT_WS`: the separator once between each pair), as MySQL
             // types it.
@@ -348,6 +361,10 @@ fn infer(s: &Sig<'_>, a: usize, b: usize, cols: &BTreeMap<String, String>) -> Op
     // the longest).
     if s.word(a, b"CASE") && s.word(b, b"END") {
         return case_type(s, a, b, cols);
+    }
+    // `NOT EXISTS (...)`: 0, 1 or NULL, as a comparison.
+    if s.word(a, b"NOT") && s.word(a + 1, b"EXISTS") && a + 1 < b {
+        return Some("BIGINT".to_owned());
     }
     // A comparison at the top level is 0, 1 or NULL.
     {
@@ -382,11 +399,14 @@ fn infer(s: &Sig<'_>, a: usize, b: usize, cols: &BTreeMap<String, String>) -> Op
         return Some(format!("{base} COLLATE {}", s.text(a + 2, a + 2)));
     }
     // Arithmetic over numeric columns and literals: integers alone give
-    // `BIGINT`; a `/`, a decimal literal or a non-integer column gives
+    // `BIGINT` (`BIGINT UNSIGNED` with an unsigned column, as MySQL types
+    // it); a `/`, a decimal literal, `RAND()` or a non-integer column gives
     // `DOUBLE`.
     let mut any_col = false;
     let mut real = false;
-    for k in a..=b {
+    let mut unsigned = false;
+    let mut k = a;
+    while k <= b {
         let tk = &s.t[k];
         match tk.kind {
             TokenKind::Number if tk.bytes(s.sql).iter().all(u8::is_ascii_digit) => {}
@@ -394,13 +414,23 @@ fn infer(s: &Sig<'_>, a: usize, b: usize, cols: &BTreeMap<String, String>) -> Op
             TokenKind::Op if matches!(tk.bytes(s.sql), b"+" | b"-" | b"*") => {}
             TokenKind::Op if tk.bytes(s.sql) == b"/" => real = true,
             TokenKind::Punct if matches!(tk.bytes(s.sql), b"(" | b")" | b".") => {}
+            // `RAND()`: typed, so MariaDB refuses it by name (1901) and
+            // the gateway answers MySQL's 3758.
+            _ if s.word(k, b"RAND") && s.punct(k + 1, b'(') => {
+                k = s.matching(k + 1).filter(|m| *m <= b)?;
+                real = true;
+                any_col = true;
+            }
             _ if tk.kind.is_ident_like() => {
                 if s.punct(k + 1, b'.') {
+                    k += 1;
                     continue;
                 }
                 let name = s.ident(k)?.to_lowercase();
                 let t = cols.get(&name)?;
-                if !is_integer_type(t) {
+                if is_integer_type(t) {
+                    unsigned |= is_unsigned_type(t);
+                } else {
                     let up = t.trim_start().to_ascii_uppercase();
                     if !["DOUBLE", "FLOAT", "REAL", "DECIMAL", "NUMERIC"]
                         .iter()
@@ -414,8 +444,25 @@ fn infer(s: &Sig<'_>, a: usize, b: usize, cols: &BTreeMap<String, String>) -> Op
             }
             _ => return None,
         }
+        k += 1;
     }
-    any_col.then(|| if real { "DOUBLE" } else { "BIGINT" }.to_owned())
+    any_col.then(|| {
+        if real {
+            "DOUBLE"
+        } else if unsigned {
+            "BIGINT UNSIGNED"
+        } else {
+            "BIGINT"
+        }
+        .to_owned()
+    })
+}
+
+/// Whether an integer column's type is unsigned.
+fn is_unsigned_type(t: &str) -> bool {
+    t.to_ascii_uppercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|w| w == "UNSIGNED")
 }
 
 /// The length of a string argument `[x, y)`: a literal (with or without
@@ -1182,9 +1229,69 @@ mod tests {
         assert_eq!(
             rw("CREATE TABLE t (a INT, b BIGINT UNSIGNED, KEY ((a + b * 2)))").unwrap(),
             format!(
-                "CREATE TABLE t (a INT, b BIGINT UNSIGNED, KEY (`{c}`), `{c}` BIGINT GENERATED ALWAYS AS (a + b * 2) VIRTUAL INVISIBLE)"
+                "CREATE TABLE t (a INT, b BIGINT UNSIGNED, KEY (`{c}`), `{c}` BIGINT UNSIGNED GENERATED ALWAYS AS (a + b * 2) VIRTUAL INVISIBLE)"
             )
         );
+        // MySQL types integer arithmetic with an unsigned column as
+        // `BIGINT UNSIGNED`: `c0 + 1` of 18446744073709551614 fits (MySQL
+        // 8.4.11 inserts it; a `BIGINT` hidden column answered 1264).
+        let c = fx_column("c0 + 1");
+        assert!(
+            rw("CREATE TABLE a1 (c0 BIGINT UNSIGNED, INDEX i ((c0 + 1)))")
+                .unwrap()
+                .contains(&format!("`{c}` BIGINT UNSIGNED GENERATED")),
+        );
+        assert!(
+            rw("CREATE TABLE a2 (c0 INT UNSIGNED, c1 int(10) unsigned zerofill, INDEX i ((c0 * c1)))")
+                .unwrap()
+                .contains(" BIGINT UNSIGNED GENERATED ALWAYS AS (c0 * c1)"),
+        );
+        assert!(
+            rw("CREATE TABLE b (c0 INT UNSIGNED, INDEX i ((abs(c0))))")
+                .unwrap()
+                .contains(" BIGINT UNSIGNED GENERATED ALWAYS AS (abs(c0))"),
+        );
+        assert!(
+            rw("CREATE TABLE b (c0 INT, INDEX i ((c0 + 1)))")
+                .unwrap()
+                .contains(" BIGINT GENERATED ALWAYS AS (c0 + 1)"),
+        );
+    }
+
+    #[test]
+    fn rand_and_exists_are_typed_so_mariadb_names_them() {
+        // MySQL refuses these with 3758; typed, MariaDB refuses them with
+        // 1901 naming the hidden column, which the gateway maps.
+        let out = rw("CREATE TABLE f1 (c0 INT, INDEX ((c0 + RAND())))").unwrap();
+        assert!(
+            out.contains(" DOUBLE GENERATED ALWAYS AS (c0 + RAND())"),
+            "{out}"
+        );
+        let out = rw("CREATE TABLE f6 (c0 INT, INDEX ((RAND())))").unwrap();
+        assert!(out.contains(" DOUBLE GENERATED ALWAYS AS (RAND())"), "{out}");
+        let out = rw("CREATE TABLE f3 (c0 INT, INDEX k ((EXISTS (SELECT 1))))").unwrap();
+        assert!(
+            out.contains(" BIGINT GENERATED ALWAYS AS (EXISTS (SELECT 1))"),
+            "{out}"
+        );
+        let out = rw("CREATE TABLE f9 (c0 INT, INDEX ((NOT EXISTS (SELECT 1))))").unwrap();
+        assert!(
+            out.contains(" BIGINT GENERATED ALWAYS AS (NOT EXISTS (SELECT 1))"),
+            "{out}"
+        );
+        let known: BTreeMap<String, String> = [("c0".to_owned(), "int".to_owned())]
+            .into_iter()
+            .collect();
+        let out = rewrite_with(
+            b"CREATE INDEX i2 ON t0((c0 + RAND()))",
+            &LexOptions::mysql84(),
+            &known,
+        )
+        .map(|v| String::from_utf8(v).unwrap())
+        .unwrap();
+        assert!(out.contains(" DOUBLE GENERATED ALWAYS AS (c0 + RAND())"), "{out}");
+        // Still untyped: a function the translator doesn't know.
+        assert_eq!(rw("CREATE TABLE f10 (c0 INT, INDEX ((c0 + FOO())))"), None);
     }
 }
 

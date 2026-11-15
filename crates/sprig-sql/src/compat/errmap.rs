@@ -319,6 +319,17 @@ pub fn reworded(e: &WireError) -> Option<WireError> {
 /// multi-table updates.
 #[must_use]
 pub fn dup_key_table(sql: &[u8], opts: &crate::lex::LexOptions) -> Option<String> {
+    dml_target(sql, opts).map(|(_, t)| t)
+}
+
+/// The target of a single-table `INSERT`, `REPLACE`, `UPDATE` or `LOAD
+/// DATA`: its database, when the statement names one, and its name.
+/// `None` for other statements and multi-table updates.
+#[must_use]
+pub fn dml_target(
+    sql: &[u8],
+    opts: &crate::lex::LexOptions,
+) -> Option<(Option<String>, String)> {
     use crate::lex::{self, TokenKind};
     let head = sql.trim_ascii_start();
     let starts = |w: &[u8]| head.len() >= w.len() && head[..w.len()].eq_ignore_ascii_case(w);
@@ -353,10 +364,11 @@ pub fn dup_key_table(sql: &[u8], opts: &crate::lex::LexOptions) -> Option<String
             .then(|| String::from_utf8_lossy(&lex::ident_value(tk.bytes(sql))).into_owned())
     };
     let mut name = name_at(j)?;
+    let mut db = None;
     if t.get(j + 1)
         .is_some_and(|tk| tk.kind == TokenKind::Punct && tk.bytes(sql) == b".")
     {
-        name = name_at(j + 2)?;
+        db = Some(std::mem::replace(&mut name, name_at(j + 2)?));
         j += 2;
     }
     // A single-table UPDATE sets right after its table (or alias).
@@ -369,7 +381,7 @@ pub fn dup_key_table(sql: &[u8], opts: &crate::lex::LexOptions) -> Option<String
             return None;
         }
     }
-    Some(name)
+    Some((db, name))
 }
 
 /// A `1062`'s message with MySQL's `'table.key'` form, given the target
@@ -601,6 +613,14 @@ mod tests {
             Some("t2")
         );
         assert_eq!(t("SELECT 1"), None);
+        assert_eq!(
+            dml_target(b"insert ignore into shop.`Orders` (a) values (1)", &o),
+            Some((Some("shop".to_owned()), "Orders".to_owned()))
+        );
+        assert_eq!(
+            dml_target(b"UPDATE p SET u = 1", &o),
+            Some((None, "p".to_owned()))
+        );
         assert_eq!(
             dup_key_message("Duplicate entry '1' for key 'PRIMARY'", "p").as_deref(),
             Some("Duplicate entry '1' for key 'p.PRIMARY'")

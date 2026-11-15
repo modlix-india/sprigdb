@@ -4,8 +4,8 @@
 //! the advisor's builds) resolve the same keys.
 //!
 //! Scopes follow chapter 19's table: `lookup.lock_wait_seconds` takes every
-//! data scope (its object is the owner table); the job keys take tenant, dc
-//! and global, like `lookup.orphan_scan_hours`.
+//! data scope (its object is the owner table, resolved per claim); the job
+//! keys take tenant, dc and global, as does `lookup.orphan_scan_hours`.
 
 use std::time::Duration;
 
@@ -60,6 +60,14 @@ key! {
     "Wait for every gateway to acknowledge a lookup state change"
 }
 
+key! {
+    /// `lookup.orphan_scan_hours`: hours between orphan scans of each public
+    /// lookup, which the controller's sharding loop schedules; 0 turns the
+    /// scans off.
+    ORPHAN_SCAN_HOURS = "lookup.orphan_scan_hours", TENANT_DC, 24, 0, 8760,
+    "Hours between orphan scans of each lookup (0: off)"
+}
+
 /// The keys for one tenant, resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LookupSettings {
@@ -71,6 +79,8 @@ pub struct LookupSettings {
     pub chunk_rows: usize,
     /// `lookup.publish_timeout_ms`.
     pub publish_timeout: Duration,
+    /// `lookup.orphan_scan_hours`; `None` when 0 (no scans).
+    pub orphan_scan_every: Option<Duration>,
 }
 
 impl Default for LookupSettings {
@@ -80,8 +90,14 @@ impl Default for LookupSettings {
             build_lease: Duration::from_secs(BUILD_LEASE_SECONDS.default),
             chunk_rows: to_usize(BACKFILL_CHUNK_ROWS.default),
             publish_timeout: Duration::from_millis(PUBLISH_TIMEOUT_MS.default),
+            orphan_scan_every: hours(ORPHAN_SCAN_HOURS.default),
         }
     }
+}
+
+/// `n` hours, `None` for 0.
+fn hours(n: u64) -> Option<Duration> {
+    (n > 0).then(|| Duration::from_secs(n.saturating_mul(3600)))
 }
 
 fn to_usize(v: u64) -> usize {
@@ -117,7 +133,20 @@ impl LookupSettings {
             build_lease: Duration::from_secs(get(&BUILD_LEASE_SECONDS, ctx).max(1)),
             chunk_rows: to_usize(get(&BACKFILL_CHUNK_ROWS, ctx)).max(1),
             publish_timeout: Duration::from_millis(get(&PUBLISH_TIMEOUT_MS, ctx).max(1)),
+            orphan_scan_every: hours(get(&ORPHAN_SCAN_HOURS, ctx)),
         }
+    }
+
+    /// `lookup.lock_wait_seconds` alone, over a snapshot of the etcd scopes
+    /// and, when given, the tenant's rows, for `ctx` (an owner table's
+    /// scope): what the controller's orphan scans use.
+    #[must_use]
+    pub fn lock_wait_with(
+        s: &MemSettings<'_>,
+        rows: Option<&TenantSettings>,
+        ctx: &SettingCtx<'_>,
+    ) -> u64 {
+        layered(s, rows, &LOCK_WAIT_SECONDS, ctx).max(1)
     }
 
     /// [`Self::resolve`] over a snapshot of the etcd scopes and, when given,
@@ -148,6 +177,7 @@ mod tests {
             ("lookup.build_lease_seconds", 30),
             ("lookup.backfill_chunk_rows", 1000),
             ("lookup.publish_timeout_ms", 10_000),
+            ("lookup.orphan_scan_hours", 24),
         ] {
             let s = reg.get(k).unwrap_or_else(|| panic!("{k} isn't registered"));
             assert_eq!(s.default_value(), sprig_settings::Value::Int(d), "{k}");
@@ -171,5 +201,9 @@ mod tests {
         assert_eq!(r.chunk_rows, 250);
         assert_eq!(r.lock_wait_seconds, 1);
         assert_eq!(r.build_lease, Duration::from_secs(1));
+        // 0 hours: no orphan scans; the default is a day.
+        assert_eq!(r.orphan_scan_every, None);
+        assert_eq!(d.orphan_scan_every, Some(Duration::from_secs(24 * 3600)));
+        assert_eq!(ORPHAN_SCAN_HOURS.scopes, TENANT_DC);
     }
 }

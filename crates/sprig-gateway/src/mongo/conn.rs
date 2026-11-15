@@ -1,5 +1,6 @@
 //! One MongoDB connection: framing and compression, the handshake as a
-//! `mongos`, SCRAM-SHA-256 and command dispatch.
+//! `mongos`, SCRAM-SHA-256, `MONGODB-OIDC` (chapter 14's external tokens)
+//! and command dispatch.
 
 #![allow(clippy::too_many_lines)]
 
@@ -69,6 +70,17 @@ pub(crate) struct PendingScram {
     finished: Option<Principal>,
 }
 
+/// A connection's `MONGODB-OIDC` state.
+#[derive(Debug, Default)]
+pub(crate) struct OidcState {
+    /// The human flow's first step named this tenant; the token follows
+    /// in `saslContinue`.
+    pending: Option<String>,
+    /// The verified claims of the token the connection logged in with:
+    /// its SQL session's `SPRIG_CLAIM()` values.
+    claims: Option<Arc<serde_json::Value>>,
+}
+
 /// One connection's state.
 pub struct Conn {
     pub(crate) shared: Arc<Shared>,
@@ -79,6 +91,8 @@ pub struct Conn {
     pub(crate) tls: Option<TlsInfo>,
     pub(crate) principal: Option<Principal>,
     pub(crate) scram: Option<PendingScram>,
+    /// `MONGODB-OIDC`: the conversation, then the token's claims.
+    pub(crate) oidc: Option<OidcState>,
     pub(crate) client_meta: Option<Document>,
     pub(crate) compressors: Vec<Compressor>,
     pub(crate) sql: Option<SqlSession>,
@@ -158,6 +172,7 @@ pub async fn serve(shared: Arc<Shared>, mut conn: ClientConn) -> Result<()> {
         tls: conn.tls_info(),
         principal: None,
         scram: None,
+        oidc: None,
         client_meta: None,
         compressors: Vec::new(),
         sql: None,
@@ -466,7 +481,7 @@ impl Conn {
             d.insert("saslSupportedMechs", vec!["SCRAM-SHA-256"]);
         }
         if let Ok(spec) = cmd.get_document("speculativeAuthenticate")
-            && spec.get_str("mechanism") == Ok("SCRAM-SHA-256")
+            && matches!(spec.get_str("mechanism"), Ok("SCRAM-SHA-256" | "MONGODB-OIDC"))
             && let Ok(r) = self.sasl_start(spec).await
         {
             d.insert("speculativeAuthenticate", r);
@@ -511,6 +526,9 @@ impl Conn {
             ));
         }
         let mech = cmd.get_str("mechanism").unwrap_or("");
+        if mech == "MONGODB-OIDC" {
+            return self.oidc_start(cmd).await;
+        }
         if mech != "SCRAM-SHA-256" {
             return Err(MongoError::new(
                 334,
@@ -576,11 +594,105 @@ impl Conn {
         Ok(doc! {"conversationId": 1, "done": false, "payload": Self::bin(first), "ok": 1.0})
     }
 
+    /// `MONGODB-OIDC`'s `saslStart`: a token (`{jwt}`, the one-step
+    /// conversation) logs in at once; otherwise (`{n}` or nothing, the
+    /// human flow's first step) the answer is the tenant's issuer
+    /// (`IdpInfo`: issuer, client id, scopes), and the token follows in
+    /// `saslContinue`. The tenant comes from the TLS server name under
+    /// `listener.tenant_sni_suffixes`, else from `n`'s prefix
+    /// (`acme.alice`).
+    async fn oidc_start(&mut self, cmd: &Document) -> std::result::Result<Document, MongoError> {
+        let raw = Self::payload(cmd)?;
+        let body = Document::from_reader(&mut raw.as_slice()).unwrap_or_default();
+        let n = body.get_str("n").ok();
+        let tenant = self.shared.d.login.tenant_named(n, self.sni());
+        if body.contains_key("jwt") {
+            return self.oidc_token(cmd, tenant).await;
+        }
+        let issuer = match &tenant {
+            Some(t) => self.shared.d.login.mongo_issuer(t).await,
+            None => None,
+        };
+        let (Some(tenant), Some(issuer)) = (tenant, issuer) else {
+            metrics::counter!("sprig_mongo_auth_total", "mechanism" => "MONGODB-OIDC", "result" => "failed").increment(1);
+            return Err(Self::auth_failed());
+        };
+        let mut info = doc! {"issuer": issuer.issuer};
+        if let Some(c) = issuer.client_id {
+            info.insert("clientId", c);
+        }
+        if let Some(sc) = issuer.request_scopes {
+            info.insert("requestScopes", sc);
+        }
+        let mut bytes = Vec::new();
+        info.to_writer(&mut bytes)
+            .map_err(|e| MongoError::new(code::INTERNAL_ERROR, e.to_string()))?;
+        self.oidc = Some(OidcState {
+            pending: Some(tenant),
+            claims: None,
+        });
+        Ok(doc! {"conversationId": 1, "done": false, "payload": Self::bin(bytes), "ok": 1.0})
+    }
+
+    /// The TLS server name, if any.
+    fn sni(&self) -> Option<&str> {
+        self.tls.as_ref().and_then(|t| t.sni.as_deref())
+    }
+
+    /// `MONGODB-OIDC`: the `{jwt}` payload of `cmd` logs in to `tenant`.
+    async fn oidc_token(
+        &mut self,
+        cmd: &Document,
+        tenant: Option<String>,
+    ) -> std::result::Result<Document, MongoError> {
+        let failed = || {
+            metrics::counter!("sprig_mongo_auth_total", "mechanism" => "MONGODB-OIDC", "result" => "failed").increment(1);
+            Self::auth_failed()
+        };
+        let raw = Self::payload(cmd)?;
+        let body = Document::from_reader(&mut raw.as_slice()).map_err(|_| failed())?;
+        let token = body.get_str("jwt").map_err(|_| failed())?;
+        let svc = Arc::clone(&self.shared.d.login);
+        if svc.admit(self.peer.ip()).is_err() {
+            return Err(failed());
+        }
+        let Some(tenant) = tenant else {
+            return Err(failed());
+        };
+        let r = svc
+            .token_login(&sprig_auth::oidc::TokenLogin {
+                protocol: sprig_auth::oidc::TokenProtocol::Mongodb,
+                label: "mongo",
+                tenant: &tenant,
+                token,
+                client_ip: self.peer.ip(),
+                tls: self.tls.is_some(),
+                client_cert: self.tls.as_ref().is_some_and(|t| t.client_cert),
+                client_dn: self.tls.as_ref().and_then(|t| t.client_dn.as_ref()),
+            })
+            .await;
+        let Ok((principal, verified)) = r else {
+            return Err(failed());
+        };
+        metrics::counter!("sprig_mongo_auth_total", "mechanism" => "MONGODB-OIDC", "result" => "ok").increment(1);
+        self.principal = Some(principal);
+        self.oidc = Some(OidcState {
+            pending: None,
+            claims: Some(verified.claims),
+        });
+        Ok(doc! {"conversationId": 1, "done": true, "payload": Self::bin(Vec::new()), "ok": 1.0})
+    }
+
     /// `saslContinue`: steps 5-9.
     pub(crate) async fn sasl_continue(
         &mut self,
         cmd: &Document,
     ) -> std::result::Result<Document, MongoError> {
+        if self.scram.is_none()
+            && let Some(tenant) = self.oidc.as_mut().and_then(|o| o.pending.take())
+        {
+            return self.oidc_token(cmd, Some(tenant)).await;
+        }
         let Some(mut p) = self.scram.take() else {
             return Err(MongoError::new(
                 code::PROTOCOL_ERROR_OR_AUTH,
@@ -643,6 +755,7 @@ impl Conn {
             .map_err(|e| MongoError::new(code::INTERNAL_ERROR, e.message))?;
             let mut s = s;
             s.set_client_dc(self.client_dc.clone());
+            s.set_claims(self.oidc.as_ref().and_then(|o| o.claims.clone()));
             self.sql = Some(s);
         }
         self.sql
@@ -920,6 +1033,7 @@ impl Conn {
             "saslContinue" => Box::pin(self.sasl_continue(&body)).await,
             "logout" => {
                 self.principal = None;
+                self.oidc = None;
                 if let Some(s) = self.sql.take() {
                     s.close().await;
                 }

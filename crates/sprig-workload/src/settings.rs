@@ -1,26 +1,28 @@
 //! The `workload.*` keys, declared next to the code that reads them.
-//! Scopes: **data** keys take
-//! global, tenant, database and object; **tenant** keys global and
-//! tenant; **gw** keys global and dc.
+//! Scopes: **gw** keys take global and dc (the recorder, the flusher and the
+//! rollup resolve them per process); `workload.capture_samples` takes
+//! global, tenant and database.
 //!
 //! How they are read *(choice)*: the gateway builds its
 //! [`RecorderConfig`] from the global and dc values ([`recorder_config`])
 //! when it starts and again whenever a `workload.*` key changes (it
 //! follows the settings and swaps the recorder's configuration), so the
 //! recorder's keys apply live, as declared; the flusher and the rollup
-//! read theirs on every run. Per-object resolution of the data keys (a tenant turning
-//! samples off for one table) waits for the recorder to resolve per
-//! fingerprint; `workload.capture_samples` is the exception: the gateway
-//! resolves it for the tenant before it captures a sample.
+//! read theirs on every run. `workload.capture_samples` is the exception:
+//! the gateway resolves it for the tenant and its current database before
+//! it captures a sample (per-object values wait for the recorder to resolve
+//! per fingerprint, so the key doesn't take object scope).
 
 use sprig_settings::{Apply, HardBounds, Scopes, Setting};
 
 use crate::recorder::RecorderConfig;
 
-/// Global and tenant.
-pub const TENANT: Scopes = Scopes(0b10_0100);
 /// Global and dc: gateway and worker behaviour.
 pub const GW: Scopes = Scopes(0b11_0000);
+/// Global, tenant and database: `workload.capture_samples`, which the
+/// gateway resolves for the session's tenant and current database, never
+/// per object.
+pub const DATABASE: Scopes = Scopes(0b10_0110);
 
 macro_rules! keys {
     ($(
@@ -60,10 +62,10 @@ keys! {
     BUCKET_MINUTES: u32 = "workload.bucket_minutes", 60, GW,
         HardBounds::range(1, 1440), "Statistics bucket size";
     /// `workload.retention_days`.
-    RETENTION_DAYS: u32 = "workload.retention_days", 30, TENANT,
+    RETENTION_DAYS: u32 = "workload.retention_days", 30, GW,
         HardBounds::range(1, 3650), "Stats retention";
     /// `workload.max_fingerprints_per_tenant`.
-    MAX_FINGERPRINTS_PER_TENANT: u32 = "workload.max_fingerprints_per_tenant", 10_000, TENANT,
+    MAX_FINGERPRINTS_PER_TENANT: u32 = "workload.max_fingerprints_per_tenant", 10_000, GW,
         HardBounds::range(10, 10_000_000), "Cap; the rest count as other";
     /// `workload.flush_seconds`.
     FLUSH_SECONDS: u32 = "workload.flush_seconds", 900, GW,
@@ -87,7 +89,7 @@ keys! {
     FULL_PROBE_MS: u32 = "workload.full_probe_ms", 100, GW,
         HardBounds::range(0, 3_600_000), "Mean latency from which every execution is probed";
     /// `workload.capture_samples`.
-    CAPTURE_SAMPLES: bool = "workload.capture_samples", true, Scopes::DATA,
+    CAPTURE_SAMPLES: bool = "workload.capture_samples", true, DATABASE,
         HardBounds::NONE, "Parameter capture switch";
     /// `workload.sample_rate`.
     SAMPLE_RATE: f64 = "workload.sample_rate", 0.01, GW,

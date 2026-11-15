@@ -33,6 +33,12 @@ const O_REFUSAL: &str = include_str!("../../fixtures/openai/refusal.sse");
 const O_MAX: &str = include_str!("../../fixtures/openai/max_tokens.sse");
 const O_OLLAMA: &str = include_str!("../../fixtures/openai/ollama_tools.sse");
 const O_ERROR: &str = include_str!("../../fixtures/openai/error.sse");
+// Streams recorded from the real APIs (November 2026), unedited.
+const A_LIVE_TOOLS: &str = include_str!("../../fixtures/anthropic/live_parallel_tools.sse");
+const A_LIVE_THINKING: &str = include_str!("../../fixtures/anthropic/live_thinking_text_tool.sse");
+const O_LIVE_OPENAI: &str = include_str!("../../fixtures/openai/live_openai_parallel_tools.sse");
+const O_LIVE_DEEPSEEK: &str =
+    include_str!("../../fixtures/openai/live_deepseek_parallel_tools.sse");
 
 fn texts(d: &[Delta]) -> String {
     d.iter()
@@ -297,6 +303,26 @@ fn anthropic_request_shape() {
     assert!(v.get("cache_control").is_none());
     assert!(v["system"][0].get("cache_control").is_none());
     assert!(v.get("thinking").is_none());
+}
+
+#[test]
+fn anthropic_marks_at_most_twenty_tools_strict() {
+    // The API answers 400 "Too many strict tools (21)" past 20, and the
+    // DBA assistant has 21 tools.
+    let mut r = request();
+    let t = r.tools[0].clone();
+    r.tools = (0..25)
+        .map(|i| ToolDef {
+            name: format!("tool_{i}"),
+            ..t.clone()
+        })
+        .collect();
+    let v = anthropic::encode_request(&AnthropicConfig::default(), &r);
+    let tools = v["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 25);
+    let strict = tools.iter().filter(|t| t.get("strict").is_some()).count();
+    assert_eq!(strict, anthropic::MAX_STRICT_TOOLS);
+    assert!(tools[24].get("strict").is_none());
 }
 
 #[test]
@@ -577,4 +603,73 @@ fn the_debug_form_never_shows_a_key() {
     )
     .unwrap();
     assert!(!format!("{p:?}").contains("hidden"));
+}
+
+// ---- streams recorded from the real APIs ----
+
+fn orders_calls(d: &[Delta]) -> Vec<(String, Value)> {
+    calls(d).into_iter().map(|(_, n, i)| (n, i)).collect()
+}
+
+fn describe_and_indexes() -> Vec<(String, Value)> {
+    let input = json!({"db": "shop", "table": "orders"});
+    vec![
+        ("describe".to_owned(), input.clone()),
+        ("indexes".to_owned(), input),
+    ]
+}
+
+#[test]
+fn live_anthropic_parallel_tool_calls() {
+    // Padded `data:` lines, `ping` events, `caller` on tool_use blocks,
+    // and a cache write on the first call.
+    let mut d = Vec::new();
+    let o = anthropic::decode_recorded(A_LIVE_TOOLS, &mut d).unwrap();
+    assert_eq!(o.stop, Stop::ToolUse);
+    assert_eq!(o.model, "claude-opus-5-5");
+    assert_eq!(orders_calls(&d), describe_and_indexes());
+    assert_eq!(o.message.tool_calls().len(), 2);
+    assert_eq!(o.usage.input_tokens, 4);
+    assert_eq!(o.usage.cache_write_tokens, 537);
+    assert_eq!(o.usage.cache_read_tokens, 0);
+    assert_eq!(o.usage.output_tokens, 136);
+}
+
+#[test]
+fn live_anthropic_thinking_text_and_a_tool_call() {
+    let mut d = Vec::new();
+    let o = anthropic::decode_recorded(A_LIVE_THINKING, &mut d).unwrap();
+    assert_eq!(o.stop, Stop::ToolUse);
+    let Some(Block::Thinking { text, signature }) = o.message.content.first() else {
+        panic!("no thinking block first: {:?}", o.message.content);
+    };
+    assert!(!text.is_empty() && !signature.is_empty());
+    assert!(d.iter().any(|x| matches!(x, Delta::Thinking(_))));
+    assert!(!texts(&d).is_empty());
+    assert_eq!(o.message.text(), texts(&d));
+    assert_eq!(
+        calls(&d)
+            .into_iter()
+            .map(|(_, n, i)| (n, i))
+            .collect::<Vec<_>>(),
+        vec![(
+            "describe".to_owned(),
+            json!({"db": "shop", "table": "orders"})
+        )]
+    );
+    assert_eq!(o.usage.output_tokens, 221);
+    assert_eq!(o.usage.cache_write_tokens, 592);
+}
+
+#[test]
+fn live_openai_and_deepseek_parallel_tool_calls() {
+    for (sse, input, output) in [(O_LIVE_OPENAI, 190, 54), (O_LIVE_DEEPSEEK, 407, 104)] {
+        let mut d = Vec::new();
+        let o = openai::decode_recorded(sse, &mut d).unwrap();
+        assert_eq!(o.stop, Stop::ToolUse);
+        assert_eq!(orders_calls(&d), describe_and_indexes());
+        assert_eq!(o.usage.input_tokens, input);
+        assert_eq!(o.usage.output_tokens, output);
+        assert_eq!(o.usage.cache_read_tokens, 0);
+    }
 }

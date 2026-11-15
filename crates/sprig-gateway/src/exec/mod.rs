@@ -1617,10 +1617,24 @@ impl PassSession {
                     .filter(|l| compat_sink::IntMetaSink::wanted(l));
                 match (dup_table.as_deref(), logical) {
                     (Some(table), _) => {
-                        let mut wrapped = compat_sink::DupKeySink { inner: out, table };
-                        self.execute(cx, stmt, &raw, &params, &mut wrapped)
-                            .await
-                            .map_err(|e| compat_sink::map(e, Some(table)))
+                        let mut wrapped = compat_sink::DupKeySink::new(&mut *out, table);
+                        let r = self.execute(cx, stmt, &raw, &params, &mut wrapped).await;
+                        // A value that doesn't fit a functional index:
+                        // MySQL's 3752 or 3751 naming the index.
+                        let r = match (wrapped.take_held(), r) {
+                            (Some(e), Ok(summary)) => {
+                                let sql = self
+                                    .stmts
+                                    .get_mut(stmt)
+                                    .ok()
+                                    .and_then(|s| s.logical.clone())
+                                    .unwrap_or_default();
+                                let e = Box::pin(self.fx_dml_error(cx, &sql, e)).await;
+                                out.error(&e).await.map(|()| summary)
+                            }
+                            (_, r) => r,
+                        };
+                        r.map_err(|e| compat_sink::map(e, Some(table)))
                     }
                     (None, Some(l)) => {
                         let lex = self.lex_opts().0;

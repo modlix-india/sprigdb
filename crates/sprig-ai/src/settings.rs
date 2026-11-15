@@ -17,6 +17,9 @@
 //! | `ai.mcp.enabled` | `false` | tenant, global |
 //! | `ai.mcp.tools` | `read` | tenant, global |
 //! | `ai.mcp.calls_per_minute` | `120` | tenant, global |
+//! | `ai.admin.enabled` | `false` | global |
+//! | `ai.admin.max_advice_hour` | `10` | global |
+//! | `ai.admin.max_triage_hour` | `60` | global |
 //!
 //! Values are read through [`Lookup`], which the gateway implements over a
 //! caller's tenant (and database) context; [`TurnSettings::read`] reads
@@ -158,6 +161,47 @@ key!(
     HardBounds::range(1, 100_000), false,
     "MCP tool calls one user may make per minute; more are refused until the minute is over"
 );
+
+key!(
+    /// `ai.admin.enabled`.
+    ADMIN_ENABLED: bool = "ai.admin.enabled", false, GLOBAL, HardBounds::NONE, true,
+    "Turn on the administration agent: processes report error counts (codes, components, spans; never names or data), and new or rising errors get triage and advice in the approvals inbox. Needs ai.model.admin"
+);
+key!(
+    /// `ai.admin.max_advice_hour`.
+    ADMIN_MAX_ADVICE_HOUR: u64 = "ai.admin.max_advice_hour", 10, GLOBAL,
+    HardBounds::range(0, 1000), true,
+    "Advice items the administration agent may file per hour in each DC; repeats of an incident only update its counts"
+);
+key!(
+    /// `ai.admin.max_triage_hour`.
+    ADMIN_MAX_TRIAGE_HOUR: u64 = "ai.admin.max_triage_hour", 60, GLOBAL,
+    HardBounds::range(0, 10_000), true,
+    "Incidents the administration agent may send to triage per hour in each DC; the rest wait for the next hour"
+);
+
+/// What the administration agent's intake reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminSettings {
+    /// `ai.admin.enabled`.
+    pub enabled: bool,
+    /// `ai.admin.max_advice_hour`.
+    pub max_advice_hour: u64,
+    /// `ai.admin.max_triage_hour`.
+    pub max_triage_hour: u64,
+}
+
+impl AdminSettings {
+    /// Reads them from `l` (the global scope).
+    #[must_use]
+    pub fn read(l: &dyn Lookup) -> Self {
+        Self {
+            enabled: l.flag(&ADMIN_ENABLED),
+            max_advice_hour: l.number(&ADMIN_MAX_ADVICE_HOUR),
+            max_triage_hour: l.number(&ADMIN_MAX_TRIAGE_HOUR),
+        }
+    }
+}
 
 /// What the MCP server reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,6 +386,9 @@ mod tests {
         assert!(!m.enabled && !m.ai_enabled);
         assert_eq!(m.tools, "read");
         assert_eq!(m.check().unwrap_err().protocol().mysql_errno, 39991);
+        let admin = AdminSettings::read(&Defaults);
+        assert!(!admin.enabled, "the administration agent is off by default");
+        assert_eq!((admin.max_advice_hour, admin.max_triage_hour), (10, 60));
         let reg = sprig_settings::Registry::global().unwrap();
         for k in [
             "ai.enabled",
@@ -353,6 +400,9 @@ mod tests {
             "ai.mcp.enabled",
             "ai.mcp.tools",
             "ai.mcp.calls_per_minute",
+            "ai.admin.enabled",
+            "ai.admin.max_advice_hour",
+            "ai.admin.max_triage_hour",
         ] {
             assert!(reg.get(k).is_some(), "{k}");
         }

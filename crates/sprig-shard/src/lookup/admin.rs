@@ -24,6 +24,8 @@
 //!   finished; a lookup whose owner table is gone is dropped
 //! drop_owned(owners), after DROP TABLE or DROP DATABASE: every lookup of
 //!   those tables goes dropping (one publish), its tables and row go, publish
+//! scan_orphans(every), from the controller's sharding loop: public lookups
+//!   not scanned for lookup.orphan_scan_hours lose their orphans
 //! a build that fails on values repeating across shards tells the host
 //!   (LookupHost::duplicates), which raises an approvals item
 //! ```
@@ -195,6 +197,14 @@ pub trait LookupHost: Send + Sync {
     /// log; the default does nothing.
     async fn duplicates(&self, report: &DuplicateReport) {
         let _ = report;
+    }
+
+    /// `lookup.lock_wait_seconds` at owner table `owner`'s scope (in
+    /// database `db`): the lock wait of the orphan scan's locks and owner
+    /// checks. The default is the key's default.
+    fn lock_wait_seconds(&self, db: DbId, owner: ObjectId) -> u64 {
+        let _ = (db, owner);
+        super::settings::LOCK_WAIT_SECONDS.default
     }
 }
 
@@ -743,12 +753,59 @@ impl Admin<'_> {
                 return Err(e);
             }
         };
-        let removed = direct::orphan_scan(&pools, &placement, &l, 5).await?;
+        let wait = self.host.lock_wait_seconds(placement.db, l.owner);
+        let removed = direct::orphan_scan(&pools, &placement, &l, wait).await?;
+        LookupCatalog.scanned(&mut cat, l.id).await?;
         tracing::info!(
             tenant = %self.tenant, lookup = %l.index_name, rows = report.rows,
             repaired = report.repaired, orphans = removed, "lookup index rebuilt"
         );
         Ok(report)
+    }
+
+    /// The scheduled orphan scan: at most `max` public lookups whose last
+    /// scan is older than `every` (`lookup.orphan_scan_hours`; never
+    /// scanned: since their last change), longest waiting first, each taken
+    /// before it runs so two schedulers don't both scan it. Each lookup
+    /// table is read in chunks of 100 rows and every orphan removed under
+    /// its locks ([`direct::orphan_scan`], with the owner table's
+    /// `lookup.lock_wait_seconds`). Returns each scanned lookup's name and
+    /// the orphans removed.
+    ///
+    /// # Errors
+    /// Catalog, etcd and MariaDB errors.
+    pub async fn scan_orphans(&self, every: Duration, max: usize) -> Result<Vec<(String, u64)>> {
+        let mut cat = self.host.catalog().await?;
+        if !has_lookup_table(&mut cat).await? {
+            return Ok(Vec::new());
+        }
+        let secs = every.as_secs();
+        let due = LookupCatalog.scans_due(&mut cat, secs).await?;
+        if due.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = LookupCatalog.rows(&mut cat).await?;
+        let mut done = Vec::new();
+        for id in due {
+            if done.len() >= max {
+                break;
+            }
+            let Some(rec) = rows.iter().find(|r| r.id == id) else {
+                continue;
+            };
+            if !LookupCatalog.claim_scan(&mut cat, id, secs).await? {
+                continue;
+            }
+            let (l, placement, pools) = self.load(&mut cat, rec).await?;
+            let wait = self.host.lock_wait_seconds(placement.db, l.owner);
+            let removed = direct::orphan_scan(&pools, &placement, &l, wait).await?;
+            tracing::info!(
+                tenant = %self.tenant, lookup = %l.index_name, table = %l.owner_table,
+                orphans = removed, "lookup orphan scan"
+            );
+            done.push((l.index_name.clone(), removed));
+        }
+        Ok(done)
     }
 
     /// Drops `owner`'s lookup `name`; `Ok(false)` when it has none.

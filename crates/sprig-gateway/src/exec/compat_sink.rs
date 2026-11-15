@@ -6,7 +6,10 @@
 //! does: [`sprig_sql::compat::errmap::dup_key_table`] reads the target of
 //! a single-table `INSERT`, `REPLACE`, `UPDATE` or `LOAD DATA`, and this
 //! sink adds it to any 1062 the statement's response carries. Everything
-//! else passes through.
+//! else passes through, except an error naming a functional key part's
+//! hidden column (`_sprig_fx_..`, a value that doesn't fit it): the sink
+//! holds it back ([`DupKeySink::take_held`]) for the caller to answer
+//! MySQL's 3752 or 3751 naming the index (`exec::mysql_ddl`).
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -20,6 +23,24 @@ use crate::pipeline::{EndOfRows, ResultSink, RowFormat, RowValues, Wire};
 pub(super) struct DupKeySink<'a> {
     pub(super) inner: &'a mut dyn ResultSink,
     pub(super) table: &'a str,
+    /// An error naming a hidden column, held back (module docs).
+    pub(super) held: Option<SprigError>,
+}
+
+impl<'a> DupKeySink<'a> {
+    /// Over `inner`, for a statement whose target is `table`.
+    pub(super) fn new(inner: &'a mut dyn ResultSink, table: &'a str) -> Self {
+        Self {
+            inner,
+            table,
+            held: None,
+        }
+    }
+
+    /// The error held back, if any; the caller sends it (mapped).
+    pub(super) fn take_held(&mut self) -> Option<SprigError> {
+        self.held.take()
+    }
 }
 
 /// `e` with the table in a 1062's key name, if it is one.
@@ -65,6 +86,18 @@ impl ResultSink for DupKeySink<'_> {
     }
 
     async fn error(&mut self, err: &SprigError) -> Result<()> {
+        if self.held.is_none()
+            && sprig_sql::compat::mysqlddl::fx_value_error(err.protocol().mysql_errno, &err.message)
+                .is_some()
+        {
+            self.held = Some(SprigError {
+                kind: err.kind,
+                message: err.message.clone(),
+                retryable: err.retryable,
+                source: None,
+            });
+            return Ok(());
+        }
         match sprig_sql::compat::errmap::with_dup_key_table(err, self.table) {
             Some(m) => self.inner.error(&m).await,
             None => self.inner.error(err).await,
@@ -88,7 +121,7 @@ impl ResultSink for DupKeySink<'_> {
     }
 
     fn finished(&self) -> bool {
-        self.inner.finished()
+        self.held.is_some() || self.inner.finished()
     }
 }
 

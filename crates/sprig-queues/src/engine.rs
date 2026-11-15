@@ -1018,13 +1018,32 @@ impl VShared {
                 }
                 // The lease holder trims the forward ledger: rows whose
                 // outbox row is gone, older than the longest a forward
-                // that read the row before its delete may still run.
+                // that read the row before its delete may still run; a
+                // change exchange's ids after a day (R9, r9feed5). Up to
+                // `LEDGER_PURGE_ROUNDS` batches a pass, so a busy queue's
+                // ledger doesn't outgrow one batch every 30 s.
                 if release && now >= next_purge {
                     next_purge = now + 30_000;
-                    match s.purge_ledger(now - LEDGER_KEEP_MS).await {
-                        Ok(n) if n > 0 => tracing::debug!(rows = n, "forward ledger trimmed"),
-                        Ok(_) => {}
-                        Err(e) => tracing::debug!(error = %e, "forward ledger trim failed"),
+                    let mut trimmed = 0;
+                    for _ in 0..LEDGER_PURGE_ROUNDS {
+                        match s
+                            .purge_ledger(now - LEDGER_KEEP_MS, now - CHANGE_LEDGER_KEEP_MS)
+                            .await
+                        {
+                            Ok(n) => {
+                                trimmed += n;
+                                if n < crate::store::LEDGER_PURGE_BATCH {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(error = %e, "forward ledger trim failed");
+                                break;
+                            }
+                        }
+                    }
+                    if trimmed > 0 {
+                        tracing::debug!(rows = trimmed, "forward ledger trimmed");
                     }
                 }
                 sleep_ms = if woken || moved > 0 {
@@ -1126,6 +1145,20 @@ pub const FORWARDER_OBJECT: u64 = 1 << 62;
 /// forward that read the row before it was deleted finishes (or times
 /// out, `amqp.publish_timeout_ms` at most 10 minutes) well within it.
 pub const LEDGER_KEEP_MS: i64 = 900_000;
+
+/// How long a forward-ledger row of a change exchange's message id
+/// ([`crate::store::is_change_id`]) stays (R9, r9feed5). Its forwarder
+/// checkpoints at most every second, after what it published, and after a
+/// restart publishes again what came after the checkpoint; the ledger
+/// keeps those publishes no-ops, even when the messages were consumed
+/// meanwhile, as long as the forwarder comes back within this time: a
+/// day covers a worker fleet that is down overnight, not only the
+/// seconds a job's lease takes to move.
+pub const CHANGE_LEDGER_KEEP_MS: i64 = 86_400_000;
+
+/// Purge batches ([`crate::store::LEDGER_PURGE_BATCH`] rows each) one
+/// trim pass runs at most, every 30 s.
+pub const LEDGER_PURGE_ROUNDS: u32 = 20;
 
 /// Delivers to a local connection, counting credit for re-attachment.
 pub(crate) struct LocalSink {

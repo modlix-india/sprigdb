@@ -5,7 +5,9 @@
 //! lookup_tick(tenant), after the groups' ticks:
 //!   1. resume: every lookup job no one touched for lookup.build_lease_seconds
 //!      (its gateway or controller died) is taken over and finished, and
-//!      lookups whose table was dropped are dropped
+//!      lookups whose table was dropped are dropped; then the orphan scan of
+//!      one public lookup not scanned for lookup.orphan_scan_hours (24; 0:
+//!      off), with its owner table's lookup.lock_wait_seconds
 //!   2. at most every advisor.lookup_eval_minutes (5), the advisor:
 //!      fingerprints of the last advisor.lookup_window_minutes (60) that ran
 //!      at least advisor.lookup_min_runs (100) times, at least
@@ -167,6 +169,10 @@ impl LookupHost for CtlHost<'_> {
         Ok(())
     }
 
+    fn lock_wait_seconds(&self, db: DbId, owner: ObjectId) -> u64 {
+        self.l.settings.lookup_lock_wait(self.tenant, db, owner)
+    }
+
     async fn duplicates(&self, r: &DuplicateReport) {
         let Some(a) = self.l.approvals.get() else {
             return;
@@ -266,6 +272,12 @@ impl ShardingLoop {
         };
         for (id, what) in admin.resume().await? {
             tracing::info!(tenant = %tenant, lookup = id.0, outcome = %what, "lookup job resumed");
+        }
+        // The orphan scan, one due lookup a tick.
+        if let Some(every) = ts.lookup.orphan_scan_every
+            && let Err(e) = admin.scan_orphans(every, 1).await
+        {
+            tracing::warn!(tenant = %tenant, error = %e, "lookup orphan scan failed");
         }
         {
             let mut last = lock(&self.lookup_runs);

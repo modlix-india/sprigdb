@@ -30,6 +30,17 @@
 //!   becomes MySQL's 1824 (the referenced table doesn't exist) or 1826 (a
 //!   constraint of that name exists in the database), once the gateway has
 //!   looked the names up.
+//! - **What functional indexes use** ([`renamed_columns`],
+//!   [`generated_dependency_of`], [`fx_drop_all`]): MySQL refuses to rename
+//!   a column a functional index (3837) or a generated column (3108) uses,
+//!   where MariaDB renames it inside the expressions; and refuses to drop
+//!   every visible column of such a table with 3837, where MariaDB says
+//!   1113. The gateway reads the table's generated columns, hidden ones
+//!   included.
+//! - **Values that don't fit a functional index** ([`fx_value_error`],
+//!   [`fx_index_name`], [`functional_index_value`]): MariaDB's 1264, 1265,
+//!   1292, 1366 or 1406 naming a hidden column becomes MySQL's 3752 or 3751
+//!   naming the index.
 
 use std::fmt::Write as _;
 
@@ -883,6 +894,205 @@ pub fn generated_dependency(column: &str, user_column: bool) -> WireError {
             ),
         )
     }
+}
+
+/// The columns an `ALTER TABLE` renames, on 3306: `RENAME COLUMN a TO b`
+/// and `CHANGE [COLUMN] a b ...` with another name (case aside). The table
+/// as written and the old names, in statement order; `None` when it
+/// renames none.
+#[must_use]
+pub fn renamed_columns(sql: &[u8], opts: &LexOptions) -> Option<(String, Vec<String>)> {
+    if opts.persona != Persona::MySql84 || !starts_with_any(sql, &[b"ALTER"]) {
+        return None;
+    }
+    let has = |n: &[u8]| sql.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n));
+    if !has(b"RENAME") && !has(b"CHANGE") {
+        return None;
+    }
+    let s = Toks::new(sql, *opts)?;
+    let j = s.alter_table()?;
+    let (_, after) = s.qualified(j)?;
+    if after <= j {
+        return None;
+    }
+    let mut cols = Vec::new();
+    for (a, b) in s.split(after, s.t.len()) {
+        let (old, new) = if s.word(a, b"RENAME") && s.word(a + 1, b"COLUMN") {
+            if !s.word(a + 3, b"TO") {
+                continue;
+            }
+            (s.ident(a + 2), s.ident(a + 4))
+        } else if s.word(a, b"CHANGE") {
+            let mut k = a + 1;
+            if s.word(k, b"COLUMN") {
+                k += 1;
+            }
+            k = s.skip_if(k);
+            if k + 1 >= b {
+                continue;
+            }
+            (s.ident(k), s.ident(k + 1))
+        } else {
+            continue;
+        };
+        if let (Some(old), Some(new)) = (old, new)
+            && !old.eq_ignore_ascii_case(&new)
+        {
+            cols.push(old);
+        }
+    }
+    if cols.is_empty() {
+        return None;
+    }
+    Some((s.text(j, after), cols))
+}
+
+/// Whether a generated column (by name) is a column of the user's own:
+/// not a functional key part's hidden column, nor another internal one.
+fn user_generated(name: &str) -> bool {
+    !name.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("_sprig"))
+}
+
+/// MySQL's refusal to rename or drop `columns` (statement order) that
+/// something generated uses: for the first such column, 3108 when one of
+/// the table's own generated columns uses it, else 3837 when a functional
+/// key part's hidden column does. `generated` is the table's generated
+/// columns, hidden ones included: name and `GENERATION_EXPRESSION`, as
+/// MariaDB's `information_schema.COLUMNS` gives them. `None` when nothing
+/// uses them. (MariaDB renames the column inside the expressions instead,
+/// and refuses a drop with 1054 or, for every visible column, 1113.)
+#[must_use]
+pub fn generated_dependency_of(
+    columns: &[String],
+    generated: &[(String, String)],
+) -> Option<WireError> {
+    columns.iter().find_map(|c| {
+        let user = generated
+            .iter()
+            .any(|(n, e)| user_generated(n) && expression_uses(e, c));
+        let fx = generated
+            .iter()
+            .any(|(n, e)| super::fxindex::is_fx_column(n) && expression_uses(e, c));
+        (user || fx).then(|| generated_dependency(c, user))
+    })
+}
+
+/// MySQL's 3837 for an `ALTER TABLE` that drops every visible column
+/// (MariaDB's 1113, `A table must have at least 1 column`) when a
+/// functional index uses one of them: the first of `dropped` that a hidden
+/// column of `generated` (as [`generated_dependency_of`]) uses. `None` for
+/// other errors.
+#[must_use]
+pub fn fx_drop_all(
+    code: u16,
+    dropped: &[String],
+    generated: &[(String, String)],
+) -> Option<WireError> {
+    if code != 1113 {
+        return None;
+    }
+    let fx: Vec<(String, String)> = generated
+        .iter()
+        .filter(|(n, _)| super::fxindex::is_fx_column(n))
+        .cloned()
+        .collect();
+    generated_dependency_of(dropped, &fx)
+}
+
+/// A MariaDB error from storing a value in a functional key part's hidden
+/// column (`_sprig_fx_..`), which MySQL reports against the index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FxValueError {
+    /// The hidden column.
+    pub column: String,
+    /// The row, from 1.
+    pub row: u64,
+    /// Out of range (1264), rather than truncated or not convertible.
+    pub out_of_range: bool,
+}
+
+/// The [`FxValueError`] in MariaDB's 1264, 1265, 1292, 1366 or 1406 when
+/// the column it names is a hidden column (`'_sprig_fx_..'` or
+/// `` `db`.`t`.`_sprig_fx_..` ``). `None` for other errors.
+#[must_use]
+pub fn fx_value_error(code: u16, message: &str) -> Option<FxValueError> {
+    let out_of_range = match code {
+        1264 => true,
+        1265 | 1292 | 1366 | 1406 => false,
+        _ => return None,
+    };
+    let prefix = super::fxindex::FX_PREFIX;
+    let at = message.find(" column ")?;
+    let rest = &message[at..];
+    let start = rest.find(prefix)?;
+    let column = rest.get(start..start + prefix.len() + 8)?;
+    if !super::fxindex::is_fx_column(column) {
+        return None;
+    }
+    let row = message
+        .rsplit_once(" at row ")
+        .and_then(|(_, r)| r.trim().parse::<u64>().ok())
+        .unwrap_or(1)
+        .max(1);
+    Some(FxValueError {
+        column: column.to_owned(),
+        row,
+        out_of_range,
+    })
+}
+
+/// MySQL 8.4's error for a value that doesn't fit functional index
+/// `index`: 3752 (`22003`) out of range, else 3751 (`01000`) truncated.
+#[must_use]
+pub fn functional_index_value(index: &str, e: &FxValueError) -> WireError {
+    if e.out_of_range {
+        WireError::new(
+            3752,
+            *b"22003",
+            format!(
+                "Value is out of range for functional index '{index}' at row {}",
+                e.row
+            ),
+        )
+    } else {
+        WireError::new(
+            3751,
+            *b"01000",
+            format!(
+                "Data truncated for functional index '{index}' at row {}",
+                e.row
+            ),
+        )
+    }
+}
+
+/// The name MySQL gives the index whose key part is hidden column
+/// `column`, from the table's key parts on hidden columns (`INDEX_NAME`,
+/// `COLUMN_NAME`, in MariaDB's `STATISTICS` order): its own name, or, for
+/// an index the client didn't name (MariaDB named it after the column),
+/// `functional_index`, then `functional_index_2`, ... in that order.
+#[must_use]
+pub fn fx_index_name(parts: &[(String, String)], column: &str) -> Option<String> {
+    let unnamed = |n: &str| {
+        n.get(..super::fxindex::FX_PREFIX.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(super::fxindex::FX_PREFIX))
+    };
+    let (index, _) = parts.iter().find(|(_, c)| c.eq_ignore_ascii_case(column))?;
+    if !unnamed(index) {
+        return Some(index.clone());
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    for (i, _) in parts {
+        if unnamed(i) && !seen.iter().any(|s| s.eq_ignore_ascii_case(i)) {
+            seen.push(i);
+        }
+    }
+    let n = seen.iter().position(|s| s.eq_ignore_ascii_case(index))? + 1;
+    Some(if n == 1 {
+        "functional_index".to_owned()
+    } else {
+        format!("functional_index_{n}")
+    })
 }
 
 /// MySQL's (and MariaDB's) 1317 for `KILL QUERY` of the session's own

@@ -100,6 +100,25 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
     else {
         return Ok(());
     };
+    // The administration agent: this worker's error counts, written to
+    // the DC tier while `ai.admin.enabled` is on.
+    let _intake = {
+        let (l, node_dc) = (live.live().cloned(), cfg.node.dc.clone());
+        sprig_ai::incidents::intake::spawn(
+            dc.clone(),
+            "worker",
+            &cfg.node.id(),
+            Arc::new(move || {
+                l.as_ref().is_some_and(|l| {
+                    l.get(
+                        &sprig_ai::settings::ADMIN_ENABLED,
+                        &sprig_settings::SettingCtx::process(&node_dc),
+                    )
+                })
+            }),
+            ctx.shutdown.clone(),
+        )
+    };
     let settings = live.live().map_or_else(MoverSettings::default, |l| {
         MoverSettings::resolve(
             &l.snapshot(),
@@ -204,7 +223,11 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
             sprig_controller::catalogs::default_naming(),
         )),
         clusters: registry_clusters,
-        feed: shared_feed.view(sprig_feed::shared::Kept::All),
+        // Each consumer reads through a view named for it: the reader's
+        // detach and catch-up logs and metrics say whose (R9, r9feed5).
+        feed: shared_feed
+            .view(sprig_feed::shared::Kept::All)
+            .named("trigger"),
         opts: live.run_opts(),
         settings: live.clone(),
         // Set below, once the gateways are known.
@@ -220,7 +243,11 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
             Arc::clone(&env.pools),
             Arc::clone(&env.clusters),
         )?
-        .with_feed(Arc::clone(&env.feed)),
+        .with_feed(
+            shared_feed
+                .view(sprig_feed::shared::Kept::All)
+                .named("copy_worker"),
+        ),
     );
     // The graph mirror applier: one job per tenant, through the shared
     // reader's view of the edge tables (R9, r9feed3).
@@ -279,7 +306,9 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
             dc: dc_logic.clone(),
             registry: registry_search,
             // Search copies read through the shared reader.
-            clusters: Arc::clone(&env.feed),
+            clusters: shared_feed
+                .view(sprig_feed::shared::Kept::All)
+                .named("search"),
             locator: Arc::clone(&env.locator),
             gateways: Arc::clone(&msg_env.gateways),
             tls: cfg
@@ -315,6 +344,9 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
                 Arc::clone(&msg_env.gateways) as Arc<dyn sprig_sinks::peer::SinkPeer>,
                 Arc::clone(&global),
             )),
+            feed: shared_feed
+                .view(sprig_feed::shared::Kept::All)
+                .named("change_exchange"),
             ..env.clone()
         })))
         .with_handler(Arc::new(logic::LogicSchedule(env)))

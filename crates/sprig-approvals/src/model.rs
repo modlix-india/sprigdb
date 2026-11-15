@@ -162,7 +162,9 @@ pub enum Home {
 }
 
 text_enum! {
-    /// What kind of decision is held. `<family>.<action>`.
+    /// What kind of decision is held: `<family>.<action>`, and the
+    /// administration agent's advisory kinds `ai_incident_advice` and
+    /// `ai_health_warning`.
     Kind {
         /// Create an index (any model: B-tree, vector, spatial, field column).
         IndexCreate = "index.create",
@@ -198,14 +200,22 @@ text_enum! {
         FailoverDc = "failover.dc",
         /// Partition a graph.
         GraphPartition = "graph.partition",
+        /// The administration agent's advice on an incident from the error
+        /// intake. Advisory only: nothing is applied.
+        AiIncidentAdvice = "ai_incident_advice",
+        /// The administration agent's health warning. Advisory only.
+        AiHealthWarning = "ai_health_warning",
     }
 }
 
 impl Kind {
-    /// The family: the part before the dot.
+    /// The family: the part before the dot; `ai` for the `ai_` kinds.
     #[must_use]
     pub fn family(self) -> &'static str {
         let s = self.as_str();
+        if s.starts_with("ai_") {
+            return "ai";
+        }
         s.split_once('.').map_or(s, |(f, _)| f)
     }
 
@@ -225,6 +235,7 @@ impl Kind {
             Kind::StandbyCreate | Kind::StandbyDrop => "failover.standby_mode",
             Kind::FailoverCluster | Kind::FailoverDc => "failover.mode",
             Kind::GraphPartition => "graph.auto_partition",
+            Kind::AiIncidentAdvice | Kind::AiHealthWarning => "ai.admin.enabled",
         }
     }
 
@@ -245,7 +256,10 @@ impl Kind {
             Kind::BalancerMove | Kind::DcMove | Kind::StandbyCreate | Kind::StandbyDrop => {
                 Level::Tenant
             }
-            Kind::FailoverCluster | Kind::FailoverDc => Level::Dc,
+            Kind::FailoverCluster
+            | Kind::FailoverDc
+            | Kind::AiIncidentAdvice
+            | Kind::AiHealthWarning => Level::Dc,
         }
     }
 
@@ -253,7 +267,7 @@ impl Kind {
     #[must_use]
     pub const fn home(self) -> Home {
         match self {
-            Kind::FailoverCluster => Home::Dc,
+            Kind::FailoverCluster | Kind::AiIncidentAdvice | Kind::AiHealthWarning => Home::Dc,
             Kind::FailoverDc => Home::Global,
             _ => Home::Tenant,
         }
@@ -270,7 +284,8 @@ impl Kind {
             | Kind::AdvisorRekey
             | Kind::AdvisorReference
             | Kind::AdvisorLookup
-            | Kind::GraphPartition => 24 * H,
+            | Kind::GraphPartition
+            | Kind::AiHealthWarning => 24 * H,
             Kind::ShardSplit
             | Kind::ShardMerge
             | Kind::ShardMove
@@ -279,6 +294,8 @@ impl Kind {
             | Kind::StandbyCreate
             | Kind::StandbyDrop => 3 * H,
             Kind::FailoverCluster | Kind::FailoverDc => H,
+            // Refreshed while the errors go on; a week without any closes it.
+            Kind::AiIncidentAdvice => 7 * 24 * H,
         })
     }
 

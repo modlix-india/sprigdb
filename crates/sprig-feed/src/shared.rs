@@ -33,7 +33,10 @@
 //!
 //! subscribe(tenant, from), and a detached subscription's return:
 //!   from at or after the hub's position → listen
-//!   from inside the ring → the ring's groups after from, then listen
+//!   from inside the ring → the ring's groups after from, then listen;
+//!     more than max_backlog of them → max_backlog now, attach again after
+//!     them (r9feed5: a consumer that fell behind after a restart catches
+//!     up from the ring, not a catch-up dump)
 //!   the hub started under `gather` ago and delivered nothing → it moves
 //!     its start back to from (a worker's restart: every sequencer comes
 //!     back at once, each from its own checkpoint)
@@ -99,8 +102,10 @@ pub struct SharedOpts {
     /// For this long after it starts, while it has delivered no group, a
     /// hub moves its start back for a subscription behind it.
     pub gather: Duration,
-    /// A return through the ring with more groups than this takes a
-    /// catch-up dump instead.
+    /// A return through the ring hands over at most this many groups at a
+    /// time; with more, the subscription reads them in parts of this size
+    /// from the ring and listens only once it is this close (R9, r9feed5:
+    /// before, it took a catch-up dump).
     pub max_backlog: usize,
 }
 
@@ -303,6 +308,8 @@ struct Sub {
     /// (`None`: never, so one is due).
     idle_every: Duration,
     idle_at: Option<Instant>,
+    /// Its view's consumer, for logs and metrics.
+    consumer: &'static str,
 }
 
 /// One group of the ring.
@@ -377,13 +384,13 @@ impl HubState {
     }
 
     /// The ring's groups after `from` up to `upto` for `tenant`, as `kept`
-    /// sees them.
+    /// sees them, the first `limit` of them.
     fn backlog(
         &self,
         tenant: TenantId,
         kept: &Kept,
-        from: &GtidPos,
-        upto: &GtidPos,
+        (from, upto): (&GtidPos, &GtidPos),
+        limit: usize,
     ) -> VecDeque<SourceItem> {
         self.ring
             .iter()
@@ -392,6 +399,7 @@ impl HubState {
                 let (_, part) = e.parts.iter().find(|(t, _)| *t == tenant)?;
                 view(part, kept).map(SourceItem::Txn)
             })
+            .take(limit)
             .collect()
     }
 
@@ -475,7 +483,7 @@ impl HubState {
     fn register(
         &mut self,
         tenant: TenantId,
-        (kept, idle_every): (Kept, Duration),
+        who: &Who,
         from: GtidPos,
         tx: mpsc::Sender<Item>,
         detached: Arc<AtomicBool>,
@@ -486,12 +494,13 @@ impl HubState {
             id,
             Sub {
                 tenant,
-                kept,
+                kept: who.kept.clone(),
                 from,
                 tx,
                 detached,
-                idle_every,
+                idle_every: who.idle_every,
                 idle_at: None,
+                consumer: who.consumer,
             },
         );
         self.by_tenant.entry(tenant).or_default().push(id);
@@ -536,8 +545,38 @@ enum Attach {
         backlog: VecDeque<SourceItem>,
         detached: Arc<AtomicBool>,
     },
-    /// Its own dump until the ring covers it.
-    CatchUp,
+    /// The next `max_backlog` of its groups from the ring, not listening
+    /// yet: it attaches again after them (r9feed5).
+    Ring(VecDeque<SourceItem>),
+    /// Its own dump until the ring covers it, and why.
+    CatchUp(Why),
+}
+
+/// Why a subscription takes a catch-up dump (logs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Why {
+    /// Its position is before the ring's start.
+    BeforeRing,
+    /// The hub doesn't keep its tenant whole since its position.
+    NotWhole,
+}
+
+impl std::fmt::Display for Why {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforeRing => f.write_str("behind the ring"),
+            Self::NotWhole => f.write_str("its tenant not kept whole that far back"),
+        }
+    }
+}
+
+/// A view's kept tables, idle cadence and consumer, as a subscription
+/// carries them.
+#[derive(Debug, Clone)]
+struct Who {
+    kept: Kept,
+    idle_every: Duration,
+    consumer: &'static str,
 }
 
 impl Hub {
@@ -556,11 +595,12 @@ impl Hub {
     fn attach(
         self: &Arc<Self>,
         tenant: TenantId,
-        (kept, idle_every): (&Kept, Duration),
+        who: &Who,
         from: &GtidPos,
         first: bool,
     ) -> Attach {
         let opts = &self.feed.opts;
+        let kept = &who.kept;
         let (tx, rx) = mpsc::channel(opts.sub_channel);
         let detached = Arc::new(AtomicBool::new(false));
         let whole = matches!(kept, Kept::All);
@@ -576,13 +616,7 @@ impl Hub {
             st.replay_until = None;
             st.reopen = Reopen::No;
             st.scope_whole.clear();
-            st.register(
-                tenant,
-                (kept.clone(), idle_every),
-                from.clone(),
-                tx,
-                Arc::clone(&detached),
-            );
+            st.register(tenant, who, from.clone(), tx, Arc::clone(&detached));
             drop(st);
             let hub = Arc::clone(self);
             let start = from.clone();
@@ -601,13 +635,7 @@ impl Hub {
             self.wake.notify_one();
         }
         if from.reached(&pos) {
-            st.register(
-                tenant,
-                (kept.clone(), idle_every),
-                from.clone(),
-                tx,
-                Arc::clone(&detached),
-            );
+            st.register(tenant, who, from.clone(), tx, Arc::clone(&detached));
             return Attach::Live {
                 rx,
                 backlog: VecDeque::new(),
@@ -619,25 +647,30 @@ impl Hub {
         } else {
             Some(st.ring_start.clone())
         };
-        let covered =
-            from.reached(&st.ring_start) && since.as_ref().is_some_and(|s| from.reached(s));
+        let in_ring = from.reached(&st.ring_start);
+        let covered = in_ring && since.as_ref().is_some_and(|s| from.reached(s));
+        let why = if in_ring {
+            Why::NotWhole
+        } else {
+            Why::BeforeRing
+        };
         if covered {
-            let backlog = st.backlog(tenant, kept, from, &pos);
-            if backlog.len() <= opts.max_backlog {
-                metrics::counter!("sprig_feed_resumes_total", "tier" => "ring").increment(1);
-                st.register(
-                    tenant,
-                    (kept.clone(), idle_every),
-                    pos,
-                    tx,
-                    Arc::clone(&detached),
-                );
-                return Attach::Live {
-                    rx,
-                    backlog,
-                    detached,
-                };
+            let mut backlog = st.backlog(tenant, kept, (from, &pos), opts.max_backlog + 1);
+            if backlog.len() > opts.max_backlog {
+                // Further behind than one hand-over: a part from the ring
+                // now, the rest on its next attach, while the ring still
+                // covers it (r9feed5; before, a catch-up dump).
+                backlog.truncate(opts.max_backlog.max(1));
+                tracing::debug!(cluster = %self.cluster, %tenant, consumer = who.consumer, "shared feed reader: a return through the ring, in parts");
+                return Attach::Ring(backlog);
             }
+            metrics::counter!("sprig_feed_resumes_total", "tier" => "ring", "consumer" => who.consumer).increment(1);
+            st.register(tenant, who, pos, tx, Arc::clone(&detached));
+            return Attach::Live {
+                rx,
+                backlog,
+                detached,
+            };
         }
         let gathering = !st.delivered
             && st
@@ -650,13 +683,7 @@ impl Hub {
             };
             st.rewind = Some(r);
             self.wake.notify_one();
-            st.register(
-                tenant,
-                (kept.clone(), idle_every),
-                from.clone(),
-                tx,
-                Arc::clone(&detached),
-            );
+            st.register(tenant, who, from.clone(), tx, Arc::clone(&detached));
             return Attach::Live {
                 rx,
                 backlog: VecDeque::new(),
@@ -679,21 +706,15 @@ impl Hub {
             st.replay = Some(r);
             st.want(Reopen::Scope);
             self.wake.notify_one();
-            st.register(
-                tenant,
-                (kept.clone(), idle_every),
-                from.clone(),
-                tx,
-                Arc::clone(&detached),
-            );
-            metrics::counter!("sprig_feed_resumes_total", "tier" => "replay").increment(1);
+            st.register(tenant, who, from.clone(), tx, Arc::clone(&detached));
+            metrics::counter!("sprig_feed_resumes_total", "tier" => "replay", "consumer" => who.consumer).increment(1);
             return Attach::Live {
                 rx,
                 backlog: VecDeque::new(),
                 detached,
             };
         }
-        Attach::CatchUp
+        Attach::CatchUp(why)
     }
 
     fn hold_whole(&self, tenant: TenantId) {
@@ -944,10 +965,10 @@ impl Hub {
                     for id in detach {
                         if let Some(s) = st.subs.get(&id) {
                             s.detached.store(true, Ordering::Release);
-                            tracing::debug!(cluster = %self.cluster, tenant = %s.tenant, "shared feed reader: a slow subscription is detached");
+                            tracing::debug!(cluster = %self.cluster, tenant = %s.tenant, consumer = s.consumer, "shared feed reader: a slow subscription is detached");
+                            metrics::counter!("sprig_feed_shared_detached_total", "cluster" => label.clone(), "consumer" => s.consumer).increment(1);
                         }
                         st.remove(id);
-                        metrics::counter!("sprig_feed_shared_detached_total", "cluster" => label.clone()).increment(1);
                     }
                     for id in gone {
                         st.remove(id);
@@ -1089,6 +1110,9 @@ enum Mode {
         detached: Arc<AtomicBool>,
     },
     CatchUp(CatchUp),
+    /// A part of a long return through the ring (r9feed5): attach again
+    /// after it.
+    Ring(VecDeque<SourceItem>),
     /// Detached, or not served yet: attach again.
     Out,
 }
@@ -1098,9 +1122,8 @@ enum Mode {
 struct SubSource {
     hub: Arc<Hub>,
     tenant: TenantId,
-    kept: Kept,
-    /// Its view's idle cadence.
-    idle_every: Duration,
+    /// Its view's kept tables, idle cadence and consumer.
+    who: Who,
     /// The position after the last item returned.
     pos: GtidPos,
     mode: Mode,
@@ -1108,7 +1131,7 @@ struct SubSource {
 
 impl Drop for SubSource {
     fn drop(&mut self) {
-        if matches!(self.kept, Kept::All) {
+        if matches!(self.who.kept, Kept::All) {
             self.hub.release_whole(self.tenant);
         }
     }
@@ -1123,7 +1146,7 @@ impl SubSource {
     }
 
     fn scope(&self) -> DumpScope {
-        match &self.kept {
+        match &self.who.kept {
             Kept::All => DumpScope {
                 tables: Vec::new(),
                 tenants: [self.tenant].into_iter().collect(),
@@ -1151,7 +1174,11 @@ impl SubSource {
                 };
                 true
             }
-            Attach::CatchUp => false,
+            Attach::Ring(part) => {
+                self.mode = Mode::Ring(part);
+                true
+            }
+            Attach::CatchUp(_) => false,
         }
     }
 
@@ -1162,12 +1189,14 @@ impl SubSource {
             .await
             .map_err(|_| SprigError::internal("the shared reader's catch-up slots are gone"))?;
         // Another catch-up may have moved the ring meanwhile.
-        let a = self
-            .hub
-            .attach(self.tenant, (&self.kept, self.idle_every), &self.pos, false);
-        if self.live(a) {
-            return Ok(());
-        }
+        let a = self.hub.attach(self.tenant, &self.who, &self.pos, false);
+        let why = match a {
+            Attach::CatchUp(why) => why,
+            a => {
+                self.live(a);
+                return Ok(());
+            }
+        };
         let src = self
             .hub
             .feed
@@ -1176,8 +1205,8 @@ impl SubSource {
             .await?;
         let cluster = self.hub.label();
         metrics::gauge!("sprig_feed_catchup_readers", "cluster" => cluster.clone()).increment(1.0);
-        metrics::counter!("sprig_feed_resumes_total", "tier" => "binlog").increment(1);
-        tracing::debug!(cluster = %self.hub.cluster, tenant = %self.tenant, pos = %self.pos, "shared feed reader: catch-up dump");
+        metrics::counter!("sprig_feed_resumes_total", "tier" => "binlog", "consumer" => self.who.consumer).increment(1);
+        tracing::info!(cluster = %self.hub.cluster, tenant = %self.tenant, consumer = self.who.consumer, pos = %self.pos, why = %why, "shared feed reader: catch-up dump");
         self.mode = Mode::CatchUp(CatchUp {
             src: Reader::start(src),
             _permit: permit,
@@ -1220,13 +1249,15 @@ impl TxnSource for SubSource {
                         }
                     }
                 }
+                Mode::Ring(part) => {
+                    if let Some(i) = part.pop_front() {
+                        self.advance(&i);
+                        return Ok(i);
+                    }
+                    self.mode = Mode::Out;
+                }
                 Mode::Out => {
-                    let a = self.hub.attach(
-                        self.tenant,
-                        (&self.kept, self.idle_every),
-                        &self.pos,
-                        false,
-                    );
+                    let a = self.hub.attach(self.tenant, &self.who, &self.pos, false);
                     if !self.live(a) {
                         self.catch_up().await?;
                     }
@@ -1240,7 +1271,7 @@ impl TxnSource for SubSource {
                     let out = match item {
                         SourceItem::Txn(t) => {
                             // The dump holds this tenant's rows only.
-                            let v = view(&t, &self.kept);
+                            let v = view(&t, &self.who.kept);
                             self.pos = newer(&self.pos, &t.after());
                             v.map(SourceItem::Txn)
                         }
@@ -1251,14 +1282,9 @@ impl TxnSource for SubSource {
                         }
                     };
                     if rejoin {
-                        let a = self.hub.attach(
-                            self.tenant,
-                            (&self.kept, self.idle_every),
-                            &self.pos,
-                            false,
-                        );
+                        let a = self.hub.attach(self.tenant, &self.who, &self.pos, false);
                         if self.live(a) {
-                            tracing::debug!(cluster = %self.hub.cluster, tenant = %self.tenant, pos = %self.pos, "shared feed reader: caught up");
+                            tracing::info!(cluster = %self.hub.cluster, tenant = %self.tenant, consumer = self.who.consumer, pos = %self.pos, "shared feed reader: caught up");
                         }
                     }
                     if let Some(o) = out {
@@ -1343,6 +1369,7 @@ impl SharedFeed {
             feed: Arc::clone(self),
             kept,
             idle_every: idle_every.max(IDLE_TICK),
+            consumer: UNNAMED,
         })
     }
 
@@ -1374,12 +1401,19 @@ pub struct SharedClusters {
     kept: Kept,
     /// Idle positions to each subscription at most this often.
     idle_every: Duration,
+    /// The consumer reading through it: the `consumer` label of the
+    /// reader's detach and catch-up logs and metrics (R9, r9feed5).
+    consumer: &'static str,
 }
+
+/// The consumer label of a view nobody named.
+pub const UNNAMED: &str = "unnamed";
 
 impl std::fmt::Debug for SharedClusters {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedClusters")
             .field("kept", &self.kept)
+            .field("consumer", &self.consumer)
             .finish_non_exhaustive()
     }
 }
@@ -1397,7 +1431,26 @@ impl SharedClusters {
             feed,
             kept: v.kept.clone(),
             idle_every: IDLE_FANOUT,
+            consumer: UNNAMED,
         }
+    }
+
+    /// The same view for `consumer`, the `consumer` label of the reader's
+    /// detach and catch-up logs and metrics (`trigger`, `search`, ...).
+    #[must_use]
+    pub fn named(&self, consumer: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            feed: Arc::clone(&self.feed),
+            kept: self.kept.clone(),
+            idle_every: self.idle_every,
+            consumer,
+        })
+    }
+
+    /// The consumer this view is named for.
+    #[must_use]
+    pub fn consumer(&self) -> &'static str {
+        self.consumer
     }
 
     /// The reader this view shares.
@@ -1428,12 +1481,15 @@ impl Clusters for SharedClusters {
         let mut s = SubSource {
             hub: Arc::clone(&hub),
             tenant,
-            kept: self.kept.clone(),
-            idle_every: self.idle_every,
+            who: Who {
+                kept: self.kept.clone(),
+                idle_every: self.idle_every,
+                consumer: self.consumer,
+            },
             pos: from.clone(),
             mode: Mode::Out,
         };
-        let a = hub.attach(tenant, (&self.kept, self.idle_every), from, true);
+        let a = hub.attach(tenant, &s.who, from, true);
         s.live(a);
         Ok(Box::new(s))
     }

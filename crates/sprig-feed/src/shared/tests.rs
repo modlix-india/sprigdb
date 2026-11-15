@@ -304,6 +304,47 @@ async fn a_slow_subscription_is_detached_and_comes_back_without_stalling_the_oth
     assert_eq!(fake.catchup_opens(), 0, "the ring served the slow one");
 }
 
+/// R9 r9feed5: a subscription that comes back further behind than
+/// `max_backlog` but inside the ring reads its groups from the ring in
+/// parts, while the hub reads on, and listens once it is close: no
+/// catch-up dump, every group once and in order.
+#[tokio::test]
+async fn a_long_return_inside_the_ring_comes_in_parts_without_a_catch_up_dump() {
+    let fake = Fake::with(vec![txn(1, &["t1_d1_g1_s1"])]);
+    let opts = SharedOpts {
+        sub_channel: 4,
+        max_backlog: 10,
+        ..SharedOpts::default()
+    };
+    let feed = SharedFeed::new(Arc::new(fake.clone()), opts);
+    let shared = feed.view(Kept::Tables(vec!["__sprig_qo".to_owned()].into()));
+    let c = cluster();
+    let mut fast = shared.open(&c, TenantId(1), &at(0)).await.unwrap();
+    let mut slow = shared.open(&c, TenantId(2), &at(0)).await.unwrap();
+    assert_eq!(take(&mut fast, 1).await, vec![(1, 1)]);
+    for seq in 2..102 {
+        fake.push(txn(seq, &["t1_d1_g1_s1", "t2_d1_g1_s1"]));
+    }
+    assert_eq!(take(&mut fast, 100).await.len(), 100);
+    // The slow one is detached, 96 groups behind (10 at a time); more
+    // groups arrive while it reads.
+    let mut seqs: Vec<u64> = take(&mut slow, 30).await.iter().map(|x| x.0).collect();
+    for seq in 102..152 {
+        fake.push(txn(seq, &["t1_d1_g1_s1", "t2_d1_g1_s1"]));
+    }
+    seqs.extend(take(&mut slow, 120).await.iter().map(|x| x.0));
+    assert_eq!(seqs, (2..152).collect::<Vec<_>>());
+    assert!(quiet(&mut slow, 300).await);
+    assert_eq!(take(&mut fast, 50).await.len(), 50);
+    assert_eq!(fake.shared_opens(), 1);
+    assert_eq!(fake.catchup_opens(), 0, "the ring served it in parts");
+    assert_eq!(
+        feed.stats(&c).unwrap().subscriptions,
+        2,
+        "both listen again"
+    );
+}
+
 #[tokio::test]
 async fn behind_the_ring_a_catch_up_dump_reads_then_hands_over() {
     let fake = Fake::with((1..=50).map(|s| txn(s, &["t1_d1_g1_s1"])).collect());
@@ -429,7 +470,11 @@ fn no_idle_position_while_a_move_back_is_pending() {
     let (tx_b, mut rx_b) = mpsc::channel(4);
     st.register(
         TenantId(1),
-        (Kept::All, IDLE_FANOUT),
+        &Who {
+            kept: Kept::All,
+            idle_every: IDLE_FANOUT,
+            consumer: UNNAMED,
+        },
         at(5),
         tx_a,
         Arc::default(),
@@ -437,7 +482,11 @@ fn no_idle_position_while_a_move_back_is_pending() {
     // B started at 0 behind the hub at 5: registered at 0, move back asked.
     st.register(
         TenantId(2),
-        (Kept::All, IDLE_FANOUT),
+        &Who {
+            kept: Kept::All,
+            idle_every: IDLE_FANOUT,
+            consumer: UNNAMED,
+        },
         at(0),
         tx_b,
         Arc::default(),

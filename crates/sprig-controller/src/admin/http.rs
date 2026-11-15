@@ -100,6 +100,14 @@ fn routes(app: Arc<App>) -> Router {
         .route("/admin/v1/tenants/{name}/settings", get(tenant_settings))
         .route("/admin/v1/tenants/{name}/users", post(create_user))
         .route(
+            "/admin/v1/tenants/{name}/users:setTokenLogin",
+            post(set_token_login),
+        )
+        .route(
+            "/admin/v1/tenants/{name}/issuers",
+            get(list_issuers).post(put_issuer),
+        )
+        .route(
             "/admin/v1/tenants/{name}/accounts",
             get(export_accounts).post(import_accounts),
         )
@@ -807,6 +815,44 @@ async fn create_user(
     let r = async {
         authorize(&app, &headers)?;
         app.svc.create_user(&name, parse_required(&body)?).await
+    };
+    respond(r.await)
+}
+
+async fn list_issuers(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    UrlPath(name): UrlPath<String>,
+) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        app.svc.list_issuers(&name).await
+    };
+    respond(r.await)
+}
+
+async fn put_issuer(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    UrlPath(name): UrlPath<String>,
+    body: Bytes,
+) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        app.svc.put_issuer(&name, parse_required(&body)?).await
+    };
+    respond(r.await)
+}
+
+async fn set_token_login(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    UrlPath(name): UrlPath<String>,
+    body: Bytes,
+) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        app.svc.set_token_login(&name, parse_required(&body)?).await
     };
     respond(r.await)
 }

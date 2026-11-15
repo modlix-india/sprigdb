@@ -227,6 +227,40 @@ async fn a_judge_grades_through_the_provider_trait() {
     assert!(parse_grade("no grade").is_none());
 }
 
+#[tokio::test]
+async fn a_judge_that_answers_in_prose_is_asked_once_more() {
+    let case = data_case();
+    let p = Arc::new(ScriptedProvider::new(
+        vec![
+            Reply::Text("The answer meets the rubric on most points.".into()),
+            Reply::Text("{\"score\": 0.8, \"reason\": \"mostly\"}".into()),
+        ],
+        run::STUB_USAGE,
+    ));
+    let judge = Judge {
+        provider: Arc::clone(&p) as Arc<dyn Provider>,
+        model: "judge".into(),
+    };
+    let g = judge
+        .grade(Role::Data, &case, &[], "an answer")
+        .await
+        .unwrap();
+    assert!((g.score - 0.8).abs() < 1e-9);
+    let reqs = p.requests();
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[1].messages.len(), 3, "the reply and a reminder follow");
+    assert!(reqs[0].max_tokens >= 4000);
+    // Two replies without a grade fail.
+    let judge = Judge {
+        provider: scripted(vec![
+            Reply::Text("prose".into()),
+            Reply::Text("more prose".into()),
+        ]),
+        model: "judge".into(),
+    };
+    assert!(judge.grade(Role::Data, &case, &[], "x").await.is_err());
+}
+
 #[test]
 fn tool_matching_uses_key_args_and_substrings() {
     let e: ExpectedCall = toml::from_str(

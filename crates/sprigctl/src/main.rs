@@ -56,6 +56,8 @@ mod gateway;
 mod graph;
 mod index;
 mod inherit;
+// Token issuers (external tokens).
+mod issuer;
 mod search;
 // Approvals and recommendations.
 mod logic;
@@ -196,6 +198,7 @@ fn tenant_group() -> Command {
         );
     g = placement::add_pin_cmds(g);
     g = suspend::add_cmds(g);
+    g = issuer::add_cmds(g);
     // Moves between DCs and traffic (crate::dcmove).
     g = g
         .subcommand(dcmove::move_command())
@@ -1060,6 +1063,14 @@ async fn run_tenant(
         }
         "suspend" | "resume" => {
             suspend::run(c, cmd, sub, m.get_flag("dry-run"), out).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        "issuer" => {
+            issuer::run_issuer(c, sub, m.get_flag("dry-run"), out).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        "token-login" => {
+            issuer::run_token_login(c, sub, m.get_flag("dry-run"), out).await?;
             Ok(ExitCode::SUCCESS)
         }
         "failover" | "standby" => {

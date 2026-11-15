@@ -470,7 +470,11 @@ fn log_outcome(name: &str, k: &dyn Display, out: &Result<Outcome>) {
         Err(e) if e.code() == Some(SprigCode::NotLeader) => {
             tracing::info!(%name, key = %k, "leadership lost during reconcile");
         }
-        Err(e) => tracing::warn!(%name, key = %k, error = %e, "reconcile failed"),
+        Err(e) => {
+            tracing::warn!(%name, key = %k, error = %e, "reconcile failed");
+            // Counted for the administration agent: the code and the loop.
+            sprig_common::incidents::record(e, &format!("loop.{name}"));
+        }
         Ok(_) => {}
     }
 }

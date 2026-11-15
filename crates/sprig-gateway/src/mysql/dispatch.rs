@@ -817,6 +817,13 @@ impl CommandLoop {
             principal,
             persona,
         });
+        // SPRIG_CLAIM(): the claims of the issuer's token the login used.
+        self.exec.set_claims(
+            login
+                .local()
+                .and_then(sprig_auth::MysqlLogin::token)
+                .map(|t| std::sync::Arc::clone(&t.claims)),
+        );
         self.session.set_state(SessionState::Ready);
         self.session.end_command();
         if let Some(db) = cu

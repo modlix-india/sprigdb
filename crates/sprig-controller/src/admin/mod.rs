@@ -23,6 +23,8 @@
 //! | `Tenants.DeleteTenant` | `DELETE /admin/v1/tenants/{name}` |
 //! | `Tenants.SuspendTenant`, `ResumeTenant` | `POST /admin/v1/tenants/{name}:suspend\|:resume` ([`crate::users`]) |
 //! | `Users.CreateUser` | `POST /admin/v1/tenants/{name}/users` ([`crate::users`]) |
+//! | `Users.ListIssuers`, `PutIssuer` | `GET`, `POST /admin/v1/tenants/{name}/issuers` (`crate::users::issuers`) |
+//! | `Users.SetTokenLogin` | `POST /admin/v1/tenants/{name}/users:setTokenLogin` |
 //! | `Tenants.ExportAccounts`, `ImportAccounts` | `GET`, `POST /admin/v1/tenants/{name}/accounts` |
 //! | `Tenants.MoveTenant`, `PinTenant`, `UnpinTenant`, traffic | `/admin/v1/tenants/{name}:move\|:pin\|:unpin`, `.../move`, `.../traffic`, `/admin/v1/traffic/reports` ([`dcmove`]) |
 //! | `Jobs.ListJobs`, `GetJob`, `CancelJob` | `/admin/v1/jobs[/{job_id}[:cancel]]` ([`jobs`]) |
@@ -301,6 +303,50 @@ impl AdminService {
             .as_ref()
             .ok_or_else(|| invalid("this controller doesn't manage users"))?
             .create(tenant, req)
+            .await
+    }
+
+    /// `Users.ListIssuers`: a tenant's token issuers.
+    ///
+    /// # Errors
+    /// As [`UserAdmin::list_issuers`].
+    pub async fn list_issuers(&self, tenant: &str) -> Result<crate::users::ListIssuersResponse> {
+        self.users
+            .as_ref()
+            .ok_or_else(|| invalid("this controller doesn't manage users"))?
+            .list_issuers(tenant)
+            .await
+    }
+
+    /// `Users.PutIssuer`: creates or replaces a token issuer.
+    ///
+    /// # Errors
+    /// As [`UserAdmin::put_issuer`].
+    pub async fn put_issuer(
+        &self,
+        tenant: &str,
+        spec: sprig_auth::oidc::IssuerSpec,
+    ) -> Result<crate::users::PutIssuerResponse> {
+        self.users
+            .as_ref()
+            .ok_or_else(|| invalid("this controller doesn't manage users"))?
+            .put_issuer(tenant, spec)
+            .await
+    }
+
+    /// `Users.SetTokenLogin`: adds or removes an account's `token` method.
+    ///
+    /// # Errors
+    /// As [`UserAdmin::set_token_login`].
+    pub async fn set_token_login(
+        &self,
+        tenant: &str,
+        req: crate::users::TokenLoginRequest,
+    ) -> Result<crate::users::TokenLoginResponse> {
+        self.users
+            .as_ref()
+            .ok_or_else(|| invalid("this controller doesn't manage users"))?
+            .set_token_login(tenant, req)
             .await
     }
 

@@ -20,6 +20,15 @@
 //!   malformed).
 //! - `sprig_ai_mcp_tool_calls_total{role,tool,result}`: MCP tool calls;
 //!   `result` is `ok`, `error`, `denied`, `proposed` or `limited`.
+//! - `sprig_ai_incidents_total{severity}`: advice items the administration
+//!   agent filed.
+//! - `sprig_ai_incident_triage_total{verdict}`: incidents triaged:
+//!   `noise`, `needs_advice` or `critical` (triage skipped).
+//! - `sprig_ai_incidents_held_total{reason}`: incidents that couldn't go
+//!   further in a pass: `advice_cap`, `triage_cap`, `budget`, `no_model`,
+//!   `error` or `expired` (pending for a day).
+//! - `sprig_ai_intake_flushes_total{result}`: a process's writes of its
+//!   error counts: `ok` or `error`.
 
 use std::time::Duration;
 
@@ -132,4 +141,29 @@ pub fn mcp_tool_call(role: Role, tool: &str, result: &'static str) {
         "result" => result
     )
     .increment(1);
+}
+
+/// An advice item filed, by its severity.
+pub fn incident(severity: &str) {
+    let severity = crate::incidents::brief::SEVERITIES
+        .iter()
+        .find(|s| **s == severity)
+        .copied()
+        .unwrap_or("medium");
+    metrics::counter!("sprig_ai_incidents_total", "severity" => severity).increment(1);
+}
+
+/// An incident triaged.
+pub fn incident_triage(verdict: &'static str) {
+    metrics::counter!("sprig_ai_incident_triage_total", "verdict" => verdict).increment(1);
+}
+
+/// An incident that couldn't go further in a pass.
+pub fn incident_held(reason: &'static str) {
+    metrics::counter!("sprig_ai_incidents_held_total", "reason" => reason).increment(1);
+}
+
+/// One write of a process's error counts.
+pub fn intake_flush(result: &'static str) {
+    metrics::counter!("sprig_ai_intake_flushes_total", "result" => result).increment(1);
 }

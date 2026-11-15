@@ -1001,11 +1001,13 @@ pub async fn orphan_scan(
                     }
                     Err(e) => {
                         t.rollback().await;
+                        metrics::counter!("sprig_lookup_orphans_removed_total").increment(removed);
                         return Err(e);
                     }
                 }
             }
         }
     }
+    metrics::counter!("sprig_lookup_orphans_removed_total").increment(removed);
     Ok(removed)
 }

@@ -46,6 +46,10 @@ pub enum Shares {
     Stats,
     /// Rows; sent only with `ai.share_data`, else reduced to their shape.
     Rows,
+    /// SprigDB's own documentation: public text that holds nothing of a
+    /// tenant's, so the administration roles' scrubber leaves its names
+    /// alone (secrets are still masked).
+    Docs,
 }
 
 /// One tool.

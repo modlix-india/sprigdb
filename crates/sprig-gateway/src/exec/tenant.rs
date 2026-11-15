@@ -473,11 +473,8 @@ impl PassSession {
             };
             let step = match dup_table.as_deref() {
                 Some(table) => {
-                    let mut wrapped = super::compat_sink::DupKeySink {
-                        inner: &mut *out,
-                        table,
-                    };
-                    Box::pin(self.tenant_text(
+                    let mut wrapped = super::compat_sink::DupKeySink::new(&mut *out, table);
+                    let r = Box::pin(self.tenant_text(
                         cx,
                         &piece,
                         attrs,
@@ -485,7 +482,19 @@ impl PassSession {
                         RowFormat::Text,
                         &mut wrapped,
                     ))
-                    .await
+                    .await;
+                    // A value that doesn't fit a functional index: MySQL's
+                    // 3752 or 3751 naming the index (exec/mysql_ddl.rs).
+                    match (wrapped.take_held(), r) {
+                        (Some(e), Ok(step)) => {
+                            let e = Box::pin(self.fx_dml_error(cx, &piece, e)).await;
+                            out.error(&e).await.map(|()| Step {
+                                errored: true,
+                                ..step
+                            })
+                        }
+                        (_, r) => r,
+                    }
                 }
                 // 3306: MySQL's integer result types.
                 None if self.persona == Persona::MySql84
@@ -512,6 +521,11 @@ impl PassSession {
                 Ok(s) => s,
                 Err(e) => {
                     summary.db = Some(self.current_logical());
+                    let e = if dup_table.is_some() {
+                        Box::pin(self.fx_dml_error(cx, &piece, e)).await
+                    } else {
+                        e
+                    };
                     return Err(super::compat_sink::map(e, dup_table.as_deref()));
                 }
             };

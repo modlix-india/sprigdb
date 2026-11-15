@@ -303,7 +303,7 @@ pub(crate) fn feed_parts(
     )?));
     let shared = SharedFeed::new(inner, SharedOpts::default());
     let parts: FeedParts = (
-        shared.view(Kept::All),
+        shared.view(Kept::All).named("gateway"),
         Arc::new(MetaPlacement::new(dc)),
         Arc::new(CatalogResolver::new(Arc::new(Catalogs(catalogs)))),
     );

@@ -259,12 +259,15 @@ jobs:
       - name: Run every target for FUZZ_SECONDS
         run: |
           set -euo pipefail
+          # cargo-fuzz defaults to the triple it was built for; the prebuilt binary is
+          # musl, and AddressSanitizer can't link against static musl. Pin glibc.
+          tgt=x86_64-unknown-linux-gnu
           for crate in crates/sprig-proto-mysql/fuzz crates/sprig-sql/fuzz; do
             ( cd "$crate"
-              cargo +nightly fuzz build -O
+              cargo +nightly fuzz build -O --target "$tgt"
               for t in $(cargo +nightly fuzz list); do
                 mkdir -p "work/$t" "regressions/$t"
-                cargo +nightly fuzz run -O "$t" "work/$t" "corpus/$t" "regressions/$t" -- \
+                cargo +nightly fuzz run -O --target "$tgt" "$t" "work/$t" "corpus/$t" "regressions/$t" -- \
                   -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=2048 -timeout=10
               done )
           done

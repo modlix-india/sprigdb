@@ -154,6 +154,28 @@ service Users {
       body: "*"
     };
   }
+  // Adds or removes an account's `token` method (logins with an issuer's
+  // token over MySQL and Redis). The body is {"user", "host", "enabled"}.
+  rpc SetTokenLogin(NameRequest) returns (JsonReply) {
+    option (google.api.http) = {
+      post: "/admin/v1/tenants/{name}/users:setTokenLogin"
+      body: "*"
+    };
+  }
+  // The tenant's token issuers (OIDC providers, the end-user layer) with
+  // their claim mappings.
+  rpc ListIssuers(NameRequest) returns (JsonReply) {
+    option (google.api.http) = {
+      get: "/admin/v1/tenants/{name}/issuers"
+    };
+  }
+  // Creates or replaces an issuer (by its `issuer`) with its mappings.
+  rpc PutIssuer(NameRequest) returns (JsonReply) {
+    option (google.api.http) = {
+      post: "/admin/v1/tenants/{name}/issuers"
+      body: "*"
+    };
+  }
 }
 
 // Settings at every scope.

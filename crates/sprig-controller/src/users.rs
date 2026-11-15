@@ -8,11 +8,14 @@
 //! tenants bootstrapped before [`AuthHooks`] registered the module get its
 //! tables too. Bootstrap migrates it with the core module from now on.
 //!
+//! Token issuers and accounts' `token` method: [`issuers`].
+//!
 //! Users are otherwise created with SQL (`CREATE USER`) or by an
 //! authenticated operator through the Admin API's `Users` service; this
 //! endpoint trusts the Admin API token, like every other Admin API call
 //! here.
 
+mod issuers;
 mod suspend;
 
 use std::sync::Arc;
@@ -26,6 +29,7 @@ use sprig_common::ids::{TenantId, UserId};
 use sprig_common::time::Clock;
 use sprig_common::{Result, SprigCode, SprigError};
 
+pub use issuers::{ListIssuersResponse, PutIssuerResponse, TokenLoginRequest, TokenLoginResponse};
 pub use suspend::{MAX_REASON, SuspendTenantRequest, SuspendTenantResponse};
 
 use crate::tenants::BootstrapHooks;
@@ -151,6 +155,44 @@ pub trait UserAdmin: Send + Sync {
     async fn resume(&self, _tenant: &str) -> Result<SuspendTenantResponse> {
         Err(crate::admin::invalid(
             "this controller doesn't suspend tenants",
+        ))
+    }
+
+    /// A tenant's token issuers.
+    ///
+    /// # Errors
+    /// As [`TenantUsers::list_issuers`].
+    async fn list_issuers(&self, _tenant: &str) -> Result<ListIssuersResponse> {
+        Err(crate::admin::invalid(
+            "this controller doesn't manage issuers",
+        ))
+    }
+
+    /// Creates or replaces a token issuer.
+    ///
+    /// # Errors
+    /// As [`TenantUsers::put_issuer`].
+    async fn put_issuer(
+        &self,
+        _tenant: &str,
+        _spec: sprig_auth::oidc::IssuerSpec,
+    ) -> Result<PutIssuerResponse> {
+        Err(crate::admin::invalid(
+            "this controller doesn't manage issuers",
+        ))
+    }
+
+    /// Adds or removes an account's `token` method.
+    ///
+    /// # Errors
+    /// As [`TenantUsers::set_token_login`].
+    async fn set_token_login(
+        &self,
+        _tenant: &str,
+        _req: TokenLoginRequest,
+    ) -> Result<TokenLoginResponse> {
+        Err(crate::admin::invalid(
+            "this controller doesn't manage issuers",
         ))
     }
 }
@@ -376,5 +418,25 @@ impl UserAdmin for TenantUsers {
 
     async fn resume(&self, tenant: &str) -> Result<SuspendTenantResponse> {
         TenantUsers::resume(self, tenant).await
+    }
+
+    async fn list_issuers(&self, tenant: &str) -> Result<ListIssuersResponse> {
+        TenantUsers::list_issuers(self, tenant).await
+    }
+
+    async fn put_issuer(
+        &self,
+        tenant: &str,
+        spec: sprig_auth::oidc::IssuerSpec,
+    ) -> Result<PutIssuerResponse> {
+        TenantUsers::put_issuer(self, tenant, spec).await
+    }
+
+    async fn set_token_login(
+        &self,
+        tenant: &str,
+        req: TokenLoginRequest,
+    ) -> Result<TokenLoginResponse> {
+        TenantUsers::set_token_login(self, tenant, req).await
     }
 }

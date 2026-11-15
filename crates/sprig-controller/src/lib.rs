@@ -117,6 +117,7 @@ pub mod workload_rollup;
 pub mod write_load;
 // AI providers in the Admin API and the payload purge.
 pub mod ai_admin;
+pub mod ai_incidents;
 pub mod ai_system;
 
 use std::sync::Arc;
@@ -534,6 +535,15 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
                 &stores.global,
             )))),
         );
+        // The administration agent's advice: approving it acknowledges it.
+        a.register(
+            sprig_approvals::Kind::AiIncidentAdvice,
+            Arc::new(ai_incidents::Acknowledge),
+        );
+        a.register(
+            sprig_approvals::Kind::AiHealthWarning,
+            Arc::new(ai_incidents::Acknowledge),
+        );
         a
     };
     let _ = sharding.sharding().approvals.set(Arc::clone(&approvals));
@@ -573,6 +583,36 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         )
         .with_tenant_scopes(Arc::clone(&tenant_scopes)),
     );
+    // The administration agent: this process's error counts, and the
+    // DC leader's intake of every process's.
+    let _intake = {
+        let (live, dc) = (settings.live.clone(), dc.clone());
+        sprig_ai::incidents::intake::spawn(
+            Arc::clone(&stores.dc),
+            "controller",
+            &cfg.node.id(),
+            Arc::new(move || {
+                live.get(
+                    &sprig_ai::settings::ADMIN_ENABLED,
+                    &sprig_settings::SettingCtx::process(&dc),
+                )
+            }),
+            ctx.shutdown.clone(),
+        )
+    };
+    let incident_env: Arc<dyn ai_incidents::IncidentEnv> =
+        Arc::new(ai_incidents::ControllerEnv::new(
+            dc.clone(),
+            Arc::clone(&stores.dc),
+            Arc::clone(&stores.global),
+            cfg.controller.workload_key_file.as_deref(),
+            RegistryPools::new(
+                ClusterRegistry::new(Arc::clone(&stores.global), Arc::clone(&stores.dc))?,
+                Some(Arc::clone(&monitor)),
+            )
+            .budget("ai_incidents", 1),
+            Some((settings.live.clone(), dc.clone())),
+        )?);
     let rt = Runtime::new(stores.clone(), Arc::clone(&clock), me)
         .with_settings(settings.control.clone())
         .with_loop(Loop::new(dispatch::Dispatch))
@@ -638,6 +678,14 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
                 .budget("ai_system", 1),
             )),
             Some((settings.live.clone(), dc.clone())),
+        )))
+        // The administration agent's incident intake: triage and advice.
+        .with_loop(Loop::new(ai_incidents::IncidentLoop::new(
+            dc.clone(),
+            Arc::clone(&stores.dc),
+            ai_incidents::Knobs::Live(settings.live.clone(), dc.clone()),
+            Arc::clone(approvals.hub()),
+            Arc::clone(&incident_env),
         )))
         // Approvals: escalation, auto-apply, appliers, expiry, gauges.
         .with_loop(Loop::new(
@@ -817,6 +865,9 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             .merge(recs)
             .merge(operators::http::router(operators))
             .merge(ai_admin::router(ai_admin))
+            .merge(ai_incidents::router(Arc::new(
+                ai_incidents::IncidentsApi::new(Arc::clone(&reg_store), incident_env),
+            )))
             .layer(axum::middleware::from_fn_with_state(
                 guard,
                 operators::guard::layer,

@@ -72,6 +72,9 @@ pub mod events {
     pub const USER_CREATED: &str = "auth.user_created";
     /// A user was dropped.
     pub const USER_DROPPED: &str = "auth.user_dropped";
+    /// An issuer's verified token named an account that didn't exist, and
+    /// the issuer creates them (`jit_users`): it was created.
+    pub const USER_CREATED_JIT: &str = "auth.user_created_jit";
     /// Another account attribute changed (`detail` names it).
     pub const ACCOUNT_CHANGED: &str = "auth.account_changed";
     /// A login was handed to another DC (residency).

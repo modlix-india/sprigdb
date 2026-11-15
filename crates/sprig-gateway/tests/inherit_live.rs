@@ -3839,3 +3839,158 @@ async fn fan_in_queue_sink_after_a_crash() {
     ok(&mut sys, "DROP CONNECTION r9fiq.hook").await;
     clean_db(&mut sys, "r9fiq").await;
 }
+
+/// R9 r9feed5: a member's change exchange to an exchange inherited from
+/// the declarer (`queue.change_exchange` naming a `FOR EACH TENANT`
+/// exchange) publishes each committed change exactly once into the
+/// member's own instance, stamped with the member's name, through a
+/// `kill -9` of the worker mid-stream (its forwarder publishes again what
+/// came after its checkpoint; the message ids make that a no-op).
+#[tokio::test]
+async fn inherited_change_exchange_exactly_once() {
+    let Some(e) = env("inherited_change_exchange_exactly_once") else {
+        return;
+    };
+    let Some(amqp_addr) = var("SPRIG_TEST_INHERIT_AMQP") else {
+        eprintln!("no SPRIG_TEST_INHERIT_AMQP: skipped");
+        return;
+    };
+    let rows: u64 = var("SPRIG_TEST_INHERIT_CX_ROWS").map_or(600, |v| v.parse().unwrap());
+    let mut sys = conn(&e.addr, &e.system).await;
+    let _leftovers = Leftovers::dbs(&e, &["cxi"]);
+    let members: Vec<String> = e.members.iter().take(2).cloned().collect();
+    let mut ms = Vec::new();
+    for m in &members {
+        let mut c = conn(&e.addr, m).await;
+        let _ = sql(
+            &mut c,
+            "ALTER TABLE cxi.ord SPRIG RESET (queue.change_exchange)",
+        )
+        .await;
+        let _ = sql(&mut c, "DROP DATABASE IF EXISTS cxi").await;
+        ms.push((m.clone(), c));
+    }
+    let _ = sql(&mut sys, "DROP EXCHANGE cxi.feed IMMEDIATE CASCADE").await;
+    let _ = sql(&mut sys, "DROP QUEUE cxi.changes IMMEDIATE CASCADE").await;
+    clean_db(&mut sys, "cxi").await;
+    ok(&mut sys, "CREATE DATABASE cxi").await;
+    for q in [
+        "CREATE EXCHANGE cxi.feed TYPE topic FOR EACH TENANT",
+        "CREATE QUEUE cxi.changes FOR EACH TENANT",
+        "BIND QUEUE cxi.changes TO EXCHANGE cxi.feed KEY '#' FOR EACH TENANT",
+    ] {
+        ok(&mut sys, q).await;
+    }
+    // Each member's first AMQP connection makes its instances and its
+    // database cxi; its table there publishes its changes to `feed`.
+    let mut chans = Vec::new();
+    for (m, c) in &mut ms {
+        let a = amqp(&amqp_addr, m, "cxi").await;
+        let ch = a.create_channel().await.unwrap();
+        ch.queue_declare(
+            "changes".into(),
+            QueueDeclareOptions {
+                passive: true,
+                ..QueueDeclareOptions::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+        ok(
+            c,
+            "CREATE TABLE cxi.ord (id INT PRIMARY KEY, v INT NOT NULL)",
+        )
+        .await;
+        ok(
+            c,
+            "ALTER TABLE cxi.ord SPRIG SET (queue.change_exchange = 'feed')",
+        )
+        .await;
+        chans.push((a, ch));
+    }
+    // Inserts, one per transaction, paced so the forwarders publish while
+    // the worker is killed half way through the first member's.
+    let t = Instant::now();
+    let mut killed = false;
+    for i in 0..rows {
+        for (j, (_, c)) in ms.iter_mut().enumerate() {
+            ok(c, &format!("INSERT INTO cxi.ord VALUES ({i}, {j})")).await;
+        }
+        if i == rows / 2 && kill_worker(&e) {
+            killed = true;
+            println!("worker killed with kill -9 after {i} inserts per member");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            start_worker(&e);
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    println!(
+        "{rows} inserts per member in {:?} (killed: {killed})",
+        t.elapsed()
+    );
+    // Every insert's change once, stamped with its member.
+    let mut failed = Vec::new();
+    for ((m, _), (_, ch)) in ms.iter().zip(&chans) {
+        let mut ids: Vec<i64> = Vec::new();
+        let mut unstamped = 0u64;
+        let end = Instant::now() + Duration::from_secs(180);
+        let mut last = Instant::now();
+        loop {
+            match ch
+                .basic_get("changes".into(), BasicGetOptions { no_ack: true })
+                .await
+                .unwrap()
+            {
+                Some(msg) => {
+                    last = Instant::now();
+                    if header(&msg, "x-sprig-tenant").as_deref() != Some(m.as_str()) {
+                        unstamped += 1;
+                    }
+                    let v: serde_json::Value =
+                        serde_json::from_slice(&msg.data).unwrap_or_default();
+                    if v["op"].as_str() == Some("c")
+                        && let Some(id) = v["after"]["id"].as_i64()
+                    {
+                        ids.push(id);
+                    }
+                }
+                None if Instant::now() > end
+                    || (ids.len() as u64 >= rows && last.elapsed() > Duration::from_secs(5)) =>
+                {
+                    break;
+                }
+                None => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+        let mut seen = std::collections::BTreeMap::<i64, u64>::new();
+        for id in &ids {
+            *seen.entry(*id).or_default() += 1;
+        }
+        let twice = seen.values().filter(|n| **n > 1).count();
+        let missing = (0..rows as i64).filter(|i| !seen.contains_key(i)).count();
+        println!(
+            "{m}: {} changes for {rows} inserts: {missing} missing, {twice} more than once, \
+             {unstamped} not stamped with {m}",
+            ids.len()
+        );
+        if twice > 0 || missing > 0 || unstamped > 0 {
+            failed.push(format!(
+                "{m}: {missing} missing, {twice} twice, {unstamped} unstamped"
+            ));
+        }
+    }
+    for (_, c) in &mut ms {
+        let _ = sql(c, "ALTER TABLE cxi.ord SPRIG RESET (queue.change_exchange)").await;
+    }
+    for (a, _) in chans {
+        let _ = a.close(200, "done".into()).await;
+    }
+    ok(&mut sys, "DROP EXCHANGE cxi.feed IMMEDIATE CASCADE").await;
+    ok(&mut sys, "DROP QUEUE cxi.changes IMMEDIATE").await;
+    for (_, c) in &mut ms {
+        let _ = sql(c, "DROP DATABASE IF EXISTS cxi").await;
+    }
+    clean_db(&mut sys, "cxi").await;
+    assert!(failed.is_empty(), "{failed:#?}");
+}

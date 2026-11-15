@@ -377,6 +377,14 @@ impl WorkerRuntime {
                 }
                 None => Err(format!("no worker handler for job kind {:?}", job.kind)),
             };
+            if let Err(why) = &result {
+                // Counted for the administration agent: the code and the
+                // job's kind, never its text.
+                sprig_common::incidents::record_code(
+                    sprig_common::incidents::code_in(why),
+                    &format!("job.{}", job.kind),
+                );
+            }
             if !cancel.is_cancelled() {
                 let c = claimed.lock().await.clone();
                 match dispatch::finish(store.as_ref(), clock.as_ref(), c, result).await {
@@ -385,6 +393,7 @@ impl WorkerRuntime {
                         tracing::info!(job = %job.job_id, "job changed before it finished; result dropped");
                     }
                     Err(e) => {
+                        sprig_common::incidents::record(&e, "job.finish");
                         tracing::warn!(job = %job.job_id, error = %e, "can't record the job's end");
                     }
                 }

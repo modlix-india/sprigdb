@@ -842,6 +842,68 @@ impl LookupCatalog {
         .map_err(crate::groups::db_err)
     }
 
+    /// The public lookups whose orphan scan is due: the last scan
+    /// (`last_scan_at`), or for one never scanned its last change, is older
+    /// than `every_secs`; the longest waiting first.
+    ///
+    /// # Errors
+    /// MariaDB's errors.
+    pub async fn scans_due(
+        &self,
+        c: &mut mysql_async::Conn,
+        every_secs: u64,
+    ) -> Result<Vec<LookupId>> {
+        use mysql_async::prelude::Queryable;
+        let ids: Vec<u64> = c
+            .exec(
+                "SELECT lookup_id FROM lookup_indexes WHERE state = 'public'
+                 AND COALESCE(last_scan_at, updated_at) < UTC_TIMESTAMP(6) - INTERVAL ? SECOND
+                 ORDER BY COALESCE(last_scan_at, updated_at), lookup_id",
+                (every_secs,),
+            )
+            .await
+            .map_err(crate::groups::db_err)?;
+        Ok(ids.into_iter().map(LookupId).collect())
+    }
+
+    /// Takes the orphan scan of public lookup `l` when it is still due (as
+    /// [`Self::scans_due`]): moves `last_scan_at` to now. Returns whether
+    /// this caller won (two can't both).
+    ///
+    /// # Errors
+    /// MariaDB's errors.
+    pub async fn claim_scan(
+        &self,
+        c: &mut mysql_async::Conn,
+        l: LookupId,
+        every_secs: u64,
+    ) -> Result<bool> {
+        use mysql_async::prelude::Queryable;
+        c.exec_drop(
+            "UPDATE lookup_indexes SET last_scan_at = UTC_TIMESTAMP(6)
+             WHERE lookup_id = ? AND state = 'public'
+             AND COALESCE(last_scan_at, updated_at) < UTC_TIMESTAMP(6) - INTERVAL ? SECOND",
+            (l.0, every_secs),
+        )
+        .await
+        .map_err(crate::groups::db_err)?;
+        Ok(c.affected_rows() == 1)
+    }
+
+    /// Records an orphan scan of `l` (`last_scan_at`), as a rebuild's.
+    ///
+    /// # Errors
+    /// MariaDB's errors.
+    pub async fn scanned(&self, c: &mut mysql_async::Conn, l: LookupId) -> Result<()> {
+        use mysql_async::prelude::Queryable;
+        c.exec_drop(
+            "UPDATE lookup_indexes SET last_scan_at = UTC_TIMESTAMP(6) WHERE lookup_id = ?",
+            (l.0,),
+        )
+        .await
+        .map_err(crate::groups::db_err)
+    }
+
     /// Takes `l` over from a job that stopped: moves `updated_at` to now
     /// if it is older than `lease_secs`. Returns whether this caller now
     /// owns the job (two takers can't both win).

@@ -135,7 +135,7 @@ async fn forwards_in_the_order_given_and_never_twice() {
 
     // The ledger keeps rows while their outbox row exists or they are
     // young; a purge before now + 1 s takes the 40 forwarded ones.
-    let n = sprig_queues::store::MsgStore::purge_ledger(&*store, i64::MAX)
+    let n = sprig_queues::store::MsgStore::purge_ledger(&*store, i64::MAX, i64::MAX)
         .await
         .unwrap();
     assert_eq!(n, 40);
@@ -183,6 +183,63 @@ async fn a_batch_of_messages_with_ids_reaches_a_queue_once_each() {
     v.publish_now(m("c"), true).await.unwrap();
     v.publish_now(m("c"), true).await.unwrap();
     assert_eq!(drain(&ch, &q).await, ["c", "c"]);
+    conn.close(0, "done".into()).await.unwrap();
+}
+
+/// R9 r9feed5: a change exchange's ids (version 8) stay in the forward
+/// ledger longer than other ids, so a forwarder that comes back late still
+/// publishes its last changes once: a purge with the general cutoff past
+/// takes the others only, and the change ids still keep their consumed
+/// messages out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn change_exchange_ids_outlive_other_ledger_rows() {
+    let s = server_with(QueueSettings::default()).await;
+    let e = Arc::clone(s.engine.as_ref().unwrap());
+    let conn = lapin(&s).await;
+    let ch = conn.create_channel().await.unwrap();
+    let q = uniq("cx-ledger");
+    declare(&ch, &q).await;
+    let v = vhost(&e).await;
+    v.ensure_store().await.unwrap();
+    let store = s.catalog.as_ref().unwrap().store_of(42, "mq").unwrap();
+    let m = |body: &str| message("", &q, body.as_bytes().to_vec(), None).unwrap();
+    // Byte 6's high nibble is the UUID version: 0x8_ a change id, 0x7_ not.
+    let id = |change: bool, i: u8| -> MsgId {
+        let mut b = [i; 16];
+        b[6] = if change { 0x80 } else { 0x70 } | (i & 0x0f);
+        b
+    };
+    assert!(sprig_queues::store::is_change_id(&id(true, 1)));
+    assert!(!sprig_queues::store::is_change_id(&id(false, 1)));
+    let batch = |tag: &str| -> Vec<_> {
+        (0..6u8)
+            .map(|i| (m(&format!("{tag}{i}")), id(i % 2 == 0, i)))
+            .collect()
+    };
+    let ok = |r: Vec<Result<u32, _>>| r.into_iter().all(|x| x.is_ok());
+    assert!(ok(v.publish_batch_once(batch("a")).await));
+    assert_eq!(drain(&ch, &q).await.len(), 6, "consumed");
+    // Past the general cutoff, not the change ids' one: the three other
+    // rows go.
+    let purge = |before: i64, changes: i64| {
+        let store = Arc::clone(&store);
+        async move {
+            sprig_queues::store::MsgStore::purge_ledger(&*store, before, changes)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(purge(i64::MAX, 0).await, 3);
+    // The forwarder comes back and publishes the same six again: the
+    // change ids are still no-ops; the others, forgotten, go in again.
+    assert!(ok(v.publish_batch_once(batch("b")).await));
+    assert_eq!(drain(&ch, &q).await, ["b1", "b3", "b5"]);
+    assert_eq!(purge(i64::MAX, 0).await, 3);
+    assert_eq!(
+        purge(i64::MAX, i64::MAX).await,
+        3,
+        "the change ids go after their own cutoff"
+    );
     conn.close(0, "done".into()).await.unwrap();
 }
 

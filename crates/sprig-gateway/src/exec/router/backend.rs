@@ -409,6 +409,20 @@ impl sprig_router::ShardBackend for GwBackend<'_> {
     }
 
     async fn lookup_claim(&mut self, c: &sprig_router::plan::Claim) -> Result<()> {
+        // `lookup.lock_wait_seconds` at the owner table's scope.
+        let cat = self
+            .factory
+            .cat
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(cat) = cat {
+            self.coord.set_lock_wait(crate::tenant::lookups_sql::lock_wait_in(
+                &self.factory.svc,
+                &cat,
+                c.lookup.index.owner,
+            ));
+        }
         let owner = OwnerRef {
             pk: c.owner_pk.clone(),
             rk: RoutingHash(c.owner_rk),

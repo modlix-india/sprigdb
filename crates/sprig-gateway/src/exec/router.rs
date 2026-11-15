@@ -626,8 +626,9 @@ impl PassSession {
                     ..TxnConfig::default()
                 },
             );
-            // `lookup.lock_wait_seconds`: Pre sessions' lock wait, at the
-            // tenant's value when the session's coordinator is made.
+            // `lookup.lock_wait_seconds`: Pre sessions' lock wait, the
+            // tenant's value until each claim sets its owner table's
+            // (`GwBackend::lookup_claim`).
             let lock_wait = crate::tenant::lookups_sql::settings(&svc, ts.tenant).lock_wait_seconds;
             self.router.coord = Some(DistTxn::new(
                 txn,

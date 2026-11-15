@@ -97,6 +97,7 @@ const EDGE_TABLES: &str = "__sprig_ge_*";
 #[must_use]
 pub fn shared_view(feed: &Arc<SharedFeed>) -> Arc<SharedClusters> {
     feed.view_every(Kept::Tables(vec![EDGE_TABLES.to_owned()].into()), IDLE_TICK)
+        .named("graph_mirror")
 }
 
 /// `graph_mirror` (see the module docs).
