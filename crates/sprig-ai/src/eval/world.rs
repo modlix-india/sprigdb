@@ -1,5 +1,6 @@
 //! The fake tool world: a [`ToolHost`] that answers from a case's world
-//! entries and records every call it gets, and a provider wrapper that
+//! entries (read tools, and proposal tools' checks) and records every call
+//! it gets, and a provider wrapper that
 //! records every body sent.
 
 use std::sync::{Arc, Mutex};
@@ -10,13 +11,14 @@ use sprig_common::{Result, SprigError};
 
 use super::case::WorldEntry;
 use crate::provider::{ChatOutcome, ChatRequest, ChatSink, Provider, ProviderKind};
-use crate::tools::{ToolHost, ToolOutput, ToolSpec};
+use crate::tools::{ProposalCheck, ToolBody, ToolHost, ToolOutput, ToolSpec};
 
 /// Serves a case's world, as the signed-in caller's host would.
 #[derive(Debug)]
 pub struct WorldHost {
     entries: Vec<WorldEntry>,
     calls: Mutex<Vec<(String, Value)>>,
+    checked: Mutex<Vec<(String, Value)>>,
 }
 
 impl WorldHost {
@@ -26,6 +28,7 @@ impl WorldHost {
         Self {
             entries,
             calls: Mutex::new(Vec::new()),
+            checked: Mutex::new(Vec::new()),
         }
     }
 
@@ -57,6 +60,17 @@ impl ToolHost for WorldHost {
                     .find(|e| e.tool == spec.name && e.when.is_none())
             });
         let Some(e) = entry else {
+            // A case that says nothing about the schema checks means its
+            // statements are fine: the real check is deterministic, and
+            // cases written before it existed assume valid DDL.
+            if spec.name == "check_ddl" {
+                return Ok(ToolOutput::json(serde_json::json!({
+                    "passed": true,
+                    "counts": {"errors": 0, "changes": 0, "notes": 0},
+                    "findings": [],
+                    "next": "It passes SprigDB's rules; propose it with propose_sql.",
+                })));
+            }
             return Err(world_error(format!(
                 "{} found nothing for that input",
                 spec.name
@@ -68,6 +82,34 @@ impl ToolHost for WorldHost {
                 sources: e.sources.clone(),
             }),
             Err(m) => Err(world_error(m)),
+        }
+    }
+
+    /// A proposal tool's check, from its world entry (`json` is the
+    /// check's result, `error` refuses the proposal); none checks nothing.
+    async fn check_proposal(&self, spec: &ToolSpec, input: &Value) -> Result<ProposalCheck> {
+        self.checked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((spec.name.to_owned(), input.clone()));
+        let entry = self
+            .entries
+            .iter()
+            .filter(|e| e.tool == spec.name)
+            .find(|e| e.when.is_some() && e.serves(input))
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .find(|e| e.tool == spec.name && e.when.is_none())
+            });
+        match entry.map(WorldEntry::body) {
+            None => Ok(ProposalCheck::default()),
+            Some(Ok(ToolBody::Json(v))) => Ok(ProposalCheck {
+                checks: Some(v),
+                generated: None,
+            }),
+            Some(Ok(_)) => Err(world_error("a proposal check's world entry is json")),
+            Some(Err(m)) => Err(world_error(m)),
         }
     }
 }

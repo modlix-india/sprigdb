@@ -389,6 +389,85 @@
         ],
         "type": "object"
       },
+      "AiProposalAction": {
+        "properties": {
+          "confirm": {
+            "type": "boolean"
+          },
+          "note": {
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "AiProposalOutcome": {
+        "properties": {
+          "approvals": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "database": {
+            "type": "string"
+          },
+          "error": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "kind": {
+            "enum": [
+              "sql",
+              "recommendation",
+              "tile",
+              "glossary",
+              "generate_rows"
+            ],
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "accepted",
+              "failed",
+              "dismissed"
+            ],
+            "type": "string"
+          },
+          "proposal": {
+            "type": "string"
+          },
+          "ran": {
+            "items": {
+              "properties": {
+                "results": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "sql": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "sql",
+                "results"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "term": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "proposal",
+          "kind",
+          "outcome"
+        ],
+        "type": "object"
+      },
       "AiRecorded": {
         "properties": {
           "recorded": {
@@ -1917,6 +1996,57 @@
           }
         },
         "summary": "{term}:accept or :reject a proposed term, or {term}:delete a term (tenant administrators)",
+        "tags": [
+          "sprig.v1.Ai"
+        ]
+      }
+    },
+    "/v1/ai/proposals/{id}": {
+      "post": {
+        "operationId": "Ai.ProposalAction",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AiProposalAction"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiProposalOutcome"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error"
+          }
+        },
+        "summary": "{id}:accept runs a proposal as the caller (an SQL statement in its database, after confirm: true for anything but a plain read; generated test rows likewise), files a recommendation as an ai_dba_advice approvals item, or accepts a glossary term; {id}:dismiss turns it down. The outcome is recorded as feedback",
         "tags": [
           "sprig.v1.Ai"
         ]

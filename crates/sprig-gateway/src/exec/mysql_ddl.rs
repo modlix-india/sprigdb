@@ -16,14 +16,21 @@
 //!   name, and a `DROP COLUMN`'s 1054 `in 'GENERATED ALWAYS AS'` is 3837
 //!   (a functional index uses the column) or 3108 (a generated column).
 //!   Dropping every visible column of a table with a functional index
-//!   (MariaDB's 1113) is 3837 when the index uses one of them.
+//!   (MariaDB's 1113) is 3837 when the index uses one of them. A `DROP
+//!   COLUMN`'s 1054 `in 'CHECK'` is 3959 naming the check, and `in
+//!   'DEFAULT'` is 3766 (another column's default expression uses it).
 //! - Before an `ALTER TABLE` that renames columns (`RENAME COLUMN`,
-//!   `CHANGE`): 3837 when a functional index uses one, 3108 when a generated
-//!   column does. MariaDB would rename it inside the expressions.
+//!   `CHANGE`): 3959 when a check constraint uses one, 3766 when another
+//!   column's default expression does, 3108 when a generated column does,
+//!   3837 when a functional index does ([`PassSession::column_uses`]).
+//!   MariaDB would rename it inside all of them.
 //! - After an `INSERT`, `REPLACE`, `UPDATE` or `LOAD DATA` failed with a
 //!   value that doesn't fit a hidden column ([`PassSession::fx_dml_error`]):
 //!   MariaDB's 1264 is 3752, its 1265, 1292, 1366 and 1406 are 3751, each
-//!   naming the index.
+//!   naming the index. So are its 1292 and 1264 from computing a hidden
+//!   column's expression (a cast to an integer, `DOUBLE` or `DECIMAL(m,d)`,
+//!   a date function of a string), when the table's columns show the key
+//!   part ([`PassSession::fx_eval_dml_error`]).
 //!
 //! The session's own `information_schema` never shows hidden columns, so
 //! the lookups that need them read MariaDB's `information_schema` on the
@@ -74,11 +81,11 @@ impl PassSession {
         if let Some(e) = mysqlddl::engine_descending(text, &lex) {
             return refused(e);
         }
-        // A renamed column that a functional index or a generated column
-        // uses.
+        // A renamed column that a check constraint, a default expression,
+        // a generated column or a functional index uses.
         if let Some((table, renamed)) = mysqlddl::renamed_columns(text, &lex)
-            && let Some(generated) = Box::pin(self.generated_columns(cx, &table)).await
-            && let Some(e) = mysqlddl::generated_dependency_of(&renamed, &generated)
+            && let Some((name, columns, checks)) = Box::pin(self.column_uses(cx, &table)).await
+            && let Some(e) = mysqlddl::rename_dependency(&renamed, &name, &columns, &checks)
         {
             return refused(e);
         }
@@ -219,8 +226,8 @@ impl PassSession {
     /// 3758 naming the index; 1054 `in 'GENERATED ALWAYS AS'` from a
     /// `DROP COLUMN` becomes 3108 when one of the table's own generated
     /// columns uses the column, else 3837 (only hidden columns are left,
-    /// and the session doesn't show them). `None` otherwise, or when the
-    /// lookup fails.
+    /// and the session doesn't show them); 1054 `in 'CHECK'` becomes 3959
+    /// and `in 'DEFAULT'` 3766. `None` otherwise, or when the lookup fails.
     async fn fx_ddl_error(
         &mut self,
         cx: &mut ExecCtx<'_>,
@@ -238,6 +245,18 @@ impl PassSession {
             let (table, _, dropped) = mysqlddl::dropped_columns(original, &lex)?;
             let generated = Box::pin(self.generated_columns(cx, &table)).await?;
             return mysqlddl::fx_drop_all(code, &dropped, &generated);
+        }
+        // A dropped column that a check of several columns or another
+        // column's default expression uses.
+        if let Some((column, check)) = mysqlddl::dropped_dependency_column(code, message) {
+            let (table, _, _) = mysqlddl::dropped_columns(original, &lex)?;
+            let (schema, name) = self.physical_written(&table)?;
+            let checks = if check {
+                Box::pin(self.table_checks(cx, &schema, &name)).await?
+            } else {
+                Vec::new()
+            };
+            return mysqlddl::drop_dependency(column, check, &name, &checks);
         }
         let column = mysqlddl::generated_dependency_column(code, message)?;
         let (table, _, _) = mysqlddl::dropped_columns(original, &lex)?;
@@ -268,14 +287,9 @@ impl PassSession {
         Some((ts.schema_of(Some(&db))?, table.to_owned()))
     }
 
-    /// The generated columns of `table` (as written, perhaps qualified),
-    /// hidden ones included: name and `GENERATION_EXPRESSION`, read on the
-    /// session's backend connection. `None` when they can't be read.
-    pub(super) async fn generated_columns(
-        &mut self,
-        cx: &mut ExecCtx<'_>,
-        table: &str,
-    ) -> Option<Vec<(String, String)>> {
+    /// The physical schema and name of `table` as written (perhaps
+    /// qualified, quoted).
+    fn physical_written(&self, table: &str) -> Option<(String, String)> {
         let (lex, _) = self.lex_opts();
         let names: Vec<String> = sprig_sql::lex::lex(table.as_bytes(), &lex)
             .ok()?
@@ -286,11 +300,100 @@ impl PassSession {
                     .into_owned()
             })
             .collect();
-        let (schema, name) = match names.as_slice() {
-            [t] => self.physical_table(None, t)?,
-            [d, t] => self.physical_table(Some(d), t)?,
-            _ => return None,
-        };
+        match names.as_slice() {
+            [t] => self.physical_table(None, t),
+            [d, t] => self.physical_table(Some(d), t),
+            _ => None,
+        }
+    }
+
+    /// What may use a column of `table` (as written): its name, its
+    /// columns with their generation expressions and defaults (hidden ones
+    /// included), and its table-level check constraints, read from
+    /// MariaDB's `information_schema` on the session's backend connection.
+    /// `None` when they can't be read.
+    pub(super) async fn column_uses(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        table: &str,
+    ) -> Option<(
+        String,
+        Vec<mysqlddl::TableColumn>,
+        Vec<mysqlddl::TableCheck>,
+    )> {
+        let (lex, _) = self.lex_opts();
+        let (schema, name) = self.physical_written(table)?;
+        let lit = |v: &str| sprig_sql::names::rewrite::sql_string(v, lex.no_backslash_escapes);
+        let rows = self
+            .backend_rows(
+                cx,
+                &format!(
+                    "SELECT COLUMN_NAME, GENERATION_EXPRESSION, COLUMN_DEFAULT \
+                     FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = {} AND TABLE_NAME = {} \
+                     ORDER BY ORDINAL_POSITION",
+                    lit(&schema),
+                    lit(&name)
+                ),
+            )
+            .await
+            .ok()?;
+        let columns = rows
+            .into_iter()
+            .filter_map(|r| {
+                Some(mysqlddl::TableColumn {
+                    name: r.first()?.clone()?,
+                    generation: r.get(1)?.clone(),
+                    default: r.get(2)?.clone(),
+                })
+            })
+            .collect();
+        let checks = self.table_checks(cx, &schema, &name).await?;
+        Some((name, columns, checks))
+    }
+
+    /// The table-level check constraints of physical `schema`.`name`.
+    async fn table_checks(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        schema: &str,
+        name: &str,
+    ) -> Option<Vec<mysqlddl::TableCheck>> {
+        let (lex, _) = self.lex_opts();
+        let lit = |v: &str| sprig_sql::names::rewrite::sql_string(v, lex.no_backslash_escapes);
+        let rows = self
+            .backend_rows(
+                cx,
+                &format!(
+                    "SELECT CONSTRAINT_NAME, CHECK_CLAUSE FROM information_schema.CHECK_CONSTRAINTS \
+                     WHERE CONSTRAINT_SCHEMA = {} AND TABLE_NAME = {} AND LEVEL = 'Table'",
+                    lit(schema),
+                    lit(name)
+                ),
+            )
+            .await
+            .ok()?;
+        Some(
+            rows.into_iter()
+                .filter_map(|r| {
+                    Some(mysqlddl::TableCheck {
+                        name: r.first()?.clone()?,
+                        clause: r.get(1)?.clone()?,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// The generated columns of `table` (as written, perhaps qualified),
+    /// hidden ones included: name and `GENERATION_EXPRESSION`, read on the
+    /// session's backend connection. `None` when they can't be read.
+    pub(super) async fn generated_columns(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        table: &str,
+    ) -> Option<Vec<(String, String)>> {
+        let (lex, _) = self.lex_opts();
+        let (schema, name) = self.physical_written(table)?;
         let lit = |v: &str| sprig_sql::names::rewrite::sql_string(v, lex.no_backslash_escapes);
         let q = format!(
             "SELECT COLUMN_NAME, GENERATION_EXPRESSION FROM information_schema.COLUMNS \
@@ -312,6 +415,10 @@ impl PassSession {
     /// naming the index, which the table's `STATISTICS` on the backend
     /// connection give. `e` itself for other errors, on the MariaDB persona,
     /// or when the lookup fails (the index is then `functional_index`).
+    /// An error raised while computing a hidden column's expression (a
+    /// failed cast or date conversion, which doesn't name the column) is
+    /// mapped the same way once the table's columns show which key part
+    /// raised it ([`Self::fx_eval_dml_error`]).
     pub(super) async fn fx_dml_error(
         &mut self,
         cx: &mut ExecCtx<'_>,
@@ -322,7 +429,7 @@ impl PassSession {
             return e;
         }
         let Some(v) = mysqlddl::fx_value_error(e.protocol().mysql_errno, &e.message) else {
-            return e;
+            return Box::pin(self.fx_eval_dml_error(cx, original, e)).await;
         };
         let (lex, _) = self.lex_opts();
         let index = match sprig_sql::compat::errmap::dml_target(original, &lex)
@@ -351,13 +458,93 @@ impl PassSession {
         };
         let m =
             mysqlddl::functional_index_value(index.as_deref().unwrap_or("functional_index"), &v);
-        let mut out = match e.kind {
-            sprig_common::ErrorKind::Backend { .. } => {
-                SprigError::backend(m.code, m.sqlstate, m.message)
-            }
-            _ => SprigError::standard(m.code, m.sqlstate, m.message),
-        };
-        out.retryable = e.retryable;
-        out
+        fx_wire_error(&e, m)
     }
+
+    /// [`Self::fx_dml_error`] for an error MariaDB raised while computing
+    /// an expression ([`mysqlddl::fx_eval_error`]): the table's columns and
+    /// key parts, read on the session's backend connection, name the
+    /// functional index whose expression raised it, and MySQL's 3751 or
+    /// 3752 names it. `e` itself when no key part's expression can raise
+    /// it, when one of the table's own generated columns or the statement
+    /// itself can, or when the lookup fails.
+    async fn fx_eval_dml_error(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        original: &[u8],
+        e: SprigError,
+    ) -> SprigError {
+        let Some(v) = mysqlddl::fx_eval_error(e.protocol().mysql_errno, &e.message) else {
+            return e;
+        };
+        if mysqlddl::statement_converts(original, &v.kind) {
+            return e;
+        }
+        let (lex, _) = self.lex_opts();
+        let Some((schema, name)) = sprig_sql::compat::errmap::dml_target(original, &lex)
+            .and_then(|(db, t)| self.physical_table(db.as_deref(), &t))
+        else {
+            return e;
+        };
+        let lit = |v: &str| sprig_sql::names::rewrite::sql_string(v, lex.no_backslash_escapes);
+        let (schema, name) = (lit(&schema), lit(&name));
+        let Ok(columns) = self
+            .backend_rows(
+                cx,
+                &format!(
+                    "SELECT COLUMN_NAME, DATA_TYPE, GENERATION_EXPRESSION \
+                     FROM information_schema.COLUMNS \
+                     WHERE TABLE_SCHEMA = {schema} AND TABLE_NAME = {name}"
+                ),
+            )
+            .await
+        else {
+            return e;
+        };
+        let columns: Vec<(String, String, Option<String>)> = columns
+            .into_iter()
+            .filter_map(|r| Some((r.first()?.clone()?, r.get(1)?.clone()?, r.get(2)?.clone())))
+            .collect();
+        let Ok(parts) = self
+            .backend_rows(
+                cx,
+                &format!(
+                    "SELECT INDEX_NAME, COLUMN_NAME FROM information_schema.STATISTICS \
+                     WHERE TABLE_SCHEMA = {schema} AND TABLE_NAME = {name}"
+                ),
+            )
+            .await
+        else {
+            return e;
+        };
+        let parts: Vec<(String, String)> = parts
+            .into_iter()
+            .filter_map(|r| Some((r.first()?.clone()?, r.get(1)?.clone()?)))
+            .filter(|(_, c)| sprig_sql::compat::fxindex::is_fx_column(c))
+            .collect();
+        let Some(column) = mysqlddl::fx_eval_part(&v, &columns, &parts) else {
+            return e;
+        };
+        let index =
+            mysqlddl::fx_index_name(&parts, &column).unwrap_or_else(|| "functional_index".into());
+        let value = mysqlddl::FxValueError {
+            column,
+            row: v.row,
+            out_of_range: v.kind == mysqlddl::FxEvalKind::DecimalRange,
+        };
+        fx_wire_error(&e, mysqlddl::functional_index_value(&index, &value))
+    }
+}
+
+/// `m` as an error of `e`'s kind (from the backend or the gateway), keeping
+/// whether `e` was retryable.
+fn fx_wire_error(e: &SprigError, m: WireError) -> SprigError {
+    let mut out = match e.kind {
+        sprig_common::ErrorKind::Backend { .. } => {
+            SprigError::backend(m.code, m.sqlstate, m.message)
+        }
+        _ => SprigError::standard(m.code, m.sqlstate, m.message),
+    };
+    out.retryable = e.retryable;
+    out
 }

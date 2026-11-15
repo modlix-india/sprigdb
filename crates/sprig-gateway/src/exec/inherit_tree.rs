@@ -400,6 +400,21 @@ pub(crate) async fn tree_ids(
 
 // ------------------------------------------------------------- adoption
 
+/// One adoption at a time for each child tenant in this gateway: `adopt`
+/// publishes a child's new table, its inheritance record and its types in
+/// separate catalog versions, and a statement that read the child's
+/// snapshot between them would plan the table as a plain one (1054 on an
+/// inherited type's parent columns). A statement that waited takes the
+/// newer snapshot the other adoption left.
+fn turn(tenant: TenantId) -> Arc<tokio::sync::Mutex<()>> {
+    static T: OnceLock<Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut m = T
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    Arc::clone(m.entry(tenant.0).or_default())
+}
+
 /// What this gateway last found up to date: tenant → (its version, its
 /// parent's version).
 fn synced() -> &'static Mutex<HashMap<u64, (u64, u64)>> {
@@ -758,8 +773,9 @@ async fn widenings(
 }
 
 /// Brings the session tenant (`cat`) and each tenant above it up to its
-/// parent, top first; the session tenant's fresh snapshot when anything
-/// changed.
+/// parent, top first, one adoption per child tenant at a time ([`turn`]);
+/// the session tenant's fresh snapshot when anything changed or a newer one
+/// than `cat` was found.
 ///
 /// # Errors
 /// The steps'.
@@ -785,6 +801,15 @@ pub(crate) async fn adopt(
     }
     let mut changed = false;
     for j in 1..line.len() {
+        // The child's turn ([`turn`]); the newest snapshot of it this
+        // gateway holds, which another adoption may have just written.
+        let turn = turn(line[j].tenant);
+        let _turn = turn.lock().await;
+        if let Some(c) = svc.cache.cached(line[j].tenant)
+            && c.version > line[j].version
+        {
+            line[j] = c;
+        }
         let child = Arc::clone(&line[j]);
         let key = (child.version, line[j - 1].version);
         let known = synced()
@@ -821,5 +846,6 @@ pub(crate) async fn adopt(
             .unwrap_or_else(PoisonError::into_inner)
             .insert(now.tenant.0, (now.version, line[j - 1].version));
     }
-    Ok(changed.then(|| Arc::clone(&line[line.len() - 1])))
+    let last = Arc::clone(&line[line.len() - 1]);
+    Ok((changed || last.version != cat.version).then_some(last))
 }

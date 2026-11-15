@@ -545,6 +545,11 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             sprig_approvals::Kind::AiHealthWarning,
             Arc::new(ai_incidents::Acknowledge),
         );
+        // A tenant assistant's advice: approving it acknowledges it too.
+        a.register(
+            sprig_approvals::Kind::AiDbaAdvice,
+            Arc::new(ai_incidents::Acknowledge),
+        );
         a
     };
     let _ = sharding.sharding().approvals.set(Arc::clone(&approvals));

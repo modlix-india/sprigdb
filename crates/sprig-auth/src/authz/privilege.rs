@@ -425,6 +425,26 @@ pub const fn all_at(level: Level, object: ObjectType) -> ActionSet {
     set.minus(ActionSet::of(&[Action::GrantOption]))
 }
 
+/// Whether a `REVOKE` of `revoked` from a database or object grant that
+/// holds `held` takes it below `ALL`, where `ALL` includes the extension
+/// `WATCH`. `WATCH` then goes with the revoked privileges: it was held only
+/// as part of `ALL`, and the grant reads back on both personas as MySQL and
+/// MariaDB print the rest. `WATCH` granted by name after the `REVOKE` stays.
+#[must_use]
+pub const fn revoke_ends_all(
+    held: ActionSet,
+    revoked: ActionSet,
+    level: Level,
+    object: ObjectType,
+) -> bool {
+    let all = all_at(level, object);
+    !matches!(level, Level::Tenant)
+        && all.has(Action::Watch)
+        && held.contains(all)
+        && !revoked.has(Action::Watch)
+        && !revoked.intersect(all).is_empty()
+}
+
 /// The actions a level accepts.
 #[must_use]
 pub const fn grantable_at(level: Level, object: ObjectType) -> ActionSet {
@@ -680,5 +700,29 @@ mod tests {
             ),
             ["SELECT", "INSERT"]
         );
+    }
+
+    #[test]
+    fn revoking_from_all_takes_watch_too() {
+        let db = all_at(Level::Database, ObjectType::Table).with(Action::GrantOption);
+        let si = ActionSet::of(&[Action::Select, Action::Insert]);
+        assert!(revoke_ends_all(db, si, Level::Database, ObjectType::Table));
+        // What remains reads back as MySQL prints it, without WATCH.
+        let left = db.minus(si.with(Action::Watch));
+        assert_eq!(
+            render_static(left, Level::Database, ObjectType::Table).last(),
+            Some(&"TRIGGER")
+        );
+        // Not ALL any more, GRANT OPTION only, or WATCH named: no change.
+        let partial = db.minus(ActionSet::of(&[Action::Delete]));
+        assert!(!revoke_ends_all(partial, si, Level::Database, ObjectType::Table));
+        let go = ActionSet::of(&[Action::GrantOption]);
+        assert!(!revoke_ends_all(db, go, Level::Database, ObjectType::Table));
+        let w = si.with(Action::Watch);
+        assert!(!revoke_ends_all(db, w, Level::Database, ObjectType::Table));
+        // Tables too; never the tenant level, which prints WATCH on its own line.
+        let t = all_at(Level::Object, ObjectType::Table);
+        assert!(revoke_ends_all(t, si, Level::Object, ObjectType::Table));
+        assert!(!revoke_ends_all(ALL_TENANT, si, Level::Tenant, ObjectType::Table));
     }
 }

@@ -1662,6 +1662,25 @@ async fn hard_time<T>(
 mod tests {
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_never_ends_stops_past_its_time_budget() {
+        // A wait that never ends (a connection that never comes) ends as
+        // the time budget's error, graph.max_time_ms plus the slack later.
+        let started = tokio::time::Instant::now();
+        let r: Result<()> = hard_time(
+            Duration::from_millis(250),
+            std::future::pending::<Result<()>>(),
+        )
+        .await;
+        let e = r.expect_err("stopped");
+        assert_eq!(e.code(), Some(SprigCode::GraphBudgetExceeded));
+        assert!(e.to_string().contains("graph.max_time_ms = 250"), "{e}");
+        assert_eq!(started.elapsed(), Duration::from_millis(250) + HARD_SLACK);
+        // One that ends in time keeps its own answer.
+        let r = hard_time(Duration::from_millis(250), async { Ok(7) }).await;
+        assert_eq!(r.ok(), Some(7));
+    }
+
     #[test]
     fn tx_timeouts_answer_neo4j_codes() {
         // The drivers' testkit: a lock wait cut by tx_timeout is

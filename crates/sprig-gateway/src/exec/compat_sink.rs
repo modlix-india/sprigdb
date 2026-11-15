@@ -7,9 +7,11 @@
 //! a single-table `INSERT`, `REPLACE`, `UPDATE` or `LOAD DATA`, and this
 //! sink adds it to any 1062 the statement's response carries. Everything
 //! else passes through, except an error naming a functional key part's
-//! hidden column (`_sprig_fx_..`, a value that doesn't fit it): the sink
-//! holds it back ([`DupKeySink::take_held`]) for the caller to answer
-//! MySQL's 3752 or 3751 naming the index (`exec::mysql_ddl`).
+//! hidden column (`_sprig_fx_..`, a value that doesn't fit it) or one a
+//! hidden column's expression may have raised (a failed cast or date
+//! conversion): the sink holds it back ([`DupKeySink::take_held`]) for the
+//! caller to answer MySQL's 3752 or 3751 naming the index, or to send it
+//! as it was (`exec::mysql_ddl`).
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -86,9 +88,10 @@ impl ResultSink for DupKeySink<'_> {
     }
 
     async fn error(&mut self, err: &SprigError) -> Result<()> {
+        let code = err.protocol().mysql_errno;
         if self.held.is_none()
-            && sprig_sql::compat::mysqlddl::fx_value_error(err.protocol().mysql_errno, &err.message)
-                .is_some()
+            && (sprig_sql::compat::mysqlddl::fx_value_error(code, &err.message).is_some()
+                || sprig_sql::compat::mysqlddl::fx_eval_error(code, &err.message).is_some())
         {
             self.held = Some(SprigError {
                 kind: err.kind,

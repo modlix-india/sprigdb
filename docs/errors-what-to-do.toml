@@ -1204,7 +1204,7 @@ meaning = "Logic code failed to parse or type-check at deploy; the message gives
 what_to_do = "Fix the code at the line and column named, and deploy again; `sprigctl logic compile` checks it without deploying."
 
 [ER_SPRIG_LOGIC_UNSUPPORTED]
-meaning = "The code can't run in any tier: for example procedural SQL that would span shards, or a dry run of something that isn't a function or procedure."
+meaning = "The code can't run in any tier: for example procedural SQL that would span shards, or a dry run of a stream or queue trigger or a schedule, which only a deploy places."
 what_to_do = "Rewrite the code so it touches one shard per call, or move it into a language the engine runs (JavaScript, Lua or KIRun)."
 
 [ER_SPRIG_LOGIC_VALIDATION_FAILED]

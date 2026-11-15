@@ -103,6 +103,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/ai/proposals/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** {id}:accept runs a proposal as the caller (an SQL statement in its database, after confirm: true for anything but a plain read; generated test rows likewise), files a recommendation as an ai_dba_advice approvals item, or accepts a glossary term; {id}:dismiss turns it down. The outcome is recorded as feedback */
+        post: operations["Ai.ProposalAction"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/api-keys": {
         parameters: {
             query?: never;
@@ -1602,6 +1619,31 @@ export interface components {
             tables?: string[];
             term: string;
         };
+        AiProposalAction: {
+            confirm?: boolean;
+            note?: string;
+        };
+        AiProposalOutcome: {
+            approvals?: {
+                [key: string]: unknown;
+            };
+            database?: string;
+            error?: {
+                [key: string]: unknown;
+            };
+            /** @enum {string} */
+            kind: "sql" | "recommendation" | "tile" | "glossary" | "generate_rows";
+            /** @enum {string} */
+            outcome: "accepted" | "failed" | "dismissed";
+            proposal: string;
+            ran?: {
+                results: {
+                    [key: string]: unknown;
+                }[];
+                sql: string;
+            }[];
+            term?: string;
+        };
         AiRecorded: {
             recorded: boolean;
         };
@@ -2216,6 +2258,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["JsonReply"];
+                };
+            };
+            /** @description An error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    "Ai.ProposalAction": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AiProposalAction"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AiProposalOutcome"];
                 };
             };
             /** @description An error */

@@ -17,6 +17,10 @@
 //! is still open first buffers that result, up to
 //! [`Config::max_buffered`] bytes (39918 past it), as the chapter says.
 //! `DISCARD`, `RESET` and `ROLLBACK` drop open streams.
+//!
+//! **Keep-alives.** While a request runs, the server sends a NOOP chunk
+//! every half `recv_timeout`, as Neo4j does, so drivers that time reads
+//! out after the hint wait for long statements ([`handle_alive`]).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
@@ -807,7 +811,7 @@ where
         loop {
             match dechunk.next(&mut inbuf) {
                 Ok(Some(msg)) => match Request::decode(&msg) {
-                    Ok(req) => conn.handle(req, svc, cfg).await,
+                    Ok(req) => handle_alive(io, conn, req, svc, cfg).await?,
                     Err(e) => {
                         conn.fail(&BoltFailure::invalid(e.to_string()));
                         conn.state = State::Defunct;
@@ -850,6 +854,59 @@ where
             Err(_) => return Ok(End::Timeout),
         }
     }
+}
+
+/// How often a running request sends a keep-alive: half the
+/// receive-timeout hint, as Neo4j does.
+fn keepalive_every(cfg: &Config) -> Duration {
+    (cfg.recv_timeout / 2).max(Duration::from_millis(500))
+}
+
+/// Handles `req`, sending a NOOP chunk (`00 00`, Bolt 4.1 on) every
+/// [`keepalive_every`] while it runs. Drivers time a read out after the
+/// `connection.recv_timeout_seconds` hint, and restart that timer on any
+/// bytes, so a statement that runs longer than the hint isn't cut off
+/// (a loader that gave up sent its committed batch again). NOOPs go
+/// between messages: answers to earlier pipelined requests, still in
+/// `conn.out`, are written before the first one, and the request's own
+/// answers after it ends.
+async fn handle_alive<S>(
+    io: &mut S,
+    conn: &mut Conn,
+    req: Request,
+    svc: &dyn BoltService,
+    cfg: &Config,
+) -> std::io::Result<()>
+where
+    S: AsyncWrite + Unpin + Send,
+{
+    let every = keepalive_every(cfg);
+    let mut earlier = std::mem::take(&mut conn.out);
+    {
+        let work = conn.handle(req, svc, cfg);
+        tokio::pin!(work);
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                () = &mut work => break,
+                _ = tick.tick() => {
+                    if !earlier.is_empty() {
+                        io.write_all(&earlier).await?;
+                        earlier.clear();
+                    }
+                    io.write_all(&[0, 0]).await?;
+                    io.flush().await?;
+                    metrics::counter!("sprig_bolt_keepalives_total").increment(1);
+                }
+            }
+        }
+    }
+    if !earlier.is_empty() {
+        earlier.extend_from_slice(&conn.out);
+        conn.out = earlier;
+    }
+    Ok(())
 }
 
 /// The completion status Neo4j puts first in a summary's `statuses` (Bolt

@@ -472,7 +472,7 @@ async fn deploy(
         .run(
             &mut conn,
             ep.store.schema(),
-            &sprig_catalog::migrate::MigrateOpts::default(),
+            &sprig_catalog::migrate::MigrateOpts::existing(),
         )
         .await?;
     if let Some(m) = store

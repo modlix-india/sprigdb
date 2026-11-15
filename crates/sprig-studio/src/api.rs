@@ -84,6 +84,11 @@ fn ai_paths() -> Value {
         "/v1/ai/glossary/{term}": {"post": with_params(op("Ai.GlossaryAction", "sprig.v1.Ai",
             "{term}:accept or :reject a proposed term, or {term}:delete a term (tenant administrators)",
             None, "JsonReply"), &[p("term")])},
+        "/v1/ai/proposals/{id}": {"post": with_params(op("Ai.ProposalAction", "sprig.v1.Ai",
+            "{id}:accept runs a proposal as the caller (an SQL statement in its database, after confirm: true \
+             for anything but a plain read; generated test rows likewise), files a recommendation as an \
+             ai_dba_advice approvals item, or accepts a glossary term; {id}:dismiss turns it down. The outcome \
+             is recorded as feedback", Some("AiProposalAction"), "AiProposalOutcome"), &[p("id")])},
         "/v1/mcp": mcp_path(),
     })
 }
@@ -474,6 +479,13 @@ fn ai_schemas() -> Value {
             "proposal_id": string, "outcome": {"type": "string", "enum": ["accepted", "dismissed", "failed"]},
             "note": string}), &[]),
         "AiRecorded": s(json!({"recorded": boolean}), &["recorded"]),
+        "AiProposalAction": s(json!({"confirm": boolean, "note": string}), &[]),
+        "AiProposalOutcome": s(json!({"proposal": string,
+            "kind": {"type": "string", "enum": ["sql", "recommendation", "tile", "glossary", "generate_rows"]},
+            "outcome": {"type": "string", "enum": ["accepted", "failed", "dismissed"]},
+            "database": string,
+            "ran": {"type": "array", "items": s(json!({"sql": string, "results": {"type": "array", "items": obj}}), &["sql", "results"])},
+            "error": obj, "approvals": obj, "term": string}), &["proposal", "kind", "outcome"]),
         "McpMessage": s(json!({"jsonrpc": {"type": "string", "enum": ["2.0"]},
             "id": {"oneOf": [{"type": "string"}, {"type": "integer"}]}, "method": string,
             "params": obj, "result": obj,

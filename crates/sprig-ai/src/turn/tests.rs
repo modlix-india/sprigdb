@@ -441,3 +441,74 @@ async fn a_stopped_turn_sends_nothing() {
         .unwrap();
     assert_eq!(out.stop, Stop::Other("stopped".into()));
 }
+
+#[tokio::test]
+async fn text_of_later_model_calls_starts_on_a_new_paragraph() {
+    let p = Arc::new(ScriptedProvider::new(
+        [
+            Reply::Tools(
+                "Let me look.".into(),
+                vec![call(
+                    "t1",
+                    "describe",
+                    json!({"db": "shop", "table": "orders"}),
+                )],
+            ),
+            Reply::Text("It has an id.".into()),
+        ],
+        usage(),
+    ));
+    let audit = Arc::new(MemoryAudit::default());
+    let host = Arc::new(Host::default());
+    let mut ev = Vec::new();
+    let r = agent(&p, &audit)
+        .run(
+            &cfg(Role::Dba),
+            req(Role::Dba, host, "What is in orders?"),
+            &mut ev,
+        )
+        .await
+        .unwrap();
+    let text: String = ev
+        .iter()
+        .filter_map(|e| match e {
+            TurnEvent::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "Let me look.\n\nIt has an id.");
+    // The stored answer is the model's own text, without the break.
+    assert_eq!(r.text(), "It has an id.");
+}
+
+#[tokio::test]
+async fn a_call_without_text_before_adds_no_break() {
+    let p = Arc::new(ScriptedProvider::new(
+        [
+            Reply::Tools(
+                String::new(),
+                vec![call(
+                    "t1",
+                    "describe",
+                    json!({"db": "shop", "table": "orders"}),
+                )],
+            ),
+            Reply::Text("It has an id.".into()),
+        ],
+        usage(),
+    ));
+    let audit = Arc::new(MemoryAudit::default());
+    let mut ev = Vec::new();
+    agent(&p, &audit)
+        .run(
+            &cfg(Role::Dba),
+            req(Role::Dba, Arc::new(Host::default()), "What is in orders?"),
+            &mut ev,
+        )
+        .await
+        .unwrap();
+    assert!(
+        ev.contains(&TurnEvent::Text("It has an id.".into())),
+        "{ev:?}"
+    );
+}

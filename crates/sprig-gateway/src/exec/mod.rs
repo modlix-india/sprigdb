@@ -102,6 +102,8 @@ mod lateral;
 mod fxindex;
 // MySQL's DDL answers that need a lookup.
 mod mysql_ddl;
+// Storage engines other than InnoDB.
+pub(crate) mod engine;
 // `SET GLOBAL` server-wide assignments as tenant defaults.
 mod set_global;
 // A `DEFINER` naming another account.

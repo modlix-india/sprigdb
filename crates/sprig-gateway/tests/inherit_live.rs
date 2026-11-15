@@ -4052,7 +4052,9 @@ async fn first_publish_with_the_catalog_pool_half_busy() {
     .await;
     ok(&mut sys, POOL_TRIGGER).await;
     let mut cb = conn(&e.addr, &busy).await;
-    ok(&mut cb, "CREATE DATABASE IF NOT EXISTS fpool_hold").await;
+    // Fresh, so the waiting CREATE TABLEs can't fail on an earlier run's.
+    ok(&mut cb, "DROP DATABASE IF EXISTS fpool_hold").await;
+    ok(&mut cb, "CREATE DATABASE fpool_hold").await;
 
     // Two busy catalog connections.
     let mut r = Conn::from_url(&root).await.unwrap();
@@ -4117,4 +4119,288 @@ async fn first_publish_with_the_catalog_pool_half_busy() {
     clean_db(&mut sys, "fpool").await;
     let _ = sql(&mut c0, "DROP DATABASE IF EXISTS fpool").await;
     ok(&mut c0, "DROP DATABASE fpool_app").await;
+}
+
+/// Catalog connections held busy on purpose: DDL sessions of member
+/// `busy` wait on its catalog version row, locked from a root session
+/// (`SPRIG_TEST_INHERIT_ROOT`), each holding one of its cluster's catalog
+/// connections until [`BusyCatalog::release`] (or their 10 s lock wait).
+/// With three of the four held, a statement that holds one catalog
+/// connection while it asks for another waits for a held one: it takes
+/// the rest of their lock wait, or fails with 39070 ("catalog begin timed
+/// out") after 5 s.
+struct BusyCatalog {
+    root: Conn,
+    held: Vec<tokio::task::JoinHandle<Option<(u16, String)>>>,
+    waiting: u64,
+}
+
+impl BusyCatalog {
+    /// Holds `n` connections; `db` is a scratch database of `busy`, made
+    /// again empty.
+    async fn hold(e: &Env, root: &str, busy: &str, busy_id: u64, n: usize, db: &str) -> Self {
+        let mut cb = conn(&e.addr, busy).await;
+        ok(&mut cb, &format!("DROP DATABASE IF EXISTS {db}")).await;
+        ok(&mut cb, &format!("CREATE DATABASE {db}")).await;
+        let _ = cb.disconnect().await;
+        let mut r = Conn::from_url(root).await.unwrap();
+        ok(&mut r, "START TRANSACTION").await;
+        ok(
+            &mut r,
+            &format!(
+                "SELECT value FROM t{busy_id}_sprig.settings WHERE scope_kind = 'tenant' AND \
+                 scope_id = 0 AND setting_key = 'sprig.catalog_version' FOR UPDATE"
+            ),
+        )
+        .await;
+        let mut held = Vec::new();
+        for i in 0..n {
+            let (addr, busy, db) = (e.addr.clone(), busy.to_owned(), db.to_owned());
+            held.push(tokio::spawn(async move {
+                let mut c = conn(&addr, &busy).await;
+                let r = sql(&mut c, &format!("CREATE TABLE {db}.h{i} (a INT)")).await;
+                let _ = c.disconnect().await;
+                r.err()
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let waiting = count(
+            &mut r,
+            "SELECT COUNT(*) FROM information_schema.processlist WHERE info LIKE \
+             '%setting_key%FOR UPDATE%' AND id <> CONNECTION_ID()",
+        )
+        .await;
+        Self {
+            root: r,
+            held,
+            waiting,
+        }
+    }
+
+    /// Lets the waiting sessions go; their outcomes.
+    async fn release(mut self) -> Vec<Option<(u16, String)>> {
+        ok(&mut self.root, "ROLLBACK").await;
+        let _ = self.root.disconnect().await;
+        let mut out = Vec::new();
+        for h in self.held {
+            out.push(h.await.unwrap());
+        }
+        out
+    }
+}
+
+/// Runs `q` on `c` while `n` catalog connections of `busy`'s cluster are
+/// held ([`BusyCatalog`]); the outcome (`None`: no answer in 20 s) and how
+/// long it took.
+async fn with_busy(
+    e: &Env,
+    root: &str,
+    (busy, busy_id): (&str, u64),
+    n: usize,
+    c: &mut Conn,
+    q: &str,
+) -> (
+    Option<Result<Vec<Vec<Option<String>>>, (u16, String)>>,
+    Duration,
+) {
+    let b = BusyCatalog::hold(e, root, busy, busy_id, n, "fone_hold").await;
+    let waiting = b.waiting;
+    let t0 = Instant::now();
+    let got = tokio::time::timeout(Duration::from_secs(20), sql(c, q))
+        .await
+        .ok();
+    let took = t0.elapsed();
+    let busy_ddl = b.release().await;
+    let short: String = q.split_whitespace().collect::<Vec<_>>().join(" ");
+    println!(
+        "{n} busy ({waiting} waiting): {:?} in {took:?}: {}; the busy sessions' DDL: {busy_ddl:?}",
+        got.as_ref().map(|r| r.as_ref().map(|_| "ok")),
+        &short[..short.len().min(90)]
+    );
+    assert!(
+        waiting >= n as u64,
+        "{n} DDL sessions should wait on the version row: {waiting}"
+    );
+    (got, took)
+}
+
+const ONE_TRIGGER: &str = r"
+CREATE TRIGGER fone.on_ev ON STREAM fone.ev
+  FOR EACH TENANT GRANTS (INSERT ON fone_app.seen)
+  LANGUAGE javascript AS $$
+export default function (ctx) {
+  db.exec('INSERT INTO fone_app.seen (k) VALUES (?)', [String(ctx.record.key)]);
+}
+$$";
+
+const ONE_FAN_IN: &str = r"
+CREATE TRIGGER fone_sys.fan ON STREAM fone.ev FAN IN
+  LANGUAGE javascript AS $$
+export default function (ctx) {
+  db.exec('INSERT INTO fone_sys.seen (tenant, k) VALUES (?, ?)',
+          [ctx.record.headers['x-sprig-tenant'] || '', String(ctx.record.key)]);
+}
+$$";
+
+/// The inherited paths that take catalog connections, each run while three
+/// of its cluster's four are held ([`BusyCatalog`]), so a step that held
+/// one catalog connection while it asked for another would wait for a held
+/// one (the rest of their 10 s lock wait, or 39070 after 5 s):
+///
+/// - a first `FOR TENANT` publish (the member's instance, its `RETENTION`
+///   setting, its trigger with `GRANTS`);
+/// - `CREATE TRIGGER ... FAN IN` over an existing instance (the chain and
+///   the attach of each instance);
+/// - a member's `ALTER INHERITED STREAM ... DETACH`;
+/// - a member's `DROP DATABASE` of a database holding an instance.
+///
+/// Each must answer within 5 s. Needs three members on one cluster,
+/// `SPRIG_TEST_INHERIT_ROOT` and `SPRIG_TEST_INHERIT_IDS`.
+#[tokio::test]
+async fn inherited_paths_with_one_catalog_connection_free() {
+    let Some(e) = env("inherited_paths_with_one_catalog_connection_free") else {
+        return;
+    };
+    let (Some(root), Some(busy_id)) = (
+        var("SPRIG_TEST_INHERIT_ROOT"),
+        e.members.get(2).and_then(|m| tenant_id_of(m)),
+    ) else {
+        eprintln!(
+            "needs SPRIG_TEST_INHERIT_ROOT, SPRIG_TEST_INHERIT_IDS and three members: skipped"
+        );
+        return;
+    };
+    let busy = (e.members[2].as_str(), busy_id);
+    let mut sys = conn(&e.addr, &e.system).await;
+    let _leftovers = Leftovers::dbs(&e, &["fone", "fone_sys"]);
+    let (m0, m1) = (e.members[0].clone(), e.members[1].clone());
+    let mut c0 = conn(&e.addr, &m0).await;
+    let mut c1 = conn(&e.addr, &m1).await;
+    let _ = sql(&mut sys, "DROP TRIGGER fone_sys.fan").await;
+    let _ = sql(&mut sys, "DROP TRIGGER fone.on_ev").await;
+    let _ = sql(&mut sys, "DROP STREAM fone.ev IMMEDIATE CASCADE").await;
+    clean_db(&mut sys, "fone").await;
+    clean_db(&mut sys, "fone_sys").await;
+    for c in [&mut c0, &mut c1] {
+        for q in [
+            "DROP DATABASE IF EXISTS fone",
+            "DROP DATABASE IF EXISTS fone_app",
+            "CREATE DATABASE fone_app",
+            "CREATE TABLE fone_app.seen (k VARCHAR(20) PRIMARY KEY)",
+        ] {
+            ok(c, q).await;
+        }
+    }
+    ok(&mut sys, "CREATE DATABASE fone").await;
+    ok(&mut sys, "CREATE DATABASE fone_sys").await;
+    ok(
+        &mut sys,
+        "CREATE TABLE fone_sys.seen (id BIGINT AUTO_INCREMENT PRIMARY KEY, tenant VARCHAR(64), \
+         k VARCHAR(20))",
+    )
+    .await;
+    ok(
+        &mut sys,
+        "CREATE STREAM fone.ev FOR EACH TENANT PARTITIONS 1 RETENTION '2 days'",
+    )
+    .await;
+    ok(&mut sys, ONE_TRIGGER).await;
+    let _ = sql(&mut sys, "GRANT SPRIG_FAN_IN ON *.* TO app").await;
+    let mut slow = Vec::new();
+    let mut check = |what: &str, got: &Option<Result<_, (u16, String)>>, took: Duration| match got {
+        Some(Ok(_)) if took < Duration::from_secs(5) => {}
+        other => slow.push(format!("{what}: {other:?} in {took:?}")),
+    };
+
+    // A first publish: m0's instance, its setting and its trigger.
+    let (got, took) = with_busy(
+        &e,
+        &root,
+        busy,
+        3,
+        &mut sys,
+        &format!("INSERT INTO fone.ev FOR TENANT {m0} (key, value) VALUES ('k1', 'v1')"),
+    )
+    .await;
+    check("first publish", &got, took);
+    assert_eq!(
+        wait_count(&mut c0, "SELECT COUNT(*) FROM fone_app.seen", 1, 60).await,
+        1,
+        "the member's trigger ran"
+    );
+    // m1's instance, with nothing held.
+    ok(
+        &mut sys,
+        &format!("INSERT INTO fone.ev FOR TENANT {m1} (key, value) VALUES ('k1', 'v1')"),
+    )
+    .await;
+    assert_eq!(
+        wait_count(&mut c1, "SELECT COUNT(*) FROM fone_app.seen", 1, 60).await,
+        1
+    );
+
+    // A fan-in trigger over the existing instances.
+    let (got, took) = with_busy(&e, &root, busy, 3, &mut sys, ONE_FAN_IN).await;
+    check("CREATE TRIGGER ... FAN IN", &got, took);
+    ok(
+        &mut sys,
+        &format!("INSERT INTO fone.ev FOR TENANT {m0} (key, value) VALUES ('k2', 'v2')"),
+    )
+    .await;
+    assert_eq!(
+        wait_count(
+            &mut sys,
+            &format!("SELECT COUNT(*) FROM fone_sys.seen WHERE tenant = '{m0}' AND k = 'k2'"),
+            1,
+            60
+        )
+        .await,
+        1,
+        "the fan-in trigger reads m0's instance"
+    );
+
+    // m0 detaches its instance.
+    let (got, took) = with_busy(
+        &e,
+        &root,
+        busy,
+        3,
+        &mut c0,
+        "ALTER INHERITED STREAM fone.ev DETACH",
+    )
+    .await;
+    check("ALTER INHERITED STREAM ... DETACH", &got, took);
+
+    // m1 drops the database holding its instance.
+    let (got, took) = with_busy(&e, &root, busy, 3, &mut c1, "DROP DATABASE fone").await;
+    check(
+        "a member's DROP DATABASE of an instance's database",
+        &got,
+        took,
+    );
+    // Its next use makes the instance again.
+    ok(
+        &mut sys,
+        &format!("INSERT INTO fone.ev FOR TENANT {m1} (key, value) VALUES ('k3', 'v3')"),
+    )
+    .await;
+    assert_eq!(
+        wait_count(&mut c1, "SELECT COUNT(*) FROM fone_app.seen", 2, 60).await,
+        2,
+        "m1's instance and trigger are back"
+    );
+
+    let mut cb = conn(&e.addr, busy.0).await;
+    let _ = sql(&mut cb, "DROP DATABASE IF EXISTS fone_hold").await;
+    ok(&mut sys, "DROP TRIGGER fone_sys.fan").await;
+    ok(&mut sys, "DROP TRIGGER fone.on_ev").await;
+    ok(&mut sys, "DROP STREAM fone.ev IMMEDIATE CASCADE").await;
+    ok(&mut sys, "REVOKE SPRIG_FAN_IN ON *.* FROM app").await;
+    clean_db(&mut sys, "fone").await;
+    clean_db(&mut sys, "fone_sys").await;
+    for c in [&mut c0, &mut c1] {
+        let _ = sql(c, "DROP DATABASE IF EXISTS fone").await;
+        let _ = sql(c, "DROP DATABASE IF EXISTS fone_app").await;
+    }
+    assert!(slow.is_empty(), "{slow:#?}");
 }

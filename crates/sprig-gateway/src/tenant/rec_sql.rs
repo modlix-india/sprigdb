@@ -207,6 +207,8 @@ pub async fn execute(
             let Ok(Some(rec)) = recs.get(&mut conn, *id).await else {
                 return Err(sprig_approvals::store::not_found(&id_of(*id)));
             };
+            // Not held across the controller's round trip.
+            drop(conn);
             let caller = caller_for(ts, cat, &*p, &rec);
             if !may_act(&rec, &caller, &[]) && rec.level <= Level::Tenant {
                 return Err(SprigError::new(

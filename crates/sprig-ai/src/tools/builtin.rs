@@ -14,6 +14,8 @@
 //! | `run_query` | data | read | rows |
 //! | `test_policy` | dba | read | stats |
 //! | `compile_logic` | dba | read | schema |
+//! | `sensitive_columns` | dba | read | stats (pattern counts only with sharing) |
+//! | `check_ddl`, `migration_check` | dba | read | schema |
 //! | `decision_log` | admin, dba | read | stats |
 //! | `metrics_trend` | admin | read | stats |
 //! | `propose_sql` | dba, data | propose | |
@@ -21,6 +23,7 @@
 //! | `propose_tile` | data, dba | propose | |
 //! | `propose_glossary` | data, dba | propose | |
 //! | `generate_rows` | dba | propose | |
+//! | `propose_policy`, `propose_logic` | dba | propose | |
 //!
 //! The triage role has no tools.
 
@@ -39,6 +42,9 @@ const ADMIN: &[Role] = &[Role::Admin];
 
 /// The longest SQL or source text a tool takes.
 pub const MAX_TEXT: usize = 64 * 1024;
+
+/// The longest schema `migration_check` takes in one call.
+pub const MAX_MIGRATION_TEXT: usize = 512 * 1024;
 
 /// The chart marks a tile may use.
 pub const MARKS: &[&str] = &[
@@ -211,7 +217,7 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "settings",
-            "SprigDB settings with their values, where each value comes from, and what they mean. Call it before suggesting a setting change.",
+            "SprigDB settings with their values, where each value comes from, and what they mean. With db (and table), the values as they resolve for that database (or table), and where each comes from. Call it before suggesting a setting change.",
             obj(
                 &[
                     (
@@ -225,6 +231,8 @@ pub fn specs() -> Vec<ToolSpec> {
                             "Resolve at this scope",
                         ),
                     ),
+                    ("db", s("Resolve for this database")),
+                    ("table", s("Resolve for this table of db")),
                 ],
                 &[],
             ),
@@ -297,12 +305,28 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "test_policy",
-            "Test the row-level security policies: which rows of a SELECT another user would see (counts, not values).",
+            "Test row-level security as another user: how many rows of a SELECT they would see (counts, not values), and the policies applied. With policy, it also tries a CREATE POLICY that doesn't exist yet, without creating it: how many of the rows the user sees now the new policy would admit, whether it applies to the user, and which attributes or claims it reads that the user lacks.",
             obj(
                 &[
                     ("db", db()),
                     ("sql", s("One SELECT")),
                     ("as_user", s("The user to test as")),
+                    (
+                        "policy",
+                        s("A CREATE POLICY statement to try without creating it"),
+                    ),
+                    (
+                        "attributes",
+                        s(
+                            "A JSON object standing in for the user's attributes (SPRIG_USER_ATTR) during the test",
+                        ),
+                    ),
+                    (
+                        "claims",
+                        s(
+                            "A JSON object standing in for the user's token claims (SPRIG_CLAIM) during the test",
+                        ),
+                    ),
                 ],
                 &["db", "sql", "as_user"],
             ),
@@ -312,10 +336,56 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "compile_logic",
-            "Compile KIRun logic without deploying it, returning its errors and warnings.",
+            "Compile logic without deploying it, returning its diagnostics: a CREATE FUNCTION, PROCEDURE, VALIDATION or TRIGGER ... AFTER COMMIT statement in KIRun or JavaScript (validations and after-commit triggers are checked against their table as a deploy would), or a KIRun JSON definition alone (checked as a function).",
             obj(
-                &[("db", db()), ("source", s("The logic's source"))],
+                &[
+                    ("db", db()),
+                    (
+                        "source",
+                        s("The CREATE statement, or a KIRun JSON definition"),
+                    ),
+                ],
                 &["db", "source"],
+            ),
+            Read,
+            DBA,
+            Shares::Schema,
+        ),
+        spec(
+            "check_ddl",
+            "Check schema statements (CREATE TABLE, ALTER TABLE, CREATE INDEX, CREATE VIEW, ...) against SprigDB without running them: each must parse with SprigDB's parser and pass its rules (reserved and long names, storage engines, definers, FULLTEXT, distribution). Call it on every schema change before you propose it, fix what it reports, and propose only statements it passes.",
+            obj(
+                &[
+                    ("db", db()),
+                    ("sql", s("One or more statements, separated by semicolons")),
+                ],
+                &["sql"],
+            ),
+            Read,
+            DBA,
+            Shares::Schema,
+        ),
+        spec(
+            "migration_check",
+            "Check a schema coming from MySQL, MariaDB or MongoDB against SprigDB, deterministically: what won't work and why, what SprigDB changes on the way in, suggested table groups and distribution keys (as SPRIG PIN statements), and an import plan. Pass the whole schema the user gave you in schema, unchanged. Explain the report; don't change its findings.",
+            obj(
+                &[
+                    (
+                        "source",
+                        one_of(
+                            &["mysql", "mariadb", "mongodb"],
+                            "Where the schema comes from",
+                        ),
+                    ),
+                    ("db", s("The SprigDB database it will go into")),
+                    (
+                        "schema",
+                        s(
+                            "The schema, as text: for mysql and mariadb the dump's DDL statements (mysqldump --no-data); for mongodb a JSON array of {name, options, indexes}, as db.getCollectionInfos() and getIndexes() print them",
+                        ),
+                    ),
+                ],
+                &["source", "schema"],
             ),
             Read,
             DBA,
@@ -423,15 +493,77 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "generate_rows",
-            "Propose test rows for a table, generated from its schema by SprigDB when the user accepts (1 to 100000 rows).",
+            "Propose test rows for a table (1 to 10000). SprigDB generates them itself from the table's schema: types, NOT NULL, unique keys, foreign keys (existing parent keys), enums and simple CHECK constraints, plus your column hints. You never see the rows; you get a summary, and the user gets an INSERT batch to review and run.",
             obj(
                 &[
                     ("db", db()),
                     ("table", s("The table")),
-                    ("n", int("Rows, 1 to 100000")),
-                    ("rules", s("Rules for the values, in words")),
+                    ("n", int("Rows, 1 to 10000")),
+                    (
+                        "rules",
+                        s("Rules for the values, in words, for the user; empty when none"),
+                    ),
+                    (
+                        "columns",
+                        strs(
+                            "Hints, one per column: \"<column>: <kind>\" then any of \", values=a|b|c\", \", min=..\", \", max=..\", \", domain=..\", \", nulls=NN\" (percent). Examples: \"status: one_of, values=paid|paid|paid|new\", \"total: decimal, min=5, max=500\", \"email: email, domain=test.example\". kind is one_of, sequence, email, phone, first_name, last_name, full_name, company, street_address, city, postcode, country_code, currency, url, ip_address, uuid, word, sentence, integer, decimal, date, datetime, boolean or null; min and max are numbers or YYYY-MM-DD. Columns without a hint are generated from their name and type; an empty list when none",
+                        ),
+                    ),
                 ],
-                &["db", "table", "n"],
+                &["db", "table", "n", "rules", "columns"],
+            ),
+            Propose,
+            DBA,
+            Shares::Schema,
+        ),
+        spec(
+            "sensitive_columns",
+            "Find columns that look like personal or sensitive data in a database (or one table): emails, phone numbers, birth dates, national ids, card and bank numbers, addresses, names, IP addresses, locations, secrets, special categories and free text. Each finding has a category, a confidence and the reasons (name, type, comment, constraint). With data sharing on, sampled values are also matched against patterns, and only the counts come back. It also says which tables have row-level security on. Call it before suggesting policies, grants or residency.",
+            obj(
+                &[
+                    ("db", db()),
+                    (
+                        "table",
+                        s("Only this table; the whole database when absent"),
+                    ),
+                ],
+                &["db"],
+            ),
+            Read,
+            DBA,
+            Shares::Stats,
+        ),
+        spec(
+            "propose_policy",
+            "Propose row-level security for the user to review and run: CREATE POLICY statements, with ALTER TABLE ... ENABLE ROW LEVEL SECURITY where it is off. Before it is shown, SprigDB checks every policy and tries it as each test user without creating it; the proposal carries those counts, and a policy that fails the check comes back to you to fix. Try policies with test_policy first.",
+            obj(
+                &[
+                    ("db", db()),
+                    ("sql", s("The statements, separated by semicolons")),
+                    ("why", s("Why, in a sentence or two")),
+                    (
+                        "test_as",
+                        strs(
+                            "Users to try the policies as: at least one who should see rows and one who shouldn't",
+                        ),
+                    ),
+                ],
+                &["db", "sql", "why", "test_as"],
+            ),
+            Propose,
+            DBA,
+            Shares::Schema,
+        ),
+        spec(
+            "propose_logic",
+            "Propose logic for the user to review and run: one CREATE [OR REPLACE] FUNCTION, PROCEDURE, VALIDATION or TRIGGER statement in KIRun or JavaScript. Before it is shown, SprigDB compiles it without deploying it; compile errors come back to you to fix and propose again. Check drafts with compile_logic.",
+            obj(
+                &[
+                    ("db", db()),
+                    ("sql", s("The CREATE statement")),
+                    ("why", s("What it does, in a sentence or two")),
+                ],
+                &["db", "sql", "why"],
             ),
             Propose,
             DBA,
@@ -444,7 +576,9 @@ pub fn specs() -> Vec<ToolSpec> {
 #[must_use]
 pub fn proposal_kind(name: &str) -> Option<ProposalKind> {
     Some(match name {
-        "propose_sql" => ProposalKind::Sql,
+        // Policies and logic are statements the user runs as any other SQL
+        // proposal; only the checks before they are shown differ.
+        "propose_sql" | "propose_policy" | "propose_logic" => ProposalKind::Sql,
         "propose_recommendation" => ProposalKind::Recommendation,
         "propose_tile" => ProposalKind::Tile,
         "propose_glossary" => ProposalKind::Glossary,
@@ -465,6 +599,7 @@ fn range(input: &Value, k: &str, lo: i64, hi: i64) -> Result<(), String> {
 ///
 /// # Errors
 /// What is wrong, for the model.
+#[allow(clippy::too_many_lines)] // one arm per tool
 pub fn check_input(name: &str, input: &Value) -> Result<(), String> {
     let text = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or_default();
     for k in ["sql", "source", "body", "definition", "rules", "chart"] {
@@ -473,10 +608,73 @@ pub fn check_input(name: &str, input: &Value) -> Result<(), String> {
         }
     }
     match name {
+        "migration_check" => {
+            let schema = text("schema");
+            if schema.len() > MAX_MIGRATION_TEXT {
+                return Err(format!(
+                    "schema is longer than {MAX_MIGRATION_TEXT} bytes; check it in parts"
+                ));
+            }
+            if schema.trim().is_empty() {
+                return Err("schema is empty: pass the schema the user gave you".to_owned());
+            }
+            if text("source") == "mongodb" {
+                match serde_json::from_str::<Value>(schema) {
+                    Ok(v) if v.is_array() => Ok(()),
+                    Ok(_) => Err("for mongodb, schema is a JSON array of collections".to_owned()),
+                    Err(e) => Err(format!("for mongodb, schema isn't JSON: {e}")),
+                }
+            } else {
+                Ok(())
+            }
+        }
         "workload" => range(input, "hours", 1, 168),
         "metrics_trend" => range(input, "days", 1, 30),
         "decision_log" => range(input, "days", 1, 90),
-        "generate_rows" => range(input, "n", 1, 100_000),
+        "generate_rows" => {
+            range(
+                input,
+                "n",
+                1,
+                i64::try_from(super::testdata::MAX_ROWS).unwrap_or(i64::MAX),
+            )?;
+            super::testdata::check_hints(input.get("columns"))
+        }
+        "test_policy" if !text("policy").trim().is_empty() => {
+            sql_guard::read_only(text("sql"))?;
+            if text("policy").len() > MAX_TEXT {
+                return Err(format!("policy is longer than {MAX_TEXT} bytes"));
+            }
+            if !text("policy")
+                .trim_start()
+                .to_ascii_uppercase()
+                .starts_with("CREATE POLICY")
+            {
+                return Err("policy is one CREATE POLICY statement".to_owned());
+            }
+            for k in ["attributes", "claims"] {
+                if !text(k).trim().is_empty() {
+                    match serde_json::from_str::<Value>(text(k)) {
+                        Ok(Value::Object(_)) => {}
+                        _ => return Err(format!("{k} is a JSON object")),
+                    }
+                }
+            }
+            Ok(())
+        }
+        "propose_policy" => {
+            let n = input
+                .get("test_as")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            if !(1..=5).contains(&n) {
+                return Err("test_as names 1 to 5 users".to_owned());
+            }
+            if !text("sql").to_ascii_uppercase().contains("CREATE POLICY") {
+                return Err("propose_policy needs at least one CREATE POLICY".to_owned());
+            }
+            Ok(())
+        }
         "run_query" => {
             range(input, "limit", 1, 1000)?;
             sql_guard::read_only(text("sql"))

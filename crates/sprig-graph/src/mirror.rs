@@ -281,6 +281,27 @@ pub async fn clear_pos<Q: Queryable + Send>(q: &mut Q, catalog: &str, graph: u64
     .map_err(backend_error)
 }
 
+/// Deletes the position rows of graphs the catalog no longer has: a graph
+/// dropped while an applier still served it, whose next position write
+/// put the rows back after `DROP GRAPH` deleted them. The number deleted.
+///
+/// # Errors
+/// A backend error (1146 before the catalog's migration 3).
+pub async fn clear_orphan_pos(q: &mut Conn, catalog: &str) -> Result<u64> {
+    let c = quote(catalog);
+    let sql = format!(
+        "{NO_BINLOG}DELETE FROM {c}.{POS_TABLE} \
+         WHERE graph_id NOT IN (SELECT graph_id FROM {c}.graphs)"
+    );
+    if q.query_drop(sql.as_str()).await.is_err() {
+        // Without `BINLOG ADMIN` (or `SUPER`): logged, as the writes.
+        q.query_drop(sql.replacen(NO_BINLOG, "", 1))
+            .await
+            .map_err(backend_error)?;
+    }
+    Ok(q.affected_rows())
+}
+
 /// One edge row change seen in a shard's binlog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EdgeChange {

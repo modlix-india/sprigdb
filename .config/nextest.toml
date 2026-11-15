@@ -182,14 +182,9 @@ binary_id(sprig-gateway::rls_live)
 '''
 test-group = 'serial-gateway-rls'
 
-# typed_tables_in_groups: a subtype a declares late can show at b for a
-# moment without its parent's columns (1054), which names_become doesn't
-# wait out (15 Nov, once in two runs). One retry, reported as flaky, until
-# the inheritance code or the test settles it.
 [[profile.default.overrides]]
 filter = 'binary_id(sprig-inherit::groups_live)'
 test-group = 'serial-inherit-tree'
-retries = 1
 
 [[profile.default.overrides]]
 filter = 'binary_id(sprig-inherit::hier_live)'

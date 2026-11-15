@@ -26,7 +26,7 @@ use sprig_proto_mysql::Persona;
 use super::privilege::{ALL_TENANT, Action, ActionSet, Level, ObjectType, render_static};
 use super::state::AuthzState;
 use super::stmt::AccountRef;
-use super::store::{Grantee, PrivTarget};
+use super::store::{EdgeRow, Grantee, PrivTarget};
 
 fn q(s: &str) -> String {
     format!("`{}`", s.replace('`', "``"))
@@ -97,7 +97,22 @@ pub fn render(
     extra: &[RoleId],
     persona: Persona,
 ) -> Vec<String> {
-    let mut out = render_one(state, cat, grantee, acc, extra, persona);
+    render_for_session(state, cat, grantee, acc, extra, &[], persona)
+}
+
+/// [`render`], with `session_roles` (a session's token roles, granted for
+/// its life) listed among the roles granted to `acc`.
+#[must_use]
+pub fn render_for_session(
+    state: &AuthzState,
+    cat: &TenantCatalog,
+    grantee: Grantee,
+    acc: &AccountRef,
+    extra: &[RoleId],
+    session_roles: &[RoleId],
+    persona: Persona,
+) -> Vec<String> {
+    let mut out = render_one(state, cat, grantee, acc, extra, session_roles, persona);
     if persona == Persona::MariaDb
         && let Grantee::Role(top) = grantee
     {
@@ -118,7 +133,15 @@ pub fn render(
                     name: row.name.clone(),
                     host: row.host.clone(),
                 };
-                out.extend(render_one(state, cat, Grantee::Role(r), &a, &[], persona));
+                out.extend(render_one(
+                    state,
+                    cat,
+                    Grantee::Role(r),
+                    &a,
+                    &[],
+                    &[],
+                    persona,
+                ));
             }
             stack.extend(
                 state
@@ -140,6 +163,7 @@ fn render_one(
     grantee: Grantee,
     acc: &AccountRef,
     extra: &[RoleId],
+    session_roles: &[RoleId],
     persona: Persona,
 ) -> Vec<String> {
     let is_role = matches!(grantee, Grantee::Role(_));
@@ -372,8 +396,18 @@ fn render_one(
             q(name)
         ));
     }
-    // Roles.
-    let edges = state.edges_of(grantee);
+    // Roles: the stored grants, then the session's own.
+    let mut edges = state.edges_of(grantee).to_vec();
+    for &r in session_roles {
+        if !edges.iter().any(|e| e.role == r) {
+            edges.push(EdgeRow {
+                grantee,
+                role: r,
+                admin_option: false,
+                is_default: false,
+            });
+        }
+    }
     let role_acc = |r: RoleId| {
         state.role(r).map(|row| AccountRef {
             name: row.name.clone(),
@@ -408,7 +442,7 @@ fn render_one(
         {
             // MariaDB prints role grants before the privileges.
             let mut roles = Vec::new();
-            for e in edges {
+            for e in &edges {
                 if let Some(a) = role_acc(e.role) {
                     let opt = if e.admin_option {
                         " WITH ADMIN OPTION"

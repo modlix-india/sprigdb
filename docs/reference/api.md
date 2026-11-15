@@ -9,7 +9,7 @@ source: the gateway's OpenAPI document (/v1/openapi.json)
 
 The gateway's REST API, as `/v1/openapi.json` describes it on every gateway. Requests authenticate with `Authorization: Bearer <token or API key>` (or HTTP Basic where allowed) and act with the caller's own rights. Statements stream as NDJSON from `POST /v1/databases/{database}/sql:query`. The same services are available over gRPC.
 
-99 operations in 27 services.
+100 operations in 27 services.
 
 ## sprig.admin.v1.Recommendations
 
@@ -34,6 +34,7 @@ The gateway's REST API, as `/v1/openapi.json` describes it on every gateway. Req
 | GET | `/v1/ai/glossary` | `Ai.ListGlossary` | The tenant glossary (status accepted, proposed or all) |
 | POST | `/v1/ai/glossary` | `Ai.PutGlossaryTerm` | Adds or replaces an accepted term (tenant administrators) |
 | POST | `/v1/ai/glossary/{term}` | `Ai.GlossaryAction` | {term}:accept or :reject a proposed term, or {term}:delete a term (tenant administrators) |
+| POST | `/v1/ai/proposals/{id}` | `Ai.ProposalAction` | {id}:accept runs a proposal as the caller (an SQL statement in its database, after confirm: true for anything but a plain read; generated test rows likewise), files a recommendation as an ai_dba_advice approvals item, or accepts a glossary term; {id}:dismiss turns it down. The outcome is recorded as feedback |
 | DELETE | `/v1/mcp` | `Ai.McpEndSession` | Ends an MCP session (Mcp-Session-Id) |
 | POST | `/v1/mcp` | `Ai.Mcp` | The MCP server (protocol revisions 2026-07-28, stateless, and 2025-03-26 to 2025-11-25, with sessions): one JSON-RPC request or notification (initialize, server/discover, tools/list, tools/call, ping). Tools run as the caller; proposals are returned, never run. Needs ai.enabled and ai.mcp.enabled (39991). Notifications are answered 202 with no body |
 

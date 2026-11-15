@@ -9,6 +9,7 @@
 //! | `GET /v1/ai/glossary?status=` | The tenant glossary (`accepted`, `proposed` or `all`) |
 //! | `POST /v1/ai/glossary` | Adds or replaces an accepted term `{term, definition, sql?, tables?}` (tenant administrators) |
 //! | `POST /v1/ai/glossary/{term}:accept`, `:reject`, `:delete` | Decides a proposal, or deletes a term (tenant administrators) |
+//! | `POST /v1/ai/proposals/{id}:accept`, `:dismiss` | Acts on a proposal `{confirm?, note?}`: runs a statement as the caller, files advice, accepts a term ([`proposals`]) |
 //! | `POST`, `DELETE /v1/mcp` | The MCP server: the tenant assistants' tools for outside agents ([`mcp`]) |
 //!
 //! **Who.** Every route runs as the signed-in caller (a Studio session,
@@ -40,6 +41,8 @@ pub mod ask;
 pub mod chat;
 pub mod host;
 pub mod mcp;
+pub mod proposals;
+pub mod schema_check;
 pub mod system;
 
 #[cfg(test)]
@@ -270,6 +273,19 @@ pub(super) async fn route(
                 return Err(invalid("POST /v1/ai/glossary/{term}:accept|reject|delete"));
             };
             glossary_verb(core, &caller, term, verb).await
+        }
+        ("POST", r) if r.starts_with("proposals/") => {
+            let seg = r.trim_start_matches("proposals/");
+            let Some((id, verb)) = seg.rsplit_once(':') else {
+                return Err(invalid("POST /v1/ai/proposals/{id}:accept|dismiss"));
+            };
+            let raw = read_body(req).await?;
+            let b = if raw.iter().all(u8::is_ascii_whitespace) {
+                json!({})
+            } else {
+                parse_json(&raw)?
+            };
+            proposals::route(core, &caller, id, verb, &b).await
         }
         _ => Err(invalid(format!("no route {method} {path}"))),
     }

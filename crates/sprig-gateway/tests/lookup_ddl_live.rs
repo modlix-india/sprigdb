@@ -61,6 +61,11 @@
 //! 7. `lookup.lock_wait_seconds` at a table's scope applies to that table's
 //!    claims only; the controller's scheduled orphan scan
 //!    (`lookup.orphan_scan_hours`) removes planted orphans once due.
+//!
+//! `advisor_multi_column_live` needs a fresh tenant as well: point reads by
+//! both columns of a two-column unique key, scattering over 4 shards, make
+//! the advisor raise an `advisor.lookup` item for that key; approved, the
+//! lookup is built on both columns and the reads go to 1 shard.
 
 #![allow(
     clippy::unwrap_used,
@@ -1797,4 +1802,265 @@ async fn lock_wait_and_orphan_scan(e: &Env, ctl_metrics: Option<&str>) {
         "[{:?}] 7. per-table lock wait and the scheduled orphan scan",
         t0.elapsed()
     );
+}
+
+// ---- the advisor's multi-column proposal --------------------------------
+
+const DB4: &str = "lkmc_db";
+
+/// `SHOW SPRIG RECOMMENDATIONS`' `advisor.lookup` items on table `orders`:
+/// id, state, summary, action.
+async fn order_items(c: &mut Conn) -> Vec<(u64, String, String, String)> {
+    let recs: Vec<Row> = c.query("SHOW SPRIG RECOMMENDATIONS").await.unwrap();
+    recs.iter()
+        .filter(|r| {
+            r.get::<String, _>(1).as_deref() == Some("advisor.lookup")
+                && r.get::<String, _>(4)
+                    .is_some_and(|o| o.ends_with(".orders"))
+        })
+        .map(|r| {
+            let id: String = r.get(0).unwrap();
+            (
+                id.parse().unwrap(),
+                r.get(3).unwrap(),
+                r.get(5).unwrap(),
+                r.get(6).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// The advisor proposes a lookup on a unique key of two columns when point
+/// reads bind both (in either order) and go to every shard, through the
+/// approvals inbox; once approved it is built, and the reads go to one
+/// shard. Reads binding only one of the two columns propose nothing (no
+/// unique key is on it alone). Needs a fresh tenant (the advisor designs
+/// only a tenant's first groups), as `lookup_ddl_live` does:
+///
+/// ```sh
+/// export SPRIG_TEST_LKD_TENANT=<fresh tenant> SPRIG_TEST_LKD_TENANT_ID=<its id>
+/// cargo test -p sprig-gateway --test lookup_ddl_live advisor_multi_column_live -- --nocapture
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn advisor_multi_column_live() {
+    let Some(e) = Env::load() else {
+        eprintln!("skipped: set the SPRIG_TEST_LKD_* variables (module docs)");
+        return;
+    };
+    let t0 = Instant::now();
+    let scope = format!("tenant:{}", e.tenant);
+    for (k, v) in [
+        ("advisor.mode", "approve"),
+        ("advisor.lookup_eval_minutes", "1"),
+        ("advisor.lookup_min_runs", "20"),
+    ] {
+        e.sprigctl(&[
+            "settings",
+            "set",
+            k,
+            v,
+            "--scope",
+            &scope,
+            "--reason",
+            "advisor_multi_column_live",
+        ]);
+    }
+    let mut c = login(&e.gateway, &e.tenant, "app", "sprig-dev-app", None)
+        .await
+        .unwrap();
+    c.query_drop(format!("DROP DATABASE IF EXISTS {DB4}"))
+        .await
+        .unwrap();
+    c.query_drop(format!("CREATE DATABASE {DB4}"))
+        .await
+        .unwrap();
+    c.query_drop(format!("USE {DB4}")).await.unwrap();
+    // (region, code) unique; each code in 5 regions.
+    c.query_drop(
+        "CREATE TABLE orders (id BIGINT PRIMARY KEY, region VARCHAR(8), code INT, \
+         note VARCHAR(20), UNIQUE KEY uk_region_code (region, code))",
+    )
+    .await
+    .unwrap();
+    let rows: Vec<String> = (1..=2000)
+        .map(|i| format!("({i}, 'r{}', {}, 'n{i}')", i % 5, i / 5))
+        .collect();
+    c.query_drop(format!("INSERT INTO orders VALUES {}", rows.join(", ")))
+        .await
+        .unwrap();
+    c.query_drop("SPRIG PIN orders SHARD KEY (id)")
+        .await
+        .unwrap();
+    e.sprigctl(&["advisor", "run", &e.tenant, "-o", "json", "--yes"]);
+    let mut cat = e.root(0).await;
+    let run: Option<u64> = cat
+        .query_first(format!(
+            "SELECT MAX(run_id) FROM t{}_sprig.advisor_runs",
+            e.tenant_id
+        ))
+        .await
+        .unwrap();
+    e.sprigctl(&[
+        "advisor",
+        "apply",
+        &e.tenant,
+        &run.unwrap().to_string(),
+        "-o",
+        "json",
+        "--yes",
+    ]);
+    let started = Instant::now();
+    let group: u32 = loop {
+        let g: Option<u32> = cat
+            .query_first(format!(
+                "SELECT m.group_id FROM t{0}_sprig.group_members m JOIN t{0}_sprig.objects o \
+                 ON o.object_id = m.object_id WHERE o.name = 'orders' AND o.state = 'active'",
+                e.tenant_id
+            ))
+            .await
+            .unwrap();
+        if let Some(g) = g {
+            break g;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(300),
+            "never grouped"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+    cat.disconnect().await.unwrap();
+    let first = shard_count(&e, group, 1).await;
+    if first.len() < 4 {
+        e.sprigctl(&[
+            "shard",
+            "split",
+            &e.tenant,
+            &group.to_string(),
+            &first[0].to_string(),
+            "--ways",
+            "4",
+            "--yes",
+        ]);
+    }
+    shard_count(&e, group, 4).await;
+    let point = |i: i64| {
+        format!(
+            "SELECT id FROM orders WHERE region = 'r{}' AND code = {}",
+            i % 5,
+            i / 5
+        )
+    };
+    let started = Instant::now();
+    let before = loop {
+        let f = fanout_of(&e, &mut c, &point(7), 5).await;
+        if f >= 3.99 {
+            break f;
+        }
+        assert!(started.elapsed() < Duration::from_secs(120), "fan-out {f}");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+    println!(
+        "[{:?}] group {group} in 4 shards; a read by (region, code) visits {before:.2} shards",
+        t0.elapsed()
+    );
+    // Point reads by both columns, written both ways round, and reads by
+    // region alone (no unique key on it).
+    for i in 10..70_i64 {
+        let r: Vec<Row> = c.query(point(i)).await.unwrap();
+        assert_eq!(r.len(), 1, "{}", point(i));
+        let r: Vec<Row> = c
+            .query(format!(
+                "SELECT id FROM orders WHERE code = {} AND region = 'r{}'",
+                i / 5,
+                i % 5
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.len(), 1);
+        let _: Vec<Row> = c
+            .query(format!(
+                "SELECT id FROM orders WHERE region = 'r{}' LIMIT 1",
+                i % 5
+            ))
+            .await
+            .unwrap();
+    }
+    assert!(order_items(&mut c).await.is_empty());
+    // The proposal, held for an approval (advisor.mode = approve).
+    let started = Instant::now();
+    let (id, state, summary, action) = loop {
+        let items = order_items(&mut c).await;
+        if let Some(i) = items.into_iter().next() {
+            break i;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(420),
+            "no advisor.lookup item for orders"
+        );
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    };
+    println!(
+        "[{:?}] item {id} ({state}): {summary} / {action}",
+        t0.elapsed()
+    );
+    assert_eq!(state, "open");
+    assert!(
+        summary.contains("lkmc_db.orders (region, code, unique key uk_region_code)"),
+        "{summary}"
+    );
+    assert_eq!(
+        action,
+        "SPRIG REBUILD LOOKUP INDEX `uk_region_code` ON `lkmc_db`.`orders`"
+    );
+    let shown: Vec<Row> = c
+        .query("SPRIG SHOW LOOKUP INDEXES FROM orders")
+        .await
+        .unwrap();
+    assert!(shown.is_empty(), "built before its approval");
+    c.query_drop(format!("SPRIG APPROVE RECOMMENDATION {id}"))
+        .await
+        .unwrap();
+    wait_state(&mut c, "orders", Some("public"), 300).await;
+    let shown: Vec<Row> = c
+        .query("SPRIG SHOW LOOKUP INDEXES FROM orders")
+        .await
+        .unwrap();
+    let described: Vec<(String, String)> = shown
+        .iter()
+        .map(|r| (r.get(2).unwrap(), r.get(3).unwrap()))
+        .collect();
+    println!("[{:?}] approved; built: {described:?}", t0.elapsed());
+    assert!(
+        described.iter().all(|(k, _)| k == "uk_region_code"),
+        "{described:?}"
+    );
+    let cols: Vec<&str> = described.iter().map(|(_, c)| c.as_str()).collect();
+    assert!(
+        cols == ["region", "code"] || cols == ["region, code"] || cols == ["region,code"],
+        "{cols:?}"
+    );
+    let after = fanout_of(&e, &mut c, &point(7), 20).await;
+    println!("a read by (region, code) now visits {after:.2} shards (was {before:.2})");
+    assert!(after <= 1.01, "{after}");
+    // The item is done (applied items leave the inbox's list), and no
+    // lookup was proposed for region alone.
+    let started = Instant::now();
+    loop {
+        let items = order_items(&mut c).await;
+        assert!(
+            items.iter().all(|i| i.2.contains("uk_region_code")),
+            "{items:?}"
+        );
+        if items.iter().all(|i| i.1 != "open" && i.1 != "approved") {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "items {items:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    c.query_drop(format!("DROP DATABASE {DB4}")).await.unwrap();
+    c.disconnect().await.unwrap();
+    println!("[{:?}] advisor_multi_column_live passed", t0.elapsed());
 }

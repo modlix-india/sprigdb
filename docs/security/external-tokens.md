@@ -97,7 +97,7 @@ They need an operator credential that covers tenants, as the other tenant routes
 
 ## Claim mappings
 
-A mapping turns a verified token's claims into the name of the account it logs in as.
+A mapping turns a verified token's claims into the name of the account it logs in as, or into a role for its session.
 
 | Field | Default | Meaning |
 |---|---|---|
@@ -172,7 +172,7 @@ The account keeps its other login methods: if it has a password or API keys, the
 
 ### Accounts created on first login
 
-Over HTTP and MongoDB, when the issuer has `"jit_users": true` and the account its user mapping names doesn't exist, SprigDB creates `'<name>'@'%'` on the first login: with the `token` method only, no password and no privileges. The creation is audited as `auth.user_created_jit`. Grant the account what it needs, or grant to it from a script that watches for the event. MySQL, MariaDB and Redis logins never create accounts: the login name must name an existing one.
+Over HTTP and MongoDB, when the issuer has `"jit_users": true` and the account its user mapping names doesn't exist, SprigDB creates `'<name>'@'%'` on the first login: with the `token` method only, no password and no privileges of its own. The creation is audited as `auth.user_created_jit`. Give it what it needs through [role mappings](#roles-from-tokens), or grant to it from a script that watches for the event. MySQL, MariaDB and Redis logins never create accounts: the login name must name an existing one.
 
 ## Log in
 

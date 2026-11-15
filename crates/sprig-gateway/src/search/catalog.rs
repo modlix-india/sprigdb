@@ -227,7 +227,7 @@ impl SearchTables {
             name: MODULE,
             migrations: SEARCH_MIGRATIONS,
         }])?
-        .run(q, &self.schema, &MigrateOpts::default())
+        .run(q, &self.schema, &MigrateOpts::existing())
         .await?;
         Ok(())
     }

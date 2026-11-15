@@ -586,14 +586,10 @@ impl GroupStore for CatalogGroups {
         group: &str,
         offsets: &[CommittedOffset],
     ) -> Result<(), StoreError> {
-        let (mut conn, schema) = self.conn(tenant).await?;
-        let store = sprig_streams::StreamsStore::new(schema);
-        let mut tx = conn
-            .start_transaction(mysql_async::TxOpts::default())
-            .await
-            .map_err(store_err)?;
         // A fan-in topic's position is on its member's instance: its id is
-        // looked up before the transaction.
+        // looked up before the transaction, and before this commit's
+        // catalog connection is taken (the lookup takes one of its own from
+        // the same pool).
         let mut parts = Vec::with_capacity(offsets.len());
         for o in offsets {
             parts.push(
@@ -602,6 +598,12 @@ impl GroupStore for CatalogGroups {
                     .map_err(store_err)?,
             );
         }
+        let (mut conn, schema) = self.conn(tenant).await?;
+        let store = sprig_streams::StreamsStore::new(schema);
+        let mut tx = conn
+            .start_transaction(mysql_async::TxOpts::default())
+            .await
+            .map_err(store_err)?;
         for (o, part) in offsets.iter().zip(parts) {
             if super::data::is_fanin(o.stream_id) && part.is_none() {
                 // An id this reader never had: nothing to commit it to.

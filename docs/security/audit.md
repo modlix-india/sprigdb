@@ -79,6 +79,7 @@ Recorded by every gateway for every protocol that logs in with a password, key o
 | `authz.default_roles_set` | `SET DEFAULT ROLE` |
 | `auth.verifiers_added` | SCRAM verifiers were added at a login |
 | `auth.handoff` | A login was decided in another data centre because of the tenant's [residency](residency.md) |
+| `auth.token_roles_ignored` | A token login's role mappings named roles the tenant doesn't define; they were ignored, and `detail` names them |
 | `auth.user_created_jit` | An account was created at its first login with an identity provider's token, with the issuer in `detail` (see [Logins with identity provider tokens](external-tokens.md)) |
 | `admin.issuer_changed` | An identity provider issuer was registered, replaced or disabled (`sprigctl tenant issuer`) |
 | `admin.token_login_changed` | An account's `token` login method was added or removed (`sprigctl tenant token-login`) |

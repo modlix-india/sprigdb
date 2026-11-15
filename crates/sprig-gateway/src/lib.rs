@@ -134,6 +134,10 @@ use crate::tls::CertStore;
 #[allow(clippy::too_many_lines)] // start-up and drain, step by step
 pub async fn run(ctx: RoleContext) -> Result<()> {
     let role = Role::Gateway;
+    // A gateway's migrations only bring catalogs bootstrap made to their
+    // newest formats; a missing catalog (a tenant being deleted) is never
+    // made again here, without its owner mark.
+    sprig_catalog::migrate::never_create_schemas();
     let registry = Registry::global()?;
     let dc = ctx.config.node.dc.clone();
     let sctx = SettingCtx::process(&dc);

@@ -9,7 +9,7 @@ source: the metric macros in the source tree, and docs/metrics-help.toml
 
 Every metric SprigDB records, as exported on each process's telemetry port (`/metrics`, Prometheus text) and through OTLP. Counters end in `_total`; durations are histograms in seconds.
 
-488 metrics in 53 groups.
+491 metrics in 53 groups.
 
 ## `sprig_advisor_*`
 
@@ -184,6 +184,7 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_bolt_auth_total` | counter | `result`, `scheme` | sprig-proto-bolt | Bolt (Neo4j protocol) logins; `scheme` is the authentication scheme, `result` is `ok` or `refused`. Unit: count. |
 | `sprig_bolt_bookmark_waits_total` | counter | `outcome` | sprig-gateway | Bolt reads with a bookmark that waited for a replica to catch up; `outcome` says whether the replica caught up or the read stayed on the writer. Unit: count. |
 | `sprig_bolt_connections` | gauge | `version` | sprig-proto-bolt | Bolt connections open on this gateway; `version` is the negotiated Bolt version. Unit: count. |
+| `sprig_bolt_keepalives_total` | counter | - | sprig-proto-bolt | Keep-alive (NOOP) chunks the gateway sent on Bolt connections while a request ran, one every half `bolt.recv_timeout_seconds`, so drivers wait for long statements. Unit: count. |
 | `sprig_bolt_messages_total` | counter | `message`, `result` | sprig-proto-bolt | Bolt protocol messages; `message` is the message name, `result` how it was handled (such as `sent` or `ignored` after a failure). Unit: count. |
 
 ## `sprig_catalog_*`
@@ -366,12 +367,14 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_graph_expansion_hops` | histogram | - | sprig-graph | Hops a graph pattern expansion went through. Unit: count. |
 | `sprig_graph_frontier_nodes` | histogram | - | sprig-graph | Nodes in the frontier at each step of a graph traversal. Unit: count. |
 | `sprig_graph_mirror_applied_total` | counter | - | sprig-worker | Rows the graph mirror applier wrote or deleted on workers. Unit: count. |
+| `sprig_graph_mirror_checkpoint_age_seconds` | gauge | - | sprig-worker | Time since the oldest graph mirror applier on this worker last recorded its checkpoint (its binlog positions in the job record), from the job's start if it hasn't yet. Written every 2 s while etcd answers. Unit: seconds. |
+| `sprig_graph_mirror_checkpoint_failures_total` | counter | - | sprig-worker | Graph mirror checkpoints (the applier's binlog positions in the job record) that failed to write; the applier keeps applying and tries again after a backoff, and a new owner resumes at the catalog's position rows meanwhile. Unit: count. |
 | `sprig_graph_mirror_fallbacks_total` | counter | `reason` | sprig-graph | Cluster; reason for fallbacks. |
 | `sprig_graph_mirror_wait_seconds` | histogram | - | sprig-gateway | Time graph reads waited for the graph mirror to catch up. Unit: seconds. |
-| `sprig_graph_mirror_waits_total` | counter | `outcome` | sprig-gateway | Graph reads that waited for the graph mirror to catch up; `outcome` is `ok`, `lag` (still behind) or `error`. Unit: count. |
+| `sprig_graph_mirror_waits_total` | counter | `outcome` | sprig-gateway | Graph reads that asked whether the graph mirror had caught up; `outcome` is `ok`, `lag` (still behind after the wait, or not served), `skipped` (behind, and the graph's waits are paused because recent reads waited the whole `graph.mirror_max_wait_ms` in vain), `busy` (no connection for the check in time) or `error`. Every outcome but `ok` reads incoming hops from every shard instead. Unit: count. |
 | `sprig_graph_route_hold_waits_total` | counter | - | sprig-gateway | Auto-commit Bolt reads that waited for a move's hold on a shard they route to. Unit: count. |
 | `sprig_graph_shard_queries_total` | counter | `tier` | sprig-graph | Shard queries graph traversals ran; `tier` is how the step ran: `join`, `cte`, `gateway` or `plugin`. Unit: count. |
-| `sprig_graph_spares_total` | counter | `outcome` | sprig-gateway | - |
+| `sprig_graph_spares_total` | counter | `outcome` | sprig-gateway | Extra backend connections auto-commit graph reads asked for, to read several shards of a cluster at once; `outcome` is `taken`, `budget` (the cluster's spare budget, a quarter of the session pool, was used up) or `busy` (none free within 50 ms). Without one, the shards are read one after another. Unit: count. |
 | `sprig_graph_stale_map_retries_total` | counter | - | sprig-gateway | Auto-commit graph statements run again after a split, merge or move changed the shard map. Unit: count. |
 | `sprig_graph_statement_duration_seconds` | histogram | `kind`, `language` | sprig-graph | Duration of graph statements; `language` is the query language (such as `cypher`), `kind` is `read` or `write`. Unit: seconds. |
 | `sprig_graph_statements_total` | counter | `kind`, `language`, `result` | sprig-graph | Graph statements; `language` is the query language, `kind` `read` or `write`, `result` `ok` or `error`. Unit: count. |

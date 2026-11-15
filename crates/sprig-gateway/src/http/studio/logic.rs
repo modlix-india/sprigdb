@@ -6,7 +6,7 @@
 //! | `GET /v1/databases/{db}/logic` | The database's modules (`logic_modules`): kind, runtime, security, tier preference, active version, state |
 //! | `GET /v1/databases/{db}/logic/{kind}/{name}` | One module with its versions (tier, placement, state, compiler), the active version's source, its binding and schedule, and, for routine administrators, the generated PL/SQL |
 //! | `GET /v1/databases/{db}/logic/{kind}/{name}/versions/{v}` | One version's source (and PL/SQL for routine administrators) |
-//! | `POST /v1/databases/{db}/logic:compile` | `Logic.Compile`: a dry run of a `CREATE FUNCTION | PROCEDURE ... LANGUAGE ...` declaration against the database's columns: tier, reasons with where they are, lints, cost, tables read and written, the signature, and the PL/SQL for routine administrators. Nothing is recorded or deployed |
+//! | `POST /v1/databases/{db}/logic:compile` | `Logic.Compile`: a dry run of a `CREATE FUNCTION | PROCEDURE ... LANGUAGE ...` declaration against the database's columns: tier, reasons with where they are, lints, cost, tables read and written, the signature, and the PL/SQL for routine administrators; a `CREATE VALIDATION` or `CREATE TRIGGER ... AFTER COMMIT` gets the deploy's checks against its table (it compiles into MariaDB, its parameters name columns) and how it would be enforced. Nothing is recorded or deployed |
 //! | `GET .../{kind}/{name}/rollout` | A function's or procedure's staged rollout (active and candidate versions, share, key) and each version's calls, errors, mean, p95 and latency histogram |
 //! | `GET .../{kind}/{name}/logs?after=&limit=` | `Logic.TailLogs`: what the module's triggers and schedules did (`logic_log`), newest first, after an id (Studio polls it) |
 //! | `GET .../{kind}/{name}/deadLetters?state=` | The module's dead letters (`logic_dead_letters` of its binding) |
@@ -658,10 +658,38 @@ pub(super) async fn compile(
             ));
         }
     };
+    // A validation or an after-commit trigger: the deploy's checks against
+    // its table, nothing recorded.
+    if matches!(decl.kind, Kind::Validation | Kind::Trigger)
+        && decl.source.is_none()
+        && let Some(t) = &decl.table
+    {
+        let tdb = t.db.as_deref().or(decl.db.as_deref()).unwrap_or(db);
+        let cols = columns(core, caller, tdb).await?;
+        let opts = Options {
+            module_id: 0,
+            version: 0,
+            max_loop_iterations: MAX_LOOP_ITERATIONS,
+            compile_max_cost: COMPILE_MAX_COST,
+            definer_security: true,
+        };
+        let v = match sprig_logic::service::check_bound(&decl, tdb, &t.name, &cols, &opts) {
+            Ok(notes) => json!({
+                "ok": true, "kind": decl.kind.as_str(), "name": decl.name,
+                "runtime": decl.runtime.as_str(), "table": t.name, "tier": "mariadb",
+                "notes": notes, "diagnostics": [],
+            }),
+            Err(e) => json!({
+                "ok": false, "kind": decl.kind.as_str(), "name": decl.name,
+                "diagnostics": [diagnostic(&e)],
+            }),
+        };
+        return Ok(json_response(200, &v));
+    }
     if !matches!(decl.kind, Kind::Function | Kind::Procedure) || decl.source.is_some() {
         return Err(SprigError::new(
             SprigCode::LogicUnsupported,
-            "a dry run compiles functions and procedures; deploy validations, triggers and schedules to see their placement",
+            "a dry run compiles functions, procedures, validations and after-commit triggers; deploy stream and queue triggers and schedules to see their placement",
         ));
     }
     let cols = columns(core, caller, decl.db.as_deref().unwrap_or(db)).await?;

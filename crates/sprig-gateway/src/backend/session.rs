@@ -212,16 +212,59 @@ struct Current {
     /// a transaction on Galera: it can't end the transaction, so an answer
     /// saying the transaction is gone means Galera aborted it silently.
     galera_dml_in_trx: bool,
+    /// Such a statement in a transaction that had written (the tracked
+    /// state's `W`). With `autocommit = 0` the statement after a silent
+    /// abort opens a new transaction, so its answer says a transaction is
+    /// open; a reported state without the `W` shows it isn't the one that
+    /// wrote.
+    wrote_before: bool,
+    /// A plain `INSERT`, `UPDATE`, `DELETE` or `REPLACE` on Galera, with
+    /// `autocommit = 0` and no transaction open: it opens one (tenant
+    /// tables are `InnoDB`; sessions with temporary tables, which may not
+    /// be, are left out), so an answer saying none is open means Galera
+    /// aborted it silently.
+    opens_implicit: bool,
+    /// A silent abort was seen while the backend had a transaction open
+    /// (the new one `wrote_before` describes): it is rolled back before
+    /// the connection serves the session again, as the client was told.
+    rollback_after: bool,
+    /// The statement may take row locks, or isn't one the statement check
+    /// covers: anything but a plain read, a prepare or `BEGIN` (see
+    /// [`BackendSession::trx_locks`]).
+    takes_locks: bool,
 }
 
 impl Current {
-    /// Whether `p` ends this statement saying no transaction is open, for
-    /// a statement that can't end one (see `galera_dml_in_trx`).
+    /// Whether `p` ends this statement showing that Galera rolled the
+    /// transaction back without an error (see `galera_dml_in_trx`,
+    /// `wrote_before` and `opens_implicit`).
     fn ended_silently(&self, p: &RespPacket) -> bool {
-        self.galera_dml_in_trx
-            && p.status().is_some_and(|s| {
-                !s.contains(StatusFlags::IN_TRANS) && !s.contains(StatusFlags::MORE_RESULTS_EXISTS)
-            })
+        p.status().is_some_and(|s| {
+            shows_silent_abort(
+                s,
+                p.tracked.trx_state.as_deref(),
+                self.galera_dml_in_trx || self.opens_implicit,
+                self.wrote_before,
+            )
+        })
+    }
+
+    /// Answers `p` (the statement's last packet, see
+    /// [`ended_silently`](Self::ended_silently)) with MariaDB's 1213 instead:
+    /// counts it, and records that no transaction is open afterwards, after
+    /// rolling back the one the backend may have opened since.
+    fn silent_abort(
+        &mut self,
+        p: &RespPacket,
+        cluster: &sprig_common::ids::ClusterId,
+        what: &str,
+    ) -> RespPacket {
+        let node = self.lease.key().node_key();
+        note_silent_abort(cluster, &node, what);
+        let status = p.status().unwrap_or_default();
+        self.rollback_after = status.contains(StatusFlags::IN_TRANS);
+        self.status = Some(status - StatusFlags::IN_TRANS);
+        silent_abort_packet(self.lease.conn_ref().client.caps())
     }
 
     fn observe(&mut self, p: &RespPacket) {
@@ -287,6 +330,7 @@ enum Req<'a> {
 
 /// One client session's backend side: its client-visible state, pins,
 /// held connection, causal position and captures.
+#[allow(clippy::struct_excessive_bools)] // independent per-session flags
 pub struct BackendSession {
     backends: Arc<Backends>,
     target: BackendTarget,
@@ -328,6 +372,12 @@ pub struct BackendSession {
     /// [`Self::release_kept`]. Boxed: a lease holds its connection inline,
     /// and futures that own a session would grow by its size.
     kept: Option<Box<BackendLease>>,
+    /// The open (or next) transaction may hold row locks, or ran a
+    /// statement whose answer isn't checked for a silent abort: a write, a
+    /// locking read or any statement but a plain read ran in it, its reads
+    /// lock (`SERIALIZABLE`), or `SET TRANSACTION` preceded it. Until then a
+    /// Galera write runs without [`TRX_GUARD`].
+    trx_locks: bool,
 }
 
 impl std::fmt::Debug for BackendSession {
@@ -384,16 +434,78 @@ async fn commit_wrote_nothing(cur: &mut Current, ok: &RespPacket, before: Option
 
 /// Whether `sql` is a plain `SELECT`, `INSERT`, `UPDATE`, `DELETE`,
 /// `REPLACE` or `WITH`: a statement that can't end a transaction (stored
-/// functions and triggers can't commit). Leading comments make it `false`.
+/// functions and triggers can't commit), after any leading comments.
 fn plain_dml(sql: &[u8]) -> bool {
-    let s = sql.trim_ascii_start();
+    first_word_in(
+        sql,
+        &["SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE", "WITH"],
+    )
+}
+
+/// Whether `sql` is a plain `INSERT`, `UPDATE`, `DELETE` or `REPLACE`: with
+/// `autocommit = 0` it opens a transaction on an `InnoDB` table even when it
+/// changes no row (a `SELECT` may read no table at all).
+fn plain_write(sql: &[u8]) -> bool {
+    first_word_in(sql, &["INSERT", "UPDATE", "DELETE", "REPLACE"])
+}
+
+/// Whether `sql`'s first word, after leading comments, is one of `words`.
+/// An executable comment (`/*!` or `/*M!`) first makes it `false`: it holds
+/// SQL.
+fn first_word_in(sql: &[u8], words: &[&str]) -> bool {
+    let Some(s) = skip_comments(sql) else {
+        return false;
+    };
     let word = s
         .iter()
         .position(|b| !b.is_ascii_alphabetic())
         .map_or(s, |n| &s[..n]);
-    ["SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE", "WITH"]
+    words
         .iter()
         .any(|k| word.eq_ignore_ascii_case(k.as_bytes()))
+}
+
+/// `sql` after leading white space and comments (`/* … */`, `-- …` and
+/// `# …` lines, as ORMs add them); `None` at an executable comment or an
+/// unterminated one.
+fn skip_comments(sql: &[u8]) -> Option<&[u8]> {
+    let mut s = sql.trim_ascii_start();
+    loop {
+        if let Some(rest) = s.strip_prefix(b"/*") {
+            if rest.starts_with(b"!") || rest.starts_with(b"M!") {
+                return None;
+            }
+            let end = rest.windows(2).position(|w| w == b"*/")?;
+            s = rest[end + 2..].trim_ascii_start();
+        } else if s.starts_with(b"#")
+            || (s.starts_with(b"--") && s.get(2).is_some_and(u8::is_ascii_whitespace))
+        {
+            let end = s.iter().position(|b| *b == b'\n')?;
+            s = s[end + 1..].trim_ascii_start();
+        } else {
+            return Some(s);
+        }
+    }
+}
+
+/// Whether a statement's last packet (`status`, and the transaction state
+/// it reported, if any) shows that Galera rolled the transaction back
+/// without an error: no transaction is open after a statement that must
+/// leave one open (`needs_trx`), or the open one isn't the one that wrote
+/// (`wrote_before`: its reported state has no `W`).
+fn shows_silent_abort(
+    status: StatusFlags,
+    trx_state: Option<&str>,
+    needs_trx: bool,
+    wrote_before: bool,
+) -> bool {
+    if status.contains(StatusFlags::MORE_RESULTS_EXISTS) {
+        return false;
+    }
+    if !status.contains(StatusFlags::IN_TRANS) {
+        return needs_trx;
+    }
+    wrote_before && trx_state.is_some_and(|t| !trx_wrote(t))
 }
 
 /// Logs and counts a transaction Galera rolled back while answering OK
@@ -530,6 +642,7 @@ impl BackendSession {
             redo: None,
             keep: false,
             kept: None,
+            trx_locks: false,
         }
     }
 
@@ -878,9 +991,7 @@ impl BackendSession {
         match packet {
             Ok(Some(mut p)) => {
                 if cur.ended_silently(&p) {
-                    let node = cur.lease.key().node_key();
-                    note_silent_abort(&self.target.cluster, &node, "a statement");
-                    p = silent_abort_packet(cur.lease.conn().client.caps());
+                    p = cur.silent_abort(&p, &self.target.cluster, "a statement");
                 }
                 cur.observe(&p);
                 cur.relayed = true;
@@ -1020,6 +1131,19 @@ impl BackendSession {
             return Ok(o);
         }
 
+        if cur.rollback_after {
+            // A silent abort answered while the backend had opened another
+            // transaction since: roll it back, as the client was told.
+            if let Err(e) = cur.lease.conn().client.query_drop("ROLLBACK").await {
+                tracing::warn!(node = %node, error = %e, "rolling back after a silent abort failed; closing the connection");
+                self.pins.after_statement(StatusFlags::empty());
+                let o = outcome(&cur, false);
+                drop(cur);
+                self.connection_gone();
+                return Ok(o);
+            }
+        }
+
         // Session tracking: schema, variables, commit GTIDs, untracked state.
         let mut observed = state::observe(&cur.tracked);
         if Self::drop_set_statement_reports(&mut cur, &mut observed) {
@@ -1129,6 +1253,9 @@ impl BackendSession {
             && self.pins.after_statement(st)
         {
             self.count_pin(PinReason::Transaction);
+        }
+        if cur.takes_locks && self.pins.in_transaction() {
+            self.trx_locks = true;
         }
         for v in &cur.stmt.assigns_user_vars {
             if !self.pending_capture.contains(v) {
@@ -1466,6 +1593,17 @@ impl BackendSession {
             .is_some_and(|v| v.eq_ignore_ascii_case("OFF") || v == "0")
     }
 
+    /// Whether the session's transactions are `SERIALIZABLE`, where plain
+    /// reads take shared locks too.
+    fn serializable(&self) -> bool {
+        ["transaction_isolation", "tx_isolation"].iter().any(|k| {
+            self.vars
+                .vars
+                .get(*k)
+                .is_some_and(|v| v.to_ascii_uppercase().contains("SERIALIZABLE"))
+        })
+    }
+
     /// The causal target of a read.
     fn causal_target(&self, settings: &BackendSettings) -> GtidSet {
         let mut t = self.causal.clone();
@@ -1728,16 +1866,38 @@ impl BackendSession {
         let mut sync_retried = false;
         let mut io_retried = false;
         let text = matches!(req, Req::Text(_));
-        let galera_dml_in_trx = view.topology == TopologyKind::Galera
-            && in_trx_before
-            && info.effects.is_empty()
-            && match &req {
-                Req::Text(sql) | Req::Binary { sql, .. } => plain_dml(sql),
-                _ => false,
-            };
+        let galera = view.topology == TopologyKind::Galera;
+        let stmt_sql = match &req {
+            Req::Text(sql) | Req::Binary { sql, .. } if info.effects.is_empty() => Some(*sql),
+            _ => None,
+        };
+        let galera_dml_in_trx = galera && in_trx_before && stmt_sql.is_some_and(plain_dml);
+        let opens_implicit = galera
+            && !in_trx_before
+            && stmt_sql.is_some_and(plain_write)
+            && self.implicit_transactions()
+            && !self
+                .pins
+                .reasons()
+                .iter()
+                .any(|r| matches!(r, PinReason::TempTables(_)));
+        if !in_trx_before {
+            // The next transaction holds no locks yet, unless all its reads
+            // lock or `SET TRANSACTION` set its characteristics.
+            self.trx_locks = self.pins.next_transaction_set() || self.serializable();
+        }
         // A write in such a transaction runs only if the transaction is
-        // still open (`TRX_GUARD`).
-        let guard = galera_dml_in_trx && info.class == StmtClass::Write;
+        // still open (`TRX_GUARD`). Galera aborts a transaction only for
+        // locks another node's write set needs, so before the first write
+        // or locking read the guard is left out: nothing can have aborted
+        // the transaction yet, and an abort for the write's own locks shows
+        // in its answer.
+        let guard = galera_dml_in_trx && info.class == StmtClass::Write && self.trx_locks;
+        // Anything but a plain read (which the statement check covers)
+        // turns the guard on for the rest of the transaction.
+        let takes_locks = (info.class == StmtClass::Write || !stmt_sql.is_some_and(plain_dml))
+            && !matches!(req, Req::Prepare { .. })
+            && !info.effects.contains(&Effect::Begin);
         // `USE x` sets the schema itself, so any pooled connection serves
         // it, including one that already has a default schema.
         let sets_schema = matches!(req, Req::Text(sql) if is_use(sql));
@@ -1787,6 +1947,8 @@ impl BackendSession {
                     .any(|r| matches!(r, PinReason::TempTables(_)))
                 && conn.client.tracker().trx_state().is_some_and(trx_wrote))
             .then(|| conn.client.tracker().last_gtid().map(str::to_owned));
+            let wrote_before =
+                galera_dml_in_trx && conn.client.tracker().trx_state().is_some_and(trx_wrote);
             if self.vars.schema.is_none()
                 && conn.applied.schema.is_some()
                 && route != RouteKind::Pinned
@@ -2125,6 +2287,10 @@ impl BackendSession {
                 explicit_ids,
                 span: None,
                 galera_dml_in_trx,
+                wrote_before,
+                opens_implicit,
+                rollback_after: false,
+                takes_locks,
             };
             let first = match outgoing {
                 // A prepare has no response beyond what prepare_cached read.
@@ -2181,9 +2347,8 @@ impl BackendSession {
                         },
                         None => None,
                     };
-                    if let Some(what) = silent {
-                        note_silent_abort(&cluster, &node_key, what);
-                        first = Some(silent_abort_packet(cur.lease.conn().client.caps()));
+                    if let (Some(what), Some(p)) = (silent, &first) {
+                        first = Some(cur.silent_abort(p, &cluster, what));
                     }
                     cur.done = first.is_none();
                     if let Some(p) = &first {
@@ -2496,7 +2661,11 @@ mod silent_abort_tests {
     use sprig_proto_mysql::Caps;
     use sprig_proto_mysql::client::PacketKind;
 
-    use super::{gtid_unchanged, plain_dml, silent_abort_packet, trx_wrote};
+    use sprig_proto_mysql::StatusFlags;
+
+    use super::{
+        gtid_unchanged, plain_dml, plain_write, shows_silent_abort, silent_abort_packet, trx_wrote,
+    };
 
     #[test]
     fn only_plain_dml_counts_as_unable_to_end_a_transaction() {
@@ -2515,12 +2684,86 @@ mod silent_abort_tests {
             "CALL p()",
             "SET autocommit = 1",
             "LOCK TABLES t WRITE",
-            "/* c */ SELECT 1",
             "SELECTED",
             "",
+            // Executable comments hold SQL; an unterminated comment is
+            // left alone.
+            "/*!40101 COMMIT */ SELECT 1",
+            "/*M!100100 COMMIT */ SELECT 1",
+            "/* c SELECT 1",
+            "-- c SELECT 1",
+            "--c\nSELECT 1",
         ] {
             assert!(!plain_dml(sql.as_bytes()), "{sql}");
         }
+        // Comments an ORM adds come before the statement.
+        for sql in [
+            "/* load Order */ SELECT v FROM t",
+            "/* a */ /* b */\n  update t SET v = 1",
+            "-- c\nINSERT INTO t VALUES (1)",
+            "# c\r\nDELETE FROM t",
+        ] {
+            assert!(plain_dml(sql.as_bytes()), "{sql}");
+        }
+    }
+
+    #[test]
+    fn only_plain_writes_always_open_a_transaction() {
+        for sql in [
+            "INSERT INTO t VALUES (?)",
+            "  update t SET v = 1 WHERE k = 0",
+            "DELETE FROM t LIMIT 0",
+            "replace into t values (1)",
+            "/* c */ INSERT INTO t VALUES (1)",
+        ] {
+            assert!(plain_write(sql.as_bytes()), "{sql}");
+        }
+        // A SELECT may read no table (`SELECT 1`, `SELECT @x := 1`), and
+        // then opens no transaction even with autocommit = 0.
+        for sql in [
+            "SELECT v FROM t",
+            "SELECT 1 FOR UPDATE",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            "/*!40101 INSERT INTO t VALUES (1) */",
+            "INSERTS",
+            "",
+        ] {
+            assert!(!plain_write(sql.as_bytes()), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_silent_abort_shows_in_the_status_or_the_transaction_state() {
+        let open = StatusFlags::IN_TRANS | StatusFlags::AUTOCOMMIT;
+        let none = StatusFlags::AUTOCOMMIT;
+        // A statement that can't end the transaction, or one that opens it
+        // with autocommit = 0, answered without one.
+        assert!(shows_silent_abort(none, None, true, false));
+        assert!(shows_silent_abort(
+            StatusFlags::empty(),
+            Some("________"),
+            true,
+            true
+        ));
+        // Any other statement may end it.
+        assert!(!shows_silent_abort(none, None, false, false));
+        // With autocommit = 0 the statement after the abort opened a new
+        // transaction: open, but its state lost the earlier write.
+        assert!(shows_silent_abort(open, Some("I_R___S_"), true, true));
+        assert!(shows_silent_abort(open, Some("________"), true, true));
+        // The transaction that wrote is still open: its state keeps the W,
+        // or nothing new was reported.
+        assert!(!shows_silent_abort(open, Some("I_R_W_S_"), true, true));
+        assert!(!shows_silent_abort(open, None, true, true));
+        // No write before: a new state without W says nothing.
+        assert!(!shows_silent_abort(open, Some("I_R___S_"), true, false));
+        // Only the statement's last result counts.
+        assert!(!shows_silent_abort(
+            none | StatusFlags::MORE_RESULTS_EXISTS,
+            None,
+            true,
+            true
+        ));
     }
 
     #[test]

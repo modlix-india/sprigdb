@@ -230,6 +230,10 @@ impl PassSession {
         modules.sort_unstable();
         modules.dedup();
         let store = sprig_logic::LogicStore::new(&schema);
+        // The candidates to roll back, read first: the abort is a deploy,
+        // which takes catalog connections from the same pool (4 per
+        // cluster), so this one isn't held across it.
+        let mut aborts = Vec::new();
         for m in modules {
             let Some(r) = rollout::get(&mut conn, &schema, m).await? else {
                 continue;
@@ -245,6 +249,10 @@ impl PassSession {
             let Some(module) = store.module_by_id(&mut conn, m).await? else {
                 continue;
             };
+            aborts.push((m, r, why, module));
+        }
+        drop(conn);
+        for (m, r, why, module) in aborts {
             let Some(db) = catalog
                 .as_ref()
                 .and_then(|c| c.databases.get(sprig_common::ids::DbId(module.db_id)))
@@ -281,16 +289,18 @@ impl PassSession {
                     ),
                 ),
             };
-            let _ = store
-                .log(
-                    &mut conn,
-                    m,
-                    Some(r.candidate_version),
-                    level,
-                    "deploy",
-                    &msg,
-                )
-                .await;
+            if let Ok(mut conn) = ep.pool.get_conn().await {
+                let _ = store
+                    .log(
+                        &mut conn,
+                        m,
+                        Some(r.candidate_version),
+                        level,
+                        "deploy",
+                        &msg,
+                    )
+                    .await;
+            }
         }
         Ok(())
     }

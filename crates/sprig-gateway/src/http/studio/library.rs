@@ -440,7 +440,7 @@ async fn context(core: &Arc<Core>, caller: &Caller) -> Result<Ctx, SprigError> {
             name: MODULE,
             migrations: LIBRARY_MIGRATIONS,
         }])?
-        .run(&mut conn, &schema, &MigrateOpts::default())
+        .run(&mut conn, &schema, &MigrateOpts::existing())
         .await?;
     }
     let history_max = core

@@ -60,6 +60,8 @@ use sprig_shard::TenantMaps;
 #[allow(clippy::too_many_lines)] // one wiring sequence
 pub async fn run(ctx: RoleContext) -> Result<()> {
     let role = Role::Worker;
+    // As in a gateway: only bootstrap creates a tenant's catalog.
+    sprig_catalog::migrate::never_create_schemas();
     let cfg = &ctx.config;
     let tls = cfg.tls.as_ref().map(EtcdTls::from_files).transpose()?;
     let tiers = connect_tiers(
@@ -256,6 +258,7 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         pools: Arc::clone(&env.pools),
         locator: Arc::clone(&env.locator),
         clusters: graph_mirror::shared_view(&shared_feed),
+        maps: sprig_shard::ShardMapCache::spawn(dc_logic.clone())?,
     };
     // Stream sequencers, on the logic jobs' pools and the
     // shared reader.

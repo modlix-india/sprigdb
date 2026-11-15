@@ -112,11 +112,11 @@ The stream:
 | `type` | Fields | Meaning |
 |---|---|---|
 | `start` | `conversation`, `role`, `model`, `share_data` | The turn started; keep `conversation` to continue it |
-| `text` | `text` | More of the answer. A turn that calls tools can stream text from several model calls, with no break between them: start a new paragraph after a `tool_start` or `usage` line |
+| `text` | `text` | More of the answer. When a turn calls tools, the text of each later model call starts with a blank line (`\n\n`), so joining the `text` lines gives readable paragraphs |
 | `thinking` | `text` | The model's reasoning, when the provider shows it |
 | `tool_start` | `id`, `name`, `input` | A tool call started |
 | `tool_end` | `id`, `name`, `ok`, `reduced` | It ended; `reduced` means rows or values were withheld or cut |
-| `proposal` | `proposal: {id, kind, tool_use_id, body}` | Something for you to review: `sql`, `tile`, `glossary`, `recommendation` or `generate_rows`. It has not run |
+| `proposal` | `proposal: {id, kind, tool_use_id, body, checks?, generated?}` | Something for you to review: `sql`, `tile`, `glossary`, `recommendation` or `generate_rows`. It has not run. `checks` is what SprigDB found when it tried the proposal (see below); `generated` holds generated test rows, which only you get |
 | `usage` | `usage` | Tokens of one model call |
 | `sources` | `sources: [{kind, title, reference}]` | What the answer drew on: docs pages, tables, queries |
 | `error` | `error: {code, name, message}` | The turn failed, or the model refused (39994) |
@@ -126,7 +126,29 @@ Closing the connection stops the turn.
 
 ### Proposals
 
-A proposal is never run by the assistant. For an SQL proposal, the stream carries the statement, why, and what it will do; you run it yourself through your usual client, with your own rights. Report what you did with it through the feedback route, so the assistants learn which proposals your team accepts.
+A proposal is never run by the assistant. For an SQL proposal, the stream carries the statement, why, and what it will do. You decide what happens to it:
+
+- **Accept it** with `POST /v1/ai/proposals/{id}:accept`. It runs as you, with your own rights, exactly as if you had typed it.
+- **Dismiss it** with `POST /v1/ai/proposals/{id}:dismiss`.
+- **Run it yourself** through your usual client, and report the outcome through the feedback route.
+
+```sh
+curl -s http://127.0.0.1:8080/v1/ai/proposals/0193…:accept \
+  -H "authorization: Bearer $TOKEN" -H "content-type: application/json" \
+  -d '{"confirm": true, "note": "ran it in the quiet hour"}'
+```
+
+| Kind | Accepting it |
+|---|---|
+| `sql` | Runs the statement (or statements, in order, stopping at the first error) in the database the proposal names. The reply holds each statement's results: `columns`, `rows` (at most 1,000), `affected_rows`, `last_insert_id`, `warnings`. A plain read runs at once. Anything else needs `"confirm": true`, which a client sends only after showing the statement to you and getting your yes; without it the call fails with 39792 and nothing runs |
+| `generate_rows` | Inserts the generated test rows, with `"confirm": true` |
+| `recommendation` | Files an `ai_dba_advice` item in the approvals inbox, at your tenant's level. It is advice only: approving it later acknowledges it and changes nothing |
+| `glossary` | Accepts the proposed term (tenant administrators, as for `POST /v1/ai/glossary/{term}:accept`) |
+| `tile` | Not yet: tiles come with dashboards |
+
+You can act only on proposals in your own tenant conversations, MCP calls included. A proposal that was accepted can't be accepted again; one that failed can. The optional `note` (up to 500 characters) is kept with the outcome. Each outcome, `accepted`, `failed` or `dismissed`, is recorded as feedback, so the assistants learn which proposals your team takes, and is counted in `sprig_ai_proposals_total` and written to the tenant's audit stream as an `ai.proposal` event.
+
+**Checked before you see it.** A proposed schema change (`CREATE`, `ALTER`, `RENAME`) must pass the same rules as the DBA assistant's `check_ddl` tool before it is shown. One that fails goes back to the assistant to fix, so a proposed `CREATE TABLE` always parses on SprigDB. Row-level security policies are tried as test users, logic is compiled, and test rows are generated before they are shown, as the next sections describe.
 
 ### What the assistants can read
 
@@ -134,9 +156,84 @@ The tools each assistant may call, all as you:
 
 - **Both:** search these docs; list databases and tables; describe a table (columns, indexes, definition); plans (`EXPLAIN FORMAT=JSON`, inside a read-only transaction for reads); column statistics over at most 100,000 rows; the approvals inbox.
 - **Data specialist:** run one `SELECT` in a read-only transaction that is rolled back, capped at its limit (1 to 1,000 rows) and at `studio.statement_timeout_ms`.
-- **DBA assistant:** workload fingerprints, indexes and automatic indexes, settings (`SHOW SPRIG SETTINGS`), shards and advisor runs, the row-level security tester (counts only), logic compiles (dry runs), and SprigDB's decisions about your tenant.
+- **DBA assistant:** workload fingerprints, indexes and automatic indexes, settings as they resolve for the tenant, a database or a table (`SHOW SPRIG SETTINGS … FOR`), shards and advisor runs, the row-level security tester (counts only), logic compiles (dry runs), SprigDB's decisions about your tenant, two schema checks, and the sensitive-data scanner (below).
 
 A tool call outside the assistant's role, or with invalid input, is refused; three refusals in one turn stop it with 39996.
+
+When `ai.share_data` is off, a query's rows are withheld and the assistant gets only its columns and row count. It then offers you the query as a proposal, so you can run it and see the rows yourself. An MCP client that isn't offered `propose_sql` is told to give you the query instead.
+
+### Schema design and migrations
+
+The DBA assistant checks schemas with SprigDB's own rules, not the model's guesses:
+
+- **`check_ddl`** reads schema statements without running them. Each one goes through the same name rules every statement meets, then SprigDB's DDL rules: names over 64 characters, storage engines, `DEFINER` clauses, `FULLTEXT` keys, generated columns, and the statement parser. The assistant runs it on every schema change before proposing one. Ask it to design tables from a description, and it writes plain MySQL DDL, checks it, and proposes what passed.
+- **`migration_check`** reads a schema you're bringing to SprigDB. For MySQL or MariaDB, paste the DDL from `mysqldump --no-data` (up to 512 KiB at a time). For MongoDB, paste the collections as `db.getCollectionInfos()` and `getIndexes()` print them, as a JSON array of `{name, options, indexes}`. The report is the same every time for the same schema:
+
+| Part | Holds |
+|---|---|
+| `findings` | Each one with a level: `error` (won't run as written, with the error code), `change` (runs, but SprigDB does something different, such as `ENGINE=MyISAM` becoming InnoDB or a `FULLTEXT` key becoming a search index), or `note` |
+| `groups`, `reference`, `unsharded`, `pins` | Table groups along your foreign keys, small code tables to pin `REFERENCE`, and the `SPRIG PIN` statements for them. Pins are optional: without them the sharding advisor designs groups from your workload |
+| `load_order` | The tables, parents first |
+| `plan` | The import steps: dump options, the port to load through, pins, loading, checks |
+
+For MongoDB, sample documents are never read: only collection options, validators and indexes. The checks follow the [MySQL and MariaDB](../connect/mysql-and-mariadb.md) and [MongoDB](../connect/mongodb.md) pages: views, time-series and clustered collections, and `2d`, `geoHaystack` and wildcard indexes are errors (39662); sparse, partial and hidden index options are kept but don't change what the index holds.
+
+### Finding sensitive data
+
+Ask the DBA assistant which columns hold personal or sensitive data. Its `sensitive_columns` tool scans a database, or one table, and decides by fixed rules, so the same schema gives the same answer:
+
+- **Names, types, comments and constraints.** Column names are split into words (`customerEmail`, `date_of_birth`), and each category has its words: email, phone, birth date or age, national, tax, passport and licence numbers, card numbers and security codes, bank accounts and IBANs, addresses and postcodes, people's names, IP addresses (and `INET4`/`INET6` columns), locations (and spatial columns), passwords, keys and tokens, special categories (health, sex, ethnicity, religion and the like), salaries and credit scores, device ids, and long free text such as `notes`. A comment that says `PII`, `GDPR` or `sensitive`, or a `CHECK` that makes a column look like an email, counts too. Flags, counts and kinds of the data aren't the data: `email_verified`, `phone_type` and `TINYINT(1)` columns are left alone.
+- **Values, only with `ai.share_data` on.** Up to 200 values of each text column (50 columns a table, 20 tables a call) are read in a read-only transaction and matched against patterns: email addresses, phone numbers, card numbers that pass the Luhn check, US social security numbers, IBANs with valid check digits, IP addresses, and tokens or keys. Only the counts leave the gateway ("188 of 200 sampled values look like an email"), never a value. Matches raise a finding's confidence or find a column whose name hides its data; a large sample with no match lowers it.
+
+Each finding has a category, a confidence (`high`, `medium`, `low`) and its reasons, and the result says which tables have row-level security on. The assistant then suggests what SprigDB has: row-level security for whose rows a user sees, column-level grants or a view for which columns, and residency, which operators set for a whole tenant. SprigDB has no column masking.
+
+### Row-level security from a sentence
+
+Describe who should see what, such as "sales reps see only the orders of their region", and the DBA assistant writes the policy, binding it to a value per user:
+
+| Session function | When |
+|---|---|
+| `SPRIG_USER_ATTR('key')` | The value is stored on each account: `ALTER USER bob ATTRIBUTE '{"region": "EU"}'` |
+| `SPRIG_CLAIM('key')` | The value is a claim of the identity provider token the session logged in with |
+| `CURRENT_USER()` | A column holds account names (`name@host`) |
+
+Before it proposes a policy, the assistant tries it. `test_policy` takes a `CREATE POLICY` that doesn't exist yet: SprigDB parses it and checks its expressions as `CREATE POLICY` would, binds its `USING` to the test user's own values (account, id, tenant, attributes, and claims you supply), and counts as that user, through the row-level security tester:
+
+- `rows_user_sees_now`: the rows of the table the user sees today;
+- `rows_new_policy_admits`: how many of those the new policy's `USING` lets through;
+- whether the policy's `TO` list applies to the user, and the attributes and claims it reads that the user lacks, with how to set them (`ALTER USER … ATTRIBUTE`, or a token claim).
+
+Only counts come back, never rows, and nothing is created. The tester's rules apply: you need `SPRIG_TENANT_ADMIN`, `studio.view_as` must be on, and administrators of your tenant can't be tested as.
+
+The proposal itself comes from `propose_policy`, with the statements (`CREATE POLICY`, and `ALTER TABLE … ENABLE ROW LEVEL SECURITY` when it's off) and the users to try them as. Every policy is tried again as each of those users before you see it, and the proposal's `checks` carries the counts and warnings, such as "enabling row-level security hides every row from users no policy admits". A statement that doesn't parse, or an expression a policy can't use, goes back to the assistant to fix. Accepting it runs it as any SQL proposal.
+
+### Writing logic
+
+Ask for a function, procedure, validation or after-commit trigger, in KIRun or JavaScript, and the DBA assistant writes the whole `CREATE … LANGUAGE … AS …` statement and checks it with `compile_logic`, a dry run of `POST /v1/databases/{db}/logic:compile` that records and deploys nothing:
+
+- functions and procedures compile and are placed in a tier, as before;
+- validations and `AFTER COMMIT` triggers get the deploy's own checks against their table: the table exists, the code compiles into MariaDB, its parameters name the table's columns, and how a validation would be enforced (a `CHECK` constraint or `BEFORE` triggers);
+- a KIRun definition on its own is compiled as a function.
+
+The assistant fixes what the compile reports and compiles again, then proposes the statement with `propose_logic`. SprigDB compiles it once more before you see it: one that doesn't compile goes back to the assistant, and the proposal's `checks` says what compiled (kind, tier, how it is enforced). Stream and queue triggers and schedules can't be dry-run; their proposals say they weren't compiled.
+
+### Test data
+
+`generate_rows` proposes up to 10,000 test rows for a table. SprigDB generates them in the gateway, from the table's schema, as you:
+
+| Column | Gets |
+|---|---|
+| `auto_increment` or generated | Left out |
+| A foreign key | Keys that exist in the parent table (up to 10,000 read), a whole tuple for a composite key. A `NOT NULL` key whose parent table is empty is refused: generate the parent's rows first |
+| `ENUM`, `SET`, a `CHECK … IN (…)` | Their values |
+| A unique integer | A sequence after the column's largest value |
+| A unique string | Values with a run tag and a sequence, so they don't collide with existing rows |
+| Text, by its name | Emails (on `example.com`), phone numbers in the 555 test range, names, companies, addresses, cities, postcodes, ISO country and currency codes, URLs, documentation IP addresses, UUIDs, payment networks' test card numbers, obviously fake ids (`TEST-…`), short sentences or words; cut to the column's length |
+| Numbers and dates, by type | Ranges that fit the type and the name (ages, years, quantities, prices), narrowed by `CHECK` bounds (`>`, `>=`, `<`, `<=`, `BETWEEN`, `AND`); dates in the last two years, birth dates between 1950 and 2006 |
+
+The assistant may add a hint per column, as a line such as `status: one_of, values=paid|paid|new`, `total: decimal, min=5, max=500` or `email: email, domain=test.example` (also `nulls=20` for a share of NULLs in a nullable column). Composite unique keys are kept distinct among the generated rows. A `CHECK` that SprigDB doesn't understand is reported, and rows that fail it are refused when the statements run.
+
+The rows go to you only: the proposal's `generated` holds the `INSERT` statements (500 rows each, at most 4 MiB in all), and the assistant gets a summary of how each column was filled, with counts but no value. Over MCP, `generated` is returned only when `ai.share_data` is on, because it may hold existing keys. Accepting the proposal runs the inserts as you.
 
 ## ASK in SQL
 

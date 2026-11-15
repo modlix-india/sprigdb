@@ -394,3 +394,21 @@ fn docs_reach_the_admin_roles_unscrubbed_with_secrets_masked() {
     let r = gate(Role::Admin, false).tool_result(&settings, &out);
     assert!(r.content.contains("name#"));
 }
+
+#[test]
+fn withheld_rows_say_what_to_offer_by_channel() {
+    let out = ToolOutput {
+        body: ToolBody::Rows(rows(2)),
+        sources: Vec::new(),
+    };
+    let chat = gate(Role::Dba, false).tool_result(&run_query(), &out);
+    let why = chat.stored["rows_withheld"].as_str().unwrap();
+    assert!(why.contains("propose_sql"), "{why}");
+    assert!(!why.contains("run_query"), "{why}");
+    let mcp = gate(Role::Data, false)
+        .with_proposals(false)
+        .tool_result(&run_query(), &out);
+    let why = mcp.stored["rows_withheld"].as_str().unwrap();
+    assert!(!why.contains("propose_sql"), "{why}");
+    assert!(why.contains("SQL client"), "{why}");
+}

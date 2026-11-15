@@ -255,7 +255,12 @@ impl PassSession {
                     .map(|v| sprig_logic::enforce::check_name(b.binding_id, *v))
                     .collect();
                 let alter = sprig_logic::enforce::check_alter(&row.name, &t, None, &names);
+                // The ALTER is a catalog change, which takes connections
+                // from the same pool: this one goes back meanwhile (it
+                // holds no transaction).
+                drop(conn);
                 self.drop_alter(cx, &alter).await?;
+                conn = ep.pool.get_conn().await.map_err(catalog_err)?;
             }
         }
         // Every shard: routines, packages, MariaDB triggers.

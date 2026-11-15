@@ -355,7 +355,7 @@ impl DocTables {
             name: MODULE,
             migrations: DOC_MIGRATIONS,
         }])?
-        .run(q, &self.schema, &MigrateOpts::default())
+        .run(q, &self.schema, &MigrateOpts::existing())
         .await?;
         Ok(())
     }

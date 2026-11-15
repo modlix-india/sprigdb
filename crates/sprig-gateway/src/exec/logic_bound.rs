@@ -399,7 +399,11 @@ impl PassSession {
             &mut shards,
         )
         .await?;
-        if let Some(alter) = &pending.alter {
+        let mut conn = if let Some(alter) = &pending.alter {
+            // The ALTER is a catalog change of its own, which takes
+            // connections from the same pool (4 per cluster): this one goes
+            // back first (it holds no transaction) and a new one finishes.
+            drop(conn);
             let mut sink = Outcome {
                 wire: Wire {
                     persona: self.persona,
@@ -417,11 +421,17 @@ impl PassSession {
                 Err(e) => Some(e),
                 Ok(_) => sink.error.take(),
             };
+            let mut conn = ep.pool.get_conn().await.map_err(|e| {
+                SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
+            })?;
             if let Some(e) = err {
                 service::abort(&mut conn, ep.store.schema(), &pending, &mut shards).await;
                 return Err(sprig_logic::triggers::map_check_error(e));
             }
-        }
+            conn
+        } else {
+            conn
+        };
         service::finish(
             &mut conn,
             ep.store.schema(),
@@ -567,6 +577,8 @@ impl PassSession {
             Ok(enforce::rewrite_computed(&sql, &call, &expr))
         }
         .await;
+        // The DDL below takes catalog connections from the same pool.
+        drop(conn);
         let rewritten = match r {
             Ok(t) => t,
             Err(e) => return self.answer(Err(e), status, out).await.map(Some),
@@ -593,7 +605,14 @@ impl PassSession {
                 enforcement: Some("generated".to_owned()),
                 state: "active".to_owned(),
             };
-            if let Err(e) = store.put_binding(&mut conn, &b).await {
+            let put = async {
+                let mut conn = ep.pool.get_conn().await.map_err(|e| {
+                    SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable")
+                        .with_source(e)
+                })?;
+                store.put_binding(&mut conn, &b).await
+            };
+            if let Err(e) = put.await {
                 tracing::warn!(error = %e, "computed field's binding not recorded");
             }
         }

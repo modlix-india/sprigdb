@@ -12,9 +12,11 @@
 //!      fingerprints of the last advisor.lookup_window_minutes (60) that ran
 //!      at least advisor.lookup_min_runs (100) times, at least
 //!      auto_index.lookup_scatter_pct (80%) of them on every shard of a
-//!      sharded group, with `=` or `IN` on one column of a single table;
-//!      a column that carries a declared single-column UNIQUE key without
-//!      the distribution key and has no lookup yet is a candidate
+//!      sharded group, with `=` or `IN` on columns of a single table; a
+//!      column, or a set of columns such reads all bind, that carries a
+//!      declared UNIQUE key on exactly those columns, without the
+//!      distribution key, and has no lookup yet is a candidate (a key of
+//!      two or more columns gets a multi-column lookup)
 //!   3. each candidate goes through the approvals gate as `advisor.lookup`
 //!      (advisor.mode: on builds at once; approve and recommend raise an
 //!      item and build once it is approved); the build is
@@ -65,10 +67,17 @@ pub(super) struct Scatter {
     pub(super) fingerprints: Vec<u64>,
 }
 
-/// Folds one fingerprint into the per-column tally: single-table shapes
-/// with `=` or `IN` on a column, by `(object, column)`.
+/// The most columns of one read whose every combination is tallied; a
+/// read binding more tallies its single columns and the whole set only.
+const MAX_SET_COLUMNS: usize = 6;
+
+/// Folds one fingerprint into the tally: single-table shapes with `=` or
+/// `IN` on columns, by `(object, columns)`. The columns are lowercase and
+/// sorted: each bound column alone, and each combination of two or more of
+/// them, since a unique key on any of those combinations can narrow the
+/// read to one shard.
 pub(super) fn tally(
-    out: &mut BTreeMap<(ObjectId, String), Scatter>,
+    out: &mut BTreeMap<(ObjectId, Vec<String>), Scatter>,
     fp: u64,
     shape: &sprig_workload::shape::Shape,
     runs: u64,
@@ -89,13 +98,47 @@ pub(super) fn tally(
         .collect();
     cols.sort();
     cols.dedup();
-    for c in cols {
-        let e = out.entry((object, c)).or_default();
+    for set in column_sets(&cols) {
+        let e = out.entry((object, set)).or_default();
         e.runs += runs;
         e.scattered += scattered;
         e.total_us += total_us;
         e.fingerprints.push(fp);
     }
+}
+
+/// The sets [`tally`] counts for the sorted columns `cols`: each column
+/// alone, then every combination of two or more (in `cols`' order), or
+/// only the whole set past [`MAX_SET_COLUMNS`].
+fn column_sets(cols: &[String]) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = cols.iter().map(|c| vec![c.clone()]).collect();
+    if cols.len() < 2 {
+        return out;
+    }
+    if cols.len() > MAX_SET_COLUMNS {
+        out.push(cols.to_vec());
+        return out;
+    }
+    for mask in 1u32..(1 << cols.len()) {
+        if mask.count_ones() >= 2 {
+            out.push(
+                cols.iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask & (1 << i) != 0)
+                    .map(|(_, c)| c.clone())
+                    .collect(),
+            );
+        }
+    }
+    out
+}
+
+/// `cols` lowercase and sorted, to compare with a tally's set.
+fn as_set(cols: &[String]) -> Vec<String> {
+    let mut v: Vec<String> = cols.iter().map(|c| c.to_ascii_lowercase()).collect();
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// Whether a tally qualifies (`advisor.lookup_min_runs`,
@@ -240,8 +283,26 @@ struct Candidate {
     table: String,
     group: GroupId,
     key: String,
-    column: String,
+    /// The key's columns, in its order.
+    columns: Vec<String>,
     scatter: Scatter,
+}
+
+impl Candidate {
+    /// The proposal's machine part: `columns` in the key's order, and
+    /// `column` too for a key of one column.
+    fn machine(&self) -> serde_json::Value {
+        let mut m = serde_json::json!({
+            "object": self.object.0,
+            "group": self.group.0,
+            "key": self.key,
+            "columns": self.columns,
+        });
+        if let [one] = self.columns.as_slice() {
+            m["column"] = serde_json::Value::from(one.as_str());
+        }
+        m
+    }
 }
 
 impl ShardingLoop {
@@ -515,7 +576,7 @@ impl ShardingLoop {
             .map(|(id, ..)| sprig_common::ids::Fingerprint(*id))
             .collect();
         let fps = wl.fingerprints(&mut c, &ids).await?;
-        let mut by_col: BTreeMap<(ObjectId, String), Scatter> = BTreeMap::new();
+        let mut by_col: BTreeMap<(ObjectId, Vec<String>), Scatter> = BTreeMap::new();
         for f in &fps {
             let Some(&(id, runs, scattered, us)) = busy.iter().find(|b| b.0 == f.id.0) else {
                 continue;
@@ -527,32 +588,33 @@ impl ShardingLoop {
             .map_err(|e| SprigError::internal(format!("catalog: {e}")))?;
         let existing = LookupCatalog.rows(&mut c).await?;
         let mut out = Vec::new();
-        for ((object, column), s) in by_col {
+        for ((object, columns), s) in by_col {
             if !qualifies(&s, &ts.lookup_advice) {
                 continue;
             }
             if existing
                 .iter()
-                .any(|l| l.owner == object && l.columns.as_slice() == [column.clone()])
+                .any(|l| l.owner == object && as_set(&l.columns) == columns)
             {
                 continue;
             }
-            if let Some(cand) = self.candidate(tenant, &mut c, object, column, s).await? {
+            if let Some(cand) = self.candidate(tenant, &mut c, object, &columns, s).await? {
                 out.push(cand);
             }
         }
         Ok(out)
     }
 
-    /// `object.column` as a candidate: an active, ready column member of
-    /// a group with two or more shards, whose column carries a declared
-    /// single-column unique key without the distribution key.
+    /// `object`'s `columns` (lowercase, sorted) as a candidate: an active,
+    /// ready column member of a group with two or more shards, with a
+    /// declared unique key on exactly those columns (in any order), without
+    /// the distribution key.
     async fn candidate(
         &self,
         tenant: TenantId,
         c: &mut Conn,
         object: ObjectId,
-        column: String,
+        columns: &[String],
         scatter: Scatter,
     ) -> Result<Option<Candidate>> {
         let member: Option<MemberText> = c
@@ -595,15 +657,15 @@ impl ShardingLoop {
         };
         Ok(lookup_keys(&shape, &key)
             .into_iter()
-            .find(|(_, cols)| cols.as_slice() == std::slice::from_ref(&column))
-            .map(|(k, _)| Candidate {
+            .find(|(_, cols)| as_set(cols) == columns)
+            .map(|(k, cols)| Candidate {
                 object,
                 db: DbId(db),
                 db_name,
                 table,
                 group: GroupId(group),
                 key: k,
-                column,
+                columns: cols,
                 scatter,
             }))
     }
@@ -644,12 +706,7 @@ impl ShardingLoop {
                             "SPRIG REBUILD LOOKUP INDEX `{}` ON `{}`.`{}`",
                             c.key, c.db_name, c.table
                         ),
-                        machine: serde_json::json!({
-                            "object": c.object.0,
-                            "group": c.group.0,
-                            "key": c.key,
-                            "column": c.column,
-                        }),
+                        machine: c.machine(),
                     },
                     evidence: serde_json::json!({
                         "runs": c.scatter.runs,
@@ -664,7 +721,7 @@ impl ShardingLoop {
                          the last hour went to every shard ({:.0} ms)",
                         c.db_name,
                         c.table,
-                        c.column,
+                        c.columns.join(", "),
                         c.key,
                         c.scatter.scattered,
                         c.scatter.runs,
@@ -692,7 +749,7 @@ impl ShardingLoop {
                     owner: c.object,
                     owner_table: c.table.clone(),
                     owner_map: Arc::new(map),
-                    columns: vec![c.column.clone()],
+                    columns: c.columns.clone(),
                     key: Some(c.key.clone()),
                     origin: LookupOrigin::UniqueKey,
                 })
@@ -757,7 +814,7 @@ mod tests {
         };
         tally(&mut out, 1, &s, 90, 90, 9000);
         tally(&mut out, 2, &s, 30, 10, 1000);
-        let e = &out[&(ObjectId(7), "email".to_owned())];
+        let e = &out[&(ObjectId(7), vec!["email".to_owned()])];
         assert_eq!((e.runs, e.scattered, e.total_us), (120, 100, 10_000));
         assert_eq!(out.len(), 1, "ranges don't count");
         let a = sprig_advisor::sharding::settings::LookupAdvice::default();
@@ -794,5 +851,64 @@ mod tests {
         let mut none = BTreeMap::new();
         tally(&mut none, 3, &j, 500, 500, 1);
         assert!(none.is_empty());
+    }
+
+    fn eq(col: &str, arg: u32) -> sprig_workload::shape::Predicate {
+        sprig_workload::shape::Predicate {
+            column: sprig_workload::shape::ColumnRef {
+                table: None,
+                col: col.into(),
+            },
+            op: PredOp::Eq,
+            args: vec![arg],
+        }
+    }
+
+    fn sets(v: &[&[&str]]) -> Vec<Vec<String>> {
+        v.iter()
+            .map(|s| s.iter().map(|c| (*c).to_owned()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn multi_column_equality_is_tallied_as_a_set() {
+        let s = Shape {
+            tables: vec![sprig_workload::shape::TableRef {
+                alias: "orders".into(),
+                object_id: Some(ObjectId(9)),
+                db: None,
+                table: "orders".into(),
+                db_id: None,
+                derived: false,
+            }],
+            predicates: vec![eq("Region", 0), eq("code", 1), eq("status", 2)],
+            ..Shape::empty(StmtType::Select)
+        };
+        let mut out = BTreeMap::new();
+        tally(&mut out, 1, &s, 50, 50, 500);
+        tally(&mut out, 2, &s, 70, 60, 700);
+        let keys: Vec<Vec<String>> = out.keys().map(|(_, c)| c.clone()).collect();
+        assert_eq!(
+            keys,
+            sets(&[
+                &["code"],
+                &["code", "region"],
+                &["code", "region", "status"],
+                &["code", "status"],
+                &["region"],
+                &["region", "status"],
+                &["status"],
+            ])
+        );
+        // A unique key on (region, code) is matched in any order.
+        let e = &out[&(ObjectId(9), as_set(&["region".into(), "CODE".into()]))];
+        assert_eq!((e.runs, e.scattered, e.total_us), (120, 110, 1200));
+        assert_eq!(e.fingerprints, [1, 2]);
+        // Many columns: only each one and the whole set.
+        let wide: Vec<String> = (0..8).map(|i| format!("c{i}")).collect();
+        let got = column_sets(&wide);
+        assert_eq!(got.len(), 9);
+        assert_eq!(got.last(), Some(&wide));
+        assert_eq!(column_sets(&wide[..3]).len(), 3 + 4);
     }
 }

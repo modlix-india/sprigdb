@@ -85,6 +85,9 @@ pub struct Gated {
 pub struct EgressGate {
     policy: EgressPolicy,
     scrubber: Option<Arc<Scrubber>>,
+    /// The assistant can offer the user a query with `propose_sql` (the
+    /// chat always can; an MCP client only when it is offered the tool).
+    can_propose: bool,
 }
 
 impl EgressGate {
@@ -101,7 +104,32 @@ impl EgressGate {
         } else {
             Some(scrubber.unwrap_or_else(|| Arc::new(Scrubber::random())))
         };
-        Self { policy, scrubber }
+        Self {
+            policy,
+            scrubber,
+            can_propose: true,
+        }
+    }
+
+    /// The same gate for a caller that can (or can't) offer queries with
+    /// `propose_sql`: it decides what a withheld result tells the model to
+    /// do instead.
+    #[must_use]
+    pub fn with_proposals(mut self, can_propose: bool) -> Self {
+        self.can_propose = can_propose;
+        self
+    }
+
+    /// What a result with rows withheld tells the model to do instead.
+    fn withheld_rows(&self) -> String {
+        let offer = if self.can_propose {
+            "offer the query to the user with propose_sql, so they can run it and see the rows themselves"
+        } else {
+            "give the user the query, so they can run it in their SQL client or SprigDB Studio and see the rows themselves"
+        };
+        format!(
+            "Data sharing is off (ai.share_data), so the rows weren't sent. Describe what the query returns from its columns and row count, and {offer}."
+        )
     }
 
     /// The policy.
@@ -167,7 +195,7 @@ impl EgressGate {
             // administration assistant docs it can't read.
             ToolBody::Json(v) if spec.shares == Shares::Docs => (self.docs(v), false),
             ToolBody::Json(v) => (self.strings(v), false),
-            ToolBody::Rows(rs) => self.rows(spec, rs),
+            ToolBody::Rows(rs) => self.rows(rs),
             ToolBody::Stats(st) => self.stats(st),
         };
         let mut text = stored.to_string();
@@ -188,7 +216,7 @@ impl EgressGate {
         }
     }
 
-    fn rows(&self, spec: &ToolSpec, rs: &ResultSet) -> (Value, bool) {
+    fn rows(&self, rs: &ResultSet) -> (Value, bool) {
         let columns: Vec<Value> = rs
             .columns
             .iter()
@@ -196,10 +224,7 @@ impl EgressGate {
             .collect();
         if !self.policy.rows_allowed() {
             let why = if self.policy.role.is_tenant() {
-                format!(
-                    "Data sharing is off (ai.share_data), so the rows weren't sent. Tell the user what the query shows in general, and offer it with propose_sql so they can run {} themselves.",
-                    spec.name
-                )
+                self.withheld_rows()
             } else {
                 "Rows are never sent for this assistant.".to_owned()
             };

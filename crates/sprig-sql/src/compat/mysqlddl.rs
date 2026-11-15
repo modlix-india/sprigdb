@@ -40,7 +40,13 @@
 //! - **Values that don't fit a functional index** ([`fx_value_error`],
 //!   [`fx_index_name`], [`functional_index_value`]): MariaDB's 1264, 1265,
 //!   1292, 1366 or 1406 naming a hidden column becomes MySQL's 3752 or 3751
-//!   naming the index.
+//!   naming the index. So does an error MariaDB raises while computing a
+//!   hidden column's expression ([`fx_eval_error`], [`fx_eval_part`]): 1292
+//!   for a cast to an integer or `DOUBLE` or a date function of a string,
+//!   1264 for a `DECIMAL(m,d)` cast too small, when the table's key parts
+//!   show which index it was. MariaDB raises these for an `UPDATE` and for
+//!   an `INSERT` or `REPLACE` that names its columns; one that doesn't, and
+//!   a `CAST(.. AS CHAR(n))` that truncates, only warn and write the row.
 
 use std::fmt::Write as _;
 
@@ -955,6 +961,153 @@ fn user_generated(name: &str) -> bool {
         .is_some_and(|p| p.eq_ignore_ascii_case("_sprig"))
 }
 
+/// A column of the table an `ALTER TABLE` changes, as MariaDB's
+/// `information_schema.COLUMNS` gives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableColumn {
+    /// `COLUMN_NAME`, as defined.
+    pub name: String,
+    /// `GENERATION_EXPRESSION`, for a generated column (hidden ones too).
+    pub generation: Option<String>,
+    /// `COLUMN_DEFAULT`: an expression default is in parentheses.
+    pub default: Option<String>,
+}
+
+/// A table-level `CHECK` constraint of the table, from MariaDB's
+/// `information_schema.CHECK_CONSTRAINTS`. On 3306 every client check is
+/// one, under MySQL's name ([`super::name_checks`]); the column-level ones
+/// are MariaDB's own `json_valid` checks, which aren't MySQL's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableCheck {
+    /// `CONSTRAINT_NAME`, already as the client knows it.
+    pub name: String,
+    /// `CHECK_CLAUSE`, names backquoted.
+    pub clause: String,
+}
+
+/// MySQL's 3959: a `CHECK` constraint uses the column.
+#[must_use]
+pub fn check_dependency(check: &str, column: &str) -> WireError {
+    WireError::new(
+        3959,
+        *b"HY000",
+        format!(
+            "Check constraint '{check}' uses column '{column}', hence column cannot be dropped or renamed."
+        ),
+    )
+}
+
+/// MySQL's 3766: another column's default expression uses the column.
+#[must_use]
+pub fn default_dependency(column: &str, table: &str) -> WireError {
+    WireError::new(
+        3766,
+        *b"HY000",
+        format!(
+            "Column '{column}' of table '{table}' has a default value expression dependency and cannot be dropped or renamed."
+        ),
+    )
+}
+
+/// `checks` in the order MySQL 8.4 reports them: by name.
+fn by_name(checks: &[TableCheck]) -> Vec<&TableCheck> {
+    let mut v: Vec<&TableCheck> = checks.iter().collect();
+    v.sort_by_key(|k| k.name.to_lowercase());
+    v
+}
+
+/// Whether a check clause uses a column besides `column` (a check of that
+/// column alone is dropped with it).
+fn uses_other_column(clause: &str, column: &str) -> bool {
+    clause
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .any(|n| !n.is_empty() && !n.eq_ignore_ascii_case(column))
+}
+
+/// Whether a `COLUMN_DEFAULT` is an expression (MariaDB shows those in
+/// parentheses) that uses `column`.
+fn default_uses(default: &str, column: &str) -> bool {
+    default.starts_with('(') && expression_uses(default, column)
+}
+
+/// MySQL 8.4's refusal to rename `renamed` (statement order) of table
+/// `table` (its name alone), for the first column something else uses: a
+/// `CHECK` constraint (3959, the first by name), another column's default
+/// expression (3766), a
+/// generated column (3108) or a functional key part (3837), checked in that
+/// order. The column is named as defined. `None` when nothing uses them;
+/// MariaDB renames the column inside all of these instead.
+#[must_use]
+pub fn rename_dependency(
+    renamed: &[String],
+    table: &str,
+    columns: &[TableColumn],
+    checks: &[TableCheck],
+) -> Option<WireError> {
+    renamed.iter().find_map(|c| {
+        let defined = columns
+            .iter()
+            .find(|x| x.name.eq_ignore_ascii_case(c))
+            .map_or(c.as_str(), |x| x.name.as_str());
+        if let Some(k) = by_name(checks)
+            .into_iter()
+            .find(|k| expression_uses(&k.clause, c))
+        {
+            return Some(check_dependency(&k.name, defined));
+        }
+        if columns
+            .iter()
+            .any(|x| x.default.as_deref().is_some_and(|d| default_uses(d, c)))
+        {
+            return Some(default_dependency(defined, table));
+        }
+        let generated: Vec<(String, String)> = columns
+            .iter()
+            .filter_map(|x| Some((x.name.clone(), x.generation.clone()?)))
+            .collect();
+        generated_dependency_of(std::slice::from_ref(&defined.to_owned()), &generated)
+    })
+}
+
+/// The column and kind of MariaDB's 1054 after an `ALTER TABLE ... DROP
+/// COLUMN` that a `CHECK` constraint of several columns (`Unknown column
+/// 'c' in 'CHECK'`) or another column's default expression (`in
+/// 'DEFAULT'`) uses: `(column, true)` for a check. `None` for other errors.
+#[must_use]
+pub fn dropped_dependency_column(code: u16, message: &str) -> Option<(&str, bool)> {
+    if code != 1054 {
+        return None;
+    }
+    let rest = message.strip_prefix("Unknown column '")?;
+    if let Some(c) = rest.strip_suffix("' in 'CHECK'") {
+        return Some((c, true));
+    }
+    rest.strip_suffix("' in 'DEFAULT'").map(|c| (c, false))
+}
+
+/// MySQL's answer to [`dropped_dependency_column`]'s error: 3959 naming
+/// the first check (by name) that uses `column` and another column, or
+/// 3766 naming `table`. `None` when no check does (the lookup raced a
+/// change).
+#[must_use]
+pub fn drop_dependency(
+    column: &str,
+    check: bool,
+    table: &str,
+    checks: &[TableCheck],
+) -> Option<WireError> {
+    if check {
+        by_name(checks)
+            .into_iter()
+            .find(|k| expression_uses(&k.clause, column) && uses_other_column(&k.clause, column))
+            .map(|k| check_dependency(&k.name, column))
+    } else {
+        Some(default_dependency(column, table))
+    }
+}
+
 /// MySQL's refusal to rename or drop `columns` (statement order) that
 /// something generated uses: for the first such column, 3108 when one of
 /// the table's own generated columns uses it, else 3837 when a functional
@@ -1041,6 +1194,191 @@ pub fn fx_value_error(code: u16, message: &str) -> Option<FxValueError> {
         row,
         out_of_range,
     })
+}
+
+/// What failed while MariaDB computed an expression on a written value, as
+/// its error says. MySQL reports the same failure inside a functional key
+/// part against the index (3751 or 3752); MariaDB raises it from the
+/// hidden column's expression, which its message doesn't name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FxEvalKind {
+    /// 1292 `Truncated incorrect INTEGER value: '..'` (`CAST(.. AS SIGNED)`
+    /// or `UNSIGNED`).
+    Integer,
+    /// 1292 `Truncated incorrect DOUBLE value: '..'` (`CAST(.. AS DOUBLE)`).
+    Double,
+    /// 1264 `Out of range value for column '(null)'` (`CAST(.. AS
+    /// DECIMAL(m,d))` of a larger number).
+    DecimalRange,
+    /// 1292 ``Incorrect date|datetime|time value: '..' for column
+    /// `db`.`t`.`c` ``: a date function or cast of string column `c`.
+    Temporal {
+        /// The column the message names.
+        column: String,
+    },
+}
+
+/// A MariaDB error raised while computing an expression on a written value
+/// ([`FxEvalKind`]), and its row (from 1; 1 when the message has none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FxEvalError {
+    /// What failed.
+    pub kind: FxEvalKind,
+    /// The row.
+    pub row: u64,
+}
+
+/// The [`FxEvalError`] in MariaDB's 1292 or 1264, when its words are those
+/// of a failed conversion inside an expression. `None` for other errors,
+/// including those naming a hidden column ([`fx_value_error`]).
+#[must_use]
+pub fn fx_eval_error(code: u16, message: &str) -> Option<FxEvalError> {
+    let row = message
+        .rsplit_once(" at row ")
+        .and_then(|(_, r)| r.trim().parse::<u64>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let kind = match code {
+        1264 if message.starts_with("Out of range value for column '(null)'") => {
+            FxEvalKind::DecimalRange
+        }
+        1292 if message.starts_with("Truncated incorrect INTEGER value: ") => FxEvalKind::Integer,
+        1292 if message.starts_with("Truncated incorrect DOUBLE value: ") => FxEvalKind::Double,
+        1292 if [
+            "Incorrect date value: ",
+            "Incorrect datetime value: ",
+            "Incorrect time value: ",
+        ]
+        .iter()
+        .any(|p| message.starts_with(p)) =>
+        {
+            // `... for column `db`.`t`.`c` at row n`: the last part.
+            let at = message.rfind(" for column ")?;
+            let named = &message[at + " for column ".len()..];
+            let named = named.rsplit_once(" at row ").map_or(named, |(n, _)| n);
+            let column = named
+                .rsplit_once("`.`")
+                .map_or(named, |(_, c)| c)
+                .trim_matches(|c| c == '`' || c == '\'')
+                .replace("``", "`");
+            if column.is_empty() || super::fxindex::is_fx_column(&column) {
+                return None;
+            }
+            FxEvalKind::Temporal { column }
+        }
+        _ => return None,
+    };
+    Some(FxEvalError { kind, row })
+}
+
+/// Whether a generation expression (MariaDB's `GENERATION_EXPRESSION` text)
+/// can raise `kind`.
+fn expression_raises(expression: &str, kind: &FxEvalKind) -> bool {
+    let e = expression.to_ascii_lowercase();
+    match kind {
+        FxEvalKind::Integer => e.contains(" as signed)") || e.contains(" as unsigned)"),
+        FxEvalKind::Double => e.contains(" as double)"),
+        FxEvalKind::DecimalRange => e.contains(" as decimal("),
+        FxEvalKind::Temporal { column } => {
+            expression_uses(&e, column)
+                && (e.contains(" as date)")
+                    || e.contains(" as datetime")
+                    || e.contains(" as time")
+                    || TEMPORAL_FUNCTIONS
+                        .iter()
+                        .any(|f| e.contains(&format!("{f}("))))
+        }
+    }
+}
+
+/// Functions that read a string as a date or time, as MariaDB prints them
+/// in a generation expression (`date(s)` prints as `cast(s as date)`).
+const TEMPORAL_FUNCTIONS: &[&str] = &[
+    "year",
+    "month",
+    "day",
+    "dayofmonth",
+    "dayofweek",
+    "dayofyear",
+    "weekday",
+    "week",
+    "yearweek",
+    "quarter",
+    "hour",
+    "minute",
+    "second",
+    "microsecond",
+    "to_days",
+    "to_seconds",
+    "unix_timestamp",
+    "last_day",
+    "monthname",
+    "dayname",
+    "date_format",
+    "extract",
+    "time_to_sec",
+    "datediff",
+    "timestampdiff",
+    "date_add",
+    "date_sub",
+    "adddate",
+    "subdate",
+];
+
+/// The hidden column whose expression raised `e`: the first functional key
+/// part (`parts`: `INDEX_NAME`, `COLUMN_NAME` in MariaDB's `STATISTICS`
+/// order) whose expression can raise it, from the table's columns
+/// (`COLUMN_NAME`, `DATA_TYPE`, `GENERATION_EXPRESSION`). `None` when none
+/// can, when one of the table's own generated columns can too (MySQL then
+/// answers as MariaDB does), or when the temporal column the message names
+/// is itself a date or time column (storing into it failed).
+#[must_use]
+pub fn fx_eval_part(
+    e: &FxEvalError,
+    columns: &[(String, String, Option<String>)],
+    parts: &[(String, String)],
+) -> Option<String> {
+    if let FxEvalKind::Temporal { column } = &e.kind {
+        let (_, data_type, _) = columns
+            .iter()
+            .find(|(n, _, _)| n.eq_ignore_ascii_case(column))?;
+        if ["date", "datetime", "timestamp", "time", "year"]
+            .iter()
+            .any(|t| data_type.eq_ignore_ascii_case(t))
+        {
+            return None;
+        }
+    }
+    let raises = |name: &str| {
+        columns.iter().any(|(n, _, g)| {
+            n.eq_ignore_ascii_case(name)
+                && g.as_deref().is_some_and(|g| expression_raises(g, &e.kind))
+        })
+    };
+    if columns
+        .iter()
+        .any(|(n, _, _)| !super::fxindex::is_fx_column(n) && raises(n))
+    {
+        return None;
+    }
+    parts
+        .iter()
+        .find(|(_, c)| super::fxindex::is_fx_column(c) && raises(c))
+        .map(|(_, c)| c.clone())
+}
+
+/// Whether the statement itself converts as `kind` does (`CAST(.. AS
+/// SIGNED)` in its own text, say): the error may then be its own, which
+/// MySQL reports as MariaDB does.
+#[must_use]
+pub fn statement_converts(original: &[u8], kind: &FxEvalKind) -> bool {
+    let s = String::from_utf8_lossy(original).to_ascii_lowercase();
+    match kind {
+        FxEvalKind::Integer => s.contains("signed"),
+        FxEvalKind::Double => s.contains("double"),
+        FxEvalKind::DecimalRange => s.contains("decimal"),
+        FxEvalKind::Temporal { .. } => false,
+    }
 }
 
 /// MySQL 8.4's error for a value that doesn't fit functional index

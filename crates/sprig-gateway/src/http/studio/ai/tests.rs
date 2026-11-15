@@ -187,7 +187,7 @@ async fn the_stream_has_one_line_per_event() {
         .filter(|l| l["type"] == "text")
         .map(|l| l["text"].as_str().unwrap())
         .collect();
-    assert_eq!(text, "Let me look.It has an email column.");
+    assert_eq!(text, "Let me look.\n\nIt has an email column.");
     assert_eq!(*r.host.calls.lock().unwrap(), ["describe"]);
 }
 

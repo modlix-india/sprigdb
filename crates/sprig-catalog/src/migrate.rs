@@ -53,6 +53,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use mysql_async::Conn;
@@ -303,6 +304,28 @@ impl Ceiling {
             Phase::Contract => m.format <= self.contract,
         }
     }
+}
+
+/// Set by [`never_create_schemas`].
+static NEVER_CREATE: AtomicBool = AtomicBool::new(false);
+
+/// From now on, no migration run in this process creates a missing schema,
+/// whatever its [`MigrateOpts::create_schema`] says: each refuses as
+/// [`MigrateOpts::existing`] does (39072). For processes whose migrations
+/// only bring catalogs that bootstrap made to their newest formats
+/// (gateways and workers). Their runs come from many crates' module
+/// helpers; one of them running after the tenant's deletion dropped the
+/// catalog, or before bootstrap claimed it, made the schema without its
+/// owner mark, which bootstrap then refused as another tenant's.
+pub fn never_create_schemas() {
+    NEVER_CREATE.store(true, Ordering::Relaxed);
+}
+
+/// Whether this process's migration runs may create a missing schema (see
+/// [`never_create_schemas`]).
+#[must_use]
+pub fn schemas_created_here() -> bool {
+    !NEVER_CREATE.load(Ordering::Relaxed)
 }
 
 /// Options of one migration run.
@@ -558,7 +581,7 @@ impl Migrator {
             .await
             .map_err(map_err)?;
         if exists.unwrap_or(0) == 0 {
-            if !opts.create_schema {
+            if !opts.create_schema || !schemas_created_here() {
                 return Err(SprigError::new(
                     SprigCode::TenantNotReady,
                     format!(

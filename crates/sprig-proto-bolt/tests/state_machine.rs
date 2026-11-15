@@ -110,6 +110,16 @@ impl BoltSession for Sess {
                 ..QueryResult::default()
             });
         }
+        if let Some(ms) = query.strip_prefix("WAIT ") {
+            // A slow statement: one record after `ms` milliseconds.
+            tokio::time::sleep(std::time::Duration::from_millis(ms.parse().unwrap_or(0))).await;
+            return Ok(QueryResult {
+                fields: vec!["x".into()],
+                records: VecDeque::from([vec![PackValue::Int(1)]]),
+                qtype: "r",
+                ..QueryResult::default()
+            });
+        }
         if let Some(rest) = query.strip_prefix('S') {
             let (n, fail_at) = match rest.split_once('!') {
                 Some((a, b)) => (a.parse().unwrap_or(0), b.parse().ok()),
@@ -169,6 +179,16 @@ async fn start(
     BoltClient<tokio::io::DuplexStream>,
     tokio::task::JoinHandle<End>,
 ) {
+    start_with(proposals, Config::default()).await
+}
+
+async fn start_with(
+    proposals: Option<[[u8; 4]; 4]>,
+    cfg: Config,
+) -> (
+    BoltClient<tokio::io::DuplexStream>,
+    tokio::task::JoinHandle<End>,
+) {
     let (a, b) = tokio::io::duplex(1 << 20);
     let svc = Arc::new(Svc);
     let h = tokio::spawn(async move {
@@ -178,7 +198,7 @@ async fn start(
             false,
             None,
             svc.as_ref(),
-            &Config::default(),
+            &cfg,
             CancellationToken::new(),
         )
         .await
@@ -487,4 +507,58 @@ async fn bolt_5_8_statuses_gql_failures_and_db() {
     let r = c.query("PLAN", vec![], vec![]).await.expect("run");
     assert_eq!(r.summary.get("statuses"), None);
     assert!(r.summary.get("notifications").is_some());
+}
+
+#[tokio::test]
+async fn slow_requests_send_keepalives_every_half_receive_timeout() {
+    // A 1 s hint: a NOOP every 500 ms while a request runs.
+    let cfg = Config {
+        recv_timeout: std::time::Duration::from_secs(1),
+        ..Config::default()
+    };
+    let (mut c, h) = start_with(None, cfg).await;
+    c.login("u", "pw").await.expect("login");
+    assert_eq!(
+        c.server
+            .get("hints")
+            .and_then(|m| m.get("connection.recv_timeout_seconds")),
+        Some(&PackValue::Int(1))
+    );
+    // A quick statement: none.
+    c.query("1", vec![], vec![]).await.expect("quick");
+    assert_eq!(c.keepalives(), 0);
+    // 1.7 s: NOOPs at 0.5, 1.0 and 1.5 s, then the result.
+    let r = c.query("WAIT 1700", vec![], vec![]).await.expect("slow");
+    assert_eq!(r.records.len(), 1);
+    let after_slow = c.keepalives();
+    assert!((2..=4).contains(&after_slow), "{after_slow} keep-alives");
+    // Pipelined: the earlier statement's answers come first, whole, and
+    // the slow one's after the NOOPs.
+    for q in ["2", "WAIT 1200"] {
+        c.send(&Request::Run {
+            query: q.into(),
+            params: PackValue::Map(vec![]),
+            extra: PackValue::Map(vec![]),
+        })
+        .await
+        .expect("send");
+        c.send(&Request::Pull(PackValue::map([("n", PackValue::Int(-1))])))
+            .await
+            .expect("send");
+    }
+    let mut seen = Vec::new();
+    while seen.len() < 7 {
+        seen.push(match c.recv().await.expect("recv") {
+            Response::Success(_) => "S",
+            Response::Record(_) => "R",
+            other => panic!("{other:?}"),
+        });
+    }
+    assert_eq!(seen, ["S", "R", "R", "S", "S", "R", "S"]);
+    assert!(c.keepalives() > after_slow);
+    c.goodbye().await.expect("bye");
+    assert!(matches!(
+        h.await.expect("join"),
+        End::Defunct(_) | End::Closed
+    ));
 }

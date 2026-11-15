@@ -108,6 +108,8 @@ pub struct Dechunker {
     current: Vec<u8>,
     /// Largest message accepted, in bytes.
     pub max_message: usize,
+    /// Keep-alive (NOOP) chunks skipped so far.
+    pub keepalives: u64,
 }
 
 impl Dechunker {
@@ -117,6 +119,7 @@ impl Dechunker {
         Self {
             current: Vec::new(),
             max_message,
+            keepalives: 0,
         }
     }
 
@@ -134,6 +137,7 @@ impl Dechunker {
             if n == 0 {
                 buf.advance(2);
                 if self.current.is_empty() {
+                    self.keepalives += 1;
                     continue; // keep-alive (NOOP)
                 }
                 return Ok(Some(std::mem::take(&mut self.current)));

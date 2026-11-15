@@ -26,7 +26,9 @@ use hyper::{Method, Response};
 use prost_types::value::Kind;
 use serde_json::{Map, Value, json};
 use sprig_ai::ToolHost;
-use sprig_ai::tools::{Column, ColumnStats, ResultSet, Source, ToolBody, ToolOutput, ToolSpec};
+use sprig_ai::tools::{
+    Column, ColumnStats, ProposalCheck, ResultSet, Source, ToolBody, ToolOutput, ToolSpec,
+};
 use sprig_api::proto::v1::ExecuteResponse;
 use sprig_common::{Result, SprigCode, SprigError};
 use tokio::sync::mpsc;
@@ -35,6 +37,8 @@ use tonic::body::Body;
 use super::super::super::Core;
 use super::super::super::sql::{CHANNEL_DEPTH, Caller, Caps, SqlCall, collect};
 use super::super::{quote_literal, run_sql};
+
+mod skills;
 
 /// Rows `column_stats` reads per table at most.
 pub const STATS_SAMPLE_ROWS: u64 = 100_000;
@@ -453,6 +457,19 @@ impl GatewayHost {
             };
             let _ = write!(sql, " LIKE {}", quote_literal(&pat));
         }
+        // As the values resolve for a table or a database: where each
+        // comes from (its SOURCE_SCOPE) is what a DBA needs before
+        // proposing a change at the narrowest scope.
+        match (s(input, "db"), s(input, "table")) {
+            ("", "") => {}
+            ("", _) => return Err(tool_error("table needs db")),
+            (db, "") => {
+                let _ = write!(sql, " FOR DATABASE {}", ident(db));
+            }
+            (db, table) => {
+                let _ = write!(sql, " FOR TABLE {}.{}", ident(db), ident(table));
+            }
+        }
         let r = self.sql("-", sql).await?;
         let mut rows = objects(&r);
         // `SHOW SPRIG SETTINGS` lists the keys a tenant may set; the
@@ -750,11 +767,29 @@ impl GatewayHost {
             &self.core,
             &self.caller,
             db,
-            &json!({"sql": s(input, "source")}),
+            &json!({"sql": draft_declaration(s(input, "source"))}),
         )
         .await?;
         Ok(ToolOutput::json(reply_json(r).await?))
     }
+}
+
+/// `compile_logic`'s source as a declaration: a KIRun definition alone
+/// is compiled as a function named after it (or `ai_draft`).
+fn draft_declaration(source: &str) -> String {
+    let t = source.trim();
+    if !t.starts_with('{') {
+        return source.to_owned();
+    }
+    let name = serde_json::from_str::<Value>(t)
+        .ok()
+        .and_then(|v| v["name"].as_str().map(str::to_owned))
+        .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or_else(|| "ai_draft".to_owned());
+    format!(
+        "CREATE FUNCTION {name} LANGUAGE kirun AS {}",
+        quote_literal(t)
+    )
 }
 
 /// A count that came back as a float.
@@ -802,6 +837,19 @@ fn index_list(rows: &[Map<String, Value>]) -> Vec<Value> {
 
 #[async_trait]
 impl ToolHost for GatewayHost {
+    async fn check_proposal(&self, spec: &ToolSpec, input: &Value) -> Result<ProposalCheck> {
+        match spec.name {
+            "propose_sql" => {
+                check_proposed_sql(input)?;
+                Ok(ProposalCheck::default())
+            }
+            "propose_policy" | "propose_logic" | "generate_rows" => {
+                self.check_skill(spec.name, input).await
+            }
+            _ => Ok(ProposalCheck::default()),
+        }
+    }
+
     async fn call(&self, spec: &ToolSpec, input: &Value) -> Result<ToolOutput> {
         match spec.name {
             "search_docs" => self.search_docs(input).await,
@@ -875,9 +923,19 @@ impl ToolHost for GatewayHost {
             }
             "column_stats" => self.column_stats(input).await,
             "run_query" => self.run_query(input).await,
+            "test_policy" if !s(input, "policy").trim().is_empty() => self.try_policy(input).await,
             "test_policy" => self.test_policy(input).await,
+            "sensitive_columns" => self.sensitive_columns(input).await,
             "compile_logic" => self.compile_logic(input).await,
             "decision_log" => self.decision_log(input).await,
+            "check_ddl" => Ok(ToolOutput {
+                body: ToolBody::Json(super::schema_check::check_ddl_json(
+                    s(input, "sql"),
+                    s(input, "db"),
+                )),
+                sources: vec![source("rules", "SprigDB's schema rules", "check_ddl")],
+            }),
+            "migration_check" => migration_check(input),
             "metrics_trend" if self.admin() => self.metrics_trend(input).await,
             "metrics_trend" => Err(tool_error(
                 "the metric history is for the administration assistant",
@@ -887,9 +945,109 @@ impl ToolHost for GatewayHost {
     }
 }
 
+/// `migration_check`: a deterministic report, run on the text the model
+/// passed; nothing is read from the tenant.
+fn migration_check(input: &Value) -> Result<ToolOutput> {
+    use super::schema_check as sc;
+    let db = Some(s(input, "db"))
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or("app");
+    let report = match s(input, "source") {
+        "mongodb" => {
+            let colls: Value = serde_json::from_str(s(input, "schema"))
+                .map_err(|e| tool_error(format!("schema isn't JSON: {e}")))?;
+            sc::mongo_report(&colls, db)
+        }
+        source @ ("mysql" | "mariadb") => {
+            let ddl = s(input, "schema");
+            if ddl.len() > sc::MAX_TEXT {
+                return Err(tool_error(format!(
+                    "schema is longer than {} bytes; check it in parts",
+                    sc::MAX_TEXT
+                )));
+            }
+            sc::mysql_report(ddl, db, source)
+        }
+        other => return Err(tool_error(format!("unknown source {other}"))),
+    };
+    Ok(ToolOutput {
+        body: ToolBody::Json(report),
+        sources: vec![source(
+            "rules",
+            "SprigDB's migration rules",
+            "migration_check",
+        )],
+    })
+}
+
+/// Statement kinds whose text `check_ddl`'s rules apply to.
+fn is_schema_change(sql: &str) -> bool {
+    let w: Vec<String> = sql
+        .split_whitespace()
+        .take(2)
+        .map(str::to_ascii_uppercase)
+        .collect();
+    matches!(
+        w.first().map(String::as_str),
+        Some("CREATE" | "ALTER" | "RENAME")
+    ) && !matches!(
+        w.get(1).map(String::as_str),
+        Some("USER" | "ROLE" | "TENANT" | "SPRIG")
+    )
+}
+
+/// The check a proposed statement gets before the user sees it: a schema
+/// change must pass `check_ddl`'s rules, so a proposed `CREATE TABLE`
+/// always parses on SprigDB.
+///
+/// # Errors
+/// What the rules found, for the model to fix.
+pub fn check_proposed_sql(input: &Value) -> Result<()> {
+    let sql = s(input, "sql");
+    if !is_schema_change(sql) {
+        return Ok(());
+    }
+    let r = super::schema_check::check_sql(
+        sql,
+        s(input, "db"),
+        sprig_proto_mysql::packets::Persona::MySql84,
+        true,
+    );
+    if !r.has_errors() {
+        return Ok(());
+    }
+    let errs: Vec<String> = r
+        .findings
+        .iter()
+        .filter(|f| f.level == super::schema_check::Level::Error)
+        .map(|f| format!("{} ({}): {}", f.at, f.rule, f.message))
+        .collect();
+    Err(tool_error(format!(
+        "not proposed: the statement fails SprigDB's schema rules. Fix it and propose again. {}",
+        errs.join("; ")
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proposed_schema_changes_are_checked() {
+        let ok = json!({"db": "shop", "sql": "CREATE TABLE t (id BIGINT PRIMARY KEY, a INT)"});
+        assert!(check_proposed_sql(&ok).is_ok());
+        let bad =
+            json!({"db": "shop", "sql": "CREATE TABLE t (id INT PRIMARY KEY) ENGINE=BLACKHOLE"});
+        let e = check_proposed_sql(&bad).unwrap_err();
+        assert!(e.message.contains("BLACKHOLE"), "{}", e.message);
+        let broken = json!({"db": "shop", "sql": "CREATE TABLE t (id INT PRIMARY KEY,, a)"});
+        assert!(check_proposed_sql(&broken).is_err());
+        // Data changes and other statements aren't held to the DDL rules.
+        let dml = json!({"db": "shop", "sql": "DELETE FROM t WHERE id = 1"});
+        assert!(check_proposed_sql(&dml).is_ok());
+        let pin = json!({"db": "shop", "sql": "SPRIG PIN t SHARD KEY (id)"});
+        assert!(check_proposed_sql(&pin).is_ok());
+    }
 
     #[test]
     fn index_rows_group_by_name() {

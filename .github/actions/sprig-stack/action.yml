@@ -39,6 +39,9 @@ runs:
       shell: bash
       env:
         SPRIG_GATEWAY_PROFILE: release
+        # Compose starts only the chosen topology's nodes; up skips the
+        # clusters whose nodes don't answer instead of failing on them.
+        SPRIG_GATEWAY_SKIP_CLUSTERS: down
       run: deploy/compose/gateway-dev.sh up
     - name: Turn on protocol listeners
       if: inputs.listeners != ''

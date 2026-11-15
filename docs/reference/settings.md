@@ -9,7 +9,7 @@ source: the settings registry (sprig-settings)
 
 Every setting SprigDB declares, with its default, the scopes that may set it, hard bounds and when a change applies. Settings resolve from the most specific scope: object, database, tenant and its ancestors, cluster, data center, global, then the built-in default. Read them with `SHOW SPRIG SETTINGS`, change them with `ALTER TENANT|DATABASE|TABLE … SPRIG SET (key = value)` or `sprigctl settings`.
 
-716 settings in 60 groups.
+717 settings in 60 groups.
 
 ## `advisor`
 
@@ -337,6 +337,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 
 | Key | Type | Default | Scopes | Bounds | Applies | Description |
 |---|---|---|---|---|---|---|
+| `compat.engine_substitution` | text | `innodb` | tenant, global | innodb, reject | live | innodb: a MyISAM, MEMORY, Aria, CSV or ARCHIVE table is created as InnoDB, with the server's warning; reject: the statement fails (3161 on 3306, 1290 on 3307) |
 | `compat.global.max_execution_time` | text | `` | tenant, dc, global | - | new sessions | The tenant's default max_execution_time in ms for new 3306 sessions (SET GLOBAL); empty: 0 |
 | `compat.global.sql_mode` | text | `` | tenant, dc, global | - | new sessions | The tenant's default sql_mode for new sessions (SET GLOBAL sql_mode); empty: the persona's |
 | `compat.global.time_zone` | text | `` | tenant, dc, global | - | new sessions | The tenant's default time_zone for new sessions (SET GLOBAL time_zone); empty: the server's |

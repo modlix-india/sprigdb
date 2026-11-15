@@ -645,7 +645,6 @@ impl JobHandler for LogicSchedule {
             .writer(tenant)
             .await
             .map_err(|e| e.to_string())?;
-        let mut catalog = ep.pool.get_conn().await.map_err(|e| e.to_string())?;
         let cluster = env
             .locator
             .cluster_of(tenant)
@@ -657,7 +656,6 @@ impl JobHandler for LogicSchedule {
             .writer(&cluster)
             .await
             .map_err(|e| e.to_string())?;
-        let mut shard = pool.get_conn().await.map_err(|e| e.to_string())?;
         let store = LogicStore::new(ep.store.schema());
         // Row-level security: the run applies its definer's policies in
         // MariaDB (policy views and write triggers), not an internal
@@ -675,7 +673,12 @@ impl JobHandler for LogicSchedule {
             gateways: None,
             binding_id: 0,
         };
+        // The definer and its policies are read (catalog connections of
+        // their own, from the same pool) before the run's connections are
+        // taken.
         let ctx = guard.context().await.map_err(|e| e.to_string())?;
+        let mut catalog = ep.pool.get_conn().await.map_err(|e| e.to_string())?;
+        let mut shard = pool.get_conn().await.map_err(|e| e.to_string())?;
         if let Some(x) = &ctx {
             shard
                 .exec_drop("SET @sprig_rls = ?", (x.as_str(),))

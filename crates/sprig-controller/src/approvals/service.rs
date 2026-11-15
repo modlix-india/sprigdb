@@ -640,14 +640,54 @@ impl RecommendationsService {
         // A lookup build's duplicates, which only a person can fix.
         let duplicates = target.ends_with(sprig_shard::lookup::admin::DUPLICATES_TARGET_SUFFIX);
         let kind = Kind::parse(&kind)
-            .filter(|k| *k == Kind::VectorAnn || (*k == Kind::AdvisorLookup && duplicates))
+            .filter(|k| {
+                *k == Kind::VectorAnn
+                    || (*k == Kind::AdvisorLookup && duplicates)
+                    || *k == Kind::AiDbaAdvice
+            })
             .ok_or_else(|| {
                 invalid(format!(
-                    "{kind}: gateways ask the gate for vector.ann, and raise advisor.lookup \
-                     duplicates"
+                    "{kind}: gateways ask the gate for vector.ann, raise advisor.lookup \
+                     duplicates, and file ai_dba_advice"
                 ))
             })?;
         let t = TenantId(tenant);
+        if kind == Kind::AiDbaAdvice {
+            // A tenant assistant's suggestion that a user accepted: advice
+            // at the tenant's level (or its database's), never acted on.
+            let mut subject = self.ctl.subject(t).await;
+            if !db.is_empty() {
+                subject.db = Some(self.db_id(t, &db).await?);
+                subject.db_name = Some(db);
+            }
+            let p = Proposal {
+                kind,
+                subject,
+                target: sprig_approvals::model::clip(&format!("t{tenant}/{target}"), 255),
+                action: Action {
+                    text: action,
+                    machine,
+                },
+                evidence,
+                score,
+                summary,
+                emergency: false,
+            };
+            let policy = sprig_approvals::Policy::fixed(
+                Mode::Recommend,
+                sprig_approvals::model::Level::Tenant,
+            );
+            let why = match self.ctl.gate(&p, &policy).await {
+                Verdict::Advice(id) | Verdict::Wait(id) => Some(format!("filed as {id}")),
+                Verdict::Suppressed(id) => Some(format!("ignored ({id})")),
+                Verdict::Proceed(_) | Verdict::Off => None,
+            };
+            return Ok(GateReply {
+                go: false,
+                ticket: None,
+                why,
+            });
+        }
         let db_id = self.db_id(t, &db).await?;
         if kind == Kind::AdvisorLookup {
             // Held for an approval with no timers whatever `advisor.mode`

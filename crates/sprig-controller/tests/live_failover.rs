@@ -17,11 +17,15 @@
 //! - [`galera_repicks_writers_and_heals`]: the shared dev Galera
 //!   (`SPRIG_TEST_MARIADB_GALERA`, three URLs). One node is cut from the
 //!   other two with faultd for 15 s; it leaves the primary component, its
-//!   shards' writers are re-picked among the two left (rendezvous), a write
-//!   sent to it gets 1047; the cut heals and the test waits for Synced 3/3.
+//!   shards' writers are re-picked among the two left (rendezvous, the
+//!   writer set the controller's monitor publishes: a node leaves only
+//!   when it answers outside the primary component or fails three probes
+//!   in a row), a write sent to it gets 1047; the cut heals and the test
+//!   waits for Synced 3/3.
 //!   A commit counts as acknowledged only if the connection's `@@last_gtid`
 //!   moved: Galera can answer OK to the COMMIT of a transaction it rolled
-//!   back. `SPRIG_TEST_GALERA_CONTAINERS` and
+//!   back. Every second process runs with `autocommit = 0`, so its first
+//!   statement opens the transaction. `SPRIG_TEST_GALERA_CONTAINERS` and
 //!   `SPRIG_TEST_FAULTD` point it at a private Galera;
 //!   `SPRIG_TEST_LA_TEXT=1` sends text statements instead of prepared ones.
 //! - [`galera_aborts_report_1213`]: the aborts MariaDB does report.
@@ -51,15 +55,15 @@ use std::time::{Duration, Instant};
 
 use mysql_async::prelude::Queryable;
 use serde_json::{Value, json};
-use sprig_cluster::driver::galera::choose_writer;
+use sprig_cluster::driver::galera::{WriterSetTracker, choose_writer};
 use sprig_cluster::failover::damper::{Damp, DownSources, FlapDamper};
-use sprig_cluster::failover::galera::{GaleraAction, GaleraQuorum, probe_node};
 use sprig_cluster::failover::primary_replica::{
     self as pr, Choice, ReplSource, binlog_pos, check_rpo, choose, diverged, diverged_events,
     drain_relay, expected_loss, promote, rejoin, repoint, semisync_on,
 };
-use sprig_cluster::record::WriterWeight;
+use sprig_cluster::record::{GaleraWriters, TopologyKind, WriterWeight};
 use sprig_cluster::sql::NodeEndpoint;
+use sprig_cluster::{ClusterSettings, HealthTracker, ProbeDepth, Prober};
 use sprig_common::ids::{NodeId, ShardId};
 use sprig_controller::failover::recovery::errant_report;
 use sprig_testkit::faults::compose::{OwnContainer, docker};
@@ -143,6 +147,9 @@ fn start_workload(route: Route, processes: u32, isolation: &'static str, galera:
     let partial = Arc::new(AtomicU64::new(0));
     // Text statements instead of prepared ones (an experiment switch).
     let text = skip::flag("SPRIG_TEST_LA_TEXT");
+    // Leave out the transaction-state check (an experiment switch: the
+    // gateway's checks before it had one).
+    let state_check = !skip::flag("SPRIG_TEST_LA_NO_STATE_CHECK");
     let t0 = Instant::now();
     let next = Arc::new(AtomicU64::new(1));
     let mut tasks = Vec::new();
@@ -157,6 +164,9 @@ fn start_workload(route: Route, processes: u32, isolation: &'static str, galera:
             Arc::clone(&next),
             Arc::clone(&route),
         );
+        // On Galera every second process runs with autocommit = 0 (no
+        // BEGIN), as many JDBC and Hibernate clients do.
+        let ac0 = galera && p % 2 == 1;
         tasks.push(tokio::spawn(async move {
             let mut conn: Option<(String, mysql_async::Conn)> = None;
             // The connection's `@@last_gtid` after its last commit that
@@ -171,16 +181,28 @@ fn start_workload(route: Route, processes: u32, isolation: &'static str, galera:
             };
             while !stop.load(Ordering::SeqCst) {
                 let n = 1 + rnd(3);
-                let mops: Vec<(bool, u64, u64)> = (0..n)
-                    .map(|_| {
-                        let k = rnd(KEYS);
-                        if rnd(2) == 0 {
-                            (true, k, next.fetch_add(1, Ordering::SeqCst))
-                        } else {
-                            (false, k, 0)
-                        }
-                    })
-                    .collect();
+                let mops: Vec<(bool, u64, u64)> = if ac0 {
+                    // An append, a read, an append: after a silent abort at
+                    // the read, the second append would commit a new
+                    // transaction without the first.
+                    let (k1, k2, k3) = (rnd(KEYS), rnd(KEYS), rnd(KEYS));
+                    vec![
+                        (true, k1, next.fetch_add(1, Ordering::SeqCst)),
+                        (false, k2, 0),
+                        (true, k3, next.fetch_add(1, Ordering::SeqCst)),
+                    ]
+                } else {
+                    (0..n)
+                        .map(|_| {
+                            let k = rnd(KEYS);
+                            if rnd(2) == 0 {
+                                (true, k, next.fetch_add(1, Ordering::SeqCst))
+                            } else {
+                                (false, k, 0)
+                            }
+                        })
+                        .collect()
+                };
                 let invoke: Vec<Value> = mops
                     .iter()
                     .map(|(a, k, v)| {
@@ -211,7 +233,16 @@ fn start_workload(route: Route, processes: u32, isolation: &'static str, galera:
                                 ))
                                 .await;
                             if galera {
-                                let _ = c.query_drop("SET SESSION wsrep_sync_wait = 1").await;
+                                let _ = c
+                                    .query_drop(
+                                        "SET SESSION wsrep_sync_wait = 1, \
+                                         session_track_transaction_info = 'STATE'",
+                                    )
+                                    .await;
+                            }
+                            if ac0 && c.query_drop("SET autocommit = 0").await.is_err() {
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                continue;
                             }
                             conn = Some((target, c));
                             last_gtid.clear();
@@ -231,18 +262,40 @@ fn start_workload(route: Route, processes: u32, isolation: &'static str, galera:
                 let mut ended = None;
                 let mut r = tokio::time::timeout(
                     Duration::from_secs(4),
-                    txn(c, &mops, text, &mut ended),
+                    txn(c, &mops, text, ac0, state_check, &mut ended),
                 )
                 .await;
                 if let Some(e) = ended {
                     silent.fetch_add(1, Ordering::SeqCst);
-                    if e.write {
+                    // Outside a transaction a write commits on its own; with
+                    // autocommit = 0 it would have opened one.
+                    let partial_write = e.write && !ac0;
+                    if partial_write {
                         partial.fetch_add(1, Ordering::SeqCst);
                     }
+                    let how = format!(
+                        "{}{}{}",
+                        if ac0 { ", autocommit = 0" } else { "" },
+                        if e.new_trx {
+                            ", a new transaction opened"
+                        } else {
+                            ""
+                        },
+                        e.read
+                            .as_ref()
+                            .map(|r| format!(", read {r}"))
+                            .unwrap_or_default()
+                    );
                     eprintln!(
-                        "silent abort seen at operation {} ({}): process {p}, connection {}, {} ms; txn {invoke:?}",
+                        "silent abort seen at operation {} ({}){how}: process {p}, connection {}, {} ms; txn {invoke:?}",
                         e.at,
-                        if e.write { "a write, which committed on its own" } else { "a read" },
+                        if partial_write {
+                            "a write, which committed on its own"
+                        } else if e.write {
+                            "a write"
+                        } else {
+                            "a read"
+                        },
                         c.id(),
                         ms(t0.elapsed())
                     );
@@ -343,9 +396,16 @@ async fn txn(
     c: &mut mysql_async::Conn,
     mops: &[(bool, u64, u64)],
     text: bool,
+    ac0: bool,
+    state_check: bool,
     ended: &mut Option<Ended>,
 ) -> Result<Vec<Value>, mysql_async::Error> {
-    c.query_drop("BEGIN").await?;
+    // The transaction wrote (its tracked state had a `W`).
+    let mut wrote = false;
+    // With autocommit = 0 the first statement opens the transaction.
+    if !ac0 {
+        c.query_drop("BEGIN").await?;
+    }
     let mut done = Vec::new();
     for (i, (append, k, v)) in mops.iter().enumerate() {
         // A write runs only inside the transaction, as through the gateway
@@ -364,6 +424,8 @@ async fn txn(
                     *ended = Some(Ended {
                         at: i,
                         write: false,
+                        read: None,
+                        new_trx: false,
                     });
                     return Err(silent_abort());
                 }
@@ -397,29 +459,47 @@ async fn txn(
                 .collect();
             done.push(json!(["r", k, list]));
         }
-        // A plain read or write can't end a transaction: an answer saying
-        // none is open means Galera rolled it back without an error.
-        // Stop, as the gateway does.
-        if !in_trans(c) {
+        // A plain read or write can't end a transaction, and with
+        // autocommit = 0 one of the test's table opens it: an answer saying
+        // none is open means Galera rolled it back without an error. Stop,
+        // as the gateway does.
+        //
+        // With autocommit = 0 the statement after the abort may instead
+        // open a new transaction: the state it reports then has lost the
+        // transaction's write, as the gateway checks too.
+        let state = trx_state(c);
+        let lost_write = state_check && wrote && state.as_deref().is_some_and(|t| !t.contains('W'));
+        if !in_trans(c) || lost_write {
             *ended = Some(Ended {
                 at: i,
                 write: *append,
+                read: (!*append).then(|| done.last().cloned()).flatten(),
+                new_trx: lost_write && in_trans(c),
             });
+            if lost_write && in_trans(c) {
+                let _ = c.query_drop("ROLLBACK").await;
+            }
             return Err(silent_abort());
         }
+        wrote |= state.is_some_and(|t| t.contains('W'));
     }
     c.query_drop("COMMIT").await?;
     Ok(done)
 }
 
 /// Where a transaction's statements showed it had been rolled back.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Ended {
     /// The operation whose answer showed it.
     at: usize,
     /// That operation was a write, which then ran outside the transaction
     /// and committed on its own.
     write: bool,
+    /// What a read there returned (an empty list for no row: the statement
+    /// didn't run).
+    read: Option<Value>,
+    /// The statement had opened a new transaction (autocommit = 0).
+    new_trx: bool,
 }
 
 /// The 1213 a silently rolled-back transaction gets in place of OK.
@@ -429,6 +509,23 @@ fn silent_abort() -> mysql_async::Error {
         message: "Galera rolled the transaction back without an error (silent abort)".into(),
         state: "40001".into(),
     })
+}
+
+/// The transaction state the connection's last OK packet reported
+/// (`session_track_transaction_info = STATE`), if it reported one.
+fn trx_state(c: &mysql_async::Conn) -> Option<String> {
+    let p = c.last_ok_packet()?;
+    p.session_state_info()
+        .ok()?
+        .into_iter()
+        .rev()
+        .find(|i| {
+            i.data_type() == mysql_async::consts::SessionStateType::SESSION_TRACK_TRANSACTION_STATE
+        })
+        .map(|i| {
+            let d = i.data_ref();
+            String::from_utf8_lossy(&d[d.len().saturating_sub(8)..]).into_owned()
+        })
 }
 
 /// `SERVER_STATUS_IN_TRANS` in the connection's last OK packet (true when
@@ -1039,35 +1136,55 @@ async fn galera_repicks_writers_and_heals() {
         .collect();
     eprintln!("writers before: {before:?}");
 
-    // The watch: every 500 ms, as the DC leader's galera_watch.
+    // The watch, as the controller's monitor publishes the writer set: light
+    // probes every `cluster.health_interval_seconds`, the health tracker
+    // (a node that only fails a probe keeps its state until
+    // `cluster.unhealthy_after_failures` failures in a row; one that
+    // answers outside the primary component leaves at once), and the
+    // Galera driver's writer-set tracker. A probe slowed down by load must
+    // not move a healthy node's shards.
     let stop = Arc::new(AtomicBool::new(false));
     let (ws, st, eps2) = (Arc::clone(&writers), Arc::clone(&stop), eps.clone());
     let changes = Arc::new(std::sync::Mutex::new(Vec::<(Instant, Vec<NodeId>)>::new()));
     let ch2 = Arc::clone(&changes);
     let watch = tokio::spawn(async move {
-        let mut q = GaleraQuorum::new();
+        let settings = ClusterSettings::default();
+        let prober = Prober::new(settings.probe_timeout);
+        let mut health = HealthTracker::new();
+        let mut tracker = WriterSetTracker::new();
+        let mut published = GaleraWriters {
+            writer_epoch: 1,
+            writers: ws.read().expect("lock").clone(),
+        };
         while !st.load(Ordering::SeqCst) {
-            let mut statuses = Vec::new();
-            for e in &eps2 {
-                statuses.push(probe_node(e, Duration::from_secs(1)).await);
-            }
-            if let GaleraAction::Primary(p) =
-                q.observe(&statuses, Instant::now(), Duration::from_secs(30), true)
-            {
-                let mut cur = ws.write().expect("lock");
-                let now: Vec<NodeId> = cur.iter().map(|w| w.node.clone()).collect();
-                if now != p {
-                    *cur = p
+            let probes = prober
+                .probe_cluster(TopologyKind::Galera, &eps2, ProbeDepth::Light)
+                .await;
+            let report = health.observe(TopologyKind::Galera, &probes, &settings);
+            if let Some(next) = tracker.observe(
+                Some(&published),
+                &report,
+                Instant::now(),
+                settings.galera_writer_rejoin,
+            ) {
+                let p: Vec<NodeId> = next.writers.iter().map(|w| w.node.clone()).collect();
+                eprintln!(
+                    "writer set epoch {}: {p:?} (nodes {:?})",
+                    next.writer_epoch,
+                    report
+                        .nodes
                         .iter()
-                        .map(|n| WriterWeight {
-                            node: n.clone(),
-                            weight: 1.0,
-                        })
-                        .collect();
-                    ch2.lock().expect("lock").push((Instant::now(), p));
-                }
+                        .map(|n| (n.node.to_string(), n.state, n.reason.clone()))
+                        .collect::<Vec<_>>()
+                );
+                ws.write().expect("lock").clone_from(&next.writers);
+                ch2.lock().expect("lock").push((Instant::now(), p));
+                published = next;
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            let next_pass = Instant::now() + settings.health_interval;
+            while Instant::now() < next_pass && !st.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
     });
 

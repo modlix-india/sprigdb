@@ -162,9 +162,9 @@ pub enum Home {
 }
 
 text_enum! {
-    /// What kind of decision is held: `<family>.<action>`, and the
+    /// What kind of decision is held: `<family>.<action>`, the
     /// administration agent's advisory kinds `ai_incident_advice` and
-    /// `ai_health_warning`.
+    /// `ai_health_warning`, and the tenant assistants' `ai_dba_advice`.
     Kind {
         /// Create an index (any model: B-tree, vector, spatial, field column).
         IndexCreate = "index.create",
@@ -205,6 +205,9 @@ text_enum! {
         AiIncidentAdvice = "ai_incident_advice",
         /// The administration agent's health warning. Advisory only.
         AiHealthWarning = "ai_health_warning",
+        /// A tenant assistant's suggestion for people to decide on later,
+        /// filed when a user accepts it. Advisory only: nothing is applied.
+        AiDbaAdvice = "ai_dba_advice",
     }
 }
 
@@ -236,6 +239,7 @@ impl Kind {
             Kind::FailoverCluster | Kind::FailoverDc => "failover.mode",
             Kind::GraphPartition => "graph.auto_partition",
             Kind::AiIncidentAdvice | Kind::AiHealthWarning => "ai.admin.enabled",
+            Kind::AiDbaAdvice => "ai.enabled",
         }
     }
 
@@ -253,9 +257,11 @@ impl Kind {
             | Kind::AdvisorRekey
             | Kind::AdvisorReference
             | Kind::AdvisorLookup => Level::Database,
-            Kind::BalancerMove | Kind::DcMove | Kind::StandbyCreate | Kind::StandbyDrop => {
-                Level::Tenant
-            }
+            Kind::BalancerMove
+            | Kind::DcMove
+            | Kind::StandbyCreate
+            | Kind::StandbyDrop
+            | Kind::AiDbaAdvice => Level::Tenant,
             Kind::FailoverCluster
             | Kind::FailoverDc
             | Kind::AiIncidentAdvice
@@ -296,6 +302,8 @@ impl Kind {
             Kind::FailoverCluster | Kind::FailoverDc => H,
             // Refreshed while the errors go on; a week without any closes it.
             Kind::AiIncidentAdvice => 7 * 24 * H,
+            // Nothing refreshes it: it waits a month for someone to decide.
+            Kind::AiDbaAdvice => 30 * 24 * H,
         })
     }
 

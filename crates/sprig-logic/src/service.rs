@@ -357,6 +357,64 @@ pub fn compile_bound(
     }
 }
 
+/// A validation's or after-commit trigger's deploy checks against
+/// `table`, without recording or deploying anything: the table exists,
+/// the body compiles (and QuickJS accepts JavaScript), it compiles into
+/// the MariaDB tier, and its parameters name the table's columns. The
+/// notes say how it would be enforced.
+///
+/// # Errors
+/// As [`deploy_bound`] would refuse it: 1146, the compiler's, 39862,
+/// 39874.
+pub fn check_bound(
+    d: &Declaration,
+    db: &str,
+    table: &str,
+    cols: &StaticColumns,
+    opts: &Options,
+) -> Result<Vec<String>> {
+    if !sprig_logic_compile::Columns::has_table(cols, table) {
+        return Err(SprigError::standard(
+            1146,
+            *b"42S02",
+            format!("Table '{db}.{table}' doesn't exist"),
+        ));
+    }
+    let compiled = compile_bound(d, table, cols, opts)?;
+    if d.runtime == sprig_logic_compile::Runtime::Javascript {
+        sprig_logic_js::Program::new(
+            d.runtime.as_str(),
+            &d.name,
+            &d.body,
+            crate::testrun::js_row_sig(&d.body),
+        )?;
+    }
+    let placed = placement::place(&compiled, d.tier, true)?;
+    let (Some(f), Tier::MariaDb) = (&compiled.ir, placed.tier) else {
+        let why: Vec<String> = placed.reasons.iter().map(ToString::to_string).collect();
+        return Err(unsupported(format!(
+            "{} {} must compile into MariaDB ({})",
+            d.kind.as_str(),
+            d.name,
+            why.join("; ")
+        )));
+    };
+    let bound = enforce::bind_row(f, table, cols)?;
+    let mut notes = Vec::new();
+    if d.kind == Kind::Validation {
+        let (en, why) = enforce::plan_validation(f, &bound, &d.events, 0, 0);
+        notes.push(match en {
+            Enforcement::Check { .. } => "enforced by a CHECK constraint".to_owned(),
+            Enforcement::Triggers => {
+                format!("enforced by BEFORE triggers ({})", why.unwrap_or_default())
+            }
+        });
+    } else {
+        notes.push("runs after each commit, from the change feed".to_owned());
+    }
+    Ok(notes)
+}
+
 /// The engine's parameter type for an IR type.
 #[must_use]
 pub fn param_ty(t: sprig_logic_compile::ir::Ty) -> sprig_logic_js::ParamTy {

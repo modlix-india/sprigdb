@@ -600,6 +600,45 @@ async fn jwt_logins_live() {
                     role.as_deref().is_some_and(|r| r.contains("ajgate")),
                     || format!("{role:?}"),
                 );
+                // SHOW GRANTS lists the token role as granted to the account,
+                // and shows its privileges as an active role's.
+                let lines: Vec<String> = s.query("SHOW GRANTS").await.unwrap_or_default();
+                let (role_line, priv_line) = if proto == "mysql" {
+                    (
+                        "GRANT `ajgate`@`%` TO `tok`@`%`",
+                        "GRANT SELECT ON `ajdb`.`gated` TO `tok`@`%`",
+                    )
+                } else {
+                    (
+                        "GRANT `ajgate` TO `tok`@`%`",
+                        "GRANT SELECT ON `ajdb`.`gated` TO `ajgate`",
+                    )
+                };
+                c.ok(
+                    &format!("{proto}: SHOW GRANTS lists the token role and its privileges"),
+                    lines.iter().any(|l| l == role_line) && lines.iter().any(|l| l == priv_line),
+                    || format!("{lines:?}"),
+                );
+                if proto == "mysql" {
+                    let lines: Vec<String> = s
+                        .query("SHOW GRANTS FOR CURRENT_USER() USING ajgate")
+                        .await
+                        .unwrap_or_default();
+                    c.ok(
+                        "mysql: SHOW GRANTS ... USING the token role",
+                        lines.iter().any(|l| l == priv_line),
+                        || format!("{lines:?}"),
+                    );
+                    // A role neither granted nor the token's: 3530.
+                    let r = s
+                        .query::<String, _>("SHOW GRANTS FOR CURRENT_USER() USING ajghost2")
+                        .await;
+                    c.ok(
+                        "mysql: USING a role not granted: 3530",
+                        r.as_ref().is_err_and(|e| code(e) == 3530),
+                        || format!("{r:?}"),
+                    );
+                }
                 if proto == "mysql" {
                     s.query_drop("SET ROLE NONE").await.unwrap();
                     let r = gated(&mut s).await;

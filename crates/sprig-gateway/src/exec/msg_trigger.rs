@@ -171,9 +171,15 @@ impl PassSession {
         let svc = Arc::clone(ts.services());
         let tenant = ts.tenant;
         let ep = svc.locator.writer(tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-        })?;
+        let catalog_conn = || {
+            let pool = ep.pool.clone();
+            async move {
+                pool.get_conn().await.map_err(|e| {
+                    SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable")
+                        .with_source(e)
+                })
+            }
+        };
         let source_db = src.db.clone().unwrap_or_else(|| db.clone());
         // `ON STREAM s FAN IN` reads every member instance of
         // the inherited stream `s` below this tenant.
@@ -269,7 +275,8 @@ impl PassSession {
                 {
                     return Err(denied(ts, "SELECT and DELETE", &source_db, &src.name));
                 }
-                let id: Option<u64> = conn
+                let id: Option<u64> = catalog_conn()
+                    .await?
                     .exec_first(
                         format!(
                             "SELECT object_id FROM {}.mq_queues WHERE db_id = ? AND name = ? \
@@ -299,6 +306,10 @@ impl PassSession {
                 (r, id, None)
             }
         };
+        // Taken after the chain's loads above and given back before the
+        // fan-in attach below, which take catalog connections of their own
+        // from the same pool (4 per cluster).
+        let mut conn = catalog_conn().await?;
         let deployed = sprig_logic::messages::deploy(
             &decl,
             sprig_logic::messages::MsgTarget {
@@ -348,6 +359,7 @@ impl PassSession {
                 ));
             }
         }
+        drop(conn);
         if let Some(def) = &fanin_def {
             let n = crate::inherited::fanin_triggers::attach_existing(
                 &svc,

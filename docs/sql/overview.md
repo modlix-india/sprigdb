@@ -99,6 +99,24 @@ Schema changes go through SprigDB's catalog, so every gateway sees a new definit
 - Views and stored programs get your own account as `DEFINER` unless you name another account, which needs `SET_ANY_DEFINER`; see [Definers](tenants-and-accounts.md#definers).
 - A DDL statement of a shape the catalog can't handle fails with 39051.
 
+### Storage engines
+
+Every SprigDB table is InnoDB: Galera replicates only InnoDB, and tables are moved, copied and restored as InnoDB. A statement that asks for another engine is answered the way MySQL and MariaDB answer when that engine is turned off:
+
+| Engine asked for | `compat.engine_substitution = innodb` (default) | `= reject` |
+|---|---|---|
+| `MyISAM`, `MEMORY` (`HEAP`), `Aria`, `CSV`, `ARCHIVE` | `CREATE TABLE` makes an InnoDB table. On 3306: warnings 3161 (`Storage engine MyISAM is disabled (Table creation is disallowed).`) and 1266 (`Using storage engine InnoDB for table 't'`), as MySQL 8.4 does. On 3307: note 1266, as MariaDB does with `enforce_storage_engine=InnoDB` | The statement fails: 3161 on 3306, 1290 on 3307 |
+| `MRG_MYISAM`, `BLACKHOLE`, `FEDERATED`, `Columnstore`, `SPIDER`, `CONNECT`, `S3`, `SEQUENCE` and other engines that don't keep their rows in InnoDB | Always fails: 3161 on 3306, 1286 on 3307 | The same |
+| `InnoDB`, or a name neither server knows | Passed to MariaDB, which answers as usual (1286 for an unknown engine) | The same |
+
+- `ALTER TABLE ... ENGINE=MyISAM` on 3306 leaves the table as it is, with MySQL's warning 1286 (`Unknown storage engine 'MyISAM'`); on 3307 it becomes `ENGINE=InnoDB` with note 1266.
+- A `CREATE TABLE` without `ENGINE` uses the session's `default_storage_engine`, with the same rules.
+- A partition's engine becomes InnoDB without a warning of its own.
+- Temporary tables keep the engine you name, since they are never replicated or moved.
+- `SHOW CREATE TABLE` and the catalog's DDL history show `ENGINE=InnoDB`.
+
+The session's `sql_mode` doesn't change this: substitution happens even with `NO_ENGINE_SUBSTITUTION`, which MySQL's default `sql_mode` includes. Set `compat.engine_substitution` (tenant or global) to `reject` when an application must not silently get InnoDB.
+
 ### SQL-level prepared statements
 
 `PREPARE`, `EXECUTE`, `EXECUTE IMMEDIATE` and `DEALLOCATE PREPARE` (or `DROP PREPARE`) work on every tenant. On a tenant whose tables are all unsharded, they go to MariaDB unchanged, and the session then keeps one backend connection until it ends, since SprigDB can't replay a statement MariaDB holds. Once a tenant has a sharded table, the gateway holds the statements itself, so they work across shards, clusters and moves:

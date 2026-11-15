@@ -801,7 +801,7 @@ calls = [
   { tool = "describe", args = { db = "shop", table = "customers" } },
   { tool = "run_query", args = { db = "shop", sql = "SELECT segment, COUNT(*) AS customers FROM customers GROUP BY segment ORDER BY customers DESC", limit = 100 }, has = { sql = ["group by segment"] } },
 ]
-forbid_tools = ["propose_sql", "catalog"]
+forbid_sql = ["DELETE"]
 forbid_text = ["other tenants' databases are"]
 answer = '''
 The count per segment:

@@ -1320,7 +1320,22 @@ async fn typed_tables_in_groups() {
                 &["a-truck", "b-small", "b-truck", "c-small"],
             )
             .await;
-            // A subtype a declares later reaches b and c.
+            // A subtype a declares later reaches b and c, while other
+            // sessions at b and c run statements (each one brings its
+            // tenant up to its parent too: an adoption half done by one
+            // must never show to another as a plain table, 1054).
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut others = Vec::new();
+            for name in &t[1..] {
+                let mut o = conn(ep, name).await;
+                let (stop, db) = (std::sync::Arc::clone(&stop), db.clone());
+                others.push(tokio::spawn(async move {
+                    let _ = try_exec(&mut o, &format!("USE {db}")).await;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = try_exec(&mut o, "SELECT COUNT(*) FROM vehicle").await;
+                    }
+                }));
+            }
             exec(
                 &mut c[0],
                 "CREATE TABLE van (doors INT NULL) INHERITS (vehicle) WHERE vtype = 'VAN'",
@@ -1329,6 +1344,10 @@ async fn typed_tables_in_groups() {
             assert_eq!(names(&mut c[0], "SELECT name FROM van").await, ["a-van"]);
             names_become(&mut c[1], "SELECT name FROM van", &["a-van"]).await;
             names_become(&mut c[2], "SELECT name FROM van", &["a-van"]).await;
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            for o in others {
+                o.await.unwrap();
+            }
             eprintln!(
                 "{p}/{mode}/{storage}: typed tree inherited a > b > c, c's own subtype, {} ms",
                 t0.elapsed().as_millis()

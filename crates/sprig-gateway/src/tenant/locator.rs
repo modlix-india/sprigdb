@@ -42,6 +42,8 @@ use crate::backend::Backends;
 
 /// Connections per cluster for catalog work and database DDL.
 const POOL_MAX: usize = 4;
+/// The test hook that shrinks the catalog pools (see [`catalog_pool_max`]).
+const CATALOG_POOL_MAX_ENV: &str = "SPRIG_TEST_CATALOG_POOL_MAX";
 /// How long an idle `sprig_ctl` connection stays open.
 const IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 /// The longest a catalog connection lives (give or take
@@ -51,6 +53,33 @@ const IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 const CATALOG_CONN_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 /// Spreads the catalog connections' renewals.
 const CATALOG_CONN_JITTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Connections per cluster in a catalog pool: [`POOL_MAX`], or fewer (1 to
+/// 4) with the test hook `SPRIG_TEST_CATALOG_POOL_MAX`.
+///
+/// A task holds at most one catalog connection at a time, and gives it back
+/// before anything that takes another from the same pool (a catalog
+/// change, a snapshot load, a migration, a nested statement). A path that
+/// held one while asking for more needed several at once and failed with
+/// 39070 ("catalog begin timed out") whenever the others were busy. With
+/// the hook at 1, such a path waits for itself, so a live suite run against
+/// a gateway started with it finds them.
+fn catalog_pool_max() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        let n = std::env::var(CATALOG_POOL_MAX_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(POOL_MAX, |n| n.clamp(1, POOL_MAX));
+        if n < POOL_MAX {
+            tracing::warn!(
+                connections = n,
+                "{CATALOG_POOL_MAX_ENV} is set: catalog pools are smaller than usual (a test hook)"
+            );
+        }
+        n
+    })
+}
 
 /// Finds tenants' catalogs and data clusters (see the module docs).
 pub struct GatewayLocator {
@@ -637,7 +666,12 @@ impl GatewayLocator {
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(cluster.clone(), u.to_owned());
         }
-        let constraints = PoolConstraints::new(0, POOL_MAX).unwrap_or_default();
+        let max = if catalog {
+            catalog_pool_max()
+        } else {
+            POOL_MAX
+        };
+        let constraints = PoolConstraints::new(0, max).unwrap_or_default();
         let mut opts = OptsBuilder::from_opts(ep.opts);
         if catalog {
             // Catalog statements name the tenant's schema, so a few

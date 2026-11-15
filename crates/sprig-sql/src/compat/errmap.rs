@@ -144,6 +144,13 @@ pub fn to_mysql(e: &WireError) -> Option<WireError> {
                 ))
             }
         }
+        // A trigger's FOLLOWS or PRECEDES naming no trigger of that timing
+        // and event: MySQL's number, and its full stop.
+        4031 if e.message.starts_with("Referenced trigger ") => Some(WireError::new(
+            3011,
+            *b"HY000",
+            format!("{}.", e.message.trim_end().trim_end_matches('.')),
+        )),
         1451 if e.message.trim_end()
             == "Cannot delete or update a parent row: a foreign key constraint fails" =>
         {
@@ -430,6 +437,21 @@ mod tests {
                 3024,
                 *b"HY000",
                 "Query execution was interrupted, maximum statement execution time exceeded"
+                    .to_owned()
+            ))
+        );
+        // A trigger's FOLLOWS naming another timing's trigger (both servers'
+        // texts measured on 15 November 2026).
+        assert_eq!(
+            map(
+                4031,
+                b"HY000",
+                "Referenced trigger 'tf1' for the given action time and event type does not exist"
+            ),
+            Some((
+                3011,
+                *b"HY000",
+                "Referenced trigger 'tf1' for the given action time and event type does not exist."
                     .to_owned()
             ))
         );

@@ -241,15 +241,32 @@ impl std::fmt::Debug for Agent {
     }
 }
 
+/// The text put between the answers of two model calls in one turn, so
+/// the words before a tool round and after it don't run together.
+pub const CALL_BREAK: &str = "\n\n";
+
 /// Forwards a provider's deltas as turn events.
 struct Forward<'a> {
     sink: &'a mut dyn TurnSink,
+    /// An earlier call of this turn streamed text: the first text of this
+    /// call starts with [`CALL_BREAK`].
+    pending_break: bool,
+    /// This call streamed text.
+    wrote: bool,
 }
 
 impl ChatSink for Forward<'_> {
     fn delta(&mut self, d: Delta) -> Result<()> {
         match d {
-            Delta::Text(t) => self.sink.event(TurnEvent::Text(t)),
+            Delta::Text(t) if t.is_empty() => Ok(()),
+            Delta::Text(t) => {
+                self.wrote = true;
+                if std::mem::take(&mut self.pending_break) {
+                    self.sink.event(TurnEvent::Text(format!("{CALL_BREAK}{t}")))
+                } else {
+                    self.sink.event(TurnEvent::Text(t))
+                }
+            }
             Delta::Thinking(t) => self.sink.event(TurnEvent::Thinking(t)),
             Delta::Usage(u) => self.sink.event(TurnEvent::Usage(u)),
             // Announced when the call runs.
@@ -365,6 +382,8 @@ impl Agent {
         let mut sources: Vec<Source> = Vec::new();
         let mut sent = Vec::new();
         let mut tools_called: Vec<String> = Vec::new();
+        // Text streamed by an earlier model call of this turn.
+        let mut streamed_text = false;
         let stop = loop {
             cfg.budget.check(used, usage.billable())?;
             let left = cfg.budget.remaining(used, usage.billable());
@@ -383,9 +402,13 @@ impl Agent {
             };
             gate.check(&mut creq)?;
             let call = {
-                let mut fwd = Forward { sink: &mut *sink };
+                let mut fwd = Forward {
+                    sink: &mut *sink,
+                    pending_break: streamed_text,
+                    wrote: false,
+                };
                 let chat = self.provider.chat(creq, &mut fwd);
-                tokio::select! {
+                let r = tokio::select! {
                     biased;
                     () = cancel.cancelled() => None,
                     r = tokio::time::timeout_at(deadline, chat) => match r {
@@ -396,7 +419,9 @@ impl Agent {
                             true,
                         ))),
                     },
-                }
+                };
+                streamed_text |= fwd.wrote;
+                r
             };
             let outcome = match call {
                 None => break Stop::Other("stopped".to_owned()),
@@ -640,6 +665,7 @@ impl Agent {
     }
 
     /// Checks and runs one call.
+    #[allow(clippy::too_many_lines)] // checked, proposed or read: one path each
     async fn call(
         &self,
         gate: &EgressGate,
@@ -670,11 +696,42 @@ impl Agent {
             }
         };
         if spec.effect == Effect::Propose {
+            // The host checks it (statements parse and pass SprigDB's
+            // rules, a policy is tried as its test users, logic compiled,
+            // rows generated); what it finds rides on the proposal, and a
+            // failure goes back to the model to fix.
+            let checked =
+                match tokio::time::timeout(TOOL_TIMEOUT, host.check_proposal(&spec, input)).await {
+                    Ok(Ok(c)) => c,
+                    Ok(Err(e)) => {
+                        crate::metrics::tool_call(name, "error");
+                        return fail(&e.message, false);
+                    }
+                    Err(_) => {
+                        crate::metrics::tool_call(name, "error");
+                        return fail(
+                            &format!(
+                                "checking {name} took longer than {}s",
+                                TOOL_TIMEOUT.as_secs()
+                            ),
+                            false,
+                        );
+                    }
+                };
             return match ToolRegistry::propose(&spec, id, input) {
-                Ok(p) => {
+                Ok(mut p) => {
+                    p.checks = checked.checks;
+                    p.generated = checked.generated;
                     crate::metrics::tool_call(name, "proposed");
                     crate::metrics::proposal(p.kind.as_str(), "shown");
-                    let note = ToolRegistry::proposal_note(&p);
+                    // The note passes the gate like a result (secrets
+                    // masked); it never holds what was generated.
+                    let note = gate
+                        .tool_result(
+                            &spec,
+                            &crate::tools::ToolOutput::json(ToolRegistry::proposal_note(&p)),
+                        )
+                        .stored;
                     Called {
                         result: Block::ToolResult {
                             tool_use_id: id.to_owned(),

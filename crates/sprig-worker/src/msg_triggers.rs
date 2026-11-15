@@ -487,6 +487,10 @@ impl MsgEnv {
         // The source itself (a fan-in trigger's: its definition).
         let alive = match source.kind {
             SourceKind::Stream if source.fanin_definition().is_some() => {
+                // The declarer's catalog may be on the same cluster: its
+                // connection comes from the same pool, so this one goes
+                // back first.
+                drop(c);
                 let (dt, dobj) = source.fanin_definition().unwrap_or((0, 0));
                 self.definition_active(TenantId(dt), dobj).await?
             }
@@ -648,18 +652,25 @@ impl MsgEnv {
 /// fails, it (one more attempt) and every later one go back to `dead`, so
 /// nothing runs out of order. Returns how many ran.
 async fn replay_due(l: &Loaded, t: &Template, gw: &dyn Gateway) -> Result<u64> {
-    let mut c = l.catalog.get_conn().await.map_err(db_err)?;
+    // A catalog connection per step: none is held across a run, which
+    // takes the gateway's time and the trigger's budget.
     let store = LogicStore::new(&l.schema);
-    let rows = store
-        .dead_letters(&mut c, Some(l.source.binding_id), Some("replaying"), 100)
-        .await?;
+    let rows = {
+        let mut c = l.catalog.get_conn().await.map_err(db_err)?;
+        store
+            .dead_letters(&mut c, Some(l.source.binding_id), Some("replaying"), 100)
+            .await?
+    };
     if rows.is_empty() {
         return Ok(0);
     }
     let group = messages::replay_group(l.source.binding_id);
     let mut n = 0;
     for r in rows {
-        offsets::init_positions(&mut c, &l.schema, &group, r.dl_id, &[(0, 0)]).await?;
+        {
+            let mut c = l.catalog.get_conn().await.map_err(db_err)?;
+            offsets::init_positions(&mut c, &l.schema, &group, r.dl_id, &[(0, 0)]).await?;
+        }
         let mut req = t.req.clone();
         req.version = t.version.load(Ordering::Relaxed);
         req.record = None;
@@ -668,6 +679,7 @@ async fn replay_due(l: &Loaded, t: &Template, gw: &dyn Gateway) -> Result<u64> {
             event: r.event.clone(),
         });
         let reply = gw.run(&req).await?;
+        let mut c = l.catalog.get_conn().await.map_err(db_err)?;
         match reply.outcome {
             messages::RunOutcome::Ok | messages::RunOutcome::Moved => {
                 store

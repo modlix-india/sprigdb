@@ -20,6 +20,7 @@
 
 pub mod collation;
 pub mod ddl;
+pub mod engine;
 pub mod errmap;
 pub mod explain;
 pub mod exprprint;

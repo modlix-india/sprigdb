@@ -120,6 +120,13 @@ impl Pins {
         self.in_trans
     }
 
+    /// Whether `SET TRANSACTION` set the next transaction's
+    /// characteristics.
+    #[must_use]
+    pub fn next_transaction_set(&self) -> bool {
+        self.next_trx
+    }
+
     /// Whether anything but an open transaction (and the session mode)
     /// pins: losing the connection then loses state.
     #[must_use]

@@ -238,7 +238,7 @@ pub async fn ensure_vhost(
         .run(
             &mut c,
             ep.store.schema(),
-            &sprig_catalog::migrate::MigrateOpts::default(),
+            &sprig_catalog::migrate::MigrateOpts::existing(),
         )
         .await?;
     }

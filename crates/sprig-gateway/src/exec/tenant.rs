@@ -1147,6 +1147,17 @@ impl PassSession {
             Ok(None) => text,
             Err(e) => return self.fail(out, &e).await,
         };
+        // Storage engines other than InnoDB: an InnoDB table with the
+        // server's warning, or refused (exec/engine.rs).
+        let engine_owned;
+        let text: &Bytes = match self.engine_substitution(text) {
+            super::engine::EngineStep::Run => text,
+            super::engine::EngineStep::Rewritten(t) => {
+                engine_owned = t;
+                &engine_owned
+            }
+            super::engine::EngineStep::Refused(e) => return self.fail(out, &e).await,
+        };
         // MySQL's answers to DDL that need a lookup: long names, descending
         // parts of MyISAM tables, a column of a multi-column unique index
         // (exec/mysql_ddl.rs).
@@ -1744,6 +1755,12 @@ impl PassSession {
         status: StatusFlags,
         out: &mut dyn ResultSink,
     ) -> Result<Route> {
+        // The engine step's warnings (exec/engine.rs), answered with the OK.
+        let engine_notes = self
+            .tenant
+            .as_deref_mut()
+            .and_then(|ts| ts.warnings.take())
+            .unwrap_or_default();
         let Some(ts) = self.tenant.as_deref() else {
             return Err(SprigError::internal("no tenant"));
         };
@@ -2082,16 +2099,19 @@ impl PassSession {
                     // so the next statement sees what it saw.
                     ts.changed(outcome.version.or(outcome.seen));
                     ts.changed(sinks_version);
-                    if !outcome.notes.is_empty() || definer_note.is_some() {
+                    if !outcome.notes.is_empty()
+                        || definer_note.is_some()
+                        || !engine_notes.is_empty()
+                    {
                         ts.warnings = Some(
-                            outcome
-                                .notes
+                            engine_notes
                                 .iter()
-                                .map(|n| LocalWarning {
+                                .cloned()
+                                .chain(outcome.notes.iter().map(|n| LocalWarning {
                                     level: "Note",
                                     code: n.code,
                                     message: n.message.clone(),
-                                })
+                                }))
                                 .chain(definer_note.clone())
                                 .collect(),
                         );
@@ -2112,9 +2132,10 @@ impl PassSession {
                 }
                 let mut ok = OkPacket::new(status);
                 ok.affected_rows = outcome.affected_rows;
-                ok.warnings =
-                    u16::try_from(outcome.notes.len() + usize::from(definer_note.is_some()))
-                        .unwrap_or(u16::MAX);
+                ok.warnings = u16::try_from(
+                    engine_notes.len() + outcome.notes.len() + usize::from(definer_note.is_some()),
+                )
+                .unwrap_or(u16::MAX);
                 // An `ALTER TABLE`, `CREATE INDEX` or
                 // `DROP INDEX` reports what the backend did, with its
                 // `Records: R  Duplicates: D  Warnings: W` line, as MariaDB
@@ -2123,7 +2144,11 @@ impl PassSession {
                     && matches!(stmt, DdlStatement::AlterObject { .. })
                 {
                     ok.affected_rows = ok.affected_rows.max(affected);
-                    ok.info = Bytes::from(info);
+                    // The line counts the gateway's own warnings too.
+                    ok.info = Bytes::from(sprig_sql::compat::engine::info_with_warnings(
+                        &info,
+                        engine_notes.len(),
+                    ));
                 }
                 if matches!(stmt, DdlStatement::DropDatabase { .. })
                     && self.current_logical().is_none()
@@ -2250,6 +2275,11 @@ impl PassSession {
         out: &mut dyn ResultSink,
         err: &SprigError,
     ) -> Result<Step> {
+        // The gateway's warnings of a statement that failed (the engine
+        // step's, say) are no answer to the next SHOW WARNINGS.
+        if let Some(ts) = self.tenant.as_deref_mut() {
+            ts.warnings = None;
+        }
         let shown = SprigError {
             kind: err.kind,
             message: err.message.clone(),

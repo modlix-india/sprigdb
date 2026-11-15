@@ -18,9 +18,10 @@ CREATE TABLE c_md6_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 
 RENAME TABLE c_md6_ct TO c_md6_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;
 ALTER TABLE c_md6_ct RENAME TO c_md6_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;
 CREATE VIEW c_md6_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS SELECT 1;
--- MyISAM has no descending indexes: 1178.
-CREATE TABLE c_md6_my (a int, b int, KEY k (a DESC, b)) ENGINE=MyISAM;
-CREATE TABLE c_md6_my2 (a int, KEY k (a)) ENGINE=MyISAM;
+-- MyISAM has no descending indexes: 1178. Temporary tables, since SprigDB
+-- makes every other table InnoDB (check mysql_engines).
+CREATE TEMPORARY TABLE c_md6_my (a int, b int, KEY k (a DESC, b)) ENGINE=MyISAM;
+CREATE TEMPORARY TABLE c_md6_my2 (a int, KEY k (a)) ENGINE=MyISAM;
 CREATE INDEX k2 ON c_md6_my2 (a DESC);
 ALTER TABLE c_md6_my2 ADD UNIQUE INDEX k3 (a DESC);
 -- DEFAULT (now()) is an expression default, apart from CURRENT_TIMESTAMP.
