@@ -1,4 +1,4 @@
-//! Chapter 32 through a running gateway (R6 order 1, single-shard tenant):
+//! Types through a running gateway (single-shard tenant):
 //! types and subtypes, writes through subtypes, polymorphic reads and
 //! filters, `ONLY`, abstract and auto-increment roots, schema metadata,
 //! and record hierarchies checked against a reference tree kept in Rust.
@@ -695,7 +695,7 @@ async fn types_and_subtypes() {
         );
 
         // Dropping a leaf, then a subtree with CASCADE: their rows stay,
-        // as rows of the parent (T8, the lead's choice of 12 November).
+        // as rows of the parent.
         exec(&mut c, "DROP TABLE truck").await;
         for a in model.values_mut().filter(|a| a.ty == "truck") {
             a.ty = "vehicle";
@@ -1082,8 +1082,8 @@ async fn hierarchies_match_a_reference_tree() {
     }
 }
 
-/// Kiran's discriminator model (inheritance plan section 7, Q2): a row's
-/// type is the subtype that declares its `vtype`, else the root.
+/// The discriminator model: a row's type is the subtype that declares its
+/// `vtype`, else the root.
 struct Fleet {
     /// id to vtype.
     rows: BTreeMap<i64, String>,
@@ -1385,9 +1385,8 @@ async fn discriminator_columns() {
             exec(&mut c, "UPDATE car SET doors = 4").await;
             let d = rows(&mut c, "SELECT COUNT(*) FROM car WHERE doors = 4").await;
             assert_eq!(d[0][0], m.ids("car", false).len().to_string());
-            // Dropping smalltruck keeps its rows (T8, the lead's choice of
-            // 12 November): their value is undeclared now, so they are the
-            // root's.
+            // Dropping smalltruck keeps its rows: their value is undeclared
+            // now, so they are the root's.
             exec(&mut c, "DROP TABLE smalltruck").await;
             m.declared.retain(|d| d.1 != "smalltruck");
             exec(
@@ -1563,7 +1562,7 @@ async fn not_null_checks_and_discriminator_conversion() {
             ids(&mut c, "SELECT id FROM lorry ORDER BY id").await,
             vec![3, 6]
         );
-        // Dropping the subtype keeps its rows (T8) and its column, nullable.
+        // Dropping the subtype keeps its rows and its column, nullable.
         exec(&mut c, "DROP TABLE minilorry").await;
         exec(
             &mut c,

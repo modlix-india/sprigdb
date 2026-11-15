@@ -1,6 +1,6 @@
-//! Writes on typed tables (chapter 32, "INSERT", "UPDATE", "DELETE"; build
-//! step 5): one statement per physical table, in one transaction (or under
-//! a savepoint inside the client's), with MySQL's row counts.
+//! Writes on typed tables (`INSERT`, `UPDATE`, `DELETE`): one statement per
+//! physical table, in one transaction (or under a savepoint inside the
+//! client's), with MySQL's row counts.
 //!
 //! Not built in this release (39710): `INSERT ... SELECT`, `INSERT
 //! IGNORE`, `REPLACE` and `ON DUPLICATE KEY UPDATE` into a subtype, and
@@ -891,8 +891,8 @@ pub async fn update(upd: &Update, ctx: &Ctx<'_>, r: &mut dyn Runner) -> Result<W
         order_limit(&order_by, upd.limit.as_ref())
     );
     // Step B: one single-table UPDATE per table whose new values read only
-    // that table (chapter 42 can then write each table's layer, typed
-    // tables in inheritance groups); else one UPDATE over the join.
+    // that table (the inheritance layer can then write each table's layer,
+    // typed tables in inheritance groups); else one UPDATE over the join.
     let mut by_alias: Vec<(String, Vec<String>)> = Vec::new();
     for ((c, _), sql) in assigned.iter().zip(&set) {
         let a = plan.alias_for(tr.owner_of(c), false).to_owned();

@@ -1,6 +1,5 @@
-//! Rewriting references to typed and hierarchical tables (chapter 32,
-//! "Resolving a table reference", "Polymorphic SELECT", "Hierarchy
-//! queries"; build steps 4 and 10).
+//! Rewriting references to typed and hierarchical tables: resolving a
+//! table reference, polymorphic `SELECT` and hierarchy queries.
 //!
 //! A statement is parsed with sqlparser-rs and walked twice with the same
 //! scope rules. The first pass ([`Pass::Collect`]) finds each typed table
@@ -273,7 +272,7 @@ impl RefPlan {
 
 /// Builds a reference's tables: `owners` (types whose own fields the
 /// statement uses) plus `extra`, ordered root first, with the filter the
-/// mode needs (chapter 32, "Polymorphic SELECT", step 3).
+/// mode needs.
 #[must_use]
 pub fn build_plan(r: &TypedRef, owners: &BTreeSet<TypeId>, extra: &[TypeId]) -> RefPlan {
     let chain = r.db.chain(r.t.id);
@@ -1458,7 +1457,7 @@ pub fn segments(path: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// A key's segment (chapter 32, "Hierarchy columns"): integers in decimal,
+/// A key's segment in a hierarchy path: integers in decimal,
 /// strings with `%`, `/` and `,` escaped, binary in upper-case hex.
 #[must_use]
 pub fn segment(key: &[u8], class: KeyClass) -> String {

@@ -1077,7 +1077,11 @@ impl GwSession {
                             .with_schema(g.def.indexes.clone(), Some(self.graphs.schema_ops(&g)))
                             .with_gate(gate)
                             .with_holds(Some(holds));
-                    run_on(&mut store, visible.clone(), &q, &p, &budgets).await
+                    hard_time(
+                        budgets.max_time,
+                        run_on(&mut store, visible.clone(), &q, &p, &budgets),
+                    )
+                    .await
                 };
                 rc.end().await;
                 let out = r?;
@@ -1628,6 +1632,29 @@ impl BoltSession for GwSession {
                 PackValue::List(vec![server("ROUTE"), server("READ"), server("WRITE")]),
             ),
         ]))
+    }
+}
+
+/// Past `graph.max_time_ms` by this much, an auto-commit read stops even
+/// while it waits (see [`hard_time`]).
+const HARD_SLACK: Duration = Duration::from_secs(5);
+
+/// Runs an auto-commit read with a hard time limit: `graph.max_time_ms`
+/// is checked between the executor's steps, so a wait that doesn't end
+/// (a connection, a lock) would keep the statement, and the connections it
+/// holds, until the client gave up (the SF1 benchmark's 120 s read
+/// timeouts, G111). Past `max` and [`HARD_SLACK`] the read stops with the
+/// same budget error; what it held goes back to the pools.
+async fn hard_time<T>(
+    max: Duration,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(max.saturating_add(HARD_SLACK), fut).await {
+        Ok(r) => r,
+        Err(_) => Err(sprig_graph::exec::budget_error(
+            "time",
+            format!("graph.max_time_ms = {}", max.as_millis()),
+        )),
     }
 }
 

@@ -26,7 +26,7 @@
 //! - [`moves`]: the tenant-move check for shares (39361);
 //! - [`guard`]: "Schema changes while an object is shared" (39895);
 //! - [`show`]: what schema tools see;
-//! - [`reference`]: the merged view as a Rust model, for tests;
+//! - [`reference`](mod@reference): the merged view as a Rust model, for tests;
 //! - [`msg`]: inherited messaging objects (`FOR EACH TENANT`): the
 //!   definitions, overrides and instances every kind shares.
 //!

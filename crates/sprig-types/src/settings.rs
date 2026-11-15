@@ -1,9 +1,8 @@
-//! The `types.*` and `hierarchy.*` keys this crate reads (chapter 32,
-//! "Configuration"). The gateway resolves them at tenant scope for each
-//! typed statement ([`crate::exec::Limits`]). `types.rewrite_chunk_rows`,
-//! `types.single_table_max_columns`, `types.mariadb_validation` and
-//! `hierarchy.backfill_chunk_rows` belong to steps not built yet and are
-//! not registered.
+//! The `types.*` and `hierarchy.*` keys this crate reads. The gateway resolves
+//! them at tenant scope for each typed statement ([`crate::exec::Limits`]).
+//! `types.rewrite_chunk_rows`, `types.single_table_max_columns`,
+//! `types.mariadb_validation` and `hierarchy.backfill_chunk_rows` belong to
+//! features not built yet and are not registered.
 
 use sprig_settings::{Apply, HardBounds, Scopes, Setting};
 

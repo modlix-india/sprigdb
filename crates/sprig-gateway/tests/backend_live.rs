@@ -2081,6 +2081,10 @@ async fn galera_commits_answered_ok_are_kept() {
     )
     .await;
     for r in &rigs {
+        // A cluster's monitor starts with its first statement.
+        let mut s = r.session(Persona::MariaDb);
+        ok(&mut s, "SELECT 1").await;
+        s.close().await;
         r.wait_roles(&[NodeRole::Galera]).await;
     }
     let next = Arc::new(std::sync::atomic::AtomicU64::new(1));

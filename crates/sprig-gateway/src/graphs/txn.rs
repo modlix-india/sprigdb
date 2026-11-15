@@ -512,10 +512,36 @@ pub(crate) struct ReadConns {
     pub(crate) pools: HashMap<String, mysql_async::Pool>,
     /// Spare connections taken (idle ones, and how many in all).
     pub(crate) spares: HashMap<String, (Vec<Conn>, usize)>,
+    /// The spare budget's permits ([`spare_budget`]) the spares hold.
+    pub(crate) spare_permits: Vec<tokio::sync::OwnedSemaphorePermit>,
 }
 
 /// Spare connections one auto-commit read takes per cluster.
 const SPARES_MAX: usize = 3;
+
+/// How long a read waits for a spare connection before it goes on
+/// without one (its shards' statements then run one after another).
+const SPARE_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Spare connections all reads of the process hold at once per cluster:
+/// a quarter of the session pool, so statements' own connections always
+/// have the rest. A read that finds none free goes on without one.
+///
+/// Spares once came from the session pool with no bound and no time limit
+/// while the read held its own connection: 32 concurrent Bolt sessions
+/// could hold all 64 and each wait for one more (G111).
+fn spare_budget(cluster: &str) -> Arc<tokio::sync::Semaphore> {
+    static B: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>> = OnceLock::new();
+    let mut m = B
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    Arc::clone(m.entry(cluster.to_owned()).or_insert_with(|| {
+        Arc::new(tokio::sync::Semaphore::new(
+            crate::graphs::SESSION_POOL_MAX / 4,
+        ))
+    }))
+}
 
 impl std::fmt::Debug for ReadConns {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -594,11 +620,25 @@ impl ShardConns for ReadConns {
         if *made >= SPARES_MAX {
             return Ok(None);
         }
+        let Ok(permit) = spare_budget(&at.cluster).try_acquire_owned() else {
+            metrics::counter!("sprig_graph_spares_total", "outcome" => "budget").increment(1);
+            return Ok(None);
+        };
         *made += 1;
-        pool.get_conn()
-            .await
-            .map(Some)
-            .map_err(sprig_graph::catalog::backend_error)
+        match tokio::time::timeout(SPARE_WAIT, pool.get_conn()).await {
+            Ok(Ok(c)) => {
+                self.spare_permits.push(permit);
+                metrics::counter!("sprig_graph_spares_total", "outcome" => "taken").increment(1);
+                Ok(Some(c))
+            }
+            Ok(Err(e)) => Err(sprig_graph::catalog::backend_error(e)),
+            Err(_) => {
+                // The pool is busy: no more spares for this statement.
+                *made = SPARES_MAX;
+                metrics::counter!("sprig_graph_spares_total", "outcome" => "busy").increment(1);
+                Ok(None)
+            }
+        }
     }
 
     fn put_back(&mut self, at: &ShardLoc, conn: Conn) {

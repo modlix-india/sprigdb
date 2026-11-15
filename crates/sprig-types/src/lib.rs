@@ -1,36 +1,34 @@
 //! `sprig-types`: types, inheritance and hierarchies.
 //!
-//! Layer: 2 data layer. Design: [chapter 32](https://github.com/serialcoder13/sprigdb-plan/blob/main/lld/chapters/32-types.md) (Types) of the SprigDB low-level design.
+//! Layer: 2 data layer.
 //!
-//! What exists (R6 order 1, SQL on single-shard tenants):
+//! What exists (SQL on single-shard tenants):
 //!
 //! - [`model`] and [`store`]: the type catalog in memory and its four
-//!   catalog tables, loaded into every snapshot by [`TypesExtension`]
-//!   (build step 1);
+//!   catalog tables, loaded into every snapshot by [`TypesExtension`];
 //! - [`grammar`]: `INHERITS`, `WITH (SPRIG_...)`, `ONLY`, `ADD | DROP
-//!   HIERARCHY`, `@sprig_inheritance` (step 2);
-//! - [`ddl`]: type DDL with joined and single-table storage (steps 3 and
-//!   6), and discriminator columns: `INHERITS (p) WHERE c = v`, under which
+//!   HIERARCHY`, `@sprig_inheritance`;
+//! - [`ddl`]: type DDL with joined and single-table storage, and
+//!   discriminator columns: `INHERITS (p) WHERE c = v`, under which
 //!   `_type` and `_type_path` are generated from a user column;
 //! - [`rewrite`], [`show`] and [`infoschema`]: polymorphic reads and the
-//!   metadata schema tools see (step 4), and the `SPRIG_*` hierarchy
-//!   predicates (step 10);
-//! - [`write`](mod@write): typed writes with MySQL's counts (step 5);
-//! - [`hier`]: record hierarchies, backfill and local subtree moves (steps
-//!   10 and 11, one shard).
+//!   metadata schema tools see, and the `SPRIG_*` hierarchy predicates;
+//! - [`write`](mod@write): typed writes with MySQL's counts;
+//! - [`hier`]: record hierarchies, backfill and local subtree moves (one
+//!   shard).
 //!
 //! [`handle`] is the entry point: the gateway calls it for each statement
-//! of a tenant session before chapter 07's name plan, with a [`Runner`]
-//! that sends the plan's statements back through the session (logical
-//! names, chapter 29's checks, chapter 17's router).
+//! of a tenant session before the name plan, with a [`Runner`] that sends
+//! the plan's statements back through the session (logical names, access
+//! checks, the router).
 //!
 //! Not built: composites and arrays, documents and
-//! the other models (they need R5), footprints for chapter 29, rename
+//! the other models, authorization footprints, rename
 //! jobs, cross-shard moves, `$graphLookup`, typed upserts and
 //! `INSERT ... SELECT` into subtypes, prepared statements on typed tables.
 
-// The plans read best as the chapter's steps in order, over SQL text built
-// with format!; short names (t, h, r, k) follow the chapter's pseudocode.
+// The plans read best as their steps in order, over SQL text built with
+// format!; short names (t, h, r, k) keep the plans compact.
 #![allow(
     clippy::too_many_lines,
     clippy::many_single_char_names,
@@ -320,7 +318,7 @@ fn target_hierarchy(
 /// `state` is the tenant's [`TypesState`] at the session's snapshot.
 ///
 /// # Errors
-/// The chapter's errors (39700-39716), or a step's error with logical
+/// The type layer's errors (39700-39716), or a step's error with logical
 /// names.
 #[allow(clippy::too_many_lines)] // one arm per statement kind
 pub async fn handle(
@@ -545,7 +543,7 @@ pub fn map_error(
 }
 
 /// The type columns a merged view of an inheritable table computes
-/// (chapter 42, typed tables in inheritance groups): for a discriminated
+/// (typed tables in inheritance groups): for a discriminated
 /// root, `_type` and `_type_path` from the discriminator's merged value, by
 /// this tenant's types (a child tenant's own subtypes included), as
 /// `(column, expression)`. Empty for any other table: `_type` hierarchies

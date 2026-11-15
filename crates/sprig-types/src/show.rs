@@ -1,5 +1,4 @@
-//! What schema tools see of typed tables (chapter 32, "Polymorphic SELECT",
-//! the metadata paragraph; build step 4):
+//! What schema tools see of typed tables:
 //!
 //! - `SHOW CREATE TABLE` shows a root without its type columns and their
 //!   index, and a subtype as created: its own columns, `INHERITS
@@ -9,8 +8,8 @@
 //! - `SHOW [FULL] TABLES` lists parents before their subtypes, so dump
 //!   tools create them in order.
 //!
-//! `information_schema.COLUMNS` still shows the physical tables (see the
-//! chapter's As built).
+//! `information_schema.COLUMNS` is not rewritten here: see
+//! [`crate::infoschema`].
 
 use std::collections::{HashMap, HashSet};
 

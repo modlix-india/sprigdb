@@ -1,5 +1,4 @@
-//! Golden tests for the rewriter: SQL in, physical SQL out (chapter 32,
-//! "Testing").
+//! Golden tests for the rewriter: SQL in, physical SQL out.
 
 use std::sync::Arc;
 

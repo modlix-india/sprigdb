@@ -1,6 +1,5 @@
-//! The `types` catalog module (chapter 32, "Catalog tables"; build step 1):
-//! `types`, `type_fields`, `type_bindings` and `hierarchies` in
-//! `t<tenant>_sprig`, their migrations, the snapshot loader
+//! The `types` catalog module: `types`, `type_fields`, `type_bindings` and
+//! `hierarchies` in `t<tenant>_sprig`, their migrations, the snapshot loader
 //! ([`TypesExtension`]) and the writes type DDL makes ([`TypesChange`]).
 //!
 //! The module is versioned with the catalog version: every type DDL commits
@@ -33,7 +32,7 @@ use crate::model::{
 /// The module name.
 pub const MODULE: &str = "types";
 
-/// `types` (chapter 32).
+/// `types`.
 pub const DDL_TYPES: &str = "CREATE TABLE IF NOT EXISTS types (
   type_id        BIGINT UNSIGNED NOT NULL,
   db_id          INT UNSIGNED NOT NULL,
@@ -58,7 +57,7 @@ pub const DDL_TYPES: &str = "CREATE TABLE IF NOT EXISTS types (
   KEY k_types_root (root_id)
 ) ENGINE=InnoDB";
 
-/// `type_fields` (chapter 32).
+/// `type_fields`.
 pub const DDL_TYPE_FIELDS: &str = "CREATE TABLE IF NOT EXISTS type_fields (
   type_id         BIGINT UNSIGNED NOT NULL,
   field_name      VARCHAR(64) NOT NULL,
@@ -78,7 +77,7 @@ pub const DDL_TYPE_FIELDS: &str = "CREATE TABLE IF NOT EXISTS type_fields (
   KEY k_tf_composite (composite_id)
 ) ENGINE=InnoDB";
 
-/// `type_bindings` (chapter 32; written by the document, key-value, vector
+/// `type_bindings` (written by the document, key-value, vector
 /// and dimensional models, none built yet).
 pub const DDL_TYPE_BINDINGS: &str = "CREATE TABLE IF NOT EXISTS type_bindings (
   object_id  BIGINT UNSIGNED NOT NULL,
@@ -91,7 +90,7 @@ pub const DDL_TYPE_BINDINGS: &str = "CREATE TABLE IF NOT EXISTS type_bindings (
   KEY k_tb_type (type_id)
 ) ENGINE=InnoDB";
 
-/// `hierarchies` (chapter 32).
+/// `hierarchies`.
 pub const DDL_HIERARCHIES: &str = "CREATE TABLE IF NOT EXISTS hierarchies (
   object_id     BIGINT UNSIGNED NOT NULL,
   model         ENUM('table','collection') NOT NULL,

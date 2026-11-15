@@ -1,4 +1,4 @@
-//! Logic jobs (chapter 41, R7 order 5) on chapter 23's job runtime:
+//! Logic jobs on the control plane's job runtime:
 //!
 //! - `logic_trigger`: one per after-commit binding, long-running. It
 //!   reads the tenant's feed from the binding's subscription checkpoint
@@ -55,9 +55,9 @@ pub struct LogicEnv {
     pub locator: Arc<ShardMapLocator>,
     /// Binlog sources for the feed.
     pub clusters: Arc<RegistryClusters>,
-    /// The worker's shared reader, keeping each tenant whole (R9,
-    /// r9feed2): after-commit triggers and search copies read through it,
-    /// one dump per cluster however many bindings and indexes.
+    /// The worker's shared reader, keeping each tenant whole: after-commit
+    /// triggers and search copies read through it, one dump per cluster
+    /// however many bindings and indexes.
     pub feed: Arc<dyn Clusters>,
     /// The runner's settings, following the worker's live settings
     /// ([`crate::settings::WorkerSettings::run_opts`]).
@@ -65,10 +65,9 @@ pub struct LogicEnv {
     /// The worker's live settings: `logic.trigger_budget_ms` when a
     /// trigger job starts, `logic.job_budget_ms` per scheduled run.
     pub settings: crate::settings::WorkerSettings,
-    /// Chapter 29 (RLS round 5, RL50): the DC's gateways and the global
-    /// tier (tenant names), for checking an after-commit trigger's events
-    /// against its definer's row policies. `None`: a bound definer's
-    /// events wait.
+    /// Row-level security: the DC's gateways and the global tier (tenant
+    /// names), for checking an after-commit trigger's events against its
+    /// definer's row policies. `None`: a bound definer's events wait.
     pub gateways: Option<(Arc<dyn sprig_sinks::peer::SinkPeer>, Arc<dyn MetaStore>)>,
 }
 
@@ -191,7 +190,7 @@ impl CatalogPools for Catalogs {
     }
 }
 
-/// Shards are where the tenant's catalog is (R1 moves them together).
+/// Shards are where the tenant's catalog is (a move takes them together).
 struct TenantShards {
     locator: Arc<ShardMapLocator>,
     pools: Arc<dyn ClusterPools>,
@@ -218,16 +217,14 @@ fn spec_u64(spec: &Value, k: &str) -> std::result::Result<u64, String> {
         .ok_or_else(|| format!("spec.{k} is missing"))
 }
 
-/// Chapter 29 (RL37, RLS round 5 RL50): an after-commit trigger's code
-/// gets a changed row's images as its definer (the user who deployed the
-/// active version). While the table's policies bind that user, each event
+/// Row-level security: an after-commit trigger's code gets a changed row's
+/// images as its definer (the user who deployed the active version). While the table's policies bind that user, each event
 /// is checked on a gateway in a session of the definer (`SinkSql`
 /// `Images`): an insert runs when its new row is visible, a delete when its
 /// old row is, an update as an update (both), a delete (only the old row)
 /// or an insert (only the new row); hidden rows are passed over. An event
 /// that became an op the binding doesn't listen to is passed over too
 /// (the job widens an INSERT- or DELETE-only binding to updates for this).
-/// Before RL50 the events waited while the definer was bound.
 struct DefinerGuard {
     rls: crate::sinks::RlsCatalogs,
     locator: Arc<dyn CatalogLocator>,
@@ -320,7 +317,7 @@ impl DefinerGuard {
 #[async_trait]
 impl RunGuard for DefinerGuard {
     async fn check(&self) -> Result<()> {
-        // RL50: bound definers' events are filtered (`shown`), not held.
+        // Bound definers' events are filtered (`shown`), not held.
         self.definer().await.map(|_| ())
     }
 
@@ -395,7 +392,7 @@ impl LogicTrigger {
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
             .collect();
-        // RL50: an update can become an insert or a delete for a definer
+        // An update can become an insert or a delete for a definer
         // the table's policies bind, so an INSERT- or DELETE-only binding
         // on a table reads updates too; the guard passes over what the
         // binding doesn't listen to.
@@ -426,7 +423,7 @@ impl LogicTrigger {
         let tail = TenantTail::start(
             tenant,
             start,
-            // R9 (r9feed2): through the worker's shared reader.
+            // Through the worker's shared reader.
             Arc::clone(&env.feed),
             Arc::new(MetaPlacement::new(Arc::clone(&env.dc))),
             Arc::new(CatalogResolver::new(Arc::new(Catalogs(Arc::clone(
@@ -452,8 +449,8 @@ impl LogicTrigger {
             }),
             versions,
             budget: env.settings.trigger_budget_for(tenant),
-            // RL37, RL50: the code gets the changed rows its definer may
-            // see (each event checked while the table's policies bind it).
+            // The code gets the changed rows its definer may see (each
+            // event checked while the table's policies bind it).
             guard: match (
                 b.object_id,
                 crate::sinks::RlsCatalogs::new(Arc::clone(&env.locator)),
@@ -491,7 +488,7 @@ impl LogicTrigger {
         )
         .await;
         let stop = cx.cancel.clone();
-        // The tenant's own `logic.trigger_*` rows too (decision RF3); the
+        // The tenant's own `logic.trigger_*` rows too; the
         // env's options (tests' overrides) when no settings mirror runs.
         let opts = if env.settings.live().is_some() {
             env.settings.run_opts_for(tenant)
@@ -511,8 +508,8 @@ impl LogicTrigger {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         let mut last_replay = Instant::now();
         let mut last_purge = Instant::now();
-        // bugfix-34: a trigger whose module was dropped (its database
-        // dropped, say) ends; before, it ran until the worker stopped.
+        // A trigger whose module was dropped (its database dropped, say)
+        // ends; before, it ran until the worker stopped.
         let mut last_check = Instant::now();
         let mut ended = None;
         let result = loop {
@@ -662,7 +659,7 @@ impl JobHandler for LogicSchedule {
             .map_err(|e| e.to_string())?;
         let mut shard = pool.get_conn().await.map_err(|e| e.to_string())?;
         let store = LogicStore::new(ep.store.schema());
-        // Chapter 29 (RL42): the run applies its definer's policies in
+        // Row-level security: the run applies its definer's policies in
         // MariaDB (policy views and write triggers), not an internal
         // session's (every row).
         let rls = crate::sinks::RlsCatalogs::new(Arc::clone(&env.locator))

@@ -18,7 +18,7 @@ sprig-catalog.workspace = true
 sprig-common.workspace = true
 sprig-proto-mysql.workspace = true
 sprig-settings.workspace = true
-# The lexer (chapter 07) for the grammar extensions; sqlparser-rs for the
+# The lexer for the grammar extensions; sqlparser-rs for the
 # statements the rewriter changes.
 sprig-sql.workspace = true
 sqlparser.workspace = true
