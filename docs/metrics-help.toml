@@ -236,6 +236,7 @@ sprig_graph_mirror_wait_seconds = "Time graph reads waited for the graph mirror 
 sprig_graph_mirror_waits_total = "Graph reads that waited for the graph mirror to catch up; `outcome` is `ok`, `lag` (still behind) or `error`. Unit: count."
 sprig_graph_route_hold_waits_total = "Auto-commit Bolt reads that waited for a move's hold on a shard they route to. Unit: count."
 sprig_graph_shard_queries_total = "Shard queries graph traversals ran; `tier` is how the step ran: `join`, `cte`, `gateway` or `plugin`. Unit: count."
+sprig_graph_spares_total = "Extra backend connections auto-commit graph reads asked for, to read several shards of a cluster at once; `outcome` is `taken`, `budget` (the cluster's spare budget, a quarter of the session pool, was used up) or `busy` (none free within 50 ms). Without one, the shards are read one after another. Unit: count."
 sprig_graph_stale_map_retries_total = "Auto-commit graph statements run again after a split, merge or move changed the shard map. Unit: count."
 sprig_graph_statement_duration_seconds = "Duration of graph statements; `language` is the query language (such as `cypher`), `kind` is `read` or `write`. Unit: seconds."
 sprig_graph_statements_total = "Graph statements; `language` is the query language, `kind` `read` or `write`, `result` `ok` or `error`. Unit: count."

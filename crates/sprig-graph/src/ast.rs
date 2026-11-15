@@ -1,5 +1,5 @@
 //! The Cypher syntax tree.
-//! The executor runs it after [`crate::bind`] checks names and marks what
+//! The executor runs it after [`crate::semantic`] checks names and marks what
 //! the planner needs, so it doubles as the graph IR of this build.
 
 use crate::value::Value;

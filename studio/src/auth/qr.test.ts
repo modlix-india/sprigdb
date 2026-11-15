@@ -5,7 +5,7 @@ import { darkModules, qrPath, QUIET_ZONE } from './qr';
 const uri =
   'otpauth://totp/SprigDB:acme.app?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=SprigDB&algorithm=SHA1&digits=6&period=30';
 
-describe('TOTP QR code (ST33)', () => {
+describe('TOTP QR code', () => {
   it('draws exactly the modules the encoder produced', () => {
     const p = qrPath(uri);
     const { modules } = QRCode.create(uri, { errorCorrectionLevel: 'M' });

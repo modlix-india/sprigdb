@@ -56,6 +56,8 @@ jobs:
       # rustup reads rust-toolchain.toml and installs the pinned toolchain.
       - run: rustup toolchain install
       - run: cargo fmt --all --check
+      # Comments explain the code themselves instead of citing design notes.
+      - run: deploy/ci/no-design-refs.sh
 
   clippy:
     name: S0 clippy

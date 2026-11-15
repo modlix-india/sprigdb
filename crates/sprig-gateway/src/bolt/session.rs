@@ -1643,7 +1643,7 @@ const HARD_SLACK: Duration = Duration::from_secs(5);
 /// is checked between the executor's steps, so a wait that doesn't end
 /// (a connection, a lock) would keep the statement, and the connections it
 /// holds, until the client gave up (the SF1 benchmark's 120 s read
-/// timeouts, G111). Past `max` and [`HARD_SLACK`] the read stops with the
+/// timeouts). Past `max` and [`HARD_SLACK`] the read stops with the
 /// same budget error; what it held goes back to the pools.
 async fn hard_time<T>(
     max: Duration,

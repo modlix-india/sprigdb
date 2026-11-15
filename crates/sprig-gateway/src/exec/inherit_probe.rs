@@ -1,5 +1,5 @@
 //! Whether a change stream's subscriber could see inherited records just
-//! before a change (`sprig_inherit::probe`, decision RL64): a `delete` goes
+//! before a change (`sprig_inherit::probe`): a `delete` goes
 //! only to subscribers who could see the record.
 //!
 //! The change stream (`Changes.Watch`, in this process) sends one marked
@@ -12,10 +12,10 @@
 //! it, just before the change, `0` when it wasn't, `2` when the
 //! subscriber's view doesn't read the changed row (another event will
 //! say). A probe that fails answers 0. A `reads_only` probe asks only
-//! whether the view reads the changed row now (`1` or `2`, RL69): a
+//! whether the view reads the changed row now (`1` or `2`): a
 //! change it doesn't read sends nothing, whatever the record is now. A
-//! `counted` probe is of a change the stream sends by its copy's handover
-//! (RL71): when the subscriber's view reaches the parent tenant through
+//! `counted` probe is of a change the stream sends by its copy's handover:
+//! when the subscriber's view reaches the parent tenant through
 //! that tenant edge, it reads the changed row (`1` for `reads_only`), and
 //! its record before is taken through the edge as the copy holds it; when
 //! a materialized share inside the tenant cuts the view first, it is
@@ -65,7 +65,7 @@ pub(crate) struct ProbeItem {
     /// Ask only whether the subscriber's view reads the changed row.
     #[serde(default)]
     pub reads_only: bool,
-    /// The stream counts the change by its copy's handover (RL71).
+    /// The stream counts the change by its copy's handover.
     #[serde(default)]
     pub counted: bool,
 }
@@ -174,7 +174,7 @@ pub(super) async fn run(
                 Ok(true) => b"1",
                 Ok(false) => b"2",
                 Err(e) => {
-                    // As before RL69: the record read now decides.
+                    // Fall back to the record as read now.
                     tracing::warn!(table = %p.table, error = %e, "a change stream's source check failed");
                     b"0"
                 }

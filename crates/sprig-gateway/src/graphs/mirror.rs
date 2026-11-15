@@ -229,7 +229,7 @@ impl CatalogGate {
 /// the gateway's `sprig_ctl` and catalog pools (4 connections each) in a
 /// cache of their own: under 32 concurrent Bolt sessions the cache held
 /// all 4, and every gate that missed it waited on the pool forever (the
-/// SF1 benchmark's ConnectionReadTimeoutException, G111).
+/// SF1 benchmark's `ConnectionReadTimeoutException`).
 fn gate_pools() -> &'static Mutex<HashMap<String, mysql_async::Pool>> {
     static C: std::sync::OnceLock<Mutex<HashMap<String, mysql_async::Pool>>> =
         std::sync::OnceLock::new();

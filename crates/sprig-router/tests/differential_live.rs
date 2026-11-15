@@ -2249,9 +2249,7 @@ async fn fk_ddl(e: &Env, sut: &mut Conn, reference: &mut Conn, tally: &mut Tally
         let a = run(sut, q).await;
         let b = run(reference, q).await;
         if matches!(a, Outcome::Err(39420, _)) {
-            tally
-                .mismatches
-                .push(format!("FK DDL REFUSED {q}: {a:?}"));
+            tally.mismatches.push(format!("FK DDL REFUSED {q}: {a:?}"));
         }
         tally.check(q, Cmp::Bag, &a, &b);
         if let Some(t) = t {

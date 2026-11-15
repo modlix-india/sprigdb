@@ -8,9 +8,10 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-# Narrow on purpose: short ids like S3, I32 or HY000 are real names, so only
-# ids written with the word "decision" (or bugfix-NN) are caught.
-pattern='\b[Cc]hapters? [0-9]|\b[Cc]h\. ?[0-9]|\b[Aa]ppendi(x|ces) [A-G]\b|\bLLD\b|low-level design|[Bb]uild steps? [0-9]|[Ww]orked example [0-9]|\b[Dd]ecisions? [A-Z]{1,3}[0-9]+|bugfix-[0-9]|sprigdb-plan'
+# Narrow on purpose: short ids like S3, I32 or HY000 are real names, so ids
+# are caught only with the word "decision", in a two-letter series that no
+# real name here uses (RL64, ST33, HD25), or as "(G111)" / ", Q53" / "S149".
+pattern='\b[Cc]hapters? [0-9]|\b[Cc]h\. ?[0-9]|\b[Aa]ppendi(x|ces) [A-G]\b|\bLLD\b|low-level design|[Bb]uild steps? [0-9]|[Ww]orked example [0-9]|\b[Dd]ecisions? [A-Z]{1,3}[0-9]+|bugfix-[0-9]|sprigdb-plan|\b(RL|RF|PF|IG|HD|TD|GR|RC|ST)[0-9]{1,3}\b|[(,;] ?[GQS][0-9]{2,3}\b|\bdecisions?/[a-z0-9-]+\.md'
 
 # Public sources (RFC appendices, the SRE workbook) are filtered out below.
 # Files allowed to contain the patterns: sprig-docs' scrubber removes

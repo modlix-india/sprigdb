@@ -10,7 +10,8 @@
 //!     every 2 s: the graphs served (grouped native graphs whose
 //!       mirror_mode is starting or async, or whose mirrors are building)
 //!       and their shard maps; clusters added to the DC get a reader
-//!     take what the readers have (at most 512 groups or 20 ms)
+//!     take what the readers have (at most 512 groups, about 20,000 rows,
+//!       or 20 ms)
 //!     per group, in each cluster's commit order: skip the mover's copies
 //!       and replays (they carry its position row); hold an XA branch's
 //!       rows from its PREPARE to its COMMIT; edge-table rows of a served
@@ -87,6 +88,15 @@ impl std::fmt::Debug for GraphMirrorEnv {
         f.debug_struct("GraphMirrorEnv").finish_non_exhaustive()
     }
 }
+
+/// Groups one take of the readers' items holds at most.
+const TAKE_GROUPS: usize = 512;
+
+/// Rows one take holds at most (about): a bulk load's groups carry 1,000
+/// edges each, and 512 of them made one batch of half a million changes,
+/// one transaction per cluster, decoded and coalesced in one poll of a
+/// runtime thread.
+const TAKE_ROWS: usize = 20_000;
 
 /// Graphs' edge tables, in every tenant's shard schemas.
 const EDGE_TABLES: &str = "__sprig_ge_*";
@@ -172,6 +182,8 @@ struct Applier {
     /// XA branches prepared but not committed, oldest first.
     held: Vec<Held>,
     applied: u64,
+    /// Whether the catalog's position rows were read (once, at the start).
+    resumed: bool,
 }
 
 impl Applier {
@@ -185,6 +197,7 @@ impl Applier {
             next_gen: 1,
             held: Vec::new(),
             applied: 0,
+            resumed: false,
         }
     }
 
@@ -218,6 +231,7 @@ impl Applier {
             }
             // Take what the readers have.
             let mut items: Vec<Item> = Vec::new();
+            let mut rows = 0usize;
             let deadline = tokio::time::sleep(Duration::from_millis(20));
             tokio::pin!(deadline);
             loop {
@@ -226,8 +240,11 @@ impl Applier {
                     () = &mut deadline => break,
                     it = rx.recv() => match it {
                         Some(it) => {
+                            if let (_, _, Ok(SourceItem::Txn(t))) = &it {
+                                rows += t.rows.len();
+                            }
                             items.push(it);
-                            if items.len() >= 512 {
+                            if items.len() >= TAKE_GROUPS || rows >= TAKE_ROWS {
                                 break;
                             }
                         }
@@ -368,6 +385,14 @@ impl Applier {
             );
         }
         self.graphs = graphs;
+        if !self.resumed {
+            match self.resume_from_catalog().await {
+                Ok(()) => self.resumed = true,
+                Err(e) => {
+                    tracing::warn!(tenant = %self.tenant, error = %e, "graph mirror positions not read; resuming at the checkpoint");
+                }
+            }
+        }
         // A reader on every cluster of the DC.
         let clusters: HashSet<ClusterId> = self.env.pools.sweepable().await?.into_iter().collect();
         self.readers.retain(|c, (_, t)| {
@@ -404,6 +429,64 @@ impl Applier {
                 tx.clone(),
                 token,
             ));
+        }
+        Ok(())
+    }
+
+    /// Moves each cluster's start up to what the catalog's position rows
+    /// say every served graph has applied, when that is past the job's
+    /// checkpoint (or there is no checkpoint). The rows are written every
+    /// 50 ms to a second, never ahead of what was applied; the checkpoint
+    /// only every 2 s, through the DC's store, and not at all while its
+    /// writes time out. A job that moved after its worker died replayed
+    /// everything since the checkpoint, its mirrors' count standing
+    /// still meanwhile; and a job submitted afresh, with no checkpoint,
+    /// started at the clusters' positions now, skipping the edges written
+    /// since its predecessor's last position.
+    async fn resume_from_catalog(&mut self) -> Result<()> {
+        if self.graphs.is_empty() {
+            return Ok(());
+        }
+        let ep = self.env.locator.writer(self.tenant).await?;
+        let schema = ep.store.schema().to_owned();
+        let mut c = ep
+            .pool
+            .get_conn()
+            .await
+            .map_err(sprig_graph::catalog::backend_error)?;
+        // Per cluster: the oldest position over the served graphs, and
+        // whether every served graph with shards there has rows for all
+        // of them (else the rows can't bound the start).
+        let mut at: BTreeMap<String, Option<GtidPos>> = BTreeMap::new();
+        for (graph, s) in &self.graphs {
+            let rows = mirror::read_pos(&mut c, &schema, *graph).await?;
+            for sh in &s.layout.shards {
+                let p = rows
+                    .iter()
+                    .find(|r| r.shard == sh.shard && r.cluster == sh.cluster)
+                    .and_then(|r| r.pos.parse::<GtidPos>().ok());
+                let e = at
+                    .entry(sh.cluster.clone())
+                    .or_insert_with(|| p.clone());
+                *e = match (e.take(), p) {
+                    (Some(a), Some(b)) => Some(sprig_feed::shared::older(&a, &b)),
+                    _ => None,
+                };
+            }
+        }
+        drop(c);
+        for (cluster, p) in at {
+            let (Ok(id), Some(p)) = (ClusterId::new(&cluster), p) else {
+                continue;
+            };
+            let start = match self.pos.get(&id) {
+                Some(cp) => sprig_feed::shared::newer(cp, &p),
+                None => p,
+            };
+            if self.pos.get(&id) != Some(&start) {
+                tracing::info!(tenant = %self.tenant, %cluster, checkpoint = ?self.pos.get(&id).map(ToString::to_string), from = %start, "graph mirror resumes at the catalog's positions");
+                self.pos.insert(id, start);
+            }
         }
         Ok(())
     }

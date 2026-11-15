@@ -9,7 +9,7 @@ source: the metric macros in the source tree, and docs/metrics-help.toml
 
 Every metric SprigDB records, as exported on each process's telemetry port (`/metrics`, Prometheus text) and through OTLP. Counters end in `_total`; durations are histograms in seconds.
 
-487 metrics in 53 groups.
+488 metrics in 53 groups.
 
 ## `sprig_advisor_*`
 
@@ -371,6 +371,7 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_graph_mirror_waits_total` | counter | `outcome` | sprig-gateway | Graph reads that waited for the graph mirror to catch up; `outcome` is `ok`, `lag` (still behind) or `error`. Unit: count. |
 | `sprig_graph_route_hold_waits_total` | counter | - | sprig-gateway | Auto-commit Bolt reads that waited for a move's hold on a shard they route to. Unit: count. |
 | `sprig_graph_shard_queries_total` | counter | `tier` | sprig-graph | Shard queries graph traversals ran; `tier` is how the step ran: `join`, `cte`, `gateway` or `plugin`. Unit: count. |
+| `sprig_graph_spares_total` | counter | `outcome` | sprig-gateway | - |
 | `sprig_graph_stale_map_retries_total` | counter | - | sprig-gateway | Auto-commit graph statements run again after a split, merge or move changed the shard map. Unit: count. |
 | `sprig_graph_statement_duration_seconds` | histogram | `kind`, `language` | sprig-graph | Duration of graph statements; `language` is the query language (such as `cypher`), `kind` is `read` or `write`. Unit: seconds. |
 | `sprig_graph_statements_total` | counter | `kind`, `language`, `result` | sprig-graph | Graph statements; `language` is the query language, `kind` `read` or `write`, `result` `ok` or `error`. Unit: count. |

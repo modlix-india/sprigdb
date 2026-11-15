@@ -529,7 +529,7 @@ const SPARE_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
 ///
 /// Spares once came from the session pool with no bound and no time limit
 /// while the read held its own connection: 32 concurrent Bolt sessions
-/// could hold all 64 and each wait for one more (G111).
+/// could hold all 64 and each wait for one more.
 fn spare_budget(cluster: &str) -> Arc<tokio::sync::Semaphore> {
     static B: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>> = OnceLock::new();
     let mut m = B
@@ -554,6 +554,7 @@ impl std::fmt::Debug for ReadConns {
                 &self.spares.values().map(|(_, n)| n).sum::<usize>(),
             )
             .field("pools", &self.pools.keys().collect::<Vec<_>>())
+            .field("spare_permits", &self.spare_permits.len())
             .finish()
     }
 }

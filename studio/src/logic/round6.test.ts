@@ -3,7 +3,7 @@ import { autoRollback } from './api';
 import { declaration, dependentsOf, dropStatement, rolloutStatement } from './declaration';
 import { argValue, budgetLines, jsonField, kirunParams, mocks, parseParams, snapshotRows } from './testrun';
 
-describe('test runs (round 6, RC13–RC17)', () => {
+describe('test runs', () => {
   it('reads parameters from the form and from a KIRun definition', () => {
     expect(parseParams('a BIGINT, n DECIMAL(10,2), IN `s` VARCHAR(40)')).toEqual([
       { name: 'a', type: 'BIGINT' },
@@ -57,7 +57,7 @@ describe('test runs (round 6, RC13–RC17)', () => {
   });
 });
 
-describe('rollout and drop (round 6, RC18–RC22)', () => {
+describe('rollout and drop', () => {
   const form = { kind: 'function' as const, name: 'f', runtime: 'javascript' as const, params: 'a BIGINT', returns: 'BIGINT', security: 'invoker' as const, tier: 'auto' as const, body: 'return a;' };
   it('deploys as a stage', () => {
     expect(declaration('shop', { ...form, rollout: { pct: 10, by: 'user' } })).toContain("WITH (SPRIG_TIER = 'auto', SPRIG_ROLLOUT = 10) AS");

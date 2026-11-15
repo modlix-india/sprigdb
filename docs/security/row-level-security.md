@@ -276,7 +276,7 @@ The rules:
 ## Not supported yet
 
 - **Claims without a token.** Password logins, HTTP Basic and API keys carry no token, so `SPRIG_CLAIM` returns `NULL` there; put per-user values in account attributes and read them with `SPRIG_USER_ATTR`.
-- **Claims after a residency hand-off.** A token login decided in another data centre because of the tenant's [residency](residency.md) has no claims, and neither do MongoDB-language calls over HTTP (`language: mongo`). See [Logins with identity provider tokens](external-tokens.md#not-supported-yet).
+- **Claims in MongoDB-language calls over HTTP.** `Sql.Query` with `language: mongo` doesn't pass the bearer token's claims to `SPRIG_CLAIM`; SQL calls do. See [Logins with identity provider tokens](external-tokens.md#not-supported-yet).
 
 ## Related
 

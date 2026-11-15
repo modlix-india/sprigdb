@@ -102,11 +102,11 @@ A mapping turns a verified token's claims into the name of the account it logs i
 | Field | Default | Meaning |
 |---|---|---|
 | `priority` | required | Mappings are tried in ascending priority |
-| `kind` | required | `user` names the account; `role` names a role (see [Not supported yet](#not-supported-yet)) |
+| `kind` | required | `user` names the account; `role` gives the session a role (see [Roles from tokens](#roles-from-tokens)) |
 | `claim` | required | The claim tested: a top-level claim name, or a dotted path into objects (`realm_access.roles`) when no top-level claim has that name; 1 to 255 characters |
 | `match_kind` | `any` | `any`: the claim is present and not null (an array must not be empty). `equals`: the claim, or one element of an array claim, equals `match_value`. `regex`: the claim, or one element, matches `match_value` as a whole |
 | `match_value` | none | The value or regular expression, up to 512 characters; required for `equals` and `regex`, refused for `any` |
-| `target` | required | The user name, without the tenant prefix, as a template: each `{claim}` is replaced by that claim's value (`{email}`, `app-{azp}`); 1 to 255 characters |
+| `target` | required | For `user`: the user name, without the tenant prefix. For `role`: the role's name (`analyst`, host `%`), or `name@host`. A template: each `{claim}` is replaced by that claim's value (`{email}`, `app-{azp}`); 1 to 255 characters |
 
 The rules:
 
@@ -131,6 +131,26 @@ Examples:
 - Tokens issued to the client `billing-service` log in as the single service account `billing`.
 - Tokens of clients named `svc-...` log in as `app-svc-...`, one account per client.
 - Any other token with a `preferred_username` logs in as the account of that name: one account per person.
+
+### Roles from tokens
+
+`role` mappings give a token login roles for its session. Every `role` mapping whose claim matches adds its target, so a token can bring several roles:
+
+```json
+[
+  {"priority": 100, "kind": "role", "claim": "realm_access.roles", "match_kind": "equals",
+   "match_value": "db-readers", "target": "reader"},
+  {"priority": 110, "kind": "role", "claim": "department", "target": "{department}_analyst"}
+]
+```
+
+A token whose `realm_access.roles` array contains `db-readers` gets the role `reader`; one whose `department` claim is `sales` gets `sales_analyst`.
+
+- The roles must exist in the tenant (`CREATE ROLE`). A token role the tenant doesn't define is ignored, and the login is audited as `auth.token_roles_ignored` naming it; SprigDB never creates roles from tokens.
+- They don't need to be granted to the account. The session holds them as if granted, for its life, and they are active from login together with the account's default roles.
+- `SET ROLE` can name them, `SET ROLE NONE` drops them, and `SET ROLE DEFAULT` and `SET ROLE ALL` include them. `CURRENT_ROLE()` lists them.
+- They are evaluated again from the token's claims after every change to the tenant's accounts, issuers or roles: a changed mapping, a disabled issuer or a dropped role holds from the session's next statement, as a `REVOKE` does.
+- A session logged in with a password has no token roles.
 
 ## Let an account log in with tokens
 
@@ -261,7 +281,9 @@ Keys are accepted as RSA (2,048 to 8,192 bits, for the `RS` and `PS` algorithms)
 
 ### Sessions
 
-Over MySQL, MariaDB, Redis and MongoDB the token is checked when the connection logs in, and the session continues after the token expires. Over REST and gRPC every request carries its token. Account changes end sessions as for any login: `DROP USER` and `ACCOUNT LOCK` close them (see [Sessions after account changes](accounts-and-logins.md#sessions-after-account-changes)). Disabling an issuer, or removing an account's `token` method, refuses new logins; connections already logged in stay open.
+Over MySQL, MariaDB, Redis and MongoDB the token is checked when the connection logs in, and the session continues after the token expires. Over REST and gRPC every request carries its token. Account changes end sessions as for any login: `DROP USER` and `ACCOUNT LOCK` close them (see [Sessions after account changes](accounts-and-logins.md#sessions-after-account-changes)). Disabling an issuer, or removing an account's `token` method, refuses new logins; connections already logged in stay open, and lose their token roles at their next statement.
+
+A login that a gateway hands to another data centre because of the tenant's [residency](residency.md) is verified there, and the session keeps the token's claims and roles.
 
 ## Claims in row-level security
 
@@ -337,7 +359,8 @@ Other events:
 
 | Event | When |
 |---|---|
-| `auth.login_succeeded` | A token login succeeded; `mechanism` is `jwt` and `detail` names the issuer (`issuer https://...`) |
+| `auth.login_succeeded` | A token login succeeded; `mechanism` is `jwt` and `detail` names the issuer and the token roles it took (`issuer https://...; token roles reader`) |
+| `auth.token_roles_ignored` | A token login succeeded, but its role mappings named roles the tenant doesn't define; `detail` names them, `reason` is `undefined_role` |
 | `auth.user_created_jit` | An account was created on first login, with the issuer in `detail` |
 | `admin.issuer_changed` | An issuer was created, replaced or disabled, with its id, `active`, `jit_users`, protocols and number of mappings |
 | `admin.token_login_changed` | An account's `token` method was added or removed |
@@ -372,8 +395,6 @@ See [Metrics](../reference/metrics.md).
 
 ## Not supported yet
 
-- **Roles from tokens.** `role` mappings are stored and evaluated, but they don't activate any role in the session yet. Grant roles to the accounts, and set default roles.
-- **Claims after a residency hand-off.** A login decided in another data centre because of the tenant's [residency](residency.md) gets no claims there: `SPRIG_CLAIM` returns `NULL`.
 - **`end_user_layer` issuers** are verified exactly like `oidc` ones.
 - **A token as an HTTP Basic password** isn't accepted; send it as a bearer token.
 - **MongoDB-language calls over HTTP** (`Sql.Query` with `language: mongo`) don't pass the token's claims to `SPRIG_CLAIM`; SQL calls do.

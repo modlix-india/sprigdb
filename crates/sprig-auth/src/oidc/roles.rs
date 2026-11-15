@@ -1,5 +1,4 @@
-//! Token roles: the roles an issuer's role mappings give a token login
-//! (chapter 29, "Token roles").
+//! Token roles: the roles an issuer's role mappings give a token login.
 //!
 //! ```text
 //! a token's roles := every role mapping matching its claims, by the issuer
