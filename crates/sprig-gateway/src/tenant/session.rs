@@ -160,6 +160,12 @@ impl TenantSession {
                 .ctl_pool(&self.principal.backend.cluster)
                 .await;
         }
+        // This gateway's acknowledgement lease lapsed (it was paused, or
+        // fenced by a lookup job): a lookup state change may have gone by
+        // without it, so the tenant's catalog comes from the writer first.
+        if let Some(lapse) = crate::mongo::publish::stale(self.tenant) {
+            self.reload_after_lapse(lapse).await;
+        }
         let cat = self.svc.cache.get(self.tenant, fresh).await?;
         self.install(&cat);
         // The tenant's per-user backend accounts follow the
@@ -178,6 +184,31 @@ impl TenantSession {
             }
         }
         Ok(cat)
+    }
+
+    /// A writer load of the tenant's catalog after the gateway's lease
+    /// lapsed (`mongo::publish::stale`); a load another session asked for
+    /// within the last second counts once it is done.
+    async fn reload_after_lapse(&mut self, lapse: u64) {
+        for _ in 0..4 {
+            match self.svc.cache.reload_after_miss(self.tenant).await {
+                Ok(Some(_)) => {
+                    crate::mongo::publish::reloaded(self.tenant, lapse);
+                    tracing::info!(tenant = %self.tenant, lapse, "catalog reloaded after the gateway's lease lapsed");
+                    return;
+                }
+                Ok(None) => {
+                    if crate::mongo::publish::stale(self.tenant).is_none() {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+                Err(e) => {
+                    tracing::warn!(tenant = %self.tenant, error = %e, "catalog reload after a lapsed lease failed");
+                    return;
+                }
+            }
+        }
     }
 
     /// After a name miss: one writer load (at most once a second per

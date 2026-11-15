@@ -67,7 +67,7 @@ fn ai_paths() -> Value {
     json!({
         "/v1/ai/chat": {"post": chat},
         "/v1/ai/conversations": {"get": with_params(op("Ai.ListConversations", "sprig.v1.Ai",
-            "The caller's conversations with the tenant assistants, newest first", None, "AiConversations"),
+            "The caller's assistant conversations, newest first: tenant conversations, and for platform operators also administration conversations (ids starting with `a`)", None, "AiConversations"),
             &[q("limit")])},
         "/v1/ai/conversations/{id}": {"get": with_params(op("Ai.GetConversation", "sprig.v1.Ai",
             "One of the caller's conversations with its messages, including the exact payloads sent to the \

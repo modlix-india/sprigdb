@@ -14,7 +14,7 @@ use crate::http::studio::ai::ask::{self, AskAnswer, AskRequest};
 use crate::pipeline::{ExecCtx, ResultSink, RowFormat, int_column, text_column};
 
 /// The columns, in order.
-pub const COLUMNS: [&str; 6] = [
+pub(super) const COLUMNS: [&str; 6] = [
     "query",
     "database",
     "explanation",
@@ -43,7 +43,7 @@ fn columns(charset: u16) -> Vec<ColumnDef> {
 
 /// The answer as a result set.
 #[must_use]
-pub fn answer_rows(a: &AskAnswer, charset: u16) -> LocalAnswer {
+pub(super) fn answer_rows(a: &AskAnswer, charset: u16) -> LocalAnswer {
     let text = |s: &str| Some(Bytes::copy_from_slice(s.as_bytes()));
     let conv = a.conversation.map(|c| c.0.to_string());
     LocalAnswer {

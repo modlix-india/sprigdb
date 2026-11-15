@@ -40,6 +40,7 @@ const COLUMNS: [&str; 6] = [
     "conversation_id",
 ];
 
+#[allow(clippy::unnecessary_wraps)] // a cell: `None` is NULL
 fn s(x: &str) -> Option<String> {
     Some(x.to_owned())
 }

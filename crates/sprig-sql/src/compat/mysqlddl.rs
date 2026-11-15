@@ -812,6 +812,79 @@ pub fn fk_duplicate_name(name: &str) -> WireError {
     )
 }
 
+/// MySQL's 3758 for a functional key part MariaDB refused through its
+/// hidden column ([`super::fxindex`]): MariaDB's 1901 (`Function or
+/// expression '...' cannot be used in the GENERATED ALWAYS AS clause of`
+/// and the column) names the hidden column; MySQL names the index, which
+/// `original` (the client's statement) gives. `None` for other errors.
+#[must_use]
+pub fn functional_index_error(
+    code: u16,
+    message: &str,
+    original: &[u8],
+    opts: &LexOptions,
+) -> Option<WireError> {
+    if code != 1901 {
+        return None;
+    }
+    let tail = message.rsplit_once(" clause of `")?.1;
+    let column = tail.strip_suffix('`')?;
+    if !super::fxindex::is_fx_column(column) {
+        return None;
+    }
+    let index = super::fxindex::index_of_fx_column(original, opts, column)
+        .unwrap_or_else(|| "functional_index".to_owned());
+    Some(WireError::new(
+        3758,
+        *b"HY000",
+        format!("Expression of functional index '{index}' contains a disallowed function."),
+    ))
+}
+
+/// The column of MariaDB's 1054 `Unknown column 'c' in 'GENERATED ALWAYS
+/// AS'`: an `ALTER TABLE` dropped a column that a generated column (or a
+/// functional key part's hidden column) uses. `None` for other errors.
+#[must_use]
+pub fn generated_dependency_column(code: u16, message: &str) -> Option<&str> {
+    if code != 1054 {
+        return None;
+    }
+    message
+        .strip_prefix("Unknown column '")?
+        .strip_suffix("' in 'GENERATED ALWAYS AS'")
+}
+
+/// Whether a generated column's expression, as `information_schema.COLUMNS`
+/// gives it (`GENERATION_EXPRESSION`, names backquoted), uses column
+/// `column`.
+#[must_use]
+pub fn expression_uses(expression: &str, column: &str) -> bool {
+    let quoted = format!("`{}`", column.replace('`', "``"));
+    expression.to_lowercase().contains(&quoted.to_lowercase())
+}
+
+/// MySQL's answer to dropping column `column` that something generated
+/// uses: 3108 when one of the table's own generated columns does
+/// (`user_column`), else 3837, a functional index's.
+#[must_use]
+pub fn generated_dependency(column: &str, user_column: bool) -> WireError {
+    if user_column {
+        WireError::new(
+            3108,
+            *b"HY000",
+            format!("Column '{column}' has a generated column dependency."),
+        )
+    } else {
+        WireError::new(
+            3837,
+            *b"HY000",
+            format!(
+                "Column '{column}' has a functional index dependency and cannot be dropped or renamed."
+            ),
+        )
+    }
+}
+
 /// MySQL's (and MariaDB's) 1317 for `KILL QUERY` of the session's own
 /// statement: the `KILL` itself is interrupted.
 #[must_use]

@@ -169,7 +169,7 @@ fn req(q: &str) -> AskRequest {
 }
 
 fn code(e: &SprigError) -> u16 {
-    e.code().map(sprig_common::SprigCode::number).unwrap_or(0)
+    e.code().map_or(0, sprig_common::SprigCode::number)
 }
 
 #[tokio::test]

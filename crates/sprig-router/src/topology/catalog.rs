@@ -540,7 +540,8 @@ pub fn build_with_fks(
                 .find(|x| {
                     x.routes()
                         && x.index.unique
-                        && l.parent_columns.as_slice() == [x.column.clone()]
+                        && l.parent_columns.as_slice() == x.columns.as_slice()
+                        && x.columns.len() == 1
                 })
                 .cloned();
             let unique = uniques[at]
@@ -697,7 +698,7 @@ fn parent_link(fk: &str, shape: &TableShape) -> Option<ParentLink> {
 }
 
 /// The router's view of lookup `l` of table `t` (named `name`): one value
-/// column, maintained, with every column's class known; `None`
+/// column or several, maintained, with every column's class known; `None`
 /// otherwise. Unique lookups (a unique key) and non-unique ones (automatic
 /// indexing's) are both followed.
 fn lookup_ref(
@@ -710,10 +711,7 @@ fn lookup_ref(
 ) -> Option<LookupRef> {
     let shape = shape?;
     let lookup_map = l.map.clone()?;
-    let [col] = l.columns.as_slice() else {
-        return None;
-    };
-    if !l.state.maintained() || shape.primary.is_empty() {
+    if l.columns.is_empty() || !l.state.maintained() || shape.primary.is_empty() {
         return None;
     }
     let column = |c: &str| -> Option<LookupColumn> {
@@ -724,27 +722,38 @@ fn lookup_ref(
             class,
         })
     };
-    let value = column(col)?;
+    let values = l
+        .columns
+        .iter()
+        .map(|c| column(c))
+        .collect::<Option<Vec<_>>>()?;
     let owner_pk = shape
         .primary
         .iter()
         .map(|c| column(c))
         .collect::<Option<Vec<_>>>()?;
-    let class = match value.class {
-        sprig_shard::KeyClass::Numeric => KeyClass::Int,
-        sprig_shard::KeyClass::String { collation } => KeyClass::Str {
-            collation: collation.0,
-        },
-        sprig_shard::KeyClass::Binary => KeyClass::Binary,
-        _ => return None,
-    };
-    let ordinals = std::iter::once(&value.name)
+    let classes = values
+        .iter()
+        .map(|v| match v.class {
+            sprig_shard::KeyClass::Numeric => Some(KeyClass::Int),
+            sprig_shard::KeyClass::String { collation } => Some(KeyClass::Str {
+                collation: collation.0,
+            }),
+            sprig_shard::KeyClass::Binary => Some(KeyClass::Binary),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let names: Vec<String> = values.iter().map(|v| v.name.clone()).collect();
+    let ordinals = names
+        .iter()
         .chain(shape.primary.iter())
         .map(|c| shape.ordinal(c))
         .collect();
     Some(LookupRef {
-        column: value.name.clone(),
-        class,
+        column: names[0].clone(),
+        class: classes[0],
+        columns: names,
+        classes,
         pk: shape.primary.clone(),
         ordinals,
         index: LookupIndex {
@@ -752,7 +761,7 @@ fn lookup_ref(
             owner: sprig_common::ids::ObjectId(l.owner),
             owner_table: name.to_owned(),
             index_name: l.index_name.clone(),
-            columns: vec![value],
+            columns: values,
             owner_pk,
             unique: l.unique,
             origin: l.origin,

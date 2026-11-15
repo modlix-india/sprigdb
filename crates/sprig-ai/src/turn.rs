@@ -342,13 +342,11 @@ impl Agent {
             },
             req.scrubber.clone(),
         );
-        let used = if role.is_tenant() {
-            let u = self.audit.usage_today(req.user).await?;
-            cfg.budget.check(u, 0)?;
-            Some(u)
-        } else {
-            None
-        };
+        // Every role is budgeted: a tenant role against its tenant's and
+        // user's usage, the administration roles against every operator's
+        // and the operator's (the system store's `usage_today`).
+        let used = self.audit.usage_today(req.user).await?;
+        cfg.budget.check(used, 0)?;
         let deadline = tokio::time::Instant::now() + cfg.timeout;
         let cancel = req.cancel.clone().unwrap_or_default();
         let defs: Vec<_> = self.tools.for_role(role).iter().map(|s| s.def()).collect();
@@ -368,12 +366,12 @@ impl Agent {
         let mut sent = Vec::new();
         let mut tools_called: Vec<String> = Vec::new();
         let stop = loop {
-            let mut max_tokens = cfg.max_output_tokens.max(1);
-            if let Some(u) = used {
-                cfg.budget.check(u, usage.billable())?;
-                let left = cfg.budget.remaining(u, usage.billable());
-                max_tokens = max_tokens.min(u32::try_from(left).unwrap_or(u32::MAX).max(1));
-            }
+            cfg.budget.check(used, usage.billable())?;
+            let left = cfg.budget.remaining(used, usage.billable());
+            let max_tokens = cfg
+                .max_output_tokens
+                .max(1)
+                .min(u32::try_from(left).unwrap_or(u32::MAX).max(1));
             let mut creq = ChatRequest {
                 model: cfg.model.clone(),
                 system: req.system.clone(),
@@ -423,9 +421,7 @@ impl Agent {
             crate::metrics::request(role, self.provider.name(), &cfg.model, result);
             crate::metrics::tokens(role, &outcome.usage);
             usage.add(&outcome.usage);
-            if role.is_tenant()
-                && let Err(e) = self.audit.add_usage(req.user, role, &outcome.usage).await
-            {
+            if let Err(e) = self.audit.add_usage(req.user, role, &outcome.usage).await {
                 tracing::warn!(error = %e, "AI usage wasn't recorded");
             }
             let mut note = json!({

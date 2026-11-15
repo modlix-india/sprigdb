@@ -342,6 +342,11 @@ impl AuthzServices {
                 }
             }
         }
+        // Accounts with table-level grants reach those tables' global
+        // lookup indexes (chapter 19, Q50).
+        if let Err(e) = super::lookups_sql::add_lookup_grants(svc, cat, cluster, &mut want).await {
+            tracing::warn!(tenant = %cat.tenant, %cluster, error = %e, "lookup tables' grants not placed; table-level users' writes to tables with lookups fail until the next reconcile");
+        }
         // Accounts bound by a table's policies read it only through its
         // policy view.
         if let Err(e) = super::rls::narrow_backend(svc, cat, cluster, &mut want).await {
@@ -377,13 +382,31 @@ impl AuthzServices {
         })?;
         let started = std::time::Instant::now();
         let rep = backend::reconcile(&mut conn, cat.tenant, &want, &per_user.key, full).await?;
-        if full {
-            // Stored code created as sprig_ctl before definers were the
-            // session's account.
-            let state = AuthzState::of(cat).cloned().unwrap_or_default();
-            let to = definers::wanted(cat, &state, auth);
-            match definers::migrate(&mut conn, cat.tenant, &to).await {
+        // Share views run as their parent's share definer (RL68, RL70): a
+        // full reconcile moves other stored code off non-tenant definers;
+        // it and the drift sweep re-point share views with another definer
+        // (an older build's) and give the definer what it lacks.
+        if full || sweep {
+            let ancestors: Vec<TenantId> = cat.ancestry.iter().map(|a| a.id).collect();
+            let r = if full {
+                // Stored code created as sprig_ctl before definers were the
+                // session's account.
+                let state = AuthzState::of(cat).cloned().unwrap_or_default();
+                let to = definers::wanted(cat, &state, auth);
+                definers::migrate(&mut conn, cat.tenant, &ancestors, &to).await
+            } else {
+                definers::repair_shares(&mut conn, cat.tenant, &ancestors).await
+            };
+            match r {
                 Ok(r) => {
+                    if !r.stale_shares.is_empty() {
+                        // Repaired here; the next statement reading the
+                        // inherited table also makes them again.
+                        sprig_inherit::upstream::forget(cat.tenant.0);
+                        for o in &r.stale_shares {
+                            tracing::warn!(tenant = %cat.tenant, %cluster, schema = %o.schema, name = %o.name, definer = %o.definer, repaired = r.repaired.contains(o), "share view not running as its parent's share definer");
+                        }
+                    }
                     for o in &r.moved {
                         tracing::warn!(tenant = %cat.tenant, %cluster, kind = o.kind.keyword(), schema = %o.schema, name = %o.name, from = %o.definer, "stored code moved off a non-tenant definer");
                     }
@@ -1200,8 +1223,31 @@ fn rls_context(ts: &TenantSession, cat: &TenantCatalog) -> Option<String> {
     if ts.rls.covered.is_empty() {
         return None;
     }
+    rls_context_now(ts, cat)
+}
+
+/// The session's row-level security context now, whatever its last
+/// statement covered (a recheck compares a prepared text's context with
+/// it), with the tables that bind the session: a table with security on
+/// and no policy (deny all) and one with security off have the same
+/// context otherwise, so disabling it wouldn't prepare a text again.
+fn rls_context_now(ts: &TenantSession, cat: &TenantCatalog) -> Option<String> {
     let rls = privileges(ts, cat).row_policies()?;
-    Some(super::rls::SessionValues::of(ts, cat).context(&rls))
+    let mut bound: Vec<u64> = rls.tables.keys().map(|o| o.0).collect();
+    bound.sort_unstable();
+    Some(format!(
+        "{} {bound:?}",
+        super::rls::SessionValues::of(ts, cat).context(&rls)
+    ))
+}
+
+/// MySQL's 1615: the gateway prepares the client's text again (RL24).
+fn needs_reprepare() -> SprigError {
+    SprigError::standard(
+        1615,
+        *b"HY000",
+        "Prepared statement needs to be re-prepared".to_owned(),
+    )
 }
 
 /// Checks a prepared statement again at execute when the session's
@@ -1219,14 +1265,12 @@ pub fn recheck(ts: &TenantSession, persona: Persona, rc: &Recheck) -> Result<()>
         return Ok(());
     }
     // The text's policy predicates were bound at prepare; a new role set or
-    // policy change needs a new text (MySQL's 1615, which connectors answer
-    // by preparing again).
-    if rc.rls_context.is_some() && rls_context(ts, &cat) != rc.rls_context {
-        return Err(SprigError::standard(
-            1615,
-            *b"HY000",
-            "Prepared statement needs to be re-prepared".to_owned(),
-        ));
+    // policy change (a policy disabled or dropped too) needs a new text
+    // (MySQL's 1615: the executor prepares the client's text again). The
+    // context is compared with the session's now, not with its last
+    // statement's, which may have covered nothing.
+    if rc.rls_context.is_some() && rls_context_now(ts, &cat) != rc.rls_context {
+        return Err(needs_reprepare());
     }
     let client_host = ts.principal.client_ip.to_string();
     let lctn = ts.lower_case_table_names();
@@ -1244,6 +1288,16 @@ pub fn recheck(ts: &TenantSession, persona: Persona, rc: &Recheck) -> Result<()>
         covered: &rc.covered,
     };
     let r = check_text(&cx, rc.kind, &rc.text, rc.lex);
+    // A table whose policies bind the session since the prepare (a policy
+    // created or row security enabled): the text has no predicates for it.
+    // Prepared again, it takes the rewrite as a fresh prepare does (S161).
+    // An engine without the gateway's rewrite keeps 39366.
+    if r.as_ref()
+        .is_err_and(|e| e.code() == Some(sprig_common::SprigCode::RlsUnsupported))
+        && p.row_policies().is_some()
+    {
+        return Err(needs_reprepare());
+    }
     if r.is_err() {
         metrics::counter!("sprig_auth_checks_total", "protocol" => "mysql", "result" => "deny")
             .increment(1);

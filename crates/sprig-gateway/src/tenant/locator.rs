@@ -44,6 +44,13 @@ use crate::backend::Backends;
 const POOL_MAX: usize = 4;
 /// How long an idle `sprig_ctl` connection stays open.
 const IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// The longest a catalog connection lives (give or take
+/// [`CATALOG_CONN_JITTER`]): its server-side prepared statements and buffers
+/// go with it, so whatever a connection accumulates on the catalog's
+/// server is bounded in time (r1-interim GR10).
+const CATALOG_CONN_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// Spreads the catalog connections' renewals.
+const CATALOG_CONN_JITTER: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Finds tenants' catalogs and data clusters (see the module docs).
 pub struct GatewayLocator {
@@ -649,7 +656,9 @@ impl GatewayLocator {
                     PoolOpts::new()
                         .with_constraints(constraints)
                         .with_inactive_connection_ttl(IDLE_TTL)
-                        .with_reset_connection(!catalog),
+                        .with_reset_connection(!catalog)
+                        .with_abs_conn_ttl(catalog.then_some(CATALOG_CONN_TTL))
+                        .with_abs_conn_ttl_jitter(catalog.then_some(CATALOG_CONN_JITTER)),
                 ),
         );
         let old = pools

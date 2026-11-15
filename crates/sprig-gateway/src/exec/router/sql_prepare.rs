@@ -94,6 +94,15 @@ pub(crate) enum Lit {
     Str(Vec<u8>),
 }
 
+/// 39366 for a SQL-level prepared statement whose text names a table the
+/// session's row-level security binds (S163).
+fn rls_refused() -> SprigError {
+    sprig_sql::rls::unsupported(
+        "a prepared statement whose text names a protected table (PREPARE ... FROM, \
+         EXECUTE)",
+    )
+}
+
 fn significant(k: TokenKind) -> bool {
     !matches!(
         k,
@@ -611,7 +620,22 @@ impl PassSession {
             SqlPs::Prepare { name, src } => {
                 // MariaDB drops the old statement first, whatever comes.
                 self.router.sql_ps.remove(&name.to_lowercase());
+                self.router.sql_texts.remove(&name.to_lowercase());
                 if !sharded {
+                    // MariaDB holds it; its text is kept for EXECUTE's
+                    // check. A text from a variable or an expression is
+                    // read now (a literal was checked with the statement)
+                    // and refused as a literal naming the same table is.
+                    let Ok(text) = self.source_text(cx, &src).await else {
+                        return Ok(None);
+                    };
+                    if src.lit.is_none() && self.rls_names_protected(cx, &text).await? {
+                        let e = self.map_error(rls_refused());
+                        return Ok(Some(self.fail(out, &e).await?));
+                    }
+                    self.router
+                        .sql_texts
+                        .insert(name.to_lowercase(), Bytes::from(text));
                     return Ok(None);
                 }
                 let held = match self.source_text(cx, &src).await {
@@ -633,12 +657,37 @@ impl PassSession {
                 match self.router.sql_ps.get(&name.to_lowercase()).cloned() {
                     Some(held) => self.run_held(cx, &held, &using, more, format, out).await?,
                     None if sharded => self.fail(out, &unknown(&name, "EXECUTE")).await?,
-                    None => return Ok(None),
+                    None => {
+                        // A statement MariaDB holds, prepared before a policy
+                        // bound its tables (or from a variable): refused as a
+                        // fresh PREPARE of its text would be.
+                        let Some(text) = self.router.sql_texts.get(&name.to_lowercase()).cloned()
+                        else {
+                            return Ok(None);
+                        };
+                        if !self.rls_names_protected(cx, &text).await? {
+                            return Ok(None);
+                        }
+                        let e = self.map_error(rls_refused());
+                        self.fail(out, &e).await?
+                    }
                 }
             }
             SqlPs::Immediate { src, using } => {
                 if !sharded {
-                    return Ok(None);
+                    // A literal was checked with the statement; a text from
+                    // a variable or an expression is read and checked now.
+                    if src.lit.is_some() {
+                        return Ok(None);
+                    }
+                    let Ok(text) = self.source_text(cx, &src).await else {
+                        return Ok(None);
+                    };
+                    if !self.rls_names_protected(cx, &text).await? {
+                        return Ok(None);
+                    }
+                    let e = self.map_error(rls_refused());
+                    return Ok(Some(self.fail(out, &e).await?));
                 }
                 let held = match self.source_text(cx, &src).await {
                     Ok(t) => self.hold(cx, t).await,
@@ -653,6 +702,7 @@ impl PassSession {
                 }
             }
             SqlPs::Deallocate { name } => {
+                self.router.sql_texts.remove(&name.to_lowercase());
                 if self.router.sql_ps.remove(&name.to_lowercase()).is_some() {
                     self.ps_ok(out, more, "").await?
                 } else if sharded {

@@ -9,13 +9,16 @@ source: the settings registry (sprig-settings)
 
 Every setting SprigDB declares, with its default, the scopes that may set it, hard bounds and when a change applies. Settings resolve from the most specific scope: object, database, tenant and its ancestors, cluster, data center, global, then the built-in default. Read them with `SHOW SPRIG SETTINGS`, change them with `ALTER TENANT|DATABASE|TABLE … SPRIG SET (key = value)` or `sprigctl settings`.
 
-702 settings in 60 groups.
+713 settings in 61 groups.
 
 ## `advisor`
 
 | Key | Type | Default | Scopes | Bounds | Applies | Description |
 |---|---|---|---|---|---|---|
+| `advisor.lookup_eval_minutes` | int | `5` | tenant, global (operator only) | 1 to 1440 | live | Period of the lookup proposals |
+| `advisor.lookup_min_runs` | int | `100` | tenant, global (operator only) | 1 to 1000000000 | live | Reads of a column before a lookup index is proposed |
 | `advisor.lookup_penalty` | float | `0.1` | tenant, global (operator only) | 0 to 1 | live | Credit lost per lookup a statement needs |
+| `advisor.lookup_window_minutes` | int | `60` | tenant, global (operator only) | 1 to 10080 | live | Workload window of lookup proposals |
 | `advisor.max_moves` | int | `200` | tenant, global (operator only) | 0 to 100000 | live | Search steps per run |
 | `advisor.max_top_value_pct` | int | `25` | tenant, global (operator only) | 1 to 100 | live | Largest share one value may hold |
 | `advisor.max_wait_hours` | float | `72` | tenant, global (operator only) | 0 to 8760 | live | Then apply the best design anyway |
@@ -41,6 +44,9 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `ai.enabled` | bool | `false` | tenant, global | - | live | Turn on the tenant's AI assistants. Off until a provider is configured and a tenant admin turns it on |
 | `ai.max_output_tokens` | int | `16000` | global (operator only) | 256 to 128000 | live | Output tokens one model call may produce, reasoning included |
 | `ai.max_tool_rounds` | int | `12` | global (operator only) | 0 to 100 | live | Tool rounds one assistant turn may take |
+| `ai.mcp.calls_per_minute` | int | `120` | tenant, global | 1 to 100000 | live | MCP tool calls one user may make per minute; more are refused until the minute is over |
+| `ai.mcp.enabled` | bool | `false` | tenant, global | - | live | Turn on the MCP server (/v1/mcp) for the tenant, so outside AI agents can use the assistants' tools as the signed-in user; ai.enabled must be on too |
+| `ai.mcp.tools` | text | `read` | tenant, global | - | live | The tools MCP clients may call, comma-separated: tool names, read (every read tool of the role) and propose (every proposal tool of the role) |
 | `ai.model.admin` | text | `` | global (operator only) | - | live | provider/model for the administration agent, such as anthropic/claude-opus-5-5; empty: none |
 | `ai.model.data` | text | `` | global (operator only) | - | live | provider/model for the data specialist; empty: none |
 | `ai.model.dba` | text | `` | global (operator only) | - | live | provider/model for the DBA assistant; empty: none |
@@ -180,6 +186,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `auto_index.eval_interval_minutes` | int | `60` | object, database, tenant, cluster, dc, global | 1 to 10080 | live | Evaluation period |
 | `auto_index.include_studio` | bool | `false` | object, database, tenant, cluster, dc, global | - | live | Count statements run from Studio toward triggers |
 | `auto_index.lookup_cost_factor` | float | `2` | object, database, tenant, cluster, dc, global | 0 to 100 | live | Extra cost of a primary-key lookup per entry |
+| `auto_index.lookup_scatter_pct` | float | `80` | object, database, tenant, cluster, dc, global | 0 to 100 | live | Scatter share for a lookup index |
 | `auto_index.maintenance_cost_ms` | float | `0.05` | object, database, tenant, cluster, dc, global | 0 to 1000 | live | Cost of one index entry change |
 | `auto_index.max_build_hours` | float | `6` | object, database, tenant, cluster, dc, global | 0.01 to 720 | live | Longest build |
 | `auto_index.max_builds_per_cluster` | int | `1` | object, database, tenant, cluster, dc, global (operator only) | 1 to 64 | live | Concurrent index builds per cluster |
@@ -586,6 +593,15 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `logic.trigger_max_attempts` | int | `10` | object, database, tenant, global | 1 to 1000000 | live | Before a dead letter |
 | `logic.trigger_retry_initial_ms` | int | `1000` | object, database, tenant, global | 1 to 3600000 | live | First backoff |
 | `logic.trigger_retry_max_ms` | int | `300000` | object, database, tenant, global | 1 to 86400000 | live | Backoff cap |
+
+## `lookup`
+
+| Key | Type | Default | Scopes | Bounds | Applies | Description |
+|---|---|---|---|---|---|---|
+| `lookup.backfill_chunk_rows` | int | `1000` | tenant, dc, global | 10 to 100000 | live | Owner rows per back-fill and verification chunk |
+| `lookup.build_lease_seconds` | int | `30` | tenant, dc, global | 5 to 3600 | live | A lookup build untouched this long is taken over |
+| `lookup.lock_wait_seconds` | int | `5` | object, database, tenant, global | 1 to 3600 | live | Lock wait for claims and owner checks |
+| `lookup.publish_timeout_ms` | int | `10000` | tenant, dc, global | 100 to 600000 | live | Wait for every gateway to acknowledge a lookup state change |
 
 ## `meta`
 

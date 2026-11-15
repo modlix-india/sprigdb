@@ -8,15 +8,24 @@
 //!   is the same rows as a view.
 //! - **`SPRIG REBUILD LOOKUP INDEX k ON t`** (needs `ALTER` on `t`) rebuilds
 //!   `t`'s lookup `k`: routing stops, every row is checked and repaired,
-//!   orphans go, routing resumes. When `k` is a declared single-column
-//!   unique key without a lookup (a table the advisor sharded), it builds
-//!   one, which makes the key unique across shards (1062 if it isn't).
+//!   orphans go, routing resumes. When `k` is a declared unique key (of
+//!   one column or several, without the distribution key) without a
+//!   lookup (a table the advisor sharded), it builds one, which makes the
+//!   key unique across shards (1062 if it isn't).
 //! - **`SPRIG DROP LOOKUP INDEX k ON t`** (needs `ALTER`) drops only the
 //!   lookup; the key stays unique within each shard.
 //!
 //! `ALTER TABLE ... ADD UNIQUE`, `CREATE UNIQUE INDEX` and `DROP INDEX` on
 //! sharded tables go through the DDL path (`exec::router::lookup_ddl`),
-//! which uses [`GwHost`] and [`build_for_key`] from here.
+//! which uses [`GwHost`] and [`build_for_key`] from here. `DROP TABLE` and
+//! `DROP DATABASE` drop the lookups of the tables they remove
+//! ([`owners_dropped`], [`drop_owned`]).
+//!
+//! A unique lookup whose build fails because its values repeat across
+//! shards raises an `advisor.lookup` approvals item naming the table, the
+//! key and up to 10 of the values ([`raise_duplicates`]); approving it
+//! once the values are fixed builds the lookup (the controller's sharding
+//! loop applies it).
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -34,8 +43,11 @@ use sprig_common::{Result, SprigCode, SprigError};
 use sprig_meta::{Tier, TierView};
 use sprig_proto_mysql::ColumnDef;
 use sprig_shard::ShardMapStore;
-use sprig_shard::lookup::admin::{Admin, LookupHost, NewLookup, lookup_keys, owner_shape};
+use sprig_shard::lookup::admin::{
+    Admin, DuplicateReport, LookupHost, NewLookup, lookup_keys, owner_shape,
+};
 use sprig_shard::lookup::direct::{BuildReport, Pools};
+use sprig_shard::lookup::settings::LookupSettings;
 use sprig_shard::lookup::{LookupCatalog, LookupOrigin, LookupRecord};
 use sprig_sql::names::LocalAnswer;
 
@@ -44,11 +56,42 @@ use super::session::TenantSession;
 use crate::pipeline::text_column;
 
 /// How long a publish waits for every gateway to load the new catalog
-/// version (each checks the directory's version at most once a second).
+/// version when acknowledgements can't be used (each checks the
+/// directory's version at most once a second).
 pub const PUBLISH_SETTLE: Duration = Duration::from_millis(2500);
 
-/// Rows a back-fill chunk reads (`mover.copy_chunk_rows`' default).
+/// Rows a back-fill chunk reads (`lookup.backfill_chunk_rows`' default).
 pub const CHUNK_ROWS: usize = 1000;
+
+/// The `lookup.*` keys for `tenant`: with its cached catalog's rows when
+/// this gateway has it.
+#[must_use]
+pub fn settings(svc: &TenantServices, tenant: TenantId) -> LookupSettings {
+    if let Some(cat) = svc.cache.cached(tenant) {
+        let ctx = cat.setting_ctx(&svc.dc);
+        LookupSettings::resolve(&ctx, |k, c| svc.settings.get(k, c, Some(&cat.settings)))
+    } else {
+        let ctx = sprig_settings::SettingCtx::process(&svc.dc).for_tenant(tenant, &[]);
+        LookupSettings::resolve(&ctx, |k, c| svc.settings.get(k, c, None))
+    }
+}
+
+/// The lookup jobs of `tenant`, run by this gateway.
+fn admin<'a>(
+    svc: &TenantServices,
+    tenant: TenantId,
+    store: &'a ShardMapStore,
+    host: &'a GwHost,
+) -> Admin<'a> {
+    let s = settings(svc, tenant);
+    Admin {
+        tenant,
+        maps: store,
+        host,
+        chunk: s.chunk_rows,
+        lease: s.build_lease,
+    }
+}
 
 fn catalog_err(e: mysql_async::Error) -> SprigError {
     SprigError::new(
@@ -72,12 +115,16 @@ pub fn maps(svc: &TenantServices, tenant: TenantId) -> ShardMapStore {
 
 /// [`LookupHost`] for a gateway: the tenant's catalog through its writer
 /// endpoint, clusters through the `sprig_ctl` pools, and a publish that is
-/// an empty versioned catalog change followed by [`PUBLISH_SETTLE`].
+/// an empty versioned catalog change followed by every gateway's
+/// acknowledgement ([`publish_wait`]).
 pub struct GwHost {
     /// The services.
     pub svc: Arc<TenantServices>,
     /// The tenant.
     pub tenant: TenantId,
+    /// Building for `ADD UNIQUE`: a failed build drops the shards' new key
+    /// again, so a duplicates item asks for the statement to be run again.
+    pub ddl: bool,
 }
 
 impl std::fmt::Debug for GwHost {
@@ -117,9 +164,95 @@ impl LookupHost for GwHost {
             .await?
             .commit()
             .await?;
-        tracing::debug!(tenant = %self.tenant, version = v, "lookup index change published");
-        tokio::time::sleep(PUBLISH_SETTLE).await;
+        publish_wait(&self.svc, self.tenant, v).await;
         Ok(())
+    }
+
+    async fn duplicates(&self, report: &DuplicateReport) {
+        if let Err(e) = raise_duplicates(&self.svc, self.tenant, report, self.ddl).await {
+            tracing::warn!(tenant = %self.tenant, table = %report.table, key = %report.key,
+                error = %e, "the approvals item for a lookup's duplicates wasn't raised");
+        }
+    }
+}
+
+/// Raises the `advisor.lookup` item that reports a failed build's
+/// duplicates (target `t<tenant>/o<owner>/lookup/<key>/duplicates`), held
+/// for an approval with no timers: approving it after the values are
+/// fixed builds the lookup. A live item for the same target is refreshed
+/// with the new evidence instead of a second one.
+///
+/// # Errors
+/// The catalog's.
+pub async fn raise_duplicates(
+    svc: &Arc<TenantServices>,
+    tenant: TenantId,
+    r: &DuplicateReport,
+    ddl: bool,
+) -> Result<()> {
+    use sprig_approvals::store::RecStore as _;
+    use sprig_approvals::{Action, Kind, Level, Mode, Policy, Proposal, Subject};
+    let db_name = svc
+        .cache
+        .cached(tenant)
+        .and_then(|c| c.databases.get(r.db).map(|d| d.name.clone()))
+        .unwrap_or_else(|| format!("d{}", r.db.0));
+    let mut subject = Subject::tenant(tenant, svc.dc.clone());
+    subject.db = Some(r.db);
+    subject.db_name = Some(db_name.clone());
+    subject.object = Some(r.owner);
+    subject.object_name = Some(r.table.clone());
+    #[allow(clippy::cast_precision_loss)] // a count of values
+    let score = r.found.values as f64;
+    // After `ADD UNIQUE` the shards' key was dropped again: the statement
+    // is what to run once the values are fixed.
+    let (text, mut machine) = if ddl {
+        (r.ddl_text(&db_name), r.machine())
+    } else {
+        (r.action_text(&db_name), r.machine())
+    };
+    machine["ddl"] = serde_json::Value::Bool(ddl);
+    let p = Proposal {
+        kind: Kind::AdvisorLookup,
+        subject,
+        target: r.target(tenant),
+        action: Action { text, machine },
+        evidence: r.evidence(),
+        score,
+        summary: r.summary(&db_name, ddl),
+        emergency: false,
+    };
+    let locator: Arc<dyn sprig_catalog::CatalogLocator> = svc.locator.clone();
+    let recs = sprig_approvals::catalog::CatalogRecStore::new(locator, tenant);
+    let now = sprig_approvals::model::wall_micros(svc.clock.wall());
+    recs.raise(&p, &Policy::fixed(Mode::Approve, Level::Database), &[], now)
+        .await?;
+    tracing::info!(tenant = %tenant, table = %r.table, key = %r.key, values = r.found.values,
+        "approvals item raised for a lookup's duplicates");
+    Ok(())
+}
+
+/// Waits until every gateway of the tenant's home DC has acknowledged
+/// catalog version `v` (`sprig_shard::lookup::publish`), fencing those that
+/// don't within `lookup.publish_timeout_ms`; when the acknowledgements
+/// can't be used at all, a fixed [`PUBLISH_SETTLE`] instead.
+pub async fn publish_wait(svc: &Arc<TenantServices>, tenant: TenantId, v: u64) {
+    let timeout = settings(svc, tenant).publish_timeout;
+    let store = Arc::clone(maps(svc, tenant).store());
+    match sprig_shard::lookup::publish::wait_for_gateways(&store, tenant, v, timeout).await {
+        Ok(o) if o.fenced.is_empty() => {
+            tracing::debug!(tenant = %tenant, version = v, gateways = o.gateways,
+                waited_ms = o.waited.as_millis(), "lookup index change acknowledged");
+        }
+        Ok(o) => {
+            tracing::warn!(tenant = %tenant, version = v, fenced = ?o.fenced,
+                waited_ms = o.waited.as_millis(), "lookup index change: gateways fenced");
+        }
+        Err(e) => {
+            tracing::warn!(tenant = %tenant, version = v, error = %e,
+                "lookup index change: acknowledgements unavailable; a fixed wait instead");
+            tokio::time::sleep(PUBLISH_SETTLE).await;
+        }
     }
 }
 
@@ -174,8 +307,9 @@ fn refused(why: &str) -> SprigError {
     )
 }
 
-/// Builds the unique lookup of `table`'s single-column unique key `key`
-/// on `column`: what `ADD UNIQUE` and `SPRIG REBUILD LOOKUP INDEX` run.
+/// Builds the unique lookup of `table`'s unique key `key` on `columns`
+/// (one or several): what `ADD UNIQUE` and `SPRIG REBUILD LOOKUP INDEX`
+/// run.
 ///
 /// # Errors
 /// 39420 for a member that follows its parent or hasn't filled
@@ -187,11 +321,13 @@ pub async fn build_for_key(
     object: ObjectId,
     table: &str,
     key: &str,
-    column: &str,
+    columns: &[String],
+    ddl: bool,
 ) -> Result<BuildReport> {
     let host = GwHost {
         svc: Arc::clone(svc),
         tenant,
+        ddl,
     };
     let mut cat = host.catalog().await?;
     let m = membership(&mut cat, object)
@@ -211,19 +347,13 @@ pub async fn build_for_key(
     drop(cat);
     let store = maps(svc, tenant);
     let (owner_map, _) = store.load(tenant, m.group).await?;
-    let admin = Admin {
-        tenant,
-        maps: &store,
-        host: &host,
-        chunk: CHUNK_ROWS,
-    };
-    let (l, report) = admin
+    let (l, report) = admin(svc, tenant, &store, &host)
         .create(&NewLookup {
             db: m.db,
             owner: object,
             owner_table: table.to_owned(),
             owner_map: Arc::new(owner_map),
-            columns: vec![column.to_ascii_lowercase()],
+            columns: columns.iter().map(|c| c.to_ascii_lowercase()).collect(),
             key: Some(key.to_owned()),
             origin: LookupOrigin::UniqueKey,
         })
@@ -248,16 +378,66 @@ pub async fn drop_for_key(
     let host = GwHost {
         svc: Arc::clone(svc),
         tenant,
+        ddl: false,
     };
     let store = maps(svc, tenant);
-    Admin {
-        tenant,
-        maps: &store,
-        host: &host,
-        chunk: CHUNK_ROWS,
+    admin(svc, tenant, &store, &host).drop(object, name).await
+}
+
+/// The tables with lookups among what a `DROP TABLE` or `DROP DATABASE`
+/// removes, from the session's snapshot (read before the statement runs).
+#[must_use]
+pub fn owners_dropped(
+    ts: &TenantSession,
+    dropped: &[sprig_auth::authz::authorizer::Dropped],
+) -> Vec<ObjectId> {
+    use sprig_auth::authz::authorizer::Dropped;
+    let Some(cat) = ts.catalog() else {
+        return Vec::new();
+    };
+    let Some(state) = cat
+        .ext
+        .get::<crate::exec::router::layout::ShardingState>(sprig_shard::groups::MODULE)
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<ObjectId> = state
+        .lookups
+        .iter()
+        .map(|l| ObjectId(l.object))
+        .filter(|o| {
+            dropped.iter().any(|d| match d {
+                Dropped::Object { object, .. } => object == o,
+                Dropped::Database { db, .. } => cat.objects.get(*o).is_some_and(|x| x.db_id == *db),
+            })
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Drops every lookup of `owners`, tables a `DROP` removed
+/// ([`Admin::drop_owned`]). Returns their names.
+///
+/// # Errors
+/// The lookup jobs' errors; a crash or failure here is finished by the
+/// controller's recovery, which drops lookups whose table is gone.
+pub async fn drop_owned(
+    svc: &Arc<TenantServices>,
+    tenant: TenantId,
+    owners: &[ObjectId],
+) -> Result<Vec<String>> {
+    if owners.is_empty() {
+        return Ok(Vec::new());
     }
-    .drop(object, name)
-    .await
+    let host = GwHost {
+        svc: Arc::clone(svc),
+        tenant,
+        ddl: false,
+    };
+    let store = maps(svc, tenant);
+    admin(svc, tenant, &store, &host).drop_owned(owners).await
 }
 
 /// The tenant's lookup rows, fresh from the catalog (none before the
@@ -284,6 +464,180 @@ pub async fn records(svc: &Arc<TenantServices>, tenant: TenantId) -> Result<Vec<
         .await
         .map_err(catalog_err)?;
     LookupCatalog.rows(&mut c).await
+}
+
+/// A lookup's owner and table, as the grants need them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LookupOwner {
+    /// The owner's database.
+    pub db: DbId,
+    /// The owner's name, lowercase.
+    pub table: String,
+    /// The lookup table's name.
+    pub physical: String,
+}
+
+/// The database a shard or reference schema of `tenant` belongs to
+/// (`t<tenant>_d<db>_...`).
+fn schema_db(tenant: TenantId, schema: &str) -> Option<DbId> {
+    let rest = schema.strip_prefix(&format!("t{}_d", tenant.0))?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() || !rest[digits.len()..].starts_with('_') {
+        return None;
+    }
+    digits.parse().ok().map(DbId)
+}
+
+/// Grants on the lookup tables of the tables accounts hold table or
+/// column grants on (Q50): a user granted only some tables reaches their
+/// lookups the way a database-wide grant does, and no others.
+///
+/// - `SELECT` on the owner gives `SELECT` on its lookup tables (routing
+///   reads them);
+/// - `INSERT`, `UPDATE` or `DELETE` on the owner gives `SELECT`, `INSERT`,
+///   `UPDATE` and `DELETE` on them (claims insert, read `FOR UPDATE` and
+///   take orphans over; releases delete).
+///
+/// `places` maps `(database, lookup table)` to the schemas of this cluster
+/// holding it (`t<tenant>_d<db>_g<lookup group>_s<n>`). Accounts without a
+/// grant on an owner get nothing; database-wide grants already cover the
+/// lookup schemas, which share the database's pattern. Clients never name
+/// lookup tables (`__sprig_` names are refused outside the gateway's own
+/// statements), so the grant reaches only the gateway's claims and reads.
+pub fn lookup_grants(
+    want: &mut sprig_auth::authz::backend::BackendState,
+    tenant: TenantId,
+    owners: &[LookupOwner],
+    places: &std::collections::BTreeMap<(DbId, String), Vec<String>>,
+) {
+    use sprig_auth::authz::backend::BackendTarget;
+    use sprig_auth::authz::{Action, ActionSet};
+    let read = ActionSet::of(&[Action::Select]);
+    let write = ActionSet::of(&[Action::Insert, Action::Update, Action::Delete]);
+    let all = read.union(write);
+    for grants in want.values_mut() {
+        let mut add: std::collections::BTreeMap<BackendTarget, ActionSet> =
+            std::collections::BTreeMap::new();
+        for (t, a) in grants.iter() {
+            let (BackendTarget::Table(schema, table) | BackendTarget::Column(schema, table, _)) = t
+            else {
+                continue;
+            };
+            if table.starts_with("__sprig_") {
+                continue;
+            }
+            let Some(db) = schema_db(tenant, schema) else {
+                continue;
+            };
+            let need = if !a.intersect(write).is_empty() {
+                all
+            } else if a.has(Action::Select) {
+                read
+            } else {
+                continue;
+            };
+            for o in owners
+                .iter()
+                .filter(|o| o.db == db && o.table.eq_ignore_ascii_case(table))
+            {
+                for s in places.get(&(db, o.physical.clone())).into_iter().flatten() {
+                    let e = add
+                        .entry(BackendTarget::Table(s.clone(), o.physical.clone()))
+                        .or_default();
+                    *e = e.union(need);
+                }
+            }
+        }
+        for (t, a) in add {
+            let e = grants.entry(t).or_default();
+            *e = e.union(a);
+        }
+    }
+}
+
+/// [`lookup_grants`] for `cat`'s lookups on `cluster`: the lookup tables
+/// there are read as `sprig_ctl` from `information_schema`, only when some
+/// account holds a table or column grant on an owner.
+///
+/// # Errors
+/// The cluster's.
+pub async fn add_lookup_grants(
+    svc: &TenantServices,
+    cat: &TenantCatalog,
+    cluster: &ClusterId,
+    want: &mut sprig_auth::authz::backend::BackendState,
+) -> Result<()> {
+    use sprig_auth::authz::backend::BackendTarget;
+    let Some(state) = cat
+        .ext
+        .get::<crate::exec::router::layout::ShardingState>(sprig_shard::groups::MODULE)
+    else {
+        return Ok(());
+    };
+    let owners: Vec<LookupOwner> = state
+        .lookups
+        .iter()
+        .filter_map(|l| {
+            let o = cat.objects.get(ObjectId(l.object))?;
+            Some(LookupOwner {
+                db: o.db_id,
+                table: o.name.to_ascii_lowercase(),
+                physical: l.physical.clone(),
+            })
+        })
+        .collect();
+    let named = want.values().flat_map(|g| g.keys()).any(|t| match t {
+        BackendTarget::Table(s, n) | BackendTarget::Column(s, n, _) => schema_db(cat.tenant, s)
+            .is_some_and(|db| {
+                owners
+                    .iter()
+                    .any(|o| o.db == db && o.table.eq_ignore_ascii_case(n))
+            }),
+        _ => false,
+    });
+    if !named {
+        return Ok(());
+    }
+    let pool = svc.locator.ctl_pool(cluster).await?;
+    let mut conn = pool.get_conn().await.map_err(|e| {
+        SprigError::new(
+            SprigCode::BackendUnavailable,
+            format!("sprig_ctl on {cluster}: {e}"),
+        )
+    })?;
+    let groups: std::collections::BTreeSet<u32> = state.lookups.iter().map(|l| l.group).collect();
+    let mut schemas = Vec::new();
+    for g in groups {
+        schemas.extend(
+            sprig_catalog::infoschema::schemas_like(
+                &mut conn,
+                &format!("t{}\\_d%\\_g{g}\\_s%", cat.tenant.0),
+            )
+            .await?,
+        );
+    }
+    let physicals = owners
+        .iter()
+        .map(|o| sprig_catalog::infoschema::literal(&o.physical))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rows: Vec<(String, String)> = sprig_catalog::infoschema::read_per_schema(
+        &mut conn,
+        "SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES",
+        "TABLE_SCHEMA",
+        &schemas,
+        &format!(" AND TABLE_NAME IN ({physicals})"),
+    )
+    .await?;
+    let mut places: std::collections::BTreeMap<(DbId, String), Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (schema, table) in rows {
+        if let Some(db) = schema_db(cat.tenant, &schema) {
+            places.entry((db, table)).or_default().push(schema);
+        }
+    }
+    lookup_grants(want, cat.tenant, &owners, &places);
+    Ok(())
 }
 
 /// A parsed lookup statement.
@@ -605,14 +959,10 @@ pub async fn execute(
             let host = GwHost {
                 svc: Arc::clone(&svc),
                 tenant: ts.tenant,
+                ddl: false,
             };
             let store = maps(&svc, ts.tenant);
-            let admin = Admin {
-                tenant: ts.tenant,
-                maps: &store,
-                host: &host,
-                chunk: CHUNK_ROWS,
-            };
+            let admin = admin(&svc, ts.tenant, &store, &host);
             let mut c = host.catalog().await?;
             if admin.find(&mut c, object, name).await?.is_some() {
                 drop(c);
@@ -633,7 +983,7 @@ pub async fn execute(
             let pool = svc.locator.ctl_pool(&r0.cluster).await?;
             let mut sc = pool.get_conn().await.map_err(catalog_err)?;
             let shape = owner_shape(&mut sc, &schema, &tname).await?;
-            let Some((key, column)) = lookup_keys(&shape, &m.key)
+            let Some((key, cols)) = lookup_keys(&shape, &m.key)
                 .into_iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
             else {
@@ -641,12 +991,12 @@ pub async fn execute(
                     1176,
                     *b"42000",
                     format!(
-                        "Key '{name}' doesn't exist in table '{tname}' as a unique key of one \
-                         column without the distribution key"
+                        "Key '{name}' doesn't exist in table '{tname}' as a unique key without \
+                         the distribution key"
                     ),
                 ));
             };
-            let r = build_for_key(&svc, ts.tenant, object, &tname, &key, &column).await?;
+            let r = build_for_key(&svc, ts.tenant, object, &tname, &key, &cols, false).await?;
             Ok(LookupAnswer::Ok { affected: r.rows })
         }
     }
@@ -694,6 +1044,79 @@ pub async fn view_sql(ts: &TenantSession, cat: &Arc<TenantCatalog>, nbe: bool) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_level_grants_reach_their_lookups_only() {
+        use sprig_auth::authz::backend::{BackendState, BackendTarget};
+        use sprig_auth::authz::{Action, ActionSet};
+        let t = TenantId(9);
+        let owners = vec![
+            LookupOwner {
+                db: DbId(1),
+                table: "customers".into(),
+                physical: "__sprig_lk_customers__uk_email".into(),
+            },
+            LookupOwner {
+                db: DbId(1),
+                table: "secrets".into(),
+                physical: "__sprig_lk_secrets__uk_code".into(),
+            },
+        ];
+        let mut places = std::collections::BTreeMap::new();
+        for o in &owners {
+            places.insert(
+                (DbId(1), o.physical.clone()),
+                vec!["t9_d1_g7_s1".to_owned(), "t9_d1_g7_s2".to_owned()],
+            );
+        }
+        let sel = ActionSet::of(&[Action::Select]);
+        let ins = ActionSet::of(&[Action::Insert]);
+        let mut want = BackendState::new();
+        // u1 may read customers; u2 may insert into it (one column);
+        // u3 holds a database-wide grant only; u4 reads another
+        // database's customers.
+        want.entry("u1".into()).or_default().insert(
+            BackendTarget::Table("t9_d1_g3_s1".into(), "Customers".into()),
+            sel,
+        );
+        want.entry("u2".into()).or_default().insert(
+            BackendTarget::Column("t9_d1_g3_s2".into(), "customers".into(), "email".into()),
+            ins,
+        );
+        want.entry("u3".into())
+            .or_default()
+            .insert(BackendTarget::Db("t9\\_d1\\_%".into()), sel.union(ins));
+        want.entry("u4".into()).or_default().insert(
+            BackendTarget::Table("t9_d2_g3_s1".into(), "customers".into()),
+            sel,
+        );
+        lookup_grants(&mut want, t, &owners, &places);
+        let lk = |s: &str| BackendTarget::Table(s.into(), "__sprig_lk_customers__uk_email".into());
+        assert_eq!(want["u1"].get(&lk("t9_d1_g7_s1")).copied(), Some(sel));
+        assert_eq!(want["u1"].get(&lk("t9_d1_g7_s2")).copied(), Some(sel));
+        let rw = ActionSet::of(&[
+            Action::Select,
+            Action::Insert,
+            Action::Update,
+            Action::Delete,
+        ]);
+        assert_eq!(want["u2"].get(&lk("t9_d1_g7_s1")).copied(), Some(rw));
+        // Nothing on a table they have no grant on, nothing for the
+        // database-wide account, nothing across databases.
+        for u in ["u1", "u2"] {
+            assert!(
+                !want[u]
+                    .keys()
+                    .any(|k| matches!(k, BackendTarget::Table(_, n) if n.contains("secrets"))),
+                "{u}"
+            );
+        }
+        assert_eq!(want["u3"].len(), 1);
+        assert_eq!(want["u4"].len(), 1);
+        assert_eq!(schema_db(t, "t9_d12_g7_s1"), Some(DbId(12)));
+        assert_eq!(schema_db(t, "t91_d1_g7_s1"), None);
+        assert_eq!(schema_db(t, "t9_d1x"), None);
+    }
 
     #[test]
     fn statements_parse() {

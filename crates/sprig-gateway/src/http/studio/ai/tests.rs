@@ -456,3 +456,177 @@ fn every_event_maps_to_a_typed_line() {
     assert_eq!(lines[0]["type"], "tool_end");
     assert_eq!(super::pct("a b/ü"), "a%20b%2F%C3%BC");
 }
+
+/// The views an operator, another operator and a tenant user have.
+fn views_of(
+    tenant: &Arc<MemoryAudit>,
+    admin: Option<&Arc<MemoryAudit>>,
+    user: UserId,
+) -> super::Views {
+    super::Views {
+        tenant: Some((Arc::clone(tenant) as Arc<dyn super::ConvStore>, user)),
+        admin: admin.map(|a| Ok((Arc::clone(a) as Arc<dyn super::ConvStore>, user))),
+    }
+}
+
+#[tokio::test]
+async fn admin_turns_are_stored_for_their_operator_only() {
+    let tenant = Arc::new(MemoryAudit::default());
+    let admin = Arc::new(MemoryAudit::system());
+    let ann = UserId(9);
+    let bob = UserId(11);
+    let carol = UserId(12);
+    // Ann's tenant conversation, and Carol's.
+    let mine = tenant.create(ann, Role::Data, "rows").await.unwrap();
+    let theirs = tenant.create(carol, Role::Data, "carol's").await.unwrap();
+    // Ann's administration turn, stored in the system store with its
+    // payload.
+    let r = run(
+        vec![Reply::Text("Check the disk.".into())],
+        cfg(Role::Admin, false, 100_000),
+        Arc::clone(&admin),
+        "Why 39993 on node n2?",
+    )
+    .await;
+    assert_eq!(r.lines[0]["role"], "admin");
+    assert_eq!(r.lines.last().unwrap()["stop"], "end_turn");
+
+    // Ann, an operator: both, newest first, the administration one
+    // prefixed.
+    let ann_v = views_of(&tenant, Some(&admin), ann);
+    let listed = super::list_json(&ann_v, 50).await.unwrap();
+    let ids: Vec<&str> = listed["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2, "{listed}");
+    assert!(ids.contains(&"a1") && ids.contains(&mine.0.to_string().as_str()));
+    assert!(listed.get("admin_unavailable").is_none());
+    let one = super::show_json(&ann_v, "a1", true).await.unwrap();
+    assert_eq!(one["conversation"]["role"], "admin");
+    assert_eq!(one["conversation"]["id"], "a1");
+    let msgs = one["messages"].as_array().unwrap();
+    assert!(
+        msgs.iter()
+            .all(|m| m["id"].as_str().unwrap().starts_with('a'))
+    );
+    let note = msgs.iter().find(|m| m["kind"] == "system_note").unwrap();
+    assert!(note["body"].get("payload").is_some(), "what was sent");
+    assert_eq!(note["sent_hash"].as_str().unwrap().len(), 64);
+    let lean = super::show_json(&ann_v, "a1", false).await.unwrap();
+    assert!(
+        lean["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["body"].get("payload").is_none())
+    );
+    // Feedback on the administration answer.
+    let answer = msgs.iter().find(|m| m["kind"] == "assistant").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let ok = super::feedback_json(
+        &ann_v,
+        &json!({"message_id": answer, "vote": "down", "note": "vague"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ok["recorded"], true);
+    // The tenant conversation keeps its plain id.
+    let tenant_one = super::show_json(&ann_v, &mine.0.to_string(), false)
+        .await
+        .unwrap();
+    assert_eq!(tenant_one["conversation"]["role"], "data");
+
+    // Bob, another operator, sees none of Ann's.
+    let bob_v = views_of(&tenant, Some(&admin), bob);
+    assert!(
+        super::list_json(&bob_v, 50).await.unwrap()["conversations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(super::show_json(&bob_v, "a1", true).await.is_err());
+
+    // Carol, a tenant user: only her own tenant conversation, never an
+    // administration one, and no feedback on one.
+    let carol_v = views_of(&tenant, None, carol);
+    let listed = super::list_json(&carol_v, 50).await.unwrap();
+    assert_eq!(listed["conversations"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["conversations"][0]["id"], theirs.0.to_string());
+    assert!(super::show_json(&carol_v, "a1", true).await.is_err());
+    assert!(
+        super::show_json(&carol_v, &mine.0.to_string(), true)
+            .await
+            .is_err()
+    );
+    assert!(
+        super::feedback_json(&carol_v, &json!({"message_id": answer, "vote": "up"}))
+            .await
+            .is_err()
+    );
+    // Ann without operator rights any more: only her tenant one.
+    let gone = views_of(&tenant, None, ann);
+    let listed = super::list_json(&gone, 50).await.unwrap();
+    assert_eq!(listed["conversations"].as_array().unwrap().len(), 1);
+    assert!(super::show_json(&gone, "a1", true).await.is_err());
+}
+
+#[tokio::test]
+async fn an_unreachable_system_store_leaves_tenant_conversations_listed() {
+    let tenant = Arc::new(MemoryAudit::default());
+    tenant.create(UserId(9), Role::Dba, "plans").await.unwrap();
+    let v = super::Views {
+        tenant: Some((Arc::clone(&tenant) as Arc<dyn super::ConvStore>, UserId(9))),
+        admin: Some(Err(SprigError::new(
+            sprig_common::SprigCode::CatalogUnavailable,
+            "administration conversations: the system cluster is unreachable",
+        ))),
+    };
+    let l = super::list_json(&v, 50).await.unwrap();
+    assert_eq!(l["conversations"].as_array().unwrap().len(), 1);
+    assert!(
+        l["admin_unavailable"]
+            .as_str()
+            .unwrap()
+            .contains("unreachable")
+    );
+    let e = super::show_json(&v, "a1", true).await.unwrap_err();
+    assert_eq!(e.code(), Some(sprig_common::SprigCode::CatalogUnavailable));
+}
+
+#[tokio::test]
+async fn admin_turns_are_budgeted_too() {
+    // The system store's usage counts: a spent operator budget stops the
+    // turn before the call.
+    let admin = Arc::new(MemoryAudit::system());
+    admin.set_usage(UserId(9), Role::Admin, 90, 20);
+    let r = run(
+        vec![Reply::Text("never sent".into())],
+        cfg(Role::Admin, false, 100),
+        Arc::clone(&admin),
+        "hi",
+    )
+    .await;
+    assert!(r.provider.requests().is_empty());
+    assert!(
+        r.lines
+            .iter()
+            .any(|l| l["type"] == "error" && l["error"]["code"] == 39992),
+        "{:#?}",
+        r.lines
+    );
+    // Usage of a turn that ran is recorded in the system store.
+    let admin = Arc::new(MemoryAudit::system());
+    run(
+        vec![Reply::Text("ok".into())],
+        cfg(Role::Admin, false, 100_000),
+        Arc::clone(&admin),
+        "hi",
+    )
+    .await;
+    assert_eq!(admin.usage_today(UserId(9)).await.unwrap().user, 120);
+}

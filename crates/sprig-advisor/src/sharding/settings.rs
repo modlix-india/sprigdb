@@ -83,6 +83,92 @@ key! {
     MAX_MOVES: u32 = "advisor.max_moves", 200, 0, 100_000, "Search steps per run"
 }
 
+key! {
+    /// `advisor.lookup_min_runs`: equality reads of one column (`=`, `IN`)
+    /// in the window before the advisor proposes a global lookup index on
+    /// it (chapter 19).
+    LOOKUP_MIN_RUNS: u64 = "advisor.lookup_min_runs", 100, 1, 1_000_000_000, "Reads of a column before a lookup index is proposed"
+}
+key! {
+    /// `advisor.lookup_window_minutes`: the workload window lookup
+    /// proposals read.
+    LOOKUP_WINDOW_MINUTES: u64 = "advisor.lookup_window_minutes", 60, 1, 10_080, "Workload window of lookup proposals"
+}
+key! {
+    /// `advisor.lookup_eval_minutes`: how often a tenant's workload is read
+    /// for lookup proposals (and approved ones are built).
+    LOOKUP_EVAL_MINUTES: u64 = "advisor.lookup_eval_minutes", 5, 1, 1440, "Period of the lookup proposals"
+}
+
+/// The advisor's lookup proposals for one tenant (chapter 19):
+/// `advisor.lookup_*` and `auto_index.lookup_scatter_pct`.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LookupAdvice {
+    /// `advisor.lookup_min_runs`.
+    pub min_runs: u64,
+    /// `auto_index.lookup_scatter_pct`: the share of those reads that
+    /// went to every shard, in percent.
+    pub scatter_pct: f64,
+    /// `advisor.lookup_window_minutes`.
+    pub window: Duration,
+    /// `advisor.lookup_eval_minutes`.
+    pub every: Duration,
+}
+
+impl Default for LookupAdvice {
+    fn default() -> Self {
+        Self {
+            min_runs: LOOKUP_MIN_RUNS.default,
+            scatter_pct: crate::autoindex::settings::LOOKUP_SCATTER_PCT.default,
+            window: Duration::from_secs(LOOKUP_WINDOW_MINUTES.default * 60),
+            every: Duration::from_secs(LOOKUP_EVAL_MINUTES.default * 60),
+        }
+    }
+}
+
+impl LookupAdvice {
+    /// Resolves the keys in `ctx` over the etcd scopes and, when given,
+    /// the tenant's own rows.
+    #[must_use]
+    pub fn resolve_with(
+        s: &MemSettings<'_>,
+        rows: Option<&TenantSettings>,
+        ctx: &SettingCtx<'_>,
+    ) -> Self {
+        Self {
+            min_runs: layered(s, rows, &LOOKUP_MIN_RUNS, ctx).max(1),
+            scatter_pct: layered(
+                s,
+                rows,
+                &crate::autoindex::settings::LOOKUP_SCATTER_PCT,
+                ctx,
+            )
+            .clamp(0.0, 100.0),
+            window: Duration::from_secs(
+                layered(s, rows, &LOOKUP_WINDOW_MINUTES, ctx)
+                    .max(1)
+                    .saturating_mul(60),
+            ),
+            every: Duration::from_secs(
+                layered(s, rows, &LOOKUP_EVAL_MINUTES, ctx)
+                    .max(1)
+                    .saturating_mul(60),
+            ),
+        }
+    }
+
+    /// Whether `runs` equality reads of which `scattered` went to every
+    /// shard ask for a lookup.
+    #[must_use]
+    pub fn qualifies(&self, runs: u64, scattered: u64) -> bool {
+        #[allow(clippy::cast_precision_loss)] // run counts
+        let share = scattered as f64 * 100.0;
+        #[allow(clippy::cast_precision_loss)]
+        let need = runs as f64 * self.scatter_pct;
+        runs >= self.min_runs && share >= need
+    }
+}
+
 /// How the advisor acts on a design.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -197,5 +283,40 @@ impl Default for AdvisorSettings {
             max_top_value: f64::from(MAX_TOP_VALUE_PCT.default) / 100.0,
             max_moves: MAX_MOVES.default,
         }
+    }
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use sprig_settings::{Registry, Value};
+
+    use super::*;
+
+    #[test]
+    fn lookup_thresholds_are_registered_and_judge_scatter() {
+        let reg = Registry::global().unwrap();
+        for (k, d) in [
+            ("advisor.lookup_min_runs", 100),
+            ("advisor.lookup_window_minutes", 60),
+            ("advisor.lookup_eval_minutes", 5),
+        ] {
+            let def = reg.get(k).unwrap_or_else(|| panic!("{k} isn't registered"));
+            assert_eq!(def.default_value(), Value::Int(d), "{k}");
+        }
+        let a = LookupAdvice::default();
+        assert_eq!(a.window, Duration::from_secs(3600));
+        assert_eq!(a.every, Duration::from_secs(300));
+        assert!((a.scatter_pct - 80.0).abs() < f64::EPSILON);
+        assert!(a.qualifies(120, 100));
+        assert!(!a.qualifies(120, 90), "75% scattered");
+        assert!(!a.qualifies(99, 99), "too few runs");
+        let strict = LookupAdvice {
+            min_runs: 10,
+            scatter_pct: 100.0,
+            ..a
+        };
+        assert!(strict.qualifies(10, 10) && !strict.qualifies(10, 9));
     }
 }

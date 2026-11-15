@@ -1817,17 +1817,20 @@ async fn lookups_before(
                     be.lookup_release(l, value, vals).await?;
                     continue;
                 };
+                // The row's new value: the assigned parts, its own for the
+                // rest (a lookup of several columns).
+                let new_value = set.value_for(&value);
                 // The row keeps its value (equal under the column's
                 // collation, `'A'` for `'a'`): its lookup row stays as it
                 // is. Releasing it would delete the row the claim keeps.
                 let null = |v: &[KeyValueOwned]| v.iter().any(|x| matches!(x, KeyValueOwned::Null));
-                if null(&value) && null(&set.value) {
+                if null(&value) && null(&new_value) {
                     continue;
                 }
                 if !null(&value)
-                    && !null(&set.value)
+                    && !null(&new_value)
                     && sprig_shard::lookup::value_hash(&l.index, &value)?
-                        == sprig_shard::lookup::value_hash(&l.index, &set.value)?
+                        == sprig_shard::lookup::value_hash(&l.index, &new_value)?
                 {
                     continue;
                 }
@@ -1839,7 +1842,7 @@ async fn lookups_before(
                     })?;
                 set_claims.push(Claim {
                     lookup: Arc::clone(l),
-                    value: set.value.clone(),
+                    value: new_value,
                     owner_pk: vals.clone(),
                     owner_rk: rk,
                 });
@@ -2254,7 +2257,8 @@ async fn explain(p: &Plan, be: &mut dyn ShardBackend, budget: &mut Budget) -> Re
                 "Lookup",
                 format!(
                     "{} ({})",
-                    v.probe.lookup.index.index_name, v.probe.lookup.column
+                    v.probe.lookup.index.index_name,
+                    v.probe.lookup.columns.join(", ")
                 ),
                 format!(
                     "{} value(s): only the shards of the rows holding them",

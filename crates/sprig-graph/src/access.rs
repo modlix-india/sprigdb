@@ -254,6 +254,10 @@ impl GraphStore for FilteredStore<'_> {
         self.inner.graph_id()
     }
 
+    fn warm_mirrors(&mut self) {
+        self.inner.warm_mirrors();
+    }
+
     fn shards(&self) -> usize {
         if self.vis.is_none() {
             return self.inner.shards();

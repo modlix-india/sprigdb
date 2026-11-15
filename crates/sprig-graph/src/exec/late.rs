@@ -350,6 +350,36 @@ fn missing(need: &Need, partial: Option<&Arc<[String]>>) -> Option<Option<BTreeS
 }
 
 impl Exec<'_> {
+    /// Queues, for the clause's first statement's round trip, the
+    /// properties the clause will need of nodes the incoming `rows`
+    /// already bind ([`crate::store::GraphStore::queue_nodes`]): LDBC
+    /// IS2's messages' text, which its `RETURN` reads after the walk.
+    pub(crate) fn queue_bound(&mut self, rows: &[Row]) {
+        let mut ids: Vec<u64> = Vec::new();
+        let mut keys: BTreeSet<String> = BTreeSet::new();
+        for (v, need) in &self.prefetch {
+            if !matches!(need, Need::Keys(_)) {
+                continue;
+            }
+            for r in rows {
+                if let Some(Value::Node(n)) = r.get(v) {
+                    let n = self.best_node(n);
+                    if let Some(Some(m)) = missing(need, n.partial.as_ref()) {
+                        ids.push(n.id);
+                        keys.extend(m.into_iter().filter(|k| real(k)));
+                    }
+                }
+            }
+        }
+        if ids.is_empty() || keys.is_empty() {
+            return;
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let keys: Vec<String> = keys.into_iter().collect();
+        self.store.queue_nodes(&ids, &keys);
+    }
+
     /// The best-read copy of node `n` this statement has.
     fn best_node(&self, n: &Arc<Node>) -> Arc<Node> {
         if n.partial.is_none() {

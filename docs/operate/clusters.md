@@ -50,6 +50,9 @@ CREATE USER 'sprig_ctl'@'%' IDENTIFIED BY 's3cret-Passw0rd' REQUIRE SSL;
 GRANT CREATE USER ON *.* TO 'sprig_ctl'@'%';
 GRANT ALL ON `t%`.* TO 'sprig_ctl'@'%' WITH GRANT OPTION;
 GRANT ALL ON `\_\_sprig\_sys`.* TO 'sprig_ctl'@'%' WITH GRANT OPTION;
+-- Optional: docs search, and the administration assistant's conversations
+GRANT ALL ON `\_\_sprig\_docs`.* TO 'sprig_ctl'@'%' WITH GRANT OPTION;
+GRANT ALL ON `\_\_sprig\_ai`.* TO 'sprig_ctl'@'%';
 
 CREATE USER 'sprig_repl'@'%' IDENTIFIED BY 's3cret-Passw0rd' REQUIRE SSL;
 GRANT REPLICATION SLAVE, BINLOG MONITOR ON *.* TO 'sprig_repl'@'%';
@@ -58,7 +61,7 @@ GRANT REPLICATION SLAVE, BINLOG MONITOR ON *.* TO 'sprig_repl'@'%';
 - `sprig_ctl` creates tenant schemas (`t<id>_...`) and accounts, probes, and fences. Missing privileges beyond these disable only what needs them, and the precheck lists each as an advisory with the `GRANT` that fixes it. For example, without `SUPER` or `log_bin_trust_function_creators = ON`, compiled logic is off.
 - `sprig_repl` reads the binlog for the mover and the change feed.
 
-On external clusters SprigDB never changes server settings, restarts servers, adds or removes nodes, or touches schemas other than `t%` and `__sprig_sys`.
+On external clusters SprigDB never changes server settings, restarts servers, adds or removes nodes, or touches schemas other than `t%`, `__sprig_sys`, `__sprig_docs` (the docs index) and `__sprig_ai` (the administration assistant's conversations, on the data center's system cluster only).
 
 ### Credentials by reference
 

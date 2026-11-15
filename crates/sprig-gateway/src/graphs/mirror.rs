@@ -75,8 +75,35 @@ pub(crate) struct CatalogGate {
     pub(crate) wait: Duration,
 }
 
+/// Per (tenant, graph): the positions its last fresh gate read, and when.
+type FreshSeen = HashMap<(u64, u64), (Vec<mirror::PosRow>, Instant)>;
+
+/// The positions each graph's last fresh gate read, and when.
+fn fresh_seen() -> &'static Mutex<FreshSeen> {
+    static C: std::sync::OnceLock<Mutex<FreshSeen>> = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 #[async_trait]
 impl MirrorGate for CatalogGate {
+    fn last_fresh(&self, graph: u64) -> Option<Vec<mirror::PosRow>> {
+        let m = fresh_seen().lock().unwrap_or_else(PoisonError::into_inner);
+        let (rows, at) = m.get(&(self.tenant.0, graph))?;
+        let aged = u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        Some(
+            rows.iter()
+                .map(|r| mirror::PosRow {
+                    age_ms: r.age_ms.saturating_add(aged),
+                    ..r.clone()
+                })
+                .collect(),
+        )
+    }
+
+    fn targets(&self) -> BTreeMap<String, String> {
+        self.targets.clone()
+    }
+
     async fn fresh(&self, layout: &GraphShards) -> bool {
         let started = Instant::now();
         let r = self.poll(layout, started).await;
@@ -94,10 +121,17 @@ impl MirrorGate for CatalogGate {
 
 impl CatalogGate {
     async fn poll(&self, layout: &GraphShards, started: Instant) -> Result<bool> {
-        let ep = self.graphs.svc.locator.writer(self.tenant).await?;
-        let mut c = ep.pool.get_conn().await.map_err(backend_error)?;
-        let schema = ep.store.schema().to_owned();
         let none = BTreeMap::new();
+        // The catalog's connection and its first positions, at the same
+        // time as the target below.
+        let catalog_key = format!("catalog:{}", self.tenant);
+        let first = async {
+            let ep = self.graphs.svc.locator.writer(self.tenant).await?;
+            let mut c = gate_conn(&catalog_key, &ep.pool).await?;
+            let schema = ep.store.schema().to_owned();
+            let rows = mirror::read_pos(&mut c, &schema, self.graph).await?;
+            Ok::<_, SprigError>((c, schema, rows))
+        };
         // The target: every transaction committed on the shards' clusters
         // before the statement (their binlog positions now), and the
         // session's causal target, so the mirrors never hide a committed
@@ -115,11 +149,13 @@ impl CatalogGate {
                 let cluster = ClusterId::new(&s.cluster)
                     .map_err(|e| SprigError::internal(format!("cluster id {}: {e}", s.cluster)))?;
                 let pool = self.graphs.pool(&cluster).await?;
-                let mut pc = pool.get_conn().await.map_err(backend_error)?;
+                let key = format!("cluster:{}", s.cluster);
+                let mut pc = gate_conn(&key, &pool).await?;
                 let now: Option<String> = pc
                     .query_first("SELECT @@gtid_binlog_pos")
                     .await
                     .map_err(backend_error)?;
+                gate_conn_back(key, pc);
                 // Both positions: `reached` keeps each domain's highest.
                 let t = targets.entry(s.cluster.clone()).or_default();
                 if !t.is_empty() {
@@ -129,23 +165,83 @@ impl CatalogGate {
             }
             Ok::<_, SprigError>(targets)
         };
-        let (targets, first) =
-            futures::join!(target, mirror::read_pos(&mut c, &schema, self.graph));
+        let (targets, first) = futures::join!(target, first);
         let targets = targets?;
-        let mut rows = first?;
+        let (mut c, schema, rows) = first?;
+        let fresh = self
+            .wait_fresh(&mut c, &schema, layout, &targets, &none, started, rows)
+            .await;
+        if fresh.is_ok() {
+            gate_conn_back(catalog_key, c);
+        }
+        fresh
+    }
+
+    /// Reads the positions again until they reach `targets` (see
+    /// [`Self::poll`]).
+    #[allow(clippy::too_many_arguments)] // the poll's state
+    async fn wait_fresh(
+        &self,
+        c: &mut mysql_async::Conn,
+        schema: &str,
+        layout: &GraphShards,
+        targets: &BTreeMap<String, String>,
+        none: &BTreeMap<String, String>,
+        started: Instant,
+        first: Vec<mirror::PosRow>,
+    ) -> Result<bool> {
+        let mut rows = first;
         // The first read also tells whether the applier serves the graph
         // at all (else scatter without waiting).
         loop {
-            if mirror::fresh(&rows, layout, &targets) {
+            if mirror::fresh(&rows, layout, targets) {
+                fresh_seen()
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert((self.tenant.0, self.graph), (rows, Instant::now()));
                 return Ok(true);
             }
             // Not serving the graph (or behind a map change): no wait.
-            if !mirror::fresh(&rows, layout, &none) || started.elapsed() >= self.wait {
+            if !mirror::fresh(&rows, layout, none) || started.elapsed() >= self.wait {
                 return Ok(false);
             }
             tokio::time::sleep(Duration::from_millis(15)).await;
-            rows = mirror::read_pos(&mut c, &schema, self.graph).await?;
+            rows = mirror::read_pos(c, schema, self.graph).await?;
         }
+    }
+}
+
+/// Idle connections of mirror gates, by what they reach: the gate's two
+/// small reads skip the pool (a pooled connection is reset when it goes
+/// back, and taking one cost a millisecond a statement).
+fn gate_conns() -> &'static Mutex<HashMap<String, Vec<mysql_async::Conn>>> {
+    static C: std::sync::OnceLock<Mutex<HashMap<String, Vec<mysql_async::Conn>>>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Idle gate connections kept per target.
+const GATE_CONNS: usize = 16;
+
+/// A gate connection to what `key` names, idle or from `pool`.
+async fn gate_conn(key: &str, pool: &mysql_async::Pool) -> Result<mysql_async::Conn> {
+    let idle = gate_conns()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_mut(key)
+        .and_then(Vec::pop);
+    match idle {
+        Some(c) => Ok(c),
+        None => pool.get_conn().await.map_err(backend_error),
+    }
+}
+
+/// Keeps a gate connection whose reads succeeded for the next gate.
+fn gate_conn_back(key: String, c: mysql_async::Conn) {
+    let mut m = gate_conns().lock().unwrap_or_else(PoisonError::into_inner);
+    let v = m.entry(key).or_default();
+    if v.len() < GATE_CONNS {
+        v.push(c);
     }
 }
 

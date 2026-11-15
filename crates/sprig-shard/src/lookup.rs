@@ -35,6 +35,8 @@ use crate::shardmap::ShardMap;
 
 pub mod admin;
 pub mod direct;
+pub mod publish;
+pub mod settings;
 
 /// `lookup_indexes`, in `t<tenant>_sprig`.
 pub const DDL_LOOKUP_INDEXES: &str = "CREATE TABLE IF NOT EXISTS lookup_indexes (

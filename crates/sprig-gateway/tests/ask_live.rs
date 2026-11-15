@@ -157,9 +157,24 @@ async fn names_called_ask_still_work_and_mistakes_are_errors() {
     c.query_drop("ALTER TENANT SPRIG SET (ai.enabled = FALSE)")
         .await
         .unwrap();
-    assert_eq!(code(&c.query_drop("ASK 'x'").await.unwrap_err()), 39991);
+    // Settings reach the gateway within seconds.
+    let mut got = None;
+    for _ in 0..50 {
+        if let Err(e) = c.query_drop("ASK 'x'").await {
+            got = Some(code(&e));
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert_eq!(got, Some(39991));
     c.query_drop("ALTER TENANT SPRIG SET (ai.enabled = TRUE)")
         .await
         .unwrap();
+    for _ in 0..50 {
+        if c.query_drop("ASK 'x'").await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
     c.query_drop("DROP DATABASE ask_live").await.unwrap();
 }

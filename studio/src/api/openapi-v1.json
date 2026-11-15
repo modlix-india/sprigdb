@@ -1705,7 +1705,7 @@
             "description": "An error"
           }
         },
-        "summary": "The caller's conversations with the tenant assistants, newest first",
+        "summary": "The caller's assistant conversations, newest first: tenant conversations, and for platform operators also administration conversations (ids starting with `a`)",
         "tags": [
           "sprig.v1.Ai"
         ]

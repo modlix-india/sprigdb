@@ -181,6 +181,26 @@ impl StoredCluster {
     }
 }
 
+/// The system cluster among `records`: the lowest-numbered cluster that
+/// is active, draining or drained (never one still probing, rejected or
+/// retired). It keeps a DC's platform-level rows, such as the
+/// administration assistant's conversations; the controller and the
+/// gateways pick it the same way.
+#[must_use]
+pub fn system_cluster(records: &[StoredCluster]) -> Option<ClusterId> {
+    records
+        .iter()
+        .map(StoredCluster::body)
+        .filter(|c| {
+            matches!(
+                c.admin_state,
+                AdminState::Active | AdminState::Draining | AdminState::Drained
+            )
+        })
+        .min_by_key(|c| c.cluster_number)
+        .map(|c| c.cluster_id.clone())
+}
+
 /// A change seen by [`ClusterRegistry::watch`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum RegistryChange {
@@ -536,6 +556,14 @@ impl ClusterRegistry {
             .iter()
             .map(StoredCluster::decode)
             .collect()
+    }
+
+    /// This data center's system cluster ([`system_cluster`]).
+    ///
+    /// # Errors
+    /// As [`Self::list`].
+    pub async fn system_cluster(&self) -> Result<Option<ClusterId>> {
+        Ok(system_cluster(&self.list().await?))
     }
 
     /// Read-modify-write on the record's `mod_revision`, retried on

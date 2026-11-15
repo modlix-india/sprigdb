@@ -182,6 +182,16 @@ To run an answer, copy the query, or use [`sprig ask --run`](sprig.md#sprig-ask)
 
 **Retention.** Payloads are kept for `ai.audit_payload_days` (30); every hour the controller drops older ones and keeps their hashes. With 0, only hashes are kept. Each turn also writes one `ai.turn` event to the tenant's audit stream: the user, the role, the tools called and the payload hashes.
 
+### Administration conversations
+
+`admin` conversations belong to no tenant, so they are kept at the system level: in the `__sprig_ai` schema on the data center's system cluster, which is its lowest-numbered cluster that is active, draining or drained. The controller creates the schema. No tenant account can read it.
+
+- **Who sees them.** Only the operator who had them, and only while their login is a platform operator (in `studio.operator_logins`, with operator mode on). Operators are told apart by login (`tenant.user`).
+- **The same routes.** For an operator, `GET /v1/ai/conversations` lists their tenant conversations and their administration conversations together, newest first. Administration ids start with `a` (`a12`), as do their message ids, so `GET /v1/ai/conversations/a12` opens one with what was sent, `"conversation": "a12"` continues it, and `{"message_id": "a40", "vote": "up"}` rates an answer in it.
+- **Retention.** The global `ai.audit_payload_days`; the controller purges them hourly like the tenants' payloads. Each turn also writes its `ai.turn` event to the platform audit stream.
+- **The grant.** `sprig_ctl` needs ``GRANT ALL ON `__sprig_ai`.* TO 'sprig_ctl'@'%'`` on the system cluster; registration lists it as an advisory when it is missing. Until it is given, or while the system cluster can't be reached, `admin` turns still run but aren't stored, and the listing says why in `admin_unavailable`.
+- **Moving.** If the system cluster is retired, the next one in service takes over with an empty history.
+
 ## Budgets
 
 | Setting | Default | Meaning |
@@ -193,6 +203,8 @@ To run an answer, copy the query, or use [`sprig ask --run`](sprig.md#sprig-ask)
 | `ai.timeout_seconds` | 120 | Wall time per turn |
 
 Budgets count input read or written uncached, and output; cached input isn't counted. They are checked before every model call: a spent budget stops the turn with 39992 before anything is sent.
+
+`admin` turns use the budgets' global values: `ai.budget.tenant_tokens_day` caps all administration turns in the data center, and `ai.budget.user_tokens_day` each operator.
 
 ## Glossary
 
@@ -216,7 +228,7 @@ POST /v1/ai/feedback
 {"proposal_id": "0193…", "outcome": "accepted"}
 ```
 
-Rate an answer up or down with an optional note (up to 500 characters), or report what became of a proposal: `accepted`, `dismissed` or `failed`. You can rate only your own conversations. The latest 20 outcomes and notes in the tenant are added to every `dba` and `data` prompt: the proposal's kind and a short label, and your note, never an answer's text. Feedback changes prompts, never a model.
+Rate an answer up or down with an optional note (up to 500 characters), or report what became of a proposal: `accepted`, `dismissed` or `failed`. You can rate only your own conversations, administration ones included. The latest 20 outcomes and notes in the tenant are added to every `dba` and `data` prompt: the proposal's kind and a short label, and your note, never an answer's text. Feedback changes prompts, never a model.
 
 ## Errors
 

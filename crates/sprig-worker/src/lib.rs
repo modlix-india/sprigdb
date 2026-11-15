@@ -188,7 +188,8 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
     ));
     // One shared binlog reader per cluster for this
     // worker's feed consumers: stream sequencers, the queue forwarder,
-    // after-commit triggers and search copies.
+    // after-commit triggers, search copies, change exchanges, the copy
+    // worker and the graph mirror.
     let shared_feed = sprig_feed::shared::SharedFeed::new(
         Arc::clone(&registry_clusters) as Arc<dyn sprig_feed::Clusters>,
         sprig_feed::shared::SharedOpts::default(),
@@ -209,20 +210,25 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         // Set below, once the gateways are known.
         gateways: None,
     };
-    // The copy worker: one job per tenant tree.
-    let inherit_env = Arc::new(inherit::LiveEnv::new(
-        dc_logic.clone(),
-        Arc::clone(&global),
-        Arc::clone(&env.locator),
-        Arc::clone(&env.pools),
-        Arc::clone(&env.clusters),
-    )?);
-    // The graph mirror applier: one job per tenant.
+    // The copy worker: one job per tenant tree, through the shared
+    // reader (R9, r9feed3).
+    let inherit_env = Arc::new(
+        inherit::LiveEnv::new(
+            dc_logic.clone(),
+            Arc::clone(&global),
+            Arc::clone(&env.locator),
+            Arc::clone(&env.pools),
+            Arc::clone(&env.clusters),
+        )?
+        .with_feed(Arc::clone(&env.feed)),
+    );
+    // The graph mirror applier: one job per tenant, through the shared
+    // reader's view of the edge tables (R9, r9feed3).
     let graph_mirror_env = graph_mirror::GraphMirrorEnv {
         dc: dc_logic.clone(),
         pools: Arc::clone(&env.pools),
         locator: Arc::clone(&env.locator),
-        clusters: Arc::clone(&env.clusters) as Arc<dyn sprig_feed::Clusters>,
+        clusters: graph_mirror::shared_view(&shared_feed),
     };
     // Stream sequencers, on the logic jobs' pools and the
     // shared reader.

@@ -1,9 +1,10 @@
 //! Unique lookup indexes in plans:
 //!
 //! - a single-table read, `UPDATE` or `DELETE` over every shard with an
-//!   equality (`c = v`, `c IN (...)`) on a public lookup's column becomes
-//!   [`Plan::ViaLookup`]: the executor reads the owners' routing hashes
-//!   and keeps only their shards;
+//!   equality (`c = v`, `c IN (...)`) on each of a public lookup's columns
+//!   (or `(a, b) = (v, w)`, `(a, b) IN ((v, w), ...)` for a lookup of
+//!   several columns) becomes [`Plan::ViaLookup`]: the executor reads the
+//!   owners' routing hashes and keeps only their shards;
 //! - an `INSERT` into a table with maintained lookups claims each row's
 //!   values ([`Claim`]) before the rows are written, in the write's
 //!   transaction;
@@ -52,18 +53,16 @@ pub(super) fn via_lookup(stmt: &Statement, plan: Plan, cx: &PlanCtx<'_>) -> Plan
     let rels = vec![rel];
     let mut cs = Vec::new();
     conjuncts(selection, &mut cs);
-    for c in cs {
-        for l in entry.lookups.iter().filter(|l| l.routes()) {
-            if let Some(values) = probe_values(&rels, l, c, cx) {
-                return Plan::ViaLookup(Box::new(ViaLookup {
-                    probe: LookupProbe {
-                        lookup: Arc::clone(l),
-                        values,
-                    },
-                    group: Arc::clone(&entry.group),
-                    plan,
-                }));
-            }
+    for l in entry.lookups.iter().filter(|l| l.routes()) {
+        if let Some(values) = probe_values(&rels, l, &cs, cx) {
+            return Plan::ViaLookup(Box::new(ViaLookup {
+                probe: LookupProbe {
+                    lookup: Arc::clone(l),
+                    values,
+                },
+                group: Arc::clone(&entry.group),
+                plan,
+            }));
         }
     }
     plan
@@ -100,15 +99,130 @@ fn single_table<'s, 'a>(stmt: &'s Statement, cx: &PlanCtx<'a>) -> Option<(Rel<'a
     Some((relation(&twj.relation, cx, 0)?, selection?))
 }
 
-/// The values conjunct `c` gives lookup `l`'s column: `c = v`, `v = c`,
-/// `c IN (v, ...)`, every value a literal of the column's class.
+/// The values the conjuncts `cs` give every column of lookup `l`, one
+/// `Vec` per value to look up (a part per column): a tuple equality or
+/// `IN` naming the lookup's columns, or for each column `c = v`, `v = c`
+/// or `c IN (v, ...)` (several columns: every combination, at most
+/// `router.max_route_values`), every value a literal of its column's class.
 fn probe_values(
+    rels: &[Rel<'_>],
+    l: &LookupRef,
+    cs: &[&Expr],
+    cx: &PlanCtx<'_>,
+) -> Option<Vec<Vec<KeyValueOwned>>> {
+    if l.columns.len() > 1
+        && let Some(v) = cs.iter().find_map(|c| tuple_values(rels, l, c, cx))
+    {
+        return Some(v);
+    }
+    let mut per: Vec<Option<Vec<KeyValueOwned>>> = vec![None; l.columns.len()];
+    for c in cs {
+        for (i, slot) in per.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = column_values(rels, l, i, c, cx);
+            }
+        }
+    }
+    let per: Vec<Vec<KeyValueOwned>> = per.into_iter().collect::<Option<_>>()?;
+    let total = per
+        .iter()
+        .try_fold(1usize, |acc, v| acc.checked_mul(v.len()))?;
+    if total == 0 || total > cx.max_route_values {
+        return None;
+    }
+    let mut out: Vec<Vec<KeyValueOwned>> = vec![Vec::new()];
+    for vs in per {
+        let mut next = Vec::with_capacity(out.len() * vs.len());
+        for prefix in &out {
+            for v in &vs {
+                let mut row = prefix.clone();
+                row.push(v.clone());
+                next.push(row);
+            }
+        }
+        out = next;
+    }
+    Some(out)
+}
+
+/// The position of column expression `e` among `l`'s value columns.
+fn lookup_col(rels: &[Rel<'_>], l: &LookupRef, e: &Expr) -> Option<usize> {
+    let (_, n) = col_rel(rels, e)?;
+    l.columns.iter().position(|c| *c == n)
+}
+
+/// `(a, b) = (v, w)` or `(a, b) IN ((v, w), ...)` naming exactly `l`'s
+/// columns (in any order): the values in key order.
+fn tuple_values(
     rels: &[Rel<'_>],
     l: &LookupRef,
     c: &Expr,
     cx: &PlanCtx<'_>,
 ) -> Option<Vec<Vec<KeyValueOwned>>> {
-    let is_col = |e: &Expr| col_rel(rels, e).is_some_and(|(_, n)| n == l.column);
+    let (cols, rows): (&[Expr], Vec<&Expr>) = match c {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => match (&**left, &**right) {
+            (Expr::Tuple(cols), r @ Expr::Tuple(_)) | (r @ Expr::Tuple(_), Expr::Tuple(cols))
+                if cols.iter().all(|e| lookup_col(rels, l, e).is_some()) =>
+            {
+                (cols.as_slice(), vec![r])
+            }
+            _ => return None,
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => match &**expr {
+            Expr::Tuple(cols) => (cols.as_slice(), list.iter().collect()),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let at: Vec<usize> = cols
+        .iter()
+        .map(|e| lookup_col(rels, l, e))
+        .collect::<Option<_>>()?;
+    let mut sorted = at.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.len() != l.columns.len() || at.len() != l.columns.len() {
+        return None;
+    }
+    if rows.is_empty() || rows.len() > cx.max_route_values {
+        return None;
+    }
+    rows.into_iter()
+        .map(|r| {
+            let Expr::Tuple(vals) = r else {
+                return None;
+            };
+            if vals.len() != at.len() {
+                return None;
+            }
+            let mut out = vec![KeyValueOwned::Null; at.len()];
+            for (e, &i) in vals.iter().zip(&at) {
+                out[i] = value_of(e, l.classes[i], l.index.columns.get(i)?.class)?;
+            }
+            Some(out)
+        })
+        .collect()
+}
+
+/// The values conjunct `c` gives lookup `l`'s column `i`: `c = v`,
+/// `v = c`, `c IN (v, ...)`, every value a literal of the column's class.
+fn column_values(
+    rels: &[Rel<'_>],
+    l: &LookupRef,
+    i: usize,
+    c: &Expr,
+    cx: &PlanCtx<'_>,
+) -> Option<Vec<KeyValueOwned>> {
+    let name = l.columns.get(i)?;
+    let is_col = |e: &Expr| col_rel(rels, e).is_some_and(|(_, n)| n == *name);
     let lits: Vec<&Expr> = match c {
         Expr::BinaryOp {
             left,
@@ -133,9 +247,9 @@ fn probe_values(
     if lits.is_empty() || lits.len() > cx.max_route_values {
         return None;
     }
-    lits.into_iter()
-        .map(|e| value_of(e, l.class, l.index.columns.first()?.class).map(|v| vec![v]))
-        .collect()
+    let class = *l.classes.get(i)?;
+    let part = l.index.columns.get(i)?.class;
+    lits.into_iter().map(|e| value_of(e, class, part)).collect()
 }
 
 /// A literal as the value `sprig-shard` normalizes: `None` when it isn't
@@ -238,7 +352,13 @@ pub(super) fn insert_claims(
     lookups.sort_by_key(|l| l.index.id);
     let mut claims = Vec::new();
     for l in lookups {
-        let mut cols = vec![(l.column.as_str(), l.index.columns.first().map(|c| c.class))];
+        let nv = l.columns.len();
+        let mut cols: Vec<(&str, Option<sprig_shard::KeyClass>)> = l
+            .columns
+            .iter()
+            .zip(&l.index.columns)
+            .map(|(n, c)| (n.as_str(), Some(c.class)))
+            .collect();
         cols.extend(
             l.pk.iter()
                 .zip(&l.index.owner_pk)
@@ -265,11 +385,11 @@ pub(super) fn insert_claims(
                 })?);
             }
             let rk = owner_rk(&entry.group, row.get(key_pos))?;
-            let value = parts.remove(0);
+            let owner_pk = parts.split_off(nv);
             claims.push(Claim {
                 lookup: Arc::clone(l),
-                value: vec![value],
-                owner_pk: parts,
+                value: parts,
+                owner_pk,
                 owner_rk: rk,
             });
         }
@@ -301,8 +421,9 @@ pub(super) fn check_update(entry: &TableEntry, assigns: &dyn Fn(&str) -> bool) -
 /// lookup it sets, the old value, primary key and key column of every row
 /// it changes, on each shard in `shards`, locked. Each row then claims the
 /// new value and releases its old one. The new value must be a literal of
-/// the column's class (or `NULL`); a parent member (no key column of its
-/// own) or a limited update is refused.
+/// the column's class (or `NULL`); of a lookup of several columns, the
+/// parts the statement doesn't set are each row's own. A parent member
+/// (no key column of its own) or a limited update is refused.
 pub(super) fn update_releases(
     stmt: &Statement,
     rel: &Rel<'_>,
@@ -315,22 +436,26 @@ pub(super) fn update_releases(
     };
     let mut out = Vec::new();
     for l in &entry.lookups {
-        let set: Vec<&sqlparser::ast::Assignment> = u
-            .assignments
-            .iter()
-            .filter(|a| match &a.target {
-                sqlparser::ast::AssignmentTarget::ColumnName(n) => ident_parts(n)
-                    .and_then(|p| p.last().map(|i| i.value.eq_ignore_ascii_case(&l.column)))
-                    .unwrap_or(false),
-                sqlparser::ast::AssignmentTarget::Tuple(_) => false,
-            })
-            .collect();
-        let [a] = set.as_slice() else {
-            if set.is_empty() {
+        let mut set: Vec<Option<&sqlparser::ast::Assignment>> = vec![None; l.columns.len()];
+        for a in &u.assignments {
+            let sqlparser::ast::AssignmentTarget::ColumnName(n) = &a.target else {
                 continue;
+            };
+            let Some(i) = ident_parts(n).and_then(|p| {
+                let last = p.last()?;
+                l.columns
+                    .iter()
+                    .position(|c| last.value.eq_ignore_ascii_case(c))
+            }) else {
+                continue;
+            };
+            if set[i].replace(a).is_some() {
+                return reject(Reason::Lookup, "a lookup column assigned twice");
             }
-            return reject(Reason::Lookup, "a lookup column assigned twice");
-        };
+        }
+        if set.iter().all(Option::is_none) {
+            continue;
+        }
         if limited {
             return reject(
                 Reason::Lookup,
@@ -343,22 +468,40 @@ pub(super) fn update_releases(
                 "an UPDATE of a lookup index's column on a table that follows its parent",
             );
         };
-        let part = l
-            .index
+        let mut value = Vec::with_capacity(set.len());
+        let mut keep = Vec::with_capacity(set.len());
+        for (i, a) in set.iter().enumerate() {
+            let part = l
+                .index
+                .columns
+                .get(i)
+                .map(|c| c.class)
+                .ok_or_else(|| Rejection::new(Reason::Lookup, "a column class"))?;
+            let Some(a) = a else {
+                value.push(KeyValueOwned::Null);
+                keep.push(true);
+                continue;
+            };
+            value.push(value_of(&a.value, l.classes[i], part).ok_or_else(|| {
+                Rejection::new(
+                    Reason::Lookup,
+                    format!(
+                        "an UPDATE setting a lookup index's column to a non-literal: {}",
+                        a.value
+                    ),
+                )
+            })?);
+            keep.push(false);
+        }
+        if !keep.contains(&true) {
+            keep.clear();
+        }
+        let mut items: Vec<String> = l
             .columns
-            .first()
-            .map(|c| c.class)
-            .ok_or_else(|| Rejection::new(Reason::Lookup, "a column class"))?;
-        let value = value_of(&a.value, l.class, part).ok_or_else(|| {
-            Rejection::new(
-                Reason::Lookup,
-                format!(
-                    "an UPDATE setting a lookup index's column to a non-literal: {}",
-                    a.value
-                ),
-            )
-        })?;
-        let mut items = vec![read_expr(&l.column, Some(part))];
+            .iter()
+            .zip(&l.index.columns)
+            .map(|(n, c)| read_expr(n, Some(c.class)))
+            .collect();
         items.extend(
             l.pk.iter()
                 .zip(&l.index.owner_pk)
@@ -377,7 +520,8 @@ pub(super) fn update_releases(
             lookup: Arc::clone(l),
             reads,
             set: Some(LookupSet {
-                value: vec![value],
+                value,
+                keep,
                 group: Arc::clone(&entry.group),
             }),
         });
@@ -391,7 +535,7 @@ fn key_read_expr(col: &str, class: KeyClass) -> String {
     match class {
         KeyClass::Str { .. } => format!("HEX(CONVERT({c} USING utf8mb4))"),
         KeyClass::Binary => format!("HEX({c})"),
-        _ => c,
+        KeyClass::Int => c,
     }
 }
 
@@ -401,7 +545,7 @@ pub(crate) fn decode_key(v: Option<&[u8]>, class: KeyClass) -> Option<KeyValue> 
     let text = std::str::from_utf8(v?).ok()?;
     Some(match class {
         KeyClass::Str { .. } | KeyClass::Binary => KeyValue::Bytes(unhex(text)?),
-        _ => KeyValue::Int(text.parse().ok()?),
+        KeyClass::Int => KeyValue::Int(text.parse().ok()?),
     })
 }
 
@@ -484,10 +628,12 @@ pub(super) fn delete_releases(
     };
     let mut out = Vec::new();
     for l in &entry.lookups {
-        let mut items = vec![read_expr(
-            &l.column,
-            l.index.columns.first().map(|c| c.class),
-        )];
+        let mut items: Vec<String> = l
+            .columns
+            .iter()
+            .zip(&l.index.columns)
+            .map(|(n, c)| read_expr(n, Some(c.class)))
+            .collect();
         items.extend(
             l.pk.iter()
                 .zip(&l.index.owner_pk)
@@ -670,14 +816,93 @@ mod tests {
             sprig_shard::KeyClass::Numeric
         ));
         assert!(!e.lookup_gap);
-        // Two value columns: maintained but not followed, so writes refuse.
+        // Two value columns: followed as one lookup of two parts.
         let t = topo(LookupState::Public, &["email", "cid"]);
         let e = crate::topology::Topology::table(&t, DEF, "accounts").unwrap();
-        assert!(e.lookups.is_empty() && e.lookup_gap);
+        let [l] = e.lookups.as_slice() else {
+            panic!("{:?}", e.lookups)
+        };
+        assert!(!e.lookup_gap);
+        assert_eq!(l.columns, ["email", "cid"]);
+        assert_eq!(l.classes, [l.class, KeyClass::Int]);
+        assert_eq!(l.ordinals, [Some(1), Some(2), Some(0)]);
+        assert_eq!(l.index.columns.len(), 2);
+    }
+
+    #[test]
+    fn lookups_of_several_columns_route_claim_and_release() {
+        let t = topo(LookupState::Public, &["email", "cid"]);
+        let pt = |sql: &str| p_with(&t, sql);
+        let s = |b: &str| KeyValueOwned::Str {
+            bytes: b.as_bytes().to_vec(),
+            charset: Charset::Utf8mb4,
+        };
+        // Every column named: routed, the combinations looked up.
+        let Plan::ViaLookup(v) = pt("SELECT * FROM accounts WHERE cid = 3 AND email = 'a@x'")
+        else {
+            panic!()
+        };
+        assert_eq!(v.probe.values, [vec![s("a@x"), KeyValueOwned::Int(3)]]);
+        let Plan::ViaLookup(v) =
+            pt("SELECT aid FROM accounts WHERE email IN ('a@x', 'b@x') AND cid IN (1, 2)")
+        else {
+            panic!()
+        };
+        assert_eq!(v.probe.values.len(), 4);
+        let Plan::ViaLookup(v) =
+            pt("SELECT aid FROM accounts WHERE (cid, email) IN ((1, 'a@x'), (2, 'b@x'))")
+        else {
+            panic!()
+        };
+        assert_eq!(
+            v.probe.values,
+            [
+                vec![s("a@x"), KeyValueOwned::Int(1)],
+                vec![s("b@x"), KeyValueOwned::Int(2)]
+            ]
+        );
         assert!(matches!(
-            p_with(&t, "INSERT INTO accounts VALUES (1, 'a@x', 1)"),
-            Plan::Reject(r) if r.reason == Reason::Lookup
+            pt("DELETE FROM accounts WHERE (email, cid) = ('a@x', 7)"),
+            Plan::ViaLookup(_)
         ));
+        // One column only: no lookup can name the rows.
+        assert!(matches!(
+            pt("SELECT * FROM accounts WHERE email = 'a@x'"),
+            Plan::Read(_)
+        ));
+        // Inserts claim both parts.
+        let Plan::Write(w) = pt("INSERT INTO accounts (cid, email, aid) VALUES (4, 'a@x', 10)")
+        else {
+            panic!()
+        };
+        assert_eq!(w.claims[0].value, [s("a@x"), KeyValueOwned::Int(4)]);
+        assert_eq!(w.claims[0].owner_pk, [KeyValueOwned::Int(10)]);
+        // An update of one part keeps each row's other part.
+        let Plan::Write(w) = pt("UPDATE accounts SET cid = 9 WHERE aid = 10") else {
+            panic!()
+        };
+        let set = w.releases[0].set.as_ref().unwrap();
+        assert_eq!(set.keep, [true, false]);
+        assert_eq!(
+            set.value_for(&[s("old@x"), KeyValueOwned::Int(4)]),
+            [s("old@x"), KeyValueOwned::Int(9)]
+        );
+        assert!(
+            w.releases[0].reads[0].sql.starts_with(
+                "SELECT HEX(CONVERT(`email` USING utf8mb4)), `cid`, `aid`, `aid` FROM"
+            ),
+            "{}",
+            w.releases[0].reads[0].sql
+        );
+        // Deletes read both parts.
+        let Plan::Write(w) = pt("DELETE FROM accounts WHERE aid = 10") else {
+            panic!()
+        };
+        assert!(
+            w.releases[0].reads[0]
+                .sql
+                .starts_with("SELECT HEX(CONVERT(`email` USING utf8mb4)), `cid`, `aid` FROM")
+        );
     }
 
     #[test]
@@ -806,6 +1031,53 @@ mod tests {
         assert_eq!(n.targets.len(), 1);
         assert_eq!(n.releases[0].reads.len(), 1);
         assert_eq!(n.releases[0].reads[0].shard, n.targets[0].shard);
+    }
+
+    #[test]
+    fn updates_of_the_lookup_column_claim_and_release() {
+        let Plan::Write(w) = p("UPDATE accounts SET email = 'b@x', cid = 2 WHERE aid = 10") else {
+            panic!(
+                "{:?}",
+                p("UPDATE accounts SET email = 'b@x' WHERE aid = 10")
+            )
+        };
+        let [r] = w.releases.as_slice() else {
+            panic!("{:?}", w.releases)
+        };
+        let set = r.set.as_ref().unwrap();
+        assert_eq!(
+            set.value,
+            [KeyValueOwned::Str {
+                bytes: b"b@x".to_vec(),
+                charset: Charset::Utf8mb4
+            }]
+        );
+        let [read] = r.reads.as_slice() else { panic!() };
+        assert!(
+            read.sql.starts_with(
+                "SELECT HEX(CONVERT(`email` USING utf8mb4)), `aid`, `aid` FROM `t7_d1_g3_s"
+            ) && read.sql.ends_with("WHERE aid = 10 FOR UPDATE"),
+            "{}",
+            read.sql
+        );
+        // Through the lookup when the WHERE names the old value; NULL
+        // releases only.
+        let Plan::ViaLookup(v) = p("UPDATE accounts SET email = NULL WHERE email = 'a@x'") else {
+            panic!()
+        };
+        let Plan::Write(w) = &v.plan else { panic!() };
+        assert_eq!(
+            w.releases[0].set.as_ref().unwrap().value,
+            [KeyValueOwned::Null]
+        );
+        // Updates that leave the column alone read nothing.
+        let Plan::Pass(_) = p("UPDATE accounts SET cid = 3 WHERE aid = 10") else {
+            panic!()
+        };
+        assert_eq!(
+            decode_key(Some(b"42"), KeyClass::Int),
+            Some(KeyValue::Int(42))
+        );
     }
 
     #[test]

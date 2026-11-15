@@ -187,3 +187,120 @@ fn a_reach_runs_on_one_shard_inside_its_range_and_reports_holds() {
             .any(|l| l.contains("when the mirrors are fresh"))
     );
 }
+
+#[test]
+fn a_top_k_hop_orders_by_cypher_classes_and_keeps_ties() {
+    let g = group(None);
+    let far = |top: Option<(String, bool, usize)>| FarNodes {
+        keys: Some(vec!["cd".into()]),
+        filter: vec![],
+        only: vec![],
+        join: true,
+        rel_keys: None,
+        rel_filter: vec![],
+        top,
+        limit: None,
+        deep: false,
+        near_scan: None,
+        after: None,
+        ordered: false,
+    };
+    let route = |top| {
+        plan_route(&spec(
+            &g,
+            HopOp::Links {
+                out: true,
+                mirror: false,
+                types: vec![4],
+                far: Some(far(top)),
+            },
+            Targets::ByKey(vec![1]),
+        ))
+    };
+    let r = route(Some(("cd".into(), false, 10)));
+    let [t] = r.targets() else { panic!() };
+    // Ranked links, then every link the statement can't rank.
+    let (top, rest) = t.sql.split_once(") UNION ALL (").unwrap();
+    assert!(top.starts_with("(SELECT "), "{}", t.sql);
+    assert!(
+        top.ends_with("DESC FETCH FIRST 10 ROWS WITH TIES"),
+        "{}",
+        t.sql
+    );
+    assert!(top.contains("IS NOT NULL AND NOT (JSON_TYPE("), "{}", t.sql);
+    // Descending: missing values first, numbers by value, then the
+    // other kinds tied.
+    assert!(top.contains("IS NULL THEN 0 WHEN"), "{}", t.sql);
+    assert!(top.contains("+ 0e0 END DESC"), "{}", t.sql);
+    assert!(rest.ends_with("<=> 'NULL'))"), "{}", t.sql);
+    let asc = route(Some(("cd".into(), true, 3)));
+    let [t] = asc.targets() else { panic!() };
+    assert!(t.sql.contains("THEN 2 WHEN JSON_TYPE("), "{}", t.sql);
+    assert!(
+        t.sql.contains("ASC FETCH FIRST 3 ROWS WITH TIES)"),
+        "{}",
+        t.sql
+    );
+    // Without a join there are no far node columns to order by.
+    let plain = plan_route(&spec(
+        &g,
+        HopOp::Links {
+            out: true,
+            mirror: false,
+            types: vec![4],
+            far: Some(FarNodes {
+                join: false,
+                ..far(Some(("cd".into(), false, 10)))
+            }),
+        },
+        Targets::ByKey(vec![1]),
+    ));
+    let [t] = plain.targets() else { panic!() };
+    assert!(!t.sql.contains("FETCH"), "{}", t.sql);
+    assert_eq!(top_parts("n.id", "n.props", "a\"b", true, 3), None);
+}
+
+#[test]
+fn links_over_a_scan_read_each_shards_own_start_nodes() {
+    let g = group(None);
+    let scan = ScanOp {
+        label: Some(3),
+        ..ScanOp::default()
+    };
+    let r = plan_route(&spec(
+        &g,
+        HopOp::Links {
+            out: true,
+            mirror: false,
+            types: vec![4],
+            far: Some(FarNodes {
+                keys: Some(vec![]),
+                filter: vec![],
+                only: vec![],
+                join: false,
+                rel_keys: None,
+                rel_filter: vec![],
+                top: None,
+                limit: Some(100),
+                deep: false,
+                near_scan: Some(Box::new(scan)),
+                after: None,
+                ordered: true,
+            }),
+        },
+        Targets::All(vec![]),
+    ));
+    let ts = r.targets();
+    assert_eq!(ts.len(), 4);
+    for t in ts {
+        let s = &t.at.schema;
+        assert!(
+            t.sql.contains(&format!(
+                "e.src IN (SELECT n.id FROM `{s}`.`__sprig_gn_77` n JOIN `{s}`.`__sprig_gl_77` l"
+            )),
+            "{}",
+            t.sql
+        );
+        assert!(t.sql.ends_with(" ORDER BY e.id LIMIT 100"), "{}", t.sql);
+    }
+}

@@ -23,8 +23,19 @@
 //! export SPRIG_TEST_RLSI_HTTP=127.0.0.1:38080
 //! export SPRIG_TEST_RLSI_TENANTS=rlsia,rlsib,rlsic
 //! export SPRIG_TEST_RLSI_MODE=read_through   # or materialized
-//! cargo test -p sprig-gateway --test rls_inherit_live -- --nocapture
+//! cargo test -p sprig-gateway --test rls_inherit_live -- --nocapture --test-threads 1
 //! ```
+//!
+//! Optional: `SPRIG_TEST_RLSI_WORKER_PID` (materialized mode: the worker
+//! is stopped for a few seconds, so a copy lags; RL69), and
+//! `SPRIG_TEST_RLSI_RESTART`, a command taking `kill9`, `term` or `all`
+//! that restarts the gateway (`kill -9`, a clean stop) or every process,
+//! for [`share_views_survive_restarts`] (RL68), with
+//! `SPRIG_TEST_RLSI_RAW` (`host:port` of the tenants' MariaDB, user
+//! `root`, password `SPRIG_TEST_RLSI_RAW_PW`) and
+//! `SPRIG_TEST_RLSI_TENANT_IDS` (`a,b,c`) to check the views' definers and
+//! repair one an older build moved. The restart test stops the gateway:
+//! run the tests one at a time (`--test-threads 1`).
 
 #![allow(
     clippy::unwrap_used,
@@ -541,11 +552,22 @@ impl Fixture<'_> {
 
 /// An NDJSON change stream of `docs`.
 async fn open_stream(e: &Env, tenant: &str, user: &str, db: &str) -> tokio::net::TcpStream {
+    open_stream_on(e, tenant, user, db, "docs").await
+}
+
+/// An NDJSON change stream of `objects`.
+async fn open_stream_on(
+    e: &Env,
+    tenant: &str,
+    user: &str,
+    db: &str,
+    objects: &str,
+) -> tokio::net::TcpStream {
     let mut s = tokio::net::TcpStream::connect(&e.http).await.unwrap();
     let auth = base64::engine::general_purpose::STANDARD.encode(format!("{tenant}.{user}:{PW}"));
     let req = format!(
-        "GET /v1/databases/{db}/changes?objects=docs HTTP/1.1\r\nhost: {}\r\nauthorization: \
-         Basic {auth}\r\n\r\n",
+        "GET /v1/databases/{db}/changes?objects={objects} HTTP/1.1\r\nhost: {}\r\n\
+         authorization: Basic {auth}\r\n\r\n",
         e.http
     );
     s.write_all(req.as_bytes()).await.unwrap();
@@ -971,20 +993,28 @@ async fn no_read_path_returns_an_inherited_row_a_policy_hides() {
         leaked.is_empty(),
         "alice@c got events of records she never saw: {ka:?}"
     );
-    // Materialized, c reads a's records through copies, whose changes
-    // don't reach change streams: a's delete of 62 comes only as a's own
-    // event, read before the copies caught up (an update, the record
-    // still there), so only read-through must send its delete (RL64).
-    let want: BTreeSet<i64> = if e.materialized {
-        BTreeSet::from([63])
-    } else {
-        BTreeSet::from([62, 63])
-    };
-    assert!(
-        deleted.is_subset(&BTreeSet::from([62, 63])) && deleted.is_superset(&want),
+    // Materialized, c reads a's records through its copy: the delete of
+    // 62 comes from the copy's tombstone (RL69), a's own event while the
+    // copy serves sending nothing.
+    assert_eq!(
+        deleted,
+        BTreeSet::from([62, 63]),
         "alice@c's deletes: {ka:?}"
     );
     assert!(ke.is_empty(), "eve@c got events: {ke:?}");
+    drop((s_alice, s_eve));
+
+    // RL69: with materialized edges, the copy's changes reach change
+    // streams, and a's own changes, which c's view doesn't read while the
+    // copy serves, send nothing. The worker (which keeps the copies) is
+    // stopped while a deletes 70, updates 71 and inserts 73, so the copy
+    // lags: alice at c gets nothing then (before, the delete came as an
+    // `update` and its delete never came), and exactly a delete of 70, an
+    // update of 71 and an insert of 73 once it catches up.
+    if e.materialized {
+        lagging_copy(&f, &mut app[0]).await;
+        flips(&f, &mut app).await;
+    }
 
     // Cleanup, best effort: rows below a, shares bottom first, users, the
     // space, the databases.
@@ -997,6 +1027,8 @@ async fn no_read_path_returns_an_inherited_row_a_policy_hides() {
         let _ = try_exec(&mut c, "SPRIG RESET vdocs").await;
     }
     for (lv, sh) in [
+        (1, "fbc"),
+        (0, "fab"),
         (1, "wb"),
         (1, "vbc"),
         (0, "vab"),
@@ -1015,6 +1047,291 @@ async fn no_read_path_returns_an_inherited_row_a_policy_hides() {
         }
         let _ = try_exec(c, &format!("DROP DATABASE IF EXISTS `{db}`")).await;
     }
+}
+
+/// The ops a stream got per key.
+fn ops_by_key(v: &[(String, i64)]) -> BTreeMap<i64, Vec<String>> {
+    let mut out: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+    for (op, k) in v {
+        out.entry(*k).or_default().push(op.clone());
+    }
+    out
+}
+
+/// RL69's lagging copy (materialized mode); needs the worker's pid in
+/// `SPRIG_TEST_RLSI_WORKER_PID` (it is stopped with `SIGSTOP` for a few
+/// seconds), else skipped.
+async fn lagging_copy(f: &Fixture<'_>, app_a: &mut mysql_async::Conn) {
+    let e = f.e;
+    let Ok(worker) = std::env::var("SPRIG_TEST_RLSI_WORKER_PID") else {
+        eprintln!("lagging copy: skipped (set SPRIG_TEST_RLSI_WORKER_PID)");
+        return;
+    };
+    let signal = |sig: &str| {
+        let ok = std::process::Command::new("kill")
+            .args([sig, worker.as_str()])
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "kill {sig} {worker}");
+    };
+    for id in 70..=72 {
+        must(
+            app_a,
+            &format!(
+                "INSERT INTO docs (id, parent_id, owner, visible, tier) VALUES ({id}, 1,                  'alice', 1, 1)"
+            ),
+        )
+        .await;
+    }
+    let want: BTreeSet<i64> = [70, 71, 72].into();
+    let mut seen = BTreeSet::new();
+    for _ in 0..60 {
+        let mut c = f.session(&e.mysql, 3, "app").await;
+        seen = ids(&mut c, "SELECT id FROM docs WHERE id BETWEEN 70 AND 73")
+            .await
+            .unwrap_or_default();
+        if seen == want {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert_eq!(seen, want, "70-72 at c");
+    let mut s_alice = open_stream(e, &e.t[2], "alice", &f.db).await;
+    let mut s_eve = open_stream(e, &e.t[2], "eve", &f.db).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    signal("-STOP");
+    let lag = async {
+        must(app_a, "DELETE FROM docs WHERE id = 70").await;
+        must(app_a, "UPDATE docs SET body = 'lagged' WHERE id = 71").await;
+        must(
+            app_a,
+            "INSERT INTO docs (id, parent_id, owner, visible, tier) VALUES (73, 1, 'alice', 1, 1)",
+        )
+        .await;
+        let mut c = f.session(&e.mysql, 3, "app").await;
+        let at_c = ids(&mut c, "SELECT id FROM docs WHERE id BETWEEN 70 AND 73").await;
+        (stream_keys(&mut s_alice, 6).await, at_c)
+    }
+    .await;
+    signal("-CONT");
+    let (during, at_c) = lag;
+    eprintln!("lagging copy: c read {at_c:?} while the worker was stopped");
+    let after = stream_keys(&mut s_alice, 20).await;
+    let ke = stream_keys(&mut s_eve, 1).await;
+    eprintln!("lagging copy: alice@c while stopped {during:?}; after {after:?}; eve@c {ke:?}");
+    assert_eq!(
+        at_c.unwrap_or_default(),
+        want,
+        "the copy didn't lag (the worker kept writing it)"
+    );
+    assert!(
+        during.is_empty(),
+        "alice@c got a's own changes while the copy lagged: {during:?}"
+    );
+    let got = ops_by_key(&after);
+    let wanted: BTreeMap<i64, Vec<String>> = [
+        (70, vec!["delete".to_owned()]),
+        (71, vec!["update".to_owned()]),
+        (73, vec!["insert".to_owned()]),
+    ]
+    .into();
+    assert_eq!(got, wanted, "alice@c's events once the copy caught up");
+    assert!(ke.is_empty(), "eve@c got events: {ke:?}");
+}
+
+/// Runs `sql` (a `CREATE SHARE`) with `inherit.merge = 'materialized'`.
+async fn materialized(c: &mut mysql_async::Conn, sql: &str) {
+    must(c, "SPRIG SET inherit.merge = 'materialized'").await;
+    must(c, sql).await;
+    must(c, "SPRIG RESET inherit.merge").await;
+}
+
+/// RL71: exactly once across a copy's flips. Table `fdocs` is shared
+/// `a > b > c`, both edges materialized, and `alice` at `c` watches it.
+/// Each cycle flips a copy while `a` and `b` write, every 200 ms for 4 s:
+/// `a` inserts a new record, updates one of its first 20 and deletes one
+/// it inserted in the cycle before; `b` inserts one of its own and deletes
+/// one from the cycle before. The cycles alternate: `b` drops and makes
+/// again its share to `c` (a first seed of `c`'s copy), `b` changes that
+/// share's filter (a reseed of `c`'s copy), `a` changes its share's filter
+/// (a reseed of `b`'s copy). Every change must reach `alice` exactly once:
+/// each new record exactly an `insert` then a `delete`, each of the first
+/// 20 exactly one `update` per cycle. `SPRIG_TEST_RLSI_FLIPS` cycles (9
+/// by default).
+async fn flips(f: &Fixture<'_>, app: &mut [mysql_async::Conn]) {
+    let e = f.e;
+    let db = &f.db;
+    let cycles: usize = std::env::var("SPRIG_TEST_RLSI_FLIPS")
+        .ok()
+        .map_or(9, |v| v.parse().unwrap());
+    let (fab, fbc) = (format!("{db}_fab"), format!("{db}_fbc"));
+    must(
+        &mut app[0],
+        "CREATE TABLE fdocs (id INT PRIMARY KEY, owner VARCHAR(20) NOT NULL, body VARCHAR(40) \
+         NOT NULL DEFAULT 'x')",
+    )
+    .await;
+    must(&mut app[0], "ALTER TABLE fdocs SPRIG INHERITABLE KEY (id)").await;
+    for id in 1..=20 {
+        must(
+            &mut app[0],
+            &format!("INSERT INTO fdocs (id, owner) VALUES ({id}, 'alice')"),
+        )
+        .await;
+    }
+    let share = |name: &str, to: &str, reshare: bool| {
+        format!(
+            "CREATE SHARE {name} ON fdocs TO SPACE `{to}`{}",
+            if reshare { " WITH RESHARE" } else { "" }
+        )
+    };
+    materialized(&mut app[0], &share(&fab, &e.t[1], true)).await;
+    let make_bc = share(&fbc, &e.t[2], false);
+    materialized(&mut app[1], &make_bc).await;
+    // Both copies serve: c reads the 20 records.
+    let base: BTreeSet<i64> = (1..=20).collect();
+    let mut at_c = BTreeSet::new();
+    for _ in 0..60 {
+        let mut c = f.session(&e.mysql, 3, "app").await;
+        at_c = ids(&mut c, "SELECT id FROM fdocs")
+            .await
+            .unwrap_or_default();
+        if at_c == base {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert_eq!(at_c, base, "fdocs at c");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let mut s = open_stream_on(e, &e.t[2], "alice", db, "fdocs").await;
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let reader = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let mut chunk = vec![0u8; 65536];
+        tokio::pin!(stopped);
+        loop {
+            tokio::select! {
+                _ = &mut stopped => break,
+                r = s.read(&mut chunk) => match r {
+                    Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                    _ => break,
+                },
+            }
+        }
+        String::from_utf8_lossy(&buf)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+            .filter(|v| v.is_object() && v["op"] != "heartbeat")
+            .filter_map(|v| {
+                let key: serde_json::Value =
+                    serde_json::from_str(v["key"].as_str().unwrap_or("null")).ok()?;
+                Some((v["op"].as_str()?.to_owned(), key["id"].as_i64()?))
+            })
+            .collect::<Vec<_>>()
+    });
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let mut want: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+    let push = |want: &mut BTreeMap<i64, Vec<String>>, k: i64, op: &str| {
+        want.entry(k).or_default().push(op.to_owned());
+    };
+    let new_a = |cycle: usize, i: usize| i64::try_from(100_000 + cycle * 1000 + i).unwrap();
+    let new_b = |cycle: usize, i: usize| i64::try_from(200_000 + cycle * 1000 + i).unwrap();
+    for cycle in 0..=cycles {
+        let kind = cycle % 3;
+        let last = cycle == cycles;
+        let flip = std::time::Instant::now();
+        if !last {
+            match kind {
+                // A first seed of c's copy.
+                0 => {
+                    must(&mut app[1], &format!("DROP SHARE {fbc}")).await;
+                    materialized(&mut app[1], &make_bc).await;
+                }
+                // A reseed of c's copy.
+                1 => {
+                    must(
+                        &mut app[1],
+                        &format!("ALTER SHARE {fbc} WHERE id > -{}", cycle + 1),
+                    )
+                    .await;
+                }
+                // A reseed of b's copy.
+                _ => {
+                    must(
+                        &mut app[0],
+                        &format!("ALTER SHARE {fab} WHERE id > -{}", cycle + 1),
+                    )
+                    .await;
+                }
+            }
+        }
+        for i in 0..20 {
+            if !last {
+                let k = new_a(cycle, i);
+                must(
+                    &mut app[0],
+                    &format!("INSERT INTO fdocs (id, owner) VALUES ({k}, 'alice')"),
+                )
+                .await;
+                push(&mut want, k, "insert");
+                let k = i64::try_from(i + 1).unwrap();
+                must(
+                    &mut app[0],
+                    &format!("UPDATE fdocs SET body = 'c{cycle}' WHERE id = {k}"),
+                )
+                .await;
+                push(&mut want, k, "update");
+                let k = new_b(cycle, i);
+                must(
+                    &mut app[1],
+                    &format!("INSERT INTO fdocs (id, owner) VALUES ({k}, 'alice')"),
+                )
+                .await;
+                push(&mut want, k, "insert");
+            }
+            if cycle > 0 {
+                let k = new_a(cycle - 1, i);
+                must(&mut app[0], &format!("DELETE FROM fdocs WHERE id = {k}")).await;
+                push(&mut want, k, "delete");
+                let k = new_b(cycle - 1, i);
+                must(&mut app[1], &format!("DELETE FROM fdocs WHERE id = {k}")).await;
+                push(&mut want, k, "delete");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        eprintln!(
+            "flips: cycle {cycle} (kind {kind}) written in {:.1} s",
+            flip.elapsed().as_secs_f64()
+        );
+        tokio::time::sleep(Duration::from_secs(6)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let _ = stop.send(());
+    let got = reader.await.unwrap();
+    let got = ops_by_key(&got);
+    let mut wrong = Vec::new();
+    for (k, w) in &want {
+        let g = got.get(k).cloned().unwrap_or_default();
+        if &g != w {
+            wrong.push(format!("{k}: want {w:?}, got {g:?}"));
+        }
+    }
+    for (k, g) in &got {
+        if !want.contains_key(k) {
+            wrong.push(format!("{k}: unexpected {g:?}"));
+        }
+    }
+    let changes: usize = want.values().map(Vec::len).sum();
+    eprintln!(
+        "flips: {cycles} flips, {changes} changes, {} keys, {} wrong",
+        want.len(),
+        wrong.len()
+    );
+    assert!(
+        wrong.is_empty(),
+        "alice@c didn't get every change exactly once across the flips:\n{}",
+        wrong.join("\n")
+    );
 }
 
 /// RL65's policy combinations: `alice` at `b1` updates and deletes records
@@ -1141,4 +1458,409 @@ async fn write_combinations(f: &Fixture<'_>, app_b: &mut mysql_async::Conn, shar
         "writes to inherited records:\n{}",
         failures.join("\n")
     );
+}
+
+/// Raw MariaDB access for [`share_views_survive_restarts`].
+struct Raw {
+    conn: mysql_async::Conn,
+    ids: Vec<u64>,
+}
+
+impl Raw {
+    async fn open() -> Option<Self> {
+        let addr = std::env::var("SPRIG_TEST_RLSI_RAW").ok()?;
+        let ids: Vec<u64> = std::env::var("SPRIG_TEST_RLSI_TENANT_IDS")
+            .ok()?
+            .split(',')
+            .map(|x| x.trim().parse().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 3, "SPRIG_TEST_RLSI_TENANT_IDS: a,b,c");
+        let pw =
+            std::env::var("SPRIG_TEST_RLSI_RAW_PW").unwrap_or_else(|_| "sprig-dev-root".into());
+        let (host, port) = addr.split_once(':').unwrap();
+        let opts = mysql_async::OptsBuilder::default()
+            .ip_or_hostname(host)
+            .tcp_port(port.parse().unwrap())
+            .user(Some("root"))
+            .pass(Some(pw))
+            .prefer_socket(false);
+        let conn = mysql_async::Conn::new(opts).await.unwrap();
+        Some(Self { conn, ids })
+    }
+
+    /// Tenant `t`'s share views on `db`'s schemas: (schema, name, definer).
+    async fn share_views(&mut self, t: usize) -> Vec<(String, String, String)> {
+        let schemas: Vec<String> = self
+            .conn
+            .exec(
+                "SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE ?",
+                (format!("t{}\\_d%", self.ids[t]),),
+            )
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        for sc in schemas {
+            let rows: Vec<(String, String, String)> = self
+                .conn
+                .exec(
+                    "SELECT TABLE_SCHEMA, TABLE_NAME, DEFINER FROM information_schema.VIEWS \
+                     WHERE TABLE_SCHEMA = ? AND TABLE_NAME LIKE '\\_\\_sprig\\_share\\_%'",
+                    (sc,),
+                )
+                .await
+                .unwrap();
+            out.extend(rows);
+        }
+        out
+    }
+
+    /// Every share view of `b` and `c` runs as its parent's share definer
+    /// (RL70), which may read only the parent's relations.
+    async fn check_definers(&mut self, when: &str) {
+        for t in [1, 2] {
+            let views = self.share_views(t).await;
+            eprintln!("share views of tenant {t} {when}: {views:?}");
+            assert!(!views.is_empty(), "tenant {t} has no share view {when}");
+            let parent = format!("t{}_sprig_share@%", self.ids[t - 1]);
+            for (sc, name, definer) in views {
+                assert_eq!(
+                    definer,
+                    parent,
+                    "{sc}.{name} runs as {definer} {when}, not as tenant {}'s share definer",
+                    t - 1
+                );
+            }
+            let grants: Vec<(String, String, String)> = self
+                .conn
+                .exec(
+                    "SELECT Db, Table_name, Table_priv FROM mysql.tables_priv WHERE User = ? AND \
+                     Host = '%'",
+                    (format!("t{}_sprig_share", self.ids[t - 1]),),
+                )
+                .await
+                .unwrap();
+            let schemas: Vec<String> = self
+                .conn
+                .exec(
+                    "SELECT Db FROM mysql.db WHERE User = ?",
+                    (format!("t{}_sprig_share", self.ids[t - 1]),),
+                )
+                .await
+                .unwrap();
+            eprintln!("tenant {}'s share definer {when}: {grants:?}", t - 1);
+            assert!(schemas.is_empty(), "no database-level grant: {schemas:?}");
+            for (db, table, privs) in &grants {
+                assert!(
+                    db.starts_with(&format!("t{}_d", self.ids[t - 1])),
+                    "the share definer reads only its tenant's schemas: {db}.{table}"
+                );
+                assert_eq!(privs, "Select", "{db}.{table}: SELECT only");
+            }
+        }
+    }
+
+    /// What a build before RL68 did: `c`'s share views run as one of `c`'s
+    /// accounts.
+    async fn move_to_child(&mut self) {
+        let child: String = self
+            .conn
+            .exec_first(
+                "SELECT User FROM mysql.user WHERE User LIKE ? ORDER BY User LIMIT 1",
+                (format!("t{}\\_u%", self.ids[2]),),
+            )
+            .await
+            .unwrap()
+            .expect("c has a backend account");
+        self.move_c_to(&child).await;
+    }
+
+    /// `c`'s share views run as `account` (host `%`).
+    async fn move_c_to(&mut self, child: &str) {
+        for (sc, name, _) in self.share_views(2).await {
+            let row: mysql_async::Row = self
+                .conn
+                .query_first(format!("SHOW CREATE VIEW `{sc}`.`{name}`"))
+                .await
+                .unwrap()
+                .unwrap();
+            let create: String = row.get("Create View").unwrap();
+            let at = create.find("DEFINER=`").unwrap();
+            let end = at + create[at..].find(" SQL SECURITY").unwrap();
+            let moved = format!(
+                "CREATE OR REPLACE {}DEFINER=`{child}`@`%`{}",
+                &create["CREATE ".len()..at],
+                &create[end..]
+            );
+            self.conn.query_drop(moved).await.unwrap();
+        }
+    }
+}
+
+/// Reads `docs` at `b` and `c` (as `app`, and as `alice` bound by `c`'s
+/// policy) until they answer, up to 30 s; `Err` with every error seen
+/// when they never do, or when one was a 1356, a 1449 or a 1045 (a share
+/// view's definer).
+async fn read_inherited(e: &Env, db: &str) -> Result<(), Vec<String>> {
+    let mut errs = Vec::new();
+    for _ in 0..60 {
+        let mut ok = true;
+        for (t, user, want) in [
+            (1, "app", vec![1, 2, 3, 4]),
+            (2, "app", vec![1, 2, 3, 4]),
+            (2, "alice", vec![1, 3]),
+        ] {
+            let got = async {
+                let (host, port) = e.mysql.split_once(':').unwrap();
+                let opts = mysql_async::OptsBuilder::default()
+                    .ip_or_hostname(host)
+                    .tcp_port(port.parse().unwrap())
+                    .user(Some(format!("{}.{user}", e.t[t])))
+                    .pass(Some(PW))
+                    .db_name(Some(db))
+                    .prefer_socket(false)
+                    .ssl_opts(
+                        mysql_async::SslOpts::default().with_danger_accept_invalid_certs(true),
+                    );
+                let mut c = mysql_async::Conn::new(opts)
+                    .await
+                    .map_err(|x| x.to_string())?;
+                let r = ids(&mut c, "SELECT id FROM docs").await;
+                let _ = c.disconnect().await;
+                r
+            }
+            .await;
+            match got {
+                Ok(g) if g == want.iter().copied().collect::<BTreeSet<i64>>() => {}
+                Ok(g) => {
+                    ok = false;
+                    errs.push(format!("{user}@{t}: {g:?}"));
+                }
+                Err(x) => {
+                    ok = false;
+                    errs.push(format!("{user}@{t}: {x}"));
+                }
+            }
+        }
+        if ok {
+            if !errs.is_empty() {
+                eprintln!("reads answered after: {errs:?}");
+            }
+            return if errs
+                .iter()
+                .any(|x| x.contains("1356") || x.contains("1449") || x.contains("1045"))
+            {
+                Err(errs)
+            } else {
+                Ok(())
+            };
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err(errs)
+}
+
+/// RL68 and RL70: read-through share views keep working across gateway
+/// restarts (`kill -9`, a clean stop) and a restart of every process, and
+/// when the users who made the shares are dropped: they run as the
+/// parent's share definer, never a user's account. A share view an older
+/// build left with another definer (the share's dropped creator: every
+/// read failing with 1449; the child's account: 1356) is re-pointed at the
+/// gateway's start, and by the drift sweep while it runs
+/// (`SPRIG_TEST_RLSI_SWEEP_SECS`: the deployment's
+/// `auth.reconcile_interval_seconds`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn share_views_survive_restarts() {
+    let Some(e) = env() else {
+        return;
+    };
+    let Ok(restart) = std::env::var("SPRIG_TEST_RLSI_RESTART") else {
+        eprintln!("skipped: set SPRIG_TEST_RLSI_RESTART");
+        return;
+    };
+    let pid = std::process::id() % 10_000;
+    let db = format!("rlsr_{pid}");
+    let mut app: Vec<mysql_async::Conn> = Vec::new();
+    for t in &e.t {
+        let mut c = conn(&e.mysql, t, "app").await;
+        must(&mut c, &format!("USE SPACE `{t}`")).await;
+        app.push(c);
+    }
+    must(&mut app[0], &format!("CREATE DATABASE `{db}`")).await;
+    must(&mut app[0], &format!("USE `{db}`")).await;
+    must(
+        &mut app[0],
+        "CREATE TABLE docs (id INT PRIMARY KEY, owner VARCHAR(20) NOT NULL, body VARCHAR(40) NOT \
+         NULL DEFAULT 'x')",
+    )
+    .await;
+    must(&mut app[0], "ALTER TABLE docs SPRIG INHERITABLE KEY (id)").await;
+    must(
+        &mut app[0],
+        "INSERT INTO docs (id, owner) VALUES (1, 'alice'), (2, 'bob'), (3, 'alice'), (4, 'bob')",
+    )
+    .await;
+    // The shares are made by users `sharer` of `a` and `b`, dropped below
+    // (RL70).
+    for (t, c) in app.iter_mut().enumerate().take(2) {
+        let _ = try_exec(c, "DROP USER IF EXISTS 'sharer'@'%'").await;
+        must(c, &format!("CREATE USER 'sharer'@'%' IDENTIFIED BY '{PW}'")).await;
+        must(c, &format!("GRANT ALL ON `{db}`.* TO 'sharer'@'%'")).await;
+        let mut sh = conn(&e.mysql, &e.t[t], "sharer").await;
+        must(&mut sh, &format!("USE `{db}`")).await;
+        let to = if t == 0 {
+            format!(
+                "CREATE SHARE {db}_ab ON docs TO SPACE `{}` WITH RESHARE",
+                e.t[1]
+            )
+        } else {
+            format!("CREATE SHARE {db}_bc ON docs TO SPACE `{}`", e.t[2])
+        };
+        must(&mut sh, &to).await;
+        drop(sh);
+    }
+    must(&mut app[1], &format!("USE `{db}`")).await;
+    must(&mut app[2], &format!("USE `{db}`")).await;
+    let _ = try_exec(&mut app[2], "DROP USER IF EXISTS 'alice'@'%'").await;
+    must(
+        &mut app[2],
+        &format!("CREATE USER 'alice'@'%' IDENTIFIED BY '{PW}'"),
+    )
+    .await;
+    must(
+        &mut app[2],
+        &format!("GRANT SELECT ON `{db}`.* TO 'alice'@'%'"),
+    )
+    .await;
+    must(&mut app[2], "ALTER TABLE docs ENABLE ROW LEVEL SECURITY").await;
+    must(
+        &mut app[2],
+        "CREATE POLICY p_alice ON docs FOR SELECT TO alice USING (owner = 'alice')",
+    )
+    .await;
+    drop(app);
+    let mut raw = Raw::open().await;
+    if raw.is_none() {
+        eprintln!("definers: not checked (set SPRIG_TEST_RLSI_RAW and SPRIG_TEST_RLSI_TENANT_IDS)");
+    }
+    let r = read_inherited(&e, &db).await;
+    assert_eq!(r, Ok(()), "reads before any restart");
+    if let Some(raw) = &mut raw {
+        raw.check_definers("before any restart").await;
+    }
+    // The users who made the shares go (RL70): the children's reads don't
+    // depend on them.
+    {
+        let mut a = conn(&e.mysql, &e.t[0], "app").await;
+        let mut b = conn(&e.mysql, &e.t[1], "app").await;
+        must(&mut a, "DROP USER 'sharer'@'%'").await;
+        must(&mut b, "DROP USER 'sharer'@'%'").await;
+    }
+    let r = read_inherited(&e, &db).await;
+    assert_eq!(r, Ok(()), "reads after the shares' creators were dropped");
+    if let Some(raw) = &mut raw {
+        raw.check_definers("after the shares' creators were dropped")
+            .await;
+    }
+    // A user id no tenant has: what a view made before RL70 runs as once
+    // the user who made its share is dropped.
+    let gone = raw.as_ref().map(|r| format!("t{}_u999999", r.ids[1]));
+    for how in ["kill9", "term", "all"] {
+        if how == "kill9"
+            && let (Some(raw), Some(gone)) = (&mut raw, &gone)
+        {
+            // A view made before RL70 whose share's creator was dropped:
+            // reads fail until the gateway starts: 1449, or 1045 naming the
+            // reader (MariaDB's answer to an account without `SET USER`).
+            raw.move_c_to(gone).await;
+            let mut c = conn(&e.mysql, &e.t[2], "app").await;
+            must(&mut c, &format!("USE `{db}`")).await;
+            let r = ids(&mut c, "SELECT id FROM docs").await;
+            eprintln!("c's share views run as a dropped user: {r:?}");
+            assert!(
+                r.as_ref()
+                    .is_err_and(|x| x.contains("1449") || x.contains("1045")),
+                "a share view running as a dropped user must fail with 1449 or 1045: {r:?}"
+            );
+        }
+        if how == "term"
+            && let Some(raw) = &mut raw
+        {
+            // An older build's damage, on a running gateway: reads fail.
+            raw.move_to_child().await;
+            let mut c = conn(&e.mysql, &e.t[2], "app").await;
+            must(&mut c, &format!("USE `{db}`")).await;
+            let r = ids(&mut c, "SELECT id FROM docs").await;
+            eprintln!("c's share views moved to c's account: {r:?}");
+            assert!(
+                r.as_ref().is_err_and(|x| x.contains("1356")),
+                "a share view running as the child's account must fail with 1356: {r:?}"
+            );
+        }
+        let out = std::process::Command::new("sh")
+            .args(["-c", &format!("{restart} {how}")])
+            .output()
+            .unwrap();
+        eprintln!(
+            "restart {how}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "restart {how}");
+        // Twice: the first statements reconcile the tenants' grants and
+        // make the views; nothing may move them afterwards.
+        for pass in 0..2 {
+            let r = read_inherited(&e, &db).await;
+            assert_eq!(r, Ok(()), "reads after restart {how}, pass {pass}");
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+        if let Some(raw) = &mut raw {
+            raw.check_definers(&format!("after restart {how}")).await;
+        }
+    }
+    // The drift sweep re-points a view while the gateway runs.
+    if let (Some(raw), Some(gone), Ok(secs)) = (
+        &mut raw,
+        &gone,
+        std::env::var("SPRIG_TEST_RLSI_SWEEP_SECS").map(|s| s.parse::<u64>().unwrap()),
+    ) {
+        raw.move_c_to(gone).await;
+        let started = std::time::Instant::now();
+        let mut last = Err(String::new());
+        while started.elapsed() < Duration::from_secs(secs * 2 + 30) {
+            let mut c = conn(&e.mysql, &e.t[2], "app").await;
+            must(&mut c, &format!("USE `{db}`")).await;
+            last = ids(&mut c, "SELECT id FROM docs").await;
+            if last.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        eprintln!(
+            "drift sweep: c read {last:?} {:.1} s after its views were moved to a dropped user",
+            started.elapsed().as_secs_f64()
+        );
+        assert!(
+            last.is_ok(),
+            "the drift sweep didn't repair c's share views: {last:?}"
+        );
+        assert_eq!(
+            read_inherited(&e, &db).await,
+            Ok(()),
+            "reads after the sweep"
+        );
+        raw.check_definers("after the drift sweep").await;
+    }
+    // Cleanup by exact name.
+    let mut a = conn(&e.mysql, &e.t[0], "app").await;
+    let mut b = conn(&e.mysql, &e.t[1], "app").await;
+    let mut c = conn(&e.mysql, &e.t[2], "app").await;
+    for x in [&mut a, &mut b, &mut c] {
+        let _ = try_exec(x, &format!("USE `{db}`")).await;
+    }
+    let _ = try_exec(&mut c, "DROP USER IF EXISTS 'alice'@'%'").await;
+    let _ = try_exec(&mut b, &format!("DROP SHARE IF EXISTS {db}_bc")).await;
+    let _ = try_exec(&mut a, &format!("DROP SHARE IF EXISTS {db}_ab")).await;
+    for x in [&mut c, &mut b, &mut a] {
+        let _ = try_exec(x, &format!("DROP DATABASE IF EXISTS `{db}`")).await;
+    }
 }

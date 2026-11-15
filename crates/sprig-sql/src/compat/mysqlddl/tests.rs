@@ -227,3 +227,70 @@ fn foreign_keys_and_their_errors() {
     );
     assert_eq!(fk_duplicate_name("fk1").code, 1826);
 }
+
+// MariaDB 11.8.9's errors through the hidden columns, and MySQL 8.4.11's
+// answers to the same statements (captured 15 November 2026; SQLancer
+// found the first two, r1diff GR8).
+#[test]
+fn functional_index_errors_name_the_index() {
+    let e = "( EXISTS (SELECT 1 wHERE FALSE)) IS NOT FALSE";
+    let c = super::super::fxindex::fx_column(e);
+    let msg = format!(
+        "Function or expression 'select ...' cannot be used in the GENERATED ALWAYS AS clause of `{c}`"
+    );
+    let sql = format!("CREATE UNIQUE INDEX i1 ON t0(({e}))");
+    let m = functional_index_error(1901, &msg, sql.as_bytes(), &my()).unwrap();
+    assert_eq!(
+        (m.code, m.sqlstate, m.message.as_str()),
+        (
+            3758,
+            *b"HY000",
+            "Expression of functional index 'i1' contains a disallowed function."
+        )
+    );
+    // The index can't be found: MySQL's name for an unnamed one.
+    let m = functional_index_error(1901, &msg, b"SELECT 1", &my()).unwrap();
+    assert!(m.message.contains("'functional_index'"));
+    assert!(!m.message.contains("_sprig_"));
+    // A user's own generated column keeps MariaDB's error.
+    assert_eq!(
+        functional_index_error(
+            1901,
+            "Function or expression 'rand()' cannot be used in the GENERATED ALWAYS AS clause of `g`",
+            b"ALTER TABLE t ADD g INT AS (RAND())",
+            &my()
+        ),
+        None
+    );
+    assert_eq!(functional_index_error(1064, &msg, b"", &my()), None);
+}
+
+#[test]
+fn dropping_a_column_something_generated_uses() {
+    let m = "Unknown column 'c1' in 'GENERATED ALWAYS AS'";
+    assert_eq!(generated_dependency_column(1054, m), Some("c1"));
+    assert_eq!(
+        generated_dependency_column(1054, "Unknown column 'c1' in 'field list'"),
+        None
+    );
+    assert_eq!(generated_dependency_column(1146, m), None);
+    assert!(expression_uses("`c0` + `C1`", "c1"));
+    assert!(!expression_uses("`c10` * 2", "c1"));
+    let f = generated_dependency("c1", false);
+    assert_eq!(
+        (f.code, f.message.as_str()),
+        (
+            3837,
+            "Column 'c1' has a functional index dependency and cannot be dropped or renamed."
+        )
+    );
+    let g = generated_dependency("c0", true);
+    assert_eq!(
+        (g.code, g.sqlstate, g.message.as_str()),
+        (
+            3108,
+            *b"HY000",
+            "Column 'c0' has a generated column dependency."
+        )
+    );
+}

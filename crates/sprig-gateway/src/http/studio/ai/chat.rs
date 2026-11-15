@@ -152,16 +152,23 @@ impl TurnSink for LineSink {
 /// Starts `t` on its own task: its lines, and the token that stops it.
 /// The `start` line names `conv`.
 #[must_use]
-pub fn start(
+pub fn start(t: Turn, conv: Option<ConvId>) -> (mpsc::UnboundedReceiver<Bytes>, CancellationToken) {
+    start_as(t, conv.map(|c| c.0.to_string()).as_deref())
+}
+
+/// [`start`] with the conversation id as the API shows it (an
+/// administration conversation's has a prefix).
+#[must_use]
+pub fn start_as(
     mut t: Turn,
-    conv: Option<ConvId>,
+    conv: Option<&str>,
 ) -> (mpsc::UnboundedReceiver<Bytes>, CancellationToken) {
     let (tx, rx) = mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
     t.req.cancel = Some(cancel.clone());
     let _ = tx.send(line(&json!({
         "type": "start",
-        "conversation": conv.map(|c| c.0.to_string()),
+        "conversation": conv,
         "role": t.cfg.role.as_str(),
         "model": t.cfg.model,
         "share_data": t.cfg.share_data,
@@ -219,7 +226,7 @@ pub fn response(rx: mpsc::UnboundedReceiver<Bytes>, cancel: CancellationToken) -
 /// never chatted with.
 ///
 /// # Errors
-/// 39790 for an unknown role or a login without a tenant; 1227 for the
+/// 39792 for an unknown role or a login without a tenant; 1227 for the
 /// administration assistant without operator rights.
 pub fn role_for(asked: &str, tenant_login: bool, operator: bool) -> Result<Role> {
     match Role::parse(asked.trim()) {
@@ -242,7 +249,7 @@ pub fn role_for(asked: &str, tenant_login: bool, operator: bool) -> Result<Role>
 /// the user has on screen), which needs `ai.share_data`.
 ///
 /// # Errors
-/// 39995 for a `result` with sharing off; 39790 for an unknown kind or a
+/// 39995 for a `result` with sharing off; 39792 for an unknown kind or a
 /// chip that is too long.
 pub fn context_text(ctx: Option<&Value>, share_data: bool) -> Result<String> {
     let Some(items) = ctx.filter(|v| !v.is_null()) else {

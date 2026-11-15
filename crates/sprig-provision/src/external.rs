@@ -520,6 +520,15 @@ pub fn classify(c: &Classify<'_>) -> (Vec<String>, Vec<String>) {
             sprig_cluster::probe::grants::DOCS_CTL_GRANT
         ));
     }
+    // The administration conversations' schema: without it only they
+    // aren't stored (on the DC's system cluster).
+    if !p.ai_schema_all {
+        advisories.push(format!(
+            "sprig_ctl can't manage __sprig_ai; the administration assistant's conversations \
+             aren't kept if this becomes the system cluster, until: {}",
+            sprig_cluster::probe::grants::AI_CTL_GRANT
+        ));
+    }
     advisories.extend(
         p.missing_ctl_grants()
             .into_iter()

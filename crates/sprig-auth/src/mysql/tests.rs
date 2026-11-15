@@ -1013,12 +1013,21 @@ async fn full_logins_backfill_scram_verifiers() {
         AuthVerdict::Accept
     );
     assert_eq!(backfills(&w, 1).await, [(ACME, UserId(1), 10)]);
-    let added: Vec<_> = w
-        .audit
-        .events()
-        .into_iter()
-        .filter(|e| e.event == crate::audit::events::VERIFIERS_ADDED)
-        .collect();
+    // The audit event is written after the backfill, by the same
+    // background task: wait for it rather than racing it.
+    let mut added: Vec<_> = Vec::new();
+    for _ in 0..200 {
+        added = w
+            .audit
+            .events()
+            .into_iter()
+            .filter(|e| e.event == crate::audit::events::VERIFIERS_ADDED)
+            .collect();
+        if !added.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     assert_eq!(added.len(), 1);
     assert_eq!(added[0].protocol, "mysql");
     assert_eq!(added[0].reason, Some("upgrade_on_login"));

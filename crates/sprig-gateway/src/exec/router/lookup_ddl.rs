@@ -7,8 +7,8 @@
 //! here, around the DDL engine's run on every shard:
 //!
 //! ```text
-//! ALTER TABLE t ADD [CONSTRAINT [c]] UNIQUE [KEY|INDEX] [k] (col)
-//! CREATE UNIQUE INDEX k ON t (col)
+//! ALTER TABLE t ADD [CONSTRAINT [c]] UNIQUE [KEY|INDEX] [k] (col, ...)
+//! CREATE UNIQUE INDEX k ON t (col, ...)
 //!   1. the statement runs on every shard (each shard's unique index; a
 //!      duplicate inside one shard fails here with 1062, as before)
 //!   2. the lookup is built (lookups_sql::build_for_key): back-fill of
@@ -22,11 +22,12 @@
 //! ```
 //!
 //! A key that holds the distribution key needs no lookup and is left to
-//! MariaDB. A key of several columns without it is refused (39420
-//! `lookup`): the router follows lookups of one column. `ADD UNIQUE` on
-//! a sharded table must be the `ALTER TABLE`'s only kind of clause, so a
-//! failed build can be undone exactly. A member that follows its parent
-//! (no key column of its own) keeps per-shard uniqueness, as before.
+//! MariaDB. A key of several columns without it gets a lookup of several
+//! columns, which the router follows when a statement names every one of
+//! them. `ADD UNIQUE` on a sharded table must be the `ALTER TABLE`'s only
+//! kind of clause, so a failed build can be undone exactly. A member that
+//! follows its parent (no key column of its own) keeps per-shard
+//! uniqueness, as before.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -262,7 +263,8 @@ pub(in crate::exec) struct LookupAdd {
     object: u64,
     table: String,
     name: Option<String>,
-    column: String,
+    /// The key's columns, lowercase, in key order.
+    columns: Vec<String>,
     /// The table's index names before the statement.
     before: BTreeSet<String>,
     /// The first shard's schema and cluster (where the key's name is read).
@@ -308,6 +310,7 @@ fn q(s: &str) -> String {
 impl PassSession {
     /// Decides what a DDL statement does about lookup indexes (module
     /// docs).
+    #[allow(clippy::too_many_lines)] // the table, its lookups, then each clause
     pub(in crate::exec) async fn lookup_ddl_plan(
         &mut self,
         physical: &str,
@@ -389,14 +392,7 @@ impl PassSession {
             if lc.contains(&key) {
                 continue; // unique across shards already
             }
-            let [column] = lc.as_slice() else {
-                return LookupDdl::Fail(refused(&format!(
-                    "a unique key of several columns ({}) without the distribution key {key}: \
-                     lookup indexes take one column",
-                    lc.join(", ")
-                )));
-            };
-            adds.push((a.name.clone(), column.clone()));
+            adds.push((a.name.clone(), lc));
         }
         if adds.is_empty() {
             return if drops.is_empty() {
@@ -423,11 +419,11 @@ impl PassSession {
             parse_index_ddl(logical).map_or_else(|| q(&ddl.table), |l| l.table_text);
         LookupDdl::Build(
             adds.into_iter()
-                .map(|(name, column)| LookupAdd {
+                .map(|(name, columns)| LookupAdd {
                     object,
                     table: table.clone(),
                     name,
-                    column,
+                    columns,
                     before: before.clone(),
                     shard: shard.clone(),
                     physical_table: ddl.table_text.clone(),
@@ -504,7 +500,7 @@ impl PassSession {
             let key = shape
                 .unique
                 .iter()
-                .filter(|(_, cols)| cols.as_slice() == [a.column.clone()])
+                .filter(|(_, cols)| *cols == a.columns)
                 .map(|(n, _)| n.clone())
                 .find(|n| match &a.name {
                     Some(given) => n.eq_ignore_ascii_case(given),
@@ -528,7 +524,8 @@ impl PassSession {
                 ObjectId(a.object),
                 &a.table,
                 &key,
-                &a.column,
+                &a.columns,
+                true,
             )
             .await
             {
@@ -546,6 +543,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::many_single_char_names)] // one statement each
     fn index_statements_are_read() {
         let a = parse_index_ddl("ALTER TABLE `shop`.customers ADD UNIQUE KEY uk_email (email)")
             .unwrap_or_else(|| unreachable!());

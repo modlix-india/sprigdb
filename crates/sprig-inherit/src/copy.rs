@@ -71,6 +71,7 @@ use sprig_common::ids::{ObjectId, TenantId};
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_sql::lex::LexOptions;
 
+use crate::handover::Handover;
 use crate::model::{ALL_BITS, InheritState, InheritableObject, MergeMode, ROOT_SPACE, SpaceId};
 use crate::plan::{AllowAll, Ctx, Limits, physical_schema, state_of, tenant_edge};
 use crate::upstream;
@@ -112,6 +113,9 @@ pub struct CopyInfo {
     pub caught_up_ms: u64,
     /// When it was seeded (ms).
     pub seeded_ms: u64,
+    /// When it became its subscribers' source in change streams
+    /// ([`crate::handover`], decision RL71).
+    pub handover: Handover,
 }
 
 /// The copies a statement may read.
@@ -148,6 +152,8 @@ pub fn state_ddl(schema: &str) -> String {
   epoch           BIGINT UNSIGNED NOT NULL,
   seeded_ms       BIGINT UNSIGNED NOT NULL,
   caught_up_ms    BIGINT UNSIGNED NOT NULL,
+  handover_source VARCHAR(1024)   NULL,
+  handover_child  VARCHAR(1024)   NULL,
   PRIMARY KEY (object_id, share_key)
 ) ENGINE=InnoDB",
         q(schema),
@@ -209,6 +215,18 @@ pub fn read_sql(
     )
 }
 
+/// `ALTER TABLE` adding the handover columns to a state table made
+/// before RL71.
+#[must_use]
+pub fn state_upgrade_ddl(schema: &str) -> String {
+    format!(
+        "ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS handover_source VARCHAR(1024) NULL, \
+         ADD COLUMN IF NOT EXISTS handover_child VARCHAR(1024) NULL",
+        q(schema),
+        q(STATE_TABLE)
+    )
+}
+
 /// The state rows of `schema` (a missing table reads as none).
 ///
 /// # Errors
@@ -218,14 +236,24 @@ pub async fn load_states<Q: Queryable + Send>(
     tenant: TenantId,
     schema: &str,
 ) -> Result<Vec<(CopyKey, CopyInfo)>> {
-    let r: std::result::Result<Vec<Row>, _> = c
-        .query(format!(
+    let read = |handover: bool| {
+        format!(
             "SELECT object_id, share_key, CAST(state AS CHAR), object_version, share_version, \
-             caught_up_ms, seeded_ms FROM {}.{}",
+             caught_up_ms, seeded_ms, {} FROM {}.{}",
+            if handover {
+                "handover_source, handover_child"
+            } else {
+                "NULL, NULL"
+            },
             q(schema),
             q(STATE_TABLE)
-        ))
-        .await;
+        )
+    };
+    let mut r: std::result::Result<Vec<Row>, _> = c.query(read(true)).await;
+    if matches!(&r, Err(mysql_async::Error::Server(s)) if s.code == 1054) {
+        // A state table the worker hasn't upgraded yet (RL71).
+        r = c.query(read(false)).await;
+    }
     let rows = match r {
         Ok(r) => r,
         Err(mysql_async::Error::Server(s)) if s.code == 1146 => return Ok(Vec::new()),
@@ -233,8 +261,27 @@ pub async fn load_states<Q: Queryable + Send>(
     };
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
-        let (o, k, st, ov, sv, cu, sd): (u64, u64, String, u64, u64, u64, u64) =
+        type StateRow = (
+            u64,
+            u64,
+            String,
+            u64,
+            u64,
+            u64,
+            u64,
+            Option<String>,
+            Option<String>,
+        );
+        let (o, k, st, ov, sv, cu, sd, hs, hc): StateRow =
             mysql_async::from_row_opt(r).map_err(|_| SprigError::internal("bad copy state row"))?;
+        let serving = st == "serving";
+        // A copy that served before handovers were recorded is its
+        // subscribers' source already.
+        let handover = if serving && hs.is_none() && hc.is_none() {
+            Handover::Always
+        } else {
+            Handover::from_columns(hs.as_deref(), hc.as_deref())
+        };
         out.push((
             CopyKey {
                 tenant,
@@ -242,11 +289,12 @@ pub async fn load_states<Q: Queryable + Send>(
                 share: k,
             },
             CopyInfo {
-                serving: st == "serving",
+                serving,
                 object_version: ov,
                 share_version: sv,
                 caught_up_ms: cu,
                 seeded_ms: sd,
+                handover,
             },
         ));
     }
@@ -818,16 +866,18 @@ impl Maintainer {
                 Some(up) => {
                     sqls.push((
                         lineage[j].tenant,
-                        upstream::create_sql(&lineage, j, db, table, &up, false)?,
+                        upstream::statements(&lineage, j, db, table, &up, false)?,
                     ));
                 }
                 None => break,
             }
             j -= 1;
         }
-        for (tenant, sql) in sqls.into_iter().rev() {
+        for (tenant, list) in sqls.into_iter().rev() {
             let mut c = self.env.conn(tenant).await?;
-            c.query_drop(sql).await.map_err(exec_err)?;
+            for sql in list {
+                c.query_drop(sql).await.map_err(exec_err)?;
+            }
         }
         self.views.insert(k);
         Ok(())
@@ -836,6 +886,56 @@ impl Maintainer {
     /// The source rows of `e` for `keys` (all rows when `None`), as the
     /// child's columns.
     async fn source(&mut self, e: &CopyEdge, keys: Option<&[KeyLit]>) -> Result<Vec<Vec<Value>>> {
+        let sql = self.source_sql(e, keys).await?;
+        let mut c = self.env.conn(e.source_tenant).await?;
+        let rows: Vec<Row> = c.query(sql).await.map_err(exec_err)?;
+        Ok(rows.into_iter().map(Row::unwrap).collect())
+    }
+
+    /// Every source row of `e`, read in one consistent snapshot of the
+    /// source's cluster, and that snapshot's GTID position (empty when the
+    /// server can't tell: then change streams compare nothing against it).
+    async fn source_snapshot(&mut self, e: &CopyEdge) -> Result<(Vec<Vec<Value>>, String)> {
+        let sql = self.source_sql(e, None).await?;
+        let mut c = self.env.conn(e.source_tenant).await?;
+        c.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+            .await
+            .map_err(exec_err)?;
+        let read = async {
+            let status: Vec<(String, String)> = c
+                .query("SHOW SESSION STATUS LIKE 'binlog\\_snapshot\\_%'")
+                .await?;
+            let rows: Vec<Row> = c.query(sql).await?;
+            Ok::<_, mysql_async::Error>((status, rows))
+        }
+        .await;
+        let end = c
+            .query_drop(if read.is_ok() { "COMMIT" } else { "ROLLBACK" })
+            .await;
+        let (status, rows) = read.map_err(exec_err)?;
+        end.map_err(exec_err)?;
+        let get = |n: &str| {
+            status
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(n))
+                .map(|(_, v)| v.clone())
+        };
+        let at = match (get("Binlog_snapshot_file"), get("Binlog_snapshot_position")) {
+            (Some(f), Some(p)) if !f.is_empty() => {
+                let pos: Option<Option<String>> = c
+                    .exec_first("SELECT BINLOG_GTID_POS(?, ?)", (f, p))
+                    .await
+                    .map_err(exec_err)?;
+                pos.flatten().unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+        Ok((rows.into_iter().map(Row::unwrap).collect(), at))
+    }
+
+    /// The statement reading `e`'s source rows for `keys` (all when
+    /// `None`); the share views it reads exist afterwards.
+    async fn source_sql(&mut self, e: &CopyEdge, keys: Option<&[KeyLit]>) -> Result<String> {
         self.ensure_views(e.source_tenant, &e.db_name, &e.table)
             .await?;
         let sql = {
@@ -886,9 +986,7 @@ impl Maintainer {
                     .map_or_else(|| "TRUE".to_owned(), |f| format!("({f})"))
             )
         };
-        let mut c = self.env.conn(e.source_tenant).await?;
-        let rows: Vec<Row> = c.query(sql).await.map_err(exec_err)?;
-        Ok(rows.into_iter().map(Row::unwrap).collect())
+        Ok(sql)
     }
 
     fn key_of(e: &CopyEdge, row: &[Value]) -> KeyLit {
@@ -972,16 +1070,21 @@ impl Maintainer {
         Ok(())
     }
 
-    async fn set_state(&mut self, e: &CopyEdge, serving: bool) -> Result<()> {
+    /// Writes `e`'s state row in one statement: with `serving`, the flip
+    /// and its handover together (RL71).
+    async fn set_state(&mut self, e: &CopyEdge, serving: bool, handover: &Handover) -> Result<()> {
         let now = self.env.now_ms();
         let mut c = self.env.conn(e.key.tenant).await?;
+        let (hs, hc) = handover.columns_sql();
         c.query_drop(format!(
             "INSERT INTO {}.{} (object_id, share_key, source_tenant, state, object_version, \
-             share_version, epoch, seeded_ms, caught_up_ms) VALUES ({}, {}, {}, '{}', {}, {}, {}, \
-             {now}, {now}) ON DUPLICATE KEY UPDATE source_tenant = VALUES(source_tenant), \
-             state = VALUES(state), object_version = VALUES(object_version), \
-             share_version = VALUES(share_version), epoch = VALUES(epoch), \
-             seeded_ms = VALUES(seeded_ms), caught_up_ms = VALUES(caught_up_ms)",
+             share_version, epoch, seeded_ms, caught_up_ms, handover_source, handover_child) \
+             VALUES ({}, {}, {}, '{}', {}, {}, {}, {now}, {now}, {hs}, {hc}) ON DUPLICATE KEY \
+             UPDATE source_tenant = VALUES(source_tenant), state = VALUES(state), \
+             object_version = VALUES(object_version), share_version = VALUES(share_version), \
+             epoch = VALUES(epoch), seeded_ms = VALUES(seeded_ms), \
+             caught_up_ms = VALUES(caught_up_ms), handover_source = VALUES(handover_source), \
+             handover_child = VALUES(handover_child)",
             q(&e.child_schema),
             q(STATE_TABLE),
             e.key.object.0,
@@ -1002,6 +1105,7 @@ impl Maintainer {
                 share_version: e.share_version,
                 caught_up_ms: now,
                 seeded_ms: now,
+                handover: handover.clone(),
             },
         );
         Ok(())
@@ -1017,6 +1121,27 @@ impl Maintainer {
         c.query_drop(state_ddl(&e.child_schema))
             .await
             .map_err(exec_err)?;
+        let upgraded: Option<u64> = c
+            .exec_first(
+                "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND \
+                 TABLE_NAME = ? AND COLUMN_NAME = 'handover_child'",
+                (e.child_schema.as_str(), STATE_TABLE),
+            )
+            .await
+            .map_err(exec_err)?;
+        if upgraded == Some(0) {
+            c.query_drop(state_upgrade_ddl(&e.child_schema))
+                .await
+                .map_err(exec_err)?;
+        }
+        // A reseed keeps the copy as its subscribers' source; a first seed
+        // (or one into a table made again) hands over when it ends.
+        let mut prior = self
+            .copies
+            .0
+            .get(&e.key)
+            .map(|i| i.handover.clone())
+            .unwrap_or_default();
         let cols: Vec<(String, String, Option<String>)> = c
             .exec(
                 "SELECT COLUMN_NAME, COLUMN_TYPE, COLLATION_NAME FROM information_schema.COLUMNS \
@@ -1063,13 +1188,14 @@ impl Maintainer {
             self.copies.0.retain(|k, _| {
                 !(k.tenant == e.key.tenant && k.object == e.key.object && k.share != e.key.share)
             });
+            prior = Handover::Pending;
         }
         c.query_drop(copy_ddl(&e.child_schema, e.key.object, &e.child_key, &cols))
             .await
             .map_err(exec_err)?;
         drop(c);
-        self.set_state(e, false).await?;
-        let rows = self.source(e, None).await?;
+        self.set_state(e, false, &prior).await?;
+        let (rows, at) = self.source_snapshot(e).await?;
         let present: BTreeSet<KeyLit> = rows.iter().map(|r| Self::key_of(e, r)).collect();
         let mut c = self.env.conn(e.key.tenant).await?;
         let held: Vec<Row> = c
@@ -1094,7 +1220,20 @@ impl Maintainer {
             .collect();
         self.counts.seed_rows += rows.len() as u64;
         self.write(e, &rows, &gone).await?;
-        self.set_state(e, true).await?;
+        let handover = if prior.handed_over() {
+            prior
+        } else {
+            let mut c = self.env.conn(e.key.tenant).await?;
+            let child: Option<String> = c
+                .query_first("SELECT @@gtid_binlog_pos")
+                .await
+                .map_err(exec_err)?;
+            Handover::At {
+                source: at,
+                child: child.unwrap_or_default(),
+            }
+        };
+        self.set_state(e, true, &handover).await?;
         self.counts.seeds += 1;
         metrics::counter!("sprig_inherit_copy_seeds_total").increment(1);
         tracing::info!(tenant = %e.key.tenant, object = %e.key.object, share = e.key.share, rows = rows.len(), "copy seeded");
@@ -1984,6 +2123,7 @@ mod tests {
                 share_version: 1,
                 caught_up_ms: 0,
                 seeded_ms: 0,
+                handover: Handover::Pending,
             },
         );
         assert!(s.ready(k, 3, 1).is_some());

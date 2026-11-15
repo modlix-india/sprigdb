@@ -77,6 +77,16 @@ pub trait Publish: Send + Sync + std::fmt::Debug {
     /// # Errors
     /// The catalog's.
     async fn catalog_changed(&self, tenant: TenantId) -> Result<()>;
+
+    /// [`Publish::catalog_changed`], with the new catalog version when the
+    /// implementation knows it (lookup jobs wait for gateways to
+    /// acknowledge it).
+    ///
+    /// # Errors
+    /// The catalog's.
+    async fn catalog_changed_to(&self, tenant: TenantId) -> Result<Option<u64>> {
+        self.catalog_changed(tenant).await.map(|()| None)
+    }
 }
 
 /// How long the regroup's hold waits after publishing, so gateways load

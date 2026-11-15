@@ -91,7 +91,17 @@ pub(crate) struct CopyRow {
 }
 
 /// A `lookup_indexes` row as read.
-type LookupTuple = (u64, u64, String, Option<String>, bool, String, u32, String);
+type LookupTuple = (
+    u64,
+    u64,
+    String,
+    Option<String>,
+    bool,
+    String,
+    u32,
+    String,
+    String,
+);
 
 /// One `lookup_indexes` row.
 #[derive(Debug, Clone)]
@@ -104,6 +114,8 @@ pub(crate) struct LookupRow {
     pub origin: sprig_shard::lookup::LookupOrigin,
     pub group: u32,
     pub state: sprig_shard::lookup::LookupState,
+    /// `physical_name`: the lookup table in the lookup group's schemas.
+    pub physical: String,
 }
 
 fn lookup_state(s: &str) -> Option<sprig_shard::lookup::LookupState> {
@@ -258,7 +270,7 @@ impl CatalogExtension for ShardingExtension {
         let lookups: Vec<LookupTuple> = if has_lookups.unwrap_or(0) > 0 {
             conn.query(format!(
                 "SELECT lookup_id, object_id, index_name, CAST(columns AS CHAR), is_unique, \
-                        origin, group_id, state \
+                        origin, group_id, state, physical_name \
                  FROM `{schema}`.lookup_indexes ORDER BY lookup_id"
             ))
             .await
@@ -314,7 +326,7 @@ impl CatalogExtension for ShardingExtension {
                 routing,
             });
         }
-        for (id, object, index_name, cols, unique, origin, group, st) in lookups {
+        for (id, object, index_name, cols, unique, origin, group, st, physical) in lookups {
             let (Some(origin), Some(lstate)) = (lookup_origin(&origin), lookup_state(&st)) else {
                 continue;
             };
@@ -329,6 +341,7 @@ impl CatalogExtension for ShardingExtension {
                 origin,
                 group,
                 state: lstate,
+                physical,
             });
         }
         for (object, cluster, role, st) in copies {

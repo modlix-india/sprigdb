@@ -49,8 +49,8 @@ use sprig_router::graph_route::{
 };
 
 use crate::store::{
-    EdgeKey, EdgeRow, FarLink, FarRead, GraphStore, IdKind, IndexDef, Link, NodeRow, Reach, Scan,
-    SchemaCounts, StoreStats, rk_of,
+    DeepLinks, EdgeKey, EdgeRow, FarLink, FarRead, GraphStore, IdKind, IndexDef, Link, NodeRow,
+    Reach, Scan, ScanLinks, SchemaCounts, StoreStats, rk_of,
 };
 
 /// Labels and relationship types of a graph, and how new ones are made.
@@ -327,6 +327,20 @@ pub trait ShardConns: Send {
     async fn end_batch(&mut self, _ok: bool) -> Result<()> {
         Err(crate::store::not_implicit())
     }
+
+    /// Another connection to `at`'s cluster whose statements may run at
+    /// the same time as [`Self::conn`]'s: auto-commit reads, where every
+    /// statement sees the latest commits on any connection. `None`: the
+    /// statement's reads run one after another on [`Self::conn`].
+    ///
+    /// # Errors
+    /// The backend's.
+    async fn spare(&mut self, _at: &ShardLoc) -> Result<Option<Conn>> {
+        Ok(None)
+    }
+
+    /// Takes back a connection [`Self::spare`] gave, for the next.
+    fn put_back(&mut self, _at: &ShardLoc, _conn: Conn) {}
 }
 
 /// `sql` with each `?` placeholder outside quotes replaced by its value
@@ -370,6 +384,41 @@ pub fn inline_params(sql: &str, params: &Params) -> String {
     out
 }
 
+/// Whether a capped joined start read brings its links unjoined too
+/// ([`GraphStore::scan_links`]). Off: the extra statement cost the reads
+/// that stay under the cap more than it saved the others (A/B on the
+/// laptop: IS2 unchanged, IS3 1.2× slower at SF0.1 and SF0.3).
+const UNJOINED_BACKUP: bool = false;
+
+/// Reads over at least this many ids run their shards' statements at the
+/// same time when [`ShardConns::spare`] gives connections.
+const PAR_MIN_IDS: usize = 48;
+
+/// Every future of `fs` to its end, polled together; their outputs in
+/// order.
+async fn join_all<F: std::future::Future>(fs: Vec<F>) -> Vec<F::Output> {
+    let mut fs: Vec<std::pin::Pin<Box<F>>> = fs.into_iter().map(Box::pin).collect();
+    let mut out: Vec<Option<F::Output>> = fs.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for (f, o) in fs.iter_mut().zip(out.iter_mut()) {
+            if o.is_none() {
+                match f.as_mut().poll(cx) {
+                    std::task::Poll::Ready(v) => *o = Some(v),
+                    std::task::Poll::Pending => pending = true,
+                }
+            }
+        }
+        if pending {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    })
+    .await;
+    out.into_iter().flatten().collect()
+}
+
 /// One connection for every shard (tests; every shard on one server).
 #[derive(Debug)]
 pub struct OneConn<'c>(pub &'c mut Conn);
@@ -398,6 +447,14 @@ pub struct MariaStore<'c> {
     gate: Option<Arc<dyn MirrorGate>>,
     /// The gate's answer, asked once per statement.
     mirror_ok: Option<bool>,
+    /// The gate's answer being asked ([`GraphStore::warm_mirrors`]).
+    mirror_ask: Option<tokio::task::JoinHandle<bool>>,
+    /// Node reads to send with the next read statement
+    /// ([`GraphStore::queue_nodes`]): the route, its ids and keys.
+    pending: Option<(Route, Vec<u64>, Vec<String>)>,
+    /// What a queued read found: by id (`None`: no such node), and its keys.
+    prefetched: HashMap<u64, Option<NodeRow>>,
+    prefetched_keys: Vec<String>,
     /// The group the router plans every read step over.
     group: Arc<sprig_router::topology::Group>,
     /// Who waits for a mover's hold a route meets (auto-commit reads);
@@ -531,6 +588,10 @@ impl<'c> MariaStore<'c> {
             schema: None,
             gate: None,
             mirror_ok: None,
+            mirror_ask: None,
+            pending: None,
+            prefetched: HashMap::new(),
+            prefetched_keys: Vec::new(),
             group: layout.group(),
             holds: None,
             routes: BTreeMap::new(),
@@ -555,6 +616,11 @@ impl<'c> MariaStore<'c> {
         targets: Targets,
         write: bool,
     ) -> Result<Vec<(usize, Vec<Row>)>> {
+        let ids = match &targets {
+            Targets::ByKey(v) | Targets::All(v) => v.len(),
+            Targets::ByHash(v) => v.len(),
+            Targets::Shard(_) => 0,
+        };
         let r = plan_route(&RouteSpec {
             group: Arc::clone(&self.group),
             graph: self.layout.graph,
@@ -595,26 +661,121 @@ impl<'c> MariaStore<'c> {
                 None => runs.push(vec![k]),
             }
         }
-        let mut out = Vec::with_capacity(runs.len());
-        for run in runs {
-            let i = idx[run[0]];
-            let sql = if run.len() == 1 {
-                ts[run[0]].sql.clone()
-            } else {
-                let mut s = String::new();
-                for (n, k) in run.iter().enumerate() {
-                    if n > 0 {
-                        s.push_str(" UNION ALL ");
-                    }
+        let union = |run: &[usize]| {
+            if run.len() == 1 {
+                return ts[run[0]].sql.clone();
+            }
+            let mut s = String::new();
+            for (n, k) in run.iter().enumerate() {
+                if n > 0 {
+                    s.push_str(" UNION ALL ");
+                }
+                // A statement that is a `UNION` of parenthesized SELECTs
+                // (a top-k hop's) joins as it is: nested in parentheses,
+                // MariaDB would read it as a derived table.
+                if ts[*k].sql.starts_with('(') {
+                    s.push_str(&ts[*k].sql);
+                } else {
                     s.push('(');
                     s.push_str(&ts[*k].sql);
                     s.push(')');
                 }
-                s
-            };
-            self.stats.shard_queries += 1;
+            }
+            s
+        };
+        let mut out = Vec::with_capacity(runs.len());
+        for run in runs {
+            let i = idx[run[0]];
             let at = self.layout.shards[i].clone();
+            // A read over many ids: its shards' statements run at the same
+            // time on spare connections when the connections allow it
+            // (auto-commit reads), not one after another in a `UNION ALL`.
+            if !write && run.len() > 1 && ids >= PAR_MIN_IDS && !ts[run[0]].sql.starts_with("SET ")
+            {
+                let mut spares = Vec::new();
+                while spares.len() + 1 < run.len() {
+                    match self.conns.spare(&at).await? {
+                        Some(c) => spares.push(c),
+                        None => break,
+                    }
+                }
+                if !spares.is_empty() {
+                    // Contiguous groups, so the rows keep shard order.
+                    let n = spares.len() + 1;
+                    let per = run.len().div_ceil(n);
+                    let sqls: Vec<String> = run.chunks(per).map(union).collect();
+                    self.stats.shard_queries += sqls.len() as u64;
+                    let t0 = std::time::Instant::now();
+                    let main = self.conns.conn(&at, write).await?;
+                    let mut conns: Vec<&mut Conn> = vec![main];
+                    conns.extend(spares.iter_mut());
+                    let futs: Vec<_> = conns
+                        .into_iter()
+                        .zip(sqls)
+                        .map(|(c, s)| c.query::<Row, _>(s))
+                        .collect();
+                    let results = join_all(futs).await;
+                    self.stats.sql_us +=
+                        u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
+                    let mut failed = None;
+                    for rows in results {
+                        match rows {
+                            Ok(rows) => {
+                                self.stats.sql_rows += rows.len() as u64;
+                                out.push((i, rows));
+                            }
+                            Err(e) => failed = failed.or(Some(e)),
+                        }
+                    }
+                    if let Some(e) = failed {
+                        return Err(backend_error(e));
+                    }
+                    for c in spares {
+                        self.conns.put_back(&at, c);
+                    }
+                    continue;
+                }
+            }
+            let mut sql = union(&run);
+            // A queued node read on this cluster goes first, in the same
+            // round trip.
+            let ahead = match &self.pending {
+                Some((r, _, _))
+                    if !write
+                        && !sql.starts_with("SET ")
+                        && r.targets().iter().all(|t| t.cluster == at.cluster) =>
+                {
+                    self.pending.take()
+                }
+                _ => None,
+            };
+            if let Some((r, _, _)) = &ahead {
+                let parts: Vec<String> =
+                    r.targets().iter().map(|t| format!("({})", t.sql)).collect();
+                sql = format!("{}; {sql}", parts.join(" UNION ALL "));
+            }
+            self.stats.shard_queries += 1;
             let conn = self.conns.conn(&at, write).await?;
+            if let Some((_, ids, keys)) = ahead {
+                let t0 = std::time::Instant::now();
+                let mut res = conn.query_iter(sql).await.map_err(backend_error)?;
+                let first: Vec<Row> = res.collect().await.map_err(backend_error)?;
+                let rows: Vec<Row> = res.collect().await.map_err(backend_error)?;
+                drop(res);
+                self.stats.sql_us += u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
+                self.stats.sql_rows += (first.len() + rows.len()) as u64;
+                for id in ids {
+                    self.prefetched.insert(id, None);
+                }
+                for mut n in nodes_of(vec![(i, first)]) {
+                    n.props = drop_nulls(n.props);
+                    n.types = n.types.map(drop_nulls);
+                    self.prefetched.insert(n.id, Some(n));
+                }
+                self.prefetched_keys = keys;
+                out.push((i, rows));
+                continue;
+            }
             let t0 = std::time::Instant::now();
             // Text protocol: each statement's text is new (its ids are
             // written in), so a prepared statement would cost a second
@@ -658,10 +819,19 @@ impl<'c> MariaStore<'c> {
                     })?;
                 // The tag goes in as the first column (a derived table
                 // would refuse the statements' repeated column names).
-                let Some(rest) = t.sql.strip_prefix("SELECT ") else {
+                // A top-k hop's statement is a `UNION ALL` of two
+                // parenthesized SELECTs (no subqueries): each gets the tag.
+                let sql = if let Some(rest) = t.sql.strip_prefix("SELECT ") {
+                    format!("(SELECT {k} AS q, {rest})")
+                } else if t.sql.starts_with("(SELECT ") {
+                    // Unwrapped: MariaDB reads a parenthesized `UNION` inside
+                    // another as a derived table (which refuses repeated
+                    // column names).
+                    t.sql.replace("(SELECT ", &format!("(SELECT {k} AS q, "))
+                } else {
                     return Err(SprigError::internal("a tagged route that isn't a SELECT"));
                 };
-                parts.push((t.cluster.clone(), i, format!("(SELECT {k} AS q, {rest})")));
+                parts.push((t.cluster.clone(), i, sql));
             }
         }
         let mut clusters: Vec<String> = Vec::new();
@@ -727,9 +897,10 @@ impl<'c> MariaStore<'c> {
         if let Some(ok) = self.mirror_ok {
             return ok;
         }
-        let ok = match &self.gate {
-            Some(g) => g.fresh(&self.layout).await,
-            None => false,
+        let ok = match (self.mirror_ask.take(), &self.gate) {
+            (Some(h), _) => h.await.unwrap_or(false),
+            (None, Some(g)) => g.fresh(&self.layout).await,
+            (None, None) => false,
         };
         if !ok {
             let reason = if self.gate.is_some() { "lag" } else { "write" };
@@ -1163,6 +1334,90 @@ impl<'c> MariaStore<'c> {
         Ok(v)
     }
 
+    /// [`GraphStore::links_deep`] over the router's deep links.
+    async fn deep_links(
+        &mut self,
+        from: &[u64],
+        types: &[u32],
+        keys: Option<&[String]>,
+    ) -> Result<crate::store::DeepLinks> {
+        let mut out = crate::store::DeepLinks::default();
+        if from.is_empty() {
+            return Ok(out);
+        }
+        let op = HopOp::Links {
+            out: true,
+            mirror: false,
+            types: types.to_vec(),
+            far: Some(FarNodes {
+                keys: Some(keys.map_or_else(Vec::new, <[String]>::to_vec)),
+                filter: Vec::new(),
+                only: Vec::new(),
+                join: keys.is_some(),
+                rel_keys: None,
+                rel_filter: Vec::new(),
+                top: None,
+                limit: None,
+                deep: true,
+                near_scan: None,
+                after: None,
+                ordered: false,
+            }),
+        };
+        // Seen links per level: one link can be both (a walk whose
+        // frontier holds a node and its far node).
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut seen2: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut seen_nodes: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for (_, rows) in self.route(op, Targets::ByKey(from.to_vec()), false).await? {
+            for mut r in rows {
+                let link = |r: &mut Row, at: usize| -> Option<Link> {
+                    let id = r.take::<Option<u64>, _>(at + 4).flatten()?;
+                    Some(Link {
+                        src: u64_col(r.take(at)),
+                        dst: u64_col(r.take(at + 1)),
+                        src_rk: u64_col(r.take(at + 2)),
+                        dst_rk: u64_col(r.take(at + 3)),
+                        id,
+                        rtype: u32::try_from(u64_col(r.take(at + 5))).unwrap_or(0),
+                    })
+                };
+                let Some(l) = link(&mut r, 0) else { continue };
+                // With far nodes: link, far node, next link, known, far.
+                let joined = keys.is_some();
+                let far1 = if joined { node_at(&mut r, 6) } else { None };
+                let at = if joined { 11 } else { 6 };
+                let next = link(&mut r, at);
+                let known = u64_col(r.take(at + 6)) == 1;
+                let far2 = if joined {
+                    node_at(&mut r, at + 7)
+                } else {
+                    None
+                };
+                for n in [far1, far2].into_iter().flatten() {
+                    if seen_nodes.insert(n.id) {
+                        let mut n = n;
+                        n.props = drop_nulls(n.props);
+                        n.types = n.types.map(drop_nulls);
+                        out.nodes.push(n);
+                    }
+                }
+                if known {
+                    out.complete.insert(l.dst);
+                }
+                if seen.insert(l.id) {
+                    out.first.push(l);
+                }
+                if let Some(n) = next
+                    && seen2.insert(n.id)
+                {
+                    out.second.push(n);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Mirror rows of edges into `dsts` (on the destinations' shards):
     /// `(source hash, edge id)`.
     async fn mirrors_into(&mut self, dsts: &[u64], types: &[u32]) -> Result<Vec<(u64, u64)>> {
@@ -1380,6 +1635,12 @@ impl GraphStore for MariaStore<'_> {
             filter: num(far.filter),
             only: far.only.to_vec(),
             join: far.join,
+            top: far.top.map(|(k, asc, n)| (k.to_owned(), asc, n)),
+            limit: far.limit,
+            deep: false,
+            near_scan: None,
+            after: far.after,
+            ordered: far.ordered,
         };
         let mirror = self.read_mirrors().await;
         let inn = if mirror {
@@ -1506,6 +1767,12 @@ impl GraphStore for MariaStore<'_> {
                 .collect(),
             only: far.only.to_vec(),
             join: far.join,
+            top: far.top.map(|(k, asc, n)| (k.to_owned(), asc, n)),
+            limit: far.limit,
+            deep: false,
+            near_scan: None,
+            after: far.after,
+            ordered: far.ordered,
         };
         let rows = self.links_with(from, types, dir, Some(far)).await?;
         Ok(rows
@@ -1528,6 +1795,319 @@ impl GraphStore for MariaStore<'_> {
         true
     }
 
+    async fn links_deep(
+        &mut self,
+        from: &[u64],
+        types: &[u32],
+        keys: Option<&[String]>,
+    ) -> Result<DeepLinks> {
+        self.deep_links(from, types, keys).await
+    }
+
+    async fn scan_links(
+        &mut self,
+        s: &Scan,
+        types: &[u32],
+        dir: Dir,
+        far: &FarRead<'_>,
+    ) -> Result<Option<ScanLinks>> {
+        // Not paged scans (a budget's limit is fine: the scan keeps it, the
+        // links' subquery can't have one and the caller caps the links).
+        if s.ids.is_some() || s.after.is_some() {
+            return Ok(None);
+        }
+        // Links on the scanned nodes' own shards only: incoming ones
+        // through the mirrors once their gate says they are fresh. (Read
+        // alongside the gate, a statement could see the mirrors before
+        // the applier reached the gate's target: the official validation
+        // caught IS2 missing messages written just before.)
+        // Or, when an earlier gate's positions are at hand, the cluster's
+        // binlog position is read first in the same round trip, and the
+        // mirrors are used if those positions already reach it (they only
+        // grow, so the links read after it see every earlier commit).
+        let optimistic = dir != Dir::Out
+            && self.mirror_ok.is_none()
+            && self.many()
+            && self.layout.mirrors
+            && !self.layout.mirror_building
+            && self.layout.mirror_async
+            && self
+                .gate
+                .as_ref()
+                .and_then(|g| g.last_fresh(self.layout.graph))
+                .is_some();
+        if dir != Dir::Out && !optimistic && !self.read_mirrors().await {
+            return Ok(None);
+        }
+        let num = |f: &[(String, CmpOp, f64)]| -> Vec<(String, CmpOp, String)> {
+            f.iter()
+                .filter(|(_, _, x)| x.is_finite())
+                .map(|(k, op, x)| (k.clone(), *op, format!("{x:?}")))
+                .collect()
+        };
+        let mut near = self.scan_op(s);
+        near.keys = Some(Vec::new());
+        near.limit = None;
+        let spec = FarNodes {
+            rel_keys: far.rel_keys.map(<[String]>::to_vec),
+            rel_filter: num(far.rel_filter),
+            keys: far.keys.map(<[String]>::to_vec),
+            filter: num(far.filter),
+            only: far.only.to_vec(),
+            join: far.join,
+            top: None,
+            limit: far.limit,
+            deep: false,
+            near_scan: Some(Box::new(near)),
+            after: None,
+            ordered: far.ordered,
+        };
+        // A capped joined read may bring the unjoined links too, in the
+        // same round trip, so the hop needn't read them again past the cap.
+        let backup = UNJOINED_BACKUP && far.join && far.limit.is_some();
+        let unjoined = FarNodes {
+            keys: Some(Vec::new()),
+            filter: Vec::new(),
+            join: false,
+            limit: Some(crate::store::FUSED_PLAIN_MAX),
+            ordered: false,
+            ..spec.clone()
+        };
+        let link = |out: bool, f: &FarNodes| HopOp::Links {
+            out,
+            mirror: !out,
+            types: types.to_vec(),
+            far: Some(f.clone()),
+        };
+        let mut ops = Vec::new();
+        let mut unjoined_ops = Vec::new();
+        if dir != Dir::In {
+            ops.push(link(true, &spec));
+            unjoined_ops.push(link(true, &unjoined));
+        }
+        if dir != Dir::Out {
+            ops.push(link(false, &spec));
+            unjoined_ops.push(link(false, &unjoined));
+        }
+        if !backup {
+            unjoined_ops.clear();
+        }
+        let scan = plan_route(&RouteSpec {
+            group: Arc::clone(&self.group),
+            graph: self.layout.graph,
+            op: HopOp::Scan(self.scan_op(s)),
+            targets: Targets::All(Vec::new()),
+        });
+        let routes_of = |ops: Vec<HopOp>| -> Vec<Route> {
+            ops.into_iter()
+                .map(|op| {
+                    plan_route(&RouteSpec {
+                        group: Arc::clone(&self.group),
+                        graph: self.layout.graph,
+                        op,
+                        targets: Targets::All(Vec::new()),
+                    })
+                })
+                .collect()
+        };
+        let hops: Vec<Route> = routes_of(ops);
+        let backup_hops: Vec<Route> = routes_of(unjoined_ops);
+        // One cluster, no holds: one multi-statement round trip.
+        let all: Vec<&sprig_router::plan::Target> = scan
+            .targets()
+            .iter()
+            .chain(hops.iter().flat_map(Route::targets))
+            .chain(backup_hops.iter().flat_map(Route::targets))
+            .collect();
+        let Some(first) = all.first() else {
+            return Ok(Some((Vec::new(), Some(Vec::new()), None)));
+        };
+        if all.iter().any(|t| t.cluster != first.cluster)
+            || scan.held_until_ms.is_some()
+            || hops
+                .iter()
+                .chain(&backup_hops)
+                .any(|h| h.held_until_ms.is_some())
+        {
+            return Ok(None);
+        }
+        let Some(i) = self
+            .layout
+            .shards
+            .iter()
+            .position(|sh| sh.shard == first.shard && sh.schema == first.at.schema)
+        else {
+            return Ok(None);
+        };
+        let union = |parts: &mut dyn Iterator<Item = String>| -> String {
+            parts.collect::<Vec<_>>().join(" UNION ALL ")
+        };
+        let wrap = |sql: &str| {
+            if sql.starts_with('(') {
+                sql.to_owned()
+            } else {
+                format!("({sql})")
+            }
+        };
+        let scan_sql = union(&mut scan.targets().iter().map(|t| wrap(&t.sql)));
+        // The links, each tagged with its direction (0 outgoing).
+        let tagged = |hops: &[Route]| -> Vec<String> {
+            let mut parts: Vec<String> = Vec::new();
+            for (k, h) in hops.iter().enumerate() {
+                let q = if dir == Dir::In { 1 } else { k };
+                for t in h.targets() {
+                    if let Some(rest) = t.sql.strip_prefix("SELECT ") {
+                        parts.push(format!("(SELECT {q} AS q, {rest})"));
+                    } else {
+                        parts.push(t.sql.replace("(SELECT ", &format!("(SELECT {q} AS q, ")));
+                    }
+                }
+            }
+            parts
+        };
+        let parts = tagged(&hops);
+        let plain_parts = tagged(&backup_hops);
+        self.note(&scan);
+        for h in &hops {
+            self.note(h);
+        }
+        if parts.is_empty() {
+            return Ok(None);
+        }
+        let mut sql = format!("{scan_sql}; {}", parts.join(" UNION ALL "));
+        if !plain_parts.is_empty() {
+            sql = format!("{sql}; {}", plain_parts.join(" UNION ALL "));
+        }
+        if optimistic {
+            sql = format!("SELECT @@gtid_binlog_pos; {sql}");
+        }
+        self.stats.shard_queries += 1;
+        let at = self.layout.shards[i].clone();
+        let conn = self.conns.conn(&at, false).await?;
+        let t0 = std::time::Instant::now();
+        let mut res = conn.query_iter(sql).await.map_err(backend_error)?;
+        let binlog: Option<String> = if optimistic {
+            let b: Vec<Option<String>> = res.collect().await.map_err(backend_error)?;
+            b.into_iter().next().flatten()
+        } else {
+            None
+        };
+        let found: Vec<Row> = res.collect().await.map_err(backend_error)?;
+        let links: Vec<Row> = res.collect().await.map_err(backend_error)?;
+        let plain_links: Option<Vec<Row>> = if plain_parts.is_empty() {
+            None
+        } else {
+            Some(res.collect().await.map_err(backend_error)?)
+        };
+        drop(res);
+        // The optimistic read stands if the last fresh positions reach the
+        // binlog position read before it (and the session's targets);
+        // else the links go, and the hop reads them after the gate.
+        let stale = optimistic && {
+            let gate = self.gate.as_ref();
+            let rows = gate.and_then(|g| g.last_fresh(self.layout.graph));
+            let mut targets = gate.map(|g| g.targets()).unwrap_or_default();
+            let t = targets.entry(at.cluster.clone()).or_default();
+            if !t.is_empty() {
+                t.push(',');
+            }
+            t.push_str(binlog.as_deref().unwrap_or_default());
+            let ok = binlog.is_some()
+                && rows.is_some_and(|r| crate::mirror::fresh(&r, &self.layout, &targets));
+            if ok {
+                self.mirror_ok = Some(true);
+            }
+            !ok
+        };
+        self.stats.sql_us += u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.stats.sql_rows += (found.len() + links.len()) as u64;
+        let mut nodes = merge_nodes(nodes_of(vec![(i, found)]), s.limit);
+        if s.keys.is_some() {
+            for n in &mut nodes {
+                n.props = drop_nulls(std::mem::take(&mut n.props));
+                n.types = n.types.take().map(drop_nulls);
+            }
+        }
+        let with_rel = far.rel_keys.is_some();
+        let decode = |rows: Vec<Row>, join: bool| -> Vec<(FarLink, bool)> {
+            rows.into_iter()
+                .map(|mut r| {
+                    let q = u64_col(r.take(0));
+                    let l = Link {
+                        src: u64_col(r.take(1)),
+                        dst: u64_col(r.take(2)),
+                        src_rk: u64_col(r.take(3)),
+                        dst_rk: u64_col(r.take(4)),
+                        id: u64_col(r.take(5)),
+                        rtype: u32::try_from(u64_col(r.take(6))).unwrap_or(0),
+                    };
+                    let n = if join {
+                        node_at(&mut r, 7).map(|mut n| {
+                            n.props = drop_nulls(n.props);
+                            n.types = n.types.map(drop_nulls);
+                            n
+                        })
+                    } else {
+                        None
+                    };
+                    let at = if join { 12 } else { 7 };
+                    let rel = if with_rel {
+                        json_col(r.take(at))
+                            .map(|p| (drop_nulls(p), json_col(r.take(at + 1)).map(drop_nulls)))
+                    } else {
+                        None
+                    };
+                    ((l, n, rel), q == 0)
+                })
+                .collect()
+        };
+        let links = decode(links, far.join);
+        let plain_links = plain_links.map(|p| decode(p, false));
+        if stale {
+            return Ok(Some((nodes, None, None)));
+        }
+        Ok(Some((nodes, Some(links), plain_links)))
+    }
+
+    fn queue_nodes(&mut self, ids: &[u64], keys: &[String]) {
+        if ids.is_empty() || keys.is_empty() {
+            return;
+        }
+        let r = plan_route(&RouteSpec {
+            group: Arc::clone(&self.group),
+            graph: self.layout.graph,
+            op: HopOp::NodesPart {
+                keys: keys.to_vec(),
+                filter: Vec::new(),
+            },
+            targets: Targets::ByKey(ids.to_vec()),
+        });
+        if r.held_until_ms.is_none() && !r.targets().is_empty() {
+            self.note(&r);
+            self.pending = Some((r, ids.to_vec(), keys.to_vec()));
+        }
+    }
+
+    fn warm_mirrors(&mut self) {
+        // The gate's round trips run while the statement's first reads
+        // do (its target, taken now, still covers every commit before the
+        // statement).
+        if self.mirror_ok.is_some()
+            || self.mirror_ask.is_some()
+            || !self.many()
+            || !self.layout.mirrors
+            || self.layout.mirror_building
+            || !self.layout.mirror_async
+            || tokio::runtime::Handle::try_current().is_err()
+        {
+            return;
+        }
+        if let Some(g) = &self.gate {
+            let (g, layout) = (Arc::clone(g), Arc::clone(&self.layout));
+            self.mirror_ask = Some(tokio::spawn(async move { g.fresh(&layout).await }));
+        }
+    }
+
     async fn nodes_part(&mut self, ids: &[u64], keys: Option<&[String]>) -> Result<Vec<NodeRow>> {
         self.nodes_where(ids, keys, &[]).await
     }
@@ -1543,6 +2123,22 @@ impl GraphStore for MariaStore<'_> {
         };
         if ids.is_empty() {
             return Ok(Vec::new());
+        }
+        // What a queued read already brought (its keys cover these).
+        if filter.is_empty()
+            && keys.iter().all(|k| self.prefetched_keys.contains(k))
+            && ids.iter().all(|i| self.prefetched.contains_key(i))
+        {
+            return Ok(ids
+                .iter()
+                .filter_map(|i| self.prefetched.get(i).cloned().flatten())
+                .map(|mut n| {
+                    if let Json::Object(m) = &mut n.props {
+                        m.retain(|k, _| keys.contains(k));
+                    }
+                    n
+                })
+                .collect());
         }
         let op = HopOp::NodesPart {
             keys: keys.to_vec(),

@@ -165,12 +165,12 @@ pub struct TableEntry {
     pub kind: TableKind,
     /// Its group (for reference tables, a group of the shards' clusters).
     pub group: Arc<Group>,
-    /// Its unique lookup indexes the router maintains and
-    /// routes through: one value column each.
+    /// Its lookup indexes the router maintains and routes through, of one
+    /// value column or several.
     pub lookups: Vec<Arc<LookupRef>>,
-    /// A maintained lookup index the router can't follow (several value
-    /// columns, an unknown column type): writes are refused (39420
-    /// `lookup`) rather than left unmaintained.
+    /// A maintained lookup index the router can't follow (an unknown
+    /// column type, a table without a known primary key): writes are
+    /// refused (39420 `lookup`) rather than left unmaintained.
     pub lookup_gap: bool,
     /// The visible columns in order, lowercase, from the stored definition
     /// (empty when unknown): an `INSERT` without a column list gets one,
@@ -236,23 +236,28 @@ pub struct ParentLink {
     pub parent_unique: bool,
 }
 
-/// A unique lookup index of a sharded table, as the router
+/// A lookup index of a sharded table, as the router
 /// uses it: writes claim and release its values in the write's
 /// transaction (`sprig_txn::lookup::DistTxn`), and reads, updates and
-/// deletes with an equality on its column go to the shards its rows
-/// name.
+/// deletes with an equality on every one of its columns go to the shards
+/// its rows name. A lookup of several columns (a unique key of several
+/// columns without the distribution key) takes one value per column.
 #[derive(Debug, Clone)]
 pub struct LookupRef {
     /// The index (columns, owner primary key, lookup group, state).
     pub index: sprig_shard::lookup::LookupIndex,
-    /// Its value column, lowercase.
+    /// Its first value column, lowercase (`columns[0]`).
     pub column: String,
-    /// How a literal of the column converts.
+    /// How a literal of the first column converts (`classes[0]`).
     pub class: KeyClass,
+    /// Its value columns, lowercase, in key order.
+    pub columns: Vec<String>,
+    /// How a literal of each value column converts.
+    pub classes: Vec<KeyClass>,
     /// The owner's primary-key columns, lowercase, in key order.
     pub pk: Vec<String>,
-    /// The value column's and the primary-key columns' positions among
-    /// the visible columns (`INSERT` without a column list).
+    /// The value columns' and then the primary-key columns' positions
+    /// among the visible columns (`INSERT` without a column list).
     pub ordinals: Vec<Option<usize>>,
     /// Where lookup rows and owner rows live.
     pub placement: Arc<sprig_shard::lookup::MapPlacement>,

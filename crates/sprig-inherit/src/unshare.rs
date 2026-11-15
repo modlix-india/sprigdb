@@ -206,6 +206,39 @@ pub async fn after_drop(
             }
         }
     }
+    // The parent's share definer reads a table only while a share to a
+    // child tenant carries it (decision RL70).
+    let after = state_of(&fresh);
+    for c in carried {
+        let still = after.is_some_and(|st| {
+            st.shares().any(|s| {
+                s.object_id == c.object
+                    && s.from == ROOT_SPACE
+                    && matches!(s.to, ShareTarget::Tenant(_) | ShareTarget::AllChildren)
+            })
+        });
+        if still {
+            continue;
+        }
+        let Ok(schema) = crate::plan::physical_schema(ctx.cat, &c.db, ctx.lctn) else {
+            continue;
+        };
+        if let Err(e) = r
+            .ctl_query(
+                parent,
+                &format!(
+                    "REVOKE SELECT ON {}.{} FROM {}",
+                    q(&schema),
+                    q(&c.table),
+                    crate::upstream::definer(parent)
+                ),
+            )
+            .await
+        {
+            // 1141/1147: never granted (no child read through it).
+            tracing::debug!(tenant = %parent, table = %c.table, error = %e.message, "share definer's grant not revoked");
+        }
+    }
     if out.orphaned > 0 {
         metrics::counter!("sprig_inherit_orphans_total", "policy" => "keep", "path" => "unshare")
             .increment(out.orphaned);

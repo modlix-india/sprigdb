@@ -7,9 +7,12 @@
 //! - **revoked privilege:** `REVOKE SELECT` makes the next reads fail
 //!   with Unauthorized (13); `GRANT` gives them back;
 //! - **row-level security:** a policy enabled on the collection hides
-//!   another owner's document from the next point read (a session that
-//!   logs in after it reads its own documents through the point path);
-//!   disabling it shows it again;
+//!   another owner's document from the next point read and still reads
+//!   the session's own (its statements are prepared again under the
+//!   policy); a session that logs in after it reads its own documents
+//!   through the point path; disabling row security shows the other
+//!   document again; dropping the policy while row security is on hides
+//!   every document;
 //! - **catalog version:** a collection dropped and created again answers
 //!   with the new document, and a dropped one with none;
 //! - **move** (with `SPRIG_TEST_MOVE_CMDS`): the tenant moved to another
@@ -221,29 +224,27 @@ async fn point_reads_fall_back_when_something_changes() {
         .run_command(doc! {"sprigRowSecurity": "pts", "enable": true})
         .await;
     check("row security enabled", r.is_ok(), format!("{r:?}"));
-    // A session whose point reads were prepared before the policy never
-    // sees the other owner's document again. (Its prepared reads are
-    // refused with 39366 instead of being prepared again under the policy,
-    // on the general path too, and before the point path existed: a known
-    // gap. A plain `find` of the same session is filtered.)
-    let hidden_or_refused = |r: &Read| matches!(r, Ok(None) | Err(39366));
-    let r = read_until(&dc, 4, 10, hidden_or_refused).await;
+    // A session whose point reads were prepared before the policy reads
+    // through it at once: the statements are prepared again under the
+    // policy (S161), so another owner's document is hidden and its own
+    // still read, on the point path and the general one alike.
+    let r = read_until(&dc, 4, 10, |r| matches!(r, Ok(None))).await;
     check(
-        "policy: another owner's document not read",
-        hidden_or_refused(&r),
+        "policy: another owner's document hidden",
+        matches!(r, Ok(None)),
         format!("{r:?}"),
     );
     for _ in 0..5 {
         let r = read(&dc, 4).await;
         check(
-            "policy: still not read",
-            hidden_or_refused(&r),
+            "policy: still hidden",
+            matches!(r, Ok(None)),
             format!("{r:?}"),
         );
         let r = read(&dc, 3).await;
         check(
-            "policy: own document read or refused",
-            n_of(&r) == Some(3) || r == Err(39366),
+            "policy: own document read",
+            n_of(&r) == Some(3),
             format!("{r:?}"),
         );
     }
@@ -268,16 +269,60 @@ async fn point_reads_fall_back_when_something_changes() {
         .run_command(doc! {"sprigRowSecurity": "pts", "enable": false})
         .await;
     check("row security disabled", r.is_ok(), format!("{r:?}"));
+    // The mirror: statements prepared under the policy are prepared again
+    // without it.
     let r = read_until(&dc, 4, 10, |r| n_of(r) == Some(4)).await;
     check(
         "policy off: document read again",
         n_of(&r) == Some(4),
         format!("{r:?}"),
     );
+    for _ in 0..5 {
+        let r = read(&dc, 4).await;
+        check(
+            "policy off: still read",
+            n_of(&r) == Some(4),
+            format!("{r:?}"),
+        );
+    }
+    // Enabled again, then the policy dropped while row security stays on:
+    // no policy shows no document, the session's own included.
+    let r = adb
+        .run_command(doc! {"sprigRowSecurity": "pts", "enable": true})
+        .await;
+    check("row security enabled again", r.is_ok(), format!("{r:?}"));
+    let r = read_until(&dc, 4, 10, |r| matches!(r, Ok(None))).await;
+    check(
+        "enabled again: hidden",
+        matches!(r, Ok(None)),
+        format!("{r:?}"),
+    );
+    let r = read(&dc, 3).await;
+    check(
+        "enabled again: own document read",
+        n_of(&r) == Some(3),
+        format!("{r:?}"),
+    );
     let r = adb
         .run_command(doc! {"sprigDropPolicy": "pts", "name": "own"})
         .await;
     check("policy dropped", r.is_ok(), format!("{r:?}"));
+    let r = read_until(&dc, 3, 10, |r| matches!(r, Ok(None))).await;
+    check(
+        "policy dropped: no document shows",
+        matches!(r, Ok(None)),
+        format!("{r:?}"),
+    );
+    let r = adb
+        .run_command(doc! {"sprigRowSecurity": "pts", "enable": false})
+        .await;
+    check("row security disabled again", r.is_ok(), format!("{r:?}"));
+    let r = read_until(&dc, 3, 10, |r| n_of(r) == Some(3)).await;
+    check(
+        "disabled again: own document read",
+        n_of(&r) == Some(3),
+        format!("{r:?}"),
+    );
 
     // Catalog version: the collection dropped and created again.
     warm(&cc, &[2, 4]).await;

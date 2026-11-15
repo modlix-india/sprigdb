@@ -809,6 +809,54 @@ impl PassSession {
             };
         }
 
+        // Global lookup indexes (before the pins, whose parser claims every
+        // `SPRIG SHOW`): `SPRIG SHOW|REBUILD|DROP LOOKUP INDEX`.
+        if let Some(stmt) = crate::tenant::lookups_sql::parse_bytes(text) {
+            if sandbox {
+                return self.fail(out, &must_reset()).await;
+            }
+            let current = self.current_logical();
+            let Some(ts) = self.tenant.as_deref_mut() else {
+                return Err(SprigError::internal("no tenant"));
+            };
+            let cat = match ts.refresh().await {
+                Ok(c) => c,
+                Err(e) => return self.fail(out, &e).await,
+            };
+            let r = Box::pin(crate::tenant::lookups_sql::execute(
+                ts,
+                &cat,
+                current.as_deref(),
+                &stmt,
+                charset,
+            ))
+            .await;
+            if let Some(ts) = self.tenant.as_deref_mut() {
+                // Its own publishes: the session reads them next.
+                let _ = ts.refresh().await;
+            }
+            let s = status(self.status());
+            return match r {
+                Ok(crate::tenant::lookups_sql::LookupAnswer::Ok { affected }) => {
+                    let mut ok = OkPacket::new(s);
+                    ok.affected_rows = affected;
+                    out.ok(ok).await?;
+                    Ok(Step {
+                        errored: false,
+                        status: Some(s),
+                    })
+                }
+                Ok(crate::tenant::lookups_sql::LookupAnswer::Rows(ans)) => {
+                    send_local(out, &ans, format, s).await?;
+                    Ok(Step {
+                        errored: false,
+                        status: Some(s),
+                    })
+                }
+                Err(e) => self.fail(out, &e).await,
+            };
+        }
+
         // The advisor's pins and advice (`SPRIG PIN`, `UNPIN`, `SHOW`).
         if let Some(parsed) = sprig_sql::pin_stmt::parse(text, &lex) {
             if sandbox {
@@ -848,53 +896,6 @@ impl PassSession {
                     })
                 }
                 Ok(pins_sql::PinAnswer::Rows(ans)) => {
-                    send_local(out, &ans, format, s).await?;
-                    Ok(Step {
-                        errored: false,
-                        status: Some(s),
-                    })
-                }
-                Err(e) => self.fail(out, &e).await,
-            };
-        }
-
-        // Global lookup indexes: `SPRIG SHOW|REBUILD|DROP LOOKUP INDEX`.
-        if let Some(stmt) = crate::tenant::lookups_sql::parse_bytes(text) {
-            if sandbox {
-                return self.fail(out, &must_reset()).await;
-            }
-            let current = self.current_logical();
-            let Some(ts) = self.tenant.as_deref_mut() else {
-                return Err(SprigError::internal("no tenant"));
-            };
-            let cat = match ts.refresh().await {
-                Ok(c) => c,
-                Err(e) => return self.fail(out, &e).await,
-            };
-            let r = Box::pin(crate::tenant::lookups_sql::execute(
-                ts,
-                &cat,
-                current.as_deref(),
-                &stmt,
-                charset,
-            ))
-            .await;
-            if let Some(ts) = self.tenant.as_deref_mut() {
-                // Its own publishes: the session reads them next.
-                let _ = ts.refresh().await;
-            }
-            let s = status(self.status());
-            return match r {
-                Ok(crate::tenant::lookups_sql::LookupAnswer::Ok { affected }) => {
-                    let mut ok = OkPacket::new(s);
-                    ok.affected_rows = affected;
-                    out.ok(ok).await?;
-                    Ok(Step {
-                        errored: false,
-                        status: Some(s),
-                    })
-                }
-                Ok(crate::tenant::lookups_sql::LookupAnswer::Rows(ans)) => {
                     send_local(out, &ans, format, s).await?;
                     Ok(Step {
                         errored: false,
@@ -1903,6 +1904,13 @@ impl PassSession {
             .as_deref()
             .map(|ts| crate::tenant::authz::dropped_objects(ts, &stmt, current.as_deref()))
             .unwrap_or_default();
+        // The global lookup indexes of the tables a DROP removes go with
+        // them once it succeeded (chapter 19).
+        let lookup_owners = self
+            .tenant
+            .as_deref()
+            .map(|ts| crate::tenant::lookups_sql::owners_dropped(ts, &dropped))
+            .unwrap_or_default();
         // A rename leaves table grants with the old names, as
         // MySQL does; the engine records that before the statement runs.
         if let Some(ts) = self.tenant.as_deref() {
@@ -2005,6 +2013,16 @@ impl PassSession {
             },
             (r, _) => r,
         };
+        if result.as_ref().is_ok_and(|o| o.version.is_some()) && !lookup_owners.is_empty() {
+            match crate::tenant::lookups_sql::drop_owned(&svc, tenant, &lookup_owners).await {
+                Ok(names) => {
+                    tracing::info!(tenant = %tenant, lookups = ?names, "lookup indexes of dropped tables dropped");
+                }
+                Err(e) => {
+                    tracing::warn!(tenant = %tenant, error = %e, "lookup indexes of dropped tables not dropped yet; the controller finishes them");
+                }
+            }
+        }
         if result.as_ref().is_ok_and(|o| o.version.is_some())
             && !dropped.is_empty()
             && let Some(ts) = self.tenant.as_deref()
@@ -2539,6 +2557,19 @@ impl PassSession {
                         &format!("CREATE USER for {n}@{h}"),
                         charset,
                     )]
+                }
+                _ => Vec::new(),
+            };
+            keep = deferred(cols)?;
+        } else if let Some(stmt) = crate::tenant::lookups_sql::parse_bytes(&sql) {
+            // `SPRIG SHOW|REBUILD|DROP LOOKUP INDEX` (before the pins, whose
+            // parser claims every `SPRIG SHOW`): run at execute time, as text.
+            if sandbox {
+                return Err(must_reset());
+            }
+            let cols = match stmt {
+                crate::tenant::lookups_sql::LookupStmt::Show { .. } => {
+                    crate::tenant::lookups_sql::columns(charset)
                 }
                 _ => Vec::new(),
             };

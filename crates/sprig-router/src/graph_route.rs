@@ -157,6 +157,70 @@ pub struct FarNodes {
     /// Numeric comparisons of the relationships' properties, as `filter`
     /// is of the far nodes'.
     pub rel_filter: Vec<(String, CmpOp, String)>,
+    /// With `join`: only the links whose far nodes are among the first
+    /// `n` by property `key` (ascending when `true`), ties kept, as Cypher
+    /// orders values ([`top_parts`]).
+    pub top: Option<(String, bool, usize)>,
+    /// Without `top`: at most this many links per statement.
+    pub limit: Option<usize>,
+    /// Outgoing links only: also the far nodes' own outgoing links of the
+    /// same types (the next level of a walk), left joined from the edges
+    /// of every shard schema on the statement's cluster: six more link
+    /// columns (`NULL`s when the far node has none or isn't on the
+    /// cluster), then whether the far node is on it; with `join`, then the
+    /// second level's far nodes as the first's.
+    pub deep: bool,
+    /// The near nodes are the ones this scan finds on the statement's
+    /// shard (a subquery in place of the ids, so a pattern's start and
+    /// its first hop go in one round trip). Only for links on the near
+    /// nodes' own shards: outgoing, or incoming through the mirrors.
+    pub near_scan: Option<Box<ScanOp>>,
+    /// Only links with ids above this one (a continuation of a read that
+    /// stopped at `limit` in id order).
+    pub after: Option<u64>,
+    /// With `limit`: in link id order (so a reader can continue `after`).
+    pub ordered: bool,
+}
+
+/// The statement parts of [`FarNodes::top`] over far node columns `fid`
+/// and `fprops`: `(top, rest, order)`. The statement becomes `(<links>
+/// AND top ORDER ... FETCH FIRST n ROWS WITH TIES) UNION ALL (<links> AND
+/// rest)`: a superset of the first `n` links in Cypher's order of `key`.
+/// The first part ranks the far nodes it can: numbers by value; every
+/// other kind of value ties within its class (strings, booleans, temporal
+/// values and lists before the numbers ascending, after them descending;
+/// a missing value, Cypher's `null`, after them ascending, before them
+/// descending). The second keeps every link it can't rank: far nodes not
+/// on the statement's cluster, and JSON `null` values (NaN and the
+/// infinities, which JSON can't hold).
+#[must_use]
+pub fn top_parts(
+    fid: &str,
+    fprops: &str,
+    key: &str,
+    asc: bool,
+    n: usize,
+) -> Option<(String, String, String)> {
+    if key.contains(['"', '\\']) || n == 0 {
+        return None;
+    }
+    let path = Lit::Str(format!("$.\"{key}\"")).sql();
+    let t = format!("JSON_TYPE(JSON_EXTRACT({fprops}, {path}))");
+    let num = format!("{t} IN ('INTEGER', 'UNSIGNED INTEGER', 'DOUBLE')");
+    let class = if asc {
+        format!("CASE WHEN {num} THEN 2 WHEN {t} IS NULL THEN 3 ELSE 1 END")
+    } else {
+        format!("CASE WHEN {t} IS NULL THEN 0 WHEN {num} THEN 1 ELSE 2 END")
+    };
+    let dir = if asc { "ASC" } else { "DESC" };
+    Some((
+        format!("{fid} IS NOT NULL AND NOT ({t} <=> 'NULL')"),
+        format!("({fid} IS NULL OR {t} <=> 'NULL')"),
+        format!(
+            " ORDER BY {class}, CASE WHEN {num} THEN JSON_VALUE({fprops}, {path}) + 0e0 END {dir} \
+             FETCH FIRST {n} ROWS WITH TIES"
+        ),
+    ))
 }
 
 /// A numeric comparison of a pushed-down filter.
@@ -475,7 +539,10 @@ fn statement(spec: &RouteSpec, i: usize, ids: &[u64]) -> Option<String> {
     let t = |x| table(schema, spec.graph, x);
     let nodes = t(GraphTable::Nodes);
     let edges = t(GraphTable::Edges);
-    if ids.is_empty() && !matches!(spec.op, HopOp::Scan(_) | HopOp::Reach { .. }) {
+    // A statement over no ids matches nothing; links whose near nodes
+    // are a scan's name none.
+    let scanned = matches!(&spec.op, HopOp::Links { far: Some(f), .. } if f.near_scan.is_some());
+    if ids.is_empty() && !scanned && !matches!(spec.op, HopOp::Scan(_) | HopOp::Reach { .. }) {
         return None;
     }
     let id_list = ids_list(ids);
@@ -583,6 +650,25 @@ fn statement(spec: &RouteSpec, i: usize, ids: &[u64]) -> Option<String> {
                 )
             };
             let near = if *out { "src" } else { "dst" };
+            // The near nodes: the ids, or the scan's on this shard.
+            let id_list = match far.as_ref().and_then(|f| f.near_scan.as_ref()) {
+                Some(scan) if *out || *mirror => {
+                    let sub = statement(
+                        &RouteSpec {
+                            group: Arc::clone(&spec.group),
+                            graph: spec.graph,
+                            op: HopOp::Scan((**scan).clone()),
+                            targets: Targets::All(Vec::new()),
+                        },
+                        i,
+                        &[],
+                    )?;
+                    let from = sub.find(" FROM ")?;
+                    format!("SELECT n.id{}", &sub[from..])
+                }
+                Some(_) => return None,
+                None => id_list,
+            };
             let plain = format!(
                 "SELECT {cols} FROM {tbl} {a} WHERE {a}.{near} IN ({id_list}){}",
                 types_filter(a, types)
@@ -615,6 +701,9 @@ fn statement(spec: &RouteSpec, i: usize, ids: &[u64]) -> Option<String> {
             let mut select = cols.to_owned();
             let mut joins = String::new();
             let mut conds: Vec<String> = Vec::new();
+            // `conds` with far node comparisons that keep only numbers.
+            let mut exact_conds: Vec<String> = Vec::new();
+            let mut far_cols: Option<(String, String)> = None;
             if far.join {
                 // Every shard of this statement's cluster, joined by range.
                 let (mut ids, mut labels, mut props, mut tys) =
@@ -632,6 +721,7 @@ fn statement(spec: &RouteSpec, i: usize, ids: &[u64]) -> Option<String> {
                     tys.push(format!("n{j}._types"));
                 }
                 let (fid, fprops, ftypes) = (co(&ids), co(&props), co(&tys));
+                far_cols = Some((fid.clone(), fprops.clone()));
                 let pcols = match &far.keys {
                     None => format!("{fprops}, {ftypes}"),
                     Some(keys) => part_exprs(&fprops, &ftypes, keys),
@@ -640,7 +730,21 @@ fn statement(spec: &RouteSpec, i: usize, ids: &[u64]) -> Option<String> {
                 let flabels = co(&labels);
                 for (k, op, v) in &far.filter {
                     if let Some(c) = node_filter(&fprops, &flabels, k, *op, v) {
+                        // A top-k read must not rank a far node the
+                        // comparison drops (it would take another's
+                        // place): only numbers compare with a number.
+                        let exact = if !k.starts_with(LABEL_KEY)
+                            && !matches!(op, CmpOp::NotNumBelow | CmpOp::NotNumAbove)
+                        {
+                            let path = Lit::Str(format!("$.\"{k}\"")).sql();
+                            format!(
+                                "JSON_TYPE(JSON_EXTRACT({fprops}, {path})) IN ('INTEGER', 'UNSIGNED INTEGER', 'DOUBLE') AND {c}"
+                            )
+                        } else {
+                            c.clone()
+                        };
                         conds.push(format!("({fid} IS NULL OR {c})"));
+                        exact_conds.push(format!("({fid} IS NULL OR {exact})"));
                     }
                 }
             }
@@ -692,17 +796,98 @@ fn statement(spec: &RouteSpec, i: usize, ids: &[u64]) -> Option<String> {
                     }
                 }
             }
+            if far.deep && *out {
+                let mut cols: [Vec<String>; 6] = Default::default();
+                let mut known: Vec<String> = Vec::new();
+                for (j, sh) in &local {
+                    let _ = write!(
+                        joins,
+                        " LEFT JOIN {} x{j} ON x{j}.src = e.dst AND {}{}",
+                        table(&sh.schema, spec.graph, GraphTable::Edges),
+                        range(*j, "e.dst_rk"),
+                        types_filter(&format!("x{j}"), types)
+                    );
+                    for (c, name) in
+                        cols.iter_mut()
+                            .zip(["src", "dst", "_sprig_rk", "dst_rk", "id", "type"])
+                    {
+                        c.push(format!("x{j}.{name}"));
+                    }
+                    known.push(format!("({})", range(*j, "e.dst_rk")));
+                }
+                for c in &cols {
+                    let _ = write!(select, ", {}", co(c));
+                }
+                let _ = write!(select, ", ({})", known.join(" OR "));
+                // With `join`, the second level's far nodes too (after the
+                // known flag), as the first level's are.
+                if far.join {
+                    let (xdst, xrk) = (co(&cols[1]), co(&cols[3]));
+                    let (mut ids, mut labels, mut props, mut tys) =
+                        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                    for (j, sh) in &local {
+                        let _ = write!(
+                            joins,
+                            " LEFT JOIN {} y{j} ON y{j}.id = {xdst} AND {}",
+                            table(&sh.schema, spec.graph, GraphTable::Nodes),
+                            range(*j, &xrk)
+                        );
+                        ids.push(format!("y{j}.id"));
+                        labels.push(format!("y{j}.labels"));
+                        props.push(format!("y{j}.props"));
+                        tys.push(format!("y{j}._types"));
+                    }
+                    let (yprops, ytypes) = (co(&props), co(&tys));
+                    let pcols = match &far.keys {
+                        None => format!("{yprops}, {ytypes}"),
+                        Some(keys) => part_exprs(&yprops, &ytypes, keys),
+                    };
+                    let _ = write!(select, ", {}, {xrk}, {}, {pcols}", co(&ids), co(&labels));
+                }
+            }
             if !far.only.is_empty() {
                 conds.push(format!("{far_col} IN ({})", ids_list(&far.only)));
             }
-            let mut sql = format!(
+            if let Some(x) = far.after {
+                conds.push(format!("{a}.id > {x}"));
+            }
+            let head = format!(
                 "SELECT {select} FROM {tbl} {a}{joins} WHERE {a}.{near} IN ({id_list}){}",
                 types_filter(a, types)
             );
-            for c in conds {
-                let _ = write!(sql, " AND {c}");
+            let with = |cs: &[String]| {
+                let mut q = head.clone();
+                for c in cs {
+                    let _ = write!(q, " AND {c}");
+                }
+                q
+            };
+            // Shared conditions (`only`, relationships') are in both lists.
+            let shared = &conds[exact_conds.len().min(conds.len())..];
+            let mut exact = exact_conds.clone();
+            exact.extend(shared.iter().cloned());
+            if far.join
+                && let (Some((k, asc, n)), Some((fid, fprops))) = (&far.top, &far_cols)
+                && let Some((top, rest, order)) = top_parts(fid, fprops, k, *asc, *n)
+            {
+                return Some(format!(
+                    "({} AND {top}{order}) UNION ALL ({} AND {rest})",
+                    with(&exact),
+                    with(&conds)
+                ));
             }
-            sql
+            let mut q = with(&conds);
+            if far.top.is_none()
+                && let Some(n) = far.limit
+            {
+                // In id order when a reader may continue after the last
+                // (the sort costs MariaDB every joined row's JSON first).
+                if far.ordered {
+                    let _ = write!(q, " ORDER BY {a}.id");
+                }
+                let _ = write!(q, " LIMIT {n}");
+            }
+            q
         }
         HopOp::NodesPart { keys, filter } => {
             let mut sql = format!(

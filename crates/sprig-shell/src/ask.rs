@@ -179,9 +179,9 @@ pub fn needs_confirm(query: &str) -> Option<String> {
 #[allow(clippy::too_many_lines)] // ask, print, then run each query
 pub async fn cli(
     runner: &mut Runner,
-    m: &ArgMatches,
+    top: &ArgMatches,
     sub: &ArgMatches,
-    w: &mut Writer<impl Write + Send>,
+    out: &mut Writer<impl Write + Send>,
     rows_format: bool,
     confirm: &mut dyn FnMut(&str) -> bool,
 ) -> ExitClass {
@@ -196,13 +196,10 @@ pub async fn cli(
         return e.class();
     }
     let sets = ResultSet::from_events(&got.0);
-    let answer = match sets.iter().find(|s| !s.columns.is_empty()) {
-        Some(s) => s,
-        None => {
-            let e = ShellError::shell(ShellCode::Parse, "the gateway sent no answer to ASK");
-            eprintln!("sprig: {e}");
-            return e.class();
-        }
+    let Some(answer) = sets.iter().find(|s| !s.columns.is_empty()) else {
+        let e = ShellError::shell(ShellCode::Parse, "the gateway sent no answer to ASK");
+        eprintln!("sprig: {e}");
+        return e.class();
     };
     let rows = match rows(answer) {
         Ok(r) => r,
@@ -213,20 +210,20 @@ pub async fn cli(
     };
     if rows_format {
         for ev in got.0 {
-            if w.event(ev).is_err() {
+            if out.event(ev).is_err() {
                 return ExitClass::Ok;
             }
         }
-        let _ = w.finish();
+        let _ = out.finish();
     } else {
         print!("{}", render(&rows));
         let _ = std::io::stdout().flush();
     }
     let run = sub.get_flag("run");
     if !run {
-        let f = footer(&rows, false);
-        if !f.is_empty() {
-            eprintln!("{f}");
+        let tail = footer(&rows, false);
+        if !tail.is_empty() {
+            eprintln!("{tail}");
         }
         return ExitClass::Ok;
     }
@@ -235,7 +232,7 @@ pub async fn cli(
         eprintln!("There is no query to run.");
         return ExitClass::Ok;
     }
-    let yes = m.get_flag("yes") || sub.get_flag("yes");
+    let yes = top.get_flag("yes") || sub.get_flag("yes");
     let mut first = ExitClass::Ok;
     for r in queries {
         let q = r.query.as_deref().unwrap_or_default();
@@ -278,8 +275,8 @@ pub async fn cli(
         if !rows_format {
             println!();
         }
-        let r = run_cancellable(runner, q, Lang::Sql, &mut *w).await;
-        let _ = w.finish();
+        let r = run_cancellable(runner, q, Lang::Sql, &mut *out).await;
+        let _ = out.finish();
         if let Err(e) = r {
             eprintln!("sprig: {e}");
             if first == ExitClass::Ok {
@@ -290,9 +287,9 @@ pub async fn cli(
             }
         }
     }
-    let f = footer(&rows, true);
-    if !f.is_empty() {
-        eprintln!("{f}");
+    let tail = footer(&rows, true);
+    if !tail.is_empty() {
+        eprintln!("{tail}");
     }
     first
 }

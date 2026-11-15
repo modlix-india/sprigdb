@@ -235,6 +235,10 @@ pub(crate) struct RouterState {
     /// SQL-level prepared statements the gateway holds, by folded name
     /// ([`sql_prepare`]).
     sql_ps: HashMap<String, sql_prepare::Held>,
+    /// The texts of SQL-level prepared statements MariaDB holds (tenants
+    /// without shards), by folded name: an `EXECUTE` is checked against
+    /// the session's row-level security of the moment (S163).
+    sql_texts: HashMap<String, bytes::Bytes>,
 }
 
 impl std::fmt::Debug for RouterState {
@@ -290,6 +294,7 @@ impl RouterState {
     /// session state.
     pub(crate) async fn reset(&mut self) {
         self.sql_ps.clear();
+        self.sql_texts.clear();
         self.close().await;
     }
 
@@ -381,10 +386,6 @@ fn collides(e: &SprigError, t: &IdsTaken) -> bool {
     let k = (v - t.first) / t.step.max(1);
     v >= t.first && (v - t.first) % t.step.max(1) == 0 && k < i128::from(t.count)
 }
-
-/// `lookup.lock_wait_seconds`' default: Pre sessions' lock
-/// wait. The key isn't registered yet.
-const LOOKUP_LOCK_WAIT_SECONDS: u64 = 5;
 
 /// Where a lookup statement's shard anchors a transaction decision: the
 /// shard's place in its map (hash point), from `layout`'s groups and
@@ -625,11 +626,14 @@ impl PassSession {
                     ..TxnConfig::default()
                 },
             );
+            // `lookup.lock_wait_seconds`: Pre sessions' lock wait, at the
+            // tenant's value when the session's coordinator is made.
+            let lock_wait = crate::tenant::lookups_sql::settings(&svc, ts.tenant).lock_wait_seconds;
             self.router.coord = Some(DistTxn::new(
                 txn,
                 Arc::clone(&f),
                 anchors(layout),
-                LOOKUP_LOCK_WAIT_SECONDS,
+                lock_wait,
             ));
             self.router.anchors_from = std::ptr::from_ref(layout) as usize;
             self.router.factory = Some(f);
@@ -1224,6 +1228,9 @@ impl PassSession {
         {
             return Box::pin(self.load_data(cx, ld, more, mapper, map, out)).await;
         }
+        // Workload capture (chapter 17): the statement with the shards it
+        // visited, so the advisor sees reads that scatter.
+        let mut wl_pending = self.wl_start(original);
         loop {
             if layout.hold_for(&text).is_some() {
                 self.wait_hold(&layout, &cache, &text).await;
@@ -1249,6 +1256,7 @@ impl PassSession {
                 return Box::pin(self.insert_select(cx, parts, more, mapper, map, out)).await;
             }
             self.note_targets(&plan, &layout);
+            let fan = fanout_of(&plan, &layout);
             let ran = self
                 .run_plan(
                     cx,
@@ -1264,7 +1272,18 @@ impl PassSession {
                 .await?;
             self.router.ids = None;
             match ran {
-                Ran::Done(step) => return Ok(step),
+                Ran::Done(step) => {
+                    if let (Some(p), Some((n, all))) = (wl_pending.as_mut(), fan) {
+                        p.set_fanout(n, all);
+                    }
+                    let r = super::capture::Ran {
+                        outcome: None,
+                        errored: step.errored,
+                        params: &[],
+                    };
+                    self.wl_finish(cx, wl_pending, original, &r);
+                    return Ok(step);
+                }
                 Ran::Stale(err) => {
                     if self.router.in_txn() {
                         return Box::pin(self.moved_under_txn(&layout, &cache, err, map, out))
@@ -2275,6 +2294,30 @@ impl PassSession {
 
 /// Waits up to `wait` for a map of `layout` to move past the version the
 /// layout was built from; whether one did.
+/// The shards a plan visits and whether that is every shard of its
+/// group (a scatter); `None` for plans that don't run on shards.
+fn fanout_of(plan: &Plan, layout: &TenantLayout) -> Option<(u32, bool)> {
+    let targets: Vec<&str> = match plan {
+        Plan::Pass(t) => vec![t.at.schema.as_str()],
+        Plan::Read(r) => r.targets.iter().map(|t| t.at.schema.as_str()).collect(),
+        Plan::Write(w) => w.targets.iter().map(|t| t.at.schema.as_str()).collect(),
+        // Narrowed by a lookup at run time: the owners' shards only.
+        Plan::ViaLookup(_) => return Some((1, false)),
+        _ => return None,
+    };
+    let n = u32::try_from(targets.len()).unwrap_or(u32::MAX);
+    // The group's shards: schemas sharing `t<t>_d<d>_g<g>_s`.
+    let prefix = targets
+        .first()
+        .and_then(|s| s.rfind("_s").map(|i| &s[..=i + 1]))?;
+    let total = layout
+        .epochs
+        .keys()
+        .filter(|k| k.starts_with(prefix))
+        .count();
+    Some((n, n > 1 && targets.len() >= total))
+}
+
 async fn maps_moved(
     cache: &ShardMapCache,
     tenant: sprig_common::ids::TenantId,

@@ -285,6 +285,14 @@ async fn run_with(
     lazy: bool,
 ) -> Result<Output> {
     let store_late = store.late_props();
+    // Reads that follow links backwards ask the mirrors' gate now, while
+    // their first statements run.
+    if q.explain != Explain::Explain && !has_writes(q) {
+        let text = format!("{q:?}");
+        if text.contains("dir: In") || text.contains("dir: Both") {
+            store.warm_mirrors();
+        }
+    }
     let mut ex = Exec {
         store,
         params,
@@ -307,6 +315,9 @@ async fn run_with(
         only: HashMap::new(),
         profile: q.explain == Explain::Profile,
         prune: None,
+        top_hop: false,
+        fused: None,
+        read_only: !has_writes(q),
     };
     if q.explain == Explain::Explain {
         let mut plan = explain(q);
@@ -318,7 +329,7 @@ async fn run_with(
             ..Output::default()
         });
     }
-    let inits = vec![Row::new(); q.parts.len()];
+    let inits = vec![Row::default(); q.parts.len()];
     let (columns, all) = ex.union_parts(q, inits, &[]).await?;
     let schema = q
         .parts
@@ -392,7 +403,7 @@ fn pushed(where_: &Expr, params: &Params) -> HashMap<String, Vec<(String, CmpOp,
         if !matches!(e, Expr::Lit(_) | Expr::Param(_)) {
             continue;
         }
-        let x = match eval(e, &Row::new(), params) {
+        let x = match eval(e, &Row::default(), params) {
             Ok(Value::Int(i)) if i.unsigned_abs() < (1u64 << 52) => {
                 #[allow(clippy::cast_precision_loss)] // below 2^52: exact
                 let f = i as f64;
@@ -422,13 +433,20 @@ fn prune_of(p: &Projection, first: Option<&Row>) -> Option<Prune> {
             other => other.clone(),
         };
         let mut ok = true;
+        let mut key_var = var.clone();
         e.walk(&mut |x| match x {
             Expr::Var(v) => {
-                if p.items.iter().any(|(_, a)| a == v) && !matches!(&e, Expr::Var(_)) {
+                // An alias inside a larger key names the item, not the
+                // variable (unless the item is the variable itself).
+                if p.items
+                    .iter()
+                    .any(|(ie, a)| a == v && !matches!(ie, Expr::Var(x) if x == v))
+                    && !matches!(&e, Expr::Var(_))
+                {
                     ok = false;
                 }
-                match &var {
-                    None => var = Some(v.clone()),
+                match &key_var {
+                    None => key_var = Some(v.clone()),
                     Some(w) if w == v => {}
                     Some(_) => ok = false,
                 }
@@ -436,9 +454,12 @@ fn prune_of(p: &Projection, first: Option<&Row>) -> Option<Prune> {
             Expr::Pattern(_) | Expr::Subquery(..) | Expr::Slot(_) => ok = false,
             _ => {}
         });
+        // The keys up to the first one that can't be judged from the one
+        // variable: a row beaten on them is beaten on all the keys.
         if !ok || e.has_aggregate() {
-            return None;
+            break;
         }
+        var = key_var;
         keys.push((e, *asc));
     }
     let var = var?;
@@ -449,6 +470,8 @@ fn prune_of(p: &Projection, first: Option<&Row>) -> Option<Prune> {
         var,
         keys,
         bound: None,
+        limit: 0,
+        sql: false,
     })
 }
 
@@ -683,6 +706,14 @@ pub(crate) struct Exec<'a> {
     /// hops that bind the one variable the sort keys read skip far nodes
     /// already worse than the last row kept.
     pub(crate) prune: Option<Prune>,
+    /// The hop running now is the last of its pattern and nothing else
+    /// of the clause's relationships can be the same relationship: with
+    /// [`Prune::sql`], it may read only the best far nodes.
+    pub(crate) top_hop: bool,
+    /// The first hop's links, read with the pattern's start scan.
+    pub(crate) fused: Option<matcher::Fused>,
+    /// The statement writes nothing (reads may be queued ahead).
+    pub(crate) read_only: bool,
 }
 
 /// [`Exec::prune`]: the variable, the sort keys over it alone with their
@@ -691,9 +722,30 @@ pub(crate) struct Prune {
     pub(crate) var: String,
     pub(crate) keys: Vec<(Expr, bool)>,
     pub(crate) bound: Option<Vec<Value>>,
+    /// The rows the projection keeps (`SKIP` + `LIMIT`).
+    pub(crate) limit: usize,
+    /// Whether the last hop to `var` may read only the links to the
+    /// far nodes first in the order (with ties), in the store: nothing
+    /// after the hop drops rows (one pattern, a `WHERE` of pushed numeric
+    /// comparisons of `var` alone; the hop checks the rest).
+    pub(crate) sql: bool,
 }
 
 impl Prune {
+    /// [`crate::store::FarRead::top`] for a hop to `var`: its first sort
+    /// key when that is a property of `var`.
+    pub(crate) fn sql_top(&self, var: Option<&String>) -> Option<(String, bool, usize)> {
+        if !self.sql || var != Some(&self.var) || self.limit == 0 {
+            return None;
+        }
+        match self.keys.first() {
+            Some((Expr::Prop(t, k), asc)) if matches!(&**t, Expr::Var(x) if *x == self.var) => {
+                Some((k.clone(), *asc, self.limit))
+            }
+            _ => None,
+        }
+    }
+
     /// Whether `ks` sorts strictly after the bound (so its row can't be
     /// kept).
     pub(crate) fn beaten(&self, ks: &[Value]) -> bool {
@@ -1193,7 +1245,7 @@ impl Exec<'_> {
                             list: Box::new(Expr::Lit(Value::List(ts))),
                             pred: Box::new(Expr::Var(" q".into())),
                         };
-                        eval(&q, &Row::new(), self.params)?
+                        eval(&q, &Row::default(), self.params)?
                     });
                 }
                 out
@@ -1423,7 +1475,7 @@ impl Exec<'_> {
                     None => match part.clauses.first() {
                         // An importing WITH: plain variables of the row.
                         Some(Clause::With(p)) => {
-                            let mut m: Row = Row::new();
+                            let mut m: Row = Row::default();
                             if p.star {
                                 m.extend(
                                     r.iter()
@@ -1440,7 +1492,7 @@ impl Exec<'_> {
                             }
                             m
                         }
-                        _ => Row::new(),
+                        _ => Row::default(),
                     },
                 };
                 inits.push(init);
@@ -1493,7 +1545,7 @@ impl Exec<'_> {
         self.store.batches().await?;
         let size = match &b.rows {
             None => 1000,
-            Some(e) => match self.eval_full(e, &Row::new()).await? {
+            Some(e) => match self.eval_full(e, &Row::default()).await? {
                 Value::Int(n) if n > 0 => usize::try_from(n).unwrap_or(usize::MAX),
                 other => {
                     return Err(SprigError::new(
@@ -1639,14 +1691,17 @@ impl Exec<'_> {
                             .as_ref()
                             .map(|w| pushed(w, self.params))
                             .unwrap_or_default();
+                        if self.read_only && rows.len() <= self.b.batch_nodes {
+                            self.queue_bound(&rows);
+                        }
                     }
-                    let top = if self.late && rows.len() > MATCH_CHUNK {
+                    let top = if self.late {
                         self.topk_of(clauses.get(i + 1))?
                     } else {
                         None
                     };
                     let r = match top {
-                        Some((p, n)) => {
+                        Some((p, n)) if rows.len() > MATCH_CHUNK => {
                             self.match_top(
                                 rows,
                                 patterns,
@@ -1657,6 +1712,21 @@ impl Exec<'_> {
                                 n,
                             )
                             .await
+                        }
+                        // Few rows: one pass, but the hops may still read
+                        // only the far nodes the projection can keep.
+                        Some((p, n)) => {
+                            self.prune = if *optional {
+                                None
+                            } else {
+                                prune_of(p, rows.first())
+                            };
+                            self.prune_sql(patterns, where_.as_ref(), n);
+                            let r = self
+                                .match_clause(rows, patterns, where_.as_ref(), *optional, mult_ok)
+                                .await;
+                            self.prune = None;
+                            r
                         }
                         None => {
                             self.match_clause(rows, patterns, where_.as_ref(), *optional, mult_ok)
@@ -1938,7 +2008,7 @@ impl Exec<'_> {
 
     fn const_int(&self, e: Option<&Expr>, what: &str) -> Result<Option<usize>> {
         let Some(e) = e else { return Ok(None) };
-        match eval(e, &Row::new(), self.params)? {
+        match eval(e, &Row::default(), self.params)? {
             Value::Int(i) if i >= 0 => Ok(usize::try_from(i).ok()),
             other => Err(SprigError::new(
                 SprigCode::GraphSyntax,
@@ -1981,6 +2051,21 @@ impl Exec<'_> {
         Ok(Some((p, skip.saturating_add(l))))
     }
 
+    /// Sets [`Prune::limit`] and [`Prune::sql`] of the clause's prune.
+    fn prune_sql(&mut self, patterns: &[PathPattern], where_: Option<&Expr>, n: usize) {
+        let params = self.params;
+        if let Some(pr) = &mut self.prune {
+            pr.limit = n;
+            pr.sql = patterns.len() == 1
+                && where_.is_none_or(|w| {
+                    matcher::conjuncts(w).into_iter().all(|c| {
+                        let m = pushed(c, params);
+                        m.len() == 1 && m.get(&pr.var).is_some_and(|v| v.len() == 1)
+                    })
+                });
+        }
+    }
+
     /// A `MATCH` followed by a projection that keeps its first `n` rows
     /// ([`Exec::topk_of`]): the incoming rows go through in chunks, and
     /// after each only the best `n` rows so far are kept (ties in input
@@ -2010,6 +2095,7 @@ impl Exec<'_> {
         } else {
             prune_of(p, rows.first())
         };
+        self.prune_sql(patterns, where_, n);
         while !rows.is_empty() {
             let rest = rows.split_off(MATCH_CHUNK.min(rows.len()));
             let chunk = std::mem::replace(&mut rows, rest);
@@ -2316,7 +2402,7 @@ impl Exec<'_> {
             }
             if groups.is_empty() && key_items.is_empty() {
                 groups.push((
-                    Row::new(),
+                    Row::default(),
                     vec![],
                     aggs.iter().map(agg::State::new).collect(),
                 ));
@@ -2382,7 +2468,7 @@ impl Exec<'_> {
                         Err(e) => return Err(e),
                     }
                 }
-                let mut merged = if p.distinct { Row::new() } else { r };
+                let mut merged = if p.distinct { Row::default() } else { r };
                 for (c, v) in cols.iter().zip(&vals) {
                     merged.insert(c.clone(), v.clone());
                 }
@@ -2709,7 +2795,7 @@ mod agg {
                     let p = match s
                         .extra
                         .as_ref()
-                        .map(|e| crate::eval::eval(e, &crate::eval::Row::new(), params))
+                        .map(|e| crate::eval::eval(e, &crate::eval::Row::default(), params))
                         .transpose()?
                     {
                         Some(Value::Float(f)) => f,

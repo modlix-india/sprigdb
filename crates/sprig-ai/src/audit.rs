@@ -12,6 +12,8 @@
 //! - **Whose.** A conversation belongs to one user; every read checks it.
 //! - The audit stream gets one `ai.turn` event per turn: the user, the
 //!   role, the tools called and the hashes sent ([`crate::turn`]).
+//! - **The administration assistant's** conversations are kept the same
+//!   way in a system schema instead ([`system`]).
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -236,6 +238,9 @@ pub(crate) struct Mem {
 #[derive(Default)]
 pub struct MemoryAudit {
     inner: Mutex<Mem>,
+    /// Keeps the administration roles' conversations instead of the
+    /// tenant roles' (as [`system::SystemAudit`] does).
+    system: bool,
 }
 
 impl std::fmt::Debug for MemoryAudit {
@@ -251,6 +256,16 @@ impl MemoryAudit {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// An in-memory store of administration conversations (`admin` and
+    /// `triage`), like [`system::SystemAudit`].
+    #[must_use]
+    pub fn system() -> Self {
+        Self {
+            system: true,
+            ..Self::default()
+        }
+    }
+
     /// Sets the tokens `user` used today (input, output), for tests.
     pub fn set_usage(&self, user: UserId, role: Role, input: u64, output: u64) {
         self.lock().usage.insert((user.0, role), (input, output, 1));
@@ -260,7 +275,11 @@ impl MemoryAudit {
 #[async_trait]
 impl AuditStore for MemoryAudit {
     async fn create(&self, user: UserId, role: Role, title: &str) -> Result<ConvId> {
-        tenant_role(role)?;
+        if self.system {
+            system::system_role(role)?;
+        } else {
+            tenant_role(role)?;
+        }
         let mut m = self.lock();
         m.next += 1;
         let id = m.next;
@@ -607,20 +626,22 @@ impl AuditStore for CatalogAudit {
 
     async fn purge_payloads(&self, days: u64) -> Result<u64> {
         let mut c = self.conn().await?;
-        c.exec_drop(
-            format!(
-                "UPDATE {} SET body = JSON_OBJECT('sha256', LOWER(HEX(sent_hash)), 'payload_purged', TRUE) \
-                 WHERE kind = 'system_note' AND sent_hash IS NOT NULL \
-                 AND JSON_EXISTS(body, '$.payload') \
-                 AND created_at < UTC_TIMESTAMP(3) - INTERVAL ? DAY",
-                self.t("ai_messages")
-            ),
-            (days,),
-        )
-        .await
-        .map_err(unavailable)?;
+        c.exec_drop(purge_sql(&self.t("ai_messages")), (days,))
+            .await
+            .map_err(unavailable)?;
         Ok(c.affected_rows())
     }
+}
+
+/// The statement that drops payloads older than `?` days from the notes
+/// of `messages` (a qualified `ai_messages`), keeping their hashes.
+pub(crate) fn purge_sql(messages: &str) -> String {
+    format!(
+        "UPDATE {messages} SET body = JSON_OBJECT('sha256', LOWER(HEX(sent_hash)), 'payload_purged', TRUE) \
+         WHERE kind = 'system_note' AND sent_hash IS NOT NULL \
+         AND JSON_EXISTS(body, '$.payload') \
+         AND created_at < UTC_TIMESTAMP(3) - INTERVAL ? DAY"
+    )
 }
 
 /// The provider history of a stored conversation, to continue it: the
@@ -709,6 +730,8 @@ pub fn history(msgs: &[StoredMessage]) -> Vec<crate::provider::Message> {
     flush(&mut out, &mut pending);
     out
 }
+
+pub mod system;
 
 #[cfg(test)]
 mod live_tests;

@@ -181,6 +181,9 @@ pub async fn run_stream(
         only: std::collections::HashMap::new(),
         profile: false,
         prune: None,
+        top_hop: false,
+        fused: None,
+        read_only: false,
     };
     let mut clauses = q.parts[0].clauses.clone();
     // SKIP and LIMIT apply to the whole stream, not to each page.
@@ -212,7 +215,7 @@ pub async fn run_stream(
         .map(|w| conjuncts(w).into_iter().cloned().collect())
         .unwrap_or_default();
     let first = &mut patterns[0];
-    let empty = [Row::new()];
+    let empty = [Row::default()];
     let from_last = first.steps.last().is_some_and(|(_, last)| {
         Exec::score(last, &empty, &conj) > Exec::score(&first.start, &empty, &conj)
     });
@@ -251,7 +254,7 @@ pub async fn run_stream(
         let full = found.len() >= page;
         let rows: Vec<Row> = found
             .iter()
-            .map(|r| Row::from([(var.clone(), Value::Node(ex.node_val(r)))]))
+            .map(|r| std::iter::once((var.clone(), Value::Node(ex.node_val(r)))).collect())
             .collect();
         let (_, out) = ex.clauses(&clauses, rows, vec![var.clone()]).await?;
         for r in out {

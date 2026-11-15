@@ -7,6 +7,13 @@
 //! columns produce no events, unless it changed chapter 42's layer
 //! columns (`_sprig_state`, `_sprig_ovr`), which change what descendant
 //! spaces see.
+//!
+//! A row of a materialized copy (chapter 42: a table with a `_sprig_live`
+//! column, `__sprig_ih_<object>`) is decoded by its liveness, since a
+//! tombstone is a removed record: a row becoming live is an insert, a live
+//! row becoming a tombstone a delete (with the live row as its before
+//! image), a live row changing an update, and a tombstone written, changed
+//! or purged nothing (decision RL69).
 
 use sprig_binlog::RowImage;
 use sprig_common::names::is_internal_column;
@@ -78,19 +85,44 @@ fn layer_changed(row: &RawRow) -> bool {
         .any(|(i, _)| b.get(i) != a.get(i))
 }
 
+/// A materialized copy's liveness column (chapter 42).
+const LIVE: &str = "_sprig_live";
+
+/// Whether `img`'s `_sprig_live` (column `i`) is true.
+fn is_live(img: Option<&RowImage>, i: usize) -> bool {
+    use sprig_binlog::Value;
+    match img.and_then(|m| m.get(i)) {
+        Some(Value::Int(v)) => *v != 0,
+        Some(Value::UInt(v)) => *v != 0,
+        _ => false,
+    }
+}
+
 /// Decodes one row change; `None` for an update that changed only
-/// internal columns (other than an inheritable object's layer columns).
+/// internal columns (other than an inheritable object's layer columns),
+/// and for a copy's tombstones (module docs).
 #[must_use]
 pub fn decode_row(row: &RawRow) -> Option<Decoded> {
     let shape = &row.table;
-    let before = row.before.as_ref().map(|i| image(shape, i));
-    let after = row.after.as_ref().map(|i| image(shape, i));
-    let key_img = row.after.as_ref().or(row.before.as_ref())?;
-    let op = match row.kind {
+    let mut op = match row.kind {
         RowKind::Insert => Op::Insert,
         RowKind::Delete => Op::Delete,
         RowKind::Update => Op::Update,
     };
+    let (mut before_img, mut after_img) = (row.before.as_ref(), row.after.as_ref());
+    if let Some(i) = shape.columns.iter().position(|c| c == LIVE) {
+        let was = before_img.is_some() && is_live(before_img, i);
+        let now = after_img.is_some() && is_live(after_img, i);
+        (op, before_img, after_img) = match (was, now) {
+            (false, false) => return None,
+            (false, true) => (Op::Insert, None, after_img),
+            (true, false) => (Op::Delete, before_img, None),
+            (true, true) => (Op::Update, before_img, after_img),
+        };
+    }
+    let before = before_img.map(|i| image(shape, i));
+    let after = after_img.map(|i| image(shape, i));
+    let key_img = after_img.or(before_img)?;
     let delta = if op == Op::Update {
         let (b, a) = (before.as_ref()?, after.as_ref()?);
         if b == a && !layer_changed(row) {
@@ -255,6 +287,94 @@ mod tests {
         let d = decode_row(&hide).unwrap();
         assert_eq!(d.delta, Some(Vec::new()));
         assert_eq!(d.key.0.len(), 2, "the key keeps the space");
+    }
+
+    #[test]
+    fn copy_rows_decode_by_liveness() {
+        let copy = Arc::new(TableShape {
+            schema: "t1_d1_g1_s1".into(),
+            table: "__sprig_ih_9".into(),
+            columns: vec![
+                "id".into(),
+                "v".into(),
+                "_sprig_share".into(),
+                "_sprig_live".into(),
+                "_sprig_src_v".into(),
+            ],
+            key: vec![0, 2],
+        });
+        let img = |v: &str, live: i64, src: u64| {
+            RowImage(vec![
+                Some(Value::Int(5)),
+                Some(Value::String(v.as_bytes().to_vec())),
+                Some(Value::UInt(0)),
+                Some(Value::Int(live)),
+                Some(Value::UInt(src)),
+            ])
+        };
+        let row = |kind, before: Option<RowImage>, after: Option<RowImage>| RawRow {
+            table: Arc::clone(&copy),
+            kind,
+            before,
+            after,
+            hint: None,
+        };
+        // A new live row, and a tombstone made live again: inserts.
+        let d = decode_row(&row(RowKind::Insert, None, Some(img("x", 1, 1)))).unwrap();
+        assert_eq!((d.op, d.before.is_none()), (Op::Insert, true));
+        assert_eq!(d.key.0.len(), 2, "the key keeps the share");
+        let d = decode_row(&row(
+            RowKind::Update,
+            Some(img("x", 0, 1)),
+            Some(img("x", 1, 2)),
+        ))
+        .unwrap();
+        assert_eq!((d.op, d.before, d.delta), (Op::Insert, None, None));
+        // A live row becoming a tombstone: a delete with the live image.
+        let d = decode_row(&row(
+            RowKind::Update,
+            Some(img("x", 1, 1)),
+            Some(img("x", 0, 2)),
+        ))
+        .unwrap();
+        assert_eq!(d.op, Op::Delete);
+        assert!(d.after.is_none());
+        assert_eq!(d.before.unwrap().0.len(), 2, "id and v");
+        // A live row changing: an update; only its guard: nothing.
+        let d = decode_row(&row(
+            RowKind::Update,
+            Some(img("x", 1, 1)),
+            Some(img("y", 1, 2)),
+        ))
+        .unwrap();
+        assert_eq!((d.op, d.delta), (Op::Update, Some(vec!["v".to_owned()])));
+        assert_eq!(
+            decode_row(&row(
+                RowKind::Update,
+                Some(img("x", 1, 1)),
+                Some(img("x", 1, 2))
+            )),
+            None
+        );
+        // Tombstones written, rewritten and purged: nothing.
+        assert_eq!(
+            decode_row(&row(RowKind::Insert, None, Some(img("", 0, 1)))),
+            None
+        );
+        assert_eq!(
+            decode_row(&row(
+                RowKind::Update,
+                Some(img("x", 0, 1)),
+                Some(img("x", 0, 2))
+            )),
+            None
+        );
+        assert_eq!(
+            decode_row(&row(RowKind::Delete, Some(img("x", 0, 1)), None)),
+            None
+        );
+        let d = decode_row(&row(RowKind::Delete, Some(img("x", 1, 1)), None)).unwrap();
+        assert_eq!(d.op, Op::Delete);
     }
 
     #[test]

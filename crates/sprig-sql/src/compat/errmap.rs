@@ -29,6 +29,7 @@
 //! | 1347 `'db.t' is not of type 'VIEW'` | `'db.t' is not VIEW` |
 //! | 1906 generated column value ignored | 3105 `... is not allowed.` |
 //! | 4078 `Illegal parameter data types int and row ...` | 1241 `Operand should contain 1 column(s)` |
+//! | 4174 `A primary key cannot be marked as IGNORE` | 3522 `A primary key index cannot be invisible` |
 //!
 //! Still MariaDB's: 3140's parser detail and position (MariaDB doesn't say
 //! why the text isn't JSON), 3730's table and constraint names (MariaDB
@@ -300,6 +301,13 @@ pub fn reworded(e: &WireError) -> Option<WireError> {
             1241,
             *b"21000",
             "Operand should contain 1 column(s)",
+        )),
+        // `INVISIBLE` on 3306 is MariaDB's `IGNORED`: a primary key (or the
+        // first NOT NULL unique key that stands for one) can't be.
+        4174 if m.starts_with("A primary key cannot be marked as IGNORE") => Some(WireError::new(
+            3522,
+            *b"HY000",
+            "A primary key index cannot be invisible",
         )),
         _ => None,
     }
@@ -606,6 +614,24 @@ mod tests {
             with_dup_key_table(&e, "p").unwrap().message,
             "Duplicate entry 'a' for key 'p.uk_u'"
         );
+    }
+
+    // Captured from MySQL 8.4.11 and MariaDB 11.8 on 15 November 2026
+    // (SQLancer found it, r1diff GR8): `CREATE UNIQUE INDEX i0 ON t1(c0)
+    // INVISIBLE` where `c0` is NOT NULL and t1 has no primary key.
+    #[test]
+    fn an_invisible_primary_key_reads_mysql() {
+        let e = SprigError::backend(4174, *b"HY000", "A primary key cannot be marked as IGNORE");
+        let m = for_persona(Persona::MySql84, &e).unwrap();
+        assert_eq!(m.protocol().mysql_errno, 3522);
+        assert_eq!(m.message, "A primary key index cannot be invisible");
+        // Re-raised by the DDL path as the gateway's own: the same.
+        let s = SprigError::standard(4174, *b"HY000", "A primary key cannot be marked as IGNORE");
+        let m = for_persona(Persona::MySql84, &s).unwrap();
+        assert_eq!(m.protocol().mysql_errno, 3522);
+        assert_eq!(&m.protocol().sqlstate, b"HY000");
+        // The MariaDB persona keeps MariaDB's own words.
+        assert!(for_persona(Persona::MariaDb, &e).is_none());
     }
 
     #[test]

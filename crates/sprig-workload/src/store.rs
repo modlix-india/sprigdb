@@ -194,6 +194,44 @@ fn take<T: mysql_async::prelude::FromValue>(row: &mut Row, idx: usize, name: &st
     }
 }
 
+/// Runs a batch statement, whose text changes with its batch's size, and
+/// closes it at once, returning the rows it changed. Kept in the driver's
+/// statement cache, every batch size stayed prepared on the catalog's
+/// server: a 500-row `REPLACE` holds about 5 MB there, and a catalog
+/// connection (128 cached statements) reached 40-70 MB (r1-interim GR10).
+async fn exec_batch<Q, P>(q: &mut Q, sql: String, params: P) -> Result<u64>
+where
+    Q: Queryable + Send,
+    P: Into<mysql_async::Params> + Send,
+{
+    let st = q.prep(sql).await.map_err(map_err)?;
+    let out = match q.exec_iter(&st, params).await {
+        Ok(r) => {
+            let n = r.affected_rows();
+            r.drop_result().await.map(|()| n)
+        }
+        Err(e) => Err(e),
+    };
+    let closed = q.close(st).await;
+    let n = out.map_err(map_err)?;
+    closed.map_err(map_err)?;
+    Ok(n)
+}
+
+/// [`exec_batch`] for a batch statement that returns rows.
+async fn query_batch<Q, P>(q: &mut Q, sql: String, params: P) -> Result<Vec<Row>>
+where
+    Q: Queryable + Send,
+    P: Into<mysql_async::Params> + Send,
+{
+    let st = q.prep(sql).await.map_err(map_err)?;
+    let out = q.exec(&st, params).await;
+    let closed = q.close(st).await;
+    let rows = out.map_err(map_err)?;
+    closed.map_err(map_err)?;
+    Ok(rows)
+}
+
 /// Runs one statement and returns the rows it changed.
 async fn exec_count<Q, P>(q: &mut Q, sql: String, params: P) -> Result<u64>
 where
@@ -427,7 +465,7 @@ impl WorkloadTables {
                     Value::Int(micros(r.first_seen)),
                 ]);
             }
-            n += exec_count(q, sql, params).await?;
+            n += exec_batch(q, sql, params).await?;
         }
         Ok(n)
     }
@@ -465,7 +503,7 @@ impl WorkloadTables {
                 ]);
                 stat_values(&r.stats, &mut params);
             }
-            q.exec_drop(sql, params).await.map_err(map_err)?;
+            exec_batch(q, sql, params).await?;
             self.touch(q, chunk).await?;
         }
         Ok(())
@@ -497,7 +535,7 @@ impl WorkloadTables {
         sql.push_str(&vec!["?"; latest.len()].join(", "));
         sql.push(')');
         params.extend(latest.keys().map(|id| Value::UInt(*id)));
-        q.exec_drop(sql, params).await.map_err(map_err)
+        exec_batch(q, sql, params).await.map(|_| ())
     }
 
     /// Sealed samples: `REPLACE` by `(fingerprint_id, sample_id)`, so a
@@ -532,7 +570,7 @@ impl WorkloadTables {
                     Value::UInt(secs(s.expires_at)),
                 ]);
             }
-            q.exec_drop(sql, params).await.map_err(map_err)?;
+            exec_batch(q, sql, params).await?;
         }
         Ok(())
     }
@@ -560,7 +598,7 @@ impl WorkloadTables {
                 vec!["?"; chunk.len()].join(", ")
             );
             let params: Vec<Value> = chunk.iter().map(|i| Value::UInt(i.0)).collect();
-            let rows: Vec<Row> = q.exec(sql, params).await.map_err(map_err)?;
+            let rows: Vec<Row> = query_batch(q, sql, params).await?;
             for mut r in rows {
                 let kind: u8 = take(&mut r, 1, "kind")?;
                 let shape: String = take(&mut r, 6, "shape")?;
@@ -860,17 +898,16 @@ impl WorkloadTables {
             None => format!("part <> {DAY_PART}"),
             Some(()) => "gateway_id = 0 AND part = 0".to_owned(),
         };
-        let rows: Vec<Row> = q
-            .exec(
-                format!(
-                    "SELECT fingerprint_id, TIMESTAMPDIFF(SECOND, '1970-01-01', bucket_start), \
-                     gateway_id, part, {STAT_COLS} FROM {} WHERE ({cond}) AND {only} FOR UPDATE",
-                    self.stats
-                ),
-                kp.clone(),
-            )
-            .await
-            .map_err(map_err)?;
+        let rows: Vec<Row> = query_batch(
+            q,
+            format!(
+                "SELECT fingerprint_id, TIMESTAMPDIFF(SECOND, '1970-01-01', bucket_start), \
+                 gateway_id, part, {STAT_COLS} FROM {} WHERE ({cond}) AND {only} FOR UPDATE",
+                self.stats
+            ),
+            kp.clone(),
+        )
+        .await?;
         // Target key → merged stats.
         let mut merged: BTreeMap<(u64, i64), Stats> = BTreeMap::new();
         let mut n_rows = 0u64;
@@ -886,12 +923,12 @@ impl WorkloadTables {
             n_rows += 1;
         }
         let part = if day.is_some() { DAY_PART } else { 0 };
-        q.exec_drop(
+        exec_batch(
+            q,
             format!("DELETE FROM {} WHERE ({cond}) AND {only}", self.stats),
             kp,
         )
-        .await
-        .map_err(map_err)?;
+        .await?;
         if day.is_some() {
             // Day rows already there (an earlier run) join the merge.
             let days: Vec<(u64, i64)> = merged.keys().copied().collect();
@@ -904,17 +941,16 @@ impl WorkloadTables {
                     Value::UInt(u64::from(DAY_PART)),
                 ]);
             }
-            let old: Vec<Row> = q
-                .exec(
-                    format!(
-                        "SELECT fingerprint_id, TIMESTAMPDIFF(SECOND, '1970-01-01', bucket_start), \
-                         {STAT_COLS} FROM {} WHERE {dcond} FOR UPDATE",
-                        self.stats
-                    ),
-                    dp,
-                )
-                .await
-                .map_err(map_err)?;
+            let old: Vec<Row> = query_batch(
+                q,
+                format!(
+                    "SELECT fingerprint_id, TIMESTAMPDIFF(SECOND, '1970-01-01', bucket_start), \
+                     {STAT_COLS} FROM {} WHERE {dcond} FOR UPDATE",
+                    self.stats
+                ),
+                dp,
+            )
+            .await?;
             for mut r in old {
                 let fp: u64 = take(&mut r, 0, "fingerprint_id")?;
                 let b: i64 = take(&mut r, 1, "bucket_start")?;
@@ -942,7 +978,7 @@ impl WorkloadTables {
                 params.push(Value::Int(*b));
                 stat_values(s, &mut params);
             }
-            q.exec_drop(sql, params).await.map_err(map_err)?;
+            exec_batch(q, sql, params).await?;
         }
         Ok((keys.len() as u64, n_rows))
     }

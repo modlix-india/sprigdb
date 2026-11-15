@@ -6,6 +6,8 @@
 //! - the forward ledger keeps a replayed forward a no-op after the
 //!   message was consumed (a forwarder that crashed between the enqueue
 //!   and the delete);
+//! - a batch of publishes with message ids (a change exchange's) reaches a
+//!   queue in order, each id once, before and after it is consumed;
 //! - with `queue.forwarder = feed` the polling forwarder leaves young
 //!   transactional publishes to the feed and takes them only after
 //!   `queue.forward_fallback_ms`; with `poll` it takes them at once.
@@ -137,6 +139,50 @@ async fn forwards_in_the_order_given_and_never_twice() {
         .await
         .unwrap();
     assert_eq!(n, 40);
+    conn.close(0, "done".into()).await.unwrap();
+}
+
+/// A change exchange's publishes (R9 r9feed4): a batch of messages, each
+/// as its message id, reaches a queue in order and each id once, while the
+/// message waits and after it was consumed (the forward ledger), within a
+/// batch too; a refused message ends the batch; a publish without an id is
+/// never deduplicated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_of_messages_with_ids_reaches_a_queue_once_each() {
+    let s = server_with(QueueSettings::default()).await;
+    let e = Arc::clone(s.engine.as_ref().unwrap());
+    let conn = lapin(&s).await;
+    let ch = conn.create_channel().await.unwrap();
+    let q = uniq("pub-once");
+    declare(&ch, &q).await;
+    let v = vhost(&e).await;
+    v.ensure_store().await.unwrap();
+    let m = |body: &str| message("", &q, body.as_bytes().to_vec(), None).unwrap();
+    let id = |i: u8| -> MsgId { [i; 16] };
+    let ok = |r: Vec<Result<u32, _>>| -> Vec<u32> { r.into_iter().map(Result::unwrap).collect() };
+    // 50 in one batch, the fifth twice in it: in order, once each.
+    let mut batch: Vec<_> = (0..50u8).map(|i| (m(&format!("m{i}")), id(i))).collect();
+    batch.insert(10, (m("m4 again"), id(4)));
+    assert_eq!(ok(v.publish_batch_once(batch).await), vec![1; 51]);
+    let want: Vec<String> = (0..50).map(|i| format!("m{i}")).collect();
+    assert_eq!(drain(&ch, &q).await, want);
+    // The same ids again after they were consumed (a forwarder's replay
+    // after a restart): the ledger keeps them out; a new id goes in.
+    let again: Vec<_> = (0..51u8).map(|i| (m(&format!("r{i}")), id(i))).collect();
+    assert_eq!(ok(v.publish_batch_once(again).await), vec![1; 51]);
+    assert_eq!(drain(&ch, &q).await, ["r50"]);
+    // A message to an exchange that doesn't exist ends the batch.
+    let bad = message("no-such-exchange", "k", b"x".to_vec(), None).unwrap();
+    let r = v
+        .publish_batch_once(vec![(m("n1"), id(101)), (bad, id(102)), (m("n3"), id(103))])
+        .await;
+    assert_eq!(r.len(), 2);
+    assert!(r[0].is_ok() && r[1].is_err(), "{r:?}");
+    assert_eq!(drain(&ch, &q).await, ["n1"]);
+    // Without an id, every publish is a new message.
+    v.publish_now(m("c"), true).await.unwrap();
+    v.publish_now(m("c"), true).await.unwrap();
+    assert_eq!(drain(&ch, &q).await, ["c", "c"]);
     conn.close(0, "done".into()).await.unwrap();
 }
 

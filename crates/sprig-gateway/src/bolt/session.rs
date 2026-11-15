@@ -534,6 +534,14 @@ impl GwSession {
             } else {
                 self.writer_conn(&cluster, true, tx, cat).await?
             };
+            // Spare connections for reads that run at the same time: from
+            // the writer's pool, when the read is on the writer.
+            if rc.autocommit
+                && (!read_mode || matches!(self.graphs.replica_pool(&cluster).await, Ok(None)))
+            {
+                rc.pools
+                    .insert(c.clone(), self.graphs.session_pool(&cluster).await?);
+            }
             rc.conns.insert(c, conn);
         }
         Ok(())

@@ -6,7 +6,7 @@
 //! accounts are expected to hold their privileges directly.
 
 use serde::{Deserialize, Serialize};
-use sprig_common::names::{DOCS_SCHEMA, SYS_SCHEMA, TENANT_SCHEMAS_GRANT_PATTERN};
+use sprig_common::names::{AI_SCHEMA, DOCS_SCHEMA, SYS_SCHEMA, TENANT_SCHEMAS_GRANT_PATTERN};
 
 /// What a grant applies to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,6 +214,10 @@ fn tokenize(s: &str) -> Option<Vec<Tok>> {
 pub const DOCS_CTL_GRANT: &str =
     "GRANT ALL ON `\\_\\_sprig\\_docs`.* TO sprig_ctl WITH GRANT OPTION";
 
+/// What `sprig_ctl` needs to own `__sprig_ai`, where the administration
+/// assistant's conversations are kept.
+pub const AI_CTL_GRANT: &str = "GRANT ALL ON `\\_\\_sprig\\_ai`.* TO sprig_ctl";
+
 /// Privilege facts about the probing account (`sprig_ctl` in production).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)] // one flag per privilege, by design
@@ -229,6 +233,11 @@ pub struct PrivilegeInfo {
     /// account `SELECT`. Without it docs search is off on the cluster.
     #[serde(default)]
     pub docs_schema_all: bool,
+    /// `ALL` on `__sprig_ai` or globally: the administration assistant's
+    /// conversations are kept there (on the DC's system cluster). Without
+    /// it they aren't stored.
+    #[serde(default)]
+    pub ai_schema_all: bool,
     /// `CREATE USER`.
     pub create_user: bool,
     /// `PROCESS`.
@@ -284,6 +293,7 @@ impl PrivilegeInfo {
                     p.tenant_schemas_grant_option |= all && *grant_option;
                     p.sys_schema_all |= all;
                     p.docs_schema_all |= all && *grant_option;
+                    p.ai_schema_all |= all;
                     p.create_user |= has("CREATE USER");
                     p.process |= has("PROCESS");
                     p.connection_admin |= has("CONNECTION ADMIN");
@@ -303,6 +313,7 @@ impl PrivilegeInfo {
                     }
                     p.sys_schema_all |= all && like(pattern, SYS_SCHEMA);
                     p.docs_schema_all |= all && *grant_option && like(pattern, DOCS_SCHEMA);
+                    p.ai_schema_all |= all && like(pattern, AI_SCHEMA);
                     p.read_mysql_db |= has("SELECT") && like(pattern, "mysql");
                 }
                 GrantTarget::Table(db, table) => {
@@ -331,6 +342,9 @@ impl PrivilegeInfo {
         }
         if !self.docs_schema_all {
             out.push(DOCS_CTL_GRANT.to_owned());
+        }
+        if !self.ai_schema_all {
+            out.push(AI_CTL_GRANT.to_owned());
         }
         let globals = [
             (self.create_user, "CREATE USER"),
@@ -407,6 +421,7 @@ mod tests {
             "GRANT ALL PRIVILEGES ON `t%`.* TO `sprig_ctl`@`%` WITH GRANT OPTION",
             "GRANT ALL PRIVILEGES ON `\\_\\_sprig\\_sys`.* TO `sprig_ctl`@`%` WITH GRANT OPTION",
             "GRANT ALL PRIVILEGES ON `\\_\\_sprig\\_docs`.* TO `sprig_ctl`@`%` WITH GRANT OPTION",
+            "GRANT ALL PRIVILEGES ON `__sprig_ai`.* TO `sprig_ctl`@`%`",
             "GRANT SELECT ON `mysql`.`db` TO `sprig_ctl`@`%`",
         ]);
         assert!(p.tenant_schemas_all && p.tenant_schemas_grant_option);
@@ -457,6 +472,31 @@ mod tests {
         // An old profile without the field reads as not granted.
         let old: PrivilegeInfo = serde_json::from_str(r#"{"tenant_schemas_all":true,"tenant_schemas_grant_option":true,"sys_schema_all":true,"create_user":true,"process":true,"connection_admin":true,"slave_monitor":true,"binlog_monitor":true,"binlog_admin":true,"read_only_admin":true,"set_user":true,"replication_slave":true,"read_mysql_db":true,"super_priv":false,"sql_log_bin_settable":null,"osu_method_settable":null}"#).unwrap();
         assert!(!old.docs_schema_all);
+    }
+
+    #[test]
+    fn the_ai_schema_needs_all() {
+        let base = [
+            "GRANT ALL PRIVILEGES ON `t%`.* TO `sprig_ctl`@`%` WITH GRANT OPTION",
+            "GRANT ALL PRIVILEGES ON `\\_\\_sprig\\_sys`.* TO `sprig_ctl`@`%` WITH GRANT OPTION",
+        ];
+        let p = priv_info(&base);
+        assert!(!p.ai_schema_all);
+        assert!(p.missing_ctl_grants().iter().any(|g| g == AI_CTL_GRANT));
+        let mut with = base.to_vec();
+        with.push("GRANT SELECT ON `__sprig_ai`.* TO `sprig_ctl`@`%`");
+        assert!(!priv_info(&with).ai_schema_all, "SELECT only");
+        with.pop();
+        with.push("GRANT ALL PRIVILEGES ON `\\_\\_sprig\\_ai`.* TO `sprig_ctl`@`%`");
+        let p = priv_info(&with);
+        assert!(p.ai_schema_all);
+        assert!(!p.missing_ctl_grants().iter().any(|g| g == AI_CTL_GRANT));
+        // The docs grant doesn't cover it, nor the reverse.
+        assert!(!like("\\_\\_sprig\\_docs", AI_SCHEMA));
+        assert!(!like("\\_\\_sprig\\_ai", DOCS_SCHEMA));
+        // An old profile without the field reads as not granted.
+        let old: PrivilegeInfo = serde_json::from_str(r#"{"tenant_schemas_all":true,"tenant_schemas_grant_option":true,"sys_schema_all":true,"docs_schema_all":true,"create_user":true,"process":true,"connection_admin":true,"slave_monitor":true,"binlog_monitor":true,"binlog_admin":true,"read_only_admin":true,"set_user":true,"replication_slave":true,"read_mysql_db":true,"super_priv":false,"sql_log_bin_settable":null,"osu_method_settable":null}"#).unwrap();
+        assert!(old.docs_schema_all && !old.ai_schema_all);
     }
 
     #[test]

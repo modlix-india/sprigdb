@@ -509,3 +509,36 @@ async fn reads_reach_another_dcs_records() {
     assert!(dc_of(&ClusterId::new("plain").unwrap()).is_none());
     assert!(dc_of(&ClusterId::new("dc-a-cx").unwrap()).is_none());
 }
+
+#[tokio::test]
+async fn the_system_cluster_is_the_lowest_numbered_in_service() {
+    let f = fixture("mum1");
+    let mut ids = Vec::new();
+    for n in ["g1", "g2", "g3"] {
+        let r = f.reg.register(registration(n)).await.unwrap();
+        ids.push(r.body().cluster_id.clone());
+    }
+    // All still probing: none yet.
+    assert_eq!(f.reg.system_cluster().await.unwrap(), None);
+    f.reg
+        .set_admin_state(&ids[1], AdminState::Active, vec![])
+        .await
+        .unwrap();
+    assert_eq!(f.reg.system_cluster().await.unwrap(), Some(ids[1].clone()));
+    // A lower-numbered one that becomes active takes over.
+    f.reg
+        .set_admin_state(&ids[0], AdminState::Active, vec![])
+        .await
+        .unwrap();
+    assert_eq!(f.reg.system_cluster().await.unwrap(), Some(ids[0].clone()));
+    // Draining and drained keep it; retired gives it up.
+    for s in [AdminState::Draining, AdminState::Drained] {
+        f.reg.set_admin_state(&ids[0], s, vec![]).await.unwrap();
+        assert_eq!(f.reg.system_cluster().await.unwrap(), Some(ids[0].clone()));
+    }
+    f.reg
+        .set_admin_state(&ids[0], AdminState::Retired, vec![])
+        .await
+        .unwrap();
+    assert_eq!(f.reg.system_cluster().await.unwrap(), Some(ids[1].clone()));
+}

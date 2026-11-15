@@ -11,7 +11,15 @@
 //! was in the subscriber's merged view, as its `SELECT` policies filter
 //! it, just before the change, `0` when it wasn't, `2` when the
 //! subscriber's view doesn't read the changed row (another event will
-//! say). A probe that fails answers 0.
+//! say). A probe that fails answers 0. A `reads_only` probe asks only
+//! whether the view reads the changed row now (`1` or `2`, RL69): a
+//! change it doesn't read sends nothing, whatever the record is now. A
+//! `counted` probe is of a change the stream sends by its copy's handover
+//! (RL71): when the subscriber's view reaches the parent tenant through
+//! that tenant edge, it reads the changed row (`1` for `reads_only`), and
+//! its record before is taken through the edge as the copy holds it; when
+//! a materialized share inside the tenant cuts the view first, it is
+//! answered as without `counted`.
 
 use std::sync::OnceLock;
 
@@ -54,6 +62,12 @@ pub(crate) struct ProbeItem {
     /// The changed row's columns, for an insert.
     #[serde(default)]
     pub columns: Vec<String>,
+    /// Ask only whether the subscriber's view reads the changed row.
+    #[serde(default)]
+    pub reads_only: bool,
+    /// The stream counts the change by its copy's handover (RL71).
+    #[serde(default)]
+    pub counted: bool,
 }
 
 /// What is asked.
@@ -147,12 +161,34 @@ pub(super) async fn run(
             (None, Some(k)) => sprig_inherit::probe::Source::Copy(k.clone()),
             (None, None) => sprig_inherit::probe::Source::Above,
         };
+        // A counted change, when no materialized share inside the tenant
+        // cuts the view before its tenant edge.
+        let counted = p.counted
+            && sprig_inherit::probe::through_tenant_edge(ctx, &req.db, &p.table).unwrap_or(false);
+        if p.reads_only && counted {
+            rows.push(vec![Some(i.to_string().into_bytes()), Some(b"1".to_vec())]);
+            continue;
+        }
+        if p.reads_only {
+            let v = match sprig_inherit::probe::reads(ctx, &req.db, &p.table, &source) {
+                Ok(true) => b"1",
+                Ok(false) => b"2",
+                Err(e) => {
+                    // As before RL69: the record read now decides.
+                    tracing::warn!(table = %p.table, error = %e, "a change stream's source check failed");
+                    b"0"
+                }
+            };
+            rows.push(vec![Some(i.to_string().into_bytes()), Some(v.to_vec())]);
+            continue;
+        }
         let probe = sprig_inherit::probe::Probe {
             table: p.table.clone(),
             key: p.key.clone(),
             source,
             before: p.before.clone(),
             columns: p.columns.clone(),
+            counted,
         };
         let v = match Box::pin(sprig_inherit::probe::visible_before(
             ctx, r, &req.db, &probe,

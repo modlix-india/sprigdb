@@ -581,7 +581,9 @@ async fn transport_rules() {
         .await;
     assert_eq!(r.status, 403, "{}", r.raw);
     let own = format!("http://{addr}");
-    let r = c.send("POST", &[("origin", own.as_str())], Some(&body)).await;
+    let r = c
+        .send("POST", &[("origin", own.as_str())], Some(&body))
+        .await;
     assert_ne!(r.status, 403, "{}", r.raw);
     let r = c
         .send("POST", &[("origin", "https://db.example.com")], Some(&body))

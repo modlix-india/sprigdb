@@ -79,8 +79,10 @@ fn env() -> Option<Env> {
             .unwrap_or_else(|_| "tablegrants".to_owned()),
         move_to: std::env::var("SPRIG_TEST_TABLE_GRANTS_MOVE_TO")
             .unwrap_or_else(|_| "dc-a-c2".to_owned()),
+        // The clusters' writers: no default, so a private deployment's
+        // run never reaches the shared dev nodes (R9 r9feed4).
         nodes: std::env::var("SPRIG_TEST_TABLE_GRANTS_NODES")
-            .unwrap_or_else(|_| "13301,13311".to_owned())
+            .ok()?
             .split(',')
             .filter_map(|p| p.trim().parse().ok())
             .collect(),
@@ -294,7 +296,10 @@ async fn grant_rows(e: &Env, tenant: u64, table: &str) -> Vec<NodeRows> {
 #[tokio::test]
 async fn table_grants_follow_regroups_splits_merges_and_moves() {
     let Some(e) = env() else {
-        eprintln!("skipped: set SPRIG_TEST_TABLE_GRANTS=<gateway mysql port>,<admin port>");
+        eprintln!(
+            "skipped: set SPRIG_TEST_TABLE_GRANTS=<gateway mysql port>,<admin port> and \
+             SPRIG_TEST_TABLE_GRANTS_NODES"
+        );
         return;
     };
     let created = ctl_retry(&e, &["tenant", "create", &e.tenant, "--cluster", "dc-a-c1"]).await;

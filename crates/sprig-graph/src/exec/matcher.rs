@@ -631,7 +631,7 @@ impl Exec<'_> {
                 None => return Ok(None),
             }
         }
-        let empty = Row::new();
+        let empty = Row::default();
         if let Some(pe) = &np.props
             && is_const(pe)
             && let Value::Map(m) = eval(pe, &empty, self.params)?
@@ -838,7 +838,13 @@ impl Exec<'_> {
                     None
                 };
             scan.keys.clone_from(&keys);
-            let found = self.store.scan(&scan).await?;
+            let found = match self
+                .fuse_first_hop(&pat, &scan, join.is_none() && rows.len() == 1, track)
+                .await?
+            {
+                Some(found) => found,
+                None => self.store.scan(&scan).await?,
+            };
             self.check_rows(found.len())?;
             let nodes: Vec<Arc<Node>> = match keys.as_deref() {
                 None => found.iter().map(|r| self.node_val(r)).collect(),
@@ -913,7 +919,32 @@ impl Exec<'_> {
                 break;
             }
             cur = match rp.range {
-                None => self.hop(cur, rp, np, track).await?,
+                None => {
+                    // The last hop, which no other relationship of the
+                    // clause can repeat, and whose patterns the store
+                    // checks exactly (one label at most), drops no row a
+                    // top-k read leaves out (`Prune::sql`).
+                    self.top_hop = si + 1 == pat.steps.len()
+                        && rp.props.is_none()
+                        && np.props.is_none()
+                        && np
+                            .labels
+                            .as_ref()
+                            .is_none_or(|l| matches!(l, crate::ast::LabelExpr::Name(_)))
+                        && !rp.types.is_empty()
+                        && !others.iter().any(|o| compatible(o, rp))
+                        && !pat
+                            .steps
+                            .iter()
+                            .enumerate()
+                            .any(|(sj, (o, _))| sj != si && compatible(o, rp))
+                        && cur.first().is_none_or(|(r, _)| {
+                            rp.var.as_ref().is_none_or(|v| !r.contains_key(v))
+                        });
+                    let out = self.hop(cur, rp, np, track).await;
+                    self.top_hop = false;
+                    out?
+                }
                 Some((lo, hi)) => {
                     let overlap = others.iter().any(|o| compatible(o, rp))
                         || pat
@@ -1380,26 +1411,16 @@ impl Exec<'_> {
         need
     }
 
-    /// [`Exec::hop_edges`] without properties: links, and the far
-    /// nodes' ids, hashes and labels (`far`; else stand-ins with the id
-    /// and hash alone, for anonymous unlabelled nodes nothing reads).
-    #[allow(clippy::too_many_arguments)] // the hop, its far node and its relationship
-    async fn hop_light(
-        &mut self,
-        ids: &[u64],
-        types: &[u32],
-        dir: Dir,
+    /// What a light hop to `var` reads of its far nodes and its
+    /// relationships ([`Exec::hop_light`]).
+    fn far_plan(
+        &self,
         far: bool,
         var: Option<&String>,
         extra: Option<&super::late::Need>,
         rel_var: Option<&String>,
         label: Option<u32>,
-    ) -> Result<Hops> {
-        let dirs: &[Dir] = match dir {
-            Dir::Both => &[Dir::Out, Dir::In],
-            Dir::Out => &[Dir::Out],
-            Dir::In => &[Dir::In],
-        };
+    ) -> FarPlan {
         // With the far nodes wanted, they come in the same statement where
         // the store can (shards on one cluster), with the keys and filters
         // the clause is known to need; the rest are read by id.
@@ -1429,10 +1450,6 @@ impl Exec<'_> {
         // being read (its labels too); a later clause reads what it needs.
         let far =
             far || (var.is_some() && (need.is_some() || !filter.is_empty() || only.is_some()));
-        if only.as_ref().is_some_and(Vec::is_empty) {
-            return Ok(HashMap::new());
-        }
-        let only = only.unwrap_or_default();
         // The relationship's properties the clause is known to read, and
         // its numeric filters, in the same statement.
         let rel_need = rel_var.and_then(|v| self.prefetch.get(v)).cloned();
@@ -1452,6 +1469,55 @@ impl Exec<'_> {
             .and_then(|v| self.push.get(v))
             .cloned()
             .unwrap_or_default();
+        FarPlan {
+            keys,
+            filter,
+            only,
+            far,
+            rel_keys,
+            rel_filter,
+        }
+    }
+
+    /// [`Exec::hop_edges`] without properties: links, and the far
+    /// nodes' ids, hashes and labels (`far`; else stand-ins with the id
+    /// and hash alone, for anonymous unlabelled nodes nothing reads).
+    #[allow(clippy::too_many_arguments)] // the hop, its far node and its relationship
+    async fn hop_light(
+        &mut self,
+        ids: &[u64],
+        types: &[u32],
+        dir: Dir,
+        far: bool,
+        var: Option<&String>,
+        extra: Option<&super::late::Need>,
+        rel_var: Option<&String>,
+        label: Option<u32>,
+    ) -> Result<Hops> {
+        let dirs: &[Dir] = match dir {
+            Dir::Both => &[Dir::Out, Dir::In],
+            Dir::Out => &[Dir::Out],
+            Dir::In => &[Dir::In],
+        };
+        let FarPlan {
+            keys,
+            filter,
+            only,
+            far,
+            rel_keys,
+            rel_filter,
+        } = self.far_plan(far, var, extra, rel_var, label);
+        if only.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(HashMap::new());
+        }
+        let only = only.unwrap_or_default();
+        // Only the far nodes a top-k projection can keep (`Prune::sql`),
+        // when they are joined.
+        let top = if SQL_TOP_K && self.top_hop {
+            self.prune.as_ref().and_then(|p| p.sql_top(var))
+        } else {
+            None
+        };
         let mut rel_props: HashMap<u64, Arc<Rel>> = HashMap::new();
         let mut raw: Vec<(u64, u64, u64, Link)> = Vec::new();
         let mut seen: HashSet<(u64, u64)> = HashSet::new();
@@ -1463,48 +1529,121 @@ impl Exec<'_> {
                 // Joined far nodes save a round trip, but over many links
                 // the joins cost more in MariaDB than reading the nodes by
                 // id: only small frontiers join them.
-                let join = far && batch.len() <= JOIN_FAR_MAX;
-                let read_far =
-                    join || !only.is_empty() || rel_keys.is_some() || !rel_filter.is_empty();
-                let found: Vec<(crate::store::FarLink, bool)> = if *d == Dir::Both && read_far {
-                    let fr = crate::store::FarRead {
-                        keys: keys.as_deref(),
-                        filter: &filter,
-                        only: &only,
-                        join,
-                        rel_keys: rel_keys.as_deref(),
-                        rel_filter: &rel_filter,
-                    };
-                    self.store.links_far_both(batch, types, &fr).await?
-                } else if *d == Dir::Both {
-                    self.store
-                        .links_both(batch, types)
-                        .await?
-                        .into_iter()
-                        .map(|(l, out)| ((l, None, None), out))
-                        .collect()
-                } else if join || !only.is_empty() || rel_keys.is_some() || !rel_filter.is_empty() {
-                    let fr = crate::store::FarRead {
-                        keys: keys.as_deref(),
-                        filter: &filter,
-                        only: &only,
-                        join,
-                        rel_keys: rel_keys.as_deref(),
-                        rel_filter: &rel_filter,
-                    };
-                    self.store
-                        .links_far(batch, types, *d, &fr)
-                        .await?
-                        .into_iter()
-                        .map(|x| (x, *d == Dir::Out))
-                        .collect()
+                let mut join = far
+                    && (batch.len() <= JOIN_FAR_MAX
+                        || (top.is_some() && batch.len() <= JOIN_TOP_MAX));
+                // A joined read that meets many links stops at
+                // `JOIN_ROWS_MAX` and reads them again without the join:
+                // its far nodes are read by id, in parallel statements.
+                let limit = (join && top.is_none()).then_some(JOIN_ROWS_MAX);
+                // The links the pattern's start scan brought with it.
+                let fused = self.fused.take().filter(|f| {
+                    f.dir == *d
+                        && f.types == types
+                        && (f.capped || f.join == join || !f.join)
+                        && batch.iter().all(|i| f.ids.binary_search(i).is_ok())
+                });
+                // The start's joined read met too many links: straight to
+                // the unjoined read.
+                if fused.as_ref().is_some_and(|f| f.capped) {
+                    join = false;
+                }
+                // The start's links; with `after`, the read goes on past
+                // them (joined, with the top-k bound they gave).
+                let (pre, after) = match fused.filter(|f| !f.capped) {
+                    Some(f) => {
+                        let near: HashSet<u64> = batch.iter().copied().collect();
+                        let pre: Vec<(crate::store::FarLink, bool)> = f
+                            .links
+                            .into_iter()
+                            .filter(|((l, _, _), out)| {
+                                near.contains(if *out { &l.src } else { &l.dst })
+                            })
+                            .collect();
+                        (Some(pre), f.after)
+                    }
+                    None => (None, None),
+                };
+                let limit = if after.is_some() { None } else { limit };
+                let found = if let Some(pre) = pre.as_ref().filter(|_| after.is_none()) {
+                    pre.clone()
                 } else {
-                    self.store
-                        .links(batch, types, *d)
-                        .await?
-                        .into_iter()
-                        .map(|l| ((l, None, None), *d == Dir::Out))
-                        .collect()
+                    let mut got = loop {
+                        let read_far = join
+                            || !only.is_empty()
+                            || rel_keys.is_some()
+                            || !rel_filter.is_empty();
+                        let found: Vec<(crate::store::FarLink, bool)> =
+                            if *d == Dir::Both && read_far {
+                                let fr = crate::store::FarRead {
+                                    keys: keys.as_deref(),
+                                    filter: &filter,
+                                    only: &only,
+                                    join,
+                                    rel_keys: rel_keys.as_deref(),
+                                    rel_filter: &rel_filter,
+                                    top: if join {
+                                        top.as_ref().map(|(k, a, n)| (k.as_str(), *a, *n))
+                                    } else {
+                                        None
+                                    },
+                                    limit: if join { limit } else { None },
+                                    after,
+                                    ordered: false,
+                                };
+                                self.store.links_far_both(batch, types, &fr).await?
+                            } else if *d == Dir::Both {
+                                self.store
+                                    .links_both(batch, types)
+                                    .await?
+                                    .into_iter()
+                                    .map(|(l, out)| ((l, None, None), out))
+                                    .collect()
+                            } else if join
+                                || !only.is_empty()
+                                || rel_keys.is_some()
+                                || !rel_filter.is_empty()
+                            {
+                                let fr = crate::store::FarRead {
+                                    keys: keys.as_deref(),
+                                    filter: &filter,
+                                    only: &only,
+                                    join,
+                                    rel_keys: rel_keys.as_deref(),
+                                    rel_filter: &rel_filter,
+                                    top: if join {
+                                        top.as_ref().map(|(k, a, n)| (k.as_str(), *a, *n))
+                                    } else {
+                                        None
+                                    },
+                                    limit: if join { limit } else { None },
+                                    after,
+                                    ordered: false,
+                                };
+                                self.store
+                                    .links_far(batch, types, *d, &fr)
+                                    .await?
+                                    .into_iter()
+                                    .map(|x| (x, *d == Dir::Out))
+                                    .collect()
+                            } else {
+                                self.store
+                                    .links(batch, types, *d)
+                                    .await?
+                                    .into_iter()
+                                    .map(|l| ((l, None, None), *d == Dir::Out))
+                                    .collect()
+                            };
+                        if join && limit.is_some_and(|n| found.len() >= n) {
+                            join = false;
+                            continue;
+                        }
+                        break found;
+                    };
+                    if let Some(pre) = pre {
+                        got.extend(pre);
+                    }
+                    got
                 };
                 for ((l, n, rp), out_link) in found {
                     if let Some((props, types)) = rp
@@ -1858,7 +1997,7 @@ impl Exec<'_> {
         // Far nodes a top-k MATCH can't keep any more (see `Exec::prune`).
         let beaten: HashSet<u64> = match (&self.prune, &np.var) {
             (Some(p), Some(v)) if p.var == *v && p.bound.is_some() => {
-                let mut scratch = Row::new();
+                let mut scratch = Row::default();
                 let mut out = HashSet::new();
                 let mut seen_far: HashSet<u64> = HashSet::new();
                 for (_, far) in hops.values().flatten() {
@@ -2143,6 +2282,23 @@ impl Exec<'_> {
             }
         }
         let mut level = 0u32;
+        let mut ahead = Ahead::default();
+        // The walk's far nodes, read with its levels, are the candidates
+        // for the end node pattern (any of them, for `*0..`): their labels
+        // and the properties the clause needs come with the links, so
+        // binding the ends reads nothing more.
+        let deep_keys: Option<Vec<String>> = if DEEP_FAR_NODES && self.late && np.props.is_none() {
+            let label = np.labels.is_some();
+            match self.need_of(np.var.as_ref(), None) {
+                Some(super::late::Need::Keys(ks)) => {
+                    Some(ks.into_iter().filter(|k| !k.starts_with('\u{1}')).collect())
+                }
+                Some(super::late::Need::All) => None,
+                None => label.then(Vec::new),
+            }
+        } else {
+            None
+        };
         while !live.is_empty() {
             self.check_time()?;
             if level >= max {
@@ -2185,9 +2341,19 @@ impl Exec<'_> {
                     .collect()
             };
             metrics::counter!("sprig_graph_shard_queries_total", "tier" => "gateway").increment(1);
-            let hops = self
-                .level_links(&ids, &types, rp, rp.dir, &mut links)
-                .await?;
+            // A small outgoing walk with levels to go reads two levels a
+            // statement (LDBC IS2's `REPLY_OF*0..` up a reply chain).
+            let hops = if rp.dir == Dir::Out
+                && rp.props.is_none()
+                && level + 1 < max
+                && ids.len() <= DEEP_MAX
+            {
+                self.level_links_deep(&ids, &types, &mut links, &mut ahead, deep_keys.as_deref())
+                    .await?
+            } else {
+                self.level_links(&ids, &types, rp, rp.dir, &mut links)
+                    .await?
+            };
             let mut next = Vec::new();
             for (o, t) in live {
                 let Some(c) = hops.get(&t.end) else {
@@ -2480,6 +2646,215 @@ impl Exec<'_> {
     /// (far id, edge id). Only ids are read; with a property map on the
     /// relationship pattern, the edges are read to check it. Every link
     /// kept is recorded in `links`.
+    /// A pattern's start scan with its first hop, in one round trip when
+    /// the store can ([`GraphStore::scan_links`]): the scanned nodes, and
+    /// [`Exec::fused`] for the hop. `None`: scan alone.
+    async fn fuse_first_hop(
+        &mut self,
+        pat: &PathPattern,
+        scan: &Scan,
+        plain: bool,
+        track: bool,
+    ) -> Result<Option<Vec<NodeRow>>> {
+        let Some((rp, np)) = pat.steps.first() else {
+            return Ok(None);
+        };
+        if !self.late || !plain || rp.range.is_some() || rp.props.is_some() || np.props.is_some() {
+            return Ok(None);
+        }
+        let Some(types) = self.type_ids(rp).await? else {
+            return Ok(None);
+        };
+        let label = self.required_label(np).await?;
+        let far = np.labels.is_some() || track;
+        let p = self.far_plan(far, np.var.as_ref(), None, rp.var.as_ref(), label);
+        if p.only.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(None);
+        }
+        let only = p.only.clone().unwrap_or_default();
+        // A start that meets many links reads them again in the hop, in
+        // its batches (and without the join).
+        let cap = if p.far {
+            JOIN_ROWS_MAX
+        } else {
+            crate::store::FUSED_PLAIN_MAX
+        };
+        // Whether a capped read may go on past its last link (in id order).
+        let cont = CONTINUE_PAST_CAP
+            && p.far
+            && pat.steps.len() == 1
+            && self
+                .prune
+                .as_ref()
+                .is_some_and(|q| q.sql && np.var.as_ref() == Some(&q.var));
+        let fr = crate::store::FarRead {
+            keys: p.keys.as_deref(),
+            filter: &p.filter,
+            only: &only,
+            join: p.far,
+            rel_keys: p.rel_keys.as_deref(),
+            rel_filter: &p.rel_filter,
+            top: None,
+            limit: Some(cap),
+            after: None,
+            ordered: cont,
+        };
+        let Some((nodes, links, plain)) = self.store.scan_links(scan, &types, rp.dir, &fr).await?
+        else {
+            return Ok(None);
+        };
+        // A joined read cut short, or stale mirrors: the hop reads again.
+        if let Some(links) = links {
+            let mut ids: Vec<u64> = nodes.iter().map(|n| n.id).collect();
+            ids.sort_unstable();
+            let mut capped = links.len() >= cap;
+            // A joined start read cut short under a top-k projection: the
+            // far nodes it read bound the rest, which the hop reads joined
+            // after the last link (LDBC IS2's people with more than 160
+            // messages: two round trips, not three).
+            let mut after = None;
+            if capped
+                && cont
+                && let Some(last) = self.top_bound(np, &links, p.keys.as_deref())
+            {
+                capped = false;
+                after = Some(last);
+            }
+            // Past the cap: the unjoined links that came along, if they
+            // are whole (their far nodes are read by id in the hop).
+            let mut join = p.far;
+            let mut links = links;
+            if capped && let Some(pl) = plain.filter(|pl| pl.len() < crate::store::FUSED_PLAIN_MAX)
+            {
+                capped = false;
+                join = false;
+                links = pl;
+            }
+            self.fused = Some(Fused {
+                ids,
+                types,
+                dir: rp.dir,
+                join,
+                capped,
+                after,
+                links: if capped { Vec::new() } else { links },
+            });
+        }
+        Ok(Some(nodes))
+    }
+
+    /// For a start read cut short: when the clause's top-k prune is on
+    /// `np`'s variable and may cut in the store (`Prune::sql`), the links
+    /// all from one near node and their far nodes at least the projection's
+    /// count, sets the prune's bound from those far nodes and answers the
+    /// last link id (the read goes on after it).
+    fn top_bound(
+        &mut self,
+        np: &NodePat,
+        links: &[(crate::store::FarLink, bool)],
+        read: Option<&[String]>,
+    ) -> Option<u64> {
+        let var = np.var.as_ref()?;
+        let p = self.prune.as_ref()?;
+        if !p.sql || p.var != *var || p.limit == 0 || p.bound.is_some() {
+            return None;
+        }
+        let near = |l: &Link, out: bool| if out { l.src } else { l.dst };
+        let ((l0, _, _), o0) = links.first()?;
+        let n0 = near(l0, *o0);
+        if links.iter().any(|((l, _, _), o)| near(l, *o) != n0) {
+            return None;
+        }
+        let keys = p.keys.clone();
+        let limit = p.limit;
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut scored: Vec<Vec<Value>> = Vec::new();
+        let mut scratch = Row::default();
+        for ((_, n, _), _) in links {
+            let n = n.as_ref()?;
+            if !seen.insert(n.id) {
+                continue;
+            }
+            let node = self.merged_node(n, read);
+            scratch.insert(var.clone(), Value::Node(node));
+            let ks: Option<Vec<Value>> = keys
+                .iter()
+                .map(|(e, _)| eval(e, &scratch, self.params).ok())
+                .collect();
+            scored.push(ks?);
+        }
+        if scored.len() < limit {
+            return None;
+        }
+        scored.sort_by(|a, b| {
+            for (i, (_, asc)) in keys.iter().enumerate() {
+                let o = a[i].order(&b[i]);
+                let o = if *asc { o } else { o.reverse() };
+                if o != std::cmp::Ordering::Equal {
+                    return o;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        let bound = scored.swap_remove(limit - 1);
+        if let Some(p) = self.prune.as_mut() {
+            p.bound = Some(bound);
+        }
+        links.iter().map(|((l, _, _), _)| l.id).max()
+    }
+
+    /// [`Exec::level_links`] for an outgoing walk, a level ahead: the
+    /// nodes whose links `ahead` holds whole aren't read again, the rest
+    /// are read with their far nodes' links ([`GraphStore::links_deep`]).
+    async fn level_links_deep(
+        &mut self,
+        ids: &[u64],
+        types: &[u32],
+        links: &mut HashMap<u64, Link>,
+        ahead: &mut Ahead,
+        keys: Option<&[String]>,
+    ) -> Result<HashMap<u64, Vec<(u64, u64)>>> {
+        let mut out: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+        let mut need: Vec<u64> = Vec::new();
+        for &i in ids {
+            if ahead.complete.contains(&i) {
+                if let Some(c) = ahead.links.get(&i) {
+                    out.insert(i, c.clone());
+                }
+            } else {
+                need.push(i);
+            }
+        }
+        if need.is_empty() {
+            return Ok(out);
+        }
+        let d = self.store.links_deep(&need, types, keys).await?;
+        self.check_time()?;
+        for r in &d.nodes {
+            let n = match keys {
+                Some([]) => self.bare_node(r),
+                k => self.merged_node(r, k),
+            };
+            self.seen_nodes.insert(n.id, n);
+        }
+        let mut seen: HashSet<(u64, u64)> = HashSet::new();
+        for l in d.first {
+            if seen.insert((l.src, l.id)) {
+                out.entry(l.src).or_default().push((l.dst, l.id));
+                links.insert(l.id, l);
+            }
+        }
+        for l in d.second {
+            let c = ahead.links.entry(l.src).or_default();
+            if !c.iter().any(|(_, r)| *r == l.id) {
+                c.push((l.dst, l.id));
+            }
+            links.insert(l.id, l);
+        }
+        ahead.complete.extend(d.complete);
+        Ok(out)
+    }
+
     async fn level_links(
         &mut self,
         ids: &[u64],
@@ -2520,7 +2895,7 @@ impl Exec<'_> {
             let mut keys: Vec<(u64, u64)> = raw.iter().map(|(_, _, l)| (l.src_rk, l.id)).collect();
             keys.sort_unstable();
             keys.dedup();
-            let empty = Row::new();
+            let empty = Row::default();
             let mut ok: HashSet<u64> = HashSet::new();
             for batch in keys.chunks(self.b.batch_nodes.max(1)) {
                 for e in self.store.edges_at(batch).await? {
@@ -2774,6 +3149,80 @@ impl Exec<'_> {
 /// Frontiers up to this many nodes read their far nodes in the links
 /// statement.
 const JOIN_FAR_MAX: usize = 64;
+
+/// What a light hop reads of its far nodes and relationships
+/// ([`Exec::far_plan`]).
+struct FarPlan {
+    keys: Option<Vec<String>>,
+    filter: Vec<(String, CmpOp, f64)>,
+    only: Option<Vec<u64>>,
+    far: bool,
+    rel_keys: Option<Vec<String>>,
+    rel_filter: Vec<(String, CmpOp, f64)>,
+}
+
+/// A pattern's first hop read with its start scan
+/// ([`GraphStore::scan_links`]), for [`Exec::hop_light`].
+pub(crate) struct Fused {
+    /// The scanned nodes, sorted.
+    ids: Vec<u64>,
+    types: Vec<u32>,
+    dir: Dir,
+    join: bool,
+    /// The read met its cap: `links` is empty, and the hop reads without
+    /// the join.
+    capped: bool,
+    /// The read met its cap but set the top-k bound: the hop reads on,
+    /// joined, after this link id.
+    after: Option<u64>,
+    links: Vec<(crate::store::FarLink, bool)>,
+}
+
+/// Whether outgoing walks read their far nodes (labels and the needed
+/// properties) with their links. Off: on the laptop the joins cost more in
+/// MariaDB than the separate read of the ends they save (LDBC IS2's walk,
+/// build 34 against 33: 3–4 ms against 2–3 ms).
+const DEEP_FAR_NODES: bool = false;
+
+/// Whether a capped joined start read under a top-k projection goes on
+/// past its last link with the top-k bound (`Exec::top_bound`). Off: the
+/// read in link id order sorts every joined row first (LDBC IS2's 387
+/// messages: 7 ms against 5 ms for the unjoined read again).
+const CONTINUE_PAST_CAP: bool = false;
+
+/// Walks over at most this many nodes a level read the next level in the
+/// same statement ([`Exec::level_links_deep`]).
+const DEEP_MAX: usize = 64;
+
+/// Links of a walk's next level, read ahead.
+#[derive(Default)]
+struct Ahead {
+    /// Outgoing links by near node: `(far, rel)`.
+    links: HashMap<u64, Vec<(u64, u64)>>,
+    /// The nodes whose outgoing links `links` holds whole.
+    complete: HashSet<u64>,
+}
+
+/// A joined hop that meets this many links reads them again without the
+/// join: past it, the joins and the JSON of the far nodes, one statement
+/// after another in MariaDB, cost more than a second round trip whose node
+/// reads run in parallel (LDBC IS2's 387 messages of one person: 3.2 ms
+/// joined).
+const JOIN_ROWS_MAX: usize = 160;
+
+/// Whether hops read only the best far nodes of a top-k projection in
+/// SQL ([`crate::store::FarRead::top`]). Off: on the laptop's MariaDB the
+/// ranked statement cost more than reading every link (LDBC IS2's 387
+/// messages: 5.3 ms in MariaDB against 2.4 ms for the plain join and the
+/// gateway's 0.8 ms; IC9's 128-friend chunks: 0.6 s against 0.2 s), as
+/// it orders by JSON values twice joined. Answers are the same either way
+/// (`tests/check.sh` of r8perf: 180 mixed-type top-k queries).
+const SQL_TOP_K: bool = false;
+
+/// [`JOIN_FAR_MAX`] for a hop that reads only the best far nodes of a
+/// top-k projection: the join's rows stay in MariaDB, so larger frontiers
+/// join too.
+const JOIN_TOP_MAX: usize = 256;
 
 /// A path by ids: its nodes and edges in order.
 type IdPath = (Vec<u64>, Vec<u64>);

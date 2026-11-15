@@ -43,6 +43,7 @@
 mod tests;
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -176,7 +177,10 @@ impl McpState {
         let mut b = [0u8; 32];
         getrandom::fill(&mut b)
             .map_err(|e| SprigError::internal(format!("no random session id: {e}")))?;
-        let id: String = b.iter().map(|x| format!("{x:02x}")).collect();
+        let id = b.iter().fold(String::with_capacity(64), |mut s, x| {
+            let _ = write!(s, "{x:02x}");
+            s
+        });
         let mut s = lock(&self.sessions);
         let now = Instant::now();
         s.retain(|_, v| now.duration_since(v.last) < SESSION_IDLE);
@@ -482,7 +486,7 @@ enum Era {
     Legacy(Option<(Role, String)>),
 }
 
-#[allow(clippy::too_many_lines)] // the checks in the module docs' order
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)] // the checks in the module docs' order
 async fn serve_counted(
     b: &dyn Backend,
     st: &McpState,
@@ -506,7 +510,7 @@ async fn serve_counted(
     match *r.method {
         Method::POST => {}
         Method::DELETE => {
-            c.method = "delete".to_owned();
+            "delete".clone_into(&mut c.method);
             return delete(b, st, h, c).await;
         }
         _ => {
@@ -632,20 +636,19 @@ async fn serve_counted(
         a.contains("text/event-stream") && !a.contains("application/json") && !a.contains("*/*")
     });
     // 8. The role and the client: the session's, or this request's.
-    let (role, client) = match &era {
-        Era::Legacy(Some((role, client))) => (*role, client.clone()),
-        _ => {
-            let role = match core_mcp::role(query_value(r.query, "role")) {
-                Ok(r) => r,
-                Err(m) => return fail_reply(&Fail::sprig(&invalid(m)), Some(id)),
-            };
-            let info = if modern {
-                meta.and_then(|m| m.get(META_CLIENT))
-            } else {
-                params.get("clientInfo")
-            };
-            (role, client_name(info))
-        }
+    let (role, client) = if let Era::Legacy(Some((role, client))) = &era {
+        (*role, client.clone())
+    } else {
+        let role = match core_mcp::role(query_value(r.query, "role")) {
+            Ok(r) => r,
+            Err(m) => return fail_reply(&Fail::sprig(&invalid(m)), Some(id)),
+        };
+        let info = if modern {
+            meta.and_then(|m| m.get(META_CLIENT))
+        } else {
+            params.get("clientInfo")
+        };
+        (role, client_name(info))
     };
     let ctx = Ctx {
         st,

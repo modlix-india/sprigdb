@@ -23,7 +23,9 @@
 //! - [`egress`]: the egress gate;
 //! - [`settings`]: the `ai.*` keys;
 //! - [`budget`]: daily token budgets;
-//! - [`audit`]: conversations, messages and usage in the tenant catalog;
+//! - [`audit`]: conversations, messages and usage in the tenant catalog,
+//!   and the administration assistant's in a system schema
+//!   ([`audit::system`]);
 //! - [`feedback`]: votes on answers and proposal outcomes, and the prompt
 //!   notes made of them;
 //! - [`glossary`]: the tenant's business terms;
@@ -53,6 +55,7 @@ pub mod sql_guard;
 pub mod tools;
 pub mod turn;
 
+pub use audit::system::SystemAudit;
 pub use audit::{AuditStore, CatalogAudit, ConvId, MemoryAudit, MsgKind};
 pub use budget::{Budget, UsageToday};
 pub use egress::{EgressPolicy, Scrubber};
