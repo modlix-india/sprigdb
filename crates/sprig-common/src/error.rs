@@ -1094,6 +1094,10 @@ sprig_codes! {
     AiEgressDenied = 39995, "ER_SPRIG_AI_EGRESS_DENIED", "SprigAiEgressDenied", SQLSTATE_GENERAL, false;
     /// The model kept calling a tool outside its role, or with invalid input.
     AiToolDenied = 39996, "ER_SPRIG_AI_TOOL_DENIED", "SprigAiToolDenied", SQLSTATE_GENERAL, false;
+    /// An embedded column can't be declared or filled: an unknown model
+    /// alias, a dimension that isn't the model's, a source that isn't a
+    /// deterministic expression of the row, or a change the column refuses.
+    EmbeddingFailed = 39997, "ER_SPRIG_EMBEDDING_FAILED", "SprigEmbeddingFailed", SQLSTATE_GENERAL, false;
     /// `sprigdb.toml` or its environment overrides are invalid. Raised only at
     /// process start; never reaches a client.
     ConfigInvalid = 39998, "ER_SPRIG_CONFIG_INVALID", "SprigConfigInvalid", SQLSTATE_GENERAL, false;
@@ -1652,7 +1656,7 @@ fn sprig_protocol(code: SprigCode) -> ProtocolError {
         | SprigCode::MqMessageTooLarge => (Code::InvalidArgument, 413),
         SprigCode::StreamOffsetOutOfRange => (Code::OutOfRange, 416),
         SprigCode::TransportUnsupported => (Code::FailedPrecondition, 415),
-        SprigCode::AiNotConfigured => (Code::FailedPrecondition, 412),
+        SprigCode::AiNotConfigured | SprigCode::EmbeddingFailed => (Code::FailedPrecondition, 412),
         SprigCode::AiRefused => (Code::FailedPrecondition, 422),
         SprigCode::AdminUnauthenticated
         | SprigCode::OperatorLoginRequired

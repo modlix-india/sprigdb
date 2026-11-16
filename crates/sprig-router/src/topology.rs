@@ -208,6 +208,9 @@ pub struct OrphanChild {
     pub parent_column: String,
     /// The child's visible columns, in order (what moves with a row).
     pub columns: Vec<String>,
+    /// The parent's referenced column holds a unique key: a join on it
+    /// pairs each waiting row with one parent row.
+    pub parent_unique: bool,
 }
 
 /// A sharded table's `AUTO_INCREMENT` column:

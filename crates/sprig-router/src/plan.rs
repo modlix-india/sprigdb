@@ -314,6 +314,17 @@ pub struct WritePlan {
 /// its rows.
 pub const LIMITED_ROWS: &str = "__sprig_limited_rows__";
 
+/// The comment that starts a write's side statement: one that moves rows
+/// waiting in the orphanage to their parent's shard. Its affected rows and
+/// info don't count in the client's answer.
+pub const SIDE_MARK: &str = "/* sprig: adopt */ ";
+
+/// Whether `sql` is a side statement ([`SIDE_MARK`]).
+#[must_use]
+pub fn is_side(sql: &str) -> bool {
+    sql.starts_with(SIDE_MARK)
+}
+
 /// The read of a limited write: `SELECT <key>, <primary key> FROM … WHERE
 /// … ORDER BY … LIMIT n FOR UPDATE`, planned as a merge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -495,6 +506,15 @@ pub struct ViaParent {
     pub orphans: bool,
     /// Rows may wait for their parent at all ([`crate::topology::ParentLink::orphanable`]).
     pub orphanable: bool,
+    /// Per probe of a one-column key, its value as SQL text (empty for
+    /// keys of several columns).
+    pub key_literals: Vec<String>,
+    /// The child's visible columns, in order (what an adopted row
+    /// carries).
+    pub columns: Vec<String>,
+    /// The parent's referenced columns hold a unique key
+    /// ([`crate::topology::ParentLink::parent_unique`]).
+    pub parent_unique: bool,
 }
 
 // Key values hold no NaN: literals only.

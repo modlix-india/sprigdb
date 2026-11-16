@@ -102,3 +102,22 @@ fn long_inputs_are_truncated() {
     let v = m.embed_passages(&[long.as_str()]).expect("embed");
     assert!((norm(&v[0]) - 1.0).abs() < 1e-4);
 }
+
+#[test]
+fn a_token_cap_cuts_inputs() {
+    let m = need_model!();
+    let head = "the quick brown fox jumps over the lazy dog";
+    let long = format!("{head} {}", "and then it rained for days ".repeat(50));
+    // Cut to the head's own length, the long text embeds as the head does.
+    let n = m.count_tokens(head).expect("count");
+    let cut = m
+        .embed_passages_truncated(&[long.as_str(), head], n)
+        .expect("embed");
+    assert!(cosine(&cut[0], &cut[1]) > 0.9999);
+    // Uncut, it doesn't.
+    let full = m.embed_passages(&[long.as_str()]).expect("embed");
+    assert!(cosine(&full[0], &cut[1]) < 0.99);
+    // A cap at or above the model's own is the plain embedding.
+    let same = m.embed_passages_truncated(&[head], 10_000).expect("embed");
+    assert!(cosine(&same[0], &cut[1]) > 0.9999);
+}

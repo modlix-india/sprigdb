@@ -241,6 +241,41 @@ Points to know:
 
 Time zones are Olson names or UTC offsets. Variables `$$ROOT`, `$$CURRENT` and `$$NOW` work, and `$map` takes `arrayIndexAs` (`$$IDX`). Some MongoDB 8.1 to 8.3 forms are on as well, such as `$toString` of any type and `$convert` with `base` and `byteOrder`.
 
+### AI operators
+
+SprigDB adds five aggregation operators that call a language model or an embedding model. They are the [AI functions in SQL](../sql/ai-functions.md) under other names, with the same rules: `ai.functions.enabled` turns them on (39991 otherwise), a provider model needs `ai.share_data` on the collection's database (39995), the daily token budgets and `ai.functions.on_budget` apply (39992), and answers from a provider are cached.
+
+| Operator | Takes | Gives |
+|---|---|---|
+| `$aiEmbed` | `<expression>` or `{input, model?}` | An array of 384 doubles with the bundled model (`local:bge-small`), computed inside SprigDB; needs no `ai.share_data` |
+| `$aiClassify` | `{input, labels: [...], model?}` | One of the labels |
+| `$aiExtract` | `{input, schema, model?}`; `schema` is a JSON schema, as a document or a string | A value that fits the schema |
+| `$aiSummarize` | `<expression>` or `{input, maxWords?, model?}` | A string of at most `maxWords` words (100) |
+| `$aiComplete` | `<expression>` or `{prompt, model?}` | A string |
+
+```js
+db.tickets.aggregate([
+  { $match: { status: "new" } },
+  { $set: {
+      kind: { $aiClassify: { input: "$body", labels: ["bug", "feature request", "question"] } },
+      gist: { $aiSummarize: { input: "$body", maxWords: 25 } }
+  } },
+  { $project: { kind: 1, gist: 1 } }
+])
+
+db.products.aggregate([
+  { $vectorSearch: { index: "by_embedding", path: "embedding",
+                     queryVector: { $aiEmbed: "red running shoes" }, limit: 10 } }
+])
+```
+
+- They work in the stages of the pipeline itself (`$project`, `$addFields`, `$set`, `$group`, `$match` with `$expr`, `$replaceWith`, and the others), anywhere an expression goes, also inside other expressions (`{$toUpper: {$aiSummarize: "$body"}}`). Inside `$facet`, `$lookup` or `$unionWith` pipelines, in `find` projections and in update pipelines they aren't answered.
+- The input is evaluated for each document. A `null` or missing input gives `null`; another value that isn't a string fails with 14 `TypeMismatch`. Equal inputs are answered once.
+- The other arguments are fixed values. Operators don't nest (9 `FailedToParse`); `$aiClassify` and `$aiExtract` without their document form fail with 9 as well.
+- `$vectorSearch` takes `queryVector: {$aiEmbed: "<text>"}`, a fixed text.
+- A `model` must be one the operators allow (`ai.functions.model`, `ai.functions.models`). For `$aiClassify`, a model that isn't allowed is taken as one more label, as in SQL.
+- Errors from the arguments (a bad schema, too few labels) are 2 `BadValue`; the AI errors keep their SprigDB codes (39990 to 39997).
+
 ### Server-side JavaScript
 
 `$where`, `$function` and `$accumulator` run in SprigDB's embedded JavaScript engine while `mongo.server_js` is on (the default; scope tenant, data centre or global). All the code of one command shares `logic.function_budget_ms` of JavaScript time and a heap of `logic.memory_limit_mb`. Past the time, `$where` fails with 50 `MaxTimeMSExpired` and the others with 11601 `Interrupted`. With `mongo.server_js` off, they fail with MongoDB's errors for disabled JavaScript.

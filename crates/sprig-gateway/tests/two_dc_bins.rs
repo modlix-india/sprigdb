@@ -39,9 +39,11 @@
     clippy::doc_markdown,
     clippy::similar_names,
     clippy::cast_possible_truncation,
+    clippy::many_single_char_names,
     missing_docs
 )]
 
+use std::fmt::Write as _;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -986,10 +988,10 @@ async fn deploy() -> Option<Deployment> {
             Duration::from_secs(60),
         )
         .await;
-        clusters[i] = v["cluster"]["cluster_id"]
+        v["cluster"]["cluster_id"]
             .as_str()
             .expect("cluster id")
-            .to_owned();
+            .clone_into(&mut clusters[i]);
     }
     for dc in DCS {
         procs.start(
@@ -1348,7 +1350,7 @@ struct Stream {
 async fn open_stream(port: u16, auth: &str, db: &str, extra: &[(&str, &str)]) -> Stream {
     let mut h = String::new();
     for (k, v) in extra {
-        h.push_str(&format!("{k}: {v}\r\n"));
+        let _ = write!(h, "{k}: {v}\r\n");
     }
     let req = format!(
         "GET /v1/databases/{db}/changes HTTP/1.1\r\nHost: {H}:{port}\r\nAuthorization: {auth}\r\n{h}\r\n"

@@ -325,6 +325,7 @@ pub async fn check_callers(
     db_id: u32,
     v: NewVersion<'_>,
 ) -> Result<()> {
+    type Row = (String, String, u64, String);
     let NewVersion {
         module_id,
         name,
@@ -332,7 +333,6 @@ pub async fn check_callers(
         compiled,
         writes,
     } = v;
-    type Row = (String, String, u64, String);
     let s = sprig_common::names::quote(schema);
     let rows: Vec<Row> = c
         .exec(

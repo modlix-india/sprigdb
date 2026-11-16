@@ -2044,6 +2044,8 @@ async fn write(w: &WritePlan, be: &mut dyn ShardBackend, budget: &mut Budget) ->
     let (mut a, mut b, mut warn_info) = (0u64, 0u64, 0u64);
     for t in limited.as_ref().unwrap_or(&w.targets) {
         match be.run(t, &t.sql, budget).await {
+            // Rows moved out of the orphanage aren't the client's.
+            Ok(ShardOutcome::Ok(_)) if crate::plan::is_side(&t.sql) => {}
             Ok(ShardOutcome::Ok(ok)) => {
                 total.affected += ok.affected;
                 if total.last_insert_id == 0 {

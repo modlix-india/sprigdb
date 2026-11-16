@@ -238,6 +238,9 @@ pub struct AutoIndexHooks {
     /// The `doc_indexes` rows of automatic document indexes; `None`
     /// registers none (tests, controllers that don't change tenant catalogs).
     pub docs: Option<Arc<crate::autoindex_doc::DocRegistry>>,
+    /// The validators' statistics journal, which the drift reconciler
+    /// reads back; `None`: none (tests).
+    pub stats: Option<Arc<dyn sprig_advisor::autoindex::validate::journal::StatsJournal>>,
 }
 
 impl fmt::Debug for AutoIndexHooks {
@@ -567,6 +570,7 @@ async fn pass(
             decisions: &*hooks.decisions,
             now,
             removals: removals.as_ref().map(|g| g as &dyn RemovalGate),
+            stats: None,
         };
         match observe::retire_now(&store, &mut q, &cx, &r, *reason).await {
             Ok(st) => rep.retired.push((r.index_id, st)),
@@ -593,6 +597,7 @@ async fn pass(
             decisions: &*hooks.decisions,
             now,
             removals: removals.as_ref().map(|g| g as &dyn RemovalGate),
+            stats: None,
         };
         match observe::step(&store, &mut q, &cx, r).await {
             Ok(s) => {
@@ -652,6 +657,7 @@ async fn pass(
                 decisions: &*hooks.decisions,
                 now,
                 removals: None,
+                stats: hooks.stats.as_deref(),
             };
             match drift::reconcile_object(&store, &mut q, &cx, *object).await {
                 Ok(d) => rep.drift.push((*object, d)),
@@ -715,6 +721,7 @@ async fn user_pass(
             decisions: &*hooks.decisions,
             now,
             removals: removals.as_ref().map(|g| g as &dyn RemovalGate),
+            stats: None,
         };
         match observe::user::object_pass(store, q, &cx, *object).await {
             Ok(steps) => {

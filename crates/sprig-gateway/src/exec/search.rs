@@ -289,7 +289,7 @@ impl PassSession {
     }
 
     /// Runs `sql` through the tenant path, collecting its rows.
-    async fn sub_rows(
+    pub(super) async fn sub_rows(
         &mut self,
         cx: &mut ExecCtx<'_>,
         wire: Wire,

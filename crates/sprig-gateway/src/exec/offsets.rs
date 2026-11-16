@@ -50,6 +50,9 @@ pub(super) struct Collect {
     /// The columns' MySQL types (`LATERAL`'s gateway apply inlines numbers
     /// as numbers).
     pub(super) types: Vec<u8>,
+    /// The columns as sent (the AI functions' gateway step keeps the
+    /// other columns' metadata).
+    pub(super) defs: Vec<ColumnDef>,
     pub(super) rows: Vec<Vec<Option<Vec<u8>>>>,
     pub(super) affected: Option<u64>,
     pub(super) error: Option<SprigError>,
@@ -62,6 +65,7 @@ impl Collect {
             wire,
             columns: Vec::new(),
             types: Vec::new(),
+            defs: Vec::new(),
             rows: Vec::new(),
             affected: None,
             error: None,
@@ -81,6 +85,7 @@ impl ResultSink for Collect {
             .map(|c| String::from_utf8_lossy(&c.name).into_owned())
             .collect();
         self.types = columns.iter().map(|c| c.col_type).collect();
+        self.defs = columns.to_vec();
         Ok(())
     }
     async fn row(&mut self, values: RowValues<'_>) -> Result<()> {

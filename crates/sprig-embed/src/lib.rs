@@ -15,6 +15,8 @@
 //!
 //! [BAAI/bge-small-en-v1.5]: https://huggingface.co/BAAI/bge-small-en-v1.5
 
+pub mod local;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -193,6 +195,26 @@ impl Embedder {
         Ok(out)
     }
 
+    /// Embeds documents as [`Embedder::embed_passages`] does, each cut to
+    /// at most `max_tokens` model tokens (`[CLS]` and `[SEP]` included;
+    /// at least 2, at most [`MAX_TOKENS`]).
+    ///
+    /// # Errors
+    ///
+    /// The tokenizer or a forward pass failed.
+    pub fn embed_passages_truncated(
+        &self,
+        texts: &[&str],
+        max_tokens: usize,
+    ) -> Result<Vec<Vector>, EmbedError> {
+        let max = max_tokens.clamp(2, MAX_TOKENS);
+        let mut out = Vec::with_capacity(texts.len());
+        for batch in texts.chunks(BATCH) {
+            out.extend(self.forward_max(batch, max)?);
+        }
+        Ok(out)
+    }
+
     /// Embeds a search query, with [`QUERY_PREFIX`] in front.
     ///
     /// # Errors
@@ -208,6 +230,13 @@ impl Embedder {
     /// One padded batch through the model: CLS pooling, then L2
     /// normalisation.
     fn forward(&self, texts: &[&str]) -> Result<Vec<Vector>, EmbedError> {
+        self.forward_max(texts, MAX_TOKENS)
+    }
+
+    /// [`Embedder::forward`] with each input cut to `max` tokens: the
+    /// tokens past `max - 1` are dropped and the last kept one becomes
+    /// `[SEP]`, as the tokenizer's own truncation ends a sequence.
+    fn forward_max(&self, texts: &[&str], max: usize) -> Result<Vec<Vector>, EmbedError> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -215,17 +244,29 @@ impl Embedder {
             .tokenizer
             .encode_batch(texts.to_vec(), true)
             .map_err(|e| EmbedError::Tokenizer(e.to_string()))?;
-        let len = encodings
-            .iter()
-            .map(|e| e.get_ids().len())
-            .max()
-            .unwrap_or(0)
-            .max(1);
-        let rows = encodings.len();
+        let sep = encodings
+            .first()
+            .and_then(|e| e.get_ids().last().copied())
+            .unwrap_or(0);
+        let cut = |e: &tokenizers::Encoding| -> (Vec<u32>, Vec<u32>) {
+            let mut ids = e.get_ids().to_vec();
+            let mut mask = e.get_attention_mask().to_vec();
+            if ids.len() > max {
+                ids.truncate(max);
+                mask.truncate(max);
+                if let Some(last) = ids.last_mut() {
+                    *last = sep;
+                }
+            }
+            (ids, mask)
+        };
+        let cuts: Vec<(Vec<u32>, Vec<u32>)> = encodings.iter().map(cut).collect();
+        let len = cuts.iter().map(|(i, _)| i.len()).max().unwrap_or(0).max(1);
+        let rows = cuts.len();
         let mut ids = vec![0u32; rows * len];
         let mut mask = vec![0u32; rows * len];
-        for (r, e) in encodings.iter().enumerate() {
-            for (c, (&id, &m)) in e.get_ids().iter().zip(e.get_attention_mask()).enumerate() {
+        for (r, (ri, rm)) in cuts.iter().enumerate() {
+            for (c, (&id, &m)) in ri.iter().zip(rm).enumerate() {
                 ids[r * len + c] = id;
                 mask[r * len + c] = m;
             }

@@ -9,6 +9,8 @@
 //! etcd scopes when it uses them ([`settings`]). Automatic index builds
 //! don't run here yet.
 
+// Embedded columns: the `ai_embed` jobs.
+pub mod ai_embed;
 // The asynchronous graph mirror applier and the `queue.change_exchange`
 // forwarders.
 pub mod change_exchange;
@@ -354,6 +356,17 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
                 .view(sprig_feed::shared::Kept::All)
                 .named("change_exchange"),
             ..env.clone()
+        })))
+        // Embedded columns: one job per column, through the shared
+        // reader.
+        .with_handler(Arc::new(ai_embed::AiEmbed(ai_embed::EmbedEnv {
+            logic: logic::LogicEnv {
+                feed: shared_feed
+                    .view(sprig_feed::shared::Kept::All)
+                    .named("ai_embed"),
+                ..env.clone()
+            },
+            maps: graph_mirror_env.maps.clone(),
         })))
         // Scheduled runs read definers' tenant subtrees from the global
         // tier.

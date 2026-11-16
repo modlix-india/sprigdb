@@ -158,6 +158,18 @@ fn service() -> Result<Arc<AiService>, SprigError> {
     })
 }
 
+/// The provider and model a `provider/model` value names, for the AI
+/// functions in statements.
+///
+/// # Errors
+/// 39990 without a provider store, or when the value names no provider.
+pub(crate) async fn provider_for(
+    model: &str,
+) -> Result<(Arc<dyn sprig_ai::Provider>, String), SprigError> {
+    let svc = service()?;
+    svc.providers.for_role(Role::Data, model, &*svc.keys).await
+}
+
 // ---- settings ----
 
 /// The `ai.*` values for a caller: the tenant's (and database's) scopes,

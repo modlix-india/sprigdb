@@ -3779,10 +3779,26 @@ fn plan_update_delete(stmt: &Statement, src: &Src<'_>, cx: &PlanCtx<'_>) -> R<Pl
         .get(shard_list[0])
         .map(|s| s.cluster.as_str());
     let fkw = fk::update_delete_work(&dml, entry, &rel.default_schema, near, cx)?;
-    if (!releases.is_empty() || fkw.is_some()) && shard_list.len() == 1 {
+    // An UPDATE of a parent's referenced column: rows waiting in the
+    // orphanage for the new value go to their parents' shards in the same
+    // write. A limited one leaves them to the controller's sweep.
+    let adopt = if kind == WriteKind::Update && !shards.is_empty() && !(order_by || limit) {
+        let parent = match &twjs[0].relation {
+            TableFactor::Table { name, .. } => ident_parts(name)
+                .and_then(|p| p.last().map(|i| i.value.clone()))
+                .unwrap_or_else(|| entry.name.clone()),
+            _ => entry.name.clone(),
+        };
+        parents::update_adoption(entry, &parent, &assignments, &shard_list)
+    } else {
+        Vec::new()
+    };
+    if (!releases.is_empty() || fkw.is_some() || !adopt.is_empty()) && shard_list.len() == 1 {
+        let mut targets = vec![make(shard_list[0], (!src.template).then_some(src))];
+        targets.extend(adopt);
         return Ok(Plan::Write(WritePlan {
             kind,
-            targets: vec![make(shard_list[0], (!src.template).then_some(src))],
+            targets,
             rows: 0,
             claims: Vec::new(),
             releases,
@@ -3829,6 +3845,7 @@ fn plan_update_delete(stmt: &Statement, src: &Src<'_>, cx: &PlanCtx<'_>) -> R<Pl
         targets: shards
             .into_iter()
             .map(|s| make(s, (!src.template).then_some(src)))
+            .chain(adopt)
             .collect(),
         rows: 0,
         claims: Vec::new(),

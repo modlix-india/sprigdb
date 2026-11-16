@@ -455,6 +455,9 @@ impl ResultMapper {
                 Role::CreateTable => {
                     // 3306: functional key parts as MySQL writes them,
                     // before their hidden columns are filtered.
+                    // Embedded columns' clauses, read from their hidden
+                    // columns before those are filtered.
+                    let s = crate::embedcol::show_create(&s);
                     let fx;
                     let src: &str = if self.persona == Persona::MySql84 {
                         fx = crate::compat::schema::mysql_functional_parts(&s);

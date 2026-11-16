@@ -3,7 +3,10 @@
 //! - `sprig_ai_requests_total{role,provider,model,result}`: model calls;
 //!   `result` is `ok`, `refused` or `error`.
 //! - `sprig_ai_tokens_total{role,direction}`: `input`, `output`,
-//!   `cache_read` or `cache_write`.
+//!   `cache_read` or `cache_write`; `role` is an assistant's, or
+//!   `functions` for the AI functions in statements.
+//! - `sprig_ai_fn_calls_total{fn,model,cached}`: distinct inputs the AI
+//!   functions answered, from the cache (`cached="true"`) or not.
 //! - `sprig_ai_turn_seconds{role}`: one turn, model calls and tools.
 //! - `sprig_ai_tool_calls_total{tool,result}`: `ok`, `error`, `denied`
 //!   or `proposed`.
@@ -54,6 +57,12 @@ pub fn request(role: Role, provider: &str, model: &str, result: &'static str) {
 
 /// One call's tokens.
 pub fn tokens(role: Role, u: &Usage) {
+    tokens_as(role.as_str(), u);
+}
+
+/// One call's tokens, under a `role` label that isn't an assistant's
+/// (`functions` for the AI functions in statements).
+pub fn tokens_as(role: &'static str, u: &Usage) {
     for (direction, n) in [
         ("input", u.input_tokens),
         ("output", u.output_tokens),
@@ -63,7 +72,7 @@ pub fn tokens(role: Role, u: &Usage) {
         if n > 0 {
             metrics::counter!(
                 "sprig_ai_tokens_total",
-                "role" => role.as_str(),
+                "role" => role,
                 "direction" => direction
             )
             .increment(n);

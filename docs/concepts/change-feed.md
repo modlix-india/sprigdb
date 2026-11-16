@@ -149,6 +149,10 @@ Instead of a resume token, a stream can start at a time: `start_at_hlc`, a hybri
 
 The same stream is the `Changes.Watch` server-streaming call of the `sprig.v1` API, one `ChangeEvent` message per event, on the gateway's HTTP ports. See [REST and gRPC](../connect/rest-and-grpc.md).
 
+### From another data centre
+
+A change stream opened at a gateway outside the tenant's home data centre (over HTTP or gRPC) is relayed from a gateway in the home data centre, where the tenant's feed is read; the client sees the same events and tokens. If the client reads too slowly, the stream ends with 39790 as usual. If the home data centre's gateway goes away, the stream ends with 39788 `ER_SPRIG_FORWARD_FAILED` (retryable): reconnect and resume from the last token. Relayed streams are counted in `sprig_api_change_streams_forwarded_total`.
+
 ### Limits
 
 | Setting | Default | Meaning |
@@ -170,6 +174,7 @@ The three settings can be set for a tenant or globally. A `Sprig-Space` header (
 | 39802 | `ER_SPRIG_FEED_SOURCE_UNSUPPORTED` | A cluster's binlog settings don't meet the feed's needs, or `start_at_hlc` on a cluster without a time index yet |
 | 39780 | `ER_SPRIG_RATE_LIMITED` | Too many open streams for the tenant on this gateway |
 | 39790 | `ER_SPRIG_STREAM_SLOW_CONSUMER` | The client fell too far behind; resume from the last token |
+| 39788 | `ER_SPRIG_FORWARD_FAILED` | A stream relayed from the home data centre lost its gateway there; resume from the last token |
 
 ## Not supported yet
 

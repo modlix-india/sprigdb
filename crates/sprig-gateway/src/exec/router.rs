@@ -1176,7 +1176,8 @@ impl PassSession {
         if let Some(e) = self.moved_under(&layout, &text).await {
             return self.fail(out, &e).await;
         }
-        if let Some(step) = self.txn_control(cx, &text, more, out).await? {
+        // Boxed: the coordinator's commit is a large future.
+        if let Some(step) = Box::pin(self.txn_control(cx, &text, more, out)).await? {
             return Ok(step);
         }
         // Statements that end a coordinator transaction first: `SET

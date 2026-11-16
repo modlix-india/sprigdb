@@ -26,11 +26,15 @@
 
 // `ASK '<question>'`: an assistant's proposed query, never run.
 mod ask;
+// AI functions in statements (`AI_CLASSIFY(...)` and the others).
+mod ai_fn;
 mod capture;
 mod compat_sink;
 mod dc;
 // A dropped database's sinks and logic modules go with it.
 mod dropdb;
+// Embedded columns in table DDL.
+mod embed_ddl;
 // The read-only `sprig_docs` database.
 mod docs;
 mod fence;

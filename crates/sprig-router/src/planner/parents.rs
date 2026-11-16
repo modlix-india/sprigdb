@@ -26,6 +26,15 @@
 //! itself an `UPDATE` of their `_sprig_rk`, elsewhere an
 //! `INSERT … SELECT` from it on the same cluster and a `DELETE` there.
 //!
+//! **Joins.** Two more writes take waiting rows along, with statements
+//! that find the parents themselves ([`join_adoption`]), on the shards of
+//! the hash-0 shard's cluster: an `UPDATE` of a parent's referenced column
+//! ([`update_adoption`]), and a row that goes to the orphanage, whose
+//! parent may have been inserted on another connection since the parent
+//! was looked for. Their statements are side statements
+//! ([`crate::plan::SIDE_MARK`]): the rows they move don't count in the
+//! client's answer.
+//!
 //! The foreign-key check on the shard is what makes this safe: a child row
 //! can only commit next to its parent, so a parent that moved or vanished
 //! between the read and the write fails the statement (a fence error or
@@ -43,7 +52,7 @@ use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 
 use super::{PlanCtx, R, Src, assigns_key, ident_parts, loc_of, one_shard_insert, shard_insert};
-use crate::plan::{ParentHits, Plan, ViaParent, WriteKind, WritePlan};
+use crate::plan::{ParentHits, Plan, SIDE_MARK, Target, ViaParent, WriteKind, WritePlan};
 use crate::reject::{Reason, Rejection, reject};
 use crate::topology::{ParentLink, TableEntry};
 
@@ -219,6 +228,14 @@ pub(super) fn plan_insert(
         }
         planned.columns = entry.columns.iter().map(|c| column(c)).collect();
     }
+    let key_literals: Vec<String> = if link.columns.len() == 1 {
+        first_of
+            .iter()
+            .filter_map(|r| r.first().map(|e| literal(e)))
+            .collect::<R<_>>()?
+    } else {
+        Vec::new()
+    };
     let lookup = link.lookup.as_ref().and_then(|l| {
         let part = l.index.columns.first()?.class;
         let values = first_of
@@ -245,6 +262,9 @@ pub(super) fn plan_insert(
         fk_columns: (link.columns.clone(), link.parent_columns.clone()),
         orphans: link.orphans,
         orphanable: link.orphanable,
+        key_literals,
+        columns: entry.columns.clone(),
+        parent_unique: link.parent_unique,
     })))
 }
 
@@ -266,6 +286,8 @@ impl ViaParent {
         let loc = loc_of(name);
         // Per row: its shard and its hash.
         let mut placed: Vec<(usize, Option<u64>)> = Vec::with_capacity(self.row_probe.len());
+        // Probes whose rows wait in the orphanage.
+        let mut orphaned: Vec<usize> = Vec::new();
         for &p in &self.row_probe {
             let mut at: Option<(usize, Option<u64>)> = None;
             for &(s, rk) in hits.get(p).map_or(&[][..], Vec::as_slice) {
@@ -297,6 +319,9 @@ impl ViaParent {
                 None if self.orphans && self.orphanable && self.fill_rk => {
                     let h = sprig_shard::fk::ORPHAN_RK;
                     placed.push((self.group.route(h), Some(h)));
+                    if !orphaned.contains(&p) {
+                        orphaned.push(p);
+                    }
                 }
                 None => {
                     return reject(
@@ -355,6 +380,35 @@ impl ViaParent {
                 *shard,
                 loc,
                 &self.default_schema,
+            ));
+        }
+        // A parent inserted on another connection since it was looked
+        // for: its rows are taken along now, after they are written.
+        if !orphaned.is_empty()
+            && self.parent_unique
+            && self.key_literals.len() == self.probes.len()
+            && let ([column], [parent_column]) =
+                (self.fk_columns.0.as_slice(), self.fk_columns.1.as_slice())
+        {
+            let values: Vec<String> = orphaned
+                .iter()
+                .filter_map(|p| self.key_literals.get(*p).cloned())
+                .collect();
+            let child = ident_parts(name)
+                .and_then(|p| p.last().map(|i| i.value.clone()))
+                .unwrap_or_else(|| self.table.clone());
+            let all: Vec<usize> = (0..self.group.shards.len()).collect();
+            targets.extend(join_adoption(
+                &self.group,
+                &Waiting {
+                    child: &child,
+                    column,
+                    columns: &self.columns,
+                    parent: &self.parent,
+                    parent_column,
+                },
+                &all,
+                Some(&values),
             ));
         }
         if targets.len() == 1 {
@@ -490,7 +544,7 @@ pub(super) fn adoption(
             let target = |i: usize, l: &crate::topology::ShardLoc, sql: String| Target {
                 cluster: l.cluster.clone(),
                 shard: l.shard,
-                sql,
+                sql: format!("{SIDE_MARK}{sql}"),
                 at: entry.group.at(i),
             };
             if shard == s0 {
@@ -542,6 +596,167 @@ pub(super) fn adoption(
         }
     }
     Ok(out)
+}
+
+/// A table whose rows may wait in the orphanage, and its parent, as
+/// [`join_adoption`] names them.
+pub(super) struct Waiting<'a> {
+    /// The child table.
+    pub(super) child: &'a str,
+    /// Its foreign-key column.
+    pub(super) column: &'a str,
+    /// Its visible columns, in order.
+    pub(super) columns: &'a [String],
+    /// The parent table.
+    pub(super) parent: &'a str,
+    /// The parent's referenced column.
+    pub(super) parent_column: &'a str,
+}
+
+/// Side statements that take the rows of `w.child` waiting on the hash-0
+/// shard (`_sprig_rk = 0`, and a key among `values` when given) to the
+/// shard among `shards` whose copy of the parent holds their parent row,
+/// with its `_sprig_rk`: on the hash-0 shard an `UPDATE … JOIN`, on each
+/// other shard an `INSERT … SELECT … JOIN`, then one `DELETE` of what was
+/// copied. Shards on other clusters are left out (their rows keep
+/// waiting). Run in one transaction, under `REPEATABLE READ`, the copy's
+/// locking read keeps the parents and the waiting rows from changing
+/// before the `DELETE`, so it removes exactly what was copied. The
+/// parent's referenced column must hold a unique key, or one row would be
+/// copied once per parent row.
+pub(super) fn join_adoption(
+    group: &crate::topology::Group,
+    w: &Waiting<'_>,
+    shards: &[usize],
+    values: Option<&[String]>,
+) -> Vec<Target> {
+    let mut out = Vec::new();
+    if values.is_some_and(<[String]>::is_empty) {
+        return out;
+    }
+    let s0 = group.route(sprig_shard::fk::ORPHAN_RK);
+    let Some(loc0) = group.shards.get(s0) else {
+        return out;
+    };
+    let rk = quote(RK);
+    let (fk, pc) = (quote(w.column), quote(w.parent_column));
+    let child0 = format!("{}.{}", quote(&loc0.schema), quote(w.child));
+    let only = values.map_or_else(String::new, |v| {
+        format!(" AND c.{fk} IN ({})", v.join(", "))
+    });
+    let mut here = false;
+    let mut away: Vec<usize> = Vec::new();
+    for &s in shards {
+        let Some(loc) = group.shards.get(s) else {
+            continue;
+        };
+        if loc.cluster != loc0.cluster {
+            continue;
+        }
+        if s == s0 {
+            here = true;
+        } else if !away.contains(&s) {
+            away.push(s);
+        }
+    }
+    let side = |i: usize, sql: String| {
+        let l = &group.shards[i];
+        Target {
+            cluster: l.cluster.clone(),
+            shard: l.shard,
+            sql: format!("{SIDE_MARK}{sql}"),
+            at: group.at(i),
+        }
+    };
+    if here {
+        out.push(side(
+            s0,
+            format!(
+                "UPDATE {child0} c JOIN {}.{} p ON p.{pc} = c.{fk} SET c.{rk} = p.{rk} \
+                 WHERE c.{rk} = 0 AND p.{rk} IS NOT NULL{only}",
+                quote(&loc0.schema),
+                quote(w.parent)
+            ),
+        ));
+    }
+    if w.columns.is_empty() || away.is_empty() {
+        return out;
+    }
+    let cols: Vec<String> = w.columns.iter().map(|c| quote(c)).collect();
+    let list = cols.join(", ");
+    let from_c = cols
+        .iter()
+        .map(|c| format!("c.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut exists = Vec::with_capacity(away.len());
+    for s in away {
+        let schema = quote(&group.shards[s].schema);
+        let parent = format!("{schema}.{}", quote(w.parent));
+        out.push(side(
+            s,
+            format!(
+                "INSERT INTO {schema}.{} ({list}, {rk}) SELECT {from_c}, p.{rk} FROM {child0} c \
+                 JOIN {parent} p ON p.{pc} = c.{fk} WHERE c.{rk} = 0 AND p.{rk} IS NOT NULL{only}",
+                quote(w.child)
+            ),
+        ));
+        exists.push(format!(
+            "EXISTS (SELECT 1 FROM {parent} p WHERE p.{pc} = c.{fk} AND p.{rk} IS NOT NULL)"
+        ));
+    }
+    out.push(side(
+        s0,
+        format!(
+            "DELETE c FROM {child0} c WHERE c.{rk} = 0{only} AND ({})",
+            exists.join(" OR ")
+        ),
+    ));
+    out
+}
+
+/// The side statements of an `UPDATE` of parent `entry` (named `parent`
+/// in the statement) on `shards`: for each child whose rows may wait for
+/// it and whose referenced column the statement sets, [`join_adoption`],
+/// narrowed to the new value when it is a literal.
+pub(super) fn update_adoption(
+    entry: &TableEntry,
+    parent: &str,
+    assignments: &[&Assignment],
+    shards: &[usize],
+) -> Vec<Target> {
+    let mut out = Vec::new();
+    for c in &entry.orphan_children {
+        if !c.parent_unique {
+            continue;
+        }
+        let Some(a) = assignments
+            .iter()
+            .find(|a| assigns_key(&a.target, &c.parent_column))
+        else {
+            continue;
+        };
+        let values = match adopt_literal(&a.value) {
+            // NULL: no row waits for it.
+            Ok(None) => continue,
+            Ok(Some(l)) => Some(vec![l]),
+            // An expression: every waiting row is looked at.
+            Err(_) => None,
+        };
+        out.extend(join_adoption(
+            &entry.group,
+            &Waiting {
+                child: &c.table,
+                column: &c.column,
+                columns: &c.columns,
+                parent,
+                parent_column: &c.parent_column,
+            },
+            shards,
+            values.as_deref(),
+        ));
+    }
+    out
 }
 
 fn literal(e: &Expr) -> R<String> {
@@ -1051,6 +1266,111 @@ mod tests {
                 .any(|(_, s)| s.contains("(10, 1, 'a', ") && s.contains(&h.to_string())),
             "{log:#?}"
         );
+        // A parent inserted since it was looked for: side statements, after
+        // the row is written, take it along (narrowed to its key).
+        let side: Vec<&str> = log
+            .iter()
+            .map(|(_, s)| s.as_str())
+            .filter(|s| crate::plan::is_side(s))
+            .collect();
+        let written = log.iter().position(|(_, s)| s.contains("(99, 1,")).unwrap();
+        let first_side = log
+            .iter()
+            .position(|(_, s)| crate::plan::is_side(s))
+            .unwrap();
+        assert!(written < first_side, "{log:#?}");
+        assert!(
+            side.iter()
+                .any(|s| s.contains("UPDATE") && s.contains("c.`iid` IN (99)")),
+            "{side:#?}"
+        );
+        assert!(side.iter().all(|s| s.contains("IN (99)")), "{side:#?}");
+    }
+
+    /// An `UPDATE` that sets a parent's referenced column takes the rows
+    /// waiting for the new value along, on the hash-0 shard's cluster:
+    /// in place on the hash-0 shard, copied to the others and then
+    /// deleted there.
+    #[test]
+    fn an_update_of_the_referenced_column_adopts() {
+        use crate::plan::is_side;
+        let t = orphan_topo(&["c1", "c2"]);
+        let g = &t.table(DEF, "invoices").unwrap().group;
+        let s0 = g.route(0);
+        let s0_schema = &g.shards[s0].schema;
+        let same = (0..g.shards.len())
+            .filter(|i| g.shards[*i].cluster == g.shards[s0].cluster)
+            .count();
+        assert!(same > 1 && same < g.shards.len());
+        let Plan::Write(w) = p_with(
+            &t,
+            "UPDATE invoices SET iid = 77, total = 1 WHERE total > 5",
+        ) else {
+            panic!()
+        };
+        let side: Vec<&str> = w
+            .targets
+            .iter()
+            .filter(|x| is_side(&x.sql))
+            .map(|x| x.sql.as_str())
+            .collect();
+        assert_eq!(w.targets.len() - side.len(), g.shards.len());
+        // The update itself first, then the hash-0 shard, the copies and
+        // one delete.
+        assert!(!is_side(&w.targets[0].sql) && is_side(&w.targets.last().unwrap().sql));
+        assert_eq!(side.len(), 1 + (same - 1) + 1, "{side:#?}");
+        assert_eq!(
+            side[0],
+            format!(
+                "/* sprig: adopt */ UPDATE `{s0_schema}`.`invoice_lines` c JOIN \
+                 `{s0_schema}`.`invoices` p ON p.`iid` = c.`iid` SET c.`_sprig_rk` = \
+                 p.`_sprig_rk` WHERE c.`_sprig_rk` = 0 AND p.`_sprig_rk` IS NOT NULL AND \
+                 c.`iid` IN (77)"
+            )
+        );
+        assert!(
+            side[1].contains("INSERT INTO") && side[1].contains("(`iid`, `line_no`, `sku`, `_sprig_rk`) SELECT c.`iid`, c.`line_no`, c.`sku`, p.`_sprig_rk`"),
+            "{}",
+            side[1]
+        );
+        assert!(
+            side.last().unwrap().starts_with(&format!(
+                "/* sprig: adopt */ DELETE c FROM `{s0_schema}`.`invoice_lines` c WHERE \
+                 c.`_sprig_rk` = 0 AND c.`iid` IN (77) AND (EXISTS (SELECT 1 FROM"
+            )),
+            "{}",
+            side.last().unwrap()
+        );
+        // Every side statement runs on the hash-0 shard's cluster.
+        assert!(
+            w.targets
+                .iter()
+                .filter(|x| is_side(&x.sql))
+                .all(|x| x.cluster == g.shards[s0].cluster)
+        );
+        // A new value that is an expression: every waiting row is looked at.
+        let Plan::Write(w) = p_with(&t, "UPDATE invoices SET iid = iid + 1000 WHERE total > 5")
+        else {
+            panic!()
+        };
+        let side: Vec<&str> = w
+            .targets
+            .iter()
+            .filter(|x| is_side(&x.sql))
+            .map(|x| x.sql.as_str())
+            .collect();
+        assert!(!side.is_empty() && side.iter().all(|s| !s.contains(" IN (")));
+        // Other columns, or a NULL: nothing more.
+        for sql in [
+            "UPDATE invoices SET total = 2 WHERE total > 5",
+            "UPDATE invoices SET iid = NULL WHERE total > 5",
+        ] {
+            match p_with(&t, sql) {
+                Plan::Write(w) => assert!(w.targets.iter().all(|x| !is_side(&x.sql)), "{sql}"),
+                Plan::Pass(x) => assert!(!is_side(&x.sql)),
+                p => panic!("{p:?}"),
+            }
+        }
     }
 
     /// A topology whose `invoice_lines` key has its orphanage open, on
@@ -1138,22 +1458,22 @@ mod tests {
         assert!(sqls[0].starts_with("INSERT INTO") && sqls[1].starts_with("INSERT INTO"));
         assert!(
             sqls.contains(&format!(
-                "UPDATE `{s0_schema}`.`invoice_lines` SET `_sprig_rk` = CASE `iid` WHEN 50 THEN \
-                 {h_home} END WHERE `iid` IN (50) AND `_sprig_rk` = 0"
+                "/* sprig: adopt */ UPDATE `{s0_schema}`.`invoice_lines` SET `_sprig_rk` = CASE \
+                 `iid` WHEN 50 THEN {h_home} END WHERE `iid` IN (50) AND `_sprig_rk` = 0"
             )
             .as_str()),
             "{sqls:#?}"
         );
         assert!(
             sqls.contains(&format!(
-                "INSERT INTO `{away_schema}`.`invoice_lines` (`iid`, `line_no`, `sku`, `_sprig_rk`) \
-                 SELECT `iid`, `line_no`, `sku`, CASE `iid` WHEN 51 THEN {h_away} END FROM \
+                "/* sprig: adopt */ INSERT INTO `{away_schema}`.`invoice_lines` (`iid`, `line_no`, \
+                 `sku`, `_sprig_rk`) SELECT `iid`, `line_no`, `sku`, CASE `iid` WHEN 51 THEN {h_away} END FROM \
                  `{s0_schema}`.`invoice_lines` WHERE `iid` IN (51) AND `_sprig_rk` = 0"
             )
             .as_str()),
             "{sqls:#?}"
         );
-        let del = sqls.iter().position(|s| s.starts_with("DELETE")).unwrap();
+        let del = sqls.iter().position(|s| s.contains("*/ DELETE")).unwrap();
         let ins = sqls
             .iter()
             .position(|s| s.contains("SELECT `iid`"))

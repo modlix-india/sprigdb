@@ -11,7 +11,7 @@
 //! ```
 //!
 //! A server with `wsrep_on` is a Galera cluster (the gateway's Galera
-//! checks run too). The test uses schemas `churnfix_txnpool_s1` and
+//! checks run too). The test uses schemas `txnpool_live_s1` and
 //! `_s2` and drops exactly those.
 
 #![allow(
@@ -237,7 +237,7 @@ async fn branch_connections_return_to_the_pool_clean() {
         .map(|(i, u)| Server {
             id: ClusterId::new(sprig_testkit::unique_name("txp")).unwrap(),
             url: u.trim_end_matches('/').to_owned(),
-            schema: format!("churnfix_txnpool_s{}", i + 1),
+            schema: format!("txnpool_live_s{}", i + 1),
             shard: u32::try_from(i + 1).unwrap(),
         })
         .collect();
@@ -284,7 +284,7 @@ async fn branch_connections_return_to_the_pool_clean() {
         let topology = if galera == Some(1) {
             TopologyKind::Galera
         } else {
-            TopologyKind::Single
+            TopologyKind::SingleNode
         };
         let rest = s.url.strip_prefix("mysql://").unwrap();
         let (cred, addr) = rest.rsplit_once('@').unwrap();
@@ -339,7 +339,7 @@ async fn branch_connections_return_to_the_pool_clean() {
         TENANT,
         TxnConfig {
             policy: NonXaPolicy::Sprig2pc,
-            coordinator_id: "churnfix-live".into(),
+            coordinator_id: "txn-pool-live".into(),
             ..TxnConfig::default()
         },
     );

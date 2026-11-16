@@ -111,6 +111,17 @@ pub fn is_running(node: &NodeId, t: &IndexTarget) -> bool {
         .contains_key(&key(node, t))
 }
 
+/// Whether a validation of this process other than the caller's runs on
+/// `node`'s table `t` (the caller has registered itself).
+#[must_use]
+pub(crate) fn others_running(node: &NodeId, t: &IndexTarget) -> bool {
+    running_map()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&key(node, t))
+        .is_some_and(|n| *n > 1)
+}
+
 /// What [`drop_leftovers`] found and dropped.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Leftovers {
@@ -489,9 +500,11 @@ mod tests {
         let a = running(&n1, &t);
         let b = running(&n1, &lower);
         assert!(is_running(&n1, &t) && is_running(&n1, &lower));
+        assert!(others_running(&n1, &t));
         assert!(!is_running(&n2, &t));
         drop(a);
         assert!(is_running(&n1, &t), "the second validation still runs");
+        assert!(!others_running(&n1, &t));
         drop(b);
         assert!(!is_running(&n1, &t));
     }

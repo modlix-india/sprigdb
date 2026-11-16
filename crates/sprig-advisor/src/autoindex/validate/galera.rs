@@ -6,7 +6,8 @@
 //!    index isn't there; note the node's global wsrep_OSU_method and
 //!    wsrep_desync, its GTID position and the table's signature
 //! 2. mark the node validating, writer weight 0
-//! 3. snapshot the statistics rows
+//! 3. snapshot the statistics rows and journal them (no ANALYZE when
+//!    the journal can't be written)
 //! 4. on the node: SET SESSION wsrep_OSU_method = 'RSU', sql_log_bin = 0;
 //!      ALTER TABLE ... ADD INDEX IF NOT EXISTS x (...)
 //!    SET SESSION wsrep_OSU_method = 'TOI'
@@ -36,6 +37,7 @@ use std::time::{Duration, Instant};
 use sprig_cluster::sql::{NodeEndpoint, ProbeError};
 use sprig_common::Result;
 
+use super::journal::StatsJournal;
 use super::node::{
     NodeSql, NodeWatch, StatsSnapshot, add_def_sql, analyze_sql, drop_index_sql, own_new_gtids,
     run_watched,
@@ -63,6 +65,8 @@ pub struct RsuValidator {
     /// The writer: an index already on the node but not there is a
     /// cut-off validation's leftover, dropped before building.
     writer: Option<NodeEndpoint>,
+    /// Where the statistics snapshot is kept while the validation runs.
+    journal: Option<Arc<dyn StatsJournal>>,
 }
 
 impl std::fmt::Debug for RsuValidator {
@@ -86,7 +90,17 @@ impl RsuValidator {
             marker,
             probe_timeout: Duration::from_secs(10),
             writer: None,
+            journal: None,
         }
+    }
+
+    /// Journals the statistics snapshot before `ANALYZE LOCAL` and removes
+    /// it after the restore ([`super::journal`]); when the journal can't be
+    /// written the validation replays without `ANALYZE`.
+    #[must_use]
+    pub fn with_stats_journal(mut self, journal: Arc<dyn StatsJournal>) -> Self {
+        self.journal = Some(journal);
+        self
     }
 
     /// Compares with the cluster's `writer` before building: the
@@ -385,17 +399,19 @@ impl Validator for RsuValidator {
         let aria_replicated = globals_before
             .to_ascii_uppercase()
             .contains("REPLICATE_ARIA");
-        let stats = if set.analyze_after_build && !aria_replicated {
-            match StatsSnapshot::take(&mut watch.mon, t, &columns, &name).await {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    r.node_check
-                        .ok(format!("statistics not snapshotted ({e}); ANALYZE skipped"));
-                    None
-                }
-            }
+        let (stats, journaled) = if set.analyze_after_build && !aria_replicated {
+            super::journal::snapshot(
+                self.journal.as_deref(),
+                &self.node,
+                &mut watch.mon,
+                t,
+                (&columns, &name),
+                &mut r,
+            )
+            .await
+            .map_or((None, None), |(s, e)| (Some(s), e))
         } else {
-            None
+            (None, None)
         };
 
         // 4-5. Build in RSU, resync.
@@ -467,6 +483,8 @@ impl Validator for RsuValidator {
         if keep {
             r.index_kept = true;
             r.node_check.ok(format!("{name} kept for the rollout"));
+            // The new index's statistics stay with it.
+            super::journal::forget(self.journal.as_deref(), journaled.as_ref()).await;
         } else if let Some(d) = &mut ddl {
             let started = Instant::now();
             let drop_sql = drop_index_sql(t, &name);
@@ -505,14 +523,17 @@ impl Validator for RsuValidator {
             }
             if let Some(s) = &stats {
                 match s.restore(d).await {
-                    Ok(()) => match StatsSnapshot::take(&mut watch.mon, t, &columns, &name).await {
-                        Ok(now) if &now == s => {
-                            r.node_check
-                                .ok(format!("statistics rows restored ({} rows)", s.rows()));
+                    Ok(()) => {
+                        super::journal::forget(self.journal.as_deref(), journaled.as_ref()).await;
+                        match StatsSnapshot::take(&mut watch.mon, t, &columns, &name).await {
+                            Ok(now) if &now == s => {
+                                r.node_check
+                                    .ok(format!("statistics rows restored ({} rows)", s.rows()));
+                            }
+                            Ok(_) => r.node_check.bad("statistics rows differ after restore"),
+                            Err(e) => r.node_check.bad(format!("statistics not re-read: {e}")),
                         }
-                        Ok(_) => r.node_check.bad("statistics rows differ after restore"),
-                        Err(e) => r.node_check.bad(format!("statistics not re-read: {e}")),
-                    },
+                    }
                     Err(e) => r.node_check.bad(format!("statistics not restored: {e}")),
                 }
             }

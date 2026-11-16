@@ -5,7 +5,9 @@
 //!    auto_index.abort_replica_lag_seconds), the index isn't there yet;
 //!    note @@server_id, @@gtid_binlog_pos and the table's signature
 //! 2. mark the node validating (reads stop going there)
-//! 3. snapshot the statistics rows ANALYZE will touch
+//! 3. snapshot the statistics rows ANALYZE will touch, and journal them
+//!    so a controller restart can't lose them (no ANALYZE when the journal
+//!    can't be written)
 //! 4. on the node, binlog off:
 //!      ALTER TABLE ... ADD INDEX IF NOT EXISTS x (...), ALGORITHM=INPLACE, LOCK=NONE
 //!      ANALYZE LOCAL TABLE ... PERSISTENT FOR COLUMNS (...) INDEXES (x)
@@ -14,9 +16,9 @@
 //! 5. replay, the same watch before every statement
 //! 6. the table's signature changed (user DDL): abort
 //! 7. always: DROP INDEX IF EXISTS x and restore the statistics rows,
-//!    binlog off (unless accepted and kept), then prove the node is as it
-//!    was: no index, no GTID from this server, statistics rows identical,
-//!    both replication threads running
+//!    binlog off (unless accepted and kept), remove the journal entry,
+//!    then prove the node is as it was: no index, no GTID from this
+//!    server, statistics rows identical, both replication threads running
 //! 8. unmark
 //! ```
 //!
@@ -34,6 +36,7 @@ use std::time::{Duration, Instant};
 use sprig_cluster::sql::{NodeEndpoint, ProbeError};
 use sprig_common::Result;
 
+use super::journal::{StatsEntry, StatsJournal};
 use super::node::{
     NodeSql, NodeWatch, StatsSnapshot, add_def_sql, analyze_sql, col, drop_index_sql,
     own_new_gtids, run_watched,
@@ -52,6 +55,8 @@ pub struct ReplicaValidator {
     /// The primary: an index already on the node but not here is a cut-off
     /// validation's leftover, dropped before building.
     writer: Option<NodeEndpoint>,
+    /// Where the statistics snapshot is kept while the validation runs.
+    journal: Option<Arc<dyn StatsJournal>>,
 }
 
 impl std::fmt::Debug for ReplicaValidator {
@@ -72,7 +77,19 @@ impl ReplicaValidator {
             marker,
             probe_timeout: Duration::from_secs(10),
             writer: None,
+            journal: None,
         }
+    }
+
+    /// Journals the statistics snapshot before `ANALYZE` and removes it
+    /// after the restore, so a controller that stops in between leaves it
+    /// for the next validation or the drift reconciler
+    /// ([`super::journal`]). When the journal can't be written the
+    /// validation replays without `ANALYZE`.
+    #[must_use]
+    pub fn with_stats_journal(mut self, journal: Arc<dyn StatsJournal>) -> Self {
+        self.journal = Some(journal);
+        self
     }
 
     /// Compares with the primary `writer` before building: the node's
@@ -294,18 +311,20 @@ impl Validator for ReplicaValidator {
         }
 
         let columns: Vec<String> = plan.candidate.def.columns().map(str::to_owned).collect();
-        // 3. Statistics as they were.
-        let stats = if set.analyze_after_build {
-            match StatsSnapshot::take(&mut mon, t, &columns, &name).await {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    r.node_check
-                        .ok(format!("statistics not snapshotted ({e}); ANALYZE skipped"));
-                    None
-                }
-            }
+        // 3. Statistics as they were, journaled until they are back.
+        let (stats, journaled) = if set.analyze_after_build {
+            super::journal::snapshot(
+                self.journal.as_deref(),
+                &self.node,
+                &mut mon,
+                t,
+                (&columns, &name),
+                &mut r,
+            )
+            .await
+            .map_or((None, None), |(s, e)| (Some(s), e))
         } else {
-            None
+            (None, None)
         };
 
         let mut watch = ReplicaWatch {
@@ -385,7 +404,7 @@ impl Validator for ReplicaValidator {
             keep,
             ddl.ok(),
             &mut watch.mon,
-            stats.as_ref(),
+            (stats.as_ref(), self.journal.as_deref(), journaled.as_ref()),
             (server_id, &gtid_before),
             &mut r,
         )
@@ -439,7 +458,11 @@ async fn cleanup(
     keep: bool,
     ddl: Option<NodeSql>,
     mon: &mut NodeSql,
-    stats: Option<&StatsSnapshot>,
+    (stats, journal, journaled): (
+        Option<&StatsSnapshot>,
+        Option<&dyn StatsJournal>,
+        Option<&StatsEntry>,
+    ),
     (server_id, gtid_before): (u32, &str),
     r: &mut ValidationReport,
 ) {
@@ -460,6 +483,8 @@ async fn cleanup(
     if keep {
         r.index_kept = true;
         r.node_check.ok(format!("{name} kept for the rollout"));
+        // The new index's statistics stay with it.
+        super::journal::forget(journal, journaled).await;
     } else {
         let started = Instant::now();
         let mut res = drop_with_retries(&mut ddl, &drop_index_sql(t, name)).await;
@@ -493,6 +518,7 @@ async fn cleanup(
         if let Some(s) = stats {
             match s.restore(&mut ddl).await {
                 Ok(()) => {
+                    super::journal::forget(journal, journaled).await;
                     match StatsSnapshot::take(
                         mon,
                         t,

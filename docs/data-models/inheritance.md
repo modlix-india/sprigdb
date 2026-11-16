@@ -492,7 +492,7 @@ Set them with `SPRIG SET` at the scopes each allows; see [Settings](../sql/setti
 - **Tables only.** Inheritable objects are SQL tables. Collections and key-value namespaces can't be inheritable yet.
 - **Unsharded tables for read-through across tenants.** Read-through between tenants needs both databases on the same cluster and unsharded; other placements need materialized shares (39889 otherwise).
 - **Reads cost more per level.** Each read-through level adds a little to every query on the table, so a point read several levels down takes longer than on a plain table. Materialized shares stop the chain at the copy. A single-table `SELECT` with `key = value` or `key IN (...)` pushes the key into every level.
-- **Instances live in members.** A member's instances use the member's shards, quotas and residency, and move with the member.
+- **Instances live in members.** A member's instances use the member's shards, quotas and residency, and move with the member. `CREATE SINK`, `ALTER SINK` and `DROP SINK ... FOR EACH TENANT` reach members homed in other data centres too: the gateway calls a gateway in each member's home data centre (counted in `sprig_inherit_remote_calls_total`), so the sink's instances are created, changed and dropped wherever its members live.
 
 ## Errors
 
@@ -537,6 +537,7 @@ See [Errors](../reference/errors.md).
 - **Prepared statements, views, routines and `INSERT ... SELECT`** naming inheritable tables (39891).
 - **Moving a tenant to another parent**, with or without shares.
 - **Creating instances in advance.** A member's instance of a `FOR EACH TENANT` definition is created on first use only.
+- **Reaching members in other data centres** for anything but sinks. `FOR EACH TENANT` triggers, overrides, `SHOW INHERITED` counts and broadcasts act only on members homed in the data centre where the statement runs.
 
 ## Related
 

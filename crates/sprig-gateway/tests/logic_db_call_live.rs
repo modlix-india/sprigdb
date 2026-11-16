@@ -557,7 +557,7 @@ async fn compiled_calls_and_publishes_run_the_same_everywhere() {
         ),
         (
             "UPDATE orders SET qty = -2 WHERE id = 1",
-            Some((39865, "RangeError: negative: -2")),
+            Some((39865, "negative: -2")),
         ),
         ("UPDATE orders SET qty = 5 WHERE id = 1", None),
     ] {
@@ -602,58 +602,69 @@ async fn compiled_calls_and_publishes_run_the_same_everywhere() {
     let t = wait_rows(&mut c, &read("ev_t"), 4, 40).await;
     let a = wait_rows(&mut c, "SELECT what FROM audit WHERE src = 't'", 4, 10).await;
     ck.check(
-        "the trigger published each order once, with the callee's price",
+        "the trigger published each order once, with the callee's price (its latest version)",
         t.len() == 4
             && a.len() == 4
             && t.iter().all(|r| {
-                r[1].as_deref().is_some_and(|v| {
-                    v.contains("\"price\":19.99") || v.contains("\"price\": 19.99")
-                })
+                r[1].as_deref()
+                    .is_some_and(|v| v.contains("\"price\":20.99"))
             }),
         format!("{t:?} / {a:?}"),
     );
 
     // ---- timing ---------------------------------------------------------------------
-    must(
-        &mut c,
-        "CREATE FUNCTION sum3(x INT) LANGUAGE javascript AS $$
-           let s = 0;
-           for (let k = 0; k < 3; k++) { const r = db.call('check', x + k); s += r.fields.v; }
-           return { s };
-         $$",
-    )
-    .await;
-    must(
-        &mut c,
-        "CREATE FUNCTION sum3_e(x INT) LANGUAGE javascript WITH (SPRIG_TIER = 'engine') AS $$
-           let s = 0;
-           for (let k = 0; k < 3; k++) { const r = db.call('check', x + k); s += r.fields.v; }
-           return { s };
-         $$",
-    )
-    .await;
-    let mut timing = Vec::new();
-    for f in ["sum3", "sum3_e", "sum3", "sum3_e"] {
+    // Callers making 3 and 20 calls of `check`, compiled and in the engine
+    // tier, each called 200 times over one connection, twice.
+    for n in [3, 20] {
+        for (suffix, tier) in [("", ""), ("_e", " WITH (SPRIG_TIER = 'engine')")] {
+            must(
+                &mut c,
+                &format!(
+                    "CREATE FUNCTION sum{n}{suffix}(x INT) LANGUAGE javascript{tier} AS $$
+                       let s = 0;
+                       for (let k = 0; k < {n}; k++) {{ const r = db.call('check', x + k); s += r.fields.v; }}
+                       return {{ s }};
+                     $$"
+                ),
+            )
+            .await;
+        }
+    }
+    let mut timing: Vec<(String, f64)> = Vec::new();
+    for f in ["sum3", "sum3_e", "sum20", "sum20_e"]
+        .iter()
+        .cycle()
+        .take(8)
+    {
         let n = 200;
         let t0 = Instant::now();
         for i in 0..n {
             must(&mut c, &format!("CALL {f}({})", 1 + i % 50)).await;
         }
-        timing.push((f, t0.elapsed().as_secs_f64() * 1000.0 / f64::from(n)));
+        timing.push((
+            (*f).to_owned(),
+            t0.elapsed().as_secs_f64() * 1000.0 / f64::from(n),
+        ));
     }
-    println!("  timing (ms per call, 3 nested calls each): {timing:?}");
     let best = |name: &str| {
         timing
             .iter()
-            .filter(|(f, _)| *f == name)
+            .filter(|(f, _)| f == name)
             .map(|(_, t)| *t)
             .fold(f64::MAX, f64::min)
     };
-    ck.check(
-        "a compiled caller of compiled code is faster than the engine tier's",
-        best("sum3") < best("sum3_e"),
-        format!("{} vs {}", best("sum3"), best("sum3_e")),
-    );
+    for n in [3, 20] {
+        let (a, b) = (best(&format!("sum{n}")), best(&format!("sum{n}_e")));
+        println!(
+            "  timing: {n} nested calls per CALL: compiled {a:.3} ms, engine tier {b:.3} ms ({:.1}x)",
+            b / a
+        );
+        ck.check(
+            &format!("a compiled caller making {n} calls is faster than the engine tier's"),
+            a < b,
+            format!("{a} vs {b}"),
+        );
+    }
 
     for u in USERS {
         let _ = sql(&mut c, &format!("DROP USER IF EXISTS '{u}'@'%'")).await;

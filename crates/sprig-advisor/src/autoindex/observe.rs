@@ -396,6 +396,9 @@ pub struct ObserveCx<'a> {
     pub now: SystemTime,
     /// The approval gate for removing an index; `None`: never held.
     pub removals: Option<&'a dyn RemovalGate>,
+    /// The validators' statistics journal: the drift reconciler puts back
+    /// what cut-off validations left there. `None`: no such pass.
+    pub stats: Option<&'a dyn crate::autoindex::validate::journal::StatsJournal>,
 }
 
 /// The approval gate before an index is removed: an automatic index's

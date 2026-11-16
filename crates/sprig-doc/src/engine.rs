@@ -2584,6 +2584,15 @@ impl Engine {
             stage_bytes: self.agg_stage_bytes(),
             now,
         };
+        // `$vectorSearch`'s `queryVector: {$aiEmbed: "<text>"}` (ai.rs).
+        let replaced;
+        let pipeline = match Box::pin(crate::ai::query_vector(sql, &ns.db, pipeline)).await? {
+            Some(p) => {
+                replaced = p;
+                &replaced[..]
+            }
+            None => pipeline,
+        };
         // `$geoNear`, `$vectorSearch` and
         // `$listSearchIndexes` read the collection themselves.
         let first = if ns.coll.is_empty() {
@@ -2701,6 +2710,21 @@ impl Engine {
             spill::set_stage(base + j);
             let name = s.keys().next().map_or("", String::as_str);
             spill::set_kind(spill::Kind::of_stage(name));
+            // A stage with AI operators: their answers first, in hidden
+            // fields the stage reads (ai.rs).
+            if crate::ai::stage_has_ai(s) {
+                let docs = crate::heavy::run(crate::heavy::HEAVY_DOCS, || seq.into_vec())?;
+                let (docs, st, hidden) =
+                    Box::pin(crate::ai::prepare(sql, &ns.db, docs, s, lim.now)).await?;
+                let n = docs.len();
+                let out = crate::heavy::run(n, || {
+                    agg::run_stage_seq(DocSeq::Mem(docs), &st, stages.get(j + 1), &lim)
+                })?;
+                let mut v = crate::heavy::run(n, || out.into_vec())?;
+                crate::ai::strip(&mut v, &hidden);
+                seq = DocSeq::Mem(v);
+                continue;
+            }
             // `$lookup` and `$graphLookup` over a spilled input, or
             // with `allowDiskUse`, run a batch of input documents at a
             // time into a builder that spills.

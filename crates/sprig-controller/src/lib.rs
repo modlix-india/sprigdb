@@ -56,6 +56,7 @@ pub mod autoindex_admin;
 pub mod autoindex_doc;
 pub mod autoindex_env;
 pub mod autoindex_loop;
+pub mod autoindex_stats;
 pub mod autoindex_validate;
 pub mod autoindex_workload;
 // The BackupMissed alert's gauge, from the backup tools' records.
@@ -96,6 +97,8 @@ pub mod streams_loop;
 pub mod graph_mirror_loop;
 // `queue.change_exchange` forwarders.
 pub mod change_exchange_loop;
+// Embedded columns' embedding jobs.
+pub mod ai_embed_loop;
 // Search copies on workers.
 pub mod search_loop;
 // The feed-driven queue outbox forwarder jobs.
@@ -363,16 +366,24 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
     );
     let marker: Arc<dyn sprig_advisor::autoindex::validate::NodeMarker> =
         Arc::new(autoindex_validate::LogMarker);
+    // Validations' statistics snapshots, kept in the DC tier until they
+    // are back on their node.
+    let ai_stats: Arc<dyn sprig_advisor::autoindex::validate::journal::StatsJournal> = Arc::new(
+        autoindex_stats::EtcdStatsJournal::new(Arc::clone(&stores.dc)),
+    );
     let auto_index = autoindex_loop::AutoIndexLoop::new(
         ai_env,
         autoindex_loop::AutoIndexHooks {
             candidates: Arc::new(ai_eval),
-            validation: Arc::new(autoindex_validate::SampleValidation::new(
-                Arc::clone(&catalog_locator),
-                registry,
-                keyring.clone(),
-                Arc::clone(&marker),
-            )),
+            validation: Arc::new(
+                autoindex_validate::SampleValidation::new(
+                    Arc::clone(&catalog_locator),
+                    registry,
+                    keyring.clone(),
+                    Arc::clone(&marker),
+                )
+                .with_stats_journal(Arc::clone(&ai_stats)),
+            ),
             workload: Arc::new(autoindex_workload::ObserveSource::new(
                 workload_store,
                 catalog_locator,
@@ -384,6 +395,7 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             marker,
             decisions: Arc::new(sprig_advisor::autoindex::store::LogDecisions),
             docs: Some(Arc::new(autoindex_doc::DocRegistry::new(versioner.clone()))),
+            stats: Some(ai_stats),
         },
         Directory::new(Arc::clone(&stores.global)),
         dc.clone(),
@@ -678,6 +690,7 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         .with_loop(Loop::new(streams_loop::StreamsLoop))
         .with_loop(Loop::new(graph_mirror_loop::GraphMirrorLoop))
         .with_loop(Loop::new(change_exchange_loop::ChangeExchangeLoop))
+        .with_loop(Loop::new(ai_embed_loop::AiEmbedLoop))
         .with_loop(Loop::new(search_loop::SearchPlacementLoop))
         .with_loop(Loop::new(queue_forwarder_loop::QueueForwarderLoop))
         .with_loop(Loop::new(kv_sweep_loop::KvSweepLoop::new(Some((

@@ -621,6 +621,7 @@ pub fn build_with_fks(
                     column: c.clone(),
                     parent_column: p.clone(),
                     columns: e.columns.clone(),
+                    parent_unique: l.parent_unique,
                 },
             ))
         })

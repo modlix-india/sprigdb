@@ -225,6 +225,8 @@ Blocking stages and sorts may use `doc.agg_stage_memory_bytes` and `doc.max_sort
 
 `$where`, `$function` and `$accumulator` run JavaScript in a sandbox while `mongo.server_js` is on (the default).
 
+SprigDB's own AI operators, `$aiEmbed`, `$aiClassify`, `$aiExtract`, `$aiSummarize` and `$aiComplete`, embed, classify, extract from, summarize or complete text inside a pipeline, once a tenant administrator turns on `ai.functions.enabled`. See [Documents](../data-models/documents.md#ai-operators).
+
 ### Indexes
 
 | Index | Support |

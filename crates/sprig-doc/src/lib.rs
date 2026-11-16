@@ -20,6 +20,7 @@
 #![recursion_limit = "512"]
 
 pub mod agg;
+pub mod ai;
 pub mod catalog;
 /// Collations.
 pub mod collation;

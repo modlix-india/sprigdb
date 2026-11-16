@@ -22,6 +22,11 @@ serde_json.workspace = true
 # Runs of triggers on streams and queues go to gateways
 # over the peer service.
 sprig-ai.workspace = true
+# Embedded columns: the local model, where it lives (`docs.model_dir`), and
+# the hidden columns' names.
+sprig-docs.workspace = true
+sprig-sql.workspace = true
+sprig-embed.workspace = true
 sprig-api.workspace = true
 # Sink owners' row-level security, checked by the worker.
 sprig-auth.workspace = true

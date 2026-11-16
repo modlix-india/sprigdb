@@ -21,6 +21,8 @@
 //! - [`providers`]: provider records in etcd, with keys sealed by [`keys`];
 //! - [`tools`]: tool specs, the built-in registry, input checks;
 //! - [`egress`]: the egress gate;
+//! - [`embedding`]: embedded columns' model aliases, keys, catalog rows
+//!   and metrics;
 //! - [`settings`]: the `ai.*` keys;
 //! - [`budget`]: daily token budgets;
 //! - [`audit`]: conversations, messages and usage in the tenant catalog,
@@ -28,6 +30,8 @@
 //!   ([`audit::system`]);
 //! - [`feedback`]: votes on answers and proposal outcomes, and the prompt
 //!   notes made of them;
+//! - [`functions`]: the AI functions in statements (`AI_CLASSIFY` and
+//!   the others, and their MongoDB operators): evaluation, cache, budgets;
 //! - [`glossary`]: the tenant's business terms;
 //! - [`dashboards`]: dashboards and their tiles, shared or not, run as
 //!   the viewer;
@@ -49,10 +53,12 @@ pub mod budget;
 pub mod dashboards;
 pub mod digest;
 pub mod egress;
+pub mod embedding;
 pub mod error;
 #[cfg(any(test, feature = "eval"))]
 pub mod eval;
 pub mod feedback;
+pub mod functions;
 pub mod glossary;
 pub mod incidents;
 pub mod keys;

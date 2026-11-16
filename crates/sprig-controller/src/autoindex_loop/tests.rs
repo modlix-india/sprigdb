@@ -310,6 +310,7 @@ async fn one_tenant_from_candidate_to_drop() {
             marker: Arc::new(NoMarker),
             decisions: Arc::new(LogDecisions),
             docs: None,
+            stats: None,
         };
         let slots = LocalSlots::new();
         let cadence = Cadence::default();
@@ -514,6 +515,7 @@ mod budgets {
             marker: Arc::new(NoMarker),
             decisions: Arc::new(LogDecisions),
             docs: None,
+            stats: None,
         }
     }
 
@@ -708,6 +710,7 @@ async fn a_stuck_pass_gives_up_at_its_limit() {
         marker: Arc::new(NoMarker),
         decisions: Arc::new(LogDecisions),
         docs: None,
+        stats: None,
     };
     let cadence = Cadence {
         pass_limit: Duration::from_secs(600),
@@ -845,6 +848,7 @@ async fn an_idle_tenant_comes_back_at_the_longest_requeue() {
             marker: Arc::new(NoMarker),
             decisions: Arc::new(LogDecisions),
             docs: None,
+            stats: None,
         };
         let cadence = Cadence::default();
         let slots = LocalSlots::new();
