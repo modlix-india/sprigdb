@@ -87,7 +87,7 @@ async fn locked(direct: &Pool, tenant: TenantId) -> Result<bool> {
     let n: Option<u64> = c
         .exec_first(
             "SELECT COUNT(*) FROM mysql.global_priv WHERE User LIKE ? AND Host = '%' \
-             AND JSON_VALUE(Priv, '$.account_locked') = 'true'",
+             AND JSON_VALUE(Priv, '$.account_locked') IN ('1', 'true')",
             (&like,),
         )
         .await

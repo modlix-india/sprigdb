@@ -607,29 +607,36 @@ async fn run(
     let analyzers = &scat::state(&cat).analyzers;
     // For a caller a row policy on the object binds, facets count only the
     // rows it may see (the copy's own counts include rows hidden from it).
+    // Such a caller's hits are also ranked over the rows it may see (the
+    // copy's term statistics count every row): its visible hits with
+    // their own statistics, or past search.max_window, plain scores.
     let visible_only = visible::needs_visible(&def, sql.row_policy_binds(def.object_id));
     let mut facet_out = serde_json::Map::new();
-    if visible_only && !facets.is_empty() {
-        let all = visible::all_hits(svc, tenant, &cat, &def, query.clone(), consistency).await?;
-        let seen = reread(sql, &def, &all, &[], false).await?;
-        let keys: Vec<Key> = all
-            .iter()
-            .filter(|h| seen.contains_key(&h.key))
-            .map(|h| h.key.clone())
-            .collect();
-        let ops: Vec<Op> = facets.iter().map(|(_, o)| o.clone()).collect();
-        let (answers, _) = svc
-            .query(
-                tenant,
-                &def,
-                analyzers,
-                visible::within(query.clone(), keys),
-                ops,
-                consistency,
-            )
-            .await?;
-        put_facets(&mut facet_out, &facets, answers);
-    }
+    let (ranked, scoring) = if visible_only {
+        match visible::candidates(svc, tenant, &cat, &def, query.clone(), consistency).await? {
+            Some(all) => {
+                let seen = reread(sql, &def, &all, &[], false).await?;
+                let keys: Vec<Key> = all
+                    .iter()
+                    .filter(|h| seen.contains_key(&h.key))
+                    .map(|h| h.key.clone())
+                    .collect();
+                let within = visible::within(query.clone(), keys);
+                if !facets.is_empty() {
+                    let ops: Vec<Op> = facets.iter().map(|(_, o)| o.clone()).collect();
+                    let (answers, _) = svc
+                        .query(tenant, &def, analyzers, within.clone(), ops, consistency)
+                        .await?;
+                    put_facets(&mut facet_out, &facets, answers);
+                }
+                (within, sprig_search::Scoring::Matched)
+            }
+            None if !facets.is_empty() => return Err(visible::too_many(knobs.max_window)),
+            None => (query.clone(), sprig_search::Scoring::Plain),
+        }
+    } else {
+        (query.clone(), knobs.scoring)
+    };
     // Ranked hits, fetched deeper while hidden rows leave the page short.
     let mut k = (cursor.as_ref().map_or(0, |c| c.p + 1) + limit)
         .saturating_mul(knobs.overfetch.max(1))
@@ -638,15 +645,12 @@ async fn run(
     let mut first = !visible_only;
     let mut applied;
     let (page, next) = loop {
-        let mut ops = vec![Op::Top {
-            k,
-            scoring: knobs.scoring,
-        }];
+        let mut ops = vec![Op::Top { k, scoring }];
         if first {
             ops.extend(facets.iter().map(|(_, o)| o.clone()));
         }
         let (answers, ap) = svc
-            .query(tenant, &def, analyzers, query.clone(), ops, consistency)
+            .query(tenant, &def, analyzers, ranked.clone(), ops, consistency)
             .await?;
         applied = ap;
         let mut it = answers.into_iter();

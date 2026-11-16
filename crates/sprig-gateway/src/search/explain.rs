@@ -71,6 +71,8 @@ pub async fn describe(
         "scoring": match knobs.scoring {
             sprig_search::Scoring::Global => "global",
             sprig_search::Scoring::Local => "local",
+            sprig_search::Scoring::Matched => "matched",
+            sprig_search::Scoring::Plain => "plain",
         },
         "copies": place,
         "ready": ready,

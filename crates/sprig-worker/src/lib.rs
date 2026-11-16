@@ -176,6 +176,15 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         .id
         .clone()
         .unwrap_or_else(|| format!("worker-{}", std::process::id()));
+    // The catalog formats this build reads, for the controller's
+    // contract migrations.
+    let _reader = tokio::spawn(sprig_catalog::readers::keep(
+        dc_logic.clone(),
+        Arc::new(SystemClock),
+        "worker",
+        worker.clone(),
+        ctx.shutdown.clone(),
+    ));
     let mut opts = WorkerOpts::new(&worker);
     opts.lease = settings.job_lease;
     // Mover jobs (cutovers, moves between DCs) run only while the worker

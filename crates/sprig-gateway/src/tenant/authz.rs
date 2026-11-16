@@ -266,10 +266,25 @@ impl AuthzServices {
         // catalog version) narrows or widens grants now.
         let digest =
             placement.as_ref().map_or(0, |p| p.0) ^ super::rls::enforcement_digest(svc, cat);
-        let versions = (cat.version, cat.auth_version, digest);
-        // Where the accounts log in from on this cluster moves with the
-        // tenant's path and the cluster's relays, not the catalog.
-        let here = with_hosts(versions, &login_hosts(svc, cat, cluster).await?);
+        // Where the accounts log in from moves with the tenant's path and
+        // its clusters' relays, not the catalog: every cluster of the
+        // tenant follows a change (a read fanning out to another cluster
+        // logs in there without reconciling it first).
+        let mut clusters = vec![cluster.clone()];
+        for c in placement
+            .as_ref()
+            .map(|p| p.1.as_slice())
+            .unwrap_or_default()
+        {
+            if !clusters.contains(c) {
+                clusters.push(c.clone());
+            }
+        }
+        let mut hosts = std::collections::hash_map::DefaultHasher::new();
+        for c in &clusters {
+            (c, login_hosts(svc, cat, c).await.ok()).hash(&mut hosts);
+        }
+        let versions = (cat.version, cat.auth_version, digest ^ hosts.finish());
         let every = Duration::from_secs(svc.settings.get(
             &sprig_auth::authz::settings::RECONCILE_INTERVAL_SECONDS,
             &cat.setting_ctx(&svc.dc),
@@ -277,7 +292,7 @@ impl AuthzServices {
         ));
         let key = (cat.tenant, cluster.clone());
         let sweep = match lock(&self.checked).get(&key) {
-            Some((v, at)) if *v == here => {
+            Some((v, at)) if *v == versions => {
                 if at.elapsed() < every {
                     return Ok(());
                 }
@@ -332,7 +347,6 @@ impl AuthzServices {
         // The name pairs stored code looks up.
         super::stored_names::sync_logged(svc, cat, cluster).await;
         let hosts = login_hosts(svc, cat, cluster).await?;
-        let versions = with_hosts(versions, &hosts);
         let Some(engine) = engine_for(svc, cat) else {
             return Ok(());
         };
@@ -489,13 +503,6 @@ async fn login_hosts(
         // No relays, or relays of a build that doesn't publish its hosts.
         _ => backend::LoginHosts::Anywhere,
     })
-}
-
-/// `versions` with the login hosts folded in.
-fn with_hosts(versions: Checked, hosts: &backend::LoginHosts) -> Checked {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    hosts.hash(&mut h);
-    (versions.0, versions.1, versions.2 ^ h.finish())
 }
 
 /// The accounts of `want` whose database-level grants (`mysql.db`)

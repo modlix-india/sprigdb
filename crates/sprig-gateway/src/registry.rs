@@ -473,5 +473,34 @@ async fn claim_slot(
     )))
 }
 
+/// The catalog modules only the gateway's crates know (types, graphs,
+/// search, MongoDB collections, Studio's library). The `sprigdb` binary
+/// declares them, with the controller's
+/// (`sprig_controller::contracts::known_modules`), as the formats this
+/// build reads (`sprig_catalog::readers`).
+#[must_use]
+pub fn catalog_modules() -> Vec<sprig_catalog::Module> {
+    use sprig_catalog::Module;
+    vec![
+        sprig_types::store::TYPES_MODULE,
+        Module {
+            name: sprig_graph::catalog::MODULE,
+            migrations: sprig_graph::catalog::GRAPH_MIGRATIONS,
+        },
+        Module {
+            name: crate::search::catalog::MODULE,
+            migrations: crate::search::catalog::SEARCH_MIGRATIONS,
+        },
+        Module {
+            name: crate::mongo::catalog::MODULE,
+            migrations: crate::mongo::catalog::DOC_MIGRATIONS,
+        },
+        Module {
+            name: crate::http::studio::library::MODULE,
+            migrations: crate::http::studio::library::LIBRARY_MIGRATIONS,
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests;

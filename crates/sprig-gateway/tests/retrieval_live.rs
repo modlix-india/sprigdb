@@ -674,7 +674,7 @@ async fn retrieval_indexes_end_to_end() {
     }
     must(
         &mut c,
-        "UPDATE articles SET body = 'Bake bread with a sourdough starter: feed it flour and water every day.' WHERE id = 100",
+        "UPDATE articles SET title = 'Sourdough', body = 'Bake bread with a sourdough starter: feed it flour and water every day.' WHERE id = 100",
     )
     .await;
     let d = wait_for(Duration::from_secs(60), || {

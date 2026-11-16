@@ -584,6 +584,8 @@ impl Migrator {
                 )));
             }
         }
+        // The process reads these: its reader record lists them.
+        crate::readers::declare(&modules);
         Ok(Self {
             modules,
             clock: Arc::new(SystemClock),

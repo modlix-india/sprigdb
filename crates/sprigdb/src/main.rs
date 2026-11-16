@@ -264,6 +264,10 @@ async fn run(role: Role, config: ProcessConfig, source: Option<(PathBuf, String)
         tracing::warn!(error = %e, "[tls] doesn't load: calls to controllers serving internal TLS will fail");
     }
 
+    // Every catalog module this build reads: each role registers their
+    // formats for the controller's contract migrations.
+    sprig_controller::contracts::declare_known();
+    sprig_controller::contracts::declare(&sprig_gateway::registry::catalog_modules());
     let ctx = RoleContext {
         config,
         health,

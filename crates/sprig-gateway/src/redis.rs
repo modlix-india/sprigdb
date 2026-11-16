@@ -707,6 +707,10 @@ impl SqlRunner for SqlSession {
         // DC (an unknown or missing id as none), as MySQL's `sprig_dc`.
         self.session.client_dc = crate::dc::hint("redis", raw).known();
     }
+
+    fn row_policy_binds(&self, object: u64) -> Option<bool> {
+        self.exec.row_policy_binds(object)
+    }
 }
 
 /// `sql` with the comment `o=k` where the change feed reads it: before a

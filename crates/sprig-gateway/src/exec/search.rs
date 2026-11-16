@@ -1123,9 +1123,30 @@ impl PassSession {
                 knobs.consistency
             };
             let started = std::time::Instant::now();
-            let hits = self
+            let mut hits = self
                 .run_search(svc, tenant, &cat, &def, query.clone(), None, consistency)
                 .await?;
+            if self.bound_by_policy(&def) {
+                // Only the hits the session reads, scored over themselves:
+                // no hidden key reaches the statement, no score moves with
+                // hidden rows.
+                let table = format!("{}.{}", quote(&def.db), quote(&def.table));
+                let seen = self
+                    .visible_hits(cx, wire, &def, &table, &hits, usize::MAX)
+                    .await?;
+                let keys = seen.into_iter().map(|h| h.key).collect();
+                hits = crate::search::visible::rescore(
+                    svc,
+                    tenant,
+                    &cat,
+                    &def,
+                    query.clone(),
+                    keys,
+                    None,
+                    consistency,
+                )
+                .await?;
+            }
             if let Some(list) = scans.as_mut() {
                 let name = tref.alias.clone().unwrap_or_else(|| tref.table.clone());
                 list.push(
@@ -1244,16 +1265,63 @@ impl PassSession {
             })
             .unwrap_or_default();
         let started = std::time::Instant::now();
-        let hits = run_search(
-            svc,
-            tenant,
-            cat,
-            &def,
-            query.clone(),
-            Some(limit),
-            consistency,
-        )
-        .await?;
+        let table = format!("{}.{}", quote(&def.db), quote(&def.table));
+        let hits = if self.bound_by_policy(&def) {
+            // The best `limit` of the hits the session reads, scored over
+            // them; past the window, plain scores, hidden hits left out.
+            match crate::search::visible::candidates(
+                svc,
+                tenant,
+                cat,
+                &def,
+                query.clone(),
+                consistency,
+            )
+            .await?
+            {
+                Some(all) => {
+                    let seen = self
+                        .visible_hits(cx, wire, &def, &table, &all, usize::MAX)
+                        .await?;
+                    crate::search::visible::rescore(
+                        svc,
+                        tenant,
+                        cat,
+                        &def,
+                        query.clone(),
+                        seen.into_iter().map(|h| h.key).collect(),
+                        Some(limit),
+                        consistency,
+                    )
+                    .await?
+                }
+                None => {
+                    let top = crate::search::visible::plain_top(
+                        svc,
+                        tenant,
+                        cat,
+                        &def,
+                        query.clone(),
+                        knobs.max_window,
+                        consistency,
+                    )
+                    .await?;
+                    self.visible_hits(cx, wire, &def, &table, &top, limit)
+                        .await?
+                }
+            }
+        } else {
+            run_search(
+                svc,
+                tenant,
+                cat,
+                &def,
+                query.clone(),
+                Some(limit),
+                consistency,
+            )
+            .await?
+        };
         if let Some(list) = scans {
             list.push(
                 self.explain_scan(
@@ -1274,7 +1342,6 @@ impl PassSession {
             qual: String::new(),
         };
         let keys: Vec<String> = def.key_columns.iter().map(|c| quote(c)).collect();
-        let table = format!("{}.{}", quote(&def.db), quote(&def.table));
         // Highlights from the text the user can read.
         let hl = if highlight.is_empty() || hits.is_empty() {
             "NULL".to_owned()
@@ -1289,6 +1356,62 @@ impl PassSession {
             hl,
             tgt.in_list(&hits)?
         ))
+    }
+
+    /// Whether a row policy on `def`'s object binds the session (or it
+    /// can't tell): its searches then rank and count the hits it reads.
+    fn bound_by_policy(&self, def: &IndexDef) -> bool {
+        crate::search::visible::needs_visible(
+            def,
+            crate::pipeline::SessionExec::row_policy_binds(self, def.object_id),
+        )
+    }
+
+    /// The first `want` of `hits`, in order, whose rows the session reads
+    /// (row-level security applies to the read), `500` keys per statement.
+    async fn visible_hits(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        wire: Wire,
+        def: &Arc<IndexDef>,
+        table: &str,
+        hits: &[Hit],
+        want: usize,
+    ) -> Result<Vec<Hit>> {
+        let tgt = Target2 {
+            def: Arc::clone(def),
+            qual: String::new(),
+        };
+        let k = tgt.key_expr();
+        let mut out = Vec::new();
+        for chunk in hits.chunks(500) {
+            if out.len() >= want {
+                break;
+            }
+            // Each row read answers its hit's position in the chunk.
+            let mut case = String::from("CASE");
+            for (i, h) in chunk.iter().enumerate() {
+                let _ = write!(case, " WHEN {k} = {} THEN {i}", h.key.sql(def.model)?);
+            }
+            case.push_str(" END");
+            let rows = self
+                .sub_rows(
+                    cx,
+                    wire,
+                    &format!("SELECT {case} FROM {table} WHERE {}", tgt.in_list(chunk)?),
+                )
+                .await?;
+            let mut seen: Vec<usize> = rows
+                .iter()
+                .filter_map(|r| r.first()?.as_deref())
+                .filter_map(|b| std::str::from_utf8(b).ok()?.parse().ok())
+                .collect();
+            seen.sort_unstable();
+            seen.dedup();
+            out.extend(seen.into_iter().filter_map(|i| chunk.get(i).cloned()));
+        }
+        out.truncate(want);
+        Ok(out)
     }
 
     /// One search's `EXPLAIN` description; the hit count
@@ -1471,6 +1594,23 @@ pub(crate) async fn run_search(
             max: knobs.max_window,
         },
     };
+    run_op(svc, tenant, cat, def, query, op, consistency).await
+}
+
+/// One op answering hits ([`run_search`]'s, or a `Top` with a scoring of
+/// the caller's choice).
+///
+/// # Errors
+/// As [`run_search`].
+pub(crate) async fn run_op(
+    svc: &Arc<SearchService>,
+    tenant: sprig_common::ids::TenantId,
+    cat: &TenantCatalog,
+    def: &Arc<IndexDef>,
+    query: SearchQuery,
+    op: sprig_search::rpc::Op,
+    consistency: Consistency,
+) -> Result<Vec<Hit>> {
     let started = std::time::Instant::now();
     let r = svc
         .query(

@@ -64,6 +64,7 @@ pub mod backups;
 pub mod balancer_loop;
 pub mod catalog_reconciler;
 pub mod catalogs;
+pub mod contracts;
 pub mod dc;
 // Automatic moves between DCs.
 pub mod dc_migrate;
@@ -671,8 +672,21 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             clock: Arc::clone(&clock),
         })),
     ));
+    // Contract migrations, once every registered reader reads the new
+    // format and catalog.contract_delay_days has passed (or an override).
+    // Other DCs' readers are read through `homes` (the relay in two tiers).
+    let contracts = Arc::new(contracts::ContractPass::new(
+        Directory::new(Arc::clone(&stores.global)),
+        Arc::new(locator.clone()),
+        Arc::clone(&stores.global),
+        Arc::clone(&homes),
+        dc.clone(),
+        Some(settings.live.clone()),
+        Arc::clone(&clock),
+    ));
     let rt = Runtime::new(stores.clone(), Arc::clone(&clock), me)
         .with_settings(settings.control.clone())
+        .with_loop(Loop::new(contracts::ContractLoop(Arc::clone(&contracts))))
         .with_loop(Loop::new(dispatch::Dispatch))
         .with_loop(Loop::new(dispatch::JobGc))
         .with_loop(Loop::new(RegistryLoop::new(Arc::clone(&monitor))))
@@ -907,7 +921,8 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             .with_sharding(sharding.sharding())
             .with_failover(Arc::clone(&failover))
             .with_residency(residency)
-            .with_search_catalog(versioner.clone()),
+            .with_search_catalog(versioner.clone())
+            .with_contracts(contracts),
     );
     // The `Recommendations` service beside the Admin API.
     let dc_token = cfg
@@ -949,6 +964,14 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
                 operators::guard::layer,
             )),
         admin_tls,
+        ctx.shutdown.clone(),
+    ));
+    // The catalog formats this process reads, for the contract pass.
+    let _reader = tokio::spawn(sprig_catalog::readers::keep(
+        Arc::clone(&reg_store),
+        Arc::clone(&clock),
+        "controller",
+        cfg.node.id(),
         ctx.shutdown.clone(),
     ));
     // Gateways find the leader's Admin API here.

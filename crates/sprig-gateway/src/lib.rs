@@ -229,6 +229,16 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         )
         .await;
 
+    // The catalog formats this build reads, for the controller's
+    // contract migrations.
+    let _reader = tokio::spawn(sprig_catalog::readers::keep(
+        Arc::clone(&stores.dc),
+        clock.clone(),
+        "gateway",
+        gateway_id.clone(),
+        stop.clone(),
+    ));
+
     // The DC permit, its watchdog and admission while the
     // DC returns from an outage.
     let _fence = failover::start(

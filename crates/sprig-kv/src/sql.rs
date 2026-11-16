@@ -55,6 +55,13 @@ pub trait SqlRunner: Send {
     /// gateway's runner counts the session's statements as traffic from
     /// that DC; by default nothing.
     fn client_dc(&mut self, _raw: Option<&str>) {}
+    /// Whether a row-level security policy on the object with this id
+    /// binds the session's user (`None`: can't tell, read as bound).
+    /// Search answers such a user from the rows it reads; by default
+    /// `None`.
+    fn row_policy_binds(&self, _object: u64) -> Option<bool> {
+        None
+    }
 }
 
 /// `X'...'`, or `''` for empty bytes.

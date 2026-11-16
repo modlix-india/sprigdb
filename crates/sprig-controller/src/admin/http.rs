@@ -161,6 +161,8 @@ fn routes(app: Arc<App>) -> Router {
         )
         // In-doubt distributed transactions.
         .route("/admin/v1/txns", get(list_txns))
+        .route("/admin/v1/catalog/contracts", get(contracts_status))
+        .route("/admin/v1/catalog/contracts:run", post(contracts_run))
         .route("/admin/v1/txns/{dtid}", get(show_txn).post(txn_method))
         .route("/admin/v1/settings", get(list_setting_keys))
         .route(
@@ -1420,6 +1422,29 @@ async fn advisor_apply(
 #[derive(Debug, Default, serde::Deserialize)]
 struct TxnsQuery {
     tenant: Option<String>,
+}
+
+/// `GET /admin/v1/catalog/contracts`: the registered readers and every
+/// catalog module's contract ceiling.
+async fn contracts_status(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        app.svc.contracts_status().await
+    };
+    respond(r.await)
+}
+
+/// `POST /admin/v1/catalog/contracts:run` `{reason, operator, tenant?}`:
+/// the contracts the readers allow, run before
+/// `catalog.contract_delay_days` is over (39084 without a reason or an
+/// operator).
+async fn contracts_run(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        let req: crate::contracts::RunContractsRequest = parse_required(&body)?;
+        app.svc.contracts_run(req).await
+    };
+    respond(r.await)
 }
 
 async fn list_txns(State(app): State<Arc<App>>, headers: HeaderMap, uri: Uri) -> Response {

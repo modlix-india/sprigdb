@@ -220,7 +220,8 @@ fn matched_and_plain_scores_ignore_other_documents() {
     let global = scores(&ix, &within, Scoring::Global);
     // Fifty more documents with both words, outside the key set.
     for id in 100..150 {
-        ix.upsert(&row(id, "red shoe red", "", "acme", 1.0)).unwrap();
+        ix.upsert(&row(id, "red shoe red", "", "acme", 1.0))
+            .unwrap();
     }
     ix.commit("p2").unwrap();
     assert_eq!(scores(&ix, &within, Scoring::Matched), matched);

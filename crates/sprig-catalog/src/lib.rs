@@ -60,6 +60,7 @@ pub mod infoschema;
 pub mod migrate;
 pub mod placement;
 pub mod pool_wait;
+pub mod readers;
 pub mod rows;
 pub mod settings;
 mod sql;

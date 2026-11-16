@@ -119,7 +119,10 @@ async fn mongo(addr: &str, user: &str, pw: &str) -> mongodb::Client {
     mongodb::Client::with_uri_str(&uri).await.unwrap()
 }
 
-async fn cmd(c: &mut redis::aio::MultiplexedConnection, args: &[&str]) -> Result<redis::Value, String> {
+async fn cmd(
+    c: &mut redis::aio::MultiplexedConnection,
+    args: &[&str],
+) -> Result<redis::Value, String> {
     let mut k = redis::cmd(args[0]);
     for a in &args[1..] {
         k.arg(*a);
@@ -262,9 +265,7 @@ async fn wait_copies(
 ) {
     for _ in 0..120 {
         let a: Vec<i64> = admin
-            .query(
-                "SELECT id FROM notes WHERE MATCH (title, body) AGAINST ('apple')",
-            )
+            .query("SELECT id FROM notes WHERE MATCH (title, body) AGAINST ('apple')")
             .await
             .unwrap_or_default();
         let m = adb
@@ -272,10 +273,21 @@ async fn wait_copies(
             .count_documents(doc! {"$text": {"$search": "apple"}})
             .await
             .unwrap_or(0);
-        let r = cmd(ar, &["FT.SEARCH", "rlss_idx", "apple", "NOCONTENT", "LIMIT", "0", "0"])
-            .await
-            .map(|v| ft_hits(&v, false).0)
-            .unwrap_or(-1);
+        let r = cmd(
+            ar,
+            &[
+                "FT.SEARCH",
+                "rlss_idx",
+                "apple",
+                "NOCONTENT",
+                "LIMIT",
+                "0",
+                "0",
+            ],
+        )
+        .await
+        .map(|v| ft_hits(&v, false).0)
+        .unwrap_or(-1);
         if a.len() == n && m as usize == n && r == n as i64 {
             return;
         }
@@ -302,7 +314,11 @@ async fn alice_scores(
         )
         .await
         .unwrap();
-    ck.ok(&format!("sql MATCH scores: alice's rows only ({tag})"), r.iter().all(|x| x.0 < 1000) && r.len() == 4, || format!("{r:?}"));
+    ck.ok(
+        &format!("sql MATCH scores: alice's rows only ({tag})"),
+        r.iter().all(|x| x.0 < 1000) && r.len() == 4,
+        || format!("{r:?}"),
+    );
     out.insert("sql match", round(&r));
     let r: Vec<(i64, f64)> = al
         .query(
@@ -311,7 +327,11 @@ async fn alice_scores(
         )
         .await
         .unwrap();
-    ck.ok(&format!("sprig_search scores: alice's rows only ({tag})"), r.iter().all(|x| x.0 < 1000) && r.len() == 4, || format!("{r:?}"));
+    ck.ok(
+        &format!("sprig_search scores: alice's rows only ({tag})"),
+        r.iter().all(|x| x.0 < 1000) && r.len() == 4,
+        || format!("{r:?}"),
+    );
     out.insert("sql sprig_search", round(&r));
     let (st, v) = post(
         http,
@@ -323,7 +343,11 @@ async fn alice_scores(
     .await;
     let mut r = rest_hits(&v);
     r.sort_by_key(|x| x.0);
-    ck.ok(&format!("REST scores: alice's rows only ({tag})"), st == 200 && r.iter().all(|x| x.0 < 1000) && r.len() == 4, || format!("{st} {v}"));
+    ck.ok(
+        &format!("REST scores: alice's rows only ({tag})"),
+        st == 200 && r.iter().all(|x| x.0 < 1000) && r.len() == 4,
+        || format!("{st} {v}"),
+    );
     out.insert("rest", round(&r));
     let docs: Vec<Document> = amdb
         .collection::<Document>("mnotes")
@@ -336,10 +360,19 @@ async fn alice_scores(
         .unwrap();
     let mut r: Vec<(i64, f64)> = docs
         .iter()
-        .map(|d| (d.get_i64("_id").unwrap_or(-1), d.get_f64("score").unwrap_or(f64::NAN)))
+        .map(|d| {
+            (
+                d.get_i64("_id").unwrap_or(-1),
+                d.get_f64("score").unwrap_or(f64::NAN),
+            )
+        })
         .collect();
     r.sort_by_key(|x| x.0);
-    ck.ok(&format!("$text scores: alice's documents only ({tag})"), r.iter().all(|x| x.0 < 1000) && r.len() == 4, || format!("{r:?}"));
+    ck.ok(
+        &format!("$text scores: alice's documents only ({tag})"),
+        r.iter().all(|x| x.0 < 1000) && r.len() == 4,
+        || format!("{r:?}"),
+    );
     out.insert("mongo $text", round(&r));
     let docs: Vec<Document> = amdb
         .collection::<Document>("mnotes")
@@ -354,13 +387,38 @@ async fn alice_scores(
         .unwrap();
     let mut r: Vec<(i64, f64)> = docs
         .iter()
-        .map(|d| (d.get_i64("_id").unwrap_or(-1), d.get_f64("score").unwrap_or(f64::NAN)))
+        .map(|d| {
+            (
+                d.get_i64("_id").unwrap_or(-1),
+                d.get_f64("score").unwrap_or(f64::NAN),
+            )
+        })
         .collect();
     r.sort_by_key(|x| x.0);
-    ck.ok(&format!("$search scores: alice's documents only ({tag})"), r.iter().all(|x| x.0 < 1000) && r.len() == 4, || format!("{r:?}"));
+    ck.ok(
+        &format!("$search scores: alice's documents only ({tag})"),
+        r.iter().all(|x| x.0 < 1000) && r.len() == 4,
+        || format!("{r:?}"),
+    );
     out.insert("mongo $search", round(&r));
-    let v = cmd(alr, &["FT.SEARCH", "rlss_idx", "apple", "NOCONTENT", "WITHSCORES", "LIMIT", "0", "100"]).await;
-    let (total, mut hits) = v.as_ref().map(|v| ft_hits(v, true)).unwrap_or((-1, Vec::new()));
+    let v = cmd(
+        alr,
+        &[
+            "FT.SEARCH",
+            "rlss_idx",
+            "apple",
+            "NOCONTENT",
+            "WITHSCORES",
+            "LIMIT",
+            "0",
+            "100",
+        ],
+    )
+    .await;
+    let (total, mut hits) = v
+        .as_ref()
+        .map(|v| ft_hits(v, true))
+        .unwrap_or((-1, Vec::new()));
     hits.sort();
     ck.ok(
         &format!("FT.SEARCH scores: alice's keys only, total 4 ({tag})"),
@@ -398,11 +456,17 @@ async fn search_respects_row_policies() {
     let mut ar = redis(&redis_addr, "app", &apw).await;
 
     // Leftovers of an earlier run.
-    let _ = admin.query_drop(format!("DROP DATABASE IF EXISTS {DB}")).await;
+    let _ = admin
+        .query_drop(format!("DROP DATABASE IF EXISTS {DB}"))
+        .await;
     let _ = cmd(&mut ar, &["FT.DROPINDEX", "rlss_idx", "DD"]).await;
-    let _ = admin.query_drop("DROP POLICY IF EXISTS rlss_own ON redis.db0").await;
+    let _ = admin
+        .query_drop("DROP POLICY IF EXISTS rlss_own ON redis.db0")
+        .await;
     for u in [ALICE, BOB] {
-        let _ = admin.query_drop(format!("DROP USER IF EXISTS '{u}'@'%'")).await;
+        let _ = admin
+            .query_drop(format!("DROP USER IF EXISTS '{u}'@'%'"))
+            .await;
     }
 
     // The SQL table, its search index and policy.
@@ -420,7 +484,11 @@ async fn search_respects_row_policies() {
         .iter()
         .map(|&i| {
             let tag = if i < 1000 { "alicetag" } else { "bobtag" };
-            format!("({i}, '{}', '{}', 'body {i}', '{tag}')", owner_of(i), title_of(i))
+            format!(
+                "({i}, '{}', '{}', 'body {i}', '{tag}')",
+                owner_of(i),
+                title_of(i)
+            )
         })
         .collect();
     admin
@@ -454,14 +522,18 @@ async fn search_respects_row_policies() {
     adb.run_command(doc! {"createIndexes": "mnotes", "indexes": [{"key": {"title": "text"}, "name": "title_text"}]})
         .await
         .unwrap();
-    adb.run_command(doc! {"createSearchIndexes": "mnotes", "indexes": [{"name": "default", "definition": {
+    adb.run_command(
+        doc! {"createSearchIndexes": "mnotes", "indexes": [{"name": "default", "definition": {
         "mappings": {"dynamic": false, "fields": {"title": {"type": "string"},
-            "tag": [{"type": "token"}, {"type": "stringFacet"}]}}}}]})
-        .await
-        .unwrap();
-    adb.run_command(doc! {"sprigCreatePolicy": "mnotes", "name": "own", "using": {"owner": "$$USER"}})
-        .await
-        .unwrap();
+            "tag": [{"type": "token"}, {"type": "stringFacet"}]}}}}]},
+    )
+    .await
+    .unwrap();
+    adb.run_command(
+        doc! {"sprigCreatePolicy": "mnotes", "name": "own", "using": {"owner": "$$USER"}},
+    )
+    .await
+    .unwrap();
     adb.run_command(doc! {"sprigRowSecurity": "mnotes", "enable": true})
         .await
         .unwrap();
@@ -476,7 +548,20 @@ async fn search_respects_row_policies() {
     }
     cmd(
         &mut ar,
-        &["FT.CREATE", "rlss_idx", "ON", "HASH", "PREFIX", "1", "rlss:", "SCHEMA", "title", "TEXT", "tag", "TAG"],
+        &[
+            "FT.CREATE",
+            "rlss_idx",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "rlss:",
+            "SCHEMA",
+            "title",
+            "TEXT",
+            "tag",
+            "TAG",
+        ],
     )
     .await
     .unwrap();
@@ -511,7 +596,11 @@ async fn search_respects_row_policies() {
     let r: Result<Vec<i64>, _> = al
         .query("SELECT id FROM notes WHERE MATCH (title, body) AGAINST ('zebra')")
         .await;
-    ck.ok("sql MATCH zebra: nothing", r.as_ref().is_ok_and(Vec::is_empty), || format!("{r:?}"));
+    ck.ok(
+        "sql MATCH zebra: nothing",
+        r.as_ref().is_ok_and(Vec::is_empty),
+        || format!("{r:?}"),
+    );
     let r: Result<Vec<i64>, _> = al
         .query("SELECT COUNT(*) FROM notes WHERE MATCH (title, body) AGAINST ('apple')")
         .await;
@@ -524,13 +613,18 @@ async fn search_respects_row_policies() {
         .await;
     ck.ok(
         "sprig_search limit 3: three of alice's rows",
-        r.as_ref().is_ok_and(|v| v.len() == 3 && v.iter().all(|i| *i < 1000)),
+        r.as_ref()
+            .is_ok_and(|v| v.len() == 3 && v.iter().all(|i| *i < 1000)),
         || format!("{r:?}"),
     );
     let r: Result<Vec<i64>, _> = al
         .query("SELECT id FROM sprig_search('notes_ix', 'zebra', NULL) AS s")
         .await;
-    ck.ok("sprig_search zebra: nothing", r.as_ref().is_ok_and(Vec::is_empty), || format!("{r:?}"));
+    ck.ok(
+        "sprig_search zebra: nothing",
+        r.as_ref().is_ok_and(Vec::is_empty),
+        || format!("{r:?}"),
+    );
     // A statement MariaDB refuses must not echo bob's keys.
     let e = al
         .query_drop("SELECT id FROM notes WHERE id = = 1 OR MATCH (title, body) AGAINST ('zebra')")
@@ -538,14 +632,26 @@ async fn search_respects_row_policies() {
         .map_err(|e| e.to_string());
     ck.ok(
         "sql error text names none of bob's keys",
-        e.as_ref().is_err_and(|m| !m.contains("7001") && !m.contains("7002")),
+        e.as_ref()
+            .is_err_and(|m| !m.contains("7001") && !m.contains("7002")),
         || format!("{e:?}"),
     );
 
     // ---- REST ----
     let path = format!("/v1/databases/{DB}/search/notes_ix:query");
-    let (st, v) = post(&http, ALICE, PW, &path, &json!({"query_string": "zebra", "consistency": "latest"})).await;
-    ck.ok("REST zebra: nothing", st == 200 && rest_hits(&v).is_empty(), || format!("{st} {v}"));
+    let (st, v) = post(
+        &http,
+        ALICE,
+        PW,
+        &path,
+        &json!({"query_string": "zebra", "consistency": "latest"}),
+    )
+    .await;
+    ck.ok(
+        "REST zebra: nothing",
+        st == 200 && rest_hits(&v).is_empty(),
+        || format!("{st} {v}"),
+    );
     let (st, v) = post(
         &http,
         ALICE,
@@ -570,10 +676,20 @@ async fn search_respects_row_policies() {
 
     // ---- MongoDB ----
     let mc = amdb.collection::<Document>("mnotes");
-    let n = mc.count_documents(doc! {"$text": {"$search": "zebra"}}).await;
-    ck.ok("$text zebra: nothing", n.as_ref().is_ok_and(|n| *n == 0), || format!("{n:?}"));
-    let n = mc.count_documents(doc! {"$text": {"$search": "apple"}}).await;
-    ck.ok("$text apple: 4", n.as_ref().is_ok_and(|n| *n == 4), || format!("{n:?}"));
+    let n = mc
+        .count_documents(doc! {"$text": {"$search": "zebra"}})
+        .await;
+    ck.ok(
+        "$text zebra: nothing",
+        n.as_ref().is_ok_and(|n| *n == 0),
+        || format!("{n:?}"),
+    );
+    let n = mc
+        .count_documents(doc! {"$text": {"$search": "apple"}})
+        .await;
+    ck.ok("$text apple: 4", n.as_ref().is_ok_and(|n| *n == 4), || {
+        format!("{n:?}")
+    });
     let got: Result<Vec<Document>, _> = async {
         mc.aggregate([doc! {"$search": {"index": "default", "consistency": "latest", "text": {"query": "zebra", "path": "title"}}}])
             .await?
@@ -581,7 +697,11 @@ async fn search_respects_row_policies() {
             .await
     }
     .await;
-    ck.ok("$search zebra: nothing", got.as_ref().is_ok_and(Vec::is_empty), || format!("{got:?}"));
+    ck.ok(
+        "$search zebra: nothing",
+        got.as_ref().is_ok_and(Vec::is_empty),
+        || format!("{got:?}"),
+    );
     let got: Result<Vec<Document>, _> = async {
         mc.aggregate([
             doc! {"$search": {"index": "default", "consistency": "latest", "text": {"query": "apple", "path": "title"}}},
@@ -625,16 +745,41 @@ async fn search_respects_row_policies() {
     let v = cmd(&mut alr, &["FT.SEARCH", "rlss_idx", "zebra", "NOCONTENT"]).await;
     ck.ok(
         "FT.SEARCH zebra: total 0, no key",
-        v.as_ref().is_ok_and(|v| ft_hits(v, false) == (0, Vec::new())),
+        v.as_ref()
+            .is_ok_and(|v| ft_hits(v, false) == (0, Vec::new())),
         || format!("{v:?}"),
     );
-    let v = cmd(&mut alr, &["FT.SEARCH", "rlss_idx", "apple", "NOCONTENT", "LIMIT", "0", "0"]).await;
+    let v = cmd(
+        &mut alr,
+        &[
+            "FT.SEARCH",
+            "rlss_idx",
+            "apple",
+            "NOCONTENT",
+            "LIMIT",
+            "0",
+            "0",
+        ],
+    )
+    .await;
     ck.ok(
         "FT.SEARCH LIMIT 0 0: total 4",
         v.as_ref().is_ok_and(|v| ft_hits(v, false).0 == 4),
         || format!("{v:?}"),
     );
-    let v = cmd(&mut alr, &["FT.SEARCH", "rlss_idx", "apple", "NOCONTENT", "LIMIT", "0", "3"]).await;
+    let v = cmd(
+        &mut alr,
+        &[
+            "FT.SEARCH",
+            "rlss_idx",
+            "apple",
+            "NOCONTENT",
+            "LIMIT",
+            "0",
+            "3",
+        ],
+    )
+    .await;
     ck.ok(
         "FT.SEARCH LIMIT 0 3: three of alice's keys",
         v.as_ref().is_ok_and(|v| {
@@ -643,7 +788,20 @@ async fn search_respects_row_policies() {
         }),
         || format!("{v:?}"),
     );
-    let v = cmd(&mut alr, &["FT.SEARCH", "rlss_idx", "*", "SORTBY", "title", "LIMIT", "0", "100"]).await;
+    let v = cmd(
+        &mut alr,
+        &[
+            "FT.SEARCH",
+            "rlss_idx",
+            "*",
+            "SORTBY",
+            "title",
+            "LIMIT",
+            "0",
+            "100",
+        ],
+    )
+    .await;
     let mut all = Vec::new();
     if let Ok(v) = &v {
         strings(v, &mut all);
@@ -651,7 +809,9 @@ async fn search_respects_row_policies() {
     ck.ok(
         "FT.SEARCH SORTBY: total 4, nothing of bob's",
         v.as_ref().is_ok_and(|v| ft_hits(v, false).0 == 4)
-            && !all.iter().any(|x| x.contains("zebra") || x.contains("rlss_bob") || x == "bobtag"),
+            && !all
+                .iter()
+                .any(|x| x.contains("zebra") || x.contains("rlss_bob") || x == "bobtag"),
         || format!("{v:?}"),
     );
     let v = cmd(&mut alr, &["FT.TAGVALS", "rlss_idx", "tag"]).await;
@@ -659,10 +819,24 @@ async fn search_respects_row_policies() {
     if let Ok(v) = &v {
         strings(v, &mut tv);
     }
-    ck.ok("FT.TAGVALS: alicetag only", tv == ["alicetag"], || format!("{v:?}"));
+    ck.ok("FT.TAGVALS: alicetag only", tv == ["alicetag"], || {
+        format!("{v:?}")
+    });
     let v = cmd(
         &mut alr,
-        &["FT.AGGREGATE", "rlss_idx", "*", "GROUPBY", "1", "@tag", "REDUCE", "COUNT", "0", "AS", "n"],
+        &[
+            "FT.AGGREGATE",
+            "rlss_idx",
+            "*",
+            "GROUPBY",
+            "1",
+            "@tag",
+            "REDUCE",
+            "COUNT",
+            "0",
+            "AS",
+            "n",
+        ],
     )
     .await;
     let mut ag = Vec::new();
@@ -671,7 +845,9 @@ async fn search_respects_row_policies() {
     }
     ck.ok(
         "FT.AGGREGATE groups: alicetag 4 only",
-        ag.contains(&"alicetag".to_owned()) && !ag.contains(&"bobtag".to_owned()) && ag.contains(&"4".to_owned()),
+        ag.contains(&"alicetag".to_owned())
+            && !ag.contains(&"bobtag".to_owned())
+            && ag.contains(&"4".to_owned()),
         || format!("{v:?}"),
     );
     let v = cmd(&mut alr, &["FT.INFO", "rlss_idx"]).await;
@@ -692,7 +868,19 @@ async fn search_respects_row_policies() {
         || format!("{num_docs:?} in {v:?}"),
     );
     // The administrator, bound by nothing, sees all 8.
-    let v = cmd(&mut ar, &["FT.SEARCH", "rlss_idx", "apple", "NOCONTENT", "LIMIT", "0", "0"]).await;
+    let v = cmd(
+        &mut ar,
+        &[
+            "FT.SEARCH",
+            "rlss_idx",
+            "apple",
+            "NOCONTENT",
+            "LIMIT",
+            "0",
+            "0",
+        ],
+    )
+    .await;
     ck.ok(
         "FT.SEARCH as the administrator: total 8",
         v.as_ref().is_ok_and(|v| ft_hits(v, false).0 == 8),
@@ -717,9 +905,19 @@ async fn search_respects_row_policies() {
     .unwrap();
     for &i in &more {
         let key = format!("rlss:{BOB}:{i}");
-        cmd(&mut ar, &["HSET", &key, "title", "apple apple apple apple", "tag", "bobtag"])
-            .await
-            .unwrap();
+        cmd(
+            &mut ar,
+            &[
+                "HSET",
+                &key,
+                "title",
+                "apple apple apple apple",
+                "tag",
+                "bobtag",
+            ],
+        )
+        .await
+        .unwrap();
     }
     wait_copies(&mut admin, &adb, &mut ar, 8 + more.len()).await;
     let after = alice_scores(&mut ck, &mut al, &http, &amdb, &mut alr, "after").await;
@@ -746,11 +944,24 @@ async fn search_respects_row_policies() {
     for k in &leftover {
         let _ = cmd(&mut ar, &["DEL", k]).await;
     }
-    let _ = admin.query_drop("DROP POLICY IF EXISTS rlss_own ON redis.db0").await;
-    let _ = admin.query_drop(format!("DROP DATABASE IF EXISTS {DB}")).await;
+    let _ = admin
+        .query_drop("DROP POLICY IF EXISTS rlss_own ON redis.db0")
+        .await;
+    let _ = admin
+        .query_drop("ALTER TABLE redis.db0 DISABLE ROW LEVEL SECURITY")
+        .await;
+    let _ = admin
+        .query_drop(format!("DROP DATABASE IF EXISTS {DB}"))
+        .await;
     for u in [ALICE, BOB] {
-        let _ = admin.query_drop(format!("DROP USER IF EXISTS '{u}'@'%'")).await;
+        let _ = admin
+            .query_drop(format!("DROP USER IF EXISTS '{u}'@'%'"))
+            .await;
     }
-    println!("rls_search_live: {} checks, {} failures", ck.n, ck.failed.len());
+    println!(
+        "rls_search_live: {} checks, {} failures",
+        ck.n,
+        ck.failed.len()
+    );
     assert!(ck.failed.is_empty(), "{:#?}", ck.failed);
 }

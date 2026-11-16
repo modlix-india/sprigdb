@@ -1125,7 +1125,7 @@ pub async fn reconcile_at(
     let locked: BTreeSet<String> = conn
         .exec::<String, _, _>(
             "SELECT User FROM mysql.global_priv WHERE User LIKE ? AND Host = '%' \
-             AND JSON_VALUE(Priv, '$.account_locked') = 'true'",
+             AND JSON_VALUE(Priv, '$.account_locked') IN ('1', 'true')",
             (&like,),
         )
         .await

@@ -16,7 +16,12 @@
 //!     expired or hidden are left out
 //!   SORTBY and FT.AGGREGATE read every match (up to search.max_window,
 //!     else 39827) and sort or aggregate in the gateway
-//! FT.INFO, FT._LIST, FT.EXPLAIN(CLI), FT.TAGVALS: from the catalog and a copy
+//!   a login a row policy on the namespace binds: every match (39827 past
+//!     the window), the keys its session reads, then the total, the page
+//!     and the scores from those keys alone (search::visible)
+//! FT.INFO, FT._LIST, FT.EXPLAIN(CLI), FT.TAGVALS: from the catalog and a copy;
+//!   for a bound login FT.TAGVALS reads the keys it may see, and FT.INFO
+//!   shows no document count
 //! ```
 //!
 //! Errors follow Redis 8's texts where clients look at them
@@ -341,22 +346,45 @@ impl Cx<'_, '_> {
         Ok(answers)
     }
 
+    /// Whether a row policy on the index's namespace binds the login (or
+    /// the session can't tell).
+    fn bound(&self, def: &IndexDef) -> bool {
+        crate::search::visible::needs_visible(def, self.sql.row_policy_binds(def.object_id))
+    }
+
+    /// The keys among `hits` the session reads (live hashes and strings
+    /// its policies show), in hit order.
+    async fn visible_keys(&mut self, def: &IndexDef, hits: &[Hit]) -> Result<Vec<Key>> {
+        let keys: Vec<Key> = hits.iter().map(|h| h.key.clone()).collect();
+        let live = self.reread(def, &keys, Some(&[])).await?;
+        Ok(keys
+            .into_iter()
+            .filter(|k| live.contains_key(&k.0))
+            .collect())
+    }
+
     async fn info(&mut self, a: &[&[u8]]) -> Result<Frame> {
         let name = a.first().map(|x| text(x)).unwrap_or_default();
         let (def, customs) = self.index(&name).await?;
         self.check_read(&def).await?;
         let (ready, _) = self.svc.state(self.tenant, &def).await;
-        let docs = match self
-            .query(&def, &customs, SearchQuery::All, vec![Op::Count])
-            .await
-        {
-            Ok(v) => match v.first() {
-                Some(Answer::Count(n)) => *n,
-                _ => 0,
-            },
-            Err(_) => 0,
+        // The copy's count includes keys hidden from a bound login: none
+        // shown, as for a protected table's row counts in metadata.
+        let docs = if self.bound(&def) {
+            Frame::null()
+        } else {
+            let n = match self
+                .query(&def, &customs, SearchQuery::All, vec![Op::Count])
+                .await
+            {
+                Ok(v) => match v.first() {
+                    Some(Answer::Count(n)) => *n,
+                    _ => 0,
+                },
+                Err(_) => 0,
+            };
+            Frame::Integer(i64::try_from(n).unwrap_or(i64::MAX))
         };
-        let docs = i64::try_from(docs).unwrap_or(i64::MAX);
         let mut attrs = Vec::new();
         let mut seen: Vec<&str> = Vec::new();
         for f in &def.fields {
@@ -409,8 +437,8 @@ impl Cx<'_, '_> {
                 ]),
             ),
             kv("attributes", Frame::Array(attrs)),
-            kv("num_docs", Frame::Integer(docs)),
-            kv("max_doc_id", Frame::Integer(docs)),
+            kv("num_docs", docs.clone()),
+            kv("max_doc_id", docs),
             kv("hash_indexing_failures", Frame::Integer(0)),
             kv("indexing", Frame::Integer(i64::from(!ready))),
             kv("percent_indexed", bulk(if ready { "1" } else { "0" })),
@@ -494,11 +522,23 @@ impl Cx<'_, '_> {
         {
             return Err(ft::arg_error(format!("Not a tag field: {field}")));
         }
+        // A bound login's values come from the keys it reads.
+        let over = if self.bound(&def) {
+            let (hits, _) = self
+                .matches(&def, &customs, SearchQuery::All, true, 0)
+                .await?;
+            crate::search::visible::within(
+                SearchQuery::All,
+                hits.into_iter().map(|h| h.key).collect(),
+            )
+        } else {
+            SearchQuery::All
+        };
         let ans = self
             .query(
                 &def,
                 &customs,
-                SearchQuery::All,
+                over,
                 vec![Op::Facet {
                     path: field,
                     n: usize::MAX,
@@ -578,6 +618,51 @@ impl Cx<'_, '_> {
         top: usize,
     ) -> Result<(Vec<Hit>, u64)> {
         let max = self.svc.knobs().max_window;
+        if self.bound(def) {
+            // Every match, the keys the session reads, and the total, the
+            // page and the scores from those alone.
+            let every = match self
+                .query(def, customs, query.clone(), vec![Op::All { max }])
+                .await
+            {
+                Ok(a) => match a.into_iter().next() {
+                    Some(Answer::Hits(h)) => h,
+                    _ => Vec::new(),
+                },
+                Err(e) if e.code() == Some(SprigCode::SearchWindowExceeded) => {
+                    metrics::counter!("sprig_search_window_exceeded_total").increment(1);
+                    return Err(crate::search::visible::too_many(max));
+                }
+                Err(e) => return Err(e),
+            };
+            let visible = self.visible_keys(def, &every).await?;
+            let total = visible.len() as u64;
+            let k = if all {
+                visible.len()
+            } else {
+                top.min(visible.len())
+            };
+            if k == 0 {
+                return Ok((Vec::new(), total));
+            }
+            metrics::counter!("sprig_rls_search_rechecks_total", "scoring" => "matched")
+                .increment(1);
+            let ops = vec![Op::Top {
+                k,
+                scoring: Scoring::Matched,
+            }];
+            let within = crate::search::visible::within(query, visible);
+            let hits = match self
+                .query(def, customs, within, ops)
+                .await?
+                .into_iter()
+                .next()
+            {
+                Some(Answer::Hits(h)) => h,
+                _ => Vec::new(),
+            };
+            return Ok((hits, total));
+        }
         let ops = if all {
             vec![Op::All { max }]
         } else if top == 0 {

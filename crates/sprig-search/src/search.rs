@@ -230,9 +230,7 @@ impl Bm25StatisticsProvider for MatchedStats {
                     Some((seg, r)) if *seg == a.segment_ord => r,
                     _ => {
                         // A field without norms: one token per document.
-                        let Ok(r) = s
-                            .segment_reader(a.segment_ord)
-                            .get_fieldnorms_reader(field)
+                        let Ok(r) = s.segment_reader(a.segment_ord).get_fieldnorms_reader(field)
                         else {
                             n += 1;
                             continue;

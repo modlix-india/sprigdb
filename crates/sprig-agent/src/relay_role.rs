@@ -449,7 +449,7 @@ impl RelayRole {
         };
         let accounts: Vec<(String, String, bool)> = match c
             .query_map(
-                "SELECT User, Host, IFNULL(JSON_VALUE(Priv, '$.account_locked'), 'false') = 'true' \
+                "SELECT User, Host, IFNULL(JSON_VALUE(Priv, '$.account_locked'), '0') IN ('1', 'true') \
                  FROM mysql.global_priv WHERE User LIKE 't%'",
                 |(u, h, l): (String, String, i64)| (u, h, l != 0),
             )

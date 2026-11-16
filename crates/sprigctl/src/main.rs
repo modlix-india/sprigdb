@@ -46,6 +46,7 @@
 
 // AI providers.
 mod ai;
+mod catalog;
 mod check;
 mod client;
 mod cluster;
@@ -509,6 +510,7 @@ fn cli() -> Command {
         .subcommand(space::group())
         .subcommand(inherit::group())
         .subcommand(txn::group())
+        .subcommand(catalog::group())
         .subcommand(ai::group())
         .subcommand(sink::group())
         .subcommand(graph::group())
@@ -641,6 +643,9 @@ fn main() -> ExitCode {
                 .await
                 .map(|()| ExitCode::SUCCESS),
             "txn" => txn::run(&client, sub, output(&matches))
+                .await
+                .map(|()| ExitCode::SUCCESS),
+            "catalog" => catalog::run(&client, sub, output(&matches))
                 .await
                 .map(|()| ExitCode::SUCCESS),
             "ai" => ai::run(&client, sub, matches.get_flag("dry-run"), output(&matches))
