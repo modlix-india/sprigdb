@@ -502,7 +502,9 @@ pub async fn ensure_vhost(
         )
         .await?;
         if d.kind == DefKind::Queue {
-            settled &= super::triggers::ensure_for_queue(svc, chain, d, (row.db_id.0, &row.name), *id).await?;
+            settled &=
+                super::triggers::ensure_for_queue(svc, chain, d, (row.db_id.0, &row.name), *id)
+                    .await?;
             // Its FOR EACH TENANT sinks, as for streams.
             super::sinks::ensure_for_queue(svc, chain, d, t).await;
         }

@@ -363,6 +363,20 @@ pub trait CopyEnv: Send + Sync {
 
     /// Milliseconds since the Unix epoch.
     fn now_ms(&self) -> u64;
+
+    /// Removes dropped shares `ids` from `tenant`'s catalog once their
+    /// cleanup in the children is done, in one versioned catalog change
+    /// (rows still `dropping` only), as the parent's own statement would
+    /// ([`crate::sweep`]).
+    ///
+    /// # Errors
+    /// The catalog's.
+    async fn purge_shares(&self, tenant: TenantId, ids: &[u64]) -> Result<()> {
+        let _ = (tenant, ids);
+        Err(SprigError::internal(
+            "this copy worker can't change catalogs",
+        ))
+    }
 }
 
 /// One copy the family keeps.
@@ -679,8 +693,19 @@ pub struct Maintainer {
     views_at: Vec<(TenantId, u64)>,
     /// Root tenants whose `inherit_refs` this maintainer made sure of.
     refs_ready: BTreeSet<u64>,
+    /// The sweep of dropped shares ([`crate::sweep`]).
+    sweeper: Arc<Sweeper>,
     /// What it did so far.
     pub counts: Counts,
+}
+
+/// The sweep of dropped shares runs beside the copies, one pass at a time:
+/// its cleanup may wait on a child's row locks, which must not hold up
+/// the copies.
+#[derive(Default)]
+struct Sweeper {
+    running: std::sync::atomic::AtomicBool,
+    seen: std::sync::Mutex<crate::sweep::Seen>,
 }
 
 impl std::fmt::Debug for Maintainer {
@@ -722,8 +747,40 @@ impl Maintainer {
             views: BTreeSet::new(),
             views_at: Vec::new(),
             refs_ready: BTreeSet::new(),
+            sweeper: Arc::default(),
             counts: Counts::default(),
         }
+    }
+
+    /// Starts a sweep of the family's dropped shares in the background
+    /// ([`crate::sweep`]) unless one is running or none is `dropping`.
+    fn sweep_dropped(&self) {
+        use std::sync::atomic::Ordering;
+        let any = self
+            .family
+            .cats
+            .values()
+            .any(|c| state_of(c).is_some_and(|s| s.dropping().next().is_some()));
+        if !any || self.sweeper.running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let env = Arc::clone(&self.env);
+        let family = self.family.clone();
+        let sweeper = Arc::clone(&self.sweeper);
+        tokio::spawn(async move {
+            let mut seen = std::mem::take(
+                &mut *sweeper
+                    .seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            crate::sweep::sweep_family(env.as_ref(), &family, &mut seen).await;
+            *sweeper
+                .seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = seen;
+            sweeper.running.store(false, Ordering::Release);
+        });
     }
 
     /// The family as last refreshed.
@@ -750,6 +807,7 @@ impl Maintainer {
     /// The catalogs' and backends'.
     pub async fn refresh(&mut self) -> Result<usize> {
         self.family = load_family(self.env.as_ref(), self.root).await?;
+        self.sweep_dropped();
         // A catalog change may have dropped share views (a parent's DROP
         // SHARE drops them on every child, and share ids are reused): they
         // are made again before their next read.

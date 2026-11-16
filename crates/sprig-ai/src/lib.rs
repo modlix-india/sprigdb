@@ -23,6 +23,8 @@
 //! - [`egress`]: the egress gate;
 //! - [`embedding`]: embedded columns' model aliases, keys, catalog rows
 //!   and metrics;
+//! - [`retrieval`]: retrieval indexes' catalog rows, chunk tables, keys
+//!   and metrics;
 //! - [`settings`]: the `ai.*` keys;
 //! - [`budget`]: daily token budgets;
 //! - [`audit`]: conversations, messages and usage in the tenant catalog,
@@ -67,6 +69,7 @@ pub mod metrics;
 pub mod prompt;
 pub mod provider;
 pub mod providers;
+pub mod retrieval;
 pub mod role;
 pub mod settings;
 pub mod sql_guard;

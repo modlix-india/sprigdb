@@ -41,7 +41,9 @@
 //!    at `fra1` removes the member's sink and connection in `ams1` at once.
 //!    `SHOW INHERITED DEFINITIONS` at `fra1` counts the member's instance, an
 //!    override `FOR TENANT` is applied to it, `DROP TRIGGER` stops its
-//!    trigger instance, and a broadcast reaches it once.
+//!    trigger instance, and a broadcast reaches it once. A queue defined at
+//!    `fra1` after the member made its AMQP vhost's instances in `ams1`
+//!    reaches that vhost without another use.
 //! 4. **A move into the standby's DC.** A tenant with its own
 //!    `failover.standby_dcs = 1` gets a job standby in `ams1`; `sprigctl
 //!    tenant move --to ams1` drops the standby first and moves it.
@@ -2259,8 +2261,61 @@ async fn members_in_ams1(d: &Deployment, c: &mut Checks, pa: &str, ma: &str, m: 
         got == Ok(vec!["1".to_owned()]),
         || format!("{got:?}"),
     );
+    // An AMQP vhost: the member in ams1 makes its instances with a
+    // publish of its own; a queue the declarer defines afterwards reaches
+    // it through a gateway of ams1, before the member uses the vhost again.
+    run(
+        "fra1",
+        pa,
+        &[
+            "CREATE DATABASE swq",
+            "CREATE EXCHANGE swq.jobs TYPE topic FOR EACH TENANT",
+            "CREATE QUEUE swq.first_q FOR EACH TENANT",
+        ],
+    )
+    .await;
+    run(
+        "ams1",
+        ma,
+        &["CALL sprig.mq_publish('jobs', 'a.b', 'first', '{}', 0, 'swq')"],
+    )
+    .await;
+    let active = |name: &'static str| async move {
+        let t0 = Instant::now();
+        loop {
+            let inst = table("ams1", ma, "SHOW INHERITED INSTANCES").await;
+            let has = inst.as_ref().is_ok_and(|v| {
+                v.iter().any(|r| {
+                    r.get(2).is_some_and(|n| n == name) && r.get(5).is_some_and(|s| s == "active")
+                })
+            });
+            if has || t0.elapsed() > Duration::from_secs(30) {
+                return (has, format!("{inst:?}"));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    };
+    let (has, why) = active("first_q").await;
+    c.ok(
+        "the member's publish at ams1 made its vhost's instances",
+        has,
+        || why,
+    );
+    run("fra1", pa, &["CREATE QUEUE swq.later_q FOR EACH TENANT"]).await;
+    let (has, why) = active("later_q").await;
+    c.ok(
+        "a queue defined at fra1 later is applied to the member's vhost in ams1",
+        has,
+        || why,
+    );
     let log = d.log("gw-fra1");
-    for op in ["count", "override", "drop_trigger", "broadcast"] {
+    for op in [
+        "count",
+        "override",
+        "drop_trigger",
+        "broadcast",
+        "mq_rollout",
+    ] {
         c.ok(
             &format!("fra1 asked ams1 to apply {op}"),
             log.lines().any(|l| {

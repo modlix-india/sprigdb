@@ -1433,6 +1433,7 @@ async fn galera_statistics_after_a_cut_off_analyze() {
     let j: Arc<dyn StatsJournal> = mem.clone();
     let validator = || {
         RsuValidator::new(node.clone(), peers.clone(), Arc::new(NoMarker))
+            .with_writer(writer.clone())
             .with_stats_journal(Arc::clone(&j))
     };
 
@@ -1472,7 +1473,10 @@ async fn galera_statistics_after_a_cut_off_analyze() {
     assert_eq!(held.len(), 1, "{held:?}");
     assert_eq!(held[0].node, node.node.as_str());
     eprintln!("galera, journaled: {} rows", held[0].rows());
-    assert!(synced(node.clone()).await, "node not Synced after the cut-off");
+    assert!(
+        synced(node.clone()).await,
+        "node not Synced after the cut-off"
+    );
 
     // 2. The drift reconciler's pass puts them back and removes the entry;
     // not while a validation of this process runs on the table.
@@ -1498,7 +1502,10 @@ async fn galera_statistics_after_a_cut_off_analyze() {
     )
     .await
     .unwrap();
-    assert!(synced(node.clone()).await, "node not Synced after the sweep");
+    assert!(
+        synced(node.clone()).await,
+        "node not Synced after the sweep"
+    );
     assert_eq!(automatic_on(&node, schema).await, "");
 
     // 3. Cut off again; the next validation of the table puts the
@@ -1506,7 +1513,10 @@ async fn galera_statistics_after_a_cut_off_analyze() {
     cut_off(good.clone()).await;
     assert_ne!(stats_of(&node, schema).await, fake);
     assert_eq!(mem.all().len(), 1);
-    assert!(synced(node.clone()).await, "node not Synced after the cut-off");
+    assert!(
+        synced(node.clone()).await,
+        "node not Synced after the cut-off"
+    );
     let v = validator();
     let r = v.validate(&good).await.unwrap();
     show("galera after a cut-off ANALYZE", &r);

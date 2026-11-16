@@ -44,6 +44,8 @@ pub mod names;
 pub mod pin_stmt;
 // Recommendations in SQL.
 pub mod rec_stmt;
+// Retrieval indexes: their DDL, `RETRIEVE()` calls and filters.
+pub mod retrieval;
 // Row-level security (policies and the rewrite).
 pub mod rls;
 pub mod settings_stmt;

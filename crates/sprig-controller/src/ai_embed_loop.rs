@@ -9,9 +9,13 @@
 //!   replaced here
 //! ```
 //!
-//! A job ends by itself when its column, table or subscription is gone, and
-//! removes the subscription, so it isn't submitted again. The names match
-//! the gateway's `exec::embed_ddl::KIND` and the worker's handler.
+//! The same for retrieval indexes: each active subscription of kind
+//! `ai_retrieval` (one per index) gets an `ai_retrieval` job.
+//!
+//! A job ends by itself when its column (or index), table or subscription
+//! is gone, and removes the subscription, so it isn't submitted again. The
+//! names match the gateway's `exec::embed_ddl::KIND` and
+//! `sprig_ai::retrieval::KIND`, and the worker's handlers.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -29,6 +33,8 @@ use crate::runtime::{LoopCx, LoopTier, MetaEvent, Outcome, Reconciler};
 pub const SUB_KIND: &str = "ai_embed";
 /// The embedding job's kind.
 pub const JOB_KIND: &str = "ai_embed";
+/// The retrieval index subscriptions' kind, and their jobs'.
+pub const RETRIEVAL_KIND: &str = sprig_ai::retrieval::KIND;
 
 /// The loop's one key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -69,11 +75,11 @@ impl Reconciler for AiEmbedLoop {
         let mut live = HashSet::new();
         for j in &list_jobs(cx.dc.as_ref()).await? {
             let job = j.job();
-            if job.state.is_final() || job.kind != JOB_KIND {
+            if job.state.is_final() || (job.kind != JOB_KIND && job.kind != RETRIEVAL_KIND) {
                 continue;
             }
             if let (Some(t), Some(n)) = (job.spec["tenant"].as_u64(), job.spec["name"].as_str()) {
-                live.insert((t, n.to_owned()));
+                live.insert((job.kind.clone(), t, n.to_owned()));
             }
         }
         let prefix = cx.dc.tier().key("feed/subs/")?;
@@ -92,27 +98,34 @@ impl Reconciler for AiEmbedLoop {
                 continue;
             };
             let s = r.body;
-            let k = (s.tenant.0, s.name.clone());
-            if s.kind != SUB_KIND || s.state != "active" || live.contains(&k) {
+            let kind = if s.kind == SUB_KIND {
+                JOB_KIND
+            } else if s.kind == RETRIEVAL_KIND {
+                RETRIEVAL_KIND
+            } else {
+                continue;
+            };
+            let k = (kind.to_owned(), s.tenant.0, s.name.clone());
+            if s.state != "active" || live.contains(&k) {
                 continue;
             }
             let id = submit(
                 l,
                 cx.clock.as_ref(),
                 NewJob {
-                    kind: JOB_KIND.into(),
-                    // One long-running job per embedded column.
+                    kind: kind.into(),
+                    // One long-running job per embedded column or index.
                     class: JobClass::Consumer,
                     tenant_id: None,
                     clusters: Vec::new(),
                     priority: 0,
-                    cause: "ai_embed".into(),
+                    cause: kind.into(),
                     zone: None,
                     spec: json!({"tenant": s.tenant.0, "name": s.name}),
                 },
             )
             .await?;
-            tracing::info!(tenant = %s.tenant, sub = %s.name, job = %id, "embedding job submitted");
+            tracing::info!(tenant = %s.tenant, sub = %s.name, job = %id, kind, "embedding job submitted");
             live.insert(k);
         }
         Ok(Outcome::RequeueAfter(Duration::from_secs(2)))

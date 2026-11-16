@@ -176,6 +176,14 @@ fn docs_paths() -> Value {
             "Searches the product documentation of this release (any signed-in user): full-text and \
              embedding hits fused, at most two per page ({query, audience, limit, version})",
             Some("DocsSearchRequest"), "DocsSearchReply")},
+        "/v1/databases/{database}/retrieval/{index}:search": {"post": with_params(op(
+            "Retrieval.Search", "sprig.v1.Retrieval",
+            "Searches a retrieval index (CREATE RETRIEVAL INDEX) as RETRIEVE() does in SQL: full-text \
+             and embedding hits fused, at most two chunks per row, only rows the caller may read \
+             ({query, limit, filter})",
+            Some("RetrievalSearchRequest"), "RetrievalSearchReply"),
+            &[json!({"name": "database", "in": "path", "required": true, "schema": {"type": "string"}}),
+              json!({"name": "index", "in": "path", "required": true, "schema": {"type": "string"}})])},
     })
 }
 
@@ -477,6 +485,16 @@ fn core_schemas() -> Value {
             "score": {"type": "number"}, "bm25_rank": {"type": "integer", "nullable": true},
             "vector_rank": {"type": "integer", "nullable": true}}),
             &["chunk_id", "page", "title", "heading_path", "audience", "text", "score"]),
+        "RetrievalSearchRequest": s(json!({"query": string, "limit": int, "filter": string}),
+            &["query"]),
+        "RetrievalSearchHit": s(json!({"key": {"type": "object", "additionalProperties": true},
+            "chunk_no": int, "title": {"type": "string", "nullable": true}, "text": string,
+            "score": {"type": "number"}, "bm25_rank": {"type": "integer", "nullable": true},
+            "vector_rank": {"type": "integer", "nullable": true}}),
+            &["key", "chunk_no", "text", "score"]),
+        "RetrievalSearchReply": s(json!({"database": string, "index": string,
+            "hits": {"type": "array", "items": {"$ref": "#/components/schemas/RetrievalSearchHit"}}}),
+            &["database", "index", "hits"]),
         "DocsSearchReply": s(json!({"version": string,
             "mode": {"type": "string", "enum": ["hybrid", "keyword"]},
             "hits": {"type": "array", "items": {"$ref": "#/components/schemas/DocsSearchHit"}}}),

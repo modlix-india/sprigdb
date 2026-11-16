@@ -551,6 +551,9 @@ pub struct LiveEnv {
     /// ([`Self::with_feed`]).
     feed: Arc<dyn Clusters>,
     source: MariaSource,
+    /// Catalog changes: a dropped share's row, once the copy worker
+    /// finished its cleanup.
+    catalog: sprig_catalog::MariaCatalog,
 }
 
 impl std::fmt::Debug for LiveEnv {
@@ -577,6 +580,10 @@ impl LiveEnv {
             Arc::new(sprig_inherit::TypesExtension),
         ];
         let source = MariaSource::new(Arc::clone(&locator) as Arc<dyn CatalogLocator>, ext)?;
+        let catalog = sprig_catalog::Versioner::new(
+            sprig_catalog::MariaBackend::new(Arc::clone(&locator) as Arc<dyn CatalogLocator>),
+            Arc::new(sprig_catalog::DirectoryAllocator::new(Arc::clone(&global))),
+        );
         Ok(Self {
             dc,
             global,
@@ -585,6 +592,7 @@ impl LiveEnv {
             feed: Arc::clone(&clusters) as Arc<dyn Clusters>,
             clusters,
             source,
+            catalog,
         })
     }
 
@@ -641,6 +649,30 @@ impl CopyEnv for LiveEnv {
 
     fn now_ms(&self) -> u64 {
         now_ms()
+    }
+
+    async fn purge_shares(&self, tenant: TenantId, ids: &[u64]) -> Result<()> {
+        let change = sprig_inherit::InheritChange {
+            purge_shares: ids.to_vec(),
+            ..sprig_inherit::InheritChange::default()
+        };
+        let mut c = self
+            .catalog
+            .change(tenant, sprig_catalog::VersionKind::Catalog)
+            .await?;
+        let version = c.version();
+        let applied = {
+            let (store, tx) = c.tx().parts();
+            sprig_inherit::InheritStore::new(store.schema())
+                .apply(tx, &change, version)
+                .await
+        };
+        if let Err(e) = applied {
+            let _ = c.rollback().await;
+            return Err(e);
+        }
+        c.commit().await?;
+        Ok(())
     }
 }
 

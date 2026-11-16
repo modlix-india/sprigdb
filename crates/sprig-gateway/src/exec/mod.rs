@@ -37,6 +37,9 @@ mod dropdb;
 mod embed_ddl;
 // The read-only `sprig_docs` database.
 mod docs;
+// Retrieval indexes: their DDL and `RETRIEVE()`.
+mod retrieval;
+pub(crate) use retrieval::KEY_JSON_HINT as RETRIEVE_KEY_JSON_HINT;
 mod fence;
 // A mover's fence never reaches clients as 1146 or 1049.
 mod fence_retry;

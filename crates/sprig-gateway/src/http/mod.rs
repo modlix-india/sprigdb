@@ -43,6 +43,8 @@ pub mod lang;
 /// Live `vector.*` and `analytics.*` settings.
 pub mod model_settings;
 pub mod rest;
+// Retrieval index searches.
+pub mod retrieval;
 // Search.Query.
 pub mod search;
 pub mod settings;

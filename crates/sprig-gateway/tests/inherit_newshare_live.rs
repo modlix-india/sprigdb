@@ -634,6 +634,134 @@ async fn a_drop_cut_off_by_a_gateway_crash_is_finished_by_the_next_statement() {
     ok(&mut c, &format!("DROP DATABASE IF EXISTS {db}")).await;
 }
 
+/// A root connection to the backend `SPRIG_TEST_NEWSHARE_BACKEND` names,
+/// with the schema pattern, when set.
+async fn backend() -> Option<(Conn, String)> {
+    let addr = std::env::var("SPRIG_TEST_NEWSHARE_BACKEND").ok()?;
+    let pw = std::env::var("SPRIG_TEST_NEWSHARE_BACKEND_PASSWORD").ok()?;
+    let like = std::env::var("SPRIG_TEST_NEWSHARE_BACKEND_SCHEMAS").ok()?;
+    let (host, port) = addr.rsplit_once(':').unwrap();
+    let b = Conn::new(
+        OptsBuilder::default()
+            .ip_or_hostname(host)
+            .tcp_port(port.parse().unwrap())
+            .user(Some("root"))
+            .pass(Some(pw)),
+    )
+    .await
+    .expect("backend login");
+    Some((b, like.replace('\'', "")))
+}
+
+/// The states of the granted share `name` in the catalogs matching the
+/// backend's schema pattern, read on the backend (no gateway statement).
+async fn share_states(b: &mut Conn, like: &str, name: &str) -> Vec<String> {
+    let schemas: Vec<String> = b
+        .query(format!(
+            "SELECT TABLE_SCHEMA FROM information_schema.TABLES WHERE TABLE_NAME = 'shares' \
+             AND TABLE_SCHEMA LIKE '{like}'"
+        ))
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    for sc in schemas {
+        let v: Vec<String> = b
+            .exec(
+                format!("SELECT state FROM `{sc}`.shares WHERE name = ? AND role = 'granted'"),
+                (name,),
+            )
+            .await
+            .unwrap();
+        out.extend(v);
+    }
+    out
+}
+
+/// The same crash as above, but nobody runs a statement afterwards: the
+/// tree's copy worker finishes the drop by itself, a minute after it
+/// first sees the share `dropping`, and removes the share's row. Checked
+/// on the backend only until the row is gone, so no gateway statement can
+/// have done it. Needs `SPRIG_TEST_NEWSHARE_RESTART`, the backend variables
+/// and a worker.
+#[tokio::test]
+async fn a_drop_cut_off_by_a_gateway_crash_is_finished_by_the_copy_worker() {
+    let Some(e) = env() else {
+        eprintln!("SPRIG_TEST_NEWSHARE_* not set; skipped");
+        return;
+    };
+    if std::env::var("SPRIG_TEST_NEWSHARE_RESTART").is_err() {
+        eprintln!("SPRIG_TEST_NEWSHARE_RESTART not set; skipped");
+        return;
+    }
+    let Some((mut b, like)) = backend().await else {
+        eprintln!("SPRIG_TEST_NEWSHARE_BACKEND* not set; skipped");
+        return;
+    };
+    let db = format!("wkdc{}", suffix());
+    let name = format!("{db}_s");
+    let mut p = conn(&e.addr, &e.parent).await;
+    share(&mut p, &db).await;
+    let mut c = conn(&e.addr, &e.child).await;
+    ok(&mut c, &format!("USE {db}")).await;
+    let seen = rows_become(&mut c, &db, &[("1", "parent one"), ("2", "parent two")]).await;
+    assert_eq!(seen, pairs(&[("1", "parent one"), ("2", "parent two")]));
+    ok(&mut c, "UPDATE t1 SET v = 'kid ovr' WHERE id = 1").await;
+    ok(&mut c, "DELETE FROM t1 WHERE id = 2").await;
+    assert_eq!(rows_of(&mut c, &db).await, pairs(&[("1", "kid ovr")]));
+    assert_eq!(share_states(&mut b, &like, &name).await, ["active"]);
+    // The child holds its override's row lock, so the drop's cleanup waits;
+    // the gateway is killed while it does.
+    let mut held = conn(&e.addr, &e.child).await;
+    ok(&mut held, &format!("USE {db}")).await;
+    ok(&mut held, "BEGIN").await;
+    ok(&mut held, "UPDATE t1 SET v = 'kid ovr' WHERE id = 1").await;
+    let addr = e.addr.clone();
+    let parent = e.parent.clone();
+    let (db2, name2) = (db.clone(), name.clone());
+    let drop = tokio::spawn(async move {
+        let mut p = conn(&addr, &parent).await;
+        p.query_drop(format!("USE {db2}")).await.unwrap();
+        p.query_drop(format!("DROP SHARE {name2}")).await
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert!(
+        !drop.is_finished(),
+        "the drop didn't wait for the child's lock"
+    );
+    assert!(restart_gateway(), "the gateway didn't restart");
+    let _ = drop.await;
+    drop_conns(vec![p, c, held]).await;
+    // The drop committed and its cleanup didn't run.
+    assert_eq!(share_states(&mut b, &like, &name).await, ["dropping"]);
+    let started = std::time::Instant::now();
+    let mut left = Vec::new();
+    while started.elapsed() < std::time::Duration::from_secs(150) {
+        left = share_states(&mut b, &like, &name).await;
+        if left.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    println!(
+        "the share's row went after {:.1} s with no statement: {left:?}",
+        started.elapsed().as_secs_f64()
+    );
+    assert!(left.is_empty(), "still there: {left:?}");
+    drop(b);
+    // The child's override is its own row, and the hide went with the share.
+    let mut c = conn(&e.addr, &e.child).await;
+    ok(&mut c, &format!("USE {db}")).await;
+    assert_eq!(rows_of(&mut c, &db).await, pairs(&[("1", "kid ovr")]));
+    let mut p = conn(&e.addr, &e.parent).await;
+    ok(&mut p, &format!("USE {db}")).await;
+    ok(&mut p, &format!("CREATE SHARE {name} ON t1 TO ALL CHILDREN")).await;
+    let seen = rows_become(&mut c, &db, &[("1", "kid ovr"), ("2", "parent two")]).await;
+    assert_eq!(seen, pairs(&[("1", "kid ovr"), ("2", "parent two")]));
+    ok(&mut p, &format!("DROP SHARE {name}")).await;
+    ok(&mut p, &format!("DROP DATABASE {db}")).await;
+    ok(&mut c, &format!("DROP DATABASE IF EXISTS {db}")).await;
+}
+
 async fn drop_conns(v: Vec<Conn>) {
     for c in v {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), c.disconnect()).await;

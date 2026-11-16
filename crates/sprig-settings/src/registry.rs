@@ -245,11 +245,6 @@ pub const MARKED: &[(&str, Mark, &str)] = &[
         "nothing produces advice recommendations (advice_wildcard) yet",
     ),
     (
-        "catalog.contract_delay_days",
-        Mark::Unbuilt,
-        "upgrade orchestration, which would gate contract migrations, isn't built",
-    ),
-    (
         "failover.quarantine_days",
         Mark::Unbuilt,
         "diverged-transaction extracts are kept until an operator removes them",

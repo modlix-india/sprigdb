@@ -100,7 +100,7 @@ impl std::fmt::Debug for EmbedEnv {
 
 impl EmbedEnv {
     /// `docs.model_dir`, else the default next to the binary.
-    fn model_dir(&self) -> PathBuf {
+    pub(crate) fn model_dir(&self) -> PathBuf {
         let set = self.logic.settings.get(&sprig_docs::settings::MODEL_DIR);
         if set.trim().is_empty() {
             sprig_docs::settings::next_to_binary(sprig_docs::settings::DEFAULT_MODEL_DIR)
@@ -137,7 +137,7 @@ impl JobHandler for AiEmbed {
     }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     u64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -146,7 +146,7 @@ fn now_ms() -> u64 {
     .unwrap_or(0)
 }
 
-fn backend(e: mysql_async::Error) -> SprigError {
+pub(crate) fn backend(e: mysql_async::Error) -> SprigError {
     let retry = match &e {
         // A moved shard (its tables renamed away at a cutover), a lock wait,
         // a deadlock: transient.
@@ -942,7 +942,7 @@ async fn load(env: &EmbedEnv, tenant: TenantId, id: u64) -> Result<Option<Column
 }
 
 /// Waits `d` unless cancelled first (`false`).
-async fn pause(cancel: &sprig_common::CancellationToken, d: Duration) -> bool {
+pub(crate) async fn pause(cancel: &sprig_common::CancellationToken, d: Duration) -> bool {
     tokio::select! {
         () = cancel.cancelled() => false,
         () = tokio::time::sleep(d) => true,

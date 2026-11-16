@@ -11,6 +11,8 @@
 
 // Embedded columns: the `ai_embed` jobs.
 pub mod ai_embed;
+// Retrieval indexes: the `ai_retrieval` jobs.
+pub mod ai_retrieval;
 // The asynchronous graph mirror applier and the `queue.change_exchange`
 // forwarders.
 pub mod change_exchange;
@@ -364,6 +366,16 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
                 feed: shared_feed
                     .view(sprig_feed::shared::Kept::All)
                     .named("ai_embed"),
+                ..env.clone()
+            },
+            maps: graph_mirror_env.maps.clone(),
+        })))
+        // Retrieval indexes: one job per index, the same machinery.
+        .with_handler(Arc::new(ai_retrieval::AiRetrieval(ai_embed::EmbedEnv {
+            logic: logic::LogicEnv {
+                feed: shared_feed
+                    .view(sprig_feed::shared::Kept::All)
+                    .named("ai_retrieval"),
                 ..env.clone()
             },
             maps: graph_mirror_env.maps.clone(),

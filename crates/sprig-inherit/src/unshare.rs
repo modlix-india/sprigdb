@@ -316,7 +316,9 @@ pub fn sweep_due(ctx: &Ctx<'_>) -> bool {
 /// layer runs the cleanup once per process ([`after_drop`] as the drop
 /// would have, from the parent's state with the share put back; a failure
 /// is tried again a minute later), and the parent's own statement then
-/// removes the row. Every step can run again.
+/// removes the row. Every step can run again. The tree's copy worker
+/// does the same without waiting for a statement ([`crate::sweep`]), for
+/// trees nobody uses.
 ///
 /// # Errors
 /// The cleanup's (the share stays `dropping`).
@@ -334,20 +336,13 @@ pub async fn sweep(ctx: &Ctx<'_>, r: &mut dyn Runner) -> Result<()> {
             .map(|sh| (**sh).clone())
             .collect();
         for sh in pending {
-            let before = st.with_share(&sh);
-            let b = Before {
-                cat,
-                state: &before,
-                lctn: ctx.lctn,
-            };
-            let carried = carried(b, &sh);
             let mark = |v: Option<std::time::Instant>| {
                 swept()
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert((cat.tenant, sh.id), v);
             };
-            let u = match after_drop(b, r, &carried).await {
+            let u = match finish_dropped(cat, st, &sh, ctx.lctn, r).await {
                 Ok(u) => u,
                 Err(e) => {
                     mark(Some(std::time::Instant::now()));
@@ -371,6 +366,32 @@ pub async fn sweep(ctx: &Ctx<'_>, r: &mut dyn Runner) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The children's side of dropped share `sh` of `cat`'s tenant, whose
+/// state `st` holds it as a `dropping` row: [`after_drop`] as the drop
+/// would have run it, from `st` with the share put back. Every step can
+/// run again, so a second run (another gateway's sweep, the copy
+/// worker's) finds nothing left to do. The `dropping` row stays: the
+/// caller removes it once this returns.
+///
+/// # Errors
+/// The cleanup's.
+pub async fn finish_dropped(
+    cat: &TenantCatalog,
+    st: &InheritState,
+    sh: &Share,
+    lctn: bool,
+    r: &mut dyn Runner,
+) -> Result<Unshared> {
+    let before = st.with_share(sh);
+    let b = Before {
+        cat,
+        state: &before,
+        lctn,
+    };
+    let carried = carried(b, sh);
+    after_drop(b, r, &carried).await
 }
 
 /// Tenant `t`'s inheritable table of `c` (`schema`.`table`), its key and

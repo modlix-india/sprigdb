@@ -1284,6 +1284,12 @@ impl PassSession {
         if let Some(step) = Box::pin(self.tenant_embed_ddl(cx, text, more, out)).await? {
             return Ok(step);
         }
+        // Retrieval indexes: CREATE, DROP and SHOW (exec/retrieval.rs).
+        if let Some(step) =
+            Box::pin(self.tenant_retrieval_ddl(cx, text, attrs, more, format, out)).await?
+        {
+            return Ok(step);
+        }
         // Search DDL and MySQL FULLTEXT DDL.
         if let Some(step) =
             Box::pin(self.tenant_search_ddl(cx, text, attrs, more, format, out)).await?
@@ -1342,6 +1348,12 @@ impl PassSession {
         // GRAPH_TABLE, run and inlined.
         if let Some(step) =
             Box::pin(self.tenant_graph_table(cx, text, attrs, more, format, out)).await?
+        {
+            return Ok(step);
+        }
+        // RETRIEVE() over retrieval indexes, searched and inlined.
+        if let Some(step) =
+            Box::pin(self.tenant_retrieve(cx, text, attrs, more, format, out)).await?
         {
             return Ok(step);
         }
