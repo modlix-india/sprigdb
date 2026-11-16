@@ -39,7 +39,7 @@ use crate::provider::{
 };
 use crate::role::Role;
 use crate::settings::TurnSettings;
-use crate::tools::{Effect, Proposal, Source, ToolHost, ToolRegistry};
+use crate::tools::{Effect, Proposal, ResultSet, Source, ToolHost, ToolRegistry};
 
 /// Refused tool calls (role, input) after which a turn ends with 39996.
 pub const MAX_DENIALS: u32 = 3;
@@ -153,6 +153,17 @@ pub enum TurnEvent {
         /// The gate withheld rows or values, or cut the result.
         reduced: bool,
     },
+    /// A read tool's rows (`run_query`), whole as the tool returned them,
+    /// for the user only: the provider gets what the egress gate let
+    /// through. Sent only by an agent built [`Agent::showing_results`].
+    Result {
+        /// The call's id.
+        id: String,
+        /// The tool.
+        name: String,
+        /// The rows.
+        result: ResultSet,
+    },
     /// A proposal for the user.
     Proposal(Proposal),
     /// Usage so far in this call.
@@ -231,6 +242,8 @@ pub struct Agent {
     provider: Arc<dyn Provider>,
     tools: Arc<ToolRegistry>,
     audit: Arc<dyn AuditStore>,
+    /// The surface shows read results to the user ([`TurnEvent::Result`]).
+    show_results: bool,
 }
 
 impl std::fmt::Debug for Agent {
@@ -284,6 +297,8 @@ struct Called {
     proposal: Option<Proposal>,
     sources: Vec<Source>,
     stored: Value,
+    /// A result with rows, for the user only (never the provider).
+    rows: Option<ResultSet>,
 }
 
 /// Appends user text: into the last message when it is the user's (after
@@ -310,7 +325,18 @@ impl Agent {
             provider,
             tools,
             audit,
+            show_results: false,
         }
+    }
+
+    /// The same agent for a surface that shows the user every result with
+    /// rows in full ([`TurnEvent::Result`], the chat). The model is told
+    /// the user sees them, so with sharing off it describes the result's
+    /// shape instead of offering the same query again.
+    #[must_use]
+    pub fn showing_results(mut self) -> Self {
+        self.show_results = true;
+        self
     }
 
     async fn record(
@@ -358,7 +384,8 @@ impl Agent {
                 share_data: cfg.share_data,
             },
             req.scrubber.clone(),
-        );
+        )
+        .with_results_shown(self.show_results);
         // Every role is budgeted: a tenant role against its tenant's and
         // user's usage, the administration roles against every operator's
         // and the operator's (the system store's `usage_today`).
@@ -564,6 +591,13 @@ impl Agent {
                     None,
                 )
                 .await;
+                if let Some(rs) = c.rows {
+                    sink.event(TurnEvent::Result {
+                        id: id.clone(),
+                        name: name.clone(),
+                        result: rs,
+                    })?;
+                }
                 sink.event(TurnEvent::ToolEnd {
                     id: id.clone(),
                     name: name.clone(),
@@ -687,6 +721,7 @@ impl Agent {
             proposal: None,
             sources: Vec::new(),
             stored: json!({"error": msg}),
+            rows: None,
         };
         let spec = match self.tools.check(role, name, input) {
             Ok(s) => s,
@@ -744,6 +779,7 @@ impl Agent {
                         proposal: Some(p),
                         sources: Vec::new(),
                         stored: note,
+                        rows: None,
                     }
                 }
                 Err(e) => fail(&e.message, false),
@@ -756,7 +792,12 @@ impl Agent {
                     crate::metrics::egress_reduced(role);
                 }
                 crate::metrics::tool_call(name, "ok");
+                let rows = match &out.body {
+                    crate::tools::ToolBody::Rows(rs) if self.show_results => Some(rs.clone()),
+                    _ => None,
+                };
                 Called {
+                    rows,
                     result: Block::ToolResult {
                         tool_use_id: id.to_owned(),
                         content: g.content,
@@ -772,12 +813,21 @@ impl Agent {
             }
             Ok(Err(e)) => {
                 crate::metrics::tool_call(name, "error");
-                fail(&e.message, false)
+                // An instructive error: what failed, then what to try, so
+                // the model recovers instead of giving up.
+                fail(
+                    &format!("{} {}", e.message, crate::tools::builtin::hint(name)),
+                    false,
+                )
             }
             Err(_) => {
                 crate::metrics::tool_call(name, "error");
                 fail(
-                    &format!("{name} took longer than {}s", TOOL_TIMEOUT.as_secs()),
+                    &format!(
+                        "{name} took longer than {}s. {}",
+                        TOOL_TIMEOUT.as_secs(),
+                        crate::tools::builtin::hint(name)
+                    ),
                     false,
                 )
             }
@@ -785,5 +835,7 @@ impl Agent {
     }
 }
 
+#[cfg(test)]
+mod data_tests;
 #[cfg(test)]
 mod tests;

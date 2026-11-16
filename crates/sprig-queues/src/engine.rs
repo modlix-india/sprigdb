@@ -32,7 +32,7 @@
 //! no-op (`uk_msg`). One gateway forwards a store at a time (a lease).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
@@ -126,6 +126,11 @@ pub trait MqCatalog: Send + Sync + 'static {
     async fn feed_forwarder_runs(&self, _v: &VhostRef) -> bool {
         false
     }
+
+    /// The engine closed the vhost on this gateway (it went unused for
+    /// `queue.vhost_idle_close_seconds`): let go of what was kept for it,
+    /// such as its store handle. The next use opens it again.
+    async fn closed(&self, _v: &VhostRef) {}
 }
 
 /// With `queue.forwarder = feed`, while the feed-driven forwarder runs
@@ -260,6 +265,10 @@ pub(crate) struct VShared {
     pub(crate) blocked: std::sync::atomic::AtomicBool,
     pub(crate) quota: Mutex<(i64, u64)>,
     pub(crate) stop: CancellationToken,
+    /// When it was last used, by the engine's clock: opened by a
+    /// connection, a SQL statement or a relay stream, a connection closed,
+    /// rows forwarded. An idle vhost closes ([`crate::idle`]).
+    pub(crate) last_used: AtomicI64,
 }
 
 impl VShared {
@@ -953,6 +962,7 @@ impl VShared {
         let mut next_try = 0i64;
         let mut next_purge = 0i64;
         let mut durable: Option<Arc<dyn MsgStore>> = None;
+        let mut next_close_check = 0i64;
         // How long the loop sleeps. A vhost stays open on a
         // gateway once used, and every lease holder read its outbox and its
         // delayed messages five times a second: at 10,000 members, tens of
@@ -977,8 +987,35 @@ impl VShared {
                 }
                 moved += n;
             }
+            if moved > 0 {
+                self.touch(now);
+            }
             if lease.as_ref().is_some_and(CancellationToken::is_cancelled) {
                 lease = None;
+            }
+            // Unused for `queue.vhost_idle_close_seconds`: close, giving
+            // back the leases; the next use opens it again.
+            if !woken
+                && moved == 0
+                && now >= next_close_check
+                && (lease.is_none() || durable.is_some())
+                && self.unused()
+            {
+                let idle = i64::try_from(deps.catalog.settings(&self.r).vhost_idle_close_ms)
+                    .unwrap_or(i64::MAX);
+                if idle > 0 && now.saturating_sub(self.last_used.load(Ordering::Relaxed)) >= idle {
+                    // Only the forwarder lease's holder moves the durable
+                    // store's outbox and delayed messages.
+                    let held = if lease.is_some() {
+                        durable.as_ref()
+                    } else {
+                        None
+                    };
+                    if self.try_close(&deps, held).await {
+                        break;
+                    }
+                    next_close_check = now + crate::idle::RETRY_MS;
+                }
             }
             if lease.is_none() && now >= next_try {
                 next_try = now + 2_000;
@@ -1045,6 +1082,9 @@ impl VShared {
                     if trimmed > 0 {
                         tracing::debug!(rows = trimmed, "forward ledger trimmed");
                     }
+                }
+                if moved > 0 {
+                    self.touch(now);
                 }
                 sleep_ms = if woken || moved > 0 {
                     POLL_MS
@@ -1208,9 +1248,9 @@ pub(crate) struct Inner {
     /// Acknowledgements inside SQL sessions' open transactions, by
     /// session: told to their owners when the transaction ends.
     pub(crate) txn_holds: Mutex<HashMap<u64, Vec<(i64, crate::token::TokenData)>>>,
-    vhosts: Mutex<HashMap<(u64, u32), Arc<VShared>>>,
+    pub(crate) vhosts: Mutex<HashMap<(u64, u32), Arc<VShared>>>,
     temp_ids: AtomicU64,
-    stop: CancellationToken,
+    pub(crate) stop: CancellationToken,
     /// Told of queues becoming ready or empty (fan-in's ready index).
     ready_hook: std::sync::OnceLock<Arc<dyn ReadyHook>>,
 }
@@ -1222,6 +1262,39 @@ impl Inner {
         (1 << 63)
             | (u64::from(self.deps.slot & 0x7ffff) << 44)
             | self.temp_ids.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// The vhost of `r` on this gateway, opened (its forwarder and
+    /// supervisor started) if it isn't; either way it counts as used now.
+    pub(crate) fn vshared(self: &Arc<Self>, r: &VhostRef) -> Arc<VShared> {
+        let now = self.deps.clock.now_ms();
+        let mut g = lock(&self.vhosts);
+        if let Some(v) = g.get(&(r.tenant, r.db_id)) {
+            v.touch(now);
+            return Arc::clone(v);
+        }
+        let (etx, erx) = mpsc::unbounded_channel();
+        let v = Arc::new(VShared {
+            r: r.clone(),
+            engine: Arc::downgrade(self),
+            temp: Mutex::new(TempSet::default()),
+            mem: Arc::new(MemStore::new()),
+            conns: Mutex::new(HashMap::new()),
+            consumers: Mutex::new(HashMap::new()),
+            owners: Mutex::new(HashMap::new()),
+            events: etx,
+            wake: Arc::new(Notify::new()),
+            blocked: std::sync::atomic::AtomicBool::new(false),
+            quota: Mutex::new((0, 0)),
+            stop: self.stop.child_token(),
+            last_used: AtomicI64::new(now),
+        });
+        g.insert((r.tenant, r.db_id), Arc::clone(&v));
+        drop(g);
+        metrics::gauge!("sprig_queue_vhosts_open").increment(1.0);
+        tokio::spawn(Arc::clone(&v).supervise(erx));
+        tokio::spawn(Arc::clone(&v).forwarder());
+        v
     }
 }
 
@@ -1285,29 +1358,20 @@ impl QueueEngine {
     }
 
     pub(crate) fn vshared(&self, r: &VhostRef) -> Arc<VShared> {
-        let mut g = lock(&self.inner.vhosts);
-        if let Some(v) = g.get(&(r.tenant, r.db_id)) {
-            return Arc::clone(v);
-        }
-        let (etx, erx) = mpsc::unbounded_channel();
-        let v = Arc::new(VShared {
-            r: r.clone(),
-            engine: Arc::downgrade(&self.inner),
-            temp: Mutex::new(TempSet::default()),
-            mem: Arc::new(MemStore::new()),
-            conns: Mutex::new(HashMap::new()),
-            consumers: Mutex::new(HashMap::new()),
-            owners: Mutex::new(HashMap::new()),
-            events: etx,
-            wake: Arc::new(Notify::new()),
-            blocked: std::sync::atomic::AtomicBool::new(false),
-            quota: Mutex::new((0, 0)),
-            stop: self.inner.stop.child_token(),
-        });
-        g.insert((r.tenant, r.db_id), Arc::clone(&v));
-        tokio::spawn(Arc::clone(&v).supervise(erx));
-        tokio::spawn(Arc::clone(&v).forwarder());
-        v
+        self.inner.vshared(r)
+    }
+
+    /// How many vhosts this gateway has open (an idle one closes after
+    /// `queue.vhost_idle_close_seconds`).
+    #[must_use]
+    pub fn open_vhosts(&self) -> usize {
+        lock(&self.inner.vhosts).len()
+    }
+
+    /// Whether this gateway has the vhost of a tenant database open.
+    #[must_use]
+    pub fn is_open(&self, tenant: u64, db_id: u32) -> bool {
+        lock(&self.inner.vhosts).contains_key(&(tenant, db_id))
     }
 
     /// The vhost of a tenant database, if this gateway has opened it.

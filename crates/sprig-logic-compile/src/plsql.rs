@@ -21,14 +21,25 @@
 //!   `DECIMAL` with four decimals;
 //! - text compares under `utf8mb4_bin`, so by code point;
 //! - division by zero (1365) and overflow (1690) are left to MariaDB; the
-//!   gateway maps them to 39866.
+//!   gateway maps them to 39866;
+//! - an exception handler can't `EXIT` or `CONTINUE` a loop outside it
+//!   (1308), so a `try` keeps the error in locals and its `catch` and
+//!   `finally` run after the block, in ordinary code; raising the error
+//!   again is a `SIGNAL` of the kept number, text and SQLSTATE;
+//! - `GET DIAGNOSTICS` comes first in a handler, before any statement
+//!   that could clear the diagnostics area.
+//!
+//! A function with a `try` tracks where an error comes from in `v__src`
+//! (0 the code itself, 1 a data operation, 2 raised again), and its own
+//! errors' name and full message in `v__thrown_name` and `v__thrown`, for
+//! the catchability rule of [`Stmt::Try`].
 
 use std::fmt::Write as _;
 
 use crate::Options;
 use crate::ir::{
-    BinOp, Bound, Builtin, DbOp, Expr, Function, Literal, LocalId, PathSeg, SqlShape, Stmt, Ty,
-    UnOp,
+    BinOp, Block, Bound, Builtin, Caught, DbOp, Expr, Function, Literal, LocalId, PathSeg,
+    SqlShape, Stmt, Ty, UnOp,
 };
 
 /// The `sql_mode` routines are created under (stored with each routine).
@@ -74,8 +85,12 @@ pub fn generate(f: &Function, opts: &Options) -> Plsql {
         uses_fail: false,
         uses_num_str: false,
         uses_nn: false,
+        uses_rethrow: false,
         guards: 0,
         params: param_names(f),
+        has_try: has_try(&f.body),
+        frames: Vec::new(),
+        loops: 0,
     };
     let mut body = String::new();
     g.block(&f.body, 1, &mut body);
@@ -101,6 +116,12 @@ pub fn generate(f: &Function, opts: &Options) -> Plsql {
     }
     for i in 0..g.guards {
         let _ = writeln!(decl, "  v__guard{i} BIGINT := 0;");
+    }
+    if g.has_try {
+        decl.push_str(
+            "  v__src INT := 0;\n  v__thrown LONGTEXT CHARACTER SET utf8mb4;\n  \
+             v__thrown_name VARCHAR(64);\n",
+        );
     }
     let mut params: Vec<String> = f
         .params
@@ -156,6 +177,33 @@ fn local_name(f: &Function, id: LocalId) -> String {
     format!("v_{}", f.local_def(id).name)
 }
 
+/// Whether a block holds a [`Stmt::Try`].
+fn has_try(b: &Block) -> bool {
+    b.iter().any(|s| match s {
+        Stmt::Try { .. } => true,
+        Stmt::If(_, a, c) => has_try(a) || has_try(c),
+        Stmt::While { body, .. } | Stmt::Block(_, body) => has_try(body),
+        _ => false,
+    })
+}
+
+/// SQLSTATEs a kept error is raised again with; any other becomes
+/// `HY000` (`SIGNAL` takes only a literal).
+const RETHROW_STATES: &[&str] = &[
+    "23000", "22001", "22003", "22004", "22007", "22012", "22018", "21000", "21S01", "42000",
+    "42S02", "42S22", "40001", "44000", "45000", "70100", "0A000", "3D000", "HY001",
+];
+
+/// What encloses the statement being generated, innermost last.
+#[derive(Debug, Clone, Copy)]
+enum Frame {
+    /// A `WHILE` with its number and whether a jump from inside a
+    /// `Block` needs its label.
+    Loop(usize, bool),
+    /// A [`Stmt::Block`]'s one-pass `LOOP`.
+    Block,
+}
+
 /// The SQL type of a local or parameter.
 #[must_use]
 pub fn sql_type(t: Ty) -> &'static str {
@@ -196,6 +244,9 @@ fn path_key(k: &str) -> String {
     format!(".\"{}\"", k.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+// What the generated text uses, one flag each, read when the package is
+// written.
+#[allow(clippy::struct_excessive_bools)]
 struct Gen<'a> {
     f: &'a Function,
     opts: &'a Options,
@@ -203,8 +254,12 @@ struct Gen<'a> {
     uses_fail: bool,
     uses_num_str: bool,
     uses_nn: bool,
+    uses_rethrow: bool,
     guards: usize,
     params: Vec<String>,
+    has_try: bool,
+    frames: Vec<Frame>,
+    loops: usize,
 }
 
 impl Gen<'_> {
@@ -214,7 +269,7 @@ impl Gen<'_> {
     }
 
     fn package(&self) -> (Option<String>, Option<String>) {
-        if !self.uses_fail && !self.uses_num_str && !self.uses_nn {
+        if !self.uses_fail && !self.uses_num_str && !self.uses_nn && !self.uses_rethrow {
             return (None, None);
         }
         let mut spec = format!("CREATE OR REPLACE PACKAGE {} AS\n", self.pkg);
@@ -249,9 +304,94 @@ impl Gen<'_> {
                 ));
             }
         }
+        if self.uses_rethrow {
+            spec.push_str("  PROCEDURE rethrow(code IN INT, msg IN VARCHAR, st IN VARCHAR);\n");
+            body.push_str(
+                "  PROCEDURE rethrow(code IN INT, msg IN VARCHAR, st IN VARCHAR) AS\n    \
+                 v VARCHAR(512) := LEFT(msg, 512);\n  BEGIN\n    CASE st\n",
+            );
+            for st in RETHROW_STATES {
+                body.push_str(&format!(
+                    "      WHEN '{st}' THEN SIGNAL SQLSTATE '{st}' SET MYSQL_ERRNO = code, \
+                     MESSAGE_TEXT = v;\n"
+                ));
+            }
+            body.push_str(
+                "      ELSE SIGNAL SQLSTATE 'HY000' SET MYSQL_ERRNO = code, MESSAGE_TEXT = v;\n    \
+                 END CASE;\n  END;\n",
+            );
+        }
         spec.push_str("END");
         body.push_str("END");
         (Some(spec), Some(body))
+    }
+
+    /// The label a `Break` or `Continue` names: `None` when its loop is
+    /// the innermost `LOOP` (no [`Stmt::Block`] in between).
+    fn loop_label(&mut self) -> Option<String> {
+        let i = self
+            .frames
+            .iter()
+            .rposition(|f| matches!(f, Frame::Loop(..)))?;
+        if i + 1 == self.frames.len() {
+            return None;
+        }
+        let Frame::Loop(n, _) = self.frames[i] else {
+            return None;
+        };
+        self.frames[i] = Frame::Loop(n, true);
+        Some(format!("w{n}"))
+    }
+
+    /// `v__thrown` and `v__thrown_name` for a 39865 a `catch` may see.
+    fn thrown(&mut self, e: &crate::ir::ErrorSpec, ind: &str, out: &mut String) -> String {
+        let (name, msg) = match &e.catch {
+            Some((n, m)) => (n.clone(), self.expr(m)),
+            None => ("Error".to_owned(), self.expr(&e.message)),
+        };
+        let _ = writeln!(out, "{ind}v__thrown := {msg};");
+        let _ = writeln!(out, "{ind}v__thrown_name := {};", quote(&name));
+        if e.catch.is_none() {
+            "v__thrown".to_owned()
+        } else {
+            self.expr(&e.message)
+        }
+    }
+
+    fn try_block(&mut self, body: &[Stmt], c: &Caught, d: usize, out: &mut String) {
+        let ind = "  ".repeat(d);
+        let l = |id: LocalId| local_name(self.f, id);
+        let (flag, code, state, text, msg, name) = (
+            l(c.flag),
+            l(c.code),
+            l(c.state),
+            l(c.text),
+            l(c.message),
+            l(c.name),
+        );
+        let _ = writeln!(out, "{ind}{flag} := FALSE;");
+        let _ = writeln!(out, "{ind}BEGIN");
+        self.block(body, d + 1, out);
+        let _ = writeln!(out, "{ind}EXCEPTION");
+        let _ = writeln!(out, "{ind}  WHEN OTHERS THEN");
+        let _ = writeln!(
+            out,
+            "{ind}    GET DIAGNOSTICS CONDITION 1 {state} = RETURNED_SQLSTATE, \
+             {code} = MYSQL_ERRNO, {text} = MESSAGE_TEXT;"
+        );
+        let _ = writeln!(
+            out,
+            "{ind}    IF NOT ({code} = 39865 OR v__src = 2 OR (v__src = 1 AND {code} <> 39864)) \
+             THEN RAISE; END IF;"
+        );
+        let _ = writeln!(
+            out,
+            "{ind}    IF v__src = 1 THEN {msg} := {text}; {name} := 'Error'; \
+             ELSE {msg} := v__thrown; {name} := v__thrown_name; END IF;"
+        );
+        let _ = writeln!(out, "{ind}    v__src := 0;");
+        let _ = writeln!(out, "{ind}    {flag} := TRUE;");
+        let _ = writeln!(out, "{ind}END;");
     }
 
     fn block(&mut self, b: &[Stmt], depth: usize, out: &mut String) {
@@ -264,8 +404,9 @@ impl Gen<'_> {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn stmt(&mut self, s: &Stmt, d: usize, out: &mut String) {
+    fn stmt(&mut self, s: &Stmt, d: usize, outer: &mut String) {
         let ind = "  ".repeat(d);
+        let out = &mut *outer;
         match s {
             Stmt::Assign(l, e) => {
                 let v = self.expr(e);
@@ -283,7 +424,11 @@ impl Gen<'_> {
             }
             Stmt::While { cond, body, bound } => {
                 let c = self.truthy(cond);
-                let _ = writeln!(out, "{ind}WHILE {c} LOOP");
+                let n = self.loops;
+                self.loops += 1;
+                self.frames.push(Frame::Loop(n, false));
+                let mut inner = String::new();
+                let out = &mut inner;
                 if *bound == Bound::Guarded {
                     let g = format!("v__guard{}", self.guards);
                     self.guards += 1;
@@ -302,15 +447,64 @@ impl Gen<'_> {
                     );
                 }
                 self.block(body, d + 1, out);
-                let _ = writeln!(out, "{ind}END LOOP;");
+                let labelled = matches!(self.frames.pop(), Some(Frame::Loop(_, true)));
+                let whole = &mut *outer;
+                if labelled {
+                    let _ = writeln!(whole, "{ind}<<w{n}>>");
+                }
+                let _ = writeln!(whole, "{ind}WHILE {c} LOOP");
+                whole.push_str(&inner);
+                if labelled {
+                    let _ = writeln!(whole, "{ind}END LOOP w{n};");
+                } else {
+                    let _ = writeln!(whole, "{ind}END LOOP;");
+                }
             }
-            Stmt::Break => {
-                let _ = writeln!(out, "{ind}EXIT;");
-            }
+            Stmt::Break => match self.loop_label() {
+                Some(l) => {
+                    let _ = writeln!(out, "{ind}EXIT {l};");
+                }
+                None => {
+                    let _ = writeln!(out, "{ind}EXIT;");
+                }
+            },
             // MariaDB's `CONTINUE` (sql_mode=ORACLE): the loop's condition,
             // and its guard, run again.
-            Stmt::Continue => {
-                let _ = writeln!(out, "{ind}CONTINUE;");
+            Stmt::Continue => match self.loop_label() {
+                Some(l) => {
+                    let _ = writeln!(out, "{ind}CONTINUE {l};");
+                }
+                None => {
+                    let _ = writeln!(out, "{ind}CONTINUE;");
+                }
+            },
+            Stmt::Try { body, caught } => self.try_block(body, caught, d, out),
+            Stmt::Rethrow(c) => {
+                self.uses_rethrow = true;
+                let l = |id: LocalId| local_name(self.f, id);
+                let _ = writeln!(out, "{ind}v__thrown := {};", l(c.message));
+                let _ = writeln!(out, "{ind}v__thrown_name := {};", l(c.name));
+                let _ = writeln!(out, "{ind}v__src := 2;");
+                let _ = writeln!(
+                    out,
+                    "{ind}{}.rethrow({}, {}, {});",
+                    self.pkg,
+                    l(c.code),
+                    l(c.text),
+                    l(c.state)
+                );
+            }
+            Stmt::Block(label, body) => {
+                self.frames.push(Frame::Block);
+                let _ = writeln!(out, "{ind}<<b{label}>>");
+                let _ = writeln!(out, "{ind}LOOP");
+                self.block(body, d + 1, out);
+                let _ = writeln!(out, "{ind}  EXIT b{label};");
+                let _ = writeln!(out, "{ind}END LOOP b{label};");
+                self.frames.pop();
+            }
+            Stmt::Leave(label) => {
+                let _ = writeln!(out, "{ind}EXIT b{label};");
             }
             Stmt::Return => {
                 let _ = writeln!(out, "{ind}RETURN;");
@@ -326,7 +520,11 @@ impl Gen<'_> {
                 }
             }
             Stmt::Throw(e) => {
-                let m = self.expr(&e.message);
+                let m = if self.has_try && e.code == 39865 {
+                    self.thrown(e, &ind, out)
+                } else {
+                    self.expr(&e.message)
+                };
                 let f = self.fail(e.code, &m);
                 let _ = writeln!(out, "{ind}{f};");
             }
@@ -336,6 +534,9 @@ impl Gen<'_> {
                 shape,
                 origin,
             }) => {
+                if self.has_try {
+                    let _ = writeln!(out, "{ind}v__src := 1;");
+                }
                 let mut text = String::new();
                 for (i, part) in stmt.parts.iter().enumerate() {
                     text.push_str(part);
@@ -423,6 +624,69 @@ impl Gen<'_> {
                             local_name(self.f, *affected)
                         );
                     }
+                    SqlShape::Call {
+                        event,
+                        result,
+                        into,
+                    } => {
+                        let res = local_name(self.f, *result);
+                        let _ = writeln!(
+                            out,
+                            "{ind}{text}{}{}, {res});",
+                            if binds.is_empty() { "" } else { ", " },
+                            local_name(self.f, *event)
+                        );
+                        // As the callee's wrapper reads its result.
+                        for (name, l) in into {
+                            let path = quote(&format!("${}", path_key(name)));
+                            let v = match self.f.local_def(*l).ty {
+                                Ty::Int | Ty::Bool => {
+                                    format!("CAST(JSON_VALUE({res}, {path}) AS SIGNED)")
+                                }
+                                Ty::Float => format!("CAST(JSON_VALUE({res}, {path}) AS DOUBLE)"),
+                                Ty::Str => format!("JSON_VALUE({res}, {path})"),
+                                Ty::Json | Ty::Null => format!("JSON_EXTRACT({res}, {path})"),
+                            };
+                            let _ = writeln!(out, "{ind}{} := {v};", local_name(self.f, *l));
+                        }
+                    }
+                    SqlShape::Publish {
+                        affected,
+                        max_bytes,
+                        compact,
+                    } => {
+                        // The gateway's checks of a publish, in its order.
+                        let vals: Vec<String> = binds.iter().map(|b| self.expr(b)).collect();
+                        let lens: Vec<String> = vals
+                            .iter()
+                            .map(|v| format!("COALESCE(LENGTH({v}), 0)"))
+                            .collect();
+                        let longest = format!("GREATEST({})", lens.join(", "));
+                        let msg = format!(
+                            "CONCAT('ER_SPRIG_STREAM_RECORD_TOO_LARGE: a value of ', {longest},                              ' bytes is above stream.max_message_bytes ({max_bytes})')"
+                        );
+                        let f = self.fail(39944, &msg);
+                        let _ = writeln!(out, "{ind}IF {longest} > {max_bytes} THEN {f}; END IF;");
+                        if *compact && let Some(k) = vals.first() {
+                            let f = self.fail(
+                                39955,
+                                &quote(
+                                    "ER_SPRIG_STREAM_COMPACT_NEEDS_KEY: a record without a key on a \
+                                     compacted stream",
+                                ),
+                            );
+                            let _ = writeln!(out, "{ind}IF {k} IS NULL THEN {f}; END IF;");
+                        }
+                        let _ = writeln!(out, "{ind}{text};");
+                        let _ = writeln!(
+                            out,
+                            "{ind}{} := ROW_COUNT();",
+                            local_name(self.f, *affected)
+                        );
+                    }
+                }
+                if self.has_try {
+                    let _ = writeln!(out, "{ind}v__src := 0;");
                 }
             }
         }
@@ -625,6 +889,7 @@ impl Gen<'_> {
                 )
             }
             Builtin::JsonLength => format!("JSON_LENGTH({})", self.expr(&a0)),
+            Builtin::JsonText => format!("JSON_COMPACT({})", self.expr(&a0)),
             Builtin::Abs => format!("ABS({})", self.expr(&a0)),
             Builtin::Floor => format!("(FLOOR({}) + 0e0)", self.expr(&a0)),
             Builtin::Ceil => format!("(CEIL({}) + 0e0)", self.expr(&a0)),

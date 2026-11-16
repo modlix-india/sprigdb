@@ -306,6 +306,35 @@ impl Candidate {
 }
 
 impl ShardingLoop {
+    /// After a re-key's cutover: rebuilds every lookup index of `owners`
+    /// (the group's members), so their rows name owners by the new key's
+    /// hashes ([`Admin::rehash`]). Returns each lookup's name and report.
+    ///
+    /// # Errors
+    /// Catalog, etcd and MariaDB errors; the caller's next tick retries.
+    pub(super) async fn rehash_lookups(
+        &self,
+        tenant: TenantId,
+        home: &ClusterId,
+        owners: &[ObjectId],
+    ) -> Result<Vec<(String, sprig_shard::lookup::direct::BuildReport)>> {
+        let ts = self.settings.settings(tenant);
+        let host = CtlHost {
+            l: self,
+            tenant,
+            home: home.clone(),
+            publish_timeout: ts.lookup.publish_timeout,
+        };
+        let admin = Admin {
+            tenant,
+            maps: &self.maps,
+            host: &host,
+            chunk: ts.lookup.chunk_rows,
+            lease: ts.lookup.build_lease,
+        };
+        admin.rehash(owners).await
+    }
+
     /// Step 4 of a tick: lookup jobs to resume, then the advisor's
     /// lookup proposals (module docs).
     ///
@@ -587,7 +616,10 @@ impl ShardingLoop {
             .await
             .map_err(|e| SprigError::internal(format!("catalog: {e}")))?;
         let existing = LookupCatalog.rows(&mut c).await?;
-        let mut out = Vec::new();
+        // The members' catalog rows first; the home connection is given
+        // back before the shards' shapes are read, whose connections come
+        // from the same budget (a task holds one at a time).
+        let mut members = Vec::new();
         for ((object, columns), s) in by_col {
             if !qualifies(&s, &ts.lookup_advice) {
                 continue;
@@ -598,40 +630,45 @@ impl ShardingLoop {
             {
                 continue;
             }
-            if let Some(cand) = self.candidate(tenant, &mut c, object, &columns, s).await? {
+            let member: Option<MemberText> = c
+                .exec_first(
+                    "SELECT m.group_id, m.db_id, CAST(m.routing AS CHAR), \
+                     CAST(m.key_columns AS CHAR), CAST(m.rk_state AS CHAR), o.name, d.name \
+                     FROM group_members m JOIN table_groups g ON g.group_id = m.group_id \
+                     JOIN objects o ON o.object_id = m.object_id \
+                     JOIN `databases` d ON d.db_id = m.db_id \
+                     WHERE m.object_id = ? AND g.kind = 'sharded' AND g.state = 'active'",
+                    (object.0,),
+                )
+                .await
+                .map_err(|e| SprigError::internal(format!("catalog: {e}")))?;
+            if let Some(m) = member {
+                members.push((object, columns, s, m));
+            }
+        }
+        drop(c);
+        let mut out = Vec::new();
+        for (object, columns, s, m) in members {
+            if let Some(cand) = self.candidate(tenant, object, &columns, s, m).await? {
                 out.push(cand);
             }
         }
         Ok(out)
     }
 
-    /// `object`'s `columns` (lowercase, sorted) as a candidate: an active,
-    /// ready column member of a group with two or more shards, with a
-    /// declared unique key on exactly those columns (in any order), without
-    /// the distribution key.
+    /// `object`'s `columns` (lowercase, sorted) as a candidate, given its
+    /// catalog row `member`: an active, ready column member of a group with
+    /// two or more shards, with a declared unique key on exactly those
+    /// columns (in any order), without the distribution key.
     async fn candidate(
         &self,
         tenant: TenantId,
-        c: &mut Conn,
         object: ObjectId,
         columns: &[String],
         scatter: Scatter,
+        member: MemberText,
     ) -> Result<Option<Candidate>> {
-        let member: Option<MemberText> = c
-            .exec_first(
-                "SELECT m.group_id, m.db_id, CAST(m.routing AS CHAR), \
-                 CAST(m.key_columns AS CHAR), CAST(m.rk_state AS CHAR), o.name, d.name \
-                 FROM group_members m JOIN table_groups g ON g.group_id = m.group_id \
-                 JOIN objects o ON o.object_id = m.object_id \
-                 JOIN `databases` d ON d.db_id = m.db_id \
-                 WHERE m.object_id = ? AND g.kind = 'sharded' AND g.state = 'active'",
-                (object.0,),
-            )
-            .await
-            .map_err(|e| SprigError::internal(format!("catalog: {e}")))?;
-        let Some((group, db, routing, key, rk, table, db_name)) = member else {
-            return Ok(None);
-        };
+        let (group, db, routing, key, rk, table, db_name) = member;
         if routing != "columns" || rk != "ready" {
             return Ok(None);
         }

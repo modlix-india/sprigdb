@@ -184,7 +184,46 @@ async fn run_writes(
         "insert" => insert(engine, sql, &ns, body, done).await,
         "update" => update(engine, sql, &ns, body, done).await,
         "delete" => delete(engine, sql, &ns, body, done).await,
-        _ => find_and_modify(engine, sql, &ns, body, done).await,
+        _ => {
+            // Without a collation of its own, the collection's default.
+            let default = if body.contains_key("collation") {
+                None
+            } else {
+                engine.default_collation(sql, &ns).await?
+            };
+            sprig_doc::collation::scope(
+                default,
+                Box::pin(find_and_modify(engine, sql, &ns, body, done)),
+            )
+            .await
+        }
+    }
+}
+
+/// A statement's collation: its own `collation` (`{locale: "simple"}`
+/// included), else the collection's `default`.
+fn statement_collation(
+    stmt: &Document,
+    default: Option<sprig_doc::collation::Collation>,
+) -> Result<Option<sprig_doc::collation::Collation>, MongoError> {
+    if stmt.contains_key("collation") {
+        sprig_doc::collation::Collation::of(stmt)
+    } else {
+        Ok(default)
+    }
+}
+
+/// [`statement_collation`] of a `bulkWrite` operation on `ns`.
+async fn op_collation(
+    engine: &Engine,
+    sql: &mut dyn SqlRunner,
+    ns: &Ns,
+    op: &Document,
+) -> Result<Option<sprig_doc::collation::Collation>, MongoError> {
+    if op.contains_key("collation") {
+        sprig_doc::collation::Collation::of(op)
+    } else {
+        engine.default_collation(sql, ns).await
     }
 }
 
@@ -257,6 +296,8 @@ async fn update(
     let mut upserted = Vec::new();
     let mut errors = Vec::new();
     let mut out = Outcome::default();
+    // A statement without a collation of its own uses the collection's.
+    let default = engine.default_collation(sql, ns).await?;
     for (i, u) in docs_of(body, "updates").iter().enumerate() {
         let r = if let Some(r) = done.get(&idx(i)) {
             r.clone()
@@ -275,7 +316,7 @@ async fn update(
             let afs = docs_of(u, "arrayFilters");
             // Per statement: its collation, and MongoDB 8.0's `sort` for
             // an update of one document.
-            let r = match sprig_doc::collation::Collation::of(u) {
+            let r = match statement_collation(u, default) {
                 Ok(coll) => {
                     sprig_doc::collation::scope(
                         coll,
@@ -346,6 +387,7 @@ async fn delete(
     let mut n = 0u64;
     let mut errors = Vec::new();
     let mut out = Outcome::default();
+    let default = engine.default_collation(sql, ns).await?;
     for (i, d) in docs_of(body, "deletes").iter().enumerate() {
         if let Some(r) = done.get(&idx(i)) {
             n += n_of(r, "n");
@@ -353,7 +395,7 @@ async fn delete(
         }
         let q = d.get_document("q").cloned().unwrap_or_default();
         let one = d.get("limit").and_then(as_i64) == Some(1);
-        let r = match sprig_doc::collation::Collation::of(d) {
+        let r = match statement_collation(d, default) {
             Ok(coll) => {
                 sprig_doc::collation::scope(coll, engine.delete(sql, ns, &q, one, None)).await
             }
@@ -557,7 +599,7 @@ async fn bulk_write(
                             code::FAILED_TO_PARSE,
                             "BSON field 'bulkWrite.ops.updateMods' is missing but a required field",
                         )),
-                        Some(spec) => match sprig_doc::collation::Collation::of(op) {
+                        Some(spec) => match op_collation(engine, sql, &ns, op).await {
                             Ok(coll) => {
                                 sprig_doc::collation::scope(
                                     coll,
@@ -594,7 +636,7 @@ async fn bulk_write(
                 _ => {
                     let q = op.get_document("filter").cloned().unwrap_or_default();
                     let multi = op.get_bool("multi").unwrap_or(false);
-                    match sprig_doc::collation::Collation::of(op) {
+                    match op_collation(engine, sql, &ns, op).await {
                         Ok(coll) => {
                             sprig_doc::collation::scope(
                                 coll,

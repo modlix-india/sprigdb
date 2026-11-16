@@ -18,7 +18,9 @@
 //! - [`rpc`], the messages between gateways and copies;
 //! - [`placement`], the DC-tier records of indexes and their copies on
 //!   workers;
-//! - [`settings`], the `search.*` keys.
+//! - [`settings`], the `search.*` keys;
+//! - [`ft`], [`ft_query`], [`ft_agg`]: Redis `FT.*` arguments, the
+//!   Redis Search query language and `FT.AGGREGATE`'s pipeline.
 //!
 //! The library holds no connections of its own: its host (a worker's
 //! `search_copy` job or a gateway) gives a copy the feed and the seed's
@@ -33,6 +35,9 @@ pub mod build;
 pub mod copy;
 pub mod ddl;
 pub mod def;
+pub mod ft;
+pub mod ft_agg;
+pub mod ft_query;
 pub mod highlight;
 pub mod partition;
 pub mod placement;

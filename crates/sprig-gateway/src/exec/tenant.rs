@@ -573,6 +573,7 @@ impl PassSession {
         out: &mut dyn ResultSink,
     ) -> Result<Step> {
         let (lex, ignore_space) = self.lex_opts();
+        self.wl_text = None;
         let status = |s: StatusFlags| {
             if more {
                 s | StatusFlags::MORE_RESULTS_EXISTS
@@ -594,6 +595,14 @@ impl PassSession {
             if let Some(step) =
                 Box::pin(self.tenant_computed(cx, text, attrs, more, format, s, out)).await?
             {
+                return Ok(step);
+            }
+        }
+        // `ALTER TABLE` changing columns compiled validations or triggers
+        // read: refused unless they still bind the same way.
+        if sprig_logic::dependent::is_candidate(&String::from_utf8_lossy(text)) {
+            let s = status(self.status());
+            if let Some(step) = Box::pin(self.tenant_column_change(text, s, out)).await? {
                 return Ok(step);
             }
         }
@@ -627,6 +636,19 @@ impl PassSession {
         {
             let s = status(self.status());
             if let Some(step) = Box::pin(self.tenant_logic_drop(cx, d, s, out)).await? {
+                return Ok(step);
+            }
+        }
+        // `ALTER TRIGGER [db.]name DISABLE | ENABLE` of a trigger on a
+        // stream or queue (MySQL has no ALTER TRIGGER).
+        if self
+            .tenant
+            .as_deref()
+            .is_some_and(|ts| !ts.principal.must_change_password)
+            && let Some(a) = sprig_logic::drop::parse_alter_trigger(&String::from_utf8_lossy(text))
+        {
+            let s = status(self.status());
+            if let Some(step) = Box::pin(self.tenant_logic_toggle(&a, s, out)).await? {
                 return Ok(step);
             }
         }
@@ -1128,6 +1150,7 @@ impl PassSession {
         let text: &Bytes = match self.ps_rewrite(cx, text) {
             None => text,
             Some(Ok(t)) => {
+                self.wl_text = Some(text.to_vec());
                 ps_owned = Bytes::from(t);
                 &ps_owned
             }
@@ -1844,6 +1867,7 @@ impl PassSession {
             )
         });
         let lctn = ts.lower_case_table_names();
+        let ddl_wait = ts.ddl_wait();
         let map = ts.map();
         let ctl = match svc.locator.ctl_pool(&self.target.cluster).await {
             Ok(p) => p,
@@ -1926,6 +1950,7 @@ impl PassSession {
             current_db: current.as_deref(),
             user,
             lower_case_table_names: lctn,
+            wait: ddl_wait,
         };
         // What a DROP removes goes to the authorization
         // engine (routine grants go with the routine; table and database
@@ -2018,6 +2043,7 @@ impl PassSession {
                             current_db: current.as_deref(),
                             user,
                             lower_case_table_names: lctn,
+                            wait: ddl_wait,
                         };
                         let exec = GatewayDdl::new(bs, MariaExecutor::new(undo_pool.clone()))
                             .checked_by(undo_pool.clone());
@@ -2116,6 +2142,22 @@ impl PassSession {
                                 .collect(),
                         );
                     }
+                }
+                // Stored code over tables with policy views reads those views
+                // from its creation on, whoever calls it first.
+                if outcome.version.is_some()
+                    && matches!(
+                        &stmt,
+                        DdlStatement::CreateObject {
+                            kind: sprig_catalog::store::ObjectKind::View
+                                | sprig_catalog::store::ObjectKind::Procedure
+                                | sprig_catalog::store::ObjectKind::Function
+                                | sprig_catalog::store::ObjectKind::Trigger,
+                            ..
+                        }
+                    )
+                {
+                    Box::pin(self.rls_wire_code()).await;
                 }
                 // Dropping the current database leaves the session without
                 // one, as on MySQL.

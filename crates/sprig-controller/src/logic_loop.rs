@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use serde_json::json;
 use sprig_catalog::CatalogLocator;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::Result;
 use sprig_feed::subs::Subscription;
 use sprig_logic::LogicStore;
@@ -175,7 +176,7 @@ impl LogicLoop {
                     continue;
                 }
             };
-            let Ok(mut c) = ep.pool.get_conn().await else {
+            let Ok(mut c) = ep.pool.get_conn_bounded().await else {
                 continue;
             };
             let store = LogicStore::new(ep.store.schema());

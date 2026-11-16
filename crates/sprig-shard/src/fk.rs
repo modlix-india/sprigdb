@@ -158,7 +158,16 @@ pub struct ForeignKey {
     pub child_lookup: Option<LookupId>,
     /// Its state.
     pub state: FkState,
+    /// `orphanage = 'present'`: child rows whose parent is missing
+    /// (written with `foreign_key_checks = 0`) may exist. For a parent
+    /// member's own key (`native`), they wait on the shard that holds
+    /// routing hash 0 with `_sprig_rk = 0`, until their parent is inserted.
+    pub orphans: bool,
 }
+
+/// The routing hash a parent member's row without a parent carries: its
+/// group's first range holds it, whatever splits and merges do.
+pub const ORPHAN_RK: u64 = 0;
 
 /// The `foreign_keys` table of a tenant's catalog.
 #[derive(Debug, Clone, Copy, Default)]
@@ -174,8 +183,8 @@ impl ForeignKeyCatalog {
         c.exec_drop(
             "INSERT INTO foreign_keys (fk_id, name, child_object_id, child_columns,
                parent_object_id, parent_columns, on_delete, on_update, enforcement,
-               child_lookup_id, state, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(6))",
+               child_lookup_id, state, orphanage, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(6))",
             (
                 fk.id,
                 &fk.name,
@@ -188,6 +197,7 @@ impl ForeignKeyCatalog {
                 fk.enforcement.as_str(),
                 fk.child_lookup.map(|l| l.0),
                 fk.state.as_str(),
+                if fk.orphans { "present" } else { "none" },
             ),
         )
         .await
@@ -204,7 +214,7 @@ impl ForeignKeyCatalog {
             .query(
                 "SELECT fk_id, name, child_object_id, CAST(child_columns AS CHAR),
                         parent_object_id, CAST(parent_columns AS CHAR), on_delete, on_update,
-                        enforcement, child_lookup_id, state
+                        enforcement, child_lookup_id, state, orphanage
                  FROM foreign_keys ORDER BY fk_id",
             )
             .await
@@ -237,12 +247,18 @@ pub type FkTuple = (
     String,
     Option<u64>,
     String,
+    String,
 );
+
+/// The columns of a [`FkTuple`], for `SELECT … FROM foreign_keys`.
+pub const FK_COLUMNS: &str = "fk_id, name, child_object_id, CAST(child_columns AS CHAR), \
+    parent_object_id, CAST(parent_columns AS CHAR), on_delete, on_update, enforcement, \
+    child_lookup_id, state, orphanage";
 
 /// A row read as [`FkTuple`]; `None` when a value is out of range.
 #[must_use]
 pub fn from_tuple(t: FkTuple) -> Option<ForeignKey> {
-    let (id, name, child, cc, parent, pc, del, upd, enf, lookup, state) = t;
+    let (id, name, child, cc, parent, pc, del, upd, enf, lookup, state, orphanage) = t;
     let cols = |s: Option<String>| -> Option<Vec<String>> {
         let v: Vec<String> = serde_json::from_str(s.as_deref()?).ok()?;
         Some(v.into_iter().map(|c| c.to_ascii_lowercase()).collect())
@@ -259,6 +275,7 @@ pub fn from_tuple(t: FkTuple) -> Option<ForeignKey> {
         enforcement: FkEnforcement::parse(&enf)?,
         child_lookup: lookup.map(LookupId),
         state: FkState::parse(&state)?,
+        orphans: orphanage == "present",
     })
 }
 
@@ -405,10 +422,12 @@ mod tests {
             "gateway".into(),
             None,
             "enforced".into(),
+            "present".into(),
         );
         let f = from_tuple(t).unwrap();
         assert_eq!(f.child_columns, ["sid"]);
         assert_eq!(f.on_delete, FkAction::Cascade);
         assert!(f.state.checked());
+        assert!(f.orphans);
     }
 }

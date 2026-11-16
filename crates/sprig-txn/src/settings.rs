@@ -58,6 +58,25 @@ pub static NON_XA_POLICY: Setting<Cow<'static, str>> = Setting {
 };
 sprig_settings::register!(NON_XA_POLICY);
 
+/// `txn.sprig_2pc_path`.
+pub static SPRIG_2PC_PATH: Setting<Cow<'static, str>> = Setting {
+    key: "txn.sprig_2pc_path",
+    default: Cow::Borrowed("gateway"),
+    scopes: TENANT_DC,
+    hard: HardBounds::one_of(&["gateway", "relay"]),
+    apply: Apply::Live,
+    operator_only: false,
+    owner: 18,
+    doc: "Under txn.non_xa_policy = sprig_2pc, who holds a held branch: gateway (the gateway session's own connection; if the gateway dies after the commit point, other writers can change those rows before the replay) or relay (every connection of the tenant to a Galera cluster with agent relays passes the relay writer, which keeps a lost holder's rows fenced until they are recovered; a cluster without a ready relay then refuses a second writer with 39440)",
+};
+sprig_settings::register!(SPRIG_2PC_PATH);
+
+/// `txn.sprig_2pc_path`: whether held branches go through agents' relays.
+#[must_use]
+pub fn relay_path(text: &str) -> bool {
+    text == "relay"
+}
+
 key! {
     /// `txn.prepare_timeout_ms`.
     PREPARE_TIMEOUT_MS: u64 = "txn.prepare_timeout_ms", TENANT_CLUSTER, 5000, 100, 600_000,

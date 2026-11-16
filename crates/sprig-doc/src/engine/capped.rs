@@ -697,7 +697,8 @@ impl Engine {
                             added += size_of(*i);
                         }
                         Err(e) if e.is(1062) => {
-                            errors.push((*i, dup_error(&e, id)));
+                            let d = json::to_bson(&s.doc, s.types.as_deref()).ok();
+                            errors.push((*i, dup_error(&e, ns, m, id, d.as_ref())));
                             if ordered {
                                 break;
                             }

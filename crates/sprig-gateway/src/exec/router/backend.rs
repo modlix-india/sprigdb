@@ -265,6 +265,19 @@ impl sprig_router::ShardBackend for GwBackend<'_> {
             .is_none_or(|v| !matches!(v.to_ascii_uppercase().as_str(), "0" | "OFF"))
     }
 
+    async fn open_orphanage(&mut self, v: &sprig_router::plan::ViaParent) -> Result<bool> {
+        let cat = self
+            .factory
+            .cat
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(cat) = cat else {
+            return Ok(false);
+        };
+        open_orphanage(&self.factory.svc, cat.tenant, v).await
+    }
+
     async fn begin_write(&mut self, targets: &[Target], budget: &mut Budget) -> Result<()> {
         let mut clusters: Vec<ClusterId> = Vec::new();
         for t in targets {
@@ -628,6 +641,116 @@ impl sprig_router::Scratch for GwScratch {
     async fn finish(mut self: Box<Self>, clean: bool) {
         if !clean {
             self.stream.bs.close().await;
+        }
+    }
+}
+
+/// Marks the foreign key parent member insert `v` follows as having an
+/// orphanage (`foreign_keys.orphanage = 'present'`; a `native` row is
+/// written when the key has none), in one catalog change, then waits until
+/// every gateway acknowledges the new catalog version (as lookup changes
+/// do). Returns `false` when the child table or its parent isn't in the
+/// catalog.
+///
+/// # Errors
+/// The catalog's.
+async fn open_orphanage(
+    svc: &Arc<crate::tenant::TenantServices>,
+    tenant: sprig_common::ids::TenantId,
+    v: &sprig_router::plan::ViaParent,
+) -> Result<bool> {
+    use mysql_async::prelude::Queryable as _;
+    let Ok(sprig_common::names::SchemaName::Shard { db, .. }) =
+        v.default_schema.parse::<sprig_common::names::SchemaName>()
+    else {
+        return Ok(false);
+    };
+    let mut c = svc
+        .catalog
+        .change(tenant, sprig_catalog::VersionKind::Catalog)
+        .await?;
+    let done = async {
+        let (store, tx) = c.tx().parts();
+        let q = |s: &str| format!("`{}`", s.replace('`', "``"));
+        let schema = q(store.schema());
+        let db_err = |e: mysql_async::Error| {
+            SprigError::new(sprig_common::SprigCode::CatalogUnavailable, e.to_string())
+        };
+        let object = |name: &str| {
+            format!(
+                "SELECT object_id FROM {schema}.objects WHERE db_id = {} AND namespace = 'relation' \
+                 AND kind = 'table' AND state <> 'dropped' AND LOWER(name) = LOWER('{}') LIMIT 1",
+                db.0,
+                name.replace('\\', "\\\\").replace('\'', "''")
+            )
+        };
+        let child: Option<u64> = tx.query_first(object(&v.table)).await.map_err(db_err)?;
+        let parent: Option<u64> = tx.query_first(object(&v.parent)).await.map_err(db_err)?;
+        let (Some(child), Some(parent)) = (child, parent) else {
+            return Ok(false);
+        };
+        let fks = format!("{schema}.foreign_keys");
+        tx.exec_drop(
+            format!(
+                "UPDATE {fks} SET orphanage = 'present', updated_at = UTC_TIMESTAMP(6) \
+                 WHERE child_object_id = ? AND name = ?"
+            ),
+            (child, v.fk.as_str()),
+        )
+        .await
+        .map_err(db_err)?;
+        let found: Option<u64> = tx
+            .exec_first(
+                format!("SELECT COUNT(*) FROM {fks} WHERE child_object_id = ? AND name = ?"),
+                (child, v.fk.as_str()),
+            )
+            .await
+            .map_err(db_err)?;
+        if found.unwrap_or(0) == 0 {
+            // A key MariaDB keeps on every shard: the row only carries the
+            // orphanage (its actions aren't read for native keys).
+            let next: Option<u64> = tx
+                .query_first(format!("SELECT COALESCE(MAX(fk_id), 0) + 1 FROM {fks}"))
+                .await
+                .map_err(db_err)?;
+            tx.exec_drop(
+                format!(
+                    "INSERT INTO {fks} (fk_id, name, child_object_id, child_columns, \
+                     parent_object_id, parent_columns, on_delete, on_update, enforcement, \
+                     child_lookup_id, orphanage, state, updated_at) VALUES (?, ?, ?, ?, ?, ?, \
+                     'restrict', 'restrict', 'native', NULL, 'present', 'enforced', \
+                     UTC_TIMESTAMP(6))"
+                ),
+                (
+                    next.unwrap_or(1),
+                    v.fk.as_str(),
+                    child,
+                    serde_json::to_string(&v.fk_columns.0).unwrap_or_default(),
+                    parent,
+                    serde_json::to_string(&v.fk_columns.1).unwrap_or_default(),
+                ),
+            )
+            .await
+            .map_err(db_err)?;
+        }
+        Ok::<bool, SprigError>(true)
+    }
+    .await;
+    match done {
+        Ok(true) => {
+            let version = c.commit().await?;
+            crate::tenant::lookups_sql::publish_wait(svc, tenant, version).await;
+            tracing::info!(tenant = %tenant, table = %v.table, fk = %v.fk,
+                "orphanage opened: rows without their parent wait on the hash-0 shard");
+            Ok(true)
+        }
+        Ok(false) => {
+            let _ = c.rollback().await;
+            Ok(false)
+        }
+        Err(e) => {
+            let _ = c.rollback().await;
+            Err(e)
         }
     }
 }

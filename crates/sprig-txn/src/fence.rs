@@ -28,6 +28,8 @@
 //! [`RelayFence`] holds the registry and runs these steps; [`RelayLinks`]
 //! is the relay itself (the agent's TCP relay, or the simulation's).
 
+pub mod wire;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -268,6 +270,62 @@ impl<L: RelayLinks> RelayFence<L> {
         tracing::info!(cluster = %self.cluster, replayed = total.replayed, dropped = total.dropped,
             unresolved = total.unresolved, "relay fence: start-up recovery done; admitting connections");
         Ok(total)
+    }
+
+    /// The node stops being the relay writer (its agent lost the relay
+    /// lease, or its node left the primary component): nobody is admitted
+    /// any more, and every relayed connection is ended, holders last, so
+    /// no waiting statement takes a holder's rows. The held branches stay
+    /// as redo rows for whichever node takes over ([`Self::start`] there).
+    /// Returns whether every connection ended in time.
+    pub async fn stand_down(&self) -> bool {
+        let (others, holders) = {
+            let mut st = self.state();
+            st.ready = false;
+            let mut others = Vec::new();
+            let mut holders = BTreeSet::new();
+            for t in st.tenants.values() {
+                let h: BTreeSet<u64> = t.holds.iter().map(|h| h.thread).collect();
+                others.extend(t.links.iter().copied().filter(|th| !h.contains(th)));
+                holders.extend(h);
+            }
+            (others, holders.into_iter().collect::<Vec<u64>>())
+        };
+        let a = futures::future::join_all(others.iter().map(|&th| self.links.end(th))).await;
+        let b = futures::future::join_all(holders.iter().map(|&th| self.links.end(th))).await;
+        self.state().tenants.clear();
+        self.stats
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .ended += (others.len() + holders.len()) as u64;
+        tracing::warn!(cluster = %self.cluster, ended = others.len() + holders.len(),
+            "relay fence: standing down; every relayed connection ended");
+        a.iter().chain(b.iter()).all(|ok| *ok)
+    }
+
+    /// Answers one holder call ([`wire`]).
+    ///
+    /// # Errors
+    /// As [`Self::prepare`] and [`Self::finished`].
+    pub async fn call(&self, c: &wire::HolderCall) -> DbResult<()> {
+        match c {
+            wire::HolderCall::Prepare {
+                tenant,
+                thread,
+                schema,
+                dtid,
+                gtrid,
+                stmts,
+            } => {
+                self.prepare(*tenant, *thread, schema, *dtid, gtrid, stmts)
+                    .await
+            }
+            wire::HolderCall::Finished { schema, dtid } => self.finished(schema, *dtid).await,
+            wire::HolderCall::Abandon { thread, dtid, .. } => {
+                self.abandon(*dtid, *thread);
+                Ok(())
+            }
+        }
     }
 
     /// Whether a new connection of `tenant` may pass.

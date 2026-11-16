@@ -1321,8 +1321,43 @@ async fn find_point(
     Ok(true)
 }
 
-#[allow(clippy::too_many_lines)]
+/// Runs a command; a read without a `collation` of its own (`find`,
+/// `aggregate`, `count`, `distinct`) runs under its collection's default
+/// collation, as on MongoDB. Writes, `findAndModify` included, apply the
+/// default per statement (`writes`), since retryable writes reach them
+/// without this function.
 async fn exec(
+    c: &mut Conn,
+    sql: &mut SqlSession,
+    name: &str,
+    body: &Document,
+    db: &str,
+    lsid: Option<&[u8]>,
+) -> Result<Document, MongoError> {
+    let default = if body.contains_key("collation")
+        || !matches!(name, "find" | "aggregate" | "count" | "distinct")
+    {
+        None
+    } else if let Ok(coll) = body.get_str(name) {
+        let ns = Ns {
+            db: db.to_owned(),
+            coll: coll.to_owned(),
+        };
+        c.shared.engine.clone().default_collation(sql, &ns).await?
+    } else {
+        None
+    };
+    match default {
+        Some(_) => {
+            sprig_doc::collation::scope(default, Box::pin(exec_cmd(c, sql, name, body, db, lsid)))
+                .await
+        }
+        None => exec_cmd(c, sql, name, body, db, lsid).await,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn exec_cmd(
     c: &mut Conn,
     sql: &mut SqlSession,
     name: &str,
@@ -1493,6 +1528,12 @@ async fn exec(
             let mut reply = doc! {};
             if let Some(ix) = body.get("index") {
                 reply = sprig_doc::engine::ttl::coll_mod_index(&mut m, &ns, ix)?;
+                // `hidden`: the MariaDB index is IGNORED by every plan.
+                if let Some(ddl) = sprig_doc::engine::ttl::hidden_ddl(&m, &ns.db, ix, &reply) {
+                    sql.exec(&ddl)
+                        .await
+                        .map_err(|e| sprig_doc::engine::mongo_error(&e))?;
+                }
                 engine.catalog.save_indexes(sql, &ns, &m).await?;
             }
             // `cappedSize` and `cappedMax`.

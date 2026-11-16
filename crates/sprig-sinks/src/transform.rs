@@ -401,6 +401,54 @@ mod tests {
         );
     }
 
+    /// `try`/`catch`/`finally`, helper functions and `do`/`while` in a
+    /// transform: the sink's worker runs them on QuickJS, as the engine
+    /// tier does for every other caller.
+    #[tokio::test]
+    async fn javascript_try_helpers_and_do_while() {
+        let sig = json!({"params": [{"name": "r", "type": "json"}], "scalar": true});
+        let t = Transform::compile(
+            "features",
+            "javascript",
+            1,
+            "function domain(email) {
+               const at = email.indexOf('@');
+               if (at < 0) throw new Error('no @ in ' + email);
+               return email.slice(at + 1);
+             }
+             const parts = (s) => s.split('.').length;
+             let tries = 0;
+             let d = null;
+             let note = '';
+             do {
+               tries++;
+               try {
+                 d = domain(r.value.email);
+               } catch (e) {
+                 note = e.message;
+                 break;
+               } finally {
+                 note = note + '/' + tries;
+               }
+             } while (d === null && tries < 3);
+             if (d === null) return null;
+             return { user: r.value.user_id, domain: d, labels: parts(d), note };",
+            &sig,
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        let out = t.apply(rec()).await.unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(out[0].value.as_deref().unwrap()).unwrap(),
+            json!({"user": 7, "domain": "b.c", "labels": 2, "note": "/1"})
+        );
+        // The helper's error is caught; the record is dropped, not failed.
+        let mut bad = rec();
+        bad.value = Some(br#"{"type":"user.added","user_id":8,"email":"nobody"}"#.to_vec());
+        assert!(t.apply(bad).await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn errors_and_budgets_fail_the_record() {
         let sig = json!({"params": [{"name": "r", "type": "json"}], "scalar": true});

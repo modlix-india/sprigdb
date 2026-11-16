@@ -11,14 +11,24 @@
 //! (runtime: overflow, division by zero, `QueryOne` with many rows, no
 //! event). MariaDB raises 1365 and 1690 for the same runtime errors; the
 //! gateway maps them to 39866.
+//!
+//! [`Stmt::Try`] catches what JavaScript can catch, as the generated code
+//! does: the code's own 39865, an error of a data operation (the
+//! interpreter notes when one is running, as the generated code does in
+//! `v__src`) other than 39864, and an error raised again.
 
 use std::cmp::Ordering as O;
 
 use serde_json::{Map, Number, Value as J};
 use sprig_common::{Result, SprigCode, SprigError};
 
+use std::collections::HashMap;
+
+use sprig_common::ErrorKind;
+
 use crate::ir::{
-    BinOp, Bound, Builtin, DbOp, Expr, Function, Literal, PathSeg, SqlShape, Stmt, Ty, UnOp,
+    BinOp, Bound, Builtin, Caught, DbOp, Expr, Function, Literal, LocalId, PathSeg, SqlShape, Stmt,
+    Ty, UnOp,
 };
 
 /// A runtime value.
@@ -80,6 +90,23 @@ pub trait Db {
     /// # Errors
     /// The server's error.
     fn exec(&mut self, sql: &str, binds: &[Value]) -> Result<u64>;
+
+    /// Runs a compiled `db.call`: `sql` is `CALL <entry>(?, ...` up to its
+    /// last argument; the event's name and the callee's result object (as
+    /// JSON text). The default runs it with two user variables on one
+    /// connection.
+    ///
+    /// # Errors
+    /// The server's error.
+    fn call(&mut self, sql: &str, binds: &[Value]) -> Result<(String, Option<String>)> {
+        let sep = if binds.is_empty() { "" } else { ", " };
+        self.exec(&format!("{sql}{sep}@sprig_call_e, @sprig_call_r)"), binds)?;
+        let rows = self.query("SELECT @sprig_call_e, @sprig_call_r", &[])?;
+        let row = rows.into_iter().next().unwrap_or_default();
+        let mut it = row.into_iter();
+        let event = it.next().flatten().unwrap_or_else(|| "output".to_owned());
+        Ok((event, it.next().flatten()))
+    }
 }
 
 /// A `Db` with no tables, for functions without data access.
@@ -128,6 +155,19 @@ enum Flow {
     Break,
     Continue,
     Return,
+    Leave(u32),
+}
+
+/// Where the error being raised came from (the generated code's
+/// `v__src`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Src {
+    /// The code itself.
+    Code,
+    /// A data operation.
+    Db,
+    /// [`Stmt::Rethrow`].
+    Again,
 }
 
 struct Run<'a> {
@@ -137,6 +177,27 @@ struct Run<'a> {
     event: Option<(String, J)>,
     db: &'a mut dyn Db,
     limits: &'a Limits,
+    src: Src,
+    /// The name and message a `catch` sees of the code's last 39865.
+    thrown: (String, String),
+    /// Errors kept by `Try`, by their flag local, for `Rethrow`.
+    kept: HashMap<LocalId, (ErrorKind, String)>,
+}
+
+fn errno(e: &SprigError) -> u16 {
+    match e.kind {
+        ErrorKind::Sprig(c) => c.number(),
+        ErrorKind::Backend { errno, .. } | ErrorKind::Standard { errno, .. } => errno,
+    }
+}
+
+fn sqlstate(e: &SprigError) -> String {
+    match e.kind {
+        ErrorKind::Sprig(_) => "HY000".to_owned(),
+        ErrorKind::Backend { sqlstate, .. } | ErrorKind::Standard { sqlstate, .. } => {
+            String::from_utf8_lossy(&sqlstate).into_owned()
+        }
+    }
 }
 
 /// Runs `f` with `args` (one per parameter, already of the parameter's
@@ -164,6 +225,9 @@ pub fn run(f: &Function, args: &[Value], db: &mut dyn Db, limits: &Limits) -> Re
         event: None,
         db,
         limits,
+        src: Src::Code,
+        thrown: (String::new(), String::new()),
+        kept: HashMap::new(),
     };
     r.block(&f.body)?;
     if let Some((event, result)) = r.event {
@@ -224,7 +288,7 @@ impl Run<'_> {
                     match self.block(body)? {
                         Flow::Next | Flow::Continue => {}
                         Flow::Break => break,
-                        Flow::Return => return Ok(Flow::Return),
+                        f @ (Flow::Return | Flow::Leave(_)) => return Ok(f),
                     }
                 }
             }
@@ -246,8 +310,17 @@ impl Run<'_> {
             }
             Stmt::Throw(e) => {
                 let m = self.eval(&e.message)?;
+                self.thrown = match &e.catch {
+                    Some((name, cm)) => {
+                        let cm = self.eval(cm)?;
+                        (name.clone(), to_str(&cm))
+                    }
+                    None => ("Error".to_owned(), to_str(&m)),
+                };
+                self.src = Src::Code;
                 let text: String = to_str(&m).chars().take(128).collect();
                 let code = match e.code {
+                    39863 => SprigCode::LogicValidationFailed,
                     39864 => SprigCode::LogicBudgetExceeded,
                     39866 => SprigCode::LogicRuntimeError,
                     _ => SprigCode::LogicUserError,
@@ -261,6 +334,9 @@ impl Run<'_> {
                 origin,
             }) => {
                 let sql = stmt.with_placeholders();
+                // As the generated code, the binds are part of the
+                // statement.
+                self.src = Src::Db;
                 let mut vals = Vec::with_capacity(binds.len());
                 for b in binds {
                     vals.push(self.eval(b)?);
@@ -298,10 +374,141 @@ impl Run<'_> {
                         self.locals[affected.0 as usize] =
                             Value::Int(i64::try_from(n).unwrap_or(i64::MAX));
                     }
+                    SqlShape::Call {
+                        event,
+                        result,
+                        into,
+                    } => {
+                        let (ev, res) = self.db.call(&sql, &vals)?;
+                        let obj: J = match &res {
+                            Some(t) => {
+                                serde_json::from_str(t).map_err(|e| runtime(e.to_string()))?
+                            }
+                            None => J::Null,
+                        };
+                        self.locals[event.0 as usize] = Value::Str(ev);
+                        self.locals[result.0 as usize] = Value::from_json(obj.clone());
+                        for (name, l) in into {
+                            let ty = self.f.local_def(*l).ty;
+                            // MariaDB's JSON_VALUE, then the wrapper's cast.
+                            let text = match obj.get(name) {
+                                Some(J::String(s)) => Some(s.clone()),
+                                Some(J::Number(n)) => Some(n.to_string()),
+                                Some(J::Bool(b)) => Some(if *b { "1" } else { "0" }.to_owned()),
+                                _ => None,
+                            };
+                            self.locals[l.0 as usize] = match (ty, text) {
+                                (Ty::Int | Ty::Bool, Some(t)) => match t.parse::<i64>() {
+                                    Ok(i) => Value::Int(i),
+                                    Err(_) => {
+                                        Value::Int(t.parse::<f64>().map_or(0, |x| x.round() as i64))
+                                    }
+                                },
+                                (Ty::Json | Ty::Null, _) => {
+                                    obj.get(name).cloned().map_or(Value::Null, Value::from_json)
+                                }
+                                (t, cell) => from_text(cell, t)?,
+                            };
+                        }
+                    }
+                    SqlShape::Publish {
+                        affected,
+                        max_bytes,
+                        compact,
+                    } => {
+                        let longest = vals
+                            .iter()
+                            .map(|v| match v {
+                                Value::Null => 0,
+                                Value::Str(s) => s.len(),
+                                other => other.to_json().to_string().len(),
+                            })
+                            .max()
+                            .unwrap_or(0);
+                        if longest as u64 > *max_bytes {
+                            return Err(SprigError::new(
+                                SprigCode::StreamRecordTooLarge,
+                                format!(
+                                    "ER_SPRIG_STREAM_RECORD_TOO_LARGE: a value of {longest} bytes is \
+                                     above stream.max_message_bytes ({max_bytes})"
+                                ),
+                            ));
+                        }
+                        if *compact && vals.first().is_none_or(Value::is_null) {
+                            return Err(SprigError::new(
+                                SprigCode::StreamCompactNeedsKey,
+                                "ER_SPRIG_STREAM_COMPACT_NEEDS_KEY: a record without a key on a \
+                                 compacted stream",
+                            ));
+                        }
+                        let n = self.db.exec(&sql, &vals)?;
+                        self.locals[affected.0 as usize] =
+                            Value::Int(i64::try_from(n).unwrap_or(i64::MAX));
+                    }
+                }
+                self.src = Src::Code;
+            }
+            Stmt::Try { body, caught } => {
+                self.locals[caught.flag.0 as usize] = Value::Bool(false);
+                match self.block(body) {
+                    Ok(flow) => return Ok(flow),
+                    Err(e) => {
+                        let code = errno(&e);
+                        let catchable = code == 39865
+                            || self.src == Src::Again
+                            || (self.src == Src::Db && code != 39864);
+                        if !catchable {
+                            return Err(e);
+                        }
+                        self.keep(caught, &e);
+                    }
                 }
             }
+            Stmt::Rethrow(c) => {
+                let (kind, text) = self
+                    .kept
+                    .get(&c.flag)
+                    .cloned()
+                    .ok_or_else(|| SprigError::internal("rethrow of nothing caught"))?;
+                self.thrown = (
+                    to_str(&self.locals[c.name.0 as usize]),
+                    to_str(&self.locals[c.message.0 as usize]),
+                );
+                self.src = Src::Again;
+                return Err(SprigError {
+                    kind,
+                    message: text,
+                    retryable: false,
+                    source: None,
+                });
+            }
+            Stmt::Block(label, body) => {
+                return Ok(match self.block(body)? {
+                    Flow::Leave(l) if l == *label => Flow::Next,
+                    other => other,
+                });
+            }
+            Stmt::Leave(l) => return Ok(Flow::Leave(*l)),
         }
         Ok(Flow::Next)
+    }
+
+    /// Records a caught error in `c`'s locals.
+    fn keep(&mut self, c: &Caught, e: &SprigError) {
+        let (name, message) = if self.src == Src::Db {
+            ("Error".to_owned(), e.message.clone())
+        } else {
+            self.thrown.clone()
+        };
+        let mut set = |l: LocalId, v: Value| self.locals[l.0 as usize] = v;
+        set(c.flag, Value::Bool(true));
+        set(c.code, Value::Int(i64::from(errno(e))));
+        set(c.state, Value::Str(sqlstate(e)));
+        set(c.text, Value::Str(e.message.clone()));
+        set(c.message, Value::Str(message));
+        set(c.name, Value::Str(name));
+        self.kept.insert(c.flag, (e.kind, e.message.clone()));
+        self.src = Src::Code;
     }
 
     #[allow(clippy::too_many_lines)]
@@ -637,6 +844,10 @@ fn builtin(b: Builtin, a: &[Value]) -> Result<Value> {
         Builtin::ToJson => match a0 {
             V::Null => V::Null,
             v => V::Json(v.to_json()),
+        },
+        Builtin::JsonText => match a0 {
+            V::Null => V::Null,
+            v => V::Str(v.to_json().to_string()),
         },
         Builtin::JsonLength => match a0 {
             V::Json(J::Array(v)) => V::Int(i64::try_from(v.len()).unwrap_or(i64::MAX)),

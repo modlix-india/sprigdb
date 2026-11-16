@@ -1070,6 +1070,9 @@ impl Vhost for ConnVhost {
 
     async fn connection_closed(&self, conn: ConnKey) {
         lock(&self.v.conns).remove(&conn);
+        if let Ok(e) = self.engine() {
+            self.v.touch(e.deps.clock.now_ms());
+        }
         lock(&self.v.consumers).retain(|_, r| r.conn != conn);
         let holder = Holder { origin: 0, conn };
         let owners: Vec<_> = lock(&self.v.owners).values().cloned().collect();

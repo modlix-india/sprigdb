@@ -1192,6 +1192,29 @@ pub struct Projection {
     spec: Document,
     inclusion: bool,
     id: bool,
+    /// The query, for a positional `"a.$": 1` (see [`Self::with_query`]).
+    query: Option<Box<filter::Pred>>,
+}
+
+/// `{a: {b: 1, c: {d: 0}}}` as `{"a.b": 1, "a.c.d": 0}` (MongoDB 4.4+
+/// reads nested projection documents as dotted paths); documents of
+/// operators (`$slice`, `$elemMatch`, `$meta`, expressions) stay.
+fn flatten_projection(spec: &Document, prefix: &str, out: &mut Document) {
+    for (k, v) in spec {
+        let path = if prefix.is_empty() {
+            k.clone()
+        } else {
+            format!("{prefix}.{k}")
+        };
+        match v {
+            Bson::Document(d) if !d.is_empty() && !d.keys().any(|x| x.starts_with('$')) => {
+                flatten_projection(d, &path, out);
+            }
+            _ => {
+                out.insert(path, v.clone());
+            }
+        }
+    }
 }
 
 fn proj_flag(v: &Bson) -> Option<bool> {
@@ -1208,8 +1231,12 @@ impl Projection {
     /// # Errors
     /// 31254 / 31253 for mixing inclusion and exclusion.
     pub fn parse(spec: &Document) -> Result<Self, MongoError> {
+        let mut flat = Document::new();
+        flatten_projection(spec, "", &mut flat);
+        let spec = &flat;
         let mut inclusion: Option<bool> = None;
         let mut id = true;
+        let mut elem_match = false;
         for (k, v) in spec {
             if k == "_id"
                 && let Some(f) = proj_flag(v)
@@ -1220,9 +1247,14 @@ impl Projection {
             let this = match proj_flag(v) {
                 Some(f) => f,
                 None => match v {
+                    // `$meta` (MongoDB 4.4+) and `$slice` leave the kind to
+                    // the other fields: alone they keep every field.
                     Bson::Document(d)
-                        if d.contains_key("$slice") || d.contains_key("$elemMatch") =>
+                        if d.contains_key("$slice")
+                            || d.contains_key("$elemMatch")
+                            || (d.len() == 1 && d.contains_key("$meta")) =>
                     {
+                        elem_match |= d.contains_key("$elemMatch");
                         continue;
                     }
                     _ => true,
@@ -1245,12 +1277,25 @@ impl Projection {
         }
         // `{_id: 1}` alone is an inclusion projection; `{_id: 0}` alone an
         // exclusion one.
-        let only_id = spec.contains_key("_id") && id;
+        // `$elemMatch` with no other field is an inclusion projection too
+        // (MongoDB returns `_id` and the matched element only).
+        let only_id = (spec.contains_key("_id") && id) || elem_match;
         Ok(Self {
             spec: spec.clone(),
             inclusion: inclusion.unwrap_or(only_id),
             id,
+            query: None,
         })
+    }
+
+    /// The projection with `find`'s query, which a positional `"a.$": 1`
+    /// needs: it keeps the first element of `a` the query matched.
+    #[must_use]
+    pub fn with_query(mut self, query: &filter::Pred) -> Self {
+        if self.spec.keys().any(|k| k.ends_with(".$")) {
+            self.query = Some(Box::new(query.clone()));
+        }
+        self
     }
 
     /// Applies the projection.
@@ -1271,6 +1316,15 @@ impl Projection {
                     continue;
                 }
                 match proj_flag(v) {
+                    Some(true) if k.ends_with(".$") => {
+                        let path = &k[..k.len() - 2];
+                        if let Some(q) = &self.query
+                            && let Some(i) = crate::update::matched_position(doc, q, path)
+                            && let Some(Bson::Array(a)) = get_path(doc, path)
+                        {
+                            crate::update::set_path(&mut o, path, Bson::Array(vec![a[i].clone()]))?;
+                        }
+                    }
                     Some(true) => include_path(doc, &mut o, k),
                     Some(false) => {}
                     None => self.special(doc, &mut o, k, v, &vars)?,
@@ -1330,11 +1384,13 @@ impl Projection {
                 return Ok(());
             }
             if let Some(Bson::Document(cond)) = d.get("$elemMatch") {
-                let p = filter::parse(cond)?;
+                // The query operator's own parse: a filter on documents, or
+                // operators on values (`{$elemMatch: {$gte: 3}}`).
+                let p = filter::parse(&bson::doc! {"e": {"$elemMatch": cond.clone()}})?;
                 if let Some(Bson::Array(a)) = doc.get(k) {
                     if let Some(e) = a
                         .iter()
-                        .find(|e| matches!(e, Bson::Document(x) if p.matches(x)))
+                        .find(|e| p.matches(&bson::doc! {"e": [(*e).clone()]}))
                     {
                         out.insert(k, Bson::Array(vec![e.clone()]));
                     } else {

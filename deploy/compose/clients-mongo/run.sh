@@ -35,6 +35,8 @@ mongoose)
     # runs every n-th test file from the i-th (0-based) of the sorted list;
     # SPRIG_MONGOOSE_XUNIT=<file> writes mocha's xunit report there instead
     # of the dot reporter; SPRIG_MONGOOSE_LABEL names the results file.
+    # START_REPLICA_SET=1 (set in CI) is Mongoose's replica-set mode: its
+    # transaction tests run on MONGOOSE_REPLSET_URI, the same URI here.
     if [[ -n ${SPRIG_MONGOOSE_SHARD:-} ]]; then
         shard=${SPRIG_MONGOOSE_SHARD%/*} of=${SPRIG_MONGOOSE_SHARD#*/}
         mapfile -t all < <(cd "$src" && printf '%s\n' test/*.test.js | sort)

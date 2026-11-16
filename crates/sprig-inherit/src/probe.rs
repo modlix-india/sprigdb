@@ -114,7 +114,7 @@ fn string_lit(s: &str, nbe: bool) -> String {
 
 /// The SQL value of an image's value of a column of type `ty` (a change
 /// record's encoding: `ENUM` and `SET` by number, binary strings in
-/// base64).
+/// base64, a `TIMESTAMP` in UTC).
 fn sql_value(v: &Value, ty: Option<&ColumnType>, nbe: bool) -> String {
     let dt = ty
         .map(|t| t.data_type.to_ascii_lowercase())
@@ -153,6 +153,15 @@ fn sql_value(v: &Value, ty: Option<&ColumnType>, nbe: bool) -> String {
             }
             "geometry" | "point" | "linestring" | "polygon" | "multipoint" | "multilinestring"
             | "multipolygon" | "geometrycollection" => "NULL".to_owned(),
+            // Records carry a TIMESTAMP in UTC: the session's time zone, as
+            // the table shows it.
+            "timestamp" => {
+                let t = string_lit(s, nbe);
+                format!(
+                    "COALESCE(FROM_UNIXTIME(TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', {t})) \
+                     + INTERVAL MICROSECOND({t}) MICROSECOND, {t})"
+                )
+            }
             _ => string_lit(s, nbe),
         },
         other => string_lit(&other.to_string(), nbe),
@@ -600,6 +609,17 @@ mod tests {
         assert_eq!(sql_value(&Value::from("a\\'b"), None, true), "'a\\''b'");
         assert_eq!(sql_value(&Value::from(7.5), None, false), "7.5");
         assert_eq!(sql_value(&Value::Null, None, false), "NULL");
+        // A TIMESTAMP comes in UTC: read in the session's time zone.
+        let ts = ColumnType {
+            data_type: "timestamp".into(),
+            column_type: "timestamp".into(),
+        };
+        assert_eq!(
+            sql_value(&Value::from("2026-11-16 10:00:00"), Some(&ts), false),
+            "COALESCE(FROM_UNIXTIME(TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', \
+             '2026-11-16 10:00:00')) + INTERVAL MICROSECOND('2026-11-16 10:00:00') MICROSECOND, \
+             '2026-11-16 10:00:00')"
+        );
         let mut row = Map::new();
         row.insert("ID".into(), Value::from(2));
         let t = [("id".to_owned(), ColumnType::default())];

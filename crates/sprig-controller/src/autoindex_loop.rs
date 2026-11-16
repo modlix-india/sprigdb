@@ -338,6 +338,10 @@ pub struct Memory {
     /// The last pass saw an automatic document index: the next one
     /// reconciles `doc_indexes` even when none is left.
     pub docs_seen: bool,
+    /// The last user-index pass had tables to look at (read in the last
+    /// hour, or holding a retiring or recommended user index). Without,
+    /// the tenant isn't brought back every `user_every` for it.
+    pub user_work: bool,
 }
 
 /// What one pass did.
@@ -611,11 +615,21 @@ async fn pass(
         .is_none_or(|t| now < t || now.duration_since(t).unwrap_or_default() >= cadence.user_every);
     if user_due {
         memory.last_user = Some(now);
-        if let Err(e) = user_pass(env, hooks, &store, &mut q, tenant, now, &mut rep).await {
-            rep.errors.push(format!("user indexes: {e}"));
-        }
+        memory.user_work = match user_pass(env, hooks, &store, &mut q, tenant, now, &mut rep).await
+        {
+            Ok(had) => had,
+            Err(e) => {
+                rep.errors.push(format!("user indexes: {e}"));
+                true
+            }
+        };
     }
-    soon(&mut rep, cadence.user_every);
+    // An idle tenant (no table read in the last hour, no user index to
+    // judge) comes back at the next other step or the longest requeue,
+    // not every `user_every`: with thousands of tenants, most are idle.
+    if memory.user_work {
+        soon(&mut rep, cadence.user_every);
+    }
 
     // 5. Drift.
     let drift_due = memory.last_drift.is_none_or(|t| {
@@ -653,7 +667,8 @@ async fn pass(
 }
 
 /// Step 4b: the user and migrated indexes of every table read in the last
-/// hour, and of every table holding a retiring or recommended one.
+/// hour, and of every table holding a retiring or recommended one. `true`
+/// when there was any such table.
 async fn user_pass(
     env: &dyn AutoIndexEnv,
     hooks: &AutoIndexHooks,
@@ -662,7 +677,7 @@ async fn user_pass(
     tenant: TenantId,
     now: SystemTime,
     rep: &mut PassReport,
-) -> Result<()> {
+) -> Result<bool> {
     use sprig_advisor::autoindex::store::usage::UserIndexState;
     let since = now
         .checked_sub(Duration::from_secs(3600))
@@ -678,7 +693,7 @@ async fn user_pass(
             .await?,
     );
     if objects.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let envs = env.objects(tenant, &objects).await?;
     for (object, o) in &envs {
@@ -714,7 +729,7 @@ async fn user_pass(
             Err(e) => rep.errors.push(format!("{}: user indexes: {e}", object.0)),
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Moves a validated row: accepted → `rolling_out` or `recommended`;

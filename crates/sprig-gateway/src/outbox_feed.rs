@@ -33,6 +33,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::{DbId, TenantId};
 use sprig_common::names::SchemaName;
 use sprig_common::{Result, SprigCode, SprigError};
@@ -125,7 +126,7 @@ async fn start_token(
             format!("read @@gtid_binlog_pos of {cluster}: {e}"),
         )
     };
-    let mut c = pool.get_conn().await.map_err(unavailable)?;
+    let mut c = pool.get_conn_bounded().await.map_err(unavailable)?;
     let pos: Option<String> = c
         .query_first("SELECT @@gtid_binlog_pos")
         .await

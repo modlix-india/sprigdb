@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use sprig_catalog::CatalogLocator;
 use sprig_catalog::ddl::database_key;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::version::VersionKind;
 use sprig_common::Result;
 use sprig_common::ids::{DbId, TenantId};
@@ -128,7 +129,7 @@ impl DbDrop {
 
     async fn drop_logic(&self, svc: &TenantServices, version: u64) -> Result<()> {
         let ep = svc.locator.writer(self.tenant).await?;
-        let mut c = ep.pool.get_conn().await.map_err(|e| {
+        let mut c = ep.pool.get_conn_bounded().await.map_err(|e| {
             sprig_common::SprigError::new(
                 sprig_common::SprigCode::CatalogUnavailable,
                 "catalog unreachable",

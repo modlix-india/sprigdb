@@ -212,8 +212,12 @@ pub struct InheritChange {
     pub delete_objects: Vec<ObjectId>,
     /// Shares created (`id` 0: allocated on commit) or replaced.
     pub upsert_shares: Vec<Share>,
-    /// Shares dropped.
+    /// Shares dropped: they stay as `dropping` rows, which no edge reads,
+    /// until [`Self::purge_shares`] records their cleanup done.
     pub drop_shares: Vec<u64>,
+    /// Dropped shares whose cleanup in the children is done: their rows
+    /// go.
+    pub purge_shares: Vec<u64>,
     /// Narrowings of received shares set or replaced.
     pub upsert_takes: Vec<Take>,
     /// Home spaces set (`None`: back to the root).
@@ -356,18 +360,23 @@ impl InheritStore {
             .query(format!(
                 "SELECT share_id, role, name, object_id, from_space_id, peer_tenant_id, \
                  to_space_id, filter_sql, CAST(columns AS CHAR), take_filter_sql, reshare, \
-                 version, created_by, CAST(merge_mode AS CHAR) FROM {} \
-                 WHERE state = 'active' ORDER BY share_id",
+                 version, created_by, CAST(merge_mode AS CHAR), CAST(state AS CHAR) FROM {} \
+                 WHERE state IN ('active', 'dropping') ORDER BY share_id",
                 self.t("shares")
             ))
             .await
             .map_err(map_err)?;
         let mut shares = Vec::new();
+        let mut dropping = Vec::new();
         let mut takes = Vec::new();
         for r in &rows {
             let role: String = col(r, 1)?;
             let peer: u64 = col(r, 5)?;
             let to: u64 = col(r, 6)?;
+            let active = col::<String>(r, 14)? == "active";
+            if !active && role != "granted" {
+                continue;
+            }
             if role == "received" {
                 takes.push(Take {
                     share_id: col(r, 0)?,
@@ -378,7 +387,8 @@ impl InheritStore {
                 continue;
             }
             let columns: Option<String> = col(r, 8)?;
-            shares.push(Share {
+            let to_list = if active { &mut shares } else { &mut dropping };
+            to_list.push(Share {
                 id: col(r, 0)?,
                 name: col(r, 2)?,
                 object_id: ObjectId(col(r, 3)?),
@@ -417,6 +427,7 @@ impl InheritStore {
         );
         st.ext_ready = ext_ready;
         st.set_ext_missing(missing);
+        st.set_dropping(dropping);
         Ok(st)
     }
 
@@ -574,7 +585,20 @@ impl InheritStore {
         for id in &change.drop_shares {
             q.exec_drop(
                 format!(
-                    "DELETE FROM {} WHERE share_id = ? AND role = 'granted'",
+                    "UPDATE {} SET state = 'dropping', changed_version = ? WHERE share_id = ? \
+                     AND role = 'granted'",
+                    self.t("shares")
+                ),
+                (version, id),
+            )
+            .await
+            .map_err(map_err)?;
+        }
+        for id in &change.purge_shares {
+            q.exec_drop(
+                format!(
+                    "DELETE FROM {} WHERE share_id = ? AND role = 'granted' AND state = \
+                     'dropping'",
                     self.t("shares")
                 ),
                 (id,),

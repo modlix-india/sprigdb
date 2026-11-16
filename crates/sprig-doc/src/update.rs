@@ -460,7 +460,7 @@ pub fn arith(a: &Bson, b: &Bson, mul: bool) -> Result<Bson, MongoError> {
 
 /// The first array position of `array_path` whose element meets the
 /// query's conditions on that array.
-fn matched_position(doc: &Document, query: &Pred, array_path: &str) -> Option<usize> {
+pub(crate) fn matched_position(doc: &Document, query: &Pred, array_path: &str) -> Option<usize> {
     let Some(Bson::Array(a)) = get_path(doc, array_path) else {
         return None;
     };
@@ -472,6 +472,12 @@ fn matched_position(doc: &Document, query: &Pred, array_path: &str) -> Option<us
     a.iter().position(|e| {
         let wrap = bson::doc! {"e": e.clone()};
         conds.iter().all(|(sub, op)| {
+            // `{a: {$elemMatch: ...}}` holds for the element when it holds
+            // for an array of just that element.
+            if sub.is_empty() && matches!(op, filter::FieldOp::ElemMatch(_)) {
+                let one = bson::doc! {"e": [e.clone()]};
+                return op.eval(&filter::values_at(&one, "e"), &filter::NoExpr, &one);
+            }
             let p = if sub.is_empty() {
                 "e".to_owned()
             } else {
@@ -621,7 +627,14 @@ fn sort_values(a: &mut [Bson], spec: &Bson) -> Result<(), MongoError> {
 
 fn pull_matches(e: &Bson, cond: &Bson) -> bool {
     match cond {
-        Bson::Document(d) if d.keys().next().is_some_and(|k| k.starts_with('$')) => {
+        // Operators on the values (`{$gte: 6}`); `$and`, `$or`, `$nor` and
+        // `$expr` are a query on the element's fields instead, as MongoDB
+        // takes `{$pull: {ticks: {$or: [{name: "a"}, {name: "b"}]}}}`.
+        Bson::Document(d)
+            if d.keys().next().is_some_and(|k| {
+                k.starts_with('$') && !matches!(k.as_str(), "$and" | "$or" | "$nor" | "$expr")
+            }) =>
+        {
             let wrap = bson::doc! {"e": e.clone()};
             filter::parse(&bson::doc! {"e": d.clone()})
                 .map(|p| p.matches(&wrap))
@@ -667,8 +680,16 @@ pub fn apply(doc: &mut Document, spec: &UpdateSpec, cx: &ApplyCx<'_>) -> Result<
             *doc = n;
         }
         UpdateSpec::Ops(ops) => {
+            // Positional paths resolve against the document as it was
+            // before the update, as in MongoDB: `$set: {'a.$.x': 1,
+            // 'a.$.y': 2}` with a query on `a.x` sets both in the same
+            // element even though the first changes what the query saw.
+            let original = ops
+                .iter()
+                .any(|(_, p, _)| p.contains('$'))
+                .then(|| doc.clone());
             for (op, path, arg) in ops {
-                for p in expand(doc, path, cx)? {
+                for p in expand(original.as_ref().unwrap_or(&*doc), path, cx)? {
                     apply_one(doc, op, &p, arg, cx)?;
                 }
             }

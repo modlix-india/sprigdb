@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { json } from '../api/client';
 import { errorText } from '../api/errors';
+import { AskButton } from '../ai/AskButton';
 
 /** A recommendation, as the controller returns it. */
 export interface Recommendation {
@@ -279,9 +280,32 @@ export function InboxPage() {
       </table>
       {selected && detail.data && (
         <section className="card stack" aria-label={`Recommendation ${detail.data.id}`} data-testid="inbox-item">
-          <h2 style={{ margin: 0 }}>
-            {detail.data.id} · {detail.data.kind} · {detail.data.state}
-          </h2>
+          <div className="row">
+            <h2 style={{ margin: 0, flex: 1 }}>
+              {detail.data.id} · {detail.data.kind} · {detail.data.state}
+            </h2>
+            <AskButton
+              label="Explain"
+              role="dba"
+              testId="ask-explain-recommendation"
+              options={() => {
+                const d = detail.data;
+                const db = d.subject.db_name;
+                return {
+                  text: `Explain recommendation ${d.id} (${d.kind}): why SprigDB raised it, and what approving it would do.`,
+                  chips: [
+                    ...(db ? [{ id: `db:${db}`, kind: 'database' as const, label: db, ref: db }] : []),
+                    {
+                      id: `note:${d.id}`,
+                      kind: 'note' as const,
+                      label: `recommendation ${d.id}`,
+                      ref: `Recommendation ${d.id}, kind ${d.kind}, state ${d.state}, target ${d.target}.\nSummary: ${d.summary}\nAction: ${d.action.text}\nEvidence: ${JSON.stringify(d.evidence).slice(0, 4000)}`,
+                    },
+                  ],
+                };
+              }}
+            />
+          </div>
           <p>{detail.data.summary}</p>
           <pre className="mono">{detail.data.action.text}</pre>
           <dl>

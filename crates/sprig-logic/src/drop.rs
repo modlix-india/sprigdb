@@ -134,6 +134,43 @@ pub fn parse(sql: &str) -> Option<Result<DropStmt>> {
     }))
 }
 
+/// `ALTER TRIGGER [db.]name {DISABLE | ENABLE}` of a trigger on a stream
+/// or a queue: a disabled trigger's job ends and its position (a
+/// stream's consumer group, a queue's messages) stays; `ENABLE` resumes
+/// there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterTrigger {
+    /// The database, if the name was qualified.
+    pub db: Option<String>,
+    /// The trigger.
+    pub name: String,
+    /// `ENABLE` (or `DISABLE`).
+    pub enable: bool,
+}
+
+/// Parses `ALTER TRIGGER [db.]name DISABLE | ENABLE`; `None` for any
+/// other statement (MySQL has no `ALTER TRIGGER`, so the server's syntax
+/// error answers the rest).
+#[must_use]
+pub fn parse_alter_trigger(sql: &str) -> Option<AlterTrigger> {
+    let head: String = sql.chars().take(512).collect();
+    let w = words(&head);
+    if w.len() != 4 || !w[0].eq_ignore_ascii_case("alter") || !w[1].eq_ignore_ascii_case("trigger")
+    {
+        return None;
+    }
+    let enable = match w[3].to_ascii_lowercase().as_str() {
+        "enable" => true,
+        "disable" => false,
+        _ => return None,
+    };
+    let (db, name) = match w[2].rsplit_once('.') {
+        Some((d, n)) if !d.is_empty() && !n.is_empty() => (Some(d.to_owned()), n.to_owned()),
+        _ => (None, w[2].clone()),
+    };
+    Some(AlterTrigger { db, name, enable })
+}
+
 /// `SHOW DEPENDENTS OF {FUNCTION | PROCEDURE} [db.]name`: what
 /// [`dependents`] finds, one row each, as `DROP ... RESTRICT` would refuse
 /// it and what `CASCADE` would do.
@@ -458,6 +495,10 @@ pub fn routine_objects(m: &ModuleRow, versions: &[u64]) -> Vec<(String, String)>
         out.push(("PROCEDURE".to_owned(), entry));
     }
     if m.kind == "function" || m.kind == "procedure" {
+        out.push((
+            "PROCEDURE".to_owned(),
+            sprig_logic_compile::link::call_entry(m.module_id),
+        ));
         out.push(("PROCEDURE".to_owned(), m.name.clone()));
     }
     if m.kind == "function" {
@@ -536,6 +577,33 @@ pub async fn module_dropped(
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn parses_alter_trigger_state() {
+        assert_eq!(
+            parse_alter_trigger("ALTER TRIGGER shop.`sync_users` DISABLE;"),
+            Some(AlterTrigger {
+                db: Some("shop".into()),
+                name: "sync_users".into(),
+                enable: false,
+            })
+        );
+        assert_eq!(
+            parse_alter_trigger("alter trigger bill enable"),
+            Some(AlterTrigger {
+                db: None,
+                name: "bill".into(),
+                enable: true,
+            })
+        );
+        assert_eq!(parse_alter_trigger("ALTER TRIGGER g"), None);
+        assert_eq!(parse_alter_trigger("ALTER TRIGGER g RENAME TO h"), None);
+        assert_eq!(
+            parse_alter_trigger("ALTER INHERITED TRIGGER g DISABLE"),
+            None
+        );
+        assert_eq!(parse_alter_trigger("ALTER TABLE g DISABLE KEYS"), None);
+    }
 
     #[test]
     fn parses_logic_drops_only() {
@@ -669,7 +737,8 @@ mod tests {
         let o = routine_objects(&m, &[1, 2]);
         assert_eq!(o[0], ("PACKAGE".into(), "__sprig_l44_v1_lib".into()));
         assert_eq!(o[3], ("PROCEDURE".into(), "__sprig_l44_v2".into()));
-        assert_eq!(o[4], ("PROCEDURE".into(), "quote".into()));
-        assert_eq!(o[5], ("FUNCTION".into(), "quote".into()));
+        assert_eq!(o[4], ("PROCEDURE".into(), "__sprig_l44_call".into()));
+        assert_eq!(o[5], ("PROCEDURE".into(), "quote".into()));
+        assert_eq!(o[6], ("FUNCTION".into(), "quote".into()));
     }
 }

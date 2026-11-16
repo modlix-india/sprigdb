@@ -21,7 +21,7 @@ Every assistant follows the same rules:
 - What leaves SprigDB passes **one gate**: by default, schema and statistics only, never rows.
 - Every call is **audited and budgeted**, and you can see exactly what was sent.
 
-Nothing is sent anywhere until an operator configures a provider and a tenant administrator turns the assistants on. SprigDB doesn't host models: you use a provider you choose. Studio's chat panel isn't part of this release; the assistants are reached through the API described here, the [`ASK` statement](#ask-in-sql) and [`sprig ask`](sprig.md#sprig-ask).
+Nothing is sent anywhere until an operator configures a provider and a tenant administrator turns the assistants on. SprigDB doesn't host models: you use a provider you choose. You reach the assistants in [Studio](#in-studio-and-the-tui) (`Ctrl+I`) and the [TUI](sprig.md#the-assistant-pane) (`Ctrl-A`), through the API described here, the [`ASK` statement](#ask-in-sql) and [`sprig ask`](sprig.md#sprig-ask).
 
 Outside AI agents, such as Claude Code, can use the same tools as you through the [MCP server](mcp.md).
 
@@ -87,6 +87,16 @@ ALTER DATABASE shop SPRIG SET (ai.share_data = TRUE);
 - **Tool results are marked untrusted**, and the model is told that text inside them is data, never instructions. Text stored in your tables can't steer the assistant into doing anything, because the assistant can't change anything anyway.
 - **The administration assistant** never receives tenant data: names in its input are replaced by stable placeholders such as `table#kqzmfa`. SprigDB's own documentation reaches it as written, except for names the scrubber knows.
 
+## In Studio and the TUI
+
+**Studio.** `Ctrl+I` (`⌘+I`), or **Assistant** in the status bar, opens the assistant dock: the assistant (**Data**, **DBA**, and **Admin** for operators), the data badge (**Schema only** or **Data shared**), chips for what your question is about, the answer as it streams, proposal cards with **Review & run**, sources, **What was sent**, and 👍 and 👎. Buttons across Studio ask from where you are: **Explain this error**, **Why is this slow?**, **Describe this table**, **Explain** on a recommendation and **Ask for a query**; the command palette has **Ask the assistant: …**; and `Ctrl+I` in a query editor proposes a change to the query as a diff. Settings has the **Glossary** and **Digests** pages, and operator mode an **Incidents** page. See [Studio](studio.md#the-assistant).
+
+**The TUI.** `Ctrl-A` on a query tab opens the assistant in place of the results. A proposal runs after the usual confirm (`Enter`, then `y`); `e` puts it in the editor and `d` dismisses it. See [the sprig shell](sprig.md#the-assistant-pane).
+
+Both use the chat API below, as you: a statement runs only when you confirm it, through `POST /v1/ai/proposals/{id}:accept` with `"confirm": true`.
+
+![The assistant dock in Studio, beside a query tab, with a proposed index](../img/studio/assistant-dock.png)
+
 ## The chat API
 
 `POST /v1/ai/chat` runs one turn and streams it as NDJSON, one JSON object per line. Sign in as for any other API call (a Studio session token, Basic, or an API key).
@@ -116,6 +126,7 @@ The stream:
 | `thinking` | `text` | The model's reasoning, when the provider shows it |
 | `tool_start` | `id`, `name`, `input` | A tool call started |
 | `tool_end` | `id`, `name`, `ok`, `reduced` | It ended; `reduced` means rows or values were withheld or cut |
+| `result` | `id`, `name`, `result: {columns, rows, row_count, truncated}` | The rows of a query the data specialist ran (`run_query`), whole, for you. The model got only the columns and the row count unless `ai.share_data` is on |
 | `proposal` | `proposal: {id, kind, tool_use_id, body, checks?, generated?}` | Something for you to review: `sql`, `tile`, `glossary`, `recommendation` or `generate_rows`. It has not run. `checks` is what SprigDB found when it tried the proposal (see below); `generated` holds generated test rows, which only you get |
 | `usage` | `usage` | Tokens of one model call |
 | `sources` | `sources: [{kind, title, reference}]` | What the answer drew on: docs pages, tables, queries |
@@ -144,7 +155,7 @@ curl -s http://127.0.0.1:8080/v1/ai/proposals/0193…:accept \
 | `generate_rows` | Inserts the generated test rows, with `"confirm": true` |
 | `recommendation` | Files an `ai_dba_advice` item in the approvals inbox, at your tenant's level. It is advice only: approving it later acknowledges it and changes nothing |
 | `glossary` | Accepts the proposed term (tenant administrators, as for `POST /v1/ai/glossary/{term}:accept`) |
-| `tile` | Not yet: tiles come with dashboards |
+| `tile` | Adds the tile to a dashboard: `{dashboard}` (an id) or `{new_dashboard}` (a name) picks it; without either, the dashboard the assistant named (one of yours by that name, made when missing), else your own "My dashboard". `title`, `chart` and `sql` may be changed on the way; the tile is checked as any other, and you need the right to edit the dashboard (1227). The reply has `dashboard` and `tile`. See [Dashboards](dashboards.md) |
 
 You can act only on proposals in your own tenant conversations, MCP calls included. A proposal that was accepted can't be accepted again; one that failed can. The optional `note` (up to 500 characters) is kept with the outcome. Each outcome, `accepted`, `failed` or `dismissed`, is recorded as feedback, so the assistants learn which proposals your team takes, and is counted in `sprig_ai_proposals_total` and written to the tenant's audit stream as an `ai.proposal` event.
 
@@ -154,13 +165,15 @@ You can act only on proposals in your own tenant conversations, MCP calls includ
 
 The tools each assistant may call, all as you:
 
-- **Both:** search these docs; list databases and tables; describe a table (columns, indexes, definition); plans (`EXPLAIN FORMAT=JSON`, inside a read-only transaction for reads); column statistics over at most 100,000 rows; the approvals inbox.
+- **Both:** search these docs; list databases and tables; describe a table (columns, indexes, foreign keys in and out, definition); how a database's tables join (`relationships`: declared foreign keys, and joins inferred from a column such as `customer_id` or `customerId` that matches another table's single-column primary key by type); plans (`EXPLAIN FORMAT=JSON`, inside a read-only transaction for reads); column statistics over at most 100,000 rows; the approvals inbox.
 - **Data specialist:** run one `SELECT` in a read-only transaction that is rolled back, capped at its limit (1 to 1,000 rows) and at `studio.statement_timeout_ms`.
 - **DBA assistant:** workload fingerprints, indexes and automatic indexes, settings as they resolve for the tenant, a database or a table (`SHOW SPRIG SETTINGS … FOR`), shards and advisor runs, the row-level security tester (counts only), logic compiles (dry runs), SprigDB's decisions about your tenant, two schema checks, and the sensitive-data scanner (below).
 
 A tool call outside the assistant's role, or with invalid input, is refused; three refusals in one turn stop it with 39996.
 
-When `ai.share_data` is off, a query's rows are withheld and the assistant gets only its columns and row count. It then offers you the query as a proposal, so you can run it and see the rows yourself. An MCP client that isn't offered `propose_sql` is told to give you the query instead.
+When `ai.share_data` is off, a query's rows are withheld and the assistant gets only its columns and row count. In the chat you still see every row: the stream's `result` line carries the whole result, and the model is told you have it, so it describes the result's shape and never guesses values. In `ASK`, which shows no results, it offers you the query instead, and an MCP client that isn't offered `propose_sql` is told to give you the query.
+
+When a tool fails (an unknown table, a statement that doesn't parse), the error the model gets says what to try next, such as listing the tables or fixing the statement and running it again.
 
 ### Schema design and migrations
 
@@ -235,6 +248,37 @@ The assistant may add a hint per column, as a line such as `status: one_of, valu
 
 The rows go to you only: the proposal's `generated` holds the `INSERT` statements (500 rows each, at most 4 MiB in all), and the assistant gets a summary of how each column was filled, with counts but no value. Over MCP, `generated` is returned only when `ai.share_data` is on, because it may hold existing keys. Accepting the proposal runs the inserts as you.
 
+## The data specialist
+
+The data specialist answers questions about your data with queries it runs as you.
+
+- **It finds the data first.** It lists tables with `catalog`, describes each table it queries, and for two or more tables calls `relationships` and joins on what that returns, instead of guessing join columns.
+- **It uses your glossary.** When a question uses a glossary term, it uses the term's definition and SQL exactly and says so. When you rely on a term that isn't there, it may propose one (`propose_glossary`) for an administrator to accept.
+- **It runs one read-only `SELECT`.** `run_query` runs inside a read-only transaction that is rolled back, capped at its limit (1 to 1,000 rows, 100 by default) and at `studio.statement_timeout_ms`. A write, a locking read or `SELECT ... INTO` is refused before anything runs.
+- **Results.** You see every row in the chat. With `ai.share_data` off, the model gets the columns and the row count only, so it describes the result rather than quoting numbers; with sharing on it gets up to 200 rows and 64 KiB and can state the figures.
+- **Explaining data.** `describe`, `relationships` and `column_stats` (counts, nulls and distinct estimates; minimum, maximum and common values only with sharing on) let it explain a table without reading rows.
+- **Charts.** It proposes a tile with `propose_tile`: a title, the database, one `SELECT`, and a chart spec. The query is planned as you (`EXPLAIN`, in a read-only transaction) and never run; one that doesn't plan goes back to the assistant to fix. The chart spec's mark must fit its shelves by [Show Me](dashboards.md#show-me)'s rules; one that doesn't goes back to the assistant with the marks that fit. The proposal reaches you as a card, and the dashboard's ask bar shows it as a preview tile you can accept into the dashboard.
+
+A chart spec is JSON text:
+
+```json
+{"mark": "line",
+ "columns": [{"field": "month", "datePart": "month"}],
+ "rows": [{"field": "revenue", "agg": "sum"}],
+ "color": {"field": "region"}, "sort": {"by": "revenue", "dir": "desc"}, "top": 10}
+```
+
+| Key | Holds |
+|---|---|
+| `mark` | `bar`, `line`, `area`, `point`, `pie`, `donut`, `waterfall`, `histogram`, `box`, `heatmap`, `highlight-table`, `treemap`, `funnel`, `radar`, `sankey`, `kpi`, `gauge`, `bullet`, `gantt`, `text-table`, `pivot`, `map-point` or `map-filled` |
+| `columns`, `rows`, `detail`, `tooltip`, `filters` | Lists of fields: a column name, or `{field, agg?, datePart?, axis?, mark?}`; a filter is `{field, in}` |
+| `color`, `size`, `label`, `facet` | One field |
+| `agg` | `sum`, `avg`, `count`, `countd`, `min`, `max`, `median` or `none` |
+| `datePart` | `year`, `quarter`, `month`, `week`, `day`, `hour` or `exact` |
+| `sort`, `top`, `stack`, `format` | `{by, dir: asc\|desc}`, a positive number, `none`, `stack` or `percent`, and display formats |
+
+Every field must be a column the query returns (unless it selects `*`), and unknown keys, marks, aggregations and date parts are refused, so the assistant fixes the spec before you see it. It picks the mark with Show Me's rules of thumb: a date and measures, a line; one dimension and one measure, bars; two measures, points; one measure alone, a KPI; two dimensions and a measure, a heatmap; parts of a whole with five or fewer categories, a pie.
+
 ## ASK in SQL
 
 `ASK` puts a question to an assistant from any SQL client, on the MySQL and MariaDB ports or through `Sql.Query` over REST and gRPC. It returns the proposed query and an explanation, and **never runs the query**.
@@ -269,13 +313,14 @@ The answer has one row for each proposed statement:
 
 The query comes from the assistant's SQL proposals. When it made none, it comes from the SQL code blocks in its answer. A proposal holding several statements becomes several rows, so `query` always holds exactly one statement. Tile and glossary proposals aren't shown by `ASK`.
 
-To run an answer, copy the query, or use [`sprig ask --run`](sprig.md#sprig-ask). In the TUI, press Ctrl-K and type `?` and your question: the `ASK` statement goes into the editor, and you run it like any other statement.
+To run an answer, copy the query, or use [`sprig ask --run`](sprig.md#sprig-ask). In the TUI, press Ctrl-K and type `?` and your question: the `ASK` statement goes into the editor, and you run it like any other statement. For a conversation instead, use the TUI's [assistant pane](sprig.md#the-assistant-pane) (`Ctrl-A`).
 
 ## Conversations and what was sent
 
 `dba` and `data` conversations are kept in your tenant's catalog, and only you can read yours:
 
 - `GET /v1/ai/conversations` lists them, newest first (`?limit=`, 50 by default).
+- In Studio, the dock's history button lists them and **What was sent** shows the payloads; in the TUI, `?` on a proposal shows them.
 - `GET /v1/ai/conversations/{id}` returns one with every message: your messages, answers, tool calls, tool results as the model got them, proposals, and a note for each model call with the SHA-256 of the exact payload sent and, while it is kept, the payload itself. Add `?payloads=false` to leave the payloads out.
 
 **Retention.** Payloads are kept for `ai.audit_payload_days` (30); every hour the controller drops older ones and keeps their hashes. With 0, only hashes are kept. Each turn also writes one `ai.turn` event to the tenant's audit stream: the user, the role, the tools called and the payload hashes.
@@ -316,7 +361,41 @@ The glossary holds your tenant's business terms ("an active customer ordered in 
 | `POST /v1/ai/glossary/{term}:reject` | tenant administrators | Drops a proposal |
 | `POST /v1/ai/glossary/{term}:delete` | tenant administrators | Deletes a term |
 
-When an assistant proposes a term, it is filed as a proposal; it reaches prompts only once an administrator accepts it. Glossary terms are text your administrators wrote, so they are sent like schema, whatever `ai.share_data` says. Changes are audited as `ai.glossary` events.
+When an assistant proposes a term, it is filed as a proposal; it reaches prompts only once an administrator accepts it. In Studio, **Settings > Glossary** lists the terms and lets tenant administrators edit them and decide proposals. Glossary terms are text your administrators wrote, so they are sent like schema, whatever `ai.share_data` says. Changes are audited as `ai.glossary` events.
+
+## Digests
+
+A digest is a weekly or daily summary of what changed in your tenant, built from statistics only and worded by the data specialist's model. It is off by default.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `ai.digest` | `off` | `weekly` (Monday to Monday, UTC) or `daily` (each UTC day); `ai.enabled` must be on too |
+| `ai.digest_email` | `false` | Also email each digest to your approvals subscribers (delivery `immediate` or `digest`), through `approvals.smtp_url` |
+
+```sql
+ALTER TENANT SPRIG SET (ai.digest = 'weekly', ai.digest_email = TRUE);
+```
+
+The data center's leading controller looks at each tenant once an hour. When the last whole week (or day) has no digest yet, it builds one:
+
+1. **The facts, measured by SprigDB:**
+   - schema changes in the period (the object and the statement's verb, never its text);
+   - table sizes (approximate rows and bytes, over all shards), compared with the previous digest;
+   - the five statements that took the most time (their normalized text, runs, mean and longest time, failures);
+   - automatic indexes created, activated or dropped;
+   - your tenant's statements, failures and mean time against the period before;
+   - recommendations waiting for review (kind, target, age).
+
+   Notable movements are picked by fixed thresholds: statements up or down 25% (from 1,000), failures doubled (from 10), mean time up or down 25%, a table's rows or size up or down 20% (and by 10,000 rows or 64 MB).
+2. **No values.** The facts hold names, counts and sizes, never a row. With `ai.share_data` off, every literal left in a statement's text or a recommendation's target becomes `?` as well.
+3. **The words.** `ai.model.data` (else `ai.model.dba`) writes a short summary and what to look at, with no tools, within your daily budgets. The turn is stored as a conversation, so you can see exactly what was sent. Without a model, with a spent budget or when the call fails, the digest keeps the facts alone and says why.
+
+| Route | Does |
+|---|---|
+| `GET /v1/ai/digests?limit=` | Your tenant's digests, newest first, with their notable movements |
+| `GET /v1/ai/digests/{id}?payloads=true` | One digest: `body` (the facts, then the words), `facts`, the model, tokens used, and `sent`, the notes of what was sent to word it (`payloads=true` adds the exact payloads) |
+
+Both need `SPRIG_TENANT_ADMIN`, because a digest covers every database of the tenant. Each digest is written to the tenant's audit stream as an `ai.digest` event. In Studio, tenant administrators read them on **Settings > Digests**.
 
 ## Feedback
 
@@ -345,4 +424,4 @@ Errors found before a turn starts (39990, 39991, 39992, 39995, the role) are ans
 
 ## Metrics
 
-`sprig_ai_requests_total`, `sprig_ai_tokens_total`, `sprig_ai_turn_seconds`, `sprig_ai_tool_calls_total`, `sprig_ai_egress_reduced_total`, `sprig_ai_proposals_total`, `sprig_ai_feedback_total`, `sprig_ai_budget_stops_total` and `sprig_ai_payloads_purged_total`. See the [metrics reference](../reference/metrics.md).
+`sprig_ai_requests_total`, `sprig_ai_tokens_total`, `sprig_ai_turn_seconds`, `sprig_ai_tool_calls_total`, `sprig_ai_egress_reduced_total`, `sprig_ai_proposals_total`, `sprig_ai_feedback_total`, `sprig_ai_budget_stops_total`, `sprig_ai_payloads_purged_total`, `sprig_ai_digests_total` and `sprig_ai_digest_emails_total`. See the [metrics reference](../reference/metrics.md).

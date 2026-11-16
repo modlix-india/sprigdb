@@ -31,7 +31,8 @@ pub struct MoveRequest {
     /// `auto` (default) or `manual` (waits in `ready` for `:cutover`).
     #[serde(default)]
     pub cutover: Option<String>,
-    /// `full` (default), `off`, or `sample:<pct>`.
+    /// `full`, `off`, or `sample:<pct>`; without it, the tenant's
+    /// `mover.verify_mode` (`full` unless set).
     #[serde(default)]
     pub verify: Option<String>,
 }
@@ -77,17 +78,20 @@ impl AdminService {
             Some("manual") => CutoverMode::Manual,
             Some(o) => return Err(invalid(format!("cutover {o:?}: auto or manual"))),
         };
+        // Without `verify`, the worker uses the tenant's `mover.verify_mode`.
         let verify = match req.verify.as_deref() {
-            None | Some("full") => VerifyMode::Full,
-            Some("off") => VerifyMode::Off,
+            None => None,
+            Some("full") => Some(VerifyMode::Full),
+            Some("off") => Some(VerifyMode::Off),
             Some(s) => match s.strip_prefix("sample:").and_then(|p| p.parse::<u8>().ok()) {
-                Some(pct) => VerifyMode::Sample { pct },
+                Some(pct) => Some(VerifyMode::Sample { pct }),
                 None => return Err(invalid(format!("verify {s:?}: full, off or sample:<pct>"))),
             },
         };
-        let mut spec = JobSpec::move_tenant(tenant, from, to)
-            .with_cutover(cutover)
-            .with_verify(verify);
+        let mut spec = JobSpec::move_tenant(tenant, from, to).with_cutover(cutover);
+        if let Some(v) = verify {
+            spec = spec.with_verify(v);
+        }
         spec.requested_by = Some("operator".to_owned());
         let m = self.mover();
         let id = m.submit(spec).await?;

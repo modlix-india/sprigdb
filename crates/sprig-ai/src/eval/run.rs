@@ -358,13 +358,21 @@ pub async fn drive(
     judge: Option<&Judge>,
 ) -> (CaseRecord, Vec<Arc<str>>) {
     let reg = ToolRegistry::builtin();
-    let host = Arc::new(WorldHost::new(case.world.clone()));
+    let host = Arc::new(
+        WorldHost::new(case.world.clone())
+            .with_context(case.context.as_deref())
+            .with_expected(&case.calls),
+    );
     let rec = Arc::new(Recording::new(provider));
-    let agent = Agent::new(
+    let mut agent = Agent::new(
         Arc::clone(&rec) as Arc<dyn Provider>,
         Arc::clone(&reg),
         Arc::new(MemoryAudit::default()),
     );
+    if role.is_tenant() {
+        // As in the chat, which shows the user every result in full.
+        agent = agent.showing_results();
+    }
     let scrubber = (!role.is_tenant()).then(|| {
         let mut s = Scrubber::new(&SCRUB_KEY);
         for (k, n) in case.scrub_names() {
@@ -749,7 +757,7 @@ pub fn unquoted(answer: &str, tool_texts: &[String]) -> String {
     // that attributes them ("the comment says ...").
     let mut done = String::with_capacity(out.len());
     for line in out.lines() {
-        let attributed = attributes(line);
+        let says = attributes(line);
         let mut s = line.to_owned();
         for (open, close) in [('`', '`'), ('"', '"'), ('\u{201c}', '\u{201d}')] {
             let mut kept = String::with_capacity(s.len());
@@ -761,7 +769,7 @@ pub fn unquoted(answer: &str, tool_texts: &[String]) -> String {
                 };
                 let inner = &after[..j];
                 let drop = if open == '`' {
-                    whole(inner) || (attributed && quoted(inner))
+                    whole(inner) || (says && quoted(inner))
                 } else {
                     quoted(inner)
                 };

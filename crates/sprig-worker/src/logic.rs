@@ -23,6 +23,7 @@ use mysql_async::prelude::Queryable;
 use serde_json::{Value, json};
 use sprig_binlog::GtidPos;
 use sprig_catalog::CatalogLocator;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_cluster::registry::ClusterRegistry;
 use sprig_common::ids::{ClusterId, TenantId};
 use sprig_common::{Result, SprigCode, SprigError};
@@ -69,6 +70,17 @@ pub struct LogicEnv {
     /// names), for checking an after-commit trigger's events against its
     /// definer's row policies. `None`: a bound definer's events wait.
     pub gateways: Option<(Arc<dyn sprig_sinks::peer::SinkPeer>, Arc<dyn MetaStore>)>,
+}
+
+impl LogicEnv {
+    /// `rls` reading definers' tenant subtrees from the global tier, when
+    /// this environment has it.
+    fn with_tree(&self, rls: crate::sinks::RlsCatalogs) -> crate::sinks::RlsCatalogs {
+        match &self.gateways {
+            Some((_, global)) => rls.with_tree(Arc::clone(global), self.settings.clone()),
+            None => rls,
+        }
+    }
 }
 
 impl std::fmt::Debug for LogicEnv {
@@ -167,7 +179,7 @@ impl Clusters for RegistryClusters {
 
     async fn position(&self, cluster: &ClusterId) -> Result<GtidPos> {
         let pool = self.pools.writer(cluster).await?;
-        let mut c = pool.get_conn().await.map_err(|e| {
+        let mut c = pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::BackendUnavailable, format!("{cluster}: {e}"))
         })?;
         let p: Option<String> = c
@@ -286,7 +298,7 @@ impl DefinerGuard {
             return Ok(u);
         }
         let ep = self.locator.writer(self.tenant).await?;
-        let mut c = ep.pool.get_conn().await.map_err(|e| {
+        let mut c = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
         let schema = sprig_common::names::quote(ep.store.schema());
@@ -370,7 +382,11 @@ impl LogicTrigger {
             .map_err(|e| e.to_string())?;
         let store = LogicStore::new(ep.store.schema());
         let (b, module) = {
-            let mut c = ep.pool.get_conn().await.map_err(|e| e.to_string())?;
+            let mut c = ep
+                .pool
+                .get_conn_bounded()
+                .await
+                .map_err(|e| e.to_string())?;
             let b = store
                 .binding_by_id(&mut c, binding_id)
                 .await
@@ -439,6 +455,9 @@ impl LogicTrigger {
             tenant,
             module.module_id,
         ));
+        // The table's and the module's database's `logic.trigger_*` rows
+        // too, over the tenant's.
+        let scope = crate::settings::LogicScope::db(tenant, module.db_id).with_object(b.object_id);
         let apply = Arc::new(MariaApply {
             tenant,
             binding_id,
@@ -448,12 +467,12 @@ impl LogicTrigger {
                 pools: Arc::clone(&env.pools),
             }),
             versions,
-            budget: env.settings.trigger_budget_for(tenant),
+            budget: env.settings.trigger_budget_for(scope),
             // The code gets the changed rows its definer may see (each
             // event checked while the table's policies bind it).
             guard: match (
                 b.object_id,
-                crate::sinks::RlsCatalogs::new(Arc::clone(&env.locator)),
+                crate::sinks::RlsCatalogs::new(Arc::clone(&env.locator)).map(|r| env.with_tree(r)),
             ) {
                 (Some(object), Some(rls)) => Some(Arc::new(DefinerGuard {
                     rls,
@@ -491,7 +510,7 @@ impl LogicTrigger {
         // The tenant's own `logic.trigger_*` rows too; the
         // env's options (tests' overrides) when no settings mirror runs.
         let opts = if env.settings.live().is_some() {
-            env.settings.run_opts_for(tenant)
+            env.settings.run_opts_for(scope)
         } else {
             env.opts.clone()
         };
@@ -563,7 +582,7 @@ impl LogicTrigger {
 /// is gone or no longer active. `None` while both are active, or when the
 /// catalog can't be read (the next check tries again).
 async fn gone(pool: &Pool, store: &LogicStore, binding_id: u64, module_id: u64) -> Option<String> {
-    let mut c = pool.get_conn().await.ok()?;
+    let mut c = pool.get_conn_bounded().await.ok()?;
     let b = store.binding_by_id(&mut c, binding_id).await.ok()?;
     let m = store.module_by_id(&mut c, module_id).await.ok()?;
     match (b, m) {
@@ -580,7 +599,7 @@ async fn purge(env: &LogicEnv, tenant: TenantId, binding_id: u64, store: &LogicS
     let Ok(ep) = env.locator.writer(tenant).await else {
         return;
     };
-    if let Ok(mut c) = ep.pool.get_conn().await {
+    if let Ok(mut c) = ep.pool.get_conn_bounded().await {
         let _ = store.purge(&mut c, 14, 14, 10_000).await;
         let schemas: Vec<String> = c
             .exec(
@@ -661,6 +680,7 @@ impl JobHandler for LogicSchedule {
         // MariaDB (policy views and write triggers), not an internal
         // session's (every row).
         let rls = crate::sinks::RlsCatalogs::new(Arc::clone(&env.locator))
+            .map(|r| env.with_tree(r))
             .ok_or("the worker can't load row-level security catalogs")?;
         let guard = DefinerGuard {
             rls,
@@ -677,14 +697,26 @@ impl JobHandler for LogicSchedule {
         // their own, from the same pool) before the run's connections are
         // taken.
         let ctx = guard.context().await.map_err(|e| e.to_string())?;
-        let mut catalog = ep.pool.get_conn().await.map_err(|e| e.to_string())?;
-        let mut shard = pool.get_conn().await.map_err(|e| e.to_string())?;
+        let mut catalog = ep
+            .pool
+            .get_conn_bounded()
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut shard = pool.get_conn_bounded().await.map_err(|e| e.to_string())?;
         if let Some(x) = &ctx {
             shard
                 .exec_drop("SET @sprig_rls = ?", (x.as_str(),))
                 .await
                 .map_err(|e| e.to_string())?;
         }
+        // The module's database's `logic.job_budget_ms` too, over the
+        // tenant's.
+        let budget = match store.module_by_id(&mut catalog, module_id).await {
+            Ok(Some(m)) => env
+                .settings
+                .job_budget_for(crate::settings::LogicScope::db(tenant, m.db_id)),
+            _ => env.settings.job_budget_for(tenant),
+        };
         let end = sprig_logic::schedule::run(
             &mut catalog,
             &store,
@@ -692,7 +724,7 @@ impl JobHandler for LogicSchedule {
             &schema,
             module_id,
             run,
-            env.settings.job_budget_for(tenant),
+            budget,
         )
         .await;
         // The pooled sprig_ctl connection mustn't keep the context.

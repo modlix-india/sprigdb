@@ -32,6 +32,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::{ClusterId, ObjectId};
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_router::Topology as _;
@@ -442,7 +443,7 @@ impl PassSession {
         let cluster = ClusterId::new(&shard.1).map_err(|e| SprigError::internal(e.to_string()))?;
         let pool = svc.locator.ctl_pool(&cluster).await?;
         let mut c = pool
-            .get_conn()
+            .get_conn_bounded()
             .await
             .map_err(|e| SprigError::new(SprigCode::BackendUnavailable, format!("MariaDB: {e}")))?;
         Ok(
@@ -487,7 +488,7 @@ impl PassSession {
                 let cluster =
                     ClusterId::new(&a.shard.1).map_err(|e| SprigError::internal(e.to_string()))?;
                 let pool = svc.locator.ctl_pool(&cluster).await?;
-                let mut c = pool.get_conn().await.map_err(|e| {
+                let mut c = pool.get_conn_bounded().await.map_err(|e| {
                     SprigError::new(SprigCode::BackendUnavailable, format!("MariaDB: {e}"))
                 })?;
                 sprig_shard::lookup::admin::owner_shape(&mut c, &a.shard.0, &a.table).await

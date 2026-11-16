@@ -1346,6 +1346,8 @@ async fn lowered_limits_converge() {
         account: rig.target.user.clone(),
         found_rows: false,
         mariadb_caps: 0,
+        relay: None,
+        branch: false,
     };
     assert_eq!(rig.backends.pools().stats(&key).idle, 4);
     rig.settings.set(BackendSettings {
@@ -2154,6 +2156,12 @@ async fn galera_commits_answered_ok_are_kept() {
                                     unavailable += 1;
                                     tokio::time::sleep(Duration::from_millis(100)).await;
                                 }
+                                committed = false;
+                                break;
+                            }
+                            // A conflict the gateway answers itself (a
+                            // write's transaction check that failed).
+                            Err(e) if matches!(code(&e), 1213 | 1205 | 1020 | 1180) => {
                                 committed = false;
                                 break;
                             }

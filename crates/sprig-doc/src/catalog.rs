@@ -19,6 +19,7 @@ use std::collections::BTreeSet;
 use std::fmt::Debug;
 
 use async_trait::async_trait;
+use bson::Document;
 use sprig_proto_mongo::errors::{MongoError, code};
 
 use crate::engine::{Ns, SqlRunner, mongo_error};
@@ -31,6 +32,19 @@ use crate::sql::{ident, str_lit};
 pub trait DocCatalog: Send + Sync + Debug {
     /// The collection's metadata; `None` when it doesn't exist.
     async fn get(&self, sql: &mut dyn SqlRunner, ns: &Ns) -> Result<Option<CollMeta>, MongoError>;
+
+    /// The collection's default collation (`create`'s `collation`
+    /// option), as given; `None` without one or without the collection.
+    async fn collation(
+        &self,
+        sql: &mut dyn SqlRunner,
+        ns: &Ns,
+    ) -> Result<Option<Document>, MongoError> {
+        Ok(self
+            .get(sql, ns)
+            .await?
+            .and_then(|m| m.options.get_document("collation").ok().cloned()))
+    }
 
     /// Every collection of `db`, by name.
     async fn list(&self, sql: &mut dyn SqlRunner, db: &str) -> Result<Vec<CollMeta>, MongoError>;

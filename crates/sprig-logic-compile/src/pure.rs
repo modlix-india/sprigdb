@@ -105,6 +105,9 @@ struct St {
     conds: Vec<String>,
     end: Option<End>,
     done: bool,
+    /// Leaving the [`Stmt::Block`] with this label (an inlined helper's
+    /// `return`): the statements up to its end are skipped.
+    left: Option<u32>,
 }
 
 struct Cx<'a> {
@@ -398,7 +401,11 @@ impl Cx<'_> {
                     Ty::Int,
                 )
             }
-            Builtin::JsonNum | Builtin::JsonStr | Builtin::ToJson | Builtin::JsonLength => {
+            Builtin::JsonNum
+            | Builtin::JsonStr
+            | Builtin::ToJson
+            | Builtin::JsonLength
+            | Builtin::JsonText => {
                 return Err("JSON values".into());
             }
         })
@@ -409,7 +416,7 @@ impl Cx<'_> {
         for stmt in block {
             let mut next = Vec::new();
             for mut s in states {
-                if s.done {
+                if s.done || s.left.is_some() {
                     next.push(s);
                     continue;
                 }
@@ -437,6 +444,19 @@ impl Cx<'_> {
                         return Err("a loop".into());
                     }
                     Stmt::Db(_) => return Err("data access".into()),
+                    Stmt::Try { .. } | Stmt::Rethrow(_) => return Err("try/catch".into()),
+                    Stmt::Block(l, body) => {
+                        for mut t in self.block(body, s)? {
+                            if t.left == Some(*l) {
+                                t.left = None;
+                            }
+                            next.push(t);
+                        }
+                    }
+                    Stmt::Leave(l) => {
+                        s.left = Some(*l);
+                        next.push(s);
+                    }
                     Stmt::Emit(name, fields) => {
                         if s.end.is_none() {
                             let mut fs = Vec::with_capacity(fields.len());
@@ -487,6 +507,7 @@ pub fn paths(f: &Function, params: &[Option<Sql>]) -> std::result::Result<Paths,
         conds: Vec::new(),
         end: None,
         done: false,
+        left: None,
     };
     let states = cx.block(&f.body, start)?;
     let output_fields = f.event("output").is_some_and(|e| !e.fields.is_empty());

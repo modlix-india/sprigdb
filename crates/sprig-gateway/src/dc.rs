@@ -112,6 +112,18 @@ impl DcRegistry {
             .and_then(|kv| Record::<DcRecord>::decode(&kv.value).ok())
             .is_some_and(|r| r.body.state != "retired")
     }
+
+    /// The registered DCs that run gateways: not retired, not witnesses.
+    #[must_use]
+    pub fn full_dcs(&self) -> Vec<DcId> {
+        self.mirror
+            .entries()
+            .iter()
+            .filter_map(|kv| Record::<DcRecord>::decode(&kv.value).ok())
+            .filter(|r| r.body.state != "retired" && r.body.kind != "witness")
+            .map(|r| r.body.dc_id)
+            .collect()
+    }
 }
 
 /// The process's registry, installed when tenant services start (the

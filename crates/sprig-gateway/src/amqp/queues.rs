@@ -29,6 +29,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sprig_auth::authz::{Action, SessionGrants, Target};
 use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::ObjectKind;
 use sprig_catalog::version::VersionKind;
 use sprig_catalog::{CatalogLocator, Freshness, TenantCatalog};
@@ -124,7 +125,7 @@ impl GatewayMq {
             .writer(TenantId(tenant))
             .await
             .map_err(unavailable)?;
-        let mut conn = ep.pool.get_conn().await.map_err(unavailable)?;
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(unavailable)?;
         let schema = ep.store.schema().to_owned();
         sprig_queues::catalog::migrate(&mut conn, &schema)
             .await
@@ -309,7 +310,7 @@ impl MqCatalog for GatewayMq {
         let new_id = match &c {
             TopoChange::AddExchange(_) | TopoChange::AddQueue(_) => {
                 let ep = self.svc.locator.writer(tenant).await.map_err(unavailable)?;
-                let mut conn = ep.pool.get_conn().await.map_err(unavailable)?;
+                let mut conn = ep.pool.get_conn_bounded().await.map_err(unavailable)?;
                 ep.store
                     .next_object_id(&mut conn)
                     .await
@@ -480,7 +481,16 @@ impl MqCatalog for GatewayMq {
             owner_move_cooldown_ms: n(&qs::OWNER_MOVE_COOLDOWN_SECONDS).saturating_mul(1000),
             forward_feed: t(&qs::FORWARDER) == "feed",
             forward_fallback_ms: n(&qs::FORWARD_FALLBACK_MS),
+            vhost_idle_close_ms: n(&qs::VHOST_IDLE_CLOSE_SECONDS).saturating_mul(1000),
         }
+    }
+
+    /// The vhost's store handle (and its replica pools) goes; the next use
+    /// opens it again. The tenant's token key, grants and feed
+    /// subscription stay: they are per tenant and small.
+    async fn closed(&self, v: &VhostRef) {
+        self.stores.lock().await.remove(&(v.tenant, v.db_id));
+        lock(&self.maria).remove(&(v.tenant, v.db_id));
     }
 
     /// The tenant's cluster's `queue-forwarder-beats/` beat, in its home DC's

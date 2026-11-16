@@ -17,6 +17,7 @@ use sprig_common::{Result, SprigError};
 use super::ext::{CatalogExtension, SnapshotTx, module_of};
 use super::snapshot::{Loaded, TenantCatalog};
 use crate::migrate::{FORMAT_KEY, FormatState, Migrator, check_readable};
+use crate::pool_wait::Bounded as _;
 use crate::sql::{map_err, timed};
 use crate::store::CatalogLocator;
 use crate::version::VersionKind;
@@ -182,7 +183,7 @@ impl CatalogSource for MariaSource {
             Node::Writer => self.locator.writer(tenant).await?,
         };
         timed(self.timeout, "catalog versions", async {
-            let mut conn = ep.pool.get_conn().await.map_err(map_err)?;
+            let mut conn = ep.pool.get_conn_bounded().await.map_err(map_err)?;
             let v = ep.store.versions(&mut conn).await?;
             Ok(Some((v.catalog, v.auth)))
         })

@@ -150,6 +150,17 @@ impl Resolver {
             clusters.into_iter().collect();
     }
 
+    /// Adds `cluster` to the clusters whose redo rows the relay fence
+    /// recovers, or takes it out.
+    pub fn mark_fenced(&self, cluster: &ClusterId, fenced: bool) {
+        let mut set = self.fenced.write().unwrap_or_else(PoisonError::into_inner);
+        if fenced {
+            set.insert(cluster.clone());
+        } else {
+            set.remove(cluster);
+        }
+    }
+
     fn is_fenced(&self, cluster: &ClusterId) -> bool {
         self.fenced
             .read()

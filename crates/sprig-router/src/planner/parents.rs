@@ -15,9 +15,16 @@
 //!   then [`ViaParent::finish`] sends each row to its parent's shard.
 //!   Rows whose parent is nowhere go to the first shard without a hash,
 //!   so MariaDB's foreign-key check answers for them exactly as an
-//!   unsharded table would; with `foreign_key_checks = 0` they are
-//!   refused (there is no orphanage table for rows whose parent is
-//!   missing yet).
+//!   unsharded table would; with `foreign_key_checks = 0` they go to the
+//!   orphanage: the shard holding routing hash 0, with `_sprig_rk = 0`
+//!   (the executor first marks the key's `orphanage` present, so every
+//!   gateway's inserts into the parent take waiting rows along).
+//!
+//! **Adoption.** An insert into a table with such children
+//! ([`adoption`]) also moves, in the same transaction, the waiting rows
+//! whose foreign key names one of the new parent rows: on the hash-0 shard
+//! itself an `UPDATE` of their `_sprig_rk`, elsewhere an
+//! `INSERT … SELECT` from it on the same cluster and a `DELETE` there.
 //!
 //! The foreign-key check on the shard is what makes this safe: a child row
 //! can only commit next to its parent, so a parent that moved or vanished
@@ -234,6 +241,10 @@ pub(super) fn plan_insert(
         row_probe,
         fill_rk: fill,
         batch: cx.lookup_batch.max(1),
+        fk: link.fk.clone(),
+        fk_columns: (link.columns.clone(), link.parent_columns.clone()),
+        orphans: link.orphans,
+        orphanable: link.orphanable,
     })))
 }
 
@@ -281,11 +292,17 @@ impl ViaParent {
                 }
                 // MariaDB's foreign-key check answers for the row there.
                 None if fk_checks => placed.push((0, None)),
+                // The orphanage: the row waits where hash 0 lives, until a
+                // parent's insert takes it to the parent's shard.
+                None if self.orphans && self.orphanable && self.fill_rk => {
+                    let h = sprig_shard::fk::ORPHAN_RK;
+                    placed.push((self.group.route(h), Some(h)));
+                }
                 None => {
                     return reject(
                         Reason::InsertKey,
                         "a row whose parent doesn't exist, with foreign_key_checks = 0 \
-                         (rows without a parent aren't supported)",
+                         (the foreign key's orphanage couldn't be opened)",
                     );
                 }
             }
@@ -378,6 +395,155 @@ fn names_rk(ins: &Insert) -> bool {
 /// A foreign-key value as SQL text: a literal only (a number, a string, a
 /// hex or charset-introduced string, a signed number). `NULL` names no
 /// parent, so the row has no shard.
+/// A parent row's referenced value for adoption: its literal text, `None`
+/// for `NULL` (no child waits for it).
+///
+/// # Errors
+/// 39420 (`insert_key`) for a value that isn't a literal while children
+/// wait for parents.
+fn adopt_literal(e: &Expr) -> R<Option<String>> {
+    match e {
+        Expr::Value(v) if matches!(v.value, Value::Null) => Ok(None),
+        Expr::Nested(inner) => adopt_literal(inner),
+        _ => literal(e).map(Some).map_err(|_| {
+            Rejection::new(
+                Reason::InsertKey,
+                format!(
+                    "a parent row whose referenced value isn't a literal ({e}) while rows wait \
+                     for their parent"
+                ),
+            )
+        }),
+    }
+}
+
+/// The statements that take the rows waiting for an inserted parent row
+/// to its shard: `rows` are the new parent rows (their shard and routing
+/// hash); `value(row, column)` is a row's value of `column`. Per child in
+/// `entry.orphan_children` and per shard: on the hash-0 shard itself an
+/// `UPDATE` of `_sprig_rk`; on another shard of the same cluster an
+/// `INSERT … SELECT` from the hash-0 shard, then a `DELETE` there.
+///
+/// # Errors
+/// 39420 (`cross_cluster`) when the parent's shard and the hash-0 shard
+/// are on different clusters; (`insert_key`) for a value that isn't a
+/// literal, or a child whose columns are unknown.
+pub(super) fn adoption(
+    entry: &TableEntry,
+    rows: &[(usize, u64)],
+    value: &dyn Fn(usize, &str) -> Option<Expr>,
+) -> R<Vec<crate::plan::Target>> {
+    use crate::plan::Target;
+    let mut out = Vec::new();
+    if entry.orphan_children.is_empty() {
+        return Ok(out);
+    }
+    let q = |s: &str| format!("`{}`", s.replace('`', "``"));
+    let s0 = entry.group.route(sprig_shard::fk::ORPHAN_RK);
+    let Some(loc0) = entry.group.shards.get(s0) else {
+        return Ok(out);
+    };
+    for c in &entry.orphan_children {
+        // Per shard: (literal, hash) of each new parent row.
+        let mut by_shard: Vec<(usize, Vec<(String, u64)>)> = Vec::new();
+        for (r, &(shard, h)) in rows.iter().enumerate() {
+            let Some(v) = value(r, &c.parent_column) else {
+                return reject(
+                    Reason::InsertKey,
+                    format!(
+                        "an INSERT without {}, which rows of {} wait for",
+                        c.parent_column, c.table
+                    ),
+                );
+            };
+            let Some(lit) = adopt_literal(&v)? else {
+                continue;
+            };
+            match by_shard.iter_mut().find(|(s, _)| *s == shard) {
+                Some((_, l)) => l.push((lit, h)),
+                None => by_shard.push((shard, vec![(lit, h)])),
+            }
+        }
+        let fk = q(&c.column);
+        let rk = q(RK);
+        for (shard, list) in by_shard {
+            let Some(loc) = entry.group.shards.get(shard) else {
+                continue;
+            };
+            let in_list = list
+                .iter()
+                .map(|(l, _)| l.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let case = format!(
+                "CASE {fk} {} END",
+                list.iter()
+                    .map(|(l, h)| format!("WHEN {l} THEN {h}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            let waiting = format!(
+                "{fk} IN ({in_list}) AND {rk} = {}",
+                sprig_shard::fk::ORPHAN_RK
+            );
+            let from = format!("{}.{}", q(&loc0.schema), q(&c.table));
+            let target = |i: usize, l: &crate::topology::ShardLoc, sql: String| Target {
+                cluster: l.cluster.clone(),
+                shard: l.shard,
+                sql,
+                at: entry.group.at(i),
+            };
+            if shard == s0 {
+                out.push(target(
+                    s0,
+                    loc0,
+                    format!("UPDATE {from} SET {rk} = {case} WHERE {waiting}"),
+                ));
+                continue;
+            }
+            if loc.cluster != loc0.cluster {
+                return reject(
+                    Reason::CrossCluster,
+                    format!(
+                        "a parent row on another cluster than the rows of {} waiting for it",
+                        c.table
+                    ),
+                );
+            }
+            if c.columns.is_empty() {
+                return reject(
+                    Reason::InsertKey,
+                    format!(
+                        "rows of {} wait for this parent, but its columns are unknown",
+                        c.table
+                    ),
+                );
+            }
+            let cols = c
+                .columns
+                .iter()
+                .map(|x| q(x))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push(target(
+                shard,
+                loc,
+                format!(
+                    "INSERT INTO {}.{} ({cols}, {rk}) SELECT {cols}, {case} FROM {from} WHERE {waiting}",
+                    q(&loc.schema),
+                    q(&c.table)
+                ),
+            ));
+            out.push(target(
+                s0,
+                loc0,
+                format!("DELETE FROM {from} WHERE {waiting}"),
+            ));
+        }
+    }
+    Ok(out)
+}
+
 fn literal(e: &Expr) -> R<String> {
     let ok = match e {
         Expr::Value(v) => match &v.value {
@@ -720,6 +886,9 @@ mod tests {
         parents: HashMap<i64, i64>,
         fk_checks: bool,
         log: Vec<(u32, String)>,
+        /// What `open_orphanage` answers, and how often it was asked.
+        opens: bool,
+        opened: usize,
     }
 
     #[async_trait::async_trait]
@@ -768,9 +937,21 @@ mod tests {
         fn in_transaction(&self) -> bool {
             false
         }
+        async fn open_orphanage(&mut self, _v: &crate::plan::ViaParent) -> Result<bool> {
+            self.opened += 1;
+            Ok(self.opens)
+        }
     }
 
     async fn run(fk_checks: bool, sql: &str) -> (Result<Output>, Vec<(u32, String)>, Fake) {
+        run_opening(fk_checks, false, sql).await
+    }
+
+    async fn run_opening(
+        fk_checks: bool,
+        opens: bool,
+        sql: &str,
+    ) -> (Result<Output>, Vec<(u32, String)>, Fake) {
         let t = topo(4, true, 3);
         let plan = p_with(&t, sql);
         assert!(matches!(plan, Plan::ViaParent(_)), "{plan:?}");
@@ -781,6 +962,8 @@ mod tests {
                 .collect(),
             fk_checks,
             log: Vec::new(),
+            opens,
+            opened: 0,
         };
         let mut budget = Budget::mb(16);
         let out = execute(&plan, &mut f, &mut budget).await;
@@ -838,6 +1021,170 @@ mod tests {
             "{e}"
         );
         assert!(!log.iter().any(|(_, s)| s.starts_with("INSERT")));
+    }
+
+    /// With `foreign_key_checks = 0`, a row whose parent is missing opens
+    /// the key's orphanage and waits on the shard holding hash 0, with
+    /// `_sprig_rk = 0`; rows with a parent still follow it.
+    #[tokio::test]
+    async fn a_row_without_its_parent_waits_in_the_orphanage() {
+        let (out, log, f) = run_opening(
+            false,
+            true,
+            "INSERT INTO invoice_lines VALUES (99, 1, 'x'), (10, 1, 'a')",
+        )
+        .await;
+        out.unwrap();
+        assert_eq!(f.opened, 1);
+        let g = &f.t.table(DEF, "invoices").unwrap().group;
+        let s0 = &g.shards[g.route(0)];
+        let w = log
+            .iter()
+            .find(|(_, s)| s.starts_with("INSERT") && s.contains("(99, 1,"))
+            .unwrap();
+        assert_eq!(w.0, s0.shard, "{log:#?}");
+        assert!(w.1.contains("(99, 1, 'x', 0)"), "{}", w.1);
+        // Its parent is there: invoice 10's line follows it.
+        let h = g.hash_of(&KeyValue::Int(1)).unwrap();
+        assert!(
+            log.iter()
+                .any(|(_, s)| s.contains("(10, 1, 'a', ") && s.contains(&h.to_string())),
+            "{log:#?}"
+        );
+    }
+
+    /// A topology whose `invoice_lines` key has its orphanage open, on
+    /// `clusters`.
+    fn orphan_topo(clusters: &[&str]) -> StaticTopology {
+        use sprig_shard::fk::{FkAction, FkEnforcement, FkState, ForeignKey};
+        let cs: Vec<ClusterId> = clusters
+            .iter()
+            .map(|c| ClusterId::new(*c).unwrap())
+            .collect();
+        let spec = KeySpec::new(vec![sprig_shard::KeyClass::Numeric]).unwrap();
+        let g = CatalogGroup {
+            id: 3,
+            spec: spec.clone(),
+            map: Arc::new(
+                ShardMap::presplit(TenantId(7), GroupId(3), spec.digest, 4, &cs).unwrap(),
+            ),
+        };
+        let table = |object: u64, name: &str, key: Option<&str>, sql: &str, fk: Option<&str>| {
+            CatalogTable {
+                object,
+                db: 1,
+                default_schema: DEF.into(),
+                name: name.into(),
+                member: Membership::Sharded {
+                    group: 3,
+                    key_columns: key.map(|k| vec![k.to_owned()]),
+                    create_sql: Some(sql.into()),
+                    lookups: Vec::new(),
+                    fill_rk: true,
+                    parent_fk: fk.map(str::to_owned),
+                },
+            }
+        };
+        crate::topology::catalog::build_with_fks(
+            7,
+            &[g],
+            &[
+                table(1, "invoices", Some("cid"), INVOICES, None),
+                table(2, "invoice_lines", None, LINES, Some("fk_il_inv")),
+            ],
+            &[ForeignKey {
+                id: 1,
+                name: "fk_il_inv".into(),
+                child: 2,
+                child_columns: vec!["iid".into()],
+                parent: 1,
+                parent_columns: vec!["iid".into()],
+                on_delete: FkAction::Cascade,
+                on_update: FkAction::Restrict,
+                enforcement: FkEnforcement::Native,
+                child_lookup: None,
+                state: FkState::Enforced,
+                orphans: true,
+            }],
+        )
+    }
+
+    /// An insert into the parent takes the rows waiting for it to its own
+    /// shard, after its own rows, in the same write.
+    #[test]
+    fn a_parents_insert_adopts_its_waiting_rows() {
+        let t = orphan_topo(&["c1"]);
+        let e = t.table(DEF, "invoices").unwrap();
+        assert_eq!(e.orphan_children.len(), 1);
+        assert_eq!(e.orphan_children[0].columns, ["iid", "line_no", "sku"]);
+        let g = &e.group;
+        let s0 = g.route(0);
+        // Two parents: one whose shard is the hash-0 shard and one that
+        // isn't (customers are picked so).
+        let at = |cid: i64| g.shard_of(&KeyValue::Int(i128::from(cid))).unwrap();
+        let home = (1..200).find(|c| at(*c) == s0).unwrap();
+        let away = (1..200).find(|c| at(*c) != s0).unwrap();
+        let sql = format!(
+            "INSERT INTO invoices (iid, cid, total) VALUES (50, {home}, 1.5), (51, {away}, 2)"
+        );
+        let Plan::Write(w) = p_with(&t, &sql) else {
+            panic!("{:?}", p_with(&t, &sql))
+        };
+        let sqls: Vec<&str> = w.targets.iter().map(|x| x.sql.as_str()).collect();
+        let h_home = g.hash_of(&KeyValue::Int(i128::from(home))).unwrap();
+        let h_away = g.hash_of(&KeyValue::Int(i128::from(away))).unwrap();
+        let s0_schema = &g.shards[s0].schema;
+        let away_schema = &g.shards[at(away)].schema;
+        assert!(sqls[0].starts_with("INSERT INTO") && sqls[1].starts_with("INSERT INTO"));
+        assert!(
+            sqls.contains(&format!(
+                "UPDATE `{s0_schema}`.`invoice_lines` SET `_sprig_rk` = CASE `iid` WHEN 50 THEN \
+                 {h_home} END WHERE `iid` IN (50) AND `_sprig_rk` = 0"
+            )
+            .as_str()),
+            "{sqls:#?}"
+        );
+        assert!(
+            sqls.contains(&format!(
+                "INSERT INTO `{away_schema}`.`invoice_lines` (`iid`, `line_no`, `sku`, `_sprig_rk`) \
+                 SELECT `iid`, `line_no`, `sku`, CASE `iid` WHEN 51 THEN {h_away} END FROM \
+                 `{s0_schema}`.`invoice_lines` WHERE `iid` IN (51) AND `_sprig_rk` = 0"
+            )
+            .as_str()),
+            "{sqls:#?}"
+        );
+        let del = sqls.iter().position(|s| s.starts_with("DELETE")).unwrap();
+        let ins = sqls
+            .iter()
+            .position(|s| s.contains("SELECT `iid`"))
+            .unwrap();
+        assert!(ins < del, "copied before it is deleted");
+        // A parent on another cluster than the waiting rows: refused.
+        let t2 = orphan_topo(&["c1", "c2"]);
+        let g2 = &t2.table(DEF, "invoices").unwrap().group;
+        let s02 = g2.route(0);
+        let far = (1..400)
+            .find(|c| {
+                let i = g2.shard_of(&KeyValue::Int(i128::from(*c))).unwrap();
+                g2.shards[i].cluster != g2.shards[s02].cluster
+            })
+            .unwrap();
+        assert_eq!(
+            rejected(
+                &t2,
+                &format!("INSERT INTO invoices (iid, cid, total) VALUES (52, {far}, 1)")
+            ),
+            Reason::CrossCluster
+        );
+        // Without an open orphanage nothing more is planned.
+        let plain = topo(4, true, 3);
+        assert!(
+            plain
+                .table(DEF, "invoices")
+                .unwrap()
+                .orphan_children
+                .is_empty()
+        );
     }
 
     /// A parent with a public unique lookup on its referenced column is
@@ -901,6 +1248,7 @@ mod tests {
             origin: LookupOrigin::PrimaryKey,
             state: LookupState::Public,
             map: Some(Arc::new(lmap)),
+            rehashing: false,
         };
         let t = build(
             7,

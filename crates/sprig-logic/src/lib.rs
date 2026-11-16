@@ -36,9 +36,11 @@
     clippy::assigning_clones
 )]
 
+pub mod calls;
 pub mod catalog;
 pub mod cron;
 pub mod declare;
+pub mod dependent;
 pub mod deploy;
 pub mod drop;
 pub mod dropdb;

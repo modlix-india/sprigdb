@@ -731,7 +731,7 @@ fn format_bytes(v: &str) -> String {
 
 /// MySQL's `FORMAT_PICO_TIME(v)`: `%3d ps` below 1 ns, else two decimals
 /// and the largest unit up to days.
-fn format_pico_time(v: &str) -> String {
+pub(super) fn format_pico_time(v: &str) -> String {
     let units = [
         ("86400000000000000", "d"),
         ("3600000000000000", "h"),

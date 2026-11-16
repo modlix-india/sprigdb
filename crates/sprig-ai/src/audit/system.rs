@@ -28,6 +28,7 @@
 use async_trait::async_trait;
 use mysql_async::prelude::Queryable as _;
 use serde_json::Value;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::UserId;
 use sprig_common::names::{AI_SCHEMA, quote};
 use sprig_common::{Result, SprigCode, SprigError};
@@ -233,7 +234,7 @@ impl SystemAudit {
     async fn conn(&self) -> Result<mysql_async::Conn> {
         let mut conn = self
             .pool
-            .get_conn()
+            .get_conn_bounded()
             .await
             .map_err(|e| store_error("connecting", e))?;
         self.ready

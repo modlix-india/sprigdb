@@ -7,7 +7,7 @@ sidebar:
 
 # Full-text search
 
-A search index finds rows, documents or key-value entries by the words they contain, ranks them by relevance, and can highlight the matching words and count matches by category (facets). You create one on a SQL table, a MongoDB collection or a key-value namespace, and query it from SQL (`MATCH ... AGAINST` and `sprig_search()`), from MongoDB (`$text`, `$search` and `$searchMeta`) or over REST and gRPC.
+A search index finds rows, documents or key-value entries by the words they contain, ranks them by relevance, and can highlight the matching words and count matches by category (facets). You create one on a SQL table, a MongoDB collection or a key-value namespace, and query it from SQL (`MATCH ... AGAINST` and `sprig_search()`), from MongoDB (`$text`, `$search` and `$searchMeta`), from Redis (`FT.SEARCH` and `FT.AGGREGATE`) or over REST and gRPC.
 
 ## How search indexes are stored
 
@@ -58,7 +58,8 @@ CREATE SEARCH INDEX [IF NOT EXISTS] name ON [db.]object (
 -- field_spec, by model:
 column KIND [WITH (option = value, ...)]        -- a SQL table
 '$.path' KIND [WITH (...)]                       -- a collection's documents
-VALUE ['$.path'] KIND [WITH (...)]               -- a key-value namespace's values
+VALUE ['$.path'] KIND [WITH (...)]               -- a key-value namespace's string values
+VALUE FIELD 'name' [AS alias] KIND [WITH (...)]  -- a key-value namespace's hash fields
 
 ALTER SEARCH INDEX [db.]name [ON [db.]object] ADD FIELD field_spec;
 ALTER SEARCH INDEX [db.]name [ON [db.]object] DROP FIELD field;
@@ -94,6 +95,8 @@ A column of the wrong type fails with 39829. The same name may appear once per k
 | `filter` | boolean | `false` | Keep the value for filter clauses (`range`, `equals`) |
 | `sort` | boolean | `false` | Keep the value for sorting |
 | `facet` | boolean | `false` (`true` for `FACET`) | Count the value in facets |
+| `separator` | text | none | `KEYWORD` hash fields: split the value at this one character into several values, each trimmed; empty parts are dropped. Another kind fails with 39822 |
+| `case_sensitive` | boolean | `false` | Fields with a `separator`: keep each value's case. Otherwise each value is lowercased when indexed, and Redis `FT.*` queries lowercase their tags to match |
 
 ### Index options
 
@@ -102,6 +105,7 @@ A column of the wrong type fails with 39829. The same name may appear once per k
 | `analyzer` | text | `standard` | The analyzer of text fields that name none |
 | `partitions` | integer | `2` | Hash buckets of keys inside each copy, 1 to 64 |
 | `dynamic` | boolean | `false` | Index every string in the document (collections) |
+| `prefixes` | text, or a list of texts | none | Key-value namespaces: index only the keys that start with one of these, such as `('product:', 'item:')`. Without it, every key is indexed |
 
 ### Collections and key-value namespaces
 
@@ -115,11 +119,30 @@ CREATE SEARCH INDEX order_notes ON shop.events (
 );
 ```
 
-On a [key-value namespace](key-value.md), `VALUE '$.path'` indexes a path inside string values that hold JSON, and `VALUE` without a path indexes the whole value as text. Hashes and other non-string values aren't indexed.
+On a [key-value namespace](key-value.md), `VALUE '$.path'` indexes a path inside string values that hold JSON, and `VALUE` without a path indexes the whole value as text. Lists, sets and sorted sets aren't indexed; hashes are, by their fields (below).
 
 ```sql
 CREATE SEARCH INDEX note_text ON shop.sessions (VALUE '$.note' TEXT);
 ```
+
+### Hash fields
+
+`VALUE FIELD 'name'` indexes one field of the namespace's hashes, by its exact name. `AS alias` gives the field another name in queries; without it, the field's own name is used. Each hash is one document holding all its indexed fields, so one query can match words in one field, filter on another and sort by a third.
+
+```sql
+CREATE SEARCH INDEX product_hash ON shop.cache (
+  VALUE FIELD 'name' TEXT WITH (analyzer = 'english', boost = 2),
+  VALUE FIELD 'desc' AS 'description' TEXT WITH (analyzer = 'english_nostem'),
+  VALUE FIELD 'tags' KEYWORD WITH (separator = ',', filter = true, facet = true),
+  VALUE FIELD 'price' NUMBER WITH (filter = true, sort = true)
+) WITH (prefixes = ('product:'));
+```
+
+This index covers the hashes whose keys start with `product:`. A hash with `tags` set to `Outdoor, Shoes` is found by the tags `outdoor` and `shoes`; add `case_sensitive = true` to keep `Outdoor` and `Shoes`. A `NUMBER` field takes the number written in the hash field. A hash that lacks some of the indexed fields is indexed by the ones it has. Hash fields index hashes only: an index with both `VALUE` and `VALUE FIELD` fields indexes string keys by the first and hashes by the second.
+
+A copy of an index with hash fields follows the namespace's key and element tables. Before each commit it reads the keys that changed back from MariaDB and indexes what each holds then, so a change to one field of a hash re-indexes the whole hash, and a key that was deleted or now holds another type leaves the index. The counter `sprig_search_docs_indexed_total{op="reread"}` counts these reads.
+
+Redis's `FT.CREATE` makes indexes of exactly this form on the Redis databases' namespaces (`redis.db0` and so on). See [Search (`FT.*`)](../connect/redis.md#search-ft).
 
 ### Inspect indexes
 
@@ -188,6 +211,8 @@ An analyzer turns text into terms, both when a value is indexed and when a query
 |---|---|
 | `standard` | Splits on non-letters, drops tokens over 255 bytes, lowercases |
 | `english`, `french`, ... | `standard`, then the language's stop words and Snowball stemmer |
+| `english_nostem`, `french_nostem`, ... | `standard`, then the language's stop words; no stemming (Redis `NOSTEM`) |
+| `english_nostop`, `french_nostop`, ... | `standard`, then the language's stemmer; no stop words (Redis `STOPWORDS 0`) |
 | `keyword` | The whole value as one term |
 | `whitespace` | Splits on whitespace only |
 | `autocomplete` | `standard`, then edge n-grams of 2 to 15 characters at index time; plain `standard` for queries |
@@ -195,7 +220,7 @@ An analyzer turns text into terms, both when a value is indexed and when a query
 | `mysql_compat` | `standard`, English stop words, terms of 3 characters or more |
 | `mongo_<language>`, `mongo_none` | For MongoDB `text` indexes: `standard`, the language's stop words and stemmer, then accents folded |
 
-Languages: Arabic, Danish, Dutch, English, Finnish, French, German, Greek, Hungarian, Italian, Norwegian, Portuguese, Romanian, Russian, Spanish, Swedish, Tamil and Turkish, by English name or ISO 639-1 code (`en`, `fr`). Atlas names map onto these: `lucene.standard` and `lucene.simple` are `standard`, `lucene.english` is `english`, `lucene.keyword` is `keyword`. An unknown analyzer or language fails with 39828.
+Languages: Arabic, Danish, Dutch, English, Finnish, French, German, Greek, Hungarian, Italian, Norwegian, Portuguese, Romanian, Russian, Spanish, Swedish, Tamil and Turkish, by English name or ISO 639-1 code (`en`, `fr`), also before `_nostem` and `_nostop` (`fr_nostem`). Atlas names map onto these: `lucene.standard` and `lucene.simple` are `standard`, `lucene.english` is `english`, `lucene.keyword` is `keyword`. An unknown analyzer or language fails with 39828.
 
 Stop words and stemmers are Tantivy's. `mysql_compat` and the MongoDB analyzers therefore use Tantivy's stop-word lists, not InnoDB's or MongoDB's, and a query made only of words that one list has and the other doesn't can match differently.
 
@@ -429,6 +454,10 @@ MongoDB's `explain` covers `find` with `$text` and pipelines that start with `$s
 
 For hybrid ranking with vector search, use `$rankFusion` or `$scoreFusion`; see [Vectors](vectors.md#hybrid-search-with-rankfusion-and-scorefusion).
 
+## Query from Redis
+
+Redis clients create and query indexes on hashes with `FT.CREATE`, `FT.SEARCH`, `FT.AGGREGATE` and the other `FT.*` commands of Redis's query engine. See [Search (`FT.*`)](../connect/redis.md#search-ft).
+
 ## Query over REST and gRPC
 
 `Search.Query` searches any index by name:
@@ -449,7 +478,7 @@ curl -u 'acme.app:<password>' -H 'Content-Type: application/json' \
 | `filter` | string | none | One operator or an array of them, as JSON, applied as unscored filter clauses |
 | `facets` | string | none | Facets as `$searchMeta` takes them, as JSON |
 | `highlight` | array | none | Text fields to highlight |
-| `include_row` | boolean | `false` | Return each hit's row: a table's columns as JSON, a collection's document as Extended JSON, a namespace's value |
+| `include_row` | boolean | `false` | Return each hit's row: a table's columns as JSON, a collection's document as Extended JSON, a namespace's value (for a hash, an object of its fields) |
 | `limit` | integer | `10` | Hits per page, at most `search.max_window` |
 | `after` | string | none | The cursor from the previous page |
 | `consistency` | string | `search.default_consistency` | `stale_ok`, `own_writes` or `latest` |
@@ -534,7 +563,7 @@ Processes that hold copies read these environment variables:
 | `sprig_search_queries_total` | counter | `flavor`, `result` | Searches |
 | `sprig_search_query_duration_seconds` | histogram | `phase` | Search time |
 | `sprig_search_window_exceeded_total` | counter | none | Searches past `search.max_window` |
-| `sprig_search_docs_indexed_total` | counter | `op` | Changes indexed from the feed |
+| `sprig_search_docs_indexed_total` | counter | `op` | Documents applied to copies: `feed` (changes from the feed), `stale_skipped` (an older change skipped) or `reread` (keys of indexes with hash fields read back from MariaDB) |
 | `sprig_search_commits_total` | counter | none | Copy commits |
 | `sprig_search_seeds_total` | counter | `source` | Copies filled, from `mariadb`, `peer` or `snapshot` |
 | `sprig_search_remote_queries_total` | counter | `result` | Searches sent to copies on workers |
@@ -570,7 +599,8 @@ MongoDB clients get the same numbers. See [Errors](../reference/errors.md).
 - Facets from SQL; use `$searchMeta` or the REST `facets` field.
 - Per-query languages in `$text`, and `language_override`.
 - Accelerating `LIKE '%...%'` with `SUBSTRING` fields.
-- Indexing hash fields or other non-string values of key-value namespaces, and Redis `FT.*` commands.
+- Indexing lists, sets and sorted sets of key-value namespaces.
+- Some Redis `FT.*` commands and options; see [Search (`FT.*`)](../connect/redis.md#search-ft).
 
 ## Related
 

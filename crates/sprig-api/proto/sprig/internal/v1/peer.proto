@@ -20,6 +20,15 @@ service GatewayPeer {
   // gateway's DC: this gateway, in an allowed DC, decides it (credentials
   // stay in allowed DCs) and returns the principal only.
   rpc HandoffLogin(HandoffLoginRequest) returns (HandoffLoginReply);
+  // A change stream of a tenant homed in this gateway's DC, opened at a
+  // gateway of another DC: authenticated again and served here; the
+  // calling gateway relays the events to its client. The first message
+  // says whether the stream opened.
+  rpc WatchChanges(WatchChangesRequest) returns (stream WatchChangesEvent);
+  // A FOR EACH TENANT definition's change reaching the members this
+  // gateway's DC indexes: the declarer's gateway asks a gateway of every
+  // other DC.
+  rpc InheritedMembers(InheritedMembersRequest) returns (InheritedMembersReply);
 }
 
 message KillRequest {
@@ -107,4 +116,63 @@ message HandoffLoginReply {
   uint32 error_code = 3;
   string sql_state = 4;
   string error_message = 5;
+}
+
+message WatchChangesRequest {
+  // The client's Authorization header, verified again here.
+  string authorization = 1;
+  // The tenant for credentials that don't name it (x-sprig-tenant).
+  string tenant = 2;
+  // The client address the first gateway saw.
+  string client_addr = 3;
+  // The client's TLS, as the first gateway saw it: whether it used TLS,
+  // the server name it asked for, and a verified client certificate's
+  // subject and issuer (empty without one).
+  bool tls = 4;
+  string sni = 5;
+  string client_subject = 6;
+  string client_issuer = 7;
+  // What to watch (sprig.v1.WatchRequest's fields).
+  string database = 8;
+  repeated string objects = 9;
+  string start_after = 10;
+  uint64 start_at_hlc = 11;
+  bool full_document = 12;
+  // The space the subscriber reads in (Sprig-Space).
+  string space = 13;
+}
+
+message WatchChangesEvent {
+  // The first message: the stream opened.
+  bool opened = 1;
+  // An event or heartbeat (sprig.v1.ChangeEvent's fields).
+  string resume_token = 2;
+  uint64 commit_hlc = 3;
+  string object = 4;
+  string op = 5;
+  string key = 6;
+  string after = 7;
+  string update = 8;
+  string ddl = 9;
+  // The stream didn't open, or ended, with this error: the REST error
+  // body as JSON (sprig.v1's ErrorBody). The last message.
+  string error_json = 10;
+}
+
+message InheritedMembersRequest {
+  // "drop_sink": drop the members' instances of sink definition
+  // `object_id` of declarer `tenant_id`, with the connections only they
+  // use; "rollout": the members holding an instance of stream or queue
+  // definition `object_id` apply its sinks and derived state again.
+  string op = 1;
+  uint64 tenant_id = 2;
+  uint64 object_id = 3;
+  // The declarer's catalog version the change reached: the callee reads
+  // the declarer's catalog at least at it (0: as its cache has it).
+  uint64 catalog_version = 4;
+}
+
+message InheritedMembersReply {
+  // The member instances this DC reached.
+  uint64 instances = 1;
 }

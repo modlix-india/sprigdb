@@ -204,6 +204,13 @@ pub struct LookupIndex {
     pub state: LookupState,
     /// The automatic index behind an `auto` lookup.
     pub auto_index_id: Option<u64>,
+    /// The owner's group is being re-keyed and its rows may already carry
+    /// the new key's routing hashes while lookup rows still hold the old
+    /// ones (from the cutover until the re-key's rebuild repairs them):
+    /// reads don't route through it, claims keep raising 1062 whatever the
+    /// state, and an owner check reads every owner shard, since `owner_rk`
+    /// may name a hash the new map places elsewhere.
+    pub rehashing: bool,
 }
 
 /// `__sprig_lk_<owner>__<index>`, or `__sprig_lk_<lookup_id>` when that
@@ -557,13 +564,48 @@ async fn rehash_own(
     Ok(())
 }
 
+/// The owner check of [`claim`]: whether an owner row holds `v`, read
+/// `LOCK IN SHARE MODE` in Main on the shard of `rk0` and, while the
+/// owner's group is re-keyed (`l.rehashing`), on every other owner shard.
+async fn holder_exists(
+    t: &mut dyn LookupSessions,
+    p: &dyn LookupPlacement,
+    l: &LookupIndex,
+    v: &[KeyValueOwned],
+    rk0: u64,
+) -> Result<bool> {
+    let first = p.owner_target(RoutingHash(rk0))?;
+    let mut shards = vec![first.clone()];
+    if l.rehashing {
+        shards.extend(p.owner_shards().into_iter().filter(|o| *o != first));
+    }
+    for o in &shards {
+        let rows = t
+            .main(
+                o,
+                &format!(
+                    "SELECT 1 FROM {} WHERE {} LIMIT 1 LOCK IN SHARE MODE",
+                    fq(o, &l.owner_table),
+                    l.value_where()
+                ),
+                params(values(v)?),
+            )
+            .await?;
+        if !rows.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[allow(clippy::many_single_char_names)] // the algorithm's names: t, p, l, v
 /// Claims value `v` of lookup `l` for `owner` inside transaction `t`
 /// (`claim`). Call it before Main writes the owner row; claims
 /// of one statement go in `lookup_id` order.
 ///
 /// # Errors
-/// 1062 when another committed owner holds `v` (public lookups only);
+/// 1062 when another committed owner holds `v` (public lookups, and
+/// lookups a re-key rebuilds);
 /// 39461 when the lookup shard is unreachable; lock waits and Galera
 /// conflicts as MariaDB returns them (1205, 1213: retryable).
 pub async fn claim(
@@ -629,21 +671,15 @@ pub async fn claim(
         return Ok(ClaimResult::Reclaimed);
     }
     // The owner check: a locking read in Main on the holder's shard waits
-    // for an in-flight insert or delete of it.
-    let o = p.owner_target(RoutingHash(rk0))?;
-    let found = t
-        .main(
-            &o,
-            &format!(
-                "SELECT 1 FROM {} WHERE {} LIMIT 1 LOCK IN SHARE MODE",
-                fq(&o, &l.owner_table),
-                l.value_where()
-            ),
-            params(values(v)?),
-        )
-        .await?;
-    if !found.is_empty() {
-        if l.state == LookupState::Public {
+    // for an in-flight insert or delete of it. While the owner's group is
+    // re-keyed, `rk0` may be a hash of the old key, which the new map
+    // places on another shard: the holder's shard is read first, then
+    // every other owner shard.
+    let found = holder_exists(t, p, l, v, rk0).await?;
+    if found {
+        // A lookup being rebuilt for a re-key was complete when the re-key
+        // began, so a holder found now is a real duplicate.
+        if l.state == LookupState::Public || l.rehashing {
             return Err(duplicate(l, v));
         }
         return Ok(ClaimResult::ConflictCounted);
@@ -1085,6 +1121,7 @@ pub fn propose_auto_lookup(
         group: lookup_group,
         state: LookupState::Building,
         auto_index_id,
+        rehashing: false,
     }
 }
 

@@ -100,6 +100,90 @@ key! {
     LOOKUP_EVAL_MINUTES: u64 = "advisor.lookup_eval_minutes", 5, 1, 1440, "Period of the lookup proposals"
 }
 
+key! {
+    /// `advisor.interval_hours`: how often a tenant with table groups gets
+    /// a periodic run (the `Rekey` verdict).
+    INTERVAL_HOURS: f64 = "advisor.interval_hours", 24.0, 0, 8760, "Periodic runs"
+}
+key! {
+    /// `advisor.rekey_min_gain_pct`: points a re-keyed design must gain.
+    REKEY_MIN_GAIN_PCT: f64 = "advisor.rekey_min_gain_pct", 15.0, 0, 100, "Gain in points needed to re-key"
+}
+key! {
+    /// `advisor.rekey_sustain_runs`: consecutive periodic runs that must
+    /// propose the same re-key before it is applied.
+    REKEY_SUSTAIN_RUNS: u32 = "advisor.rekey_sustain_runs", 3, 1, 100, "Consecutive runs that must agree"
+}
+key! {
+    /// `advisor.rekey_cooldown_days`: the least time between two re-keys
+    /// of a group.
+    REKEY_COOLDOWN_DAYS: f64 = "advisor.rekey_cooldown_days", 14.0, 0, 3650, "Minimum days between re-keys of a group"
+}
+
+/// The periodic run's re-key rules for one tenant: `advisor.interval_hours`,
+/// `advisor.rekey_*`, and `migration.auto_size_limit_gb` (a larger group
+/// is only recommended).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RekeyAdvice {
+    /// `advisor.interval_hours` (zero: no periodic runs).
+    pub every: Duration,
+    /// `advisor.rekey_min_gain_pct`, in points.
+    pub min_gain_pts: f64,
+    /// `advisor.rekey_sustain_runs`.
+    pub sustain_runs: u32,
+    /// `advisor.rekey_cooldown_days`.
+    pub cooldown: Duration,
+    /// `migration.auto_size_limit_gb` in bytes.
+    pub size_limit_bytes: f64,
+}
+
+impl Default for RekeyAdvice {
+    fn default() -> Self {
+        Self {
+            every: hours(INTERVAL_HOURS.default),
+            min_gain_pts: REKEY_MIN_GAIN_PCT.default,
+            sustain_runs: REKEY_SUSTAIN_RUNS.default,
+            cooldown: hours(REKEY_COOLDOWN_DAYS.default * 24.0),
+            size_limit_bytes: 200.0 * 1024.0 * 1024.0 * 1024.0,
+        }
+    }
+}
+
+impl RekeyAdvice {
+    /// Resolves the `advisor.*` keys in `ctx` over the etcd scopes and,
+    /// when given, the tenant's own rows; `size_limit_gb` is
+    /// `migration.auto_size_limit_gb`, which the caller resolves.
+    #[must_use]
+    pub fn resolve_with(
+        s: &MemSettings<'_>,
+        rows: Option<&TenantSettings>,
+        ctx: &SettingCtx<'_>,
+        size_limit_gb: u64,
+    ) -> Self {
+        #[allow(clippy::cast_precision_loss)] // gigabytes
+        let gb = size_limit_gb as f64;
+        Self {
+            every: hours(layered(s, rows, &INTERVAL_HOURS, ctx)),
+            min_gain_pts: layered(s, rows, &REKEY_MIN_GAIN_PCT, ctx).clamp(0.0, 100.0),
+            sustain_runs: layered(s, rows, &REKEY_SUSTAIN_RUNS, ctx).max(1),
+            cooldown: hours(layered(s, rows, &REKEY_COOLDOWN_DAYS, ctx) * 24.0),
+            size_limit_bytes: gb * 1024.0 * 1024.0 * 1024.0,
+        }
+    }
+}
+
+/// One key over the etcd scopes and, when given, a tenant's own rows (for
+/// callers resolving a key this crate doesn't own).
+#[must_use]
+pub fn layered_key<T: sprig_settings::SettingValue>(
+    s: &MemSettings<'_>,
+    rows: Option<&TenantSettings>,
+    k: &Setting<T>,
+    ctx: &SettingCtx<'_>,
+) -> T {
+    layered(s, rows, k, ctx)
+}
+
 /// The advisor's lookup proposals for one tenant:
 /// `advisor.lookup_*` and `auto_index.lookup_scatter_pct`.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -293,6 +377,24 @@ mod lookup_tests {
     use sprig_settings::{Registry, Value};
 
     use super::*;
+
+    #[test]
+    fn periodic_rekey_keys_are_registered() {
+        let reg = Registry::global().unwrap();
+        for (k, d) in [
+            ("advisor.interval_hours", Value::Float(24.0)),
+            ("advisor.rekey_min_gain_pct", Value::Float(15.0)),
+            ("advisor.rekey_sustain_runs", Value::Int(3)),
+            ("advisor.rekey_cooldown_days", Value::Float(14.0)),
+        ] {
+            let def = reg.get(k).unwrap_or_else(|| panic!("{k} isn't registered"));
+            assert_eq!(def.default_value(), d, "{k}");
+        }
+        let r = RekeyAdvice::default();
+        assert_eq!(r.every, Duration::from_secs(24 * 3600));
+        assert_eq!(r.sustain_runs, 3);
+        assert_eq!(r.cooldown, Duration::from_secs(14 * 24 * 3600));
+    }
 
     #[test]
     fn lookup_thresholds_are_registered_and_judge_scatter() {

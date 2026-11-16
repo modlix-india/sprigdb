@@ -121,3 +121,11 @@ fn elem_match_documents_and_upsert_fields() {
     p.equality_fields(&mut f);
     assert_eq!(f.len(), 2, "a two-value $in pins nothing");
 }
+
+#[test]
+fn dbref_fields_are_fields_not_operators() {
+    let d = doc! {"members": [{"$ref": "foo", "$id": 7, "$db": "foo"}]};
+    assert!(m(doc! {"members": {"$elemMatch": {"$id": 7}}}, d.clone()));
+    assert!(!m(doc! {"members": {"$elemMatch": {"$id": 8}}}, d.clone()));
+    assert!(m(doc! {"members.$ref": "foo"}, d));
+}

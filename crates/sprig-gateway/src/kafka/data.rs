@@ -36,6 +36,7 @@ use futures::StreamExt;
 use mysql_async::Pool;
 use sprig_auth::authz::{Action, SessionGrants, Target};
 use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::ObjectKind;
 use sprig_catalog::{Freshness, TenantCatalog};
 use sprig_common::ids::{ObjectId, TenantId, UserId};
@@ -574,7 +575,7 @@ impl GatewayData {
     async fn conn(&self, tenant: u64) -> Result<mysql_async::Conn, TopicError> {
         self.pool(tenant)
             .await?
-            .get_conn()
+            .get_conn_bounded()
             .await
             .map_err(|e| kafka_err(&sprig_streams::maria::map_err(e)))
     }
@@ -631,7 +632,7 @@ impl GatewayData {
         tokio::spawn(async move {
             if let Ok(cluster) = svc.locator.cluster(TenantId(tenant)).await
                 && let Ok(pool) = svc.locator.ctl_pool(&cluster).await
-                && let Ok(mut c) = pool.get_conn().await
+                && let Ok(mut c) = pool.get_conn_bounded().await
             {
                 let _ = publish::expire_producers(&mut c, &schema, id).await;
             }
@@ -818,9 +819,12 @@ impl StreamData for GatewayData {
         let outbox = Self::outbox_schema(&r)?;
         let reader = Self::log_reader(&r, ticket.partition)?;
         let pn = Self::part(ticket.partition)?;
-        let mut c = self.conn(p.tenant_id).await?;
         let mut checked_outbox = !ticket.duplicate;
         loop {
+            // A connection per look, not across the waits: producers
+            // waiting for their offsets held the cluster's `sprig_ctl`
+            // pool (four) from everything else meanwhile.
+            let mut c = self.conn(p.tenant_id).await?;
             let at = publish::locate(
                 &mut c,
                 &reader.schema,
@@ -832,6 +836,7 @@ impl StreamData for GatewayData {
             )
             .await
             .map_err(|e| kafka_err(&e))?;
+            drop(c);
             checked_outbox = true;
             match at {
                 Located::Offset(o) => return Ok(i64::try_from(o).unwrap_or(i64::MAX)),
@@ -894,6 +899,8 @@ impl StreamData for GatewayData {
             .read(&mut c, r.def.id, Self::part(partition)?, Offset(from), lim)
             .await
             .map_err(|e| kafka_err(&e))?;
+        // Back before the row filter, which runs a statement of its own.
+        drop(c);
         let mut records: Vec<StoredRecord> = batch
             .records
             .into_iter()

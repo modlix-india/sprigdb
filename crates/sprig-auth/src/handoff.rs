@@ -117,6 +117,18 @@ pub struct HandoffStart {
     /// empty login name, and refuses it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_login: Option<TokenStart>,
+    /// An HTTP API key's check: the password is the whole key. A target
+    /// from before API key hand-offs reads a MySQL login with an empty
+    /// login name, and refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<ApiKeyStart>,
+}
+
+/// A handed-off API key check's request ([`HandoffStart::api_key`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiKeyStart {
+    /// The tenant the key names.
+    pub tenant: String,
 }
 
 /// A handed-off token login's request ([`HandoffStart::token_login`]).
@@ -190,6 +202,7 @@ impl HandoffStart {
             can_handle_expired_password: req.can_handle_expired_password,
             source_dc,
             token_login: None,
+            api_key: None,
         }
     }
 
@@ -210,6 +223,42 @@ impl HandoffStart {
                 protocol: req.protocol,
                 tenant: req.tenant.to_owned(),
             }),
+            api_key: None,
+        }
+    }
+
+    /// The start of a handed-off API key check (see [`Self::api_key`]).
+    pub(crate) fn of_api_key(
+        req: &crate::http::HttpRequest<'_>,
+        tenant: &str,
+        source_dc: DcId,
+    ) -> Self {
+        Self {
+            persona: "mysql".into(),
+            login_name: Vec::new(),
+            sni: None,
+            client_ip: req.client_ip,
+            tls: req.tls,
+            client_cert: req.client_cert,
+            client_subject: req.client_dn.map(|d| d.subject.clone()),
+            client_issuer: req.client_dn.map(|d| d.issuer.clone()),
+            can_handle_expired_password: false,
+            source_dc,
+            token_login: None,
+            api_key: Some(ApiKeyStart {
+                tenant: tenant.to_owned(),
+            }),
+        }
+    }
+
+    /// The client certificate's names, as the request had them.
+    fn client_dn(&self) -> Option<crate::mysql::ClientDn> {
+        match (&self.client_subject, &self.client_issuer) {
+            (Some(subject), Some(issuer)) => Some(crate::mysql::ClientDn {
+                subject: subject.clone(),
+                issuer: issuer.clone(),
+            }),
+            _ => None,
         }
     }
 }
@@ -250,6 +299,9 @@ pub async fn serve_handoff(
 ) -> HandoffResult {
     if let Some(t) = &start.token_login {
         return serve_token_handoff(svc, &start, t, password).await;
+    }
+    if let Some(k) = &start.api_key {
+        return serve_api_key_handoff(svc, &start, k, password).await;
     }
     let req = start.request();
     if !matches!(svc.route_of(&req, false).await, Route::Local) {
@@ -365,6 +417,70 @@ async fn serve_token_handoff(
             ev.reason = Some(denied.reason);
             svc.audit().emit(&ev);
             HandoffResult::Refused(denied.error)
+        }
+    }
+}
+
+/// The target side of an API key check's hand-off: refused (39301)
+/// outside the tenant's allowed DCs, else checked here as a request that
+/// arrived here would be (its own `auth.login_*` event and failure
+/// counts), and audited `auth.handoff` with mechanism `api_key`.
+async fn serve_api_key_handoff(
+    svc: &Arc<LoginService>,
+    start: &HandoffStart,
+    req: &ApiKeyStart,
+    key: &[u8],
+) -> HandoffResult {
+    if !matches!(svc.token_route(&req.tenant).await, Route::Local) {
+        metrics::counter!("sprig_auth_handoffs_total", "outcome" => "misrouted").increment(1);
+        return HandoffResult::Refused(ErrPacket::from_error(
+            Persona::MySql84,
+            &SprigError::new(
+                SprigCode::AuthUnavailable,
+                "this data center isn't allowed to decide the tenant's logins",
+            ),
+        ));
+    }
+    let Ok(key) = std::str::from_utf8(key) else {
+        return HandoffResult::Refused(ErrPacket::access_denied(
+            Persona::MySql84,
+            "",
+            &start.client_ip.to_string(),
+            true,
+        ));
+    };
+    let dn = start.client_dn();
+    let http = crate::http::HttpRequest {
+        authorization: None,
+        host: None,
+        sni: None,
+        tenant_header: None,
+        client_ip: start.client_ip,
+        tls: start.tls,
+        client_cert: start.client_cert,
+        client_dn: dn.as_ref(),
+    };
+    let decided = crate::http::HttpAuth::new(Arc::clone(svc))
+        .api_key_here(&http, key)
+        .await;
+    let mut ev = AuditEvent::new(audit::events::HANDOFF, "http", svc.clock().wall());
+    ev.client_ip = Some(start.client_ip);
+    ev.tenant_name = Some(req.tenant.clone());
+    ev.mechanism = Some("api_key");
+    ev.detail = Some(format!("from {}", start.source_dc));
+    match decided {
+        Ok(principal) => {
+            ev.tenant = principal.tenant;
+            ev.user = Some(principal.user.clone());
+            ev.user_id = principal.user_id;
+            svc.audit().emit(&ev);
+            HandoffResult::Accepted(Box::new(principal), None)
+        }
+        Err((reason, e)) => {
+            ev.outcome = "refused";
+            ev.reason = Some(reason);
+            svc.audit().emit(&ev);
+            HandoffResult::Refused(e.error)
         }
     }
 }
@@ -633,20 +749,60 @@ impl LoginService {
     /// Starts one MySQL login, routed by the tenant's residency: decided
     /// here, relayed to an allowed DC, or refused.
     pub async fn begin(self: &Arc<Self>, req: LoginRequest) -> ResidentLogin {
-        self.begin_as(req, false).await
+        self.begin_as(req, Begin::Mysql).await
     }
 
-    /// [`Self::begin`] for an HTTP login.
+    /// [`Self::begin`] for an HTTP login, and for the other front ends
+    /// whose client sends its password (Redis `AUTH`, AMQP `PLAIN`, Bolt).
     pub async fn begin_http(self: &Arc<Self>, req: LoginRequest) -> ResidentLogin {
-        self.begin_as(req, true).await
+        self.begin_as(req, Begin::Http).await
     }
 
-    async fn begin_as(self: &Arc<Self>, req: LoginRequest, http: bool) -> ResidentLogin {
-        match self.route_of(&req, http).await {
-            Route::Local => ResidentLogin::Local(Box::new(if http {
-                self.start_http(req).await
-            } else {
-                self.start(req).await
+    /// [`Self::begin`] for a Kafka `SASL/PLAIN` login.
+    pub async fn begin_kafka(self: &Arc<Self>, req: LoginRequest) -> ResidentLogin {
+        self.begin_as(req, Begin::Kafka).await
+    }
+
+    /// For an exchange that can't be handed to another DC (SCRAM, whose
+    /// verifier the client proves itself against, and a certificate
+    /// login without a password): `None` when this DC decides the login;
+    /// else its refusal, without loading anything of the tenant's
+    /// credentials: 39302 with `deny_remote_access`, otherwise 39301
+    /// naming the DCs that decide (the client connects to a gateway there,
+    /// or uses a mechanism that sends its password or token).
+    pub async fn local_only(&self, req: &LoginRequest, mechanism: &str) -> Option<SprigError> {
+        match self.route_of(req, true).await {
+            Route::Local => None,
+            Route::Deny => {
+                metrics::counter!("sprig_auth_handoffs_total", "outcome" => "denied").increment(1);
+                Some(SprigError::new(
+                    SprigCode::RemoteAccessDenied,
+                    "ER_SPRIG_REMOTE_ACCESS_DENIED: this tenant can't be reached from this data center",
+                ))
+            }
+            Route::HandOff(dcs) => {
+                metrics::counter!("sprig_auth_handoffs_total", "outcome" => "not_relayable")
+                    .increment(1);
+                let names: Vec<String> = dcs.iter().map(ToString::to_string).collect();
+                Some(SprigError::new(
+                    SprigCode::AuthUnavailable,
+                    format!(
+                        "ER_SPRIG_AUTH_UNAVAILABLE: this tenant's logins are decided in {}, and \
+                         {mechanism} can't be handed to another data center: connect to a gateway \
+                         there, or use a mechanism that sends the password or a token",
+                        names.join(", ")
+                    ),
+                ))
+            }
+        }
+    }
+
+    async fn begin_as(self: &Arc<Self>, req: LoginRequest, kind: Begin) -> ResidentLogin {
+        match self.route_of(&req, kind != Begin::Mysql).await {
+            Route::Local => ResidentLogin::Local(Box::new(match kind {
+                Begin::Mysql => self.start(req).await,
+                Begin::Http => self.start_http(req).await,
+                Begin::Kafka => self.start_kafka(req).await,
             })),
             Route::Deny => {
                 metrics::counter!("sprig_auth_handoffs_total", "outcome" => "denied").increment(1);
@@ -668,6 +824,15 @@ impl LoginService {
             }
         }
     }
+}
+
+/// The front end a resident login starts for (its user name limit, and
+/// the `protocol` of a login decided here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Begin {
+    Mysql,
+    Http,
+    Kafka,
 }
 
 /// A login refused because the tenant's residency denies remote access
@@ -750,6 +915,27 @@ impl ResidentLogin {
         match self {
             Self::Local(l) => l.check_clear_fast(password),
             _ => false,
+        }
+    }
+
+    /// A login decided here may take an issuer's token as its password on
+    /// `protocol` ([`MysqlLogin::allow_tokens`]); a handed-off one is
+    /// decided as the target's MySQL login, token included.
+    pub fn allow_tokens(&mut self, protocol: TokenProtocol) {
+        if let Self::Local(l) = self {
+            l.allow_tokens(protocol);
+        }
+    }
+
+    /// Why the login was refused, for the front ends that say so: the
+    /// local login's reason, `remote_access_denied` for 39302, none for a
+    /// handed-off login (the deciding DC's audit has it).
+    #[must_use]
+    pub fn refusal_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Local(l) => l.refusal_reason(),
+            Self::Relay(_) => None,
+            Self::Deny(_) => Some("remote_access_denied"),
         }
     }
 }

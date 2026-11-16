@@ -41,6 +41,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use sprig_catalog::cache::{CatalogSource, MariaSource, Node};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::{CatalogExtension, CatalogLocator, TenantCatalog};
 use sprig_common::ids::TenantId;
 use sprig_common::{CancellationToken, Result, SprigCode, SprigError};
@@ -631,7 +632,7 @@ impl CopyEnv for LiveEnv {
             e
         })?;
         let pool = self.pools.writer(&cluster).await?;
-        pool.get_conn().await.map_err(|e| {
+        pool.get_conn_bounded().await.map_err(|e| {
             let mut x = SprigError::new(SprigCode::BackendUnavailable, format!("{cluster}: {e}"));
             x.retryable = true;
             x

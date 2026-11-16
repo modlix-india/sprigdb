@@ -789,3 +789,87 @@ async fn lease_tags_are_released_through_any_gateway() {
     assert!(vc.get(&q, 10, 600_000).await.unwrap().is_empty());
     let _ = ca.close(200, "bye".into()).await;
 }
+
+/// Waits until neither gateway has the vhost open.
+async fn both_closed(gs: &[&Gw]) -> Duration {
+    let start = std::time::Instant::now();
+    while gs.iter().any(|g| g.engine.open_vhosts() > 0) {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "a vhost stayed open"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    start.elapsed()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_vhosts_close_on_both_ends_of_a_relay() {
+    let net = Net::new(QueueSettings {
+        vhost_idle_close_ms: 300,
+        ..quick()
+    });
+    let a = net.gateway(1).await;
+    let b = net.gateway(2).await;
+    let ca = connect(&a).await;
+    let cha = ca.create_channel().await.unwrap();
+    cha.confirm_select(ConfirmSelectOptions::default())
+        .await
+        .unwrap();
+    let q = common::uniq("idle-relay");
+    declare(&cha, &q).await;
+    let qid = queue_id(&net, &q).await;
+    // A consumer on b, publishes through a: whichever owns the queue,
+    // the other relays to it.
+    let cb = connect(&b).await;
+    let chb = cb.create_channel().await.unwrap();
+    let mut consumer = chb
+        .basic_consume(
+            q.as_str().into(),
+            "c".into(),
+            BasicConsumeOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+    assert!(publish_confirmed(&cha, &q, "one", "m1").await);
+    let d = tokio::time::timeout(Duration::from_secs(5), consumer.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    d.ack(BasicAckOptions::default()).await.unwrap();
+    let owner = net.holder(qid).expect("an owner");
+    // a's client leaves; b's consumer keeps the queue in use on both.
+    ca.close(200, "bye".into()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert_eq!(
+        a.engine.open_vhosts() + b.engine.open_vhosts(),
+        2,
+        "owner {owner}"
+    );
+    // b's consumer leaves too: both close and give the lease back.
+    cb.close(200, "bye".into()).await.unwrap();
+    let took = both_closed(&[&a, &b]).await;
+    eprintln!("both gateways closed the vhost {took:?} after the last client");
+    assert_eq!(net.holder(qid), None);
+    // Opened again by a publish on a, read on b.
+    let ca = connect(&a).await;
+    let cha = ca.create_channel().await.unwrap();
+    cha.confirm_select(ConfirmSelectOptions::default())
+        .await
+        .unwrap();
+    assert!(publish_confirmed(&cha, &q, "two", "m2").await);
+    let cb = connect(&b).await;
+    let chb = cb.create_channel().await.unwrap();
+    let m = chb
+        .basic_get(q.as_str().into(), BasicGetOptions::default())
+        .await
+        .unwrap()
+        .expect("the message published after the reopen");
+    assert_eq!(&*m.delivery.data, b"two");
+    m.ack(BasicAckOptions::default()).await.unwrap();
+    ca.close(200, "bye".into()).await.unwrap();
+    cb.close(200, "bye".into()).await.unwrap();
+    both_closed(&[&a, &b]).await;
+}

@@ -1076,8 +1076,8 @@ meaning = "The search query string or an operator in it is malformed, or a reque
 what_to_do = "Correct the query at the point the message names."
 
 [ER_SPRIG_SEARCH_UNSUPPORTED]
-meaning = "The search asks for a feature SprigDB doesn't offer, such as sorting by anything but score in `Search.Query`, `WITH QUERY EXPANSION`, or a MariaDB `FULLTEXT` index while `search.fulltext_ddl` is `reject`."
-what_to_do = "Use a supported form: `CREATE SEARCH INDEX` instead of `FULLTEXT`, and sort results in the application if needed."
+meaning = "The search asks for a feature SprigDB doesn't offer, such as sorting by anything but score in `Search.Query`, `WITH QUERY EXPANSION`, a MariaDB `FULLTEXT` index while `search.fulltext_ddl` is `reject`, or, over Redis, an `FT.*` option SprigDB doesn't offer: `ON JSON`, `GEO`, `VECTOR` or `GEOSHAPE` fields, `PHONETIC`, custom `STOPWORDS`, an unknown `LANGUAGE`, `FILTER` or `TEMPORARY` in `FT.CREATE`, `HIGHLIGHT`, `SUMMARIZE` or `GEOFILTER` in `FT.SEARCH`, or `WITHCURSOR` in `FT.AGGREGATE`. Redis clients get an error starting `SPRIG SEARCH_UNSUPPORTED 39823`."
+what_to_do = "Use a supported form: `CREATE SEARCH INDEX` instead of `FULLTEXT`, and sort results in the application if needed. With `FT.*`, drop the option the message names: index hashes with `ON HASH` and `TEXT`, `TAG` or `NUMERIC` fields, page with `LIMIT` instead of a cursor, and highlight in the application. A retry won't help."
 
 [ER_SPRIG_SEARCH_INDEX_NOT_READY]
 meaning = "The search index is still being built, so it can't answer yet."
@@ -1168,8 +1168,8 @@ meaning = "A Lua scripting feature SprigDB doesn't offer, such as `SCRIPT DEBUG`
 what_to_do = "Debug scripts outside SprigDB, and send scripts as Lua source."
 
 [ER_SPRIG_REDIS_RESTRICTED]
-meaning = "A Redis administrative command SprigDB doesn't offer, such as `CONFIG SET`, `ACL SETUSER`, some `CLIENT` subcommands, or a command SprigDB doesn't list. Clients get an error starting `SPRIG REDIS_RESTRICTED 39842`."
-what_to_do = "Manage SprigDB through SQL, the Admin API or `sprigctl` instead. A retry won't help."
+meaning = "A Redis administrative command SprigDB doesn't offer, such as `CONFIG SET`, `ACL SETUSER`, some `CLIENT` subcommands, `MODULE`, or a command SprigDB doesn't list, including the `FT.*` commands outside the ten it answers (`FT.PROFILE`, `FT.CURSOR`, `FT.CONFIG`, aliases, spelling, dictionaries, synonyms and suggestions). Clients get an error starting `SPRIG REDIS_RESTRICTED 39842`."
+what_to_do = "Manage SprigDB through SQL, the Admin API or `sprigctl` instead. For those `FT.*` commands, change the client: page with `FT.SEARCH ... LIMIT` instead of `FT.CURSOR`, use the index's own name instead of an alias, and turn off a client library's check for a search module. A retry won't help."
 
 [ER_SPRIG_REDIS_MULTI_TOO_LARGE]
 meaning = "A `MULTI` block queued more commands than `redis.max_multi_commands`. The command that went over the limit gets this error, and `EXEC` then fails with `EXECABORT`."

@@ -109,6 +109,50 @@ async fn create_and_match_basics() {
     }
 }
 
+/// `graph.traversal_tier = gateway`: the same answers with no recursive
+/// CTE, each level read hop by hop.
+#[tokio::test]
+async fn the_gateway_tier_expands_hop_by_hop_without_ctes() {
+    let text = "MATCH (a:Person {email: $email})-[:KNOWS*1..2]->(f:Person)-[:BOUGHT]->(p:Product)
+                WHERE NOT (a)-[:BOUGHT]->(p) AND f <> a
+                RETURN p.name AS product, count(DISTINCT f) AS buyers
+                ORDER BY buyers DESC, product LIMIT 5";
+    let p: Params = [("email".to_owned(), Value::str("alice@example.com"))]
+        .into_iter()
+        .collect();
+    for shards in [1, 4] {
+        let mut by_tier = Vec::new();
+        for tier in [super::TraversalTier::Auto, super::TraversalTier::Gateway] {
+            let mut s = social(shards).await;
+            let b = Budgets {
+                tier,
+                ..Budgets::default()
+            };
+            let o = crate::execute(&mut s, text, &p, &b).await.unwrap();
+            by_tier.push((show(&o), s.stats().cte_queries));
+        }
+        assert_eq!(by_tier[0].0, ["Desk|2", "Pen|1"]);
+        assert_eq!(by_tier[1].0, by_tier[0].0, "{shards} shards");
+        assert!(by_tier[0].1 >= 1, "{shards} shards: auto bursts");
+        assert_eq!(
+            by_tier[1].1, 0,
+            "{shards} shards: no CTE in the gateway tier"
+        );
+    }
+    let mut s = social(4).await;
+    let b = Budgets {
+        tier: super::TraversalTier::Gateway,
+        ..Budgets::default()
+    };
+    let o = crate::execute(&mut s, &format!("PROFILE {text}"), &p, &b)
+        .await
+        .unwrap();
+    assert!(
+        o.plan.unwrap().iter().any(|l| l.contains("tier gateway")),
+        "the plan names the tier"
+    );
+}
+
 #[tokio::test]
 async fn the_worked_example_on_one_and_four_shards() {
     let text = "MATCH (a:Person {email: $email})-[:KNOWS*1..2]->(f:Person)-[:BOUGHT]->(p:Product)

@@ -96,9 +96,18 @@ fn text_spec(def: &IndexDef) -> Document {
         let w = f.boost.round() as i32;
         weights.insert(f.name.clone(), w);
     }
+    let key = def.mongo_text_key().map_or_else(
+        || doc! {"_fts": "text", "_ftsx": 1},
+        |parts| {
+            parts
+                .into_iter()
+                .map(|(k, v)| (k, Bson::try_from(v).unwrap_or(Bson::Int32(1))))
+                .collect()
+        },
+    );
     doc! {
         "v": 2,
-        "key": {"_fts": "text", "_ftsx": 1},
+        "key": key,
         "name": def.name.clone(),
         "weights": weights,
         "default_language": language_of(def),
@@ -471,8 +480,15 @@ impl TextSearch for DocSearch {
                     .unwrap_or_default();
                 let name = spec.get_str("name").map_or_else(
                     |_| {
-                        key.keys()
-                            .map(|k| format!("{k}_text"))
+                        // MongoDB's default name: `title_text_age_1`.
+                        key.iter()
+                            .map(|(k, v)| match v {
+                                Bson::String(s) => format!("{k}_{s}"),
+                                Bson::Int32(i) => format!("{k}_{i}"),
+                                Bson::Int64(i) => format!("{k}_{i}"),
+                                Bson::Double(f) => format!("{k}_{f}"),
+                                other => format!("{k}_{other}"),
+                            })
                             .collect::<Vec<_>>()
                             .join("_")
                     },

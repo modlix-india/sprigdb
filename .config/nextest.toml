@@ -99,6 +99,7 @@ binary_id(sprig-controller::live_cluster_failover_bins)
 | binary_id(sprig-controller::live_residency_bins)
 | binary_id(sprig-controller::live_standby_bins)
 | binary_id(sprig-controller::live_node_rebuild)
+| binary_id(sprig-gateway::two_dc_bins)
 '''
 test-group = 'serial-controller-bins'
 
@@ -246,7 +247,8 @@ test-group = 'binlog-scratch'
 # Tests that need a setup the job doesn't build. Each says which job covers
 # it; none does yet, so they run only by hand. Keep this list in step with
 # .github/workflows/ci.yml's integration job.
-# - The real-binary multi-DC tests (*_bins, live_node_rebuild): each starts
+# - The real-binary multi-DC tests (*_bins, including the gateway's
+#   two_dc_bins, and live_node_rebuild): each starts
 #   its own etcd, MariaDB containers and 10 to 13 sprigdb processes for 2 to
 #   3 minutes, over half an hour together. Covered nowhere.
 # - ask_live: a data assistant pointing at a stub model provider. Covered
@@ -288,6 +290,7 @@ not (
   | binary_id(sprig-controller::live_residency_bins)
   | binary_id(sprig-controller::live_standby_bins)
   | binary_id(sprig-controller::live_node_rebuild)
+  | binary_id(sprig-gateway::two_dc_bins)
   | binary_id(sprig-gateway::ask_live)
   | binary_id(sprig-gateway::operators_live)
   | binary_id(sprig-gateway::large_statement_live)

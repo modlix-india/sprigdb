@@ -26,6 +26,7 @@ pub mod lifecycle;
 pub mod mq;
 pub mod orphan_sinks;
 pub mod outbox;
+pub mod remote;
 pub mod sinks;
 pub mod streams;
 pub mod triggers;
@@ -35,6 +36,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sprig_catalog::cache::Freshness;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::version::VersionKind;
 use sprig_catalog::{CatalogLocator, TenantCatalog};
 use sprig_common::ids::TenantId;
@@ -249,7 +251,7 @@ pub fn unavailable(what: impl std::fmt::Display) -> SprigError {
 /// The catalog's.
 pub async fn migrate(svc: &TenantServices, tenant: TenantId) -> Result<()> {
     let ep = svc.locator.writer(tenant).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(|e| {
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
         SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
     })?;
     sprig_inherit::msg::store::migrate(&mut conn, ep.store.schema()).await

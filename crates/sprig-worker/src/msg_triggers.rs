@@ -31,6 +31,7 @@ use serde_json::{Value, json};
 use sprig_api::proto::logic_peer::RunTriggerRequest;
 use sprig_api::proto::logic_peer::logic_peer_client::LogicPeerClient;
 use sprig_catalog::CatalogLocator;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::TenantId;
 use sprig_common::names::quote;
 use sprig_common::{Result, SprigCode, SprigError};
@@ -48,6 +49,7 @@ use sprig_streams::{PartitionNo, StreamId, StreamState, StreamsStore};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 use crate::runtime::{JobCtx, JobHandler};
+use crate::settings::LogicScope;
 
 /// How long one run may take before the peer call gives up (the run's
 /// own budget is `logic.trigger_budget_ms`; this is the transport's).
@@ -376,7 +378,7 @@ struct RunLog {
 
 impl RunLog {
     async fn write(&self, level: &str, message: &str) {
-        let Ok(mut c) = self.catalog.get_conn().await else {
+        let Ok(mut c) = self.catalog.get_conn_bounded().await else {
             return;
         };
         let _ = LogicStore::new(&self.schema)
@@ -447,7 +449,7 @@ impl MsgEnv {
     async fn load(&self, tenant: TenantId, binding: u64) -> Result<Option<Loaded>> {
         let ep = self.locator.writer(tenant).await?;
         let schema = ep.store.schema().to_owned();
-        let mut c = ep.pool.get_conn().await.map_err(|e| {
+        let mut c = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
         let Some(source) = messages::source(&mut c, &schema, binding).await? else {
@@ -527,7 +529,7 @@ impl MsgEnv {
     /// trigger's source).
     async fn definition_active(&self, declarer: TenantId, object: u64) -> Result<bool> {
         let ep = self.locator.writer(declarer).await?;
-        let mut c = ep.pool.get_conn().await.map_err(|e| {
+        let mut c = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
         let r: std::result::Result<Option<String>, _> = c
@@ -543,26 +545,30 @@ impl MsgEnv {
         Ok(matches!(r, Ok(Some(s)) if s == "active"))
     }
 
-    /// The tenant's own `logic.trigger_*` rows over the etcd scopes, as
-    /// after-commit triggers read them; the
-    /// worker-wide options when the worker reads no tenant rows (tests).
-    fn opts_for(&self, tenant: TenantId) -> RunOpts {
+    /// The stream's or queue's database's and the tenant's own
+    /// `logic.trigger_*` rows over the etcd scopes, as after-commit
+    /// triggers read them; the worker-wide options when the worker reads
+    /// no tenant rows (tests).
+    fn opts_for(&self, tenant: TenantId, l: &Loaded) -> RunOpts {
         if self.settings.tenant_scopes().is_some() {
-            self.settings.run_opts_for(tenant)
+            self.settings
+                .run_opts_for(LogicScope::db(tenant, l.source.db_id))
         } else {
             self.opts.clone()
         }
     }
 
     fn template(&self, tenant: TenantId, l: &Loaded) -> Template {
-        let budget = self.settings.trigger_budget_for(tenant);
+        let budget = self
+            .settings
+            .trigger_budget_for(LogicScope::db(tenant, l.source.db_id));
         Template {
             req: RunRequest {
                 tenant: tenant.0,
                 source: l.source.clone(),
                 version: l.version,
                 record: None,
-                max_attempts: self.opts_for(tenant).current().max_attempts,
+                max_attempts: self.opts_for(tenant, l).current().max_attempts,
                 lease_ms: 30_000.max(u64::try_from(budget.as_millis()).unwrap_or(30_000) + 5_000),
                 budget_ms: u64::try_from(budget.as_millis()).unwrap_or(30_000),
                 instance_tenant: 0,
@@ -656,7 +662,7 @@ async fn replay_due(l: &Loaded, t: &Template, gw: &dyn Gateway) -> Result<u64> {
     // takes the gateway's time and the trigger's budget.
     let store = LogicStore::new(&l.schema);
     let rows = {
-        let mut c = l.catalog.get_conn().await.map_err(db_err)?;
+        let mut c = l.catalog.get_conn_bounded().await.map_err(db_err)?;
         store
             .dead_letters(&mut c, Some(l.source.binding_id), Some("replaying"), 100)
             .await?
@@ -668,7 +674,7 @@ async fn replay_due(l: &Loaded, t: &Template, gw: &dyn Gateway) -> Result<u64> {
     let mut n = 0;
     for r in rows {
         {
-            let mut c = l.catalog.get_conn().await.map_err(db_err)?;
+            let mut c = l.catalog.get_conn_bounded().await.map_err(db_err)?;
             offsets::init_positions(&mut c, &l.schema, &group, r.dl_id, &[(0, 0)]).await?;
         }
         let mut req = t.req.clone();
@@ -679,7 +685,7 @@ async fn replay_due(l: &Loaded, t: &Template, gw: &dyn Gateway) -> Result<u64> {
             event: r.event.clone(),
         });
         let reply = gw.run(&req).await?;
-        let mut c = l.catalog.get_conn().await.map_err(db_err)?;
+        let mut c = l.catalog.get_conn_bounded().await.map_err(db_err)?;
         match reply.outcome {
             messages::RunOutcome::Ok | messages::RunOutcome::Moved => {
                 store
@@ -766,7 +772,7 @@ struct CatalogPool {
 impl CatalogPool {
     async fn get_conn(&self) -> Result<mysql_async::Conn> {
         let ep = self.locator.writer(self.tenant).await?;
-        ep.pool.get_conn().await.map_err(db_err)
+        ep.pool.get_conn_bounded().await.map_err(db_err)
     }
 }
 
@@ -808,7 +814,13 @@ impl StreamSide for MariaSide {
     }
 
     async fn bounds(&self) -> Result<HashMap<u32, (u64, u64)>> {
-        let mut c = self.shard.get().await?.get_conn().await.map_err(db_err)?;
+        let mut c = self
+            .shard
+            .get()
+            .await?
+            .get_conn_bounded()
+            .await
+            .map_err(db_err)?;
         let rows: Vec<(u32, u64, u64)> = c
             .exec(
                 format!(
@@ -825,7 +837,13 @@ impl StreamSide for MariaSide {
     }
 
     async fn read(&self, p: u32, from: u64, max: u32) -> Result<Vec<RecordIn>> {
-        let mut c = self.shard.get().await?.get_conn().await.map_err(db_err)?;
+        let mut c = self
+            .shard
+            .get()
+            .await?
+            .get_conn_bounded()
+            .await
+            .map_err(db_err)?;
         let r = LogReader {
             schema: self.log_schema.clone(),
         }
@@ -959,7 +977,11 @@ impl JobHandler for StreamTrigger {
             return run_fan_in(env, cx, tenant, binding, &l, def).await;
         }
         let def = {
-            let mut c = l.catalog.get_conn().await.map_err(|e| e.to_string())?;
+            let mut c = l
+                .catalog
+                .get_conn_bounded()
+                .await
+                .map_err(|e| e.to_string())?;
             StreamsStore::new(l.schema.clone())
                 .get(&mut c, StreamId(l.source.object_id))
                 .await
@@ -1009,7 +1031,7 @@ impl JobHandler for StreamTrigger {
             side,
             Arc::clone(&gw),
             t.clone(),
-            env.opts_for(tenant),
+            env.opts_for(tenant, &l),
             Arc::clone(&stats),
             def.partitions,
             Duration::from_millis(100),
@@ -1117,7 +1139,7 @@ async fn run_fan_in(
                         side,
                         Arc::clone(&gw),
                         mt,
-                        env.opts_for(tenant),
+                        env.opts_for(tenant, l),
                         Arc::clone(&stats),
                         parts,
                         Duration::from_millis(100),
@@ -1157,7 +1179,7 @@ async fn fan_in_side(
 ) -> Result<(Arc<dyn StreamSide>, u32)> {
     let ep = env.locator.writer(m.member).await?;
     let def = {
-        let mut c = ep.pool.get_conn().await.map_err(|e| {
+        let mut c = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
         StreamsStore::new(ep.store.schema().to_owned())
@@ -1224,7 +1246,7 @@ impl JobHandler for QueueTrigger {
                 l.source.name,
                 l.source.db_name,
                 cx.job_id,
-                env.opts_for(tenant).lanes
+                env.opts_for(tenant, &l).lanes
             ),
         )
         .await;
@@ -1235,11 +1257,11 @@ impl JobHandler for QueueTrigger {
         });
         let stats = Arc::new(MsgStats::default());
         let stop = cx.cancel.child_token();
-        tracing::info!(%tenant, binding, queue = %l.source.name, lanes = env.opts_for(tenant).lanes, "trigger on a queue started");
+        tracing::info!(%tenant, binding, queue = %l.source.name, lanes = env.opts_for(tenant, &l).lanes, "trigger on a queue started");
         let runner = msgrun::run_queue(
             Arc::clone(&gw),
             t.clone(),
-            env.opts_for(tenant),
+            env.opts_for(tenant, &l),
             Arc::clone(&stats),
             stop.clone(),
         );

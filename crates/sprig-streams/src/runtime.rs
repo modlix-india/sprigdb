@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use mysql_async::Pool;
@@ -435,13 +435,17 @@ pub async fn run_job(
             Vec::new(),
         ),
     };
+    let window = Arc::new(AtomicU64::new(batch_window_ms(&*env)));
     let seq = Sequencer {
         filter,
         owned: log.partitions.clone(),
         store,
         feed: env.feed(tenant, keep),
         marks: Arc::new(MetaWatermarks::new(env.dc(), tenant, id, log.slot.shard.0)),
-        opts: SeqOpts::default(),
+        opts: SeqOpts {
+            live_window: Some(Arc::clone(&window)),
+            ..SeqOpts::default()
+        },
         stats: Arc::default(),
     };
     let stats = Arc::clone(&seq.stats);
@@ -474,6 +478,7 @@ pub async fn run_job(
                 // the gauges are this worker's worst lag and the count over
                 // the threshold.
                 lag::export(false);
+                window.store(batch_window_ms(&*env), Ordering::Relaxed);
                 if !report.progress(p).await {
                     stop.cancel();
                 }
@@ -512,6 +517,18 @@ pub async fn run_job(
         RunEnd::Stopped => JobEnd::Stopped,
         RunEnd::Fenced => JobEnd::Fenced,
     })
+}
+
+/// `stream.sequencer_batch_ms` from the worker's live settings (the
+/// default without them), read at a sequencer's start and every second.
+fn batch_window_ms(env: &dyn JobEnv) -> u64 {
+    env.settings()
+        .map_or(crate::settings::SEQUENCER_BATCH_MS.default, |(s, dc)| {
+            s.get(
+                &crate::settings::SEQUENCER_BATCH_MS,
+                &sprig_settings::SettingCtx::process(&dc),
+            )
+        })
 }
 
 /// The lag of this worker's stream sequencers as bounded series (they

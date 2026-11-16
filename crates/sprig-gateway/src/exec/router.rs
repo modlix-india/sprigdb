@@ -135,6 +135,9 @@ pub(crate) struct Configs {
     generation: u64,
     pub(crate) router: sprig_router::RouterConfig,
     txn: TxnConfig,
+    /// Sprig 2PC through the agents' relays (`txn.non_xa_policy =
+    /// sprig_2pc` and `txn.sprig_2pc_path = relay`).
+    relay: bool,
 }
 
 static SERVICES: OnceLock<Services> = OnceLock::new();
@@ -590,6 +593,7 @@ impl PassSession {
 
     /// The coordinator, made for the session's first sharded statement,
     /// with the clusters' capabilities and the session's state current.
+    #[allow(clippy::too_many_lines)] // one set-up, step by step
     async fn ensure_coord(&mut self, cx: &ExecCtx<'_>, layout: &TenantLayout) {
         let _ = self.bs(cx);
         let (Some(ts), Some(bs)) = (self.tenant.as_deref(), self.bs.as_ref()) else {
@@ -616,8 +620,10 @@ impl PassSession {
                 admin: Arc::clone(&rs.admin),
                 svc: Arc::clone(&svc),
                 cat: Mutex::new(None),
+                relay: Arc::new(Mutex::new(None)),
+                relayed: Arc::new(Mutex::new(HashMap::new())),
             });
-            let txn = TxnCoordinator::new(
+            let mut txn = TxnCoordinator::new(
                 Arc::clone(&f),
                 Arc::clone(&rs.dtids),
                 ts.tenant,
@@ -626,6 +632,9 @@ impl PassSession {
                     ..TxnConfig::default()
                 },
             );
+            if let Some(h) = txn::pause_hooks() {
+                txn.set_hooks(h);
+            }
             // `lookup.lock_wait_seconds`: Pre sessions' lock wait, the
             // tenant's value until each claim sets its owner table's
             // (`GwBackend::lookup_claim`).
@@ -650,6 +659,7 @@ impl PassSession {
             return;
         };
         *f.vars.lock().unwrap_or_else(PoisonError::into_inner) = bs.vars().clone();
+        *f.relay.lock().unwrap_or_else(PoisonError::into_inner) = bs.relay();
         *f.cat.lock().unwrap_or_else(PoisonError::into_inner) = ts.catalog().cloned();
         let missing: Vec<ClusterId> = {
             let caps = f.caps.lock().unwrap_or_else(PoisonError::into_inner);
@@ -728,13 +738,28 @@ impl PassSession {
             |k, cx| svc.settings.get(k, cx, Some(&cat.settings)).into_owned(),
             &rs.coordinator_id,
         );
+        let relay = txn.policy == sprig_txn::NonXaPolicy::Sprig2pc
+            && sprig_txn::settings::relay_path(&svc.settings.get(
+                &sprig_txn::settings::SPRIG_2PC_PATH,
+                &ctx,
+                Some(&cat.settings),
+            ));
         self.router.cfg = Some(Configs {
             version: cat.version,
             generation,
             router,
             txn,
+            relay,
         });
         router
+    }
+
+    /// The tenant whose backend connections go through the agents' relays
+    /// (Sprig 2PC's relay path), resolved with the router's settings.
+    pub(crate) fn relay_tenant(&mut self) -> Option<sprig_common::ids::TenantId> {
+        let tenant = self.tenant.as_deref()?.tenant;
+        self.router_cfg();
+        self.router.cfg.as_ref()?.relay.then_some(tenant)
     }
 
     /// The shard reference of the session's default schema (unsharded

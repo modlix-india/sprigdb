@@ -27,6 +27,20 @@ pub struct Analysis {
     pub writes: Vec<String>,
     /// Loops without a static bound, guarded at run time.
     pub guarded_loops: usize,
+    /// What compiled `db.call`s were compiled against.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<crate::link::CallDep>,
+    /// Modules the compiled calls reach, directly or through others.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reaches: Vec<u64>,
+    /// The longest chain of compiled calls below this code.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub call_depth: u32,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl Analysis {
@@ -91,11 +105,16 @@ fn cost(
                 writes.extend(stmt.writes.iter().cloned());
                 mult
             }
+            Stmt::Try { body, .. } | Stmt::Block(_, body) => {
+                cost(body, mult, opts, a, reads, writes)
+            }
             Stmt::Assign(..)
             | Stmt::Break
             | Stmt::Continue
             | Stmt::Emit(..)
             | Stmt::Throw(_)
+            | Stmt::Rethrow(_)
+            | Stmt::Leave(_)
             | Stmt::Return => 0,
         });
     }

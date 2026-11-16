@@ -1235,6 +1235,26 @@ impl Maintainer {
         self.counts.seeds += 1;
         metrics::counter!("sprig_inherit_copy_seeds_total").increment(1);
         tracing::info!(tenant = %e.key.tenant, object = %e.key.object, share = e.key.share, rows = rows.len(), "copy seeded");
+        // What a (re)seed changed in this copy (a share's filter that now
+        // hides or shows records, its columns) changed this tenant's view:
+        // the copies made from it below follow, as for a change of the
+        // source's rows, parents first.
+        let below = self.family.edges.iter().any(|x| {
+            x.key != e.key
+                && x.db_name.eq_ignore_ascii_case(&e.db_name)
+                && x.table.eq_ignore_ascii_case(&e.table)
+                && self.family.at_or_above(e.key.tenant, x.source_tenant)
+                && self
+                    .copies
+                    .ready(x.key, x.object_version, x.share_version)
+                    .is_some()
+        });
+        if below {
+            let keys: Vec<KeyLit> = present.into_iter().chain(gone).collect();
+            for part in keys.chunks(500) {
+                Box::pin(self.on_keys(e.key.tenant, &e.db_name, &e.table, part)).await?;
+            }
+        }
         Ok(())
     }
 
@@ -2048,13 +2068,27 @@ pub(crate) async fn keep_serving(
         }
     }
     if !adds.is_empty() {
-        r.ctl(&format!(
-            "ALTER TABLE {}.{} {}",
-            q(&schema),
-            q(&copy_table(o.object_id)),
-            adds.join(", ")
-        ))
-        .await?;
+        let altered = r
+            .ctl(&format!(
+                "ALTER TABLE {}.{} {}",
+                q(&schema),
+                q(&copy_table(o.object_id)),
+                adds.join(", ")
+            ))
+            .await;
+        match altered {
+            Ok(()) => {}
+            // The copy worker saw the child's new columns first and is
+            // making the copy again (dropped: 1146; made with them: 1060).
+            // Its seed brings every column and its own state, so there is
+            // nothing left to keep serving, and the statement stands.
+            Err(e) if matches!(sprig_catalog::ddl::errno(&e), Some(1146 | 1060)) => {
+                tracing::info!(tenant = %t, table = %o.table, error = %e.message,
+                    "copy being seeded again; not kept serving");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
     }
     r.ctl(&format!(
         "UPDATE {}.{} SET object_version = {} WHERE object_id = {} AND share_key = {UPSTREAM} \

@@ -180,6 +180,36 @@ pub struct FarNodes {
     pub after: Option<u64>,
     /// With `limit`: in link id order (so a reader can continue `after`).
     pub ordered: bool,
+    /// With `join` (no `top`, `deep` or `ordered`): the far nodes are
+    /// joined only where the statement's near nodes have at most this many
+    /// links; past it, the same statement gives its links with `NULL`
+    /// far node columns (at most `limit`), and the caller reads those
+    /// nodes by id. One statement either way: `(<joined> AND <probe> IS
+    /// NULL LIMIT n) UNION ALL (<links> AND <probe> IS NOT NULL)`, where
+    /// the probe (the near nodes' link past the `n`th, if any) is a
+    /// constant MariaDB reads first, so only one part runs. Over many
+    /// links the joins cost more than reading the far nodes by id in
+    /// parallel, and a capped joined read had to be read again.
+    pub join_max: Option<usize>,
+    /// With `join` (not `deep`): the far nodes' own outgoing links of
+    /// another type, the pattern's next hop, left joined from the edges
+    /// of every shard schema on the statement's cluster with their far
+    /// nodes ([`NextHop`]): six more link columns, then `id, rk, labels,
+    /// props, _types` of the next far node (`NULL`s for a far node without
+    /// such links, or not on the cluster). A row per pair; a joined part
+    /// of a `join_max` statement has no `LIMIT` then (its links are
+    /// bounded already).
+    pub next: Option<NextHop>,
+}
+
+/// The next hop a [`FarNodes`] read brings along.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NextHop {
+    /// Type ids (empty: any).
+    pub types: Vec<u32>,
+    /// Property keys of its far nodes (`None`: all; empty: none). Their
+    /// labels come too; the caller checks the pattern's.
+    pub keys: Option<Vec<String>>,
 }
 
 /// The statement parts of [`FarNodes::top`] over far node columns `fid`
@@ -220,6 +250,191 @@ pub fn top_parts(
             " ORDER BY {class}, CASE WHEN {num} THEN JSON_VALUE({fprops}, {path}) + 0e0 END {dir} \
              FETCH FIRST {n} ROWS WITH TIES"
         ),
+    ))
+}
+
+/// `sql` with `tag AS q` as its first column, for several routes' rows in
+/// one result: a `SELECT`, or each part of a `UNION ALL` of parenthesized
+/// `SELECT`s (a top-k or `join_max` hop's statement), never a subquery's.
+/// `None` for any other statement.
+#[must_use]
+pub fn tagged(sql: &str, tag: usize) -> Option<String> {
+    if let Some(rest) = sql.strip_prefix("SELECT ") {
+        return Some(format!("(SELECT {tag} AS q, {rest})"));
+    }
+    let rest = sql.strip_prefix("(SELECT ")?;
+    let head = format!("(SELECT {tag} AS q, ");
+    Some(format!(
+        "{head}{}",
+        rest.replace(") UNION ALL (SELECT ", &format!(") UNION ALL {head}"))
+    ))
+}
+
+/// A walk read ahead in one statement: every outgoing link of `types`
+/// within `hops` levels of `seeds`, as a recursive CTE over the edge tables
+/// of every shard schema (all of the group's shards on one cluster; `None`
+/// otherwise, or for no seeds). Each link comes once, at the first level
+/// that reaches it: `src, dst, src_rk, dst_rk, id, type, level` (1 for the
+/// seeds' own links), then, with `far`, its far node's `id, rk, labels`
+/// and `props, _types` of those keys. A node first reached below `hops`
+/// has all its links in the rows. At most `limit` rows, and at most
+/// `max_ms` of the server's time (it stops the statement past that).
+///
+/// With `next`, the clause's next hop from the walk's ends comes too:
+/// every row starts with a kind, 0 for a walk row (its next columns
+/// `NULL`) and 1 for a node the walk reaches or starts from (its walk
+/// columns `NULL`): that node's id, then one of its outgoing links of
+/// `next.types` (six columns, `NULL`s when it has none) and the link's
+/// far node (`id, rk, labels, props, _types`).
+#[allow(clippy::too_many_arguments)] // the walk's seeds, types, depth, far nodes and bounds
+#[must_use]
+pub fn walk_statement(
+    group: &Group,
+    graph: u64,
+    seeds: &[u64],
+    types: &[u32],
+    hops: u32,
+    far: Option<&[String]>,
+    next: Option<&NextHop>,
+    limit: usize,
+    max_ms: u64,
+) -> Option<String> {
+    let cluster = &group.shards.first()?.cluster;
+    if seeds.is_empty() || hops == 0 || group.shards.iter().any(|s| &s.cluster != cluster) {
+        return None;
+    }
+    let mut per: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
+    for &id in seeds {
+        let i = node_hash(group, id).map_or(0, |h| group.route(h));
+        per.entry(i).or_default().push(id);
+    }
+    let range = |j: usize, rk: &str| {
+        let mut c = format!("{rk} >= {}", group.shards[j].lo);
+        if let Some(next) = group.shards.get(j + 1) {
+            let _ = write!(c, " AND {rk} < {}", next.lo);
+        }
+        c
+    };
+    let edges = |j: usize| table(&group.shards[j].schema, graph, GraphTable::Edges);
+    let tf = types_filter("e", types);
+    let mut parts: Vec<String> = Vec::new();
+    for (i, ids) in &per {
+        parts.push(format!(
+            "SELECT e.src, e.dst, e._sprig_rk, e.dst_rk, e.id, e.type, 1 FROM {} e \
+             WHERE e.src IN ({}){tf}",
+            edges(*i),
+            ids_list(ids)
+        ));
+    }
+    for j in 0..group.shards.len() {
+        parts.push(format!(
+            "SELECT e.src, e.dst, e._sprig_rk, e.dst_rk, e.id, e.type, w.d + 1 FROM w \
+             JOIN {} e ON e.src = w.dst{tf} WHERE w.d < {hops} AND {}",
+            edges(j),
+            range(j, "w.dst_rk")
+        ));
+    }
+    let co = |v: &[String]| {
+        if v.len() == 1 {
+            v[0].clone()
+        } else {
+            format!("COALESCE({})", v.join(", "))
+        }
+    };
+    let mut select = String::from("w.src, w.dst, w.src_rk, w.dst_rk, w.id, w.type, w.d");
+    let mut joins = String::new();
+    if let Some(keys) = far {
+        let (mut ids, mut labels, mut props, mut tys) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for j in 0..group.shards.len() {
+            let _ = write!(
+                joins,
+                " LEFT JOIN {} n{j} ON n{j}.id = w.dst AND {}",
+                table(&group.shards[j].schema, graph, GraphTable::Nodes),
+                range(j, "w.dst_rk")
+            );
+            ids.push(format!("n{j}.id"));
+            labels.push(format!("n{j}.labels"));
+            props.push(format!("n{j}.props"));
+            tys.push(format!("n{j}._types"));
+        }
+        let _ = write!(
+            select,
+            ", {}, w.dst_rk, {}, {}",
+            co(&ids),
+            co(&labels),
+            part_exprs(&co(&props), &co(&tys), keys)
+        );
+    }
+    let mut body = format!("SELECT {select} FROM w{joins}");
+    if let Some(nx) = next {
+        // The nodes the walk is at (its seeds and every node it reaches),
+        // each with its next hop's links and their far nodes.
+        let mut at = String::from("SELECT dst AS n, dst_rk AS rk FROM w");
+        for &id in seeds {
+            let _ = write!(
+                at,
+                " UNION SELECT {id}, {}",
+                node_hash(group, id).unwrap_or(0)
+            );
+        }
+        let mut xs: [Vec<String>; 6] = Default::default();
+        let mut njoins = String::new();
+        for j in 0..group.shards.len() {
+            let _ = write!(
+                njoins,
+                " LEFT JOIN {} x{j} ON x{j}.src = z.n AND {}{}",
+                edges(j),
+                range(j, "z.rk"),
+                types_filter(&format!("x{j}"), &nx.types)
+            );
+            for (c, name) in xs
+                .iter_mut()
+                .zip(["src", "dst", "_sprig_rk", "dst_rk", "id", "type"])
+            {
+                c.push(format!("x{j}.{name}"));
+            }
+        }
+        let (xdst, xrk) = (co(&xs[1]), co(&xs[3]));
+        let (mut ids, mut labels, mut props, mut tys) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for j in 0..group.shards.len() {
+            let _ = write!(
+                njoins,
+                " LEFT JOIN {} y{j} ON y{j}.id = {xdst} AND {}",
+                table(&group.shards[j].schema, graph, GraphTable::Nodes),
+                range(j, &xrk)
+            );
+            ids.push(format!("y{j}.id"));
+            labels.push(format!("y{j}.labels"));
+            props.push(format!("y{j}.props"));
+            tys.push(format!("y{j}._types"));
+        }
+        let (yprops, ytypes) = (co(&props), co(&tys));
+        let pcols = match &nx.keys {
+            None => format!("{yprops}, {ytypes}"),
+            Some(keys) => part_exprs(&yprops, &ytypes, keys),
+        };
+        let xcols: Vec<String> = xs.iter().map(|c| co(c)).collect();
+        let walk_nulls = if far.is_some() { 12 } else { 7 };
+        body = format!(
+            "SELECT 0, {select}, {} FROM w{joins} UNION ALL SELECT 1, {}, z.n, {}, {}, {xrk}, {}, {pcols} \
+             FROM ({at}) z{njoins}",
+            ["NULL"; 12].join(", "),
+            vec!["NULL"; walk_nulls].join(", "),
+            xcols.join(", "),
+            co(&ids),
+            co(&labels)
+        );
+    }
+    Some(format!(
+        "SET STATEMENT max_recursive_iterations = {}, max_statement_time = {}.{:03} FOR \
+         WITH RECURSIVE w (src, dst, src_rk, dst_rk, id, type, d) AS ({}) CYCLE id RESTRICT \
+         {body} LIMIT {limit}",
+        hops + 1,
+        max_ms / 1000,
+        max_ms % 1000,
+        parts.join(" UNION ALL ")
     ))
 }
 
@@ -698,9 +913,19 @@ fn statement(spec: &RouteSpec, i: usize, ids: &[u64]) -> Option<String> {
                     format!("COALESCE({})", v.join(", "))
                 }
             };
+            // Joined only up to `join_max` links: the same statement's
+            // links without the join past it (five `NULL` node columns).
+            let split = far
+                .join_max
+                .filter(|_| far.join && far.top.is_none() && !far.deep && !far.ordered);
             let mut select = cols.to_owned();
+            let mut plain_select = format!("{cols}, NULL, NULL, NULL, NULL, NULL");
             let mut joins = String::new();
+            let mut plain_joins = String::new();
             let mut conds: Vec<String> = Vec::new();
+            // The conditions that don't name the far node (both parts of a
+            // split statement).
+            let mut plain_conds: Vec<String> = Vec::new();
             // `conds` with far node comparisons that keep only numbers.
             let mut exact_conds: Vec<String> = Vec::new();
             let mut far_cols: Option<(String, String)> = None;
@@ -748,6 +973,7 @@ fn statement(spec: &RouteSpec, i: usize, ids: &[u64]) -> Option<String> {
                     }
                 }
             }
+            let far_joins_end = joins.len();
             if far.rel_keys.is_some() || !far.rel_filter.is_empty() {
                 // The edge row: the statement's own, or (mirrors) joined
                 // from the edge's source shard.
@@ -775,26 +1001,76 @@ fn statement(spec: &RouteSpec, i: usize, ids: &[u64]) -> Option<String> {
                         part_pair(&eprops, &etypes, keys)
                     };
                     // A mirror whose edge isn't on this cluster: NULLs.
-                    match &eid {
+                    let rel_cols = match &eid {
                         Some(id) => {
-                            let _ = write!(
-                                select,
-                                ", IF({id} IS NULL, NULL, {p}), IF({id} IS NULL, NULL, {t})"
-                            );
+                            format!(", IF({id} IS NULL, NULL, {p}), IF({id} IS NULL, NULL, {t})")
                         }
-                        None => {
-                            let _ = write!(select, ", {p}, {t}");
-                        }
-                    }
+                        None => format!(", {p}, {t}"),
+                    };
+                    select.push_str(&rel_cols);
+                    plain_select.push_str(&rel_cols);
                 }
                 for (k, op, v) in &far.rel_filter {
                     if let Some(c) = number_filter(&eprops, k, *op, v) {
-                        conds.push(match &eid {
+                        let c = match &eid {
                             Some(id) => format!("({id} IS NULL OR {c})"),
                             None => c,
-                        });
+                        };
+                        plain_conds.push(c.clone());
+                        conds.push(c);
                     }
                 }
+                // The edges' joins (mirrors): every far node join comes
+                // before them in `joins`.
+                joins[far_joins_end..].clone_into(&mut plain_joins);
+            }
+            if let Some(nx) = far.next.as_ref().filter(|_| far.join && !far.deep)
+                && let Some((fid, _)) = &far_cols
+            {
+                // The far node's id is `fid` (NULL off the cluster); its
+                // hash, the link's far hash.
+                let mut xs: [Vec<String>; 6] = Default::default();
+                for (j, sh) in &local {
+                    let _ = write!(
+                        joins,
+                        " LEFT JOIN {} x{j} ON x{j}.src = {fid} AND {}{}",
+                        table(&sh.schema, spec.graph, GraphTable::Edges),
+                        range(*j, far_rk),
+                        types_filter(&format!("x{j}"), &nx.types)
+                    );
+                    for (c, name) in
+                        xs.iter_mut()
+                            .zip(["src", "dst", "_sprig_rk", "dst_rk", "id", "type"])
+                    {
+                        c.push(format!("x{j}.{name}"));
+                    }
+                }
+                for c in &xs {
+                    let _ = write!(select, ", {}", co(c));
+                }
+                plain_select.push_str(", NULL, NULL, NULL, NULL, NULL, NULL");
+                let (xdst, xrk) = (co(&xs[1]), co(&xs[3]));
+                let (mut ids, mut labels, mut props, mut tys) =
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                for (j, sh) in &local {
+                    let _ = write!(
+                        joins,
+                        " LEFT JOIN {} y{j} ON y{j}.id = {xdst} AND {}",
+                        table(&sh.schema, spec.graph, GraphTable::Nodes),
+                        range(*j, &xrk)
+                    );
+                    ids.push(format!("y{j}.id"));
+                    labels.push(format!("y{j}.labels"));
+                    props.push(format!("y{j}.props"));
+                    tys.push(format!("y{j}._types"));
+                }
+                let (yid, yprops, ytypes, ylabels) = (co(&ids), co(&props), co(&tys), co(&labels));
+                let pcols = match &nx.keys {
+                    None => format!("{yprops}, {ytypes}"),
+                    Some(keys) => part_exprs(&yprops, &ytypes, keys),
+                };
+                let _ = write!(select, ", {yid}, {xrk}, {ylabels}, {pcols}");
+                plain_select.push_str(", NULL, NULL, NULL, NULL, NULL");
             }
             if far.deep && *out {
                 let mut cols: [Vec<String>; 6] = Default::default();
@@ -847,9 +1123,11 @@ fn statement(spec: &RouteSpec, i: usize, ids: &[u64]) -> Option<String> {
             }
             if !far.only.is_empty() {
                 conds.push(format!("{far_col} IN ({})", ids_list(&far.only)));
+                plain_conds.push(format!("{far_col} IN ({})", ids_list(&far.only)));
             }
             if let Some(x) = far.after {
                 conds.push(format!("{a}.id > {x}"));
+                plain_conds.push(format!("{a}.id > {x}"));
             }
             let head = format!(
                 "SELECT {select} FROM {tbl} {a}{joins} WHERE {a}.{near} IN ({id_list}){}",
@@ -875,6 +1153,30 @@ fn statement(spec: &RouteSpec, i: usize, ids: &[u64]) -> Option<String> {
                     with(&exact),
                     with(&conds)
                 ));
+            }
+            if let Some(n) = split {
+                let types = types_filter(a, types);
+                // Whether the near nodes have a link past the `n`th: NULL
+                // when they don't (no derived table, and it stops there).
+                let past = format!(
+                    "(SELECT 1 FROM {tbl} {a} WHERE {a}.{near} IN ({id_list}){types} LIMIT {n}, 1)"
+                );
+                let mut joined = with(&conds);
+                let _ = write!(joined, " AND {past} IS NULL");
+                if far.next.is_none() {
+                    let _ = write!(joined, " LIMIT {n}");
+                }
+                let mut plain = format!(
+                    "SELECT {plain_select} FROM {tbl} {a}{plain_joins} WHERE {a}.{near} IN ({id_list}){types}"
+                );
+                for c in &plain_conds {
+                    let _ = write!(plain, " AND {c}");
+                }
+                let _ = write!(plain, " AND {past} IS NOT NULL");
+                if let Some(l) = far.limit {
+                    let _ = write!(plain, " LIMIT {l}");
+                }
+                return Some(format!("({joined}) UNION ALL ({plain})"));
             }
             let mut q = with(&conds);
             if far.top.is_none()

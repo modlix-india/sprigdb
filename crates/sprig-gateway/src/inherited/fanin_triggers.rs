@@ -21,6 +21,7 @@
 
 use std::sync::Arc;
 
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::Result;
 use sprig_common::ids::TenantId;
 use sprig_inherit::msg::{Chain, DefKind, Definition};
@@ -94,7 +95,7 @@ pub async fn attach_existing(
             let cluster = svc.locator.cluster(e.tenant).await?;
             let pool = svc.locator.ctl_pool(&cluster).await?;
             let mut c = pool
-                .get_conn()
+                .get_conn_bounded()
                 .await
                 .map_err(sprig_streams::maria::map_err)?;
             let reader = sprig_streams::read::LogReader {
@@ -113,7 +114,7 @@ pub async fn attach_existing(
             let ep = svc.locator.writer(p).await?;
             let mut c = ep
                 .pool
-                .get_conn()
+                .get_conn_bounded()
                 .await
                 .map_err(sprig_streams::maria::map_err)?;
             sprig_streams::store::migrate(&mut c, &schema).await?;

@@ -20,9 +20,9 @@
 │       │Admin         sprigctl commands; Up/Down history                                  │       │
 │       │Inbox         a approve, w window, i ignore, s snooze, c comment                  │       │
 │       │Ctrl-K, Ctrl-P search everything; ?question writes an ASK (runs nothing)          │       │
+│       │Ctrl-A        the assistant; on a proposal: Enter run (asks), e edit, d drop      │       │
 │       │Ctrl-S        save the editor's text under a name                                 │       │
 │       │Enter, r      (explorer) open a table's view, or run a SELECT on it               │       │
-│       │Table view    / filter, = by cell, e edit, o add, d delete, n p page              │       │
 │       └──────────────────────────────────────────────────────────────────────────────────┘       │
 └────────────────────────────┘└────────────────────────────────────────────────────────────────────┘
  dev  127.0.0.1:8080 db shop  F1 help · F5 run · Ctrl-C cancel · Ctrl-Q quit

@@ -17,6 +17,9 @@ import { StatusBar } from '../workspace/StatusBar';
 import { CommandPalette } from '../workspace/CommandPalette';
 import { HistoryPanel, SavedPanel } from '../workspace/LibraryPanels';
 import { loadLibrary } from '../workspace/library';
+import { DashboardsPanel } from '../dashboards/DashboardsPanel';
+import { AssistantDock } from '../ai/AssistantDock';
+import { toggleDock, useAssistant } from '../ai/store';
 
 /** Studio's workspace (the Studio and TUI redesign):
  * a title bar, an activity bar of sections, a side panel with the section's
@@ -29,6 +32,7 @@ export function Shell() {
   const firstTab = useTabs((s) => s.tabs[0]?.id ?? 'new');
   const openCount = useOpenCount();
   const [palette, setPalette] = useState(false);
+  const dockOpen = useAssistant((s) => s.open);
   // A panel-only section (saved queries, history) chosen in the activity bar,
   // for the page it was chosen on; navigating elsewhere goes back to the page's section.
   const [panelOn, setPanelOn] = useState<{ id: string; rel: string } | null>(null);
@@ -42,6 +46,11 @@ export function Shell() {
       if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'k' || e.key === 'p')) {
         e.preventDefault();
         setPalette((p) => !p);
+      }
+      // Ctrl/Cmd+I: the assistant dock (a query editor takes it for an inline ask).
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'i' && !e.defaultPrevented) {
+        e.preventDefault();
+        toggleDock();
       }
     };
     window.addEventListener('keydown', keys);
@@ -143,7 +152,7 @@ export function Shell() {
           <FormattedMessage id="session.signOut" />
         </button>
       </header>
-      <div className="body">
+      <div className={dockOpen ? 'body with-dock' : 'body'}>
         <nav className="activity" aria-label={intl.formatMessage({ id: 'nav.sections' })}>
           {visible.filter((s) => !s.bottom).map(activityItem)}
           <span className="grow" />
@@ -155,7 +164,8 @@ export function Shell() {
           </h2>
           {active.panel === 'saved' && <SavedPanel />}
           {active.panel === 'history' && <HistoryPanel />}
-          {!active.panel && active.links.length > 0 && (
+          {active.side === 'dashboards' && <DashboardsPanel />}
+          {!active.panel && !active.side && active.links.length > 0 && (
             <nav className="side-links" aria-label={intl.formatMessage({ id: active.label })}>
               {active.links.map((l) => (
                 <NavLink key={l.to} to={resolve(base, l.to)} end={l.end}>
@@ -169,7 +179,7 @@ export function Shell() {
               ))}
             </nav>
           )}
-          {!active.panel && <Explorer />}
+          {!active.panel && !active.side && <Explorer />}
         </aside>
         <section className="workspace">
           <WorkspaceTabs />
@@ -177,6 +187,7 @@ export function Shell() {
             <Outlet />
           </main>
         </section>
+        {dockOpen && <AssistantDock />}
       </div>
       <StatusBar />
       <CommandPalette open={palette} onClose={() => setPalette(false)} />

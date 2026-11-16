@@ -8,7 +8,7 @@
 //! | `Authorization` | Check |
 //! |---|---|
 //! | `Basic` base64(`user:password`) | Like Redis `AUTH`: the fast cache (`SHA256(SHA256(password))`), else the `caching_sha2_password` verifiers on a hashing slot; then the MySQL login's policy order (temporary lock, credentials, suspension, `ACCOUNT LOCK`, TLS requirement, expiry: HTTP has no sandbox mode, so an expired password is refused with 1862) |
-//! | `Bearer sprig_<tenant>_<key_id>_<secret>` | API key ([`crate::apikey`]): `SHA256(secret)` in constant time; revocation, expiry, `allowed_cidrs`; the user live, with the `api_key` method; temporary lock, `ACCOUNT LOCK`, TLS requirement, suspension |
+//! | `Bearer sprig_<tenant>_<key_id>_<secret>` | API key ([`crate::apikey`]): checked in a DC the tenant's residency allows (handed off from any other, 39302 with `deny_remote_access`); `SHA256(secret)` in constant time; revocation, expiry, `allowed_cidrs`; the user live, with the `api_key` method; temporary lock, `ACCOUNT LOCK`, TLS requirement, suspension |
 //! | `Bearer` an issuer's JWT | [`crate::oidc`]: the tenant from the `Host` header (or TLS SNI) under `listener.tenant_sni_suffixes`, else `x-sprig-tenant`, else 39786; the token verified against the tenant's issuers for `http`; its user mapping names the account (created when the issuer has `jit_users`); the account's `token` method, temporary lock, suspension, `ACCOUNT LOCK` and TLS requirement |
 //! | `Bearer` anything else | 401 (SprigDB session tokens are checked by the HTTP front end) |
 //!
@@ -40,6 +40,7 @@ use zeroize::Zeroizing;
 
 use crate::apikey::parse_key;
 use crate::audit::{self, AuditEvent};
+use crate::handoff::{HandoffResult, HandoffStart, Route, remote_access_denied};
 use crate::mysql::{LoginRequest, LoginService, LoginSource, Principal, locked, temp_locked};
 use crate::store::{AuthMethods, RequireTls};
 
@@ -327,7 +328,88 @@ impl HttpAuth {
             .map_err(|d| HttpAuthError::from_packet(d.error))
     }
 
+    /// An API key, checked where the tenant's residency allows: here, in
+    /// an allowed DC (handed off as token logins are), or refused (39302).
     async fn api_key(&self, req: &HttpRequest<'_>, key: &str) -> Result<Principal, HttpAuthError> {
+        if let Some(k) = parse_key(key) {
+            match self.svc.token_route(&k.tenant).await {
+                Route::Local => {}
+                Route::Deny => {
+                    metrics::counter!("sprig_auth_handoffs_total", "outcome" => "denied")
+                        .increment(1);
+                    return Err(HttpAuthError::from_packet(remote_access_denied(
+                        Persona::MySql84,
+                    )));
+                }
+                Route::HandOff(dcs) => return self.relay_api_key(req, key, &k.tenant, &dcs).await,
+            }
+        }
+        self.api_key_here(req, key).await.map_err(|(_, e)| e)
+    }
+
+    /// The source side of an API key's hand-off: each allowed DC in order
+    /// until one answers. The deciding DC audits and counts failures; the
+    /// principal gets this gateway's backend target.
+    async fn relay_api_key(
+        &self,
+        req: &HttpRequest<'_>,
+        key: &str,
+        tenant: &str,
+        dcs: &[sprig_common::ids::DcId],
+    ) -> Result<Principal, HttpAuthError> {
+        let unavailable = || {
+            HttpAuthError::from_error(&SprigError::new(
+                SprigCode::AuthUnavailable,
+                "authentication unavailable; retry",
+            ))
+        };
+        let (Some(handoff), LoginSource::Catalog(logins)) = (self.svc.handoff(), self.svc.source())
+        else {
+            return Err(unavailable());
+        };
+        let start = HandoffStart::of_api_key(req, tenant, handoff.here.clone());
+        for dc in dcs {
+            let reply = handoff
+                .peers
+                .login(dc, start.clone(), Zeroizing::new(key.as_bytes().to_vec()))
+                .await;
+            match reply {
+                Ok(HandoffResult::Accepted(mut principal, _)) => {
+                    metrics::counter!("sprig_auth_handoffs_total", "outcome" => "decided")
+                        .increment(1);
+                    match logins.local_backend(&principal) {
+                        Some(Ok(b)) => principal.backend = b,
+                        Some(Err(e)) => {
+                            tracing::warn!(error = %e, "no backend for a handed-off API key");
+                            return Err(HttpAuthError::from_error(&e));
+                        }
+                        None => {}
+                    }
+                    return Ok(*principal);
+                }
+                Ok(HandoffResult::Refused(packet)) => {
+                    metrics::counter!("sprig_auth_handoffs_total", "outcome" => "decided")
+                        .increment(1);
+                    return Err(HttpAuthError::from_packet(packet));
+                }
+                Err(e) => {
+                    metrics::counter!("sprig_auth_handoffs_total", "outcome" => "unreachable")
+                        .increment(1);
+                    tracing::warn!(%dc, error = %e, "API key handoff target unreachable; trying the next");
+                }
+            }
+        }
+        Err(unavailable())
+    }
+
+    /// An API key checked here, whatever the residency (a hand-off's
+    /// target has checked it first): audited, a wrong key counted against
+    /// the address. The error comes with its audit reason.
+    pub(crate) async fn api_key_here(
+        &self,
+        req: &HttpRequest<'_>,
+        key: &str,
+    ) -> Result<Principal, (&'static str, HttpAuthError)> {
         let now = self.svc_now();
         let mut ev = AuditEvent::new(audit::events::LOGIN_SUCCEEDED, "http", now);
         ev.client_ip = Some(req.client_ip);
@@ -339,15 +421,12 @@ impl HttpAuth {
             ev.reason = Some(reason);
         }
         self.svc.audit().emit(&ev);
-        match r {
-            Ok(p) => Ok(p),
-            Err((reason, err)) => {
-                if reason == "bad_credentials" {
-                    self.svc.ip_failure(req.client_ip, "http");
-                }
-                Err(err)
-            }
+        if let Err((reason, _)) = &r
+            && *reason == "bad_credentials"
+        {
+            self.svc.ip_failure(req.client_ip, "http");
         }
+        r
     }
 
     #[allow(clippy::too_many_lines)] // the checks, in order

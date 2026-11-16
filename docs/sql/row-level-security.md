@@ -309,7 +309,10 @@ Policies apply wherever the table's rows are read or written: MongoDB commands o
 Some statements can't carry the rewrite. On a table that binds the session, these fail with 39366 `ER_SPRIG_RLS_UNSUPPORTED`:
 
 - `CALL`, `PREPARE` and `EXECUTE` of text naming a protected table, `HANDLER`, `CHECKSUM TABLE`, `LOAD DATA … REPLACE`;
-- `CREATE VIEW`, `PROCEDURE`, `FUNCTION`, `TRIGGER`, `EVENT` or `CREATE TABLE … SELECT` that read a protected table, or stored code with dynamic SQL.
+- `CREATE TABLE … SELECT` that reads a protected table, and stored code that uses dynamic SQL (`PREPARE` or `EXECUTE IMMEDIATE`) over one: it is never pointed at the policy views;
+- stored code that couldn't be pointed at the policy views (below), until it's fixed: the message says why (`stored code wasn't pointed at the policy views: …`).
+
+**Views and stored code over protected tables.** A view, procedure, function or trigger that reads a protected table can be created as usual, by any user with the privileges for it, bound by the policies or not. Right after the `CREATE` succeeds, the gateway points it at the table's policy views, so it applies the policies of whoever it runs as: the caller for `SQL SECURITY INVOKER`, its definer for `SQL SECURITY DEFINER` (as on any call). Code written before a table got its policies is pointed when a policy statement runs. For a few milliseconds after a `CREATE`, another gateway may not know about the new code's pointing yet, and a call that lands there runs with the caller's policies.
 
 `LOAD DATA` without `REPLACE` is checked by MariaDB's triggers. DDL, `SHOW`, `DESCRIBE` and transaction statements are unaffected. A statement that names `@sprig_rls` (SprigDB's internal session context) fails with 39050 `ER_SPRIG_RESERVED_NAME`.
 
@@ -332,7 +335,6 @@ Some statements can't carry the rewrite. On a table that binds the session, thes
 ## Not supported yet
 
 - **Claims without a token.** Password logins, HTTP Basic and API keys carry no token, so `SPRIG_CLAIM` returns `NULL` there; put per-user values in account attributes and read them with `SPRIG_USER_ATTR`.
-- **Claims in MongoDB-language calls over HTTP.** `Sql.Query` with `language: mongo` doesn't pass the bearer token's claims to `SPRIG_CLAIM`; SQL calls do.
 
 ## Related
 

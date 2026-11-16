@@ -8,6 +8,7 @@
 //! | `thinking` | `text` | more reasoning text, when the provider shows it |
 //! | `tool_start` | `id`, `name`, `input` | a tool call starts |
 //! | `tool_end` | `id`, `name`, `ok`, `reduced` | it ended; `reduced` when rows or values were withheld |
+//! | `result` | `id`, `name`, `result: {columns, rows, row_count, truncated}` | a `run_query` result, whole, for the user only: the provider got only its shape unless `ai.share_data` is on |
 //! | `proposal` | `proposal: {id, kind, tool_use_id, body}`, `filed` | something for the user to review; never run |
 //! | `usage` | `usage` | tokens of one model call |
 //! | `sources` | `sources: [{kind, title, reference}]` | what the answer drew on |
@@ -84,6 +85,9 @@ pub fn event_json(e: &TurnEvent) -> Vec<Value> {
             reduced,
         } => {
             vec![json!({"type": "tool_end", "id": id, "name": name, "ok": ok, "reduced": reduced})]
+        }
+        TurnEvent::Result { id, name, result } => {
+            vec![json!({"type": "result", "id": id, "name": name, "result": result})]
         }
         TurnEvent::Proposal(p) => vec![json!({
             "type": "proposal",

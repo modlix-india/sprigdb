@@ -750,14 +750,7 @@ async fn no_read_path_returns_an_inherited_row_a_policy_hides() {
         let view = &views[level];
         for user in USERS.iter().copied().chain(["app"]) {
             for (p, must) in PATHS {
-                // The REST API doesn't take a space (`Sprig-Space` isn't
-                // built): it reads the home space's view, `b`'s root at
-                // `b1`.
-                let view = if matches!(p, Path::Http) && level == 2 {
-                    &views[1]
-                } else {
-                    view
-                };
+                // The REST API reads `b1` through its `Sprig-Space` header.
                 let shown = expected(view, t, user, Cmd::Select);
                 checks += 1;
                 let got = f.run(*p, level, user, &all).await;

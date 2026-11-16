@@ -233,12 +233,38 @@ fn language_chain(lang: Language, fold: bool) -> TextAnalyzer {
     }
 }
 
+/// A language's chain without its stemmer (`<language>_nostem`) or
+/// without its stop words (`<language>_nostop`): Redis `NOSTEM` text
+/// fields and `STOPWORDS 0` indexes.
+fn language_variant(name: &str) -> Option<TextAnalyzer> {
+    let (lang, stem) = if let Some(l) = name.strip_suffix("_nostem") {
+        (language(l)?, false)
+    } else {
+        (language(name.strip_suffix("_nostop")?)?, true)
+    };
+    let b = TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(RemoveLongFilter::limit(MAX_TOKEN_BYTES))
+        .filter(LowerCaser)
+        .dynamic();
+    Some(if stem {
+        b.filter_dynamic(Stemmer::new(lang)).build()
+    } else {
+        match stop(lang) {
+            Some(s) => b.filter_dynamic(s).build(),
+            None => b.build(),
+        }
+    })
+}
+
 /// A built-in analyzer by name.
 ///
 /// # Errors
 /// 39828 for an unknown name.
 pub fn builtin(name: &str) -> Result<Analyzer> {
     let n = from_atlas(name);
+    if let Some(a) = language_variant(&n) {
+        return Ok(Analyzer::plain(&n, a, None));
+    }
     Ok(match n.as_str() {
         "standard" => Analyzer::plain(&n, standard(), None),
         "keyword" | "raw" => Analyzer::plain(&n, TextAnalyzer::from(RawTokenizer::default()), None),

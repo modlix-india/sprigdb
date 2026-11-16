@@ -15,6 +15,7 @@ use sprig_approvals::store::Filter;
 use sprig_approvals::{Caller, may_act, may_see};
 use sprig_auth::authz::{Action, SessionGrants, Target};
 use sprig_catalog::ddl::database_key;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::{CatalogLocator, TenantCatalog};
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_proto_mysql::ColumnDef;
@@ -134,7 +135,7 @@ pub async fn execute(
     let p = super::authz::privileges(ts, cat);
     let ep = ts.services().locator.writer(ts.tenant).await?;
     let recs = SqlRecs::new(ts.tenant, ep.store.schema());
-    let mut conn = ep.pool.get_conn().await.map_err(backend)?;
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(backend)?;
     let id_of = |n: u64| sprig_approvals::RecId::Tenant(ts.tenant, n);
     match stmt {
         RecStmt::Show { all, scope } => {

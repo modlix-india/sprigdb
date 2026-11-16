@@ -4404,3 +4404,408 @@ async fn inherited_paths_with_one_catalog_connection_free() {
     }
     assert!(slow.is_empty(), "{slow:#?}");
 }
+
+// ---------------------------------------------------------------------------
+// The gateway's `sprig_ctl` pools under load: the paths that hold one of
+// them while they deliver (the cross-tenant outbox forward, a broadcast's
+// fan-out) and the logic deploys.
+// ---------------------------------------------------------------------------
+
+/// Catalog and `sprig_ctl` connections held busy on purpose: logic deploys
+/// (`CREATE FUNCTION`) of tenant `busy`, each holding one of its cluster's
+/// four catalog connections and one of its four `sprig_ctl` connections
+/// while it waits on the catalog's object-id counter, locked from a root
+/// session (`SPRIG_TEST_INHERIT_ROOT`), until [`BusyCtl::release`] (or the
+/// server's 50 s lock wait). With three held, a step that holds one
+/// `sprig_ctl` connection while it asks for another waits for a held one.
+struct BusyCtl {
+    root: Conn,
+    held: Vec<tokio::task::JoinHandle<Option<(u16, String)>>>,
+    waiting: u64,
+}
+
+impl BusyCtl {
+    async fn hold(e: &Env, root: &str, (busy, busy_id): (&str, u64), n: usize) -> Self {
+        let mut cb = conn(&e.addr, busy).await;
+        let _ = sql(&mut cb, "DROP DATABASE IF EXISTS fctl_hold").await;
+        ok(&mut cb, "CREATE DATABASE fctl_hold").await;
+        let _ = cb.disconnect().await;
+        let mut r = Conn::from_url(root).await.unwrap();
+        ok(&mut r, "START TRANSACTION").await;
+        ok(
+            &mut r,
+            &format!(
+                "SELECT value FROM t{busy_id}_sprig.settings WHERE scope_kind = 'tenant' AND \
+                 scope_id = 0 AND setting_key = 'sprig.next_object_id' FOR UPDATE"
+            ),
+        )
+        .await;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let mut held = Vec::new();
+        for i in 0..n {
+            let (addr, busy) = (e.addr.clone(), busy.to_owned());
+            held.push(tokio::spawn(async move {
+                let mut c = conn(&addr, &busy).await;
+                ok(&mut c, "USE fctl_hold").await;
+                let r = sql(
+                    &mut c,
+                    &format!(
+                        "CREATE FUNCTION h{stamp}_{i}(a INT) RETURNS INT LANGUAGE javascript \
+                         AS $$ return a; $$"
+                    ),
+                )
+                .await;
+                let _ = c.disconnect().await;
+                r.err()
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let waiting = count(
+            &mut r,
+            "SELECT COUNT(*) FROM information_schema.processlist WHERE info LIKE \
+             'UPDATE%LAST_INSERT_ID(CAST(value AS UNSIGNED)%' AND id <> CONNECTION_ID()",
+        )
+        .await;
+        Self {
+            root: r,
+            held,
+            waiting,
+        }
+    }
+
+    /// Lets the waiting deploys go; their outcomes.
+    async fn release(mut self) -> Vec<Option<(u16, String)>> {
+        ok(&mut self.root, "ROLLBACK").await;
+        let _ = self.root.disconnect().await;
+        let mut out = Vec::new();
+        for h in self.held {
+            out.push(h.await.unwrap());
+        }
+        out
+    }
+}
+
+/// Waits until `q` (a count) reaches `n`, at most `secs`: whether it did,
+/// and how long it took.
+async fn reached(c: &mut Conn, q: &str, n: u64, secs: u64) -> (bool, Duration) {
+    let t0 = Instant::now();
+    let got = wait_count(c, q, n, secs).await;
+    (got >= n, t0.elapsed())
+}
+
+const CTL_QTY_RULE: &str = r#"{"namespace": "Test", "name": "QtyPositive",
+ "parameters": {"qty": {"parameterName": "qty", "schema": {"type": ["INTEGER"]}}},
+ "events": {"output": {"name": "output", "parameters": {}},
+            "reject": {"name": "reject", "parameters": {"message": {"type": ["STRING"]}}}},
+ "steps": {
+  "bad": {"statementName": "bad", "namespace": "System", "name": "If",
+    "parameterMap": {"condition": {"c": {"type": "EXPRESSION", "expression": "Arguments.qty <= 0"}}}},
+  "no": {"statementName": "no", "namespace": "System", "name": "GenerateEvent",
+    "executeIftrue": {"Steps.bad.true": true},
+    "parameterMap": {"eventName": {"e": {"type": "VALUE", "value": "reject"}},
+      "results": {"r": {"type": "VALUE", "value": {"name": "message", "value": {"isExpression": false, "value": "qty must be positive"}}}}}}}}"#;
+
+/// The paths that hold a `sprig_ctl` connection across other work, each
+/// run while three of the cluster's four `sprig_ctl` connections (and
+/// three of its four catalog connections) are held ([`BusyCtl`]):
+///
+/// - a cross-tenant publish in a transaction (the outbox forward: its
+///   transaction's lock held while it writes into the member's instance);
+/// - a broadcast in a transaction and one outside (the forward into the
+///   broadcast log, then the fan-out: each broadcast's row lock held while
+///   it delivers to every member);
+/// - a logic deploy (`CREATE FUNCTION`) and a validation enforced by a
+///   `CHECK` (its shard connection was held across the `ALTER TABLE`,
+///   whose DDL takes more).
+///
+/// Each must be done within 5 s, while the connections are still held.
+/// Needs three members on one cluster, `SPRIG_TEST_INHERIT_ROOT` and
+/// `SPRIG_TEST_INHERIT_IDS`; the third member's deploys hold the
+/// connections.
+#[tokio::test]
+async fn delivery_and_deploys_with_one_sprig_ctl_connection_free() {
+    let Some(e) = env("delivery_and_deploys_with_one_sprig_ctl_connection_free") else {
+        return;
+    };
+    let (Some(root), Some(busy_id)) = (
+        var("SPRIG_TEST_INHERIT_ROOT"),
+        e.members.get(2).and_then(|m| tenant_id_of(m)),
+    ) else {
+        eprintln!(
+            "needs SPRIG_TEST_INHERIT_ROOT, SPRIG_TEST_INHERIT_IDS and three members: skipped"
+        );
+        return;
+    };
+    let busy = (e.members[2].as_str(), busy_id);
+    let mut sys = conn(&e.addr, &e.system).await;
+    let _leftovers = Leftovers::dbs(&e, &["fctl", "fctl_sys"]);
+    let mut ms = Vec::new();
+    for m in &e.members {
+        ms.push((m.clone(), conn(&e.addr, m).await));
+    }
+    let _ = sql(&mut sys, "DROP STREAM fctl.ev IMMEDIATE CASCADE").await;
+    clean_db(&mut sys, "fctl").await;
+    clean_db(&mut sys, "fctl_sys").await;
+    for (_, c) in &mut ms {
+        let _ = sql(c, "DROP DATABASE IF EXISTS fctl").await;
+    }
+    ok(&mut sys, "CREATE DATABASE fctl").await;
+    ok(&mut sys, "CREATE DATABASE fctl_sys").await;
+    ok(
+        &mut sys,
+        "CREATE TABLE fctl_sys.t (id INT PRIMARY KEY, qty INT)",
+    )
+    .await;
+    ok(
+        &mut sys,
+        "CREATE STREAM fctl.ev FOR EACH TENANT PARTITIONS 1 RETENTION '2 days'",
+    )
+    .await;
+    // Every member's instance first, so the deliveries below only write.
+    let q = |v: &str| format!("SELECT COUNT(*) FROM fctl.ev WHERE CAST(value AS CHAR) = '{v}'");
+    for (m, c) in &mut ms {
+        ok(
+            &mut sys,
+            &format!("INSERT INTO fctl.ev FOR TENANT {m} (key, value) VALUES ('k0', 'own')"),
+        )
+        .await;
+        assert_eq!(wait_count(c, &q("own"), 1, 60).await, 1, "{m}'s instance");
+    }
+    let mut slow: Vec<String> = Vec::new();
+    let mut report = |what: &str, done: bool, took: Duration, waiting: u64, held: &[_]| {
+        println!(
+            "3 busy ({waiting} waiting): {what}: done {done} in {took:?}; the busy deploys: {held:?}"
+        );
+        if !done || took >= Duration::from_secs(5) {
+            slow.push(format!("{what}: done {done} in {took:?}"));
+        }
+    };
+    let m0 = ms[0].0.clone();
+
+    // A cross-tenant publish in a transaction: the outbox forward.
+    let b = BusyCtl::hold(&e, &root, busy, 3).await;
+    let waiting = b.waiting;
+    ok(&mut sys, "START TRANSACTION").await;
+    ok(
+        &mut sys,
+        &format!("INSERT INTO fctl.ev FOR TENANT {m0} (key, value) VALUES ('k1', 'fwd')"),
+    )
+    .await;
+    ok(&mut sys, "COMMIT").await;
+    let (done, took) = reached(&mut ms[0].1, &q("fwd"), 1, 20).await;
+    let held = b.release().await;
+    report("outbox forward", done, took, waiting, &held);
+    assert!(
+        waiting >= 3,
+        "three deploys should wait on the counter: {waiting}"
+    );
+
+    // Broadcasts, in a transaction and outside one: the fan-out.
+    let b = BusyCtl::hold(&e, &root, busy, 3).await;
+    let waiting = b.waiting;
+    ok(&mut sys, "START TRANSACTION").await;
+    ok(
+        &mut sys,
+        "INSERT INTO fctl.ev FOR ALL TENANTS (key, value) VALUES ('k2', 'bc-txn')",
+    )
+    .await;
+    ok(&mut sys, "COMMIT").await;
+    ok(
+        &mut sys,
+        "INSERT INTO fctl.ev FOR ALL TENANTS (key, value) VALUES ('k3', 'bc-now')",
+    )
+    .await;
+    let t0 = Instant::now();
+    let mut done = true;
+    for (_, c) in ms.iter_mut().take(2) {
+        for v in ["bc-txn", "bc-now"] {
+            let left = Duration::from_secs(20)
+                .saturating_sub(t0.elapsed())
+                .as_secs();
+            done &= reached(c, &q(v), 1, left).await.0;
+        }
+    }
+    let took = t0.elapsed();
+    let held = b.release().await;
+    report("broadcasts to the members", done, took, waiting, &held);
+    // Everybody has both afterwards, once each.
+    for (m, c) in &mut ms {
+        for v in ["bc-txn", "bc-now"] {
+            assert_eq!(wait_count(c, &q(v), 1, 60).await, 1, "{m}: {v}");
+        }
+    }
+
+    // A logic deploy, and a validation enforced by a CHECK.
+    ok(&mut sys, "USE fctl_sys").await;
+    for (what, stmt) in [
+        (
+            "CREATE FUNCTION",
+            "CREATE FUNCTION plus_one(a INT) RETURNS INT LANGUAGE javascript \
+             AS $$ return a + 1; $$"
+                .to_owned(),
+        ),
+        (
+            "CREATE VALIDATION (CHECK)",
+            format!(
+                "CREATE VALIDATION qty_positive ON t FOR INSERT, UPDATE LANGUAGE kirun AS \
+                 '{CTL_QTY_RULE}'"
+            ),
+        ),
+    ] {
+        let b = BusyCtl::hold(&e, &root, busy, 3).await;
+        let waiting = b.waiting;
+        let t0 = Instant::now();
+        let got = tokio::time::timeout(Duration::from_secs(20), sql(&mut sys, &stmt))
+            .await
+            .ok();
+        let took = t0.elapsed();
+        let held = b.release().await;
+        println!("{what}: {got:?}");
+        report(what, matches!(got, Some(Ok(_))), took, waiting, &held);
+    }
+    let r = sql(&mut sys, "INSERT INTO t VALUES (5, -1)").await;
+    assert!(
+        matches!(r, Err((39863, _))),
+        "the validation rejects: {r:?}"
+    );
+
+    let mut cb = conn(&e.addr, busy.0).await;
+    let _ = sql(&mut cb, "DROP DATABASE IF EXISTS fctl_hold").await;
+    let _ = sql(&mut sys, "DROP VALIDATION qty_positive").await;
+    let _ = sql(&mut sys, "DROP FUNCTION plus_one").await;
+    ok(&mut sys, "DROP STREAM fctl.ev IMMEDIATE CASCADE").await;
+    clean_db(&mut sys, "fctl").await;
+    clean_db(&mut sys, "fctl_sys").await;
+    for (_, c) in &mut ms {
+        let _ = sql(c, "DROP DATABASE IF EXISTS fctl").await;
+    }
+    assert!(slow.is_empty(), "{slow:#?}");
+}
+
+// ---------------------------------------------------------------------------
+// Bounded pool waits: with one connection per pool, a held one makes the
+// next wait fail within the pool's limit instead of hanging.
+// ---------------------------------------------------------------------------
+
+/// The sum of `sprig_pool_wait_timeouts_total` over its labels, by pool, from
+/// the gateway's metrics endpoint at `addr` (`host:port`).
+async fn pool_timeouts(addr: &str) -> std::collections::BTreeMap<String, u64> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(
+        format!("GET /metrics HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut body = String::new();
+    s.read_to_string(&mut body).await.unwrap();
+    let mut out = std::collections::BTreeMap::new();
+    for l in body
+        .lines()
+        .filter(|l| l.starts_with("sprig_pool_wait_timeouts_total{"))
+    {
+        let pool = l
+            .split("pool=\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .unwrap_or("?")
+            .to_owned();
+        // A counter: a whole number, possibly written as `2` or `2.0`.
+        let n: u64 = l
+            .rsplit(' ')
+            .next()
+            .and_then(|v| v.split('.').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        *out.entry(pool).or_insert(0) += n;
+    }
+    out
+}
+
+/// Against a gateway started with `SPRIG_TEST_CATALOG_POOL_MAX=1` and
+/// `SPRIG_TEST_CTL_POOL_MAX=1` (say so with `SPRIG_TEST_INHERIT_POOLS_AT_ONE=1`;
+/// its metrics endpoint in `SPRIG_TEST_INHERIT_GATEWAY_METRICS`): a logic
+/// deploy blocked on the catalog's id counter holds the cluster's one
+/// catalog and one `sprig_ctl` connection ([`BusyCtl`]). A `CREATE TABLE`
+/// and a `CREATE STREAM` of another member must each fail instead of
+/// waiting for the holder: every acquire on their way ends at its pool's
+/// limit (catalog 5 s, `sprig_ctl` 10 s), so a statement that meets both
+/// answers within 15 s plus slack (a `CREATE TABLE` first loads the
+/// tenant's inherited copies' states through `sprig_ctl`, which it skips
+/// when that fails). The gateway must count the timeouts, and once the
+/// holder lets go both statements work again.
+#[tokio::test]
+async fn pool_waits_end_when_the_one_connection_is_held() {
+    let Some(e) = env("pool_waits_end_when_the_one_connection_is_held") else {
+        return;
+    };
+    let (Some(root), Some(busy_id), Some(metrics), Some(_)) = (
+        var("SPRIG_TEST_INHERIT_ROOT"),
+        e.members.get(2).and_then(|m| tenant_id_of(m)),
+        var("SPRIG_TEST_INHERIT_GATEWAY_METRICS"),
+        var("SPRIG_TEST_INHERIT_POOLS_AT_ONE").filter(|v| v == "1"),
+    ) else {
+        eprintln!(
+            "needs SPRIG_TEST_INHERIT_POOLS_AT_ONE=1 (a gateway with both pool hooks at 1), \
+             SPRIG_TEST_INHERIT_GATEWAY_METRICS, SPRIG_TEST_INHERIT_ROOT, \
+             SPRIG_TEST_INHERIT_IDS and three members: skipped"
+        );
+        return;
+    };
+    let busy = (e.members[2].as_str(), busy_id);
+    let other = e.members[0].clone();
+    let mut c = conn(&e.addr, &other).await;
+    let _ = sql(&mut c, "DROP STREAM fpw.s").await;
+    let _ = sql(&mut c, "DROP DATABASE IF EXISTS fpw").await;
+    ok(&mut c, "CREATE DATABASE fpw").await;
+    let before = pool_timeouts(&metrics).await;
+
+    let b = BusyCtl::hold(&e, &root, busy, 1).await;
+    assert!(
+        b.waiting >= 1,
+        "the holder's deploy should wait: {}",
+        b.waiting
+    );
+    let mut outcomes = Vec::new();
+    let limit = Duration::from_secs(5 + 10);
+    for stmt in [
+        "CREATE TABLE fpw.t (a INT)",
+        "CREATE STREAM fpw.s PARTITIONS 1",
+    ] {
+        let t0 = Instant::now();
+        let got = tokio::time::timeout(Duration::from_secs(30), sql(&mut c, stmt)).await;
+        let took = t0.elapsed();
+        println!("one connection held: {stmt}: {got:?} in {took:?}");
+        outcomes.push((stmt, got, took));
+    }
+    let held = b.release().await;
+    println!("the holder's deploy: {held:?}");
+    let after = pool_timeouts(&metrics).await;
+    println!("pool wait timeouts before {before:?}, after {after:?}");
+    for (stmt, got, took) in &outcomes {
+        assert!(
+            matches!(got, Ok(Err(_))),
+            "{stmt}: must fail while the one connection is held: {got:?}"
+        );
+        assert!(
+            *took < limit + Duration::from_secs(3),
+            "{stmt}: answered after {took:?}, past its pools' limits ({limit:?})"
+        );
+    }
+    let gained: u64 = after
+        .iter()
+        .map(|(p, n)| n.saturating_sub(before.get(p).copied().unwrap_or(0)))
+        .sum();
+    assert!(gained >= 2, "two timeouts counted: {before:?} -> {after:?}");
+
+    // Free again: both work.
+    ok(&mut c, "CREATE TABLE fpw.t (a INT)").await;
+    ok(&mut c, "CREATE STREAM fpw.s PARTITIONS 1").await;
+    ok(&mut c, "DROP STREAM fpw.s").await;
+    ok(&mut c, "DROP DATABASE fpw").await;
+    let mut cb = conn(&e.addr, busy.0).await;
+    let _ = sql(&mut cb, "DROP DATABASE IF EXISTS fctl_hold").await;
+}

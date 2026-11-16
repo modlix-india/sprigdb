@@ -268,7 +268,13 @@ impl PassSession {
                 let mut ok = OkPacket::new(s);
                 // Change sinks over the table aren't paused when its
                 // policies come to bind their owners: their workers filter each batch for the owner.
-                if let Err(e) = Box::pin(self.deploy_checks(object)).await {
+                let deployed = Box::pin(self.deploy_checks(object)).await;
+                if deployed.is_ok() {
+                    // Stored code over the table reads its policy view
+                    // from now on, whoever calls it.
+                    Box::pin(self.rls_wire_code()).await;
+                }
+                if let Err(e) = deployed {
                     tracing::warn!(error = %e, "row-level security write checks not deployed");
                     if let Some(ts) = self.tenant.as_deref_mut() {
                         ts.warnings = Some(vec![crate::tenant::session::LocalWarning {
@@ -426,7 +432,11 @@ impl PassSession {
         }
         drop(probe);
         crate::tenant::rls::hidden_set(tenant.0, object.0, hidden);
-        let mut plan: Vec<(String, Vec<String>)> = Vec::new();
+        // Per shard: the views and the context function, then (after the
+        // change topic's view) the triggers, whose label marks the
+        // deployment's format: written last, a labelled trigger means
+        // every other part was written before it.
+        let mut plan: Vec<(String, Vec<String>, Vec<String>)> = Vec::new();
         for (schema, _) in &list {
             // `off`: the gateway's rewrite alone, nothing in MariaDB.
             if !sec.enabled || enforcement == "off" {
@@ -438,7 +448,7 @@ impl PassSession {
                     schema, &obj.name, object.0,
                 ));
                 d.extend(element_view_drops(schema, &obj.name, object.0));
-                plan.push((schema.clone(), d));
+                plan.push((schema.clone(), d, Vec::new()));
                 continue;
             }
             let here = schema.clone();
@@ -458,7 +468,8 @@ impl PassSession {
                 lex: lex_opts,
                 physical: &physical,
             };
-            let mut stmts = spec.statements_for(layered)?;
+            let triggers = spec.statements_for(layered)?;
+            let mut stmts = Vec::new();
             if views {
                 // The context function, its caller's right to run it, then
                 // the views.
@@ -492,7 +503,7 @@ impl PassSession {
                 ));
                 stmts.extend(element_view_drops(schema, &obj.name, object.0));
             }
-            plan.push((schema.clone(), stmts));
+            plan.push((schema.clone(), stmts, triggers));
         }
         let _ = persona;
         let mut shards = super::logic_bound::CtlShards {
@@ -509,7 +520,7 @@ impl PassSession {
                 .flatten()
                 .any(|e| e.to_ascii_uppercase().contains("SPRIG_TENANT_"))
         });
-        for (schema, stmts) in &plan {
+        for (schema, stmts, _) in &plan {
             let s = shards.session(schema).await?;
             if subtree {
                 for q in sprig_sql::rls::subtree::setup_sql() {
@@ -523,6 +534,29 @@ impl PassSession {
                 s.exec(q).await?;
             }
         }
+        // Back before the change topic's view and the catalog change below
+        // (catalog before `sprig_ctl`, never the other way round).
+        let list = std::mem::take(&mut shards.list);
+        drop(shards);
+        // The table's change topic filter view follows its policies.
+        Box::pin(self.redeploy_change_view(object)).await;
+        let mut shards = super::logic_bound::CtlShards {
+            list,
+            conns: HashMap::new(),
+            locator: Arc::clone(&svc.locator),
+        };
+        for (schema, _, triggers) in &plan {
+            if triggers.is_empty() {
+                continue;
+            }
+            let s = shards.session(schema).await?;
+            s.exec(&format!("USE {}", sprig_sql::rls::quote(schema)))
+                .await?;
+            for q in triggers {
+                s.exec(q).await?;
+            }
+        }
+        drop(shards);
         verified()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -553,9 +587,6 @@ impl PassSession {
                 if let Some(ts) = self.tenant.as_deref_mut() {
                     crate::tenant::rls::await_auth(ts, v).await;
                 }
-                // The table's change topic filter view
-                // follows its policies.
-                Box::pin(self.redeploy_change_view(object)).await;
                 Ok(())
             }
             Err(e) => {
@@ -708,6 +739,20 @@ impl PassSession {
                 )),
                 s = q(schema),
             ));
+            // Then how many triggers carry this build's format label: a
+            // deployment of an older format is redeployed whole.
+            extra.push_str(&format!(
+                ", (SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = {s} \
+                 AND TRIGGER_NAME IN ({}, {}, {}) AND ACTION_STATEMENT LIKE {})",
+                q(&names[0]),
+                q(&names[1]),
+                q(&names[2]),
+                q(&format!(
+                    "%{}:%",
+                    sprig_sql::rls::triggers::format_label().replace('_', "\\_")
+                )),
+                s = q(schema),
+            ));
             let rows = s
                 .rows(&format!(
                     "SELECT (SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = {s} \
@@ -793,8 +838,13 @@ impl PassSession {
             let merged_term = cell(7 + element_tables.len() * 5)
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
-            // Triggers made by older builds check an override as an insert.
-            let triggers_ok = triggers_ok && (!triggers || inheritable == (layer_checks > 0));
+            let formatted = cell(8 + element_tables.len() * 5)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            // Triggers made by older builds check an override as an insert,
+            // or render the policies in an older format.
+            let triggers_ok =
+                triggers_ok && (!triggers || (inheritable == (layer_checks > 0) && formatted == 3));
             let views_ok = views_ok && elements_ok && (!views || !inheritable || merged_term > 0);
             if !triggers_ok || !views_ok {
                 complete = false;
@@ -1006,6 +1056,9 @@ impl PassSession {
         {
             bs.vars_mut().rls_views = None;
         }
+        // Stored policies and deployed checks from older builds (once per
+        // tenant and auth version).
+        Box::pin(self.rls_refresh()).await;
         let Some(ts) = self.tenant.as_deref_mut() else {
             return Ok(None);
         };
@@ -1064,7 +1117,29 @@ impl PassSession {
                 std::collections::BTreeSet::new()
             }
         };
-        let context = match crate::tenant::rls::definer_contexts(&cat, &accounts) {
+        // Their subtree sets, when a policy of the tenant names the
+        // subtree functions (definers are the tenant's users: its subtree).
+        let names_tree = !accounts.is_empty()
+            && state.rows().policies.iter().any(|p| {
+                [p.using_expr.as_deref(), p.check_expr.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|e| e.to_ascii_uppercase().contains("SPRIG_TENANT_"))
+            });
+        let tree = if names_tree {
+            match crate::tenant::rls::tree_binding(ts, &cat).await {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    // The definers' sets stay empty: their subtree
+                    // policies show nothing.
+                    tracing::warn!(error = %e, "definers' tenant subtree not read");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let context = match crate::tenant::rls::definer_contexts(&cat, &accounts, tree.as_ref()) {
             Some(d) => {
                 let mut v: serde_json::Value =
                     serde_json::from_str(&context).unwrap_or(serde_json::Value::Null);
@@ -1655,6 +1730,226 @@ impl PassSession {
             }
         }
         safe
+    }
+}
+
+/// What [`PassSession::rls_refresh`] last did for a tenant on this gateway.
+#[derive(Debug, Clone, Copy)]
+struct Refreshed {
+    /// The auth version it ran at.
+    version: u64,
+    /// When.
+    at: std::time::Instant,
+    /// Whether it finished without an error.
+    ok: bool,
+    /// Whether every protected table's deployment was checked (once per
+    /// process).
+    probed: bool,
+}
+
+fn refreshed() -> &'static std::sync::Mutex<HashMap<u64, Refreshed>> {
+    static R: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, Refreshed>>> =
+        std::sync::OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+impl PassSession {
+    /// Brings what the catalog and MariaDB hold of the tenant's
+    /// row-level security up to this build, at a user session's statement:
+    /// once per tenant and auth version on this gateway, and again a minute
+    /// after a failure.
+    ///
+    /// ```text
+    /// policies whose MongoDB forms compile to other SQL now
+    ///   → their rows rewritten, their tables' checks marked stale
+    ///     (tenant::rls::recompile_policies; idempotent across gateways)
+    /// the tables of the rows this gateway rewrote, and once per process
+    ///   those whose checks are behind their policies (a deployment that
+    ///   didn't finish)
+    ///   → deploy_checks: views, change topic view, then triggers
+    /// once per process: every other deployed table checked
+    ///   → ensure_checks redeploys one of an older format
+    /// ```
+    ///
+    /// Each step is safe to stop at any point: the rewrite already applies
+    /// the new SQL (loaded so), a stale table stays stale in the catalog
+    /// until its deployment is recorded, and an unlabelled trigger marks a
+    /// deployment that didn't finish.
+    pub(super) async fn rls_refresh(&mut self) {
+        let Some(ts) = self.tenant.as_deref() else {
+            return;
+        };
+        if ts.principal.user_id.is_none() {
+            return;
+        }
+        let Some(cat) = ts.catalog().cloned() else {
+            return;
+        };
+        if !RlsState::of(&cat).is_some_and(RlsState::is_migrated) {
+            return;
+        }
+        let tenant = ts.tenant.0;
+        let probed = {
+            let mut m = refreshed()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prev = m.get(&tenant).copied();
+            if let Some(p) = prev
+                && (p.version > cat.auth_version
+                    || (p.version == cat.auth_version
+                        && (p.ok || p.at.elapsed() < std::time::Duration::from_secs(60))))
+            {
+                return;
+            }
+            let probed = prev.is_some_and(|p| p.probed);
+            // Taken now: other sessions of the tenant go on meanwhile.
+            m.insert(
+                tenant,
+                Refreshed {
+                    version: cat.auth_version,
+                    at: std::time::Instant::now(),
+                    ok: false,
+                    probed,
+                },
+            );
+            probed
+        };
+        let r = Box::pin(self.rls_refresh_now(&cat, !probed)).await;
+        if let Err(e) = &r {
+            tracing::warn!(tenant, error = %e, "row-level security not brought up to this build yet; again in a minute");
+        }
+        refreshed()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                tenant,
+                Refreshed {
+                    version: cat.auth_version,
+                    at: std::time::Instant::now(),
+                    ok: r.is_ok(),
+                    probed: probed || r.is_ok(),
+                },
+            );
+    }
+
+    async fn rls_refresh_now(
+        &mut self,
+        cat: &Arc<sprig_catalog::TenantCatalog>,
+        probe: bool,
+    ) -> Result<()> {
+        let Some(ts) = self.tenant.as_deref_mut() else {
+            return Ok(());
+        };
+        let mut stale = crate::tenant::rls::recompile_policies(ts, cat).await?;
+        let cat = ts.catalog().cloned().unwrap_or_else(|| Arc::clone(cat));
+        let Some(state) = RlsState::of(&cat).cloned() else {
+            return Ok(());
+        };
+        // Once per process, tables whose checks are behind their policies:
+        // a gateway stopped between a change and its deployment (later
+        // runs leave those to the gateway making the change, so a policy
+        // change isn't deployed by every gateway at once).
+        if probe {
+            stale.extend(
+                state
+                    .rows()
+                    .security
+                    .iter()
+                    .filter(|s| !s.checks_current() && (s.enabled || s.checks_version > 0))
+                    .map(|s| s.object_id),
+            );
+        }
+        stale.sort_unstable();
+        stale.dedup();
+        let mut failed = None;
+        for o in &stale {
+            if let Err(e) = Box::pin(self.deploy_checks(*o)).await {
+                tracing::warn!(object = o.0, error = %e, "row-level security checks not redeployed");
+                failed = Some(e);
+            }
+        }
+        if !stale.is_empty() {
+            tracing::info!(
+                tables = stale.len(),
+                "row-level security checks behind their policies redeployed"
+            );
+        }
+        if probe {
+            let deployed: Vec<ObjectId> = state
+                .rows()
+                .security
+                .iter()
+                .filter(|s| s.enabled && s.checks_version > 0 && !stale.contains(&s.object_id))
+                .map(|s| s.object_id)
+                .collect();
+            for o in deployed {
+                if let Err(e) = Box::pin(self.ensure_checks(o)).await {
+                    tracing::warn!(object = o.0, error = %e, "row-level security checks not verified");
+                    failed = Some(e);
+                }
+            }
+        }
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// Points the tenant's stored code over tables with policy views at
+    /// those views now, after stored code was created or a table's
+    /// policies changed: a definer routine a bound user creates otherwise
+    /// waits for a bound session's statement, and other callers get 1142
+    /// meanwhile (the definer's account can't read the table itself). A
+    /// failure is logged; the code then stays refused to bound sessions.
+    pub(super) async fn rls_wire_code(&mut self) {
+        let Some(ts) = self.tenant.as_deref_mut() else {
+            return;
+        };
+        let Ok(cat) = ts.refresh().await else {
+            return;
+        };
+        let Some(state) = RlsState::of(&cat).filter(|s| s.any_enabled()) else {
+            return;
+        };
+        let svc = Arc::clone(ts.services());
+        let names: Vec<String> = state
+            .rows()
+            .security
+            .iter()
+            .filter(|s| {
+                s.enabled
+                    && s.checks_version > 0
+                    && crate::tenant::rls::views_on(&svc, &cat, s.object_id)
+            })
+            .filter_map(|s| cat.objects.get(s.object_id))
+            .map(|o| o.name.to_lowercase())
+            .collect();
+        if names.is_empty() {
+            return;
+        }
+        let tainted = match crate::tenant::rls::tainted(ts, &cat, &names).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "stored code over protected tables not read");
+                return;
+            }
+        };
+        let fixable: Vec<crate::tenant::rls::TaintedCode> = tainted
+            .code
+            .iter()
+            .filter(|c| {
+                !c.dynamic
+                    && matches!(
+                        c.kind,
+                        ObjectKind::View
+                            | ObjectKind::Procedure
+                            | ObjectKind::Function
+                            | ObjectKind::Trigger
+                    )
+                    && crate::tenant::rls::enforcement(&svc, &cat, c.db) == "views"
+            })
+            .cloned()
+            .collect();
+        if !fixable.is_empty() {
+            let _ = Box::pin(self.repoint(&cat, &fixable)).await;
+        }
     }
 }
 

@@ -729,6 +729,10 @@ mod tests {
     const ACCOUNTS: &str = "CREATE TABLE `accounts` (\n  `aid` int(11) NOT NULL,\n  `email` varchar(40) COLLATE utf8mb4_general_ci DEFAULT NULL,\n  `cid` int(11) DEFAULT NULL,\n  PRIMARY KEY (`aid`),\n  UNIQUE KEY `email` (`email`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci";
 
     fn topo(state: LookupState, columns: &[&str]) -> StaticTopology {
+        topo_rehashing(state, columns, false)
+    }
+
+    fn topo_rehashing(state: LookupState, columns: &[&str], rehashing: bool) -> StaticTopology {
         let c1 = ClusterId::new("c1").unwrap();
         let c2 = ClusterId::new("c2").unwrap();
         let spec = KeySpec::new(vec![sprig_shard::KeyClass::Numeric]).unwrap();
@@ -749,6 +753,7 @@ mod tests {
             origin: LookupOrigin::UniqueKey,
             state,
             map: Some(Arc::new(lmap)),
+            rehashing,
         };
         build(
             7,
@@ -951,6 +956,28 @@ mod tests {
             ),
             Plan::Read(_)
         ));
+    }
+
+    /// After a re-key's cutover, until the re-key rebuilds it, a public
+    /// lookup may name owners by the old key's hashes: reads scatter, and
+    /// inserts still claim (and the claim knows to check every shard).
+    #[test]
+    fn a_rehashing_lookup_is_maintained_but_not_followed() {
+        let t = topo_rehashing(LookupState::Public, &["email"], true);
+        assert!(matches!(
+            p_with(&t, "SELECT * FROM accounts WHERE email = 'a@x'"),
+            Plan::Read(_)
+        ));
+        let Plan::Write(w) = p_with(
+            &t,
+            "INSERT INTO accounts (cid, email, aid) VALUES (1, 'a@x', 10)",
+        ) else {
+            panic!()
+        };
+        let [c] = w.claims.as_slice() else {
+            panic!("{:?}", w.claims)
+        };
+        assert!(c.lookup.index.rehashing);
     }
 
     #[test]

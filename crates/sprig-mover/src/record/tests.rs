@@ -389,3 +389,24 @@ async fn retention_follows_the_setting_and_an_operators_end_stands() {
     let (after, _) = st.get(&rec.job_id).await.unwrap();
     assert_eq!(after.retain_until_ms, Some(now - 5));
 }
+
+#[test]
+fn a_job_without_its_own_verify_mode_follows_the_setting() {
+    use crate::api::VerifyMode;
+    let s = spec(4);
+    assert_eq!(s.verify_mode(VerifyMode::Off), VerifyMode::Off);
+    assert_eq!(s.verify_mode(VerifyMode::Full), VerifyMode::Full);
+    let chosen = spec(4).with_verify(VerifyMode::Sample { pct: 50 });
+    assert_eq!(
+        chosen.verify_mode(VerifyMode::Off),
+        VerifyMode::Sample { pct: 50 }
+    );
+    // A record written before the field existed keeps its own mode.
+    let mut old = serde_json::to_value(&s).unwrap();
+    old.as_object_mut().unwrap().remove("verify_from_settings");
+    let old: JobSpec = serde_json::from_value(old).unwrap();
+    assert_eq!(old.verify_mode(VerifyMode::Off), VerifyMode::Full);
+    // The flag round-trips.
+    let back: JobSpec = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+    assert_eq!(back, s);
+}

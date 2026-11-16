@@ -10,6 +10,7 @@ use sprig_approvals::model::{Level, RecId, Recommendation, State};
 use sprig_approvals::policy::level_for;
 use sprig_approvals::store::{Filter, RecStore};
 use sprig_approvals::{Act, Caller, Kind, may_act, may_see, settings as keys};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::TenantId;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_settings::ScopeKind;
@@ -810,7 +811,7 @@ impl RecommendationsService {
         use mysql_async::prelude::Queryable;
         let ep = self.ctl.locator().writer(t).await?;
         let schema = ep.store.schema().to_owned();
-        let mut c = ep.pool.get_conn().await.map_err(|e| {
+        let mut c = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e)
         })?;
         let id: Option<u32> = c

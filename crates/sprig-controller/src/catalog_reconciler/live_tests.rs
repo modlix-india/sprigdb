@@ -139,6 +139,7 @@ async fn live_reconciler_repairs_crashes_and_outside_changes() {
             current_db: Some("billing"),
             user: None,
             lower_case_table_names: false,
+            wait: None,
         };
         let table = |name: &str| DdlStatement::CreateObject {
             kind: ObjectKind::Table,

@@ -62,6 +62,20 @@ pub struct Placement {
     pub writes: Vec<String>,
     /// Static cost.
     pub cost: u64,
+    /// What compiled `db.call`s were compiled against ([`crate::calls`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<sprig_logic_compile::link::CallDep>,
+    /// Modules those calls reach, directly or through others.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reaches: Vec<u64>,
+    /// The longest chain of compiled calls below this code.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub call_depth: u32,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// Places a compiled version. `single_shard` says the database's group
@@ -108,6 +122,21 @@ pub fn place(c: &Compiled, pref: TierPref, single_shard: bool) -> Result<Placeme
         reads: a.reads.clone(),
         writes: a.writes.clone(),
         cost: a.cost,
+        calls: if tier == Tier::MariaDb {
+            a.calls.clone()
+        } else {
+            Vec::new()
+        },
+        reaches: if tier == Tier::MariaDb {
+            a.reaches.clone()
+        } else {
+            Vec::new()
+        },
+        call_depth: if tier == Tier::MariaDb {
+            a.call_depth
+        } else {
+            0
+        },
     })
 }
 
@@ -338,6 +367,9 @@ mod explain_tests {
             reads: vec!["products".into()],
             writes: Vec::new(),
             cost: 4,
+            calls: Vec::new(),
+            reaches: Vec::new(),
+            call_depth: 0,
         };
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(explain_stored("engine", &v), explain(&p));
@@ -349,6 +381,9 @@ mod explain_tests {
             reads: Vec::new(),
             writes: vec!["orders".into()],
             cost: 2,
+            calls: Vec::new(),
+            reaches: Vec::new(),
+            call_depth: 0,
         };
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(explain_stored("mariadb", &v), explain(&m));

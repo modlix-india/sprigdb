@@ -1004,7 +1004,7 @@ world = [
 ]
 calls = [
   { tool = "describe", args = { db = "shop", table = "orders" } },
-  { tool = "propose_tile", args = { dashboard = "ops", title = "Orders per day (30 days)", db = "shop", sql = "SELECT DATE(created_at) AS day, COUNT(*) AS orders FROM orders WHERE created_at >= CURRENT_DATE - INTERVAL 30 DAY GROUP BY day ORDER BY day", chart = '{"mark": "line", "x": "day", "y": "orders"}' }, has = { sql = ["created_at", "group by"], chart = ["line"] } },
+  { tool = "propose_tile", args = { dashboard = "ops", title = "Orders per day (30 days)", db = "shop", sql = "SELECT DATE(created_at) AS day, COUNT(*) AS orders FROM orders WHERE created_at >= CURRENT_DATE - INTERVAL 30 DAY GROUP BY day ORDER BY day", chart = '{"mark": "line", "columns": [{"field": "day", "datePart": "day"}], "rows": [{"field": "orders", "agg": "sum"}]}' }, has = { sql = ["created_at", "group by"], chart = ["line"] } },
 ]
 answer = """
 I proposed a line tile "Orders per day (30 days)" for the ops dashboard: daily `COUNT(*)` of orders grouped by `DATE(created_at)` over the last 30 days. Preview it and add it if it looks right — it hasn't been added yet.

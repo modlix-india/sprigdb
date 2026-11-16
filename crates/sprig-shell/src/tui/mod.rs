@@ -6,6 +6,7 @@
 //! or, natively, sends `KILL QUERY` and reconnects.
 
 pub mod app;
+pub mod assistant;
 pub mod complete;
 pub mod editor;
 pub mod explorer;
@@ -139,6 +140,8 @@ struct Rt {
     admin: Option<AdminApi>,
     rates: Rates,
     last_auth: Instant,
+    /// The assistant's streaming answer.
+    ai_task: Option<AbortHandle>,
 }
 
 fn describe(r: &Runner) -> (String, Option<String>, bool) {
@@ -449,6 +452,73 @@ impl Rt {
                 });
             }
             Effect::Copy(text) => copy_osc52(&text),
+            Effect::AiChat(body) => {
+                if let Some(h) = self.ai_task.take() {
+                    h.abort();
+                }
+                let c = self.client.clone();
+                let h = tokio::spawn(async move {
+                    let lines = tx.clone();
+                    let r = c
+                        .ai_chat(&body, &mut |v| {
+                            let _ = lines.send(Msg::Ai(v));
+                        })
+                        .await;
+                    let _ = tx.send(Msg::AiDone(r.err()));
+                });
+                self.ai_task = Some(h.abort_handle());
+            }
+            Effect::AiStop => {
+                // Dropping the stream stops the turn in the gateway.
+                if let Some(h) = self.ai_task.take() {
+                    h.abort();
+                    let _ = tx.send(Msg::AiDone(Some(ShellError::shell(
+                        ShellCode::Cancelled,
+                        "stopped",
+                    ))));
+                }
+            }
+            Effect::AiAccept(id) => {
+                let c = self.client.clone();
+                tokio::spawn(async move {
+                    let path = format!("/v1/ai/proposals/{}:accept", crate::api::encode(&id));
+                    let r = c
+                        .call(
+                            hyper::Method::POST,
+                            &path,
+                            Some(&serde_json::json!({"confirm": true})),
+                        )
+                        .await;
+                    let _ = tx.send(Msg::AiAccepted(id, r));
+                });
+            }
+            Effect::AiDismiss(id) => {
+                let c = self.client.clone();
+                tokio::spawn(async move {
+                    let path = format!("/v1/ai/proposals/{}:dismiss", crate::api::encode(&id));
+                    let _ = c
+                        .call(hyper::Method::POST, &path, Some(&serde_json::json!({})))
+                        .await;
+                });
+            }
+            Effect::AiFeedback(body) => {
+                let c = self.client.clone();
+                tokio::spawn(async move {
+                    let _ = c
+                        .call(hyper::Method::POST, "/v1/ai/feedback", Some(&body))
+                        .await;
+                });
+            }
+            Effect::AiSent(conv) => {
+                let c = self.client.clone();
+                tokio::spawn(async move {
+                    let path = format!(
+                        "/v1/ai/conversations/{}?payloads=true",
+                        crate::api::encode(&conv)
+                    );
+                    let _ = tx.send(Msg::AiSent(c.get(&path).await));
+                });
+            }
             Effect::InboxRefresh => {
                 let src = InboxSource {
                     client: self.client.clone(),
@@ -671,6 +741,7 @@ async fn open(
         admin,
         rates: Rates::default(),
         last_auth: Instant::now(),
+        ai_task: None,
     };
     // Keys come from a thread reading the terminal.
     let (ktx, mut krx) = mpsc::unbounded_channel::<Event>();
@@ -728,7 +799,9 @@ async fn open(
             ev = krx.recv() => match ev {
                 Some(Event::Key(k)) if k.kind != KeyEventKind::Release => fx = app.on_key(k),
                 Some(Event::Paste(s)) => {
-                    if let Some(t) = app.tabs.get_mut(app.screen) {
+                    if app.assistant.open && app.focus == app::Focus::Results && app.fixed().is_none() {
+                        app.assistant.input.push_str(&s.replace('\n', " "));
+                    } else if let Some(t) = app.tabs.get_mut(app.screen) {
                         t.editor.insert_str(&s);
                     } else if app.fixed() == Some(Fixed::Admin) {
                         app.admin.input.insert_str(&s.replace('\n', " "));
@@ -753,6 +826,9 @@ async fn open(
         }
     }
     for (h, _, _) in rt.tasks.values() {
+        h.abort();
+    }
+    if let Some(h) = rt.ai_task.take() {
         h.abort();
     }
     restore();

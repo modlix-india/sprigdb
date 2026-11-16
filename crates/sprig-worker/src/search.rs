@@ -578,6 +578,22 @@ impl Seeder for GatewaySeeder {
                 generation: self.generation,
                 after: after.cloned(),
                 limit,
+                keys: None,
+            },
+        )
+        .await
+    }
+
+    async fn fetch(&mut self, keys: &[Key]) -> Result<Vec<SearchRecord>> {
+        seed_call(
+            &self.gateways,
+            &SeedRequest {
+                tenant: self.tenant,
+                index: self.index,
+                generation: self.generation,
+                after: None,
+                limit: keys.len(),
+                keys: Some(keys.to_vec()),
             },
         )
         .await
@@ -631,6 +647,7 @@ impl CopyHost for WorkerHost {
                 generation: def.generation,
                 after: None,
                 limit: 0,
+                keys: None,
             },
         )
         .await;

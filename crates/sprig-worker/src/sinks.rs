@@ -50,6 +50,9 @@ pub struct SinksEnv {
 /// sink's owner may see, checked before each batch.
 pub(crate) struct RlsCatalogs {
     source: sprig_catalog::cache::MariaSource,
+    /// The global tier (the tenant directory) and the worker's settings:
+    /// definers' subtree sets. `None`: they stay empty.
+    tree: Option<(Arc<dyn MetaStore>, crate::settings::WorkerSettings)>,
     cache: std::sync::Mutex<
         std::collections::HashMap<
             TenantId,
@@ -60,6 +63,8 @@ pub(crate) struct RlsCatalogs {
 
 impl RlsCatalogs {
     pub(crate) fn new(locator: Arc<ShardMapLocator>) -> Option<Self> {
+        // Policies from MongoDB filters get this build's SQL when loaded.
+        sprig_auth::authz::rls::set_mongo_compiler(sprig_doc::policy::stored_sql);
         let ext: Vec<Arc<dyn sprig_catalog::CatalogExtension>> = vec![
             Arc::new(sprig_auth::AuthExtension),
             Arc::new(sprig_auth::authz::AuthzExtension),
@@ -69,8 +74,20 @@ impl RlsCatalogs {
             .ok()
             .map(|source| Self {
                 source,
+                tree: None,
                 cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             })
+    }
+
+    /// Reads definers' tenant subtrees from `global`'s directory, up to
+    /// `rls.inline_subtree_max` tenants (`settings`), for [`Self::context`].
+    pub(crate) fn with_tree(
+        mut self,
+        global: Arc<dyn MetaStore>,
+        settings: crate::settings::WorkerSettings,
+    ) -> Self {
+        self.tree = Some((global, settings));
+        self
     }
 
     async fn catalog(&self, tenant: TenantId) -> Result<Arc<sprig_catalog::TenantCatalog>> {
@@ -176,14 +193,27 @@ impl RlsCatalogs {
     /// the gateway builds it for a session): what MariaDB's policy views
     /// and write triggers apply while worker-run code of that definer runs.
     /// `None` when the tenant has no row-level security. Claims are absent
-    /// (no token) and the subtree sets empty, so policies naming them show
-    /// nothing to such code.
+    /// (no token: a claim is a session's). The definer is a user of the
+    /// tenant, so its subtree sets are the tenant's, as for a definer
+    /// routine in the gateway: `"sub"` the tenant's subtree, `"man"` the
+    /// same when the definer administers the tenant. They are read only
+    /// when a policy of the tenant names the subtree functions, and stay
+    /// empty (those policies then show nothing) without a directory, when
+    /// reading it fails, or above `rls.inline_subtree_max`: the subtree
+    /// table's view reads the session account's tenant, and worker-run
+    /// code runs as `sprig_ctl`.
     pub(crate) async fn context(&self, tenant: TenantId, user: u32) -> Result<Option<String>> {
-        use sprig_auth::authz::{AuthzState, CompiledPrivileges};
+        use sprig_auth::authz::{Action, AuthzState, CompiledPrivileges, Target};
         let cat = self.catalog(tenant).await?;
-        if sprig_auth::authz::rls::RlsState::of(&cat).is_none() {
+        let Some(state) = sprig_auth::authz::rls::RlsState::of(&cat) else {
             return Ok(None);
-        }
+        };
+        let names_tree = state.rows().policies.iter().any(|p| {
+            [p.using_expr.as_deref(), p.check_expr.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|e| e.to_ascii_uppercase().contains("SPRIG_TENANT_"))
+        });
         let authz = AuthzState::of(&cat).ok_or_else(|| {
             SprigError::new(
                 SprigCode::RlsUnsupported,
@@ -202,6 +232,31 @@ impl RlsCatalogs {
             })?;
         let c = CompiledPrivileges::compile(authz, u, &authz.granted_roles(u));
         let r = sprig_auth::authz::rls::compile(&cat, &c, u);
+        let tree = match &self.tree {
+            Some((global, settings)) if names_tree => {
+                match sprig_auth::authz::rls::directory_subtree(global.as_ref(), tenant.0).await {
+                    Ok(t) => {
+                        let max = settings.tenant_get(
+                            tenant,
+                            &sprig_auth::authz::settings::RLS_INLINE_SUBTREE_MAX,
+                        );
+                        if t.len() as u64 <= max {
+                            t
+                        } else {
+                            tracing::warn!(%tenant, tenants = t.len(), max, "worker-run code: tenant subtree above rls.inline_subtree_max, its subtree policies show nothing");
+                            Vec::new()
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(%tenant, error = %e, "worker-run code: tenant subtree not read, its subtree policies show nothing");
+                        Vec::new()
+                    }
+                }
+            }
+            _ => Vec::new(),
+        };
+        let admin = c.everything || c.allows(Action::TenantAdmin, Target::Tenant);
+        let managed = if admin { tree.clone() } else { Vec::new() };
         let v = json!({
             "b": u8::from(r.bypass),
             "x": r.exempt.iter().map(|o| o.0).collect::<Vec<_>>(),
@@ -214,8 +269,8 @@ impl RlsCatalogs {
                 "space": (row.home_space_id != 0).then_some(row.home_space_id),
                 "claims": Value::Null,
                 "attrs": row.attributes.clone().unwrap_or(Value::Null),
-                "sub": Vec::<u64>::new(),
-                "man": Vec::<u64>::new(),
+                "sub": tree,
+                "man": managed,
             }
         });
         Ok(Some(v.to_string()))

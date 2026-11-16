@@ -391,9 +391,10 @@ impl Field<'_> {
                 "JSON_TYPE({x}) = 'STRING' AND ({ty} IS NULL OR {ty} = 'symbol') AND {val} COLLATE utf8mb4_bin = {}",
                 str_lit(s)
             )),
-            Bson::Boolean(b) => {
-                SqlPred::exact(format!("JSON_TYPE({x}) = 'BOOLEAN' AND {val} = '{b}'"))
-            }
+            Bson::Boolean(b) => SqlPred::exact(format!(
+                "JSON_TYPE({x}) = 'BOOLEAN' AND {val} IN ({})",
+                crate::sql::json_bool_texts(*b)
+            )),
             Bson::Null | Bson::Undefined => {
                 SqlPred::exact(format!("({x} IS NULL OR JSON_TYPE({x}) = 'NULL')"))
             }
@@ -435,7 +436,13 @@ impl Field<'_> {
                     ))
                 }
             }
-            Bson::Boolean(b) => SqlPred::exact(format!("{c} = 90 AND {n} = {}", u8::from(*b))),
+            // Not `{n}`: index columns made before MariaDB 11.8's `JSON_VALUE`
+            // answered `1` for `true` hold 0 for every boolean.
+            Bson::Boolean(b) => SqlPred::exact(format!(
+                "{c} = 90 AND {} IN ({})",
+                self.val(),
+                crate::sql::json_bool_texts(*b)
+            )),
             Bson::Null | Bson::Undefined => SqlPred::exact(format!("{c} = 20")),
             Bson::ObjectId(o) => {
                 SqlPred::exact(format!("{c} = 80 AND {n} = 0 AND {s} = '{}'", o.to_hex()))

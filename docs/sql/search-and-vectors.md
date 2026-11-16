@@ -23,7 +23,8 @@ CREATE SEARCH INDEX [IF NOT EXISTS] index_name ON [db_name.]object_name (
 field_spec:
     column_name kind [WITH (field_option = value [, ...])]       -- a table
   | '$.path' kind [WITH (field_option = value [, ...])]          -- a collection's documents
-  | VALUE ['$.path'] kind [WITH (field_option = value [, ...])]  -- a key-value namespace's values
+  | VALUE ['$.path'] kind [WITH (field_option = value [, ...])]  -- a key-value namespace's string values
+  | VALUE FIELD 'name' [AS alias] kind [WITH (field_option = value [, ...])]  -- its hash fields
 
 kind:
     TEXT | STRING | KEYWORD | TOKEN | NUMBER | NUMERIC | DATE
@@ -49,12 +50,15 @@ kind:
 | `filter` | `false` | Keep the value for fast filtering |
 | `sort` | `false` | Keep the value for sorting |
 | `facet` | `false` | Count the field in facets |
+| `separator` | none | `KEYWORD` hash fields: split values at this one character |
+| `case_sensitive` | `false` | Fields with a `separator`: keep the values' case instead of lowercasing them |
 
 | Index option | Default | Meaning |
 |---|---|---|
 | `analyzer` | `standard` | Analyzer of text fields that name none |
-| `partitions` | 1 | Key-hash partitions per copy; more partitions spread a large index over workers |
+| `partitions` | 2 | Key-hash partitions per copy (1 to 64) |
 | `dynamic` | `false` | Collections: index every string in the document |
+| `prefixes` | none | Key-value namespaces: index only keys that start with one of these texts, as `prefixes = ('product:', 'item:')` |
 
 An object may have at most `search.max_indexes_per_object` search indexes (default 4). Each partition has `search.copies` copies (default 2) on different workers.
 
@@ -81,7 +85,7 @@ CREATE SEARCH INDEX products_text ON products (
 );
 ```
 
-For a collection, name document paths: `CREATE SEARCH INDEX events_text ON events ('$.title' TEXT, '$.tags' KEYWORD)`. For a key-value namespace, name the value: `CREATE SEARCH INDEX notes_text ON notes (VALUE TEXT)` or `VALUE '$.body' TEXT` for JSON values.
+For a collection, name document paths: `CREATE SEARCH INDEX events_text ON events ('$.title' TEXT, '$.tags' KEYWORD)`. For a key-value namespace, name the value: `CREATE SEARCH INDEX notes_text ON notes (VALUE TEXT)` or `VALUE '$.body' TEXT` for JSON values. For hashes, name their fields: `VALUE FIELD 'title' TEXT, VALUE FIELD 'tags' KEYWORD WITH (separator = ',')` (see [Hash fields](../data-models/search.md#hash-fields)).
 
 A new index fills from the table's existing rows in the background, then follows changes, typically within about a second (see [Search](../data-models/search.md#freshness-and-lag)).
 

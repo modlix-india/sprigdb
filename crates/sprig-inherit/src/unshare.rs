@@ -43,10 +43,12 @@ use sprig_catalog::ddl::database_key;
 use sprig_common::Result;
 use sprig_common::ids::{ObjectId, TenantId};
 
+use sprig_catalog::TenantCatalog;
+
 use crate::Runner;
 use crate::copy::{STATE_TABLE, UPSTREAM, copy_table, key_text};
 use crate::ids::TreeTable;
-use crate::model::{ALL_BITS, ROOT_SPACE, Share, ShareTarget};
+use crate::model::{ALL_BITS, InheritState, ROOT_SPACE, Share, ShareTarget};
 use crate::plan::{Ctx, state_of};
 use crate::view::q;
 
@@ -108,10 +110,38 @@ pub struct Unshared {
     pub copies: u64,
 }
 
+/// The parent tenant whose share went, as it read before the drop: its
+/// snapshot, its state with the share, and `lower_case_table_names`.
+#[derive(Clone, Copy)]
+pub struct Before<'a> {
+    /// The parent's snapshot.
+    pub cat: &'a TenantCatalog,
+    /// Its inheritance state with the dropped share in it.
+    pub state: &'a InheritState,
+    /// `lower_case_table_names`.
+    pub lctn: bool,
+}
+
+impl<'a> Before<'a> {
+    /// The parent's own statement's context, read before its drop.
+    #[must_use]
+    pub fn of(ctx: &'a Ctx<'_>) -> Self {
+        Self {
+            cat: ctx.cat,
+            state: ctx.state,
+            lctn: ctx.lctn,
+        }
+    }
+
+    fn db_name(&self, db: sprig_common::ids::DbId) -> Option<String> {
+        self.cat.databases.get(db).map(|d| d.name.clone())
+    }
+}
+
 /// The tenant edges `sh`, and the shares derived from it, carry: read
 /// from the parent's state before the drop commits.
 #[must_use]
-pub fn carried(ctx: &Ctx<'_>, sh: &Share) -> Vec<Carried> {
+pub fn carried(ctx: Before<'_>, sh: &Share) -> Vec<Carried> {
     ctx.state
         .shares()
         .filter(|s| {
@@ -132,12 +162,12 @@ pub fn carried(ctx: &Ctx<'_>, sh: &Share) -> Vec<Carried> {
 }
 
 /// The children's side of a committed `DROP SHARE` (module docs).
-/// `ctx` is the parent's context from before the drop.
+/// `ctx` is the parent as it read before the drop.
 ///
 /// # Errors
 /// The directory's, the cache's and the backends'.
 pub async fn after_drop(
-    ctx: &Ctx<'_>,
+    ctx: Before<'_>,
     r: &mut dyn Runner,
     carried: &[Carried],
 ) -> Result<Unshared> {
@@ -241,6 +271,106 @@ pub async fn after_drop(
             .increment(out.orphaned);
     }
     Ok(out)
+}
+
+/// A failed sweep of a dropped share is tried again after this long.
+const SWEEP_RETRY: Duration = Duration::from_secs(60);
+
+/// Dropped shares this process swept, by (parent, share): `None` once the
+/// cleanup ran, else when it last failed.
+type Swept = std::collections::HashMap<(TenantId, u64), Option<std::time::Instant>>;
+
+fn swept() -> &'static std::sync::Mutex<Swept> {
+    static S: std::sync::OnceLock<std::sync::Mutex<Swept>> = std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+/// Whether [`sweep`] has work for share `id` of `parent` now.
+fn due(parent: TenantId, id: u64) -> bool {
+    match swept()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(parent, id))
+    {
+        None => true,
+        Some(None) => false,
+        Some(Some(failed)) => failed.elapsed() >= SWEEP_RETRY,
+    }
+}
+
+/// Whether `ctx`'s tenant or an ancestor has a dropped share whose
+/// cleanup isn't recorded done and this process has yet to run
+/// ([`sweep`]).
+#[must_use]
+pub fn sweep_due(ctx: &Ctx<'_>) -> bool {
+    std::iter::once(ctx.cat)
+        .chain(ctx.ancestors.iter().map(AsRef::as_ref))
+        .any(|cat| state_of(cat).is_some_and(|st| st.dropping().any(|sh| due(cat.tenant, sh.id))))
+}
+
+/// The second half of `DROP SHARE`s whose first half committed but whose
+/// cleanup in the children never ran or kept failing (a gateway stopped
+/// in between): such a share stays as a `dropping` row in its parent's
+/// catalog ([`InheritState::dropping`]), which no edge reads. A statement
+/// of the parent or of a tenant below it that reaches the inheritance
+/// layer runs the cleanup once per process ([`after_drop`] as the drop
+/// would have, from the parent's state with the share put back; a failure
+/// is tried again a minute later), and the parent's own statement then
+/// removes the row. Every step can run again.
+///
+/// # Errors
+/// The cleanup's (the share stays `dropping`).
+pub async fn sweep(ctx: &Ctx<'_>, r: &mut dyn Runner) -> Result<()> {
+    let cats: Vec<&TenantCatalog> = std::iter::once(ctx.cat)
+        .chain(ctx.ancestors.iter().map(AsRef::as_ref))
+        .collect();
+    for cat in cats {
+        let Some(st) = state_of(cat) else {
+            continue;
+        };
+        let pending: Vec<Share> = st
+            .dropping()
+            .filter(|sh| due(cat.tenant, sh.id))
+            .map(|sh| (**sh).clone())
+            .collect();
+        for sh in pending {
+            let before = st.with_share(&sh);
+            let b = Before {
+                cat,
+                state: &before,
+                lctn: ctx.lctn,
+            };
+            let carried = carried(b, &sh);
+            let mark = |v: Option<std::time::Instant>| {
+                swept()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert((cat.tenant, sh.id), v);
+            };
+            let u = match after_drop(b, r, &carried).await {
+                Ok(u) => u,
+                Err(e) => {
+                    mark(Some(std::time::Instant::now()));
+                    return Err(e);
+                }
+            };
+            tracing::info!(tenant = %cat.tenant, share = %sh.name, views = u.views, orphaned = u.orphaned, unhidden = u.unhidden, copies = u.copies, "a dropped share's cleanup ran after its drop was cut off");
+            metrics::counter!("sprig_inherit_unshare_swept_total").increment(1);
+            if cat.tenant == ctx.cat.tenant
+                && let Err(e) = r
+                    .commit(&crate::store::InheritChange {
+                        purge_shares: vec![sh.id],
+                        ..crate::store::InheritChange::default()
+                    })
+                    .await
+            {
+                mark(Some(std::time::Instant::now()));
+                return Err(e);
+            }
+            mark(None);
+        }
+    }
+    Ok(())
 }
 
 /// Tenant `t`'s inheritable table of `c` (`schema`.`table`), its key and

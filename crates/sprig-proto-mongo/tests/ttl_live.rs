@@ -6,7 +6,8 @@
 //!   conflicts), `listIndexes` (with the value's BSON type), `collMod`'s
 //!   `index` option and its errors; then expiry: dates, arrays holding a
 //!   date, nested paths through arrays, non-dates that never expire, a
-//!   capped collection, an `expireAfterSeconds` lowered by `collMod`, and
+//!   capped collection, an `expireAfterSeconds` lowered by `collMod`, a
+//!   partial TTL index (only the documents its filter matches expire), and
 //!   the `delete` change events the monitor's deletes give.
 //! - `ttl_deletes_are_batched_and_paced`: 1,000 expired documents go in
 //!   several passes' batches; with `SPRIG_TEST_TTL_RATE` (the deployment's
@@ -339,6 +340,21 @@ async fn load(db: &Database) {
         ])
         .await
         .unwrap();
+    // A partial TTL index expires only the documents its filter matches.
+    db.run_command(
+        doc! {"createIndexes": "pf", "indexes": [{"key": {"at": 1}, "name": "at_1",
+        "expireAfterSeconds": 0, "partialFilterExpression": {"kind": "temp"}}]},
+    )
+    .await
+    .unwrap();
+    db.collection::<Document>("pf")
+        .insert_many(vec![
+            doc! {"_id": 1, "at": at(-100_000), "kind": "temp"},
+            doc! {"_id": 2, "at": at(-100_000), "kind": "keep"},
+            doc! {"_id": 3, "at": at(-100_000)},
+        ])
+        .await
+        .unwrap();
     // Lowered by collMod: nothing expires at an hour, everything at 10 s.
     db.run_command(doc! {"createIndexes": "m", "indexes": [{"key": {"at": 1}, "name": "at_1", "expireAfterSeconds": 3600}]})
         .await
@@ -356,7 +372,7 @@ async fn load(db: &Database) {
 /// collections' `_id`s.
 async fn left(db: &Database) -> Vec<(String, Vec<Bson>)> {
     let mut out = Vec::new();
-    for c in ["x", "n", "e", "cap", "m"] {
+    for c in ["x", "n", "e", "cap", "m", "pf"] {
         out.push((c.to_owned(), ids(db, c).await));
     }
     out
@@ -477,6 +493,7 @@ async fn ttl_matches_mongodb() {
                 && l[2].1.len() == 1
                 && l[3].1.len() == 1
                 && l[4].1.is_empty()
+                && l[5].1.len() == 2
         }
     };
     let ok_r = until(60, || done(r.clone())).await;

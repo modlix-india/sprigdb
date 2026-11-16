@@ -9,6 +9,16 @@
 //! column is `!hidden!i!0!0`). MariaDB 11.8 uses an indexed virtual column
 //! for a condition written over its expression, so queries need nothing.
 //!
+//! An index the client didn't name gets MySQL's name for it in the
+//! rewritten statement: `functional_index`, or the first of
+//! `functional_index_2`, `_3`, ... that the table doesn't use yet, as MySQL
+//! names an unnamed index with a functional part when it is created (also
+//! when its first part is a column). For `ALTER TABLE ... ADD INDEX` the
+//! gateway reads the table's index names first ([`unnamed_alter_table`],
+//! [`rewrite_named`]). So `SHOW INDEX`, `SHOW CREATE TABLE`, `STATISTICS`,
+//! `DROP INDEX functional_index` and the errors naming the index all
+//! match MySQL without a mapping.
+//!
 //! Shown as MySQL shows it: `SHOW CREATE TABLE` puts `((e))` back in the key
 //! and leaves the column out ([`super::schema::mysql_functional_parts`]); `SHOW
 //! INDEX` and `information_schema.STATISTICS` give `NULL` as the column and `e`
@@ -204,7 +214,7 @@ fn key_element(s: &Sig<'_>, a: usize) -> Option<usize> {
         return None;
     }
     // An optional name, then the part list.
-    if !s.punct(j, b'(') {
+    if !s.punct(j, b'(') && !s.word(j, b"USING") {
         j += 1;
     }
     if s.word(j, b"USING") {
@@ -662,11 +672,80 @@ pub fn needs_types(sql: &[u8], opts: &LexOptions) -> Option<String> {
 /// [`rewrite`] with the table's column types known (`known`: lower-case
 /// name to type), for `CREATE INDEX` and `ALTER TABLE`.
 #[must_use]
-#[allow(clippy::too_many_lines)] // the three statement forms
 pub fn rewrite_with(
     sql: &[u8],
     opts: &LexOptions,
     known: &BTreeMap<String, String>,
+) -> Option<Vec<u8>> {
+    rewrite_named(sql, opts, known, &[])
+}
+
+/// The table (as written) of an `ALTER TABLE` that adds an index the
+/// client didn't name with a functional part: the gateway reads the
+/// table's index names, so the new one gets the name MySQL would give it
+/// ([`rewrite_named`]).
+#[must_use]
+pub fn unnamed_alter_table(sql: &[u8], opts: &LexOptions) -> Option<String> {
+    if !maybe_functional(sql) {
+        return None;
+    }
+    let tokens = lex::lex(sql, opts).ok()?;
+    let s = Sig {
+        sql,
+        t: tokens.into_iter().filter(|t| !t.kind.is_trivia()).collect(),
+    };
+    if !(s.word(0, b"ALTER") && s.word(1, b"TABLE")) {
+        return None;
+    }
+    let add = (2..s.t.len()).find(|&k| s.word(k, b"ADD"))?;
+    let unnamed = s.split(2, s.t.len()).into_iter().any(|(a, _)| {
+        let start = if a == 2 { add } else { a };
+        s.word(start, b"ADD")
+            && key_name_slot(&s, start + 1)
+                .is_some_and(|(name, list, _)| name.is_none() && has_functional_part(&s, list))
+    });
+    unnamed.then(|| s.text(2, add - 1))
+}
+
+/// MySQL's name for the next unnamed functional index: `functional_index`,
+/// else the first free `functional_index_<n>` (n from 2), compared
+/// ignoring case; the name is added to `taken`.
+pub(crate) fn next_functional_name(taken: &mut Vec<String>) -> String {
+    let mut n = 1;
+    loop {
+        let name = if n == 1 {
+            "functional_index".to_owned()
+        } else {
+            format!("functional_index_{n}")
+        };
+        if !taken.iter().any(|t| t.eq_ignore_ascii_case(&name)) {
+            taken.push(name.clone());
+            return name;
+        }
+        n += 1;
+    }
+}
+
+/// Whether the part list at `open` has a functional part `(expr)`.
+fn has_functional_part(s: &Sig<'_>, open: usize) -> bool {
+    let Some(close) = s.matching(open) else {
+        return false;
+    };
+    s.split(open + 1, close)
+        .into_iter()
+        .any(|(a, b)| s.punct(a, b'(') && s.matching(a).is_some_and(|pc| pc < b && pc > a + 1))
+}
+
+/// [`rewrite_with`], naming each index the client didn't name that has a
+/// functional part as MySQL would (`existing`: the table's index names,
+/// for `ALTER TABLE`; the statement's own names count too).
+#[must_use]
+#[allow(clippy::too_many_lines)] // the three statement forms
+pub fn rewrite_named(
+    sql: &[u8],
+    opts: &LexOptions,
+    known: &BTreeMap<String, String>,
+    existing: &[String],
 ) -> Option<Vec<u8>> {
     if !maybe_functional(sql) {
         return None;
@@ -687,11 +766,20 @@ pub fn rewrite_with(
         let elems = s.split(open + 1, close);
         let cols = column_types(&s, &elems);
         let mut defs: BTreeMap<String, String> = BTreeMap::new();
+        let mut taken: Vec<String> = elems
+            .iter()
+            .filter_map(|&(a, _)| key_name_slot(&s, a)?.0)
+            .collect();
         for &(a, _) in &elems {
-            let Some(list) = key_element(&s, a) else {
+            let Some((name, list, slot)) = key_name_slot(&s, a) else {
                 continue;
             };
-            for p in parts(&s, list, &cols)? {
+            let ps = parts(&s, list, &cols)?;
+            if name.is_none() && !ps.is_empty() {
+                let n = next_functional_name(&mut taken);
+                edits.push((en(slot), en(slot), format!(" `{n}`")));
+            }
+            for p in ps {
                 edits.push((st(p.open), en(p.close), format!("`{}`", p.column)));
                 defs.insert(p.column, p.definition);
             }
@@ -754,20 +842,33 @@ pub fn rewrite_with(
     // ALTER TABLE t ADD [UNIQUE] {INDEX | KEY} [i] (parts), ...
     if s.word(0, b"ALTER") && s.word(1, b"TABLE") {
         let mut defs: Vec<(String, String)> = Vec::new();
-        for (a, _) in s.split(2, s.t.len()) {
-            let start = if a == 2 {
-                // The first specification follows the table name.
-                (a..s.t.len()).find(|&k| s.word(k, b"ADD"))?
+        let specs = s.split(2, s.t.len());
+        let first_add = (2..s.t.len()).find(|&k| s.word(k, b"ADD"))?;
+        let start_of = |a: usize| if a == 2 { first_add } else { a };
+        let mut taken: Vec<String> = existing.to_vec();
+        taken.extend(specs.iter().filter_map(|&(a, _)| {
+            let start = start_of(a);
+            if s.word(start, b"ADD") {
+                key_name_slot(&s, start + 1)?.0
             } else {
-                a
-            };
+                None
+            }
+        }));
+        for (a, _) in specs {
+            // The first specification follows the table name.
+            let start = start_of(a);
             if !s.word(start, b"ADD") {
                 continue;
             }
-            let Some(list) = key_element(&s, start + 1) else {
+            let Some((name, list, slot)) = key_name_slot(&s, start + 1) else {
                 continue;
             };
-            for p in parts(&s, list, known)? {
+            let ps = parts(&s, list, known)?;
+            if name.is_none() && !ps.is_empty() {
+                let n = next_functional_name(&mut taken);
+                edits.push((en(slot), en(slot), format!(" `{n}`")));
+            }
+            for p in ps {
                 edits.push((st(p.open), en(p.close), format!("`{}`", p.column)));
                 if !defs.iter().any(|(c, _)| *c == p.column) {
                     defs.push((p.column, p.definition));
@@ -778,7 +879,6 @@ pub fn rewrite_with(
             return None;
         }
         // The columns come first: `ADD INDEX` names them.
-        let first_add = (2..s.t.len()).find(|&k| s.word(k, b"ADD"))?;
         let at = st(first_add);
         let text = defs.iter().fold(String::new(), |mut s, (_, d)| {
             let _ = write!(s, "ADD COLUMN IF NOT EXISTS {d}, ");
@@ -793,6 +893,12 @@ pub fn rewrite_with(
 /// For a key element at `a` (as [`key_element`]): its name, if written,
 /// and the index of its `(` part list.
 fn named_key_element(s: &Sig<'_>, a: usize) -> Option<(Option<String>, usize)> {
+    key_name_slot(s, a).map(|(name, list, _)| (name, list))
+}
+
+/// [`named_key_element`], and the token after which an unnamed key's
+/// name goes (its `KEY`, `INDEX` or `UNIQUE`).
+fn key_name_slot(s: &Sig<'_>, a: usize) -> Option<(Option<String>, usize, usize)> {
     let list = key_element(s, a)?;
     // The name, if any, is the identifier before the list or before `USING t`.
     let mut j = list.checked_sub(1)?;
@@ -801,13 +907,13 @@ fn named_key_element(s: &Sig<'_>, a: usize) -> Option<(Option<String>, usize)> {
     }
     let keyword = s.word(j, b"KEY") || s.word(j, b"INDEX") || s.word(j, b"UNIQUE");
     if !keyword {
-        return Some((s.ident(j), list));
+        return Some((s.ident(j), list, j));
     }
     // `CONSTRAINT c UNIQUE (...)`: the index is named `c`.
     let constraint = (s.word(a, b"CONSTRAINT") && !s.word(a + 1, b"UNIQUE"))
         .then(|| s.ident(a + 1))
         .flatten();
-    Some((constraint, list))
+    Some((constraint, list, j))
 }
 
 /// The hidden columns behind the parts of the part list at `open`: a
@@ -874,21 +980,16 @@ pub fn index_of_fx_column(sql: &[u8], opts: &LexOptions, column: &str) -> Option
     } else {
         return None;
     }
-    let mut unnamed = 0;
+    let mut taken: Vec<String> = keys.iter().filter_map(|(n, _)| n.clone()).collect();
     for (name, list) in keys {
         let cols = fx_columns_of(&s, list);
-        let generated = name.is_none() && !cols.is_empty();
-        if generated {
-            unnamed += 1;
-        }
+        let name = match name {
+            Some(n) => n,
+            None if !cols.is_empty() => next_functional_name(&mut taken),
+            None => continue,
+        };
         if cols.iter().any(|c| c.eq_ignore_ascii_case(column)) {
-            return Some(name.unwrap_or_else(|| {
-                if unnamed == 1 {
-                    "functional_index".to_owned()
-                } else {
-                    format!("functional_index_{unnamed}")
-                }
-            }));
+            return Some(name);
         }
     }
     None
@@ -1229,7 +1330,7 @@ mod tests {
         assert_eq!(
             rw("CREATE TABLE t (a INT, b BIGINT UNSIGNED, KEY ((a + b * 2)))").unwrap(),
             format!(
-                "CREATE TABLE t (a INT, b BIGINT UNSIGNED, KEY (`{c}`), `{c}` BIGINT UNSIGNED GENERATED ALWAYS AS (a + b * 2) VIRTUAL INVISIBLE)"
+                "CREATE TABLE t (a INT, b BIGINT UNSIGNED, KEY `functional_index` (`{c}`), `{c}` BIGINT UNSIGNED GENERATED ALWAYS AS (a + b * 2) VIRTUAL INVISIBLE)"
             )
         );
         // MySQL types integer arithmetic with an unsigned column as
@@ -1357,5 +1458,83 @@ mod index_name_tests {
         );
         assert_eq!(of("CREATE INDEX i ON t ((a + 2))", &a), None);
         assert_eq!(of("SELECT 1", &a), None);
+    }
+
+    // MySQL 8.4.11 (captured 16 November 2026): an unnamed index with a
+    // functional part, even after a column, is `functional_index`, then the
+    // first free `functional_index_<n>`; a name in use is skipped.
+    #[test]
+    fn unnamed_functional_indexes_get_mysqls_names() {
+        let o = LexOptions::mysql84();
+        let rw = |sql: &str, existing: &[&str]| {
+            let existing: Vec<String> = existing.iter().map(|e| (*e).to_owned()).collect();
+            rewrite_named(sql.as_bytes(), &o, &BTreeMap::new(), &existing)
+                .map(|v| String::from_utf8(v).unwrap())
+        };
+        let (a1, a2, b2) = (fx_column("a+1"), fx_column("a+2"), fx_column("b*2"));
+        assert_eq!(
+            rw(
+                "CREATE TABLE t (a INT, b INT, INDEX ((a+1)), UNIQUE INDEX ((a+2)), INDEX bi (b), INDEX ((b*2), a))",
+                &[]
+            )
+            .unwrap(),
+            format!(
+                "CREATE TABLE t (a INT, b INT, INDEX `functional_index` (`{a1}`), UNIQUE INDEX `functional_index_2` (`{a2}`), INDEX bi (b), INDEX `functional_index_3` (`{b2}`, a), `{a1}` BIGINT GENERATED ALWAYS AS (a+1) VIRTUAL INVISIBLE, `{a2}` BIGINT GENERATED ALWAYS AS (a+2) VIRTUAL INVISIBLE, `{b2}` BIGINT GENERATED ALWAYS AS (b*2) VIRTUAL INVISIBLE)"
+            )
+        );
+        // A column first, `UNIQUE` alone, `USING`, a name the client took.
+        let out = rw(
+            "CREATE TABLE t (a INT, KEY functional_index (a), INDEX (a, (a+1)), UNIQUE ((a+2)), KEY USING BTREE ((a*2)))",
+            &[],
+        )
+        .unwrap();
+        assert!(
+            out.contains("INDEX `functional_index_2` (a, `")
+                && out.contains("UNIQUE `functional_index_3` (`")
+                && out.contains("KEY `functional_index_4` USING BTREE (`"),
+            "{out}"
+        );
+        // ALTER TABLE: the table's own names are taken.
+        let alter = "ALTER TABLE t ADD INDEX ((a+3))";
+        assert_eq!(
+            unnamed_alter_table(alter.as_bytes(), &o).as_deref(),
+            Some("t")
+        );
+        let a3 = fx_column("a+3");
+        let types: BTreeMap<String, String> = [("a".to_owned(), "int(11)".to_owned())].into();
+        let named = |existing: &[&str]| {
+            let existing: Vec<String> = existing.iter().map(|e| (*e).to_owned()).collect();
+            String::from_utf8(rewrite_named(alter.as_bytes(), &o, &types, &existing).unwrap())
+                .unwrap()
+        };
+        assert_eq!(
+            named(&[
+                "bi",
+                "functional_index_2",
+                "FUNCTIONAL_INDEX",
+                "functional_index_3"
+            ]),
+            format!(
+                "ALTER TABLE t ADD COLUMN IF NOT EXISTS `{a3}` BIGINT GENERATED ALWAYS AS (a+3) VIRTUAL INVISIBLE, ADD INDEX `functional_index_4` (`{a3}`)"
+            )
+        );
+        assert!(named(&["functional_index_2"]).contains("ADD INDEX `functional_index` ("));
+        // Named, or no functional part: nothing to look up.
+        for sql in [
+            "ALTER TABLE t ADD INDEX fi ((a+3))",
+            "ALTER TABLE t ADD INDEX (a)",
+            "CREATE TABLE t (a INT, INDEX ((a+1)))",
+            "ALTER TABLE t ADD COLUMN c INT, ADD CONSTRAINT u UNIQUE ((a+1))",
+        ] {
+            assert_eq!(unnamed_alter_table(sql.as_bytes(), &o), None, "{sql}");
+        }
+        assert_eq!(
+            unnamed_alter_table(
+                b"ALTER TABLE s.t ADD COLUMN c INT, ADD UNIQUE KEY ((a+1))",
+                &o
+            )
+            .as_deref(),
+            Some("s.t")
+        );
     }
 }

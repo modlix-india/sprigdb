@@ -23,10 +23,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use mysql_async::prelude::Queryable;
 use sprig_auth::authz::{Action, Target as AuthzTarget};
 use sprig_catalog::CatalogLocator;
 use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::{Namespace, ObjectKind, ObjectState};
 use sprig_common::ids::ClusterId;
 use sprig_common::{Result, SprigCode, SprigError};
@@ -49,10 +49,39 @@ const MAX_LOOP_ITERATIONS: u64 = 100_000;
 /// `logic.compile_max_cost`'s default (validations: `logic.validation_max_cost`).
 const COMPILE_MAX_COST: u64 = 100_000;
 
-/// `sprig_ctl` connections to every shard a deploy reaches.
+/// One `sprig_ctl` connection that several [`Session`]s of one deploy
+/// share: the routines' creator, the reader of the columns and the shard
+/// session of its cluster. A deploy runs one statement at a time, so they
+/// never wait for each other; with a connection each, one deploy held up
+/// to three of a cluster's four and waited for more while it held them.
+#[derive(Clone)]
+pub(super) struct SharedCtl(Arc<tokio::sync::Mutex<ConnSession>>);
+
+impl SharedCtl {
+    pub(super) fn new(conn: mysql_async::Conn) -> Self {
+        Self(Arc::new(tokio::sync::Mutex::new(ConnSession(conn))))
+    }
+}
+
+#[async_trait]
+impl Session for SharedCtl {
+    async fn exec(&mut self, sql: &str) -> Result<()> {
+        self.0.lock().await.exec(sql).await
+    }
+
+    async fn rows(&mut self, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
+        self.0.lock().await.rows(sql).await
+    }
+}
+
+/// `sprig_ctl` connections to every shard a deploy reaches: one per
+/// cluster, taken together in cluster order the first time one is needed
+/// (two deploys over the same clusters can't each hold one and wait for
+/// the other's), and given back with [`CtlShards::release`] before work
+/// that takes connections of its own.
 pub(super) struct CtlShards {
     pub(super) list: Vec<(String, ClusterId)>,
-    pub(super) conns: HashMap<String, ConnSession>,
+    pub(super) conns: HashMap<String, SharedCtl>,
     pub(super) locator: Arc<crate::tenant::locator::GatewayLocator>,
 }
 
@@ -77,9 +106,7 @@ impl ShardSessions for CtlShards {
             })?;
         let key = cluster.to_string();
         if !self.conns.contains_key(&key) {
-            let pool = self.locator.ctl_pool(&cluster).await?;
-            let conn = pool.get_conn().await.map_err(conn_err)?;
-            self.conns.insert(key.clone(), ConnSession(conn));
+            self.take_all().await?;
         }
         self.conns
             .get_mut(&key)
@@ -89,6 +116,42 @@ impl ShardSessions for CtlShards {
 }
 
 impl CtlShards {
+    /// A connection to every cluster of the list not held yet, in cluster
+    /// order.
+    async fn take_all(&mut self) -> Result<()> {
+        let mut clusters: Vec<ClusterId> = self.list.iter().map(|(_, c)| c.clone()).collect();
+        clusters.sort_by_key(ToString::to_string);
+        clusters.dedup();
+        for cluster in clusters {
+            let key = cluster.to_string();
+            if self.conns.contains_key(&key) {
+                continue;
+            }
+            let pool = self.locator.ctl_pool(&cluster).await?;
+            let conn = pool.get_conn_bounded().await.map_err(conn_err)?;
+            self.conns.insert(key, SharedCtl::new(conn));
+        }
+        Ok(())
+    }
+
+    /// The connection to `cluster` (one of the list's), to share with the
+    /// deploy's other sessions.
+    pub(super) async fn shared(&mut self, cluster: &ClusterId) -> Result<SharedCtl> {
+        let key = cluster.to_string();
+        if !self.conns.contains_key(&key) {
+            self.take_all().await?;
+        }
+        self.conns
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| SprigError::internal(format!("{cluster} isn't a shard's cluster")))
+    }
+
+    /// Gives every connection back; the next session takes them again.
+    pub(super) fn release(&mut self) {
+        self.conns.clear();
+    }
+
     /// `@@gtid_binlog_pos` of the first shard's cluster.
     async fn position(&mut self) -> Result<(ClusterId, String)> {
         let (schema, cluster) = self
@@ -96,15 +159,13 @@ impl CtlShards {
             .first()
             .cloned()
             .ok_or_else(|| SprigError::internal("no shard"))?;
-        self.session(&schema).await?;
-        let c = self
-            .conns
-            .get_mut(&cluster.to_string())
-            .ok_or_else(|| SprigError::internal("no shard session"))?;
-        let pos: Option<String> =
-            c.0.query_first("SELECT @@gtid_binlog_pos")
-                .await
-                .map_err(conn_err)?;
+        let s = self.session(&schema).await?;
+        let pos = s
+            .rows("SELECT @@gtid_binlog_pos")
+            .await?
+            .into_iter()
+            .next()
+            .and_then(|r| r.into_iter().next().flatten());
         Ok((cluster, pos.unwrap_or_default()))
     }
 }
@@ -334,6 +395,7 @@ impl PassSession {
         };
         let svc = Arc::clone(ts.services());
         let tenant = ts.tenant;
+        let streams = super::logic::logic_streams(ts, &catalog, row.db_id);
         // The DDL layout's shards: the table's group, or every shard of the
         // database; one shard (the template) for unsharded databases.
         let template = ts.schema_of(Some(&db));
@@ -370,7 +432,7 @@ impl PassSession {
             locator: Arc::clone(&svc.locator),
         };
         let ep = svc.locator.writer(tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(|e| {
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
         let account = sprig_auth::authz::backend::account(tenant, user);
@@ -395,6 +457,7 @@ impl PassSession {
                 table: table.as_ref().map(|(n, o)| (n.as_str(), *o)),
                 definer,
                 now_ms: now_ms(),
+                streams,
             },
             &mut shards,
         )
@@ -403,7 +466,11 @@ impl PassSession {
             // The ALTER is a catalog change of its own, which takes
             // connections from the same pool (4 per cluster): this one goes
             // back first (it holds no transaction) and a new one finishes.
+            // So do the shards' `sprig_ctl` ones (the ALTER's DDL takes
+            // more from their pool); the finish takes them again after the
+            // catalog's, in that order.
             drop(conn);
+            shards.release();
             let mut sink = Outcome {
                 wire: Wire {
                     persona: self.persona,
@@ -421,7 +488,7 @@ impl PassSession {
                 Err(e) => Some(e),
                 Ok(_) => sink.error.take(),
             };
-            let mut conn = ep.pool.get_conn().await.map_err(|e| {
+            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
                 SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
             })?;
             if let Some(e) = err {
@@ -477,6 +544,129 @@ impl PassSession {
         }
         tracing::info!(module = pending.module_id, version = pending.version, kind = decl.kind.as_str(), name = %decl.name, "logic version deployed");
         Ok(notes)
+    }
+
+    /// `ALTER TABLE t` changing existing columns under a compiled
+    /// validation or after-commit trigger on `t`: refused (39481) when the
+    /// code reads a changed column and would bind differently
+    /// ([`sprig_logic::dependent`]). `None`: the statement goes on.
+    #[allow(clippy::too_many_lines)]
+    pub(super) async fn tenant_column_change(
+        &mut self,
+        text: &Bytes,
+        status: StatusFlags,
+        out: &mut dyn ResultSink,
+    ) -> Result<Option<Step>> {
+        let sql = String::from_utf8_lossy(text).into_owned();
+        let Some(change) = sprig_logic::dependent::parse(&sql) else {
+            return Ok(None);
+        };
+        let current = self.current_logical();
+        let cluster = self.target.cluster.clone();
+        let Some(ts) = self.tenant.as_deref_mut() else {
+            return Ok(None);
+        };
+        let Some(db) = change.db.clone().or(current) else {
+            return Ok(None);
+        };
+        let catalog = match ts.catalog() {
+            Some(c) => Arc::clone(c),
+            None => ts.refresh().await?,
+        };
+        let lctn = ts.lower_case_table_names();
+        let Some(row) = catalog.database(&database_key(&db, lctn)).cloned() else {
+            return Ok(None);
+        };
+        let Some(obj) = catalog
+            .object(
+                row.db_id,
+                Namespace::Relation,
+                &object_key(ObjectKind::Table, &change.table, lctn),
+            )
+            .map(|o| o.object_id.0)
+        else {
+            return Ok(None);
+        };
+        let Some(template) = ts.schema_of(Some(&db)) else {
+            return Ok(None);
+        };
+        let svc = Arc::clone(ts.services());
+        let tenant = ts.tenant;
+        let Ok(ep) = svc.locator.writer(tenant).await else {
+            return Ok(None);
+        };
+        let Ok(mut conn) = ep.pool.get_conn_bounded().await else {
+            return Ok(None);
+        };
+        let store = LogicStore::new(ep.store.schema());
+        // No logic catalog yet: nothing is bound.
+        let Ok(modules) = store.modules(&mut conn, Some(row.db_id.0)).await else {
+            return Ok(None);
+        };
+        let mut bound = Vec::new();
+        for m in modules {
+            if !matches!(m.kind.as_str(), "validation" | "trigger") || m.state != "active" {
+                continue;
+            }
+            let Some(v) = m.active_version else {
+                continue;
+            };
+            let Ok(Some(b)) = store.binding(&mut conn, m.module_id).await else {
+                continue;
+            };
+            if b.object_id != Some(obj)
+                || !matches!(b.timing.as_str(), "before_write" | "after_commit")
+            {
+                continue;
+            }
+            let source = store.source(&mut conn, m.module_id, v).await?;
+            bound.push((m, source));
+        }
+        drop(conn);
+        if bound.is_empty() {
+            return Ok(None);
+        }
+        // Today's columns, read as a deploy reads them.
+        let mut shards = CtlShards {
+            list: vec![(template.clone(), cluster.clone())],
+            conns: HashMap::new(),
+            locator: Arc::clone(&svc.locator),
+        };
+        let before = {
+            let mut session = shards.shared(&cluster).await?;
+            service::columns(&mut session, &template).await
+        };
+        shards.release();
+        let before = before?;
+        let after = sprig_logic::dependent::predict(&before, &change.table, &change.ops);
+        let mut why = Vec::new();
+        for (m, source) in &bound {
+            let runtime = sprig_logic::compiler::Runtime::parse(&m.runtime)
+                .unwrap_or(sprig_logic::compiler::Runtime::Kirun);
+            if let Err(w) = sprig_logic::dependent::still_binds(
+                runtime,
+                &m.name,
+                source,
+                &change.table,
+                &before,
+                &after,
+            ) {
+                why.push(format!("{} {}: {w}", m.kind, m.name));
+            }
+        }
+        if why.is_empty() {
+            return Ok(None);
+        }
+        let e = SprigError::new(
+            SprigCode::DdlUnsupported,
+            format!(
+                "ALTER TABLE {} would change columns compiled logic reads: {}; drop it, change \
+                 the table, and create it again",
+                change.table,
+                why.join("; ")
+            ),
+        );
+        self.answer(Err(e), status, out).await.map(Some)
     }
 
     /// `ALTER TABLE t ADD c TYPE AS (f(args))` where `f` is a logic
@@ -537,7 +727,7 @@ impl PassSession {
         let Ok(ep) = svc.locator.writer(tenant).await else {
             return Ok(None);
         };
-        let Ok(mut conn) = ep.pool.get_conn().await else {
+        let Ok(mut conn) = ep.pool.get_conn_bounded().await else {
             return Ok(None);
         };
         let store = LogicStore::new(ep.store.schema());
@@ -606,7 +796,7 @@ impl PassSession {
                 state: "active".to_owned(),
             };
             let put = async {
-                let mut conn = ep.pool.get_conn().await.map_err(|e| {
+                let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
                     SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable")
                         .with_source(e)
                 })?;
@@ -639,7 +829,7 @@ pub(super) fn map_validation(
             let Ok(ep) = svc.locator.writer(tenant).await else {
                 return;
             };
-            let Ok(mut c) = ep.pool.get_conn().await else {
+            let Ok(mut c) = ep.pool.get_conn_bounded().await else {
                 return;
             };
             if let Err(e) = sprig_logic::triggers::load_checks(&mut c, ep.store.schema()).await {
@@ -662,7 +852,7 @@ pub(super) fn warm_validations(ts: &crate::tenant::session::TenantSession) {
         let Ok(ep) = svc.locator.writer(tenant).await else {
             return;
         };
-        let Ok(mut c) = ep.pool.get_conn().await else {
+        let Ok(mut c) = ep.pool.get_conn_bounded().await else {
             return;
         };
         // No logic catalog yet is fine: nothing to load.

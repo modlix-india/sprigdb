@@ -50,6 +50,7 @@ impl Live {
             current_db: Some("billing"),
             user: Some(UserId(1)),
             lower_case_table_names: false,
+            wait: None,
         }
     }
 

@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use mysql_async::prelude::Queryable;
 use serde_json::{Value, json};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_controller::catalogs::ClusterPools;
 use sprig_controller::dispatch::JobClass;
 use sprig_kv::sweep::{self, SweepOpts, Swept};
@@ -185,7 +186,7 @@ impl JobHandler for KvSweep {
                     // `kv.*` as they resolve now, at every pass.
                     let o = Opts::now(&spec, settings.as_ref());
                     let wait = match pools.writer(&cluster).await {
-                        Ok(pool) => match pool.get_conn().await {
+                        Ok(pool) => match pool.get_conn_bounded().await {
                             Ok(conn) => {
                                 let mut sql = Ctl(conn);
                                 let orphans =

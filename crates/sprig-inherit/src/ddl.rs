@@ -1071,7 +1071,7 @@ pub async fn drop_share(
         }
     }
     // The children it served, read before the drop.
-    let carried = crate::unshare::carried(ctx, &sh);
+    let carried = crate::unshare::carried(crate::unshare::Before::of(ctx), &sh);
     // Child tenants of a record hierarchy: only while they
     // have no structure of their own; their path overrides go first.
     Box::pin(crate::hier::tenants::before_unshare(ctx, r, &carried)).await?;
@@ -1085,7 +1085,7 @@ pub async fn drop_share(
     // still succeeds.
     let mut retry = crate::unshare::Retry::default();
     loop {
-        match crate::unshare::after_drop(ctx, r, &carried).await {
+        match crate::unshare::after_drop(crate::unshare::Before::of(ctx), r, &carried).await {
             Ok(u) => {
                 if u.views + u.orphaned + u.unhidden + u.copies > 0 {
                     tracing::info!(
@@ -1098,10 +1098,20 @@ pub async fn drop_share(
                         "share dropped: the children's overrides are their own rows"
                     );
                 }
+                // The cleanup is done: the share's `dropping` row goes. If
+                // this fails, the next statement's sweep removes it.
+                let mut purge = root_change(ctx);
+                purge.purge_shares.push(sh.id);
+                if let Err(e) = r.commit(&purge).await {
+                    tracing::info!(share = %name, error = %e, "a dropped share's row stays until the next sweep");
+                }
                 break;
             }
             Err(e) => {
                 let Some(pause) = retry.again() else {
+                    // The share stays `dropping`: the next statement of
+                    // the parent or a tenant below it after a restart
+                    // runs the cleanup again (`unshare::sweep`).
                     metrics::counter!("sprig_inherit_unshare_failures_total").increment(1);
                     tracing::warn!(share = %name, error = %e, attempts = retry.failed(), "share dropped, but its children were not cleaned up");
                     break;

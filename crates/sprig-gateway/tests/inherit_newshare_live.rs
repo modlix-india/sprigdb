@@ -539,3 +539,185 @@ async fn a_dropped_share_takes_the_childs_hides_and_copy_with_it() {
         ok(x, "SPRIG RESET inherit.merge").await;
     }
 }
+
+/// Runs `SPRIG_TEST_NEWSHARE_RESTART` (a script that kills the gateway
+/// with `kill -9` and starts it again, waiting until it is ready).
+fn restart_gateway() -> bool {
+    let Ok(script) = std::env::var("SPRIG_TEST_NEWSHARE_RESTART") else {
+        return false;
+    };
+    let out = std::process::Command::new(script)
+        .arg("kill9")
+        .output()
+        .expect("restart script");
+    println!("{}", String::from_utf8_lossy(&out.stdout).trim());
+    out.status.success()
+}
+
+/// A gateway that stops between `DROP SHARE`'s commit and its cleanup in
+/// the children no longer leaves the child's overrides hidden for good:
+/// the share stays as a `dropping` row, and the next statement of the
+/// child (or the parent) that reaches the inheritance layer runs the
+/// cleanup. The cleanup is held up with a row lock on the child's
+/// override (an open transaction of the child's), the gateway is killed
+/// while it waits, and started again. Needs `SPRIG_TEST_NEWSHARE_RESTART`.
+#[tokio::test]
+async fn a_drop_cut_off_by_a_gateway_crash_is_finished_by_the_next_statement() {
+    let Some(e) = env() else {
+        eprintln!("SPRIG_TEST_NEWSHARE_* not set; skipped");
+        return;
+    };
+    if std::env::var("SPRIG_TEST_NEWSHARE_RESTART").is_err() {
+        eprintln!("SPRIG_TEST_NEWSHARE_RESTART not set; skipped");
+        return;
+    }
+    let db = format!("rls11dc{}", suffix());
+    let mut p = conn(&e.addr, &e.parent).await;
+    share(&mut p, &db).await;
+    let mut c = conn(&e.addr, &e.child).await;
+    ok(&mut c, &format!("USE {db}")).await;
+    let seen = rows_become(&mut c, &db, &[("1", "parent one"), ("2", "parent two")]).await;
+    assert_eq!(seen, pairs(&[("1", "parent one"), ("2", "parent two")]));
+    // The child overrides record 1 and hides record 2.
+    ok(&mut c, "UPDATE t1 SET v = 'kid ovr' WHERE id = 1").await;
+    ok(&mut c, "DELETE FROM t1 WHERE id = 2").await;
+    assert_eq!(rows_of(&mut c, &db).await, pairs(&[("1", "kid ovr")]));
+    // Another session of the child holds its override's row lock, so the
+    // drop's cleanup waits on it.
+    let mut held = conn(&e.addr, &e.child).await;
+    ok(&mut held, &format!("USE {db}")).await;
+    ok(&mut held, "BEGIN").await;
+    ok(&mut held, "UPDATE t1 SET v = 'kid ovr' WHERE id = 1").await;
+    ok(&mut p, &format!("USE {db}")).await;
+    let addr = e.addr.clone();
+    let parent = e.parent.clone();
+    let name = format!("{db}_s");
+    let drop = tokio::spawn(async move {
+        let mut p = conn(&addr, &parent).await;
+        // The gateway is killed under it: the call fails.
+        p.query_drop(format!("DROP SHARE {name}")).await
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert!(
+        !drop.is_finished(),
+        "the drop didn't wait for the child's lock"
+    );
+    // The gateway stops after the drop committed, before the cleanup ran.
+    assert!(restart_gateway(), "the gateway didn't restart");
+    let _ = drop.await;
+    drop_conns(vec![p, c, held]).await;
+    let mut c = conn(&e.addr, &e.child).await;
+    ok(&mut c, &format!("USE {db}")).await;
+    // The child's next statement finishes the drop: its override is its own
+    // row, as written, and its hide is gone with the share.
+    let after = rows_of(&mut c, &db).await;
+    println!("the child after the restart: {after:?}");
+    assert_eq!(after, pairs(&[("1", "kid ovr")]));
+    let mut p = conn(&e.addr, &e.parent).await;
+    ok(&mut p, &format!("USE {db}")).await;
+    let shares = ok(&mut p, "SHOW SHARES").await;
+    assert!(
+        shares.is_empty(),
+        "the dropped share is still listed: {shares:?}"
+    );
+    // A new share shows the record the child had hidden under the old one.
+    ok(
+        &mut p,
+        &format!("CREATE SHARE {db}_s ON t1 TO ALL CHILDREN"),
+    )
+    .await;
+    let seen = rows_become(&mut c, &db, &[("1", "kid ovr"), ("2", "parent two")]).await;
+    println!("the child under a new share: {seen:?}");
+    assert_eq!(seen, pairs(&[("1", "kid ovr"), ("2", "parent two")]));
+    ok(&mut p, &format!("DROP SHARE {db}_s")).await;
+    ok(&mut p, &format!("DROP DATABASE {db}")).await;
+    ok(&mut c, &format!("DROP DATABASE IF EXISTS {db}")).await;
+}
+
+async fn drop_conns(v: Vec<Conn>) {
+    for c in v {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), c.disconnect()).await;
+    }
+}
+
+/// When a parent changes a materialized share's filter, its child's copy
+/// is seeded again; the copy made from the child's view below it (a
+/// grandchild's) follows for the records the filter now hides or shows
+/// (before, only changes of the source's rows reached it). Needs
+/// `SPRIG_TEST_NEWSHARE_GRANDCHILD` and a worker.
+#[tokio::test]
+async fn a_childs_reseed_reaches_the_grandchilds_copy() {
+    let Some(e) = env() else {
+        eprintln!("SPRIG_TEST_NEWSHARE_* not set; skipped");
+        return;
+    };
+    let Some(gk) = std::env::var("SPRIG_TEST_NEWSHARE_GRANDCHILD")
+        .ok()
+        .filter(|s| !s.is_empty())
+    else {
+        eprintln!("SPRIG_TEST_NEWSHARE_GRANDCHILD not set; skipped");
+        return;
+    };
+    let db = format!("rls11rs{}", suffix());
+    let mut p = conn(&e.addr, &e.parent).await;
+    let mut c = conn(&e.addr, &e.child).await;
+    let mut g = conn(&e.addr, &gk).await;
+    for (x, t) in [(&mut p, &e.parent), (&mut c, &e.child), (&mut g, &gk)] {
+        ok(x, &format!("USE SPACE `{t}`")).await;
+        ok(x, "SPRIG SET inherit.merge = 'materialized'").await;
+    }
+    share_with(&mut p, &db, "WITH RESHARE").await;
+    ok(
+        &mut p,
+        "INSERT INTO t1 VALUES (3, 'parent three'), (4, 'parent four')",
+    )
+    .await;
+    ok(&mut c, &format!("USE {db}")).await;
+    let all = [
+        ("1", "parent one"),
+        ("2", "parent two"),
+        ("3", "parent three"),
+        ("4", "parent four"),
+    ];
+    assert_eq!(rows_become(&mut c, &db, &all).await, pairs(&all));
+    ok(
+        &mut c,
+        &format!("CREATE SHARE {db}_k ON t1 TO ALL CHILDREN"),
+    )
+    .await;
+    ok(&mut g, &format!("USE {db}")).await;
+    assert_eq!(rows_become(&mut g, &db, &all).await, pairs(&all));
+    // Let both copies serve before the filter changes.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    ok(&mut p, &format!("ALTER SHARE {db}_s WHERE id <= 2")).await;
+    let two = [("1", "parent one"), ("2", "parent two")];
+    let child = rows_become(&mut c, &db, &two).await;
+    println!("the child after the filter change: {child:?}");
+    assert_eq!(child, pairs(&two));
+    let grand = rows_become(&mut g, &db, &two).await;
+    println!("the grandchild after the filter change: {grand:?}");
+    assert_eq!(
+        grand,
+        pairs(&two),
+        "the grandchild's copy kept the hidden records"
+    );
+    // And back: the records the filter shows again reach it too.
+    ok(&mut p, &format!("ALTER SHARE {db}_s WHERE id <= 3")).await;
+    let three = [
+        ("1", "parent one"),
+        ("2", "parent two"),
+        ("3", "parent three"),
+    ];
+    let grand = rows_become(&mut g, &db, &three).await;
+    println!("the grandchild after widening: {grand:?}");
+    assert_eq!(grand, pairs(&three));
+    ok(&mut c, &format!("DROP SHARE {db}_k")).await;
+    ok(&mut p, &format!("DROP SHARE {db}_s")).await;
+    ok(&mut p, &format!("DROP DATABASE {db}")).await;
+    ok(&mut c, &format!("DROP DATABASE IF EXISTS {db}")).await;
+    ok(&mut g, &format!("DROP DATABASE IF EXISTS {db}")).await;
+    for (x, t) in [(&mut p, &e.parent), (&mut c, &e.child), (&mut g, &gk)] {
+        ok(x, &format!("USE SPACE `{t}`")).await;
+        ok(x, "SPRIG RESET inherit.merge").await;
+    }
+}

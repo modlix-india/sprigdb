@@ -117,6 +117,7 @@ pub mod workload_rollup;
 pub mod write_load;
 // AI providers in the Admin API and the payload purge.
 pub mod ai_admin;
+pub mod ai_digest;
 pub mod ai_health;
 pub mod ai_incidents;
 pub mod ai_system;
@@ -713,6 +714,20 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         )))
         // The administration agent's health checks and write-ups.
         .with_loop(Loop::from_arc(Arc::clone(&ai_health)))
+        // Tenant digests (ai.digest), from statistics only.
+        .with_loop(Loop::new(ai_digest::DigestLoop::new(
+            Directory::new(Arc::clone(&stores.global)),
+            Arc::new(locator.clone()),
+            dc.clone(),
+            Some(settings.live.clone()),
+            Arc::clone(&incident_env),
+            RegistryPools::new(
+                ClusterRegistry::new(Arc::clone(&stores.global), Arc::clone(&stores.dc))?,
+                Some(Arc::clone(&monitor)),
+            )
+            .budget("ai_digest", 1),
+            Some(Arc::clone(&notifier)),
+        )))
         // The administration agent's incident intake: triage and advice.
         .with_loop(Loop::new(ai_incidents::IncidentLoop::new(
             dc.clone(),

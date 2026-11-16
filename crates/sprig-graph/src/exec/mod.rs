@@ -41,6 +41,35 @@ use crate::store::{EdgeRow, GraphStore, NodeRow};
 use crate::value::{Key, Node, Rel, Value, props_from_json};
 use sprig_router::graph_route::CmpOp;
 
+/// How variable-length hops expand (`graph.traversal_tier`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TraversalTier {
+    /// The default: per-shard recursive CTE bursts.
+    #[default]
+    Auto,
+    /// Per-shard recursive CTE bursts of `graph.local_burst_hops`.
+    Cte,
+    /// One hop per level, every level read and joined in the gateway (no
+    /// recursive CTE).
+    Gateway,
+    /// The `sprig_graph` plugin, which isn't available: as `Auto`.
+    Plugin,
+}
+
+impl TraversalTier {
+    /// The tier a `graph.traversal_tier` value names (`Auto` for an
+    /// unknown one).
+    #[must_use]
+    pub fn parse(v: &str) -> Self {
+        match v {
+            "cte" => Self::Cte,
+            "gateway" => Self::Gateway,
+            "plugin" => Self::Plugin,
+            _ => Self::Auto,
+        }
+    }
+}
+
 /// The traversal budgets of one statement.
 #[derive(Debug, Clone)]
 pub struct Budgets {
@@ -60,6 +89,8 @@ pub struct Budgets {
     pub local_burst_hops: u32,
     /// `graph.max_detach_edges`.
     pub max_detach_edges: usize,
+    /// `graph.traversal_tier`.
+    pub tier: TraversalTier,
     /// Not a budget: the Bolt transaction's `tx_metadata`, which
     /// `CALL tx.getMetaData()` returns (an empty map when there is none).
     pub tx_metadata: Option<BTreeMap<String, Value>>,
@@ -76,6 +107,7 @@ impl Default for Budgets {
             batch_nodes: 1000,
             local_burst_hops: 4,
             max_detach_edges: 100_000,
+            tier: TraversalTier::Auto,
             tx_metadata: None,
         }
     }
@@ -318,6 +350,7 @@ async fn run_with(
         top_hop: false,
         fused: None,
         read_only: !has_writes(q),
+        then: None,
     };
     if q.explain == Explain::Explain {
         let mut plan = explain(q);
@@ -714,6 +747,10 @@ pub(crate) struct Exec<'a> {
     pub(crate) fused: Option<matcher::Fused>,
     /// The statement writes nothing (reads may be queued ahead).
     pub(crate) read_only: bool,
+    /// The next pattern of the clause, when it starts from the node the
+    /// pattern being matched ends at: that node's variable and the next
+    /// pattern's first step, which may be read with this pattern's last.
+    pub(crate) then: Option<(String, crate::ast::RelPat, crate::ast::NodePat)>,
 }
 
 /// [`Exec::prune`]: the variable, the sort keys over it alone with their

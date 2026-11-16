@@ -120,6 +120,18 @@ impl BoltSession for Sess {
                 ..QueryResult::default()
             });
         }
+        if let Some(ms) = query.strip_prefix("BLOCK ") {
+            // A slow statement that holds its thread, as the gateway's
+            // graph statements do (`block_in_place`).
+            let d = std::time::Duration::from_millis(ms.parse().unwrap_or(0));
+            tokio::task::block_in_place(|| std::thread::sleep(d));
+            return Ok(QueryResult {
+                fields: vec!["x".into()],
+                records: VecDeque::from([vec![PackValue::Int(1)]]),
+                qtype: "r",
+                ..QueryResult::default()
+            });
+        }
         if let Some(rest) = query.strip_prefix('S') {
             let (n, fail_at) = match rest.split_once('!') {
                 Some((a, b)) => (a.parse().unwrap_or(0), b.parse().ok()),
@@ -509,7 +521,7 @@ async fn bolt_5_8_statuses_gql_failures_and_db() {
     assert!(r.summary.get("notifications").is_some());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slow_requests_send_keepalives_every_half_receive_timeout() {
     // A 1 s hint: a NOOP every 500 ms while a request runs.
     let cfg = Config {
@@ -530,8 +542,19 @@ async fn slow_requests_send_keepalives_every_half_receive_timeout() {
     // 1.7 s: NOOPs at 0.5, 1.0 and 1.5 s, then the result.
     let r = c.query("WAIT 1700", vec![], vec![]).await.expect("slow");
     assert_eq!(r.records.len(), 1);
+    let after_wait = c.keepalives();
+    assert!((2..=4).contains(&after_wait), "{after_wait} keep-alives");
+    // A statement that holds its thread gets them too.
+    let r = c
+        .query("BLOCK 1700", vec![], vec![])
+        .await
+        .expect("blocking");
+    assert_eq!(r.records.len(), 1);
     let after_slow = c.keepalives();
-    assert!((2..=4).contains(&after_slow), "{after_slow} keep-alives");
+    assert!(
+        (after_wait + 2..=after_wait + 4).contains(&after_slow),
+        "{after_wait} then {after_slow} keep-alives"
+    );
     // Pipelined: the earlier statement's answers come first, whole, and
     // the slow one's after the NOOPs.
     for q in ["2", "WAIT 1200"] {

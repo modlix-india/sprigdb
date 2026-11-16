@@ -17,6 +17,8 @@
 //!   a hook the gateway installs.
 //! - [`lua`]: `EVAL`, `EVALSHA`, `SCRIPT`, `FUNCTION`, `FCALL` on SprigDB's
 //!   one Lua runtime (`sprig_logic_js::lua::Sandbox`).
+//! - [`search`]: `FT.*` on SprigDB's search indexes, through a hook the
+//!   gateway installs.
 //! - [`pubsub`]: the gateway's subscribers and the wait table of blocking
 //!   commands.
 //! - [`fabric`]: the hubs, carrying publishes and wake-ups of
@@ -59,6 +61,7 @@ pub mod logic;
 pub mod lua;
 pub mod pubsub;
 pub mod reply;
+pub mod search;
 pub mod session;
 pub mod spec;
 

@@ -24,6 +24,7 @@ pub mod http;
 pub mod search;
 pub mod sql;
 
+use sprig_catalog::pool_wait::Bounded as _;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -352,7 +353,7 @@ impl DocsService {
         for cluster in self.candidates(tenant).await {
             let r = async {
                 let pool = self.pool(&cluster).await?;
-                let mut conn = tokio::time::timeout(CONNECT_TIMEOUT, pool.get_conn())
+                let mut conn = tokio::time::timeout(CONNECT_TIMEOUT, pool.get_conn_bounded())
                     .await
                     .map_err(|_| {
                         SprigError::new(

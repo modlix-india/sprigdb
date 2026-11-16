@@ -252,7 +252,8 @@ async fn change_streams_filtered_per_event() {
     for u in ["rlsc_alice", "rlsc_bob"] {
         must(
             &mut admin,
-            &format!("GRANT SELECT ON {DB}.docs TO '{u}'@'%'"),
+            // `Changes.Watch` needs WATCH as well as SELECT.
+            &format!("GRANT SELECT, WATCH ON {DB}.docs TO '{u}'@'%'"),
         )
         .await;
     }
@@ -746,7 +747,7 @@ async fn open_limits(addr: &str, query: &str) -> tokio::net::TcpStream {
 
 /// The limits on `Changes.Watch`: the open
 /// streams per tenant on a gateway (39780), the slow-consumer end (39790);
-/// `start_at_hlc` stays refused (39802).
+/// a `start_at_hlc` older than the feed's time index (39800).
 #[allow(clippy::many_single_char_names)] // streams a to d, h
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn change_stream_limits() {
@@ -839,7 +840,7 @@ async fn change_stream_limits() {
     );
     drop(d);
 
-    // 3. start_at_hlc is refused (39802): the feed can't position by time.
+    // 3. A start_at_hlc older than the feed's time index is 39800.
     global_setting(&ctl, "api.stream.max_buffered_events", None);
     let mut h = open_limits(
         &http_addr,
@@ -850,8 +851,8 @@ async fn change_stream_limits() {
     read_for(&mut h, &mut hb, 3).await;
     let ht = String::from_utf8_lossy(&hb).into_owned();
     ck.ok(
-        "start_at_hlc is refused (39802)",
-        !ht.starts_with("HTTP/1.1 200") && ht.contains("39802"),
+        "a start_at_hlc before the time index is refused (39800)",
+        !ht.starts_with("HTTP/1.1 200") && ht.contains("39800"),
         || ht.chars().take(600).collect(),
     );
     drop(h);
@@ -860,6 +861,145 @@ async fn change_stream_limits() {
     let _ = admin.query_drop("DROP DATABASE IF EXISTS rlsl_suite").await;
     eprintln!(
         "change stream limits: {} checks, {} failed",
+        ck.n,
+        ck.failed.len()
+    );
+    assert!(ck.failed.is_empty(), "{:#?}", ck.failed);
+}
+
+/// `Changes.Watch` from a time (`start_at_hlc`), for a user row-level
+/// security binds: the stream reads from the feed's time index position
+/// before the time and sends the changes stamped at or after it that the
+/// subscriber's policies show, and nothing before it; an administrator's
+/// stream from the same time gets every change after it. With a resume
+/// token too it is 39801. The deployment's controller must have written
+/// the time index for 40 s (the start reads a position 30 s or more
+/// before the time).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn change_streams_start_at_a_time() {
+    const HDB: &str = "rlsh_suite";
+    const HPW: &str = "Rlsh-suite-pw-1";
+    let (Ok(sql_addr), Ok(http_addr)) = (
+        std::env::var("SPRIG_TEST_RLS_SQL"),
+        std::env::var("SPRIG_TEST_RLS_HTTP"),
+    ) else {
+        eprintln!("skipped: set SPRIG_TEST_RLS_SQL and SPRIG_TEST_RLS_HTTP");
+        return;
+    };
+    let mut ck = Checks {
+        n: 0,
+        failed: Vec::new(),
+    };
+    let mut admin = sql(&sql_addr, "app", "sprig-dev-app").await;
+    for s in [
+        format!("DROP DATABASE IF EXISTS {HDB}"),
+        "DROP USER IF EXISTS 'rlsh_alice'@'%'".to_owned(),
+        format!("CREATE DATABASE {HDB}"),
+        format!(
+            "CREATE TABLE {HDB}.docs (id INT PRIMARY KEY, owner VARCHAR(64), body VARCHAR(64))"
+        ),
+        format!("CREATE USER 'rlsh_alice'@'%' IDENTIFIED BY '{HPW}'"),
+        format!("GRANT SELECT, WATCH ON {HDB}.docs TO 'rlsh_alice'@'%'"),
+        format!("CREATE POLICY own ON {HDB}.docs USING (owner = CURRENT_USER())"),
+        format!("ALTER TABLE {HDB}.docs ENABLE ROW LEVEL SECURITY"),
+        format!(
+            "INSERT INTO {HDB}.docs VALUES (1, 'rlsh_alice@%', 'before'), (2, 'bob@%', 'before')"
+        ),
+    ] {
+        must(&mut admin, &s).await;
+    }
+    // A time after the first two rows, before the next two.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let at = secs << 32;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    must(
+        &mut admin,
+        &format!(
+            "INSERT INTO {HDB}.docs VALUES (3, 'rlsh_alice@%', 'after'), (4, 'bob@%', 'after')"
+        ),
+    )
+    .await;
+    must(
+        &mut admin,
+        &format!("UPDATE {HDB}.docs SET owner = 'bob@%' WHERE id = 3"),
+    )
+    .await;
+    let open = |user: &'static str, pw: &'static str, q: String| {
+        let addr = http_addr.clone();
+        async move {
+            let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+            let req = format!(
+                "GET /v1/databases/{HDB}/changes{q} HTTP/1.1\r\nhost: {addr}\r\nauthorization: {}\r\n\r\n",
+                basic(user, pw)
+            );
+            s.write_all(req.as_bytes()).await.unwrap();
+            let mut b = Vec::new();
+            read_for(&mut s, &mut b, 6).await;
+            String::from_utf8_lossy(&b).into_owned()
+        }
+    };
+    let ops = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+            .filter(|v| v.get("op").is_some() && v["op"] != "heartbeat")
+            .map(|v| {
+                // `key` is the key's JSON as text.
+                let key: serde_json::Value = v["key"]
+                    .as_str()
+                    .and_then(|k| serde_json::from_str(k).ok())
+                    .unwrap_or_default();
+                let id = key["id"].as_i64().unwrap_or(-1);
+                format!("{}:{id}", v["op"].as_str().unwrap_or("?"))
+            })
+            .collect()
+    };
+    let t = open(
+        "rlsh_alice",
+        HPW,
+        format!("?objects=docs&start_at_hlc={at}"),
+    )
+    .await;
+    let got = ops(&t);
+    ck.ok(
+        "a bound user's stream from a time: her insert after it, then its delete as it leaves her view",
+        t.starts_with("HTTP/1.1 200") && got == ["insert:3", "delete:3"],
+        || format!("{got:?} {}", t.chars().take(400).collect::<String>()),
+    );
+    let t = open(
+        "app",
+        "sprig-dev-app",
+        format!("?objects=docs&start_at_hlc={at}"),
+    )
+    .await;
+    let got = ops(&t);
+    ck.ok(
+        "an administrator's stream from the same time: every change after it, none before",
+        t.starts_with("HTTP/1.1 200") && got == ["insert:3", "insert:4", "update:3"],
+        || format!("{got:?} {}", t.chars().take(400).collect::<String>()),
+    );
+    let t = open(
+        "app",
+        "sprig-dev-app",
+        format!("?objects=docs&start_at_hlc={at}&start_after=00"),
+    )
+    .await;
+    ck.ok(
+        "start_at_hlc with a resume token is refused (39801)",
+        !t.starts_with("HTTP/1.1 200") && t.contains("39801"),
+        || t.chars().take(400).collect(),
+    );
+    for s in [
+        format!("DROP DATABASE IF EXISTS {HDB}"),
+        "DROP USER IF EXISTS 'rlsh_alice'@'%'".to_owned(),
+    ] {
+        let _ = admin.query_drop(&s).await;
+    }
+    eprintln!(
+        "change streams from a time: {} checks, {} failed",
         ck.n,
         ck.failed.len()
     );

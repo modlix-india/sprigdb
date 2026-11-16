@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 use mysql_async::prelude::Queryable;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::{ClusterId, TenantId};
 use sprig_common::names::quote;
 use sprig_common::{Result, SprigCode, SprigError};
@@ -208,12 +209,14 @@ pub async fn ensure_table(
     }
     let pool = svc.locator.ctl_pool(cluster).await?;
     let mut c = pool
-        .get_conn()
+        .get_conn_bounded()
         .await
         .map_err(sprig_streams::maria::map_err)?;
     c.query_drop(ddl(schema))
         .await
         .map_err(sprig_streams::maria::map_err)?;
+    // Back before the subscription below, which takes one of its own.
+    drop(c);
     let store = svc.locator.dc_store();
     let k = store.tier().key(&format!("inherit-xo/{tenant}/{schema}"))?;
     store
@@ -373,16 +376,17 @@ async fn forward_with(
     force: bool,
     ordered: bool,
 ) -> Result<(usize, usize)> {
-    // One forward at a time per gateway: a forward holds a `sprig_ctl`
-    // connection in its transaction while it delivers, and the delivery
-    // takes more from the same pool (4 per cluster). Sixteen commit hooks
-    // at once held all four and waited for a fifth forever (seen live:
-    // every outbox of the cluster stopped, the sweeper too).
-    let _slot = forward_slot().acquire().await.ok();
+    // The transaction's row locks keep other forwarders (this gateway's
+    // and others') off these rows until the deliveries are done, so its
+    // connection is held while the deliveries take catalog and `sprig_ctl`
+    // connections of their own. It comes from the holders' pool: from the
+    // pool the deliveries use, sixteen commit hooks at once held all four
+    // connections and each waited for a fifth forever (seen live: every
+    // outbox of the cluster stopped, the sweeper too).
     let cluster = svc.locator.cluster(tenant).await?;
-    let pool = svc.locator.ctl_pool(&cluster).await?;
+    let pool = svc.locator.ctl_hold_pool(&cluster).await?;
     let mut c = pool
-        .get_conn()
+        .get_conn_bounded()
         .await
         .map_err(sprig_streams::maria::map_err)?;
     let mut tx = c
@@ -498,11 +502,6 @@ async fn forward_with(
             .increment(n as u64);
     }
     Ok((n, found))
-}
-
-fn forward_slot() -> &'static tokio::sync::Semaphore {
-    static S: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
-    S.get_or_init(|| tokio::sync::Semaphore::new(1))
 }
 
 type Backoff = HashMap<String, (u32, Instant)>;
@@ -653,7 +652,7 @@ async fn deliver(svc: &Arc<TenantServices>, dest: &Dest, rows: &[Row]) -> Result
     let cluster = svc.locator.cluster(tenant).await?;
     let pool = svc.locator.ctl_pool(&cluster).await?;
     let mut c = pool
-        .get_conn()
+        .get_conn_bounded()
         .await
         .map_err(sprig_streams::maria::map_err)?;
     c.query_drop(format!(
@@ -675,7 +674,7 @@ pub async fn pending_rows(svc: &TenantServices, tenant: TenantId, schema: &str) 
     let cluster = svc.locator.cluster(tenant).await?;
     let pool = svc.locator.ctl_pool(&cluster).await?;
     let mut c = pool
-        .get_conn()
+        .get_conn_bounded()
         .await
         .map_err(sprig_streams::maria::map_err)?;
     let r: std::result::Result<Option<u64>, _> = c

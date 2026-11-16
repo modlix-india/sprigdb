@@ -74,6 +74,7 @@ use sprig_auth::authz::{
     Target,
 };
 use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::{DbState, Namespace, ObjectKind, ObjectState};
 use sprig_catalog::{Freshness, TenantCatalog};
 use sprig_common::ids::{ClusterId, DbId, RoleId, TenantId};
@@ -374,7 +375,7 @@ impl AuthzServices {
         // A deletion that began while this reconcile waited.
         self.refuse_gone(cat.tenant)?;
         let pool = svc.locator.ctl_pool(cluster).await?;
-        let mut conn = pool.get_conn().await.map_err(|e| {
+        let mut conn = pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(
                 sprig_common::SprigCode::BackendUnavailable,
                 format!("sprig_ctl on {cluster}: {e}"),
@@ -494,7 +495,7 @@ async fn placement_on(
 ) -> Result<backend::Placement> {
     use mysql_async::prelude::Queryable;
     let pool = svc.locator.ctl_pool(cluster).await?;
-    let mut conn = pool.get_conn().await.map_err(|e| {
+    let mut conn = pool.get_conn_bounded().await.map_err(|e| {
         SprigError::new(
             sprig_common::SprigCode::BackendUnavailable,
             format!("sprig_ctl on {cluster}: {e}"),

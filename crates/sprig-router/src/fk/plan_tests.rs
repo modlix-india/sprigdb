@@ -39,6 +39,7 @@ fn fk(id: u64, name: &str, child: u64, on_delete: FkAction) -> ForeignKey {
         enforcement: FkEnforcement::Gateway,
         child_lookup: None,
         state: FkState::Enforced,
+        orphans: false,
     }
 }
 

@@ -26,6 +26,7 @@ use async_trait::async_trait;
 use mysql_async::prelude::Queryable;
 use serde_json::{Value, json};
 use sprig_catalog::ddl::{DdlRequest, DdlStatement, database_key, object_key, shard_schemas};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::{Namespace, ObjectKind, SettingRow, SettingScope};
 use sprig_catalog::version::VersionKind;
 use sprig_catalog::{CatalogLocator, TenantCatalog};
@@ -195,7 +196,7 @@ pub async fn ensure(
         // own from the same pool (4 per cluster). Held across them, one
         // publish needed 3 at once and failed with 39070 ("catalog begin
         // timed out") whenever two were busy elsewhere.
-        let mut conn = ep.pool.get_conn().await.map_err(|e| {
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
         let row = store.instance(&mut conn, key).await?;
@@ -528,6 +529,7 @@ pub async fn ensure_database(
         current_db: None,
         user: None,
         lower_case_table_names: lc,
+        wait: None,
     };
     let out = svc
         .ddl
@@ -646,7 +648,7 @@ async fn create(svc: &Arc<TenantServices>, t: TenantId, def: &Definition, id: u6
         // IF NOT EXISTS found the stream (a retry after a crash): the row
         // goes active now.
         let ep = svc.locator.writer(t).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(|e| {
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
         let existing = streams_of(&host.cat)
@@ -702,7 +704,9 @@ struct InstanceHost {
 impl InstanceHost {
     async fn ctl(&self, cluster: &sprig_common::ids::ClusterId) -> Result<mysql_async::Conn> {
         let pool = self.svc.locator.ctl_pool(cluster).await?;
-        pool.get_conn().await.map_err(sprig_streams::maria::map_err)
+        pool.get_conn_bounded()
+            .await
+            .map_err(sprig_streams::maria::map_err)
     }
 }
 
@@ -801,7 +805,7 @@ impl Host for InstanceHost {
         let tenant = self.cat.tenant;
         let ep = self.svc.locator.writer(tenant).await?;
         {
-            let mut conn = ep.pool.get_conn().await.map_err(|e| {
+            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
                 SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
             })?;
             sprig_streams::store::migrate(&mut conn, ep.store.schema()).await?;
@@ -927,7 +931,7 @@ pub async fn remove(svc: &Arc<TenantServices>, t: TenantId, def: DefKey) -> Resu
         sprig_streams::sql::handle(&text, &ctx, &mut host).await?;
     }
     let ep = svc.locator.writer(t).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(|e| {
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
         SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
     })?;
     MsgStore::new(ep.store.schema())

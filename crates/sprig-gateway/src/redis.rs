@@ -16,6 +16,7 @@
 pub mod hub;
 mod keyspace_feed;
 pub mod logic;
+pub mod search;
 
 use std::borrow::Cow;
 use std::net::SocketAddr;
@@ -306,6 +307,8 @@ impl RedisFrontend {
         ));
         // FCALL of logic-layer functions.
         env.set_logic(Arc::new(logic::GatewayLogic));
+        // FT.* on search indexes.
+        env.set_search(Arc::new(search::GatewaySearch));
         // Keyspace notifications reach only subscribers who may read the
         // key.
         env.set_key_filter(Arc::new(KeyImages));
@@ -421,10 +424,11 @@ impl Auth for GatewayAuth {
             return Err(wrongpass());
         }
         let name = self.login_name(&user);
+        // Decided here, handed to an allowed DC, or refused (residency).
         let mut login = self
             .d
             .login
-            .start_http(LoginRequest {
+            .begin_http(LoginRequest {
                 persona: Persona::MySql84,
                 login_name: name.into_bytes(),
                 sni: self.tls.as_ref().and_then(|t| t.sni.clone()),

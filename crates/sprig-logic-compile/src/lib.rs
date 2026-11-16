@@ -6,7 +6,7 @@
 //! ```text
 //!  source ─► front end ─► IR ─► checks ─► PL/SQL text
 //!   KIRun: JSON + expressions (kirun)    language, bounds, cost (check)
-//!   JavaScript: not yet (js)             generator (plsql)
+//!   JavaScript: oxc (js)                 generator (plsql)
 //!                        └─► reference interpreter (interp), for tests
 //!                            and the differential suite
 //! ```
@@ -24,11 +24,13 @@
 //! - [`interp`]: a reference interpreter of the IR;
 //! - [`pure`]: bodies as plain SQL expressions, for `CHECK` constraints
 //!   and generated columns;
-//! - [`js`]: the JavaScript front end's place, which for now sends every
-//!   function to the engine tier.
+//! - [`js`]: the JavaScript front end (the compilable subset, with
+//!   `try`/`catch`/`finally` and inlined helper functions);
+//! - [`link`]: what compiled code links to: other modules' call entries
+//!   (`db.call`) and streams' outboxes (`db.publish`).
 //!
-//! Not yet: the JavaScript and Lua front ends, collections and key-value
-//! access, locality over sharded groups, inlining of helper functions.
+//! Not yet: the Lua front end, collections and key-value access,
+//! locality over sharded groups.
 
 // A compiler's code reads best with short names for AST and IR nodes, and
 // the interpreter mirrors SQL's numeric casts and exact double compares on
@@ -51,6 +53,7 @@ pub mod interp;
 pub mod ir;
 pub mod js;
 pub mod kirun;
+pub mod link;
 pub mod plsql;
 pub mod pure;
 pub mod sql;

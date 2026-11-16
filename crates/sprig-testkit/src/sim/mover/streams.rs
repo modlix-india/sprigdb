@@ -224,6 +224,7 @@ pub(super) async fn sequencer_worker(
         marks: Arc::new(NoWatermarks),
         opts: SeqOpts {
             batch_window: Duration::from_millis(20),
+            live_window: None,
             max_batch: 7,
             idle_checkpoint: Duration::from_millis(300),
             retry: Duration::from_millis(50),

@@ -25,6 +25,15 @@
 //!     leftover field columns
 //! ```
 //!
+//! A canary (the estimate-and-canary validator, on the writer of a single
+//! node or of a cluster without a usable replica) builds with the binary
+//! log on, so a cut-off one leaves a real, replicated index under a row
+//! that is still `validating`. Before the next canary of that row builds,
+//! [`clear_canary_leftover`] kills the build MariaDB may still run for the
+//! gone client and drops the index (binary log on, as it was built),
+//! unless a validation of this process runs on the table. A kept canary's
+//! row is accepted, never validated again, so its index isn't touched.
+//!
 //! Who calls it: the replica and RSU validators when the index they are
 //! about to build is already on their node but not on the writer (the
 //! controller restarted during the last validation of the same row), and
@@ -186,6 +195,79 @@ async fn builds(
         })
         .filter_map(|r| col(r, "ID").and_then(|v| v.parse().ok()))
         .collect())
+}
+
+/// Kills the client `ALTER`s on `t` naming one of `names` ([`builds`])
+/// and waits (at most 30 s) until they have ended; their ids go to
+/// `out.killed`.
+async fn kill_builds(
+    n: &mut NodeSql,
+    node: &NodeEndpoint,
+    t: &IndexTarget,
+    names: &[String],
+    out: &mut Leftovers,
+) -> Result<(), ProbeError> {
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        let ids = builds(n, t, names).await?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        for id in &ids {
+            if !out.killed.contains(id) {
+                let _ = n.exec(&format!("KILL QUERY {id}")).await;
+                out.killed.push(*id);
+            }
+        }
+        if Instant::now() >= until {
+            return Err(ProbeError {
+                errno: None,
+                message: format!("leftover builds still running on {}: {ids:?}", node.node),
+                timeout: true,
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Before a canary builds index `name` on `node`'s table `t` (the
+/// writer): the leftover of a cut-off canary of the same row, if any (see
+/// the module docs). Its build, if MariaDB still runs it, is killed; the
+/// index, if it exists, is dropped with the binary log on. The caller has
+/// checked that no other validation of this process runs on the table.
+///
+/// # Errors
+/// The node is unreachable, a build didn't end within 30 s, or the drop
+/// failed.
+pub(crate) async fn clear_canary_leftover(
+    node: &NodeEndpoint,
+    t: &IndexTarget,
+    name: &str,
+    lock_wait: Duration,
+) -> Result<Leftovers, ProbeError> {
+    let mut n = NodeSql::connect(node, Duration::from_secs(10)).await?;
+    let mut out = Leftovers::default();
+    let res = async {
+        kill_builds(&mut n, node, t, &[name.to_owned()], &mut out).await?;
+        if n.index_columns(t, name).await?.is_empty() {
+            return Ok(());
+        }
+        tracing::warn!(node = %node.node, schema = %t.schema, table = %t.table, index = name,
+            "a cut-off canary's index found; dropping it");
+        n.exec(&format!(
+            "SET SESSION lock_wait_timeout = {}",
+            lock_wait.as_secs().max(1)
+        ))
+        .await?;
+        drop_with_retries(&mut n, &drop_index_sql(t, name)).await?;
+        out.indexes.push(name.to_owned());
+        metrics::counter!("sprig_advisor_autoindex_validation_leftovers_total").increment(1);
+        Ok::<_, ProbeError>(())
+    }
+    .await;
+    n.s.close().await;
+    res?;
+    Ok(out)
 }
 
 /// Waits (at most `limit`) until the node is `Synced` (Galera, after an
@@ -352,27 +434,7 @@ async fn sweep_one(
     // The build MariaDB may still be running for a client that's gone.
     let mut names = indexes.clone();
     names.extend(fields.iter().cloned());
-    let until = Instant::now() + Duration::from_secs(30);
-    loop {
-        let ids = builds(n, t, &names).await?;
-        if ids.is_empty() {
-            break;
-        }
-        for id in &ids {
-            if !out.killed.contains(id) {
-                let _ = n.exec(&format!("KILL QUERY {id}")).await;
-                out.killed.push(*id);
-            }
-        }
-        if Instant::now() >= until {
-            return Err(ProbeError {
-                errno: None,
-                message: format!("leftover builds still running on {}: {ids:?}", node.node),
-                timeout: true,
-            });
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
+    kill_builds(n, node, t, &names, out).await?;
     let mut ddl = quiet_session(node, Duration::from_secs(120), Duration::from_secs(5)).await?;
     let dropped = async {
         for x in &indexes {

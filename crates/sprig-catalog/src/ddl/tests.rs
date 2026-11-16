@@ -17,7 +17,7 @@ use sprig_meta::{MemStore, MetaStore, Op, Tier, Txn};
 
 use super::mem::{Fault, MemExecutor};
 use super::*;
-use crate::cache::mem::{MemSource, MemTables};
+use crate::cache::mem::{MemSource, MemSourceTx, MemTables};
 use crate::store::ObjectState;
 use crate::version::{DirectoryAllocator, Failpoint, Step};
 
@@ -135,6 +135,7 @@ fn req(statement: DdlStatement, sql: &str) -> DdlRequest<'_> {
         current_db: Some("billing"),
         user: Some(UserId(7)),
         lower_case_table_names: false,
+        wait: None,
     }
 }
 
@@ -615,6 +616,36 @@ async fn a_refused_statement_rolls_back_without_a_version() {
             .starts_with("DROP DATABASE IF EXISTS")
     );
     assert_eq!(env.intents(), 0);
+}
+
+/// The tenant's `catalog.ddl_wait_ms` travels with each request and
+/// replaces the engine's default wait.
+#[tokio::test]
+async fn the_requests_wait_replaces_the_engines_default() {
+    let env = billing_with_orders().await;
+    let e = env
+        .crashing(DdlStep::Prepared)
+        .execute(
+            &req(alter("orders"), "ALTER TABLE orders ADD c INT"),
+            &env.exec,
+        )
+        .await
+        .unwrap_err();
+    assert!(e.message.contains("injected crash"));
+    let engine = env.engine(); // waits 200 ms by default
+    let mut waited = Vec::new();
+    for wait in [Duration::from_millis(20), Duration::from_millis(900)] {
+        let r = DdlRequest {
+            wait: Some(wait),
+            ..req(alter("orders"), "ALTER TABLE orders ADD d INT")
+        };
+        let started = std::time::Instant::now();
+        let e = engine.execute(&r, &env.exec).await.unwrap_err();
+        assert_eq!(e.code(), Some(SprigCode::CatalogConflict), "{e}");
+        waited.push(started.elapsed());
+    }
+    assert!(waited[0] < Duration::from_millis(150), "{waited:?}");
+    assert!(waited[1] >= Duration::from_millis(850), "{waited:?}");
 }
 
 #[tokio::test]
@@ -1302,6 +1333,121 @@ async fn phase_3_retries_its_read_before_leaving_the_job() {
     let d = DdlOpts::default();
     assert_eq!(d.finish_read_attempts, 4);
     assert_eq!(d.finish_read_backoff, Duration::from_millis(500));
+}
+
+/// Rows another module writes with a publish: one internal row, or a
+/// refusal.
+struct Marker(bool);
+
+#[async_trait::async_trait]
+impl PublishWith<MemSourceTx> for Marker {
+    async fn write(&self, tx: &mut MemSourceTx, version: u64) -> Result<()> {
+        if !self.0 {
+            return Err(SprigError::internal("refused"));
+        }
+        tx.put_internal(&SettingRow {
+            scope: SettingScope::Tenant,
+            key: "sprig.test.marker".to_owned(),
+            value: Some(json!(version)),
+            bounds: None,
+            set_by: "system".to_owned(),
+            set_at: std::time::SystemTime::now(),
+            version,
+        })
+        .await
+    }
+}
+
+fn staged(s: Stage) -> Staged {
+    match s {
+        Stage::Staged(s) => *s,
+        Stage::Done(o) => panic!("not staged: {o:?}"),
+    }
+}
+
+#[tokio::test]
+async fn staged_statements_publish_in_one_version_with_other_rows() {
+    let env = Env::new().await;
+    env.run(create_db("billing"), "CREATE DATABASE billing")
+        .await
+        .unwrap();
+    let before = env.tables().versions.catalog;
+    let engine = env.engine();
+    let mut all = Vec::new();
+    for (n, sql) in [
+        ("vehicle", "CREATE TABLE vehicle (id INT)"),
+        ("van", "CREATE TABLE van (id INT)"),
+    ] {
+        let done = engine
+            .stage(&req(create(ObjectKind::Table, n), sql), &env.exec)
+            .await
+            .unwrap();
+        all.push(staged(done));
+    }
+    // Made on the cluster; the catalog's readers see nothing yet.
+    assert_eq!(env.tables().versions.catalog, before);
+    for n in ["vehicle", "van"] {
+        assert_eq!(env.object(n).unwrap().state, ObjectState::Creating);
+    }
+    let ids: Vec<ObjectId> = all.iter().flat_map(Staged::objects).collect();
+    assert_eq!(ids.len(), 2);
+    let ver = engine.publish(T, all, &Marker(true)).await.unwrap();
+    assert!(ver > before);
+    let tables = env.tables();
+    assert_eq!(tables.versions.catalog, ver);
+    for n in ["vehicle", "van"] {
+        let o = env.object(n).unwrap();
+        assert_eq!(o.state, ObjectState::Active);
+        assert_eq!(o.changed_version, ver);
+        assert!(ids.contains(&o.object_id));
+    }
+    let marker = tables
+        .settings
+        .values()
+        .find(|r| r.key == "sprig.test.marker")
+        .unwrap();
+    assert_eq!(marker.version, ver);
+    assert_eq!(env.intents(), 0);
+
+    // A refused write publishes nothing; the statement is left to the
+    // reconciler, which publishes it on its own.
+    let trip = staged(
+        engine
+            .stage(
+                &req(
+                    create(ObjectKind::Table, "trip"),
+                    "CREATE TABLE trip (id INT)",
+                ),
+                &env.exec,
+            )
+            .await
+            .unwrap(),
+    );
+    let err = engine
+        .publish(T, vec![trip], &Marker(false))
+        .await
+        .unwrap_err();
+    assert_eq!(err.message, "refused");
+    // (The rollback settles its version empty.)
+    assert_eq!(env.object("trip").unwrap().state, ObjectState::Creating);
+    assert_eq!(env.intents(), 1);
+    env.repair().await;
+    assert_eq!(env.object("trip").unwrap().state, ObjectState::Active);
+    assert_eq!(env.intents(), 0);
+
+    // `IF NOT EXISTS` that finds its answer has nothing to stage.
+    let mut stmt = create(ObjectKind::Table, "van");
+    if let DdlStatement::CreateObject { if_not_exists, .. } = &mut stmt {
+        *if_not_exists = true;
+    }
+    let done = engine
+        .stage(
+            &req(stmt, "CREATE TABLE IF NOT EXISTS van (id INT)"),
+            &env.exec,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(done, Stage::Done(o) if o.version.is_none() && o.notes.len() == 1));
 }
 
 #[tokio::test]

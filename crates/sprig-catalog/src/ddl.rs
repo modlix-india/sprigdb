@@ -500,6 +500,10 @@ pub struct DdlRequest<'a> {
     pub user: Option<UserId>,
     /// The tenant's `names.lower_case_table_names`.
     pub lower_case_table_names: bool,
+    /// How long to wait for a target another DDL holds before failing
+    /// with 39071: the session's `catalog.ddl_wait_ms`. `None` uses the
+    /// engine's [`DdlOpts::ddl_wait`].
+    pub wait: Option<Duration>,
 }
 
 /// A note for the client (level `Note`), as MariaDB raises for
@@ -721,7 +725,8 @@ pub type DdlFailpoint = Arc<dyn Fn(TenantId, DdlStep) -> Result<()> + Send + Syn
 /// Timing of the DDL path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DdlOpts {
-    /// `catalog.ddl_wait_ms`: the wait for a target another DDL holds.
+    /// `catalog.ddl_wait_ms`'s default: the wait for a target another DDL
+    /// holds when the request carries none ([`DdlRequest::wait`]).
     pub ddl_wait: Duration,
     /// How often a waiting DDL looks again.
     pub poll: Duration,
@@ -735,9 +740,9 @@ pub struct DdlOpts {
 impl Default for DdlOpts {
     fn default() -> Self {
         Self {
-            // `catalog.ddl_wait_ms`'s default: the key is registered ahead
-            // of a per-tenant read (marked unbuilt).
-            ddl_wait: Duration::from_millis(10_000),
+            // `catalog.ddl_wait_ms`'s default, for requests that don't
+            // carry the tenant's value.
+            ddl_wait: Duration::from_millis(DDL_WAIT_MS.default),
             poll: Duration::from_millis(50),
             // Four reads over 3.5 s (waits of 0.5, 1 and 2 s): a dropped
             // connection or a writer switch heals in that time, and the job
@@ -787,6 +792,57 @@ enum Planned {
     AlterDb(DatabaseRow, Vec<PhysicalDdl>),
     /// A job: marks written in the transaction.
     Go(Box<Plan>),
+}
+
+/// A statement whose phases 1 and 2 ran ([`DdlEngine::stage`]) and whose
+/// catalog change waits for [`DdlEngine::publish`]. Dropped unpublished,
+/// its job is abandoned, as when a statement's future is dropped.
+pub struct Staged {
+    plan: Plan,
+    facts: Facts,
+    running: Running,
+}
+
+impl Staged {
+    /// The object the statement creates, or the objects it changes.
+    #[must_use]
+    pub fn objects(&self) -> Vec<ObjectId> {
+        self.plan.intent.objects()
+    }
+
+    /// The job.
+    #[must_use]
+    pub fn job(&self) -> JobId {
+        self.plan.intent.job
+    }
+}
+
+impl std::fmt::Debug for Staged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Staged")
+            .field("intent", &self.plan.intent)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What [`DdlEngine::stage`] did.
+#[derive(Debug)]
+pub enum Stage {
+    /// Phases 1 and 2 ran: publish it.
+    Staged(Box<Staged>),
+    /// Nothing is left to publish.
+    Done(DdlOutcome),
+}
+
+/// Rows another module writes in the catalog version
+/// [`DdlEngine::publish`] publishes its statements in.
+#[async_trait::async_trait]
+pub trait PublishWith<T: ?Sized>: Send + Sync {
+    /// Writes them in `tx`, at catalog version `version`.
+    ///
+    /// # Errors
+    /// The catalog's; refusing the write refuses the whole publish.
+    async fn write(&self, tx: &mut T, version: u64) -> Result<()>;
 }
 
 /// Runs DDL for tenants through their catalogs (see the module docs).
@@ -1210,23 +1266,56 @@ where
         req: &DdlRequest<'_>,
         exec: &dyn DdlExecutor,
     ) -> Result<DdlOutcome> {
+        let mut s = match self.stage(req, exec).await? {
+            Stage::Done(o) => return Ok(o),
+            Stage::Staged(s) => s,
+        };
+        let job = s.plan.intent.job;
+        let version = self.finish(req.tenant, &s.plan.intent, &s.facts).await?;
+        s.running.finished = true;
+        if version.is_none() {
+            tracing::warn!(tenant = %req.tenant, job = %job,
+                "the reconciler resolved this DDL before it finished");
+        }
+        Ok(DdlOutcome {
+            version,
+            affected_rows: s.plan.affected,
+            notes: std::mem::take(&mut s.plan.notes),
+            job: Some(job),
+            seen: None,
+        })
+    }
+
+    /// Phases 1 and 2 of one statement, and phase 3's read: the physical
+    /// change is made and read back, and its catalog change waits for
+    /// [`Self::publish`]. Readers keep seeing the catalog as it was (phase
+    /// 1's rows are invisible to them). A statement with no job to publish
+    /// (`IF [NOT] EXISTS` that found its answer, `TRUNCATE`, `ALTER
+    /// DATABASE`) runs in full here and comes back [`Stage::Done`].
+    ///
+    /// # Errors
+    /// As [`Self::execute`].
+    pub async fn stage(&self, req: &DdlRequest<'_>, exec: &dyn DdlExecutor) -> Result<Stage> {
         let tenant = req.tenant;
         let job = self.new_job();
         // Until this returns or its future is dropped.
         let mut running = self.owner.start(tenant, job);
         let plan = match self.prepare(req, job, exec).await? {
             Planned::Busy(what) => return Err(conflict(&what)),
-            Planned::Done(o) => return Ok(o),
+            Planned::Done(o) => return Ok(Stage::Done(o)),
             Planned::Run(stmt, names, fan) => {
                 for s in multi::fan_out(tenant, &stmt, fan.as_ref(), exec).await? {
                     exec.execute(&s)
                         .await
                         .map_err(|e| map_names(e, tenant, &names))?;
                 }
-                return Ok(DdlOutcome::default());
+                return Ok(Stage::Done(DdlOutcome::default()));
             }
             Planned::AlterDb(db, stmts) => {
-                return self.alter_database(tenant, db, &stmts, exec).await;
+                return self
+                    .alter_database(tenant, db, &stmts, exec)
+                    .await
+                    .map(Stage::Done);
             }
             Planned::Go(p) => *p,
         };
@@ -1270,18 +1359,68 @@ where
         if let Some(set) = &plan.intent.shards {
             multi::check_skew(tenant, job, set, &plan.targets, exec).await;
         }
-        let version = self.finish(tenant, &plan.intent, &facts).await?;
-        running.finished = true;
-        if version.is_none() {
-            tracing::warn!(%tenant, job = %job, "the reconciler resolved this DDL before it finished");
+        Ok(Stage::Staged(Box::new(Staged {
+            plan,
+            facts,
+            running,
+        })))
+    }
+
+    /// Publishes `staged` (statements of `tenant` from [`Self::stage`])
+    /// and the rows `with` writes in ONE catalog version, so no reader
+    /// sees some of them without the others. A statement the reconciler
+    /// has already finished is left out. On an error nothing is published,
+    /// and the statements are abandoned (the janitor, then the reconciler,
+    /// publishes each on its own).
+    ///
+    /// # Errors
+    /// The catalog's; `with`'s.
+    pub async fn publish(
+        &self,
+        tenant: TenantId,
+        staged: Vec<Staged>,
+        with: &dyn PublishWith<B::Tx>,
+    ) -> Result<u64> {
+        let mut locked = self.versioner.lock(tenant, VersionKind::Catalog).await?;
+        let mut live = Vec::with_capacity(staged.len());
+        for mut s in staged {
+            let job = s.plan.intent.job;
+            if locked
+                .tx()
+                .internal_rows(&intent_key(job))
+                .await?
+                .is_empty()
+            {
+                s.running.finished = true;
+                tracing::warn!(%tenant, job = %job,
+                    "the reconciler resolved this DDL before it was published");
+            } else {
+                live.push(s);
+            }
         }
-        Ok(DdlOutcome {
-            version,
-            affected_rows: plan.affected,
-            notes: plan.notes,
-            job: Some(job),
-            seen: None,
-        })
+        let mut c = locked.allocate(ChangeOpts::default()).await?;
+        let v = c.version();
+        let now = self.clock.wall();
+        let mut r = Ok(());
+        for s in &live {
+            r = apply_finish(c.tx(), tenant, &s.plan.intent, &s.facts, v, now).await;
+            if r.is_err() {
+                break;
+            }
+        }
+        if r.is_ok() {
+            r = with.write(c.tx(), v).await;
+        }
+        if let Err(e) = r {
+            let _ = c.rollback().await;
+            return Err(e);
+        }
+        c.commit().await?;
+        for s in &mut live {
+            s.running.finished = true;
+        }
+        tracing::info!(%tenant, statements = live.len(), version = v, "DDL published");
+        Ok(v)
     }
 
     /// Phase 3's read, tried `finish_read_attempts` times with a doubling
@@ -1326,7 +1465,7 @@ where
         exec: &dyn DdlExecutor,
     ) -> Result<Planned> {
         let tenant = req.tenant;
-        let deadline = self.clock.now() + self.opts.ddl_wait;
+        let deadline = self.clock.now() + req.wait.unwrap_or(self.opts.ddl_wait);
         let mut next_sweep = self.clock.now();
         loop {
             let mut locked = self.versioner.lock(tenant, VersionKind::Catalog).await?;

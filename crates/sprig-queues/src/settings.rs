@@ -117,6 +117,15 @@ key!(
     HardBounds::NONE, "Publish the object's changes to this exchange"
 );
 
+key!(
+    /// `queue.vhost_idle_close_seconds`: a gateway closes a vhost (stops
+    /// its queue owners and forwarder, gives back their leases, drops its
+    /// store handle) after this long without connections, consumers or
+    /// work; the next use opens it again (0: never close).
+    VHOST_IDLE_CLOSE_SECONDS: u64 = "queue.vhost_idle_close_seconds", 300, Scopes::PROCESS,
+    HardBounds::range(0, 86_400), "Close a gateway's idle vhost after this many seconds without connections, consumers or work (0 = never)"
+);
+
 /// What one vhost's queues run with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueSettings {
@@ -150,6 +159,8 @@ pub struct QueueSettings {
     pub forward_feed: bool,
     /// `queue.forward_fallback_ms`.
     pub forward_fallback_ms: u64,
+    /// `queue.vhost_idle_close_seconds`, in ms (0: never close).
+    pub vhost_idle_close_ms: u64,
 }
 
 impl Default for QueueSettings {
@@ -170,6 +181,7 @@ impl Default for QueueSettings {
             owner_move_cooldown_ms: 300_000,
             forward_feed: true,
             forward_fallback_ms: 2_000,
+            vhost_idle_close_ms: 300_000,
         }
     }
 }

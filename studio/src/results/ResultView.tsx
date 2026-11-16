@@ -7,6 +7,7 @@ import { errorText } from '../api/errors';
 import { Pager, track } from './cursor';
 import type { QueryLanguage } from '../api/sql';
 import { hasGraph } from '../graph/elements';
+import { AddToDashboard } from '../dashboards/AddToDashboard';
 
 const Chart = lazy(() => import('./Chart').then((m) => ({ default: m.Chart })));
 const GraphResult = lazy(() => import('../graph/GraphResult'));
@@ -129,6 +130,7 @@ export function ResultView({
         <span style={{ flex: 1 }} />
         {lang === 'sql' && (
           <>
+            <AddToDashboard db={db} sql={sql} columns={b.columns.map((c) => ({ name: c.name, type: c.type }))} />
             <button onClick={() => void doExport('csv')}>{intl.formatMessage({ id: 'results.export' })} CSV</button>
             <button onClick={() => void doExport('ndjson')}>{intl.formatMessage({ id: 'results.export' })} NDJSON</button>
           </>

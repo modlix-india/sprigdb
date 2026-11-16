@@ -36,6 +36,20 @@ pub trait Columns {
     fn column(&self, table: &str, column: &str) -> Option<Ty>;
     /// Whether the table exists.
     fn has_table(&self, table: &str) -> bool;
+    /// The logic function or procedure `name` of the code's database, for
+    /// a compiled `db.call`: `Err` says why calls of it can't compile.
+    /// `None` when the compiler wasn't told of any.
+    fn callee(&self, name: &str) -> Option<std::result::Result<crate::link::Callee, String>> {
+        let _ = name;
+        None
+    }
+    /// Stream `name` of the code's database, for a compiled `db.publish`:
+    /// `Err` says why publishing to it can't compile. `None` when the
+    /// compiler wasn't told of any.
+    fn stream(&self, name: &str) -> Option<std::result::Result<crate::link::StreamTarget, String>> {
+        let _ = name;
+        None
+    }
 }
 
 /// A fixed map of tables to typed columns.
@@ -69,6 +83,13 @@ impl StaticColumns {
             .entry(table.to_ascii_lowercase())
             .or_default()
             .insert(column.to_ascii_lowercase(), ty);
+    }
+
+    /// Removes a column; its type, if it was there.
+    pub fn remove(&mut self, table: &str, column: &str) -> Option<Ty> {
+        self.tables
+            .get_mut(&table.to_ascii_lowercase())?
+            .remove(&column.to_ascii_lowercase())
     }
 }
 

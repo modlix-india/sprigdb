@@ -980,7 +980,7 @@ impl<B: TxnBackend> TxnCoordinator<B> {
             let admin = admin.clone();
             async move {
                 if b.phase == XaPhase::Prepared {
-                    finish_prepared(&*admin, b, false, dtid, &gtrid).await;
+                    finish_prepared(&*admin, b, false, dtid, &gtrid, restore).await;
                 } else {
                     end_branch(b, false, restore).await;
                 }
@@ -1400,6 +1400,7 @@ impl<B: TxnBackend> TxnCoordinator<B> {
         let dtid = self.dtid;
         let gtrid = self.gtrid(dtid.unwrap_or(sprig_common::ids::TxnId(0)));
         let wait = self.cfg.phase2_wait;
+        let restore = self.cfg.session_lock_wait_timeout_s;
         let mut idx = prepared.to_vec();
         idx.sort_unstable();
         idx.dedup();
@@ -1412,7 +1413,7 @@ impl<B: TxnBackend> TxnCoordinator<B> {
             running.push(Phase2Fut {
                 cluster,
                 fut: Box::pin(async move {
-                    let ok = finish_prepared(&*admin, &mut b, true, dtid, &gtrid).await;
+                    let ok = finish_prepared(&*admin, &mut b, true, dtid, &gtrid, restore).await;
                     if ok && let Some(h) = &hooks {
                         h.at(dtid, Point::Phase2Branch).await;
                     }
@@ -1739,14 +1740,20 @@ async fn end_branch<C: BranchConn>(b: &mut Branch<C>, commit: bool, restore: u32
         (None, true) => b.conn.control(&[Ctl::Commit]).await,
         (None, false) => b.conn.control(&[Ctl::Rollback]).await,
     };
+    // The settings go back together (one statement on a gateway), and only
+    // once the branch ended.
+    let mut put_back = Vec::new();
     if r.is_ok() && b.lowered {
-        let _ = b.conn.control(&[Ctl::LockWaitTimeout(restore)]).await;
+        put_back.push(Ctl::LockWaitTimeout(restore));
     }
     if b.kind == BranchKind::Held {
         let _ = b.conn.take_redo();
         if r.is_ok() {
-            let _ = b.conn.control(&[Ctl::SetTimestamp(None)]).await;
+            put_back.push(Ctl::SetTimestamp(None));
         }
+    }
+    if !put_back.is_empty() {
+        let _ = b.conn.control(&put_back).await;
     }
     b.phase = XaPhase::Done;
 }
@@ -1795,18 +1802,30 @@ async fn prepare_one<C: BranchConn>(
 /// the admin. Returns whether it
 /// is known finished; a commit that fails rolls the branch back and
 /// leaves the rows to the resolver, which replays them.
+///
+/// The branch's settings (its fixed clock, the lowered lock wait) are put
+/// back only after its transaction ended on its own connection: a
+/// connection whose branch failed keeps them, and the gateway closes a
+/// connection whose settings weren't put back instead of pooling it (the
+/// relay fence may still end that thread).
 async fn finish_held<C: BranchConn>(
     admin: &dyn ClusterAdmin,
     b: &mut Branch<C>,
     commit: bool,
     dtid: Option<Dtid>,
     gtrid: &Gtrid,
+    restore: u32,
 ) -> bool {
     b.phase = XaPhase::Done;
     let Some(dtid) = dtid else {
         let _ = b.conn.control(&[Ctl::Rollback]).await;
         return true;
     };
+    let mut put_back = Vec::new();
+    if b.lowered {
+        put_back.push(Ctl::LockWaitTimeout(restore));
+    }
+    put_back.push(Ctl::SetTimestamp(None));
     if commit {
         let ctl = [
             Ctl::RedoDone {
@@ -1815,10 +1834,12 @@ async fn finish_held<C: BranchConn>(
                 gtrid: *gtrid,
             },
             Ctl::Commit,
-            Ctl::SetTimestamp(None),
         ];
         match b.conn.control(&ctl).await {
             Ok(()) => {
+                // Committed: a failure here only keeps the connection from
+                // the pool.
+                let _ = b.conn.control(&put_back).await;
                 // Finished: the rows can go (the resolver deletes them
                 // otherwise).
                 let _ = admin.delete_redo(&b.cluster, &b.anchor.schema, dtid).await;
@@ -1827,10 +1848,9 @@ async fn finish_held<C: BranchConn>(
             Err(e) => {
                 tracing::warn!(cluster = %b.cluster, schema = %b.anchor.schema, errno = e.errno, error = %e.message, "a held branch's phase 2 failed; it is replayed");
                 if !e.is_lost() {
-                    let _ = b
-                        .conn
-                        .control(&[Ctl::Rollback, Ctl::SetTimestamp(None)])
-                        .await;
+                    // The settings stay as they are: the connection is
+                    // given up on with the branch and never pooled.
+                    let _ = b.conn.control(&[Ctl::Rollback]).await;
                 }
                 // On a relay-fenced cluster the agent fences the tenant and
                 // recovers the branch now (a no-op elsewhere).
@@ -1841,10 +1861,9 @@ async fn finish_held<C: BranchConn>(
             }
         }
     } else {
-        let _ = b
-            .conn
-            .control(&[Ctl::Rollback, Ctl::SetTimestamp(None)])
-            .await;
+        let mut ctl = vec![Ctl::Rollback];
+        ctl.extend(put_back);
+        let _ = b.conn.control(&ctl).await;
         admin
             .delete_redo(&b.cluster, &b.anchor.schema, dtid)
             .await
@@ -1855,16 +1874,20 @@ async fn finish_held<C: BranchConn>(
 /// Finishes a prepared branch with `XA COMMIT` (or `XA ROLLBACK`) on its
 /// own connection; on 1397 or a broken connection, through the admin
 /// after killing the old thread (spike-xa: `KILL` detaches the branch).
-/// Returns whether the branch is known finished.
+/// Returns whether the branch is known finished. A branch finished on its
+/// own connection gets its lock wait back (`restore`), so the connection
+/// can serve another transaction; one finished any other way keeps the
+/// lowered value, and the gateway closes such a connection.
 async fn finish_prepared<C: BranchConn>(
     admin: &dyn ClusterAdmin,
     b: &mut Branch<C>,
     commit: bool,
     dtid: Option<Dtid>,
     gtrid: &Gtrid,
+    restore: u32,
 ) -> bool {
     if b.kind == BranchKind::Held {
-        return finish_held(admin, b, commit, dtid, gtrid).await;
+        return finish_held(admin, b, commit, dtid, gtrid, restore).await;
     }
     let Some(x) = b.xid.clone() else {
         return true;
@@ -1877,7 +1900,12 @@ async fn finish_prepared<C: BranchConn>(
     let r = b.conn.control(std::slice::from_ref(&ctl)).await;
     b.phase = XaPhase::Done;
     let e = match r {
-        Ok(()) => return true,
+        Ok(()) => {
+            if b.lowered {
+                let _ = b.conn.control(&[Ctl::LockWaitTimeout(restore)]).await;
+            }
+            return true;
+        }
         Err(e) => e,
     };
     if !e.is_lost() && e.errno != errno::XAER_NOTA {

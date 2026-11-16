@@ -388,6 +388,34 @@ impl DataClient {
         Ok(())
     }
 
+    /// `POST /v1/ai/chat`: one assistant turn, each NDJSON line handed to
+    /// `on` as it arrives. Dropping the future closes the stream, which
+    /// stops the turn in the gateway.
+    ///
+    /// # Errors
+    /// The API's error before the turn starts (39990, 39991, 39992, ...),
+    /// or 39987.
+    pub async fn ai_chat(&self, body: &Value, on: &mut (dyn FnMut(Value) + Send)) -> Result<()> {
+        let mut r = self
+            .send(
+                Method::POST,
+                "/v1/ai/chat",
+                Some(body),
+                "application/x-ndjson",
+            )
+            .await?;
+        if !(200..300).contains(&r.status) {
+            let status = r.status;
+            return Err(error_from(status, &r.bytes().await?));
+        }
+        while let Some(line) = r.next_line().await? {
+            if let Ok(v) = serde_json::from_slice::<Value>(&line) {
+                on(v);
+            }
+        }
+        Ok(())
+    }
+
     /// `Transactions.Begin`: the handle (`transactions/...`).
     ///
     /// # Errors

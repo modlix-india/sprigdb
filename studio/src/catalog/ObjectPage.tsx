@@ -9,6 +9,7 @@ import { Browse } from '../browse/Browse';
 import { StructureView, type StructureTab } from './Structure';
 import { addTab } from '../editor/tabs';
 import { useNavigate } from 'react-router';
+import { AskButton } from '../ai/AskButton';
 
 type Tab = 'columns' | 'indexes' | 'ddl' | 'data' | StructureTab;
 
@@ -62,6 +63,20 @@ export function ObjectPage() {
         >
           Query
         </button>
+        {isTable && (
+          <AskButton
+            label="Describe this table"
+            role="data"
+            testId="ask-describe-table"
+            options={() => ({
+              text: `Describe the ${kind} ${name}: what it holds, its keys, and how it relates to other tables.`,
+              chips: [
+                { id: `db:${db}`, kind: 'database', label: db, ref: db },
+                { id: `table:${db}.${name}`, kind: 'table', label: name, ref: `${db}.${name}` },
+              ],
+            })}
+          />
+        )}
         {kind === 'table' && (
           <Link to={`/t/${encodeURIComponent(tenant)}/settings?scope=table&db=${encodeURIComponent(db)}&table=${encodeURIComponent(name)}`}>
             Settings

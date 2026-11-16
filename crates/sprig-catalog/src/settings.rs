@@ -136,6 +136,22 @@ pub static BOOTSTRAP_TIMEOUT_MINUTES: Setting<u64> = Setting {
 };
 sprig_settings::register!(BOOTSTRAP_TIMEOUT_MINUTES);
 
+/// `catalog.contract_delay_days`: how long after an upgrade's expand
+/// migrations its contract migrations may run (with no older reader
+/// registered). Upgrade orchestration, which reads it, isn't built: no
+/// contract migration runs.
+pub static CONTRACT_DELAY_DAYS: Setting<u64> = Setting {
+    key: "catalog.contract_delay_days",
+    default: 7,
+    scopes: Scopes(0b10_0000),
+    hard: HardBounds::range(0, 3650),
+    apply: Apply::Live,
+    operator_only: true,
+    owner: 8,
+    doc: "Wait before contract migrations",
+};
+sprig_settings::register!(CONTRACT_DELAY_DAYS);
+
 // ---- who writes, and what they need ----
 
 /// Who changes a setting; recorded as the row's `set_by`.

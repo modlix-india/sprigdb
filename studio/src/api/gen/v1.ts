@@ -9,7 +9,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** One assistant turn, streamed as NDJSON: one AiChatEvent per line (start, text, thinking, tool_start, tool_end, proposal, usage, sources, error, end). Proposals are shown, never run. Errors found before the turn starts (39990, 39991, 39992, 39995, a role the caller may not use) are plain HTTP errors */
+        /** One assistant turn, streamed as NDJSON: one AiChatEvent per line (start, text, thinking, tool_start, tool_end, result, proposal, usage, sources, error, end). Proposals are shown, never run. A result event carries a run_query result whole, for the user; the provider gets only its shape unless ai.share_data is on. Errors found before the turn starts (39990, 39991, 39992, 39995, a role the caller may not use) are plain HTTP errors */
         post: operations["Ai.Chat"];
         delete?: never;
         options?: never;
@@ -43,6 +43,40 @@ export interface paths {
         };
         /** One of the caller's conversations with its messages, including the exact payloads sent to the provider while ai.audit_payload_days keeps them (payloads=false leaves them out) */
         get: operations["Ai.GetConversation"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/ai/digests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The tenant's digests (ai.digest), newest first; tenant administrators */
+        get: operations["Ai.ListDigests"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/ai/digests/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One digest: its facts (statistics only), the model's words, and what was sent to word it (payloads=true adds the exact payloads); tenant administrators */
+        get: operations["Ai.GetDigest"];
         put?: never;
         post?: never;
         delete?: never;
@@ -112,7 +146,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** {id}:accept runs a proposal as the caller (an SQL statement in its database, after confirm: true for anything but a plain read; generated test rows likewise), files a recommendation as an ai_dba_advice approvals item, or accepts a glossary term; {id}:dismiss turns it down. The outcome is recorded as feedback */
+        /** {id}:accept runs a proposal as the caller (an SQL statement in its database, after confirm: true for anything but a plain read; generated test rows likewise), files a recommendation as an ai_dba_advice approvals item, accepts a glossary term, or adds a tile to a dashboard (dashboard, an id, or new_dashboard, a name; else the one the assistant named, the caller's own, made when missing); {id}:dismiss turns it down. The outcome is recorded as feedback */
         post: operations["Ai.ProposalAction"];
         delete?: never;
         options?: never;
@@ -281,7 +315,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** The principal, session, tenant tree, grants and studio.* settings */
+        /** The principal, session, tenant tree, grants, studio.* settings, and whether the AI assistants are on and which roles have a model */
         get: operations["Auth.WhoAmI"];
         put?: never;
         post?: never;
@@ -370,6 +404,93 @@ export interface paths {
         put?: never;
         /** The next page; done closes the cursor (39934 unknown, 39935 expired) */
         post: operations["Cursors.Fetch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/dashboards": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The caller's own dashboards and the tenant's shared ones */
+        get: operations["Dashboards.List"];
+        put?: never;
+        /** Makes a dashboard {name, shared?, filters?}, the caller's */
+        post: operations["Dashboards.Create"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/dashboards/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One dashboard the caller owns or that is shared, with its tiles */
+        get: operations["Dashboards.Get"];
+        put?: never;
+        /** Changes a dashboard's name, filters, layout or tile positions (its owner, or a tenant                  administrator for a shared one); {id}:share {shared} shares or unshares it (its owner);                  {id}:delete deletes it */
+        post: operations["Dashboards.Update"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/dashboards/{id}/tiles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Adds a tile {title, database, sql, chart, refresh_seconds?, pos?}: one SELECT whose {{filter}}              names are dashboard filters, and a chart spec that fits it */
+        post: operations["Dashboards.AddTile"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/dashboards/{id}/tiles/{tile}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Replaces a tile; {tile}:delete deletes it; {tile}:run {params?} runs its query as the caller              (their grants and row-level security, never the owner's), answering a TileRun */
+        post: operations["Dashboards.UpdateTile"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/dashboards:run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Runs a query that isn't saved yet (the chart editor, a proposal's preview) as the caller: one read,              filters bound as literals, in a read-only transaction, capped at studio.max_result_rows and              studio.statement_timeout_ms */
+        post: operations["Dashboards.RunQuery"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1537,6 +1658,15 @@ export interface components {
                 tool_use_id?: string;
             };
             reduced?: boolean;
+            result?: {
+                columns: {
+                    name: string;
+                    type: string;
+                }[];
+                row_count: number;
+                rows: unknown[][];
+                truncated?: boolean;
+            };
             role?: string;
             share_data?: boolean;
             sources?: {
@@ -1548,7 +1678,7 @@ export interface components {
             stop?: "end_turn" | "max_tokens" | "refusal" | "other";
             text?: string;
             /** @enum {string} */
-            type: "start" | "text" | "thinking" | "tool_start" | "tool_end" | "proposal" | "usage" | "sources" | "error" | "end";
+            type: "start" | "text" | "thinking" | "tool_start" | "tool_end" | "result" | "proposal" | "usage" | "sources" | "error" | "end";
             usage?: {
                 [key: string]: unknown;
             };
@@ -1588,6 +1718,38 @@ export interface components {
         AiConversations: {
             conversations: components["schemas"]["AiConversationHeader"][];
         };
+        AiDigest: components["schemas"]["AiDigestHeader"] & {
+            body: string;
+            facts: {
+                [key: string]: unknown;
+            };
+            facts_text: string;
+            sent?: {
+                [key: string]: unknown;
+            }[];
+            text?: string | null;
+            usage?: {
+                [key: string]: unknown;
+            };
+        };
+        AiDigestHeader: {
+            /** @enum {string} */
+            cadence: "weekly" | "daily";
+            conversation?: string | null;
+            created_ms?: number;
+            emailed_ms?: number | null;
+            from_ms: number;
+            id: string;
+            model?: string | null;
+            notable?: string[];
+            note?: string | null;
+            /** @enum {string} */
+            status: "worded" | "facts";
+            to_ms: number;
+        };
+        AiDigests: {
+            digests: components["schemas"]["AiDigestHeader"][];
+        };
         AiFeedbackRequest: {
             message_id?: string;
             note?: string;
@@ -1620,13 +1782,19 @@ export interface components {
             term: string;
         };
         AiProposalAction: {
+            chart?: components["schemas"]["ChartSpec"];
             confirm?: boolean;
+            dashboard?: string;
+            new_dashboard?: string;
             note?: string;
+            sql?: string;
+            title?: string;
         };
         AiProposalOutcome: {
             approvals?: {
                 [key: string]: unknown;
             };
+            dashboard?: string;
             database?: string;
             error?: {
                 [key: string]: unknown;
@@ -1643,6 +1811,7 @@ export interface components {
                 sql: string;
             }[];
             term?: string;
+            tile?: string;
         };
         AiRecorded: {
             recorded: boolean;
@@ -1684,6 +1853,44 @@ export interface components {
         };
         /** @description The ChangeEvent message as JSON (proto3 mapping) */
         ChangeEvent: Record<string, never>;
+        ChartField: {
+            /** @enum {string} */
+            agg?: "sum" | "avg" | "count" | "countd" | "min" | "max" | "median" | "none";
+            /** @enum {string} */
+            axis?: "left" | "right";
+            /** @enum {string} */
+            datePart?: "year" | "quarter" | "month" | "week" | "day" | "hour" | "exact";
+            field: string;
+            /** @enum {string} */
+            mark?: "bar" | "line" | "area" | "point" | "pie" | "donut" | "waterfall" | "histogram" | "box" | "heatmap" | "highlight-table" | "treemap" | "funnel" | "radar" | "sankey" | "kpi" | "gauge" | "bullet" | "gantt" | "text-table" | "pivot" | "map-point" | "map-filled";
+        };
+        ChartSpec: {
+            color?: (string | components["schemas"]["ChartField"]) | null;
+            columns?: (string | components["schemas"]["ChartField"])[];
+            detail?: (string | components["schemas"]["ChartField"])[];
+            facet?: (string | components["schemas"]["ChartField"]) | null;
+            filters?: {
+                field: string;
+                in?: unknown[];
+            }[];
+            format?: {
+                [key: string]: unknown;
+            };
+            label?: (string | components["schemas"]["ChartField"]) | null;
+            /** @enum {string} */
+            mark: "bar" | "line" | "area" | "point" | "pie" | "donut" | "waterfall" | "histogram" | "box" | "heatmap" | "highlight-table" | "treemap" | "funnel" | "radar" | "sankey" | "kpi" | "gauge" | "bullet" | "gantt" | "text-table" | "pivot" | "map-point" | "map-filled";
+            rows?: (string | components["schemas"]["ChartField"])[];
+            size?: (string | components["schemas"]["ChartField"]) | null;
+            sort?: {
+                by?: string;
+                /** @enum {string} */
+                dir?: "asc" | "desc";
+            } | null;
+            /** @enum {string|null} */
+            stack?: "none" | "stack" | "percent" | null;
+            tooltip?: (string | components["schemas"]["ChartField"])[];
+            top?: number | null;
+        };
         CheckReply: {
             statements: {
                 checked?: string;
@@ -1761,6 +1968,77 @@ export interface components {
             done: boolean;
             position: string;
             rows: (string | null)[][];
+        };
+        Dashboard: {
+            can_edit: boolean;
+            filters: components["schemas"]["DashboardFilter"][];
+            id: string;
+            layout?: {
+                [key: string]: unknown;
+            };
+            mine: boolean;
+            name: string;
+            owner: string;
+            owner_id?: number;
+            shared: boolean;
+            tiles: components["schemas"]["DashboardTile"][];
+            updated_ms: number;
+        };
+        DashboardCreate: {
+            filters?: components["schemas"]["DashboardFilter"][];
+            name: string;
+            shared?: boolean;
+        };
+        DashboardFilter: {
+            /** @enum {string} */
+            kind: "text" | "number" | "date" | "list";
+            label?: string;
+            name: string;
+            value?: unknown;
+        };
+        DashboardHeader: {
+            can_edit: boolean;
+            id: string;
+            mine: boolean;
+            name: string;
+            owner: string;
+            owner_id?: number;
+            shared: boolean;
+            tiles: number;
+            updated_ms: number;
+        };
+        DashboardQueryRun: {
+            database?: string;
+            filters?: components["schemas"]["DashboardFilter"][];
+            params?: {
+                [key: string]: unknown;
+            };
+            sql: string;
+        };
+        DashboardTile: {
+            chart: components["schemas"]["ChartSpec"];
+            database?: string | null;
+            id: string;
+            pos: components["schemas"]["TilePos"];
+            refresh_seconds: number;
+            sql: string;
+            title: string;
+        };
+        DashboardUpdate: {
+            filters?: components["schemas"]["DashboardFilter"][];
+            layout?: {
+                [key: string]: unknown;
+            };
+            name?: string;
+            positions?: {
+                pos: components["schemas"]["TilePos"];
+                tile: string;
+            }[];
+            shared?: boolean;
+        };
+        Dashboards: {
+            mine: components["schemas"]["DashboardHeader"][];
+            shared: components["schemas"]["DashboardHeader"][];
         };
         /** @description The DeleteVectorsRequest message as JSON (proto3 mapping) */
         DeleteVectorsRequest: Record<string, never>;
@@ -1978,6 +2256,38 @@ export interface components {
         TestRunRequest: Record<string, never>;
         /** @description The TestRunResponse message as JSON (proto3 mapping) */
         TestRunResponse: Record<string, never>;
+        TilePos: {
+            h: number;
+            w: number;
+            x: number;
+            y: number;
+        };
+        TileRequest: {
+            chart?: components["schemas"]["ChartSpec"];
+            database?: string;
+            params?: {
+                [key: string]: unknown;
+            };
+            pos?: components["schemas"]["TilePos"];
+            refresh_seconds?: number;
+            sql?: string;
+            title?: string;
+        };
+        TileRun: {
+            columns: {
+                name: string;
+                type: string;
+            }[];
+            ms: number;
+            row_count: number;
+            rows: unknown[][];
+            truncated: boolean;
+        };
+        TileSaved: {
+            dashboard?: components["schemas"]["Dashboard"];
+            deleted?: boolean;
+            tile?: string;
+        };
         TokenReply: {
             access_token: string;
             expires_in: number;
@@ -2001,6 +2311,11 @@ export interface components {
         /** @description The WatchRequest message as JSON (proto3 mapping) */
         WatchRequest: Record<string, never>;
         WhoAmI: {
+            ai?: {
+                enabled: boolean;
+                roles: ("data" | "dba" | "admin")[];
+                share_data: boolean;
+            };
             amr: string[];
             gateway?: {
                 dc?: string;
@@ -2130,6 +2445,70 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AiConversation"];
+                };
+            };
+            /** @description An error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    "Ai.ListDigests": {
+        parameters: {
+            query?: {
+                limit?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AiDigests"];
+                };
+            };
+            /** @description An error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    "Ai.GetDigest": {
+        parameters: {
+            query?: {
+                payloads?: string;
+            };
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AiDigest"];
                 };
             };
             /** @description An error */
@@ -2797,6 +3176,238 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["CursorPage"];
+                };
+            };
+            /** @description An error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    "Dashboards.List": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Dashboards"];
+                };
+            };
+            /** @description An error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    "Dashboards.Create": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DashboardCreate"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Dashboard"];
+                };
+            };
+            /** @description An error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    "Dashboards.Get": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Dashboard"];
+                };
+            };
+            /** @description An error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    "Dashboards.Update": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DashboardUpdate"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Dashboard"];
+                };
+            };
+            /** @description An error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    "Dashboards.AddTile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TileRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TileSaved"];
+                };
+            };
+            /** @description An error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    "Dashboards.UpdateTile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+                tile: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TileRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TileSaved"];
+                };
+            };
+            /** @description An error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    "Dashboards.RunQuery": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DashboardQueryRun"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TileRun"];
                 };
             };
             /** @description An error */

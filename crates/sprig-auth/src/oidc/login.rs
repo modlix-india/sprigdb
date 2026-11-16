@@ -103,6 +103,13 @@ impl LoginService {
         let LoginSource::Catalog(cl) = self.source() else {
             return None;
         };
+        // The issuer is public (any OIDC client of the tenant gets it), so
+        // a DC the login will be handed from reads it here; one that may
+        // not serve the tenant at all (`residency.deny_remote_access`)
+        // refuses now, without loading the tenant's catalog.
+        if self.token_route(tenant).await == Route::Deny {
+            return None;
+        }
         let t = cl.tenants().lookup(tenant).await.ok()??;
         if !t.can_log_in {
             return None;

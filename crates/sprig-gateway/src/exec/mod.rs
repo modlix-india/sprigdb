@@ -200,6 +200,7 @@ impl Executor for PassThrough {
             subst: Vec::new(),
             wl: None,
             wl_multi: false,
+            wl_text: None,
             router: router::RouterState::default(),
             packet_limit: None,
             placement_memo: follow::PlacementMemo::default(),
@@ -228,6 +229,11 @@ pub struct PassSession {
     wl: Option<crate::workload::SessionCapture>,
     /// The current `COM_QUERY` holds several statements: none is probed.
     wl_multi: bool,
+    /// The client's own text of the current statement when a rewrite put
+    /// data into it (`performance_schema` and `sys` tables): workload
+    /// capture fingerprints this, as MySQL's digests show the client's
+    /// statement.
+    wl_text: Option<Vec<u8>>,
     /// The router: the session's connections to other clusters and the
     /// transaction coordinator, for tenants with sharded tables.
     router: router::RouterState,
@@ -343,6 +349,9 @@ impl PassSession {
     /// tenant session opens it in the schema of its current logical
     /// database.
     fn bs(&mut self, cx: &ExecCtx<'_>) -> &mut BackendSession {
+        // Sprig 2PC's relay path: every connection of the tenant to a
+        // cluster with relays goes through its relay writer.
+        let relay = self.relay_tenant();
         let backends = &self.backends;
         let target = &self.target;
         let persona = self.persona;
@@ -350,7 +359,7 @@ impl PassSession {
             Some(ts) => ts.schema_of(ts.current.as_deref().or(cx.db)),
             None => cx.db.map(str::to_owned),
         };
-        self.bs.get_or_insert_with(|| {
+        let bs = self.bs.get_or_insert_with(|| {
             backends.session(
                 target.clone(),
                 SessionOpts {
@@ -359,10 +368,16 @@ impl PassSession {
                     mariadb_caps: mariadb_caps(persona, cx.proto.caps),
                     collation: cx.proto.collation,
                     schema,
+                    relay,
                     ..SessionOpts::default()
                 },
             )
-        })
+        });
+
+        if bs.relay() != relay {
+            bs.set_relay(relay);
+        }
+        bs
     }
 
     fn backend_caps(&self, cx: &ExecCtx<'_>) -> Caps {
@@ -576,6 +591,7 @@ impl PassSession {
         let backend_caps = self.backend_caps(cx);
         // One statement per execute: probes allowed.
         self.wl_multi = false;
+        self.wl_text = None;
         let s = self.stmts.get_mut(stmt)?;
         if let Some(text) = s.deferred.clone() {
             // A search text: the bound values as literals.

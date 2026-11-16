@@ -25,10 +25,22 @@ This listener needs TLS.\n";
 /// response isn't lost to a reset.
 const HTTP_REJECT_LINGER: Duration = Duration::from_millis(500);
 
-/// Whether a connection whose first byte is `first` starts a TLS handshake.
-pub(crate) const fn starts_tls(first: u8) -> bool {
-    first == TLS_HANDSHAKE_RECORD
+/// Whether a connection that starts with `head` (its first bytes, at most
+/// [`TLS_SNIFF`]) starts a TLS handshake: a handshake record (`0x16`) of
+/// protocol version 3.x (SSL 3.0 to TLS 1.3 put `03 00` to `03 04` there)
+/// whose first message is a `ClientHello` (`01`). The first byte alone
+/// isn't enough: a MongoDB message starts with its length in little-endian
+/// order, so a plaintext `hello` of 278, 534 or 790 bytes also starts with
+/// `0x16` (the Rust driver's does, depending on its client metadata).
+pub(crate) fn starts_tls(head: &[u8]) -> bool {
+    match head {
+        [TLS_HANDSHAKE_RECORD, 0x03, minor, _, _, hello, ..] => *minor <= 0x04 && *hello == 0x01,
+        _ => false,
+    }
 }
+
+/// How many first bytes [`starts_tls`] looks at.
+pub(crate) const TLS_SNIFF: usize = 6;
 
 /// Keeps `sprig_gateway_connections{listener, state="open"}` in step.
 struct OpenGuard(&'static str);
@@ -123,11 +135,20 @@ async fn prepare(
     } else if spec.tls == TlsMode::Off {
         (MaybeTls::Plain(sock), InProtocolTls::NotOffered)
     } else {
-        let mut first = [0u8; 1];
-        if sock.peek(&mut first).await.map_err(|_| "io")? == 0 {
+        let mut head = [0u8; TLS_SNIFF];
+        let mut n = sock.peek(&mut head).await.map_err(|_| "io")?;
+        if n == 0 {
             return Err("closed");
         }
-        if starts_tls(first[0]) {
+        // A first byte of 0x16 may be TLS: wait briefly for the rest of the
+        // record header (a `ClientHello` always has it) before deciding.
+        let mut waited = 0;
+        while head[0] == TLS_HANDSHAKE_RECORD && n < TLS_SNIFF && waited < 200 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            waited += 1;
+            n = sock.peek(&mut head).await.map_err(|_| "io")?;
+        }
+        if starts_tls(&head[..n]) {
             let acceptor = active.acceptor.clone().ok_or("no_certificate")?;
             let Ok(tls) = acceptor.accept(sock).await else {
                 count_handshake(spec.name, None, "error");

@@ -52,6 +52,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::{Freshness, TenantCatalog};
 use sprig_common::Result;
 use sprig_common::ids::{ObjectId, TenantId};
@@ -383,7 +384,7 @@ impl Mapper {
             let read = async {
                 let cluster = svc.locator.cluster(child.tenant).await?;
                 let pool = svc.locator.ctl_pool(&cluster).await?;
-                let mut conn = pool.get_conn().await.map_err(|e| {
+                let mut conn = pool.get_conn_bounded().await.map_err(|e| {
                     sprig_common::SprigError::new(
                         sprig_common::SprigCode::BackendUnavailable,
                         e.to_string(),
@@ -572,7 +573,10 @@ pub(super) async fn read(
             multi: false,
         };
         let c = caller.clone();
-        let task = tokio::spawn(async move { engine.run(&c, call, None, tx).await });
+        let space = crate::http::sql::call_space();
+        let task = tokio::spawn(crate::http::sql::SPACE.scope(space, async move {
+            engine.run(&c, call, None, tx).await;
+        }));
         let resp = collect(rx, 64 << 20, None).await;
         let _ = task.await;
         let resp = resp?;
@@ -790,7 +794,10 @@ pub(super) async fn probe(
         multi: false,
     };
     let c = caller.clone();
-    let task = tokio::spawn(async move { engine.run(&c, call, None, tx).await });
+    let space = crate::http::sql::call_space();
+    let task = tokio::spawn(crate::http::sql::SPACE.scope(space, async move {
+        engine.run(&c, call, None, tx).await;
+    }));
     let resp = collect(rx, 64 << 20, None).await;
     let _ = task.await;
     let resp = resp?;

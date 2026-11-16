@@ -137,6 +137,14 @@ data: {"resume_token":"01000000000000002a...","object":"orders","model":"table",
 
 When nothing changes for `api.stream.heartbeat_seconds` (15), the stream sends a `heartbeat` event carrying the latest token, so a quiet stream still moves its resume point on. Changes to rows you may not see also move the token on, without showing you the row.
 
+### Starting at a point in time
+
+Instead of a resume token, a stream can start at a time: `start_at_hlc`, a hybrid logical clock value (the `commit_hlc` of an event, for example), as a query parameter (`?start_at_hlc=...`) or the `Changes.Watch` field. The stream sends the tenant's changes committed at or after it.
+
+- Give either `start_after` (or `Last-Event-ID`) or `start_at_hlc`, not both: 39801.
+- SprigDB finds the binlog position from an index it records every 10 seconds per cluster, so the stream starts slightly before the time and leaves out the earlier events.
+- A time older than the time index reaches back, or than the tenant's move to its current cluster, fails with 39800. A cluster that has no index yet (just added or upgraded) fails with 39802.
+
 ### gRPC
 
 The same stream is the `Changes.Watch` server-streaming call of the `sprig.v1` API, one `ChangeEvent` message per event, on the gateway's HTTP ports. See [REST and gRPC](../connect/rest-and-grpc.md).
@@ -149,6 +157,8 @@ The same stream is the `Changes.Watch` server-streaming call of the `sprig.v1` A
 | `api.stream.max_buffered_events` | 10000 | A client further behind gets 39790 `ER_SPRIG_STREAM_SLOW_CONSUMER`, and the stream ends; resume from the last token |
 | `api.stream.heartbeat_seconds` | 15 | Heartbeat interval on a quiet stream |
 
+The three settings can be set for a tenant or globally. A `Sprig-Space` header (gRPC metadata `sprig-space`) makes the subscriber's session act in that space, as `USE SPACE` does.
+
 ## Errors
 
 | Code | Name | When |
@@ -156,14 +166,14 @@ The same stream is the `Changes.Watch` server-streaming call of the `sprig.v1` A
 | 1142 | `ER_TABLEACCESS_DENIED_ERROR` | A named table you can't read (`SELECT command denied`) or watch (`WATCH command denied`) |
 | 13 | `Unauthorized` (MongoDB) | `watch()` on a collection without `WATCH` |
 | 39800 | `ER_SPRIG_FEED_HISTORY_LOST` | The start point is older than the history the binlogs keep |
-| 39801 | `ER_SPRIG_FEED_BAD_RESUME_TOKEN` | The token is malformed or belongs to another tenant |
-| 39802 | `ER_SPRIG_FEED_SOURCE_UNSUPPORTED` | A cluster's binlog settings don't meet the feed's needs, or a start by time was asked for |
+| 39801 | `ER_SPRIG_FEED_BAD_RESUME_TOKEN` | The token is malformed or belongs to another tenant, or both a token and `start_at_hlc` were given |
+| 39802 | `ER_SPRIG_FEED_SOURCE_UNSUPPORTED` | A cluster's binlog settings don't meet the feed's needs, or `start_at_hlc` on a cluster without a time index yet |
 | 39780 | `ER_SPRIG_RATE_LIMITED` | Too many open streams for the tenant on this gateway |
 | 39790 | `ER_SPRIG_STREAM_SLOW_CONSUMER` | The client fell too far behind; resume from the last token |
 
 ## Not supported yet
 
-- Starting a stream at a point in time (`start_at_hlc`, MongoDB's `startAtOperationTime`).
+- Starting a MongoDB change stream at a point in time (`startAtOperationTime`).
 - A SQL statement for subscribing to changes. Use one of the transports above, a change topic or a sink.
 
 ## Related

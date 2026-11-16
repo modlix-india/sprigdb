@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_inherit::msg::{Cause, DefKind, Definition, StreamSpec};
 use sprig_proto_kafka::broker::data::{AppendTicket, DataTopic, ProduceRecord};
 use sprig_proto_kafka::protocol::err;
@@ -481,7 +482,7 @@ async fn reader_catalog(
         .await?;
     let mut c = ep
         .pool
-        .get_conn()
+        .get_conn_bounded()
         .await
         .map_err(sprig_streams::maria::map_err)?;
     let schema = ep.store.schema().to_owned();

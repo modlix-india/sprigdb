@@ -715,7 +715,12 @@ mod tests {
         );
         // Not ALL any more, GRANT OPTION only, or WATCH named: no change.
         let partial = db.minus(ActionSet::of(&[Action::Delete]));
-        assert!(!revoke_ends_all(partial, si, Level::Database, ObjectType::Table));
+        assert!(!revoke_ends_all(
+            partial,
+            si,
+            Level::Database,
+            ObjectType::Table
+        ));
         let go = ActionSet::of(&[Action::GrantOption]);
         assert!(!revoke_ends_all(db, go, Level::Database, ObjectType::Table));
         let w = si.with(Action::Watch);
@@ -723,6 +728,11 @@ mod tests {
         // Tables too; never the tenant level, which prints WATCH on its own line.
         let t = all_at(Level::Object, ObjectType::Table);
         assert!(revoke_ends_all(t, si, Level::Object, ObjectType::Table));
-        assert!(!revoke_ends_all(ALL_TENANT, si, Level::Tenant, ObjectType::Table));
+        assert!(!revoke_ends_all(
+            ALL_TENANT,
+            si,
+            Level::Tenant,
+            ObjectType::Table
+        ));
     }
 }

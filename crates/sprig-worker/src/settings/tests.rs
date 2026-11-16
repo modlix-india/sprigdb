@@ -170,7 +170,7 @@ async fn tenant_rows_win_for_that_tenants_jobs() {
     // The tenant's trigger: its own value; any other tenant: the global.
     assert_eq!(s.run_opts_for(t).max_attempts, 7);
     assert_eq!(s.run_opts_for(TenantId(78)).max_attempts, 3);
-    // A scheduled run's budget (smallfix: read per tenant, as declared).
+    // A scheduled run's budget, read per tenant as declared.
     assert_eq!(s.job_budget_for(t), Duration::from_millis(1500));
     assert_eq!(s.job_budget_for(TenantId(78)), Duration::from_secs(300));
     // The mover: the tenant's value over the dc's.
@@ -184,6 +184,130 @@ async fn tenant_rows_win_for_that_tenants_jobs() {
     assert_eq!(
         MoverSettings::resolve(&snap, &ctx).cutover_max_hold,
         Duration::from_millis(4000)
+    );
+    stop.cancel();
+}
+
+/// Worker settings over a fresh mirror, with `rows` seeded as tenant
+/// `t`'s catalog rows.
+async fn seeded(
+    t: sprig_common::ids::TenantId,
+    rows: Vec<sprig_catalog::SettingRow>,
+) -> (WorkerSettings, CancellationToken) {
+    use sprig_controller::tenant_scopes::{TenantScopes, build_rows};
+    let dc = DcId::new("mum1").unwrap();
+    let mem = MemStore::new(Tier::Dc(dc.clone()));
+    let global: Arc<dyn MetaStore> = Arc::new(mem.with_tier(Tier::Global));
+    let dc_store: Arc<dyn MetaStore> = Arc::new(mem);
+    let stop = CancellationToken::new();
+    let scopes = TenantScopes::new(
+        Arc::clone(&global),
+        Arc::clone(&dc_store),
+        Arc::new(sprig_controller::catalogs::StaticPools::new()),
+    )
+    .unwrap();
+    let s = WorkerSettings::start(global, dc_store, dc, &stop)
+        .await
+        .unwrap()
+        .unwrap()
+        .with_tenant_scopes(Arc::clone(&scopes));
+    scopes.seed(
+        t,
+        2,
+        build_rows(sprig_settings::Registry::global().unwrap(), t, 2, rows),
+    );
+    (s, stop)
+}
+
+/// Worker settings seeded with tenant 79's `logic.*` rows at tenant,
+/// database 5 and table 11 scope.
+async fn seeded_trigger_rows() -> (WorkerSettings, CancellationToken) {
+    use sprig_catalog::{SettingRow, SettingScope};
+    use sprig_common::ids::{DbId, ObjectId, TenantId};
+
+    let row = |scope: SettingScope, key: &str, v: serde_json::Value| SettingRow {
+        scope,
+        key: key.into(),
+        value: Some(v),
+        bounds: None,
+        set_by: "op:test".into(),
+        set_at: std::time::SystemTime::UNIX_EPOCH,
+        version: 2,
+    };
+    let db = SettingScope::Database(DbId(5));
+    let table = SettingScope::Object(ObjectId(11));
+    seeded(
+        TenantId(79),
+        vec![
+            row(
+                SettingScope::Tenant,
+                "logic.trigger_max_attempts",
+                serde_json::json!(7),
+            ),
+            row(db, "logic.trigger_max_attempts", serde_json::json!(2)),
+            row(db, "logic.trigger_retry_initial_ms", serde_json::json!(100)),
+            row(db, "logic.trigger_budget_ms", serde_json::json!(4000)),
+            row(db, "logic.job_budget_ms", serde_json::json!(9000)),
+            row(table, "logic.trigger_max_attempts", serde_json::json!(4)),
+            row(table, "logic.trigger_lanes", serde_json::json!(3)),
+        ],
+    )
+    .await
+}
+
+/// A trigger reads its table's and its database's `logic.trigger_*` rows
+/// over its tenant's: a value set with `ALTER DATABASE … SPRIG SET` was
+/// accepted but ignored before.
+#[tokio::test]
+async fn database_and_table_rows_reach_a_trigger() {
+    use sprig_common::ids::TenantId;
+
+    use super::LogicScope;
+
+    let t = TenantId(79);
+    let (s, stop) = seeded_trigger_rows().await;
+    // The tenant alone, another database, the database, its table.
+    assert_eq!(s.run_opts_for(t).max_attempts, 7);
+    assert_eq!(s.run_opts_for(LogicScope::db(t, 6)).max_attempts, 7);
+    let in_db = s.run_opts_for(LogicScope::db(t, 5));
+    assert_eq!(in_db.max_attempts, 2);
+    assert_eq!(in_db.retry_initial, Duration::from_millis(100));
+    assert_eq!(in_db.lanes, 8);
+    let on_table = s.run_opts_for(LogicScope::db(t, 5).with_object(Some(11)));
+    assert_eq!(on_table.max_attempts, 4);
+    assert_eq!(on_table.retry_initial, Duration::from_millis(100));
+    assert_eq!(on_table.lanes, 3);
+    // A stream's or queue's trigger has no table.
+    assert_eq!(
+        s.run_opts_for(LogicScope::db(t, 5).with_object(Some(0)))
+            .max_attempts,
+        2
+    );
+    // Read again at each failure.
+    assert_eq!(
+        s.run_opts_for(LogicScope::db(t, 5)).current().max_attempts,
+        2
+    );
+    stop.cancel();
+}
+
+/// Trigger and job budgets follow the database's rows too.
+#[tokio::test]
+async fn database_rows_reach_trigger_and_job_budgets() {
+    use sprig_common::ids::TenantId;
+
+    use super::LogicScope;
+
+    let t = TenantId(79);
+    let (s, stop) = seeded_trigger_rows().await;
+    assert_eq!(
+        s.trigger_budget_for(LogicScope::db(t, 5)),
+        Duration::from_secs(4)
+    );
+    assert_eq!(s.trigger_budget_for(t), Duration::from_secs(30));
+    assert_eq!(
+        s.job_budget_for(LogicScope::db(t, 5)),
+        Duration::from_secs(9)
     );
     stop.cancel();
 }

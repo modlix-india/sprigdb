@@ -1264,3 +1264,104 @@ async fn a_handed_off_token_login_keeps_its_claims_and_roles() {
         "{r:?}"
     );
 }
+
+/// An API key used outside the tenant's allowed DCs is checked there, as
+/// token logins are: `nyc1` hands it to `fra1`, which audits it and counts
+/// a wrong key; `nyc1` never loads the tenant's catalog. With
+/// `deny_remote_access` the key is refused with 39302, and `MONGODB-OIDC`'s
+/// first step names no issuer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_keys_follow_the_tenant_residency() {
+    use sha2::{Digest, Sha256};
+
+    use crate::apikey::ApiKeyRow;
+    use crate::handoff::{HandoffTarget, LocalPeers};
+    use crate::http::{HttpAuth, HttpRequest};
+    const SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    let dc = |d: &str| sprig_common::ids::DcId::new(d).unwrap();
+    let fra = world_in(Some(("fra1", Arc::new(LocalPeers::default()))), false).await;
+    fra.tenants.set_residency("acme", pinned(&["fra1"], false));
+    // fra1's acme: user 10 `svc` with the api_key method and one key.
+    let mut svc_user = row(10, "svc", "%", 1);
+    svc_user.auth_methods = AuthMethods::API_KEY;
+    let key = ApiKeyRow {
+        key_id: "aaaaaaaaaaaa".into(),
+        user_id: UserId(10),
+        name: "ci".into(),
+        secret_sha256: Sha256::digest(SECRET.as_bytes()).into(),
+        scopes: json!([]),
+        allowed_cidrs: None,
+        expires_at: None,
+        revoked_at: None,
+        created_by: None,
+        created_at: fra.clock.wall(),
+        changed_version: 4,
+    };
+    let auth = TenantAuth::build(vec![svc_user], &[], Vec::new())
+        .with_issuers(Some(vec![spec(&fra.idp, &["RS256"])]))
+        .with_api_keys(vec![key], false);
+    fra.catalogs.map.lock().unwrap().insert(
+        ACME,
+        crate::mysql::tests::snapshot_with(ACME, auth, 4, Vec::new()),
+    );
+    let peers: Arc<dyn HandoffTarget> =
+        Arc::new(LocalPeers::default().with(dc("fra1"), Arc::clone(&fra.svc)));
+    let nyc = world_in(Some(("nyc1", peers)), false).await;
+    nyc.tenants.set_residency("acme", pinned(&["fra1"], false));
+    nyc.catalogs.map.lock().unwrap().clear();
+    let req = |auth: &'static str| HttpRequest {
+        authorization: Some(auth),
+        host: None,
+        sni: None,
+        tenant_header: None,
+        client_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        tls: true,
+        client_cert: false,
+        client_dn: None,
+    };
+    let good: &'static str =
+        Box::leak(format!("Bearer sprig_acme_aaaaaaaaaaaa_{SECRET}").into_boxed_str());
+    let wrong: &'static str =
+        Box::leak(format!("Bearer sprig_acme_aaaaaaaaaaaa_{}", "f".repeat(64)).into_boxed_str());
+    let http = HttpAuth::new(Arc::clone(&nyc.svc));
+    let p = http.authenticate(&req(good)).await.unwrap();
+    assert_eq!(
+        (p.user.as_str(), p.user_id, p.tenant),
+        ("svc", Some(UserId(10)), Some(ACME))
+    );
+    let e = http.authenticate(&req(wrong)).await.unwrap_err();
+    assert_eq!((e.status, e.error.code), (401, 1045));
+    // fra1 decided both: its own login events and hand-off events.
+    let evs = fra.audit.events();
+    let ok = evs
+        .iter()
+        .filter(|e| e.event == "auth.login_succeeded" && e.mechanism == Some("api_key"))
+        .count();
+    let failed = evs
+        .iter()
+        .filter(|e| e.event == "auth.login_failed" && e.mechanism == Some("api_key"))
+        .count();
+    let handoffs = evs
+        .iter()
+        .filter(|e| e.event == "auth.handoff" && e.mechanism == Some("api_key"))
+        .count();
+    assert_eq!((ok, failed, handoffs), (1, 1, 2));
+    assert!(
+        !nyc.audit
+            .events()
+            .iter()
+            .any(|e| e.mechanism == Some("api_key")),
+        "the source doesn't audit what it didn't decide"
+    );
+    assert!(
+        nyc.catalogs.map.lock().unwrap().is_empty(),
+        "the source never loads the tenant's catalog"
+    );
+    // deny_remote_access: 39302, decided at the source; no issuer either.
+    nyc.tenants.set_residency("acme", pinned(&["fra1"], true));
+    let e = http.authenticate(&req(good)).await.unwrap_err();
+    assert_eq!(e.error.code, 39302);
+    assert!(nyc.svc.mongo_issuer("acme").await.is_none());
+    // In an allowed DC, the issuer is named.
+    assert!(fra.svc.mongo_issuer("acme").await.is_some());
+}

@@ -564,7 +564,18 @@ pub struct At<'a> {
     pub shards: Option<&'a mut dyn ShardSessions>,
     /// The tenant, for a staged rollout `BY TENANT` (decided at deploy).
     pub tenant: u64,
+    /// The database's name, for `db.call("db.name")` and `db.publish`.
+    pub db_name: &'a str,
+    /// The database's streams, for a compiled `db.publish`
+    /// ([`crate::calls::Env::with_streams`]).
+    pub streams: StreamList,
 }
+
+/// Streams by name: what a compiled `db.publish` writes, or why it can't.
+pub type StreamList = Vec<(
+    String,
+    std::result::Result<sprig_logic_compile::link::StreamTarget, String>,
+)>;
 
 /// [`deploy()`] at a fixed version and on several shards.
 ///
@@ -630,6 +641,9 @@ pub async fn deploy_at(
         None => store.next_version(t.catalog, module.module_id).await?,
     };
     let cols = columns(session, t.shard_schema).await?;
+    let env = crate::calls::Env::new(cols, at.db_name)
+        .with_callees(crate::calls::callees(t.catalog, t.catalog_schema, t.db_id).await?)
+        .with_streams(&at.streams);
     let opts = Options {
         module_id: module.module_id,
         version,
@@ -640,10 +654,11 @@ pub async fn deploy_at(
     let mut compiled = if d.runtime == sprig_logic_compile::Runtime::Javascript {
         // The JavaScript front end: the declaration gives
         // the parameters' types and `RETURNS`.
-        sprig_logic_compile::js::compile_with(&d.name, &d.body, &js_signature(d), &cols, &opts)?
+        sprig_logic_compile::js::compile_with(&d.name, &d.body, &js_signature(d), &env, &opts)?
     } else {
-        compile(d.runtime, &d.body, &cols, &opts)?
+        compile(d.runtime, &d.body, &env, &opts)?
     };
+    let cols = &env.cols;
     let script = matches!(
         d.runtime,
         sprig_logic_compile::Runtime::Javascript | sprig_logic_compile::Runtime::Lua
@@ -667,10 +682,27 @@ pub async fn deploy_at(
     }
     let computed_notes = match (&previous, &compiled.ir) {
         (Some(prev), Some(f)) if d.kind == Kind::Function => {
-            computed_dependents(t.catalog, &store, prev, f, &cols).await?
+            computed_dependents(t.catalog, &store, prev, f, cols).await?
         }
         _ => Vec::new(),
     };
+    // Compiled code calling this module was made for its signature and
+    // tier: a version that changes them would break those calls.
+    if let (Some(prev), Some(f)) = (&previous, &compiled.ir) {
+        crate::calls::check_callers(
+            t.catalog,
+            t.catalog_schema,
+            t.db_id,
+            crate::calls::NewVersion {
+                module_id: prev.module_id,
+                name: &d.name,
+                func: f,
+                compiled: placed.tier == Tier::MariaDb,
+                writes: !compiled.analysis.writes.is_empty(),
+            },
+        )
+        .await?;
+    }
     // A staged rollout: the active version stays for most
     // callers; it must take the same parameters, in the same language,
     // with the same rights, so one wrapper can hold both.
@@ -873,6 +905,27 @@ pub async fn deploy_at(
                         )
                     }
                 };
+                // The call entry picks as the wrapper does.
+                let cond = match spec.by {
+                    crate::rollout::RolloutBy::User => {
+                        crate::rollout::user_condition(module.module_id, spec.pct)
+                    }
+                    crate::rollout::RolloutBy::Tenant => {
+                        if crate::rollout::picks_candidate(*spec, "", at.tenant, module.module_id) {
+                            "TRUE".to_owned()
+                        } else {
+                            "FALSE".to_owned()
+                        }
+                    }
+                };
+                let entry_name = sprig_logic_compile::link::call_entry(module.module_id);
+                if let Some(r) = plan.routines.iter_mut().find(|r| r.name == entry_name) {
+                    r.sql = deploy::call_entry(
+                        t.shard_schema,
+                        &active_side,
+                        Some((&cand_side, cond.as_str())),
+                    );
+                }
                 if let Some(last) = plan.routines.last_mut() {
                     last.sql = sql;
                 }
@@ -994,6 +1047,8 @@ pub struct Bind<'a> {
     pub definer: String,
     /// Now, Unix ms (schedules).
     pub now_ms: u64,
+    /// The database's streams, for a compiled `db.publish`.
+    pub streams: StreamList,
 }
 
 /// A bound deploy whose routines are on every shard, waiting for the
@@ -1131,7 +1186,11 @@ pub async fn deploy_bound(
         let s = shards.session(&first).await?;
         columns(s, &first).await?
     };
-    if !sprig_logic_compile::Columns::has_table(&cols, table) {
+    let env = crate::calls::Env::new(cols, b.db_name)
+        .with_callees(crate::calls::callees(t.catalog, t.catalog_schema, t.db_id).await?)
+        .with_streams(&b.streams);
+    let cols = &env.cols;
+    if !sprig_logic_compile::Columns::has_table(cols, table) {
         return Err(SprigError::standard(
             1146,
             *b"42S02",
@@ -1145,7 +1204,7 @@ pub async fn deploy_bound(
         compile_max_cost: t.compile_max_cost,
         definer_security: true,
     };
-    let compiled = compile_bound(d, table, &cols, &opts)?;
+    let compiled = compile_bound(d, table, &env, &opts)?;
     if d.runtime == sprig_logic_compile::Runtime::Javascript {
         // QuickJS must accept it too: the engine tier defines the
         // language, and test runs run it there.
@@ -1171,7 +1230,7 @@ pub async fn deploy_bound(
             }
         )));
     };
-    let bound = enforce::bind_row(f, table, &cols)?;
+    let bound = enforce::bind_row(f, table, cols)?;
     let mut binding = match store.binding(t.catalog, module.module_id).await? {
         Some(x) => x,
         None => BindingRow {
@@ -1472,6 +1531,9 @@ async fn deploy_schedule(
         reads: Vec::new(),
         writes: Vec::new(),
         cost: 1,
+        calls: Vec::new(),
+        reaches: Vec::new(),
+        call_depth: 0,
     };
     store
         .add_version(
@@ -1661,6 +1723,32 @@ mod tests {
     }
 
     #[test]
+    fn javascript_helpers_make_a_computed_column_and_try_does_not() {
+        let c = call("ALTER TABLE products ADD COLUMN c DOUBLE AS (net(price, stock)) STORED");
+        // An arrow helper and a helper with several returns: one CASE.
+        let body = "const tax = (x) => x * 0.2;
+            function gross(a) { if (a > 100) return a * 0.95; return a; }
+            return gross(price * stock) + tax(price * stock);";
+        let expr = computed_column("net", "javascript", body, &net_sig(), &c).unwrap();
+        assert!(expr.contains("CASE") && expr.contains("(price)"), "{expr}");
+        // `try` and loops have no expression form: 39862 with the reason.
+        for (body, why) in [
+            (
+                "try { return price * stock; } catch (e) { return 0; }",
+                "try/catch",
+            ),
+            (
+                "let n = 0; do { n++; } while (n < stock); return n * price;",
+                "a loop",
+            ),
+        ] {
+            let e = computed_column("net", "javascript", body, &net_sig(), &c).unwrap_err();
+            assert_eq!(e.code(), Some(SprigCode::LogicUnsupported), "{body}");
+            assert!(e.message.contains(why), "{}", e.message);
+        }
+    }
+
+    #[test]
     fn nondeterministic_code_makes_no_computed_column() {
         for (stored, sql) in [
             (
@@ -1761,5 +1849,68 @@ mod tests {
         d.runtime = sprig_logic_compile::Runtime::Lua;
         let c = compile_bound(&d, "sales", &sales(), &opts).unwrap();
         assert!(!c.compilable());
+    }
+
+    #[test]
+    fn javascript_try_helpers_and_do_while_in_validations_and_triggers() {
+        let opts = Options::default();
+        // A helper with several returns over the new row only: still a
+        // CHECK with one message.
+        let d = crate::declare::parse(
+            "CREATE VALIDATION qty_cap ON sales FOR INSERT, UPDATE LANGUAGE javascript AS $$
+             function cap(status) { if (status === 'bulk') return 1000; return 10; }
+             export default function (row) { if (row.qty > cap(row.status)) sprig.reject('too many'); }
+             $$",
+        )
+        .unwrap();
+        let c = compile_bound(&d, "sales", &sales(), &opts).unwrap();
+        assert!(c.compilable(), "{:?}", c.analysis.reasons);
+        let f = c.ir.as_ref().unwrap();
+        let bound = enforce::bind_row(f, "sales", &sales()).unwrap();
+        assert!(matches!(
+            enforce::plan_validation(f, &bound, &d.events, 7, 1).0,
+            Enforcement::Check { .. }
+        ));
+        // `try`, `finally` and `do`: BEFORE triggers calling the routine.
+        let d = crate::declare::parse(
+            "CREATE VALIDATION steps ON sales FOR INSERT, UPDATE LANGUAGE javascript AS $$
+             export default function (row, old) {
+               let n = 0;
+               do { n++; } while (n < row.qty && n < 5);
+               try {
+                 if (old !== null && old.qty > row.qty) throw new Error('falls');
+               } catch (e) {
+                 sprig.reject(`qty ${e.message} after ${n} steps`);
+               } finally {
+                 n = 0;
+               }
+             }
+             $$",
+        )
+        .unwrap();
+        let c = compile_bound(&d, "sales", &sales(), &opts).unwrap();
+        assert!(c.compilable(), "{:?}", c.analysis.reasons);
+        let f = c.ir.as_ref().unwrap();
+        let bound = enforce::bind_row(f, "sales", &sales()).unwrap();
+        assert!(matches!(
+            enforce::plan_validation(f, &bound, &d.events, 7, 1).0,
+            Enforcement::Triggers
+        ));
+        // An after-commit trigger catching a duplicate key.
+        let d = crate::declare::parse(
+            "CREATE TRIGGER copy AFTER COMMIT ON sales FOR INSERT LANGUAGE javascript AS $$
+             export default function (row) {
+               const twice = (q) => q * 2;
+               try {
+                 db.exec('INSERT INTO sales (id, qty, status) VALUES (?, ?, ?)', [row.id + 1000, twice(row.qty), 'copy']);
+               } catch {
+                 db.exec('UPDATE sales SET qty = qty + 1 WHERE id = ?', [row.id + 1000]);
+               }
+             }
+             $$",
+        )
+        .unwrap();
+        let c = compile_bound(&d, "sales", &sales(), &opts).unwrap();
+        assert!(c.compilable(), "{:?}", c.analysis.reasons);
     }
 }

@@ -57,6 +57,19 @@ fn connection_admin(exec: &dyn SessionExec) -> bool {
         .unwrap_or(false)
 }
 
+tokio::task_local! {
+    /// The space a REST or gRPC call names (the `Sprig-Space` header,
+    /// gRPC metadata `sprig-space`): a session the call opens acts there,
+    /// as after `USE SPACE`. Set around the call's work.
+    pub static SPACE: Option<String>;
+}
+
+/// The space the running call names ([`SPACE`]), if any.
+#[must_use]
+pub fn call_space() -> Option<String> {
+    SPACE.try_with(Clone::clone).ok().flatten()
+}
+
 /// Messages buffered between the executor and the HTTP response.
 pub const CHANNEL_DEPTH: usize = 4;
 /// How long an expired handle is remembered, so its use gets 39782.
@@ -374,13 +387,40 @@ impl SqlEngine {
             db = Some(database.to_owned());
             session.set_db(db.clone());
         }
-        Ok(Live {
+        let mut live = Live {
             session,
             exec,
             proto,
             db,
             held: false,
-        })
+        };
+        // The call's space: the session acts there, as after `USE SPACE`
+        // (an unknown space or one outside the user's home subtree fails
+        // the call as that statement does).
+        if let Some(space) = call_space() {
+            let sql = format!("USE SPACE `{}`", space.replace('`', "``"));
+            if let Err(e) = self.internal(&mut live, sql).await {
+                live.exec.close().await;
+                return Err(e);
+            }
+        }
+        Ok(live)
+    }
+
+    /// Runs `sql` in `live` for the gateway itself: its rows are dropped,
+    /// its error returned.
+    async fn internal(&self, live: &mut Live, sql: String) -> Result<()> {
+        let (tx, mut rx) = mpsc::channel(CHANNEL_DEPTH);
+        let mut sink = ChannelSink::new(tx, self.settings().batch_rows);
+        let r = self.statement(live, sql, &mut sink).await;
+        drop(sink);
+        let mut failed = r.err();
+        while let Some(item) = rx.recv().await {
+            if let Item::Error(e) = item {
+                failed = Some(e);
+            }
+        }
+        failed.map_or(Ok(()), Err)
     }
 
     /// Runs one text in `live`, writing to `sink`.

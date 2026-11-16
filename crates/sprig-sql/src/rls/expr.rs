@@ -908,6 +908,23 @@ pub struct LiteralBinder<'a> {
     pub no_backslash_escapes: bool,
 }
 
+/// A claim or user attribute (any JSON value) as the SQL literal the
+/// rewrite binds: the text MariaDB's policy views and triggers read from
+/// the session's context (`JSON_VALUE`, or `JSON_QUERY` for an array or
+/// object), so both decide alike. A boolean is `'1'` or `'0'`, a number
+/// its JSON text, an array or object its compact JSON; never a bare number
+/// or `TRUE`, which would compare with a string column as a number.
+#[must_use]
+pub fn json_literal(v: &serde_json::Value, no_backslash_escapes: bool) -> String {
+    match v {
+        serde_json::Value::Null => "NULL".to_owned(),
+        serde_json::Value::Bool(b) => if *b { "'1'" } else { "'0'" }.to_owned(),
+        serde_json::Value::Number(n) => format!("'{n}'"),
+        serde_json::Value::String(s) => super::text::sql_string(s, no_backslash_escapes),
+        other => super::text::sql_string(&other.to_string(), no_backslash_escapes),
+    }
+}
+
 fn id_list(ids: &[u64]) -> String {
     if ids.is_empty() {
         return "NULL".to_owned();
@@ -922,12 +939,14 @@ impl Binder for LiteralBinder<'_> {
     fn value(&self, func: &str, arg: Option<&str>) -> Result<String, SprigError> {
         Ok(match func {
             "CURRENT_USER" => super::text::sql_string(self.current_user, self.no_backslash_escapes),
-            "SPRIG_USER_ID" => self.user_id.to_string(),
-            "SPRIG_TENANT_ID" => self.tenant_id.to_string(),
-            "SPRIG_HOME_TENANT_ID" => self.home_tenant_id.to_string(),
+            // Ids as text, as MariaDB's policy views and triggers read
+            // them from the context (`JSON_VALUE`).
+            "SPRIG_USER_ID" => format!("'{}'", self.user_id),
+            "SPRIG_TENANT_ID" => format!("'{}'", self.tenant_id),
+            "SPRIG_HOME_TENANT_ID" => format!("'{}'", self.home_tenant_id),
             "SPRIG_SESSION_SPACE" => self
                 .space
-                .map_or_else(|| "NULL".to_owned(), |s| s.to_string()),
+                .map_or_else(|| "NULL".to_owned(), |s| format!("'{s}'")),
             "SPRIG_CLAIM" => (self.claim)(arg.unwrap_or_default()).unwrap_or_else(|| "NULL".into()),
             "SPRIG_USER_ATTR" => {
                 (self.attr)(arg.unwrap_or_default()).unwrap_or_else(|| "NULL".into())
@@ -1117,6 +1136,20 @@ mod tests {
             "(`t`.org IN (42, 43)) AND `t`.u = 'alice@%'"
         );
         assert!(r("SPRIG_TENANT_MANAGED(org)").is_err());
+        // Ids are text, as MariaDB's side reads them.
+        assert_eq!(
+            r("o = SPRIG_USER_ID() AND t = SPRIG_TENANT_ID()").unwrap(),
+            "`t`.o = '7' AND `t`.t = '42'"
+        );
+        assert_eq!(json_literal(&serde_json::json!(true), false), "'1'");
+        assert_eq!(json_literal(&serde_json::json!(false), false), "'0'");
+        assert_eq!(json_literal(&serde_json::json!(7), false), "'7'");
+        assert_eq!(json_literal(&serde_json::json!(1.5), false), "'1.5'");
+        assert_eq!(json_literal(&serde_json::json!(null), false), "NULL");
+        assert_eq!(
+            json_literal(&serde_json::json!(["a", "b"]), false),
+            "'[\"a\",\"b\"]'"
+        );
         // Above rls.inline_subtree_max, the subtree table.
         let t = LiteralBinder {
             subtree: None,

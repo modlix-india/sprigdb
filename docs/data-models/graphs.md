@@ -430,6 +430,7 @@ Each graph statement runs within budgets. Exceeding one fails the statement with
 | `graph.max_detach_edges` | int | `100000` | Relationships one `DETACH DELETE` may remove; more fails with `ER_SPRIG_GRAPH_DETACH_TOO_LARGE` (39907) |
 | `graph.batch_nodes` | int | `1000` | Frontier ids per shard statement |
 | `graph.local_burst_hops` | int | `4` | Hops one recursive CTE runs on a shard |
+| `graph.traversal_tier` | text | `auto` | How variable-length hops run: `auto` and `cte` use the per-shard recursive CTE bursts above; `gateway` reads one hop per level and joins it in the gateway, with no recursive CTE (slower, but useful when a backend's CTEs misbehave); `plugin` behaves as `auto` |
 | `graph.mirror` | text | `async` | Mirrors of incoming relationships: `async` or `sync` |
 | `graph.mirror_max_wait_ms` | int | `1000` | Wait for mirrors before scanning every shard |
 | `bolt.max_buffered_result_mb` | int | `64` | Size of a Bolt result that can't stream; more fails with 39918 |

@@ -43,7 +43,7 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The preamble a gateway sends for `tenant`.
 #[must_use]
 pub fn preamble(tenant: TenantId) -> Vec<u8> {
-    format!("{PREAMBLE} 1 {}\n", tenant.0).into_bytes()
+    sprig_txn::fence::wire::preamble(tenant)
 }
 
 /// Parses a preamble line (without its newline).
@@ -222,6 +222,14 @@ impl Relay {
                 }
             }
         }
+        self.serve_gated(listener, stop).await;
+    }
+
+    /// Relays connections from `listener` and runs the fence until
+    /// `stop`, without the start-up recovery: the fence admits nobody
+    /// until its owner runs [`RelayFence::start`] (the relay role does
+    /// that once it holds the relay lease).
+    pub async fn serve_gated(self: Arc<Self>, listener: TcpListener, stop: CancellationToken) {
         let fence = Arc::clone(&self.fence);
         let fstop = stop.clone();
         let fence_task = tokio::spawn(async move { fence.run(fstop).await });

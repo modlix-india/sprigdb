@@ -3,7 +3,7 @@
 //! | Tool | Roles | Effect | Shares |
 //! |---|---|---|---|
 //! | `search_docs` | admin, dba, data | read | docs |
-//! | `catalog`, `describe` | dba, data | read | schema |
+//! | `catalog`, `describe`, `relationships` | dba, data | read | schema |
 //! | `workload`, `fingerprint` | dba | read | stats |
 //! | `explain` | dba, data | read | stats |
 //! | `indexes`, `auto_indexes` | dba | read | schema |
@@ -45,6 +45,20 @@ pub const MAX_TEXT: usize = 64 * 1024;
 
 /// The longest schema `migration_check` takes in one call.
 pub const MAX_MIGRATION_TEXT: usize = 512 * 1024;
+
+/// The aggregations a chart shelf may use.
+pub const AGGS: &[&str] = &[
+    "sum", "avg", "count", "countd", "min", "max", "median", "none",
+];
+
+/// The date parts a chart shelf may use.
+pub const DATE_PARTS: &[&str] = &["year", "quarter", "month", "week", "day", "hour", "exact"];
+
+/// The keys a chart spec may hold.
+pub const CHART_KEYS: &[&str] = &[
+    "mark", "columns", "rows", "color", "size", "label", "detail", "tooltip", "filters", "sort",
+    "top", "facet", "stack", "format",
+];
 
 /// The chart marks a tile may use.
 pub const MARKS: &[&str] = &[
@@ -159,6 +173,20 @@ pub fn specs() -> Vec<ToolSpec> {
             "describe",
             "Describe one table: columns, types, keys, indexes, distribution and comments. Call it before writing SQL that uses the table.",
             obj(&[("db", db()), ("table", s("The table"))], &["db", "table"]),
+            Read,
+            DBA_DATA,
+            Shares::Schema,
+        ),
+        spec(
+            "relationships",
+            "How a database's tables join: declared foreign keys, and joins inferred from column names and types (a column such as customer_id or customerId that matches another table's single-column primary key, by type) for tables without them. With table, only the joins that touch it. Call it before writing a query over two or more tables, and join on what it returns.",
+            obj(
+                &[
+                    ("db", db()),
+                    ("table", s("Only joins of this table; all when absent")),
+                ],
+                &["db"],
+            ),
             Read,
             DBA_DATA,
             Shares::Schema,
@@ -458,19 +486,21 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "propose_tile",
-            "Propose a dashboard tile: a query and a chart spec (JSON with a mark and shelves). The user previews it and decides whether to add it.",
+            "Propose a chart for a dashboard: a read-only query returning row-level or grouped rows, and a chart spec as JSON text. The spec has a mark (bar, line, area, point, pie, donut, kpi, text-table, heatmap, ... ) and shelves: columns and rows are lists of {field, agg?, datePart?, axis?, mark?}; color, size and label are {field, agg?}; tooltip and detail are lists; filters are [{field, in}]; sort is {by, dir}; top is a number; stack is none, stack or percent. Every field must be a column the query returns. Choose the mark as Show Me does: a date and measures, line; one dimension and one measure, bar; two measures, point; one measure alone, kpi; two dimensions and a measure, heatmap; parts of a whole with five or fewer categories, pie. SprigDB checks the query's plan without running it; the user previews the tile and decides whether to add it.",
             obj(
                 &[
                     ("dashboard", s("The dashboard; a new one when absent")),
                     ("title", s("The tile's title")),
                     ("db", db()),
-                    ("sql", s("The tile's query, returning rows")),
+                    ("sql", s("The tile's query: one SELECT")),
                     (
                         "chart",
-                        s("The chart spec as JSON: mark, columns, rows, color, ..."),
+                        s(
+                            "The chart spec as JSON text: {\"mark\": ..., \"columns\": [...], \"rows\": [...], ...}",
+                        ),
                     ),
                 ],
-                &["title", "sql", "chart"],
+                &["title", "db", "sql", "chart"],
             ),
             Propose,
             &[Role::Data, Role::Dba],
@@ -693,14 +723,197 @@ pub fn check_input(name: &str, input: &Value) -> Result<(), String> {
             }
         }
         "propose_tile" => {
-            let chart: Value = serde_json::from_str(text("chart"))
-                .map_err(|e| format!("chart isn't JSON: {e}"))?;
-            match chart.get("mark").and_then(Value::as_str) {
-                Some(m) if MARKS.contains(&m) => Ok(()),
-                Some(m) => Err(format!("unknown mark {m}; use one of {}", MARKS.join(", "))),
-                None => Err("chart needs a mark".to_owned()),
-            }
+            sql_guard::read_only(text("sql"))
+                .map_err(|e| format!("a tile's query is one SELECT: {e}"))?;
+            check_chart(text("chart"), text("sql"))
         }
         _ => Ok(()),
+    }
+}
+
+/// One shelf entry's field, checked: a name, or an object with a `field` string and
+/// known `agg` and `datePart` values.
+fn shelf_field<'a>(shelf: &str, v: &'a Value) -> Result<Option<&'a str>, String> {
+    if v.is_null() {
+        return Ok(None);
+    }
+    // A bare name is short for {"field": name}.
+    if let Some(f) = v.as_str() {
+        return Ok(Some(f).filter(|f| !f.trim().is_empty()));
+    }
+    let Some(o) = v.as_object() else {
+        return Err(format!(
+            "chart.{shelf} holds {{\"field\": ...}} objects, not {v}"
+        ));
+    };
+    let field = o
+        .get("field")
+        .and_then(Value::as_str)
+        .filter(|f| !f.trim().is_empty());
+    if let Some(a) = o.get("agg").and_then(Value::as_str)
+        && !AGGS.contains(&a)
+    {
+        return Err(format!(
+            "chart.{shelf}: unknown agg {a}; use one of {}",
+            AGGS.join(", ")
+        ));
+    }
+    if let Some(d) = o.get("datePart").and_then(Value::as_str)
+        && !DATE_PARTS.contains(&d)
+    {
+        return Err(format!(
+            "chart.{shelf}: unknown datePart {d}; use one of {}",
+            DATE_PARTS.join(", ")
+        ));
+    }
+    if field.is_none() && o.get("field").is_some_and(|f| !f.is_null()) {
+        return Err(format!("chart.{shelf}: field is a column name"));
+    }
+    Ok(field)
+}
+
+/// Whether `word` appears in `sql` as a whole word or a quoted name,
+/// ignoring case.
+fn names(sql: &str, word: &str) -> bool {
+    let sql = sql.to_lowercase();
+    let w = word.to_lowercase();
+    let mut from = 0;
+    while let Some(i) = sql[from..].find(&w) {
+        let at = from + i;
+        let before = sql[..at].chars().next_back();
+        let after = sql[at + w.len()..].chars().next();
+        let edge = |c: Option<char>| c.is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        if edge(before) && edge(after) {
+            return true;
+        }
+        from = at + w.len().max(1);
+    }
+    false
+}
+
+/// A tile's chart spec: JSON, a known mark, the shelves well formed,
+/// every field one the query names (unless it selects `*`), and a mark
+/// that fits the shelves ([`super::chart`]).
+///
+/// # Errors
+/// What is wrong, for the model.
+pub fn check_chart(chart: &str, sql: &str) -> Result<(), String> {
+    let chart: Value = serde_json::from_str(chart).map_err(|e| format!("chart isn't JSON: {e}"))?;
+    let Some(o) = chart.as_object() else {
+        return Err("chart is a JSON object with a mark and shelves".to_owned());
+    };
+    for k in o.keys() {
+        if !CHART_KEYS.contains(&k.as_str()) {
+            return Err(format!(
+                "chart has no key {k}; the keys are {}",
+                CHART_KEYS.join(", ")
+            ));
+        }
+    }
+    match o.get("mark").and_then(Value::as_str) {
+        Some(m) if MARKS.contains(&m) => {}
+        Some(m) => return Err(format!("unknown mark {m}; use one of {}", MARKS.join(", "))),
+        None => return Err("chart needs a mark".to_owned()),
+    }
+    let mut fields = Vec::new();
+    for shelf in ["columns", "rows", "detail", "tooltip", "filters"] {
+        match o.get(shelf) {
+            None | Some(Value::Null) => {}
+            Some(Value::Array(a)) => {
+                for v in a {
+                    if let Some(f) = shelf_field(shelf, v)? {
+                        fields.push(f);
+                    }
+                    if let Some(m) = v.get("mark").and_then(Value::as_str)
+                        && !MARKS.contains(&m)
+                    {
+                        return Err(format!("chart.{shelf}: unknown mark {m}"));
+                    }
+                }
+            }
+            Some(_) => return Err(format!("chart.{shelf} is a list")),
+        }
+    }
+    for shelf in ["color", "size", "label", "facet"] {
+        if let Some(v) = o.get(shelf)
+            && let Some(f) = shelf_field(shelf, v)?
+        {
+            fields.push(f);
+        }
+    }
+    if let Some(st) = o.get("stack")
+        && !st.is_null()
+        && !matches!(st.as_str(), Some("none" | "stack" | "percent"))
+    {
+        return Err("chart.stack is none, stack or percent".to_owned());
+    }
+    if let Some(t) = o.get("top")
+        && !t.is_null()
+        && t.as_u64().is_none_or(|n| n == 0)
+    {
+        return Err("chart.top is a positive whole number".to_owned());
+    }
+    if let Some(sort) = o.get("sort").filter(|v| !v.is_null()) {
+        if let Some(d) = sort.get("dir").and_then(Value::as_str)
+            && !matches!(d, "asc" | "desc")
+        {
+            return Err("chart.sort.dir is asc or desc".to_owned());
+        }
+        if let Some(b) = sort.get("by").and_then(Value::as_str) {
+            fields.push(b);
+        }
+    }
+    if fields.is_empty() && !matches!(o.get("mark").and_then(Value::as_str), Some("text-table")) {
+        return Err(
+            "chart puts no field on a shelf: put the query's columns on columns and rows"
+                .to_owned(),
+        );
+    }
+    // `SELECT *` (or `t.*`) returns columns the text doesn't name.
+    let star = sql
+        .to_lowercase()
+        .replace("count(*)", "")
+        .replace("count( * )", "")
+        .contains('*');
+    if !star {
+        for f in fields {
+            if !names(sql, f) {
+                return Err(format!(
+                    "chart names the field {f}, which the query doesn't return; use the query's column names or aliases"
+                ));
+            }
+        }
+    }
+    // The mark must fit the shelves, by Show Me's rules (Studio's editor
+    // applies the same ones).
+    super::chart::check_fit(&chart)
+}
+
+/// What a model should do after a read tool failed, added to the error it
+/// gets, so it recovers instead of giving up.
+#[must_use]
+pub fn hint(tool: &str) -> &'static str {
+    match tool {
+        "describe" | "indexes" => {
+            "What to do: call catalog with the database to list the tables the user can see, then try one of those names. If the database itself is unknown, call catalog without db."
+        }
+        "catalog" => {
+            "What to do: call catalog without db to list the databases the user can see, or ask the user which database they mean."
+        }
+        "column_stats" => {
+            "What to do: describe the table to get its column names, then ask for those. If statistics still can't be read, go on without them."
+        }
+        "relationships" => {
+            "What to do: describe the tables instead; their keys, comments and column names show how they join."
+        }
+        "run_query" | "explain" => {
+            "What to do: read the error, check the names and types with describe (and relationships for joins), fix the statement and try again. If it still fails, show the user the query and the error."
+        }
+        "search_docs" => {
+            "What to do: answer from what the other tools show and say that the documentation couldn't be searched."
+        }
+        _ => {
+            "What to do: try another tool that answers the same question, or go on with what you have and tell the user what couldn't be read."
+        }
     }
 }

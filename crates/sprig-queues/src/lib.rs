@@ -37,6 +37,7 @@
 
 pub mod catalog;
 pub mod engine;
+mod idle;
 pub mod maria;
 pub mod mem;
 pub mod memstore;

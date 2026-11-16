@@ -52,6 +52,7 @@ use mysql_async::prelude::Queryable;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sprig_catalog::ddl::{database_key, shard_schemas};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::{ClusterId, TenantId};
 use sprig_common::names::quote;
 use sprig_common::{Result, SprigCode, SprigError};
@@ -213,7 +214,7 @@ async fn ensure_retry(pool: &mysql_async::Pool, schema: &str, def: DefKey) -> Re
         return Ok(());
     }
     let mut c = pool
-        .get_conn()
+        .get_conn_bounded()
         .await
         .map_err(sprig_streams::maria::map_err)?;
     match c.query_drop(retry_ddl(schema, def)).await {
@@ -241,7 +242,7 @@ async fn ensure_log(svc: &Arc<TenantServices>, def: &Definition) -> Result<(Clus
     }
     let pool = svc.locator.ctl_pool(&cluster).await?;
     let mut c = pool
-        .get_conn()
+        .get_conn_bounded()
         .await
         .map_err(sprig_streams::maria::map_err)?;
     c.query_drop(ddl(&schema, def.key()))
@@ -250,6 +251,7 @@ async fn ensure_log(svc: &Arc<TenantServices>, def: &Definition) -> Result<(Clus
     c.query_drop(retry_ddl(&schema, def.key()))
         .await
         .map_err(sprig_streams::maria::map_err)?;
+    drop(c);
     let store = svc.locator.dc_store();
     let k = store.tier().key(&format!("inherit-bcast/{}", def.key()))?;
     store
@@ -401,7 +403,7 @@ pub async fn check_limits(
     let (cluster, schema) = ensure_log(svc, def).await?;
     let pool = svc.locator.ctl_pool(&cluster).await?;
     let mut c = pool
-        .get_conn()
+        .get_conn_bounded()
         .await
         .map_err(sprig_streams::maria::map_err)?;
     let since = sprig_inherit::msg::store::now_ms().saturating_sub(3_600_000);
@@ -416,6 +418,7 @@ pub async fn check_limits(
         )
         .await
         .map_err(sprig_streams::maria::map_err)?;
+    drop(c);
     if n.unwrap_or(0) >= per_hour {
         return Err(limit_err(format!(
             "{}.{} took {} broadcasts in the last hour (inherit.broadcasts_per_hour = {per_hour})",
@@ -459,7 +462,7 @@ pub async fn append(
     let (cluster, schema) = ensure_log(svc, def).await?;
     let pool = svc.locator.ctl_pool(&cluster).await?;
     let mut c = pool
-        .get_conn()
+        .get_conn_bounded()
         .await
         .map_err(sprig_streams::maria::map_err)?;
     c.exec_drop(
@@ -610,7 +613,7 @@ async fn deliver(
             let cluster = svc.locator.cluster(t).await?;
             let pool = svc.locator.ctl_pool(&cluster).await?;
             let mut c = pool
-                .get_conn()
+                .get_conn_bounded()
                 .await
                 .map_err(sprig_streams::maria::map_err)?;
             c.query_drop(sql)
@@ -751,6 +754,11 @@ pub async fn fan_out(svc: &Arc<TenantServices>, def_key: DefKey, schema: &str) -
         .remove(&def_key);
     let cluster = svc.locator.cluster(def_key.tenant).await?;
     let pool = svc.locator.ctl_pool(&cluster).await?;
+    // Each broadcast's transaction keeps its row locked (other gateways
+    // skip it) while the members' deliveries take catalog and `sprig_ctl`
+    // connections of their own: its connection comes from the holders'
+    // pool, which the deliveries never wait for.
+    let hold = svc.locator.ctl_hold_pool(&cluster).await?;
     let rate = svc
         .settings
         .get(
@@ -769,8 +777,8 @@ pub async fn fan_out(svc: &Arc<TenantServices>, def_key: DefKey, schema: &str) -
     ensure_retry(&pool, schema, def_key).await?;
     let mut finished = 0;
     loop {
-        let mut c = pool
-            .get_conn()
+        let mut c = hold
+            .get_conn_bounded()
             .await
             .map_err(sprig_streams::maria::map_err)?;
         let oldest: Option<Vec<u8>> = match c
@@ -827,7 +835,11 @@ pub async fn fan_out(svc: &Arc<TenantServices>, def_key: DefKey, schema: &str) -
             continue;
         }
         let todo: Vec<TenantId> = all.into_iter().filter(|t| t.0 > b.next).collect();
-        let batch: Vec<TenantId> = todo.iter().take(STEP).copied().collect();
+        // At most a second's worth of deliveries a batch: the row lock and
+        // its hold connection are kept across the batch and its pacing, so
+        // a slow rate makes smaller batches rather than longer holds.
+        let step = STEP.min(usize::try_from(rate).unwrap_or(STEP));
+        let batch: Vec<TenantId> = todo.iter().take(step).copied().collect();
         let started = Instant::now();
         let (mut delivered, mut skipped) = (0u64, 0u64);
         // Members still waiting for an earlier broadcast of this
@@ -909,7 +921,7 @@ pub async fn fan_out(svc: &Arc<TenantServices>, def_key: DefKey, schema: &str) -
         }
     }
     // Failed deliveries, from the saved retry list.
-    if let Err(e) = Box::pin(retry_pass(svc, &def, &pool, &tbl, &rtbl)).await {
+    if let Err(e) = Box::pin(retry_pass(svc, &def, &hold, &tbl, &rtbl)).await {
         tracing::debug!(def = %def_key, error = %e, "broadcast retry pass");
     }
     // Retention.
@@ -919,7 +931,7 @@ pub async fn fan_out(svc: &Arc<TenantServices>, def_key: DefKey, schema: &str) -
         Some(&acat.settings),
     );
     let mut c = pool
-        .get_conn()
+        .get_conn_bounded()
         .await
         .map_err(sprig_streams::maria::map_err)?;
     let _ = c
@@ -956,19 +968,22 @@ async fn gone(svc: &TenantServices, def: &Definition, t: TenantId) -> Result<boo
 }
 
 /// One retry pass over `def`'s retry list (see the module docs), by one
-/// gateway at a time: the deliveries made.
+/// gateway at a time: the deliveries made. `hold` is the holders' pool
+/// ([`crate::tenant::locator::GatewayLocator::ctl_hold_pool`]): the
+/// connection keeps the pass's `GET_LOCK` while the deliveries take
+/// connections of their own.
 ///
 /// # Errors
 /// The cluster's.
 async fn retry_pass(
     svc: &Arc<TenantServices>,
     def: &Definition,
-    pool: &mysql_async::Pool,
+    hold: &mysql_async::Pool,
     tbl: &str,
     rtbl: &str,
 ) -> Result<usize> {
-    let mut c = pool
-        .get_conn()
+    let mut c = hold
+        .get_conn_bounded()
         .await
         .map_err(sprig_streams::maria::map_err)?;
     let lock = format!("sprig_ibr_{}_{}", def.declarer.0, def.object_id);
@@ -1128,7 +1143,7 @@ async fn replay_inner(svc: &Arc<TenantServices>, def: &Definition, t: TenantId) 
         let (cluster, schema) = place(svc, def).await?;
         let pool = svc.locator.ctl_pool(&cluster).await?;
         let mut c = pool
-            .get_conn()
+            .get_conn_bounded()
             .await
             .map_err(sprig_streams::maria::map_err)?;
         let rows: Vec<mysql_async::Row> = match c
@@ -1143,6 +1158,8 @@ async fn replay_inner(svc: &Arc<TenantServices>, def: &Definition, t: TenantId) 
             Err(mysql_async::Error::Server(s)) if matches!(s.code, 1146 | 1049) => return Ok(0),
             Err(e) => return Err(sprig_streams::maria::map_err(e)),
         };
+        // Back before the deliveries, which take their own.
+        drop(c);
         let mut n = 0;
         for r in rows {
             let b = logged(&r);
@@ -1179,11 +1196,12 @@ pub type ShowRow = Vec<Option<String>>;
 pub async fn show(svc: &Arc<TenantServices>, def: &Definition) -> Result<Vec<ShowRow>> {
     let (cluster, schema) = place(svc, def).await?;
     let pool = svc.locator.ctl_pool(&cluster).await?;
+    // Before this connection is taken: it takes its own.
+    let _ = ensure_retry(&pool, &schema, def.key()).await;
     let mut c = pool
-        .get_conn()
+        .get_conn_bounded()
         .await
         .map_err(sprig_streams::maria::map_err)?;
-    let _ = ensure_retry(&pool, &schema, def.key()).await;
     let rows: Vec<mysql_async::Row> = match c
         .query(format!(
             "SELECT l.bid, l.publisher, l.committed_ms, l.form, l.under_tenant, l.state, \

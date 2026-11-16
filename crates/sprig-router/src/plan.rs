@@ -485,6 +485,16 @@ pub struct ViaParent {
     pub fill_rk: bool,
     /// Probes per lookup statement (`router.lookup_batch_size`).
     pub batch: usize,
+    /// The foreign key the rows follow (its constraint name).
+    pub fk: String,
+    /// Its columns in the child, and the parent's referenced columns.
+    pub fk_columns: (Vec<String>, Vec<String>),
+    /// Its orphanage is present: under `foreign_key_checks = 0` a row
+    /// whose parent is missing waits on the shard holding routing hash 0,
+    /// with that hash.
+    pub orphans: bool,
+    /// Rows may wait for their parent at all ([`crate::topology::ParentLink::orphanable`]).
+    pub orphanable: bool,
 }
 
 // Key values hold no NaN: literals only.

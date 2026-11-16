@@ -24,13 +24,14 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::BytesMut;
 use sprig_common::CancellationToken;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 
 use crate::message::{BoltVersion, Dechunker, MAGIC, Request, Response, negotiate, write_chunked};
 use crate::packstream::PackValue;
@@ -743,7 +744,7 @@ pub async fn serve<S>(
     close: CancellationToken,
 ) -> std::io::Result<End>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut hs = [0u8; 20];
     match tokio::time::timeout(cfg.handshake_timeout, io.read_exact(&mut hs)).await {
@@ -784,21 +785,29 @@ where
     };
     let gauge = metrics::gauge!("sprig_bolt_connections", "version" => version.to_string());
     gauge.increment(1.0);
-    let r = run_loop(&mut io, &mut conn, svc, cfg, close).await;
+    // Writes go through a shared half: keep-alives are written by a task
+    // of their own while a request runs (see [`handle_alive`]).
+    let (mut rd, wr) = tokio::io::split(io);
+    let wr = Arc::new(tokio::sync::Mutex::new(wr));
+    let r = run_loop(&mut rd, &wr, &mut conn, svc, cfg, close).await;
     gauge.decrement(1.0);
     conn.reset_session().await;
     r
 }
 
+/// The connection's write half, shared with the keep-alive task.
+type Writer<S> = Arc<tokio::sync::Mutex<WriteHalf<S>>>;
+
 async fn run_loop<S>(
-    io: &mut S,
+    rd: &mut ReadHalf<S>,
+    wr: &Writer<S>,
     conn: &mut Conn,
     svc: &dyn BoltService,
     cfg: &Config,
     close: CancellationToken,
 ) -> std::io::Result<End>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut inbuf = BytesMut::with_capacity(8192);
     let mut dechunk = Dechunker::new(cfg.max_message);
@@ -811,7 +820,7 @@ where
         loop {
             match dechunk.next(&mut inbuf) {
                 Ok(Some(msg)) => match Request::decode(&msg) {
-                    Ok(req) => handle_alive(io, conn, req, svc, cfg).await?,
+                    Ok(req) => handle_alive(wr, conn, req, svc, cfg).await?,
                     Err(e) => {
                         conn.fail(&BoltFailure::invalid(e.to_string()));
                         conn.state = State::Defunct;
@@ -828,8 +837,9 @@ where
             }
         }
         if !conn.out.is_empty() {
-            io.write_all(&conn.out).await?;
-            io.flush().await?;
+            let mut w = wr.lock().await;
+            w.write_all(&conn.out).await?;
+            w.flush().await?;
             conn.out.clear();
         }
         if conn.state == State::Defunct {
@@ -844,7 +854,7 @@ where
             return Ok(End::Drained);
         }
         let read = tokio::select! {
-            r = tokio::time::timeout(idle, io.read_buf(&mut inbuf)) => r,
+            r = tokio::time::timeout(idle, rd.read_buf(&mut inbuf)) => r,
             () = close.cancelled(), if idle_now => return Ok(End::Drained),
         };
         match read {
@@ -866,47 +876,80 @@ fn keepalive_every(cfg: &Config) -> Duration {
 /// [`keepalive_every`] while it runs. Drivers time a read out after the
 /// `connection.recv_timeout_seconds` hint, and restart that timer on any
 /// bytes, so a statement that runs longer than the hint isn't cut off
-/// (a loader that gave up sent its committed batch again). NOOPs go
-/// between messages: answers to earlier pipelined requests, still in
-/// `conn.out`, are written before the first one, and the request's own
-/// answers after it ends.
+/// (a loader that gave up sent its committed batch again).
+///
+/// The NOOPs come from a task of their own: a service may run the
+/// request on the connection's own thread (the gateway's graph
+/// statements use `block_in_place`), and then nothing else in this task
+/// runs until it ends. NOOPs go between messages: answers to earlier
+/// pipelined requests, still in `conn.out`, are written before the first
+/// one, and the request's own answers after the task stopped.
 async fn handle_alive<S>(
-    io: &mut S,
+    wr: &Writer<S>,
     conn: &mut Conn,
     req: Request,
     svc: &dyn BoltService,
     cfg: &Config,
 ) -> std::io::Result<()>
 where
-    S: AsyncWrite + Unpin + Send,
+    S: AsyncWrite + Send + 'static,
 {
-    let every = keepalive_every(cfg);
-    let mut earlier = std::mem::take(&mut conn.out);
-    {
-        let work = conn.handle(req, svc, cfg);
-        tokio::pin!(work);
-        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                () = &mut work => break,
-                _ = tick.tick() => {
-                    if !earlier.is_empty() {
-                        io.write_all(&earlier).await?;
-                        earlier.clear();
-                    }
-                    io.write_all(&[0, 0]).await?;
-                    io.flush().await?;
-                    metrics::counter!("sprig_bolt_keepalives_total").increment(1);
-                }
-            }
+    let earlier = Arc::new(std::sync::Mutex::new(std::mem::take(&mut conn.out)));
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(keepalives(
+        Arc::clone(wr),
+        Arc::clone(&earlier),
+        keepalive_every(cfg),
+        stop.clone(),
+    ));
+    conn.handle(req, svc, cfg).await;
+    // Not aborted: a write in progress finishes first.
+    stop.cancel();
+    let r = task
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+    let mut pending = std::mem::take(
+        &mut *earlier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    if !pending.is_empty() {
+        pending.extend_from_slice(&conn.out);
+        conn.out = pending;
+    }
+    r
+}
+
+/// Writes `earlier` (once) and a NOOP every `every` until `stop`.
+async fn keepalives<S>(
+    wr: Writer<S>,
+    earlier: Arc<std::sync::Mutex<BytesMut>>,
+    every: Duration,
+    stop: CancellationToken,
+) -> std::io::Result<()>
+where
+    S: AsyncWrite + Send + 'static,
+{
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            () = stop.cancelled() => return Ok(()),
+            _ = tick.tick() => {}
         }
+        let pending = std::mem::take(
+            &mut *earlier
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let mut w = wr.lock().await;
+        if !pending.is_empty() {
+            w.write_all(&pending).await?;
+        }
+        w.write_all(&[0, 0]).await?;
+        w.flush().await?;
+        metrics::counter!("sprig_bolt_keepalives_total").increment(1);
     }
-    if !earlier.is_empty() {
-        earlier.extend_from_slice(&conn.out);
-        conn.out = earlier;
-    }
-    Ok(())
 }
 
 /// The completion status Neo4j puts first in a summary's `statuses` (Bolt

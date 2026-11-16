@@ -32,6 +32,7 @@ use mysql_async::Pool;
 use mysql_async::prelude::Queryable;
 use serde_json::{Map, json};
 use sprig_catalog::CatalogLocator;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::{DcId, TenantId};
 use sprig_common::names::quote;
 use sprig_common::{Result, SprigCode, SprigError};
@@ -229,7 +230,7 @@ impl Webhooks {
     async fn tenant_target(&self, tenant: TenantId, name: &ConnName) -> Result<WebhookTarget> {
         let ep = self.locator.writer(tenant).await?;
         let schema = ep.store.schema().to_owned();
-        let mut c = ep.pool.get_conn().await.map_err(|e| {
+        let mut c = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e)
         })?;
         let store = SinksStore::new(schema.clone());

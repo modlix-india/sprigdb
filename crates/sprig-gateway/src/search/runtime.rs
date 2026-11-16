@@ -13,7 +13,10 @@ use async_trait::async_trait;
 use sprig_common::ids::{ClusterId, TenantId};
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_doc::engine::SqlRunner as _;
-use sprig_search::copy::{CopyHost, CopyKnobs, FeedParts, Seeder, record_from_text, seed_page_sql};
+use sprig_search::copy::{
+    CopyHost, CopyKnobs, FeedParts, Seeder, fetch_sql, fill_hash_fields, hash_fields_sql,
+    record_from_text, seed_page_sql,
+};
 use sprig_search::def::IndexDef;
 use sprig_search::schema::{Key, Record};
 
@@ -105,7 +108,31 @@ impl DefinerSession {
         limit: usize,
     ) -> Result<Vec<Record>> {
         let (cols, stmt) = seed_page_sql(def, after, limit)?;
-        let rows = self.sql.query(&stmt).await.map_err(|e| {
+        self.records(def, &cols, &stmt).await
+    }
+
+    /// The current rows of `keys` (an index with hash fields re-reads the
+    /// keys its feed changed).
+    ///
+    /// # Errors
+    /// As [`DefinerSession::page`].
+    pub(crate) async fn fetch(&mut self, def: &IndexDef, keys: &[Key]) -> Result<Vec<Record>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (cols, stmt) = fetch_sql(def, keys)?;
+        self.records(def, &cols, &stmt).await
+    }
+
+    /// The records of `stmt`'s rows; hashes get their indexed fields from
+    /// a second read.
+    async fn records(
+        &mut self,
+        def: &IndexDef,
+        cols: &[String],
+        stmt: &str,
+    ) -> Result<Vec<Record>> {
+        let read_err = |e: sprig_doc::engine::SqlError| {
             let code = e.errno.unwrap_or(0);
             if code == 1146 {
                 SprigError::new(
@@ -118,11 +145,17 @@ impl DefinerSession {
                     def.name, e.message
                 ))
             }
-        })?;
-        Ok(rows
+        };
+        let rows = self.sql.query(stmt).await.map_err(read_err)?;
+        let mut recs: Vec<Record> = rows
             .into_iter()
-            .map(|r| record_from_text(def, &cols, r))
-            .collect())
+            .map(|r| record_from_text(def, cols, r))
+            .collect();
+        if let Some(fields) = hash_fields_sql(def, &recs) {
+            let rows = self.sql.query(&fields).await.map_err(read_err)?;
+            fill_hash_fields(&mut recs, rows);
+        }
+        Ok(recs)
     }
 
     /// Closes it.
@@ -140,6 +173,10 @@ struct LocalSeeder {
 impl Seeder for LocalSeeder {
     async fn page(&mut self, after: Option<&Key>, limit: usize) -> Result<Vec<Record>> {
         self.session.page(&self.def, after, limit).await
+    }
+
+    async fn fetch(&mut self, keys: &[Key]) -> Result<Vec<Record>> {
+        self.session.fetch(&self.def, keys).await
     }
 
     async fn close(self: Box<Self>) {

@@ -247,8 +247,11 @@ pub enum Filter {
 /// The sequencer's timing.
 #[derive(Debug, Clone)]
 pub struct SeqOpts {
-    /// `stream.sequencer_batch_ms`.
+    /// `stream.sequencer_batch_ms`, unless `live_window` is set.
     pub batch_window: Duration,
+    /// `stream.sequencer_batch_ms` in ms as the job last resolved it: a
+    /// change reaches the running sequencer's next batch.
+    pub live_window: Option<Arc<AtomicU64>>,
     /// Records per append at most.
     pub max_batch: usize,
     /// How long a moved position waits before it is written alone.
@@ -262,12 +265,23 @@ pub struct SeqOpts {
 impl Default for SeqOpts {
     fn default() -> Self {
         Self {
-            batch_window: Duration::from_millis(10),
+            batch_window: Duration::from_millis(crate::settings::SEQUENCER_BATCH_MS.default),
+            live_window: None,
             max_batch: 1000,
             idle_checkpoint: Duration::from_secs(5),
             retry: Duration::from_millis(100),
             cleanup: true,
         }
+    }
+}
+
+impl SeqOpts {
+    /// The batching window now.
+    #[must_use]
+    pub fn window(&self) -> Duration {
+        self.live_window.as_ref().map_or(self.batch_window, |w| {
+            Duration::from_millis(w.load(Ordering::Relaxed))
+        })
     }
 }
 
@@ -521,7 +535,7 @@ impl Sequencer {
         loop {
             let now = Instant::now();
             let deadline = if let Some(f) = first_pending {
-                f + self.opts.batch_window
+                f + self.opts.window()
             } else if dirty {
                 last_write + self.opts.idle_checkpoint
             } else {
@@ -570,7 +584,7 @@ impl Sequencer {
             }
             let now = Instant::now();
             let due = pending.len() >= self.opts.max_batch
-                || first_pending.is_some_and(|f| now >= f + self.opts.batch_window)
+                || first_pending.is_some_and(|f| now >= f + self.opts.window())
                 || (pending.is_empty() && dirty && now >= last_write + self.opts.idle_checkpoint);
             if !due {
                 continue;

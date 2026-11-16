@@ -239,6 +239,8 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         stop.clone(),
     );
 
+    // Sprig 2PC's holder calls to the relay writers' agents.
+    backend::relay_calls::init(ctx.config.tls.as_ref())?;
     // The peer service.
     let peer_tls = ctx
         .config
@@ -276,6 +278,9 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         clock.clone(),
         handoff,
     )?;
+    if let Some(t) = &tenants {
+        let _ = t.peers.set(Arc::clone(&peers));
+    }
     let mut executor = exec::PassThrough::new(
         Arc::clone(&backends),
         exec::ExecSettingsSource::Live {
@@ -789,6 +794,26 @@ impl peer::PeerHost for PeerHost {
         password: zeroize::Zeroizing<Vec<u8>>,
     ) -> sprig_auth::handoff::HandoffResult {
         sprig_auth::handoff::serve_handoff(&self.login, start, &password).await
+    }
+
+    async fn watch_changes(
+        &self,
+        req: sprig_api::proto::internal::WatchChangesRequest,
+    ) -> tokio::sync::mpsc::Receiver<sprig_api::proto::internal::WatchChangesEvent> {
+        http::changes::serve_relayed(&self.core, req).await
+    }
+
+    async fn inherited_members(
+        &self,
+        req: sprig_api::proto::internal::InheritedMembersRequest,
+    ) -> sprig_common::Result<sprig_api::proto::internal::InheritedMembersReply> {
+        let svc = self.core.engine.tenants.clone().ok_or_else(|| {
+            sprig_common::SprigError::new(
+                sprig_common::SprigCode::ForwardFailed,
+                "this gateway serves no tenant catalogs",
+            )
+        })?;
+        inherited::remote::serve(&svc, &req).await
     }
 }
 

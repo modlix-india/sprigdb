@@ -569,9 +569,10 @@ impl BoltGraphService {
                 "name the tenant: log in as <tenant>.<user>, or connect with the tenant's TLS server name",
             ));
         }
+        // Decided here, handed to an allowed DC, or refused (residency).
         let mut login = self
             .login
-            .start_http(LoginRequest {
+            .begin_http(LoginRequest {
                 persona: Persona::MySql84,
                 login_name: user.as_bytes().to_vec(),
                 sni: info.sni.clone(),

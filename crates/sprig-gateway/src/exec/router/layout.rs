@@ -289,10 +289,8 @@ impl CatalogExtension for ShardingExtension {
             .map_err(db_err)?;
         let fks: Vec<sprig_shard::fk::FkTuple> = if has_fks.unwrap_or(0) > 0 {
             conn.query(format!(
-                "SELECT fk_id, name, child_object_id, CAST(child_columns AS CHAR), \
-                        parent_object_id, CAST(parent_columns AS CHAR), on_delete, on_update, \
-                        enforcement, child_lookup_id, state \
-                 FROM `{schema}`.foreign_keys ORDER BY fk_id"
+                "SELECT {} FROM `{schema}`.foreign_keys ORDER BY fk_id",
+                sprig_shard::fk::FK_COLUMNS
             ))
             .await
             .map_err(db_err)?
@@ -688,6 +686,9 @@ fn build(cat: &TenantCatalog, state: &ShardingState, cache: &ShardMapCache) -> T
                             origin: l.origin,
                             state: l.state,
                             map,
+                            // Past a re-key's cutover, until the re-key's
+                            // rebuild clears the next routing.
+                            rehashing: next.is_some(),
                         }
                     })
                     .collect(),

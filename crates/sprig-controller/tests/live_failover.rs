@@ -147,8 +147,9 @@ fn start_workload(route: Route, processes: u32, isolation: &'static str, galera:
     let partial = Arc::new(AtomicU64::new(0));
     // Text statements instead of prepared ones (an experiment switch).
     let text = skip::flag("SPRIG_TEST_LA_TEXT");
-    // Leave out the transaction-state check (an experiment switch: the
-    // gateway's checks before it had one).
+    // Leave out the check that the transaction after a read with
+    // autocommit = 0 is still the one that wrote (an experiment switch:
+    // the gateway's checks before it had one).
     let state_check = !skip::flag("SPRIG_TEST_LA_NO_STATE_CHECK");
     let t0 = Instant::now();
     let next = Arc::new(AtomicU64::new(1));
@@ -233,12 +234,7 @@ fn start_workload(route: Route, processes: u32, isolation: &'static str, galera:
                                 ))
                                 .await;
                             if galera {
-                                let _ = c
-                                    .query_drop(
-                                        "SET SESSION wsrep_sync_wait = 1, \
-                                         session_track_transaction_info = 'STATE'",
-                                    )
-                                    .await;
+                                let _ = c.query_drop("SET SESSION wsrep_sync_wait = 1").await;
                             }
                             if ac0 && c.query_drop("SET autocommit = 0").await.is_err() {
                                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -400,8 +396,8 @@ async fn txn(
     state_check: bool,
     ended: &mut Option<Ended>,
 ) -> Result<Vec<Value>, mysql_async::Error> {
-    // The transaction wrote (its tracked state had a `W`).
-    let mut wrote = false;
+    // The transaction's first append.
+    let mut first_append: Option<(u64, u64)> = None;
     // With autocommit = 0 the first statement opens the transaction.
     if !ac0 {
         c.query_drop("BEGIN").await?;
@@ -464,11 +460,17 @@ async fn txn(
         // none is open means Galera rolled it back without an error. Stop,
         // as the gateway does.
         //
-        // With autocommit = 0 the statement after the abort may instead
-        // open a new transaction: the state it reports then has lost the
-        // transaction's write, as the gateway checks too.
-        let state = trx_state(c);
-        let lost_write = state_check && wrote && state.as_deref().is_some_and(|t| !t.contains('W'));
+        // With autocommit = 0 the read after the abort may instead open a
+        // new transaction that hasn't written. The gateway sees that in the
+        // transaction state its answers report (the `W` is gone); this
+        // client doesn't negotiate session tracking, so it reads its first
+        // append back: the transaction that made it sees it.
+        let lost_write = match first_append {
+            Some((k1, v1)) if state_check && ac0 && !*append && in_trans(c) => {
+                !sees_append(c, k1, v1).await?
+            }
+            _ => false,
+        };
         if !in_trans(c) || lost_write {
             *ended = Some(Ended {
                 at: i,
@@ -481,7 +483,9 @@ async fn txn(
             }
             return Err(silent_abort());
         }
-        wrote |= state.is_some_and(|t| t.contains('W'));
+        if *append && first_append.is_none() {
+            first_append = Some((*k, *v));
+        }
     }
     c.query_drop("COMMIT").await?;
     Ok(done)
@@ -511,21 +515,16 @@ fn silent_abort() -> mysql_async::Error {
     })
 }
 
-/// The transaction state the connection's last OK packet reported
-/// (`session_track_transaction_info = STATE`), if it reported one.
-fn trx_state(c: &mysql_async::Conn) -> Option<String> {
-    let p = c.last_ok_packet()?;
-    p.session_state_info()
-        .ok()?
-        .into_iter()
-        .rev()
-        .find(|i| {
-            i.data_type() == mysql_async::consts::SessionStateType::SESSION_TRACK_TRANSACTION_STATE
-        })
-        .map(|i| {
-            let d = i.data_ref();
-            String::from_utf8_lossy(&d[d.len().saturating_sub(8)..]).into_owned()
-        })
+/// Whether the connection's transaction sees value `v` appended to key `k`.
+async fn sees_append(
+    c: &mut mysql_async::Conn,
+    k: u64,
+    v: u64,
+) -> Result<bool, mysql_async::Error> {
+    let cur: Option<String> = c
+        .query_first(format!("SELECT v FROM `{SCHEMA}`.la WHERE k = {k}"))
+        .await?;
+    Ok(cur.is_some_and(|l| l.split(',').any(|x| x.parse() == Ok(v))))
 }
 
 /// `SERVER_STATUS_IN_TRANS` in the connection's last OK packet (true when

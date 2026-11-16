@@ -23,6 +23,7 @@ use sprig_auth::authz::SessionGrants;
 use sprig_auth::authz::compile::Target as AuthTarget;
 use sprig_auth::authz::privilege::Action;
 use sprig_catalog::ddl::database_key;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::version::VersionKind;
 use sprig_catalog::{CatalogLocator, Freshness, TenantCatalog};
 use sprig_common::ids::{DbId, ObjectId, TenantId};
@@ -216,7 +217,7 @@ async fn copy_states(
     let svc = Arc::clone(ts.services());
     let cluster = ts.principal.backend.cluster.clone();
     if let Ok(pool) = svc.locator.ctl_pool(&cluster).await
-        && let Ok(mut conn) = pool.get_conn().await
+        && let Ok(mut conn) = pool.get_conn_bounded().await
     {
         for s in &schemas {
             if let Ok(rows) = sprig_inherit::copy::load_states(&mut conn, cat.tenant, s).await {
@@ -413,6 +414,15 @@ impl PassSession {
                 },
                 migrated,
             };
+            // A `DROP SHARE` here or above whose cleanup in the children
+            // was cut off (a gateway stopped after the drop committed):
+            // run it now.
+            if probe.is_none()
+                && sprig_inherit::unshare::sweep_due(&ctx)
+                && let Err(e) = Box::pin(sprig_inherit::unshare::sweep(&ctx, &mut runner)).await
+            {
+                tracing::warn!(error = %e, "a dropped share's cleanup failed; tried again in a minute");
+            }
             let h = match &probe {
                 Some(req) => {
                     let col =
@@ -601,7 +611,7 @@ impl sprig_inherit::Runner for InhRunner<'_, '_, '_> {
         let tenant = ts.tenant;
         if !self.migrated {
             let ep = svc.locator.writer(tenant).await?;
-            let mut conn = ep.pool.get_conn().await.map_err(|e| {
+            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
                 SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
             })?;
             sprig_inherit::store::migrate(&mut conn, ep.store.schema()).await?;
@@ -632,7 +642,7 @@ impl sprig_inherit::Runner for InhRunner<'_, '_, '_> {
         let svc = Arc::clone(ts.services());
         let cluster = ts.principal.backend.cluster.clone();
         let pool = svc.locator.ctl_pool(&cluster).await?;
-        let mut conn = pool.get_conn().await.map_err(|e| {
+        let mut conn = pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::BackendUnavailable, "cluster unreachable").with_source(e)
         })?;
         conn.query_drop(sql).await.map_err(|e| {
@@ -848,7 +858,7 @@ impl sprig_inherit::Runner for InhRunner<'_, '_, '_> {
         // A tree's tenants share the session's cluster.
         let cluster = ts.principal.backend.cluster.clone();
         let pool = svc.locator.ctl_pool(&cluster).await?;
-        let mut conn = pool.get_conn().await.map_err(|e| {
+        let mut conn = pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::BackendUnavailable, "cluster unreachable").with_source(e)
         })?;
         let unreachable = |e| {

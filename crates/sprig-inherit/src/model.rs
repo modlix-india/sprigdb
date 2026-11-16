@@ -370,6 +370,9 @@ pub struct InheritState {
     /// Objects made inheritable before `inherit_ext` (no row there yet):
     /// their `AUTO_INCREMENT` column is learnt at their next insert.
     ext_missing: std::collections::BTreeSet<ObjectId>,
+    /// Shares dropped whose cleanup in the children isn't recorded done
+    /// (`shares.state = 'dropping'`): no edge reads them.
+    dropping: Vec<Arc<Share>>,
 }
 
 impl InheritState {
@@ -400,6 +403,7 @@ impl InheritState {
             takes,
             homes: homes.into_iter().collect(),
             ext_missing: std::collections::BTreeSet::new(),
+            dropping: Vec::new(),
         };
         st.derive_group_shares();
         st
@@ -414,6 +418,29 @@ impl InheritState {
     /// Records the objects without an `inherit_ext` row (the loader).
     pub fn set_ext_missing(&mut self, ids: impl IntoIterator<Item = ObjectId>) {
         self.ext_missing = ids.into_iter().collect();
+    }
+
+    /// Records the dropped shares whose cleanup isn't done (the loader).
+    pub fn set_dropping(&mut self, shares: impl IntoIterator<Item = Share>) {
+        self.dropping = shares.into_iter().map(Arc::new).collect();
+    }
+
+    /// Shares dropped whose cleanup in the children (`DROP SHARE`'s
+    /// second half) isn't recorded done: a gateway stopped between the
+    /// drop's commit and its cleanup, or the cleanup kept failing.
+    pub fn dropping(&self) -> impl Iterator<Item = &Arc<Share>> {
+        self.dropping.iter()
+    }
+
+    /// This state as it read before dropped share `sh` went: `sh` and the
+    /// shares derived from it for its foreign-key group are back.
+    #[must_use]
+    pub fn with_share(&self, sh: &Share) -> Self {
+        let mut st = self.clone();
+        st.shares.retain(|x| x.id != sh.id && x.via != Some(sh.id));
+        st.shares.push(Arc::new(sh.clone()));
+        st.derive_group_shares();
+        st
     }
 
     /// The objects linked to `o` by foreign keys, either way, through the
@@ -461,6 +488,17 @@ impl InheritState {
         self.objects
             .values()
             .find(|o| o.db == db && o.table.eq_ignore_ascii_case(table))
+    }
+
+    /// This state with `objects` written over its own (by object id), as
+    /// it reads once a change upserting them commits.
+    #[must_use]
+    pub fn with_objects(&self, objects: impl IntoIterator<Item = InheritableObject>) -> Self {
+        let mut st = self.clone();
+        for o in objects {
+            st.objects.insert(o.object_id, Arc::new(o));
+        }
+        st
     }
 
     /// Adds, for every stored share of an object, a derived share of each

@@ -107,7 +107,7 @@ sprigctl shard list acme                              # groups, shards and their
 | Flag | Default | Meaning |
 |---|---|---|
 | `--to <cluster>` | none | The target cluster, in the same data centre |
-| `--verify` | `full` | `full`, `off`, or `sample:<pct>` |
+| `--verify` | `mover.verify_mode` (`full`) | `full`, `off`, or `sample:<pct>`. Without the flag the job uses `mover.verify_mode` (operator setting: `full`, `sample`, which checks 10% of the chunks, or `off`) |
 | `--manual` | off | Wait in `ready` until you run `sprigctl job cutover <id>` |
 | `--wait` | off | Return once the cutover committed or the job ended |
 | `--pin` | off | Then pin the tenant to the target, so the balancer leaves it there |
@@ -126,7 +126,7 @@ sprigctl shard list acme                              # groups, shards and their
 | `post_cutover`, `retaining`, `cleaning` | The fenced source is kept for `mover.source_retain_hours` (24), then dropped |
 | `done` | Finished |
 | `rolling_back`, `rolled_back` | Cancelled or failed before the commit; the source stayed authoritative throughout |
-| `paused` | Stopped by an operator or a guardrail; resumes into the same state |
+| `paused` | Stopped by an operator or a guardrail; resumes into the same state. A job whose step keeps failing (an unreachable target) retries for up to `mover.max_pause_minutes` (60), then rolls back |
 
 ```sh
 sprigctl job list --tenant acme

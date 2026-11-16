@@ -37,6 +37,7 @@ use bytes::Bytes;
 use mysql_async::Conn;
 use mysql_async::prelude::Queryable;
 use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::{DbState, Namespace, ObjectKind, ObjectState};
 use sprig_catalog::{CatalogLocator, Target, TenantCatalog, VersionKind};
 use sprig_common::ids::{ClusterId, DbId, GroupId, ObjectId, TenantId};
@@ -165,7 +166,7 @@ impl LookupHost for GwHost {
     async fn catalog(&self) -> Result<Conn> {
         let ep = self.svc.locator.writer(self.tenant).await?;
         let schema = ep.store.schema().to_owned();
-        let mut c = ep.pool.get_conn().await.map_err(catalog_err)?;
+        let mut c = ep.pool.get_conn_bounded().await.map_err(catalog_err)?;
         sprig_shard::groups::migrate(&mut c, &schema).await?;
         c.query_drop(format!("USE {}", sprig_common::names::quote(&schema)))
             .await
@@ -530,7 +531,7 @@ pub async fn drop_owned(
 pub async fn records(svc: &Arc<TenantServices>, tenant: TenantId) -> Result<Vec<LookupRecord>> {
     let ep = svc.locator.writer(tenant).await?;
     let schema = ep.store.schema().to_owned();
-    let mut c = ep.pool.get_conn().await.map_err(catalog_err)?;
+    let mut c = ep.pool.get_conn_bounded().await.map_err(catalog_err)?;
     let has: Option<u64> = c
         .exec_first(
             "SELECT COUNT(*) FROM information_schema.TABLES \
@@ -681,7 +682,7 @@ pub async fn add_lookup_grants(
         return Ok(());
     }
     let pool = svc.locator.ctl_pool(cluster).await?;
-    let mut conn = pool.get_conn().await.map_err(|e| {
+    let mut conn = pool.get_conn_bounded().await.map_err(|e| {
         SprigError::new(
             SprigCode::BackendUnavailable,
             format!("sprig_ctl on {cluster}: {e}"),
@@ -1063,7 +1064,7 @@ pub async fn execute(
                 .ok_or_else(|| SprigError::internal("a group without shards"))?;
             let schema = sprig_shard::shard_schema(ts.tenant, m.db, m.group, r0.shard);
             let pool = svc.locator.ctl_pool(&r0.cluster).await?;
-            let mut sc = pool.get_conn().await.map_err(catalog_err)?;
+            let mut sc = pool.get_conn_bounded().await.map_err(catalog_err)?;
             let shape = owner_shape(&mut sc, &schema, &tname).await?;
             let Some((key, cols)) = lookup_keys(&shape, &m.key)
                 .into_iter()
@@ -1078,6 +1079,8 @@ pub async fn execute(
                     ),
                 ));
             };
+            // Back before the build, which takes connections of its own.
+            drop(sc);
             let r = build_for_key(&svc, ts.tenant, object, &tname, &key, &cols, false).await?;
             Ok(LookupAnswer::Ok { affected: r.rows })
         }

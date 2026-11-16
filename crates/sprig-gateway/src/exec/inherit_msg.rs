@@ -39,6 +39,7 @@ use serde_json::{Map, Value, json};
 use sprig_auth::authz::{Action, Target};
 use sprig_catalog::TenantCatalog;
 use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::ObjectKind;
 use sprig_common::ids::TenantId;
 use sprig_common::{Result, SprigCode, SprigError};
@@ -1189,7 +1190,7 @@ pub(super) fn check_quota(svc: &TenantServices, cat: &TenantCatalog, own: &MsgSt
 pub(super) async fn next_object_id(svc: &TenantServices, t: TenantId) -> Result<u64> {
     use sprig_catalog::CatalogLocator;
     let ep = svc.locator.writer(t).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(|e| {
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
         SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
     })?;
     Ok(ep.store.next_object_id(&mut conn).await?.0)
@@ -1199,25 +1200,17 @@ pub(super) async fn next_object_id(svc: &TenantServices, t: TenantId) -> Result<
 /// its derived state (settings, triggers, sinks) now, in the background;
 /// for a queue definition, its sinks. The number of instances.
 pub(super) async fn rollout(svc: &Arc<TenantServices>, def: DefKey) -> Result<usize> {
-    let entries = inherited::instances_of(svc, def).await?;
-    let n = entries.len();
+    // A stream's derived state, or a queue's sinks.
+    let n = crate::inherited::remote::rollout_here(svc, def).await?;
+    // Members in other DCs: their DC's gateways do the same.
     let svc = Arc::clone(svc);
     tokio::spawn(async move {
-        for e in entries {
-            // A stream's derived state, or a queue's sinks.
-            let r = Box::pin(crate::inherited::sinks::reapply_source(&svc, e.tenant, def))
-                .await
-                .and_then(|reached| {
-                    if reached {
-                        Ok(())
-                    } else {
-                        Err(SprigError::internal("the definition is gone"))
-                    }
-                });
-            if let Err(err) = r {
-                tracing::warn!(tenant = %e.tenant, def = %def, error = %err, "inherited instance not updated; its next use retries");
-            }
-        }
+        crate::inherited::remote::in_other_dcs(
+            &svc,
+            crate::inherited::remote::MemberOp::Rollout,
+            def,
+        )
+        .await;
     });
     Ok(n)
 }
@@ -1256,7 +1249,7 @@ async fn drop_trigger_instances(svc: &Arc<TenantServices>, g: DefKey) -> Result<
             continue;
         }
         let ep = svc.locator.writer(t).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(|e| {
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
         let store = sprig_inherit::msg::MsgStore::new(ep.store.schema());
@@ -1643,7 +1636,7 @@ impl PassSession {
                     let cluster = svc.locator.cluster(si.tenant).await?;
                     let pool = svc.locator.ctl_pool(&cluster).await?;
                     let mut c = pool
-                        .get_conn()
+                        .get_conn_bounded()
                         .await
                         .map_err(sprig_streams::maria::map_err)?;
                     c.query_drop(ins)
@@ -2072,7 +2065,7 @@ impl PassSession {
                 let live: std::collections::BTreeMap<DefKey, sprig_inherit::msg::Instance> = {
                     use sprig_catalog::CatalogLocator;
                     let ep = svc.locator.writer(me).await?;
-                    let mut conn = ep.pool.get_conn().await.map_err(|e| {
+                    let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
                         SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable")
                             .with_source(e)
                     })?;
@@ -2448,7 +2441,7 @@ impl PassSession {
         let cluster = svc.locator.cluster(owner).await?;
         let pool = svc.locator.ctl_pool(&cluster).await?;
         let mut c = pool
-            .get_conn()
+            .get_conn_bounded()
             .await
             .map_err(sprig_streams::maria::map_err)?;
         c.query_drop(ins)

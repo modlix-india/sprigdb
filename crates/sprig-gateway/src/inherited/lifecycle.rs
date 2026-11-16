@@ -23,6 +23,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sprig_catalog::CatalogLocator;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::version::VersionKind;
 use sprig_common::ids::TenantId;
 use sprig_common::{Result, SprigCode, SprigError};
@@ -78,7 +79,7 @@ pub async fn remove_all(svc: &Arc<TenantServices>, def: &Definition) -> Result<u
         }
         let ep = svc.locator.writer(t).await?;
         let found = {
-            let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+            let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
             let st = MsgStore::new(ep.store.schema());
             if st.migrated(&mut conn).await? {
                 st.instance(&mut conn, def.key()).await?
@@ -267,7 +268,7 @@ pub async fn database_dropped(
     // this function's catalog connection is taken.
     let chain = super::chain(svc, &cat).await?;
     let ep = svc.locator.writer(t).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
     let st = MsgStore::new(ep.store.schema());
     for i in &gone {
         let triggers = match chain.def(i.def) {
@@ -320,7 +321,7 @@ pub async fn detach(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) ->
     let ep = svc.locator.writer(t).await?;
     let st = MsgStore::new(ep.store.schema());
     {
-        let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
         let Some(i) = st.instance(&mut conn, def.key()).await? else {
             return Err(super::target_err(format!(
                 "this tenant has no instance of {} {}.{} to detach",
@@ -349,7 +350,7 @@ pub async fn detach(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) ->
         DefKind::Queue => super::triggers::on_queue(&chain, def),
         _ => Vec::new(),
     };
-    let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
     let mut stopped = 0;
     for g in triggers {
         if let Some(gi) = st.instance(&mut conn, g.key()).await? {

@@ -3,6 +3,11 @@
 //! `statement_analysis` and `statements_with_errors_or_warnings` (with their
 //! `x$` forms).
 //!
+//! The rows reach MariaDB as one `JSON_TABLE` over a single JSON literal,
+//! at most MySQL's 10,000 (the most recently seen) with texts of at most
+//! 1,024 bytes, so the statement stays a few megabytes at most and quick
+//! to parse.
+//!
 //! The gateway passes the tenant's digests ([`PsDigest`]): the workload
 //! recorder keeps, beside each fingerprint's hourly statistics, its totals
 //! since this gateway first counted it or since the tenant's last `TRUNCATE` of
@@ -22,7 +27,7 @@
 //!   `QUERY_SAMPLE_TEXT` is `NULL`: the recorder keeps no plain statement
 //!   text (parameter samples are sealed).
 
-use super::{format_pico_time, sql_string};
+use super::sql_string;
 
 /// One digest row, as the gateway hands it over.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -65,8 +70,29 @@ fn ps(us: u64) -> u64 {
     us.saturating_mul(1_000_000)
 }
 
-fn time(us: u64) -> String {
-    format!("FROM_UNIXTIME({}.{:06})", us / 1_000_000, us % 1_000_000)
+/// Seconds since the epoch with six places, for `FROM_UNIXTIME`.
+fn secs(us: u64) -> String {
+    format!("{}.{:06}", us / 1_000_000, us % 1_000_000)
+}
+
+/// MySQL 8.4's `performance_schema_digests_size`: rows the summary holds.
+pub(super) const MAX_DIGEST_ROWS: usize = 10_000;
+
+/// MySQL 8.4's `performance_schema_max_digest_length`: bytes of
+/// `DIGEST_TEXT`. MySQL stops at a token boundary, so a longer text is cut
+/// at its last space within the limit.
+pub(super) const MAX_DIGEST_TEXT: usize = 1024;
+
+fn capped_text(t: &str) -> &str {
+    if t.len() <= MAX_DIGEST_TEXT {
+        return t;
+    }
+    let mut end = MAX_DIGEST_TEXT;
+    while !t.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = &t[..end];
+    cut.rfind(' ').map_or(cut, |i| &cut[..i])
 }
 
 /// One row: each column of `cols` (`NAME:CAST;...`) from `values` by name,
@@ -95,9 +121,75 @@ fn row(cols: &str, values: &[(&str, String)]) -> String {
     format!("SELECT {}", items.join(", "))
 }
 
-#[allow(clippy::needless_pass_by_value)] // takes the collected rows
-fn union(rows: Vec<String>) -> Option<String> {
-    (!rows.is_empty()).then(|| rows.join(" UNION ALL "))
+/// The alias of the digests' `JSON_TABLE`.
+const DG: &str = "`_sprig_dg`";
+
+/// The digests as one `JSON_TABLE` over a single string literal: the
+/// statement stays small and quick to parse whatever the number of
+/// digests (a `UNION ALL` of one `SELECT` per digest took the gateway and
+/// MariaDB seconds at a few thousand, and passed `max_allowed_packet` at
+/// about ten thousand). At most [`MAX_DIGEST_ROWS`], the most recently
+/// seen; texts cut at [`MAX_DIGEST_TEXT`] bytes.
+fn digest_table(digests: &[&PsDigest], nbe: bool) -> String {
+    let mut ds: Vec<&PsDigest> = digests.to_vec();
+    if ds.len() > MAX_DIGEST_ROWS {
+        ds.sort_by(|a, b| b.last_seen_us.cmp(&a.last_seen_us));
+        ds.truncate(MAX_DIGEST_ROWS);
+    }
+    let rows: Vec<serde_json::Value> = ds
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "s": d.schema,
+                "d": d.digest,
+                "t": capped_text(&d.text),
+                "n": d.count,
+                "e": d.errors,
+                "su": ps(d.sum_us),
+                "mi": ps(d.min_us),
+                "av": ps(d.sum_us.checked_div(d.count).unwrap_or(0)),
+                "mx": ps(d.max_us),
+                "ra": d.rows_affected,
+                "rs": d.rows_sent,
+                "rx": d.rows_examined,
+                "fs": secs(d.first_seen_us),
+                "ls": secs(d.last_seen_us),
+                "q95": ps(d.p95_us),
+                "q99": ps(d.p99_us),
+                "q999": ps(d.p999_us),
+            })
+        })
+        .collect();
+    let json = serde_json::Value::Array(rows).to_string();
+    let num = |k: &str| format!("{k} DECIMAL(20,0) PATH '$.{k}'");
+    let mut cols = vec![
+        "s VARCHAR(64) PATH '$.s'".to_owned(),
+        "d VARCHAR(64) PATH '$.d'".to_owned(),
+        "t LONGTEXT PATH '$.t'".to_owned(),
+    ];
+    cols.extend(
+        [
+            "n", "e", "su", "mi", "av", "mx", "ra", "rs", "rx", "q95", "q99", "q999",
+        ]
+        .iter()
+        .map(|k| num(k)),
+    );
+    cols.push("fs DECIMAL(20,6) PATH '$.fs'".to_owned());
+    cols.push("ls DECIMAL(20,6) PATH '$.ls'".to_owned());
+    format!(
+        " FROM JSON_TABLE({}, '$[*]' COLUMNS ({})) AS {DG}",
+        sql_string(&json, nbe),
+        cols.join(", ")
+    )
+}
+
+/// A column of the digests' table.
+fn c(k: &str) -> String {
+    format!("{DG}.`{k}`")
+}
+
+fn time(k: &str) -> String {
+    format!("FROM_UNIXTIME({})", c(k))
 }
 
 /// The computed rows of `obj` (lower case) in `schema` (`performance_schema`
@@ -111,148 +203,134 @@ pub(super) fn object(
     digests: &[PsDigest],
     nbe: bool,
 ) -> Option<String> {
-    let lit = |v: &str| sql_string(v, nbe);
-    let opt = |v: Option<&str>| v.map_or_else(|| "NULL".to_owned(), lit);
-    let avg = |sum: u64, n: u64| sum.checked_div(n).unwrap_or(0);
-    let pct = |part: u64, n: u64| {
-        if n == 0 {
-            "0".to_owned()
-        } else {
-            format!("ROUND(100 * {part} / {n}, 4)")
+    let all: Vec<&PsDigest> = digests.iter().collect();
+    let per_exec = |k: &str| format!("ROUND({} / GREATEST({}, 1))", c(k), c("n"));
+    let sql = match (schema, obj) {
+        ("performance_schema", "events_statements_summary_by_digest") => {
+            if all.is_empty() {
+                return None;
+            }
+            let select = row(
+                cols,
+                &[
+                    ("SCHEMA_NAME", c("s")),
+                    ("DIGEST", c("d")),
+                    ("DIGEST_TEXT", c("t")),
+                    ("COUNT_STAR", c("n")),
+                    ("SUM_TIMER_WAIT", c("su")),
+                    ("MIN_TIMER_WAIT", c("mi")),
+                    ("AVG_TIMER_WAIT", c("av")),
+                    ("MAX_TIMER_WAIT", c("mx")),
+                    ("SUM_ERRORS", c("e")),
+                    ("SUM_ROWS_AFFECTED", c("ra")),
+                    ("SUM_ROWS_SENT", c("rs")),
+                    ("SUM_ROWS_EXAMINED", c("rx")),
+                    ("FIRST_SEEN", time("fs")),
+                    ("LAST_SEEN", time("ls")),
+                    ("QUANTILE_95", c("q95")),
+                    ("QUANTILE_99", c("q99")),
+                    ("QUANTILE_999", c("q999")),
+                ],
+            );
+            select + &digest_table(&all, nbe)
         }
-    };
-    match (schema, obj) {
-        ("performance_schema", "events_statements_summary_by_digest") => union(
-            digests
-                .iter()
-                .map(|d| {
-                    row(
-                        cols,
-                        &[
-                            ("SCHEMA_NAME", opt(d.schema.as_deref())),
-                            ("DIGEST", lit(&d.digest)),
-                            ("DIGEST_TEXT", lit(&d.text)),
-                            ("COUNT_STAR", d.count.to_string()),
-                            ("SUM_TIMER_WAIT", ps(d.sum_us).to_string()),
-                            ("MIN_TIMER_WAIT", ps(d.min_us).to_string()),
-                            ("AVG_TIMER_WAIT", ps(avg(d.sum_us, d.count)).to_string()),
-                            ("MAX_TIMER_WAIT", ps(d.max_us).to_string()),
-                            ("SUM_ERRORS", d.errors.to_string()),
-                            ("SUM_ROWS_AFFECTED", d.rows_affected.to_string()),
-                            ("SUM_ROWS_SENT", d.rows_sent.to_string()),
-                            ("SUM_ROWS_EXAMINED", d.rows_examined.to_string()),
-                            ("FIRST_SEEN", time(d.first_seen_us)),
-                            ("LAST_SEEN", time(d.last_seen_us)),
-                            ("QUANTILE_95", ps(d.p95_us).to_string()),
-                            ("QUANTILE_99", ps(d.p99_us).to_string()),
-                            ("QUANTILE_999", ps(d.p999_us).to_string()),
-                        ],
-                    )
-                })
-                .collect(),
-        ),
         ("sys", "statement_analysis" | "x$statement_analysis") => {
+            if all.is_empty() {
+                return None;
+            }
             let x = obj.starts_with("x$");
-            let lat = |us: u64| {
+            let lat = |k: &str| {
                 if x {
-                    ps(us).to_string()
+                    c(k)
                 } else {
-                    format_pico_time(&ps(us).to_string())
+                    super::format_pico_time(&c(k))
                 }
             };
-            let query = |t: &str| {
-                if x {
-                    lit(t)
-                } else {
-                    let v = lit(t);
-                    format!(
-                        "(CASE WHEN CHAR_LENGTH({v}) > 64 THEN CONCAT(LEFT({v}, 30), ' ... ', RIGHT({v}, 30)) ELSE {v} END)"
-                    )
-                }
+            let query = if x {
+                c("t")
+            } else {
+                let v = c("t");
+                format!(
+                    "(CASE WHEN CHAR_LENGTH({v}) > 64 THEN CONCAT(LEFT({v}, 30), ' ... ', RIGHT({v}, 30)) ELSE {v} END)"
+                )
             };
-            let zero_lat = lat(0);
+            let zero_lat = if x {
+                "0".to_owned()
+            } else {
+                super::format_pico_time("0")
+            };
             let mem = if x {
                 "0".to_owned()
             } else {
                 "'   0 bytes'".to_owned()
             };
-            union(
-                digests
-                    .iter()
-                    .map(|d| {
-                        row(
-                            cols,
-                            &[
-                                ("query", query(&d.text)),
-                                ("db", opt(d.schema.as_deref())),
-                                ("full_scan", "''".to_owned()),
-                                ("exec_count", d.count.to_string()),
-                                ("err_count", d.errors.to_string()),
-                                ("total_latency", lat(d.sum_us)),
-                                ("max_latency", lat(d.max_us)),
-                                ("avg_latency", lat(avg(d.sum_us, d.count))),
-                                ("lock_latency", zero_lat.clone()),
-                                ("cpu_latency", zero_lat.clone()),
-                                ("rows_sent", d.rows_sent.to_string()),
-                                (
-                                    "rows_sent_avg",
-                                    format!("ROUND({} / {})", d.rows_sent, d.count.max(1)),
-                                ),
-                                ("rows_examined", d.rows_examined.to_string()),
-                                (
-                                    "rows_examined_avg",
-                                    format!("ROUND({} / {})", d.rows_examined, d.count.max(1)),
-                                ),
-                                ("rows_affected", d.rows_affected.to_string()),
-                                (
-                                    "rows_affected_avg",
-                                    format!("ROUND({} / {})", d.rows_affected, d.count.max(1)),
-                                ),
-                                ("max_controlled_memory", mem.clone()),
-                                ("max_total_memory", mem.clone()),
-                                ("digest", lit(&d.digest)),
-                                ("first_seen", time(d.first_seen_us)),
-                                ("last_seen", time(d.last_seen_us)),
-                            ],
-                        )
-                    })
-                    .collect(),
-            )
+            let select = row(
+                cols,
+                &[
+                    ("query", query),
+                    ("db", c("s")),
+                    ("full_scan", "''".to_owned()),
+                    ("exec_count", c("n")),
+                    ("err_count", c("e")),
+                    ("total_latency", lat("su")),
+                    ("max_latency", lat("mx")),
+                    ("avg_latency", lat("av")),
+                    ("lock_latency", zero_lat.clone()),
+                    ("cpu_latency", zero_lat),
+                    ("rows_sent", c("rs")),
+                    ("rows_sent_avg", per_exec("rs")),
+                    ("rows_examined", c("rx")),
+                    ("rows_examined_avg", per_exec("rx")),
+                    ("rows_affected", c("ra")),
+                    ("rows_affected_avg", per_exec("ra")),
+                    ("max_controlled_memory", mem.clone()),
+                    ("max_total_memory", mem),
+                    ("digest", c("d")),
+                    ("first_seen", time("fs")),
+                    ("last_seen", time("ls")),
+                ],
+            );
+            select + &digest_table(&all, nbe)
         }
         ("sys", "statements_with_errors_or_warnings" | "x$statements_with_errors_or_warnings") => {
+            let failed: Vec<&PsDigest> = all.into_iter().filter(|d| d.errors > 0).collect();
+            if failed.is_empty() {
+                return None;
+            }
             let x = obj.starts_with("x$");
-            union(
-                digests
-                    .iter()
-                    .filter(|d| d.errors > 0)
-                    .map(|d| {
-                        let q = lit(&d.text);
-                        let query = if x {
-                            q
-                        } else {
-                            format!(
-                                "(CASE WHEN CHAR_LENGTH({q}) > 64 THEN CONCAT(LEFT({q}, 30), ' ... ', RIGHT({q}, 30)) ELSE {q} END)"
-                            )
-                        };
-                        row(
-                            cols,
-                            &[
-                                ("query", query),
-                                ("db", opt(d.schema.as_deref())),
-                                ("exec_count", d.count.to_string()),
-                                ("errors", d.errors.to_string()),
-                                ("error_pct", pct(d.errors, d.count)),
-                                ("digest", lit(&d.digest)),
-                                ("first_seen", time(d.first_seen_us)),
-                                ("last_seen", time(d.last_seen_us)),
-                            ],
-                        )
-                    })
-                    .collect(),
-            )
+            let query = if x {
+                c("t")
+            } else {
+                let v = c("t");
+                format!(
+                    "(CASE WHEN CHAR_LENGTH({v}) > 64 THEN CONCAT(LEFT({v}, 30), ' ... ', RIGHT({v}, 30)) ELSE {v} END)"
+                )
+            };
+            let select = row(
+                cols,
+                &[
+                    ("query", query),
+                    ("db", c("s")),
+                    ("exec_count", c("n")),
+                    ("errors", c("e")),
+                    (
+                        "error_pct",
+                        format!(
+                            "IF({n} = 0, 0, ROUND(100 * {e} / {n}, 4))",
+                            n = c("n"),
+                            e = c("e")
+                        ),
+                    ),
+                    ("digest", c("d")),
+                    ("first_seen", time("fs")),
+                    ("last_seen", time("ls")),
+                ],
+            );
+            select + &digest_table(&failed, nbe)
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some(sql)
 }
 
 /// Whether `obj` (lower case) in `schema` is computed from digests.

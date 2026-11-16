@@ -28,6 +28,11 @@
 //!   not scanned for lookup.orphan_scan_hours lose their orphans
 //! a build that fails on values repeating across shards tells the host
 //!   (LookupHost::duplicates), which raises an approvals item
+//! rehash(owners), from a re-key after its cutover: every lookup of those
+//!   tables is rebuilt as above while the group is still `rekeying`; until
+//!   then no other job touches them (resume skips them, create and rebuild
+//!   refuse with 39470), claims keep raising 1062 and owner checks read
+//!   every owner shard (LookupIndex::rehashing)
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -488,6 +493,7 @@ impl Admin<'_> {
     /// across shards (the lookup is dropped); MariaDB's and etcd's errors.
     pub async fn create(&self, n: &NewLookup) -> Result<(LookupIndex, BuildReport)> {
         let mut cat = self.host.catalog().await?;
+        refuse_while_rekeyed(&mut cat, n.owner, &n.owner_table).await?;
         let lmap = self.lookup_group(&mut cat, &n.owner_map).await?;
         let pools = self
             .host
@@ -614,15 +620,15 @@ impl Admin<'_> {
         cat: &mut Conn,
         rec: &LookupRecord,
     ) -> Result<(LookupIndex, MapPlacement, Pools)> {
-        let owner: Option<(String, u32, u32)> = cat
+        let owner: Option<(String, u32, u32, bool)> = cat
             .exec_first(
-                "SELECT o.name, o.db_id, m.group_id FROM objects o \
+                "SELECT o.name, o.db_id, m.group_id, m.next_routing IS NOT NULL FROM objects o \
                  JOIN group_members m ON m.object_id = o.object_id WHERE o.object_id = ?",
                 (rec.owner.0,),
             )
             .await
             .map_err(db_err)?;
-        let Some((table, db, group)) = owner else {
+        let Some((table, db, group, rehashing)) = owner else {
             return Err(SprigError::internal(format!(
                 "lookup index {} names object {}, which is no group member",
                 rec.index_name, rec.owner.0
@@ -662,6 +668,7 @@ impl Admin<'_> {
             group: rec.group,
             state: rec.state,
             auto_index_id: rec.auto_index_id,
+            rehashing,
         };
         let placement = MapPlacement {
             tenant: self.tenant,
@@ -702,15 +709,44 @@ impl Admin<'_> {
             .find(&mut cat, owner, name)
             .await?
             .ok_or_else(|| no_lookup(name, table))?;
-        let (mut l, placement, pools) = self.load(&mut cat, &rec).await?;
+        refuse_while_rekeyed(&mut cat, owner, table).await?;
+        self.rebuild_record(&mut cat, &rec).await
+    }
+
+    /// Rebuilds every lookup of the tables in `owners` after a re-key's
+    /// cutover, while their group is still `rekeying`: each lookup row
+    /// still names its owner by the old key's hash, which
+    /// the verification repairs. Returns each lookup's name and report.
+    ///
+    /// # Errors
+    /// The first lookup that fails (1062 if its values repeat now: it is
+    /// dropped); catalog, etcd and MariaDB errors. The caller retries.
+    pub async fn rehash(&self, owners: &[ObjectId]) -> Result<Vec<(String, BuildReport)>> {
+        let mut cat = self.host.catalog().await?;
+        if owners.is_empty() || !has_lookup_table(&mut cat).await? {
+            return Ok(Vec::new());
+        }
+        let recs: Vec<LookupRecord> = LookupCatalog
+            .rows(&mut cat)
+            .await?
+            .into_iter()
+            .filter(|r| owners.contains(&r.owner) && r.state != LookupState::Dropping)
+            .collect();
+        let mut out = Vec::new();
+        for rec in recs {
+            let report = self.rebuild_record(&mut cat, &rec).await?;
+            out.push((rec.index_name.clone(), report));
+        }
+        Ok(out)
+    }
+
+    /// [`Admin::rebuild`] of one catalog row, without the re-key check.
+    async fn rebuild_record(&self, cat: &mut Conn, rec: &LookupRecord) -> Result<BuildReport> {
+        let name = rec.index_name.as_str();
+        let (mut l, placement, pools) = self.load(cat, rec).await?;
         if l.state == LookupState::Public {
             if !LookupCatalog
-                .set_state(
-                    &mut cat,
-                    l.id,
-                    LookupState::Public,
-                    LookupState::Backfilling,
-                )
+                .set_state(cat, l.id, LookupState::Public, LookupState::Backfilling)
                 .await?
             {
                 return Err(SprigError::new(
@@ -721,7 +757,7 @@ impl Admin<'_> {
             l.state = LookupState::Backfilling;
             self.host.publish().await?;
         } else if LookupCatalog
-            .take_over(&mut cat, l.id, self.lease.as_secs())
+            .take_over(cat, l.id, self.lease.as_secs())
             .await?
         {
             // A stopped build: carry on from its state.
@@ -735,14 +771,11 @@ impl Admin<'_> {
             ));
         }
         if l.state == LookupState::Dropping {
-            direct::drop_with(&pools, &mut cat, &placement, &mut l, &mut || {
-                self.host.publish()
-            })
-            .await?;
-            return Err(no_lookup(name, table));
+            direct::drop_with(&pools, cat, &placement, &mut l, &mut || self.host.publish()).await?;
+            return Err(no_lookup(name, &l.owner_table));
         }
         let host = self.host;
-        let built = direct::build(&pools, &mut cat, &placement, &mut l, self.chunk, || {
+        let built = direct::build(&pools, cat, &placement, &mut l, self.chunk, || {
             host.publish()
         })
         .await;
@@ -755,7 +788,7 @@ impl Admin<'_> {
         };
         let wait = self.host.lock_wait_seconds(placement.db, l.owner);
         let removed = direct::orphan_scan(&pools, &placement, &l, wait).await?;
-        LookupCatalog.scanned(&mut cat, l.id).await?;
+        LookupCatalog.scanned(cat, l.id).await?;
         tracing::info!(
             tenant = %self.tenant, lookup = %l.index_name, rows = report.rows,
             repaired = report.repaired, orphans = removed, "lookup index rebuilt"
@@ -950,12 +983,19 @@ impl Admin<'_> {
         let mut done = Vec::new();
         let rows = LookupCatalog.rows(&mut cat).await?;
         let live = live_owners(&mut cat, &rows).await?;
+        let rekeyed = rekeyed_owners(&mut cat).await?;
         let lease = self.lease.as_secs();
         for rec in rows {
             // An owner `DROP TABLE` (or `DROP DATABASE`) removed while its
             // gateway died before the lookup went with it.
             let gone = !live.contains(&rec.owner);
             if (rec.state == LookupState::Public && !gone) || rec.idle_secs < lease {
+                continue;
+            }
+            // The re-key's own follow-up rebuilds these after its cutover:
+            // built on now, a lookup would go public with the old key's
+            // hashes just before the cutover makes them wrong.
+            if !gone && rekeyed.contains(&rec.owner) {
                 continue;
             }
             if !LookupCatalog.take_over(&mut cat, rec.id, lease).await? {
@@ -1027,6 +1067,34 @@ async fn has_lookup_table(cat: &mut Conn) -> Result<bool> {
         .await
         .map_err(db_err)?;
     Ok(has.unwrap_or(0) > 0)
+}
+
+/// The tables of groups an online re-key holds (`rekeying`).
+async fn rekeyed_owners(cat: &mut Conn) -> Result<BTreeSet<ObjectId>> {
+    let v: Vec<u64> = cat
+        .query(
+            "SELECT m.object_id FROM group_members m JOIN table_groups g \
+             ON g.group_id = m.group_id WHERE g.state = 'rekeying'",
+        )
+        .await
+        .map_err(db_err)?;
+    Ok(v.into_iter().map(ObjectId).collect())
+}
+
+/// 39470 while `owner`'s group is re-keyed: a lookup built or rebuilt then
+/// would hold routing hashes of the key the cutover replaces; the re-key
+/// rebuilds the group's lookups itself.
+async fn refuse_while_rekeyed(cat: &mut Conn, owner: ObjectId, table: &str) -> Result<()> {
+    if rekeyed_owners(cat).await?.contains(&owner) {
+        return Err(SprigError::new(
+            SprigCode::ShardBusy,
+            format!(
+                "table {table} is being re-keyed; its lookup indexes are rebuilt when the \
+                 re-key ends, retry after it"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// The owners of `rows` the catalog still has (an `objects` row that

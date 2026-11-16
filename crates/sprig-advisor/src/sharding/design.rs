@@ -91,7 +91,7 @@ pub struct Table {
 }
 
 impl Table {
-    fn column(&self, n: &str) -> Option<&Column> {
+    pub(crate) fn column(&self, n: &str) -> Option<&Column> {
         self.columns.iter().find(|c| c.name == n)
     }
 }
@@ -229,7 +229,7 @@ pub struct Input {
 }
 
 impl Input {
-    fn table(&self, o: Obj) -> Option<&Table> {
+    pub(crate) fn table(&self, o: Obj) -> Option<&Table> {
         self.tables.iter().find(|t| t.object == o)
     }
 
@@ -1253,6 +1253,33 @@ pub fn confidence(
     let Some(other) = runner_up else {
         return 1.0;
     };
+    resampled_share(input, best, other, s, |a, b| a > b)
+}
+
+/// The confidence of a re-key: over the same 200 Poisson resamples as
+/// [`confidence`], the share where `proposed` scores at least `margin`
+/// (a ratio: 0.15 for 15 points) above `current`.
+#[must_use]
+pub fn gain_confidence(
+    input: &Input,
+    proposed: &Design,
+    current: &Design,
+    margin: f64,
+    s: &AdvisorSettings,
+) -> f64 {
+    // A hair under the margin counts: sums of shares aren't exact.
+    resampled_share(input, proposed, current, s, |a, b| a - b >= margin - 1e-9)
+}
+
+/// The share of 200 Poisson resamples of the statements' executions where
+/// `wins(score of a, score of b)` holds; 0 without statements.
+fn resampled_share(
+    input: &Input,
+    best: &Design,
+    other: &Design,
+    s: &AdvisorSettings,
+    wins_if: impl Fn(f64, f64) -> bool,
+) -> f64 {
     let mut input = input.clone();
     input.normalize();
     if input.stmts.is_empty() {
@@ -1289,7 +1316,7 @@ pub fn confidence(
         let w: Vec<f64> = input.stmts.iter().map(|st| poisson(st.weight)).collect();
         let a = score_weighted(&input, best, s, Some(&w)).total;
         let b = score_weighted(&input, other, s, Some(&w)).total;
-        if a > b {
+        if wins_if(a, b) {
             wins += 1;
         }
     }

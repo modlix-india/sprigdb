@@ -101,6 +101,17 @@ impl SettingsSource for LiveSource {
                 rows.as_deref(),
                 &ctx,
             ),
+            rekey: sprig_advisor::sharding::settings::RekeyAdvice::resolve_with(
+                s,
+                rows.as_deref(),
+                &ctx,
+                sprig_advisor::sharding::settings::layered_key(
+                    s,
+                    rows.as_deref(),
+                    &sprig_balancer::settings::AUTO_SIZE_LIMIT_GB,
+                    &ctx,
+                ),
+            ),
         }
     }
 

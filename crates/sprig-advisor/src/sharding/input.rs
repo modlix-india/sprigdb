@@ -181,13 +181,37 @@ pub async fn tables(
 ) -> Result<(Vec<Table>, Vec<ForeignKey>, Vec<Located>)> {
     let catalog = SchemaName::catalog(tenant).to_string();
     let schemas = default_schemas(c, tenant, &catalog).await?;
-    let objects: Vec<(u64, u32, String)> = c
-        .query(format!(
-            "SELECT object_id, db_id, name FROM `{catalog}`.objects \
-             WHERE namespace = 'relation' AND kind = 'table' AND state = 'active'"
-        ))
-        .await
-        .map_err(|e| db_err("objects", &e))?;
+    let objects = catalog_tables(c, tenant).await?;
+    tables_in(c, &objects, &schemas).await
+}
+
+/// The tenant's active tables in its catalog: `(object, database, name)`.
+///
+/// # Errors
+/// MariaDB's.
+pub async fn catalog_tables(c: &mut Conn, tenant: TenantId) -> Result<Vec<(u64, u32, String)>> {
+    let catalog = SchemaName::catalog(tenant).to_string();
+    c.query(format!(
+        "SELECT object_id, db_id, name FROM `{catalog}`.objects \
+         WHERE namespace = 'relation' AND kind = 'table' AND state = 'active'"
+    ))
+    .await
+    .map_err(|e| db_err("objects", &e))
+}
+
+/// Reads the tables of `schemas` (each a database's schema on the
+/// connection's server) and their keys; `objects` are the catalog's
+/// tables ([`catalog_tables`]), which give each table its object id.
+/// A periodic run reads each table group's first shard this way.
+///
+/// # Errors
+/// MariaDB's.
+#[allow(clippy::too_many_lines)]
+pub async fn tables_in(
+    c: &mut Conn,
+    objects: &[(u64, u32, String)],
+    schemas: &[(DbId, String)],
+) -> Result<(Vec<Table>, Vec<ForeignKey>, Vec<Located>)> {
     let obj = |db: DbId, name: &str| {
         objects
             .iter()
@@ -197,7 +221,7 @@ pub async fn tables(
     let mut tables = Vec::new();
     let mut located = Vec::new();
     let mut fks = Vec::new();
-    for (db, schema) in &schemas {
+    for (db, schema) in schemas {
         let s = quote_list(std::slice::from_ref(schema));
         let tbls: Vec<(String, u64)> = c
             .query(format!(
@@ -591,7 +615,25 @@ pub async fn assemble(
     window: Duration,
     split_bytes: f64,
 ) -> Result<Assembled> {
-    let (mut tables, fks, mut located) = tables(c, tenant).await?;
+    let (tables, fks, located) = tables(c, tenant).await?;
+    assemble_from(c, tenant, now, window, split_bytes, (tables, fks, located)).await
+}
+
+/// [`assemble`] over tables already read ([`tables_in`]): statements and
+/// units from the workload store, pins, key-value units and stored code,
+/// all from the tenant's catalog on `c`.
+///
+/// # Errors
+/// MariaDB's.
+pub async fn assemble_from(
+    c: &mut Conn,
+    tenant: TenantId,
+    now: SystemTime,
+    window: Duration,
+    split_bytes: f64,
+    read: (Vec<Table>, Vec<ForeignKey>, Vec<Located>),
+) -> Result<Assembled> {
+    let (mut tables, fks, mut located) = read;
     let store = WorkloadTables::for_tenant(tenant);
     let from = now.checked_sub(window).unwrap_or(SystemTime::UNIX_EPOCH);
     let fps = store

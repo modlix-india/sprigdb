@@ -49,6 +49,7 @@ Connection settings:
 | `amqp.consumer_timeout_ms` | int | `1800000` | Longest a delivery may stay unacknowledged; 0 for no limit |
 | `amqp.max_unacked_per_consumer` | int | `65535` | Unacknowledged deliveries per consumer with prefetch 0 |
 | `amqp.quota_publish_bytes_per_sec` | int | `0` | Tenant's publish quota, bytes per second; 0 for none |
+| `queue.vhost_idle_close_seconds` | int | `300` | A virtual host with no connections, consumers or work for this long is closed on the gateway; 0 never closes. Data centre or global |
 
 ## Virtual hosts are databases
 
@@ -66,6 +67,8 @@ CREATE DATABASE mq;
 ```
 
 Exchanges, queues and bindings belong to their virtual host, so two tenants (or two databases) can each have a queue named `billing`.
+
+A gateway keeps an open virtual host in memory only while it is in use. After `queue.vhost_idle_close_seconds` (300) with nothing to do, it closes it; the next connection, or a delayed or expiring message falling due, opens it again, so delays and TTLs still fire on time. Nothing in the queues is lost. The metrics `sprig_queue_vhosts_open`, `sprig_queue_vhost_closes_total` and `sprig_queue_vhost_wakeups_total` show it.
 
 ## Log in
 

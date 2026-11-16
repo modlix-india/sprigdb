@@ -137,6 +137,22 @@ function themeName(): string {
   return isDark() ? 'sprig-dark' : 'sprig-light';
 }
 
+/** One line of read-only code as Monaco tokenizes it: [text, token type]. */
+export type TokenLine = [string, string][];
+
+/** Read-only code split into Monaco's tokens (the assistant's proposal
+ * cards draw them as text spans): no editor instance, so a long thread of
+ * cards stays light and reads as plain text to screen readers. */
+export async function tokenLines(text: string, language: EditorLanguage = 'mysql'): Promise<TokenLine[]> {
+  // colorize waits for the language's tokenizer to load; tokenize doesn't.
+  await monaco.editor.colorize(' ', language, {});
+  const lines = text.split('\n');
+  return monaco.editor.tokenize(text, language).map((toks, i) => {
+    const line = lines[i] ?? '';
+    return toks.map((t, j) => [line.slice(t.offset, toks[j + 1]?.offset ?? line.length), t.type] as [string, string]);
+  });
+}
+
 export interface MonacoHandle {
   /** The selection's text, or '' without a selection. */
   selection(): string;
@@ -155,11 +171,14 @@ export default function Monaco({
   label,
   handle,
   language = 'mysql',
+  onAsk,
 }: {
   language?: EditorLanguage;
   value: string;
   onChange: (v: string) => void;
   onRun: () => void;
+  /** Ctrl/Cmd+I: an inline ask; without it the shortcut toggles the assistant. */
+  onAsk?: () => void;
   completion: CompletionSource;
   label: string;
   handle: (h: MonacoHandle | null) => void;
@@ -168,9 +187,11 @@ export default function Monaco({
   const ed = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const run = useRef(onRun);
   const change = useRef(onChange);
+  const askRef = useRef(onAsk);
   useEffect(() => {
     run.current = onRun;
     change.current = onChange;
+    askRef.current = onAsk;
     source = completion;
   });
   useEffect(() => {
@@ -194,6 +215,10 @@ export default function Monaco({
     ed.current = e;
     e.onDidChangeModelContent(() => change.current(e.getValue()));
     e.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => run.current());
+    e.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyI, () => {
+      if (askRef.current) askRef.current();
+      else window.dispatchEvent(new Event('sprig-assistant-toggle'));
+    });
     handle({
       selection: () => {
         const sel = e.getSelection();

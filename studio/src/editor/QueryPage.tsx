@@ -16,6 +16,9 @@ import { KEYWORDS } from './keywords';
 import { classifyCypher, cypherAt, splitCypher, CYPHER_KEYWORDS } from '../graph/cypher';
 import { mongoAt, MongoshError, splitMongo, toCommand } from '../docs/mongosh';
 import { MONGO_WORDS } from '../docs/words';
+import { AskButton } from '../ai/AskButton';
+import { InlineAsk } from '../ai/InlineAsk';
+import { useRoles } from '../ai/store';
 
 const EDITOR_LANG: Record<QueryLanguage, EditorLanguage> = { sql: 'mysql', cypher: 'cypher', gql: 'cypher', mongo: 'javascript' };
 
@@ -71,6 +74,9 @@ export function QueryPage() {
   const running = useRef<RunHandle | null>(null);
   const stopAll = useRef(false);
   const dialog = useRef<HTMLDialogElement>(null);
+  const aiRoles = useRoles();
+  // Ctrl/Cmd+I in the editor: the inline ask.
+  const [inline, setInline] = useState(false);
 
   useEffect(() => {
     if (me) void loadTabs(me.principal.tenant ?? '-', me.principal.user, me.studio.persist_drafts);
@@ -480,12 +486,39 @@ export function QueryPage() {
           {phase === 'streaming' ? 'Running…' : phase === 'cancelled' ? intl.formatMessage({ id: 'results.cancelled' }) : ''}
           {phase === 'done' && elapsed !== null ? intl.formatMessage({ id: 'results.elapsed' }, { ms: elapsed }) : ''}
         </span>
+        {phase === 'done' && lang === 'sql' && elapsed !== null && elapsed >= 1000 && (
+          <AskButton
+            label="Why is this slow?"
+            role="dba"
+            testId="ask-slow-query"
+            options={() => ({
+              text: 'Why is this query slow, and how can I make it faster?',
+              chips: [
+                ...(tab.db ? [{ id: `db:${tab.db}`, kind: 'database' as const, label: tab.db, ref: tab.db }] : []),
+                { id: `query:${tab.id}`, kind: 'query' as const, label: tab.title, ref: lastSql || tab.sql },
+                { id: 'note:elapsed', kind: 'note' as const, label: `took ${elapsed} ms`, ref: `It took ${elapsed} ms in Studio.` },
+              ],
+            })}
+          />
+        )}
       </div>
+      {inline && (
+        <InlineAsk
+          sql={tab.sql}
+          db={tab.db}
+          onApply={(v) => updateTab(tab.id, { sql: v })}
+          onClose={() => {
+            setInline(false);
+            editor.current?.focus();
+          }}
+        />
+      )}
       <Suspense fallback={<div className="editor-host muted">Loading editor…</div>}>
         <Monaco
           value={tab.sql}
           onChange={(v) => updateTab(tab.id, { sql: v })}
           onRun={() => void run(false)}
+          onAsk={aiRoles.includes('data') && lang === 'sql' ? () => setInline(true) : undefined}
           completion={completion}
           language={EDITOR_LANG[lang]}
           label={`${lang === 'sql' ? 'SQL' : lang === 'mongo' ? 'MongoDB' : lang === 'gql' ? 'GQL' : 'Cypher'} editor, ${tab.title}`}
@@ -497,7 +530,20 @@ export function QueryPage() {
       {error && (
         <div className="error" role="alert" data-testid="query-error">
           {error.text}
-          {error.trace && <span className="muted"> (trace {error.trace})</span>}
+          {error.trace && <span className="muted"> (trace {error.trace})</span>}{' '}
+          <AskButton
+            label="Explain this error"
+            role="data"
+            testId="ask-explain-error"
+            options={() => ({
+              text: 'Explain this error and how to fix my query.',
+              chips: [
+                ...(tab.db ? [{ id: `db:${tab.db}`, kind: 'database' as const, label: tab.db, ref: tab.db }] : []),
+                { id: `query:${tab.id}`, kind: 'query' as const, label: tab.title, ref: lastSql || tab.sql },
+                { id: 'note:error', kind: 'note' as const, label: 'the error', ref: `The error: ${error.text}` },
+              ],
+            })}
+          />
         </div>
       )}
       {explain && <pre aria-label="Explain">{explain}</pre>}
@@ -505,6 +551,21 @@ export function QueryPage() {
         {items.length === 0 && phase === 'idle' && (
           <p className="muted">
             <FormattedMessage id="results.empty" />
+          </p>
+        )}
+        {items.length === 0 && phase === 'idle' && !tab.sql.trim() && lang === 'sql' && (
+          <p>
+            <AskButton
+              label="Ask for a query"
+              role="data"
+              testId="ask-for-query"
+              options={() => ({
+                draft: true,
+                text: '',
+                targetTab: tab.id,
+                chips: tab.db ? [{ id: `db:${tab.db}`, kind: 'database' as const, label: tab.db, ref: tab.db }] : [],
+              })}
+            />
           </p>
         )}
         {items.map((it, i) => (

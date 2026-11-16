@@ -231,6 +231,9 @@ pub enum Builtin {
     ToJson,
     /// The number of elements of a JSON array or members of an object.
     JsonLength,
+    /// A JSON value as compact text (`{"a":1}`), as `JSON.stringify` and
+    /// the engine tier's `db.publish` write it.
+    JsonText,
     /// Absolute value.
     Abs,
     /// Round down, `Float` to `Float`.
@@ -280,6 +283,7 @@ impl Builtin {
             Builtin::JsonStr => "json_str",
             Builtin::ToJson => "to_json",
             Builtin::JsonLength => "json_len",
+            Builtin::JsonText => "json_text",
             Builtin::Abs => "abs",
             Builtin::Floor => "floor",
             Builtin::Ceil => "ceil",
@@ -412,6 +416,44 @@ pub struct ErrorSpec {
     pub code: u16,
     /// The message, `Str`; cut to 128 characters.
     pub message: Expr,
+    /// What a JavaScript `catch` sees of a 39865, when that isn't the
+    /// name `Error` with `message`: the error's name (`TypeError`,
+    /// `RangeError`; empty for a thrown value that isn't an error object)
+    /// and its message, uncut.
+    pub catch: Option<(String, Expr)>,
+}
+
+impl ErrorSpec {
+    /// An error with the name `Error` for a `catch`.
+    #[must_use]
+    pub fn new(code: u16, message: Expr) -> Self {
+        Self {
+            code,
+            message,
+            catch: None,
+        }
+    }
+}
+
+/// Where a [`Stmt::Try`] keeps the error it caught: locals of the
+/// function, all set when `flag` is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Caught {
+    /// `Bool`: whether an error was caught (`false` when the body ended
+    /// without one).
+    pub flag: LocalId,
+    /// `Int`: its error number.
+    pub code: LocalId,
+    /// `Str`: its SQLSTATE.
+    pub state: LocalId,
+    /// `Str`: its message as MariaDB carries it.
+    pub text: LocalId,
+    /// `Str`: the message a JavaScript `catch` sees (the code's own
+    /// error's, uncut; a database error's text).
+    pub message: LocalId,
+    /// `Str`: the error's name for a `catch` (`Error`, `TypeError`; empty
+    /// for a thrown value that isn't an error object).
+    pub name: LocalId,
 }
 
 /// What an embedded SQL statement returns.
@@ -438,6 +480,33 @@ pub enum SqlShape {
     Exec {
         /// The `Int` local the count lands in.
         affected: LocalId,
+    },
+    /// `db.call`: the statement is `CALL <call entry>(` and the bind
+    /// values separated by `, `; the generator adds the event and result
+    /// variables and `)`. Each field lands in its local, read from the
+    /// result as the callee's wrapper reads it (`Int` through `CAST AS
+    /// SIGNED`, `Float` through `CAST AS DOUBLE`, `Str` through
+    /// `JSON_VALUE`); a field the event lacks is `NULL`.
+    Call {
+        /// The `Str` local the event's name lands in.
+        event: LocalId,
+        /// The `Json` local the callee's own result object lands in.
+        result: LocalId,
+        /// Field name and the local it lands in, in the wrapper's order.
+        into: Vec<(String, LocalId)>,
+    },
+    /// `db.publish`: the statement is an `INSERT` of binds key, value and
+    /// headers into a stream's outbox; before it, as the gateway checks a
+    /// publish, a value longer than `max_bytes` raises 39944 and, on a
+    /// compacted stream, a key that is `NULL` raises 39955. Both count as
+    /// errors of the data operation.
+    Publish {
+        /// The `Int` local the count lands in.
+        affected: LocalId,
+        /// `stream.max_message_bytes`.
+        max_bytes: u64,
+        /// A compacted stream.
+        compact: bool,
     },
 }
 
@@ -511,6 +580,27 @@ pub enum Stmt {
     Return,
     /// A data operation.
     Db(DbOp),
+    /// Runs `body`; an error it raises that JavaScript can catch is kept
+    /// in `caught` (its flag set) and the statement ends normally; any
+    /// other error goes on. Catchable: the code's own `throw` (39865), any
+    /// error of a data operation except a budget (39864), and an error
+    /// raised again by [`Stmt::Rethrow`]. Not catchable: `sprig.reject`
+    /// (39863 raised by the code), budgets, and runtime errors of the
+    /// code's own arithmetic (39866, overflow, division by zero), which
+    /// JavaScript doesn't throw.
+    Try {
+        /// The protected statements.
+        body: Block,
+        /// Where the error is kept.
+        caught: Caught,
+    },
+    /// Raises the error a [`Stmt::Try`] kept, again (catchable again).
+    Rethrow(Caught),
+    /// Runs `body` once; [`Stmt::Leave`] with its label leaves it.
+    Block(u32, Block),
+    /// Leaves the enclosing [`Stmt::Block`] with this label, through any
+    /// loops in between.
+    Leave(u32),
 }
 
 /// A parameter.
@@ -626,7 +716,11 @@ impl Function {
                 | Builtin::Round
                 | Builtin::Sqrt
                 | Builtin::Pow => Ty::Float,
-                Builtin::ToStr | Builtin::JsonStr | Builtin::Upper | Builtin::Lower => Ty::Str,
+                Builtin::ToStr
+                | Builtin::JsonStr
+                | Builtin::JsonText
+                | Builtin::Upper
+                | Builtin::Lower => Ty::Str,
                 Builtin::ToJson => Ty::Json,
                 Builtin::JsonLength | Builtin::Len | Builtin::IndexOf => Ty::Int,
                 Builtin::Abs | Builtin::NotNull => {
@@ -660,7 +754,10 @@ impl Function {
                 Stmt::Emit(_, f) => f.iter().map(|(_, e)| expr(e)).sum(),
                 Stmt::Throw(e) => expr(&e.message),
                 Stmt::Db(DbOp::Sql { binds, .. }) => binds.iter().map(expr).sum(),
-                Stmt::Break | Stmt::Continue | Stmt::Return => 0,
+                Stmt::Try { body, .. } | Stmt::Block(_, body) => block(body),
+                Stmt::Break | Stmt::Continue | Stmt::Return | Stmt::Rethrow(_) | Stmt::Leave(_) => {
+                    0
+                }
             }
         }
         block(&self.body)
@@ -791,6 +888,20 @@ impl Printer<'_> {
                 let t = format!("throw({}, {})", e.code, self.expr(&e.message));
                 self.line(d, &t);
             }
+            Stmt::Try { body, caught } => {
+                let t = format!("try -> {}", self.f.local_def(caught.flag).name);
+                self.line(d, &t);
+                self.block(body, d + 1);
+            }
+            Stmt::Rethrow(c) => {
+                let t = format!("rethrow {}", self.f.local_def(c.flag).name);
+                self.line(d, &t);
+            }
+            Stmt::Block(l, body) => {
+                self.line(d, &format!("block b{l}"));
+                self.block(body, d + 1);
+            }
+            Stmt::Leave(l) => self.line(d, &format!("leave b{l}")),
             Stmt::Db(DbOp::Sql {
                 stmt, binds, shape, ..
             }) => {
@@ -810,6 +921,27 @@ impl Printer<'_> {
                     SqlShape::Exec { affected } => {
                         format!("{} := db.exec({call})", self.f.local_def(*affected).name)
                     }
+                    SqlShape::Call {
+                        event,
+                        result,
+                        into,
+                    } => {
+                        let names: Vec<&str> = [*event, *result]
+                            .into_iter()
+                            .chain(into.iter().map(|(_, l)| *l))
+                            .map(|l| self.f.local_def(l).name.as_str())
+                            .collect();
+                        format!("({}) := db.call({call})", names.join(", "))
+                    }
+                    SqlShape::Publish {
+                        affected,
+                        max_bytes,
+                        compact,
+                    } => format!(
+                        "{} := db.publish({call}, max {max_bytes}{})",
+                        self.f.local_def(*affected).name,
+                        if *compact { ", compact" } else { "" }
+                    ),
                 };
                 self.line(d, &t);
             }

@@ -17,6 +17,11 @@
 //!   [`PeerHandoff`] is the calling side. A
 //!   gateway of another DC is found in that DC's tier of the one etcd
 //!   (single-etcd mode, like the locator's remote maps).
+//! - `WatchChanges`: a change stream of a tenant homed in this DC, opened
+//!   at a gateway of another DC, served here and relayed there
+//!   ([`crate::http::changes`]).
+//! - `InheritedMembers`: a declarer's `FOR EACH TENANT` change for the
+//!   members this DC indexes ([`crate::inherited::remote`]).
 //!
 //! **Transport.** With `[tls]` in `sprigdb.toml` (the process identity from
 //! the internal CA) the listener requires client certificates signed by
@@ -37,7 +42,8 @@ use sprig_api::proto::internal::gateway_peer_client::GatewayPeerClient;
 use sprig_api::proto::internal::gateway_peer_server::{GatewayPeer, GatewayPeerServer};
 use sprig_api::proto::internal::{
     DrainReply, DrainRequest, ForwardReply, ForwardRequest, HandoffLoginReply, HandoffLoginRequest,
-    KillReply, KillRequest, ListSessionsReply, ListSessionsRequest, SessionRow,
+    InheritedMembersReply, InheritedMembersRequest, KillReply, KillRequest, ListSessionsReply,
+    ListSessionsRequest, SessionRow, WatchChangesEvent, WatchChangesRequest,
 };
 use sprig_auth::handoff::{HandoffResult, HandoffStart, HandoffTarget, PrincipalWire};
 use sprig_common::ids::{ConnId, DcId, TenantId};
@@ -173,6 +179,37 @@ pub trait PeerHost: Send + Sync + 'static {
         HandoffResult::Refused(ErrPacket::from_error(
             Persona::MySql84,
             &SprigError::new(SprigCode::AuthUnavailable, "this gateway decides no logins"),
+        ))
+    }
+    /// Serves a change stream relayed by a gateway of another DC: the
+    /// first message says whether it opened. Hosts without tenant catalogs
+    /// refuse it.
+    async fn watch_changes(
+        &self,
+        req: WatchChangesRequest,
+    ) -> tokio::sync::mpsc::Receiver<WatchChangesEvent> {
+        let _ = req;
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (_, body) = sprig_api::status::to_rest(&SprigError::new(
+            SprigCode::ForwardFailed,
+            "this gateway serves no change streams",
+        ));
+        let _ = tx.try_send(WatchChangesEvent {
+            error_json: serde_json::to_string(&body).unwrap_or_default(),
+            ..WatchChangesEvent::default()
+        });
+        rx
+    }
+    /// Applies a declarer's `FOR EACH TENANT` change to the members this
+    /// DC indexes. Hosts without tenant catalogs refuse it.
+    async fn inherited_members(
+        &self,
+        req: InheritedMembersRequest,
+    ) -> Result<InheritedMembersReply> {
+        let _ = req;
+        Err(SprigError::new(
+            SprigCode::ForwardFailed,
+            "this gateway serves no tenant catalogs",
         ))
     }
 }
@@ -315,6 +352,37 @@ impl GatewayPeer for Service {
             .map_err(|e| tonic::Status::invalid_argument(format!("start_json: {e}")))?;
         let result = self.host.handoff(start, Zeroizing::new(r.password)).await;
         Ok(tonic::Response::new(reply_of(&result)))
+    }
+
+    type WatchChangesStream = std::pin::Pin<
+        Box<
+            dyn futures::Stream<Item = std::result::Result<WatchChangesEvent, tonic::Status>>
+                + Send,
+        >,
+    >;
+
+    async fn watch_changes(
+        &self,
+        req: tonic::Request<WatchChangesRequest>,
+    ) -> std::result::Result<tonic::Response<Self::WatchChangesStream>, tonic::Status> {
+        let rx = self.host.watch_changes(req.into_inner()).await;
+        let events =
+            futures::stream::unfold(
+                rx,
+                |mut rx| async move { rx.recv().await.map(|m| (Ok(m), rx)) },
+            );
+        Ok(tonic::Response::new(Box::pin(events)))
+    }
+
+    async fn inherited_members(
+        &self,
+        req: tonic::Request<InheritedMembersRequest>,
+    ) -> std::result::Result<tonic::Response<InheritedMembersReply>, tonic::Status> {
+        self.host
+            .inherited_members(req.into_inner())
+            .await
+            .map(tonic::Response::new)
+            .map_err(|e| tonic::Status::unavailable(e.to_string()))
     }
 }
 
@@ -603,6 +671,38 @@ impl Peers {
         result_of(&reply)
     }
 
+    /// `WatchChanges` on gateway `rec`: the stream of its messages.
+    ///
+    /// # Errors
+    /// 39788 when it can't be reached.
+    pub async fn watch_changes(
+        &self,
+        rec: &GatewayRecord,
+        req: WatchChangesRequest,
+    ) -> Result<tonic::Streaming<WatchChangesEvent>> {
+        let mut c = self.client(rec)?;
+        Ok(c.watch_changes(req)
+            .await
+            .map_err(|e| unavailable("change stream relay", e))?
+            .into_inner())
+    }
+
+    /// `InheritedMembers` on gateway `rec`.
+    ///
+    /// # Errors
+    /// 39788 when it can't be reached or fails.
+    pub async fn inherited_members(
+        &self,
+        rec: &GatewayRecord,
+        req: InheritedMembersRequest,
+    ) -> Result<InheritedMembersReply> {
+        let mut c = self.client(rec)?;
+        Ok(c.inherited_members(req)
+            .await
+            .map_err(|e| unavailable("inherited members", e))?
+            .into_inner())
+    }
+
     /// Every gateway's sessions (for operators).
     ///
     /// # Errors
@@ -698,6 +798,45 @@ mod tests {
         }
         async fn forwarded(&self, _req: ForwardRequest) -> ForwardReply {
             ForwardReply::default()
+        }
+        /// Opens for database `d`, then one event 6 s later (past the
+        /// peer call timeout); refuses any other database.
+        async fn watch_changes(
+            &self,
+            req: WatchChangesRequest,
+        ) -> tokio::sync::mpsc::Receiver<WatchChangesEvent> {
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            tokio::spawn(async move {
+                if req.database != "d" {
+                    let (_, body) = sprig_api::status::to_rest(&SprigError::standard(
+                        1044,
+                        *b"42000",
+                        "Access denied",
+                    ));
+                    let _ = tx
+                        .send(WatchChangesEvent {
+                            error_json: serde_json::to_string(&body).unwrap(),
+                            ..WatchChangesEvent::default()
+                        })
+                        .await;
+                    return;
+                }
+                let _ = tx
+                    .send(WatchChangesEvent {
+                        opened: true,
+                        ..WatchChangesEvent::default()
+                    })
+                    .await;
+                tokio::time::sleep(CALL_TIMEOUT + Duration::from_secs(1)).await;
+                let _ = tx
+                    .send(WatchChangesEvent {
+                        op: "insert".into(),
+                        resume_token: "t1".into(),
+                        ..WatchChangesEvent::default()
+                    })
+                    .await;
+            });
+            rx
         }
         async fn handoff(
             &self,
@@ -891,6 +1030,62 @@ mod tests {
                 .await
                 .is_err()
         );
+        stop.cancel();
+        let _ = task.await;
+    }
+
+    /// A change stream relayed from another DC outlives the peer call
+    /// timeout; a refusal comes back as the first message; a host without
+    /// tenant catalogs refuses `InheritedMembers`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn change_streams_cross_to_a_gateway_of_the_home_dc() {
+        let mem: Arc<dyn MetaStore> = Arc::new(MemStore::new(Tier::Dc(dc("nyc1"))));
+        let host = Arc::new(Fra1 {
+            sessions: Arc::new(SessionTable::new(Arc::new(SystemClock))),
+            seen: Mutex::new(Vec::new()),
+        });
+        let stop = CancellationToken::new();
+        let (addr, task) = serve(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            Arc::clone(&host) as Arc<dyn PeerHost>,
+            stop.clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let rec = GatewayRecord {
+            gateway_id: "fra1-gw".into(),
+            slot: 1,
+            version: "test".into(),
+            addr: "127.0.0.1".into(),
+            listeners: [("peer".to_owned(), addr.port())].into(),
+            state: registry::GatewayState::Ready,
+            catalog_formats: Vec::new(),
+            authorizers: Vec::new(),
+            load: registry::Load::default(),
+            kafka_host: None,
+        };
+        let peers = Peers::new(Arc::clone(&mem), None);
+        let req = |db: &str| WatchChangesRequest {
+            database: db.into(),
+            ..WatchChangesRequest::default()
+        };
+        let mut s = peers.watch_changes(&rec, req("d")).await.unwrap();
+        assert!(s.message().await.unwrap().unwrap().opened);
+        let t0 = std::time::Instant::now();
+        let ev = s.message().await.unwrap().unwrap();
+        assert_eq!((ev.op.as_str(), ev.resume_token.as_str()), ("insert", "t1"));
+        assert!(t0.elapsed() > CALL_TIMEOUT, "{:?}", t0.elapsed());
+        assert!(s.message().await.unwrap().is_none(), "then the end");
+        let mut s = peers.watch_changes(&rec, req("other")).await.unwrap();
+        let m = s.message().await.unwrap().unwrap();
+        assert!(!m.opened && m.error_json.contains("1044"), "{m:?}");
+        let e = peers
+            .inherited_members(&rec, InheritedMembersRequest::default())
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Some(SprigCode::ForwardFailed));
         stop.cancel();
         let _ = task.await;
     }

@@ -290,6 +290,88 @@ impl Side<'_> {
             None => engine_wrapper_body(&self.spec),
         }
     }
+
+    /// The call entry's statement for this version.
+    fn call(&self) -> String {
+        let Some(e) = &self.entry else {
+            let msg: String = format!(
+                "{} version {} runs in the engine tier, which compiled code can't call",
+                self.spec.name, self.spec.version
+            )
+            .chars()
+            .take(128)
+            .collect();
+            return format!(
+                "SIGNAL SQLSTATE 'HY000' SET MYSQL_ERRNO = {}, MESSAGE_TEXT = {}",
+                SprigCode::LogicEngineUnavailable.number(),
+                quote(&msg)
+            );
+        };
+        let mut args: Vec<String> = wrapper_params(self.spec.func)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        args.push("p__event".to_owned());
+        args.push("p__result".to_owned());
+        format!("CALL {}({})", bq(e), args.join(", "))
+    }
+}
+
+/// A module's call entry, `__sprig_l<module>_call`: what compiled code's
+/// `db.call` calls. It takes the wrapper's parameters and two `OUT`
+/// parameters, the event's name and the result object, returns no result
+/// set and starts no transaction, so it runs inside the caller's. It calls
+/// the version a call of the wrapper would run: the active one, or, in a
+/// staged rollout, the candidate when `condition` (the wrapper's pick)
+/// holds. A version in the engine tier raises 39876.
+#[must_use]
+pub fn call_entry(schema: &str, active: &Side<'_>, candidate: Option<(&Side<'_>, &str)>) -> String {
+    let w = &active.spec;
+    let mut params: Vec<String> = wrapper_params(w.func)
+        .iter()
+        .map(|(n, t)| format!("IN {n} {}", sql_type(*t)))
+        .collect();
+    params.push("OUT p__event VARCHAR(64)".to_owned());
+    params.push("OUT p__result LONGTEXT".to_owned());
+    let comment = match candidate {
+        Some((c, _)) => format!(
+            "sprig logic module {} call entry: version {}, candidate version {}",
+            w.module_id, w.version, c.spec.version
+        ),
+        None => format!(
+            "sprig logic module {} call entry: version {}",
+            w.module_id, w.version
+        ),
+    };
+    let body = match candidate {
+        Some((c, cond)) => format!(
+            "BEGIN\n  IF {cond} THEN\n    {};\n  ELSE\n    {};\n  END IF;\nEND",
+            c.call(),
+            active.call()
+        ),
+        None => format!("BEGIN\n  {};\nEND", active.call()),
+    };
+    format!(
+        "CREATE OR REPLACE PROCEDURE {}.{}({})\n  SQL SECURITY {}\n  COMMENT {}\n{body}",
+        bq(schema),
+        bq(&sprig_logic_compile::link::call_entry(w.module_id)),
+        params.join(", "),
+        if w.definer_security {
+            "DEFINER"
+        } else {
+            "INVOKER"
+        },
+        quote(&comment)
+    )
+}
+
+fn call_entry_routine(schema: &str, side: &Side<'_>) -> Routine {
+    Routine {
+        kind: "PROCEDURE",
+        name: sprig_logic_compile::link::call_entry(side.spec.module_id),
+        sql: call_entry(schema, side, None),
+        oracle: false,
+    }
 }
 
 /// A staged rollout's wrapper ([`crate::rollout`]): one procedure under
@@ -316,7 +398,8 @@ pub fn rollout_wrapper(
     )
 }
 
-/// The plan for a compiled version: its PL/SQL, then the wrapper.
+/// The plan for a compiled version: its PL/SQL, the call entry, then the
+/// wrapper.
 #[must_use]
 pub fn plan_compiled(schema: &str, p: &plsql::Plsql, w: &WrapperSpec<'_>) -> Plan {
     let mut routines = Vec::new();
@@ -340,6 +423,13 @@ pub fn plan_compiled(schema: &str, p: &plsql::Plsql, w: &WrapperSpec<'_>) -> Pla
         sql: qualify(&p.procedure, "PROCEDURE", &p.entry, schema),
         oracle: true,
     });
+    routines.push(call_entry_routine(
+        schema,
+        &Side {
+            spec: w.clone(),
+            entry: Some(p.entry.clone()),
+        },
+    ));
     routines.push(Routine {
         kind: "PROCEDURE",
         name: w.name.to_owned(),
@@ -504,17 +594,27 @@ pub fn plan_select(schema: &str, name: &str, sql: String, definer: &str) -> Plan
     }
 }
 
-/// The plan for an engine-tier version: only its wrapper.
+/// The plan for an engine-tier version: its call entry (which raises
+/// 39876) and its wrapper.
 #[must_use]
 pub fn plan_engine(schema: &str, w: &WrapperSpec<'_>) -> Plan {
     Plan {
         schema: schema.to_owned(),
-        routines: vec![Routine {
-            kind: "PROCEDURE",
-            name: w.name.to_owned(),
-            sql: engine_wrapper(w, schema),
-            oracle: false,
-        }],
+        routines: vec![
+            call_entry_routine(
+                schema,
+                &Side {
+                    spec: w.clone(),
+                    entry: None,
+                },
+            ),
+            Routine {
+                kind: "PROCEDURE",
+                name: w.name.to_owned(),
+                sql: engine_wrapper(w, schema),
+                oracle: false,
+            },
+        ],
         definer: None,
     }
 }

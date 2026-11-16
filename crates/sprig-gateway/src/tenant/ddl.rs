@@ -30,6 +30,7 @@ use std::sync::Arc;
 use sprig_catalog::ddl::{
     DdlExecutor, Effect, MariaExecutor, PhysicalDdl, PhysicalObject, SchemaInfo, ShardTarget,
 };
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::{DatabaseRow, ObjectKind};
 use sprig_common::ids::{ClusterId, TenantId};
 use sprig_common::names::SchemaName;
@@ -369,7 +370,7 @@ async fn verify_definer_on(pool: &mysql_async::Pool, stmt: &PhysicalDdl, want: &
         _ => return Ok(()),
     };
     let schema = stmt.schema.to_string();
-    let mut c = pool.get_conn().await.map_err(|e| {
+    let mut c = pool.get_conn_bounded().await.map_err(|e| {
         SprigError::new(SprigCode::BackendUnavailable, "sprig_ctl unreachable").with_source(e)
     })?;
     let got: Option<String> = c

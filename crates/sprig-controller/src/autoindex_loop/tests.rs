@@ -737,3 +737,138 @@ async fn a_stuck_pass_gives_up_at_its_limit() {
     b.expired().await;
     assert_eq!(t1.elapsed(), Duration::from_secs(10));
 }
+
+/// A tenant with no table read in the last hour and no user index to
+/// judge isn't brought back every `user_every`: its pass asks for the
+/// longest requeue. With reads, it comes back every `user_every`. Live:
+/// `SPRIG_TEST_MARIADB_SINGLE`, in schema `__sprig_test_idle_loop_<pid>`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idle_tenant_comes_back_at_the_longest_requeue() {
+    struct Idle {
+        url: String,
+        schema: String,
+    }
+
+    #[async_trait::async_trait]
+    impl AutoIndexEnv for Idle {
+        async fn catalog(&self, _t: TenantId) -> Result<(Conn, AutoIndexStore)> {
+            let c = Conn::new(Opts::from_url(&self.url).unwrap()).await.unwrap();
+            Ok((c, AutoIndexStore::new(&self.schema)))
+        }
+        async fn objects(
+            &self,
+            _t: TenantId,
+            _o: &BTreeSet<ObjectId>,
+        ) -> Result<BTreeMap<ObjectId, ObjectEnv>> {
+            Ok(BTreeMap::new())
+        }
+        async fn external_builds(&self, _c: &ClusterId) -> Result<u32> {
+            Ok(0)
+        }
+    }
+
+    /// Tables read in the last hour: `OBJECT` or none.
+    struct Reads(bool);
+
+    #[async_trait::async_trait]
+    impl WorkloadSource for Reads {
+        async fn latency(
+            &self,
+            _t: TenantId,
+            _o: ObjectId,
+            _s: SystemTime,
+            _u: SystemTime,
+        ) -> Result<Option<BTreeMap<Fingerprint, FpLatency>>> {
+            Ok(None)
+        }
+        async fn samples(
+            &self,
+            _t: TenantId,
+            _o: ObjectId,
+            _n: usize,
+            _since: SystemTime,
+        ) -> Result<Option<Vec<UsageSample>>> {
+            Ok(None)
+        }
+        async fn objects_read(
+            &self,
+            _t: TenantId,
+            _since: SystemTime,
+            _until: SystemTime,
+        ) -> Result<Option<BTreeSet<ObjectId>>> {
+            Ok(Some(if self.0 {
+                [OBJECT].into()
+            } else {
+                BTreeSet::new()
+            }))
+        }
+    }
+
+    let Some(url) = std::env::var("SPRIG_TEST_MARIADB_SINGLE")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    else {
+        eprintln!("skipped: set SPRIG_TEST_MARIADB_SINGLE to run it");
+        return;
+    };
+    let schema = format!("__sprig_test_idle_loop_{}", std::process::id());
+    let mut c = Conn::new(Opts::from_url(&url).unwrap()).await.unwrap();
+    c.query_drop(format!("DROP DATABASE IF EXISTS {}", quote(&schema)))
+        .await
+        .unwrap();
+    c.query_drop(format!("CREATE DATABASE {}", quote(&schema)))
+        .await
+        .unwrap();
+    c.query_drop(format!("USE {}", quote(&schema)))
+        .await
+        .unwrap();
+    for ddl in [
+        DDL_AUTO_INDEXES,
+        DDL_CANDIDATES,
+        DDL_VALIDATIONS,
+        DDL_INDEX_ORIGINS,
+        sprig_advisor::autoindex::store::DDL_INDEX_USAGE,
+    ] {
+        c.query_drop(ddl).await.unwrap();
+    }
+    let r = std::panic::AssertUnwindSafe(async {
+        let env = Idle {
+            url: url.clone(),
+            schema: schema.clone(),
+        };
+        let hooks = |reads: bool| AutoIndexHooks {
+            candidates: Arc::new(NoCandidates),
+            validation: Arc::new(AcceptAll),
+            workload: Arc::new(Reads(reads)),
+            locks: Arc::new(NoMover),
+            mover: None,
+            marker: Arc::new(NoMarker),
+            decisions: Arc::new(LogDecisions),
+            docs: None,
+        };
+        let cadence = Cadence::default();
+        let slots = LocalSlots::new();
+        let mut mem = Memory::default();
+        let now = SystemTime::now();
+        let rep = tenant_pass(&env, &hooks(false), &slots, TENANT, now, &mut mem, &cadence)
+            .await
+            .unwrap();
+        assert!(rep.errors.is_empty(), "{:?}", rep.errors);
+        assert_eq!(rep.next_in, cadence.max_requeue, "an idle tenant");
+        mem.last_user = None;
+        let rep = tenant_pass(&env, &hooks(true), &slots, TENANT, now, &mut mem, &cadence)
+            .await
+            .unwrap();
+        assert!(rep.errors.is_empty(), "{:?}", rep.errors);
+        assert_eq!(rep.next_in, cadence.user_every, "a tenant with reads");
+    })
+    .catch_unwind()
+    .await;
+    c.query_drop(format!("DROP DATABASE IF EXISTS {}", quote(&schema)))
+        .await
+        .unwrap();
+    let _ = c.disconnect().await;
+    if let Err(p) = r {
+        std::panic::resume_unwind(p);
+    }
+}

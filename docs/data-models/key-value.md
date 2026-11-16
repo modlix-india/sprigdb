@@ -89,6 +89,7 @@ These commands are built. Each takes Redis 7.2's options.
 | Blocking | `BLPOP`, `BRPOP`, `BLMOVE`, `BRPOPLPUSH`, `BLMPOP`, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP` |
 | Transactions | `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH` |
 | Scripting | `EVAL`, `EVALSHA`, `EVAL_RO`, `EVALSHA_RO`, `SCRIPT` (`LOAD`, `EXISTS`, `FLUSH`, `KILL`), `FUNCTION` (`LOAD`, `DELETE`, `FLUSH`, `LIST`, `STATS`, `KILL`), `FCALL`, `FCALL_RO` |
+| Search | `FT.CREATE`, `FT.ALTER`, `FT.DROPINDEX`, `FT.SEARCH`, `FT.AGGREGATE`, `FT.INFO`, `FT._LIST`, `FT.EXPLAIN`, `FT.EXPLAINCLI`, `FT.TAGVALS`, on hashes; see [Search (`FT.*`)](../connect/redis.md#search-ft) |
 | Pub/sub | `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `SSUBSCRIBE`, `SUNSUBSCRIBE`, `PUBLISH`, `SPUBLISH`, `PUBSUB` (`CHANNELS`, `NUMSUB`, `NUMPAT`, `SHARDCHANNELS`, `SHARDNUMSUB`) |
 | Connection | `PING`, `ECHO`, `QUIT`, `RESET`, `SELECT`, `HELLO`, `AUTH`, `CLIENT` (`ID`, `SETNAME`, `GETNAME`, `INFO`, `LIST`, `SETINFO`, `NO-EVICT`, `NO-TOUCH`, `REPLY ON`, `UNBLOCK`, `GETREDIR`, `TRACKINGINFO`) |
 | Server | `INFO`, `TIME`, `COMMAND`, `CONFIG`, `ACL`, `ROLE`, `CLUSTER`, `SLOWLOG`, `LATENCY`, `MEMORY`, `LASTSAVE`, `LOLWUT`, `READONLY`, `READWRITE`, `ASKING`, `WAIT`, `WAITAOF`; `SAVE`, `BGSAVE` and `BGREWRITEAOF` succeed and do nothing |
@@ -304,6 +305,15 @@ Keys and key prefixes are primary-key lookups, and sorted sets have a score inde
 
 Each such index costs every write of the namespace.
 
+To find keys by the words in their values, or hashes by their fields, create a [search index](search.md#collections-and-key-value-namespaces) on the namespace: `VALUE` fields index string values, and `VALUE FIELD 'name'` fields index hash fields, optionally only under some key `prefixes`. From Redis, `FT.CREATE` makes the same kind of index; see [Search (`FT.*`)](../connect/redis.md#search-ft).
+
+```sql
+CREATE SEARCH INDEX customer_hash ON redis.db0 (
+  VALUE FIELD 'name' TEXT,
+  VALUE FIELD 'city' KEYWORD WITH (separator = ',', filter = true)
+) WITH (prefixes = ('customer:'));
+```
+
 ## Limits
 
 | Limit | Value | Error |
@@ -347,6 +357,8 @@ SprigDB presents itself as one standalone server (`HELLO` reports `mode` `standa
 | `SWAPDB`, `MONITOR`, `CLIENT REPLY OFF` | `SPRIG REDIS_UNSUPPORTED 39840` |
 | `SCRIPT DEBUG` | `SPRIG REDIS_LUA_UNSUPPORTED 39841` |
 | `DUMP`, `RESTORE`, `MIGRATE`, `FUNCTION DUMP`, `FUNCTION RESTORE`, `DEBUG`, `SHUTDOWN`, `REPLICAOF`, `SLAVEOF`, `SYNC`, `PSYNC`, `FAILOVER`, `MODULE`, `CLIENT KILL`, `CLIENT PAUSE`, `CLIENT TRACKING` | `SPRIG REDIS_RESTRICTED 39842`: manage SprigDB through SQL, the API or `sprigctl` |
+| `FT.PROFILE`, `FT.CURSOR`, `FT.CONFIG`, and the alias, spelling, dictionary, synonym and suggestion `FT.*` commands | `SPRIG REDIS_RESTRICTED 39842`. Unsupported options of the other `FT.*` commands answer `SPRIG SEARCH_UNSUPPORTED 39823`; see [Search (`FT.*`)](../connect/redis.md#search-ft) |
+| `JSON.*` (RedisJSON) | Unknown command |
 | Lua libraries `cmsgpack`, `bit`, `struct` | not loaded |
 | Eviction of keys to free memory | not offered |
 | Key-value API: transactions over several keys, value filters in `Scan` | use `Exec` with a script, or SQL |

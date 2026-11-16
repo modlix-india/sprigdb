@@ -27,6 +27,7 @@ use mysql_async::prelude::Queryable;
 use sprig_auth::authz::{Action, Target};
 use sprig_catalog::CatalogLocator;
 use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::ObjectKind;
 use sprig_common::ids::ClusterId;
 use sprig_common::names::SchemaName;
@@ -410,7 +411,7 @@ impl PassSession {
             let ep = svc.locator.writer(tenant).await?;
             let mut conn = ep
                 .pool
-                .get_conn()
+                .get_conn_bounded()
                 .await
                 .map_err(sprig_streams::maria::map_err)?;
             if let Err(e) = conn.query_drop(&call).await {
@@ -493,7 +494,7 @@ impl PassSession {
             .ok_or_else(|| SprigError::internal("no tenant"))?;
         let pool = ts.services().locator.ctl_pool(cluster).await?;
         let mut conn = pool
-            .get_conn()
+            .get_conn_bounded()
             .await
             .map_err(sprig_streams::maria::map_err)?;
         for s in offsets::grant_sql(schema, tenant, user) {

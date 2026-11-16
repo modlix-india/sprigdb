@@ -542,7 +542,10 @@ impl SqlEngine {
             tls: caller.tls.clone(),
             principal: Some(caller.principal.clone()),
             scram: None,
-            oidc: None,
+            // `SPRIG_CLAIM()` and the token's roles, as for a SQL call: the
+            // verified bearer token's claims (Basic and API keys have none).
+            oidc: super::studio::session_claims(caller.authorization.as_deref())
+                .map(|c| crate::mongo::conn::OidcState::logged_in(Arc::new(c))),
             client_meta: None,
             compressors: Vec::new(),
             sql: None,

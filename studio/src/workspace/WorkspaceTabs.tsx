@@ -7,6 +7,7 @@ import {
   Eye,
   GitFork,
   KeyRound,
+  LayoutDashboard,
   Plus,
   Send,
   Settings,
@@ -19,6 +20,8 @@ import {
   Zap,
   ShardIcon,
   SproutIcon,
+  BookOpen,
+  Sparkles,
 } from '../icons';
 import { closeDoc, describe, openDoc, syncQueryTabs, resetForTenant, useWorkspace, type DocKind } from './store';
 
@@ -40,6 +43,9 @@ export const DOC_ICON: Record<DocKind, ComponentType<{ size?: number }>> = {
   access: Shield,
   security: Shield,
   settings: Settings,
+  docs: BookOpen,
+  assistant: Sparkles,
+  dashboard: LayoutDashboard,
 };
 
 /** The tenant-relative part of the current path. */

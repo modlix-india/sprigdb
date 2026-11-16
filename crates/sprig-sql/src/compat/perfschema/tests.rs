@@ -332,14 +332,23 @@ fn statement_digests() {
     let sql =
         rw("SELECT DIGEST, COUNT_STAR FROM performance_schema.events_statements_summary_by_digest");
     for want in [
-        "CAST('shop' AS CHAR(64)) AS `SCHEMA_NAME`",
-        "CAST('00ab00cd00ef0011' AS CHAR(64)) AS `DIGEST`",
-        "CAST(4 AS UNSIGNED) AS `COUNT_STAR`",
-        "CAST(1000000000 AS UNSIGNED) AS `SUM_TIMER_WAIT`",
-        "CAST(250000000 AS UNSIGNED) AS `AVG_TIMER_WAIT`",
+        "CAST(`_sprig_dg`.`s` AS CHAR(64)) AS `SCHEMA_NAME`",
+        "CAST(`_sprig_dg`.`d` AS CHAR(64)) AS `DIGEST`",
+        "CAST(`_sprig_dg`.`n` AS UNSIGNED) AS `COUNT_STAR`",
+        "CAST(`_sprig_dg`.`su` AS UNSIGNED) AS `SUM_TIMER_WAIT`",
+        "CAST(`_sprig_dg`.`av` AS UNSIGNED) AS `AVG_TIMER_WAIT`",
         "CAST(0 AS UNSIGNED) AS `SUM_LOCK_TIME`",
-        "CAST(FROM_UNIXTIME(1700000000.000001) AS DATETIME(6)) AS `FIRST_SEEN`",
+        "CAST(FROM_UNIXTIME(`_sprig_dg`.`fs`) AS DATETIME(6)) AS `FIRST_SEEN`",
         "CAST(NULL AS CHAR(65535)) AS `QUERY_SAMPLE_TEXT`",
+        // The values, in one JSON literal.
+        "JSON_TABLE('[{",
+        "\"s\":\"shop\"",
+        "\"d\":\"00ab00cd00ef0011\"",
+        "\"n\":4",
+        "\"su\":1000000000",
+        "\"av\":250000000",
+        "\"fs\":\"1700000000.000001\"",
+        "fs DECIMAL(20,6) PATH '$.fs'",
     ] {
         assert!(sql.contains(want), "{want} in {sql}");
     }
@@ -351,11 +360,14 @@ fn statement_digests() {
     );
     let xa = rw("SELECT * FROM sys.x$statement_analysis");
     assert!(
-        xa.contains("CAST(1000000000 AS UNSIGNED) AS `total_latency`"),
+        xa.contains("CAST(`_sprig_dg`.`su` AS UNSIGNED) AS `total_latency`"),
         "{xa}"
     );
     let ew = rw("SELECT * FROM sys.statements_with_errors_or_warnings");
-    assert!(ew.contains("ROUND(100 * 1 / 4, 4)"), "{ew}");
+    assert!(
+        ew.contains("ROUND(100 * `_sprig_dg`.`e` / `_sprig_dg`.`n`, 4)"),
+        "{ew}"
+    );
     // No digests: the empty table, as before.
     let none = String::from_utf8(
         rewrite(
@@ -406,4 +418,50 @@ fn show_tables_in_the_system_schemas() {
     );
     assert!(rw("SHOW TABLES", Some("shop")).is_none());
     assert!(rw("SHOW TABLES FROM performance_schema WHERE 1", None).is_none());
+}
+
+#[test]
+fn digests_stay_one_literal_and_are_capped() {
+    // Ten thousand and one digests, one with a long text: the statement
+    // holds MySQL's 10,000 most recent, as one JSON literal, and the long
+    // text is cut at a space within 1,024 bytes.
+    let v = vars();
+    let long = format!("SELECT {}", vec!["a_column_name"; 200].join(" , "));
+    let d: Vec<PsDigest> = (0..10_001u64)
+        .map(|i| PsDigest {
+            schema: Some("shop".to_owned()),
+            digest: format!("{i:016x}"),
+            text: if i == 10_000 {
+                long.clone()
+            } else {
+                format!("SELECT {i}")
+            },
+            count: 1,
+            last_seen_us: 1_700_000_000_000_000 + i,
+            ..PsDigest::default()
+        })
+        .collect();
+    let s = PsSession {
+        digests: &d,
+        ..session(&v, &[], None)
+    };
+    let sql = String::from_utf8(
+        rewrite(
+            b"SELECT COUNT(*) FROM performance_schema.events_statements_summary_by_digest",
+            &LexOptions::mysql84(),
+            &s,
+        )
+        .unwrap()
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sql.matches("JSON_TABLE(").count(), 1);
+    assert!(!sql.contains("UNION ALL"));
+    // The oldest (digest 0) is the one left out.
+    assert!(!sql.contains("\"d\":\"0000000000000000\""));
+    assert!(sql.contains("\"d\":\"0000000000000001\""));
+    let t = sql.split("\"t\":\"SELECT a_column_name").nth(1).unwrap();
+    let text_len = "SELECT a_column_name".len() + t.find('"').unwrap();
+    assert!(text_len <= 1024 && text_len > 1000, "{text_len}");
+    assert!(sql.len() < 2_000_000, "{}", sql.len());
 }

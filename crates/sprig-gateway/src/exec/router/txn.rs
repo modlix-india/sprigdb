@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use sprig_auth::BackendTarget;
 use sprig_catalog::TenantCatalog;
+use sprig_cluster::failover::relay::RelayLease;
 use sprig_common::ids::ClusterId;
+use sprig_txn::fence::wire::HolderCall;
 use sprig_txn::mysql::{MyAdmin, MyCluster};
 use sprig_txn::{
     ClusterAdmin, ClusterCaps, DbError, DbResult, Decision, DecisionRow, Dtid, TxnBackend, Xid,
@@ -39,6 +41,11 @@ pub(crate) struct GwTxn {
     pub(super) admin: Arc<GwAdmin>,
     pub(super) svc: Arc<TenantServices>,
     pub(super) cat: Mutex<Option<Arc<TenantCatalog>>>,
+    /// Sprig 2PC's relay path: the tenant named in relay preambles.
+    pub(super) relay: Arc<Mutex<Option<sprig_common::ids::TenantId>>>,
+    /// Clusters whose branch connections went through a ready relay
+    /// writer, with its lease (where the holder calls go).
+    pub(super) relayed: Arc<Mutex<HashMap<ClusterId, RelayLease>>>,
 }
 
 impl std::fmt::Debug for GwTxn {
@@ -116,18 +123,291 @@ impl TxnBackend for GwTxn {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        Ok(session_on(
+        let mut bs = session_on(
             &self.backends,
             &self.target,
             &self.opts,
             &self.main,
             cluster,
             &vars,
-        ))
+        );
+        bs.set_txn_branch();
+        let relay = *self.relay.lock().unwrap_or_else(PoisonError::into_inner);
+        bs.set_relay(relay);
+        if relay.is_none() {
+            self.relayed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(cluster);
+        } else {
+            // The relay path holds branches only where a ready relay
+            // writer fences them; elsewhere a second writer without XA is
+            // refused (39440), as under `reject`.
+            let ready = bs
+                .relay_ready(cluster)
+                .await
+                .map_err(|e| DbError::new(0, e.to_string()))?;
+            let mut m = self.relayed.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(l) = ready {
+                m.insert(cluster.clone(), l);
+            } else {
+                m.remove(cluster);
+                bs.forbid_redo();
+            }
+        }
+        Ok(bs)
     }
 
+    // The coordinator keeps the admin it gets at first; the relay path
+    // may be switched on later, so the wrapper decides per call.
     fn admin(&self) -> Arc<dyn ClusterAdmin> {
-        self.admin.clone()
+        Arc::new(RelayAdmin {
+            inner: Arc::clone(&self.admin),
+            relayed: Arc::clone(&self.relayed),
+            relay: Arc::clone(&self.relay),
+        })
+    }
+
+    fn relay_fenced(&self, cluster: &ClusterId) -> bool {
+        self.relay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+            && self
+                .relayed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(cluster)
+    }
+}
+
+/// The admin of a session on Sprig 2PC's relay path: on clusters whose
+/// branches went through a relay writer, a held branch's prepare, finish
+/// and abandon go to that writer's agent, which registers the holder
+/// before its redo rows exist; everything else is [`GwAdmin`]'s.
+struct RelayAdmin {
+    inner: Arc<GwAdmin>,
+    relayed: Arc<Mutex<HashMap<ClusterId, RelayLease>>>,
+    relay: Arc<Mutex<Option<sprig_common::ids::TenantId>>>,
+}
+
+impl RelayAdmin {
+    fn tenant(&self) -> sprig_common::ids::TenantId {
+        self.relay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .unwrap_or(sprig_common::ids::TenantId(0))
+    }
+
+    fn agent(&self, c: &ClusterId) -> Option<String> {
+        self.relay
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()?;
+        self.relayed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(c)
+            .map(|l| l.internal_url.clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl ClusterAdmin for RelayAdmin {
+    async fn xa_recover(&self, c: &ClusterId) -> DbResult<Vec<Xid>> {
+        self.inner.xa_recover(c).await
+    }
+    async fn ensure_redo(&self, c: &ClusterId, schema: &str) -> DbResult<()> {
+        self.inner.ensure_redo(c, schema).await
+    }
+    async fn insert_redo(
+        &self,
+        c: &ClusterId,
+        schema: &str,
+        dtid: Dtid,
+        gtrid: &sprig_txn::Gtrid,
+        stmts: &[sprig_txn::RedoStmt],
+    ) -> DbResult<()> {
+        self.inner.insert_redo(c, schema, dtid, gtrid, stmts).await
+    }
+    async fn insert_redo_held(
+        &self,
+        c: &ClusterId,
+        schema: &str,
+        dtid: Dtid,
+        gtrid: &sprig_txn::Gtrid,
+        stmts: &[sprig_txn::RedoStmt],
+        holder: u64,
+    ) -> DbResult<()> {
+        match self.agent(c) {
+            Some(url) => {
+                let call = HolderCall::Prepare {
+                    tenant: gtrid.tenant,
+                    thread: holder,
+                    schema: schema.to_owned(),
+                    dtid,
+                    gtrid: *gtrid,
+                    stmts: stmts.to_vec(),
+                };
+                crate::backend::relay_calls::call(&url, &call).await
+            }
+            None => self.inner.insert_redo(c, schema, dtid, gtrid, stmts).await,
+        }
+    }
+    async fn abandon_held(
+        &self,
+        c: &ClusterId,
+        _schema: &str,
+        dtid: Dtid,
+        holder: u64,
+    ) -> DbResult<()> {
+        match self.agent(c) {
+            Some(url) => {
+                let call = HolderCall::Abandon {
+                    tenant: self.tenant(),
+                    thread: holder,
+                    dtid,
+                };
+                crate::backend::relay_calls::call(&url, &call).await
+            }
+            None => Ok(()),
+        }
+    }
+    async fn redo_branches(&self, c: &ClusterId) -> DbResult<Vec<sprig_txn::RedoBranch>> {
+        self.inner.redo_branches(c).await
+    }
+    async fn replay_redo(
+        &self,
+        c: &ClusterId,
+        schema: &str,
+        dtid: Dtid,
+    ) -> DbResult<sprig_txn::Replay> {
+        self.inner.replay_redo(c, schema, dtid).await
+    }
+    async fn delete_redo(&self, c: &ClusterId, schema: &str, dtid: Dtid) -> DbResult<()> {
+        match self.agent(c) {
+            Some(url) => {
+                let call = HolderCall::Finished {
+                    schema: schema.to_owned(),
+                    dtid,
+                };
+                crate::backend::relay_calls::call(&url, &call).await
+            }
+            None => self.inner.delete_redo(c, schema, dtid).await,
+        }
+    }
+    async fn xa_finish(&self, c: &ClusterId, xid: &Xid, commit: bool) -> DbResult<()> {
+        self.inner.xa_finish(c, xid, commit).await
+    }
+    async fn kill(&self, c: &ClusterId, thread: u64) -> DbResult<()> {
+        self.inner.kill(c, thread).await
+    }
+    async fn insert_decision(
+        &self,
+        c: &ClusterId,
+        schema: &str,
+        row: &DecisionRow,
+    ) -> DbResult<()> {
+        self.inner.insert_decision(c, schema, row).await
+    }
+    async fn read_decision(
+        &self,
+        c: &ClusterId,
+        schema: &str,
+        dtid: Dtid,
+    ) -> DbResult<Option<DecisionRow>> {
+        self.inner.read_decision(c, schema, dtid).await
+    }
+    async fn settle_pending(
+        &self,
+        c: &ClusterId,
+        schema: &str,
+        dtid: Dtid,
+        o: Decision,
+    ) -> DbResult<()> {
+        self.inner.settle_pending(c, schema, dtid, o).await
+    }
+    async fn decision_rows(&self, c: &ClusterId) -> DbResult<Vec<(String, DecisionRow)>> {
+        self.inner.decision_rows(c).await
+    }
+    async fn delete_decision(&self, c: &ClusterId, schema: &str, dtid: Dtid) -> DbResult<()> {
+        self.inner.delete_decision(c, schema, dtid).await
+    }
+}
+
+/// Crash tests of a deployment: `SPRIGDB_TEST_TXN_PAUSE=<step>:<n>:<dir>`
+/// stops one distributed transaction in `n` at the coordinator's `<step>`
+/// (`before_prepare`, `prepared`, `commit_point`, `phase2_branch`): it
+/// writes `<dir>/pause-<pid>-<dtid>` naming the step and waits until the
+/// file is gone (at most 30 s), so the test can `kill -9` a process at that
+/// moment. Unset in production.
+pub(crate) fn pause_hooks() -> Option<Arc<dyn sprig_txn::TxnHooks>> {
+    static HOOKS: std::sync::OnceLock<Option<Arc<dyn sprig_txn::TxnHooks>>> =
+        std::sync::OnceLock::new();
+    HOOKS
+        .get_or_init(|| {
+            let v = std::env::var("SPRIGDB_TEST_TXN_PAUSE").ok()?;
+            let mut it = v.splitn(3, ':');
+            let step = it.next()?.to_owned();
+            let every: u64 = it.next()?.parse().ok()?;
+            let dir = std::path::PathBuf::from(it.next()?);
+            tracing::warn!(%step, every, dir = %dir.display(), "SPRIGDB_TEST_TXN_PAUSE is set: crash-test pauses on");
+            Some(Arc::new(PauseHooks {
+                step,
+                every: every.max(1),
+                dir,
+                seen: std::sync::atomic::AtomicU64::new(0),
+            }) as Arc<dyn sprig_txn::TxnHooks>)
+        })
+        .clone()
+}
+
+struct PauseHooks {
+    step: String,
+    every: u64,
+    dir: std::path::PathBuf,
+    seen: std::sync::atomic::AtomicU64,
+}
+
+fn step_name(p: sprig_txn::Point) -> &'static str {
+    use sprig_txn::Point;
+    match p {
+        Point::BranchOpened => "branch_opened",
+        Point::BeforePrepare => "before_prepare",
+        Point::Prepared => "prepared",
+        Point::PendingRecorded => "pending_recorded",
+        Point::BeforeCommitPoint => "before_commit_point",
+        Point::CommitPoint => "commit_point",
+        Point::Phase2Branch => "phase2_branch",
+        Point::Finished => "finished",
+    }
+}
+
+#[async_trait::async_trait]
+impl sprig_txn::TxnHooks for PauseHooks {
+    async fn at(&self, dtid: Option<Dtid>, p: sprig_txn::Point) {
+        if step_name(p) != self.step {
+            return;
+        }
+        let n = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if !(n + 1).is_multiple_of(self.every) {
+            return;
+        }
+        let name = format!(
+            "pause-{}-{}",
+            std::process::id(),
+            dtid.map_or_else(|| format!("n{n}"), |d| d.to_string())
+        );
+        let path = self.dir.join(name);
+        if std::fs::write(&path, self.step.as_bytes()).is_err() {
+            return;
+        }
+        tracing::warn!(step = %self.step, file = %path.display(), "crash-test pause");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while path.exists() && std::time::Instant::now() < until {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }
 

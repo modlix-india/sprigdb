@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use sprig_catalog::CatalogLocator;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_logic::rollout::{self, Acc, Rollout};
 
 use super::PassSession;
@@ -109,7 +110,7 @@ impl PassSession {
         let svc = Arc::clone(ts.services());
         let loaded = async {
             let ep = svc.locator.writer(tenant).await.ok()?;
-            let mut conn = ep.pool.get_conn().await.ok()?;
+            let mut conn = ep.pool.get_conn_bounded().await.ok()?;
             rollout::all(&mut conn, ep.store.schema()).await.ok()
         }
         .await;
@@ -216,7 +217,7 @@ impl PassSession {
         let tenant = ts.tenant;
         let catalog = ts.catalog().cloned();
         let ep = svc.locator.writer(tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(|e| {
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
             sprig_common::SprigError::new(
                 sprig_common::SprigCode::CatalogUnavailable,
                 "catalog unreachable",
@@ -289,7 +290,7 @@ impl PassSession {
                     ),
                 ),
             };
-            if let Ok(mut conn) = ep.pool.get_conn().await {
+            if let Ok(mut conn) = ep.pool.get_conn_bounded().await {
                 let _ = store
                     .log(
                         &mut conn,

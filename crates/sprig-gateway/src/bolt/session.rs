@@ -968,6 +968,11 @@ impl GwSession {
         let settings = &self.graphs.svc.settings;
         let mut budgets =
             sprig_graph::settings::budgets(&|s| settings.get(s, &ctx, Some(&cat.settings)));
+        budgets.tier = sprig_graph::exec::TraversalTier::parse(&settings.get(
+            &sprig_graph::settings::TRAVERSAL_TIER,
+            &ctx,
+            Some(&cat.settings),
+        ));
         let timeout = match &self.tx {
             Some(t) => t.timeout,
             None => timeout_of(extra),

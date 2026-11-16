@@ -73,6 +73,7 @@ use sprig_common::time::{Clock, SystemClock};
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_meta::{Cmp, Consistency, Key, Leadership, MetaStore, Op, Record, Txn, Versioned};
 
+use crate::pool_wait::Bounded as _;
 use crate::sql::{map_err, timed};
 use crate::store::{CatalogLocator, PurgeReport, Snapshot, Store};
 
@@ -959,7 +960,7 @@ impl VersionBackend for MariaBackend {
         let ep = self.locator.writer(tenant).await?;
         let mut tx = timed(self.opts.statement_timeout, "begin", async {
             ep.pool
-                .start_transaction(TxOpts::default())
+                .start_transaction_bounded(TxOpts::default())
                 .await
                 .map_err(map_err)
         })

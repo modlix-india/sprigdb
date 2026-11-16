@@ -96,6 +96,7 @@ Schema changes go through SprigDB's catalog, so every gateway sees a new definit
 - On a sharded table, a change runs on every shard, all or nothing: a shard that refuses it rolls back the shards already changed. A change that removed data and then fails on a shard is finished later by SprigDB (39480 `ER_SPRIG_DDL_FAILED`). If the shards already disagree on the table's definition, the change is refused with 39483 `ER_SPRIG_DDL_SHARD_DRIFT`.
 - One statement may not change tables of different table groups, or a sharded table and another database (39481 `ER_SPRIG_DDL_UNSUPPORTED`): run it once per table.
 - DDL inside a transaction commits it first, as in MySQL.
+- A DDL statement that names a table another DDL statement is still changing waits up to `catalog.ddl_wait_ms` (10000; tenant, data centre or global) for it, then fails with 39071 `ER_SPRIG_CATALOG_CONFLICT`, which is safe to retry.
 - Views and stored programs get your own account as `DEFINER` unless you name another account, which needs `SET_ANY_DEFINER`; see [Definers](tenants-and-accounts.md#definers).
 - A DDL statement of a shape the catalog can't handle fails with 39051.
 
@@ -108,6 +109,19 @@ Every SprigDB table is InnoDB: Galera replicates only InnoDB, and tables are mov
 | `MyISAM`, `MEMORY` (`HEAP`), `Aria`, `CSV`, `ARCHIVE` | `CREATE TABLE` makes an InnoDB table. On 3306: warnings 3161 (`Storage engine MyISAM is disabled (Table creation is disallowed).`) and 1266 (`Using storage engine InnoDB for table 't'`), as MySQL 8.4 does. On 3307: note 1266, as MariaDB does with `enforce_storage_engine=InnoDB` | The statement fails: 3161 on 3306, 1290 on 3307 |
 | `MRG_MYISAM`, `BLACKHOLE`, `FEDERATED`, `Columnstore`, `SPIDER`, `CONNECT`, `S3`, `SEQUENCE` and other engines that don't keep their rows in InnoDB | Always fails: 3161 on 3306, 1286 on 3307 | The same |
 | `InnoDB`, or a name neither server knows | Passed to MariaDB, which answers as usual (1286 for an unknown engine) | The same |
+
+On 3306:
+
+```sql test
+CREATE TABLE legacy_log (id INT PRIMARY KEY, line TEXT) ENGINE=MyISAM;
+SHOW WARNINGS;
+```
+
+```text output
+Level	Code	Message
+Warning	3161	Storage engine MyISAM is disabled (Table creation is disallowed).
+Warning	1266	Using storage engine InnoDB for table 'legacy_log'
+```
 
 - `ALTER TABLE ... ENGINE=MyISAM` on 3306 leaves the table as it is, with MySQL's warning 1286 (`Unknown storage engine 'MyISAM'`); on 3307 it becomes `ENGINE=InnoDB` with note 1266.
 - A `CREATE TABLE` without `ENGINE` uses the session's `default_storage_engine`, with the same rules.

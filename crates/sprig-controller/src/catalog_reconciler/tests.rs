@@ -100,6 +100,7 @@ impl Env {
             current_db: Some("billing"),
             user: None,
             lower_case_table_names: false,
+            wait: None,
         }
     }
 

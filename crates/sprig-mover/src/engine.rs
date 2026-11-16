@@ -43,8 +43,9 @@ const SAVE_EVERY: Duration = Duration::from_secs(2);
 const POS_COMMIT_EVERY: Duration = Duration::from_secs(1);
 /// Items buffered between the stream reader and the apply lane.
 const STREAM_BUFFER: usize = 256;
-/// Consecutive failures before a job gives up and rolls back.
-const MAX_FAILURES: u32 = 200;
+/// Failures in a row a job always retries, however short
+/// `mover.max_pause_minutes` is.
+const MIN_FAILURES: u32 = 3;
 /// How often a `Continuous` job records its source's triggers and events
 /// on its target.
 const RECORD_OBJECTS_EVERY: Duration = Duration::from_secs(30);
@@ -139,6 +140,8 @@ pub struct Engine {
     /// The last commit of the applied position on the target.
     last_commit: Instant,
     failures: u32,
+    /// When the current run of failures began.
+    failing_since: Option<Instant>,
     copied_since: (Instant, u64),
     /// Prepared XA groups waiting for their outcome, oldest first, with the
     /// position just before each: while any waits, the persisted position
@@ -177,6 +180,14 @@ fn code(e: &SprigError) -> Option<SprigCode> {
         ErrorKind::Sprig(c) => Some(c),
         _ => None,
     }
+}
+
+/// Whether a job whose step failed `failures` times in a row, over
+/// `failing_for`, rolls back: once the failures have lasted
+/// `mover.max_pause_minutes` (an unreachable target), and never before
+/// [`MIN_FAILURES`] attempts.
+fn gives_up(failures: u32, failing_for: Duration, max_pause: Duration) -> bool {
+    failures >= MIN_FAILURES && failing_for >= max_pause
 }
 
 fn aborted(m: impl Into<String>) -> SprigError {
@@ -225,6 +236,7 @@ impl Engine {
             last_save: now,
             last_commit: now,
             failures: 0,
+            failing_since: None,
             copied_since: (now, 0),
             xa_open: Vec::new(),
             handoff: None,
@@ -284,7 +296,10 @@ impl Engine {
                 }
             };
             match r {
-                Ok(Step::Next) => self.failures = 0,
+                Ok(Step::Next) => {
+                    self.failures = 0;
+                    self.failing_since = None;
+                }
                 Ok(Step::End(s)) => return Ok(s),
                 Err(e) => self.on_error(e).await?,
             }
@@ -325,17 +340,26 @@ impl Engine {
             _ => {}
         }
         self.failures += 1;
+        let now = self.clock.now();
+        let since = *self.failing_since.get_or_insert(now);
         let msg = e.to_string();
         // A Continuous job (a standby) never gives up by itself: its source
         // may be a lost DC, and its target is then what a promotion needs.
-        if self.failures >= MAX_FAILURES
-            && !self.claim.rec.state.is_committed()
+        if gives_up(
+            self.failures,
+            now.saturating_duration_since(since),
+            self.settings.max_pause,
+        ) && !self.claim.rec.state.is_committed()
             && self.claim.rec.spec.cutover != CutoverMode::Continuous
         {
             self.claim
                 .save(|r| {
                     r.state = JobState::RollingBack;
-                    r.error = Some(format!("gave up after {MAX_FAILURES} failures: {msg}"));
+                    r.error = Some(format!(
+                        "gave up after {failures} failures over {secs} s (mover.max_pause_minutes): {msg}",
+                        failures = self.failures,
+                        secs = now.saturating_duration_since(since).as_secs()
+                    ));
                 })
                 .await?;
             return Ok(());
@@ -1121,7 +1145,7 @@ impl Engine {
                 .await?;
             self.maybe_save().await?;
         }
-        let verify = self.claim.rec.spec.verify != VerifyMode::Off && !self.verified();
+        let verify = self.verify_mode() != VerifyMode::Off && !self.verified();
         self.claim
             .save(|r| {
                 r.state = if verify {
@@ -1138,12 +1162,18 @@ impl Engine {
         self.claim.rec.verified
     }
 
+    /// The job's verification: its own, or `mover.verify_mode` as now
+    /// resolved for its tenant.
+    fn verify_mode(&self) -> VerifyMode {
+        self.claim.rec.spec.verify_mode(self.settings.verify_mode)
+    }
+
     // ---- verification ----------------------------------------------------
 
     async fn verifying(&mut self) -> Result<Step> {
         self.attach().await?;
-        let sample = match self.claim.rec.spec.verify {
-            crate::api::VerifyMode::Sample { pct } => Some(u64::from(pct.clamp(1, 100))),
+        let sample = match self.verify_mode() {
+            VerifyMode::Sample { pct } => Some(u64::from(pct.clamp(1, 100))),
             _ => None,
         };
         // Where verification got to survives errors and worker changes:
@@ -1931,4 +1961,21 @@ fn spawn_reader(mut stream: Box<dyn ChangeStream>) -> Reader {
         }
     });
     Reader { rx, task }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failing_job_rolls_back_after_max_pause_minutes() {
+        let min = Duration::from_secs(60);
+        // The default hour tolerates a ten-minute outage; five minutes
+        // doesn't.
+        assert!(!gives_up(300, min * 10, min * 60));
+        assert!(gives_up(300, min * 10, min * 5));
+        assert!(gives_up(MIN_FAILURES, min * 60, min * 60));
+        // Never on the first failures, even past a short setting.
+        assert!(!gives_up(MIN_FAILURES - 1, min * 10, min));
+    }
 }

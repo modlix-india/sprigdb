@@ -21,6 +21,8 @@
 //! | `ai.admin.max_advice_hour` | `10` | global |
 //! | `ai.admin.max_triage_hour` | `60` | global |
 //! | `ai.admin.check_interval` | `1h` | global |
+//! | `ai.digest` | `off` | tenant, global |
+//! | `ai.digest_email` | `false` | tenant, global |
 //!
 //! Values are read through [`Lookup`], which the gateway implements over a
 //! caller's tenant (and database) context; [`TurnSettings::read`] reads
@@ -189,6 +191,21 @@ key!(
     ADMIN_CHECK_INTERVAL: Text = "ai.admin.check_interval", Cow::Borrowed("1h"), GLOBAL,
     HardBounds::one_of(CHECK_INTERVALS), true,
     "How often the administration agent's health checks run over the metric history in each DC: 15m, 30m, 1h, 2h, 3h, 6h, 12h or 24h"
+);
+
+/// The values `ai.digest` takes.
+pub const DIGEST_CADENCES: &[&str] = &["off", "weekly", "daily"];
+
+key!(
+    /// `ai.digest`.
+    DIGEST: Text = "ai.digest", Cow::Borrowed("off"), TENANT_GLOBAL,
+    HardBounds::one_of(DIGEST_CADENCES), false,
+    "A digest of the tenant's week or day, built from statistics only (schema and data-volume changes, the slowest statements, new automatic indexes, movements in the tenant's own workload numbers, recommendations waiting for review) and worded by the data assistant's model: off, weekly or daily. Read with GET /v1/ai/digests; ai.enabled must be on too"
+);
+key!(
+    /// `ai.digest_email`.
+    DIGEST_EMAIL: bool = "ai.digest_email", false, TENANT_GLOBAL, HardBounds::NONE, false,
+    "Also email each digest to the tenant's approvals subscribers (approval_subscriptions with delivery immediate or digest), through approvals.smtp_url"
 );
 
 /// `ai.admin.check_interval`'s value as a duration (1 hour for anything
@@ -421,6 +438,8 @@ mod tests {
             assert!(check_interval(v) >= Duration::from_secs(900), "{v}");
         }
         assert_eq!(check_interval("30m"), Duration::from_secs(1800));
+        assert_eq!(Defaults.text(&DIGEST), "off", "digests are off by default");
+        assert!(!Defaults.flag(&DIGEST_EMAIL));
         let reg = sprig_settings::Registry::global().unwrap();
         for k in [
             "ai.enabled",
@@ -436,6 +455,8 @@ mod tests {
             "ai.admin.max_advice_hour",
             "ai.admin.max_triage_hour",
             "ai.admin.check_interval",
+            "ai.digest",
+            "ai.digest_email",
         ] {
             assert!(reg.get(k).is_some(), "{k}");
         }

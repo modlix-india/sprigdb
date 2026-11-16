@@ -490,6 +490,25 @@ fn html_snapshots() {
         a.on_key(key(KeyCode::Char(c)));
     }
     std::fs::write(format!("{dir}/palette.html"), html(&mut a, 110, 30)).expect("write");
+    let mut a = app();
+    a.tabs[0].editor.set_text(
+        "SELECT status, COUNT(*) FROM orders WHERE created_at >= NOW() - INTERVAL 30 DAY GROUP BY status;",
+    );
+    a.on_key(ctrl('a'));
+    for c in "/dba".chars() {
+        a.on_key(key(KeyCode::Char(c)));
+    }
+    a.on_key(key(KeyCode::Enter));
+    a.assistant.items.clear();
+    for c in "why is this slow?".chars() {
+        a.on_key(key(KeyCode::Char(c)));
+    }
+    a.on_key(key(KeyCode::Enter));
+    for ev in assistant_turn() {
+        a.on_msg(Msg::Ai(ev));
+    }
+    a.on_msg(Msg::AiDone(None));
+    std::fs::write(format!("{dir}/assistant.html"), html(&mut a, 100, 30)).expect("write");
 }
 
 #[test]
@@ -708,4 +727,148 @@ fn table_view_filters_stages_edits_and_applies() {
     assert!(
         matches!(&fx[..], [Effect::TableQuery(_, _, Purpose::Structure(Sub::Indexes), q)] if q == "SHOW INDEX FROM `shop`.`orders`")
     );
+}
+
+/// The assistant pane's stream: a DBA turn with tool rows, an answer and
+/// a proposal (what the gateway's `/v1/ai/chat` sends).
+fn assistant_turn() -> Vec<serde_json::Value> {
+    vec![
+        json!({"type": "start", "conversation": "41", "role": "dba", "model": "claude-opus-5-5", "share_data": false}),
+        json!({"type": "tool_start", "id": "t1", "name": "workload", "input": {"db": "shop"}}),
+        json!({"type": "tool_end", "id": "t1", "name": "workload", "ok": true, "reduced": false}),
+        json!({"type": "tool_start", "id": "t2", "name": "explain", "input": {"db": "shop", "sql": "SELECT …"}}),
+        json!({"type": "tool_end", "id": "t2", "name": "explain", "ok": true, "reduced": false}),
+        json!({"type": "text", "text": "No index starts with status or created_at, so all 2.1 M orders are read."}),
+        json!({"type": "proposal", "proposal": {"id": "p1", "kind": "sql", "tool_use_id": "t3", "body": {
+            "db": "shop",
+            "sql": "CREATE INDEX orders_status_created ON shop.orders (status, created_at);",
+            "why": "Reads only the matching orders.",
+            "estimate": "~180 MB · p95 4.2 s -> ~40 ms · writes +3%"}}, "filed": null}),
+        json!({"type": "sources", "sources": [{"kind": "docs", "title": "Automatic indexing", "reference": "tools/automatic-indexing.md"}]}),
+        json!({"type": "end", "stop": "end_turn"}),
+    ]
+}
+
+#[test]
+fn assistant_pane_streams_and_runs_a_proposal_only_after_a_yes() {
+    let mut a = app();
+    a.on_key(ctrl('a'));
+    assert!(a.assistant.open);
+    assert_eq!(a.focus, Focus::Results);
+    for c in "/dba".chars() {
+        a.on_key(key(KeyCode::Char(c)));
+    }
+    assert!(a.on_key(key(KeyCode::Enter)).is_empty());
+    for c in "why is this slow?".chars() {
+        a.on_key(key(KeyCode::Char(c)));
+    }
+    let fx = a.on_key(key(KeyCode::Enter));
+    let [Effect::AiChat(body)] = &fx[..] else {
+        panic!("{fx:?}")
+    };
+    assert_eq!(body["role"], "dba");
+    assert_eq!(body["message"], "why is this slow?");
+    assert_eq!(body["database"], "shop");
+    assert_eq!(body["context"][0]["kind"], "query");
+    assert!(a.assistant.running);
+    for ev in assistant_turn() {
+        a.on_msg(Msg::Ai(ev));
+    }
+    a.on_msg(Msg::AiDone(None));
+    assert_eq!(a.assistant.conversation.as_deref(), Some("41"));
+    golden("assistant.txt", &screen(&mut a, 100, 30));
+
+    // Enter asks first; n runs nothing; y accepts it with confirm.
+    assert!(a.on_key(key(KeyCode::Enter)).is_empty());
+    assert!(matches!(a.dialog, Some(Dialog::Confirm(..))));
+    assert!(a.on_key(key(KeyCode::Char('n'))).is_empty());
+    assert!(a.dialog.is_none());
+    a.on_key(key(KeyCode::Enter));
+    assert_eq!(
+        a.on_key(key(KeyCode::Char('y'))),
+        vec![Effect::AiAccept("p1".into())]
+    );
+    let fx = a.on_msg(Msg::AiAccepted(
+        "p1".into(),
+        Ok(
+            json!({"proposal": "p1", "kind": "sql", "outcome": "accepted",
+                  "ran": [{"sql": "CREATE INDEX …", "results": [{"affected_rows": "0"}]}]}),
+        ),
+    ));
+    assert_eq!(fx, vec![Effect::LoadCatalog]);
+    let shown = screen(&mut a, 100, 30);
+    assert!(
+        shown.contains("done · ran 1 statement · 0 rows affected"),
+        "{shown}"
+    );
+
+    // A follow-up continues the conversation.
+    for c in "thanks".chars() {
+        a.on_key(key(KeyCode::Char(c)));
+    }
+    let fx = a.on_key(key(KeyCode::Enter));
+    let [Effect::AiChat(body)] = &fx[..] else {
+        panic!("{fx:?}")
+    };
+    assert_eq!(body["conversation"], "41");
+    // Ctrl-C stops it; Ctrl-A twice closes the pane.
+    assert_eq!(a.on_key(ctrl('c')), vec![Effect::AiStop]);
+    a.on_msg(Msg::AiDone(Some(crate::error::ShellError::shell(
+        crate::error::ShellCode::Cancelled,
+        "stopped",
+    ))));
+    assert!(!a.assistant.running);
+    a.on_key(ctrl('a'));
+    assert!(!a.assistant.open);
+    assert_eq!(a.focus, Focus::Editor);
+}
+
+#[test]
+fn assistant_proposals_edit_dismiss_copy_and_what_was_sent() {
+    let mut a = app();
+    a.on_key(ctrl('a'));
+    for ev in assistant_turn() {
+        a.on_msg(Msg::Ai(ev));
+    }
+    a.on_msg(Msg::AiDone(None));
+    // y copies, ? reads what was sent, e puts it in the editor.
+    assert!(
+        matches!(&a.on_key(key(KeyCode::Char('y')))[..], [Effect::Copy(s)] if s.starts_with("CREATE INDEX"))
+    );
+    assert_eq!(
+        a.on_key(key(KeyCode::Char('?'))),
+        vec![Effect::AiSent("41".into())]
+    );
+    a.on_msg(Msg::AiSent(Ok(json!({"messages": [
+        {"kind": "system_note", "body": {"provider": "anthropic", "model": "m", "sha256": "abcd", "payload": {"system": "…"}}}]}))));
+    assert!(matches!(&a.dialog, Some(Dialog::Cell(t)) if t.contains("sha256 abcd")));
+    a.on_key(key(KeyCode::Esc));
+    let fx = a.on_key(key(KeyCode::Char('e')));
+    assert!(matches!(&fx[..], [Effect::AiFeedback(b)] if b["outcome"] == "accepted"));
+    assert_eq!(
+        a.tabs[0].editor.text(),
+        "CREATE INDEX orders_status_created ON shop.orders (status, created_at);"
+    );
+    assert_eq!(a.focus, Focus::Editor);
+    // A second proposal, dismissed.
+    a.on_msg(Msg::Ai(
+        json!({"type": "proposal", "proposal": {"id": "p2", "kind": "sql",
+        "body": {"db": "shop", "sql": "DROP INDEX x ON orders"}}, "filed": null}),
+    ));
+    a.on_msg(Msg::AiDone(None));
+    a.on_key(key(KeyCode::F(2)));
+    assert_eq!(a.focus, Focus::Results);
+    assert_eq!(
+        a.on_key(key(KeyCode::Char('d'))),
+        vec![Effect::AiDismiss("p2".into())]
+    );
+    assert!(a.assistant.waiting().is_empty());
+    // Typing goes to the question; an error before the stream is shown.
+    a.on_key(key(KeyCode::Char('h')));
+    assert_eq!(a.assistant.input, "h");
+    a.on_msg(Msg::AiDone(Some(crate::error::ShellError::shell(
+        crate::error::ShellCode::Parse,
+        "39990 ER_SPRIG_AI_NOT_CONFIGURED: no model",
+    ))));
+    assert!(screen(&mut a, 100, 30).contains("ER_SPRIG_AI_NOT_CONFIGURED"));
 }

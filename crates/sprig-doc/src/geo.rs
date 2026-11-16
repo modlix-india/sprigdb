@@ -716,6 +716,14 @@ pub fn parse(op: &str, v: &Bson, siblings: &Document) -> Result<GeoOp, MongoErro
                         d.get("$minDistance").and_then(num),
                     )
                 }
+                // A GeoJSON point without `$geometry`, which MongoDB takes
+                // as the same `2dsphere` query.
+                Bson::Document(d) if d.get_str("type") == Ok("Point") => {
+                    let Geom::Point(p) = geometry_arg(&bson::doc! {"$geometry": d.clone()})? else {
+                        return Err(bad("$near requires a point, given a non-point"));
+                    };
+                    (p, true, None, None)
+                }
                 other => {
                     // A legacy pair with `$near` needs a `2d` index, which
                     // SprigDB never has: MongoDB's answer without one.

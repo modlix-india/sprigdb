@@ -617,6 +617,7 @@ where
                     current_db: None,
                     user: None,
                     lower_case_table_names: lctn,
+                    wait: None,
                 };
                 match self.engine.execute(&req, &*exec).await {
                     Ok(_) => {

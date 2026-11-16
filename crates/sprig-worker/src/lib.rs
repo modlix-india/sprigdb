@@ -198,10 +198,13 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
     );
     // Shards get their own connection budget: a trigger holds a shard's
     // connection while it runs, and must never wait for a catalog one
-    // from the same budget.
+    // from the same budget. A run may hold one for its whole budget
+    // (`logic.job_budget_ms`, 5 minutes by default), so a wait for one ends
+    // only after 10 minutes, not the default 20 s.
     let shard_pools: Arc<dyn sprig_controller::catalogs::ClusterPools> = Arc::new(
         sprig_controller::catalogs::RegistryPools::new(registry_logic.clone(), None)
-            .budget("logic_shards", 16),
+            .budget("logic_shards", 16)
+            .wait_limit(std::time::Duration::from_secs(600)),
     );
     let registry_clusters = Arc::new(logic::RegistryClusters::new(
         registry_logic.clone(),
@@ -352,7 +355,15 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
                 .named("change_exchange"),
             ..env.clone()
         })))
-        .with_handler(Arc::new(logic::LogicSchedule(env)))
+        // Scheduled runs read definers' tenant subtrees from the global
+        // tier.
+        .with_handler(Arc::new(logic::LogicSchedule(logic::LogicEnv {
+            gateways: Some((
+                Arc::clone(&msg_env.gateways) as Arc<dyn sprig_sinks::peer::SinkPeer>,
+                Arc::clone(&global),
+            )),
+            ..env
+        })))
         .with_handler(Arc::new(inherit::InheritCopy(inherit_env)))
         .with_handler(Arc::new(graph_mirror::GraphMirror(graph_mirror_env)))
         .with_handler(Arc::new(streams::StreamSequencer(streams_env)))

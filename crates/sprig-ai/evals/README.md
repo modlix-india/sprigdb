@@ -83,6 +83,11 @@ world = [                          # what each read tool returns
   { tool = "describe", when = { table = "orders" }, json = { ... } },  # only for this input
   { tool = "catalog", error = "SHOW command denied" },                 # the tool fails
 ]
+```
+
+What a case's world doesn't hold is answered as the real host would, from the case itself: `catalog` lists the case's database (from `context`'s `Database:` line) with the tables its `describe` entries and its expected SQL name; `relationships` infers joins from `<table>_id` columns of the described tables; `describe` of a table that only the expected SQL names returns the columns that SQL uses; an entry is served for the table its JSON names before another table's. A read with nothing to answer from fails, as an unknown table would.
+
+```toml
 calls = [                          # what a good answer calls, round by round
   { tool = "explain", args = { db = "shop", sql = "SELECT ..." }, has = { sql = ["customer_id"] } },
   { tool = "indexes", args = { db = "shop", table = "orders" }, round = 1 },  # same round

@@ -508,34 +508,19 @@ impl PassSession {
         d: &Arc<Definition>,
     ) -> Result<Handled> {
         let chain = inherited::chain(svc, cat).await?;
-        let spec: SinkSpec = serde_json::from_value(d.definition.clone()).unwrap_or_default();
-        let conn_names: Vec<String> = spec
-            .connections
-            .iter()
-            .filter(|(_, p)| !p)
-            .map(|(c, _)| c.clone())
-            .collect();
-        let mut members = crate::inherited::sinks::members_of(svc, &chain, d).await?;
-        // Members that detached their source instance keep their sink
-        // instance; the source's index no longer lists them.
-        let detached = crate::inherited::sinks::unindexed_members(svc, d, &members).await?;
-        if !detached.is_empty() {
-            tracing::info!(def = %d.key(), members = ?detached, "dropping detached members' sink instances too");
-        }
-        members.extend(detached);
-        let mut n = 0;
-        for t in members {
-            if inherited::dir_entry(svc, t).await?.is_none() {
-                continue;
-            }
-            match crate::inherited::sinks::drop_instance(svc, t, d, &conn_names).await {
-                Ok(true) => n += 1,
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!(tenant = %t, def = %d.key(), error = %e, "inherited sink instance not dropped");
-                }
-            }
-        }
+        let members = crate::inherited::sinks::members_to_drop(svc, &chain, d).await?;
+        let mut n = crate::inherited::sinks::drop_listed(svc, d, members).await?;
+        // Members in other DCs: their DC's gateways drop the instances
+        // their index lists, while the definition still exists.
+        n += usize::try_from(
+            crate::inherited::remote::in_other_dcs(
+                svc,
+                crate::inherited::remote::MemberOp::DropSink,
+                d.key(),
+            )
+            .await,
+        )
+        .unwrap_or(0);
         let v = inherited::commit(svc, cat.tenant, &[MsgWrite::DeleteDef(d.object_id)]).await?;
         self.after_own_change(v).await?;
         tracing::info!(tenant = %cat.tenant, def = %d.key(), instances = n, "inherited sink dropped");

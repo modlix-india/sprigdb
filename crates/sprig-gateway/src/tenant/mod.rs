@@ -107,6 +107,10 @@ pub struct TenantServices {
     /// The queue engine, set when the AMQP front end starts
     /// (`sprig.mq_*` calls in SQL use it).
     pub mq: std::sync::OnceLock<Arc<sprig_queues::QueueEngine>>,
+    /// The gateways of other DCs (the peer service), set when the
+    /// gateway starts: `FOR EACH TENANT` changes reaching members homed
+    /// there.
+    pub peers: std::sync::OnceLock<Arc<crate::peer::Peers>>,
     _follow: Registration,
 }
 
@@ -171,6 +175,8 @@ impl TenantServices {
             Some(live.clone()),
         ));
         let dyn_locator: Arc<dyn CatalogLocator> = locator.clone();
+        // Policies from MongoDB filters get this build's SQL when loaded.
+        sprig_auth::authz::rls::set_mongo_compiler(sprig_doc::policy::stored_sql);
         let extensions: Vec<Arc<dyn CatalogExtension>> = vec![
             Arc::new(AuthExtension),
             Arc::new(sprig_auth::authz::AuthzExtension),
@@ -251,6 +257,7 @@ impl TenantServices {
             auth_changes,
             authz: authz::AuthzServices::default(),
             mq: std::sync::OnceLock::new(),
+            peers: std::sync::OnceLock::new(),
             _follow: follow,
         });
         // Rows of cross-tenant outboxes a lost commit hook

@@ -316,6 +316,75 @@ async fn reread(
                 );
             }
         }
+    } else if def.has_hash_fields() {
+        // A namespace's live hashes (a row is the object of their fields)
+        // and string keys.
+        let elems = format!("{}.{}", q(&def.db), q(&format!("__sprig_ke_{}", def.table)));
+        for chunk in hits.chunks(500) {
+            let list: Vec<String> = chunk
+                .iter()
+                .map(|h| sprig_doc::sql::bin_lit(&h.key.0))
+                .collect();
+            let rows = sql
+                .query(&format!(
+                    "SELECT t.k, t.type, t.v, e.e, e.v FROM {table} AS t LEFT JOIN {elems} AS e \
+                     ON e.k = t.k AND e.g = t.g AND t.type = 'hash' WHERE t.k IN ({}) \
+                     AND t.type IN ('string', 'hash') \
+                     AND (t.expires_at IS NULL OR t.expires_at > NOW(3)) ORDER BY t.k, e.o, e.e",
+                    list.join(", ")
+                ))
+                .await
+                .map_err(|e| sql_err(&e))?;
+            let mut by_key: Vec<(Vec<u8>, Value)> = Vec::new();
+            for r in rows {
+                let col = |i: usize| r.get(i).cloned().flatten();
+                let k = col(0).unwrap_or_default();
+                let string = col(1).as_deref() == Some(b"string".as_slice());
+                if by_key.last().is_none_or(|(x, _)| *x != k) {
+                    let v = if string {
+                        sprig_search::copy::kv_value(&col(2).unwrap_or_default())
+                    } else {
+                        Value::Object(serde_json::Map::new())
+                    };
+                    by_key.push((k.clone(), v));
+                }
+                if let (Some(e), Some((_, Value::Object(m)))) = (col(3), by_key.last_mut()) {
+                    m.insert(
+                        String::from_utf8_lossy(&e).into_owned(),
+                        Value::String(
+                            String::from_utf8_lossy(&col(4).unwrap_or_default()).into_owned(),
+                        ),
+                    );
+                }
+            }
+            for (k, value) in by_key {
+                let key = match std::str::from_utf8(&k) {
+                    Ok(t) => json!({"k": t}),
+                    Err(_) => {
+                        json!({"k_base64": base64::engine::general_purpose::STANDARD.encode(&k)})
+                    }
+                };
+                let mut t = HashMap::new();
+                for f in texts {
+                    let got = if f.source == sprig_search::Source::KvField {
+                        value.get(&f.source_ref).and_then(Value::as_str)
+                    } else {
+                        None
+                    };
+                    if let Some(x) = got {
+                        t.insert(f.name.clone(), x.to_owned());
+                    }
+                }
+                out.insert(
+                    Key(k),
+                    Seen {
+                        key,
+                        row: with_row.then_some(value),
+                        texts: t,
+                    },
+                );
+            }
+        }
     } else if def.model == Model::Kv {
         // A namespace's live string keys.
         for chunk in hits.chunks(500) {

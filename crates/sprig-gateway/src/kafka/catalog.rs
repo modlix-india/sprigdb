@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::{CatalogLocator, Freshness, TenantCatalog};
 use sprig_common::SprigError;
 use sprig_common::ids::{ObjectId, TenantId};
@@ -558,7 +559,7 @@ impl CatalogGroups {
             .writer(TenantId(tenant))
             .await
             .map_err(store_err)?;
-        let mut conn = ep.pool.get_conn().await.map_err(store_err)?;
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(store_err)?;
         let schema = ep.store.schema().to_owned();
         let done = self
             .migrated

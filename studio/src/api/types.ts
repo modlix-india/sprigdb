@@ -110,6 +110,9 @@ export interface WhoAmI {
   gateway?: { id: string; dc: string; studio_build: string };
   /** The administrator acting, in an impersonation session. */
   impersonator?: string | null;
+  /** The AI assistants: on for the tenant, results shared, roles with a model
+   * (absent from gateways without assistants). */
+  ai?: { enabled: boolean; share_data: boolean; roles: ('data' | 'dba' | 'admin')[] };
 }
 
 import type { components } from './gen/v1';

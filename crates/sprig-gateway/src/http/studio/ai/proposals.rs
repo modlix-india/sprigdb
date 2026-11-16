@@ -7,7 +7,7 @@
 //! | `generate_rows` | runs the generated `INSERT` as the caller, with `confirm: true` |
 //! | `recommendation` | files an `ai_dba_advice` item in the approvals inbox, at the tenant's level; advice only |
 //! | `glossary` | accepts the proposed term (tenant administrators) |
-//! | `tile` | not yet: dashboards come later |
+//! | `tile` | adds the tile to a dashboard: the one the user picks (`dashboard`, an id, or `new_dashboard`, a name), else the one the assistant named, one of the caller's own (made when missing); `title`, `chart` and `sql` may be changed on the way, and the tile is checked as any other |
 //!
 //! `:dismiss` records that the user turned it down. Either way the
 //! outcome goes to `ai_feedback` (`accepted`, `failed` or `dismissed`), so
@@ -172,8 +172,9 @@ async fn file_advice(
 ///
 /// # Errors
 /// 39792 for an unknown proposal or verb, a proposal already accepted, a
-/// change without `confirm`, or a kind that can't be accepted here; 1227
-/// for a glossary term without `SPRIG_TENANT_ADMIN`.
+/// change without `confirm`, a tile that fails its checks, or a kind that
+/// can't be accepted here; 1227 for a glossary term without
+/// `SPRIG_TENANT_ADMIN`, or a tile for a dashboard the caller can't edit.
 #[allow(clippy::too_many_lines)] // one arm per kind
 pub async fn route(
     core: &Arc<Core>,
@@ -299,6 +300,19 @@ pub async fn route(
             (
                 Outcome::Accepted,
                 json!({"proposal": id, "kind": kind, "outcome": "accepted", "term": term}),
+            )
+        }
+        "tile" => {
+            // Into the dashboard the user picked ({dashboard} or
+            // {new_dashboard}), else the one the assistant named. The tile
+            // is checked again as any tile a person saves.
+            let store = super::super::dashboards::store(core, caller).await?;
+            let who = super::super::dashboards::who(core, caller, true).await?;
+            let (dash, tile) = sprig_ai::dashboards::accept_tile(&store, &who, &body, b).await?;
+            (
+                Outcome::Accepted,
+                json!({"proposal": id, "kind": kind, "outcome": "accepted",
+                       "dashboard": dash.to_string(), "tile": tile.to_string()}),
             )
         }
         _ => {

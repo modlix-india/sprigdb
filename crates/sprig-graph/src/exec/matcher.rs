@@ -195,6 +195,25 @@ impl Exec<'_> {
             self.only = self.only_ids(w, &mut rows).await?;
             self.only_by_conj(patterns, &conj, &mut rows).await?;
         }
+        // The later patterns' lone start nodes are scanned with the first
+        // pattern's first statement, in the same round trip (LDBC IC1's
+        // `MATCH (p:Person {id: $personId}), (friend:Person {firstName:
+        // $firstName})`).
+        if self.late && self.read_only {
+            for p in patterns.iter().skip(1) {
+                let bound = rows
+                    .first()
+                    .is_some_and(|r| p.start.var.as_ref().is_some_and(|v| r.contains_key(v)));
+                if p.kind == PathKind::Normal
+                    && p.steps.is_empty()
+                    && !bound
+                    && p.start.props.as_ref().is_none_or(is_const)
+                    && let Some(s) = self.start_scan(&p.start, &conj).await?
+                {
+                    self.store.queue_scan(&s);
+                }
+            }
+        }
         for (pi, p) in patterns.iter().enumerate() {
             // Types of the other relationship patterns of the clause, for
             // endpoint mode's uniqueness rule.
@@ -205,7 +224,24 @@ impl Exec<'_> {
                 .filter(|(qi, _)| *qi != pi)
                 .map(|(_, r)| r)
                 .collect();
-            rows = self.match_pattern(rows, p, &conj, mult_ok, &others).await?;
+            // The next pattern's first hop, when it starts where this
+            // pattern ends (LDBC IS2's `(message)-[:REPLY_OF*0..]->(post:Post),
+            // (post)-[:HAS_CREATOR]->(person)`).
+            self.then = patterns.get(pi + 1).and_then(|q| {
+                let v = q.start.var.as_ref()?;
+                let ends_there = p.steps.last().and_then(|(_, np)| np.var.as_ref()) == Some(v);
+                let unbound = rows.first().is_none_or(|r| !r.contains_key(v));
+                (q.kind == PathKind::Normal && ends_there && unbound)
+                    .then(|| {
+                        q.steps
+                            .first()
+                            .map(|(rp, np)| (v.clone(), rp.clone(), np.clone()))
+                    })
+                    .flatten()
+            });
+            let matched = self.match_pattern(rows, p, &conj, mult_ok, &others).await;
+            self.then = None;
+            rows = matched?;
             self.check_rows(rows.len())?;
             // The WHERE's conjuncts whose variables are all bound now
             // filter before the next pattern expands every row (LDBC
@@ -918,6 +954,16 @@ impl Exec<'_> {
             if cur.is_empty() {
                 break;
             }
+            // The step after this one: the pattern's next, or after its
+            // last, the clause's next pattern's first from the same node.
+            let then: Option<(RelPat, NodePat)> = match pat.steps.get(si + 1) {
+                Some(s) => Some(s.clone()),
+                None => self
+                    .then
+                    .as_ref()
+                    .filter(|(v, _, _)| np.var.as_ref() == Some(v))
+                    .map(|(_, r, n)| (r.clone(), n.clone())),
+            };
             cur = match rp.range {
                 None => {
                     // The last hop, which no other relationship of the
@@ -941,7 +987,12 @@ impl Exec<'_> {
                         && cur.first().is_none_or(|(r, _)| {
                             rp.var.as_ref().is_none_or(|v| !r.contains_key(v))
                         });
+                    if let Some(next) = self.next_hop(then.as_ref()).await? {
+                        self.store
+                            .queue_next_hop(Some((&next.0, next.1.as_deref())));
+                    }
                     let out = self.hop(cur, rp, np, track).await;
+                    self.store.queue_next_hop(None);
                     self.top_hop = false;
                     out?
                 }
@@ -963,7 +1014,8 @@ impl Exec<'_> {
                     if endpoint {
                         self.var_endpoints(cur, rp, np, min, hi).await?
                     } else {
-                        self.var_paths(cur, rp, np, min, hi, track).await?
+                        let next = self.next_hop(then.as_ref()).await?;
+                        self.var_paths(cur, rp, np, min, hi, track, next).await?
                     }
                 }
             };
@@ -1532,10 +1584,10 @@ impl Exec<'_> {
                 let mut join = far
                     && (batch.len() <= JOIN_FAR_MAX
                         || (top.is_some() && batch.len() <= JOIN_TOP_MAX));
-                // A joined read that meets many links stops at
-                // `JOIN_ROWS_MAX` and reads them again without the join:
-                // its far nodes are read by id, in parallel statements.
-                let limit = (join && top.is_none()).then_some(JOIN_ROWS_MAX);
+                // A joined read past `JOIN_ROWS_MAX` links (per statement)
+                // gives them without the join, in the same statement: their
+                // far nodes are read by id, in parallel statements.
+                let join_max = (join && top.is_none()).then_some(JOIN_ROWS_MAX);
                 // The links the pattern's start scan brought with it.
                 let fused = self.fused.take().filter(|f| {
                     f.dir == *d
@@ -1564,11 +1616,10 @@ impl Exec<'_> {
                     }
                     None => (None, None),
                 };
-                let limit = if after.is_some() { None } else { limit };
                 let found = if let Some(pre) = pre.as_ref().filter(|_| after.is_none()) {
                     pre.clone()
                 } else {
-                    let mut got = loop {
+                    let mut got = {
                         let read_far = join
                             || !only.is_empty()
                             || rel_keys.is_some()
@@ -1587,9 +1638,14 @@ impl Exec<'_> {
                                     } else {
                                         None
                                     },
-                                    limit: if join { limit } else { None },
+                                    limit: None,
                                     after,
                                     ordered: false,
+                                    join_max: if join && after.is_none() {
+                                        join_max
+                                    } else {
+                                        None
+                                    },
                                 };
                                 self.store.links_far_both(batch, types, &fr).await?
                             } else if *d == Dir::Both {
@@ -1616,9 +1672,14 @@ impl Exec<'_> {
                                     } else {
                                         None
                                     },
-                                    limit: if join { limit } else { None },
+                                    limit: None,
                                     after,
                                     ordered: false,
+                                    join_max: if join && after.is_none() {
+                                        join_max
+                                    } else {
+                                        None
+                                    },
                                 };
                                 self.store
                                     .links_far(batch, types, *d, &fr)
@@ -1634,11 +1695,7 @@ impl Exec<'_> {
                                     .map(|l| ((l, None, None), *d == Dir::Out))
                                     .collect()
                             };
-                        if join && limit.is_some_and(|n| found.len() >= n) {
-                            join = false;
-                            continue;
-                        }
-                        break found;
+                        found
                     };
                     if let Some(pre) = pre {
                         got.extend(pre);
@@ -2085,11 +2142,19 @@ impl Exec<'_> {
             return Ok(Vec::new());
         };
         let (max, unbounded) = self.max_hops(hi)?;
-        self.plan.push(format!(
-            "VarExpand *{min}..{}: endpoint mode, tier cte (bursts of {} hops), gateway continuation across shards",
-            hi.map_or_else(String::new, |h| h.to_string()),
-            self.b.local_burst_hops
-        ));
+        let hop_by_hop = self.b.tier == super::TraversalTier::Gateway;
+        self.plan.push(if hop_by_hop {
+            format!(
+                "VarExpand *{min}..{}: endpoint mode, tier gateway (one hop per level)",
+                hi.map_or_else(String::new, |h| h.to_string()),
+            )
+        } else {
+            format!(
+                "VarExpand *{min}..{}: endpoint mode, tier cte (bursts of {} hops), gateway continuation across shards",
+                hi.map_or_else(String::new, |h| h.to_string()),
+                self.b.local_burst_hops
+            )
+        });
         let origins: Vec<(u64, u64)> = {
             let mut seen = HashSet::new();
             cur.iter()
@@ -2156,6 +2221,42 @@ impl Exec<'_> {
                 }
             }
             let mut next = Vec::new();
+            if hop_by_hop {
+                // `graph.traversal_tier = gateway`: the whole level's next
+                // hop in batched one-hop reads, joined here.
+                let level: Vec<(u64, u64, u32)> = groups
+                    .into_iter()
+                    .flat_map(|((_, d), v)| v.into_iter().map(move |(o, n)| (o, n, d)))
+                    .collect();
+                let ids: Vec<u64> = {
+                    let mut s = HashSet::new();
+                    level.iter().map(|x| x.1).filter(|i| s.insert(*i)).collect()
+                };
+                metrics::counter!("sprig_graph_shard_queries_total", "tier" => "gateway")
+                    .increment(1);
+                let hops = self.hop_edges(&ids, &types, rp.dir).await?;
+                for (o, n, depth) in level {
+                    let d = depth + 1;
+                    for (_, f) in hops.get(&n).map_or(&[][..], Vec::as_slice) {
+                        if best.get(&(o, f.id)).is_some_and(|b| *b <= d) {
+                            continue;
+                        }
+                        best.insert((o, f.id), d);
+                        if d < max || unbounded {
+                            next.push((o, f.id, f.rk, d));
+                        }
+                    }
+                    if best.len() > self.b.max_rows {
+                        return Err(budget_error(
+                            "rows",
+                            format!("more than graph.max_rows = {} endpoints", self.b.max_rows),
+                        ));
+                    }
+                }
+                level_hist += 1;
+                pending = next;
+                continue;
+            }
             let mut keys: Vec<(usize, u32)> = groups.keys().copied().collect();
             keys.sort_unstable();
             for (shard, depth) in keys {
@@ -2243,6 +2344,7 @@ impl Exec<'_> {
         min: u32,
         hi: Option<u32>,
         track: bool,
+        next: Option<(Vec<u32>, Option<Vec<String>>)>,
     ) -> Result<Vec<(Row, Arc<Node>)>> {
         let Some(types) = self.type_ids(rp).await? else {
             return Ok(Vec::new());
@@ -2299,6 +2401,23 @@ impl Exec<'_> {
         } else {
             None
         };
+        // A small outgoing walk reads all its levels in one statement first,
+        // where the store can (a recursive CTE), with the far nodes'
+        // labels and the properties the clause needs: then binding the
+        // ends reads nothing more (LDBC IS2's `REPLY_OF*0..` up a reply
+        // chain, any depth, in one round trip).
+        let walk_keys: Option<Vec<String>> = if self.late && np.props.is_none() {
+            match self.need_of(np.var.as_ref(), None) {
+                Some(super::late::Need::Keys(ks)) => {
+                    Some(ks.into_iter().filter(|k| !k.starts_with('\u{1}')).collect())
+                }
+                Some(super::late::Need::All) => None,
+                None => Some(Vec::new()),
+            }
+        } else {
+            None
+        };
+        let mut walked = false;
         while !live.is_empty() {
             self.check_time()?;
             if level >= max {
@@ -2341,9 +2460,31 @@ impl Exec<'_> {
                     .collect()
             };
             metrics::counter!("sprig_graph_shard_queries_total", "tier" => "gateway").increment(1);
+            if !walked && rp.dir == Dir::Out && rp.props.is_none() && level + 1 < max {
+                walked = true;
+                if ids.len() <= DEEP_MAX {
+                    let nx = next.as_ref().map(|(t, k)| (t.as_slice(), k.as_deref()));
+                    self.walk_ahead(
+                        &ids,
+                        &types,
+                        (max - level, walk_keys.as_deref(), nx),
+                        &mut links,
+                        &mut ahead,
+                    )
+                    .await?;
+                }
+            }
             // A small outgoing walk with levels to go reads two levels a
             // statement (LDBC IS2's `REPLY_OF*0..` up a reply chain).
             let hops = if rp.dir == Dir::Out
+                && rp.props.is_none()
+                && ids.iter().all(|i| ahead.complete.contains(i))
+            {
+                // Every end's links were read ahead.
+                ids.iter()
+                    .filter_map(|i| ahead.links.get(i).map(|c| (*i, c.clone())))
+                    .collect()
+            } else if rp.dir == Dir::Out
                 && rp.props.is_none()
                 && level + 1 < max
                 && ids.len() <= DEEP_MAX
@@ -2673,8 +2814,14 @@ impl Exec<'_> {
         }
         let only = p.only.clone().unwrap_or_default();
         // A start that meets many links reads them again in the hop, in
-        // its batches (and without the join).
-        let cap = if p.far {
+        // its batches. One way, past `JOIN_ROWS_MAX` links a statement
+        // gives them without the join (their far nodes are read by id in
+        // the hop). Both ways, a joined read stops at `JOIN_ROWS_MAX` and
+        // the hop reads again: each part's check of its link count runs
+        // the start's scan again, and twice the parts cost more than the
+        // rare second read saves (LDBC IS3: 3.9 ms against 2.4 ms).
+        let split = p.far && rp.dir != Dir::Both;
+        let cap = if p.far && !split {
             JOIN_ROWS_MAX
         } else {
             crate::store::FUSED_PLAIN_MAX
@@ -2698,6 +2845,7 @@ impl Exec<'_> {
             limit: Some(cap),
             after: None,
             ordered: cont,
+            join_max: (split && !cont).then_some(JOIN_ROWS_MAX),
         };
         let Some((nodes, links, plain)) = self.store.scan_links(scan, &types, rp.dir, &fr).await?
         else {
@@ -2801,6 +2949,78 @@ impl Exec<'_> {
             p.bound = Some(bound);
         }
         links.iter().map(|((l, _, _), _)| l.id).max()
+    }
+
+    /// The next step's hop, when the store may read it along with the hop
+    /// or walk about to run ([`GraphStore::queue_next_hop`],
+    /// [`GraphStore::walk_ahead`]): a plain outgoing hop whose far nodes
+    /// are read. Its types, and the keys its far nodes need. LDBC IC1's
+    /// `(friend)-[:STUDY_AT]->(uni)-[:IS_LOCATED_IN]->(city)` in one round
+    /// trip, not two.
+    async fn next_hop(
+        &mut self,
+        next: Option<&(RelPat, NodePat)>,
+    ) -> Result<Option<(Vec<u32>, Option<Vec<String>>)>> {
+        let Some((rp, np)) = next else {
+            return Ok(None);
+        };
+        if !self.late
+            || !self.read_only
+            || rp.range.is_some()
+            || rp.props.is_some()
+            || np.props.is_some()
+            || rp.dir != Dir::Out
+        {
+            return Ok(None);
+        }
+        let Some(types) = self.type_ids(rp).await? else {
+            return Ok(None);
+        };
+        let label = self.required_label(np).await?;
+        let far = np.labels.is_some();
+        let p = self.far_plan(far, np.var.as_ref(), None, rp.var.as_ref(), label);
+        if !p.far || p.rel_keys.is_some() || !p.rel_filter.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some((types, p.keys)))
+    }
+
+    /// A walk's levels read ahead in one statement where the store can
+    /// ([`GraphStore::walk_ahead`]): its links go in `links`, and in
+    /// `ahead` by near node with the nodes they are whole for; the far
+    /// nodes read with them are kept for binding.
+    async fn walk_ahead(
+        &mut self,
+        ids: &[u64],
+        types: &[u32],
+        (hops, keys, next): WalkAsk<'_>,
+        links: &mut HashMap<u64, Link>,
+        ahead: &mut Ahead,
+    ) -> Result<()> {
+        let Some(d) = self
+            .store
+            .walk_ahead(ids, types, hops, keys, next, WALK_LINKS_MAX)
+            .await?
+        else {
+            return Ok(());
+        };
+        self.check_time()?;
+        for r in &d.nodes {
+            let n = match keys {
+                Some([]) => self.bare_node(r),
+                k => self.merged_node(r, k),
+            };
+            self.seen_nodes.insert(n.id, n);
+        }
+        for l in d.first.into_iter().chain(d.second) {
+            let c = ahead.links.entry(l.src).or_default();
+            if !c.iter().any(|(_, r)| *r == l.id) {
+                c.push((l.dst, l.id));
+            }
+            links.insert(l.id, l);
+        }
+        ahead.complete.extend(d.complete);
+        Ok(())
     }
 
     /// [`Exec::level_links`] for an outgoing walk, a level ahead: the
@@ -2931,12 +3151,38 @@ impl Exec<'_> {
             .flat_map(|(ns, _)| ns.iter().copied())
             .filter(|i| !nodes.contains_key(i))
             .collect();
-        let any = NodePat {
-            var: None,
-            labels: None,
-            props: None,
-        };
-        nodes.extend(self.bind_nodes(&want, &any).await?);
+        if self.late && self.read_only {
+            // Nothing is read for them now: their labels and properties
+            // come late, if a later clause needs them (LDBC IC1 and IC13
+            // use only a shortest path's length). Every link's ends exist
+            // in a read-only statement.
+            let graph = self.store.graph_id();
+            let rk: HashMap<u64, u64> = links
+                .values()
+                .flat_map(|l| [(l.src, l.src_rk), (l.dst, l.dst_rk)])
+                .collect();
+            for id in want {
+                let n = match self.seen_nodes.get(&id) {
+                    Some(n) => Arc::clone(n),
+                    None => Arc::new(Node {
+                        graph,
+                        id,
+                        rk: rk.get(&id).copied().unwrap_or(0),
+                        labels: Vec::new(),
+                        props: crate::value::Props::new(),
+                        partial: Some(Arc::from(vec![super::late::NO_LABELS.to_owned()])),
+                    }),
+                };
+                nodes.insert(id, n);
+            }
+        } else {
+            let any = NodePat {
+                var: None,
+                labels: None,
+                props: None,
+            };
+            nodes.extend(self.bind_nodes(&want, &any).await?);
+        }
         let keys: Vec<(u64, u64)> = paths
             .iter()
             .flat_map(|(_, rs)| rs.iter())
@@ -2982,9 +3228,32 @@ impl Exec<'_> {
                     ),
                 ));
             }
-            let hops = self
-                .level_links(&front, types, rp, rp.dir, &mut links)
-                .await?;
+            // The last level from the other side: only links into the
+            // targets left count, so the targets' own links (the other way)
+            // that reach the frontier are those links, and far fewer than
+            // the frontier's (LDBC IC1's third `KNOWS` level: a few hundred
+            // links of the named friends against tens of thousands).
+            let hops = if d + 1 == max && left.len() < front.len() {
+                let back = match rp.dir {
+                    Dir::Out => Dir::In,
+                    Dir::In => Dir::Out,
+                    Dir::Both => Dir::Both,
+                };
+                let ends: Vec<u64> = left.iter().copied().collect();
+                let fs: HashSet<u64> = front.iter().copied().collect();
+                let mut inv: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+                for (t, fars) in self.level_links(&ends, types, rp, back, &mut links).await? {
+                    for (f, rel) in fars {
+                        if fs.contains(&f) {
+                            inv.entry(f).or_default().push((t, rel));
+                        }
+                    }
+                }
+                inv
+            } else {
+                self.level_links(&front, types, rp, rp.dir, &mut links)
+                    .await?
+            };
             d += 1;
             let mut next = Vec::new();
             for near in &front {
@@ -3191,8 +3460,21 @@ const DEEP_FAR_NODES: bool = false;
 const CONTINUE_PAST_CAP: bool = false;
 
 /// Walks over at most this many nodes a level read the next level in the
-/// same statement ([`Exec::level_links_deep`]).
+/// same statement ([`Exec::level_links_deep`]), and start with a read of
+/// all their levels ([`Exec::walk_ahead`]).
 const DEEP_MAX: usize = 64;
+
+/// A walk read ahead with more links than this is read level by level
+/// instead.
+const WALK_LINKS_MAX: usize = 4096;
+
+/// What a walk read ahead asks for ([`Exec::walk_ahead`]): its levels, the
+/// keys of its far nodes, and the next hop's types and far nodes' keys.
+type WalkAsk<'a> = (
+    u32,
+    Option<&'a [String]>,
+    Option<(&'a [u32], Option<&'a [String]>)>,
+);
 
 /// Links of a walk's next level, read ahead.
 #[derive(Default)]

@@ -189,6 +189,27 @@ async fn definer_routines_apply_their_definers_policies() {
     ck.ok("alice creates a definer function", r.is_ok(), || {
         format!("{r:?}")
     });
+    // Called by someone else before alice ever calls it: creating it
+    // pointed it at the policy views, so it reads alice's rows (before, her
+    // account couldn't read the table itself and the call failed with
+    // 1142 until alice called it once).
+    let r = a
+        .query_drop(
+            "CREATE FUNCTION first_call() RETURNS INT READS SQL DATA SQL SECURITY DEFINER \
+             RETURN (SELECT COUNT(*) FROM docs)",
+        )
+        .await;
+    ck.ok("alice creates a second definer function", r.is_ok(), || {
+        format!("{r:?}")
+    });
+    for i in 1..=3 {
+        let got = n(&mut admin, &format!("SELECT {DB}.first_call()")).await;
+        ck.ok(
+            &format!("another user calls alice's new definer function first ({i})"),
+            got == Ok(1),
+            || format!("{got:?}"),
+        );
+    }
     let got = n(&mut a, "SELECT mine()").await;
     ck.ok("alice's definer function for alice", got == Ok(1), || {
         format!("{got:?}")
@@ -379,7 +400,7 @@ async fn large_subtrees_read_the_subtree_table() {
         format!("CREATE TABLE {SDB}.orgs (id INT PRIMARY KEY, org BIGINT UNSIGNED NOT NULL)"),
         format!("INSERT INTO {SDB}.orgs VALUES (1, {tid}), (2, {child}), (3, 99)"),
         format!("CREATE USER 'rlst_alice'@'%' IDENTIFIED BY '{PW}'"),
-        format!("GRANT SELECT ON {SDB}.* TO 'rlst_alice'@'%'"),
+        format!("GRANT SELECT, CREATE ROUTINE, EXECUTE ON {SDB}.* TO 'rlst_alice'@'%'"),
         format!("CREATE POLICY sub ON {SDB}.orgs USING (SPRIG_TENANT_IN_SUBTREE(org))"),
         format!("ALTER TABLE {SDB}.orgs ENABLE ROW LEVEL SECURITY"),
     ] {
@@ -396,6 +417,30 @@ async fn large_subtrees_read_the_subtree_table() {
         got == Ok(vec![1, 2]),
         || format!("{got:?}"),
     );
+    // A definer function of alice's applies her policies with her
+    // tenant's subtree, whoever calls it (before, a definer's subtree set
+    // was empty and it showed nothing).
+    let r = a
+        .query_drop(format!(
+            "CREATE FUNCTION {SDB}.tree_n() RETURNS INT READS SQL DATA SQL SECURITY DEFINER \
+             RETURN (SELECT COUNT(*) FROM {SDB}.orgs)"
+        ))
+        .await;
+    ck.ok("alice's definer function", r.is_ok(), || format!("{r:?}"));
+    let tree_n = format!("SELECT {SDB}.tree_n()");
+    // Another user's call before alice's first one finds the body as
+    // written (1142 on the table, closed): her own call points it at the
+    // policy views.
+    let got = ids(&mut a, &tree_n).await;
+    ck.ok("alice's own call", got == Ok(vec![2]), || {
+        format!("{got:?}")
+    });
+    let got = ids(&mut admin, &tree_n).await;
+    ck.ok(
+        "alice's definer function for the administrator: her subtree's rows",
+        got == Ok(vec![2]),
+        || format!("{got:?}"),
+    );
     // Above the inline limit (the tree has 2 tenants).
     setting(&ctl, "rls.inline_subtree_max", Some("1"), &scope);
     // The setting is live; give it a few seconds to reach the gateway.
@@ -404,6 +449,12 @@ async fn large_subtrees_read_the_subtree_table() {
     ck.ok(
         "subtree above rls.inline_subtree_max: own and child rows (was 39366)",
         got == Ok(vec![1, 2]),
+        || format!("{got:?}"),
+    );
+    let got = ids(&mut admin, &tree_n).await;
+    ck.ok(
+        "above the limit, alice's definer function reads the subtree table",
+        got == Ok(vec![2]),
         || format!("{got:?}"),
     );
     let got = ids(

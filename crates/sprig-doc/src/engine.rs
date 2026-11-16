@@ -597,6 +597,25 @@ impl Engine {
         self.catalog.get(sql, ns).await
     }
 
+    /// The default collation of collection `ns` (`create`'s
+    /// `collation`), which its commands without a `collation` of their own
+    /// use, as on MongoDB. `None` for the simple collation, no collection,
+    /// or an option this release can't parse.
+    ///
+    /// # Errors
+    /// SQL errors.
+    pub async fn default_collation(
+        &self,
+        sql: &mut dyn SqlRunner,
+        ns: &Ns,
+    ) -> Result<Option<crate::collation::Collation>, MongoError> {
+        Ok(self
+            .catalog
+            .collation(sql, ns)
+            .await?
+            .and_then(|c| crate::collation::Collation::parse(&c).ok().flatten()))
+    }
+
     /// Creates the database (if needed) and its metadata table.
     ///
     /// # Errors
@@ -663,6 +682,8 @@ impl Engine {
         }
         // Schema validation.
         crate::validate::check_create(&options)?;
+        // The default collation, checked as a command's is.
+        crate::collation::Collation::of(&options)?;
         self.ensure_db(sql, &ns.db).await?;
         let table = meta::table_name(&ns.coll);
         let ddl = if capped::Cap::of(&options).is_some() {
@@ -962,7 +983,8 @@ impl Engine {
                 Ok(d) => return Ok((d.affected, errors)),
                 Err(e) if e.is(1062) && good.len() > 1 => {}
                 Err(e) if e.is(1062) => {
-                    errors.push((0, dup_error(&e, &good[0].1)));
+                    let d = json::to_bson(&good[0].0.doc, good[0].0.types.as_deref()).ok();
+                    errors.push((0, dup_error(&e, ns, &m, &good[0].1, d.as_ref())));
                     return Ok((0, errors));
                 }
                 Err(e) => return Err(mongo_error(&e)),
@@ -986,7 +1008,8 @@ impl Engine {
                     match sql.exec(&stmt).await {
                         Ok(_) => n += 1,
                         Err(e) if e.is(1062) => {
-                            errors.push((i, dup_error(&e, &id)));
+                            let d = json::to_bson(&s.doc, s.types.as_deref()).ok();
+                            errors.push((i, dup_error(&e, ns, &m, &id, d.as_ref())));
                             if ordered {
                                 break;
                             }
@@ -1031,7 +1054,8 @@ impl Engine {
             .as_ref()
             .filter(|p| !p.is_empty())
             .map(Projection::parse)
-            .transpose()?;
+            .transpose()?
+            .map(|p| p.with_query(&pred));
         // `{$natural: 1}` or `{$natural: -1}`, the collection's own
         // order (a capped collection's insertion order).
         let natural = capped::natural_of(spec.sort.as_ref())?;
@@ -1923,7 +1947,7 @@ impl Engine {
                     return Ok((true, Some(new), Some(old)));
                 }
                 Ok(_) => {}
-                Err(e) if e.is(1062) => return Err(dup_error(&e, &id)),
+                Err(e) if e.is(1062) => return Err(dup_error(&e, ns, m, &id, Some(&new))),
                 Err(e) => return Err(mongo_error(&e)),
             }
         }
@@ -2021,6 +2045,10 @@ impl Engine {
         specs: &[Document],
         migrated: bool,
     ) -> Result<(usize, usize, bool), MongoError> {
+        // One build at a time per collection, as MongoDB orders them: a
+        // second `createIndexes` then sees the first's index (the same one
+        // is a no-op, a different one under its name is refused).
+        let _build = index_build_lock(sql.tenant(), ns).await;
         let existed = self.meta(sql, ns).await?.is_some();
         let mut m = self.meta_or_create(sql, ns).await?;
         let texts = self.text_index_specs(sql, ns).await?.len();
@@ -2095,15 +2123,58 @@ impl Engine {
                 continue;
             }
             let unique = s.get_bool("unique").unwrap_or(false);
+            let sparse = s.get_bool("sparse").unwrap_or(false);
+            let partial = match s.get(meta::PARTIAL_FILTER) {
+                None => None,
+                Some(Bson::Document(f)) => Some(f.clone()),
+                Some(_) => {
+                    return Err(MongoError::new(
+                        code::TYPE_MISMATCH,
+                        "partialFilterExpression must be an object",
+                    ));
+                }
+            };
+            if sparse && partial.is_some() {
+                return Err(MongoError::new(
+                    code::CANNOT_CREATE_INDEX,
+                    "cannot mix \"partialFilterExpression\" and \"sparse\" options",
+                ));
+            }
+            // MongoDB checks every partial filter; the SQL form is needed
+            // only for a unique index (its gate column).
+            if let Some(f) = &partial
+                && let Err(e) = crate::policy::partial_to_sql(f)
+                && (unique || e.code != code::SPRIG_DOC_FEATURE_UNSUPPORTED)
+            {
+                return Err(e);
+            }
+            let same_scope = |i: &IndexDef| {
+                i.sparse == sparse
+                    && i.extra.get_document(meta::PARTIAL_FILTER).ok() == partial.as_ref()
+            };
             // An automatic index never conflicts: the user's
             // index is made beside it, and automatic indexing retires its
             // own as redundant.
             if let Some(ex) = m.indexes.iter().find(|i| i.name == name && !i.is_auto()) {
-                if ex.key == pattern && ex.unique == unique && ex.expire_after == expire {
+                if ex.key == pattern
+                    && ex.unique == unique
+                    && ex.expire_after == expire
+                    && same_scope(ex)
+                {
                     continue;
                 }
-                if ex.key == pattern && ex.unique == unique {
+                // A different partial filter is another index (86 below).
+                if ex.key == pattern
+                    && ex.unique == unique
+                    && ex.extra.get_document(meta::PARTIAL_FILTER).ok() == partial.as_ref()
+                {
                     let mut want = doc! {"v": 2, "key": key.clone(), "name": name.clone()};
+                    if sparse {
+                        want.insert("sparse", true);
+                    }
+                    if let Some(f) = &partial {
+                        want.insert(meta::PARTIAL_FILTER, f.clone());
+                    }
                     if let Some(e) = expire {
                         want.insert("expireAfterSeconds", e);
                     }
@@ -2123,7 +2194,13 @@ impl Engine {
                     ),
                 ));
             }
-            if let Some(ex) = m.indexes.iter().find(|i| i.key == pattern && !i.is_auto()) {
+            // Indexes on one key pattern may differ in their partial
+            // filters, as on MongoDB 8.0.
+            if let Some(ex) = m.indexes.iter().find(|i| {
+                i.key == pattern
+                    && !i.is_auto()
+                    && i.extra.get_document(meta::PARTIAL_FILTER).ok() == partial.as_ref()
+            }) {
                 return Err(MongoError::new(
                     code::INDEX_OPTIONS_CONFLICT,
                     format!("Index already exists with a different name: {}", ex.name),
@@ -2140,7 +2217,6 @@ impl Engine {
                             | "sparse"
                             | "expireAfterSeconds"
                             | "v"
-                            | "background"
                             | "ns"
                             | "sprig"
                     )
@@ -2148,6 +2224,20 @@ impl Engine {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             let mut extra = extra;
+            if let Some((p, _)) = key
+                .iter()
+                .find(|(_, v)| matches!(v, Bson::String(t) if t == "hashed"))
+            {
+                extra.insert(meta::HASHED_PATH, p.clone());
+            }
+            // An index without a collation of its own takes the
+            // collection's default, as on MongoDB.
+            if !extra.contains_key("collation")
+                && let Ok(c) = m.options.get_document("collation")
+                && c.get_str("locale").is_ok_and(|l| l != "simple")
+            {
+                extra.insert("collation", c.clone());
+            }
             if geo_path.is_some() && !extra.contains_key("2dsphereIndexVersion") {
                 extra.insert("2dsphereIndexVersion", 3);
             }
@@ -2156,7 +2246,7 @@ impl Engine {
                 name,
                 key: pattern.clone(),
                 unique,
-                sparse: s.get_bool("sparse").unwrap_or(false),
+                sparse,
                 expire_after: expire,
                 origin: if migrated {
                     "migrated".into()
@@ -2181,10 +2271,56 @@ impl Engine {
                         .map_err(|e| mongo_error(&e))?;
                 }
             }
-            if let Err(e) = sql
-                .exec(&meta::create_index_sql(&ns.db, &m.table, &idx))
-                .await
+            let mut idx = idx;
+            let mut made = sql
+                .exec(&meta::create_index_sql(
+                    &ns.db,
+                    &m.table,
+                    &idx,
+                    idx.gate_sql()?.as_deref(),
+                ))
+                .await;
+            // 1061: another createIndexes made an index of this number at
+            // the same moment (Mongoose's autoIndex beside syncIndexes).
+            // The same index is then already there, as MongoDB answers a
+            // concurrent identical build; another index moves this one on.
+            let mut tries = 0;
+            while let Err(e) = &made
+                && e.is(1061)
+                && tries < 40
             {
+                tries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let Some(now) = self.meta(sql, ns).await? else {
+                    break;
+                };
+                if now
+                    .indexes
+                    .iter()
+                    .any(|i| i.name == idx.name && i.key == idx.key && i.unique == idx.unique)
+                {
+                    m = now;
+                    made = Ok(Done::default());
+                    idx.id = u32::MAX;
+                    break;
+                }
+                if now.next_index > idx.id {
+                    m = now;
+                    idx.id = m.next_index;
+                    made = sql
+                        .exec(&meta::create_index_sql(
+                            &ns.db,
+                            &m.table,
+                            &idx,
+                            idx.gate_sql()?.as_deref(),
+                        ))
+                        .await;
+                }
+            }
+            if idx.id == u32::MAX {
+                continue;
+            }
+            if let Err(e) = made {
                 if e.is(1062) {
                     return Err(MongoError::new(
                         code::DUPLICATE_KEY,
@@ -2232,7 +2368,15 @@ impl Engine {
         let Some(m) = self.meta(sql, ns).await? else {
             return Ok(None);
         };
-        let mut out = vec![doc! {"v": 2, "key": {"_id": 1}, "name": "_id_"}];
+        let mut id = doc! {"v": 2, "key": {"_id": 1}, "name": "_id_"};
+        // The `_id` index has the collection's default collation, as on
+        // MongoDB (the stored key itself still compares bytes).
+        if let Ok(c) = m.options.get_document("collation")
+            && c.get_str("locale").is_ok_and(|l| l != "simple")
+        {
+            id.insert("collation", c.clone());
+        }
+        let mut out = vec![id];
         out.extend(
             m.indexes
                 .iter()
@@ -3186,25 +3330,75 @@ fn parse_array_filters(afs: &[Document]) -> Result<Vec<(String, Pred)>, MongoErr
         .collect()
 }
 
-fn dup_error(e: &SqlError, id: &Bson) -> MongoError {
-    let idx = if e.message.contains("PRIMARY") {
-        None
-    } else {
-        e.message.split('\'').rev().nth(1).map(str::to_owned)
+/// This gateway's lock on index builds of the collection `ns` of `tenant`
+/// (other gateways' concurrent builds meet MariaDB's 1061 instead, which
+/// `create_indexes` resolves).
+async fn index_build_lock(tenant: u64, ns: &Ns) -> tokio::sync::OwnedMutexGuard<()> {
+    type Locks = std::collections::HashMap<(u64, String), Arc<tokio::sync::Mutex<()>>>;
+    static LOCKS: std::sync::LazyLock<std::sync::Mutex<Locks>> =
+        std::sync::LazyLock::new(Default::default);
+    let lock = {
+        let mut g = LOCKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if g.len() > 1024 {
+            g.retain(|_, l| Arc::strong_count(l) > 1);
+        }
+        Arc::clone(g.entry((tenant, ns.to_string())).or_default())
     };
-    let (pattern, value) = match idx {
-        None => (doc! {"_id": 1}, doc! {"_id": id.clone()}),
-        Some(_) => (doc! {}, doc! {}),
-    };
+    lock.lock_owned().await
+}
+
+/// MongoDB's 11000 for a duplicate on `m`'s index named in MariaDB's
+/// 1062: `E11000 duplicate key error collection: db.c index: email_1 dup
+/// key: { email: "a@b" }`, with `keyPattern` and `keyValue` from `doc`
+/// (clients such as Mongoose read the index and its fields from them).
+fn dup_error(e: &SqlError, ns: &Ns, m: &CollMeta, id: &Bson, doc: Option<&Document>) -> MongoError {
+    let mut pattern = doc! {"_id": 1};
+    let mut value = doc! {"_id": id.clone()};
+    let mut name = "_id_".to_owned();
+    if !e.message.contains("PRIMARY") {
+        let key = e.message.split('\'').rev().nth(1).unwrap_or_default();
+        let idx = m.indexes.iter().find(|i| i.mariadb_name() == key);
+        match (idx, doc) {
+            (Some(i), Some(d)) => {
+                name.clone_from(&i.name);
+                pattern = Document::new();
+                value = Document::new();
+                for (path, dir) in &i.key {
+                    pattern.insert(path.clone(), *dir);
+                    let v = filter::values_at(d, path)
+                        .leaves
+                        .first()
+                        .map_or(Bson::Null, |v| (*v).clone());
+                    value.insert(path.clone(), v);
+                }
+            }
+            (Some(i), None) => {
+                name.clone_from(&i.name);
+                pattern = i
+                    .key
+                    .iter()
+                    .map(|(p, d)| (p.clone(), Bson::Int32(*d)))
+                    .collect();
+                value = Document::new();
+            }
+            (None, _) => {
+                "unique".clone_into(&mut name);
+                pattern = Document::new();
+                value = Document::new();
+            }
+        }
+    }
+    let shown: Vec<String> = value
+        .iter()
+        .map(|(k, v)| format!("{k}: {}", v.clone().into_relaxed_extjson()))
+        .collect();
     MongoError::new(
         code::DUPLICATE_KEY,
         format!(
-            "E11000 duplicate key error collection: index: {} dup key: {value}",
-            if pattern.contains_key("_id") {
-                "_id_"
-            } else {
-                "unique"
-            }
+            "E11000 duplicate key error collection: {ns} index: {name} dup key: {{ {} }}",
+            shown.join(", ")
         ),
     )
     .with_extra(doc! {"keyPattern": pattern, "keyValue": value})

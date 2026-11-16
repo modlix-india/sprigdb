@@ -547,6 +547,16 @@ impl Remote {
             }
             // The owner reads its own catalog; a hand-off is the owner's.
             Cmd::Reconfigure(_) | Cmd::HandOff(_) => {}
+            // A relayed slot is quiet with no consumer and no request
+            // waiting; the owner's side decides for itself.
+            Cmd::Quiet(reply) => {
+                let quiet = self.consumers.is_empty() && self.pending.is_empty();
+                let _ = reply.send(if quiet {
+                    crate::owner::Quiet::Idle { expires_at: None }
+                } else {
+                    crate::owner::Quiet::Busy
+                });
+            }
             Cmd::Stop => return false,
         }
         true

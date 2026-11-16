@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use sprig_catalog::CatalogLocator;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_logic::placement::{EXPLAIN_COLUMNS, ExplainFunction, explain_stored};
 use sprig_proto_mysql::StatusFlags;
@@ -119,7 +120,7 @@ impl PassSession {
         let svc = Arc::clone(ts.services());
         let ep = svc.locator.writer(ts.tenant).await?;
         let store = sprig_logic::LogicStore::new(ep.store.schema());
-        let mut conn = ep.pool.get_conn().await.map_err(catalog_err)?;
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(catalog_err)?;
         let module = match store
             .module(&mut conn, row.db_id.0, e.kind.as_str(), &e.name)
             .await

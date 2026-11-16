@@ -81,6 +81,17 @@ pub(crate) struct OidcState {
     claims: Option<Arc<serde_json::Value>>,
 }
 
+impl OidcState {
+    /// Logged in already with a token whose verified claims are `claims`
+    /// (a MongoDB command sent over HTTP with a bearer token).
+    pub(crate) fn logged_in(claims: Arc<serde_json::Value>) -> Self {
+        Self {
+            pending: None,
+            claims: Some(claims),
+        }
+    }
+}
+
 /// One connection's state.
 pub struct Conn {
     pub(crate) shared: Arc<Shared>,
@@ -549,18 +560,25 @@ impl Conn {
             .map_err(|e| MongoError::new(code::AUTHENTICATION_FAILED, e.to_string()))?;
         let svc = &self.shared.d.login;
         let admitted = svc.admit(self.peer.ip()).is_ok();
-        let login = svc
-            .start_mongo(LoginRequest {
-                persona: Persona::MySql84,
-                login_name: user.as_bytes().to_vec(),
-                sni: self.tls.as_ref().and_then(|t| t.sni.clone()),
-                client_ip: self.peer.ip(),
-                tls: self.tls.is_some(),
-                client_cert: self.tls.as_ref().is_some_and(|t| t.client_cert),
-                client_dn: self.tls.as_ref().and_then(|t| t.client_dn.clone()),
-                can_handle_expired_password: false,
-            })
-            .await;
+        let req = LoginRequest {
+            persona: Persona::MySql84,
+            login_name: user.as_bytes().to_vec(),
+            sni: self.tls.as_ref().and_then(|t| t.sni.clone()),
+            client_ip: self.peer.ip(),
+            tls: self.tls.is_some(),
+            client_cert: self.tls.as_ref().is_some_and(|t| t.client_cert),
+            client_dn: self.tls.as_ref().and_then(|t| t.client_dn.clone()),
+            can_handle_expired_password: false,
+        };
+        // Residency: SCRAM can't be handed to another DC (the client
+        // proves itself against the verifier), so a tenant pinned to
+        // other DCs is refused here without loading it: 39301 naming the
+        // DCs, 39302 with `deny_remote_access`. MONGODB-OIDC is handed off.
+        if let Some(e) = svc.local_only(&req, "SCRAM-SHA-256").await {
+            metrics::counter!("sprig_mongo_auth_total", "mechanism" => "SCRAM-SHA-256", "result" => "failed").increment(1);
+            return Err(MongoError::new(code::AUTHENTICATION_FAILED, e.to_string()));
+        }
+        let login = svc.start_mongo(req).await;
         let real = login
             .scram_credential(ScramKind::Sha256)
             .filter(|_| admitted)

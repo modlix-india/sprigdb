@@ -184,6 +184,7 @@ pub async fn run_stream(
         top_hop: false,
         fused: None,
         read_only: false,
+        then: None,
     };
     let mut clauses = q.parts[0].clauses.clone();
     // SKIP and LIMIT apply to the whole stream, not to each page.

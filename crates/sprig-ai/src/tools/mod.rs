@@ -15,10 +15,14 @@
 //!   ([`ToolHost::check_proposal`]): try a policy as test users, compile
 //!   logic, generate test rows. A failed check comes back to the model to
 //!   fix; the check's counts ride on the proposal.
+//! - [`chart`]: Show Me's rules, which chart marks fit a tile's shelves;
+//! - [`joins`]: declared and inferred joins behind `relationships`;
 //! - [`sensitive`]: the deterministic scanner behind `sensitive_columns`;
 //!   [`testdata`]: the test-row generator behind `generate_rows`.
 
 pub mod builtin;
+pub mod chart;
+pub mod joins;
 pub mod schema;
 pub mod sensitive;
 pub mod testdata;
@@ -344,6 +348,14 @@ impl ToolRegistry {
             }
         }
         Ok(Self { tools })
+    }
+
+    /// A registry without tools, for turns that only write (a digest).
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            tools: BTreeMap::new(),
+        }
     }
 
     /// The built-in tools.

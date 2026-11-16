@@ -108,6 +108,8 @@ struct ClusterState {
     probing_since: Option<Instant>,
     last_pass: Option<Instant>,
     heartbeat: Option<(sprig_common::ids::NodeId, HeartbeatWriter)>,
+    /// When the change feed's time index was last written here.
+    time_marked: Option<Instant>,
     /// The `sprig_ctl` reference `sprig_gw` was last made sure of with,
     /// when, and whether that worked.
     gw_checked: Option<(String, Instant, bool)>,
@@ -440,6 +442,7 @@ impl ClusterMonitor {
         }
         if rec.topology != TopologyKind::Galera {
             beat(&mut st, &eps, settings.probe_timeout).await;
+            time_mark(&mut st, &eps, settings.probe_timeout).await;
         }
         let started = Instant::now();
         let mut probes = Prober::with_clock(settings.probe_timeout, Arc::clone(&self.clock))
@@ -724,6 +727,40 @@ async fn beat(st: &mut ClusterState, eps: &[NodeEndpoint], timeout: Duration) {
     if let Err(e) = r {
         tracing::debug!(node = %writer, error = %e, "heartbeat failed");
         st.heartbeat = None;
+    }
+}
+
+/// Writes the change feed's time index on the cluster's writable node
+/// (`sprig_cluster::sys::feed_time_mark`), at most once per step: a
+/// change stream that starts at a time reads from the position written
+/// before it.
+async fn time_mark(st: &mut ClusterState, eps: &[NodeEndpoint], timeout: Duration) {
+    let step = Duration::from_secs(sprig_cluster::sys::FEED_TIME_STEP_SECONDS);
+    if st.time_marked.is_some_and(|t| t.elapsed() < step) {
+        return;
+    }
+    let Some(writer) = st
+        .last_probes
+        .iter()
+        .find(|p| p.facts().is_some_and(|f| !f.is_replica() && f.writable()))
+        .map(|p| p.node.clone())
+    else {
+        return;
+    };
+    let Some(ep) = eps.iter().find(|e| e.node == writer) else {
+        return;
+    };
+    let r = match ProbeSession::connect(ep, timeout).await {
+        Ok(mut s) => {
+            let r = sprig_cluster::sys::feed_time_mark(&mut s).await;
+            s.close().await;
+            r
+        }
+        Err(e) => Err(e),
+    };
+    match r {
+        Ok(()) => st.time_marked = Some(Instant::now()),
+        Err(e) => tracing::debug!(node = %writer, error = %e, "feed time index not written"),
     }
 }
 

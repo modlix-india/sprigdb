@@ -95,6 +95,8 @@ impl PassSession {
     /// and asks the recorder for a plan. `None` without capture or tenant.
     pub(super) fn wl_start(&self, logical: &[u8]) -> Option<Pending> {
         let wl = self.wl.as_ref()?;
+        // The client's text when a rewrite put data into the statement.
+        let logical = self.wl_text.as_deref().unwrap_or(logical);
         let ts = self.tenant.as_deref()?;
         let (lex, _) = self.lex_opts();
         let current = self.current_logical();

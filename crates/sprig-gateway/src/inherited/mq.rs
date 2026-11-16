@@ -38,6 +38,7 @@ use mysql_async::prelude::Queryable;
 use serde_json::{Value, json};
 use sprig_catalog::CatalogLocator;
 use sprig_catalog::ddl::{database_key, shard_schemas};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::version::VersionKind;
 use sprig_common::ids::TenantId;
 use sprig_common::names::quote;
@@ -230,7 +231,7 @@ pub async fn ensure_vhost(
     // catalog load that starts before a module's tables exist fails with 1412
     // when it reads them (seen when they ran together).
     {
-        let mut c = ep.pool.get_conn().await.map_err(cat_err)?;
+        let mut c = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
         sprig_catalog::Migrator::new(&[
             sprig_inherit::msg::store::MSG_MODULE,
             sprig_queues::catalog::MQ_MODULE,
@@ -256,7 +257,7 @@ pub async fn ensure_vhost(
         .iter()
         .any(|d| d.kind == DefKind::Queue)
         .then(|| tokio::spawn(warm_store(Arc::clone(svc), t, Arc::clone(&row))));
-    let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
     let mstore = MsgStore::new(ep.store.schema());
     let st = super::state_of(&cat);
     let mq = cat
@@ -590,7 +591,7 @@ pub async fn remove(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) ->
         }
     }
     let ep = svc.locator.writer(t).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
     MsgStore::new(ep.store.schema())
         .delete_instance(&mut conn, def.key())
         .await?;
@@ -943,7 +944,7 @@ pub async fn deliver_outbox(
     let cluster = svc.locator.cluster(t).await?;
     let pool = svc.locator.ctl_pool(&cluster).await?;
     let mut c = pool
-        .get_conn()
+        .get_conn_bounded()
         .await
         .map_err(sprig_streams::maria::map_err)?;
     c.query_drop(format!(

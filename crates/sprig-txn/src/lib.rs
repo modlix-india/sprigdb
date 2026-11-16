@@ -63,6 +63,9 @@ pub use locate::{GroupSchemas, MapLocator};
 pub use redo::{RedoBranch, RedoStmt, Replay};
 pub use resolver::{DrainReport, RedoReport, Resolver, ScanReport, SweepReport};
 pub use settings::{NonXaPolicy, ResolverConfig, TxnConfig};
+/// The map stores a [`MapLocator`] reads (for roles that build one without
+/// depending on `sprig-shard` themselves).
+pub use sprig_shard::{ShardMapStore, TenantMaps};
 pub use xid::{AnchorRef, Dtid, DtidGen, Gtrid, Xid};
 
 use sprig_common::ids::{ClusterId, TenantId};

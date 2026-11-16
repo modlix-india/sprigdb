@@ -43,6 +43,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::{Namespace, ObjectKind, ObjectState};
 use sprig_catalog::version::VersionKind;
 use sprig_catalog::{CatalogLocator, Freshness, TenantCatalog};
@@ -700,7 +701,7 @@ async fn record(
     state: InstanceState,
 ) -> Result<()> {
     let ep = svc.locator.writer(t).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
     let store = MsgStore::new(ep.store.schema());
     if store.instance(&mut conn, s.key()).await?.is_none() {
         let id = ep.store.next_object_id(&mut conn).await?.0;
@@ -776,7 +777,7 @@ async fn ensure_one(
     let sig = signature(chain, s, &conns);
     let ep = svc.locator.writer(t).await?;
     let row = {
-        let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
         let store = MsgStore::new(ep.store.schema());
         if store.migrated(&mut conn).await? {
             store.instance(&mut conn, s.key()).await?
@@ -1101,7 +1102,7 @@ pub async fn drop_instance(
     conn_names: &[String],
 ) -> Result<bool> {
     let ep = svc.locator.writer(t).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
     let store = MsgStore::new(ep.store.schema());
     if !store.migrated(&mut conn).await? {
         return Ok(false);
@@ -1161,7 +1162,7 @@ pub async fn drop_instance(
             }
         }
     }
-    let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
     store.delete_instance(&mut conn, s.key()).await?;
     Ok(true)
 }
@@ -1219,7 +1220,7 @@ pub(crate) async fn drop_instance_rows(
     sink: u64,
 ) -> Result<usize> {
     let ep = svc.locator.writer(t).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
     let store = MsgStore::new(ep.store.schema());
     if !store.migrated(&mut conn).await? {
         return Ok(0);
@@ -1251,7 +1252,7 @@ pub(crate) async fn stale_instance_rows(
     t: TenantId,
 ) -> Result<Vec<DefKey>> {
     let ep = svc.locator.writer(t).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
     let store = MsgStore::new(ep.store.schema());
     if !store.migrated(&mut conn).await? {
         return Ok(Vec::new());
@@ -1296,7 +1297,7 @@ pub(crate) async fn delete_instance_row(
     k: DefKey,
 ) -> Result<()> {
     let ep = svc.locator.writer(t).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
     let store = MsgStore::new(ep.store.schema());
     let Some(row) = store.instance(&mut conn, k).await? else {
         return Ok(());
@@ -1337,7 +1338,7 @@ pub(crate) async fn delete_instance_row(
             tracing::warn!(tenant = %t, def = %k, error = %e, "a stale sink instance's connections were not dropped");
         }
     }
-    let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
     store.delete_instance(&mut conn, k).await
 }
 
@@ -1378,6 +1379,62 @@ async fn drop_unused_connections(
     Ok(())
 }
 
+/// The members this DC indexes that hold an instance of sink definition
+/// `d`: those with an instance of its source, and those that detached it
+/// ([`unindexed_members`]).
+///
+/// # Errors
+/// The store's.
+pub async fn members_to_drop(
+    svc: &Arc<TenantServices>,
+    chain: &Chain,
+    d: &Definition,
+) -> Result<Vec<TenantId>> {
+    let mut members = members_of(svc, chain, d).await?;
+    // Members that detached their source instance keep their sink
+    // instance; the source's index no longer lists them.
+    let detached = unindexed_members(svc, d, &members).await?;
+    if !detached.is_empty() {
+        tracing::info!(def = %d.key(), members = ?detached, "dropping detached members' sink instances too");
+    }
+    members.extend(detached);
+    Ok(members)
+}
+
+/// Drops `members`' instances of sink definition `d`, with the
+/// connections only that sink used; a member that fails is logged (the
+/// orphan sweep takes it later). The number dropped.
+///
+/// # Errors
+/// The directory's.
+pub async fn drop_listed(
+    svc: &Arc<TenantServices>,
+    d: &Definition,
+    members: Vec<TenantId>,
+) -> Result<usize> {
+    let spec: SinkSpec = serde_json::from_value(d.definition.clone()).unwrap_or_default();
+    let conn_names: Vec<String> = spec
+        .connections
+        .iter()
+        .filter(|(_, p)| !p)
+        .map(|(c, _)| c.clone())
+        .collect();
+    let mut n = 0;
+    for t in members {
+        if super::dir_entry(svc, t).await?.is_none() {
+            continue;
+        }
+        match drop_instance(svc, t, d, &conn_names).await {
+            Ok(true) => n += 1,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(tenant = %t, def = %d.key(), error = %e, "inherited sink instance not dropped");
+            }
+        }
+    }
+    Ok(n)
+}
+
 /// Members holding an instance of sink definition `s` that the source's
 /// instance index doesn't list: `ALTER INHERITED STREAM ...
 /// DETACH` removes the member's source instance from `inherit-instances/`,
@@ -1408,7 +1465,7 @@ pub async fn unindexed_members(
         }
         let r = async {
             let ep = svc.locator.writer(t).await?;
-            let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+            let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
             let store = MsgStore::new(ep.store.schema());
             Ok::<bool, SprigError>(
                 store.migrated(&mut conn).await?
@@ -1530,7 +1587,7 @@ impl DeployHost {
 
     async fn conn(&self) -> Result<(mysql_async::Conn, String)> {
         let ep = self.svc.locator.writer(self.cat.tenant).await?;
-        let c = ep.pool.get_conn().await.map_err(cat_err)?;
+        let c = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
         Ok((c, ep.store.schema().to_owned()))
     }
 }
@@ -1641,7 +1698,7 @@ impl Host for DeployHost {
 
     async fn next_id(&mut self) -> Result<u64> {
         let ep = self.svc.locator.writer(self.cat.tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
         Ok(ep.store.next_object_id(&mut conn).await?.0)
     }
 

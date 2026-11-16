@@ -40,7 +40,17 @@
 //!   `toUpperCase`, `toLowerCase`, `includes`, `startsWith`, `endsWith`,
 //!   `indexOf` on non-null text; `String(x)`;
 //! - `return {fields}`, `return sprig.event(name, {fields})`,
-//!   `sprig.reject(message)`, `throw new Error(message)`.
+//!   `sprig.reject(message)`, `throw new Error(message)`;
+//! - `do { } while (test)`;
+//! - `try`/`catch`/`finally` and `throw e` ([`Stmt::Try`] says what a
+//!   `catch` catches); a `catch` reads `e.message` and `e.name` only when
+//!   the `try` raises just the code's own error objects (a database
+//!   error's text can differ between the tiers);
+//! - helper functions (`function f() {}`, `const f = (x) => ...`), at
+//!   module level or inside the function, inlined at each call in the
+//!   scope they were declared in, so closures read and write the variables
+//!   they see; one whose body is one `return` is an expression, any other
+//!   runs as statements before the statement that calls it.
 //!
 //! Reading a column of a `sqlOne` row that may be `null` throws a
 //! `TypeError` in JavaScript, so the compiled code checks the row first
@@ -71,9 +81,10 @@ use sprig_common::Result;
 
 use crate::check::Analysis;
 use crate::ir::{
-    BinOp, Block, Bound, Builtin, DbOp, ErrorSpec, EventDef, Expr, Function, Literal, LocalId,
-    Param, PathSeg, SqlShape, Stmt, Ty, UnOp,
+    BinOp, Block, Bound, Builtin, Caught, DbOp, ErrorSpec, EventDef, Expr, Function, Literal,
+    LocalId, Param, PathSeg, SqlShape, Stmt, Ty, UnOp,
 };
+use crate::link::{CallDep, StreamTarget};
 use crate::sql::{self, Columns, Want};
 use crate::{Compiled, Options, Reason};
 
@@ -211,6 +222,7 @@ pub fn compile_with(
             )));
         }
         let mut l = L::new(name, source, sig, cat, widen.clone());
+        l.module_id = opts.module_id;
         l.program(&parsed.program);
         if let Some(e) = l.fatal.take() {
             return Err(e);
@@ -219,8 +231,15 @@ pub fn compile_with(
             widen = l.widen;
             continue;
         }
+        let calls = std::mem::take(&mut l.calls);
+        let reaches = std::mem::take(&mut l.reaches);
+        let depth = l.depth;
         let (f, reasons, lints) = l.finish();
-        return Ok(crate::finish(f, reasons, lints, opts));
+        let mut c = crate::finish(f, reasons, lints, opts);
+        c.analysis.calls = calls;
+        c.analysis.reaches = reaches.into_iter().collect();
+        c.analysis.call_depth = depth;
+        return Ok(c);
     }
     Ok(refused(Reason::new(
         "js.types",
@@ -239,9 +258,15 @@ enum Var {
         found: LocalId,
         cols: Vec<(String, LocalId)>,
     },
-    /// A `db.exec` result.
+    /// A `db.exec` or `db.publish` result.
     Exec {
         affected: LocalId,
+    },
+    /// A `db.call` result: the event's name, and each field's local in
+    /// the callee's wrapper order.
+    Call {
+        event: LocalId,
+        cols: Vec<(String, LocalId)>,
     },
     /// A `db.sql` result (a JSON array of rows) and its columns.
     Rows {
@@ -267,6 +292,59 @@ enum Var {
     /// A validation's or trigger's scalar: a column, `old_<column>` or
     /// `op`, made a parameter when first read.
     Field(String),
+    /// A helper function: its source's offsets, the scope it was declared
+    /// in, and whether it is an expression (`const f = (a) => ...`).
+    Helper {
+        start: u32,
+        end: u32,
+        depth: usize,
+        expr: bool,
+    },
+    /// An expression-form helper's parameter: its argument's value.
+    Val(V),
+    /// A `catch`'s binding: where the error is kept, and whether its
+    /// `message` and `name` read the same in both tiers (the `try` body
+    /// raises only the code's own errors).
+    Exc {
+        caught: Caught,
+        readable: bool,
+    },
+}
+
+/// What a jump can reach.
+#[derive(Debug, Clone)]
+enum JFrame {
+    /// A loop, and what `continue` runs first (a counted loop's update,
+    /// a `do`'s test).
+    Loop { cont: Block },
+    /// An inlined helper: its block's label, and the local its value
+    /// lands in (made at its first `return` of a value).
+    Helper {
+        label: u32,
+        result: Option<LocalId>,
+        /// Every `return` gave a non-null value.
+        nn: bool,
+    },
+    /// A `try` with a `finally`: a jump out of it leaves its block with
+    /// `cmp` set to the jump's number, the `finally` runs, and the jump
+    /// goes on from there.
+    Finally {
+        label: u32,
+        cmp: LocalId,
+        jumps: Vec<Jump>,
+    },
+}
+
+/// A jump, as it goes on after `finally` blocks.
+#[derive(Debug, Clone)]
+enum Jump {
+    Break,
+    Continue,
+    /// The function's `return`: the event and its fields, already
+    /// evaluated.
+    Return(String, Vec<(String, Expr)>),
+    /// A helper's `return`: leave its block.
+    Leave(u32),
 }
 
 /// A fact key: a parameter or a local (a row's `found`).
@@ -313,15 +391,28 @@ struct L<'s, 'c> {
     lints: Vec<Reason>,
     scopes: Vec<Vec<(String, Var)>>,
     facts: BTreeSet<Key>,
-    /// Unconditional reads of rows that may be `null`, for the guard
-    /// before the statement.
-    guards: Vec<(LocalId, String)>,
+    /// Statements that must run before the statement being lowered, in
+    /// order: the checks of rows it reads unconditionally (a `TypeError`
+    /// when one is `null`) and the bodies of helper functions it calls.
+    pre: Block,
     /// Inside a conditionally evaluated operand.
     cond: u32,
-    loops: u32,
-    /// Per enclosing loop, what `continue` runs first: a counted loop's
-    /// update.
-    conts: Vec<Block>,
+    /// What jumps can reach, innermost last: loops, inlined helpers and
+    /// `try` statements with a `finally`.
+    jframes: Vec<JFrame>,
+    /// Labels of [`Stmt::Block`]s, and `try` statements, numbered.
+    labels: u32,
+    /// Helper functions being inlined (their start offsets): a call to
+    /// one of them again is recursion.
+    inlining: Vec<u32>,
+    /// Added to span offsets: an inlined helper's source is parsed alone,
+    /// so its spans start at 0.
+    span_base: u32,
+    /// Added to declaration offsets for widening, per inlined call, so two
+    /// calls of one helper widen their locals apart.
+    salt: u32,
+    /// Inlined calls so far (for `salt`).
+    inlines: u32,
     /// Declaration offset → wider type for the next pass.
     widen: BTreeMap<u32, Ty>,
     /// Event name → fields in first-seen order.
@@ -336,15 +427,79 @@ struct L<'s, 'c> {
     table: Option<String>,
     old_found: Option<LocalId>,
     old_used: std::cell::Cell<bool>,
+    /// The module being compiled (a `db.call` back into it is recursion).
+    module_id: u64,
+    /// What compiled `db.call`s were compiled against.
+    calls: Vec<CallDep>,
+    /// Modules the compiled calls reach.
+    reaches: BTreeSet<u64>,
+    /// The longest chain of compiled calls below this code.
+    depth: u32,
 }
 
 /// Whether control can't continue after the lowered statements.
 fn exits(b: &Block) -> bool {
     match b.last() {
-        Some(Stmt::Return | Stmt::Throw(_)) => true,
+        Some(Stmt::Return | Stmt::Throw(_) | Stmt::Rethrow(_) | Stmt::Leave(_)) => true,
         Some(Stmt::If(_, a, c)) => exits(a) && exits(c),
         _ => false,
     }
+}
+
+/// The locals a block assigns.
+fn assigned(b: &Block, out: &mut BTreeSet<LocalId>) {
+    for s in b {
+        match s {
+            Stmt::Assign(l, _) => {
+                out.insert(*l);
+            }
+            Stmt::If(_, a, c) => {
+                assigned(a, out);
+                assigned(c, out);
+            }
+            Stmt::While { body, .. } | Stmt::Block(_, body) | Stmt::Try { body, .. } => {
+                assigned(body, out);
+            }
+            Stmt::Db(DbOp::Sql { shape, .. }) => match shape {
+                SqlShape::One { found, into } => {
+                    out.insert(*found);
+                    out.extend(into.iter().map(|(_, l)| *l));
+                }
+                SqlShape::Many { into, .. } => {
+                    out.insert(*into);
+                }
+                SqlShape::Exec { affected } | SqlShape::Publish { affected, .. } => {
+                    out.insert(*affected);
+                }
+                SqlShape::Call {
+                    event,
+                    result,
+                    into,
+                } => {
+                    out.insert(*event);
+                    out.insert(*result);
+                    out.extend(into.iter().map(|(_, l)| *l));
+                }
+            },
+            _ => {}
+        }
+    }
+}
+
+/// Whether a `catch` can read the error's `message` and `name` in the
+/// compiled tier: the `try` body raises only the code's own error objects
+/// (a database error's text, or a thrown value that isn't an error, can
+/// read differently than in the engine tier).
+fn catch_readable(b: &Block) -> bool {
+    b.iter().all(|s| match s {
+        Stmt::Db(_) => false,
+        Stmt::Throw(e) => !matches!(&e.catch, Some((n, _)) if n.is_empty()),
+        Stmt::If(_, a, c) => catch_readable(a) && catch_readable(c),
+        Stmt::While { body, .. } | Stmt::Block(_, body) | Stmt::Try { body, .. } => {
+            catch_readable(body)
+        }
+        _ => true,
+    })
 }
 
 impl<'s, 'c> L<'s, 'c> {
@@ -383,10 +538,14 @@ impl<'s, 'c> L<'s, 'c> {
             lints: Vec::new(),
             scopes: vec![Vec::new()],
             facts: BTreeSet::new(),
-            guards: Vec::new(),
+            pre: Vec::new(),
             cond: 0,
-            loops: 0,
-            conts: Vec::new(),
+            jframes: Vec::new(),
+            labels: 0,
+            inlining: Vec::new(),
+            span_base: 0,
+            salt: 0,
+            inlines: 0,
             widen,
             events: vec![("output".to_owned(), Vec::new())],
             tmp: 0,
@@ -395,11 +554,15 @@ impl<'s, 'c> L<'s, 'c> {
             table: sig.row.clone(),
             old_found,
             old_used: std::cell::Cell::new(false),
+            module_id: 0,
+            calls: Vec::new(),
+            reaches: BTreeSet::new(),
+            depth: 0,
         }
     }
 
     fn at(&self, span: Span) -> String {
-        let start = (span.start as usize).min(self.src.len());
+        let start = ((span.start + self.span_base) as usize).min(self.src.len());
         let before = &self.src[..start];
         let line = before.matches('\n').count() + 1;
         let col = start - before.rfind('\n').map_or(0, |i| i + 1) + 1;
@@ -595,7 +758,7 @@ impl<'s, 'c> L<'s, 'c> {
                     "old may be null here (it is null for an insert)",
                 );
             }
-            self.guards.push((found, col.to_owned()));
+            self.guard(found, col);
         }
         let i = self.param_named(&format!("old_{col}"), ty);
         Ok(V {
@@ -640,8 +803,40 @@ impl<'s, 'c> L<'s, 'c> {
             return;
         }
         let mut entry = None;
+        // Helper functions at module level are hoisted too.
+        for s in &p.body {
+            if let Statement::FunctionDeclaration(f) = s
+                && let Some(id) = &f.id
+            {
+                let v = Var::Helper {
+                    start: f.span.start,
+                    end: f.span.end,
+                    depth: 0,
+                    expr: false,
+                };
+                self.bind(id.name.as_str(), v);
+            }
+        }
         for s in &p.body {
             match s {
+                Statement::FunctionDeclaration(f) if f.id.is_some() => {}
+                Statement::VariableDeclaration(d)
+                    if matches!(d.kind, oxc_ast::ast::VariableDeclarationKind::Const)
+                        && d.declarations.iter().all(|x| {
+                            matches!(&x.id, BindingPattern::BindingIdentifier(_))
+                                && x.init
+                                    .as_ref()
+                                    .is_some_and(|i| self.helper_def(i).is_some())
+                        }) =>
+                {
+                    for x in &d.declarations {
+                        if let (BindingPattern::BindingIdentifier(id), Some(i)) = (&x.id, &x.init)
+                            && let Some(h) = self.helper_def(i)
+                        {
+                            self.bind(id.name.as_str(), h);
+                        }
+                    }
+                }
                 Statement::ImportDeclaration(d) => {
                     if d.source.value.as_str() != "sprig:db" {
                         let _ =
@@ -700,7 +895,8 @@ impl<'s, 'c> L<'s, 'c> {
                     let _ = self.stop::<()>(
                         "js.module_scope",
                         other.span(),
-                        "only imports and the default export compile at module level",
+                        "only imports, helper functions and the default export compile at \
+                         module level",
                     );
                 }
             }
@@ -825,44 +1021,67 @@ impl<'s, 'c> L<'s, 'c> {
 
     fn block(&mut self, stmts: &[Statement<'_>]) -> Block {
         let mut out = Vec::new();
+        // Helper functions are hoisted: callable from the block's start.
+        for s in stmts {
+            if let Statement::FunctionDeclaration(f) = s
+                && let Some(id) = &f.id
+            {
+                let depth = self.scopes.len() - 1;
+                let v = Var::Helper {
+                    start: self.span_base + f.span.start,
+                    end: self.span_base + f.span.end,
+                    depth,
+                    expr: false,
+                };
+                self.bind(id.name.as_str(), v);
+            }
+        }
+        let outer = std::mem::take(&mut self.pre);
         for s in stmts {
             if exits(&out) {
                 break;
             }
             let mut piece = Vec::new();
             let r = self.stmt(s, &mut piece);
-            let guards = std::mem::take(&mut self.guards);
+            let pre = std::mem::take(&mut self.pre);
             if r.is_err() {
                 continue;
             }
-            out.extend(self.guard_stmts(guards));
+            out.extend(pre);
             out.extend(piece);
         }
+        self.pre = outer;
         out
     }
 
-    /// The checks for the rows a statement reads unconditionally; after
-    /// them the rows are known to be there.
-    fn guard_stmts(&mut self, guards: Vec<(LocalId, String)>) -> Block {
-        let mut out = Vec::new();
-        let mut seen = BTreeSet::new();
-        for (found, col) in guards {
-            if !seen.insert(found) {
-                continue;
-            }
-            out.push(Stmt::If(
-                Expr::Unary(UnOp::Not, Box::new(Expr::Local(found))),
-                vec![Stmt::Throw(ErrorSpec {
-                    code: 39865,
-                    message: Expr::Lit(Literal::Str(format!(
-                        "TypeError: cannot read properties of null (reading '{col}')"
-                    ))),
-                })],
-                Vec::new(),
-            ));
-            self.facts.insert(Key::L(found));
+    /// The check, before the statement, of a row it reads
+    /// unconditionally; after it the row is known to be there.
+    fn guard(&mut self, found: LocalId, col: &str) {
+        if !self.facts.insert(Key::L(found)) {
+            return;
         }
-        out
+        self.pre.push(Stmt::If(
+            Expr::Unary(UnOp::Not, Box::new(Expr::Local(found))),
+            vec![Stmt::Throw(ErrorSpec {
+                code: 39865,
+                message: Expr::Lit(Literal::Str(format!(
+                    "TypeError: cannot read properties of null (reading '{col}')"
+                ))),
+                // QuickJS's own words, for a `catch`.
+                catch: Some((
+                    "TypeError".to_owned(),
+                    Expr::Lit(Literal::Str(format!(
+                        "cannot read property '{col}' of null"
+                    ))),
+                )),
+            })],
+            Vec::new(),
+        ));
+    }
+
+    /// Moves the statements that must run first into `out`.
+    fn flush(&mut self, out: &mut Block) {
+        out.append(&mut self.pre);
     }
 
     fn sub_block(&mut self, s: &Statement<'_>) -> Block {
@@ -875,7 +1094,9 @@ impl<'s, 'c> L<'s, 'c> {
     #[allow(clippy::too_many_lines)]
     fn stmt(&mut self, s: &Statement<'_>, out: &mut Block) -> R<()> {
         match s {
-            Statement::EmptyStatement(_) => Ok(()),
+            // A helper is hoisted when its block starts (`block`); `async`
+            // and generators are refused at their call.
+            Statement::EmptyStatement(_) | Statement::FunctionDeclaration(_) => Ok(()),
             Statement::BlockStatement(b) => {
                 let inner = self.scoped(|l| l.block(&b.body));
                 out.extend(inner);
@@ -886,8 +1107,7 @@ impl<'s, 'c> L<'s, 'c> {
             Statement::IfStatement(i) => {
                 let test = self.test(&i.test)?;
                 let before = self.facts.clone();
-                let guards = std::mem::take(&mut self.guards);
-                out.extend(self.guard_stmts(guards));
+                self.flush(out);
                 let base = self.facts.clone();
                 let (t_true, t_false) =
                     (self.facts_if(&i.test, true), self.facts_if(&i.test, false));
@@ -910,16 +1130,38 @@ impl<'s, 'c> L<'s, 'c> {
                 Ok(())
             }
             Statement::WhileStatement(w) => {
+                self.flush(out);
                 self.loop_entry();
-                let test = self.loop_test(&w.test)?;
-                self.loops += 1;
-                self.conts.push(Vec::new());
+                let (tpre, test) = self.loop_test(&w.test)?;
+                self.jframes.push(JFrame::Loop { cont: Vec::new() });
                 let body = self.sub_block(&w.body);
-                self.conts.pop();
-                self.loops -= 1;
+                self.jframes.pop();
                 self.loop_entry();
+                out.push(Self::looped(tpre, test, body, Bound::Guarded));
+                Ok(())
+            }
+            Statement::DoWhileStatement(dw) => {
+                // `do { body } while (test)`: the body, then the test; a
+                // `continue` goes to the test.
+                self.flush(out);
+                self.loop_entry();
+                let (mut check, test) = self.loop_test(&dw.test)?;
+                check.push(Stmt::If(
+                    Expr::Unary(UnOp::Not, Box::new(test)),
+                    vec![Stmt::Break],
+                    Vec::new(),
+                ));
+                self.jframes.push(JFrame::Loop {
+                    cont: check.clone(),
+                });
+                let mut body = self.sub_block(&dw.body);
+                self.jframes.pop();
+                self.loop_entry();
+                if !exits(&body) {
+                    body.extend(check);
+                }
                 out.push(Stmt::While {
-                    cond: test,
+                    cond: Expr::bool(true),
                     body,
                     bound: Bound::Guarded,
                 });
@@ -945,12 +1187,11 @@ impl<'s, 'c> L<'s, 'c> {
                         }
                         None => {}
                     }
-                    let guards = std::mem::take(&mut self.guards);
-                    out.extend(self.guard_stmts(guards));
+                    self.flush(out);
                     self.loop_entry();
-                    let test = match &fs.test {
+                    let (tpre, test) = match &fs.test {
                         Some(t) => self.loop_test(t)?,
-                        None => Expr::bool(true),
+                        None => (Vec::new(), Expr::bool(true)),
                     };
                     let bound = match (static_from, &fs.test, &fs.update) {
                         (
@@ -976,28 +1217,24 @@ impl<'s, 'c> L<'s, 'c> {
                     if let Some(u) = &fs.update {
                         let facts = self.facts.clone();
                         self.expr_stmt(u, &mut cont)?;
+                        self.flush(&mut cont);
                         self.facts = facts;
                     }
-                    self.loops += 1;
-                    self.conts.push(cont);
+                    self.jframes.push(JFrame::Loop { cont });
                     let mut body = self.sub_block(&fs.body);
-                    self.conts.pop();
-                    self.loops -= 1;
+                    self.jframes.pop();
                     if let Some(u) = &fs.update {
                         if exits(&body) {
                             // The update never runs; nothing to add.
                         } else {
                             let mut upd = Vec::new();
                             self.expr_stmt(u, &mut upd)?;
+                            self.flush(&mut upd);
                             body.extend(upd);
                         }
                     }
                     self.loop_entry();
-                    out.push(Stmt::While {
-                        cond: test,
-                        body,
-                        bound,
-                    });
+                    out.push(Self::looped(tpre, test, body, bound));
                     Ok(())
                 })();
                 self.scopes.pop();
@@ -1005,58 +1242,23 @@ impl<'s, 'c> L<'s, 'c> {
             }
             Statement::ForOfStatement(fo) => self.for_of(fo, out),
             Statement::BreakStatement(b) => {
-                if b.label.is_some() || self.loops == 0 {
+                if b.label.is_some() || self.loop_cont().is_none() {
                     return self.stop("js.label", b.span, "labelled break");
                 }
-                out.push(Stmt::Break);
+                self.jump(Jump::Break, out);
                 Ok(())
             }
             Statement::ReturnStatement(r) => self.ret(r.argument.as_ref(), r.span, out),
-            Statement::ThrowStatement(t) => {
-                let msg = match &t.argument {
-                    Expression::NewExpression(n) => match (&n.callee, n.arguments.first()) {
-                        (Expression::Identifier(id), a) if id.name.as_str().ends_with("Error") => {
-                            match a.and_then(Argument::as_expression) {
-                                Some(m) => {
-                                    let v = self.val(m)?;
-                                    self.text_of(v, m.span())?
-                                }
-                                None => Expr::Lit(Literal::Str(String::new())),
-                            }
-                        }
-                        _ => return self.stop("js.throw", t.span, "throw new Error(message)"),
-                    },
-                    other => {
-                        let v = self.val(other)?;
-                        self.text_of(v, other.span())?
-                    }
-                };
-                out.push(Stmt::Throw(ErrorSpec {
-                    code: 39865,
-                    message: msg,
-                }));
-                Ok(())
-            }
+            Statement::ThrowStatement(t) => self.throw(&t.argument, t.span, out),
             Statement::ContinueStatement(c) => {
-                let Some(pre) = self.conts.last().cloned().filter(|_| c.label.is_none()) else {
+                if c.label.is_some() || self.loop_cont().is_none() {
                     return self.stop("js.label", c.span, "labelled continue");
-                };
-                out.extend(pre);
-                out.push(Stmt::Continue);
+                }
+                self.jump(Jump::Continue, out);
                 Ok(())
             }
-            Statement::TryStatement(t) => {
-                self.stop("js.try", t.span, "try/catch runs in the engine tier")
-            }
+            Statement::TryStatement(t) => self.try_stmt(t, out),
             Statement::SwitchStatement(sw) => self.switch(sw, out),
-            Statement::DoWhileStatement(t) => {
-                self.stop("js.do_while", t.span, "do/while runs in the engine tier")
-            }
-            Statement::FunctionDeclaration(t) => self.stop(
-                "js.helper",
-                t.span,
-                "helper functions aren't inlined yet; they run in the engine tier",
-            ),
             other => self.stop(
                 "js.statement",
                 other.span(),
@@ -1073,8 +1275,7 @@ impl<'s, 'c> L<'s, 'c> {
     /// `js.switch`.
     fn switch(&mut self, sw: &oxc_ast::ast::SwitchStatement<'_>, out: &mut Block) -> R<()> {
         let d = self.val(&sw.discriminant)?;
-        let guards = std::mem::take(&mut self.guards);
-        out.extend(self.guard_stmts(guards));
+        self.flush(out);
         let d = match &d.e {
             Expr::Lit(_) | Expr::Param(_) | Expr::Local(_) => d,
             _ => {
@@ -1149,12 +1350,12 @@ impl<'s, 'c> L<'s, 'c> {
                     Some(c) => Expr::bin(BinOp::Or, c, eq),
                 });
             }
-            if !self.guards.is_empty() {
-                self.guards.clear();
+            if !self.pre.is_empty() {
+                self.pre.clear();
                 return self.stop(
-                    "js.null_row",
+                    "js.switch",
                     sw.span,
-                    "a case reads a row that may be null",
+                    "a case's test reads a row that may be null or calls a helper",
                 );
             }
             self.facts.clone_from(&before);
@@ -1217,17 +1418,296 @@ impl<'s, 'c> L<'s, 'c> {
         });
     }
 
-    fn loop_test(&mut self, e: &Expression<'_>) -> R<Expr> {
+    /// A loop's test, and the statements that must run before it each
+    /// time (row checks, helpers' bodies).
+    fn loop_test(&mut self, e: &Expression<'_>) -> R<(Block, Expr)> {
         let t = self.test(e)?;
-        if !self.guards.is_empty() {
-            self.guards.clear();
-            return self.stop(
-                "js.null_row",
-                e.span(),
-                "a loop test reads a row that may be null",
-            );
+        Ok((std::mem::take(&mut self.pre), t))
+    }
+
+    /// A `while` whose test may need statements first: `while (true) {
+    /// pre; if (!test) break; body }` (a `continue` goes back to the top,
+    /// so it runs them again).
+    fn looped(pre: Block, test: Expr, body: Block, bound: Bound) -> Stmt {
+        if pre.is_empty() {
+            return Stmt::While {
+                cond: test,
+                body,
+                bound,
+            };
         }
-        Ok(t)
+        let mut full = pre;
+        full.push(Stmt::If(
+            Expr::Unary(UnOp::Not, Box::new(test)),
+            vec![Stmt::Break],
+            Vec::new(),
+        ));
+        full.extend(body);
+        Stmt::While {
+            cond: Expr::bool(true),
+            body: full,
+            bound: Bound::Guarded,
+        }
+    }
+
+    /// What `continue` runs first in the innermost loop; `None` outside
+    /// loops (of this function or helper).
+    fn loop_cont(&self) -> Option<Block> {
+        for f in self.jframes.iter().rev() {
+            match f {
+                JFrame::Loop { cont } => return Some(cont.clone()),
+                JFrame::Helper { .. } => return None,
+                JFrame::Finally { .. } => {}
+            }
+        }
+        None
+    }
+
+    /// Whether `j` leaves a `try` with a `finally` on its way.
+    fn crosses_finally(&self, j: &Jump) -> bool {
+        for f in self.jframes.iter().rev() {
+            match (f, j) {
+                (JFrame::Finally { .. }, _) => return true,
+                // A loop ends a `break` or `continue`; a helper ends its own
+                // `return`s (a function's `return` inside it is the helper's).
+                (JFrame::Loop { .. }, Jump::Break | Jump::Continue)
+                | (JFrame::Helper { .. }, _) => {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Lowers a jump: directly, or through the `finally` blocks it leaves.
+    fn jump(&mut self, j: Jump, out: &mut Block) {
+        self.flush(out);
+        for i in (0..self.jframes.len()).rev() {
+            match (&mut self.jframes[i], &j) {
+                (JFrame::Finally { label, cmp, jumps }, _) => {
+                    jumps.push(j.clone());
+                    let n = i64::try_from(jumps.len()).unwrap_or(i64::MAX);
+                    out.push(Stmt::Assign(*cmp, Expr::int(n)));
+                    out.push(Stmt::Leave(*label));
+                    return;
+                }
+                (JFrame::Loop { .. }, Jump::Break | Jump::Continue)
+                | (JFrame::Helper { .. }, _) => break,
+                _ => {}
+            }
+        }
+        match j {
+            Jump::Break => out.push(Stmt::Break),
+            Jump::Continue => {
+                out.extend(self.loop_cont().unwrap_or_default());
+                out.push(Stmt::Continue);
+            }
+            Jump::Return(name, fields) => {
+                out.push(Stmt::Emit(name, fields));
+                out.push(Stmt::Return);
+            }
+            Jump::Leave(l) => out.push(Stmt::Leave(l)),
+        }
+    }
+
+    fn next_label(&mut self) -> u32 {
+        self.labels += 1;
+        self.labels
+    }
+
+    /// The locals a `try` keeps a caught error in, named `<base>_*`.
+    fn caught_locals(&mut self, base: &str) -> Caught {
+        let mut l = |what: &str, ty: Ty| self.f.local(&format!("{base}_{what}"), ty);
+        Caught {
+            flag: l("caught", Ty::Bool),
+            code: l("code", Ty::Int),
+            state: l("state", Ty::Str),
+            text: l("text", Ty::Str),
+            message: l("message", Ty::Str),
+            name: l("name", Ty::Str),
+        }
+    }
+
+    /// `try { ... } catch (e) { ... } finally { ... }`: the error is kept
+    /// ([`Stmt::Try`]), the `catch` and `finally` run as ordinary
+    /// statements after it, and a jump out of the `try` or `catch` leaves
+    /// through the `finally`. A `finally` that ends normally raises a kept
+    /// error again ([`Stmt::Rethrow`]).
+    fn try_stmt(&mut self, t: &oxc_ast::ast::TryStatement<'_>, out: &mut Block) -> R<()> {
+        self.flush(out);
+        let n = self.next_label();
+        let caught = self.caught_locals(&format!("try{n}"));
+        // What held before the `try` holds at its start; in its `catch`,
+        // `finally` and after it, only for what the blocks before didn't
+        // assign (an error can come anywhere in them).
+        let entry = self.facts.clone();
+        let Some(fin) = &t.finalizer else {
+            let body = self.scoped(|l| l.block(&t.block.body));
+            out.push(Stmt::Try {
+                body: body.clone(),
+                caught,
+            });
+            let mut changed = BTreeSet::new();
+            assigned(&body, &mut changed);
+            if let Some(h) = &t.handler {
+                self.facts = Self::unchanged(&entry, &changed);
+                let c = self.catch_body(h, caught, &body)?;
+                assigned(&c, &mut changed);
+                out.push(Stmt::If(Expr::Local(caught.flag), c, Vec::new()));
+            }
+            self.facts = Self::unchanged(&entry, &changed);
+            return Ok(());
+        };
+        let cmp = self.f.local(&format!("try{n}_jump"), Ty::Int);
+        self.jframes.push(JFrame::Finally {
+            label: n,
+            cmp,
+            jumps: Vec::new(),
+        });
+        let mut changed = BTreeSet::new();
+        let lowered = (|| {
+            let body = self.scoped(|l| l.block(&t.block.body));
+            assigned(&body, &mut changed);
+            let mut inner = vec![Stmt::Try {
+                body: body.clone(),
+                caught,
+            }];
+            let mut last = caught;
+            if let Some(h) = &t.handler {
+                self.facts = Self::unchanged(&entry, &changed);
+                let c = self.catch_body(h, caught, &body)?;
+                assigned(&c, &mut changed);
+                let again = self.caught_locals(&format!("catch{n}"));
+                inner.push(Stmt::If(
+                    Expr::Local(caught.flag),
+                    vec![Stmt::Try {
+                        body: c,
+                        caught: again,
+                    }],
+                    Vec::new(),
+                ));
+                last = again;
+            }
+            Ok((inner, last))
+        })();
+        let Some(JFrame::Finally { jumps, .. }) = self.jframes.pop() else {
+            return Err(Stop);
+        };
+        let (inner, last) = lowered?;
+        self.facts = Self::unchanged(&entry, &changed);
+        let fin_body = self.scoped(|l| l.block(&fin.body));
+        assigned(&fin_body, &mut changed);
+        if jumps.is_empty() {
+            out.extend(inner);
+        } else {
+            out.push(Stmt::Assign(cmp, Expr::int(0)));
+            out.push(Stmt::Block(n, inner));
+        }
+        let fin_exits = exits(&fin_body);
+        out.extend(fin_body);
+        if !fin_exits {
+            out.push(Stmt::If(
+                Expr::Local(last.flag),
+                vec![Stmt::Rethrow(last)],
+                Vec::new(),
+            ));
+            for (i, j) in jumps.into_iter().enumerate() {
+                let mut go = Vec::new();
+                self.jump(j, &mut go);
+                out.push(Stmt::If(
+                    Expr::bin(
+                        BinOp::Eq,
+                        Expr::Local(cmp),
+                        Expr::int(i64::try_from(i + 1).unwrap_or(i64::MAX)),
+                    ),
+                    go,
+                    Vec::new(),
+                ));
+            }
+        }
+        self.facts = Self::unchanged(&entry, &changed);
+        Ok(())
+    }
+
+    /// `facts` without those about the locals in `changed`.
+    fn unchanged(facts: &BTreeSet<Key>, changed: &BTreeSet<LocalId>) -> BTreeSet<Key> {
+        facts
+            .iter()
+            .filter(|k| !matches!(k, Key::L(l) if changed.contains(l)))
+            .copied()
+            .collect()
+    }
+
+    /// A `catch` clause's body, with its binding.
+    fn catch_body(
+        &mut self,
+        h: &oxc_ast::ast::CatchClause<'_>,
+        caught: Caught,
+        body: &Block,
+    ) -> R<Block> {
+        let readable = catch_readable(body);
+        self.scopes.push(Vec::new());
+        let r = match h.param.as_ref().map(|p| &p.pattern) {
+            None => Ok(()),
+            Some(BindingPattern::BindingIdentifier(b)) => {
+                self.bind(b.name.as_str(), Var::Exc { caught, readable });
+                Ok(())
+            }
+            Some(_) => self.stop("js.destructuring", h.span, "a destructured catch binding"),
+        };
+        let b = r.map(|()| self.block(&h.body.body));
+        self.scopes.pop();
+        b
+    }
+
+    /// `throw`: an error object, a value, or a caught error again.
+    fn throw(&mut self, arg: &Expression<'_>, span: Span, out: &mut Block) -> R<()> {
+        if let Expression::Identifier(id) = strip_parens(arg)
+            && let Some(Var::Exc { caught, .. }) = self.lookup(id.name.as_str())
+        {
+            self.flush(out);
+            out.push(Stmt::Rethrow(caught));
+            return Ok(());
+        }
+        let (msg, catch) = match strip_parens(arg) {
+            Expression::NewExpression(n) => match (&n.callee, n.arguments.first()) {
+                (Expression::Identifier(id), a)
+                    if id.name.as_str().ends_with("Error")
+                        && self.lookup(id.name.as_str()).is_none() =>
+                {
+                    let m = match a.and_then(Argument::as_expression) {
+                        // `new Error(undefined)` has an empty message.
+                        Some(Expression::Identifier(u)) if u.name.as_str() == "undefined" => {
+                            Expr::Lit(Literal::Str(String::new()))
+                        }
+                        Some(m) => {
+                            let v = self.val(m)?;
+                            self.text_of(v, m.span())?
+                        }
+                        None => Expr::Lit(Literal::Str(String::new())),
+                    };
+                    let name = id.name.as_str();
+                    let catch = (name != "Error").then(|| (name.to_owned(), m.clone()));
+                    (m, catch)
+                }
+                _ => return self.stop("js.throw", span, "throw new Error(message)"),
+            },
+            other => {
+                let v = self.val(other)?;
+                let m = self.text_of(v, other.span())?;
+                // A thrown value that isn't an error object: a `catch`
+                // sees the value itself.
+                (m.clone(), Some((String::new(), m)))
+            }
+        };
+        self.flush(out);
+        out.push(Stmt::Throw(ErrorSpec {
+            code: 39865,
+            message: msg,
+            catch,
+        }));
+        Ok(())
     }
 
     fn declare(&mut self, d: &VariableDeclaration<'_>, out: &mut Block) -> R<()> {
@@ -1247,8 +1727,19 @@ impl<'s, 'c> L<'s, 'c> {
                 self.bind(name, v);
                 continue;
             }
+            if let Some(h) = self.helper_def(init) {
+                if !matches!(d.kind, oxc_ast::ast::VariableDeclarationKind::Const) {
+                    return self.stop(
+                        "js.helper",
+                        decl.span,
+                        "a function value in a variable that can change: use const",
+                    );
+                }
+                self.bind(name, h);
+                continue;
+            }
             let v = self.val(init)?;
-            let key = decl.span.start;
+            let key = self.salt + self.span_base + decl.span.start;
             let ty = match (self.widen.get(&key), v.ty) {
                 (Some(w), _) => *w,
                 (None, Ty::Null) => {
@@ -1262,6 +1753,7 @@ impl<'s, 'c> L<'s, 'c> {
             };
             let l = self.f.local(name, ty);
             let e = self.coerce(v.clone(), ty, decl.span)?;
+            self.flush(out);
             out.push(Stmt::Assign(l, e));
             self.facts.remove(&Key::L(l));
             if v.nn {
@@ -1290,10 +1782,8 @@ impl<'s, 'c> L<'s, 'c> {
                             }
                             None => Expr::Lit(Literal::Str(String::new())),
                         };
-                        out.push(Stmt::Throw(ErrorSpec {
-                            code: 39863,
-                            message: m,
-                        }));
+                        self.flush(out);
+                        out.push(Stmt::Throw(ErrorSpec::new(39863, m)));
                         Ok(())
                     }
                     Some(["ctx" | "console", "log"]) => {
@@ -1303,6 +1793,13 @@ impl<'s, 'c> L<'s, 'c> {
                             &at,
                             "log lines are dropped in the compiled tier",
                         ));
+                        Ok(())
+                    }
+                    _ if self.helper_of(&c.callee).is_some() => {
+                        // A helper called for what it does; its value is
+                        // dropped.
+                        self.call(c)?;
+                        self.flush(out);
                         Ok(())
                     }
                     _ => self.stop("js.call", c.span, "this call runs in the engine tier"),
@@ -1373,6 +1870,7 @@ impl<'s, 'c> L<'s, 'c> {
             Some(op) => self.binary(op, cur.clone(), rhs, span)?,
         };
         let ty = self.f.local_def(l).ty;
+        self.flush(out);
         let e = match self.coerce(v.clone(), ty, span) {
             Ok(e) => e,
             Err(Stop) => {
@@ -1424,6 +1922,7 @@ impl<'s, 'c> L<'s, 'c> {
                 }
             }
         };
+        self.flush(out);
         self.tmp += 1;
         let n = self.tmp;
         let arr = self.f.local(&format!("of{n}_source"), Ty::Json);
@@ -1449,12 +1948,10 @@ impl<'s, 'c> L<'s, 'c> {
                     None => Var::Local(each),
                 },
             );
-            l.loops += 1;
             // The index moves at the top of each iteration.
-            l.conts.push(Vec::new());
+            l.jframes.push(JFrame::Loop { cont: Vec::new() });
             let b = l.sub_block(&fo.body);
-            l.conts.pop();
-            l.loops -= 1;
+            l.jframes.pop();
             b
         });
         self.loop_entry();
@@ -1478,6 +1975,13 @@ impl<'s, 'c> L<'s, 'c> {
     }
 
     fn ret(&mut self, arg: Option<&Expression<'_>>, span: Span, out: &mut Block) -> R<()> {
+        if let Some(i) = self
+            .jframes
+            .iter()
+            .rposition(|f| matches!(f, JFrame::Helper { .. }))
+        {
+            return self.helper_return(i, arg, span, out);
+        }
         let scalar = self.sig.returns;
         let Some(arg) = arg else {
             let fields = if scalar.is_some() {
@@ -1485,8 +1989,7 @@ impl<'s, 'c> L<'s, 'c> {
             } else {
                 Vec::new()
             };
-            out.push(Stmt::Emit("output".to_owned(), fields));
-            out.push(Stmt::Return);
+            self.finish_return("output".to_owned(), fields, out);
             return Ok(());
         };
         let arg = strip_parens(arg);
@@ -1515,11 +2018,7 @@ impl<'s, 'c> L<'s, 'c> {
         if let Some(ty) = scalar {
             let v = self.val(arg)?;
             let e = self.coerce(v, ty, arg.span())?;
-            out.push(Stmt::Emit(
-                "output".to_owned(),
-                vec![("value".to_owned(), e)],
-            ));
-            out.push(Stmt::Return);
+            self.finish_return("output".to_owned(), vec![("value".to_owned(), e)], out);
             return Ok(());
         }
         match arg {
@@ -1607,8 +2106,94 @@ impl<'s, 'c> L<'s, 'c> {
                 (k, e)
             })
             .collect();
-        out.push(Stmt::Emit(name.to_owned(), fields));
-        out.push(Stmt::Return);
+        self.finish_return(name.to_owned(), fields, out);
+        Ok(())
+    }
+
+    /// The function's `return` of an event: at once, or, when it leaves a
+    /// `try` with a `finally`, with its fields evaluated first (JavaScript
+    /// evaluates the value before the `finally` runs).
+    fn finish_return(&mut self, name: String, fields: Vec<(String, Expr)>, out: &mut Block) {
+        let j = Jump::Return(name.clone(), Vec::new());
+        if !self.crosses_finally(&j) {
+            self.jump(Jump::Return(name, fields), out);
+            return;
+        }
+        self.flush(out);
+        let mut held = Vec::with_capacity(fields.len());
+        for (k, e) in fields {
+            let ty = self.f.ty_of(&e);
+            self.tmp += 1;
+            let l = self.f.local(&format!("ret{}_{k}", self.tmp), ty);
+            out.push(Stmt::Assign(l, e));
+            held.push((k, Expr::Local(l)));
+        }
+        self.jump(Jump::Return(name, held), out);
+    }
+
+    /// A helper's `return`: its value into the helper's result local,
+    /// then leave the helper's block.
+    fn helper_return(
+        &mut self,
+        frame: usize,
+        arg: Option<&Expression<'_>>,
+        span: Span,
+        out: &mut Block,
+    ) -> R<()> {
+        let JFrame::Helper { label, result, .. } = self.jframes[frame].clone() else {
+            return Err(Stop);
+        };
+        let v = match arg {
+            None => V::null(),
+            Some(e) => {
+                if let Expression::CallExpression(c) = strip_parens(e)
+                    && self.callee_path(&c.callee).as_deref() == Some(&["sprig", "event"])
+                {
+                    return self.stop(
+                        "js.helper",
+                        c.span,
+                        "a helper returning sprig.event(...): return the event from the function",
+                    );
+                }
+                self.val(e)?
+            }
+        };
+        // The result's type is the join of every `return`'s: a wider one
+        // runs the lowering again (as for variables).
+        let key = self.salt + self.span_base;
+        let ty = match (result, self.widen.get(&key)) {
+            (Some(l), _) => self.f.local_def(l).ty,
+            (None, Some(w)) => *w,
+            (None, None) => v.ty,
+        };
+        let l = match result {
+            Some(l) => l,
+            None => {
+                let l = self.f.local(&format!("h{label}_result"), ty);
+                if let JFrame::Helper { result, .. } = &mut self.jframes[frame] {
+                    *result = Some(l);
+                }
+                l
+            }
+        };
+        let e = match self.coerce(v.clone(), ty, span) {
+            Ok(e) => e,
+            Err(Stop) => {
+                if let Some(w) = ty.join(v.ty)
+                    && w != ty
+                {
+                    self.reasons.pop();
+                    self.widen.insert(key, w);
+                }
+                return Err(Stop);
+            }
+        };
+        if let JFrame::Helper { nn, .. } = &mut self.jframes[frame] {
+            *nn &= v.nn;
+        }
+        self.flush(out);
+        out.push(Stmt::Assign(l, e));
+        self.jump(Jump::Leave(label), out);
         Ok(())
     }
 
@@ -1640,6 +2225,8 @@ impl<'s, 'c> L<'s, 'c> {
             "sql" => "sql",
             "sqlOne" => "sqlOne",
             "exec" => "exec",
+            "call" => "call",
+            "publish" => "publish",
             "reject" => "reject",
             "event" => "event",
             "log" => "log",
@@ -1669,11 +2256,14 @@ impl<'s, 'c> L<'s, 'c> {
             ["db", "sql"] => "sql",
             ["db", "sqlOne"] => "sqlOne",
             ["db", "exec"] => "exec",
+            ["db", "call"] => return self.db_invoke(c, name, out).map(Some),
+            ["db", "publish"] => return self.db_publish(c, name, out).map(Some),
             ["db", _] => {
                 return self.stop(
                     "js.db",
                     c.span,
-                    "only db.sql, db.sqlOne and db.exec compile",
+                    "db.commitOffset and db.mq run in the engine tier: the gateway itself \
+                     answers them, so MariaDB has nothing to call",
                 );
             }
             _ => return Ok(None),
@@ -1777,8 +2367,7 @@ impl<'s, 'c> L<'s, 'c> {
                 (SqlShape::Exec { affected }, Var::Exec { affected })
             }
         };
-        let guards = std::mem::take(&mut self.guards);
-        out.extend(self.guard_stmts(guards));
+        self.flush(out);
         out.push(Stmt::Db(DbOp::Sql {
             stmt: bound.stmt,
             binds,
@@ -1791,6 +2380,260 @@ impl<'s, 'c> L<'s, 'c> {
         Ok(Some(var))
     }
 }
+
+impl L<'_, '_> {
+    /// `db.call(name, ...args)` into a callee's call entry
+    /// ([`crate::link`]): the callee must be a compiled function or
+    /// procedure of this database the deploy knows.
+    fn db_invoke(
+        &mut self,
+        c: &oxc_ast::ast::CallExpression<'_>,
+        name: &str,
+        out: &mut Block,
+    ) -> R<Var> {
+        let at = self.at(c.span);
+        let target = match c.arguments.first().and_then(Argument::as_expression) {
+            Some(Expression::StringLiteral(s)) => s.value.as_str().to_owned(),
+            _ => return self.stop("db.call", c.span, "the function's name must be a literal"),
+        };
+        let callee = match self.cat.callee(&target) {
+            None => {
+                return self.stop(
+                    "db.call",
+                    c.span,
+                    format!("{target} isn't a logic function or procedure of this database"),
+                );
+            }
+            Some(Err(why)) => return self.stop("db.call", c.span, why),
+            Some(Ok(k)) => k,
+        };
+        if callee.module_id == self.module_id || callee.reaches.contains(&self.module_id) {
+            return self.stop(
+                "js.recursion",
+                c.span,
+                format!("{target} calls back into this code"),
+            );
+        }
+        if callee.depth + 1 > MAX_CALL_DEPTH {
+            return self.stop(
+                "db.call",
+                c.span,
+                format!("calls through {target} nest deeper than logic.max_call_depth ({MAX_CALL_DEPTH})"),
+            );
+        }
+        let args = &c.arguments[1..];
+        if args.len() != callee.params.len() {
+            return self.stop(
+                "db.call",
+                c.span,
+                format!(
+                    "{target} takes {} arguments, not {}",
+                    callee.params.len(),
+                    args.len()
+                ),
+            );
+        }
+        let mut binds = Vec::new();
+        for a in args {
+            let Some(x) = a.as_expression() else {
+                return self.stop("js.spread", c.span, "spread in the arguments");
+            };
+            let v = self.val(x)?;
+            if v.ty == Ty::Json {
+                return self.stop("db.json_bind", x.span(), "JSON values can't be passed yet");
+            }
+            binds.push(v.e);
+        }
+        self.tmp += 1;
+        let base = if name.is_empty() {
+            format!("call{}", self.tmp)
+        } else {
+            name.to_owned()
+        };
+        let event = self.f.local(&format!("{base}_event"), Ty::Str);
+        let result = self.f.local(&format!("{base}_result"), Ty::Json);
+        let cols: Vec<(String, LocalId)> = callee
+            .fields
+            .iter()
+            .map(|(n, t)| {
+                let t = if *t == Ty::Bool { Ty::Int } else { *t };
+                (n.clone(), self.f.local(&format!("{base}_{n}"), t))
+            })
+            .collect();
+        let mut parts = vec![format!("CALL `{}`(", callee.entry())];
+        for i in 1..binds.len() {
+            let _ = i;
+            parts.push(", ".to_owned());
+        }
+        if !binds.is_empty() {
+            parts.push(String::new());
+        }
+        self.flush(out);
+        out.push(Stmt::Db(DbOp::Sql {
+            stmt: crate::ir::BoundSql {
+                parts,
+                reads: callee.reads.clone(),
+                writes: callee.writes.clone(),
+            },
+            binds,
+            shape: SqlShape::Call {
+                event,
+                result,
+                into: cols.clone(),
+            },
+            origin: at,
+        }));
+        self.reaches.insert(callee.module_id);
+        self.reaches.extend(callee.reaches.iter().copied());
+        self.depth = self.depth.max(callee.depth + 1);
+        let dep = CallDep::of(&callee);
+        if !self.calls.contains(&dep) {
+            self.calls.push(dep);
+        }
+        Ok(Var::Call { event, cols })
+    }
+
+    /// A `db.call` result's `fields` as a value: every field, in the
+    /// wrapper's order, as the engine tier's row gives them.
+    fn call_fields(cols: &[(String, LocalId)]) -> V {
+        V {
+            e: Expr::ObjectLit(
+                cols.iter()
+                    .map(|(n, l)| (n.clone(), Expr::Local(*l)))
+                    .collect(),
+            ),
+            ty: Ty::Json,
+            nn: true,
+        }
+    }
+
+    /// `db.publish(stream, key, value, headers?)` into the stream's
+    /// outbox, with the gateway's checks first.
+    fn db_publish(
+        &mut self,
+        c: &oxc_ast::ast::CallExpression<'_>,
+        name: &str,
+        out: &mut Block,
+    ) -> R<Var> {
+        let at = self.at(c.span);
+        let stream = match c.arguments.first().and_then(Argument::as_expression) {
+            Some(Expression::StringLiteral(s)) => s.value.as_str().to_owned(),
+            _ => return self.stop("db.publish", c.span, "the stream's name must be a literal"),
+        };
+        if c.arguments.len() > 4 {
+            return self.stop(
+                "db.publish",
+                c.span,
+                "publishing to a member tenant's stream needs the gateway",
+            );
+        }
+        let target: StreamTarget = match self.cat.stream(&stream) {
+            None => {
+                return self.stop(
+                    "db.publish",
+                    c.span,
+                    format!("{stream} isn't a stream of this database"),
+                );
+            }
+            Some(Err(why)) => return self.stop("db.publish", c.span, why),
+            Some(Ok(t)) => t,
+        };
+        let mut binds = Vec::new();
+        for i in 1..=2 {
+            let e = match c.arguments.get(i) {
+                None => Expr::Lit(Literal::Null),
+                Some(a) => {
+                    let Some(x) = a.as_expression() else {
+                        return self.stop("js.spread", c.span, "spread in the arguments");
+                    };
+                    let v = self.val(x)?;
+                    // The engine tier's text of a value: text as it is,
+                    // `null` as NULL, anything else as its JSON text.
+                    match v.ty {
+                        Ty::Str => v.e,
+                        Ty::Null => Expr::Lit(Literal::Null),
+                        Ty::Json => Expr::call(Builtin::JsonText, vec![v.e]),
+                        Ty::Int | Ty::Float | Ty::Bool => {
+                            if v.nn {
+                                Expr::call(Builtin::ToStr, vec![v.e])
+                            } else {
+                                Expr::Cond(
+                                    Box::new(Expr::bin(
+                                        BinOp::Eq,
+                                        v.e.clone(),
+                                        Expr::Lit(Literal::Null),
+                                    )),
+                                    Box::new(Expr::Lit(Literal::Null)),
+                                    Box::new(Expr::call(Builtin::ToStr, vec![v.e])),
+                                )
+                            }
+                        }
+                    }
+                }
+            };
+            binds.push(e);
+        }
+        let absent = |x: &Expression<'_>| match x {
+            Expression::NullLiteral(_) => true,
+            Expression::Identifier(id) => id.name.as_str() == "undefined",
+            _ => false,
+        };
+        let given = c
+            .arguments
+            .get(3)
+            .and_then(Argument::as_expression)
+            .filter(|x| !absent(x));
+        let headers = match given {
+            Some(x @ Expression::ObjectExpression(_)) => {
+                let v = self.val(x)?;
+                Expr::call(Builtin::JsonText, vec![v.e])
+            }
+            None => Expr::Lit(Literal::Null),
+            Some(x) => {
+                return self.stop(
+                    "db.publish",
+                    x.span(),
+                    "headers must be an object literal (or null) to compile",
+                );
+            }
+        };
+        binds.push(headers);
+        self.tmp += 1;
+        let base = if name.is_empty() {
+            format!("pub{}", self.tmp)
+        } else {
+            name.to_owned()
+        };
+        let affected = self.f.local(&format!("{base}_affected"), Ty::Int);
+        self.flush(out);
+        out.push(Stmt::Db(DbOp::Sql {
+            stmt: crate::ir::BoundSql {
+                parts: vec![
+                    format!(
+                        "INSERT INTO `{}` (k, v, headers) VALUES (",
+                        target.outbox.replace('`', "``")
+                    ),
+                    ", ".to_owned(),
+                    ", ".to_owned(),
+                    ")".to_owned(),
+                ],
+                reads: Vec::new(),
+                writes: vec![target.name.clone()],
+            },
+            binds,
+            shape: SqlShape::Publish {
+                affected,
+                max_bytes: target.max_bytes,
+                compact: target.compact,
+            },
+            origin: at,
+        }));
+        Ok(Var::Exec { affected })
+    }
+}
+
+/// `logic.max_call_depth`'s default: compiled calls nest at most this deep.
+const MAX_CALL_DEPTH: u32 = 8;
 
 /// Whether `s` holds a `break` that would leave an enclosing `switch`
 /// (one not inside a loop or another switch of its own).
@@ -2055,6 +2898,28 @@ impl L<'_, '_> {
                         nn: true,
                     }),
                     Some(Var::Field(f)) => self.field_val(&f, id.span),
+                    Some(Var::Val(v)) => Ok(v),
+                    Some(Var::Call { event, cols }) => {
+                        let fields = Self::call_fields(&cols);
+                        Ok(V {
+                            e: Expr::ObjectLit(vec![
+                                ("event".to_owned(), Expr::Local(event)),
+                                ("fields".to_owned(), fields.e),
+                            ]),
+                            ty: Ty::Json,
+                            nn: true,
+                        })
+                    }
+                    Some(Var::Helper { .. }) => self.stop(
+                        "js.helper",
+                        id.span,
+                        format!("{name} is a function: only calls of it compile"),
+                    ),
+                    Some(Var::Exc { .. }) => self.stop(
+                        "js.catch_value",
+                        id.span,
+                        format!("only {name}.message, {name}.name and throw {name} compile"),
+                    ),
                     Some(
                         Var::Row { .. }
                         | Var::Exec { .. }
@@ -2079,10 +2944,40 @@ impl L<'_, '_> {
                 if prop == "op" && self.ctx_trigger(&m.object) {
                     return self.field_val("op", m.span);
                 }
+                if let Expression::StaticMemberExpression(inner) = strip_parens(&m.object)
+                    && inner.property.name.as_str() == "fields"
+                    && let Expression::Identifier(obj) = strip_parens(&inner.object)
+                    && let Some(Var::Call { cols, .. }) = self.lookup(obj.name.as_str())
+                {
+                    // A field the callee doesn't return is `undefined`,
+                    // which the IR has no value for.
+                    let Some((_, l)) = cols.iter().find(|(c, _)| c == prop) else {
+                        return self.stop(
+                            "js.member",
+                            m.span,
+                            format!("the call returns no field {prop}"),
+                        );
+                    };
+                    return Ok(V {
+                        e: Expr::Local(*l),
+                        ty: self.f.local_def(*l).ty,
+                        nn: false,
+                    });
+                }
                 if let Expression::Identifier(obj) = strip_parens(&m.object)
                     && let Some(var) = self.lookup(obj.name.as_str())
                 {
                     match var {
+                        Var::Call { event, .. } if prop == "event" => {
+                            return Ok(V {
+                                e: Expr::Local(event),
+                                ty: Ty::Str,
+                                nn: true,
+                            });
+                        }
+                        Var::Call { cols, .. } if prop == "fields" => {
+                            return Ok(Self::call_fields(&cols));
+                        }
                         Var::Row { found, cols } => {
                             let Some((_, l)) = cols.iter().find(|(c, _)| c == prop).cloned() else {
                                 return self.stop(
@@ -2099,7 +2994,7 @@ impl L<'_, '_> {
                                         format!("{} may be null here", obj.name.as_str()),
                                     );
                                 }
-                                self.guards.push((found, prop.to_owned()));
+                                self.guard(found, prop);
                             }
                             return Ok(V {
                                 e: Expr::Local(l),
@@ -2135,6 +3030,34 @@ impl L<'_, '_> {
                                 _ => (path, Ty::Json),
                             };
                             return Ok(V { e, ty, nn: false });
+                        }
+                        Var::Exc { caught, readable } => {
+                            if !matches!(prop, "message" | "name") {
+                                return self.stop(
+                                    "js.catch_value",
+                                    m.span,
+                                    format!("reading .{prop} of a caught error"),
+                                );
+                            }
+                            if !readable {
+                                return self.stop(
+                                    "js.catch_value",
+                                    m.span,
+                                    "the try can raise a database error (or a thrown value that \
+                                     isn't an error), whose text can differ between MariaDB and the \
+                                     engine tier",
+                                );
+                            }
+                            let l = if prop == "message" {
+                                caught.message
+                            } else {
+                                caught.name
+                            };
+                            return Ok(V {
+                                e: Expr::Local(l),
+                                ty: Ty::Str,
+                                nn: true,
+                            });
                         }
                         Var::Rows { local, .. } if prop == "length" => {
                             return Ok(V {
@@ -2336,6 +3259,9 @@ impl L<'_, '_> {
     }
 
     fn call(&mut self, c: &oxc_ast::ast::CallExpression<'_>) -> R<V> {
+        if let Some(h) = self.helper_of(&c.callee) {
+            return self.inline(h, c);
+        }
         if let Some(what) = self.nondeterministic(&c.callee) {
             return self.stop(
                 "js.nondeterministic",
@@ -2483,6 +3409,222 @@ impl L<'_, '_> {
             }
         }
         self.stop("js.call", c.span, "this call runs in the engine tier")
+    }
+
+    /// The helper `init` declares (`const f = (a) => ...`,
+    /// `const f = function (a) { ... }`).
+    fn helper_def(&self, init: &Expression<'_>) -> Option<Var> {
+        let span = match strip_parens(init) {
+            Expression::ArrowFunctionExpression(a) => a.span,
+            Expression::FunctionExpression(f) => f.span,
+            _ => return None,
+        };
+        Some(Var::Helper {
+            start: self.span_base + span.start,
+            end: self.span_base + span.end,
+            depth: self.scopes.len() - 1,
+            expr: true,
+        })
+    }
+
+    /// The helper a call's callee names.
+    fn helper_of(&self, callee: &Expression<'_>) -> Option<(u32, u32, usize, bool)> {
+        let Expression::Identifier(id) = strip_parens(callee) else {
+            return None;
+        };
+        match self.lookup(id.name.as_str()) {
+            Some(Var::Helper {
+                start,
+                end,
+                depth,
+                expr,
+            }) => Some((start, end, depth, expr)),
+            _ => None,
+        }
+    }
+
+    /// A call of a helper, inlined: its source is parsed again on its own
+    /// and lowered in the scope it was declared in (a closure reads and
+    /// writes the variables it sees there), with the arguments evaluated
+    /// first. A helper whose body is one `return` is an expression; any
+    /// other runs as statements before the statement that calls it, in a
+    /// block its `return`s leave.
+    fn inline(
+        &mut self,
+        (start, end, depth, is_expr): (u32, u32, usize, bool),
+        c: &oxc_ast::ast::CallExpression<'_>,
+    ) -> R<V> {
+        if self.inlining.contains(&start) {
+            return self.stop(
+                "js.recursion",
+                c.span,
+                "a helper that calls itself runs in the engine tier",
+            );
+        }
+        if self.inlining.len() >= 8 || self.inlines >= 200 {
+            return self.stop(
+                "js.helper",
+                c.span,
+                "helpers nested more than 8 deep, or more than 200 helper calls",
+            );
+        }
+        let mut args = Vec::with_capacity(c.arguments.len());
+        for a in &c.arguments {
+            let Some(x) = a.as_expression() else {
+                return self.stop("js.spread", c.span, "spread arguments");
+            };
+            args.push(self.val(x)?);
+        }
+        let text = self
+            .src
+            .get(start as usize..end as usize)
+            .unwrap_or_default();
+        let (text, base) = if is_expr {
+            (format!("({text})"), start.saturating_sub(1))
+        } else {
+            (text.to_owned(), start)
+        };
+        let alloc = Allocator::default();
+        let parsed = Parser::new(&alloc, &text, SourceType::mjs()).parse();
+        let func = parsed.program.body.first().and_then(|st| match st {
+            Statement::FunctionDeclaration(f) => {
+                Some((&f.params, f.body.as_ref(), None, f.r#async || f.generator))
+            }
+            Statement::ExpressionStatement(es) => match strip_parens(&es.expression) {
+                Expression::FunctionExpression(f) => {
+                    Some((&f.params, f.body.as_ref(), None, f.r#async || f.generator))
+                }
+                Expression::ArrowFunctionExpression(a) => {
+                    let concise = a.expression.then(|| match a.body.statements.first() {
+                        Some(Statement::ExpressionStatement(e)) => Some(&e.expression),
+                        _ => None,
+                    });
+                    Some((&a.params, Some(&a.body), concise.flatten(), a.r#async))
+                }
+                _ => None,
+            },
+            _ => None,
+        });
+        let Some((params, Some(body), concise, unusual)) =
+            func.filter(|_| parsed.errors.is_empty())
+        else {
+            return self.stop("js.helper", c.span, "this helper's form");
+        };
+        if unusual {
+            return self.stop(
+                "js.async",
+                c.span,
+                "async helpers and generators run in the engine tier",
+            );
+        }
+        if params.rest.is_some()
+            || params.items.iter().any(|p| {
+                p.initializer.is_some()
+                    || !matches!(p.pattern, BindingPattern::BindingIdentifier(_))
+            })
+        {
+            return self.stop(
+                "js.params",
+                c.span,
+                "a helper's parameters must be plain names",
+            );
+        }
+        // One `return expr` (or an arrow's expression): an expression.
+        let single = concise.or(match body.statements.as_slice() {
+            [Statement::ReturnStatement(r)] => r.argument.as_ref(),
+            _ => None,
+        });
+        // Enter the helper's scope.
+        let saved = (self.span_base, self.salt);
+        self.inlines += 1;
+        self.span_base = base;
+        self.salt = self.inlines.wrapping_mul(0x0100_0000);
+        let stash = self.scopes.split_off((depth + 1).min(self.scopes.len()));
+        self.scopes.push(Vec::new());
+        self.inlining.push(start);
+        let r = if let Some(e) = single {
+            for (i, p) in params.items.iter().enumerate() {
+                if let BindingPattern::BindingIdentifier(b) = &p.pattern {
+                    let v = args.get(i).cloned().unwrap_or_else(V::null);
+                    self.bind(b.name.as_str(), Var::Val(v));
+                }
+            }
+            self.val(e)
+        } else if self.cond > 0 {
+            self.stop(
+                "js.helper",
+                c.span,
+                "a helper with statements, called where its call may not run",
+            )
+        } else {
+            self.inline_body(params, &body.statements, &args)
+        };
+        self.inlining.pop();
+        self.scopes.pop();
+        self.scopes.extend(stash);
+        (self.span_base, self.salt) = saved;
+        r
+    }
+
+    /// A statement-form helper's body, into `pre`: the parameters as
+    /// locals, then the body in a block its `return`s leave.
+    fn inline_body(
+        &mut self,
+        params: &FormalParameters<'_>,
+        stmts: &[Statement<'_>],
+        args: &[V],
+    ) -> R<V> {
+        let before = self.facts.clone();
+        for (i, p) in params.items.iter().enumerate() {
+            let BindingPattern::BindingIdentifier(b) = &p.pattern else {
+                continue;
+            };
+            let v = args.get(i).cloned().unwrap_or_else(V::null);
+            let key = self.salt + self.span_base + p.span.start;
+            let ty = self.widen.get(&key).copied().unwrap_or(v.ty);
+            let l = self.f.local(b.name.as_str(), ty);
+            let e = self.coerce(v.clone(), ty, p.span)?;
+            self.pre.push(Stmt::Assign(l, e));
+            self.facts.remove(&Key::L(l));
+            if v.nn {
+                self.facts.insert(Key::L(l));
+            }
+            self.decls.insert(l, key);
+            self.bind(b.name.as_str(), Var::Local(l));
+        }
+        let label = self.next_label();
+        self.jframes.push(JFrame::Helper {
+            label,
+            result: None,
+            nn: true,
+        });
+        let body = self.block(stmts);
+        let Some(JFrame::Helper { result, nn, .. }) = self.jframes.pop() else {
+            return Err(Stop);
+        };
+        // What the helper assigned may not hold its old facts; facts it
+        // learned may not hold either (a `return` can leave first).
+        let mut changed = BTreeSet::new();
+        assigned(&body, &mut changed);
+        self.facts = before;
+        self.facts
+            .retain(|k| !matches!(k, Key::L(l) if changed.contains(l)));
+        let always = exits(&body);
+        match result {
+            Some(l) => {
+                self.pre.push(Stmt::Assign(l, Expr::Lit(Literal::Null)));
+                self.pre.push(Stmt::Block(label, body));
+                Ok(V {
+                    e: Expr::Local(l),
+                    ty: self.f.local_def(l).ty,
+                    nn: nn && always,
+                })
+            }
+            None => {
+                self.pre.push(Stmt::Block(label, body));
+                Ok(V::null())
+            }
+        }
     }
 
     fn need_nn(&mut self, v: &V, span: Span) -> R<()> {

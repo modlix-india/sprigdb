@@ -29,11 +29,15 @@
 //! - [`feedback`]: votes on answers and proposal outcomes, and the prompt
 //!   notes made of them;
 //! - [`glossary`]: the tenant's business terms;
+//! - [`dashboards`]: dashboards and their tiles, shared or not, run as
+//!   the viewer;
 //! - [`incidents`]: the administration agent's error intake, triage and
 //!   advice;
 //! - [`admin`]: its metric history, health rules, upgrade readiness and
 //!   incident write-ups;
 //! - [`mcp`]: the MCP server's tools and calls, without the transport;
+//! - [`digest`]: tenant digests from statistics, worded by the data
+//!   assistant's model;
 //! - [`turn`]: one chat turn, provider and tools in a loop;
 //! - [`mod@metrics`]: the `sprig_ai_*` metrics;
 //! - `eval` (feature `eval`, and in tests): the evaluation sets and their
@@ -42,6 +46,8 @@
 pub mod admin;
 pub mod audit;
 pub mod budget;
+pub mod dashboards;
+pub mod digest;
 pub mod egress;
 pub mod error;
 #[cfg(any(test, feature = "eval"))]

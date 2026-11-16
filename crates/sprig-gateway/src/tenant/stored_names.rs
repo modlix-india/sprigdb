@@ -24,6 +24,7 @@ use std::sync::{LazyLock, Mutex, PoisonError};
 use mysql_async::prelude::Queryable;
 use sprig_auth::TenantAuth;
 use sprig_catalog::TenantCatalog;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::{ClusterId, TenantId};
 use sprig_common::names::AccountName;
 use sprig_common::{Result, SprigCode, SprigError};
@@ -101,7 +102,7 @@ pub async fn sync(svc: &TenantServices, cat: &TenantCatalog, cluster: &ClusterId
         return Ok(());
     }
     let pool = svc.locator.ctl_pool(cluster).await?;
-    let mut c = pool.get_conn().await.map_err(|e| {
+    let mut c = pool.get_conn_bounded().await.map_err(|e| {
         SprigError::new(
             SprigCode::BackendUnavailable,
             format!("sprig_ctl on {cluster}: {e}"),

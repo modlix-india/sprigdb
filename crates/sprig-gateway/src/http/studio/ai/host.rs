@@ -208,7 +208,12 @@ impl GatewayHost {
     }
 
     /// `sql` in a read-only transaction that is rolled back.
-    async fn read_only(&self, db: &str, sql: String, caps: Caps) -> Result<ExecuteResponse> {
+    pub(crate) async fn read_only(
+        &self,
+        db: &str,
+        sql: String,
+        caps: Caps,
+    ) -> Result<ExecuteResponse> {
         let engine = &self.core.engine;
         let t = engine.begin(&self.caller, db, true).await?;
         let (tx, rx) = mpsc::channel(CHANNEL_DEPTH);
@@ -358,7 +363,7 @@ impl GatewayHost {
         let columns: Vec<Value> = objects(&r).into_iter().map(Value::Object).collect();
         if columns.is_empty() {
             return Err(tool_error(format!(
-                "there is no table {db}.{table} that the user can see"
+                "there is no table {db}.{table} that the user can see (or no database {db})"
             )));
         }
         let q = format!("{}.{}", ident(db), ident(table));
@@ -367,6 +372,27 @@ impl GatewayHost {
             .await
             .map(|r| index_list(&objects(&r)))
             .unwrap_or_default();
+        // Foreign keys out of the table and into it, so the model joins on
+        // declared keys.
+        let (foreign_keys, referenced_by) = match self.fks(db).await {
+            Ok(fks) => {
+                let key = |f: &sprig_ai::tools::joins::Fk| {
+                    json!({"column": f.column, "references": format!("{}.{}", f.ref_table, f.ref_column),
+                           "from": format!("{}.{}", f.table, f.column), "constraint": f.name})
+                };
+                (
+                    fks.iter()
+                        .filter(|f| f.table.eq_ignore_ascii_case(table))
+                        .map(key)
+                        .collect::<Vec<_>>(),
+                    fks.iter()
+                        .filter(|f| f.ref_table.eq_ignore_ascii_case(table))
+                        .map(key)
+                        .collect::<Vec<_>>(),
+                )
+            }
+            Err(_) => (Vec::new(), Vec::new()),
+        };
         let definition = match self.sql("-", format!("SHOW CREATE TABLE {q}")).await {
             Ok(r) => result_set(&r)
                 .rows
@@ -379,13 +405,114 @@ impl GatewayHost {
         Ok(ToolOutput {
             body: ToolBody::Json(json!({
                 "db": db, "table": table, "columns": columns,
-                "indexes": indexes, "definition": definition,
+                "indexes": indexes, "foreign_keys": foreign_keys,
+                "referenced_by": referenced_by, "definition": definition,
             })),
             sources: vec![source(
                 "table",
                 format!("{db}.{table}"),
                 format!("{db}.{table}"),
             )],
+        })
+    }
+
+    /// The declared foreign keys of `db`, as the caller sees them.
+    async fn fks(&self, db: &str) -> Result<Vec<sprig_ai::tools::joins::Fk>> {
+        let r = self
+            .sql(
+                "-",
+                format!(
+                    "SELECT CONSTRAINT_NAME AS name, TABLE_NAME AS t, COLUMN_NAME AS c, \
+                     REFERENCED_TABLE_NAME AS rt, REFERENCED_COLUMN_NAME AS rc \
+                     FROM information_schema.KEY_COLUMN_USAGE \
+                     WHERE TABLE_SCHEMA = {} AND REFERENCED_TABLE_NAME IS NOT NULL \
+                     ORDER BY TABLE_NAME, CONSTRAINT_NAME, ORDINAL_POSITION LIMIT 2000",
+                    quote_literal(db)
+                ),
+            )
+            .await?;
+        let text = |m: &Map<String, Value>, k: &str| {
+            m.get(k).and_then(Value::as_str).unwrap_or("").to_owned()
+        };
+        Ok(objects(&r)
+            .iter()
+            .map(|m| sprig_ai::tools::joins::Fk {
+                name: text(m, "name"),
+                table: text(m, "t"),
+                column: text(m, "c"),
+                ref_table: text(m, "rt"),
+                ref_column: text(m, "rc"),
+            })
+            .collect())
+    }
+
+    async fn relationships(&self, input: &Value) -> Result<ToolOutput> {
+        use sprig_ai::tools::joins::{Col, relationships};
+        let db = s(input, "db");
+        let only = Some(s(input, "table")).filter(|t| !t.is_empty());
+        let r = self
+            .sql(
+                "-",
+                format!(
+                    "SELECT TABLE_NAME AS t, COLUMN_NAME AS c, DATA_TYPE AS ty, COLUMN_KEY AS k \
+                     FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = {} \
+                     ORDER BY TABLE_NAME, ORDINAL_POSITION LIMIT 20000",
+                    quote_literal(db)
+                ),
+            )
+            .await?;
+        let cols: Vec<Col> = objects(&r)
+            .iter()
+            .map(|m| {
+                let text = |k: &str| m.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+                Col {
+                    table: text("t"),
+                    column: text("c"),
+                    ty: text("ty"),
+                    primary: text("k") == "PRI",
+                }
+            })
+            .collect();
+        if cols.is_empty() {
+            return Err(tool_error(format!(
+                "there is no database {db} with tables the user can see"
+            )));
+        }
+        if let Some(t) = only
+            && !cols.iter().any(|c| c.table.eq_ignore_ascii_case(t))
+        {
+            return Err(tool_error(format!(
+                "there is no table {db}.{t} that the user can see"
+            )));
+        }
+        let fks = self.fks(db).await.unwrap_or_default();
+        let mut body = relationships(&cols, &fks, only);
+        body["db"] = json!(db);
+        Ok(ToolOutput {
+            body: ToolBody::Json(body),
+            sources: vec![source("database", db, db)],
+        })
+    }
+
+    /// A tile's query, planned as the caller in a read-only transaction
+    /// and never run: one that doesn't plan goes back to the model.
+    async fn check_tile(&self, input: &Value) -> Result<ProposalCheck> {
+        let (db, sql) = (s(input, "db"), s(input, "sql"));
+        let caps = Caps {
+            timeout: Some(self.timeout(db)),
+            ..Caps::default()
+        };
+        self.read_only(db, format!("EXPLAIN {sql}"), caps)
+            .await
+            .map_err(|e| {
+                tool_error(format!(
+                    "the tile's query doesn't plan: {}. Fix it (describe the tables to check the names) and propose the tile again.",
+                    e.message
+                ))
+            })?;
+        Ok(ProposalCheck {
+            checks: Some(json!({"planned": true, "ran": false})),
+            generated: None,
         })
     }
 
@@ -846,6 +973,7 @@ impl ToolHost for GatewayHost {
             "propose_policy" | "propose_logic" | "generate_rows" => {
                 self.check_skill(spec.name, input).await
             }
+            "propose_tile" => self.check_tile(input).await,
             _ => Ok(ProposalCheck::default()),
         }
     }
@@ -855,6 +983,7 @@ impl ToolHost for GatewayHost {
             "search_docs" => self.search_docs(input).await,
             "catalog" => self.catalog(input).await,
             "describe" => self.describe(input).await,
+            "relationships" => self.relationships(input).await,
             "workload" => {
                 let q = format!("hours={}&limit=20", input["hours"].as_u64().unwrap_or(24));
                 let r = super::super::workload::list(&self.core, &self.caller, &q).await?;

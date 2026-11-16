@@ -1086,6 +1086,28 @@ impl DocCatalog for CatalogDocs {
             .map(|m| (**m).clone()))
     }
 
+    async fn collation(
+        &self,
+        sql: &mut dyn SqlRunner,
+        ns: &Ns,
+    ) -> std::result::Result<Option<Document>, MongoError> {
+        let Some(tenant) = tenant_of(sql) else {
+            return TableCatalog.collation(sql, ns).await;
+        };
+        let Some((db, cat)) = self
+            .state(sql, tenant, &ns.db)
+            .await
+            .map_err(|e| mongo(&e))?
+        else {
+            return Ok(None);
+        };
+        Ok(cat
+            .ext
+            .get::<DocState>(MODULE)
+            .and_then(|s| s.get(db, &ns.coll))
+            .and_then(|m| m.options.get_document("collation").ok().cloned()))
+    }
+
     async fn list(
         &self,
         sql: &mut dyn SqlRunner,

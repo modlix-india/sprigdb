@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use sprig_auth::accounts::BackendTarget;
+use sprig_cluster::failover::relay::RelayLease;
 use sprig_cluster::record::TopologyKind;
-use sprig_common::ids::{NodeId, ShardId};
+use sprig_common::ids::{ClusterId, NodeId, ShardId};
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_proto_mysql::client::{ClientError, PacketKind, RespPacket, TrackedChanges};
 use sprig_proto_mysql::packets::OkPacket;
@@ -18,7 +19,7 @@ use tokio::time::Instant;
 use super::classify::{Effect, StmtClass, StmtInfo};
 use super::cluster::{ClusterView, NodeKey, NodeRef};
 use super::conn::{self, BackendStmt, ConnectSpec, Warning};
-use super::pins::{PinReason, Pins};
+use super::pins::{PinReason, Pins, TxnSetting};
 use super::pool::{AcquireError, BackendLease, PoolKey, Release};
 use super::settings::{BackendSettings, CausalScope, PoolMode};
 use super::state::{self, SessionVars};
@@ -50,6 +51,17 @@ pub struct SessionOpts {
     pub schema: Option<String>,
     /// The shard (shard 0 for a login's unsharded cluster).
     pub shard: ShardId,
+    /// Sprig 2PC's relay path (`txn.sprig_2pc_path = relay` under
+    /// `sprig_2pc`): on a cluster with relays, every connection goes
+    /// through the relay writer with this tenant in its preamble.
+    pub relay: Option<sprig_common::ids::TenantId>,
+    /// A transaction coordinator's branch (the transaction's connection to
+    /// one cluster): its connections come from pools of their own. A
+    /// session holding a branch connection may still lease one for its own
+    /// statements (preparing a statement during the transaction); from
+    /// the same pool, sessions that each hold a branch could wait on each
+    /// other until every wait times out.
+    pub txn_branch: bool,
 }
 
 impl Default for SessionOpts {
@@ -61,6 +73,8 @@ impl Default for SessionOpts {
             collation: 45,
             schema: None,
             shard: ShardId(0),
+            relay: None,
+            txn_branch: false,
         }
     }
 }
@@ -128,8 +142,11 @@ enum Sent {
     /// busy with it and must be dropped.
     WaitTimedOut,
     /// [`TRX_GUARD`] failed: the transaction is gone and the statement
-    /// wasn't run; the connection is idle and reusable.
-    TrxGone,
+    /// wasn't run; the connection is idle and reusable. `None` for the
+    /// guard's own error (no transaction open); otherwise the error the
+    /// server reported in its place, such as the 1213 of an abort it did
+    /// report.
+    TrxGone(Option<ErrPacket>),
 }
 
 /// Run before a write inside a Galera transaction: fails with 1242, and
@@ -181,6 +198,11 @@ pub struct StmtOutcome {
 #[allow(clippy::struct_excessive_bools)] // independent flags of one statement
 struct Current {
     lease: BackendLease,
+    /// An autocommit write on a relayed connection: the gateway opened a
+    /// transaction for it, and commits in a round trip of its own once
+    /// the write answered (so a write waiting for a held branch's rows
+    /// never commits after its client is gone).
+    wrapped: bool,
     stmt: StmtInfo,
     route: RouteKind,
     first: Option<RespPacket>,
@@ -361,6 +383,9 @@ pub struct BackendSession {
     /// Sprig 2PC: a held branch's record of its writes
     /// (`sprig_txn::BranchConn::start_redo`, in `backend::txn`).
     pub(super) redo: Option<super::txn::Recording>,
+    /// Sprig 2PC's relay path on a cluster without a ready relay: this
+    /// connection may not hold a branch (`start_redo` says no).
+    pub(super) redo_off: bool,
     /// The held connection (thread id) and when its database-level
     /// grants were last refreshed with a `USE`.
     grants_seen: Option<(u64, std::time::Instant)>,
@@ -378,6 +403,11 @@ pub struct BackendSession {
     /// lock (`SERIALIZABLE`), or `SET TRANSACTION` preceded it. Until then a
     /// Galera write runs without [`TRX_GUARD`].
     trx_locks: bool,
+    /// The statement running is the transaction coordinator's own
+    /// (`sprig_txn::BranchConn::control`, in `backend::txn`), with the
+    /// coordinator settings it changes (`true`) or puts back (`false`)
+    /// once it succeeds.
+    pub(super) txn_ctl: Option<Vec<(TxnSetting, bool)>>,
 }
 
 impl std::fmt::Debug for BackendSession {
@@ -435,6 +465,61 @@ async fn commit_wrote_nothing(cur: &mut Current, ok: &RespPacket, before: Option
 /// Whether `sql` is a plain `SELECT`, `INSERT`, `UPDATE`, `DELETE`,
 /// `REPLACE` or `WITH`: a statement that can't end a transaction (stored
 /// functions and triggers can't commit), after any leading comments.
+/// Whether `p` ends a statement's response.
+fn ends_response(p: &RespPacket) -> bool {
+    match &p.kind {
+        PacketKind::Err(_) => true,
+        PacketKind::Ok(_) | PacketKind::End(_) => !p
+            .status()
+            .unwrap_or_default()
+            .contains(StatusFlags::MORE_RESULTS_EXISTS),
+        _ => false,
+    }
+}
+
+/// `p` (an OK, or an OK-form or EOF terminator) without
+/// `SERVER_STATUS_IN_TRANS`: the transaction the gateway opened around an
+/// autocommit write has committed.
+fn without_in_trans(mut p: RespPacket) -> RespPacket {
+    let b = &p.payload;
+    // OK (0x00) and OK-form terminators (0xfe, long): affected rows and
+    // the insert id, length-encoded, then the status. EOF (0xfe, short):
+    // warnings, then the status.
+    let at = match b.first() {
+        Some(0xfe) if b.len() < 9 => Some(3),
+        Some(0x00 | 0xfe) => lenenc_len(b, 1).and_then(|n| lenenc_len(b, 1 + n).map(|m| 1 + n + m)),
+        _ => None,
+    };
+    if let Some(at) = at
+        && b.len() >= at + 2
+    {
+        let mut v = b.to_vec();
+        let st = u16::from_le_bytes([v[at], v[at + 1]]) & !StatusFlags::IN_TRANS.bits();
+        v[at..at + 2].copy_from_slice(&st.to_le_bytes());
+        p.payload = Bytes::from(v);
+        if let PacketKind::Ok(ok) = &mut p.kind {
+            ok.status -= StatusFlags::IN_TRANS;
+        }
+    }
+    p
+}
+
+/// The length of the length-encoded integer at `b[at]`.
+fn lenenc_len(b: &[u8], at: usize) -> Option<usize> {
+    match *b.get(at)? {
+        x if x < 0xfb => Some(1),
+        0xfc => Some(3),
+        0xfd => Some(4),
+        0xfe => Some(9),
+        _ => None,
+    }
+}
+
+/// Sprig 2PC's relay preamble for `tenant`.
+fn relay_preamble(tenant: sprig_common::ids::TenantId) -> Vec<u8> {
+    sprig_txn::fence::wire::preamble(tenant)
+}
+
 fn plain_dml(sql: &[u8]) -> bool {
     first_word_in(
         sql,
@@ -523,6 +608,13 @@ fn note_silent_abort(cluster: &sprig_common::ids::ClusterId, node: &NodeKey, wha
 /// is the one it had before (`before`): the commit wrote nothing.
 fn gtid_unchanged(before: Option<&str>, after: &str) -> bool {
     after.is_empty() || before == Some(after)
+}
+
+/// The error a failed [`TRX_GUARD`] reports: `None` for the guard's own
+/// (1242, no transaction open: a silent abort), else the server's, such as
+/// the 1213 of an abort it reported as usual.
+fn reported(e: ErrPacket) -> Option<ErrPacket> {
+    (e.code != 1242).then_some(e)
 }
 
 /// MariaDB's own deadlock error, the answer for a transaction Galera rolled
@@ -640,9 +732,11 @@ impl BackendSession {
             explicit_ids_next: false,
             trace_ctx: None,
             redo: None,
+            redo_off: false,
             keep: false,
             kept: None,
             trx_locks: false,
+            txn_ctl: None,
         }
     }
 
@@ -684,7 +778,9 @@ impl BackendSession {
             && key.node == node.node
             && key.account == self.target.user
             && key.found_rows == self.opts.found_rows
-            && key.mariadb_caps == self.opts.mariadb_caps.bits();
+            && key.mariadb_caps == self.opts.mariadb_caps.bits()
+            && key.relay == self.relay_via(view)
+            && key.branch == self.opts.txn_branch;
         let limits = self.backends.limits(&self.target.cluster);
         let retired = self
             .backends
@@ -975,6 +1071,77 @@ impl BackendSession {
     /// # Errors
     /// The lost-connection errors of the module docs.
     pub async fn next(&mut self) -> Result<Option<RespPacket>> {
+        match self.next_packet().await? {
+            Some(p) if self.cur.as_ref().is_some_and(|c| c.wrapped) && ends_response(&p) => {
+                self.commit_wrapped(p).await.map(Some)
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// The end of a wrapped autocommit write's response: `COMMIT` (or,
+    /// after an error, `ROLLBACK`) in a round trip of its own. The
+    /// client gets the write's answer only once it committed; a failed
+    /// `COMMIT` answers in its place.
+    async fn commit_wrapped(&mut self, p: RespPacket) -> Result<RespPacket> {
+        let Some(cur) = self.cur.as_mut() else {
+            return Ok(p);
+        };
+        cur.wrapped = false;
+        let rollback = matches!(p.kind, PacketKind::Err(_));
+        let r: std::result::Result<Vec<RespPacket>, ClientError> = async {
+            let client = &mut cur.lease.conn().client;
+            // The write's response is complete: read its end.
+            while client.next_packet().await?.is_some() {}
+            client
+                .send_query(if rollback { b"ROLLBACK" } else { b"COMMIT" })
+                .await?;
+            let mut v = Vec::new();
+            while let Some(q) = client.next_packet().await? {
+                v.push(q);
+            }
+            Ok(v)
+        }
+        .await;
+        cur.done = true;
+        match r {
+            Ok(pkts) => {
+                let (last_ok, warnings, error) =
+                    (cur.last_ok.clone(), cur.warnings, cur.error.clone());
+                let mut failed = None;
+                for q in &pkts {
+                    if matches!(q.kind, PacketKind::Err(_)) {
+                        failed = Some(q.clone());
+                    }
+                    cur.observe(q);
+                }
+                if rollback {
+                    cur.error = error;
+                    return Ok(p);
+                }
+                if let Some(f) = failed {
+                    metrics::counter!("sprig_backend_wrapped_commit_failures_total", "cluster" => self.target.cluster.to_string())
+                        .increment(1);
+                    return Ok(f);
+                }
+                cur.last_ok = last_ok;
+                cur.warnings = warnings;
+                let status = cur.status.unwrap_or_default() - StatusFlags::IN_TRANS;
+                cur.status = Some(status);
+                Ok(without_in_trans(p))
+            }
+            Err(e) if e.is_connection_lost() => {
+                cur.failed = true;
+                let node = cur.lease.key().node_key();
+                let stmt = cur.stmt.clone();
+                self.backends.note_failure(&node, "io");
+                Err(self.lost(&stmt, false, true, &node))
+            }
+            Err(e) => Err(internal(&e)),
+        }
+    }
+
+    async fn next_packet(&mut self) -> Result<Option<RespPacket>> {
         let Some(cur) = self.cur.as_mut() else {
             return Ok(None);
         };
@@ -1149,6 +1316,9 @@ impl BackendSession {
         if Self::drop_set_statement_reports(&mut cur, &mut observed) {
             observed.unexplained = false;
         }
+        if self.drop_txn_setting_reports(&mut observed) {
+            observed.unexplained = false;
+        }
         self.vars.apply(&observed);
         // The MySQL persona's sql_mode view.
         self.vars.mysql_sql_mode_after(&observed);
@@ -1253,6 +1423,14 @@ impl BackendSession {
             && self.pins.after_statement(st)
         {
             self.count_pin(PinReason::Transaction);
+        }
+        // The coordinator's settings, as its statement left them.
+        if let Some(changes) = &self.txn_ctl
+            && cur.error.is_none()
+        {
+            for &(setting, changed) in changes {
+                self.pins.set_txn_setting(setting, changed);
+            }
         }
         if cur.takes_locks && self.pins.in_transaction() {
             self.trx_locks = true;
@@ -1409,6 +1587,35 @@ impl BackendSession {
             .chain(scoped.iter().cloned())
             .collect();
         observed.vars.len() + observed.untracked.len() != before
+    }
+
+    /// MariaDB's reports of the transaction coordinator's own settings. They
+    /// aren't session state to replay or pin as `Untracked`: the
+    /// coordinator's statements keep [`PinReason::TxnSettings`] instead,
+    /// until it puts them back. A coordinator statement's reports of
+    /// `innodb_lock_wait_timeout` and `timestamp` are dropped, and so is
+    /// `timestamp` while the coordinator's clock is fixed (MariaDB reports
+    /// it again after a commit on such a connection; whatever set it, the
+    /// coordinator's reset to `DEFAULT` comes before the connection can
+    /// leave). Returns whether the statement's state change is then
+    /// explained: a coordinator statement changes nothing else, a client
+    /// statement only if nothing else was reported.
+    fn drop_txn_setting_reports(&self, observed: &mut state::Observed) -> bool {
+        let coordinator = self.txn_ctl.is_some();
+        if !coordinator && !self.pins.txn_setting(TxnSetting::Clock) {
+            return false;
+        }
+        let before = observed.untracked.len();
+        observed.untracked.retain(|n| match n.as_str() {
+            "timestamp" => false,
+            "innodb_lock_wait_timeout" => !coordinator,
+            _ => true,
+        });
+        coordinator
+            || (observed.untracked.len() != before
+                && observed.untracked.is_empty()
+                && observed.vars.is_empty()
+                && observed.schema.is_none())
     }
 
     /// A client statement set gateway-owned variables: keep the client's
@@ -1600,7 +1807,7 @@ impl BackendSession {
             self.vars
                 .vars
                 .get(*k)
-                .is_some_and(|v| v.to_ascii_uppercase().contains("SERIALIZABLE"))
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("SERIALIZABLE"))
         })
     }
 
@@ -1632,6 +1839,8 @@ impl BackendSession {
             account: self.target.user.clone(),
             found_rows: self.opts.found_rows,
             mariadb_caps: self.opts.mariadb_caps.bits(),
+            relay: self.relay_via(view),
+            branch: self.opts.txn_branch,
         };
         let node_key = view.key(&node.node);
         let budget = b.budget(&node_key);
@@ -1665,6 +1874,7 @@ impl BackendSession {
                         connect_timeout: settings.connect_timeout,
                         net_write_timeout_secs: settings.net_write_timeout_secs,
                         wait_timeout_secs: settings.idle_timeout.as_secs().max(300) + 300,
+                        preamble: key.relay.map(relay_preamble),
                     };
                     let r = conn::connect(&spec, Arc::clone(&budget)).await;
                     let outcome = if r.is_ok() { "ok" } else { "error" };
@@ -1679,6 +1889,114 @@ impl BackendSession {
             .await;
         stmt_metrics::pool_wait(&view.id).record(started.elapsed().as_secs_f64());
         r
+    }
+
+    /// The tenant whose connections to `view`'s cluster go through its
+    /// relay writer: the session is on the relay path and the cluster has
+    /// relays.
+    fn relay_via(&self, view: &ClusterView) -> Option<sprig_common::ids::TenantId> {
+        use sprig_cluster::failover::relay::RelayState;
+        self.opts.relay.filter(|_| view.relay != RelayState::None)
+    }
+
+    /// This session is a transaction coordinator's branch: its connections
+    /// come from the branch pools ([`SessionOpts::txn_branch`]).
+    pub fn set_txn_branch(&mut self) {
+        self.opts.txn_branch = true;
+    }
+
+    /// This session may not hold a Sprig 2PC branch (the relay path on a
+    /// cluster without a ready relay writer).
+    pub fn forbid_redo(&mut self) {
+        self.redo_off = true;
+    }
+
+    /// The tenant whose connections go through relays, if any.
+    #[must_use]
+    pub fn relay(&self) -> Option<sprig_common::ids::TenantId> {
+        self.opts.relay
+    }
+
+    /// Changes the session's relay path (a settings change): connections
+    /// leased from now on follow it.
+    pub fn set_relay(&mut self, relay: Option<sprig_common::ids::TenantId>) {
+        self.opts.relay = relay;
+    }
+
+    /// Whether `cluster` takes this session's connections through a ready
+    /// relay writer (a held branch there is fenced by the relay).
+    ///
+    /// # Errors
+    /// As [`Backends::view`].
+    pub async fn relay_ready(&self, cluster: &ClusterId) -> Result<Option<RelayLease>> {
+        use sprig_cluster::failover::relay::RelayState;
+        if self.opts.relay.is_none() {
+            return Ok(None);
+        }
+        Ok(match &self.backends.view(cluster).await?.relay {
+            RelayState::Ready(l) => Some(l.clone()),
+            _ => None,
+        })
+    }
+
+    /// A relayed tenant's connection: every statement, reads included, goes
+    /// to the relay writer, through its relay. While the cluster has no
+    /// ready relay writer (a takeover recovering held branches), it waits
+    /// until the deadline, then fails with 39448 (retryable).
+    async fn relay_lease(
+        &mut self,
+        view: &ClusterView,
+        settings: &BackendSettings,
+        deadline: Instant,
+    ) -> Result<(BackendLease, RouteKind, Wait)> {
+        use sprig_cluster::failover::relay::RelayState;
+        let mut fresh: Option<Arc<ClusterView>> = None;
+        loop {
+            let v = fresh.as_deref().unwrap_or(view);
+            let why = match &v.relay {
+                RelayState::Ready(l) => {
+                    let node = NodeRef {
+                        node: NodeId::new(&l.node_id)
+                            .map_err(|e| SprigError::internal(format!("relay lease node: {e}")))?,
+                        addr: l.relay_addr.clone(),
+                    };
+                    if let Some(k) = self.take_kept(v, &node) {
+                        return Ok((k, RouteKind::Writer, Wait::None));
+                    }
+                    match Box::pin(self.lease(v, &node, settings, deadline)).await {
+                        Ok(k) => return Ok((k, RouteKind::Writer, Wait::None)),
+                        Err(AcquireError::Timeout) => return Err(pool_timeout()),
+                        Err(AcquireError::Connect(e)) => match e.server_error() {
+                            Some(err) if err.code == sprig_txn::fence::FENCED_ERRNO => {
+                                format!("the relay refused: {}", err.message)
+                            }
+                            Some(err) => {
+                                return Err(unavailable(format!(
+                                    "backend login through the relay on {} failed: {} {}",
+                                    node.node, err.code, err.message
+                                )));
+                            }
+                            None => format!("relay {}: {e}", node.addr),
+                        },
+                    }
+                }
+                RelayState::Unavailable(why) => why.clone(),
+                RelayState::None => {
+                    return Err(unavailable("the cluster's relays went away"));
+                }
+            };
+            if Instant::now() >= deadline {
+                return Err(SprigError::new(
+                    SprigCode::HeldBranchFenced,
+                    format!(
+                        "cluster {} has no ready relay writer ({why}); retry",
+                        view.id
+                    ),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            fresh = Some(self.backends.view(&view.id).await?);
+        }
     }
 
     /// Chooses the node (writer, or a reader for a plain read) and leases a
@@ -1713,6 +2031,9 @@ impl BackendSession {
             && !self.implicit_transactions()
             && !self.client_sync_wait();
         let mut last_err: Option<String> = None;
+        if self.relay_via(view).is_some() {
+            return self.relay_lease(view, settings, deadline).await;
+        }
         loop {
             let writer = self.backends.writers.writer(view, shard);
             let (node, route, wait) = if plain {
@@ -1884,7 +2205,7 @@ impl BackendSession {
         if !in_trx_before {
             // The next transaction holds no locks yet, unless all its reads
             // lock or `SET TRANSACTION` set its characteristics.
-            self.trx_locks = self.pins.next_transaction_set() || self.serializable();
+            self.trx_locks = galera && (self.pins.next_transaction_set() || self.serializable());
         }
         // A write in such a transaction runs only if the transaction is
         // still open (`TRX_GUARD`). Galera aborts a transaction only for
@@ -1895,7 +2216,8 @@ impl BackendSession {
         let guard = galera_dml_in_trx && info.class == StmtClass::Write && self.trx_locks;
         // Anything but a plain read (which the statement check covers)
         // turns the guard on for the rest of the transaction.
-        let takes_locks = (info.class == StmtClass::Write || !stmt_sql.is_some_and(plain_dml))
+        let takes_locks = galera
+            && (info.class == StmtClass::Write || !stmt_sql.is_some_and(plain_dml))
             && !matches!(req, Req::Prepare { .. })
             && !info.effects.contains(&Effect::Begin);
         // `USE x` sets the schema itself, so any pooled connection serves
@@ -2009,7 +2331,16 @@ impl BackendSession {
             };
             let base = Arc::clone(&conn.baseline);
             self.vars.settle_login(&base);
-            let (prefix, next_applied) =
+            // An autocommit write on a relayed connection never commits in
+            // the round trip that ran it: a write waiting for a held
+            // branch's rows when the relay dies would otherwise commit
+            // although its client is gone.
+            let wrapped = conn.relayed
+                && !in_trx_before
+                && !self.pins.in_transaction()
+                && !self.implicit_transactions()
+                && stmt_sql.is_some_and(plain_write);
+            let (mut prefix, next_applied) =
                 match state::sync_prefix(&conn.applied, &base, &self.vars, info, 0) {
                     Ok(x) => x,
                     Err(state::Unreplayable(why)) => {
@@ -2022,6 +2353,9 @@ impl BackendSession {
                         ));
                     }
                 };
+            if wrapped {
+                prefix.push("START TRANSACTION".to_owned());
+            }
             let kind = match (prefix.is_empty(), text) {
                 (true, _) => "none",
                 (false, true) => "prefix",
@@ -2074,8 +2408,8 @@ impl BackendSession {
                             return Ok(Sent::SyncErr(e));
                         }
                     }
-                    if guard && consume_statement(conn).await?.is_some() {
-                        return Ok(Sent::TrxGone);
+                    if guard && let Some(e) = consume_statement(conn).await? {
+                        return Ok(Sent::TrxGone(reported(e)));
                     }
                     return Ok(match &wait {
                         Wait::None => Sent::Ready,
@@ -2107,7 +2441,7 @@ impl BackendSession {
                 if guard {
                     match conn.client.query_drop(TRX_GUARD).await {
                         Ok(()) => {}
-                        Err(ClientError::Server(_)) => return Ok(Sent::TrxGone),
+                        Err(ClientError::Server(e)) => return Ok(Sent::TrxGone(reported(e))),
                         Err(e) => return Err(e),
                     }
                 }
@@ -2146,11 +2480,13 @@ impl BackendSession {
             let waited = !matches!(wait, Wait::None);
             match sent {
                 Ok(Sent::Ready) => {}
-                Ok(Sent::TrxGone) => {
+                Ok(Sent::TrxGone(reported)) => {
                     // The sync statements before the guard ran.
                     conn.applied = next_applied;
                     conn.client.take_changes();
-                    note_silent_abort(&cluster, &node_key, "a write's transaction check");
+                    if reported.is_none() {
+                        note_silent_abort(&cluster, &node_key, "a write's transaction check");
+                    }
                     self.pins.after_statement(StatusFlags::empty());
                     if route == RouteKind::Pinned {
                         self.held = Some((lease, route));
@@ -2159,7 +2495,7 @@ impl BackendSession {
                         self.backends.pools.release(lease, Release::Reuse, limits);
                     }
                     self.inflight = None;
-                    return Err(backend_err(&silent_abort_err()));
+                    return Err(backend_err(&reported.unwrap_or_else(silent_abort_err)));
                 }
                 Ok(Sent::WaitFailed | Sent::WaitTimedOut) => {
                     // The read reruns on the writer (the replica, or the
@@ -2267,6 +2603,7 @@ impl BackendSession {
             };
             let prepared_only = matches!(req, Req::Prepare { .. });
             let mut cur = Current {
+                wrapped,
                 lease,
                 stmt: info.clone(),
                 route,

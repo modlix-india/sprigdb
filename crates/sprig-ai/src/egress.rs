@@ -88,6 +88,8 @@ pub struct EgressGate {
     /// The assistant can offer the user a query with `propose_sql` (the
     /// chat always can; an MCP client only when it is offered the tool).
     can_propose: bool,
+    /// The user sees every result with rows in full (the chat).
+    results_shown: bool,
 }
 
 impl EgressGate {
@@ -108,7 +110,16 @@ impl EgressGate {
             policy,
             scrubber,
             can_propose: true,
+            results_shown: false,
         }
+    }
+
+    /// The same gate for a surface that shows the user every result with
+    /// rows in full: a withheld result tells the model the user has it.
+    #[must_use]
+    pub fn with_results_shown(mut self, shown: bool) -> Self {
+        self.results_shown = shown;
+        self
     }
 
     /// The same gate for a caller that can (or can't) offer queries with
@@ -122,6 +133,10 @@ impl EgressGate {
 
     /// What a result with rows withheld tells the model to do instead.
     fn withheld_rows(&self) -> String {
+        if self.results_shown {
+            return "Data sharing is off (ai.share_data), so the rows weren't sent to you; the user sees the whole result in the chat. Describe it from its columns and row count, never guess or invent values, and point the user to the result they see. Don't offer the same query again."
+                .to_owned();
+        }
         let offer = if self.can_propose {
             "offer the query to the user with propose_sql, so they can run it and see the rows themselves"
         } else {

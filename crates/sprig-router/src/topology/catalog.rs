@@ -50,6 +50,11 @@ pub struct CatalogLookup {
     /// The lookup group's current map (`None` while it isn't cached:
     /// the lookup is then a gap, and writes to the table refuse).
     pub map: Option<Arc<ShardMap>>,
+    /// The owner's group passed a re-key's cutover and the lookup's rows
+    /// may still name owners by the old key's hashes: no routing through
+    /// it, and claims check owners on every shard
+    /// (`LookupIndex::rehashing`).
+    pub rehashing: bool,
 }
 
 /// A sharded group: its key and its current map.
@@ -464,7 +469,14 @@ pub fn build_with_fks(
                     && key_columns.is_none()
                     && let (Some(fk), Some(s)) = (parent_fk.as_deref(), shape.as_ref())
                 {
-                    parent = parent_link(fk, s);
+                    parent = parent_link(fk, s).map(|mut l| {
+                        // Rows written without their parent may wait on
+                        // the group's first shard.
+                        l.orphans = fks.iter().any(|f| {
+                            f.orphans && f.child == t.object && f.name.eq_ignore_ascii_case(fk)
+                        });
+                        l
+                    });
                 }
                 let group = built
                     .entry((g.id, t.db))
@@ -515,6 +527,7 @@ pub fn build_with_fks(
                 auto_inc,
                 primary,
                 primary_classes,
+                orphan_children: Vec::new(),
             },
         ));
     }
@@ -561,6 +574,64 @@ pub fn build_with_fks(
             _ => e.parent = None,
         }
         done.push((schema, e));
+    }
+    // Which links may hold rows waiting for their parent.
+    let orphanable: Vec<bool> = done
+        .iter()
+        .map(|(schema, e)| {
+            let Some(l) = e.parent.as_ref() else {
+                return false;
+            };
+            let parent_keyed = done
+                .iter()
+                .any(|(s, p)| s == schema && p.name == l.table && p.key().is_some());
+            let followed = done.iter().any(|(s, x)| {
+                s == schema && x.parent.as_ref().is_some_and(|pl| pl.table == e.name)
+            });
+            l.columns.len() == 1 && parent_keyed && !followed
+        })
+        .collect();
+    for ((_, e), ok) in done.iter_mut().zip(orphanable) {
+        if let Some(l) = e.parent.as_mut() {
+            l.orphanable = ok;
+            l.orphans &= ok;
+        }
+    }
+    // Each parent learns its children whose rows may wait for it.
+    let waiting: Vec<(String, String, crate::topology::OrphanChild)> = done
+        .iter()
+        .filter_map(|(schema, e)| {
+            let l = e.parent.as_ref().filter(|l| l.orphans)?;
+            let ([c], [p]) = (l.columns.as_slice(), l.parent_columns.as_slice()) else {
+                return None;
+            };
+            // The table's own spelling: shard schemas name it so.
+            let table = tables
+                .iter()
+                .find(|t| {
+                    t.name.eq_ignore_ascii_case(&e.name)
+                        && t.default_schema.eq_ignore_ascii_case(schema)
+                })
+                .map_or_else(|| e.name.clone(), |t| t.name.clone());
+            Some((
+                schema.clone(),
+                l.table.clone(),
+                crate::topology::OrphanChild {
+                    table,
+                    column: c.clone(),
+                    parent_column: p.clone(),
+                    columns: e.columns.clone(),
+                },
+            ))
+        })
+        .collect();
+    for (schema, parent, child) in waiting {
+        if let Some((_, p)) = done
+            .iter_mut()
+            .find(|(s, p)| *s == schema && p.name == parent)
+        {
+            p.orphan_children.push(child);
+        }
     }
     for (schema, graph) in fk_graphs(fks, &done, &shapes) {
         topo.set_fk_graph(&schema, graph);
@@ -694,6 +765,8 @@ fn parent_link(fk: &str, shape: &TableShape) -> Option<ParentLink> {
         parent_columns: f.ref_columns.clone(),
         lookup: None,
         parent_unique: false,
+        orphans: false,
+        orphanable: false,
     })
 }
 
@@ -768,6 +841,7 @@ fn lookup_ref(
             group: GroupId(lookup_map.group.0),
             state: l.state,
             auto_index_id: None,
+            rehashing: l.rehashing,
         },
         placement: Arc::new(MapPlacement {
             tenant: TenantId(tenant),

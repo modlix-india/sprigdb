@@ -20,6 +20,38 @@ Each version runs in one of two **tiers**:
 
 SprigDB picks the tier (`SPRIG_TIER = 'auto'`): code that can't compile to SQL, such as code with outbound `fetch` calls or loops it can't bound, runs in the engine tier. After a declaration, `SHOW WARNINGS` lists one note per line of the placement: the module, the version, the tier and each reason for the engine tier.
 
+JavaScript compiles to the MariaDB tier with `try`/`catch`/`finally`, helper functions declared in the same source, and `do ... while` loops. These keep it in the engine tier, each shown as a reason:
+
+| Reason | Why |
+|---|---|
+| `js.catch_value` | A `catch` reads the database error it caught (its message), which SQL handlers can't pass on |
+| `js.recursion` | A helper function calls itself, directly or through another |
+| `js.db` | `db.call`, `db.publish`, `db.commitOffset` or a `db.mq.*` call |
+
+`EXPLAIN FUNCTION` lists every reason with its place in the source.
+
+```sql test
+CREATE OR REPLACE FUNCTION safe_ratio(a DOUBLE, b DOUBLE) RETURNS DOUBLE LANGUAGE javascript AS '
+function ratio(x, y) { if (y === 0) throw new Error("zero"); return x / y; }
+try { return ratio(a, b); } catch (e) { return null; } finally { }
+';
+SELECT safe_ratio(6, 3) AS r, safe_ratio(1, 0) AS z;
+```
+
+```text output
+r	z
+2	NULL
+```
+
+```sql test
+EXPLAIN FUNCTION safe_ratio;
+```
+
+```text output
+Version	State	Tier	Placement
+1	active (live)	mariadb	tier mariadb, route any shard, cost 0
+```
+
 Budgets are settings, per object, database or tenant: `logic.function_budget_ms` (5000 ms per synchronous call), `logic.trigger_budget_ms`, `logic.job_budget_ms`, `logic.kirun_max_steps`, `logic.max_data_ops` (1000 `db` calls per invocation), `logic.max_rows_read`, `logic.max_loop_iterations` and `logic.memory_limit_mb`. Workers read `logic.trigger_budget_ms` and `logic.job_budget_ms` per tenant, so set those on the tenant or globally. Outbound `fetch` reaches only the hosts in `logic.outbound_allowlist`. See the [settings reference](../reference/settings.md#logic).
 
 ## Statements
@@ -235,6 +267,31 @@ DELIMITER ;
 ```
 
 Because it reads `old`, this validation becomes `BEFORE INSERT` and `BEFORE UPDATE` triggers rather than a `CHECK` constraint; the deploy notes say which.
+
+### Changing columns under compiled code
+
+Validations and after-commit triggers in the MariaDB tier are compiled against the table's columns. `ALTER TABLE ... MODIFY`, `CHANGE`, `RENAME COLUMN`, `DROP COLUMN` or `ALTER COLUMN ... TYPE` compiles each of them again against the columns the statement would leave:
+
+- if each still reads the same columns with compatible types (a column it doesn't read, `INT` to `BIGINT`, `VARCHAR(16)` to `VARCHAR(64)`, `DOUBLE` to `DECIMAL`), the statement runs;
+- otherwise it is refused with 39481 `ER_SPRIG_DDL_UNSUPPORTED`, naming the validation or trigger and why (for example `qty (i64 becomes f64)` or `would no longer compile`).
+
+```sql test
+CREATE TABLE order_lines (id INT PRIMARY KEY, qty INT, memo VARCHAR(16));
+CREATE VALIDATION qty_ok ON order_lines FOR INSERT, UPDATE LANGUAGE javascript
+  AS 'if (row.qty <= 0) sprig.reject("qty must be positive");';
+ALTER TABLE order_lines MODIFY qty BIGINT;        -- the validation still reads an integer
+ALTER TABLE order_lines MODIFY memo VARCHAR(64);  -- a column it doesn't read
+```
+
+```sql test-error
+ALTER TABLE order_lines MODIFY qty DOUBLE;  -- 39481: qty (i64 becomes f64)
+```
+
+```sql test-error
+ALTER TABLE order_lines RENAME COLUMN qty TO quantity;  -- 39481: it would no longer compile
+```
+
+To make such a change, drop the validation or trigger, change the table, and create it again.
 
 ## CREATE TRIGGER … AFTER COMMIT
 
@@ -558,7 +615,7 @@ DROP FUNCTION net_value CASCADE;
 
 ## Logs and dead letters
 
-What triggers and schedules did, and the events that kept failing, aren't SQL tables. Read and settle them with:
+What triggers and schedules did, and the events that kept failing, aren't SQL tables. A run's log holds its errors and the lines its code wrote (`console.log`, `ctx.log`, Lua `log` and `print`); for stream and queue triggers, at most 60 lines a minute per trigger reach the log (a line says how many more were dropped), with each record's partition and offset or the message's id. Read and settle them with:
 
 - `sprigctl logic logs [name] [--follow]`;
 - `sprigctl logic dead-letters list | replay | discard` (replay sends them back to the trigger in order, with the active version);

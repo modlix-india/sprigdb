@@ -221,7 +221,7 @@ db.runCommand({ sprigRowSecurity: "orders", enable: true, force: false });
 db.runCommand({ sprigDropPolicy: "orders", name: "own", ifExists: true });
 ```
 
-A filter may use equality, `$in`, `$gt`, `$gte`, `$lt`, `$lte`, `$ne`, `$nin`, `$exists: true`, `$and` and `$or`, and the session values `$$USER`, `$$USER_ID`, `$$TENANT_ID`, `$$HOME_TENANT_ID`, `$$SESSION_SPACE`, `$$CLAIM.<key>` and `$$ATTR.<key>`. Other operators are refused with 39364. Where MongoDB's matching needs more than the translation can express, the document stays hidden: a policy filter is never wider than MongoDB's own match.
+A filter may use equality, `$in`, `$gt`, `$gte`, `$lt`, `$lte`, `$ne`, `$nin`, `$exists: true`, `$and` and `$or`, and the session values `$$USER`, `$$USER_ID`, `$$TENANT_ID`, `$$HOME_TENANT_ID`, `$$SESSION_SPACE`, `$$CLAIM.<key>` and `$$ATTR.<key>`. Other operators are refused with 39364. Where MongoDB's matching needs more than the translation can express, the document stays hidden: a policy filter is never wider than MongoDB's own match. The SQL a MongoDB filter becomes is compiled again by each new release from the stored filter, so a translation fix also applies to policies created before it.
 
 ## Statements a protected table refuses
 
@@ -261,7 +261,7 @@ The rules:
 - **`BYPASS RLS` and `SPRIG_TENANT_ADMIN`.** `BYPASS RLS` skips every policy it covers. A tenant's first administrator holds `ALL` on `*.*`, which includes `ALTER`, so they are a manager of every table and see all rows of unforced tables.
 - **Claims and attributes.** `SPRIG_USER_ATTR('key')` reads the account's attributes, which an administrator sets with `CREATE USER` or `ALTER USER ... ATTRIBUTE '{json}'` (or `COMMENT 'text'`, read as `SPRIG_USER_ATTR('comment')`); see [Accounts and logins](accounts-and-logins.md#users-and-passwords). `SPRIG_CLAIM('key')` reads a top-level claim of the token the session logged in with. For a token from an identity provider the tenant registered, that is any of the token's verified claims, unchanged, on MySQL, MariaDB, Redis, MongoDB, REST and gRPC; see [Logins with identity provider tokens](external-tokens.md#claims-in-row-level-security). For SprigDB's own session token (REST, gRPC, Studio) it is one of its fixed claims: `sub` (`<tenant id>:<user id>`), `ten` (the tenant's name), `sid` (the session id), `amr` (the login methods, an array), `cli` (`studio`, `api` or `cli`), `iat` and `exp` (Unix seconds), `act` while an administrator impersonates the user, and `iss` and `aud` (always `sprigdb`). Sessions without a token (password logins on any protocol, HTTP Basic, API keys) have no claims, so `SPRIG_CLAIM` returns `NULL` there, and a policy that relies on a claim hides rows from them. Claims come from whoever issued the token: trust only issuers whose claims you would let decide what a user sees.
 - **Constraint errors.** A plain `INSERT` whose key collides with a hidden row fails with the duplicate-key error, which tells the user that a row with that key exists. Don't rely on row-level security to keep the existence of keys secret; use keys that reveal nothing.
-- **Stored code.** `SQL SECURITY DEFINER` routines over protected tables run under their definer's policies while they run, and the caller's again afterwards. Views and routines can't be created over protected tables (39366).
+- **Stored code.** Views and routines over protected tables are pointed at the policy views when they're created, so `SQL SECURITY DEFINER` routines run under their definer's policies while they run, and the caller's again afterwards. Code that couldn't be pointed (a table without its policy view, or a failed repoint) is refused to bound sessions with 39366 until it's fixed. For a few milliseconds after a `CREATE`, a call that reaches another gateway runs with the caller's policies.
 - **Search indexes and analytics copies** are filled without row-level security; queries re-check results through your session, but treat index storage as containing every row.
 - **`rls.backend_enforcement = off`** leaves the gateway as the only enforcement. Keep the default unless you have measured the cost of the triggers.
 
@@ -270,13 +270,12 @@ The rules:
 | Setting | Type | Default | Scopes | Meaning |
 |---|---|---|---|---|
 | `rls.backend_enforcement` | text | `views` | database, tenant, global | `views`, `triggers` or `off` |
-| `rls.inline_subtree_max` | int | 1000 | tenant, dc, global | Tenant ids inlined for `SPRIG_TENANT_IN_SUBTREE` and `SPRIG_TENANT_MANAGED` |
+| `rls.inline_subtree_max` | int | 1000 | tenant, dc, global | Tenant ids inlined for `SPRIG_TENANT_IN_SUBTREE` and `SPRIG_TENANT_MANAGED`. After-commit triggers and schedules get their definer's subtree and managed tenants too; above this size those sets are empty for them, so such a policy hides every row from that code (it fails closed) |
 | `studio.view_as` | text | `on` | tenant, dc, global | Allow the row-level security tester |
 
 ## Not supported yet
 
 - **Claims without a token.** Password logins, HTTP Basic and API keys carry no token, so `SPRIG_CLAIM` returns `NULL` there; put per-user values in account attributes and read them with `SPRIG_USER_ATTR`.
-- **Claims in MongoDB-language calls over HTTP.** `Sql.Query` with `language: mongo` doesn't pass the bearer token's claims to `SPRIG_CLAIM`; SQL calls do. See [Logins with identity provider tokens](external-tokens.md#not-supported-yet).
 
 ## Related
 

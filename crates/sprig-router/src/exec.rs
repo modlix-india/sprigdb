@@ -249,6 +249,19 @@ pub trait ShardBackend: Send {
         true
     }
 
+    /// Opens the orphanage of the foreign key parent member insert `v`
+    /// follows: its `foreign_keys` row says `orphanage = 'present'`, and
+    /// every gateway has the catalog version that says so, so their
+    /// inserts into the parent take waiting rows along. `Ok(false)` when
+    /// this backend can't (the row is refused).
+    ///
+    /// # Errors
+    /// The catalog's.
+    async fn open_orphanage(&mut self, v: &ViaParent) -> Result<bool> {
+        let _ = v;
+        Ok(false)
+    }
+
     /// The routing hashes of the rows holding `probe`'s values (the lookup's
     /// `route`), as the session's transaction sees them.
     ///
@@ -482,6 +495,18 @@ async fn parents(v: &ViaParent, be: &mut dyn ShardBackend, budget: &mut Budget) 
         None => true,
     };
     metrics::counter!("sprig_router_parent_routes_total").increment(1);
+    // A row without its parent, checks off: the orphanage opens first.
+    if !fk_checks
+        && !v.orphans
+        && v.orphanable
+        && v.fill_rk
+        && hits.iter().any(Vec::is_empty)
+        && be.open_orphanage(v).await?
+    {
+        let mut opened = v.clone();
+        opened.orphans = true;
+        return opened.finish(&hits, fk_checks).map_err(|r| r.error());
+    }
     v.finish(&hits, fk_checks).map_err(|r| r.error())
 }
 

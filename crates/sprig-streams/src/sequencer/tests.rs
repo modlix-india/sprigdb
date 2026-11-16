@@ -176,6 +176,28 @@ async fn deadlines_never_drop_a_half_read_feed_item() {
     check(&log, &feed);
 }
 
+/// `stream.sequencer_batch_ms` as the job resolved it (the live window):
+/// a short window appends each transaction as it arrives, a long one
+/// gathers the whole script into one append.
+#[tokio::test(start_paused = true)]
+async fn the_live_batch_window_sets_how_records_are_batched() {
+    let mut batches = Vec::new();
+    for ms in [1, 5000] {
+        let feed = script(20);
+        let log = MemLog::new(&start());
+        let mut s = sequencer(&log, &feed);
+        s.feed = Arc::new(SlowScript(feed.clone()));
+        s.opts.batch_window = Duration::from_secs(3600);
+        s.opts.live_window = Some(Arc::new(AtomicU64::new(ms)));
+        s.opts.idle_checkpoint = Duration::from_secs(60);
+        assert_eq!(run_for(&s, Duration::from_secs(10)).await, RunEnd::Stopped);
+        check(&log, &feed);
+        batches.push(s.stats.batches.load(Ordering::Relaxed));
+    }
+    assert!(batches[0] >= 20, "{batches:?}");
+    assert_eq!(batches[1], 1, "{batches:?}");
+}
+
 fn script(n: u64) -> Script {
     let keys = ["a", "b", "c", "d", "e"];
     let txns = (1..=n)

@@ -25,7 +25,9 @@
 //!   reverse, so waits between budgets can't form a cycle;
 //! - every wait for a connection ends after [`ACQUIRE_TIMEOUT`]
 //!   ([`acquire`], [`bounded`]) with 39070, so a starved caller fails and
-//!   retries instead of hanging.
+//!   retries instead of hanging; the pools themselves carry the same limit
+//!   ([`RegistryPools::wait_limit`], [`sprig_catalog::pool_wait`]), so an
+//!   acquire through `get_conn_bounded` anywhere is bounded too.
 //!
 //! `sprig_controller_catalog_pool_connections{pool, cluster, state}`
 //! (`in_use`, `idle`, `waiting`) shows each budget.
@@ -161,6 +163,8 @@ pub struct RegistryPools {
     name: &'static str,
     /// Connections per cluster.
     max: usize,
+    /// The longest a task waits for one ([`Self::wait_limit`]).
+    wait: Duration,
 }
 
 /// One budget's connections to one cluster, from the pool's own counters.
@@ -216,6 +220,7 @@ impl RegistryPools {
             pools: Mutex::new(HashMap::new()),
             name: "catalog",
             max: POOL_MAX,
+            wait: ACQUIRE_TIMEOUT,
         }
     }
 
@@ -225,6 +230,16 @@ impl RegistryPools {
     pub fn budget(mut self, name: &'static str, max: usize) -> Self {
         self.name = name;
         self.max = max.max(1);
+        self
+    }
+
+    /// The same pools with every wait for a connection ending after
+    /// `wait` ([`sprig_catalog::pool_wait`]); the default is
+    /// [`ACQUIRE_TIMEOUT`]. A budget whose holders legitimately keep a
+    /// connection for long (a logic run) takes a longer one.
+    #[must_use]
+    pub fn wait_limit(mut self, wait: Duration) -> Self {
+        self.wait = wait;
         self
     }
 
@@ -429,6 +444,7 @@ impl ClusterPools for RegistryPools {
         }
         let ep = CredentialConnector::ctl(&rec.secrets).endpoint(&spec)?;
         let pool = pool_for(ep.opts, self.max);
+        sprig_catalog::pool_wait::limit(&pool, self.name, cluster.as_str(), self.max, self.wait);
         let old = self
             .pools
             .lock()
@@ -463,7 +479,15 @@ impl StaticPools {
     pub fn with_url(mut self, cluster: ClusterId, url: &str) -> Result<Self> {
         let opts = mysql_async::Opts::from_url(url)
             .map_err(|e| SprigError::internal(format!("bad MariaDB URL: {e}")))?;
-        self.pools.push((cluster, pool_for(opts, POOL_MAX)));
+        let pool = pool_for(opts, POOL_MAX);
+        sprig_catalog::pool_wait::limit(
+            &pool,
+            "static",
+            cluster.as_str(),
+            POOL_MAX,
+            ACQUIRE_TIMEOUT,
+        );
+        self.pools.push((cluster, pool));
         Ok(self)
     }
 
@@ -474,7 +498,9 @@ impl StaticPools {
     pub fn with_url_max(mut self, cluster: ClusterId, url: &str, max: usize) -> Result<Self> {
         let opts = mysql_async::Opts::from_url(url)
             .map_err(|e| SprigError::internal(format!("bad MariaDB URL: {e}")))?;
-        self.pools.push((cluster, pool_for(opts, max)));
+        let pool = pool_for(opts, max);
+        sprig_catalog::pool_wait::limit(&pool, "static", cluster.as_str(), max, ACQUIRE_TIMEOUT);
+        self.pools.push((cluster, pool));
         Ok(self)
     }
 }

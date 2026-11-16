@@ -1304,9 +1304,14 @@ impl GatewayGraphs {
             return Err(denied(&format!("graph '{}.{}'", g.db, g.name)));
         }
         let ctx = cat.setting_ctx(&self.svc.dc).with_db(g.db_id);
-        let budgets = sprig_graph::settings::budgets(&|s| {
+        let mut budgets = sprig_graph::settings::budgets(&|s| {
             self.svc.settings.get(s, &ctx, Some(&cat.settings))
         });
+        budgets.tier = sprig_graph::exec::TraversalTier::parse(&self.svc.settings.get(
+            &sprig_graph::settings::TRAVERSAL_TIER,
+            &ctx,
+            Some(&cat.settings),
+        ));
         let mut rc = txn::ReadConns::default();
         let opened: Result<()> = async {
             for c in rc.missing(&g.shards) {

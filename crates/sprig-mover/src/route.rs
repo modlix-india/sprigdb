@@ -662,6 +662,7 @@ mod tests {
             routing: Routing::HashRange { group: 3 },
             cutover: CutoverMode::Auto,
             verify: VerifyMode::Full,
+            verify_from_settings: true,
             decision_id: None,
             requested_by: None,
             max_hold_ms: None,

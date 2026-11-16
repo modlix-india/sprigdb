@@ -63,7 +63,10 @@ pub async fn call(
     let e2 = Arc::clone(engine);
     let c2 = caller.clone();
     let txn = (!transaction.is_empty()).then(|| transaction.to_owned());
-    tokio::spawn(async move { e2.run(&c2, call, txn.as_deref(), tx).await });
+    let space = super::sql::call_space();
+    tokio::spawn(super::sql::SPACE.scope(space, async move {
+        e2.run(&c2, call, txn.as_deref(), tx).await;
+    }));
     let reply = collect(rx, max, charge).await?;
     let row = reply
         .results
@@ -130,7 +133,10 @@ pub async fn test_run(
     let charge = engine.charge(caller);
     let e2 = Arc::clone(engine);
     let c2 = caller.clone();
-    tokio::spawn(async move { e2.run(&c2, call, None, tx).await });
+    let space = super::sql::call_space();
+    tokio::spawn(super::sql::SPACE.scope(space, async move {
+        e2.run(&c2, call, None, tx).await;
+    }));
     let reply = collect(rx, max, charge).await?;
     let report = reply
         .results

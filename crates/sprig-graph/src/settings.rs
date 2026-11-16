@@ -71,8 +71,10 @@ key!(
     "Relationships one DETACH DELETE may remove"
 );
 key!(
-    /// `graph.traversal_tier`: as built, `auto` and `cte` behave alike;
-    /// `plugin` isn't available.
+    /// `graph.traversal_tier`: `auto` and `cte` run variable-length hops
+    /// as per-shard CTE bursts; `gateway` reads one hop per level and joins
+    /// it in the gateway; `plugin` isn't available (as `auto`). The
+    /// gateway sets [`crate::exec::Budgets::tier`] from it.
     TRAVERSAL_TIER: Cow<'static, str> = "graph.traversal_tier", Cow::Borrowed("auto"), Scopes::ALL,
     HardBounds::one_of(&["auto", "cte", "gateway", "plugin"]),
     "Traversal tier: auto, cte, gateway or plugin"
@@ -106,6 +108,8 @@ pub fn budgets(get: &dyn Fn(&'static Setting<u64>) -> u64) -> Budgets {
         batch_nodes: n(&BATCH_NODES),
         local_burst_hops: u32::try_from(get(&LOCAL_BURST_HOPS)).unwrap_or(4),
         max_detach_edges: n(&MAX_DETACH_EDGES),
+        // `graph.traversal_tier` is a text key: the caller sets it.
+        tier: crate::exec::TraversalTier::Auto,
         tx_metadata: None,
     }
 }

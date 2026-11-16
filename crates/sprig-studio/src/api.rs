@@ -46,7 +46,36 @@ pub fn paths() -> Value {
     if let (Value::Object(m), Value::Object(r)) = (&mut v, ai_paths()) {
         m.extend(r);
     }
+    if let (Value::Object(m), Value::Object(r)) = (&mut v, dashboard_paths()) {
+        m.extend(r);
+    }
     v
+}
+
+/// Dashboards and their tiles.
+fn dashboard_paths() -> Value {
+    let p = |name: &str| json!({"name": name, "in": "path", "required": true, "schema": {"type": "string"}});
+    let tag = "sprig.v1.Dashboards";
+    json!({
+        "/v1/dashboards": {
+            "get": op("Dashboards.List", tag,
+                "The caller's own dashboards and the tenant's shared ones", None, "Dashboards"),
+            "post": op("Dashboards.Create", tag,
+                "Makes a dashboard {name, shared?, filters?}, the caller's", Some("DashboardCreate"), "Dashboard")},
+        "/v1/dashboards:run": {"post": op("Dashboards.RunQuery", tag,
+            "Runs a query that isn't saved yet (the chart editor, a proposal's preview) as the caller: one read,              filters bound as literals, in a read-only transaction, capped at studio.max_result_rows and              studio.statement_timeout_ms", Some("DashboardQueryRun"), "TileRun")},
+        "/v1/dashboards/{id}": {
+            "get": with_params(op("Dashboards.Get", tag,
+                "One dashboard the caller owns or that is shared, with its tiles", None, "Dashboard"), &[p("id")]),
+            "post": with_params(op("Dashboards.Update", tag,
+                "Changes a dashboard's name, filters, layout or tile positions (its owner, or a tenant                  administrator for a shared one); {id}:share {shared} shares or unshares it (its owner);                  {id}:delete deletes it", Some("DashboardUpdate"), "Dashboard"), &[p("id")])},
+        "/v1/dashboards/{id}/tiles": {"post": with_params(op("Dashboards.AddTile", tag,
+            "Adds a tile {title, database, sql, chart, refresh_seconds?, pos?}: one SELECT whose {{filter}}              names are dashboard filters, and a chart spec that fits it", Some("TileRequest"), "TileSaved"),
+            &[p("id")])},
+        "/v1/dashboards/{id}/tiles/{tile}": {"post": with_params(op("Dashboards.UpdateTile", tag,
+            "Replaces a tile; {tile}:delete deletes it; {tile}:run {params?} runs its query as the caller              (their grants and row-level security, never the owner's), answering a TileRun",
+            Some("TileRequest"), "TileSaved"), &[p("id"), p("tile")])},
+    })
 }
 
 /// The AI assistants: chat, conversations, feedback and the glossary.
@@ -57,7 +86,9 @@ fn ai_paths() -> Value {
         "Ai.Chat",
         "sprig.v1.Ai",
         "One assistant turn, streamed as NDJSON: one AiChatEvent per line (start, text, thinking, tool_start, \
-         tool_end, proposal, usage, sources, error, end). Proposals are shown, never run. Errors found before the \
+         tool_end, result, proposal, usage, sources, error, end). Proposals are shown, never run. A result \
+         event carries a run_query result whole, for the user; the provider gets only its shape unless \
+         ai.share_data is on. Errors found before the \
          turn starts (39990, 39991, 39992, 39995, a role the caller may not use) are plain HTTP errors",
         Some("AiChatRequest"),
         "AiChatEvent",
@@ -84,11 +115,20 @@ fn ai_paths() -> Value {
         "/v1/ai/glossary/{term}": {"post": with_params(op("Ai.GlossaryAction", "sprig.v1.Ai",
             "{term}:accept or :reject a proposed term, or {term}:delete a term (tenant administrators)",
             None, "JsonReply"), &[p("term")])},
+        "/v1/ai/digests": {"get": with_params(op("Ai.ListDigests", "sprig.v1.Ai",
+            "The tenant's digests (ai.digest), newest first; tenant administrators", None, "AiDigests"),
+            &[q("limit")])},
+        "/v1/ai/digests/{id}": {"get": with_params(op("Ai.GetDigest", "sprig.v1.Ai",
+            "One digest: its facts (statistics only), the model's words, and what was sent to word it \
+             (payloads=true adds the exact payloads); tenant administrators", None, "AiDigest"),
+            &[p("id"), q("payloads")])},
         "/v1/ai/proposals/{id}": {"post": with_params(op("Ai.ProposalAction", "sprig.v1.Ai",
             "{id}:accept runs a proposal as the caller (an SQL statement in its database, after confirm: true \
              for anything but a plain read; generated test rows likewise), files a recommendation as an \
-             ai_dba_advice approvals item, or accepts a glossary term; {id}:dismiss turns it down. The outcome \
-             is recorded as feedback", Some("AiProposalAction"), "AiProposalOutcome"), &[p("id")])},
+             ai_dba_advice approvals item, accepts a glossary term, or adds a tile to a dashboard (dashboard, \
+             an id, or new_dashboard, a name; else the one the assistant named, the caller's own, made when \
+             missing); {id}:dismiss turns it down. The outcome is recorded as feedback",
+             Some("AiProposalAction"), "AiProposalOutcome"), &[p("id")])},
         "/v1/mcp": mcp_path(),
     })
 }
@@ -299,7 +339,7 @@ fn core_paths() -> Value {
         "/v1/auth/impersonate": {"post": op("Auth.Impersonate", "sprig.v1.Auth",
             "A session as a user of one's tenant or a descendant, with a reason; no refresh token", Some("ImpersonateRequest"), "TokenReply")},
         "/v1/auth/me": {"get": op("Auth.WhoAmI", "sprig.v1.Auth",
-            "The principal, session, tenant tree, grants and studio.* settings", None, "WhoAmI")},
+            "The principal, session, tenant tree, grants, studio.* settings, and whether the AI assistants are on and which roles have a model", None, "WhoAmI")},
         "/v1/exports:ticket": {"post": op("Exports.CreateTicket", "sprig.v1.Exports",
             "A short-lived ticket for a form POST /v1/exports (form field ticket)", Some("ExportTicketRequest"), "ExportTicket")},
         "/v1/users:setPassword": {"post": op("Users.SetPassword", "sprig.v1.Users",
@@ -352,6 +392,9 @@ pub fn schemas() -> Value {
     if let (Value::Object(m), Value::Object(a)) = (&mut v, ai_schemas()) {
         m.extend(a);
     }
+    if let (Value::Object(m), Value::Object(a)) = (&mut v, dashboard_schemas()) {
+        m.extend(a);
+    }
     v
 }
 
@@ -388,6 +431,9 @@ fn core_schemas() -> Value {
             "platform_roles": {"type": "array", "items": string},
             "studio": obj,
             "gateway": s(json!({"id": string, "dc": string, "studio_build": string}), &[]),
+            "ai": s(json!({"enabled": boolean, "share_data": boolean,
+                "roles": {"type": "array", "items": {"type": "string", "enum": ["data", "dba", "admin"]}}}),
+                &["enabled", "share_data", "roles"]),
         }), &["principal", "amr", "session", "tenants", "grants", "privileges", "platform_roles", "studio"]),
         "ExportTicketRequest": s(json!({"database": string, "sql": string,
             "format": {"type": "string", "enum": ["csv", "ndjson"]}, "name": string}), &["sql", "format"]),
@@ -453,12 +499,15 @@ fn ai_schemas() -> Value {
                 "kind": {"type": "string", "enum": ["query", "table", "note", "result"]}, "ref": string}),
                 &["kind", "ref"])}}), &["role", "message"]),
         "AiChatEvent": s(json!({"type": {"type": "string", "enum": ["start", "text", "thinking",
-                "tool_start", "tool_end", "proposal", "usage", "sources", "error", "end"]},
+                "tool_start", "tool_end", "result", "proposal", "usage", "sources", "error", "end"]},
             "conversation": nullable, "role": string, "model": string, "share_data": boolean,
             "text": string, "id": string, "name": string, "input": obj, "ok": boolean, "reduced": boolean,
             "proposal": s(json!({"id": string, "kind": {"type": "string",
                 "enum": ["sql", "recommendation", "tile", "glossary", "generate_rows"]},
                 "tool_use_id": string, "body": obj}), &["id", "kind", "body"]),
+            "result": s(json!({"columns": {"type": "array", "items": s(json!({"name": string,
+                "type": string}), &["name", "type"])}, "rows": {"type": "array", "items": {"type": "array",
+                "items": {}}}, "row_count": int, "truncated": boolean}), &["columns", "rows", "row_count"]),
             "filed": nullable, "usage": obj,
             "sources": {"type": "array", "items": s(json!({"kind": string, "title": string,
                 "reference": string}), &["kind", "title", "reference"])},
@@ -475,17 +524,30 @@ fn ai_schemas() -> Value {
                     "proposal", "system_note"]},
                 "body": obj, "sent_hash": nullable, "created_ms": int}), &["id", "kind", "body"])}}),
             &["conversation", "messages"]),
+        "AiDigestHeader": s(json!({"id": string, "cadence": {"type": "string", "enum": ["weekly", "daily"]},
+            "from_ms": int, "to_ms": int, "status": {"type": "string", "enum": ["worded", "facts"]},
+            "model": nullable, "note": nullable, "conversation": nullable,
+            "emailed_ms": {"type": "integer", "nullable": true}, "created_ms": int,
+            "notable": {"type": "array", "items": string}}), &["id", "cadence", "from_ms", "to_ms", "status"]),
+        "AiDigests": s(json!({"digests": {"type": "array",
+            "items": {"$ref": "#/components/schemas/AiDigestHeader"}}}), &["digests"]),
+        "AiDigest": {"allOf": [{"$ref": "#/components/schemas/AiDigestHeader"}, s(json!({
+            "body": string, "facts_text": string, "text": nullable, "facts": obj, "usage": obj,
+            "sent": {"type": "array", "items": obj}}), &["body", "facts_text", "facts"])]},
         "AiFeedbackRequest": s(json!({"message_id": string, "vote": {"type": "string", "enum": ["up", "down"]},
             "proposal_id": string, "outcome": {"type": "string", "enum": ["accepted", "dismissed", "failed"]},
             "note": string}), &[]),
         "AiRecorded": s(json!({"recorded": boolean}), &["recorded"]),
-        "AiProposalAction": s(json!({"confirm": boolean, "note": string}), &[]),
+        "AiProposalAction": s(json!({"confirm": boolean, "note": string,
+            "dashboard": string, "new_dashboard": string, "title": string,
+            "chart": {"$ref": "#/components/schemas/ChartSpec"}, "sql": string}), &[]),
         "AiProposalOutcome": s(json!({"proposal": string,
             "kind": {"type": "string", "enum": ["sql", "recommendation", "tile", "glossary", "generate_rows"]},
             "outcome": {"type": "string", "enum": ["accepted", "failed", "dismissed"]},
             "database": string,
             "ran": {"type": "array", "items": s(json!({"sql": string, "results": {"type": "array", "items": obj}}), &["sql", "results"])},
-            "error": obj, "approvals": obj, "term": string}), &["proposal", "kind", "outcome"]),
+            "error": obj, "approvals": obj, "term": string, "dashboard": string, "tile": string}),
+            &["proposal", "kind", "outcome"]),
         "McpMessage": s(json!({"jsonrpc": {"type": "string", "enum": ["2.0"]},
             "id": {"oneOf": [{"type": "string"}, {"type": "integer"}]}, "method": string,
             "params": obj, "result": obj,
@@ -499,6 +561,92 @@ fn ai_schemas() -> Value {
                 "author": string, "accepted_by": {"type": "integer", "nullable": true},
                 "proposal_id": nullable, "updated_ms": int}), &["term", "status", "definition"])},
             "can_edit": boolean}), &["terms", "can_edit"])
+    })
+}
+
+/// The marks a chart spec may use (as the assistants' tile check has them).
+pub const CHART_MARKS: &[&str] = &[
+    "bar",
+    "line",
+    "area",
+    "point",
+    "pie",
+    "donut",
+    "waterfall",
+    "histogram",
+    "box",
+    "heatmap",
+    "highlight-table",
+    "treemap",
+    "funnel",
+    "radar",
+    "sankey",
+    "kpi",
+    "gauge",
+    "bullet",
+    "gantt",
+    "text-table",
+    "pivot",
+    "map-point",
+    "map-filled",
+];
+
+/// Dashboards' schemas.
+fn dashboard_schemas() -> Value {
+    let s = |props: Value, req: &[&str]| json!({"type": "object", "properties": props, "required": req});
+    let string = json!({"type": "string"});
+    let int = json!({"type": "integer"});
+    let boolean = json!({"type": "boolean"});
+    let obj = json!({"type": "object", "additionalProperties": true});
+    let r = |name: &str| json!({"$ref": format!("#/components/schemas/{name}")});
+    let shelf = json!({"oneOf": [string, r("ChartField")]});
+    let shelf_one = json!({"oneOf": [string, r("ChartField")], "nullable": true});
+    json!({
+        "ChartField": s(json!({"field": string,
+            "agg": {"type": "string", "enum": ["sum", "avg", "count", "countd", "min", "max", "median", "none"]},
+            "datePart": {"type": "string", "enum": ["year", "quarter", "month", "week", "day", "hour", "exact"]},
+            "axis": {"type": "string", "enum": ["left", "right"]},
+            "mark": {"type": "string", "enum": CHART_MARKS}}), &["field"]),
+        "ChartSpec": s(json!({"mark": {"type": "string", "enum": CHART_MARKS},
+            "columns": {"type": "array", "items": shelf}, "rows": {"type": "array", "items": shelf},
+            "color": shelf_one, "size": shelf_one, "label": shelf_one, "facet": shelf_one,
+            "detail": {"type": "array", "items": shelf}, "tooltip": {"type": "array", "items": shelf},
+            "filters": {"type": "array", "items": s(json!({"field": string, "in": {"type": "array", "items": {}}}), &["field"])},
+            "sort": {"type": "object", "nullable": true, "properties": {"by": string,
+                "dir": {"type": "string", "enum": ["asc", "desc"]}}},
+            "top": {"type": "integer", "nullable": true},
+            "stack": {"type": "string", "enum": ["none", "stack", "percent"], "nullable": true},
+            "format": obj}), &["mark"]),
+        "DashboardFilter": s(json!({"name": string, "label": string,
+            "kind": {"type": "string", "enum": ["text", "number", "date", "list"]}, "value": {}}), &["name", "kind"]),
+        "TilePos": s(json!({"x": int, "y": int, "w": int, "h": int}), &["x", "y", "w", "h"]),
+        "DashboardTile": s(json!({"id": string, "title": string, "database": {"type": "string", "nullable": true},
+            "sql": string, "chart": r("ChartSpec"), "refresh_seconds": int, "pos": r("TilePos")}),
+            &["id", "title", "sql", "chart", "refresh_seconds", "pos"]),
+        "DashboardHeader": s(json!({"id": string, "name": string, "owner": string, "owner_id": int,
+            "shared": boolean, "mine": boolean, "can_edit": boolean, "tiles": int, "updated_ms": int}),
+            &["id", "name", "owner", "shared", "mine", "can_edit", "tiles", "updated_ms"]),
+        "Dashboards": s(json!({"mine": {"type": "array", "items": r("DashboardHeader")},
+            "shared": {"type": "array", "items": r("DashboardHeader")}}), &["mine", "shared"]),
+        "Dashboard": s(json!({"id": string, "name": string, "owner": string, "owner_id": int,
+            "shared": boolean, "mine": boolean, "can_edit": boolean,
+            "filters": {"type": "array", "items": r("DashboardFilter")}, "layout": obj, "updated_ms": int,
+            "tiles": {"type": "array", "items": r("DashboardTile")}}),
+            &["id", "name", "owner", "shared", "mine", "can_edit", "filters", "updated_ms", "tiles"]),
+        "DashboardCreate": s(json!({"name": string, "shared": boolean,
+            "filters": {"type": "array", "items": r("DashboardFilter")}}), &["name"]),
+        "DashboardUpdate": s(json!({"name": string, "shared": boolean,
+            "filters": {"type": "array", "items": r("DashboardFilter")}, "layout": obj,
+            "positions": {"type": "array", "items": s(json!({"tile": string, "pos": r("TilePos")}), &["tile", "pos"])}}), &[]),
+        "TileRequest": s(json!({"title": string, "database": string, "sql": string,
+            "chart": r("ChartSpec"), "refresh_seconds": int, "pos": r("TilePos"),
+            "params": obj}), &[]),
+        "TileSaved": s(json!({"tile": string, "dashboard": r("Dashboard"), "deleted": boolean}), &[]),
+        "DashboardQueryRun": s(json!({"database": string, "sql": string,
+            "filters": {"type": "array", "items": r("DashboardFilter")}, "params": obj}), &["sql"]),
+        "TileRun": s(json!({"columns": {"type": "array", "items": s(json!({"name": string, "type": string}), &["name", "type"])},
+            "rows": {"type": "array", "items": {"type": "array", "items": {}}}, "row_count": int,
+            "truncated": boolean, "ms": int}), &["columns", "rows", "row_count", "truncated", "ms"]),
     })
 }
 

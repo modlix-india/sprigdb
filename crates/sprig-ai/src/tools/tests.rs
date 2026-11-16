@@ -71,9 +71,53 @@ fn calls_are_checked_before_anything_runs() {
     let e = deny(
         Role::Data,
         "propose_tile",
-        json!({"title": "t", "sql": "SELECT 1", "chart": "{\"mark\":\"spiral\"}"}),
+        json!({"title": "t", "db": "s", "sql": "SELECT 1", "chart": "{\"mark\":\"spiral\"}"}),
     );
     assert!(e.message.contains("unknown mark"));
+    // A tile's query is a read, and its fields are the query's columns.
+    let tile = |sql: &str, chart: &str| {
+        r.check(
+            Role::Data,
+            "propose_tile",
+            &json!({"title": "t", "db": "s", "sql": sql, "chart": chart}),
+        )
+    };
+    let e = tile("DELETE FROM orders", r#"{"mark":"bar"}"#).unwrap_err();
+    assert!(e.message.contains("one SELECT"), "{}", e.message);
+    let ok_sql = "SELECT region, SUM(total) AS revenue FROM orders GROUP BY region";
+    assert!(
+        tile(
+            ok_sql,
+            r#"{"mark":"bar","columns":[{"field":"region"}],"rows":[{"field":"revenue","agg":"sum"}],"sort":{"by":"revenue","dir":"desc"},"top":10}"#
+        )
+        .is_ok()
+    );
+    let e = tile(ok_sql, r#"{"mark":"bar","columns":[{"field":"country"}]}"#).unwrap_err();
+    assert!(e.message.contains("country"), "{}", e.message);
+    let e = tile(
+        ok_sql,
+        r#"{"mark":"bar","rows":[{"field":"revenue","agg":"total"}]}"#,
+    )
+    .unwrap_err();
+    assert!(e.message.contains("unknown agg"), "{}", e.message);
+    let e = tile(ok_sql, r#"{"mark":"bar","x":"region"}"#).unwrap_err();
+    assert!(e.message.contains("no key x"), "{}", e.message);
+    // SELECT * returns columns the text doesn't name.
+    assert!(
+        tile(
+            "SELECT * FROM v",
+            r#"{"mark":"line","columns":[{"field":"week"}],"rows":[{"field":"n","agg":"sum"}]}"#
+        )
+        .is_ok()
+    );
+    // The mark must fit the shelves (Show Me's rules): a line needs a
+    // measure, a pie one dimension.
+    let e = tile(
+        "SELECT * FROM v",
+        r#"{"mark":"line","columns":[{"field":"week","datePart":"week"}]}"#,
+    )
+    .unwrap_err();
+    assert!(e.message.contains("marks that fit"), "{}", e.message);
     let e = deny(
         Role::Data,
         "describe",
@@ -84,7 +128,7 @@ fn calls_are_checked_before_anything_runs() {
         r.check(
             Role::Data,
             "propose_tile",
-            &json!({"title": "t", "sql": "SELECT 1", "chart": "{\"mark\":\"bar\",\"columns\":[]}"})
+            &json!({"title": "t", "db": "s", "sql": "SELECT 1 AS n", "chart": "{\"mark\":\"kpi\",\"rows\":[{\"field\":\"n\"}]}"})
         )
         .is_ok()
     );

@@ -15,7 +15,7 @@ Each kind of decision is governed by one mode setting. The mode has four values:
 
 | Mode | What happens when SprigDB wants to act |
 |---|---|
-| `on` | It acts. Nothing waits; the decision is recorded in the decision log |
+| `on` | It acts. Nothing waits; the decision is recorded in the decision log (kept for `decisions.retention_days`, 180, then purged daily; set per tenant or globally by an operator) |
 | `approve` | It raises a **recommendation** and waits. The change runs only after someone approves it, or a timer you set approves it |
 | `recommend` | It raises a recommendation as advice and doesn't act. A person may still approve it |
 | `off` | It does nothing |

@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use sprig_auth::authz::{Action, Target};
 use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::{Namespace, ObjectKind, ObjectState};
 use sprig_catalog::version::VersionKind;
 use sprig_catalog::{CatalogLocator, TenantCatalog};
@@ -180,7 +181,7 @@ impl GwHost<'_> {
     async fn catalog_conn(&self) -> Result<(mysql_async::Conn, String)> {
         let ts = self.ts().ok_or_else(|| SprigError::internal("no tenant"))?;
         let ep = ts.services().locator.writer(self.cat.tenant).await?;
-        let conn = ep.pool.get_conn().await.map_err(|e| {
+        let conn = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
         Ok((conn, ep.store.schema().to_owned()))
@@ -435,7 +436,7 @@ impl Host for GwHost<'_> {
     async fn next_id(&mut self) -> Result<u64> {
         let ts = self.ts().ok_or_else(|| SprigError::internal("no tenant"))?;
         let ep = ts.services().locator.writer(self.cat.tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(|e| {
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
         Ok(ep.store.next_object_id(&mut conn).await?.0)
@@ -452,7 +453,7 @@ impl Host for GwHost<'_> {
         };
         if !self.migrated {
             let ep = svc.locator.writer(tenant).await?;
-            let mut conn = ep.pool.get_conn().await.map_err(|e| {
+            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
                 SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
             })?;
             sprig_sinks::store::migrate(&mut conn, ep.store.schema()).await?;

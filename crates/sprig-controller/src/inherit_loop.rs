@@ -18,6 +18,7 @@ use std::fmt;
 use std::time::Duration;
 
 use serde_json::json;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::Result;
 use sprig_feed::subs::Subscription;
 use sprig_inherit::subs::{JOB_KIND, KIND, root_of};
@@ -193,7 +194,7 @@ impl<H> WithMessagingModules<H> {
             let Ok(pool) = self.locator.pools().writer(&cluster).await else {
                 continue;
             };
-            let Ok(mut c) = pool.get_conn().await else {
+            let Ok(mut c) = pool.get_conn_bounded().await else {
                 continue;
             };
             // No `inherited_defs` table (1146): nothing declared there.
@@ -242,7 +243,7 @@ impl<H: crate::tenants::BootstrapHooks> crate::tenants::BootstrapHooks for WithM
             ..sprig_catalog::migrate::MigrateOpts::existing()
         };
         let run = async {
-            let mut c = catalog.pool.get_conn().await.map_err(|e| {
+            let mut c = catalog.pool.get_conn_bounded().await.map_err(|e| {
                 sprig_common::SprigError::new(
                     sprig_common::SprigCode::CatalogUnavailable,
                     format!("catalog: {e}"),

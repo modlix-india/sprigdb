@@ -431,6 +431,25 @@ Start the search with `?` to ask an assistant instead: `?top 10 customers` offer
 
 ![The sprig command palette with "ord" typed, listing the orders and order_items tables of shop and the Dashboard screen](../img/sprig/tui-palette.png)
 
+### The assistant pane
+
+`Ctrl-A` on a query tab opens the assistant in place of the results, with the keys: type a question and press `Enter`. The tenant's data specialist answers, with the tab's database and the editor's statement as context; `/dba` switches to the DBA assistant, `/data` back, and `/new` starts a new conversation. It needs the HTTP transport and an [AI provider](assistants.md#setting-up). The title shows the assistant and the data badge (**schema only** while `ai.share_data` is off, **data shared** while it is on).
+
+![The sprig TUI with the assistant pane open under the editor: the DBA assistant, the question, two tool rows, the answer, and a proposed CREATE INDEX with its estimate and the keys Enter, e, d, y and ?](../img/sprig/tui-assistant.png)
+
+The answer streams in: tool calls as quiet `▸` rows, the text, the first rows of any read-only query it ran, and proposals in a box. The newest proposal waiting is selected, and its keys show under it:
+
+| Key | Does |
+|---|---|
+| `Enter` | Run it: the usual confirm (`y` runs it as you, in its database; `n` or `Esc` doesn't), then the box shows what happened. A recommendation goes to the approvals inbox; a glossary term is accepted |
+| `e` | Put it in the editor; nothing runs (`F5` runs it) |
+| `d` | Dismiss it |
+| `y` | Copy it to the terminal's clipboard |
+| `?` | What was sent to the AI provider in this conversation |
+| `Up`, `Down`, `Tab` | Choose another proposal, or go back to the question |
+
+Typing goes back to the question. `Ctrl-C` stops an answer that is still streaming, `PageUp` and `PageDown` scroll, `Esc` gives the keys back to the editor, and `Ctrl-A` closes the pane (or gives it the keys when the editor has them). `F2` moves the focus as usual.
+
 ### The table view
 
 Open a table from the explorer or the palette and it gets its own tab, the terminal form of Studio's table page, with sub-tabs: **Data**, **Cols** (columns), **Idx** (indexes), **Rel** (foreign keys out of and into the table), **Trig** (triggers), **Pol** (row-level security policies), **Inh** (inheritance), **Shards** (the table group and shards) and **DDL**. A view has Data, Columns, Policies and DDL. `[` and `]` move between sub-tabs; `g` reloads.
@@ -489,6 +508,7 @@ The Inbox screen lists the recommendations you may act on, with the selected ite
 |---|---|
 | `F1` | All the keys |
 | `Ctrl-K`, `Ctrl-P` | The command palette |
+| `Ctrl-A` | The [assistant pane](#the-assistant-pane) |
 | `F2` | Move the focus: explorer, editor, results |
 | `F3` | Results as grid, JSON tree or graph |
 | `F4` | The editor's language: SQL, Redis, Cypher, MongoDB |
@@ -502,7 +522,7 @@ The Inbox screen lists the recommendations you may act on, with the selected ite
 | `Alt-1` … `Alt-9` | Tab n |
 | `Ctrl-Q` | Quit |
 
-In the editor, `Ctrl-A` goes to the start of the line, `Ctrl-U` and `Ctrl-K` delete to the start and end, `Ctrl-L` clears the editor, and `Ctrl-Left`/`Ctrl-Right` (or `Alt-`) move by word.
+In the editor, `Home` goes to the start of the line (`Ctrl-A` opens the assistant), `Ctrl-U` and `Ctrl-K` delete to the start and end, `Ctrl-L` clears the editor, and `Ctrl-Left`/`Ctrl-Right` (or `Alt-`) move by word.
 
 ### Colour and symbols
 

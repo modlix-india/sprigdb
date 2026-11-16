@@ -7,7 +7,9 @@
 //! SeedPage(tenant, index, generation, after, limit):
 //!   the index in the tenant's catalog, else 39820 (the copy stops)
 //!   its generation ≠ the copy's: 39825 (retryable; the job restarts the copy)
-//!   a session of the definer, exempt; SELECT the page by key; close it
+//!   a session of the definer, exempt; SELECT the page by key (or the
+//!     keys asked for: an index with hash fields re-reads changed keys);
+//!     close it
 //! ```
 //!
 //! The peer service is mutual TLS between SprigDB's own processes, so the
@@ -79,7 +81,10 @@ async fn page(req: &SeedRequest) -> Result<Vec<sprig_search::Record>> {
         return Ok(Vec::new());
     }
     let mut s = DefinerSession::open(svc, tenant, &def).await?;
-    let r = s.page(&def, req.after.as_ref(), req.limit).await;
+    let r = match &req.keys {
+        Some(keys) => s.fetch(&def, keys).await,
+        None => s.page(&def, req.after.as_ref(), req.limit).await,
+    };
     s.close().await;
     r
 }

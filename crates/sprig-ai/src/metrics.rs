@@ -29,6 +29,11 @@
 //!   `error` or `expired` (pending for a day).
 //! - `sprig_ai_intake_flushes_total{result}`: a process's writes of its
 //!   error counts: `ok` or `error`.
+//! - `sprig_ai_digests_total{result}`: tenant digests: `worded`, `facts`
+//!   (stored with the facts alone: no model, a spent budget or a failed
+//!   call) or `error`.
+//! - `sprig_ai_digest_emails_total{result}`: digests emailed: `sent`,
+//!   `skipped` (no SMTP or no subscriber) or `failed`.
 
 use std::time::Duration;
 
@@ -204,4 +209,14 @@ pub fn writeup(result: &'static str) {
 /// One upgrade readiness check; `result` is `ok` or `error`.
 pub fn upgrade_check(result: &'static str) {
     metrics::counter!("sprig_ai_upgrade_checks_total", "result" => result).increment(1);
+}
+
+/// One tenant digest; `result` is `worded`, `facts` or `error`.
+pub fn digest(result: &'static str) {
+    metrics::counter!("sprig_ai_digests_total", "result" => result).increment(1);
+}
+
+/// One digest email; `result` is `sent`, `skipped` or `failed`.
+pub fn digest_email(result: &'static str) {
+    metrics::counter!("sprig_ai_digest_emails_total", "result" => result).increment(1);
 }

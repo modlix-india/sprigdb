@@ -40,10 +40,14 @@ use tokio::sync::watch;
 
 use crate::backend::Backends;
 
-/// Connections per cluster for catalog work and database DDL.
+/// Connections per cluster in each of the three `sprig_ctl` pools (see
+/// [`Budget`]).
 const POOL_MAX: usize = 4;
-/// The test hook that shrinks the catalog pools (see [`catalog_pool_max`]).
+/// The test hook that shrinks the catalog pools (see [`pool_max`]).
 const CATALOG_POOL_MAX_ENV: &str = "SPRIG_TEST_CATALOG_POOL_MAX";
+/// The test hook that shrinks the other two `sprig_ctl` pools, the short
+/// one and the holders' one (see [`pool_max`]).
+const CTL_POOL_MAX_ENV: &str = "SPRIG_TEST_CTL_POOL_MAX";
 /// How long an idle `sprig_ctl` connection stays open.
 const IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 /// The longest a catalog connection lives (give or take
@@ -54,27 +58,95 @@ const CATALOG_CONN_TTL: std::time::Duration = std::time::Duration::from_secs(15 
 /// Spreads the catalog connections' renewals.
 const CATALOG_CONN_JITTER: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Connections per cluster in a catalog pool: [`POOL_MAX`], or fewer (1 to
-/// 4) with the test hook `SPRIG_TEST_CATALOG_POOL_MAX`.
+/// The gateway's three `sprig_ctl` pools per cluster, each its own budget
+/// of [`POOL_MAX`] connections.
 ///
-/// A task holds at most one catalog connection at a time, and gives it back
-/// before anything that takes another from the same pool (a catalog
+/// - [`Budget::Hold`] ([`GatewayLocator::ctl_hold_pool`]): a connection
+///   that keeps a lock (a transaction's row locks, `GET_LOCK`) while its
+///   task does other work with more connections: the cross-tenant outbox
+///   forward, a broadcast's fan-out, the broadcast retry pass.
+/// - [`Budget::Catalog`] ([`GatewayLocator::catalog_pool`]): tenant
+///   catalog reads and changes.
+/// - [`Budget::Ctl`] ([`GatewayLocator::ctl_pool`]): everything else
+///   (shard DDL, outbox and log rows, logic routines), one step at a time.
+///
+/// They are taken in that order and never the other way round: a task
+/// holding a hold connection may take catalog and short ones, a task
+/// holding a catalog connection may take a short one, a task holding a
+/// short one takes no other (a deploy over shards on several clusters
+/// takes one per cluster, all at once in cluster order), and no task
+/// waits for a second connection of a pool while it holds one. So waits
+/// can't form a cycle, and a path that holds one while it asks the same
+/// pool for another is a bug: it waits for itself once the rest are busy
+/// (with the test hooks at 1, at once).
+///
+/// **Waits end.** Every acquire from these pools is bounded
+/// ([`sprig_catalog::pool_wait`]): past [`Budget::wait`] it fails, naming
+/// the pool and the cluster, and counts in `sprig_pool_wait_timeouts_total`.
+/// A path that broke the order above then fails instead of hanging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Budget {
+    Hold,
+    Catalog,
+    Ctl,
+}
+
+impl Budget {
+    /// The pool's name in errors and metrics.
+    fn name(self) -> &'static str {
+        match self {
+            Budget::Hold => "sprig_ctl_hold",
+            Budget::Catalog => "catalog",
+            Budget::Ctl => "sprig_ctl",
+        }
+    }
+
+    /// The longest a task waits for one of the pool's connections.
+    ///
+    /// - Catalog: 5 s, the catalog's own `begin` timeout (39070), which
+    ///   already bounded the versioned changes' waits.
+    /// - Short `sprig_ctl`: 10 s, the DDL executor's wait for the same
+    ///   pool's connections. Its holders are one statement or one step;
+    ///   the longest is a DDL statement itself.
+    /// - Holders: 30 s. A holder keeps its connection across one batch of
+    ///   deliveries (up to 500 rows or members, plus the broadcast pacing,
+    ///   at most 1 s a batch), so a waiter may legitimately wait for a few.
+    fn wait(self) -> std::time::Duration {
+        std::time::Duration::from_secs(match self {
+            Budget::Hold => 30,
+            Budget::Catalog => 5,
+            Budget::Ctl => 10,
+        })
+    }
+}
+
+/// Connections per cluster in a pool of `budget`: [`POOL_MAX`], or fewer
+/// (1 to 4) with the test hooks `SPRIG_TEST_CATALOG_POOL_MAX` (catalog
+/// pools) and `SPRIG_TEST_CTL_POOL_MAX` (the short and hold pools).
+///
+/// A task holds at most one connection of a pool at a time, and gives it
+/// back before anything that takes another from the same pool (a catalog
 /// change, a snapshot load, a migration, a nested statement). A path that
-/// held one while asking for more needed several at once and failed with
-/// 39070 ("catalog begin timed out") whenever the others were busy. With
-/// the hook at 1, such a path waits for itself, so a live suite run against
-/// a gateway started with it finds them.
-fn catalog_pool_max() -> usize {
-    static MAX: OnceLock<usize> = OnceLock::new();
-    *MAX.get_or_init(|| {
-        let n = std::env::var(CATALOG_POOL_MAX_ENV)
+/// held one while asking for more needed several at once and waited
+/// (catalog: failed with 39070, "catalog begin timed out") whenever the
+/// others were busy. With a hook at 1, such a path waits for itself, so a
+/// live suite run against a gateway started with it finds them.
+fn pool_max(budget: Budget) -> usize {
+    static CATALOG: OnceLock<usize> = OnceLock::new();
+    static CTL: OnceLock<usize> = OnceLock::new();
+    let (cell, env, what) = match budget {
+        Budget::Catalog => (&CATALOG, CATALOG_POOL_MAX_ENV, "catalog"),
+        Budget::Ctl | Budget::Hold => (&CTL, CTL_POOL_MAX_ENV, "sprig_ctl"),
+    };
+    *cell.get_or_init(|| {
+        let n = std::env::var(env)
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .map_or(POOL_MAX, |n| n.clamp(1, POOL_MAX));
         if n < POOL_MAX {
             tracing::warn!(
                 connections = n,
-                "{CATALOG_POOL_MAX_ENV} is set: catalog pools are smaller than usual (a test hook)"
+                "{env} is set: {what} pools are smaller than usual (a test hook)"
             );
         }
         n
@@ -86,10 +158,9 @@ pub struct GatewayLocator {
     dc: Arc<dyn MetaStore>,
     registry: ClusterRegistry,
     backends: Arc<Backends>,
-    pools: Mutex<HashMap<ClusterId, (String, Pool)>>,
-    /// `sprig_ctl` pools for catalog reads and changes only, which keep
-    /// their connections' prepared statements.
-    catalog_pools: Mutex<HashMap<ClusterId, (String, Pool)>>,
+    /// The `sprig_ctl` pools per cluster, by [`Budget`]; the catalog ones
+    /// keep their connections' prepared statements.
+    pools: Mutex<HashMap<(Budget, ClusterId), (String, Pool)>>,
     clusters: Mutex<HashMap<TenantId, ClusterId>>,
     ctl_users: Mutex<HashMap<ClusterId, String>>,
     /// Every tenant map in this DC tier (`shardmaps/`), fed by a watch,
@@ -135,7 +206,6 @@ impl GatewayLocator {
             registry,
             backends,
             pools: Mutex::new(HashMap::new()),
-            catalog_pools: Mutex::new(HashMap::new()),
             clusters: Mutex::new(HashMap::new()),
             ctl_users: Mutex::new(HashMap::new()),
             maps: OnceLock::new(),
@@ -562,13 +632,29 @@ impl GatewayLocator {
         Ok(out)
     }
 
-    /// A pool of `sprig_ctl` connections to `cluster`'s writer.
+    /// A pool of `sprig_ctl` connections to `cluster`'s writer, for work
+    /// done one step at a time: a task holding one of these takes no other
+    /// connection (see [`Budget`]).
     ///
     /// # Errors
     /// 39104 for an unknown cluster; 39100 without a writer; 39998 for a
     /// credential reference that doesn't resolve.
     pub async fn ctl_pool(&self, cluster: &ClusterId) -> Result<Pool> {
-        self.pool_of(cluster, false).await
+        self.pool_of(cluster, Budget::Ctl).await
+    }
+
+    /// The pool of `sprig_ctl` connections to `cluster`'s writer for a lock
+    /// held across other work: a transaction whose row locks keep another
+    /// gateway off the same rows (the cross-tenant outbox forward, a
+    /// broadcast's fan-out) or a `GET_LOCK`, while the task delivers with
+    /// catalog and [`Self::ctl_pool`] connections. A holder takes one of
+    /// these first and never a second (see [`Budget`]); the deliveries
+    /// can't wait for it, because they come from the other pools.
+    ///
+    /// # Errors
+    /// As [`Self::ctl_pool`].
+    pub async fn ctl_hold_pool(&self, cluster: &ClusterId) -> Result<Pool> {
+        self.pool_of(cluster, Budget::Hold).await
     }
 
     /// A `sprig_ctl` connection to `cluster`'s writer outside the pools:
@@ -620,15 +706,12 @@ impl GatewayLocator {
     /// # Errors
     /// As [`Self::ctl_pool`].
     pub async fn catalog_pool(&self, cluster: &ClusterId) -> Result<Pool> {
-        self.pool_of(cluster, true).await
+        self.pool_of(cluster, Budget::Catalog).await
     }
 
-    async fn pool_of(&self, cluster: &ClusterId, catalog: bool) -> Result<Pool> {
-        let pools = if catalog {
-            &self.catalog_pools
-        } else {
-            &self.pools
-        };
+    async fn pool_of(&self, cluster: &ClusterId, budget: Budget) -> Result<Pool> {
+        let catalog = budget == Budget::Catalog;
+        let key = (budget, cluster.clone());
         let stored = self.registry.get(cluster).await?.ok_or_else(|| {
             SprigError::new(
                 SprigCode::ClusterNotFound,
@@ -651,10 +734,11 @@ impl GatewayLocator {
             )
         })?;
         let fingerprint = format!("{}|{}|{}", writer.node, writer.addr, rec.secrets.ctl);
-        if let Some((f, p)) = pools
+        if let Some((f, p)) = self
+            .pools
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(cluster)
+            .get(&key)
             && *f == fingerprint
         {
             return Ok(p.clone());
@@ -666,12 +750,7 @@ impl GatewayLocator {
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(cluster.clone(), u.to_owned());
         }
-        let max = if catalog {
-            catalog_pool_max()
-        } else {
-            POOL_MAX
-        };
-        let constraints = PoolConstraints::new(0, max).unwrap_or_default();
+        let constraints = PoolConstraints::new(0, pool_max(budget)).unwrap_or_default();
         let mut opts = OptsBuilder::from_opts(ep.opts);
         if catalog {
             // Catalog statements name the tenant's schema, so a few
@@ -695,10 +774,18 @@ impl GatewayLocator {
                         .with_abs_conn_ttl_jitter(catalog.then_some(CATALOG_CONN_JITTER)),
                 ),
         );
-        let old = pools
+        sprig_catalog::pool_wait::limit(
+            &pool,
+            budget.name(),
+            cluster.as_str(),
+            pool_max(budget),
+            budget.wait(),
+        );
+        let old = self
+            .pools
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(cluster.clone(), (fingerprint, pool.clone()));
+            .insert(key, (fingerprint, pool.clone()));
         if let Some((_, old)) = old {
             tokio::spawn(async move {
                 let _ = old.disconnect().await;
@@ -736,20 +823,13 @@ impl GatewayLocator {
 
     /// Closes every pool (shutdown).
     pub async fn close(&self) {
-        let mut pools: Vec<Pool> = self
+        let pools: Vec<Pool> = self
             .pools
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .drain()
             .map(|(_, (_, p))| p)
             .collect();
-        pools.extend(
-            self.catalog_pools
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .drain()
-                .map(|(_, (_, p))| p),
-        );
         for p in pools {
             let _ = p.disconnect().await;
         }

@@ -570,7 +570,12 @@ pub fn check_set(set: &Set, reg: &ToolRegistry) -> Result<(), Vec<String>> {
             prev = r;
             match reg.check(role, &call.tool, &call.args) {
                 Ok(spec) => {
+                    // `catalog` and `relationships` are derived from the
+                    // case's `describe` entries when it has none of its own.
+                    let derived = matches!(call.tool.as_str(), "catalog" | "relationships")
+                        && c.world.iter().any(|w| w.tool == "describe");
                     if spec.effect == Effect::Read
+                        && !derived
                         && !c
                             .world
                             .iter()

@@ -397,7 +397,6 @@ See [Metrics](../reference/metrics.md).
 
 - **`end_user_layer` issuers** are verified exactly like `oidc` ones.
 - **A token as an HTTP Basic password** isn't accepted; send it as a bearer token.
-- **MongoDB-language calls over HTTP** (`Sql.Query` with `language: mongo`) don't pass the token's claims to `SPRIG_CLAIM`; SQL calls do.
 - **Accounts created on first login** over MySQL, MariaDB and Redis.
 - **Tokens on Bolt, Kafka and AMQP.**
 - **Key sets behind a private certificate authority.** Key sets are fetched only from servers with a publicly trusted certificate, or over plain HTTP on a loopback address.

@@ -205,6 +205,7 @@ impl ShardingLoop {
                         members,
                         shards,
                         to,
+                        reason: None,
                     },
                     actor,
                 )
@@ -471,7 +472,8 @@ impl ShardingLoop {
     }
 
     /// Applies run `run`'s design (`sprigctl advisor apply`, for a
-    /// `recommend` or `wait` verdict) to a tenant without table groups.
+    /// `recommend` or `wait` verdict) to a tenant without table groups, or
+    /// starts the re-key a periodic run proposes.
     ///
     /// # Errors
     /// 39471 for a run that isn't `decided`, has no design, or a tenant that
@@ -480,6 +482,28 @@ impl ShardingLoop {
     pub async fn advisor_apply(&self, tenant: TenantId, run: u64) -> Result<TickReport> {
         let ts = self.settings.settings(tenant);
         let home = self.home(tenant).await?;
+        // A periodic run's re-key: started as `sprigctl shard rekey` would.
+        if let Some(shown) = self.advisor_show(tenant, Some(run)).await?
+            && shown["cause"].as_str() == Some("periodic")
+        {
+            let p = super::periodic::stored_rekey(&shown["design"], &shown["evidence"])
+                .ok_or_else(|| not_allowed(format!("advisor run {run} proposes no re-key")))?;
+            if !matches!(shown["status"].as_str(), Some("decided")) {
+                return Err(not_allowed(format!(
+                    "advisor run {run} is {}, not decided",
+                    shown["status"].as_str().unwrap_or("?")
+                )));
+            }
+            if !self.start_rekey(tenant, &home, run, &p, None).await? {
+                return Err(not_allowed(format!(
+                    "advisor run {run}'s re-key was refused; see the run's error"
+                )));
+            }
+            return Ok(TickReport {
+                advisor: Some((run, "apply")),
+                ..TickReport::default()
+            });
+        }
         let mut c = self.conn(&home).await?;
         self.no_groups(tenant, &mut c).await?;
         let shown = self

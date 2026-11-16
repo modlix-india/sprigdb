@@ -847,6 +847,77 @@ async fn automatic_on(ep: &NodeEndpoint, schema: &str) -> String {
     .unwrap_or_default()
 }
 
+/// A canary on a single node cut off mid-way (its future dropped, as a
+/// controller restart drops it) leaves a real index, built with the
+/// binary log on, under a row that is still `validating`. The next canary
+/// of the same row aborted with `index_exists` for good; now it drops the
+/// leftover first and validates as usual.
+#[tokio::test]
+async fn canary_validation_after_a_cut_off_one() {
+    let eps = topology_or_skip!("SPRIG_TEST_MARIADB_SINGLE");
+    let node = eps[0].clone();
+    let schema = "__sprig_test_canary_cut";
+    create_fixture(&node, schema).await;
+    let w = workload(schema, 10);
+    let good = plan(
+        schema,
+        9201,
+        &["a"],
+        FP_A_RANGE,
+        w["a_range"].clone(),
+        &w["other"],
+    );
+    let name = good.index_name();
+
+    // 1. Cut off once the canary's index exists (it is replaying then).
+    let cut = {
+        let v = CanaryValidator::new(node.clone(), true);
+        let p = good.clone();
+        tokio::spawn(async move { v.validate(&p).await })
+    };
+    let started = Instant::now();
+    while !indexes_named_auto(&node, schema).await.contains(&name) {
+        assert!(!cut.is_finished(), "the canary ended before it was cut off");
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "no build seen"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    cut.abort();
+    let _ = cut.await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        indexes_named_auto(&node, schema).await.contains(&name),
+        "the cut-off canary left nothing"
+    );
+
+    // 2. The next canary of the row drops it first, then validates.
+    let v = CanaryValidator::new(node.clone(), true);
+    let r = v.validate(&good).await.unwrap();
+    show("canary after a cut-off canary", &r);
+    assert!(
+        !r.verdict.reason.contains("index_exists"),
+        "{}",
+        r.verdict.reason
+    );
+    assert_ne!(r.verdict.kind, VerdictKind::Aborted, "{}", r.verdict.reason);
+    assert!(
+        r.node_check
+            .notes
+            .iter()
+            .any(|n| n.contains("cut-off canary dropped first")),
+        "{:?}",
+        r.node_check.notes
+    );
+    if r.index_kept {
+        v.drop_canary(&good).await.unwrap();
+    }
+    let left = indexes_named_auto(&node, schema).await;
+    drop_fixture(&node, schema).await;
+    assert!(left.is_empty(), "{left}");
+}
+
 /// A replica validation cut off mid-way (its future dropped, as
 /// a controller restart drops it) leaves its index on the replica, since
 /// MariaDB finishes the `ALTER` without its client. The next validation of

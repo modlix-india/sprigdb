@@ -54,15 +54,11 @@ use super::{
 /// The qualifier a tried policy's columns get.
 const PROBE: &str = "`ai_probe`";
 
-/// A JSON value as a SQL literal, as the rewrite binds session values.
+/// A JSON value as a SQL literal, exactly as the gateway's rewrite binds
+/// session values (text, as MariaDB's policy views read them), so a trial
+/// gives the verdict the database will enforce.
 fn literal(v: &Value) -> String {
-    match v {
-        Value::Null => "NULL".to_owned(),
-        Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_owned(),
-        Value::Number(n) => n.to_string(),
-        Value::String(x) => sprig_sql::rls::sql_string(x, false),
-        other => sprig_sql::rls::sql_string(&other.to_string(), false),
-    }
+    expr::json_literal(v, false)
 }
 
 /// A JSON object given as text (`attributes`, `claims`), if any.
@@ -1005,5 +1001,23 @@ mod tests {
             }
         }
         assert!(n >= 3, "{n} logic proposals");
+    }
+
+    #[test]
+    fn session_values_bind_as_text_like_the_rewrite() {
+        // MariaDB's policy views read attributes and claims as text, so a
+        // trial must compare against text too: numbers and booleans bind as
+        // quoted strings, exactly as the gateway's rewrite binds them.
+        for (v, want) in [
+            (json!(3), "'3'"),
+            (json!(2.5), "'2.5'"),
+            (json!(true), "'1'"),
+            (json!(false), "'0'"),
+            (json!("EU"), "'EU'"),
+            (Value::Null, "NULL"),
+        ] {
+            assert_eq!(literal(&v), want, "{v}");
+            assert_eq!(literal(&v), sprig_sql::rls::expr::json_literal(&v, false));
+        }
     }
 }

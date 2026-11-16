@@ -28,6 +28,7 @@
 //! | `POST /admin/v1/ai/writeups/{id}:draft` | Drafts (again) the write-up of an event id or incident fingerprint |
 //! | `POST /admin/v1/ai:upgradeCheck` | `{to, catalog?, explain?}`: the upgrade readiness report |
 
+use sprig_catalog::pool_wait::Bounded as _;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -778,7 +779,7 @@ impl HealthEnv for ControllerHealth {
             let read = async {
                 let ep = self.locator.reader(*t).await?;
                 let schema = ep.store.schema().to_owned();
-                let mut conn = ep.pool.get_conn().await.map_err(|e| {
+                let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
                     SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable")
                         .with_source(e)
                 })?;
@@ -838,7 +839,7 @@ impl HealthEnv for ControllerHealth {
             return Ok(None);
         };
         let pool = self.pools.writer(&cluster).await?;
-        let mut conn = pool.get_conn().await.map_err(|e| {
+        let mut conn = pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(
                 SprigCode::CatalogUnavailable,
                 "the system cluster is unreachable",

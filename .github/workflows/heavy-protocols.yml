@@ -138,6 +138,10 @@ jobs:
     env:
       SPRIG_CLIENTS_CACHE: ${{ github.workspace }}/target/clients-mongo
       SPRIG_MONGOOSE_SHARD: ${{ matrix.shard }}/8
+      # Mongoose's replica-set mode: its transaction tests run (against
+      # MONGOOSE_REPLSET_URI, which run.sh sets to the same URI) instead of
+      # being skipped. The reference is a one-node replica set.
+      START_REPLICA_SET: "1"
       R: ${{ github.workspace }}/target/ci-results/mongoose-${{ matrix.shard }}
     steps:
       - uses: actions/checkout@v4

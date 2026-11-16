@@ -14,6 +14,7 @@
 
 #![allow(clippy::cast_precision_loss)] // milliseconds for display
 
+use sprig_catalog::pool_wait::Bounded as _;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -127,7 +128,7 @@ async fn tables(
         return Err(super::invalid("workload views need a tenant login"));
     };
     let ep = sprig_catalog::CatalogLocator::writer(&*svc.locator, tid).await?;
-    let conn = ep.pool.get_conn().await.map_err(|e| {
+    let conn = ep.pool.get_conn_bounded().await.map_err(|e| {
         SprigError::new(
             sprig_common::SprigCode::CatalogUnavailable,
             "the tenant's catalog is unreachable",

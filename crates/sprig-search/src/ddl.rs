@@ -327,13 +327,36 @@ impl P {
     }
 
     fn field(&mut self) -> Result<FieldDef> {
+        let mut source_ref = None;
         let (source, name) = if self.eat("VALUE") {
-            match self.t.get(self.i).cloned() {
-                Some(T::Str(p)) => {
-                    self.i += 1;
-                    (Source::KvValue, path_of(&p))
+            if self.eat("FIELD") {
+                // A hash field by its exact name, queried as itself or
+                // by `AS name`.
+                let Some(T::Str(field)) = self.t.get(self.i).cloned() else {
+                    return Err(syntax("expected the hash field's name in quotes"));
+                };
+                self.i += 1;
+                let name = if self.eat("AS") {
+                    match self.t.get(self.i).cloned() {
+                        Some(T::Str(a)) => {
+                            self.i += 1;
+                            a
+                        }
+                        _ => self.ident()?,
+                    }
+                } else {
+                    field.clone()
+                };
+                source_ref = Some(field);
+                (Source::KvField, name)
+            } else {
+                match self.t.get(self.i).cloned() {
+                    Some(T::Str(p)) => {
+                        self.i += 1;
+                        (Source::KvValue, path_of(&p))
+                    }
+                    _ => (Source::KvValue, String::new()),
                 }
-                _ => (Source::KvValue, String::new()),
             }
         } else {
             match self.t.get(self.i).cloned() {
@@ -348,6 +371,9 @@ impl P {
         let kind = FieldKind::parse(&kw)
             .ok_or_else(|| syntax(format!("unknown search field kind {kw}")))?;
         let mut f = FieldDef::new(&name, source, kind);
+        if let Some(r) = source_ref {
+            f.source_ref = r;
+        }
         for (k, v) in self.options()? {
             match k.as_str() {
                 "analyzer" => f.analyzer = v.as_str().map(crate::analyze::from_atlas),
@@ -363,6 +389,17 @@ impl P {
                 "filter" => f.filter = v.as_bool().unwrap_or(false),
                 "sort" => f.sort = v.as_bool().unwrap_or(false),
                 "facet" => f.facet = v.as_bool().unwrap_or(false),
+                "separator" => {
+                    let sep = v
+                        .as_str()
+                        .filter(|s| s.chars().count() == 1)
+                        .ok_or_else(|| syntax("separator must be one character"))?;
+                    if f.kind != FieldKind::Keyword {
+                        return Err(syntax("separator is for keyword fields"));
+                    }
+                    f.separator = Some(sep.to_owned());
+                }
+                "case_sensitive" => f.case_sensitive = v.as_bool().unwrap_or(false),
                 other => return Err(syntax(format!("unknown field option {other}"))),
             }
         }
@@ -589,11 +626,26 @@ fn create_index(p: &mut P) -> Result<SearchDdl> {
                     .ok_or_else(|| syntax("partitions must be 1 to 64"))?;
             }
             "dynamic" => def.dynamic = v.as_bool().unwrap_or(false),
+            "prefixes" => {
+                def.key_prefixes = match v {
+                    Json::String(p) => vec![p],
+                    Json::Array(a) => a
+                        .into_iter()
+                        .map(|x| x.as_str().map(str::to_owned))
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| syntax("prefixes must be strings"))?,
+                    _ => return Err(syntax("prefixes must be a string or a list of strings")),
+                };
+            }
             other => return Err(syntax(format!("unknown search index option {other}"))),
         }
     }
     if def.fields.iter().any(|f| f.source != Source::Column) {
-        def.model = if def.fields.iter().any(|f| f.source == Source::KvValue) {
+        def.model = if def
+            .fields
+            .iter()
+            .any(|f| matches!(f.source, Source::KvValue | Source::KvField))
+        {
             Model::Kv
         } else {
             Model::Collection

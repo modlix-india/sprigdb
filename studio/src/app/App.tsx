@@ -25,6 +25,10 @@ import { MessagingPage } from '../msg/MessagingPage';
 import { PoliciesPage } from '../access/PoliciesPage';
 import { InheritancePage } from '../inherit/InheritancePage';
 import { isApiError } from '../api/errors';
+import { DocsPage } from '../ai/DocsPage';
+import { DashboardsRoute, TileEditorRoute } from '../dashboards/routes';
+import { GlossaryPage } from '../ai/GlossaryPage';
+import { DigestsPage } from '../ai/DigestsPage';
 
 export const queryClient = new QueryClient({
   defaultOptions: {
@@ -96,6 +100,12 @@ export const routes = [
       { path: 'logic/:db/new/:kind', element: <LogicPage creating /> },
       { path: 'access/:area', element: <AccessPage /> },
       { path: 'access', element: <Navigate to="users" replace /> },
+      { path: 'docs', element: <DocsPage /> },
+      { path: 'd', element: <DashboardsRoute /> },
+      { path: 'd/:id', element: <DashboardsRoute /> },
+      { path: 'd/:id/tile/:tile', element: <TileEditorRoute /> },
+      { path: 'glossary', element: <GlossaryPage /> },
+      { path: 'digests', element: <DigestsPage /> },
     ],
   },
   {

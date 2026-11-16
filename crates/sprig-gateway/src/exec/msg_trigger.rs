@@ -41,6 +41,7 @@ use mysql_async::prelude::Queryable;
 use serde_json::{Value, json};
 use sprig_catalog::CatalogLocator;
 use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::ObjectKind;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_logic::declare::{Declaration, SourceKind};
@@ -58,6 +59,31 @@ use super::logic::{ChannelDb, DbRequest};
 use super::offsets::find_stream;
 use super::tenant::Step;
 use crate::pipeline::{ExecCtx, ResultSink, RowFormat, Wire};
+
+/// A trigger run's `db`: the session's, keeping the code's log lines
+/// (`console.log`, `ctx.log`) for the run log (`logic_log`), at most
+/// [`sprig_logic::engine::engine::MAX_LOG_LINES`] a run.
+struct LoggedDb {
+    db: ChannelDb,
+    lines: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl sprig_logic::engine::bridge::DbBridge for LoggedDb {
+    async fn exec(&self, op: DbOp) -> Result<sprig_logic::engine::bridge::Reply> {
+        self.db.exec(op).await
+    }
+
+    fn log(&self, line: &str) {
+        let mut v = self
+            .lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if v.len() < sprig_logic::engine::engine::MAX_LOG_LINES {
+            v.push(line.to_owned());
+        }
+    }
+}
 
 /// The marked statement's start.
 pub(crate) const MARK: &str = "/* sprig message trigger ";
@@ -174,7 +200,7 @@ impl PassSession {
         let catalog_conn = || {
             let pool = ep.pool.clone();
             async move {
-                pool.get_conn().await.map_err(|e| {
+                pool.get_conn_bounded().await.map_err(|e| {
                     SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable")
                         .with_source(e)
                 })
@@ -337,7 +363,7 @@ impl PassSession {
                     let cluster = svc.locator.cluster(tenant).await?;
                     let pool = svc.locator.ctl_pool(&cluster).await?;
                     let mut c = pool
-                        .get_conn()
+                        .get_conn_bounded()
                         .await
                         .map_err(sprig_streams::maria::map_err)?;
                     let reader = sprig_streams::read::LogReader { schema };
@@ -566,7 +592,29 @@ impl PassSession {
         req: &RunRequest,
         field: &str,
         event: Value,
-    ) -> Result<Vec<String>> {
+    ) -> (Result<()>, Vec<String>) {
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let r = self
+            .run_version_logged(cx, req, field, event, Arc::clone(&lines))
+            .await;
+        let logs = std::mem::take(
+            &mut *lines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        (r, logs)
+    }
+
+    /// [`Self::run_version`], keeping the code's log lines in `lines`.
+    #[allow(clippy::too_many_lines)]
+    async fn run_version_logged(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        req: &RunRequest,
+        field: &str,
+        event: Value,
+        lines: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Result<()> {
         let (svc, tenant, cat, user) = {
             let ts = self
                 .tenant
@@ -589,7 +637,7 @@ impl PassSession {
             v
         } else {
             let ep = svc.locator.writer(tenant).await?;
-            let mut conn = ep.pool.get_conn().await.map_err(|e| {
+            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
                 SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
             })?;
             sprig_logic::invoke::load(
@@ -636,7 +684,10 @@ impl PassSession {
         };
         let (tx, mut rx) = mpsc::channel::<DbRequest>(1);
         let host = Host {
-            db: Arc::new(ChannelDb(tx)),
+            db: Arc::new(LoggedDb {
+                db: ChannelDb(tx),
+                lines,
+            }),
             outbound: Arc::new(HttpOutbound::new(policy)),
             default_db: db_row.map(|r| r.name.clone()),
             info: ctx,
@@ -686,7 +737,7 @@ impl PassSession {
                 format!("{}: {msg}", outcome.event),
             ));
         }
-        Ok(Vec::new())
+        Ok(())
     }
 
     /// A dead letter's replay: its event with the active version, in
@@ -723,12 +774,10 @@ impl PassSession {
             SourceKind::Stream => "record",
             SourceKind::Queue => "message",
         };
-        match self.run_version(cx, req, arg, rp.event.clone()).await {
-            Ok(logs) => match self.trigger_stmt(cx, "COMMIT").await {
-                Ok(()) => RunReply {
-                    logs,
-                    ..RunReply::of(RunOutcome::Ok)
-                },
+        let (ran, logs) = self.run_version(cx, req, arg, rp.event.clone()).await;
+        let reply = match ran {
+            Ok(()) => match self.trigger_stmt(cx, "COMMIT").await {
+                Ok(()) => RunReply::of(RunOutcome::Ok),
                 Err(e) => {
                     self.rollback_quietly(cx).await;
                     RunReply::failed(&e)
@@ -738,7 +787,8 @@ impl PassSession {
                 self.rollback_quietly(cx).await;
                 RunReply::failed(&e)
             }
-        }
+        };
+        RunReply { logs, ..reply }
     }
 
     /// One record of a stream (see the module docs).
@@ -810,12 +860,10 @@ impl PassSession {
                 }
             };
         }
-        match self.run_version(cx, req, "record", event).await {
-            Ok(logs) => match self.trigger_stmt(cx, "COMMIT").await {
-                Ok(()) => RunReply {
-                    logs,
-                    ..RunReply::of(RunOutcome::Ok)
-                },
+        let (ran, logs) = self.run_version(cx, req, "record", event).await;
+        let reply = match ran {
+            Ok(()) => match self.trigger_stmt(cx, "COMMIT").await {
+                Ok(()) => RunReply::of(RunOutcome::Ok),
                 Err(e) => {
                     self.rollback_quietly(cx).await;
                     RunReply::failed(&e)
@@ -825,7 +873,8 @@ impl PassSession {
                 self.rollback_quietly(cx).await;
                 RunReply::failed(&e)
             }
-        }
+        };
+        RunReply { logs, ..reply }
     }
 
     /// The next message of a queue (see the module docs).
@@ -923,6 +972,8 @@ impl PassSession {
             r.attempts = attempts;
             r
         };
+        // The code's log lines, also when the run fails.
+        let mut code_logs = Vec::new();
         let failure = if let Err(e) = self.trigger_stmt(cx, "START TRANSACTION").await {
             e
         } else {
@@ -949,7 +1000,9 @@ impl PassSession {
                     v.release(&t, false);
                     return with_id(RunReply::of(RunOutcome::Moved));
                 }
-                match self.run_version(cx, req, "message", event.clone()).await {
+                let (ran, logs) = self.run_version(cx, req, "message", event.clone()).await;
+                code_logs.clone_from(&logs);
+                match ran.map(|()| logs) {
                     Ok(logs) => match self.trigger_stmt(cx, "COMMIT").await {
                         Ok(()) => {
                             v.release(&t, true);
@@ -972,7 +1025,10 @@ impl PassSession {
                 }
             }
         };
-        let mut reply = with_id(RunReply::failed(&failure));
+        let mut reply = with_id(RunReply {
+            logs: code_logs,
+            ..RunReply::failed(&failure)
+        });
         // An inherited trigger whose sprig_inherited lost a
         // privilege waits for the grant (39242, marked by `on_run`): its
         // message goes back without counting, never to the dead letters.
@@ -1005,7 +1061,7 @@ impl PassSession {
                     .ok_or_else(|| SprigError::internal("no tenant"))?;
                 ts.services().locator.writer(tenant).await?
             };
-            let mut conn = ep.pool.get_conn().await.map_err(|e| {
+            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
                 SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
             })?;
             let store = sprig_logic::LogicStore::new(ep.store.schema());

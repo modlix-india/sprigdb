@@ -22,6 +22,7 @@
 use std::sync::Arc;
 
 use mysql_async::prelude::Queryable;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::TenantId;
 use sprig_common::names::quote;
 use sprig_common::{Result, SprigError};
@@ -179,7 +180,7 @@ pub async fn derived(
         let cluster = svc.locator.cluster(e.tenant).await?;
         let pool = svc.locator.ctl_pool(&cluster).await?;
         let mut c = pool
-            .get_conn()
+            .get_conn_bounded()
             .await
             .map_err(sprig_streams::maria::map_err)?;
         type R = (

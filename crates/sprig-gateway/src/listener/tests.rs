@@ -56,10 +56,18 @@ fn free_port() -> u16 {
 
 #[test]
 fn first_byte_detection() {
-    assert!(starts_tls(0x16));
+    // A TLS 1.2/1.3 ClientHello record: 16 03 01 <length> 01.
+    assert!(starts_tls(&[0x16, 0x03, 0x01, 0x02, 0x00, 0x01]));
+    assert!(starts_tls(&[0x16, 0x03, 0x03, 0x00, 0xc4, 0x01, 0x00]));
     for b in [b'G', b'P', b'*', 0x00, 0x03, 0x60, b'\r'] {
-        assert!(!starts_tls(b), "{b:#x}");
+        assert!(!starts_tls(&[b, 0x03, 0x01, 0x02, 0x00, 0x01]), "{b:#x}");
     }
+    // MongoDB messages of 534 and 790 bytes: their length's low byte is
+    // 0x16, then the rest of the length and the request id.
+    assert!(!starts_tls(&[0x16, 0x02, 0x00, 0x00, 0x07, 0x00]));
+    assert!(!starts_tls(&[0x16, 0x03, 0x00, 0x00, 0x09, 0x00]));
+    // Too short to tell: plaintext.
+    assert!(!starts_tls(&[0x16]));
 }
 
 #[test]

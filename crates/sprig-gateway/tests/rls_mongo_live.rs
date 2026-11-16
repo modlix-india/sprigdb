@@ -14,6 +14,15 @@
 //! The users hold `SELECT, INSERT, UPDATE, DELETE, WATCH` on the
 //! database: a change stream needs `WATCH`.
 //!
+//! Boolean policies (`boolean_policies`): one collection per filter, each
+//! with the same six documents (booleans, null, a missing field, other
+//! types, arrays, nested fields) and one permissive policy. Alice must see
+//! what MongoDB 8.0's `find` with that filter returns, through MongoDB,
+//! SQL and a change stream. MariaDB 11.8's `JSON_VALUE` reads JSON `true`
+//! as `1`, so a policy comparing with `'true'` showed `{deleted: true}`
+//! documents to `{deleted: {$ne: true}}` and hid every document from
+//! `{active: true}`.
+//!
 //! ```sh
 //! export SPRIG_TEST_RLS_SQL=127.0.0.1:33306
 //! export SPRIG_TEST_RLS_MONGO=127.0.0.1:33737
@@ -558,6 +567,7 @@ async fn row_level_security_on_collections() {
         .await
         .unwrap();
     ck.ok("disabled", n == 24, || format!("{n}"));
+    boolean_policies(&mut ck, &adb, &alice, &sql_addr).await;
     // Cleanup.
     let _ = admin_sql
         .query_drop(format!("DROP DATABASE IF EXISTS {DB}"))
@@ -573,4 +583,124 @@ async fn row_level_security_on_collections() {
         ck.failed.len()
     );
     assert!(ck.failed.is_empty(), "{:#?}", ck.failed);
+}
+
+/// The boolean policy cases (see the module docs); `alice` is bound by
+/// every policy (she can't `ALTER`).
+async fn boolean_policies(
+    ck: &mut Checks,
+    adb: &mongodb::Database,
+    alice: &mongodb::Client,
+    sql_addr: &str,
+) {
+    let six_docs = || {
+        vec![
+            doc! {"_id": 1, "deleted": true, "active": true, "meta": {"hidden": true}},
+            doc! {"_id": 2, "deleted": false, "active": false, "meta": {"hidden": false}},
+            doc! {"_id": 3},
+            doc! {"_id": 4, "deleted": null, "active": true, "meta": {}},
+            doc! {"_id": 5, "deleted": "yes", "active": 1, "meta": {"hidden": 1}},
+            doc! {"_id": 6, "deleted": [true], "active": [true], "meta": {"hidden": [true]}},
+        ]
+    };
+    // (collection, policy filter, what MongoDB 8.0's find with the filter
+    // returns; checked against mongo:8.0.34).
+    let cases: Vec<(&str, Document, Vec<i64>)> = vec![
+        ("b_eq_true", doc! {"active": true}, vec![1, 4, 6]),
+        ("b_eq_false", doc! {"active": {"$eq": false}}, vec![2]),
+        (
+            "b_ne_true",
+            doc! {"deleted": {"$ne": true}},
+            vec![2, 3, 4, 5],
+        ),
+        (
+            "b_in",
+            doc! {"active": {"$in": [true, false]}},
+            vec![1, 2, 4, 6],
+        ),
+        (
+            "b_nin",
+            doc! {"deleted": {"$nin": [true, false]}},
+            vec![3, 4, 5],
+        ),
+        (
+            "b_missing",
+            doc! {"archived": {"$ne": true}},
+            vec![1, 2, 3, 4, 5, 6],
+        ),
+        ("b_nested_eq", doc! {"meta.hidden": true}, vec![1, 6]),
+        (
+            "b_nested_ne",
+            doc! {"meta.hidden": {"$ne": true}},
+            vec![2, 3, 4, 5],
+        ),
+    ];
+    let mut s = sql(sql_addr, "rlsm_alice", PW).await;
+    for (coll, filter, want) in &cases {
+        let c = adb.collection::<Document>(coll);
+        c.insert_many(six_docs()).await.unwrap();
+        let r = adb
+            .run_command(doc! {"sprigCreatePolicy": *coll, "name": "p", "using": filter.clone()})
+            .await;
+        ck.ok(&format!("{coll}: create"), r.is_ok(), || format!("{r:?}"));
+        adb.run_command(doc! {"sprigRowSecurity": *coll, "enable": true})
+            .await
+            .unwrap();
+        let want: BTreeSet<i64> = want.iter().copied().collect();
+        let mine = alice.database(DB).collection::<Document>(coll);
+        let got: Result<Vec<Document>, _> = match mine.find(doc! {}).await {
+            Ok(cur) => cur.try_collect().await,
+            Err(e) => Err(e),
+        };
+        let got_ids = got.as_ref().map(|d| ids(d)).unwrap_or_default();
+        ck.ok(&format!("{coll}: find"), got_ids == want, || {
+            format!("{got_ids:?} vs {want:?} ({:?})", got.as_ref().err())
+        });
+        let n = mine.count_documents(doc! {}).await;
+        ck.ok(
+            &format!("{coll}: countDocuments"),
+            n.as_ref().is_ok_and(|n| *n == want.len() as u64),
+            || format!("{n:?}"),
+        );
+        let n: Result<Option<i64>, _> = s
+            .query_first(format!("SELECT COUNT(*) FROM {DB}.{coll}"))
+            .await;
+        ck.ok(
+            &format!("{coll}: SQL count"),
+            n.as_ref()
+                .is_ok_and(|n| *n == Some(i64::try_from(want.len()).unwrap())),
+            || format!("{n:?}"),
+        );
+    }
+    // A change stream shows what the policy shows: under
+    // `{deleted: {$ne: true}}`, a deleted document's insert never arrives,
+    // a missing field's does, and an update that deletes one is a delete.
+    let mut cs = alice
+        .database(DB)
+        .collection::<Document>("b_ne_true")
+        .watch()
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), cs.next_if_any()).await;
+    let c = adb.collection::<Document>("b_ne_true");
+    c.insert_one(doc! {"_id": 100, "deleted": true})
+        .await
+        .unwrap();
+    c.insert_one(doc! {"_id": 101, "deleted": false})
+        .await
+        .unwrap();
+    c.insert_one(doc! {"_id": 102}).await.unwrap();
+    c.update_one(doc! {"_id": 101}, doc! {"$set": {"deleted": true}})
+        .await
+        .unwrap();
+    let seen = collect_events(&mut cs, 4, 20).await;
+    ck.ok(
+        "b_ne_true: change stream",
+        seen == vec![
+            "Insert:101".to_owned(),
+            "Insert:102".to_owned(),
+            "Delete:101".to_owned(),
+        ],
+        || format!("{seen:?}"),
+    );
 }

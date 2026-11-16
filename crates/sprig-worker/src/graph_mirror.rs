@@ -7,10 +7,12 @@
 //!   open a binlog reader on every cluster of the DC (registered, not
 //!   retired), each after its checkpointed position or at its position now
 //!   loop:
-//!     every 2 s: the graphs served (grouped native graphs whose
-//!       mirror_mode is starting or async, or whose mirrors are building)
-//!       and their shard maps (the worker's watched copy); clusters added
-//!       to the DC get a reader; when a graph stopped being served, the
+//!     every 2 s, beside the loop: the graphs served (grouped native
+//!       graphs whose mirror_mode is starting or async, or whose mirrors
+//!       are building) and their shard maps (the worker's watched copy),
+//!       the DC's clusters, the catalog's and the clusters' writer pools;
+//!       once that lookup is back, the loop takes them: clusters added to
+//!       the DC get a reader; when a graph stopped being served, the
 //!       position rows of dropped graphs are deleted
 //!     take what the readers have (at most 512 groups, about 20,000 rows,
 //!       or 20 ms)
@@ -27,6 +29,15 @@
 //!     every 2 s: the positions as the job's progress (its checkpoint),
 //!       written beside the loop, backing off after failures (Checkpoint)
 //! ```
+//!
+//! **No etcd in the loop.** The loop doesn't read etcd: shard maps come
+//! from the worker's watched copy, the catalog's and the clusters' writer
+//! pools are looked up beside the loop every 2 s (and soon after a
+//! failure, the old ones serving meanwhile), and the checkpoint is written
+//! beside the loop. When etcd was slow, each of those reads made the
+//! applier fall behind, and reads waited for it. Only a batch that failed
+//! on a moved shard reads its map from etcd, and only the job's first
+//! lookup is waited for.
 //!
 //! Delivery is at least once: a new owner resumes at the checkpoint and
 //! applies again, which is harmless because every step is idempotent and
@@ -164,15 +175,26 @@ type Item = (ClusterId, u64, std::result::Result<SourceItem, String>);
 /// position before its PREPARE, and its rows.
 type Held = (ClusterId, String, GtidPos, Vec<RawRow>);
 
-/// Connections for [`mirror::apply_batch`]: fresh ones from the pools.
-struct PoolConns(Arc<dyn ClusterPools>);
+/// Connections for [`mirror::apply_batch`]: fresh ones from the clusters'
+/// writer pools, which the applier keeps between batches (looking one up
+/// reads the cluster's record from etcd).
+struct PoolConns {
+    pools: Arc<dyn ClusterPools>,
+    writers: HashMap<String, mysql_async::Pool>,
+}
 
 #[async_trait]
 impl ApplyConns for PoolConns {
     async fn connect(&mut self, cluster: &str) -> Result<mysql_async::Conn> {
-        let id = ClusterId::new(cluster)
-            .map_err(|e| SprigError::internal(format!("cluster id {cluster}: {e}")))?;
-        let pool = self.0.writer(&id).await?;
+        let pool = if let Some(p) = self.writers.get(cluster) {
+            p.clone()
+        } else {
+            let id = ClusterId::new(cluster)
+                .map_err(|e| SprigError::internal(format!("cluster id {cluster}: {e}")))?;
+            let p = self.pools.writer(&id).await?;
+            self.writers.insert(cluster.to_owned(), p.clone());
+            p
+        };
         pool.get_conn()
             .await
             .map_err(sprig_graph::catalog::backend_error)
@@ -196,6 +218,162 @@ struct Applier {
     /// Whether the position rows of dropped graphs were deleted since the
     /// served graphs last changed.
     orphans_cleared: bool,
+    /// The tenant catalog's writer pool and schema, and the clusters'
+    /// writer pools, looked up again at every refresh and after a
+    /// failure. Looking them up reads etcd (the tenant's directory entry,
+    /// the cluster's record and its published writer), which cost every
+    /// position write and every batch an etcd round trip.
+    catalog: Option<(mysql_async::Pool, String)>,
+    writers: HashMap<String, mysql_async::Pool>,
+    /// The refresh's lookups running beside the loop ([`look`]).
+    looking: Option<tokio::task::JoinHandle<Result<Refreshed>>>,
+}
+
+/// What a refresh found ([`look`]).
+struct Refreshed {
+    /// The tenant catalog's writer pool and schema.
+    catalog: (mysql_async::Pool, String),
+    /// The graphs served, with their layouts.
+    graphs: HashMap<u64, Served>,
+    /// The DC's clusters (each gets a reader).
+    clusters: HashSet<ClusterId>,
+    /// Their writer pools, by cluster.
+    writers: HashMap<String, mysql_async::Pool>,
+}
+
+/// A refresh's lookups, beside the loop: the catalog's writer pool, the
+/// graphs served and their maps (the watched copy; `current`'s layout
+/// where that copy is no newer), the DC's clusters and their writer
+/// pools. Each lookup reads etcd.
+async fn look(
+    env: GraphMirrorEnv,
+    tenant: TenantId,
+    current: HashMap<u64, Served>,
+) -> Result<Refreshed> {
+    let ep = env.locator.writer(tenant).await?;
+    let catalog = (ep.pool, ep.store.schema().to_owned());
+    let mut c = catalog
+        .0
+        .get_conn()
+        .await
+        .map_err(sprig_graph::catalog::backend_error)?;
+    let rows: Vec<(u64, u32, u32)> = match c
+        .query(format!(
+            "SELECT graph_id, db_id, group_id FROM {}.graphs WHERE kind = 'native' \
+             AND group_id IS NOT NULL AND state = 'active' \
+             AND (mirror_mode IN ('starting', 'async') OR mirror_state = 'building')",
+            quote(&catalog.1)
+        ))
+        .await
+    {
+        Ok(r) => r,
+        // Before the catalog's graph migration 3: nothing to serve.
+        Err(mysql_async::Error::Server(e)) if e.code == 1054 || e.code == 1146 => Vec::new(),
+        Err(e) => return Err(sprig_graph::catalog::backend_error(e)),
+    };
+    drop(c);
+    let mut graphs = HashMap::new();
+    for (graph, db, group) in rows {
+        // The watched map, unless a linearizable read after a failed
+        // batch already gave a newer one.
+        if let Some(s) = current.get(&graph)
+            && s.layout.db == db
+            && s.layout.group == group
+            && env
+                .maps
+                .get(tenant, GroupId(group))
+                .is_ok_and(|m| m.version <= s.layout.version)
+        {
+            graphs.insert(graph, s.clone());
+            continue;
+        }
+        let (map, _) = map_of(&env, tenant, GroupId(group), false).await?;
+        graphs.insert(
+            graph,
+            Served {
+                layout: Arc::new(GraphShards {
+                    graph,
+                    db,
+                    group,
+                    version: map.version,
+                    shards: shards_of(tenant, graph, db, group, &map),
+                    seq: String::new(),
+                    mirrors: true,
+                    mirror_async: true,
+                    mirror_building: false,
+                    route: None,
+                }),
+            },
+        );
+    }
+    let clusters: HashSet<ClusterId> = env.pools.sweepable().await?.into_iter().collect();
+    // Every cluster's writer pool (a shard can move to any of them); the
+    // pools are cached by the cluster's writer, so a lookup that finds the
+    // same writer gives the same pool.
+    let mut writers = HashMap::new();
+    if !graphs.is_empty() {
+        for c in &clusters {
+            match env.pools.writer(c).await {
+                Ok(p) => {
+                    writers.insert(c.to_string(), p);
+                }
+                Err(e) => {
+                    tracing::debug!(%tenant, cluster = %c, error = %e, "graph mirror writer pool not looked up");
+                }
+            }
+        }
+    }
+    Ok(Refreshed {
+        catalog,
+        graphs,
+        clusters,
+        writers,
+    })
+}
+
+/// `group`'s map and whether it was read linearizably: the watched copy,
+/// unless `latest` or the copy has none; the copy again when the
+/// linearizable read fails (etcd timing out).
+async fn map_of(
+    env: &GraphMirrorEnv,
+    tenant: TenantId,
+    group: GroupId,
+    latest: bool,
+) -> Result<(Arc<ShardMap>, bool)> {
+    if !latest && let Ok(m) = env.maps.get(tenant, group) {
+        return Ok((m, false));
+    }
+    match ShardMapStore::new(Arc::clone(&env.dc))
+        .load(tenant, group)
+        .await
+    {
+        Ok((m, _)) => Ok((Arc::new(m), true)),
+        Err(e) => match env.maps.get(tenant, group) {
+            Ok(m) => {
+                tracing::debug!(%tenant, %group, error = %e, "shard map read failed; using the watched copy");
+                Ok((m, false))
+            }
+            Err(_) => Err(e),
+        },
+    }
+}
+
+/// The shards of `graph` under `map`.
+fn shards_of(tenant: TenantId, graph: u64, db: u32, group: u32, map: &ShardMap) -> Vec<ShardLoc> {
+    map.ranges
+        .iter()
+        .map(|r| {
+            let schema = shard_schema(tenant, DbId(db), GroupId(group), r.shard);
+            ShardLoc {
+                shard: r.shard.0,
+                lo: r.lo,
+                epoch: r.epoch,
+                cluster: r.cluster.to_string(),
+                tables: Tables::of(&schema, graph),
+                schema,
+            }
+        })
+        .collect()
 }
 
 impl Applier {
@@ -211,6 +389,9 @@ impl Applier {
             applied: 0,
             resumed: false,
             orphans_cleared: false,
+            catalog: None,
+            writers: HashMap::new(),
+            looking: None,
         }
     }
 
@@ -235,12 +416,44 @@ impl Applier {
             if cx.cancel.is_cancelled() {
                 break Err("cancelled".to_owned());
             }
-            if last_refresh.is_none_or(|t| t.elapsed() >= Duration::from_secs(2)) {
-                if let Err(e) = self.refresh(&tx).await {
-                    tracing::warn!(tenant = %self.tenant, error = %e, "graph mirror refresh failed");
-                }
+            // The refresh's lookups run beside the loop; the loop takes
+            // their answer once it is back (it waits only for the first,
+            // before it has readers).
+            if self.looking.is_none()
+                && last_refresh.is_none_or(|t| t.elapsed() >= Duration::from_secs(2))
+            {
+                self.looking = Some(tokio::spawn(look(
+                    self.env.clone(),
+                    self.tenant,
+                    self.graphs.clone(),
+                )));
                 last_refresh = Some(Instant::now());
-                dirty = true;
+            }
+            if self
+                .looking
+                .as_ref()
+                .is_some_and(|h| h.is_finished() || self.readers.is_empty())
+                && let Some(h) = self.looking.take()
+            {
+                let r = match h.await {
+                    Ok(r) => r,
+                    Err(e) => Err(SprigError::internal(format!("graph mirror lookup: {e}"))),
+                };
+                match r {
+                    Ok(r) => {
+                        if let Err(e) = self.refresh(r, &tx).await {
+                            tracing::warn!(tenant = %self.tenant, error = %e, "graph mirror refresh failed");
+                        }
+                        dirty = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!(tenant = %self.tenant, error = %e, "graph mirror refresh failed");
+                        // Not again at once (the readers wait for the first).
+                        if self.readers.is_empty() {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                    }
+                }
             }
             // Take what the readers have.
             let mut items: Vec<Item> = Vec::new();
@@ -273,10 +486,17 @@ impl Applier {
                         // readers again from the positions (items of the
                         // old readers are ignored by generation).
                         tracing::warn!(tenant = %self.tenant, error = %e, "graph mirror batch failed; rereading");
+                        // The pools serve until the refresh, looked up
+                        // again at once beside the loop, replaces them; the
+                        // readers start again from the positions.
+                        let clusters: HashSet<ClusterId> = self.readers.keys().cloned().collect();
                         self.stop_readers();
                         self.held.clear();
                         last_refresh = None;
                         tokio::time::sleep(Duration::from_millis(500)).await;
+                        if let Err(e) = self.start_readers(clusters, &tx).await {
+                            tracing::warn!(tenant = %self.tenant, error = %e, "graph mirror readers not started again");
+                        }
                         continue;
                     }
                 }
@@ -290,6 +510,8 @@ impl Applier {
                         dirty = false;
                     }
                     Err(e) => {
+                        // Looked up again beside the loop.
+                        last_refresh = None;
                         tracing::warn!(tenant = %self.tenant, error = %e, "graph mirror positions not written");
                     }
                 }
@@ -332,64 +554,21 @@ impl Applier {
             .or_else(|| self.pos.get(c).cloned())
     }
 
-    /// The graphs served and their maps; readers for clusters without one.
-    async fn refresh(&mut self, tx: &mpsc::Sender<Item>) -> Result<()> {
-        let ep = self.env.locator.writer(self.tenant).await?;
-        let schema = ep.store.schema().to_owned();
-        let mut c = ep
-            .pool
-            .get_conn()
-            .await
-            .map_err(sprig_graph::catalog::backend_error)?;
-        let rows: Vec<(u64, u32, u32)> = match c
-            .query(format!(
-                "SELECT graph_id, db_id, group_id FROM {}.graphs WHERE kind = 'native' \
-                 AND group_id IS NOT NULL AND state = 'active' \
-                 AND (mirror_mode IN ('starting', 'async') OR mirror_state = 'building')",
-                quote(&schema)
-            ))
-            .await
-        {
-            Ok(r) => r,
-            // Before the catalog's graph migration 3: nothing to serve.
-            Err(mysql_async::Error::Server(e)) if e.code == 1054 || e.code == 1146 => Vec::new(),
-            Err(e) => return Err(sprig_graph::catalog::backend_error(e)),
-        };
-        drop(c);
-        let mut graphs = HashMap::new();
-        for (graph, db, group) in rows {
-            // The watched map, unless a linearizable read after a failed
-            // batch already gave a newer one.
-            if let Some(s) = self.graphs.get(&graph)
-                && s.layout.db == db
-                && s.layout.group == group
-                && self
-                    .env
-                    .maps
-                    .get(self.tenant, GroupId(group))
-                    .is_ok_and(|m| m.version <= s.layout.version)
+    /// Takes a refresh's lookups ([`look`]): its pools, the graphs
+    /// served (a layout read linearizably meanwhile stays where it is
+    /// newer), and a reader for each cluster without one. Reads no etcd
+    /// (a new cluster's position is its binlog's).
+    async fn refresh(&mut self, r: Refreshed, tx: &mpsc::Sender<Item>) -> Result<()> {
+        self.catalog = Some(r.catalog);
+        self.writers.extend(r.writers);
+        let mut graphs = r.graphs;
+        for (g, s) in &mut graphs {
+            if let Some(have) = self.graphs.get(g)
+                && have.layout.group == s.layout.group
+                && have.layout.version > s.layout.version
             {
-                graphs.insert(graph, s.clone());
-                continue;
+                *s = have.clone();
             }
-            let (map, _) = self.map_of(GroupId(group), false).await?;
-            graphs.insert(
-                graph,
-                Served {
-                    layout: Arc::new(GraphShards {
-                        graph,
-                        db,
-                        group,
-                        version: map.version,
-                        shards: self.shards_of(graph, db, group, &map),
-                        seq: String::new(),
-                        mirrors: true,
-                        mirror_async: true,
-                        mirror_building: false,
-                        route: None,
-                    }),
-                },
-            );
         }
         if self.graphs.keys().any(|g| !graphs.contains_key(g)) {
             self.orphans_cleared = false;
@@ -400,14 +579,23 @@ impl Applier {
         }
         self.resume_once().await;
         // A reader on every cluster of the DC.
-        let clusters: HashSet<ClusterId> = self.env.pools.sweepable().await?.into_iter().collect();
         self.readers.retain(|c, (_, t)| {
-            let keep = clusters.contains(c) && !t.is_cancelled();
+            let keep = r.clusters.contains(c) && !t.is_cancelled();
             if !keep {
                 t.cancel();
             }
             keep
         });
+        self.start_readers(r.clusters, tx).await
+    }
+
+    /// A reader for each of `clusters` without one, from its position (a
+    /// new cluster's: its binlog's now).
+    async fn start_readers(
+        &mut self,
+        clusters: HashSet<ClusterId>,
+        tx: &mpsc::Sender<Item>,
+    ) -> Result<()> {
         for c in clusters {
             if self.readers.contains_key(&c) {
                 continue;
@@ -466,10 +654,8 @@ impl Applier {
         if self.graphs.is_empty() {
             return Ok(());
         }
-        let ep = self.env.locator.writer(self.tenant).await?;
-        let schema = ep.store.schema().to_owned();
-        let mut conn = ep
-            .pool
+        let (pool, schema) = self.catalog().await?;
+        let mut conn = pool
             .get_conn()
             .await
             .map_err(sprig_graph::catalog::backend_error)?;
@@ -620,14 +806,30 @@ impl Applier {
     /// Applies `ch` to `graph`'s mirrors, again with a newer map when one
     /// of the shards changed epoch meanwhile.
     async fn apply(&mut self, graph: u64, ch: &[EdgeChange]) -> Result<()> {
-        let mut conns = PoolConns(Arc::clone(&self.env.pools));
+        let mut conns = PoolConns {
+            pools: Arc::clone(&self.env.pools),
+            writers: std::mem::take(&mut self.writers),
+        };
+        let r = self.apply_with(graph, ch, &mut conns).await;
+        // A failure may come from a stale pool (a new writer): the loop has
+        // the pools looked up again beside it, and these serve meanwhile.
+        self.writers = conns.writers;
+        r
+    }
+
+    async fn apply_with(
+        &mut self,
+        graph: u64,
+        ch: &[EdgeChange],
+        conns: &mut PoolConns,
+    ) -> Result<()> {
         let mut attempt = 0;
         loop {
             attempt += 1;
             let Some(served) = self.graphs.get(&graph).cloned() else {
                 return Ok(()); // no longer served (dropped, or back to sync)
             };
-            let r = mirror::apply_batch(&mut conns, &served.layout, ch, now_us()).await;
+            let r = mirror::apply_batch(conns, &served.layout, ch, now_us()).await;
             let stale = match &r {
                 Ok(a) => {
                     // The watched map now: a cutover seen meanwhile runs
@@ -686,14 +888,15 @@ impl Applier {
         let Some(s) = self.graphs.get(&graph).cloned() else {
             return Ok(());
         };
-        let (map, linearizable) = self.map_of(GroupId(s.layout.group), latest).await?;
+        let (map, linearizable) =
+            map_of(&self.env, self.tenant, GroupId(s.layout.group), latest).await?;
         // A watched copy can trail a linearizable read taken earlier.
         if map.version == s.layout.version || (!linearizable && map.version < s.layout.version) {
             return Ok(());
         }
         let mut l = (*s.layout).clone();
         l.version = map.version;
-        l.shards = self.shards_of(graph, l.db, l.group, &map);
+        l.shards = shards_of(self.tenant, graph, l.db, l.group, &map);
         self.graphs.insert(
             graph,
             Served {
@@ -703,56 +906,14 @@ impl Applier {
         Ok(())
     }
 
-    /// `group`'s map and whether it was read linearizably: the watched
-    /// copy, unless `latest` or the copy has none; the copy again when
-    /// the linearizable read fails (etcd timing out).
-    async fn map_of(&self, group: GroupId, latest: bool) -> Result<(Arc<ShardMap>, bool)> {
-        if !latest && let Ok(m) = self.env.maps.get(self.tenant, group) {
-            return Ok((m, false));
-        }
-        match ShardMapStore::new(Arc::clone(&self.env.dc))
-            .load(self.tenant, group)
-            .await
-        {
-            Ok((m, _)) => Ok((Arc::new(m), true)),
-            Err(e) => match self.env.maps.get(self.tenant, group) {
-                Ok(m) => {
-                    tracing::debug!(tenant = %self.tenant, %group, error = %e, "shard map read failed; using the watched copy");
-                    Ok((m, false))
-                }
-                Err(_) => Err(e),
-            },
-        }
-    }
-
-    /// The shards of `graph` under `map`.
-    fn shards_of(&self, graph: u64, db: u32, group: u32, map: &ShardMap) -> Vec<ShardLoc> {
-        map.ranges
-            .iter()
-            .map(|r| {
-                let schema = shard_schema(self.tenant, DbId(db), GroupId(group), r.shard);
-                ShardLoc {
-                    shard: r.shard.0,
-                    lo: r.lo,
-                    epoch: r.epoch,
-                    cluster: r.cluster.to_string(),
-                    tables: Tables::of(&schema, graph),
-                    schema,
-                }
-            })
-            .collect()
-    }
-
     /// Deletes the position rows of dropped graphs. `DROP GRAPH` deletes
     /// them in its own transaction, but an applier that still served the
     /// graph (it looks every 2 s) wrote them again; once the graph is no
     /// longer served, nothing writes them.
     async fn clear_orphans(&mut self) {
         let r = async {
-            let ep = self.env.locator.writer(self.tenant).await?;
-            let schema = ep.store.schema().to_owned();
-            let mut c = ep
-                .pool
+            let (pool, schema) = self.catalog().await?;
+            let mut c = pool
                 .get_conn()
                 .await
                 .map_err(sprig_graph::catalog::backend_error)?;
@@ -776,15 +937,25 @@ impl Applier {
         }
     }
 
+    /// The tenant catalog's writer pool and schema, kept until the next
+    /// refresh or failure.
+    async fn catalog(&mut self) -> Result<(mysql_async::Pool, String)> {
+        if let Some(c) = &self.catalog {
+            return Ok(c.clone());
+        }
+        let ep = self.env.locator.writer(self.tenant).await?;
+        let c = (ep.pool, ep.store.schema().to_owned());
+        self.catalog = Some(c.clone());
+        Ok(c)
+    }
+
     /// A position row per shard of every served graph.
     async fn write_positions(&mut self) -> Result<()> {
         if self.graphs.is_empty() {
             return Ok(());
         }
-        let ep = self.env.locator.writer(self.tenant).await?;
-        let schema = ep.store.schema().to_owned();
-        let mut c = ep
-            .pool
+        let (pool, schema) = self.catalog().await?;
+        let mut c = pool
             .get_conn()
             .await
             .map_err(sprig_graph::catalog::backend_error)?;

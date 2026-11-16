@@ -30,7 +30,7 @@ use sprig_common::ids::{DbId, ObjectId, TenantId};
 use sprig_common::names::quote;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_search::analyze::CustomAnalyzer;
-use sprig_search::def::{Flavor, IndexDef};
+use sprig_search::def::{Flavor, IndexDef, Source};
 
 use crate::tenant::TenantServices;
 
@@ -326,11 +326,16 @@ impl SearchTables {
                     d.index_id.into(),
                     f.field_no.into(),
                     f.name.as_str().into(),
-                    serde_json::to_value(f.source)
-                        .ok()
-                        .and_then(|v| v.as_str().map(str::to_owned))
-                        .unwrap_or_default()
-                        .into(),
+                    // The mirror's ENUM has no hash-field source: a hash
+                    // field shows as a value field (the definition says which).
+                    match f.source {
+                        Source::KvField => "kv_value".to_owned(),
+                        other => serde_json::to_value(other)
+                            .ok()
+                            .and_then(|v| v.as_str().map(str::to_owned))
+                            .unwrap_or_default(),
+                    }
+                    .into(),
                     f.source_ref.as_str().into(),
                     f.kind.as_str().into(),
                     f.analyzer.clone().into(),

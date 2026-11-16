@@ -16,6 +16,7 @@
 mod graphs;
 mod lookups;
 mod ops;
+mod periodic;
 mod rekey;
 pub use graphs::{GraphIndexRow, GraphPartition, GraphRow, GraphShardRow, GraphView};
 pub use ops::{GroupView, ManualJob, ShardRow, design_from_json};
@@ -35,6 +36,7 @@ use sprig_balancer::shards::{
     self, Admission, Backoff, GroupStat, Proposal, Reason, RunningJob, ShardJob, ShardStat,
     ShardingMode, ShardingSettings, Weight,
 };
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::{ClusterId, DbId, GroupId, JobId, ShardId, TenantId};
 use sprig_common::names::SchemaName;
 use sprig_common::{CancellationToken, Result, SprigError};
@@ -71,6 +73,9 @@ pub struct TenantSettings {
     pub lookup: sprig_shard::lookup::settings::LookupSettings,
     /// `advisor.lookup_*`: the advisor's lookup proposals.
     pub lookup_advice: sprig_advisor::sharding::settings::LookupAdvice,
+    /// `advisor.interval_hours`, `advisor.rekey_*` and
+    /// `migration.auto_size_limit_gb`: the periodic run's re-keys.
+    pub rekey: sprig_advisor::sharding::settings::RekeyAdvice,
 }
 
 impl Default for TenantSettings {
@@ -85,6 +90,7 @@ impl Default for TenantSettings {
             chunk_rows: m.copy_chunk_rows,
             lookup: sprig_shard::lookup::settings::LookupSettings::default(),
             lookup_advice: sprig_advisor::sharding::settings::LookupAdvice::default(),
+            rekey: sprig_advisor::sharding::settings::RekeyAdvice::default(),
         }
     }
 }
@@ -188,6 +194,10 @@ struct TenantState {
     last_run: Option<Instant>,
     /// Waits already logged, by subject and blocker.
     logged_waits: BTreeSet<(String, &'static str)>,
+    /// When the next periodic run is due (`advisor.interval_hours`).
+    next_periodic: Option<Instant>,
+    /// A periodic run's re-key held for approval.
+    pending_rekey: Option<periodic::PendingRekey>,
 }
 
 /// A `group_members` row: object, routing, key columns, parent, parent FK.
@@ -493,7 +503,7 @@ impl ShardingLoop {
 
     async fn conn(&self, cluster: &ClusterId) -> Result<Conn> {
         let pool = self.pools.pool(cluster).await?;
-        pool.get_conn().await.map_err(|e| {
+        pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(sprig_common::SprigCode::BackendUnavailable, e.to_string())
         })
     }
@@ -551,6 +561,10 @@ impl ShardingLoop {
             r?;
             return Ok(report);
         }
+        // The tick's own connection goes back before the steps below: the
+        // re-key follow-up and each group's tick take their own from the
+        // same pool, and a task holding one mustn't wait for another.
+        drop(c);
         // Groups applied before this loop started (or by an older binary)
         // are published once, so every gateway routes them.
         if let Some(p) = &self.publish
@@ -569,6 +583,17 @@ impl ShardingLoop {
         self.jobs
             .unlock_tenant(tenant, &Self::advisor_holder(tenant))
             .await?;
+        // The advisor's periodic run, once every group is active; a re-key
+        // it starts leaves the groups' splits and merges for the next tick.
+        if groups.iter().all(|g| g.1 == "active") {
+            match self.periodic(tenant, &ts, &home, &mut report).await {
+                Ok(true) => return Ok(report),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(tenant = %tenant, error = %e, "advisor periodic run failed");
+                }
+            }
+        }
         for (g, state, min_shards, created_ms) in groups {
             if state != "active" {
                 continue;
@@ -585,10 +610,8 @@ impl ShardingLoop {
             .await?;
         }
         // Global lookup indexes: stopped builds, and the advisor's
-        // proposals for reads that scatter by a unique column. The tick's
-        // own connection goes back first: the jobs take their own from
-        // the loop's small pools.
-        drop(c);
+        // proposals for reads that scatter by a unique column (the jobs
+        // take their own connections from the loop's small pools).
         if let Err(e) = self.lookup_tick(tenant, &home, &ts).await {
             tracing::warn!(tenant = %tenant, error = %e, "lookup indexes: the tick failed");
         }

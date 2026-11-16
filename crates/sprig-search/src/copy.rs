@@ -25,7 +25,7 @@
 //!   snapshots), checked against the linked meta.json
 //! ```
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -190,6 +190,12 @@ pub trait Seeder: Send {
     /// The next `limit` rows after `after` (`None`: from the first), in
     /// key order. 39820 when the object is gone.
     async fn page(&mut self, after: Option<&Key>, limit: usize) -> Result<Vec<Record>>;
+    /// The current rows of `keys` (absent keys are left out): an index
+    /// with hash fields re-reads the keys its feed changed.
+    async fn fetch(&mut self, keys: &[Key]) -> Result<Vec<Record>> {
+        let _ = keys;
+        Err(unavailable("this seed source can't re-read keys"))
+    }
     /// Ends the seed.
     async fn close(self: Box<Self>);
 }
@@ -381,8 +387,17 @@ pub fn record_from_text(def: &IndexDef, columns: &[String], row: Vec<Option<Vec<
                 .collect(),
         }
     } else if def.model == Model::Kv {
+        // `k, type, v`: a hash's fields come from a second read
+        // ([`hash_fields_sql`], [`fill_hash_fields`]).
         let mut it = row.into_iter();
         let key = Key(it.next().flatten().unwrap_or_default());
+        let ty = it.next().flatten();
+        if ty.as_deref() == Some(b"hash".as_slice()) {
+            return Record::Hash {
+                key,
+                fields: Vec::new(),
+            };
+        }
         let doc = it
             .next()
             .flatten()
@@ -419,6 +434,124 @@ fn kv_string(v: &BinValue) -> bool {
     }
 }
 
+/// The key types a namespace index reads: string keys, and hashes when it
+/// has hash fields.
+fn kv_types(def: &IndexDef) -> &'static str {
+    if def.has_hash_fields() {
+        "`type` IN ('string', 'hash')"
+    } else {
+        "`type` = 'string'"
+    }
+}
+
+/// `LEFT(k, n) = X'..'` for each key prefix of `def`, joined with `OR`, or empty.
+fn kv_prefix_cond(def: &IndexDef) -> String {
+    if def.key_prefixes.is_empty() || def.key_prefixes.iter().any(String::is_empty) {
+        return String::new();
+    }
+    let parts: Vec<String> = def
+        .key_prefixes
+        .iter()
+        .map(|p| {
+            format!(
+                "LEFT(`k`, {}) = {}",
+                p.len(),
+                Key(p.as_bytes().to_vec())
+                    .sql(Model::Kv)
+                    .unwrap_or_default()
+            )
+        })
+        .collect();
+    format!(" AND ({})", parts.join(" OR "))
+}
+
+/// The `SELECT` of `keys`' current rows (a copy re-reads the keys a
+/// change touched, for indexes with hash fields): `k, type, v` of the
+/// string and hash keys among them.
+///
+/// # Errors
+/// Never for a namespace's keys.
+pub fn fetch_sql(def: &IndexDef, keys: &[Key]) -> Result<(Vec<String>, String)> {
+    let q = |s: &str| sprig_common::names::quote(s);
+    let table = format!("{}.{}", q(&def.db), q(&def.table));
+    let list = keys
+        .iter()
+        .map(|k| k.sql(Model::Kv))
+        .collect::<Result<Vec<_>>>()?;
+    let list = if list.is_empty() {
+        "NULL".to_owned()
+    } else {
+        list.join(", ")
+    };
+    Ok((
+        vec!["k".to_owned(), "type".to_owned(), "v".to_owned()],
+        format!(
+            "SELECT `k`, `type`, `v` FROM {table} WHERE `k` IN ({list}) AND {}",
+            kv_types(def)
+        ),
+    ))
+}
+
+/// The `SELECT` of the indexed fields of the hashes among `records`
+/// (`k, e, v` rows), or `None` when there are none.
+#[must_use]
+pub fn hash_fields_sql(def: &IndexDef, records: &[Record]) -> Option<String> {
+    let q = |s: &str| sprig_common::names::quote(s);
+    let keys: Vec<String> = records
+        .iter()
+        .filter(|r| matches!(r, Record::Hash { .. }))
+        .filter_map(|r| r.key().sql(Model::Kv).ok())
+        .collect();
+    if keys.is_empty() {
+        return None;
+    }
+    let mut names: Vec<String> = def
+        .fields
+        .iter()
+        .filter(|f| f.source == crate::def::Source::KvField)
+        .map(|f| {
+            Key(f.source_ref.as_bytes().to_vec())
+                .sql(Model::Kv)
+                .unwrap_or_default()
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    Some(format!(
+        "SELECT t.`k`, e.`e`, e.`v` FROM {db}.{keys_t} AS t JOIN {db}.{elems} AS e \
+         ON e.`k` = t.`k` AND e.`g` = t.`g` WHERE t.`k` IN ({list}) AND t.`type` = 'hash' \
+         AND e.`e` IN ({fields})",
+        db = q(&def.db),
+        keys_t = q(&def.table),
+        elems = q(&format!("__sprig_ke_{}", def.table)),
+        list = keys.join(", "),
+        fields = names.join(", ")
+    ))
+}
+
+/// Puts the `k, e, v` rows of [`hash_fields_sql`] into their hashes.
+pub fn fill_hash_fields(records: &mut [Record], rows: Vec<Vec<Option<Vec<u8>>>>) {
+    let mut by_key: HashMap<Vec<u8>, Vec<(String, String)>> = HashMap::new();
+    for r in rows {
+        let mut it = r.into_iter();
+        let (Some(Some(k)), Some(Some(e)), Some(v)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        by_key.entry(k).or_default().push((
+            String::from_utf8_lossy(&e).into_owned(),
+            String::from_utf8_lossy(&v.unwrap_or_default()).into_owned(),
+        ));
+    }
+    for r in records {
+        if let Record::Hash { key, fields } = r
+            && let Some(mut f) = by_key.remove(&key.0)
+        {
+            f.sort();
+            *fields = f;
+        }
+    }
+}
+
 /// The columns a seed reads, and the `SELECT` of the page after `after`.
 ///
 /// # Errors
@@ -432,7 +565,7 @@ pub fn seed_page_sql(
     let table = format!("{}.{}", q(&def.db), q(&def.table));
     let cols: Vec<String> = match def.model {
         Model::Table => crate::schema::columns_read(def),
-        Model::Kv => vec!["k".to_owned(), "v".to_owned()],
+        Model::Kv => vec!["k".to_owned(), "type".to_owned(), "v".to_owned()],
         Model::Collection => vec!["_id".to_owned(), "doc".to_owned()],
     };
     let nk = def.key_columns.len().max(1);
@@ -455,10 +588,11 @@ pub fn seed_page_sql(
         (Some(k), Model::Kv) => format!(" WHERE `k` > {}", k.sql(def.model)?),
         (Some(k), _) => format!(" WHERE `_id` > {}", k.sql(def.model)?),
     };
-    // A namespace's string keys only.
+    // A namespace's string keys (and hashes, with hash fields), under
+    // the index's key prefixes.
     let cond = match (def.model, cond.is_empty()) {
-        (Model::Kv, true) => " WHERE `type` = 'string'".to_owned(),
-        (Model::Kv, false) => format!("{cond} AND `type` = 'string'"),
+        (Model::Kv, true) => format!(" WHERE {}{}", kv_types(def), kv_prefix_cond(def)),
+        (Model::Kv, false) => format!("{cond} AND {}{}", kv_types(def), kv_prefix_cond(def)),
         _ => cond,
     };
     let stmt = format!("SELECT {select} FROM {table}{cond} ORDER BY {order} LIMIT {limit}");
@@ -478,6 +612,10 @@ pub struct SeedRequest {
     pub after: Option<Key>,
     /// Rows.
     pub limit: usize,
+    /// Instead of a page: these keys' current rows (indexes with hash
+    /// fields re-read the keys a change touched).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<Vec<Key>>,
 }
 
 /// The page.
@@ -803,6 +941,14 @@ impl Copy {
                 progress_every: Duration::from_millis(200),
                 follow_moves: false,
                 progress_on_filtered: true,
+                // Hash fields live in the namespace's element table: a
+                // field change alone (the key row's `_v` is not a change
+                // the feed reports) shows only there.
+                keep_internal: if self.def.has_hash_fields() {
+                    vec![format!("__sprig_ke_{}", self.def.table)]
+                } else {
+                    Vec::new()
+                },
                 ..TailOptions::default()
             },
         )
@@ -915,9 +1061,69 @@ impl Copy {
         if d.object_id != 0 && e.object == d.object_id {
             return true;
         }
-        e.object == 0
+        (e.object == 0
             && e.db_name.eq_ignore_ascii_case(&d.db)
-            && e.table.eq_ignore_ascii_case(&d.table)
+            && e.table.eq_ignore_ascii_case(&d.table))
+            || self.elems_event(e)
+    }
+
+    /// Whether `e` is a row of the namespace's element table (hash
+    /// fields), for an index with hash fields.
+    fn elems_event(&self, e: &ChangeEvent) -> bool {
+        let d = &self.def;
+        d.has_hash_fields()
+            && e.db_name.eq_ignore_ascii_case(&d.db)
+            && e.table.len() == d.table.len() + 11
+            && e.table.starts_with("__sprig_ke_")
+            && e.table[11..].eq_ignore_ascii_case(&d.table)
+    }
+
+    /// Re-reads `dirty` keys (an index with hash fields) and indexes what
+    /// they hold now: a hash's fields, a string's value, or nothing for a
+    /// key that is gone or of another type.
+    async fn refresh(&self, host: &dyn CopyHost, dirty: &mut HashSet<Key>) -> Result<()> {
+        if dirty.is_empty() {
+            return Ok(());
+        }
+        let keys: Vec<Key> = dirty.drain().collect();
+        let mut seeder = host.seeder(self.tenant, &self.def).await?;
+        let mut r = Ok(());
+        for chunk in keys.chunks(500) {
+            let recs = match seeder.fetch(chunk).await {
+                Ok(v) => v,
+                Err(e) => {
+                    r = Err(e);
+                    break;
+                }
+            };
+            let found: HashSet<&Key> = recs.iter().map(Record::key).collect();
+            let gone: Vec<Key> = chunk
+                .iter()
+                .filter(|k| !found.contains(k))
+                .cloned()
+                .collect();
+            let ix = Arc::clone(&self.index);
+            let applied = tokio::task::spawn_blocking(move || -> Result<()> {
+                for k in &gone {
+                    ix.delete(k);
+                }
+                for rec in &recs {
+                    ix.upsert(rec)?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(join_err)
+            .and_then(|x| x);
+            if let Err(e) = applied {
+                r = Err(e);
+                break;
+            }
+        }
+        seeder.close().await;
+        metrics::counter!("sprig_search_docs_indexed_total", "op" => "reread")
+            .increment(keys.len() as u64);
+        r
     }
 
     fn key_of(&self, img: &Image) -> Key {
@@ -1066,6 +1272,10 @@ impl Copy {
         let lag = LagReport::new();
         // Each key's last applied clamp, and each cluster's clamp so far.
         let mut newest: HashMap<Key, u64> = HashMap::new();
+        // Indexes with hash fields: keys a change touched, re-read before
+        // the next commit (a hash's fields arrive one row at a time).
+        let rereads = self.def.has_hash_fields();
+        let mut dirty: HashSet<Key> = HashSet::new();
         let mut frontier: BTreeMap<ClusterId, u64> = BTreeMap::new();
         let mut pending = 0u64;
         let mut since = Instant::now();
@@ -1080,6 +1290,7 @@ impl Copy {
                 biased;
                 () = self.stop.cancelled() => {
                     if pending > 0 {
+                        self.refresh(host, &mut dirty).await?;
                         self.commit(&pos).await?;
                     }
                     return Ok(());
@@ -1113,6 +1324,13 @@ impl Copy {
                             }
                             false
                         }
+                        (true, Op::Insert | Op::Update | Op::Delete) if rereads => {
+                            let k = self.key_of(&e.key);
+                            self.def.covers_key(&k.0) && dirty.insert(k)
+                        }
+                        // Emptying the element table comes with emptying
+                        // the key table, which empties the index.
+                        (true, _) if self.elems_event(&e) => false,
                         (true, Op::Insert | Op::Update | Op::Delete) => {
                             let k = self.key_of(&e.key);
                             if newest.get(&k).is_some_and(|h| *h > e.hlc) {
@@ -1192,6 +1410,7 @@ impl Copy {
             if pending >= MAX_PENDING
                 || (boundary && (since.elapsed() >= interval || waiting || early))
             {
+                self.refresh(host, &mut dirty).await?;
                 self.commit(&pos).await?;
                 lag.report(&frontier);
                 pending = 0;
@@ -1313,6 +1532,92 @@ mod tests {
         assert!((5.0..100.0).contains(&m), "{m}");
         drop(b);
         assert!(max(&c).is_none());
+    }
+
+    fn hash_def() -> IndexDef {
+        let mut d = IndexDef::new("i", "redis", "db0", Model::Kv, crate::def::Flavor::Sql);
+        d.push(crate::def::FieldDef::new(
+            "title",
+            crate::def::Source::KvField,
+            crate::def::FieldKind::Text,
+        ))
+        .unwrap();
+        d.key_prefixes = vec!["doc:".into()];
+        d
+    }
+
+    #[test]
+    fn hashes_are_read_in_two_statements() {
+        let d = hash_def();
+        let (cols, page) = seed_page_sql(&d, None, 10).unwrap();
+        assert_eq!(cols, vec!["k", "type", "v"]);
+        assert!(page.contains("`type` IN ('string', 'hash')"), "{page}");
+        assert!(page.contains("LEFT(`k`, 4) = X'646F633A'"), "{page}");
+        let recs = vec![
+            record_from_text(
+                &d,
+                &cols,
+                vec![Some(b"doc:1".to_vec()), Some(b"hash".to_vec()), None],
+            ),
+            record_from_text(
+                &d,
+                &cols,
+                vec![
+                    Some(b"doc:2".to_vec()),
+                    Some(b"string".to_vec()),
+                    Some(b"plain".to_vec()),
+                ],
+            ),
+        ];
+        let fields = hash_fields_sql(&d, &recs).unwrap();
+        assert!(fields.contains("t.`k` IN (X'646F633A31')"), "{fields}");
+        assert!(fields.contains("e.`e` IN (X'7469746C65')"), "{fields}");
+        let mut recs = recs;
+        fill_hash_fields(
+            &mut recs,
+            vec![vec![
+                Some(b"doc:1".to_vec()),
+                Some(b"title".to_vec()),
+                Some(b"Hello".to_vec()),
+            ]],
+        );
+        assert_eq!(
+            recs[0],
+            Record::Hash {
+                key: Key(b"doc:1".to_vec()),
+                fields: vec![("title".into(), "Hello".into())]
+            }
+        );
+        let (_, fetch) = fetch_sql(&d, &[Key(b"doc:1".to_vec())]).unwrap();
+        assert!(fetch.contains("`k` IN (X'646F633A31')"), "{fetch}");
+        // A string-only namespace index is read as before.
+        let mut s = d.clone();
+        s.fields[0].source = crate::def::Source::KvValue;
+        assert!(hash_fields_sql(&s, &[]).is_none());
+        assert!(
+            seed_page_sql(&s, None, 10)
+                .unwrap()
+                .1
+                .contains("`type` = 'string'")
+        );
+    }
+
+    #[test]
+    fn hashes_extract_only_their_fields_under_the_prefixes() {
+        let d = hash_def();
+        let schema = IndexSchema::build(&d, &[]).unwrap();
+        let hash = |k: &str| Record::Hash {
+            key: Key(k.as_bytes().to_vec()),
+            fields: vec![("title".into(), "Hello".into())],
+        };
+        assert!(schema.extract(&hash("doc:1")).is_some());
+        assert!(schema.extract(&hash("other:1")).is_none());
+        // A string key's JSON value doesn't feed hash fields.
+        let doc = Record::Doc {
+            key: Key(b"doc:2".to_vec()),
+            doc: serde_json::json!({"title": "Hello"}),
+        };
+        assert!(schema.extract(&doc).is_none());
     }
 
     #[test]

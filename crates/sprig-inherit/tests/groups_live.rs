@@ -19,6 +19,7 @@
 //! export SPRIG_TEST_IG_GATEWAY=127.0.0.1:27406,127.0.0.1:27407   # mysql, mariadb persona
 //! export SPRIG_TEST_IG_TENANTS=ig-a,ig-b,ig-c                     # a > b > c
 //! export SPRIG_TEST_IG_MODE=read_through                          # or materialized
+//! export SPRIG_TEST_IG_GATEWAY2=127.0.0.1:27416,127.0.0.1:27417  # optional second gateway
 //! cargo test -p sprig-inherit --test groups_live -- --nocapture --test-threads 1
 //! ```
 //!
@@ -58,6 +59,16 @@ fn endpoints(test: &str) -> Option<Vec<String>> {
         eprintln!("{test}: skipped, set {GATEWAY}");
         None
     }
+}
+
+/// A second gateway of the same deployment, persona for persona
+/// (`SPRIG_TEST_IG_GATEWAY2`, in the form of `SPRIG_TEST_IG_GATEWAY`):
+/// `typed_tables_in_groups` runs other sessions through it too.
+fn second_gateway(persona: usize) -> Option<String> {
+    std::env::var("SPRIG_TEST_IG_GATEWAY2")
+        .ok()
+        .and_then(|v| v.split(',').nth(persona).map(|s| s.trim().to_owned()))
+        .filter(|v| !v.is_empty())
 }
 
 fn tenants() -> Vec<String> {
@@ -1321,20 +1332,36 @@ async fn typed_tables_in_groups() {
             )
             .await;
             // A subtype a declares later reaches b and c, while other
-            // sessions at b and c run statements (each one brings its
-            // tenant up to its parent too: an adoption half done by one
-            // must never show to another as a plain table, 1054).
+            // sessions at b and c run statements, through this gateway
+            // and through a second one when there is one (each statement
+            // brings its tenant up to its parent too, so two gateways
+            // adopt for the same child at once: no session may ever see
+            // an adoption half done, a plain `van` without `name`, 1054).
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let mut others = Vec::new();
-            for name in &t[1..] {
-                let mut o = conn(ep, name).await;
-                let (stop, db) = (std::sync::Arc::clone(&stop), db.clone());
-                others.push(tokio::spawn(async move {
-                    let _ = try_exec(&mut o, &format!("USE {db}")).await;
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        let _ = try_exec(&mut o, "SELECT COUNT(*) FROM vehicle").await;
-                    }
-                }));
+            let mut via = vec![ep.clone()];
+            via.extend(second_gateway(pi));
+            for e in &via {
+                for name in &t[1..] {
+                    let mut o = conn(e, name).await;
+                    let (stop, db) = (std::sync::Arc::clone(&stop), db.clone());
+                    others.push(tokio::spawn(async move {
+                        let _ = try_exec(&mut o, &format!("USE {db}")).await;
+                        let (mut n, mut errs) = (0_u64, Vec::new());
+                        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            for sql in ["SELECT COUNT(*) FROM vehicle", "SELECT name FROM van"] {
+                                n += 1;
+                                // 1146: `van` isn't there yet.
+                                if let Err(code) = try_exec(&mut o, sql).await
+                                    && code != 1146
+                                {
+                                    errs.push((sql, code));
+                                }
+                            }
+                        }
+                        (n, errs)
+                    }));
+                }
             }
             exec(
                 &mut c[0],
@@ -1345,9 +1372,22 @@ async fn typed_tables_in_groups() {
             names_become(&mut c[1], "SELECT name FROM van", &["a-van"]).await;
             names_become(&mut c[2], "SELECT name FROM van", &["a-van"]).await;
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let (mut n, mut errs) = (0, Vec::new());
             for o in others {
-                o.await.unwrap();
+                let (k, e) = o.await.unwrap();
+                n += k;
+                errs.extend(e);
             }
+            eprintln!(
+                "{p}/{mode}/{storage}: {n} statements by {} other sessions through {} \
+                 gateway(s), errors: {errs:?}",
+                2 * via.len(),
+                via.len()
+            );
+            assert!(
+                errs.iter().all(|(_, code)| *code != 1054),
+                "a session saw an adoption half done: {errs:?}"
+            );
             eprintln!(
                 "{p}/{mode}/{storage}: typed tree inherited a > b > c, c's own subtype, {} ms",
                 t0.elapsed().as_millis()

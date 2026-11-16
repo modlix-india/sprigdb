@@ -46,7 +46,7 @@ Each protocol has its own listener. MySQL (3306), MariaDB (3307) and HTTP (8080,
 | Documents | Read (JSON functions) | Read and write | No | No | No | No | MongoDB commands with `"language": "mongo"` |
 | Key-value | Read (key tables and views) | No | Read and write (Redis databases) | No | No | No | `KeyValue` API (namespaces) |
 | Vectors | `VECTOR` columns, `VEC_DISTANCE_*` | `$vectorSearch` | No | No | No | No | `Vectors` API |
-| Full-text search | `MATCH ... AGAINST`, `sprig_search()` | `$text`, `$search`, `$searchMeta` | No | No | No | No | `Search.Query` |
+| Full-text search | `MATCH ... AGAINST`, `sprig_search()` | `$text`, `$search`, `$searchMeta` | `FT.*` commands, on hashes | No | No | No | `Search.Query` |
 | Graphs | `CREATE GRAPH`, `GRAPH_TABLE` | No | No | Cypher | No | No | `"language": "cypher"` or `"gql"` |
 | Geospatial | Spatial types and functions | `2dsphere`, `$near`, `$geoWithin`, `$geoIntersects`, `$geoNear` | `GEO*` commands | No | No | No | `KeyValue.GeoSearch` |
 | Analytics | Analytic reads across shards | No | No | No | No | No | `Analytics` API |

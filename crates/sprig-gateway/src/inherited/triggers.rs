@@ -29,6 +29,7 @@ use sprig_auth::admin::NewUser;
 use sprig_auth::authz::privilege::{Action, ActionSet, PrivName, parse_privilege};
 use sprig_auth::authz::store::{AuthzStore, Grantee, PrivTarget};
 use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::{Namespace, ObjectKind};
 use sprig_catalog::version::VersionKind;
 use sprig_catalog::{CatalogLocator, ChangeOpts, TenantCatalog};
@@ -211,7 +212,7 @@ async fn ensure_for(
     for g in triggers {
         let key = g.key();
         let disabled = chain.disabled(key);
-        let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
         let row = match st.instances.get(&key) {
             Some(i) => Some((**i).clone()),
             None => mstore.instance(&mut conn, key).await?,
@@ -309,7 +310,7 @@ async fn ensure_for(
         drop(conn);
         let run_as = ensure_run_as(svc, t, &g, binding.is_none(), &extra).await?;
         let deployed = deploy(svc, t, &g, &text, src, run_as).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
         // A new stream trigger's position.
         if let Some(si) = src.stream {
             stream_positions(svc, &mut conn, &schema, &g, si, deployed.binding_id).await?;
@@ -372,7 +373,7 @@ async fn stream_positions(
                 let cluster = svc.locator.cluster(t).await?;
                 let pool = svc.locator.ctl_pool(&cluster).await?;
                 let mut c = pool
-                    .get_conn()
+                    .get_conn_bounded()
                     .await
                     .map_err(sprig_streams::maria::map_err)?;
                 let reader = sprig_streams::read::LogReader { schema: lschema };
@@ -465,7 +466,7 @@ async fn deploy(
         .cloned()
         .ok_or_else(|| SprigError::internal("an instance without its database"))?;
     let ep = svc.locator.writer(t).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
     // A member's own trigger of the name shadows the inherited one.
     let store = sprig_logic::LogicStore::new(ep.store.schema());
     let _ = sprig_catalog::Migrator::new(&[sprig_logic::catalog::LOGIC_MODULE])?
@@ -793,7 +794,7 @@ async fn mark_blocked(svc: &TenantServices, t: TenantId, binding: u64, why: Opti
     use mysql_async::prelude::Queryable;
     let r = async {
         let ep = svc.locator.writer(t).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
         // `?` is the reason; NULL removes it.
         let set = "IF(? IS NULL, JSON_REMOVE(physical, '$.blocked'), \
                    JSON_SET(physical, '$.blocked', ?))";

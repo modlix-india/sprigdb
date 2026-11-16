@@ -879,6 +879,34 @@ impl LogicStore {
         r.map(module_row).transpose()
     }
 
+    /// Sets a live module `active` or `disabled`; whether it was in the
+    /// other state (a dropped module is never changed).
+    ///
+    /// # Errors
+    /// 39070 or a backend error.
+    pub async fn set_module_state(
+        &self,
+        c: &mut Conn,
+        module_id: u64,
+        enabled: bool,
+    ) -> Result<bool> {
+        let (to, from) = if enabled {
+            ("active", "disabled")
+        } else {
+            ("disabled", "active")
+        };
+        c.exec_drop(
+            format!(
+                "UPDATE {} SET state = ? WHERE module_id = ? AND state = ?",
+                self.modules
+            ),
+            (to, module_id, from),
+        )
+        .await
+        .map_err(map_err)?;
+        Ok(c.affected_rows() > 0)
+    }
+
     /// A version's source text.
     ///
     /// # Errors

@@ -22,6 +22,19 @@
 //! _sprig_p_<slug>_s  VARCHAR(160) bin   strings, ObjectId hex, ISO dates, UUID text
 //! KEY sprig_dix_<id> (a_c, a_n, a_s, b_c DESC, b_n DESC, b_s DESC)
 //! ```
+//!
+//! A unique index that is `sparse` or has a `partialFilterExpression`
+//! covers only some documents. MariaDB's unique index then ends with a
+//! gate column that is `1` for the documents MongoDB's index holds and
+//! `NULL` for the others, so their keys never clash (MariaDB's unique
+//! indexes allow any number of rows with a `NULL` in the key). The index
+//! still holds every row, so queries use it as any other:
+//!
+//! ```text
+//! _sprig_g_<id>  TINYINT  IF(<filter as SQL>, 1, NULL)    partialFilterExpression
+//!                         IF(<some key path present>, 1, NULL)    sparse
+//! UNIQUE KEY sprig_dix_<id> (a_c, a_n, a_s, _sprig_g_<id>)
+//! ```
 
 use std::collections::BTreeSet;
 
@@ -73,7 +86,8 @@ pub struct IndexDef {
     pub key: Vec<(String, i32)>,
     /// `unique`.
     pub unique: bool,
-    /// `sparse` (recorded; MariaDB indexes every row).
+    /// `sparse`: a unique one is unique over the documents that have
+    /// one of its paths (see the module docs).
     pub sparse: bool,
     /// `expireAfterSeconds`: a TTL index (`engine::ttl`, `sprig_worker::doc_ttl`).
     pub expire_after: Option<i64>,
@@ -87,6 +101,14 @@ pub struct IndexDef {
     /// The automatic index (`auto_indexes.index_id`) behind an `auto` one.
     pub auto_index_id: Option<u64>,
 }
+
+/// The `extra` entry naming an index's `hashed` path (kept in the
+/// metadata, not shown in `listIndexes`): the MariaDB index is an ordinary
+/// one on that path, and the key pattern shows `"hashed"` there.
+pub const HASHED_PATH: &str = "__sprig_hashed";
+
+/// The `extra` entry of a partial index's filter.
+pub const PARTIAL_FILTER: &str = "partialFilterExpression";
 
 impl IndexDef {
     /// The MariaDB index name.
@@ -104,6 +126,54 @@ impl IndexDef {
         self.origin == "auto"
     }
 
+    /// Whether the index is unique over some documents only: unique, and
+    /// sparse or partial. Its MariaDB index ends with
+    /// [`gate_column`](Self::gate_column).
+    #[must_use]
+    pub fn gated(&self) -> bool {
+        self.unique && (self.sparse || self.extra.contains_key(PARTIAL_FILTER))
+    }
+
+    /// The gate column of a [`gated`](Self::gated) index.
+    #[must_use]
+    pub fn gate_column(&self) -> String {
+        format!("_sprig_g_{}", self.id)
+    }
+
+    /// The SQL condition true for the documents a [`gated`](Self::gated)
+    /// index holds: its partial filter, or (sparse) one of its paths
+    /// present. `None` for other indexes.
+    ///
+    /// # Errors
+    /// [`crate::policy::partial_to_sql`]'s, and 14 for a filter that isn't
+    /// a document.
+    pub fn gate_sql(&self) -> Result<Option<String>, MongoError> {
+        if !self.gated() {
+            return Ok(None);
+        }
+        if let Some(f) = self.extra.get(PARTIAL_FILTER) {
+            let Bson::Document(f) = f else {
+                return Err(MongoError::new(
+                    code::TYPE_MISMATCH,
+                    "partialFilterExpression must be an object",
+                ));
+            };
+            return crate::policy::partial_to_sql(f).map(Some);
+        }
+        let any: Vec<String> = self
+            .key
+            .iter()
+            .map(|(p, _)| {
+                let parts: Vec<&str> = p.split('.').collect();
+                format!(
+                    "JSON_EXTRACT(doc, {}) IS NOT NULL",
+                    str_lit(&json_path(&parts, &[]))
+                )
+            })
+            .collect();
+        Ok(Some(format!("({})", any.join(" OR "))))
+    }
+
     /// The key pattern as a document.
     #[must_use]
     pub fn key_doc(&self) -> Document {
@@ -111,9 +181,12 @@ impl IndexDef {
         // A `2dsphere` index keys its one path
         // by the type's name.
         let geo = crate::geo::is_2dsphere(self);
+        let hashed = self.extra.get_str(HASHED_PATH).ok();
         for (p, dir) in &self.key {
             if geo {
                 d.insert(p.clone(), "2dsphere");
+            } else if hashed == Some(p.as_str()) {
+                d.insert(p.clone(), "hashed");
             } else {
                 d.insert(p.clone(), *dir);
             }
@@ -140,7 +213,9 @@ impl IndexDef {
             };
         }
         for (k, v) in &self.extra {
-            d.insert(k.clone(), v.clone());
+            if k != HASHED_PATH {
+                d.insert(k.clone(), v.clone());
+            }
         }
         d
     }
@@ -480,7 +555,7 @@ pub fn add_columns_clause(path: &str) -> String {
 WHEN {jt} IN ('INTEGER','DOUBLE') AND ({ty} IS NULL OR {ty} IN ('long','decimal','double')) THEN CAST({val} AS DOUBLE) \
 WHEN {ty} IN ('double','decimal') AND {val} = 'Infinity' THEN 1.7976931348623157E308 \
 WHEN {ty} IN ('double','decimal') AND {val} = '-Infinity' THEN -1.7976931348623157E308 \
-WHEN {jt} = 'BOOLEAN' THEN IF({val} = 'true', 1, 0) \
+WHEN {jt} = 'BOOLEAN' THEN IF({val} IN ('true', '1'), 1, 0) \
 WHEN {ty} = 'date' AND {jt} = 'INTEGER' THEN CAST({val} AS DOUBLE) \
 END, 0)"
     );
@@ -499,9 +574,11 @@ ADD COLUMN IF NOT EXISTS {} VARCHAR({S_CHARS}) CHARACTER SET utf8mb4 COLLATE utf
     )
 }
 
-/// `CREATE INDEX` of `idx`.
+/// `CREATE INDEX` of `idx`; with `gate` ([`IndexDef::gate_sql`]), an
+/// `ALTER TABLE` adding the gate column and the unique index ending
+/// with it.
 #[must_use]
-pub fn create_index_sql(db: &str, table: &str, idx: &IndexDef) -> String {
+pub fn create_index_sql(db: &str, table: &str, idx: &IndexDef, gate: Option<&str>) -> String {
     let mut cols = Vec::new();
     for (p, dir) in &idx.key {
         let (c, n, s) = columns(p);
@@ -513,6 +590,17 @@ pub fn create_index_sql(db: &str, table: &str, idx: &IndexDef) -> String {
             ident(&s)
         ));
     }
+    if let Some(g) = gate {
+        let gc = ident(&idx.gate_column());
+        return format!(
+            "ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS {gc} TINYINT AS (IF({g}, 1, NULL)) VIRTUAL INVISIBLE, \
+ADD UNIQUE INDEX {} ({}, {gc})",
+            ident(db),
+            ident(table),
+            ident(&idx.mariadb_name()),
+            cols.join(", ")
+        );
+    }
     format!(
         "CREATE {}INDEX {} ON {}.{} ({})",
         if idx.unique { "UNIQUE " } else { "" },
@@ -523,9 +611,18 @@ pub fn create_index_sql(db: &str, table: &str, idx: &IndexDef) -> String {
     )
 }
 
-/// `DROP INDEX` of `idx`.
+/// `DROP INDEX` of `idx` (with its gate column, if it has one).
 #[must_use]
 pub fn drop_index_sql(db: &str, table: &str, idx: &IndexDef) -> String {
+    if idx.gated() {
+        return format!(
+            "ALTER TABLE {}.{} DROP INDEX {}, DROP COLUMN IF EXISTS {}",
+            ident(db),
+            ident(table),
+            ident(&idx.mariadb_name()),
+            ident(&idx.gate_column())
+        );
+    }
     format!(
         "DROP INDEX {} ON {}.{}",
         ident(&idx.mariadb_name()),
@@ -612,10 +709,55 @@ mod tests {
         assert!(!m.may_cross_array("item"));
         assert_eq!(m.array_parts("items.sku"), vec![true, false]);
         assert_eq!(default_index_name(&doc! {"a": 1, "b": -1}), "a_1_b_-1");
-        let sql = create_index_sql("d", "o", &m.indexes[0]);
+        let sql = create_index_sql("d", "o", &m.indexes[0], None);
         assert!(
             sql.starts_with("CREATE UNIQUE INDEX `sprig_dix_1` ON `d`.`o`"),
             "{sql}"
         );
+    }
+
+    #[test]
+    fn sparse_and_partial_unique_indexes_have_a_gate() {
+        let mut i = IndexDef {
+            id: 4,
+            name: "email_1".into(),
+            key: vec![("email".into(), 1), ("org.id".into(), -1)],
+            unique: true,
+            sparse: true,
+            expire_after: None,
+            origin: "user".into(),
+            extra: Document::new(),
+            mariadb: None,
+            auto_index_id: None,
+        };
+        let g = i.gate_sql().unwrap().unwrap();
+        assert_eq!(
+            g,
+            "(JSON_EXTRACT(doc, '$.\"email\"') IS NOT NULL OR JSON_EXTRACT(doc, '$.\"org\".\"id\"') IS NOT NULL)"
+        );
+        let sql = create_index_sql("d", "o", &i, Some(&g));
+        assert!(
+            sql.starts_with("ALTER TABLE `d`.`o` ADD COLUMN IF NOT EXISTS `_sprig_g_4` TINYINT AS (IF((JSON_EXTRACT"),
+            "{sql}"
+        );
+        assert!(sql.ends_with("`_sprig_g_4`)"), "{sql}");
+        assert!(
+            sql.contains("ADD UNIQUE INDEX `sprig_dix_4` (`_sprig_p_email"),
+            "{sql}"
+        );
+        assert_eq!(
+            drop_index_sql("d", "o", &i),
+            "ALTER TABLE `d`.`o` DROP INDEX `sprig_dix_4`, DROP COLUMN IF EXISTS `_sprig_g_4`"
+        );
+        i.sparse = false;
+        i.extra.insert(PARTIAL_FILTER, doc! {"kind": "Device"});
+        let g = i.gate_sql().unwrap().unwrap();
+        assert!(g.contains("CAST('Device' AS CHAR)"), "{g}");
+        i.extra.insert(PARTIAL_FILTER, doc! {"kind": {"$ne": "x"}});
+        assert_eq!(i.gate_sql().unwrap_err().code, 67);
+        // Not unique: no gate.
+        i.unique = false;
+        assert!(!i.gated() && i.gate_sql().unwrap().is_none());
+        assert!(drop_index_sql("d", "o", &i).starts_with("DROP INDEX"));
     }
 }

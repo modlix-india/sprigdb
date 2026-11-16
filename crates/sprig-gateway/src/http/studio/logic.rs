@@ -26,6 +26,7 @@
 //! `SPRIG_TENANT_ADMIN` (1044 otherwise): Studio shows the generated PL/SQL
 //! only to users with alter routine.
 
+use sprig_catalog::pool_wait::Bounded as _;
 use std::sync::Arc;
 
 use hyper::body::Incoming;
@@ -151,7 +152,7 @@ async fn store(
         .ok_or_else(|| SprigError::standard(1049, *b"42000", format!("Unknown database '{db}'")))?;
     let db_id = row.db_id.0;
     let ep = sprig_catalog::CatalogLocator::writer(&*svc.locator, tid).await?;
-    let conn = ep.pool.get_conn().await.map_err(|e| {
+    let conn = ep.pool.get_conn_bounded().await.map_err(|e| {
         SprigError::new(
             SprigCode::CatalogUnavailable,
             "the tenant's catalog is unreachable",

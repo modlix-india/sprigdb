@@ -174,6 +174,11 @@ pub struct FarRead<'a> {
     pub after: Option<u64>,
     /// With `limit`: in link id order (for a later `after`).
     pub ordered: bool,
+    /// With `join`: the far nodes are joined only where a statement's
+    /// near nodes have at most this many links; past it, that statement's
+    /// links come without them (the caller reads those by id), in the
+    /// same round trip. `None`: always joined.
+    pub join_max: Option<usize>,
 }
 
 /// [`GraphStore::scan_links`]'s answer: the scan's nodes, the links from
@@ -352,6 +357,32 @@ pub trait GraphStore: Send {
         })
     }
 
+    /// A walk read ahead: every outgoing link of `types` within `hops`
+    /// levels of `from`, in one statement where the store can. The links
+    /// of `from` are [`DeepLinks::first`], the deeper ones
+    /// [`DeepLinks::second`]; [`DeepLinks::complete`] names the nodes whose
+    /// outgoing links of `types` are all there (`from` among them); with
+    /// `keys`, [`DeepLinks::nodes`] has the far nodes with those
+    /// properties. `None`: the store can't, or the walk has more than
+    /// `limit` links or took too long (the caller reads it level by
+    /// level). With `next` (types, and keys of its far nodes), the
+    /// clause's next hop from every node the walk is at comes too, as
+    /// [`GraphStore::queue_next_hop`] would bring it.
+    ///
+    /// # Errors
+    /// The store's.
+    async fn walk_ahead(
+        &mut self,
+        _from: &[u64],
+        _types: &[u32],
+        _hops: u32,
+        _keys: Option<&[String]>,
+        _next: Option<(&[u32], Option<&[String]>)>,
+        _limit: usize,
+    ) -> Result<Option<DeepLinks>> {
+        Ok(None)
+    }
+
     /// A pattern's start scan and its first hop in one round trip: the
     /// nodes `s` finds, and the links of `types` from them in `dir` (with
     /// far nodes as `far` says). `None`: the store can't (the caller
@@ -374,6 +405,20 @@ pub trait GraphStore: Send {
     /// [`GraphStore::nodes_part`] for them from that. Read-only statements
     /// only.
     fn queue_nodes(&mut self, _ids: &[u64], _keys: &[String]) {}
+
+    /// A scan a later pattern of the clause will make: a store may send
+    /// it with its next read statement (in the same round trip) and answer
+    /// [`GraphStore::scan`] for the same conditions from that (with every
+    /// property). Read-only statements only.
+    fn queue_scan(&mut self, _s: &Scan) {}
+
+    /// The pattern's next hop, outgoing over `types` from the far nodes of
+    /// the hop about to be read, whose far nodes need `keys` (`None`:
+    /// all): a store may read it with that hop when it joins the far
+    /// nodes, and answer [`GraphStore::links_far`] for it from that (whole
+    /// links, with their far nodes and labels). Read-only statements only.
+    /// `None` takes back a request no hop used.
+    fn queue_next_hop(&mut self, _next: Option<(&[u32], Option<&[String]>)>) {}
 
     /// The statement will read incoming links: a store whose mirrors need
     /// a freshness check may start it now, alongside the first reads.

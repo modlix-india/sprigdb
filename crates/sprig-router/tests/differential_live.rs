@@ -255,6 +255,7 @@ fn email_lookup(owner: ObjectId) -> sprig_shard::lookup::LookupIndex {
         group: GroupId(LOOKUP_GROUP),
         state: LookupState::Public,
         auto_index_id: None,
+        rehashing: false,
     }
 }
 
@@ -735,6 +736,7 @@ async fn setup(e: &Env, sut: &mut Conn) -> World {
                     },
                     child_lookup: None,
                     state: sprig_shard::fk::FkState::Enforced,
+                    orphans: false,
                 },
             )
             .await
