@@ -200,7 +200,7 @@ pub enum RolloutOp {
 pub fn parse_op(rest: &[String]) -> Result<RolloutOp> {
     let usage = || {
         syntax(
-            "expected ALTER FUNCTION f ROLLOUT {TO n [PERCENT] [BY USER | TENANT] | PROMOTE | ABORT}",
+            "expected ROLLOUT {TO n [PERCENT] [BY USER | TENANT | KEY] | PROMOTE | ABORT}",
         )
     };
     match rest {

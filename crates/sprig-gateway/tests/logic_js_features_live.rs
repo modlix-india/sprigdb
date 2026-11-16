@@ -715,7 +715,10 @@ $$"
     must(
         &mut c,
         &format!(
-            "INSERT INTO {DB}.cevents (key, value) VALUES              ('c1', '{{"kind": "a", "items": [{{"qty": 2}}, {{"qty": 3}}]}}'),              ('c2', '{{"kind": 5}}'), ('c3', '{{"kind": "b", "items": [{{"qty": 1.5}}]}}'),              ('c4', '{{}}')"
+            "INSERT INTO {DB}.cevents (key, value) VALUES \
+             ('c1', '{{\"kind\": \"a\", \"items\": [{{\"qty\": 2}}, {{\"qty\": 3}}]}}'), \
+             ('c2', '{{\"kind\": 5}}'), ('c3', '{{\"kind\": \"b\", \"items\": [{{\"qty\": 1.5}}]}}'), \
+             ('c4', '{{}}')"
         ),
     )
     .await;

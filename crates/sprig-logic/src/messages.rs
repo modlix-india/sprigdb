@@ -703,6 +703,11 @@ pub struct Deployed {
     pub tier: String,
     /// Why the engine tier, when it is.
     pub reasons: Vec<String>,
+    /// A staged rollout: the active version, and the candidate's share
+    /// of keys.
+    pub staged: Option<(u64, u8)>,
+    /// `SPRIG_ROLLOUT` on a trigger's first version (active at once).
+    pub first_rollout: bool,
 }
 
 impl Deployed {
@@ -735,6 +740,19 @@ impl Deployed {
             )
         }];
         v.extend(self.reasons.iter().cloned());
+        if let Some((active, pct)) = self.staged {
+            v.push(format!(
+                "version {} is the candidate for the records whose key falls in {pct}% of keys \
+                 (a record without a key gets version {active}); version {active} answers the rest",
+                self.version
+            ));
+        } else if self.first_rollout {
+            v.push(
+                "SPRIG_ROLLOUT ignored: there is no other active version, so this one is active at \
+                 once"
+                    .to_owned(),
+            );
+        }
         v.push(what);
         v
     }
@@ -1006,9 +1024,45 @@ pub async fn deploy(d: &Declaration, t: MsgTarget<'_>) -> Result<Deployed> {
             },
         )
         .await?;
-    store
-        .activate(t.catalog, module.module_id, version, t.catalog_version)
-        .await?;
+    // `SPRIG_ROLLOUT = n`: the new version is the candidate for the
+    // records whose key falls in n% of keys (`crate::rollout`); the
+    // active version answers the rest. Any other deploy ends a rollout.
+    let staged = match (d.rollout, module.active_version) {
+        (Some(_), Some(_)) if moved => {
+            return Err(SprigError::new(
+                SprigCode::LogicRolloutBlocked,
+                format!(
+                    "{}: a staged rollout keeps the stream or queue; deploy without \
+                     SPRIG_ROLLOUT to switch at once",
+                    d.name
+                ),
+            ));
+        }
+        (Some(spec), Some(active)) if active != version => Some((active, spec)),
+        _ => None,
+    };
+    match staged {
+        Some((active, spec)) => {
+            crate::rollout::put(
+                t.catalog,
+                t.catalog_schema,
+                module.module_id,
+                active,
+                version,
+                crate::rollout::RolloutSpec {
+                    pct: spec.pct,
+                    by: crate::rollout::RolloutBy::Key(None),
+                },
+            )
+            .await?;
+        }
+        None => {
+            crate::rollout::clear(t.catalog, t.catalog_schema, module.module_id).await?;
+            store
+                .activate(t.catalog, module.module_id, version, t.catalog_version)
+                .await?;
+        }
+    }
     let row = SourceRow {
         binding_id: binding.binding_id,
         module_id: module.module_id,
@@ -1053,6 +1107,8 @@ pub async fn deploy(d: &Declaration, t: MsgTarget<'_>) -> Result<Deployed> {
         created: created || moved,
         tier: placed.tier.to_owned(),
         reasons: placed.reasons,
+        staged: staged.map(|(a, spec)| (a, spec.pct)),
+        first_rollout: d.rollout.is_some() && module.active_version.is_none(),
     })
 }
 
@@ -1193,6 +1249,113 @@ async fn place(
         })),
         reasons: Vec::new(),
     })
+}
+
+/// `ALTER TRIGGER t ROLLOUT TO n | PROMOTE | ABORT` of trigger `name`
+/// (module `module_id`, on a stream or queue): another stage, the
+/// candidate made active, or the rollout ended; `who` goes to the run
+/// log. A note for the client. Workers take a new active version within
+/// 5 s.
+///
+/// # Errors
+/// 39860 without a rollout; 39861 for `BY USER | TENANT`; catalog errors.
+pub async fn rollout_change(
+    c: &mut Conn,
+    schema: &str,
+    module_id: u64,
+    name: &str,
+    op: crate::rollout::RolloutOp,
+    catalog_version: u64,
+    who: &str,
+) -> Result<String> {
+    use crate::rollout::{RolloutBy, RolloutOp, RolloutSpec};
+    let Some(r) = crate::rollout::get(c, schema, module_id).await? else {
+        return Err(SprigError::new(
+            SprigCode::LogicNotFound,
+            format!("{name} has no rollout: deploy a candidate WITH (SPRIG_ROLLOUT = n)"),
+        ));
+    };
+    let store = LogicStore::new(schema);
+    let (note, version) = match op {
+        RolloutOp::To(pct, by) => {
+            if !matches!(by, None | Some(RolloutBy::Key(None))) {
+                return Err(SprigError::new(
+                    SprigCode::LogicSyntax,
+                    "a trigger on a stream or queue rolls out by key: ROLLOUT TO n [BY KEY]",
+                ));
+            }
+            crate::rollout::put(
+                c,
+                schema,
+                module_id,
+                r.active_version,
+                r.candidate_version,
+                RolloutSpec {
+                    pct,
+                    by: RolloutBy::Key(None),
+                },
+            )
+            .await?;
+            (
+                format!(
+                    "{name}: version {} is the candidate for {pct}% of keys",
+                    r.candidate_version
+                ),
+                r.candidate_version,
+            )
+        }
+        RolloutOp::Promote => {
+            store
+                .activate(c, module_id, r.candidate_version, catalog_version)
+                .await?;
+            crate::rollout::clear(c, schema, module_id).await?;
+            (
+                format!(
+                    "{name}: version {} is active for every record (workers take it within 5 s)",
+                    r.candidate_version
+                ),
+                r.candidate_version,
+            )
+        }
+        RolloutOp::Abort => {
+            crate::rollout::clear(c, schema, module_id).await?;
+            (
+                format!(
+                    "{name}: rollout of version {} ended; version {} runs every record",
+                    r.candidate_version, r.active_version
+                ),
+                r.active_version,
+            )
+        }
+    };
+    let _ = store
+        .log(
+            c,
+            module_id,
+            Some(version),
+            "info",
+            "rollout",
+            &format!("{note} (by {who})"),
+        )
+        .await;
+    Ok(note)
+}
+
+/// The key a run of a trigger in a rollout is picked by: a stream
+/// record's key as `ctx.record.key` has it (UTF-8 text, or base64); a
+/// queue message's `message-id` property, or else its own id. `None`: no
+/// key (the active version runs it).
+#[must_use]
+pub fn rollout_key(event: &Value, message_id: Option<&str>) -> Option<String> {
+    if let Some(k) = event.get("key") {
+        return k.as_str().map(str::to_owned);
+    }
+    event
+        .pointer("/properties/messageId")
+        .or_else(|| event.pointer("/properties/message_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| message_id.map(str::to_owned))
 }
 
 // ---- runs: the worker asks a gateway --------------------------------------

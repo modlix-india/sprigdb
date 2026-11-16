@@ -146,17 +146,38 @@ pub struct AlterTrigger {
     pub name: String,
     /// `ENABLE` (or `DISABLE`).
     pub enable: bool,
+    /// `ROLLOUT TO n | PROMOTE | ABORT` instead ([`crate::rollout`]), or
+    /// why its words don't parse.
+    pub rollout: Option<std::result::Result<crate::rollout::RolloutOp, String>>,
 }
 
-/// Parses `ALTER TRIGGER [db.]name DISABLE | ENABLE`; `None` for any
+/// Parses `ALTER TRIGGER [db.]name DISABLE | ENABLE` and `ALTER TRIGGER
+/// [db.]name ROLLOUT ...` (a trigger on a stream or queue); `None` for any
 /// other statement (MySQL has no `ALTER TRIGGER`, so the server's syntax
 /// error answers the rest).
 #[must_use]
 pub fn parse_alter_trigger(sql: &str) -> Option<AlterTrigger> {
     let head: String = sql.chars().take(512).collect();
     let w = words(&head);
-    if w.len() != 4 || !w[0].eq_ignore_ascii_case("alter") || !w[1].eq_ignore_ascii_case("trigger")
+    if w.len() < 4 || !w[0].eq_ignore_ascii_case("alter") || !w[1].eq_ignore_ascii_case("trigger")
     {
+        return None;
+    }
+    let (db, name) = match w[2].rsplit_once('.') {
+        Some((d, n)) if !d.is_empty() && !n.is_empty() => (Some(d.to_owned()), n.to_owned()),
+        _ => (None, w[2].clone()),
+    };
+    if w[3].eq_ignore_ascii_case("rollout") {
+        let rest: Vec<String> = w[4..].iter().map(|x| x.to_ascii_lowercase()).collect();
+        let op = crate::rollout::parse_op(&rest).map_err(|e| e.message);
+        return Some(AlterTrigger {
+            db,
+            name,
+            enable: true,
+            rollout: Some(op),
+        });
+    }
+    if w.len() != 4 {
         return None;
     }
     let enable = match w[3].to_ascii_lowercase().as_str() {
@@ -164,11 +185,12 @@ pub fn parse_alter_trigger(sql: &str) -> Option<AlterTrigger> {
         "disable" => false,
         _ => return None,
     };
-    let (db, name) = match w[2].rsplit_once('.') {
-        Some((d, n)) if !d.is_empty() && !n.is_empty() => (Some(d.to_owned()), n.to_owned()),
-        _ => (None, w[2].clone()),
-    };
-    Some(AlterTrigger { db, name, enable })
+    Some(AlterTrigger {
+        db,
+        name,
+        enable,
+        rollout: None,
+    })
 }
 
 /// `SHOW DEPENDENTS OF {FUNCTION | PROCEDURE} [db.]name`: what
@@ -586,6 +608,7 @@ mod tests {
                 db: Some("shop".into()),
                 name: "sync_users".into(),
                 enable: false,
+                rollout: None,
             })
         );
         assert_eq!(
@@ -594,8 +617,21 @@ mod tests {
                 db: None,
                 name: "bill".into(),
                 enable: true,
+                rollout: None,
             })
         );
+        assert_eq!(
+            parse_alter_trigger("ALTER TRIGGER shop.sync ROLLOUT TO 30 PERCENT").and_then(|a| a.rollout),
+            Some(Ok(crate::rollout::RolloutOp::To(30, None)))
+        );
+        assert_eq!(
+            parse_alter_trigger("ALTER TRIGGER sync ROLLOUT PROMOTE").and_then(|a| a.rollout),
+            Some(Ok(crate::rollout::RolloutOp::Promote))
+        );
+        assert!(matches!(
+            parse_alter_trigger("ALTER TRIGGER sync ROLLOUT SIDEWAYS").and_then(|a| a.rollout),
+            Some(Err(_))
+        ));
         assert_eq!(parse_alter_trigger("ALTER TRIGGER g"), None);
         assert_eq!(parse_alter_trigger("ALTER TRIGGER g RENAME TO h"), None);
         assert_eq!(

@@ -88,6 +88,25 @@ impl sprig_logic::engine::bridge::DbBridge for LoggedDb {
 /// The marked statement's start.
 pub(crate) const MARK: &str = "/* sprig message trigger ";
 
+/// How long a trigger's rollout is cached.
+const ROLLOUT_TTL: Duration = Duration::from_secs(5);
+
+type RolloutCache =
+    std::collections::HashMap<(u64, u64), (std::time::Instant, Option<sprig_logic::rollout::Rollout>)>;
+
+/// Triggers' rollouts by tenant and module (`None`: none), read at most
+/// every [`ROLLOUT_TTL`].
+static ROLLOUTS: std::sync::LazyLock<std::sync::Mutex<RolloutCache>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Forgets a trigger's cached rollout (after `ALTER TRIGGER ... ROLLOUT`
+/// through this gateway).
+pub(super) fn forget_rollout(tenant: u64, module: u64) {
+    if let Ok(mut m) = ROLLOUTS.lock() {
+        m.remove(&(tenant, module));
+    }
+}
+
 /// This process's nonce: only statements carrying it are runs.
 #[must_use]
 pub(crate) fn nonce() -> &'static str {
@@ -792,6 +811,71 @@ impl PassSession {
         Ok(())
     }
 
+    /// The trigger's rollout, if it has one (cached).
+    async fn trigger_rollout(&mut self, module: u64) -> Option<sprig_logic::rollout::Rollout> {
+        let ts = self.tenant.as_deref()?;
+        let tenant = ts.tenant.0;
+        if let Ok(m) = ROLLOUTS.lock()
+            && let Some((at, r)) = m.get(&(tenant, module))
+            && at.elapsed() < ROLLOUT_TTL
+        {
+            return r.clone();
+        }
+        let svc = Arc::clone(ts.services());
+        let ep = svc.locator.writer(ts.tenant).await.ok()?;
+        let mut conn = ep.pool.get_conn_bounded().await.ok()?;
+        let r = sprig_logic::rollout::get(&mut conn, ep.store.schema(), module)
+            .await
+            .ok()?;
+        if let Ok(mut m) = ROLLOUTS.lock() {
+            m.insert((tenant, module), (std::time::Instant::now(), r.clone()));
+        }
+        r
+    }
+
+    /// The version a run of `event` takes: the worker's (the active one),
+    /// or, in a rollout, the candidate when the event's key falls in its
+    /// share ([`sprig_logic::rollout::key_picks_candidate`]). With the
+    /// module when it is in a rollout, so the run is counted.
+    async fn pick_version(
+        &mut self,
+        req: &RunRequest,
+        event: &Value,
+        message_id: Option<&str>,
+    ) -> (RunRequest, Option<u64>) {
+        let module = req.source.module_id;
+        let Some(r) = self.trigger_rollout(module).await else {
+            return (req.clone(), None);
+        };
+        if r.active_version != req.version {
+            return (req.clone(), None);
+        }
+        let key = messages::rollout_key(event, message_id);
+        let mut picked = req.clone();
+        if sprig_logic::rollout::key_picks_candidate(r.spec(), key.as_deref(), module) {
+            picked.version = r.candidate_version;
+        }
+        (picked, Some(module))
+    }
+
+    /// Counts a run of a trigger in a rollout (the automatic rollback
+    /// reads the numbers).
+    async fn count_run(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        counted: Option<u64>,
+        req: &RunRequest,
+        started: std::time::Instant,
+        reply: &RunReply,
+    ) {
+        if let Some(module) = counted {
+            let failed = matches!(reply.outcome, RunOutcome::Failed | RunOutcome::Dead)
+                && !reply.transient;
+            self.rollout_count(cx, module, req.version, started.elapsed(), failed)
+                .await;
+        }
+    }
+
     /// A compiled trigger version, in this session's transaction: its
     /// entry procedure with the event's fields, after a savepoint, under
     /// `logic.trigger_budget_ms`. `Ok(false)` when the code handed the
@@ -991,7 +1075,10 @@ impl PassSession {
                 }
             };
         }
-        let (ran, logs) = self.run_version(cx, req, "record", event).await;
+        // In a rollout, the record's key picks the version.
+        let (picked, counted) = self.pick_version(req, &event, None).await;
+        let started = std::time::Instant::now();
+        let (ran, logs) = self.run_version(cx, &picked, "record", event).await;
         let reply = match ran {
             Ok(()) => match self.trigger_stmt(cx, "COMMIT").await {
                 Ok(()) => RunReply::of(RunOutcome::Ok),
@@ -1005,7 +1092,9 @@ impl PassSession {
                 RunReply::failed(&e)
             }
         };
-        RunReply { logs, ..reply }
+        let reply = RunReply { logs, ..reply };
+        self.count_run(cx, counted, &picked, started, &reply).await;
+        reply
     }
 
     /// The next message of a queue (see the module docs).
@@ -1131,8 +1220,25 @@ impl PassSession {
                     v.release(&t, false);
                     return with_id(RunReply::of(RunOutcome::Moved));
                 }
-                let (ran, logs) = self.run_version(cx, req, "message", event.clone()).await;
+                // In a rollout, the message's key picks the version.
+                let (picked, counted) =
+                    self.pick_version(req, &event, Some(&message_id)).await;
+                let started = std::time::Instant::now();
+                let (ran, logs) = self
+                    .run_version(cx, &picked, "message", event.clone())
+                    .await;
                 code_logs.clone_from(&logs);
+                let ok = RunReply::of(RunOutcome::Ok);
+                let failed = RunReply::of(RunOutcome::Failed);
+                let counted_ok = ran.is_ok();
+                self.count_run(
+                    cx,
+                    counted,
+                    &picked,
+                    started,
+                    if counted_ok { &ok } else { &failed },
+                )
+                .await;
                 match ran.map(|()| logs) {
                     Ok(logs) => match self.trigger_stmt(cx, "COMMIT").await {
                         Ok(()) => {

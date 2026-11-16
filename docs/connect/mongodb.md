@@ -250,7 +250,7 @@ Multi-document transactions work through the drivers' session API, across collec
 
 ### Change streams
 
-`watch()` on a collection, a database or the whole deployment works, with `fullDocument`, `fullDocumentBeforeChange`, `resumeAfter`, `startAfter` and `showExpandedEvents`. `startAtOperationTime` isn't supported (39662). A stream needs `find` and `changeStream` on what it watches: in SprigDB's terms `SELECT` and `WATCH`. The built-in `read` and `readWrite` roles include both; see [Grants and roles](../security/grants-and-roles.md#change-streams-need-watch). See [Documents](../data-models/documents.md#change-streams).
+`watch()` on a collection, a database or the whole deployment works, with `fullDocument`, `fullDocumentBeforeChange`, `resumeAfter`, `startAfter` and `showExpandedEvents`. `startAtOperationTime` isn't supported (39662). A stream at a gateway outside the tenant's home data centre is relayed from there, with the same events and resume tokens (see [Change feed](../concepts/change-feed.md#from-another-data-centre)). A stream needs `find` and `changeStream` on what it watches: in SprigDB's terms `SELECT` and `WATCH`. The built-in `read` and `readWrite` roles include both; see [Grants and roles](../security/grants-and-roles.md#change-streams-need-watch). See [Documents](../data-models/documents.md#change-streams).
 
 ## Not supported
 

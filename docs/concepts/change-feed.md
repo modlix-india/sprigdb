@@ -151,7 +151,7 @@ The same stream is the `Changes.Watch` server-streaming call of the `sprig.v1` A
 
 ### From another data centre
 
-A change stream opened at a gateway outside the tenant's home data centre (over HTTP or gRPC) is relayed from a gateway in the home data centre, where the tenant's feed is read; the client sees the same events and tokens. If the client reads too slowly, the stream ends with 39790 as usual. If the home data centre's gateway goes away, the stream ends with 39788 `ER_SPRIG_FORWARD_FAILED` (retryable): reconnect and resume from the last token. Relayed streams are counted in `sprig_api_change_streams_forwarded_total`.
+A change stream opened at a gateway outside the tenant's home data centre (over HTTP, gRPC or MongoDB) is relayed from a gateway in the home data centre, where the tenant's feed is read; the client sees the same events and tokens. If the client reads too slowly, the stream ends with 39790 as usual. If the home data centre's gateway goes away, the stream ends with 39788 `ER_SPRIG_FORWARD_FAILED` (retryable): reconnect and resume from the last token. Relayed streams are counted in `sprig_api_change_streams_forwarded_total`, and MongoDB's in `sprig_mongo_change_streams_relayed_total`. A relayed MongoDB stream applies the session's privileges and row-level security at the gateway the client is connected to.
 
 ### Limits
 

@@ -14,7 +14,7 @@
 //! the catalog: dropped, versions retired, rollout ended, index entries
 //! ```
 //!
-//! `ALTER TRIGGER [db.]name DISABLE | ENABLE` of a trigger on a stream or
+//! `ALTER TRIGGER [db.]name DISABLE | ENABLE | ROLLOUT ...` of a trigger on a stream or
 //! a queue (the rights `DROP TRIGGER` needs):
 //!
 //! ```text
@@ -411,6 +411,24 @@ impl PassSession {
             return Err(not_found());
         }
         let (b, src) = message_source(&mut conn, &store, &schema, &catalog, a, m.module_id).await?;
+        // `ROLLOUT TO n | PROMOTE | ABORT`: the trigger's rollout by key.
+        if let Some(op) = &a.rollout {
+            let op = op
+                .clone()
+                .map_err(|msg| SprigError::new(SprigCode::LogicSyntax, msg))?;
+            let note = sprig_logic::messages::rollout_change(
+                &mut conn,
+                &schema,
+                m.module_id,
+                &a.name,
+                op,
+                catalog.version,
+                &who,
+            )
+            .await?;
+            super::msg_trigger::forget_rollout(tenant.0, m.module_id);
+            return Ok(vec![note]);
+        }
         let changed = store
             .set_module_state(&mut conn, m.module_id, a.enable)
             .await?;

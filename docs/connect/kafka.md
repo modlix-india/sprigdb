@@ -38,6 +38,8 @@ Kafka settings:
 | `kafka.group_session_timeout_max_ms` | int | `300000` | Largest session timeout a group member may ask for |
 | `stream.produce_wait_ms` | int | `2000` | How long a produce waits for its records' offsets |
 
+A fetch or produce at a gateway outside the tenant's home data centre reads and writes the log there. A waiting fetch wakes as soon as the home data centre has new records; when the data centres have separate etcd tiers, it checks every 250 ms instead.
+
 ### Brokers and addresses
 
 Clients see every ready gateway in the data centre that runs the Kafka listener as a broker. Each gateway's broker id is a small integer that is unique among the data centre's live gateways. Each partition's leader is one of those gateways, chosen by hashing, but any gateway can serve any request.
