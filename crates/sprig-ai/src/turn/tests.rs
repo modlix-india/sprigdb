@@ -169,7 +169,8 @@ async fn a_turn_reads_as_the_caller_proposes_and_answers() {
     assert!(matches!(
         ev.last(),
         Some(TurnEvent::End {
-            stop: Stop::EndTurn
+            stop: Stop::EndTurn,
+            ..
         })
     ));
     assert!(matches!(&ev[ev.len() - 2], TurnEvent::Sources(s) if s.len() == 1));
@@ -213,6 +214,15 @@ async fn a_turn_reads_as_the_caller_proposes_and_answers() {
         .unwrap();
     assert!(note.sent_hash.is_some());
     assert!(note.body["payload"].is_string());
+    // The end names the stored answer: the turn's last assistant message.
+    let answer = stored
+        .iter()
+        .rfind(|m| m.kind == MsgKind::Assistant)
+        .unwrap();
+    assert!(matches!(
+        ev.last(),
+        Some(TurnEvent::End { message: Some(id), .. }) if *id == answer.id
+    ));
     let used = audit.usage_today(UserId(9)).await.unwrap();
     assert_eq!(used.user, 240);
 }

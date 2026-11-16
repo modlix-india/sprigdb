@@ -1,6 +1,6 @@
 // How a spec is drawn: which Recharts chart and series (or which of
-// Studio's own drawings: tables, heatmaps, KPIs), worked out without
-// React so the mapping can be tested.
+// Studio's own drawings: tables, heatmaps, KPIs, point maps), worked out
+// without React so the mapping can be tested.
 
 import type { ColumnInfo, Spec } from './spec';
 import {
@@ -25,6 +25,7 @@ import {
   type Rec,
   type SeriesData,
 } from './data';
+import { pointMap, type PointMap } from './map';
 
 /** One drawn series: a Recharts component with its props. */
 export interface DrawnSeries {
@@ -64,6 +65,7 @@ export type Plan =
   | { kind: 'bullet'; data: { name: string; value: number; target: number | null }[]; measure: string }
   | { kind: 'matrix'; numbers: boolean; m: Matrix }
   | { kind: 'pivot'; p: Pivot }
+  | PointMap
   | { kind: 'table'; heads: string[]; rows: Rec[] }
   | { kind: 'unavailable'; why: string }
   | { kind: 'empty'; why: string };
@@ -215,8 +217,17 @@ export function plan(s: Spec, columns: ColumnInfo[], rows: unknown[][]): Plan {
     case 'pivot':
       return { kind: 'pivot', p: pivot(s, columns, rows) };
     case 'map-point':
+      return (
+        pointMap(s, columns, rows) ?? {
+          kind: 'empty',
+          why: 'A point map needs a latitude and a longitude field (named lat or latitude, and lon, lng, long or longitude). Place names alone need region shapes, which Studio doesn’t have yet.',
+        }
+      );
     case 'map-filled':
-      return { kind: 'unavailable', why: 'Maps are not drawn in Studio yet. Show Me suggests another chart; the tile keeps its spec.' };
+      return {
+        kind: 'unavailable',
+        why: 'A filled map needs region shapes (the outlines of countries or states), which Studio doesn’t have yet. Use a point map with latitude and longitude, or another chart; the tile keeps its spec.',
+      };
     case 'text-table':
     default: {
       if (!dims.length && !measures.length) {
@@ -245,6 +256,8 @@ export function describePlan(p: Plan, title: string): string {
       return `${title}: ${p.label} is ${fmt(p.value)}`;
     case 'pie':
       return `${title}: ${p.donut ? 'donut' : 'pie'} of ${p.data.length} slices`;
+    case 'map':
+      return `${title}: point map of ${p.points.length} places${p.size ? `, sized by ${p.size.label}` : ''}${p.colour ? `, coloured by ${p.colour.label}` : ''}`;
     case 'empty':
     case 'unavailable':
       return `${title}: ${p.why}`;

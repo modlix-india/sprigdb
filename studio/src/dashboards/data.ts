@@ -146,17 +146,23 @@ export function fieldsOf(s: Spec): { dims: Field[]; measures: Field[] } {
   return { dims, measures };
 }
 
-/**
- * Filtered, then grouped by every dimension with each measure aggregated
- * (row level when a measure's aggregation is `none`). Keys are labelOf().
- */
-export function grouped(s: Spec, columns: ColumnInfo[], rows: unknown[][]): Rec[] {
+/** The rows as records, with the spec's filters applied, and a field getter. */
+function filtered(s: Spec, columns: ColumnInfo[], rows: unknown[][]): { recs: Rec[]; get: (rec: Rec, field: string) => Cell } {
   const get = getter(columns);
   let recs = records(columns, rows);
   for (const f of s.filters) {
     const allowed = new Set(f.in.map(String));
     recs = recs.filter((r) => allowed.has(String(get(r, f.field))));
   }
+  return { recs, get };
+}
+
+/**
+ * Filtered, then grouped by every dimension with each measure aggregated
+ * (row level when a measure's aggregation is `none`). Keys are labelOf().
+ */
+export function grouped(s: Spec, columns: ColumnInfo[], rows: unknown[][]): Rec[] {
+  const { recs, get } = filtered(s, columns, rows);
   const { dims, measures } = fieldsOf(s);
   const rowLevel = measures.some((m) => m.agg === 'none');
   if (rowLevel) {
@@ -461,51 +467,74 @@ export interface Pivot {
  * A pivot table: dimensions on rows down the side, dimensions on columns
  * across, every measure in each column group; subtotals for each value of
  * the first row dimension (when there are two or more), and a grand total.
+ *
+ * Every cell, subtotal and total is aggregated from the underlying rows of
+ * its group, so an average, minimum, maximum, median or distinct count is
+ * right at every level (a subtotal of averages is the average of the
+ * group's rows, not the sum of the averages shown). A row-level measure
+ * (`none`) adds up.
  */
 export function pivot(s: Spec, columns: ColumnInfo[], rows: unknown[][]): Pivot {
   const rowDims = s.rows.filter((f) => !isMeasure(f));
   const colDims = s.columns.filter((f) => !isMeasure(f));
   const { measures } = fieldsOf(s);
-  const recs = grouped(s, columns, rows);
-  const rk = (r: Rec) => rowDims.map((d) => String(r[labelOf(d)] ?? 'NULL'));
-  const ck = (r: Rec) => colDims.map((d) => String(r[labelOf(d)] ?? 'NULL')).join(' · ');
+  const { recs, get } = filtered(s, columns, rows);
+  const keysOf = (r: Rec, ds: Field[]) => ds.map((d) => String(datePart(get(r, d.field), d.datePart) ?? 'NULL'));
+  // A group's raw values: by column key, then by measure.
+  type Bucket = { keys: string[]; cells: Map<string, unknown[][]> };
+  const bucket = (keys: string[]): Bucket => ({ keys, cells: new Map() });
+  const put = (b: Bucket, ck: string, r: Rec) => {
+    let cell = b.cells.get(ck);
+    if (!cell) {
+      cell = measures.map(() => []);
+      b.cells.set(ck, cell);
+    }
+    measures.forEach((m, mi) => cell[mi]!.push(get(r, m.field)));
+  };
   const colKeys: string[] = [];
-  for (const r of recs) if (!colKeys.includes(ck(r))) colKeys.push(ck(r));
+  const leaves = new Map<string, Bucket>();
+  const firsts = new Map<string, Bucket>();
+  const total = bucket([]);
+  for (const r of recs) {
+    const rk = keysOf(r, rowDims);
+    const ck = keysOf(r, colDims).join(' · ');
+    if (!colKeys.includes(ck)) colKeys.push(ck);
+    const k = JSON.stringify(rk);
+    let leaf = leaves.get(k);
+    if (!leaf) {
+      leaf = bucket(rk);
+      leaves.set(k, leaf);
+    }
+    put(leaf, ck, r);
+    if (rowDims.length >= 2) {
+      let first = firsts.get(rk[0]!);
+      if (!first) {
+        first = bucket([rk[0]!]);
+        firsts.set(rk[0]!, first);
+      }
+      put(first, ck, r);
+    }
+    put(total, ck, r);
+  }
   if (colDims.some((d) => d.datePart)) colKeys.sort();
   const heads = colKeys.flatMap((c) => measures.map((m) => (c ? `${c} · ${labelOf(m)}` : labelOf(m))));
-  const cellIndex = (c: string, mi: number) => colKeys.indexOf(c) * measures.length + mi;
-  const byRow = new Map<string, { keys: string[]; values: (number | null)[] }>();
-  for (const r of recs) {
-    const keys = rk(r);
-    const k = JSON.stringify(keys);
-    let row = byRow.get(k);
-    if (!row) {
-      row = { keys, values: heads.map(() => null) };
-      byRow.set(k, row);
-    }
-    measures.forEach((m, mi) => {
-      const v = num(r[labelOf(m)]);
-      if (v === null) return;
-      const i = cellIndex(ck(r), mi);
-      row.values[i] = (row.values[i] ?? 0) + v;
-    });
-  }
-  const body = [...byRow.values()];
+  const values = (b: Bucket): (number | null)[] =>
+    colKeys.flatMap((c) =>
+      measures.map((m, mi) => {
+        const vals = b.cells.get(c)?.[mi];
+        return vals ? aggregate(vals, m.agg === 'none' ? 'sum' : m.agg) : null;
+      }),
+    );
+  const body = [...leaves.values()];
   if (rowDims.length) body.sort((a, b) => a.keys.join('\u0000').localeCompare(b.keys.join('\u0000'), undefined, { numeric: true }));
-  // Subtotals and totals add; for averages, minimums and the like they are
-  // the sum of what is shown, as a spreadsheet's would be.
-  const add = (rs: { values: (number | null)[] }[]) =>
-    heads.map((_, i) => {
-      const xs = rs.map((r) => r.values[i]).filter((v): v is number => v !== null && v !== undefined);
-      return xs.length ? xs.reduce((a, b) => a + b, 0) : null;
-    });
   const out: PivotRow[] = [];
   if (rowDims.length >= 2) {
-    let group: typeof body = [];
+    let group: Bucket[] = [];
     const flush = () => {
       if (!group.length) return;
-      out.push(...group.map((r) => ({ ...r, kind: 'row' as const })));
-      out.push({ keys: [group[0]!.keys[0]!, ...rowDims.slice(1).map(() => '')], values: add(group), kind: 'subtotal' });
+      out.push(...group.map((r) => ({ keys: r.keys, values: values(r), kind: 'row' as const })));
+      const first = group[0]!.keys[0]!;
+      out.push({ keys: [first, ...rowDims.slice(1).map(() => '')], values: values(firsts.get(first)!), kind: 'subtotal' });
       group = [];
     };
     for (const r of body) {
@@ -514,9 +543,9 @@ export function pivot(s: Spec, columns: ColumnInfo[], rows: unknown[][]): Pivot 
     }
     flush();
   } else {
-    out.push(...body.map((r) => ({ ...r, kind: 'row' as const })));
+    out.push(...body.map((r) => ({ keys: r.keys, values: values(r), kind: 'row' as const })));
   }
-  if (body.length > 1) out.push({ keys: rowDims.map((_, i) => (i === 0 ? 'Total' : '')), values: add(body), kind: 'total' });
+  if (body.length > 1) out.push({ keys: rowDims.map((_, i) => (i === 0 ? 'Total' : '')), values: values(total), kind: 'total' });
   return { rowDims: rowDims.map(labelOf), heads, rows: out };
 }
 

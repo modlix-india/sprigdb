@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { plan, type Plan } from './plan';
+import { describePlan, plan, type Plan } from './plan';
+import { bounds, radius, tileTemplate } from './map';
 import { normalize, type ChartSpec } from './spec';
 import { datePart, fmt } from './data';
 
@@ -142,6 +143,56 @@ describe('spec to Recharts', () => {
     ]);
   });
 
+  describe('pivot subtotals and totals', () => {
+    const pv = (agg: 'avg' | 'min' | 'max' | 'median' | 'countd' | 'count', field = 'revenue', columns: ChartSpec['columns'] = []) => {
+      const x = p({ mark: 'pivot', rows: [{ field: 'region' }, { field: 'status' }], columns: [...(columns ?? []), { field, agg }] });
+      if (x.kind !== 'pivot') throw new Error(x.kind);
+      return x.p;
+    };
+    const at = (pt: ReturnType<typeof pv>, kind: string, key: string, col = 0) => pt.rows.find((r) => r.kind === kind && r.keys[0] === key)!.values[col];
+
+    it('average the group’s rows, not the averages shown, for groups of unequal size', () => {
+      const a = pv('avg');
+      // North: paid 100 and 120 (avg 110), refunded 10: three rows, 230 / 3.
+      expect(a.rows.find((r) => r.keys.join('/') === 'North/paid')!.values[0]).toBe(110);
+      expect(at(a, 'subtotal', 'North')).toBeCloseTo(230 / 3);
+      expect(at(a, 'subtotal', 'South')).toBe(60);
+      expect(at(a, 'subtotal', 'West')).toBe(30);
+      // Six rows, 380 / 6 (not 110 + 10 + 50 + 70 + 30).
+      expect(at(a, 'total', 'Total')).toBeCloseTo(380 / 6);
+    });
+
+    it('take the minimum and maximum of the group', () => {
+      expect(at(pv('min'), 'subtotal', 'North')).toBe(10);
+      expect(at(pv('min'), 'total', 'Total')).toBe(10);
+      expect(at(pv('max'), 'subtotal', 'North')).toBe(120);
+      expect(at(pv('max'), 'subtotal', 'South')).toBe(70);
+      expect(at(pv('max'), 'total', 'Total')).toBe(120);
+    });
+
+    it('recompute medians and distinct counts; counts still add', () => {
+      // 10, 30, 50, 70, 100, 120.
+      expect(at(pv('median'), 'total', 'Total')).toBe(60);
+      expect(at(pv('median'), 'subtotal', 'North')).toBe(100);
+      // paid, refunded, shipped: three, not 1 + 1 + 1 + 1 + 1.
+      expect(at(pv('countd', 'status'), 'total', 'Total')).toBe(3);
+      expect(at(pv('countd', 'status'), 'subtotal', 'North')).toBe(2);
+      expect(at(pv('count'), 'subtotal', 'North')).toBe(3);
+      expect(at(pv('count'), 'total', 'Total')).toBe(6);
+    });
+
+    it('recompute per column group too', () => {
+      const a = pv('avg', 'revenue', [{ field: 'week' }]);
+      expect(a.heads).toEqual(['2026-07-06 · AVG(revenue)', '2026-07-13 · AVG(revenue)', '2026-07-14 · AVG(revenue)']);
+      // Week of 6 July: North 100 and 10, South 50.
+      expect(at(a, 'subtotal', 'North', 0)).toBe(55);
+      expect(at(a, 'total', 'Total', 0)).toBeCloseTo(160 / 3);
+      // No South rows in the week of 13 July: no value, not zero.
+      expect(at(a, 'subtotal', 'South', 1)).toBeNull();
+      expect(at(a, 'total', 'Total', 1)).toBe(75);
+    });
+  });
+
   it('steps a waterfall and lays out Gantt bars', () => {
     const w = p({ mark: 'waterfall', columns: [{ field: 'region' }], rows: [{ field: 'revenue', agg: 'sum' }] });
     if (w.kind !== 'waterfall') throw new Error(w.kind);
@@ -171,13 +222,70 @@ describe('spec to Recharts', () => {
     expect(bu.kind === 'bullet' && bu.data[0]).toEqual({ name: 'SUM(revenue)', value: 380, target: 10 });
   });
 
-  it('keeps maps as specs it can’t draw yet, filters rows, and says when nothing came back', () => {
-    expect(p({ mark: 'map-point', columns: ['country'] }).kind).toBe('unavailable');
+  it('keeps filled maps as specs it can’t draw yet, filters rows, and says when nothing came back', () => {
+    const filled = p({ mark: 'map-filled', columns: ['region'], rows: [{ field: 'revenue', agg: 'sum' }] });
+    expect(filled.kind === 'unavailable' && filled.why).toMatch(/needs region shapes/);
+    const noPlace = p({ mark: 'map-point', columns: ['country'] });
+    expect(noPlace.kind === 'empty' && noPlace.why).toMatch(/latitude and a longitude/);
     const f = cart(p({ mark: 'bar', columns: ['region'], rows: [{ field: 'revenue', agg: 'sum' }], filters: [{ field: 'status', in: ['paid'] }] }));
     expect(f.data.find((r) => r.region === 'North')!['SUM(revenue)']).toBe(220);
     expect(p({ mark: 'bar', columns: ['region'], rows: [{ field: 'revenue', agg: 'sum' }] }, []).kind).toBe('empty');
     const t = p({ mark: 'text-table' });
     expect(t.kind === 'table' && t.heads).toEqual(['week', 'region', 'status', 'revenue', 'orders']);
+  });
+
+  it('draws point maps at latitude and longitude, sized and coloured by the shelves', () => {
+    const cols = [
+      { name: 'city', type: 'VARCHAR' },
+      { name: 'lat', type: 'DECIMAL(9,6)' },
+      { name: 'lng', type: 'DOUBLE' },
+      { name: 'region', type: 'VARCHAR' },
+      { name: 'revenue', type: 'DECIMAL' },
+    ];
+    const rows: unknown[][] = [
+      ['Pune', '18.52', 73.85, 'West', 100],
+      ['Pune', '18.52', 73.85, 'West', 50],
+      ['Delhi', 28.61, 77.21, 'North', 300],
+      ['Nowhere', null, 10, 'North', 5],
+      ['Bad', 95, 10, 'North', 5],
+      ['Chennai', 13.08, 80.27, 'South', 20],
+    ];
+    // Bare lat and lng on the shelves stay locations (never summed).
+    const s = normalize({ mark: 'map-point', columns: ['lng'], rows: ['lat'], size: 'revenue', color: 'region', tooltip: ['city'] }, cols);
+    expect(s.columns[0]).toEqual({ field: 'lng' });
+    const m = plan(s, cols, rows);
+    if (m.kind !== 'map') throw new Error(m.kind);
+    expect(m.skipped).toBe(2);
+    expect(m.points.map((x) => [x.lat, x.lon, x.size])).toEqual([
+      [18.52, 73.85, 150],
+      [28.61, 77.21, 300],
+      [13.08, 80.27, 20],
+    ]);
+    expect(m.size).toEqual({ label: 'SUM(revenue)', min: 20, max: 300 });
+    expect(m.colour).toEqual({ kind: 'category', label: 'region', values: ['West', 'North', 'South'] });
+    expect(m.points.map((x) => x.colour)).toEqual([0, 1, 2]);
+    expect(m.points[0]!.tip.map((t) => [t.label, t.value])).toEqual([
+      ['region', 'West'],
+      ['city', 'Pune'],
+      ['SUM(revenue)', 150],
+    ]);
+    expect(radius(m, m.points[2]!)).toBe(4);
+    expect(radius(m, m.points[1]!)).toBe(22);
+    expect(bounds(m)).toEqual([
+      [73.85, 13.08],
+      [80.27, 28.61],
+    ]);
+    // A colour measure: a range, not categories.
+    const cm = plan(normalize({ mark: 'map-point', columns: ['lng', 'lat'], color: { field: 'revenue', agg: 'avg' } }, cols), cols, rows);
+    expect(cm.kind === 'map' && cm.colour).toEqual({ kind: 'measure', label: 'AVG(revenue)', min: 20, max: 300 });
+    expect(describePlan(m, 'Sales')).toBe('Sales: point map of 3 places, sized by SUM(revenue), coloured by region');
+  });
+
+  it('takes only XYZ templates as tile servers', () => {
+    expect(tileTemplate('https://tiles.example.com/{z}/{x}/{y}.png')).toBe('https://tiles.example.com/{z}/{x}/{y}.png');
+    expect(tileTemplate('')).toBeNull();
+    expect(tileTemplate('https://tiles.example.com/style.json')).toBeNull();
+    expect(tileTemplate('javascript:{z}{x}{y}')).toBeNull();
   });
 
   it('cuts dates into parts and formats numbers', () => {

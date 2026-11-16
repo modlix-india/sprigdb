@@ -174,6 +174,10 @@ pub enum TurnEvent {
     End {
         /// Why.
         stop: Stop,
+        /// The stored id of the turn's answer (its last `assistant`
+        /// message), for feedback; `None` when the turn keeps no
+        /// conversation or the message wasn't stored.
+        message: Option<u64>,
     },
 }
 
@@ -339,17 +343,22 @@ impl Agent {
         self
     }
 
+    /// Stores a message of `conv`; its id, or `None` without a
+    /// conversation or when storing failed (logged, the turn goes on).
     async fn record(
         &self,
         conv: Option<ConvId>,
         kind: MsgKind,
         body: Value,
         hash: Option<[u8; 32]>,
-    ) {
-        if let Some(c) = conv
-            && let Err(e) = self.audit.append(c, kind, &body, hash).await
-        {
-            tracing::warn!(error = %e, kind = kind.as_str(), "an AI message wasn't recorded");
+    ) -> Option<u64> {
+        let c = conv?;
+        match self.audit.append(c, kind, &body, hash).await {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!(error = %e, kind = kind.as_str(), "an AI message wasn't recorded");
+                None
+            }
         }
     }
 
@@ -411,6 +420,8 @@ impl Agent {
         let mut tools_called: Vec<String> = Vec::new();
         // Text streamed by an earlier model call of this turn.
         let mut streamed_text = false;
+        // The stored id of the newest answer message.
+        let mut answer: Option<u64> = None;
         let stop = loop {
             cfg.budget.check(used, usage.billable())?;
             let left = cfg.budget.remaining(used, usage.billable());
@@ -494,13 +505,14 @@ impl Agent {
                 Some(outcome.sent.sha256),
             )
             .await;
-            self.record(
-                req.conv,
-                MsgKind::Assistant,
-                serde_json::to_value(&outcome.message).unwrap_or(Value::Null),
-                None,
-            )
-            .await;
+            answer = self
+                .record(
+                    req.conv,
+                    MsgKind::Assistant,
+                    serde_json::to_value(&outcome.message).unwrap_or(Value::Null),
+                    None,
+                )
+                .await;
             let calls: Vec<(String, String, Value)> = outcome
                 .message
                 .tool_calls()
@@ -626,7 +638,10 @@ impl Agent {
         if !sources.is_empty() {
             sink.event(TurnEvent::Sources(sources.clone()))?;
         }
-        sink.event(TurnEvent::End { stop: stop.clone() })?;
+        sink.event(TurnEvent::End {
+            stop: stop.clone(),
+            message: answer,
+        })?;
         self.audit_event(&req, role, &tools_called, &sent, stop.label());
         crate::metrics::turn(role, started.elapsed());
         Ok(TurnResult {

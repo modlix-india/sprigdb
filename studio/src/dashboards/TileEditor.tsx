@@ -28,6 +28,7 @@ import {
   roleOf,
   toStored,
   DRAWN,
+  NOT_DRAWN_WHY,
   type Agg,
   type ChartSpec,
   type DatePart,
@@ -396,7 +397,7 @@ function Editor({ dash, existing, draft }: { dash: Dashboard; existing: Tile | u
                 <option key={m} value={m} disabled={!DRAWN.has(m)}>
                   {MARK_NAMES[m]}
                   {fits(m, exact) ? '' : ' (doesn’t fit the shelves)'}
-                  {DRAWN.has(m) ? '' : ' (not drawn yet)'}
+                  {DRAWN.has(m) ? '' : ` (${NOT_DRAWN_WHY[m] ?? 'not drawn yet'})`}
                 </option>
               ))}
             </select>
@@ -495,7 +496,7 @@ function Editor({ dash, existing, draft }: { dash: Dashboard; existing: Tile | u
                 disabled={!ok}
                 className={p.mark === pick.mark && !p.stack && !p.horizontal && !p.combo && p.id === pick.mark ? 'best' : undefined}
                 onClick={() => setSpec(applyPreset(spec, p))}
-                title={ok ? p.label : DRAWN.has(p.mark) ? `${p.label}: needs other fields` : `${p.label}: not drawn in Studio yet`}
+                title={ok ? p.label : DRAWN.has(p.mark) ? `${p.label}: needs other fields` : `${p.label}: ${NOT_DRAWN_WHY[p.mark] ?? 'not drawn in Studio yet'}`}
                 data-testid={`showme-${p.id}`}
               >
                 <i aria-hidden="true">{ICONS[p.id] ?? '▮'}</i>

@@ -17,7 +17,7 @@ describe('Show Me', () => {
   const c = (s: Parameters<typeof counts>[0]) => counts(s);
   it('follows the rules of thumb, as the tile check does', () => {
     const date = c({ mark: 'bar', columns: [{ field: 'week', datePart: 'week' }], rows: [{ field: 'revenue', agg: 'sum' }] });
-    expect(date).toEqual({ dims: 1, measures: 1, dates: 1, geo: false, unknown: 0 });
+    expect(date).toEqual({ dims: 1, measures: 1, dates: 1, geo: false, latLon: false, unknown: 0 });
     expect(best(date).mark).toBe('line');
     const one = c({ mark: 'bar', columns: [{ field: 'status' }], rows: [{ field: 'n', agg: 'count' }] });
     expect(best(one).mark).toBe('bar');
@@ -28,8 +28,14 @@ describe('Show Me', () => {
     expect(best(c({ mark: 'bar', columns: [{ field: 'a', agg: 'sum' }], rows: [{ field: 'b', agg: 'sum' }] })).mark).toBe('point');
     expect(best(c({ mark: 'bar', rows: [{ field: 'a', agg: 'sum' }] })).mark).toBe('kpi');
     expect(best(c({ mark: 'bar', columns: ['day'], rows: ['hour'], color: { field: 'n', agg: 'count' } })).mark).toBe('heatmap');
-    // A map would win for a place, but Studio doesn't draw maps yet: the next rule.
+    // A place name alone would be a filled map, which needs region shapes: the next rule.
     expect(best(c({ mark: 'bar', columns: [{ field: 'country' }], rows: [{ field: 'n', agg: 'sum' }] })).mark).toBe('bar');
+    // A latitude and a longitude: a point map.
+    const ll = c({ mark: 'bar', columns: [{ field: 'longitude' }], rows: [{ field: 'Lat' }], size: { field: 'n', agg: 'sum' } });
+    expect(ll.latLon).toBe(true);
+    expect(best(ll)).toEqual({ mark: 'map-point', why: 'a geographic field: a map' });
+    expect(presetFits(PRESETS.find((p) => p.id === 'map-point')!, ll)).toBe(true);
+    expect(presetFits(PRESETS.find((p) => p.id === 'map-point')!, c({ mark: 'bar', columns: [{ field: 'country' }] }))).toBe(false);
     expect(best(c({ mark: 'bar' })).mark).toBe('text-table');
   });
 

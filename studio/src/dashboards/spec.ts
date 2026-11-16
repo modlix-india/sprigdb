@@ -90,14 +90,22 @@ export interface ColumnInfo {
 
 export type Role = 'measure' | 'dimension' | 'date';
 
+/** Field names read as a latitude or a longitude (any case). */
+export const LAT_NAMES = ['lat', 'latitude'];
+export const LON_NAMES = ['lon', 'lng', 'long', 'longitude'];
+export const isLat = (name: string) => LAT_NAMES.includes(name.toLowerCase());
+export const isLon = (name: string) => LON_NAMES.includes(name.toLowerCase());
+
 const NUMERIC = ['DECIMAL', 'TINYINT', 'SMALLINT', 'INT', 'FLOAT', 'DOUBLE', 'BIGINT', 'MEDIUMINT', 'INTEGER', 'NUMBER'];
 const DATES = ['DATE', 'DATETIME', 'TIMESTAMP'];
 
 /** What a column is on the shelves, from its type: numbers are measures,
- * dates are dates, the rest dimensions. Ids and flags stay dimensions. */
+ * dates are dates, the rest dimensions. Ids, flags, latitudes and
+ * longitudes stay dimensions (a location is never summed). */
 export function roleOf(c: ColumnInfo): Role {
   const t = c.type.toUpperCase().replace(/\(.*$/, '').trim();
   if (DATES.includes(t)) return 'date';
+  if (isLat(c.name) || isLon(c.name)) return 'dimension';
   const n = c.name.toLowerCase();
   if (NUMERIC.includes(t)) {
     const idLike = n === 'id' || n.endsWith('_id') || /[a-z]Id$/.test(c.name);
@@ -170,6 +178,9 @@ export interface Counts {
   measures: number;
   dates: number;
   geo: boolean;
+  /** A latitude and a longitude field are on the shelves (Studio's own
+   * count, for point maps; the gateway's rules don't use it). */
+  latLon: boolean;
   /** Bare entries that might be measures (only for specs without column types). */
   unknown: number;
 }
@@ -188,14 +199,21 @@ const GEO = new Set(RULES.geoNames);
 
 /** Counts a spec's fields the way the gateway's tile check does. */
 export function counts(s: ChartSpec): Counts {
-  const c: Counts = { dims: 0, measures: 0, dates: 0, geo: false, unknown: 0 };
+  const c: Counts = { dims: 0, measures: 0, dates: 0, geo: false, latLon: false, unknown: 0 };
+  let lat = false;
+  let lon = false;
+  const place = (f: Field) => {
+    if (GEO.has(f.field.toLowerCase())) c.geo = true;
+    lat ||= isLat(f.field);
+    lon ||= isLon(f.field);
+  };
   const shelf = (name: 'columns' | 'rows' | 'color' | 'size') => {
     const v = s[name];
     const list = Array.isArray(v) ? v : v === null || v === undefined ? [] : [v];
     for (const e of list) {
       const f = one(e);
       if (!f) continue;
-      if (GEO.has(f.field.toLowerCase())) c.geo = true;
+      place(f);
       if (f.agg !== undefined || name === 'size') c.measures++;
       else {
         c.dims++;
@@ -213,9 +231,10 @@ export function counts(s: ChartSpec): Counts {
     const list = Array.isArray(v) ? v : v ? [v] : [];
     for (const e of list) {
       const f = one(e);
-      if (f && GEO.has(f.field.toLowerCase())) c.geo = true;
+      if (f) place(f);
     }
   }
+  c.latLon = lat && lon;
   return c;
 }
 
@@ -242,11 +261,16 @@ export function fits(mark: Mark, c: Counts): boolean {
   return false;
 }
 
-/** Marks Studio can draw today; the rest show in Show Me as "not yet". */
-export const DRAWN: ReadonlySet<Mark> = new Set<Mark>(MARKS.filter((m) => m !== 'map-point' && m !== 'map-filled'));
+/** Marks Studio can draw; a filled map needs region shapes Studio doesn't
+ * have, so Show Me offers it as "needs region shapes". */
+export const DRAWN: ReadonlySet<Mark> = new Set<Mark>(MARKS.filter((m) => m !== 'map-filled'));
+
+/** Why Studio doesn't draw a mark (for marks not in DRAWN). */
+export const NOT_DRAWN_WHY: Partial<Record<Mark, string>> = { 'map-filled': 'needs region shapes' };
 
 /** The best mark for the shelves, and why (the first rule that holds),
- * skipping marks Studio can't draw. */
+ * skipping marks Studio can't draw, and a point map without a latitude
+ * and a longitude. */
 export function best(c: Counts): { mark: Mark; why: string } {
   for (const b of RULES.best) {
     const w = b.when as Record<string, unknown>;
@@ -258,7 +282,7 @@ export function best(c: Counts): { mark: Mark; why: string } {
       if (k === 'dates') return within(c.dates, r);
       return true;
     });
-    if (ok && DRAWN.has(b.mark as Mark)) return { mark: b.mark as Mark, why: b.why };
+    if (ok && DRAWN.has(b.mark as Mark) && (b.mark !== 'map-point' || c.latLon)) return { mark: b.mark as Mark, why: b.why };
   }
   return { mark: 'text-table', why: '' };
 }
@@ -305,7 +329,7 @@ export const PRESETS: Preset[] = [
   { id: 'gauge', label: 'Gauge', mark: 'gauge' },
   { id: 'bullet', label: 'Bullet', mark: 'bullet' },
   { id: 'gantt', label: 'Gantt', mark: 'gantt' },
-  { id: 'map-point', label: 'Point map', mark: 'map-point' },
+  { id: 'map-point', label: 'Point map', mark: 'map-point', needs: (c) => c.latLon },
   { id: 'map-filled', label: 'Filled map', mark: 'map-filled' },
 ];
 

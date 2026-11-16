@@ -1,9 +1,10 @@
 // Draws a tile's chart from its plan with Recharts (bar, line, area,
 // combo, scatter, pie, radar, treemap, funnel, sankey, gauge; box plots,
-// waterfalls, bullets and Gantt bars from Bar shapes), and Studio's own
-// HTML for tables, pivots, heatmaps and KPIs.
+// waterfalls, bullets and Gantt bars from Bar shapes), Studio's own HTML
+// for tables, pivots, heatmaps and KPIs, and MapLibre for point maps
+// (loaded on first use).
 
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   Area,
   AreaChart,
@@ -41,6 +42,8 @@ import { isDark } from '../app/theme';
 import { facets, fmt, num, type Rec } from './data';
 import { describePlan, plan, type Plan } from './plan';
 import type { ColumnInfo, Spec } from './spec';
+
+const MapView = lazy(() => import('./MapView'));
 
 // The categorical palette (validated for colour-blind separation in both
 // themes); slots are given by a series' first appearance and never cycled.
@@ -95,9 +98,11 @@ const short = (v: unknown) => {
   return s.length > 18 ? `${s.slice(0, 17)}…` : s;
 };
 
-function Frame({ label, children, height }: { label: string; children: ReactNode; height: number | string }) {
+/** A chart's box, read as one image; a map, which takes the keyboard and
+ * has buttons, is a figure instead. */
+function Frame({ label, children, height, interactive = false }: { label: string; children: ReactNode; height: number | string; interactive?: boolean }) {
   return (
-    <div className="chart-frame" role="img" aria-label={label} style={{ height }}>
+    <div className="chart-frame" role={interactive ? 'figure' : 'img'} aria-label={label} style={{ height }}>
       {children}
     </div>
   );
@@ -519,6 +524,12 @@ function One({ p, pal, format, title }: { p: Plan; pal: Palette; format: (v: unk
       );
     case 'table':
       return <Table heads={p.heads} rows={p.rows} format={format} />;
+    case 'map':
+      return (
+        <Suspense fallback={<p className="muted chart-note">Loading the map…</p>}>
+          <MapView m={p} pal={pal} format={format} />
+        </Suspense>
+      );
     case 'unavailable':
     case 'empty':
       return <p className="muted chart-note">{p.why}</p>;
@@ -549,7 +560,7 @@ export function ChartView({
     const cut = 'cut' in single && single.cut ? single.cut : 0;
     return (
       <div className="chart-wrap" style={{ height }}>
-        <Frame label={describePlan(single, title)} height={cut ? 'calc(100% - 18px)' : '100%'}>
+        <Frame label={describePlan(single, title)} height={cut ? 'calc(100% - 18px)' : '100%'} interactive={single.kind === 'map'}>
           <One p={single} pal={pal} format={format} title={title} />
         </Frame>
         {cut > 0 && <p className="muted chart-cut">{cut} more categories not shown</p>}
@@ -564,7 +575,7 @@ export function ChartView({
         return (
           <div className="facet" key={f.value}>
             <div className="facet-title">{f.value}</div>
-            <Frame label={describePlan(p, `${title}, ${f.value}`)} height="calc(100% - 20px)">
+            <Frame label={describePlan(p, `${title}, ${f.value}`)} height="calc(100% - 20px)" interactive={p.kind === 'map'}>
               <One p={p} pal={pal} format={format} title={title} />
             </Frame>
           </div>

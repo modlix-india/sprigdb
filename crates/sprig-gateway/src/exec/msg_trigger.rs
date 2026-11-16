@@ -901,7 +901,9 @@ impl PassSession {
             "SET STATEMENT max_statement_time = {} FOR {call}",
             Duration::from_millis(budget).as_secs_f64()
         );
-        if let Err(e) = self.trigger_stmt(cx, &timed).await {
+        // The entry procedure's name is reserved (`__sprig_`): only the
+        // gateway's own statements may name it.
+        if let Err(e) = self.run_checked(cx, &timed, true).await.map(|_| ()) {
             let n = messages::error_number(&e);
             if n == messages::ENGINE_RERUN {
                 tracing::debug!(binding = req.source.binding_id, reason = %e.message, "compiled trigger: this record runs in the engine tier");
@@ -909,7 +911,7 @@ impl PassSession {
                     .await?;
                 return Ok(false);
             }
-            if n == 1969 {
+            if matches!(n, 1969 | 3024) {
                 return Err(SprigError::new(
                     SprigCode::LogicBudgetExceeded,
                     format!("the run ran past logic.trigger_budget_ms = {budget} ms"),

@@ -13,7 +13,7 @@
 //! | `usage` | `usage` | tokens of one model call |
 //! | `sources` | `sources: [{kind, title, reference}]` | what the answer drew on |
 //! | `error` | `error: {code, name, message, ...}` | the turn failed (39992, 39993, 39996, ...), or the model refused (39994) |
-//! | `end` | `stop` | the turn ended: `end_turn`, `max_tokens`, `refusal` or `other` (`detail`: `max_tool_rounds`, `stopped`) |
+//! | `end` | `stop`, `message_id` | the turn ended: `end_turn`, `max_tokens`, `refusal` or `other` (`detail`: `max_tool_rounds`, `stopped`); `message_id` is the stored answer's id for `POST /v1/ai/feedback`, as conversation reads show it (`a`-prefixed in an administration conversation), and is absent when nothing was stored |
 //!
 //! Errors found before the turn starts (39990, 39991, 39992, 39995, a
 //! role the caller may not use) are answered as plain HTTP errors instead;
@@ -69,9 +69,16 @@ pub fn error_json(e: &SprigError) -> Value {
     json!({"type": "error", "error": body})
 }
 
-/// The lines one turn event becomes.
+/// The lines one turn event becomes (a tenant conversation's ids).
 #[must_use]
 pub fn event_json(e: &TurnEvent) -> Vec<Value> {
+    event_json_as(e, false)
+}
+
+/// [`event_json`], with message ids as an administration conversation
+/// shows them (`a12`) when `admin`.
+#[must_use]
+pub fn event_json_as(e: &TurnEvent, admin: bool) -> Vec<Value> {
     match e {
         TurnEvent::Text(t) => vec![json!({"type": "text", "text": t})],
         TurnEvent::Thinking(t) => vec![json!({"type": "thinking", "text": t})],
@@ -96,7 +103,7 @@ pub fn event_json(e: &TurnEvent) -> Vec<Value> {
         })],
         TurnEvent::Usage(u) => vec![json!({"type": "usage", "usage": u})],
         TurnEvent::Sources(s) => vec![json!({"type": "sources", "sources": s})],
-        TurnEvent::End { stop } => {
+        TurnEvent::End { stop, message } => {
             let mut out = Vec::new();
             if let Stop::Refusal(t) = stop {
                 out.push(error_json(&sprig_ai::error::refused(t)));
@@ -104,6 +111,13 @@ pub fn event_json(e: &TurnEvent) -> Vec<Value> {
             let mut end = json!({"type": "end", "stop": stop.label()});
             if let Stop::Other(d) = stop {
                 end["detail"] = json!(d);
+            }
+            if let Some(id) = message {
+                end["message_id"] = json!(if admin {
+                    super::system::label(*id)
+                } else {
+                    id.to_string()
+                });
             }
             out.push(end);
             out
@@ -123,6 +137,8 @@ struct LineSink {
     user: UserId,
     author: String,
     filing: Vec<JoinHandle<()>>,
+    /// An administration conversation (its ids carry a prefix).
+    admin: bool,
 }
 
 impl TurnSink for LineSink {
@@ -144,7 +160,7 @@ impl TurnSink for LineSink {
                 }
             }));
         }
-        for v in event_json(&e) {
+        for v in event_json_as(&e, self.admin) {
             self.tx
                 .send(line(&v))
                 .map_err(|_| SprigError::internal("the client went away"))?;
@@ -169,6 +185,7 @@ pub fn start_as(
 ) -> (mpsc::UnboundedReceiver<Bytes>, CancellationToken) {
     let (tx, rx) = mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
+    let admin = conv.is_some_and(|c| super::system::parse(c).is_some());
     t.req.cancel = Some(cancel.clone());
     let _ = tx.send(line(&json!({
         "type": "start",
@@ -184,6 +201,7 @@ pub fn start_as(
             user: t.req.user,
             author: t.author.clone(),
             filing: Vec::new(),
+            admin,
         };
         let r = t.agent.run(&t.cfg, t.req, &mut sink).await;
         for h in std::mem::take(&mut sink.filing) {
