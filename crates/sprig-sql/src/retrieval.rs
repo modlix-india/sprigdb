@@ -21,6 +21,7 @@
 //!   `NOT` and parentheses are allowed, so the same filter can run on the
 //!   index's own table and on the source table.
 
+use std::fmt::Write as _;
 use std::ops::Range;
 
 use crate::lex::{self, LexOptions, Token, TokenKind};
@@ -73,7 +74,10 @@ impl Chunking {
         if s == "headings" {
             return Some(Chunking::Headings);
         }
-        s.strip_prefix("tokens:")?.parse().ok().map(Chunking::Tokens)
+        s.strip_prefix("tokens:")?
+            .parse()
+            .ok()
+            .map(Chunking::Tokens)
     }
 }
 
@@ -136,8 +140,8 @@ struct Toks<'a> {
 }
 
 impl<'a> Toks<'a> {
-    fn new(sql: &'a [u8], opts: &LexOptions) -> Option<Self> {
-        let all = lex::lex(sql, opts).ok()?;
+    fn new(sql: &'a [u8], opts: LexOptions) -> Option<Self> {
+        let all = lex::lex(sql, &opts).ok()?;
         Some(Self {
             sql,
             t: all.into_iter().filter(|k| !k.kind.is_trivia()).collect(),
@@ -221,8 +225,7 @@ fn check_name(what: &str, n: &str) -> Result<(), String> {
 /// [`parse`]).
 #[must_use]
 pub fn mentions_ddl(sql: &[u8]) -> bool {
-    sql.windows(9)
-        .any(|w| w.eq_ignore_ascii_case(b"RETRIEVAL"))
+    sql.windows(9).any(|w| w.eq_ignore_ascii_case(b"RETRIEVAL"))
 }
 
 /// The statement in `sql`: `None` when it isn't a retrieval index
@@ -232,7 +235,7 @@ pub fn parse(sql: &[u8], opts: &LexOptions) -> Option<Result<Stmt, String>> {
     if !mentions_ddl(sql) {
         return None;
     }
-    let t = Toks::new(sql, opts)?;
+    let t = Toks::new(sql, *opts)?;
     let mut end = t.t.len();
     if end > 0 && t.punct(end - 1, b';') {
         end -= 1;
@@ -268,15 +271,13 @@ pub fn parse(sql: &[u8], opts: &LexOptions) -> Option<Result<Stmt, String>> {
         if end == 3 {
             return Some(Ok(Stmt::Show { db: None }));
         }
-        return Some(
-            if (t.word(3, "FROM") || t.word(3, "IN")) && end == 5 {
-                t.ident(4)
-                    .map(|db| Stmt::Show { db: Some(db) })
-                    .ok_or_else(|| "SHOW RETRIEVAL INDEXES [FROM db]".to_owned())
-            } else {
-                Err("SHOW RETRIEVAL INDEXES [FROM db]".into())
-            },
-        );
+        return Some(if (t.word(3, "FROM") || t.word(3, "IN")) && end == 5 {
+            t.ident(4)
+                .map(|db| Stmt::Show { db: Some(db) })
+                .ok_or_else(|| "SHOW RETRIEVAL INDEXES [FROM db]".to_owned())
+        } else {
+            Err("SHOW RETRIEVAL INDEXES [FROM db]".into())
+        });
     }
     None
 }
@@ -472,16 +473,19 @@ pub fn render(s: &Shape<'_>) -> String {
     }
     if !s.filters.is_empty() {
         let f: Vec<String> = s.filters.iter().map(|f| quote(f)).collect();
-        out.push_str(&format!(" FILTERS ({})", f.join(", ")));
+        let _ = write!(out, " FILTERS ({})", f.join(", "));
     }
     match s.chunking {
         Chunking::Headings => out.push_str(" CHUNK BY HEADINGS"),
-        Chunking::Tokens(n) => out.push_str(&format!(" CHUNK BY TOKENS {n}")),
+        Chunking::Tokens(n) => {
+            let _ = write!(out, " CHUNK BY TOKENS {n}");
+        }
     }
-    out.push_str(&format!(
+    let _ = write!(
+        out,
         " EMBED WITH MODEL '{}'",
         s.model.replace('\\', "\\\\").replace('\'', "''")
-    ));
+    );
     out
 }
 
@@ -566,6 +570,7 @@ const CLAUSE_WORDS: &[&str] = &[
 
 /// Whether the call at token `j` stands in a `FROM` list: after `FROM`,
 /// `JOIN`, or a comma of a `FROM` list.
+#[allow(clippy::many_single_char_names)] // tokens and positions
 fn in_from(t: &Toks<'_>, j: usize) -> bool {
     let Some(p) = j.checked_sub(1) else {
         return false;
@@ -606,11 +611,12 @@ fn in_from(t: &Toks<'_>, j: usize) -> bool {
 ///
 /// # Errors
 /// [`CallError`] for a call in a `FROM` list written wrongly.
+#[allow(clippy::many_single_char_names, clippy::too_many_lines)] // one check per argument
 pub fn calls(sql: &[u8], opts: &LexOptions) -> Result<Vec<Call>, CallError> {
     if !mentions(sql) {
         return Ok(Vec::new());
     }
-    let Some(t) = Toks::new(sql, opts) else {
+    let Some(t) = Toks::new(sql, *opts) else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
@@ -666,9 +672,7 @@ pub fn calls(sql: &[u8], opts: &LexOptions) -> Result<Vec<Call>, CallError> {
         let query = one(args[1])
             .then(|| t.string(args[1].0))
             .flatten()
-            .ok_or_else(|| {
-                CallError::new(1210, "RETRIEVE's query must be a string literal")
-            })?;
+            .ok_or_else(|| CallError::new(1210, "RETRIEVE's query must be a string literal"))?;
         if query.trim().is_empty() {
             return Err(CallError::new(1210, "RETRIEVE's query is empty"));
         }
@@ -691,9 +695,9 @@ pub fn calls(sql: &[u8], opts: &LexOptions) -> Result<Vec<Call>, CallError> {
             })?;
         let filter = match args.get(3) {
             None => None,
-            Some(&a) if one(a) && t.t[a.0].kind == TokenKind::String => t
-                .string(a.0)
-                .filter(|f| !f.trim().is_empty()),
+            Some(&a) if one(a) && t.t[a.0].kind == TokenKind::String => {
+                t.string(a.0).filter(|f| !f.trim().is_empty())
+            }
             Some(&a) if one(a) && t.word(a.0, "NULL") => None,
             Some(_) => {
                 return Err(CallError::new(
@@ -747,7 +751,8 @@ pub fn compile_filter(
     if filter.len() > MAX_FILTER {
         return Err(format!("a filter is longer than {MAX_FILTER} bytes"));
     }
-    let t = Toks::new(filter.as_bytes(), opts).ok_or_else(|| "a filter that can't be read".to_owned())?;
+    let t = Toks::new(filter.as_bytes(), *opts)
+        .ok_or_else(|| "a filter that can't be read".to_owned())?;
     let mut out: Vec<String> = Vec::with_capacity(t.t.len());
     let mut depth = 0i32;
     for (j, tk) in t.t.iter().enumerate() {
@@ -779,7 +784,9 @@ pub fn compile_filter(
                 out.push(rename(c));
             }
             TokenKind::String => {
-                let v = t.string(j).ok_or_else(|| "a filter string that can't be read".to_owned())?;
+                let v = t
+                    .string(j)
+                    .ok_or_else(|| "a filter string that can't be read".to_owned())?;
                 out.push(crate::ai_fn::string_literal(&v, out_nbe));
             }
             TokenKind::Number | TokenKind::HexNumber | TokenKind::HexString => {
@@ -866,7 +873,8 @@ mod tests {
 
     #[test]
     fn create_defaults_and_refusals() {
-        let Some(Ok(Stmt::Create(c))) = p("CREATE RETRIEVAL INDEX IF NOT EXISTS kb ON a (b)") else {
+        let Some(Ok(Stmt::Create(c))) = p("CREATE RETRIEVAL INDEX IF NOT EXISTS kb ON a (b)")
+        else {
             panic!();
         };
         assert!(c.if_not_exists);
@@ -949,9 +957,21 @@ mod tests {
         assert_eq!(c.len(), 1);
         assert!(c[0].filter.is_none());
         // Not in a FROM list, or qualified: not ours.
-        assert!(calls(b"SELECT RETRIEVE(kb, 'x', 3)", &o).unwrap().is_empty());
-        assert!(calls(b"SELECT * FROM t WHERE a IN (1, RETRIEVE(1))", &o).unwrap().is_empty());
-        assert!(calls(b"SELECT * FROM db.retrieve(1)", &o).unwrap().is_empty());
+        assert!(
+            calls(b"SELECT RETRIEVE(kb, 'x', 3)", &o)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            calls(b"SELECT * FROM t WHERE a IN (1, RETRIEVE(1))", &o)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            calls(b"SELECT * FROM db.retrieve(1)", &o)
+                .unwrap()
+                .is_empty()
+        );
         for (bad, code) in [
             ("SELECT * FROM RETRIEVE(kb, 'x')", 1582),
             ("SELECT * FROM RETRIEVE(kb, 'x', 0)", 1210),

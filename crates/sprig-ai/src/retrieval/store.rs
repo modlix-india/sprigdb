@@ -316,7 +316,11 @@ impl Store {
     ///
     /// # Errors
     /// The catalog is unreachable.
-    pub async fn of_db(&self, c: &mut mysql_async::Conn, db_id: u32) -> Result<Vec<RetrievalIndex>> {
+    pub async fn of_db(
+        &self,
+        c: &mut mysql_async::Conn,
+        db_id: u32,
+    ) -> Result<Vec<RetrievalIndex>> {
         self.select(c, "WHERE db_id = ?", (db_id,).into()).await
     }
 
@@ -493,7 +497,12 @@ mod tests {
 
     #[test]
     fn states_round_trip() {
-        for s in [State::Building, State::Ready, State::Rebuilding, State::Failed] {
+        for s in [
+            State::Building,
+            State::Ready,
+            State::Rebuilding,
+            State::Failed,
+        ] {
             assert_eq!(State::parse(s.as_str()), s);
         }
         let ix = RetrievalIndex {

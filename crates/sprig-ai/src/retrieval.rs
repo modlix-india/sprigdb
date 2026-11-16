@@ -275,9 +275,16 @@ pub fn embedding_input(heading: &str, text: &str) -> String {
 #[must_use]
 pub fn is_text_type(column_type: &str) -> bool {
     let t = column_type.to_ascii_lowercase();
-    ["char", "varchar", "tinytext", "text", "mediumtext", "longtext"]
-        .iter()
-        .any(|p| t == *p || t.starts_with(&format!("{p}(")))
+    [
+        "char",
+        "varchar",
+        "tinytext",
+        "text",
+        "mediumtext",
+        "longtext",
+    ]
+    .iter()
+    .any(|p| t == *p || t.starts_with(&format!("{p}(")))
 }
 
 /// Whether a `COLUMN_TYPE` can be a `FILTERS` column (not a binary
@@ -286,12 +293,28 @@ pub fn is_text_type(column_type: &str) -> bool {
 pub fn is_filter_type(column_type: &str) -> bool {
     let t = column_type.to_ascii_lowercase();
     let bad = [
-        "binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "text", "tinytext",
-        "mediumtext", "longtext", "vector", "geometry", "point", "linestring", "polygon",
-        "multipoint", "multilinestring", "multipolygon", "geometrycollection", "json",
+        "binary",
+        "varbinary",
+        "blob",
+        "tinyblob",
+        "mediumblob",
+        "longblob",
+        "text",
+        "tinytext",
+        "mediumtext",
+        "longtext",
+        "vector",
+        "geometry",
+        "point",
+        "linestring",
+        "polygon",
+        "multipoint",
+        "multilinestring",
+        "multipolygon",
+        "geometrycollection",
+        "json",
     ];
-    !bad
-        .iter()
+    !bad.iter()
         .any(|p| t == *p || t.starts_with(&format!("{p}(")) || t.starts_with(&format!("{p} ")))
 }
 
@@ -308,8 +331,19 @@ pub fn is_binary_type(column_type: &str) -> bool {
 pub fn is_numeric_type(column_type: &str) -> bool {
     let t = column_type.to_ascii_lowercase();
     [
-        "tinyint", "smallint", "mediumint", "int", "integer", "bigint", "decimal", "numeric",
-        "float", "double", "real", "bit", "year",
+        "tinyint",
+        "smallint",
+        "mediumint",
+        "int",
+        "integer",
+        "bigint",
+        "decimal",
+        "numeric",
+        "float",
+        "double",
+        "real",
+        "bit",
+        "year",
     ]
     .iter()
     .any(|p| t == *p || t.starts_with(&format!("{p}(")) || t.starts_with(&format!("{p} ")))

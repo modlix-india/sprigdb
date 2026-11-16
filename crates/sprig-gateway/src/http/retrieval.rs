@@ -89,7 +89,9 @@ pub fn parse(body: &[u8]) -> Result<SearchBody, SprigError> {
         return Err(invalid("query is required"));
     }
     if query.chars().count() > MAX_QUERY {
-        return Err(invalid(format!("query is longer than {MAX_QUERY} characters")));
+        return Err(invalid(format!(
+            "query is longer than {MAX_QUERY} characters"
+        )));
     }
     let limit = match v.get("limit") {
         None | Some(Value::Null) => DEFAULT_LIMIT,
@@ -236,7 +238,10 @@ mod tests {
         );
         assert_eq!(route("GET", "/v1/databases/shop/retrieval/kb:search"), None);
         assert_eq!(route("POST", "/v1/databases/shop/retrieval/kb"), None);
-        assert_eq!(route("POST", "/v1/databases/shop/vectorIndexes/kb:search"), None);
+        assert_eq!(
+            route("POST", "/v1/databases/shop/vectorIndexes/kb:search"),
+            None
+        );
         let r = parse(br#"{"query":"reset password","limit":3,"filter":"lang = 'en'"}"#).unwrap();
         assert_eq!(r.limit, 3);
         assert_eq!(r.filter.as_deref(), Some("lang = 'en'"));
@@ -247,7 +252,9 @@ mod tests {
         assert!(parse(br#"{"query":1}"#).is_err());
         let sql = statement("shop", "kb", &r);
         assert!(sql.starts_with(crate::exec::RETRIEVE_KEY_JSON_HINT));
-        assert!(sql.contains("FROM RETRIEVE(`shop`.`kb`, 'reset password', 3, 'lang = ''en''') AS r"));
+        assert!(
+            sql.contains("FROM RETRIEVE(`shop`.`kb`, 'reset password', 3, 'lang = ''en''') AS r")
+        );
     }
 
     #[test]

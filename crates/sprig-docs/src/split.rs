@@ -77,11 +77,7 @@ fn pieces(s: &str, max: usize) -> Vec<String> {
     if parts.len() > 1 {
         return pack(parts.into_iter().map(str::to_owned).collect(), " ", max);
     }
-    pack(
-        s.split_whitespace().map(str::to_owned).collect(),
-        " ",
-        max,
-    )
+    pack(s.split_whitespace().map(str::to_owned).collect(), " ", max)
 }
 
 /// Joins consecutive `parts` with `sep` into pieces of at most `max`
@@ -153,10 +149,7 @@ mod tests {
         }
         // Nothing is lost.
         let words = |s: &str| s.split_whitespace().count();
-        assert_eq!(
-            chunks.iter().map(|c| words(c)).sum::<usize>(),
-            words(&text)
-        );
+        assert_eq!(chunks.iter().map(|c| words(c)).sum::<usize>(), words(&text));
         // A sentence with no ends is cut between words.
         let long = "word ".repeat(500);
         let chunks = by_tokens(&long, 100);

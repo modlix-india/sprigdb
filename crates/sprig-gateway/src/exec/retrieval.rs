@@ -225,12 +225,7 @@ fn key_json(keys: &[KeyColumn], v: &[Option<String>]) -> serde_json::Value {
 }
 
 /// The derived table a call becomes: one row per hit.
-fn derived_table(
-    found: &Found,
-    alias: Option<&str>,
-    key_as_json: bool,
-    nbe: bool,
-) -> String {
+fn derived_table(found: &Found, alias: Option<&str>, key_as_json: bool, nbe: bool) -> String {
     let keys = &found.index.key_columns;
     let lit = |s: &str| string_literal(s, nbe);
     let rows: Vec<String> = found
@@ -246,18 +241,28 @@ fn derived_table(
             } else {
                 keys.iter()
                     .zip(&h.key)
-                    .map(|(k, v)| format!("{} AS {}", key_literal(k, v.as_deref(), nbe), quote(&k.name)))
+                    .map(|(k, v)| {
+                        format!(
+                            "{} AS {}",
+                            key_literal(k, v.as_deref(), nbe),
+                            quote(&k.name)
+                        )
+                    })
                     .collect()
             };
             cols.push(format!("{} AS `chunk_no`", h.chunk_no));
             cols.push(format!(
                 "{} AS `title`",
-                h.title.as_deref().map_or_else(|| "CAST(NULL AS CHAR)".to_owned(), lit)
+                h.title
+                    .as_deref()
+                    .map_or_else(|| "CAST(NULL AS CHAR)".to_owned(), lit)
             ));
             cols.push(format!("{} AS `chunk`", lit(&h.text)));
             cols.push(format!("CAST({:e} AS DOUBLE) AS `score`", h.score));
             cols.push(format!("{} AS `rank`", i + 1));
-            let r = |x: Option<usize>| x.map_or_else(|| "CAST(NULL AS SIGNED)".to_owned(), |n| n.to_string());
+            let r = |x: Option<usize>| {
+                x.map_or_else(|| "CAST(NULL AS SIGNED)".to_owned(), |n| n.to_string())
+            };
             cols.push(format!("{} AS `bm25_rank`", r(h.bm25_rank)));
             cols.push(format!("{} AS `vector_rank`", r(h.vector_rank)));
             format!("SELECT {}", cols.join(", "))
@@ -325,7 +330,15 @@ impl PassSession {
     }
 
     /// Whether the session's user holds `a` on table `object` of `db`.
-    fn rx_allowed(&self, cat: &TenantCatalog, lctn: bool, db: &str, db_id: DbId, object: u64, a: Action) -> bool {
+    fn rx_allowed(
+        &self,
+        cat: &TenantCatalog,
+        lctn: bool,
+        db: &str,
+        db_id: DbId,
+        object: u64,
+        a: Action,
+    ) -> bool {
         let Some(ts) = self.tenant.as_deref() else {
             return false;
         };
@@ -371,8 +384,7 @@ impl PassSession {
         format: RowFormat,
         out: &mut dyn ResultSink,
     ) -> Result<Option<Step>> {
-        if !sqlrx::mentions_ddl(text) || self.tenant.as_deref().is_none_or(|ts| ts.types.internal)
-        {
+        if !sqlrx::mentions_ddl(text) || self.tenant.as_deref().is_none_or(|ts| ts.types.internal) {
             return Ok(None);
         }
         let (lex, _) = self.lex_opts();
@@ -429,7 +441,10 @@ impl PassSession {
 
     #[allow(clippy::too_many_lines)] // one check per part of the statement
     async fn rx_create(&mut self, cx: &mut ExecCtx<'_>, wire: Wire, c: &Create) -> Result<()> {
-        let db = c.db.clone().or_else(|| self.current_logical()).ok_or_else(no_db)?;
+        let db =
+            c.db.clone()
+                .or_else(|| self.current_logical())
+                .ok_or_else(no_db)?;
         let (svc, tenant, user) = self.rx_services()?;
         let (cat, lctn) = self.rx_catalog().await?;
         let Some((db_id, object)) = Self::rx_table(&cat, &db, &c.table, lctn) else {
@@ -443,7 +458,10 @@ impl PassSession {
             return Err(self.rx_denied("INDEX", &db, &c.table));
         }
         // The model.
-        let alias = c.model.clone().unwrap_or_else(|| embedding::LOCAL_ALIAS.to_owned());
+        let alias = c
+            .model
+            .clone()
+            .unwrap_or_else(|| embedding::LOCAL_ALIAS.to_owned());
         let models = svc.settings.get(
             &embedding::MODELS,
             &cat.setting_ctx(&svc.dc),
@@ -472,7 +490,8 @@ impl PassSession {
                 ),
             )
             .await?;
-        let s = |v: &Option<Vec<u8>>| String::from_utf8_lossy(v.as_deref().unwrap_or(b"")).into_owned();
+        let s =
+            |v: &Option<Vec<u8>>| String::from_utf8_lossy(v.as_deref().unwrap_or(b"")).into_owned();
         let columns: Vec<(String, String)> = cols.iter().map(|r| (s(&r[0]), s(&r[1]))).collect();
         let type_of = |name: &str| -> Option<(String, String)> {
             columns
@@ -480,9 +499,8 @@ impl PassSession {
                 .find(|(n, _)| n.eq_ignore_ascii_case(name))
                 .cloned()
         };
-        let col_err = |what: &str, name: &str| {
-            sql_err(1054, format!("Unknown column '{name}' in '{what}'"))
-        };
+        let col_err =
+            |what: &str, name: &str| sql_err(1054, format!("Unknown column '{name}' in '{what}'"));
         let (text_column, text_type) =
             type_of(&c.column).ok_or_else(|| col_err("RETRIEVAL INDEX", &c.column))?;
         if !rx::is_text_type(&text_type) {
@@ -586,7 +604,10 @@ impl PassSession {
             return Err(SprigError::standard(
                 1061,
                 *b"42000",
-                format!("Duplicate key name '{}': {db} has a retrieval index of that name", c.name),
+                format!(
+                    "Duplicate key name '{}': {db} has a retrieval index of that name",
+                    c.name
+                ),
             ));
         };
         if let Err(e) = register(&svc, tenant, id, &db, &c.table, object).await {
@@ -639,7 +660,11 @@ impl PassSession {
         Ok(())
     }
 
-    fn rx_shape<'a>(ix: &'a RetrievalIndex, db: &'a str, table: &'a str) -> (Shape<'a>, Vec<String>) {
+    fn rx_shape<'a>(
+        ix: &'a RetrievalIndex,
+        db: &'a str,
+        table: &'a str,
+    ) -> (Shape<'a>, Vec<String>) {
         let filters: Vec<String> = ix.filters.iter().map(|f| f.name.clone()).collect();
         (
             Shape {
@@ -671,7 +696,14 @@ impl PassSession {
             return Err(no_index(&db, name));
         };
         let table = Self::rx_table_name(&cat, &ix);
-        if !self.rx_allowed(&cat, lctn, &db, DbId(ix.db_id), ix.object_id, Action::Select) {
+        if !self.rx_allowed(
+            &cat,
+            lctn,
+            &db,
+            DbId(ix.db_id),
+            ix.object_id,
+            Action::Select,
+        ) {
             return Err(self.rx_denied("SELECT", &db, &table));
         }
         let (lex, _) = self.lex_opts();
@@ -719,10 +751,12 @@ impl PassSession {
             ));
         }
         if rows.is_empty() {
-            return Ok("SELECT '' AS `Index`, '' AS `Table`, '' AS `Column`, '' AS `Model`, \
+            return Ok(
+                "SELECT '' AS `Index`, '' AS `Table`, '' AS `Column`, '' AS `Model`, \
                        '' AS `State`, 0 AS `Rows`, 0 AS `Shards`, CAST(NULL AS CHAR) AS `Error` \
                        FROM DUAL WHERE 0 = 1"
-                .to_owned());
+                    .to_owned(),
+            );
         }
         Ok(rows.join(" UNION ALL "))
     }
@@ -787,7 +821,12 @@ impl PassSession {
     }
 
     /// One `RETRIEVE()`'s search (see the module docs), timed and counted.
-    async fn retrieval_search(&mut self, cx: &mut ExecCtx<'_>, wire: Wire, call: &Call) -> Result<Found> {
+    async fn retrieval_search(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        wire: Wire,
+        call: &Call,
+    ) -> Result<Found> {
         let started = Instant::now();
         let r = Box::pin(self.retrieval_search_inner(cx, wire, call)).await;
         match &r {
@@ -852,13 +891,17 @@ impl PassSession {
                 let q = call.query.clone();
                 tokio::task::spawn_blocking(move || {
                     let m = sprig_embed::local::shared(&dir)?;
-                    m.embed_query(&q).map(|v| v.to_vec()).map_err(|e| e.to_string())
+                    m.embed_query(&q)
+                        .map(|v| v.to_vec())
+                        .map_err(|e| e.to_string())
                 })
                 .await
                 .ok()
                 .and_then(|r| {
-                    r.map_err(|why| tracing::warn!(%why, "retrieval search without the query embedding"))
-                        .ok()
+                    r.map_err(
+                        |why| tracing::warn!(%why, "retrieval search without the query embedding"),
+                    )
+                    .ok()
                 })
             }
         };
@@ -953,14 +996,16 @@ impl PassSession {
                             Some(mysql_async::Value::Bytes(b)) => Some(b.clone()),
                             _ => None,
                         };
-                        let text_of = |i: usize| b(i).map(|x| String::from_utf8_lossy(&x).into_owned());
+                        let text_of =
+                            |i: usize| b(i).map(|x| String::from_utf8_lossy(&x).into_owned());
                         let cand = Candidate {
                             key: (0..nk).map(|i| keys[i].text(b(i).as_deref())).collect(),
                             chunk_no: text_of(nk).and_then(|s| s.parse().ok()).unwrap_or(0),
                             title: text_of(nk + 1),
                             text: text_of(nk + 2).unwrap_or_default(),
                         };
-                        let score: f64 = text_of(nk + 3).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                        let score: f64 =
+                            text_of(nk + 3).and_then(|s| s.parse().ok()).unwrap_or(0.0);
                         if keyword {
                             kw.push((score, cand));
                         } else {
@@ -987,7 +1032,13 @@ impl PassSession {
                         let eq: Vec<String> = keys
                             .iter()
                             .zip(k)
-                            .map(|(c, v)| format!("{} = {}", quote(&c.name), key_literal(c, v.as_deref(), nbe)))
+                            .map(|(c, v)| {
+                                format!(
+                                    "{} = {}",
+                                    quote(&c.name),
+                                    key_literal(c, v.as_deref(), nbe)
+                                )
+                            })
                             .collect();
                         format!("({})", eq.join(" AND "))
                     })
@@ -1138,8 +1189,16 @@ mod tests {
         assert_eq!(hits[0].text, "1/0");
         assert_eq!(hits[0].bm25_rank, Some(1));
         assert_eq!(hits[0].vector_rank, Some(2));
-        assert_eq!(hits.iter().filter(|h| h.key[0].as_deref() == Some("1")).count(), 2);
-        assert!(hits.iter().any(|h| h.text == "3/0" && h.bm25_rank.is_none()));
+        assert_eq!(
+            hits.iter()
+                .filter(|h| h.key[0].as_deref() == Some("1"))
+                .count(),
+            2
+        );
+        assert!(
+            hits.iter()
+                .any(|h| h.text == "3/0" && h.bm25_rank.is_none())
+        );
         assert_eq!(fuse(&kw, &v, 1.0, 1).len(), 1);
     }
 

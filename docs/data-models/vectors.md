@@ -201,6 +201,20 @@ The worker finds the model in `docs.model_dir`, the same directory the docs sear
 | `sprig_ai_embedding_backlog` | gauge | none | Changed rows a worker has read and not yet written |
 | `sprig_ai_embedding_cutovers_total` | counter | `result` | Re-embeddings swapped in: `done` or `failed` |
 
+## Retrieval indexes
+
+When the text to search is long (articles, tickets, manuals), one vector per row isn't enough: a retrieval index cuts each row's text into chunks, embeds every chunk with the bundled model, indexes the chunks for full-text search too, and keeps them in step with the table. `RETRIEVE()` then searches by meaning and by keywords at once and returns the best chunks with their rows' keys, only from rows the caller may read:
+
+```sql
+CREATE RETRIEVAL INDEX kb ON articles (body) TITLE title FILTERS (product);
+
+SELECT id, chunk, score
+FROM RETRIEVE(kb, 'how do I reset my password', 5, 'product = ''app''')
+ORDER BY `rank`;
+```
+
+The same search is `POST /v1/databases/{database}/retrieval/{index}:search` over REST. See [Retrieval indexes](../sql/retrieval-indexes.md).
+
 ## MongoDB collections
 
 MongoDB clients search vectors the way MongoDB Atlas does: create a search index of type `vectorSearch`, then use the `$vectorSearch` aggregation stage. See [MongoDB](../connect/mongodb.md) for connecting, and [Documents](documents.md) for how documents are stored.
@@ -491,4 +505,5 @@ Over HTTP these return 400 unless stated, with the code in the body. MongoDB cli
 - [Documents](documents.md)
 - [Cross-model queries](cross-model-queries.md)
 - [Search and vectors in SQL](../sql/search-and-vectors.md)
+- [Retrieval indexes](../sql/retrieval-indexes.md)
 - [Automatic indexing](../performance/automatic-indexing.md)

@@ -21,10 +21,12 @@
 //!    `orphanage` back to `none` (within its `sharding.check_interval_seconds`).
 //!
 //! ```sh
-//! source target/agent-r3small/env.sh   # a private deployment (gateway-dev.sh up)
+//! # a private deployment (gateway-dev.sh up on your own etcd); sprigctl's
+//! # calls below name no endpoint, so point it at that deployment's controller
+//! export SPRIGCTL_ENDPOINT=http://127.0.0.1:35480
 //! export SPRIG_TEST_ORPH_GATEWAY=127.0.0.1:35306 SPRIG_TEST_ORPH_TENANT=<tenant> \
-//!   SPRIG_TEST_ORPH_TENANT_ID=<id> SPRIG_TEST_ORPH_CLUSTER=127.0.0.1:13301 \
-//!   SPRIG_TEST_ORPH_SPRIGCTL=target/agent-r3small/debug/sprigctl
+//!   SPRIG_TEST_ORPH_TENANT_ID=<id> SPRIG_TEST_ORPH_CLUSTER=<its cluster> \
+//!   SPRIG_TEST_ORPH_SPRIGCTL=target/debug/sprigctl
 //! cargo test -p sprig-gateway --test orphanage_live -- --nocapture
 //! ```
 //!

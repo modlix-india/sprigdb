@@ -364,6 +364,10 @@ Rules:
 
 Errors: 39997 `ER_SPRIG_EMBEDDING_FAILED` for a source that isn't a function of the row, an unknown model alias, a dimension that isn't the model's, `ON CHANGE SYNC`, a provider's model (not available yet), a missing primary key, a column name that is too long, or a change the column refuses; 39050 for a statement declaring an embedded column that also names a reserved (`_sprig_`) column.
 
+### Retrieval indexes
+
+`CREATE RETRIEVAL INDEX` keeps a table's text cut into chunks, each chunk embedded and full-text indexed, in step with the table; `RETRIEVE(index, 'query', limit [, 'filter'])` searches it by meaning and keywords at once, in a `FROM` list, with the caller's privileges and row-level security applied. The full reference, with the REST route, is [Retrieval indexes](retrieval-indexes.md).
+
 ### Distance functions
 
 | Function | Returns |
@@ -445,5 +449,6 @@ On the MySQL persona (port 3306), `SELECT … FROM t [WHERE …] ORDER BY ST_Dis
 
 - [Search](../data-models/search.md)
 - [Vectors](../data-models/vectors.md)
+- [Retrieval indexes](retrieval-indexes.md)
 - [Automatic indexing](../performance/automatic-indexing.md)
 - [EXPLAIN and workload](explain-and-workload.md)

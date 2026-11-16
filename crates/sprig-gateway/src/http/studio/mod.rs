@@ -831,7 +831,7 @@ fn rows_of(r: &ExecuteResponse) -> Vec<Vec<Option<String>>> {
 ///
 /// # Errors
 /// The request, unchanged, when it isn't Studio's.
-#[allow(clippy::result_large_err)] // the request goes back to the REST router
+#[allow(clippy::result_large_err, clippy::too_many_lines)] // the request goes back to the REST router; one arm per route
 pub async fn handle(
     core: &Arc<Core>,
     info: &ConnInfo,

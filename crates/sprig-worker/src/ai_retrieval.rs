@@ -40,6 +40,7 @@
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -146,6 +147,9 @@ pub fn wants(op: Op, delta: Option<&[String]>, columns: &[String]) -> bool {
     }
 }
 
+/// Feed keys of one round, by shard.
+type RoundKeys = BTreeMap<ShardLoc, Vec<Vec<(String, sprig_binlog::Value)>>>;
+
 /// Where one shard of the table is.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct ShardLoc {
@@ -177,7 +181,11 @@ impl Index {
     }
 
     fn chunks(&self, schema: &str) -> String {
-        format!("{}.{}", quote(schema), quote(&retrieval::table_name(self.row.id)))
+        format!(
+            "{}.{}",
+            quote(schema),
+            quote(&retrieval::table_name(self.row.id))
+        )
     }
 
     /// The columns whose change matters: text, title, filters, key.
@@ -213,7 +221,11 @@ impl Index {
         let r = &self.row;
         let mut cols: Vec<String> = r.key_columns.iter().map(|k| quote(&k.name)).collect();
         cols.push(quote(&r.text_column));
-        cols.push(r.title_column.as_deref().map_or_else(|| "NULL".to_owned(), quote));
+        cols.push(
+            r.title_column
+                .as_deref()
+                .map_or_else(|| "NULL".to_owned(), quote),
+        );
         cols.extend(r.filters.iter().map(|f| quote(&f.name)));
         cols.push(retrieval::hash_expr(
             &r.text_column,
@@ -228,7 +240,7 @@ impl Index {
         );
         if let Some(n) = order {
             let keys: Vec<String> = r.key_columns.iter().map(|k| quote(&k.name)).collect();
-            sql.push_str(&format!(" ORDER BY {} LIMIT {n}", keys.join(", ")));
+            let _ = write!(sql, " ORDER BY {} LIMIT {n}", keys.join(", "));
         }
         sql
     }
@@ -291,7 +303,9 @@ impl Job<'_> {
 
     async fn set_state(&mut self, state: State, error: Option<&str>) -> Result<()> {
         let (mut c, store) = self.catalog().await?;
-        store.set_state(&mut c, self.ix.row.id, state, error).await?;
+        store
+            .set_state(&mut c, self.ix.row.id, state, error)
+            .await?;
         self.ix.row.state = state;
         Ok(())
     }
@@ -334,6 +348,7 @@ impl Job<'_> {
     /// The table's shards, each with its chunk table: a shard without one
     /// gets it and starts filling (state rebuilding once the index was
     /// ready); a shard gone leaves `progress`.
+    #[allow(clippy::too_many_lines)] // list, then make, then follow
     async fn shards(&mut self) -> Result<Vec<(ShardLoc, ClusterId)>> {
         if let Some((at, s)) = &self.shards
             && at.elapsed() < SHARDS_EVERY
@@ -354,7 +369,11 @@ impl Job<'_> {
                     "SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES \
                      WHERE TABLE_SCHEMA LIKE CONCAT(REPLACE(?, '_', '\\_'), '%') \
                      AND TABLE_NAME IN (?, ?)",
-                    (prefix.as_str(), self.ix.table.as_str(), chunk_table.as_str()),
+                    (
+                        prefix.as_str(),
+                        self.ix.table.as_str(),
+                        chunk_table.as_str(),
+                    ),
                 )
                 .await
                 .map_err(backend)?;
@@ -414,8 +433,10 @@ impl Job<'_> {
                 }
                 self.progress.insert(schema, Value::Null);
                 changed = true;
-            } else if !self.progress.contains_key(&schema) {
-                self.progress.insert(schema, Value::Null);
+            } else if let std::collections::btree_map::Entry::Vacant(e) =
+                self.progress.entry(schema)
+            {
+                e.insert(Value::Null);
                 changed = true;
             }
         }
@@ -482,7 +503,7 @@ impl Job<'_> {
     /// Brings the source rows `sql` selects up to date in the chunk table
     /// of `schema` (see the module docs); the last row's key as SQL
     /// literals and the number of rows read.
-    #[allow(clippy::too_many_lines)] // the reconcile of the module docs
+    #[allow(clippy::too_many_lines, clippy::many_single_char_names)] // the reconcile of the module docs
     async fn reconcile(
         &mut self,
         s: &ShardLoc,
@@ -502,14 +523,20 @@ impl Job<'_> {
                 let key: Vec<mysql_async::Value> = (0..nk)
                     .map(|i| r.as_ref(i).cloned().unwrap_or(mysql_async::Value::NULL))
                     .collect();
-                let key_text = (0..nk).map(|i| keys[i].text(bytes(r, i).as_deref())).collect();
+                let key_text = (0..nk)
+                    .map(|i| keys[i].text(bytes(r, i).as_deref()))
+                    .collect();
                 SrcRow {
                     key,
                     key_text,
                     text: text_of(r, nk),
                     title: text_of(r, nk + 1),
                     filters: (0..nf)
-                        .map(|i| r.as_ref(nk + 2 + i).cloned().unwrap_or(mysql_async::Value::NULL))
+                        .map(|i| {
+                            r.as_ref(nk + 2 + i)
+                                .cloned()
+                                .unwrap_or(mysql_async::Value::NULL)
+                        })
                         .collect(),
                     hash: bytes(r, nk + 2 + nf),
                 }
@@ -559,8 +586,9 @@ impl Job<'_> {
             );
             let got: Vec<mysql_async::Row> = c.query(q).await.map_err(backend)?;
             for r in &got {
-                let kt: Vec<Option<String>> =
-                    (0..nk).map(|i| keys[i].text(bytes(r, i).as_deref())).collect();
+                let kt: Vec<Option<String>> = (0..nk)
+                    .map(|i| keys[i].text(bytes(r, i).as_deref()))
+                    .collect();
                 if let Some(h) = bytes(r, nk) {
                     stored.insert(kt, h);
                 }
@@ -655,10 +683,7 @@ impl Job<'_> {
             }
             let inputs: Vec<String> = group
                 .iter()
-                .flat_map(|(_, ch)| {
-                    ch.iter()
-                        .map(|(h, t)| retrieval::embedding_input(h, t))
-                })
+                .flat_map(|(_, ch)| ch.iter().map(|(h, t)| retrieval::embedding_input(h, t)))
                 .collect();
             let vectors = if inputs.is_empty() {
                 Vec::new()
@@ -909,9 +934,8 @@ async fn load(env: &EmbedEnv, tenant: TenantId, id: u64) -> Result<Option<Index>
     let Some((db, table)) = table_of(&mut c, &schema, row.object_id).await? else {
         return Ok(None);
     };
-    let chunking = Chunking::from_catalog(&row.chunking).unwrap_or(Chunking::Tokens(
-        sprig_sql::retrieval::DEFAULT_CHUNK_TOKENS,
-    ));
+    let chunking = Chunking::from_catalog(&row.chunking)
+        .unwrap_or(Chunking::Tokens(sprig_sql::retrieval::DEFAULT_CHUNK_TOKENS));
     Ok(Some(Index {
         row,
         db,
@@ -1105,7 +1129,9 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
                     backlog_set(&job_key, 0);
                     forget(env, tenant, name, id).await;
                     tracing::info!(%tenant, index = id, "retrieval index or its table is gone; job ends");
-                    return Ok(json!({"stopped": "the index or its table is gone", "indexed": job.indexed}));
+                    return Ok(
+                        json!({"stopped": "the index or its table is gone", "indexed": job.indexed}),
+                    );
                 }
                 Ok(Some(mut x)) => {
                     if x.table != job.ix.table {
@@ -1177,7 +1203,7 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
             }
         }
         let watched = job.ix.watched();
-        let mut keys: BTreeMap<ShardLoc, Vec<Vec<(String, sprig_binlog::Value)>>> = BTreeMap::new();
+        let mut keys: RoundKeys = BTreeMap::new();
         let mut truncated: BTreeSet<ShardLoc> = BTreeSet::new();
         let mut seen: HashSet<(ShardLoc, String)> = HashSet::new();
         for i in &items {

@@ -747,7 +747,7 @@ async fn a_drop_cut_off_by_a_gateway_crash_is_finished_by_the_copy_worker() {
         started.elapsed().as_secs_f64()
     );
     assert!(left.is_empty(), "still there: {left:?}");
-    drop(b);
+    std::mem::drop(b);
     // The child's override is its own row, and the hide went with the share.
     let mut c = conn(&e.addr, &e.child).await;
     ok(&mut c, &format!("USE {db}")).await;
