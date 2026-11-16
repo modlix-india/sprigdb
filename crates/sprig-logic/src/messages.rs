@@ -1614,6 +1614,33 @@ mod tests {
     }
 
     #[test]
+    fn compiled_entries_are_called_with_the_fields_they_read() {
+        let sig = json!({"params": [{"name": "ctx", "type": "json"}], "compiled": {
+            "params": [{"name": "value", "type": "str"}, {"name": "offset", "type": "i64"},
+                       {"name": "headers", "type": "json"}, {"name": "key", "type": "str"}],
+            "log": true}});
+        let e = CompiledEntry::of(&sig).unwrap();
+        assert!(e.log);
+        let ev = json!({"value": "{}", "offset": 9, "headers": {"a": "b"}, "key": null});
+        assert_eq!(
+            e.call("shop", 44, 3, &ev),
+            "CALL `shop`.`__sprig_l44_v3`(_utf8mb4 X'7B7D', 9, _utf8mb4 X'7B2261223A2262227D', \
+             NULL, @__sprig_e, @__sprig_r, @__sprig_l)"
+        );
+        assert!(CompiledEntry::of(&script_signature()).is_none());
+        // Rollout keys.
+        let rec = json!({"key": "k1", "partition": 0});
+        assert_eq!(rollout_key(&rec, None).as_deref(), Some("k1"));
+        assert_eq!(rollout_key(&json!({"key": null}), Some("ff")), None);
+        let msg = json!({"body": "x", "properties": {"message_id": "order-7"}});
+        assert_eq!(rollout_key(&msg, Some("ff")).as_deref(), Some("order-7"));
+        assert_eq!(
+            rollout_key(&json!({"body": "x", "properties": {}}), Some("ff")).as_deref(),
+            Some("ff")
+        );
+    }
+
+    #[test]
     fn transient_errors() {
         assert!(transient(&SprigError::backend(1213, *b"40001", "deadlock")));
         assert!(!transient(&SprigError::backend(1062, *b"23000", "dup")));

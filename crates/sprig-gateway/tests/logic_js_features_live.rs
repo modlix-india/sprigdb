@@ -694,7 +694,11 @@ $$"
         )
     };
     let r = sql(&mut c, &ctrig("on_cevent", "c", "")).await;
-    let n = if r.is_ok() { notes(&mut c).await } else { String::new() };
+    let n = if r.is_ok() {
+        notes(&mut c).await
+    } else {
+        String::new()
+    };
     ck.check(
         "a stream trigger reading JSON.parse and ctx.record compiles into MariaDB",
         r.is_ok() && n.contains("tier mariadb"),
@@ -705,7 +709,11 @@ $$"
         &ctrig("on_eevent", "e", "WITH (SPRIG_TIER = 'engine')"),
     )
     .await;
-    let n = if r.is_ok() { notes(&mut c).await } else { String::new() };
+    let n = if r.is_ok() {
+        notes(&mut c).await
+    } else {
+        String::new()
+    };
     ck.check(
         "its twin deploys in the engine tier",
         r.is_ok() && n.contains("tier engine"),
@@ -725,10 +733,15 @@ $$"
     let q = |src: &str| format!("SELECT k, what FROM hits WHERE src = '{src}' ORDER BY k");
     let compiled = wait_rows(&mut c, &q("c"), 4, 90).await;
     let engine = wait_rows(&mut c, &q("e"), 4, 90).await;
-    let want: Rows = [("c1", "a/5"), ("c2", "5/0"), ("c3", "b/1.5"), ("c4", "none/0")]
-        .iter()
-        .map(|(k, w)| vec![Some((*k).to_owned()), Some((*w).to_owned())])
-        .collect();
+    let want: Rows = [
+        ("c1", "a/5"),
+        ("c2", "5/0"),
+        ("c3", "b/1.5"),
+        ("c4", "none/0"),
+    ]
+    .iter()
+    .map(|(k, w)| vec![Some((*k).to_owned()), Some((*w).to_owned())])
+    .collect();
     ck.check(
         "the compiled stream trigger ran each record once, as its engine-tier twin did",
         compiled == want && engine == want,
@@ -873,7 +886,11 @@ export default function (ctx) {{
 $$"
             );
             let r = sql(&mut c, &t).await;
-            let n = if r.is_ok() { notes(&mut c).await } else { String::new() };
+            let n = if r.is_ok() {
+                notes(&mut c).await
+            } else {
+                String::new()
+            };
             deployed.push((r.is_ok(), n));
         }
         ck.check(

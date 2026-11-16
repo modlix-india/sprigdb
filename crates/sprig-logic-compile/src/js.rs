@@ -2105,7 +2105,10 @@ impl<'s, 'c> L<'s, 'c> {
                 UnOp::Not,
                 Box::new(Expr::call(
                     Builtin::JsonKind,
-                    vec![Expr::Local(arr), Expr::Lit(Literal::Str("array".to_owned()))],
+                    vec![
+                        Expr::Local(arr),
+                        Expr::Lit(Literal::Str("array".to_owned())),
+                    ],
                 )),
             );
             let msg = format!(
@@ -3487,9 +3490,7 @@ impl L<'_, '_> {
             }
             Expression::ChainExpression(c) => match &c.expression {
                 oxc_ast::ast::ChainElement::StaticMemberExpression(m) => self.static_member(m),
-                oxc_ast::ast::ChainElement::ComputedMemberExpression(m) => {
-                    self.computed_member(m)
-                }
+                oxc_ast::ast::ChainElement::ComputedMemberExpression(m) => self.computed_member(m),
                 _ => self.stop("js.optional_chain", c.span, "optional chaining"),
             },
             Expression::ComputedMemberExpression(m) => self.computed_member(m),
@@ -3588,8 +3589,7 @@ impl L<'_, '_> {
                     });
                 }
                 Var::Elem { local, cols } => {
-                    let Some((_, ty)) = cols.iter().find(|(c, _)| c == prop).cloned()
-                    else {
+                    let Some((_, ty)) = cols.iter().find(|(c, _)| c == prop).cloned() else {
                         return self.stop(
                             "js.member",
                             m.span,
@@ -4259,11 +4259,7 @@ impl L<'_, '_> {
                         (x, y)
                     }
                     (true, true) => {
-                        return self.stop(
-                            "js.compare",
-                            span,
-                            "comparing two parsed JSON values",
-                        );
+                        return self.stop("js.compare", span, "comparing two parsed JSON values");
                     }
                     (true, false) => (self.num(x, span)?, y),
                     (false, true) => {
@@ -4625,7 +4621,11 @@ impl L<'_, '_> {
             {
                 let v = self.val(&u.argument)?;
                 if !self.is_dyn(&v) {
-                    return self.stop("js.operator", u.span, "typeof of a value that isn't parsed JSON");
+                    return self.stop(
+                        "js.operator",
+                        u.span,
+                        "typeof of a value that isn't parsed JSON",
+                    );
                 }
                 let e = match k.value.as_str() {
                     "object" => Expr::Binary(
@@ -4656,7 +4656,11 @@ impl L<'_, '_> {
             if !self.is_dyn(&v) {
                 // Not parsed: the ordinary comparison with null.
                 let n = V::null();
-                let (l, r) = if std::ptr::eq(x, &b.left) { (v, n) } else { (n, v) };
+                let (l, r) = if std::ptr::eq(x, &b.left) {
+                    (v, n)
+                } else {
+                    (n, v)
+                };
                 return self.binary(b.operator, l, r, b.span).map(Some);
             }
             let e = if !strict {
@@ -4727,7 +4731,11 @@ impl L<'_, '_> {
             };
             let v = self.val(x)?;
             if !self.is_dyn(&v) {
-                return self.stop("js.call", c.span, "Array.isArray of a value that isn't parsed JSON");
+                return self.stop(
+                    "js.call",
+                    c.span,
+                    "Array.isArray of a value that isn't parsed JSON",
+                );
             }
             return Ok(Some(V {
                 e: Expr::call(

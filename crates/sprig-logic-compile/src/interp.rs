@@ -915,7 +915,9 @@ fn json_builtin(b: Builtin, a: &[Value]) -> Result<Value> {
                 (Builtin::JsonAsBool, V::Json(J::Bool(x))) => V::Bool(*x),
                 (Builtin::JsonAsNum, v) if num(v).is_some() => V::Float(num(v).unwrap_or(0.0)),
                 (Builtin::JsonAsInt, v)
-                    if num(v).is_some_and(|x| x.fract() == 0.0 && x.abs() <= 9_007_199_254_740_992.0) =>
+                    if num(v).is_some_and(|x| {
+                        x.fract() == 0.0 && x.abs() <= 9_007_199_254_740_992.0
+                    }) =>
                 {
                     V::Int(num(v).unwrap_or(0.0) as i64)
                 }

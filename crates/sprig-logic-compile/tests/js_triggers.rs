@@ -168,7 +168,8 @@ impl Suite {
             self.rt
                 .block_on(async {
                     c.query_drop(format!("USE `{s}`")).await?;
-                    c.query_drop("DROP TABLE IF EXISTS hits, stock, jobs").await?;
+                    c.query_drop("DROP TABLE IF EXISTS hits, stock, jobs")
+                        .await?;
                     for q in SEED {
                         c.query_drop(*q).await?;
                     }
@@ -256,9 +257,7 @@ impl Suite {
             default_db: None,
             info: ctx.clone(),
         };
-        let r = self
-            .rt
-            .block_on(p.run(vec![ctx], host, Limits::default()));
+        let r = self.rt.block_on(p.run(vec![ctx], host, Limits::default()));
         match r {
             Ok(o) if matches!(o.event.as_str(), "error" | "reject") => Err(39865),
             Ok(_) => Ok(db.lines.lock().unwrap().clone()),
@@ -418,7 +417,11 @@ impl Suite {
             if reran != c.reruns.contains(&i) {
                 self.failures.push(format!(
                     "{label}: the compiled side {} QuickJS",
-                    if reran { "handed it to" } else { "kept it from" }
+                    if reran {
+                        "handed it to"
+                    } else {
+                        "kept it from"
+                    }
                 ));
             }
             println!("{label}: {want:?}{}", if reran { " (QuickJS)" } else { "" });

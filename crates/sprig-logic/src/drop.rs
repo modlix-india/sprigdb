@@ -159,8 +159,7 @@ pub struct AlterTrigger {
 pub fn parse_alter_trigger(sql: &str) -> Option<AlterTrigger> {
     let head: String = sql.chars().take(512).collect();
     let w = words(&head);
-    if w.len() < 4 || !w[0].eq_ignore_ascii_case("alter") || !w[1].eq_ignore_ascii_case("trigger")
-    {
+    if w.len() < 4 || !w[0].eq_ignore_ascii_case("alter") || !w[1].eq_ignore_ascii_case("trigger") {
         return None;
     }
     let (db, name) = match w[2].rsplit_once('.') {
@@ -621,7 +620,8 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_alter_trigger("ALTER TRIGGER shop.sync ROLLOUT TO 30 PERCENT").and_then(|a| a.rollout),
+            parse_alter_trigger("ALTER TRIGGER shop.sync ROLLOUT TO 30 PERCENT")
+                .and_then(|a| a.rollout),
             Some(Ok(crate::rollout::RolloutOp::To(30, None)))
         );
         assert_eq!(

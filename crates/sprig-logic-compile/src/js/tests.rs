@@ -1222,7 +1222,11 @@ fn stream_triggers_read_the_record_and_parsed_json() {
         &s,
     );
     // `e.items ?? []` mixes an array literal with parsed JSON: refused.
-    assert!(reasons(&c).contains(&"js.dynamic_types".to_owned()), "{:?}", reasons(&c));
+    assert!(
+        reasons(&c).contains(&"js.dynamic_types".to_owned()),
+        "{:?}",
+        reasons(&c)
+    );
     let c = js(
         "export default function (ctx) {
            const r = ctx.record;
@@ -1238,15 +1242,22 @@ fn stream_triggers_read_the_record_and_parsed_json() {
         &s,
     );
     assert!(c.compilable(), "{:?}", c.analysis.reasons);
-    let names: Vec<&str> = c.ir.as_ref().unwrap().params.iter().map(|p| p.name.as_str()).collect();
+    let names: Vec<&str> =
+        c.ir.as_ref()
+            .unwrap()
+            .params
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
     assert_eq!(names, ["value", "key", "offset", "headers"]);
-    let rec = |value: serde_json::Value| {
-        json!({"key": "k1", "value": value, "offset": 7, "headers": {"x-src": "app"}})
-    };
+    let rec = |value: serde_json::Value| json!({"key": "k1", "value": value, "offset": 7, "headers": {"x-src": "app"}});
     let v = json!({"type": "add", "user": {"name": "ann"}, "items": [{"qty": 2}, {"qty": 1.5}],
                    "n": 3, "tags": ["a", "b"], "flag": 1});
     assert_eq!(
-        run_logs(&c, &record_args(&c, &rec(serde_json::Value::String(v.to_string())))),
+        run_logs(
+            &c,
+            &record_args(&c, &rec(serde_json::Value::String(v.to_string())))
+        ),
         Ok(vec![
             "add ann 7 7 true 2".to_owned(),
             "flagged 3".to_owned(),
@@ -1261,14 +1272,23 @@ fn stream_triggers_read_the_record_and_parsed_json() {
     // A missing member is undefined: `?.` of it too.
     let v = json!({"n": "3", "tags": "ab"});
     assert_eq!(
-        run_logs(&c, &record_args(&c, &rec(serde_json::Value::String(v.to_string())))),
+        run_logs(
+            &c,
+            &record_args(&c, &rec(serde_json::Value::String(v.to_string())))
+        ),
         Err(39876),
         "`e.n == 3` with a string n converts: the engine tier"
     );
     let v = json!({"n": 4, "tags": "abc", "flag": ""});
     assert_eq!(
-        run_logs(&c, &record_args(&c, &rec(serde_json::Value::String(v.to_string())))),
-        Ok(vec!["none undefined 0 7 true 3".to_owned(), "app false".to_owned()])
+        run_logs(
+            &c,
+            &record_args(&c, &rec(serde_json::Value::String(v.to_string())))
+        ),
+        Ok(vec![
+            "none undefined 0 7 true 3".to_owned(),
+            "app false".to_owned()
+        ])
     );
     // Not JSON: the engine tier throws its own SyntaxError.
     assert_eq!(
@@ -1277,7 +1297,11 @@ fn stream_triggers_read_the_record_and_parsed_json() {
     );
     // The generated code has the log parameter and the helpers.
     let p = c.plsql.as_ref().unwrap();
-    assert!(p.procedure.contains("p__log OUT LONGTEXT"), "{}", p.procedure);
+    assert!(
+        p.procedure.contains("p__log OUT LONGTEXT"),
+        "{}",
+        p.procedure
+    );
     let body = p.package_body.as_deref().unwrap_or_default();
     for f in ["j_parse", "j_get", "j_at", "j_truthy", "j_text"] {
         assert!(body.contains(&format!("FUNCTION {f}(")), "{f}");
@@ -1310,7 +1334,10 @@ fn queue_triggers_bind_parsed_values_by_column() {
             _ => "?",
         })
         .collect();
-    assert_eq!(kinds, ["json_as_int", "json_as_int", "json_as_int", "json_as_str"]);
+    assert_eq!(
+        kinds,
+        ["json_as_int", "json_as_int", "json_as_int", "json_as_str"]
+    );
     // Where the column isn't known, the value must be converted first.
     let c = js(
         "const job = JSON.parse(ctx.message.body);

@@ -1191,7 +1191,9 @@ fn json_helpers(spec: &mut String, body: &mut String) {
     for (head, rest) in fns {
         let _ = writeln!(spec, "  {head};");
         let (decls, block) = match rest.split_once("BEGIN") {
-            Some((d, b)) if !d.is_empty() => (format!("\n    {}", d.trim_end()), format!("BEGIN{b}")),
+            Some((d, b)) if !d.is_empty() => {
+                (format!("\n    {}", d.trim_end()), format!("BEGIN{b}"))
+            }
             _ => (String::new(), rest.clone()),
         };
         let _ = writeln!(body, "  {head} AS{decls}\n  {block}");

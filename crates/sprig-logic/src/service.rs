@@ -754,7 +754,10 @@ pub async fn deploy_at(
                         .map(|i| (i, f.params[i].ty))
                 });
                 match at {
-                    Some((i, sprig_logic_compile::ir::Ty::Int | sprig_logic_compile::ir::Ty::Str)) => {
+                    Some((
+                        i,
+                        sprig_logic_compile::ir::Ty::Int | sprig_logic_compile::ir::Ty::Str,
+                    )) => {
                         spec.by = crate::rollout::RolloutBy::Key(u16::try_from(i).ok());
                     }
                     Some(_) => {

@@ -198,11 +198,8 @@ pub enum RolloutOp {
 /// # Errors
 /// 39861 for anything else.
 pub fn parse_op(rest: &[String]) -> Result<RolloutOp> {
-    let usage = || {
-        syntax(
-            "expected ROLLOUT {TO n [PERCENT] [BY USER | TENANT | KEY] | PROMOTE | ABORT}",
-        )
-    };
+    let usage =
+        || syntax("expected ROLLOUT {TO n [PERCENT] [BY USER | TENANT | KEY] | PROMOTE | ABORT}");
     match rest {
         [p] if p == "promote" => Ok(RolloutOp::Promote),
         [a] if a == "abort" => Ok(RolloutOp::Abort),
@@ -782,6 +779,49 @@ mod tests {
         assert_eq!(
             user_condition(1001, 10),
             "CRC32(CONCAT(SUBSTRING_INDEX(USER(), '@', 1), ':1001')) % 100 < 10"
+        );
+    }
+
+    #[test]
+    fn keys_pick_as_mariadb_does() {
+        // MariaDB: SELECT CRC32(CONCAT(COALESCE(CAST(7 AS CHAR), ''), ':1001'))
+        // → 2705881612, % 100 → 12; CRC32('k7:1001') % 100 → 70.
+        assert_eq!(crc32fast::hash(b"7:1001"), 2_705_881_612);
+        let spec = |pct| RolloutSpec {
+            pct,
+            by: RolloutBy::Key(None),
+        };
+        assert!(key_picks_candidate(spec(13), Some("7"), 1001));
+        assert!(!key_picks_candidate(spec(12), Some("7"), 1001));
+        assert!(key_picks_candidate(spec(71), Some("k7"), 1001));
+        assert!(
+            !key_picks_candidate(spec(99), None, 1001),
+            "no key: the active version"
+        );
+        assert_eq!(
+            key_condition(1001, 13, "p_k"),
+            "CRC32(CONCAT(COALESCE(CAST(p_k AS CHAR), ''), ':1001')) % 100 < 13"
+        );
+        assert_eq!(
+            RolloutBy::parse("key:customer_id"),
+            Some(RolloutBy::Key(None))
+        );
+        assert_eq!(
+            key_param("KEY: Customer_Id").as_deref(),
+            Some("customer_id")
+        );
+        assert_eq!(key_param("key"), None);
+        for by in [
+            RolloutBy::User,
+            RolloutBy::Tenant,
+            RolloutBy::Key(None),
+            RolloutBy::Key(Some(2)),
+        ] {
+            assert_eq!(RolloutBy::parse(&by.stored()), Some(by));
+        }
+        assert_eq!(
+            parse_op(&w("to 30 by key")).unwrap(),
+            RolloutOp::To(30, Some(RolloutBy::Key(None)))
         );
     }
 

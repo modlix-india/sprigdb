@@ -320,7 +320,9 @@ pub fn bind(text: &str, want: Want, cat: &dyn Columns, at: &str) -> Result<Bound
 /// The bind variable `e` is, by number.
 fn bind_no(e: &SqlExpr) -> Option<usize> {
     match e {
-        SqlExpr::Identifier(i) if i.quote_style.is_none() => i.value.strip_prefix(BIND)?.parse().ok(),
+        SqlExpr::Identifier(i) if i.quote_style.is_none() => {
+            i.value.strip_prefix(BIND)?.parse().ok()
+        }
         SqlExpr::Nested(x) => bind_no(x),
         _ => None,
     }
@@ -442,7 +444,9 @@ fn placeholder_targets(
                     }
                 }
             }
-            SqlExpr::Between { expr, low, high, .. } => {
+            SqlExpr::Between {
+                expr, low, high, ..
+            } => {
                 if let Some(c) = column_of(expr) {
                     set(bind_no(low), ty_any(&c));
                     set(bind_no(high), ty_any(&c));

@@ -91,8 +91,10 @@ pub(crate) const MARK: &str = "/* sprig message trigger ";
 /// How long a trigger's rollout is cached.
 const ROLLOUT_TTL: Duration = Duration::from_secs(5);
 
-type RolloutCache =
-    std::collections::HashMap<(u64, u64), (std::time::Instant, Option<sprig_logic::rollout::Rollout>)>;
+type RolloutCache = std::collections::HashMap<
+    (u64, u64),
+    (std::time::Instant, Option<sprig_logic::rollout::Rollout>),
+>;
 
 /// Triggers' rollouts by tenant and module (`None`: none), read at most
 /// every [`ROLLOUT_TTL`].
@@ -869,8 +871,8 @@ impl PassSession {
         reply: &RunReply,
     ) {
         if let Some(module) = counted {
-            let failed = matches!(reply.outcome, RunOutcome::Failed | RunOutcome::Dead)
-                && !reply.transient;
+            let failed =
+                matches!(reply.outcome, RunOutcome::Failed | RunOutcome::Dead) && !reply.transient;
             self.rollout_count(cx, module, req.version, started.elapsed(), failed)
                 .await;
         }
@@ -1221,8 +1223,7 @@ impl PassSession {
                     return with_id(RunReply::of(RunOutcome::Moved));
                 }
                 // In a rollout, the message's key picks the version.
-                let (picked, counted) =
-                    self.pick_version(req, &event, Some(&message_id)).await;
+                let (picked, counted) = self.pick_version(req, &event, Some(&message_id)).await;
                 let started = std::time::Instant::now();
                 let (ran, logs) = self
                     .run_version(cx, &picked, "message", event.clone())

@@ -884,13 +884,12 @@ pub fn parse(sql: &str) -> Result<Declaration> {
                             pct = Some(n);
                         }
                         "sprig_rollout_by" => {
-                            by =
-                                Some(crate::rollout::RolloutBy::parse(&val).ok_or_else(|| {
-                                    syntax(
-                                        "SPRIG_ROLLOUT_BY is 'user', 'tenant' or \
+                            by = Some(crate::rollout::RolloutBy::parse(&val).ok_or_else(|| {
+                                syntax(
+                                    "SPRIG_ROLLOUT_BY is 'user', 'tenant' or \
                                          'key:<parameter>'",
-                                    )
-                                })?);
+                                )
+                            })?);
                             d.rollout_key = crate::rollout::key_param(&val);
                             by_caller = matches!(
                                 by,
@@ -1019,6 +1018,34 @@ mod tests {
             "CREATE FUNCTION f() LANGUAGE lua WITH (SPRIG_ROLLOUT_BY = 'user') AS $$ 1 $$",
             "CREATE FUNCTION f() LANGUAGE lua WITH (SPRIG_COLOUR = 'red') AS $$ 1 $$",
             "CREATE VALIDATION v ON t FOR INSERT LANGUAGE kirun WITH (SPRIG_ROLLOUT = 5) AS '{}'",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn rollout_by_key() {
+        use crate::rollout::RolloutBy;
+        let d = parse(
+            "CREATE OR REPLACE FUNCTION f(cust BIGINT) LANGUAGE javascript \
+             WITH (SPRIG_ROLLOUT = 20, SPRIG_ROLLOUT_BY = 'key:Cust') AS $$ return 1; $$",
+        )
+        .unwrap();
+        assert_eq!(d.rollout.unwrap().by, RolloutBy::Key(None));
+        assert_eq!(d.rollout_key.as_deref(), Some("cust"));
+        let d = parse(
+            "CREATE OR REPLACE TRIGGER g ON STREAM s LANGUAGE javascript \
+             WITH (SPRIG_ROLLOUT = 10) AS $$ 1 $$",
+        )
+        .unwrap();
+        assert_eq!(d.rollout.unwrap().by, RolloutBy::Key(None));
+        for bad in [
+            "CREATE FUNCTION f(k INT) LANGUAGE javascript WITH (SPRIG_ROLLOUT = 5, \
+             SPRIG_ROLLOUT_BY = 'key') AS $$ 1 $$",
+            "CREATE TRIGGER g ON QUEUE q LANGUAGE javascript WITH (SPRIG_ROLLOUT = 5, \
+             SPRIG_ROLLOUT_BY = 'user') AS $$ 1 $$",
+            "CREATE TRIGGER g AFTER COMMIT ON t FOR INSERT LANGUAGE javascript \
+             WITH (SPRIG_ROLLOUT = 5) AS $$ 1 $$",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
