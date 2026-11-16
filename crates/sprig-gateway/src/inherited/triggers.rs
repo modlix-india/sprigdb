@@ -129,7 +129,10 @@ fn body_of(chain: &Chain, g: &Definition) -> (String, String) {
     }
 }
 
-/// See the module docs.
+/// See the module docs. Whether every trigger is settled: `false` when
+/// another deploy (the rollout, another gateway, another session's
+/// publish) is still making one, so the caller doesn't record the
+/// instance as up to date and its next use looks again.
 ///
 /// # Errors
 /// The catalog's and the deploy's (an inherited body that no longer
@@ -139,10 +142,10 @@ pub async fn ensure_for_stream(
     chain: &Chain,
     stream_def: &Definition,
     si: &StreamInstance,
-) -> Result<()> {
+) -> Result<bool> {
     let triggers = on_stream(chain, stream_def);
     if triggers.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
     let db_id = si.stream.db.0;
     ensure_for(
@@ -164,6 +167,7 @@ pub async fn ensure_for_stream(
 
 /// The inherited triggers of the member's queue instance (`queue_def`'s
 /// instance, queue `queue_id` of database `db`); see the module docs.
+/// Whether every trigger is settled, as [`ensure_for_stream`].
 ///
 /// # Errors
 /// The catalog's and the deploy's.
@@ -173,10 +177,10 @@ pub async fn ensure_for_queue(
     queue_def: &Definition,
     db: (u32, &str),
     queue_id: u64,
-) -> Result<()> {
+) -> Result<bool> {
     let triggers = on_queue(chain, queue_def);
     if triggers.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
     ensure_for(
         svc,
@@ -201,7 +205,7 @@ async fn ensure_for(
     chain: &Chain,
     triggers: Vec<Arc<Definition>>,
     src: Source<'_>,
-) -> Result<()> {
+) -> Result<bool> {
     let t = src.tenant;
     let cat = catalog(svc, t).await?;
     let st = super::state_of(&cat);
@@ -209,6 +213,7 @@ async fn ensure_for(
     let schema = ep.store.schema().to_owned();
     let mstore = MsgStore::new(&schema);
     let dc = svc.locator.dc_store();
+    let mut settled = true;
     for g in triggers {
         let key = g.key();
         let disabled = chain.disabled(key);
@@ -266,6 +271,16 @@ async fn ensure_for(
         }
         // A new instance, or a new body.
         let instance_id = if let Some(i) = &row {
+            if i.state == InstanceState::Creating
+                && !mstore.take_over(&mut conn, key, CLAIM_ABANDONED_MS).await?
+            {
+                // Another deploy claimed it and is making it now (the
+                // rollout, or a publish on another connection or gateway).
+                // Deploying it here too would race that one for the
+                // module's version and fail with 39869.
+                settled = false;
+                continue;
+            }
             i.instance_id
         } else {
             let id = ep.store.next_object_id(&mut conn).await?.0;
@@ -287,6 +302,7 @@ async fn ensure_for(
                 .await?;
             if !claimed {
                 // Another gateway is deploying it.
+                settled = false;
                 continue;
             }
             id
@@ -309,7 +325,17 @@ async fn ensure_for(
         // them (with the stream's, a first publish needed 3 at once).
         drop(conn);
         let run_as = ensure_run_as(svc, t, &g, binding.is_none(), &extra).await?;
-        let deployed = deploy(svc, t, &g, &text, src, run_as).await?;
+        let deployed = match deploy(svc, t, &g, &text, src, run_as).await {
+            Ok(d) => d,
+            Err(e) if e.code() == Some(SprigCode::LogicVersionConflict) => {
+                // A new body deployed by two at once: the other one took
+                // the version and finishes the instance.
+                tracing::debug!(tenant = %t, def = %key, "inherited trigger being deployed by another session");
+                settled = false;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
         // A new stream trigger's position.
         if let Some(si) = src.stream {
@@ -347,8 +373,12 @@ async fn ensure_for(
             .increment(u64::from(row.is_none()));
         tracing::info!(tenant = %t, def = %key, binding = deployed.binding_id, version = deployed.version, source = src.kind.as_str(), "inherited trigger deployed");
     }
-    Ok(())
+    Ok(settled)
 }
+
+/// A `creating` instance row nobody finished for this long was left by a
+/// gateway that stopped while deploying it; the next use takes it over.
+const CLAIM_ABANDONED_MS: u64 = 30_000;
 
 /// A new stream trigger's consumer group: from the start when the stream
 /// instance came after the trigger, else at each partition's end.

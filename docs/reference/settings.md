@@ -9,7 +9,7 @@ source: the settings registry (sprig-settings)
 
 Every setting SprigDB declares, with its default, the scopes that may set it, hard bounds and when a change applies. Settings resolve from the most specific scope: object, database, tenant and its ancestors, cluster, data center, global, then the built-in default. Read them with `SHOW SPRIG SETTINGS`, change them with `ALTER TENANT|DATABASE|TABLE … SPRIG SET (key = value)` or `sprigctl settings`.
 
-731 settings in 61 groups.
+744 settings in 61 groups.
 
 ## `advisor`
 
@@ -51,7 +51,20 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `ai.effort.data` | text | `medium` | global (operator only) | low, medium, high, xhigh, max | live | The data specialist's effort: low, medium, high, xhigh or max |
 | `ai.effort.dba` | text | `medium` | global (operator only) | low, medium, high, xhigh, max | live | The DBA assistant's effort: low, medium, high, xhigh or max |
 | `ai.effort.triage` | text | `low` | global (operator only) | low, medium, high, xhigh, max | live | The triage model's effort: low, medium, high, xhigh or max |
+| `ai.embedding.backfill_rows_per_s` | int | `500` | tenant, global | 1 to 1000000 | live | Existing rows an embedded column's backfill embeds per second at most |
+| `ai.embedding.batch_rows` | int | `64` | global (operator only) | 1 to 1024 | live | Inputs the embedding worker sends to the model at once |
+| `ai.embedding.max_input_bytes` | int | `65536` | global (operator only) | 256 to 16777216 | live | A source value longer than this is cut to this many bytes before it is embedded |
+| `ai.embedding.rows_per_s` | int | `2000` | tenant, global | 1 to 1000000 | live | Rows one embedded column embeds per second at most, changes and backfill together |
+| `ai.embedding_models` | text | `{"local:bge-small":{"provider":"local","model":"BAAI/bge-small-en-v1.5","dimensions":384}}` | global (operator only) | - | live | Embedding model aliases offered to tenants, a JSON object: alias to {provider, model, dimensions}; provider local is the bundled model |
 | `ai.enabled` | bool | `false` | tenant, global | - | live | Turn on the tenant's AI assistants. Off until a provider is configured and a tenant admin turns it on |
+| `ai.functions.cache_days` | int | `30` | tenant, global | 0 to 3650 | live | Days an AI function's answer from a provider is reused for the same function, model, arguments and input; 0 turns the cache off |
+| `ai.functions.cache_max_entries` | int | `100000` | tenant, global (operator only) | 0 to 100000000 | live | Answers the tenant's AI function cache keeps; past it the least recently used go first |
+| `ai.functions.enabled` | bool | `false` | tenant, global | - | live | Turn on the AI functions in SQL (AI_EMBED, AI_CLASSIFY, AI_EXTRACT, AI_SUMMARIZE, AI_COMPLETE) and their MongoDB aggregation operators for the tenant. Provider models also need ai.share_data, since their inputs are row values |
+| `ai.functions.max_inputs` | int | `10000` | tenant, global (operator only) | 1 to 1000000 | live | Distinct inputs one statement may send to a provider through AI functions (cache hits and the bundled model don't count); more fail the statement with 39992 before anything is sent |
+| `ai.functions.max_output_tokens` | int | `1024` | global (operator only) | 64 to 32000 | live | Output tokens one provider call of an AI function may produce |
+| `ai.functions.model` | text | `` | global (operator only) | - | live | provider/model that AI_CLASSIFY, AI_EXTRACT, AI_SUMMARIZE and AI_COMPLETE use when the call names none; empty: ai.model.data |
+| `ai.functions.models` | text | `` | global (operator only) | - | live | Other provider/model values an AI function's model argument may name, comma-separated; the default model is always allowed |
+| `ai.functions.on_budget` | text | `error` | tenant, global | error, null | live | What an AI function does when the daily token budget is spent: error fails the statement with 39992; null gives NULL for the rows not yet answered |
 | `ai.max_output_tokens` | int | `16000` | global (operator only) | 256 to 128000 | live | Output tokens one model call may produce, reasoning included |
 | `ai.max_tool_rounds` | int | `12` | global (operator only) | 0 to 100 | live | Tool rounds one assistant turn may take |
 | `ai.mcp.calls_per_minute` | int | `120` | tenant, global | 1 to 100000 | live | MCP tool calls one user may make per minute; more are refused until the minute is over |

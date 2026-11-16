@@ -26,7 +26,10 @@
     clippy::expect_used,
     missing_docs,
     clippy::too_many_lines,
-    clippy::cast_precision_loss
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names
 )]
 
 use std::time::{Duration, Instant};
@@ -149,7 +152,7 @@ async fn wrong_rows(
     wrong
 }
 
-async fn metric(url: &str, result: &str) -> u64 {
+fn metric(url: &str, result: &str) -> u64 {
     let Ok(out) = std::process::Command::new("curl")
         .args(["-fsS", "--max-time", "5", url])
         .output()
@@ -554,7 +557,7 @@ async fn embedded_columns_end_to_end() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let embedded_before = match &metrics {
-            Some(u) => metric(u, "embedded").await,
+            Some(u) => metric(u, "embedded"),
             None => 0,
         };
         let out = std::process::Command::new("sh")
@@ -604,8 +607,8 @@ async fn embedded_columns_end_to_end() {
             || format!("{wrong:?}"),
         );
         if let Some(u) = &metrics {
-            let after = metric(u, "embedded").await;
-            let skipped = metric(u, "skipped").await;
+            let after = metric(u, "embedded");
+            let skipped = metric(u, "skipped");
             // The new process embedded the rows not done at the kill and
             // the 15 edited ones; the ones done before were passed over.
             let left = n as u64 - at_kill + 15;

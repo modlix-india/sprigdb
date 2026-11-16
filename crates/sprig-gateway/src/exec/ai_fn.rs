@@ -223,9 +223,9 @@ fn prepared_refused() -> SprigError {
 ///
 /// # Errors
 /// 39051.
-pub(super) fn refuse_prepared(sql: &[u8], lex: &sprig_sql::lex::LexOptions) -> Result<()> {
+pub(super) fn refuse_prepared(sql: &[u8], lex: sprig_sql::lex::LexOptions) -> Result<()> {
     if ai_fn::mentions(sql)
-        && ai_fn::analyze(sql, lex)
+        && ai_fn::analyze(sql, &lex)
             .is_some_and(|p| p.is_err() || p.is_ok_and(|p| !p.calls.is_empty()))
     {
         return Err(prepared_refused());

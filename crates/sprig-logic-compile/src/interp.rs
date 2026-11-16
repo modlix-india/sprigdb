@@ -27,8 +27,8 @@ use std::collections::HashMap;
 use sprig_common::ErrorKind;
 
 use crate::ir::{
-    BinOp, Bound, Builtin, Caught, DbOp, Expr, Function, Literal, LocalId, PathSeg, SqlShape, Stmt,
-    Ty, UnOp,
+    BinOp, Bound, Builtin, Caught, DbOp, Expr, Function, Literal, LocalId, MAX_KEY_BYTES, PathSeg,
+    SqlShape, Stmt, Ty, UnOp,
 };
 
 /// A runtime value.
@@ -416,20 +416,30 @@ impl Run<'_> {
                         max_bytes,
                         compact,
                     } => {
-                        let longest = vals
+                        let lens: Vec<u64> = vals
                             .iter()
                             .map(|v| match v {
                                 Value::Null => 0,
-                                Value::Str(s) => s.len(),
-                                other => other.to_json().to_string().len(),
+                                Value::Str(s) => s.len() as u64,
+                                other => other.to_json().to_string().len() as u64,
                             })
-                            .max()
-                            .unwrap_or(0);
-                        if longest as u64 > *max_bytes {
+                            .collect();
+                        let key = lens.first().copied().unwrap_or(0);
+                        if key > MAX_KEY_BYTES {
                             return Err(SprigError::new(
                                 SprigCode::StreamRecordTooLarge,
                                 format!(
-                                    "ER_SPRIG_STREAM_RECORD_TOO_LARGE: a value of {longest} bytes is \
+                                    "ER_SPRIG_STREAM_RECORD_TOO_LARGE: a key of {key} bytes is \
+                                     above {MAX_KEY_BYTES}"
+                                ),
+                            ));
+                        }
+                        let total: u64 = lens.iter().sum();
+                        if total > *max_bytes {
+                            return Err(SprigError::new(
+                                SprigCode::StreamRecordTooLarge,
+                                format!(
+                                    "ER_SPRIG_STREAM_RECORD_TOO_LARGE: a record of {total} bytes is \
                                      above stream.max_message_bytes ({max_bytes})"
                                 ),
                             ));

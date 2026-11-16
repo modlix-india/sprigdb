@@ -317,7 +317,7 @@ async fn after_use(
         return Ok(());
     }
     adopt_settings(svc, chain, def, si).await?;
-    super::triggers::ensure_for_stream(svc, chain, def, si).await?;
+    let triggers_settled = super::triggers::ensure_for_stream(svc, chain, def, si).await?;
     // Inherited sinks (and their connections) on the instance.
     super::sinks::ensure_for_stream(svc, chain, def, si).await;
     // Fan-in triggers above read the instance.
@@ -334,7 +334,10 @@ async fn after_use(
         },
     )
     .await?;
-    set_applied(si.tenant, def.key(), sig);
+    // A trigger another deploy is still making: the next use looks again.
+    if triggers_settled {
+        set_applied(si.tenant, def.key(), sig);
+    }
     Ok(())
 }
 

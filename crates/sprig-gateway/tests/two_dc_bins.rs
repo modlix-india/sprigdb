@@ -2212,6 +2212,8 @@ async fn members_in_ams1(d: &Deployment, c: &mut Checks, pa: &str, ma: &str, m: 
     let t0 = Instant::now();
     let mut has = false;
     while !has && t0.elapsed() < Duration::from_secs(30) {
+        // A publish while the rollout deploys the trigger leaves the
+        // deploy to the rollout; it doesn't fail.
         run(
             "ams1",
             ma,

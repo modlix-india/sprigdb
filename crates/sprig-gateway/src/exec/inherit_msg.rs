@@ -3017,52 +3017,23 @@ impl PassSession {
 /// Re-applies database `db`'s inherited exchanges, queues and bindings in
 /// every member of `declarer`'s definitions that has instances there, in
 /// the background (a new definition, an override); with `unbind`, also
-/// removes that binding in each first. The number of members.
+/// removes that binding in each first. Members homed in other DCs: a
+/// gateway of each other DC does the same for the members its DC indexes.
+/// The number of members in this DC.
 async fn mq_rollout(
     svc: &Arc<TenantServices>,
     declarer: TenantId,
     db: &str,
     unbind: Option<&sprig_inherit::msg::BindingSpec>,
 ) -> Result<usize> {
-    let mut members: std::collections::BTreeSet<TenantId> = std::collections::BTreeSet::new();
-    let dcat = inherited::catalog(svc, declarer).await?;
-    let dchain = inherited::chain(svc, &dcat).await?;
-    for d in inherited::mq::declared_in(&dchain, db) {
-        for e in inherited::instances_of(svc, d.key()).await? {
-            members.insert(e.tenant);
-        }
-    }
-    let n = members.len();
+    let n = inherited::mq::rollout_here(svc, declarer, db, unbind.cloned()).await?;
+    let p = inherited::remote::MqRolloutPayload {
+        db: db.to_owned(),
+        unbind: unbind.cloned(),
+    };
     let svc = Arc::clone(svc);
-    let db = db.to_owned();
-    let unbind = unbind.cloned();
     tokio::spawn(async move {
-        for t in members {
-            inherited::mq::forget_applied(t, Some(&db));
-            let r = async {
-                if let Some(b) = &unbind {
-                    // Only the binding goes; the vhost's other instances are
-                    // applied at its next use (a drop is often followed by
-                    // more drops).
-                    return inherited::mq::remove_binding(&svc, t, &db, b)
-                        .await
-                        .map(|()| true);
-                }
-                let cat = inherited::catalog(&svc, t).await?;
-                let chain = inherited::chain(&svc, &cat).await?;
-                Box::pin(inherited::mq::ensure_vhost(
-                    &svc,
-                    &chain,
-                    &db,
-                    Cause::Declare,
-                ))
-                .await
-            }
-            .await;
-            if let Err(e) = r {
-                tracing::warn!(tenant = %t, %db, error = %e, "inherited exchanges and queues not updated; the next use retries");
-            }
-        }
+        inherited::remote::mq_rollout_in_other_dcs(&svc, declarer, &p).await;
     });
     Ok(n)
 }

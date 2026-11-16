@@ -816,11 +816,12 @@ impl StreamData for GatewayData {
         let mut publishes = Vec::with_capacity(count);
         for rec in records {
             let headers = headers_to_json(&rec.headers);
+            // The record as stored: key, value and its headers' JSON.
             publish::check_record(
                 &r.def,
                 rec.key.as_deref(),
                 rec.value.as_ref().map_or(0, Vec::len),
-                0,
+                headers.as_ref().map_or(0, String::len),
                 u64::try_from(t.max_message_bytes).unwrap_or(u64::MAX),
             )
             .map_err(|e| kafka_err(&e))?;

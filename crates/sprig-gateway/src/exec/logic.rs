@@ -53,8 +53,6 @@ tokio::task_local! {
     static LOGIC_DEPTH: u32;
 }
 
-/// `logic.function_budget_ms`'s default.
-const FUNCTION_BUDGET_MS: u64 = 5000;
 /// `logic.max_loop_iterations`'s default.
 const MAX_LOOP_ITERATIONS: u64 = 100_000;
 /// `logic.compile_max_cost`'s default.
@@ -304,6 +302,16 @@ impl PassSession {
             Some(c) => c,
             None => &mut user_session,
         };
+        // The wall budget a compiled version's wrapper sets for each call:
+        // `logic.function_budget_ms` for the database, as the engine tier
+        // reads it per call (a later change reaches compiled code when it
+        // is deployed again). Calls it makes into other compiled code run
+        // inside that budget, as an engine-tier call's nested calls do.
+        let budget_ms = svc.settings.get(
+            &sprig_logic::settings::FUNCTION_BUDGET_MS,
+            &catalog.setting_ctx(&svc.dc).with_db(row.db_id),
+            Some(&catalog.settings),
+        );
         let (decl, fixed) = match &rollback {
             Some(r) => {
                 let store = sprig_logic::LogicStore::new(ep.store.schema());
@@ -323,7 +331,7 @@ impl PassSession {
                 shard_schema: &schema,
                 single_shard,
                 user_id: user.0,
-                budget_ms: FUNCTION_BUDGET_MS,
+                budget_ms,
                 max_loop_iterations: MAX_LOOP_ITERATIONS,
                 compile_max_cost: COMPILE_MAX_COST,
             },
@@ -436,15 +444,19 @@ pub(super) fn logic_streams(
         return Vec::new();
     };
     let svc = ts.services();
-    let ctx = cat.setting_ctx(&svc.dc).with_db(db);
-    let max = svc.settings.get(
-        &sprig_streams::settings::MAX_MESSAGE_BYTES,
-        &ctx,
-        Some(&cat.settings),
-    );
     state
         .of_db(db)
         .map(|s| {
+            // The stream's own value, else its database's and up, as an
+            // `INSERT INTO <stream>` reads it.
+            let ctx = cat
+                .object_ctx(&svc.dc, sprig_common::ids::ObjectId(s.id.0))
+                .with_db(db);
+            let max = svc.settings.get(
+                &sprig_streams::settings::MAX_MESSAGE_BYTES,
+                &ctx,
+                Some(&cat.settings),
+            );
             let t = if s.kind == sprig_streams::StreamKind::Changes {
                 Err(format!(
                     "{} is a change topic, which only SprigDB writes",

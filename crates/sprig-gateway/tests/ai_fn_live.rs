@@ -25,6 +25,7 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::too_many_lines,
+    clippy::many_single_char_names,
     missing_docs
 )]
 
@@ -103,11 +104,11 @@ fn answer(body: &Value) -> String {
             s.push_str(&chunk(&json!({}), Some("stop")));
         }
     }
-    s.push_str(&format!(
-        "data: {}\n\ndata: [DONE]\n\n",
-        json!({"id": "c1", "object": "chat.completion.chunk", "model": "fn-model", "choices": [],
-               "usage": {"prompt_tokens": 50, "completion_tokens": 5, "total_tokens": 55}})
-    ));
+    let usage = json!({"id": "c1", "object": "chat.completion.chunk", "model": "fn-model", "choices": [],
+           "usage": {"prompt_tokens": 50, "completion_tokens": 5, "total_tokens": 55}});
+    s.push_str("data: ");
+    s.push_str(&usage.to_string());
+    s.push_str("\n\ndata: [DONE]\n\n");
     s
 }
 

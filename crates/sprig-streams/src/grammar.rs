@@ -21,6 +21,7 @@ use std::ops::Range;
 use sprig_common::{Result, SprigError};
 use sprig_sql::lex::{LexOptions, Token, TokenKind, ident_value, lex, string_value};
 
+use crate::measure::{self, Size};
 use crate::model::Cleanup;
 use crate::settings::parse_retention;
 
@@ -86,8 +87,12 @@ pub struct InsertInto {
     pub set_form: bool,
     /// Values in the first `VALUES` row, when there is one.
     pub first_row_arity: Option<usize>,
-    /// The longest string literal in the statement, in bytes.
-    pub longest_literal: usize,
+    /// Where the rows start: just after the column list (or the target).
+    pub source_start: usize,
+    /// For `VALUES` rows and nothing after them: what each value writes,
+    /// by row and position ([`crate::measure`]). `None` for an `INSERT ...
+    /// SELECT` or anything else after the rows.
+    pub rows: Option<Vec<Vec<Size>>>,
 }
 
 /// What a statement is, for the stream layer.
@@ -142,6 +147,8 @@ struct Cur<'a> {
     src: &'a [u8],
     toks: Vec<Token>,
     i: usize,
+    /// `NO_BACKSLASH_ESCAPES`.
+    nbe: bool,
 }
 
 impl<'a> Cur<'a> {
@@ -151,7 +158,12 @@ impl<'a> Cur<'a> {
             .into_iter()
             .filter(|t| !t.kind.is_trivia())
             .collect();
-        Some(Self { src, toks, i: 0 })
+        Some(Self {
+            src,
+            toks,
+            i: 0,
+            nbe: lex_opts.no_backslash_escapes,
+        })
     }
 
     fn peek(&self) -> Option<&Token> {
@@ -569,56 +581,25 @@ fn insert(c: &mut Cur<'_>) -> Option<InsertInto> {
         }
         columns = Some(cols);
     }
+    let source_start = c.peek().map_or(c.src.len(), |t| t.start as usize);
     let set_form = c.at("SET");
     let mut first_row_arity = None;
+    let mut rows = None;
     if (c.eat("VALUES") || c.eat("VALUE")) && c.punct(b'(') {
-        {
-            let mut depth = 0usize;
-            let mut n = 1usize;
-            let mut empty = true;
-            while let Some(t) = c.peek().copied() {
-                c.i += 1;
-                if t.kind == TokenKind::Punct {
-                    match c.text(&t) {
-                        b"(" => {
-                            depth += 1;
-                            continue;
-                        }
-                        b")" => {
-                            depth -= 1;
-                            if depth == 0 {
-                                break;
-                            }
-                            continue;
-                        }
-                        b"," if depth == 1 => n += 1,
-                        _ => {}
-                    }
-                }
-                if depth >= 1 {
-                    empty = false;
-                }
-            }
-            first_row_arity = Some(if empty { 0 } else { n });
+        rows = values_rows(c);
+        first_row_arity = rows.as_ref().and_then(|r| r.first()).map(Vec::len);
+        if rows.is_none() {
+            // Not plain rows: the first row's arity still picks the
+            // columns of a list-less insert.
+            first_row_arity = Some(first_arity(c));
         }
     }
     let mut on_duplicate = false;
-    let mut longest_literal = 0;
-    let rest_start = c.i;
     while let Some(t) = c.peek().copied() {
-        if t.kind == TokenKind::String {
-            longest_literal = longest_literal.max(t.range().len().saturating_sub(2));
-        }
         if c.is_word(Some(&t), "DUPLICATE") {
             on_duplicate = true;
         }
         c.i += 1;
-    }
-    // Literals inside the first row count too.
-    for t in &c.toks[..rest_start] {
-        if t.kind == TokenKind::String {
-            longest_literal = longest_literal.max(t.range().len().saturating_sub(2));
-        }
     }
     Some(InsertInto {
         target,
@@ -627,8 +608,98 @@ fn insert(c: &mut Cur<'_>) -> Option<InsertInto> {
         on_duplicate,
         set_form,
         first_row_arity,
-        longest_literal,
+        source_start,
+        rows,
     })
+}
+
+/// `(..), (..), ...` at the cursor (just after `VALUES`): each row's values
+/// measured, the cursor after the rows. `None` when something other than
+/// `;` or `ON DUPLICATE KEY UPDATE` follows them, or a row isn't closed.
+fn values_rows(c: &mut Cur<'_>) -> Option<Vec<Vec<Size>>> {
+    let save = c.i;
+    let mut rows = Vec::new();
+    loop {
+        if !c.eat_punct(b'(') {
+            c.i = save;
+            return None;
+        }
+        let start = c.i;
+        let mut depth = 1usize;
+        while let Some(t) = c.peek().copied() {
+            c.i += 1;
+            if t.kind == TokenKind::Punct {
+                match c.text(&t) {
+                    b"(" => depth += 1,
+                    b")" => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if depth != 0 {
+            c.i = save;
+            return None;
+        }
+        let inner = &c.toks[start..c.i - 1];
+        let row = if inner.is_empty() {
+            Vec::new()
+        } else {
+            measure::split_commas(c.src, inner)
+                .into_iter()
+                .map(|v| measure::value(c.src, v, c.nbe))
+                .collect()
+        };
+        rows.push(row);
+        if !c.eat_punct(b',') {
+            break;
+        }
+    }
+    let after = c.i;
+    let ok = c.done() || (c.at("ON") && c.is_word(c.peek_at(1), "DUPLICATE"));
+    c.i = after;
+    if ok {
+        Some(rows)
+    } else {
+        c.i = save;
+        None
+    }
+}
+
+/// The number of values in the first row at the cursor (just after
+/// `VALUES`), leaving the cursor after it.
+fn first_arity(c: &mut Cur<'_>) -> usize {
+    let mut depth = 0usize;
+    let mut n = 1usize;
+    let mut empty = true;
+    while let Some(t) = c.peek().copied() {
+        c.i += 1;
+        if t.kind == TokenKind::Punct {
+            match c.text(&t) {
+                b"(" => {
+                    depth += 1;
+                    continue;
+                }
+                b")" => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                b"," if depth == 1 => n += 1,
+                _ => {}
+            }
+        }
+        if depth >= 1 {
+            empty = false;
+        }
+    }
+    if empty { 0 } else { n }
 }
 
 /// Identifiers in `sql` (words and quoted names, values only), for the
@@ -729,7 +800,11 @@ mod tests {
             .collect();
         assert_eq!(cols, ["key", "value", "headers"]);
         assert_eq!(i.first_row_arity, Some(3));
-        assert_eq!(i.longest_literal, 10);
+        assert_eq!(
+            i.rows,
+            Some(vec![vec![Size::Bytes(4), Size::Unknown, Size::Null]])
+        );
+        assert_eq!(&s[i.source_start..i.source_start + 6], "VALUES");
         assert!(!i.on_duplicate);
         let Stmt::Insert(i) = cl("insert s values ('k', 'v') on duplicate key update v = 1") else {
             panic!()
@@ -742,6 +817,26 @@ mod tests {
             panic!()
         };
         assert_eq!(i.first_row_arity, None);
+        assert_eq!(i.rows, None);
+        let Stmt::Insert(i) =
+            cl("INSERT INTO s VALUES (_utf8mb4 X'414243', 'it''s', 0x00), ('k', CONCAT('a', 'b'))")
+        else {
+            panic!()
+        };
+        assert_eq!(
+            i.rows,
+            Some(vec![
+                vec![Size::Bytes(3), Size::Bytes(4), Size::Bytes(1)],
+                vec![Size::Bytes(1), Size::Bytes(2)],
+            ])
+        );
+        assert_eq!(i.first_row_arity, Some(3));
+        // Something after the rows: not measured here.
+        let Stmt::Insert(i) = cl("INSERT INTO s VALUES ('k', 'v') RETURNING k") else {
+            panic!()
+        };
+        assert_eq!(i.rows, None);
+        assert_eq!(i.first_row_arity, Some(2));
         assert!(matches!(
             cl("UPDATE s SET v = 1"),
             Stmt::Write { verb: "UPDATE", .. }

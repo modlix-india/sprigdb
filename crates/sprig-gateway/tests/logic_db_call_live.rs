@@ -347,24 +347,26 @@ async fn compiled_calls_and_publishes_run_the_same_everywhere() {
         ),
     )
     .await;
-    for n in [2, 6, 11] {
+    // The record is key and value together: 1 + n0 bytes, so 9 fits and
+    // 10 is one byte over in both tiers.
+    for n in [2, 6, 9, 10, 11] {
         let a = sorted(sql(&mut c, &format!("CALL pubs_c({n})")).await);
         let b = sorted(sql(&mut c, &format!("CALL pubs_e({n})")).await);
         println!("  {n}0 bytes: compiled {a:?}, engine {b:?}");
-        if n < 10 {
-            ck.check(
-                &format!("a {n}0-byte value: the same answer in both tiers"),
-                a == b,
-                format!("{a:?} / {b:?}"),
-            );
-        }
+        ck.check(
+            &format!("a {n}0-byte value: the same answer in both tiers"),
+            a == b,
+            format!("{a:?} / {b:?}"),
+        );
     }
-    let r = sql(&mut c, "CALL pubs_c(11)").await;
-    ck.check(
-        "a compiled publish above stream.max_message_bytes is caught as 39944",
-        format!("{r:?}").contains("big;") && format!("{r:?}").contains("nokey;"),
-        format!("{r:?}"),
-    );
+    for tier in ["c", "e"] {
+        let r = sql(&mut c, &format!("CALL pubs_{tier}(10)")).await;
+        ck.check(
+            &format!("a publish above stream.max_message_bytes is caught as 39944 ({tier})"),
+            format!("{r:?}").contains("big;") && format!("{r:?}").contains("nokey;"),
+            format!("{r:?}"),
+        );
+    }
 
     // ---- a callee mid-rollout ---------------------------------------------------
     let r = sql(

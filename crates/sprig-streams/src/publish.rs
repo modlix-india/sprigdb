@@ -101,28 +101,38 @@ pub fn check_record(
     max_message_bytes: u64,
 ) -> Result<()> {
     let k = key.map_or(0, <[u8]>::len);
-    if k > MAX_KEY_BYTES {
-        return Err(SprigError::new(
-            SprigCode::StreamRecordTooLarge,
-            format!(
-                "ER_SPRIG_STREAM_RECORD_TOO_LARGE: a key of {k} bytes is above {MAX_KEY_BYTES}"
-            ),
-        ));
-    }
-    let size = (k + value_len + extra) as u64;
-    if size > max_message_bytes {
-        return Err(SprigError::new(
-            SprigCode::StreamRecordTooLarge,
-            format!(
-                "ER_SPRIG_STREAM_RECORD_TOO_LARGE: a record of {size} bytes is above \
-                 stream.max_message_bytes ({max_message_bytes})"
-            ),
-        ));
-    }
+    check_size(k as u64, (k + value_len + extra) as u64, max_message_bytes)?;
     if def.cleanup == Cleanup::Compact && key.is_none() {
         return Err(SprigError::new(
             SprigCode::StreamCompactNeedsKey,
             "ER_SPRIG_STREAM_COMPACT_NEEDS_KEY: a record without a key on a compacted stream",
+        ));
+    }
+    Ok(())
+}
+
+/// The size limits every publish path applies, the same in every tier: a
+/// key of at most [`MAX_KEY_BYTES`], and a record (key, value and headers
+/// together) of at most `max_message_bytes`.
+///
+/// # Errors
+/// 39944.
+pub fn check_size(key_bytes: u64, record_bytes: u64, max_message_bytes: u64) -> Result<()> {
+    if key_bytes > MAX_KEY_BYTES as u64 {
+        return Err(SprigError::new(
+            SprigCode::StreamRecordTooLarge,
+            format!(
+                "ER_SPRIG_STREAM_RECORD_TOO_LARGE: a key of {key_bytes} bytes is above {MAX_KEY_BYTES}"
+            ),
+        ));
+    }
+    if record_bytes > max_message_bytes {
+        return Err(SprigError::new(
+            SprigCode::StreamRecordTooLarge,
+            format!(
+                "ER_SPRIG_STREAM_RECORD_TOO_LARGE: a record of {record_bytes} bytes is above \
+                 stream.max_message_bytes ({max_message_bytes})"
+            ),
         ));
     }
     Ok(())

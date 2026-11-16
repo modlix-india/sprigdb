@@ -2601,7 +2601,7 @@ impl PassSession {
         let charset = cx.proto.collation;
         let client_text = sql.clone();
         // AI functions run only in plain statements.
-        super::ai_fn::refuse_prepared(&sql, &lex)?;
+        super::ai_fn::refuse_prepared(&sql, lex)?;
         // `MATCH ... AGAINST (?)` on a search
         // index is prepared for its metadata without the call, and run as
         // text with the bound values at each execute.
@@ -2614,6 +2614,11 @@ impl PassSession {
                 s.deferred_params = true;
                 s.client = Some(client_text);
             }
+            return Ok(summary);
+        }
+        // A publish into a stream: run as text at each execute, its
+        // values written in, so every record is measured.
+        if let Some(summary) = self.streams_prepare(&sql, charset) {
             return Ok(summary);
         }
         let Some(ts) = self.tenant.as_deref_mut() else {

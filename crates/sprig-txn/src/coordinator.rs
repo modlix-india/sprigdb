@@ -1073,7 +1073,7 @@ impl<B: TxnBackend> TxnCoordinator<B> {
         tracing::info!(dtid = ?self.dtid, step = label, "finishing a distributed commit that was cut short");
         let ended = match step {
             Committing::Preparing => {
-                self.abort_prepared("client_gone").await;
+                self.abort_prepared("interrupted").await;
                 Interrupted::RolledBack
             }
             Committing::PointSent { l, dtid, sent } => {

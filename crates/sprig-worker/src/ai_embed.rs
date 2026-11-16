@@ -155,7 +155,7 @@ fn backend(e: mysql_async::Error) -> SprigError {
     };
     let mut x = SprigError::new(SprigCode::BackendUnavailable, format!("embedding: {e}"));
     x.retryable = retry;
-    x
+    x.with_source(e)
 }
 
 // ---- the parts the loop is made of -------------------------------------------
@@ -287,6 +287,10 @@ impl Throttle {
 }
 
 // ---- one column -----------------------------------------------------------------
+
+/// One row's work for one generation: the target's index, the row's key,
+/// what to do, and the source's hash.
+type Work = (usize, Vec<mysql_async::Value>, Action, Option<Vec<u8>>);
 
 /// The generation a reconcile fills: its vector, source and hash columns.
 #[derive(Debug, Clone)]
@@ -547,7 +551,7 @@ impl Job<'_> {
                 .collect::<Vec<_>>()
         });
         // (target, key values, action, source hash)
-        let mut work: Vec<(usize, Vec<mysql_async::Value>, Action, Option<Vec<u8>>)> = Vec::new();
+        let mut work: Vec<Work> = Vec::new();
         let (mut skipped, mut cleared) = (0u64, 0u64);
         for r in &rows {
             let key: Vec<mysql_async::Value> = (0..pk.len())
@@ -1099,7 +1103,7 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
                     job.col = c;
                 }
                 Err(e) => {
-                    tracing::warn!(%tenant, embedding = id, error = %e, "embedded column row unreadable")
+                    tracing::warn!(%tenant, embedding = id, error = %e, "embedded column row unreadable");
                 }
             }
             job.live

@@ -114,8 +114,11 @@ impl EngineDb {
         let body = rest.strip_suffix(')')?;
         let lits: Vec<&str> = body.split(", ").collect();
         let sizes: Vec<Option<Vec<u8>>> = lits.iter().map(|l| literal_bytes(l)).collect();
-        let longest = sizes.iter().flatten().map(Vec::len).max().unwrap_or(0);
-        if longest as u64 > MAX_BYTES {
+        // As the gateway measures every publish: a key above 4096 bytes,
+        // or key, value and headers together above the limit.
+        let key = sizes[0].as_ref().map_or(0, Vec::len);
+        let record: usize = sizes.iter().flatten().map(Vec::len).sum();
+        if key > 4096 || record as u64 > MAX_BYTES {
             return Some(Err(SprigError::new(
                 SprigCode::StreamRecordTooLarge,
                 "ER_SPRIG_STREAM_RECORD_TOO_LARGE",
@@ -676,6 +679,33 @@ fn corpus() -> Vec<(&'static str, &'static str, ScriptSig, Vec<Vec<J>>)> {
              return { caught };",
             x(),
             vec![vec![json!(1)], vec![json!(2)], vec![json!(7)]],
+        ),
+        (
+            // Calls and publishes inside larger expressions run first,
+            // before the statement they are in.
+            "inline",
+            "const t = db.call('total', x, 3).fields.total;
+             let out = 'e:' + db.call('price', x).event;
+             if (db.call('check', x).event === 'output') out = out + ';checked';
+             const n = db.publish('orders_s', 'i' + x, out).affected;
+             return { t, out, n, w: db.call('price', x).fields.why, all: db.call('total', x, 1) };",
+            x(),
+            vec![vec![json!(7)], vec![json!(8)], vec![json!(70)]],
+        ),
+        (
+            // The limit is on the whole record: key 1, value 50 and headers
+            // `{"h":"..."}` 8 + x bytes fill 64 at x = 5.
+            "publish_sizes",
+            "let v = '';
+             for (let k = 0; k < 5; k++) v = v + '0123456789';
+             let h = '';
+             for (let k = 0; k < x; k++) h = h + 'a';
+             let caught = 0;
+             try { db.publish('orders_s', 'k', v, { h: h }); } catch (e) { caught = 1; }
+             try { db.publish('orders_s', v, h); } catch (e) { caught = caught + 2; }
+             return { caught };",
+            x(),
+            vec![vec![json!(0)], vec![json!(5)], vec![json!(6)], vec![json!(14)], vec![json!(15)]],
         ),
     ]
 }

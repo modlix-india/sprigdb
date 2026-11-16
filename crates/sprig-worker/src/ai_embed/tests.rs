@@ -66,8 +66,10 @@ fn the_throttle_keeps_its_rate() {
     // Spending past zero makes the next ones wait longer.
     t.spend(200, t0 + Duration::from_secs(60));
     assert!(t.wait() >= Duration::from_secs(2));
+    // A higher rate refills faster: a second at 1,000 a second covers
+    // the 200 owed and leaves 800.
     t.set_rate(1000);
-    assert_eq!(t.take(10, t0 + Duration::from_secs(61)), 0);
+    assert_eq!(t.take(10_000, t0 + Duration::from_secs(61)), 800);
 }
 
 #[test]

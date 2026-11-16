@@ -18,6 +18,10 @@
 
 use std::fmt;
 
+/// The longest stream record key (the outbox's `k VARBINARY(4096)`), as
+/// every publish path checks it.
+pub const MAX_KEY_BYTES: u64 = 4096;
+
 /// A local variable's index into [`Function::locals`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LocalId(pub u32);
@@ -497,8 +501,9 @@ pub enum SqlShape {
     },
     /// `db.publish`: the statement is an `INSERT` of binds key, value and
     /// headers into a stream's outbox; before it, as the gateway checks a
-    /// publish, a value longer than `max_bytes` raises 39944 and, on a
-    /// compacted stream, a key that is `NULL` raises 39955. Both count as
+    /// publish, a key longer than [`MAX_KEY_BYTES`] or a record (key, value
+    /// and headers together) longer than `max_bytes` raises 39944 and, on
+    /// a compacted stream, a key that is `NULL` raises 39955. Both count as
     /// errors of the data operation.
     Publish {
         /// The `Int` local the count lands in.

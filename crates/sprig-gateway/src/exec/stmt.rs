@@ -87,6 +87,10 @@ pub(crate) struct Stmt {
     /// each execute with the bound values written in (SQL literals
     /// outside the calls, Cypher literals inside them).
     pub graph_params: bool,
+    /// Tenant sessions: with `deferred_params`, a publish into a stream,
+    /// whose bound values are written in as `X'..'` literals (any
+    /// `sql_mode`), so the stream layer measures each record.
+    pub stream_params: bool,
     /// Tenant sessions: the fingerprint workload capture made
     /// of `logical`, with what it was made under; the next execute under
     /// the same reuses it instead of normalizing the text again.
@@ -118,6 +122,7 @@ impl Stmt {
             client: None,
             deferred_params: false,
             graph_params: false,
+            stream_params: false,
             fp: None,
         }
     }
@@ -144,6 +149,7 @@ impl Stmt {
             client: None,
             deferred_params: false,
             graph_params: false,
+            stream_params: false,
             fp: None,
             sql,
         }

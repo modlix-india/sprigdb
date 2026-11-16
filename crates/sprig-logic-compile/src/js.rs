@@ -397,6 +397,10 @@ struct L<'s, 'c> {
     pre: Block,
     /// Inside a conditionally evaluated operand.
     cond: u32,
+    /// `db.call` and `db.publish` inside larger expressions, already run
+    /// into `pre`, by where they are in the source (an expression may be
+    /// lowered twice).
+    inlined: BTreeMap<u32, Var>,
     /// What jumps can reach, innermost last: loops, inlined helpers and
     /// `try` statements with a `finally`.
     jframes: Vec<JFrame>,
@@ -540,6 +544,7 @@ impl<'s, 'c> L<'s, 'c> {
             facts: BTreeSet::new(),
             pre: Vec::new(),
             cond: 0,
+            inlined: BTreeMap::new(),
             jframes: Vec::new(),
             labels: 0,
             inlining: Vec::new(),
@@ -2493,6 +2498,110 @@ impl L<'_, '_> {
         Ok(Var::Call { event, cols })
     }
 
+    /// `db.call(...)` or `db.publish(...)` inside a larger expression
+    /// (`return db.call('add_tax', x).fields.value;`): the call runs
+    /// first, before the statement it is in (as a helper's statements do),
+    /// and its result is read as a `const` holding it would be: the whole
+    /// result, `.event`, `.fields`, `.fields.<name>` or `.affected`.
+    /// `None` when `e` is none of those.
+    fn inline_db(&mut self, e: &Expression<'_>) -> R<Option<V>> {
+        let e = strip_parens(e);
+        // The call, and the members read from it.
+        let (call, path): (&Expression<'_>, Vec<&str>) = match e {
+            Expression::CallExpression(_) => (e, Vec::new()),
+            Expression::StaticMemberExpression(m) => match strip_parens(&m.object) {
+                o @ Expression::CallExpression(_) => (o, vec![m.property.name.as_str()]),
+                Expression::StaticMemberExpression(i) => match strip_parens(&i.object) {
+                    o @ Expression::CallExpression(_) => {
+                        (o, vec![i.property.name.as_str(), m.property.name.as_str()])
+                    }
+                    _ => return Ok(None),
+                },
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        let Expression::CallExpression(c) = call else {
+            return Ok(None);
+        };
+        if !matches!(
+            self.callee_path(&c.callee).as_deref(),
+            Some(["db", "call" | "publish"])
+        ) {
+            return Ok(None);
+        }
+        let key = self.salt + self.span_base + c.span.start;
+        let var = if let Some(v) = self.inlined.get(&key) {
+            v.clone()
+        } else {
+            if self.cond > 0 {
+                return self.stop(
+                    "js.db",
+                    c.span,
+                    "db.call or db.publish where its call may not run (an operand of &&, ||, ?? \
+                     or ?:): call it in a statement of its own first",
+                );
+            }
+            let mut first = Vec::new();
+            let Some(v) = self.db_call(call, "", &mut first)? else {
+                return Ok(None);
+            };
+            self.pre.append(&mut first);
+            self.inlined.insert(key, v.clone());
+            v
+        };
+        let v = match (var, path.as_slice()) {
+            (Var::Call { event, cols }, []) => V {
+                e: Expr::ObjectLit(vec![
+                    ("event".to_owned(), Expr::Local(event)),
+                    ("fields".to_owned(), Self::call_fields(&cols).e),
+                ]),
+                ty: Ty::Json,
+                nn: true,
+            },
+            (Var::Call { event, .. }, ["event"]) => V {
+                e: Expr::Local(event),
+                ty: Ty::Str,
+                nn: true,
+            },
+            (Var::Call { cols, .. }, ["fields"]) => Self::call_fields(&cols),
+            (Var::Call { cols, .. }, ["fields", f]) => {
+                let Some((_, l)) = cols.iter().find(|(c, _)| c == f) else {
+                    return self.stop(
+                        "js.member",
+                        e.span(),
+                        format!("the call returns no field {f}"),
+                    );
+                };
+                V {
+                    e: Expr::Local(*l),
+                    ty: self.f.local_def(*l).ty,
+                    nn: false,
+                }
+            }
+            (Var::Exec { affected }, ["affected"]) => V {
+                e: Expr::Local(affected),
+                ty: Ty::Int,
+                nn: true,
+            },
+            (Var::Exec { .. }, _) => {
+                return self.stop(
+                    "js.member",
+                    e.span(),
+                    "of db.publish's result only .affected compiles",
+                );
+            }
+            _ => {
+                return self.stop(
+                    "js.member",
+                    e.span(),
+                    "of db.call's result only .event, .fields and .fields.<name> compile",
+                );
+            }
+        };
+        Ok(Some(v))
+    }
+
     /// A `db.call` result's `fields` as a value: every field, in the
     /// wrapper's order, as the engine tier's row gives them.
     fn call_fields(cols: &[(String, LocalId)]) -> V {
@@ -2845,6 +2954,9 @@ impl L<'_, '_> {
                 ty: Ty::Bool,
                 nn: true,
             });
+        }
+        if let Some(v) = self.inline_db(e)? {
+            return Ok(v);
         }
         match e {
             Expression::ParenthesizedExpression(p) => self.val(&p.expression),

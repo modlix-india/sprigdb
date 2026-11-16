@@ -19,6 +19,10 @@
 //!                applies to here re-apply it, then every other DC's
 //!                ("override", with the overriding tenant's catalog version)
 //! SHOW INHERITED the instance counts add every other DC's ("count")
+//! AMQP vhost     a new or dropped exchange, queue or binding definition,
+//!                or an override of one: this DC's members re-apply their
+//!                vhost (or drop the binding), then every other DC's do
+//!                ("mq_rollout", the database and binding in the call)
 //! broadcast      the fan-out delivers to a member homed in another DC
 //!                through a gateway of that DC ("broadcast", the record in
 //!                the call), so its instance and index stay in its home
@@ -38,7 +42,9 @@ use serde::{Deserialize, Serialize};
 use sprig_api::proto::internal::{InheritedMembersReply, InheritedMembersRequest};
 use sprig_common::ids::{DcId, TenantId};
 use sprig_common::{Result, SprigCode, SprigError};
-use sprig_inherit::msg::{AppliesTo, Cause, Chain, DefKey, DefKind, Definition, TriggerSpec};
+use sprig_inherit::msg::{
+    AppliesTo, BindingSpec, Cause, Chain, DefKey, DefKind, Definition, TriggerSpec,
+};
 
 use crate::tenant::TenantServices;
 
@@ -102,6 +108,16 @@ pub struct BroadcastPayload {
     pub headers: Option<String>,
     /// `WITH INSTANCE`: only a member whose instance exists.
     pub with_instance: bool,
+}
+
+/// `payload` of an AMQP vhost re-apply: the vhost's database, and the
+/// binding to remove for an `UNBIND`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MqRolloutPayload {
+    /// The vhost's database.
+    pub db: String,
+    /// Only this binding goes (an `UNBIND` of a binding definition).
+    pub unbind: Option<BindingSpec>,
 }
 
 /// The registered DCs other than this one that aren't retired or
@@ -193,16 +209,51 @@ pub async fn in_other_dcs(svc: &TenantServices, op: MemberOp, def: DefKey) -> u6
         subtree,
         payload,
     };
+    fan_out(svc, &req).await
+}
+
+/// Asks a ready gateway of every other DC to re-apply vhost `p.db` of
+/// `declarer`'s definitions (or remove binding `p.unbind`) for the members
+/// it indexes, as [`in_other_dcs`]. The members they reached.
+pub async fn mq_rollout_in_other_dcs(
+    svc: &TenantServices,
+    declarer: TenantId,
+    p: &MqRolloutPayload,
+) -> u64 {
+    if svc.peers.get().is_none() {
+        return 0;
+    }
+    let req = InheritedMembersRequest {
+        op: MQ_ROLLOUT.to_owned(),
+        tenant_id: declarer.0,
+        object_id: 0,
+        catalog_version: svc.cache.cached(declarer).map_or(0, |c| c.version),
+        target_tenant_id: 0,
+        subtree: false,
+        payload: serde_json::to_vec(p).unwrap_or_default(),
+    };
+    fan_out(svc, &req).await
+}
+
+/// The `op` of an AMQP vhost re-apply.
+const MQ_ROLLOUT: &str = "mq_rollout";
+
+/// `req` on a ready gateway of every other DC; the instances they reached.
+async fn fan_out(svc: &TenantServices, req: &InheritedMembersRequest) -> u64 {
+    let def = DefKey {
+        tenant: TenantId(req.tenant_id),
+        object: req.object_id,
+    };
     let mut n = 0;
     for dc in other_dcs(svc) {
-        match call_dc(svc, &dc, &req).await {
+        match call_dc(svc, &dc, req).await {
             Ok(Some(r)) => n += r.instances,
             Ok(None) => {
                 tracing::debug!(%dc, %def, "no ready gateway in the DC: none of its members to reach");
             }
             Err(e) => {
-                tracing::warn!(%dc, %def, op = op.as_str(), error = %e, "no gateway of the DC applied the FOR EACH TENANT change; its sweep or the members' next use catches up");
-                failed(op.as_str());
+                tracing::warn!(%dc, %def, op = %req.op, error = %e, "no gateway of the DC applied the FOR EACH TENANT change; its sweep or the members' next use catches up");
+                failed(&req.op);
             }
         }
     }
@@ -313,6 +364,11 @@ pub async fn serve(
             n
         }
         "rollout" => rollout_here(svc, key).await?,
+        MQ_ROLLOUT => {
+            let p: MqRolloutPayload = serde_json::from_slice(&req.payload)
+                .map_err(|e| bad(format!("mq_rollout payload: {e}")))?;
+            super::mq::rollout_here(svc, key.tenant, &p.db, p.unbind).await?
+        }
         "drop_trigger" => drop_trigger_here(svc, key).await?,
         "count" => super::instances_of(svc, key).await?.len(),
         "override" => {

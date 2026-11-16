@@ -620,10 +620,15 @@ impl PassSession {
                         )
                     })?
             } else if s.deferred_params {
+                let literal = if s.stream_params {
+                    streams::param_literal
+                } else {
+                    search::param_literal
+                };
                 let values: Vec<String> = s
                     .params_for_backend(params, persona)?
                     .iter()
-                    .map(search::param_literal)
+                    .map(literal)
                     .collect();
                 std::str::from_utf8(&text)
                     .ok()

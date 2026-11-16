@@ -154,10 +154,29 @@ async fn create_publish_read_drop() {
     )
     .await
     .unwrap();
+    // A function's size isn't in the text: the session evaluates the rows.
+    assert_eq!(
+        r,
+        Handled::Publish(PublishRows {
+            source: "VALUES (7001, JSON_OBJECT('a', 1), NULL)".into(),
+            columns: vec!["k", "v", "headers"],
+            head: "INSERT INTO `__sprig_eo_41`".into(),
+            max_bytes: 100,
+            compact: false,
+        })
+    );
+    let r = handle(
+        "INSERT INTO order_events (key, value, headers) VALUES (7001, '{\"a\": 1}', NULL)",
+        &cx(&state),
+        &mut m,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         r,
         Handled::Forward {
-            sql: "INSERT INTO `__sprig_eo_41` (k, v, headers) VALUES (7001, JSON_OBJECT('a', 1), NULL)".into(),
+            sql: "INSERT INTO `__sprig_eo_41` (k, v, headers) VALUES (7001, '{\"a\": 1}', NULL)"
+                .into(),
             write: true,
             compact: false
         }
@@ -186,6 +205,158 @@ async fn create_publish_read_drop() {
     .await
     .unwrap_err();
     assert_eq!(e.code(), Some(SprigCode::StreamRecordTooLarge));
+    // Every literal form is measured, the engine tier's `_utf8mb4 X'..'`
+    // too, and the record is key, value and headers together.
+    let hex = |n: usize| format!("_utf8mb4 X'{}'", "41".repeat(n));
+    for (sql, ok) in [
+        (
+            format!(
+                "INSERT INTO order_events (key, value, headers) VALUES ({}, {}, NULL)",
+                hex(3),
+                hex(97)
+            ),
+            true,
+        ),
+        (
+            format!(
+                "INSERT INTO order_events (key, value, headers) VALUES ({}, {}, NULL)",
+                hex(3),
+                hex(98)
+            ),
+            false,
+        ),
+        (
+            format!(
+                "INSERT INTO order_events (key, value, headers) VALUES ('k', 'v', '{}')",
+                "h".repeat(99)
+            ),
+            false,
+        ),
+        (
+            format!(
+                "INSERT INTO order_events VALUES ('a', 'b'), ('k', 0x{})",
+                "00".repeat(100)
+            ),
+            false,
+        ),
+        (
+            format!(
+                "INSERT INTO order_events (value, key) VALUES (B'{}', NULL)",
+                "1".repeat(801)
+            ),
+            false,
+        ),
+        (
+            format!(
+                "INSERT INTO order_events (key, value) VALUES ('k', CONCAT('{}', 'x' 'y'))",
+                "z".repeat(98)
+            ),
+            false,
+        ),
+        (
+            format!(
+                "INSERT INTO order_events (key, value) VALUES ('k', CONCAT('{}', 'x'))",
+                "z".repeat(97)
+            ),
+            true,
+        ),
+        (
+            format!(
+                "INSERT INTO order_events (key, value) VALUES ('k', N'{}')",
+                "é".repeat(50)
+            ),
+            false,
+        ),
+    ] {
+        let r = handle(&sql, &cx(&state), &mut m).await;
+        match (ok, r) {
+            (true, Ok(Handled::Forward { .. })) => {}
+            (false, Err(e)) => {
+                assert_eq!(e.code(), Some(SprigCode::StreamRecordTooLarge), "{sql}");
+                assert!(e.message.contains("stream.max_message_bytes (100)"), "{e}");
+            }
+            (_, other) => panic!("{sql}: {other:?}"),
+        }
+    }
+    let e = handle(
+        &format!(
+            "INSERT INTO order_events (key, value) VALUES (X'{}', 'v')",
+            "00".repeat(4097)
+        ),
+        &cx(&state),
+        &mut m,
+    )
+    .await
+    .unwrap_err();
+    assert!(e.message.contains("a key of 4097 bytes"), "{e}");
+    // Rows MariaDB evaluates are measured as they come back.
+    let Handled::Publish(p) = handle(
+        "INSERT IGNORE INTO shop.order_events (value, key) SELECT body, id FROM orders",
+        &cx(&state),
+        &mut m,
+    )
+    .await
+    .unwrap() else {
+        panic!()
+    };
+    assert_eq!(p.source, "SELECT body, id FROM orders");
+    assert_eq!(p.head, "INSERT IGNORE INTO `shop`.`__sprig_eo_41`");
+    assert_eq!(p.columns, ["v", "k"]);
+    let ok = p
+        .inserts(&[
+            vec![Some(b"ab".to_vec()), Some(b"7".to_vec())],
+            vec![None, None],
+        ])
+        .unwrap();
+    assert_eq!(
+        ok,
+        ["INSERT IGNORE INTO `shop`.`__sprig_eo_41` (v, k) VALUES (X'6162', X'37'), (NULL, NULL)"]
+    );
+    let e = p
+        .inserts(&[vec![Some(vec![b'x'; 100]), Some(b"7".to_vec())]])
+        .unwrap_err();
+    assert!(e.message.contains("a record of 101 bytes"), "{e}");
+    let e = p.inserts(&[vec![None]]).unwrap_err();
+    assert_eq!(e.protocol().mysql_errno, 1136);
+    assert!(p.inserts(&[]).unwrap().is_empty());
+    let h = PublishRows {
+        columns: vec!["k", "v", "headers"],
+        ..p.clone()
+    };
+    assert_eq!(
+        h.inserts(&[vec![
+            Some(b"k".to_vec()),
+            Some(Vec::new()),
+            Some(b"{}".to_vec())
+        ]])
+        .unwrap(),
+        [
+            "INSERT IGNORE INTO `shop`.`__sprig_eo_41` (k, v, headers) VALUES (X'6B', X'', _utf8mb4 X'7B7D')"
+        ]
+    );
+    // Prepared statements: which ones publish.
+    let ids = |n: &str| (n == "shop").then_some(DbId(1));
+    assert!(publishes(
+        "INSERT INTO order_events (key, value) VALUES (?, ?)",
+        &cx(&state),
+        &ids
+    ));
+    assert!(publishes(
+        "insert into shop.order_events values (?, ?)",
+        &cx(&state),
+        &ids
+    ));
+    assert!(!publishes(
+        "INSERT INTO orders VALUES (?)",
+        &cx(&state),
+        &ids
+    ));
+    assert!(!publishes("SELECT * FROM order_events", &cx(&state), &ids));
+    assert!(!publishes(
+        "INSERT INTO other.order_events VALUES (?, ?)",
+        &cx(&state),
+        &ids
+    ));
     let e = handle(
         "INSERT INTO order_events (key, nope) VALUES (1, 2)",
         &cx(&state),

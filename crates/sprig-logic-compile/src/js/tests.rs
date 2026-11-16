@@ -953,7 +953,7 @@ impl crate::sql::Columns for Linked {
             Ok(crate::link::StreamTarget {
                 name: "orders_s".into(),
                 outbox: "__sprig_eo_5".into(),
-                max_bytes: 10,
+                max_bytes: 20,
                 compact: true,
             })
         })
@@ -1060,6 +1060,22 @@ fn db_call_stays_in_the_engine_tier_when_it_must() {
         ),
         ("db.call('price'); return {};", 9, "db.call"),
         ("const n = 'price'; db.call(n, x); return {};", 9, "db.call"),
+        (
+            "return { v: x > 0 ? db.call('price', x).fields.price : 0 };",
+            9,
+            "js.db",
+        ),
+        (
+            "return { v: db.call('price', x).fields.nope };",
+            9,
+            "js.member",
+        ),
+        ("return { v: db.call('price', x).nope };", 9, "js.member"),
+        (
+            "return { v: db.publish('orders_s', 'k', 'v').nope };",
+            9,
+            "js.member",
+        ),
         ("db.commitOffset('g', 's', 0, 1); return {};", 9, "js.db"),
         ("db.mq.ack('t'); return {};", 9, "*"),
         (
@@ -1109,13 +1125,13 @@ fn db_publish_writes_the_outbox_after_the_gateway_checks() {
     assert!(p.procedure.contains("JSON_COMPACT("), "{}", p.procedure);
     assert_eq!(c.analysis.writes, vec!["orders_s".to_owned()]);
     let f = c.ir.as_ref().unwrap();
-    // The first publish fits (key "7", value {"id":7}, headers {"h":"v"});
-    // the second has no key on a compacted stream.
+    // The first publish fits (key "7", value {"id":7} and headers
+    // {"h":"v"}: 18 bytes); the second has no key on a compacted stream.
     let mut db = CallDb::default();
     let e = interp::run(f, &[Value::Int(7)], &mut db, &interp::Limits::default()).unwrap_err();
     assert_eq!(e.code().map(sprig_common::SprigCode::number), Some(39955));
     assert_eq!(db.seen.len(), 1);
-    // A value of 11 bytes is above the stream's 10.
+    // Key, value and headers of 36 bytes are above the stream's 20.
     let e = interp::run(
         f,
         &[Value::Int(1_234_567_890)],
@@ -1124,4 +1140,31 @@ fn db_publish_writes_the_outbox_after_the_gateway_checks() {
     )
     .unwrap_err();
     assert_eq!(e.code().map(sprig_common::SprigCode::number), Some(39944));
+}
+
+#[test]
+fn db_call_and_db_publish_compile_inside_expressions() {
+    let c = linked(
+        "const t = 'p:' + db.call('price', x).event;
+         if (db.call('price', x + 1).event === 'output') {
+           return { t, a: db.publish('orders_s', 'k', 'v').affected };
+         }
+         return { t, p: db.call('price', x).fields.price, all: db.call('price', x) };",
+        9,
+    );
+    assert!(c.compilable(), "{:?}", c.analysis.reasons);
+    let f = c.ir.as_ref().unwrap();
+    let mut db = CallDb::default();
+    let o = interp::run(f, &[Value::Int(7)], &mut db, &interp::Limits::default()).unwrap();
+    assert_eq!(
+        o.result,
+        json!({"t": "p:output", "p": 2.5,
+               "all": {"event": "output", "fields": {"price": 2.5, "ok": 1}}})
+    );
+    // Each call once, in the order JavaScript makes them.
+    assert_eq!(db.seen.len(), 4, "{:?}", db.seen);
+    let mut db = CallDb::default();
+    let o = interp::run(f, &[Value::Int(6)], &mut db, &interp::Limits::default()).unwrap();
+    assert_eq!(o.result["a"], json!(1));
+    assert_eq!(db.seen.len(), 3, "{:?}", db.seen);
 }

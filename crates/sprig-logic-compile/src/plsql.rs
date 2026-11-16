@@ -38,8 +38,8 @@ use std::fmt::Write as _;
 
 use crate::Options;
 use crate::ir::{
-    BinOp, Block, Bound, Builtin, Caught, DbOp, Expr, Function, Literal, LocalId, PathSeg,
-    SqlShape, Stmt, Ty, UnOp,
+    BinOp, Block, Bound, Builtin, Caught, DbOp, Expr, Function, Literal, LocalId, MAX_KEY_BYTES,
+    PathSeg, SqlShape, Stmt, Ty, UnOp,
 };
 
 /// The `sql_mode` routines are created under (stored with each routine).
@@ -655,18 +655,30 @@ impl Gen<'_> {
                         max_bytes,
                         compact,
                     } => {
-                        // The gateway's checks of a publish, in its order.
+                        // The gateway's checks of a publish, in its order:
+                        // a key above 4096 bytes, then the record (key,
+                        // value and headers together) above the limit.
                         let vals: Vec<String> = binds.iter().map(|b| self.expr(b)).collect();
                         let lens: Vec<String> = vals
                             .iter()
                             .map(|v| format!("COALESCE(LENGTH({v}), 0)"))
                             .collect();
-                        let longest = format!("GREATEST({})", lens.join(", "));
+                        if let Some(key) = lens.first() {
+                            let msg = format!(
+                                "CONCAT('ER_SPRIG_STREAM_RECORD_TOO_LARGE: a key of ', {key}, \
+                                 ' bytes is above {MAX_KEY_BYTES}')"
+                            );
+                            let f = self.fail(39944, &msg);
+                            let _ =
+                                writeln!(out, "{ind}IF {key} > {MAX_KEY_BYTES} THEN {f}; END IF;");
+                        }
+                        let total = format!("({})", lens.join(" + "));
                         let msg = format!(
-                            "CONCAT('ER_SPRIG_STREAM_RECORD_TOO_LARGE: a value of ', {longest},                              ' bytes is above stream.max_message_bytes ({max_bytes})')"
+                            "CONCAT('ER_SPRIG_STREAM_RECORD_TOO_LARGE: a record of ', {total}, \
+                             ' bytes is above stream.max_message_bytes ({max_bytes})')"
                         );
                         let f = self.fail(39944, &msg);
-                        let _ = writeln!(out, "{ind}IF {longest} > {max_bytes} THEN {f}; END IF;");
+                        let _ = writeln!(out, "{ind}IF {total} > {max_bytes} THEN {f}; END IF;");
                         if *compact && let Some(k) = vals.first() {
                             let f = self.fail(
                                 39955,

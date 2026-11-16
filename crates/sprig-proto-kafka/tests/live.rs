@@ -1128,6 +1128,64 @@ async fn live_data_plane() {
 /// records of `SPRIG_KAFKA_TP_SIZE` bytes in batches of
 /// `SPRIG_KAFKA_TP_BATCH`, `SPRIG_KAFKA_TP_INFLIGHT` batches in flight, as
 /// an idempotent producer; then one consumer reads them all.
+/// One record of key `k`, a 60-byte value and the given headers.
+fn headed_batch(headers: Vec<Header>) -> Vec<u8> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    RecordBatch {
+        last_offset_delta: 0,
+        base_timestamp: now,
+        max_timestamp: now,
+        producer_id: -1,
+        producer_epoch: -1,
+        base_sequence: -1,
+        records: vec![Record {
+            key: Some(b"k".to_vec()),
+            value: Some(vec![b'v'; 60]),
+            headers,
+            ..Record::default()
+        }],
+        ..RecordBatch::default()
+    }
+    .to_bytes()
+    .unwrap()
+}
+
+/// `max.message.bytes` counts a record's headers too (key, value and the
+/// headers as stored), as every other publish path does.
+#[tokio::test]
+#[ignore = "needs a running gateway with the kafka listener and a sequencer"]
+async fn live_headers_count_toward_max_message_bytes() {
+    let db = env("SPRIG_KAFKA_DB").unwrap();
+    let topic = format!("{db}.sf7_headers_{}", std::process::id());
+    let mut c = login().await;
+    create_topic(&mut c, &topic, 1).await;
+    warm_up(&mut c, &topic, 0).await;
+    assert_eq!(
+        alter_config(&mut c, &topic, "max.message.bytes", "100").await,
+        0
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let h = |n: usize| Header {
+        key: "h".into(),
+        value: Some(vec![b'a'; n]),
+    };
+    // 1 + 60 + {"h":"..."} (8 + n): 100 at n = 31.
+    for (n, want) in [(0, 0), (31, 0), (32, err::MESSAGE_TOO_LARGE)] {
+        let r = produce_one(&mut c, 9, &topic, 0, headed_batch(vec![h(n)])).await;
+        println!(
+            "headers of {} bytes: {} {:?}",
+            8 + n,
+            r.error_code,
+            r.error_message
+        );
+        assert_eq!(r.error_code, want, "{n}: {:?}", r.error_message);
+    }
+    delete_topic(&mut c, &topic).await;
+}
+
 #[tokio::test]
 #[ignore = "needs a running gateway with the kafka listener and a sequencer"]
 async fn live_throughput() {

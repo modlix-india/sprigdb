@@ -1357,3 +1357,211 @@ async fn replica_statistics_after_a_cut_off_analyze() {
     drop_fixture(primary, schema).await;
     wait_caught_up(primary, replicas, schema, true).await;
 }
+
+/// The Galera form of [`replica_statistics_after_a_cut_off_analyze`]: an
+/// RSU validation cut off after its local `ANALYZE` left the node with the
+/// statistics it refreshed. The journal's snapshot is put back by the
+/// drift reconciler's pass and by the next validation of the table, on
+/// that node only (the statistics tables are Aria, which Galera doesn't
+/// replicate); no node writes a binary log event of its own, and the
+/// cluster ends with 3 nodes Synced.
+#[tokio::test]
+async fn galera_statistics_after_a_cut_off_analyze() {
+    use sprig_advisor::autoindex::validate::journal::{self, MemJournal, StatsJournal};
+    use sprig_advisor::autoindex::validate::orphans::{self, NodeKind};
+    let eps = topology_or_skip!("SPRIG_TEST_MARIADB_GALERA");
+    let writer = &eps[0];
+    let node = eps.last().unwrap().clone();
+    let peers: Vec<NodeEndpoint> = eps[..eps.len() - 1].to_vec();
+    let schema = "__sprig_test_stats_cut_g";
+    create_fixture(writer, schema).await;
+    wait_caught_up(writer, &eps[1..], schema, false).await;
+    let synced = |ep: NodeEndpoint| async move {
+        for _ in 0..300 {
+            if scalar(&ep, "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME = 'wsrep_local_state_comment'").await.as_deref() == Some("Synced") {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    };
+    // Statistics the node had before: written by hand on that node only.
+    let fake = "12345|42.0000";
+    {
+        let mut c = conn(&node).await;
+        c.exec("SET SESSION sql_log_bin = 0").await.unwrap();
+        c.exec(&format!(
+            "REPLACE INTO mysql.table_stats (db_name, table_name, cardinality) VALUES \
+             ('{schema}', 't', 12345)"
+        ))
+        .await
+        .unwrap();
+        c.exec(&format!(
+            "REPLACE INTO mysql.column_stats (db_name, table_name, column_name, avg_frequency) \
+             VALUES ('{schema}', 't', 'a', 42)"
+        ))
+        .await
+        .unwrap();
+        c.close().await;
+    }
+    assert_eq!(stats_of(&node, schema).await, fake);
+    let mut peer_stats = Vec::new();
+    for p in &peers {
+        peer_stats.push(stats_of(p, schema).await);
+    }
+    eprintln!("galera statistics: node {fake}, peers {peer_stats:?}");
+    assert!(peer_stats.iter().all(|s| s != fake), "{peer_stats:?}");
+    let mut binlog_before = Vec::new();
+    for ep in &eps {
+        binlog_before.push(
+            scalar(ep, "SELECT @@gtid_binlog_pos")
+                .await
+                .unwrap_or_default(),
+        );
+    }
+    let w = workload(schema, 10);
+    let good = plan(
+        schema,
+        9202,
+        &["a"],
+        FP_A_RANGE,
+        w["a_range"].clone(),
+        &w["other"],
+    );
+    let target = good.target.clone();
+    let mem = Arc::new(MemJournal::default());
+    let j: Arc<dyn StatsJournal> = mem.clone();
+    let validator = || {
+        RsuValidator::new(node.clone(), peers.clone(), Arc::new(NoMarker))
+            .with_stats_journal(Arc::clone(&j))
+    };
+
+    // Cuts a validation off once its ANALYZE has written (it replays then).
+    let cut_off = |p: ValidationPlan| {
+        let v = validator();
+        let node = node.clone();
+        async move {
+            let task = tokio::spawn(async move { v.validate(&p).await });
+            let started = Instant::now();
+            while stats_of(&node, schema).await == fake {
+                assert!(
+                    !task.is_finished(),
+                    "the validation ended before it was cut off"
+                );
+                assert!(
+                    started.elapsed() < Duration::from_secs(120),
+                    "no ANALYZE seen"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            task.abort();
+            let _ = task.await;
+        }
+    };
+
+    // 1. Cut off after ANALYZE: the node's statistics stay changed, the
+    // snapshot stays in the journal, the peers' don't change.
+    cut_off(good.clone()).await;
+    let changed = stats_of(&node, schema).await;
+    eprintln!("galera, after the cut-off ANALYZE: {changed} (before: {fake})");
+    assert_ne!(changed, fake);
+    for (p, before) in peers.iter().zip(&peer_stats) {
+        assert_eq!(&stats_of(p, schema).await, before, "{}", p.node);
+    }
+    let held = mem.all();
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0].node, node.node.as_str());
+    eprintln!("galera, journaled: {} rows", held[0].rows());
+    assert!(synced(node.clone()).await, "node not Synced after the cut-off");
+
+    // 2. The drift reconciler's pass puts them back and removes the entry;
+    // not while a validation of this process runs on the table.
+    {
+        let _busy = orphans::running(&node.node, &target);
+        let r = journal::restore_journaled(&node, &*j, std::slice::from_ref(&target)).await;
+        assert!(r.tables.is_empty() && r.errors.is_empty(), "{r:?}");
+        assert_ne!(stats_of(&node, schema).await, fake);
+    }
+    let r = journal::restore_journaled(&node, &*j, std::slice::from_ref(&target)).await;
+    eprintln!("galera drift pass: {r:?}");
+    assert_eq!(r.tables, vec![format!("{schema}.t")]);
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(stats_of(&node, schema).await, fake);
+    assert!(mem.all().is_empty());
+    // The cut-off validation's index goes too (the reconciler's other pass).
+    orphans::drop_leftovers(
+        &node,
+        writer,
+        std::slice::from_ref(&target),
+        NodeKind::Galera,
+        &std::collections::BTreeSet::new(),
+    )
+    .await
+    .unwrap();
+    assert!(synced(node.clone()).await, "node not Synced after the sweep");
+    assert_eq!(automatic_on(&node, schema).await, "");
+
+    // 3. Cut off again; the next validation of the table puts the
+    // statistics back before its own snapshot, and again at its end.
+    cut_off(good.clone()).await;
+    assert_ne!(stats_of(&node, schema).await, fake);
+    assert_eq!(mem.all().len(), 1);
+    assert!(synced(node.clone()).await, "node not Synced after the cut-off");
+    let v = validator();
+    let r = v.validate(&good).await.unwrap();
+    show("galera after a cut-off ANALYZE", &r);
+    assert_ne!(r.verdict.kind, VerdictKind::Aborted, "{}", r.verdict.reason);
+    assert!(
+        r.node_check
+            .notes
+            .iter()
+            .any(|n| n.contains("statistics of a cut-off validation put back first")),
+        "{:?}",
+        r.node_check.notes
+    );
+    assert!(r.analyze_ms.is_some(), "{:?}", r.node_check.notes);
+    assert!(r.node_check.restored, "{:?}", r.node_check.notes);
+    assert_eq!(stats_of(&node, schema).await, fake);
+    assert!(mem.all().is_empty());
+
+    // 4. A journal that can't be written: no ANALYZE, statistics untouched.
+    mem.set_failing(true);
+    let r = v.validate(&good).await.unwrap();
+    show("galera, journal failing", &r);
+    mem.set_failing(false);
+    assert!(r.analyze_ms.is_none());
+    assert!(
+        r.node_check
+            .notes
+            .iter()
+            .any(|n| n.contains("ANALYZE skipped")),
+        "{:?}",
+        r.node_check.notes
+    );
+    assert_eq!(stats_of(&node, schema).await, fake);
+
+    // No node wrote a binary log event of its own (the positions moved
+    // only through the writer's statements, the same on every node), the
+    // peers' statistics never changed, and every node is Synced.
+    let mut binlog_after = Vec::new();
+    for ep in &eps {
+        assert!(synced(ep.clone()).await, "{} not Synced", ep.node);
+        binlog_after.push(
+            scalar(ep, "SELECT @@gtid_binlog_pos")
+                .await
+                .unwrap_or_default(),
+        );
+    }
+    eprintln!("galera binlog before {binlog_before:?} after {binlog_after:?}");
+    assert!(
+        binlog_after.windows(2).all(|w| w[0] == w[1]),
+        "{binlog_after:?}"
+    );
+    for (p, before) in peers.iter().zip(&peer_stats) {
+        assert_eq!(&stats_of(p, schema).await, before, "{}", p.node);
+    }
+    for ep in &eps {
+        assert_eq!(automatic_on(ep, schema).await, "", "{}", ep.node);
+    }
+    drop_fixture(writer, schema).await;
+}

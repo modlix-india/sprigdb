@@ -281,7 +281,7 @@ impl GatewayData {
                     &si.stream,
                     r.key.as_deref(),
                     r.value.as_ref().map_or(0, Vec::len),
-                    0,
+                    headers.as_ref().map_or(0, String::len),
                     u64::try_from(t.max_message_bytes).unwrap_or(u64::MAX),
                 )
                 .map_err(|e| kafka_err(&e))?;
