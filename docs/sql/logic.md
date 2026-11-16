@@ -26,17 +26,17 @@ JavaScript compiles to the MariaDB tier with `try`/`catch`/`finally`, helper fun
 |---|---|
 | `js.catch_value` | A `catch` reads the database error it caught (its message), which SQL handlers can't pass on |
 | `js.recursion` | A helper function calls itself, directly or through another; or `db.call`s form a cycle or nest deeper than 8 |
-| `js.db` | A `db` call that can't compile: `db.commitOffset` or `db.mq.*`; a `db.call` or `db.publish` naming another database, or a name that isn't a literal; a callee in the engine tier, or mid-rollout with versions of different shapes; JSON arguments; a change topic |
+| `js.db` | A `db` call that can't compile: `db.commitOffset` or `db.mq.*`; a `db.call` or `db.publish` naming another database, or a name that isn't a literal; a callee in the engine tier, or mid-rollout with versions of different shapes; JSON arguments; a change topic; a `db.call` or `db.publish` in an operand of `&&`, `\|\|`, `??` or `?:`, which may not run |
 | `js.member` | Reading a field the callee never returns, or a column the table doesn't have |
 | `js.call` | Another built-in call that only the engine tier runs |
 
-**Compiled calls.** `db.call(name, ...args)` and `db.publish` compile when the call is a statement of its own or a declaration's initializer (`const r = db.call(...)`), as `db.sql` does; inside a larger expression (`return db.call(...).fields.value`), the call runs in the engine tier for now.
+**Compiled calls.** `db.call(name, ...args)` and `db.publish` compile as a statement of their own, as a declaration's initializer (`const r = db.call(...)`), or inside a larger expression (`return db.call(...).fields.value`). The one exception is an operand of `&&`, `||`, `??` or `?:`, where JavaScript may skip the call: that keeps the code in the engine tier with a `js.db` reason, so make the call in a statement of its own first.
 
 ```sql test
 CREATE OR REPLACE FUNCTION add_tax(amount DOUBLE) RETURNS DOUBLE LANGUAGE javascript AS
   'return amount * 1.2;';
 CREATE OR REPLACE FUNCTION gross_total(net DOUBLE, qty INT) RETURNS DOUBLE LANGUAGE javascript AS
-  'const r = db.call("add_tax", net * qty); return r.fields.value;';
+  'return db.call("add_tax", net * qty).fields.value;';
 SELECT gross_total(10, 3) AS g;
 ```
 
@@ -54,7 +54,7 @@ Version	State	Tier	Placement
 1	active (live)	mariadb	tier mariadb, route any shard, cost 1
 ```
 
-A compiled `db.call` goes through a hidden entry, `` `__sprig_l<module>_call` ``, so it follows the callee's deploys, rollbacks and rollout stage; that name can appear in MariaDB errors such as 1370 and 1305. Nested compiled calls stay fast: three levels deep cost about 1.3 ms against 4.8 ms in the engine tier, and twenty about 1.3 ms against 15 ms. Redeploying a callee so that its compiled callers no longer fit (other parameters or result) is refused with 39875, naming the callers; redeploy them `WITH (SPRIG_TIER = 'engine')` first, then the callee. A compiled `db.publish` checks the stream's `stream.max_message_bytes`, as read when the code was deployed (39944), and a compacted stream's key (39955). Computed columns still refuse `db.call`, and sink transforms have no `db`.
+A compiled `db.call` goes through a hidden entry, `` `__sprig_l<module>_call` ``, so it follows the callee's deploys, rollbacks and rollout stage; that name can appear in MariaDB errors such as 1370 and 1305. Nested compiled calls stay fast: three levels deep cost about 1.3 ms against 4.8 ms in the engine tier, and twenty about 1.3 ms against 15 ms. Redeploying a callee so that its compiled callers no longer fit (other parameters or result) is refused with 39875, naming the callers; redeploy them `WITH (SPRIG_TIER = 'engine')` first, then the callee. A compiled `db.publish` checks the stream's `stream.max_message_bytes`, as read when the code was deployed (39944), so redeploy it after changing the limit (until then it keeps the old limit, refusing or accepting by it); the engine tier reads the current limit, and a compacted stream's key (39955). Computed columns still refuse `db.call`, and sink transforms have no `db`.
 
 `EXPLAIN FUNCTION` lists every reason with its place in the source and a message, for example `js.db: the arguments must be an array literal`.
 

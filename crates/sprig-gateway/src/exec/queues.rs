@@ -331,23 +331,14 @@ impl PassSession {
                 let exchange = text(0).unwrap_or_default();
                 let key = text(1).unwrap_or_default();
                 let body = vals.get(2).cloned().flatten().unwrap_or_default();
-                // `amqp.max_message_bytes`, as the AMQP listeners refuse a
-                // larger body (the tenant's value, else the DC's and the
-                // global one the listeners read).
+                // `amqp.max_message_bytes` at the scope of the vhost's
+                // database, as the AMQP listeners refuse a larger body.
                 let max = self.tenant.as_deref().map_or(u64::MAX, |ts| {
-                    let svc = ts.services();
-                    match ts.catalog() {
-                        Some(cat) => svc.settings.get(
-                            &crate::amqp::MAX_MESSAGE_BYTES,
-                            &cat.setting_ctx(&svc.dc),
-                            Some(&cat.settings),
-                        ),
-                        None => svc.settings.get(
-                            &crate::amqp::MAX_MESSAGE_BYTES,
-                            &sprig_settings::SettingCtx::process(&svc.dc),
-                            None,
-                        ),
-                    }
+                    crate::amqp::max_message_bytes(
+                        ts.services(),
+                        ts.catalog().map(|c| &**c),
+                        &vhost(5),
+                    )
                 });
                 if body.len() as u64 > max {
                     return Err(sql_error(&MqError::new(

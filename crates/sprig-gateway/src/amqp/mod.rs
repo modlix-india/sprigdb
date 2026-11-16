@@ -298,6 +298,52 @@ impl QueueBackend for GatewayQueues {
         }
         self.mem.open_vhost(principal, vhost, conn, events).await
     }
+
+    async fn max_message_bytes(&self, principal: &Principal, vhost: &str) -> Option<u64> {
+        let t = self.tenants.as_ref()?;
+        let tenant = TenantId(principal.tenant_id);
+        let cat = match t.cache.cached(tenant) {
+            Some(c) => c,
+            None => t.cache.get(tenant, Freshness::Latest).await.ok()?,
+        };
+        Some(max_message_bytes(t, Some(&cat), vhost))
+    }
+}
+
+/// `amqp.max_message_bytes` for a publish into vhost `vhost` of tenant
+/// `cat`: at the scope of the vhost's database, so its value, the
+/// tenant's, the DC's and the global one apply in that order (the AMQP
+/// listeners and `sprig.mq_publish` both read it here). Without a
+/// catalog, the DC's and the global one.
+#[must_use]
+pub fn max_message_bytes(
+    svc: &TenantServices,
+    cat: Option<&sprig_catalog::TenantCatalog>,
+    vhost: &str,
+) -> u64 {
+    let Some(cat) = cat else {
+        return svc
+            .settings
+            .get(&MAX_MESSAGE_BYTES, &SettingCtx::process(&svc.dc), None);
+    };
+    let db = default_database(
+        vhost,
+        &svc.settings.get(
+            &DEFAULT_VHOST_DATABASE,
+            &cat.setting_ctx(&svc.dc),
+            Some(&cat.settings),
+        ),
+    );
+    let mut ctx = cat.setting_ctx(&svc.dc);
+    if let Some(d) = cat
+        .databases
+        .by_name(&db)
+        .or_else(|| cat.databases.by_name(&db.to_lowercase()))
+    {
+        ctx = ctx.with_db(d.db_id);
+    }
+    svc.settings
+        .get(&MAX_MESSAGE_BYTES, &ctx, Some(&cat.settings))
 }
 
 /// The AMQP front end: one server for both listeners.

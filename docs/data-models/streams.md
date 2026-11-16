@@ -151,7 +151,7 @@ Refused forms:
 | `INSERT ... ON DUPLICATE KEY UPDATE` | 39941 |
 | `INSERT ... SET col = ...` | 1235: use `VALUES` or `SELECT` |
 | An insert into a change topic | 39941 |
-| A literal larger than `stream.max_message_bytes` | `ER_SPRIG_STREAM_RECORD_TOO_LARGE` (39944) |
+| A record whose key, value and headers together are larger than `stream.max_message_bytes`, or a key over 4,096 bytes, from any insert shape (`VALUES`, `SELECT`, logic) | `ER_SPRIG_STREAM_RECORD_TOO_LARGE` (39944) |
 | A record without a key on a compacted stream | `ER_SPRIG_STREAM_COMPACT_NEEDS_KEY` (39955) |
 
 Logic code publishes the same way. `db.publish(stream, key, value, headers?)` in JavaScript and Lua, and `Sprig.Db.Publish` in KIRun, run that `INSERT` through the caller's session, so the record is part of the caller's transaction. In logic, a `null` value is a tombstone. See [Logic](logic.md).
@@ -414,7 +414,7 @@ Every reader of the stream in the owning tenant sees every tenant's records. Rou
 |---|---|---|
 | Stream name | 1 to 249 characters of `[a-zA-Z0-9._-]` | 1103 |
 | Partitions of a new stream | 1 to 10,000 (`stream.partitions_default` bounds) | |
-| Record size | `stream.max_message_bytes`, 1 MiB by default, at most 1 GiB | 39944 |
+| Record size (key, value and headers) | `stream.max_message_bytes`, 1 MiB by default, at most 1 GiB; the stream's own setting comes first | 39944 |
 | Key size | 4,096 bytes | 39944 |
 | Time retention | 1 hour to 87,600 hours (10 years) | 1231 from `ALTER STREAM ... SET` |
 | Kafka produce batch, uncompressed | 64 MiB | |

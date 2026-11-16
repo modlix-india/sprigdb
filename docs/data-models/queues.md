@@ -195,6 +195,7 @@ COMMIT;
 - `properties` is a JSON object with RabbitMQ's property names: `content_type`, `content_encoding`, `headers` (an object), `delivery_mode`, `priority`, `correlation_id`, `reply_to`, `expiration`, `message_id`, `timestamp`, `type`, `user_id`, `app_id`. `NULL` means none. Messages are persistent unless `delivery_mode` is 1.
 - With `mandatory = 1`, a message that reaches no queue is an error (`ER_SPRIG_MQ_UNROUTABLE`, 39255).
 - `vhost` is a virtual host name; `NULL` or absent means `/`.
+- A message above `amqp.max_message_bytes` is refused with 39257 before it is routed, whether or not it would reach a queue. The virtual host's database value applies. For now, only a value set on the tenant or a wider scope is enforced here; a database value is not yet read by this call.
 
 The example above needs the exchange `orders`, declared by an AMQP client. You can try the call in any database without one: the default exchange `""` routes to the queue named by the routing key, and here no queue `billing` exists yet, so the message reaches none. `DATABASE()` names the current database as the virtual host.
 

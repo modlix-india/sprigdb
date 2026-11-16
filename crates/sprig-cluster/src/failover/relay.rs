@@ -18,6 +18,14 @@
 //! picks): a held branch's rows are fenced only on the node that holds
 //! them, so every connection of the tenant to the cluster must pass that
 //! node's relay.
+//!
+//! **Relay hosts.** Each relay agent adds the address its node sees its
+//! connections come from to `relays/<cluster>`'s `hosts`. A relayed
+//! tenant's backend accounts on the cluster log in only from those
+//! addresses: its accounts at `'%'` are locked (they stay, as the definers
+//! of its stored code), and the same accounts at each relay host carry the
+//! logins. Only the ready relay writer admits anyone, so a login from a
+//! relay host is a login through the fence.
 
 use serde::{Deserialize, Serialize};
 use sprig_common::Result;
@@ -33,6 +41,19 @@ pub struct RelayCluster {
     /// When, in milliseconds since the epoch.
     #[serde(default)]
     pub since_ms: u64,
+    /// Every relay agent of the cluster, by agent id: the host its node
+    /// sees the agent's connections come from (MariaDB's account host).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub hosts: std::collections::BTreeMap<String, String>,
+}
+
+impl RelayCluster {
+    /// The distinct relay hosts, sorted.
+    #[must_use]
+    pub fn relay_hosts(&self) -> Vec<String> {
+        let set: std::collections::BTreeSet<&String> = self.hosts.values().collect();
+        set.into_iter().cloned().collect()
+    }
 }
 
 impl Versioned for RelayCluster {
@@ -117,6 +138,18 @@ pub async fn read_relay_state(
     store: &dyn sprig_meta::MetaStore,
     cluster: &ClusterId,
 ) -> Result<RelayState> {
+    Ok(read_relay(store, cluster).await?.0)
+}
+
+/// Reads the relay state of `cluster` and its relay hosts
+/// ([`RelayCluster::relay_hosts`]) from the DC tier.
+///
+/// # Errors
+/// The store's errors.
+pub async fn read_relay(
+    store: &dyn sprig_meta::MetaStore,
+    cluster: &ClusterId,
+) -> Result<(RelayState, Vec<String>)> {
     use sprig_meta::{Consistency, Record};
     let marker = match store
         .get(
@@ -138,7 +171,11 @@ pub async fn read_relay_state(
         Some(kv) => Some(Record::<RelayLease>::decode(&kv.value)?.body),
         None => None,
     };
-    Ok(relay_state(marker.as_ref(), lease.as_ref()))
+    let hosts = marker
+        .as_ref()
+        .map(RelayCluster::relay_hosts)
+        .unwrap_or_default();
+    Ok((relay_state(marker.as_ref(), lease.as_ref()), hosts))
 }
 
 #[cfg(test)]
@@ -161,6 +198,7 @@ mod tests {
         let m = RelayCluster {
             first_agent: "agent-n1".into(),
             since_ms: 1,
+            hosts: std::collections::BTreeMap::new(),
         };
         assert_eq!(relay_state(None, None), RelayState::None);
         assert!(matches!(
@@ -184,5 +222,27 @@ mod tests {
         )
         .expect("decode");
         assert_eq!((l.epoch, l.ready), (0, false));
+        // A marker an older agent wrote has no hosts.
+        let m: RelayCluster =
+            serde_json::from_str(r#"{"first_agent":"a","since_ms":5}"#).expect("decode");
+        assert!(m.relay_hosts().is_empty());
+    }
+
+    #[test]
+    fn relay_hosts_are_distinct_and_sorted() {
+        let mut m = RelayCluster {
+            first_agent: "a1".into(),
+            since_ms: 0,
+            hosts: std::collections::BTreeMap::new(),
+        };
+        m.hosts.insert("a3".into(), "10.0.0.9".into());
+        m.hosts.insert("a1".into(), "10.0.0.2".into());
+        m.hosts.insert("a2".into(), "10.0.0.9".into());
+        assert_eq!(m.relay_hosts(), vec!["10.0.0.2", "10.0.0.9"]);
+        let text = serde_json::to_string(&m).expect("encode");
+        assert_eq!(
+            serde_json::from_str::<RelayCluster>(&text).expect("decode"),
+            m
+        );
     }
 }

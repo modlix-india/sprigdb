@@ -19,6 +19,12 @@
 //!     set ready = true: gateways connect from now on
 //! holder calls (prepare, finished, abandon) on the internal service:
 //!   POST /v1/relay/... answered by the fence
+//! the relay host (what the node sees this agent's connections come
+//!   from) goes into relays/<cluster>'s hosts before the agent competes
+//!   for the lease: relayed tenants' accounts log in only from there
+//! every 2 s: end the node's connections of relayed tenants' accounts
+//!   (their '%' account locked) that came from no relay host (logins from
+//!   before the tenant took the relay path, or an old gateway's)
 //! ```
 //!
 //! A relay writer that loses its etcd session stands down before its lease
@@ -63,6 +69,73 @@ pub const LEASE_TTL: Duration = Duration::from_secs(10);
 pub const STAND_DOWN_MARGIN: Duration = Duration::from_secs(3);
 /// An unusable node keeps the lease this long (a short desync).
 pub const UNUSABLE_GRACE: Duration = Duration::from_secs(2);
+/// How often the node's connections are checked for logins around the
+/// relays.
+pub const DIRECT_LOGIN_SWEEP: Duration = Duration::from_secs(2);
+/// How often the relay host is read again (an address can change when a
+/// container restarts).
+pub const HOST_RECHECK: Duration = Duration::from_secs(30);
+
+/// MariaDB's account host for a `PROCESSLIST.HOST` value: the address
+/// without its port (`10.0.0.5:51234` → `10.0.0.5`, `[::1]:5` → `::1`,
+/// `localhost` as it is).
+#[must_use]
+pub fn account_host(processlist_host: &str) -> String {
+    let h = processlist_host.trim();
+    if let Some(rest) = h.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest).to_owned();
+    }
+    match h.rsplit_once(':') {
+        Some((addr, port))
+            if !addr.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            addr.to_owned()
+        }
+        _ => h.to_owned(),
+    }
+}
+
+/// Of the node's connections, the ids to end: a tenant user account
+/// (`t<tenant>_u<user>`) whose `'%'` account is locked (the tenant is on
+/// the relay path) logged in from a host it has no account at (so it
+/// matched the `'%'` account before the lock: not through a relay).
+#[must_use]
+pub fn direct_logins(
+    accounts: &[(String, String, bool)],
+    processes: &[(u64, String, String)],
+) -> Vec<u64> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut locked: BTreeSet<&str> = BTreeSet::new();
+    let mut hosts: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    for (user, host, is_locked) in accounts {
+        if !matches!(
+            user.parse::<sprig_common::names::AccountName>(),
+            Ok(sprig_common::names::AccountName::User { .. })
+        ) {
+            continue;
+        }
+        if host == "%" {
+            if *is_locked {
+                locked.insert(user);
+            }
+        } else {
+            hosts
+                .entry(user)
+                .or_default()
+                .insert(host.to_ascii_lowercase());
+        }
+    }
+    processes
+        .iter()
+        .filter(|(_, user, host)| {
+            locked.contains(user.as_str())
+                && !hosts
+                    .get(user.as_str())
+                    .is_some_and(|h| h.contains(&account_host(host).to_ascii_lowercase()))
+        })
+        .map(|(id, _, _)| *id)
+        .collect()
+}
 
 fn pool_of(opts: mysql_async::Opts, max: usize) -> Pool {
     Pool::new(
@@ -147,6 +220,8 @@ pub struct RelayRole {
     relay: Arc<Relay>,
     relay_addr: String,
     internal_url: String,
+    /// `sprig_ctl` on this node (the relay host, the direct-login sweep).
+    own_pool: Pool,
     /// Whether this agent is the ready relay writer, for logs and tests.
     status: Mutex<&'static str>,
 }
@@ -184,7 +259,7 @@ impl RelayRole {
             TenantMaps::new(Arc::clone(&store)),
             Arc::clone(&admin) as Arc<dyn sprig_txn::GroupSchemas>,
         );
-        let registry = Arc::new(RelayRegistry::new(own_pool));
+        let registry = Arc::new(RelayRegistry::new(own_pool.clone()));
         let fence = Arc::new(RelayFence::new(
             target.cluster.clone(),
             Arc::clone(&registry),
@@ -201,6 +276,7 @@ impl RelayRole {
             relay,
             relay_addr,
             internal_url,
+            own_pool,
             status: Mutex::new("starting"),
         })
     }
@@ -299,6 +375,7 @@ impl RelayRole {
         let value = Record::new(RelayCluster {
             first_agent: self.agent_id.clone(),
             since_ms,
+            hosts: BTreeMap::new(),
         })
         .encode()?;
         self.store
@@ -313,6 +390,101 @@ impl RelayRole {
             })
             .await?;
         Ok(())
+    }
+
+    /// The host this node sees this agent's connections come from.
+    async fn own_host(&self) -> Option<String> {
+        use mysql_async::prelude::Queryable;
+        let mut c = self.own_pool.get_conn().await.ok()?;
+        let h: Option<String> = c
+            .query_first(
+                "SELECT HOST FROM information_schema.PROCESSLIST WHERE ID = CONNECTION_ID()",
+            )
+            .await
+            .ok()?;
+        h.map(|h| account_host(&h)).filter(|h| !h.is_empty())
+    }
+
+    /// Adds `host` as this agent's relay host to `relays/<cluster>`
+    /// (compare-and-set on the marker); true once the marker has it.
+    async fn publish_host(&self, host: &str) -> Result<bool> {
+        let key = relay_cluster_key(self.store.tier(), &self.target.cluster)?;
+        for _ in 0..3 {
+            let Some(kv) = self.store.get(&key, Consistency::Linearizable).await? else {
+                return Ok(false);
+            };
+            let mut m = Record::<RelayCluster>::decode(&kv.value)?.body;
+            if m.hosts.get(&self.agent_id).map(String::as_str) == Some(host) {
+                return Ok(true);
+            }
+            m.hosts.insert(self.agent_id.clone(), host.to_owned());
+            let value = Record::new(m).encode()?;
+            let t = self
+                .store
+                .txn(Txn {
+                    when: vec![Cmp::ModRev(key.clone(), kv.mod_revision)],
+                    then: vec![Op::Put {
+                        key: key.clone(),
+                        value,
+                        lease: None,
+                    }],
+                    otherwise: Vec::new(),
+                })
+                .await?;
+            if t.succeeded {
+                tracing::info!(cluster = %self.target.cluster, node = %self.target.node, host,
+                    "relay: relayed tenants' accounts log in from this host");
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Ends the node's connections that logged in around the relays
+    /// ([`direct_logins`]); how many.
+    async fn end_direct_logins(&self) -> usize {
+        use mysql_async::prelude::Queryable;
+        let Ok(mut c) = self.own_pool.get_conn().await else {
+            return 0;
+        };
+        let accounts: Vec<(String, String, bool)> = match c
+            .query_map(
+                "SELECT User, Host, IFNULL(JSON_VALUE(Priv, '$.account_locked'), 'false') = 'true' \
+                 FROM mysql.global_priv WHERE User LIKE 't%'",
+                |(u, h, l): (String, String, i64)| (u, h, l != 0),
+            )
+            .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::debug!(error = %e, "relay: the accounts can't be read");
+                return 0;
+            }
+        };
+        if !accounts.iter().any(|(_, h, l)| h == "%" && *l) {
+            return 0;
+        }
+        let processes: Vec<(u64, String, String)> = c
+            .query(
+                "SELECT ID, USER, HOST FROM information_schema.PROCESSLIST \
+                 WHERE USER LIKE 't%' AND ID <> CONNECTION_ID()",
+            )
+            .await
+            .unwrap_or_default();
+        let mut ended = 0;
+        for id in direct_logins(&accounts, &processes) {
+            match c.query_drop(format!("KILL CONNECTION {id}")).await {
+                Ok(()) => ended += 1,
+                // Gone already.
+                Err(mysql_async::Error::Server(e)) if e.code == 1094 => {}
+                Err(e) => tracing::warn!(id, error = %e, "relay: a direct login couldn't be ended"),
+            }
+        }
+        if ended > 0 {
+            tracing::warn!(cluster = %self.target.cluster, node = %self.target.node, ended,
+                "relay: ended relayed tenants' connections that didn't come through a relay");
+        }
+        ended
     }
 
     async fn register(&self, reg: &mut Option<Session>) {
@@ -394,9 +566,29 @@ impl RelayRole {
         let mut unusable_since: Option<Instant> = None;
         let mut last_epoch = 0u64;
         let bounded = Duration::from_secs(2);
+        // The relay host in the marker: (host, when it was last checked).
+        let mut published: Option<(String, Instant)> = None;
+        let mut swept = Instant::now();
         self.set_status("standby");
         while !stop.is_cancelled() {
             let _ = tokio::time::timeout(bounded, self.register(&mut reg)).await;
+            if published
+                .as_ref()
+                .is_none_or(|(_, at)| at.elapsed() >= HOST_RECHECK)
+                && let Ok(Some(host)) = tokio::time::timeout(bounded, self.own_host()).await
+            {
+                match tokio::time::timeout(bounded, self.publish_host(&host)).await {
+                    Ok(Ok(true)) => published = Some((host, Instant::now())),
+                    Ok(Ok(false)) | Err(_) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "relay: the relay host can't be published yet");
+                    }
+                }
+            }
+            if swept.elapsed() >= DIRECT_LOGIN_SWEEP {
+                swept = Instant::now();
+                let _ = tokio::time::timeout(bounded, self.end_direct_logins()).await;
+            }
             let usable = Self::usable(&mut conn, &self.target).await;
             if usable {
                 unusable_since = None;
@@ -417,8 +609,10 @@ impl RelayRole {
                     }
                     self.set_status("standby");
                 }
-            } else if usable {
-                // Not the writer: is the lease free?
+            } else if usable && published.is_some() {
+                // Not the writer: is the lease free? (Only once the relay
+                // host is published: relayed tenants' accounts must exist
+                // at this host before gateways log in through it.)
                 let cur = tokio::time::timeout(
                     bounded,
                     self.store.get(&lease_key, Consistency::Linearizable),
@@ -522,4 +716,42 @@ async fn holder_call(State(role): State<Arc<RelayRole>>, body: String) -> (Statu
         StatusCode::CONFLICT
     };
     (code, encode_answer(&r))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_hosts_drop_the_port() {
+        assert_eq!(account_host("172.20.0.5:51234"), "172.20.0.5");
+        assert_eq!(account_host("localhost"), "localhost");
+        assert_eq!(account_host("[::1]:3306"), "::1");
+        assert_eq!(account_host("cf-relay-1:40000"), "cf-relay-1");
+    }
+
+    #[test]
+    fn only_logins_around_the_relays_of_locked_tenants_are_ended() {
+        let acc = |u: &str, h: &str, l: bool| (u.to_owned(), h.to_owned(), l);
+        let accounts = vec![
+            // Relayed tenant 7: '%' locked, logins from the relay host.
+            acc("t7_u1", "%", true),
+            acc("t7_u1", "10.0.0.9", false),
+            acc("t7_u2", "%", true),
+            acc("t7_u2", "10.0.0.9", false),
+            // Tenant 8 isn't relayed.
+            acc("t8_u1", "%", false),
+            // A share definer is locked but isn't a user account.
+            acc("t7_sprig_share", "%", true),
+        ];
+        let p = |id: u64, u: &str, h: &str| (id, u.to_owned(), h.to_owned());
+        let processes = vec![
+            p(1, "t7_u1", "10.0.0.9:4001"),
+            p(2, "t7_u1", "192.168.65.1:4002"),
+            p(3, "t7_u2", "10.0.0.10:4003"),
+            p(4, "t8_u1", "192.168.65.1:4004"),
+            p(5, "t7_sprig_share", "192.168.65.1:4005"),
+        ];
+        assert_eq!(direct_logins(&accounts, &processes), vec![2, 3]);
+    }
 }

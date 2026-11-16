@@ -267,6 +267,9 @@ impl AuthzServices {
         let digest =
             placement.as_ref().map_or(0, |p| p.0) ^ super::rls::enforcement_digest(svc, cat);
         let versions = (cat.version, cat.auth_version, digest);
+        // Where the accounts log in from on this cluster moves with the
+        // tenant's path and the cluster's relays, not the catalog.
+        let here = with_hosts(versions, &login_hosts(svc, cat, cluster).await?);
         let every = Duration::from_secs(svc.settings.get(
             &sprig_auth::authz::settings::RECONCILE_INTERVAL_SECONDS,
             &cat.setting_ctx(&svc.dc),
@@ -274,7 +277,7 @@ impl AuthzServices {
         ));
         let key = (cat.tenant, cluster.clone());
         let sweep = match lock(&self.checked).get(&key) {
-            Some((v, at)) if *v == versions => {
+            Some((v, at)) if *v == here => {
                 if at.elapsed() < every {
                     return Ok(());
                 }
@@ -328,6 +331,8 @@ impl AuthzServices {
         };
         // The name pairs stored code looks up.
         super::stored_names::sync_logged(svc, cat, cluster).await;
+        let hosts = login_hosts(svc, cat, cluster).await?;
+        let versions = with_hosts(versions, &hosts);
         let Some(engine) = engine_for(svc, cat) else {
             return Ok(());
         };
@@ -356,6 +361,7 @@ impl AuthzServices {
         let hash = {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             want.hash(&mut h);
+            hosts.hash(&mut h);
             h.finish()
         };
         if !sweep && lock(&self.applied).get(&key) == Some(&hash) {
@@ -382,7 +388,11 @@ impl AuthzServices {
             )
         })?;
         let started = std::time::Instant::now();
-        let rep = backend::reconcile(&mut conn, cat.tenant, &want, &per_user.key, full).await?;
+        let rep = backend::reconcile_at(&mut conn, cat.tenant, &want, &per_user.key, full, &hosts)
+            .await?;
+        if rep.statements > 0 && hosts.locks_any() {
+            tracing::info!(tenant = %cat.tenant, %cluster, hosts = ?hosts.hosts(), "backend accounts log in only from the cluster's relays");
+        }
         // Share views run as their parent's share definer: a full
         // reconcile moves other stored code off non-tenant definers;
         // it and the drift sweep re-point share views with another definer
@@ -446,6 +456,46 @@ impl AuthzServices {
         lock(&self.checked).insert(key, (versions, now()));
         Ok(())
     }
+}
+
+/// Where `cat`'s per-user accounts on `cluster` may log in from: only the
+/// hosts of the cluster's relays for a tenant on Sprig 2PC's relay path
+/// (`txn.non_xa_policy = sprig_2pc` and `txn.sprig_2pc_path = relay`) once
+/// the cluster has relays that published them; anywhere otherwise.
+///
+/// # Errors
+/// The cluster's view can't be read.
+async fn login_hosts(
+    svc: &TenantServices,
+    cat: &TenantCatalog,
+    cluster: &ClusterId,
+) -> Result<backend::LoginHosts> {
+    let ctx = cat.setting_ctx(&svc.dc);
+    let relayed = svc.settings.get(
+        &sprig_txn::settings::NON_XA_POLICY,
+        &ctx,
+        Some(&cat.settings),
+    ) == "sprig_2pc"
+        && sprig_txn::settings::relay_path(&svc.settings.get(
+            &sprig_txn::settings::SPRIG_2PC_PATH,
+            &ctx,
+            Some(&cat.settings),
+        ));
+    if !relayed {
+        return Ok(backend::LoginHosts::Anywhere);
+    }
+    Ok(match svc.locator.relay_hosts(cluster).await? {
+        Some(h) if !h.is_empty() => backend::LoginHosts::Only(h),
+        // No relays, or relays of a build that doesn't publish its hosts.
+        _ => backend::LoginHosts::Anywhere,
+    })
+}
+
+/// `versions` with the login hosts folded in.
+fn with_hosts(versions: Checked, hosts: &backend::LoginHosts) -> Checked {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    hosts.hash(&mut h);
+    (versions.0, versions.1, versions.2 ^ h.finish())
 }
 
 /// The accounts of `want` whose database-level grants (`mysql.db`)

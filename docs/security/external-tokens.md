@@ -297,7 +297,7 @@ A login that a gateway hands to another data centre because of the tenant's [res
 | An array or an object | Its JSON text, as a string |
 | Missing | `NULL` |
 
-`SPRIG_CLAIM` is a session function of row-level security policies; see [Row-level security](row-level-security.md). This policy shows each token only its own organisation's rows:
+`SPRIG_CLAIM` works in any query (`SELECT SPRIG_CLAIM('org')`) and in row-level security policies; see [Row-level security](row-level-security.md). This policy shows each token only its own organisation's rows:
 
 ```sql test
 CREATE TABLE projects (

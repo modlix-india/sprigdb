@@ -221,9 +221,20 @@ impl GatewayDdl<'_> {
     }
 }
 
+/// The host of a definer: a tenant user's account logged in from a relay
+/// host (Sprig 2PC's relay path) still defines stored code as its `'%'`
+/// account, which every cluster keeps whatever the relays' hosts.
+fn definer_host(user: &str, host: &str) -> String {
+    match user.parse::<sprig_common::names::AccountName>() {
+        Ok(sprig_common::names::AccountName::User { .. }) => "%".to_owned(),
+        _ => host.to_owned(),
+    }
+}
+
 impl GatewayDdl<'_> {
     /// The session's backend account as MariaDB authenticated it
-    /// (`CURRENT_USER()`): user and host.
+    /// (`CURRENT_USER()`): user and host (for a tenant user's account, its
+    /// `'%'` account).
     async fn session_account(&self) -> Result<(String, String)> {
         let mut bs = self.bs.lock().await;
         bs.query(&StmtInfo::read(), b"SELECT CURRENT_USER()")
@@ -251,7 +262,7 @@ impl GatewayDdl<'_> {
         }
         v.as_deref()
             .and_then(|a| a.rsplit_once('@'))
-            .map(|(u, h)| (u.to_owned(), h.to_owned()))
+            .map(|(u, h)| (u.to_owned(), definer_host(u, h)))
             .ok_or_else(|| SprigError::internal("CURRENT_USER() returned no account"))
     }
 
@@ -1349,6 +1360,13 @@ mod tests {
             with_definer("CREATE PROCEDURE p() SELECT 'DEFINER=x'", D, &p),
             "CREATE DEFINER=`t1_u7`@`%` PROCEDURE p() SELECT 'DEFINER=x'"
         );
+    }
+
+    #[test]
+    fn relayed_logins_define_as_their_any_host_account() {
+        assert_eq!(definer_host("t7_u3", "10.0.0.9"), "%");
+        assert_eq!(definer_host("t7_u3", "%"), "%");
+        assert_eq!(definer_host("sprig_app", "10.0.0.9"), "10.0.0.9");
     }
 
     #[test]

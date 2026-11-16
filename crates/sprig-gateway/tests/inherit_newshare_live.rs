@@ -754,7 +754,11 @@ async fn a_drop_cut_off_by_a_gateway_crash_is_finished_by_the_copy_worker() {
     assert_eq!(rows_of(&mut c, &db).await, pairs(&[("1", "kid ovr")]));
     let mut p = conn(&e.addr, &e.parent).await;
     ok(&mut p, &format!("USE {db}")).await;
-    ok(&mut p, &format!("CREATE SHARE {name} ON t1 TO ALL CHILDREN")).await;
+    ok(
+        &mut p,
+        &format!("CREATE SHARE {name} ON t1 TO ALL CHILDREN"),
+    )
+    .await;
     let seen = rows_become(&mut c, &db, &[("1", "kid ovr"), ("2", "parent two")]).await;
     assert_eq!(seen, pairs(&[("1", "kid ovr"), ("2", "parent two")]));
     ok(&mut p, &format!("DROP SHARE {name}")).await;

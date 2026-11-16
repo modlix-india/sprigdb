@@ -9,7 +9,7 @@ source: the gateway's OpenAPI document (/v1/openapi.json)
 
 The gateway's REST API, as `/v1/openapi.json` describes it on every gateway. Requests authenticate with `Authorization: Bearer <token or API key>` (or HTTP Basic where allowed) and act with the caller's own rights. Statements stream as NDJSON from `POST /v1/databases/{database}/sql:query`. The same services are available over gRPC.
 
-109 operations in 28 services.
+110 operations in 29 services.
 
 ## sprig.admin.v1.Recommendations
 
@@ -197,6 +197,12 @@ The gateway's REST API, as `/v1/openapi.json` describes it on every gateway. Req
 | Method | Path | Operation | Description |
 |---|---|---|---|
 | POST | `/v1/policies:testAs` | `Policies.TestAs` | One read-only statement run as another user of the tenant ({tenant, user, host, database, sql}) |
+
+## sprig.v1.Retrieval
+
+| Method | Path | Operation | Description |
+|---|---|---|---|
+| POST | `/v1/databases/{database}/retrieval/{index}:search` | `Retrieval.Search` | Searches a retrieval index (CREATE RETRIEVAL INDEX) as RETRIEVE() does in SQL: full-text and embedding hits fused, at most two chunks per row, only rows the caller may read ({query, limit, filter}) |
 
 ## sprig.v1.Search
 

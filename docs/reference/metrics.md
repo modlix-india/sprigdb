@@ -9,7 +9,7 @@ source: the metric macros in the source tree, and docs/metrics-help.toml
 
 Every metric SprigDB records, as exported on each process's telemetry port (`/metrics`, Prometheus text) and through OTLP. Counters end in `_total`; durations are histograms in seconds.
 
-513 metrics in 54 groups.
+518 metrics in 55 groups.
 
 ## `sprig_advisor_*`
 
@@ -45,7 +45,7 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_ai_embedding_backlog` | gauge | - | sprig-ai | Changed rows of embedded columns the worker's embedding jobs have read from the change feed and not yet written. Unit: rows. |
 | `sprig_ai_embedding_cutovers_total` | counter | `result` | sprig-ai | Re-embeddings of embedded columns swapped into place after a model or source change; `result` is `done` or `failed` (retried). Unit: count. |
 | `sprig_ai_embedding_rows_total` | counter | `model`, `result` | sprig-ai | Rows the embedding worker handled for embedded columns; `model` is the model alias, `result` is `embedded`, `cleared` (no source: the vector became NULL), `skipped` (already the current source's) or `superseded` (the row changed again before the write). Unit: rows. |
-| `sprig_ai_embedding_seconds` | histogram | `model` | sprig-ai | Time of one model batch of the embedding worker; `model` is the model alias. Unit: seconds. |
+| `sprig_ai_embedding_seconds` | histogram | `model` | sprig-ai | Time of one model batch of the embedding worker (embedded columns and retrieval indexes); `model` is the model alias. Unit: seconds. |
 | `sprig_ai_feedback_total` | counter | `role`, `vote` | sprig-ai | Thumbs up or down users gave AI assistant answers (`POST /v1/ai/feedback`); `role` is the assistant, `vote` is `up` or `down`. Unit: count. |
 | `sprig_ai_fn_calls_total` | counter | `cached`, `fn`, `model` | sprig-ai | Distinct inputs the AI functions in statements answered (`AI_EMBED`, `AI_CLASSIFY`, ... and their MongoDB operators); `fn` is `embed`, `classify`, `extract`, `summarize` or `complete`, `model` is the model used, `cached` is `true` for answers from the function cache. Unit: count. |
 | `sprig_ai_health_findings_total` | counter | `rule` | sprig-ai | Findings of the administration agent's health rules over its metric history, one per finding per check; `rule` is `shard_split`, `cluster_full`, `replica_lag`, `cluster_health`, `connections`, `backup_age` or `mover_backlog`. Unit: count. |
@@ -598,6 +598,16 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_redis_connections` | gauge | `dc` | sprig-gateway | Redis connections open on this gateway; `dc` is the data centre. Unit: count. |
 | `sprig_redis_keyspace_events_total` | counter | - | sprig-gateway | Redis keyspace notifications published (`redis.notify_keyspace_events`). Unit: count. |
 | `sprig_redis_pubsub_messages_total` | counter | `kind` | sprig-gateway | Redis pub/sub messages routed between gateways; `kind` is the message kind. Unit: count. |
+
+## `sprig_retrieval_*`
+
+| Metric | Type | Labels | Recorded by | Description |
+|---|---|---|---|---|
+| `sprig_retrieval_backlog` | gauge | - | sprig-ai | Changed rows of tables with retrieval indexes that the worker's retrieval jobs have read from the change feed and not yet indexed. Unit: rows. |
+| `sprig_retrieval_chunks_total` | counter | - | sprig-ai | Chunks the retrieval workers wrote into retrieval indexes (each embedded and full-text indexed). Unit: count. |
+| `sprig_retrieval_rows_total` | counter | `result` | sprig-ai | Source rows the retrieval workers handled; `result` is `indexed` (chunks written), `cleared` (chunks removed: the row is gone or has no text), `skipped` (already current) or `superseded` (the row changed again before the write). Unit: rows. |
+| `sprig_retrieval_search_seconds` | histogram | `mode` | sprig-ai | Time of one retrieval index search (`RETRIEVE()` or the REST route), from the query embedding to the fused hits; `mode` is `hybrid`, or `keyword` when the query couldn't be embedded. Unit: seconds. |
+| `sprig_retrieval_searches_total` | counter | `result` | sprig-ai | Retrieval index searches; `result` is `ok`, `empty` (no hit) or `error`. Unit: count. |
 
 ## `sprig_rls_*`
 

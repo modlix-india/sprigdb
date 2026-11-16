@@ -147,6 +147,10 @@ pub fn wants(op: Op, delta: Option<&[String]>, columns: &[String]) -> bool {
     }
 }
 
+/// One source row's work: its index in the read, and its (heading,
+/// chunk) pairs.
+type RowWork = (usize, Vec<(String, String)>);
+
 /// Feed keys of one round, by shard.
 type RoundKeys = BTreeMap<ShardLoc, Vec<Vec<(String, sprig_binlog::Value)>>>;
 
@@ -596,7 +600,7 @@ impl Job<'_> {
         }
         // What each row needs.
         let mut skipped = 0u64;
-        let mut work: Vec<(usize, Vec<(String, String)>)> = Vec::new();
+        let mut work: Vec<RowWork> = Vec::new();
         for (i, r) in src.iter().enumerate() {
             let have = stored.get(&r.key_text);
             if have.is_some() && have.map(Vec::as_slice) == r.hash.as_deref() {
@@ -624,8 +628,8 @@ impl Job<'_> {
         // Groups of rows, about a model batch of chunks each, one
         // transaction per group.
         let target = self.batch.max(1);
-        let mut groups: Vec<Vec<(usize, Vec<(String, String)>)>> = Vec::new();
-        let mut cur: Vec<(usize, Vec<(String, String)>)> = Vec::new();
+        let mut groups: Vec<Vec<RowWork>> = Vec::new();
+        let mut cur: Vec<RowWork> = Vec::new();
         let mut n = 0;
         for w in work {
             n += w.1.len().max(1);
@@ -825,6 +829,9 @@ impl Job<'_> {
     /// Deletes the chunks of shard `s` whose row is gone.
     async fn sweep(&self, s: &ShardLoc) -> Result<u64> {
         let schema = self.ix.schema(self.tenant, s);
+        // Single-table form: a multi-table DELETE with no current schema
+        // is refused (1046).
+        let chunks = self.ix.chunks(&schema);
         let on: Vec<String> = self
             .ix
             .row
@@ -832,7 +839,7 @@ impl Job<'_> {
             .iter()
             .map(|k| {
                 format!(
-                    "s.{} = x.{}",
+                    "s.{} = {chunks}.{}",
                     quote(&k.name),
                     quote(&retrieval::key_column(&k.name))
                 )
@@ -840,8 +847,7 @@ impl Job<'_> {
             .collect();
         let mut c = self.conn_of(s).await?;
         c.query_drop(format!(
-            "DELETE x FROM {} AS x WHERE NOT EXISTS (SELECT 1 FROM {} AS s WHERE {})",
-            self.ix.chunks(&schema),
+            "DELETE FROM {chunks} WHERE NOT EXISTS (SELECT 1 FROM {} AS s WHERE {})",
             self.ix.source(&schema),
             on.join(" AND ")
         ))

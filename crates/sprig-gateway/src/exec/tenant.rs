@@ -2614,6 +2614,8 @@ impl PassSession {
         let client_text = sql.clone();
         // AI functions run only in plain statements.
         super::ai_fn::refuse_prepared(&sql, lex)?;
+        // So does RETRIEVE().
+        super::retrieval::refuse_prepared(&sql, lex)?;
         // `MATCH ... AGAINST (?)` on a search
         // index is prepared for its metadata without the call, and run as
         // text with the bound values at each execute.

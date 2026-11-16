@@ -65,6 +65,10 @@ pub struct ClusterView {
     /// last read. Tenants on the relay path reach the cluster only through
     /// it once the cluster has relays.
     pub relay: sprig_cluster::failover::relay::RelayState,
+    /// Galera: the hosts the cluster's relays reach its nodes from
+    /// (`relays/<cluster>`), as last read: relayed tenants' backend
+    /// accounts log in only from these.
+    pub relay_hosts: Vec<String>,
 }
 
 /// The writer of a primary + replicas cluster as the controller publishes
@@ -232,6 +236,7 @@ impl ClusterView {
             published: Published::default(),
             monitor_secret: Some(rec.secrets.ctl.clone()),
             relay: sprig_cluster::failover::relay::RelayState::None,
+            relay_hosts: Vec::new(),
         }
     }
 
@@ -259,6 +264,7 @@ impl ClusterView {
             published: Published::default(),
             monitor_secret: None,
             relay: sprig_cluster::failover::relay::RelayState::None,
+            relay_hosts: Vec::new(),
         }
     }
 
@@ -423,10 +429,16 @@ impl ClusterSource for RegistryClusters {
                 if rec.topology == TopologyKind::Galera
                     && let Some(store) = &self.leases
                 {
-                    use sprig_cluster::failover::relay::{RelayState, read_relay_state};
-                    view.relay = match read_relay_state(&**store, id).await {
-                        Ok(r) => r,
+                    use sprig_cluster::failover::relay::{RelayState, read_relay};
+                    view.relay = match read_relay(&**store, id).await {
+                        Ok((r, hosts)) => {
+                            view.relay_hosts = hosts;
+                            r
+                        }
                         Err(e) => {
+                            if let Some((_, old)) = &cached {
+                                view.relay_hosts.clone_from(&old.relay_hosts);
+                            }
                             tracing::warn!(cluster = %id, error = %e, "the relay writer can't be read");
                             match cached.as_ref().map(|(_, old)| &old.relay) {
                                 // A cluster with relays never falls back

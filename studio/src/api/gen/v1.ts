@@ -959,6 +959,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/databases/{database}/retrieval/{index}:search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Searches a retrieval index (CREATE RETRIEVAL INDEX) as RETRIEVE() does in SQL: full-text and embedding hits fused, at most two chunks per row, only rows the caller may read ({query, limit, filter}) */
+        post: operations["Retrieval.Search"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/databases/{database}/search/{index}:query": {
         parameters: {
             query?: never;
@@ -2227,6 +2244,27 @@ export interface components {
             rows?: (string | null)[][];
             truncated?: boolean;
             warnings?: number;
+        };
+        RetrievalSearchHit: {
+            bm25_rank?: number | null;
+            chunk_no: number;
+            key: {
+                [key: string]: unknown;
+            };
+            score: number;
+            text: string;
+            title?: string | null;
+            vector_rank?: number | null;
+        };
+        RetrievalSearchReply: {
+            database: string;
+            hits: components["schemas"]["RetrievalSearchHit"][];
+            index: string;
+        };
+        RetrievalSearchRequest: {
+            filter?: string;
+            limit?: number;
+            query: string;
         };
         /** @description The SearchQueryRequest message as JSON (proto3 mapping) */
         SearchQueryRequest: Record<string, never>;
@@ -4470,6 +4508,42 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["KvScanResponse"];
+                };
+            };
+            /** @description An error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    "Retrieval.Search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                database: string;
+                index: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RetrievalSearchRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetrievalSearchReply"];
                 };
             };
             /** @description An error */

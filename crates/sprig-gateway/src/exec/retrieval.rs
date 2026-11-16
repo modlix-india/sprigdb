@@ -298,6 +298,26 @@ fn derived_table(found: &Found, alias: Option<&str>, key_as_json: bool, nbe: boo
     }
 }
 
+fn prepared_refused() -> SprigError {
+    SprigError::new(
+        SprigCode::NameRewriteUnsupported,
+        "RETRIEVE() in a prepared statement: run it as a plain statement",
+    )
+}
+
+/// 39051 when `sql`, being prepared, calls `RETRIEVE()` in a `FROM` list
+/// (its arguments must be literals the gateway answers before the
+/// statement runs).
+///
+/// # Errors
+/// 39051.
+pub(super) fn refuse_prepared(sql: &[u8], lex: sprig_sql::lex::LexOptions) -> Result<()> {
+    if sqlrx::mentions(sql) && !matches!(sqlrx::calls(sql, &lex), Ok(c) if c.is_empty()) {
+        return Err(prepared_refused());
+    }
+    Ok(())
+}
+
 impl PassSession {
     fn rx_services(&self) -> Result<(Arc<TenantServices>, TenantId, Option<u32>)> {
         let ts = self
@@ -790,11 +810,7 @@ impl PassSession {
             Err(e) => return Ok(Some(self.fail(out, &sql_err(e.code, e.message)).await?)),
         };
         if format == RowFormat::Binary {
-            let e = SprigError::new(
-                SprigCode::NameRewriteUnsupported,
-                "RETRIEVE() in a prepared statement: run it as a plain statement",
-            );
-            return Ok(Some(self.fail(out, &e).await?));
+            return Ok(Some(self.fail(out, &prepared_refused()).await?));
         }
         let Ok(sql) = std::str::from_utf8(text) else {
             return Ok(None);

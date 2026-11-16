@@ -203,9 +203,12 @@ impl CatalogPools for Catalogs {
 }
 
 /// Shards are where the tenant's catalog is (a move takes them together).
+/// A tenant on Sprig 2PC's relay path reaches them through the relay
+/// writer ([`crate::relay_pools`]).
 struct TenantShards {
     locator: Arc<ShardMapLocator>,
     pools: Arc<dyn ClusterPools>,
+    dc: Arc<dyn MetaStore>,
 }
 
 #[async_trait]
@@ -219,7 +222,8 @@ impl ShardPools for TenantShards {
             e.retryable = true;
             e
         })?;
-        self.pools.writer(&cluster).await
+        let direct = self.pools.writer(&cluster).await?;
+        crate::relay_pools::shard_pool(&self.dc, tenant, &cluster, direct).await
     }
 }
 
@@ -465,6 +469,7 @@ impl LogicTrigger {
             pools: Arc::new(TenantShards {
                 locator: Arc::clone(&env.locator),
                 pools: Arc::clone(&env.pools),
+                dc: Arc::clone(&env.dc),
             }),
             versions,
             budget: env.settings.trigger_budget_for(scope),

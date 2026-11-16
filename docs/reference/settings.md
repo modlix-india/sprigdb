@@ -9,7 +9,7 @@ source: the settings registry (sprig-settings)
 
 Every setting SprigDB declares, with its default, the scopes that may set it, hard bounds and when a change applies. Settings resolve from the most specific scope: object, database, tenant and its ancestors, cluster, data center, global, then the built-in default. Read them with `SHOW SPRIG SETTINGS`, change them with `ALTER TENANT|DATABASE|TABLE … SPRIG SET (key = value)` or `sprigctl settings`.
 
-744 settings in 61 groups.
+747 settings in 61 groups.
 
 ## `advisor`
 
@@ -74,6 +74,8 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `ai.model.data` | text | `` | global (operator only) | - | live | provider/model for the data specialist; empty: none |
 | `ai.model.dba` | text | `` | global (operator only) | - | live | provider/model for the DBA assistant; empty: none |
 | `ai.model.triage` | text | `` | global (operator only) | - | live | provider/model that screens administration intake for noise; empty: none |
+| `ai.retrieval.candidates` | int | `40` | global (operator only) | 5 to 1000 | live | Hits a retrieval index search takes from each shard's full-text list and vector list before fusing them |
+| `ai.retrieval.max_chunks_per_row` | int | `64` | global (operator only) | 1 to 10000 | live | Chunks a retrieval index keeps of one row at most; the rest of a longer text isn't indexed |
 | `ai.share_data` | bool | `false` | database, tenant, global | - | live | Let the assistants send rows, results and value statistics to the AI provider; off sends schema, plans and statistics without values |
 | `ai.timeout_seconds` | int | `120` | global (operator only) | 5 to 3600 | live | Wall time of one assistant turn, model calls and tools together |
 
@@ -327,6 +329,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `catalog.cache_max_mb` | int | `512` | dc, global (operator only) | 1 to 1048576 | live | Catalog cache memory per gateway |
 | `catalog.cache_max_tenants` | int | `20000` | dc, global (operator only) | 1 to 10000000 | live | Tenants cached per gateway |
 | `catalog.cache_ttl_seconds` | int | `300` | dc, global (operator only) | 1 to 86400 | live | Backstop for missed watch events: re-read the directory entry after this long |
+| `catalog.contract_delay_days` | int | `7` | global (operator only) | 0 to 3650 | live | Days after a catalog module's last expand migration before its contract migrations may run; only an override with a recorded reason runs one earlier |
 | `catalog.ddl_wait_ms` | int | `10000` | tenant, dc, global | 0 to 3600000 | live | Wait for a pending DDL job |
 | `catalog.orphan_retention_days` | int | `7` | dc, global (operator only) | 0 to 3650 | live | Quarantine before dropping an empty orphan |
 | `catalog.reconcile_interval_seconds` | int | `300` | dc, global (operator only) | 1 to 86400 | live | Reconciler period per tenant |

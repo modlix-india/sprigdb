@@ -2111,6 +2111,81 @@
         },
         "type": "object"
       },
+      "RetrievalSearchHit": {
+        "properties": {
+          "bm25_rank": {
+            "nullable": true,
+            "type": "integer"
+          },
+          "chunk_no": {
+            "type": "integer"
+          },
+          "key": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "score": {
+            "type": "number"
+          },
+          "text": {
+            "type": "string"
+          },
+          "title": {
+            "nullable": true,
+            "type": "string"
+          },
+          "vector_rank": {
+            "nullable": true,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "key",
+          "chunk_no",
+          "text",
+          "score"
+        ],
+        "type": "object"
+      },
+      "RetrievalSearchReply": {
+        "properties": {
+          "database": {
+            "type": "string"
+          },
+          "hits": {
+            "items": {
+              "$ref": "#/components/schemas/RetrievalSearchHit"
+            },
+            "type": "array"
+          },
+          "index": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "database",
+          "index",
+          "hits"
+        ],
+        "type": "object"
+      },
+      "RetrievalSearchRequest": {
+        "properties": {
+          "filter": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
       "SearchQueryRequest": {
         "description": "The SearchQueryRequest message as JSON (proto3 mapping)",
         "type": "object"
@@ -5576,6 +5651,65 @@
         },
         "tags": [
           "sprig.v1.KeyValue"
+        ]
+      }
+    },
+    "/v1/databases/{database}/retrieval/{index}:search": {
+      "post": {
+        "operationId": "Retrieval.Search",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "database",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "index",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetrievalSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetrievalSearchReply"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error"
+          }
+        },
+        "summary": "Searches a retrieval index (CREATE RETRIEVAL INDEX) as RETRIEVE() does in SQL: full-text and embedding hits fused, at most two chunks per row, only rows the caller may read ({query, limit, filter})",
+        "tags": [
+          "sprig.v1.Retrieval"
         ]
       }
     },

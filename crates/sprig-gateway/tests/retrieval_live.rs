@@ -26,7 +26,8 @@
     missing_docs,
     clippy::too_many_lines,
     clippy::cast_precision_loss,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    clippy::many_single_char_names
 )]
 
 use std::collections::{BTreeSet, HashMap};
@@ -85,7 +86,7 @@ fn q(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
 }
 
-/// `RETRIEVE()`'s hits as (id, chunk_no, bm25_rank, vector_rank).
+/// `RETRIEVE()`'s hits as (`id`, `chunk_no`, `bm25_rank`, `vector_rank`).
 async fn retrieve(
     c: &mut mysql_async::Conn,
     index: &str,
@@ -381,7 +382,7 @@ fn shell(cmd: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-async fn rest(
+fn rest(
     http: &str,
     user: &str,
     password: &str,
@@ -689,10 +690,12 @@ async fn retrieval_indexes_end_to_end() {
         }
     })
     .await;
+    let new = ids(&mut c, "kb", "sourdough starter bread", 3).await;
+    let old = ids(&mut c, "kb", "link my outlook calendar", 3).await;
     ck.ok(
         "an updated row is found by its new text, not its old",
         d.is_some(),
-        String::new,
+        || format!("new text: {new:?}, old text: {old:?}"),
     );
     let kb_id = match &mut b {
         Some(b) => index_id(b, "kb").await,
@@ -734,8 +737,7 @@ async fn retrieval_indexes_end_to_end() {
             &password,
             &format!("/v1/databases/{DB}/retrieval/kb:search"),
             &serde_json::json!({"query": "where is my package right now", "limit": 3}),
-        )
-        .await;
+        );
         let first = v["hits"][0]["key"]["id"].as_i64();
         ck.ok(
             "REST search answers with keys and ranks",
@@ -756,8 +758,7 @@ async fn retrieval_indexes_end_to_end() {
             &password,
             &format!("/v1/databases/{DB}/retrieval/kb:search"),
             &serde_json::json!({"query": "money back", "limit": 5, "filter": "product = 'billing'"}),
-        )
-        .await;
+        );
         ck.ok(
             "REST filter",
             code == 200 && v["hits"].as_array().is_some_and(|h| !h.is_empty()),
@@ -769,8 +770,7 @@ async fn retrieval_indexes_end_to_end() {
             &password,
             &format!("/v1/databases/{DB}/retrieval/nope:search"),
             &serde_json::json!({"query": "x"}),
-        )
-        .await;
+        );
         ck.ok("REST: an unknown index fails", code >= 400, || {
             format!("{code}")
         });
@@ -780,8 +780,7 @@ async fn retrieval_indexes_end_to_end() {
             &password,
             &format!("/v1/databases/{DB}/retrieval/kb:search"),
             &serde_json::json!({}),
-        )
-        .await;
+        );
         ck.ok("REST: a query is required (400)", code == 400, || {
             format!("{code}")
         });
@@ -829,8 +828,7 @@ async fn retrieval_indexes_end_to_end() {
             "Rx-reader-Passw0rd",
             &format!("/v1/databases/{DB}/retrieval/kb:search"),
             &serde_json::json!({"query": "where is my package right now", "limit": 5}),
-        )
-        .await;
+        );
         let odd = v["hits"].as_array().is_some_and(|h| {
             !h.is_empty()
                 && h.iter()
@@ -957,8 +955,8 @@ async fn retrieval_indexes_end_to_end() {
         let t = Instant::now();
         let mut at = 0;
         while t.elapsed() < Duration::from_secs(120) {
-            at = state(&mut c, "notes_ix").await.1;
             let chunks: u64 = chunk_tables(bk, id).await.iter().map(|x| x.1).sum();
+            at = chunks;
             if chunks > 50 {
                 break;
             }
@@ -1013,7 +1011,7 @@ async fn retrieval_indexes_end_to_end() {
             .await
             .unwrap();
         eprintln!(
-            "     killed at about {at} rows indexed; after: missing {missing}, orphans {orphans}, stale {stale}, gaps {}",
+            "     killed with {at} chunks written; after: missing {missing}, orphans {orphans}, stale {stale}, gaps {}",
             per_row.len()
         );
         ck.ok(

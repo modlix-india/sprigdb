@@ -776,32 +776,14 @@ impl Migrator {
                     report.blocked.push(r);
                     break;
                 }
-                let mut overridden = None;
-                if m.phase == Phase::Contract {
-                    let hist = read_history(conn, schema, module.name).await?;
-                    let expand_at = last_expand_at(&hist, m.format);
-                    if let Err(due) = contract_due(expand_at, self.clock.wall(), opts.contract_delay)
-                    {
-                        let Some(o) = &opts.contract_override else {
-                            let due = due.map(rfc3339);
-                            tracing::info!(schema, module = module.name, format = m.format, name = m.name, due = due.as_deref().unwrap_or("unknown"), "catalog contract migration waits for catalog.contract_delay_days");
-                            report.delayed.push(Delayed {
-                                migration: r.clone(),
-                                due,
-                            });
-                            report.blocked.push(r);
-                            break;
-                        };
-                        let rec = DelayOverride {
-                            reason: o.reason.clone(),
-                            by: o.by.clone(),
-                            expand_at: expand_at.map(rfc3339),
-                            delay_secs: opts.contract_delay.as_secs(),
-                        };
-                        tracing::warn!(schema, module = module.name, format = m.format, name = m.name, by = %rec.by, reason = %rec.reason, expand_at = rec.expand_at.as_deref().unwrap_or("unknown"), "catalog contract migration runs before catalog.contract_delay_days is over, by override");
-                        overridden = Some(rec);
+                let overridden = match self.contract_gate(conn, schema, opts, &r).await? {
+                    Ok(o) => o,
+                    Err(d) => {
+                        report.delayed.push(d);
+                        report.blocked.push(r);
+                        break;
                     }
-                }
+                };
                 refuse_fenced(conn, schema).await?;
                 tracing::info!(schema, module = module.name, format = m.format, phase = ?m.phase, name = m.name, "applying catalog migration");
                 for stmt in m.statements {
@@ -816,6 +798,50 @@ impl Migrator {
         }
         report.state = state;
         Ok(report)
+    }
+
+    /// The contract delay (module docs) for migration `r`: `Ok(None)` when
+    /// it may run (an expand, or a contract past the delay), `Ok(Some(o))`
+    /// when only the run's override lets it run early (recorded as `o`),
+    /// `Err(d)` when it waits.
+    async fn contract_gate(
+        &self,
+        conn: &mut Conn,
+        schema: &str,
+        opts: &MigrateOpts,
+        r: &MigrationRef,
+    ) -> Result<std::result::Result<Option<DelayOverride>, Delayed>> {
+        if r.phase != Phase::Contract {
+            return Ok(Ok(None));
+        }
+        let hist = read_history(conn, schema, r.module).await?;
+        let expand_at = last_expand_at(&hist, r.format);
+        let Err(due) = contract_due(expand_at, self.clock.wall(), opts.contract_delay) else {
+            return Ok(Ok(None));
+        };
+        let Some(o) = &opts.contract_override else {
+            let due = due.map(rfc3339);
+            tracing::info!(
+                schema,
+                module = r.module,
+                format = r.format,
+                name = r.name,
+                due = due.as_deref().unwrap_or("unknown"),
+                "catalog contract migration waits for catalog.contract_delay_days"
+            );
+            return Ok(Err(Delayed {
+                migration: r.clone(),
+                due,
+            }));
+        };
+        let rec = DelayOverride {
+            reason: o.reason.clone(),
+            by: o.by.clone(),
+            expand_at: expand_at.map(rfc3339),
+            delay_secs: opts.contract_delay.as_secs(),
+        };
+        tracing::warn!(schema, module = r.module, format = r.format, name = r.name, by = %rec.by, reason = %rec.reason, expand_at = rec.expand_at.as_deref().unwrap_or("unknown"), "catalog contract migration runs before catalog.contract_delay_days is over, by override");
+        Ok(Ok(Some(rec)))
     }
 
     /// Records `m` in `sprig.migration.<module>` and the new state in

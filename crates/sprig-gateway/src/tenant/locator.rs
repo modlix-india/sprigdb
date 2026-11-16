@@ -643,6 +643,20 @@ impl GatewayLocator {
         self.pool_of(cluster, Budget::Ctl).await
     }
 
+    /// Sprig 2PC's relays on `cluster`: `None` when it has none (or isn't
+    /// Galera), else the hosts its relays reach its nodes from (empty while
+    /// no relay has published one).
+    ///
+    /// # Errors
+    /// As [`Self::ctl_pool`].
+    pub async fn relay_hosts(&self, cluster: &ClusterId) -> Result<Option<Vec<String>>> {
+        let v = self.backends.view(cluster).await?;
+        Ok(
+            (v.relay != sprig_cluster::failover::relay::RelayState::None)
+                .then(|| v.relay_hosts.clone()),
+        )
+    }
+
     /// The pool of `sprig_ctl` connections to `cluster`'s writer for a lock
     /// held across other work: a transaction whose row locks keep another
     /// gateway off the same rows (the cross-tenant outbox forward, a

@@ -30,6 +30,7 @@ pub mod permit;
 pub mod queue_forwarder;
 // Recovery: errant_extract and node_rebuild.
 pub mod recovery;
+mod relay_pools;
 pub mod runtime;
 // The search role.
 pub mod search;

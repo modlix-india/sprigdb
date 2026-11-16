@@ -232,7 +232,12 @@ impl Runner for EnvRunner<'_> {
         self.env.catalog(t).await
     }
 
-    async fn tree_tables(&mut self, root: TenantId, db: &str, table: &str) -> Result<Vec<TreeTable>> {
+    async fn tree_tables(
+        &mut self,
+        root: TenantId,
+        db: &str,
+        table: &str,
+    ) -> Result<Vec<TreeTable>> {
         Ok(tree_tables(self.family, root, db, table))
     }
 }
@@ -382,7 +387,11 @@ mod tests {
         assert_eq!(sweep_family(&env, &f, &mut seen).await, Swept::default());
         env.later(GRACE_MS - 1);
         assert_eq!(sweep_family(&env, &f, &mut seen).await, Swept::default());
-        assert_eq!(env.reads.load(Ordering::Relaxed), 0, "read before the grace");
+        assert_eq!(
+            env.reads.load(Ordering::Relaxed),
+            0,
+            "read before the grace"
+        );
         env.later(1);
         let s = sweep_family(&env, &f, &mut seen).await;
         assert_eq!(s.shares, 1);
