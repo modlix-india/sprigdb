@@ -10,6 +10,11 @@
 //! SPRIG_TEST_DOCKER=1 cargo test -p sprig-gateway --test two_dc_bins -- --nocapture
 //! ```
 //!
+//! `XDC_TWO_TIER=1` runs it in two etcd tiers (a global etcd on 33379 and
+//! one per DC on 33376 and 33377; other DCs' tiers are read through the
+//! controllers' relay); run it there with `XDC_ONLY=residency,streams,sinks`
+//! (job standbys are single-etcd only). `XDC_ONLY` picks parts.
+//!
 //! Ports 33306-33392 on 127.0.0.1; tenant ids from 33,306,000,000 (the
 //! MySQL port x 1,000,000, `tenant.id_min`/`id_max`). Nothing touches the
 //! shared stack. Checked, each part recording its checks so a failure in one
@@ -21,15 +26,25 @@
 //!    key, `MONGODB-OIDC`, MongoDB SCRAM, Redis `AUTH`) and the statements
 //!    after it run against `fra1`'s cluster; with `deny_remote_access` each
 //!    one is refused with 39302 while `fra1` still accepts.
+//!    `SELECT SPRIG_CLAIM('org')` in a plain query gives the token's claim
+//!    over MySQL and HTTP.
 //! 2. **Change streams.** A change stream of a `fra1` tenant opened at
 //!    `ams1` (NDJSON and SSE) is relayed from a `fra1` gateway: it gets the
 //!    tenant's changes, outlives the peer call timeout, and resumes from its
-//!    last token.
-//! 3. **Inherited sinks.** Declarer `xdc-p` (in `fra1`) has a `FOR EACH
-//!    TENANT` stream, connection and sink; its member `xdc-m` lives in `ams1`.
-//!    The member's instance appears on its first publish; a second sink
-//!    created by the declarer reaches it; `DROP SINK` at `fra1` removes the
-//!    member's sink and connection in `ams1` at once.
+//!    last token. A MongoDB change stream at `ams1` renders the items of a
+//!    `fra1` gateway's tail (typed, resumable), and a Kafka fetch at `ams1`
+//!    reads the tenant's stream and wakes on `fra1`'s next record.
+//! 3. **Inherited sinks and members.** Declarer `xdc-p` (in `fra1`) has a
+//!    `FOR EACH TENANT` stream, connection and sink; its member `xdc-m` is
+//!    created directly in `ams1`. The member's instance appears on its first
+//!    publish; a second sink created by the declarer reaches it; `DROP SINK`
+//!    at `fra1` removes the member's sink and connection in `ams1` at once.
+//!    `SHOW INHERITED DEFINITIONS` at `fra1` counts the member's instance, an
+//!    override `FOR TENANT` is applied to it, `DROP TRIGGER` stops its
+//!    trigger instance, and a broadcast reaches it once.
+//! 4. **A move into the standby's DC.** A tenant with its own
+//!    `failover.standby_dcs = 1` gets a job standby in `ams1`; `sprigctl
+//!    tenant move --to ams1` drops the standby first and moves it.
 
 #![allow(
     clippy::unwrap_used,
@@ -71,6 +86,34 @@ const DEPLOYMENT: &str = "sprigdb-xdc";
 /// The MySQL port of `fra1`'s gateway x 1,000,000 (below 2^38).
 const TENANT_BASE: u64 = 33_306_000_000;
 const ETCD_PORT: u16 = 33379;
+
+/// `XDC_TWO_TIER=1`: each DC gets its own etcd (33376 for `fra1`, 33377
+/// for `ams1`) beside the global one on 33379, and other DCs' tiers are
+/// read through the controllers' relay.
+fn two_tier() -> bool {
+    std::env::var("XDC_TWO_TIER").is_ok_and(|v| v == "1")
+}
+
+/// The etcd of `dc`'s tier.
+fn dc_seed(dc: &str) -> String {
+    if two_tier() {
+        format!(
+            "http://127.0.0.1:{}",
+            if dc == "fra1" { 33376 } else { 33377 }
+        )
+    } else {
+        format!("http://127.0.0.1:{ETCD_PORT}")
+    }
+}
+
+/// `[meta] global_seeds`: empty in single-etcd mode.
+fn global_seeds() -> String {
+    if two_tier() {
+        format!("\"http://127.0.0.1:{ETCD_PORT}\"")
+    } else {
+        String::new()
+    }
+}
 const ISS: &str = "https://idp.xdc.test";
 const AUD: &str = "xdc-app";
 /// The test's webhook receiver for sinks.
@@ -90,6 +133,7 @@ struct Ports {
     mongo: u16,
     redis: u16,
     wk_tel: u16,
+    kafka: u16,
     db: u16,
 }
 
@@ -108,6 +152,7 @@ fn ports(dc: &str) -> Ports {
         mongo: b + 19,
         redis: b + 20,
         wk_tel: b + 21,
+        kafka: b + 22,
         db: if dc == "fra1" { 33391 } else { 33392 },
     }
 }
@@ -416,6 +461,45 @@ async fn rows(dc: &str, user: &str, sql: &str) -> Result<Vec<String>, u16> {
     rows_col(dc, user, sql, 0).await
 }
 
+/// Every row of `sql`, each column as text; the error's code.
+async fn table(dc: &str, user: &str, sql: &str) -> Result<Vec<Vec<String>>, u16> {
+    let mut c = my(dc, user, APP_PW).await?;
+    let r: Result<Vec<mysql_async::Row>, _> = c.query(sql).await;
+    let _ = c.disconnect().await;
+    match r {
+        Ok(rs) => Ok(rs
+            .into_iter()
+            .map(|row| {
+                (0..row.len())
+                    .map(|i| {
+                        row.get_opt::<Option<String>, _>(i)
+                            .and_then(Result::ok)
+                            .flatten()
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
+            .collect()),
+        Err(mysql_async::Error::Server(e)) => Err(e.code),
+        Err(e) => panic!("{sql}: {e}"),
+    }
+}
+
+/// The notes `sql` left (`SHOW WARNINGS` after it), as `user` at `dc`.
+async fn info(dc: &str, user: &str, sql: &str) -> Result<String, String> {
+    let mut c = my(dc, user, APP_PW).await.map_err(|e| e.to_string())?;
+    let r = c.query_drop(sql).await.map_err(|e| e.to_string());
+    let notes: Vec<(String, u32, String)> = c.query("SHOW WARNINGS").await.unwrap_or_default();
+    let _ = c.disconnect().await;
+    r.map(|()| {
+        notes
+            .into_iter()
+            .map(|(_, _, m)| m)
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
+}
+
 fn now() -> i64 {
     i64::try_from(
         SystemTime::now()
@@ -602,6 +686,119 @@ async fn mongo_scram(dc: &str, user: &str, pw: &str) -> Result<(), String> {
     mongo_ping(dc, cred).await
 }
 
+/// A MongoDB client of `user` (SCRAM) at `dc`.
+async fn mongo_client(dc: &str, user: &str) -> mongodb::Client {
+    use mongodb::options::{AuthMechanism, ClientOptions, Credential};
+    let mut o = ClientOptions::parse(format!(
+        "mongodb://{H}:{}/?directConnection=true&serverSelectionTimeoutMS=8000",
+        ports(dc).mongo
+    ))
+    .await
+    .expect("mongo options");
+    o.credential = Some(
+        Credential::builder()
+            .mechanism(AuthMechanism::ScramSha256)
+            .username(user.to_owned())
+            .password(APP_PW.to_owned())
+            .source("admin".to_owned())
+            .build(),
+    );
+    mongodb::Client::with_options(o).expect("mongo client")
+}
+
+/// The next change event of `s`, within `within`.
+async fn next_change(
+    s: &mut mongodb::change_stream::ChangeStream<
+        mongodb::change_stream::event::ChangeStreamEvent<mongodb::bson::Document>,
+    >,
+    within: Duration,
+) -> Result<mongodb::change_stream::event::ChangeStreamEvent<mongodb::bson::Document>, String> {
+    let t0 = Instant::now();
+    while t0.elapsed() < within {
+        match tokio::time::timeout(Duration::from_secs(2), s.next_if_any()).await {
+            Ok(Ok(Some(ev))) => return Ok(ev),
+            Ok(Ok(None)) | Err(_) => {}
+            Ok(Err(e)) => return Err(e.to_string()),
+        }
+    }
+    Err("no event".into())
+}
+
+type KafkaIo = tokio_rustls::client::TlsStream<TcpStream>;
+
+/// A Kafka client of `user` at `dc` (TLS, SASL PLAIN).
+async fn kafka(dc: &str, user: &str) -> sprig_proto_kafka::client::Client<KafkaIo> {
+    use rustls::pki_types::pem::PemObject as _;
+    let tcp = TcpStream::connect((H, ports(dc).kafka))
+        .await
+        .expect("kafka tcp");
+    let mut roots = rustls::RootCertStore::empty();
+    let ca = std::fs::read(sprig_testkit::compose::compose_dir().join("gateway-certs/ca.pem"))
+        .expect("ca");
+    for c in rustls::pki_types::CertificateDer::pem_slice_iter(&ca) {
+        roots.add(c.expect("ca pem")).expect("ca");
+    }
+    let cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from("localhost").expect("name");
+    let s = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+        .connect(name, tcp)
+        .await
+        .expect("kafka tls");
+    let mut c = sprig_proto_kafka::client::Client::new(s, "two-dc");
+    c.sasl_plain(user, APP_PW).await.expect("kafka login");
+    c
+}
+
+/// One Fetch of `topic` partition 0 from `offset`, waiting up to
+/// `wait_ms`: the records' values and the high watermark, or the error.
+async fn kafka_fetch(
+    c: &mut sprig_proto_kafka::client::Client<KafkaIo>,
+    topic: &str,
+    offset: i64,
+    wait_ms: i32,
+) -> Result<(Vec<String>, i64), String> {
+    use sprig_proto_kafka::messages::{FetchRequest, FetchResponse, fetch_request};
+    use sprig_proto_kafka::records::RecordBatch;
+    let req = FetchRequest {
+        replica_id: -1,
+        max_wait_ms: wait_ms,
+        min_bytes: 1,
+        max_bytes: 1 << 20,
+        isolation_level: 1,
+        session_epoch: -1,
+        topics: vec![fetch_request::FetchTopic {
+            topic: topic.into(),
+            partitions: vec![fetch_request::FetchPartition {
+                partition: 0,
+                current_leader_epoch: -1,
+                fetch_offset: offset,
+                partition_max_bytes: 1 << 20,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let r: FetchResponse = c.call(12, &req).await.map_err(|e| e.to_string())?;
+    let p = r
+        .responses
+        .first()
+        .and_then(|t| t.partitions.first())
+        .ok_or("no partition")?;
+    if p.error_code != 0 {
+        return Err(format!("error {}", p.error_code));
+    }
+    let values = RecordBatch::decode_all(p.records.as_deref().unwrap_or(&[]), 1 << 26, true)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .flat_map(|b| b.records)
+        .map(|r| String::from_utf8_lossy(&r.value.unwrap_or_default()).into_owned())
+        .collect();
+    Ok((values, p.high_watermark))
+}
+
 async fn redis_auth(dc: &str, user: &str, pass: &str) -> Result<String, String> {
     let c = redis::Client::open(format!("redis://{H}:{}/", ports(dc).redis)).unwrap();
     let mut con = tokio::time::timeout(
@@ -619,15 +816,17 @@ async fn redis_auth(dc: &str, user: &str, pass: &str) -> Result<String, String> 
         .map_err(|e| e.to_string())
 }
 
-fn controller_toml(dc: &str, seed: &str, work: &Path) -> String {
+fn controller_toml(dc: &str, work: &Path) -> String {
     let p = ports(dc);
+    let seed = dc_seed(dc);
+    let global = global_seeds();
     format!(
         r#"[node]
 dc = "{dc}"
 id = "ctl-{dc}"
 [meta]
 dc_seeds = ["{seed}"]
-global_seeds = []
+global_seeds = [{global}]
 deployment_id = "{DEPLOYMENT}"
 [controller]
 bootstrap = {boot}
@@ -651,14 +850,16 @@ sink_dir = "{w}/audit-sink-{dc}"
 }
 
 /// A worker: the mover's jobs of a DC move run on the target DC's.
-fn worker_toml(dc: &str, seed: &str) -> String {
+fn worker_toml(dc: &str) -> String {
+    let seed = dc_seed(dc);
+    let global = global_seeds();
     format!(
         r#"[node]
 dc = "{dc}"
 id = "worker-{dc}"
 [meta]
 dc_seeds = ["{seed}"]
-global_seeds = []
+global_seeds = [{global}]
 deployment_id = "{DEPLOYMENT}"
 [telemetry]
 bootstrap_log_level = "info"
@@ -669,15 +870,17 @@ bootstrap_addr = "127.0.0.1:{tel}"
     )
 }
 
-fn gateway_toml(dc: &str, seed: &str, backends: &Path) -> String {
+fn gateway_toml(dc: &str, backends: &Path) -> String {
     let p = ports(dc);
+    let seed = dc_seed(dc);
+    let global = global_seeds();
     format!(
         r#"[node]
 dc = "{dc}"
 id = "gw-{dc}"
 [meta]
 dc_seeds = ["{seed}"]
-global_seeds = []
+global_seeds = [{global}]
 deployment_id = "{DEPLOYMENT}"
 [gateway]
 login_mode = "catalog"
@@ -691,6 +894,7 @@ https = "127.0.0.1:{hs}"
 peer = "127.0.0.1:{pe}"
 mongo = "127.0.0.1:{mo}"
 redis = "127.0.0.1:{re}"
+kafka = "127.0.0.1:{ka}"
 [telemetry]
 bootstrap_log_level = "info"
 log_format = "pretty"
@@ -704,6 +908,7 @@ bootstrap_addr = "127.0.0.1:{tel}"
         pe = p.peer,
         mo = p.mongo,
         re = p.redis,
+        ka = p.kafka,
         tel = p.gw_tel
     )
 }
@@ -767,6 +972,8 @@ async fn db_up(dc: &str) {
 /// The deployment: containers, processes, the two clusters' ids.
 struct Deployment {
     store: Arc<dyn MetaStore>,
+    /// Each DC's tier (the global store's etcd in single-etcd mode).
+    dc_stores: [Arc<dyn MetaStore>; 2],
     sprigctl: PathBuf,
     work: PathBuf,
     clusters: [String; 2],
@@ -778,6 +985,10 @@ struct Deployment {
 impl Deployment {
     fn cluster(&self, dc: &str) -> &str {
         &self.clusters[usize::from(dc != "fra1")]
+    }
+
+    fn dc_store(&self, dc: &str) -> &dyn MetaStore {
+        &*self.dc_stores[usize::from(dc != "fra1")]
     }
 
     /// Creates `name` on `dc`'s cluster (under `parent`), with user `app`;
@@ -859,20 +1070,55 @@ async fn deploy() -> Option<Deployment> {
         )
         .expect("etcd"),
     );
+    if two_tier() {
+        for (dc, port) in [("fra1", 33376), ("ams1", 33377)] {
+            let publish = format!("127.0.0.1:{port}:2379");
+            let adv = format!("--advertise-client-urls=http://127.0.0.1:{port}");
+            containers.push(
+                OwnContainer::run(
+                    &format!("xdc-etcd-{dc}"),
+                    &[
+                        "--memory",
+                        "256m",
+                        "-p",
+                        &publish,
+                        "quay.io/coreos/etcd:v3.6.5",
+                        "etcd",
+                        "--listen-client-urls=http://0.0.0.0:2379",
+                        &adv,
+                        "--auto-compaction-mode=periodic",
+                        "--auto-compaction-retention=1h",
+                    ],
+                )
+                .expect("dc etcd"),
+            );
+        }
+    }
     containers.push(mariadb("fra1", 331));
     containers.push(mariadb("ams1", 332));
-    let seed = format!("http://127.0.0.1:{ETCD_PORT}");
-    let mut cfg = EtcdConfig::new(vec![seed.clone()]);
-    cfg.request_timeout = Duration::from_secs(2);
-    let t0 = Instant::now();
-    let store: Arc<dyn MetaStore> = loop {
-        match EtcdStore::connect(Tier::Global, &cfg).await {
-            Ok(s) => break Arc::new(s),
-            Err(_) if t0.elapsed() < Duration::from_secs(60) => {
-                tokio::time::sleep(Duration::from_millis(300)).await;
+    let connect = |tier: Tier, seed: String| async move {
+        let mut cfg = EtcdConfig::new(vec![seed]);
+        cfg.request_timeout = Duration::from_secs(2);
+        let t0 = Instant::now();
+        loop {
+            match EtcdStore::connect(tier.clone(), &cfg).await {
+                Ok(s) => break Arc::new(s) as Arc<dyn MetaStore>,
+                Err(_) if t0.elapsed() < Duration::from_secs(60) => {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                Err(e) => panic!("etcd: {e}"),
             }
-            Err(e) => panic!("etcd: {e}"),
         }
+    };
+    let store = connect(Tier::Global, format!("http://127.0.0.1:{ETCD_PORT}")).await;
+    let dc_stores: [Arc<dyn MetaStore>; 2] = if two_tier() {
+        let dc = |d: &str| Tier::Dc(sprig_common::ids::DcId::new(d).expect("dc"));
+        [
+            connect(dc("fra1"), dc_seed("fra1")).await,
+            connect(dc("ams1"), dc_seed("ams1")).await,
+        ]
+    } else {
+        [Arc::clone(&store), Arc::clone(&store)]
     };
     db_up("fra1").await;
     db_up("ams1").await;
@@ -897,11 +1143,18 @@ async fn deploy() -> Option<Deployment> {
             ("listener.mongo.tls", json!("off")),
             ("listener.redis.enabled", json!(true)),
             ("listener.redis.tls", json!("off")),
+            ("listener.kafka.enabled", json!(true)),
+            ("listener.kafka.tls", json!("optional")),
             // No standby copies in the other DC: a standby's job locks the
             // tenant, and the member's move would wait for it.
             ("failover.standby_dcs", json!(0)),
         ] {
-            setting(&*store, &format!("/sprig/dc/{d}/settings/{k}"), v).await;
+            setting(
+                &*dc_stores[usize::from(d != "fra1")],
+                &format!("/sprig/dc/{d}/settings/{k}"),
+                v,
+            )
+            .await;
         }
     }
     setting(
@@ -938,11 +1191,7 @@ async fn deploy() -> Option<Deployment> {
         work: work.clone(),
         kids: Vec::new(),
     };
-    procs.start(
-        "ctl-fra1",
-        "controller",
-        &controller_toml("fra1", &seed, &work),
-    );
+    procs.start("ctl-fra1", "controller", &controller_toml("fra1", &work));
     assert!(
         ready(ports("fra1").ctl_tel, Duration::from_secs(120)).await,
         "ctl-fra1 ready"
@@ -957,11 +1206,7 @@ async fn deploy() -> Option<Deployment> {
         Duration::from_secs(30),
     )
     .await;
-    procs.start(
-        "ctl-ams1",
-        "controller",
-        &controller_toml("ams1", &seed, &work),
-    );
+    procs.start("ctl-ams1", "controller", &controller_toml("ams1", &work));
     assert!(
         ready(ports("ams1").ctl_tel, Duration::from_secs(120)).await,
         "ctl-ams1 ready"
@@ -994,12 +1239,8 @@ async fn deploy() -> Option<Deployment> {
             .clone_into(&mut clusters[i]);
     }
     for dc in DCS {
-        procs.start(
-            &format!("gw-{dc}"),
-            "gateway",
-            &gateway_toml(dc, &seed, &backends),
-        );
-        procs.start(&format!("worker-{dc}"), "worker", &worker_toml(dc, &seed));
+        procs.start(&format!("gw-{dc}"), "gateway", &gateway_toml(dc, &backends));
+        procs.start(&format!("worker-{dc}"), "worker", &worker_toml(dc));
     }
     for dc in DCS {
         assert!(
@@ -1014,6 +1255,7 @@ async fn deploy() -> Option<Deployment> {
     eprintln!("clusters {clusters:?}");
     Some(Deployment {
         store,
+        dc_stores,
         sprigctl,
         work,
         clusters,
@@ -1162,11 +1404,26 @@ async fn residency(d: &Deployment, c: &mut Checks) {
     match my("ams1", &format!("{T}.tok"), &tok).await {
         Ok(mut s) => {
             let ids: Result<Vec<i32>, _> = s.query("SELECT id FROM eu.docs ORDER BY id").await;
+            // The session functions in a statement of its own, bound as in
+            // policies.
+            let own: Result<Vec<(Option<String>, Option<String>)>, _> = s
+                .query("SELECT SPRIG_CLAIM('org'), SPRIG_CLAIM('missing')")
+                .await;
+            let filtered: Result<Vec<i32>, _> = s
+                .query("SELECT id FROM eu.notes WHERE SPRIG_CLAIM('org') = 'o-7' AND id = 1")
+                .await;
             let _ = s.disconnect().await;
             c.ok(
                 "ams1: MySQL token login handed off, its claim filters rows",
                 ids.as_ref().is_ok_and(|v| v == &vec![1, 2]),
                 || format!("{ids:?}"),
+            );
+            c.ok(
+                "ams1: SELECT SPRIG_CLAIM('org') in a plain query gives the claim over MySQL",
+                own.as_ref()
+                    .is_ok_and(|v| v == &vec![(Some("o-7".to_owned()), None)])
+                    && filtered.as_ref().is_ok_and(|v| v == &vec![1]),
+                || format!("{own:?} {filtered:?}"),
             );
         }
         Err(e) => c.ok("ams1: MySQL token login", false, || e.to_string()),
@@ -1197,6 +1454,19 @@ async fn residency(d: &Deployment, c: &mut Checks) {
     c.ok(
         "ams1: HTTP bearer token handed off, its claim filters rows (1,2)",
         st == 200 && b.contains("\"1,2\""),
+        || format!("{st} {b}"),
+    );
+    let (st, b) = http_sql(
+        "ams1",
+        &format!("Bearer {tok}"),
+        Some(T),
+        "eu",
+        "SELECT SPRIG_CLAIM('org') AS org",
+    )
+    .await;
+    c.ok(
+        "ams1: SELECT SPRIG_CLAIM('org') in a plain query gives the claim over HTTP",
+        st == 200 && b.contains("\"o-7\""),
         || format!("{st} {b}"),
     );
     let (st, b) = http_sql(
@@ -1507,6 +1777,129 @@ async fn change_streams(d: &Deployment, c: &mut Checks) {
     });
 }
 
+/// Part 2, continued: a MongoDB change stream and Kafka fetches of a
+/// `fra1` tenant at `ams1`. The stream's items come from a `fra1` gateway's
+/// reader (`TailFeed`) and are rendered at `ams1`; a long-polling fetch at
+/// `ams1` wakes on `fra1`'s watermarks.
+async fn mongo_and_kafka(c: &mut Checks) {
+    use mongodb::bson::{Document, doc};
+    use mongodb::change_stream::event::OperationType;
+    const T: &str = "xdc-cs";
+    let app = format!("{T}.app");
+    let relayed = "sprig_mongo_change_streams_relayed_total";
+    let before = metric(ports("ams1").gw_tel, relayed).await;
+    let home = mongo_client("fra1", &app).await;
+    let away = mongo_client("ams1", &app).await;
+    let at_home = home.database("mcs").collection::<Document>("c");
+    let r = at_home.insert_one(doc! {"_id": 0, "a": "first"}).await;
+    c.ok("fra1: a MongoDB insert", r.is_ok(), || format!("{r:?}"));
+    let coll = away.database("mcs").collection::<Document>("c");
+    match coll.watch().await {
+        Ok(mut s) => {
+            let _ = tokio::time::timeout(Duration::from_secs(2), s.next_if_any()).await;
+            let _ = at_home
+                .insert_one(doc! {"_id": 1, "a": "x", "n": 7_i64})
+                .await;
+            let ev = next_change(&mut s, Duration::from_secs(20)).await;
+            c.ok(
+                "ams1: a MongoDB change stream of a fra1 tenant gets fra1's insert, typed",
+                ev.as_ref().is_ok_and(|e| {
+                    e.operation_type == OperationType::Insert
+                        && e.full_document
+                            .as_ref()
+                            .is_some_and(|d| d.get_i64("n") == Ok(7) && d.get_str("a") == Ok("x"))
+                }),
+                || format!("{ev:?}"),
+            );
+            let token = s.resume_token();
+            drop(s);
+            let _ = at_home
+                .update_one(doc! {"_id": 1}, doc! {"$set": {"a": "y"}})
+                .await;
+            let resumed = match token {
+                Some(t) => match coll.watch().resume_after(t).await {
+                    Ok(mut s2) => next_change(&mut s2, Duration::from_secs(20)).await,
+                    Err(e) => Err(e.to_string()),
+                },
+                None => Err("no resume token".into()),
+            };
+            c.ok(
+                "ams1: the stream resumes from its token with the update only",
+                resumed
+                    .as_ref()
+                    .is_ok_and(|e| e.operation_type == OperationType::Update),
+                || format!("{resumed:?}"),
+            );
+        }
+        Err(e) => c.ok("ams1: a MongoDB change stream opens", false, || {
+            e.to_string()
+        }),
+    }
+    home.shutdown().await;
+    away.shutdown().await;
+    c.ok(
+        "ams1 counted relayed change feeds",
+        metric(ports("ams1").gw_tel, relayed).await >= before + 2.0,
+        String::new,
+    );
+
+    // Kafka: a stream of the tenant fetched at ams1.
+    run("fra1", &app, &["CREATE STREAM cs.kev PARTITIONS 1"]).await;
+    run(
+        "fra1",
+        &app,
+        &["INSERT INTO cs.kev (key, value) VALUES ('k', 'one')"],
+    )
+    .await;
+    let mut k = kafka("ams1", &app).await;
+    let t0 = Instant::now();
+    let mut first = kafka_fetch(&mut k, "cs.kev", 0, 1000).await;
+    while t0.elapsed() < Duration::from_secs(20)
+        && !first
+            .as_ref()
+            .is_ok_and(|(v, _)| v.iter().any(|x| x == "one"))
+    {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        first = kafka_fetch(&mut k, "cs.kev", 0, 1000).await;
+    }
+    c.ok(
+        "ams1: a Kafka fetch of a fra1 tenant's stream returns its record",
+        first
+            .as_ref()
+            .is_ok_and(|(v, _)| v.iter().any(|x| x == "one")),
+        || format!("{first:?}"),
+    );
+    // At the end: fetches (each waiting up to kafka.fetch_max_wait_ms)
+    // get fra1's next record.
+    let hw = first.as_ref().map_or(1, |(_, hw)| *hw);
+    run(
+        "fra1",
+        &app,
+        &["INSERT INTO cs.kev (key, value) VALUES ('k', 'two')"],
+    )
+    .await;
+    let published = Instant::now();
+    let mut polled = kafka_fetch(&mut k, "cs.kev", hw, 5_000).await;
+    while published.elapsed() < Duration::from_secs(15)
+        && !polled
+            .as_ref()
+            .is_ok_and(|(v, _)| v.iter().any(|x| x == "two"))
+    {
+        polled = kafka_fetch(&mut k, "cs.kev", hw, 5_000).await;
+    }
+    eprintln!(
+        "kafka at ams1 got fra1's next record {} ms after its insert",
+        published.elapsed().as_millis()
+    );
+    c.ok(
+        "ams1: a waiting Kafka fetch gets fra1's next record",
+        polled
+            .as_ref()
+            .is_ok_and(|(v, _)| v.iter().any(|x| x == "two")),
+        || format!("{polled:?}"),
+    );
+}
+
 /// The member's sinks and connections of database `sw`.
 async fn member_sinks(user: &str) -> (Result<Vec<String>, u16>, Result<Vec<String>, u16>) {
     (
@@ -1521,51 +1914,21 @@ async fn inherited_sinks(d: &Deployment, c: &mut Checks) {
     const M: &str = "xdc-m";
     let _hits = serve_hook().await;
     let pid = d.tenant("fra1", P, None).await;
-    // A member homed in another DC than its declarer: created beside it
-    // (a controller bootstraps a child only where its ancestors' catalogs
-    // are), then moved to ams1, as a DC move would place it.
-    let mid = d.tenant("fra1", M, Some(P)).await;
+    // A member homed in another DC than its declarer, created there
+    // directly: the ams1 controller reads its ancestor's catalog through
+    // fra1's map (bootstrap copies the ancestry, then the tenant is
+    // active).
     let t0 = Instant::now();
-    ctl_retry(
-        &d.sprigctl,
-        "fra1",
-        &[
-            "tenant",
-            "move",
-            M,
-            "--to",
-            "ams1",
-            "--cluster",
-            d.cluster("ams1"),
-        ],
-        Duration::from_secs(60),
-    )
-    .await;
-    loop {
-        let e = get(&*d.store, &format!("/sprig/g/tenants/{mid}"))
-            .await
-            .unwrap_or_default();
-        if e["home_dc"] == "ams1" && e["state"] == "active" {
-            break;
-        }
-        assert!(
-            t0.elapsed() < Duration::from_secs(180),
-            "{M} never moved to ams1: {e}"
-        );
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
+    let mid = d.tenant("ams1", M, Some(P)).await;
+    c.ok(
+        "a child is created directly in ams1 under a parent homed in fra1",
+        true,
+        String::new,
+    );
     eprintln!(
-        "member {M} moved to ams1 in {} ms",
+        "member {M} created in ams1 under {P} in {} ms",
         t0.elapsed().as_millis()
     );
-    let t0 = Instant::now();
-    while my("ams1", &format!("{M}.app"), APP_PW).await.is_err() {
-        assert!(
-            t0.elapsed() < Duration::from_secs(60),
-            "{M} never logs in at ams1"
-        );
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
     let allow = format!("[\"127.0.0.1:{HOOK_PORT}\"]");
     for (dc, t) in [("fra1", P), ("ams1", M)] {
         let scope = format!("tenant:{t}");
@@ -1624,7 +1987,7 @@ async fn inherited_sinks(d: &Deployment, c: &mut Checks) {
             && have.1.as_ref().is_ok_and(|s| s.iter().any(|n| n == "hook")),
         || format!("{have:?}"),
     );
-    let ams1_index = keys_under(&*d.store, &format!("/sprig/dc/ams1/sinks/{mid}/")).await;
+    let ams1_index = keys_under(d.dc_store("ams1"), &format!("/sprig/dc/ams1/sinks/{mid}/")).await;
     c.ok(
         "the member's sink is indexed in ams1's tier",
         !ams1_index.is_empty(),
@@ -1670,12 +2033,13 @@ async fn inherited_sinks(d: &Deployment, c: &mut Checks) {
         have.0.as_ref().is_ok_and(Vec::is_empty) && have.1.as_ref().is_ok_and(Vec::is_empty),
         || format!("{have:?}"),
     );
-    let ams1_index = keys_under(&*d.store, &format!("/sprig/dc/ams1/sinks/{mid}/")).await;
+    let ams1_index = keys_under(d.dc_store("ams1"), &format!("/sprig/dc/ams1/sinks/{mid}/")).await;
     c.ok(
         "the member's sink index in ams1 is gone",
         ams1_index.is_empty(),
         || format!("{ams1_index:?}"),
     );
+    members_in_ams1(d, c, &pa, &ma, M).await;
     let fra1_log = d.log("gw-fra1");
     c.ok(
         "fra1 asked ams1 for its members (drop_sink and rollout)",
@@ -1687,6 +2051,222 @@ async fn inherited_sinks(d: &Deployment, c: &mut Checks) {
         String::new,
     );
     eprintln!("declarer {pid}, member {mid}");
+}
+
+/// Part 4: a tenant with a job standby in `ams1` (its own
+/// `failover.standby_dcs = 1`; the DCs' default is 0 here) moves to
+/// `ams1`: the move drops the standby first instead of failing with 39131.
+async fn standby_move(d: &Deployment, c: &mut Checks) {
+    const T: &str = "xdc-sb";
+    let id = d.tenant("fra1", T, None).await;
+    let app = format!("{T}.app");
+    run(
+        "fra1",
+        &app,
+        &[
+            "CREATE DATABASE sb",
+            "CREATE TABLE sb.t (id INT PRIMARY KEY, v VARCHAR(20))",
+            "INSERT INTO sb.t VALUES (1, 'before the move')",
+        ],
+    )
+    .await;
+    let scope = format!("tenant:{T}");
+    ctl_retry(
+        &d.sprigctl,
+        "fra1",
+        &[
+            "settings",
+            "set",
+            "failover.standby_dcs",
+            "1",
+            "--scope",
+            &scope,
+            "--reason",
+            "two_dc_bins",
+        ],
+        Duration::from_secs(30),
+    )
+    .await;
+    let t0 = Instant::now();
+    let mut entry = Value::Null;
+    while t0.elapsed() < Duration::from_secs(120) {
+        entry = get(&*d.store, &format!("/sprig/g/tenants/{id}"))
+            .await
+            .unwrap_or_default();
+        if entry["standby_jobs"]["ams1"]["job"].is_string() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let job = entry["standby_jobs"]["ams1"]["job"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    c.ok(
+        "the tenant gets a job standby in ams1",
+        !job.is_empty(),
+        || format!("{entry}"),
+    );
+    eprintln!(
+        "standby job {job} in ams1 after {} ms",
+        t0.elapsed().as_millis()
+    );
+    // Let it stream a little: its job holds the tenant's lock in ams1.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let t0 = Instant::now();
+    let r = ctl(
+        &d.sprigctl,
+        "fra1",
+        &[
+            "tenant",
+            "move",
+            T,
+            "--to",
+            "ams1",
+            "--cluster",
+            d.cluster("ams1"),
+        ],
+    );
+    c.ok(
+        "tenant move to the standby's DC starts (no 39131)",
+        r.is_ok(),
+        || format!("{r:?}"),
+    );
+    let mut moved = false;
+    while r.is_ok() && t0.elapsed() < Duration::from_secs(240) {
+        let e = get(&*d.store, &format!("/sprig/g/tenants/{id}"))
+            .await
+            .unwrap_or_default();
+        if e["home_dc"] == "ams1" && e["state"] == "active" {
+            moved = true;
+            entry = e;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    c.ok("the tenant moves to ams1", moved, || format!("{entry}"));
+    eprintln!("moved to ams1 in {} ms", t0.elapsed().as_millis());
+    let was = entry["last_move"]["job"]
+        .as_str()
+        .or_else(|| entry["last_move"]["migration"]["job"].as_str())
+        .unwrap_or_default();
+    c.ok(
+        "the move's job isn't the dropped standby's",
+        moved && !was.is_empty() && was != job,
+        || format!("{entry}"),
+    );
+    let t0 = Instant::now();
+    let mut seen = rows("ams1", &app, "SELECT v FROM sb.t WHERE id = 1").await;
+    while t0.elapsed() < Duration::from_secs(60) && seen != Ok(vec!["before the move".to_owned()]) {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        seen = rows("ams1", &app, "SELECT v FROM sb.t WHERE id = 1").await;
+    }
+    c.ok(
+        "the row written before the move reads back at ams1",
+        seen == Ok(vec!["before the move".to_owned()]),
+        || format!("{seen:?}"),
+    );
+}
+
+/// Part 3, continued: `FOR EACH TENANT` changes beyond sinks reach the
+/// member homed in `ams1` through `InheritedMembers`: `SHOW INHERITED`
+/// counts its instance, an override `FOR TENANT` it applies there, `DROP
+/// TRIGGER` stops its trigger instance, and a broadcast is delivered by a
+/// gateway of `ams1`.
+async fn members_in_ams1(d: &Deployment, c: &mut Checks, pa: &str, ma: &str, m: &str) {
+    // The declarer's own count includes the member's stream instance in
+    // ams1.
+    let defs = table("fra1", pa, "SHOW INHERITED DEFINITIONS").await;
+    c.ok(
+        "SHOW INHERITED DEFINITIONS at fra1 counts the member's instance in ams1",
+        defs.as_ref().is_ok_and(|v| {
+            v.iter()
+                .any(|r| r.get(2).is_some_and(|n| n == "ev") && r.get(6).is_some_and(|n| n == "1"))
+        }),
+        || format!("{defs:?}"),
+    );
+    // An override FOR TENANT the member applies in ams1.
+    let r = info(
+        "fra1",
+        pa,
+        &format!(
+            "ALTER INHERITED STREAM sw.ev FOR TENANT `{m}` SPRIG SET (stream.retention_hours = 72)"
+        ),
+    )
+    .await;
+    c.ok(
+        "ALTER ... FOR TENANT at fra1 is applied to the member's instance in ams1",
+        r.as_ref()
+            .is_ok_and(|m| m.contains("applied to 1 instance")),
+        || format!("{r:?}"),
+    );
+    // A FOR EACH TENANT trigger: its member instance in ams1 is made by
+    // the rollout or the member's next publish, and DROP TRIGGER at fra1
+    // stops it there.
+    run(
+        "fra1",
+        pa,
+        &["CREATE TRIGGER sw.tg ON STREAM sw.ev FOR EACH TENANT LANGUAGE javascript AS $$\nexport default function (ctx) { return; }\n$$"],
+    )
+    .await;
+    let t0 = Instant::now();
+    let mut has = false;
+    while !has && t0.elapsed() < Duration::from_secs(30) {
+        run(
+            "ams1",
+            ma,
+            &["INSERT INTO sw.ev (key, value) VALUES ('k', 'for the trigger')"],
+        )
+        .await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let inst = table("ams1", ma, "SHOW INHERITED INSTANCES").await;
+        has = inst.as_ref().is_ok_and(|v| {
+            v.iter().any(|r| {
+                r.get(2).is_some_and(|n| n == "tg") && r.get(5).is_some_and(|s| s == "active")
+            })
+        });
+    }
+    c.ok(
+        "the member in ams1 has an instance of the FOR EACH TENANT trigger",
+        has,
+        String::new,
+    );
+    let r = info("fra1", pa, "DROP TRIGGER sw.tg").await;
+    c.ok(
+        "DROP TRIGGER at fra1 stops the member's trigger instance in ams1",
+        r.as_ref()
+            .is_ok_and(|m| m.contains("1 instance(s) removed")),
+        || format!("{r:?}"),
+    );
+    // A broadcast reaches the member through a gateway of ams1.
+    run(
+        "fra1",
+        pa,
+        &["INSERT INTO sw.ev FOR ALL TENANTS (key, value) VALUES ('bk', 'to all')"],
+    )
+    .await;
+    let q = "SELECT COUNT(*) FROM sw.ev WHERE CAST(value AS CHAR) = 'to all'";
+    let t0 = Instant::now();
+    let mut got = rows("ams1", ma, q).await;
+    while t0.elapsed() < Duration::from_secs(30) && got != Ok(vec!["1".to_owned()]) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        got = rows("ams1", ma, q).await;
+    }
+    c.ok(
+        "a broadcast at fra1 reaches the member in ams1 exactly once",
+        got == Ok(vec!["1".to_owned()]),
+        || format!("{got:?}"),
+    );
+    let log = d.log("gw-fra1");
+    for op in ["count", "override", "drop_trigger", "broadcast"] {
+        c.ok(
+            &format!("fra1 asked ams1 to apply {op}"),
+            log.lines().any(|l| {
+                l.contains("FOR EACH TENANT change applied in another DC") && l.contains(op)
+            }),
+            String::new,
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1709,9 +2289,13 @@ async fn bins_two_data_centres() {
     }
     if only.is_empty() || only.contains("streams") {
         change_streams(&d, &mut c).await;
+        mongo_and_kafka(&mut c).await;
     }
     if only.is_empty() || only.contains("sinks") {
         inherited_sinks(&d, &mut c).await;
+    }
+    if only.is_empty() || only.contains("standby") {
+        standby_move(&d, &mut c).await;
     }
     eprintln!("two_dc_bins: {} checks, {} failed", c.n, c.failed.len());
     let work = d.work.clone();

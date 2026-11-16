@@ -972,6 +972,93 @@ impl Binder for LiteralBinder<'_> {
     }
 }
 
+/// Binds the session functions a statement calls itself (`SELECT
+/// SPRIG_CLAIM('org')`, `UPDATE ... WHERE owner = SPRIG_CLAIM('sub')`) as
+/// [`render`] binds them in a policy: each call becomes the binder's text.
+/// `None` when the statement calls none.
+///
+/// It works on tokens: a name in a string, a comment or backquotes, and a
+/// qualified call (`db.SPRIG_CLAIM(...)`, a stored function's), are left
+/// alone. `CURRENT_USER` is MariaDB's own. A membership test keeps its
+/// argument (`SPRIG_TENANT_IN_SUBTREE(t.tenant)` → `(t.tenant IN (...))`).
+///
+/// # Errors
+/// 39364 for a keyed function whose key isn't one string literal, a
+/// constant function given arguments, an unbalanced call, or a function
+/// the binder can't bind.
+pub fn bind_statement(
+    text: &str,
+    lex_opts: &LexOptions,
+    binder: &dyn Binder,
+) -> Result<Option<String>, SprigError> {
+    let all = lex::lex(text.as_bytes(), lex_opts).map_err(|_| invalid("too long"))?;
+    let toks = Toks::new(text.as_bytes(), &all);
+    let mut edits = Vec::new();
+    let mut i = 0;
+    while i < toks.toks.len() {
+        let t = toks.toks[i];
+        if t.kind != TokenKind::Word || !toks.punct(i + 1, "(") || (i > 0 && toks.punct(i - 1, "."))
+        {
+            i += 1;
+            continue;
+        }
+        let name = String::from_utf8_lossy(t.bytes(toks.src)).to_ascii_uppercase();
+        if name == "CURRENT_USER" || !SESSION_FUNCTIONS.contains(&name.as_str()) {
+            i += 1;
+            continue;
+        }
+        let close = toks
+            .matching(i + 1)
+            .ok_or_else(|| invalid(format!("{name}( has no closing parenthesis")))?;
+        if MEMBERSHIP.contains(&name.as_str()) {
+            if close == i + 2 {
+                return Err(invalid(format!("{name}() takes a tenant id")));
+            }
+            let (pre, post) = binder.membership(&name)?;
+            edits.push(Edit {
+                start: toks.start(i),
+                end: toks.end(i + 1),
+                with: pre,
+            });
+            edits.push(Edit {
+                start: toks.start(close),
+                end: toks.end(close),
+                with: post,
+            });
+            // The argument may call session functions too.
+            i += 2;
+            continue;
+        }
+        let arg = if KEYED.contains(&name.as_str()) {
+            let key = match toks.toks.get(i + 2) {
+                Some(s) if s.kind == TokenKind::String && close == i + 3 => {
+                    lex::string_value(s.bytes(toks.src), lex_opts.no_backslash_escapes)
+                        .map(|v| String::from_utf8_lossy(&v).into_owned())
+                }
+                _ => None,
+            };
+            Some(key.ok_or_else(|| invalid(format!("{name}()'s key must be one string")))?)
+        } else {
+            if close != i + 2 {
+                return Err(invalid(format!("{name}() takes no arguments")));
+            }
+            None
+        };
+        edits.push(Edit {
+            start: toks.start(i),
+            end: toks.end(close),
+            with: binder.value(&name, arg.as_deref())?,
+        });
+        i = close + 1;
+    }
+    if edits.is_empty() {
+        return Ok(None);
+    }
+    apply(text, &edits)
+        .map(Some)
+        .map_err(|_| invalid("overlapping edits"))
+}
+
 /// Parses `text` as one expression the way [`render`] reads it (for the
 /// statement rewrite's verification).
 pub(crate) fn parse_rendered(text: &str) -> Option<Expr> {
@@ -1168,5 +1255,68 @@ mod tests {
             .unwrap(),
             "(`t`.org IN (SELECT `descendant` FROM `__sprig_sys`.`__sprig_subtree_v`)) OR (`t`.org IN (NULL))"
         );
+    }
+    #[test]
+    fn a_statement_binds_its_own_session_functions() {
+        let claim = |k: &str| (k == "org").then(|| "'o-7'".to_owned());
+        let attr = |k: &str| (k == "team").then(|| "'red'".to_owned());
+        let b = LiteralBinder {
+            current_user: "app@%",
+            user_id: 9,
+            tenant_id: 42,
+            home_tenant_id: 42,
+            space: None,
+            claim: &claim,
+            attr: &attr,
+            subtree: Some(&[42, 43]),
+            managed: Some(&[]),
+            subtree_table: false,
+            managed_table: false,
+            no_backslash_escapes: false,
+        };
+        let o = lexo();
+        let bind = |s: &str| bind_statement(s, &o, &b);
+        assert_eq!(
+            bind("SELECT SPRIG_CLAIM('org'), sprig_claim('missing')")
+                .unwrap()
+                .as_deref(),
+            Some("SELECT 'o-7', NULL")
+        );
+        assert_eq!(
+            bind("UPDATE d SET x = 1 WHERE team = SPRIG_USER_ATTR ( 'team' ) AND t = SPRIG_TENANT_ID()")
+                .unwrap()
+                .as_deref(),
+            Some("UPDATE d SET x = 1 WHERE team = 'red' AND t = '42'")
+        );
+        assert_eq!(
+            bind("SELECT * FROM t WHERE SPRIG_TENANT_IN_SUBTREE(t.tenant) AND u = SPRIG_USER_ID()")
+                .unwrap()
+                .as_deref(),
+            Some("SELECT * FROM t WHERE (t.tenant IN (42, 43)) AND u = '9'")
+        );
+        // Strings, comments, backquotes, qualified calls and CURRENT_USER
+        // stay.
+        for s in [
+            "SELECT 'SPRIG_CLAIM(1)' /* SPRIG_CLAIM('x') */",
+            "SELECT `SPRIG_CLAIM` FROM t",
+            "SELECT db.SPRIG_CLAIM('org')",
+            "SELECT CURRENT_USER()",
+        ] {
+            assert_eq!(bind(s).unwrap(), None, "{s}");
+        }
+        // A key that isn't one string, arguments where none are taken.
+        for s in [
+            "SELECT SPRIG_CLAIM(col)",
+            "SELECT SPRIG_CLAIM('a', 'b')",
+            "SELECT SPRIG_TENANT_ID(1)",
+            "SELECT SPRIG_TENANT_IN_SUBTREE()",
+            "SELECT SPRIG_CLAIM('a'",
+        ] {
+            assert_eq!(
+                bind(s).unwrap_err().code(),
+                Some(SprigCode::RlsPolicyInvalid),
+                "{s}"
+            );
+        }
     }
 }

@@ -815,6 +815,13 @@ impl peer::PeerHost for PeerHost {
         })?;
         inherited::remote::serve(&svc, &req).await
     }
+
+    async fn tail_feed(
+        &self,
+        req: sprig_api::proto::internal::TailFeedRequest,
+    ) -> tokio::sync::mpsc::Receiver<sprig_api::proto::internal::TailFeedMessage> {
+        mongo::feed_relay::serve(self.core.engine.tenants.clone(), req)
+    }
 }
 
 /// `[gateway] listen_override`: this process's own listener addresses.

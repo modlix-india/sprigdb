@@ -7,9 +7,16 @@
 //! follows that chain for [`sprig_catalog::MariaBackend`]; [`ClusterPools`]
 //! is the cluster half, so tests can point clusters at their own servers.
 //!
-//! Limits, for now: catalog loads read the writer (never a local replica);
-//! ancestors homed in other DCs are unreachable until the relay carries
-//! their shard maps.
+//! **Remote homes.** A tenant's map lives in its home DC's tier. A child
+//! homed here reads its ancestors' catalogs (the `tree_settings` copy, the
+//! inherited definitions), and an ancestor may be homed in another DC. When
+//! this DC's tier has no `home` map of a tenant, [`ShardMapLocator`] reads
+//! the directory entry's `home_dc` and that DC's map (single-etcd mode:
+//! the one etcd; two tiers: the controllers' relay), as the gateway's
+//! locator does. [`ShardMapLocator::cluster_of`] stays this DC's own map:
+//! bootstrap, placement and deletion act only on catalogs homed here.
+//!
+//! Limits, for now: catalog loads read the writer (never a local replica).
 //!
 //! **Connection budgets** (the fix of a catalog-connection deadlock). Each [`RegistryPools`] is
 //! one budget: at most `max` connections per cluster. The controller's
@@ -38,7 +45,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use mysql_async::{Conn, OptsBuilder, Pool, PoolConstraints, PoolOpts};
-use sprig_catalog::placement::{RangeState, ShardMap};
+use sprig_catalog::placement::{MapRole, RangeState, ShardMap};
 use sprig_catalog::{CatalogEndpoint, CatalogLocator, Store};
 use sprig_cluster::driver::NodeConnector;
 use sprig_cluster::record::{AdminState, ClusterRecord, NodeSpec};
@@ -46,7 +53,7 @@ use sprig_cluster::registry::ClusterRegistry;
 use sprig_common::ids::{ClusterId, TenantId};
 use sprig_common::names::SchemaName;
 use sprig_common::{Result, SprigCode, SprigError};
-use sprig_meta::{Consistency, MetaStore, Record};
+use sprig_meta::{Consistency, MetaStore, Record, Tier, TierView};
 use sprig_provision::credentials::CredentialConnector;
 
 use crate::monitor::ClusterMonitor;
@@ -263,7 +270,15 @@ impl RegistryPools {
     }
 
     async fn writer_spec(&self, rec: &ClusterRecord) -> Result<NodeSpec> {
-        let published = read_published(&**self.registry.dc_store(), &rec.cluster_id).await?;
+        // Another DC's cluster (an ancestor's catalog homed there): its
+        // writer is published in that DC's tier.
+        let store = match sprig_cluster::registry::dc_of(&rec.cluster_id) {
+            Some(d) if Tier::Dc(d.clone()) != *self.registry.dc_store().tier() => {
+                TierView::over(self.registry.dc_store(), Tier::Dc(d))
+            }
+            _ => Arc::clone(self.registry.dc_store()),
+        };
+        let published = read_published(&*store, &rec.cluster_id).await?;
         let driver = match &self.monitor {
             Some(m) => m.writer_node(&rec.cluster_id).await,
             None => None,
@@ -522,12 +537,15 @@ impl ClusterPools for StaticPools {
     }
 }
 
-/// Finds catalogs through their shard maps in this DC's tier.
+/// Finds catalogs through their shard maps in this DC's tier, and, with
+/// the directory ([`ShardMapLocator::with_directory`]), those of tenants
+/// homed in other DCs through their home DC's tier.
 #[derive(Clone)]
 pub struct ShardMapLocator {
     dc: Arc<dyn MetaStore>,
     pools: Arc<dyn ClusterPools>,
     naming: CatalogNaming,
+    global: Option<Arc<dyn MetaStore>>,
 }
 
 impl std::fmt::Debug for ShardMapLocator {
@@ -546,7 +564,21 @@ impl ShardMapLocator {
         pools: Arc<dyn ClusterPools>,
         naming: CatalogNaming,
     ) -> Self {
-        Self { dc, pools, naming }
+        Self {
+            dc,
+            pools,
+            naming,
+            global: None,
+        }
+    }
+
+    /// The same locator following tenants homed in other DCs: their
+    /// directory entries in `global` name the home, whose map is read from
+    /// that DC's tier through this DC's store (one etcd, or the relay).
+    #[must_use]
+    pub fn with_directory(mut self, global: Arc<dyn MetaStore>) -> Self {
+        self.global = Some(global);
+        self
     }
 
     /// The catalog schema of `tenant`.
@@ -575,17 +607,84 @@ impl ShardMapLocator {
     pub fn pools(&self) -> &Arc<dyn ClusterPools> {
         &self.pools
     }
+
+    /// `tenant`'s catalog map in this DC's tier, if any.
+    async fn local_map(&self, tenant: TenantId) -> Result<Option<ShardMap>> {
+        let key = ShardMap::catalog_key(self.dc.tier(), tenant)?;
+        let Some(kv) = self.dc.get(&key, Consistency::Linearizable).await? else {
+            return Ok(None);
+        };
+        Ok(Some(Record::<ShardMap>::decode(&kv.value)?.body))
+    }
+
+    /// `tenant`'s catalog map in its home DC, when that is another DC
+    /// (`None` without the directory, for a tenant homed here or without
+    /// an entry, or when the home has no map).
+    async fn home_map(&self, tenant: TenantId) -> Result<Option<ShardMap>> {
+        let Some(global) = &self.global else {
+            return Ok(None);
+        };
+        let Some(entry) = sprig_shard::home::read_home(&**global, tenant).await? else {
+            return Ok(None);
+        };
+        if Tier::Dc(entry.home_dc.clone()) == *self.dc.tier() {
+            return Ok(None);
+        }
+        let store = TierView::over(&self.dc, Tier::Dc(entry.home_dc));
+        let key = ShardMap::catalog_key(store.tier(), tenant)?;
+        let Some(kv) = store.get(&key, Consistency::Linearizable).await? else {
+            return Ok(None);
+        };
+        Ok(Some(Record::<ShardMap>::decode(&kv.value)?.body))
+    }
+
+    /// The map that names `tenant`'s catalog wherever it is homed: this
+    /// DC's `home` map; else the home DC's map (a tenant homed in another
+    /// DC: an ancestor of a child homed here); else whatever map this DC
+    /// has (a standby's, or a forwarding record, when the directory or the
+    /// home can't be read).
+    ///
+    /// # Errors
+    /// The store's errors; `Internal` for a bad record.
+    pub async fn catalog_map(&self, tenant: TenantId) -> Result<Option<ShardMap>> {
+        let local = self.local_map(tenant).await?;
+        if local.as_ref().is_some_and(|m| m.role == MapRole::Home) || self.global.is_none() {
+            return Ok(local);
+        }
+        match self.home_map(tenant).await {
+            Ok(Some(m)) => {
+                tracing::debug!(%tenant, "catalog homed in another DC: following its home's map");
+                Ok(Some(m))
+            }
+            Ok(None) => Ok(local),
+            Err(e) if local.is_some() => {
+                tracing::debug!(%tenant, error = %e, "the home DC's map can't be read; using this DC's");
+                Ok(local)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The cluster of `tenant`'s catalog wherever it is homed
+    /// ([`Self::catalog_map`]).
+    ///
+    /// # Errors
+    /// As [`Self::catalog_map`].
+    pub async fn catalog_cluster(&self, tenant: TenantId) -> Result<Option<ClusterId>> {
+        Ok(self
+            .catalog_map(tenant)
+            .await?
+            .and_then(|m| m.catalog_cluster().cloned()))
+    }
 }
 
 #[async_trait::async_trait]
 impl CatalogLocator for ShardMapLocator {
     async fn held_by(&self, tenant: TenantId) -> Result<Option<String>> {
-        let key = ShardMap::catalog_key(self.dc.tier(), tenant)?;
-        let Some(kv) = self.dc.get(&key, Consistency::Linearizable).await? else {
+        let Some(map) = self.catalog_map(tenant).await? else {
             return Ok(None);
         };
-        Ok(Record::<ShardMap>::decode(&kv.value)?
-            .body
+        Ok(map
             .ranges
             .iter()
             .find(|r| r.state == RangeState::Held)
@@ -593,12 +692,12 @@ impl CatalogLocator for ShardMapLocator {
     }
 
     async fn writer(&self, tenant: TenantId) -> Result<CatalogEndpoint> {
-        let cluster = self.cluster_of(tenant).await?.ok_or_else(|| {
+        let cluster = self.catalog_cluster(tenant).await?.ok_or_else(|| {
             SprigError::new(
                 SprigCode::TenantNotReady,
                 format!(
-                    "tenant {tenant} has no catalog in this data center (not bootstrapped, or \
-                     homed in another DC, which needs the relay)"
+                    "tenant {tenant} has no catalog map here or in its home DC (not \
+                     bootstrapped yet, or deleted)"
                 ),
             )
         })?;

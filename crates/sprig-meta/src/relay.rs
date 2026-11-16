@@ -2,9 +2,11 @@
 //!
 //! A DC's etcd is reachable only inside its DC. In two tiers, a process
 //! that needs another DC's shard maps or cluster records (a gateway
-//! following a tenant homed there) reads them through a
-//! controller of that DC, which serves them from its own tier. The
-//! controllers are found in the global key `dc-observe/<dc>` (their
+//! following a tenant homed there, a controller reading an ancestor's
+//! catalog), or its gateways' records (a login hand-off, a relayed change
+//! stream, a `FOR EACH TENANT` change for members homed there), reads them
+//! through a controller of that DC, which serves them from its own tier.
+//! The controllers are found in the global key `dc-observe/<dc>` (their
 //! internal URLs).
 //!
 //! - [`RelayStore`] is a read-only [`MetaStore`] over one remote DC's tier:
@@ -19,8 +21,9 @@
 //!
 //! **Transport.** The relay is JSON over HTTP on the controllers'
 //! internal address, and watches poll (not a streaming subscription per
-//! remote DC). Only
-//! `shardmaps/` and `clusters/` are served.
+//! remote DC). Only `shardmaps/`, `clusters/` and `gateways/` are served:
+//! read-only, and nothing a gateway of another DC couldn't already learn
+//! by calling that DC (a gateway record names its listeners and state).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -42,7 +45,7 @@ use crate::{
 pub const POLL: Duration = Duration::from_secs(1);
 
 /// Prefixes of a DC tier the relay serves.
-pub const SERVED: [&str; 2] = ["shardmaps/", "clusters/"];
+pub const SERVED: [&str; 3] = ["shardmaps/", "clusters/", "gateways/"];
 
 /// Whether the relay serves `key` (a full key) of `tier`.
 #[must_use]
@@ -393,10 +396,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_maps_and_clusters_are_served() {
+    fn only_maps_clusters_and_gateways_are_served() {
         let t = Tier::Dc(DcId::new("ams1").expect("dc"));
         assert!(served(&t, "/sprig/dc/ams1/shardmaps/42/0"));
         assert!(served(&t, "/sprig/dc/ams1/clusters/ams1-c1"));
+        assert!(served(&t, "/sprig/dc/ams1/gateways/gw-ams1"));
+        assert!(!served(&t, "/sprig/dc/ams1/gateway-slots/7"));
         assert!(!served(&t, "/sprig/dc/ams1/leases/writer/ams1-c1"));
         assert!(!served(&t, "/sprig/dc/ams1/settings/x"));
         assert!(!served(&t, "/sprig/dc/fra1/shardmaps/42/0"));

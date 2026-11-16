@@ -29,6 +29,11 @@ service GatewayPeer {
   // gateway's DC indexes: the declarer's gateway asks a gateway of every
   // other DC.
   rpc InheritedMembers(InheritedMembersRequest) returns (InheritedMembersReply);
+  // A tenant homed in this gateway's DC: its change feed's items, read by
+  // this DC's shared reader, for a gateway of another DC that renders them
+  // for its own client (a MongoDB change stream opened there). The first
+  // message says whether the tail opened.
+  rpc TailFeed(TailFeedRequest) returns (stream TailFeedMessage);
 }
 
 message KillRequest {
@@ -163,16 +168,49 @@ message InheritedMembersRequest {
   // "drop_sink": drop the members' instances of sink definition
   // `object_id` of declarer `tenant_id`, with the connections only they
   // use; "rollout": the members holding an instance of stream or queue
-  // definition `object_id` apply its sinks and derived state again.
+  // definition `object_id` apply its sinks and derived state again;
+  // "drop_trigger": the members' instances of trigger definition
+  // `object_id` stop and go; "override": an override FOR TENANT
+  // `target_tenant_id` (FOR SUBTREE with `subtree`) of definition
+  // `object_id` reaches the members it applies to; "count": only count the
+  // instances of definition `object_id`; "broadcast": deliver broadcast
+  // `payload` of definition `object_id` to member `target_tenant_id`.
   string op = 1;
   uint64 tenant_id = 2;
   uint64 object_id = 3;
   // The declarer's catalog version the change reached: the callee reads
   // the declarer's catalog at least at it (0: as its cache has it).
   uint64 catalog_version = 4;
+  // The member an override or a broadcast is for.
+  uint64 target_tenant_id = 5;
+  // An override FOR SUBTREE.
+  bool subtree = 6;
+  // A broadcast: its record as JSON (id, publisher, key, value, headers,
+  // WITH INSTANCE).
+  bytes payload = 7;
 }
 
 message InheritedMembersReply {
-  // The member instances this DC reached.
+  // The member instances this DC reached (for "count", has; for
+  // "broadcast", 1 when delivered, 0 when skipped).
   uint64 instances = 1;
+}
+
+message TailFeedRequest {
+  uint64 tenant_id = 1;
+  // Resume after this token (hex); empty: from now.
+  string start_after = 2;
+  // The calling gateway's DC: a tenant's tail goes only to its allowed DCs.
+  string caller_dc = 3;
+}
+
+message TailFeedMessage {
+  // The first message: the tail opened; `item` holds its starting token
+  // (hex, UTF-8).
+  bool opened = 1;
+  // A feed item, JSON (sprig-gateway's mongo::feed_relay format).
+  bytes item = 2;
+  // The tail didn't open, or ended, with this error: the REST error body
+  // as JSON. The last message.
+  string error_json = 3;
 }

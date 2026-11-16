@@ -23,6 +23,13 @@
 //!   (`streams/<tenant>/<stream>/<shard>` in the DC tier), which one watch
 //!   per gateway follows ([`Marks`]), and reads the checkpoint again at
 //!   least every 250 ms in case a mark was skipped.
+//! - **A tenant homed in another DC.** Its log is read on its home
+//!   cluster, as every statement of a session there is; its sequencers
+//!   publish their marks in the home DC's tier, so the gateway also follows
+//!   `streams/<tenant>/` there for each such tenant it serves (from its
+//!   first fetch or produce), and a long poll wakes on the home's marks.
+//!   Through the one etcd; in two tiers the relay doesn't serve `streams/`,
+//!   and such a long poll reads the checkpoint every 250 ms.
 
 // The trait's names (p: principal, t: topic) and Kafka API names.
 #![allow(clippy::many_single_char_names, clippy::doc_markdown)]
@@ -151,6 +158,60 @@ impl Marks {
         })
     }
 
+    /// Follows the marks of `tenant`, homed in another DC, in its home's
+    /// tier (`streams/<tenant>/`) until `stop`; reads the home again every
+    /// minute, and ends once the tenant is homed here.
+    async fn follow_home(
+        self: Arc<Self>,
+        svc: Arc<TenantServices>,
+        tenant: TenantId,
+        stop: sprig_common::CancellationToken,
+    ) {
+        loop {
+            let home = match crate::mongo::feed_relay::remote_home(&svc, tenant).await {
+                Ok(Some(h)) => h,
+                Ok(None) => return,
+                Err(e) => {
+                    tracing::debug!(%tenant, error = %e, "kafka: the tenant's home not read");
+                    tokio::select! {
+                        () = stop.cancelled() => return,
+                        () = tokio::time::sleep(Duration::from_secs(5)) => continue,
+                    }
+                }
+            };
+            let tier = sprig_meta::TierView::over(
+                &svc.locator.dc_store(),
+                sprig_meta::Tier::Dc(home.clone()),
+            );
+            let Ok(prefix) = tier.tier().key(&format!("streams/{tenant}/")) else {
+                return;
+            };
+            let recheck = tokio::time::sleep(Duration::from_secs(60));
+            tokio::pin!(recheck);
+            match tier.watch(&prefix, 0).await {
+                Ok(mut w) => loop {
+                    let ev = tokio::select! {
+                        () = stop.cancelled() => return,
+                        () = &mut recheck => break,
+                        ev = w.next() => ev,
+                    };
+                    match ev {
+                        Some(Ok(WatchEvent::Put(kv))) => self.apply(kv.key.as_str(), &kv.value),
+                        Some(Ok(WatchEvent::Compacted { .. }) | Err(_)) | None => break,
+                        Some(Ok(_)) => {}
+                    }
+                },
+                Err(e) => {
+                    tracing::debug!(%tenant, %home, error = %e, "kafka: the home's watermark watch failed");
+                }
+            }
+            tokio::select! {
+                () = stop.cancelled() => return,
+                () = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+        }
+    }
+
     /// Waits for the next change, at most until `until`.
     async fn changed(&self, until: Instant) {
         let mut rx = self.tick.subscribe();
@@ -185,6 +246,9 @@ type EpochCache = HashMap<(u64, u64), (Instant, HashMap<u32, u32>)>;
 pub struct GatewayData {
     svc: Arc<TenantServices>,
     marks: Arc<Marks>,
+    /// Tenants whose home DC's marks this gateway follows.
+    homes: Mutex<std::collections::HashSet<u64>>,
+    stop: sprig_common::CancellationToken,
     grants: Mutex<GrantCache>,
     epochs: Mutex<EpochCache>,
     expired: Mutex<HashMap<(u64, u64), Instant>>,
@@ -234,15 +298,30 @@ impl GatewayData {
     #[must_use]
     pub fn start(svc: Arc<TenantServices>, stop: sprig_common::CancellationToken) -> Self {
         let marks = Arc::new(Marks::new());
-        tokio::spawn(Arc::clone(&marks).follow(svc.locator.dc_store(), stop));
+        tokio::spawn(Arc::clone(&marks).follow(svc.locator.dc_store(), stop.clone()));
         Self {
             svc,
             marks,
+            homes: Mutex::new(std::collections::HashSet::new()),
+            stop,
             grants: Mutex::new(HashMap::new()),
             epochs: Mutex::new(HashMap::new()),
             expired: Mutex::new(HashMap::new()),
             engine: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Follows `tenant`'s marks in its home DC, once per tenant, when it
+    /// is homed in another DC ([`Marks::follow_home`]).
+    fn follow_home(&self, tenant: u64) {
+        if !lock(&self.homes).insert(tenant) {
+            return;
+        }
+        tokio::spawn(Arc::clone(&self.marks).follow_home(
+            Arc::clone(&self.svc),
+            TenantId(tenant),
+            self.stop.clone(),
+        ));
     }
 
     /// The SQL engine filtered change-topic reads run through.
@@ -815,6 +894,7 @@ impl StreamData for GatewayData {
         if let Some(o) = ticket.base_offset {
             return Ok(o);
         }
+        self.follow_home(p.tenant_id);
         let r = self.resolve_t(p, t).await?;
         let outbox = Self::outbox_schema(&r)?;
         let reader = Self::log_reader(&r, ticket.partition)?;
@@ -932,6 +1012,7 @@ impl StreamData for GatewayData {
     async fn wait(&self, p: &Principal, beyond: &[(u64, i32, i64)], deadline: Instant) {
         // Wake on a watermark beyond, or every 250 ms to read the
         // checkpoints again (a mark the sequencer skipped).
+        self.follow_home(p.tenant_id);
         let until = deadline.min(Instant::now() + Duration::from_millis(250));
         loop {
             if self.marks.beyond(p.tenant_id, beyond) || Instant::now() >= until {

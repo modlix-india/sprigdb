@@ -1,7 +1,7 @@
-//! The relay's `RemoteMaps`, served side: every controller answers reads of its own DC tier's `shardmaps/`
-//! and `clusters/` for processes in other DCs (`sprig_meta::relay`'s
-//! client), on `[controller] internal_addr`. Nothing else of the tier is
-//! served, and nothing is written.
+//! The relay's `RemoteMaps`, served side: every controller answers reads of its own DC tier's `shardmaps/`,
+//! `clusters/` and `gateways/` for processes in other DCs
+//! (`sprig_meta::relay`'s client), on `[controller] internal_addr`. Nothing
+//! else of the tier is served, and nothing is written.
 
 use std::sync::Arc;
 
@@ -31,7 +31,7 @@ fn key_of(dc: &dyn MetaStore, body: &Bytes) -> std::result::Result<Key, Response
     if !served(tier, &req.key) {
         return Err(reply(
             StatusCode::FORBIDDEN,
-            b"the relay serves only this DC's shardmaps/ and clusters/".to_vec(),
+            b"the relay serves only this DC's shardmaps/, clusters/ and gateways/".to_vec(),
         ));
     }
     let rel = req
@@ -202,6 +202,23 @@ mod tests {
             }
         }
         assert!(saw_home, "the relayed watch saw the map turn home");
+        // The DC's gateways (login hand-offs, relayed change streams and
+        // member calls find them so).
+        put(
+            &*ams1,
+            ams_tier.key("gateways/gw-ams1").expect("k"),
+            "{\"v\":1,\"gateway_id\":\"gw-ams1\"}",
+        )
+        .await;
+        let gws = view
+            .list(
+                &view.tier().key("gateways/").expect("k"),
+                ListOpts::default(),
+            )
+            .await
+            .expect("list");
+        assert_eq!(gws.kvs.len(), 1);
+        assert!(String::from_utf8_lossy(&gws.kvs[0].value).contains("gw-ams1"));
         // Writes never go through the relay.
         let own = fra1.tier().key("shardmaps/7/0").expect("k");
         put(&*routed, own.clone(), "{\"v\":1}").await;

@@ -553,13 +553,77 @@ fn logged(r: &mysql_async::Row) -> Logged {
 const COLS: &str = "bid, publisher, committed_ms, form, under_tenant, next_tenant_id, delivered, skipped, k, v, \
      CAST(headers AS CHAR)";
 
-/// Delivers broadcast `b` of `def` into member `t`'s instance. `false`:
-/// skipped (`WITH INSTANCE` and no instance).
+/// Delivers broadcast `b` of `def` to member `t`: here when `t` is homed
+/// in this DC, else through a gateway of its home DC
+/// ([`super::remote::broadcast_in`]), so the member's instance and its
+/// index are made where it lives. `false`: skipped (`WITH INSTANCE` and no
+/// instance).
 ///
 /// # Errors
-/// The member's (its catalog, cluster or quota); the fan-out goes on with
-/// the next member.
+/// The member's (its catalog, cluster or quota), or its DC's gateways
+/// unreachable; the fan-out goes on with the next member.
 async fn deliver(
+    svc: &Arc<TenantServices>,
+    def: &Definition,
+    t: TenantId,
+    b: &Logged,
+    with_instance: bool,
+) -> Result<bool> {
+    let home = super::dir_entry(svc, t)
+        .await?
+        .map(|e| e.home_dc)
+        .filter(|h| !h.is_empty() && h != svc.dc.as_str())
+        .and_then(|h| sprig_common::ids::DcId::new(&h).ok());
+    let Some(home) = home else {
+        return deliver_local(svc, def, t, b, with_instance).await;
+    };
+    let payload = super::remote::BroadcastPayload {
+        bid: b.bid.clone(),
+        publisher: b.publisher.0,
+        key: b.rec.key.clone(),
+        value: b.rec.value.clone(),
+        headers: b.rec.headers.clone(),
+        with_instance,
+    };
+    // The member's DC counts the delivery.
+    super::remote::broadcast_in(svc, &home, def.key(), t, &payload).await
+}
+
+/// Delivers a broadcast another DC's fan-out sent for member `t`, homed
+/// here (`GatewayPeer.InheritedMembers` "broadcast"). `false`: skipped.
+///
+/// # Errors
+/// As [`deliver`].
+pub async fn deliver_here(
+    svc: &Arc<TenantServices>,
+    def: &Definition,
+    t: TenantId,
+    p: &super::remote::BroadcastPayload,
+) -> Result<bool> {
+    let b = Logged {
+        bid: p.bid.clone(),
+        publisher: TenantId(p.publisher),
+        committed_ms: 0,
+        form: Form {
+            with_instance: p.with_instance,
+            under: None,
+        },
+        next: 0,
+        delivered: 0,
+        skipped: 0,
+        rec: Publish {
+            key: p.key.clone(),
+            value: p.value.clone(),
+            headers: p.headers.clone(),
+            partition: None,
+            ts_ms: None,
+        },
+    };
+    deliver_local(svc, def, t, &b, p.with_instance).await
+}
+
+/// [`deliver`] into an instance of a member homed here.
+async fn deliver_local(
     svc: &Arc<TenantServices>,
     def: &Definition,
     t: TenantId,

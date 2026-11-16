@@ -1066,6 +1066,24 @@ impl PassSession {
         if sprig_sql::rls::inject::names_context_variable(text, lex_opts) {
             return Err(reserved_var());
         }
+        // The session functions a statement calls itself (`SELECT
+        // SPRIG_CLAIM('org')`): bound as in policies, whether or not the
+        // tenant uses row-level security. Stored code and views keep the
+        // call (binding it would freeze the creator's values).
+        if text.windows(6).any(|w| w.eq_ignore_ascii_case(b"SPRIG_"))
+            && let Ok(utf8) = std::str::from_utf8(text)
+            && class(&words(text, lex_opts)) == Class::Rewrite
+            && let Some(cat) = ts.catalog().cloned()
+            && let Some(bound) =
+                crate::tenant::rls::bind_session_functions(ts, &cat, utf8, lex_opts).await?
+        {
+            let t = Bytes::from(bound);
+            return Ok(Some(
+                Box::pin(self.tenant_rls(cx, &t, lex_opts))
+                    .await?
+                    .unwrap_or(t),
+            ));
+        }
         // `information_schema.SPRIG_ROW_POLICIES`: the session's rows, inline.
         if let Some(t) = crate::tenant::rls::inline_view(ts, text, lex_opts) {
             let t = Bytes::from(t);

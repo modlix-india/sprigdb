@@ -241,12 +241,24 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         Arc::clone(&clock),
     ));
     // Tenant catalogs: found through their shard maps, changed with
-    // versions allocated in the directory.
+    // versions allocated in the directory. An ancestor homed in another
+    // DC is followed to its home's map and cluster: through the one etcd,
+    // or in two tiers through that DC's controllers (the relay).
+    let homes: Arc<dyn MetaStore> = if two_tier(&cfg.meta) {
+        Arc::new(sprig_meta::relay::RoutedStore::new(
+            Arc::clone(&stores.dc),
+            Arc::clone(&stores.global),
+        ))
+    } else {
+        Arc::clone(&stores.dc)
+    };
+    let catalog_registry = ClusterRegistry::new(Arc::clone(&stores.global), Arc::clone(&homes))?;
     let pools: Arc<dyn ClusterPools> = Arc::new(RegistryPools::new(
-        registry.clone(),
+        catalog_registry.clone(),
         Some(Arc::clone(&monitor)),
     ));
-    let locator = ShardMapLocator::new(Arc::clone(&stores.dc), pools, default_naming());
+    let locator = ShardMapLocator::new(Arc::clone(&homes), pools, default_naming())
+        .with_directory(Arc::clone(&stores.global));
     let versioner = Versioner::new(
         MariaBackend::new(Arc::new(locator.clone())).with_clock(Arc::clone(&clock)),
         Arc::new(DirectoryAllocator::new(Arc::clone(&stores.global))),
@@ -286,13 +298,14 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
     // so they can never starve the short calls of every other loop
     // (see the `catalogs` module docs).
     let ai_sessions = ShardMapLocator::new(
-        Arc::clone(&stores.dc),
+        Arc::clone(&homes),
         Arc::new(
-            RegistryPools::new(registry.clone(), Some(Arc::clone(&monitor)))
+            RegistryPools::new(catalog_registry.clone(), Some(Arc::clone(&monitor)))
                 .budget("autoindex", autoindex_loop::SESSIONS),
         ),
         default_naming(),
-    );
+    )
+    .with_directory(Arc::clone(&stores.global));
     let indexes = Arc::new(
         autoindex_admin::AutoIndexService::new(
             Directory::new(Arc::clone(&stores.global)),
@@ -1071,6 +1084,20 @@ async fn prepare_deployment(
             () = tokio::time::sleep(BOOTSTRAP_WAIT) => {}
         }
     }
+}
+
+/// Whether `[meta]` names a global tier apart from the DC's (two tiers:
+/// other DCs' tiers are read through their controllers' relay).
+fn two_tier(meta: &sprig_common::config::MetaConfig) -> bool {
+    let norm = |v: &[String]| {
+        let mut v: Vec<String> = v
+            .iter()
+            .map(|s| s.trim_end_matches('/').to_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    !meta.global_seeds.is_empty() && norm(&meta.global_seeds) != norm(&meta.dc_seeds)
 }
 
 #[cfg(test)]

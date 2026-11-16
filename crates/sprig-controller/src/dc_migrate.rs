@@ -372,6 +372,12 @@ impl DecisionState {
             .get(&tenant)
             .is_some_and(|(d, until)| d == dc && *until > now_ms)
     }
+
+    /// Records that `tenant` is about to move to `dc`, until `until_ms`:
+    /// the `standby` loop places no standby there meanwhile.
+    pub fn intend(&self, tenant: TenantId, dc: &DcId, until_ms: u64) {
+        lock(&self.intents).insert(tenant, (dc.clone(), until_ms));
+    }
 }
 
 /// The loop (module docs).
@@ -671,7 +677,8 @@ impl MigrationDecider {
         }
         // The tenant's job standby in the target holds its lock there:
         // drop it first, and keep the standby loop out of it.
-        lock(&self.state().intents).insert(tenant, (best.clone(), now + 10 * 60 * 1000));
+        self.state()
+            .intend(tenant, &best, now + crate::migrate::INTENT_MS);
         if crate::standby::job_standbys(&e.raw).contains_key(&best) {
             crate::standby::drop_job_standby(
                 m.store(),

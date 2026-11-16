@@ -12,20 +12,33 @@
 //!                derived-state changes): this DC's members re-apply their
 //!                state, and every other DC is asked to do the same
 //!                ("rollout"), in the background
+//! DROP TRIGGER   (and a stream's trigger readers going with it): this
+//!                DC's instances stop, then every other DC's
+//!                ("drop_trigger"), before the definition goes
+//! override       ALTER ... FOR TENANT t | FOR SUBTREE t: the members it
+//!                applies to here re-apply it, then every other DC's
+//!                ("override", with the overriding tenant's catalog version)
+//! SHOW INHERITED the instance counts add every other DC's ("count")
+//! broadcast      the fan-out delivers to a member homed in another DC
+//!                through a gateway of that DC ("broadcast", the record in
+//!                the call), so its instance and index stay in its home
 //! a DC that can't be reached: logged and counted; its gateways' orphan
-//!   sweep (orphan_sinks) drops what a dropped definition left there, and a
-//!   member's next publish applies a new definition
+//!   sweep (orphan_sinks) drops what a dropped definition left there, a
+//!   member's next publish applies a new definition, an override reaches
+//!   it at its next use, and a broadcast goes to the retry list
 //! ```
 //!
-//! Gateways of another DC are found in that DC's tier of the one etcd
-//! (single-etcd mode), as for the login hand-off.
+//! Gateways of another DC are found in that DC's tier: through the one
+//! etcd (single-etcd mode), or through its controllers' relay (two tiers),
+//! as for the login hand-off.
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use sprig_api::proto::internal::{InheritedMembersReply, InheritedMembersRequest};
 use sprig_common::ids::{DcId, TenantId};
 use sprig_common::{Result, SprigCode, SprigError};
-use sprig_inherit::msg::{DefKey, DefKind, Definition};
+use sprig_inherit::msg::{AppliesTo, Cause, Chain, DefKey, DefKind, Definition, TriggerSpec};
 
 use crate::tenant::TenantServices;
 
@@ -37,6 +50,22 @@ pub enum MemberOp {
     /// Re-apply the derived state (sinks, triggers, settings) of the
     /// members holding an instance of a stream or queue definition.
     Rollout,
+    /// Stop and forget the members' instances of a trigger definition.
+    DropTrigger,
+    /// An override made in tenant `by` (its catalog at `version` or
+    /// later) for `target`, alone or with its subtree.
+    Override {
+        /// The tenant that made it.
+        by: TenantId,
+        /// Its catalog version with the override.
+        version: u64,
+        /// For whom.
+        target: TenantId,
+        /// FOR SUBTREE.
+        subtree: bool,
+    },
+    /// Count the instances only.
+    Count,
 }
 
 impl MemberOp {
@@ -44,16 +73,35 @@ impl MemberOp {
         match self {
             Self::DropSink => "drop_sink",
             Self::Rollout => "rollout",
+            Self::DropTrigger => "drop_trigger",
+            Self::Override { .. } => "override",
+            Self::Count => "count",
         }
     }
+}
 
-    fn parse(s: &str) -> Option<Self> {
-        match s {
-            "drop_sink" => Some(Self::DropSink),
-            "rollout" => Some(Self::Rollout),
-            _ => None,
-        }
-    }
+/// `payload` of an override: who made it, and at which version.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct OverridePayload {
+    by: u64,
+    version: u64,
+}
+
+/// `payload` of a broadcast: the logged record.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BroadcastPayload {
+    /// The broadcast id (16 bytes).
+    pub bid: Vec<u8>,
+    /// Who published it.
+    pub publisher: u64,
+    /// The record's key.
+    pub key: Option<Vec<u8>>,
+    /// Its value.
+    pub value: Option<Vec<u8>>,
+    /// Its headers, JSON text.
+    pub headers: Option<String>,
+    /// `WITH INSTANCE`: only a member whose instance exists.
+    pub with_instance: bool,
 }
 
 /// The registered DCs other than this one that aren't retired or
@@ -67,57 +115,136 @@ fn other_dcs(svc: &TenantServices) -> Vec<DcId> {
         .collect()
 }
 
-/// Asks a ready gateway of every other DC to apply `op` to definition
-/// `def` for the members it indexes. The member instances they reached;
-/// a DC that can't be reached is logged and counted
-/// (`sprig_inherit_remote_calls_total{outcome="failed"}`).
-pub async fn in_other_dcs(svc: &TenantServices, op: MemberOp, def: DefKey) -> u64 {
+fn failed(op: &str) {
+    metrics::counter!("sprig_inherit_remote_calls_total", "op" => op.to_owned(), "outcome" => "failed")
+        .increment(1);
+}
+
+/// `req` on a ready gateway of `dc`, each in turn until one answers: its
+/// reply; `None` when the DC has no ready gateway.
+///
+/// # Errors
+/// The last gateway's error when none answers; the store's.
+async fn call_dc(
+    svc: &TenantServices,
+    dc: &DcId,
+    req: &InheritedMembersRequest,
+) -> Result<Option<InheritedMembersReply>> {
     let Some(peers) = svc.peers.get() else {
-        return 0;
+        return Ok(None);
     };
-    // The declarer's catalog as this gateway's session left it: the other
-    // DC reads at least that version, not what its watch has delivered.
+    let gateways = peers.gateways_in(dc).await?;
+    let mut last = None;
+    for rec in &gateways {
+        match peers.inherited_members(rec, req.clone()).await {
+            Ok(r) => {
+                tracing::info!(%dc, gateway = %rec.gateway_id, op = %req.op, tenant = req.tenant_id, object = req.object_id, instances = r.instances, "FOR EACH TENANT change applied in another DC");
+                metrics::counter!("sprig_inherit_remote_calls_total", "op" => req.op.clone(), "outcome" => "ok").increment(1);
+                return Ok(Some(r));
+            }
+            Err(e) => {
+                tracing::warn!(%dc, gateway = %rec.gateway_id, op = %req.op, error = %e, "a gateway of another DC didn't apply a FOR EACH TENANT change; trying the next");
+                last = Some(e);
+            }
+        }
+    }
+    match last {
+        Some(e) => Err(e),
+        None => Ok(None),
+    }
+}
+
+/// Asks a ready gateway of every other DC to apply `op` to definition
+/// `def` for the members it indexes. The member instances they reached
+/// (for [`MemberOp::Count`], have); a DC that can't be reached is logged
+/// and counted (`sprig_inherit_remote_calls_total{outcome="failed"}`).
+pub async fn in_other_dcs(svc: &TenantServices, op: MemberOp, def: DefKey) -> u64 {
+    if svc.peers.get().is_none() {
+        return 0;
+    }
+    let (catalog_version, target_tenant_id, subtree, payload) = match op {
+        MemberOp::Override {
+            by,
+            version,
+            target,
+            subtree,
+        } => (
+            0,
+            target.0,
+            subtree,
+            serde_json::to_vec(&OverridePayload { by: by.0, version }).unwrap_or_default(),
+        ),
+        // The declarer's catalog as this gateway's session left it: the
+        // other DC reads at least that version, not what its watch has
+        // delivered.
+        _ => (
+            svc.cache.cached(def.tenant).map_or(0, |c| c.version),
+            0,
+            false,
+            Vec::new(),
+        ),
+    };
     let req = InheritedMembersRequest {
         op: op.as_str().to_owned(),
         tenant_id: def.tenant.0,
         object_id: def.object,
-        catalog_version: svc.cache.cached(def.tenant).map_or(0, |c| c.version),
+        catalog_version,
+        target_tenant_id,
+        subtree,
+        payload,
     };
     let mut n = 0;
     for dc in other_dcs(svc) {
-        let gateways = match peers.gateways_in(&dc).await {
-            Ok(g) => g,
+        match call_dc(svc, &dc, &req).await {
+            Ok(Some(r)) => n += r.instances,
+            Ok(None) => {
+                tracing::debug!(%dc, %def, "no ready gateway in the DC: none of its members to reach");
+            }
             Err(e) => {
-                tracing::warn!(%dc, %def, op = op.as_str(), error = %e, "can't list the DC's gateways for a FOR EACH TENANT change");
-                metrics::counter!("sprig_inherit_remote_calls_total", "op" => op.as_str(), "outcome" => "failed").increment(1);
-                continue;
+                tracing::warn!(%dc, %def, op = op.as_str(), error = %e, "no gateway of the DC applied the FOR EACH TENANT change; its sweep or the members' next use catches up");
+                failed(op.as_str());
             }
-        };
-        if gateways.is_empty() {
-            tracing::debug!(%dc, %def, "no ready gateway in the DC: none of its members to reach");
-            continue;
-        }
-        let mut done = false;
-        for rec in &gateways {
-            match peers.inherited_members(rec, req.clone()).await {
-                Ok(r) => {
-                    tracing::info!(%dc, gateway = %rec.gateway_id, %def, op = op.as_str(), instances = r.instances, "FOR EACH TENANT change applied in another DC");
-                    metrics::counter!("sprig_inherit_remote_calls_total", "op" => op.as_str(), "outcome" => "ok").increment(1);
-                    n += r.instances;
-                    done = true;
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!(%dc, gateway = %rec.gateway_id, %def, op = op.as_str(), error = %e, "a gateway of another DC didn't apply a FOR EACH TENANT change; trying the next");
-                }
-            }
-        }
-        if !done {
-            tracing::warn!(%dc, %def, op = op.as_str(), "no gateway of the DC applied the FOR EACH TENANT change; its orphan sweep or the members' next use catches up");
-            metrics::counter!("sprig_inherit_remote_calls_total", "op" => op.as_str(), "outcome" => "failed").increment(1);
         }
     }
     n
+}
+
+/// Delivers a broadcast of `def` to member `member`, homed in `dc`,
+/// through a gateway there. `true` when delivered, `false` when skipped
+/// (`WITH INSTANCE` and no instance).
+///
+/// # Errors
+/// 39788 when no gateway of `dc` answers (the fan-out retries it); the
+/// member's errors there.
+pub async fn broadcast_in(
+    svc: &TenantServices,
+    dc: &DcId,
+    def: DefKey,
+    member: TenantId,
+    payload: &BroadcastPayload,
+) -> Result<bool> {
+    let req = InheritedMembersRequest {
+        op: "broadcast".to_owned(),
+        tenant_id: def.tenant.0,
+        object_id: def.object,
+        catalog_version: svc.cache.cached(def.tenant).map_or(0, |c| c.version),
+        target_tenant_id: member.0,
+        subtree: false,
+        payload: serde_json::to_vec(payload).map_err(|e| SprigError::internal(e.to_string()))?,
+    };
+    match call_dc(svc, dc, &req).await {
+        Ok(Some(r)) => Ok(r.instances > 0),
+        Ok(None) => Err(SprigError::new(
+            SprigCode::ForwardFailed,
+            format!(
+                "ER_SPRIG_FORWARD_FAILED: no ready gateway in {dc} to deliver a broadcast to tenant {member}"
+            ),
+        )),
+        Err(e) => {
+            failed("broadcast");
+            Err(e)
+        }
+    }
 }
 
 /// The declarer's definition `object` of kind `kind`, from its own rows.
@@ -136,17 +263,13 @@ fn definition(chain: &sprig_inherit::msg::Chain, key: DefKey) -> Option<Arc<Defi
 /// the members this DC indexes.
 ///
 /// # Errors
-/// 39792 for an unknown op; the catalog's and the store's.
+/// 39792 for an unknown op or a malformed payload; the catalog's and the
+/// store's.
 pub async fn serve(
     svc: &Arc<TenantServices>,
     req: &InheritedMembersRequest,
 ) -> Result<InheritedMembersReply> {
-    let op = MemberOp::parse(&req.op).ok_or_else(|| {
-        SprigError::new(
-            SprigCode::AdminRequestInvalid,
-            format!("unknown member op {:?}", req.op),
-        )
-    })?;
+    let bad = |why: String| SprigError::new(SprigCode::AdminRequestInvalid, why);
     let key = DefKey {
         tenant: TenantId(req.tenant_id),
         object: req.object_id,
@@ -163,8 +286,8 @@ pub async fn serve(
             )
             .await?;
     }
-    let instances = match op {
-        MemberOp::DropSink => {
+    let instances = match req.op.as_str() {
+        "drop_sink" => {
             let cat = super::catalog(svc, key.tenant).await?;
             let chain = super::chain(svc, &cat).await?;
             // Gone already (another gateway's drop committed): nothing to
@@ -189,11 +312,223 @@ pub async fn serve(
             });
             n
         }
-        MemberOp::Rollout => rollout_here(svc, key).await?,
+        "rollout" => rollout_here(svc, key).await?,
+        "drop_trigger" => drop_trigger_here(svc, key).await?,
+        "count" => super::instances_of(svc, key).await?.len(),
+        "override" => {
+            let p: OverridePayload = serde_json::from_slice(&req.payload)
+                .map_err(|e| bad(format!("override payload: {e}")))?;
+            let by = TenantId(p.by);
+            let cat = svc
+                .cache
+                .get(
+                    by,
+                    sprig_catalog::cache::Freshness::Cached {
+                        min_version: p.version,
+                    },
+                )
+                .await?;
+            let chain = super::chain(svc, &cat).await?;
+            let Some(d) = definition(&chain, key) else {
+                return Ok(InheritedMembersReply { instances: 0 });
+            };
+            apply_override_here(
+                svc,
+                &chain,
+                &d,
+                TenantId(req.target_tenant_id),
+                if req.subtree {
+                    AppliesTo::Subtree
+                } else {
+                    AppliesTo::Own
+                },
+            )
+            .await?
+        }
+        "broadcast" => {
+            let p: BroadcastPayload = serde_json::from_slice(&req.payload)
+                .map_err(|e| bad(format!("broadcast payload: {e}")))?;
+            let cat = super::catalog(svc, key.tenant).await?;
+            let Some(d) = super::state_of(&cat).def_by_id(key.object).cloned() else {
+                return Err(super::target_err(format!("definition {key} is gone")));
+            };
+            usize::from(
+                super::broadcast::deliver_here(svc, &d, TenantId(req.target_tenant_id), &p).await?,
+            )
+        }
+        other => return Err(bad(format!("unknown member op {other:?}"))),
     };
     Ok(InheritedMembersReply {
         instances: u64::try_from(instances).unwrap_or(0),
     })
+}
+
+/// Stops and forgets the instance of trigger definition `g` of every
+/// member this DC indexes: its job's index entry and its instance row (the
+/// member's module keeps its versions for the record). The number of
+/// instances.
+///
+/// # Errors
+/// The store's and the members' catalogs'.
+pub async fn drop_trigger_here(svc: &Arc<TenantServices>, g: DefKey) -> Result<usize> {
+    use mysql_async::prelude::Queryable;
+    use serde_json::Value;
+    use sprig_catalog::CatalogLocator;
+    use sprig_catalog::pool_wait::Bounded as _;
+    // Trigger instances live with the members' stream instances.
+    let prefix = svc.locator.dc_store().tier().key("inherit-instances/")?;
+    let page = svc
+        .locator
+        .dc_store()
+        .list(
+            &prefix,
+            sprig_meta::ListOpts {
+                limit: 1_000_000,
+                ..sprig_meta::ListOpts::default()
+            },
+        )
+        .await?;
+    let tenants: std::collections::BTreeSet<TenantId> = page
+        .kvs
+        .iter()
+        .filter_map(|kv| {
+            sprig_meta::Record::<super::InstanceIndex>::decode(&kv.value)
+                .ok()
+                .map(|r| r.body.tenant)
+        })
+        .collect();
+    let mut n = 0;
+    for t in tenants {
+        // A member deleted since has nothing left to stop.
+        if super::dir_entry(svc, t).await?.is_none() {
+            continue;
+        }
+        let ep = svc.locator.writer(t).await?;
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
+            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
+        })?;
+        let store = sprig_inherit::msg::MsgStore::new(ep.store.schema());
+        if let Some(i) = store.instance(&mut conn, g).await? {
+            if let Some(b) = i
+                .physical
+                .as_ref()
+                .and_then(|p| p.get("binding"))
+                .and_then(Value::as_u64)
+            {
+                sprig_logic::messages::delete_index(svc.locator.dc_store().as_ref(), t, b).await?;
+                // The job ends at its next check; its module stays, marked.
+                let _ = conn
+                    .exec_drop(
+                        format!(
+                            "UPDATE {}.logic_modules SET state = 'dropped' WHERE module_id = ?",
+                            sprig_common::names::quote(ep.store.schema())
+                        ),
+                        (i.physical
+                            .as_ref()
+                            .and_then(|p| p.get("module"))
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),),
+                    )
+                    .await;
+            }
+            store.delete_instance(&mut conn, g).await?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// The members this DC indexes that an override of `def`, made by
+/// `chain`'s tenant for `target` (alone, or with its subtree), applies to
+/// re-apply it now: exchanges, queues, bindings and triggers on queues
+/// through the members' vhosts; streams and triggers on streams through
+/// their stream instances. The instances reached.
+///
+/// # Errors
+/// The members' catalogs' and the store's.
+pub async fn apply_override_here(
+    svc: &Arc<TenantServices>,
+    chain: &Chain,
+    def: &Definition,
+    target: TenantId,
+    applies: AppliesTo,
+) -> Result<usize> {
+    let own = chain
+        .levels
+        .first()
+        .and_then(|l| l.state.clone())
+        .unwrap_or_default();
+    let stream_key = match def.kind {
+        DefKind::Stream => Some(def.key()),
+        DefKind::Trigger => {
+            let spec: TriggerSpec =
+                serde_json::from_value(def.definition.clone()).unwrap_or_default();
+            chain
+                .resolve(&spec.source_db, DefKind::Stream, &spec.source_name)
+                .or_else(|| {
+                    own.def(&spec.source_db, DefKind::Stream, &spec.source_name)
+                        .cloned()
+                })
+                .map(|d| d.key())
+        }
+        _ => None,
+    };
+    let mut reached = 0;
+    let hits = |t: TenantId| async move {
+        if t == target {
+            return Ok::<_, SprigError>(true);
+        }
+        Ok(applies == AppliesTo::Subtree
+            && super::dir_entry(svc, t)
+                .await?
+                .is_some_and(|d| d.path_ids().contains(&target.0)))
+    };
+    let mq_db = match def.kind {
+        DefKind::Exchange | DefKind::Queue | DefKind::Binding => Some(def.db_name.clone()),
+        DefKind::Trigger => {
+            let spec: TriggerSpec =
+                serde_json::from_value(def.definition.clone()).unwrap_or_default();
+            (spec.source_kind == "queue").then_some(spec.source_db)
+        }
+        _ => None,
+    };
+    if let Some(mdb) = mq_db {
+        let mut members = std::collections::BTreeSet::new();
+        for d in super::mq::declared_in(chain, &mdb)
+            .into_iter()
+            .chain(super::mq::defs_in(chain, &mdb))
+        {
+            for e in super::instances_of(svc, d.key()).await? {
+                members.insert(e.tenant);
+            }
+        }
+        for t in members {
+            if !hits(t).await? {
+                continue;
+            }
+            super::mq::forget_applied(t, Some(&mdb));
+            let tcat = super::catalog(svc, t).await?;
+            let tchain = super::chain(svc, &tcat).await?;
+            if Box::pin(super::mq::ensure_vhost(svc, &tchain, &mdb, Cause::Declare)).await? {
+                reached += 1;
+            }
+        }
+    }
+    if let Some(sk) = stream_key {
+        for e in super::instances_of(svc, sk).await? {
+            if !hits(e.tenant).await? {
+                continue;
+            }
+            super::streams::forget_applied(e.tenant, sk);
+            let tcat = super::catalog(svc, e.tenant).await?;
+            let tchain = super::chain(svc, &tcat).await?;
+            if let Some(d) = tchain.def(sk) {
+                Box::pin(super::streams::ensure(svc, &tchain, &d, Cause::Declare)).await?;
+                reached += 1;
+            }
+        }
+    }
+    Ok(reached)
 }
 
 /// Every member this DC indexes with an instance of stream or queue

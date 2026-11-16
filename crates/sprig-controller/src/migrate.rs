@@ -77,6 +77,14 @@ sprig_settings::register!(WRITE_PAUSE_TARGET_MS);
 /// A start without a job id this long is abandoned.
 const SUBMIT_GRACE_MS: u64 = 120_000;
 
+/// How long a move intends its target: the `standby` loop places no new
+/// standby of the tenant there meanwhile.
+pub const INTENT_MS: u64 = 10 * 60 * 1000;
+
+/// How long a move waits for a dropped standby's job to let go of the
+/// tenant's lock in the target before it answers "retry".
+const STANDBY_RELEASE_WAIT: Duration = Duration::from_secs(60);
+
 /// 39550.
 fn refused(msg: impl Into<String>) -> SprigError {
     SprigError::new(SprigCode::TenantMoveRefused, msg)
@@ -467,6 +475,28 @@ impl DcMoves {
         if e.state != "active" {
             return Err(refused(format!("tenant {name} is {}", e.state)));
         }
+        // A job standby of the tenant in the target: its job holds the
+        // tenant's lock there and its maps there are standby maps, so the
+        // move's job couldn't start (39131). It is dropped first, as an
+        // automatic move does, and the move waits for its job to let go.
+        let standby = crate::standby::job_standbys(&e.raw).remove(&to);
+        if let Some(sb) = &standby
+            && !req.dry_run
+        {
+            self.decisions
+                .intend(tenant, &to, self.now_ms() + INTENT_MS);
+            crate::standby::drop_job_standby(
+                &self.store,
+                self.global(),
+                &self.clock,
+                tenant,
+                &to,
+                "the tenant moves there",
+            )
+            .await?;
+            tracing::info!(tenant = %name, %to, job = %sb.job.0, "the tenant's job standby in the target is dropped before its move");
+            self.await_standby_gone(tenant, name, &to, &sb.job).await?;
+        }
         let open = self
             .mover_in(&self.dc)
             .list(&JobFilter {
@@ -514,6 +544,14 @@ impl DcMoves {
             "job": Value::Null,
         });
         if req.dry_run {
+            let mut migration = migration;
+            if let (Some(sb), Value::Object(m)) = (&standby, &mut migration) {
+                // What the move would do first.
+                m.insert(
+                    "drops_standby".into(),
+                    json!({"dc": to.as_str(), "cluster": sb.cluster.as_str(), "job": sb.job.0.to_string()}),
+                );
+            }
             let mut v = self.view(name, &e, None).await;
             v.migration = Some(migration);
             v.dry_run = true;
@@ -572,6 +610,49 @@ impl DcMoves {
         metrics::counter!("sprig_controller_migrations_total", "cause" => cause.to_owned(), "result" => "started")
             .increment(1);
         Ok(self.view(name, &dir, None).await)
+    }
+
+    /// Waits until the dropped standby's job `job` no longer holds
+    /// `tenant`'s lock in `to` and has ended (the copy rolled back), at
+    /// most [`STANDBY_RELEASE_WAIT`].
+    ///
+    /// # Errors
+    /// 39131 (retryable) when it still holds the lock then; the stores'.
+    async fn await_standby_gone(
+        &self,
+        tenant: TenantId,
+        name: &str,
+        to: &DcId,
+        job: &JobId,
+    ) -> Result<()> {
+        let js = JobStore::new(
+            TierView::over(&self.store, Tier::Dc(to.clone())),
+            Arc::clone(&self.clock),
+        );
+        let me = job.0.to_string();
+        let t0 = std::time::Instant::now();
+        loop {
+            let holds = js.tenant_lock_holder(tenant).await?.as_deref() == Some(me.as_str());
+            let open = match js.get(job).await {
+                Ok((r, _)) => !r.state.is_terminal(),
+                Err(e) if e.code() == Some(SprigCode::JobNotFound) => false,
+                Err(e) => return Err(e),
+            };
+            if !holds && !open {
+                return Ok(());
+            }
+            if t0.elapsed() >= STANDBY_RELEASE_WAIT {
+                return Err(SprigError::new(
+                    SprigCode::ShardLocked,
+                    format!(
+                        "tenant {name}'s job standby in {to} was dropped, and its job {me} is \
+                         still rolling back (it holds the tenant's lock there); retry the move \
+                         shortly"
+                    ),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
 
     /// Refuses the move while a split, merge or shard move of `tenant`

@@ -1216,71 +1216,17 @@ pub(super) async fn rollout(svc: &Arc<TenantServices>, def: DefKey) -> Result<us
 }
 
 /// Stops and forgets every member's instance of trigger definition `g`:
-/// its job's index entry and its instance row (the member's module keeps
-/// its versions for the record). The number of instances.
+/// this DC's members, then those other DCs index (each DC's gateways stop
+/// their own). The number of instances.
 async fn drop_trigger_instances(svc: &Arc<TenantServices>, g: DefKey) -> Result<usize> {
-    use sprig_catalog::CatalogLocator;
-    // Trigger instances live with the members' stream instances.
-    let prefix = svc.locator.dc_store().tier().key("inherit-instances/")?;
-    let page = svc
-        .locator
-        .dc_store()
-        .list(
-            &prefix,
-            sprig_meta::ListOpts {
-                limit: 1_000_000,
-                ..sprig_meta::ListOpts::default()
-            },
-        )
-        .await?;
-    let tenants: std::collections::BTreeSet<TenantId> = page
-        .kvs
-        .iter()
-        .filter_map(|kv| {
-            sprig_meta::Record::<inherited::InstanceIndex>::decode(&kv.value)
-                .ok()
-                .map(|r| r.body.tenant)
-        })
-        .collect();
-    let mut n = 0;
-    for t in tenants {
-        // A member deleted since has nothing left to stop.
-        if inherited::dir_entry(svc, t).await?.is_none() {
-            continue;
-        }
-        let ep = svc.locator.writer(t).await?;
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-        })?;
-        let store = sprig_inherit::msg::MsgStore::new(ep.store.schema());
-        if let Some(i) = store.instance(&mut conn, g).await? {
-            if let Some(b) = i
-                .physical
-                .as_ref()
-                .and_then(|p| p.get("binding"))
-                .and_then(Value::as_u64)
-            {
-                sprig_logic::messages::delete_index(svc.locator.dc_store().as_ref(), t, b).await?;
-                // The job ends at its next check; its module stays, marked.
-                let _ = conn
-                    .exec_drop(
-                        format!(
-                            "UPDATE {}.logic_modules SET state = 'dropped' WHERE module_id = ?",
-                            sprig_common::names::quote(ep.store.schema())
-                        ),
-                        (i.physical
-                            .as_ref()
-                            .and_then(|p| p.get("module"))
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),),
-                    )
-                    .await;
-            }
-            store.delete_instance(&mut conn, g).await?;
-            n += 1;
-        }
-    }
-    Ok(n)
+    let here = crate::inherited::remote::drop_trigger_here(svc, g).await?;
+    let there = crate::inherited::remote::in_other_dcs(
+        svc,
+        crate::inherited::remote::MemberOp::DropTrigger,
+        g,
+    )
+    .await;
+    Ok(here + usize::try_from(there).unwrap_or(0))
 }
 
 impl PassSession {
@@ -1914,87 +1860,24 @@ impl PassSession {
         }
         let v = inherited::commit(svc, me, &writes).await?;
         self.after_own_change(v).await?;
-        // Members with an instance apply it now.
-        let stream_key = match def.kind {
-            DefKind::Stream => Some(def.key()),
-            DefKind::Trigger => {
-                let spec: TriggerSpec =
-                    serde_json::from_value(def.definition.clone()).unwrap_or_default();
-                chain
-                    .resolve(&spec.source_db, DefKind::Stream, &spec.source_name)
-                    .or_else(|| {
-                        own.def(&spec.source_db, DefKind::Stream, &spec.source_name)
-                            .cloned()
-                    })
-                    .map(|d| d.key())
-            }
-            _ => None,
-        };
-        let mut reached = 0;
-        // Exchanges, queues, bindings and triggers on queues: the members'
-        // vhosts apply it now.
-        let mq_db = match def.kind {
-            DefKind::Exchange | DefKind::Queue | DefKind::Binding => Some(def.db_name.clone()),
-            DefKind::Trigger => {
-                let spec: TriggerSpec =
-                    serde_json::from_value(def.definition.clone()).unwrap_or_default();
-                (spec.source_kind == "queue").then_some(spec.source_db)
-            }
-            _ => None,
-        };
-        if let Some(mdb) = mq_db {
-            let mut members = std::collections::BTreeSet::new();
-            for d in inherited::mq::declared_in(chain, &mdb)
-                .into_iter()
-                .chain(inherited::mq::defs_in(chain, &mdb))
-            {
-                for e in inherited::instances_of(svc, d.key()).await? {
-                    members.insert(e.tenant);
-                }
-            }
-            for t in members {
-                let hit = t == target
-                    || (applies == AppliesTo::Subtree
-                        && inherited::dir_entry(svc, t)
-                            .await?
-                            .is_some_and(|d| d.path_ids().contains(&target.0)));
-                if !hit {
-                    continue;
-                }
-                inherited::mq::forget_applied(t, Some(&mdb));
-                let tcat = inherited::catalog(svc, t).await?;
-                let tchain = inherited::chain(svc, &tcat).await?;
-                if Box::pin(inherited::mq::ensure_vhost(
-                    svc,
-                    &tchain,
-                    &mdb,
-                    Cause::Declare,
-                ))
-                .await?
-                {
-                    reached += 1;
-                }
-            }
-        }
-        if let Some(sk) = stream_key {
-            for e in inherited::instances_of(svc, sk).await? {
-                let hit = e.tenant == target
-                    || (applies == AppliesTo::Subtree
-                        && inherited::dir_entry(svc, e.tenant)
-                            .await?
-                            .is_some_and(|d| d.path_ids().contains(&target.0)));
-                if !hit {
-                    continue;
-                }
-                streams::forget_applied(e.tenant, sk);
-                let tcat = inherited::catalog(svc, e.tenant).await?;
-                let tchain = inherited::chain(svc, &tcat).await?;
-                if let Some(d) = tchain.def(sk) {
-                    Box::pin(streams::ensure(svc, &tchain, &d, Cause::Declare)).await?;
-                    reached += 1;
-                }
-            }
-        }
+        // Members with an instance apply it now: this DC's, then those
+        // other DCs index.
+        let mut reached =
+            inherited::remote::apply_override_here(svc, chain, &def, target, applies).await?;
+        reached += usize::try_from(
+            inherited::remote::in_other_dcs(
+                svc,
+                inherited::remote::MemberOp::Override {
+                    by: me,
+                    version: v,
+                    target,
+                    subtree: applies == AppliesTo::Subtree,
+                },
+                def.key(),
+            )
+            .await,
+        )
+        .unwrap_or(0);
         Ok(Reply::Ok(
             0,
             vec![format!(
@@ -2024,9 +1907,23 @@ impl PassSession {
             ShowInherited::Definitions => {
                 let mut rows = Vec::new();
                 for d in own.defs.values() {
-                    let n = inherited::instances_of(svc, d.key())
+                    let counted =
+                        matches!(d.kind, DefKind::Stream | DefKind::Exchange | DefKind::Queue);
+                    let mut n = inherited::instances_of(svc, d.key())
                         .await
                         .map_or(0, |v| v.len());
+                    // Members homed in other DCs: their DCs count them.
+                    if counted {
+                        n += usize::try_from(
+                            inherited::remote::in_other_dcs(
+                                svc,
+                                inherited::remote::MemberOp::Count,
+                                d.key(),
+                            )
+                            .await,
+                        )
+                        .unwrap_or(0);
+                    }
                     rows.push(vec![
                         Some(d.kind.as_str().to_owned()),
                         Some(d.db_name.clone()),
@@ -2034,16 +1931,7 @@ impl PassSession {
                         Some(serde_json::to_string(&d.scope).unwrap_or_default()),
                         Some(d.def_version.to_string()),
                         Some(d.state.as_str().to_owned()),
-                        Some(
-                            if matches!(
-                                d.kind,
-                                DefKind::Stream | DefKind::Exchange | DefKind::Queue
-                            ) {
-                                n.to_string()
-                            } else {
-                                "-".into()
-                            },
-                        ),
+                        Some(if counted { n.to_string() } else { "-".into() }),
                     ]);
                 }
                 Ok(Reply::Rows(

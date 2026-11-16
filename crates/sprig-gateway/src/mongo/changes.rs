@@ -245,6 +245,9 @@ pub struct ChangeFeed {
     clusters: Arc<dyn Clusters>,
     placement: Arc<dyn PlacementView>,
     names: Arc<dyn Resolver>,
+    /// The tenant services: a tenant homed in another DC gets its feed
+    /// relayed from there ([`super::feed_relay`]).
+    relay: Option<Arc<crate::tenant::TenantServices>>,
 }
 
 impl std::fmt::Debug for ChangeFeed {
@@ -269,7 +272,39 @@ impl ChangeFeed {
             clusters,
             placement,
             names,
+            relay: None,
         })
+    }
+
+    /// The same feed relaying the tails of tenants homed in other DCs
+    /// from a gateway there.
+    #[must_use]
+    pub fn with_relay(mut self, svc: Arc<crate::tenant::TenantServices>) -> Self {
+        self.relay = Some(svc);
+        self
+    }
+}
+
+/// Where a stream's items come from: this gateway's tail, or a tail of the
+/// tenant's home DC relayed here.
+enum Tail {
+    Local(Box<TenantTail>),
+    Relayed(mpsc::Receiver<Result<FeedItem>>),
+}
+
+impl Tail {
+    /// The next item (cancel-safe, as the stream's task races it).
+    async fn next(&mut self) -> Result<FeedItem> {
+        match self {
+            Self::Local(t) => t.next().await,
+            Self::Relayed(rx) => rx.recv().await.unwrap_or_else(|| {
+                Err(SprigError::new(
+                    SprigCode::ForwardFailed,
+                    "ER_SPRIG_FORWARD_FAILED: the relayed change feed ended; resume from the \
+                     last token",
+                ))
+            }),
+        }
     }
 }
 
@@ -839,6 +874,26 @@ impl ChangeFeed {
             StartAt::After(t) => Some(t.to_hex()),
             _ => None,
         };
+        // A tenant homed in another DC: its home's reader tails it, and
+        // the items are rendered here.
+        if let Some(svc) = &self.relay
+            && let Some(home) = super::feed_relay::remote_home(svc, tenant)
+                .await
+                .map_err(|e| feed_error(&e))?
+        {
+            let after = match &start {
+                StartAt::After(t) => Some(t.clone()),
+                _ => None,
+            };
+            let (token, rx) = super::feed_relay::open(svc, &home, tenant, after.as_ref())
+                .await
+                .map_err(|e| feed_error(&e))?;
+            return Ok(Self::stream(
+                Tail::Relayed(rx),
+                spec,
+                first.unwrap_or(token),
+            ));
+        }
         let tail = TenantTail::start(
             tenant,
             start,
@@ -875,29 +930,29 @@ impl ChangeFeed {
                 .to_hex()
             }
         };
+        Ok(Self::stream(Tail::Local(Box::new(tail)), spec, token))
+    }
+
+    /// The stream over `tail`, its token starting at `token`.
+    fn stream(tail: Tail, spec: StreamSpec, token: String) -> ChangeStream {
         let (tx, rx) = mpsc::channel(QUEUE);
         let stop = CancellationToken::new();
         let pipeline = spec.pipeline.clone();
         let policies = crate::tenant::rls::DocViews::fingerprint(spec.visibility.as_deref());
         tokio::spawn(run(tail, spec, tx, stop.clone()));
         metrics::gauge!("sprig_mongo_cursors_open", "kind" => "change_stream").increment(1.0);
-        Ok(ChangeStream {
+        ChangeStream {
             rx,
             stop,
             token,
             pipeline,
             done: false,
             policies,
-        })
+        }
     }
 }
 
-async fn run(
-    mut tail: TenantTail,
-    spec: StreamSpec,
-    tx: mpsc::Sender<Item>,
-    stop: CancellationToken,
-) {
+async fn run(mut tail: Tail, spec: StreamSpec, tx: mpsc::Sender<Item>, stop: CancellationToken) {
     loop {
         // The tail is raced only against the stream's end, which drops it
         // for good (a resumed stream starts from the client's token), so a

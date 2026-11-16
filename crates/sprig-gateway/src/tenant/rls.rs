@@ -1402,6 +1402,15 @@ pub async fn bind_tree(
     if !uses {
         return Ok(());
     }
+    bind_tree_values(ts, cat, values).await
+}
+
+/// Fills `values`' subtree and managed sets.
+async fn bind_tree_values(
+    ts: &TenantSession,
+    cat: &TenantCatalog,
+    values: &mut SessionValues,
+) -> Result<()> {
     let tree = tree_binding(ts, cat).await?;
     let p = super::authz::privileges(ts, cat);
     let admin = p.unrestricted() || p.allows(Action::TenantAdmin, Target::Tenant);
@@ -1419,6 +1428,58 @@ pub async fn bind_tree(
     });
     values.subtree = Some(tree.tree);
     Ok(())
+}
+
+/// A statement of the session that calls the session functions itself
+/// (`SELECT SPRIG_CLAIM('org')`), with each call bound to the session's
+/// value as a policy binds it ([`sprig_sql::rls::expr::bind_statement`]);
+/// `None` when it calls none. Works whether or not the tenant uses
+/// row-level security.
+///
+/// # Errors
+/// 39364 for a call that can't be bound (a key that isn't one string);
+/// the directory's for the subtree functions.
+pub async fn bind_session_functions(
+    ts: &TenantSession,
+    cat: &TenantCatalog,
+    text: &str,
+    lex: &LexOptions,
+) -> Result<Option<String>> {
+    let mut values = SessionValues::of(ts, cat);
+    let up = text.to_ascii_uppercase();
+    if up.contains("SPRIG_TENANT_IN_SUBTREE") || up.contains("SPRIG_TENANT_MANAGED") {
+        bind_tree_values(ts, cat, &mut values).await?;
+    }
+    let nbe = lex.no_backslash_escapes;
+    let claim = |k: &str| {
+        values
+            .claims
+            .as_deref()
+            .and_then(|c| c.get(k))
+            .map(|v| literal(v, nbe))
+    };
+    let attr = |k: &str| {
+        values
+            .attrs
+            .as_ref()
+            .and_then(|c| c.get(k))
+            .map(|v| literal(v, nbe))
+    };
+    let b = LiteralBinder {
+        current_user: &values.current_user,
+        user_id: values.user_id,
+        tenant_id: values.tenant,
+        home_tenant_id: values.home,
+        space: values.space,
+        claim: &claim,
+        attr: &attr,
+        subtree: values.subtree.as_deref().map(Vec::as_slice),
+        managed: values.managed.as_deref().map(Vec::as_slice),
+        subtree_table: values.subtree_table,
+        managed_table: values.managed_table,
+        no_backslash_escapes: nbe,
+    };
+    expr::bind_statement(text, lex, &b)
 }
 
 /// The session tenant's subtree as the subtree functions read it.

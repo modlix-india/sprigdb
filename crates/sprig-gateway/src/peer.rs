@@ -22,6 +22,9 @@
 //!   ([`crate::http::changes`]).
 //! - `InheritedMembers`: a declarer's `FOR EACH TENANT` change for the
 //!   members this DC indexes ([`crate::inherited::remote`]).
+//! - `TailFeed`: the change feed of a tenant homed in this DC, for a
+//!   MongoDB change stream opened at a gateway of another DC
+//!   ([`crate::mongo::feed_relay`]).
 //!
 //! **Transport.** With `[tls]` in `sprigdb.toml` (the process identity from
 //! the internal CA) the listener requires client certificates signed by
@@ -43,7 +46,8 @@ use sprig_api::proto::internal::gateway_peer_server::{GatewayPeer, GatewayPeerSe
 use sprig_api::proto::internal::{
     DrainReply, DrainRequest, ForwardReply, ForwardRequest, HandoffLoginReply, HandoffLoginRequest,
     InheritedMembersReply, InheritedMembersRequest, KillReply, KillRequest, ListSessionsReply,
-    ListSessionsRequest, SessionRow, WatchChangesEvent, WatchChangesRequest,
+    ListSessionsRequest, SessionRow, TailFeedMessage, TailFeedRequest, WatchChangesEvent,
+    WatchChangesRequest,
 };
 use sprig_auth::handoff::{HandoffResult, HandoffStart, HandoffTarget, PrincipalWire};
 use sprig_common::ids::{ConnId, DcId, TenantId};
@@ -211,6 +215,25 @@ pub trait PeerHost: Send + Sync + 'static {
             SprigCode::ForwardFailed,
             "this gateway serves no tenant catalogs",
         ))
+    }
+    /// Serves a tenant's feed tail to a gateway of another DC: the first
+    /// message says whether it opened. Hosts without tenant catalogs
+    /// refuse it.
+    async fn tail_feed(
+        &self,
+        req: TailFeedRequest,
+    ) -> tokio::sync::mpsc::Receiver<TailFeedMessage> {
+        let _ = req;
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (_, body) = sprig_api::status::to_rest(&SprigError::new(
+            SprigCode::ForwardFailed,
+            "this gateway serves no change feeds",
+        ));
+        let _ = tx.try_send(TailFeedMessage {
+            error_json: serde_json::to_string(&body).unwrap_or_default(),
+            ..TailFeedMessage::default()
+        });
+        rx
     }
 }
 
@@ -383,6 +406,23 @@ impl GatewayPeer for Service {
             .await
             .map(tonic::Response::new)
             .map_err(|e| tonic::Status::unavailable(e.to_string()))
+    }
+
+    type TailFeedStream = std::pin::Pin<
+        Box<dyn futures::Stream<Item = std::result::Result<TailFeedMessage, tonic::Status>> + Send>,
+    >;
+
+    async fn tail_feed(
+        &self,
+        req: tonic::Request<TailFeedRequest>,
+    ) -> std::result::Result<tonic::Response<Self::TailFeedStream>, tonic::Status> {
+        let rx = self.host.tail_feed(req.into_inner()).await;
+        let items =
+            futures::stream::unfold(
+                rx,
+                |mut rx| async move { rx.recv().await.map(|m| (Ok(m), rx)) },
+            );
+        Ok(tonic::Response::new(Box::pin(items)))
     }
 }
 
@@ -684,6 +724,22 @@ impl Peers {
         Ok(c.watch_changes(req)
             .await
             .map_err(|e| unavailable("change stream relay", e))?
+            .into_inner())
+    }
+
+    /// `TailFeed` on gateway `rec`: the stream of its messages.
+    ///
+    /// # Errors
+    /// 39788 when it can't be reached.
+    pub async fn tail_feed(
+        &self,
+        rec: &GatewayRecord,
+        req: TailFeedRequest,
+    ) -> Result<tonic::Streaming<TailFeedMessage>> {
+        let mut c = self.client(rec)?;
+        Ok(c.tail_feed(req)
+            .await
+            .map_err(|e| unavailable("feed relay", e))?
             .into_inner())
     }
 

@@ -9,7 +9,7 @@ source: the metric macros in the source tree, and docs/metrics-help.toml
 
 Every metric SprigDB records, as exported on each process's telemetry port (`/metrics`, Prometheus text) and through OTLP. Counters end in `_total`; durations are histograms in seconds.
 
-507 metrics in 54 groups.
+513 metrics in 54 groups.
 
 ## `sprig_advisor_*`
 
@@ -42,7 +42,12 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_ai_digest_emails_total` | counter | `result` | sprig-ai | Tenant digests emailed to approvals subscribers (`ai.digest_email`); `result` is `sent`, `skipped` (no SMTP server or no subscriber) or `failed`. Unit: count. |
 | `sprig_ai_digests_total` | counter | `result` | sprig-ai | Tenant digests built (`ai.digest`); `result` is `worded` (the facts and the model's words), `facts` (the facts alone: no model, a spent budget or a failed call) or `error` (the facts couldn't be read or stored). Unit: count. |
 | `sprig_ai_egress_reduced_total` | counter | `role` | sprig-ai | Tool results the AI egress gate reduced before they reached the provider: rows or values withheld because `ai.share_data` is off, or a result cut at 200 rows or 64 KiB; `role` is the assistant. Unit: count. |
+| `sprig_ai_embedding_backlog` | gauge | - | sprig-ai | Changed rows of embedded columns the worker's embedding jobs have read from the change feed and not yet written. Unit: rows. |
+| `sprig_ai_embedding_cutovers_total` | counter | `result` | sprig-ai | Re-embeddings of embedded columns swapped into place after a model or source change; `result` is `done` or `failed` (retried). Unit: count. |
+| `sprig_ai_embedding_rows_total` | counter | `model`, `result` | sprig-ai | Rows the embedding worker handled for embedded columns; `model` is the model alias, `result` is `embedded`, `cleared` (no source: the vector became NULL), `skipped` (already the current source's) or `superseded` (the row changed again before the write). Unit: rows. |
+| `sprig_ai_embedding_seconds` | histogram | `model` | sprig-ai | Time of one model batch of the embedding worker; `model` is the model alias. Unit: seconds. |
 | `sprig_ai_feedback_total` | counter | `role`, `vote` | sprig-ai | Thumbs up or down users gave AI assistant answers (`POST /v1/ai/feedback`); `role` is the assistant, `vote` is `up` or `down`. Unit: count. |
+| `sprig_ai_fn_calls_total` | counter | `cached`, `fn`, `model` | sprig-ai | Distinct inputs the AI functions in statements answered (`AI_EMBED`, `AI_CLASSIFY`, ... and their MongoDB operators); `fn` is `embed`, `classify`, `extract`, `summarize` or `complete`, `model` is the model used, `cached` is `true` for answers from the function cache. Unit: count. |
 | `sprig_ai_health_findings_total` | counter | `rule` | sprig-ai | Findings of the administration agent's health rules over its metric history, one per finding per check; `rule` is `shard_split`, `cluster_full`, `replica_lag`, `cluster_health`, `connections`, `backup_age` or `mover_backlog`. Unit: count. |
 | `sprig_ai_health_warnings_total` | counter | `worded` | sprig-ai | Health warnings the administration agent filed in the approvals inbox (`ai_health_warning`); `worded` is `model`, or `rules` when no model was available and the rule's own words were filed. Unit: count. |
 | `sprig_ai_history_samples_total` | counter | `result` | sprig-ai | Sampling passes of the administration agent's metric history on the data center's leading controller, while `ai.admin.enabled` is on; `result` is `ok` or `error`. Unit: count. |
@@ -55,7 +60,7 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_ai_payloads_purged_total` | counter | - | sprig-ai | Exact payloads sent to AI providers that the controller dropped from conversations after `ai.audit_payload_days`; their SHA-256 hashes stay. Unit: count. |
 | `sprig_ai_proposals_total` | counter | `kind`, `outcome` | sprig-ai | Proposals the AI assistants made, and what became of them; `kind` is `sql`, `recommendation`, `tile`, `glossary` or `generate_rows`, `outcome` is `shown` when made, then `accepted`, `dismissed` or `failed` as users report it with `POST /v1/ai/feedback`. Unit: count. |
 | `sprig_ai_requests_total` | counter | `model`, `provider`, `result`, `role` | sprig-ai | Calls to an AI provider; `role` is the assistant, `provider` and `model` as configured in `ai.model.<role>`, `result` is `ok`, `refused` or `error` (after retries). Unit: count. |
-| `sprig_ai_tokens_total` | counter | `direction`, `role` | sprig-ai | Tokens AI providers reported; `role` is the assistant, `direction` is `input` (uncached), `output`, `cache_read` or `cache_write`. Unit: tokens. |
+| `sprig_ai_tokens_total` | counter | `direction`, `role` | sprig-ai | Tokens AI providers reported; `role` is the assistant, or `functions` for the AI functions in statements, `direction` is `input` (uncached), `output`, `cache_read` or `cache_write`. Unit: tokens. |
 | `sprig_ai_tool_calls_total` | counter | `result`, `tool` | sprig-ai | Tool calls made by the AI assistants; `tool` is the tool, `result` is `ok`, `error`, `denied` (outside the role or invalid input) or `proposed`. Unit: count. |
 | `sprig_ai_turn_seconds` | histogram | `role` | sprig-ai | Duration of one AI assistant turn, model calls and tools together; `role` is the assistant. Unit: seconds. |
 | `sprig_ai_upgrade_checks_total` | counter | `result` | sprig-ai | Upgrade readiness checks (`sprigctl ai upgrade-check`, `POST /admin/v1/ai:upgradeCheck`); `result` is `ok` or `error`. Unit: count. |
@@ -442,7 +447,7 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_inherit_reads_total` | counter | `mode` | sprig-inherit | Reads of inherited data; `mode` is how it was read, such as `read_through` (a view over the parent's rows). Unit: count. |
 | `sprig_inherit_ready_index_writes_total` | counter | `op` | sprig-gateway | Updates to the index of member instances ready for fan-in reads; `op` is `put` or `delete`. Unit: count. |
 | `sprig_inherit_refused_total` | counter | `reason` | sprig-gateway | Publishes and changes to inherited objects refused; `reason` is why, such as `target` or `no_target`. Unit: count. |
-| `sprig_inherit_remote_calls_total` | counter | `op`, `outcome` | sprig-gateway | Calls to a gateway of another data centre for a `FOR EACH TENANT` change reaching the members that data centre indexes; `op` is `drop_sink` or `rollout`, `outcome` is `ok` or `failed`. Unit: count. |
+| `sprig_inherit_remote_calls_total` | counter | `op`, `outcome` | sprig-gateway | Calls to a gateway of another data centre for a `FOR EACH TENANT` change reaching the members that data centre indexes; `op` is `drop_sink`, `rollout`, `drop_trigger`, `override`, `count` or `broadcast`, `outcome` is `ok` or `failed`. Unit: count. |
 | `sprig_inherit_sink_retries_total` | counter | `result` | sprig-gateway | Retries to deploy an inherited sink in a member; `result` is `deployed` or `dropped`. Unit: count. |
 | `sprig_inherit_unshare_failures_total` | counter | - | sprig-inherit | `DROP SHARE` statements whose clean-up in child tenants failed after its retries. Unit: count. |
 | `sprig_inherit_unshare_swept_total` | counter | - | sprig-inherit | Dropped shares whose cleanup in the child tenants (removing the share views, turning overrides into the child's own rows, clearing hides) was finished later by a sweep, because the DROP SHARE that started it was cut off. Unit: count. |
@@ -489,11 +494,12 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | Metric | Type | Labels | Recorded by | Description |
 |---|---|---|---|---|
 | `sprig_mongo_auth_total` | counter | `mechanism`, `result` | sprig-gateway | MongoDB logins; `mechanism` is the SASL mechanism (`SCRAM-SHA-256`), `result` `ok` or `failed`. Unit: count. |
+| `sprig_mongo_change_streams_relayed_total` | counter | `outcome` | sprig-gateway | MongoDB change streams of tenants homed in another data centre whose change feed is relayed from a gateway there; `outcome` is `opened`, `refused` (the home gateway refused it, as under residency) or `unavailable` (no gateway there answered). Unit: count. |
 | `sprig_mongo_command_duration_seconds` | histogram | `command` | sprig-gateway | Duration of MongoDB commands; `command` is the command name. Unit: seconds. |
 | `sprig_mongo_commands_total` | counter | `command`, `result` | sprig-gateway | MongoDB commands; `command` is the command name, `result` `ok`, `error` or `interrupted`. Unit: count. |
 | `sprig_mongo_connections` | gauge | `dc` | sprig-gateway | MongoDB connections open on this gateway; `dc` is reserved for the data centre. Unit: count. |
 | `sprig_mongo_cursor_timeouts_total` | counter | `kind` | sprig-gateway | MongoDB cursors closed for being idle past `mongo.cursor_timeout_ms`; `kind` is `find`. Unit: count. |
-| `sprig_mongo_cursors_open` | gauge | `kind` | sprig-gateway | MongoDB cursors open on this gateway; `kind` is the cursor kind, such as `change_stream`. Unit: count. |
+| `sprig_mongo_cursors_open` | gauge | `kind` | sprig-gateway | MongoDB cursors open on this gateway; `kind` is the cursor kind, such as `change_stream` (or `relayed_feed`: a tenant's feed this gateway relays to a change stream in another data centre). Unit: count. |
 | `sprig_mongo_query_settings_rejected_total` | counter | - | sprig-gateway | MongoDB queries refused because their query settings say `reject`. Unit: count. |
 | `sprig_mongo_retryable_replays_total` | counter | `command` | sprig-gateway | MongoDB retryable writes answered from their recorded result instead of running again; `command` is the command. Unit: count. |
 | `sprig_mongo_retryable_unrecorded_total` | counter | `command` | sprig-gateway | MongoDB retryable writes refused because their retry record couldn't be stored; `command` is the command. Unit: count. |

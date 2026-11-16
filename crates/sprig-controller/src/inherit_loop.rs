@@ -188,7 +188,7 @@ impl<H> WithMessagingModules<H> {
             .filter(|id| *id != tenant.tenant_id.0);
         for a in ancestors {
             let a = sprig_common::ids::TenantId(a);
-            let Ok(Some(cluster)) = self.locator.cluster_of(a).await else {
+            let Ok(Some(cluster)) = self.locator.catalog_cluster(a).await else {
                 continue;
             };
             let Ok(pool) = self.locator.pools().writer(&cluster).await else {
