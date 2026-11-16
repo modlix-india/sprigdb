@@ -237,10 +237,16 @@ async fn ai_functions_end_to_end() {
     c.query_drop("CREATE TABLE tickets (id INT PRIMARY KEY, body TEXT)")
         .await
         .unwrap();
-    c.query_drop(
-        "INSERT INTO tickets VALUES (1, 'the app crashes on start'), (2, 'add a dark mode'), \
-         (3, NULL), (4, 'the app crashes on start'), (5, 'ship it to Pune please')",
-    )
+    // A tag of this run in every input sent, so answers cached by an
+    // earlier run don't hide the calls.
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    c.query_drop(format!(
+        "INSERT INTO tickets VALUES (1, 'the app crashes on start {run}'), (2, 'add a dark mode {run}'), \
+         (3, NULL), (4, 'the app crashes on start {run}'), (5, 'ship it to Pune please {run}')"
+    ))
     .await
     .unwrap();
 
@@ -342,7 +348,8 @@ async fn ai_functions_end_to_end() {
         .await
         .unwrap();
     let j: String = rows[0].get(0).unwrap();
-    assert_eq!(j, r#"{"city":"Pune"}"#);
+    // As MySQL 8.4 prints a JSON value.
+    assert_eq!(j, r#"{"city": "Pune"}"#);
     let s: Option<String> = c
         .query_first("SELECT AI_SUMMARIZE(body, 10) FROM tickets WHERE id = 2")
         .await
@@ -371,7 +378,7 @@ async fn ai_functions_end_to_end() {
     settle().await;
     let before = sent(&seen);
     let e = c
-        .query_drop("SELECT AI_COMPLETE('write a new line here')")
+        .query_drop(format!("SELECT AI_COMPLETE('write a new line here {run}')"))
         .await
         .unwrap_err();
     assert_eq!(code(&e), 39992);
@@ -405,8 +412,8 @@ async fn ai_functions_end_to_end() {
         let client = mongodb::Client::with_uri_str(&uri).await.unwrap();
         let coll = client.database(DB).collection::<Document>("notes");
         coll.insert_many([
-            doc! {"_id": 1, "text": "it crashes on save"},
-            doc! {"_id": 2, "text": "please add export"},
+            doc! {"_id": 1, "text": format!("it crashes on save {run}")},
+            doc! {"_id": 2, "text": format!("please add export {run}")},
             doc! {"_id": 3},
         ])
         .await

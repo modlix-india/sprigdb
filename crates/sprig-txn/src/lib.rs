@@ -55,8 +55,8 @@ pub use backend::{
     AnchorLocator, BranchConn, ClusterAdmin, ClusterCaps, Ctl, DbError, DbResult, TxnBackend,
 };
 pub use coordinator::{
-    BeginOptions, Branch, BranchKind, CommitOutcome, Intent, Point, ShardRef, StmtMark,
-    TxnCoordinator, TxnHooks, TxnMode,
+    BeginOptions, Branch, BranchKind, CommitOutcome, Intent, Interrupted, Point, ShardRef,
+    StmtMark, TxnCoordinator, TxnHooks, TxnMode,
 };
 pub use decision::{Decision, DecisionRow};
 pub use locate::{GroupSchemas, MapLocator};

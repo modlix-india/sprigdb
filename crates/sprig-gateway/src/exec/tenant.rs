@@ -2600,6 +2600,8 @@ impl PassSession {
         let (lex, ignore_space) = self.lex_opts();
         let charset = cx.proto.collation;
         let client_text = sql.clone();
+        // AI functions run only in plain statements.
+        super::ai_fn::refuse_prepared(&sql, &lex)?;
         // `MATCH ... AGAINST (?)` on a search
         // index is prepared for its metadata without the call, and run as
         // text with the bound values at each execute.

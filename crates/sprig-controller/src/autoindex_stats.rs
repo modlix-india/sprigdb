@@ -14,6 +14,7 @@
 //! validation's statistics back.
 
 use std::fmt;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use sprig_advisor::autoindex::validate::journal::{StatsEntry, StatsJournal};
@@ -42,7 +43,7 @@ fn segment(name: &str) -> String {
         if b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'$' | b'-') {
             out.push(char::from(b));
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            let _ = write!(out, "%{b:02X}");
         }
     }
     if out.is_empty() {

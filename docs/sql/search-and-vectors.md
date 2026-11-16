@@ -335,7 +335,7 @@ The clause goes in a column definition of `CREATE TABLE`, in `ALTER TABLE ... AD
 | Part | Meaning |
 |---|---|
 | `VECTOR(dimensions)` | Must be the model's dimensions: 384 for `local:bge-small`. The column is `NULL` until filled; `NOT NULL` and `DEFAULT` aren't allowed. |
-| `source_expression` | Any expression MariaDB accepts in a generated column: deterministic, over the row's own columns, for example `CONCAT_WS(' ', name, description)`. A `NULL` or blank value makes the vector `NULL`. |
+| `source_expression` | An expression over the row's own columns that MariaDB accepts in a generated column, for example `CONCAT_WS(' ', name, description)`. Functions whose value isn't the row's (`RAND()`, `NOW()`, `UUID()`, `USER()`, …), variables and subqueries are refused (39997). A `NULL` or blank value makes the vector `NULL`. |
 | `USING MODEL` | An alias from `ai.embedding_models`. `local:bge-small` is the bundled model; it runs in SprigDB, so no row leaves it. |
 | `ON CHANGE ASYNC` | The default: a worker fills the column after the write commits. `SYNC` isn't available yet. |
 | `max_input_tokens` | Embed at most this many tokens of the source (1 to 512 for the bundled model). |
@@ -362,7 +362,7 @@ Rules:
 - A column the source uses can't be dropped while the embedded column exists (MariaDB's 1054, `in 'GENERATED ALWAYS AS'`).
 - `SHOW CREATE TABLE` prints the clause. The column's bookkeeping lives in hidden columns that clients don't see.
 
-Errors: 39997 `ER_SPRIG_EMBEDDING_FAILED` for an unknown model alias, a dimension that isn't the model's, `ON CHANGE SYNC`, a provider's model (not available yet), a missing primary key, a column name that is too long, or a change the column refuses; 39050 for a statement declaring an embedded column that also names a reserved (`_sprig_`) column.
+Errors: 39997 `ER_SPRIG_EMBEDDING_FAILED` for a source that isn't a function of the row, an unknown model alias, a dimension that isn't the model's, `ON CHANGE SYNC`, a provider's model (not available yet), a missing primary key, a column name that is too long, or a change the column refuses; 39050 for a statement declaring an embedded column that also names a reserved (`_sprig_`) column.
 
 ### Distance functions
 

@@ -175,9 +175,12 @@ A new model, source or token limit starts a re-embedding into a new generation o
 - Change the column with `CHANGE`, `MODIFY` (without the clause), `RENAME COLUMN` or `ALTER COLUMN`: drop it and add it again, or change its model or source as above (39997).
 - Drop a column the source uses while the embedded column exists: MariaDB refuses it (1054).
 - Declare an embedded column on a table without a primary key, or in a temporary table (39997).
+- Embed something that isn't a function of the row, such as `RAND()`, `NOW()`, `USER()`, a variable or a subquery (39997).
 - Use a provider's embedding model or `ON CHANGE SYNC`: neither is available yet (39997).
 
 Writing to the column yourself is allowed, but the next change to the row's source replaces what you wrote.
+
+The column is a visible column like any other, so an `INSERT` without a column list must give it a value: name your columns, or give `NULL` for it.
 
 ### Settings and metrics
 

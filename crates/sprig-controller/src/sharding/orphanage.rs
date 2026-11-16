@@ -30,6 +30,7 @@
 //! keep waiting (readable, never joined with their parent) and the flag
 //! stays present.
 
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use mysql_async::prelude::Queryable as _;
@@ -100,7 +101,7 @@ fn sql_value(v: &[u8], numeric: bool) -> Option<String> {
     let mut out = String::with_capacity(v.len() * 2 + 3);
     out.push_str("X'");
     for b in v {
-        out.push_str(&format!("{b:02X}"));
+        let _ = write!(out, "{b:02X}");
     }
     out.push('\'');
     Some(out)
@@ -154,8 +155,6 @@ impl ShardingLoop {
     }
 
     async fn orphanage_keys(&self, tenant: TenantId, home: &ClusterId) -> Result<Vec<Key>> {
-        let cat = quote(&SchemaName::catalog(tenant).to_string());
-        let mut c = self.conn(home).await?;
         type Row = (
             u64,
             String,
@@ -167,6 +166,8 @@ impl ShardingLoop {
             String,
             String,
         );
+        let cat = quote(&SchemaName::catalog(tenant).to_string());
+        let mut c = self.conn(home).await?;
         let rows: Vec<Row> = c
             .exec(
                 format!(

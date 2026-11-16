@@ -328,12 +328,30 @@ async fn the_bundled_model_needs_no_sharing_and_sends_nothing() {
     assert_eq!(*env.embedded.lock().unwrap(), ["red shoes"]);
     assert!(env.provider.requests().is_empty());
     assert!(env.cache.is_empty(), "local answers aren't cached");
-    // A model that isn't offered for embeddings.
+    // An alias ai.embedding_models doesn't list: 39997.
     let call = Call::from_args(AiFn::Embed, &inputs(&[Some("openai/x")]), &[]).unwrap();
     let e = evaluate(&env, &s, &call, &inputs(&[Some("a")]))
         .await
         .unwrap_err();
+    assert_eq!(e.protocol().mysql_errno, 39997);
+    // A provider's embedding model it lists: not run by AI_EMBED yet (39990).
+    s.embedding_models = r#"{"local:bge-small":{"provider":"local","model":"BAAI/bge-small-en-v1.5","dimensions":384},
+        "small3":{"provider":"openai","model":"text-embedding-3-small","dimensions":1536},
+        "mine":{"provider":"local","model":"BAAI/bge-small-en-v1.5","dimensions":384}}"#
+        .into();
+    assert!(s.known_models(AiFn::Embed).contains(&"small3".to_owned()));
+    let call = Call::from_args(AiFn::Embed, &inputs(&[Some("small3")]), &[]).unwrap();
+    let e = evaluate(&env, &s, &call, &inputs(&[Some("a")]))
+        .await
+        .unwrap_err();
     assert_eq!(e.protocol().mysql_errno, 39990);
+    // Another alias of the bundled model works.
+    let call = Call::from_args(AiFn::Embed, &inputs(&[Some("mine")]), &[]).unwrap();
+    assert!(
+        evaluate(&env, &s, &call, &inputs(&[Some("a")]))
+            .await
+            .is_ok()
+    );
     // Bytes as MariaDB stores a VECTOR.
     let b = vector_bytes(&[1.0, 2.0]);
     assert_eq!(b, [0, 0, 0x80, 0x3f, 0, 0, 0, 0x40]);

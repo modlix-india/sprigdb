@@ -264,6 +264,53 @@ pub struct TxnCoordinator<B: TxnBackend> {
     /// `txn.phase2_wait_ms`: settled before the session
     /// next uses their cluster.
     stragglers: Vec<Straggler<B::Conn>>,
+    /// How far a `COMMIT` got, while it runs. Still set when its future
+    /// was dropped (the client went away, or `KILL QUERY`): the next call
+    /// finishes that commit first ([`Self::finish_interrupted`]).
+    committing: Option<Committing>,
+    /// Phase 2's branches while it runs, kept here so a dropped `COMMIT`
+    /// doesn't drop them: they become stragglers.
+    phase2_run: Option<Phase2Run<B::Conn>>,
+}
+
+/// The step a `COMMIT` reached, for finishing it when its future was
+/// dropped. A dropped future must never let the rollback that follows
+/// (the session closing) undo a branch after the commit point.
+#[derive(Debug, Clone, Copy)]
+enum Committing {
+    /// Before the last resource's commit was sent: the outcome is abort.
+    /// Branches phase 1 reached may be prepared.
+    Preparing,
+    /// The last resource's commit was sent and hasn't answered: decided by
+    /// the insert race at its anchor.
+    PointSent {
+        l: usize,
+        dtid: Dtid,
+        sent: tokio::time::Instant,
+    },
+    /// The commit point passed: every prepared branch commits.
+    Decided,
+}
+
+/// Phase 2 under way.
+struct Phase2Run<C> {
+    dtid: Option<Dtid>,
+    gtrid: Gtrid,
+    /// The mutex only keeps the coordinator `Sync` (reached through `&mut`).
+    running: Mutex<FuturesUnordered<Phase2Fut<C>>>,
+}
+
+/// How a commit cut short ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Interrupted {
+    /// No commit was cut short.
+    None,
+    /// It committed (the commit point had passed, or the race found it).
+    Committed,
+    /// It rolled back.
+    RolledBack,
+    /// Unknown: the prepared branches are left to the resolver.
+    Unknown,
 }
 
 /// A prepared branch's phase 2, still running after `COMMIT` answered.
@@ -372,6 +419,8 @@ impl<B: TxnBackend> TxnCoordinator<B> {
             best_effort: false,
             savepoints: Vec::new(),
             stragglers: Vec::new(),
+            committing: None,
+            phase2_run: None,
         }
     }
 
@@ -510,6 +559,11 @@ impl<B: TxnBackend> TxnCoordinator<B> {
         shard: &ShardRef,
         intent: Intent,
     ) -> Result<&mut Branch<B::Conn>> {
+        // A commit of this session cut short is finished before anything
+        // else runs.
+        if self.interrupted() {
+            Box::pin(self.finish_interrupted()).await;
+        }
         if let Some(i) = self.find(cluster) {
             if intent == Intent::Write {
                 self.note_write_at(i)?;
@@ -964,8 +1018,145 @@ impl<B: TxnBackend> TxnCoordinator<B> {
     /// # Errors
     /// None: failures leave prepared branches to the resolver.
     pub async fn rollback(&mut self) -> Result<()> {
+        if Box::pin(self.finish_interrupted()).await != Interrupted::None {
+            return Ok(());
+        }
         self.abort_all("client").await;
         Ok(())
+    }
+
+    /// Whether a `COMMIT` was cut short (its future dropped) and isn't
+    /// finished yet.
+    #[must_use]
+    pub fn interrupted(&self) -> bool {
+        self.committing.is_some() || self.phase2_run.is_some()
+    }
+
+    /// Finishes a `COMMIT` whose future was dropped: the client went away
+    /// or its statement was killed while it ran. The commit goes on from
+    /// the step it reached, as if it hadn't been cut short:
+    ///
+    /// - before the last resource's commit was sent, everything rolls back
+    ///   (branches phase 1 reached count as prepared);
+    /// - while that commit was under way, its old thread is killed and the
+    ///   insert race at its anchor decides; commit finishes phase 2, abort
+    ///   rolls back, and unknown leaves the prepared branches to the
+    ///   resolver;
+    /// - after the commit point, phase 2 commits every prepared branch.
+    ///
+    /// Phase 2 branches already running carry on as stragglers. Never
+    /// rolls back a branch of a transaction whose decision is commit.
+    pub async fn finish_interrupted(&mut self) -> Interrupted {
+        if let Some(run) = self.phase2_run.take() {
+            let running = run
+                .running
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner);
+            for f in running {
+                self.stragglers.push(Straggler {
+                    cluster: f.cluster.clone(),
+                    dtid: run.dtid,
+                    gtrid: run.gtrid,
+                    state: StragglerState::Running(Mutex::new(f)),
+                });
+            }
+            tracing::info!(dtid = ?run.dtid, "a distributed commit was cut short in phase 2; its branches finish as stragglers");
+        }
+        let Some(step) = self.committing else {
+            return Interrupted::None;
+        };
+        let label = match step {
+            Committing::Preparing => "prepare",
+            Committing::PointSent { .. } => "commit_point",
+            Committing::Decided => "decided",
+        };
+        tracing::info!(dtid = ?self.dtid, step = label, "finishing a distributed commit that was cut short");
+        let ended = match step {
+            Committing::Preparing => {
+                self.abort_prepared("client_gone").await;
+                Interrupted::RolledBack
+            }
+            Committing::PointSent { l, dtid, sent } => {
+                if let Some(b) = self.branches.get_mut(l) {
+                    b.phase = XaPhase::Done;
+                }
+                match self.resolve_unknown(l, dtid, sent).await {
+                    Some(Decision::Commit) => {
+                        self.committing = Some(Committing::Decided);
+                        self.complete_decided().await;
+                        Interrupted::Committed
+                    }
+                    Some(_) => {
+                        self.committing = Some(Committing::Preparing);
+                        self.abort_prepared("resolver").await;
+                        Interrupted::RolledBack
+                    }
+                    None => {
+                        metrics::counter!("sprig_txn_unknown_outcomes_total").increment(1);
+                        // Prepared branches stay for the resolver.
+                        self.reset();
+                        Interrupted::Unknown
+                    }
+                }
+            }
+            Committing::Decided => {
+                self.complete_decided().await;
+                Interrupted::Committed
+            }
+        };
+        self.hook(Point::Finished).await;
+        ended
+    }
+
+    /// Rolls back after a commit cut short before its commit point: the
+    /// writers phase 1 may have reached are treated as prepared, so a held
+    /// branch's redo rows go and a prepared XA branch is rolled back.
+    async fn abort_prepared(&mut self, reason: &'static str) {
+        let l = self.last_resource.unwrap_or(0);
+        for (i, b) in self.branches.iter_mut().enumerate() {
+            if i != l && b.wrote && b.phase == XaPhase::Active && b.kind != BranchKind::Local {
+                b.phase = XaPhase::Prepared;
+            }
+        }
+        self.abort_all(reason).await;
+    }
+
+    /// Finishes a commit whose commit point passed: best effort's other
+    /// writers commit, phase 2 commits the prepared branches, the rest end.
+    async fn complete_decided(&mut self) {
+        let restore = self.cfg.session_lock_wait_timeout_s;
+        if self.best_effort {
+            for b in &mut self.branches {
+                if b.wrote && b.phase == XaPhase::Active && b.kind != BranchKind::Xa {
+                    let _ = commit_one(b, restore).await;
+                }
+            }
+        }
+        let prepared: Vec<usize> = (0..self.branches.len())
+            .filter(|&i| self.branches[i].phase == XaPhase::Prepared)
+            .collect();
+        let _ = self.phase2(&prepared).await;
+        let left = std::mem::take(&mut self.branches);
+        for mut b in left {
+            end_branch(&mut b, false, restore).await;
+        }
+        self.reset();
+    }
+
+    /// Ends the session's transaction state when its session closes: a
+    /// commit cut short is finished, an open transaction rolls back, and
+    /// phase 2 stragglers are waited for (at most
+    /// `txn.commit_resolve_timeout_ms` each), so their branches aren't
+    /// dropped half way.
+    pub async fn close(&mut self) {
+        let _ = self.rollback().await;
+        let mut clusters: Vec<ClusterId> =
+            self.stragglers.iter().map(|s| s.cluster.clone()).collect();
+        clusters.sort();
+        clusters.dedup();
+        for c in clusters {
+            let _ = self.settle(&c).await;
+        }
     }
 
     /// Rolls back every branch and ends the transaction. Prepared branches
@@ -994,6 +1185,7 @@ impl<B: TxnBackend> TxnCoordinator<B> {
     }
 
     fn reset(&mut self) {
+        self.committing = None;
         self.branches.clear();
         self.explicit = None;
         self.dtid = None;
@@ -1013,6 +1205,28 @@ impl<B: TxnBackend> TxnCoordinator<B> {
     /// (best effort committed only some clusters), or the last resource's
     /// error.
     pub async fn commit(&mut self) -> Result<CommitOutcome> {
+        // A `COMMIT` cut short, then sent again: the first one's outcome.
+        match Box::pin(self.finish_interrupted()).await {
+            Interrupted::None => {}
+            Interrupted::Committed => {
+                return Ok(CommitOutcome {
+                    mode: TxnMode::Sprig2pc,
+                    dtid: None,
+                    stragglers: self.stragglers.len(),
+                });
+            }
+            Interrupted::RolledBack => {
+                return Err(dtx_rolled_back(
+                    "its commit was cut short before the commit point",
+                ));
+            }
+            Interrupted::Unknown => {
+                return Err(SprigError::new(
+                    SprigCode::CommitOutcomeUnknown,
+                    "the outcome of the distributed commit is unknown",
+                ));
+            }
+        }
         let started = tokio::time::Instant::now();
         let r = self.commit_inner().await;
         self.reset();
@@ -1087,6 +1301,8 @@ impl<B: TxnBackend> TxnCoordinator<B> {
             // Nothing to prepare, so no decision to record.
             return self.commit_best_effort(&writers).await;
         }
+        // From here a dropped future is finished by the next call.
+        self.committing = Some(Committing::Preparing);
         self.end_readers(|i| i != l).await;
         self.hook(Point::BeforePrepare).await;
         let dtid = self.dtid.expect("XA and held branches have a dtid");
@@ -1217,25 +1433,33 @@ impl<B: TxnBackend> TxnCoordinator<B> {
         // `txn.commit_resolve_timeout_ms` after it (kept below min_age)
         // can't meet a deleted row and record a false abort.
         let sent = tokio::time::Instant::now();
+        self.committing = Some(Committing::PointSent { l, dtid, sent });
         let res = lb.conn.control(&ctl).await;
         let decided = match res {
             Ok(()) => {
                 lb.phase = XaPhase::Done;
+                self.committing = Some(Committing::Decided);
                 true
             }
             Err(e) if e.errno == errno::DUP_ENTRY => {
+                self.committing = Some(Committing::Preparing);
                 self.abort_all("resolver").await;
                 return Err(dtx_rolled_back("the resolver aborted it"));
             }
             Err(e) if !e.is_lost() => {
+                self.committing = Some(Committing::Preparing);
                 self.abort_all("prepare_failed").await;
                 return Err(rollback_error_or_backend(&e));
             }
             Err(_) => {
                 lb.phase = XaPhase::Done;
                 match self.resolve_unknown(l, dtid, sent).await {
-                    Some(Decision::Commit) => true,
+                    Some(Decision::Commit) => {
+                        self.committing = Some(Committing::Decided);
+                        true
+                    }
                     Some(_) => {
+                        self.committing = Some(Committing::Preparing);
                         self.abort_all("resolver").await;
                         return Err(dtx_rolled_back("the last resource did not commit"));
                     }
@@ -1404,7 +1628,7 @@ impl<B: TxnBackend> TxnCoordinator<B> {
         let mut idx = prepared.to_vec();
         idx.sort_unstable();
         idx.dedup();
-        let mut running: FuturesUnordered<Phase2Fut<B::Conn>> = FuturesUnordered::new();
+        let running: FuturesUnordered<Phase2Fut<B::Conn>> = FuturesUnordered::new();
         for &i in idx.iter().rev() {
             let mut b = self.branches.remove(i);
             let admin = admin.clone();
@@ -1424,10 +1648,27 @@ impl<B: TxnBackend> TxnCoordinator<B> {
         // The removed branches shifted the others: nothing indexes them
         // after phase 2 but the reset that follows.
         self.last_resource = None;
+        // Kept in the coordinator, not on this future's stack: if the
+        // `COMMIT` is dropped now, these branches still finish.
+        self.phase2_run = Some(Phase2Run {
+            dtid,
+            gtrid,
+            running: Mutex::new(running),
+        });
         let deadline = tokio::time::Instant::now() + wait;
         let mut left = 0usize;
         loop {
-            match tokio::time::timeout_at(deadline, running.next()).await {
+            let next = {
+                let Some(run) = self.phase2_run.as_mut() else {
+                    break;
+                };
+                let running = run
+                    .running
+                    .get_mut()
+                    .unwrap_or_else(PoisonError::into_inner);
+                tokio::time::timeout_at(deadline, running.next()).await
+            };
+            match next {
                 Ok(Some((true, _done))) => {}
                 Ok(Some((false, b))) => {
                     left += 1;
@@ -1440,6 +1681,13 @@ impl<B: TxnBackend> TxnCoordinator<B> {
                 }
                 Ok(None) => break,
                 Err(_) => {
+                    let Some(run) = self.phase2_run.take() else {
+                        break;
+                    };
+                    let running = run
+                        .running
+                        .into_inner()
+                        .unwrap_or_else(PoisonError::into_inner);
                     for f in running {
                         left += 1;
                         self.stragglers.push(Straggler {
@@ -1453,6 +1701,7 @@ impl<B: TxnBackend> TxnCoordinator<B> {
                 }
             }
         }
+        self.phase2_run = None;
         if left > 0 {
             // The client gets OK before these branches commit; the session
             // settles them before it reads their clusters again. Other

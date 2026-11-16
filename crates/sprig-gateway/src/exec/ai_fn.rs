@@ -219,6 +219,20 @@ fn prepared_refused() -> SprigError {
     )
 }
 
+/// 39051 when `sql`, being prepared, calls an AI function.
+///
+/// # Errors
+/// 39051.
+pub(super) fn refuse_prepared(sql: &[u8], lex: &sprig_sql::lex::LexOptions) -> Result<()> {
+    if ai_fn::mentions(sql)
+        && ai_fn::analyze(sql, lex)
+            .is_some_and(|p| p.is_err() || p.is_ok_and(|p| !p.calls.is_empty()))
+    {
+        return Err(prepared_refused());
+    }
+    Ok(())
+}
+
 impl PassSession {
     /// Answers a statement calling AI functions; `None` for any other.
     #[allow(clippy::too_many_lines)] // constants, then columns

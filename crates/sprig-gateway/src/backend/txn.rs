@@ -34,6 +34,10 @@ pub(crate) struct Recording {
     /// The next binary-protocol statement with its bound values written
     /// in: recorded like a text statement.
     pub(super) bound: Option<String>,
+    /// The coordinator's own statement is running: nothing is recorded.
+    /// Still set after that statement was cut short (its future dropped),
+    /// which makes the record unusable.
+    paused: bool,
 }
 
 fn first_word(sql: &[u8]) -> String {
@@ -49,6 +53,9 @@ impl Recording {
     /// Before a text statement.
     pub(super) fn before(&mut self, info: &StmtInfo, sql: &[u8]) {
         self.pending = None;
+        if self.paused {
+            return;
+        }
         let w = first_word(sql);
         if matches!(w.as_str(), "INSERT" | "UPDATE" | "DELETE" | "REPLACE") {
             let text = String::from_utf8_lossy(sql).into_owned();
@@ -69,6 +76,9 @@ impl Recording {
     /// Before a binary-protocol statement.
     pub(super) fn before_binary(&mut self, info: &StmtInfo, sql: &[u8]) {
         self.pending = None;
+        if self.paused {
+            return;
+        }
         if let Some(text) = self.bound.take() {
             // The values are written in: the same rules as a text write.
             self.before(info, text.as_bytes());
@@ -170,8 +180,12 @@ impl BranchConn for BackendSession {
             // wait, savepoints, the redo marker) aren't the branch's writes:
             // the record pauses for them (found by the gateway's live test
             // of Sprig 2PC: a recorded `SET timestamp` made every held
-            // branch unreplayable).
-            let rec = self.redo.take();
+            // branch unreplayable). The record stays in place, paused: if
+            // this call is cut short, the pause stays and the record is
+            // refused at prepare rather than missing statements.
+            if let Some(r) = self.redo.as_mut() {
+                r.paused = true;
+            }
             self.txn_ctl = Some(settings);
             let ran = async {
                 self.query(&info, sql.as_bytes())
@@ -188,8 +202,8 @@ impl BranchConn for BackendSession {
             }
             .await;
             self.txn_ctl = None;
-            if self.redo.is_none() {
-                self.redo = rec;
+            if let Some(r) = self.redo.as_mut() {
+                r.paused = false;
             }
             if let Some(e) = ran? {
                 return Err(e);
@@ -230,6 +244,9 @@ impl BranchConn for BackendSession {
         let Some(r) = self.redo.take() else {
             return Ok(Vec::new());
         };
+        if r.paused && r.unsafe_why.is_none() {
+            return Err("a statement of the coordinator's on this branch was cut short".to_owned());
+        }
         match r.unsafe_why {
             Some(why) => Err(why),
             None => Ok(r.stmts),
@@ -287,6 +304,19 @@ mod tests {
         // Lowered again inside a transaction: a change, not a put-back.
         let (_, set, _) = ctl_statement(&[Ctl::LockWaitTimeout(5)], &pins);
         assert_eq!(set, vec![(TxnSetting::LockWait, true)]);
+    }
+
+    #[test]
+    fn a_paused_record_records_nothing() {
+        let mut r = Recording::default();
+        let sql = b"UPDATE acct SET bal = bal - 1 WHERE id = 1";
+        let info = StmtInfo::classify(sql);
+        r.paused = true;
+        r.before(&info, sql);
+        assert_eq!(r.pending, None, "a coordinator statement isn't recorded");
+        r.paused = false;
+        r.before(&info, sql);
+        assert!(r.pending.is_some());
     }
 
     #[test]

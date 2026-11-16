@@ -304,7 +304,7 @@ impl PassSession {
     }
 
     /// The model a clause names, checked.
-    fn model_for(&self, svc: &TenantServices, cat: &TenantCatalog, c: &Clause) -> Result<ModelRef> {
+    fn model_for(svc: &TenantServices, cat: &TenantCatalog, c: &Clause) -> Result<ModelRef> {
         embedcol::check_column_name(&c.column).map_err(failed)?;
         if c.mode == Mode::Sync {
             return Err(failed(format!(
@@ -367,7 +367,7 @@ impl PassSession {
         };
         let mut models = Vec::with_capacity(clauses.len());
         for c in clauses {
-            models.push(self.model_for(&svc, &cat, c)?);
+            models.push(Self::model_for(&svc, &cat, c)?);
         }
         if create {
             let upper = sql.to_ascii_uppercase();
@@ -486,7 +486,7 @@ impl PassSession {
                 .ok_or_else(|| SprigError::internal("no tenant"))?;
             ts.refresh().await?
         };
-        let m = self.model_for(&svc, &cat, c)?;
+        let m = Self::model_for(&svc, &cat, c)?;
         if e.state == State::Reembedding {
             return Err(failed(format!(
                 "embedded column {} is being re-embedded (generation {}); wait until it is ready",

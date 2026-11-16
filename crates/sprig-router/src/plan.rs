@@ -473,6 +473,7 @@ impl ViaLookup {
 /// every shard), then [`ViaParent::finish`] sends each row to its
 /// parent's shard with the parent's routing hash in `_sprig_rk`.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // independent facts about one insert
 pub struct ViaParent {
     /// The `INSERT`, its column list filled in when `_sprig_rk` is added.
     pub stmt: sqlparser::ast::Statement,

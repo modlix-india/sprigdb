@@ -342,8 +342,13 @@ impl Column {
     }
 
     fn schema(&self, tenant: TenantId, s: &ShardLoc) -> String {
-        SchemaName::shard(tenant, DbId(self.row.db_id), GroupId(s.group), ShardId(s.shard))
-            .to_string()
+        SchemaName::shard(
+            tenant,
+            DbId(self.row.db_id),
+            GroupId(s.group),
+            ShardId(s.shard),
+        )
+        .to_string()
     }
 
     fn table_ref(&self, tenant: TenantId, s: &ShardLoc) -> String {
@@ -440,7 +445,10 @@ impl Job<'_> {
                 .map_err(backend)?;
             for s in schemas {
                 let Ok(SchemaName::Shard {
-                    tenant, db, group, shard,
+                    tenant,
+                    db,
+                    group,
+                    shard,
                 }) = s.parse::<SchemaName>()
                 else {
                     continue;
@@ -691,7 +699,9 @@ impl Job<'_> {
         let shards = self.shards().await?;
         let Some((s, _)) = shards
             .iter()
-            .find(|(s, _)| self.progress.get(&self.col.schema(self.tenant, s)) != Some(&json!("done")))
+            .find(|(s, _)| {
+                self.progress.get(&self.col.schema(self.tenant, s)) != Some(&json!("done"))
+            })
             .cloned()
         else {
             return Ok(true);
@@ -742,9 +752,10 @@ impl Job<'_> {
         let Some(p) = self.col.row.pending.clone() else {
             return Ok(true);
         };
-        let shadow = self.col.targets.get(1).cloned().ok_or_else(|| {
-            SprigError::internal("a re-embedding without its shadow generation")
-        })?;
+        let shadow =
+            self.col.targets.get(1).cloned().ok_or_else(|| {
+                SprigError::internal("a re-embedding without its shadow generation")
+            })?;
         let shards = self.shards().await?;
         let column = self.col.row.column.clone();
         // Fresh everywhere first.
@@ -817,7 +828,9 @@ impl Job<'_> {
             }
         }
         let (mut c, store, _) = self.catalog().await?;
-        store.finish_reembedding(&mut c, self.col.row.id, &p).await?;
+        store
+            .finish_reembedding(&mut c, self.col.row.id, &p)
+            .await?;
         metrics::cutovers("done");
         tracing::info!(tenant = %self.tenant, db = %self.col.db, table = %self.col.table, %column, generation = p.generation, model = %p.model.alias, "embedded column re-embedded: cutover done");
         Ok(true)
@@ -832,7 +845,11 @@ impl Job<'_> {
             .exec_first(
                 "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? \
                  AND TABLE_NAME = ? AND COLUMN_NAME = ?",
-                (self.col.schema(self.tenant, s), self.col.table.as_str(), column),
+                (
+                    self.col.schema(self.tenant, s),
+                    self.col.table.as_str(),
+                    column,
+                ),
             )
             .await
             .map_err(backend)?;
@@ -1061,7 +1078,9 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
                     backlog_set(&job_key, 0);
                     forget(env, tenant, name, id).await;
                     tracing::info!(%tenant, embedding = id, "embedded column or its table is gone; job ends");
-                    return Ok(json!({"stopped": "the column or its table is gone", "embedded": job.embedded}));
+                    return Ok(
+                        json!({"stopped": "the column or its table is gone", "embedded": job.embedded}),
+                    );
                 }
                 Ok(Some(c)) => {
                     let new_gen = c.row.generation != job.col.row.generation
@@ -1079,7 +1098,9 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
                     }
                     job.col = c;
                 }
-                Err(e) => tracing::warn!(%tenant, embedding = id, error = %e, "embedded column row unreadable"),
+                Err(e) => {
+                    tracing::warn!(%tenant, embedding = id, error = %e, "embedded column row unreadable")
+                }
             }
             job.live
                 .set_rate(settings.tenant_get(tenant, &embedding::ROWS_PER_S));

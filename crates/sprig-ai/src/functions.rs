@@ -497,6 +497,8 @@ pub struct FnSettings {
     pub max_output_tokens: u32,
     /// `ai.functions.max_inputs`.
     pub max_inputs: u64,
+    /// `ai.embedding_models`: the embedding model aliases, as JSON.
+    pub embedding_models: String,
 }
 
 impl FnSettings {
@@ -534,6 +536,7 @@ impl FnSettings {
             },
             max_output_tokens: u32::try_from(l.number(&MAX_OUTPUT_TOKENS)).unwrap_or(1024),
             max_inputs: l.number(&MAX_INPUTS),
+            embedding_models: l.text(&crate::embedding::MODELS),
         }
     }
 
@@ -543,6 +546,10 @@ impl FnSettings {
         let mut m = Vec::new();
         if f == AiFn::Embed {
             m.push(LOCAL_MODEL.to_owned());
+            if let Ok(all) = crate::embedding::models(&self.embedding_models) {
+                m.extend(all.into_iter().map(|r| r.alias));
+            }
+            return m;
         } else if !self.model.is_empty() {
             m.push(self.model.clone());
         }
@@ -676,17 +683,31 @@ pub fn cache_key(call: &Call, model: &str, input: &str) -> [u8; 32] {
 pub fn model_of(call: &Call, s: &FnSettings) -> Result<String> {
     let f = call.f;
     match (&call.model, f) {
-        (None, AiFn::Embed) => Ok(LOCAL_MODEL.to_owned()),
+        (_, AiFn::Embed) => {
+            // An alias of `ai.embedding_models`; the bundled model's always works.
+            let alias = call.model.as_deref().unwrap_or(LOCAL_MODEL);
+            if alias == LOCAL_MODEL {
+                return Ok(LOCAL_MODEL.to_owned());
+            }
+            let m = crate::embedding::resolve(alias, &s.embedding_models)?;
+            if m.is_local() {
+                Ok(LOCAL_MODEL.to_owned())
+            } else {
+                Err(not_configured(
+                    f,
+                    format!(
+                        "{alias} is a provider's embedding model ({}/{}); AI_EMBED runs only the bundled model so far",
+                        m.provider, m.model
+                    ),
+                ))
+            }
+        }
         (None, _) if s.model.is_empty() => Err(not_configured(
             f,
             "ai.functions.model and ai.model.data are empty",
         )),
         (None, _) => Ok(s.model.clone()),
         (Some(m), _) if s.known_models(f).iter().any(|k| k == m) => Ok(m.clone()),
-        (Some(m), AiFn::Embed) => Err(not_configured(
-            f,
-            format!("{m} isn't an embedding model offered here; {LOCAL_MODEL} is"),
-        )),
         (Some(m), _) => Err(not_configured(
             f,
             format!("{m} isn't offered to AI functions (ai.functions.model, ai.functions.models)"),

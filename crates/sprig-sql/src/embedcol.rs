@@ -540,6 +540,11 @@ fn clause(t: &Toks<'_>, a: usize, b: usize, span: Range<usize>) -> Result<Clause
         return Err(format!("embedded column {column}: the source is empty"));
     }
     let source = t.text(j + 1, close - 1);
+    if let Some(why) = nondeterministic(t, j + 1, close) {
+        return Err(format!(
+            "embedded column {column}: the source must give the same text for the same row, and {why} doesn't"
+        ));
+    }
     j = close + 1;
     if !(t.word(j, "USING") && t.word(j + 1, "MODEL")) {
         return Err(format!(
@@ -607,6 +612,89 @@ fn clause(t: &Toks<'_>, a: usize, b: usize, span: Range<usize>) -> Result<Clause
         max_input_tokens,
         span,
     })
+}
+
+/// Functions whose value isn't a function of the row. MariaDB accepts
+/// them in a `VIRTUAL` column that has no index, so the clause refuses
+/// them itself.
+const NONDETERMINISTIC: &[&str] = &[
+    "RAND",
+    "UUID",
+    "UUID_SHORT",
+    "SYS_GUID",
+    "NOW",
+    "SYSDATE",
+    "CURDATE",
+    "CURTIME",
+    "CURRENT_DATE",
+    "CURRENT_TIME",
+    "CURRENT_TIMESTAMP",
+    "LOCALTIME",
+    "LOCALTIMESTAMP",
+    "UTC_DATE",
+    "UTC_TIME",
+    "UTC_TIMESTAMP",
+    "UNIX_TIMESTAMP",
+    "CONNECTION_ID",
+    "USER",
+    "CURRENT_USER",
+    "SESSION_USER",
+    "SYSTEM_USER",
+    "CURRENT_ROLE",
+    "DATABASE",
+    "SCHEMA",
+    "LAST_INSERT_ID",
+    "FOUND_ROWS",
+    "ROW_COUNT",
+    "SLEEP",
+    "BENCHMARK",
+    "GET_LOCK",
+    "RELEASE_LOCK",
+    "IS_FREE_LOCK",
+    "IS_USED_LOCK",
+    "NEXTVAL",
+    "LASTVAL",
+    "SETVAL",
+    "VERSION",
+    "LOAD_FILE",
+    "MASTER_POS_WAIT",
+    "SELECT",
+];
+
+/// The first part of tokens `[a, b)` whose value isn't a function of the
+/// row: a function of [`NONDETERMINISTIC`], `NEXT VALUE FOR`, a user or
+/// system variable, or a subquery.
+fn nondeterministic(t: &Toks<'_>, a: usize, b: usize) -> Option<String> {
+    for j in a..b {
+        let tk = t.t[j];
+        match tk.kind {
+            TokenKind::UserVar | TokenKind::SysVar => return Some(t.text(j, j)),
+            TokenKind::Word => {
+                let w = String::from_utf8_lossy(tk.bytes(t.sql)).to_ascii_uppercase();
+                if w == "NEXT" && t.word(j + 1, "VALUE") {
+                    return Some("NEXT VALUE FOR".into());
+                }
+                if NONDETERMINISTIC.contains(&w.as_str())
+                    && (t.punct(j + 1, b'(')
+                        || matches!(
+                            w.as_str(),
+                            "SELECT"
+                                | "CURRENT_DATE"
+                                | "CURRENT_TIME"
+                                | "CURRENT_TIMESTAMP"
+                                | "LOCALTIME"
+                                | "LOCALTIMESTAMP"
+                                | "CURRENT_USER"
+                                | "CURRENT_ROLE"
+                        ))
+                {
+                    return Some(w);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Finds embedding clauses in `CREATE TABLE` and `ALTER TABLE`, and the

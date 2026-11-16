@@ -46,7 +46,7 @@ Without it, any call fails with 39991 `ER_SPRIG_AI_DISABLED`. It is separate fro
 
 - **`AI_EMBED` with the bundled model** (`local:bge-small`, the default) runs inside the gateway. Nothing is sent anywhere, no budget is spent, and `ai.share_data` doesn't matter.
 - **Every other call goes to a provider**, so the values in it leave SprigDB. That needs `ai.share_data` on for every database the statement names, and for the session's database (the tenant's value when it names none). Otherwise the statement fails with 39995 `ER_SPRIG_AI_EGRESS_DENIED` before anything is sent.
-- **The model.** Without a model argument, `AI_CLASSIFY`, `AI_EXTRACT`, `AI_SUMMARIZE` and `AI_COMPLETE` use `ai.functions.model`, or `ai.model.data` when that is empty. A model argument (`'anthropic/claude-haiku-4-5'`) must be that model or one listed in `ai.functions.models`; operators set both. With no model at all, or one not offered, the call fails with 39990 `ER_SPRIG_AI_NOT_CONFIGURED`. For `AI_EMBED`, the model is `local:bge-small`.
+- **The model.** Without a model argument, `AI_CLASSIFY`, `AI_EXTRACT`, `AI_SUMMARIZE` and `AI_COMPLETE` use `ai.functions.model`, or `ai.model.data` when that is empty. A model argument (`'anthropic/claude-haiku-4-5'`) must be that model or one listed in `ai.functions.models`; operators set both. With no model at all, or one not offered, the call fails with 39990 `ER_SPRIG_AI_NOT_CONFIGURED`. For `AI_EMBED`, the model is an alias of `ai.embedding_models` (the same aliases as [embedded columns](../data-models/vectors.md)); `local:bge-small` is the default. Only aliases of the bundled model run in `AI_EMBED` so far: a provider's embedding model fails with 39990, and an alias that isn't listed with 39997 `ER_SPRIG_EMBEDDING_FAILED`.
 
 ## Where they can stand
 
@@ -106,7 +106,7 @@ One statement may send at most `ai.functions.max_inputs` distinct inputs (10,000
 | 39992 `ER_SPRIG_AI_BUDGET_EXCEEDED` | A daily budget is spent, or too many inputs |
 | 39993 `ER_SPRIG_AI_PROVIDER_ERROR` | The provider failed after retries (retryable) |
 | 39994 `ER_SPRIG_AI_REFUSED` | The model declined |
-| 39997 `ER_SPRIG_EMBEDDING_FAILED` | The bundled model couldn't be loaded on the gateway |
+| 39997 `ER_SPRIG_EMBEDDING_FAILED` | `AI_EMBED` names an alias `ai.embedding_models` doesn't list, or the bundled model couldn't be loaded on the gateway |
 | 1210, 1582, 1235 | Wrong arguments, a wrong count, or a call where it can't stand |
 
 ## Audit and metrics

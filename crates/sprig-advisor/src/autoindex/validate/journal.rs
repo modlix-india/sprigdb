@@ -354,7 +354,7 @@ pub(crate) async fn snapshot(
     r: &mut super::ValidationReport,
 ) -> Option<(StatsSnapshot, Option<StatsEntry>)> {
     match prepare(journal, node, t).await {
-        Ok(Some(note)) => r.node_check.ok(note),
+        Ok(Some(msg)) => r.node_check.ok(msg),
         Ok(None) => {}
         Err(why) => {
             r.node_check.ok(format!("{why}; ANALYZE skipped"));

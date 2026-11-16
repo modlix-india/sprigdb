@@ -281,12 +281,21 @@ impl RouterState {
                 bs.abandon(drain).await;
             }
         }
+        // A `COMMIT` cut short goes on from where it stopped: a rollback
+        // after its commit point would leave it half applied.
+        if let Some(c) = self.coord.as_mut()
+            && c.interrupted()
+        {
+            let _ = Box::pin(c.finish_interrupted()).await;
+        }
     }
 
-    /// Ends the session's router state: an open transaction rolls back.
+    /// Ends the session's router state: a commit cut short is finished,
+    /// an open transaction rolls back, and phase 2 stragglers are waited
+    /// for.
     pub(crate) async fn close(&mut self) {
         if let Some(c) = self.coord.as_mut() {
-            let _ = c.rollback().await;
+            Box::pin(c.close()).await;
         }
         for (_, mut bs) in self.others.drain() {
             bs.close().await;

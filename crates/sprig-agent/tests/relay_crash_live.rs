@@ -21,6 +21,17 @@
 //! - the balances still sum to the start;
 //! - no `__sprig_redo` statement row and no `pending` decision is left.
 //!
+//! The target `client` kills the client instead: the test's own workers
+//! stop, a child process (this test binary, `client_victim`) runs
+//! transfers until one pauses at the step, and the test `kill -9`s it.
+//! The gateway sees its client gone with the transaction stopped there.
+//! The child's transfers must be in both rows or in neither.
+//!
+//! `client_kills` (`R3W_CLIENT_KILLS=<n>`) kills such a child `n` times at
+//! random moments of a 32-session load, without pauses, then checks the
+//! same: every transfer in both rows or in neither, the balances, and no
+//! branch left in doubt.
+//!
 //! ```sh
 //! export R3W_SCRIPT=target/agent-r3wire/deploy/r3w.sh      # start|kill9 <proc>
 //! export R3W_GATEWAY=mysql://r3wire-t.app:sprig-dev-app@127.0.0.1:27306/bank
@@ -275,19 +286,34 @@ async fn transfers_survive_kill_9_at_each_step() {
     let seen: Arc<Mutex<BTreeMap<u64, (Seen, i64, i64)>>> = Arc::new(Mutex::new(BTreeMap::new()));
     let ok_since = Arc::new(Mutex::new(Instant::now()));
     let stop = Arc::new(AtomicBool::new(false));
+    // While a child client runs (target `client`), the workers wait.
+    let hold = Arc::new(AtomicBool::new(false));
+    let busy = Arc::new(AtomicU64::new(0));
+    let mut victims = 0usize;
     let mut workers = Vec::new();
     for w in 0..e.sessions {
-        let (gw, next, seen, stop, ok_since) = (
+        let (gw, next, seen, stop, ok_since, hold, busy) = (
             gw.clone(),
             Arc::clone(&next),
             Arc::clone(&seen),
             Arc::clone(&stop),
             Arc::clone(&ok_since),
+            Arc::clone(&hold),
+            Arc::clone(&busy),
         );
         let (a, b) = (a_ids.clone(), b_ids.clone());
         workers.push(tokio::spawn(async move {
             let mut x: u64 = 0x9e37_79b9_7f4a_7c15 ^ (w as u64 + 1);
             while !stop.load(Ordering::SeqCst) {
+                if hold.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                busy.fetch_add(1, Ordering::SeqCst);
+                if hold.load(Ordering::SeqCst) {
+                    busy.fetch_sub(1, Ordering::SeqCst);
+                    continue;
+                }
                 x ^= x << 13;
                 x ^= x >> 7;
                 x ^= x << 17;
@@ -301,12 +327,24 @@ async fn transfers_survive_kill_9_at_each_step() {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
                 seen.lock().await.insert(t, (s, from, to));
+                busy.fetch_sub(1, Ordering::SeqCst);
             }
         }));
     }
     let mut rounds = Vec::new();
     for rep in 0..e.repeat {
         for target in &e.targets {
+            if target == "client" {
+                let back = kill_a_client(&e, &hold, &busy, &ok_since, victims).await;
+                victims += 1;
+                println!("round {rep}/client: transfers commit again after {back:?}");
+                assert!(
+                    back.is_some(),
+                    "no transfer committed within 240 s after the client kill"
+                );
+                rounds.push((rep, target.clone(), back));
+                continue;
+            }
             // Wait for the next paused transaction (others pass at once).
             release_all(&e.pause_dir);
             let started = Instant::now();
@@ -477,6 +515,16 @@ async fn transfers_survive_kill_9_at_each_step() {
             }
         }
     }
+    // The killed clients' transfers: in both rows or in neither.
+    let v = victim_tags(&notes);
+    if victims > 0 {
+        println!(
+            "killed clients: {victims}, their transfers applied {}, half applied {}, doubled {}",
+            v.applied,
+            v.partial.len(),
+            v.doubled.len()
+        );
+    }
     // Tags in rows that no transfer of this run made.
     let mine: BTreeSet<String> = seen.keys().map(u64::to_string).collect();
     println!(
@@ -492,9 +540,314 @@ async fn transfers_survive_kill_9_at_each_step() {
     assert!(lost.is_empty(), "lost: {lost:?}");
     assert!(doubled.is_empty(), "applied twice: {doubled:?}");
     assert!(partial.is_empty(), "half applied: {partial:?}");
+    assert!(
+        v.partial.is_empty(),
+        "a killed client's transfer half applied: {:?}",
+        v.partial
+    );
+    assert!(
+        v.doubled.is_empty(),
+        "a killed client's transfer applied twice: {:?}",
+        v.doubled
+    );
     assert_eq!(failed_applied, 0, "a transfer reported failed was applied");
     assert_eq!(sum, sum0, "balances");
     assert_eq!(left, (0, 0), "in-doubt branches left");
+}
+
+/// Transfer ids of child clients start here; the workers' stay far below.
+const VICTIM_BASE: u64 = 10_000_000_000_000;
+
+/// The child clients' transfers as the rows show them.
+struct VictimTags {
+    applied: usize,
+    partial: Vec<u64>,
+    doubled: Vec<u64>,
+}
+
+/// Counts each child client's transfer id in the notes: a transfer is in
+/// one account on each cluster, so each id must appear twice or not at all.
+fn victim_tags(notes: &BTreeMap<i64, String>) -> VictimTags {
+    let mut count: BTreeMap<u64, usize> = BTreeMap::new();
+    for n in notes.values() {
+        for t in n.split(',').filter_map(|x| x.parse::<u64>().ok()) {
+            if t >= VICTIM_BASE {
+                *count.entry(t).or_default() += 1;
+            }
+        }
+    }
+    VictimTags {
+        applied: count.values().filter(|&&c| c == 2).count(),
+        partial: count
+            .iter()
+            .filter(|(_, c)| **c == 1)
+            .map(|(t, _)| *t)
+            .collect(),
+        doubled: count
+            .iter()
+            .filter(|(_, c)| **c > 2)
+            .map(|(t, _)| *t)
+            .collect(),
+    }
+}
+
+/// Starts a child client (this binary's `client_victim`) running
+/// `sessions` transfer loops from ids `base`; `spread` gives each session
+/// its own rows (the cost bench's pattern) instead of random ones.
+fn spawn_victim(base: u64, sessions: usize, spread: bool) -> std::process::Child {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "client_victim",
+            "--exact",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env("R3W_VICTIM", base.to_string())
+        .env("R3W_VICTIM_SESSIONS", sessions.to_string())
+        .env("R3W_VICTIM_SPREAD", if spread { "1" } else { "0" })
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("start the child client")
+}
+
+/// One `client` round: the workers wait, a child client runs until one of
+/// its transactions pauses at the gateway's step, and it is killed there.
+/// Returns how long until the workers' transfers committed again.
+async fn kill_a_client(
+    e: &Env,
+    hold: &AtomicBool,
+    busy: &AtomicU64,
+    ok_since: &Mutex<Instant>,
+    n: usize,
+) -> Option<Duration> {
+    hold.store(true, Ordering::SeqCst);
+    let started = Instant::now();
+    while busy.load(Ordering::SeqCst) > 0 && started.elapsed() < Duration::from_secs(60) {
+        release_all(&e.pause_dir);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    release_all(&e.pause_dir);
+    let mut child = spawn_victim(VICTIM_BASE + n as u64 * 100_000_000, 4, false);
+    let started = Instant::now();
+    let paused = loop {
+        if let Some(p) = pauses(&e.pause_dir).into_iter().next() {
+            break Some(p);
+        }
+        if started.elapsed() > Duration::from_secs(120) {
+            break None;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    let Some(paused) = paused else {
+        panic!(
+            "no transaction of the child client paused at {} within 120 s",
+            e.step
+        );
+    };
+    println!(
+        "round client {n}: {} paused at {}; client killed",
+        paused.display(),
+        e.step
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The gateway goes on with the stopped transactions.
+    for _ in 0..50 {
+        release_all(&e.pause_dir);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    hold.store(false, Ordering::SeqCst);
+    let at = Instant::now();
+    *ok_since.lock().await = at.checked_sub(Duration::from_secs(1)).unwrap();
+    let releaser = {
+        let dir = e.pause_dir.clone();
+        tokio::spawn(async move {
+            for _ in 0..150 {
+                release_all(&dir);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+    };
+    let back = loop {
+        if *ok_since.lock().await > at {
+            break Some(at.elapsed());
+        }
+        if at.elapsed() > Duration::from_secs(240) {
+            break None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let _ = releaser.await;
+    back
+}
+
+/// The child client: transfers from `R3W_VICTIM` on until it is killed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_victim() {
+    let (Ok(base), Some(e)) = (std::env::var("R3W_VICTIM"), env()) else {
+        eprintln!(
+            "relay_crash_live: R3W_VICTIM not set; skipped (a child client of the kill tests)"
+        );
+        return;
+    };
+    let base: u64 = base.parse().unwrap();
+    let sessions: usize = std::env::var("R3W_VICTIM_SESSIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+    let spread = std::env::var("R3W_VICTIM_SPREAD").is_ok_and(|s| s == "1");
+    let a = ids_of(&e.backends[0], &e.schemas[0]).await;
+    let b = ids_of(&e.backends[1], &e.schemas[1]).await;
+    let gw = pool(&e.gateway, sessions + 2);
+    let mut hs = Vec::new();
+    for w in 0..sessions {
+        let (gw, a, b) = (gw.clone(), a.clone(), b.clone());
+        hs.push(tokio::spawn(async move {
+            let mut x: u64 = 0x9e37_79b9_7f4a_7c15 ^ (w as u64 + 7);
+            for i in 0u64.. {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let (from, to) = if spread {
+                    let k = (w * 4 + (i % 4) as usize) % a.len().min(b.len());
+                    (a[k], b[k])
+                } else {
+                    let (f, t) = (a[(x % 20) as usize], b[((x >> 8) % 20) as usize]);
+                    if x & 1 == 0 { (f, t) } else { (t, f) }
+                };
+                let t = base + w as u64 * 1_000_000 + i;
+                if transfer(&gw, t, from, to).await != Seen::Committed {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }));
+    }
+    for h in hs {
+        let _ = h.await;
+    }
+}
+
+/// `R3W_CLIENT_KILLS=<n>`: a child client of `R3W_KILL_SESSIONS` (32)
+/// sessions transfers between the clusters, each session on its own rows,
+/// and is killed with `kill -9` after a random 1–4 s, `n` times. Then,
+/// once no branch is in doubt, every child transfer must be in both rows
+/// or in neither, and the balances must sum to the start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_kills() {
+    let (Ok(n), Some(e)) = (std::env::var("R3W_CLIENT_KILLS"), env()) else {
+        eprintln!("relay_crash_live: R3W_CLIENT_KILLS not set; skipped");
+        return;
+    };
+    let kills: usize = n.parse().unwrap();
+    let sessions: usize = std::env::var("R3W_KILL_SESSIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
+    let in_doubt = || async {
+        let mut left = (0u64, 0u64);
+        for (url, schema) in e.backends.iter().zip(&e.schemas) {
+            let mut c = backend(url).await;
+            let redo: Option<u64> = c
+                .query_first(format!(
+                    "SELECT COUNT(*) FROM `{schema}`.__sprig_redo WHERE seq < 9223372036854775808"
+                ))
+                .await
+                .unwrap_or(Some(0));
+            let pending: Option<u64> = c
+                .query_first(format!(
+                    "SELECT COUNT(*) FROM `{schema}`.__sprig_dtx WHERE outcome = 'pending'"
+                ))
+                .await
+                .unwrap_or(Some(0));
+            left.0 += redo.unwrap_or(0);
+            left.1 += pending.unwrap_or(0);
+            c.disconnect().await.unwrap();
+        }
+        left
+    };
+    let settle = || async {
+        let started = Instant::now();
+        loop {
+            let left = in_doubt().await;
+            if left == (0, 0) || started.elapsed() > Duration::from_secs(180) {
+                return (left, started.elapsed());
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    };
+    let (left, _) = settle().await;
+    assert_eq!(left, (0, 0), "branches in doubt before the run");
+    // A fresh start: the notes of earlier runs go.
+    let mut sum0 = 0i64;
+    for (url, schema) in e.backends.iter().zip(&e.schemas) {
+        let mut c = backend(url).await;
+        c.query_drop(format!(
+            "UPDATE `{schema}`.acct SET note = '' WHERE note <> ''"
+        ))
+        .await
+        .unwrap();
+        let s: Option<i64> = c
+            .query_first(format!("SELECT SUM(bal) FROM `{schema}`.acct"))
+            .await
+            .unwrap();
+        sum0 += s.unwrap_or(0);
+        c.disconnect().await.unwrap();
+    }
+    let run = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        % 1000)
+        * 1_000_000_000;
+    let mut x: u64 = 0x2545_f491_4f6c_dd1d ^ run;
+    for k in 0..kills {
+        while time_wait(&[]).0 > 1500 {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let mut child = spawn_victim(VICTIM_BASE + run + k as u64 * 100_000_000, sessions, true);
+        let ms = 1000 + x % 3000;
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        let _ = child.kill();
+        let _ = child.wait();
+        println!("kill {k}: child client killed after {ms} ms");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let (left, took) = settle().await;
+    let mut notes: BTreeMap<i64, String> = BTreeMap::new();
+    let mut sum = 0i64;
+    for (url, schema) in e.backends.iter().zip(&e.schemas) {
+        let mut c = backend(url).await;
+        let rows: Vec<(i64, i64, String)> = c
+            .query(format!("SELECT id, bal, note FROM `{schema}`.acct"))
+            .await
+            .unwrap();
+        for (id, bal, note) in rows {
+            sum += bal;
+            notes.insert(id, note);
+        }
+        c.disconnect().await.unwrap();
+    }
+    let v = victim_tags(&notes);
+    println!(
+        "CLIENT-KILLS kills={kills} sessions={sessions} applied={} half_applied={} doubled={} \
+         in_doubt_redo={} in_doubt_pending={} recovered_in={took:?} sum={sum} start={sum0} lost={}",
+        v.applied,
+        v.partial.len(),
+        v.doubled.len(),
+        left.0,
+        left.1,
+        sum0 - sum
+    );
+    assert!(v.partial.is_empty(), "half applied: {:?}", v.partial);
+    assert!(v.doubled.is_empty(), "applied twice: {:?}", v.doubled);
+    assert_eq!(left, (0, 0), "in doubt after recovery");
+    assert_eq!(sum, sum0, "balances");
 }
 
 /// What a cost run measured.
