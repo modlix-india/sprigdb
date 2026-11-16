@@ -902,6 +902,12 @@ pub async fn handle(
         ("POST", crate::docs::http::PATH) => {
             return Ok(crate::docs::http::search(core, info, req).await);
         }
+        ("GET", p)
+            if p == crate::docs::http::PAGES
+                || p.starts_with(&format!("{}/", crate::docs::http::PAGES)) =>
+        {
+            return Ok(crate::docs::http::page(core, info, req).await);
+        }
         (m, p) if crate::http::retrieval::route(m, p).is_some() => {
             let Some((db, index)) = crate::http::retrieval::route(m, p) else {
                 return Err(req);

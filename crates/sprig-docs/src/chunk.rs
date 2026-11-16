@@ -375,6 +375,145 @@ pub fn chunk_page(page: &Page) -> Vec<PageChunk> {
     out
 }
 
+// ---- a page again ----
+
+/// The first sentence of `text`'s opening paragraph, as [`chunk_page`]
+/// repeats it in front of a long section's later pieces.
+fn lead_of(text: &str) -> Option<String> {
+    let first = text.split("\n\n").next()?;
+    let t = first.trim_start();
+    if fence(t).is_some() || t.starts_with('|') || heading(t).is_some() {
+        return None;
+    }
+    let blocks = [Block {
+        kind: Kind::Para,
+        lines: first.lines().map(str::to_owned).collect(),
+    }];
+    first_sentence(&blocks)
+}
+
+/// Updates `path` with the headings (`#` to `###`) written in `text`,
+/// outside code fences, as [`chunk_page`] reads them.
+fn follow_headings(path: &mut Vec<String>, text: &str) {
+    let mut open: Option<(char, usize)> = None;
+    for line in text.lines() {
+        if let Some((c, n)) = open {
+            let t = line.trim();
+            if t.chars().take_while(|&x| x == c).count() >= n && t.chars().all(|x| x == c) {
+                open = None;
+            }
+            continue;
+        }
+        if let Some(f) = fence(line) {
+            open = Some(f);
+            continue;
+        }
+        if let Some((level, h)) = heading(line).filter(|(l, _)| *l <= 3) {
+            path.truncate(level - 1);
+            path.push(h);
+        }
+    }
+}
+
+/// Joins the parts of a table [`chunk_page`] split between rows: a table
+/// that follows another, with only blank lines between, and starts with
+/// the same header and delimiter rows, continues it.
+fn join_split_tables(md: &str) -> String {
+    let lines: Vec<&str> = md.lines().collect();
+    let mut out: Vec<&str> = Vec::new();
+    let mut open: Option<(char, usize)> = None;
+    // The header and delimiter rows of the table the output ends with.
+    let mut table: Option<(&str, &str)> = None;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if let Some((c, n)) = open {
+            let t = line.trim();
+            if t.chars().take_while(|&x| x == c).count() >= n && t.chars().all(|x| x == c) {
+                open = None;
+            }
+            out.push(line);
+            i += 1;
+            continue;
+        }
+        if let Some(f) = fence(line) {
+            open = Some(f);
+            table = None;
+            out.push(line);
+            i += 1;
+            continue;
+        }
+        let is_row = |l: &str| l.trim_start().starts_with('|');
+        if is_row(line) {
+            let starts = out.last().is_none_or(|l| !is_row(l));
+            if starts {
+                let head = (line, lines.get(i + 1).copied().unwrap_or(""));
+                let blank_between = out.last().is_some_and(|l| l.trim().is_empty());
+                if blank_between && table == Some(head) {
+                    while out.last().is_some_and(|l| l.trim().is_empty()) {
+                        out.pop();
+                    }
+                    i += 2;
+                    continue;
+                }
+                table = Some(head);
+            }
+        } else if !line.trim().is_empty() {
+            table = None;
+        }
+        out.push(line);
+        i += 1;
+    }
+    let mut s = out.join("\n");
+    s.push('\n');
+    s
+}
+
+/// A page's Markdown again from its chunks in page order, each given as
+/// its heading path (joined with [`PATH_SEP`]) and text: the heading lines
+/// that only the paths hold are written back (`#` for the title, `##` and
+/// `###` below), the first sentence a long section's later pieces repeat
+/// is dropped, and tables split between chunks are joined again. Front
+/// matter and HTML comment lines aren't kept.
+#[must_use]
+pub fn rebuild<'a>(chunks: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
+    let mut out = String::new();
+    // The headings in force where the text so far ends.
+    let mut cur: Vec<String> = Vec::new();
+    // The heading path of the chunk before, and the lead of its section.
+    let mut prev: Option<(&str, Option<String>)> = None;
+    for (path, text) in chunks {
+        let segs: Vec<&str> = path.split(PATH_SEP).collect();
+        let mut body = text;
+        match &prev {
+            Some((p, lead)) if *p == path => {
+                if let Some(l) = lead
+                    && let Some(rest) = body.strip_prefix(l.as_str())
+                    && let Some(rest) = rest.strip_prefix("\n\n")
+                {
+                    body = rest;
+                }
+            }
+            _ => {
+                let same = cur
+                    .iter()
+                    .zip(&segs)
+                    .take_while(|(a, b)| a.as_str() == **b)
+                    .count();
+                for (i, h) in segs.iter().enumerate().skip(same) {
+                    let _ = write!(out, "{} {h}\n\n", "#".repeat(i + 1));
+                }
+                cur = segs.iter().map(|x| (*x).to_owned()).collect();
+                prev = Some((path, lead_of(text)));
+            }
+        }
+        out.push_str(body.trim_end());
+        out.push_str("\n\n");
+        follow_headings(&mut cur, body);
+    }
+    join_split_tables(out.trim_end())
+}
+
 // ---- identifiers ----
 
 /// Last segments of dotted names that are file names, not settings.

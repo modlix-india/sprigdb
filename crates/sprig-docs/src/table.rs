@@ -10,6 +10,12 @@
 //!                      load time and state (loading → ready → retired)
 //! ```
 //!
+//! `seq` is the chunk's position in its page (from 1), the last column: it
+//! came with pack format 2, and [`ddl`] adds it to a table made before
+//! (`ADD COLUMN IF NOT EXISTS`), where the rows already there get 0. A
+//! page's chunks in `seq` order are its Markdown; 0 means the order is
+//! unknown.
+//!
 //! `terms` holds the chunk's exact identifiers (error codes and names,
 //! SQLSTATEs, setting keys), separated by spaces, so a full-text search on
 //! an identifier finds the chunks that name it even when the prose
@@ -54,11 +60,11 @@ pub fn qualified(table: &str) -> String {
     format!("`{SCHEMA}`.`{table}`")
 }
 
-/// The statements that create the schema and its tables; each is
-/// idempotent. Text columns compare case-insensitively, so full-text
-/// search ignores case.
+/// The statements that create the schema and its tables, then add `seq` to
+/// a `chunks` table made before it existed; each is idempotent. Text
+/// columns compare case-insensitively, so full-text search ignores case.
 #[must_use]
-pub fn ddl() -> [String; 3] {
+pub fn ddl() -> [String; 4] {
     [
         format!(
             "CREATE DATABASE IF NOT EXISTS `{SCHEMA}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
@@ -75,6 +81,7 @@ pub fn ddl() -> [String; 3] {
              tokens SMALLINT UNSIGNED NOT NULL, \
              terms TEXT NOT NULL, \
              embedding VECTOR({DIM}) NOT NULL, \
+             seq SMALLINT UNSIGNED NOT NULL DEFAULT 0, \
              PRIMARY KEY (version, chunk_id), \
              FULLTEXT KEY ft_text (text), \
              FULLTEXT KEY ft_text_heading (text, heading_path), \
@@ -93,19 +100,23 @@ pub fn ddl() -> [String; 3] {
              ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
             qualified(PACKS)
         ),
+        format!(
+            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS seq SMALLINT UNSIGNED NOT NULL DEFAULT 0",
+            qualified(CHUNKS)
+        ),
     ]
 }
 
 /// The columns of `chunks`, in the order [`Row`] binds them.
 pub const COLUMNS: &str =
-    "version, chunk_id, page, title, heading_path, audience, text, tokens, terms, embedding";
+    "version, chunk_id, page, title, heading_path, audience, text, tokens, terms, embedding, seq";
 
-/// A multi-row `INSERT` of `rows` rows, ten placeholders each. The
+/// A multi-row `INSERT` of `rows` rows, eleven placeholders each. The
 /// binary columns are cast, so a parameter sent as a string isn't read in
 /// the connection's character set.
 #[must_use]
 pub fn insert_sql(rows: usize) -> String {
-    let one = "(?, CAST(? AS BINARY), ?, ?, ?, ?, ?, ?, ?, CAST(? AS BINARY))";
+    let one = "(?, CAST(? AS BINARY), ?, ?, ?, ?, ?, ?, ?, CAST(? AS BINARY), ?)";
     let mut s = format!("INSERT INTO {} ({COLUMNS}) VALUES ", qualified(CHUNKS));
     for i in 0..rows {
         if i > 0 {
@@ -139,6 +150,8 @@ pub struct Row {
     pub terms: String,
     /// [`DIM`] little-endian `f32` values.
     pub embedding: Vec<u8>,
+    /// The position in the page, from 1; 0 when unknown.
+    pub seq: u16,
 }
 
 /// Why a chunk can't be a row.
@@ -227,6 +240,7 @@ impl Row {
             tokens: c.tokens,
             terms: c.terms.join(" "),
             embedding: vector_bytes(&c.embedding_f32()),
+            seq: c.seq,
         })
     }
 }
@@ -262,6 +276,7 @@ pub fn rows_digest<'a>(rows: impl IntoIterator<Item = &'a Row>) -> [u8; 32] {
         field(&r.tokens.to_le_bytes());
         field(r.terms.as_bytes());
         field(&r.embedding);
+        field(&r.seq.to_le_bytes());
     }
     h.finalize().into()
 }
@@ -318,6 +333,7 @@ mod tests {
             Box::new(|r| r[0].terms.clear()),
             Box::new(|r| r[0].embedding[5] ^= 1),
             Box::new(|r| r[0].title.push(' ')),
+            Box::new(|r| r[0].seq += 1),
             Box::new(|r| {
                 r.pop();
             }),
@@ -358,8 +374,10 @@ mod tests {
         assert!(d[1].contains("FULLTEXT KEY ft_text (text)"));
         assert!(d[1].contains("DISTANCE=cosine"));
         assert!(d[2].contains("ENUM('loading','ready','retired')"));
+        assert!(d[1].contains("seq SMALLINT UNSIGNED NOT NULL DEFAULT 0, PRIMARY KEY"));
+        assert!(d[3].starts_with("ALTER TABLE `__sprig_docs`.`chunks` ADD COLUMN IF NOT EXISTS seq"));
         let s = insert_sql(2);
-        assert_eq!(s.matches('?').count(), 20);
+        assert_eq!(s.matches('?').count(), 22);
         assert!(s.starts_with("INSERT INTO `__sprig_docs`.`chunks` (version, chunk_id"));
         assert_eq!(vector_text(&[1.0, -0.5]), "[1.0,-0.5]");
         assert_eq!(vector_bytes(&[1.0]), vec![0, 0, 0x80, 0x3f]);

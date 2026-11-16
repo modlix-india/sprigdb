@@ -176,6 +176,13 @@ fn docs_paths() -> Value {
             "Searches the product documentation of this release (any signed-in user): full-text and \
              embedding hits fused, at most two per page ({query, audience, limit, version})",
             Some("DocsSearchRequest"), "DocsSearchReply")},
+        "/v1/docs/pages/{page}": {"get": with_params(op("Docs.Page", "sprig.v1.Docs",
+            "One page of the product documentation of this release (any signed-in user), rebuilt \
+             from the docs pack: its chunks in page order and its Markdown. {page} is the page's path \
+             under docs/, slashes included (tools/studio.md)",
+            None, "DocsPage"),
+            &[json!({"name": "page", "in": "path", "required": true, "schema": {"type": "string"}}),
+              json!({"name": "version", "in": "query", "required": false, "schema": {"type": "string"}})])},
         "/v1/databases/{database}/retrieval/{index}:search": {"post": with_params(op(
             "Retrieval.Search", "sprig.v1.Retrieval",
             "Searches a retrieval index (CREATE RETRIEVAL INDEX) as RETRIEVE() does in SQL: full-text \
@@ -495,6 +502,13 @@ fn core_schemas() -> Value {
         "RetrievalSearchReply": s(json!({"database": string, "index": string,
             "hits": {"type": "array", "items": {"$ref": "#/components/schemas/RetrievalSearchHit"}}}),
             &["database", "index", "hits"]),
+        "DocsPageChunk": s(json!({"chunk_id": string, "heading_path": string, "text": string,
+            "seq": int}), &["chunk_id", "heading_path", "text", "seq"]),
+        "DocsPage": s(json!({"version": string, "page": string, "title": string,
+            "audience": {"type": "array", "items": string}, "ordered": {"type": "boolean"},
+            "markdown": string,
+            "chunks": {"type": "array", "items": {"$ref": "#/components/schemas/DocsPageChunk"}}}),
+            &["version", "page", "title", "audience", "ordered", "markdown", "chunks"]),
         "DocsSearchReply": s(json!({"version": string,
             "mode": {"type": "string", "enum": ["hybrid", "keyword"]},
             "hits": {"type": "array", "items": {"$ref": "#/components/schemas/DocsSearchHit"}}}),
@@ -531,7 +545,7 @@ fn ai_schemas() -> Value {
                 "reference": string}), &["kind", "title", "reference"])},
             "error": {"$ref": "#/components/schemas/Error"},
             "stop": {"type": "string", "enum": ["end_turn", "max_tokens", "refusal", "other"]},
-            "detail": string}), &["type"]),
+            "detail": string, "message_id": string}), &["type"]),
         "AiConversationHeader": s(json!({"id": string, "role": string, "title": string,
             "created_ms": int, "updated_ms": int}), &["id", "role", "title"]),
         "AiConversations": s(json!({"conversations": {"type": "array",

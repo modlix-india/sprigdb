@@ -7,8 +7,10 @@
 //! - [`sql`]: the read-only virtual database `sprig_docs` in SQL sessions:
 //!   `SELECT ... FROM sprig_docs.chunks ...` runs on the docs-reader
 //!   account; anything else that names `sprig_docs` is refused.
+//! - [`page`]: `GET /v1/docs/pages/{page}`: one page's chunks in page
+//!   order and its Markdown rebuilt from them, for Studio's Docs panel.
 //! - [`embed`]: the query embedding model, loaded on first use.
-//! - [`http`]: the REST handler.
+//! - [`http`]: the REST handlers.
 //!
 //! **Reads.** Every read goes through `sprig_docs_r`, the docs-reader
 //! account (`sprig_provision::docs_account`), which can `SELECT` from
@@ -21,6 +23,7 @@
 
 pub mod embed;
 pub mod http;
+pub mod page;
 pub mod search;
 pub mod sql;
 

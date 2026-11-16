@@ -115,6 +115,11 @@ impl DocsDb for Fake {
 
 /// A pack of `pages` pages for `version`, its bytes and the loader's form.
 fn pack(version: &str, pages: usize) -> (Vec<u8>, LoadedPack) {
+    pack_as(version, pages, sprig_docs::pack::FORMAT)
+}
+
+/// [`pack`] in pack format `format`.
+fn pack_as(version: &str, pages: usize, format: u16) -> (Vec<u8>, LoadedPack) {
     let pages: Vec<_> = (0..pages)
         .map(|i| {
             sprig_docs::page::parse_page(
@@ -140,7 +145,7 @@ fn pack(version: &str, pages: usize) -> (Vec<u8>, LoadedPack) {
         model_sha256: [1; 32],
         chunks,
     }
-    .to_bytes()
+    .to_bytes_as(format)
     .unwrap();
     let loaded = LoadedPack::from_bytes(&bytes).unwrap();
     (bytes, loaded)
@@ -158,6 +163,7 @@ fn row(i: usize, text_len: usize) -> Row {
         tokens: 1,
         terms: String::new(),
         embedding: vec![0; 4],
+        seq: 0,
     }
 }
 
@@ -199,6 +205,38 @@ async fn loads_then_trusts_then_verifies_again_at_start() {
     // A new process verifies the rows once, and finds them good.
     let r = sync_cluster(&mut db, &p, 2, false).await.unwrap();
     assert!(r.verified && !r.loaded && !r.tampered);
+}
+
+#[tokio::test]
+async fn rows_keep_their_place_and_older_packs_load_with_none() {
+    // Format 2: each page's chunks numbered from 1, in page order.
+    let (_, p) = pack("1.0.0", 3);
+    let mut seqs: BTreeMap<&str, Vec<u16>> = BTreeMap::new();
+    for r in &p.rows {
+        seqs.entry(r.page.as_str()).or_default().push(r.seq);
+    }
+    for (page, mut s) in seqs {
+        s.sort_unstable();
+        assert_eq!(s, (1..=u16::try_from(s.len()).unwrap()).collect::<Vec<_>>(), "{page}");
+    }
+    let fake = Fake::default();
+    let mut db = fake.clone();
+    sync_cluster(&mut db, &p, 2, false).await.unwrap();
+    assert!(fake.st().rows.values().all(|r| r.seq > 0));
+    // A position changed behind the loader's back is an edit: reloaded.
+    fake.st().rows.values_mut().next().unwrap().seq += 1;
+    let r = sync_cluster(&mut db, &p, 2, false).await.unwrap();
+    assert!(r.tampered && r.loaded, "{r:?}");
+    // Format 1: still loaded and verified, every row with seq 0.
+    let (_, old) = pack_as("0.9.0", 3, 1);
+    assert_eq!(old.rows.len(), p.rows.len());
+    assert!(old.rows.iter().all(|r| r.seq == 0));
+    let fake = Fake::default();
+    let mut db = fake.clone();
+    let r = sync_cluster(&mut db, &old, 2, false).await.unwrap();
+    assert!(r.loaded && r.verified, "{r:?}");
+    let r = sync_cluster(&mut db, &old, 2, false).await.unwrap();
+    assert!(r.verified && !r.loaded && !r.tampered, "{r:?}");
 }
 
 #[tokio::test]

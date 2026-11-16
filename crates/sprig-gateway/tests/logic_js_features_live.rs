@@ -651,7 +651,9 @@ $$"
         let mut r = Conn::from_url(root.as_str()).await.unwrap();
         let q = format!(
             "SELECT message FROM t{t}_sprig.logic_log WHERE level = 'info' \
-             AND message LIKE '%r7js event%' ORDER BY log_id"
+             AND message LIKE '%r7js event%' AND module_id = (SELECT module_id FROM \
+             t{t}_sprig.logic_modules WHERE name = 'on_event' AND state = 'active') \
+             ORDER BY log_id"
         );
         let deadline = Instant::now() + Duration::from_secs(30);
         let lines: Vec<String> = loop {
@@ -754,7 +756,9 @@ $$"
         let mut r = Conn::from_url(root.as_str()).await.unwrap();
         let q = format!(
             "SELECT message FROM t{t}_sprig.logic_log WHERE level = 'info' \
-             AND message LIKE '%ctrig c %' ORDER BY log_id"
+             AND message LIKE '%ctrig c %' AND module_id = (SELECT module_id FROM \
+             t{t}_sprig.logic_modules WHERE name = 'on_cevent' AND state = 'active') \
+             ORDER BY log_id"
         );
         let deadline = Instant::now() + Duration::from_secs(30);
         let lines: Vec<String> = loop {

@@ -362,6 +362,7 @@ fn docs_search_keeps_operator_pages() {
         tokens: 10,
         terms: Vec::new(),
         embedding: Vec::new(),
+        seq: 0,
     };
     let ix = DocsIndex::of(sprig_docs::pack::Pack {
         version: "0.9.0".into(),
