@@ -5,7 +5,9 @@
 //! cargo test -p sprig-gateway --test search_api_live -- --nocapture
 //! ```
 //!
-//! Login `acme.app` / `sprig-dev-app`. The test makes database
+//! Login `acme.app` / `sprig-dev-app`, once over TLS first (on a fresh
+//! deployment `caching_sha2_password` refuses a plain login before
+//! one). The test makes database
 //! `r5seven_api` with a table, its search index and a row-level security
 //! policy hiding some rows from the user, then checks:
 //!
@@ -86,6 +88,17 @@ async fn search_query_over_rest_and_grpc() {
     };
     let (mysql, http) = v.split_once(',').expect("mysql,http");
     let url = format!("mysql://{USER}:{PASSWORD}@{mysql}");
+    // `caching_sha2_password` refuses a login without TLS until the account
+    // has logged in once over TLS (its cache is empty on a fresh
+    // deployment): one TLS login first.
+    let warm = mysql_async::OptsBuilder::from_opts(mysql_async::Opts::from_url(&url).unwrap())
+        .ssl_opts(mysql_async::SslOpts::default().with_danger_accept_invalid_certs(true));
+    mysql_async::Conn::new(warm)
+        .await
+        .expect("a TLS login")
+        .disconnect()
+        .await
+        .unwrap();
     let pool = mysql_async::Pool::new(
         mysql_async::OptsBuilder::from_opts(mysql_async::Opts::from_url(&url).unwrap()).pool_opts(
             mysql_async::PoolOpts::default()

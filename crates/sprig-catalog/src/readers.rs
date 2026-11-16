@@ -489,7 +489,12 @@ mod tests {
         .unwrap();
         let key = dc.tier().key(&key_of("gateway", "g1")).unwrap();
         for _ in 0..100 {
-            if dc.get(&key, Consistency::Linearizable).await.unwrap().is_some() {
+            if dc
+                .get(&key, Consistency::Linearizable)
+                .await
+                .unwrap()
+                .is_some()
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -500,6 +505,11 @@ mod tests {
         assert_eq!(s.unregistered, vec!["worker w1 (dc dc-t)"]);
         stop.cancel();
         task.await.unwrap();
-        assert!(dc.get(&key, Consistency::Linearizable).await.unwrap().is_none());
+        assert!(
+            dc.get(&key, Consistency::Linearizable)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

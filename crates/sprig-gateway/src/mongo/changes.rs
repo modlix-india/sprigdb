@@ -41,9 +41,16 @@
 //!   through the gateway's shared reader ([`feed_parts`]), not a binlog
 //!   dump of its own.
 //!
-//! Not built: `startAtOperationTime` (the feed can't position by time yet),
-//! `shardCollection` events, and the k-way merge across clusters (a
-//! tenant lives on one cluster at a time).
+//! - **`startAtOperationTime`** (a cluster time `T`, `seconds << 32 |
+//!   increment` as the feed's HLC stamps): the tail starts where
+//!   `Changes.Watch`'s `start_at_hlc` does, at the feed time index's last
+//!   position 30 s or more before `T` on the tenant's cluster, and the
+//!   stream leaves out events stamped before `T`. Older than the index or
+//!   than the tenant's last move: 286; a cluster without an index (Galera):
+//!   39802; a tenant homed in another DC: 39662.
+//!
+//! Not built: `shardCollection` events, and the k-way merge across clusters
+//! (a tenant lives on one cluster at a time).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -866,7 +873,13 @@ impl ChangeFeed {
         resume: Option<&Bson>,
     ) -> std::result::Result<ChangeStream, MongoError> {
         let tenant = spec.tenant;
+        // `startAtOperationTime` comes as its timestamp ([`parse_stage`]).
+        let from = match resume {
+            Some(Bson::Timestamp(t)) => (u64::from(t.time) << 32) | u64::from(t.increment),
+            _ => 0,
+        };
         let start = match resume {
+            Some(Bson::Timestamp(_)) => self.start_at(tenant, from).await?,
             Some(v) => StartAt::After(parse_token(v, tenant)?),
             None => StartAt::Now,
         };
@@ -881,6 +894,13 @@ impl ChangeFeed {
                 .await
                 .map_err(|e| feed_error(&e))?
         {
+            if from != 0 {
+                return Err(MongoError::new(
+                    code::SPRIG_DOC_FEATURE_UNSUPPORTED,
+                    "startAtOperationTime for a tenant homed in another data center is not \
+                     supported yet; resume with a token",
+                ));
+            }
             let after = match &start {
                 StartAt::After(t) => Some(t.clone()),
                 _ => None,
@@ -892,6 +912,7 @@ impl ChangeFeed {
                 Tail::Relayed(rx),
                 spec,
                 first.unwrap_or(token),
+                0,
             ));
         }
         let tail = TenantTail::start(
@@ -930,16 +951,40 @@ impl ChangeFeed {
                 .to_hex()
             }
         };
-        Ok(Self::stream(Tail::Local(Box::new(tail)), spec, token))
+        Ok(Self::stream(Tail::Local(Box::new(tail)), spec, token, from))
     }
 
-    /// The stream over `tail`, its token starting at `token`.
-    fn stream(tail: Tail, spec: StreamSpec, token: String) -> ChangeStream {
+    /// Where a stream from cluster time `hlc` starts: the feed time
+    /// index's position before it on the tenant's cluster, as
+    /// `Changes.Watch`'s `start_at_hlc`.
+    ///
+    /// # Errors
+    /// 286 before the index or the tenant's last move; 39802 without an
+    /// index; 39662 without the tenant services (a test feed).
+    async fn start_at(
+        &self,
+        tenant: TenantId,
+        hlc: u64,
+    ) -> std::result::Result<StartAt, MongoError> {
+        let Some(svc) = &self.relay else {
+            return Err(MongoError::new(
+                code::SPRIG_DOC_FEATURE_UNSUPPORTED,
+                "startAtOperationTime needs the tenant services; resume with a token",
+            ));
+        };
+        crate::http::changes::start_at(svc, &self.placement, tenant, hlc)
+            .await
+            .map_err(|e| feed_error(&e))
+    }
+
+    /// The stream over `tail`, its token starting at `token`; events
+    /// stamped before `from` (`startAtOperationTime`) are left out.
+    fn stream(tail: Tail, spec: StreamSpec, token: String, from: u64) -> ChangeStream {
         let (tx, rx) = mpsc::channel(QUEUE);
         let stop = CancellationToken::new();
         let pipeline = spec.pipeline.clone();
         let policies = crate::tenant::rls::DocViews::fingerprint(spec.visibility.as_deref());
-        tokio::spawn(run(tail, spec, tx, stop.clone()));
+        tokio::spawn(run(tail, spec, tx, stop.clone(), from));
         metrics::gauge!("sprig_mongo_cursors_open", "kind" => "change_stream").increment(1.0);
         ChangeStream {
             rx,
@@ -952,7 +997,13 @@ impl ChangeFeed {
     }
 }
 
-async fn run(mut tail: Tail, spec: StreamSpec, tx: mpsc::Sender<Item>, stop: CancellationToken) {
+async fn run(
+    mut tail: Tail,
+    spec: StreamSpec,
+    tx: mpsc::Sender<Item>,
+    stop: CancellationToken,
+    from: u64,
+) {
     loop {
         // The tail is raced only against the stream's end, which drops it
         // for good (a resumed stream starts from the client's token), so a
@@ -964,6 +1015,9 @@ async fn run(mut tail: Tail, spec: StreamSpec, tx: mpsc::Sender<Item>, stop: Can
             i = tail.next() => i,
         };
         let out = match item {
+            // Before `startAtOperationTime`: the tail starts a little
+            // earlier (the time index's margin).
+            Ok(FeedItem::Event(e)) if e.hlc < from => Item::Progress(e.token.to_hex()),
             Ok(FeedItem::Event(e)) => match render(&spec, &e).await {
                 Ok(Some((d, false))) => Item::Event(Box::new(d), e.token.to_hex()),
                 Ok(Some((d, true))) => Item::Invalidate(Box::new(d), e.token.to_hex()),
@@ -1074,7 +1128,9 @@ impl ChangeStream {
 /// The options of a `$changeStream` stage.
 ///
 /// # Errors
-/// 9 for unknown options or values; 39662 for `startAtOperationTime`.
+/// 9 for unknown options or values; 40674 for `startAtOperationTime`
+/// with `resumeAfter` or `startAfter`. `startAtOperationTime` comes back
+/// as the resume value, a `Timestamp` (a token is a document).
 pub fn parse_stage(
     st: &Document,
 ) -> std::result::Result<(Images, Images, Option<Bson>, bool), MongoError> {
@@ -1082,6 +1138,7 @@ pub fn parse_stage(
     let mut before = Images::Off;
     let mut resume = None;
     let mut all = false;
+    let mut kinds = 0;
     for (k, v) in st {
         match k.as_str() {
             "fullDocument" => {
@@ -1111,14 +1168,21 @@ pub fn parse_stage(
                     }
                 };
             }
-            "resumeAfter" | "startAfter" => resume = Some(v.clone()),
+            "resumeAfter" | "startAfter" => {
+                kinds += 1;
+                resume = Some(v.clone());
+            }
             "allChangesForCluster" => all = v.as_bool().unwrap_or(false),
             "showExpandedEvents" | "allowToRunOnConfigDB" | "allowToRunOnSystemNS" => {}
             "startAtOperationTime" => {
-                return Err(MongoError::new(
-                    code::SPRIG_DOC_FEATURE_UNSUPPORTED,
-                    "startAtOperationTime is not supported in this release; resume with a token",
-                ));
+                let Bson::Timestamp(t) = v else {
+                    return Err(MongoError::new(
+                        code::TYPE_MISMATCH,
+                        "startAtOperationTime must be a timestamp",
+                    ));
+                };
+                kinds += 1;
+                resume = Some(Bson::Timestamp(*t));
             }
             other => {
                 return Err(MongoError::new(
@@ -1127,6 +1191,12 @@ pub fn parse_stage(
                 ));
             }
         }
+    }
+    if kinds > 1 {
+        return Err(MongoError::new(
+            40674,
+            "Only one type of resume option is allowed, but multiple were found.",
+        ));
     }
     Ok((full, before, resume, all))
 }
@@ -1190,11 +1260,30 @@ mod tests {
                 .unwrap();
         assert_eq!((f, b, all), (Images::On, Images::Off, false));
         assert!(r.is_some());
+        let (_, _, r, _) =
+            parse_stage(&doc! {"startAtOperationTime": Timestamp { time: 7, increment: 2 }})
+                .unwrap();
         assert_eq!(
-            parse_stage(&doc! {"startAtOperationTime": Timestamp { time: 1, increment: 0 }})
+            r,
+            Some(Bson::Timestamp(Timestamp {
+                time: 7,
+                increment: 2
+            }))
+        );
+        assert_eq!(
+            parse_stage(&doc! {"startAtOperationTime": 1})
                 .unwrap_err()
                 .code,
-            39662
+            code::TYPE_MISMATCH
+        );
+        assert_eq!(
+            parse_stage(
+                &doc! {"startAtOperationTime": Timestamp { time: 1, increment: 0 },
+                "resumeAfter": {"_data": "00"}}
+            )
+            .unwrap_err()
+            .code,
+            40674
         );
         assert!(check_pipeline(&[doc! {"$match": {"operationType": "insert"}}]).is_ok());
         assert!(check_pipeline(&[doc! {"$group": {"_id": 1}}]).is_err());

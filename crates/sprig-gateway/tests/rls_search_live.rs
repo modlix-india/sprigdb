@@ -27,6 +27,12 @@
 //!   more of bob's rows full of "apple": scores computed over every row
 //!   would move with rows she can't see (their term statistics).
 //!
+//! With `SPRIG_TEST_RLS_SETTING` (a script setting a dc-scope key:
+//! `<script> search.max_window 5`, `-` to remove it), the window part
+//! checks a search matching more rows than `search.max_window`: alice's
+//! ranked results still hold only her rows, and her counts, facets and
+//! tag values are refused (39827) without the number of matches.
+//!
 //! ```sh
 //! export SPRIG_TEST_RLS_SQL=127.0.0.1:44306
 //! export SPRIG_TEST_RLS_HTTP=127.0.0.1:44080
@@ -44,7 +50,10 @@
     clippy::expect_used,
     missing_docs,
     clippy::too_many_lines,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::similar_names,
+    clippy::many_single_char_names
 )]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -419,7 +428,7 @@ async fn alice_scores(
         .as_ref()
         .map(|v| ft_hits(v, true))
         .unwrap_or((-1, Vec::new()));
-    hits.sort();
+    hits.sort_by(|a, b| a.0.cmp(&b.0));
     ck.ok(
         &format!("FT.SEARCH scores: alice's keys only, total 4 ({tag})"),
         total == 4 && hits.len() == 4 && hits.iter().all(|h| h.0.starts_with("rlss:rlss_alice:")),
@@ -432,6 +441,150 @@ async fn alice_scores(
         .collect();
     out.insert("redis FT.SEARCH", r);
     out
+}
+
+/// Runs the deployment's setting script (`<script> <key> <json value>`,
+/// `-` to remove).
+fn set(script: &str, key: &str, value: &str) {
+    let st = std::process::Command::new(script)
+        .args([key, value])
+        .status()
+        .unwrap();
+    assert!(st.success(), "{script} {key} {value}");
+}
+
+fn code_of(e: &mongodb::error::Error) -> i32 {
+    match e.kind.as_ref() {
+        mongodb::error::ErrorKind::Command(c) => c.code,
+        _ => 0,
+    }
+}
+
+async fn past_the_window(
+    ck: &mut Checks,
+    script: &str,
+    al: &mut mysql_async::Conn,
+    http: &str,
+    amdb: &mongodb::Database,
+    alr: &mut redis::aio::MultiplexedConnection,
+    ar: &mut redis::aio::MultiplexedConnection,
+) {
+    set(script, "search.max_window", "5");
+    // The setting reaches the gateway through its watch.
+    let mut applied = false;
+    for _ in 0..40 {
+        let v = cmd(
+            ar,
+            &["FT.AGGREGATE", "rlss_idx", "apple", "LIMIT", "0", "1"],
+        )
+        .await;
+        if v.is_err_and(|e| e.contains("39827") || e.contains("max_window")) {
+            applied = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    ck.ok(
+        "window: search.max_window = 5 applied",
+        applied,
+        String::new,
+    );
+    let v = cmd(alr, &["FT.SEARCH", "rlss_idx", "apple", "NOCONTENT"]).await;
+    ck.ok(
+        "window: FT.SEARCH refused to alice, without a count",
+        v.as_ref()
+            .is_err_and(|e| e.contains("max_window") && !e.contains("38")),
+        || format!("{v:?}"),
+    );
+    let v = cmd(alr, &["FT.TAGVALS", "rlss_idx", "tag"]).await;
+    ck.ok(
+        "window: FT.TAGVALS refused to alice",
+        v.as_ref().is_err_and(|e| e.contains("max_window")),
+        || format!("{v:?}"),
+    );
+    let r: Result<Vec<(i64, f64)>, _> = al
+        .query(
+            "SELECT id, score FROM sprig_search('notes_ix', 'apple', '{\"limit\": 20}') AS s ORDER BY id",
+        )
+        .await;
+    ck.ok(
+        "window: sprig_search answers alice's rows only",
+        r.as_ref().is_ok_and(|v| v.iter().all(|x| x.0 < 1000)),
+        || format!("{r:?}"),
+    );
+    let path = format!("/v1/databases/{DB}/search/notes_ix:query");
+    let (st, v) = post(
+        http,
+        ALICE,
+        PW,
+        &path,
+        &json!({"query_string": "apple", "limit": 3}),
+    )
+    .await;
+    ck.ok(
+        "window: REST hits are alice's only",
+        st == 200 && rest_hits(&v).iter().all(|h| h.0 < 1000),
+        || format!("{st} {v}"),
+    );
+    let (st, v) = post(
+        http,
+        ALICE,
+        PW,
+        &path,
+        &json!({"query_string": "apple", "limit": 3,
+                "facets": r#"{"tags": {"type": "string", "path": "tag"}}"#}),
+    )
+    .await;
+    ck.ok(
+        "window: REST facets refused to alice, without a count",
+        st != 200 && v.to_string().contains("max_window") && !v.to_string().contains("38"),
+        || format!("{st} {v}"),
+    );
+    let got: Result<Vec<Document>, _> = async {
+        amdb.collection::<Document>("mnotes")
+            .aggregate([
+                doc! {"$search": {"index": "default", "text": {"query": "apple", "path": "title"}}},
+            ])
+            .await?
+            .try_collect()
+            .await
+    }
+    .await;
+    ck.ok(
+        "window: $search answers alice's documents only",
+        got.as_ref()
+            .is_ok_and(|v| v.iter().all(|d| d.get_i64("_id").is_ok_and(|i| i < 1000))),
+        || format!("{got:?}"),
+    );
+    let got: Result<Vec<Document>, _> = async {
+        amdb.collection::<Document>("mnotes")
+            .aggregate([
+                doc! {"$searchMeta": {"index": "default", "count": {"type": "total"},
+                "text": {"query": "apple", "path": "title"}}},
+            ])
+            .await?
+            .try_collect()
+            .await
+    }
+    .await;
+    ck.ok(
+        "window: $searchMeta refused to alice",
+        got.as_ref().is_err_and(|e| code_of(e) == 39827),
+        || format!("{got:?}"),
+    );
+    set(script, "search.max_window", "-");
+    for _ in 0..40 {
+        if cmd(
+            ar,
+            &["FT.AGGREGATE", "rlss_idx", "apple", "LIMIT", "0", "1"],
+        )
+        .await
+        .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -604,7 +757,11 @@ async fn search_respects_row_policies() {
     let r: Result<Vec<i64>, _> = al
         .query("SELECT COUNT(*) FROM notes WHERE MATCH (title, body) AGAINST ('apple')")
         .await;
-    ck.ok("sql MATCH count: 4", r == Ok(vec![4]), || format!("{r:?}"));
+    ck.ok(
+        "sql MATCH count: 4",
+        r.as_ref().is_ok_and(|v| v == &[4]),
+        || format!("{r:?}"),
+    );
     // Bob's rows rank above hers; a limit of 3 still gives her 3 rows.
     let r: Result<Vec<i64>, _> = al
         .query(
@@ -618,7 +775,7 @@ async fn search_respects_row_policies() {
         || format!("{r:?}"),
     );
     let r: Result<Vec<i64>, _> = al
-        .query("SELECT id FROM sprig_search('notes_ix', 'zebra', NULL) AS s")
+        .query("SELECT id FROM sprig_search('notes_ix', 'zebra') AS s")
         .await;
     ck.ok(
         "sprig_search zebra: nothing",
@@ -928,6 +1085,15 @@ async fn search_respects_row_policies() {
             &a == b,
             || format!("before {b:?}, after {a:?}"),
         );
+    }
+
+    // ---- Past search.max_window ----
+    // With a window of 5 and 38 matches, alice's ranked results use plain
+    // scores and leave out bob's rows; counts and facets are refused.
+    if let Ok(script) = std::env::var("SPRIG_TEST_RLS_SETTING") {
+        past_the_window(&mut ck, &script, &mut al, &http, &amdb, &mut alr, &mut ar).await;
+    } else {
+        eprintln!("SPRIG_TEST_RLS_SETTING not set: the window checks skipped");
     }
 
     // ---- Cleanup ----

@@ -655,8 +655,8 @@ impl TextSearch for DocSearch {
         };
         // The copy's count includes documents hidden from a caller a row
         // policy binds: shown to others only.
-        let shown =
-            execute && !super::visible::needs_visible(def, sql.row_policy_binds(def.object_id));
+        let bound = super::visible::needs_visible(def, sql.row_policy_binds(def.object_id));
+        let shown = execute && !bound;
         let (hits, took) = if shown {
             let started = std::time::Instant::now();
             let (a, _) = s
@@ -678,7 +678,7 @@ impl TextSearch for DocSearch {
         } else {
             (None, None)
         };
-        let v = super::explain::describe(s, t, def, &q, cons, hits, took).await;
+        let v = super::explain::describe(s, t, def, &q, cons, bound, hits, took).await;
         Ok(to_doc(&v))
     }
 

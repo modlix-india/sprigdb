@@ -11,6 +11,12 @@
 //!   caller bound by row-level security searches within its visible hits)
 //! plain: N = 1, n[t] = 1, T[f] = PLAIN_AVERAGE_LENGTH: no statistics of
 //!   the index at all
+//! expansions: a prefix or fuzzy term becomes the most frequent
+//!   max_expansions terms it matches, counted over every document, or,
+//!   when the query is restricted to keys, over those keys' documents
+//!   only (a bound caller's terms depend on no row it can't read)
+//! every(query, max): every hit with every term each prefix or fuzzy
+//!   term matches (the candidates a bound caller re-reads)
 //! ```
 //!
 //! Each document is in exactly one partition, so the sums are the
@@ -25,7 +31,7 @@ use std::sync::Mutex;
 
 use sprig_common::{Result, SprigCode, SprigError};
 use tantivy::collector::{Count, DocSetCollector, TopDocs};
-use tantivy::query::{Bm25StatisticsProvider, BooleanQuery, Occur, Query, TermQuery};
+use tantivy::query::{Bm25StatisticsProvider, BooleanQuery, Occur, Query, TermQuery, TermSetQuery};
 use tantivy::schema::{Field, IndexRecordOption, Value};
 use tantivy::{DocAddress, Searcher, TantivyDocument, Term};
 
@@ -342,15 +348,75 @@ fn within(a: &str, b: &str, max: usize) -> bool {
     prev[b.len()] <= max
 }
 
-/// Expands over a set of searchers (every partition of the index).
-struct Over<'a>(&'a [Searcher]);
+/// The documents of each searcher, by segment, ascending.
+type DocsBySegment = Vec<BTreeMap<u32, Vec<u32>>>;
+
+/// Expands over a set of searchers (every partition of the index), or
+/// over some documents of them only.
+struct Over<'a> {
+    searchers: &'a [Searcher],
+    /// Count only these documents: a query restricted to keys (a caller
+    /// bound by row-level security) chooses its terms among the
+    /// documents it may see.
+    within: Option<DocsBySegment>,
+}
+
+/// How many of `ids` (ascending) hold the term of `info`.
+fn freq_within(
+    inv: &tantivy::InvertedIndexReader,
+    info: &tantivy::postings::TermInfo,
+    ids: &[u32],
+) -> Result<u64> {
+    use tantivy::{DocSet, TERMINATED};
+    let mut p = inv
+        .read_postings_from_terminfo(info, IndexRecordOption::Basic)
+        .map_err(terr)?;
+    let mut n = 0u64;
+    if (info.doc_freq as usize) <= ids.len() {
+        // Walk the postings; look each document up.
+        let mut d = p.doc();
+        while d != TERMINATED {
+            if ids.binary_search(&d).is_ok() {
+                n += 1;
+            }
+            d = p.advance();
+        }
+    } else {
+        // Seek each document in the postings (only forward: a seek past
+        // one document may land beyond the next).
+        for &id in ids {
+            let mut d = p.doc();
+            if d < id {
+                d = p.seek(id);
+            }
+            if d == TERMINATED {
+                break;
+            }
+            if d == id {
+                n += 1;
+            }
+        }
+    }
+    Ok(n)
+}
 
 impl Expander for Over<'_> {
     fn expand(&self, base: &TermBase, how: &Expansion, max: usize) -> Result<Vec<String>> {
         let pre = base.value_prefix();
         let mut found: BTreeMap<String, u64> = BTreeMap::new();
-        for s in self.0 {
-            for seg in s.segment_readers() {
+        for (i, s) in self.searchers.iter().enumerate() {
+            for (ord, seg) in s.segment_readers().iter().enumerate() {
+                let ids = match &self.within {
+                    None => None,
+                    Some(w) => match w
+                        .get(i)
+                        .zip(u32::try_from(ord).ok())
+                        .and_then(|(m, o)| m.get(&o))
+                    {
+                        Some(ids) if !ids.is_empty() => Some(ids.as_slice()),
+                        _ => continue,
+                    },
+                };
                 let inv = seg.inverted_index(base.field).map_err(terr)?;
                 let dict = inv.terms();
                 let start: Vec<u8> = match how {
@@ -376,8 +442,13 @@ impl Expander for Over<'_> {
                         Expansion::Fuzzy(w, d) => within(w, text, usize::from(*d)),
                     };
                     if keep {
-                        *found.entry(text.to_owned()).or_default() +=
-                            u64::from(st.value().doc_freq);
+                        let n = match ids {
+                            None => u64::from(st.value().doc_freq),
+                            Some(ids) => freq_within(&inv, st.value(), ids)?,
+                        };
+                        if n > 0 {
+                            *found.entry(text.to_owned()).or_default() += n;
+                        }
                     }
                 }
             }
@@ -390,6 +461,29 @@ impl Expander for Over<'_> {
         out.sort();
         Ok(out)
     }
+}
+
+/// The key sets `q` is restricted to: `Keys` among the clauses every
+/// match must meet (`must` and `filter` of `Bool`s, all the way down).
+fn key_sets<'q>(q: &'q SearchQuery, out: &mut Vec<&'q [Key]>) {
+    match q {
+        SearchQuery::Keys(k) => out.push(k),
+        SearchQuery::Bool { must, filter, .. } => {
+            for x in must.iter().chain(filter) {
+                key_sets(x, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The refusal of a search matching more than `max` documents, without
+/// the count (it would include rows the caller may not see).
+fn window_exceeded(max: usize) -> SprigError {
+    SprigError::new(
+        SprigCode::SearchWindowExceeded,
+        format!("the search matched more than search.max_window ({max}) rows"),
+    )
 }
 
 /// A search index's partitions.
@@ -503,8 +597,55 @@ impl SearchIndex {
         searchers: &[Searcher],
         max_expansions: usize,
     ) -> Result<Box<dyn Query>> {
-        let ex = Over(searchers);
+        let ex = self.expander(q, searchers)?;
         Builder::new(&self.schema, &ex, max_expansions).build(q)
+    }
+
+    /// The expander of `q`: over every document, or, when `q` is
+    /// restricted to keys, over those keys' documents only, so the
+    /// prefix and fuzzy terms chosen depend on nothing else.
+    fn expander<'s>(&self, q: &SearchQuery, searchers: &'s [Searcher]) -> Result<Over<'s>> {
+        let mut sets = Vec::new();
+        key_sets(q, &mut sets);
+        let Some((first, rest)) = sets.split_first() else {
+            return Ok(Over {
+                searchers,
+                within: None,
+            });
+        };
+        let docs = |keys: &[Key]| -> Result<Vec<std::collections::HashSet<DocAddress>>> {
+            let q = TermSetQuery::new(
+                keys.iter()
+                    .map(|k| Term::from_field_bytes(self.schema.key, &k.0)),
+            );
+            searchers
+                .iter()
+                .map(|s| s.search(&q, &DocSetCollector).map_err(terr))
+                .collect()
+        };
+        let mut all = docs(first)?;
+        for keys in rest {
+            for (mine, other) in all.iter_mut().zip(docs(keys)?) {
+                mine.retain(|a| other.contains(a));
+            }
+        }
+        let within = all
+            .into_iter()
+            .map(|set| {
+                let mut m: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+                for a in set {
+                    m.entry(a.segment_ord).or_default().push(a.doc_id);
+                }
+                for ids in m.values_mut() {
+                    ids.sort_unstable();
+                }
+                m
+            })
+            .collect();
+        Ok(Over {
+            searchers,
+            within: Some(within),
+        })
     }
 
     fn key_of(&self, s: &Searcher, a: DocAddress) -> Result<Key> {
@@ -571,14 +712,45 @@ impl SearchIndex {
     pub fn all(&self, q: &SearchQuery, max: usize, max_expansions: usize) -> Result<Vec<Hit>> {
         let n = self.count(q, max_expansions)?;
         if n > max as u64 {
-            return Err(SprigError::new(
-                SprigCode::SearchWindowExceeded,
-                // No count: it would include rows the caller may not see.
-                format!("the search matched more than search.max_window ({max}) rows"),
-            ));
+            return Err(window_exceeded(max));
         }
         #[allow(clippy::cast_possible_truncation)]
         self.top(q, n as usize, Scoring::Global, max_expansions)
+    }
+
+    /// Every hit, up to `max` (39827 past it), with each prefix and fuzzy
+    /// term expanded to **every** term it matches rather than the most
+    /// frequent `search.max_expansions`: the hits a caller bound by
+    /// row-level security re-reads before its terms are chosen among the
+    /// rows it may see. Scores are 0 and the order is the key order.
+    ///
+    /// # Errors
+    /// As [`SearchIndex::all`].
+    pub fn every(&self, q: &SearchQuery, max: usize) -> Result<Vec<Hit>> {
+        let searchers = self.searchers();
+        let ex = self.expander(q, &searchers)?;
+        let query = Builder::new(&self.schema, &ex, usize::MAX)
+            .every_term()
+            .build(q)?;
+        let mut n = 0u64;
+        for s in &searchers {
+            n += s.search(query.as_ref(), &Count).map_err(terr)? as u64;
+        }
+        if n > max as u64 {
+            return Err(window_exceeded(max));
+        }
+        let mut hits = Vec::new();
+        for (i, s) in searchers.iter().enumerate() {
+            for a in s.search(query.as_ref(), &DocSetCollector).map_err(terr)? {
+                hits.push(Hit {
+                    score: 0.0,
+                    part: self.parts[i].no,
+                    key: self.key_of(s, a)?,
+                });
+            }
+        }
+        hits.sort_by(order);
+        Ok(hits)
     }
 
     /// Matching documents.

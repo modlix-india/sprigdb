@@ -365,6 +365,21 @@ struct GwClient {
     gws: Arc<Gateways>,
     seed: u64,
     log: RunLog,
+    /// When "no gateway answers" was last logged.
+    unreachable_noted: Mutex<Option<Instant>>,
+}
+
+/// How often a trigger whose runs reach no gateway says so.
+const UNREACHABLE_NOTE_EVERY: Duration = Duration::from_secs(30);
+
+/// Whether a note last made at `last` is due again at `now`; records `now`
+/// when it is.
+fn note_due(last: &mut Option<Instant>, now: Instant, every: Duration) -> bool {
+    if last.is_some_and(|t| now.saturating_duration_since(t) < every) {
+        return false;
+    }
+    *last = Some(now);
+    true
 }
 
 /// Where a trigger's run log goes: `logic_log` in its tenant's catalog.
@@ -397,7 +412,31 @@ impl RunLog {
 #[async_trait]
 impl Gateway for GwClient {
     async fn run(&self, req: &RunRequest) -> Result<RunReply> {
-        self.gws.run(self.seed, req).await
+        let r = self.gws.run(self.seed, req).await;
+        // Runs that reach no gateway are retried without end; say so in
+        // the worker's log and the trigger's run log, at most every 30 s,
+        // instead of waiting silently (a gateway whose peer service is off
+        // looks like this).
+        if let Err(e) = &r
+            && e.code() == Some(SprigCode::ForwardFailed)
+            && note_due(
+                &mut self
+                    .unreachable_noted
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+                Instant::now(),
+                UNREACHABLE_NOTE_EVERY,
+            )
+        {
+            tracing::warn!(binding = self.seed, error = %e, "trigger runs reach no gateway; retrying");
+            self.log
+                .write(
+                    "warn",
+                    &format!("runs wait: no gateway answered ({})", e.message),
+                )
+                .await;
+        }
+        r
     }
 
     async fn note(&self, level: &str, message: &str) {
@@ -1023,6 +1062,7 @@ impl JobHandler for StreamTrigger {
             gws: Arc::clone(&env.gateways),
             seed: binding,
             log,
+            unreachable_noted: Mutex::new(None),
         });
         let stats = Arc::new(MsgStats::default());
         let stop = cx.cancel.child_token();
@@ -1091,6 +1131,7 @@ async fn run_fan_in(
         gws: Arc::clone(&env.gateways),
         seed: binding,
         log,
+        unreachable_noted: Mutex::new(None),
     });
     let stats = Arc::new(MsgStats::default());
     let stop = cx.cancel.child_token();
@@ -1254,6 +1295,7 @@ impl JobHandler for QueueTrigger {
             gws: Arc::clone(&env.gateways),
             seed: binding,
             log,
+            unreachable_noted: Mutex::new(None),
         });
         let stats = Arc::new(MsgStats::default());
         let stop = cx.cancel.child_token();
@@ -1313,5 +1355,27 @@ mod tests {
         let r = Record::<GwRecord>::decode(raw).unwrap();
         assert_eq!(r.body.listeners.get("peer"), Some(&7403));
         assert_eq!(r.body.state, "ready");
+    }
+
+    #[test]
+    fn a_trigger_reaching_no_gateway_says_so_at_most_every_30_s() {
+        let t0 = Instant::now();
+        let mut last = None;
+        assert!(note_due(&mut last, t0, UNREACHABLE_NOTE_EVERY));
+        assert!(!note_due(
+            &mut last,
+            t0 + Duration::from_secs(29),
+            UNREACHABLE_NOTE_EVERY
+        ));
+        assert!(note_due(
+            &mut last,
+            t0 + Duration::from_secs(30),
+            UNREACHABLE_NOTE_EVERY
+        ));
+        assert!(!note_due(
+            &mut last,
+            t0 + Duration::from_secs(31),
+            UNREACHABLE_NOTE_EVERY
+        ));
     }
 }

@@ -13,8 +13,8 @@
 //! hands out ([`SessionTable::set_slot`]), so `KILL` of an id on another
 //! gateway finds its owner through `gateway-slots/<slot>`. The record
 //! carries the listeners' ports, the state (`starting`, `ready`,
-//! `draining`), the authorization engines the build knows and a load
-//! report, rewritten every [`LOAD_PERIOD`] and on
+//! `draining`), the authorization engines the build knows, the parts that
+//! are off while it serves (`degraded`) and a load report, rewritten every [`LOAD_PERIOD`] and on
 //! every state change. A re-registration after a lost lease tries the same
 //! slot first; sessions opened under the old slot keep their ids.
 
@@ -113,6 +113,11 @@ pub struct GatewayRecord {
     /// Metadata. Unset: `addr`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kafka_host: Option<String>,
+    /// Parts of the gateway that are off while it serves, by name, with
+    /// the reason (`peer`: the peer service, which workers' triggers and
+    /// sinks need). Empty: nothing is.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub degraded: BTreeMap<String, String>,
 }
 
 impl Versioned for GatewayRecord {
@@ -239,6 +244,21 @@ impl Registrar {
     pub fn set_listeners(&self, listeners: BTreeMap<String, u16>) {
         self.shared.lock().listeners = listeners;
         self.shared.bump();
+    }
+
+    /// Marks `part` degraded with `reason`, or clears it (`None`); the
+    /// record is rewritten at once when that changes it.
+    pub fn set_degraded(&self, part: &str, reason: Option<String>) {
+        let changed = {
+            let mut r = self.shared.lock();
+            match reason {
+                Some(why) => r.degraded.insert(part.to_owned(), why.clone()) != Some(why),
+                None => r.degraded.remove(part).is_some(),
+            }
+        };
+        if changed {
+            self.shared.bump();
+        }
     }
 
     /// Updates the load report (written with the next periodic write).

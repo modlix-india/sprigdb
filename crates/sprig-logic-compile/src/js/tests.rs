@@ -29,6 +29,7 @@ fn sig(params: &[(&str, Ty)], returns: Option<Ty>) -> Signature {
         params: params.iter().map(|(n, t)| ((*n).to_owned(), *t)).collect(),
         returns,
         row: None,
+        on: None,
     }
 }
 
@@ -1167,4 +1168,160 @@ fn db_call_and_db_publish_compile_inside_expressions() {
     let o = interp::run(f, &[Value::Int(6)], &mut db, &interp::Limits::default()).unwrap();
     assert_eq!(o.result["a"], json!(1));
     assert_eq!(db.seen.len(), 3, "{:?}", db.seen);
+}
+
+/// A trigger on a stream: its arguments by parameter name, from a record.
+fn record_args(c: &Compiled, rec: &serde_json::Value) -> Vec<Value> {
+    c.ir.as_ref()
+        .unwrap()
+        .params
+        .iter()
+        .map(|p| {
+            let v = rec
+                .as_object()
+                .unwrap()
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&p.name))
+                .map_or(serde_json::Value::Null, |(_, v)| v.clone());
+            match (p.ty, v) {
+                (_, serde_json::Value::Null) => Value::Null,
+                (Ty::Json, v) => Value::Json(v),
+                (_, serde_json::Value::String(t)) => Value::Str(t),
+                (_, serde_json::Value::Bool(b)) => Value::Bool(b),
+                (_, v) => v.as_i64().map_or_else(|| Value::from_json(v), Value::Int),
+            }
+        })
+        .collect()
+}
+
+fn run_logs(c: &Compiled, args: &[Value]) -> std::result::Result<Vec<String>, u16> {
+    let f = c.ir.as_ref().unwrap();
+    interp::run(f, args, &mut interp::NoDb, &interp::Limits::default())
+        .map(|o| o.logs)
+        .map_err(|e| {
+            println!("error: {e}");
+            e.code().map_or(0, sprig_common::SprigCode::number)
+        })
+}
+
+#[test]
+fn stream_triggers_read_the_record_and_parsed_json() {
+    let s = Signature::message(MsgSource::Stream);
+    let c = js(
+        "export default function (ctx) {
+           const r = ctx.record;
+           const e = JSON.parse(r.value);
+           if (e === null) { console.log('tombstone', r.key); return; }
+           const kind = e.type ?? 'none';
+           let total = 0;
+           for (const it of e.items ?? []) { total += it.qty * 2; }
+           console.log(kind, e.user?.name, total, r.offset, typeof e.n === 'number', e.tags.length);
+           if (e.flag) console.log('flagged ' + e.n);
+           console.log(ctx.record.headers['x-src'] ?? 'nosrc', e.n == 3);
+         }",
+        &s,
+    );
+    // `e.items ?? []` mixes an array literal with parsed JSON: refused.
+    assert!(reasons(&c).contains(&"js.dynamic_types".to_owned()), "{:?}", reasons(&c));
+    let c = js(
+        "export default function (ctx) {
+           const r = ctx.record;
+           const e = JSON.parse(r.value);
+           if (e === null) { console.log('tombstone', r.key); return; }
+           const kind = e.type ?? 'none';
+           let total = 0;
+           if (Array.isArray(e.items)) { for (const it of e.items) { total += it.qty * 2; } }
+           console.log(kind, e.user?.name, total, r.offset, typeof e.n === 'number', e.tags.length);
+           if (e.flag) console.log('flagged ' + e.n);
+           console.log(ctx.record.headers['x-src'] ?? 'nosrc', e.n == 3);
+         }",
+        &s,
+    );
+    assert!(c.compilable(), "{:?}", c.analysis.reasons);
+    let names: Vec<&str> = c.ir.as_ref().unwrap().params.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["value", "key", "offset", "headers"]);
+    let rec = |value: serde_json::Value| {
+        json!({"key": "k1", "value": value, "offset": 7, "headers": {"x-src": "app"}})
+    };
+    let v = json!({"type": "add", "user": {"name": "ann"}, "items": [{"qty": 2}, {"qty": 1.5}],
+                   "n": 3, "tags": ["a", "b"], "flag": 1});
+    assert_eq!(
+        run_logs(&c, &record_args(&c, &rec(serde_json::Value::String(v.to_string())))),
+        Ok(vec![
+            "add ann 7 7 true 2".to_owned(),
+            "flagged 3".to_owned(),
+            "app true".to_owned(),
+        ])
+    );
+    // A tombstone parses as null.
+    assert_eq!(
+        run_logs(&c, &record_args(&c, &rec(serde_json::Value::Null))),
+        Ok(vec!["tombstone k1".to_owned()])
+    );
+    // A missing member is undefined: `?.` of it too.
+    let v = json!({"n": "3", "tags": "ab"});
+    assert_eq!(
+        run_logs(&c, &record_args(&c, &rec(serde_json::Value::String(v.to_string())))),
+        Err(39876),
+        "`e.n == 3` with a string n converts: the engine tier"
+    );
+    let v = json!({"n": 4, "tags": "abc", "flag": ""});
+    assert_eq!(
+        run_logs(&c, &record_args(&c, &rec(serde_json::Value::String(v.to_string())))),
+        Ok(vec!["none undefined 0 7 true 3".to_owned(), "app false".to_owned()])
+    );
+    // Not JSON: the engine tier throws its own SyntaxError.
+    assert_eq!(
+        run_logs(&c, &record_args(&c, &rec(json!("{nope")))),
+        Err(39876)
+    );
+    // The generated code has the log parameter and the helpers.
+    let p = c.plsql.as_ref().unwrap();
+    assert!(p.procedure.contains("p__log OUT LONGTEXT"), "{}", p.procedure);
+    let body = p.package_body.as_deref().unwrap_or_default();
+    for f in ["j_parse", "j_get", "j_at", "j_truthy", "j_text"] {
+        assert!(body.contains(&format!("FUNCTION {f}(")), "{f}");
+    }
+}
+
+#[test]
+fn queue_triggers_bind_parsed_values_by_column() {
+    let s = Signature::message(MsgSource::Queue);
+    let c = js(
+        "const job = JSON.parse(ctx.message.body);
+         db.exec('INSERT INTO orders (id, product_id, qty, note) VALUES (?, ?, ?, ?)',
+                 [job.id, job.product, job.qty, job.note]);
+         if (ctx.message.redelivered) console.log('again ' + ctx.message.deliveryCount);",
+        &s,
+    );
+    assert!(c.compilable(), "{:?}", c.analysis.reasons);
+    let f = c.ir.as_ref().unwrap();
+    let names: Vec<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["body", "redelivered", "deliverycount"]);
+    let Some(crate::ir::Stmt::Db(crate::ir::DbOp::Sql { binds, .. })) =
+        f.body.iter().find(|s| matches!(s, crate::ir::Stmt::Db(_)))
+    else {
+        panic!("no statement: {f}");
+    };
+    let kinds: Vec<&str> = binds
+        .iter()
+        .map(|b| match b {
+            Expr::Builtin(b, _) => b.name(),
+            _ => "?",
+        })
+        .collect();
+    assert_eq!(kinds, ["json_as_int", "json_as_int", "json_as_int", "json_as_str"]);
+    // Where the column isn't known, the value must be converted first.
+    let c = js(
+        "const job = JSON.parse(ctx.message.body);
+         db.exec('INSERT INTO orders VALUES (?, ?, ?, ?)', [job.id, 1, 1, 'x']);",
+        &s,
+    );
+    assert_eq!(reasons(&c), ["db.json_bind"]);
+    // Elsewhere, JSON.parse stays in the engine tier.
+    let c = js(
+        "return { n: JSON.parse(t).n };",
+        &sig(&[("t", Ty::Str)], None),
+    );
+    assert_eq!(reasons(&c), ["js.json_parse"]);
 }

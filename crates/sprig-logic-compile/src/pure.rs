@@ -405,7 +405,17 @@ impl Cx<'_> {
             | Builtin::JsonStr
             | Builtin::ToJson
             | Builtin::JsonLength
-            | Builtin::JsonText => {
+            | Builtin::JsonText
+            | Builtin::JsonParse
+            | Builtin::JsonGet
+            | Builtin::JsonLen
+            | Builtin::JsonAsStr
+            | Builtin::JsonAsNum
+            | Builtin::JsonAsInt
+            | Builtin::JsonAsBool
+            | Builtin::JsonTruthy
+            | Builtin::JsonKind
+            | Builtin::JsonToStr => {
                 return Err("JSON values".into());
             }
         })
@@ -444,6 +454,7 @@ impl Cx<'_> {
                         return Err("a loop".into());
                     }
                     Stmt::Db(_) => return Err("data access".into()),
+                    Stmt::Log(_) => return Err("log lines".into()),
                     Stmt::Try { .. } | Stmt::Rethrow(_) => return Err("try/catch".into()),
                     Stmt::Block(l, body) => {
                         for mut t in self.block(body, s)? {

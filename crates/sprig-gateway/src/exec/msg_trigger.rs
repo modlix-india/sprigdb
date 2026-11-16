@@ -332,6 +332,42 @@ impl PassSession {
                 (r, id, None)
             }
         };
+        // The compiled tier's routines go on every shard of the trigger's
+        // database, through `sprig_ctl`, with the definer as `DEFINER`.
+        let streams = super::logic::logic_streams(ts, &cat, row.db_id);
+        let template = ts.schema_of(Some(&db));
+        let layout = super::router::ddl_layout(ts);
+        let shard_list: Vec<(String, sprig_common::ids::ClusterId)> = {
+            let from_layout = match (&layout, &template) {
+                (Some(l), Some(t)) => l(t, None),
+                (Some(l), None) => sprig_catalog::ddl::shard_schemas(tenant, &row)
+                    .first()
+                    .map(ToString::to_string)
+                    .and_then(|f| l(&f, None)),
+                _ => None,
+            };
+            match (from_layout.filter(|v| !v.is_empty()), template) {
+                (Some(v), _) => v,
+                (None, Some(t)) => vec![(t, self.target.cluster.clone())],
+                (None, None) => Vec::new(),
+            }
+        };
+        let single_shard = shard_list.len() == 1;
+        let mut shards = super::logic_bound::CtlShards {
+            list: shard_list,
+            conns: std::collections::HashMap::new(),
+            locator: Arc::clone(&svc.locator),
+        };
+        let account = sprig_auth::authz::backend::account(tenant, user);
+        let compile = (!shards.list.is_empty()).then(|| sprig_logic::messages::MsgCompile {
+            shards: &mut shards,
+            single_shard,
+            definer: format!("`{}`@`%`", account.replace('`', "``")),
+            db_name: &row.name,
+            streams,
+            max_loop_iterations: 100_000,
+            compile_max_cost: 100_000,
+        });
         // Taken after the chain's loads above and given back before the
         // fan-in attach below, which take catalog connections of their own
         // from the same pool (4 per cluster).
@@ -348,9 +384,11 @@ impl PassSession {
                 source_db: (source_db_row.db_id.0, &source_db_row.name),
                 object_id,
                 fanin_declarer: fanin_def.as_ref().map_or(0, |d| d.declarer.0),
+                compile,
             },
         )
         .await?;
+        shards.release();
         let mut notes = deployed.notes();
         // A new stream trigger reads what is published from now on.
         if let Some(def) = &stream_def {
@@ -640,7 +678,7 @@ impl PassSession {
             let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
                 SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
             })?;
-            sprig_logic::invoke::load(
+            sprig_logic::invoke::load_any(
                 &mut conn,
                 ep.store.schema(),
                 tenant.0,
@@ -649,6 +687,20 @@ impl PassSession {
             )
             .await?
         };
+        // A compiled version runs in MariaDB; a record it hands back (39876)
+        // runs below, in the engine tier.
+        if v.tier == "mariadb"
+            && let Some(entry) = messages::CompiledEntry::of(&v.signature)
+            && let Some(db) = cat.databases.get(sprig_common::ids::DbId(v.db_id))
+        {
+            let db = db.name.clone();
+            if self
+                .run_compiled(cx, req, &entry, &db, &event, &lines)
+                .await?
+            {
+                return Ok(());
+            }
+        }
         let program = v.program.as_ref().ok_or_else(|| {
             SprigError::new(
                 SprigCode::LogicEngineUnavailable,
@@ -738,6 +790,85 @@ impl PassSession {
             ));
         }
         Ok(())
+    }
+
+    /// A compiled trigger version, in this session's transaction: its
+    /// entry procedure with the event's fields, after a savepoint, under
+    /// `logic.trigger_budget_ms`. `Ok(false)` when the code handed the
+    /// record back (39876): the savepoint is rolled back and the caller
+    /// runs it in the engine tier.
+    async fn run_compiled(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        req: &RunRequest,
+        entry: &messages::CompiledEntry,
+        db: &str,
+        event: &Value,
+        lines: &Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Result<bool> {
+        const SAVEPOINT: &str = "__sprig_compiled";
+        self.trigger_stmt(cx, &format!("SAVEPOINT {SAVEPOINT}"))
+            .await?;
+        let call = entry.call(db, req.source.module_id, req.version, event);
+        let budget = req.budget_ms.max(1);
+        let timed = format!(
+            "SET STATEMENT max_statement_time = {} FOR {call}",
+            Duration::from_millis(budget).as_secs_f64()
+        );
+        if let Err(e) = self.trigger_stmt(cx, &timed).await {
+            let n = messages::error_number(&e);
+            if n == messages::ENGINE_RERUN {
+                tracing::debug!(binding = req.source.binding_id, reason = %e.message, "compiled trigger: this record runs in the engine tier");
+                self.trigger_stmt(cx, &format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}"))
+                    .await?;
+                return Ok(false);
+            }
+            if n == 1969 {
+                return Err(SprigError::new(
+                    SprigCode::LogicBudgetExceeded,
+                    format!("the run ran past logic.trigger_budget_ms = {budget} ms"),
+                ));
+            }
+            return Err(e);
+        }
+        let read = if entry.log {
+            "SELECT @__sprig_e, @__sprig_r, @__sprig_l"
+        } else {
+            "SELECT @__sprig_e, @__sprig_r"
+        };
+        let mut got = self.run_checked(cx, read, false).await?;
+        let row = got.rows.pop().unwrap_or_default();
+        let text = |i: usize| {
+            row.get(i)
+                .cloned()
+                .flatten()
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+        };
+        if let Some(l) = text(2) {
+            let logged: Vec<String> = serde_json::from_str(&l).unwrap_or_default();
+            let mut v = lines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            v.extend(logged);
+            v.truncate(sprig_logic::engine::engine::MAX_LOG_LINES);
+        }
+        let ev = text(0).unwrap_or_else(|| "output".to_owned());
+        // An `error` or `reject` event fails the run, as in the engine
+        // tier (39865).
+        if matches!(ev.as_str(), "error" | "reject") {
+            let result: Value = text(1)
+                .and_then(|r| serde_json::from_str(&r).ok())
+                .unwrap_or(Value::Null);
+            let msg = result
+                .get("message")
+                .and_then(Value::as_str)
+                .map_or_else(|| result.to_string(), str::to_owned);
+            return Err(SprigError::new(
+                SprigCode::LogicUserError,
+                format!("{ev}: {msg}"),
+            ));
+        }
+        Ok(true)
     }
 
     /// A dead letter's replay: its event with the active version, in

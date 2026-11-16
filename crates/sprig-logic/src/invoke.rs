@@ -110,6 +110,9 @@ pub struct EngineVersion {
     pub program: Option<Program>,
     /// The result row's declared columns (see [`EngineVersion::columns_for`]).
     pub columns: Vec<OutCol>,
+    /// `logic_versions.signature` (a compiled trigger's entry is in it,
+    /// [`crate::messages::CompiledEntry`]).
+    pub signature: Value,
 }
 
 impl EngineVersion {
@@ -763,8 +766,37 @@ pub async fn load(
     module_id: u64,
     version: u64,
 ) -> Result<Arc<EngineVersion>> {
+    load_version(c, catalog_schema, tenant, module_id, version, false).await
+}
+
+/// [`load`] of a version of any tier: a compiled trigger's version, whose
+/// records its code can't run go to the engine tier one by one
+/// ([`crate::messages`]).
+///
+/// # Errors
+/// As [`load`].
+pub async fn load_any(
+    c: &mut Conn,
+    catalog_schema: &str,
+    tenant: u64,
+    module_id: u64,
+    version: u64,
+) -> Result<Arc<EngineVersion>> {
+    load_version(c, catalog_schema, tenant, module_id, version, true).await
+}
+
+async fn load_version(
+    c: &mut Conn,
+    catalog_schema: &str,
+    tenant: u64,
+    module_id: u64,
+    version: u64,
+    any_tier: bool,
+) -> Result<Arc<EngineVersion>> {
     let key = (tenant, module_id, version);
-    if let Some(v) = CACHE.lock().ok().and_then(|m| m.get(&key).cloned()) {
+    if let Some(v) = CACHE.lock().ok().and_then(|m| m.get(&key).cloned())
+        && (any_tier || v.tier == "engine")
+    {
         return Ok(v);
     }
     let q = sprig_common::names::quote(catalog_schema);
@@ -791,7 +823,7 @@ pub async fn load(
             format!("logic module {module_id} has no version {version}"),
         ));
     };
-    if tier != "engine" {
+    if tier != "engine" && !any_tier {
         return Err(SprigError::new(
             SprigCode::LogicNotFound,
             format!("{name} version {version} isn't an engine-tier version"),
@@ -814,6 +846,7 @@ pub async fn load(
         tier,
         program,
         columns: columns(&sig),
+        signature: sig,
     });
     if let Ok(mut m) = CACHE.lock() {
         if m.len() >= CACHE_MAX {
@@ -863,6 +896,7 @@ mod tests {
             tier: "engine".into(),
             program: None,
             columns: columns(&sig),
+            signature: sig.clone(),
         };
         let names: Vec<&str> = v.columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["event", "total", "n", "rows", "message"]);

@@ -9,7 +9,7 @@ source: the metric macros in the source tree, and docs/metrics-help.toml
 
 Every metric SprigDB records, as exported on each process's telemetry port (`/metrics`, Prometheus text) and through OTLP. Counters end in `_total`; durations are histograms in seconds.
 
-518 metrics in 55 groups.
+519 metrics in 55 groups.
 
 ## `sprig_advisor_*`
 
@@ -618,6 +618,7 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_rls_policies_recompiled_total` | counter | - | sprig-gateway | Row-level security policies written as MongoDB filters whose stored SQL was compiled again with this build's translator, because an earlier build had stored a different rendering; rewritten on the tenant's first statement on a gateway. Unit: policies. |
 | `sprig_rls_reprepares_total` | counter | - | sprig-gateway | Prepared statements prepared again because the row-level security policies they depend on changed. Unit: count. |
 | `sprig_rls_rewrites_total` | counter | `protocol` | sprig-gateway | Statements rewritten to apply row-level security policies; `protocol` is the front end. Unit: count. |
+| `sprig_rls_search_rechecks_total` | counter | `scoring` | sprig-gateway | Searches by a user that row-level security binds, answered from the hits that user may read; `scoring` is `matched` (ranked with statistics of those hits alone) or `plain` (no index statistics, when the search matched more than `search.max_window` rows). Unit: count. |
 
 ## `sprig_router_*`
 

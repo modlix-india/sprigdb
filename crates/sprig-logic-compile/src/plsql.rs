@@ -86,13 +86,19 @@ pub fn generate(f: &Function, opts: &Options) -> Plsql {
         uses_num_str: false,
         uses_nn: false,
         uses_rethrow: false,
+        uses_json: false,
+        reruns: f.may_rerun(),
         guards: 0,
         params: param_names(f),
         has_try: has_try(&f.body),
         frames: Vec::new(),
         loops: 0,
     };
+    let logs = f.logs();
     let mut body = String::new();
+    if logs {
+        body.push_str("  p__log := JSON_ARRAY();\n");
+    }
     g.block(&f.body, 1, &mut body);
     // No event raised: `output` with no fields, unless `output` declares
     // fields (KIRun's "No events raised").
@@ -131,6 +137,10 @@ pub fn generate(f: &Function, opts: &Options) -> Plsql {
         .collect();
     params.push("p__event OUT VARCHAR(64)".to_owned());
     params.push("p__result OUT LONGTEXT".to_owned());
+    if logs {
+        // A trigger's log lines, as a JSON array of text.
+        params.push("p__log OUT LONGTEXT".to_owned());
+    }
     let security = if opts.definer_security {
         "DEFINER"
     } else {
@@ -255,6 +265,11 @@ struct Gen<'a> {
     uses_num_str: bool,
     uses_nn: bool,
     uses_rethrow: bool,
+    /// The parsed-JSON helpers (`j_*`).
+    uses_json: bool,
+    /// The code can raise 39876 (a record that runs in the engine tier),
+    /// which no `catch` sees.
+    reruns: bool,
     guards: usize,
     params: Vec<String>,
     has_try: bool,
@@ -269,12 +284,17 @@ impl Gen<'_> {
     }
 
     fn package(&self) -> (Option<String>, Option<String>) {
-        if !self.uses_fail && !self.uses_num_str && !self.uses_nn && !self.uses_rethrow {
+        if !self.uses_fail
+            && !self.uses_num_str
+            && !self.uses_nn
+            && !self.uses_rethrow
+            && !self.uses_json
+        {
             return (None, None);
         }
         let mut spec = format!("CREATE OR REPLACE PACKAGE {} AS\n", self.pkg);
         let mut body = format!("CREATE OR REPLACE PACKAGE BODY {} AS\n", self.pkg);
-        if self.uses_fail {
+        if self.uses_fail || self.uses_json {
             spec.push_str("  PROCEDURE fail(code IN INT, msg IN VARCHAR);\n");
             body.push_str(
                 "  PROCEDURE fail(code IN INT, msg IN VARCHAR) AS\n    \
@@ -283,7 +303,7 @@ impl Gen<'_> {
                  END;\n",
             );
         }
-        if self.uses_num_str {
+        if self.uses_num_str || self.uses_json {
             spec.push_str("  FUNCTION num_str(x IN DOUBLE) RETURN VARCHAR;\n");
             body.push_str(
                 "  FUNCTION num_str(x IN DOUBLE) RETURN VARCHAR AS\n  BEGIN\n    \
@@ -320,6 +340,9 @@ impl Gen<'_> {
                 "      ELSE SIGNAL SQLSTATE 'HY000' SET MYSQL_ERRNO = code, MESSAGE_TEXT = v;\n    \
                  END CASE;\n  END;\n",
             );
+        }
+        if self.uses_json {
+            json_helpers(&mut spec, &mut body);
         }
         spec.push_str("END");
         body.push_str("END");
@@ -379,9 +402,16 @@ impl Gen<'_> {
             "{ind}    GET DIAGNOSTICS CONDITION 1 {state} = RETURNED_SQLSTATE, \
              {code} = MYSQL_ERRNO, {text} = MESSAGE_TEXT;"
         );
+        // A record that must run in the engine tier (39876) is never
+        // caught, wherever it comes from.
+        let db_errors = if self.reruns {
+            format!("{code} NOT IN (39864, 39876)")
+        } else {
+            format!("{code} <> 39864")
+        };
         let _ = writeln!(
             out,
-            "{ind}    IF NOT ({code} = 39865 OR v__src = 2 OR (v__src = 1 AND {code} <> 39864)) \
+            "{ind}    IF NOT ({code} = 39865 OR v__src = 2 OR (v__src = 1 AND {db_errors})) \
              THEN RAISE; END IF;"
         );
         let _ = writeln!(
@@ -505,6 +535,15 @@ impl Gen<'_> {
             }
             Stmt::Leave(label) => {
                 let _ = writeln!(out, "{ind}EXIT b{label};");
+            }
+            Stmt::Log(e) => {
+                let v = self.expr(e);
+                let _ = writeln!(
+                    out,
+                    "{ind}IF JSON_LENGTH(p__log) < {} THEN p__log := JSON_ARRAY_APPEND(p__log, '$', \
+                     {v}); END IF;",
+                    crate::ir::MAX_LOG_LINES
+                );
             }
             Stmt::Return => {
                 let _ = writeln!(out, "{ind}RETURN;");
@@ -955,7 +994,207 @@ impl Gen<'_> {
                 self.expr(&a1),
                 self.expr(&a0)
             ),
+            Builtin::JsonParse
+            | Builtin::JsonGet
+            | Builtin::JsonLen
+            | Builtin::JsonAsStr
+            | Builtin::JsonAsNum
+            | Builtin::JsonAsInt
+            | Builtin::JsonAsBool
+            | Builtin::JsonTruthy
+            | Builtin::JsonKind
+            | Builtin::JsonToStr => self.json_builtin(b, args),
         }
+    }
+
+    /// The parsed-JSON builtins, through the package's `j_*` helpers.
+    fn json_builtin(&mut self, b: Builtin, args: &[Expr]) -> String {
+        self.uses_json = true;
+        let pkg = self.pkg.clone();
+        let a0 = args.first().cloned().unwrap_or(Expr::Lit(Literal::Null));
+        let flag = |i: usize| match args.get(i) {
+            Some(Expr::Lit(Literal::Bool(true))) => 1,
+            _ => 0,
+        };
+        let v = self.expr(&a0);
+        match b {
+            Builtin::JsonParse => format!("{pkg}.j_parse({v})"),
+            Builtin::JsonGet => match args.get(1) {
+                Some(Expr::Lit(Literal::Str(k))) => format!(
+                    "{pkg}.j_get({v}, {}, {})",
+                    quote(&format!("${}", path_key(k))),
+                    flag(2)
+                ),
+                Some(i) => {
+                    let i = self.expr(i);
+                    format!("{pkg}.j_at({v}, {i}, {})", flag(2))
+                }
+                None => "NULL".to_owned(),
+            },
+            Builtin::JsonLen => format!("{pkg}.j_len({v})"),
+            Builtin::JsonAsStr => format!("{pkg}.j_str({v}, {})", flag(1)),
+            Builtin::JsonAsNum => format!("{pkg}.j_num({v}, {})", flag(1)),
+            Builtin::JsonAsInt => format!("{pkg}.j_int({v}, {})", flag(1)),
+            Builtin::JsonAsBool => format!("{pkg}.j_bool({v}, {})", flag(1)),
+            Builtin::JsonTruthy => format!("{pkg}.j_truthy({v})"),
+            Builtin::JsonKind => {
+                let k = match args.get(1) {
+                    Some(Expr::Lit(Literal::Str(k))) => k.clone(),
+                    _ => String::new(),
+                };
+                format!("({pkg}.j_kind({v}) = {})", quote(&k))
+            }
+            _ => format!("{pkg}.j_text({v}, {})", flag(1)),
+        }
+    }
+}
+
+/// The message of a 39876 a `j_*` helper raises.
+fn rerun_msg(why: &str) -> String {
+    quote(&format!("{}: {why}", crate::ir::ENGINE_RERUN_TEXT))
+}
+
+/// The package's parsed-JSON helpers (see [`Builtin::JsonParse`]): a
+/// parsed value is JSON text, JSON `null` the text `null`, `NULL`
+/// JavaScript's `undefined`. Each raises 39876 where it can't give what
+/// JavaScript would; the gateway then runs the record in the engine tier.
+fn json_helpers(spec: &mut String, body: &mut String) {
+    const T: &str = "LONGTEXT CHARACTER SET utf8mb4";
+    let fail = |why: &str| format!("fail(39876, {})", rerun_msg(why));
+    // What JSON.parse refuses and MariaDB reads: `1.` and `1.e5` (a
+    // number's dot without a digit after it, outside strings) and escapes
+    // JSON doesn't have (`\x`, `\'`). Strings are blanked first, without
+    // backtracking.
+    let strings = quote(r#"(?-i)"(?:[^"\\]++|\\.)*+""#);
+    let dot = quote("(?-i)[0-9][.]([^0-9]|$)");
+    let escape = quote(r#"(?-i)\\[^"\\/bfnrtu]"#);
+    let astral = quote("(?-i)[^\\x{0}-\\x{FFFF}]");
+    let fns: Vec<(String, String)> = vec![
+        (
+            "FUNCTION j_kind(v IN LONGTEXT) RETURN VARCHAR".to_owned(),
+            "BEGIN\n    IF v IS NULL THEN RETURN 'undefined'; END IF;\n    \
+             RETURN CASE JSON_TYPE(v) WHEN 'NULL' THEN 'null' WHEN 'STRING' THEN 'string' \
+             WHEN 'BOOLEAN' THEN 'boolean' WHEN 'OBJECT' THEN 'object' WHEN 'ARRAY' THEN 'array' \
+             ELSE 'number' END;\n  END;"
+                .to_owned(),
+        ),
+        (
+            "FUNCTION j_parse(s IN LONGTEXT) RETURN LONGTEXT".to_owned(),
+            format!(
+                "ok INT := 0;\n  BEGIN\n    IF s IS NULL THEN RETURN 'null'; END IF;\n    BEGIN\n      \
+                 IF JSON_VALID(s) = 1 AND NOT (REGEXP_REPLACE(s, {strings}, '\"\"') REGEXP {dot}) \
+                 AND NOT (s REGEXP {escape}) THEN ok := 1; END IF;\n    \
+                 EXCEPTION WHEN OTHERS THEN ok := 0;\n    END;\n    \
+                 IF ok = 0 THEN {}; END IF;\n    RETURN s;\n  END;",
+                fail("JSON.parse of text MariaDB would read differently")
+            ),
+        ),
+        (
+            "FUNCTION j_get(v IN LONGTEXT, p IN VARCHAR, opt IN INT) RETURN LONGTEXT".to_owned(),
+            format!(
+                "BEGIN\n    IF v IS NULL OR JSON_TYPE(v) = 'NULL' THEN\n      \
+                 IF opt = 1 THEN RETURN NULL; END IF;\n      {};\n    END IF;\n    \
+                 IF JSON_TYPE(v) <> 'OBJECT' THEN {}; END IF;\n    \
+                 IF JSON_LENGTH(v) <> JSON_LENGTH(JSON_KEYS(v)) THEN {}; END IF;\n    \
+                 RETURN JSON_EXTRACT(v, p);\n  END;",
+                fail("a member of null or undefined"),
+                fail("a member of a value that isn't an object"),
+                fail("an object with a repeated member")
+            ),
+        ),
+        (
+            "FUNCTION j_at(v IN LONGTEXT, i IN BIGINT, opt IN INT) RETURN LONGTEXT".to_owned(),
+            format!(
+                "BEGIN\n    IF v IS NULL OR JSON_TYPE(v) = 'NULL' THEN\n      \
+                 IF opt = 1 THEN RETURN NULL; END IF;\n      {};\n    END IF;\n    \
+                 IF JSON_TYPE(v) <> 'ARRAY' OR i IS NULL THEN {}; END IF;\n    \
+                 IF i < 0 OR i >= JSON_LENGTH(v) THEN RETURN NULL; END IF;\n    \
+                 RETURN JSON_EXTRACT(v, CONCAT('$[', i, ']'));\n  END;",
+                fail("an element of null or undefined"),
+                fail("an element of a value that isn't an array")
+            ),
+        ),
+        (
+            "FUNCTION j_len(v IN LONGTEXT) RETURN BIGINT".to_owned(),
+            format!(
+                "k VARCHAR(16) := j_kind(v);\n  BEGIN\n    \
+                 IF k = 'array' THEN RETURN JSON_LENGTH(v); END IF;\n    \
+                 IF k = 'string' AND NOT (JSON_UNQUOTE(v) REGEXP {astral}) THEN \
+                 RETURN CHAR_LENGTH(JSON_UNQUOTE(v)); END IF;\n    {};\n    RETURN NULL;\n  END;",
+                fail("the length of a value that isn't an array or a string of the basic plane")
+            ),
+        ),
+        (
+            format!("FUNCTION j_str(v IN LONGTEXT, n IN INT) RETURN {T}"),
+            format!(
+                "k VARCHAR(16) := j_kind(v);\n  BEGIN\n    \
+                 IF n = 1 AND k IN ('undefined', 'null') THEN RETURN NULL; END IF;\n    \
+                 IF k <> 'string' THEN {}; END IF;\n    RETURN JSON_UNQUOTE(v);\n  END;",
+                fail("a string was expected")
+            ),
+        ),
+        (
+            "FUNCTION j_num(v IN LONGTEXT, n IN INT) RETURN DOUBLE".to_owned(),
+            format!(
+                "k VARCHAR(16) := j_kind(v);\n    d DOUBLE;\n  BEGIN\n    \
+                 IF n = 1 AND k IN ('undefined', 'null') THEN RETURN NULL; END IF;\n    \
+                 IF k <> 'number' THEN {}; END IF;\n    BEGIN\n      d := CAST(v AS DOUBLE);\n    \
+                 EXCEPTION WHEN OTHERS THEN d := NULL;\n    END;\n    \
+                 IF d IS NULL OR ABS(d) >= 1.7976931348623157e308 THEN {}; END IF;\n    \
+                 RETURN d;\n  END;",
+                fail("a number was expected"),
+                fail("a number past a double's range")
+            ),
+        ),
+        (
+            "FUNCTION j_int(v IN LONGTEXT, n IN INT) RETURN BIGINT".to_owned(),
+            format!(
+                "d DOUBLE := j_num(v, n);\n  BEGIN\n    IF d IS NULL THEN RETURN NULL; END IF;\n    \
+                 IF d <> FLOOR(d) OR ABS(d) > 9007199254740992 THEN {}; END IF;\n    \
+                 RETURN CAST(d AS SIGNED);\n  END;",
+                fail("a whole number was expected")
+            ),
+        ),
+        (
+            "FUNCTION j_bool(v IN LONGTEXT, n IN INT) RETURN BOOLEAN".to_owned(),
+            format!(
+                "k VARCHAR(16) := j_kind(v);\n  BEGIN\n    \
+                 IF n = 1 AND k IN ('undefined', 'null') THEN RETURN NULL; END IF;\n    \
+                 IF k <> 'boolean' THEN {}; END IF;\n    RETURN v = 'true';\n  END;",
+                fail("a boolean was expected")
+            ),
+        ),
+        (
+            "FUNCTION j_truthy(v IN LONGTEXT) RETURN BOOLEAN".to_owned(),
+            "k VARCHAR(16) := j_kind(v);\n  BEGIN\n    RETURN CASE k WHEN 'undefined' THEN FALSE \
+             WHEN 'null' THEN FALSE WHEN 'boolean' THEN v = 'true' \
+             WHEN 'number' THEN j_num(v, 0) <> 0 \
+             WHEN 'string' THEN CHAR_LENGTH(JSON_UNQUOTE(v)) > 0 ELSE TRUE END;\n  END;"
+                .to_owned(),
+        ),
+        (
+            format!("FUNCTION j_text(v IN LONGTEXT, n IN INT) RETURN {T}"),
+            format!(
+                "k VARCHAR(16) := j_kind(v);\n    d DOUBLE;\n  BEGIN\n    \
+                 IF k IN ('undefined', 'null') THEN RETURN CASE WHEN n = 1 THEN NULL ELSE k END; \
+                 END IF;\n    IF k = 'string' THEN RETURN JSON_UNQUOTE(v); END IF;\n    \
+                 IF k = 'boolean' THEN RETURN v; END IF;\n    IF k = 'number' THEN\n      \
+                 d := j_num(v, 0);\n      \
+                 IF d = FLOOR(d) AND ABS(d) < 9007199254740992 THEN \
+                 RETURN CAST(CAST(d AS SIGNED) AS CHAR); END IF;\n      \
+                 IF d <> FLOOR(d) AND ABS(d) >= 1e-6 AND ABS(d) < 1e15 THEN \
+                 RETURN CAST(d AS CHAR); END IF;\n    END IF;\n    {};\n    RETURN NULL;\n  END;",
+                fail("this value's text")
+            ),
+        ),
+    ];
+    for (head, rest) in fns {
+        let _ = writeln!(spec, "  {head};");
+        let (decls, block) = match rest.split_once("BEGIN") {
+            Some((d, b)) if !d.is_empty() => (format!("\n    {}", d.trim_end()), format!("BEGIN{b}")),
+            _ => (String::new(), rest.clone()),
+        };
+        let _ = writeln!(body, "  {head} AS{decls}\n  {block}");
     }
 }
 

@@ -211,6 +211,7 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
             .collect(),
         load: registry::Load::default(),
         kafka_host: ctx.config.gateway.kafka_advertise_host.clone(),
+        degraded: std::collections::BTreeMap::new(),
     });
     let lease_live = live.clone();
     let lease_dc = dc.clone();
@@ -596,8 +597,19 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         })?,
     };
     let peer_server = peer::serve(peer_bind, peer_tls, peer_host, stop.clone()).await?;
-    if peer_server.is_some() {
+    if let Some((addr, _)) = &peer_server {
         redis_peer.start(&redis_env, stop.clone());
+        ctx.health
+            .set_check("peer", true, format!("listening on {addr}"));
+    } else {
+        // Readiness reports it; workers then can't run triggers or sinks.
+        tokio::spawn(peer::report_off(
+            peer_bind,
+            Arc::clone(&stores.dc),
+            ctx.health.clone(),
+            registrar.clone(),
+            stop.clone(),
+        ));
     }
     let peer_port = peer_server.as_ref().map(|(a, _)| a.port());
 

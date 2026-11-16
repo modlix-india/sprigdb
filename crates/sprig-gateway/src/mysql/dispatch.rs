@@ -579,14 +579,16 @@ impl CommandLoop {
                 // answers how it ended; 1317 only while that is unknown.
                 match self.exec.take_cut_commit() {
                     Some(Ok(())) => {
-                        self.status.remove(StatusFlags::IN_TRANS | StatusFlags::IN_TRANS_READONLY);
+                        self.status
+                            .remove(StatusFlags::IN_TRANS | StatusFlags::IN_TRANS_READONLY);
                         if !silent {
                             sink.ok(OkPacket::new(self.status)).await?;
                         }
                         Ran::Done(ExecSummary::default())
                     }
                     Some(Err(e)) => {
-                        self.status.remove(StatusFlags::IN_TRANS | StatusFlags::IN_TRANS_READONLY);
+                        self.status
+                            .remove(StatusFlags::IN_TRANS | StatusFlags::IN_TRANS_READONLY);
                         if !silent {
                             sink.error(&e).await?;
                         }

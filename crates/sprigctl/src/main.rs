@@ -32,6 +32,8 @@
 //!   transactions; see [`txn`].
 //! - `sprigctl ai provider add|list|test|remove`: the AI assistants'
 //!   providers; see [`ai`].
+//! - `sprigctl catalog contracts [show|run]`: catalog contract
+//!   migrations and their audited early run; see [`catalog`].
 //!
 //! Every other command group is hidden, and prints "not available in this version",
 //! exiting with status 1.
@@ -570,7 +572,9 @@ fn main() -> ExitCode {
     let implemented = match group {
         "dc" | "cluster" | "settings" | "index" | "job" | "gateway" | "check" | "advisor"
         | "shard" | "space" | "txn" | "sink" | "graph" | "search" | "recommendations"
-        | "inherit" | "login" | "logout" | "whoami" | "operator" | "token" | "ai" => true,
+        | "inherit" | "login" | "logout" | "whoami" | "operator" | "token" | "ai" | "catalog" => {
+            true
+        }
         "explain" => matches!(name.as_str(), "query" | "decision" | "placement"),
         "tenant" => !TENANT_LATER.contains(&name.as_str()),
         "logic" => logic::implemented(&name),

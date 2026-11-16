@@ -19,6 +19,7 @@ fn record(id: &str) -> GatewayRecord {
         authorizers: vec![],
         load: Load::default(),
         kafka_host: None,
+        degraded: std::collections::BTreeMap::new(),
     }
 }
 

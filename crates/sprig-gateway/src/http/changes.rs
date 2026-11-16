@@ -511,7 +511,7 @@ const START_MARGIN_SECONDS: u64 = 30;
 /// 39800 when `hlc` is older than the index (or than the tenant's last
 /// move to its cluster); 39802 when the cluster has no index yet; the
 /// cluster's.
-async fn start_at(
+pub(crate) async fn start_at(
     svc: &crate::tenant::TenantServices,
     placement: &Arc<dyn PlacementView>,
     tenant: TenantId,

@@ -32,6 +32,14 @@
 //! `[tls]` (development) the listener serves plaintext and only on a
 //! loopback address; a non-loopback `listener.peer.bind` without `[tls]`
 //! leaves the peer service off.
+//!
+//! **An off peer service is reported** ([`report_off`]): `/readyz?verbose`
+//! shows check `peer`, failing while workers are registered (they run
+//! triggers and sinks by calling a gateway here), and the registration
+//! record lists `degraded.peer` with the reason, which `sprigctl gateway
+//! list` shows. Readiness itself stays `ready`: clients' statements still
+//! work, and an off peer service is a configuration to fix, not a reason
+//! to take the gateway out of a load balancer.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -818,6 +826,103 @@ impl HandoffTarget for PeerHandoff {
     }
 }
 
+/// How often a gateway whose peer service is off looks for workers.
+pub const OFF_CHECK_PERIOD: Duration = Duration::from_secs(30);
+
+/// Why the peer service is off on `bind`, and what turns it on.
+#[must_use]
+pub fn off_reason(bind: SocketAddr) -> String {
+    format!(
+        "the peer service is off: listener.peer.bind is {bind}, not a loopback address, and \
+         sprigdb.toml has no [tls] (mutual TLS); set [tls], or bind it to 127.0.0.1 when \
+         every process runs on this host"
+    )
+}
+
+/// The `/readyz?verbose` check of a peer service that is off: whether it
+/// passes and its text. `workers` is the number of workers registered in
+/// the DC (`None`: unknown). Workers run triggers and sinks by calling a
+/// gateway's peer service, so with workers it fails (the gateway is
+/// degraded); with none, nothing needs it yet and it passes.
+#[must_use]
+pub fn off_check(bind: SocketAddr, workers: Option<usize>) -> (bool, String) {
+    let why = off_reason(bind);
+    match workers {
+        Some(0) => (
+            true,
+            format!("off; no worker is registered, so no trigger or sink needs it ({why})"),
+        ),
+        Some(n) => (
+            false,
+            format!(
+                "degraded: {n} registered worker(s) can't run triggers or sinks through this \
+                 gateway ({why})"
+            ),
+        ),
+        None => (
+            false,
+            format!(
+                "degraded: workers can't run triggers or sinks through this gateway, if any \
+                 run ({why})"
+            ),
+        ),
+    }
+}
+
+/// The number of workers registered in the DC (`workers/<id>`).
+///
+/// # Errors
+/// The store's.
+pub async fn registered_workers(store: &dyn MetaStore) -> Result<usize> {
+    let prefix = store.tier().key("workers/")?;
+    let mut n = 0;
+    let mut opts = sprig_meta::ListOpts::default();
+    loop {
+        let page = store.list(&prefix, opts.clone()).await?;
+        n += page.kvs.len();
+        if !page.more {
+            return Ok(n);
+        }
+        opts.at = Some(page.revision);
+        opts.after = page.kvs.last().map(|kv| kv.key.clone());
+    }
+}
+
+/// Reports a peer service that is off until `stop`: the `peer` check of
+/// `/readyz?verbose`, and `degraded.peer` in the registration record
+/// when workers are registered (they can't run triggers or sinks through
+/// this gateway). Looks for workers every [`OFF_CHECK_PERIOD`].
+pub async fn report_off(
+    bind: SocketAddr,
+    store: Arc<dyn MetaStore>,
+    health: sprig_common::telemetry::Health,
+    registrar: registry::Registrar,
+    stop: CancellationToken,
+) {
+    let mut tick = tokio::time::interval(OFF_CHECK_PERIOD);
+    let mut last: Option<bool> = None;
+    loop {
+        tokio::select! {
+            () = stop.cancelled() => return,
+            _ = tick.tick() => {}
+        }
+        let workers = match registered_workers(store.as_ref()).await {
+            Ok(n) => Some(n),
+            Err(e) => {
+                tracing::debug!(error = %e, "can't count the registered workers");
+                None
+            }
+        };
+        let (ok, detail) = off_check(bind, workers);
+        health.set_check("peer", ok, detail.clone());
+        registrar.set_degraded("peer", (!ok).then(|| detail.clone()));
+        if last != Some(ok) && !ok {
+            tracing::warn!(%bind, "{detail}");
+        }
+        last = Some(ok);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -830,6 +935,69 @@ mod tests {
     use sprig_meta::{MemStore, Op, Record, Txn};
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_peer_service_that_is_off_degrades_the_gateway_only_when_workers_run() {
+        let bind: SocketAddr = "0.0.0.0:7403".parse().unwrap();
+        let (ok, text) = off_check(bind, Some(0));
+        assert!(ok, "{text}");
+        assert!(text.contains("no worker is registered"), "{text}");
+        assert!(
+            text.contains("listener.peer.bind is 0.0.0.0:7403"),
+            "{text}"
+        );
+        let (ok, text) = off_check(bind, Some(2));
+        assert!(!ok);
+        assert!(
+            text.starts_with("degraded: 2 registered worker(s) can't run triggers or sinks"),
+            "{text}"
+        );
+        assert!(text.contains("[tls]"), "{text}");
+        assert!(!off_check(bind, None).0);
+
+        // Workers are counted from their registrations.
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new(Tier::Dc(dc("dc-a"))));
+        assert_eq!(registered_workers(store.as_ref()).await.unwrap(), 0);
+        for id in ["w1", "w2"] {
+            let k = store.tier().key(&format!("workers/{id}")).unwrap();
+            store
+                .txn(Txn {
+                    when: Vec::new(),
+                    then: vec![Op::Put {
+                        key: k,
+                        value: b"{}".to_vec(),
+                        lease: None,
+                    }],
+                    otherwise: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(registered_workers(store.as_ref()).await.unwrap(), 2);
+
+        // The record names the degraded part until it is cleared.
+        let r = registry::Registrar::new(GatewayRecord {
+            gateway_id: "gw-1".into(),
+            slot: 0,
+            version: "test".into(),
+            addr: "127.0.0.1".into(),
+            listeners: std::collections::BTreeMap::new(),
+            state: registry::GatewayState::Ready,
+            catalog_formats: vec![],
+            authorizers: vec![],
+            load: registry::Load::default(),
+            kafka_host: None,
+            degraded: std::collections::BTreeMap::new(),
+        });
+        r.set_degraded("peer", Some(text.clone()));
+        assert_eq!(r.record().degraded.get("peer"), Some(&text));
+        let json = serde_json::to_value(r.record()).unwrap();
+        assert!(json["degraded"]["peer"].is_string(), "{json}");
+        r.set_degraded("peer", None);
+        assert!(r.record().degraded.is_empty());
+        let json = serde_json::to_value(r.record()).unwrap();
+        assert!(json.get("degraded").is_none(), "{json}");
+    }
 
     fn dc(s: &str) -> DcId {
         DcId::new(s).unwrap()
@@ -1021,6 +1189,7 @@ mod tests {
             authorizers: Vec::new(),
             load: registry::Load::default(),
             kafka_host: None,
+            degraded: std::collections::BTreeMap::new(),
         };
         let put = |r: &GatewayRecord| {
             let fra1 = Arc::clone(&fra1);
@@ -1121,6 +1290,7 @@ mod tests {
             authorizers: Vec::new(),
             load: registry::Load::default(),
             kafka_host: None,
+            degraded: std::collections::BTreeMap::new(),
         };
         let peers = Peers::new(Arc::clone(&mem), None);
         let req = |db: &str| WatchChangesRequest {

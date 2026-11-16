@@ -74,9 +74,8 @@ pub(crate) fn group() -> Command {
             Command::new("contracts")
                 .about("Contract migrations: who holds them back, and running them early")
                 .subcommand(
-                    Command::new("show").about(
-                        "The registered readers and each catalog module's contract ceiling",
-                    ),
+                    Command::new("show")
+                        .about("The registered readers and each catalog module's contract ceiling"),
                 )
                 .subcommand(
                     Command::new("run")

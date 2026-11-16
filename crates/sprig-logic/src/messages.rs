@@ -36,10 +36,19 @@
 //!     dead-letter exchange, or into logic_dead_letters when it has none
 //! ```
 //!
-//! **Every trigger version runs in the engine tier** (QuickJS, the native
-//! KIRun runtime, Lua), in a gateway, through the definer's own session:
-//! name virtualization, privilege checks, `db.publish` and `db.mq.*`
-//! all work as for a client. JavaScript and Lua code gets one argument,
+//! **Where a version runs.** JavaScript compiles into MariaDB when the
+//! compiler can keep its meaning ([`place`]): the version's entry
+//! procedure in the trigger database's shard schema takes the fields of
+//! `ctx.record` or `ctx.message` the code reads, and the gateway calls it
+//! in the definer's session, in the run's transaction, after a savepoint.
+//! A record whose parsed JSON the compiled code can't treat as JavaScript
+//! does (a member of a kind it wasn't compiled for, text `JSON.parse`
+//! refuses) raises 39876; the gateway rolls back to the savepoint and runs
+//! that record in the engine tier. Anything else runs in the engine tier
+//! (QuickJS, the native KIRun runtime, Lua), in a gateway, through the
+//! definer's own session: name virtualization, privilege checks,
+//! `db.publish` and `db.mq.*` all work as for a client, with the reason
+//! recorded at deploy. JavaScript and Lua code gets one argument,
 //! `ctx` (also the global `ctx`): `ctx.record {stream, partition, offset,
 //! key, value, headers, timestamp}` or `ctx.message {queue, exchange,
 //! routingKey, body, properties, redelivered, deliveryCount}`. A KIRun
@@ -584,6 +593,97 @@ pub struct MsgTarget<'a> {
     pub object_id: u64,
     /// A fan-in trigger's definition's declaring tenant; 0 otherwise.
     pub fanin_declarer: u64,
+    /// What the compiled tier needs; `None` keeps the version in the
+    /// engine tier (an inherited trigger's instance).
+    pub compile: Option<MsgCompile<'a>>,
+}
+
+/// Where a trigger's compiled routines go, and what the compiler reads.
+pub struct MsgCompile<'a> {
+    /// The trigger database's shards, each through `sprig_ctl`.
+    pub shards: &'a mut dyn crate::deploy::ShardSessions,
+    /// Whether that database's group is always one shard.
+    pub single_shard: bool,
+    /// The definer's backend account, `` `t1_u7`@`%` ``: the routines'
+    /// `DEFINER`.
+    pub definer: String,
+    /// The trigger database's name.
+    pub db_name: &'a str,
+    /// Its streams, for a compiled `db.publish`.
+    pub streams: crate::service::StreamList,
+    /// `logic.max_loop_iterations`.
+    pub max_loop_iterations: u64,
+    /// `logic.compile_max_cost`.
+    pub compile_max_cost: u64,
+}
+
+/// The error number a compiled trigger raises for a record it hands to
+/// the engine tier.
+pub const ENGINE_RERUN: u16 = sprig_logic_compile::ir::ENGINE_RERUN;
+
+/// A trigger version's compiled entry, from its signature
+/// (`logic_versions.signature["compiled"]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledEntry {
+    /// The fields of `ctx.record` or `ctx.message` it takes, in order:
+    /// the parameter's name (the field's, in lower case) and IR type name.
+    pub params: Vec<(String, String)>,
+    /// It returns its log lines (`p__log`).
+    pub log: bool,
+}
+
+impl CompiledEntry {
+    /// The entry of a version whose signature `sig` records one.
+    #[must_use]
+    pub fn of(sig: &Value) -> Option<Self> {
+        let c = sig.get("compiled")?;
+        Some(Self {
+            params: c["params"]
+                .as_array()?
+                .iter()
+                .map(|p| {
+                    (
+                        p["name"].as_str().unwrap_or_default().to_owned(),
+                        p["type"].as_str().unwrap_or_default().to_owned(),
+                    )
+                })
+                .collect(),
+            log: c["log"].as_bool().unwrap_or(false),
+        })
+    }
+
+    /// The `CALL` of `module`'s version `version` in database `db`, with
+    /// `event`'s fields: the session variables `@__sprig_e`, `@__sprig_r`
+    /// (and `@__sprig_l`) get the event, the result and the log lines.
+    #[must_use]
+    pub fn call(&self, db: &str, module: u64, version: u64, event: &Value) -> String {
+        let field = |name: &str| {
+            event
+                .as_object()
+                .and_then(|o| o.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)))
+                .map_or(Value::Null, |(_, v)| v.clone())
+        };
+        let mut args: Vec<String> = self
+            .params
+            .iter()
+            .map(|(n, t)| match (t.as_str(), field(n)) {
+                (_, Value::Null) => "NULL".to_owned(),
+                ("json", v) => sprig_logic_js::bridge::literal(&Value::String(v.to_string())),
+                (_, v) => sprig_logic_js::bridge::literal(&v),
+            })
+            .collect();
+        args.push("@__sprig_e".to_owned());
+        args.push("@__sprig_r".to_owned());
+        if self.log {
+            args.push("@__sprig_l".to_owned());
+        }
+        format!(
+            "CALL {}.{}({})",
+            quote(db),
+            quote(&sprig_logic_compile::plsql::names(module, version).1),
+            args.join(", ")
+        )
+    }
 }
 
 /// What [`deploy`] did.
@@ -599,6 +699,10 @@ pub struct Deployed {
     pub source: SourceRow,
     /// A new binding (not `OR REPLACE` of an existing one).
     pub created: bool,
+    /// `mariadb` or `engine`.
+    pub tier: String,
+    /// Why the engine tier, when it is.
+    pub reasons: Vec<String>,
 }
 
 impl Deployed {
@@ -618,13 +722,21 @@ impl Deployed {
                 self.source.name, self.source.db_name, self.binding_id
             ),
         };
-        vec![
+        let mut v = vec![if self.tier == "mariadb" {
             format!(
-                "trigger module {} version {}: tier engine (triggers on streams and queues run in the engine tier)",
+                "trigger module {} version {}: tier mariadb (compiled; a record whose JSON it \
+                 can't read as JavaScript does runs in the engine tier)",
                 self.module_id, self.version
-            ),
-            what,
-        ]
+            )
+        } else {
+            format!(
+                "trigger module {} version {}: tier engine",
+                self.module_id, self.version
+            )
+        }];
+        v.extend(self.reasons.iter().cloned());
+        v.push(what);
+        v
     }
 }
 
@@ -785,7 +897,7 @@ pub async fn deploy(d: &Declaration, t: MsgTarget<'_>) -> Result<Deployed> {
         Some(mut m) => {
             m.runtime = d.runtime.as_str().to_owned();
             m.security = "definer".to_owned();
-            m.tier_pref = "engine".to_owned();
+            m.tier_pref = d.tier.as_str().to_owned();
             (m, true)
         }
         None => (
@@ -799,7 +911,7 @@ pub async fn deploy(d: &Declaration, t: MsgTarget<'_>) -> Result<Deployed> {
                 kind: kind.to_owned(),
                 runtime: d.runtime.as_str().to_owned(),
                 security: "definer".to_owned(),
-                tier_pref: "engine".to_owned(),
+                tier_pref: d.tier.as_str().to_owned(),
                 active_version: None,
                 state: "active".to_owned(),
                 created_by: t.user_id,
@@ -807,6 +919,21 @@ pub async fn deploy(d: &Declaration, t: MsgTarget<'_>) -> Result<Deployed> {
             false,
         ),
     };
+    // Placed (and compiled routines created) before anything is
+    // recorded: a refusal leaves no module behind.
+    let version = store.next_version(t.catalog, module.module_id).await?;
+    let mut t = t;
+    let placed = place(
+        d,
+        src.kind,
+        module.module_id,
+        version,
+        t.catalog,
+        t.catalog_schema,
+        t.db_id,
+        t.compile.as_mut(),
+    )
+    .await?;
     if exists {
         store
             .update_options(t.catalog, &module, t.catalog_version)
@@ -816,7 +943,6 @@ pub async fn deploy(d: &Declaration, t: MsgTarget<'_>) -> Result<Deployed> {
             .create_module(t.catalog, &module, t.catalog_version)
             .await?;
     }
-    let version = store.next_version(t.catalog, module.module_id).await?;
     let prior = store.binding(t.catalog, module.module_id).await?;
     if let Some(b) = &prior
         && b.timing != "on_message"
@@ -865,17 +991,17 @@ pub async fn deploy(d: &Declaration, t: MsgTarget<'_>) -> Result<Deployed> {
             version,
             &NewVersion {
                 source: &d.body,
-                signature,
+                signature: {
+                    let mut sig = signature;
+                    if let Some(c) = &placed.compiled {
+                        sig["compiled"] = c.clone();
+                    }
+                    sig
+                },
                 catalog_version: t.catalog_version,
-                tier: "engine",
-                placement: json!({
-                    "tier": "engine",
-                    "reasons": [{"code": "trigger.on_message", "detail": "triggers on streams and queues run in the engine tier"}],
-                    "route": null,
-                    "objects": [],
-                    "cost": 0,
-                }),
-                plsql: None,
+                tier: placed.tier,
+                placement: placed.placement.clone(),
+                plsql: placed.plsql.clone(),
                 created_by: t.user_id,
             },
         )
@@ -925,6 +1051,147 @@ pub async fn deploy(d: &Declaration, t: MsgTarget<'_>) -> Result<Deployed> {
         binding_id: binding.binding_id,
         source: row,
         created: created || moved,
+        tier: placed.tier.to_owned(),
+        reasons: placed.reasons,
+    })
+}
+
+/// Where a trigger version runs.
+struct Placed {
+    tier: &'static str,
+    placement: Value,
+    plsql: Option<String>,
+    /// `signature["compiled"]` ([`CompiledEntry`]).
+    compiled: Option<Value>,
+    reasons: Vec<String>,
+}
+
+impl Placed {
+    fn engine(code: &str, detail: &str) -> Self {
+        Self {
+            tier: "engine",
+            placement: json!({
+                "tier": "engine",
+                "reasons": [{"code": code, "at": "source", "detail": detail}],
+                "route": null,
+                "objects": [],
+                "cost": 0,
+            }),
+            plsql: None,
+            compiled: None,
+            reasons: vec![format!("{code} at source: {detail}")],
+        }
+    }
+}
+
+/// Places a trigger version and, compiled, creates its routines on every
+/// shard of the trigger's database ([`MsgCompile`]): JavaScript compiles
+/// with `ctx.record` or `ctx.message` as its parameters; KIRun and Lua
+/// triggers, and code the compiler can't keep the meaning of, run in the
+/// engine tier, with the reasons.
+///
+/// # Errors
+/// 39868 for `SPRIG_TIER = 'mariadb'` with reasons; the compiler's
+/// errors; a shard's error creating the routines.
+#[allow(clippy::too_many_arguments)]
+async fn place(
+    d: &Declaration,
+    kind: SourceKind,
+    module_id: u64,
+    version: u64,
+    catalog: &mut Conn,
+    catalog_schema: &str,
+    db_id: u32,
+    c: Option<&mut MsgCompile<'_>>,
+) -> Result<Placed> {
+    use sprig_logic_compile::Runtime;
+    use sprig_logic_compile::js::{MsgSource, Signature};
+    let refuse_mariadb = |why: &str| -> Result<()> {
+        if d.tier == crate::declare::TierPref::Mariadb {
+            return Err(SprigError::new(
+                SprigCode::LogicTierUnavailable,
+                format!("SPRIG_TIER = 'mariadb' but the code can't compile: {why}"),
+            ));
+        }
+        Ok(())
+    };
+    match d.runtime {
+        Runtime::Javascript => {}
+        Runtime::Kirun => {
+            let why = "KIRun triggers on streams and queues run in the engine tier";
+            refuse_mariadb(why)?;
+            return Ok(Placed::engine("kirun.trigger", why));
+        }
+        _ => {
+            let why = "no compiler front end for this language yet";
+            refuse_mariadb(why)?;
+            return Ok(Placed::engine("lua.front_end", why));
+        }
+    }
+    let Some(c) = c else {
+        let why = "an inherited trigger's instance runs in the engine tier";
+        refuse_mariadb(why)?;
+        return Ok(Placed::engine("trigger.instance", why));
+    };
+    if d.tier == crate::declare::TierPref::Engine {
+        return Ok(Placed::engine("tier.declared", "SPRIG_TIER = 'engine'"));
+    }
+    let schemas = c.shards.schemas();
+    let first = schemas
+        .first()
+        .cloned()
+        .ok_or_else(|| SprigError::internal("a trigger deploy with no shard"))?;
+    let cols = {
+        let s = c.shards.session(&first).await?;
+        crate::service::columns(s, &first).await?
+    };
+    let env = crate::calls::Env::new(cols, c.db_name)
+        .with_callees(crate::calls::callees(catalog, catalog_schema, db_id).await?)
+        .with_streams(&c.streams);
+    let opts = sprig_logic_compile::Options {
+        module_id,
+        version,
+        max_loop_iterations: c.max_loop_iterations,
+        compile_max_cost: c.compile_max_cost,
+        definer_security: true,
+    };
+    let on = match kind {
+        SourceKind::Stream => MsgSource::Stream,
+        SourceKind::Queue => MsgSource::Queue,
+    };
+    let compiled = sprig_logic_compile::js::compile_with(
+        &d.name,
+        &d.body,
+        &Signature::message(on),
+        &env,
+        &opts,
+    )?;
+    let placed = crate::placement::place(&compiled, d.tier, c.single_shard)?;
+    let placement = serde_json::to_value(&placed).unwrap_or_default();
+    let (Some(f), Some(p), crate::placement::Tier::MariaDb) =
+        (&compiled.ir, &compiled.plsql, placed.tier)
+    else {
+        return Ok(Placed {
+            tier: "engine",
+            placement,
+            plsql: None,
+            compiled: None,
+            reasons: placed.reasons.iter().map(ToString::to_string).collect(),
+        });
+    };
+    let mut plan = crate::deploy::plan_entry(&first, p);
+    plan.definer = Some(c.definer.clone());
+    crate::deploy::deploy_shards(c.shards, &plan).await?;
+    Ok(Placed {
+        tier: "mariadb",
+        placement,
+        plsql: Some(p.statements.join(";\n\n")),
+        compiled: Some(json!({
+            "params": f.params.iter().map(|p| json!({"name": p.name, "type": p.ty.name()})).collect::<Vec<_>>(),
+            "log": f.logs(),
+            "reruns": f.may_rerun(),
+        })),
+        reasons: Vec::new(),
     })
 }
 

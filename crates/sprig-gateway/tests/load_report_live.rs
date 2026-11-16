@@ -112,6 +112,7 @@ async fn registration_keeps_refreshing_with_a_huge_load_report() {
         authorizers: vec![],
         load: Load::default(),
         kafka_host: None,
+        degraded: std::collections::BTreeMap::new(),
     });
     let task = r
         .start(

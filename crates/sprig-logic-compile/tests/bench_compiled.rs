@@ -141,6 +141,7 @@ fn sig(params: &[(&str, Ty)], returns: Option<Ty>) -> Signature {
         params: params.iter().map(|(n, t)| ((*n).to_owned(), *t)).collect(),
         returns,
         row: None,
+        on: None,
     }
 }
 

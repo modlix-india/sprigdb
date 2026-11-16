@@ -129,6 +129,8 @@ pub struct Outcome {
     pub event: String,
     /// Its fields, as a JSON object.
     pub result: J,
+    /// Log lines ([`Stmt::Log`]), at most [`crate::ir::MAX_LOG_LINES`].
+    pub logs: Vec<String>,
 }
 
 /// Limits the interpreter enforces.
@@ -182,6 +184,8 @@ struct Run<'a> {
     thrown: (String, String),
     /// Errors kept by `Try`, by their flag local, for `Rethrow`.
     kept: HashMap<LocalId, (ErrorKind, String)>,
+    /// Log lines.
+    logs: Vec<String>,
 }
 
 fn errno(e: &SprigError) -> u16 {
@@ -228,10 +232,16 @@ pub fn run(f: &Function, args: &[Value], db: &mut dyn Db, limits: &Limits) -> Re
         src: Src::Code,
         thrown: (String::new(), String::new()),
         kept: HashMap::new(),
+        logs: Vec::new(),
     };
     r.block(&f.body)?;
+    let logs = std::mem::take(&mut r.logs);
     if let Some((event, result)) = r.event {
-        return Ok(Outcome { event, result });
+        return Ok(Outcome {
+            event,
+            result,
+            logs,
+        });
     }
     if f.event("output").is_some_and(|e| !e.fields.is_empty()) {
         return Err(runtime("No events raised"));
@@ -239,6 +249,7 @@ pub fn run(f: &Function, args: &[Value], db: &mut dyn Db, limits: &Limits) -> Re
     Ok(Outcome {
         event: "output".to_owned(),
         result: J::Object(Map::new()),
+        logs,
     })
 }
 
@@ -323,6 +334,7 @@ impl Run<'_> {
                     39863 => SprigCode::LogicValidationFailed,
                     39864 => SprigCode::LogicBudgetExceeded,
                     39866 => SprigCode::LogicRuntimeError,
+                    crate::ir::ENGINE_RERUN => SprigCode::LogicEngineUnavailable,
                     _ => SprigCode::LogicUserError,
                 };
                 return Err(SprigError::new(code, text));
@@ -466,7 +478,9 @@ impl Run<'_> {
                         let code = errno(&e);
                         let catchable = code == 39865
                             || self.src == Src::Again
-                            || (self.src == Src::Db && code != 39864);
+                            || (self.src == Src::Db
+                                && code != 39864
+                                && code != crate::ir::ENGINE_RERUN);
                         if !catchable {
                             return Err(e);
                         }
@@ -499,6 +513,12 @@ impl Run<'_> {
                 });
             }
             Stmt::Leave(l) => return Ok(Flow::Leave(*l)),
+            Stmt::Log(e) => {
+                let v = self.eval(e)?;
+                if self.logs.len() < crate::ir::MAX_LOG_LINES {
+                    self.logs.push(to_str(&v));
+                }
+            }
         }
         Ok(Flow::Next)
     }
@@ -813,8 +833,138 @@ fn cast_double(s: &str) -> f64 {
     best
 }
 
+/// 39876: the record runs in the engine tier.
+fn rerun(why: &str) -> SprigError {
+    SprigError::new(
+        SprigCode::LogicEngineUnavailable,
+        format!("{}: {why}", crate::ir::ENGINE_RERUN_TEXT),
+    )
+}
+
+/// A parsed value's kind, as JavaScript's `typeof` tells them apart
+/// (`object` for objects only).
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Json(J::Null) => "null",
+        Value::Json(J::String(_)) | Value::Str(_) => "string",
+        Value::Json(J::Number(_)) | Value::Int(_) | Value::Float(_) => "number",
+        Value::Json(J::Bool(_)) | Value::Bool(_) => "boolean",
+        Value::Json(J::Object(_)) => "object",
+        Value::Json(J::Array(_)) => "array",
+        Value::Null => "undefined",
+    }
+}
+
+/// A parsed value: JSON `null` stays a value (`undefined` is `NULL`).
+fn parsed(j: J) -> Value {
+    Value::Json(j)
+}
+
+/// The parsed-JSON builtins ([`Builtin::JsonParse`] and the rest).
+fn json_builtin(b: Builtin, a: &[Value]) -> Result<Value> {
+    use Value as V;
+    let a0 = a.first().cloned().unwrap_or(V::Null);
+    let a1 = a.get(1).cloned().unwrap_or(V::Null);
+    let flag = |i: usize| matches!(a.get(i), Some(V::Bool(true)));
+    let kind = json_kind(&a0);
+    let nullish = matches!(kind, "undefined" | "null");
+    let num = |v: &V| match v {
+        V::Json(J::Number(n)) => n.as_f64(),
+        _ => None,
+    };
+    Ok(match b {
+        Builtin::JsonParse => match &a0 {
+            V::Null => parsed(J::Null),
+            V::Str(s) => parsed(
+                serde_json::from_str(s).map_err(|_| rerun("JSON.parse of text it can't read"))?,
+            ),
+            _ => return Err(rerun("JSON.parse of a value that isn't text")),
+        },
+        Builtin::JsonGet => {
+            if nullish {
+                if flag(2) {
+                    return Ok(V::Null);
+                }
+                return Err(rerun("a member of null or undefined"));
+            }
+            match (&a0, &a1) {
+                (V::Json(J::Object(m)), V::Str(k)) => m.get(k).cloned().map_or(V::Null, parsed),
+                (V::Json(J::Array(v)), V::Int(i)) => {
+                    if *i < 0 {
+                        V::Null
+                    } else {
+                        v.get(*i as usize).cloned().map_or(V::Null, parsed)
+                    }
+                }
+                _ => return Err(rerun("a member of a value of another kind")),
+            }
+        }
+        Builtin::JsonLen => match &a0 {
+            V::Json(J::Array(v)) => V::Int(i64::try_from(v.len()).unwrap_or(i64::MAX)),
+            V::Json(J::String(s)) if s.chars().all(|c| (c as u32) < 0x10000) => {
+                V::Int(i64::try_from(s.chars().count()).unwrap_or(i64::MAX))
+            }
+            _ => return Err(rerun("the length of this value")),
+        },
+        Builtin::JsonAsStr | Builtin::JsonAsNum | Builtin::JsonAsInt | Builtin::JsonAsBool => {
+            if nullish && flag(1) {
+                return Ok(V::Null);
+            }
+            match (b, &a0) {
+                (Builtin::JsonAsStr, V::Json(J::String(s))) => V::Str(s.clone()),
+                (Builtin::JsonAsBool, V::Json(J::Bool(x))) => V::Bool(*x),
+                (Builtin::JsonAsNum, v) if num(v).is_some() => V::Float(num(v).unwrap_or(0.0)),
+                (Builtin::JsonAsInt, v)
+                    if num(v).is_some_and(|x| x.fract() == 0.0 && x.abs() <= 9_007_199_254_740_992.0) =>
+                {
+                    V::Int(num(v).unwrap_or(0.0) as i64)
+                }
+                _ => return Err(rerun("a value of another kind")),
+            }
+        }
+        Builtin::JsonTruthy => V::Bool(match &a0 {
+            V::Null | V::Json(J::Null) => false,
+            V::Json(J::Bool(x)) => *x,
+            V::Json(J::Number(n)) => n.as_f64().is_some_and(|x| x != 0.0),
+            V::Json(J::String(s)) => !s.is_empty(),
+            _ => true,
+        }),
+        Builtin::JsonKind => V::Bool(matches!(&a1, V::Str(k) if k == kind)),
+        _ => match &a0 {
+            V::Null | V::Json(J::Null) if flag(1) => V::Null,
+            V::Null => V::Str("undefined".to_owned()),
+            V::Json(J::Null) => V::Str("null".to_owned()),
+            V::Json(J::String(s)) => V::Str(s.clone()),
+            V::Json(J::Bool(x)) => V::Str(x.to_string()),
+            v if num(v).is_some_and(|x| {
+                (x.fract() == 0.0 && x.abs() < 9_007_199_254_740_992.0)
+                    || (x.fract() != 0.0 && x.abs() >= 1e-6 && x.abs() < 1e15)
+            }) =>
+            {
+                V::Str(num_str(num(v).unwrap_or(0.0)))
+            }
+            _ => return Err(rerun("this value's text")),
+        },
+    })
+}
+
 fn builtin(b: Builtin, a: &[Value]) -> Result<Value> {
     use Value as V;
+    if matches!(
+        b,
+        Builtin::JsonParse
+            | Builtin::JsonGet
+            | Builtin::JsonLen
+            | Builtin::JsonAsStr
+            | Builtin::JsonAsNum
+            | Builtin::JsonAsInt
+            | Builtin::JsonAsBool
+            | Builtin::JsonTruthy
+            | Builtin::JsonKind
+            | Builtin::JsonToStr
+    ) {
+        return json_builtin(b, a);
+    }
     let a0 = a.first().cloned().unwrap_or(V::Null);
     let a1 = a.get(1).cloned().unwrap_or(V::Null);
     Ok(match b {
@@ -943,6 +1093,7 @@ fn builtin(b: Builtin, a: &[Value]) -> Result<Value> {
                 }),
             }
         }
+        _ => return json_builtin(b, a),
     })
 }
 

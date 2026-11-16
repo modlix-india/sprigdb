@@ -599,10 +599,11 @@ impl PassSession {
             }
         }
         // `ALTER TABLE` changing columns compiled validations or triggers
-        // read: refused unless they still bind the same way.
+        // read: refused when they would no longer compile, recompiled
+        // after it when only a type changes.
         if sprig_logic::dependent::is_candidate(&String::from_utf8_lossy(text)) {
             let s = status(self.status());
-            if let Some(step) = Box::pin(self.tenant_column_change(text, s, out)).await? {
+            if let Some(step) = Box::pin(self.tenant_column_change(cx, text, s, out)).await? {
                 return Ok(step);
             }
         }

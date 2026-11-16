@@ -46,6 +46,8 @@ use mongodb::bson::{Bson, Document, doc};
 use mysql_async::prelude::Queryable;
 
 const DB: &str = "rlsm_suite";
+/// The database of the `startAtOperationTime` test.
+const ATDB: &str = "rlsm_at";
 const PW: &str = "Rlsm-suite-pw-1";
 
 struct Checks {
@@ -703,4 +705,129 @@ async fn boolean_policies(
         ],
         || format!("{seen:?}"),
     );
+}
+
+/// `startAtOperationTime`: a stream opened from a cluster time gets the
+/// changes made since then that the watcher may see, and none from
+/// before; an operation time older than the feed time index is 286, and
+/// a second resume option 40674.
+///
+/// The controller writes the time index every 10 s; the stream starts at
+/// its position 30 s or more before the time, so the deployment must have
+/// run for a minute.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn change_stream_starts_at_an_operation_time() {
+    let (Ok(sql_addr), Ok(mongo_addr)) = (
+        std::env::var("SPRIG_TEST_RLS_SQL"),
+        std::env::var("SPRIG_TEST_RLS_MONGO"),
+    ) else {
+        eprintln!("SPRIG_TEST_RLS_SQL or SPRIG_TEST_RLS_MONGO not set; skipped");
+        return;
+    };
+    let mut ck = Checks {
+        n: 0,
+        failed: Vec::new(),
+    };
+    let apw = std::env::var("SPRIG_TEST_RLS_ADMIN_PW").unwrap_or_else(|_| "sprig-dev-app".into());
+    let mut admin_sql = sql(&sql_addr, "app", &apw).await;
+    let admin = client(&mongo_addr, "app", &apw).await;
+    let adb = admin.database(ATDB);
+    let _ = adb.drop().await;
+    let _ = admin_sql
+        .query_drop("DROP USER IF EXISTS 'rlsm_at_alice'@'%'")
+        .await;
+    let notes = adb.collection::<Document>("notes");
+    notes
+        .insert_many([
+            doc! {"_id": 1, "owner": "rlsm_at_alice@%"},
+            doc! {"_id": 2, "owner": "rlsm_at_bob@%"},
+        ])
+        .await
+        .unwrap();
+    adb.run_command(
+        doc! {"sprigCreatePolicy": "notes", "name": "own", "using": {"owner": "$$USER"}},
+    )
+    .await
+    .unwrap();
+    adb.run_command(doc! {"sprigRowSecurity": "notes", "enable": true})
+        .await
+        .unwrap();
+    admin_sql
+        .query_drop(format!(
+            "CREATE USER 'rlsm_at_alice'@'%' IDENTIFIED BY '{PW}'"
+        ))
+        .await
+        .unwrap();
+    admin_sql
+        .query_drop(format!(
+            "GRANT SELECT, WATCH ON {ATDB}.* TO 'rlsm_at_alice'@'%'"
+        ))
+        .await
+        .unwrap();
+    // Statement stamps round up to the next second: the time is taken
+    // two seconds after the first writes and a second before the next.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let r = adb.run_command(doc! {"ping": 1}).await.unwrap();
+    let at = r.get_timestamp("operationTime").unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    notes
+        .insert_many([
+            doc! {"_id": 3, "owner": "rlsm_at_alice@%"},
+            doc! {"_id": 4, "owner": "rlsm_at_bob@%"},
+        ])
+        .await
+        .unwrap();
+    notes
+        .update_one(doc! {"_id": 3}, doc! {"$set": {"owner": "rlsm_at_bob@%"}})
+        .await
+        .unwrap();
+
+    let alice = client(&mongo_addr, "rlsm_at_alice", PW).await;
+    let ac = alice.database(ATDB).collection::<Document>("notes");
+    let mut st = ac.watch().start_at_operation_time(at).await;
+    match &mut st {
+        Ok(st) => {
+            let ev = collect_events(st, 3, 12).await;
+            ck.ok(
+                "from the time: alice's insert of 3, then its delete when it became bob's",
+                ev == ["Insert:3", "Delete:3"],
+                || format!("{ev:?}"),
+            );
+        }
+        Err(e) => ck.ok("stream from the time opens", false, || format!("{e}")),
+    }
+    let old = ac
+        .watch()
+        .start_at_operation_time(mongodb::bson::Timestamp {
+            time: 1,
+            increment: 0,
+        })
+        .await;
+    ck.ok(
+        "a time older than the index: 286",
+        old.as_ref().is_err_and(|e| code_of(e) == 286),
+        || format!("{:?}", old.as_ref().err()),
+    );
+    let both = alice
+        .database(ATDB)
+        .run_command(doc! {"aggregate": "notes", "cursor": {},
+            "pipeline": [{"$changeStream": {"startAtOperationTime": at, "resumeAfter": {"_data": "00"}}}]})
+        .await;
+    ck.ok(
+        "two resume options: 40674",
+        both.as_ref().is_err_and(|e| code_of(e) == 40674),
+        || format!("{both:?}"),
+    );
+
+    drop(st);
+    let _ = adb.drop().await;
+    let _ = admin_sql
+        .query_drop("DROP USER IF EXISTS 'rlsm_at_alice'@'%'")
+        .await;
+    println!(
+        "change stream from an operation time: {} checks, {} failed",
+        ck.n,
+        ck.failed.len()
+    );
+    assert!(ck.failed.is_empty(), "{:#?}", ck.failed);
 }

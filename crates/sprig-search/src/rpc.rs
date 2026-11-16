@@ -6,7 +6,8 @@
 //! Query(index, generation, query, ops, wait):
 //!   the copy of that generation, else 39825 (retryable: another copy)
 //!   wait: ready (stale_ok), or every target position applied (latest)
-//!   each op over the same query: top k, all (up to a window), count, facet
+//!   each op over the same query: top k, all (up to a window), every (all,
+//!   with every term a prefix or fuzzy term matches), count, facet
 //!   → answers, and the positions the copy had applied
 //! ```
 
@@ -30,6 +31,13 @@ pub enum Op {
     },
     /// Every hit, 39827 past `max`.
     All {
+        /// `search.max_window`.
+        max: usize,
+    },
+    /// Every hit, 39827 past `max`, with each prefix and fuzzy term
+    /// expanded to every term it matches (a bound caller's candidates;
+    /// [`SearchIndex::every`]).
+    Every {
         /// `search.max_window`.
         max: usize,
     },
@@ -148,6 +156,7 @@ pub fn execute(
                     Answer::Hits(index.top(query, *k, *scoring, max_expansions)?)
                 }
                 Op::All { max } => Answer::Hits(index.all(query, *max, max_expansions)?),
+                Op::Every { max } => Answer::Hits(index.every(query, *max)?),
                 Op::Count => Answer::Count(index.count(query, max_expansions)?),
                 Op::Facet { path, n, bounds } => Answer::Buckets(index.facet(
                     query,

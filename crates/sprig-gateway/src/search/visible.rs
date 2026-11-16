@@ -25,6 +25,17 @@
 //!   the index (Scoring::Plain); the front end leaves out hidden hits
 //! ```
 //!
+//! Prefix and fuzzy terms (`trai*`, `runing~1`) become the most frequent
+//! `search.max_expansions` terms they match. For a bound caller those
+//! terms are chosen among the rows it may see:
+//!
+//! ```text
+//! candidates: every_hit (Op::Every): every term each one matches
+//! rescore, counts, facets: query AND _key IN visible; the copy chooses
+//!   the terms by their frequency in the visible hits alone
+//! past the window (plain_top): chosen over every row; see plain_top
+//! ```
+//!
 //! Callers no policy binds keep the single call to the copy. A front end
 //! that can't tell whether a policy binds (`None`) takes the visible path.
 
@@ -75,7 +86,7 @@ pub async fn all_hits(
     consistency: Consistency,
 ) -> Result<Vec<Hit>> {
     let max = svc.knobs().max_window;
-    crate::exec::search::run_search(svc, tenant, cat, def, query, None, consistency)
+    every_hit(svc, tenant, cat, def, query, consistency)
         .await
         .map_err(|e| {
             if e.code() == Some(SprigCode::SearchWindowExceeded) {
@@ -85,6 +96,26 @@ pub async fn all_hits(
                 e
             }
         })
+}
+
+/// Every hit of `query` a bound caller could see, for it to re-read: each
+/// prefix and fuzzy term expanded to every term it matches (`Op::Every`),
+/// so no hidden row's words push a visible row's word out of the
+/// `search.max_expansions` chosen. The copy's 39827 past
+/// `search.max_window` (it counts hidden rows: worded without the count).
+///
+/// # Errors
+/// 39827; the copy's.
+pub async fn every_hit(
+    svc: &Arc<SearchService>,
+    tenant: TenantId,
+    cat: &TenantCatalog,
+    def: &Arc<IndexDef>,
+    query: SearchQuery,
+    consistency: Consistency,
+) -> Result<Vec<Hit>> {
+    let max = svc.knobs().max_window;
+    crate::exec::search::run_op(svc, tenant, cat, def, query, Op::Every { max }, consistency).await
 }
 
 /// Every hit of `query` for a bound caller to re-read; `None` when it
@@ -100,7 +131,7 @@ pub async fn candidates(
     query: SearchQuery,
     consistency: Consistency,
 ) -> Result<Option<Vec<Hit>>> {
-    match crate::exec::search::run_search(svc, tenant, cat, def, query, None, consistency).await {
+    match every_hit(svc, tenant, cat, def, query, consistency).await {
         Ok(h) => Ok(Some(h)),
         Err(e) if e.code() == Some(SprigCode::SearchWindowExceeded) => Ok(None),
         Err(e) => Err(e),
@@ -146,7 +177,10 @@ pub async fn rescore(
 
 /// The best `k` hits of `query` with no statistics of the index (a bound
 /// caller's search past the window); hidden ones included, for the front
-/// end to leave out.
+/// end to leave out. Its prefix and fuzzy terms are still the most
+/// frequent over every row (the visible rows aren't known past the
+/// window): with more than `search.max_expansions` such terms, hidden
+/// rows' words can take the places of a visible row's word.
 ///
 /// # Errors
 /// The copy's.

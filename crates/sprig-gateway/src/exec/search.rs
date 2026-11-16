@@ -1123,10 +1123,24 @@ impl PassSession {
                 knobs.consistency
             };
             let started = std::time::Instant::now();
-            let mut hits = self
-                .run_search(svc, tenant, &cat, &def, query.clone(), None, consistency)
-                .await?;
-            if self.bound_by_policy(&def) {
+            let bound = self.bound_by_policy(&def);
+            let mut hits = if bound {
+                // Every candidate (prefix and fuzzy terms not cut down by
+                // hidden rows' words), to re-read.
+                crate::search::visible::every_hit(
+                    svc,
+                    tenant,
+                    &cat,
+                    &def,
+                    query.clone(),
+                    consistency,
+                )
+                .await?
+            } else {
+                self.run_search(svc, tenant, &cat, &def, query.clone(), None, consistency)
+                    .await?
+            };
+            if bound {
                 // Only the hits the session reads, scored over themselves:
                 // no hidden key reaches the statement, no score moves with
                 // hidden rows.
@@ -1269,7 +1283,7 @@ impl PassSession {
         let hits = if self.bound_by_policy(&def) {
             // The best `limit` of the hits the session reads, scored over
             // them; past the window, plain scores, hidden hits left out.
-            match crate::search::visible::candidates(
+            let all = crate::search::visible::candidates(
                 svc,
                 tenant,
                 cat,
@@ -1277,38 +1291,35 @@ impl PassSession {
                 query.clone(),
                 consistency,
             )
-            .await?
-            {
-                Some(all) => {
-                    let seen = self
-                        .visible_hits(cx, wire, &def, &table, &all, usize::MAX)
-                        .await?;
-                    crate::search::visible::rescore(
-                        svc,
-                        tenant,
-                        cat,
-                        &def,
-                        query.clone(),
-                        seen.into_iter().map(|h| h.key).collect(),
-                        Some(limit),
-                        consistency,
-                    )
-                    .await?
-                }
-                None => {
-                    let top = crate::search::visible::plain_top(
-                        svc,
-                        tenant,
-                        cat,
-                        &def,
-                        query.clone(),
-                        knobs.max_window,
-                        consistency,
-                    )
+            .await?;
+            if let Some(all) = all {
+                let seen = self
+                    .visible_hits(cx, wire, &def, &table, &all, usize::MAX)
                     .await?;
-                    self.visible_hits(cx, wire, &def, &table, &top, limit)
-                        .await?
-                }
+                crate::search::visible::rescore(
+                    svc,
+                    tenant,
+                    cat,
+                    &def,
+                    query.clone(),
+                    seen.into_iter().map(|h| h.key).collect(),
+                    Some(limit),
+                    consistency,
+                )
+                .await?
+            } else {
+                let top = crate::search::visible::plain_top(
+                    svc,
+                    tenant,
+                    cat,
+                    &def,
+                    query.clone(),
+                    knobs.max_window,
+                    consistency,
+                )
+                .await?;
+                self.visible_hits(cx, wire, &def, &table, &top, limit)
+                    .await?
             }
         } else {
             run_search(
@@ -1440,6 +1451,7 @@ impl PassSession {
             def,
             query,
             consistency,
+            !shown,
             shown.then_some(hits),
             shown.then_some(took),
         )

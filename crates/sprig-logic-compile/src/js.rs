@@ -99,6 +99,61 @@ pub struct Signature {
     /// sees. `params` and `returns` are then unused: the code's own
     /// parameters bind by name (see [`compile_with`]).
     pub row: Option<String>,
+    /// Triggers on streams and queues: what the code's `ctx` holds. The
+    /// IR's parameters are then the fields of `ctx.record` or
+    /// `ctx.message` the code reads (see [`MsgSource::fields`]).
+    pub on: Option<MsgSource>,
+}
+
+/// What a trigger on a stream or queue gets: `ctx.record` or
+/// `ctx.message`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsgSource {
+    /// `ctx.record {stream, partition, offset, key, value, headers,
+    /// timestamp}`.
+    Stream,
+    /// `ctx.message {queue, vhost, exchange, routingKey, body, properties,
+    /// redelivered, deliveryCount}`.
+    Queue,
+}
+
+impl MsgSource {
+    /// `record` or `message`.
+    #[must_use]
+    pub const fn member(self) -> &'static str {
+        match self {
+            MsgSource::Stream => "record",
+            MsgSource::Queue => "message",
+        }
+    }
+
+    /// The fields the code can read, their types, and whether each is
+    /// never `null`. A field's parameter is its name in lower case.
+    /// `headers` and `properties` are parsed JSON objects.
+    #[must_use]
+    pub const fn fields(self) -> &'static [(&'static str, Ty, bool)] {
+        match self {
+            MsgSource::Stream => &[
+                ("stream", Ty::Str, true),
+                ("partition", Ty::Int, true),
+                ("offset", Ty::Int, true),
+                ("key", Ty::Str, false),
+                ("value", Ty::Str, false),
+                ("headers", Ty::Json, true),
+                ("timestamp", Ty::Int, true),
+            ],
+            MsgSource::Queue => &[
+                ("queue", Ty::Str, true),
+                ("vhost", Ty::Str, true),
+                ("exchange", Ty::Str, false),
+                ("routingKey", Ty::Str, false),
+                ("body", Ty::Str, true),
+                ("properties", Ty::Json, true),
+                ("redelivered", Ty::Bool, true),
+                ("deliveryCount", Ty::Int, true),
+            ],
+        }
+    }
 }
 
 impl Signature {
@@ -107,6 +162,15 @@ impl Signature {
     pub fn row_of(table: &str) -> Self {
         Self {
             row: Some(table.to_ascii_lowercase()),
+            ..Self::default()
+        }
+    }
+
+    /// The signature of a trigger on a stream or queue.
+    #[must_use]
+    pub fn message(on: MsgSource) -> Self {
+        Self {
+            on: Some(on),
             ..Self::default()
         }
     }
@@ -289,6 +353,11 @@ enum Var {
     },
     /// A validation's or trigger's `ctx`: only `ctx.trigger.*` compiles.
     Ctx,
+    /// A trigger on a stream or queue's `ctx`: `ctx.record` or
+    /// `ctx.message`, and `ctx.log`.
+    Msg,
+    /// `ctx.record` or `ctx.message` (also given a name of its own).
+    Event,
     /// A validation's or trigger's scalar: a column, `old_<column>` or
     /// `op`, made a parameter when first read.
     Field(String),
@@ -439,6 +508,12 @@ struct L<'s, 'c> {
     reaches: BTreeSet<u64>,
     /// The longest chain of compiled calls below this code.
     depth: u32,
+    /// Triggers on streams and queues: what `ctx` holds.
+    msg: Option<MsgSource>,
+    /// Locals and parameters holding parsed JSON ([`Builtin::JsonParse`]):
+    /// their `NULL` is `undefined`, and JSON `null` is the text `null`.
+    dyn_locals: BTreeSet<LocalId>,
+    dyn_params: BTreeSet<u16>,
 }
 
 /// Whether control can't continue after the lowered statements.
@@ -520,7 +595,7 @@ impl<'s, 'c> L<'s, 'c> {
         };
         // A validation's or trigger's parameters are the columns it reads,
         // added as they are read.
-        if sig.row.is_none() {
+        if sig.row.is_none() && sig.on.is_none() {
             f.params = sig
                 .params
                 .iter()
@@ -563,6 +638,9 @@ impl<'s, 'c> L<'s, 'c> {
             calls: Vec::new(),
             reaches: BTreeSet::new(),
             depth: 0,
+            msg: sig.on,
+            dyn_locals: BTreeSet::new(),
+            dyn_params: BTreeSet::new(),
         }
     }
 
@@ -795,6 +873,8 @@ impl<'s, 'c> L<'s, 'c> {
         if !module {
             if self.table.is_some() {
                 self.bind_row_names();
+            } else if self.msg.is_some() {
+                self.bind("ctx", Var::Msg);
             } else {
                 for (i, (n, _)) in self.sig.params.iter().enumerate() {
                     let n = n.clone();
@@ -981,6 +1061,26 @@ impl<'s, 'c> L<'s, 'c> {
     fn params(&mut self, ps: &FormalParameters<'_>, span: Span) -> R<()> {
         if self.table.is_some() {
             return self.row_params(ps);
+        }
+        if self.msg.is_some() {
+            // The engine tier calls it with `ctx` alone.
+            if ps.rest.is_some() || ps.items.len() > 1 {
+                return self.stop(
+                    "js.params",
+                    span,
+                    "a trigger on a stream or queue takes one parameter, ctx",
+                );
+            }
+            match ps.items.first() {
+                None => self.bind("ctx", Var::Msg),
+                Some(p) => match &p.pattern {
+                    BindingPattern::BindingIdentifier(b) if p.initializer.is_none() => {
+                        self.bind(b.name.as_str(), Var::Msg);
+                    }
+                    _ => return self.stop("js.params", p.span, "parameters must be plain names"),
+                },
+            }
+            return Ok(());
         }
         if ps.rest.is_some() || ps.items.len() != self.sig.params.len() {
             return self.stop(
@@ -1716,7 +1816,36 @@ impl<'s, 'c> L<'s, 'c> {
     }
 
     fn declare(&mut self, d: &VariableDeclaration<'_>, out: &mut Block) -> R<()> {
+        let constant = matches!(d.kind, oxc_ast::ast::VariableDeclarationKind::Const);
         for decl in &d.declarations {
+            // `const r = ctx.record;` and `const { key, value } = ctx.record;`.
+            if let Some(init) = &decl.init
+                && constant
+                && self.event_of(init)
+            {
+                match &decl.id {
+                    BindingPattern::BindingIdentifier(id) => {
+                        self.bind(id.name.as_str(), Var::Event);
+                        continue;
+                    }
+                    BindingPattern::ObjectPattern(o) if o.rest.is_none() => {
+                        for p in &o.properties {
+                            let (Some(k), BindingPattern::BindingIdentifier(id)) =
+                                (p.key.static_name(), &p.value)
+                            else {
+                                return self.stop("js.destructuring", p.span, "destructuring");
+                            };
+                            if p.computed {
+                                return self.stop("js.destructuring", p.span, "destructuring");
+                            }
+                            let v = self.msg_field(k.as_ref(), p.span)?;
+                            self.bind(id.name.as_str(), Var::Val(v));
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             let BindingPattern::BindingIdentifier(id) = &decl.id else {
                 return self.stop("js.destructuring", decl.span, "destructuring");
             };
@@ -1757,6 +1886,9 @@ impl<'s, 'c> L<'s, 'c> {
                 (None, t) => t,
             };
             let l = self.f.local(name, ty);
+            if self.is_dyn(&v) {
+                self.dyn_locals.insert(l);
+            }
             let e = self.coerce(v.clone(), ty, decl.span)?;
             self.flush(out);
             out.push(Stmt::Assign(l, e));
@@ -1789,6 +1921,14 @@ impl<'s, 'c> L<'s, 'c> {
                         };
                         self.flush(out);
                         out.push(Stmt::Throw(ErrorSpec::new(39863, m)));
+                        Ok(())
+                    }
+                    Some(["ctx" | "console", "log"]) if self.msg.is_some() => {
+                        // Triggers on streams and queues keep their log
+                        // lines for the run log.
+                        let line = self.log_line(c)?;
+                        self.flush(out);
+                        out.push(Stmt::Log(line));
                         Ok(())
                     }
                     Some(["ctx" | "console", "log"]) => {
@@ -1875,6 +2015,13 @@ impl<'s, 'c> L<'s, 'c> {
             Some(op) => self.binary(op, cur.clone(), rhs, span)?,
         };
         let ty = self.f.local_def(l).ty;
+        if ty == Ty::Json && self.dyn_locals.contains(&l) != self.is_dyn(&v) {
+            return self.stop(
+                "js.types",
+                span,
+                format!("{name} holds a parsed JSON value and another kind of value"),
+            );
+        }
         self.flush(out);
         let e = match self.coerce(v.clone(), ty, span) {
             Ok(e) => e,
@@ -1910,10 +2057,15 @@ impl<'s, 'c> L<'s, 'c> {
         let BindingPattern::BindingIdentifier(id) = &decl.id else {
             return self.stop("js.destructuring", decl.span, "destructuring");
         };
+        // An array of parsed JSON: its elements are parsed values too.
+        let mut parsed = false;
         let (src, cols) = match &fo.right {
             Expression::Identifier(i) => match self.lookup(i.name.as_str()) {
                 Some(Var::Rows { local, cols }) => (Expr::Local(local), Some(cols)),
-                Some(Var::Local(l)) if self.f.local_def(l).ty == Ty::Json => (Expr::Local(l), None),
+                Some(Var::Local(l)) if self.f.local_def(l).ty == Ty::Json => {
+                    parsed = self.dyn_locals.contains(&l);
+                    (Expr::Local(l), None)
+                }
                 _ => return self.stop("js.for_of", fo.span, "for ... of rows from db.sql"),
             },
             other => {
@@ -1923,7 +2075,18 @@ impl<'s, 'c> L<'s, 'c> {
                         out.extend(pre);
                         (Expr::Local(local), Some(cols))
                     }
-                    _ => return self.stop("js.for_of", fo.span, "for ... of rows from db.sql"),
+                    Some(_) => {
+                        return self.stop("js.for_of", fo.span, "for ... of rows from db.sql");
+                    }
+                    None if self.msg.is_some() => {
+                        let v = self.val(other)?;
+                        if !self.is_dyn(&v) {
+                            return self.stop("js.for_of", fo.span, "for ... of rows from db.sql");
+                        }
+                        parsed = true;
+                        (v.e, None)
+                    }
+                    None => return self.stop("js.for_of", fo.span, "for ... of rows from db.sql"),
                 }
             }
         };
@@ -1934,16 +2097,48 @@ impl<'s, 'c> L<'s, 'c> {
         let len = self.f.local(&format!("of{n}_length"), Ty::Int);
         let cur = self.f.local(&format!("of{n}_index"), Ty::Int);
         out.push(Stmt::Assign(arr, src));
-        out.push(Stmt::Assign(
-            len,
-            Expr::bin(
-                BinOp::Coalesce,
-                Expr::call(Builtin::JsonLength, vec![Expr::Local(arr)]),
-                Expr::int(0),
-            ),
-        ));
+        if parsed {
+            // JavaScript iterates an array; a string's characters, or a
+            // TypeError for anything else: the engine tier.
+            self.dyn_locals.insert(arr);
+            let not_array = Expr::Unary(
+                UnOp::Not,
+                Box::new(Expr::call(
+                    Builtin::JsonKind,
+                    vec![Expr::Local(arr), Expr::Lit(Literal::Str("array".to_owned()))],
+                )),
+            );
+            let msg = format!(
+                "{}: for ... of over a value that isn't an array",
+                crate::ir::ENGINE_RERUN_TEXT
+            );
+            out.push(Stmt::If(
+                not_array,
+                vec![Stmt::Throw(ErrorSpec::new(
+                    crate::ir::ENGINE_RERUN,
+                    Expr::Lit(Literal::Str(msg)),
+                ))],
+                Vec::new(),
+            ));
+            out.push(Stmt::Assign(
+                len,
+                Expr::call(Builtin::JsonLen, vec![Expr::Local(arr)]),
+            ));
+        } else {
+            out.push(Stmt::Assign(
+                len,
+                Expr::bin(
+                    BinOp::Coalesce,
+                    Expr::call(Builtin::JsonLength, vec![Expr::Local(arr)]),
+                    Expr::int(0),
+                ),
+            ));
+        }
         out.push(Stmt::Assign(cur, Expr::int(0)));
         let each = self.f.local(id.name.as_str(), Ty::Json);
+        if parsed {
+            self.dyn_locals.insert(each);
+        }
         self.loop_entry();
         let body = self.scoped(|l| {
             l.bind(
@@ -1960,14 +2155,19 @@ impl<'s, 'c> L<'s, 'c> {
             b
         });
         self.loop_entry();
+        let element = if parsed {
+            Expr::call(
+                Builtin::JsonGet,
+                vec![Expr::Local(arr), Expr::Local(cur), Expr::bool(false)],
+            )
+        } else {
+            Expr::Path(
+                Box::new(Expr::Local(arr)),
+                vec![PathSeg::Index(Box::new(Expr::Local(cur)))],
+            )
+        };
         let mut full = vec![
-            Stmt::Assign(
-                each,
-                Expr::Path(
-                    Box::new(Expr::Local(arr)),
-                    vec![PathSeg::Index(Box::new(Expr::Local(cur)))],
-                ),
-            ),
+            Stmt::Assign(each, element),
             Stmt::Assign(cur, Expr::bin(BinOp::Add, Expr::Local(cur), Expr::int(1))),
         ];
         full.extend(body);
@@ -2074,6 +2274,13 @@ impl<'s, 'c> L<'s, 'c> {
         };
         let mut exprs = Vec::new();
         for (k, v) in fields {
+            if self.is_dyn(&v) {
+                return self.stop(
+                    "js.return",
+                    span,
+                    format!("field {k} is a parsed JSON value (JSON.stringify drops undefined)"),
+                );
+            }
             let ty = if v.ty == Ty::Null { None } else { Some(v.ty) };
             let decl = self.events[idx].1.iter().position(|(n, _)| *n == k);
             match (decl, ty) {
@@ -2213,7 +2420,7 @@ impl<'s, 'c> L<'s, 'c> {
         };
         let base: &'static str = match self.lookup(obj.name.as_str()) {
             Some(Var::Module(m)) => m,
-            Some(Var::Ctx) => "ctx",
+            Some(Var::Ctx | Var::Msg) => "ctx",
             None => match obj.name.as_str() {
                 "Math" => "Math",
                 // QuickJS's globals, in a module too.
@@ -2222,6 +2429,7 @@ impl<'s, 'c> L<'s, 'c> {
                 "ctx" => "ctx",
                 "console" => "console",
                 "JSON" => "JSON",
+                "Array" => "Array",
                 _ => return None,
             },
             Some(_) => return None,
@@ -2243,6 +2451,8 @@ impl<'s, 'c> L<'s, 'c> {
             "pow" => "pow",
             "max" => "max",
             "min" => "min",
+            "parse" => "parse",
+            "isArray" => "isArray",
             _ => "?",
         };
         Some(vec![base, prop])
@@ -2284,6 +2494,9 @@ impl<'s, 'c> L<'s, 'c> {
             _ => return self.stop("db.dynamic_sql", c.span, "the SQL text must be a literal"),
         };
         let mut binds = Vec::new();
+        // Parsed JSON arguments: bound as their column's type, once the
+        // statement says which.
+        let mut parsed: Vec<(usize, V, Span)> = Vec::new();
         match c.arguments.get(1).map(|a| a.as_expression()) {
             None => {}
             Some(Some(Expression::ArrayExpression(a))) => {
@@ -2292,6 +2505,11 @@ impl<'s, 'c> L<'s, 'c> {
                         return self.stop("js.spread", a.span, "spread in the arguments");
                     };
                     let v = self.val(x)?;
+                    if self.is_dyn(&v) {
+                        parsed.push((binds.len(), v, x.span()));
+                        binds.push(Expr::Lit(Literal::Null));
+                        continue;
+                    }
                     if v.ty == Ty::Json {
                         return self.stop(
                             "db.json_bind",
@@ -2331,6 +2549,21 @@ impl<'s, 'c> L<'s, 'c> {
                 ),
             ));
             return Err(Stop);
+        }
+        for (i, v, span) in parsed {
+            // The engine tier binds the value's own kind; read as the
+            // column's type, another kind runs the record in the engine
+            // tier (`null` and `undefined` bind as NULL in both).
+            let ty = bound.targets.get(i).copied().flatten();
+            let Some(r) = ty.and_then(|t| Self::undyn(v, t, true)) else {
+                return self.stop(
+                    "db.json_bind",
+                    span,
+                    "a parsed JSON value bound where the statement doesn't name its column \
+                     (or the column is JSON): convert it first, with String(x) or Number(x)",
+                );
+            };
+            binds[i] = r.e;
         }
         self.tmp += 1;
         let base = if name.is_empty() {
@@ -2444,6 +2677,22 @@ impl L<'_, '_> {
                 return self.stop("js.spread", c.span, "spread in the arguments");
             };
             let v = self.val(x)?;
+            if self.is_dyn(&v) {
+                // Read as the parameter's type (MariaDB converts the engine
+                // tier's value to it); another kind runs in the engine tier.
+                let ty = callee.params.get(binds.len()).copied().unwrap_or(Ty::Json);
+                match Self::undyn(v, ty, true) {
+                    Some(r) => binds.push(r.e),
+                    None => {
+                        return self.stop(
+                            "db.json_bind",
+                            x.span(),
+                            "a parsed JSON value passed as a JSON parameter",
+                        );
+                    }
+                }
+                continue;
+            }
             if v.ty == Ty::Json {
                 return self.stop("db.json_bind", x.span(), "JSON values can't be passed yet");
             }
@@ -2658,6 +2907,10 @@ impl L<'_, '_> {
                     let v = self.val(x)?;
                     // The engine tier's text of a value: text as it is,
                     // `null` as NULL, anything else as its JSON text.
+                    if self.is_dyn(&v) {
+                        binds.push(Expr::call(Builtin::JsonToStr, vec![v.e, Expr::bool(true)]));
+                        continue;
+                    }
                     match v.ty {
                         Ty::Str => v.e,
                         Ty::Null => Expr::Lit(Literal::Null),
@@ -2865,6 +3118,7 @@ impl L<'_, '_> {
                 Expr::call(Builtin::Present, vec![v.e.clone()]),
                 Expr::bin(BinOp::Ne, Expr::call(Builtin::Len, vec![v.e]), Expr::int(0)),
             ),
+            Ty::Json if self.dyn_expr(&v.e) => Expr::call(Builtin::JsonTruthy, vec![v.e]),
             Ty::Json => match &v.e {
                 Expr::ObjectLit(_) | Expr::ArrayLit(_) => Expr::bool(true),
                 _ => {
@@ -3038,7 +3292,9 @@ impl L<'_, '_> {
                         | Var::Elem { .. }
                         | Var::Module(_)
                         | Var::Image { .. }
-                        | Var::Ctx,
+                        | Var::Ctx
+                        | Var::Msg
+                        | Var::Event,
                     ) => self.stop(
                         "js.value",
                         id.span,
@@ -3048,156 +3304,7 @@ impl L<'_, '_> {
                     None => self.stop("js.unknown_name", id.span, format!("unknown name {name}")),
                 }
             }
-            Expression::StaticMemberExpression(m) => {
-                let prop = m.property.name.as_str();
-                if let Some(old) = self.image_of(&m.object) {
-                    return self.image_col(old, prop, m.span);
-                }
-                if prop == "op" && self.ctx_trigger(&m.object) {
-                    return self.field_val("op", m.span);
-                }
-                if let Expression::StaticMemberExpression(inner) = strip_parens(&m.object)
-                    && inner.property.name.as_str() == "fields"
-                    && let Expression::Identifier(obj) = strip_parens(&inner.object)
-                    && let Some(Var::Call { cols, .. }) = self.lookup(obj.name.as_str())
-                {
-                    // A field the callee doesn't return is `undefined`,
-                    // which the IR has no value for.
-                    let Some((_, l)) = cols.iter().find(|(c, _)| c == prop) else {
-                        return self.stop(
-                            "js.member",
-                            m.span,
-                            format!("the call returns no field {prop}"),
-                        );
-                    };
-                    return Ok(V {
-                        e: Expr::Local(*l),
-                        ty: self.f.local_def(*l).ty,
-                        nn: false,
-                    });
-                }
-                if let Expression::Identifier(obj) = strip_parens(&m.object)
-                    && let Some(var) = self.lookup(obj.name.as_str())
-                {
-                    match var {
-                        Var::Call { event, .. } if prop == "event" => {
-                            return Ok(V {
-                                e: Expr::Local(event),
-                                ty: Ty::Str,
-                                nn: true,
-                            });
-                        }
-                        Var::Call { cols, .. } if prop == "fields" => {
-                            return Ok(Self::call_fields(&cols));
-                        }
-                        Var::Row { found, cols } => {
-                            let Some((_, l)) = cols.iter().find(|(c, _)| c == prop).cloned() else {
-                                return self.stop(
-                                    "js.member",
-                                    m.span,
-                                    format!("the row has no column {prop}"),
-                                );
-                            };
-                            if !self.facts.contains(&Key::L(found)) {
-                                if self.cond > 0 {
-                                    return self.stop(
-                                        "js.null_row",
-                                        m.span,
-                                        format!("{} may be null here", obj.name.as_str()),
-                                    );
-                                }
-                                self.guard(found, prop);
-                            }
-                            return Ok(V {
-                                e: Expr::Local(l),
-                                ty: self.f.local_def(l).ty,
-                                nn: false,
-                            });
-                        }
-                        Var::Exec { affected } if prop == "affected" => {
-                            return Ok(V {
-                                e: Expr::Local(affected),
-                                ty: Ty::Int,
-                                nn: true,
-                            });
-                        }
-                        Var::Elem { local, cols } => {
-                            let Some((_, ty)) = cols.iter().find(|(c, _)| c == prop).cloned()
-                            else {
-                                return self.stop(
-                                    "js.member",
-                                    m.span,
-                                    format!("the rows have no column {prop}"),
-                                );
-                            };
-                            let path = Expr::Path(
-                                Box::new(Expr::Local(local)),
-                                vec![PathSeg::Key(prop.to_owned())],
-                            );
-                            let (e, ty) = match ty {
-                                Ty::Int | Ty::Float => {
-                                    (Expr::call(Builtin::JsonNum, vec![path]), Ty::Float)
-                                }
-                                Ty::Str => (Expr::call(Builtin::JsonStr, vec![path]), Ty::Str),
-                                _ => (path, Ty::Json),
-                            };
-                            return Ok(V { e, ty, nn: false });
-                        }
-                        Var::Exc { caught, readable } => {
-                            if !matches!(prop, "message" | "name") {
-                                return self.stop(
-                                    "js.catch_value",
-                                    m.span,
-                                    format!("reading .{prop} of a caught error"),
-                                );
-                            }
-                            if !readable {
-                                return self.stop(
-                                    "js.catch_value",
-                                    m.span,
-                                    "the try can raise a database error (or a thrown value that \
-                                     isn't an error), whose text can differ between MariaDB and the \
-                                     engine tier",
-                                );
-                            }
-                            let l = if prop == "message" {
-                                caught.message
-                            } else {
-                                caught.name
-                            };
-                            return Ok(V {
-                                e: Expr::Local(l),
-                                ty: Ty::Str,
-                                nn: true,
-                            });
-                        }
-                        Var::Rows { local, .. } if prop == "length" => {
-                            return Ok(V {
-                                e: Expr::bin(
-                                    BinOp::Coalesce,
-                                    Expr::call(Builtin::JsonLength, vec![Expr::Local(local)]),
-                                    Expr::int(0),
-                                ),
-                                ty: Ty::Int,
-                                nn: true,
-                            });
-                        }
-                        _ => {}
-                    }
-                }
-                let v = self.val(&m.object)?;
-                match (v.ty, prop) {
-                    (Ty::Str, "length") => {
-                        self.need_nn(&v, m.span)?;
-                        Ok(V {
-                            e: Expr::call(Builtin::Len, vec![v.e]),
-                            ty: Ty::Int,
-                            nn: true,
-                        })
-                    }
-                    _ => self.stop("js.member", m.span, format!("reading .{prop} here")),
-                }
-            }
+            Expression::StaticMemberExpression(m) => self.static_member(m),
             Expression::UnaryExpression(u) => {
                 let v = self.val(&u.argument)?;
                 match u.operator {
@@ -3222,6 +3329,9 @@ impl L<'_, '_> {
                 }
             }
             Expression::BinaryExpression(b) => {
+                if let Some(v) = self.dyn_test(b)? {
+                    return Ok(v);
+                }
                 let x = self.val(&b.left)?;
                 let y = self.val(&b.right)?;
                 self.binary(b.operator, x, y, b.span)
@@ -3237,6 +3347,10 @@ impl L<'_, '_> {
                     }
                     LogicalOperator::Coalesce => self.cond_val(&l.right, BTreeSet::new())?,
                 };
+                let (xd, yd) = (self.is_dyn(&x), self.is_dyn(&y));
+                if xd || yd {
+                    return self.dyn_logical(l.operator, x, y, xd, yd, l.span);
+                }
                 if l.operator == LogicalOperator::Coalesce {
                     let ty = self.join(x.ty, y.ty, l.span)?;
                     let (a, b) = (
@@ -3288,6 +3402,24 @@ impl L<'_, '_> {
                 let t = self.test(&c.test)?;
                 let a = self.cond_val(&c.consequent, self.facts_if(&c.test, true))?;
                 let b = self.cond_val(&c.alternate, self.facts_if(&c.test, false))?;
+                let (a, b) = match (self.is_dyn(&a), self.is_dyn(&b)) {
+                    (true, true) => {
+                        return Ok(V {
+                            e: Expr::Cond(Box::new(t), Box::new(a.e), Box::new(b.e)),
+                            ty: Ty::Json,
+                            nn: false,
+                        });
+                    }
+                    (true, false) => match Self::undyn(a, Self::read_as(b.ty), false) {
+                        Some(a) => (a, b),
+                        None => return self.stop("js.types", c.span, "a parsed JSON value here"),
+                    },
+                    (false, true) => match Self::undyn(b, Self::read_as(a.ty), false) {
+                        Some(b) => (a, b),
+                        None => return self.stop("js.types", c.span, "a parsed JSON value here"),
+                    },
+                    (false, false) => (a, b),
+                };
                 let ty = self.join(a.ty, b.ty, c.span)?;
                 let nn = a.nn && b.nn;
                 let (a, b) = (self.coerce(a, ty, c.span)?, self.coerce(b, ty, c.span)?);
@@ -3301,6 +3433,14 @@ impl L<'_, '_> {
                 let fields = self.fields(o)?;
                 let mut m = Vec::new();
                 for (k, v) in fields {
+                    if self.is_dyn(&v) {
+                        // JSON.stringify drops an `undefined` member.
+                        return self.stop(
+                            "js.dynamic_types",
+                            o.span,
+                            "a parsed JSON value inside an object literal",
+                        );
+                    }
                     let e = v.e;
                     m.push((k, e));
                 }
@@ -3317,6 +3457,13 @@ impl L<'_, '_> {
                         return self.stop("js.spread", a.span, "spread or holes in an array");
                     };
                     let v = self.val(x)?;
+                    if self.is_dyn(&v) {
+                        return self.stop(
+                            "js.dynamic_types",
+                            a.span,
+                            "a parsed JSON value inside an array literal",
+                        );
+                    }
                     items.push(v.e);
                 }
                 Ok(V {
@@ -3338,14 +3485,186 @@ impl L<'_, '_> {
                      tier, and a computed column, validation or trigger can't use it",
                 )
             }
-            Expression::ChainExpression(c) => {
-                self.stop("js.optional_chain", c.span, "optional chaining")
-            }
+            Expression::ChainExpression(c) => match &c.expression {
+                oxc_ast::ast::ChainElement::StaticMemberExpression(m) => self.static_member(m),
+                oxc_ast::ast::ChainElement::ComputedMemberExpression(m) => {
+                    self.computed_member(m)
+                }
+                _ => self.stop("js.optional_chain", c.span, "optional chaining"),
+            },
+            Expression::ComputedMemberExpression(m) => self.computed_member(m),
             other => self.stop(
                 "js.expression",
                 other.span(),
                 "this expression runs in the engine tier",
             ),
+        }
+    }
+
+    /// `obj.prop`, also inside an optional chain (`m.optional` is `?.`).
+    #[allow(clippy::too_many_lines)]
+    fn static_member(&mut self, m: &oxc_ast::ast::StaticMemberExpression<'_>) -> R<V> {
+        let prop = m.property.name.as_str();
+        if self.event_of(&m.object) {
+            return self.msg_field(prop, m.span);
+        }
+        if m.optional {
+            // `?.` compiles on parsed JSON only.
+            let v = self.val(&m.object)?;
+            if !self.is_dyn(&v) {
+                return self.stop("js.optional_chain", m.span, "optional chaining");
+            }
+            return self.json_member(v, prop, true, m.span);
+        }
+        if let Some(old) = self.image_of(&m.object) {
+            return self.image_col(old, prop, m.span);
+        }
+        if prop == "op" && self.ctx_trigger(&m.object) {
+            return self.field_val("op", m.span);
+        }
+        if let Expression::StaticMemberExpression(inner) = strip_parens(&m.object)
+            && inner.property.name.as_str() == "fields"
+            && let Expression::Identifier(obj) = strip_parens(&inner.object)
+            && let Some(Var::Call { cols, .. }) = self.lookup(obj.name.as_str())
+        {
+            // A field the callee doesn't return is `undefined`,
+            // which the IR has no value for.
+            let Some((_, l)) = cols.iter().find(|(c, _)| c == prop) else {
+                return self.stop(
+                    "js.member",
+                    m.span,
+                    format!("the call returns no field {prop}"),
+                );
+            };
+            return Ok(V {
+                e: Expr::Local(*l),
+                ty: self.f.local_def(*l).ty,
+                nn: false,
+            });
+        }
+        if let Expression::Identifier(obj) = strip_parens(&m.object)
+            && let Some(var) = self.lookup(obj.name.as_str())
+        {
+            match var {
+                Var::Call { event, .. } if prop == "event" => {
+                    return Ok(V {
+                        e: Expr::Local(event),
+                        ty: Ty::Str,
+                        nn: true,
+                    });
+                }
+                Var::Call { cols, .. } if prop == "fields" => {
+                    return Ok(Self::call_fields(&cols));
+                }
+                Var::Row { found, cols } => {
+                    let Some((_, l)) = cols.iter().find(|(c, _)| c == prop).cloned() else {
+                        return self.stop(
+                            "js.member",
+                            m.span,
+                            format!("the row has no column {prop}"),
+                        );
+                    };
+                    if !self.facts.contains(&Key::L(found)) {
+                        if self.cond > 0 {
+                            return self.stop(
+                                "js.null_row",
+                                m.span,
+                                format!("{} may be null here", obj.name.as_str()),
+                            );
+                        }
+                        self.guard(found, prop);
+                    }
+                    return Ok(V {
+                        e: Expr::Local(l),
+                        ty: self.f.local_def(l).ty,
+                        nn: false,
+                    });
+                }
+                Var::Exec { affected } if prop == "affected" => {
+                    return Ok(V {
+                        e: Expr::Local(affected),
+                        ty: Ty::Int,
+                        nn: true,
+                    });
+                }
+                Var::Elem { local, cols } => {
+                    let Some((_, ty)) = cols.iter().find(|(c, _)| c == prop).cloned()
+                    else {
+                        return self.stop(
+                            "js.member",
+                            m.span,
+                            format!("the rows have no column {prop}"),
+                        );
+                    };
+                    let path = Expr::Path(
+                        Box::new(Expr::Local(local)),
+                        vec![PathSeg::Key(prop.to_owned())],
+                    );
+                    let (e, ty) = match ty {
+                        Ty::Int | Ty::Float => {
+                            (Expr::call(Builtin::JsonNum, vec![path]), Ty::Float)
+                        }
+                        Ty::Str => (Expr::call(Builtin::JsonStr, vec![path]), Ty::Str),
+                        _ => (path, Ty::Json),
+                    };
+                    return Ok(V { e, ty, nn: false });
+                }
+                Var::Exc { caught, readable } => {
+                    if !matches!(prop, "message" | "name") {
+                        return self.stop(
+                            "js.catch_value",
+                            m.span,
+                            format!("reading .{prop} of a caught error"),
+                        );
+                    }
+                    if !readable {
+                        return self.stop(
+                            "js.catch_value",
+                            m.span,
+                            "the try can raise a database error (or a thrown value that \
+                             isn't an error), whose text can differ between MariaDB and the \
+                             engine tier",
+                        );
+                    }
+                    let l = if prop == "message" {
+                        caught.message
+                    } else {
+                        caught.name
+                    };
+                    return Ok(V {
+                        e: Expr::Local(l),
+                        ty: Ty::Str,
+                        nn: true,
+                    });
+                }
+                Var::Rows { local, .. } if prop == "length" => {
+                    return Ok(V {
+                        e: Expr::bin(
+                            BinOp::Coalesce,
+                            Expr::call(Builtin::JsonLength, vec![Expr::Local(local)]),
+                            Expr::int(0),
+                        ),
+                        ty: Ty::Int,
+                        nn: true,
+                    });
+                }
+                _ => {}
+            }
+        }
+        let v = self.val(&m.object)?;
+        if self.is_dyn(&v) {
+            return self.json_member(v, prop, false, m.span);
+        }
+        match (v.ty, prop) {
+            (Ty::Str, "length") => {
+                self.need_nn(&v, m.span)?;
+                Ok(V {
+                    e: Expr::call(Builtin::Len, vec![v.e]),
+                    ty: Ty::Int,
+                    nn: true,
+                })
+            }
+            _ => self.stop("js.member", m.span, format!("reading .{prop} here")),
         }
     }
 
@@ -3390,6 +3709,9 @@ impl L<'_, '_> {
                 return self.stop("js.spread", c.span, "spread arguments");
             };
             args.push(x);
+        }
+        if let Some(v) = self.json_call(c, &args)? {
+            return Ok(v);
         }
         if let Some(path) = self.callee_path(&c.callee) {
             let b = match path.as_slice() {
@@ -3492,6 +3814,13 @@ impl L<'_, '_> {
                 && args.len() == n
             {
                 let s = self.val(&m.object)?;
+                // On parsed JSON: a string, or the engine tier (a method of
+                // another kind, or a TypeError).
+                let s = if self.is_dyn(&s) {
+                    Self::undyn(s, Ty::Str, false).unwrap_or_else(V::null)
+                } else {
+                    s
+                };
                 if s.ty != Ty::Str {
                     return self.stop("js.call", c.span, format!("{method} on a non-string"));
                 }
@@ -3499,6 +3828,11 @@ impl L<'_, '_> {
                 let mut es = vec![s.e];
                 for a in args {
                     let v = self.val(a)?;
+                    let v = if self.is_dyn(&v) {
+                        Self::undyn(v, Ty::Str, false).unwrap_or_else(V::null)
+                    } else {
+                        v
+                    };
                     if v.ty != Ty::Str || !v.nn {
                         return self.stop(
                             "js.call",
@@ -3769,6 +4103,13 @@ impl L<'_, '_> {
                 }
             }),
             Ty::Null => Ok(V::lit(Literal::Int(0))),
+            // JavaScript's `+x` of anything but a number converts it: run
+            // the record in the engine tier then.
+            Ty::Json if self.dyn_expr(&v.e) => Ok(V {
+                e: Expr::call(Builtin::JsonAsNum, vec![v.e, Expr::bool(false)]),
+                ty: Ty::Float,
+                nn: true,
+            }),
             other => self.stop(
                 "js.dynamic_types",
                 span,
@@ -3851,6 +4192,20 @@ impl L<'_, '_> {
                     || (x.ty.is_number() && y.ty.is_number())
                     || x.ty == Ty::Null
                     || y.ty == Ty::Null;
+                let (xd, yd) = (self.is_dyn(&x), self.is_dyn(&y));
+                if xd != yd {
+                    let (d, o) = if xd { (x, y) } else { (y, x) };
+                    let e = self.dyn_equals(d, o, strict, span)?;
+                    return Ok(V {
+                        e: if negate {
+                            Expr::Unary(UnOp::Not, Box::new(e))
+                        } else {
+                            e
+                        },
+                        ty: Ty::Bool,
+                        nn: true,
+                    });
+                }
                 if x.ty == Ty::Json || y.ty == Ty::Json {
                     return self.stop(
                         "js.dynamic_types",
@@ -3891,6 +4246,31 @@ impl L<'_, '_> {
                     B::LessEqualThan => BinOp::Le,
                     B::GreaterThan => BinOp::Gt,
                     _ => BinOp::Ge,
+                };
+                let (xd, yd) = (self.is_dyn(&x), self.is_dyn(&y));
+                let (x, y) = match (xd, yd) {
+                    // Text with text compares as text; anything else as
+                    // numbers (another kind runs in the engine tier).
+                    (true, false) if y.ty == Ty::Str && y.nn => {
+                        (Self::undyn(x, Ty::Str, false).unwrap_or_else(V::null), y)
+                    }
+                    (false, true) if x.ty == Ty::Str && x.nn => {
+                        let y = Self::undyn(y, Ty::Str, false).unwrap_or_else(V::null);
+                        (x, y)
+                    }
+                    (true, true) => {
+                        return self.stop(
+                            "js.compare",
+                            span,
+                            "comparing two parsed JSON values",
+                        );
+                    }
+                    (true, false) => (self.num(x, span)?, y),
+                    (false, true) => {
+                        let y = self.num(y, span)?;
+                        (x, y)
+                    }
+                    _ => (x, y),
                 };
                 let (a, b) = if x.ty == Ty::Str && y.ty == Ty::Str && x.nn && y.nn {
                     (x.e, y.e)
@@ -3933,6 +4313,9 @@ impl L<'_, '_> {
                     )
                 }
             }
+            Ty::Json if self.dyn_expr(&v.e) => {
+                Expr::call(Builtin::JsonToStr, vec![v.e, Expr::bool(false)])
+            }
             Ty::Json => {
                 return self.stop(
                     "js.dynamic_types",
@@ -3959,6 +4342,11 @@ impl L<'_, '_> {
         if v.ty == ty || v.ty == Ty::Null {
             return Ok(v.e);
         }
+        if self.is_dyn(&v)
+            && let Some(r) = Self::undyn(v.clone(), ty, false)
+        {
+            return Ok(r.e);
+        }
         if ty == Ty::Float && v.ty == Ty::Int {
             return Ok(Expr::call(Builtin::ToFloat, vec![v.e]));
         }
@@ -3971,6 +4359,487 @@ impl L<'_, '_> {
             span,
             format!("a {} value where {ty} is expected", v.ty),
         )
+    }
+}
+
+/// Members every JavaScript object inherits: reading one of a parsed
+/// object gives a function where MariaDB finds no member.
+const PROTO_NAMES: &[&str] = &[
+    "constructor",
+    "__proto__",
+    "hasOwnProperty",
+    "isPrototypeOf",
+    "propertyIsEnumerable",
+    "toLocaleString",
+    "toString",
+    "valueOf",
+    "__defineGetter__",
+    "__defineSetter__",
+    "__lookupGetter__",
+    "__lookupSetter__",
+];
+
+/// Triggers on streams and queues: `ctx.record`, `ctx.message`,
+/// `JSON.parse` and parsed values. A parsed value is JSON text (its JSON
+/// `null` the text `null`, `undefined` a `NULL`); wherever JavaScript's
+/// meaning depends on a kind the code can't know until it runs, the
+/// generated code checks the kind and, when it isn't the one compiled
+/// for, raises 39876 so the record runs again in the engine tier.
+impl L<'_, '_> {
+    /// Whether `e` is `ctx.record` or `ctx.message` (or a name given to
+    /// it).
+    fn event_of(&self, e: &Expression<'_>) -> bool {
+        let Some(on) = self.msg else {
+            return false;
+        };
+        match strip_parens(e) {
+            Expression::Identifier(id) => {
+                matches!(self.lookup(id.name.as_str()), Some(Var::Event))
+            }
+            Expression::StaticMemberExpression(m) if !m.optional => {
+                m.property.name.as_str() == on.member()
+                    && matches!(strip_parens(&m.object), Expression::Identifier(id)
+                        if matches!(self.lookup(id.name.as_str()), Some(Var::Msg)))
+            }
+            _ => false,
+        }
+    }
+
+    /// Field `name` of `ctx.record` or `ctx.message`: its parameter.
+    fn msg_field(&mut self, name: &str, span: Span) -> R<V> {
+        let Some(on) = self.msg else {
+            return self.stop("js.member", span, format!("reading .{name} here"));
+        };
+        let Some((n, ty, nn)) = on.fields().iter().find(|(n, _, _)| *n == name).copied() else {
+            return self.stop(
+                "js.member",
+                span,
+                format!("ctx.{} has no field {name}", on.member()),
+            );
+        };
+        let i = self.param_named(n, ty);
+        if ty == Ty::Json {
+            self.dyn_params.insert(i);
+        }
+        Ok(V {
+            e: Expr::Param(i),
+            ty,
+            nn: nn || self.facts.contains(&Key::P(i)),
+        })
+    }
+
+    fn dyn_expr(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Builtin(Builtin::JsonParse | Builtin::JsonGet, _) => true,
+            Expr::Local(l) => self.dyn_locals.contains(l),
+            Expr::Param(i) => self.dyn_params.contains(i),
+            Expr::Cond(_, a, b) => self.dyn_expr(a) && self.dyn_expr(b),
+            _ => false,
+        }
+    }
+
+    /// Whether `v` is a parsed JSON value.
+    fn is_dyn(&self, v: &V) -> bool {
+        v.ty == Ty::Json && self.dyn_expr(&v.e)
+    }
+
+    /// `v.prop` (`v?.prop` with `optional`) of a parsed value.
+    fn json_member(&mut self, v: V, prop: &str, optional: bool, span: Span) -> R<V> {
+        if prop == "length" {
+            if optional {
+                return self.stop("js.optional_chain", span, "?.length");
+            }
+            return Ok(V {
+                e: Expr::call(Builtin::JsonLen, vec![v.e]),
+                ty: Ty::Int,
+                nn: true,
+            });
+        }
+        if PROTO_NAMES.contains(&prop) {
+            return self.stop(
+                "js.member",
+                span,
+                format!("reading .{prop} of a parsed JSON value gives JavaScript's own member"),
+            );
+        }
+        Ok(V {
+            e: Expr::call(
+                Builtin::JsonGet,
+                vec![
+                    v.e,
+                    Expr::Lit(Literal::Str(prop.to_owned())),
+                    Expr::bool(optional),
+                ],
+            ),
+            ty: Ty::Json,
+            nn: false,
+        })
+    }
+
+    /// `obj[expr]`: `ctx.record['key']`, or a member or element of a
+    /// parsed value.
+    fn computed_member(&mut self, m: &oxc_ast::ast::ComputedMemberExpression<'_>) -> R<V> {
+        if !m.optional
+            && self.event_of(&m.object)
+            && let Expression::StringLiteral(k) = strip_parens(&m.expression)
+        {
+            return self.msg_field(k.value.as_str(), m.span);
+        }
+        let v = self.val(&m.object)?;
+        if !self.is_dyn(&v) {
+            return self.stop("js.member", m.span, "a computed member");
+        }
+        if let Expression::StringLiteral(k) = strip_parens(&m.expression) {
+            return self.json_member(v, k.value.as_str(), m.optional, m.span);
+        }
+        let i = self.val(&m.expression)?;
+        if i.ty != Ty::Int {
+            return self.stop(
+                "js.member",
+                m.span,
+                "an index that isn't a whole number or a literal name",
+            );
+        }
+        Ok(V {
+            e: Expr::call(Builtin::JsonGet, vec![v.e, i.e, Expr::bool(m.optional)]),
+            ty: Ty::Json,
+            nn: false,
+        })
+    }
+
+    /// A parsed value read as `ty` (numbers as doubles, or `Int` for an
+    /// `Int` local): any other kind runs the record in the engine tier;
+    /// with `nullable`, `null` and `undefined` are `NULL`.
+    fn undyn(v: V, ty: Ty, nullable: bool) -> Option<V> {
+        let (b, t) = match ty {
+            Ty::Str => (Builtin::JsonAsStr, Ty::Str),
+            Ty::Float => (Builtin::JsonAsNum, Ty::Float),
+            Ty::Int => (Builtin::JsonAsInt, Ty::Int),
+            Ty::Bool => (Builtin::JsonAsBool, Ty::Bool),
+            Ty::Json | Ty::Null => return None,
+        };
+        Some(V {
+            e: Expr::call(b, vec![v.e, Expr::bool(nullable)]),
+            ty: t,
+            nn: !nullable,
+        })
+    }
+
+    /// The other side of a comparison with a parsed value, as the type
+    /// the parsed value is read as: numbers as doubles.
+    fn read_as(t: Ty) -> Ty {
+        if t == Ty::Int { Ty::Float } else { t }
+    }
+
+    /// `d === o`, `d == o` (and negated by the caller) where `d` is parsed
+    /// and `o` isn't.
+    fn dyn_equals(&mut self, d: V, o: V, strict: bool, span: Span) -> R<Expr> {
+        if !o.nn {
+            return self.stop(
+                "js.dynamic_types",
+                span,
+                "comparing a parsed JSON value with a value that may be null",
+            );
+        }
+        let ty = Self::read_as(o.ty);
+        let kind = match ty {
+            Ty::Str => "string",
+            Ty::Float => "number",
+            Ty::Bool => "boolean",
+            _ => {
+                return self.stop(
+                    "js.dynamic_types",
+                    span,
+                    "comparing a parsed JSON value with this value",
+                );
+            }
+        };
+        let o_e = if o.ty == Ty::Int {
+            Expr::call(Builtin::ToFloat, vec![o.e])
+        } else {
+            o.e
+        };
+        // `==` converts across kinds in JavaScript: any other kind runs
+        // the record in the engine tier.
+        let Some(read) = Self::undyn(d.clone(), ty, strict) else {
+            return self.stop("js.dynamic_types", span, "this comparison");
+        };
+        let eq = Expr::bin(BinOp::Eq, read.e, o_e);
+        if !strict {
+            return Ok(eq);
+        }
+        // Another kind is never equal.
+        Ok(Expr::Cond(
+            Box::new(Expr::call(
+                Builtin::JsonKind,
+                vec![d.e, Expr::Lit(Literal::Str(kind.to_owned()))],
+            )),
+            Box::new(eq),
+            Box::new(Expr::bool(false)),
+        ))
+    }
+
+    /// `x === null`, `x === undefined`, `x == null` (and their negations)
+    /// of a parsed value; `typeof x === 'kind'`; `None` otherwise (nothing
+    /// lowered).
+    fn dyn_test(&mut self, b: &oxc_ast::ast::BinaryExpression<'_>) -> R<Option<V>> {
+        use BinaryOperator as B;
+        if self.msg.is_none() {
+            return Ok(None);
+        }
+        let (negate, strict) = match b.operator {
+            B::StrictEquality => (false, true),
+            B::StrictInequality => (true, true),
+            B::Equality => (false, false),
+            B::Inequality => (true, false),
+            _ => return Ok(None),
+        };
+        let undefined = |x: &Expression<'_>| {
+            matches!(strip_parens(x), Expression::Identifier(u)
+                if u.name.as_str() == "undefined" && self.lookup("undefined").is_none())
+        };
+        let null = |x: &Expression<'_>| matches!(strip_parens(x), Expression::NullLiteral(_));
+        let wrap = |e: Expr| {
+            let e = if negate {
+                Expr::Unary(UnOp::Not, Box::new(e))
+            } else {
+                e
+            };
+            V {
+                e,
+                ty: Ty::Bool,
+                nn: true,
+            }
+        };
+        let kind = |e: &Expr, k: &str| {
+            Expr::call(
+                Builtin::JsonKind,
+                vec![e.clone(), Expr::Lit(Literal::Str(k.to_owned()))],
+            )
+        };
+        // `typeof x === 'kind'`.
+        for (t, lit) in [(&b.left, &b.right), (&b.right, &b.left)] {
+            if let Expression::UnaryExpression(u) = strip_parens(t)
+                && u.operator == UnaryOperator::Typeof
+                && let Expression::StringLiteral(k) = strip_parens(lit)
+            {
+                let v = self.val(&u.argument)?;
+                if !self.is_dyn(&v) {
+                    return self.stop("js.operator", u.span, "typeof of a value that isn't parsed JSON");
+                }
+                let e = match k.value.as_str() {
+                    "object" => Expr::Binary(
+                        BinOp::Or,
+                        Box::new(Expr::Binary(
+                            BinOp::Or,
+                            Box::new(kind(&v.e, "object")),
+                            Box::new(kind(&v.e, "array")),
+                        )),
+                        Box::new(kind(&v.e, "null")),
+                    ),
+                    k @ ("string" | "number" | "boolean" | "undefined") => kind(&v.e, k),
+                    _ => Expr::bool(false),
+                };
+                return Ok(Some(wrap(e)));
+            }
+        }
+        // `x === null` and the like.
+        for (x, lit) in [(&b.left, &b.right), (&b.right, &b.left)] {
+            let (is_null, is_undef) = (null(lit), undefined(lit));
+            if !is_null && !is_undef {
+                continue;
+            }
+            if null(x) || undefined(x) {
+                return Ok(None);
+            }
+            let v = self.val(x)?;
+            if !self.is_dyn(&v) {
+                // Not parsed: the ordinary comparison with null.
+                let n = V::null();
+                let (l, r) = if std::ptr::eq(x, &b.left) { (v, n) } else { (n, v) };
+                return self.binary(b.operator, l, r, b.span).map(Some);
+            }
+            let e = if !strict {
+                Expr::Binary(
+                    BinOp::Or,
+                    Box::new(kind(&v.e, "null")),
+                    Box::new(kind(&v.e, "undefined")),
+                )
+            } else if is_null {
+                kind(&v.e, "null")
+            } else {
+                kind(&v.e, "undefined")
+            };
+            return Ok(Some(wrap(e)));
+        }
+        Ok(None)
+    }
+
+    /// `JSON.parse(text)`, `Number(x)` and `Array.isArray(x)` of parsed
+    /// JSON; `None` for any other call.
+    fn json_call(
+        &mut self,
+        c: &oxc_ast::ast::CallExpression<'_>,
+        args: &[&Expression<'_>],
+    ) -> R<Option<V>> {
+        let global = |s: &Self, n: &str| s.lookup(n).is_none();
+        let path = self.callee_path(&c.callee);
+        let name = match strip_parens(&c.callee) {
+            Expression::Identifier(id) if global(self, id.name.as_str()) => Some(id.name.as_str()),
+            _ => None,
+        };
+        if path.as_deref() == Some(&["JSON", "parse"]) {
+            if self.msg.is_none() {
+                return self.stop(
+                    "js.json_parse",
+                    c.span,
+                    "JSON.parse compiles only in triggers on streams and queues, which can run \
+                     a record again in the engine tier",
+                );
+            }
+            let [x] = args else {
+                return self.stop("js.json_parse", c.span, "JSON.parse with a reviver");
+            };
+            let v = self.val(x)?;
+            let text = if self.is_dyn(&v) {
+                Self::undyn(v, Ty::Str, false).map_or(Expr::Lit(Literal::Null), |v| v.e)
+            } else {
+                match v.ty {
+                    Ty::Str | Ty::Null => v.e,
+                    _ => {
+                        return self.stop(
+                            "js.json_parse",
+                            x.span(),
+                            "JSON.parse of a value that isn't text",
+                        );
+                    }
+                }
+            };
+            return Ok(Some(V {
+                e: Expr::call(Builtin::JsonParse, vec![text]),
+                ty: Ty::Json,
+                nn: true,
+            }));
+        }
+        if path.as_deref() == Some(&["Array", "isArray"]) && global(self, "Array") {
+            let [x] = args else {
+                return self.stop("js.call", c.span, "the number of arguments");
+            };
+            let v = self.val(x)?;
+            if !self.is_dyn(&v) {
+                return self.stop("js.call", c.span, "Array.isArray of a value that isn't parsed JSON");
+            }
+            return Ok(Some(V {
+                e: Expr::call(
+                    Builtin::JsonKind,
+                    vec![v.e, Expr::Lit(Literal::Str("array".to_owned()))],
+                ),
+                ty: Ty::Bool,
+                nn: true,
+            }));
+        }
+        if name == Some("Number") {
+            let [x] = args else {
+                return self.stop("js.call", c.span, "the number of arguments");
+            };
+            let v = self.val(x)?;
+            if self.is_dyn(&v) || v.ty.is_number() {
+                return self.num(v, x.span()).map(Some);
+            }
+            return self.stop("js.call", c.span, "Number() of a value that isn't a number");
+        }
+        Ok(None)
+    }
+
+    /// `x ?? y`, `x || y`, `x && y` where `x` (`xd`) or `y` (`yd`) is
+    /// parsed JSON: the parsed side is read as the other side's type, or
+    /// both stay parsed (`||` and `&&` only).
+    fn dyn_logical(
+        &mut self,
+        op: LogicalOperator,
+        x: V,
+        y: V,
+        xd: bool,
+        yd: bool,
+        span: Span,
+    ) -> R<V> {
+        let typed = |s: &mut Self, d: V, ty: Ty, nullable: bool| -> R<V> {
+            match Self::undyn(d, ty, nullable) {
+                Some(v) => Ok(v),
+                None => s.stop(
+                    "js.dynamic_types",
+                    span,
+                    "a parsed JSON value with a value of no kind it can be read as",
+                ),
+            }
+        };
+        if op == LogicalOperator::Coalesce {
+            if xd && yd {
+                return self.stop("js.dynamic_types", span, "?? of two parsed JSON values");
+            }
+            let ty = Self::read_as(if xd { y.ty } else { x.ty });
+            let nn = xd && y.nn;
+            let (a, b) = if xd {
+                let a = typed(self, x, ty, true)?;
+                (a.e, self.coerce(y, ty, span)?)
+            } else {
+                let b = typed(self, y, ty, true)?;
+                (self.coerce(x, ty, span)?, b.e)
+            };
+            return Ok(V {
+                e: Expr::bin(BinOp::Coalesce, a, b),
+                ty,
+                nn,
+            });
+        }
+        let t = self.truthy(x.clone(), span)?;
+        let (a, b, ty) = if xd && yd {
+            (x.e, y.e, Ty::Json)
+        } else if xd {
+            let ty = Self::read_as(y.ty);
+            let a = typed(self, x, ty, false)?;
+            (a.e, self.coerce(y, ty, span)?, ty)
+        } else {
+            let ty = Self::read_as(x.ty);
+            let b = typed(self, y, ty, false)?;
+            (self.coerce(x, ty, span)?, b.e, ty)
+        };
+        let e = if op == LogicalOperator::Or {
+            Expr::Cond(Box::new(t), Box::new(a), Box::new(b))
+        } else {
+            Expr::Cond(Box::new(t), Box::new(b), Box::new(a))
+        };
+        Ok(V { e, ty, nn: false })
+    }
+
+    /// One `console.log` or `ctx.log` line: the arguments' text, joined
+    /// by spaces (QuickJS's formatting for text, numbers, booleans and
+    /// `null`).
+    fn log_line(&mut self, c: &oxc_ast::ast::CallExpression<'_>) -> R<Expr> {
+        let mut acc: Option<Expr> = None;
+        for a in &c.arguments {
+            let Some(x) = a.as_expression() else {
+                return self.stop("js.spread", c.span, "spread arguments");
+            };
+            let v = self.val(x)?;
+            if v.ty == Ty::Json && !self.is_dyn(&v) {
+                return self.stop(
+                    "js.log",
+                    x.span(),
+                    "logging an object: QuickJS writes its JSON",
+                );
+            }
+            let t = self.text_of(v, x.span())?;
+            acc = Some(match acc {
+                None => t,
+                Some(p) => Expr::bin(
+                    BinOp::Concat,
+                    Expr::bin(BinOp::Concat, p, Expr::Lit(Literal::Str(" ".to_owned()))),
+                    t,
+                ),
+            });
+        }
+        Ok(acc.unwrap_or(Expr::Lit(Literal::Str(String::new()))))
     }
 }
 

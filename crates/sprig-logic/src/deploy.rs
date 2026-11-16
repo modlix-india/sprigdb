@@ -138,6 +138,15 @@ pub struct WrapperSpec<'a> {
     pub version: u64,
 }
 
+/// The wrapper's (and call entry's) name for parameter `i`.
+#[must_use]
+pub fn wrapper_param(f: &Function, i: u16) -> String {
+    wrapper_params(f)
+        .into_iter()
+        .nth(usize::from(i))
+        .map_or_else(|| "NULL".to_owned(), |(n, _)| n)
+}
+
 fn wrapper_params(f: &Function) -> Vec<(String, Ty)> {
     let mut out: Vec<(String, Ty)> = Vec::new();
     for p in &f.params {

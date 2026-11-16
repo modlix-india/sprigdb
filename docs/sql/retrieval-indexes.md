@@ -11,7 +11,7 @@ A retrieval index makes a table's text searchable by meaning and by keywords at 
 
 Every search applies the caller's privileges and [row-level security](row-level-security.md): a user only ever gets chunks of rows they could `SELECT`.
 
-```sql
+```sql test
 CREATE TABLE articles (
   id      BIGINT PRIMARY KEY,
   title   VARCHAR(200),
@@ -20,13 +20,38 @@ CREATE TABLE articles (
   lang    CHAR(2)
 );
 
+INSERT INTO articles VALUES
+  (1, 'Reset your password', 'Open Settings, choose Account, then Reset password. We email you a link that works for one hour.', 'app', 'en'),
+  (2, 'Change your plan', 'Plans can be changed at any time from Billing. The new price applies from the next invoice.', 'app', 'en'),
+  (3, 'Export your data', 'Admins can export every table as CSV from the Data page.', 'web', 'en');
+
 CREATE RETRIEVAL INDEX kb ON articles (body)
   TITLE title
   FILTERS (product, lang);
+```
 
-SELECT id, title, chunk, score
-FROM RETRIEVE(kb, 'how do I reset my password', 5, 'product = ''app''')
+The worker indexes the rows in the background, within a few seconds:
+
+```sql test
+SELECT SLEEP(15) INTO @waited;
+SHOW RETRIEVAL INDEXES;
+```
+
+```text output
+Index	Table	Column	Model	State	Rows	Shards	Error
+kb	articles	body	local:bge-small	ready	3	1	NULL
+```
+
+```sql test
+SELECT id, title, `rank`
+FROM RETRIEVE(kb, 'how do I reset my password', 2, 'product = ''app''')
 ORDER BY `rank`;
+```
+
+```text output
+id	title	rank
+1	Reset your password	1
+2	Change your plan	2
 ```
 
 ## CREATE RETRIEVAL INDEX

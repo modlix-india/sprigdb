@@ -17,8 +17,8 @@ use std::time::Duration;
 use sprig_common::ids::{ClusterId, DbId, GroupId, ShardId, TenantId};
 use sprig_txn::{
     BeginOptions, BranchConn, ClusterAdmin, ClusterCaps, Ctl, DbError, DbResult, Decision,
-    DecisionRow, Dtid, DtidGen, Intent, Interrupted, NonXaPolicy, ShardRef, TxnBackend,
-    TxnConfig, TxnCoordinator, TxnMode, Xid,
+    DecisionRow, Dtid, DtidGen, Intent, Interrupted, NonXaPolicy, ShardRef, TxnBackend, TxnConfig,
+    TxnCoordinator, TxnMode, Xid,
 };
 
 type Log = Arc<Mutex<Vec<(String, String)>>>;

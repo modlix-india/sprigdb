@@ -1,7 +1,8 @@
 //! Staged rollout of functions and procedures.
 //!
 //! ```text
-//! CREATE OR REPLACE FUNCTION f ... WITH (SPRIG_ROLLOUT = 10 [, SPRIG_ROLLOUT_BY = 'user' | 'tenant']) AS ...
+//! CREATE OR REPLACE FUNCTION f ... WITH (SPRIG_ROLLOUT = 10
+//!     [, SPRIG_ROLLOUT_BY = 'user' | 'tenant' | 'key:<parameter>']) AS ...
 //!   → version n+1 is the candidate for 10% of callers; the active version
 //!     answers the rest
 //! ALTER FUNCTION f ROLLOUT TO 50 [PERCENT] [BY USER | TENANT]   another stage
@@ -16,7 +17,20 @@
 //! ```text
 //! BY USER (default): CRC32(CONCAT(<the caller's backend account>, ':', module)) % 100 < pct
 //! BY TENANT:         CRC32(CONCAT('t<tenant>', ':', module)) % 100 < pct, decided at deploy
+//! BY KEY p:          CRC32(CONCAT(COALESCE(CAST(<argument p> AS CHAR), ''), ':', module))
+//!                    % 100 < pct: one key (a customer, a tenant id passed in) keeps
+//!                    its version whoever calls
 //! ```
+//!
+//! **Triggers on streams and queues** roll out by key too: `CREATE OR
+//! REPLACE TRIGGER ... ON STREAM | ON QUEUE ... WITH (SPRIG_ROLLOUT = n)`
+//! makes the new version the candidate for the records whose key (a
+//! stream record's key; a queue message's `message-id` property, or its
+//! own id when it has none) falls in the first n buckets, by the same
+//! [`bucket`]. The gateway picks for each run, so a key gets the same
+//! version whichever tier each version runs in. A record without a key
+//! gets the active version. `ALTER TRIGGER t ROLLOUT TO n | PROMOTE |
+//! ABORT` moves it on.
 //!
 //! So a caller keeps the version it got while the stage lasts, and a
 //! larger stage keeps everyone the smaller one had. The gateway computes
@@ -50,6 +64,11 @@ pub const MIN_CALLS: u64 = 20;
 /// Upper bounds of the latency histogram's buckets, in milliseconds; the
 /// last bucket holds everything slower.
 pub const BUCKETS_MS: [u64; 11] = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000];
+
+/// Migration 6: `by_key` holds `key` (a trigger's record key) and
+/// `key:<position>` (a function's argument) too.
+pub const DDL_ROLLOUTS_BY_KEY: &str =
+    "ALTER TABLE logic_rollouts MODIFY by_key VARCHAR(80) NOT NULL DEFAULT 'user'";
 
 /// `logic_rollouts`: one row per module with a candidate (migration 5).
 pub const DDL_ROLLOUTS: &str = "CREATE TABLE IF NOT EXISTS logic_rollouts (
@@ -105,6 +124,10 @@ pub enum RolloutBy {
     /// The tenant: all of a tenant's calls get the same version, for code
     /// deployed to many tenants at once.
     Tenant,
+    /// A key from the call: a function's or procedure's argument at this
+    /// position; `None` for a trigger on a stream or queue (the record's
+    /// or message's key).
+    Key(Option<u16>),
 }
 
 impl RolloutBy {
@@ -114,18 +137,40 @@ impl RolloutBy {
         match self {
             RolloutBy::User => "user",
             RolloutBy::Tenant => "tenant",
+            RolloutBy::Key(_) => "key",
         }
     }
 
-    /// Reads `user` or `tenant`.
+    /// Reads `user`, `tenant` or `key` (a key whose parameter is named
+    /// apart, [`key_param`]).
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "user" | "caller" => Some(RolloutBy::User),
             "tenant" => Some(RolloutBy::Tenant),
+            "key" => Some(RolloutBy::Key(None)),
+            k if k.starts_with("key:") => Some(RolloutBy::Key(k[4..].trim().parse().ok())),
             _ => None,
         }
     }
+
+    /// The catalog's `by_key` text: `key:<position>` for a parameter.
+    #[must_use]
+    pub fn stored(self) -> String {
+        match self {
+            RolloutBy::Key(Some(i)) => format!("key:{i}"),
+            other => other.as_str().to_owned(),
+        }
+    }
+}
+
+/// The parameter `SPRIG_ROLLOUT_BY = 'key:<parameter>'` names.
+#[must_use]
+pub fn key_param(s: &str) -> Option<String> {
+    let t = s.trim();
+    let (k, p) = t.split_once(':')?;
+    (k.trim().eq_ignore_ascii_case("key") && !p.trim().is_empty())
+        .then(|| p.trim().to_ascii_lowercase())
 }
 
 /// A stage: the candidate's share and the key.
@@ -199,10 +244,25 @@ pub fn bucket(key: &str, module_id: u64) -> u32 {
 #[must_use]
 pub fn picks_candidate(spec: RolloutSpec, account: &str, tenant: u64, module_id: u64) -> bool {
     let key = match spec.by {
-        RolloutBy::User => account.to_owned(),
+        RolloutBy::User | RolloutBy::Key(_) => account.to_owned(),
         RolloutBy::Tenant => format!("t{tenant}"),
     };
     bucket(&key, module_id) < u32::from(spec.pct)
+}
+
+/// Whether a call or record keyed `key` gets the candidate of a `BY KEY`
+/// stage (`None`, no key: the active version).
+#[must_use]
+pub fn key_picks_candidate(spec: RolloutSpec, key: Option<&str>, module_id: u64) -> bool {
+    key.is_some_and(|k| bucket(k, module_id) < u32::from(spec.pct))
+}
+
+/// The SQL condition the wrapper uses for a `BY KEY` stage on parameter
+/// `param` (its routine name, `p_<name>`): the same [`bucket`] of the
+/// argument's text, the empty text for `NULL`.
+#[must_use]
+pub fn key_condition(module_id: u64, pct: u8, param: &str) -> String {
+    format!("CRC32(CONCAT(COALESCE(CAST({param} AS CHAR), ''), ':{module_id}')) % 100 < {pct}")
 }
 
 /// The SQL condition the wrapper uses for a `BY USER` stage.
@@ -348,7 +408,7 @@ pub async fn put(
                candidate_version = VALUES(candidate_version), started_at, VALUES(started_at)), \
              active_version = VALUES(active_version), candidate_version = VALUES(candidate_version)"
         ),
-        (module_id, active, candidate, spec.pct, spec.by.as_str()),
+        (module_id, active, candidate, spec.pct, spec.by.stored()),
     )
     .await
     .map_err(map_err)?;

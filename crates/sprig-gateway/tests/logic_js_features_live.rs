@@ -16,7 +16,9 @@
 //! cargo test -p sprig-gateway --test logic_js_features_live -- --nocapture --test-threads 1
 //! ```
 //!
-//! Works in the database `r7js_live`, dropped afterwards.
+//! Works in the database `r7js_live`, dropped afterwards. Triggers on
+//! streams and queues run both compiled into MariaDB and in the engine
+//! tier, each checked against the other.
 
 #![allow(
     clippy::unwrap_used,
@@ -424,20 +426,39 @@ $$";
 
     // ---- changing columns under compiled logic -------------------------------------
     must(&mut c, "ALTER TABLE sales ADD COLUMN memo VARCHAR(16) NULL").await;
-    for (q, refused) in [
-        ("ALTER TABLE sales MODIFY memo VARCHAR(64) NULL", false),
-        ("ALTER TABLE sales MODIFY qty BIGINT NOT NULL", false),
-        ("ALTER TABLE sales MODIFY qty DOUBLE NOT NULL", true),
-        ("ALTER TABLE sales RENAME COLUMN status TO state", true),
+    // A column the validation reads that changes type: the statement runs
+    // and the validation is recompiled for the new type (a new version);
+    // one it reads that is renamed: refused.
+    for (q, refused, recompiled) in [
+        (
+            "ALTER TABLE sales MODIFY memo VARCHAR(64) NULL",
+            false,
+            false,
+        ),
+        ("ALTER TABLE sales MODIFY qty BIGINT NOT NULL", false, false),
+        ("ALTER TABLE sales MODIFY qty DOUBLE NOT NULL", false, true),
+        (
+            "ALTER TABLE sales RENAME COLUMN status TO state",
+            true,
+            false,
+        ),
         (
             "ALTER TABLE sales CHANGE total total DECIMAL(12,2) NOT NULL",
             false,
+            false,
         ),
-        ("ALTER TABLE sales DROP COLUMN memo", false),
+        ("ALTER TABLE sales DROP COLUMN memo", false, false),
     ] {
         let r = sql(&mut c, q).await;
+        let n = if r.is_ok() {
+            notes(&mut c).await
+        } else {
+            String::new()
+        };
         let ok = if refused {
             matches!(&r, Err((39481, m)) if m.contains("validation sale_rules"))
+        } else if recompiled {
+            r.is_ok() && n.contains("validation sale_rules was recompiled")
         } else {
             r.is_ok()
         };
@@ -445,15 +466,23 @@ $$";
             &format!(
                 "{q}: {}",
                 if refused {
-                    "refused (39481), the validation reads it"
+                    "refused (39481), the validation would no longer compile"
+                } else if recompiled {
+                    "runs, and the validation is recompiled for the new type"
                 } else {
                     "runs"
                 }
             ),
             ok,
-            format!("{r:?}"),
+            format!("{r:?} / {n}"),
         );
     }
+    let r = sql(&mut c, "INSERT INTO sales VALUES (8, 'new', -0.5, 50, 1)").await;
+    ck.check(
+        "the recompiled validation reads the DOUBLE value as it is (-0.5, not -1)",
+        matches!(&r, Err((39863, m)) if m == "Error: qty -0.5 after 1 steps"),
+        format!("{r:?}"),
+    );
     let r = sql(&mut c, "INSERT INTO sales VALUES (7, 'new', 0, 50, 1)").await;
     ck.check(
         "the validation still refuses with its message after the allowed changes",
@@ -529,10 +558,24 @@ $$";
         format!("{got:?}"),
     );
     let r = sql(&mut c, "ALTER TABLE items MODIFY qty DOUBLE NOT NULL").await;
+    let n = notes(&mut c).await;
     ck.check(
-        "retyping a column an after-commit trigger reads is refused (39481)",
-        matches!(&r, Err((39481, m)) if m.contains("trigger count_items")),
-        format!("{r:?}"),
+        "retyping a column an after-commit trigger reads recompiles the trigger",
+        r.is_ok() && n.contains("trigger count_items was recompiled"),
+        format!("{r:?} / {n}"),
+    );
+    must(&mut c, "INSERT INTO items VALUES (4, 80.5)").await;
+    let got = wait_rows(
+        &mut c,
+        "SELECT id FROM audit WHERE id = 4 AND note = 'many'",
+        1,
+        60,
+    )
+    .await;
+    ck.check(
+        "the recompiled trigger runs on the new type",
+        got.len() == 1,
+        format!("{got:?}"),
     );
 
     // ---- a trigger on a stream (engine tier, in a worker) -------------------------------
@@ -629,6 +672,93 @@ $$"
         drop(r);
     }
 
+    // ---- a stream trigger compiled into MariaDB, against its engine-tier twin ------------
+    // Both read every record of one stream (each trigger has its own
+    // consumer group); a record whose JSON the compiled code can't read as
+    // JavaScript does (`kind` a number where `??` reads text) runs in the
+    // engine tier, record by record.
+    must(&mut c, &format!("CREATE STREAM {DB}.cevents PARTITIONS 2")).await;
+    let ctrig = |name: &str, src: &str, with: &str| {
+        format!(
+            "CREATE TRIGGER {DB}.{name} ON STREAM {DB}.cevents LANGUAGE javascript {with} AS $$
+export default function (ctx) {{
+  const r = ctx.record;
+  const e = JSON.parse(r.value);
+  const kind = e.kind ?? 'none';
+  let n = 0;
+  if (Array.isArray(e.items)) {{ for (const it of e.items) {{ n += it.qty; }} }}
+  db.exec('INSERT INTO hits (src, k, what) VALUES (?, ?, ?)', ['{src}', r.key, kind + '/' + n]);
+  console.log('ctrig {src} ' + r.key + ' ' + kind);
+}}
+$$"
+        )
+    };
+    let r = sql(&mut c, &ctrig("on_cevent", "c", "")).await;
+    let n = if r.is_ok() { notes(&mut c).await } else { String::new() };
+    ck.check(
+        "a stream trigger reading JSON.parse and ctx.record compiles into MariaDB",
+        r.is_ok() && n.contains("tier mariadb"),
+        format!("{r:?} / {n}"),
+    );
+    let r = sql(
+        &mut c,
+        &ctrig("on_eevent", "e", "WITH (SPRIG_TIER = 'engine')"),
+    )
+    .await;
+    let n = if r.is_ok() { notes(&mut c).await } else { String::new() };
+    ck.check(
+        "its twin deploys in the engine tier",
+        r.is_ok() && n.contains("tier engine"),
+        format!("{r:?} / {n}"),
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    must(
+        &mut c,
+        &format!(
+            "INSERT INTO {DB}.cevents (key, value) VALUES              ('c1', '{{"kind": "a", "items": [{{"qty": 2}}, {{"qty": 3}}]}}'),              ('c2', '{{"kind": 5}}'), ('c3', '{{"kind": "b", "items": [{{"qty": 1.5}}]}}'),              ('c4', '{{}}')"
+        ),
+    )
+    .await;
+    let q = |src: &str| format!("SELECT k, what FROM hits WHERE src = '{src}' ORDER BY k");
+    let compiled = wait_rows(&mut c, &q("c"), 4, 90).await;
+    let engine = wait_rows(&mut c, &q("e"), 4, 90).await;
+    let want: Rows = [("c1", "a/5"), ("c2", "5/0"), ("c3", "b/1.5"), ("c4", "none/0")]
+        .iter()
+        .map(|(k, w)| vec![Some((*k).to_owned()), Some((*w).to_owned())])
+        .collect();
+    ck.check(
+        "the compiled stream trigger ran each record once, as its engine-tier twin did",
+        compiled == want && engine == want,
+        format!("compiled {compiled:?} / engine {engine:?}"),
+    );
+    if let (Some(root), Some(t)) = (
+        skip::var("SPRIG_TEST_R7JS_ROOT"),
+        skip::var("SPRIG_TEST_R7JS_TENANT"),
+    ) {
+        let mut r = Conn::from_url(root.as_str()).await.unwrap();
+        let q = format!(
+            "SELECT message FROM t{t}_sprig.logic_log WHERE level = 'info' \
+             AND message LIKE '%ctrig c %' ORDER BY log_id"
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let lines: Vec<String> = loop {
+            let lines: Vec<String> = r.query(&q).await.unwrap();
+            if lines.len() >= 4 || Instant::now() > deadline {
+                break lines;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        ck.check(
+            "the compiled trigger's console.log lines are in its run log, also for the record \
+             the engine tier ran",
+            lines.len() == 4
+                && lines.iter().any(|l| l.ends_with("ctrig c c1 a"))
+                && lines.iter().any(|l| l.ends_with("ctrig c c2 5")),
+            format!("{lines:?}"),
+        );
+        drop(r);
+    }
+
     // ---- a trigger on a queue (engine tier, in a worker) ---------------------------------
     if let Some(amqp) = skip::var("SPRIG_TEST_R7JS_AMQP") {
         let (user, password) = user();
@@ -711,6 +841,89 @@ $$"
             "the queue trigger ran each message once, with the caught errors and helpers' results",
             rows == want,
             format!("{rows:?}"),
+        );
+        // A compiled queue trigger and its engine-tier twin, each on its
+        // own queue (a queue's triggers compete for its messages), given
+        // the same messages.
+        let mut deployed = Vec::new();
+        for (queue, name, src, with) in [
+            ("cjobs", "on_cjob", "qc", ""),
+            ("ejobs", "on_ejob", "qe", "WITH (SPRIG_TIER = 'engine')"),
+        ] {
+            ch.queue_declare(
+                queue.into(),
+                QueueDeclareOptions {
+                    durable: true,
+                    ..QueueDeclareOptions::default()
+                },
+                FieldTable::default(),
+            )
+            .await
+            .unwrap();
+            let t = format!(
+                "CREATE TRIGGER {DB}.{name} ON QUEUE {DB}.{queue} LANGUAGE javascript {with} AS $$
+export default function (ctx) {{
+  const job = JSON.parse(ctx.message.body);
+  db.exec('INSERT INTO hits (src, k, what) VALUES (?, ?, ?)',
+          ['{src}', ctx.message.body, String(job.n ?? -1) + '#' + ctx.message.deliveryCount]);
+}}
+$$"
+            );
+            let r = sql(&mut c, &t).await;
+            let n = if r.is_ok() { notes(&mut c).await } else { String::new() };
+            deployed.push((r.is_ok(), n));
+        }
+        ck.check(
+            "a queue trigger reading JSON.parse and ctx.message compiles; its twin stays in the \
+             engine tier",
+            deployed[0].0
+                && deployed[0].1.contains("tier mariadb")
+                && deployed[1].0
+                && deployed[1].1.contains("tier engine"),
+            format!("{deployed:?}"),
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        for queue in ["cjobs", "ejobs"] {
+            for body in ["{\"n\": 1}", "{\"n\": 2.5}", "{\"n\": \"x\"}", "{}"] {
+                ch.basic_publish(
+                    "".into(),
+                    queue.into(),
+                    BasicPublishOptions::default(),
+                    body.as_bytes(),
+                    BasicProperties::default().with_delivery_mode(2),
+                )
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+            }
+        }
+        let mut rows = Vec::new();
+        for src in ["qc", "qe"] {
+            let mut got = wait_rows(
+                &mut c,
+                &format!("SELECT k, what FROM hits WHERE src = '{src}' ORDER BY k"),
+                4,
+                90,
+            )
+            .await;
+            got.sort();
+            rows.push(got);
+        }
+        let mut want: Rows = [
+            ("{\"n\": 1}", "1#0"),
+            ("{\"n\": 2.5}", "2.5#0"),
+            ("{\"n\": \"x\"}", "x#0"),
+            ("{}", "-1#0"),
+        ]
+        .iter()
+        .map(|(k, w)| vec![Some((*k).to_owned()), Some((*w).to_owned())])
+        .collect();
+        want.sort();
+        ck.check(
+            "the compiled queue trigger ran each message once, as its engine-tier twin did",
+            rows[0] == want && rows[1] == want,
+            format!("compiled {:?} / engine {:?}", rows[0], rows[1]),
         );
         a.close(200, "done".into()).await.unwrap();
     } else {

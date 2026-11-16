@@ -272,7 +272,50 @@ pub enum Builtin {
     /// arithmetic operators refuse a null operand, so the KIRun front end
     /// wraps every operand that may be `NULL`.
     NotNull,
+    // Parsed JSON (triggers on streams and queues). A parsed value is JSON
+    // text whose JSON `null` is the text `null`; `NULL` is JavaScript's
+    // `undefined` (a missing member). Where JavaScript's meaning can't be
+    // kept for the value at hand, these raise 39876 ([`ENGINE_RERUN`]) and
+    // the record runs again in the engine tier.
+    /// `JSON.parse(text)`: `[text]`, `Str`. `NULL` parses as `null`.
+    JsonParse,
+    /// `v.name` or `v[i]`: `[v, Lit(Str(name)) or an Int index,
+    /// Lit(Bool(optional))]`. A member of an object (`NULL` when missing),
+    /// an element of an array; `?.` of `null` or `undefined` is `NULL`.
+    JsonGet,
+    /// `v.length` of an array or a string: `[v]`.
+    JsonLen,
+    /// A string's text: `[v, Lit(Bool(nullable))]`; with `nullable`,
+    /// `null` and `undefined` are `NULL`.
+    JsonAsStr,
+    /// A number, as a double: `[v, Lit(Bool(nullable))]`.
+    JsonAsNum,
+    /// A whole number within ±2^53: `[v, Lit(Bool(nullable))]`.
+    JsonAsInt,
+    /// A boolean: `[v, Lit(Bool(nullable))]`.
+    JsonAsBool,
+    /// JavaScript's truthiness of a parsed value: `[v]`, never `NULL`.
+    JsonTruthy,
+    /// Whether the value is of a kind: `[v, Lit(Str(kind))]`, kind one
+    /// of `string`, `number`, `boolean`, `null`, `undefined`, `object`
+    /// (an object, not an array or `null`), `array`; never `NULL`.
+    JsonKind,
+    /// `String(v)`: `[v, Lit(Bool(null_as_null))]`; with `null_as_null`
+    /// (a publish's value), `null` and `undefined` are `NULL`.
+    JsonToStr,
 }
+
+/// The error number compiled code raises when a record must run in the
+/// engine tier instead (a parsed JSON value it can't treat as JavaScript
+/// would); the gateway rolls the run back to its savepoint and runs the
+/// engine tier.
+pub const ENGINE_RERUN: u16 = 39876;
+
+/// The text that starts [`ENGINE_RERUN`]'s message.
+pub const ENGINE_RERUN_TEXT: &str = "this record runs in the engine tier";
+
+/// Log lines a run keeps ([`Stmt::Log`]), as the engine tier keeps.
+pub const MAX_LOG_LINES: usize = 100;
 
 impl Builtin {
     /// The name used in printed IR.
@@ -304,6 +347,16 @@ impl Builtin {
             Builtin::EndsWith => "ends_with",
             Builtin::IndexOf => "index_of",
             Builtin::NotNull => "not_null",
+            Builtin::JsonParse => "json_parse",
+            Builtin::JsonGet => "json_get",
+            Builtin::JsonLen => "json_len_of",
+            Builtin::JsonAsStr => "json_as_str",
+            Builtin::JsonAsNum => "json_as_num",
+            Builtin::JsonAsInt => "json_as_int",
+            Builtin::JsonAsBool => "json_as_bool",
+            Builtin::JsonTruthy => "json_truthy",
+            Builtin::JsonKind => "json_kind",
+            Builtin::JsonToStr => "json_to_str",
         }
     }
 }
@@ -606,6 +659,9 @@ pub enum Stmt {
     /// Leaves the enclosing [`Stmt::Block`] with this label, through any
     /// loops in between.
     Leave(u32),
+    /// Writes a log line (`console.log`, `ctx.log`), `Str`: the run keeps
+    /// the first [`MAX_LOG_LINES`] (triggers on streams and queues).
+    Log(Expr),
 }
 
 /// A parameter.
@@ -713,7 +769,14 @@ impl Function {
                 | Builtin::Present
                 | Builtin::Contains
                 | Builtin::StartsWith
-                | Builtin::EndsWith => Ty::Bool,
+                | Builtin::EndsWith
+                | Builtin::JsonAsBool
+                | Builtin::JsonTruthy
+                | Builtin::JsonKind => Ty::Bool,
+                Builtin::JsonParse | Builtin::JsonGet => Ty::Json,
+                Builtin::JsonAsNum => Ty::Float,
+                Builtin::JsonAsInt | Builtin::JsonLen => Ty::Int,
+                Builtin::JsonAsStr | Builtin::JsonToStr => Ty::Str,
                 Builtin::ToFloat
                 | Builtin::JsonNum
                 | Builtin::Floor
@@ -758,12 +821,88 @@ impl Function {
                 Stmt::While { cond, body, .. } => expr(cond) + block(body),
                 Stmt::Emit(_, f) => f.iter().map(|(_, e)| expr(e)).sum(),
                 Stmt::Throw(e) => expr(&e.message),
+                Stmt::Log(e) => expr(e),
                 Stmt::Db(DbOp::Sql { binds, .. }) => binds.iter().map(expr).sum(),
                 Stmt::Try { body, .. } | Stmt::Block(_, body) => block(body),
                 Stmt::Break | Stmt::Continue | Stmt::Return | Stmt::Rethrow(_) | Stmt::Leave(_) => {
                     0
                 }
             }
+        }
+        block(&self.body)
+    }
+
+    /// Calls `f` on every expression of the body, nested ones included.
+    pub fn each_expr(&self, f: &mut dyn FnMut(&Expr)) {
+        fn block(b: &Block, f: &mut dyn FnMut(&Expr)) {
+            for s in b {
+                stmt(s, f);
+            }
+        }
+        fn stmt(s: &Stmt, f: &mut dyn FnMut(&Expr)) {
+            match s {
+                Stmt::Assign(_, e) | Stmt::Log(e) => e.walk(f),
+                Stmt::If(c, a, b) => {
+                    c.walk(f);
+                    block(a, f);
+                    block(b, f);
+                }
+                Stmt::While { cond, body, .. } => {
+                    cond.walk(f);
+                    block(body, f);
+                }
+                Stmt::Emit(_, fs) => fs.iter().for_each(|(_, e)| e.walk(f)),
+                Stmt::Throw(e) => {
+                    e.message.walk(f);
+                    if let Some((_, m)) = &e.catch {
+                        m.walk(f);
+                    }
+                }
+                Stmt::Db(DbOp::Sql { binds, .. }) => binds.iter().for_each(|e| e.walk(f)),
+                Stmt::Try { body, .. } | Stmt::Block(_, body) => block(body, f),
+                Stmt::Break | Stmt::Continue | Stmt::Return | Stmt::Rethrow(_) | Stmt::Leave(_) => {
+                }
+            }
+        }
+        block(&self.body, f);
+    }
+
+    /// Whether the code can raise [`ENGINE_RERUN`] (it reads parsed JSON).
+    #[must_use]
+    pub fn may_rerun(&self) -> bool {
+        let mut hit = false;
+        self.each_expr(&mut |e| {
+            if let Expr::Builtin(b, _) = e
+                && matches!(
+                    b,
+                    Builtin::JsonParse
+                        | Builtin::JsonGet
+                        | Builtin::JsonLen
+                        | Builtin::JsonAsStr
+                        | Builtin::JsonAsNum
+                        | Builtin::JsonAsInt
+                        | Builtin::JsonAsBool
+                        | Builtin::JsonToStr
+                )
+            {
+                hit = true;
+            }
+        });
+        hit
+    }
+
+    /// Whether the code writes log lines ([`Stmt::Log`]).
+    #[must_use]
+    pub fn logs(&self) -> bool {
+        fn block(b: &Block) -> bool {
+            b.iter().any(|s| match s {
+                Stmt::Log(_) => true,
+                Stmt::If(_, a, c) => block(a) || block(c),
+                Stmt::While { body, .. } | Stmt::Try { body, .. } | Stmt::Block(_, body) => {
+                    block(body)
+                }
+                _ => false,
+            })
         }
         block(&self.body)
     }
@@ -907,6 +1046,10 @@ impl Printer<'_> {
                 self.block(body, d + 1);
             }
             Stmt::Leave(l) => self.line(d, &format!("leave b{l}")),
+            Stmt::Log(e) => {
+                let t = format!("log {}", self.expr(e));
+                self.line(d, &t);
+            }
             Stmt::Db(DbOp::Sql {
                 stmt, binds, shape, ..
             }) => {

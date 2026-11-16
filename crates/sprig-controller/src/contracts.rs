@@ -79,6 +79,7 @@ pub fn known_modules() -> Vec<Module> {
 /// Declares [`known_modules`] as read by this process
 /// ([`sprig_catalog::readers`]).
 pub fn declare_known() {
+    readers::declare(&[migrate::CORE_MODULE]);
     readers::declare(&known_modules());
 }
 
@@ -202,15 +203,14 @@ impl ContractPass {
     }
 
     fn delay_days(&self) -> u64 {
-        self.live.as_ref().map_or(
-            sprig_catalog::settings::CONTRACT_DELAY_DAYS.default,
-            |l| {
+        self.live
+            .as_ref()
+            .map_or(sprig_catalog::settings::CONTRACT_DELAY_DAYS.default, |l| {
                 l.get(
                     &sprig_catalog::settings::CONTRACT_DELAY_DAYS,
                     &SettingCtx::process(&self.dc),
                 )
-            },
-        )
+            })
     }
 
     async fn scan(&self) -> Result<ReaderScan> {
@@ -331,8 +331,7 @@ impl ContractPass {
         let due: Vec<Module> = modules
             .iter()
             .filter(|m| {
-                let (Some(&ceiling), Some(have)) = (runnable.get(m.name), state.get(m.name))
-                else {
+                let (Some(&ceiling), Some(have)) = (runnable.get(m.name), state.get(m.name)) else {
                     return false;
                 };
                 m.migrations.iter().any(|x| {
@@ -376,7 +375,9 @@ impl ContractPass {
                     "{} {} (due {})",
                     d.migration.module,
                     d.migration.format,
-                    d.due.as_deref().unwrap_or("unknown: no expand time recorded")
+                    d.due
+                        .as_deref()
+                        .unwrap_or("unknown: no expand time recorded")
                 )
             })
             .collect();

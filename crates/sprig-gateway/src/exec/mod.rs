@@ -214,6 +214,7 @@ impl Executor for PassThrough {
             point_memo: point::PointMemo::default(),
             status: status::SessionStatus::default(),
             globals_applied: false,
+            column_change_running: false,
         })
     }
 }
@@ -256,6 +257,10 @@ pub struct PassSession {
     /// The tenant's `compat.global.*` defaults were given to the session:
     /// at its first request, and again after a reset.
     globals_applied: bool,
+    /// An `ALTER TABLE` whose compiled validations or triggers are
+    /// recompiled afterwards runs now: its own column check is done
+    /// (`logic_bound`).
+    column_change_running: bool,
 }
 
 impl std::fmt::Debug for PassSession {

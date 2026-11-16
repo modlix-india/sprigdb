@@ -203,6 +203,7 @@ pub fn js_signature(d: &Declaration) -> sprig_logic_compile::js::Signature {
             .collect(),
         returns: d.returns.as_deref().map(crate::declare::Param::ir_ty),
         row: None,
+        on: None,
     }
 }
 
@@ -250,6 +251,7 @@ pub fn js_signature_of(sig: &serde_json::Value) -> sprig_logic_compile::js::Sign
                 })
             }),
         row: None,
+        on: None,
     }
 }
 
@@ -740,6 +742,31 @@ pub async fn deploy_at(
                 .find(|v| v.version == active)
                 .cloned()
                 .ok_or_else(|| blocked(format!("needs the active version {active}")))?;
+            let mut spec = spec;
+            if spec.by == crate::rollout::RolloutBy::Key(None) {
+                // `BY KEY p`: the pick reads argument p, a whole number
+                // or text (its text is the same in MariaDB and here).
+                let name = d.rollout_key.clone().unwrap_or_default();
+                let at = compiled.ir.as_ref().and_then(|f| {
+                    f.params
+                        .iter()
+                        .position(|p| p.name.eq_ignore_ascii_case(&name))
+                        .map(|i| (i, f.params[i].ty))
+                });
+                match at {
+                    Some((i, sprig_logic_compile::ir::Ty::Int | sprig_logic_compile::ir::Ty::Str)) => {
+                        spec.by = crate::rollout::RolloutBy::Key(u16::try_from(i).ok());
+                    }
+                    Some(_) => {
+                        return Err(blocked(format!(
+                            "by key reads a whole-number or text parameter ({name} isn't)"
+                        )));
+                    }
+                    None => {
+                        return Err(blocked(format!("by key needs a parameter {name}")));
+                    }
+                }
+            }
             Some((spec, av))
         }
         (Some(_), _) => {
@@ -887,6 +914,17 @@ pub async fn deploy_at(
                         &crate::rollout::user_condition(module.module_id, spec.pct),
                         spec.pct,
                     ),
+                    crate::rollout::RolloutBy::Key(i) => deploy::rollout_wrapper(
+                        t.shard_schema,
+                        &active_side,
+                        &cand_side,
+                        &crate::rollout::key_condition(
+                            module.module_id,
+                            spec.pct,
+                            &deploy::wrapper_param(f, i.unwrap_or(0)),
+                        ),
+                        spec.pct,
+                    ),
                     // Decided here: one tenant, one pick.
                     crate::rollout::RolloutBy::Tenant => {
                         let cand =
@@ -910,6 +948,11 @@ pub async fn deploy_at(
                     crate::rollout::RolloutBy::User => {
                         crate::rollout::user_condition(module.module_id, spec.pct)
                     }
+                    crate::rollout::RolloutBy::Key(i) => crate::rollout::key_condition(
+                        module.module_id,
+                        spec.pct,
+                        &deploy::wrapper_param(f, i.unwrap_or(0)),
+                    ),
                     crate::rollout::RolloutBy::Tenant => {
                         if crate::rollout::picks_candidate(*spec, "", at.tenant, module.module_id) {
                             "TRUE".to_owned()

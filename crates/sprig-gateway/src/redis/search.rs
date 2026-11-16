@@ -619,10 +619,11 @@ impl Cx<'_, '_> {
     ) -> Result<(Vec<Hit>, u64)> {
         let max = self.svc.knobs().max_window;
         if self.bound(def) {
-            // Every match, the keys the session reads, and the total, the
-            // page and the scores from those alone.
+            // Every match (prefix and fuzzy terms expanded to every term
+            // they match), the keys the session reads, and the total, the
+            // page, the terms and the scores from those alone.
             let every = match self
-                .query(def, customs, query.clone(), vec![Op::All { max }])
+                .query(def, customs, query.clone(), vec![Op::Every { max }])
                 .await
             {
                 Ok(a) => match a.into_iter().next() {

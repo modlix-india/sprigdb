@@ -349,3 +349,133 @@ fn local_scores_differ_where_global_agree() {
         "local statistics should disagree across partitions"
     );
 }
+
+/// Prefix and fuzzy terms of a query restricted to keys are chosen among
+/// those keys' documents: other documents' words can't push a visible
+/// document's word out of the `max_expansions` most frequent. `every`
+/// expands to every matching term, so it finds every candidate.
+#[test]
+fn expansions_of_a_keyed_query_count_only_its_documents() {
+    let ix = sample(2);
+    let k = |i: i64| Key::of_parts(&[KeyPart::Int(i)]);
+    let within = |q: &SearchQuery, keys: Vec<Key>| SearchQuery::Bool {
+        must: vec![q.clone()],
+        should: Vec::new(),
+        must_not: Vec::new(),
+        filter: vec![SearchQuery::Keys(keys)],
+        min_should: 0,
+    };
+    // Row 10 holds "zorbiny" and "kayak" once; rows 100.. hold ten other
+    // words of each kind twice, so they are the most frequent.
+    ix.upsert(&row(10, "visible", "zorbiny kayak", "acme", 1.0))
+        .unwrap();
+    let letters = "abcdefghij";
+    let hidden = |ix: &SearchIndex, from: i64| {
+        for (i, c) in letters.chars().enumerate() {
+            for copy in 0..2 {
+                let id = from + i64::try_from(i * 2 + copy).unwrap();
+                ix.upsert(&row(
+                    id,
+                    "hidden",
+                    &format!("zorb{c}{c} kaya{c}"),
+                    "zoom",
+                    1.0,
+                ))
+                .unwrap();
+            }
+        }
+        ix.commit(&format!("p{from}")).unwrap();
+    };
+    hidden(&ix, 100);
+    let max = 5;
+    let prefix = parse_query_string("body:zorb*", &[]).unwrap();
+    let fuzzy = parse_query_string("body:kayak~1", &[]).unwrap();
+    for q in [&prefix, &fuzzy] {
+        // Over every document, the ten others' words win: row 10 is missed.
+        let all = ids(&ix.top(q, 100, Scoring::Global, max).unwrap());
+        assert!(!all.contains(&10), "{q:?}: {all:?}");
+        // Restricted to row 10 and one other row, row 10's word counts.
+        let mine = within(q, vec![k(10), k(100)]);
+        let got = ix.top(&mine, 100, Scoring::Matched, max).unwrap();
+        let mut got_ids = ids(&got);
+        got_ids.sort_unstable();
+        assert_eq!(got_ids, [10, 100], "{q:?}");
+        assert_eq!(ix.count(&mine, max).unwrap(), 2, "{q:?}");
+        // Every candidate: row 10 and all twenty others.
+        let every = ids(&ix.every(q, 1000).unwrap());
+        assert_eq!(every.len(), 21, "{q:?}: {every:?}");
+        assert!(every.contains(&10));
+        let e = ix.every(q, 20).unwrap_err();
+        assert_eq!(e.code(), Some(SprigCode::SearchWindowExceeded));
+        assert!(!e.message.contains("21"), "{}", e.message);
+    }
+    // More documents outside the key set change neither the terms nor
+    // the scores of the restricted query.
+    let before: Vec<Vec<(i64, f32)>> = [&prefix, &fuzzy]
+        .iter()
+        .map(|q| {
+            let h = ix
+                .top(&within(q, vec![k(10)]), 10, Scoring::Matched, max)
+                .unwrap();
+            ids(&h).into_iter().zip(h.iter().map(|x| x.score)).collect()
+        })
+        .collect();
+    hidden(&ix, 200);
+    hidden(&ix, 300);
+    let after: Vec<Vec<(i64, f32)>> = [&prefix, &fuzzy]
+        .iter()
+        .map(|q| {
+            let h = ix
+                .top(&within(q, vec![k(10)]), 10, Scoring::Matched, max)
+                .unwrap();
+            ids(&h).into_iter().zip(h.iter().map(|x| x.score)).collect()
+        })
+        .collect();
+    assert_eq!(before, after);
+    assert_eq!(before[0].len(), 1);
+    // Two key sets (nested restrictions) intersect.
+    let nested = within(&within(&prefix, vec![k(10), k(100)]), vec![k(10)]);
+    assert_eq!(
+        ids(&ix.top(&nested, 10, Scoring::Matched, max).unwrap()),
+        [10]
+    );
+    // A restriction to no key expands to nothing.
+    assert!(
+        ix.top(&within(&prefix, Vec::new()), 10, Scoring::Matched, max)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A term in more documents than the key set has is counted by seeking
+/// the key set's documents in its postings, forward only: a visible
+/// document before the term's first one (and one between) is skipped.
+#[test]
+fn restricted_expansions_seek_postings_forward() {
+    let ix = sample(1);
+    let k = |i: i64| Key::of_parts(&[KeyPart::Int(i)]);
+    ix.upsert(&row(10, "first", "plain words", "acme", 1.0))
+        .unwrap();
+    for id in 100..106 {
+        ix.upsert(&row(id, "hidden", "zorbqq", "zoom", 1.0))
+            .unwrap();
+    }
+    ix.upsert(&row(11, "second", "zorbqq zorbint", "acme", 1.0))
+        .unwrap();
+    ix.upsert(&row(12, "third", "plain again", "acme", 1.0))
+        .unwrap();
+    ix.commit("p1").unwrap();
+    let q = parse_query_string("body:zorb*", &[]).unwrap();
+    let within = SearchQuery::Bool {
+        must: vec![q],
+        should: Vec::new(),
+        must_not: Vec::new(),
+        filter: vec![SearchQuery::Keys(vec![k(10), k(11), k(12)])],
+        min_should: 0,
+    };
+    assert_eq!(
+        ids(&ix.top(&within, 10, Scoring::Matched, 1).unwrap()),
+        [11]
+    );
+    assert_eq!(ix.count(&within, 1).unwrap(), 1);
+}

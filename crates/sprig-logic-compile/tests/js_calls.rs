@@ -367,6 +367,7 @@ impl Suite {
                 .collect(),
             returns: None,
             row: None,
+            on: None,
         };
         let c = sprig_logic_compile::js::compile_with(name, js, &jsig, &self.env, &opts).unwrap();
         assert!(

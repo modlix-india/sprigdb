@@ -115,6 +115,7 @@ fn cost(
             | Stmt::Throw(_)
             | Stmt::Rethrow(_)
             | Stmt::Leave(_)
+            | Stmt::Log(_)
             | Stmt::Return => 0,
         });
     }

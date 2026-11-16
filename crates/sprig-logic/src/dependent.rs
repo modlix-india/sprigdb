@@ -14,10 +14,14 @@
 //! ALTER TABLE t MODIFY | CHANGE | RENAME COLUMN | DROP COLUMN | ALTER COLUMN ... TYPE:
 //!   for each active validation and after-commit trigger bound to t:
 //!     compile its active version against today's columns and against
-//!     the columns the statement would leave
-//!   the same parameters, of the same types: the statement runs
-//!   otherwise: 39481, naming the code and why; drop it (or replace it
-//!     after the change), change the column, and create it again
+//!     the columns the statement would leave              (rebind)
+//!   the same parameters, of the same types: nothing to do
+//!   the same parameter names, other types (a column it reads changes
+//!     type): the gateway runs the statement, then deploys the same
+//!     source again as a new version, for the module's owner
+//!   it would no longer compile (a column it reads is dropped or
+//!     renamed): 39481, naming the code and why; drop it, change the
+//!     table, and create it again
 //! ```
 //!
 //! Only the compiled parameters count: code that doesn't read a changed
@@ -181,20 +185,58 @@ pub fn predict(cols: &StaticColumns, table: &str, ops: &[ColumnOp]) -> StaticCol
     out
 }
 
-/// Whether a validation's or trigger's active version (`source` in
-/// `runtime`) still compiles to the same routine after the change: the
-/// same parameters (`NEW.c`, `OLD.c` and `op`, by name) of the same types.
-///
-/// # Errors
-/// Why it doesn't, for the 39481 message.
-pub fn still_binds(
+/// What a column change means for one validation or trigger
+/// ([`rebind`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rebind {
+    /// It compiles to the same routine: nothing to do.
+    Same,
+    /// It still compiles, with other parameter types (a column it reads
+    /// changes type): it is recompiled and redeployed after the change,
+    /// as its owner. The text says which parameters change.
+    Recompile(String),
+    /// It would no longer compile (a column it reads is dropped, renamed,
+    /// or gets a type the compiler has no type for): the change is refused
+    /// with 39481. The text says why.
+    Refuse(String),
+}
+
+/// What the change from `before` to `after` means for a validation's or
+/// trigger's active version (`source` in `runtime`): the same routine
+/// (the same parameters `NEW.c`, `OLD.c` and `op`, by name, of the same
+/// types), a recompile (the same names, other types), or a refusal.
+#[must_use]
+pub fn rebind(
     runtime: Runtime,
     name: &str,
     source: &str,
     table: &str,
     before: &StaticColumns,
     after: &StaticColumns,
-) -> std::result::Result<(), String> {
+) -> Rebind {
+    match still_binds(runtime, name, source, table, before, after) {
+        Ok(()) => Rebind::Same,
+        Err(Changed::Types(why)) => Rebind::Recompile(why),
+        Err(Changed::Broken(why)) => Rebind::Refuse(why),
+    }
+}
+
+/// Why a version doesn't bind the same way.
+enum Changed {
+    /// The same parameter names, other types.
+    Types(String),
+    /// It doesn't compile, or a parameter is gone.
+    Broken(String),
+}
+
+fn still_binds(
+    runtime: Runtime,
+    name: &str,
+    source: &str,
+    table: &str,
+    before: &StaticColumns,
+    after: &StaticColumns,
+) -> std::result::Result<(), Changed> {
     let compile = |cols: &StaticColumns| {
         if runtime == Runtime::Javascript {
             sprig_logic_compile::js::compile_with(
@@ -218,7 +260,7 @@ pub fn still_binds(
         // Not compiled today: nothing of it is in MariaDB to break.
         _ => return Ok(()),
     };
-    let then = compile(after).map_err(|e| e.message)?;
+    let then = compile(after).map_err(|e| Changed::Broken(e.message))?;
     if !then.compilable() {
         let why: Vec<String> = then
             .analysis
@@ -226,7 +268,10 @@ pub fn still_binds(
             .iter()
             .map(ToString::to_string)
             .collect();
-        return Err(format!("it would no longer compile ({})", why.join("; ")));
+        return Err(Changed::Broken(format!(
+            "it would no longer compile ({})",
+            why.join("; ")
+        )));
     }
     let (a, b) = (params(&now), params(&then));
     if a == b {
@@ -240,10 +285,16 @@ pub fn still_binds(
             None => format!("{n} (gone)"),
         })
         .collect();
-    Err(format!(
+    let names = |v: &[(String, Ty)]| v.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+    let why = format!(
         "the columns it reads would change under it: {}",
         changed.join(", ")
-    ))
+    );
+    if names(&a) == names(&b) {
+        Err(Changed::Types(why))
+    } else {
+        Err(Changed::Broken(why))
+    }
 }
 
 #[cfg(test)]
@@ -293,43 +344,33 @@ mod tests {
     }
 
     #[test]
-    fn a_validation_must_keep_its_parameters() {
+    fn a_type_change_recompiles_and_a_lost_column_refuses() {
         let src = "export default function (row) { if (row.qty > 10) sprig.reject('too many'); }";
         let before = cols();
-        let keep = predict(
-            &before,
-            "sales",
-            &parse("ALTER TABLE sales MODIFY qty BIGINT").unwrap().ops,
-        );
+        let after = |sql: &str| predict(&before, "sales", &parse(sql).unwrap().ops);
+        let r = |a: &StaticColumns| rebind(Runtime::Javascript, "v", src, "sales", &before, a);
         assert_eq!(
-            still_binds(Runtime::Javascript, "v", src, "sales", &before, &keep),
-            Ok(())
+            r(&after("ALTER TABLE sales MODIFY qty BIGINT")),
+            Rebind::Same
         );
         // A column it doesn't read may change freely.
-        let note = predict(
-            &before,
-            "sales",
-            &parse("ALTER TABLE sales DROP COLUMN note").unwrap().ops,
-        );
         assert_eq!(
-            still_binds(Runtime::Javascript, "v", src, "sales", &before, &note),
-            Ok(())
+            r(&after("ALTER TABLE sales DROP COLUMN note")),
+            Rebind::Same
         );
-        let retype = predict(
-            &before,
-            "sales",
-            &parse("ALTER TABLE sales MODIFY qty DOUBLE").unwrap().ops,
-        );
-        let e = still_binds(Runtime::Javascript, "v", src, "sales", &before, &retype).unwrap_err();
-        assert!(e.contains("qty (i64 becomes f64)"), "{e}");
-        let gone = predict(
-            &before,
-            "sales",
-            &parse("ALTER TABLE sales RENAME COLUMN qty TO amount")
-                .unwrap()
-                .ops,
-        );
-        let e = still_binds(Runtime::Javascript, "v", src, "sales", &before, &gone).unwrap_err();
-        assert!(e.contains("no longer compile"), "{e}");
+        // A column it reads changes type: recompiled.
+        match r(&after("ALTER TABLE sales MODIFY qty DOUBLE")) {
+            Rebind::Recompile(why) => assert!(why.contains("qty (i64 becomes f64)"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        // A column it reads is renamed or dropped: refused.
+        match r(&after("ALTER TABLE sales RENAME COLUMN qty TO amount")) {
+            Rebind::Refuse(why) => assert!(why.contains("no longer compile"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            r(&after("ALTER TABLE sales DROP COLUMN qty")),
+            Rebind::Refuse(_)
+        ));
     }
 }

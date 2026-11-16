@@ -32,6 +32,7 @@ use sprig_common::ids::ClusterId;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_logic::catalog::BindingRow;
 use sprig_logic::declare::{Declaration, Kind};
+use sprig_logic::dependent::Rebind;
 use sprig_logic::deploy::{ConnSession, Session, ShardSessions, conn_err};
 use sprig_logic::service::{self, Bind, Target};
 use sprig_logic::{LogicStore, enforce};
@@ -302,6 +303,20 @@ impl PassSession {
         cx: &mut ExecCtx<'_>,
         decl: Declaration,
     ) -> Result<Vec<String>> {
+        self.logic_deploy_bound_as(cx, decl, None).await
+    }
+
+    /// [`Self::logic_deploy_bound`]; with `owner`, SprigDB deploys it for
+    /// that user (the module's owner, its `DEFINER`): a validation or
+    /// trigger recompiled after its table's columns changed type. Rights
+    /// aren't checked then.
+    #[allow(clippy::too_many_lines)]
+    async fn logic_deploy_bound_as(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        decl: Declaration,
+        owner: Option<sprig_common::ids::UserId>,
+    ) -> Result<Vec<String>> {
         let current = self.current_logical();
         let Some(ts) = self.tenant.as_deref_mut() else {
             return Err(SprigError::internal("no tenant"));
@@ -322,12 +337,17 @@ impl PassSession {
         let row = catalog.database(&db_key).cloned().ok_or_else(|| {
             SprigError::standard(1049, *b"42000", format!("Unknown database '{db}'"))
         })?;
-        let user = ts
-            .principal
-            .user_id
-            .ok_or_else(|| SprigError::internal("a logic deploy without a user"))?;
+        let user = match owner {
+            Some(u) => u,
+            None => ts
+                .principal
+                .user_id
+                .ok_or_else(|| SprigError::internal("a logic deploy without a user"))?,
+        };
         let user_name = ts.principal.user.clone();
         let grants = crate::tenant::authz::privileges(ts, &catalog);
+        // SprigDB's own redeploy for the owner checks no rights.
+        let unchecked = owner.is_some() || grants.unrestricted();
         let table = if let Some(t) = &decl.table {
             {
                 let o = catalog
@@ -345,7 +365,7 @@ impl PassSession {
                             format!("Table '{db}.{}' doesn't exist", t.name),
                         )
                     })?;
-                if !grants.unrestricted()
+                if !unchecked
                     && !grants.allows(
                         Action::Trigger,
                         AuthzTarget::Object {
@@ -364,7 +384,7 @@ impl PassSession {
                 // event's rows against them (refused before). Validations
                 // run in the writer's own statement and see only its row, so
                 // TRIGGER stays enough for them.
-                if decl.kind == Kind::Trigger && !grants.unrestricted() {
+                if decl.kind == Kind::Trigger && !unchecked {
                     let on = AuthzTarget::Object {
                         db_key: &db_key,
                         db: row.db_id,
@@ -378,7 +398,7 @@ impl PassSession {
             }
         } else {
             {
-                if !grants.unrestricted()
+                if !unchecked
                     && !grants.allows(
                         Action::CreateRoutine,
                         AuthzTarget::Database { db_key: &db_key },
@@ -547,16 +567,24 @@ impl PassSession {
     }
 
     /// `ALTER TABLE t` changing existing columns under a compiled
-    /// validation or after-commit trigger on `t`: refused (39481) when the
-    /// code reads a changed column and would bind differently
-    /// ([`sprig_logic::dependent`]). `None`: the statement goes on.
+    /// validation or after-commit trigger on `t`
+    /// ([`sprig_logic::dependent`]): refused (39481) when the code would
+    /// no longer compile (a column it reads is dropped or renamed); when a
+    /// column it reads only changes type, the statement runs here and each
+    /// such validation or trigger is then recompiled and deployed again as
+    /// a new version, for its owner. `None`: the statement goes on.
     #[allow(clippy::too_many_lines)]
     pub(super) async fn tenant_column_change(
         &mut self,
+        cx: &mut ExecCtx<'_>,
         text: &Bytes,
         status: StatusFlags,
         out: &mut dyn ResultSink,
     ) -> Result<Option<Step>> {
+        // The statement this check runs itself, below.
+        if self.column_change_running {
+            return Ok(None);
+        }
         let sql = String::from_utf8_lossy(text).into_owned();
         let Some(change) = sprig_logic::dependent::parse(&sql) else {
             return Ok(None);
@@ -620,7 +648,7 @@ impl PassSession {
                 continue;
             }
             let source = store.source(&mut conn, m.module_id, v).await?;
-            bound.push((m, source));
+            bound.push((m, source, b));
         }
         drop(conn);
         if bound.is_empty() {
@@ -640,33 +668,132 @@ impl PassSession {
         let before = before?;
         let after = sprig_logic::dependent::predict(&before, &change.table, &change.ops);
         let mut why = Vec::new();
-        for (m, source) in &bound {
+        let mut recompile = Vec::new();
+        for (m, source, b) in bound {
             let runtime = sprig_logic::compiler::Runtime::parse(&m.runtime)
                 .unwrap_or(sprig_logic::compiler::Runtime::Kirun);
-            if let Err(w) = sprig_logic::dependent::still_binds(
+            match sprig_logic::dependent::rebind(
                 runtime,
                 &m.name,
-                source,
+                &source,
                 &change.table,
                 &before,
                 &after,
             ) {
-                why.push(format!("{} {}: {w}", m.kind, m.name));
+                Rebind::Same => {}
+                Rebind::Refuse(w) => why.push(format!("{} {}: {w}", m.kind, m.name)),
+                Rebind::Recompile(w) => recompile.push((m, source, b, runtime, w)),
             }
         }
-        if why.is_empty() {
+        if !why.is_empty() {
+            let e = SprigError::new(
+                SprigCode::DdlUnsupported,
+                format!(
+                    "ALTER TABLE {} would change columns compiled logic reads: {}; drop it, \
+                     change the table, and create it again",
+                    change.table,
+                    why.join("; ")
+                ),
+            );
+            return self.answer(Err(e), status, out).await.map(Some);
+        }
+        if recompile.is_empty() {
             return Ok(None);
         }
-        let e = SprigError::new(
-            SprigCode::DdlUnsupported,
-            format!(
-                "ALTER TABLE {} would change columns compiled logic reads: {}; drop it, change \
-                 the table, and create it again",
-                change.table,
-                why.join("; ")
-            ),
-        );
-        self.answer(Err(e), status, out).await.map(Some)
+        // The statement itself, then each validation or trigger again for
+        // the new types. Until its new version is in place (milliseconds
+        // to seconds), the old one gets the column's values converted to
+        // the old type, as before this check existed.
+        let mut sink = Outcome {
+            wire: Wire {
+                persona: self.persona,
+                caps: cx.proto.caps,
+            },
+            error: None,
+            done: false,
+        };
+        self.column_change_running = true;
+        let r = Box::pin(self.tenant_text(
+            cx,
+            text,
+            &QueryAttrs::default(),
+            false,
+            RowFormat::Text,
+            &mut sink,
+        ))
+        .await;
+        self.column_change_running = false;
+        let err = match r {
+            Err(e) => Some(e),
+            Ok(_) => sink.error.take(),
+        };
+        if let Some(e) = err {
+            return self.answer(Err(e), status, out).await.map(Some);
+        }
+        let mut notes = Vec::new();
+        for (m, source, b, runtime, w) in recompile {
+            let kind = if m.kind == "validation" {
+                Kind::Validation
+            } else {
+                Kind::Trigger
+            };
+            let decl = Declaration {
+                kind,
+                or_replace: true,
+                db: Some(db.clone()),
+                name: m.name.clone(),
+                runtime,
+                definer_security: m.security == "definer",
+                deterministic: false,
+                exposure: Vec::new(),
+                tier: match m.tier_pref.as_str() {
+                    "mariadb" => sprig_logic::declare::TierPref::Mariadb,
+                    "engine" => sprig_logic::declare::TierPref::Engine,
+                    _ => sprig_logic::declare::TierPref::Auto,
+                },
+                body: source,
+                table: Some(sprig_logic::declare::TableRef {
+                    db: Some(db.clone()),
+                    name: change.table.clone(),
+                }),
+                source: None,
+                events: b
+                    .events
+                    .split(',')
+                    .filter(|e| !e.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+                when_fields: b.when_fields.clone(),
+                schedule: None,
+                params: Vec::new(),
+                returns: None,
+                rollout: None,
+                rollout_key: None,
+            };
+            let owner = sprig_common::ids::UserId(m.created_by);
+            match Box::pin(self.logic_deploy_bound_as(cx, decl, Some(owner))).await {
+                Ok(_) => {
+                    tracing::info!(kind = %m.kind, name = %m.name, table = %change.table, "recompiled for its table's new column types");
+                    notes.push(format!(
+                        "{} {} was recompiled for the new column types and deployed as a new \
+                         version ({w})",
+                        m.kind, m.name
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!(kind = %m.kind, name = %m.name, table = %change.table, error = %e, "recompiling after a column change failed");
+                    notes.push(format!(
+                        "the table changed, but recompiling {} {} failed ({}); its previous \
+                         version still runs with the old column types: deploy it again",
+                        m.kind, m.name, e.message
+                    ));
+                }
+            }
+        }
+        if let Some(ts) = self.tenant.as_deref() {
+            super::logic_rollout::invalidate(ts.tenant.0);
+        }
+        self.answer(Ok(notes), status, out).await.map(Some)
     }
 
     /// `ALTER TABLE t ADD c TYPE AS (f(args))` where `f` is a logic
