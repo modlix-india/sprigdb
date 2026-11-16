@@ -131,10 +131,10 @@ pub struct Plan {
     pub qualifiers: Vec<String>,
 }
 
-fn refused(errno: u16, sqlstate: &[u8; 5], message: String) -> NameError {
+fn refused(errno: u16, sqlstate: [u8; 5], message: String) -> NameError {
     NameError::Refused {
         errno,
-        sqlstate: *sqlstate,
+        sqlstate,
         message,
     }
 }
@@ -142,7 +142,7 @@ fn refused(errno: u16, sqlstate: &[u8; 5], message: String) -> NameError {
 fn not_here(name: &str, why: &str) -> NameError {
     refused(
         1235,
-        b"42000",
+        *b"42000",
         format!(
             "This version of SprigDB doesn't yet support '{name} over row values {why}': \
              use it as a whole item of the outermost SELECT list, or give it a literal input"
@@ -151,7 +151,11 @@ fn not_here(name: &str, why: &str) -> NameError {
 }
 
 fn bad_args(name: &str, why: &str) -> NameError {
-    refused(1210, b"HY000", format!("Incorrect arguments to {name}: {why}"))
+    refused(
+        1210,
+        *b"HY000",
+        format!("Incorrect arguments to {name}: {why}"),
+    )
 }
 
 /// The statement's tokens without trivia, with their nesting depth.
@@ -164,7 +168,8 @@ struct Toks<'a> {
 impl Toks<'_> {
     fn word(&self, i: usize) -> Option<String> {
         let t = self.t.get(i)?;
-        (t.kind == TokenKind::Word).then(|| String::from_utf8_lossy(t.bytes(self.sql)).to_ascii_uppercase())
+        (t.kind == TokenKind::Word)
+            .then(|| String::from_utf8_lossy(t.bytes(self.sql)).to_ascii_uppercase())
     }
 
     fn is_word(&self, i: usize, w: &str) -> bool {
@@ -200,6 +205,7 @@ impl Toks<'_> {
 }
 
 /// A literal argument's value: `Some(None)` for `NULL`.
+#[allow(clippy::option_option, clippy::many_single_char_names)]
 fn literal(tk: &Toks<'_>, r: Range<usize>, nbe: bool) -> Option<Option<String>> {
     let toks = &tk.t[r];
     let sql = tk.sql;
@@ -211,9 +217,7 @@ fn literal(tk: &Toks<'_>, r: Range<usize>, nbe: bool) -> Option<Option<String>> 
             Some(Some(String::from_utf8_lossy(t.bytes(sql)).into_owned()))
         }
         [m, t]
-            if m.kind == TokenKind::Op
-                && m.bytes(sql) == b"-"
-                && t.kind == TokenKind::Number =>
+            if m.kind == TokenKind::Op && m.bytes(sql) == b"-" && t.kind == TokenKind::Number =>
         {
             Some(Some(format!("-{}", String::from_utf8_lossy(t.bytes(sql)))))
         }
@@ -371,13 +375,17 @@ fn outer_select(tk: &Toks<'_>) -> Option<Outer> {
 
 /// Whether item `r` is exactly the call `c` (token indexes), with an
 /// optional alias after it; `Some(alias)` when it is.
+#[allow(clippy::option_option)]
 fn item_alias(tk: &Toks<'_>, r: &Range<usize>, c: &Range<usize>) -> Option<Option<String>> {
     if r.start != c.start {
         return None;
     }
     match r.end - c.end {
         0 => Some(None),
-        1 => tk.ident(c.end).or_else(|| string_alias(tk, c.end)).map(Some),
+        1 => tk
+            .ident(c.end)
+            .or_else(|| string_alias(tk, c.end))
+            .map(Some),
         2 if tk.is_word(c.end, "AS") => tk
             .ident(c.end + 1)
             .or_else(|| string_alias(tk, c.end + 1))
@@ -409,6 +417,7 @@ fn is_wildcard(tk: &Toks<'_>, r: &Range<usize>) -> bool {
 /// inputs); 1210 for a later argument that isn't a literal, or a nested
 /// call; 1582 for a call without arguments.
 #[allow(clippy::too_many_lines)] // one pass over the calls
+#[must_use]
 pub fn analyze(text: &[u8], opts: &LexOptions) -> Option<Result<Plan, NameError>> {
     if !mentions(text) {
         return None;
@@ -461,9 +470,7 @@ pub fn analyze(text: &[u8], opts: &LexOptions) -> Option<Result<Plan, NameError>
         let Some(name) = NAMES.iter().find(|n| w.eq_ignore_ascii_case(n.as_bytes())) else {
             continue;
         };
-        let Some(close) = tk.close(i + 1) else {
-            return None;
-        };
+        let close = tk.close(i + 1)?;
         found.push((name, i, close));
     }
     if found.is_empty() {
@@ -494,10 +501,10 @@ pub fn analyze(text: &[u8], opts: &LexOptions) -> Option<Result<Plan, NameError>
             }
         }
         args.push(from..close);
-        if args.iter().any(|a| a.is_empty()) {
+        if args.iter().any(Range::is_empty) {
             return Some(Err(refused(
                 1582,
-                b"42000",
+                *b"42000",
                 format!("Incorrect parameter count in the call to native function '{name}'"),
             )));
         }
@@ -517,7 +524,11 @@ pub fn analyze(text: &[u8], opts: &LexOptions) -> Option<Result<Plan, NameError>
         }
         let call_toks = open_at..close + 1;
         let item = outer.as_ref().and_then(|o| {
-            let (n, r) = o.items.iter().enumerate().find(|(_, r)| r.contains(&open_at))?;
+            let (n, r) = o
+                .items
+                .iter()
+                .enumerate()
+                .find(|(_, r)| r.contains(&open_at))?;
             let alias = item_alias(&tk, r, &call_toks)?;
             let before = o.items[..n].iter().any(|r| is_wildcard(&tk, r));
             let after = o.items[n + 1..].iter().any(|r| is_wildcard(&tk, r));
@@ -536,7 +547,9 @@ pub fn analyze(text: &[u8], opts: &LexOptions) -> Option<Result<Plan, NameError>
             let Some(it) = &item else {
                 return Some(Err(not_here(name, "outside the outermost SELECT list")));
             };
-            let o = outer.as_ref().unwrap_or_else(|| unreachable!("an item has an outer list"));
+            let o = outer
+                .as_ref()
+                .unwrap_or_else(|| unreachable!("an item has an outer list"));
             if o.distinct {
                 return Some(Err(not_here(name, "with SELECT DISTINCT")));
             }
@@ -552,7 +565,10 @@ pub fn analyze(text: &[u8], opts: &LexOptions) -> Option<Result<Plan, NameError>
             let named = o.clauses.iter().any(|c| {
                 c.clone().any(|k| {
                     let t = &tk.t[k];
-                    (t.kind == TokenKind::Number && pos.as_deref().is_some_and(|p| t.bytes(text) == p.as_bytes())
+                    (t.kind == TokenKind::Number
+                        && pos
+                            .as_deref()
+                            .is_some_and(|p| t.bytes(text) == p.as_bytes())
                         && (tk.is_word(k - 1, "BY") || tk.punct(k - 1, b',')))
                         || it.alias.as_ref().is_some_and(|a| {
                             tk.ident(k).is_some_and(|x| x.eq_ignore_ascii_case(a))
@@ -645,7 +661,9 @@ mod tests {
     use super::*;
 
     fn plan(sql: &str) -> Plan {
-        analyze(sql.as_bytes(), &LexOptions::mariadb()).unwrap().unwrap()
+        analyze(sql.as_bytes(), &LexOptions::mariadb())
+            .unwrap()
+            .unwrap()
     }
 
     fn err(sql: &str) -> u16 {
@@ -716,7 +734,10 @@ mod tests {
         let it = k.item.as_ref().unwrap();
         assert_eq!(it.alias.as_deref(), Some("kind"));
         assert_eq!(it.column, ColumnAt::FromStart(1));
-        assert_eq!(p.calls[1].item.as_ref().unwrap().column, ColumnAt::FromStart(2));
+        assert_eq!(
+            p.calls[1].item.as_ref().unwrap().column,
+            ColumnAt::FromStart(2)
+        );
         assert_eq!(p.calls[1].written(sql.as_bytes()), "AI_SUMMARIZE(body, 30)");
         assert_eq!(
             p.render(sql.as_bytes(), &[String::new(), String::new()]),
@@ -725,9 +746,16 @@ mod tests {
         );
         // After `*`, counted from the end.
         let p = plan("WITH x AS (SELECT * FROM t) SELECT *, AI_EMBED(body) e FROM x");
-        assert_eq!(p.calls[0].item.as_ref().unwrap().column, ColumnAt::FromEnd(0));
+        assert_eq!(
+            p.calls[0].item.as_ref().unwrap().column,
+            ColumnAt::FromEnd(0)
+        );
         assert_eq!(ColumnAt::FromEnd(0).index(4), Some(3));
-        assert!(plan("SELECT t.*, AI_EMBED('x') FROM t").calls[0].item.is_some());
+        assert!(
+            plan("SELECT t.*, AI_EMBED('x') FROM t").calls[0]
+                .item
+                .is_some()
+        );
         // Qualifiers, for the databases read.
         let p = plan("SELECT AI_EMBED(p.name) FROM shop.products p");
         assert_eq!(p.qualifiers, ["p", "shop"]);
@@ -738,14 +766,29 @@ mod tests {
 
     #[test]
     fn row_inputs_elsewhere_are_refused() {
-        assert_eq!(err("SELECT id FROM t WHERE AI_CLASSIFY(body, 'a', 'b') = 'a'"), 1235);
+        assert_eq!(
+            err("SELECT id FROM t WHERE AI_CLASSIFY(body, 'a', 'b') = 'a'"),
+            1235
+        );
         assert_eq!(err("SELECT UPPER(AI_SUMMARIZE(body)) FROM t"), 1235);
         assert_eq!(err("UPDATE t SET s = AI_SUMMARIZE(body)"), 1235);
         assert_eq!(err("INSERT INTO s SELECT AI_SUMMARIZE(body) FROM t"), 1235);
-        assert_eq!(err("SELECT DISTINCT AI_CLASSIFY(body, 'a', 'b') FROM t"), 1235);
-        assert_eq!(err("SELECT AI_SUMMARIZE(body) FROM t UNION SELECT 'x'"), 1235);
-        assert_eq!(err("SELECT AI_CLASSIFY(b, 'a', 'b') k FROM t ORDER BY k"), 1235);
-        assert_eq!(err("SELECT id, AI_CLASSIFY(b, 'a', 'b') FROM t GROUP BY 2"), 1235);
+        assert_eq!(
+            err("SELECT DISTINCT AI_CLASSIFY(body, 'a', 'b') FROM t"),
+            1235
+        );
+        assert_eq!(
+            err("SELECT AI_SUMMARIZE(body) FROM t UNION SELECT 'x'"),
+            1235
+        );
+        assert_eq!(
+            err("SELECT AI_CLASSIFY(b, 'a', 'b') k FROM t ORDER BY k"),
+            1235
+        );
+        assert_eq!(
+            err("SELECT id, AI_CLASSIFY(b, 'a', 'b') FROM t GROUP BY 2"),
+            1235
+        );
         assert_eq!(err("SELECT AI_SUMMARIZE(body) INTO @x FROM t"), 1235);
         assert_eq!(err("SELECT t.*, AI_EMBED(b), u.* FROM t, u"), 1235);
         assert_eq!(err("SELECT AI_CLASSIFY(body, label, 'b') FROM t"), 1210);
@@ -754,7 +797,9 @@ mod tests {
         // An alias named in WHERE is the table's column, not the item's.
         assert!(plan("SELECT AI_SUMMARIZE(body) AS body FROM t WHERE body <> ''").has_columns());
         // ORDER BY another column is fine.
-        assert!(plan("SELECT id, AI_SUMMARIZE(body) s FROM t ORDER BY 1 DESC LIMIT 5").has_columns());
+        assert!(
+            plan("SELECT id, AI_SUMMARIZE(body) s FROM t ORDER BY 1 DESC LIMIT 5").has_columns()
+        );
     }
 
     #[test]

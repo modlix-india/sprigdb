@@ -36,10 +36,10 @@ use bytes::Bytes;
 use serde_json::json;
 use sprig_ai::embedding::store::{EmbeddedColumn, NewColumn, Pending, State, Store};
 use sprig_ai::embedding::{self, ModelRef, failed};
-use sprig_catalog::TenantCatalog;
 use sprig_catalog::ddl::{database_key, object_key};
 use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::{Namespace, ObjectKind, ObjectState};
+use sprig_catalog::{CatalogLocator as _, TenantCatalog};
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_feed::subs::{Subscription, Subscriptions};
 use sprig_feed::{ResumeToken, StartAt, TailOptions, TenantTail};
@@ -49,7 +49,7 @@ use sprig_sql::embedcol::{self, Clause, Meta, Mode, Spec, Stmt, Touch, quote};
 
 use super::PassSession;
 use super::tenant::Step;
-use crate::pipeline::{ExecCtx, ResultSink};
+use crate::pipeline::{ExecCtx, ResultSink, Wire};
 use crate::tenant::TenantServices;
 
 /// The feed subscription kind (and the controller's job kind).
@@ -109,7 +109,8 @@ impl PassSession {
             .position(|b| !b.is_ascii_whitespace())
             .map_or(&text[..0], |i| &text[i..]);
         if !(first.len() >= 6
-            && (first[..6].eq_ignore_ascii_case(b"CREATE") || first[..5].eq_ignore_ascii_case(b"ALTER")))
+            && (first[..6].eq_ignore_ascii_case(b"CREATE")
+                || first[..5].eq_ignore_ascii_case(b"ALTER")))
         {
             return Ok(None);
         }
@@ -126,6 +127,7 @@ impl PassSession {
         let Ok(sql) = std::str::from_utf8(text) else {
             return Ok(None);
         };
+        let wire = out.wire();
         let r = match plan {
             Plan::Pass => return Ok(None),
             Plan::Declare {
@@ -141,13 +143,13 @@ impl PassSession {
                     );
                     return Ok(Some(self.fail(out, &e).await?));
                 }
-                Box::pin(self.declare(cx, out, sql, &db, &table, create, &clauses)).await
+                Box::pin(self.declare(cx, wire, sql, &db, &table, create, &clauses)).await
             }
             Plan::Modify { db, table, clause } => {
-                Box::pin(self.modify(cx, out, &db, &table, &clause)).await
+                Box::pin(self.modify(cx, wire, &db, &table, &clause)).await
             }
             Plan::Touches { db, table, specs } => {
-                match Box::pin(self.touches(cx, out, sql, &db, &table, &specs)).await {
+                match Box::pin(self.touches(cx, wire, sql, &db, &table, &specs)).await {
                     Ok(true) => Ok(()),
                     Ok(false) => return Ok(None),
                     Err(e) => Err(e),
@@ -234,7 +236,9 @@ impl PassSession {
         })
     }
 
-    fn services_and_tenant(&self) -> Result<(Arc<TenantServices>, sprig_common::ids::TenantId, u32)> {
+    fn services_and_tenant(
+        &self,
+    ) -> Result<(Arc<TenantServices>, sprig_common::ids::TenantId, u32)> {
         let ts = self
             .tenant
             .as_deref()
@@ -258,11 +262,11 @@ impl PassSession {
     }
 
     /// Runs `sql` through the session with the hidden names allowed.
-    async fn run_internal(&mut self, cx: &mut ExecCtx<'_>, out: &dyn ResultSink, sql: &str) -> Result<()> {
+    async fn embed_run(&mut self, cx: &mut ExecCtx<'_>, wire: Wire, sql: &str) -> Result<()> {
         if let Some(ts) = self.tenant.as_deref_mut() {
             ts.types.internal = true;
         }
-        let r = self.sub_rows(cx, out.wire(), sql).await;
+        let r = self.sub_rows(cx, wire, sql).await;
         if let Some(ts) = self.tenant.as_deref_mut() {
             ts.types.internal = false;
         }
@@ -273,7 +277,7 @@ impl PassSession {
     async fn has_primary_key(
         &mut self,
         cx: &mut ExecCtx<'_>,
-        out: &dyn ResultSink,
+        wire: Wire,
         db: &str,
         table: &str,
     ) -> Result<bool> {
@@ -281,7 +285,7 @@ impl PassSession {
         let rows = self
             .sub_rows(
                 cx,
-                out.wire(),
+                wire,
                 &format!(
                     "SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = {} \
                      AND TABLE_NAME = {} AND INDEX_NAME = 'PRIMARY'",
@@ -346,7 +350,7 @@ impl PassSession {
     async fn declare(
         &mut self,
         cx: &mut ExecCtx<'_>,
-        out: &dyn ResultSink,
+        wire: Wire,
         sql: &str,
         db: &str,
         table: &str,
@@ -373,7 +377,7 @@ impl PassSession {
                 )));
             }
         } else if self.table_object(db, table).await?.is_some()
-            && !self.has_primary_key(cx, out, db, table).await?
+            && !self.has_primary_key(cx, wire, db, table).await?
         {
             return Err(failed(format!(
                 "{table}: a table with embedded columns needs a primary key"
@@ -403,7 +407,7 @@ impl PassSession {
             })
             .collect();
         let rewritten = embedcol::splice(sql, edits);
-        self.run_internal(cx, out, &rewritten).await?;
+        self.embed_run(cx, wire, &rewritten).await?;
         // The table (new or altered) and its rows.
         let Some((db_id, object)) = self.table_object(db, table).await? else {
             return Err(SprigError::internal(format!(
@@ -443,13 +447,15 @@ impl PassSession {
         let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
-        Store::new(ep.store.schema()).of_object(&mut conn, object).await
+        Store::new(ep.store.schema())
+            .of_object(&mut conn, object)
+            .await
     }
 
     async fn modify(
         &mut self,
         cx: &mut ExecCtx<'_>,
-        out: &dyn ResultSink,
+        wire: Wire,
         db: &str,
         table: &str,
         c: &Clause,
@@ -519,7 +525,7 @@ impl PassSession {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        self.run_internal(cx, out, &sql).await?;
+        self.embed_run(cx, wire, &sql).await?;
         let ep = svc.locator.writer(tenant).await?;
         let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
@@ -546,7 +552,7 @@ impl PassSession {
     async fn touches(
         &mut self,
         cx: &mut ExecCtx<'_>,
-        out: &dyn ResultSink,
+        wire: Wire,
         sql: &str,
         db: &str,
         table: &str,
@@ -600,7 +606,7 @@ impl PassSession {
             return Ok(false);
         }
         let rewritten = embedcol::splice(sql, edits);
-        self.run_internal(cx, out, &rewritten).await?;
+        self.embed_run(cx, wire, &rewritten).await?;
         let (svc, tenant, _) = self.services_and_tenant()?;
         let ep = svc.locator.writer(tenant).await?;
         let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {

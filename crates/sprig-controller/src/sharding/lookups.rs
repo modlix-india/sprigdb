@@ -150,12 +150,12 @@ pub(super) fn qualifies(s: &Scatter, a: &sprig_advisor::sharding::settings::Look
 
 /// [`LookupHost`] for the controller: the catalog on the tenant's home
 /// cluster, the loop's writer pools, and the loop's publish.
-struct CtlHost<'a> {
-    l: &'a ShardingLoop,
-    tenant: TenantId,
-    home: ClusterId,
+pub(super) struct CtlHost<'a> {
+    pub(super) l: &'a ShardingLoop,
+    pub(super) tenant: TenantId,
+    pub(super) home: ClusterId,
     /// `lookup.publish_timeout_ms`.
-    publish_timeout: Duration,
+    pub(super) publish_timeout: Duration,
 }
 
 #[async_trait::async_trait]

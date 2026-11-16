@@ -20,15 +20,43 @@ Each version runs in one of two **tiers**:
 
 SprigDB picks the tier (`SPRIG_TIER = 'auto'`): code that can't compile to SQL, such as code with outbound `fetch` calls or loops it can't bound, runs in the engine tier. After a declaration, `SHOW WARNINGS` lists one note per line of the placement: the module, the version, the tier and each reason for the engine tier.
 
-JavaScript compiles to the MariaDB tier with `try`/`catch`/`finally`, helper functions declared in the same source, and `do ... while` loops. These keep it in the engine tier, each shown as a reason:
+JavaScript compiles to the MariaDB tier with `try`/`catch`/`finally`, helper functions declared in the same source, `do ... while` loops, and, in functions, procedures, validations and after-commit triggers, `db.call` and `db.publish`. These keep it in the engine tier, each shown as a reason:
 
 | Reason | Why |
 |---|---|
 | `js.catch_value` | A `catch` reads the database error it caught (its message), which SQL handlers can't pass on |
-| `js.recursion` | A helper function calls itself, directly or through another |
-| `js.db` | `db.call`, `db.publish`, `db.commitOffset` or a `db.mq.*` call |
+| `js.recursion` | A helper function calls itself, directly or through another; or `db.call`s form a cycle or nest deeper than 8 |
+| `js.db` | A `db` call that can't compile: `db.commitOffset` or `db.mq.*`; a `db.call` or `db.publish` naming another database, or a name that isn't a literal; a callee in the engine tier, or mid-rollout with versions of different shapes; JSON arguments; a change topic |
+| `js.member` | Reading a field the callee never returns, or a column the table doesn't have |
+| `js.call` | Another built-in call that only the engine tier runs |
 
-`EXPLAIN FUNCTION` lists every reason with its place in the source.
+**Compiled calls.** `db.call(name, ...args)` and `db.publish` compile when the call is a statement of its own or a declaration's initializer (`const r = db.call(...)`), as `db.sql` does; inside a larger expression (`return db.call(...).fields.value`), the call runs in the engine tier for now.
+
+```sql test
+CREATE OR REPLACE FUNCTION add_tax(amount DOUBLE) RETURNS DOUBLE LANGUAGE javascript AS
+  'return amount * 1.2;';
+CREATE OR REPLACE FUNCTION gross_total(net DOUBLE, qty INT) RETURNS DOUBLE LANGUAGE javascript AS
+  'const r = db.call("add_tax", net * qty); return r.fields.value;';
+SELECT gross_total(10, 3) AS g;
+```
+
+```text output
+g
+36
+```
+
+```sql test
+EXPLAIN FUNCTION gross_total;
+```
+
+```text output
+Version	State	Tier	Placement
+1	active (live)	mariadb	tier mariadb, route any shard, cost 1
+```
+
+A compiled `db.call` goes through a hidden entry, `` `__sprig_l<module>_call` ``, so it follows the callee's deploys, rollbacks and rollout stage; that name can appear in MariaDB errors such as 1370 and 1305. Nested compiled calls stay fast: three levels deep cost about 1.3 ms against 4.8 ms in the engine tier, and twenty about 1.3 ms against 15 ms. Redeploying a callee so that its compiled callers no longer fit (other parameters or result) is refused with 39875, naming the callers; redeploy them `WITH (SPRIG_TIER = 'engine')` first, then the callee. A compiled `db.publish` checks the stream's `stream.max_message_bytes`, as read when the code was deployed (39944), and a compacted stream's key (39955). Computed columns still refuse `db.call`, and sink transforms have no `db`.
+
+`EXPLAIN FUNCTION` lists every reason with its place in the source and a message, for example `js.db: the arguments must be an array literal`.
 
 ```sql test
 CREATE OR REPLACE FUNCTION safe_ratio(a DOUBLE, b DOUBLE) RETURNS DOUBLE LANGUAGE javascript AS '

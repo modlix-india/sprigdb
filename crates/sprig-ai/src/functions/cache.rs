@@ -24,9 +24,9 @@ use async_trait::async_trait;
 use mysql_async::prelude::Queryable as _;
 use sprig_catalog::migrate::{MigrateOpts, Migration, Migrator, Module, Phase};
 use sprig_catalog::pool_wait::Bounded as _;
+use sprig_common::Result;
 use sprig_common::ids::UserId;
 use sprig_common::names::quote;
-use sprig_common::Result;
 
 use super::AiFn;
 use crate::audit::{CatalogAudit, unavailable};
@@ -102,7 +102,10 @@ impl MemoryFnCache {
     /// The number of answers kept.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.rows.lock().unwrap_or_else(PoisonError::into_inner).len()
+        self.rows
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     /// Whether it is empty.
@@ -347,7 +350,8 @@ impl FnCache for CatalogFnCache {
                 params.push(model.into());
                 params.push(v.as_str().into());
             }
-            let rows = vec!["(?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))"; chunk.len()].join(", ");
+            let rows =
+                vec!["(?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))"; chunk.len()].join(", ");
             c.exec_drop(
                 format!(
                     "INSERT INTO {} (k, fn, model, result, created_at, used_at) VALUES {rows} \

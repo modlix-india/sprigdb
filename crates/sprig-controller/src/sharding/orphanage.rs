@@ -55,17 +55,17 @@ const LOCK_WAIT: u64 = 5;
 
 /// One key's sweep.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct OrphanageReport {
+pub(super) struct OrphanageReport {
     /// The constraint.
-    pub fk: String,
+    pub(super) fk: String,
     /// Rows adopted.
-    pub adopted: u64,
+    pub(super) adopted: u64,
     /// Rows still waiting.
-    pub waiting: u64,
+    pub(super) waiting: u64,
     /// The flag was cleared (and stayed so).
-    pub cleared: bool,
+    pub(super) cleared: bool,
     /// The flag was set again (rows were waiting after a clear).
-    pub reopened: bool,
+    pub(super) reopened: bool,
 }
 
 /// A key the sweep looks at.
@@ -241,17 +241,7 @@ impl ShardingLoop {
             fk: k.name.clone(),
             ..OrphanageReport::default()
         };
-        let waiting = |c: &mut Conn| {
-            let sql = format!(
-                "SELECT COUNT(*) FROM {child0} WHERE {rk} = 0",
-                rk = quote(sprig_shard::rk::RK_COLUMN)
-            );
-            async move {
-                let n: Option<u64> = c.query_first(sql).await.map_err(db_err("count"))?;
-                Ok::<u64, SprigError>(n.unwrap_or(0))
-            }
-        };
-        if waiting(&mut c).await? > 0 {
+        if count_waiting(&mut c, &child0).await? > 0 {
             let (columns, numeric) = self.child_columns(&mut c, tenant, k, s0).await?;
             for s in &shards {
                 let parent = format!("{}.{}", schema(*s), quote(&k.parent));
@@ -273,12 +263,12 @@ impl ShardingLoop {
                 }
             }
         }
-        rep.waiting = waiting(&mut c).await?;
+        rep.waiting = count_waiting(&mut c, &child0).await?;
         // The flag follows what waits.
         if rep.waiting == 0 && k.present {
             self.set_orphanage(tenant, home, k.fk_id, false, publish_timeout)
                 .await?;
-            rep.waiting = waiting(&mut c).await?;
+            rep.waiting = count_waiting(&mut c, &child0).await?;
             if rep.waiting > 0 {
                 // A gateway wrote a row before it saw the change.
                 self.set_orphanage(tenant, home, k.fk_id, true, publish_timeout)
@@ -313,9 +303,9 @@ impl ShardingLoop {
             )
             .await
             .map_err(db_err("columns"))?;
-        let numeric = rows.iter().any(|(n, t)| {
-            n.eq_ignore_ascii_case(&k.column) && NUMERIC.contains(&t.as_str())
-        });
+        let numeric = rows
+            .iter()
+            .any(|(n, t)| n.eq_ignore_ascii_case(&k.column) && NUMERIC.contains(&t.as_str()));
         Ok((rows.into_iter().map(|(n, _)| n).collect(), numeric))
     }
 
@@ -348,6 +338,18 @@ impl ShardingLoop {
     }
 }
 
+/// Rows waiting in `child0` (the hash-0 shard's child table).
+async fn count_waiting(c: &mut Conn, child0: &str) -> Result<u64> {
+    let n: Option<u64> = c
+        .query_first(format!(
+            "SELECT COUNT(*) FROM {child0} WHERE {} = 0",
+            quote(sprig_shard::rk::RK_COLUMN)
+        ))
+        .await
+        .map_err(db_err("count"))?;
+    Ok(n.unwrap_or(0))
+}
+
 /// What one adoption transaction did.
 struct Batch {
     /// Parent values found.
@@ -371,13 +373,11 @@ async fn adopt_batch(
     let join = format!(
         "FROM {child0} c JOIN {parent} p ON p.{pc} = c.{fk} WHERE c.{rk} = 0 AND p.{rk} IS NOT NULL"
     );
-    let stmt = |sql: String| format!("SET STATEMENT innodb_lock_wait_timeout = {LOCK_WAIT} FOR {sql}");
-    let mut tx = c
-        .start_transaction(
-            TxOpts::default().with_isolation_level(mysql_async::IsolationLevel::RepeatableRead),
-        )
-        .await
-        .map_err(db_err("begin"))?;
+    let stmt =
+        |sql: String| format!("SET STATEMENT innodb_lock_wait_timeout = {LOCK_WAIT} FOR {sql}");
+    let mut opts = TxOpts::default();
+    opts.with_isolation_level(mysql_async::IsolationLevel::RepeatableRead);
+    let mut tx = c.start_transaction(opts).await.map_err(db_err("begin"))?;
     let found: Vec<Option<Vec<u8>>> = tx
         .query(stmt(format!(
             "SELECT DISTINCT c.{fk} {join} LIMIT {BATCH} FOR UPDATE"

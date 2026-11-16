@@ -40,14 +40,11 @@ impl Env {
         self.provider
             .requests()
             .iter()
-            .map(|r| {
-                format!(
-                    "{}{}",
-                    serde_json::to_string(&r.system).unwrap(),
-                    serde_json::to_string(&r.messages).unwrap()
-                )
+            .fold(String::new(), |mut a, r| {
+                a.push_str(&serde_json::to_string(&r.system).unwrap());
+                a.push_str(&serde_json::to_string(&r.messages).unwrap());
+                a
             })
-            .collect()
     }
 }
 
@@ -61,7 +58,10 @@ impl FnEnv for Env {
     }
     async fn provider(&self, model: &str) -> Result<(Arc<dyn Provider>, String)> {
         let (_, m) = model.split_once('/').unwrap();
-        Ok((Arc::clone(&self.provider) as Arc<dyn Provider>, m.to_owned()))
+        Ok((
+            Arc::clone(&self.provider) as Arc<dyn Provider>,
+            m.to_owned(),
+        ))
     }
     async fn embed_local(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         let mut e = self.embedded.lock().unwrap();
@@ -113,6 +113,7 @@ fn tool(name: &str, input: Value) -> Reply {
     Reply::Tools(String::new(), vec![("t1".into(), name.into(), input)])
 }
 
+#[allow(clippy::ref_option)] // called on slice elements
 fn text(o: &Option<Output>) -> Option<&str> {
     match o {
         Some(Output::Text(t) | Output::Json(t)) => Some(t),
@@ -183,7 +184,10 @@ fn arguments_are_checked() {
     let mut s = settings();
     s.model.clear();
     let c = Call::from_args(AiFn::Complete, &[], &known).unwrap();
-    assert_eq!(model_of(&c, &s).unwrap_err().code(), Some(SprigCode::AiNotConfigured));
+    assert_eq!(
+        model_of(&c, &s).unwrap_err().code(),
+        Some(SprigCode::AiNotConfigured)
+    );
     // AI_EMBED defaults to the bundled model.
     let c = Call::from_args(AiFn::Embed, &[], &known).unwrap();
     assert_eq!(model_of(&c, &s).unwrap(), LOCAL_MODEL);
@@ -239,7 +243,8 @@ async fn classify_batches_dedupes_and_caches() {
     assert!(r.sent.is_empty());
     assert_eq!(env.provider.requests().len(), 1);
     // Other labels are another key.
-    let other = Call::from_args(AiFn::Classify, &inputs(&[Some("bug"), Some("idea")]), &[]).unwrap();
+    let other =
+        Call::from_args(AiFn::Classify, &inputs(&[Some("bug"), Some("idea")]), &[]).unwrap();
     assert_ne!(
         cache_key(&classify_call(), "m", "x"),
         cache_key(&other, "m", "x")
@@ -305,9 +310,14 @@ async fn the_bundled_model_needs_no_sharing_and_sends_nothing() {
     let mut s = settings();
     s.share_data = false;
     let call = Call::from_args(AiFn::Embed, &[], &[]).unwrap();
-    let (out, r) = evaluate(&env, &s, &call, &inputs(&[Some("red shoes"), None, Some("red shoes")]))
-        .await
-        .unwrap();
+    let (out, r) = evaluate(
+        &env,
+        &s,
+        &call,
+        &inputs(&[Some("red shoes"), None, Some("red shoes")]),
+    )
+    .await
+    .unwrap();
     match &out[0] {
         Some(Output::Vector(v)) => assert_eq!(v.len(), LOCAL_DIM),
         o => panic!("{o:?}"),
@@ -320,7 +330,9 @@ async fn the_bundled_model_needs_no_sharing_and_sends_nothing() {
     assert!(env.cache.is_empty(), "local answers aren't cached");
     // A model that isn't offered for embeddings.
     let call = Call::from_args(AiFn::Embed, &inputs(&[Some("openai/x")]), &[]).unwrap();
-    let e = evaluate(&env, &s, &call, &inputs(&[Some("a")])).await.unwrap_err();
+    let e = evaluate(&env, &s, &call, &inputs(&[Some("a")]))
+        .await
+        .unwrap_err();
     assert_eq!(e.protocol().mysql_errno, 39990);
     // Bytes as MariaDB stores a VECTOR.
     let b = vector_bytes(&[1.0, 2.0]);
@@ -383,7 +395,10 @@ async fn extract_summarize_complete_and_refusals() {
     assert_eq!(out[1], None, "JSON that doesn't fit the schema is NULL");
     assert_eq!(r.invalid, 1);
     let req = &env.provider.requests()[0];
-    assert_eq!(req.tools[0].input_schema["properties"]["value"]["required"][0], "city");
+    assert_eq!(
+        req.tools[0].input_schema["properties"]["value"]["required"][0],
+        "city"
+    );
     assert!(!req.tools[0].strict);
 
     let env = Env::new(vec![
@@ -391,9 +406,14 @@ async fn extract_summarize_complete_and_refusals() {
         Reply::MaxTokens("cut".into()),
     ]);
     let sum = Call::from_args(AiFn::Summarize, &inputs(&[Some("12")]), &[]).unwrap();
-    let (out, _) = evaluate(&env, &settings(), &sum, &inputs(&[Some("long"), Some("longer")]))
-        .await
-        .unwrap();
+    let (out, _) = evaluate(
+        &env,
+        &settings(),
+        &sum,
+        &inputs(&[Some("long"), Some("longer")]),
+    )
+    .await
+    .unwrap();
     assert_eq!(text(&out[0]), Some("A short summary."));
     assert_eq!(text(&out[1]), Some("cut"));
     assert_eq!(env.cache.len(), 1, "a cut-off answer isn't cached");
@@ -414,9 +434,15 @@ async fn extract_summarize_complete_and_refusals() {
 
 #[test]
 fn json_answers_in_words_and_schema_checks() {
-    assert_eq!(json_in_text("```json\n{\"a\":1}\n```"), Some(json!({"a": 1})));
+    assert_eq!(
+        json_in_text("```json\n{\"a\":1}\n```"),
+        Some(json!({"a": 1}))
+    );
     assert!(fits(&json!(3), Some(&json!({"type": "integer"}))));
-    assert!(!fits(&json!("3"), Some(&json!({"type": ["integer", "null"]}))));
+    assert!(!fits(
+        &json!("3"),
+        Some(&json!({"type": ["integer", "null"]}))
+    ));
     assert_eq!(label_of(&["Bug".into()], " \"bug\". "), Some("Bug"));
     assert_eq!(cut("héllo", 2), "h");
 }

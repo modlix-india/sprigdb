@@ -341,6 +341,7 @@ impl Call {
     /// # Errors
     /// 1582 for the wrong number of arguments; 1210 for an argument that
     /// isn't allowed.
+    #[allow(clippy::too_many_lines)] // one arm per function
     pub fn from_args(f: AiFn, rest: &[Option<String>], known_models: &[String]) -> Result<Call> {
         let mut call = Call {
             f,
@@ -369,7 +370,10 @@ impl Call {
                         .ok_or_else(|| {
                             wrong_args(
                                 f,
-                                &format!("max_words must be a whole number from 1 to {}", SUMMARY_WORDS.1),
+                                &format!(
+                                    "max_words must be a whole number from 1 to {}",
+                                    SUMMARY_WORDS.1
+                                ),
                             )
                         })?;
                     call.max_words = Some(n);
@@ -580,7 +584,7 @@ pub fn vector_bytes(v: &[f32]) -> Vec<u8> {
 /// number of `f32`s.
 #[must_use]
 pub fn vector_of(b: &[u8]) -> Option<Vec<f32>> {
-    if b.len() % 4 != 0 {
+    if !b.len().is_multiple_of(4) {
         return None;
     }
     Some(
@@ -803,7 +807,9 @@ fn audit(env: &dyn FnEnv, call: &Call, model: &str, r: &Report) {
     if r.distinct == 0 {
         return;
     }
-    let stream = env.tenant().map_or(AuditStream::Platform, AuditStream::Tenant);
+    let stream = env
+        .tenant()
+        .map_or(AuditStream::Platform, AuditStream::Tenant);
     sprig_common::audit::record(
         stream,
         "ai.function",
@@ -825,6 +831,7 @@ fn audit(env: &dyn FnEnv, call: &Call, model: &str, r: &Report) {
 }
 
 /// The provider's answers to `distinct`, cache first.
+#[allow(clippy::too_many_lines)] // cache, waves, store
 async fn provider_answers(
     env: &dyn FnEnv,
     s: &FnSettings,
@@ -834,10 +841,7 @@ async fn provider_answers(
     report: &mut Report,
 ) -> Result<Vec<Option<Output>>> {
     let mut answers: Vec<Option<Output>> = vec![None; distinct.len()];
-    let keys: Vec<[u8; 32]> = distinct
-        .iter()
-        .map(|t| cache_key(call, model, t))
-        .collect();
+    let keys: Vec<[u8; 32]> = distinct.iter().map(|t| cache_key(call, model, t)).collect();
     let cache = if s.cache_days > 0 {
         Some(env.cache().await?)
     } else {
@@ -1152,7 +1156,11 @@ fn parse(call: &Call, out: &ChatOutcome, n: usize) -> Option<Vec<Answer>> {
                 None => Vec::new(),
             };
             if answers.len() != n {
-                return if n == 1 { Some(vec![Answer::Invalid]) } else { None };
+                return if n == 1 {
+                    Some(vec![Answer::Invalid])
+                } else {
+                    None
+                };
             }
             Some(
                 answers

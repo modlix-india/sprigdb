@@ -1165,3 +1165,195 @@ async fn galera_leftover_is_dropped_on_its_node() {
     assert_eq!(state.as_deref(), Some("Synced"));
     drop_fixture(writer, schema).await;
 }
+
+/// The node's statistics of `schema.t` as the test compares them: the
+/// table's cardinality and column `a`'s average frequency.
+async fn stats_of(ep: &NodeEndpoint, schema: &str) -> String {
+    scalar(
+        ep,
+        &format!(
+            "SELECT CONCAT_WS('|', IFNULL((SELECT cardinality FROM mysql.table_stats WHERE \
+             db_name = '{schema}' AND table_name = 't'), '-'), IFNULL((SELECT \
+             CAST(avg_frequency AS CHAR) FROM mysql.column_stats WHERE db_name = '{schema}' \
+             AND table_name = 't' AND column_name = 'a'), '-'))"
+        ),
+    )
+    .await
+    .unwrap_or_default()
+}
+
+/// A replica validation cut off after its `ANALYZE` (its future dropped,
+/// as a controller restart drops it) left the replica with statistics
+/// `ANALYZE` refreshed: the snapshot was only in memory. The snapshot is
+/// now journaled before `ANALYZE`; the drift reconciler's pass
+/// (`journal::restore_journaled`) puts it back, and so does the next
+/// validation of the table before its own snapshot. A journal that can't
+/// be written means no `ANALYZE`.
+#[tokio::test]
+async fn replica_statistics_after_a_cut_off_analyze() {
+    use sprig_advisor::autoindex::validate::journal::{self, MemJournal, StatsJournal};
+    use sprig_advisor::autoindex::validate::orphans::{self, NodeKind};
+    let eps = topology_or_skip!("SPRIG_TEST_MARIADB_REPLICATION");
+    let (primary, replicas) = (&eps[0], &eps[1..]);
+    let node = replicas.last().unwrap().clone();
+    let schema = "__sprig_test_stats_cut";
+    let server_id = scalar(&node, "SELECT @@server_id").await.unwrap();
+    let gtid_before = scalar(&node, "SELECT @@gtid_binlog_pos")
+        .await
+        .unwrap_or_default();
+    create_fixture(primary, schema).await;
+    wait_caught_up(primary, replicas, schema, true).await;
+    // Statistics the replica had before: written by hand (binary log off),
+    // so ANALYZE certainly changes them.
+    let fake = "12345|42.0000";
+    {
+        let mut c = conn(&node).await;
+        c.exec("SET SESSION sql_log_bin = 0").await.unwrap();
+        c.exec(&format!(
+            "REPLACE INTO mysql.table_stats (db_name, table_name, cardinality) VALUES \
+             ('{schema}', 't', 12345)"
+        ))
+        .await
+        .unwrap();
+        c.exec(&format!(
+            "REPLACE INTO mysql.column_stats (db_name, table_name, column_name, avg_frequency) \
+             VALUES ('{schema}', 't', 'a', 42)"
+        ))
+        .await
+        .unwrap();
+        c.close().await;
+    }
+    assert_eq!(stats_of(&node, schema).await, fake);
+    let w = workload(schema, 10);
+    let good = plan(
+        schema,
+        9201,
+        &["a"],
+        FP_A_RANGE,
+        w["a_range"].clone(),
+        &w["other"],
+    );
+    let target = good.target.clone();
+    let mem = Arc::new(MemJournal::default());
+    let j: Arc<dyn StatsJournal> = mem.clone();
+
+    // Cuts a validation off once its ANALYZE has written (it replays then).
+    let cut_off = |p: ValidationPlan| {
+        let v = ReplicaValidator::new(node.clone(), Arc::new(NoMarker))
+            .with_writer(primary.clone())
+            .with_stats_journal(Arc::clone(&j));
+        let node = node.clone();
+        async move {
+            let task = tokio::spawn(async move { v.validate(&p).await });
+            let started = Instant::now();
+            while stats_of(&node, schema).await == fake {
+                assert!(
+                    !task.is_finished(),
+                    "the validation ended before it was cut off"
+                );
+                assert!(
+                    started.elapsed() < Duration::from_secs(120),
+                    "no ANALYZE seen"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            task.abort();
+            let _ = task.await;
+        }
+    };
+
+    // 1. Cut off after ANALYZE: the statistics stay changed, the snapshot
+    // stays in the journal.
+    cut_off(good.clone()).await;
+    let changed = stats_of(&node, schema).await;
+    eprintln!("after the cut-off ANALYZE: {changed} (before: {fake})");
+    assert_ne!(changed, fake);
+    let held = mem.all();
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0].node, node.node.as_str());
+    eprintln!("journaled: {} rows", held[0].rows());
+
+    // 2. The drift reconciler's pass puts them back and removes the entry;
+    // not while a validation of this process runs on the table.
+    {
+        let _busy = orphans::running(&node.node, &target);
+        let r = journal::restore_journaled(&node, &*j, std::slice::from_ref(&target)).await;
+        assert!(r.tables.is_empty() && r.errors.is_empty(), "{r:?}");
+        assert_ne!(stats_of(&node, schema).await, fake);
+    }
+    let r = journal::restore_journaled(&node, &*j, std::slice::from_ref(&target)).await;
+    eprintln!("drift pass: {r:?}");
+    assert_eq!(r.tables, vec![format!("{schema}.t")]);
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(stats_of(&node, schema).await, fake);
+    assert!(mem.all().is_empty());
+    // The cut-off validation's index goes too (the reconciler's other pass).
+    orphans::drop_leftovers(
+        &node,
+        primary,
+        std::slice::from_ref(&target),
+        NodeKind::Replica,
+        &std::collections::BTreeSet::new(),
+    )
+    .await
+    .unwrap();
+
+    // 3. Cut off again; this time the next validation of the table puts
+    // the statistics back before its own snapshot, and again at its end.
+    cut_off(good.clone()).await;
+    assert_ne!(stats_of(&node, schema).await, fake);
+    assert_eq!(mem.all().len(), 1);
+    let v = ReplicaValidator::new(node.clone(), Arc::new(NoMarker))
+        .with_writer(primary.clone())
+        .with_stats_journal(Arc::clone(&j));
+    let r = v.validate(&good).await.unwrap();
+    show("replica after a cut-off ANALYZE", &r);
+    assert_ne!(r.verdict.kind, VerdictKind::Aborted, "{}", r.verdict.reason);
+    assert!(
+        r.node_check
+            .notes
+            .iter()
+            .any(|n| n.contains("statistics of a cut-off validation put back first")),
+        "{:?}",
+        r.node_check.notes
+    );
+    assert!(r.analyze_ms.is_some(), "{:?}", r.node_check.notes);
+    assert!(r.node_check.restored, "{:?}", r.node_check.notes);
+    assert_eq!(stats_of(&node, schema).await, fake);
+    assert!(mem.all().is_empty());
+
+    // 4. A journal that can't be written: no ANALYZE, statistics untouched.
+    mem.set_failing(true);
+    let r = v.validate(&good).await.unwrap();
+    show("replica, journal failing", &r);
+    mem.set_failing(false);
+    assert!(r.analyze_ms.is_none());
+    assert!(
+        r.node_check
+            .notes
+            .iter()
+            .any(|n| n.contains("ANALYZE skipped")),
+        "{:?}",
+        r.node_check.notes
+    );
+    assert_eq!(stats_of(&node, schema).await, fake);
+
+    // Nothing reached the binary log from the replica's own server id.
+    let gtid_after = scalar(&node, "SELECT @@gtid_binlog_pos")
+        .await
+        .unwrap_or_default();
+    let own = |pos: &str| {
+        pos.split(',')
+            .filter(|g| g.split('-').nth(1) == Some(server_id.as_str()))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        own(&gtid_before),
+        own(&gtid_after),
+        "{gtid_before} -> {gtid_after}"
+    );
+    assert_eq!(automatic_on(&node, schema).await, "");
+    drop_fixture(primary, schema).await;
+    wait_caught_up(primary, replicas, schema, true).await;
+}

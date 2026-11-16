@@ -702,13 +702,17 @@ pub(super) fn join_adoption(
             ),
         ));
         exists.push(format!(
-            "EXISTS (SELECT 1 FROM {parent} p WHERE p.{pc} = c.{fk} AND p.{rk} IS NOT NULL)"
+            "EXISTS (SELECT 1 FROM {parent} p WHERE p.{pc} = {child0}.{fk} AND p.{rk} IS NOT NULL)"
         ));
     }
     out.push(side(
         s0,
         format!(
-            "DELETE c FROM {child0} c WHERE c.{rk} = 0{only} AND ({})",
+            "DELETE FROM {child0} WHERE {child0}.{rk} = 0{} AND ({})",
+            values.map_or_else(String::new, |v| format!(
+                " AND {child0}.{fk} IN ({})",
+                v.join(", ")
+            )),
             exists.join(" OR ")
         ),
     ));
@@ -1335,8 +1339,9 @@ mod tests {
         );
         assert!(
             side.last().unwrap().starts_with(&format!(
-                "/* sprig: adopt */ DELETE c FROM `{s0_schema}`.`invoice_lines` c WHERE \
-                 c.`_sprig_rk` = 0 AND c.`iid` IN (77) AND (EXISTS (SELECT 1 FROM"
+                "/* sprig: adopt */ DELETE FROM `{s0_schema}`.`invoice_lines` WHERE \
+                 `{s0_schema}`.`invoice_lines`.`_sprig_rk` = 0 AND \
+                 `{s0_schema}`.`invoice_lines`.`iid` IN (77) AND (EXISTS (SELECT 1 FROM"
             )),
             "{}",
             side.last().unwrap()

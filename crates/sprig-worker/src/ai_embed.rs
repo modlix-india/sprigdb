@@ -48,6 +48,7 @@
 //! last checkpoint) and no row is embedded twice for the same source.
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -57,6 +58,7 @@ use mysql_async::{Pool, TxOpts};
 use serde_json::{Value, json};
 use sprig_ai::embedding::store::{EmbeddedColumn, State, Store};
 use sprig_ai::embedding::{self, metrics};
+use sprig_catalog::CatalogLocator as _;
 use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::{ClusterId, DbId, GroupId, ShardId, TenantId};
 use sprig_common::names::{SchemaName, quote};
@@ -507,7 +509,7 @@ impl Job<'_> {
         );
         if let Some(n) = order {
             let keys: Vec<String> = pk.iter().map(|c| quote(c)).collect();
-            sql.push_str(&format!(" ORDER BY {} LIMIT {n}", keys.join(", ")));
+            let _ = write!(sql, " ORDER BY {} LIMIT {n}", keys.join(", "));
         }
         sql
     }
@@ -1101,13 +1103,15 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
         } else {
             Duration::from_millis(200)
         };
-        let first = tokio::select! {
+        let read = tokio::select! {
             biased;
-            () = cx.cancel.cancelled() => break,
-            r = tokio::time::timeout(wait, feed.next()) => match r {
-                Ok(i) => Some(i?),
-                Err(_) => None,
-            },
+            () = cx.cancel.cancelled() => None,
+            r = tokio::time::timeout(wait, feed.next()) => Some(r),
+        };
+        let first = match read {
+            None => break,
+            Some(Ok(i)) => Some(i?),
+            Some(Err(_)) => None,
         };
         let mut items = Vec::new();
         let mut ended = None;

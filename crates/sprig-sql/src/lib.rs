@@ -32,8 +32,8 @@
 //!   providers and `SHOW` rewrites, result metadata and error mapping on 3306.
 
 pub mod access;
-pub mod ai_fn;
 pub mod account_stmt;
+pub mod ai_fn;
 // `ASK`: a question for an AI assistant.
 pub mod ask_stmt;
 pub mod compat;

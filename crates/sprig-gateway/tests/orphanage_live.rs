@@ -12,7 +12,13 @@
 //!    invoice's hash, joins narrowed by `cid` find every line, and a line
 //!    whose invoice never came stays readable;
 //! 3. with checks on, a line without its invoice still fails with 1452;
-//!    `DELETE` of an invoice cascades to its adopted lines.
+//!    `DELETE` of an invoice cascades to its adopted lines;
+//! 4. an `UPDATE` of an invoice's `iid` onto the waiting line's value takes
+//!    the line to the invoice's shard (the client sees 1 row changed);
+//! 5. 40 lines and their invoices inserted at the same moment on two
+//!    connections all end with their invoices;
+//! 6. with nothing waiting, the controller's sweep sets the key's
+//!    `orphanage` back to `none` (within its `sharding.check_interval_seconds`).
 //!
 //! ```sh
 //! source target/agent-r3small/env.sh   # a private deployment (gateway-dev.sh up)
@@ -39,6 +45,7 @@ use mysql_async::{Conn, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts};
 
 const DB: &str = "r3s_orph_db";
 const INVOICES: i64 = 120;
+const RACES: i64 = 40;
 
 fn tls() -> SslOpts {
     SslOpts::default()
@@ -126,6 +133,13 @@ fn errno_of<T>(r: mysql_async::Result<T>) -> Option<u16> {
     }
 }
 
+fn code(r: &mysql_async::Result<()>) -> Option<u16> {
+    match r {
+        Err(mysql_async::Error::Server(s)) => Some(s.code),
+        _ => None,
+    }
+}
+
 fn cid_of(iid: i64) -> i64 {
     1 + (iid * 31) % 50
 }
@@ -151,6 +165,29 @@ async fn placed(look: &mut Conn, tenant_id: u64, group: u32) -> Vec<(i64, i64, S
     }
     out.sort();
     out
+}
+
+/// Where invoice `iid` is: its shard schema and `_sprig_rk`.
+async fn invoice_at(look: &mut Conn, tenant_id: u64, group: u32, iid: i64) -> (String, u64) {
+    let schemas: Vec<String> = look
+        .query(format!(
+            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA \
+             WHERE SCHEMA_NAME LIKE 't{tenant_id}\\_d%\\_g{group}\\_s%'"
+        ))
+        .await
+        .unwrap();
+    for s in schemas {
+        let h: Option<u64> = look
+            .query_first(format!(
+                "SELECT _sprig_rk FROM `{s}`.invoices WHERE iid = {iid}"
+            ))
+            .await
+            .unwrap_or_default();
+        if let Some(h) = h {
+            return (s, h);
+        }
+    }
+    panic!("invoice {iid} nowhere");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -405,6 +442,108 @@ async fn rows_without_their_parent_wait_and_are_adopted() {
         "[{:?}] {adopted} lines adopted onto their invoices' shards, {joined} joined by cid, \
          1 still waiting; cascade ok",
         t0.elapsed()
+    );
+
+    // ---- an UPDATE of the referenced column adopts --------------------------
+    // Invoice 8000 has no lines; renumbered 9000, it takes the waiting line.
+    // The line moved isn't counted in the client's answer.
+    c.query_drop("INSERT INTO invoices VALUES (8000, 7, 1.00)")
+        .await
+        .unwrap();
+    let res = c
+        .query_iter("UPDATE invoices SET iid = 9000 WHERE iid = 8000")
+        .await
+        .unwrap();
+    let affected = res.affected_rows();
+    drop(res);
+    assert_eq!(affected, 1, "only the invoice counts");
+    let at = invoice_at(&mut look, e.tenant_id, group, 9000).await;
+    let after = placed(&mut look, e.tenant_id, group).await;
+    let line = after.iter().find(|r| r.0 == 9000).unwrap();
+    assert_eq!(
+        (&line.2, line.3),
+        (&at.0, at.1),
+        "line 9000 adopted by the UPDATE"
+    );
+    eprintln!("[{:?}] UPDATE of iid adopted line 9000", t0.elapsed());
+
+    // ---- the race: a line and its invoice at the same moment -----------------
+    // Two connections; the line's insert (checks off) may look for its
+    // invoice before the invoice commits. Its side statements take it along
+    // once both are in.
+    let mut a = pool.get_conn().await.unwrap();
+    let mut b = pool.get_conn().await.unwrap();
+    a.query_drop("SET foreign_key_checks = 0").await.unwrap();
+    let (mut deadlocks, mut waited_first) = (0, 0);
+    for iid in 20_000..20_000 + RACES {
+        loop {
+            let line = format!("INSERT INTO invoice_lines VALUES ({iid}, 1, 'race')");
+            let inv = format!("INSERT INTO invoices VALUES ({iid}, {}, 1.00)", cid_of(iid));
+            let (ra, rb) = tokio::join!(a.query_drop(line), b.query_drop(inv));
+            let lost = [code(&ra), code(&rb)];
+            if lost.contains(&Some(1213)) {
+                // One of the two was chosen as a deadlock victim: retried.
+                deadlocks += 1;
+                let _ = a
+                    .query_drop(format!("DELETE FROM invoice_lines WHERE iid = {iid}"))
+                    .await;
+                let _ = b
+                    .query_drop(format!("DELETE FROM invoices WHERE iid = {iid}"))
+                    .await;
+                continue;
+            }
+            ra.unwrap();
+            rb.unwrap();
+            break;
+        }
+    }
+    a.query_drop("SET foreign_key_checks = 1").await.unwrap();
+    let after = placed(&mut look, e.tenant_id, group).await;
+    let mut raced_ok = 0;
+    for iid in 20_000..20_000 + RACES {
+        let at = invoice_at(&mut look, e.tenant_id, group, iid).await;
+        let line = after.iter().find(|r| r.0 == iid).unwrap();
+        if line.3 == 0 && line.2 == zero_schema {
+            waited_first += 1;
+        }
+        assert_eq!(
+            (&line.2, line.3),
+            (&at.0, at.1),
+            "raced line {iid} not with its invoice"
+        );
+        raced_ok += 1;
+    }
+    eprintln!(
+        "[{:?}] {raced_ok} raced lines with their invoices ({deadlocks} deadlocks retried, \
+         {waited_first} left waiting)",
+        t0.elapsed()
+    );
+    drop(a);
+    drop(b);
+
+    // ---- nothing waits: the controller's sweep clears the flag --------------
+    let started = Instant::now();
+    loop {
+        let flag: Option<String> = look
+            .query_first(format!(
+                "SELECT orphanage FROM t{}_sprig.foreign_keys WHERE name = 'fk_il_inv'",
+                e.tenant_id
+            ))
+            .await
+            .unwrap();
+        if flag.as_deref() == Some("none") {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(240),
+            "the flag stayed {flag:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    eprintln!(
+        "[{:?}] orphanage cleared after {:?}",
+        t0.elapsed(),
+        started.elapsed()
     );
     c.query_drop(format!("DROP DATABASE {DB}")).await.unwrap();
     drop(c);

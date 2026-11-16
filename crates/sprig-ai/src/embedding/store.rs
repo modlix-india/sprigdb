@@ -196,15 +196,34 @@ type RowTuple = (
     Option<u32>,
     u32,
 );
-type RowTail = (String, Option<String>, Option<String>, u64, Option<String>, Option<u32>);
+type RowTail = (
+    String,
+    Option<String>,
+    Option<String>,
+    u64,
+    Option<String>,
+    Option<u32>,
+);
 
 const COLUMNS: &str = "embedding_id, db_id, object_id, column_name, source_expr, model_alias, provider, \
      model, dimensions, mode, max_input_tokens, generation";
 const TAIL: &str = "state, pending, progress, rows_embedded, last_error, created_by";
 
 fn row_of(head: RowTuple, tail: RowTail) -> EmbeddedColumn {
-    let (id, db_id, object_id, column, source, alias, provider, model, dimensions, mode, mit, generation) =
-        head;
+    let (
+        id,
+        db_id,
+        object_id,
+        column,
+        source,
+        alias,
+        provider,
+        model,
+        dimensions,
+        mode,
+        mit,
+        generation,
+    ) = head;
     let (state, pending, progress, rows_embedded, last_error, created_by) = tail;
     EmbeddedColumn {
         id,
@@ -345,7 +364,8 @@ impl Store {
         c: &mut mysql_async::Conn,
         object: u64,
     ) -> Result<Vec<EmbeddedColumn>> {
-        self.select(c, "WHERE object_id = ?", (object,).into()).await
+        self.select(c, "WHERE object_id = ?", (object,).into())
+            .await
     }
 
     /// Embedded column `id`.

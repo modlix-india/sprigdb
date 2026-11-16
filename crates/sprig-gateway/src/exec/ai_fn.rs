@@ -52,7 +52,7 @@ use crate::tenant::session::LocalWarning;
 
 /// Rows a statement with AI function columns may return at most (they are
 /// held in the gateway while their inputs are answered).
-pub const MAX_ROWS: usize = 100_000;
+const MAX_ROWS: usize = 100_000;
 
 /// The longest text a column announces (`MEDIUMTEXT`'s).
 const TEXT_LENGTH: u32 = 16_777_215;
@@ -110,8 +110,8 @@ impl GatewayEnv {
     async fn catalog(&self) -> Result<&(mysql_async::Pool, String)> {
         self.catalog
             .get_or_try_init(|| async {
-                let ep = sprig_catalog::CatalogLocator::writer(&*self.svc.locator, self.tenant)
-                    .await?;
+                let ep =
+                    sprig_catalog::CatalogLocator::writer(&*self.svc.locator, self.tenant).await?;
                 Ok::<_, SprigError>((ep.pool.clone(), ep.store.schema().to_owned()))
             })
             .await
@@ -401,14 +401,14 @@ impl PassSession {
                         .map(|b| String::from_utf8_lossy(&b).into_owned())
                 })
                 .collect();
-            let answers =
-                match Box::pin(functions::evaluate(&env, &settings, call, &inputs)).await {
-                    Ok((a, r)) => {
-                        note_nulls(call.f, r.budget_nulls);
-                        a
-                    }
-                    Err(e) => return self.fail(out, &e).await.map(Some),
-                };
+            let answers = match Box::pin(functions::evaluate(&env, &settings, call, &inputs)).await
+            {
+                Ok((a, r)) => {
+                    note_nulls(call.f, r.budget_nulls);
+                    a
+                }
+                Err(e) => return self.fail(out, &e).await.map(Some),
+            };
             let name = item
                 .alias
                 .clone()
@@ -460,7 +460,10 @@ mod tests {
             "X'0000803F00000040'"
         );
         let c = column(AiFn::Embed, "e", Persona::MariaDb, 45);
-        assert_eq!((c.col_type, c.charset, c.length), (ct::VAR_STRING, 63, 1536));
+        assert_eq!(
+            (c.col_type, c.charset, c.length),
+            (ct::VAR_STRING, 63, 1536)
+        );
         let c = column(AiFn::Extract, "j", Persona::MySql84, 255);
         assert_eq!((c.col_type, c.charset), (ct::JSON, 255));
         let c = column(AiFn::Classify, "k", Persona::MySql84, 255);

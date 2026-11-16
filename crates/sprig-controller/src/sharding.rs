@@ -16,6 +16,7 @@
 mod graphs;
 mod lookups;
 mod ops;
+mod orphanage;
 mod periodic;
 mod rekey;
 pub use graphs::{GraphIndexRow, GraphPartition, GraphRow, GraphShardRow, GraphView};
@@ -614,6 +615,13 @@ impl ShardingLoop {
         // take their own connections from the loop's small pools).
         if let Err(e) = self.lookup_tick(tenant, &home, &ts).await {
             tracing::warn!(tenant = %tenant, error = %e, "lookup indexes: the tick failed");
+        }
+        // Rows waiting in the orphanage whose parent has come.
+        if let Err(e) = self
+            .orphanage_tick(tenant, &home, ts.lookup.publish_timeout)
+            .await
+        {
+            tracing::warn!(tenant = %tenant, error = %e, "orphanage sweep failed");
         }
         Ok(report)
     }

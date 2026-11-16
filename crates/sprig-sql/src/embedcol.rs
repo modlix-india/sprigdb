@@ -725,9 +725,23 @@ fn alter_table(t: &Toks<'_>, end: usize) -> Result<Option<Stmt>, String> {
                 if column_word {
                     k += 1;
                 }
-                let not_column = ["INDEX", "KEY", "UNIQUE", "PRIMARY", "FOREIGN", "CONSTRAINT", "FULLTEXT", "SPATIAL", "VECTOR", "CHECK", "PARTITION", "PERIOD", "SYSTEM"]
-                    .iter()
-                    .any(|w| t.word(k, w))
+                let not_column = [
+                    "INDEX",
+                    "KEY",
+                    "UNIQUE",
+                    "PRIMARY",
+                    "FOREIGN",
+                    "CONSTRAINT",
+                    "FULLTEXT",
+                    "SPATIAL",
+                    "VECTOR",
+                    "CHECK",
+                    "PARTITION",
+                    "PERIOD",
+                    "SYSTEM",
+                ]
+                .iter()
+                .any(|w| t.word(k, w))
                     && !column_word;
                 if t.word(k, "IF") {
                     // IF [NOT] EXISTS
@@ -763,9 +777,23 @@ fn alter_table(t: &Toks<'_>, end: usize) -> Result<Option<Stmt>, String> {
                 }
                 if column_word {
                     k += 1;
-                } else if ["INDEX", "KEY", "PRIMARY", "FOREIGN", "CONSTRAINT", "CHECK", "PARTITION", "SYSTEM", "PERIOD", "UNIQUE", "FULLTEXT", "SPATIAL", "VECTOR"]
-                    .iter()
-                    .any(|w| t.word(k, w))
+                } else if [
+                    "INDEX",
+                    "KEY",
+                    "PRIMARY",
+                    "FOREIGN",
+                    "CONSTRAINT",
+                    "CHECK",
+                    "PARTITION",
+                    "SYSTEM",
+                    "PERIOD",
+                    "UNIQUE",
+                    "FULLTEXT",
+                    "SPATIAL",
+                    "VECTOR",
+                ]
+                .iter()
+                .any(|w| t.word(k, w))
                 {
                     continue;
                 }

@@ -63,18 +63,22 @@ fn sql_name(op: &str) -> Option<&'static str> {
 #[must_use]
 pub fn has_ai(v: &Bson) -> bool {
     match v {
-        Bson::Document(d) => d
-            .iter()
-            .any(|(k, v)| sql_name(k).is_some() || has_ai(v)),
+        Bson::Document(d) => d.iter().any(|(k, v)| sql_name(k).is_some() || has_ai(v)),
         Bson::Array(a) => a.iter().any(has_ai),
         _ => false,
     }
 }
 
-/// Whether the stage holds an AI operator.
+/// Stages whose sub-pipelines see other documents: their operators
+/// aren't answered (MongoDB's "unrecognized expression" follows).
+const NESTED: [&str; 4] = ["$lookup", "$unionWith", "$graphLookup", "$facet"];
+
+/// Whether the stage holds an AI operator the stage's own input answers.
 #[must_use]
 pub fn stage_has_ai(stage: &Document) -> bool {
-    stage.values().any(has_ai)
+    stage
+        .iter()
+        .any(|(k, v)| !NESTED.contains(&k.as_str()) && has_ai(v))
 }
 
 /// One operator of a stage.
@@ -101,7 +105,11 @@ fn text_arg(op: &str, k: &str, v: &Bson) -> Result<String, MongoError> {
 
 /// The operator `op` with argument `arg`.
 fn parse_op(op: &str, f: &'static str, arg: &Bson) -> Result<Op, MongoError> {
-    let input_key = if op == "$aiComplete" { "prompt" } else { "input" };
+    let input_key = if op == "$aiComplete" {
+        "prompt"
+    } else {
+        "input"
+    };
     let spec = match arg {
         Bson::Document(d) if d.contains_key(input_key) || d.contains_key("input") => Some(d),
         _ => None,
@@ -110,7 +118,11 @@ fn parse_op(op: &str, f: &'static str, arg: &Bson) -> Result<Op, MongoError> {
         if matches!(op, "$aiClassify" | "$aiExtract") {
             return Err(bad(format!(
                 "{op} takes a document with input and {}",
-                if op == "$aiClassify" { "labels" } else { "schema" }
+                if op == "$aiClassify" {
+                    "labels"
+                } else {
+                    "schema"
+                }
             )));
         }
         return Ok(Op {
@@ -190,7 +202,11 @@ fn rewrite(v: &Bson, ops: &mut Vec<Op>) -> Result<Bson, MongoError> {
             }
             Bson::Document(out)
         }
-        Bson::Array(a) => Bson::Array(a.iter().map(|x| rewrite(x, ops)).collect::<Result<_, _>>()?),
+        Bson::Array(a) => Bson::Array(
+            a.iter()
+                .map(|x| rewrite(x, ops))
+                .collect::<Result<_, _>>()?,
+        ),
         x => x.clone(),
     })
 }
@@ -210,7 +226,11 @@ fn hex_text(s: &str) -> String {
 /// The statement answering `inputs` with `f(v, rest...)`.
 #[must_use]
 pub fn statement(db: &str, f: &str, rest: &[String], inputs: &[&str]) -> String {
-    let args: String = rest.iter().map(|r| format!(", {}", hex_text(r))).collect();
+    let args: String = rest.iter().fold(String::new(), |mut a, r| {
+        a.push_str(", ");
+        a.push_str(&hex_text(r));
+        a
+    });
     let rows: Vec<String> = inputs
         .iter()
         .enumerate()
@@ -308,9 +328,8 @@ pub async fn prepare(
     now: DateTime,
 ) -> Result<(Vec<Document>, Document, Vec<String>), MongoError> {
     let mut ops = Vec::new();
-    let rewritten = match rewrite(&Bson::Document(stage.clone()), &mut ops)? {
-        Bson::Document(d) => d,
-        _ => return Err(MongoError::new(code::INTERNAL_ERROR, "a stage")),
+    let Bson::Document(rewritten) = rewrite(&Bson::Document(stage.clone()), &mut ops)? else {
+        return Err(MongoError::new(code::INTERNAL_ERROR, "a stage"));
     };
     let mut hidden = Vec::with_capacity(ops.len());
     for (k, op) in ops.iter().enumerate() {
@@ -345,7 +364,9 @@ pub async fn prepare(
             answer(sql, db, op.f, &op.rest, &refs).await?
         };
         for (d, s) in docs.iter_mut().zip(slots) {
-            let v = s.and_then(|i| answers.get(i).cloned()).unwrap_or(Bson::Null);
+            let v = s
+                .and_then(|i| answers.get(i).cloned())
+                .unwrap_or(Bson::Null);
             d.insert(name.clone(), v);
         }
         hidden.push(name);
@@ -386,7 +407,9 @@ pub async fn query_vector(
     };
     let op = parse_op("$aiEmbed", "AI_EMBED", arg)?;
     let Bson::String(text) = &op.input else {
-        return Err(bad("$vectorSearch's queryVector takes {$aiEmbed: \"<text>\"}"));
+        return Err(bad(
+            "$vectorSearch's queryVector takes {$aiEmbed: \"<text>\"}",
+        ));
     };
     let v = answer(sql, db, op.f, &op.rest, &[text.as_str()]).await?;
     let mut first = pipeline[0].clone();
@@ -451,7 +474,12 @@ mod tests {
 
     #[test]
     fn statements_carry_values_as_hex() {
-        let s = statement("media", "AI_CLASSIFY", &["a".into(), "b'c".into()], &["x", "it's"]);
+        let s = statement(
+            "media",
+            "AI_CLASSIFY",
+            &["a".into(), "b'c".into()],
+            &["x", "it's"],
+        );
         assert_eq!(
             s,
             "/* sprig-ai-db:media */ SELECT i, AI_CLASSIFY(v, _utf8mb4 X'61', _utf8mb4 X'622763') \
@@ -459,6 +487,10 @@ mod tests {
         );
         assert!(has_ai(&Bson::Document(doc! {"a": [{"$aiEmbed": "$t"}]})));
         assert!(!has_ai(&Bson::Document(doc! {"a": "$aiEmbed"})));
+        assert!(!stage_has_ai(
+            &doc! {"$facet": {"a": [{"$set": {"e": {"$aiEmbed": "$t"}}}]}}
+        ));
+        assert!(stage_has_ai(&doc! {"$group": {"_id": {"$aiEmbed": "$t"}}}));
     }
 
     #[tokio::test]
@@ -480,7 +512,11 @@ mod tests {
         assert_eq!(hidden, ["__sprig_ai_0", "__sprig_ai_1"]);
         assert_eq!(sql.seen.len(), 2, "one statement per operator");
         assert!(sql.seen[0].contains("AI_CLASSIFY(v, _utf8mb4 X'73686F7274'"));
-        assert_eq!(sql.seen[0].matches("UNION ALL").count(), 1, "distinct inputs only");
+        assert_eq!(
+            sql.seen[0].matches("UNION ALL").count(),
+            1,
+            "distinct inputs only"
+        );
         let lim = agg::AggLimits {
             stage_bytes: 1 << 20,
             now: DateTime::now(),
@@ -519,7 +555,9 @@ mod tests {
     #[tokio::test]
     async fn query_vectors_and_forms() {
         let mut sql = Fake::default();
-        let p = vec![doc! {"$vectorSearch": {"index": "v", "path": "e", "queryVector": {"$aiEmbed": "red shoes"}, "limit": 3}}];
+        let p = vec![
+            doc! {"$vectorSearch": {"index": "v", "path": "e", "queryVector": {"$aiEmbed": "red shoes"}, "limit": 3}},
+        ];
         let out = query_vector(&mut sql, "shop", &p).await.unwrap().unwrap();
         let q = out[0]
             .get_document("$vectorSearch")
@@ -549,6 +587,9 @@ mod tests {
         .unwrap();
         assert!(op.rest.is_empty());
         assert!(op.input.as_document().unwrap().contains_key("$concat"));
-        assert_eq!(value_of("AI_EXTRACT", Some(br#"{"a":1}"#)), Bson::Document(doc! {"a": 1}));
+        assert_eq!(
+            value_of("AI_EXTRACT", Some(br#"{"a":1}"#)),
+            Bson::Document(doc! {"a": 1})
+        );
     }
 }

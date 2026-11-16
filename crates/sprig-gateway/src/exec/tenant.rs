@@ -620,9 +620,7 @@ impl PassSession {
             return Ok(step);
         }
         // AI functions: answered in the gateway, never sent on.
-        if let Some(step) =
-            Box::pin(self.tenant_ai_fn(cx, text, attrs, more, format, out)).await?
-        {
+        if let Some(step) = Box::pin(self.tenant_ai_fn(cx, text, attrs, more, format, out)).await? {
             return Ok(step);
         }
         // Inherited messaging objects (`FOR EACH TENANT`), before the logic
