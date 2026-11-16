@@ -7,6 +7,10 @@
 //!   each partition scores its top k through a statistics provider returning
 //!     the global values
 //!   merge by (score desc, partition, key)
+//! matched: N, T[f] and n[t] of the documents the query matches only (a
+//!   caller bound by row-level security searches within its visible hits)
+//! plain: N = 1, n[t] = 1, T[f] = PLAIN_AVERAGE_LENGTH: no statistics of
+//!   the index at all
 //! ```
 //!
 //! Each document is in exactly one partition, so the sums are the
@@ -21,8 +25,8 @@ use std::sync::Mutex;
 
 use sprig_common::{Result, SprigCode, SprigError};
 use tantivy::collector::{Count, DocSetCollector, TopDocs};
-use tantivy::query::{Bm25StatisticsProvider, Query};
-use tantivy::schema::{Field, Value};
+use tantivy::query::{Bm25StatisticsProvider, BooleanQuery, Occur, Query, TermQuery};
+use tantivy::schema::{Field, IndexRecordOption, Value};
 use tantivy::{DocAddress, Searcher, TantivyDocument, Term};
 
 use crate::build::{Builder, Expander, Expansion, TermBase};
@@ -37,7 +41,18 @@ pub enum Scoring {
     Global,
     /// Each partition's own statistics (`local`).
     Local,
+    /// Statistics of the documents the query matches, and of no other: a
+    /// caller that row-level security binds searches within the hits it
+    /// may see, so its scores depend on nothing it can't read.
+    Matched,
+    /// No statistics of the index: every term weighs the same, and field
+    /// lengths compare with [`PLAIN_AVERAGE_LENGTH`]. A bound caller's
+    /// search that matches more than the gateway rechecks.
+    Plain,
 }
+
+/// The average field length, in tokens, that [`Scoring::Plain`] assumes.
+pub const PLAIN_AVERAGE_LENGTH: u64 = 16;
 
 /// One hit.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -156,6 +171,126 @@ impl Bm25StatisticsProvider for GlobalStats {
         }
         cache.insert(term.clone(), n);
         Ok(n)
+    }
+}
+
+/// BM25 statistics of the documents `query` matches ([`Scoring::Matched`]):
+/// their number, their tokens per field (from the field norms) and, per
+/// term, how many of them hold it. Terms and fields are counted when
+/// Tantivy first asks for them.
+struct MatchedStats {
+    searchers: Vec<Searcher>,
+    query: Box<dyn Query>,
+    /// The matched documents of each searcher, by segment.
+    docs: Vec<Vec<DocAddress>>,
+    num_docs: u64,
+    tokens: Mutex<HashMap<Field, u64>>,
+    freq: Mutex<HashMap<Term, u64>>,
+}
+
+impl MatchedStats {
+    fn new(searchers: &[Searcher], query: &dyn Query) -> Result<Self> {
+        let mut docs = Vec::with_capacity(searchers.len());
+        let mut num_docs = 0u64;
+        for s in searchers {
+            let mut d: Vec<DocAddress> = s
+                .search(query, &DocSetCollector)
+                .map_err(terr)?
+                .into_iter()
+                .collect();
+            d.sort_unstable();
+            num_docs += d.len() as u64;
+            docs.push(d);
+        }
+        Ok(Self {
+            searchers: searchers.to_vec(),
+            query: query.box_clone(),
+            docs,
+            num_docs,
+            tokens: Mutex::new(HashMap::new()),
+            freq: Mutex::new(HashMap::new()),
+        })
+    }
+}
+
+impl Bm25StatisticsProvider for MatchedStats {
+    fn total_num_tokens(&self, field: Field) -> tantivy::Result<u64> {
+        let mut cache = self
+            .tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(n) = cache.get(&field) {
+            return Ok(*n);
+        }
+        let mut n = 0u64;
+        for (s, docs) in self.searchers.iter().zip(&self.docs) {
+            let mut norms: Option<(u32, tantivy::fieldnorm::FieldNormReader)> = None;
+            for a in docs {
+                let reader = match &norms {
+                    Some((seg, r)) if *seg == a.segment_ord => r,
+                    _ => {
+                        // A field without norms: one token per document.
+                        let Ok(r) = s
+                            .segment_reader(a.segment_ord)
+                            .get_fieldnorms_reader(field)
+                        else {
+                            n += 1;
+                            continue;
+                        };
+                        &norms.insert((a.segment_ord, r)).1
+                    }
+                };
+                n += u64::from(reader.fieldnorm(a.doc_id));
+            }
+        }
+        cache.insert(field, n);
+        Ok(n)
+    }
+
+    fn total_num_docs(&self) -> tantivy::Result<u64> {
+        // Never 0: BM25 divides by it.
+        Ok(self.num_docs.max(1))
+    }
+
+    fn doc_freq(&self, term: &Term) -> tantivy::Result<u64> {
+        let mut cache = self
+            .freq
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(n) = cache.get(term) {
+            return Ok(*n);
+        }
+        let q = BooleanQuery::new(vec![
+            (Occur::Must, self.query.box_clone()),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(term.clone(), IndexRecordOption::Basic)),
+            ),
+        ]);
+        let mut n = 0u64;
+        for s in &self.searchers {
+            n += s.search(&q, &Count)? as u64;
+        }
+        cache.insert(term.clone(), n);
+        Ok(n)
+    }
+}
+
+/// [`Scoring::Plain`]'s statistics: one document holding every term, of
+/// [`PLAIN_AVERAGE_LENGTH`] tokens in every field.
+struct PlainStats;
+
+impl Bm25StatisticsProvider for PlainStats {
+    fn total_num_tokens(&self, _field: Field) -> tantivy::Result<u64> {
+        Ok(PLAIN_AVERAGE_LENGTH)
+    }
+
+    fn total_num_docs(&self) -> tantivy::Result<u64> {
+        Ok(1)
+    }
+
+    fn doc_freq(&self, _term: &Term) -> tantivy::Result<u64> {
+        Ok(1)
     }
 }
 
@@ -398,21 +533,23 @@ impl SearchIndex {
         if k == 0 {
             return Ok(Vec::new());
         }
-        let stats = match scoring {
+        let stats: Option<Box<dyn Bm25StatisticsProvider>> = match scoring {
             Scoring::Global => {
                 let parts = searchers
                     .iter()
                     .map(|s| part_stats(s, query.as_ref()))
                     .collect::<Result<Vec<_>>>()?;
-                Some(GlobalStats::sum(&parts, searchers.clone()))
+                Some(Box::new(GlobalStats::sum(&parts, searchers.clone())))
             }
             Scoring::Local => None,
+            Scoring::Matched => Some(Box::new(MatchedStats::new(&searchers, query.as_ref())?)),
+            Scoring::Plain => Some(Box::new(PlainStats)),
         };
         let mut hits = Vec::new();
         for (i, s) in searchers.iter().enumerate() {
             let c = TopDocs::with_limit(k).order_by_score();
             let top = match &stats {
-                Some(g) => s.search_with_statistics_provider(query.as_ref(), &c, g),
+                Some(g) => s.search_with_statistics_provider(query.as_ref(), &c, g.as_ref()),
                 None => s.search(query.as_ref(), &c),
             }
             .map_err(terr)?;

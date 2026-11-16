@@ -194,6 +194,53 @@ fn keys_restrict_counts_and_facets() {
     assert_eq!(serde_json::from_str::<SearchQuery>(&wire).unwrap(), v);
 }
 
+/// Matched scoring (a bound caller's search within its visible hits)
+/// and plain scoring give the same scores however many other documents
+/// hold the query's words; global scoring doesn't.
+#[test]
+fn matched_and_plain_scores_ignore_other_documents() {
+    let ix = sample(2);
+    let k = |i: i64| Key::of_parts(&[KeyPart::Int(i)]);
+    let q = parse_query_string("red shoe", &["name".into()]).unwrap();
+    let within = SearchQuery::Bool {
+        must: vec![q.clone()],
+        should: Vec::new(),
+        must_not: Vec::new(),
+        filter: vec![SearchQuery::Keys(vec![k(1), k(3)])],
+        min_should: 0,
+    };
+    let scores = |ix: &SearchIndex, q: &SearchQuery, s: Scoring| -> Vec<(i64, f32)> {
+        let h = ix.top(q, 100, s, 50).unwrap();
+        ids(&h).into_iter().zip(h.iter().map(|x| x.score)).collect()
+    };
+    let matched = scores(&ix, &within, Scoring::Matched);
+    assert_eq!(matched.iter().map(|x| x.0).collect::<Vec<_>>(), [1, 3]);
+    assert!(matched[0].1 > matched[1].1, "{matched:?}");
+    let plain = scores(&ix, &q, Scoring::Plain);
+    let global = scores(&ix, &within, Scoring::Global);
+    // Fifty more documents with both words, outside the key set.
+    for id in 100..150 {
+        ix.upsert(&row(id, "red shoe red", "", "acme", 1.0)).unwrap();
+    }
+    ix.commit("p2").unwrap();
+    assert_eq!(scores(&ix, &within, Scoring::Matched), matched);
+    let plain_after: Vec<(i64, f32)> = scores(&ix, &q, Scoring::Plain)
+        .into_iter()
+        .filter(|x| x.0 < 100)
+        .collect();
+    assert_eq!(plain_after, plain);
+    assert_ne!(scores(&ix, &within, Scoring::Global), global);
+    // A key set nothing matches: no hits, no division by zero.
+    let none = SearchQuery::Bool {
+        must: vec![q],
+        should: Vec::new(),
+        must_not: Vec::new(),
+        filter: vec![SearchQuery::Keys(vec![k(999)])],
+        min_should: 0,
+    };
+    assert!(ix.top(&none, 10, Scoring::Matched, 50).unwrap().is_empty());
+}
+
 #[test]
 fn collections_and_dynamic_text() {
     let mut d = IndexDef::from_mongo_text(

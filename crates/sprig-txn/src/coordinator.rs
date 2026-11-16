@@ -313,6 +313,26 @@ pub enum Interrupted {
     Unknown,
 }
 
+impl Interrupted {
+    /// What a `COMMIT` statement killed while it ran answers, once its
+    /// cut commit is finished ([`TxnCoordinator::finish_interrupted`]):
+    /// `Some(Ok(()))` when it committed, `Some(Err(39443))` when it rolled
+    /// back, and `None` when the outcome is still unknown after
+    /// `txn.commit_resolve_timeout_ms` or no commit was cut, for which the
+    /// caller answers 1317 (`ER_QUERY_INTERRUPTED`): an unknown outcome,
+    /// as on MySQL.
+    #[must_use]
+    pub fn commit_answer(self) -> Option<Result<()>> {
+        match self {
+            Interrupted::Committed => Some(Ok(())),
+            Interrupted::RolledBack => Some(Err(dtx_rolled_back(
+                "its COMMIT was killed before the commit point",
+            ))),
+            Interrupted::None | Interrupted::Unknown => None,
+        }
+    }
+}
+
 /// A prepared branch's phase 2, still running after `COMMIT` answered.
 struct Phase2Fut<C> {
     cluster: ClusterId,

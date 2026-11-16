@@ -309,6 +309,15 @@ pub trait SessionExec: Send {
     /// the backend's work and discard whatever state it left.
     async fn abandoned(&mut self, _cx: &mut ExecCtx<'_>, _why: Abandon) {}
 
+    /// After [`Self::abandoned`] with [`Abandon::Killed`]: when the killed
+    /// statement was a `COMMIT` whose distributed commit was then finished,
+    /// how it ended (`Ok`: committed; `Err`: the rollback's error), which
+    /// the front end answers in place of 1317. `None` (the default): no
+    /// such commit, or its outcome is still unknown.
+    fn take_cut_commit(&mut self) -> Option<Result<()>> {
+        None
+    }
+
     /// The session ends (quit, error, drain): roll back and release.
     async fn close(&mut self) {}
 
@@ -665,6 +674,10 @@ impl SessionExec for HookedSession {
 
     async fn abandoned(&mut self, cx: &mut ExecCtx<'_>, why: Abandon) {
         self.inner.abandoned(cx, why).await;
+    }
+
+    fn take_cut_commit(&mut self) -> Option<Result<()>> {
+        self.inner.take_cut_commit()
     }
 
     async fn close(&mut self) {

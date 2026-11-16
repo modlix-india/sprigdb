@@ -242,6 +242,13 @@ pub(crate) struct RouterState {
     /// without shards), by folded name: an `EXECUTE` is checked against
     /// the session's row-level security of the moment.
     sql_texts: HashMap<String, bytes::Bytes>,
+    /// A client's `COMMIT` statement is running on the coordinator; still
+    /// set when `KILL QUERY` dropped it.
+    commit_running: bool,
+    /// How a client's `COMMIT` that `KILL QUERY` cut short ended, once
+    /// finished: the front end answers it in place of 1317
+    /// ([`Self::take_cut_commit`]).
+    cut_commit: Option<sprig_txn::Interrupted>,
 }
 
 impl std::fmt::Debug for RouterState {
@@ -283,11 +290,23 @@ impl RouterState {
         }
         // A `COMMIT` cut short goes on from where it stopped: a rollback
         // after its commit point would leave it half applied.
+        let commit = std::mem::take(&mut self.commit_running);
         if let Some(c) = self.coord.as_mut()
             && c.interrupted()
         {
-            let _ = Box::pin(c.finish_interrupted()).await;
+            let ended = Box::pin(c.finish_interrupted()).await;
+            // A client's `COMMIT` answers how it ended.
+            self.cut_commit = commit.then_some(ended);
         }
+    }
+
+    /// How the client's `COMMIT` that [`Self::abandon_in_flight`] just
+    /// finished ended: `Some(Ok)` committed, `Some(Err)` rolled back
+    /// (39443). `None` when no `COMMIT` was cut or its outcome is still
+    /// unknown after `txn.commit_resolve_timeout_ms`: the front end
+    /// answers 1317.
+    pub(crate) fn take_cut_commit(&mut self) -> Option<Result<()>> {
+        self.cut_commit.take()?.commit_answer()
     }
 
     /// Ends the session's router state: a commit cut short is finished,
@@ -1100,7 +1119,12 @@ impl PassSession {
                 res
             }
             (Some(crate::backend::Effect::Commit), _) => {
+                // Left set if `KILL QUERY` drops the commit (see
+                // `abandon_in_flight`).
+                self.router.commit_running = true;
+                self.router.cut_commit = None;
                 let r = coord.commit().await.map(|_| ());
+                self.router.commit_running = false;
                 if let Err(e) = &r
                     && e.code() == Some(SprigCode::CommitOutcomeUnknown)
                 {

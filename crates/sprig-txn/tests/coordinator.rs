@@ -17,8 +17,8 @@ use std::time::Duration;
 use sprig_common::ids::{ClusterId, DbId, GroupId, ShardId, TenantId};
 use sprig_txn::{
     BeginOptions, BranchConn, ClusterAdmin, ClusterCaps, Ctl, DbError, DbResult, Decision,
-    DecisionRow, Dtid, DtidGen, Intent, NonXaPolicy, ShardRef, TxnBackend, TxnConfig,
-    TxnCoordinator, TxnMode, Xid,
+    DecisionRow, Dtid, DtidGen, Intent, Interrupted, NonXaPolicy, ShardRef, TxnBackend,
+    TxnConfig, TxnCoordinator, TxnMode, Xid,
 };
 
 type Log = Arc<Mutex<Vec<(String, String)>>>;
@@ -112,6 +112,8 @@ impl BranchConn for FakeConn {
 #[derive(Default)]
 struct FakeAdmin {
     rows: Mutex<BTreeMap<(String, Dtid), Decision>>,
+    /// `KILL` fails, so a commit point's race can't be run.
+    kill_fails: AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -123,6 +125,9 @@ impl ClusterAdmin for FakeAdmin {
         Ok(())
     }
     async fn kill(&self, _: &ClusterId, _: u64) -> DbResult<()> {
+        if self.kill_fails.load(Ordering::SeqCst) {
+            return Err(DbError::new(2013, "scripted"));
+        }
         Ok(())
     }
     async fn insert_decision(&self, c: &ClusterId, _: &str, row: &DecisionRow) -> DbResult<()> {
@@ -645,4 +650,75 @@ async fn the_next_statement_after_a_cut_finishes_it_first() {
         "{b:?}"
     );
     assert!(!b.contains(&"XA ROLLBACK".to_owned()), "{b:?}");
+}
+
+// A `COMMIT` killed while it ran (`KILL QUERY`) answers its real outcome
+// once the cut commit is finished: OK when it committed, 39443 when it
+// rolled back, and nothing (the caller answers 1317) when the outcome is
+// still unknown after `txn.commit_resolve_timeout_ms`.
+#[tokio::test]
+async fn a_killed_commit_answers_its_outcome() {
+    // Cut after the commit point: committed.
+    let (mut t, log) = two_writers(("a", "COMMIT", true, None)).await;
+    let ended = t.finish_interrupted().await;
+    assert_eq!(ended, Interrupted::Committed);
+    assert!(matches!(ended.commit_answer(), Some(Ok(()))));
+    assert!(on(&log, "b").contains(&"XA COMMIT".to_owned()));
+    assert!(!t.in_txn() && !t.interrupted());
+    // Cut before it: rolled back, 39443.
+    let (mut t, log) = two_writers(("a", "INSERT INTO", false, None)).await;
+    let ended = t.finish_interrupted().await;
+    assert_eq!(ended, Interrupted::RolledBack);
+    let e = ended.commit_answer().unwrap().unwrap_err();
+    assert_eq!(e.protocol().mysql_errno, 39443, "{e}");
+    assert!(on(&log, "b").contains(&"XA ROLLBACK".to_owned()));
+    // Cut while the last resource's COMMIT was under way: the race at its
+    // anchor decides; it finds the decision row, so committed.
+    let (mut t, log) = two_writers(("a", "COMMIT", false, None)).await;
+    assert_eq!(t.finish_interrupted().await, Interrupted::Committed);
+    assert!(on(&log, "b").contains(&"XA COMMIT".to_owned()));
+    // No commit cut: nothing to answer.
+    assert_eq!(t.finish_interrupted().await, Interrupted::None);
+    assert!(Interrupted::None.commit_answer().is_none());
+}
+
+#[tokio::test]
+async fn a_killed_commit_whose_race_cant_run_stays_unknown() {
+    let log: Log = Arc::default();
+    let script = Arc::new(Script::default());
+    let admin = Arc::new(FakeAdmin::default());
+    admin.kill_fails.store(true, Ordering::SeqCst);
+    script.record_decisions.store(true, Ordering::SeqCst);
+    let b = Arc::new(Fake {
+        log: log.clone(),
+        script: script.clone(),
+        admin,
+    });
+    let cfg = TxnConfig {
+        policy: NonXaPolicy::Reject,
+        tenant_all_xa: true,
+        commit_resolve_timeout: Duration::from_millis(500),
+        ..TxnConfig::default()
+    };
+    let mut t = TxnCoordinator::new(b, Arc::new(DtidGen::new(1)), TenantId(1), cfg);
+    t.begin(BeginOptions::default()).unwrap();
+    write(&mut t, "a", 1).await.unwrap();
+    write(&mut t, "b", 2).await.unwrap();
+    script.stall.lock().unwrap().push(Stall {
+        cluster: "a".into(),
+        prefix: "COMMIT".into(),
+        after: false,
+        wait: None,
+    });
+    let cut = tokio::time::timeout(Duration::from_millis(100), t.commit()).await;
+    assert!(cut.is_err());
+    let started = tokio::time::Instant::now();
+    let ended = t.finish_interrupted().await;
+    assert_eq!(ended, Interrupted::Unknown);
+    assert!(ended.commit_answer().is_none(), "answered 1317");
+    // Bounded by the resolve timeout, measured from the COMMIT's send.
+    assert!(started.elapsed() < Duration::from_secs(2));
+    // The prepared branch is left to the resolver.
+    assert!(!on(&log, "b").contains(&"XA ROLLBACK".to_owned()));
+    assert!(!on(&log, "b").contains(&"XA COMMIT".to_owned()));
 }

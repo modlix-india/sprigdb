@@ -145,3 +145,50 @@ fn fixed_columns_and_text_charset() {
     a.set_text_charset(45);
     assert_eq!((a.columns[0].charset, a.columns[1].charset), (45, 63));
 }
+
+// On 3306, an index MariaDB named after a functional key part's hidden
+// column (a table made before such indexes got MySQL's names) shows
+// MySQL's name in key order, skipping the names the table already uses,
+// as SHOW CREATE TABLE shows it.
+#[test]
+fn old_functional_index_names_show_as_mysql_names_them() {
+    let m = acme();
+    let ctx = OutputCtx::new(&m);
+    let mut r = ResultMapper::show(ShowKind::Index, Visibility::for_persona(Persona::MySql84))
+        .with_persona(Persona::MySql84);
+    let mut defs = vec![def("Table"), def("Key_name"), def("Column_name")];
+    r.column_defs(&mut defs, &ctx);
+    let mut out = Vec::new();
+    for v in [
+        ["t", "PRIMARY", "id"],
+        ["t", "functional_index", "NULL"],
+        ["t", "_sprig_fx_0a1b2c3d", "NULL"],
+        ["t", "_sprig_fx_0a1b2c3d", "b"],
+        ["t", "bx", "b"],
+        ["t", "_sprig_fx_ffff0000", "NULL"],
+        ["u", "_sprig_fx_12345678", "NULL"],
+    ] {
+        r.row(row(&v), &ctx, &mut out);
+    }
+    r.finish(&ctx, &mut out);
+    assert_eq!(
+        strings(&out),
+        [
+            ["t", "PRIMARY", "id"],
+            ["t", "functional_index", "NULL"],
+            ["t", "functional_index_2", "NULL"],
+            ["t", "functional_index_2", "b"],
+            ["t", "bx", "b"],
+            ["t", "functional_index_3", "NULL"],
+            ["u", "functional_index", "NULL"],
+        ]
+    );
+    // MariaDB's port keeps the backend's names.
+    let mut r = ResultMapper::show(ShowKind::Index, Visibility::for_persona(Persona::MariaDb));
+    let mut defs = vec![def("Table"), def("Key_name"), def("Column_name")];
+    r.column_defs(&mut defs, &ctx);
+    let mut out = Vec::new();
+    r.row(row(&["t", "_sprig_fx_0a1b2c3d", "NULL"]), &ctx, &mut out);
+    r.finish(&ctx, &mut out);
+    assert_eq!(strings(&out), [["t", "_sprig_fx_0a1b2c3d", "NULL"]]);
+}

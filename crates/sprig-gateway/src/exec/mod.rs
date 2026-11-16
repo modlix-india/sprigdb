@@ -1255,6 +1255,10 @@ impl SessionExec for PassSession {
         }
     }
 
+    fn take_cut_commit(&mut self) -> Option<Result<()>> {
+        self.router.take_cut_commit()
+    }
+
     async fn abandoned(&mut self, _cx: &mut ExecCtx<'_>, why: Abandon) {
         // The router's statements on other connections too.
         self.router.abandon_in_flight(DRAIN_TIMEOUT).await;
