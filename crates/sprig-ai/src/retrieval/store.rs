@@ -136,7 +136,9 @@ pub struct RetrievalIndex {
     pub state: State,
     /// The fill's position per shard schema.
     pub progress: Value,
-    /// Source rows indexed so far.
+    /// Source rows that have their chunks now, over the index's live
+    /// shards (rows without text have none). The worker sets it: exact
+    /// once a fill or check ends, kept per row in between.
     pub rows_indexed: u64,
     /// Why it failed, or the last transient error.
     pub last_error: Option<String>,
@@ -449,7 +451,8 @@ impl Store {
         .await
     }
 
-    /// Records the fill's position and adds `rows` to the rows indexed.
+    /// Records the fill's position and the rows indexed (rows with chunks
+    /// over the live shards).
     ///
     /// # Errors
     /// The catalog is unreachable.
@@ -462,7 +465,7 @@ impl Store {
     ) -> Result<()> {
         self.update(
             c,
-            "progress = ?, rows_indexed = rows_indexed + ?",
+            "progress = ?, rows_indexed = ?",
             id,
             vec![progress.to_string().into(), rows.into()],
         )

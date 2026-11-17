@@ -31,6 +31,10 @@
 //! export SPRIG_TEST_RX_BACKEND2=mysql://root:...@127.0.0.1:42321
 //! # optional: kills the worker (kill -9) and starts it again
 //! export SPRIG_TEST_RX_KILL='.../rx.sh kill-worker'
+//! # optional: the workers' telemetry addresses, comma-separated: their
+//! # sprig_retrieval_rows_total{result="indexed"} (rows embedded) proves
+//! # what a split, merge, move and re-key embed again
+//! export SPRIG_TEST_RX_METRICS=127.0.0.1:42185
 //! cargo test -p sprig-gateway --test retrieval_live -- --nocapture
 //! ```
 
@@ -603,6 +607,40 @@ async fn index_id(b: &mut mysql_async::Conn, name: &str) -> Option<u64> {
         }
     }
     None
+}
+
+/// Rows the workers have embedded (`sprig_retrieval_rows_total{result="indexed"}`
+/// summed over `SPRIG_TEST_RX_METRICS`); `None` without the variable.
+fn embedded() -> Option<u64> {
+    let addrs = std::env::var("SPRIG_TEST_RX_METRICS").ok()?;
+    let mut n = 0u64;
+    for a in addrs.split(',').map(str::trim).filter(|a| !a.is_empty()) {
+        let out = std::process::Command::new("curl")
+            .args(["-sS", "--max-time", "10", &format!("http://{a}/metrics")])
+            .output()
+            .ok()?;
+        n += String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| {
+                l.starts_with("sprig_retrieval_rows_total{") && l.contains("result=\"indexed\"")
+            })
+            .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+            .map(|v| v as u64)
+            .sum::<u64>();
+    }
+    Some(n)
+}
+
+/// `before → after` of [`embedded`], and whether it grew by `by`
+/// (always true without `SPRIG_TEST_RX_METRICS`).
+fn embedded_by(before: Option<u64>, by: u64) -> (String, bool) {
+    match (before, embedded()) {
+        (Some(b), Some(a)) => (format!("rows embedded {b} → {a}"), a == b + by),
+        _ => (
+            "(no SPRIG_TEST_RX_METRICS: embeddings not counted)".into(),
+            true,
+        ),
+    }
 }
 
 fn shell(cmd: &str) -> bool {
@@ -1383,6 +1421,12 @@ async fn retrieval_indexes_end_to_end() {
         );
         must(&mut c, "SPRIG PIN many SHARD KEY (id)").await;
         let rows_before_group = state(&mut c, "kb2").await.1;
+        ck.ok(
+            "rows indexed counts the table's 20 rows",
+            rows_before_group == 20,
+            || format!("{rows_before_group}"),
+        );
+        let emb_group = embedded();
         let group = format!("{cmd} group");
         ck.ok("the table moved into its group", shell(&group), || {
             group.clone()
@@ -1441,13 +1485,20 @@ async fn retrieval_indexes_end_to_end() {
             );
         }
         let rows_before = state(&mut c, "kb2").await.1;
-        eprintln!("     group: rows indexed {rows_before_group} → {rows_before}");
+        let (emb, none_again) = embedded_by(emb_group, 0);
+        eprintln!("     group: rows indexed {rows_before_group} → {rows_before}, {emb}");
         ck.ok(
-            "the move into the group embeds nothing again (rows indexed unchanged)",
+            "the move into the group keeps rows indexed",
             rows_before == rows_before_group,
             || format!("{rows_before_group} → {rows_before}"),
         );
+        ck.ok(
+            "the move into the group embeds nothing again",
+            none_again,
+            || emb.clone(),
+        );
         let before = all_hits(&mut c, "kb2").await;
+        let emb_split = embedded();
         let split = format!("{cmd} split");
         ck.ok("the shard split ran", shell(&split), || split.clone());
         // At once after the cutover: the chunks are in the new shards, with
@@ -1480,8 +1531,9 @@ async fn retrieval_indexes_end_to_end() {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         let rows_after = state(&mut c, "kb2").await.1;
+        let (emb, none_again) = embedded_by(emb_split, 0);
         eprintln!(
-            "     after the split: states seen {states:?}, rows indexed {rows_before} → {rows_after}"
+            "     after the split: states seen {states:?}, rows indexed {rows_before} → {rows_after}, {emb}"
         );
         ck.ok(
             "the split leaves the index ready (never rebuilding)",
@@ -1489,10 +1541,11 @@ async fn retrieval_indexes_end_to_end() {
             || format!("{states:?}"),
         );
         ck.ok(
-            "the split embeds nothing again",
+            "the split keeps rows indexed (summed over the two shards)",
             rows_after == rows_before,
             || format!("{rows_before} → {rows_after}"),
         );
+        ck.ok("the split embeds nothing again", none_again, || emb.clone());
         let shards = match (&mut b, kb2) {
             (Some(b), Some(id)) => chunk_tables(b, id).await,
             _ => Vec::new(),
@@ -1559,6 +1612,7 @@ async fn retrieval_indexes_end_to_end() {
         // And back: the two shards merged into one, the chunks with them.
         let rows_before = state(&mut c, "kb2").await.1;
         let before = all_hits(&mut c, "kb2").await;
+        let emb_merge = embedded();
         let merge = format!("{cmd} merge");
         ck.ok("the shards were merged", shell(&merge), || merge.clone());
         let right_after = all_hits(&mut c, "kb2").await;
@@ -1578,8 +1632,9 @@ async fn retrieval_indexes_end_to_end() {
             (Some(b), Some(id)) => misplaced(b, id, "many").await,
             _ => (0, 0, 0),
         };
+        let (emb, none_again) = embedded_by(emb_merge, 0);
         eprintln!(
-            "     after the merge: {found}/{} questions with five hits, states {states:?}, rows indexed {rows_before} → {rows_after}, chunk tables {shards:?}",
+            "     after the merge: {found}/{} questions with five hits, states {states:?}, rows indexed {rows_before} → {rows_after}, {emb}, chunk tables {shards:?}",
             QUESTIONS.len()
         );
         ck.ok(
@@ -1588,9 +1643,12 @@ async fn retrieval_indexes_end_to_end() {
             || format!("before {before:?}\nafter {right_after:?}"),
         );
         ck.ok(
-            "the merge leaves the index ready and embeds nothing again",
-            states.len() == 1 && states.contains("ready") && rows_after == rows_before,
-            || format!("{states:?} {rows_before} → {rows_after}"),
+            "the merge leaves the index ready, keeps rows indexed and embeds nothing again",
+            states.len() == 1
+                && states.contains("ready")
+                && rows_after == rows_before
+                && none_again,
+            || format!("{states:?} {rows_before} → {rows_after}, {emb}"),
         );
         ck.ok(
             "after the merge the chunks are in the one shard, with their rows",
@@ -1604,6 +1662,7 @@ async fn retrieval_indexes_end_to_end() {
             let chunks_before: u64 = source.iter().map(|x| x.2).sum();
             let rows_before = state(&mut c, "kb2").await.1;
             let before = all_hits(&mut c, "kb2").await;
+            let emb_move = embedded();
             let mv = format!("{cmd} move");
             let t = Instant::now();
             let (moved_ok, mut states) = shell_watching(&mut c, &mv, "kb2").await;
@@ -1629,8 +1688,9 @@ async fn retrieval_indexes_end_to_end() {
                 "many",
             )
             .await;
+            let (emb, none_again) = embedded_by(emb_move, 0);
             eprintln!(
-                "     after the move: chunk tables {source:?} → {tables:?}, states {states:?}, rows indexed {rows_before} → {rows_after}"
+                "     after the move: chunk tables {source:?} → {tables:?}, states {states:?}, rows indexed {rows_before} → {rows_after}, {emb}"
             );
             ck.ok(
                 "the chunk table arrives on the other cluster with its rows",
@@ -1647,10 +1707,11 @@ async fn retrieval_indexes_end_to_end() {
                 || format!("{states:?}"),
             );
             ck.ok(
-                "the move embeds nothing again (rows indexed unchanged)",
+                "the move keeps rows indexed",
                 rows_after == rows_before,
                 || format!("{rows_before} → {rows_after}"),
             );
+            ck.ok("the move embeds nothing again", none_again, || emb.clone());
             // The vector ranks must not move at all. MariaDB's own
             // full-text relevance (an unrestricted user's keyword list)
             // counts a table's deleted documents until it is optimized, so
@@ -1696,6 +1757,7 @@ async fn retrieval_indexes_end_to_end() {
             let old = chunk_tables_both(b1, b2, id).await;
             let rows_before = state(&mut c, "kb2").await.1;
             let before = all_hits(&mut c, "kb2").await;
+            let emb_rekey = embedded();
             let rk = format!("{cmd} rekey");
             let t = Instant::now();
             let (rekeyed, mut states) = shell_watching(&mut c, &rk, "kb2").await;
@@ -1716,16 +1778,22 @@ async fn retrieval_indexes_end_to_end() {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
             let rows_after = state(&mut c, "kb2").await.1;
+            let (emb, all_again) = embedded_by(emb_rekey, 20);
             eprintln!(
-                "     re-key: chunk tables {old:?} → when the job ended {after_job:?}, states {states:?}, ready again in {:?}, rows indexed {rows_before} → {rows_after}",
+                "     re-key: chunk tables {old:?} → when the job ended {after_job:?}, states {states:?}, ready again in {:?}, rows indexed {rows_before} → {rows_after}, {emb}",
                 ready_in.map(|d| d.as_millis())
             );
+            ck.ok(
+                "the re-key keeps rows indexed (the same 20 rows, refilled)",
+                rows_after == rows_before && rows_after == 20,
+                || format!("{rows_before} → {rows_after}"),
+            );
             // Chunks the mover had copied would be checked, not embedded
-            // (as in the move above): rows indexed would stay the same.
+            // (as in the move above).
             ck.ok(
                 "the re-key leaves the chunk tables out of its copy (every row embedded once again)",
-                rows_after == rows_before + 20,
-                || format!("{rows_before} → {rows_after}"),
+                all_again,
+                || emb.clone(),
             );
             ck.ok(
                 "the index goes rebuilding, then ready",

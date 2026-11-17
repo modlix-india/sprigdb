@@ -9,7 +9,7 @@
 //! to be `ready`, pins the table's shard key and applies the advisor's
 //! design. Right after the apply the chunk table must be in the group's
 //! schema with every chunk, none left in the old schema; the index must
-//! stay `ready` with the same rows indexed (nothing embedded again), its
+//! stay `ready` with the same rows indexed (never filled again), its
 //! chunks must get their rows' routing hashes, and searches must find the
 //! same rows as before the move.
 //!
@@ -393,7 +393,7 @@ async fn regroup_moves_chunk_tables_with_their_table() {
     }
     let (st2, rows2) = state(&mut c, "rgx_kb").await;
     ck.ok(
-        "nothing is embedded again (rows indexed unchanged)",
+        "rows indexed unchanged (the chunks moved with the table)",
         rows2 == rows0,
         || format!("{rows0} -> {rows2}"),
     );

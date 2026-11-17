@@ -202,7 +202,7 @@ SHOW RETRIEVAL INDEXES [FROM database];
 
 - `DROP RETRIEVAL INDEX` needs `INDEX` on the table. Searches stop at once; the worker removes the chunks shortly after. Dropping the table or its database drops its indexes too.
 - `SHOW CREATE RETRIEVAL INDEX` prints the index's statement with every clause, defaults included, so it can be run again elsewhere.
-- `SHOW RETRIEVAL INDEXES` lists the database's indexes over tables you can read: `Index`, `Table`, `Column`, `Model`, `State`, `Rows` (rows indexed so far), `Shards` and `Error`.
+- `SHOW RETRIEVAL INDEXES` lists the database's indexes over tables you can read: `Index`, `Table`, `Column`, `Model`, `State`, `Rows`, `Shards` and `Error`. `Rows` is the number of the table's rows indexed so far: rows that have their chunks, over the index's shards. Rows without text have no chunks and aren't counted. It is exact once a build ends; during one it grows as rows are indexed. A split, merge, move or re-key of the table's shards doesn't change it, even when the rows are embedded again (a re-key fills the new shards again, and `Rows` dips meanwhile). Embeddings are counted by the metric `sprig_retrieval_rows_total{result="indexed"}`.
 
 Changing an index means dropping it and creating it again. A column the index reads can be dropped from the table, but the index then fails until it is dropped.
 
@@ -226,7 +226,7 @@ The model is found in `docs.model_dir`, as for [embedded columns](../data-models
 |---|---|---|---|
 | `sprig_retrieval_searches_total` | counter | `result` | Searches: `ok`, `empty` or `error` |
 | `sprig_retrieval_search_seconds` | histogram | `mode` | Time of one search: `hybrid`, or `keyword` when the query couldn't be embedded |
-| `sprig_retrieval_rows_total` | counter | `result` | Rows a worker handled: `indexed`, `cleared` (chunks removed), `skipped` (already current), `superseded` (changed again first) |
+| `sprig_retrieval_rows_total` | counter | `result` | Rows a worker handled: `indexed` (embedded and written; a row embedded again counts again), `cleared` (chunks removed), `skipped` (already current), `superseded` (changed again first) |
 | `sprig_retrieval_chunks_total` | counter | none | Chunks written |
 | `sprig_retrieval_backlog` | gauge | none | Changed rows a worker has read and not yet indexed |
 | `sprig_ai_embedding_seconds` | histogram | `model` | Time of one model batch, shared with embedded columns |

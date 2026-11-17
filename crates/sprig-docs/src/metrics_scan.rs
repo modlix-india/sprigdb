@@ -761,7 +761,7 @@ mod tests {
             Some(("B", "y", 30))
         );
         assert_eq!(const_str(r#"const C: &[&str] = &["x"];"#, 0), None);
-        assert_eq!(const_str(r#"const D: u32 = 1;"#, 0), None);
+        assert_eq!(const_str("const D: u32 = 1;", 0), None);
         assert_eq!(const_str("const fn f() {}", 0), None);
         assert_eq!(const_str(r#"constant E: &str = "z";"#, 0), None);
     }

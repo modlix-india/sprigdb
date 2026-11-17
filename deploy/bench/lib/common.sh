@@ -61,8 +61,17 @@ emit() {
     local model=$1 op=$2 workload=$3 metric=$4 value=$5 unit=$6 better=$7
     shift 7
     if [[ $DRY == 1 ]]; then echo "would record $model/$op/$workload $metric=$value $unit"; return; fi
+    # One of several measured runs (a "run=N" config) is kept out of the pairing: lib/summarize.py
+    # writes the paired median of the runs. BENCH_UNPAIRED=1 keeps every result of this
+    # invocation out of the pairing (e.g. a second durability setting reported separately), and
+    # BENCH_VARIANT_SUFFIX is appended to the variant (e.g. ",persistence=default").
+    local unpaired=${BENCH_UNPAIRED:-0} a
+    for a in "$@"; do [[ $a == run=* ]] && unpaired=1; done
+    local variant=${VARIANT:-}${BENCH_VARIANT_SUFFIX:-}
+    variant=${variant#,}
     python3 -I "$RESULT_PY" --model "$model" --op "$op" --workload "$workload" --metric "$metric" \
         --value "$value" --unit "$unit" --better "$better" --product "$PRODUCT" \
-        --product-version "$VERSION" --competitor "$COMPETITOR" --run "$workload-${VARIANT:-}-$metric-$PRODUCT-$RUN_ID" \
-        ${VARIANT:+--variant "$VARIANT"} --source "logs/$LOGREL" --command "$CMDLINE" "$@"
+        --product-version "$VERSION" --competitor "$COMPETITOR" --run "$workload-$variant-$metric-$PRODUCT-$RUN_ID" \
+        ${variant:+--variant "$variant"} --source "logs/$LOGREL" --command "$CMDLINE" \
+        $([[ ${BENCH_UNPAIRED:-0} == 1 ]] && echo --extra-json '{"pair":false,"keep_unpaired":true}' || { [[ $unpaired == 1 ]] && echo --extra-json '{"pair":false}'; }) "$@"
 }

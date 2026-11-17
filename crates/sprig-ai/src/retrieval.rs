@@ -403,7 +403,8 @@ pub mod metrics {
         metrics::gauge!("sprig_retrieval_backlog").set(rows as f64);
     }
 
-    /// Source rows handled: `result` is `indexed` (chunks written),
+    /// Source rows handled: `result` is `indexed` (embedded and chunks
+    /// written: the embedding count; a row embedded again counts again),
     /// `cleared` (chunks removed: the row is gone or has no text),
     /// `skipped` (already current) or `superseded` (the row changed again
     /// first).

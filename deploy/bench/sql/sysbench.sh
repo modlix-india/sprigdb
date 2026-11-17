@@ -9,22 +9,28 @@
 #   sql/sysbench.sh --target 10.0.0.3:3306 --product SprigDB --version <build> \
 #       --user bench --password pw --db sbtest -- [--tests "..."] [--threads "1 16 64"] \
 #       [--tables 10] [--table-size 1000000] [--time 120] [--warmup 60] [--runs 3] [--no-prepare]
+#       [--driver mysql|pgsql]   (pgsql: PostgreSQL through sysbench's own pgsql driver)
 #
 # Needs sysbench 1.0.20 on PATH ($BENCH_SYSBENCH to override).
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 bench_args "$@"
-TESTS="oltp_point_select oltp_read_only oltp_read_write" THREADS="1 16 64" TABLES=10 SIZE=1000000 TIME=120 WARM=60 RUNS=3 PREP=1
+TESTS="oltp_point_select oltp_read_only oltp_read_write" THREADS="1 16 64" TABLES=10 SIZE=1000000 TIME=120 WARM=60 RUNS=3 PREP=1 DRIVER=mysql
 set -- "${EXTRA[@]+"${EXTRA[@]}"}"
 while [[ $# -gt 0 ]]; do case $1 in
     --tests) TESTS=$2; shift 2 ;; --threads) THREADS=$2; shift 2 ;; --tables) TABLES=$2; shift 2 ;;
     --table-size) SIZE=$2; shift 2 ;; --time) TIME=$2; shift 2 ;; --warmup) WARM=$2; shift 2 ;;
-    --runs) RUNS=$2; shift 2 ;; --no-prepare) PREP=0; shift ;;
+    --runs) RUNS=$2; shift 2 ;; --no-prepare) PREP=0; shift ;; --driver) DRIVER=$2; shift 2 ;;
     *) echo "unknown $1" >&2; exit 2 ;; esac; done
 SB=${BENCH_SYSBENCH:-sysbench}
 need "$SB" python3
-conn=(--db-driver=mysql --mysql-host="$HOST" --mysql-port="$PORT" --mysql-user="$B_USER" --mysql-password="$B_PASS"
-      --mysql-db="${B_DB:-sbtest}" --mysql-ssl=off --tables="$TABLES" --table-size="$SIZE")
+if [[ $DRIVER == pgsql ]]; then
+    conn=(--db-driver=pgsql --pgsql-host="$HOST" --pgsql-port="$PORT" --pgsql-user="$B_USER" --pgsql-password="$B_PASS"
+          --pgsql-db="${B_DB:-sbtest}" --tables="$TABLES" --table-size="$SIZE")
+else
+    conn=(--db-driver=mysql --mysql-host="$HOST" --mysql-port="$PORT" --mysql-user="$B_USER" --mysql-password="$B_PASS"
+          --mysql-db="${B_DB:-sbtest}" --mysql-ssl=off --tables="$TABLES" --table-size="$SIZE")
+fi
 [[ $PREP == 1 && $DRY == 0 ]] && "$SB" oltp_read_write "${conn[@]}" --threads=16 prepare >"$LOGDIR/prepare.log" 2>&1
 for t in $TESTS; do
     op=complex; [[ $t == oltp_point_select ]] && op=point

@@ -824,21 +824,28 @@ async fn forward(
     };
     metrics::counter!("sprig_studio_cursors_forwarded_total").increment(1);
     let reply = peers
-        .forward(
-            &h.gateway_id,
-            ForwardRequest {
-                authorization: caller.authorization.clone().unwrap_or_default(),
-                method: method.to_owned(),
-                request_json: b.to_string(),
-                client_addr: caller.peer.to_string(),
-            },
-        )
+        .forward(&h.gateway_id, forward_request(caller, method, &b))
         .await?;
     let v: Value = serde_json::from_str(&reply.body_json).unwrap_or_else(|_| json!({}));
     Ok(json_response(
         u16::try_from(reply.http_status).unwrap_or(500),
         &v,
     ))
+}
+
+/// The peer call of a forwarded cursor call. An issuer's bearer token
+/// goes as `Basic <tenant>.<user>:<token>`: the forwarded call has no
+/// `Host` or tenant header for the target to find the tenant by.
+fn forward_request(caller: &Caller, method: &str, body: &Value) -> ForwardRequest {
+    ForwardRequest {
+        authorization: super::super::auth::forwarded_authorization(
+            caller.authorization.as_deref(),
+            &caller.principal,
+        ),
+        method: method.to_owned(),
+        request_json: body.to_string(),
+        client_addr: caller.peer.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -1032,6 +1039,70 @@ mod tests {
         let (name, p, _) = opened(&reg, "alice", 20, 0, WAIT).await;
         assert_eq!((name.as_str(), p.rows.len(), p.done), ("", 20, true));
         assert!(reg.is_empty());
+    }
+
+    fn caller(authorization: Option<&str>) -> Caller {
+        let peer: std::net::SocketAddr = "10.0.0.9:5000".parse().unwrap();
+        Caller {
+            principal: sprig_auth::Principal {
+                tenant: Some(TenantId(7)),
+                tenant_name: Some("acme".into()),
+                user_id: None,
+                user: "tok".into(),
+                host: "%".into(),
+                client_ip: peer.ip(),
+                must_change_password: false,
+                limits: sprig_auth::store::AccountLimits::default(),
+                auth_version: 0,
+                backend: sprig_auth::BackendTarget {
+                    cluster: sprig_common::ids::ClusterId::new("dc-a-c1").unwrap(),
+                    user: "root".into(),
+                    credentials: "env:SPRIG_TEST_BACKEND".parse().unwrap(),
+                },
+            },
+            peer,
+            tls: None,
+            listener: "http",
+            generation: 0,
+            authorization: authorization.map(str::to_owned),
+            client_dc: None,
+        }
+    }
+
+    #[test]
+    fn a_forwarded_cursor_call_names_the_tenant_of_a_bearer_token() {
+        use base64::Engine as _;
+        let jwt = "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJ0b2sifQ.c2ln";
+        let body = json!({"cursor": "cursors/x", "rows": 10});
+        let r = forward_request(
+            &caller(Some(&format!("Bearer {jwt}"))),
+            "Cursors.Fetch",
+            &body,
+        );
+        let basic = r.authorization.strip_prefix("Basic ").unwrap();
+        let pair = base64::engine::general_purpose::STANDARD
+            .decode(basic)
+            .unwrap();
+        assert_eq!(String::from_utf8(pair).unwrap(), format!("acme.tok:{jwt}"));
+        assert_eq!(
+            (r.method.as_str(), r.client_addr.as_str()),
+            ("Cursors.Fetch", "10.0.0.9:5000")
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&r.request_json).unwrap(),
+            body
+        );
+        // A Studio session's token and a Basic header go as they came.
+        for a in ["Bearer sprigat_abc", "Basic YWNtZS5hcHA6cHc="] {
+            assert_eq!(
+                forward_request(&caller(Some(a)), "Cursors.Close", &body).authorization,
+                a
+            );
+        }
+        assert_eq!(
+            forward_request(&caller(None), "Cursors.Close", &body).authorization,
+            ""
+        );
     }
 
     #[test]

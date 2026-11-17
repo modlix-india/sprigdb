@@ -34,6 +34,13 @@
 //!       (ai.embedding.backfill_rows_per_s, at most 200 rows), its last key
 //!       saved in `progress`; a shard done is swept of chunks whose row is
 //!       gone; every shard done → ready
+//!     rows indexed (`rows_indexed`, SHOW's `Rows`): the rows with chunks
+//!       per live shard, summed; each shard counted from its chunk table
+//!       (its chunk 0s) when the job starts, when the live shards change
+//!       (a split, merge, move or re-key), after a sweep and when its fill
+//!       or check ends; in between each committed write adds a row that
+//!       gained chunks and takes away one that lost them. Embeddings are
+//!       counted apart: sprig_retrieval_rows_total{result="indexed"}
 //!
 //! reconcile(shard, rows):
 //!   SELECT pk, text, title, filters, UNHEX(MD5(JSON_ARRAY(text, title,
@@ -344,7 +351,10 @@ struct Job<'a> {
     backfill: Throttle,
     /// The fill's position per shard schema: the last key, or `done`.
     progress: BTreeMap<String, Value>,
-    progress_dirty: u64,
+    /// Rows with chunks per live shard schema.
+    rows: BTreeMap<String, u64>,
+    /// The rows indexed last saved in the catalog.
+    rows_saved: Option<u64>,
     shards: Option<(Instant, Vec<(ShardLoc, ClusterId)>)>,
     /// The live shard schemas whose source table has `_sprig_rk`.
     rk: HashSet<String>,
@@ -352,6 +362,7 @@ struct Job<'a> {
     map_changes: tokio::sync::watch::Receiver<u64>,
     /// Chunk tables in schemas without the source table, since when.
     orphans: HashMap<String, Instant>,
+    /// Rows embedded by this run of the job.
     indexed: u64,
 }
 
@@ -538,6 +549,9 @@ impl Job<'_> {
             }
         }
         out.sort();
+        // A split, merge, move or re-key changes the live shards (or their
+        // clusters): every shard's rows are counted again.
+        let recount = self.shards.as_ref().is_none_or(|(_, v)| *v != out);
         // Chunk tables where they are missing; progress follows the shards.
         let mut changed = false;
         let mut created = false;
@@ -563,6 +577,7 @@ impl Job<'_> {
                     .await
                     .map_err(backend)?;
                 c.query_drop(&sql).await.map_err(backend)?;
+                self.rows.insert(schema.clone(), 0);
                 self.progress.insert(schema, Value::Null);
                 created = true;
                 changed = true;
@@ -577,6 +592,12 @@ impl Job<'_> {
                 c.query_drop(retrieval::add_rk_sql(self.ix.row.id))
                     .await
                     .map_err(backend)?;
+            }
+            if recount || !self.rows.contains_key(&schema) {
+                let n = self.count(loc, &schema).await?;
+                if self.rows.insert(schema.clone(), n) != Some(n) {
+                    changed = true;
+                }
             }
             if let std::collections::btree_map::Entry::Vacant(e) = self.progress.entry(schema) {
                 // Carried here with its rows: checked, not filled again.
@@ -594,6 +615,7 @@ impl Job<'_> {
             self.progress.remove(&g);
             changed = true;
         }
+        self.rows.retain(|k, _| schemas.contains(k));
         if changed {
             self.save_progress().await?;
         }
@@ -654,13 +676,42 @@ impl Job<'_> {
         self.progress.values().all(|p| p == "done")
     }
 
+    /// The rows with chunks in shard `s` (schema `schema`): its chunk 0s.
+    async fn count(&self, s: &ShardLoc, schema: &str) -> Result<u64> {
+        let mut c = self.conn_of(s).await?;
+        let n: Option<u64> = c
+            .query_first(format!(
+                "SELECT COUNT(*) FROM {} WHERE chunk_no = 0",
+                self.ix.chunks(schema)
+            ))
+            .await
+            .map_err(backend)?;
+        Ok(n.unwrap_or(0))
+    }
+
+    /// Adds `gained` rows to shard `schema`'s count and takes `lost` away.
+    fn adjust(&mut self, schema: &str, gained: u64, lost: u64) {
+        if let Some(n) = self.rows.get_mut(schema) {
+            *n = (*n + gained).saturating_sub(lost);
+        }
+    }
+
+    /// The rows indexed: the rows with chunks over the live shards.
+    fn rows_indexed(&self) -> u64 {
+        self.rows.values().sum()
+    }
+
+    /// Whether the rows indexed changed since the last save.
+    fn rows_unsaved(&self) -> bool {
+        self.rows_saved != Some(self.rows_indexed())
+    }
+
     async fn save_progress(&mut self) -> Result<()> {
         let (mut c, store) = self.catalog().await?;
         let p = Value::Object(self.progress.clone().into_iter().collect());
-        store
-            .set_progress(&mut c, self.ix.row.id, &p, self.progress_dirty)
-            .await?;
-        self.progress_dirty = 0;
+        let rows = self.rows_indexed();
+        store.set_progress(&mut c, self.ix.row.id, &p, rows).await?;
+        self.rows_saved = Some(rows);
         Ok(())
     }
 
@@ -883,6 +934,9 @@ impl Job<'_> {
         );
         let (mut indexed, mut cleared, mut superseded, mut written) = (0u64, 0u64, 0u64, 0u64);
         for group in groups {
+            // Rows that gained chunks and rows that lost them, counted once
+            // the group's transaction commits.
+            let (mut gained, mut lost) = (0u64, 0u64);
             if cancel.is_cancelled() {
                 return Err(SprigError::internal("cancelled"));
             }
@@ -902,6 +956,7 @@ impl Job<'_> {
                 .map_err(backend)?;
             for (i, chunks) in &group {
                 let r = &src[*i];
+                let had = stored.contains_key(&r.key_text);
                 let now: Option<mysql_async::Row> = tx
                     .exec_first(&guard, mysql_async::Params::Positional(r.key.clone()))
                     .await
@@ -921,6 +976,7 @@ impl Job<'_> {
                     .map_err(backend)?;
                 if gone || chunks.is_empty() {
                     cleared += 1;
+                    lost += u64::from(had);
                     vi += chunks.len();
                     continue;
                 }
@@ -945,8 +1001,10 @@ impl Job<'_> {
                     written += 1;
                 }
                 indexed += 1;
+                gained += u64::from(!had);
             }
             tx.commit().await.map_err(backend)?;
+            self.adjust(&schema, gained, lost);
         }
         // Current chunks given their row's routing hash, under the guard.
         if !rk_only.is_empty() {
@@ -987,7 +1045,6 @@ impl Job<'_> {
         metrics::rows("superseded", superseded);
         metrics::chunks(written);
         self.indexed += indexed;
-        self.progress_dirty += indexed;
         Ok((last, read))
     }
 
@@ -1061,13 +1118,15 @@ impl Job<'_> {
                     gone += 1;
                 }
             }
+            self.adjust(&schema, 0, gone);
             metrics::rows("cleared", gone);
         }
         Ok(())
     }
 
-    /// Deletes the chunks of shard `s` whose row is gone.
-    async fn sweep(&self, s: &ShardLoc) -> Result<u64> {
+    /// Deletes the chunks of shard `s` whose row is gone, then counts the
+    /// shard's rows again.
+    async fn sweep(&mut self, s: &ShardLoc) -> Result<u64> {
         let schema = self.ix.schema(self.tenant, s);
         // Single-table form: a multi-table DELETE with no current schema
         // is refused (1046).
@@ -1093,7 +1152,11 @@ impl Job<'_> {
         ))
         .await
         .map_err(backend)?;
-        Ok(c.affected_rows())
+        let swept = c.affected_rows();
+        drop(c);
+        let n = self.count(s, &schema).await?;
+        self.rows.insert(schema, n);
+        Ok(swept)
     }
 
     /// One fill chunk of the first shard not done; whether every shard is
@@ -1323,7 +1386,8 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
         live: Throttle::new(settings.tenant_get(tenant, &embedding::ROWS_PER_S)),
         backfill: Throttle::new(settings.tenant_get(tenant, &embedding::BACKFILL_ROWS_PER_S)),
         progress,
-        progress_dirty: 0,
+        rows: BTreeMap::new(),
+        rows_saved: None,
         shards: None,
         rk: HashSet::new(),
         map_changes: env.maps.changes(),
@@ -1528,7 +1592,7 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
                 }
             }
             job.live.spend(n_keys, Instant::now());
-            if job.progress_dirty > 0 {
+            if job.rows_unsaved() {
                 let _ = job.save_progress().await;
             }
             let w = job.live.wait();

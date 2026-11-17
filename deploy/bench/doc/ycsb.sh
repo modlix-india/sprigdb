@@ -9,15 +9,16 @@
 #   doc/ycsb.sh --target 10.0.0.3:27017 --product SprigDB --user acme.bench --password pw --db ycsb \
 #       -- --ycsb-dir /opt/ycsb-0.17.0 [--binding mongodb|couchbase3] [--workloads "a b c e f"] \
 #       [--records 1000000] [--ops 2000000] [--threads 16] [--runs 3] [--no-load] [--write-concern majority]
+#       [--time S]   (cap each measured run at S seconds, the warm-up at S/2: YCSB's maxexecutiontime)
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 bench_args "$@"
-Y="" BIND=mongodb WL="a b c e f" REC=1000000 OPS=2000000 TH=16 RUNS=3 LOAD=1 WC=majority
+Y="" BIND=mongodb WL="a b c e f" REC=1000000 OPS=2000000 TH=16 RUNS=3 LOAD=1 WC=majority TLIM=""
 set -- "${EXTRA[@]+"${EXTRA[@]}"}"
 while [[ $# -gt 0 ]]; do case $1 in
     --ycsb-dir) Y=$2; shift 2 ;; --binding) BIND=$2; shift 2 ;; --workloads) WL=$2; shift 2 ;;
     --records) REC=$2; shift 2 ;; --ops) OPS=$2; shift 2 ;; --threads) TH=$2; shift 2 ;;
-    --runs) RUNS=$2; shift 2 ;; --no-load) LOAD=0; shift ;; --write-concern) WC=$2; shift 2 ;;
+    --runs) RUNS=$2; shift 2 ;; --no-load) LOAD=0; shift ;; --write-concern) WC=$2; shift 2 ;; --time) TLIM=$2; shift 2 ;;
     *) echo "unknown $1" >&2; exit 2 ;; esac; done
 [[ -x $Y/bin/ycsb.sh ]] || { echo "--ycsb-dir must hold bin/ycsb.sh (YCSB 0.17.0)" >&2; exit 2; }
 need java python3
@@ -28,6 +29,8 @@ else
     props=(-p "couchbase.host=$HOST" -p "couchbase.bucket=${B_DB:-ycsb}" -p "couchbase.username=$B_USER" -p "couchbase.password=$B_PASS")
 fi
 common=(-p recordcount="$REC" -p operationcount="$OPS" -p measurementtype=hdrhistogram -p hdrhistogram.percentiles=50,99 -threads "$TH")
+warmcap=(); runcap=()
+[[ -n $TLIM ]] && warmcap=(-p maxexecutiontime=$((TLIM / 2))) && runcap=(-p maxexecutiontime="$TLIM")
 parse() { # file op metric -> value
     python3 -I - "$@" <<'PY'
 import sys
@@ -49,10 +52,10 @@ fi
 for w in $WL; do
     op=point; [[ $w == e ]] && op=complex
     VARIANT="records=$REC,threads=$TH"
-    "$Y/bin/ycsb.sh" run "$BIND" -s -P "$Y/workloads/workload$w" "${props[@]}" "${common[@]}" -p operationcount=$((OPS / 4)) >"$LOGDIR/$w-warmup.log" 2>&1
+    "$Y/bin/ycsb.sh" run "$BIND" -s -P "$Y/workloads/workload$w" "${props[@]}" "${common[@]}" -p operationcount=$((OPS / 4)) "${warmcap[@]+"${warmcap[@]}"}" >"$LOGDIR/$w-warmup.log" 2>&1
     for r in $(seq 1 "$RUNS"); do
         f=$LOGDIR/$w-run$r.log
-        "$Y/bin/ycsb.sh" run "$BIND" -s -P "$Y/workloads/workload$w" "${props[@]}" "${common[@]}" >"$f" 2>&1
+        "$Y/bin/ycsb.sh" run "$BIND" -s -P "$Y/workloads/workload$w" "${props[@]}" "${common[@]}" "${runcap[@]+"${runcap[@]}"}" >"$f" 2>&1
         RUN_ID_SAVE=$RUN_ID; RUN_ID=$RUN_ID_SAVE-run$r
         emit doc "$op" "ycsb-$w" ops_per_s "$(parse "$f" OVERALL 'Throughput(ops/sec)')" "ops/s" higher --config "run=$r" --config "write_concern=$WC"
         rd=READ; [[ $w == e ]] && rd=SCAN

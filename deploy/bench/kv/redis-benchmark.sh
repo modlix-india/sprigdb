@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# redis-benchmark (from the redis:7.4.6 image) core commands against a
+# redis-benchmark (from the redis:7.4.11 image) core commands against a
 # Redis-protocol endpoint: GET, SET, INCR, LPUSH, RPOP, SADD, HSET, ZADD,
 # MSET, 50 clients, --requests each, --runs runs. Records kv / point /
 # redis-benchmark: ops_per_s, variant cmd=<name>. Speed workload: VMs only.
@@ -16,7 +16,7 @@ need docker
 auth=(); [[ -n $B_PASS ]] && auth=(--user "${B_USER:-default}" -a "$B_PASS")
 [[ $DRY == 1 ]] && { echo "would run redis-benchmark"; exit 0; }
 for r in $(seq 1 "$RUNS"); do
-    docker run --rm --name "bench-rb-$$" --network "$NET" redis:7.4.6 redis-benchmark -h "$HOST" -p "$PORT" \
+    docker run --rm --name "bench-rb-$$" --network "$NET" redis:7.4.11 redis-benchmark -h "$HOST" -p "$PORT" \
         "${auth[@]+"${auth[@]}"}" -c 50 -n "$REQ" -t get,set,incr,lpush,rpop,sadd,hset,zadd,mset --csv >"$LOGDIR/run$r.csv" 2>"$LOGDIR/run$r.err"
     while IFS=, read -r name rps _; do
         name=${name//\"/}; rps=${rps//\"/}

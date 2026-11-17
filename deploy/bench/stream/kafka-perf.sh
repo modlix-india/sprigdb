@@ -7,13 +7,14 @@
 # Speed workload: benchmark VMs only.
 #
 #   stream/kafka-perf.sh --target 10.0.0.3:9092 --product Redpanda -- [--records 2000000] [--size 1024] [--runs 3] [--partitions 12]
+#       [--topic-db bench]   (topics are <topic-db>.perf_<run>_<n>: SprigDB maps a topic to <database>.<stream>)
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 bench_args "$@"
-REC=2000000 SIZE=1024 RUNS=3 PARTS=12 NET=host
+REC=2000000 SIZE=1024 RUNS=3 PARTS=12 NET=host TDB=bench
 set -- "${EXTRA[@]+"${EXTRA[@]}"}"
 while [[ $# -gt 0 ]]; do case $1 in --records) REC=$2; shift 2 ;; --size) SIZE=$2; shift 2 ;; --runs) RUNS=$2; shift 2 ;;
-    --partitions) PARTS=$2; shift 2 ;; --network) NET=$2; shift 2 ;; *) echo "unknown $1" >&2; exit 2 ;; esac; done
+    --partitions) PARTS=$2; shift 2 ;; --network) NET=$2; shift 2 ;; --topic-db) TDB=$2; shift 2 ;; *) echo "unknown $1" >&2; exit 2 ;; esac; done
 need docker python3
 cfg=$LOGDIR/client.properties
 : >"$cfg"
@@ -24,7 +25,7 @@ fi
 k() { docker run --rm --name "bench-kperf-$$" --network "$NET" -v "$LOGDIR:/out" --entrypoint /opt/kafka/bin/"$1" apache/kafka:4.1.0 "${@:2}"; }
 [[ $DRY == 1 ]] && { echo "would run kafka perf tools"; exit 0; }
 for r in $(seq 1 "$RUNS"); do
-    t=bench.perf.$RUN_ID.$r
+    t=$TDB.perf_${RUN_ID//[^A-Za-z0-9]/_}_$r
     k kafka-topics.sh --bootstrap-server "$TARGET" --command-config /out/client.properties --create --topic "$t" --partitions "$PARTS" --replication-factor 1 >"$LOGDIR/topic$r.log" 2>&1 || true
     k kafka-producer-perf-test.sh --topic "$t" --num-records "$REC" --record-size "$SIZE" --throughput -1 \
         --producer-props bootstrap.servers="$TARGET" acks=all --producer.config /out/client.properties >"$LOGDIR/produce$r.log" 2>&1

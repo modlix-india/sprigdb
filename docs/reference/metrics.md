@@ -608,7 +608,7 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 |---|---|---|---|---|
 | `sprig_retrieval_backlog` | gauge | - | sprig-ai | Changed rows of tables with retrieval indexes that the worker's retrieval jobs have read from the change feed and not yet indexed. Unit: rows. |
 | `sprig_retrieval_chunks_total` | counter | - | sprig-ai | Chunks the retrieval workers wrote into retrieval indexes (each embedded and full-text indexed). Unit: count. |
-| `sprig_retrieval_rows_total` | counter | `result` | sprig-ai | Source rows the retrieval workers handled; `result` is `indexed` (chunks written), `cleared` (chunks removed: the row is gone or has no text), `skipped` (already current) or `superseded` (the row changed again before the write). Unit: rows. |
+| `sprig_retrieval_rows_total` | counter | `result` | sprig-ai | Source rows the retrieval workers handled; `result` is `indexed` (embedded and chunks written; a row embedded again counts again), `cleared` (chunks removed: the row is gone or has no text), `skipped` (already current) or `superseded` (the row changed again before the write). Unit: rows. |
 | `sprig_retrieval_search_seconds` | histogram | `mode` | sprig-ai | Time of one retrieval index search (`RETRIEVE()` or the REST route), from the query embedding to the fused hits; `mode` is `hybrid`, or `keyword` when the query couldn't be embedded. Unit: seconds. |
 | `sprig_retrieval_searches_total` | counter | `result` | sprig-ai | Retrieval index searches; `result` is `ok`, `empty` (no hit) or `error`. Unit: count. |
 

@@ -44,9 +44,11 @@ use sprig_docs::reference::{
 /// read.
 const LABEL_OVERRIDES: &[(&str, &[&str])] = &[];
 
-/// The pages generated from code alone, by file name, and warnings about
-/// them.
-fn pages(root: &Path) -> Result<(Vec<(String, String)>, Vec<String>), String> {
+/// Pages by file name, with their text.
+type Pages = Vec<(String, String)>;
+
+/// The pages generated from code alone, and warnings about them.
+fn pages(root: &Path) -> Result<(Pages, Vec<String>), String> {
     let error_help = read(&root.join("docs/errors-what-to-do.toml"))
         .map(|t| reference::parse_error_help(&t))
         .transpose()?
