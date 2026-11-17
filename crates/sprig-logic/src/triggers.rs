@@ -24,7 +24,20 @@
 //!       → logic_dead_letters, and the lane moves on
 //!   checkpoint := the token of the last item before the first unfinished
 //!   one, acknowledged at most every second
+//!   stop (graceful): the lanes finish their events, the feed is read and
+//!   handled on until the checkpoint has passed the cluster's position
+//!   (read again once passed, until nothing more was written), at most
+//!   sprig_feed::drain::STOP_DRAIN; then the checkpoint is acknowledged
 //! ```
+//!
+//! **The stop.** Acknowledging only once a second, a runner that stopped
+//! where it was left the last second's writes (its own procedures', a
+//! stream sequencer's last append) after its checkpoint, and a binlog
+//! purge right after the stop removed history its restart needed: the
+//! trigger alone failed with 39800, though it had missed nothing. The
+//! drain ([`sprig_feed::drain`]) skips nothing: the checkpoint still moves
+//! only past handled items, and an event still in a lane at the drain's
+//! end stays after it.
 //!
 //! **Exactly once.** The marker commits with the procedure's writes, so a
 //! re-delivered event (a worker died before acknowledging it; a resume
@@ -43,10 +56,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use sprig_binlog::GtidPos;
 use sprig_binlog::Value as BValue;
-use sprig_common::ids::{DbId, GroupId, ShardId, TenantId};
+use sprig_common::ids::{ClusterId, DbId, GroupId, ShardId, TenantId};
 use sprig_common::names::SchemaName;
 use sprig_common::{CancellationToken, ErrorKind, Result, SprigCode, SprigError};
+use sprig_feed::drain::{ClusterPosition, STOP_DRAIN, StopDrain};
 use sprig_feed::{ChangeEvent, FeedItem, Op, ResumeToken, TenantTail};
 use tokio::sync::mpsc;
 
@@ -508,6 +523,36 @@ pub trait Outcomes: Send + Sync {
     async fn ack(&self, token: &ResumeToken, events: u64) -> Result<()>;
     /// A line for `sprigctl logic logs` (best effort).
     async fn log(&self, level: &str, message: &str);
+    /// `cluster`'s binlog position now, which a stopping runner reads on
+    /// past. `None` (the default): not known; the stop then only finishes
+    /// the events in flight.
+    async fn cluster_position(&self, cluster: &ClusterId) -> Option<GtidPos> {
+        let _ = cluster;
+        None
+    }
+}
+
+/// [`Outcomes::cluster_position`] as the drain reads it.
+struct OutPosition<'a>(&'a dyn Outcomes);
+
+#[async_trait]
+impl ClusterPosition for OutPosition<'_> {
+    async fn cluster_position(&self, cluster: &ClusterId) -> Result<GtidPos> {
+        self.0
+            .cluster_position(cluster)
+            .await
+            .ok_or_else(|| SprigError::internal(format!("no position of {cluster}")))
+    }
+}
+
+/// Moves `handled` past the finished items at the front of `pending`.
+fn advance(pending: &mut BTreeMap<u64, (ResumeToken, bool)>, handled: &mut Option<ResumeToken>) {
+    while let Some(e) = pending.first_entry() {
+        if !e.get().1 {
+            break;
+        }
+        *handled = Some(e.remove().0);
+    }
 }
 
 /// The feed the runner reads.
@@ -711,7 +756,8 @@ fn lane_of(ev: &TriggerEvent, lanes: usize) -> usize {
     usize::try_from(h.finish() % (lanes.max(1) as u64)).unwrap_or(0)
 }
 
-/// Runs a binding over `feed` until `cancel` (see the module docs).
+/// Runs a binding over `feed` until `cancel` (see the module docs): at
+/// the cancel, the stop's drain, then the checkpoint acknowledged.
 ///
 /// The feed is read by its own task into a bounded channel: a tail's
 /// `next` is never dropped half way (it isn't cancel-safe), only when the
@@ -720,6 +766,7 @@ fn lane_of(ev: &TriggerEvent, lanes: usize) -> usize {
 /// # Errors
 /// The feed's errors (the job then fails and is started again from the
 /// checkpoint).
+#[allow(clippy::too_many_lines)] // the loop of the module docs
 pub async fn run(
     feed: Box<dyn Feed>,
     filter: &Filter,
@@ -733,7 +780,10 @@ pub async fn run(
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<u64>();
     let mut senders = Vec::with_capacity(lanes);
     let mut tasks = Vec::with_capacity(lanes);
-    let stop = cancel.child_token();
+    // The lanes' own stop: they go on through the stop's drain, and end
+    // with the run.
+    let stop = CancellationToken::new();
+    let _stop_lanes = stop.clone().drop_guard();
     for _ in 0..lanes {
         let (tx, mut rx) = mpsc::unbounded_channel::<(u64, TriggerEvent)>();
         senders.push(tx);
@@ -768,14 +818,36 @@ pub async fn run(
     let mut pending: BTreeMap<u64, (ResumeToken, bool)> = BTreeMap::new();
     let mut seq = 0u64;
     let mut done_events = 0u64;
+    // The token past every finished item, and the one acknowledged last.
+    let mut handled: Option<ResumeToken> = None;
     let mut acked: Option<ResumeToken> = None;
+    // The newest token read (the cluster the feed is on).
+    let mut newest: Option<ResumeToken> = None;
+    let mut drain: Option<StopDrain> = None;
+    let position = OutPosition(out.as_ref());
     let mut tick = tokio::time::interval(opts.ack_every);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let result = loop {
-        let room = pending.len() < opts.max_in_flight;
+        // Without a position to pass, a stopping runner reads no more:
+        // it finishes what it has.
+        let room = pending.len() < opts.max_in_flight
+            && drain.as_ref().is_none_or(|d| d.target().is_some());
+        let until = drain.as_ref().map(StopDrain::deadline);
         tokio::select! {
             biased;
-            () = cancel.cancelled() => break Ok(()),
+            () = cancel.cancelled(), if drain.is_none() => {
+                let cluster = newest.as_ref().map(|t| t.cluster.clone());
+                drain = Some(StopDrain::begin(&position, cluster.as_ref(), STOP_DRAIN).await);
+            }
+            () = tokio::time::sleep_until(until.unwrap_or_else(tokio::time::Instant::now)), if until.is_some() => {
+                tracing::debug!(
+                    pending = pending.len(),
+                    at = ?handled.as_ref().or(acked.as_ref()).map(|t| t.pos.to_string()),
+                    target = ?drain.as_ref().and_then(|d| d.target().map(|t| t.1.to_string())),
+                    "trigger's stop drain ran out of time"
+                );
+                break Ok(());
+            }
             Some(s) = done_rx.recv() => {
                 if let Some(e) = pending.get_mut(&s) {
                     e.1 = true;
@@ -783,28 +855,18 @@ pub async fn run(
                 }
             }
             _ = tick.tick() => {
-                let mut last = None;
-                while let Some(e) = pending.first_entry() {
-                    if !e.get().1 {
-                        break;
-                    }
-                    last = Some(e.remove().0);
-                }
-                if let Some(t) = last
-                    && acked.as_ref() != Some(&t)
+                advance(&mut pending, &mut handled);
+                if let Some(t) = &handled
+                    && acked.as_ref() != Some(t)
                 {
-                    match out.ack(&t, done_events).await {
+                    match out.ack(t, done_events).await {
                         Ok(()) => {
                             stats.acks.fetch_add(1, Ordering::Relaxed);
                             done_events = 0;
-                            acked = Some(t);
+                            acked = Some(t.clone());
                         }
-                        Err(e) => {
-                            // Not acknowledged: put it back so the next
-                            // tick tries again.
-                            tracing::warn!(error = %e, "trigger checkpoint not acknowledged");
-                            pending.insert(0, (t, true));
-                        }
+                        // Not acknowledged: the next tick tries again.
+                        Err(e) => tracing::warn!(error = %e, "trigger checkpoint not acknowledged"),
                     }
                 }
             }
@@ -816,6 +878,7 @@ pub async fn run(
                 };
                 seq += 1;
                 let token = item.token().clone();
+                newest = Some(token.clone());
                 match &item {
                     FeedItem::Event(e) if filter.wants(e) => {
                         if let Some(ev) = TriggerEvent::from_change(e) {
@@ -833,7 +896,37 @@ pub async fn run(
                 }
             }
         }
+        if let Some(d) = drain.as_mut() {
+            advance(&mut pending, &mut handled);
+            let at = handled.as_ref().or(acked.as_ref());
+            let finished = match at {
+                Some(at) if d.target().is_some() => d.done(&position, &at.cluster, &at.pos).await,
+                // The first item isn't handled yet.
+                None if d.target().is_some() => false,
+                // Nothing to read on to: the events in flight are done.
+                _ => pending.is_empty(),
+            };
+            if finished {
+                tracing::debug!(pos = ?at.map(|t| t.pos.to_string()), "trigger drained at its stop");
+                break Ok(());
+            }
+        }
     };
+    if result.is_ok() && drain.is_some() {
+        advance(&mut pending, &mut handled);
+        if let Some(t) = &handled
+            && acked.as_ref() != Some(t)
+        {
+            match out.ack(t, done_events).await {
+                Ok(()) => {
+                    stats.acks.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "trigger checkpoint not acknowledged at the stop");
+                }
+            }
+        }
+    }
     stop.cancel();
     reader.abort();
     drop(senders);

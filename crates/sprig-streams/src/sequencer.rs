@@ -658,23 +658,33 @@ impl Sequencer {
         // its feed must pass first.
         let mut stopping: Option<Instant> = None;
         let mut target: Option<GtidPos> = None;
+        // When `target` was read: it is read again once passed, at least
+        // QUIET later (other jobs' last writes of the stop come after it).
+        let mut target_at = Instant::now();
         loop {
             let now = Instant::now();
             let mut deadline = if let Some(f) = first_pending {
                 f + self.opts.window()
-            } else if dirty {
+            } else if dirty && stopping.is_none() {
+                // (No idle checkpoint while stopping: a past deadline
+                // would spin the loop.)
                 last_write + self.opts.idle_checkpoint
             } else {
                 now + far
             };
             if let Some(s) = stopping {
                 deadline = deadline.min(s);
+                let quiet_end = target_at + sprig_feed::drain::QUIET;
+                if quiet_end > now {
+                    deadline = deadline.min(quiet_end);
+                }
             }
             let item = tokio::select! {
                 biased;
                 () = stop.cancelled(), if stopping.is_none() => {
                     stopping = Some(Instant::now() + STOP_DRAIN);
                     target = self.store.position().await.unwrap_or_default();
+                    target_at = Instant::now();
                     None
                 }
                 r = feed.next() => Some(r?),
@@ -773,13 +783,28 @@ impl Sequencer {
                     if stopping.is_some() {
                         // This append is a later write: read on past it.
                         target = self.store.position().await.unwrap_or_default();
+                        target_at = Instant::now();
                     }
                 }
             }
             if let Some(end) = stopping {
                 let at = resume.as_ref().map_or(&base, |t| &t.pos);
                 let quiet = txn.is_empty() && pending.is_empty();
-                let drained = quiet && target.as_ref().is_none_or(|c| passed(at, c));
+                let mut drained = quiet && target.as_ref().is_none_or(|c| passed(at, c));
+                if drained && target.is_some() {
+                    // Passed: done once the log's cluster wrote nothing
+                    // more for QUIET (the worker's other jobs stop too).
+                    if target_at.elapsed() < sprig_feed::drain::QUIET {
+                        drained = false;
+                    } else if let Some(now) = self.store.position().await.unwrap_or_default()
+                        && !passed(at, &now)
+                    {
+                        tracing::debug!(epoch = epoch.0, at = %at, to = %now, "stopping stream sequencer: the log's cluster wrote more; reading on");
+                        target = Some(now);
+                        target_at = Instant::now();
+                        drained = false;
+                    }
+                }
                 if drained || Instant::now() >= end {
                     if quiet
                         && let Some(t) = &resume

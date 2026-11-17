@@ -31,6 +31,11 @@
 //!   acknowledge the position after the last transaction forwarded (at
 //!     most once a second after rows were forwarded, at most every 30 s
 //!     otherwise, and when stopping)
+//!   a graceful stop drains first (sprig_feed::drain): the run in flight
+//!     finishes, and the feed is read and forwarded on until the position
+//!     has passed the cluster's position (read again once passed, until
+//!     nothing more was written), at most STOP_DRAIN; so a binlog purge
+//!     right after the stop takes nothing the restart needs
 //! ```
 //!
 //! **Exactly once.** A run's rows are deleted only after every destination
@@ -65,6 +70,7 @@ use sprig_common::ids::{ClusterId, TenantId};
 use sprig_controller::catalogs::ShardMapLocator;
 use sprig_controller::dispatch::JobClass;
 use sprig_feed::PlacementView;
+use sprig_feed::drain::{STOP_DRAIN, StopDrain};
 use sprig_feed::names::{CatalogPools, CatalogResolver};
 use sprig_feed::shared::{Kept, SharedClusters, SharedFeed};
 use sprig_feed::subs::{Subscription, Subscriptions};
@@ -119,6 +125,10 @@ pub struct QueueForwarder(pub ForwarderEnv);
 impl JobHandler for QueueForwarder {
     fn kind(&self) -> &'static str {
         JOB_KIND
+    }
+
+    fn drains(&self) -> bool {
+        true
     }
 
     fn class(&self) -> JobClass {
@@ -597,6 +607,22 @@ impl Forwarder {
         let mut dirty = false;
         let mut pending_events = 0u64;
         let mut retry = Duration::from_millis(200);
+        // A graceful stop drains: the run in flight finishes and the feed
+        // is read on, until `hard`, STOP_DRAIN after the cancel.
+        let hard = sprig_common::CancellationToken::new();
+        let _hard = hard.clone().drop_guard();
+        {
+            let (cancel, hard) = (cancel.clone(), hard.clone());
+            tokio::spawn(async move {
+                tokio::select! {
+                    () = cancel.cancelled() => {}
+                    () = hard.cancelled() => return,
+                }
+                tokio::time::sleep(STOP_DRAIN).await;
+                hard.cancel();
+            });
+        }
+        let mut drain: Option<StopDrain> = None;
         'outer: loop {
             if cancel.is_cancelled() {
                 break;
@@ -611,7 +637,7 @@ impl Forwarder {
                 Some(t) => StartAt::After(t.clone()),
                 None => self.start_at().await,
             };
-            let stop = cancel.child_token();
+            let stop = hard.child_token();
             let mut rx = match self.open(start, stop.clone()).await {
                 Ok(rx) => rx,
                 Err(e) => {
@@ -629,8 +655,27 @@ impl Forwarder {
             // Rows of the transaction being read, and of whole ones.
             let mut open_txn: Vec<Committed> = Vec::new();
             loop {
+                if cancel.is_cancelled() && drain.is_none() {
+                    let cluster = acked.as_ref().map(|t| t.cluster.clone());
+                    drain = Some(
+                        StopDrain::begin(self.env.clusters.as_ref(), cluster.as_ref(), STOP_DRAIN)
+                            .await,
+                    );
+                }
+                if let Some(d) = drain.as_mut() {
+                    let finished = match &acked {
+                        Some(t) => d.done(self.env.clusters.as_ref(), &t.cluster, &t.pos).await,
+                        None => true,
+                    };
+                    if finished || hard.is_cancelled() {
+                        tracing::debug!(tenant = %self.tenant, passed = d.reached(), "queue forwarder drained at its stop");
+                        stop.cancel();
+                        break 'outer;
+                    }
+                }
+                let wake = if drain.is_some() { &hard } else { cancel };
                 let first = tokio::select! {
-                    () = cancel.cancelled() => { stop.cancel(); break 'outer; }
+                    () = wake.cancelled() => continue,
                     i = rx.recv() => i,
                 };
                 let Some(first) = first else {
@@ -672,7 +717,7 @@ impl Forwarder {
                 if !batch.is_empty() {
                     unacked_rows = true;
                 }
-                if !batch.is_empty() && !self.forward(&batch, cancel).await {
+                if !batch.is_empty() && !self.forward(&batch, &hard).await {
                     stop.cancel();
                     break 'outer;
                 }

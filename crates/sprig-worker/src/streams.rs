@@ -197,6 +197,10 @@ impl JobHandler for StreamSequencer {
         JOB_KIND
     }
 
+    fn drains(&self) -> bool {
+        true
+    }
+
     fn class(&self) -> JobClass {
         JobClass::Consumer
     }

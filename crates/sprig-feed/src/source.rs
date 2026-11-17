@@ -192,6 +192,20 @@ pub trait Clusters: Send + Sync {
     /// # Errors
     /// Connection errors (retryable).
     async fn position(&self, cluster: &ClusterId) -> Result<GtidPos>;
+
+    /// The position a stopping consumer reads on past ([`crate::drain`]):
+    /// [`Self::position`] in the GTID domains a purge on the dump's node
+    /// can take from it. The default: every domain. A Galera cluster's
+    /// keeps only its shared domain: the writer pool's node need not be
+    /// the one the dump reads (its own local domain isn't in the feed),
+    /// and a node-local domain the reader lags in is added at its next
+    /// dump start when purged ([`crate::local_domains`]).
+    ///
+    /// # Errors
+    /// Connection errors (retryable).
+    async fn drain_position(&self, cluster: &ClusterId) -> Result<GtidPos> {
+        self.position(cluster).await
+    }
 }
 
 /// What a cluster-wide dump keeps ([`Clusters::open_scope`]).

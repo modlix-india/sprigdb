@@ -31,6 +31,8 @@ struct World {
     copy: BTreeMap<(TenantId, i64), (u64, u64)>,
     /// Deliveries of each (tenant, index).
     applied: BTreeMap<(TenantId, usize), u32>,
+    /// The cluster's position is known (one tenant: its log's length).
+    positions: bool,
 }
 
 type Shared = Arc<Mutex<World>>;
@@ -41,7 +43,11 @@ fn token(t: TenantId, next: usize) -> ResumeToken {
         clamp: next as u64,
         cluster: ClusterId::new("sim-c1").unwrap(),
         segment: 0,
-        pos: GtidPos::default(),
+        pos: GtidPos::from_gtids([sprig_binlog::Gtid {
+            domain: 0,
+            server: 1,
+            seq: next as u64,
+        }]),
         until: None,
         progress: true,
     }
@@ -150,6 +156,15 @@ impl Feeds for ModelFeeds {
         assert!(next >= *cur, "acknowledged positions never go back");
         *cur = next;
         Ok(())
+    }
+
+    async fn cluster_position(&self, _cluster: &ClusterId) -> Option<GtidPos> {
+        let w = self.0.lock().unwrap();
+        if !w.positions {
+            return None;
+        }
+        let n: usize = w.logs.values().map(|l| l.events.len()).sum();
+        Some(token(TenantId(1), n).pos)
     }
 }
 
@@ -311,4 +326,66 @@ async fn worker_kills_lose_nothing() {
     }
     eprintln!("40 seeds: {total_kills} kills, {total_replays} events delivered again after a kill");
     assert!(total_kills > 40, "the runs were killed {total_kills} times");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_graceful_stop_reads_on_and_acknowledges_the_clusters_position() {
+    let t = TenantId(1);
+    let w: Shared = Arc::default();
+    {
+        let mut x = w.lock().unwrap();
+        x.logs.insert(t, Log::default());
+        x.positions = true;
+    }
+    // Writes go on for 600 ms after the stop (others writing while the
+    // worker stops), then end.
+    let writer = {
+        let w = Arc::clone(&w);
+        tokio::spawn(async move {
+            for v in 1..=80u64 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let k = i64::try_from(v % 13).unwrap();
+                let mut w = w.lock().unwrap();
+                w.source.insert((t, k), v);
+                w.logs.get_mut(&t).unwrap().events.push((k, v));
+            }
+        })
+    };
+    // Acknowledging once a second, a stop without a drain would leave up
+    // to a second of changes after the checkpoint.
+    let opts = ServeOpts {
+        ack_every: Duration::from_secs(1),
+        ..ServeOpts::default()
+    };
+    let feeds: Arc<dyn Feeds> = Arc::new(ModelFeeds(Arc::clone(&w)));
+    let mut apply = ModelApply {
+        w: Arc::clone(&w),
+        epoch: 1,
+        tenants: vec![t],
+    };
+    let stop = CancellationToken::new();
+    let s2 = stop.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        s2.cancel();
+    });
+    let begun = tokio::time::Instant::now();
+    let mut noop = |_: ServeStats| {};
+    serve(t, feeds, &mut apply, &opts, &stop, &mut noop)
+        .await
+        .unwrap();
+    assert!(
+        writer.is_finished(),
+        "the drain read past the writes made while stopping"
+    );
+    assert!(begun.elapsed() < Duration::from_millis(1_000) + STOP_DRAIN);
+    let w = w.lock().unwrap();
+    assert_eq!(
+        w.acks[&t], 80,
+        "acknowledged exactly the cluster's position"
+    );
+    for (k, v) in &w.source {
+        assert_eq!(w.copy.get(k).map(|c| c.0), Some(*v), "key {k:?} missed");
+    }
+    assert!(w.applied.values().all(|n| *n == 1), "nothing read twice");
 }

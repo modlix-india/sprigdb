@@ -34,6 +34,12 @@
 //!   once, in commit order
 //! the tail is read by a task of its own (sprig_feed::pump), so the loop's
 //!   1 s housekeeping wait never cancels a read half-way
+//! a graceful stop drains (sprig_feed::drain): the round in flight is
+//!   published, the feed read and published on until the position has
+//!   passed the cluster's position (read again once passed, until nothing
+//!   more was written), at most STOP_DRAIN after the stop; then the
+//!   position is acknowledged, so a binlog purge right after the stop
+//!   takes nothing the restart needs
 //! the job ends when the subscription is dropped (checked every 5 s)
 //! ```
 
@@ -44,6 +50,7 @@ use serde_json::{Value, json};
 use sprig_common::ids::TenantId;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_controller::dispatch::JobClass;
+use sprig_feed::drain::{STOP_DRAIN, StopDrain};
 use sprig_feed::names::CatalogResolver;
 use sprig_feed::pump::Pump;
 use sprig_feed::subs::Subscriptions;
@@ -282,6 +289,10 @@ pub struct ChangeExchange(pub LogicEnv);
 impl JobHandler for ChangeExchange {
     fn kind(&self) -> &'static str {
         JOB_KIND
+    }
+
+    fn drains(&self) -> bool {
+        true
     }
 
     fn class(&self) -> JobClass {
@@ -624,11 +635,40 @@ async fn serve(env: &LogicEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
     };
     let (mut published, mut filtered, mut pending, mut requests) = (0u64, 0u64, 0u64, 0u64);
     let mut last: Option<ResumeToken> = None;
+    // The position past everything published (`last` is taken by acks).
+    let mut at: Option<ResumeToken> = None;
     let mut acked = Instant::now();
     let mut checked = Instant::now();
-    loop {
-        if cx.cancel.is_cancelled() {
-            break;
+    // A graceful stop drains: the work in flight goes on, and the feed is
+    // read on, until `hard`, STOP_DRAIN after the cancel.
+    let hard = sprig_common::CancellationToken::new();
+    let _hard = hard.clone().drop_guard();
+    {
+        let (cancel, hard) = (cx.cancel.clone(), hard.clone());
+        tokio::spawn(async move {
+            tokio::select! {
+                () = cancel.cancelled() => {}
+                () = hard.cancelled() => return,
+            }
+            tokio::time::sleep(STOP_DRAIN).await;
+            hard.cancel();
+        });
+    }
+    let mut drain: Option<StopDrain> = None;
+    'serve: loop {
+        if cx.cancel.is_cancelled() && drain.is_none() {
+            let cluster = at.as_ref().map(|t| t.cluster.clone());
+            drain = Some(StopDrain::begin(env.feed.as_ref(), cluster.as_ref(), STOP_DRAIN).await);
+        }
+        if let Some(d) = drain.as_mut() {
+            let finished = match &at {
+                Some(t) => d.done(env.feed.as_ref(), &t.cluster, &t.pos).await,
+                None => true,
+            };
+            if finished || hard.is_cancelled() {
+                tracing::debug!(%tenant, passed = d.reached(), "change exchange forwarder drained at its stop");
+                break;
+            }
         }
         if checked.elapsed() > Duration::from_secs(5) {
             checked = Instant::now();
@@ -650,10 +690,12 @@ async fn serve(env: &LogicEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
                 )
                 .await;
         }
-        let (next, items, ended) = round(&mut feed, &cx.cancel, Duration::from_secs(1)).await?;
+        let wake = if drain.is_some() { &hard } else { &cx.cancel };
+        let (next, items, ended) = round(&mut feed, wake, Duration::from_secs(1)).await?;
         let began = Instant::now();
         if matches!(next, Next::Stop) {
-            break;
+            // The stop: its drain starts (or ends) above.
+            continue;
         }
         let Some(end) = items.last().map(|i| i.token().clone()) else {
             continue;
@@ -677,7 +719,7 @@ async fn serve(env: &LogicEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
                         tracing::warn!(%tenant, error = %err, "change exchange: the changes can't be checked yet; retrying");
                         let wait = retry_wait(attempt);
                         tokio::select! {
-                            () = cx.cancel.cancelled() => return Ok(json!({"stopped": "cancelled"})),
+                            () = hard.cancelled() => break 'serve,
                             () = tokio::time::sleep(wait) => {}
                         }
                     }
@@ -713,12 +755,14 @@ async fn serve(env: &LogicEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
                 spec.object,
                 &spec.exchange,
                 &pubs,
-                &cx.cancel,
+                &hard,
                 &mut requests,
             )
             .await
             {
-                return Ok(json!({"stopped": "cancelled"}));
+                // Out of time at a stop: this round stays after the
+                // checkpoint.
+                break;
             }
             let n = pubs.len() as u64;
             published += n;
@@ -728,6 +772,7 @@ async fn serve(env: &LogicEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
         if began.elapsed() > Duration::from_millis(500) {
             tracing::debug!(%tenant, items = items.len(), events = events_n, took_ms = began.elapsed().as_millis(), "change exchange: a slow round");
         }
+        at = Some(end.clone());
         last = Some(end);
         if let Some(e) = ended {
             if let Some(t) = last {

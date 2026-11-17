@@ -479,6 +479,9 @@ pub struct CatalogOutcomes {
     pub module_id: u64,
     /// The subscriptions (the tenant's home DC tier).
     pub subs: Subscriptions,
+    /// The clusters' binlog positions, for the stop's drain (`None`: the
+    /// stop only finishes the events in flight).
+    pub clusters: Option<Arc<dyn sprig_feed::Clusters>>,
 }
 
 impl CatalogOutcomes {
@@ -531,6 +534,19 @@ impl Outcomes for CatalogOutcomes {
                 now_ms(),
             )
             .await
+    }
+
+    async fn cluster_position(
+        &self,
+        cluster: &sprig_common::ids::ClusterId,
+    ) -> Option<sprig_binlog::GtidPos> {
+        match self.clusters.as_ref()?.drain_position(cluster).await {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::debug!(%cluster, error = %e, "trigger can't read the cluster's position at its stop");
+                None
+            }
+        }
     }
 
     async fn log(&self, level: &str, message: &str) {

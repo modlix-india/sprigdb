@@ -10,6 +10,9 @@
 //!   handler.progress(v): write compared on the job's revision; Lost -> cancel
 //!   handler returns: finish (succeeded with progress, or failed with the reason)
 //!   session lost: cancel every running job; register again
+//!   stop: cancel the jobs that don't drain the change feed and wait for
+//!     them (at most STOP_WRITERS), then cancel the ones that do: their
+//!     drain reads past the others' last writes (sprig_feed::drain)
 //! ```
 //!
 //! A job of a kind this worker has no handler for is failed at once with
@@ -35,6 +38,9 @@ use tokio::sync::Mutex as AsyncMutex;
 pub const POLL: Duration = Duration::from_secs(1);
 /// The registration lease.
 pub const SESSION_TTL: Duration = Duration::from_secs(10);
+/// At a stop, how long the jobs that drain the change feed wait for the
+/// others to end before they are stopped too.
+pub const STOP_WRITERS: Duration = Duration::from_secs(10);
 
 /// What a running job sees.
 pub struct JobCtx {
@@ -101,6 +107,12 @@ pub trait JobHandler: Send + Sync + 'static {
     /// Runs the job; `Ok(progress)` succeeds, `Err(reason)` fails. Must
     /// return soon after `cx.cancel` fires.
     async fn run(&self, cx: &JobCtx) -> std::result::Result<Value, String>;
+    /// Whether the job drains the change feed at a graceful stop
+    /// (`sprig_feed::drain`): such jobs are stopped after every other job
+    /// of the worker has ended, so they read past the others' last writes.
+    fn drains(&self) -> bool {
+        false
+    }
 }
 
 /// `noop`: sleeps `spec.sleep_ms` in steps of 100 ms, reporting progress;
@@ -157,6 +169,8 @@ pub struct WorkerRuntime {
     handlers: HashMap<&'static str, Arc<dyn JobHandler>>,
     slots: BTreeMap<JobClass, u32>,
     running: Arc<Mutex<HashSet<JobId>>>,
+    /// The running jobs that drain the change feed at a stop.
+    draining: Arc<Mutex<HashSet<JobId>>>,
 }
 
 impl std::fmt::Debug for WorkerRuntime {
@@ -186,6 +200,7 @@ impl WorkerRuntime {
                 (JobClass::Consumer, dispatch::CONSUMER_SLOTS),
             ]),
             running: Arc::default(),
+            draining: Arc::default(),
         }
     }
 
@@ -250,9 +265,22 @@ impl WorkerRuntime {
                 }
             };
             let term = stop.child_token();
-            let lost = self.serve(&session, &term).await;
+            // The jobs' stops: those that don't drain the change feed, and
+            // those that do.
+            let (writers, drainers) = (CancellationToken::new(), CancellationToken::new());
+            let lost = self.serve(&session, &term, &writers, &drainers).await;
             term.cancel();
-            // Running jobs see `term` and stop; wait for them.
+            writers.cancel();
+            if !lost {
+                // The others end first, so the drains read past their last
+                // writes.
+                let since = tokio::time::Instant::now();
+                while self.running() > self.draining_now() && since.elapsed() < STOP_WRITERS {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+            drainers.cancel();
+            // Running jobs see their tokens and stop; wait for them.
             while self.running() > 0 {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -283,8 +311,23 @@ impl WorkerRuntime {
         Ok(session)
     }
 
-    /// Claims and runs until the session is lost (`true`) or `term` fires.
-    async fn serve(&self, session: &Session, term: &CancellationToken) -> bool {
+    /// Running jobs that drain the change feed at a stop.
+    fn draining_now(&self) -> usize {
+        self.draining
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// Claims and runs until the session is lost (`true`) or `term` fires;
+    /// jobs stop with `writers`, or `drainers` for those that drain.
+    async fn serve(
+        &self,
+        session: &Session,
+        term: &CancellationToken,
+        writers: &CancellationToken,
+        drainers: &CancellationToken,
+    ) -> bool {
         let mut tick = tokio::time::interval(POLL);
         loop {
             tokio::select! {
@@ -314,7 +357,7 @@ impl WorkerRuntime {
                             .contains(&j.job().job_id);
                         if mine && !local {
                             tracing::info!(job = %j.job().job_id, kind = %j.job().kind, "resuming a job this worker owns but isn't running");
-                            self.start(Claimed { job: j }, term.child_token());
+                            self.start(Claimed { job: j }, writers, drainers);
                         }
                     }
                 }
@@ -345,17 +388,30 @@ impl WorkerRuntime {
                         continue;
                     }
                 };
-                self.start(claimed, term.child_token());
+                self.start(claimed, writers, drainers);
             }
         }
     }
 
-    fn start(&self, claimed: Claimed, cancel: CancellationToken) {
+    fn start(&self, claimed: Claimed, writers: &CancellationToken, drainers: &CancellationToken) {
         let job = claimed.job.job().clone();
         let handler = self.handlers.get(job.kind.as_str()).cloned();
+        let drains = handler.as_ref().is_some_and(|h| h.drains());
+        let cancel = if drains {
+            drainers.child_token()
+        } else {
+            writers.child_token()
+        };
         let store = Arc::clone(&self.store);
         let clock = Arc::clone(&self.clock);
         let running = Arc::clone(&self.running);
+        let draining = Arc::clone(&self.draining);
+        if drains {
+            draining
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(job.job_id);
+        }
         running
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -398,6 +454,10 @@ impl WorkerRuntime {
                     }
                 }
             }
+            draining
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&job.job_id);
             running
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)

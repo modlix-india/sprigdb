@@ -34,6 +34,7 @@
 pub mod beat;
 pub mod binlog;
 pub mod decode;
+pub mod drain;
 pub mod event;
 pub mod hlc;
 pub mod local_domains;

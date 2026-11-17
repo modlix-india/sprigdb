@@ -1636,6 +1636,10 @@ impl Clusters for SharedClusters {
     async fn position(&self, cluster: &ClusterId) -> Result<GtidPos> {
         self.feed.shared.inner.position(cluster).await
     }
+
+    async fn drain_position(&self, cluster: &ClusterId) -> Result<GtidPos> {
+        self.feed.shared.inner.drain_position(cluster).await
+    }
 }
 
 #[cfg(test)]

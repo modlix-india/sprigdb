@@ -142,6 +142,9 @@ impl Apply for Mem {
 struct Out {
     acked: Mutex<Option<ResumeToken>>,
     dead: Mutex<Vec<(String, u32)>>,
+    /// The cluster's positions as a stopping runner reads them, one per
+    /// read (the last one stays); empty: not known.
+    positions: Mutex<VecDeque<GtidPos>>,
 }
 
 #[async_trait]
@@ -163,6 +166,15 @@ impl Outcomes for Out {
     }
 
     async fn log(&self, _level: &str, _message: &str) {}
+
+    async fn cluster_position(&self, _cluster: &ClusterId) -> Option<GtidPos> {
+        let mut p = self.positions.lock().unwrap();
+        if p.len() > 1 {
+            p.pop_front()
+        } else {
+            p.front().cloned()
+        }
+    }
 }
 
 fn filter() -> Filter {
@@ -294,10 +306,13 @@ async fn crashes_resume_from_the_checkpoint_without_running_twice() {
             )
             .await
         });
-        // A worker killed at an odd moment: before or after acks.
+        // A worker killed at an odd moment: before or after acks (no
+        // stop, so no drain).
         tokio::time::sleep(Duration::from_millis(7 + round * 13)).await;
-        cancel.cancel();
-        h.await.unwrap().unwrap();
+        h.abort();
+        let _ = h.await;
+        // Its lanes' last applies settle.
+        tokio::time::sleep(Duration::from_millis(50)).await;
         restarts += 1;
         stats_already += stats.already.load(Ordering::Relaxed);
     }
@@ -427,4 +442,205 @@ fn check_failures_become_39863() {
     ));
     assert!(other.code().is_none());
     assert_eq!(binding_of(&subscription_name(42)), Some(42));
+}
+
+/// A feed that hands out one item every `gap`, resumable after a token.
+struct Slow {
+    items: VecDeque<FeedItem>,
+    gap: Duration,
+}
+
+#[async_trait]
+impl Feed for Slow {
+    async fn next(&mut self) -> Result<FeedItem> {
+        tokio::time::sleep(self.gap).await;
+        match self.items.pop_front() {
+            Some(i) => Ok(i),
+            None => std::future::pending().await,
+        }
+    }
+}
+
+fn slow(all: &[FeedItem], after: Option<&ResumeToken>, gap: Duration) -> Slow {
+    Slow {
+        items: script(all, after).items,
+        gap,
+    }
+}
+
+fn pos(seq: u64) -> GtidPos {
+    GtidPos::from_gtids([Gtid {
+        domain: 0,
+        server: 1,
+        seq,
+    }])
+}
+
+/// Runs a life of the binding over `feed` and stops it gracefully after
+/// `stop_after`; its stats.
+async fn life(
+    feed: Box<dyn Feed>,
+    shard: &Arc<Mutex<Shard>>,
+    out: &Arc<Out>,
+    opts: RunOpts,
+    stop_after: Duration,
+) -> Arc<Stats> {
+    let stats = Arc::new(Stats::default());
+    let cancel = CancellationToken::new();
+    let c2 = cancel.clone();
+    let (sh, o, st) = (Arc::clone(shard), Arc::clone(out), Arc::clone(&stats));
+    let h =
+        tokio::spawn(
+            async move { run(feed, &filter(), Arc::new(Mem(sh)), o, &opts, st, &c2).await },
+        );
+    tokio::time::sleep(stop_after).await;
+    cancel.cancel();
+    h.await.unwrap().unwrap();
+    stats
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_reads_on_to_the_clusters_position_and_acknowledges_it_exactly() {
+    // Writes made while stopping (by others) move the cluster from 9 to 12
+    // once the runner reached 9.
+    let all = workload(40);
+    let shard = Arc::new(Mutex::new(Shard::default()));
+    let out = Arc::new(Out::default());
+    out.positions.lock().unwrap().extend([pos(9), pos(12)]);
+    let gap = Duration::from_millis(100);
+    // Stopped after about 4 items (seq 2 or 3); acknowledging once a
+    // second, it had acknowledged nothing yet.
+    let mut o = opts();
+    o.ack_every = Duration::from_secs(1);
+    life(
+        Box::new(slow(&all, None, gap)),
+        &shard,
+        &out,
+        o,
+        gap * 4 + gap / 2,
+    )
+    .await;
+    let acked = out.acked.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        acked.pos,
+        pos(12),
+        "the checkpoint is the cluster's position at the stop"
+    );
+    // Everything before it ran, nothing after it.
+    let ran: BTreeSet<String> = shard
+        .lock()
+        .unwrap()
+        .effects
+        .iter()
+        .map(|(k, _)| k.clone())
+        .collect();
+    let upto = all.iter().position(|i| i.token() == &acked).unwrap();
+    assert_eq!(ran, wanted(&all[..=upto]));
+    // The restart runs the rest, nothing twice and nothing missed: no
+    // marker had to stop a re-delivery.
+    out.positions.lock().unwrap().clear();
+    let st = life(
+        Box::new(script(&all, Some(&acked))),
+        &shard,
+        &out,
+        opts(),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(st.already.load(Ordering::Relaxed), 0);
+    let s = shard.lock().unwrap();
+    let got: BTreeSet<String> = s.effects.iter().map(|(k, _)| k.clone()).collect();
+    assert_eq!(got.len(), s.effects.len(), "an event ran twice");
+    assert_eq!(got, wanted(&all), "an event was lost");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_finishes_the_events_in_flight_before_its_checkpoint() {
+    // Each apply takes 1 ms; at the stop many events are in the lanes.
+    let all = workload(200);
+    let shard = Arc::new(Mutex::new(Shard::default()));
+    let out = Arc::new(Out::default());
+    let mut o = opts();
+    o.ack_every = Duration::from_secs(1);
+    o.lanes = 1;
+    let st = life(
+        Box::new(script(&all, None)),
+        &shard,
+        &out,
+        o,
+        Duration::from_millis(20),
+    )
+    .await;
+    // No position known: it read no more, finished what it had, and
+    // acknowledged past it.
+    let acked = out.acked.lock().unwrap().clone().unwrap();
+    let upto = all.iter().position(|i| i.token() == &acked).unwrap();
+    let ran: BTreeSet<String> = shard
+        .lock()
+        .unwrap()
+        .effects
+        .iter()
+        .map(|(k, _)| k.clone())
+        .collect();
+    assert_eq!(ran, wanted(&all[..=upto]));
+    assert!(st.ran.load(Ordering::Relaxed) > 0);
+    assert_eq!(
+        st.acks.load(Ordering::Relaxed),
+        1,
+        "one acknowledgement, at the stop"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_drain_out_of_time_leaves_the_unfinished_event_after_its_checkpoint() {
+    let all = workload(30);
+    let keys: Vec<String> = wanted(&all).into_iter().collect();
+    // The first wanted event fails until the drain is over.
+    let stuck = keys[0].clone();
+    let shard = Arc::new(Mutex::new(Shard::default()));
+    shard.lock().unwrap().fail.insert(stuck.clone(), 1_000_000);
+    let out = Arc::new(Out::default());
+    out.positions.lock().unwrap().push_back(pos(30));
+    let mut o = opts();
+    o.max_attempts = u32::MAX;
+    let begun = tokio::time::Instant::now();
+    life(
+        Box::new(script(&all, None)),
+        &shard,
+        &out,
+        o,
+        Duration::from_millis(100),
+    )
+    .await;
+    let took = begun.elapsed();
+    assert!(
+        took >= Duration::from_millis(100) + sprig_feed::drain::STOP_DRAIN
+            && took < Duration::from_millis(100) + sprig_feed::drain::STOP_DRAIN * 2,
+        "the drain is bounded: {took:?}"
+    );
+    // The checkpoint lies before the stuck event.
+    let acked = out.acked.lock().unwrap().clone();
+    let stuck_at = all
+        .iter()
+        .position(|i| matches!(i, FeedItem::Event(e) if TriggerEvent::from_change(e).is_some_and(|t| t.key == stuck)))
+        .unwrap();
+    let acked_at = acked
+        .as_ref()
+        .and_then(|a| all.iter().position(|i| i.token() == a));
+    assert!(
+        acked_at.is_none_or(|a| a < stuck_at),
+        "{acked_at:?} >= {stuck_at}"
+    );
+    // The restart runs it, and nothing twice.
+    shard.lock().unwrap().fail.clear();
+    out.positions.lock().unwrap().clear();
+    let feed = match &acked {
+        Some(a) => script(&all, Some(a)),
+        None => script(&all, None),
+    };
+    life(Box::new(feed), &shard, &out, opts(), Duration::from_secs(5)).await;
+    let s = shard.lock().unwrap();
+    let got: BTreeSet<String> = s.effects.iter().map(|(k, _)| k.clone()).collect();
+    assert_eq!(got.len(), s.effects.len(), "an event ran twice");
+    assert_eq!(got, wanted(&all), "an event was lost");
 }

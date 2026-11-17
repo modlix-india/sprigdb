@@ -190,6 +190,15 @@ impl Clusters for RegistryClusters {
             })?;
         p.unwrap_or_default().parse()
     }
+
+    async fn drain_position(&self, cluster: &ClusterId) -> Result<GtidPos> {
+        let mut p = self.position(cluster).await?;
+        // Galera: only the shared domain (see the trait).
+        if let Some(d) = self.access(cluster).await?.domain {
+            p.retain_domains(|x| x == d);
+        }
+        Ok(p)
+    }
 }
 
 /// The tenant catalog's pool, for the feed's name resolver.
@@ -506,6 +515,7 @@ impl LogicTrigger {
             binding_id,
             module_id: module.module_id,
             subs,
+            clusters: Some(Arc::clone(&env.feed)),
         });
         let stats = Arc::new(Stats::default());
         tracing::info!(%tenant, binding = binding_id, job = %cx.job_id, "after-commit trigger started");
@@ -556,6 +566,10 @@ impl LogicTrigger {
                     // Ok(false): the job was lost, and progress() fired the cancel.
                     if let Err(e) = cx.progress(p).await {
                         tracing::warn!(error = %e, "trigger progress not written");
+                    }
+                    // Stopping: the runner drains; nothing new starts.
+                    if cx.cancel.is_cancelled() {
+                        continue;
                     }
                     if last_replay.elapsed() > Duration::from_secs(3) {
                         last_replay = Instant::now();
@@ -628,6 +642,10 @@ async fn purge(env: &LogicEnv, tenant: TenantId, binding_id: u64, store: &LogicS
 impl JobHandler for LogicTrigger {
     fn kind(&self) -> &'static str {
         "logic_trigger"
+    }
+
+    fn drains(&self) -> bool {
+        true
     }
 
     fn class(&self) -> JobClass {

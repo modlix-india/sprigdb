@@ -39,14 +39,16 @@
 //! own writes behind (the append that writes it comes after it), so a
 //! purge right after a stop used to remove an event its restart needed:
 //! the change topic refused to read on, and the stream trigger got
-//! nothing more. The sequencer now saves its exact position at the stop:
-//! the stream trigger and the sink must hold rows 1 to 60 exactly once.
-//! The after-commit trigger acknowledges its position at most every
-//! second and not at a stop, so a write in the worker's last second (any
-//! consumer's) can lie after it; then its history is really purged, and it
-//! alone fails with 39800 while the others read on. Its rows and the
-//! worker's `sprig_feed_history_lost_total` in this round are reported,
-//! not checked.
+//! nothing more. The sequencer now saves its exact position at the stop.
+//! The after-commit trigger acknowledged its position at most every second
+//! and not at a stop, so a write in the worker's last second (any
+//! consumer's) lay after it, the purge removed it, and the trigger alone
+//! failed with 39800. Every consumer that keeps its position in etcd now
+//! drains at a graceful stop (reads on past the cluster's position, then
+//! acknowledges it): the stream trigger, the after-commit trigger and the
+//! sink must hold rows 1 to 60 exactly once, and with
+//! `SPRIG_TEST_FLD_METRICS` the restarted worker must count no history
+//! lost.
 //!
 //! After each round, the trigger tables and the sink must hold every row so
 //! far exactly once (the sink by idempotency key: it is at least once, and
@@ -632,29 +634,23 @@ async fn feed_readers_survive_purged_local_domains() {
             s.sink == exactly(60),
             || format!("{:?}", s.sink),
         );
-        let ac_once = s.ac == exactly(60);
         ck.ok(
-            &format!(
-                "after-commit trigger {when}: rows 1-60 once each, or (its history purged) 1-40"
-            ),
-            ac_once || s.ac == exactly(40),
+            &format!("after-commit trigger {when}: rows 1-60 once each"),
+            s.ac == exactly(60),
             || format!("{:?}", s.ac),
-        );
-        eprintln!(
-            "     after-commit trigger {when}: {}",
-            if ac_once {
-                "every row once"
-            } else {
-                "its position was purged; it alone stopped"
-            }
         );
         let mut after = totals;
         add_metrics(&mut after).await;
-        eprintln!(
-            "     worker in this round: sprig_feed_history_lost_total {}",
-            after.1 - before.1
-        );
-        totals = before;
+        let lost = after.1 - before.1;
+        eprintln!("     worker in this round: sprig_feed_history_lost_total {lost}");
+        if std::env::var("SPRIG_TEST_FLD_METRICS").is_ok() {
+            ck.ok(
+                &format!("worker {when}: no consumer lost history"),
+                lost <= 0.0,
+                || format!("sprig_feed_history_lost_total {lost}"),
+            );
+        }
+        totals = after;
     } else {
         add_metrics(&mut totals).await;
     }

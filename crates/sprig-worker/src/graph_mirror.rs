@@ -28,6 +28,13 @@
 //!       of each served graph, its cluster's position
 //!     every 2 s: the positions as the job's progress (its checkpoint),
 //!       written beside the loop, backing off after failures (Checkpoint)
+//!   a graceful stop drains (sprig_feed::drain): no more position rows
+//!     (each is a write of its own after the position it holds); the
+//!     readers' items are applied on until every cluster's position has
+//!     passed that cluster's (read again once passed, until nothing more
+//!     was written), at most STOP_DRAIN; then the positions are the
+//!     job's progress, so a binlog purge right after the stop takes
+//!     nothing a restart needs
 //! ```
 //!
 //! **No etcd in the loop.** The loop doesn't read etcd: shard maps come
@@ -73,6 +80,7 @@ use sprig_common::names::quote;
 use sprig_common::{CancellationToken, Result, SprigError};
 use sprig_controller::catalogs::{ClusterPools, ShardMapLocator};
 use sprig_controller::dispatch::JobClass;
+use sprig_feed::drain::{STOP_DRAIN, StopDrain};
 use sprig_feed::shared::{IDLE_TICK, Kept, SharedClusters, SharedFeed};
 use sprig_feed::source::{RawRow, RowKind, XaMark};
 use sprig_feed::{Clusters, SourceItem, TxnSource};
@@ -138,6 +146,10 @@ pub struct GraphMirror(pub GraphMirrorEnv);
 impl JobHandler for GraphMirror {
     fn kind(&self) -> &'static str {
         JOB_KIND
+    }
+
+    fn drains(&self) -> bool {
+        true
     }
 
     fn class(&self) -> JobClass {
@@ -436,14 +448,54 @@ impl Applier {
         let mut last_pos_write = Instant::now();
         let mut checkpoint = Checkpoint::new(cx, self.tenant);
         let mut dirty = true;
+        // A graceful stop's drain, per cluster read.
+        let mut drain: Option<Vec<(ClusterId, StopDrain)>> = None;
         let result = loop {
-            if cx.cancel.is_cancelled() {
-                break Err("cancelled".to_owned());
+            if cx.cancel.is_cancelled() && drain.is_none() {
+                let mut d = Vec::new();
+                for c in self.pos.keys() {
+                    d.push((
+                        c.clone(),
+                        StopDrain::begin(self.env.clusters.as_ref(), Some(c), STOP_DRAIN).await,
+                    ));
+                }
+                drain = Some(d);
+            }
+            if let Some(d) = drain.as_mut() {
+                let mut all = true;
+                for (c, s) in d.iter_mut() {
+                    let Some(at) = self.safe_pos(c) else { continue };
+                    if !s.done(self.env.clusters.as_ref(), c, &at).await {
+                        all = false;
+                        break;
+                    }
+                }
+                if all || d.first().is_none_or(|(_, s)| s.expired()) {
+                    // The exact positions as the checkpoint (in etcd: no
+                    // write after them in the binlog).
+                    if checkpoint.settle().await {
+                        let pos: serde_json::Map<String, Value> = self
+                            .pos
+                            .keys()
+                            .filter_map(|c| {
+                                self.safe_pos(c)
+                                    .map(|p| (c.to_string(), Value::String(p.to_string())))
+                            })
+                            .collect();
+                        let p = json!({ "pos": pos, "applied": self.applied, "graphs": self.graphs.len() });
+                        if let Err(e) = cx.progress(p).await {
+                            tracing::warn!(tenant = %self.tenant, error = %e, "graph mirror checkpoint not written at its stop");
+                        }
+                    }
+                    tracing::debug!(tenant = %self.tenant, passed = all, "graph mirror drained at its stop");
+                    break Err("cancelled".to_owned());
+                }
             }
             // The refresh's lookups run beside the loop; the loop takes
             // their answer once it is back (it waits only for the first,
             // before it has readers).
             if self.looking.is_none()
+                && drain.is_none()
                 && last_refresh.is_none_or(|t| t.elapsed() >= Duration::from_secs(2))
             {
                 self.looking = Some(tokio::spawn(look(
@@ -486,7 +538,7 @@ impl Applier {
             tokio::pin!(deadline);
             loop {
                 tokio::select! {
-                    () = cx.cancel.cancelled() => break,
+                    () = cx.cancel.cancelled(), if drain.is_none() => break,
                     () = &mut deadline => break,
                     it = rx.recv() => match it {
                         Some(it) => {
@@ -525,8 +577,9 @@ impl Applier {
                     }
                 }
             }
-            if (dirty && last_pos_write.elapsed() >= Duration::from_millis(50))
-                || last_pos_write.elapsed() >= Duration::from_secs(1)
+            if drain.is_none()
+                && ((dirty && last_pos_write.elapsed() >= Duration::from_millis(50))
+                    || last_pos_write.elapsed() >= Duration::from_secs(1))
             {
                 match self.write_positions().await {
                     Ok(()) => {
@@ -543,7 +596,7 @@ impl Applier {
             if !checkpoint.poll().await {
                 break Err("lost the job".to_owned());
             }
-            if checkpoint.due() {
+            if checkpoint.due() && drain.is_none() {
                 let pos: serde_json::Map<String, Value> = self
                     .pos
                     .keys()
@@ -1102,6 +1155,15 @@ impl<'a> Checkpoint<'a> {
     /// Starts writing `progress`.
     fn start(&mut self, progress: Value) {
         self.inflight = Some(Box::pin(self.cx.progress(progress)));
+    }
+
+    /// Waits for the write in flight; `false` when the job is no longer
+    /// this worker's.
+    async fn settle(&mut self) -> bool {
+        match self.inflight.take() {
+            Some(w) => !matches!(w.await, Ok(false)),
+            None => true,
+        }
     }
 
     /// Looks at the write in flight without waiting for it; `false` when
