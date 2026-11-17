@@ -473,11 +473,8 @@ impl PassSession {
             };
             let step = match dup_table.as_deref() {
                 Some(table) => {
-                    let mut wrapped = super::compat_sink::DupKeySink {
-                        inner: &mut *out,
-                        table,
-                    };
-                    Box::pin(self.tenant_text(
+                    let mut wrapped = super::compat_sink::DupKeySink::new(&mut *out, table);
+                    let r = Box::pin(self.tenant_text(
                         cx,
                         &piece,
                         attrs,
@@ -485,7 +482,19 @@ impl PassSession {
                         RowFormat::Text,
                         &mut wrapped,
                     ))
-                    .await
+                    .await;
+                    // A value that doesn't fit a functional index: MySQL's
+                    // 3752 or 3751 naming the index (exec/mysql_ddl.rs).
+                    match (wrapped.take_held(), r) {
+                        (Some(e), Ok(step)) => {
+                            let e = Box::pin(self.fx_dml_error(cx, &piece, e)).await;
+                            out.error(&e).await.map(|()| Step {
+                                errored: true,
+                                ..step
+                            })
+                        }
+                        (_, r) => r,
+                    }
                 }
                 // 3306: MySQL's integer result types.
                 None if self.persona == Persona::MySql84
@@ -512,6 +521,11 @@ impl PassSession {
                 Ok(s) => s,
                 Err(e) => {
                     summary.db = Some(self.current_logical());
+                    let e = if dup_table.is_some() {
+                        Box::pin(self.fx_dml_error(cx, &piece, e)).await
+                    } else {
+                        e
+                    };
                     return Err(super::compat_sink::map(e, dup_table.as_deref()));
                 }
             };
@@ -559,6 +573,7 @@ impl PassSession {
         out: &mut dyn ResultSink,
     ) -> Result<Step> {
         let (lex, ignore_space) = self.lex_opts();
+        self.wl_text = None;
         let status = |s: StatusFlags| {
             if more {
                 s | StatusFlags::MORE_RESULTS_EXISTS
@@ -583,6 +598,15 @@ impl PassSession {
                 return Ok(step);
             }
         }
+        // `ALTER TABLE` changing columns compiled validations or triggers
+        // read: refused when they would no longer compile, recompiled
+        // after it when only a type changes.
+        if sprig_logic::dependent::is_candidate(&String::from_utf8_lossy(text)) {
+            let s = status(self.status());
+            if let Some(step) = Box::pin(self.tenant_column_change(cx, text, s, out)).await? {
+                return Ok(step);
+            }
+        }
         // Sinks and connections, before anything else
         // reads the text (it may hold credentials).
         if let Some(step) = Box::pin(self.tenant_sinks(cx, text, more, format, out)).await? {
@@ -594,6 +618,10 @@ impl PassSession {
         }
         // `ASK '<question>'`: answered by an assistant, never sent on.
         if let Some(step) = Box::pin(self.tenant_ask(cx, text, more, format, out)).await? {
+            return Ok(step);
+        }
+        // AI functions: answered in the gateway, never sent on.
+        if let Some(step) = Box::pin(self.tenant_ai_fn(cx, text, attrs, more, format, out)).await? {
             return Ok(step);
         }
         // Inherited messaging objects (`FOR EACH TENANT`), before the logic
@@ -613,6 +641,19 @@ impl PassSession {
         {
             let s = status(self.status());
             if let Some(step) = Box::pin(self.tenant_logic_drop(cx, d, s, out)).await? {
+                return Ok(step);
+            }
+        }
+        // `ALTER TRIGGER [db.]name DISABLE | ENABLE` of a trigger on a
+        // stream or queue (MySQL has no ALTER TRIGGER).
+        if self
+            .tenant
+            .as_deref()
+            .is_some_and(|ts| !ts.principal.must_change_password)
+            && let Some(a) = sprig_logic::drop::parse_alter_trigger(&String::from_utf8_lossy(text))
+        {
+            let s = status(self.status());
+            if let Some(step) = Box::pin(self.tenant_logic_toggle(&a, s, out)).await? {
                 return Ok(step);
             }
         }
@@ -1114,6 +1155,7 @@ impl PassSession {
         let text: &Bytes = match self.ps_rewrite(cx, text) {
             None => text,
             Some(Ok(t)) => {
+                self.wl_text = Some(text.to_vec());
                 ps_owned = Bytes::from(t);
                 &ps_owned
             }
@@ -1132,6 +1174,17 @@ impl PassSession {
             }
             Ok(None) => text,
             Err(e) => return self.fail(out, &e).await,
+        };
+        // Storage engines other than InnoDB: an InnoDB table with the
+        // server's warning, or refused (exec/engine.rs).
+        let engine_owned;
+        let text: &Bytes = match self.engine_substitution(text) {
+            super::engine::EngineStep::Run => text,
+            super::engine::EngineStep::Rewritten(t) => {
+                engine_owned = t;
+                &engine_owned
+            }
+            super::engine::EngineStep::Refused(e) => return self.fail(out, &e).await,
         };
         // MySQL's answers to DDL that need a lookup: long names, descending
         // parts of MyISAM tables, a column of a multi-column unique index
@@ -1226,6 +1279,18 @@ impl PassSession {
         } else {
             text
         };
+        // Embedded columns: `GENERATED BY EMBEDDING` in CREATE and ALTER
+        // TABLE, and ALTER TABLE changes to embedded columns
+        // (exec/embed_ddl.rs).
+        if let Some(step) = Box::pin(self.tenant_embed_ddl(cx, text, more, out)).await? {
+            return Ok(step);
+        }
+        // Retrieval indexes: CREATE, DROP and SHOW (exec/retrieval.rs).
+        if let Some(step) =
+            Box::pin(self.tenant_retrieval_ddl(cx, text, attrs, more, format, out)).await?
+        {
+            return Ok(step);
+        }
         // Search DDL and MySQL FULLTEXT DDL.
         if let Some(step) =
             Box::pin(self.tenant_search_ddl(cx, text, attrs, more, format, out)).await?
@@ -1284,6 +1349,12 @@ impl PassSession {
         // GRAPH_TABLE, run and inlined.
         if let Some(step) =
             Box::pin(self.tenant_graph_table(cx, text, attrs, more, format, out)).await?
+        {
+            return Ok(step);
+        }
+        // RETRIEVE() over retrieval indexes, searched and inlined.
+        if let Some(step) =
+            Box::pin(self.tenant_retrieve(cx, text, attrs, more, format, out)).await?
         {
             return Ok(step);
         }
@@ -1730,6 +1801,12 @@ impl PassSession {
         status: StatusFlags,
         out: &mut dyn ResultSink,
     ) -> Result<Route> {
+        // The engine step's warnings (exec/engine.rs), answered with the OK.
+        let mut engine_notes = self
+            .tenant
+            .as_deref_mut()
+            .and_then(|ts| ts.warnings.take())
+            .unwrap_or_default();
         let Some(ts) = self.tenant.as_deref() else {
             return Err(SprigError::internal("no tenant"));
         };
@@ -1813,6 +1890,7 @@ impl PassSession {
             )
         });
         let lctn = ts.lower_case_table_names();
+        let ddl_wait = ts.ddl_wait();
         let map = ts.map();
         let ctl = match svc.locator.ctl_pool(&self.target.cluster).await {
             Ok(p) => p,
@@ -1877,13 +1955,20 @@ impl PassSession {
         }
         // The database's sinks, connections and logic modules
         // go with it once the drop has published.
-        let db_drop = match &stmt {
+        let mut db_drop = match &stmt {
             DdlStatement::DropDatabase { name, .. } => self
                 .tenant
                 .as_deref()
                 .and_then(|ts| super::dropdb::DbDrop::before(ts, name, lctn)),
             _ => None,
         };
+        // Its table groups' shards, which may be on other clusters: read
+        // now, refused while a mover job holds one.
+        if let Some(d) = db_drop.as_mut()
+            && let Err(e) = Box::pin(d.prepare(&svc)).await
+        {
+            return Ok(Route::Done(self.fail(out, &e).await?));
+        }
         let ctl_pool = ctl.clone();
         let undo_pool = ctl.clone();
         let ctl = MariaExecutor::new(ctl);
@@ -1895,6 +1980,7 @@ impl PassSession {
             current_db: current.as_deref(),
             user,
             lower_case_table_names: lctn,
+            wait: ddl_wait,
         };
         // What a DROP removes goes to the authorization
         // engine (routine grants go with the routine; table and database
@@ -1905,7 +1991,7 @@ impl PassSession {
             .map(|ts| crate::tenant::authz::dropped_objects(ts, &stmt, current.as_deref()))
             .unwrap_or_default();
         // The global lookup indexes of the tables a DROP removes go with
-        // them once it succeeded (chapter 19).
+        // them once it succeeded.
         let lookup_owners = self
             .tenant
             .as_deref()
@@ -1987,6 +2073,7 @@ impl PassSession {
                             current_db: current.as_deref(),
                             user,
                             lower_case_table_names: lctn,
+                            wait: ddl_wait,
                         };
                         let exec = GatewayDdl::new(bs, MariaExecutor::new(undo_pool.clone()))
                             .checked_by(undo_pool.clone());
@@ -2060,7 +2147,15 @@ impl PassSession {
         match result {
             Ok(outcome) => {
                 let sinks_version = match (db_drop, outcome.version) {
-                    (Some(d), Some(v)) => Box::pin(d.after(&svc, v)).await,
+                    (Some(d), Some(v)) => {
+                        let a = Box::pin(d.after(&svc, v)).await;
+                        engine_notes.extend(a.warnings.into_iter().map(|message| LocalWarning {
+                            level: "Warning",
+                            code: 1105,
+                            message,
+                        }));
+                        a.version
+                    }
                     _ => None,
                 };
                 if let Some(ts) = self.tenant.as_deref_mut() {
@@ -2068,20 +2163,39 @@ impl PassSession {
                     // so the next statement sees what it saw.
                     ts.changed(outcome.version.or(outcome.seen));
                     ts.changed(sinks_version);
-                    if !outcome.notes.is_empty() || definer_note.is_some() {
+                    if !outcome.notes.is_empty()
+                        || definer_note.is_some()
+                        || !engine_notes.is_empty()
+                    {
                         ts.warnings = Some(
-                            outcome
-                                .notes
+                            engine_notes
                                 .iter()
-                                .map(|n| LocalWarning {
+                                .cloned()
+                                .chain(outcome.notes.iter().map(|n| LocalWarning {
                                     level: "Note",
                                     code: n.code,
                                     message: n.message.clone(),
-                                })
+                                }))
                                 .chain(definer_note.clone())
                                 .collect(),
                         );
                     }
+                }
+                // Stored code over tables with policy views reads those views
+                // from its creation on, whoever calls it first.
+                if outcome.version.is_some()
+                    && matches!(
+                        &stmt,
+                        DdlStatement::CreateObject {
+                            kind: sprig_catalog::store::ObjectKind::View
+                                | sprig_catalog::store::ObjectKind::Procedure
+                                | sprig_catalog::store::ObjectKind::Function
+                                | sprig_catalog::store::ObjectKind::Trigger,
+                            ..
+                        }
+                    )
+                {
+                    Box::pin(self.rls_wire_code()).await;
                 }
                 // Dropping the current database leaves the session without
                 // one, as on MySQL.
@@ -2098,9 +2212,10 @@ impl PassSession {
                 }
                 let mut ok = OkPacket::new(status);
                 ok.affected_rows = outcome.affected_rows;
-                ok.warnings =
-                    u16::try_from(outcome.notes.len() + usize::from(definer_note.is_some()))
-                        .unwrap_or(u16::MAX);
+                ok.warnings = u16::try_from(
+                    engine_notes.len() + outcome.notes.len() + usize::from(definer_note.is_some()),
+                )
+                .unwrap_or(u16::MAX);
                 // An `ALTER TABLE`, `CREATE INDEX` or
                 // `DROP INDEX` reports what the backend did, with its
                 // `Records: R  Duplicates: D  Warnings: W` line, as MariaDB
@@ -2109,7 +2224,11 @@ impl PassSession {
                     && matches!(stmt, DdlStatement::AlterObject { .. })
                 {
                     ok.affected_rows = ok.affected_rows.max(affected);
-                    ok.info = Bytes::from(info);
+                    // The line counts the gateway's own warnings too.
+                    ok.info = Bytes::from(sprig_sql::compat::engine::info_with_warnings(
+                        &info,
+                        engine_notes.len(),
+                    ));
                 }
                 if matches!(stmt, DdlStatement::DropDatabase { .. })
                     && self.current_logical().is_none()
@@ -2236,6 +2355,11 @@ impl PassSession {
         out: &mut dyn ResultSink,
         err: &SprigError,
     ) -> Result<Step> {
+        // The gateway's warnings of a statement that failed (the engine
+        // step's, say) are no answer to the next SHOW WARNINGS.
+        if let Some(ts) = self.tenant.as_deref_mut() {
+            ts.warnings = None;
+        }
         let shown = SprigError {
             kind: err.kind,
             message: err.message.clone(),
@@ -2504,6 +2628,10 @@ impl PassSession {
         let (lex, ignore_space) = self.lex_opts();
         let charset = cx.proto.collation;
         let client_text = sql.clone();
+        // AI functions run only in plain statements.
+        super::ai_fn::refuse_prepared(&sql, lex)?;
+        // So does RETRIEVE().
+        super::retrieval::refuse_prepared(&sql, lex)?;
         // `MATCH ... AGAINST (?)` on a search
         // index is prepared for its metadata without the call, and run as
         // text with the bound values at each execute.
@@ -2516,6 +2644,11 @@ impl PassSession {
                 s.deferred_params = true;
                 s.client = Some(client_text);
             }
+            return Ok(summary);
+        }
+        // A publish into a stream: run as text at each execute, its
+        // values written in, so every record is measured.
+        if let Some(summary) = self.streams_prepare(&sql, charset) {
             return Ok(summary);
         }
         let Some(ts) = self.tenant.as_deref_mut() else {

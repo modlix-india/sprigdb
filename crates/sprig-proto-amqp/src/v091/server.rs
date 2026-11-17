@@ -333,6 +333,12 @@ where
             return Err(e);
         }
     };
+    // The vhost's own limit (its tenant's or database's), else the
+    // listener's.
+    let mut cfg = cfg;
+    if let Some(max) = svc.backend.max_message_bytes(&principal, &vhost_name).await {
+        cfg.max_message_bytes = max;
+    }
     put_method(&mut out, 0, &ConnectionOpenOk::default().into());
     flush(&mut wr, &mut out).await?;
     tracing::debug!(peer = %info.peer, user = %principal.user, vhost = %vhost_name, "AMQP 0-9-1 connection open");

@@ -1,14 +1,13 @@
-//! `information_schema` as schema tools should see typed tables (chapter
-//! 32, "Polymorphic SELECT", the metadata paragraph).
+//! `information_schema` as schema tools should see typed tables.
 //!
 //! In a query of a tenant with types, each reference to
-//! `information_schema.COLUMNS` becomes a derived table of the same name
-//! (or alias): the backend's rows without the subtypes' physical tables and
-//! without the roots' `_type` and `_type_path`, plus, for each subtype, its
-//! logical columns, inherited first, under its own name and with its own
+//! `information_schema.COLUMNS` becomes a derived table of the same name (or
+//! alias): the backend's rows without the subtypes' physical tables and without
+//! the roots' `_type` and `_type_path`, plus, for each subtype, its logical
+//! columns, inherited first, under its own name and with its own
 //! `ORDINAL_POSITION`. `STATISTICS`, `KEY_COLUMN_USAGE`, `TABLE_CONSTRAINTS`
-//! and `REFERENTIAL_CONSTRAINTS` lose the rows of the `_sprig_type_path`
-//! index and the `_sprig_fk_` foreign keys. Chapter 07 then maps each inner
+//! and `REFERENTIAL_CONSTRAINTS` lose the rows of the `_sprig_type_path` index
+//! and the `_sprig_fk_` foreign keys. The name layer then maps each inner
 //! reference as it maps any other, so the persona's shape and the tenant's
 //! restriction apply unchanged.
 //!

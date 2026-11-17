@@ -96,9 +96,18 @@ fn text_spec(def: &IndexDef) -> Document {
         let w = f.boost.round() as i32;
         weights.insert(f.name.clone(), w);
     }
+    let key = def.mongo_text_key().map_or_else(
+        || doc! {"_fts": "text", "_ftsx": 1},
+        |parts| {
+            parts
+                .into_iter()
+                .map(|(k, v)| (k, Bson::try_from(v).unwrap_or(Bson::Int32(1))))
+                .collect()
+        },
+    );
     doc! {
         "v": 2,
-        "key": {"_fts": "text", "_ftsx": 1},
+        "key": key,
         "name": def.name.clone(),
         "weights": weights,
         "default_language": language_of(def),
@@ -471,8 +480,15 @@ impl TextSearch for DocSearch {
                     .unwrap_or_default();
                 let name = spec.get_str("name").map_or_else(
                     |_| {
-                        key.keys()
-                            .map(|k| format!("{k}_text"))
+                        // MongoDB's default name: `title_text_age_1`.
+                        key.iter()
+                            .map(|(k, v)| match v {
+                                Bson::String(s) => format!("{k}_{s}"),
+                                Bson::Int32(i) => format!("{k}_{i}"),
+                                Bson::Int64(i) => format!("{k}_{i}"),
+                                Bson::Double(f) => format!("{k}_{f}"),
+                                other => format!("{k}_{other}"),
+                            })
                             .collect::<Vec<_>>()
                             .join("_")
                     },
@@ -639,8 +655,8 @@ impl TextSearch for DocSearch {
         };
         // The copy's count includes documents hidden from a caller a row
         // policy binds: shown to others only.
-        let shown =
-            execute && !super::visible::needs_visible(def, sql.row_policy_binds(def.object_id));
+        let bound = super::visible::needs_visible(def, sql.row_policy_binds(def.object_id));
+        let shown = execute && !bound;
         let (hits, took) = if shown {
             let started = std::time::Instant::now();
             let (a, _) = s
@@ -662,7 +678,7 @@ impl TextSearch for DocSearch {
         } else {
             (None, None)
         };
-        let v = super::explain::describe(s, t, def, &q, cons, hits, took).await;
+        let v = super::explain::describe(s, t, def, &q, cons, bound, hits, took).await;
         Ok(to_doc(&v))
     }
 
@@ -697,16 +713,26 @@ impl TextSearch for DocSearch {
                 }
                 // `$caseSensitive` and `$diacriticSensitive` are applied by
                 // the engine after the search.
-                let hits = self
-                    .search(
+                let q = parse_mongo_text(text);
+                let mut hits = self
+                    .search(t, &cat, def, q.clone(), None, Consistency::Latest)
+                    .await?;
+                if super::visible::needs_visible(def, sql.row_policy_binds(def.object_id)) {
+                    // The documents the caller reads, scored over themselves.
+                    let keys = visible_ids(sql, def, &hits).await?;
+                    hits = super::visible::rescore(
+                        s,
                         t,
                         &cat,
                         def,
-                        parse_mongo_text(text),
+                        q,
+                        keys,
                         None,
                         Consistency::Latest,
                     )
-                    .await?;
+                    .await
+                    .map_err(|e| mongo(&e))?;
+                }
                 Ok(TextHits {
                     hits: hits
                         .into_iter()
@@ -722,9 +748,40 @@ impl TextSearch for DocSearch {
                 };
                 let q = parse_atlas(&to_json(&spec)).map_err(|e| mongo(&e))?;
                 let max = s.knobs().max_window;
-                let hits = self
-                    .search(t, &cat, def, q.clone(), Some(max), consistency(&spec)?)
-                    .await?;
+                let cons = consistency(&spec)?;
+                let hits =
+                    if super::visible::needs_visible(def, sql.row_policy_binds(def.object_id)) {
+                        // The documents the caller reads, scored over themselves;
+                        // past the window, plain scores (the engine leaves out
+                        // the hidden documents when it reads the hits).
+                        match super::visible::candidates(s, t, &cat, def, q.clone(), cons)
+                            .await
+                            .map_err(|e| mongo(&e))?
+                        {
+                            Some(all) => {
+                                let keys = visible_ids(sql, def, &all).await?;
+                                super::visible::rescore(
+                                    s,
+                                    t,
+                                    &cat,
+                                    def,
+                                    q.clone(),
+                                    keys,
+                                    None,
+                                    cons,
+                                )
+                                .await
+                            }
+                            None => {
+                                super::visible::plain_top(s, t, &cat, def, q.clone(), max, cons)
+                                    .await
+                            }
+                        }
+                        .map_err(|e| mongo(&e))?
+                    } else {
+                        self.search(t, &cat, def, q.clone(), Some(max), cons)
+                            .await?
+                    };
                 let paths: Vec<String> = match spec
                     .get_document("highlight")
                     .ok()

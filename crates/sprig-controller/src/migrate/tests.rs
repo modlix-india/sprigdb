@@ -244,3 +244,90 @@ async fn a_move_without_a_job_goes_back_to_active() {
     assert!(v.migration.is_none());
     assert!(v.last_error.is_some());
 }
+
+/// The default `failover.standby_dcs` gives every tenant a job standby in
+/// another DC, whose `Continuous` job holds the tenant's lock there: a
+/// move into that DC drops the standby first (its job, its standby maps,
+/// its directory record), keeps the `standby` loop out of the target, and
+/// then starts, instead of failing with 39131.
+#[tokio::test]
+async fn a_move_into_the_standby_dc_drops_the_standby_first() {
+    let b = bed().await;
+    let global = TierView::over(&b.store, Tier::Global);
+    let fra1 = TierView::over(&b.store, Tier::Dc(dc("fra1")));
+    let standby = b
+        .fra1
+        .mover_in(&dc("fra1"))
+        .submit(
+            JobSpec::move_tenant(T, ClusterId::new("mum1-c1").unwrap(), b.target.clone())
+                .with_cutover(sprig_mover::CutoverMode::Continuous),
+        )
+        .await
+        .unwrap();
+    let mut sb_map = ShardMap::catalog(T, b.target.clone(), 1);
+    sb_map.role = MapRole::Standby;
+    fra1.txn(Txn {
+        when: vec![],
+        then: vec![Op::Put {
+            key: ShardMap::catalog_key(fra1.tier(), T).unwrap(),
+            value: Record::new(sb_map).encode().unwrap(),
+            lease: None,
+        }],
+        otherwise: vec![],
+    })
+    .await
+    .unwrap();
+    home::update_home(&*global, T, |e| {
+        e.raw.insert(
+            crate::standby::FIELD.into(),
+            json!({"fra1": {"cluster": b.target.as_str(), "source": "mum1-c1",
+                "job": standby.0.to_string(), "created_ms": 1}}),
+        );
+        e.raw.insert("standby_dcs".into(), json!(["fra1"]));
+        Ok(true)
+    })
+    .await
+    .unwrap();
+    // A dry run says so and changes nothing.
+    let mut dry = to("fra1");
+    dry.dry_run = true;
+    let v = b.mum1.start(T, "acme", &dry).await.unwrap();
+    assert_eq!(v.migration.unwrap()["drops_standby"]["dc"], json!("fra1"));
+    let e = home::read_home(&*global, T).await.unwrap().unwrap();
+    assert!(crate::standby::job_standbys(&e.raw).contains_key(&dc("fra1")));
+    // The move.
+    let v = b.mum1.start(T, "acme", &to("fra1")).await.unwrap();
+    assert_eq!(v.state, "migrating");
+    let e = home::read_home(&*global, T).await.unwrap().unwrap();
+    assert!(
+        crate::standby::job_standbys(&e.raw).is_empty(),
+        "{:?}",
+        e.raw
+    );
+    let js = JobStore::new(Arc::clone(&fra1), Arc::new(SystemClock));
+    let (old, _) = js.get(&standby).await.unwrap();
+    assert_eq!(old.state, JobState::RolledBack);
+    // The move's job is the open one, and the standby map is gone.
+    let open = b
+        .fra1
+        .mover_in(&dc("fra1"))
+        .list(&JobFilter {
+            tenant: Some(T),
+            active_only: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(open.len(), 1);
+    assert_ne!(open[0].id, standby);
+    assert!(
+        fra1.get(
+            &ShardMap::catalog_key(fra1.tier(), T).unwrap(),
+            sprig_meta::Consistency::Linearizable
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    // No new standby goes there while the move runs.
+    assert!(b.mum1.decisions.intends(T, &dc("fra1"), b.mum1.now_ms()));
+}

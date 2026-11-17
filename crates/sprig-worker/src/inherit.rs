@@ -22,6 +22,12 @@
 //!     every 1 s, when every feed reported progress with nothing pending:
 //!       record that the copies are caught up
 //!     every hour: purge tombstones older than inherit.copy_tombstone_hours
+//!   a graceful stop drains (sprig_feed::drain): the batch in flight is
+//!     applied, and the feeds are read and applied on until each tenant's
+//!     position has passed its cluster's position (read again once
+//!     passed, until nothing more was written), at most STOP_DRAIN; then
+//!     every position is acknowledged, so a binlog purge right after the
+//!     stop takes nothing a restart needs
 //! ```
 //!
 //! Delivery is at least once: after a crash, a new owner resumes after the
@@ -40,13 +46,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use sprig_binlog::GtidPos;
 use sprig_catalog::cache::{CatalogSource, MariaSource, Node};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::{CatalogExtension, CatalogLocator, TenantCatalog};
-use sprig_common::ids::TenantId;
+use sprig_common::ids::{ClusterId, TenantId};
 use sprig_common::{CancellationToken, Result, SprigCode, SprigError};
 use sprig_controller::catalogs::{ClusterPools, ShardMapLocator};
 use sprig_controller::dispatch::JobClass;
 use sprig_controller::tree::Directory;
+use sprig_feed::drain::{ClusterPosition, STOP_DRAIN, StopDrain};
 use sprig_feed::names::{CatalogPools, CatalogResolver};
 use sprig_feed::subs::Subscriptions;
 use sprig_feed::{
@@ -102,6 +111,27 @@ pub trait Feeds: Send + Sync {
         token: &ResumeToken,
         events: u64,
     ) -> Result<()>;
+
+    /// `cluster`'s binlog position now, which a stopping loop reads on
+    /// past. `None` (the default): not known; the stop then only applies
+    /// the batch in flight.
+    async fn cluster_position(&self, cluster: &ClusterId) -> Option<GtidPos> {
+        let _ = cluster;
+        None
+    }
+}
+
+/// [`Feeds::cluster_position`] as the drain reads it.
+struct FeedsPosition<'a>(&'a dyn Feeds);
+
+#[async_trait]
+impl ClusterPosition for FeedsPosition<'_> {
+    async fn cluster_position(&self, cluster: &ClusterId) -> Result<GtidPos> {
+        self.0
+            .cluster_position(cluster)
+            .await
+            .ok_or_else(|| SprigError::internal(format!("no position of {cluster}")))
+    }
 }
 
 /// What the loop does with the feeds' rows.
@@ -295,7 +325,25 @@ pub async fn serve(
 ) -> Result<ServeStats> {
     let mut stats = ServeStats::default();
     let (tx, mut rx) = mpsc::channel::<Item>(1024);
-    let tails_stop = stop.child_token();
+    // A graceful stop drains: the batch in flight is applied and the
+    // feeds are read on, until `hard`, STOP_DRAIN after the stop.
+    let hard = CancellationToken::new();
+    let _hard = hard.clone().drop_guard();
+    {
+        let (stop, hard) = (stop.clone(), hard.clone());
+        tokio::spawn(async move {
+            tokio::select! {
+                () = stop.cancelled() => {}
+                () = hard.cancelled() => return,
+            }
+            tokio::time::sleep(STOP_DRAIN).await;
+            hard.cancel();
+        });
+    }
+    let mut drains: Option<BTreeMap<TenantId, StopDrain>> = None;
+    let position = FeedsPosition(feeds.as_ref());
+    // The tails read on through the drain.
+    let tails_stop = hard.child_token();
     let _guard = tails_stop.clone().drop_guard();
     let mut open: BTreeSet<TenantId> = BTreeSet::new();
     // Per tenant: the last applied token, events since the last ack.
@@ -308,8 +356,34 @@ pub async fn serve(
     let mut last_purge = tokio::time::Instant::now();
     let mut last_progress = tokio::time::Instant::now();
     let mut need_refresh = true;
-    loop {
-        if need_refresh || last_refresh.elapsed() >= opts.refresh_every {
+    'serve: loop {
+        if stop.is_cancelled() && drains.is_none() {
+            let mut m = BTreeMap::new();
+            for (t, (token, _)) in &applied {
+                m.insert(
+                    *t,
+                    StopDrain::begin(&position, Some(&token.cluster), STOP_DRAIN).await,
+                );
+            }
+            drains = Some(m);
+        }
+        if let Some(m) = drains.as_mut() {
+            let mut all = true;
+            for (t, d) in m.iter_mut() {
+                let Some((token, _)) = applied.get(t) else {
+                    continue;
+                };
+                if !d.done(&position, &token.cluster, &token.pos).await {
+                    all = false;
+                    break;
+                }
+            }
+            if all || hard.is_cancelled() {
+                tracing::debug!(%root, passed = all, "copy worker drained at its stop");
+                break;
+            }
+        }
+        if drains.is_none() && (need_refresh || last_refresh.elapsed() >= opts.refresh_every) {
             let tenants = loop {
                 match apply.refresh().await {
                     Ok(t) => break t,
@@ -338,9 +412,10 @@ pub async fn serve(
             .ack_every
             .min(opts.refresh_every)
             .min(Duration::from_millis(250));
+        let wake = if drains.is_some() { &hard } else { stop };
         tokio::select! {
             biased;
-            () = stop.cancelled() => break,
+            () = wake.cancelled() => continue,
             i = rx.recv() => if let Some(i) = i { batch.push(i) },
             () = tokio::time::sleep(wait) => {}
         }
@@ -427,7 +502,9 @@ pub async fn serve(
                         stats.retries += 1;
                         tracing::warn!(error = %e, attempt, "copy batch failed; applying it again");
                         tokio::select! {
-                            () = stop.cancelled() => return Ok(stats),
+                            // Out of time at a stop: the batch stays after
+                            // the positions.
+                            () = hard.cancelled() => break 'serve,
                             () = tokio::time::sleep(opts.retry) => {}
                         }
                         // The tree may have changed (a dropped share).
@@ -550,6 +627,9 @@ pub struct LiveEnv {
     /// ([`Self::with_feed`]).
     feed: Arc<dyn Clusters>,
     source: MariaSource,
+    /// Catalog changes: a dropped share's row, once the copy worker
+    /// finished its cleanup.
+    catalog: sprig_catalog::MariaCatalog,
 }
 
 impl std::fmt::Debug for LiveEnv {
@@ -576,6 +656,10 @@ impl LiveEnv {
             Arc::new(sprig_inherit::TypesExtension),
         ];
         let source = MariaSource::new(Arc::clone(&locator) as Arc<dyn CatalogLocator>, ext)?;
+        let catalog = sprig_catalog::Versioner::new(
+            sprig_catalog::MariaBackend::new(Arc::clone(&locator) as Arc<dyn CatalogLocator>),
+            Arc::new(sprig_catalog::DirectoryAllocator::new(Arc::clone(&global))),
+        );
         Ok(Self {
             dc,
             global,
@@ -584,12 +668,13 @@ impl LiveEnv {
             feed: Arc::clone(&clusters) as Arc<dyn Clusters>,
             clusters,
             source,
+            catalog,
         })
     }
 
     /// Tails read through `feed`: the worker's shared reader keeping each
     /// tenant whole, one binlog dump per cluster however many trees and
-    /// members (R9, r9feed3).
+    /// members.
     #[must_use]
     pub fn with_feed(mut self, feed: Arc<dyn Clusters>) -> Self {
         self.feed = feed;
@@ -630,8 +715,13 @@ impl CopyEnv for LiveEnv {
             e.retryable = true;
             e
         })?;
-        let pool = self.pools.writer(&cluster).await?;
-        pool.get_conn().await.map_err(|e| {
+        // The copy worker updates the tenant's own rows (overrides it
+        // orphans, references it fills, hierarchy paths), which its
+        // transactions write too: for a tenant on Sprig 2PC's relay path,
+        // through the relay writer.
+        let direct = self.pools.writer(&cluster).await?;
+        let pool = crate::relay_pools::shard_pool(&self.dc, tenant, &cluster, direct).await?;
+        pool.get_conn_bounded().await.map_err(|e| {
             let mut x = SprigError::new(SprigCode::BackendUnavailable, format!("{cluster}: {e}"));
             x.retryable = true;
             x
@@ -640,6 +730,30 @@ impl CopyEnv for LiveEnv {
 
     fn now_ms(&self) -> u64 {
         now_ms()
+    }
+
+    async fn purge_shares(&self, tenant: TenantId, ids: &[u64]) -> Result<()> {
+        let change = sprig_inherit::InheritChange {
+            purge_shares: ids.to_vec(),
+            ..sprig_inherit::InheritChange::default()
+        };
+        let mut c = self
+            .catalog
+            .change(tenant, sprig_catalog::VersionKind::Catalog)
+            .await?;
+        let version = c.version();
+        let applied = {
+            let (store, tx) = c.tx().parts();
+            sprig_inherit::InheritStore::new(store.schema())
+                .apply(tx, &change, version)
+                .await
+        };
+        if let Err(e) = applied {
+            let _ = c.rollback().await;
+            return Err(e);
+        }
+        c.commit().await?;
+        Ok(())
     }
 }
 
@@ -711,6 +825,10 @@ impl Feeds for LiveEnv {
             )
             .await
     }
+
+    async fn cluster_position(&self, cluster: &ClusterId) -> Option<GtidPos> {
+        self.feed.drain_position(cluster).await.ok()
+    }
 }
 
 /// `inherit_copy` (see the module docs).
@@ -732,6 +850,10 @@ fn shared_stats() -> &'static Mutex<HashMap<u64, ServeStats>> {
 impl JobHandler for InheritCopy {
     fn kind(&self) -> &'static str {
         sprig_inherit::subs::JOB_KIND
+    }
+
+    fn drains(&self) -> bool {
+        true
     }
 
     fn class(&self) -> JobClass {

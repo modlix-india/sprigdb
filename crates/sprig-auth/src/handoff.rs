@@ -57,6 +57,7 @@ use zeroize::Zeroizing;
 use crate::accounts::BackendTarget;
 use crate::audit::{self, AuditEvent};
 use crate::mysql::{LoginRequest, LoginService, MysqlLogin, Principal, max_user_len};
+use crate::oidc::{IssuerKind, TokenLogin, TokenProtocol, VerifiedToken};
 use crate::store::AccountLimits;
 
 /// Where a login is decided.
@@ -109,6 +110,46 @@ pub struct HandoffStart {
     pub can_handle_expired_password: bool,
     /// The source DC, for the target's audit event.
     pub source_dc: DcId,
+    /// A token login that names its account (HTTP bearer tokens,
+    /// `MONGODB-OIDC`): the password is the token. Absent for MySQL and
+    /// MariaDB logins, whose token, if any, is the password itself. A
+    /// target from before token hand-offs reads a MySQL login with an
+    /// empty login name, and refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_login: Option<TokenStart>,
+    /// An HTTP API key's check: the password is the whole key. A target
+    /// from before API key hand-offs reads a MySQL login with an empty
+    /// login name, and refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<ApiKeyStart>,
+}
+
+/// A handed-off API key check's request ([`HandoffStart::api_key`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiKeyStart {
+    /// The tenant the key names.
+    pub tenant: String,
+}
+
+/// A handed-off token login's request ([`HandoffStart::token_login`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenStart {
+    /// `http` or `mongodb`.
+    pub protocol: TokenProtocol,
+    /// The tenant's name.
+    pub tenant: String,
+}
+
+impl TokenStart {
+    /// The `protocol` label of the target's metrics and audit events.
+    fn label(&self) -> &'static str {
+        match self.protocol {
+            TokenProtocol::Mongodb => "mongo",
+            TokenProtocol::Redis => "redis",
+            TokenProtocol::Mysql => "mysql",
+            TokenProtocol::Http => "http",
+        }
+    }
 }
 
 impl std::fmt::Debug for HandoffStart {
@@ -160,15 +201,74 @@ impl HandoffStart {
             client_issuer: req.client_dn.as_ref().map(|d| d.issuer.clone()),
             can_handle_expired_password: req.can_handle_expired_password,
             source_dc,
+            token_login: None,
+            api_key: None,
+        }
+    }
+
+    /// The start of a handed-off token login (see [`Self::token_login`]).
+    pub(crate) fn of_token(req: &TokenLogin<'_>, source_dc: DcId) -> Self {
+        Self {
+            persona: "mysql".into(),
+            login_name: Vec::new(),
+            sni: None,
+            client_ip: req.client_ip,
+            tls: req.tls,
+            client_cert: req.client_cert,
+            client_subject: req.client_dn.map(|d| d.subject.clone()),
+            client_issuer: req.client_dn.map(|d| d.issuer.clone()),
+            can_handle_expired_password: false,
+            source_dc,
+            token_login: Some(TokenStart {
+                protocol: req.protocol,
+                tenant: req.tenant.to_owned(),
+            }),
+            api_key: None,
+        }
+    }
+
+    /// The start of a handed-off API key check (see [`Self::api_key`]).
+    pub(crate) fn of_api_key(
+        req: &crate::http::HttpRequest<'_>,
+        tenant: &str,
+        source_dc: DcId,
+    ) -> Self {
+        Self {
+            persona: "mysql".into(),
+            login_name: Vec::new(),
+            sni: None,
+            client_ip: req.client_ip,
+            tls: req.tls,
+            client_cert: req.client_cert,
+            client_subject: req.client_dn.map(|d| d.subject.clone()),
+            client_issuer: req.client_dn.map(|d| d.issuer.clone()),
+            can_handle_expired_password: false,
+            source_dc,
+            token_login: None,
+            api_key: Some(ApiKeyStart {
+                tenant: tenant.to_owned(),
+            }),
+        }
+    }
+
+    /// The client certificate's names, as the request had them.
+    fn client_dn(&self) -> Option<crate::mysql::ClientDn> {
+        match (&self.client_subject, &self.client_issuer) {
+            (Some(subject), Some(issuer)) => Some(crate::mysql::ClientDn {
+                subject: subject.clone(),
+                issuer: issuer.clone(),
+            }),
+            _ => None,
         }
     }
 }
 
 /// The target's decision.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum HandoffResult {
-    /// Accepted: the principal's fields.
-    Accepted(Box<Principal>),
+    /// Accepted: the principal's fields, and the issuer's token the login
+    /// used, as the target verified it (its claims and roles).
+    Accepted(Box<Principal>, Option<Box<VerifiedToken>>),
     /// Refused with this packet.
     Refused(ErrPacket),
 }
@@ -197,6 +297,12 @@ pub async fn serve_handoff(
     start: HandoffStart,
     password: &[u8],
 ) -> HandoffResult {
+    if let Some(t) = &start.token_login {
+        return serve_token_handoff(svc, &start, t, password).await;
+    }
+    if let Some(k) = &start.api_key {
+        return serve_api_key_handoff(svc, &start, k, password).await;
+    }
     let req = start.request();
     if !matches!(svc.route_of(&req, false).await, Route::Local) {
         metrics::counter!("sprig_auth_handoffs_total", "outcome" => "misrouted").increment(1);
@@ -231,7 +337,7 @@ pub async fn serve_handoff(
                 e.tenant_name.clone_from(&p.tenant_name);
                 e.user_id = p.user_id;
                 svc.audit().emit(&e);
-                HandoffResult::Accepted(Box::new(p))
+                HandoffResult::Accepted(Box::new(p), login.token().cloned().map(Box::new))
             }
             None => HandoffResult::Refused(ErrPacket::from_error(
                 Persona::MySql84,
@@ -243,6 +349,138 @@ pub async fn serve_handoff(
             e.reason = login.refusal_reason();
             svc.audit().emit(&e);
             HandoffResult::Refused(p)
+        }
+    }
+}
+
+/// The target side of a token login's hand-off: refused (39301) outside
+/// the tenant's allowed DCs, else an ordinary token login here, whose
+/// verified token goes back with the principal.
+async fn serve_token_handoff(
+    svc: &Arc<LoginService>,
+    start: &HandoffStart,
+    req: &TokenStart,
+    token: &[u8],
+) -> HandoffResult {
+    if !matches!(svc.token_route(&req.tenant).await, Route::Local) {
+        metrics::counter!("sprig_auth_handoffs_total", "outcome" => "misrouted").increment(1);
+        return HandoffResult::Refused(ErrPacket::from_error(
+            Persona::MySql84,
+            &SprigError::new(
+                SprigCode::AuthUnavailable,
+                "this data center isn't allowed to decide the tenant's logins",
+            ),
+        ));
+    }
+    let Ok(token) = std::str::from_utf8(token) else {
+        return HandoffResult::Refused(ErrPacket::access_denied(
+            Persona::MySql84,
+            "",
+            &start.client_ip.to_string(),
+            true,
+        ));
+    };
+    let dn = match (&start.client_subject, &start.client_issuer) {
+        (Some(subject), Some(issuer)) => Some(crate::mysql::ClientDn {
+            subject: subject.clone(),
+            issuer: issuer.clone(),
+        }),
+        _ => None,
+    };
+    let decided = svc
+        .token_login_here(&TokenLogin {
+            protocol: req.protocol,
+            label: req.label(),
+            tenant: &req.tenant,
+            token,
+            client_ip: start.client_ip,
+            tls: start.tls,
+            client_cert: start.client_cert,
+            client_dn: dn.as_ref(),
+        })
+        .await;
+    let mut ev = AuditEvent::new(audit::events::HANDOFF, req.label(), svc.clock().wall());
+    ev.client_ip = Some(start.client_ip);
+    ev.tenant_name = Some(req.tenant.clone());
+    ev.mechanism = Some("jwt");
+    ev.detail = Some(format!("from {}", start.source_dc));
+    match decided {
+        Ok((principal, verified)) => {
+            ev.tenant = principal.tenant;
+            ev.user = Some(principal.user.clone());
+            ev.user_id = principal.user_id;
+            svc.audit().emit(&ev);
+            HandoffResult::Accepted(Box::new(principal), Some(Box::new(verified)))
+        }
+        Err(denied) => {
+            ev.outcome = "refused";
+            ev.reason = Some(denied.reason);
+            svc.audit().emit(&ev);
+            HandoffResult::Refused(denied.error)
+        }
+    }
+}
+
+/// The target side of an API key check's hand-off: refused (39301)
+/// outside the tenant's allowed DCs, else checked here as a request that
+/// arrived here would be (its own `auth.login_*` event and failure
+/// counts), and audited `auth.handoff` with mechanism `api_key`.
+async fn serve_api_key_handoff(
+    svc: &Arc<LoginService>,
+    start: &HandoffStart,
+    req: &ApiKeyStart,
+    key: &[u8],
+) -> HandoffResult {
+    if !matches!(svc.token_route(&req.tenant).await, Route::Local) {
+        metrics::counter!("sprig_auth_handoffs_total", "outcome" => "misrouted").increment(1);
+        return HandoffResult::Refused(ErrPacket::from_error(
+            Persona::MySql84,
+            &SprigError::new(
+                SprigCode::AuthUnavailable,
+                "this data center isn't allowed to decide the tenant's logins",
+            ),
+        ));
+    }
+    let Ok(key) = std::str::from_utf8(key) else {
+        return HandoffResult::Refused(ErrPacket::access_denied(
+            Persona::MySql84,
+            "",
+            &start.client_ip.to_string(),
+            true,
+        ));
+    };
+    let dn = start.client_dn();
+    let http = crate::http::HttpRequest {
+        authorization: None,
+        host: None,
+        sni: None,
+        tenant_header: None,
+        client_ip: start.client_ip,
+        tls: start.tls,
+        client_cert: start.client_cert,
+        client_dn: dn.as_ref(),
+    };
+    let decided = crate::http::HttpAuth::new(Arc::clone(svc))
+        .api_key_here(&http, key)
+        .await;
+    let mut ev = AuditEvent::new(audit::events::HANDOFF, "http", svc.clock().wall());
+    ev.client_ip = Some(start.client_ip);
+    ev.tenant_name = Some(req.tenant.clone());
+    ev.mechanism = Some("api_key");
+    ev.detail = Some(format!("from {}", start.source_dc));
+    match decided {
+        Ok(principal) => {
+            ev.tenant = principal.tenant;
+            ev.user = Some(principal.user.clone());
+            ev.user_id = principal.user_id;
+            svc.audit().emit(&ev);
+            HandoffResult::Accepted(Box::new(principal), None)
+        }
+        Err((reason, e)) => {
+            ev.outcome = "refused";
+            ev.reason = Some(reason);
+            svc.audit().emit(&ev);
+            HandoffResult::Refused(e.error)
         }
     }
 }
@@ -343,7 +581,7 @@ impl RelayLogin {
     /// An accepted principal with this gateway's backend target; a refusal
     /// (39301) when none can be had.
     fn localize(&self, r: HandoffResult) -> HandoffResult {
-        let HandoffResult::Accepted(mut p) = r else {
+        let HandoffResult::Accepted(mut p, token) = r else {
             return r;
         };
         match self.rebackend.as_ref().and_then(|f| f(&p)) {
@@ -363,14 +601,24 @@ impl RelayLogin {
             }
             None => {}
         }
-        HandoffResult::Accepted(p)
+        HandoffResult::Accepted(p, token)
     }
 
     /// The principal, once accepted.
     #[must_use]
     pub fn principal(&self) -> Option<&Principal> {
         match &self.result {
-            Some(HandoffResult::Accepted(p)) => Some(p),
+            Some(HandoffResult::Accepted(p, _)) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// The issuer's token the accepted login used, as the deciding DC
+    /// verified it.
+    #[must_use]
+    pub fn token(&self) -> Option<&VerifiedToken> {
+        match &self.result {
+            Some(HandoffResult::Accepted(_, t)) => t.as_deref(),
             _ => None,
         }
     }
@@ -405,7 +653,7 @@ impl LoginFlow for RelayLogin {
                     let r = self.localize(r);
                     metrics::counter!("sprig_auth_handoffs_total", "outcome" => "decided")
                         .increment(1);
-                    let ok = matches!(r, HandoffResult::Accepted(_));
+                    let ok = matches!(r, HandoffResult::Accepted(..));
                     self.result = Some(r);
                     return ok;
                 }
@@ -422,7 +670,7 @@ impl LoginFlow for RelayLogin {
     async fn decide(&mut self, outcome: Outcome, _path: AuthPath) -> AuthVerdict {
         let persona = self.req.persona;
         match (&self.result, outcome) {
-            (Some(HandoffResult::Accepted(_)), Outcome::Verified) => AuthVerdict::Accept,
+            (Some(HandoffResult::Accepted(..)), Outcome::Verified) => AuthVerdict::Accept,
             (Some(HandoffResult::Refused(p)), _) => AuthVerdict::Refuse(p.clone()),
             (None, Outcome::WrongCredentials | Outcome::Verified)
                 if self.used_password && !self.dcs.is_empty() =>
@@ -501,20 +749,60 @@ impl LoginService {
     /// Starts one MySQL login, routed by the tenant's residency: decided
     /// here, relayed to an allowed DC, or refused.
     pub async fn begin(self: &Arc<Self>, req: LoginRequest) -> ResidentLogin {
-        self.begin_as(req, false).await
+        self.begin_as(req, Begin::Mysql).await
     }
 
-    /// [`Self::begin`] for an HTTP login.
+    /// [`Self::begin`] for an HTTP login, and for the other front ends
+    /// whose client sends its password (Redis `AUTH`, AMQP `PLAIN`, Bolt).
     pub async fn begin_http(self: &Arc<Self>, req: LoginRequest) -> ResidentLogin {
-        self.begin_as(req, true).await
+        self.begin_as(req, Begin::Http).await
     }
 
-    async fn begin_as(self: &Arc<Self>, req: LoginRequest, http: bool) -> ResidentLogin {
-        match self.route_of(&req, http).await {
-            Route::Local => ResidentLogin::Local(Box::new(if http {
-                self.start_http(req).await
-            } else {
-                self.start(req).await
+    /// [`Self::begin`] for a Kafka `SASL/PLAIN` login.
+    pub async fn begin_kafka(self: &Arc<Self>, req: LoginRequest) -> ResidentLogin {
+        self.begin_as(req, Begin::Kafka).await
+    }
+
+    /// For an exchange that can't be handed to another DC (SCRAM, whose
+    /// verifier the client proves itself against, and a certificate
+    /// login without a password): `None` when this DC decides the login;
+    /// else its refusal, without loading anything of the tenant's
+    /// credentials: 39302 with `deny_remote_access`, otherwise 39301
+    /// naming the DCs that decide (the client connects to a gateway there,
+    /// or uses a mechanism that sends its password or token).
+    pub async fn local_only(&self, req: &LoginRequest, mechanism: &str) -> Option<SprigError> {
+        match self.route_of(req, true).await {
+            Route::Local => None,
+            Route::Deny => {
+                metrics::counter!("sprig_auth_handoffs_total", "outcome" => "denied").increment(1);
+                Some(SprigError::new(
+                    SprigCode::RemoteAccessDenied,
+                    "ER_SPRIG_REMOTE_ACCESS_DENIED: this tenant can't be reached from this data center",
+                ))
+            }
+            Route::HandOff(dcs) => {
+                metrics::counter!("sprig_auth_handoffs_total", "outcome" => "not_relayable")
+                    .increment(1);
+                let names: Vec<String> = dcs.iter().map(ToString::to_string).collect();
+                Some(SprigError::new(
+                    SprigCode::AuthUnavailable,
+                    format!(
+                        "ER_SPRIG_AUTH_UNAVAILABLE: this tenant's logins are decided in {}, and \
+                         {mechanism} can't be handed to another data center: connect to a gateway \
+                         there, or use a mechanism that sends the password or a token",
+                        names.join(", ")
+                    ),
+                ))
+            }
+        }
+    }
+
+    async fn begin_as(self: &Arc<Self>, req: LoginRequest, kind: Begin) -> ResidentLogin {
+        match self.route_of(&req, kind != Begin::Mysql).await {
+            Route::Local => ResidentLogin::Local(Box::new(match kind {
+                Begin::Mysql => self.start(req).await,
+                Begin::Http => self.start_http(req).await,
+                Begin::Kafka => self.start_kafka(req).await,
             })),
             Route::Deny => {
                 metrics::counter!("sprig_auth_handoffs_total", "outcome" => "denied").increment(1);
@@ -536,6 +824,15 @@ impl LoginService {
             }
         }
     }
+}
+
+/// The front end a resident login starts for (its user name limit, and
+/// the `protocol` of a login decided here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Begin {
+    Mysql,
+    Http,
+    Kafka,
 }
 
 /// A login refused because the tenant's residency denies remote access
@@ -590,6 +887,18 @@ impl ResidentLogin {
         }
     }
 
+    /// The issuer's token the accepted login used (its claims are the
+    /// session's `SPRIG_CLAIM()` values, and give its token roles), whether
+    /// decided here or in the DC it was handed to.
+    #[must_use]
+    pub fn token(&self) -> Option<&VerifiedToken> {
+        match self {
+            Self::Local(l) => l.token(),
+            Self::Relay(r) => r.token(),
+            Self::Deny(_) => None,
+        }
+    }
+
     /// The local login, if decided here (its file account, its refusal
     /// reason).
     #[must_use]
@@ -606,6 +915,27 @@ impl ResidentLogin {
         match self {
             Self::Local(l) => l.check_clear_fast(password),
             _ => false,
+        }
+    }
+
+    /// A login decided here may take an issuer's token as its password on
+    /// `protocol` ([`MysqlLogin::allow_tokens`]); a handed-off one is
+    /// decided as the target's MySQL login, token included.
+    pub fn allow_tokens(&mut self, protocol: TokenProtocol) {
+        if let Self::Local(l) = self {
+            l.allow_tokens(protocol);
+        }
+    }
+
+    /// Why the login was refused, for the front ends that say so: the
+    /// local login's reason, `remote_access_denied` for 39302, none for a
+    /// handed-off login (the deciding DC's audit has it).
+    #[must_use]
+    pub fn refusal_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Local(l) => l.refusal_reason(),
+            Self::Relay(_) => None,
+            Self::Deny(_) => Some("remote_access_denied"),
         }
     }
 }
@@ -685,6 +1015,77 @@ pub struct PrincipalWire {
     pub backend_user: String,
     /// The backend credential's reference.
     pub backend_credentials: String,
+    /// The issuer's token the login used, as the deciding DC verified it.
+    /// A target from before token hand-offs sends none: the session then
+    /// has no claims and no token roles, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<TokenWire>,
+}
+
+/// A verified token on the wire: what the deciding DC verified, for the
+/// source's session (`SPRIG_CLAIM()` and token roles). The source can't
+/// verify it again (the tenant's issuers and their keys stay in its
+/// allowed DCs' logins), so it takes it, like the principal, from the
+/// mutually authenticated peer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenWire {
+    /// The issuer's id.
+    pub issuer_id: u32,
+    /// `iss`.
+    pub issuer: String,
+    /// OIDC provider or end-user layer.
+    pub kind: IssuerKind,
+    /// Whether the issuer creates mapped accounts.
+    pub jit_users: bool,
+    /// Every verified claim, as JSON text.
+    pub claims: String,
+    /// The account its user mapping named.
+    pub user: Option<String>,
+    /// The roles its role mappings gave at the deciding DC.
+    pub roles: Vec<String>,
+    /// `exp`, in seconds since the Unix epoch.
+    pub expires: u64,
+}
+
+impl TokenWire {
+    /// The wire form of `t`.
+    #[must_use]
+    pub fn of(t: &VerifiedToken) -> Self {
+        Self {
+            issuer_id: t.issuer_id,
+            issuer: t.issuer.clone(),
+            kind: t.kind,
+            jit_users: t.jit_users,
+            claims: t.claims.to_string(),
+            user: t.user.clone(),
+            roles: t.roles.clone(),
+            expires: t
+                .expires
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+        }
+    }
+
+    /// The token.
+    ///
+    /// # Errors
+    /// Internal when the claims aren't a JSON object.
+    pub fn token(&self) -> Result<VerifiedToken> {
+        let claims: serde_json::Value = serde_json::from_str(&self.claims)
+            .ok()
+            .filter(serde_json::Value::is_object)
+            .ok_or_else(|| SprigError::internal("handoff token: claims aren't an object"))?;
+        Ok(VerifiedToken {
+            issuer_id: self.issuer_id,
+            issuer: self.issuer.clone(),
+            kind: self.kind,
+            jit_users: self.jit_users,
+            claims: Arc::new(claims),
+            user: self.user.clone(),
+            roles: self.roles.clone(),
+            expires: std::time::UNIX_EPOCH + std::time::Duration::from_secs(self.expires),
+        })
+    }
 }
 
 impl PrincipalWire {
@@ -712,7 +1113,26 @@ impl PrincipalWire {
                 sprig_provision::credentials::SecretSource::Resolved(_) => UNRESOLVED.to_owned(),
                 _ => p.backend.credentials.to_string(),
             },
+            token: None,
         }
+    }
+
+    /// The wire form of an accepted hand-off: the principal and the
+    /// token it used.
+    #[must_use]
+    pub fn accepted(p: &Principal, token: Option<&VerifiedToken>) -> Self {
+        Self {
+            token: token.map(TokenWire::of),
+            ..Self::of(p)
+        }
+    }
+
+    /// The token, if one crossed.
+    ///
+    /// # Errors
+    /// Internal for malformed claims.
+    pub fn verified_token(&self) -> Result<Option<VerifiedToken>> {
+        self.token.as_ref().map(TokenWire::token).transpose()
     }
 
     /// The principal.

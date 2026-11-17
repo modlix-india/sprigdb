@@ -166,6 +166,13 @@ pub enum Record {
         /// The document.
         doc: Json,
     },
+    /// A key-value hash: its key and fields (names and values as text).
+    Hash {
+        /// The key.
+        key: Key,
+        /// The fields.
+        fields: Vec<(String, String)>,
+    },
 }
 
 impl Record {
@@ -173,7 +180,7 @@ impl Record {
     #[must_use]
     pub fn key(&self) -> &Key {
         match self {
-            Self::Row { key, .. } | Self::Doc { key, .. } => key,
+            Self::Row { key, .. } | Self::Doc { key, .. } | Self::Hash { key, .. } => key,
         }
     }
 }
@@ -292,6 +299,9 @@ impl IndexSchema {
     /// document isn't indexed, only its old version deleted).
     #[must_use]
     pub fn extract(&self, r: &Record) -> Option<TantivyDocument> {
+        if !self.def.covers_key(&r.key().0) {
+            return None;
+        }
         let mut d = TantivyDocument::new();
         d.add_bytes(self.key, &r.key().0);
         let mut any = false;
@@ -301,6 +311,16 @@ impl IndexSchema {
             };
             let mut vals = Vec::new();
             match r {
+                // A hash's fields feed only hash-field fields, and a
+                // string key's value only value fields.
+                Record::Hash { fields, .. } => {
+                    if f.source == Source::KvField
+                        && let Some((_, v)) = fields.iter().find(|(n, _)| *n == f.source_ref)
+                    {
+                        vals.extend(f.split_value(v).into_iter().map(Val::Str));
+                    }
+                }
+                Record::Doc { .. } if f.source == Source::KvField => {}
                 Record::Row { columns, .. } => {
                     if let Some((_, v)) = columns
                         .iter()
@@ -347,6 +367,7 @@ impl IndexSchema {
                         }
                     }
                 }
+                Record::Hash { fields, .. } => vals.extend(fields.iter().map(|(_, v)| v.clone())),
             }
             for v in vals {
                 d.add_text(allf, &v);

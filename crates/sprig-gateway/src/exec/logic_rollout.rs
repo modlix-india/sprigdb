@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use sprig_catalog::CatalogLocator;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_logic::rollout::{self, Acc, Rollout};
 
 use super::PassSession;
@@ -93,6 +94,120 @@ fn call_target(text: &[u8]) -> Option<(Option<String>, String)> {
     }
 }
 
+/// Argument `i` of a `CALL`'s text as the wrapper's key reads it
+/// (`COALESCE(CAST(... AS CHAR), '')`), when it is a literal: a number, a
+/// quoted string, or `NULL` (the empty text). `None` for anything else.
+fn call_arg(text: &[u8], i: usize) -> Option<String> {
+    let s = std::str::from_utf8(text).ok()?;
+    let open = s.find('(')?;
+    let mut args: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut depth = 0usize;
+    let mut chars = s[open + 1..].chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), '\\') => {
+                cur.push(c);
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+                let _ = q;
+            }
+            (Some(q), c) if c == q => {
+                cur.push(c);
+                if chars.peek() == Some(&q) {
+                    cur.push(q);
+                    chars.next();
+                } else {
+                    quote = None;
+                }
+            }
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                cur.push(c);
+            }
+            (None, '(') => {
+                depth += 1;
+                cur.push(c);
+            }
+            (None, ')') if depth == 0 => {
+                args.push(std::mem::take(&mut cur));
+                break;
+            }
+            (None, ')') => {
+                depth -= 1;
+                cur.push(c);
+            }
+            (None, ',') if depth == 0 => args.push(std::mem::take(&mut cur)),
+            (_, c) => cur.push(c),
+        }
+    }
+    let a = args.get(i)?.trim();
+    if a.eq_ignore_ascii_case("null") {
+        return Some(String::new());
+    }
+    if let Some(inner) = a
+        .strip_prefix('\'')
+        .and_then(|x| x.strip_suffix('\''))
+        .or_else(|| a.strip_prefix('"').and_then(|x| x.strip_suffix('"')))
+    {
+        let mut out = String::new();
+        let mut it = inner.chars().peekable();
+        while let Some(c) = it.next() {
+            match c {
+                '\\' => {
+                    if let Some(n) = it.next() {
+                        out.push(match n {
+                            'n' => '\n',
+                            't' => '\t',
+                            '0' => '\0',
+                            other => other,
+                        });
+                    }
+                }
+                '\'' | '"' if it.peek() == Some(&c) => {
+                    out.push(c);
+                    it.next();
+                }
+                c => out.push(c),
+            }
+        }
+        return Some(out);
+    }
+    // A whole number, as MariaDB writes it back.
+    a.parse::<i64>().ok().map(|n| n.to_string())
+}
+
+/// Ends a trigger's rollout (a trigger on a stream or queue): in the
+/// catalog only, both versions' routines stay.
+async fn abort_trigger_rollout(
+    pool: &mysql_async::Pool,
+    schema: &str,
+    module: u64,
+    name: &str,
+    catalog_version: u64,
+) -> sprig_common::Result<Vec<String>> {
+    let mut conn = pool.get_conn_bounded().await.map_err(|e| {
+        sprig_common::SprigError::new(
+            sprig_common::SprigCode::CatalogUnavailable,
+            "catalog unreachable",
+        )
+        .with_source(e)
+    })?;
+    sprig_logic::messages::rollout_change(
+        &mut conn,
+        schema,
+        module,
+        name,
+        rollout::RolloutOp::Abort,
+        catalog_version,
+        "SprigDB",
+    )
+    .await
+    .map(|n| vec![n])
+}
+
 impl PassSession {
     /// The tenant's rollouts, from the cache or the catalog.
     async fn rollouts(&mut self) -> Arc<Vec<Entry>> {
@@ -109,7 +224,7 @@ impl PassSession {
         let svc = Arc::clone(ts.services());
         let loaded = async {
             let ep = svc.locator.writer(tenant).await.ok()?;
-            let mut conn = ep.pool.get_conn().await.ok()?;
+            let mut conn = ep.pool.get_conn_bounded().await.ok()?;
             rollout::all(&mut conn, ep.store.schema()).await.ok()
         }
         .await;
@@ -153,8 +268,20 @@ impl PassSession {
         let name = name.to_ascii_lowercase();
         let e = list.iter().find(|e| e.db_id == db_id && e.name == name)?;
         let account = sprig_auth::authz::backend::account(ts.tenant, ts.principal.user_id?);
-        let cand =
-            rollout::picks_candidate(e.rollout.spec(), &account, ts.tenant.0, e.rollout.module_id);
+        let cand = match e.rollout.by {
+            // The wrapper reads the argument; counted when the call gives
+            // it as a literal.
+            rollout::RolloutBy::Key(Some(i)) => {
+                let arg = call_arg(original, usize::from(i))?;
+                rollout::bucket(&arg, e.rollout.module_id) < u32::from(e.rollout.pct)
+            }
+            _ => rollout::picks_candidate(
+                e.rollout.spec(),
+                &account,
+                ts.tenant.0,
+                e.rollout.module_id,
+            ),
+        };
         Some((
             e.rollout.module_id,
             if cand {
@@ -216,7 +343,7 @@ impl PassSession {
         let tenant = ts.tenant;
         let catalog = ts.catalog().cloned();
         let ep = svc.locator.writer(tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(|e| {
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
             sprig_common::SprigError::new(
                 sprig_common::SprigCode::CatalogUnavailable,
                 "catalog unreachable",
@@ -230,6 +357,10 @@ impl PassSession {
         modules.sort_unstable();
         modules.dedup();
         let store = sprig_logic::LogicStore::new(&schema);
+        // The candidates to roll back, read first: the abort is a deploy,
+        // which takes catalog connections from the same pool (4 per
+        // cluster), so this one isn't held across it.
+        let mut aborts = Vec::new();
         for m in modules {
             let Some(r) = rollout::get(&mut conn, &schema, m).await? else {
                 continue;
@@ -245,6 +376,10 @@ impl PassSession {
             let Some(module) = store.module_by_id(&mut conn, m).await? else {
                 continue;
             };
+            aborts.push((m, r, why, module));
+        }
+        drop(conn);
+        for (m, r, why, module) in aborts {
             let Some(db) = catalog
                 .as_ref()
                 .and_then(|c| c.databases.get(sprig_common::ids::DbId(module.db_id)))
@@ -260,9 +395,14 @@ impl PassSession {
             );
             tracing::warn!(module = m, candidate = r.candidate_version, %why, "logic rollout: rolling back the candidate");
             let owner = sprig_common::ids::UserId(module.created_by);
-            let done =
+            let done = if module.kind == "trigger" {
+                let version = catalog.as_ref().map_or(0, |c| c.version);
+                abort_trigger_rollout(&ep.pool, &schema, m, &module.name, version).await
+            } else {
                 Box::pin(self.logic_deploy_with(cx, &Bytes::from(text.into_bytes()), Some(owner)))
-                    .await;
+                    .await
+            };
+            super::msg_trigger::forget_rollout(tenant.0, m);
             invalidate(tenant.0);
             let (level, msg) = match &done {
                 Ok(_) => (
@@ -281,16 +421,18 @@ impl PassSession {
                     ),
                 ),
             };
-            let _ = store
-                .log(
-                    &mut conn,
-                    m,
-                    Some(r.candidate_version),
-                    level,
-                    "deploy",
-                    &msg,
-                )
-                .await;
+            if let Ok(mut conn) = ep.pool.get_conn_bounded().await {
+                let _ = store
+                    .log(
+                        &mut conn,
+                        m,
+                        Some(r.candidate_version),
+                        level,
+                        "deploy",
+                        &msg,
+                    )
+                    .await;
+            }
         }
         Ok(())
     }
@@ -314,5 +456,18 @@ mod tests {
         assert_eq!(call_target(b"CALL quote"), Some((None, "quote".into())));
         assert_eq!(call_target(b"SELECT 1"), None);
         assert_eq!(call_target(b"CALLX f()"), None);
+    }
+
+    #[test]
+    fn call_arguments_as_keys() {
+        let t = b"CALL shop.quote(7, 'cust''o', f(1, 2), NULL, \"a,b\", @v)";
+        assert_eq!(call_arg(t, 0), Some("7".into()));
+        assert_eq!(call_arg(t, 1), Some("cust'o".into()));
+        assert_eq!(call_arg(t, 2), None);
+        assert_eq!(call_arg(t, 3), Some(String::new()));
+        assert_eq!(call_arg(t, 4), Some("a,b".into()));
+        assert_eq!(call_arg(t, 5), None);
+        assert_eq!(call_arg(t, 6), None);
+        assert_eq!(call_arg(b"CALL q(  -42 )", 0), Some("-42".into()));
     }
 }

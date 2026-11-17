@@ -23,6 +23,13 @@
 //!   6. DataFusion over the streams: joins on keys, GROUP BY keys, aggregates in
 //!      exact integer and DECIMAL arithmetic, windows, ORDER BY keys, LIMIT
 //!   7. the rows rendered as MariaDB prints those types, then sent
+//!   an aggregating statement with HAVING or expressions over its aggregates
+//!   (translate.rs's Finish): steps 2–7 compute its groups and aggregates
+//!   only; then, on a scratch connection, a temporary table made like their
+//!   answer (CREATE TEMPORARY TABLE … AS <groups and aggregates> LIMIT 0 over
+//!   empty copies) takes those rows, and MariaDB runs the rest of the
+//!   statement over it: every value the client sees is still computed by
+//!   MariaDB; the answer's column types must equal the statement's own
 //! ```
 //!
 //! The answer is buffered (charged to `router.max_statement_memory_mb`) so
@@ -793,6 +800,8 @@ fn qi(id: &str) -> String {
 struct Probe {
     answer: Vec<ColumnDef>,
     scans: Vec<Vec<ColumnDef>>,
+    /// The plan's own answer when MariaDB finishes the statement.
+    inner: Option<Vec<ColumnDef>>,
 }
 
 async fn probe(
@@ -822,6 +831,17 @@ async fn probe(
             Err(e) => return Err(e),
         };
         while scratch.next_row().await?.is_some() {}
+        let inner = match &q.finish {
+            Some(fin) => match scratch.start(&fin.inner).await {
+                Ok(Some(c)) => {
+                    while scratch.next_row().await?.is_some() {}
+                    Some(c)
+                }
+                Ok(None) => return Ok(Err("the groups' statement answers with OK".into())),
+                Err(e) => return Ok(Err(format!("the groups' statement: {}", e.message))),
+            },
+            None => None,
+        };
         let mut scans = Vec::new();
         for (i, s) in q.scans.iter().enumerate() {
             let t = &p.tables[s.table];
@@ -845,7 +865,11 @@ async fn probe(
                 ShardOutcome::Ok(_) => return Ok(Err("a scan answered with OK".into())),
             }
         }
-        Ok(Ok(Probe { answer, scans }))
+        Ok(Ok(Probe {
+            answer,
+            scans,
+            inner,
+        }))
     }
     .await;
     let clean = if created.is_empty() {
@@ -1169,7 +1193,10 @@ async fn execute_inner<'a, 'b: 'a, 'c: 'a>(
             schema: Arc::new(Schema::new(fields)),
         }));
     }
-    let (df_sql, out) = match datafusion_sql(&query, &layouts, &pr.answer) {
+    // The plan computes the statement's answer, or (finished by MariaDB)
+    // its groups and aggregates.
+    let computed = pr.inner.as_deref().unwrap_or(&pr.answer);
+    let (df_sql, out) = match datafusion_sql(&query, &layouts, computed) {
         Ok(x) => x,
         Err(why) => return refused(why),
     };
@@ -1243,10 +1270,20 @@ async fn execute_inner<'a, 'b: 'a, 'c: 'a>(
         .iter()
         .map(datafusion::arrow::array::RecordBatch::num_rows)
         .sum();
-    let rows = match sprig_common::cpu::heavy(n, || render(&batches, &out, budget)) {
+    let mut rows = match sprig_common::cpu::heavy(n, || render(&batches, &out, budget)) {
         Ok(r) => r,
         Err(why) => return refused(why),
     };
+    let mut warnings = 0;
+    if let Some(fin) = &query.finish {
+        match finish(p, fin, &ddls, &rows, computed, &pr.answer, be, budget).await? {
+            Ok((r, w)) => {
+                rows = r;
+                warnings = w;
+            }
+            Err(why) => return refused(why),
+        }
+    }
     metrics::histogram!("sprig_router_datafusion_duration_seconds")
         .record(started.elapsed().as_secs_f64());
     metrics::counter!("sprig_router_analytics_total", "result" => "done").increment(1);
@@ -1256,14 +1293,164 @@ async fn execute_inner<'a, 'b: 'a, 'c: 'a>(
         for r in &rows {
             sink.row(r).await?;
         }
-        return Ok(Outcome::Done(Output::Streamed { warnings: 0 }));
+        return Ok(Outcome::Done(Output::Streamed { warnings }));
     }
     Ok(Outcome::Done(Output::Rows {
         columns,
         rows,
-        warnings: 0,
+        warnings,
     }))
 }
 
+/// A value of a column of type `ty` as an SQL literal: numbers as
+/// printed, anything else as its bytes (`CAST(X'…' AS BINARY)`: a string
+/// MariaDB converts as it converts text, never a hexadecimal number), so
+/// no character set or escaping applies on the way back in.
+fn literal(ty: u8, v: Option<&Bytes>) -> String {
+    let Some(b) = v else {
+        return "NULL".to_owned();
+    };
+    let numeric = matches!(
+        ty,
+        ct::DECIMAL
+            | ct::NEWDECIMAL
+            | ct::TINY
+            | ct::SHORT
+            | ct::LONG
+            | ct::LONGLONG
+            | ct::INT24
+            | ct::YEAR
+    );
+    if numeric && !b.is_empty() && b.iter().all(|c| c.is_ascii_digit() || b"-+.eE".contains(c)) {
+        return String::from_utf8_lossy(b).into_owned();
+    }
+    let mut out = String::with_capacity(20 + 2 * b.len());
+    out.push_str("CAST(X'");
+    for c in b {
+        let _ = write!(out, "{c:02X}");
+    }
+    out.push_str("' AS BINARY)");
+    out
+}
+
+/// The rows of one `INSERT` of the finishing step, at most this many bytes.
+const FINISH_INSERT_BYTES: usize = 1 << 20;
+
+/// MariaDB's finishing step (`fin`): the plan's `rows` (typed as
+/// `computed`) go into a temporary table made like the groups' own answer,
+/// and the statement's outer part runs over it. Returns the answer's rows
+/// and warnings, or why it can't be used (the statement is then gathered):
+/// a MariaDB error, or column types other than the statement's own
+/// (`answer`).
+#[allow(clippy::too_many_arguments)]
+async fn finish(
+    p: &GatherPlan,
+    fin: &translate::Finish,
+    ddls: &[String],
+    rows: &[Row],
+    computed: &[ColumnDef],
+    answer: &[ColumnDef],
+    be: &mut dyn ShardBackend,
+    budget: &mut Budget,
+) -> Result<std::result::Result<(Vec<Row>, u16), String>> {
+    let Some(mut scratch) = be.open_scratch().await? else {
+        return Ok(Err("no scratch connection".into()));
+    };
+    let mut created: Vec<String> = Vec::new();
+    let r = async {
+        for (t, ddl) in p.tables.iter().zip(ddls) {
+            let Some(create) = temp_ddl(ddl, &t.schema, &t.name) else {
+                return Ok(Err(format!("{}: no temporary copy", t.name)));
+            };
+            match scratch.run(&create, budget).await {
+                Ok(_) => created.push(format!("{}.{}", qi(&t.schema), qi(&t.name))),
+                Err(e) => return Ok(Err(format!("{}: {}", t.name, e.message))),
+            }
+        }
+        let make = format!(
+            "CREATE TEMPORARY TABLE {} AS {} LIMIT 0",
+            fin.table, fin.inner
+        );
+        if let Err(e) = scratch.run(&make, budget).await {
+            return Ok(Err(format!("the finishing table: {}", e.message)));
+        }
+        created.push(fin.table.clone());
+        let mut values = String::new();
+        let flush = |values: &mut String| {
+            format!(
+                "INSERT INTO {} VALUES {}",
+                fin.table,
+                std::mem::take(values)
+            )
+        };
+        for row in rows {
+            if row.len() != computed.len() {
+                return Ok(Err("a row of the plan doesn't match its columns".into()));
+            }
+            if !values.is_empty() {
+                values.push_str(", ");
+            }
+            values.push('(');
+            for (i, (v, c)) in row.iter().zip(computed).enumerate() {
+                if i > 0 {
+                    values.push_str(", ");
+                }
+                values.push_str(&literal(c.col_type, v.as_ref()));
+            }
+            values.push(')');
+            if values.len() >= FINISH_INSERT_BYTES {
+                let sql = flush(&mut values);
+                if let Err(e) = scratch.run(&sql, budget).await {
+                    return Ok(Err(format!("the finishing rows: {}", e.message)));
+                }
+            }
+        }
+        if !values.is_empty() {
+            let sql = flush(&mut values);
+            if let Err(e) = scratch.run(&sql, budget).await {
+                return Ok(Err(format!("the finishing rows: {}", e.message)));
+            }
+        }
+        let cols = match scratch.start(&fin.outer).await {
+            Ok(Some(c)) => c,
+            Ok(None) => return Ok(Err("the finishing statement answers with OK".into())),
+            Err(e) => return Ok(Err(format!("the finishing statement: {}", e.message))),
+        };
+        let mut out = Vec::new();
+        while let Some(row) = scratch.next_row().await? {
+            let n: u64 = row
+                .iter()
+                .map(|v| v.as_ref().map_or(1, |b| b.len() as u64 + 1))
+                .sum();
+            budget.charge(n)?;
+            out.push(row);
+        }
+        let warnings = scratch.warnings();
+        let same = cols.len() == answer.len()
+            && cols
+                .iter()
+                .zip(answer)
+                .all(|(a, b)| a.col_type == b.col_type && a.decimals == b.decimals);
+        if !same {
+            return Ok(Err(
+                "the finished answer's column types differ from the statement's".into(),
+            ));
+        }
+        Ok(Ok((out, warnings)))
+    }
+    .await;
+    let clean = if created.is_empty() {
+        true
+    } else {
+        let drop = format!("DROP TEMPORARY TABLE IF EXISTS {}", created.join(", "));
+        let mut b = Budget::mb(1);
+        scratch.run(&drop, &mut b).await.is_ok()
+    };
+    scratch.finish(clean && r.is_ok()).await;
+    r
+}
+
+#[cfg(test)]
+mod live_tests;
 #[cfg(test)]
 mod tests;

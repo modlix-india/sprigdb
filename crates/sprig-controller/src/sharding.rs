@@ -16,6 +16,8 @@
 mod graphs;
 mod lookups;
 mod ops;
+mod orphanage;
+mod periodic;
 mod rekey;
 pub use graphs::{GraphIndexRow, GraphPartition, GraphRow, GraphShardRow, GraphView};
 pub use ops::{GroupView, ManualJob, ShardRow, design_from_json};
@@ -35,6 +37,7 @@ use sprig_balancer::shards::{
     self, Admission, Backoff, GroupStat, Proposal, Reason, RunningJob, ShardJob, ShardStat,
     ShardingMode, ShardingSettings, Weight,
 };
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::{ClusterId, DbId, GroupId, JobId, ShardId, TenantId};
 use sprig_common::names::SchemaName;
 use sprig_common::{CancellationToken, Result, SprigError};
@@ -71,6 +74,9 @@ pub struct TenantSettings {
     pub lookup: sprig_shard::lookup::settings::LookupSettings,
     /// `advisor.lookup_*`: the advisor's lookup proposals.
     pub lookup_advice: sprig_advisor::sharding::settings::LookupAdvice,
+    /// `advisor.interval_hours`, `advisor.rekey_*` and
+    /// `migration.auto_size_limit_gb`: the periodic run's re-keys.
+    pub rekey: sprig_advisor::sharding::settings::RekeyAdvice,
 }
 
 impl Default for TenantSettings {
@@ -85,6 +91,7 @@ impl Default for TenantSettings {
             chunk_rows: m.copy_chunk_rows,
             lookup: sprig_shard::lookup::settings::LookupSettings::default(),
             lookup_advice: sprig_advisor::sharding::settings::LookupAdvice::default(),
+            rekey: sprig_advisor::sharding::settings::RekeyAdvice::default(),
         }
     }
 }
@@ -98,6 +105,17 @@ pub trait SettingsSource: Send + Sync {
     /// database scope). The default is the tenant's value.
     fn min_shards(&self, tenant: TenantId, _db: DbId) -> u32 {
         self.settings(tenant).sharding.min_shards
+    }
+
+    /// `lookup.lock_wait_seconds` at owner table `object`'s scope (in
+    /// database `db`). The default is the tenant's value.
+    fn lookup_lock_wait(
+        &self,
+        tenant: TenantId,
+        _db: DbId,
+        _object: sprig_common::ids::ObjectId,
+    ) -> u64 {
+        self.settings(tenant).lookup.lock_wait_seconds
     }
 }
 
@@ -177,6 +195,10 @@ struct TenantState {
     last_run: Option<Instant>,
     /// Waits already logged, by subject and blocker.
     logged_waits: BTreeSet<(String, &'static str)>,
+    /// When the next periodic run is due (`advisor.interval_hours`).
+    next_periodic: Option<Instant>,
+    /// A periodic run's re-key held for approval.
+    pending_rekey: Option<periodic::PendingRekey>,
 }
 
 /// A `group_members` row: object, routing, key columns, parent, parent FK.
@@ -212,6 +234,9 @@ pub struct ShardingLoop {
     pub approvals: std::sync::OnceLock<Arc<crate::approvals::ControllerApprovals>>,
     /// When each tenant's workload was last read for lookup proposals.
     lookup_runs: Mutex<HashMap<TenantId, Instant>>,
+    /// Each table group's largest shard against its split size, for the
+    /// administration agent's metric history.
+    pub ai_sizes: crate::ai_health::ShardSizes,
 }
 
 impl std::fmt::Debug for ShardingLoop {
@@ -273,6 +298,7 @@ impl ShardingLoop {
             published: Mutex::new(BTreeSet::new()),
             approvals: std::sync::OnceLock::new(),
             lookup_runs: Mutex::new(HashMap::new()),
+            ai_sizes: crate::ai_health::ShardSizes::default(),
         }
     }
 
@@ -478,7 +504,34 @@ impl ShardingLoop {
 
     async fn conn(&self, cluster: &ClusterId) -> Result<Conn> {
         let pool = self.pools.pool(cluster).await?;
-        pool.get_conn().await.map_err(|e| {
+        pool.get_conn_bounded().await.map_err(|e| {
+            SprigError::new(sprig_common::SprigCode::BackendUnavailable, e.to_string())
+        })
+    }
+
+    /// The `sprig_ctl` pool for writes of `tenant`'s rows on `cluster`:
+    /// for a tenant on Sprig 2PC's relay path, through the cluster's
+    /// relay writer, so the relay fence ends these connections with the
+    /// tenant's own (`sprig_cluster::failover::relay_pools`).
+    ///
+    /// # Errors
+    /// Retryable 39030 while such a cluster has no ready relay writer.
+    async fn tenant_pool(&self, tenant: TenantId, cluster: &ClusterId) -> Result<Pool> {
+        let direct = self.pools.pool(cluster).await?;
+        sprig_cluster::failover::relay_pools::tenant_pool(
+            self.maps.store(),
+            tenant,
+            cluster,
+            direct,
+            sprig_txn::fence::wire::preamble,
+        )
+        .await
+    }
+
+    /// A connection from [`Self::tenant_pool`].
+    async fn tenant_conn(&self, tenant: TenantId, cluster: &ClusterId) -> Result<Conn> {
+        let pool = self.tenant_pool(tenant, cluster).await?;
+        pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(sprig_common::SprigCode::BackendUnavailable, e.to_string())
         })
     }
@@ -512,7 +565,8 @@ impl ShardingLoop {
                 format!(
                     "SELECT group_id, state, min_shards, \
                      TIMESTAMPDIFF(MICROSECOND, '1970-01-01', created_at) DIV 1000 \
-                     FROM `{cat}`.table_groups WHERE kind = 'sharded' ORDER BY group_id"
+                     FROM `{cat}`.table_groups WHERE kind = 'sharded' AND state <> 'retired' \
+                     ORDER BY group_id"
                 ),
             )
             .await
@@ -536,6 +590,10 @@ impl ShardingLoop {
             r?;
             return Ok(report);
         }
+        // The tick's own connection goes back before the steps below: the
+        // re-key follow-up and each group's tick take their own from the
+        // same pool, and a task holding one mustn't wait for another.
+        drop(c);
         // Groups applied before this loop started (or by an older binary)
         // are published once, so every gateway routes them.
         if let Some(p) = &self.publish
@@ -554,6 +612,17 @@ impl ShardingLoop {
         self.jobs
             .unlock_tenant(tenant, &Self::advisor_holder(tenant))
             .await?;
+        // The advisor's periodic run, once every group is active; a re-key
+        // it starts leaves the groups' splits and merges for the next tick.
+        if groups.iter().all(|g| g.1 == "active") {
+            match self.periodic(tenant, &ts, &home, &mut report).await {
+                Ok(true) => return Ok(report),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(tenant = %tenant, error = %e, "advisor periodic run failed");
+                }
+            }
+        }
         for (g, state, min_shards, created_ms) in groups {
             if state != "active" {
                 continue;
@@ -570,12 +639,17 @@ impl ShardingLoop {
             .await?;
         }
         // Global lookup indexes: stopped builds, and the advisor's
-        // proposals for reads that scatter by a unique column. The tick's
-        // own connection goes back first: the jobs take their own from
-        // the loop's small pools.
-        drop(c);
+        // proposals for reads that scatter by a unique column (the jobs
+        // take their own connections from the loop's small pools).
         if let Err(e) = self.lookup_tick(tenant, &home, &ts).await {
             tracing::warn!(tenant = %tenant, error = %e, "lookup indexes: the tick failed");
+        }
+        // Rows waiting in the orphanage whose parent has come.
+        if let Err(e) = self
+            .orphanage_tick(tenant, &home, ts.lookup.publish_timeout)
+            .await
+        {
+            tracing::warn!(tenant = %tenant, error = %e, "orphanage sweep failed");
         }
         Ok(report)
     }
@@ -1126,6 +1200,12 @@ impl ShardingLoop {
                 busy: r.state == RangeState::Held || busy_shards.contains(&r.shard.0),
             });
         }
+        self.ai_sizes.record(
+            tenant,
+            group.0,
+            stats.iter().map(|s| s.size_bytes).fold(0.0, f64::max),
+            ts.sharding.split_bytes,
+        );
         let gs = GroupStat {
             tenant,
             group: group.0,

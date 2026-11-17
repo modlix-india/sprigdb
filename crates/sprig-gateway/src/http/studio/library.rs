@@ -27,6 +27,7 @@
 //! - **Left behind.** A dropped user's rows stay until the tenant is
 //!   dropped; they are never shown to a new user (ids aren't reused).
 
+use sprig_catalog::pool_wait::Bounded as _;
 use std::sync::Arc;
 
 use hyper::Request;
@@ -425,7 +426,7 @@ async fn context(core: &Arc<Core>, caller: &Caller) -> Result<Ctx, SprigError> {
         return Err(invalid("saved queries need a tenant login"));
     };
     let ep = sprig_catalog::CatalogLocator::writer(&*svc.locator, tid).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(unavailable)?;
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(unavailable)?;
     let schema = ep.store.schema().to_owned();
     let have: Option<u64> = conn
         .exec_first(
@@ -440,7 +441,7 @@ async fn context(core: &Arc<Core>, caller: &Caller) -> Result<Ctx, SprigError> {
             name: MODULE,
             migrations: LIBRARY_MIGRATIONS,
         }])?
-        .run(&mut conn, &schema, &MigrateOpts::default())
+        .run(&mut conn, &schema, &MigrateOpts::existing())
         .await?;
     }
     let history_max = core

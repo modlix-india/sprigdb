@@ -908,6 +908,23 @@ pub struct LiteralBinder<'a> {
     pub no_backslash_escapes: bool,
 }
 
+/// A claim or user attribute (any JSON value) as the SQL literal the
+/// rewrite binds: the text MariaDB's policy views and triggers read from
+/// the session's context (`JSON_VALUE`, or `JSON_QUERY` for an array or
+/// object), so both decide alike. A boolean is `'1'` or `'0'`, a number
+/// its JSON text, an array or object its compact JSON; never a bare number
+/// or `TRUE`, which would compare with a string column as a number.
+#[must_use]
+pub fn json_literal(v: &serde_json::Value, no_backslash_escapes: bool) -> String {
+    match v {
+        serde_json::Value::Null => "NULL".to_owned(),
+        serde_json::Value::Bool(b) => if *b { "'1'" } else { "'0'" }.to_owned(),
+        serde_json::Value::Number(n) => format!("'{n}'"),
+        serde_json::Value::String(s) => super::text::sql_string(s, no_backslash_escapes),
+        other => super::text::sql_string(&other.to_string(), no_backslash_escapes),
+    }
+}
+
 fn id_list(ids: &[u64]) -> String {
     if ids.is_empty() {
         return "NULL".to_owned();
@@ -922,12 +939,14 @@ impl Binder for LiteralBinder<'_> {
     fn value(&self, func: &str, arg: Option<&str>) -> Result<String, SprigError> {
         Ok(match func {
             "CURRENT_USER" => super::text::sql_string(self.current_user, self.no_backslash_escapes),
-            "SPRIG_USER_ID" => self.user_id.to_string(),
-            "SPRIG_TENANT_ID" => self.tenant_id.to_string(),
-            "SPRIG_HOME_TENANT_ID" => self.home_tenant_id.to_string(),
+            // Ids as text, as MariaDB's policy views and triggers read
+            // them from the context (`JSON_VALUE`).
+            "SPRIG_USER_ID" => format!("'{}'", self.user_id),
+            "SPRIG_TENANT_ID" => format!("'{}'", self.tenant_id),
+            "SPRIG_HOME_TENANT_ID" => format!("'{}'", self.home_tenant_id),
             "SPRIG_SESSION_SPACE" => self
                 .space
-                .map_or_else(|| "NULL".to_owned(), |s| s.to_string()),
+                .map_or_else(|| "NULL".to_owned(), |s| format!("'{s}'")),
             "SPRIG_CLAIM" => (self.claim)(arg.unwrap_or_default()).unwrap_or_else(|| "NULL".into()),
             "SPRIG_USER_ATTR" => {
                 (self.attr)(arg.unwrap_or_default()).unwrap_or_else(|| "NULL".into())
@@ -951,6 +970,93 @@ impl Binder for LiteralBinder<'_> {
             ids.ok_or_else(|| invalid(format!("{func}() isn't available on this gateway yet")))?;
         Ok(("(".to_owned(), format!(" IN ({}))", id_list(ids))))
     }
+}
+
+/// Binds the session functions a statement calls itself (`SELECT
+/// SPRIG_CLAIM('org')`, `UPDATE ... WHERE owner = SPRIG_CLAIM('sub')`) as
+/// [`render`] binds them in a policy: each call becomes the binder's text.
+/// `None` when the statement calls none.
+///
+/// It works on tokens: a name in a string, a comment or backquotes, and a
+/// qualified call (`db.SPRIG_CLAIM(...)`, a stored function's), are left
+/// alone. `CURRENT_USER` is MariaDB's own. A membership test keeps its
+/// argument (`SPRIG_TENANT_IN_SUBTREE(t.tenant)` → `(t.tenant IN (...))`).
+///
+/// # Errors
+/// 39364 for a keyed function whose key isn't one string literal, a
+/// constant function given arguments, an unbalanced call, or a function
+/// the binder can't bind.
+pub fn bind_statement(
+    text: &str,
+    lex_opts: &LexOptions,
+    binder: &dyn Binder,
+) -> Result<Option<String>, SprigError> {
+    let all = lex::lex(text.as_bytes(), lex_opts).map_err(|_| invalid("too long"))?;
+    let toks = Toks::new(text.as_bytes(), &all);
+    let mut edits = Vec::new();
+    let mut i = 0;
+    while i < toks.toks.len() {
+        let t = toks.toks[i];
+        if t.kind != TokenKind::Word || !toks.punct(i + 1, "(") || (i > 0 && toks.punct(i - 1, "."))
+        {
+            i += 1;
+            continue;
+        }
+        let name = String::from_utf8_lossy(t.bytes(toks.src)).to_ascii_uppercase();
+        if name == "CURRENT_USER" || !SESSION_FUNCTIONS.contains(&name.as_str()) {
+            i += 1;
+            continue;
+        }
+        let close = toks
+            .matching(i + 1)
+            .ok_or_else(|| invalid(format!("{name}( has no closing parenthesis")))?;
+        if MEMBERSHIP.contains(&name.as_str()) {
+            if close == i + 2 {
+                return Err(invalid(format!("{name}() takes a tenant id")));
+            }
+            let (pre, post) = binder.membership(&name)?;
+            edits.push(Edit {
+                start: toks.start(i),
+                end: toks.end(i + 1),
+                with: pre,
+            });
+            edits.push(Edit {
+                start: toks.start(close),
+                end: toks.end(close),
+                with: post,
+            });
+            // The argument may call session functions too.
+            i += 2;
+            continue;
+        }
+        let arg = if KEYED.contains(&name.as_str()) {
+            let key = match toks.toks.get(i + 2) {
+                Some(s) if s.kind == TokenKind::String && close == i + 3 => {
+                    lex::string_value(s.bytes(toks.src), lex_opts.no_backslash_escapes)
+                        .map(|v| String::from_utf8_lossy(&v).into_owned())
+                }
+                _ => None,
+            };
+            Some(key.ok_or_else(|| invalid(format!("{name}()'s key must be one string")))?)
+        } else {
+            if close != i + 2 {
+                return Err(invalid(format!("{name}() takes no arguments")));
+            }
+            None
+        };
+        edits.push(Edit {
+            start: toks.start(i),
+            end: toks.end(close),
+            with: binder.value(&name, arg.as_deref())?,
+        });
+        i = close + 1;
+    }
+    if edits.is_empty() {
+        return Ok(None);
+    }
+    apply(text, &edits)
+        .map(Some)
+        .map_err(|_| invalid("overlapping edits"))
 }
 
 /// Parses `text` as one expression the way [`render`] reads it (for the
@@ -1117,6 +1223,20 @@ mod tests {
             "(`t`.org IN (42, 43)) AND `t`.u = 'alice@%'"
         );
         assert!(r("SPRIG_TENANT_MANAGED(org)").is_err());
+        // Ids are text, as MariaDB's side reads them.
+        assert_eq!(
+            r("o = SPRIG_USER_ID() AND t = SPRIG_TENANT_ID()").unwrap(),
+            "`t`.o = '7' AND `t`.t = '42'"
+        );
+        assert_eq!(json_literal(&serde_json::json!(true), false), "'1'");
+        assert_eq!(json_literal(&serde_json::json!(false), false), "'0'");
+        assert_eq!(json_literal(&serde_json::json!(7), false), "'7'");
+        assert_eq!(json_literal(&serde_json::json!(1.5), false), "'1.5'");
+        assert_eq!(json_literal(&serde_json::json!(null), false), "NULL");
+        assert_eq!(
+            json_literal(&serde_json::json!(["a", "b"]), false),
+            "'[\"a\",\"b\"]'"
+        );
         // Above rls.inline_subtree_max, the subtree table.
         let t = LiteralBinder {
             subtree: None,
@@ -1135,5 +1255,68 @@ mod tests {
             .unwrap(),
             "(`t`.org IN (SELECT `descendant` FROM `__sprig_sys`.`__sprig_subtree_v`)) OR (`t`.org IN (NULL))"
         );
+    }
+    #[test]
+    fn a_statement_binds_its_own_session_functions() {
+        let claim = |k: &str| (k == "org").then(|| "'o-7'".to_owned());
+        let attr = |k: &str| (k == "team").then(|| "'red'".to_owned());
+        let b = LiteralBinder {
+            current_user: "app@%",
+            user_id: 9,
+            tenant_id: 42,
+            home_tenant_id: 42,
+            space: None,
+            claim: &claim,
+            attr: &attr,
+            subtree: Some(&[42, 43]),
+            managed: Some(&[]),
+            subtree_table: false,
+            managed_table: false,
+            no_backslash_escapes: false,
+        };
+        let o = lexo();
+        let bind = |s: &str| bind_statement(s, &o, &b);
+        assert_eq!(
+            bind("SELECT SPRIG_CLAIM('org'), sprig_claim('missing')")
+                .unwrap()
+                .as_deref(),
+            Some("SELECT 'o-7', NULL")
+        );
+        assert_eq!(
+            bind("UPDATE d SET x = 1 WHERE team = SPRIG_USER_ATTR ( 'team' ) AND t = SPRIG_TENANT_ID()")
+                .unwrap()
+                .as_deref(),
+            Some("UPDATE d SET x = 1 WHERE team = 'red' AND t = '42'")
+        );
+        assert_eq!(
+            bind("SELECT * FROM t WHERE SPRIG_TENANT_IN_SUBTREE(t.tenant) AND u = SPRIG_USER_ID()")
+                .unwrap()
+                .as_deref(),
+            Some("SELECT * FROM t WHERE (t.tenant IN (42, 43)) AND u = '9'")
+        );
+        // Strings, comments, backquotes, qualified calls and CURRENT_USER
+        // stay.
+        for s in [
+            "SELECT 'SPRIG_CLAIM(1)' /* SPRIG_CLAIM('x') */",
+            "SELECT `SPRIG_CLAIM` FROM t",
+            "SELECT db.SPRIG_CLAIM('org')",
+            "SELECT CURRENT_USER()",
+        ] {
+            assert_eq!(bind(s).unwrap(), None, "{s}");
+        }
+        // A key that isn't one string, arguments where none are taken.
+        for s in [
+            "SELECT SPRIG_CLAIM(col)",
+            "SELECT SPRIG_CLAIM('a', 'b')",
+            "SELECT SPRIG_TENANT_ID(1)",
+            "SELECT SPRIG_TENANT_IN_SUBTREE()",
+            "SELECT SPRIG_CLAIM('a'",
+        ] {
+            assert_eq!(
+                bind(s).unwrap_err().code(),
+                Some(SprigCode::RlsPolicyInvalid),
+                "{s}"
+            );
+        }
     }
 }

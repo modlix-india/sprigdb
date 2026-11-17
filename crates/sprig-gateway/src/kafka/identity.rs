@@ -14,6 +14,11 @@
 //!   a verifier, or an unknown one, gets a decoy salt (stable per name) and
 //!   fails at the proof, so probes can't tell them apart.
 //!
+//! Residency: a tenant pinned to other DCs has PLAIN logins handed to an
+//! allowed DC (as HTTP Basic); SCRAM can't be (the client proves itself
+//! against the verifier), so it is refused there with 39301 naming the
+//! DCs, or 39302 with `deny_remote_access`, without loading the verifier.
+//!
 //! Accounts whose password was set before SCRAM verifiers were stored get
 //! them at their next successful PLAIN login (or MySQL full or HTTP Basic
 //! login): the upgrade on login. Logins are labelled `kafka` in
@@ -22,7 +27,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sprig_auth::mysql::{LoginRequest, LoginService, MysqlLogin, Principal as AuthPrincipal};
+use sprig_auth::handoff::ResidentLogin;
+use sprig_auth::mysql::{LoginRequest, LoginService, Principal as AuthPrincipal};
 use sprig_auth::scram::{DEFAULT_SCRAM_ITERATIONS, ScramKind};
 use sprig_proto_kafka::broker::{AuthFailure, ConnInfo, Identity, ScramFinish, ScramLookup};
 use sprig_proto_kafka::sasl::{PlainCredentials, ScramCredential, ScramMechanism};
@@ -55,22 +61,20 @@ impl KafkaIdentity {
         Self { svc, decoy_secret }
     }
 
-    async fn start(&self, c: &ConnInfo, user: &str) -> MysqlLogin {
-        self.svc
-            .start_kafka(LoginRequest {
-                persona: Persona::MySql84,
-                login_name: user.as_bytes().to_vec(),
-                sni: c.sni.clone(),
-                client_ip: c.peer.ip(),
-                tls: c.tls,
-                client_cert: c.client_cert,
-                client_dn: c
-                    .client_dn
-                    .clone()
-                    .map(|(subject, issuer)| sprig_auth::mysql::ClientDn { subject, issuer }),
-                can_handle_expired_password: false,
-            })
-            .await
+    fn request(c: &ConnInfo, user: &str) -> LoginRequest {
+        LoginRequest {
+            persona: Persona::MySql84,
+            login_name: user.as_bytes().to_vec(),
+            sni: c.sni.clone(),
+            client_ip: c.peer.ip(),
+            tls: c.tls,
+            client_cert: c.client_cert,
+            client_dn: c
+                .client_dn
+                .clone()
+                .map(|(subject, issuer)| sprig_auth::mysql::ClientDn { subject, issuer }),
+            can_handle_expired_password: false,
+        }
     }
 }
 
@@ -85,7 +89,7 @@ fn principal(p: &AuthPrincipal) -> Principal {
     }
 }
 
-fn refused(login: &MysqlLogin, verdict: &AuthVerdict) -> AuthFailure {
+fn refused(login: &ResidentLogin, verdict: &AuthVerdict) -> AuthFailure {
     let reason = login.refusal_reason().unwrap_or("bad_credentials");
     let text = match verdict {
         AuthVerdict::Refuse(p) => p.message.clone(),
@@ -95,7 +99,7 @@ fn refused(login: &MysqlLogin, verdict: &AuthVerdict) -> AuthFailure {
 }
 
 async fn decide(
-    mut login: MysqlLogin,
+    mut login: ResidentLogin,
     outcome: Outcome,
     path: AuthPath,
 ) -> Result<Principal, AuthFailure> {
@@ -115,7 +119,8 @@ impl Identity for KafkaIdentity {
         if let Err(e) = self.svc.admit(c.peer.ip()) {
             return Err(AuthFailure(format!("Authentication failed: {e}")));
         }
-        let mut login = self.start(c, &creds.user).await;
+        // Decided here, handed to an allowed DC, or refused (residency).
+        let mut login = self.svc.begin_kafka(Self::request(c, &creds.user)).await;
         let (outcome, path) = if login.check_clear_fast(&creds.password) {
             (Outcome::Verified, AuthPath::Fast)
         } else if login
@@ -131,13 +136,24 @@ impl Identity for KafkaIdentity {
 
     async fn scram(&self, c: &ConnInfo, mech: ScramMechanism, user: &str) -> ScramLookup {
         let admitted = self.svc.admit(c.peer.ip()).is_ok();
-        let login = self.start(c, user).await;
+        let req = Self::request(c, user);
         let kind = match mech {
             ScramMechanism::Sha256 => ScramKind::Sha256,
             ScramMechanism::Sha512 => ScramKind::Sha512,
         };
+        // A tenant pinned to other DCs: nothing of its verifier is loaded
+        // here; the exchange runs on a decoy and ends with the refusal.
+        let name = match mech {
+            ScramMechanism::Sha256 => "SCRAM-SHA-256",
+            ScramMechanism::Sha512 => "SCRAM-SHA-512",
+        };
+        let (login, refusal) = match self.svc.local_only(&req, name).await {
+            None => (Some(self.svc.start_kafka(req).await), None),
+            Some(e) => (None, Some(e.to_string())),
+        };
         let real = login
-            .scram_credential(kind)
+            .as_ref()
+            .and_then(|l| l.scram_credential(kind))
             .filter(|_| admitted)
             .map(|(v, secondary)| ScramCredential {
                 mechanism: mech,
@@ -155,6 +171,7 @@ impl Identity for KafkaIdentity {
             credential,
             finish: Box::new(ScramEnd {
                 login,
+                refusal,
                 real: real.is_some(),
                 admitted,
             }),
@@ -163,7 +180,9 @@ impl Identity for KafkaIdentity {
 }
 
 struct ScramEnd {
-    login: MysqlLogin,
+    /// `None` when residency refused the login before it started.
+    login: Option<sprig_auth::mysql::MysqlLogin>,
+    refusal: Option<String>,
     real: bool,
     admitted: bool,
 }
@@ -176,15 +195,25 @@ impl ScramFinish for ScramEnd {
                 "Authentication failed: too many failed logins from this address".into(),
             ));
         }
+        let Some(mut login) = self.login else {
+            return Err(AuthFailure(format!(
+                "Authentication failed: {}",
+                self.refusal.unwrap_or_default()
+            )));
+        };
         let outcome = if verified && self.real {
             Outcome::Verified
         } else {
             Outcome::WrongCredentials
         };
-        let mut login = self.login;
         // The client sent a proof of a password: a refusal says "using
         // password: YES", not the MySQL login's default "NO".
         login.proof_presented();
-        decide(login, outcome, AuthPath::Full).await
+        decide(
+            ResidentLogin::Local(Box::new(login)),
+            outcome,
+            AuthPath::Full,
+        )
+        .await
     }
 }

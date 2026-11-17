@@ -226,7 +226,7 @@ async fn point_reads_fall_back_when_something_changes() {
     check("row security enabled", r.is_ok(), format!("{r:?}"));
     // A session whose point reads were prepared before the policy reads
     // through it at once: the statements are prepared again under the
-    // policy (S161), so another owner's document is hidden and its own
+    // policy, so another owner's document is hidden and its own
     // still read, on the point path and the general one alike.
     let r = read_until(&dc, 4, 10, |r| matches!(r, Ok(None))).await;
     check(

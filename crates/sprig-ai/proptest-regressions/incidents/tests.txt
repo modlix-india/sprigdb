@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 30451d72b646a73f8702b3d4a6fd1b396c366fd842713aae8db1327b7f56910e # shrinks to tenant = "zqa0_a", db = "zqaa0_", table = "zqa0__", host = "zqaa0a", cluster = "zqaaa0", ip = (1, 0, 0, 1), port = 39694, value = 2885181066807292482

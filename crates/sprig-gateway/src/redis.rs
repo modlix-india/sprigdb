@@ -16,6 +16,7 @@
 pub mod hub;
 mod keyspace_feed;
 pub mod logic;
+pub mod search;
 
 use std::borrow::Cow;
 use std::net::SocketAddr;
@@ -306,6 +307,8 @@ impl RedisFrontend {
         ));
         // FCALL of logic-layer functions.
         env.set_logic(Arc::new(logic::GatewayLogic));
+        // FT.* on search indexes.
+        env.set_search(Arc::new(search::GatewaySearch));
         // Keyspace notifications reach only subscribers who may read the
         // key.
         env.set_key_filter(Arc::new(KeyImages));
@@ -421,10 +424,11 @@ impl Auth for GatewayAuth {
             return Err(wrongpass());
         }
         let name = self.login_name(&user);
+        // Decided here, handed to an allowed DC, or refused (residency).
         let mut login = self
             .d
             .login
-            .start_http(LoginRequest {
+            .begin_http(LoginRequest {
                 persona: Persona::MySql84,
                 login_name: name.into_bytes(),
                 sni: self.tls.as_ref().and_then(|t| t.sni.clone()),
@@ -435,6 +439,9 @@ impl Auth for GatewayAuth {
                 can_handle_expired_password: false,
             })
             .await;
+        // The password may be an issuer's token (an external token) for
+        // an account with the `token` method.
+        login.allow_tokens(sprig_auth::oidc::TokenProtocol::Redis);
         let password = pass.to_vec();
         let (outcome, path) = if login.check_clear_fast(&password) {
             (Outcome::Verified, AuthPath::Fast)
@@ -456,7 +463,7 @@ impl Auth for GatewayAuth {
             .tenant
             .map_or_else(String::new, |t| t.0.to_string());
         let user_name = principal.user.clone();
-        let sql = SqlSession::open(
+        let mut sql = SqlSession::open(
             &self.d.sessions,
             &self.d.executor,
             &principal,
@@ -466,6 +473,9 @@ impl Auth for GatewayAuth {
             self.tls.clone(),
         )
         .map_err(|e| Frame::err(&e.message))?;
+        // SPRIG_CLAIM(): the claims of the issuer's token the login used.
+        sql.exec
+            .set_claims(login.token().map(|t| std::sync::Arc::clone(&t.claims)));
         Ok(Login {
             sql: Box::new(sql),
             scope,
@@ -696,6 +706,10 @@ impl SqlRunner for SqlSession {
         // The session's statements count as traffic from this
         // DC (an unknown or missing id as none), as MySQL's `sprig_dc`.
         self.session.client_dc = crate::dc::hint("redis", raw).known();
+    }
+
+    fn row_policy_binds(&self, object: u64) -> Option<bool> {
+        self.exec.row_policy_binds(object)
     }
 }
 

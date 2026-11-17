@@ -28,7 +28,10 @@
 //! A name the gateway doesn't hold gets 1243 from the gateway: sent to the
 //! backend, the command would pin the session's connection for good.
 //! Tenants without sharded or reference tables keep MariaDB's own
-//! statements.
+//! statements, except a publish into a stream (`INSERT INTO stream ...`),
+//! which MariaDB can't prepare (the stream is no table of its own): the
+//! gateway holds it as above, as it does for `COM_STMT_PREPARE`, and
+//! `EXECUTE IMMEDIATE` of one runs it the same way.
 //!
 //! Differences from MariaDB: an expression with a parameter in the
 //! select list is named after its value (`5+1`, not `?+1`; a bare `?` is
@@ -95,7 +98,7 @@ pub(crate) enum Lit {
 }
 
 /// 39366 for a SQL-level prepared statement whose text names a table the
-/// session's row-level security binds (S163).
+/// session's row-level security binds.
 fn rls_refused() -> SprigError {
     sprig_sql::rls::unsupported(
         "a prepared statement whose text names a protected table (PREPARE ... FROM, \
@@ -584,6 +587,17 @@ impl PassSession {
         r
     }
 
+    /// After the gateway took over name `name` (a stream publish), a
+    /// statement MariaDB may still hold under it goes, as MariaDB's own
+    /// `PREPARE` drops it: unknown names are fine.
+    async fn forget_backend_ps(&mut self, cx: &mut ExecCtx<'_>, name: &str) {
+        let sql = format!(
+            "DEALLOCATE PREPARE {}",
+            crate::backend::state::quote_ident(name)
+        );
+        let _ = Box::pin(self.run_checked(cx, &sql, false)).await;
+    }
+
     async fn ps_ok(&mut self, out: &mut dyn ResultSink, more: bool, info: &str) -> Result<Step> {
         let mut status = self.status();
         if more {
@@ -600,6 +614,7 @@ impl PassSession {
 
     /// A SQL-level prepared-statement command of a tenant session (see the
     /// module docs): `None` when it isn't one, or goes on as before.
+    #[allow(clippy::too_many_lines)] // one arm per command
     pub(super) async fn sql_prepared(
         &mut self,
         cx: &mut ExecCtx<'_>,
@@ -629,6 +644,23 @@ impl PassSession {
                     let Ok(text) = self.source_text(cx, &src).await else {
                         return Ok(None);
                     };
+                    // A publish into a stream: the gateway holds it, as for
+                    // COM_STMT_PREPARE (MariaDB has no table to prepare it
+                    // on: 1146).
+                    if self.stream_publish(&text) {
+                        let step = match self.hold(cx, text).await {
+                            Ok(h) => {
+                                self.forget_backend_ps(cx, &name).await;
+                                self.router.sql_ps.insert(name.to_lowercase(), h);
+                                self.ps_ok(out, more, "Statement prepared").await?
+                            }
+                            Err(e) => {
+                                let e = self.map_error(e);
+                                self.fail(out, &e).await?
+                            }
+                        };
+                        return Ok(Some(step));
+                    }
                     if src.lit.is_none() && self.rls_names_protected(cx, &text).await? {
                         let e = self.map_error(rls_refused());
                         return Ok(Some(self.fail(out, &e).await?));
@@ -675,14 +707,26 @@ impl PassSession {
             }
             SqlPs::Immediate { src, using } => {
                 if !sharded {
-                    // A literal was checked with the statement; a text from
-                    // a variable or an expression is read and checked now.
-                    if src.lit.is_some() {
-                        return Ok(None);
-                    }
                     let Ok(text) = self.source_text(cx, &src).await else {
                         return Ok(None);
                     };
+                    // A publish into a stream runs as the gateway's own
+                    // statement, as an EXECUTE of a held one does.
+                    if self.stream_publish(&text) {
+                        let step = match self.hold(cx, text).await {
+                            Ok(h) => self.run_held(cx, &h, &using, more, format, out).await?,
+                            Err(e) => {
+                                let e = self.map_error(e);
+                                self.fail(out, &e).await?
+                            }
+                        };
+                        return Ok(Some(step));
+                    }
+                    // A literal was checked with the statement; a text from
+                    // a variable or an expression is checked now.
+                    if src.lit.is_some() {
+                        return Ok(None);
+                    }
                     if !self.rls_names_protected(cx, &text).await? {
                         return Ok(None);
                     }

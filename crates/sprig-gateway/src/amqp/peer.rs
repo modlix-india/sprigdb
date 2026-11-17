@@ -1332,6 +1332,7 @@ mod tests {
                 authorizers: Vec::new(),
                 load: registry::Load::default(),
                 kafka_host: None,
+                degraded: std::collections::BTreeMap::new(),
             };
             let slot = registry::SlotRecord {
                 gateway_id: id.clone(),

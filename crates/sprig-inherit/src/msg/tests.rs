@@ -135,7 +135,7 @@ impl Rng {
     }
 }
 
-/// The reference model of chapter 42's override rule, written as a rank
+/// The reference model of the override rule, written as a rank
 /// over every visible row: `(class, distance of the target, distance of
 /// the maker)`, smallest wins; class 0 targets the member itself, class 1
 /// is a subtree override of an ancestor between the member and the

@@ -23,6 +23,8 @@
 //! | `Tenants.DeleteTenant` | `DELETE /admin/v1/tenants/{name}` |
 //! | `Tenants.SuspendTenant`, `ResumeTenant` | `POST /admin/v1/tenants/{name}:suspend\|:resume` ([`crate::users`]) |
 //! | `Users.CreateUser` | `POST /admin/v1/tenants/{name}/users` ([`crate::users`]) |
+//! | `Users.ListIssuers`, `PutIssuer` | `GET`, `POST /admin/v1/tenants/{name}/issuers` (`crate::users::issuers`) |
+//! | `Users.SetTokenLogin` | `POST /admin/v1/tenants/{name}/users:setTokenLogin` |
 //! | `Tenants.ExportAccounts`, `ImportAccounts` | `GET`, `POST /admin/v1/tenants/{name}/accounts` |
 //! | `Tenants.MoveTenant`, `PinTenant`, `UnpinTenant`, traffic | `/admin/v1/tenants/{name}:move\|:pin\|:unpin`, `.../move`, `.../traffic`, `/admin/v1/traffic/reports` ([`dcmove`]) |
 //! | `Jobs.ListJobs`, `GetJob`, `CancelJob` | `/admin/v1/jobs[/{job_id}[:cancel]]` ([`jobs`]) |
@@ -121,6 +123,8 @@ pub struct AdminService {
     txn: std::sync::OnceLock<Arc<txn_admin::TxnAdmin>>,
     /// Tenant catalog changes for `sprigctl search rebuild`.
     search_catalog: Option<sprig_catalog::Versioner<sprig_catalog::MariaBackend>>,
+    /// Contract migrations (`sprigctl catalog contracts`).
+    contracts: Option<Arc<crate::contracts::ContractPass>>,
 }
 
 impl std::fmt::Debug for AdminService {
@@ -157,7 +161,48 @@ impl AdminService {
             sharding: None,
             txn: std::sync::OnceLock::new(),
             search_catalog: None,
+            contracts: None,
         }
+    }
+
+    /// The same service with the contract pass, for
+    /// `/admin/v1/catalog/contracts`.
+    #[must_use]
+    pub fn with_contracts(mut self, c: Arc<crate::contracts::ContractPass>) -> Self {
+        self.contracts = Some(c);
+        self
+    }
+
+    fn contract_pass(&self) -> Result<&crate::contracts::ContractPass> {
+        self.contracts
+            .as_deref()
+            .ok_or_else(|| invalid("this controller doesn't run contract migrations"))
+    }
+
+    /// `GET /admin/v1/catalog/contracts`: the readers and every module's
+    /// contract ceiling.
+    ///
+    /// # Errors
+    /// The stores' errors.
+    pub async fn contracts_status(&self) -> Result<crate::contracts::ContractsView> {
+        self.contract_pass()?.status().await
+    }
+
+    /// `POST /admin/v1/catalog/contracts:run`: runs the contracts the
+    /// readers allow now, before `catalog.contract_delay_days` is over,
+    /// recording the reason and the operator in each one's history.
+    ///
+    /// # Errors
+    /// 39084 without a reason or operator; an unknown tenant; the stores'
+    /// errors.
+    pub async fn contracts_run(
+        &self,
+        req: crate::contracts::RunContractsRequest,
+    ) -> Result<crate::contracts::ContractRunView> {
+        let over = crate::contracts::override_of(&req)?;
+        let pass = self.contract_pass()?;
+        tracing::warn!(event = "catalog.contract_override", operator = %over.by(), reason = %over.reason(), tenant = ?req.tenant, "contract migrations run before catalog.contract_delay_days, by override");
+        pass.run(Some(&over), req.tenant.as_deref()).await
     }
 
     /// The same service with tenant catalog changes for `sprigctl search
@@ -272,6 +317,24 @@ impl AdminService {
         self.placement()?.decision(tenant, id).await
     }
 
+    /// A tenant's decisions about a subject (an id, or words), newest
+    /// first, for the DBA assistant's `decision_log`.
+    ///
+    /// # Errors
+    /// As `BalancerLoop::search_decisions`.
+    pub async fn search_decisions(
+        &self,
+        tenant: &str,
+        subject: &str,
+        days: u64,
+    ) -> Result<serde_json::Value> {
+        let (rows, note) = self
+            .placement()?
+            .search_decisions(tenant, subject, days)
+            .await?;
+        Ok(serde_json::json!({"decisions": rows, "note": note.unwrap_or_default(), "days": days}))
+    }
+
     /// The same service with the tenant calls.
     #[must_use]
     pub fn with_tenants(mut self, tenants: Arc<dyn TenantAdmin>) -> Self {
@@ -301,6 +364,50 @@ impl AdminService {
             .as_ref()
             .ok_or_else(|| invalid("this controller doesn't manage users"))?
             .create(tenant, req)
+            .await
+    }
+
+    /// `Users.ListIssuers`: a tenant's token issuers.
+    ///
+    /// # Errors
+    /// As [`UserAdmin::list_issuers`].
+    pub async fn list_issuers(&self, tenant: &str) -> Result<crate::users::ListIssuersResponse> {
+        self.users
+            .as_ref()
+            .ok_or_else(|| invalid("this controller doesn't manage users"))?
+            .list_issuers(tenant)
+            .await
+    }
+
+    /// `Users.PutIssuer`: creates or replaces a token issuer.
+    ///
+    /// # Errors
+    /// As [`UserAdmin::put_issuer`].
+    pub async fn put_issuer(
+        &self,
+        tenant: &str,
+        spec: sprig_auth::oidc::IssuerSpec,
+    ) -> Result<crate::users::PutIssuerResponse> {
+        self.users
+            .as_ref()
+            .ok_or_else(|| invalid("this controller doesn't manage users"))?
+            .put_issuer(tenant, spec)
+            .await
+    }
+
+    /// `Users.SetTokenLogin`: adds or removes an account's `token` method.
+    ///
+    /// # Errors
+    /// As [`UserAdmin::set_token_login`].
+    pub async fn set_token_login(
+        &self,
+        tenant: &str,
+        req: crate::users::TokenLoginRequest,
+    ) -> Result<crate::users::TokenLoginResponse> {
+        self.users
+            .as_ref()
+            .ok_or_else(|| invalid("this controller doesn't manage users"))?
+            .set_token_login(tenant, req)
             .await
     }
 

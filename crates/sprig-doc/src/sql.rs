@@ -4,6 +4,14 @@
 
 use std::fmt::Write as _;
 
+/// The texts `JSON_VALUE` may answer for the JSON boolean `b`, as an SQL
+/// list: MariaDB 11.8 answers `1` and `0`, other versions `true` and
+/// `false`. Compare only after `JSON_TYPE(...) = 'BOOLEAN'`.
+#[must_use]
+pub fn json_bool_texts(b: bool) -> &'static str {
+    if b { "'1', 'true'" } else { "'0', 'false'" }
+}
+
 /// A string literal: `'…'` with `\` and `'` escaped and NUL as `\0`
 /// (gateway sessions run without `NO_BACKSLASH_ESCAPES`).
 #[must_use]

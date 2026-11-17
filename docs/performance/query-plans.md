@@ -182,7 +182,7 @@ id	sku	qty
 
 4. **Keep small, read-mostly tables out of sharded groups.** Pin tables such as `countries` and `currencies` `UNSHARDED` (or `REFERENCE`) so the advisor leaves them in the database's default group; see [Pins](sharding-advisor.md#pin-a-tables-place). Copies of reference tables on every cluster aren't built yet, so a `REFERENCE` pin currently behaves like `UNSHARDED`.
 
-5. **Reads by a unique column other than the key go to every shard.** A read by an order number or an email address, when the table is sharded by customer, can't be narrowed today: there is no statement to create a global lookup index, and automatic indexing doesn't propose one yet. Where you can, include the distribution key in the condition. (The router already uses a lookup index when one exists, and `EXPLAIN FORMAT=SPRIG` then shows a top `Lookup` row.)
+5. **Give unique columns other than the key a lookup index.** A read by an order number or an email address, when the table is sharded by customer, goes to every shard unless the column has a global lookup index. Declare the column `UNIQUE` (`ALTER TABLE … ADD UNIQUE`), and SprigDB builds one; the sharding advisor also proposes one when such reads keep scattering. See [Unique keys and lookup indexes](../sql/sharding.md#unique-keys-and-lookup-indexes). Reads through a lookup show a top `Lookup` row in `EXPLAIN FORMAT=SPRIG`. Columns that aren't unique get no lookup: include the distribution key in the condition where you can.
 
 6. **Keep key values literal and of the key's type.** Compare an integer key with an integer, not a string.
 
@@ -194,6 +194,7 @@ Some `SELECT` statements can't be answered by running them on each shard and mer
 
 - **Gathered read** (`Gather` in the plan): the rows each table needs are copied into temporary tables on the session's cluster, filtered by the statement's own conditions where they can be pushed down, and the statement runs once over the copies. A gathered read may copy at most `router.gather.max_rows` (100,000) rows; at most `router.gather.max_concurrent` (4) run at once per gateway.
 - **Analytic read**: the same statement runs inside the gateway over streams of the shards' rows, with joins, grouping, aggregates in exact integer and decimal arithmetic, and window functions, and results rendered as MariaDB would. It may read at most `router.analytics.max_rows` (50,000,000) rows and spill at most `router.analytics.spill_mb` (4096 MB) to disk.
+  An aggregating statement with `HAVING`, or with expressions over its aggregates (`SUM(a) * 2`, `ROUND(AVG(q), 1)`, `CASE`), can be an analytic read too: the gateway computes the groups and aggregates, and MariaDB computes the select list, `HAVING`, `ORDER BY` and `LIMIT` over them, so every value you see is MariaDB's. Aggregates of expressions (`SUM(a * b)`), `DISTINCT`, window functions over aggregates, subqueries, and a name that is both a column and an alias are still gathered.
 
 `router.analytics.mode` chooses between them:
 

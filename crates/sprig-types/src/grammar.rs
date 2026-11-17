@@ -1,6 +1,5 @@
-//! The SQL extensions (chapter 32, "SQL extensions"; build step 2), read
-//! from the token stream of chapter 07's lexer so they work on both
-//! personas, and the classification of every statement the type layer
+//! The SQL extensions, read from the token stream of the SQL lexer so they work
+//! on both personas, and the classification of every statement the type layer
 //! looks at.
 //!
 //! | Form | Read as |
@@ -905,8 +904,8 @@ pub fn identifiers(sql: &[u8], lex_opts: &LexOptions) -> Vec<String> {
     (0..t.len()).filter_map(|i| t.ident(i)).collect()
 }
 
-/// The `SPRIG_*` functions of chapters 32 (hierarchies) and 42
-/// (`SPRIG_ORIGIN`, data inheritance).
+/// The `SPRIG_*` functions of record hierarchies and of data inheritance
+/// (`SPRIG_ORIGIN`).
 pub const SPRIG_FUNCTIONS: [&str; 6] = [
     "SPRIG_SUBTREE",
     "SPRIG_DESCENDANTS",
@@ -936,7 +935,7 @@ pub fn calls_sprig_function(sql: &[u8], lex_opts: &LexOptions) -> bool {
 }
 
 /// Whether `sql` names something reserved (`_sprig_` columns, `__sprig_`
-/// objects): such a statement is left to chapter 07, which refuses it.
+/// objects): such a statement is left to the name layer, which refuses it.
 #[must_use]
 pub fn names_reserved(sql: &[u8], lex_opts: &LexOptions) -> bool {
     identifiers(sql, lex_opts).iter().any(|n| {
@@ -960,8 +959,8 @@ pub fn is_dump_read(sql: &[u8]) -> bool {
 
 /// Replaces `ONLY x` with `` `__sprig_only__x` `` wherever `is_typed(x)`
 /// says `x` (as `(db, name)`) is a typed table and `ONLY` follows `FROM`,
-/// `JOIN`, `,`, `UPDATE` or `DELETE FROM` (chapter 32, "Resolving a table
-/// reference", step 2). Returns `None` when nothing was marked.
+/// `JOIN`, `,`, `UPDATE` or `DELETE FROM`. Returns `None` when nothing was
+/// marked.
 #[must_use]
 pub fn mark_only(
     sql: &[u8],
@@ -1047,7 +1046,7 @@ mod tests {
         };
         assert!(!ct.is_typed());
 
-        // The discriminator forms (chapter 32, discriminator columns).
+        // The discriminator forms.
         let Stmt::CreateTable(ct) = c(
             "CREATE TABLE truck (payload_kg DECIMAL(10,2)) INHERITS (vehicle) WHERE vtype = 'TRUCK' \
              WITH (SPRIG_STORAGE = 'single_table')",

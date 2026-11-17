@@ -134,6 +134,10 @@ use crate::tls::CertStore;
 #[allow(clippy::too_many_lines)] // start-up and drain, step by step
 pub async fn run(ctx: RoleContext) -> Result<()> {
     let role = Role::Gateway;
+    // A gateway's migrations only bring catalogs bootstrap made to their
+    // newest formats; a missing catalog (a tenant being deleted) is never
+    // made again here, without its owner mark.
+    sprig_catalog::migrate::never_create_schemas();
     let registry = Registry::global()?;
     let dc = ctx.config.node.dc.clone();
     let sctx = SettingCtx::process(&dc);
@@ -207,6 +211,7 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
             .collect(),
         load: registry::Load::default(),
         kafka_host: ctx.config.gateway.kafka_advertise_host.clone(),
+        degraded: std::collections::BTreeMap::new(),
     });
     let lease_live = live.clone();
     let lease_dc = dc.clone();
@@ -225,6 +230,16 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         )
         .await;
 
+    // The catalog formats this build reads, for the controller's
+    // contract migrations.
+    let _reader = tokio::spawn(sprig_catalog::readers::keep(
+        Arc::clone(&stores.dc),
+        clock.clone(),
+        "gateway",
+        gateway_id.clone(),
+        stop.clone(),
+    ));
+
     // The DC permit, its watchdog and admission while the
     // DC returns from an outage.
     let _fence = failover::start(
@@ -235,6 +250,8 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         stop.clone(),
     );
 
+    // Sprig 2PC's holder calls to the relay writers' agents.
+    backend::relay_calls::init(ctx.config.tls.as_ref())?;
     // The peer service.
     let peer_tls = ctx
         .config
@@ -272,6 +289,9 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         clock.clone(),
         handoff,
     )?;
+    if let Some(t) = &tenants {
+        let _ = t.peers.set(Arc::clone(&peers));
+    }
     let mut executor = exec::PassThrough::new(
         Arc::clone(&backends),
         exec::ExecSettingsSource::Live {
@@ -393,6 +413,23 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         Arc::clone(&stores.global),
         ctx.config.gateway.workload_key_file.as_deref(),
     );
+    // The administration agent: this gateway's error counts, written to
+    // the DC tier while `ai.admin.enabled` is on.
+    let _intake = {
+        let (live, dc) = (live.clone(), dc.clone());
+        sprig_ai::incidents::intake::spawn(
+            Arc::clone(&stores.dc),
+            "gateway",
+            &gateway_id,
+            Arc::new(move || {
+                live.get(
+                    &sprig_ai::settings::ADMIN_ENABLED,
+                    &SettingCtx::process(&dc),
+                )
+            }),
+            stop.clone(),
+        )
+    };
     // `ASK` in SQL runs its turn and tools through the HTTP core.
     http::studio::ai::ask::install(Arc::clone(&core));
     let http_fe = Arc::new(http::HttpFrontend::new(Arc::clone(&core)));
@@ -560,8 +597,19 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         })?,
     };
     let peer_server = peer::serve(peer_bind, peer_tls, peer_host, stop.clone()).await?;
-    if peer_server.is_some() {
+    if let Some((addr, _)) = &peer_server {
         redis_peer.start(&redis_env, stop.clone());
+        ctx.health
+            .set_check("peer", true, format!("listening on {addr}"));
+    } else {
+        // Readiness reports it; workers then can't run triggers or sinks.
+        tokio::spawn(peer::report_off(
+            peer_bind,
+            Arc::clone(&stores.dc),
+            ctx.health.clone(),
+            registrar.clone(),
+            stop.clone(),
+        ));
     }
     let peer_port = peer_server.as_ref().map(|(a, _)| a.port());
 
@@ -769,6 +817,33 @@ impl peer::PeerHost for PeerHost {
     ) -> sprig_auth::handoff::HandoffResult {
         sprig_auth::handoff::serve_handoff(&self.login, start, &password).await
     }
+
+    async fn watch_changes(
+        &self,
+        req: sprig_api::proto::internal::WatchChangesRequest,
+    ) -> tokio::sync::mpsc::Receiver<sprig_api::proto::internal::WatchChangesEvent> {
+        http::changes::serve_relayed(&self.core, req).await
+    }
+
+    async fn inherited_members(
+        &self,
+        req: sprig_api::proto::internal::InheritedMembersRequest,
+    ) -> sprig_common::Result<sprig_api::proto::internal::InheritedMembersReply> {
+        let svc = self.core.engine.tenants.clone().ok_or_else(|| {
+            sprig_common::SprigError::new(
+                sprig_common::SprigCode::ForwardFailed,
+                "this gateway serves no tenant catalogs",
+            )
+        })?;
+        inherited::remote::serve(&svc, &req).await
+    }
+
+    async fn tail_feed(
+        &self,
+        req: sprig_api::proto::internal::TailFeedRequest,
+    ) -> tokio::sync::mpsc::Receiver<sprig_api::proto::internal::TailFeedMessage> {
+        mongo::feed_relay::serve(self.core.engine.tenants.clone(), req)
+    }
 }
 
 /// `[gateway] listen_override`: this process's own listener addresses.
@@ -872,11 +947,17 @@ fn logins(
             // Failure counters and temporary locks in the tenants'
             // catalogs, audit events in the log (target sprig_audit).
             let state = sprig_auth::policy::CatalogLoginState::new(tenants.catalog.clone());
+            // External tokens: issuers' JWTs over MySQL,
+            // Redis, MongoDB and HTTP, with just-in-time accounts written
+            // to the tenants' catalogs.
+            let tokens =
+                sprig_auth::oidc::ExternalTokens::default().with_catalog(tenants.catalog.clone());
             let svc = LoginService::new(LoginSource::Catalog(catalogs), fast_cache)
                 .with_clock(clock)
                 .with_login_state(Arc::new(state))
                 .with_audit(audit)
-                .with_handoff(handoff);
+                .with_handoff(handoff)
+                .with_external_tokens(Arc::new(tokens));
             Ok((Arc::new(svc), Some(tenants), vec![sni]))
         }
     }

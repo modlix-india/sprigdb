@@ -81,6 +81,12 @@ pub(crate) async fn caller<T>(
     Ok(c)
 }
 
+/// The space a call names, as gRPC metadata `sprig-space` (the REST
+/// header `Sprig-Space`): its session acts there.
+fn space<T>(req: &Request<T>) -> Option<String> {
+    meta(req, "sprig-space").filter(|s| !s.is_empty())
+}
+
 /// A reply from a gateway the call was forwarded to, as the error or the
 /// JSON it carries.
 fn forwarded_json(
@@ -121,7 +127,10 @@ async fn forward(
         .forward(
             &h.gateway_id,
             ForwardRequest {
-                authorization: caller.authorization.clone().unwrap_or_default(),
+                authorization: super::auth::forwarded_authorization(
+                    caller.authorization.as_deref(),
+                    &caller.principal,
+                ),
                 method: rpc.to_owned(),
                 request_json: request.to_string(),
                 client_addr: caller.peer.to_string(),
@@ -166,6 +175,7 @@ impl Sql for SqlSvc {
     async fn query(&self, req: Request<QueryRequest>) -> GrpcResult<QueryStream> {
         metrics::counter!("sprig_api_requests_total", "service" => "sprig.v1.Sql", "method" => "Query", "protocol" => "grpc").increment(1);
         let c = caller(&self.0, &req).await?;
+        let sp = space(&req);
         let r = req.into_inner();
         if let Some(v) = forward(&self.0, &c, "Sql.Query", &r.transaction, query_json(&r)).await? {
             let parts: Vec<_> = v
@@ -189,11 +199,11 @@ impl Sql for SqlSvc {
         };
         let txn = (!r.transaction.is_empty()).then_some(r.transaction);
         let language = super::lang::with_output(&r.language, &r.output);
-        tokio::spawn(async move {
+        tokio::spawn(super::sql::SPACE.scope(sp, async move {
             engine
                 .run_in(&c, &language, call, txn.as_deref(), caps, tx)
                 .await;
-        });
+        }));
         let stream = futures::stream::unfold(Some(rx), |rx| async move {
             let mut rx = rx?;
             match rx.recv().await? {
@@ -207,6 +217,7 @@ impl Sql for SqlSvc {
     async fn execute(&self, req: Request<QueryRequest>) -> GrpcResult<ExecuteResponse> {
         metrics::counter!("sprig_api_requests_total", "service" => "sprig.v1.Sql", "method" => "Execute", "protocol" => "grpc").increment(1);
         let c = caller(&self.0, &req).await?;
+        let sp = space(&req);
         let r = req.into_inner();
         if let Some(v) = forward(&self.0, &c, "Sql.Execute", &r.transaction, query_json(&r)).await?
         {
@@ -226,11 +237,11 @@ impl Sql for SqlSvc {
         };
         let txn = (!r.transaction.is_empty()).then_some(r.transaction);
         let language = super::lang::with_output(&r.language, &r.output);
-        tokio::spawn(async move {
+        tokio::spawn(super::sql::SPACE.scope(sp, async move {
             engine
                 .run_in(&c, &language, call, txn.as_deref(), caps, tx)
                 .await;
-        });
+        }));
         collect(rx, max, charge)
             .await
             .map(Response::new)
@@ -246,6 +257,7 @@ impl Functions for FunctionsSvc {
     async fn call(&self, req: Request<CallRequest>) -> GrpcResult<CallResponse> {
         metrics::counter!("sprig_api_requests_total", "service" => "sprig.v1.Functions", "method" => "Call", "protocol" => "grpc").increment(1);
         let c = caller(&self.0, &req).await?;
+        let sp = space(&req);
         let r = req.into_inner();
         let body = super::functions::request_json(&r);
         if let Some(v) = forward(&self.0, &c, "Functions.Call", &r.transaction, body).await? {
@@ -255,18 +267,22 @@ impl Functions for FunctionsSvc {
             .args
             .as_ref()
             .map_or(serde_json::Value::Null, super::functions::from_proto);
-        super::functions::call(
-            &self.0.engine,
-            &c,
-            "grpc",
-            r.database,
-            &r.name,
-            args,
-            &r.transaction,
-        )
-        .await
-        .map(|v| Response::new(super::functions::response(&v)))
-        .map_err(|e| st(&e))
+        super::sql::SPACE
+            .scope(
+                sp,
+                super::functions::call(
+                    &self.0.engine,
+                    &c,
+                    "grpc",
+                    r.database,
+                    &r.name,
+                    args,
+                    &r.transaction,
+                ),
+            )
+            .await
+            .map(|v| Response::new(super::functions::response(&v)))
+            .map_err(|e| st(&e))
     }
 }
 
@@ -498,10 +514,10 @@ struct TxnSvc(Arc<Core>);
 impl Transactions for TxnSvc {
     async fn begin(&self, req: Request<BeginRequest>) -> GrpcResult<Transaction> {
         let c = caller(&self.0, &req).await?;
+        let sp = space(&req);
         let r = req.into_inner();
-        self.0
-            .engine
-            .begin(&c, &r.database, r.read_only)
+        super::sql::SPACE
+            .scope(sp, self.0.engine.begin(&c, &r.database, r.read_only))
             .await
             .map(Response::new)
             .map_err(|e| st(&e))
@@ -787,6 +803,9 @@ admin_service!(TenantsSvc, tenants_server::Tenants, TenantsServer, "Tenants", {
 });
 admin_service!(UsersSvc, users_server::Users, UsersServer, "Users", {
     create_user: NameRequest => "CreateUser",
+    set_token_login: NameRequest => "SetTokenLogin",
+    list_issuers: NameRequest => "ListIssuers",
+    put_issuer: NameRequest => "PutIssuer",
 });
 admin_service!(SettingsSvc, settings_server::Settings, SettingsServer, "Settings", {
     list_setting_keys: ListRequest => "ListSettingKeys",
@@ -978,6 +997,7 @@ impl sprig_api::proto::v1::changes_server::Changes for ChangesSvc {
     ) -> GrpcResult<Self::WatchStream> {
         metrics::counter!("sprig_api_requests_total", "service" => "sprig.v1.Changes", "method" => "Watch", "protocol" => "grpc").increment(1);
         let c = caller(&self.0, &req).await?;
+        let sp = space(&req);
         let r = req.into_inner();
         let spec = super::changes::WatchSpec {
             database: r.database,
@@ -985,6 +1005,7 @@ impl sprig_api::proto::v1::changes_server::Changes for ChangesSvc {
             start_after: r.start_after,
             start_at_hlc: r.start_at_hlc,
             full_document: r.full_document,
+            space: sp,
         };
         let rx = super::changes::open(&self.0, c, spec)
             .await

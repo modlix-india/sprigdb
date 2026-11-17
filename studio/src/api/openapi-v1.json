@@ -24,6 +24,9 @@
             "additionalProperties": true,
             "type": "object"
           },
+          "message_id": {
+            "type": "string"
+          },
           "model": {
             "type": "string"
           },
@@ -65,6 +68,47 @@
           },
           "reduced": {
             "type": "boolean"
+          },
+          "result": {
+            "properties": {
+              "columns": {
+                "items": {
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "type": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "type"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "row_count": {
+                "type": "integer"
+              },
+              "rows": {
+                "items": {
+                  "items": {},
+                  "type": "array"
+                },
+                "type": "array"
+              },
+              "truncated": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "columns",
+              "rows",
+              "row_count"
+            ],
+            "type": "object"
           },
           "role": {
             "type": "string"
@@ -113,6 +157,7 @@
               "thinking",
               "tool_start",
               "tool_end",
+              "result",
               "proposal",
               "usage",
               "sources",
@@ -270,6 +315,122 @@
         ],
         "type": "object"
       },
+      "AiDigest": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/AiDigestHeader"
+          },
+          {
+            "properties": {
+              "body": {
+                "type": "string"
+              },
+              "facts": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "facts_text": {
+                "type": "string"
+              },
+              "sent": {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "text": {
+                "nullable": true,
+                "type": "string"
+              },
+              "usage": {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            },
+            "required": [
+              "body",
+              "facts_text",
+              "facts"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "AiDigestHeader": {
+        "properties": {
+          "cadence": {
+            "enum": [
+              "weekly",
+              "daily"
+            ],
+            "type": "string"
+          },
+          "conversation": {
+            "nullable": true,
+            "type": "string"
+          },
+          "created_ms": {
+            "type": "integer"
+          },
+          "emailed_ms": {
+            "nullable": true,
+            "type": "integer"
+          },
+          "from_ms": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "model": {
+            "nullable": true,
+            "type": "string"
+          },
+          "notable": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "note": {
+            "nullable": true,
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "worded",
+              "facts"
+            ],
+            "type": "string"
+          },
+          "to_ms": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "cadence",
+          "from_ms",
+          "to_ms",
+          "status"
+        ],
+        "type": "object"
+      },
+      "AiDigests": {
+        "properties": {
+          "digests": {
+            "items": {
+              "$ref": "#/components/schemas/AiDigestHeader"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "digests"
+        ],
+        "type": "object"
+      },
       "AiFeedbackRequest": {
         "properties": {
           "message_id": {
@@ -389,6 +550,106 @@
         ],
         "type": "object"
       },
+      "AiProposalAction": {
+        "properties": {
+          "chart": {
+            "$ref": "#/components/schemas/ChartSpec"
+          },
+          "confirm": {
+            "type": "boolean"
+          },
+          "dashboard": {
+            "type": "string"
+          },
+          "new_dashboard": {
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          },
+          "sql": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "AiProposalOutcome": {
+        "properties": {
+          "approvals": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "dashboard": {
+            "type": "string"
+          },
+          "database": {
+            "type": "string"
+          },
+          "error": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "kind": {
+            "enum": [
+              "sql",
+              "recommendation",
+              "tile",
+              "glossary",
+              "generate_rows"
+            ],
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "accepted",
+              "failed",
+              "dismissed"
+            ],
+            "type": "string"
+          },
+          "proposal": {
+            "type": "string"
+          },
+          "ran": {
+            "items": {
+              "properties": {
+                "results": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "sql": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "sql",
+                "results"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "term": {
+            "type": "string"
+          },
+          "tile": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "proposal",
+          "kind",
+          "outcome"
+        ],
+        "type": "object"
+      },
       "AiRecorded": {
         "properties": {
           "recorded": {
@@ -495,6 +756,260 @@
       },
       "ChangeEvent": {
         "description": "The ChangeEvent message as JSON (proto3 mapping)",
+        "type": "object"
+      },
+      "ChartField": {
+        "properties": {
+          "agg": {
+            "enum": [
+              "sum",
+              "avg",
+              "count",
+              "countd",
+              "min",
+              "max",
+              "median",
+              "none"
+            ],
+            "type": "string"
+          },
+          "axis": {
+            "enum": [
+              "left",
+              "right"
+            ],
+            "type": "string"
+          },
+          "datePart": {
+            "enum": [
+              "year",
+              "quarter",
+              "month",
+              "week",
+              "day",
+              "hour",
+              "exact"
+            ],
+            "type": "string"
+          },
+          "field": {
+            "type": "string"
+          },
+          "mark": {
+            "enum": [
+              "bar",
+              "line",
+              "area",
+              "point",
+              "pie",
+              "donut",
+              "waterfall",
+              "histogram",
+              "box",
+              "heatmap",
+              "highlight-table",
+              "treemap",
+              "funnel",
+              "radar",
+              "sankey",
+              "kpi",
+              "gauge",
+              "bullet",
+              "gantt",
+              "text-table",
+              "pivot",
+              "map-point",
+              "map-filled"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "field"
+        ],
+        "type": "object"
+      },
+      "ChartSpec": {
+        "properties": {
+          "color": {
+            "nullable": true,
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/components/schemas/ChartField"
+              }
+            ]
+          },
+          "columns": {
+            "items": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "$ref": "#/components/schemas/ChartField"
+                }
+              ]
+            },
+            "type": "array"
+          },
+          "detail": {
+            "items": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "$ref": "#/components/schemas/ChartField"
+                }
+              ]
+            },
+            "type": "array"
+          },
+          "facet": {
+            "nullable": true,
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/components/schemas/ChartField"
+              }
+            ]
+          },
+          "filters": {
+            "items": {
+              "properties": {
+                "field": {
+                  "type": "string"
+                },
+                "in": {
+                  "items": {},
+                  "type": "array"
+                }
+              },
+              "required": [
+                "field"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "format": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "label": {
+            "nullable": true,
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/components/schemas/ChartField"
+              }
+            ]
+          },
+          "mark": {
+            "enum": [
+              "bar",
+              "line",
+              "area",
+              "point",
+              "pie",
+              "donut",
+              "waterfall",
+              "histogram",
+              "box",
+              "heatmap",
+              "highlight-table",
+              "treemap",
+              "funnel",
+              "radar",
+              "sankey",
+              "kpi",
+              "gauge",
+              "bullet",
+              "gantt",
+              "text-table",
+              "pivot",
+              "map-point",
+              "map-filled"
+            ],
+            "type": "string"
+          },
+          "rows": {
+            "items": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "$ref": "#/components/schemas/ChartField"
+                }
+              ]
+            },
+            "type": "array"
+          },
+          "size": {
+            "nullable": true,
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/components/schemas/ChartField"
+              }
+            ]
+          },
+          "sort": {
+            "nullable": true,
+            "properties": {
+              "by": {
+                "type": "string"
+              },
+              "dir": {
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "stack": {
+            "enum": [
+              "none",
+              "stack",
+              "percent"
+            ],
+            "nullable": true,
+            "type": "string"
+          },
+          "tooltip": {
+            "items": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "$ref": "#/components/schemas/ChartField"
+                }
+              ]
+            },
+            "type": "array"
+          },
+          "top": {
+            "nullable": true,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "mark"
+        ],
         "type": "object"
       },
       "CheckReply": {
@@ -776,12 +1291,339 @@
         ],
         "type": "object"
       },
+      "Dashboard": {
+        "properties": {
+          "can_edit": {
+            "type": "boolean"
+          },
+          "filters": {
+            "items": {
+              "$ref": "#/components/schemas/DashboardFilter"
+            },
+            "type": "array"
+          },
+          "id": {
+            "type": "string"
+          },
+          "layout": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "mine": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "owner_id": {
+            "type": "integer"
+          },
+          "shared": {
+            "type": "boolean"
+          },
+          "tiles": {
+            "items": {
+              "$ref": "#/components/schemas/DashboardTile"
+            },
+            "type": "array"
+          },
+          "updated_ms": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "owner",
+          "shared",
+          "mine",
+          "can_edit",
+          "filters",
+          "updated_ms",
+          "tiles"
+        ],
+        "type": "object"
+      },
+      "DashboardCreate": {
+        "properties": {
+          "filters": {
+            "items": {
+              "$ref": "#/components/schemas/DashboardFilter"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "shared": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "DashboardFilter": {
+        "properties": {
+          "kind": {
+            "enum": [
+              "text",
+              "number",
+              "date",
+              "list"
+            ],
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "value": {}
+        },
+        "required": [
+          "name",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "DashboardHeader": {
+        "properties": {
+          "can_edit": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "mine": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "owner_id": {
+            "type": "integer"
+          },
+          "shared": {
+            "type": "boolean"
+          },
+          "tiles": {
+            "type": "integer"
+          },
+          "updated_ms": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "owner",
+          "shared",
+          "mine",
+          "can_edit",
+          "tiles",
+          "updated_ms"
+        ],
+        "type": "object"
+      },
+      "DashboardQueryRun": {
+        "properties": {
+          "database": {
+            "type": "string"
+          },
+          "filters": {
+            "items": {
+              "$ref": "#/components/schemas/DashboardFilter"
+            },
+            "type": "array"
+          },
+          "params": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "sql": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sql"
+        ],
+        "type": "object"
+      },
+      "DashboardTile": {
+        "properties": {
+          "chart": {
+            "$ref": "#/components/schemas/ChartSpec"
+          },
+          "database": {
+            "nullable": true,
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "pos": {
+            "$ref": "#/components/schemas/TilePos"
+          },
+          "refresh_seconds": {
+            "type": "integer"
+          },
+          "sql": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "sql",
+          "chart",
+          "refresh_seconds",
+          "pos"
+        ],
+        "type": "object"
+      },
+      "DashboardUpdate": {
+        "properties": {
+          "filters": {
+            "items": {
+              "$ref": "#/components/schemas/DashboardFilter"
+            },
+            "type": "array"
+          },
+          "layout": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "name": {
+            "type": "string"
+          },
+          "positions": {
+            "items": {
+              "properties": {
+                "pos": {
+                  "$ref": "#/components/schemas/TilePos"
+                },
+                "tile": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "tile",
+                "pos"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "shared": {
+            "type": "boolean"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "Dashboards": {
+        "properties": {
+          "mine": {
+            "items": {
+              "$ref": "#/components/schemas/DashboardHeader"
+            },
+            "type": "array"
+          },
+          "shared": {
+            "items": {
+              "$ref": "#/components/schemas/DashboardHeader"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "mine",
+          "shared"
+        ],
+        "type": "object"
+      },
       "DeleteVectorsRequest": {
         "description": "The DeleteVectorsRequest message as JSON (proto3 mapping)",
         "type": "object"
       },
       "DeleteVectorsResponse": {
         "description": "The DeleteVectorsResponse message as JSON (proto3 mapping)",
+        "type": "object"
+      },
+      "DocsPage": {
+        "properties": {
+          "audience": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "chunks": {
+            "items": {
+              "$ref": "#/components/schemas/DocsPageChunk"
+            },
+            "type": "array"
+          },
+          "markdown": {
+            "type": "string"
+          },
+          "ordered": {
+            "type": "boolean"
+          },
+          "page": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "page",
+          "title",
+          "audience",
+          "ordered",
+          "markdown",
+          "chunks"
+        ],
+        "type": "object"
+      },
+      "DocsPageChunk": {
+        "properties": {
+          "chunk_id": {
+            "type": "string"
+          },
+          "heading_path": {
+            "type": "string"
+          },
+          "seq": {
+            "type": "integer"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "chunk_id",
+          "heading_path",
+          "text",
+          "seq"
+        ],
         "type": "object"
       },
       "DocsSearchHit": {
@@ -1336,6 +2178,108 @@
         },
         "type": "object"
       },
+      "RetrievalSearchHit": {
+        "properties": {
+          "bm25_rank": {
+            "nullable": true,
+            "type": "integer"
+          },
+          "chunk_no": {
+            "type": "integer"
+          },
+          "key": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "score": {
+            "type": "number"
+          },
+          "text": {
+            "type": "string"
+          },
+          "title": {
+            "nullable": true,
+            "type": "string"
+          },
+          "vector_rank": {
+            "nullable": true,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "key",
+          "chunk_no",
+          "text",
+          "score"
+        ],
+        "type": "object"
+      },
+      "RetrievalSearchReply": {
+        "properties": {
+          "database": {
+            "type": "string"
+          },
+          "hits": {
+            "items": {
+              "$ref": "#/components/schemas/RetrievalSearchHit"
+            },
+            "type": "array"
+          },
+          "index": {
+            "type": "string"
+          },
+          "warnings": {
+            "description": "What SHOW WARNINGS answers after the search: 39827 when the keyword list was skipped (a caller restricted by row-level security, past 1,000 keyword matches on a shard); empty without",
+            "items": {
+              "$ref": "#/components/schemas/RetrievalSearchWarning"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "database",
+          "index",
+          "hits",
+          "warnings"
+        ],
+        "type": "object"
+      },
+      "RetrievalSearchRequest": {
+        "properties": {
+          "filter": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "RetrievalSearchWarning": {
+        "properties": {
+          "code": {
+            "type": "integer"
+          },
+          "level": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "level",
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
       "SearchQueryRequest": {
         "description": "The SearchQueryRequest message as JSON (proto3 mapping)",
         "type": "object"
@@ -1415,6 +2359,118 @@
         "description": "The TestRunResponse message as JSON (proto3 mapping)",
         "type": "object"
       },
+      "TilePos": {
+        "properties": {
+          "h": {
+            "type": "integer"
+          },
+          "w": {
+            "type": "integer"
+          },
+          "x": {
+            "type": "integer"
+          },
+          "y": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "x",
+          "y",
+          "w",
+          "h"
+        ],
+        "type": "object"
+      },
+      "TileRequest": {
+        "properties": {
+          "chart": {
+            "$ref": "#/components/schemas/ChartSpec"
+          },
+          "database": {
+            "type": "string"
+          },
+          "params": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "pos": {
+            "$ref": "#/components/schemas/TilePos"
+          },
+          "refresh_seconds": {
+            "type": "integer"
+          },
+          "sql": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "TileRun": {
+        "properties": {
+          "columns": {
+            "items": {
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "type": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "type"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "ms": {
+            "type": "integer"
+          },
+          "row_count": {
+            "type": "integer"
+          },
+          "rows": {
+            "items": {
+              "items": {},
+              "type": "array"
+            },
+            "type": "array"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "columns",
+          "rows",
+          "row_count",
+          "truncated",
+          "ms"
+        ],
+        "type": "object"
+      },
+      "TileSaved": {
+        "properties": {
+          "dashboard": {
+            "$ref": "#/components/schemas/Dashboard"
+          },
+          "deleted": {
+            "type": "boolean"
+          },
+          "tile": {
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
       "TokenReply": {
         "properties": {
           "access_token": {
@@ -1475,6 +2531,33 @@
       },
       "WhoAmI": {
         "properties": {
+          "ai": {
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "roles": {
+                "items": {
+                  "enum": [
+                    "data",
+                    "dba",
+                    "admin"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "share_data": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "enabled",
+              "share_data",
+              "roles"
+            ],
+            "type": "object"
+          },
           "amr": {
             "items": {
               "type": "string"
@@ -1664,7 +2747,7 @@
             "description": "An error"
           }
         },
-        "summary": "One assistant turn, streamed as NDJSON: one AiChatEvent per line (start, text, thinking, tool_start, tool_end, proposal, usage, sources, error, end). Proposals are shown, never run. Errors found before the turn starts (39990, 39991, 39992, 39995, a role the caller may not use) are plain HTTP errors",
+        "summary": "One assistant turn, streamed as NDJSON: one AiChatEvent per line (start, text, thinking, tool_start, tool_end, result, proposal, usage, sources, error, end). Proposals are shown, never run. A result event carries a run_query result whole, for the user; the provider gets only its shape unless ai.share_data is on. Errors found before the turn starts (39990, 39991, 39992, 39995, a role the caller may not use) are plain HTTP errors",
         "tags": [
           "sprig.v1.Ai"
         ]
@@ -1755,6 +2838,96 @@
           }
         },
         "summary": "One of the caller's conversations with its messages, including the exact payloads sent to the provider while ai.audit_payload_days keeps them (payloads=false leaves them out)",
+        "tags": [
+          "sprig.v1.Ai"
+        ]
+      }
+    },
+    "/v1/ai/digests": {
+      "get": {
+        "operationId": "Ai.ListDigests",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiDigests"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error"
+          }
+        },
+        "summary": "The tenant's digests (ai.digest), newest first; tenant administrators",
+        "tags": [
+          "sprig.v1.Ai"
+        ]
+      }
+    },
+    "/v1/ai/digests/{id}": {
+      "get": {
+        "operationId": "Ai.GetDigest",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "payloads",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiDigest"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error"
+          }
+        },
+        "summary": "One digest: its facts (statistics only), the model's words, and what was sent to word it (payloads=true adds the exact payloads); tenant administrators",
         "tags": [
           "sprig.v1.Ai"
         ]
@@ -1917,6 +3090,57 @@
           }
         },
         "summary": "{term}:accept or :reject a proposed term, or {term}:delete a term (tenant administrators)",
+        "tags": [
+          "sprig.v1.Ai"
+        ]
+      }
+    },
+    "/v1/ai/proposals/{id}": {
+      "post": {
+        "operationId": "Ai.ProposalAction",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AiProposalAction"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiProposalOutcome"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error"
+          }
+        },
+        "summary": "{id}:accept runs a proposal as the caller (an SQL statement in its database, after confirm: true for anything but a plain read; generated test rows likewise), files a recommendation as an ai_dba_advice approvals item, accepts a glossary term, or adds a tile to a dashboard (dashboard, an id, or new_dashboard, a name; else the one the assistant named, the caller's own, made when missing); {id}:dismiss turns it down. The outcome is recorded as feedback",
         "tags": [
           "sprig.v1.Ai"
         ]
@@ -2315,7 +3539,7 @@
             "description": "An error"
           }
         },
-        "summary": "The principal, session, tenant tree, grants and studio.* settings",
+        "summary": "The principal, session, tenant tree, grants, studio.* settings, and whether the AI assistants are on and which roles have a model",
         "tags": [
           "sprig.v1.Auth"
         ]
@@ -2523,6 +3747,317 @@
         "summary": "The next page; done closes the cursor (39934 unknown, 39935 expired)",
         "tags": [
           "sprig.v1.Cursors"
+        ]
+      }
+    },
+    "/v1/dashboards": {
+      "get": {
+        "operationId": "Dashboards.List",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Dashboards"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error"
+          }
+        },
+        "summary": "The caller's own dashboards and the tenant's shared ones",
+        "tags": [
+          "sprig.v1.Dashboards"
+        ]
+      },
+      "post": {
+        "operationId": "Dashboards.Create",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DashboardCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Dashboard"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error"
+          }
+        },
+        "summary": "Makes a dashboard {name, shared?, filters?}, the caller's",
+        "tags": [
+          "sprig.v1.Dashboards"
+        ]
+      }
+    },
+    "/v1/dashboards/{id}": {
+      "get": {
+        "operationId": "Dashboards.Get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Dashboard"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error"
+          }
+        },
+        "summary": "One dashboard the caller owns or that is shared, with its tiles",
+        "tags": [
+          "sprig.v1.Dashboards"
+        ]
+      },
+      "post": {
+        "operationId": "Dashboards.Update",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DashboardUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Dashboard"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error"
+          }
+        },
+        "summary": "Changes a dashboard's name, filters, layout or tile positions (its owner, or a tenant                  administrator for a shared one); {id}:share {shared} shares or unshares it (its owner);                  {id}:delete deletes it",
+        "tags": [
+          "sprig.v1.Dashboards"
+        ]
+      }
+    },
+    "/v1/dashboards/{id}/tiles": {
+      "post": {
+        "operationId": "Dashboards.AddTile",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TileSaved"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error"
+          }
+        },
+        "summary": "Adds a tile {title, database, sql, chart, refresh_seconds?, pos?}: one SELECT whose {{filter}}              names are dashboard filters, and a chart spec that fits it",
+        "tags": [
+          "sprig.v1.Dashboards"
+        ]
+      }
+    },
+    "/v1/dashboards/{id}/tiles/{tile}": {
+      "post": {
+        "operationId": "Dashboards.UpdateTile",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "tile",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TileSaved"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error"
+          }
+        },
+        "summary": "Replaces a tile; {tile}:delete deletes it; {tile}:run {params?} runs its query as the caller              (their grants and row-level security, never the owner's), answering a TileRun",
+        "tags": [
+          "sprig.v1.Dashboards"
+        ]
+      }
+    },
+    "/v1/dashboards:run": {
+      "post": {
+        "operationId": "Dashboards.RunQuery",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DashboardQueryRun"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TileRun"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error"
+          }
+        },
+        "summary": "Runs a query that isn't saved yet (the chart editor, a proposal's preview) as the caller: one read,              filters bound as literals, in a read-only transaction, capped at studio.max_result_rows and              studio.statement_timeout_ms",
+        "tags": [
+          "sprig.v1.Dashboards"
         ]
       }
     },
@@ -4213,6 +5748,65 @@
         ]
       }
     },
+    "/v1/databases/{database}/retrieval/{index}:search": {
+      "post": {
+        "operationId": "Retrieval.Search",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "database",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "index",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetrievalSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetrievalSearchReply"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error"
+          }
+        },
+        "summary": "Searches a retrieval index (CREATE RETRIEVAL INDEX) as RETRIEVE() does in SQL: full-text and embedding hits fused, at most two chunks per row, only rows the caller may read ({query, limit, filter})",
+        "tags": [
+          "sprig.v1.Retrieval"
+        ]
+      }
+    },
     "/v1/databases/{database}/search/{index}:query": {
       "post": {
         "operationId": "Search.Query",
@@ -5041,6 +6635,55 @@
         },
         "tags": [
           "sprig.v1.Vectors"
+        ]
+      }
+    },
+    "/v1/docs/pages/{page}": {
+      "get": {
+        "operationId": "Docs.Page",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "page",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "version",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DocsPage"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error"
+          }
+        },
+        "summary": "One page of the product documentation of this release (any signed-in user), rebuilt from the docs pack: its chunks in page order and its Markdown. {page} is the page's path under docs/, slashes included (tools/studio.md)",
+        "tags": [
+          "sprig.v1.Docs"
         ]
       }
     },

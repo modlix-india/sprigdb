@@ -1,5 +1,5 @@
 //! Row-level security and statements prepared before a policy changed,
-//! live, through both personas (decision S161).
+//! live, through both personas.
 //!
 //! A user prepares statements (`COM_STMT_PREPARE`, and SQL `PREPARE`)
 //! while table `t` has no policy and runs them once. The administrator then
@@ -11,9 +11,9 @@
 //!   point read of another owner's row finds nothing, the user's own row is
 //!   read, a count counts the user's rows, and an update of a hidden row
 //!   changes nothing. A SQL `PREPARE` naming a protected table is refused
-//!   (39366), so `EXECUTE` of one made before the policy is refused too
-//!   (S163), whether its text was a literal or a variable's; so is a fresh
-//!   `PREPARE ... FROM @var` naming it. Before S163, under
+//!   (39366), so `EXECUTE` of one made before the policy is refused too,
+//!   whether its text was a literal or a variable's; so is a fresh
+//!   `PREPARE ... FROM @var` naming it. In older builds, under
 //!   `rls.backend_enforcement = triggers` or `off` such an `EXECUTE`
 //!   counted the hidden rows (MariaDB held the statement), and under
 //!   `views` MariaDB refused it (1142);
@@ -212,7 +212,7 @@ async fn prepare(ck: &mut Checks, addr: &str, tag: &str) -> Prepared {
         .await
         .unwrap();
     // The variable reads back on the pinned connection, whatever an
-    // earlier session left on it (S163's sync fix).
+    // earlier session left on it.
     let q: Option<String> = c.query_first("SELECT @q").await.unwrap();
     ck.ok(
         &format!("{tag} before: @q set"),
@@ -286,7 +286,7 @@ async fn filtered(ck: &mut Checks, p: &mut Prepared, tag: &str) {
         format!("{r:?}")
     });
     // A SQL PREPARE naming a protected table is refused: EXECUTE of one
-    // made before is refused too, from a literal or a variable (S163).
+    // made before is refused too, from a literal or a variable.
     for name in ["s", "v"] {
         let r = p.sql_exec(name).await;
         ck.ok(

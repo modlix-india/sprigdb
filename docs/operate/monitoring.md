@@ -41,6 +41,9 @@ ready
 - `process` gives the pid and start time, so you can prove that a process didn't restart across a change (as `sprigctl check no-restart` does).
 - `watchdog` is `ticking`, or `[-]watchdog stalled`.
 - `config` compares the configuration file on disk with the one the process started from. `[-]config drift: ... differs from the running configuration; it applies at the next rolling restart` means someone edited `sprigdb.toml` and the process hasn't picked it up. Live settings never cause drift; only the process file does.
+- `peer` (gateways only) is about the internal listener that workers call to run triggers and sinks. `[+]peer listening on <address>` is the normal case. Without `[tls]`, a peer listener bound off loopback stays off. That is fine when no worker is registered, and the check passes with `[+]peer off; ...`. With workers registered it fails with `[-]peer degraded: ...`, naming the cause and the fix: set `[tls]`, or bind `listener.peer.bind` to `127.0.0.1` when every process runs on one host.
+
+A failing `peer` check doesn't change `/readyz` itself: the status stays 200 and the first line `ready`, because clients' statements still work. `sprigctl gateway list` shows such a gateway as `ready (degraded)`, the gateway logs a warning, and workers log `trigger runs reach no gateway; retrying` (also written to the trigger's run log).
 
 ## Metrics
 

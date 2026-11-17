@@ -56,7 +56,7 @@ pub const HIDDEN_PREFIX: &str = "__sprig_rlsh_";
 pub const CTX_FUNCTION: &str = "__sprig_rls_ctx";
 
 /// The alias of a layer-table reference inside a merged view of an
-/// inheritable table (chapter 42; `sprig_inherit::view::LAYER_ALIAS`): the
+/// inheritable table (`sprig_inherit::view::LAYER_ALIAS`): the
 /// rewrite leaves it to the filter on the merged records, and the swap reads
 /// it through the all-columns view whatever else the statement selects.
 pub const MERGED_LAYER_ALIAS: &str = "__sprig_lyr";
@@ -505,9 +505,9 @@ pub fn swap(
         let Some((full, cols)) = lookup.hidden(&view) else {
             return view;
         };
-        // A merged view's layer reference (chapter 42) names the layer
-        // columns, and `*` never reaches it: it is read from a CTE body
-        // with its columns listed.
+        // A merged view's layer reference names the layer columns, and `*`
+        // never reaches it: it is read from a CTE body with its columns
+        // listed.
         if layer {
             return full;
         }
@@ -1116,8 +1116,8 @@ mod tests {
         assert!(hidden_view_name(&"y".repeat(51), 123_456_789).len() <= 64);
         assert!(is_policy_view("__sprig_rlsh_docs") && is_policy_view("__SPRIG_RLS_docs"));
         assert!(!is_policy_view("__sprig_rls_ctx") && !is_policy_view("docs"));
-        // A merged view's layer reference (chapter 42) reads the all-columns
-        // view whatever the statement's `*`s select.
+        // A merged view's layer reference reads the all-columns view
+        // whatever the statement's `*`s select.
         assert_eq!(
             a("SELECT * FROM (SELECT id FROM docs `__sprig_lyr` WHERE `_sprig_rk` = 1) AS d")
                 .as_deref(),

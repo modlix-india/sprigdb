@@ -4,7 +4,10 @@
 //! OR of terms. Fuzzy and prefix terms are **expanded once**, over every
 //! partition ([`Expander`]), into an OR of concrete terms scored with
 //! BM25, so every partition expands them the same way and scores agree
-//! (Tantivy's own fuzzy query scores with a constant). Wildcards and
+//! (Tantivy's own fuzzy query scores with a constant). The expander picks
+//! the terms: the most frequent `max_expansions` over every document, or
+//! over some documents only (a caller bound by row-level security), or
+//! every matching term ([`Builder::every_term`]). Wildcards and
 //! regular expressions keep a constant score, as in Atlas.
 
 use std::ops::Bound;
@@ -103,6 +106,9 @@ pub struct Builder<'a> {
     schema: &'a IndexSchema,
     expander: &'a dyn Expander,
     max_expansions: usize,
+    /// Expand to every matching term, as one constant-score set
+    /// ([`Builder::every_term`]).
+    every_term: bool,
 }
 
 impl std::fmt::Debug for Builder<'_> {
@@ -168,6 +174,27 @@ impl<'a> Builder<'a> {
             schema,
             expander,
             max_expansions,
+            every_term: false,
+        }
+    }
+
+    /// Expands each prefix and fuzzy term to every term it matches (no
+    /// `max_expansions`), matched as one set with a constant score: for
+    /// finding every document a query could match, not for ranking.
+    #[must_use]
+    pub fn every_term(mut self) -> Self {
+        self.every_term = true;
+        self.max_expansions = usize::MAX;
+        self
+    }
+
+    /// The query of `terms`, alternatives of one token on `t`: an OR of
+    /// scored terms, or one set ([`Builder::every_term`]).
+    fn alternatives(&self, t: &Target<'_>, terms: &[String]) -> Box<dyn Query> {
+        if self.every_term && terms.len() > 1 {
+            boxed(TermSetQuery::new(terms.iter().map(|x| t.base.term(x))))
+        } else {
+            or(terms.iter().map(|x| Self::term_query(t, x)).collect())
         }
     }
 
@@ -305,10 +332,7 @@ impl<'a> Builder<'a> {
             let toks = t.analyzer.query_tokens(text);
             for (i, tok) in toks.iter().enumerate() {
                 let alts = self.term_alternatives(t, &tok.text, fuzzy)?;
-                let q = boost(
-                    or(alts.iter().map(|a| Self::term_query(t, a)).collect()),
-                    t.boost,
-                );
+                let q = boost(self.alternatives(t, &alts), t.boost);
                 if all {
                     if per_token.len() <= i {
                         per_token.resize_with(i + 1, Vec::new);
@@ -358,10 +382,7 @@ impl<'a> Builder<'a> {
             let terms =
                 self.expander
                     .expand(&t.base, &Expansion::Prefix(p), self.max_expansions)?;
-            out.push(boost(
-                or(terms.iter().map(|x| Self::term_query(&t, x)).collect()),
-                t.boost,
-            ));
+            out.push(boost(self.alternatives(&t, &terms), t.boost));
         }
         Ok(or(out))
     }

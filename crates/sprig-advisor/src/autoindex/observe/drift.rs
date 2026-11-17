@@ -24,6 +24,10 @@
 //!   with the binary log off, unless a validation of this process runs
 //!   there; Galera keeps the names of rows rolling out
 //!   (validate::orphans)
+//! every node: statistics snapshots a cut-off replica or RSU validation
+//!   left in the journal for the object's tables, put back with the binary
+//!   log off and removed, unless a validation of this process runs there
+//!   (validate::journal)
 //! ```
 //!
 //! `frozen` rows are left alone; `validating` and `recommended` rows
@@ -58,6 +62,9 @@ pub struct DriftReport {
     /// Leftovers of cut-off validations dropped on replicas or Galera
     /// nodes, as `node:shard/name`.
     pub leftovers_dropped: Vec<String>,
+    /// Statistics of cut-off validations put back from the journal, as
+    /// `node:schema.table`.
+    pub statistics_restored: Vec<String>,
     /// Statements that failed (retried next time).
     pub errors: Vec<String>,
 }
@@ -257,10 +264,12 @@ pub async fn reconcile_object<Q: Queryable + Send>(
     if !rep.strays_dropped.is_empty()
         || !rep.rows_dropped.is_empty()
         || !rep.leftovers_dropped.is_empty()
+        || !rep.statistics_restored.is_empty()
     {
         tracing::info!(
             tenant = %cx.tenant, object = object.0, strays = ?rep.strays_dropped,
             rows = ?rep.rows_dropped, leftovers = ?rep.leftovers_dropped,
+            statistics = ?rep.statistics_restored,
             "automatic index drift reconciled"
         );
     }
@@ -268,7 +277,8 @@ pub async fn reconcile_object<Q: Queryable + Send>(
 }
 
 /// Drops the leftovers of cut-off validations on every replica, and on
-/// every Galera node but the writer (module docs).
+/// every Galera node but the writer, and puts back the statistics they
+/// journaled (module docs).
 async fn leftovers(
     cx: &ObserveCx<'_>,
     by_name: &BTreeMap<&str, &AutoIndexRow>,
@@ -277,6 +287,28 @@ async fn leftovers(
     use crate::autoindex::rollout::Nodes;
     use crate::autoindex::validate::IndexTarget;
     use crate::autoindex::validate::orphans::{NodeKind, drop_leftovers};
+    let targets: Vec<IndexTarget> = cx
+        .shards
+        .iter()
+        .map(|t| IndexTarget {
+            schema: t.schema.clone(),
+            table: t.table.clone(),
+            pk: Vec::new(),
+        })
+        .collect();
+    if let Some(journal) = cx.stats {
+        for n in cx.view.nodes.all() {
+            let got =
+                crate::autoindex::validate::journal::restore_journaled(n, journal, &targets).await;
+            rep.statistics_restored
+                .extend(got.tables.iter().map(|t| format!("{}:{t}", n.node)));
+            rep.errors.extend(
+                got.errors
+                    .iter()
+                    .map(|e| format!("statistics on {}: {e}", n.node)),
+            );
+        }
+    }
     let (writer, others, kind) = match &cx.view.nodes {
         Nodes::PrimaryReplica { writer, replicas } => (
             writer,
@@ -306,15 +338,6 @@ async fn leftovers(
     } else {
         std::collections::BTreeSet::new()
     };
-    let targets: Vec<IndexTarget> = cx
-        .shards
-        .iter()
-        .map(|t| IndexTarget {
-            schema: t.schema.clone(),
-            table: t.table.clone(),
-            pk: Vec::new(),
-        })
-        .collect();
     for n in others {
         match drop_leftovers(n, writer, &targets, kind, &keep).await {
             Ok(found) => {

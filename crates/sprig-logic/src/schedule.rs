@@ -272,7 +272,13 @@ pub async fn run(
         Ok(()) => ("ok", None),
         Err(e)
             if e.message.contains("max_statement_time")
-                || matches!(e.kind, sprig_common::ErrorKind::Backend { errno: 1969, .. }) =>
+                || matches!(
+                    e.kind,
+                    sprig_common::ErrorKind::Backend {
+                        errno: 1969 | 39864,
+                        ..
+                    }
+                ) =>
         {
             ("budget", Some(e.to_string()))
         }

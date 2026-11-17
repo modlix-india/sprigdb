@@ -1,12 +1,12 @@
-//! The `inherit_msg` catalog module (chapter 42, "Where definitions and
-//! instances live"): `inherited_defs`, `inherited_overrides` and
+//! The `inherit_msg` catalog module, where definitions and instances live:
+//! `inherited_defs`, `inherited_overrides` and
 //! `inherited_instances` in `t<tenant>_sprig`, their migration, the
 //! snapshot loader ([`MsgExtension`]) and the writes.
 //!
 //! Definitions and overrides are versioned with the catalog: they are
 //! written inside a catalog change ([`MsgStore`] on the change's
-//! transaction). Instance rows are written outside one (chapter 42: "not
-//! versioned"); the member's catalog change that creates the instance's
+//! transaction). Instance rows are written outside one (they are not
+//! versioned); the member's catalog change that creates the instance's
 //! physical object (a stream's `streams` row, a trigger's binding) comes
 //! right after, so the next snapshot has both.
 
@@ -31,7 +31,7 @@ use super::model::{
 /// The module name.
 pub const MODULE: &str = "inherit_msg";
 
-/// `inherited_defs` (chapter 42), in the declaring tenant.
+/// `inherited_defs`, in the declaring tenant.
 pub const DDL_DEFS: &str = "CREATE TABLE IF NOT EXISTS inherited_defs (
   object_id         BIGINT UNSIGNED NOT NULL,
   kind              ENUM('stream','exchange','queue','binding','trigger',
@@ -51,7 +51,7 @@ pub const DDL_DEFS: &str = "CREATE TABLE IF NOT EXISTS inherited_defs (
   UNIQUE KEY uk_def_name (db_name, kind, name)
 ) ENGINE=InnoDB";
 
-/// `inherited_overrides` (chapter 42), in a member or an intermediate
+/// `inherited_overrides`, in a member or an intermediate
 /// tenant.
 pub const DDL_OVERRIDES: &str = "CREATE TABLE IF NOT EXISTS inherited_overrides (
   def_tenant_id     BIGINT UNSIGNED NOT NULL,
@@ -66,7 +66,7 @@ pub const DDL_OVERRIDES: &str = "CREATE TABLE IF NOT EXISTS inherited_overrides 
   PRIMARY KEY (def_tenant_id, def_object_id, target_tenant_id, applies_to, what)
 ) ENGINE=InnoDB";
 
-/// `inherited_instances` (chapter 42), in the member; not versioned.
+/// `inherited_instances`, in the member; not versioned.
 pub const DDL_INSTANCES: &str = "CREATE TABLE IF NOT EXISTS inherited_instances (
   def_tenant_id     BIGINT UNSIGNED NOT NULL,
   def_object_id     BIGINT UNSIGNED NOT NULL,

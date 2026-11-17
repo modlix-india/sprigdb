@@ -30,6 +30,16 @@ pub(crate) fn map_err(e: mysql_async::Error) -> SprigError {
             }
         }
         .with_source(e),
+        // The catalog pool's wait limit (`crate::pool_wait`): every
+        // connection busy for that long.
+        _ if crate::pool_wait::PoolWaitTimeout::of(&e).is_some() => {
+            let ms = crate::pool_wait::PoolWaitTimeout::of(&e).map_or(0, |t| t.waited.as_millis());
+            SprigError::new(
+                SprigCode::CatalogUnavailable,
+                format!("catalog unavailable: no catalog connection free within {ms} ms"),
+            )
+            .with_source(e)
+        }
         _ => SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e),
     }
 }

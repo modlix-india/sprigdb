@@ -77,7 +77,11 @@ pub fn builtin(name: &str) -> Option<ProviderEntry> {
             key_env: Some("ANTHROPIC_API_KEY".to_owned()),
         },
         "openai" => ProviderEntry {
-            settings: ProviderSettings::OpenAiChat(OpenAiConfig::default()),
+            // OpenAI refuses max_tokens on its current models.
+            settings: ProviderSettings::OpenAiChat(OpenAiConfig {
+                max_tokens_field: "max_completion_tokens".to_owned(),
+                ..OpenAiConfig::default()
+            }),
             key_env: Some("OPENAI_API_KEY".to_owned()),
         },
         "ollama" => ProviderEntry {

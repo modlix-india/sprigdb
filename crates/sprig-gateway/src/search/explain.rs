@@ -6,6 +6,8 @@
 //!             consistency, scoring, copies (where, ready), query (the AST),
 //!             hits and search_ms when the search ran and no row policy
 //!             binds the caller}
+//! scoring: the index's (search.scoring), or for a caller a row policy
+//!   binds the one it gets: matched (scoring_past_window: plain)
 //! SQL EXPLAIN [FORMAT=...] <statement with MATCH or sprig_search()>:
 //!   the searches run (as the statement would), the statement's EXPLAIN
 //!   from MariaDB, then one row per search: select_type SEARCH, type
@@ -46,15 +48,35 @@ pub fn consistency_name(c: Consistency) -> &'static str {
     }
 }
 
+/// The scoring a caller's search uses: the index's (`search.scoring`), or,
+/// for a caller a row policy binds, `matched` (statistics of the rows it
+/// may see; `plain` past `search.max_window`).
+#[must_use]
+pub fn scoring_name(index: sprig_search::Scoring, bound: bool) -> &'static str {
+    if bound {
+        return "matched";
+    }
+    match index {
+        sprig_search::Scoring::Global => "global",
+        sprig_search::Scoring::Local => "local",
+        sprig_search::Scoring::Matched => "matched",
+        sprig_search::Scoring::Plain => "plain",
+    }
+}
+
 /// The `SearchScan` document of a search of `def` with `query`. `hits` and
 /// `took` are shown only when given (callers leave them out for callers a
-/// row policy binds: the copy's hit count includes hidden rows).
+/// row policy binds: the copy's hit count includes hidden rows). `bound`:
+/// a row policy binds the caller, whose search is scored over the rows it
+/// may see (`scoring` `matched`, and `scoring_past_window` `plain`).
+#[allow(clippy::too_many_arguments)]
 pub async fn describe(
     svc: &Arc<SearchService>,
     tenant: TenantId,
     def: &IndexDef,
     query: &SearchQuery,
     consistency: Consistency,
+    bound: bool,
     hits: Option<usize>,
     took: Option<Duration>,
 ) -> Value {
@@ -68,14 +90,14 @@ pub async fn describe(
         "generation": def.generation,
         "partitions": def.partitions,
         "consistency": consistency_name(consistency),
-        "scoring": match knobs.scoring {
-            sprig_search::Scoring::Global => "global",
-            sprig_search::Scoring::Local => "local",
-        },
+        "scoring": scoring_name(knobs.scoring, bound),
         "copies": place,
         "ready": ready,
         "query": serde_json::to_value(query).unwrap_or(Value::Null),
     });
+    if bound {
+        v["scoring_past_window"] = json!("plain");
+    }
     if let Some(n) = hits {
         v["hits"] = json!(n);
     }
@@ -167,6 +189,15 @@ pub fn json_row(scans: &[Scan]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bound_caller_is_shown_its_own_scoring() {
+        use sprig_search::Scoring;
+        assert_eq!(scoring_name(Scoring::Global, false), "global");
+        assert_eq!(scoring_name(Scoring::Local, false), "local");
+        assert_eq!(scoring_name(Scoring::Global, true), "matched");
+        assert_eq!(scoring_name(Scoring::Local, true), "matched");
+    }
 
     #[test]
     fn explain_statements_are_recognised() {

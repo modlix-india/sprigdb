@@ -98,6 +98,17 @@ pub struct SweepReport {
     pub settled: usize,
 }
 
+/// Asked by a resolver outside the relay fence (the controller's, a
+/// cutover's drain) right before it decides and finishes one held branch
+/// itself: a relay writer that took the cluster's relay lease since the
+/// pass began owns the cluster's held branches, and replays them inside
+/// its fence.
+#[async_trait::async_trait]
+pub trait RedoGuard: Send + Sync {
+    /// Whether this resolver may finish `cluster`'s held branches now.
+    async fn may_finish(&self, cluster: &ClusterId) -> bool;
+}
+
 /// One data center's resolver.
 pub struct Resolver {
     admin: Arc<dyn ClusterAdmin>,
@@ -108,6 +119,8 @@ pub struct Resolver {
     /// their redo rows are the agents' to recover, inside the fence, so
     /// [`Resolver::scan_redo`] leaves them alone.
     fenced: RwLock<std::collections::BTreeSet<ClusterId>>,
+    /// [`RedoGuard`], when this resolver runs outside the relay fence.
+    guard: std::sync::OnceLock<Arc<dyn RedoGuard>>,
 }
 
 impl std::fmt::Debug for Resolver {
@@ -139,6 +152,23 @@ impl Resolver {
             cfg: RwLock::new(cfg),
             first_seen: Mutex::new(HashMap::new()),
             fenced: RwLock::new(std::collections::BTreeSet::new()),
+            guard: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Asks `guard` before each held branch [`Resolver::scan_redo`] or
+    /// [`Resolver::drain_prepared`] would finish itself. Set once; later
+    /// calls are ignored.
+    pub fn set_redo_guard(&self, guard: Arc<dyn RedoGuard>) {
+        let _ = self.guard.set(guard);
+    }
+
+    /// Whether [`RedoGuard`] (if any) lets this resolver finish `cluster`'s
+    /// held branches now.
+    async fn may_finish(&self, cluster: &ClusterId) -> bool {
+        match self.guard.get() {
+            Some(g) => g.may_finish(cluster).await,
+            None => true,
         }
     }
 
@@ -148,6 +178,17 @@ impl Resolver {
     pub fn set_fenced(&self, clusters: impl IntoIterator<Item = ClusterId>) {
         *self.fenced.write().unwrap_or_else(PoisonError::into_inner) =
             clusters.into_iter().collect();
+    }
+
+    /// Adds `cluster` to the clusters whose redo rows the relay fence
+    /// recovers, or takes it out.
+    pub fn mark_fenced(&self, cluster: &ClusterId, fenced: bool) {
+        let mut set = self.fenced.write().unwrap_or_else(PoisonError::into_inner);
+        if fenced {
+            set.insert(cluster.clone());
+        } else {
+            set.remove(cluster);
+        }
     }
 
     fn is_fenced(&self, cluster: &ClusterId) -> bool {
@@ -426,6 +467,12 @@ impl Resolver {
                 r.young += 1;
                 continue;
             }
+            if b.mark.is_none() && !self.may_finish(cluster).await {
+                // A relay writer took the cluster meanwhile: its fence
+                // recovers the rest.
+                r.fenced = true;
+                break;
+            }
             self.finish_redo(cluster, b, &mut r).await;
         }
         #[allow(clippy::cast_precision_loss)]
@@ -449,10 +496,16 @@ impl Resolver {
     ) -> Result<DrainReport> {
         let mut rep = DrainReport::default();
         loop {
-            // Held branches (Sprig 2PC): replayed or dropped, whatever age.
+            // Held branches (Sprig 2PC): replayed or dropped, whatever age;
+            // on a cluster whose relay writer holds the lease, left to its
+            // fence (a live holder finishes its own; a lost one is
+            // recovered inside the fence).
             if let Ok(held) = self.admin.redo_branches(cluster).await {
                 let mut r = RedoReport::default();
                 for b in held.iter().filter(|b| b.gtrid.tenant == tenant) {
+                    if b.mark.is_none() && !self.may_finish(cluster).await {
+                        break;
+                    }
                     self.finish_redo(cluster, b, &mut r).await;
                 }
                 rep.committed += r.replayed;
@@ -619,5 +672,166 @@ mod tests {
     fn schema_names_carry_the_tenant() {
         assert_eq!(tenant_of_schema("t42_d1_g3_s5"), Some(TenantId(42)));
         assert_eq!(tenant_of_schema("app"), None);
+    }
+
+    mod guard {
+        #![allow(clippy::unwrap_used)]
+
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use sprig_common::ids::{DbId, GroupId};
+
+        use super::super::*;
+        use crate::StaticLocator;
+        use crate::backend::DbResult;
+        use crate::decision::DecisionRow;
+        use crate::redo::{RedoBranch, Replay};
+        use crate::xid::{AnchorRef, Dtid, DtidGen};
+
+        const T: TenantId = TenantId(7);
+
+        /// Two committed held branches whose holders are gone.
+        #[derive(Default)]
+        struct Fake {
+            held: Mutex<Vec<RedoBranch>>,
+            rows: Mutex<Vec<DecisionRow>>,
+            replayed: Mutex<Vec<Dtid>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ClusterAdmin for Fake {
+            async fn xa_recover(&self, _: &ClusterId) -> DbResult<Vec<Xid>> {
+                Ok(Vec::new())
+            }
+            async fn xa_finish(&self, _: &ClusterId, _: &Xid, _: bool) -> DbResult<()> {
+                Ok(())
+            }
+            async fn kill(&self, _: &ClusterId, _: u64) -> DbResult<()> {
+                Ok(())
+            }
+            async fn insert_decision(
+                &self,
+                _: &ClusterId,
+                _: &str,
+                row: &DecisionRow,
+            ) -> DbResult<()> {
+                let mut rows = self.rows.lock().unwrap();
+                if rows.iter().any(|r| r.dtid == row.dtid) {
+                    return Err(crate::backend::DbError::new(
+                        crate::backend::errno::DUP_ENTRY,
+                        "dup",
+                    ));
+                }
+                rows.push(row.clone());
+                Ok(())
+            }
+            async fn read_decision(
+                &self,
+                _: &ClusterId,
+                _: &str,
+                d: Dtid,
+            ) -> DbResult<Option<DecisionRow>> {
+                Ok(self
+                    .rows
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r.dtid == d)
+                    .cloned())
+            }
+            async fn settle_pending(
+                &self,
+                _: &ClusterId,
+                _: &str,
+                _: Dtid,
+                _: Decision,
+            ) -> DbResult<()> {
+                Ok(())
+            }
+            async fn decision_rows(&self, _: &ClusterId) -> DbResult<Vec<(String, DecisionRow)>> {
+                Ok(Vec::new())
+            }
+            async fn delete_decision(&self, _: &ClusterId, _: &str, _: Dtid) -> DbResult<()> {
+                Ok(())
+            }
+            async fn redo_branches(&self, _: &ClusterId) -> DbResult<Vec<RedoBranch>> {
+                Ok(self.held.lock().unwrap().clone())
+            }
+            async fn replay_redo(&self, _: &ClusterId, _: &str, d: Dtid) -> DbResult<Replay> {
+                self.held.lock().unwrap().retain(|b| b.dtid != d);
+                self.replayed.lock().unwrap().push(d);
+                Ok(Replay::Applied)
+            }
+        }
+
+        /// Lets a resolver finish held branches only while `open`.
+        struct Gate(AtomicBool);
+
+        #[async_trait::async_trait]
+        impl RedoGuard for Gate {
+            async fn may_finish(&self, _: &ClusterId) -> bool {
+                self.0.load(Ordering::SeqCst)
+            }
+        }
+
+        fn world() -> (Arc<Fake>, Resolver, Arc<Gate>, ClusterId) {
+            let ids = DtidGen::new(1);
+            let a = ClusterId::new("dc-a-c1").unwrap();
+            let home = AnchorRef {
+                db: DbId(1),
+                group: GroupId(3),
+                hash_point: 0,
+            };
+            let fake = Fake::default();
+            for _ in 0..2 {
+                let g = Gtrid {
+                    tenant: T,
+                    dtid: ids.next(),
+                    start_ms: 1,
+                    home,
+                };
+                fake.rows
+                    .lock()
+                    .unwrap()
+                    .push(DecisionRow::new(g.dtid, Decision::Commit, "gw1"));
+                fake.held.lock().unwrap().push(RedoBranch {
+                    schema: "t7_d1_g3_s1".into(),
+                    dtid: g.dtid,
+                    gtrid: g,
+                    age_seconds: 3600,
+                    statements: 1,
+                    mark: None,
+                });
+            }
+            let loc = StaticLocator::new();
+            loc.insert(T, home, a.clone(), "t7_d1_g3_s1");
+            let fake = Arc::new(fake);
+            let r = Resolver::new(fake.clone(), Arc::new(loc), ResolverConfig::default());
+            let gate = Arc::new(Gate(AtomicBool::new(false)));
+            r.set_redo_guard(gate.clone());
+            (fake, r, gate, a)
+        }
+
+        /// A resolver outside the relay fence leaves held branches alone
+        /// while the guard says a relay writer owns the cluster: in its
+        /// scan and in a cutover's drain. Once the guard lets it, it
+        /// replays them.
+        #[tokio::test]
+        async fn held_branches_wait_for_the_guard() {
+            let (fake, r, gate, a) = world();
+            let rep = r.scan_redo(&a).await.unwrap();
+            assert!(rep.fenced && rep.replayed == 0, "{rep:?}");
+            let d = r
+                .drain_prepared(&a, T, Instant::now() + Duration::from_millis(50))
+                .await
+                .unwrap();
+            assert_eq!(d.committed, 0);
+            assert!(fake.replayed.lock().unwrap().is_empty());
+            gate.0.store(true, Ordering::SeqCst);
+            let rep = r.scan_redo(&a).await.unwrap();
+            assert_eq!((rep.replayed, rep.fenced), (2, false), "{rep:?}");
+            assert_eq!(fake.replayed.lock().unwrap().len(), 2);
+        }
     }
 }

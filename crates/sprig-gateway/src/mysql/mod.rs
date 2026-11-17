@@ -528,6 +528,9 @@ async fn login_phase(
         principal: principal.clone(),
         persona,
     });
+    // SPRIG_CLAIM() and token roles: the claims of the issuer's token the
+    // login used, here or in the DC it was handed to.
+    exec.set_claims(login.token().map(|t| std::sync::Arc::clone(&t.claims)));
     let db = resp
         .database
         .as_ref()

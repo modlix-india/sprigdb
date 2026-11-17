@@ -6,6 +6,7 @@
 //! | Input assembly from the catalog and the workload store | [`input`] |
 //! | Graph, structural design, key filters, scoring, search, confidence, verdicts | [`design`] |
 //! | Key-value units: shard a Redis database or namespace only when a rule says so | [`kv`] |
+//! | The periodic run's `Rekey` verdict for tenants with table groups | [`periodic`] |
 //! | `advisor_runs` and decision-log evidence | [`runs`] |
 //! | Stored code keeps the tables it names in place | [`code`] |
 //! | The first-design plan: regroup by `RENAME` under a hold, `_sprig_rk`, back-fill | [`apply`] |
@@ -26,6 +27,7 @@ pub mod code;
 pub mod design;
 pub mod input;
 pub mod kv;
+pub mod periodic;
 pub mod runs;
 pub mod settings;
 

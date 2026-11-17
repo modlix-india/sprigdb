@@ -176,6 +176,32 @@ These look similar but carry their own error numbers:
 
 Logins also slow down after failures: from the `auth.delay_after_failures`th failure in a row (3 by default) for an account and address, each failure is delayed by `auth.failure_delay_ms` (1 second), doubling up to `auth.failure_delay_max_ms` (10 seconds). A client that looks hung during login may be waiting out this delay.
 
+## A token from an identity provider is refused
+
+**Symptom.** A login with a token from the tenant's identity provider fails: 1045 over MySQL and MariaDB, `WRONGPASS` over Redis, 401 with 1045 over REST and gRPC, 18 `AuthenticationFailed` over MongoDB. Or a REST or gRPC call answers 401 with 39786 `ER_SPRIG_TENANT_AMBIGUOUS`.
+
+**Cause.** Clients get the same error whatever was wrong with the token, so that tokens can't be probed. The reason is in the tenant's audit stream. 39786 means the request didn't say which tenant the token is for.
+
+**Confirm.** Find the `auth.login_failed` event with `mechanism` `jwt`; its `detail` says why:
+
+```sh
+cat /mnt/audit/audit/tenant-42/2026-11-15/*.jsonl \
+  | jq -c 'select(.event == "auth.login_failed" and .mechanism == "jwt") | {at_ms, user, protocol, detail}'
+```
+
+| `detail` | Usual cause |
+|---|---|
+| `token: unknown issuer` | The token's `iss` differs from the registered `issuer` (a trailing `/`, another realm), the issuer is disabled, or its `protocols` leave this protocol out |
+| `token: wrong audience` | The provider issued the token for another client or API |
+| `token: expired`, `token: not yet valid` | An old token, or clocks more than `auth.token_clock_skew_seconds` apart |
+| `token: issuer keys unavailable (...)` | The gateway can't fetch the key set: network, DNS, or a certificate not from a public authority |
+| `token: no claim mapping names this account` | No user mapping matched; over MySQL, MariaDB and Redis, the token names another account than the login name |
+| `token: the mapped account doesn't take tokens` | The account doesn't exist, or lacks the `token` method |
+
+Over MySQL, MariaDB and Redis, a token sent for an account without the `token` method is checked as a password: the event then has no `detail` and no `jwt` mechanism. `sprigctl tenant issuer list acme` shows the registered issuers.
+
+**Fix.** Correct the issuer (`sprigctl tenant issuer put`), give the account the `token` method (`sprigctl tenant token-login acme <user>`), or get a fresh token. For 39786, send `x-sprig-tenant: <tenant>` or use the tenant's host name. Over MySQL and MariaDB the connection must use TLS. See [Logins with identity provider tokens](../security/external-tokens.md#audit-and-troubleshooting).
+
 ## Tenant suspended
 
 **Symptom.** `ER_SPRIG_TENANT_SUSPENDED` (39303): `tenant acme is suspended`. Over HTTP it is a 403.

@@ -3,7 +3,8 @@
 //!
 //! - **Headers:** `x-api-key`, `anthropic-version` (2026-10-21 by
 //!   default), and `anthropic-beta` when betas are configured.
-//! - **Tools:** JSON-schema tools with `strict: true`; tool choice is left
+//! - **Tools:** JSON-schema tools with `strict: true` (on the first 20,
+//!   the most the API takes); tool choice is left
 //!   to the model (`auto`), since newer models refuse forced tool use.
 //! - **Caching:** with `cache_prefix`, a `cache_control` breakpoint on the
 //!   last system block (it covers the tools, which come first) and the
@@ -43,6 +44,10 @@ pub const API_VERSION: &str = "2026-10-21";
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 /// The model the examples and the default configuration name.
 pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
+/// The most tools one request may mark `strict`: the API refuses more
+/// with a 400. Tools past it are sent without `strict`; the registry
+/// still checks every call against its schema.
+pub const MAX_STRICT_TOOLS: usize = 20;
 
 /// An Anthropic Messages provider's settings (its record, without the
 /// key).
@@ -231,6 +236,7 @@ pub fn encode_request(cfg: &AnthropicConfig, req: &ChatRequest) -> Value {
             _ => None,
         })
         .collect();
+    let mut strict_left = MAX_STRICT_TOOLS;
     let mut tools: Vec<Value> = req
         .tools
         .iter()
@@ -240,7 +246,8 @@ pub fn encode_request(cfg: &AnthropicConfig, req: &ChatRequest) -> Value {
                 "description": t.description,
                 "input_schema": t.input_schema,
             });
-            if t.strict && cfg.strict_tools {
+            if t.strict && cfg.strict_tools && strict_left > 0 {
+                strict_left -= 1;
                 v["strict"] = json!(true);
             }
             v

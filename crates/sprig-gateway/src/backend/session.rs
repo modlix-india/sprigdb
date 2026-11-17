@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use sprig_auth::accounts::BackendTarget;
+use sprig_cluster::failover::relay::RelayLease;
 use sprig_cluster::record::TopologyKind;
-use sprig_common::ids::{NodeId, ShardId};
+use sprig_common::ids::{ClusterId, NodeId, ShardId};
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_proto_mysql::client::{ClientError, PacketKind, RespPacket, TrackedChanges};
 use sprig_proto_mysql::packets::OkPacket;
@@ -18,7 +19,7 @@ use tokio::time::Instant;
 use super::classify::{Effect, StmtClass, StmtInfo};
 use super::cluster::{ClusterView, NodeKey, NodeRef};
 use super::conn::{self, BackendStmt, ConnectSpec, Warning};
-use super::pins::{PinReason, Pins};
+use super::pins::{PinReason, Pins, TxnSetting};
 use super::pool::{AcquireError, BackendLease, PoolKey, Release};
 use super::settings::{BackendSettings, CausalScope, PoolMode};
 use super::state::{self, SessionVars};
@@ -50,6 +51,17 @@ pub struct SessionOpts {
     pub schema: Option<String>,
     /// The shard (shard 0 for a login's unsharded cluster).
     pub shard: ShardId,
+    /// Sprig 2PC's relay path (`txn.sprig_2pc_path = relay` under
+    /// `sprig_2pc`): on a cluster with relays, every connection goes
+    /// through the relay writer with this tenant in its preamble.
+    pub relay: Option<sprig_common::ids::TenantId>,
+    /// A transaction coordinator's branch (the transaction's connection to
+    /// one cluster): its connections come from pools of their own. A
+    /// session holding a branch connection may still lease one for its own
+    /// statements (preparing a statement during the transaction); from
+    /// the same pool, sessions that each hold a branch could wait on each
+    /// other until every wait times out.
+    pub txn_branch: bool,
 }
 
 impl Default for SessionOpts {
@@ -61,6 +73,8 @@ impl Default for SessionOpts {
             collation: 45,
             schema: None,
             shard: ShardId(0),
+            relay: None,
+            txn_branch: false,
         }
     }
 }
@@ -127,7 +141,20 @@ enum Sent {
     /// The Galera check didn't finish in time; the connection is still
     /// busy with it and must be dropped.
     WaitTimedOut,
+    /// [`TRX_GUARD`] failed: the transaction is gone and the statement
+    /// wasn't run; the connection is idle and reusable. `None` for the
+    /// guard's own error (no transaction open); otherwise the error the
+    /// server reported in its place, such as the 1213 of an abort it did
+    /// report.
+    TrxGone(Option<ErrPacket>),
 }
+
+/// Run before a write inside a Galera transaction: fails with 1242, and
+/// stops the statement after it, when no transaction is open. Galera can
+/// roll a transaction back without an error; the write would then run,
+/// and commit, on its own.
+const TRX_GUARD: &str = "SET @__sprig_t = (SELECT CASE WHEN @@in_transaction = 1 THEN 1 \
+                         ELSE (SELECT 1 UNION SELECT 2) END)";
 
 /// What the gateway answers itself after a release.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -171,6 +198,11 @@ pub struct StmtOutcome {
 #[allow(clippy::struct_excessive_bools)] // independent flags of one statement
 struct Current {
     lease: BackendLease,
+    /// An autocommit write on a relayed connection: the gateway opened a
+    /// transaction for it, and commits in a round trip of its own once
+    /// the write answered (so a write waiting for a held branch's rows
+    /// never commits after its client is gone).
+    wrapped: bool,
     stmt: StmtInfo,
     route: RouteKind,
     first: Option<RespPacket>,
@@ -198,9 +230,65 @@ struct Current {
     /// `finish` drops the statement. A light child of the request's span,
     /// not a `tracing` span.
     span: Option<sprig_common::telemetry::trace::ChildSpan>,
+    /// A plain `SELECT`, `INSERT`, `UPDATE`, `DELETE` or `REPLACE` inside
+    /// a transaction on Galera: it can't end the transaction, so an answer
+    /// saying the transaction is gone means Galera aborted it silently.
+    galera_dml_in_trx: bool,
+    /// Such a statement in a transaction that had written (the tracked
+    /// state's `W`). With `autocommit = 0` the statement after a silent
+    /// abort opens a new transaction, so its answer says a transaction is
+    /// open; a reported state without the `W` shows it isn't the one that
+    /// wrote.
+    wrote_before: bool,
+    /// A plain `INSERT`, `UPDATE`, `DELETE` or `REPLACE` on Galera, with
+    /// `autocommit = 0` and no transaction open: it opens one (tenant
+    /// tables are `InnoDB`; sessions with temporary tables, which may not
+    /// be, are left out), so an answer saying none is open means Galera
+    /// aborted it silently.
+    opens_implicit: bool,
+    /// A silent abort was seen while the backend had a transaction open
+    /// (the new one `wrote_before` describes): it is rolled back before
+    /// the connection serves the session again, as the client was told.
+    rollback_after: bool,
+    /// The statement may take row locks, or isn't one the statement check
+    /// covers: anything but a plain read, a prepare or `BEGIN` (see
+    /// [`BackendSession::trx_locks`]).
+    takes_locks: bool,
 }
 
 impl Current {
+    /// Whether `p` ends this statement showing that Galera rolled the
+    /// transaction back without an error (see `galera_dml_in_trx`,
+    /// `wrote_before` and `opens_implicit`).
+    fn ended_silently(&self, p: &RespPacket) -> bool {
+        p.status().is_some_and(|s| {
+            shows_silent_abort(
+                s,
+                p.tracked.trx_state.as_deref(),
+                self.galera_dml_in_trx || self.opens_implicit,
+                self.wrote_before,
+            )
+        })
+    }
+
+    /// Answers `p` (the statement's last packet, see
+    /// [`ended_silently`](Self::ended_silently)) with MariaDB's 1213 instead:
+    /// counts it, and records that no transaction is open afterwards, after
+    /// rolling back the one the backend may have opened since.
+    fn silent_abort(
+        &mut self,
+        p: &RespPacket,
+        cluster: &sprig_common::ids::ClusterId,
+        what: &str,
+    ) -> RespPacket {
+        let node = self.lease.key().node_key();
+        note_silent_abort(cluster, &node, what);
+        let status = p.status().unwrap_or_default();
+        self.rollback_after = status.contains(StatusFlags::IN_TRANS);
+        self.status = Some(status - StatusFlags::IN_TRANS);
+        silent_abort_packet(self.lease.conn_ref().client.caps())
+    }
+
     fn observe(&mut self, p: &RespPacket) {
         match &p.kind {
             PacketKind::Ok(ok) => {
@@ -264,6 +352,7 @@ enum Req<'a> {
 
 /// One client session's backend side: its client-visible state, pins,
 /// held connection, causal position and captures.
+#[allow(clippy::struct_excessive_bools)] // independent per-session flags
 pub struct BackendSession {
     backends: Arc<Backends>,
     target: BackendTarget,
@@ -294,6 +383,9 @@ pub struct BackendSession {
     /// Sprig 2PC: a held branch's record of its writes
     /// (`sprig_txn::BranchConn::start_redo`, in `backend::txn`).
     pub(super) redo: Option<super::txn::Recording>,
+    /// Sprig 2PC's relay path on a cluster without a ready relay: this
+    /// connection may not hold a branch (`start_redo` says no).
+    pub(super) redo_off: bool,
     /// The held connection (thread id) and when its database-level
     /// grants were last refreshed with a `USE`.
     grants_seen: Option<(u64, std::time::Instant)>,
@@ -305,6 +397,17 @@ pub struct BackendSession {
     /// [`Self::release_kept`]. Boxed: a lease holds its connection inline,
     /// and futures that own a session would grow by its size.
     kept: Option<Box<BackendLease>>,
+    /// The open (or next) transaction may hold row locks, or ran a
+    /// statement whose answer isn't checked for a silent abort: a write, a
+    /// locking read or any statement but a plain read ran in it, its reads
+    /// lock (`SERIALIZABLE`), or `SET TRANSACTION` preceded it. Until then a
+    /// Galera write runs without [`TRX_GUARD`].
+    trx_locks: bool,
+    /// The statement running is the transaction coordinator's own
+    /// (`sprig_txn::BranchConn::control`, in `backend::txn`), with the
+    /// coordinator settings it changes (`true`) or puts back (`false`)
+    /// once it succeeds.
+    pub(super) txn_ctl: Option<Vec<(TxnSetting, bool)>>,
 }
 
 impl std::fmt::Debug for BackendSession {
@@ -330,6 +433,211 @@ fn backend_err(e: &ErrPacket) -> SprigError {
 }
 
 /// Server errors after which the server closes the connection.
+/// Whether a transaction state (`session_track_transaction_info =
+/// STATE`, such as `T___W___`) says the transaction wrote transactional
+/// tables.
+fn trx_wrote(state: &str) -> bool {
+    state.as_bytes().get(4) == Some(&b'W')
+}
+
+/// Whether a Galera COMMIT answered `ok` produced no GTID: the transaction
+/// that wrote was rolled back without an error. Galera can abort a
+/// transaction for another node's conflicting write set while it runs a
+/// statement that doesn't wait for locks, answer that statement
+/// normally, and then answer COMMIT with OK: nothing was written. The OK
+/// of a commit that wrote reports its GTID (`last_gtid`); without one, the
+/// GTID is read, since MariaDB 11.8 can report `timestamp` in its place.
+/// A GTID that can't be read counts as written: only a known non-commit is
+/// turned into an error.
+async fn commit_wrote_nothing(cur: &mut Current, ok: &RespPacket, before: Option<&str>) -> bool {
+    if let Some(g) = ok.tracked.gtid.as_deref() {
+        return gtid_unchanged(before, g);
+    }
+    match cur.lease.conn().capture_last_gtid().await {
+        Ok(g) => gtid_unchanged(before, &g),
+        Err(e) => {
+            tracing::debug!(error = %e, "reading last_gtid after a Galera commit failed");
+            false
+        }
+    }
+}
+
+/// Whether `sql` is a plain `SELECT`, `INSERT`, `UPDATE`, `DELETE`,
+/// `REPLACE` or `WITH`: a statement that can't end a transaction (stored
+/// functions and triggers can't commit), after any leading comments.
+/// Whether `p` ends a statement's response.
+fn ends_response(p: &RespPacket) -> bool {
+    match &p.kind {
+        PacketKind::Err(_) => true,
+        PacketKind::Ok(_) | PacketKind::End(_) => !p
+            .status()
+            .unwrap_or_default()
+            .contains(StatusFlags::MORE_RESULTS_EXISTS),
+        _ => false,
+    }
+}
+
+/// `p` (an OK, or an OK-form or EOF terminator) without
+/// `SERVER_STATUS_IN_TRANS`: the transaction the gateway opened around an
+/// autocommit write has committed.
+fn without_in_trans(mut p: RespPacket) -> RespPacket {
+    let b = &p.payload;
+    // OK (0x00) and OK-form terminators (0xfe, long): affected rows and
+    // the insert id, length-encoded, then the status. EOF (0xfe, short):
+    // warnings, then the status.
+    let at = match b.first() {
+        Some(0xfe) if b.len() < 9 => Some(3),
+        Some(0x00 | 0xfe) => lenenc_len(b, 1).and_then(|n| lenenc_len(b, 1 + n).map(|m| 1 + n + m)),
+        _ => None,
+    };
+    if let Some(at) = at
+        && b.len() >= at + 2
+    {
+        let mut v = b.to_vec();
+        let st = u16::from_le_bytes([v[at], v[at + 1]]) & !StatusFlags::IN_TRANS.bits();
+        v[at..at + 2].copy_from_slice(&st.to_le_bytes());
+        p.payload = Bytes::from(v);
+        if let PacketKind::Ok(ok) = &mut p.kind {
+            ok.status -= StatusFlags::IN_TRANS;
+        }
+    }
+    p
+}
+
+/// The length of the length-encoded integer at `b[at]`.
+fn lenenc_len(b: &[u8], at: usize) -> Option<usize> {
+    match *b.get(at)? {
+        x if x < 0xfb => Some(1),
+        0xfc => Some(3),
+        0xfd => Some(4),
+        0xfe => Some(9),
+        _ => None,
+    }
+}
+
+/// Sprig 2PC's relay preamble for `tenant`.
+fn relay_preamble(tenant: sprig_common::ids::TenantId) -> Vec<u8> {
+    sprig_txn::fence::wire::preamble(tenant)
+}
+
+fn plain_dml(sql: &[u8]) -> bool {
+    first_word_in(
+        sql,
+        &["SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE", "WITH"],
+    )
+}
+
+/// Whether `sql` is a plain `INSERT`, `UPDATE`, `DELETE` or `REPLACE`: with
+/// `autocommit = 0` it opens a transaction on an `InnoDB` table even when it
+/// changes no row (a `SELECT` may read no table at all).
+fn plain_write(sql: &[u8]) -> bool {
+    first_word_in(sql, &["INSERT", "UPDATE", "DELETE", "REPLACE"])
+}
+
+/// Whether `sql`'s first word, after leading comments, is one of `words`.
+/// An executable comment (`/*!` or `/*M!`) first makes it `false`: it holds
+/// SQL.
+fn first_word_in(sql: &[u8], words: &[&str]) -> bool {
+    let Some(s) = skip_comments(sql) else {
+        return false;
+    };
+    let word = s
+        .iter()
+        .position(|b| !b.is_ascii_alphabetic())
+        .map_or(s, |n| &s[..n]);
+    words
+        .iter()
+        .any(|k| word.eq_ignore_ascii_case(k.as_bytes()))
+}
+
+/// `sql` after leading white space and comments (`/* … */`, `-- …` and
+/// `# …` lines, as ORMs add them); `None` at an executable comment or an
+/// unterminated one.
+fn skip_comments(sql: &[u8]) -> Option<&[u8]> {
+    let mut s = sql.trim_ascii_start();
+    loop {
+        if let Some(rest) = s.strip_prefix(b"/*") {
+            if rest.starts_with(b"!") || rest.starts_with(b"M!") {
+                return None;
+            }
+            let end = rest.windows(2).position(|w| w == b"*/")?;
+            s = rest[end + 2..].trim_ascii_start();
+        } else if s.starts_with(b"#")
+            || (s.starts_with(b"--") && s.get(2).is_some_and(u8::is_ascii_whitespace))
+        {
+            let end = s.iter().position(|b| *b == b'\n')?;
+            s = s[end + 1..].trim_ascii_start();
+        } else {
+            return Some(s);
+        }
+    }
+}
+
+/// Whether a statement's last packet (`status`, and the transaction state
+/// it reported, if any) shows that Galera rolled the transaction back
+/// without an error: no transaction is open after a statement that must
+/// leave one open (`needs_trx`), or the open one isn't the one that wrote
+/// (`wrote_before`: its reported state has no `W`).
+fn shows_silent_abort(
+    status: StatusFlags,
+    trx_state: Option<&str>,
+    needs_trx: bool,
+    wrote_before: bool,
+) -> bool {
+    if status.contains(StatusFlags::MORE_RESULTS_EXISTS) {
+        return false;
+    }
+    if !status.contains(StatusFlags::IN_TRANS) {
+        return needs_trx;
+    }
+    wrote_before && trx_state.is_some_and(|t| !trx_wrote(t))
+}
+
+/// Logs and counts a transaction Galera rolled back while answering OK
+/// (`what`: the statement whose answer showed it).
+fn note_silent_abort(cluster: &sprig_common::ids::ClusterId, node: &NodeKey, what: &str) {
+    tracing::warn!(
+        node = %node,
+        "Galera answered {what} with OK, but the transaction was rolled back and wrote nothing; answering 1213"
+    );
+    metrics::counter!("sprig_backend_silent_aborts_total", "cluster" => cluster.to_string())
+        .increment(1);
+}
+
+/// Whether the connection's GTID after a commit (`after`, empty for none)
+/// is the one it had before (`before`): the commit wrote nothing.
+fn gtid_unchanged(before: Option<&str>, after: &str) -> bool {
+    after.is_empty() || before == Some(after)
+}
+
+/// The error a failed [`TRX_GUARD`] reports: `None` for the guard's own
+/// (1242, no transaction open: a silent abort), else the server's, such as
+/// the 1213 of an abort it reported as usual.
+fn reported(e: ErrPacket) -> Option<ErrPacket> {
+    (e.code != 1242).then_some(e)
+}
+
+/// MariaDB's own deadlock error, the answer for a transaction Galera rolled
+/// back silently: it tells the client the transaction is gone and may be
+/// retried.
+fn silent_abort_err() -> ErrPacket {
+    ErrPacket::new(
+        1213,
+        *b"40001",
+        "Deadlock found when trying to get lock; try restarting transaction",
+    )
+}
+
+/// [`silent_abort_err`] as a response packet, in place of an OK.
+fn silent_abort_packet(caps: Caps) -> RespPacket {
+    let e = silent_abort_err();
+    RespPacket {
+        payload: e.encode(caps),
+        kind: PacketKind::Err(e),
+        tracked: TrackedChanges::default(),
+    }
+}
+
 fn conn_fatal(code: u16) -> bool {
     // 1927 ER_CONNECTION_KILLED, 1053 ER_SERVER_SHUTDOWN, 1152
     // ER_ABORTING_CONNECTION, 4031 (idle disconnect).
@@ -424,8 +732,11 @@ impl BackendSession {
             explicit_ids_next: false,
             trace_ctx: None,
             redo: None,
+            redo_off: false,
             keep: false,
             kept: None,
+            trx_locks: false,
+            txn_ctl: None,
         }
     }
 
@@ -467,7 +778,9 @@ impl BackendSession {
             && key.node == node.node
             && key.account == self.target.user
             && key.found_rows == self.opts.found_rows
-            && key.mariadb_caps == self.opts.mariadb_caps.bits();
+            && key.mariadb_caps == self.opts.mariadb_caps.bits()
+            && key.relay == self.relay_via(view)
+            && key.branch == self.opts.txn_branch;
         let limits = self.backends.limits(&self.target.cluster);
         let retired = self
             .backends
@@ -758,6 +1071,77 @@ impl BackendSession {
     /// # Errors
     /// The lost-connection errors of the module docs.
     pub async fn next(&mut self) -> Result<Option<RespPacket>> {
+        match self.next_packet().await? {
+            Some(p) if self.cur.as_ref().is_some_and(|c| c.wrapped) && ends_response(&p) => {
+                self.commit_wrapped(p).await.map(Some)
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// The end of a wrapped autocommit write's response: `COMMIT` (or,
+    /// after an error, `ROLLBACK`) in a round trip of its own. The
+    /// client gets the write's answer only once it committed; a failed
+    /// `COMMIT` answers in its place.
+    async fn commit_wrapped(&mut self, p: RespPacket) -> Result<RespPacket> {
+        let Some(cur) = self.cur.as_mut() else {
+            return Ok(p);
+        };
+        cur.wrapped = false;
+        let rollback = matches!(p.kind, PacketKind::Err(_));
+        let r: std::result::Result<Vec<RespPacket>, ClientError> = async {
+            let client = &mut cur.lease.conn().client;
+            // The write's response is complete: read its end.
+            while client.next_packet().await?.is_some() {}
+            client
+                .send_query(if rollback { b"ROLLBACK" } else { b"COMMIT" })
+                .await?;
+            let mut v = Vec::new();
+            while let Some(q) = client.next_packet().await? {
+                v.push(q);
+            }
+            Ok(v)
+        }
+        .await;
+        cur.done = true;
+        match r {
+            Ok(pkts) => {
+                let (last_ok, warnings, error) =
+                    (cur.last_ok.clone(), cur.warnings, cur.error.clone());
+                let mut failed = None;
+                for q in &pkts {
+                    if matches!(q.kind, PacketKind::Err(_)) {
+                        failed = Some(q.clone());
+                    }
+                    cur.observe(q);
+                }
+                if rollback {
+                    cur.error = error;
+                    return Ok(p);
+                }
+                if let Some(f) = failed {
+                    metrics::counter!("sprig_backend_wrapped_commit_failures_total", "cluster" => self.target.cluster.to_string())
+                        .increment(1);
+                    return Ok(f);
+                }
+                cur.last_ok = last_ok;
+                cur.warnings = warnings;
+                let status = cur.status.unwrap_or_default() - StatusFlags::IN_TRANS;
+                cur.status = Some(status);
+                Ok(without_in_trans(p))
+            }
+            Err(e) if e.is_connection_lost() => {
+                cur.failed = true;
+                let node = cur.lease.key().node_key();
+                let stmt = cur.stmt.clone();
+                self.backends.note_failure(&node, "io");
+                Err(self.lost(&stmt, false, true, &node))
+            }
+            Err(e) => Err(internal(&e)),
+        }
+    }
+
+    async fn next_packet(&mut self) -> Result<Option<RespPacket>> {
         let Some(cur) = self.cur.as_mut() else {
             return Ok(None);
         };
@@ -772,7 +1156,10 @@ impl BackendSession {
         let packet = cur.lease.conn().client.next_packet().await;
         crate::observe::backend_time(waited.elapsed());
         match packet {
-            Ok(Some(p)) => {
+            Ok(Some(mut p)) => {
+                if cur.ended_silently(&p) {
+                    p = cur.silent_abort(&p, &self.target.cluster, "a statement");
+                }
                 cur.observe(&p);
                 cur.relayed = true;
                 Ok(Some(p))
@@ -911,9 +1298,25 @@ impl BackendSession {
             return Ok(o);
         }
 
+        if cur.rollback_after {
+            // A silent abort answered while the backend had opened another
+            // transaction since: roll it back, as the client was told.
+            if let Err(e) = cur.lease.conn().client.query_drop("ROLLBACK").await {
+                tracing::warn!(node = %node, error = %e, "rolling back after a silent abort failed; closing the connection");
+                self.pins.after_statement(StatusFlags::empty());
+                let o = outcome(&cur, false);
+                drop(cur);
+                self.connection_gone();
+                return Ok(o);
+            }
+        }
+
         // Session tracking: schema, variables, commit GTIDs, untracked state.
         let mut observed = state::observe(&cur.tracked);
         if Self::drop_set_statement_reports(&mut cur, &mut observed) {
+            observed.unexplained = false;
+        }
+        if self.drop_txn_setting_reports(&mut observed) {
             observed.unexplained = false;
         }
         self.vars.apply(&observed);
@@ -1020,6 +1423,17 @@ impl BackendSession {
             && self.pins.after_statement(st)
         {
             self.count_pin(PinReason::Transaction);
+        }
+        // The coordinator's settings, as its statement left them.
+        if let Some(changes) = &self.txn_ctl
+            && cur.error.is_none()
+        {
+            for &(setting, changed) in changes {
+                self.pins.set_txn_setting(setting, changed);
+            }
+        }
+        if cur.takes_locks && self.pins.in_transaction() {
+            self.trx_locks = true;
         }
         for v in &cur.stmt.assigns_user_vars {
             if !self.pending_capture.contains(v) {
@@ -1173,6 +1587,35 @@ impl BackendSession {
             .chain(scoped.iter().cloned())
             .collect();
         observed.vars.len() + observed.untracked.len() != before
+    }
+
+    /// MariaDB's reports of the transaction coordinator's own settings. They
+    /// aren't session state to replay or pin as `Untracked`: the
+    /// coordinator's statements keep [`PinReason::TxnSettings`] instead,
+    /// until it puts them back. A coordinator statement's reports of
+    /// `innodb_lock_wait_timeout` and `timestamp` are dropped, and so is
+    /// `timestamp` while the coordinator's clock is fixed (MariaDB reports
+    /// it again after a commit on such a connection; whatever set it, the
+    /// coordinator's reset to `DEFAULT` comes before the connection can
+    /// leave). Returns whether the statement's state change is then
+    /// explained: a coordinator statement changes nothing else, a client
+    /// statement only if nothing else was reported.
+    fn drop_txn_setting_reports(&self, observed: &mut state::Observed) -> bool {
+        let coordinator = self.txn_ctl.is_some();
+        if !coordinator && !self.pins.txn_setting(TxnSetting::Clock) {
+            return false;
+        }
+        let before = observed.untracked.len();
+        observed.untracked.retain(|n| match n.as_str() {
+            "timestamp" => false,
+            "innodb_lock_wait_timeout" => !coordinator,
+            _ => true,
+        });
+        coordinator
+            || (observed.untracked.len() != before
+                && observed.untracked.is_empty()
+                && observed.vars.is_empty()
+                && observed.schema.is_none())
     }
 
     /// A client statement set gateway-owned variables: keep the client's
@@ -1357,6 +1800,17 @@ impl BackendSession {
             .is_some_and(|v| v.eq_ignore_ascii_case("OFF") || v == "0")
     }
 
+    /// Whether the session's transactions are `SERIALIZABLE`, where plain
+    /// reads take shared locks too.
+    fn serializable(&self) -> bool {
+        ["transaction_isolation", "tx_isolation"].iter().any(|k| {
+            self.vars
+                .vars
+                .get(*k)
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("SERIALIZABLE"))
+        })
+    }
+
     /// The causal target of a read.
     fn causal_target(&self, settings: &BackendSettings) -> GtidSet {
         let mut t = self.causal.clone();
@@ -1385,6 +1839,8 @@ impl BackendSession {
             account: self.target.user.clone(),
             found_rows: self.opts.found_rows,
             mariadb_caps: self.opts.mariadb_caps.bits(),
+            relay: self.relay_via(view),
+            branch: self.opts.txn_branch,
         };
         let node_key = view.key(&node.node);
         let budget = b.budget(&node_key);
@@ -1418,6 +1874,7 @@ impl BackendSession {
                         connect_timeout: settings.connect_timeout,
                         net_write_timeout_secs: settings.net_write_timeout_secs,
                         wait_timeout_secs: settings.idle_timeout.as_secs().max(300) + 300,
+                        preamble: key.relay.map(relay_preamble),
                     };
                     let r = conn::connect(&spec, Arc::clone(&budget)).await;
                     let outcome = if r.is_ok() { "ok" } else { "error" };
@@ -1432,6 +1889,114 @@ impl BackendSession {
             .await;
         stmt_metrics::pool_wait(&view.id).record(started.elapsed().as_secs_f64());
         r
+    }
+
+    /// The tenant whose connections to `view`'s cluster go through its
+    /// relay writer: the session is on the relay path and the cluster has
+    /// relays.
+    fn relay_via(&self, view: &ClusterView) -> Option<sprig_common::ids::TenantId> {
+        use sprig_cluster::failover::relay::RelayState;
+        self.opts.relay.filter(|_| view.relay != RelayState::None)
+    }
+
+    /// This session is a transaction coordinator's branch: its connections
+    /// come from the branch pools ([`SessionOpts::txn_branch`]).
+    pub fn set_txn_branch(&mut self) {
+        self.opts.txn_branch = true;
+    }
+
+    /// This session may not hold a Sprig 2PC branch (the relay path on a
+    /// cluster without a ready relay writer).
+    pub fn forbid_redo(&mut self) {
+        self.redo_off = true;
+    }
+
+    /// The tenant whose connections go through relays, if any.
+    #[must_use]
+    pub fn relay(&self) -> Option<sprig_common::ids::TenantId> {
+        self.opts.relay
+    }
+
+    /// Changes the session's relay path (a settings change): connections
+    /// leased from now on follow it.
+    pub fn set_relay(&mut self, relay: Option<sprig_common::ids::TenantId>) {
+        self.opts.relay = relay;
+    }
+
+    /// Whether `cluster` takes this session's connections through a ready
+    /// relay writer (a held branch there is fenced by the relay).
+    ///
+    /// # Errors
+    /// As [`Backends::view`].
+    pub async fn relay_ready(&self, cluster: &ClusterId) -> Result<Option<RelayLease>> {
+        use sprig_cluster::failover::relay::RelayState;
+        if self.opts.relay.is_none() {
+            return Ok(None);
+        }
+        Ok(match &self.backends.view(cluster).await?.relay {
+            RelayState::Ready(l) => Some(l.clone()),
+            _ => None,
+        })
+    }
+
+    /// A relayed tenant's connection: every statement, reads included, goes
+    /// to the relay writer, through its relay. While the cluster has no
+    /// ready relay writer (a takeover recovering held branches), it waits
+    /// until the deadline, then fails with 39448 (retryable).
+    async fn relay_lease(
+        &mut self,
+        view: &ClusterView,
+        settings: &BackendSettings,
+        deadline: Instant,
+    ) -> Result<(BackendLease, RouteKind, Wait)> {
+        use sprig_cluster::failover::relay::RelayState;
+        let mut fresh: Option<Arc<ClusterView>> = None;
+        loop {
+            let v = fresh.as_deref().unwrap_or(view);
+            let why = match &v.relay {
+                RelayState::Ready(l) => {
+                    let node = NodeRef {
+                        node: NodeId::new(&l.node_id)
+                            .map_err(|e| SprigError::internal(format!("relay lease node: {e}")))?,
+                        addr: l.relay_addr.clone(),
+                    };
+                    if let Some(k) = self.take_kept(v, &node) {
+                        return Ok((k, RouteKind::Writer, Wait::None));
+                    }
+                    match Box::pin(self.lease(v, &node, settings, deadline)).await {
+                        Ok(k) => return Ok((k, RouteKind::Writer, Wait::None)),
+                        Err(AcquireError::Timeout) => return Err(pool_timeout()),
+                        Err(AcquireError::Connect(e)) => match e.server_error() {
+                            Some(err) if err.code == sprig_txn::fence::FENCED_ERRNO => {
+                                format!("the relay refused: {}", err.message)
+                            }
+                            Some(err) => {
+                                return Err(unavailable(format!(
+                                    "backend login through the relay on {} failed: {} {}",
+                                    node.node, err.code, err.message
+                                )));
+                            }
+                            None => format!("relay {}: {e}", node.addr),
+                        },
+                    }
+                }
+                RelayState::Unavailable(why) => why.clone(),
+                RelayState::None => {
+                    return Err(unavailable("the cluster's relays went away"));
+                }
+            };
+            if Instant::now() >= deadline {
+                return Err(SprigError::new(
+                    SprigCode::HeldBranchFenced,
+                    format!(
+                        "cluster {} has no ready relay writer ({why}); retry",
+                        view.id
+                    ),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            fresh = Some(self.backends.view(&view.id).await?);
+        }
     }
 
     /// Chooses the node (writer, or a reader for a plain read) and leases a
@@ -1466,6 +2031,9 @@ impl BackendSession {
             && !self.implicit_transactions()
             && !self.client_sync_wait();
         let mut last_err: Option<String> = None;
+        if self.relay_via(view).is_some() {
+            return self.relay_lease(view, settings, deadline).await;
+        }
         loop {
             let writer = self.backends.writers.writer(view, shard);
             let (node, route, wait) = if plain {
@@ -1619,6 +2187,39 @@ impl BackendSession {
         let mut sync_retried = false;
         let mut io_retried = false;
         let text = matches!(req, Req::Text(_));
+        let galera = view.topology == TopologyKind::Galera;
+        let stmt_sql = match &req {
+            Req::Text(sql) | Req::Binary { sql, .. } if info.effects.is_empty() => Some(*sql),
+            _ => None,
+        };
+        let galera_dml_in_trx = galera && in_trx_before && stmt_sql.is_some_and(plain_dml);
+        let opens_implicit = galera
+            && !in_trx_before
+            && stmt_sql.is_some_and(plain_write)
+            && self.implicit_transactions()
+            && !self
+                .pins
+                .reasons()
+                .iter()
+                .any(|r| matches!(r, PinReason::TempTables(_)));
+        if !in_trx_before {
+            // The next transaction holds no locks yet, unless all its reads
+            // lock or `SET TRANSACTION` set its characteristics.
+            self.trx_locks = galera && (self.pins.next_transaction_set() || self.serializable());
+        }
+        // A write in such a transaction runs only if the transaction is
+        // still open (`TRX_GUARD`). Galera aborts a transaction only for
+        // locks another node's write set needs, so before the first write
+        // or locking read the guard is left out: nothing can have aborted
+        // the transaction yet, and an abort for the write's own locks shows
+        // in its answer.
+        let guard = galera_dml_in_trx && info.class == StmtClass::Write && self.trx_locks;
+        // Anything but a plain read (which the statement check covers)
+        // turns the guard on for the rest of the transaction.
+        let takes_locks = galera
+            && (info.class == StmtClass::Write || !stmt_sql.is_some_and(plain_dml))
+            && !matches!(req, Req::Prepare { .. })
+            && !info.effects.contains(&Effect::Begin);
         // `USE x` sets the schema itself, so any pooled connection serves
         // it, including one that already has a default schema.
         let sets_schema = matches!(req, Req::Text(sql) if is_use(sql));
@@ -1656,6 +2257,20 @@ impl BackendSession {
             let node_key = lease.key().node_key();
             self.inflight = Some((node_key.clone(), lease.conn_ref().thread_id));
             let conn = lease.conn();
+            // A Galera COMMIT of a transaction that wrote must produce a
+            // GTID: the connection's last one, to compare.
+            let commit_check = (view.topology == TopologyKind::Galera
+                && in_trx_before
+                && info.effects.contains(&Effect::Commit)
+                && !self
+                    .pins
+                    .reasons()
+                    .iter()
+                    .any(|r| matches!(r, PinReason::TempTables(_)))
+                && conn.client.tracker().trx_state().is_some_and(trx_wrote))
+            .then(|| conn.client.tracker().last_gtid().map(str::to_owned));
+            let wrote_before =
+                galera_dml_in_trx && conn.client.tracker().trx_state().is_some_and(trx_wrote);
             if self.vars.schema.is_none()
                 && conn.applied.schema.is_some()
                 && route != RouteKind::Pinned
@@ -1674,7 +2289,7 @@ impl BackendSession {
             // would otherwise write the session's older value over them: a
             // pinned session's `SET @v = ...` and then a read of `@v`, on a
             // pooled connection that held `@v` for an earlier session, read
-            // NULL (found by rlsprep, S163).
+            // NULL.
             if route == RouteKind::Pinned && !self.pending_capture.is_empty() {
                 let names = std::mem::take(&mut self.pending_capture);
                 match conn.capture_user_vars(&names).await {
@@ -1716,7 +2331,16 @@ impl BackendSession {
             };
             let base = Arc::clone(&conn.baseline);
             self.vars.settle_login(&base);
-            let (prefix, next_applied) =
+            // An autocommit write on a relayed connection never commits in
+            // the round trip that ran it: a write waiting for a held
+            // branch's rows when the relay dies would otherwise commit
+            // although its client is gone.
+            let wrapped = conn.relayed
+                && !in_trx_before
+                && !self.pins.in_transaction()
+                && !self.implicit_transactions()
+                && stmt_sql.is_some_and(plain_write);
+            let (mut prefix, next_applied) =
                 match state::sync_prefix(&conn.applied, &base, &self.vars, info, 0) {
                     Ok(x) => x,
                     Err(state::Unreplayable(why)) => {
@@ -1729,6 +2353,9 @@ impl BackendSession {
                         ));
                     }
                 };
+            if wrapped {
+                prefix.push("START TRANSACTION".to_owned());
+            }
             let kind = match (prefix.is_empty(), text) {
                 (true, _) => "none",
                 (false, true) => "prefix",
@@ -1744,6 +2371,10 @@ impl BackendSession {
                     let mut all = Vec::with_capacity(sql.len() + 256);
                     for p in &prefix {
                         all.extend_from_slice(p.as_bytes());
+                        all.extend_from_slice(b"; ");
+                    }
+                    if guard {
+                        all.extend_from_slice(TRX_GUARD.as_bytes());
                         all.extend_from_slice(b"; ");
                     }
                     match &wait {
@@ -1777,6 +2408,9 @@ impl BackendSession {
                             return Ok(Sent::SyncErr(e));
                         }
                     }
+                    if guard && let Some(e) = consume_statement(conn).await? {
+                        return Ok(Sent::TrxGone(reported(e)));
+                    }
                     return Ok(match &wait {
                         Wait::None => Sent::Ready,
                         Wait::Replica(_) => match consume_statement(conn).await? {
@@ -1801,6 +2435,13 @@ impl BackendSession {
                     match conn.client.query(&prefix.join("; ")).await {
                         Ok(_) => {}
                         Err(ClientError::Server(e)) => return Ok(Sent::SyncErr(e)),
+                        Err(e) => return Err(e),
+                    }
+                }
+                if guard {
+                    match conn.client.query_drop(TRX_GUARD).await {
+                        Ok(()) => {}
+                        Err(ClientError::Server(e)) => return Ok(Sent::TrxGone(reported(e))),
                         Err(e) => return Err(e),
                     }
                 }
@@ -1839,6 +2480,23 @@ impl BackendSession {
             let waited = !matches!(wait, Wait::None);
             match sent {
                 Ok(Sent::Ready) => {}
+                Ok(Sent::TrxGone(reported)) => {
+                    // The sync statements before the guard ran.
+                    conn.applied = next_applied;
+                    conn.client.take_changes();
+                    if reported.is_none() {
+                        note_silent_abort(&cluster, &node_key, "a write's transaction check");
+                    }
+                    self.pins.after_statement(StatusFlags::empty());
+                    if route == RouteKind::Pinned {
+                        self.held = Some((lease, route));
+                    } else {
+                        let limits = self.backends.limits(&cluster);
+                        self.backends.pools.release(lease, Release::Reuse, limits);
+                    }
+                    self.inflight = None;
+                    return Err(backend_err(&reported.unwrap_or_else(silent_abort_err)));
+                }
                 Ok(Sent::WaitFailed | Sent::WaitTimedOut) => {
                     // The read reruns on the writer (the replica, or the
                     // Galera node, was too slow).
@@ -1945,6 +2603,7 @@ impl BackendSession {
             };
             let prepared_only = matches!(req, Req::Prepare { .. });
             let mut cur = Current {
+                wrapped,
                 lease,
                 stmt: info.clone(),
                 route,
@@ -1964,6 +2623,11 @@ impl BackendSession {
                 sets_schema,
                 explicit_ids,
                 span: None,
+                galera_dml_in_trx,
+                wrote_before,
+                opens_implicit,
+                rollback_after: false,
+                takes_locks,
             };
             let first = match outgoing {
                 // A prepare has no response beyond what prepare_cached read.
@@ -2004,7 +2668,25 @@ impl BackendSession {
                 continue;
             }
             match first {
-                Ok(first) => {
+                Ok(mut first) => {
+                    let silent = match &first {
+                        Some(p) if cur.ended_silently(p) => Some("a statement"),
+                        Some(p) => match &commit_check {
+                            Some(before)
+                                if matches!(p.kind, PacketKind::Ok(_))
+                                    && !p.more_results()
+                                    && commit_wrote_nothing(&mut cur, p, before.as_deref())
+                                        .await =>
+                            {
+                                Some("COMMIT")
+                            }
+                            _ => None,
+                        },
+                        None => None,
+                    };
+                    if let (Some(what), Some(p)) = (silent, &first) {
+                        first = Some(cur.silent_abort(p, &cluster, what));
+                    }
                     cur.done = first.is_none();
                     if let Some(p) = &first {
                         cur.observe(p);
@@ -2308,6 +2990,150 @@ mod stmt_metrics {
                 })
                 .clone()
         })
+    }
+}
+
+#[cfg(test)]
+mod silent_abort_tests {
+    use sprig_proto_mysql::Caps;
+    use sprig_proto_mysql::client::PacketKind;
+
+    use sprig_proto_mysql::StatusFlags;
+
+    use super::{
+        gtid_unchanged, plain_dml, plain_write, shows_silent_abort, silent_abort_packet, trx_wrote,
+    };
+
+    #[test]
+    fn only_plain_dml_counts_as_unable_to_end_a_transaction() {
+        for sql in [
+            "SELECT v FROM t WHERE k = ?",
+            "  insert into t values (1)",
+            "UPDATE t SET v = 1",
+            "delete from t",
+            "REPLACE INTO t VALUES (1)",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+        ] {
+            assert!(plain_dml(sql.as_bytes()), "{sql}");
+        }
+        for sql in [
+            "COMMIT",
+            "CALL p()",
+            "SET autocommit = 1",
+            "LOCK TABLES t WRITE",
+            "SELECTED",
+            "",
+            // Executable comments hold SQL; an unterminated comment is
+            // left alone.
+            "/*!40101 COMMIT */ SELECT 1",
+            "/*M!100100 COMMIT */ SELECT 1",
+            "/* c SELECT 1",
+            "-- c SELECT 1",
+            "--c\nSELECT 1",
+        ] {
+            assert!(!plain_dml(sql.as_bytes()), "{sql}");
+        }
+        // Comments an ORM adds come before the statement.
+        for sql in [
+            "/* load Order */ SELECT v FROM t",
+            "/* a */ /* b */\n  update t SET v = 1",
+            "-- c\nINSERT INTO t VALUES (1)",
+            "# c\r\nDELETE FROM t",
+        ] {
+            assert!(plain_dml(sql.as_bytes()), "{sql}");
+        }
+    }
+
+    #[test]
+    fn only_plain_writes_always_open_a_transaction() {
+        for sql in [
+            "INSERT INTO t VALUES (?)",
+            "  update t SET v = 1 WHERE k = 0",
+            "DELETE FROM t LIMIT 0",
+            "replace into t values (1)",
+            "/* c */ INSERT INTO t VALUES (1)",
+        ] {
+            assert!(plain_write(sql.as_bytes()), "{sql}");
+        }
+        // A SELECT may read no table (`SELECT 1`, `SELECT @x := 1`), and
+        // then opens no transaction even with autocommit = 0.
+        for sql in [
+            "SELECT v FROM t",
+            "SELECT 1 FOR UPDATE",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            "/*!40101 INSERT INTO t VALUES (1) */",
+            "INSERTS",
+            "",
+        ] {
+            assert!(!plain_write(sql.as_bytes()), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_silent_abort_shows_in_the_status_or_the_transaction_state() {
+        let open = StatusFlags::IN_TRANS | StatusFlags::AUTOCOMMIT;
+        let none = StatusFlags::AUTOCOMMIT;
+        // A statement that can't end the transaction, or one that opens it
+        // with autocommit = 0, answered without one.
+        assert!(shows_silent_abort(none, None, true, false));
+        assert!(shows_silent_abort(
+            StatusFlags::empty(),
+            Some("________"),
+            true,
+            true
+        ));
+        // Any other statement may end it.
+        assert!(!shows_silent_abort(none, None, false, false));
+        // With autocommit = 0 the statement after the abort opened a new
+        // transaction: open, but its state lost the earlier write.
+        assert!(shows_silent_abort(open, Some("I_R___S_"), true, true));
+        assert!(shows_silent_abort(open, Some("________"), true, true));
+        // The transaction that wrote is still open: its state keeps the W,
+        // or nothing new was reported.
+        assert!(!shows_silent_abort(open, Some("I_R_W_S_"), true, true));
+        assert!(!shows_silent_abort(open, None, true, true));
+        // No write before: a new state without W says nothing.
+        assert!(!shows_silent_abort(open, Some("I_R___S_"), true, false));
+        // Only the statement's last result counts.
+        assert!(!shows_silent_abort(
+            none | StatusFlags::MORE_RESULTS_EXISTS,
+            None,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn only_a_transactional_write_counts_as_writing() {
+        assert!(trx_wrote("T___W___"));
+        assert!(trx_wrote("T_R_W_S_"));
+        // Reads, non-transactional writes, nothing.
+        assert!(!trx_wrote("T_R___S_"));
+        assert!(!trx_wrote("T__w____"));
+        assert!(!trx_wrote("________"));
+        assert!(!trx_wrote(""));
+    }
+
+    #[test]
+    fn a_commit_that_wrote_moves_the_gtid() {
+        // A new GTID: written.
+        assert!(!gtid_unchanged(Some("3-301-5081"), "3-301-5090"));
+        assert!(!gtid_unchanged(None, "3-301-5090"));
+        // The GTID it had before, or none at all: nothing was written (the
+        // 15 November CI loss and its local reproductions).
+        assert!(gtid_unchanged(Some("3-301-5081"), "3-301-5081"));
+        assert!(gtid_unchanged(None, ""));
+        assert!(gtid_unchanged(Some("3-301-5081"), ""));
+    }
+
+    #[test]
+    fn a_silent_abort_answers_mariadbs_deadlock_error() {
+        let p = silent_abort_packet(Caps::PROTOCOL_41);
+        let PacketKind::Err(e) = &p.kind else {
+            panic!("an ERR packet: {p:?}");
+        };
+        assert_eq!((e.code, &e.sqlstate), (1213, b"40001"));
+        assert_eq!(p.payload, e.encode(Caps::PROTOCOL_41));
     }
 }
 

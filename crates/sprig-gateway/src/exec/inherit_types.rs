@@ -1,25 +1,24 @@
-//! Typed tables in inheritance groups (chapter 42 with chapter 32;
-//! `inheritance-plan.md` step 6b): a child tenant that receives the tables
+//! Typed tables in inheritance groups: a child tenant that receives the tables
 //! of a type tree also receives the types, so its type layer plans the
 //! same polymorphic reads and writes over them.
 //!
-//! After [`super::inherit_tree::adopt`] has brought a child's tables up to
-//! its parent's, [`adopt_types`] compares the parent's types of those
-//! tables with the child's and writes what differs into the child's
-//! `types` module: the same names, paths, storage, discriminator and
-//! values, under the child's object ids. A child's own subtypes (Kiran's
-//! Q2: "a child tenant can declare its own subtypes") and the columns it
-//! added to an inherited type stay.
+//! When [`super::inherit_tree::adopt`] brings a child's tables up to its
+//! parent's, [`wanted_types`] compares the parent's types of those tables
+//! with the child's, and what differs is written into the child's `types`
+//! module in the same catalog version as the tables and their inheritance
+//! records: the same names, paths, storage, discriminator and values,
+//! under the child's object ids. A child's own subtypes (a child
+//! tenant can declare its own) and the columns it added to an inherited
+//! type stay.
 
 use std::sync::Arc;
 
+use sprig_catalog::TenantCatalog;
 use sprig_catalog::ddl::database_key;
-use sprig_catalog::version::VersionKind;
-use sprig_catalog::{CatalogLocator, TenantCatalog};
 use sprig_common::ids::ObjectId;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_types::model::{FieldDef, TypeDef, TypeState};
-use sprig_types::{TypesChange, TypesState, TypesStore};
+use sprig_types::{TypesChange, TypesState};
 
 use crate::tenant::TenantServices;
 
@@ -62,8 +61,8 @@ fn same_type(a: &TypeDef, b: &TypeDef) -> bool {
         && same_fields(&a.own_fields, &b.own_fields)
 }
 
-/// A tree whose discriminator the parent added or dropped (decision
-/// T19): the child's root table is converted before its types follow.
+/// A tree whose discriminator the parent added or dropped: the child's
+/// root table is converted before its types follow.
 pub(crate) struct Follow {
     /// The logical database, and its id in the child.
     pub(crate) db_name: String,
@@ -176,8 +175,8 @@ pub(crate) fn wanted_types(
             change.fields.push((id, want.own_fields.clone()));
             change.upsert_types.push(want);
         }
-        // Record hierarchies of the tables the child inherits (decision
-        // T28): the child's statements go through chapter 32's plans too,
+        // Record hierarchies of the tables the child inherits: the child's
+        // statements go through the type layer's plans too,
         // and its levels keep their own paths.
         for ph in pd.hierarchies() {
             if ph.state != sprig_types::model::HierState::Active
@@ -211,11 +210,11 @@ pub(crate) fn wanted_types(
 /// markers.
 const LIVE_ROWS: &str = "`_sprig_state` <> 'hide'";
 
-/// Converts the child's root tables of `follow` (decision T19) and adds
+/// Converts the child's root tables of `follow` and adds
 /// the types they then have to `change`. A tree that can't convert (an own
 /// subtype whose rows don't tell its value, rows that disagree) is left as
 /// it was, with a warning, until its next catalog change.
-async fn follow_discriminators(
+pub(crate) async fn follow_discriminators(
     svc: &Arc<TenantServices>,
     child: &TenantCatalog,
     follow: Vec<Follow>,
@@ -357,65 +356,4 @@ impl sprig_types::Runner for ProvRunner {
     async fn commit_types(&mut self, _change: &TypesChange) -> Result<()> {
         Err(SprigError::internal("no catalog in this runner"))
     }
-}
-
-/// Writes [`wanted_types`] into `child`'s catalog when anything differs:
-/// the new catalog version.
-///
-/// # Errors
-/// The catalog's.
-pub(crate) async fn adopt_types(
-    svc: &Arc<TenantServices>,
-    parent: &TenantCatalog,
-    child: &TenantCatalog,
-    lctn: bool,
-) -> Result<Option<u64>> {
-    let (mut change, follow) = wanted_types(parent, child, lctn);
-    let mut objects = Vec::new();
-    Box::pin(follow_discriminators(
-        svc,
-        child,
-        follow,
-        lctn,
-        &mut change,
-        &mut objects,
-    ))
-    .await?;
-    if change.is_empty() {
-        return Ok(None);
-    }
-    let t = child.tenant;
-    let ep = svc.locator.writer(t).await?;
-    {
-        let mut conn = ep.pool.get_conn().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-        })?;
-        sprig_types::store::migrate(&mut conn, ep.store.schema()).await?;
-    }
-    let mut c = svc.catalog.change(t, VersionKind::Catalog).await?;
-    let version = c.version();
-    let applied = {
-        let (store, tx) = c.tx().parts();
-        match TypesStore::new(store.schema()).apply(tx, &change).await {
-            Ok(()) if !objects.is_empty() => {
-                let inh = sprig_inherit::InheritChange {
-                    upsert_objects: objects,
-                    ..sprig_inherit::InheritChange::default()
-                };
-                sprig_inherit::InheritStore::new(store.schema())
-                    .apply(tx, &inh, version)
-                    .await
-            }
-            other => other,
-        }
-    };
-    if let Err(e) = applied {
-        let _ = c.rollback().await;
-        return Err(e);
-    }
-    let v = c.commit().await?;
-    metrics::counter!("sprig_inherit_adopted_types_total")
-        .increment(change.upsert_types.len() as u64);
-    tracing::info!(tenant = %t, types = change.upsert_types.len(), "inherited types adopted");
-    Ok(Some(v))
 }

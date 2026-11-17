@@ -158,6 +158,7 @@ fn template(binding: u64) -> Template {
             replay: None,
         },
         version: Arc::new(AtomicU64::new(1)),
+        budget: None,
     }
 }
 
@@ -403,4 +404,20 @@ async fn a_queue_trigger_dead_letters_after_its_attempts() {
     assert_eq!(g.done.len(), 28);
     assert_eq!(stats.dead.load(Ordering::Relaxed), 2);
     assert_eq!(stats.failed.load(Ordering::Relaxed), 4);
+}
+
+#[test]
+fn a_live_budget_reaches_every_request() {
+    let ms = Arc::new(AtomicU64::new(300));
+    let mut t = template(1);
+    assert_eq!(t.request(None).budget_ms, t.req.budget_ms);
+    let m = Arc::clone(&ms);
+    t.budget = Some(crate::triggers::LiveBudget(Arc::new(move || {
+        Duration::from_millis(m.load(Ordering::Relaxed))
+    })));
+    let r = t.request(None);
+    assert_eq!((r.budget_ms, r.lease_ms), (300, 30_000));
+    ms.store(60_000, Ordering::Relaxed);
+    let r = t.request(None);
+    assert_eq!((r.budget_ms, r.lease_ms), (60_000, 65_000));
 }

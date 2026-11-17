@@ -204,6 +204,8 @@ fn a_top_k_hop_orders_by_cypher_classes_and_keeps_ties() {
         near_scan: None,
         after: None,
         ordered: false,
+        join_max: None,
+        next: None,
     };
     let route = |top| {
         plan_route(&spec(
@@ -286,6 +288,8 @@ fn links_over_a_scan_read_each_shards_own_start_nodes() {
                 near_scan: Some(Box::new(scan)),
                 after: None,
                 ordered: true,
+                join_max: None,
+                next: None,
             }),
         },
         Targets::All(vec![]),
@@ -303,4 +307,135 @@ fn links_over_a_scan_read_each_shards_own_start_nodes() {
         );
         assert!(t.sql.ends_with(" ORDER BY e.id LIMIT 100"), "{}", t.sql);
     }
+}
+
+#[test]
+fn a_joined_hop_past_join_max_gives_its_links_unjoined_in_the_same_statement() {
+    let g = group(None);
+    let r = plan_route(&spec(
+        &g,
+        HopOp::Links {
+            out: true,
+            mirror: false,
+            types: vec![4],
+            far: Some(FarNodes {
+                keys: Some(vec!["cd".into()]),
+                filter: vec![(format!("{LABEL_KEY}3"), CmpOp::Eq, "0".into())],
+                only: vec![9],
+                join: true,
+                rel_keys: Some(vec![]),
+                rel_filter: vec![],
+                top: None,
+                limit: Some(2000),
+                deep: false,
+                near_scan: None,
+                after: None,
+                ordered: false,
+                join_max: Some(160),
+                next: None,
+            }),
+        },
+        Targets::ByKey(vec![1]),
+    ));
+    let [t] = r.targets() else { panic!() };
+    let (joined, plain) = t.sql.split_once(") UNION ALL (").unwrap();
+    // One part runs: the count of the near nodes' links decides which.
+    assert!(joined.starts_with("(SELECT "), "{}", t.sql);
+    assert!(
+        joined.ends_with(" LIMIT 160, 1) IS NULL LIMIT 160"),
+        "{}",
+        t.sql
+    );
+    assert!(joined.contains("JSON_CONTAINS("), "{}", t.sql);
+    assert!(
+        plain.ends_with(" LIMIT 160, 1) IS NOT NULL LIMIT 2000)"),
+        "{}",
+        t.sql
+    );
+    assert!(
+        plain.starts_with("SELECT e.src, e.dst, e._sprig_rk, e.dst_rk, e.id, e.type, NULL, NULL, NULL, NULL, NULL, e.props, e._types FROM "),
+        "{}",
+        t.sql
+    );
+    // The far node's filters stay out of the unjoined part; `only` stays.
+    assert!(!plain.contains("JSON_CONTAINS("), "{}", t.sql);
+    assert!(plain.contains("e.dst IN (9)"), "{}", t.sql);
+    assert!(!plain.contains("LEFT JOIN"), "{}", t.sql);
+    // Tagging marks both parts, not the count's subqueries.
+    let tagged_sql = tagged(&t.sql, 1).unwrap();
+    assert_eq!(tagged_sql.matches("1 AS q, ").count(), 2, "{tagged_sql}");
+    assert!(tagged_sql.contains(" AND (SELECT 1 FROM "), "{tagged_sql}");
+    assert_eq!(
+        tagged("SELECT a FROM b", 0).unwrap(),
+        "(SELECT 0 AS q, a FROM b)"
+    );
+    assert_eq!(tagged("SET STATEMENT x = 1 FOR SELECT 1", 0), None);
+}
+
+#[test]
+fn a_walk_reads_ahead_in_one_recursive_statement_on_one_cluster() {
+    let two = group(None);
+    assert_eq!(
+        walk_statement(&two, 77, &[1, 2], &[6], 15, None, None, 100, 100),
+        None
+    );
+    let mut one = (*two).clone();
+    for s in &mut one.shards {
+        s.cluster = "c1".into();
+    }
+    let sql = walk_statement(
+        &one,
+        77,
+        &[1, 2, 3],
+        &[6],
+        15,
+        Some(&["id".into()]),
+        None,
+        4097,
+        100,
+    )
+    .unwrap();
+    assert!(
+        sql.starts_with("SET STATEMENT max_recursive_iterations = 16, max_statement_time = 0.100 FOR WITH RECURSIVE w (src, dst, src_rk, dst_rk, id, type, d) AS (SELECT "),
+        "{sql}"
+    );
+    // A recursive part per shard, each following links into its range.
+    assert_eq!(sql.matches(" FROM w JOIN ").count(), 4, "{sql}");
+    assert!(
+        sql.contains("WHERE w.d < 15 AND w.dst_rk >= 0 AND w.dst_rk < "),
+        "{sql}"
+    );
+    assert!(sql.contains(" AND e.type IN (6) WHERE w.d < 15"), "{sql}");
+    assert!(sql.contains(") CYCLE id RESTRICT SELECT w.src, "), "{sql}");
+    assert!(
+        sql.contains(
+            " LEFT JOIN `t1_d2_g30_s4`.`__sprig_gn_77` n3 ON n3.id = w.dst AND w.dst_rk >= "
+        ),
+        "{sql}"
+    );
+    assert!(sql.ends_with(" LIMIT 4097"), "{sql}");
+    assert_eq!(
+        walk_statement(&one, 77, &[], &[6], 15, None, None, 1, 100),
+        None
+    );
+    // The clause's next hop from every node the walk is at.
+    let nx = NextHop {
+        types: vec![5],
+        keys: Some(vec!["firstName".into()]),
+    };
+    let sql = walk_statement(&one, 77, &[1, 2], &[6], 15, Some(&[]), Some(&nx), 99, 100).unwrap();
+    assert!(sql.contains(" SELECT 0, w.src, "), "{sql}");
+    assert!(sql.contains(" UNION ALL SELECT 1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, z.n, "), "{sql}");
+    assert!(
+        sql.contains("FROM (SELECT dst AS n, dst_rk AS rk FROM w UNION SELECT 1, "),
+        "{sql}"
+    );
+    assert!(
+        sql.contains(
+            " LEFT JOIN `t1_d2_g30_s1`.`__sprig_ge_77` x0 ON x0.src = z.n AND z.rk >= 0 AND z.rk < "
+        ),
+        "{sql}"
+    );
+    assert!(sql.contains(" AND x0.type IN (5)"), "{sql}");
+    assert!(sql.ends_with(" LIMIT 99"), "{sql}");
 }

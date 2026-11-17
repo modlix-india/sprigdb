@@ -446,6 +446,16 @@ pub struct AgentConfig {
     /// node.
     #[serde(default)]
     pub rebuild: AgentRebuildConfig,
+    /// Where Sprig 2PC's relay listens, on a Galera node (7404 by
+    /// convention). Needs `internal_addr` too: gateways make the holder
+    /// calls there. Unset: no relay; the agent then leaves a Galera node
+    /// alone.
+    #[serde(default)]
+    pub relay_addr: Option<SocketAddr>,
+    /// The `host:port` gateways connect to the relay at. Unset: the bound
+    /// address.
+    #[serde(default)]
+    pub relay_advertise: Option<String>,
 }
 
 /// `[agent.rebuild]`: the commands and paths `node_rebuild` uses on the

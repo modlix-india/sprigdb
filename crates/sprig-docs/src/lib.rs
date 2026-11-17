@@ -10,6 +10,8 @@
 //! - The docs pack, which makes the pages searchable offline:
 //!   - [`page`] reads `docs/` and each page's front matter;
 //!   - [`chunk`] cuts a page into chunks and finds exact identifiers;
+//!   - [`split`] cuts any text into chunks, as retrieval indexes do with
+//!     their tables' rows;
 //!   - [`pack`] is the reproducible pack file, written and verified;
 //!   - [`search`] is in-process BM25, cosine and reciprocal-rank fusion;
 //!   - [`table`] is the pack as rows of the `__sprig_docs` system tables
@@ -25,4 +27,5 @@ pub mod page;
 pub mod reference;
 pub mod search;
 pub mod settings;
+pub mod split;
 pub mod table;

@@ -44,6 +44,7 @@ pub mod ddl;
 pub mod envelope;
 pub mod grammar;
 pub mod maria;
+pub mod measure;
 pub mod memlog;
 pub mod model;
 pub mod offsets;

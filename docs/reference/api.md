@@ -9,7 +9,7 @@ source: the gateway's OpenAPI document (/v1/openapi.json)
 
 The gateway's REST API, as `/v1/openapi.json` describes it on every gateway. Requests authenticate with `Authorization: Bearer <token or API key>` (or HTTP Basic where allowed) and act with the caller's own rights. Statements stream as NDJSON from `POST /v1/databases/{database}/sql:query`. The same services are available over gRPC.
 
-99 operations in 27 services.
+111 operations in 29 services.
 
 ## sprig.admin.v1.Recommendations
 
@@ -27,13 +27,16 @@ The gateway's REST API, as `/v1/openapi.json` describes it on every gateway. Req
 
 | Method | Path | Operation | Description |
 |---|---|---|---|
-| POST | `/v1/ai/chat` | `Ai.Chat` | One assistant turn, streamed as NDJSON: one AiChatEvent per line (start, text, thinking, tool_start, tool_end, proposal, usage, sources, error, end). Proposals are shown, never run. Errors found before the turn starts (39990, 39991, 39992, 39995, a role the caller may not use) are plain HTTP errors |
+| POST | `/v1/ai/chat` | `Ai.Chat` | One assistant turn, streamed as NDJSON: one AiChatEvent per line (start, text, thinking, tool_start, tool_end, result, proposal, usage, sources, error, end). Proposals are shown, never run. A result event carries a run_query result whole, for the user; the provider gets only its shape unless ai.share_data is on. Errors found before the turn starts (39990, 39991, 39992, 39995, a role the caller may not use) are plain HTTP errors |
 | GET | `/v1/ai/conversations` | `Ai.ListConversations` | The caller's assistant conversations, newest first: tenant conversations, and for platform operators also administration conversations (ids starting with `a`) |
 | GET | `/v1/ai/conversations/{id}` | `Ai.GetConversation` | One of the caller's conversations with its messages, including the exact payloads sent to the provider while ai.audit_payload_days keeps them (payloads=false leaves them out) |
+| GET | `/v1/ai/digests` | `Ai.ListDigests` | The tenant's digests (ai.digest), newest first; tenant administrators |
+| GET | `/v1/ai/digests/{id}` | `Ai.GetDigest` | One digest: its facts (statistics only), the model's words, and what was sent to word it (payloads=true adds the exact payloads); tenant administrators |
 | POST | `/v1/ai/feedback` | `Ai.Feedback` | A thumbs up or down on an answer ({message_id, vote, note}), or what became of a proposal ({proposal_id, outcome, note}) |
 | GET | `/v1/ai/glossary` | `Ai.ListGlossary` | The tenant glossary (status accepted, proposed or all) |
 | POST | `/v1/ai/glossary` | `Ai.PutGlossaryTerm` | Adds or replaces an accepted term (tenant administrators) |
 | POST | `/v1/ai/glossary/{term}` | `Ai.GlossaryAction` | {term}:accept or :reject a proposed term, or {term}:delete a term (tenant administrators) |
+| POST | `/v1/ai/proposals/{id}` | `Ai.ProposalAction` | {id}:accept runs a proposal as the caller (an SQL statement in its database, after confirm: true for anything but a plain read; generated test rows likewise), files a recommendation as an ai_dba_advice approvals item, accepts a glossary term, or adds a tile to a dashboard (dashboard, an id, or new_dashboard, a name; else the one the assistant named, the caller's own, made when missing); {id}:dismiss turns it down. The outcome is recorded as feedback |
 | DELETE | `/v1/mcp` | `Ai.McpEndSession` | Ends an MCP session (Mcp-Session-Id) |
 | POST | `/v1/mcp` | `Ai.Mcp` | The MCP server (protocol revisions 2026-07-28, stateless, and 2025-03-26 to 2025-11-25, with sessions): one JSON-RPC request or notification (initialize, server/discover, tools/list, tools/call, ping). Tools run as the caller; proposals are returned, never run. Needs ai.enabled and ai.mcp.enabled (39991). Notifications are answered 202 with no body |
 
@@ -65,7 +68,7 @@ The gateway's REST API, as `/v1/openapi.json` describes it on every gateway. Req
 | POST | `/v1/auth/impersonate` | `Auth.Impersonate` | A session as a user of one's tenant or a descendant, with a reason; no refresh token |
 | POST | `/v1/auth/login` | `Auth.Login` | Password login; the refresh token comes as an HttpOnly cookie (refresh_transport cookie, needs X-Sprig-CSRF) or in the body |
 | POST | `/v1/auth/logout` | `Auth.Logout` | Ends the session |
-| GET | `/v1/auth/me` | `Auth.WhoAmI` | The principal, session, tenant tree, grants and studio.* settings |
+| GET | `/v1/auth/me` | `Auth.WhoAmI` | The principal, session, tenant tree, grants, studio.* settings, and whether the AI assistants are on and which roles have a model |
 | POST | `/v1/auth/mfa` | `Auth.CompleteMfa` | Completes a login's challenge with a TOTP code or a recovery code (cookie rules as login) |
 | POST | `/v1/auth/refresh` | `Auth.Refresh` | Rotates the refresh token (cookie with X-Sprig-CSRF, or refresh_token in the body) |
 
@@ -97,10 +100,23 @@ The gateway's REST API, as `/v1/openapi.json` describes it on every gateway. Req
 | POST | `/v1/cursors/{cursor}:fetch` | `Cursors.Fetch` | The next page; done closes the cursor (39934 unknown, 39935 expired) |
 | POST | `/v1/databases/{database}/cursors` | `Cursors.Open` | Runs a read and keeps its stream for paging (first result only): skip rows, then the first page; the stream waits between fetches and closes after studio.cursor_idle_seconds |
 
+## sprig.v1.Dashboards
+
+| Method | Path | Operation | Description |
+|---|---|---|---|
+| GET | `/v1/dashboards` | `Dashboards.List` | The caller's own dashboards and the tenant's shared ones |
+| POST | `/v1/dashboards` | `Dashboards.Create` | Makes a dashboard {name, shared?, filters?}, the caller's |
+| GET | `/v1/dashboards/{id}` | `Dashboards.Get` | One dashboard the caller owns or that is shared, with its tiles |
+| POST | `/v1/dashboards/{id}` | `Dashboards.Update` | Changes a dashboard's name, filters, layout or tile positions (its owner, or a tenant                  administrator for a shared one); {id}:share {shared} shares or unshares it (its owner);                  {id}:delete deletes it |
+| POST | `/v1/dashboards/{id}/tiles` | `Dashboards.AddTile` | Adds a tile {title, database, sql, chart, refresh_seconds?, pos?}: one SELECT whose {{filter}}              names are dashboard filters, and a chart spec that fits it |
+| POST | `/v1/dashboards/{id}/tiles/{tile}` | `Dashboards.UpdateTile` | Replaces a tile; {tile}:delete deletes it; {tile}:run {params?} runs its query as the caller              (their grants and row-level security, never the owner's), answering a TileRun |
+| POST | `/v1/dashboards:run` | `Dashboards.RunQuery` | Runs a query that isn't saved yet (the chart editor, a proposal's preview) as the caller: one read,              filters bound as literals, in a read-only transaction, capped at studio.max_result_rows and              studio.statement_timeout_ms |
+
 ## sprig.v1.Docs
 
 | Method | Path | Operation | Description |
 |---|---|---|---|
+| GET | `/v1/docs/pages/{page}` | `Docs.Page` | One page of the product documentation of this release (any signed-in user), rebuilt from the docs pack: its chunks in page order and its Markdown. {page} is the page's path under docs/, slashes included (tools/studio.md) |
 | POST | `/v1/docs:search` | `Docs.Search` | Searches the product documentation of this release (any signed-in user): full-text and embedding hits fused, at most two per page ({query, audience, limit, version}) |
 
 ## sprig.v1.Exports
@@ -182,6 +198,12 @@ The gateway's REST API, as `/v1/openapi.json` describes it on every gateway. Req
 | Method | Path | Operation | Description |
 |---|---|---|---|
 | POST | `/v1/policies:testAs` | `Policies.TestAs` | One read-only statement run as another user of the tenant ({tenant, user, host, database, sql}) |
+
+## sprig.v1.Retrieval
+
+| Method | Path | Operation | Description |
+|---|---|---|---|
+| POST | `/v1/databases/{database}/retrieval/{index}:search` | `Retrieval.Search` | Searches a retrieval index (CREATE RETRIEVAL INDEX) as RETRIEVE() does in SQL: full-text and embedding hits fused, at most two chunks per row, only rows the caller may read ({query, limit, filter}) |
 
 ## sprig.v1.Search
 

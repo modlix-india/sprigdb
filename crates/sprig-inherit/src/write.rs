@@ -1,5 +1,4 @@
-//! `LayerWriter` for tables (chapter 42, "Writes" and "Parent deletes and
-//! orphans"; build steps 5 and 6).
+//! `LayerWriter` for tables: layer writes, parent deletes and orphans.
 //!
 //! Every write targets the session's space `s` only:
 //!
@@ -355,8 +354,8 @@ pub async fn update(sql: &str, ctx: &Ctx<'_>, r: &mut dyn Runner) -> Result<Hand
             .collect::<Vec<_>>()
             .join(" AND ")
     };
-    // Only records the session may update (chapter 29: `UPDATE` applies the
-    // `SELECT` and `UPDATE` policies, on the merged records here).
+    // Only records the session may update (`UPDATE` applies the `SELECT`
+    // and `UPDATE` policies, on the merged records here).
     let find = format!(
         "SELECT {}, ({same}) FROM ({}) AS {a}{}{order}{limit}",
         key_list(o, Some(&a)),
@@ -400,7 +399,7 @@ pub async fn update(sql: &str, ctx: &Ctx<'_>, r: &mut dyn Runner) -> Result<Hand
             // Every field takes the merged record's new value, not only
             // the overridden ones (the merge reads only those): a layer
             // row stays a copy of its record, which MariaDB's row-level
-            // security triggers check as the update's new version (RL65).
+            // security triggers check as the update's new version.
             let upd: Vec<String> = o
                 .values()
                 .map(|c| format!("{c} = VALUES({c})", c = q(c)))
@@ -558,8 +557,8 @@ async fn delete_where(
         layer_op("delete");
         return r.exec(&text).await.map(Handled::Ok);
     }
-    // Only records the session may delete (chapter 29: `DELETE` applies
-    // the `SELECT` and `DELETE` policies, on the merged records here).
+    // Only records the session may delete (`DELETE` applies the `SELECT`
+    // and `DELETE` policies, on the merged records here).
     let find = format!(
         "SELECT {} FROM ({}) AS {a}{where_sql}{tail}",
         key_list(o, Some(a)),
@@ -721,7 +720,7 @@ async fn delete_keys(
         }
     }
     // Refused (1451) while a row of s's view, or of a space or tenant
-    // below s, still references a key (Kiran's decision 4).
+    // below s, still references a key.
     let hidden: BTreeSet<String> = keys
         .iter()
         .zip(hexes)
@@ -745,8 +744,7 @@ async fn delete_keys(
         .collect();
     if !hide.is_empty() {
         // A hide marker over an override takes the record's values too:
-        // the row-level security triggers check it as the deleted record
-        // (RL65).
+        // the row-level security triggers check it as the deleted record.
         let refresh = o.values().fold(String::new(), |mut acc, c| {
             let c = q(c);
             acc.push_str(&c);
@@ -816,7 +814,7 @@ async fn delete_keys(
                     key_in(o, std::slice::from_ref(&c.key))
                 );
                 // A hierarchy's path override isn't the space's edit: it
-                // goes with its record (decision T22).
+                // goes with its record.
                 let pb = crate::hier::path_bits(o);
                 let paths_only = pb != 0 && c.bits & !pb == 0;
                 if ctx.limits.parent_delete_follow || paths_only {
@@ -946,7 +944,7 @@ pub async fn insert(sql: &str, ctx: &Ctx<'_>, r: &mut dyn Runner) -> Result<Hand
     } else {
         vec![ins.assignments.iter().map(|a| a.value.clone()).collect()]
     };
-    // Generated ids come from the tree's one sequence (Kiran's decision 3).
+    // Generated ids come from the tree's one sequence.
     let learnt;
     let seq_obj: &InheritableObject = if ctx.state.ext_missing(o.object_id) {
         // Made inheritable before its AUTO_INCREMENT column was recorded.
@@ -1243,8 +1241,7 @@ pub async fn reset(
     };
     let cond = filter.map(|f| format!(" AND ({f})")).unwrap_or_default();
     layer_op("reset");
-    // A hierarchy's paths follow the reset records in this space and below
-    // (decision T22).
+    // A hierarchy's paths follow the reset records in this space and below.
     if let Some(h) =
         crate::hier::hierarchy_of(ctx, &res.obj).filter(|_| crate::hier::has_paths(&res.obj))
     {

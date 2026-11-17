@@ -645,7 +645,7 @@ Commands:
   space            Spaces and shares
   inherit          Inherited tables, shares, tree-wide ids and the references that refuse deletes
   txn              In-doubt distributed transactions
-  ai               The AI assistants: providers
+  ai               The AI assistants: providers, and the administration agent's incidents, health checks, write-ups and upgrade checks
   sink             Sinks: list, show, pause, resume, reset, dead letters, connections
   graph            Graphs
   search           Search indexes and their copies on workers

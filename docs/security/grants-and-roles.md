@@ -162,6 +162,8 @@ SET ROLE NONE;
 
 A role revoked from the account while a session has it active stops counting from the session's next statement.
 
+A session that logged in with a token from an identity provider also holds the roles its issuer's role mappings give the token, as if granted, active from login with the default roles; `SET ROLE` treats them like granted roles. See [Logins with identity provider tokens](external-tokens.md#roles-from-tokens).
+
 ## SHOW GRANTS
 
 ```sql test

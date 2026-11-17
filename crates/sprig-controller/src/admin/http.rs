@@ -100,6 +100,14 @@ fn routes(app: Arc<App>) -> Router {
         .route("/admin/v1/tenants/{name}/settings", get(tenant_settings))
         .route("/admin/v1/tenants/{name}/users", post(create_user))
         .route(
+            "/admin/v1/tenants/{name}/users:setTokenLogin",
+            post(set_token_login),
+        )
+        .route(
+            "/admin/v1/tenants/{name}/issuers",
+            get(list_issuers).post(put_issuer),
+        )
+        .route(
             "/admin/v1/tenants/{name}/accounts",
             get(export_accounts).post(import_accounts),
         )
@@ -144,11 +152,17 @@ fn routes(app: Arc<App>) -> Router {
             post(pin_tenant_cluster).delete(unpin_tenant_cluster),
         )
         .route(
+            "/admin/v1/tenants/{name}/decisions",
+            get(search_decisions),
+        )
+        .route(
             "/admin/v1/tenants/{name}/decisions/{id}",
             get(explain_decision),
         )
         // In-doubt distributed transactions.
         .route("/admin/v1/txns", get(list_txns))
+        .route("/admin/v1/catalog/contracts", get(contracts_status))
+        .route("/admin/v1/catalog/contracts:run", post(contracts_run))
         .route("/admin/v1/txns/{dtid}", get(show_txn).post(txn_method))
         .route("/admin/v1/settings", get(list_setting_keys))
         .route(
@@ -811,6 +825,44 @@ async fn create_user(
     respond(r.await)
 }
 
+async fn list_issuers(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    UrlPath(name): UrlPath<String>,
+) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        app.svc.list_issuers(&name).await
+    };
+    respond(r.await)
+}
+
+async fn put_issuer(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    UrlPath(name): UrlPath<String>,
+    body: Bytes,
+) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        app.svc.put_issuer(&name, parse_required(&body)?).await
+    };
+    respond(r.await)
+}
+
+async fn set_token_login(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    UrlPath(name): UrlPath<String>,
+    body: Bytes,
+) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        app.svc.set_token_login(&name, parse_required(&body)?).await
+    };
+    respond(r.await)
+}
+
 async fn export_accounts(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -1183,6 +1235,30 @@ async fn explain_decision(
     respond(r.await)
 }
 
+/// `GET /admin/v1/tenants/{name}/decisions?subject=&days=`.
+async fn search_decisions(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    UrlPath(name): UrlPath<String>,
+    uri: axum::http::Uri,
+) -> Response {
+    let r = async {
+        authorize_gateway(&app, &headers)?;
+        let q = uri.query().unwrap_or("");
+        let get = |k: &str| {
+            q.split('&')
+                .filter_map(|kv| kv.split_once('='))
+                .find(|(a, _)| *a == k)
+                .map(|(_, v)| crate::ai_health::pct_decode(v))
+        };
+        let days = get("days").and_then(|d| d.parse().ok()).unwrap_or(30);
+        app.svc
+            .search_decisions(&name, &get("subject").unwrap_or_default(), days)
+            .await
+    };
+    respond(r.await)
+}
+
 async fn list_search(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -1346,6 +1422,29 @@ async fn advisor_apply(
 #[derive(Debug, Default, serde::Deserialize)]
 struct TxnsQuery {
     tenant: Option<String>,
+}
+
+/// `GET /admin/v1/catalog/contracts`: the registered readers and every
+/// catalog module's contract ceiling.
+async fn contracts_status(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        app.svc.contracts_status().await
+    };
+    respond(r.await)
+}
+
+/// `POST /admin/v1/catalog/contracts:run` `{reason, operator, tenant?}`:
+/// the contracts the readers allow, run before
+/// `catalog.contract_delay_days` is over (39084 without a reason or an
+/// operator).
+async fn contracts_run(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
+    let r = async {
+        authorize(&app, &headers)?;
+        let req: crate::contracts::RunContractsRequest = parse_required(&body)?;
+        app.svc.contracts_run(req).await
+    };
+    respond(r.await)
 }
 
 async fn list_txns(State(app): State<Arc<App>>, headers: HeaderMap, uri: Uri) -> Response {

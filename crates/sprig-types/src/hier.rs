@@ -1,6 +1,5 @@
-//! Record hierarchies (chapter 32, "Hierarchy columns", "Maintaining
-//! paths", "Moving a subtree", "Declaring a hierarchy on existing rows";
-//! build steps 10 and 11, single shard).
+//! Record hierarchies: hierarchy columns, maintaining paths, moving a
+//! subtree and declaring a hierarchy on existing rows (single shard).
 //!
 //! A table with a hierarchy has three invisible columns, `_sprig_hpath`
 //! (`/1/7/42/`), `_sprig_hdepth` (0 at the top) and `_sprig_rk` (the top
@@ -108,10 +107,10 @@ pub async fn fill_paths(h: &HierarchyDef, db: Option<&str>, r: &mut dyn Runner) 
 /// A row the keyed fill gives a path: its key, path, depth and top key.
 type Filled = (Vec<u8>, Vec<u8>, i64, Vec<u8>);
 
-/// [`fill_paths`] for an inheritable table (decision T22, piece 1): chapter
-/// 42 refuses a multi-table `UPDATE`, so each level is read with a join,
-/// computed here and written with one single-table `UPDATE` per batch.
-/// Returns the keys given a path, as SQL literals.
+/// [`fill_paths`] for an inheritable table: the inheritance layer refuses a
+/// multi-table `UPDATE`, so each level is read with a join, computed here and
+/// written with one single-table `UPDATE` per batch. Returns the keys given a
+/// path, as SQL literals.
 ///
 /// # Errors
 /// A statement's error.
@@ -188,7 +187,7 @@ pub async fn fill_paths_keyed(
     Ok(out)
 }
 
-/// Whether `table`'s hierarchy is inheritable (chapter 42): its plans then
+/// Whether `table`'s hierarchy is inheritable: its plans then
 /// fill paths with [`fill_paths_keyed`] and tell the inheritance layer.
 async fn inheritable(r: &mut dyn Runner, db: Option<&str>, table: &str) -> Result<bool> {
     r.tree_inheritable(db, table).await
@@ -559,8 +558,7 @@ pub async fn delete(
             .filter_map(|i| val(&found, i, 1))
             .collect();
         // An inheritable table's cascade deletes the subtrees first, so
-        // the spaces below are checked once every row is gone (decision
-        // T22, piece 4).
+        // the spaces below are checked once every row is gone.
         let mut gone = Vec::new();
         if inh && h.on_delete == OnDelete::Cascade {
             gone = cascade_first(h, db, &paths, batch, max_move, r, nbe).await?;
@@ -834,7 +832,7 @@ pub async fn add(ah: &AddHierarchy, ctx: &Ctx<'_>, r: &mut dyn Runner) -> Result
             ),
         ));
     }
-    // The spaces below get their own paths (decision T22): a cycle or a
+    // The spaces below get their own paths: a cycle or a
     // missing parent there fails the declaration as one here does.
     if inh
         && let Err(e) = r

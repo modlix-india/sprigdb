@@ -30,6 +30,21 @@ pub enum PinReason {
     SessionMode,
     /// A compiled logic routine is running.
     Routine,
+    /// The transaction coordinator changed a session variable of the
+    /// connection (its lowered lock wait, a held branch's fixed clock)
+    /// and hasn't put it back yet.
+    TxnSettings,
+}
+
+/// A session variable the transaction coordinator sets on a branch's
+/// connection and puts back when the branch's transaction ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TxnSetting {
+    /// `innodb_lock_wait_timeout`, lowered while a transaction has two
+    /// branches.
+    LockWait,
+    /// `timestamp`, fixed for a held branch so `NOW()` replays the same.
+    Clock,
 }
 
 impl PinReason {
@@ -47,6 +62,7 @@ impl PinReason {
             PinReason::Untracked => "untracked",
             PinReason::SessionMode => "session_mode",
             PinReason::Routine => "routine",
+            PinReason::TxnSettings => "txn_settings",
         }
     }
 }
@@ -66,6 +82,8 @@ pub struct Pins {
     untracked: bool,
     session_mode: bool,
     routine: bool,
+    txn_lock_wait: bool,
+    txn_clock: bool,
 }
 
 impl Pins {
@@ -111,6 +129,9 @@ impl Pins {
         if self.routine {
             r.push(PinReason::Routine);
         }
+        if self.txn_lock_wait || self.txn_clock {
+            r.push(PinReason::TxnSettings);
+        }
         r
     }
 
@@ -118,6 +139,13 @@ impl Pins {
     #[must_use]
     pub fn in_transaction(&self) -> bool {
         self.in_trans
+    }
+
+    /// Whether `SET TRANSACTION` set the next transaction's
+    /// characteristics.
+    #[must_use]
+    pub fn next_transaction_set(&self) -> bool {
+        self.next_trx
     }
 
     /// Whether anything but an open transaction (and the session mode)
@@ -133,6 +161,8 @@ impl Pins {
             || self.untracked
             || self.routine
             || self.next_trx
+            || self.txn_lock_wait
+            || self.txn_clock
     }
 
     /// Applies a statement's parsed effects, before its outcome is known
@@ -219,6 +249,26 @@ impl Pins {
         self.routine = on;
     }
 
+    /// The coordinator changed `setting` on the connection (`changed`), or
+    /// put it back to the server's default. While any is changed the
+    /// connection stays with the session ([`PinReason::TxnSettings`]); once
+    /// all are back it may serve anyone.
+    pub fn set_txn_setting(&mut self, setting: TxnSetting, changed: bool) {
+        match setting {
+            TxnSetting::LockWait => self.txn_lock_wait = changed,
+            TxnSetting::Clock => self.txn_clock = changed,
+        }
+    }
+
+    /// Whether the coordinator's `setting` is changed on the connection.
+    #[must_use]
+    pub fn txn_setting(&self, setting: TxnSetting) -> bool {
+        match setting {
+            TxnSetting::LockWait => self.txn_lock_wait,
+            TxnSetting::Clock => self.txn_clock,
+        }
+    }
+
     /// Forgets everything the lost connection held; the session mode
     /// stays.
     pub fn lose_connection(&mut self) {
@@ -279,5 +329,22 @@ mod tests {
         p.apply_effects(&[Effect::Untracked("x".into())]);
         p.lose_connection();
         assert_eq!(p.reasons(), vec![PinReason::SessionMode]);
+    }
+
+    #[test]
+    fn the_coordinators_settings_pin_until_both_are_back() {
+        let mut p = Pins::default();
+        p.set_txn_setting(TxnSetting::LockWait, true);
+        p.set_txn_setting(TxnSetting::Clock, true);
+        assert_eq!(p.reasons(), vec![PinReason::TxnSettings]);
+        assert!(p.holds_state(), "losing the connection loses them");
+        p.set_txn_setting(TxnSetting::LockWait, false);
+        assert!(!p.is_empty(), "the clock is still fixed");
+        assert!(p.txn_setting(TxnSetting::Clock));
+        p.set_txn_setting(TxnSetting::Clock, false);
+        assert!(p.is_empty());
+        p.set_txn_setting(TxnSetting::Clock, true);
+        p.lose_connection();
+        assert!(p.is_empty(), "a lost connection took them with it");
     }
 }

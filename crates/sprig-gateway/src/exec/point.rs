@@ -138,6 +138,7 @@ impl PassSession {
         }
         self.count_execute(stmt, cx.session);
         self.wl_multi = false;
+        self.wl_text = None;
         let pending = logical.as_ref().and_then(|l| self.wl_start_stmt(stmt, l));
         self.wl_probe(pending.as_ref());
         let Some(bs) = self.bs.as_mut() else {

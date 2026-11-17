@@ -292,6 +292,15 @@ pub trait QueueBackend: Send + Sync + 'static {
         conn: ConnKey,
         events: EventSender,
     ) -> Result<Arc<dyn Vhost>, MqError>;
+
+    /// The largest message body `principal` may publish in `vhost`, when
+    /// the backend sets its own (a setting at the tenant's or the vhost
+    /// database's scope); `None` keeps the listener's
+    /// [`Config::max_message_bytes`](crate::server::Config). Read once,
+    /// after [`open_vhost`](Self::open_vhost).
+    async fn max_message_bytes(&self, _principal: &Principal, _vhost: &str) -> Option<u64> {
+        None
+    }
 }
 
 /// One virtual host, as one connection uses it.

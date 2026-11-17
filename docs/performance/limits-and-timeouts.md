@@ -173,7 +173,11 @@ ALTER TENANT acme SPRIG SET (limits.user_active_statements = 128);
 sprigctl settings set --scope dc:dc-a limits.tenant_connections 5000 --reason "bigger tenants in dc-a"
 ```
 
-Changes apply live, without restarting gateways. The gateway-wide limits (`gateway.max_connections`, `gateway.memory_limit_mb`) are set per data centre or globally. `limits.tenant_active_statements` and `limits.tenant_connections` are operator-only.
+Changes apply live, without restarting gateways. The gateway-wide limits (`gateway.max_connections`, `gateway.memory_limit_mb`) are set per data centre or globally. `limits.tenant_active_statements` and `limits.tenant_connections` are operator-only. The `limits.*` keys are read for the session's tenant: a value set on a tenant (or on a parent tenant above it) applies to that tenant only, ahead of the data-centre and global values.
+
+```sh
+sprigctl settings set --scope tenant:acme limits.tenant_connections 500 --reason "cap acme"
+```
 
 ## Errors at a glance
 

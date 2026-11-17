@@ -1,12 +1,11 @@
-//! The R1 differential suite (chapter 46, "Differential testing"; chapter
-//! 17, "Testing"): the same statements against a sharded tenant through
+//! The router's differential suite: the same statements against a sharded tenant through
 //! the gateway and against one unsharded MariaDB schema, compared exactly.
 //! A statement the router can't plan exactly must fail with 39420
 //! (`ER_SPRIG_STATEMENT_NOT_DISTRIBUTABLE`); it is counted as skipped,
 //! never as a pass. Any other difference fails the test.
 //!
-//! The layout is made the way chapters 15, 20 and 21 make it, and the
-//! gateway reads it from the catalog and the shard maps:
+//! The layout is made the way sharding, splits and schema changes make it,
+//! and the gateway reads it from the catalog and the shard maps:
 //!
 //! - the tables are created through the gateway (catalog objects, the
 //!   database's template schema);
@@ -21,7 +20,7 @@
 //!
 //! Phases: seed through the gateway, the read corpus, prepared statements
 //! (binary protocol), DML with full-table checks (writes across clusters
-//! commit through chapter 18's coordinator), transactions spanning clusters
+//! commit through the transaction coordinator), transactions spanning clusters
 //! (committed, rolled back, with savepoints), a split of one range onto the
 //! other cluster while point reads run (the map changes mid-run, under a
 //! hold and a rename fence), the corpus again on the new layout, and a
@@ -119,8 +118,7 @@ impl Env {
         format!("r1finish_diff_{}", self.tenant)
     }
     /// The root endpoint of the unsharded reference MariaDB: its own server
-    /// when `SPRIG_TEST_R1_REFERENCE` names one (chapter 46's "one unsharded
-    /// MariaDB"), else the first cluster.
+    /// when `SPRIG_TEST_R1_REFERENCE` names one, else the first cluster.
     fn reference_addr(&self) -> String {
         env("SPRIG_TEST_R1_REFERENCE").unwrap_or_else(|| self.cluster(0).1.clone())
     }
@@ -185,13 +183,13 @@ fn layout() -> Vec<Grp> {
                 ("accounts", "aid"),
                 ("invoices", "cid"),
                 ("invoice_lines", ""),
-                // Chapter 19's ID blocks: an AUTO_INCREMENT key, an
+                // ID blocks: an AUTO_INCREMENT key, an
                 // AUTO_INCREMENT column beside the key, and a parent
                 // member with one.
                 ("tickets", "tid"),
                 ("events", "cid"),
                 ("inv_notes", ""),
-                // Chapter 19's foreign keys across groups (R3): children
+                // Foreign keys across groups: children
                 // of `suppliers` (group 902) and `tags` (group 903), and
                 // `ship_items`, whose key to `shipments` stays native.
                 ("parts", "cid"),
@@ -228,12 +226,12 @@ fn layout() -> Vec<Grp> {
 }
 
 const REF_GROUP: u32 = 904;
-/// The tenant's lookup group (chapter 19): `accounts.email`'s unique
+/// The tenant's lookup group: `accounts.email`'s unique
 /// lookup, two shards, one per cluster.
 const LOOKUP_GROUP: u32 = 905;
 const LOOKUP_ID: u64 = 9051;
 
-/// `accounts.email`'s unique lookup, as chapter 19 records it.
+/// `accounts.email`'s unique lookup, as the catalog records it.
 fn email_lookup(owner: ObjectId) -> sprig_shard::lookup::LookupIndex {
     use sprig_shard::lookup::{LookupColumn, LookupId, LookupIndex, LookupOrigin, LookupState};
     let ci = sprig_shard::collation::collation_by_name("utf8mb4_general_ci").unwrap();
@@ -257,6 +255,7 @@ fn email_lookup(owner: ObjectId) -> sprig_shard::lookup::LookupIndex {
         group: GroupId(LOOKUP_GROUP),
         state: LookupState::Public,
         auto_index_id: None,
+        rehashing: false,
     }
 }
 
@@ -288,8 +287,7 @@ fn ddl_of(table: &str) -> &'static str {
 }
 
 /// A shard's copy of `table`: without the foreign keys the gateway keeps
-/// (chapter 19, R3; `sprig_shard::fk::strip_foreign_keys` on the DDL
-/// path).
+/// (`sprig_shard::fk::strip_foreign_keys` on the DDL path).
 fn shard_ddl_of(table: &str) -> String {
     let ddl = ddl_of(table);
     let mut out = ddl.to_owned();
@@ -307,7 +305,7 @@ fn shard_ddl_of(table: &str) -> String {
     out
 }
 
-/// Chapter 19's `foreign_keys` rows the suite records, as the DDL path
+/// The `foreign_keys` rows the suite records, as the DDL path
 /// would: `(fk_id, child, name, child column, parent, parent column)`.
 const FKS: &[(u64, &str, &str, &str, &str, &str)] = &[
     (9061, "parts", "fk_parts_sup", "sid", "suppliers", "sid"),
@@ -339,7 +337,7 @@ const TAG_LINKS_DDL: &str = "CREATE TABLE tag_links (cid INT NOT NULL, lid INT N
      CONSTRAINT fk_tl_tag FOREIGN KEY (tag) REFERENCES tags (tag) ON DELETE CASCADE) \
      DEFAULT CHARSET utf8mb4";
 
-/// The tables whose members fill `_sprig_rk` (chapter 15), with the
+/// The tables whose members fill `_sprig_rk`, with the
 /// column on their shard schemas: a column member and its parent member.
 const RK_TABLES: [&str; 2] = ["invoices", "invoice_lines"];
 
@@ -475,7 +473,7 @@ async fn clear_layout(e: &Env, store: &ShardMapStore) {
              WHERE o.name = 'countries'",
         )
         .await;
-    // Chapter 19's sequences of the suite's ID-block tables.
+    // The sequences of the suite's ID-block tables.
     let _ = c
         .query_drop(
             "DELETE s FROM sequences s JOIN objects o ON o.object_id = s.object_id \
@@ -505,7 +503,7 @@ async fn setup(e: &Env, sut: &mut Conn) -> World {
         gw_ddl(sut, ddl_of(t)).await;
     }
     let (db_id, default_schema) = database(e).await;
-    // Chapter 18's decision table came with the database's schema
+    // The transaction decision table came with the database's schema
     // (`CREATE DATABASE` through the gateway), not from the suite.
     {
         let mut c = root(e, 0, None).await;
@@ -690,7 +688,7 @@ async fn setup(e: &Env, sut: &mut Conn) -> World {
         .await
         .unwrap();
     }
-    // Chapter 19: accounts.email's unique lookup, in the tenant's lookup
+    // accounts.email's unique lookup, in the tenant's lookup
     // group (two shards, one per cluster), public from the start (the
     // table is empty).
     let lk = email_lookup(object("accounts"));
@@ -711,7 +709,7 @@ async fn setup(e: &Env, sut: &mut Conn) -> World {
         .insert(&mut c, &lk)
         .await
         .unwrap();
-    // Chapter 19 (R3): the keys across groups, kept by the gateway.
+    // The keys across groups, kept by the gateway.
     for (id, child, name, col, parent, pcol) in FKS {
         let line = ddl_of(child)
             .split(", CONSTRAINT ")
@@ -738,6 +736,7 @@ async fn setup(e: &Env, sut: &mut Conn) -> World {
                     },
                     child_lookup: None,
                     state: sprig_shard::fk::FkState::Enforced,
+                    orphans: false,
                 },
             )
             .await
@@ -863,7 +862,7 @@ const TABLES: [&str; 17] = [
     "contacts",
     "tag_links",
 ];
-/// Chapter 19's ID blocks: keyed by its `AUTO_INCREMENT` column.
+/// ID blocks: keyed by its `AUTO_INCREMENT` column.
 const TICKETS_DDL: &str = "CREATE TABLE tickets (tid BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, \
      title VARCHAR(20) COLLATE utf8mb4_bin, qty INT) DEFAULT CHARSET utf8mb4";
 /// Keyed by `cid`; its `AUTO_INCREMENT` column only names rows.
@@ -1005,7 +1004,7 @@ fn seed(r: &mut Rng) -> Vec<String> {
         tags.join(", ")
     ));
     // `accounts`: a unique email (case-insensitive) on a table keyed by
-    // `aid`, kept by chapter 19's lookup.
+    // `aid`, kept by a unique lookup.
     let rows: Vec<String> = (1..=60)
         .map(|aid| {
             let email = if aid % 11 == 0 {
@@ -1021,7 +1020,7 @@ fn seed(r: &mut Rng) -> Vec<String> {
         .collect();
     out.push(format!("INSERT INTO accounts VALUES {}", rows.join(", ")));
     // `invoices` (keyed by cid) and their lines, a parent member: the
-    // lines' inserts span shards and follow each invoice (chapter 15).
+    // lines' inserts span shards and follow each invoice.
     let rows: Vec<String> = (1..=60i64)
         .map(|iid| {
             let cid = 1 + r.below(120) as i64;
@@ -1334,9 +1333,9 @@ fn corpus(r: &mut Rng) -> Vec<(String, Cmp)> {
     v
 }
 
-/// R3's corpus (chapter 17, "Gathered reads (R3)"): statements R1's
-/// operators refuse — window functions, subqueries (correlated or not),
-/// set operations, CTEs (recursive too), derived tables, joins of several
+/// The gathered-read corpus: statements the per-shard operators can't
+/// run — window functions, subqueries (correlated or not), set
+/// operations, CTEs (recursive too), derived tables, joins of several
 /// groups or on any condition, aggregates the gateway can't split —
 /// written so the answer is deterministic (windows ordered totally).
 fn corpus_r3(r: &mut Rng) -> Vec<(String, Cmp)> {
@@ -1503,7 +1502,7 @@ fn corpus_r3(r: &mut Rng) -> Vec<(String, Cmp)> {
         "SELECT c.cid, p.pid FROM customers c LEFT JOIN products p ON p.pid = c.cid + 1000 WHERE p.pid IS NULL AND c.cid < 20",
         Bag,
     );
-    // Ordering R1 can't merge.
+    // Ordering the per-shard merge can't follow.
     push("SELECT * FROM customers ORDER BY 2, 1", Ordered);
     push(
         "SELECT cid, name FROM customers ORDER BY name COLLATE utf8mb4_bin, cid",
@@ -1520,8 +1519,8 @@ fn corpus_r3(r: &mut Rng) -> Vec<(String, Cmp)> {
     v
 }
 
-/// R3's prepared statements (binary protocol): gathered with the values
-/// written in.
+/// Prepared statements (binary protocol) of gathered reads, with the
+/// values written in.
 fn prepared_r3(r: &mut Rng) -> Vec<(&'static str, Vec<Value>, Cmp)> {
     use Cmp::Bag;
     let mut v = Vec::new();
@@ -1545,9 +1544,8 @@ fn prepared_r3(r: &mut Rng) -> Vec<(&'static str, Vec<Value>, Cmp)> {
     v
 }
 
-/// R8 round 7 (decision G53): derived tables of literal rows — `VALUES`,
-/// `SELECT … UNION ALL …` of constants, `FROM DUAL` — join inside each
-/// shard. A derived table with columns `i` (unique per row, for a total
+/// Derived tables of literal rows — `VALUES`, `SELECT … UNION ALL …` of
+/// constants, `FROM DUAL` — join inside each shard. A derived table with columns `i` (unique per row, for a total
 /// order), `a` (an integer near the keys), `s` (a string with case,
 /// accent and trailing-space variants), `n` (a decimal or NULL) and `cc`.
 fn lit_rows(r: &mut Rng) -> String {
@@ -1573,7 +1571,7 @@ fn lit_rows(r: &mut Rng) -> String {
         .map(|(i, a, s, num, cc)| format!("({i}, {a}, {s}, {num}, {cc})"))
         .collect();
     match r.below(4) {
-        // G55's form: a SELECT then one VALUES list.
+        // A SELECT then one VALUES list.
         0 if !rest.is_empty() => format!("({first} UNION ALL VALUES {})", rest.join(", ")),
         // A UNION ALL of SELECTs (FROM DUAL now and then).
         1 | 0 => {
@@ -1596,8 +1594,8 @@ fn lit_rows(r: &mut Rng) -> String {
     }
 }
 
-/// G53's corpus: literal derived tables with sharded, reference and
-/// unsharded tables (`lit_u`), in every shape the router may run inside
+/// The literal derived-table corpus: literal derived tables with sharded,
+/// reference and unsharded tables (`lit_u`), in every shape the router may run inside
 /// each shard, and the shapes it must keep gathering.
 fn corpus_lit(r: &mut Rng) -> Vec<(String, Cmp)> {
     use Cmp::{Bag, Count, Ordered};
@@ -1918,7 +1916,7 @@ async fn lit_reads(
     )
 }
 
-/// What R3's statements did: compared, refused by reason, and how long the
+/// What the gathered statements did: compared, refused by reason, and how long the
 /// gateway and the reference took per statement.
 #[derive(Default)]
 struct R3Stats {
@@ -1950,7 +1948,7 @@ impl R3Stats {
     }
 }
 
-/// Runs R3's corpus through both sides: the answers must match, column
+/// Runs the gathered-read corpus through both sides: the answers must match, column
 /// types included.
 async fn r3_reads(
     sut: &mut Conn,
@@ -1977,7 +1975,7 @@ fn r3_check(tally: &mut Tally, st: &mut R3Stats, s: &str, mode: Cmp, a: &Outcome
     st.compared += 1;
     if matches!(a, Outcome::Err(39420, _)) {
         st.skipped += 1;
-        println!("R3 REFUSED {s}: {a:?}");
+        println!("GATHERED REFUSED {s}: {a:?}");
     }
     if let (Outcome::Rows(ta, _), Outcome::Rows(tb, _)) = (a, b)
         && ta != tb
@@ -2094,7 +2092,7 @@ fn dml(r: &mut Rng) -> Vec<(String, &'static str)> {
         "UPDATE customers SET name = 'x' ORDER BY cid LIMIT 2".into(),
         "customers",
     ));
-    // R3's limited DML over shards: a locked two-step when the order is
+    // Limited DML over shards: a locked two-step when the order is
     // total (it names every primary-key column); refused otherwise.
     for (sql, t) in [
         (
@@ -2204,7 +2202,7 @@ fn dml(r: &mut Rng) -> Vec<(String, &'static str)> {
     v
 }
 
-/// Chapter 19's DDL path (R3): `ALTER TABLE … ADD FOREIGN KEY` between
+/// The foreign-key DDL path: `ALTER TABLE … ADD FOREIGN KEY` between
 /// tables of two groups through the gateway becomes a `foreign_keys` row
 /// the gateway keeps (the reference MariaDB keeps it natively); child and
 /// parent writes are then checked alike; an orphan refuses the key; `DROP
@@ -2253,9 +2251,7 @@ async fn fk_ddl(e: &Env, sut: &mut Conn, reference: &mut Conn, tally: &mut Tally
         let a = run(sut, q).await;
         let b = run(reference, q).await;
         if matches!(a, Outcome::Err(39420, _)) {
-            tally
-                .mismatches
-                .push(format!("R3 FK DDL REFUSED {q}: {a:?}"));
+            tally.mismatches.push(format!("FK DDL REFUSED {q}: {a:?}"));
         }
         tally.check(q, Cmp::Bag, &a, &b);
         if let Some(t) = t {
@@ -2297,8 +2293,7 @@ async fn load(c: &mut Conn, sql: &str, data: &[u8]) -> Outcome {
     run(c, sql).await
 }
 
-/// R3's write forms (chapter 17, "`INSERT … SELECT` and `LOAD DATA`
-/// (R3)"): `INSERT … SELECT` into, out of and across sharded tables, with
+/// Write forms: `INSERT … SELECT` into, out of and across sharded tables, with
 /// `IGNORE`, upserts, `REPLACE`, errors, aggregates, subqueries and
 /// transactions, and `LOAD DATA LOCAL INFILE` with its field and line
 /// options; every statement's answer and the whole table afterwards are
@@ -2408,7 +2403,7 @@ async fn write_forms(sut: &mut Conn, reference: &mut Conn, tally: &mut Tally) ->
         if matches!(a, Outcome::Err(39420, _)) {
             tally
                 .mismatches
-                .push(format!("R3 WRITE FORM REFUSED {q}: {a:?}"));
+                .push(format!("WRITE FORM REFUSED {q}: {a:?}"));
         }
         tally.check(q, Cmp::Bag, &a, &b);
         compare_full(sut, reference, tally, "after a write form", t).await;
@@ -2474,7 +2469,7 @@ async fn write_forms(sut: &mut Conn, reference: &mut Conn, tally: &mut Tally) ->
         if matches!(a, Outcome::Err(39420, _)) {
             tally
                 .mismatches
-                .push(format!("R3 LOAD DATA REFUSED {q}: {a:?}"));
+                .push(format!("LOAD DATA REFUSED {q}: {a:?}"));
         }
         tally.check(q, Cmp::Bag, &a, &b);
         compare_full(sut, reference, tally, "after LOAD DATA", t).await;
@@ -2931,7 +2926,7 @@ fn full(t: &str) -> String {
     }
 }
 
-/// Chapter 21 through the gateway: an `ALTER TABLE` of a sharded table
+/// Schema changes through the gateway: an `ALTER TABLE` of a sharded table
 /// reaches every shard (the DDL path reads the same catalog layout as the
 /// router). Returns the shards that have the new column.
 async fn ddl_across_shards(
@@ -3132,7 +3127,7 @@ async fn transactions(
     .await;
 }
 
-/// Chapter 19's foreign keys across groups (R3), against MariaDB's own:
+/// Foreign keys across groups, against MariaDB's own:
 /// child inserts and updates (1452), parent deletes (1451), `ON DELETE
 /// CASCADE` (with a native cascade below it) and `SET NULL`, a reference
 /// parent, a string key under a case-insensitive collation, transactions,
@@ -3352,7 +3347,7 @@ async fn foreign_keys(sut: &mut Conn, reference: &mut Conn, tally: &mut Tally) -
     )
 }
 
-/// Chapter 19's test: concurrent child inserts against parent deletes
+/// Concurrent child inserts against parent deletes
 /// never commit an orphan child. Per round a fresh supplier, then at once
 /// an insert of a part referencing it (another cluster) and its delete;
 /// afterwards every part of the rounds has its supplier. Returns
@@ -3416,7 +3411,7 @@ async fn fk_race(e: &Env, tally: &mut Tally) -> (usize, usize, usize) {
     (rounds, ins_won, del_won)
 }
 
-/// Parent members (chapter 15) inside transactions: an invoice and its
+/// Parent members inside transactions: an invoice and its
 /// lines in one transaction (the lines find a parent the transaction
 /// wrote, on both clusters, committed with XA), a rolled-back one with a
 /// savepoint, `autocommit = 0`, and a missing parent with
@@ -3560,7 +3555,7 @@ async fn parent_rk_check(e: &Env, w: &World, tally: &mut Tally) {
     }
 }
 
-/// Chapter 19 through the router: reads, updates and deletes by a unique
+/// Unique lookups through the router: reads, updates and deletes by a unique
 /// lookup's column reach only the owners' shards; inserts claim values
 /// (a duplicate fails with 1062 everywhere), deletes release them, all in
 /// the statement's transaction; a transaction sees its own claims. The
@@ -3622,8 +3617,8 @@ async fn lookups(e: &Env, w: &World, sut: &mut Conn, reference: &mut Conn, tally
         ],
     )
     .await;
-    // A changed email needs a claim and a release: refused in R1, and
-    // only the gateway is asked.
+    // A changed email needs a claim and a release: refused, and only the
+    // gateway is asked.
     match run(sut, "UPDATE accounts SET email = 'zz@x.org' WHERE aid = 12").await {
         Outcome::Err(39420, m) if m.contains("(lookup)") => {}
         other => tally
@@ -3776,7 +3771,7 @@ async fn ddl_in_txn(
 }
 
 /// A schema change dropping a column runs on the shards first and is
-/// published afterwards (chapter 21, decision D8): reads of the whole
+/// published afterwards: reads of the whole
 /// table meanwhile retry once after the change publishes, instead of
 /// failing.
 async fn drop_column_window(
@@ -3816,7 +3811,7 @@ async fn drop_column_window(
 }
 
 /// Splits group 901's first range into two shards on the other cluster
-/// while point reads of its keys run, as chapter 20's split does: hold the
+/// while point reads of its keys run, as a split does: hold the
 /// range, fence the source (rename), copy rows by hash, commit the new map,
 /// drop the source. Returns the new shard list and the reads' errors.
 async fn split(
@@ -3958,7 +3953,7 @@ async fn split(
         .unwrap();
     }
     // Copy by hash, parents before children; `_sprig_rk` goes along, and
-    // a parent member's rows go with their parent (chapter 15).
+    // a parent member's rows go with their parent.
     for (t, _) in g.tables {
         let f = format!("`{src_schema}`.`__fenced_{t}`");
         let (select, key_at, cols) = match *t {
@@ -4239,11 +4234,10 @@ struct IdStmt {
     step: u64,
 }
 
-/// Chapter 19's ID blocks on sharded tables: `tickets` (keyed by its
+/// ID blocks on sharded tables: `tickets` (keyed by its
 /// `AUTO_INCREMENT` column), `events` (keyed by `cid`, the `AUTO_INCREMENT`
 /// column beside it) and `inv_notes` (a parent member). The values differ
-/// from the reference's, so the checks are the ones chapter 46 allows:
-/// the same affected rows and the same rows apart from the ids; on both
+/// from the reference's, so the checks are looser: the same affected rows and the same rows apart from the ids; on both
 /// sides each statement's generated rows hold `LAST_INSERT_ID()`,
 /// `+ step`, … in order, and the OK packet's insert id is that first
 /// value; an explicit-only statement leaves `LAST_INSERT_ID()` alone; the
@@ -4318,7 +4312,7 @@ async fn auto_ids(
         ev("INSERT INTO events SET cid = 33, note = '{p}g00'"),
         ev("INSERT INTO events VALUES (NULL, 34, '{p}g00'), (0, 35, '{p}g01')"),
         // IGNORE skips the first row (statement 11 wrote it): the first
-        // value really inserted is reported (decision IB10).
+        // value really inserted is reported.
         ev(&format!(
             "INSERT IGNORE INTO events (cid, note) VALUES (1, 'r{round}s11g00'), (2, '{{p}}g00'), \
              (3, '{{p}}g01')"
@@ -4566,7 +4560,7 @@ async fn ids_unique(e: &Env, w: &World) -> Vec<String> {
     out
 }
 
-/// Chapter 19's leased blocks (decision IB8): one gateway writes explicit
+/// Leased ID blocks: one gateway writes explicit
 /// ids while sessions on the other keep inserting from their cached
 /// blocks. An explicit value inside a block the other gateway still holds
 /// is refused (39463); one past every block raises the sequence. Either
@@ -4663,7 +4657,7 @@ async fn explicit_vs_blocks(e: &Env, w: &World, second: &str, tally: &mut Tally)
         // no live block (leases all ended, say after the server's clock
         // stepped forward) `top` alone would be 0, and the same explicit
         // value would go to several shards (an id that isn't the shard key
-        // and has no unique lookup is only unique per shard; chapter 19).
+        // and has no unique lookup is only unique per shard).
         let next: i64 = cat
             .exec_first::<String, _, _>(
                 "SELECT CAST(next_value AS CHAR) FROM sequences WHERE seq_id = ?",
@@ -4754,8 +4748,8 @@ async fn explicit_vs_blocks(e: &Env, w: &World, second: &str, tally: &mut Tally)
         .unwrap();
 }
 
-/// Concurrent inserts through two gateways (chapter 19: unique across
-/// gateways, increasing per gateway): `tasks` sessions per gateway each
+/// Concurrent inserts through two gateways (ids unique across gateways,
+/// increasing per gateway): `tasks` sessions per gateway each
 /// run `n` multi-row inserts into `events` (rows on every shard) and
 /// `tickets`; afterwards no id is held twice on any shard, each session's
 /// `LAST_INSERT_ID()` values increase, and every row is there. The rows
@@ -4874,7 +4868,7 @@ async fn two_gateways(e: &Env, w: &World, second: &str, tally: &mut Tally) {
         .unwrap();
 }
 
-/// bugfix prepfix: SQL-level prepared statements (`PREPARE`, `EXECUTE …
+/// SQL-level prepared statements (`PREPARE`, `EXECUTE …
 /// USING`, `EXECUTE IMMEDIATE`, `DEALLOCATE`), which the gateway holds for
 /// a tenant with shards and runs as the client's own statement at each
 /// `EXECUTE`. Every step runs on both sides; `(sql, mode, inner)`, where
@@ -5192,7 +5186,7 @@ async fn sql_ps_after_move(sut: &mut Conn, reference: &mut Conn, tally: &mut Tal
     )
 }
 
-/// The SQL-level prepared-statement phases alone (bugfix prepfix): the
+/// The SQL-level prepared-statement phases alone: the
 /// steps, then statements prepared before a split of group 901 run after
 /// it. Same environment as [`differential_against_one_unsharded_mariadb`].
 #[tokio::test]
@@ -5304,7 +5298,7 @@ async fn differential_against_one_unsharded_mariadb() {
         let b = run(&mut reference, s).await;
         tally.check(s, *mode, &a, &b);
     }
-    // R3: what R1 refused, gathered (chapter 17, "Gathered reads (R3)").
+    // Gathered reads: what the per-shard operators can't run.
     let r3_corpus = corpus_r3(&mut Rng(seed_value + 7));
     let mut r3 = R3Stats::default();
     r3_reads(&mut sut, &mut reference, &mut tally, &mut r3, &r3_corpus).await;
@@ -5319,7 +5313,7 @@ async fn differential_against_one_unsharded_mariadb() {
     }
     r3_in_txn(&mut sut, &mut reference, &mut tally, &mut r3).await;
     let r3_before_split = r3.line("before the split");
-    // R8 round 7: literal derived tables (decision G53).
+    // Literal derived tables.
     lit_setup(&mut sut, &mut reference).await;
     let lit_corpus = corpus_lit(&mut Rng(seed_value + 9));
     let lit_before = lit_reads(
@@ -5331,7 +5325,7 @@ async fn differential_against_one_unsharded_mariadb() {
     )
     .await;
     println!("{lit_before}");
-    // R3 part 4: analytic reads in DataFusion.
+    // Analytic reads in DataFusion.
     let analytics_line = analytics_reads(&mut sut, &mut reference, &mut tally).await;
     let (ddl_have, ddl_of_n) =
         ddl_across_shards(&e, &w, &mut sut, &mut reference, &mut tally).await;
@@ -5360,7 +5354,7 @@ async fn differential_against_one_unsharded_mariadb() {
         )
         .await;
     }
-    // bugfix prepfix: SQL-level PREPARE / EXECUTE.
+    // SQL-level PREPARE / EXECUTE.
     // `SPRIG_TEST_R1_NO_SQL_PS` leaves these phases out (a run as before
     // them, to tell their effect apart).
     let sql_ps = env("SPRIG_TEST_R1_NO_SQL_PS").is_none();
@@ -5588,7 +5582,7 @@ async fn differential_against_one_unsharded_mariadb() {
     );
 }
 
-/// R3 part 4's analytic corpus (chapter 17, "Analytic reads (R3)"):
+/// The analytic corpus:
 /// joins across groups, large aggregations, windows over gathered rows,
 /// DISTINCT, LEFT JOIN and statements the analytic guard refuses (they are
 /// gathered instead). Each runs as written and with the hint
@@ -5818,8 +5812,8 @@ async fn analytics_against_one_unsharded_mariadb() {
     );
 }
 
-/// Single-shard latency (chapter 17: pass-through adds at most 50 µs at
-/// p50 over R0 routing). Point selects: direct to the backend, through the
+/// Single-shard latency (the goal: pass-through adds at most 50 µs at p50
+/// over plain routing). Point selects: direct to the backend, through the
 /// gateway on an unsharded table, through the gateway on a sharded table
 /// whose shard is on the session's cluster, and as prepared statements.
 #[tokio::test]

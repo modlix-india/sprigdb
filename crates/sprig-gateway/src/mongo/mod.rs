@@ -31,6 +31,7 @@ pub mod cursors;
 pub mod diag;
 pub mod explain;
 pub mod failpoint;
+pub mod feed_relay;
 pub mod logic;
 pub mod publish;
 pub mod qsettings;
@@ -402,7 +403,7 @@ impl MongoFrontend {
             (Some(t), Some(dc)) => {
                 let locator: Arc<dyn sprig_catalog::CatalogLocator> = t.locator.clone();
                 match changes::ChangeFeed::new(Arc::clone(&t.global), Arc::clone(dc), locator) {
-                    Ok(f) => Some(f),
+                    Ok(f) => Some(f.with_relay(Arc::clone(t))),
                     Err(e) => {
                         tracing::warn!(error = %e, "change streams unavailable");
                         None

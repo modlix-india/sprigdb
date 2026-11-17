@@ -22,6 +22,9 @@
 #   ./sprig-vm.sh rotate-certs          new server and process certificates from the same CA, live
 #   ./sprig-vm.sh reload-certs          after copying a rotated secrets/tls to another VM: MariaDB re-reads it
 #   ./sprig-vm.sh db-status             this VM's MariaDB node: role, replication, semi-sync (compose.db-ha.yaml)
+#   ./sprig-vm.sh db-stream             a copy of this VM's MariaDB node to stdout (mariadb-backup, zstd), for db-seed
+#   ./sprig-vm.sh db-seed [node]        replace this VM's node with the copy on stdin; it replicates the writer
+#   ./sprig-vm.sh restart-agent         restart the node agent; a writer's node stays writable (no fence)
 #   ./sprig-vm.sh lb-config             write lb/envoy.yaml (the load balancer) from SPRIG_LB_GATEWAYS
 #   ./sprig-vm.sh lb-up                 lb-config, then start the load balancer (compose.lb.yaml)
 #   ./sprig-vm.sh monitoring-config     write config/prometheus-targets.json (every VM) from SPRIG_VM_HOSTS
@@ -189,6 +192,13 @@ chore() {
     docker run --rm -u 0 --entrypoint bash -v "$vol:/d" "${SPRIGDB_IMAGE:-sprigdb:dev}" -c "$*"
 }
 project=${COMPOSE_PROJECT_NAME:-sprigdb}
+# A missing named volume, made with the labels Compose gives its own (so
+# Compose uses it later without a warning): on a rebuilt VM, before a chore
+# writes into it.
+compose_volume() {
+    docker volume inspect "${project}_$1" >/dev/null 2>&1 ||
+        docker volume create --label "com.docker.compose.project=$project" --label "com.docker.compose.volume=$1" "${project}_$1" >/dev/null
+}
 
 # --- init ------------------------------------------------------------------------
 
@@ -432,22 +442,81 @@ db_follow() {
     me=$(my_db_node)
     [[ $me == "$primary" ]] && return 0
     if [[ -n $(dbq "SHOW SLAVE STATUS") ]]; then return 0; fi
+    # After a failover (or a restore on its VM) this node may be the writer.
+    [[ -n ${SPRIG_DB_CLUSTER_ID:-} && $(db_writer) == "$me" ]] && return 0
     addr=$(db_addr "$primary") || die "SPRIG_DB_NODES has no $primary"
     host=${addr%:*} port=${addr##*:}
     n=$(dbq "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('mysql','information_schema','performance_schema','sys')")
     [[ $n == 0 ]] || die "this VM's MariaDB has data but doesn't replicate: seed it from the primary first (RUNBOOK.md, \"MariaDB high availability\")"
     say "MariaDB $me: replicating $primary ($addr) over TLS, semi-sync"
-    dbq "RESET MASTER; SET GLOBAL gtid_slave_pos = '';
+    db_replicate "$primary" "$host" "$port" ''
+}
+
+# Makes this VM's node replicate <node> at <host>:<port> over verified TLS,
+# from GTID position <gtid> ('' = from the primary's first GTID), and waits
+# until it does.
+db_replicate() {
+    local node=$1 host=$2 port=$3 gtid=$4 i
+    dbq "STOP SLAVE; RESET SLAVE ALL; RESET MASTER; SET GLOBAL gtid_slave_pos = '$gtid';
 CHANGE MASTER TO MASTER_HOST = '$host', MASTER_PORT = $port, MASTER_USER = 'sprig_repl',
   MASTER_PASSWORD = '$(cat secrets/mariadb/sprig_repl-password)', MASTER_SSL = 1,
   MASTER_SSL_CA = '/run/sprig/tls/ca.pem', MASTER_SSL_VERIFY_SERVER_CERT = 1, MASTER_USE_GTID = slave_pos;
 START SLAVE;" >/dev/null
     for i in $(seq 1 60); do
-        [[ $(db_status_field Slave_IO_Running) == Yes && $(db_status_field Slave_SQL_Running) == Yes ]] && { say "MariaDB $me: replicating"; return 0; }
+        [[ $(db_status_field Slave_IO_Running) == Yes && $(db_status_field Slave_SQL_Running) == Yes ]] && { say "MariaDB $(my_db_node): replicating $node"; return 0; }
         sleep 2
     done
-    die "MariaDB $me doesn't replicate $primary: $(db_status_field Last_IO_Error) $(db_status_field Last_SQL_Error)"
+    die "MariaDB $(my_db_node) doesn't replicate $node: $(db_status_field Last_IO_Error) $(db_status_field Last_SQL_Error)"
 }
+
+# The node that holds the cluster's writer lease now (after failovers, not
+# necessarily SPRIG_DB_PRIMARY).
+db_writer() {
+    local id=${SPRIG_DB_CLUSTER_ID:-} w=
+    [[ -n $id ]] && w=$(etcdctl_retry get "/sprig/dc/$dc/leases/writer/$id" --print-value-only 2>/dev/null | jq -r '.node_id // empty' 2>/dev/null)
+    echo "${w:-${SPRIG_DB_PRIMARY:-db1}}"
+}
+
+# A copy of this VM's MariaDB node on stdout: a mariadb-backup stream,
+# compressed (for db-seed on another VM; send it over SSH, which encrypts
+# it in transit).
+db_stream() {
+    dc_compose exec -T mariadb-1 bash -c 'set -euo pipefail
+        p=$(cat /run/sprig/mariadb/root-password)
+        mariadb-backup --backup --stream=xbstream --user=root --password="$p" --target-dir=/tmp 2>/tmp/sprig-db-stream.log | zstd -q -T2
+        grep -q "completed OK" /tmp/sprig-db-stream.log || { tail -5 /tmp/sprig-db-stream.log >&2; exit 1; }'
+}
+
+# Seeds this VM's node from a copy of the writer (db-stream on its VM, on
+# stdin): for a replica rebuilt from nothing, one whose data is lost, one
+# the writer's binlogs no longer cover (they expire after 7 days), and the
+# replicas after a restore. The node's data is replaced; it then
+# replicates <node> (default: the writer now) from the copy's GTID position.
+#   ssh vm1 'cd /opt/sprigdb && ./sprig-vm.sh db-stream' | ./sprig-vm.sh db-seed
+db_seed() {
+    db_ha || die "db-seed is for compose.db-ha.yaml's nodes (SPRIG_DB_NODES)"
+    [[ ! -t 0 ]] || die "db-seed reads the copy on stdin: ssh <writer's VM> './sprig-vm.sh db-stream' | ./sprig-vm.sh db-seed"
+    local node=${1:-} me addr gtid
+    me=$(my_db_node)
+    [[ -n $node ]] || node=$(db_writer)
+    [[ $node != "$me" ]] || die "$me is the writer: seed the other nodes from it"
+    addr=$(db_addr "$node") || die "SPRIG_DB_NODES has no $node"
+    say "MariaDB $me: replacing its data with the copy on stdin (the agent and the node stop meanwhile)"
+    dc_compose stop agent mariadb-1 >/dev/null 2>&1
+    gtid=$(dc_compose run --rm --no-deps -T -u root --entrypoint bash mariadb-1 -c 'set -euo pipefail
+        find /var/lib/mysql -mindepth 1 -delete
+        zstd -dq | mbstream -x -C /var/lib/mysql
+        mariadb-backup --prepare --target-dir=/var/lib/mysql >/tmp/sprig-seed.log 2>&1 || { tail -5 /tmp/sprig-seed.log >&2; exit 1; }
+        chown -R mysql:mysql /var/lib/mysql
+        f=/var/lib/mysql/mariadb_backup_binlog_info; [ -f "$f" ] || f=/var/lib/mysql/xtrabackup_binlog_info
+        awk "{print \$3}" "$f"') || die "the copy couldn't be unpacked into $me's datadir"
+    say "MariaDB $me: the copy is at GTID ${gtid:-(none)}; starting it"
+    dc_compose up -d --no-deps --wait --wait-timeout "${SPRIG_UP_TIMEOUT:-300}" mariadb-1
+    db_replicate "$node" "${addr%:*}" "${addr##*:}" "$gtid"
+    dc_compose up -d --no-deps agent >/dev/null
+    say "MariaDB $me: seeded and replicating $node; its agent keeps it read-only"
+}
+
 
 # On the first primary's VM, once every replica is attached: open the
 # primary for its agent (registration wants one writable node), turn on
@@ -580,6 +649,7 @@ etcd_rejoin() {
     ic=$(sed -n 's/^ETCD_INITIAL_CLUSTER="\(.*\)"$/\1/p' <<<"$out")
     [[ -n $ic ]] || die "member add didn't say the initial cluster: $out"
     say "emptying $name's data directory"
+    compose_volume etcd-data
     chore "${project}_etcd-data" 'rm -rf /d/data'
     SPRIG_ETCD_INITIAL_CLUSTER=$ic SPRIG_ETCD_CLUSTER_STATE=existing dc_compose up -d --no-deps --force-recreate etcd
     wait_healthy etcd 90 || die "etcd member $name didn't become healthy (docker compose logs etcd)"
@@ -751,16 +821,21 @@ restore() {
     read -r -a dbs <<<"$(mariadb_services | tr '\n' ' ')"
     for s in "${dbs[@]}"; do [[ -f $d/$s.xbstream.zst.enc ]] || die "$d has no copy of $s"; inbak+=("$s"); done
     say "stopping SprigDB, MariaDB and etcd on this VM (stop the other VMs' SprigDB first: RUNBOOK.md, \"Restore\")"
-    dc_compose stop gateway worker controller "${dbs[@]}" etcd 2>/dev/null || dc_compose stop
+    local agent=()
+    has_service agent && agent=(agent)
+    dc_compose stop gateway worker "${agent[@]}" controller "${dbs[@]}" etcd 2>/dev/null || dc_compose stop
+    local gtids=()
     for s in "${inbak[@]}"; do
         say "MariaDB $s: decrypting, unpacking and preparing $d/$s.xbstream.zst.enc"
-        printf '%s' "$k" | dc_compose run --rm --no-deps -T -u root --entrypoint bash "$s" -c "set -euo pipefail; umask 077
+        gtids+=("$(printf '%s' "$k" | dc_compose run --rm --no-deps -T -u root --entrypoint bash "$s" -c "set -euo pipefail; umask 077
             cat >/dev/shm/k
             find /var/lib/mysql -mindepth 1 -delete
             openssl enc -d -aes-256-ctr -pbkdf2 -pass file:/dev/shm/k -in /backups/$ts/$s.xbstream.zst.enc | zstd -dq | mbstream -x -C /var/lib/mysql
             rm -f /dev/shm/k
             mariadb-backup --prepare --target-dir=/var/lib/mysql >/backups/$ts/$s-restore.log 2>&1
-            chown -R mysql:mysql /var/lib/mysql"
+            chown -R mysql:mysql /var/lib/mysql
+            f=/var/lib/mysql/mariadb_backup_binlog_info; [ -f \$f ] || f=/var/lib/mysql/xtrabackup_binlog_info
+            [ -f \$f ] && awk '{print \$3}' \$f || true")") || die "MariaDB $s: the backup couldn't be restored (backups/$ts/$s-restore.log)"
     done
     if has_service etcd && [[ -f $d/etcd.db.zst.enc ]]; then
         local name=${SPRIG_ETCD_NAME:-etcd-0} peer
@@ -770,6 +845,7 @@ restore() {
             cat >/dev/shm/k
             openssl enc -d -aes-256-ctr -pbkdf2 -pass file:/dev/shm/k -in /backups/$ts/etcd.db.zst.enc | zstd -dq >/backups/$ts/.etcd.db.part
             rm -f /dev/shm/k"
+        compose_volume etcd-data
         chore "${project}_etcd-data" 'rm -rf /d/data'
         dc_compose run --rm --no-deps -T --entrypoint etcdutl etcd snapshot restore "/backups/$ts/.etcd.db.part" \
             --data-dir /etcd-data/data --name "$name" --initial-cluster "$name=$peer" \
@@ -778,6 +854,18 @@ restore() {
         rm -f "$d/.etcd.db.part"
     fi
     k=
+    # A backup holds no binlog, so a restored server would number its next
+    # transaction from 1 again: binlog readers (change streams, sinks,
+    # replicas) that saw the old numbers would skip the new ones. Each
+    # server carries on from the backup's GTID position instead.
+    local i
+    dc_compose up -d --no-deps --wait --wait-timeout "${SPRIG_UP_TIMEOUT:-300}" "${inbak[@]}"
+    for i in "${!inbak[@]}"; do
+        [[ -n ${gtids[$i]} ]] || continue
+        say "MariaDB ${inbak[$i]}: continuing the GTID sequence from the backup's position ${gtids[$i]}"
+        printf '%s\n' "RESET MASTER; SET GLOBAL gtid_binlog_state = '${gtids[$i]}';" | dc_compose exec -T "${inbak[$i]}" bash -c \
+            'MYSQL_PWD=$(cat /run/sprig/mariadb/root-password) exec mariadb -uroot -h127.0.0.1 -P3306 --ssl-ca=/run/sprig/tls/ca.pem -N -B'
+    done
     say "starting"
     dc_compose up -d --wait --wait-timeout "${SPRIG_UP_TIMEOUT:-300}"
     say "restored $ts"
@@ -803,8 +891,27 @@ roll() {
     for s in controller worker agent gateway; do
         has_service "$s" || continue
         say "$s -> $SPRIGDB_IMAGE"
+        [[ $s == agent ]] && announce_agent_restart
         dc_compose up -d --no-deps --wait --wait-timeout "${SPRIG_UP_TIMEOUT:-300}" "$s"
     done
+}
+
+# Tells the node agent a restart is coming (SIGUSR1): if its node is the
+# writer, it stops without fencing it and leaves its writer lease to its
+# successor, so writes go on through the restart (an agent older than
+# this script restarts once more on the signal, then fences as before).
+announce_agent_restart() {
+    [[ -n $(dc_compose ps -q --status running agent 2>/dev/null) ]] || return 0
+    dc_compose kill -s SIGUSR1 agent >/dev/null 2>&1 || true
+    sleep 1
+}
+
+restart_agent() {
+    has_service agent || die "no node agent on this VM (compose.db-ha.yaml)"
+    announce_agent_restart
+    dc_compose restart agent
+    wait_healthy agent 60 || die "the agent didn't become healthy (docker compose logs agent)"
+    say "agent restarted"
 }
 
 upgrade() {
@@ -1002,6 +1109,9 @@ rollback) rollback ;;
 rotate-certs) rotate_certs ;;
 reload-certs) reload_certs ;;
 db-status) db_status ;;
+db-stream) db_stream ;;
+db-seed) db_seed "$@" ;;
+restart-agent) restart_agent ;;
 lb-config) lb_config ;;
 lb-up) lb_up ;;
 monitoring-config) monitoring_config ;;

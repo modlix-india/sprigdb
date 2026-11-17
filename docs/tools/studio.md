@@ -9,7 +9,7 @@ sidebar:
 
 Studio is SprigDB's browser workspace. Every gateway serves it, at `/studio` on its HTTP listeners, so there is nothing to install. You sign in with your own SprigDB login and see exactly what your grants allow: Studio calls only the public REST API, with your token, as any other client would.
 
-Use it to browse and edit data, write SQL, Cypher, GQL, MongoDB and Redis commands, look at query performance and automatic indexing, approve what SprigDB recommends, manage users, roles and row-level security, work with streams, queues and sinks, write logic, and, for platform operators, watch clusters, moves and jobs.
+Use it to browse and edit data, write SQL, Cypher, GQL, MongoDB and Redis commands, look at query performance and automatic indexing, approve what SprigDB recommends, manage users, roles and row-level security, work with streams, queues and sinks, write logic, ask the [AI assistants](#the-assistant), and, for platform operators, watch clusters, moves, jobs and incidents.
 
 For a guided first look, see the [Studio tour](../get-started/studio-tour.md). The terminal counterpart is [the sprig shell](sprig.md), which shares your saved queries and history with Studio.
 
@@ -31,7 +31,7 @@ sprigctl settings set studio.session_idle_minutes 15 --scope tenant --tenant acm
 | `studio.path` | text | `/studio` | dc, global | The mount path; a value under `/v1`, `/admin` or `/.well-known`, or `/`, falls back to `/studio`. The Studio that ships with SprigDB is built for `/studio`, so keep the default |
 | `studio.allow_insecure_http` | bool | `false` | dc, global | Allow sign-in over plain HTTP from another computer |
 | `studio.public_origins` | text | empty | dc, global | Extra origins for the Origin check, comma-separated, for a reverse proxy in front of the gateway |
-| `studio.map_tile_url` | text | empty | dc, global | A base-map tile server; its origin is added to the Content-Security-Policy |
+| `studio.map_tile_url` | text | empty | dc, global | A base-map tile server for dashboard maps, as an XYZ template (`https://tiles.example.com/{z}/{x}/{y}.png`); its origin is added to the Content-Security-Policy. Empty: maps have no base map and fetch nothing from outside |
 
 Studio's files are built into the `sprigdb` binary. A binary built without them answers 503 with a page saying so (39932 `ER_SPRIG_STUDIO_NOT_BUILT`).
 
@@ -127,10 +127,10 @@ Studio's window has five parts:
 ```
 
 - **The title bar** has the tenant (a switcher, if you administer descendant tenants), the search box that opens the [command palette](#the-command-palette), the theme, who you are, and **Sign out**.
-- **The activity bar** on the left picks a section. From the top: **Explorer**, **Query**, **Saved queries**, **History**, **Messaging**, **Logic**, **Performance** (with a badge counting approvals that wait), **Inheritance** and **Access control**; at the bottom, **Operator mode** (operators only) and **Settings**.
+- **The activity bar** on the left picks a section. From the top: **Explorer**, **Query**, **Saved queries**, **History**, **Dashboards**, **Messaging**, **Logic**, **Performance** (with a badge counting approvals that wait), **Inheritance**, **Access control** and **Docs**; at the bottom, **Operator mode** (operators only) and **Settings**.
 - **The side panel** lists the section's pages and, below them, the database tree. For Saved queries and History, it shows those lists instead.
 - **The tabs** hold everything you have open: query tabs, tables, and pages. `Left` and `Right` move between tabs, and `Delete` (or a middle click) closes one.
-- **The status bar** shows whether you are connected (and whether Studio is working), the tenant and database, the gateway and its data centre, and your login.
+- **The status bar** shows whether you are connected (and whether Studio is working), the tenant and database, the gateway and its data centre, your login, and the **Assistant** button, which opens [the assistant](#the-assistant).
 
 The tenant's home page welcomes you and lists your databases, with who you are signed in as, your session limits, your privileges and the gateway you reached. If you are a tenant administrator, the tenant switcher lists your home tenant and its descendants; choosing a descendant opens its settings. Settings and access can target a descendant; data views always use your home tenant.
 
@@ -221,6 +221,7 @@ Studio's forms (users, roles, policies, settings, messaging, logic) never write 
 Rows stream in as the gateway sends them. Studio holds up to `studio.max_result_rows` rows and `studio.max_result_mb` of each result, and says when it stopped. Then:
 
 - **Fetch more** continues the same run through a cursor on the gateway, with a sliding window: earlier rows are dropped to keep the cap in the browser, and the notice says which rows you are seeing. A cursor holds no backend session of its own. It closes when you start a new run, leave the result or hide the tab, and the gateway closes it after `studio.cursor_idle_seconds` (39935). **Fetch more** after that runs the statement again, skips the rows already read, and says so, because rows from there on can differ if the data changed.
+- **▦ Add to dashboard** saves the statement as a tile on one of your [dashboards](dashboards.md), drawn as Show Me suggests for its columns.
 - **Export CSV** and **Export NDJSON** run the statement again on the gateway and stream every row to a download, whatever the cap. The download uses a one-time ticket that lives `studio.export_ticket_seconds` and never appears in a URL; a bad or expired ticket fails with 39929.
 
 A result has up to four views:
@@ -392,6 +393,59 @@ The **Settings** page shows every setting at a scope you choose: the tenant, a d
 
 ![The Settings page at database scope for retail, filtered to studio. keys, with each key's effective value, source and bounds, and Set and Lock buttons](../img/studio/settings.png)
 
+## Dashboards
+
+**Dashboards** in the activity bar lists your own dashboards, the tenant's shared ones and, for tenant administrators, the digests. A dashboard is a 12-column grid of tiles: charts over read-only queries that run as whoever views them, built on Tableau-style shelves with Show Me, or proposed by the data assistant from the ask bar. See [Dashboards](dashboards.md).
+
+## The assistant
+
+`Ctrl+I` (`⌘+I` on a Mac), or **Assistant** at the end of the status bar, opens the assistant dock on the right. It is one chat with the tenant's **Data** specialist and **DBA** assistant, and, for platform operators, the **Admin** assistant. What each one can do, and how an operator and a tenant administrator set them up, is in [AI assistants](assistants.md). Nothing the assistant proposes changes anything until you press **Run**.
+
+![Studio with a query tab on the left and the assistant dock on the right: the DBA assistant chosen, the Schema only badge, chips for the database and the query tab, tool rows, the answer, and a proposed CREATE INDEX card with Review & run](../img/studio/assistant-dock.png)
+
+- **The assistant**: **Data**, **DBA** and (operators) **Admin** at the top. A conversation belongs to one assistant, so switching starts a new one.
+- **The data badge** says what may leave SprigDB: **Schema only** while `ai.share_data` is off (schema, plans and statistics, never rows or values), **Data shared** while it is on. Each answer applies the value for its database.
+- **Chips** under the header are what your question is about: the database, table and query tab you are on, and whatever an entry point added (a statement, an error, a recommendation). `×` removes one. The database chip picks the database the assistant works in; a statement or note goes along as context.
+- **The answer** streams in. Tool calls are quiet rows (choose one to see its input). When the data specialist runs a read-only query, you see its first 20 rows, with **Open in tab** to open the query in a tab. With sharing off, a note says the assistant saw only the result's shape.
+- **Proposals** are cards: the statement, the assistant's estimate, and what SprigDB checked before showing it (a schema change's checks, a policy tried as test users, a compile). Generated test rows can be previewed; they never went to the provider.
+- **Sources** link to the docs pages and tables the answer drew on. **What was sent** shows every call to the AI provider in the conversation, exactly as it left SprigDB, with its SHA-256, while `ai.audit_payload_days` keeps it. 👍 and 👎 rate the answer (👎 takes an optional note).
+- **Stop** ends an answer that is still streaming. The history button lists your conversations and reopens one; `+` starts a new one. `Escape` closes the dock and puts the focus back where it was.
+
+When no AI provider is set up, the dock says "Ask your operator to set up an AI provider." and Studio shows no other assistant controls. When the assistants are off for the tenant (`ai.enabled`), it says so instead.
+
+### Proposals
+
+![A proposal card: Proposed statement, a DDL badge, the reason, the CREATE INDEX statement, the estimate, what was checked, and Review & run, Open in query tab and Dismiss](../img/studio/assistant-proposal.png)
+
+| Proposal | Buttons |
+|---|---|
+| A statement (`sql`), a policy, logic, test rows | **Review & run** opens the same confirm dialog as a query tab; **Run it** runs it as you, in its database, and the card shows the result. **Open in query tab** puts it in a tab and runs nothing |
+| A recommendation | **Send to approvals** files it in the [approvals inbox](#approvals) as advice |
+| A glossary term | It is filed as a proposed term; tenant administrators can **Accept term** here or on the [Glossary](#docs-glossary-and-digests) page |
+| A chart | **Add to dashboard**, or **Open in query tab** |
+
+**Dismiss** turns any proposal down. Each outcome is recorded as feedback, so the assistants learn which proposals your team takes.
+
+### Asking from where you are
+
+| Where | Button | Asks |
+|---|---|---|
+| A failed statement in a query tab | **Explain this error** | The data specialist, with the statement and the error |
+| A query tab, after a statement took a second or more | **Why is this slow?** | The DBA assistant, with the statement and its time |
+| Performance > Automatic indexing, a fingerprint | **Why is this slow?** | The DBA assistant, with the statement and its workload |
+| A table or view page | **Describe this table** | The data specialist, with the table |
+| Approvals, a recommendation | **Explain** | The DBA assistant, with the recommendation |
+| An empty query tab | **Ask for a query** | Opens the dock for your question; **Open in query tab** then fills that tab |
+| The command palette | **Ask the assistant: …**, **Search docs: …** | Your words, as a question or a docs search (start with `?` to put the question first) |
+
+In a query editor, `Ctrl+I` (`⌘+I`) asks inline: describe the change ("only paid orders", "add the customer's name"), and the data specialist's new query comes back as a diff over the editor's text. `Tab` puts it in the editor and `Escape` discards it. Either way nothing runs.
+
+### Docs, glossary and digests
+
+- **Docs**, in the activity bar, searches this version's documentation, the same index the assistants cite. Each result opens its page in Studio, at its section. The page is rebuilt from the docs that ship with the running release (`GET /v1/docs/pages/{page}`, see [Searching the docs](docs-search.md)), so it works with no internet access and always matches your version. Links between pages stay in Studio, and **Open on the website** opens the published page instead. The pages an assistant cites in an answer, and links to the documentation website in its answers, open in Studio the same way. If the release's docs pack is older than chunk positions, the page says that its sections may be out of order.
+- **Settings > Glossary** lists the tenant's business terms, which the assistants use as written. Everyone can read it; tenant administrators add, edit and delete terms and accept or reject the ones the assistants propose.
+- **Settings > Digests** lists the tenant's daily or weekly digests (`ai.digest`) for tenant administrators: what changed, the facts they were built from, and what was sent to word them.
+
 ## Operator mode
 
 Operator mode is for platform operators. It opens at `/studio/ops/` and has its own pages:
@@ -405,6 +459,7 @@ Operator mode is for platform operators. It opens at `/studio/ops/` and has its 
 | Jobs | Every job with its owner, attempts, start and error |
 | Failovers | The failover records |
 | In-doubt transactions | Cross-shard transactions waiting for resolution |
+| Incidents | The administration assistant's incidents (errors counted by code and place, with their advice) and health warnings; an incident's advice, what it was given, and what was sent. Without an admin model, a card says how to connect a provider |
 
 Every action asks you to type the target's name and a reason, which is audited.
 
@@ -420,7 +475,7 @@ A tenant login listed in `studio.operator_logins` also gets operator mode, with 
 
 ## The command palette
 
-`Ctrl+K` or `Ctrl+P` (`⌘+K`, `⌘+P` on a Mac), or the search box, opens one search over pages, open tabs, databases, the objects of databases already loaded, and commands: **New query tab**, **Switch theme** and **Sign out**. Type part of a name; matches rank by how early and how closely they match. `Up` and `Down` choose, `Enter` opens, and `Escape` closes.
+`Ctrl+K` or `Ctrl+P` (`⌘+K`, `⌘+P` on a Mac), or the search box, opens one search over pages, open tabs, databases, the objects of databases already loaded, and commands: **New query tab**, **Switch theme** and **Sign out**. Whatever you type also offers **Ask the assistant: …** (when the assistants are on) and **Search docs: …**; start with `?` to put the question first. Type part of a name; matches rank by how early and how closely they match. `Up` and `Down` choose, `Enter` opens, and `Escape` closes.
 
 ![The command palette with "ord" typed, listing the orders and order_items tables and the order_total function and procedure of the retail database](../img/studio/palette.png)
 
@@ -431,6 +486,11 @@ A tenant login listed in `studio.operator_logins` also gets operator mode, with 
 | `Ctrl+K`, `Ctrl+P` (`⌘` on a Mac) | Anywhere | Open or close the command palette |
 | `Ctrl+Enter` (`⌘+Enter`) | Query editor | Run the selection or the statement at the cursor |
 | `Ctrl+S` (`⌘+S`) | Query tab | Save the query |
+| `Ctrl+I` (`⌘+I`) | Anywhere | Open or close the assistant |
+| `Ctrl+I` (`⌘+I`) | Query editor | Ask the assistant to change the query (inline) |
+| `Tab`, `Escape` | Inline ask's diff | Put it in the editor, or discard it |
+| `Enter`, `Shift+Enter` | Assistant's question | Send, or a new line |
+| `Escape` | Assistant | Close it |
 | `Left`, `Right` | Tab bar | Previous or next tab |
 | `Delete`, middle click | Tab bar | Close the tab |
 | Arrows, `PageUp`, `PageDown`, `Home`, `End` | Grid | Move between cells |
@@ -457,6 +517,8 @@ Studio is in English.
 ## Related
 
 - [Studio tour](../get-started/studio-tour.md)
+- [AI assistants](assistants.md)
+- [Dashboards](dashboards.md)
 - [The sprig shell](sprig.md)
 - [sprigctl](sprigctl.md)
 - [Settings and scopes](../concepts/settings-and-scopes.md)

@@ -9,6 +9,7 @@ use sprig_common::ids::{DbId, ObjectId, TenantId};
 use sprig_common::{Result, SprigCode, SprigError};
 
 use crate::cache::mem::{MemSource, MemSourceTx};
+use crate::pool_wait::Bounded as _;
 use crate::sql::{map_err, timed};
 use crate::store::{
     Counter, DatabaseRow, DbState, Namespace, ObjectRow, ObjectState, PurgeReport,
@@ -332,7 +333,7 @@ impl DdlBackend for MariaBackend {
     async fn version_mark(&self, tenant: TenantId) -> Result<(u64, SystemTime)> {
         let ep = self.locator().writer(tenant).await?;
         timed(self.opts().statement_timeout, "version mark", async {
-            let mut conn = ep.pool.get_conn().await.map_err(map_err)?;
+            let mut conn = ep.pool.get_conn_bounded().await.map_err(map_err)?;
             let row = ep
                 .store
                 .setting(&mut conn, SettingScope::Tenant, VersionKind::Catalog.key())

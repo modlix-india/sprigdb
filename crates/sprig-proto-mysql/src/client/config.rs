@@ -184,6 +184,10 @@ pub struct ClientConfig {
     pub attrs: Vec<(String, String)>,
     /// Deadline for TCP, TLS and authentication together.
     pub connect_timeout: Duration,
+    /// Bytes written on the TCP connection before anything else (Sprig
+    /// 2PC's relay reads a one-line preamble naming the tenant, then
+    /// relays the MySQL exchange unchanged).
+    pub preamble: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for ClientConfig {
@@ -231,6 +235,7 @@ impl ClientConfig {
                 ),
             ],
             connect_timeout: Duration::from_secs(2),
+            preamble: None,
         }
     }
 }

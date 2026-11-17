@@ -40,7 +40,17 @@
 //!   `toUpperCase`, `toLowerCase`, `includes`, `startsWith`, `endsWith`,
 //!   `indexOf` on non-null text; `String(x)`;
 //! - `return {fields}`, `return sprig.event(name, {fields})`,
-//!   `sprig.reject(message)`, `throw new Error(message)`.
+//!   `sprig.reject(message)`, `throw new Error(message)`;
+//! - `do { } while (test)`;
+//! - `try`/`catch`/`finally` and `throw e` ([`Stmt::Try`] says what a
+//!   `catch` catches); a `catch` reads `e.message` and `e.name` only when
+//!   the `try` raises just the code's own error objects (a database
+//!   error's text can differ between the tiers);
+//! - helper functions (`function f() {}`, `const f = (x) => ...`), at
+//!   module level or inside the function, inlined at each call in the
+//!   scope they were declared in, so closures read and write the variables
+//!   they see; one whose body is one `return` is an expression, any other
+//!   runs as statements before the statement that calls it.
 //!
 //! Reading a column of a `sqlOne` row that may be `null` throws a
 //! `TypeError` in JavaScript, so the compiled code checks the row first
@@ -52,7 +62,8 @@
 //! whole numbers past 2^63 overflow (39866) where JavaScript loses
 //! precision; `length` and `indexOf` count code points; number-to-text is
 //! exact for integers and up to 15 significant digits; `ctx.log` and
-//! `console.log` lines are dropped.
+//! `console.log` lines (and `console.info`, `warn`, `error`, `debug`) are
+//! dropped, except a stream or queue trigger's, which go to its run log.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -71,9 +82,10 @@ use sprig_common::Result;
 
 use crate::check::Analysis;
 use crate::ir::{
-    BinOp, Block, Bound, Builtin, DbOp, ErrorSpec, EventDef, Expr, Function, Literal, LocalId,
-    Param, PathSeg, SqlShape, Stmt, Ty, UnOp,
+    BinOp, Block, Bound, Builtin, Caught, DbOp, ErrorSpec, EventDef, Expr, Function, Literal,
+    LocalId, Param, PathSeg, SqlShape, Stmt, Ty, UnOp,
 };
+use crate::link::{CallDep, StreamTarget};
 use crate::sql::{self, Columns, Want};
 use crate::{Compiled, Options, Reason};
 
@@ -88,6 +100,61 @@ pub struct Signature {
     /// sees. `params` and `returns` are then unused: the code's own
     /// parameters bind by name (see [`compile_with`]).
     pub row: Option<String>,
+    /// Triggers on streams and queues: what the code's `ctx` holds. The
+    /// IR's parameters are then the fields of `ctx.record` or
+    /// `ctx.message` the code reads (see [`MsgSource::fields`]).
+    pub on: Option<MsgSource>,
+}
+
+/// What a trigger on a stream or queue gets: `ctx.record` or
+/// `ctx.message`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsgSource {
+    /// `ctx.record {stream, partition, offset, key, value, headers,
+    /// timestamp}`.
+    Stream,
+    /// `ctx.message {queue, vhost, exchange, routingKey, body, properties,
+    /// redelivered, deliveryCount}`.
+    Queue,
+}
+
+impl MsgSource {
+    /// `record` or `message`.
+    #[must_use]
+    pub const fn member(self) -> &'static str {
+        match self {
+            MsgSource::Stream => "record",
+            MsgSource::Queue => "message",
+        }
+    }
+
+    /// The fields the code can read, their types, and whether each is
+    /// never `null`. A field's parameter is its name in lower case.
+    /// `headers` and `properties` are parsed JSON objects.
+    #[must_use]
+    pub const fn fields(self) -> &'static [(&'static str, Ty, bool)] {
+        match self {
+            MsgSource::Stream => &[
+                ("stream", Ty::Str, true),
+                ("partition", Ty::Int, true),
+                ("offset", Ty::Int, true),
+                ("key", Ty::Str, false),
+                ("value", Ty::Str, false),
+                ("headers", Ty::Json, true),
+                ("timestamp", Ty::Int, true),
+            ],
+            MsgSource::Queue => &[
+                ("queue", Ty::Str, true),
+                ("vhost", Ty::Str, true),
+                ("exchange", Ty::Str, false),
+                ("routingKey", Ty::Str, false),
+                ("body", Ty::Str, true),
+                ("properties", Ty::Json, true),
+                ("redelivered", Ty::Bool, true),
+                ("deliveryCount", Ty::Int, true),
+            ],
+        }
+    }
 }
 
 impl Signature {
@@ -96,6 +163,15 @@ impl Signature {
     pub fn row_of(table: &str) -> Self {
         Self {
             row: Some(table.to_ascii_lowercase()),
+            ..Self::default()
+        }
+    }
+
+    /// The signature of a trigger on a stream or queue.
+    #[must_use]
+    pub fn message(on: MsgSource) -> Self {
+        Self {
+            on: Some(on),
             ..Self::default()
         }
     }
@@ -211,6 +287,7 @@ pub fn compile_with(
             )));
         }
         let mut l = L::new(name, source, sig, cat, widen.clone());
+        l.module_id = opts.module_id;
         l.program(&parsed.program);
         if let Some(e) = l.fatal.take() {
             return Err(e);
@@ -219,8 +296,15 @@ pub fn compile_with(
             widen = l.widen;
             continue;
         }
+        let calls = std::mem::take(&mut l.calls);
+        let reaches = std::mem::take(&mut l.reaches);
+        let depth = l.depth;
         let (f, reasons, lints) = l.finish();
-        return Ok(crate::finish(f, reasons, lints, opts));
+        let mut c = crate::finish(f, reasons, lints, opts);
+        c.analysis.calls = calls;
+        c.analysis.reaches = reaches.into_iter().collect();
+        c.analysis.call_depth = depth;
+        return Ok(c);
     }
     Ok(refused(Reason::new(
         "js.types",
@@ -239,9 +323,15 @@ enum Var {
         found: LocalId,
         cols: Vec<(String, LocalId)>,
     },
-    /// A `db.exec` result.
+    /// A `db.exec` or `db.publish` result.
     Exec {
         affected: LocalId,
+    },
+    /// A `db.call` result: the event's name, and each field's local in
+    /// the callee's wrapper order.
+    Call {
+        event: LocalId,
+        cols: Vec<(String, LocalId)>,
     },
     /// A `db.sql` result (a JSON array of rows) and its columns.
     Rows {
@@ -264,9 +354,67 @@ enum Var {
     },
     /// A validation's or trigger's `ctx`: only `ctx.trigger.*` compiles.
     Ctx,
+    /// A trigger on a stream or queue's `ctx`: `ctx.record` or
+    /// `ctx.message`, and `ctx.log`.
+    Msg,
+    /// `ctx.record` or `ctx.message` (also given a name of its own).
+    Event,
     /// A validation's or trigger's scalar: a column, `old_<column>` or
     /// `op`, made a parameter when first read.
     Field(String),
+    /// A helper function: its source's offsets, the scope it was declared
+    /// in, and whether it is an expression (`const f = (a) => ...`).
+    Helper {
+        start: u32,
+        end: u32,
+        depth: usize,
+        expr: bool,
+    },
+    /// An expression-form helper's parameter: its argument's value.
+    Val(V),
+    /// A `catch`'s binding: where the error is kept, and whether its
+    /// `message` and `name` read the same in both tiers (the `try` body
+    /// raises only the code's own errors).
+    Exc {
+        caught: Caught,
+        readable: bool,
+    },
+}
+
+/// What a jump can reach.
+#[derive(Debug, Clone)]
+enum JFrame {
+    /// A loop, and what `continue` runs first (a counted loop's update,
+    /// a `do`'s test).
+    Loop { cont: Block },
+    /// An inlined helper: its block's label, and the local its value
+    /// lands in (made at its first `return` of a value).
+    Helper {
+        label: u32,
+        result: Option<LocalId>,
+        /// Every `return` gave a non-null value.
+        nn: bool,
+    },
+    /// A `try` with a `finally`: a jump out of it leaves its block with
+    /// `cmp` set to the jump's number, the `finally` runs, and the jump
+    /// goes on from there.
+    Finally {
+        label: u32,
+        cmp: LocalId,
+        jumps: Vec<Jump>,
+    },
+}
+
+/// A jump, as it goes on after `finally` blocks.
+#[derive(Debug, Clone)]
+enum Jump {
+    Break,
+    Continue,
+    /// The function's `return`: the event and its fields, already
+    /// evaluated.
+    Return(String, Vec<(String, Expr)>),
+    /// A helper's `return`: leave its block.
+    Leave(u32),
 }
 
 /// A fact key: a parameter or a local (a row's `found`).
@@ -313,15 +461,32 @@ struct L<'s, 'c> {
     lints: Vec<Reason>,
     scopes: Vec<Vec<(String, Var)>>,
     facts: BTreeSet<Key>,
-    /// Unconditional reads of rows that may be `null`, for the guard
-    /// before the statement.
-    guards: Vec<(LocalId, String)>,
+    /// Statements that must run before the statement being lowered, in
+    /// order: the checks of rows it reads unconditionally (a `TypeError`
+    /// when one is `null`) and the bodies of helper functions it calls.
+    pre: Block,
     /// Inside a conditionally evaluated operand.
     cond: u32,
-    loops: u32,
-    /// Per enclosing loop, what `continue` runs first: a counted loop's
-    /// update.
-    conts: Vec<Block>,
+    /// `db.call` and `db.publish` inside larger expressions, already run
+    /// into `pre`, by where they are in the source (an expression may be
+    /// lowered twice).
+    inlined: BTreeMap<u32, Var>,
+    /// What jumps can reach, innermost last: loops, inlined helpers and
+    /// `try` statements with a `finally`.
+    jframes: Vec<JFrame>,
+    /// Labels of [`Stmt::Block`]s, and `try` statements, numbered.
+    labels: u32,
+    /// Helper functions being inlined (their start offsets): a call to
+    /// one of them again is recursion.
+    inlining: Vec<u32>,
+    /// Added to span offsets: an inlined helper's source is parsed alone,
+    /// so its spans start at 0.
+    span_base: u32,
+    /// Added to declaration offsets for widening, per inlined call, so two
+    /// calls of one helper widen their locals apart.
+    salt: u32,
+    /// Inlined calls so far (for `salt`).
+    inlines: u32,
     /// Declaration offset → wider type for the next pass.
     widen: BTreeMap<u32, Ty>,
     /// Event name → fields in first-seen order.
@@ -336,15 +501,85 @@ struct L<'s, 'c> {
     table: Option<String>,
     old_found: Option<LocalId>,
     old_used: std::cell::Cell<bool>,
+    /// The module being compiled (a `db.call` back into it is recursion).
+    module_id: u64,
+    /// What compiled `db.call`s were compiled against.
+    calls: Vec<CallDep>,
+    /// Modules the compiled calls reach.
+    reaches: BTreeSet<u64>,
+    /// The longest chain of compiled calls below this code.
+    depth: u32,
+    /// Triggers on streams and queues: what `ctx` holds.
+    msg: Option<MsgSource>,
+    /// Locals and parameters holding parsed JSON ([`Builtin::JsonParse`]):
+    /// their `NULL` is `undefined`, and JSON `null` is the text `null`.
+    dyn_locals: BTreeSet<LocalId>,
+    dyn_params: BTreeSet<u16>,
 }
 
 /// Whether control can't continue after the lowered statements.
 fn exits(b: &Block) -> bool {
     match b.last() {
-        Some(Stmt::Return | Stmt::Throw(_)) => true,
+        Some(Stmt::Return | Stmt::Throw(_) | Stmt::Rethrow(_) | Stmt::Leave(_)) => true,
         Some(Stmt::If(_, a, c)) => exits(a) && exits(c),
         _ => false,
     }
+}
+
+/// The locals a block assigns.
+fn assigned(b: &[Stmt], out: &mut BTreeSet<LocalId>) {
+    for s in b {
+        match s {
+            Stmt::Assign(l, _) => {
+                out.insert(*l);
+            }
+            Stmt::If(_, a, c) => {
+                assigned(a, out);
+                assigned(c, out);
+            }
+            Stmt::While { body, .. } | Stmt::Block(_, body) | Stmt::Try { body, .. } => {
+                assigned(body, out);
+            }
+            Stmt::Db(DbOp::Sql { shape, .. }) => match shape {
+                SqlShape::One { found, into } => {
+                    out.insert(*found);
+                    out.extend(into.iter().map(|(_, l)| *l));
+                }
+                SqlShape::Many { into, .. } => {
+                    out.insert(*into);
+                }
+                SqlShape::Exec { affected } | SqlShape::Publish { affected, .. } => {
+                    out.insert(*affected);
+                }
+                SqlShape::Call {
+                    event,
+                    result,
+                    into,
+                } => {
+                    out.insert(*event);
+                    out.insert(*result);
+                    out.extend(into.iter().map(|(_, l)| *l));
+                }
+            },
+            _ => {}
+        }
+    }
+}
+
+/// Whether a `catch` can read the error's `message` and `name` in the
+/// compiled tier: the `try` body raises only the code's own error objects
+/// (a database error's text, or a thrown value that isn't an error, can
+/// read differently than in the engine tier).
+fn catch_readable(b: &Block) -> bool {
+    b.iter().all(|s| match s {
+        Stmt::Db(_) => false,
+        Stmt::Throw(e) => !matches!(&e.catch, Some((n, _)) if n.is_empty()),
+        Stmt::If(_, a, c) => catch_readable(a) && catch_readable(c),
+        Stmt::While { body, .. } | Stmt::Block(_, body) | Stmt::Try { body, .. } => {
+            catch_readable(body)
+        }
+        _ => true,
+    })
 }
 
 impl<'s, 'c> L<'s, 'c> {
@@ -361,7 +596,7 @@ impl<'s, 'c> L<'s, 'c> {
         };
         // A validation's or trigger's parameters are the columns it reads,
         // added as they are read.
-        if sig.row.is_none() {
+        if sig.row.is_none() && sig.on.is_none() {
             f.params = sig
                 .params
                 .iter()
@@ -383,10 +618,15 @@ impl<'s, 'c> L<'s, 'c> {
             lints: Vec::new(),
             scopes: vec![Vec::new()],
             facts: BTreeSet::new(),
-            guards: Vec::new(),
+            pre: Vec::new(),
             cond: 0,
-            loops: 0,
-            conts: Vec::new(),
+            inlined: BTreeMap::new(),
+            jframes: Vec::new(),
+            labels: 0,
+            inlining: Vec::new(),
+            span_base: 0,
+            salt: 0,
+            inlines: 0,
             widen,
             events: vec![("output".to_owned(), Vec::new())],
             tmp: 0,
@@ -395,11 +635,18 @@ impl<'s, 'c> L<'s, 'c> {
             table: sig.row.clone(),
             old_found,
             old_used: std::cell::Cell::new(false),
+            module_id: 0,
+            calls: Vec::new(),
+            reaches: BTreeSet::new(),
+            depth: 0,
+            msg: sig.on,
+            dyn_locals: BTreeSet::new(),
+            dyn_params: BTreeSet::new(),
         }
     }
 
     fn at(&self, span: Span) -> String {
-        let start = (span.start as usize).min(self.src.len());
+        let start = ((span.start + self.span_base) as usize).min(self.src.len());
         let before = &self.src[..start];
         let line = before.matches('\n').count() + 1;
         let col = start - before.rfind('\n').map_or(0, |i| i + 1) + 1;
@@ -595,7 +842,7 @@ impl<'s, 'c> L<'s, 'c> {
                     "old may be null here (it is null for an insert)",
                 );
             }
-            self.guards.push((found, col.to_owned()));
+            self.guard(found, col);
         }
         let i = self.param_named(&format!("old_{col}"), ty);
         Ok(V {
@@ -627,6 +874,8 @@ impl<'s, 'c> L<'s, 'c> {
         if !module {
             if self.table.is_some() {
                 self.bind_row_names();
+            } else if self.msg.is_some() {
+                self.bind("ctx", Var::Msg);
             } else {
                 for (i, (n, _)) in self.sig.params.iter().enumerate() {
                     let n = n.clone();
@@ -640,8 +889,40 @@ impl<'s, 'c> L<'s, 'c> {
             return;
         }
         let mut entry = None;
+        // Helper functions at module level are hoisted too.
+        for s in &p.body {
+            if let Statement::FunctionDeclaration(f) = s
+                && let Some(id) = &f.id
+            {
+                let v = Var::Helper {
+                    start: f.span.start,
+                    end: f.span.end,
+                    depth: 0,
+                    expr: false,
+                };
+                self.bind(id.name.as_str(), v);
+            }
+        }
         for s in &p.body {
             match s {
+                Statement::FunctionDeclaration(f) if f.id.is_some() => {}
+                Statement::VariableDeclaration(d)
+                    if matches!(d.kind, oxc_ast::ast::VariableDeclarationKind::Const)
+                        && d.declarations.iter().all(|x| {
+                            matches!(&x.id, BindingPattern::BindingIdentifier(_))
+                                && x.init
+                                    .as_ref()
+                                    .is_some_and(|i| self.helper_def(i).is_some())
+                        }) =>
+                {
+                    for x in &d.declarations {
+                        if let (BindingPattern::BindingIdentifier(id), Some(i)) = (&x.id, &x.init)
+                            && let Some(h) = self.helper_def(i)
+                        {
+                            self.bind(id.name.as_str(), h);
+                        }
+                    }
+                }
                 Statement::ImportDeclaration(d) => {
                     if d.source.value.as_str() != "sprig:db" {
                         let _ =
@@ -700,7 +981,8 @@ impl<'s, 'c> L<'s, 'c> {
                     let _ = self.stop::<()>(
                         "js.module_scope",
                         other.span(),
-                        "only imports and the default export compile at module level",
+                        "only imports, helper functions and the default export compile at \
+                         module level",
                     );
                 }
             }
@@ -781,6 +1063,26 @@ impl<'s, 'c> L<'s, 'c> {
         if self.table.is_some() {
             return self.row_params(ps);
         }
+        if self.msg.is_some() {
+            // The engine tier calls it with `ctx` alone.
+            if ps.rest.is_some() || ps.items.len() > 1 {
+                return self.stop(
+                    "js.params",
+                    span,
+                    "a trigger on a stream or queue takes one parameter, ctx",
+                );
+            }
+            match ps.items.first() {
+                None => self.bind("ctx", Var::Msg),
+                Some(p) => match &p.pattern {
+                    BindingPattern::BindingIdentifier(b) if p.initializer.is_none() => {
+                        self.bind(b.name.as_str(), Var::Msg);
+                    }
+                    _ => return self.stop("js.params", p.span, "parameters must be plain names"),
+                },
+            }
+            return Ok(());
+        }
         if ps.rest.is_some() || ps.items.len() != self.sig.params.len() {
             return self.stop(
                 "js.params",
@@ -825,44 +1127,67 @@ impl<'s, 'c> L<'s, 'c> {
 
     fn block(&mut self, stmts: &[Statement<'_>]) -> Block {
         let mut out = Vec::new();
+        // Helper functions are hoisted: callable from the block's start.
+        for s in stmts {
+            if let Statement::FunctionDeclaration(f) = s
+                && let Some(id) = &f.id
+            {
+                let depth = self.scopes.len() - 1;
+                let v = Var::Helper {
+                    start: self.span_base + f.span.start,
+                    end: self.span_base + f.span.end,
+                    depth,
+                    expr: false,
+                };
+                self.bind(id.name.as_str(), v);
+            }
+        }
+        let outer = std::mem::take(&mut self.pre);
         for s in stmts {
             if exits(&out) {
                 break;
             }
             let mut piece = Vec::new();
             let r = self.stmt(s, &mut piece);
-            let guards = std::mem::take(&mut self.guards);
+            let pre = std::mem::take(&mut self.pre);
             if r.is_err() {
                 continue;
             }
-            out.extend(self.guard_stmts(guards));
+            out.extend(pre);
             out.extend(piece);
         }
+        self.pre = outer;
         out
     }
 
-    /// The checks for the rows a statement reads unconditionally; after
-    /// them the rows are known to be there.
-    fn guard_stmts(&mut self, guards: Vec<(LocalId, String)>) -> Block {
-        let mut out = Vec::new();
-        let mut seen = BTreeSet::new();
-        for (found, col) in guards {
-            if !seen.insert(found) {
-                continue;
-            }
-            out.push(Stmt::If(
-                Expr::Unary(UnOp::Not, Box::new(Expr::Local(found))),
-                vec![Stmt::Throw(ErrorSpec {
-                    code: 39865,
-                    message: Expr::Lit(Literal::Str(format!(
-                        "TypeError: cannot read properties of null (reading '{col}')"
-                    ))),
-                })],
-                Vec::new(),
-            ));
-            self.facts.insert(Key::L(found));
+    /// The check, before the statement, of a row it reads
+    /// unconditionally; after it the row is known to be there.
+    fn guard(&mut self, found: LocalId, col: &str) {
+        if !self.facts.insert(Key::L(found)) {
+            return;
         }
-        out
+        self.pre.push(Stmt::If(
+            Expr::Unary(UnOp::Not, Box::new(Expr::Local(found))),
+            vec![Stmt::Throw(ErrorSpec {
+                code: 39865,
+                message: Expr::Lit(Literal::Str(format!(
+                    "TypeError: cannot read properties of null (reading '{col}')"
+                ))),
+                // QuickJS's own words, for a `catch`.
+                catch: Some((
+                    "TypeError".to_owned(),
+                    Expr::Lit(Literal::Str(format!(
+                        "cannot read property '{col}' of null"
+                    ))),
+                )),
+            })],
+            Vec::new(),
+        ));
+    }
+
+    /// Moves the statements that must run first into `out`.
+    fn flush(&mut self, out: &mut Block) {
+        out.append(&mut self.pre);
     }
 
     fn sub_block(&mut self, s: &Statement<'_>) -> Block {
@@ -875,7 +1200,9 @@ impl<'s, 'c> L<'s, 'c> {
     #[allow(clippy::too_many_lines)]
     fn stmt(&mut self, s: &Statement<'_>, out: &mut Block) -> R<()> {
         match s {
-            Statement::EmptyStatement(_) => Ok(()),
+            // A helper is hoisted when its block starts (`block`); `async`
+            // and generators are refused at their call.
+            Statement::EmptyStatement(_) | Statement::FunctionDeclaration(_) => Ok(()),
             Statement::BlockStatement(b) => {
                 let inner = self.scoped(|l| l.block(&b.body));
                 out.extend(inner);
@@ -886,8 +1213,7 @@ impl<'s, 'c> L<'s, 'c> {
             Statement::IfStatement(i) => {
                 let test = self.test(&i.test)?;
                 let before = self.facts.clone();
-                let guards = std::mem::take(&mut self.guards);
-                out.extend(self.guard_stmts(guards));
+                self.flush(out);
                 let base = self.facts.clone();
                 let (t_true, t_false) =
                     (self.facts_if(&i.test, true), self.facts_if(&i.test, false));
@@ -910,16 +1236,38 @@ impl<'s, 'c> L<'s, 'c> {
                 Ok(())
             }
             Statement::WhileStatement(w) => {
+                self.flush(out);
                 self.loop_entry();
-                let test = self.loop_test(&w.test)?;
-                self.loops += 1;
-                self.conts.push(Vec::new());
+                let (tpre, test) = self.loop_test(&w.test)?;
+                self.jframes.push(JFrame::Loop { cont: Vec::new() });
                 let body = self.sub_block(&w.body);
-                self.conts.pop();
-                self.loops -= 1;
+                self.jframes.pop();
                 self.loop_entry();
+                out.push(Self::looped(tpre, test, body, Bound::Guarded));
+                Ok(())
+            }
+            Statement::DoWhileStatement(dw) => {
+                // `do { body } while (test)`: the body, then the test; a
+                // `continue` goes to the test.
+                self.flush(out);
+                self.loop_entry();
+                let (mut check, test) = self.loop_test(&dw.test)?;
+                check.push(Stmt::If(
+                    Expr::Unary(UnOp::Not, Box::new(test)),
+                    vec![Stmt::Break],
+                    Vec::new(),
+                ));
+                self.jframes.push(JFrame::Loop {
+                    cont: check.clone(),
+                });
+                let mut body = self.sub_block(&dw.body);
+                self.jframes.pop();
+                self.loop_entry();
+                if !exits(&body) {
+                    body.extend(check);
+                }
                 out.push(Stmt::While {
-                    cond: test,
+                    cond: Expr::bool(true),
                     body,
                     bound: Bound::Guarded,
                 });
@@ -945,12 +1293,11 @@ impl<'s, 'c> L<'s, 'c> {
                         }
                         None => {}
                     }
-                    let guards = std::mem::take(&mut self.guards);
-                    out.extend(self.guard_stmts(guards));
+                    self.flush(out);
                     self.loop_entry();
-                    let test = match &fs.test {
+                    let (tpre, test) = match &fs.test {
                         Some(t) => self.loop_test(t)?,
-                        None => Expr::bool(true),
+                        None => (Vec::new(), Expr::bool(true)),
                     };
                     let bound = match (static_from, &fs.test, &fs.update) {
                         (
@@ -976,28 +1323,24 @@ impl<'s, 'c> L<'s, 'c> {
                     if let Some(u) = &fs.update {
                         let facts = self.facts.clone();
                         self.expr_stmt(u, &mut cont)?;
+                        self.flush(&mut cont);
                         self.facts = facts;
                     }
-                    self.loops += 1;
-                    self.conts.push(cont);
+                    self.jframes.push(JFrame::Loop { cont });
                     let mut body = self.sub_block(&fs.body);
-                    self.conts.pop();
-                    self.loops -= 1;
+                    self.jframes.pop();
                     if let Some(u) = &fs.update {
                         if exits(&body) {
                             // The update never runs; nothing to add.
                         } else {
                             let mut upd = Vec::new();
                             self.expr_stmt(u, &mut upd)?;
+                            self.flush(&mut upd);
                             body.extend(upd);
                         }
                     }
                     self.loop_entry();
-                    out.push(Stmt::While {
-                        cond: test,
-                        body,
-                        bound,
-                    });
+                    out.push(Self::looped(tpre, test, body, bound));
                     Ok(())
                 })();
                 self.scopes.pop();
@@ -1005,58 +1348,23 @@ impl<'s, 'c> L<'s, 'c> {
             }
             Statement::ForOfStatement(fo) => self.for_of(fo, out),
             Statement::BreakStatement(b) => {
-                if b.label.is_some() || self.loops == 0 {
+                if b.label.is_some() || self.loop_cont().is_none() {
                     return self.stop("js.label", b.span, "labelled break");
                 }
-                out.push(Stmt::Break);
+                self.jump(Jump::Break, out);
                 Ok(())
             }
             Statement::ReturnStatement(r) => self.ret(r.argument.as_ref(), r.span, out),
-            Statement::ThrowStatement(t) => {
-                let msg = match &t.argument {
-                    Expression::NewExpression(n) => match (&n.callee, n.arguments.first()) {
-                        (Expression::Identifier(id), a) if id.name.as_str().ends_with("Error") => {
-                            match a.and_then(Argument::as_expression) {
-                                Some(m) => {
-                                    let v = self.val(m)?;
-                                    self.text_of(v, m.span())?
-                                }
-                                None => Expr::Lit(Literal::Str(String::new())),
-                            }
-                        }
-                        _ => return self.stop("js.throw", t.span, "throw new Error(message)"),
-                    },
-                    other => {
-                        let v = self.val(other)?;
-                        self.text_of(v, other.span())?
-                    }
-                };
-                out.push(Stmt::Throw(ErrorSpec {
-                    code: 39865,
-                    message: msg,
-                }));
-                Ok(())
-            }
+            Statement::ThrowStatement(t) => self.throw(&t.argument, t.span, out),
             Statement::ContinueStatement(c) => {
-                let Some(pre) = self.conts.last().cloned().filter(|_| c.label.is_none()) else {
+                if c.label.is_some() || self.loop_cont().is_none() {
                     return self.stop("js.label", c.span, "labelled continue");
-                };
-                out.extend(pre);
-                out.push(Stmt::Continue);
+                }
+                self.jump(Jump::Continue, out);
                 Ok(())
             }
-            Statement::TryStatement(t) => {
-                self.stop("js.try", t.span, "try/catch runs in the engine tier")
-            }
+            Statement::TryStatement(t) => self.try_stmt(t, out),
             Statement::SwitchStatement(sw) => self.switch(sw, out),
-            Statement::DoWhileStatement(t) => {
-                self.stop("js.do_while", t.span, "do/while runs in the engine tier")
-            }
-            Statement::FunctionDeclaration(t) => self.stop(
-                "js.helper",
-                t.span,
-                "helper functions aren't inlined yet; they run in the engine tier",
-            ),
             other => self.stop(
                 "js.statement",
                 other.span(),
@@ -1073,8 +1381,7 @@ impl<'s, 'c> L<'s, 'c> {
     /// `js.switch`.
     fn switch(&mut self, sw: &oxc_ast::ast::SwitchStatement<'_>, out: &mut Block) -> R<()> {
         let d = self.val(&sw.discriminant)?;
-        let guards = std::mem::take(&mut self.guards);
-        out.extend(self.guard_stmts(guards));
+        self.flush(out);
         let d = match &d.e {
             Expr::Lit(_) | Expr::Param(_) | Expr::Local(_) => d,
             _ => {
@@ -1149,12 +1456,12 @@ impl<'s, 'c> L<'s, 'c> {
                     Some(c) => Expr::bin(BinOp::Or, c, eq),
                 });
             }
-            if !self.guards.is_empty() {
-                self.guards.clear();
+            if !self.pre.is_empty() {
+                self.pre.clear();
                 return self.stop(
-                    "js.null_row",
+                    "js.switch",
                     sw.span,
-                    "a case reads a row that may be null",
+                    "a case's test reads a row that may be null or calls a helper",
                 );
             }
             self.facts.clone_from(&before);
@@ -1217,21 +1524,329 @@ impl<'s, 'c> L<'s, 'c> {
         });
     }
 
-    fn loop_test(&mut self, e: &Expression<'_>) -> R<Expr> {
+    /// A loop's test, and the statements that must run before it each
+    /// time (row checks, helpers' bodies).
+    fn loop_test(&mut self, e: &Expression<'_>) -> R<(Block, Expr)> {
         let t = self.test(e)?;
-        if !self.guards.is_empty() {
-            self.guards.clear();
-            return self.stop(
-                "js.null_row",
-                e.span(),
-                "a loop test reads a row that may be null",
-            );
+        Ok((std::mem::take(&mut self.pre), t))
+    }
+
+    /// A `while` whose test may need statements first: `while (true) {
+    /// pre; if (!test) break; body }` (a `continue` goes back to the top,
+    /// so it runs them again).
+    fn looped(pre: Block, test: Expr, body: Block, bound: Bound) -> Stmt {
+        if pre.is_empty() {
+            return Stmt::While {
+                cond: test,
+                body,
+                bound,
+            };
         }
-        Ok(t)
+        let mut full = pre;
+        full.push(Stmt::If(
+            Expr::Unary(UnOp::Not, Box::new(test)),
+            vec![Stmt::Break],
+            Vec::new(),
+        ));
+        full.extend(body);
+        Stmt::While {
+            cond: Expr::bool(true),
+            body: full,
+            bound: Bound::Guarded,
+        }
+    }
+
+    /// What `continue` runs first in the innermost loop; `None` outside
+    /// loops (of this function or helper).
+    fn loop_cont(&self) -> Option<Block> {
+        for f in self.jframes.iter().rev() {
+            match f {
+                JFrame::Loop { cont } => return Some(cont.clone()),
+                JFrame::Helper { .. } => return None,
+                JFrame::Finally { .. } => {}
+            }
+        }
+        None
+    }
+
+    /// Whether `j` leaves a `try` with a `finally` on its way.
+    fn crosses_finally(&self, j: &Jump) -> bool {
+        for f in self.jframes.iter().rev() {
+            match (f, j) {
+                (JFrame::Finally { .. }, _) => return true,
+                // A loop ends a `break` or `continue`; a helper ends its own
+                // `return`s (a function's `return` inside it is the helper's).
+                (JFrame::Loop { .. }, Jump::Break | Jump::Continue)
+                | (JFrame::Helper { .. }, _) => {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Lowers a jump: directly, or through the `finally` blocks it leaves.
+    fn jump(&mut self, j: Jump, out: &mut Block) {
+        self.flush(out);
+        for i in (0..self.jframes.len()).rev() {
+            match (&mut self.jframes[i], &j) {
+                (JFrame::Finally { label, cmp, jumps }, _) => {
+                    jumps.push(j.clone());
+                    let n = i64::try_from(jumps.len()).unwrap_or(i64::MAX);
+                    out.push(Stmt::Assign(*cmp, Expr::int(n)));
+                    out.push(Stmt::Leave(*label));
+                    return;
+                }
+                (JFrame::Loop { .. }, Jump::Break | Jump::Continue)
+                | (JFrame::Helper { .. }, _) => break,
+                _ => {}
+            }
+        }
+        match j {
+            Jump::Break => out.push(Stmt::Break),
+            Jump::Continue => {
+                out.extend(self.loop_cont().unwrap_or_default());
+                out.push(Stmt::Continue);
+            }
+            Jump::Return(name, fields) => {
+                out.push(Stmt::Emit(name, fields));
+                out.push(Stmt::Return);
+            }
+            Jump::Leave(l) => out.push(Stmt::Leave(l)),
+        }
+    }
+
+    fn next_label(&mut self) -> u32 {
+        self.labels += 1;
+        self.labels
+    }
+
+    /// The locals a `try` keeps a caught error in, named `<base>_*`.
+    fn caught_locals(&mut self, base: &str) -> Caught {
+        let mut l = |what: &str, ty: Ty| self.f.local(&format!("{base}_{what}"), ty);
+        Caught {
+            flag: l("caught", Ty::Bool),
+            code: l("code", Ty::Int),
+            state: l("state", Ty::Str),
+            text: l("text", Ty::Str),
+            message: l("message", Ty::Str),
+            name: l("name", Ty::Str),
+        }
+    }
+
+    /// `try { ... } catch (e) { ... } finally { ... }`: the error is kept
+    /// ([`Stmt::Try`]), the `catch` and `finally` run as ordinary
+    /// statements after it, and a jump out of the `try` or `catch` leaves
+    /// through the `finally`. A `finally` that ends normally raises a kept
+    /// error again ([`Stmt::Rethrow`]).
+    fn try_stmt(&mut self, t: &oxc_ast::ast::TryStatement<'_>, out: &mut Block) -> R<()> {
+        self.flush(out);
+        let n = self.next_label();
+        let caught = self.caught_locals(&format!("try{n}"));
+        // What held before the `try` holds at its start; in its `catch`,
+        // `finally` and after it, only for what the blocks before didn't
+        // assign (an error can come anywhere in them).
+        let entry = self.facts.clone();
+        let Some(fin) = &t.finalizer else {
+            let body = self.scoped(|l| l.block(&t.block.body));
+            out.push(Stmt::Try {
+                body: body.clone(),
+                caught,
+            });
+            let mut changed = BTreeSet::new();
+            assigned(&body, &mut changed);
+            if let Some(h) = &t.handler {
+                self.facts = Self::unchanged(&entry, &changed);
+                let c = self.catch_body(h, caught, &body)?;
+                assigned(&c, &mut changed);
+                out.push(Stmt::If(Expr::Local(caught.flag), c, Vec::new()));
+            }
+            self.facts = Self::unchanged(&entry, &changed);
+            return Ok(());
+        };
+        let cmp = self.f.local(&format!("try{n}_jump"), Ty::Int);
+        self.jframes.push(JFrame::Finally {
+            label: n,
+            cmp,
+            jumps: Vec::new(),
+        });
+        let mut changed = BTreeSet::new();
+        let lowered = (|| {
+            let body = self.scoped(|l| l.block(&t.block.body));
+            assigned(&body, &mut changed);
+            let mut inner = vec![Stmt::Try {
+                body: body.clone(),
+                caught,
+            }];
+            let mut last = caught;
+            if let Some(h) = &t.handler {
+                self.facts = Self::unchanged(&entry, &changed);
+                let c = self.catch_body(h, caught, &body)?;
+                assigned(&c, &mut changed);
+                let again = self.caught_locals(&format!("catch{n}"));
+                inner.push(Stmt::If(
+                    Expr::Local(caught.flag),
+                    vec![Stmt::Try {
+                        body: c,
+                        caught: again,
+                    }],
+                    Vec::new(),
+                ));
+                last = again;
+            }
+            Ok((inner, last))
+        })();
+        let Some(JFrame::Finally { jumps, .. }) = self.jframes.pop() else {
+            return Err(Stop);
+        };
+        let (inner, last) = lowered?;
+        self.facts = Self::unchanged(&entry, &changed);
+        let fin_body = self.scoped(|l| l.block(&fin.body));
+        assigned(&fin_body, &mut changed);
+        if jumps.is_empty() {
+            out.extend(inner);
+        } else {
+            out.push(Stmt::Assign(cmp, Expr::int(0)));
+            out.push(Stmt::Block(n, inner));
+        }
+        let fin_exits = exits(&fin_body);
+        out.extend(fin_body);
+        if !fin_exits {
+            out.push(Stmt::If(
+                Expr::Local(last.flag),
+                vec![Stmt::Rethrow(last)],
+                Vec::new(),
+            ));
+            for (i, j) in jumps.into_iter().enumerate() {
+                let mut go = Vec::new();
+                self.jump(j, &mut go);
+                out.push(Stmt::If(
+                    Expr::bin(
+                        BinOp::Eq,
+                        Expr::Local(cmp),
+                        Expr::int(i64::try_from(i + 1).unwrap_or(i64::MAX)),
+                    ),
+                    go,
+                    Vec::new(),
+                ));
+            }
+        }
+        self.facts = Self::unchanged(&entry, &changed);
+        Ok(())
+    }
+
+    /// `facts` without those about the locals in `changed`.
+    fn unchanged(facts: &BTreeSet<Key>, changed: &BTreeSet<LocalId>) -> BTreeSet<Key> {
+        facts
+            .iter()
+            .filter(|k| !matches!(k, Key::L(l) if changed.contains(l)))
+            .copied()
+            .collect()
+    }
+
+    /// A `catch` clause's body, with its binding.
+    fn catch_body(
+        &mut self,
+        h: &oxc_ast::ast::CatchClause<'_>,
+        caught: Caught,
+        body: &Block,
+    ) -> R<Block> {
+        let readable = catch_readable(body);
+        self.scopes.push(Vec::new());
+        let r = match h.param.as_ref().map(|p| &p.pattern) {
+            None => Ok(()),
+            Some(BindingPattern::BindingIdentifier(b)) => {
+                self.bind(b.name.as_str(), Var::Exc { caught, readable });
+                Ok(())
+            }
+            Some(_) => self.stop("js.destructuring", h.span, "a destructured catch binding"),
+        };
+        let b = r.map(|()| self.block(&h.body.body));
+        self.scopes.pop();
+        b
+    }
+
+    /// `throw`: an error object, a value, or a caught error again.
+    fn throw(&mut self, arg: &Expression<'_>, span: Span, out: &mut Block) -> R<()> {
+        if let Expression::Identifier(id) = strip_parens(arg)
+            && let Some(Var::Exc { caught, .. }) = self.lookup(id.name.as_str())
+        {
+            self.flush(out);
+            out.push(Stmt::Rethrow(caught));
+            return Ok(());
+        }
+        let (msg, catch) = match strip_parens(arg) {
+            Expression::NewExpression(n) => match (&n.callee, n.arguments.first()) {
+                (Expression::Identifier(id), a)
+                    if id.name.as_str().ends_with("Error")
+                        && self.lookup(id.name.as_str()).is_none() =>
+                {
+                    let m = match a.and_then(Argument::as_expression) {
+                        // `new Error(undefined)` has an empty message.
+                        Some(Expression::Identifier(u)) if u.name.as_str() == "undefined" => {
+                            Expr::Lit(Literal::Str(String::new()))
+                        }
+                        Some(m) => {
+                            let v = self.val(m)?;
+                            self.text_of(v, m.span())?
+                        }
+                        None => Expr::Lit(Literal::Str(String::new())),
+                    };
+                    let name = id.name.as_str();
+                    let catch = (name != "Error").then(|| (name.to_owned(), m.clone()));
+                    (m, catch)
+                }
+                _ => return self.stop("js.throw", span, "throw new Error(message)"),
+            },
+            other => {
+                let v = self.val(other)?;
+                let m = self.text_of(v, other.span())?;
+                // A thrown value that isn't an error object: a `catch`
+                // sees the value itself.
+                (m.clone(), Some((String::new(), m)))
+            }
+        };
+        self.flush(out);
+        out.push(Stmt::Throw(ErrorSpec {
+            code: 39865,
+            message: msg,
+            catch,
+        }));
+        Ok(())
     }
 
     fn declare(&mut self, d: &VariableDeclaration<'_>, out: &mut Block) -> R<()> {
+        let constant = matches!(d.kind, oxc_ast::ast::VariableDeclarationKind::Const);
         for decl in &d.declarations {
+            // `const r = ctx.record;` and `const { key, value } = ctx.record;`.
+            if let Some(init) = &decl.init
+                && constant
+                && self.event_of(init)
+            {
+                match &decl.id {
+                    BindingPattern::BindingIdentifier(id) => {
+                        self.bind(id.name.as_str(), Var::Event);
+                        continue;
+                    }
+                    BindingPattern::ObjectPattern(o) if o.rest.is_none() => {
+                        for p in &o.properties {
+                            let (Some(k), BindingPattern::BindingIdentifier(id)) =
+                                (p.key.static_name(), &p.value)
+                            else {
+                                return self.stop("js.destructuring", p.span, "destructuring");
+                            };
+                            if p.computed {
+                                return self.stop("js.destructuring", p.span, "destructuring");
+                            }
+                            let v = self.msg_field(k.as_ref(), p.span)?;
+                            self.bind(id.name.as_str(), Var::Val(v));
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             let BindingPattern::BindingIdentifier(id) = &decl.id else {
                 return self.stop("js.destructuring", decl.span, "destructuring");
             };
@@ -1247,8 +1862,19 @@ impl<'s, 'c> L<'s, 'c> {
                 self.bind(name, v);
                 continue;
             }
+            if let Some(h) = self.helper_def(init) {
+                if !matches!(d.kind, oxc_ast::ast::VariableDeclarationKind::Const) {
+                    return self.stop(
+                        "js.helper",
+                        decl.span,
+                        "a function value in a variable that can change: use const",
+                    );
+                }
+                self.bind(name, h);
+                continue;
+            }
             let v = self.val(init)?;
-            let key = decl.span.start;
+            let key = self.salt + self.span_base + decl.span.start;
             let ty = match (self.widen.get(&key), v.ty) {
                 (Some(w), _) => *w,
                 (None, Ty::Null) => {
@@ -1261,7 +1887,11 @@ impl<'s, 'c> L<'s, 'c> {
                 (None, t) => t,
             };
             let l = self.f.local(name, ty);
+            if self.is_dyn(&v) {
+                self.dyn_locals.insert(l);
+            }
             let e = self.coerce(v.clone(), ty, decl.span)?;
+            self.flush(out);
             out.push(Stmt::Assign(l, e));
             self.facts.remove(&Key::L(l));
             if v.nn {
@@ -1290,19 +1920,36 @@ impl<'s, 'c> L<'s, 'c> {
                             }
                             None => Expr::Lit(Literal::Str(String::new())),
                         };
-                        out.push(Stmt::Throw(ErrorSpec {
-                            code: 39863,
-                            message: m,
-                        }));
+                        self.flush(out);
+                        out.push(Stmt::Throw(ErrorSpec::new(39863, m)));
                         Ok(())
                     }
-                    Some(["ctx" | "console", "log"]) => {
+                    Some(
+                        ["ctx", "log"] | ["console", "log" | "info" | "warn" | "error" | "debug"],
+                    ) if self.msg.is_some() => {
+                        // Triggers on streams and queues keep their log
+                        // lines for the run log.
+                        let line = self.log_line(c)?;
+                        self.flush(out);
+                        out.push(Stmt::Log(line));
+                        Ok(())
+                    }
+                    Some(
+                        ["ctx", "log"] | ["console", "log" | "info" | "warn" | "error" | "debug"],
+                    ) => {
                         let at = self.at(c.span);
                         self.lints.push(Reason::new(
                             "js.log",
                             &at,
                             "log lines are dropped in the compiled tier",
                         ));
+                        Ok(())
+                    }
+                    _ if self.helper_of(&c.callee).is_some() => {
+                        // A helper called for what it does; its value is
+                        // dropped.
+                        self.call(c)?;
+                        self.flush(out);
                         Ok(())
                     }
                     _ => self.stop("js.call", c.span, "this call runs in the engine tier"),
@@ -1312,6 +1959,9 @@ impl<'s, 'c> L<'s, 'c> {
                 let AssignmentTarget::AssignmentTargetIdentifier(id) = &a.left else {
                     return self.stop("js.assign", a.span, "only variables can be assigned");
                 };
+                // A compound assignment reads the variable before the
+                // right side.
+                let mark = self.pre.len();
                 let rhs = self.val(&a.right)?;
                 let op = match a.operator {
                     AssignmentOperator::Assign => None,
@@ -1322,7 +1972,7 @@ impl<'s, 'c> L<'s, 'c> {
                     AssignmentOperator::Remainder => Some(BinaryOperator::Remainder),
                     _ => return self.stop("js.assign", a.span, "this assignment operator"),
                 };
-                self.assign(id.name.as_str(), op, rhs, a.span, out)
+                self.assign(id.name.as_str(), op, rhs, Some(mark), a.span, out)
             }
             Expression::UpdateExpression(u) => {
                 let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &u.argument else {
@@ -1337,6 +1987,7 @@ impl<'s, 'c> L<'s, 'c> {
                     id.name.as_str(),
                     Some(op),
                     V::lit(Literal::Int(1)),
+                    None,
                     u.span,
                     out,
                 )
@@ -1353,6 +2004,7 @@ impl<'s, 'c> L<'s, 'c> {
         name: &str,
         op: Option<BinaryOperator>,
         rhs: V,
+        read_at: Option<usize>,
         span: Span,
         out: &mut Block,
     ) -> R<()> {
@@ -1368,11 +2020,23 @@ impl<'s, 'c> L<'s, 'c> {
             ty: self.f.local_def(l).ty,
             nn: self.facts.contains(&Key::L(l)),
         };
+        let cur = match read_at {
+            Some(mark) if op.is_some() => self.settle(cur, mark),
+            _ => cur,
+        };
         let v = match op {
             None => rhs,
             Some(op) => self.binary(op, cur.clone(), rhs, span)?,
         };
         let ty = self.f.local_def(l).ty;
+        if ty == Ty::Json && self.dyn_locals.contains(&l) != self.is_dyn(&v) {
+            return self.stop(
+                "js.types",
+                span,
+                format!("{name} holds a parsed JSON value and another kind of value"),
+            );
+        }
+        self.flush(out);
         let e = match self.coerce(v.clone(), ty, span) {
             Ok(e) => e,
             Err(Stop) => {
@@ -1407,10 +2071,15 @@ impl<'s, 'c> L<'s, 'c> {
         let BindingPattern::BindingIdentifier(id) = &decl.id else {
             return self.stop("js.destructuring", decl.span, "destructuring");
         };
+        // An array of parsed JSON: its elements are parsed values too.
+        let mut parsed = false;
         let (src, cols) = match &fo.right {
             Expression::Identifier(i) => match self.lookup(i.name.as_str()) {
                 Some(Var::Rows { local, cols }) => (Expr::Local(local), Some(cols)),
-                Some(Var::Local(l)) if self.f.local_def(l).ty == Ty::Json => (Expr::Local(l), None),
+                Some(Var::Local(l)) if self.f.local_def(l).ty == Ty::Json => {
+                    parsed = self.dyn_locals.contains(&l);
+                    (Expr::Local(l), None)
+                }
                 _ => return self.stop("js.for_of", fo.span, "for ... of rows from db.sql"),
             },
             other => {
@@ -1420,26 +2089,73 @@ impl<'s, 'c> L<'s, 'c> {
                         out.extend(pre);
                         (Expr::Local(local), Some(cols))
                     }
-                    _ => return self.stop("js.for_of", fo.span, "for ... of rows from db.sql"),
+                    Some(_) => {
+                        return self.stop("js.for_of", fo.span, "for ... of rows from db.sql");
+                    }
+                    None if self.msg.is_some() => {
+                        let v = self.val(other)?;
+                        if !self.is_dyn(&v) {
+                            return self.stop("js.for_of", fo.span, "for ... of rows from db.sql");
+                        }
+                        parsed = true;
+                        (v.e, None)
+                    }
+                    None => return self.stop("js.for_of", fo.span, "for ... of rows from db.sql"),
                 }
             }
         };
+        self.flush(out);
         self.tmp += 1;
         let n = self.tmp;
         let arr = self.f.local(&format!("of{n}_source"), Ty::Json);
         let len = self.f.local(&format!("of{n}_length"), Ty::Int);
         let cur = self.f.local(&format!("of{n}_index"), Ty::Int);
         out.push(Stmt::Assign(arr, src));
-        out.push(Stmt::Assign(
-            len,
-            Expr::bin(
-                BinOp::Coalesce,
-                Expr::call(Builtin::JsonLength, vec![Expr::Local(arr)]),
-                Expr::int(0),
-            ),
-        ));
+        if parsed {
+            // JavaScript iterates an array; a string's characters, or a
+            // TypeError for anything else: the engine tier.
+            self.dyn_locals.insert(arr);
+            let not_array = Expr::Unary(
+                UnOp::Not,
+                Box::new(Expr::call(
+                    Builtin::JsonKind,
+                    vec![
+                        Expr::Local(arr),
+                        Expr::Lit(Literal::Str("array".to_owned())),
+                    ],
+                )),
+            );
+            let msg = format!(
+                "{}: for ... of over a value that isn't an array",
+                crate::ir::ENGINE_RERUN_TEXT
+            );
+            out.push(Stmt::If(
+                not_array,
+                vec![Stmt::Throw(ErrorSpec::new(
+                    crate::ir::ENGINE_RERUN,
+                    Expr::Lit(Literal::Str(msg)),
+                ))],
+                Vec::new(),
+            ));
+            out.push(Stmt::Assign(
+                len,
+                Expr::call(Builtin::JsonLen, vec![Expr::Local(arr)]),
+            ));
+        } else {
+            out.push(Stmt::Assign(
+                len,
+                Expr::bin(
+                    BinOp::Coalesce,
+                    Expr::call(Builtin::JsonLength, vec![Expr::Local(arr)]),
+                    Expr::int(0),
+                ),
+            ));
+        }
         out.push(Stmt::Assign(cur, Expr::int(0)));
         let each = self.f.local(id.name.as_str(), Ty::Json);
+        if parsed {
+            self.dyn_locals.insert(each);
+        }
         self.loop_entry();
         let body = self.scoped(|l| {
             l.bind(
@@ -1449,23 +2165,26 @@ impl<'s, 'c> L<'s, 'c> {
                     None => Var::Local(each),
                 },
             );
-            l.loops += 1;
             // The index moves at the top of each iteration.
-            l.conts.push(Vec::new());
+            l.jframes.push(JFrame::Loop { cont: Vec::new() });
             let b = l.sub_block(&fo.body);
-            l.conts.pop();
-            l.loops -= 1;
+            l.jframes.pop();
             b
         });
         self.loop_entry();
+        let element = if parsed {
+            Expr::call(
+                Builtin::JsonGet,
+                vec![Expr::Local(arr), Expr::Local(cur), Expr::bool(false)],
+            )
+        } else {
+            Expr::Path(
+                Box::new(Expr::Local(arr)),
+                vec![PathSeg::Index(Box::new(Expr::Local(cur)))],
+            )
+        };
         let mut full = vec![
-            Stmt::Assign(
-                each,
-                Expr::Path(
-                    Box::new(Expr::Local(arr)),
-                    vec![PathSeg::Index(Box::new(Expr::Local(cur)))],
-                ),
-            ),
+            Stmt::Assign(each, element),
             Stmt::Assign(cur, Expr::bin(BinOp::Add, Expr::Local(cur), Expr::int(1))),
         ];
         full.extend(body);
@@ -1478,6 +2197,13 @@ impl<'s, 'c> L<'s, 'c> {
     }
 
     fn ret(&mut self, arg: Option<&Expression<'_>>, span: Span, out: &mut Block) -> R<()> {
+        if let Some(i) = self
+            .jframes
+            .iter()
+            .rposition(|f| matches!(f, JFrame::Helper { .. }))
+        {
+            return self.helper_return(i, arg, span, out);
+        }
         let scalar = self.sig.returns;
         let Some(arg) = arg else {
             let fields = if scalar.is_some() {
@@ -1485,8 +2211,7 @@ impl<'s, 'c> L<'s, 'c> {
             } else {
                 Vec::new()
             };
-            out.push(Stmt::Emit("output".to_owned(), fields));
-            out.push(Stmt::Return);
+            self.finish_return("output".to_owned(), fields, out);
             return Ok(());
         };
         let arg = strip_parens(arg);
@@ -1515,11 +2240,7 @@ impl<'s, 'c> L<'s, 'c> {
         if let Some(ty) = scalar {
             let v = self.val(arg)?;
             let e = self.coerce(v, ty, arg.span())?;
-            out.push(Stmt::Emit(
-                "output".to_owned(),
-                vec![("value".to_owned(), e)],
-            ));
-            out.push(Stmt::Return);
+            self.finish_return("output".to_owned(), vec![("value".to_owned(), e)], out);
             return Ok(());
         }
         match arg {
@@ -1542,7 +2263,8 @@ impl<'s, 'c> L<'s, 'c> {
     }
 
     fn fields(&mut self, o: &oxc_ast::ast::ObjectExpression<'_>) -> R<Vec<(String, V)>> {
-        let mut out: Vec<(String, V)> = Vec::new();
+        let mut out: Vec<(String, usize)> = Vec::new();
+        let mut read: Vec<(V, usize)> = Vec::new();
         for p in &o.properties {
             let ObjectPropertyKind::ObjectProperty(p) = p else {
                 return self.stop("js.spread", o.span, "spread in an object literal");
@@ -1554,10 +2276,16 @@ impl<'s, 'c> L<'s, 'c> {
                 return self.stop("js.object", p.span, "the key must be a name");
             };
             let v = self.val(&p.value)?;
+            read.push((v, self.pre.len()));
             out.retain(|(n, _)| n.as_str() != k.as_ref());
-            out.push((k.into_owned(), v));
+            out.push((k.into_owned(), read.len() - 1));
         }
-        Ok(out)
+        // Every value is evaluated, a repeated name's too, in order.
+        self.settle_all(&mut read);
+        Ok(out
+            .into_iter()
+            .map(|(k, i)| (k, read[i].0.clone()))
+            .collect())
     }
 
     fn emit(&mut self, name: &str, fields: Vec<(String, V)>, span: Span, out: &mut Block) -> R<()> {
@@ -1570,6 +2298,13 @@ impl<'s, 'c> L<'s, 'c> {
         };
         let mut exprs = Vec::new();
         for (k, v) in fields {
+            if self.is_dyn(&v) {
+                return self.stop(
+                    "js.return",
+                    span,
+                    format!("field {k} is a parsed JSON value (JSON.stringify drops undefined)"),
+                );
+            }
             let ty = if v.ty == Ty::Null { None } else { Some(v.ty) };
             let decl = self.events[idx].1.iter().position(|(n, _)| *n == k);
             match (decl, ty) {
@@ -1607,8 +2342,94 @@ impl<'s, 'c> L<'s, 'c> {
                 (k, e)
             })
             .collect();
-        out.push(Stmt::Emit(name.to_owned(), fields));
-        out.push(Stmt::Return);
+        self.finish_return(name.to_owned(), fields, out);
+        Ok(())
+    }
+
+    /// The function's `return` of an event: at once, or, when it leaves a
+    /// `try` with a `finally`, with its fields evaluated first (JavaScript
+    /// evaluates the value before the `finally` runs).
+    fn finish_return(&mut self, name: String, fields: Vec<(String, Expr)>, out: &mut Block) {
+        let j = Jump::Return(name.clone(), Vec::new());
+        if !self.crosses_finally(&j) {
+            self.jump(Jump::Return(name, fields), out);
+            return;
+        }
+        self.flush(out);
+        let mut held = Vec::with_capacity(fields.len());
+        for (k, e) in fields {
+            let ty = self.f.ty_of(&e);
+            self.tmp += 1;
+            let l = self.f.local(&format!("ret{}_{k}", self.tmp), ty);
+            out.push(Stmt::Assign(l, e));
+            held.push((k, Expr::Local(l)));
+        }
+        self.jump(Jump::Return(name, held), out);
+    }
+
+    /// A helper's `return`: its value into the helper's result local,
+    /// then leave the helper's block.
+    fn helper_return(
+        &mut self,
+        frame: usize,
+        arg: Option<&Expression<'_>>,
+        span: Span,
+        out: &mut Block,
+    ) -> R<()> {
+        let JFrame::Helper { label, result, .. } = self.jframes[frame].clone() else {
+            return Err(Stop);
+        };
+        let v = match arg {
+            None => V::null(),
+            Some(e) => {
+                if let Expression::CallExpression(c) = strip_parens(e)
+                    && self.callee_path(&c.callee).as_deref() == Some(&["sprig", "event"])
+                {
+                    return self.stop(
+                        "js.helper",
+                        c.span,
+                        "a helper returning sprig.event(...): return the event from the function",
+                    );
+                }
+                self.val(e)?
+            }
+        };
+        // The result's type is the join of every `return`'s: a wider one
+        // runs the lowering again (as for variables).
+        let key = self.salt + self.span_base;
+        let ty = match (result, self.widen.get(&key)) {
+            (Some(l), _) => self.f.local_def(l).ty,
+            (None, Some(w)) => *w,
+            (None, None) => v.ty,
+        };
+        let l = match result {
+            Some(l) => l,
+            None => {
+                let l = self.f.local(&format!("h{label}_result"), ty);
+                if let JFrame::Helper { result, .. } = &mut self.jframes[frame] {
+                    *result = Some(l);
+                }
+                l
+            }
+        };
+        let e = match self.coerce(v.clone(), ty, span) {
+            Ok(e) => e,
+            Err(Stop) => {
+                if let Some(w) = ty.join(v.ty)
+                    && w != ty
+                {
+                    self.reasons.pop();
+                    self.widen.insert(key, w);
+                }
+                return Err(Stop);
+            }
+        };
+        if let JFrame::Helper { nn, .. } = &mut self.jframes[frame] {
+            *nn &= v.nn;
+        }
+        self.flush(out);
+        out.push(Stmt::Assign(l, e));
+        self.jump(Jump::Leave(label), out);
         Ok(())
     }
 
@@ -1623,7 +2444,7 @@ impl<'s, 'c> L<'s, 'c> {
         };
         let base: &'static str = match self.lookup(obj.name.as_str()) {
             Some(Var::Module(m)) => m,
-            Some(Var::Ctx) => "ctx",
+            Some(Var::Ctx | Var::Msg) => "ctx",
             None => match obj.name.as_str() {
                 "Math" => "Math",
                 // QuickJS's globals, in a module too.
@@ -1632,6 +2453,7 @@ impl<'s, 'c> L<'s, 'c> {
                 "ctx" => "ctx",
                 "console" => "console",
                 "JSON" => "JSON",
+                "Array" => "Array",
                 _ => return None,
             },
             Some(_) => return None,
@@ -1640,9 +2462,16 @@ impl<'s, 'c> L<'s, 'c> {
             "sql" => "sql",
             "sqlOne" => "sqlOne",
             "exec" => "exec",
+            "call" => "call",
+            "publish" => "publish",
             "reject" => "reject",
             "event" => "event",
             "log" => "log",
+            // `console`'s other methods write the same line.
+            "info" => "info",
+            "warn" => "warn",
+            "error" => "error",
+            "debug" => "debug",
             "abs" => "abs",
             "floor" => "floor",
             "ceil" => "ceil",
@@ -1651,6 +2480,8 @@ impl<'s, 'c> L<'s, 'c> {
             "pow" => "pow",
             "max" => "max",
             "min" => "min",
+            "parse" => "parse",
+            "isArray" => "isArray",
             _ => "?",
         };
         Some(vec![base, prop])
@@ -1669,11 +2500,14 @@ impl<'s, 'c> L<'s, 'c> {
             ["db", "sql"] => "sql",
             ["db", "sqlOne"] => "sqlOne",
             ["db", "exec"] => "exec",
+            ["db", "call"] => return self.db_invoke(c, name, out).map(Some),
+            ["db", "publish"] => return self.db_publish(c, name, out).map(Some),
             ["db", _] => {
                 return self.stop(
                     "js.db",
                     c.span,
-                    "only db.sql, db.sqlOne and db.exec compile",
+                    "db.commitOffset and db.mq run in the engine tier: the gateway itself \
+                     answers them, so MariaDB has nothing to call",
                 );
             }
             _ => return Ok(None),
@@ -1689,6 +2523,10 @@ impl<'s, 'c> L<'s, 'c> {
             _ => return self.stop("db.dynamic_sql", c.span, "the SQL text must be a literal"),
         };
         let mut binds = Vec::new();
+        // Parsed JSON arguments: bound as their column's type, once the
+        // statement says which.
+        let mut parsed: Vec<(usize, V, Span)> = Vec::new();
+        let mut marks: Vec<usize> = Vec::new();
         match c.arguments.get(1).map(|a| a.as_expression()) {
             None => {}
             Some(Some(Expression::ArrayExpression(a))) => {
@@ -1697,6 +2535,12 @@ impl<'s, 'c> L<'s, 'c> {
                         return self.stop("js.spread", a.span, "spread in the arguments");
                     };
                     let v = self.val(x)?;
+                    marks.push(self.pre.len());
+                    if self.is_dyn(&v) {
+                        parsed.push((binds.len(), v, x.span()));
+                        binds.push(Expr::Lit(Literal::Null));
+                        continue;
+                    }
                     if v.ty == Ty::Json {
                         return self.stop(
                             "db.json_bind",
@@ -1705,6 +2549,16 @@ impl<'s, 'c> L<'s, 'c> {
                         );
                     }
                     binds.push(v.e);
+                }
+                // Each argument as it was when read, in order.
+                for i in (0..binds.len()).rev() {
+                    let mark = marks[i];
+                    if let Some(p) = parsed.iter_mut().find(|p| p.0 == i) {
+                        p.1 = self.settle(p.1.clone(), mark);
+                    } else {
+                        let e = std::mem::replace(&mut binds[i], Expr::Lit(Literal::Null));
+                        binds[i] = self.settle_e(e, mark);
+                    }
                 }
             }
             Some(_) => {
@@ -1736,6 +2590,21 @@ impl<'s, 'c> L<'s, 'c> {
                 ),
             ));
             return Err(Stop);
+        }
+        for (i, v, span) in parsed {
+            // The engine tier binds the value's own kind; read as the
+            // column's type, another kind runs the record in the engine
+            // tier (`null` and `undefined` bind as NULL in both).
+            let ty = bound.targets.get(i).copied().flatten();
+            let Some(r) = ty.and_then(|t| Self::undyn(v, t, true)) else {
+                return self.stop(
+                    "db.json_bind",
+                    span,
+                    "a parsed JSON value bound where the statement doesn't name its column \
+                     (or the column is JSON): convert it first, with String(x) or Number(x)",
+                );
+            };
+            binds[i] = r.e;
         }
         self.tmp += 1;
         let base = if name.is_empty() {
@@ -1777,8 +2646,7 @@ impl<'s, 'c> L<'s, 'c> {
                 (SqlShape::Exec { affected }, Var::Exec { affected })
             }
         };
-        let guards = std::mem::take(&mut self.guards);
-        out.extend(self.guard_stmts(guards));
+        self.flush(out);
         out.push(Stmt::Db(DbOp::Sql {
             stmt: bound.stmt,
             binds,
@@ -1791,6 +2659,395 @@ impl<'s, 'c> L<'s, 'c> {
         Ok(Some(var))
     }
 }
+
+impl L<'_, '_> {
+    /// `db.call(name, ...args)` into a callee's call entry
+    /// ([`crate::link`]): the callee must be a compiled function or
+    /// procedure of this database the deploy knows.
+    fn db_invoke(
+        &mut self,
+        c: &oxc_ast::ast::CallExpression<'_>,
+        name: &str,
+        out: &mut Block,
+    ) -> R<Var> {
+        let at = self.at(c.span);
+        let target = match c.arguments.first().and_then(Argument::as_expression) {
+            Some(Expression::StringLiteral(s)) => s.value.as_str().to_owned(),
+            _ => return self.stop("db.call", c.span, "the function's name must be a literal"),
+        };
+        let callee = match self.cat.callee(&target) {
+            None => {
+                return self.stop(
+                    "db.call",
+                    c.span,
+                    format!("{target} isn't a logic function or procedure of this database"),
+                );
+            }
+            Some(Err(why)) => return self.stop("db.call", c.span, why),
+            Some(Ok(k)) => k,
+        };
+        if callee.module_id == self.module_id || callee.reaches.contains(&self.module_id) {
+            return self.stop(
+                "js.recursion",
+                c.span,
+                format!("{target} calls back into this code"),
+            );
+        }
+        if callee.depth + 1 > MAX_CALL_DEPTH {
+            return self.stop(
+                "db.call",
+                c.span,
+                format!("calls through {target} nest deeper than logic.max_call_depth ({MAX_CALL_DEPTH})"),
+            );
+        }
+        let args = &c.arguments[1..];
+        if args.len() != callee.params.len() {
+            return self.stop(
+                "db.call",
+                c.span,
+                format!(
+                    "{target} takes {} arguments, not {}",
+                    callee.params.len(),
+                    args.len()
+                ),
+            );
+        }
+        let mut binds = Vec::new();
+        let mut marks: Vec<usize> = Vec::new();
+        for a in args {
+            let Some(x) = a.as_expression() else {
+                return self.stop("js.spread", c.span, "spread in the arguments");
+            };
+            let v = self.val(x)?;
+            if self.is_dyn(&v) {
+                // Read as the parameter's type (MariaDB converts the engine
+                // tier's value to it); another kind runs in the engine tier.
+                let ty = callee.params.get(binds.len()).copied().unwrap_or(Ty::Json);
+                match Self::undyn(v, ty, true) {
+                    Some(r) => {
+                        binds.push(r.e);
+                        marks.push(self.pre.len());
+                    }
+                    None => {
+                        return self.stop(
+                            "db.json_bind",
+                            x.span(),
+                            "a parsed JSON value passed as a JSON parameter",
+                        );
+                    }
+                }
+                continue;
+            }
+            if v.ty == Ty::Json {
+                return self.stop("db.json_bind", x.span(), "JSON values can't be passed yet");
+            }
+            binds.push(v.e);
+            marks.push(self.pre.len());
+        }
+        self.settle_binds(&mut binds, &marks);
+        self.tmp += 1;
+        let base = if name.is_empty() {
+            format!("call{}", self.tmp)
+        } else {
+            name.to_owned()
+        };
+        let event = self.f.local(&format!("{base}_event"), Ty::Str);
+        let result = self.f.local(&format!("{base}_result"), Ty::Json);
+        let cols: Vec<(String, LocalId)> = callee
+            .fields
+            .iter()
+            .map(|(n, t)| {
+                let t = if *t == Ty::Bool { Ty::Int } else { *t };
+                (n.clone(), self.f.local(&format!("{base}_{n}"), t))
+            })
+            .collect();
+        let mut parts = vec![format!("CALL `{}`(", callee.entry())];
+        for i in 1..binds.len() {
+            let _ = i;
+            parts.push(", ".to_owned());
+        }
+        if !binds.is_empty() {
+            parts.push(String::new());
+        }
+        self.flush(out);
+        out.push(Stmt::Db(DbOp::Sql {
+            stmt: crate::ir::BoundSql {
+                parts,
+                reads: callee.reads.clone(),
+                writes: callee.writes.clone(),
+            },
+            binds,
+            shape: SqlShape::Call {
+                event,
+                result,
+                into: cols.clone(),
+            },
+            origin: at,
+        }));
+        self.reaches.insert(callee.module_id);
+        self.reaches.extend(callee.reaches.iter().copied());
+        self.depth = self.depth.max(callee.depth + 1);
+        let dep = CallDep::of(&callee);
+        if !self.calls.contains(&dep) {
+            self.calls.push(dep);
+        }
+        Ok(Var::Call { event, cols })
+    }
+
+    /// `db.call(...)` or `db.publish(...)` inside a larger expression
+    /// (`return db.call('add_tax', x).fields.value;`): the call runs
+    /// first, before the statement it is in (as a helper's statements do),
+    /// and its result is read as a `const` holding it would be: the whole
+    /// result, `.event`, `.fields`, `.fields.<name>` or `.affected`.
+    /// `None` when `e` is none of those.
+    fn inline_db(&mut self, e: &Expression<'_>) -> R<Option<V>> {
+        let e = strip_parens(e);
+        // The call, and the members read from it.
+        let (call, path): (&Expression<'_>, Vec<&str>) = match e {
+            Expression::CallExpression(_) => (e, Vec::new()),
+            Expression::StaticMemberExpression(m) => match strip_parens(&m.object) {
+                o @ Expression::CallExpression(_) => (o, vec![m.property.name.as_str()]),
+                Expression::StaticMemberExpression(i) => match strip_parens(&i.object) {
+                    o @ Expression::CallExpression(_) => {
+                        (o, vec![i.property.name.as_str(), m.property.name.as_str()])
+                    }
+                    _ => return Ok(None),
+                },
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        let Expression::CallExpression(c) = call else {
+            return Ok(None);
+        };
+        if !matches!(
+            self.callee_path(&c.callee).as_deref(),
+            Some(["db", "call" | "publish"])
+        ) {
+            return Ok(None);
+        }
+        let key = self.salt + self.span_base + c.span.start;
+        let var = if let Some(v) = self.inlined.get(&key) {
+            v.clone()
+        } else {
+            if self.cond > 0 {
+                return self.stop(
+                    "js.db",
+                    c.span,
+                    "db.call or db.publish where its call may not run (an operand of &&, ||, ?? \
+                     or ?:): call it in a statement of its own first",
+                );
+            }
+            let mut first = Vec::new();
+            let Some(v) = self.db_call(call, "", &mut first)? else {
+                return Ok(None);
+            };
+            self.pre.append(&mut first);
+            self.inlined.insert(key, v.clone());
+            v
+        };
+        let v = match (var, path.as_slice()) {
+            (Var::Call { event, cols }, []) => V {
+                e: Expr::ObjectLit(vec![
+                    ("event".to_owned(), Expr::Local(event)),
+                    ("fields".to_owned(), Self::call_fields(&cols).e),
+                ]),
+                ty: Ty::Json,
+                nn: true,
+            },
+            (Var::Call { event, .. }, ["event"]) => V {
+                e: Expr::Local(event),
+                ty: Ty::Str,
+                nn: true,
+            },
+            (Var::Call { cols, .. }, ["fields"]) => Self::call_fields(&cols),
+            (Var::Call { cols, .. }, ["fields", f]) => {
+                let Some((_, l)) = cols.iter().find(|(c, _)| c == f) else {
+                    return self.stop(
+                        "js.member",
+                        e.span(),
+                        format!("the call returns no field {f}"),
+                    );
+                };
+                V {
+                    e: Expr::Local(*l),
+                    ty: self.f.local_def(*l).ty,
+                    nn: false,
+                }
+            }
+            (Var::Exec { affected }, ["affected"]) => V {
+                e: Expr::Local(affected),
+                ty: Ty::Int,
+                nn: true,
+            },
+            (Var::Exec { .. }, _) => {
+                return self.stop(
+                    "js.member",
+                    e.span(),
+                    "of db.publish's result only .affected compiles",
+                );
+            }
+            _ => {
+                return self.stop(
+                    "js.member",
+                    e.span(),
+                    "of db.call's result only .event, .fields and .fields.<name> compile",
+                );
+            }
+        };
+        Ok(Some(v))
+    }
+
+    /// A `db.call` result's `fields` as a value: every field, in the
+    /// wrapper's order, as the engine tier's row gives them.
+    fn call_fields(cols: &[(String, LocalId)]) -> V {
+        V {
+            e: Expr::ObjectLit(
+                cols.iter()
+                    .map(|(n, l)| (n.clone(), Expr::Local(*l)))
+                    .collect(),
+            ),
+            ty: Ty::Json,
+            nn: true,
+        }
+    }
+
+    /// `db.publish(stream, key, value, headers?)` into the stream's
+    /// outbox, with the gateway's checks first.
+    fn db_publish(
+        &mut self,
+        c: &oxc_ast::ast::CallExpression<'_>,
+        name: &str,
+        out: &mut Block,
+    ) -> R<Var> {
+        let at = self.at(c.span);
+        let stream = match c.arguments.first().and_then(Argument::as_expression) {
+            Some(Expression::StringLiteral(s)) => s.value.as_str().to_owned(),
+            _ => return self.stop("db.publish", c.span, "the stream's name must be a literal"),
+        };
+        if c.arguments.len() > 4 {
+            return self.stop(
+                "db.publish",
+                c.span,
+                "publishing to a member tenant's stream needs the gateway",
+            );
+        }
+        let target: StreamTarget = match self.cat.stream(&stream) {
+            None => {
+                return self.stop(
+                    "db.publish",
+                    c.span,
+                    format!("{stream} isn't a stream of this database"),
+                );
+            }
+            Some(Err(why)) => return self.stop("db.publish", c.span, why),
+            Some(Ok(t)) => t,
+        };
+        let mut binds = Vec::new();
+        let mut marks: Vec<usize> = Vec::new();
+        for i in 1..=2 {
+            let e = match c.arguments.get(i) {
+                None => Expr::Lit(Literal::Null),
+                Some(a) => {
+                    let Some(x) = a.as_expression() else {
+                        return self.stop("js.spread", c.span, "spread in the arguments");
+                    };
+                    let v = self.val(x)?;
+                    // The engine tier's text of a value: text as it is,
+                    // `null` as NULL, anything else as its JSON text.
+                    if self.is_dyn(&v) {
+                        binds.push(Expr::call(Builtin::JsonToStr, vec![v.e, Expr::bool(true)]));
+                        marks.push(self.pre.len());
+                        continue;
+                    }
+                    match v.ty {
+                        Ty::Str => v.e,
+                        Ty::Null => Expr::Lit(Literal::Null),
+                        Ty::Json => Expr::call(Builtin::JsonText, vec![v.e]),
+                        Ty::Int | Ty::Float | Ty::Bool => {
+                            if v.nn {
+                                Expr::call(Builtin::ToStr, vec![v.e])
+                            } else {
+                                Expr::Cond(
+                                    Box::new(Expr::bin(
+                                        BinOp::Eq,
+                                        v.e.clone(),
+                                        Expr::Lit(Literal::Null),
+                                    )),
+                                    Box::new(Expr::Lit(Literal::Null)),
+                                    Box::new(Expr::call(Builtin::ToStr, vec![v.e])),
+                                )
+                            }
+                        }
+                    }
+                }
+            };
+            binds.push(e);
+            marks.push(self.pre.len());
+        }
+        let absent = |x: &Expression<'_>| match x {
+            Expression::NullLiteral(_) => true,
+            Expression::Identifier(id) => id.name.as_str() == "undefined",
+            _ => false,
+        };
+        let given = c
+            .arguments
+            .get(3)
+            .and_then(Argument::as_expression)
+            .filter(|x| !absent(x));
+        let headers = match given {
+            Some(x @ Expression::ObjectExpression(_)) => {
+                let v = self.val(x)?;
+                Expr::call(Builtin::JsonText, vec![v.e])
+            }
+            None => Expr::Lit(Literal::Null),
+            Some(x) => {
+                return self.stop(
+                    "db.publish",
+                    x.span(),
+                    "headers must be an object literal (or null) to compile",
+                );
+            }
+        };
+        binds.push(headers);
+        marks.push(self.pre.len());
+        self.settle_binds(&mut binds, &marks);
+        self.tmp += 1;
+        let base = if name.is_empty() {
+            format!("pub{}", self.tmp)
+        } else {
+            name.to_owned()
+        };
+        let affected = self.f.local(&format!("{base}_affected"), Ty::Int);
+        self.flush(out);
+        out.push(Stmt::Db(DbOp::Sql {
+            stmt: crate::ir::BoundSql {
+                parts: vec![
+                    format!(
+                        "INSERT INTO `{}` (k, v, headers) VALUES (",
+                        target.outbox.replace('`', "``")
+                    ),
+                    ", ".to_owned(),
+                    ", ".to_owned(),
+                    ")".to_owned(),
+                ],
+                reads: Vec::new(),
+                writes: vec![target.name.clone()],
+            },
+            binds,
+            shape: SqlShape::Publish {
+                affected,
+                max_bytes: target.max_bytes,
+                compact: target.compact,
+            },
+            origin: at,
+        }));
+        Ok(Var::Exec { affected })
+    }
+}
+
+/// `logic.max_call_depth`'s default: compiled calls nest at most this deep.
+const MAX_CALL_DEPTH: u32 = 8;
 
 /// Whether `s` holds a `break` that would leave an enclosing `switch`
 /// (one not inside a loop or another switch of its own).
@@ -1913,6 +3170,7 @@ impl L<'_, '_> {
                 Expr::call(Builtin::Present, vec![v.e.clone()]),
                 Expr::bin(BinOp::Ne, Expr::call(Builtin::Len, vec![v.e]), Expr::int(0)),
             ),
+            Ty::Json if self.dyn_expr(&v.e) => Expr::call(Builtin::JsonTruthy, vec![v.e]),
             Ty::Json => match &v.e {
                 Expr::ObjectLit(_) | Expr::ArrayLit(_) => Expr::bool(true),
                 _ => {
@@ -2003,6 +3261,9 @@ impl L<'_, '_> {
                 nn: true,
             });
         }
+        if let Some(v) = self.inline_db(e)? {
+            return Ok(v);
+        }
         match e {
             Expression::ParenthesizedExpression(p) => self.val(&p.expression),
             Expression::NullLiteral(_) => Ok(V::null()),
@@ -2010,25 +3271,35 @@ impl L<'_, '_> {
             Expression::NumericLiteral(n) => Ok(V::lit(number(n.value))),
             Expression::StringLiteral(s) => Ok(V::lit(Literal::Str(s.value.as_str().to_owned()))),
             Expression::TemplateLiteral(t) => {
-                let mut acc: Option<Expr> = None;
+                // Each part with where it was read, for the order of
+                // evaluation.
+                let mut parts: Vec<(Expr, usize)> = Vec::new();
                 for (i, q) in t.quasis.iter().enumerate() {
                     let Some(text) = q.value.cooked.as_ref() else {
                         return self.stop("js.template", t.span, "an invalid escape");
                     };
-                    let mut parts = Vec::new();
                     if !text.as_str().is_empty() {
-                        parts.push(Expr::Lit(Literal::Str(text.as_str().to_owned())));
+                        parts.push((
+                            Expr::Lit(Literal::Str(text.as_str().to_owned())),
+                            self.pre.len(),
+                        ));
                     }
                     if let Some(x) = t.expressions.get(i) {
                         let v = self.val(x)?;
-                        parts.push(self.text_of(v, x.span())?);
+                        let e = self.text_of(v, x.span())?;
+                        parts.push((e, self.pre.len()));
                     }
-                    for p in parts {
-                        acc = Some(match acc {
-                            None => p,
-                            Some(a) => Expr::bin(BinOp::Concat, a, p),
-                        });
-                    }
+                }
+                for i in (0..parts.len()).rev() {
+                    let (e, mark) = parts[i].clone();
+                    parts[i].0 = self.settle_e(e, mark);
+                }
+                let mut acc: Option<Expr> = None;
+                for (p, _) in parts {
+                    acc = Some(match acc {
+                        None => p,
+                        Some(a) => Expr::bin(BinOp::Concat, a, p),
+                    });
                 }
                 Ok(V {
                     e: acc.unwrap_or(Expr::Lit(Literal::Str(String::new()))),
@@ -2055,13 +3326,37 @@ impl L<'_, '_> {
                         nn: true,
                     }),
                     Some(Var::Field(f)) => self.field_val(&f, id.span),
+                    Some(Var::Val(v)) => Ok(v),
+                    Some(Var::Call { event, cols }) => {
+                        let fields = Self::call_fields(&cols);
+                        Ok(V {
+                            e: Expr::ObjectLit(vec![
+                                ("event".to_owned(), Expr::Local(event)),
+                                ("fields".to_owned(), fields.e),
+                            ]),
+                            ty: Ty::Json,
+                            nn: true,
+                        })
+                    }
+                    Some(Var::Helper { .. }) => self.stop(
+                        "js.helper",
+                        id.span,
+                        format!("{name} is a function: only calls of it compile"),
+                    ),
+                    Some(Var::Exc { .. }) => self.stop(
+                        "js.catch_value",
+                        id.span,
+                        format!("only {name}.message, {name}.name and throw {name} compile"),
+                    ),
                     Some(
                         Var::Row { .. }
                         | Var::Exec { .. }
                         | Var::Elem { .. }
                         | Var::Module(_)
                         | Var::Image { .. }
-                        | Var::Ctx,
+                        | Var::Ctx
+                        | Var::Msg
+                        | Var::Event,
                     ) => self.stop(
                         "js.value",
                         id.span,
@@ -2071,98 +3366,7 @@ impl L<'_, '_> {
                     None => self.stop("js.unknown_name", id.span, format!("unknown name {name}")),
                 }
             }
-            Expression::StaticMemberExpression(m) => {
-                let prop = m.property.name.as_str();
-                if let Some(old) = self.image_of(&m.object) {
-                    return self.image_col(old, prop, m.span);
-                }
-                if prop == "op" && self.ctx_trigger(&m.object) {
-                    return self.field_val("op", m.span);
-                }
-                if let Expression::Identifier(obj) = strip_parens(&m.object)
-                    && let Some(var) = self.lookup(obj.name.as_str())
-                {
-                    match var {
-                        Var::Row { found, cols } => {
-                            let Some((_, l)) = cols.iter().find(|(c, _)| c == prop).cloned() else {
-                                return self.stop(
-                                    "js.member",
-                                    m.span,
-                                    format!("the row has no column {prop}"),
-                                );
-                            };
-                            if !self.facts.contains(&Key::L(found)) {
-                                if self.cond > 0 {
-                                    return self.stop(
-                                        "js.null_row",
-                                        m.span,
-                                        format!("{} may be null here", obj.name.as_str()),
-                                    );
-                                }
-                                self.guards.push((found, prop.to_owned()));
-                            }
-                            return Ok(V {
-                                e: Expr::Local(l),
-                                ty: self.f.local_def(l).ty,
-                                nn: false,
-                            });
-                        }
-                        Var::Exec { affected } if prop == "affected" => {
-                            return Ok(V {
-                                e: Expr::Local(affected),
-                                ty: Ty::Int,
-                                nn: true,
-                            });
-                        }
-                        Var::Elem { local, cols } => {
-                            let Some((_, ty)) = cols.iter().find(|(c, _)| c == prop).cloned()
-                            else {
-                                return self.stop(
-                                    "js.member",
-                                    m.span,
-                                    format!("the rows have no column {prop}"),
-                                );
-                            };
-                            let path = Expr::Path(
-                                Box::new(Expr::Local(local)),
-                                vec![PathSeg::Key(prop.to_owned())],
-                            );
-                            let (e, ty) = match ty {
-                                Ty::Int | Ty::Float => {
-                                    (Expr::call(Builtin::JsonNum, vec![path]), Ty::Float)
-                                }
-                                Ty::Str => (Expr::call(Builtin::JsonStr, vec![path]), Ty::Str),
-                                _ => (path, Ty::Json),
-                            };
-                            return Ok(V { e, ty, nn: false });
-                        }
-                        Var::Rows { local, .. } if prop == "length" => {
-                            return Ok(V {
-                                e: Expr::bin(
-                                    BinOp::Coalesce,
-                                    Expr::call(Builtin::JsonLength, vec![Expr::Local(local)]),
-                                    Expr::int(0),
-                                ),
-                                ty: Ty::Int,
-                                nn: true,
-                            });
-                        }
-                        _ => {}
-                    }
-                }
-                let v = self.val(&m.object)?;
-                match (v.ty, prop) {
-                    (Ty::Str, "length") => {
-                        self.need_nn(&v, m.span)?;
-                        Ok(V {
-                            e: Expr::call(Builtin::Len, vec![v.e]),
-                            ty: Ty::Int,
-                            nn: true,
-                        })
-                    }
-                    _ => self.stop("js.member", m.span, format!("reading .{prop} here")),
-                }
-            }
+            Expression::StaticMemberExpression(m) => self.static_member(m),
             Expression::UnaryExpression(u) => {
                 let v = self.val(&u.argument)?;
                 match u.operator {
@@ -2187,12 +3391,18 @@ impl L<'_, '_> {
                 }
             }
             Expression::BinaryExpression(b) => {
+                if let Some(v) = self.dyn_test(b)? {
+                    return Ok(v);
+                }
                 let x = self.val(&b.left)?;
+                let mark = self.pre.len();
                 let y = self.val(&b.right)?;
+                let x = self.settle(x, mark);
                 self.binary(b.operator, x, y, b.span)
             }
             Expression::LogicalExpression(l) => {
                 let x = self.val(&l.left)?;
+                let mark = self.pre.len();
                 let y = match l.operator {
                     LogicalOperator::Or => {
                         self.cond_val(&l.right, self.facts_if(&l.left, false))?
@@ -2202,6 +3412,11 @@ impl L<'_, '_> {
                     }
                     LogicalOperator::Coalesce => self.cond_val(&l.right, BTreeSet::new())?,
                 };
+                let x = self.settle(x, mark);
+                let (xd, yd) = (self.is_dyn(&x), self.is_dyn(&y));
+                if xd || yd {
+                    return self.dyn_logical(l.operator, x, y, xd, yd, l.span);
+                }
                 if l.operator == LogicalOperator::Coalesce {
                     let ty = self.join(x.ty, y.ty, l.span)?;
                     let (a, b) = (
@@ -2251,8 +3466,28 @@ impl L<'_, '_> {
             }
             Expression::ConditionalExpression(c) => {
                 let t = self.test(&c.test)?;
+                let mark = self.pre.len();
                 let a = self.cond_val(&c.consequent, self.facts_if(&c.test, true))?;
                 let b = self.cond_val(&c.alternate, self.facts_if(&c.test, false))?;
+                let t = self.settle_e(t, mark);
+                let (a, b) = match (self.is_dyn(&a), self.is_dyn(&b)) {
+                    (true, true) => {
+                        return Ok(V {
+                            e: Expr::Cond(Box::new(t), Box::new(a.e), Box::new(b.e)),
+                            ty: Ty::Json,
+                            nn: false,
+                        });
+                    }
+                    (true, false) => match Self::undyn(a, Self::read_as(b.ty), false) {
+                        Some(a) => (a, b),
+                        None => return self.stop("js.types", c.span, "a parsed JSON value here"),
+                    },
+                    (false, true) => match Self::undyn(b, Self::read_as(a.ty), false) {
+                        Some(b) => (a, b),
+                        None => return self.stop("js.types", c.span, "a parsed JSON value here"),
+                    },
+                    (false, false) => (a, b),
+                };
                 let ty = self.join(a.ty, b.ty, c.span)?;
                 let nn = a.nn && b.nn;
                 let (a, b) = (self.coerce(a, ty, c.span)?, self.coerce(b, ty, c.span)?);
@@ -2266,6 +3501,14 @@ impl L<'_, '_> {
                 let fields = self.fields(o)?;
                 let mut m = Vec::new();
                 for (k, v) in fields {
+                    if self.is_dyn(&v) {
+                        // JSON.stringify drops an `undefined` member.
+                        return self.stop(
+                            "js.dynamic_types",
+                            o.span,
+                            "a parsed JSON value inside an object literal",
+                        );
+                    }
                     let e = v.e;
                     m.push((k, e));
                 }
@@ -2282,8 +3525,17 @@ impl L<'_, '_> {
                         return self.stop("js.spread", a.span, "spread or holes in an array");
                     };
                     let v = self.val(x)?;
-                    items.push(v.e);
+                    if self.is_dyn(&v) {
+                        return self.stop(
+                            "js.dynamic_types",
+                            a.span,
+                            "a parsed JSON value inside an array literal",
+                        );
+                    }
+                    items.push((v, self.pre.len()));
                 }
+                self.settle_all(&mut items);
+                let items = items.into_iter().map(|(v, _)| v.e).collect();
                 Ok(V {
                     e: Expr::ArrayLit(items),
                     ty: Ty::Json,
@@ -2303,14 +3555,183 @@ impl L<'_, '_> {
                      tier, and a computed column, validation or trigger can't use it",
                 )
             }
-            Expression::ChainExpression(c) => {
-                self.stop("js.optional_chain", c.span, "optional chaining")
-            }
+            Expression::ChainExpression(c) => match &c.expression {
+                oxc_ast::ast::ChainElement::StaticMemberExpression(m) => self.static_member(m),
+                oxc_ast::ast::ChainElement::ComputedMemberExpression(m) => self.computed_member(m),
+                _ => self.stop("js.optional_chain", c.span, "optional chaining"),
+            },
+            Expression::ComputedMemberExpression(m) => self.computed_member(m),
             other => self.stop(
                 "js.expression",
                 other.span(),
                 "this expression runs in the engine tier",
             ),
+        }
+    }
+
+    /// `obj.prop`, also inside an optional chain (`m.optional` is `?.`).
+    #[allow(clippy::too_many_lines)]
+    fn static_member(&mut self, m: &oxc_ast::ast::StaticMemberExpression<'_>) -> R<V> {
+        let prop = m.property.name.as_str();
+        if self.event_of(&m.object) {
+            return self.msg_field(prop, m.span);
+        }
+        if m.optional {
+            // `?.` compiles on parsed JSON only.
+            let v = self.val(&m.object)?;
+            if !self.is_dyn(&v) {
+                return self.stop("js.optional_chain", m.span, "optional chaining");
+            }
+            return self.json_member(v, prop, true, m.span);
+        }
+        if let Some(old) = self.image_of(&m.object) {
+            return self.image_col(old, prop, m.span);
+        }
+        if prop == "op" && self.ctx_trigger(&m.object) {
+            return self.field_val("op", m.span);
+        }
+        if let Expression::StaticMemberExpression(inner) = strip_parens(&m.object)
+            && inner.property.name.as_str() == "fields"
+            && let Expression::Identifier(obj) = strip_parens(&inner.object)
+            && let Some(Var::Call { cols, .. }) = self.lookup(obj.name.as_str())
+        {
+            // A field the callee doesn't return is `undefined`,
+            // which the IR has no value for.
+            let Some((_, l)) = cols.iter().find(|(c, _)| c == prop) else {
+                return self.stop(
+                    "js.member",
+                    m.span,
+                    format!("the call returns no field {prop}"),
+                );
+            };
+            return Ok(V {
+                e: Expr::Local(*l),
+                ty: self.f.local_def(*l).ty,
+                nn: false,
+            });
+        }
+        if let Expression::Identifier(obj) = strip_parens(&m.object)
+            && let Some(var) = self.lookup(obj.name.as_str())
+        {
+            match var {
+                Var::Call { event, .. } if prop == "event" => {
+                    return Ok(V {
+                        e: Expr::Local(event),
+                        ty: Ty::Str,
+                        nn: true,
+                    });
+                }
+                Var::Call { cols, .. } if prop == "fields" => {
+                    return Ok(Self::call_fields(&cols));
+                }
+                Var::Row { found, cols } => {
+                    let Some((_, l)) = cols.iter().find(|(c, _)| c == prop).cloned() else {
+                        return self.stop(
+                            "js.member",
+                            m.span,
+                            format!("the row has no column {prop}"),
+                        );
+                    };
+                    if !self.facts.contains(&Key::L(found)) {
+                        if self.cond > 0 {
+                            return self.stop(
+                                "js.null_row",
+                                m.span,
+                                format!("{} may be null here", obj.name.as_str()),
+                            );
+                        }
+                        self.guard(found, prop);
+                    }
+                    return Ok(V {
+                        e: Expr::Local(l),
+                        ty: self.f.local_def(l).ty,
+                        nn: false,
+                    });
+                }
+                Var::Exec { affected } if prop == "affected" => {
+                    return Ok(V {
+                        e: Expr::Local(affected),
+                        ty: Ty::Int,
+                        nn: true,
+                    });
+                }
+                Var::Elem { local, cols } => {
+                    let Some((_, ty)) = cols.iter().find(|(c, _)| c == prop).cloned() else {
+                        return self.stop(
+                            "js.member",
+                            m.span,
+                            format!("the rows have no column {prop}"),
+                        );
+                    };
+                    let path = Expr::Path(
+                        Box::new(Expr::Local(local)),
+                        vec![PathSeg::Key(prop.to_owned())],
+                    );
+                    let (e, ty) = match ty {
+                        Ty::Int | Ty::Float => {
+                            (Expr::call(Builtin::JsonNum, vec![path]), Ty::Float)
+                        }
+                        Ty::Str => (Expr::call(Builtin::JsonStr, vec![path]), Ty::Str),
+                        _ => (path, Ty::Json),
+                    };
+                    return Ok(V { e, ty, nn: false });
+                }
+                Var::Exc { caught, readable } => {
+                    if !matches!(prop, "message" | "name") {
+                        return self.stop(
+                            "js.catch_value",
+                            m.span,
+                            format!("reading .{prop} of a caught error"),
+                        );
+                    }
+                    if !readable {
+                        return self.stop(
+                            "js.catch_value",
+                            m.span,
+                            "the try can raise a database error (or a thrown value that \
+                             isn't an error), whose text can differ between MariaDB and the \
+                             engine tier",
+                        );
+                    }
+                    let l = if prop == "message" {
+                        caught.message
+                    } else {
+                        caught.name
+                    };
+                    return Ok(V {
+                        e: Expr::Local(l),
+                        ty: Ty::Str,
+                        nn: true,
+                    });
+                }
+                Var::Rows { local, .. } if prop == "length" => {
+                    return Ok(V {
+                        e: Expr::bin(
+                            BinOp::Coalesce,
+                            Expr::call(Builtin::JsonLength, vec![Expr::Local(local)]),
+                            Expr::int(0),
+                        ),
+                        ty: Ty::Int,
+                        nn: true,
+                    });
+                }
+                _ => {}
+            }
+        }
+        let v = self.val(&m.object)?;
+        if self.is_dyn(&v) {
+            return self.json_member(v, prop, false, m.span);
+        }
+        match (v.ty, prop) {
+            (Ty::Str, "length") => {
+                self.need_nn(&v, m.span)?;
+                Ok(V {
+                    e: Expr::call(Builtin::Len, vec![v.e]),
+                    ty: Ty::Int,
+                    nn: true,
+                })
+            }
+            _ => self.stop("js.member", m.span, format!("reading .{prop} here")),
         }
     }
 
@@ -2336,6 +3757,9 @@ impl L<'_, '_> {
     }
 
     fn call(&mut self, c: &oxc_ast::ast::CallExpression<'_>) -> R<V> {
+        if let Some(h) = self.helper_of(&c.callee) {
+            return self.inline(h, c);
+        }
         if let Some(what) = self.nondeterministic(&c.callee) {
             return self.stop(
                 "js.nondeterministic",
@@ -2352,6 +3776,9 @@ impl L<'_, '_> {
                 return self.stop("js.spread", c.span, "spread arguments");
             };
             args.push(x);
+        }
+        if let Some(v) = self.json_call(c, &args)? {
+            return Ok(v);
         }
         if let Some(path) = self.callee_path(&c.callee) {
             let b = match path.as_slice() {
@@ -2384,8 +3811,10 @@ impl L<'_, '_> {
                 if v.ty == Ty::Float {
                     ty = Ty::Float;
                 }
-                xs.push(v);
+                xs.push((v, self.pre.len()));
             }
+            self.settle_all(&mut xs);
+            let mut xs: Vec<V> = xs.into_iter().map(|(v, _)| v).collect();
             let e = match b {
                 Builtin::Abs => Expr::call(b, vec![xs.remove(0).e]),
                 Builtin::Max | Builtin::Min => {
@@ -2454,13 +3883,25 @@ impl L<'_, '_> {
                 && args.len() == n
             {
                 let s = self.val(&m.object)?;
+                // On parsed JSON: a string, or the engine tier (a method of
+                // another kind, or a TypeError).
+                let s = if self.is_dyn(&s) {
+                    Self::undyn(s, Ty::Str, false).unwrap_or_else(V::null)
+                } else {
+                    s
+                };
                 if s.ty != Ty::Str {
                     return self.stop("js.call", c.span, format!("{method} on a non-string"));
                 }
                 self.need_nn(&s, m.span)?;
-                let mut es = vec![s.e];
+                let mut es = vec![(s.e, self.pre.len())];
                 for a in args {
                     let v = self.val(a)?;
+                    let v = if self.is_dyn(&v) {
+                        Self::undyn(v, Ty::Str, false).unwrap_or_else(V::null)
+                    } else {
+                        v
+                    };
                     if v.ty != Ty::Str || !v.nn {
                         return self.stop(
                             "js.call",
@@ -2468,8 +3909,13 @@ impl L<'_, '_> {
                             format!("{method} takes a non-null string here"),
                         );
                     }
-                    es.push(v.e);
+                    es.push((v.e, self.pre.len()));
                 }
+                for i in (0..es.len()).rev() {
+                    let (e, mark) = es[i].clone();
+                    es[i].0 = self.settle_e(e, mark);
+                }
+                let es = es.into_iter().map(|(e, _)| e).collect();
                 let ty = match b {
                     Builtin::Upper | Builtin::Lower => Ty::Str,
                     Builtin::IndexOf => Ty::Int,
@@ -2483,6 +3929,356 @@ impl L<'_, '_> {
             }
         }
         self.stop("js.call", c.span, "this call runs in the engine tier")
+    }
+
+    /// The helper `init` declares (`const f = (a) => ...`,
+    /// `const f = function (a) { ... }`).
+    fn helper_def(&self, init: &Expression<'_>) -> Option<Var> {
+        let span = match strip_parens(init) {
+            Expression::ArrowFunctionExpression(a) => a.span,
+            Expression::FunctionExpression(f) => f.span,
+            _ => return None,
+        };
+        Some(Var::Helper {
+            start: self.span_base + span.start,
+            end: self.span_base + span.end,
+            depth: self.scopes.len() - 1,
+            expr: true,
+        })
+    }
+
+    /// The helper a call's callee names.
+    fn helper_of(&self, callee: &Expression<'_>) -> Option<(u32, u32, usize, bool)> {
+        let Expression::Identifier(id) = strip_parens(callee) else {
+            return None;
+        };
+        match self.lookup(id.name.as_str()) {
+            Some(Var::Helper {
+                start,
+                end,
+                depth,
+                expr,
+            }) => Some((start, end, depth, expr)),
+            _ => None,
+        }
+    }
+
+    /// A call of a helper, inlined: its source is parsed again on its own
+    /// and lowered in the scope it was declared in (a closure reads and
+    /// writes the variables it sees there), with the arguments evaluated
+    /// first. A helper whose body is one `return` is an expression; any
+    /// other runs as statements before the statement that calls it, in a
+    /// block its `return`s leave.
+    fn inline(
+        &mut self,
+        (start, end, depth, is_expr): (u32, u32, usize, bool),
+        c: &oxc_ast::ast::CallExpression<'_>,
+    ) -> R<V> {
+        if self.inlining.contains(&start) {
+            return self.stop(
+                "js.recursion",
+                c.span,
+                "a helper that calls itself runs in the engine tier",
+            );
+        }
+        if self.inlining.len() >= 8 || self.inlines >= 200 {
+            return self.stop(
+                "js.helper",
+                c.span,
+                "helpers nested more than 8 deep, or more than 200 helper calls",
+            );
+        }
+        let mut args = Vec::with_capacity(c.arguments.len());
+        for a in &c.arguments {
+            let Some(x) = a.as_expression() else {
+                return self.stop("js.spread", c.span, "spread arguments");
+            };
+            let v = self.val(x)?;
+            args.push((v, self.pre.len()));
+        }
+        self.settle_all(&mut args);
+        let args: Vec<V> = args.into_iter().map(|(v, _)| v).collect();
+        let text = self
+            .src
+            .get(start as usize..end as usize)
+            .unwrap_or_default();
+        let (text, base) = if is_expr {
+            (format!("({text})"), start.saturating_sub(1))
+        } else {
+            (text.to_owned(), start)
+        };
+        let alloc = Allocator::default();
+        let parsed = Parser::new(&alloc, &text, SourceType::mjs()).parse();
+        let func = parsed.program.body.first().and_then(|st| match st {
+            Statement::FunctionDeclaration(f) => {
+                Some((&f.params, f.body.as_ref(), None, f.r#async || f.generator))
+            }
+            Statement::ExpressionStatement(es) => match strip_parens(&es.expression) {
+                Expression::FunctionExpression(f) => {
+                    Some((&f.params, f.body.as_ref(), None, f.r#async || f.generator))
+                }
+                Expression::ArrowFunctionExpression(a) => {
+                    let concise = a.expression.then(|| match a.body.statements.first() {
+                        Some(Statement::ExpressionStatement(e)) => Some(&e.expression),
+                        _ => None,
+                    });
+                    Some((&a.params, Some(&a.body), concise.flatten(), a.r#async))
+                }
+                _ => None,
+            },
+            _ => None,
+        });
+        let Some((params, Some(body), concise, unusual)) =
+            func.filter(|_| parsed.errors.is_empty())
+        else {
+            return self.stop("js.helper", c.span, "this helper's form");
+        };
+        if unusual {
+            return self.stop(
+                "js.async",
+                c.span,
+                "async helpers and generators run in the engine tier",
+            );
+        }
+        if params.rest.is_some()
+            || params.items.iter().any(|p| {
+                p.initializer.is_some()
+                    || !matches!(p.pattern, BindingPattern::BindingIdentifier(_))
+            })
+        {
+            return self.stop(
+                "js.params",
+                c.span,
+                "a helper's parameters must be plain names",
+            );
+        }
+        // One `return expr` (or an arrow's expression): an expression.
+        let single = concise.or(match body.statements.as_slice() {
+            [Statement::ReturnStatement(r)] => r.argument.as_ref(),
+            _ => None,
+        });
+        // Enter the helper's scope.
+        let saved = (self.span_base, self.salt);
+        self.inlines += 1;
+        self.span_base = base;
+        self.salt = self.inlines.wrapping_mul(0x0100_0000);
+        let stash = self.scopes.split_off((depth + 1).min(self.scopes.len()));
+        self.scopes.push(Vec::new());
+        self.inlining.push(start);
+        let r = if let Some(e) = single {
+            // The parameters are bound first, so a name in the body that
+            // a parameter shadows doesn't count as a helper call.
+            for (i, p) in params.items.iter().enumerate() {
+                if let BindingPattern::BindingIdentifier(b) = &p.pattern {
+                    let v = args.get(i).cloned().unwrap_or_else(V::null);
+                    self.bind(b.name.as_str(), Var::Val(v));
+                }
+            }
+            // An argument is its value at the call: when the body calls
+            // a helper, whose statements run before the body's value is
+            // read, an argument reading a local is kept in one of its own.
+            let body_text = text
+                .get(e.span().start as usize..e.span().end as usize)
+                .unwrap_or_default();
+            if self.cond == 0 && self.may_call_helper(body_text) {
+                for (i, p) in params.items.iter().enumerate() {
+                    let BindingPattern::BindingIdentifier(b) = &p.pattern else {
+                        continue;
+                    };
+                    let Some(v) = args.get(i).cloned() else {
+                        continue;
+                    };
+                    let mut local = false;
+                    v.e.walk(&mut |x| local |= matches!(x, Expr::Local(_)));
+                    if local {
+                        let parsed = self.is_dyn(&v);
+                        let at = self.pre.len();
+                        let l = self.snapshot(v.e, v.ty, at);
+                        if parsed {
+                            self.dyn_locals.insert(l);
+                        }
+                        let held = V {
+                            e: Expr::Local(l),
+                            ty: v.ty,
+                            nn: v.nn,
+                        };
+                        self.bind(b.name.as_str(), Var::Val(held));
+                    }
+                }
+            }
+            self.val(e)
+        } else if self.cond > 0 {
+            self.stop(
+                "js.helper",
+                c.span,
+                "a helper with statements, called where its call may not run",
+            )
+        } else {
+            self.inline_body(params, &body.statements, &args)
+        };
+        self.inlining.pop();
+        self.scopes.pop();
+        self.scopes.extend(stash);
+        (self.span_base, self.salt) = saved;
+        r
+    }
+
+    /// A statement-form helper's body, into `pre`: the parameters as
+    /// locals, then the body in a block its `return`s leave.
+    fn inline_body(
+        &mut self,
+        params: &FormalParameters<'_>,
+        stmts: &[Statement<'_>],
+        args: &[V],
+    ) -> R<V> {
+        let before = self.facts.clone();
+        for (i, p) in params.items.iter().enumerate() {
+            let BindingPattern::BindingIdentifier(b) = &p.pattern else {
+                continue;
+            };
+            let v = args.get(i).cloned().unwrap_or_else(V::null);
+            let key = self.salt + self.span_base + p.span.start;
+            let ty = self.widen.get(&key).copied().unwrap_or(v.ty);
+            let l = self.f.local(b.name.as_str(), ty);
+            let e = self.coerce(v.clone(), ty, p.span)?;
+            self.pre.push(Stmt::Assign(l, e));
+            self.facts.remove(&Key::L(l));
+            if v.nn {
+                self.facts.insert(Key::L(l));
+            }
+            self.decls.insert(l, key);
+            self.bind(b.name.as_str(), Var::Local(l));
+        }
+        let label = self.next_label();
+        self.jframes.push(JFrame::Helper {
+            label,
+            result: None,
+            nn: true,
+        });
+        let body = self.block(stmts);
+        let Some(JFrame::Helper { result, nn, .. }) = self.jframes.pop() else {
+            return Err(Stop);
+        };
+        // What the helper assigned may not hold its old facts; facts it
+        // learned may not hold either (a `return` can leave first).
+        let mut changed = BTreeSet::new();
+        assigned(&body, &mut changed);
+        self.facts = before;
+        self.facts
+            .retain(|k| !matches!(k, Key::L(l) if changed.contains(l)));
+        let always = exits(&body);
+        match result {
+            Some(l) => {
+                self.pre.push(Stmt::Assign(l, Expr::Lit(Literal::Null)));
+                self.pre.push(Stmt::Block(label, body));
+                Ok(V {
+                    e: Expr::Local(l),
+                    ty: self.f.local_def(l).ty,
+                    nn: nn && always,
+                })
+            }
+            None => {
+                self.pre.push(Stmt::Block(label, body));
+                Ok(V::null())
+            }
+        }
+    }
+
+    // -- evaluation order -------------------------------------------------------
+    //
+    // JavaScript evaluates operands left to right, and a helper's body runs
+    // in the statements before the one calling it. So an operand read before
+    // a later operand's helper call must keep the value it had then:
+    // `n + bump()` adds the old `n` when `bump` changes it. After the later
+    // operands are lowered, an earlier one whose locals their statements
+    // assign is kept in a local of its own, assigned where it was read.
+
+    /// Whether the statements added since `mark` assign a local `e` reads.
+    fn reads_changed(&self, e: &Expr, mark: usize) -> bool {
+        let Some(after) = self.pre.get(mark..).filter(|a| !a.is_empty()) else {
+            return false;
+        };
+        let mut changed = BTreeSet::new();
+        assigned(after, &mut changed);
+        let mut hit = false;
+        e.walk(&mut |x| {
+            if let Expr::Local(l) = x {
+                hit |= changed.contains(l);
+            }
+        });
+        hit
+    }
+
+    /// `e` in a new local, assigned at `mark` of the statements before.
+    fn snapshot(&mut self, e: Expr, ty: Ty, mark: usize) -> LocalId {
+        self.tmp += 1;
+        let l = self.f.local(&format!("operand{}", self.tmp), ty);
+        let at = mark.min(self.pre.len());
+        self.pre.insert(at, Stmt::Assign(l, e));
+        l
+    }
+
+    /// `v`, read at `mark`, as it was there (see above).
+    fn settle(&mut self, v: V, mark: usize) -> V {
+        if !self.reads_changed(&v.e, mark) {
+            return v;
+        }
+        let parsed = self.is_dyn(&v);
+        let l = self.snapshot(v.e, v.ty, mark);
+        if parsed {
+            self.dyn_locals.insert(l);
+        }
+        V {
+            e: Expr::Local(l),
+            ty: v.ty,
+            nn: v.nn,
+        }
+    }
+
+    /// An operand's IR, read at `mark`, as it was there.
+    fn settle_e(&mut self, e: Expr, mark: usize) -> Expr {
+        if !self.reads_changed(&e, mark) {
+            return e;
+        }
+        let ty = self.f.ty_of(&e);
+        Expr::Local(self.snapshot(e, ty, mark))
+    }
+
+    /// Bind values read in order, each with where it was read: every one
+    /// as it was then.
+    fn settle_binds(&mut self, binds: &mut [Expr], marks: &[usize]) {
+        for i in (0..binds.len().min(marks.len())).rev() {
+            let e = std::mem::replace(&mut binds[i], Expr::Lit(Literal::Null));
+            binds[i] = self.settle_e(e, marks[i]);
+        }
+    }
+
+    /// Operands read in order, each with the length of the statements
+    /// before when it was read: every one as it was then.
+    fn settle_all(&mut self, vs: &mut [(V, usize)]) {
+        for i in (0..vs.len()).rev() {
+            let (v, mark) = vs[i].clone();
+            vs[i].0 = self.settle(v, mark);
+        }
+    }
+
+    /// Whether an expression-form helper's body may call a helper (whose
+    /// statements could change what its arguments read): any name in it
+    /// that names a helper where it was declared.
+    fn may_call_helper(&self, text: &str) -> bool {
+        let is_start = |c: char| c.is_alphabetic() || c == '_' || c == '$';
+        let mut rest = text;
+        while let Some(i) = rest.find(is_start) {
+            let tail = &rest[i..];
+            let n = tail
+                .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+                .unwrap_or(tail.len());
+            if matches!(self.lookup(&tail[..n]), Some(Var::Helper { .. })) {
+                return true;
+            }
+            rest = &tail[n..];
+        }
+        false
     }
 
     fn need_nn(&mut self, v: &V, span: Span) -> R<()> {
@@ -2515,6 +4311,13 @@ impl L<'_, '_> {
                 }
             }),
             Ty::Null => Ok(V::lit(Literal::Int(0))),
+            // JavaScript's `+x` of anything but a number converts it: run
+            // the record in the engine tier then.
+            Ty::Json if self.dyn_expr(&v.e) => Ok(V {
+                e: Expr::call(Builtin::JsonAsNum, vec![v.e, Expr::bool(false)]),
+                ty: Ty::Float,
+                nn: true,
+            }),
             other => self.stop(
                 "js.dynamic_types",
                 span,
@@ -2597,6 +4400,20 @@ impl L<'_, '_> {
                     || (x.ty.is_number() && y.ty.is_number())
                     || x.ty == Ty::Null
                     || y.ty == Ty::Null;
+                let (xd, yd) = (self.is_dyn(&x), self.is_dyn(&y));
+                if xd != yd {
+                    let (d, o) = if xd { (x, y) } else { (y, x) };
+                    let e = self.dyn_equals(d, o, strict, span)?;
+                    return Ok(V {
+                        e: if negate {
+                            Expr::Unary(UnOp::Not, Box::new(e))
+                        } else {
+                            e
+                        },
+                        ty: Ty::Bool,
+                        nn: true,
+                    });
+                }
                 if x.ty == Ty::Json || y.ty == Ty::Json {
                     return self.stop(
                         "js.dynamic_types",
@@ -2637,6 +4454,27 @@ impl L<'_, '_> {
                     B::LessEqualThan => BinOp::Le,
                     B::GreaterThan => BinOp::Gt,
                     _ => BinOp::Ge,
+                };
+                let (xd, yd) = (self.is_dyn(&x), self.is_dyn(&y));
+                let (x, y) = match (xd, yd) {
+                    // Text with text compares as text; anything else as
+                    // numbers (another kind runs in the engine tier).
+                    (true, false) if y.ty == Ty::Str && y.nn => {
+                        (Self::undyn(x, Ty::Str, false).unwrap_or_else(V::null), y)
+                    }
+                    (false, true) if x.ty == Ty::Str && x.nn => {
+                        let y = Self::undyn(y, Ty::Str, false).unwrap_or_else(V::null);
+                        (x, y)
+                    }
+                    (true, true) => {
+                        return self.stop("js.compare", span, "comparing two parsed JSON values");
+                    }
+                    (true, false) => (self.num(x, span)?, y),
+                    (false, true) => {
+                        let y = self.num(y, span)?;
+                        (x, y)
+                    }
+                    _ => (x, y),
                 };
                 let (a, b) = if x.ty == Ty::Str && y.ty == Ty::Str && x.nn && y.nn {
                     (x.e, y.e)
@@ -2679,6 +4517,9 @@ impl L<'_, '_> {
                     )
                 }
             }
+            Ty::Json if self.dyn_expr(&v.e) => {
+                Expr::call(Builtin::JsonToStr, vec![v.e, Expr::bool(false)])
+            }
             Ty::Json => {
                 return self.stop(
                     "js.dynamic_types",
@@ -2705,6 +4546,11 @@ impl L<'_, '_> {
         if v.ty == ty || v.ty == Ty::Null {
             return Ok(v.e);
         }
+        if self.is_dyn(&v)
+            && let Some(r) = Self::undyn(v.clone(), ty, false)
+        {
+            return Ok(r.e);
+        }
         if ty == Ty::Float && v.ty == Ty::Int {
             return Ok(Expr::call(Builtin::ToFloat, vec![v.e]));
         }
@@ -2717,6 +4563,505 @@ impl L<'_, '_> {
             span,
             format!("a {} value where {ty} is expected", v.ty),
         )
+    }
+}
+
+/// Members every JavaScript object inherits: reading one of a parsed
+/// object gives a function where MariaDB finds no member.
+const PROTO_NAMES: &[&str] = &[
+    "constructor",
+    "__proto__",
+    "hasOwnProperty",
+    "isPrototypeOf",
+    "propertyIsEnumerable",
+    "toLocaleString",
+    "toString",
+    "valueOf",
+    "__defineGetter__",
+    "__defineSetter__",
+    "__lookupGetter__",
+    "__lookupSetter__",
+];
+
+/// Triggers on streams and queues: `ctx.record`, `ctx.message`,
+/// `JSON.parse` and parsed values. A parsed value is JSON text (its JSON
+/// `null` the text `null`, `undefined` a `NULL`); wherever JavaScript's
+/// meaning depends on a kind the code can't know until it runs, the
+/// generated code checks the kind and, when it isn't the one compiled
+/// for, raises 39876 so the record runs again in the engine tier.
+impl L<'_, '_> {
+    /// Whether `e` is `ctx.record` or `ctx.message` (or a name given to
+    /// it).
+    fn event_of(&self, e: &Expression<'_>) -> bool {
+        let Some(on) = self.msg else {
+            return false;
+        };
+        match strip_parens(e) {
+            Expression::Identifier(id) => {
+                matches!(self.lookup(id.name.as_str()), Some(Var::Event))
+            }
+            Expression::StaticMemberExpression(m) if !m.optional => {
+                m.property.name.as_str() == on.member()
+                    && matches!(strip_parens(&m.object), Expression::Identifier(id)
+                        if matches!(self.lookup(id.name.as_str()), Some(Var::Msg)))
+            }
+            _ => false,
+        }
+    }
+
+    /// Field `name` of `ctx.record` or `ctx.message`: its parameter.
+    fn msg_field(&mut self, name: &str, span: Span) -> R<V> {
+        let Some(on) = self.msg else {
+            return self.stop("js.member", span, format!("reading .{name} here"));
+        };
+        let Some((n, ty, nn)) = on.fields().iter().find(|(n, _, _)| *n == name).copied() else {
+            return self.stop(
+                "js.member",
+                span,
+                format!("ctx.{} has no field {name}", on.member()),
+            );
+        };
+        let i = self.param_named(n, ty);
+        if ty == Ty::Json {
+            self.dyn_params.insert(i);
+        }
+        Ok(V {
+            e: Expr::Param(i),
+            ty,
+            nn: nn || self.facts.contains(&Key::P(i)),
+        })
+    }
+
+    fn dyn_expr(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Builtin(Builtin::JsonParse | Builtin::JsonGet, _) => true,
+            Expr::Local(l) => self.dyn_locals.contains(l),
+            Expr::Param(i) => self.dyn_params.contains(i),
+            Expr::Cond(_, a, b) => self.dyn_expr(a) && self.dyn_expr(b),
+            _ => false,
+        }
+    }
+
+    /// Whether `v` is a parsed JSON value.
+    fn is_dyn(&self, v: &V) -> bool {
+        v.ty == Ty::Json && self.dyn_expr(&v.e)
+    }
+
+    /// `v.prop` (`v?.prop` with `optional`) of a parsed value.
+    fn json_member(&mut self, v: V, prop: &str, optional: bool, span: Span) -> R<V> {
+        if prop == "length" {
+            if optional {
+                return self.stop("js.optional_chain", span, "?.length");
+            }
+            return Ok(V {
+                e: Expr::call(Builtin::JsonLen, vec![v.e]),
+                ty: Ty::Int,
+                nn: true,
+            });
+        }
+        if PROTO_NAMES.contains(&prop) {
+            return self.stop(
+                "js.member",
+                span,
+                format!("reading .{prop} of a parsed JSON value gives JavaScript's own member"),
+            );
+        }
+        Ok(V {
+            e: Expr::call(
+                Builtin::JsonGet,
+                vec![
+                    v.e,
+                    Expr::Lit(Literal::Str(prop.to_owned())),
+                    Expr::bool(optional),
+                ],
+            ),
+            ty: Ty::Json,
+            nn: false,
+        })
+    }
+
+    /// `obj[expr]`: `ctx.record['key']`, or a member or element of a
+    /// parsed value.
+    fn computed_member(&mut self, m: &oxc_ast::ast::ComputedMemberExpression<'_>) -> R<V> {
+        if !m.optional
+            && self.event_of(&m.object)
+            && let Expression::StringLiteral(k) = strip_parens(&m.expression)
+        {
+            return self.msg_field(k.value.as_str(), m.span);
+        }
+        let v = self.val(&m.object)?;
+        if !self.is_dyn(&v) {
+            return self.stop("js.member", m.span, "a computed member");
+        }
+        if let Expression::StringLiteral(k) = strip_parens(&m.expression) {
+            return self.json_member(v, k.value.as_str(), m.optional, m.span);
+        }
+        let mark = self.pre.len();
+        let i = self.val(&m.expression)?;
+        let v = self.settle(v, mark);
+        if i.ty != Ty::Int {
+            return self.stop(
+                "js.member",
+                m.span,
+                "an index that isn't a whole number or a literal name",
+            );
+        }
+        Ok(V {
+            e: Expr::call(Builtin::JsonGet, vec![v.e, i.e, Expr::bool(m.optional)]),
+            ty: Ty::Json,
+            nn: false,
+        })
+    }
+
+    /// A parsed value read as `ty` (numbers as doubles, or `Int` for an
+    /// `Int` local): any other kind runs the record in the engine tier;
+    /// with `nullable`, `null` and `undefined` are `NULL`.
+    fn undyn(v: V, ty: Ty, nullable: bool) -> Option<V> {
+        let (b, t) = match ty {
+            Ty::Str => (Builtin::JsonAsStr, Ty::Str),
+            Ty::Float => (Builtin::JsonAsNum, Ty::Float),
+            Ty::Int => (Builtin::JsonAsInt, Ty::Int),
+            Ty::Bool => (Builtin::JsonAsBool, Ty::Bool),
+            Ty::Json | Ty::Null => return None,
+        };
+        Some(V {
+            e: Expr::call(b, vec![v.e, Expr::bool(nullable)]),
+            ty: t,
+            nn: !nullable,
+        })
+    }
+
+    /// The other side of a comparison with a parsed value, as the type
+    /// the parsed value is read as: numbers as doubles.
+    fn read_as(t: Ty) -> Ty {
+        if t == Ty::Int { Ty::Float } else { t }
+    }
+
+    /// `d === o`, `d == o` (and negated by the caller) where `d` is parsed
+    /// and `o` isn't.
+    fn dyn_equals(&mut self, d: V, o: V, strict: bool, span: Span) -> R<Expr> {
+        if !o.nn {
+            return self.stop(
+                "js.dynamic_types",
+                span,
+                "comparing a parsed JSON value with a value that may be null",
+            );
+        }
+        let ty = Self::read_as(o.ty);
+        let kind = match ty {
+            Ty::Str => "string",
+            Ty::Float => "number",
+            Ty::Bool => "boolean",
+            _ => {
+                return self.stop(
+                    "js.dynamic_types",
+                    span,
+                    "comparing a parsed JSON value with this value",
+                );
+            }
+        };
+        let o_e = if o.ty == Ty::Int {
+            Expr::call(Builtin::ToFloat, vec![o.e])
+        } else {
+            o.e
+        };
+        // `==` converts across kinds in JavaScript: any other kind runs
+        // the record in the engine tier.
+        let Some(read) = Self::undyn(d.clone(), ty, strict) else {
+            return self.stop("js.dynamic_types", span, "this comparison");
+        };
+        let eq = Expr::bin(BinOp::Eq, read.e, o_e);
+        if !strict {
+            return Ok(eq);
+        }
+        // Another kind is never equal.
+        Ok(Expr::Cond(
+            Box::new(Expr::call(
+                Builtin::JsonKind,
+                vec![d.e, Expr::Lit(Literal::Str(kind.to_owned()))],
+            )),
+            Box::new(eq),
+            Box::new(Expr::bool(false)),
+        ))
+    }
+
+    /// `x === null`, `x === undefined`, `x == null` (and their negations)
+    /// of a parsed value; `typeof x === 'kind'`; `None` otherwise (nothing
+    /// lowered).
+    fn dyn_test(&mut self, b: &oxc_ast::ast::BinaryExpression<'_>) -> R<Option<V>> {
+        use BinaryOperator as B;
+        if self.msg.is_none() {
+            return Ok(None);
+        }
+        let (negate, strict) = match b.operator {
+            B::StrictEquality => (false, true),
+            B::StrictInequality => (true, true),
+            B::Equality => (false, false),
+            B::Inequality => (true, false),
+            _ => return Ok(None),
+        };
+        let undefined = |x: &Expression<'_>| {
+            matches!(strip_parens(x), Expression::Identifier(u)
+                if u.name.as_str() == "undefined" && self.lookup("undefined").is_none())
+        };
+        let null = |x: &Expression<'_>| matches!(strip_parens(x), Expression::NullLiteral(_));
+        let wrap = |e: Expr| {
+            let e = if negate {
+                Expr::Unary(UnOp::Not, Box::new(e))
+            } else {
+                e
+            };
+            V {
+                e,
+                ty: Ty::Bool,
+                nn: true,
+            }
+        };
+        let kind = |e: &Expr, k: &str| {
+            Expr::call(
+                Builtin::JsonKind,
+                vec![e.clone(), Expr::Lit(Literal::Str(k.to_owned()))],
+            )
+        };
+        // `typeof x === 'kind'`.
+        for (t, lit) in [(&b.left, &b.right), (&b.right, &b.left)] {
+            if let Expression::UnaryExpression(u) = strip_parens(t)
+                && u.operator == UnaryOperator::Typeof
+                && let Expression::StringLiteral(k) = strip_parens(lit)
+            {
+                let v = self.val(&u.argument)?;
+                if !self.is_dyn(&v) {
+                    return self.stop(
+                        "js.operator",
+                        u.span,
+                        "typeof of a value that isn't parsed JSON",
+                    );
+                }
+                let e = match k.value.as_str() {
+                    "object" => Expr::Binary(
+                        BinOp::Or,
+                        Box::new(Expr::Binary(
+                            BinOp::Or,
+                            Box::new(kind(&v.e, "object")),
+                            Box::new(kind(&v.e, "array")),
+                        )),
+                        Box::new(kind(&v.e, "null")),
+                    ),
+                    k @ ("string" | "number" | "boolean" | "undefined") => kind(&v.e, k),
+                    _ => Expr::bool(false),
+                };
+                return Ok(Some(wrap(e)));
+            }
+        }
+        // `x === null` and the like.
+        for (x, lit, left) in [(&b.left, &b.right, true), (&b.right, &b.left, false)] {
+            let (is_null, is_undef) = (null(lit), undefined(lit));
+            if !is_null && !is_undef {
+                continue;
+            }
+            if null(x) || undefined(x) {
+                return Ok(None);
+            }
+            let v = self.val(x)?;
+            if !self.is_dyn(&v) {
+                // Not parsed: the ordinary comparison with null.
+                let n = V::null();
+                let (l, r) = if left { (v, n) } else { (n, v) };
+                return self.binary(b.operator, l, r, b.span).map(Some);
+            }
+            let e = if !strict {
+                Expr::Binary(
+                    BinOp::Or,
+                    Box::new(kind(&v.e, "null")),
+                    Box::new(kind(&v.e, "undefined")),
+                )
+            } else if is_null {
+                kind(&v.e, "null")
+            } else {
+                kind(&v.e, "undefined")
+            };
+            return Ok(Some(wrap(e)));
+        }
+        Ok(None)
+    }
+
+    /// `JSON.parse(text)`, `Number(x)` and `Array.isArray(x)` of parsed
+    /// JSON; `None` for any other call.
+    fn json_call(
+        &mut self,
+        c: &oxc_ast::ast::CallExpression<'_>,
+        args: &[&Expression<'_>],
+    ) -> R<Option<V>> {
+        let global = |s: &Self, n: &str| s.lookup(n).is_none();
+        let path = self.callee_path(&c.callee);
+        let name = match strip_parens(&c.callee) {
+            Expression::Identifier(id) if global(self, id.name.as_str()) => Some(id.name.as_str()),
+            _ => None,
+        };
+        if path.as_deref() == Some(&["JSON", "parse"]) {
+            if self.msg.is_none() {
+                return self.stop(
+                    "js.json_parse",
+                    c.span,
+                    "JSON.parse compiles only in triggers on streams and queues, which can run \
+                     a record again in the engine tier",
+                );
+            }
+            let [x] = args else {
+                return self.stop("js.json_parse", c.span, "JSON.parse with a reviver");
+            };
+            let v = self.val(x)?;
+            let text = if self.is_dyn(&v) {
+                Self::undyn(v, Ty::Str, false).map_or(Expr::Lit(Literal::Null), |v| v.e)
+            } else {
+                match v.ty {
+                    Ty::Str | Ty::Null => v.e,
+                    _ => {
+                        return self.stop(
+                            "js.json_parse",
+                            x.span(),
+                            "JSON.parse of a value that isn't text",
+                        );
+                    }
+                }
+            };
+            return Ok(Some(V {
+                e: Expr::call(Builtin::JsonParse, vec![text]),
+                ty: Ty::Json,
+                nn: true,
+            }));
+        }
+        if path.as_deref() == Some(&["Array", "isArray"]) && global(self, "Array") {
+            let [x] = args else {
+                return self.stop("js.call", c.span, "the number of arguments");
+            };
+            let v = self.val(x)?;
+            if !self.is_dyn(&v) {
+                return self.stop(
+                    "js.call",
+                    c.span,
+                    "Array.isArray of a value that isn't parsed JSON",
+                );
+            }
+            return Ok(Some(V {
+                e: Expr::call(
+                    Builtin::JsonKind,
+                    vec![v.e, Expr::Lit(Literal::Str("array".to_owned()))],
+                ),
+                ty: Ty::Bool,
+                nn: true,
+            }));
+        }
+        if name == Some("Number") {
+            let [x] = args else {
+                return self.stop("js.call", c.span, "the number of arguments");
+            };
+            let v = self.val(x)?;
+            if self.is_dyn(&v) || v.ty.is_number() {
+                return self.num(v, x.span()).map(Some);
+            }
+            return self.stop("js.call", c.span, "Number() of a value that isn't a number");
+        }
+        Ok(None)
+    }
+
+    /// `x ?? y`, `x || y`, `x && y` where `x` (`xd`) or `y` (`yd`) is
+    /// parsed JSON: the parsed side is read as the other side's type, or
+    /// both stay parsed (`||` and `&&` only).
+    fn dyn_logical(
+        &mut self,
+        op: LogicalOperator,
+        x: V,
+        y: V,
+        xd: bool,
+        yd: bool,
+        span: Span,
+    ) -> R<V> {
+        let typed = |s: &mut Self, d: V, ty: Ty, nullable: bool| -> R<V> {
+            match Self::undyn(d, ty, nullable) {
+                Some(v) => Ok(v),
+                None => s.stop(
+                    "js.dynamic_types",
+                    span,
+                    "a parsed JSON value with a value of no kind it can be read as",
+                ),
+            }
+        };
+        if op == LogicalOperator::Coalesce {
+            if xd && yd {
+                return self.stop("js.dynamic_types", span, "?? of two parsed JSON values");
+            }
+            let ty = Self::read_as(if xd { y.ty } else { x.ty });
+            let nn = xd && y.nn;
+            let (a, b) = if xd {
+                let a = typed(self, x, ty, true)?;
+                (a.e, self.coerce(y, ty, span)?)
+            } else {
+                let b = typed(self, y, ty, true)?;
+                (self.coerce(x, ty, span)?, b.e)
+            };
+            return Ok(V {
+                e: Expr::bin(BinOp::Coalesce, a, b),
+                ty,
+                nn,
+            });
+        }
+        let t = self.truthy(x.clone(), span)?;
+        let (a, b, ty) = if xd && yd {
+            (x.e, y.e, Ty::Json)
+        } else if xd {
+            let ty = Self::read_as(y.ty);
+            let a = typed(self, x, ty, false)?;
+            (a.e, self.coerce(y, ty, span)?, ty)
+        } else {
+            let ty = Self::read_as(x.ty);
+            let b = typed(self, y, ty, false)?;
+            (self.coerce(x, ty, span)?, b.e, ty)
+        };
+        let e = if op == LogicalOperator::Or {
+            Expr::Cond(Box::new(t), Box::new(a), Box::new(b))
+        } else {
+            Expr::Cond(Box::new(t), Box::new(b), Box::new(a))
+        };
+        Ok(V { e, ty, nn: false })
+    }
+
+    /// One `console.log` or `ctx.log` line: the arguments' text, joined
+    /// by spaces (QuickJS's formatting for text, numbers, booleans and
+    /// `null`).
+    fn log_line(&mut self, c: &oxc_ast::ast::CallExpression<'_>) -> R<Expr> {
+        let mut parts: Vec<(Expr, usize)> = Vec::new();
+        for a in &c.arguments {
+            let Some(x) = a.as_expression() else {
+                return self.stop("js.spread", c.span, "spread arguments");
+            };
+            let v = self.val(x)?;
+            if v.ty == Ty::Json && !self.is_dyn(&v) {
+                return self.stop(
+                    "js.log",
+                    x.span(),
+                    "logging an object: QuickJS writes its JSON",
+                );
+            }
+            let t = self.text_of(v, x.span())?;
+            parts.push((t, self.pre.len()));
+        }
+        for i in (0..parts.len()).rev() {
+            let (e, mark) = parts[i].clone();
+            parts[i].0 = self.settle_e(e, mark);
+        }
+        let mut acc: Option<Expr> = None;
+        for (t, _) in parts {
+            acc = Some(match acc {
+                None => t,
+                Some(p) => Expr::bin(
+                    BinOp::Concat,
+                    Expr::bin(BinOp::Concat, p, Expr::Lit(Literal::Str(" ".to_owned()))),
+                    t,
+                ),
+            });
+        }
+        Ok(acc.unwrap_or(Expr::Lit(Literal::Str(String::new()))))
     }
 }
 

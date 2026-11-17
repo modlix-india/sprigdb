@@ -15,13 +15,13 @@
 //!     copy tables too) → an event of the object, as from above
 //!   a change of a tenant edge's source or copy (a parent tenant's root or
 //!     copy row, the tenant's own edge copy): the edges' copies' handovers
-//!     decide whether this change or the copy's sends it (decision RL71,
-//!     `sprig_inherit::handover`), read after the batch arrived; held while
+//!     decide whether this change or the copy's sends it
+//!     (`sprig_inherit::handover`), read after the batch arrived; held while
 //!     an edge's first seed runs
 //!   any other change the subscriber's view doesn't read now (a space
 //!     above a serving copy inside the tenant, a copy of a share inside it
 //!     being seeded) → nothing: the change that reaches its view comes as
-//!     its own event (decision RL69)
+//!     its own event
 //!   read the record in s now, through the subscriber's session (its space,
 //!     privileges and row-level security; path columns hidden), with
 //!     SPRIG_ORIGIN()
@@ -33,7 +33,7 @@
 //!     else                                            → update (after: the
 //!                                                       merged record)
 //!   absent: the record was visible to the subscriber just before the
-//!     change → delete; else nothing (decision RL64)
+//!     change → delete; else nothing
 //! ```
 //!
 //! "Visible before" is what the stream last knew of the key ([`Seen`]:
@@ -52,6 +52,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::{Freshness, TenantCatalog};
 use sprig_common::Result;
 use sprig_common::ids::{ObjectId, TenantId};
@@ -78,18 +79,18 @@ pub(super) struct Mapped {
     pub space: Option<SpaceId>,
     /// A copy row's `_sprig_share`.
     pub share: Option<Value>,
-    /// Where the changed row is, for the copies' handover (RL71).
+    /// Where the changed row is, for the copies' handover.
     pub origin: Origin,
     /// The change's GTID: domain, server, sequence number.
     pub gtid: Gtid,
 }
 
 /// Where an inheritable object's changed row is, for the handover of the
-/// copies on the tenant edges (RL71).
+/// copies on the tenant edges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Origin {
     /// A layer row of a space of the subscriber's tenant, or a copy of a
-    /// share inside it: decided by what the view reads now (RL69).
+    /// share inside it: decided by what the view reads now.
     Inside,
     /// The subscriber's tenant's copy of its tenant edge.
     OwnCopy,
@@ -268,8 +269,8 @@ impl Mapper {
     }
 
     /// A parent tenant's event: its root space's layer rows of a table this
-    /// tenant inherits, and the rows of its copy of its own tenant edge
-    /// (RL71), renamed to the table.
+    /// tenant inherits, and the rows of its copy of its own tenant edge,
+    /// renamed to the table.
     #[allow(clippy::wrong_self_convention)] // "from" the parent tenants
     fn from_above(&self, st: &InheritState, e: &mut ChangeEvent) -> Class {
         if matches!(e.op, Op::Ddl(_) | Op::Truncate) {
@@ -347,7 +348,7 @@ impl Mapper {
     }
 
     /// The copies' handovers on the tenant edges into the line's tenants
-    /// for `db`.`table` (RL71), by place in the line: `None` for an edge
+    /// for `db`.`table`, by place in the line: `None` for an edge
     /// without a materialized copy, or whose copy has no state yet (a seed
     /// that hasn't begun reads later than any change the stream has).
     /// Read now, after the batch's changes arrived.
@@ -383,7 +384,7 @@ impl Mapper {
             let read = async {
                 let cluster = svc.locator.cluster(child.tenant).await?;
                 let pool = svc.locator.ctl_pool(&cluster).await?;
-                let mut conn = pool.get_conn().await.map_err(|e| {
+                let mut conn = pool.get_conn_bounded().await.map_err(|e| {
                     sprig_common::SprigError::new(
                         sprig_common::SprigCode::BackendUnavailable,
                         e.to_string(),
@@ -401,7 +402,8 @@ impl Mapper {
                         .map(|(_, info)| info.handover);
                 }
                 Err(e) => {
-                    // Unknown: the line's verdicts fall back to RL69.
+                    // Unknown: the line's verdicts fall back to what the
+                    // view reads now.
                     tracing::warn!(tenant = %child.tenant, error = %e, "a copy's handover wasn't read for a change stream");
                     out[k] = Some(Handover::At {
                         source: String::new(),
@@ -413,8 +415,9 @@ impl Mapper {
         out
     }
 
-    /// Whether `m`'s change counts (RL71), given [`Self::handovers`] of its
-    /// table; `None` for a change inside the tenant (RL69 decides).
+    /// Whether `m`'s change counts, given [`Self::handovers`] of its table;
+    /// `None` for a change inside the tenant (what the view reads now
+    /// decides).
     pub(super) fn verdict(&self, m: &Mapped, edges: &[Option<Handover>]) -> Option<Verdict> {
         let n = self.line.len() - 1;
         let at = |k: usize| edges.get(k).and_then(Option::as_ref);
@@ -570,7 +573,10 @@ pub(super) async fn read(
             multi: false,
         };
         let c = caller.clone();
-        let task = tokio::spawn(async move { engine.run(&c, call, None, tx).await });
+        let space = crate::http::sql::call_space();
+        let task = tokio::spawn(crate::http::sql::SPACE.scope(space, async move {
+            engine.run(&c, call, None, tx).await;
+        }));
         let resp = collect(rx, 64 << 20, None).await;
         let _ = task.await;
         let resp = resp?;
@@ -709,7 +715,7 @@ pub(super) fn decide(
 /// the keys it forgot).
 const SEEN_MAX: usize = 100_000;
 
-/// What the stream last knew of each key's visibility (RL64): set from the
+/// What the stream last knew of each key's visibility: set from the
 /// record read after each of the key's events, cleared when the tenant's
 /// catalog version moves (a policy or grant may have changed what the
 /// subscriber sees).
@@ -788,7 +794,10 @@ pub(super) async fn probe(
         multi: false,
     };
     let c = caller.clone();
-    let task = tokio::spawn(async move { engine.run(&c, call, None, tx).await });
+    let space = crate::http::sql::call_space();
+    let task = tokio::spawn(crate::http::sql::SPACE.scope(space, async move {
+        engine.run(&c, call, None, tx).await;
+    }));
     let resp = collect(rx, 64 << 20, None).await;
     let _ = task.await;
     let resp = resp?;
@@ -876,7 +885,7 @@ pub(super) async fn ancestor_tails(
             Arc::clone(names),
             TailOptions {
                 progress_every: std::time::Duration::from_millis(500),
-                // The parents' copies of their own tenant edges (RL71).
+                // The parents' copies of their own tenant edges.
                 keep_internal: vec!["__sprig_ih_".to_owned()],
                 ..TailOptions::default()
             },

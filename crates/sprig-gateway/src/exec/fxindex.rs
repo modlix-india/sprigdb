@@ -8,6 +8,9 @@
 //! through the session and rewrites the statement with them
 //! (`fxindex::rewrite_with`). Django creates functional unique
 //! constraints this way (`CREATE UNIQUE INDEX u ON t ((LOWER(name)), rank)`).
+//! An `ALTER TABLE ... ADD INDEX ((e))` without a name also reads the
+//! table's index names, so the index gets the name MySQL would give it
+//! (`functional_index`, or the first free `functional_index_<n>`).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -38,7 +41,10 @@ impl PassSession {
                 .await
                 .unwrap_or(None));
         }
-        let Some(table) = fxindex::needs_types(text, &lex) else {
+        // An unnamed functional index added to a table gets the first
+        // name MySQL would give it that the table doesn't use.
+        let unnamed = fxindex::unnamed_alter_table(text, &lex);
+        let Some(table) = fxindex::needs_types(text, &lex).or_else(|| unnamed.clone()) else {
             return Ok(None);
         };
         let Some((schema, name)) = self.table_literals(&table) else {
@@ -61,7 +67,24 @@ impl PassSession {
                 ))
             })
             .collect();
-        Ok(fxindex::rewrite_with(text, &lex, &known).map(Bytes::from))
+        let mut existing: Vec<String> = Vec::new();
+        if unnamed.is_some() {
+            let q = format!(
+                "SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS \
+                 WHERE TABLE_SCHEMA = {schema} AND TABLE_NAME = {name}"
+            );
+            let got = self.run_checked(cx, &q, false).await?;
+            existing = got
+                .rows
+                .iter()
+                .filter_map(|r| {
+                    r.first()?
+                        .as_deref()
+                        .map(|n| String::from_utf8_lossy(n).into_owned())
+                })
+                .collect();
+        }
+        Ok(fxindex::rewrite_named(text, &lex, &known, &existing).map(Bytes::from))
     }
 
     /// The table `table` (as written, perhaps qualified) as two SQL

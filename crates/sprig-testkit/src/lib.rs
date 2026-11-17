@@ -1,9 +1,8 @@
 //! `sprig-testkit`: the test harness, deterministic simulation, differential testing and Compose fixtures.
 //!
-//! Layer: dev only. Design: [chapter 46](https://github.com/serialcoder13/sprigdb-plan/blob/main/lld/chapters/46-testing.md) (Testing) of the SprigDB low-level design, with the Compose
-//! setup from chapter 27 ("Development setup").
+//! Layer: dev only.
 //!
-//! Build steps 1 to 3 of chapter 46:
+//! Modules:
 //!
 //! - [`env`](mod@env): [`Env`], a description of a test environment (data centers,
 //!   MariaDB clusters with their topology and endpoints, etcd tiers), read
@@ -20,11 +19,11 @@
 //! - [`faults`]: the [`faults::Faults`] trait, toxiproxy and `faultd` for
 //!   Compose, throwaway `sprig-sim-*` containers, operation histories and
 //!   `elle-cli`;
-//! - [`fleet`]: the fleet simulator of chapter 11 (placement and
+//! - [`fleet`]: the fleet simulator (placement and
 //!   rebalancing over months of synthetic load, with a fake mover).
 //!
-//! Differential testing and the other suites of chapter 46 come in its
-//! later build steps.
+//! The differential suites live with the crates they test (for example
+//! `sprig-router`'s `differential_live`).
 //!
 //! # Using it from another crate
 //!

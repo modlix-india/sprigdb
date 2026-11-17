@@ -105,6 +105,8 @@ pub struct Env {
     /// `FCALL` of logic-layer functions; unset, only Lua
     /// library functions are found.
     logic: OnceLock<Arc<dyn crate::logic::LogicCalls>>,
+    /// `FT.*` on search indexes; unset, they aren't available.
+    search: OnceLock<Arc<dyn crate::search::SearchCalls>>,
     /// `CONFIG SET notify-keyspace-events` per tenant on this gateway,
     /// over [`Config::notify_keyspace_events`].
     keyspace: Mutex<std::collections::HashMap<String, String>>,
@@ -136,6 +138,7 @@ impl Env {
             scripts: crate::lua::Running::default(),
             mesh: OnceLock::new(),
             logic: OnceLock::new(),
+            search: OnceLock::new(),
             keyspace: Mutex::new(std::collections::HashMap::new()),
             key_filter: OnceLock::new(),
             keyspace_feed: OnceLock::new(),
@@ -190,6 +193,17 @@ impl Env {
     /// Installs the logic layer's `FCALL` hook (the gateway does, once).
     pub fn set_logic(&self, l: Arc<dyn crate::logic::LogicCalls>) {
         let _ = self.logic.set(l);
+    }
+
+    /// Installs the `FT.*` hook.
+    pub fn set_search(&self, s: Arc<dyn crate::search::SearchCalls>) {
+        let _ = self.search.set(s);
+    }
+
+    /// The `FT.*` hook, when installed.
+    #[must_use]
+    pub fn search(&self) -> Option<&Arc<dyn crate::search::SearchCalls>> {
+        self.search.get()
     }
 
     /// The logic layer's `FCALL` hook, when installed.

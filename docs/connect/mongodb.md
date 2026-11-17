@@ -142,7 +142,8 @@ URL-encode the password if it contains `@`, `:`, `/` or `%`.
 | SCRAM-SHA-256 | yes | Including speculative authentication in `hello` and `saslSupportedMechs` |
 | SCRAM-SHA-1 | no | It needs a verifier format SprigDB doesn't store |
 | MONGODB-X509 | no | A client certificate can be required in addition to SCRAM; see below |
-| PLAIN (LDAP), GSSAPI, MONGODB-AWS, MONGODB-OIDC | no | |
+| MONGODB-OIDC | yes | A token from an identity provider the tenant registered; the human flow and, on a tenant endpoint, the machine flow. See [Logins with identity provider tokens](../security/external-tokens.md#mongodb) |
+| PLAIN (LDAP), GSSAPI, MONGODB-AWS | no | |
 
 A login that fails for any reason answers 18 `AuthenticationFailed`, "Authentication failed.". A second `saslStart` on a connection that is already logged in answers 20 `IllegalOperation`. Commands other than the handshake and `saslStart` before a login answer 13 `Unauthorized`, "Command ... requires authentication".
 
@@ -224,6 +225,8 @@ Blocking stages and sorts may use `doc.agg_stage_memory_bytes` and `doc.max_sort
 
 `$where`, `$function` and `$accumulator` run JavaScript in a sandbox while `mongo.server_js` is on (the default).
 
+SprigDB's own AI operators, `$aiEmbed`, `$aiClassify`, `$aiExtract`, `$aiSummarize` and `$aiComplete`, embed, classify, extract from, summarize or complete text inside a pipeline, once a tenant administrator turns on `ai.functions.enabled`. See [Documents](../data-models/documents.md#ai-operators).
+
 ### Indexes
 
 | Index | Support |
@@ -236,7 +239,9 @@ Blocking stages and sorts may use `doc.agg_stage_memory_bytes` and `doc.max_sort
 | Vector search indexes | yes, with `createSearchIndexes` |
 | Multikey (indexing array elements) | no; queries on array fields are checked in the gateway |
 | Wildcard (`$**`), `2d`, `geoHaystack` | no |
-| `sparse`, `partialFilterExpression`, `collation`, `hidden` | kept and listed, but the index holds every document |
+| `sparse`, `partialFilterExpression` | yes on unique indexes: uniqueness covers only the documents the index includes; on other indexes kept and listed, and the index holds every document |
+| `hidden` | yes through `collMod`; kept and listed from `createIndexes` |
+| `collation` | yes; an index without one takes the collection's default |
 | TTL (`expireAfterSeconds`) | yes: expired documents are deleted in the background; see [Documents](../data-models/documents.md#ttl-indexes) |
 
 SprigDB also creates indexes on its own from your queries; `listIndexes` hides those unless you pass `showAutoIndexes: true`. See [Automatic indexing](../performance/automatic-indexing.md).
@@ -247,18 +252,16 @@ Multi-document transactions work through the drivers' session API, across collec
 
 ### Change streams
 
-`watch()` on a collection, a database or the whole deployment works, with `fullDocument`, `fullDocumentBeforeChange`, `resumeAfter`, `startAfter` and `showExpandedEvents`. `startAtOperationTime` isn't supported (39662). A stream needs `find` and `changeStream` on what it watches: in SprigDB's terms `SELECT` and `WATCH`. The built-in `read` and `readWrite` roles include both; see [Grants and roles](../security/grants-and-roles.md#change-streams-need-watch). See [Documents](../data-models/documents.md#change-streams).
+`watch()` on a collection, a database or the whole deployment works, with `fullDocument`, `fullDocumentBeforeChange`, `resumeAfter`, `startAfter`, `startAtOperationTime` and `showExpandedEvents`. `startAtOperationTime` leaves out events stamped before the time; a time older than the feed's time index reaches back, or than the tenant's last move to another cluster, fails with 286 `ChangeStreamHistoryLost`, labelled `NonResumableChangeStreamError` (see [Change feed](../concepts/change-feed.md#starting-at-a-point-in-time)). A stream at a gateway outside the tenant's home data centre is relayed from there, with the same events and resume tokens (see [Change feed](../concepts/change-feed.md#from-another-data-centre)). A stream needs `find` and `changeStream` on what it watches: in SprigDB's terms `SELECT` and `WATCH`. The built-in `read` and `readWrite` roles include both; see [Grants and roles](../security/grants-and-roles.md#change-streams-need-watch). See [Documents](../data-models/documents.md#change-streams).
 
 ## Not supported
 
 | Feature | What happens |
 |---|---|
-| SCRAM-SHA-1, MONGODB-X509, LDAP, Kerberos, AWS and OIDC logins | Authentication fails |
+| SCRAM-SHA-1, MONGODB-X509, LDAP, Kerberos and AWS logins | Authentication fails |
 | Views, time-series collections, clustered collections, Queryable Encryption | 39662 `SprigDocFeatureUnsupported` |
 | `mapReduce`, `eval`, the `geoNear` command | 115 `CommandNotSupported` |
-| Multikey, wildcard and `2d` indexes; sparse and partial semantics | See [Indexes](#indexes) |
-| A collection's default collation | Collation per command works |
-| `startAtOperationTime` in change streams | 39662 |
+| Multikey, wildcard and `2d` indexes; sparse and partial semantics on non-unique indexes | See [Indexes](#indexes) |
 | Replica-set commands and topology | SprigDB presents a `mongos` |
 
 ## Tested clients
@@ -278,7 +281,7 @@ MongoDB clients receive MongoDB's codes and `codeName`s, and SprigDB's own error
 | Code | `codeName` | When |
 |---|---|---|
 | 13 | `Unauthorized` | A command before logging in, or your grants don't cover the collection; a change stream on a collection without `WATCH` |
-| 18 | `AuthenticationFailed` | Wrong credentials, unknown tenant, a missing or wrong client certificate for the account, or any other refused login |
+| 18 | `AuthenticationFailed` | Wrong credentials, unknown tenant, a missing or wrong client certificate for the account, a refused `MONGODB-OIDC` token (the reason is in the audit log), or any other refused login |
 | 43 | `CursorNotFound` | The cursor idled past `mongo.cursor_timeout_ms`, was killed, or was opened on another gateway |
 | 59 | `CommandNotFound` | A command SprigDB doesn't have |
 | 115 | `CommandNotSupported` | `mapReduce`, `eval`, `geoNear` |

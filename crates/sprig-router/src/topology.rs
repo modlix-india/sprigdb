@@ -190,6 +190,27 @@ pub struct TableEntry {
     /// How each primary-key column's values read back
     /// ([`crate::fk::ValClass`]), matching `primary`.
     pub primary_classes: Vec<crate::fk::ValClass>,
+    /// Parent members that follow this table by a one-column foreign key
+    /// whose orphanage is present: an insert here takes their rows waiting
+    /// for the new parent rows to the parents' shards.
+    pub orphan_children: Vec<OrphanChild>,
+}
+
+/// A parent member whose rows may wait for their parent
+/// ([`TableEntry::orphan_children`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanChild {
+    /// The child table, lowercase.
+    pub table: String,
+    /// Its foreign-key column.
+    pub column: String,
+    /// The parent's referenced column.
+    pub parent_column: String,
+    /// The child's visible columns, in order (what moves with a row).
+    pub columns: Vec<String>,
+    /// The parent's referenced column holds a unique key: a join on it
+    /// pairs each waiting row with one parent row.
+    pub parent_unique: bool,
 }
 
 /// A sharded table's `AUTO_INCREMENT` column:
@@ -210,6 +231,7 @@ pub struct AutoInc {
 /// member of the same group and database, whose row holds the routing
 /// hash.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent facts about one key
 pub struct ParentLink {
     /// The constraint's name.
     pub fk: String,
@@ -234,6 +256,16 @@ pub struct ParentLink {
     /// on the foreign key pairs each row with its own parent: such a join
     /// is co-located (`colocation_safe`, through a parent chain).
     pub parent_unique: bool,
+    /// The key's `foreign_keys` row says `orphanage = 'present'`: rows
+    /// written without their parent (`foreign_key_checks = 0`) may wait on
+    /// the shard holding routing hash 0, and a parent's insert takes its
+    /// waiting children to its own shard.
+    pub orphans: bool,
+    /// Rows may wait for their parent at all: a one-column key to a parent
+    /// keyed by a column of its own (whose inserts adopt them), and no
+    /// parent member following this table (its rows would be left
+    /// behind when theirs move).
+    pub orphanable: bool,
 }
 
 /// A lookup index of a sharded table, as the router
@@ -275,10 +307,11 @@ impl Eq for LookupRef {}
 
 impl LookupRef {
     /// Whether reads may route through it (`public`; a `write_only` or
-    /// `backfilling` index is maintained but not complete).
+    /// `backfilling` index is maintained but not complete, and one whose
+    /// owner was just re-keyed may name owners by old hashes).
     #[must_use]
     pub fn routes(&self) -> bool {
-        self.index.state == sprig_shard::lookup::LookupState::Public
+        self.index.state == sprig_shard::lookup::LookupState::Public && !self.index.rehashing
     }
 
     /// The class of key part `i` of the lookup's value or the owner's
@@ -631,6 +664,7 @@ impl TenantFile {
                     fill_rk: false,
                     parent: None,
                     auto_inc: None,
+                    orphan_children: Vec::new(),
                 },
             );
         }

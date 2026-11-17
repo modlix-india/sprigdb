@@ -10,12 +10,14 @@
 )]
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use sprig_common::ids::{ClusterId, DbId, GroupId, ShardId, TenantId};
 use sprig_txn::{
     BeginOptions, BranchConn, ClusterAdmin, ClusterCaps, Ctl, DbError, DbResult, Decision,
-    DecisionRow, Dtid, DtidGen, Intent, NonXaPolicy, ShardRef, TxnBackend, TxnConfig,
+    DecisionRow, Dtid, DtidGen, Intent, Interrupted, NonXaPolicy, ShardRef, TxnBackend, TxnConfig,
     TxnCoordinator, TxnMode, Xid,
 };
 
@@ -25,12 +27,46 @@ type Log = Arc<Mutex<Vec<(String, String)>>>;
 #[derive(Default)]
 struct Script {
     fail: Mutex<Vec<(String, String, u16)>>,
+    /// Stalls the first control statement on (cluster, prefix): before it
+    /// runs (`after` false) or once it ran (`after` true), for the given
+    /// time or forever, so a test can cut the call short there.
+    stall: Mutex<Vec<Stall>>,
+    /// The last resource's decision insert also lands in the admin's rows
+    /// (as a committed `__sprig_dtx` row would), so the insert race sees it.
+    record_decisions: AtomicBool,
+}
+
+/// A stall: on `cluster`, the first statement starting with `prefix`,
+/// before it runs or once it ran (`after`), for `wait` or forever.
+struct Stall {
+    cluster: String,
+    prefix: String,
+    after: bool,
+    wait: Option<Duration>,
 }
 
 struct FakeConn {
     cluster: String,
     log: Log,
     script: Arc<Script>,
+    admin: Arc<FakeAdmin>,
+}
+
+impl FakeConn {
+    fn stall_of(&self, sql: &str, after: bool) -> Option<Stall> {
+        let mut st = self.script.stall.lock().unwrap();
+        let i = st.iter().position(|x| {
+            x.cluster == self.cluster && x.after == after && sql.starts_with(x.prefix.as_str())
+        })?;
+        Some(st.remove(i))
+    }
+}
+
+async fn stall(s: Stall) {
+    match s.wait {
+        Some(d) => tokio::time::sleep(d).await,
+        None => std::future::pending::<()>().await,
+    }
 }
 
 #[async_trait::async_trait]
@@ -42,17 +78,32 @@ impl BranchConn for FakeConn {
     async fn control(&mut self, ctl: &[Ctl]) -> DbResult<()> {
         for c in ctl {
             let sql = c.sql();
-            let mut f = self.script.fail.lock().unwrap();
-            if let Some(i) = f
-                .iter()
-                .position(|(cl, p, _)| *cl == self.cluster && sql.starts_with(p.as_str()))
-            {
-                let (_, _, e) = f.remove(i);
+            if let Some(d) = self.stall_of(&sql, false) {
+                stall(d).await;
+            }
+            let failed = {
+                let mut f = self.script.fail.lock().unwrap();
+                f.iter()
+                    .position(|(cl, p, _)| *cl == self.cluster && sql.starts_with(p.as_str()))
+                    .map(|i| f.remove(i).2)
+            };
+            if let Some(e) = failed {
                 return Err(DbError::new(e, "scripted"));
             }
-            drop(f);
             let short = sql.split(" X'").next().unwrap().to_owned();
             self.log.lock().unwrap().push((self.cluster.clone(), short));
+            if let Ctl::InsertDecision { row, .. } = c
+                && self.script.record_decisions.load(Ordering::SeqCst)
+            {
+                self.admin
+                    .rows
+                    .lock()
+                    .unwrap()
+                    .insert((self.cluster.clone(), row.dtid), row.outcome);
+            }
+            if let Some(d) = self.stall_of(&sql, true) {
+                stall(d).await;
+            }
         }
         Ok(())
     }
@@ -61,6 +112,8 @@ impl BranchConn for FakeConn {
 #[derive(Default)]
 struct FakeAdmin {
     rows: Mutex<BTreeMap<(String, Dtid), Decision>>,
+    /// `KILL` fails, so a commit point's race can't be run.
+    kill_fails: AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -72,6 +125,9 @@ impl ClusterAdmin for FakeAdmin {
         Ok(())
     }
     async fn kill(&self, _: &ClusterId, _: u64) -> DbResult<()> {
+        if self.kill_fails.load(Ordering::SeqCst) {
+            return Err(DbError::new(2013, "scripted"));
+        }
         Ok(())
     }
     async fn insert_decision(&self, c: &ClusterId, _: &str, row: &DecisionRow) -> DbResult<()> {
@@ -126,6 +182,7 @@ impl TxnBackend for Fake {
             cluster: c.to_string(),
             log: self.log.clone(),
             script: self.script.clone(),
+            admin: self.admin.clone(),
         })
     }
     fn admin(&self) -> Arc<dyn ClusterAdmin> {
@@ -420,4 +477,248 @@ async fn max_branches_is_enforced() {
     let e = write(&mut t, "c", 3).await.unwrap_err();
     assert_eq!(e.protocol().mysql_errno, 39444);
     t.rollback().await.unwrap();
+}
+
+#[async_trait::async_trait]
+impl sprig_txn::lookup::DistConn for FakeConn {
+    async fn run(&mut self, sql: &str) -> DbResult<()> {
+        self.log
+            .lock()
+            .unwrap()
+            .push((self.cluster.clone(), sql.to_owned()));
+        Ok(())
+    }
+    async fn query(
+        &mut self,
+        sql: &str,
+        _: mysql_async::Params,
+    ) -> DbResult<Vec<mysql_async::Row>> {
+        self.run(sql).await.map(|()| Vec::new())
+    }
+}
+
+/// One Pre statement on `a`.
+async fn pre(d: &mut sprig_txn::lookup::DistTxn<Fake>, a: &sprig_shard::lookup::Target) {
+    use sprig_shard::lookup::LookupSessions as _;
+    d.pre(a, "INSERT 1", mysql_async::Params::Empty)
+        .await
+        .unwrap();
+}
+
+// `lookup.lock_wait_seconds` per owner table: each claim sets its table's
+// value, and a Pre session already open on the cluster sets it again only
+// when it changes.
+#[tokio::test]
+async fn pre_sessions_take_each_claims_lock_wait() {
+    use sprig_shard::lookup::Target;
+    let (t, log, _, _) = setup(NonXaPolicy::Reject, true);
+    let backend = Arc::new(Fake {
+        log: log.clone(),
+        script: Arc::default(),
+        admin: Arc::default(),
+    });
+    let anchor: sprig_txn::lookup::AnchorOf = Arc::new(|_: &Target| shard(1));
+    let mut d = sprig_txn::lookup::DistTxn::new(t, backend, anchor, 5);
+    let a = Target {
+        cluster: c("a"),
+        schema: "s".into(),
+    };
+    pre(&mut d, &a).await;
+    pre(&mut d, &a).await;
+    d.set_lock_wait(12);
+    pre(&mut d, &a).await;
+    d.set_lock_wait(12);
+    pre(&mut d, &a).await;
+    d.set_lock_wait(0);
+    pre(&mut d, &a).await;
+    assert_eq!(
+        on(&log, "a"),
+        [
+            "SET SESSION innodb_lock_wait_timeout = 5",
+            "START TRANSACTION",
+            "INSERT 1",
+            "INSERT 1",
+            "SET SESSION innodb_lock_wait_timeout = 12",
+            "INSERT 1",
+            "INSERT 1",
+            "SET SESSION innodb_lock_wait_timeout = 1",
+            "INSERT 1",
+        ]
+    );
+    d.rollback().await.unwrap();
+    // The next transaction's Pre session starts with the value now set.
+    log.lock().unwrap().clear();
+    pre(&mut d, &a).await;
+    assert_eq!(
+        on(&log, "a")[..2],
+        [
+            "SET SESSION innodb_lock_wait_timeout = 1",
+            "START TRANSACTION"
+        ]
+    );
+}
+
+// A `COMMIT` cut short: the client went away (or `KILL QUERY`) while it
+// ran, its future was dropped, and the session closed, which rolls back.
+// The transaction must still end all or nothing.
+
+/// Two writers on an all-XA tenant: the home (`a`) is the last resource,
+/// `b` is prepared.
+async fn two_writers(stall: (&str, &str, bool, Option<Duration>)) -> (TxnCoordinator<Fake>, Log) {
+    let (mut t, log, script, _) = setup(NonXaPolicy::Reject, true);
+    script.record_decisions.store(true, Ordering::SeqCst);
+    t.begin(BeginOptions::default()).unwrap();
+    write(&mut t, "a", 1).await.unwrap();
+    write(&mut t, "b", 2).await.unwrap();
+    script.stall.lock().unwrap().push(Stall {
+        cluster: stall.0.into(),
+        prefix: stall.1.into(),
+        after: stall.2,
+        wait: stall.3,
+    });
+    let cut = tokio::time::timeout(Duration::from_millis(100), t.commit()).await;
+    assert!(cut.is_err(), "the commit was meant to be cut short");
+    (t, log)
+}
+
+#[tokio::test]
+async fn a_commit_cut_short_after_the_commit_point_still_commits_the_prepared_branches() {
+    let (mut t, log) = two_writers(("a", "COMMIT", true, None)).await;
+    assert!(t.interrupted());
+    t.close().await;
+    let b = on(&log, "b");
+    assert!(b.contains(&"XA COMMIT".to_owned()), "{b:?}");
+    assert!(!b.contains(&"XA ROLLBACK".to_owned()), "{b:?}");
+    assert!(!t.in_txn() && !t.interrupted());
+}
+
+#[tokio::test]
+async fn a_commit_cut_short_before_its_commit_point_ran_rolls_back() {
+    let (mut t, log) = two_writers(("a", "INSERT INTO", false, None)).await;
+    t.rollback().await.unwrap();
+    let b = on(&log, "b");
+    assert!(b.contains(&"XA ROLLBACK".to_owned()), "{b:?}");
+    assert!(!b.contains(&"XA COMMIT".to_owned()), "{b:?}");
+    assert!(!on(&log, "a").contains(&"COMMIT".to_owned()));
+}
+
+#[tokio::test]
+async fn a_commit_cut_short_in_prepare_rolls_back() {
+    let (mut t, log) = two_writers(("b", "XA PREPARE", false, None)).await;
+    t.close().await;
+    assert!(on(&log, "b").contains(&"XA ROLLBACK".to_owned()));
+    assert!(!on(&log, "a").iter().any(|s| s.starts_with("INSERT")));
+    assert!(!t.in_txn());
+}
+
+#[tokio::test]
+async fn a_commit_cut_short_in_phase_2_finishes_it_when_the_session_closes() {
+    let (mut t, log) =
+        two_writers(("b", "XA COMMIT", false, Some(Duration::from_millis(300)))).await;
+    assert!(on(&log, "a").contains(&"COMMIT".to_owned()));
+    assert!(t.interrupted());
+    t.close().await;
+    let b = on(&log, "b");
+    assert!(b.contains(&"XA COMMIT".to_owned()), "{b:?}");
+    assert!(!b.contains(&"XA ROLLBACK".to_owned()), "{b:?}");
+}
+
+#[tokio::test]
+async fn commit_sent_again_after_a_cut_returns_the_first_outcome() {
+    let (mut t, log) = two_writers(("a", "COMMIT", true, None)).await;
+    t.commit().await.unwrap();
+    assert!(on(&log, "b").contains(&"XA COMMIT".to_owned()));
+    let (mut t, _) = two_writers(("a", "INSERT INTO", false, None)).await;
+    let e = t.commit().await.unwrap_err();
+    assert_eq!(e.protocol().mysql_errno, 39443, "{e}");
+}
+
+#[tokio::test]
+async fn the_next_statement_after_a_cut_finishes_it_first() {
+    let (mut t, log) = two_writers(("a", "COMMIT", true, None)).await;
+    // A killed `COMMIT`, then a new statement on the session.
+    write(&mut t, "b", 3).await.unwrap();
+    let b = on(&log, "b");
+    let commit = b
+        .iter()
+        .position(|s| s == "XA COMMIT")
+        .expect("phase 2 ran");
+    // Then the new statement's branch opens (the home now: a plain
+    // transaction).
+    assert!(
+        b[commit + 1..].iter().any(|s| s == "START TRANSACTION"),
+        "{b:?}"
+    );
+    assert!(!b.contains(&"XA ROLLBACK".to_owned()), "{b:?}");
+}
+
+// A `COMMIT` killed while it ran (`KILL QUERY`) answers its real outcome
+// once the cut commit is finished: OK when it committed, 39443 when it
+// rolled back, and nothing (the caller answers 1317) when the outcome is
+// still unknown after `txn.commit_resolve_timeout_ms`.
+#[tokio::test]
+async fn a_killed_commit_answers_its_outcome() {
+    // Cut after the commit point: committed.
+    let (mut t, log) = two_writers(("a", "COMMIT", true, None)).await;
+    let ended = t.finish_interrupted().await;
+    assert_eq!(ended, Interrupted::Committed);
+    assert!(matches!(ended.commit_answer(), Some(Ok(()))));
+    assert!(on(&log, "b").contains(&"XA COMMIT".to_owned()));
+    assert!(!t.in_txn() && !t.interrupted());
+    // Cut before it: rolled back, 39443.
+    let (mut t, log) = two_writers(("a", "INSERT INTO", false, None)).await;
+    let ended = t.finish_interrupted().await;
+    assert_eq!(ended, Interrupted::RolledBack);
+    let e = ended.commit_answer().unwrap().unwrap_err();
+    assert_eq!(e.protocol().mysql_errno, 39443, "{e}");
+    assert!(on(&log, "b").contains(&"XA ROLLBACK".to_owned()));
+    // Cut while the last resource's COMMIT was under way: the race at its
+    // anchor decides; it finds the decision row, so committed.
+    let (mut t, log) = two_writers(("a", "COMMIT", false, None)).await;
+    assert_eq!(t.finish_interrupted().await, Interrupted::Committed);
+    assert!(on(&log, "b").contains(&"XA COMMIT".to_owned()));
+    // No commit cut: nothing to answer.
+    assert_eq!(t.finish_interrupted().await, Interrupted::None);
+    assert!(Interrupted::None.commit_answer().is_none());
+}
+
+#[tokio::test]
+async fn a_killed_commit_whose_race_cant_run_stays_unknown() {
+    let log: Log = Arc::default();
+    let script = Arc::new(Script::default());
+    let admin = Arc::new(FakeAdmin::default());
+    admin.kill_fails.store(true, Ordering::SeqCst);
+    script.record_decisions.store(true, Ordering::SeqCst);
+    let b = Arc::new(Fake {
+        log: log.clone(),
+        script: script.clone(),
+        admin,
+    });
+    let cfg = TxnConfig {
+        policy: NonXaPolicy::Reject,
+        tenant_all_xa: true,
+        commit_resolve_timeout: Duration::from_millis(500),
+        ..TxnConfig::default()
+    };
+    let mut t = TxnCoordinator::new(b, Arc::new(DtidGen::new(1)), TenantId(1), cfg);
+    t.begin(BeginOptions::default()).unwrap();
+    write(&mut t, "a", 1).await.unwrap();
+    write(&mut t, "b", 2).await.unwrap();
+    script.stall.lock().unwrap().push(Stall {
+        cluster: "a".into(),
+        prefix: "COMMIT".into(),
+        after: false,
+        wait: None,
+    });
+    let cut = tokio::time::timeout(Duration::from_millis(100), t.commit()).await;
+    assert!(cut.is_err());
+    let started = tokio::time::Instant::now();
+    let ended = t.finish_interrupted().await;
+    assert_eq!(ended, Interrupted::Unknown);
+    assert!(ended.commit_answer().is_none(), "answered 1317");
+    // Bounded by the resolve timeout, measured from the COMMIT's send.
+    assert!(started.elapsed() < Duration::from_secs(2));
+    // The prepared branch is left to the resolver.
+    assert!(!on(&log, "b").contains(&"XA ROLLBACK".to_owned()));
+    assert!(!on(&log, "b").contains(&"XA COMMIT".to_owned()));
 }

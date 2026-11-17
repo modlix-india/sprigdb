@@ -1,5 +1,5 @@
-//! The SQL extensions (chapter 42, "Interfaces"), read from the token
-//! stream of chapter 07's lexer so they work on both personas, and the
+//! The SQL extensions, read from the token stream of the SQL lexer so
+//! they work on both personas, and the
 //! classification of every statement the inheritance layer looks at.
 //!
 //! | Form | Read as |
@@ -91,7 +91,7 @@ pub enum Stmt {
     },
     /// `ALTER TABLE t DROP SPRIG INHERITABLE`.
     DropInheritable(Name),
-    /// `ALTER TABLE t SPRIG RECONCILE HIERARCHY ...`: chapter 32's plans
+    /// `ALTER TABLE t SPRIG RECONCILE HIERARCHY ...`: the type layer's plans
     /// telling this layer of a structural change ([`crate::hier`]); a type
     /// plan's statement only.
     Reconcile {
@@ -821,8 +821,8 @@ fn drop(t: &Toks<'_>) -> Result<Stmt, SprigError> {
     Ok(Stmt::DropTable(names))
 }
 
-/// Whether `sql` is one of this crate's statements that chapter 08's
-/// settings grammar would otherwise claim (`ALTER TABLE t SPRIG
+/// Whether `sql` is one of this crate's statements that the settings
+/// grammar would otherwise claim (`ALTER TABLE t SPRIG
 /// INHERITABLE ...`, and `SPRIG RESET t ...` naming a table rather than a
 /// setting): the gateway leaves them to [`crate::handle`].
 #[must_use]
@@ -895,7 +895,7 @@ pub fn identifiers(sql: &[u8], lex_opts: &LexOptions) -> Vec<String> {
 }
 
 /// Whether the text names a reserved (`_sprig_` or `__sprig_`) name: such
-/// a client statement is left to chapter 07, which refuses it.
+/// a client statement is left to the name layer, which refuses it.
 #[must_use]
 pub fn names_reserved(sql: &[u8], lex_opts: &LexOptions) -> bool {
     identifiers(sql, lex_opts)

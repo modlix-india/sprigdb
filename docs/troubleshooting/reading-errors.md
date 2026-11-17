@@ -210,7 +210,7 @@ Common retryable errors:
 
 | Error | Retry how |
 |---|---|
-| 1213, deadlock; `ER_SPRIG_SHARD_MAP_CHANGED` (39424); `ER_SPRIG_DTX_ROLLED_BACK` (39443) | The whole transaction, from `BEGIN` |
+| 1213, deadlock (also when a Galera cluster rolled back a transaction it would otherwise have reported as committed); `ER_SPRIG_SHARD_MAP_CHANGED` (39424); `ER_SPRIG_DTX_ROLLED_BACK` (39443) | The whole transaction, from `BEGIN` |
 | 1205, lock wait timeout | The statement or the transaction |
 | `ER_SPRIG_GATEWAY_DRAINING` (39000), `ER_SPRIG_LISTENER_RETIRED` (39004) | Reconnect, then retry |
 | `ER_SPRIG_ADMISSION_TIMEOUT` (39002), `ER_SPRIG_MEMORY_LIMIT` (39003), `ER_SPRIG_BACKEND_POOL_TIMEOUT` (39031) | With backoff; these mean the system is busy |

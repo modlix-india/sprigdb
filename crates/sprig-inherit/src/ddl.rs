@@ -1,11 +1,10 @@
-//! Spaces, home spaces, shares and `SPRIG INHERITABLE` (chapter 42,
-//! "Interfaces" and "The physical layer"; build steps 1-3).
+//! Spaces, home spaces, shares and `SPRIG INHERITABLE`.
 //!
 //! `ALTER TABLE t SPRIG INHERITABLE KEY (k)` adds the invisible columns
 //! `_sprig_space`, `_sprig_state` and `_sprig_ovr`, widens the primary
 //! key and every user `UNIQUE` key with `_sprig_space`, and adds the
 //! `_sprig_layer` index, in one `ALTER TABLE` (MariaDB copies the table;
-//! the chapter's copy-and-swap job is not used). Existing rows become the
+//! the DDL engine's copy-and-swap job is not used). Existing rows become the
 //! root space's own rows. The key must be the table's primary key.
 
 use sprig_common::{Result, SprigCode, SprigError};
@@ -252,7 +251,7 @@ pub async fn space_home(
 /// The table's MariaDB foreign keys, to and from it, become foreign keys
 /// the gateway keeps, and the tables at their other ends become inheritable
 /// too (their primary key is their key): a table and the tables linked to
-/// it by foreign keys inherit together (Kiran's decision 1, [`crate::links`]).
+/// it by foreign keys inherit together ([`crate::links`]).
 ///
 /// # Errors
 /// 1146; 1142; 39891 when the key isn't the primary key, or for a typed
@@ -319,7 +318,7 @@ async fn follow_tree(
             .filter(|c| !c.generated() && !c.name.to_ascii_lowercase().starts_with("_sprig_"))
             .map(|c| c.name)
             .collect();
-        // Type columns a discriminator made generated (decision T19)
+        // Type columns a discriminator made generated
         // aren't fields any more: merged views compute them.
         let gone = |c: &String| {
             (c.eq_ignore_ascii_case("_type") || c.eq_ignore_ascii_case("_type_path"))
@@ -383,8 +382,8 @@ pub(crate) async fn enable(
         .filter(|c| !c.generated())
         .map(|c| c.name.clone())
         .collect();
-    // A record hierarchy's paths are fields, kept per space (decision
-    // T22): `SHOW COLUMNS` never lists them.
+    // A record hierarchy's paths are fields, kept per space:
+    // `SHOW COLUMNS` never lists them.
     if hierarchical && crate::hier::probe_paths(r, &layer).await {
         cols.extend(crate::hier::PATH_COLUMNS.iter().map(|c| (*c).to_owned()));
     }
@@ -794,7 +793,7 @@ pub async fn create_share(ctx: &Ctx<'_>, r: &mut dyn Runner, s: &NewShare<'_>) -
     if let Some(f) = s.filter {
         validate_filter(o, f, columns.as_deref(), &ctx.lex)?;
     }
-    // A record hierarchy is shared whole (decisions T22 and T28).
+    // A record hierarchy is shared whole.
     for m in ctx.state.group_of(o.object_id) {
         if let Some(mo) = ctx.state.object(m) {
             crate::hier::check_share(mo, s.filter.is_some() || s.columns.is_some())?;
@@ -810,8 +809,7 @@ pub async fn create_share(ctx: &Ctx<'_>, r: &mut dyn Runner, s: &NewShare<'_>) -
             ),
         ));
     }
-    // Read-through levels since the nearest materialized edge (chapter 42,
-    // "Choosing the merge mode").
+    // Read-through levels since the nearest materialized edge.
     let levels = ctx
         .chain_with(o, from, &res.prefix, crate::plan::Cut::Declared)?
         .levels
@@ -836,7 +834,7 @@ pub async fn create_share(ctx: &Ctx<'_>, r: &mut dyn Runner, s: &NewShare<'_>) -
     };
     // A copy between spaces of one tenant would be read by the spaces'
     // reconciles before the worker applied it; a child tenant's copy is
-    // reconciled by the worker itself (decision T28).
+    // reconciled by the worker itself.
     if mode == MergeMode::Materialized
         && !matches!(to, ShareTarget::Tenant(_))
         && ctx
@@ -1038,7 +1036,7 @@ pub async fn drop_share(
         }
     }
     // A record hierarchy's spaces below keep their own rows only while
-    // the rows they hang under stay visible (decision T22).
+    // the rows they hang under stay visible.
     if let Some(o) = ctx
         .state
         .object(sh.object_id)
@@ -1072,9 +1070,9 @@ pub async fn drop_share(
             }
         }
     }
-    // The children it served, read before the drop (bugfix-44).
-    let carried = crate::unshare::carried(ctx, &sh);
-    // Child tenants of a record hierarchy (decision T28): only while they
+    // The children it served, read before the drop.
+    let carried = crate::unshare::carried(crate::unshare::Before::of(ctx), &sh);
+    // Child tenants of a record hierarchy: only while they
     // have no structure of their own; their path overrides go first.
     Box::pin(crate::hier::tenants::before_unshare(ctx, r, &carried)).await?;
     let mut c = root_change(ctx);
@@ -1082,12 +1080,12 @@ pub async fn drop_share(
     r.commit(&c).await?;
     // The share is gone: its children's overrides become their own rows,
     // their hides, views and copies go. Every step can run again, so a
-    // failure runs the cleanup again (bugfix-55); one that keeps failing
+    // failure runs the cleanup again; one that keeps failing
     // leaves them as before (hidden, the view unused), and the statement
     // still succeeds.
     let mut retry = crate::unshare::Retry::default();
     loop {
-        match crate::unshare::after_drop(ctx, r, &carried).await {
+        match crate::unshare::after_drop(crate::unshare::Before::of(ctx), r, &carried).await {
             Ok(u) => {
                 if u.views + u.orphaned + u.unhidden + u.copies > 0 {
                     tracing::info!(
@@ -1100,10 +1098,20 @@ pub async fn drop_share(
                         "share dropped: the children's overrides are their own rows"
                     );
                 }
+                // The cleanup is done: the share's `dropping` row goes. If
+                // this fails, the next statement's sweep removes it.
+                let mut purge = root_change(ctx);
+                purge.purge_shares.push(sh.id);
+                if let Err(e) = r.commit(&purge).await {
+                    tracing::info!(share = %name, error = %e, "a dropped share's row stays until the next sweep");
+                }
                 break;
             }
             Err(e) => {
                 let Some(pause) = retry.again() else {
+                    // The share stays `dropping`: the next statement of
+                    // the parent or a tenant below it after a restart
+                    // runs the cleanup again (`unshare::sweep`).
                     metrics::counter!("sprig_inherit_unshare_failures_total").increment(1);
                     tracing::warn!(share = %name, error = %e, attempts = retry.failed(), "share dropped, but its children were not cleaned up");
                     break;

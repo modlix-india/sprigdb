@@ -26,6 +26,7 @@ use async_trait::async_trait;
 use mysql_async::prelude::Queryable;
 use serde_json::{Value, json};
 use sprig_catalog::ddl::{DdlRequest, DdlStatement, database_key, object_key, shard_schemas};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::{Namespace, ObjectKind, SettingRow, SettingScope};
 use sprig_catalog::version::VersionKind;
 use sprig_catalog::{CatalogLocator, TenantCatalog};
@@ -186,16 +187,22 @@ pub async fn ensure(
     let ep = svc.locator.writer(t).await?;
     let schema = ep.store.schema().to_owned();
     let store = MsgStore::new(&schema);
-    let mut conn = ep.pool.get_conn().await.map_err(|e| {
-        SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-    })?;
     let deadline = Instant::now() + Duration::from_millis(wait_ms);
     let key = def.key();
     let mut created = false;
     loop {
+        // A catalog connection for this round's reads and claim only,
+        // dropped before the creation and the triggers, which take their
+        // own from the same pool (4 per cluster). Held across them, one
+        // publish needed 3 at once and failed with 39070 ("catalog begin
+        // timed out") whenever two were busy elsewhere.
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
+            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
+        })?;
         let row = store.instance(&mut conn, key).await?;
         match row {
             Some(i) if i.state == InstanceState::Active => {
+                drop(conn);
                 // Committed; wait for this gateway's snapshot to have it.
                 loop {
                     cat = catalog(svc, t).await?;
@@ -220,7 +227,9 @@ pub async fn ensure(
                 }
             }
             Some(i) if i.state == InstanceState::Creating => {
-                if store.take_over(&mut conn, key, 30_000).await? {
+                let mine = store.take_over(&mut conn, key, 30_000).await?;
+                drop(conn);
+                if mine {
                     create(svc, t, def, i.instance_id).await?;
                     created = true;
                     continue;
@@ -264,7 +273,9 @@ pub async fn ensure(
                     physical: Some(json!({"db": def.db_name, "name": def.name})),
                     created_at_ms: 0,
                 };
-                if store.claim(&mut conn, &row).await? {
+                let claimed = store.claim(&mut conn, &row).await?;
+                drop(conn);
+                if claimed {
                     let started = Instant::now();
                     if let Err(e) = create_retrying(svc, t, def, id).await {
                         tracing::warn!(tenant = %t, def = %key, error = %e, "inherited stream instance not created; the next use retries");
@@ -306,7 +317,7 @@ async fn after_use(
         return Ok(());
     }
     adopt_settings(svc, chain, def, si).await?;
-    super::triggers::ensure_for_stream(svc, chain, def, si).await?;
+    let triggers_settled = super::triggers::ensure_for_stream(svc, chain, def, si).await?;
     // Inherited sinks (and their connections) on the instance.
     super::sinks::ensure_for_stream(svc, chain, def, si).await;
     // Fan-in triggers above read the instance.
@@ -323,7 +334,10 @@ async fn after_use(
         },
     )
     .await?;
-    set_applied(si.tenant, def.key(), sig);
+    // A trigger another deploy is still making: the next use looks again.
+    if triggers_settled {
+        set_applied(si.tenant, def.key(), sig);
+    }
     Ok(())
 }
 
@@ -518,6 +532,7 @@ pub async fn ensure_database(
         current_db: None,
         user: None,
         lower_case_table_names: lc,
+        wait: None,
     };
     let out = svc
         .ddl
@@ -636,7 +651,7 @@ async fn create(svc: &Arc<TenantServices>, t: TenantId, def: &Definition, id: u6
         // IF NOT EXISTS found the stream (a retry after a crash): the row
         // goes active now.
         let ep = svc.locator.writer(t).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(|e| {
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
         let existing = streams_of(&host.cat)
@@ -659,6 +674,8 @@ async fn create(svc: &Arc<TenantServices>, t: TenantId, def: &Definition, id: u6
                         &def.definition,
                     )
                     .await?;
+                // The change takes its own connection.
+                drop(conn);
                 // Every gateway reloads the member at its next version.
                 let c = svc.catalog.change(t, VersionKind::Catalog).await?;
                 c.commit().await?;
@@ -690,7 +707,9 @@ struct InstanceHost {
 impl InstanceHost {
     async fn ctl(&self, cluster: &sprig_common::ids::ClusterId) -> Result<mysql_async::Conn> {
         let pool = self.svc.locator.ctl_pool(cluster).await?;
-        pool.get_conn().await.map_err(sprig_streams::maria::map_err)
+        pool.get_conn_bounded()
+            .await
+            .map_err(sprig_streams::maria::map_err)
     }
 }
 
@@ -789,7 +808,7 @@ impl Host for InstanceHost {
         let tenant = self.cat.tenant;
         let ep = self.svc.locator.writer(tenant).await?;
         {
-            let mut conn = ep.pool.get_conn().await.map_err(|e| {
+            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
                 SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
             })?;
             sprig_streams::store::migrate(&mut conn, ep.store.schema()).await?;
@@ -915,7 +934,7 @@ pub async fn remove(svc: &Arc<TenantServices>, t: TenantId, def: DefKey) -> Resu
         sprig_streams::sql::handle(&text, &ctx, &mut host).await?;
     }
     let ep = svc.locator.writer(t).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(|e| {
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
         SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
     })?;
     MsgStore::new(ep.store.schema())

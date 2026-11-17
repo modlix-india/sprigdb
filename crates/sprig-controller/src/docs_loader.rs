@@ -5,7 +5,9 @@
 //! pack := docs.pack_path, or sprig-docs-<version>.pack next to the binary;
 //!         its trailing SHA-256 checked (sprig_docs::pack::Pack::from_bytes)
 //! per cluster (one key each, on the DC leader; a failure backs off on its own):
-//!   1. CREATE the schema and tables IF NOT EXISTS; the docs-reader account
+//!   1. CREATE the schema and tables IF NOT EXISTS, and add chunks.seq to a
+//!      table made before it (ADD COLUMN IF NOT EXISTS: rows already there,
+//!      such as a release kept for rollback, get 0); the docs-reader account
 //!      sprig_docs_r with SELECT on __sprig_docs.* only (once per process)
 //!   2. packs[version] ready with the pack's sha256 and, the first time this
 //!      process looks, its rows hash to the pack's rows: done
@@ -15,6 +17,9 @@
 //!   4. retire: keep docs.keep_versions releases (this one and the newest
 //!      others by load time); older ones lose their rows and become retired
 //! ```
+//!
+//! A pack of format 1 (before chunk positions) still loads: its rows get
+//! `seq` 0.
 //!
 //! Every connection is `sprig_ctl`'s, through the loop's own connection
 //! budget (`docs`, one per cluster), so a slow cluster never holds another
@@ -184,6 +189,7 @@ fn row_bytes(r: &Row) -> usize {
         + 2
         + r.terms.len()
         + r.embedding.len()
+        + 2
 }
 
 /// Brings one cluster's `__sprig_docs` to `pack`: verifies a ready copy
@@ -321,6 +327,10 @@ fn row_from(mut r: mysql_async::Row) -> Result<Row> {
             .ok_or_else(|| SprigError::internal("docs: tokens unreadable"))?,
         terms: text(&mut r, 8)?,
         embedding: bytes(&mut r, 9)?,
+        seq: r
+            .take_opt::<u16, _>(10)
+            .and_then(std::result::Result::ok)
+            .ok_or_else(|| SprigError::internal("docs: seq unreadable"))?,
     })
 }
 
@@ -366,7 +376,7 @@ impl DocsDb for MariaDocs {
     async fn read_rows(&mut self, version: &str) -> Result<Vec<Row>> {
         let sql = format!(
             "SELECT {} FROM {} WHERE version = ? ORDER BY chunk_id",
-            "chunk_id, version, page, title, heading_path, audience, text, tokens, terms, embedding",
+            "chunk_id, version, page, title, heading_path, audience, text, tokens, terms, embedding, seq",
             table::qualified(table::CHUNKS)
         );
         let rows: Vec<mysql_async::Row> = self
@@ -403,7 +413,7 @@ impl DocsDb for MariaDocs {
         if rows.is_empty() {
             return Ok(());
         }
-        let mut params: Vec<Value> = Vec::with_capacity(rows.len() * 10);
+        let mut params: Vec<Value> = Vec::with_capacity(rows.len() * 11);
         for r in rows {
             params.extend([
                 Value::from(r.version.as_str()),
@@ -416,6 +426,7 @@ impl DocsDb for MariaDocs {
                 Value::UInt(u64::from(r.tokens)),
                 Value::from(r.terms.as_str()),
                 Value::Bytes(r.embedding.clone()),
+                Value::UInt(u64::from(r.seq)),
             ]);
         }
         self.conn

@@ -1,9 +1,8 @@
 //! One tenant's feed for internal consumers: decoded, filtered, ordered,
-//! resumable, and following the tenant across moves (chapter 38,
-//! "Filtering", "Ordering and transactions", "Positioning and resume").
+//! resumable, and following the tenant across moves.
 //!
-//! R0 and R1 keep a tenant's catalog and every shard on one cluster at a
-//! time and move them together, so the tenant's feed is one cluster's
+//! A tenant's catalog and every shard live on one cluster at a time and
+//! move together, so the tenant's feed is one cluster's
 //! binlog at a time: commit order there is the merged order of all the
 //! tenant's shards, transactions whole. The tail reads one **segment**
 //! per owner: from a move's `H` on the target until the next move's `G`.
@@ -12,10 +11,10 @@
 //! emits the source's changes up to `G`, then the target's after `H`, so a
 //! consumer sees no gap and no duplicate, and none of the mover's copies.
 //!
-//! Filters (chapter 38's rules): only the tenant's shard and reference
-//! schemas; no internal tables or DDL naming them; no transaction that
-//! writes an applier position (rule 2); a segment's window (rule 3);
-//! internal columns removed and no-op updates dropped (rule 4).
+//! Filter rules: (1) only the tenant's shard and reference schemas, no
+//! internal tables or DDL naming them; (2) no transaction that writes an
+//! applier position; (3) a segment's window; (4) internal columns removed
+//! and no-op updates dropped.
 //!
 //! Every item carries a [`ResumeToken`]; [`StartAt::After`] resumes after
 //! it, also across moves that committed in between.
@@ -70,17 +69,17 @@ pub struct TailOptions {
     /// First retry delay after a broken stream; doubles up to 5 s.
     pub retry: Duration,
     /// Internal tables whose rows are delivered anyway, by name prefix:
-    /// chapter 45's sequencers read their outboxes (`__sprig_eo_`).
+    /// the event sequencers read their outboxes (`__sprig_eo_`).
     /// Empty: filter rule 1 drops every internal table.
     pub keep_internal: Vec<String>,
     /// Follow the tenant when it moves (the default). `false` pins the
-    /// tail to its starting cluster: chapter 39's search copies read every
+    /// tail to its starting cluster: search copies read every
     /// cluster that may hold the tenant's shards, one tail each.
     pub follow_moves: bool,
     /// Also send a progress item (at most every `progress_every`) after
     /// transactions the filters dropped, so a consumer's position moves on
     /// a cluster busy with other tenants' writes, where the source is
-    /// never idle (chapter 39's waits for `latest`).
+    /// never idle (search's waits for `latest`).
     pub progress_on_filtered: bool,
 }
 
@@ -509,7 +508,7 @@ impl TenantTail {
     }
 
     /// Handles one group: XA bookkeeping, skipping, filters, decoding.
-    #[allow(clippy::too_many_lines)] // the chapter's steps, in order
+    #[allow(clippy::too_many_lines)] // one group's steps, in order
     async fn on_txn(&mut self, t: RawTxn) -> Result<()> {
         self.reads += 1;
         let read = self.reads;

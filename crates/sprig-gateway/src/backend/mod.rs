@@ -89,6 +89,7 @@ pub mod health;
 mod monitor;
 pub mod pins;
 pub mod pool;
+pub mod relay_calls;
 mod session;
 pub mod settings;
 pub mod state;

@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use sprig_settings::{Apply, HardBounds, MemSettings, Scopes, Setting, SettingCtx, TenantSettings};
 
+use crate::api::VerifyMode;
+
 /// "Ops": cluster, dc and global.
 const OPS: Scopes = Scopes::OPERATIONAL;
 /// Tenant and ops.
@@ -206,6 +208,25 @@ pub struct MoverSettings {
     pub job_lease: Duration,
     pub source_retain: Duration,
     pub server_id_base: u32,
+    /// `mover.verify_mode`, for jobs that don't choose their own.
+    pub verify_mode: VerifyMode,
+    /// `mover.max_pause_minutes`: how long a job keeps retrying a failing
+    /// step (an unreachable target) before it rolls back.
+    pub max_pause: Duration,
+}
+
+/// The share of chunks `mover.verify_mode = sample` checks.
+pub const SAMPLE_PCT: u8 = 10;
+
+/// `mover.verify_mode`'s value as a [`VerifyMode`]: `sample` checks
+/// [`SAMPLE_PCT`] of the chunks.
+#[must_use]
+pub fn verify_mode_of(v: &str) -> VerifyMode {
+    match v {
+        "off" => VerifyMode::Off,
+        "sample" => VerifyMode::Sample { pct: SAMPLE_PCT },
+        _ => VerifyMode::Full,
+    }
 }
 
 fn ms(v: u64) -> Duration {
@@ -246,6 +267,8 @@ impl Default for MoverSettings {
             job_lease: Duration::from_secs(JOB_LEASE_SECONDS.default),
             source_retain: Duration::from_secs(SOURCE_RETAIN_HOURS.default * 3600),
             server_id_base: u32_of(SERVER_ID_BASE.default),
+            verify_mode: verify_mode_of(&VERIFY_MODE.default),
+            max_pause: Duration::from_secs(MAX_PAUSE_MINUTES.default * 60),
         }
     }
 }
@@ -316,6 +339,8 @@ impl MoverSettings {
             job_lease: Duration::from_secs(g(&JOB_LEASE_SECONDS)),
             source_retain: Duration::from_secs(g(&SOURCE_RETAIN_HOURS) * 3600),
             server_id_base: u32_of(g(&SERVER_ID_BASE)),
+            verify_mode: verify_mode_of(&layered(s, tenant, &VERIFY_MODE, ctx)),
+            max_pause: Duration::from_secs(g(&MAX_PAUSE_MINUTES).saturating_mul(60)),
         }
     }
 
@@ -362,5 +387,49 @@ mod tests {
         assert_eq!(got, MoverSettings::default());
         assert_eq!(got.cutover_max_hold, Duration::from_secs(2));
         assert_eq!(got.copy_chunk_rows, 5000);
+        assert_eq!(got.verify_mode, VerifyMode::Full);
+        assert_eq!(got.max_pause, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn verify_mode_and_max_pause_follow_their_settings() {
+        use sprig_common::ids::TenantId;
+        use sprig_settings::{Level, Value};
+        let reg = Registry::global().unwrap();
+        let mut s = MemSettings::new(reg);
+        let dc = DcId::new("mum1").unwrap();
+        let ctx = SettingCtx::process(&dc);
+        let tctx = SettingCtx {
+            tenant: Some(TenantId(42)),
+            ..ctx
+        };
+        s.set_value(
+            Level::Dc,
+            &ctx,
+            "mover.verify_mode",
+            &Value::Str("sample".into()),
+        )
+        .unwrap();
+        s.set_value(Level::Dc, &ctx, "mover.max_pause_minutes", &Value::Int(5))
+            .unwrap();
+        let dc_wide = MoverSettings::resolve(&s, &tctx);
+        assert_eq!(dc_wide.verify_mode, VerifyMode::Sample { pct: SAMPLE_PCT });
+        assert_eq!(dc_wide.max_pause, Duration::from_secs(300));
+        // A tenant's own value wins over the dc's.
+        s.set_value(
+            Level::Tenant,
+            &tctx,
+            "mover.verify_mode",
+            &Value::Str("off".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            MoverSettings::resolve(&s, &tctx).verify_mode,
+            VerifyMode::Off
+        );
+        assert_eq!(
+            MoverSettings::resolve(&s, &ctx).verify_mode,
+            VerifyMode::Sample { pct: SAMPLE_PCT }
+        );
     }
 }

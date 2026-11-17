@@ -24,7 +24,7 @@
     clippy::too_many_arguments,
     clippy::format_push_string,
     clippy::too_many_lines
-)] // pedantic style: names follow the chapter's pseudocode
+)] // pedantic style lints
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -32,9 +32,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sprig_auth::TenantAuth;
-use sprig_auth::authz::rls::{Clause, NewPolicy, RlsState, RlsStore, SessionRls, TableRls, cmd};
+use sprig_auth::authz::rls::{
+    Clause, NewPolicy, PolicyRow, RlsState, RlsStore, SessionRls, TableRls, cmd,
+};
 use sprig_auth::authz::{Action, AuthzState, Grantee, SessionGrants, Target};
 use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::{DbState, Namespace, ObjectKind, ObjectState};
 use sprig_catalog::{CatalogLocator, ChangeOpts, Freshness, TenantCatalog, VersionKind};
 use sprig_common::ids::{DbId, ObjectId};
@@ -390,7 +393,7 @@ pub async fn statement(
     {
         let ep = svc.locator.writer(ts.tenant).await?;
         let store = RlsStore::new(ep.store.schema());
-        let mut conn = ep.pool.get_conn().await.map_err(|e| {
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
         if !store.migrated(&mut conn).await? {
@@ -581,6 +584,78 @@ pub async fn statement(
             let _ = change.rollback().await;
             let _ = svc.catalog.settle(ts.tenant, VersionKind::Auth).await;
             Ok(PolicyAnswer::Unchanged)
+        }
+        Err(e) => {
+            let _ = change.rollback().await;
+            let _ = svc.catalog.settle(ts.tenant, VersionKind::Auth).await;
+            Err(e)
+        }
+    }
+}
+
+/// Rewrites the catalog rows of the tenant's policies whose MongoDB forms
+/// compile to other SQL than the rows hold (created before a translator
+/// fix; [`RlsState::recompiled`]), in one auth change, and marks their
+/// tables' MariaDB checks stale. Returns the tables whose rows changed;
+/// empty when another gateway got there first. The rewrite and every other
+/// reader already apply the new SQL (loaded so); this makes the rows say so
+/// too, so older gateways and the deployed views and triggers follow.
+///
+/// # Errors
+/// The catalog's.
+pub async fn recompile_policies(
+    ts: &mut TenantSession,
+    cat: &TenantCatalog,
+) -> Result<Vec<ObjectId>> {
+    let Some(state) = RlsState::of(cat) else {
+        return Ok(Vec::new());
+    };
+    let stale: Vec<PolicyRow> = state.recompiled().cloned().collect();
+    if stale.is_empty() {
+        return Ok(Vec::new());
+    }
+    let svc = Arc::clone(ts.services());
+    let mut change = svc
+        .catalog
+        .change_with(ts.tenant, VersionKind::Auth, ChangeOpts::default())
+        .await?;
+    let version = change.version();
+    let r: Result<Vec<ObjectId>> = async {
+        let (core, q) = change.tx().parts();
+        let store = RlsStore::new(core.schema());
+        let mut touched = Vec::new();
+        for p in &stale {
+            if store.recompiled(q, p, version).await? {
+                touched.push(p.object_id);
+            }
+        }
+        touched.sort_unstable();
+        touched.dedup();
+        for o in &touched {
+            let Some(db) = cat.objects.get(*o).map(|x| x.db_id) else {
+                continue;
+            };
+            store.touch(q, *o, db, version, None).await?;
+        }
+        Ok(touched)
+    }
+    .await;
+    match r {
+        Ok(touched) if !touched.is_empty() => {
+            let v = change.commit().await?;
+            await_auth(ts, v).await;
+            metrics::counter!("sprig_rls_policies_recompiled_total").increment(stale.len() as u64);
+            tracing::info!(
+                tenant = %ts.tenant,
+                policies = ?stale.iter().map(|p| p.policy_id).collect::<Vec<_>>(),
+                "row-level security policies from MongoDB filters compiled again with this build's translator"
+            );
+            Ok(touched)
+        }
+        Ok(_) => {
+            let _ = change.rollback().await;
+            let _ = svc.catalog.settle(ts.tenant, VersionKind::Auth).await;
+            Ok(Vec::new())
         }
         Err(e) => {
             let _ = change.rollback().await;
@@ -845,15 +920,10 @@ impl SessionValues {
     }
 }
 
-/// A JSON value as a SQL literal.
+/// A claim or attribute as a SQL literal: the text MariaDB's side reads
+/// ([`sprig_sql::rls::expr::json_literal`]).
 fn literal(v: &serde_json::Value, nbe: bool) -> String {
-    match v {
-        serde_json::Value::Null => "NULL".to_owned(),
-        serde_json::Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_owned(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::String(s) => sprig_sql::rls::sql_string(s, nbe),
-        other => sprig_sql::rls::sql_string(&other.to_string(), nbe),
-    }
+    sprig_sql::rls::expr::json_literal(v, nbe)
 }
 
 /// The rewrite's view of the session.
@@ -1212,8 +1282,14 @@ pub async fn subtree_sync(
     {
         return Ok(());
     }
-    let pool = svc.locator.ctl_pool(cluster).await?;
-    let mut c = pool.get_conn().await.map_err(|e| {
+    // The tenant's row policies read these rows inside its own writes, so
+    // a held branch can hold them: for a tenant on Sprig 2PC's relay path
+    // they change through the relay writer.
+    let pool = svc
+        .locator
+        .tenant_ctl_pool(sprig_common::ids::TenantId(tenant), cluster)
+        .await?;
+    let mut c = pool.get_conn_bounded().await.map_err(|e| {
         SprigError::new(
             SprigCode::BackendUnavailable,
             format!("sprig_ctl on {cluster}: {e}"),
@@ -1293,15 +1369,6 @@ pub async fn subtree(
     svc: &super::TenantServices,
     root: sprig_common::ids::TenantId,
 ) -> Result<Arc<Vec<u64>>> {
-    use sprig_meta::{ListOpts, Record, Versioned};
-    #[derive(serde::Deserialize, serde::Serialize)]
-    struct Entry {
-        #[serde(default)]
-        path: String,
-    }
-    impl Versioned for Entry {
-        const V: u32 = 1;
-    }
     if let Some((at, v)) = subtree_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1310,35 +1377,7 @@ pub async fn subtree(
     {
         return Ok(Arc::clone(v));
     }
-    let prefix = svc.global.tier().key("tenants/")?;
-    let mark = format!("/{}/", root.0);
-    let mut out = vec![root.0];
-    let mut opts = ListOpts::default();
-    loop {
-        let page = svc.global.list(&prefix, opts.clone()).await?;
-        for kv in &page.kvs {
-            let key = kv.key.to_string();
-            let Some(id) = key.rsplit('/').next().and_then(|x| x.parse::<u64>().ok()) else {
-                continue;
-            };
-            if id == root.0 {
-                continue;
-            }
-            if let Ok(r) = Record::<Entry>::decode(&kv.value)
-                && r.body.path.contains(&mark)
-            {
-                out.push(id);
-            }
-        }
-        if !page.more {
-            break;
-        }
-        opts.at = Some(page.revision);
-        opts.after = page.kvs.last().map(|kv| kv.key.clone());
-    }
-    out.sort_unstable();
-    out.dedup();
-    let v = Arc::new(out);
+    let v = Arc::new(sprig_auth::authz::rls::directory_subtree(svc.global.as_ref(), root.0).await?);
     subtree_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1369,34 +1408,19 @@ pub async fn bind_tree(
     if !uses {
         return Ok(());
     }
-    let svc = ts.services();
-    let tree = subtree(svc, ts.tenant).await?;
-    let max = svc.settings.get(
-        &sprig_auth::authz::settings::RLS_INLINE_SUBTREE_MAX,
-        &cat.setting_ctx(&svc.dc),
-        Some(&cat.settings),
-    );
+    bind_tree_values(ts, cat, values).await
+}
+
+/// Fills `values`' subtree and managed sets.
+async fn bind_tree_values(
+    ts: &TenantSession,
+    cat: &TenantCatalog,
+    values: &mut SessionValues,
+) -> Result<()> {
+    let tree = tree_binding(ts, cat).await?;
     let p = super::authz::privileges(ts, cat);
     let admin = p.unrestricted() || p.allows(Action::TenantAdmin, Target::Tenant);
-    if tree.len() as u64 > max {
-        // A large subtree goes to `__sprig_sys.__sprig_subtree` on the
-        // tenant's clusters, and the statement reads it there.
-        let mut clusters = crate::exec::router::placement_digest(svc, cat)
-            .map(|p| p.1)
-            .unwrap_or_default();
-        if !clusters.contains(&ts.principal.backend.cluster) {
-            clusters.push(ts.principal.backend.cluster.clone());
-        }
-        if clusters.is_empty() {
-            return Err(sprig_sql::rls::unsupported(&format!(
-                "a subtree of {} tenants (rls.inline_subtree_max is {max}) before the tenant's \
-                 clusters are known",
-                tree.len()
-            )));
-        }
-        for c in &clusters {
-            subtree_sync(svc, ts.tenant.0, &tree, c).await?;
-        }
+    if tree.table {
         values.subtree = None;
         values.subtree_table = true;
         values.managed_table = admin;
@@ -1404,12 +1428,113 @@ pub async fn bind_tree(
         return Ok(());
     }
     values.managed = Some(if admin {
-        Arc::clone(&tree)
+        Arc::clone(&tree.tree)
     } else {
         Arc::new(Vec::new())
     });
-    values.subtree = Some(tree);
+    values.subtree = Some(tree.tree);
     Ok(())
+}
+
+/// A statement of the session that calls the session functions itself
+/// (`SELECT SPRIG_CLAIM('org')`), with each call bound to the session's
+/// value as a policy binds it ([`sprig_sql::rls::expr::bind_statement`]);
+/// `None` when it calls none. Works whether or not the tenant uses
+/// row-level security.
+///
+/// # Errors
+/// 39364 for a call that can't be bound (a key that isn't one string);
+/// the directory's for the subtree functions.
+pub async fn bind_session_functions(
+    ts: &TenantSession,
+    cat: &TenantCatalog,
+    text: &str,
+    lex: &LexOptions,
+) -> Result<Option<String>> {
+    let mut values = SessionValues::of(ts, cat);
+    let up = text.to_ascii_uppercase();
+    if up.contains("SPRIG_TENANT_IN_SUBTREE") || up.contains("SPRIG_TENANT_MANAGED") {
+        bind_tree_values(ts, cat, &mut values).await?;
+    }
+    let nbe = lex.no_backslash_escapes;
+    let claim = |k: &str| {
+        values
+            .claims
+            .as_deref()
+            .and_then(|c| c.get(k))
+            .map(|v| literal(v, nbe))
+    };
+    let attr = |k: &str| {
+        values
+            .attrs
+            .as_ref()
+            .and_then(|c| c.get(k))
+            .map(|v| literal(v, nbe))
+    };
+    let b = LiteralBinder {
+        current_user: &values.current_user,
+        user_id: values.user_id,
+        tenant_id: values.tenant,
+        home_tenant_id: values.home,
+        space: values.space,
+        claim: &claim,
+        attr: &attr,
+        subtree: values.subtree.as_deref().map(Vec::as_slice),
+        managed: values.managed.as_deref().map(Vec::as_slice),
+        subtree_table: values.subtree_table,
+        managed_table: values.managed_table,
+        no_backslash_escapes: nbe,
+    };
+    expr::bind_statement(text, lex, &b)
+}
+
+/// The session tenant's subtree as the subtree functions read it.
+#[derive(Debug, Clone)]
+pub struct TreeBinding {
+    /// The tenant and its descendants.
+    pub tree: Arc<Vec<u64>>,
+    /// Above `rls.inline_subtree_max`: read from
+    /// `__sprig_sys.__sprig_subtree_v` (written to the tenant's clusters
+    /// now), not inlined.
+    pub table: bool,
+}
+
+/// The session tenant's subtree, written to `__sprig_sys.__sprig_subtree`
+/// on the tenant's clusters when it is above `rls.inline_subtree_max`.
+///
+/// # Errors
+/// The directory's; 39366 above the limit before the tenant's clusters
+/// are known.
+pub async fn tree_binding(ts: &TenantSession, cat: &TenantCatalog) -> Result<TreeBinding> {
+    let svc = ts.services();
+    let tree = subtree(svc, ts.tenant).await?;
+    let max = svc.settings.get(
+        &sprig_auth::authz::settings::RLS_INLINE_SUBTREE_MAX,
+        &cat.setting_ctx(&svc.dc),
+        Some(&cat.settings),
+    );
+    if tree.len() as u64 <= max {
+        return Ok(TreeBinding { tree, table: false });
+    }
+    // A large subtree goes to `__sprig_sys.__sprig_subtree` on the
+    // tenant's clusters, and the statement reads it there.
+    let mut clusters = crate::exec::router::placement_digest(svc, cat)
+        .map(|p| p.1)
+        .unwrap_or_default();
+    if !clusters.contains(&ts.principal.backend.cluster) {
+        clusters.push(ts.principal.backend.cluster.clone());
+    }
+    if clusters.is_empty() {
+        return Err(sprig_sql::rls::unsupported(&format!(
+            "a subtree of {} tenants (rls.inline_subtree_max is {max}) before the tenant's \
+             clusters are known",
+            tree.len()
+        )));
+    }
+    for c in &clusters {
+        subtree_sync(svc, ts.tenant.0, &tree, c).await?;
+    }
+    Ok(TreeBinding { tree, table: true })
 }
 
 // Change sinks over a table are not paused when its policies come to bind
@@ -1700,7 +1825,7 @@ pub async fn definers_of(
         return Ok(set.clone());
     }
     let pool = svc.locator.ctl_pool(cluster).await?;
-    let mut conn = pool.get_conn().await.map_err(|e| {
+    let mut conn = pool.get_conn_bounded().await.map_err(|e| {
         SprigError::new(
             SprigCode::BackendUnavailable,
             format!("sprig_ctl on {cluster}: {e}"),
@@ -1739,6 +1864,7 @@ pub async fn definers_of(
 pub fn definer_contexts(
     cat: &TenantCatalog,
     accounts: &std::collections::BTreeSet<String>,
+    tree: Option<&TreeBinding>,
 ) -> Option<serde_json::Value> {
     use sprig_auth::authz::CompiledPrivileges;
     let (Some(state), Some(auth)) = (AuthzState::of(cat), TenantAuth::of(cat)) else {
@@ -1756,6 +1882,14 @@ pub fn definer_contexts(
         };
         let c = CompiledPrivileges::compile(state, u, &state.default_roles(u));
         let r = sprig_auth::authz::rls::compile(cat, &c, u);
+        // A definer is a user of this tenant: its subtree is the tenant's,
+        // and it manages it when it administers the tenant.
+        let admin = c.everything || c.allows(Action::TenantAdmin, Target::Tenant);
+        let inline = |on: bool| -> Vec<u64> {
+            tree.filter(|t| on && !t.table)
+                .map(|t| t.tree.to_vec())
+                .unwrap_or_default()
+        };
         d.insert(
             a.clone(),
             serde_json::json!({
@@ -1768,10 +1902,15 @@ pub fn definer_contexts(
                     "tid": cat.tenant.0,
                     "htid": cat.tenant.0,
                     "space": (row.home_space_id != 0).then_some(row.home_space_id),
+                    // No token: claims are a session's, and the caller's
+                    // with the definer's policies could show rows
+                    // neither sees.
                     "claims": serde_json::Value::Null,
                     "attrs": row.attributes.clone().unwrap_or(serde_json::Value::Null),
-                    "sub": Vec::<u64>::new(),
-                    "man": Vec::<u64>::new(),
+                    "sub": inline(true),
+                    "man": inline(admin),
+                    "subt": u8::from(tree.is_some_and(|t| t.table)),
+                    "mant": u8::from(admin && tree.is_some_and(|t| t.table)),
                 }
             }),
         );
@@ -1974,7 +2113,7 @@ pub async fn narrow_backend(
         return Ok(());
     }
     let pool = svc.locator.ctl_pool(cluster).await?;
-    let mut conn = pool.get_conn().await.map_err(|e| {
+    let mut conn = pool.get_conn_bounded().await.map_err(|e| {
         SprigError::new(
             SprigCode::BackendUnavailable,
             format!("sprig_ctl on {cluster}: {e}"),
@@ -2164,7 +2303,7 @@ pub async fn tainted(
     };
     if !missing.is_empty() {
         let ep = ts.services().locator.writer(ts.tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(|e| {
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
         let list = missing

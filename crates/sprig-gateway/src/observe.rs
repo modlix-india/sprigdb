@@ -61,6 +61,12 @@ pub fn backend_time(d: Duration) {
     });
 }
 
+/// Counts a failed request for the administration agent: its code at
+/// `<protocol>.<request>`; no text, no names.
+fn count_error(code: u16, protocol: &str, request: &str) {
+    sprig_common::incidents::record_code(code, &format!("{protocol}.{request}"));
+}
+
 /// The `result` label of an error.
 #[must_use]
 pub fn classify(e: &SprigError) -> &'static str {
@@ -255,7 +261,10 @@ impl SessionExec for ObservedSession {
         let total = started.elapsed();
         let result = match &r {
             Ok(_) => "ok",
-            Err(e) => classify(e),
+            Err(e) => {
+                count_error(sprig_common::incidents::code_of(e), protocol, "point_read");
+                classify(e)
+            }
         };
         let backend = Duration::from_nanos(waited.load(Ordering::Relaxed));
         let busy = self
@@ -290,6 +299,7 @@ impl SessionExec for ObservedSession {
             return self.inner.execute(cx, req, out).await;
         }
         let protocol = cx.session.protocol.as_str();
+        let request = req.name();
         // One span per request: an engine statement inside a
         // traced command (MongoDB's) is part of that command's span.
         let span = if self.internal && in_traced_request() {
@@ -312,6 +322,7 @@ impl SessionExec for ObservedSession {
         let mut sink = Watch {
             inner: out,
             result: None,
+            code: None,
         };
         let run = self.inner.execute(cx, req, &mut sink);
         let r = match &span {
@@ -327,6 +338,11 @@ impl SessionExec for ObservedSession {
             Ok(_) => sink.result.unwrap_or("ok"),
             Err(e) => classify(e),
         };
+        match (&r, sink.code) {
+            (Err(e), _) => count_error(sprig_common::incidents::code_of(e), protocol, request),
+            (Ok(_), Some(code)) => count_error(code, protocol, request),
+            _ => {}
+        }
         if let Some(span) = &span {
             span.record("result", result);
             if result != "ok" {
@@ -358,6 +374,10 @@ impl SessionExec for ObservedSession {
 
     async fn abandoned(&mut self, cx: &mut ExecCtx<'_>, why: Abandon) {
         self.inner.abandoned(cx, why).await;
+    }
+
+    fn take_cut_commit(&mut self) -> Option<Result<()>> {
+        self.inner.take_cut_commit()
     }
 
     async fn close(&mut self) {
@@ -403,6 +423,8 @@ impl SessionExec for ObservedSession {
 struct Watch<'a> {
     inner: &'a mut dyn ResultSink,
     result: Option<&'static str>,
+    /// The first error's number, for the administration agent's counts.
+    code: Option<u16>,
 }
 
 #[async_trait]
@@ -434,6 +456,8 @@ impl ResultSink for Watch<'_> {
     async fn error(&mut self, err: &SprigError) -> Result<()> {
         // The first error of a multi-statement decides.
         self.result.get_or_insert(classify(err));
+        self.code
+            .get_or_insert(sprig_common::incidents::code_of(err));
         self.inner.error(err).await
     }
     async fn column_list(&mut self, columns: &[ColumnDef], end: EndOfRows) -> Result<()> {

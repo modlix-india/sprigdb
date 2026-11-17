@@ -382,7 +382,8 @@ async fn row_level_security_on_kv_and_vectors() {
         for db in ["redis", VDB] {
             admin
                 .query_drop(format!(
-                    "GRANT SELECT, INSERT, UPDATE, DELETE ON {db}.* TO '{u}'@'%'"
+                    // WATCH: `Changes.Watch` needs it as well as SELECT.
+                    "GRANT SELECT, INSERT, UPDATE, DELETE, WATCH ON {db}.* TO '{u}'@'%'"
                 ))
                 .await
                 .unwrap();

@@ -203,6 +203,7 @@ pub fn js_signature(d: &Declaration) -> sprig_logic_compile::js::Signature {
             .collect(),
         returns: d.returns.as_deref().map(crate::declare::Param::ir_ty),
         row: None,
+        on: None,
     }
 }
 
@@ -250,6 +251,7 @@ pub fn js_signature_of(sig: &serde_json::Value) -> sprig_logic_compile::js::Sign
                 })
             }),
         row: None,
+        on: None,
     }
 }
 
@@ -269,10 +271,22 @@ pub fn compile_version(
     cat: &dyn sprig_logic_compile::Columns,
     opts: &Options,
 ) -> Result<sprig_logic_compile::Compiled> {
-    if runtime == sprig_logic_compile::Runtime::Javascript {
-        sprig_logic_compile::js::compile_with(name, source, &js_signature_of(signature), cat, opts)
-    } else {
-        compile(runtime, source, cat, opts)
+    match runtime {
+        sprig_logic_compile::Runtime::Javascript => sprig_logic_compile::js::compile_with(
+            name,
+            source,
+            &js_signature_of(signature),
+            cat,
+            opts,
+        ),
+        sprig_logic_compile::Runtime::Lua => sprig_logic_compile::lua::compile_with(
+            name,
+            source,
+            &js_signature_of(signature),
+            cat,
+            opts,
+        ),
+        _ => compile(runtime, source, cat, opts),
     }
 }
 
@@ -344,17 +358,94 @@ pub fn compile_bound(
     cat: &dyn sprig_logic_compile::Columns,
     opts: &Options,
 ) -> Result<sprig_logic_compile::Compiled> {
-    if d.runtime == sprig_logic_compile::Runtime::Javascript {
-        sprig_logic_compile::js::compile_with(
+    match d.runtime {
+        sprig_logic_compile::Runtime::Javascript => sprig_logic_compile::js::compile_with(
             &d.name,
             &d.body,
             &sprig_logic_compile::js::Signature::row_of(table),
             cat,
             opts,
-        )
-    } else {
-        compile(d.runtime, &d.body, cat, opts)
+        ),
+        // Lua code sees the row through `ctx`, as its test runs give it.
+        sprig_logic_compile::Runtime::Lua => sprig_logic_compile::lua::compile_with(
+            &d.name,
+            &d.body,
+            &sprig_logic_compile::js::Signature::row_of(table),
+            cat,
+            opts,
+        ),
+        _ => compile(d.runtime, &d.body, cat, opts),
     }
+}
+
+/// The engine tier must accept a validation's or trigger's source too
+/// (it defines the language, and test runs run it there): QuickJS with
+/// the row's names, Lua with `ctx`.
+///
+/// # Errors
+/// 39861 for source the engine tier refuses.
+fn bound_engine_check(d: &Declaration) -> Result<()> {
+    let sig = match d.runtime {
+        sprig_logic_compile::Runtime::Javascript => crate::testrun::js_row_sig(&d.body),
+        sprig_logic_compile::Runtime::Lua => sprig_logic_js::ScriptSig {
+            params: vec![("ctx".to_owned(), sprig_logic_js::ParamTy::Json)],
+            scalar: false,
+        },
+        _ => return Ok(()),
+    };
+    sprig_logic_js::Program::new(d.runtime.as_str(), &d.name, &d.body, sig)?;
+    Ok(())
+}
+
+/// A validation's or after-commit trigger's deploy checks against
+/// `table`, without recording or deploying anything: the table exists,
+/// the body compiles (and QuickJS accepts JavaScript), it compiles into
+/// the MariaDB tier, and its parameters name the table's columns. The
+/// notes say how it would be enforced.
+///
+/// # Errors
+/// As [`deploy_bound`] would refuse it: 1146, the compiler's, 39862,
+/// 39874.
+pub fn check_bound(
+    d: &Declaration,
+    db: &str,
+    table: &str,
+    cols: &StaticColumns,
+    opts: &Options,
+) -> Result<Vec<String>> {
+    if !sprig_logic_compile::Columns::has_table(cols, table) {
+        return Err(SprigError::standard(
+            1146,
+            *b"42S02",
+            format!("Table '{db}.{table}' doesn't exist"),
+        ));
+    }
+    let compiled = compile_bound(d, table, cols, opts)?;
+    bound_engine_check(d)?;
+    let placed = placement::place(&compiled, d.tier, true)?;
+    let (Some(f), Tier::MariaDb) = (&compiled.ir, placed.tier) else {
+        let why: Vec<String> = placed.reasons.iter().map(ToString::to_string).collect();
+        return Err(unsupported(format!(
+            "{} {} must compile into MariaDB ({})",
+            d.kind.as_str(),
+            d.name,
+            why.join("; ")
+        )));
+    };
+    let bound = enforce::bind_row(f, table, cols)?;
+    let mut notes = Vec::new();
+    if d.kind == Kind::Validation {
+        let (en, why) = enforce::plan_validation(f, &bound, &d.events, 0, 0);
+        notes.push(match en {
+            Enforcement::Check { .. } => "enforced by a CHECK constraint".to_owned(),
+            Enforcement::Triggers => {
+                format!("enforced by BEFORE triggers ({})", why.unwrap_or_default())
+            }
+        });
+    } else {
+        notes.push("runs after each commit, from the change feed".to_owned());
+    }
+    Ok(notes)
 }
 
 /// The engine's parameter type for an IR type.
@@ -506,7 +597,18 @@ pub struct At<'a> {
     pub shards: Option<&'a mut dyn ShardSessions>,
     /// The tenant, for a staged rollout `BY TENANT` (decided at deploy).
     pub tenant: u64,
+    /// The database's name, for `db.call("db.name")` and `db.publish`.
+    pub db_name: &'a str,
+    /// The database's streams, for a compiled `db.publish`
+    /// ([`crate::calls::Env::with_streams`]).
+    pub streams: StreamList,
 }
+
+/// Streams by name: what a compiled `db.publish` writes, or why it can't.
+pub type StreamList = Vec<(
+    String,
+    std::result::Result<sprig_logic_compile::link::StreamTarget, String>,
+)>;
 
 /// [`deploy()`] at a fixed version and on several shards.
 ///
@@ -572,6 +674,9 @@ pub async fn deploy_at(
         None => store.next_version(t.catalog, module.module_id).await?,
     };
     let cols = columns(session, t.shard_schema).await?;
+    let env = crate::calls::Env::new(cols, at.db_name)
+        .with_callees(crate::calls::callees(t.catalog, t.catalog_schema, t.db_id).await?)
+        .with_streams(&at.streams);
     let opts = Options {
         module_id: module.module_id,
         version,
@@ -582,10 +687,14 @@ pub async fn deploy_at(
     let mut compiled = if d.runtime == sprig_logic_compile::Runtime::Javascript {
         // The JavaScript front end: the declaration gives
         // the parameters' types and `RETURNS`.
-        sprig_logic_compile::js::compile_with(&d.name, &d.body, &js_signature(d), &cols, &opts)?
+        sprig_logic_compile::js::compile_with(&d.name, &d.body, &js_signature(d), &env, &opts)?
+    } else if d.runtime == sprig_logic_compile::Runtime::Lua {
+        // The Lua front end takes the same signature.
+        sprig_logic_compile::lua::compile_with(&d.name, &d.body, &js_signature(d), &env, &opts)?
     } else {
-        compile(d.runtime, &d.body, &cols, &opts)?
+        compile(d.runtime, &d.body, &env, &opts)?
     };
+    let cols = &env.cols;
     let script = matches!(
         d.runtime,
         sprig_logic_compile::Runtime::Javascript | sprig_logic_compile::Runtime::Lua
@@ -609,10 +718,27 @@ pub async fn deploy_at(
     }
     let computed_notes = match (&previous, &compiled.ir) {
         (Some(prev), Some(f)) if d.kind == Kind::Function => {
-            computed_dependents(t.catalog, &store, prev, f, &cols).await?
+            computed_dependents(t.catalog, &store, prev, f, cols).await?
         }
         _ => Vec::new(),
     };
+    // Compiled code calling this module was made for its signature and
+    // tier: a version that changes them would break those calls.
+    if let (Some(prev), Some(f)) = (&previous, &compiled.ir) {
+        crate::calls::check_callers(
+            t.catalog,
+            t.catalog_schema,
+            t.db_id,
+            crate::calls::NewVersion {
+                module_id: prev.module_id,
+                name: &d.name,
+                func: f,
+                compiled: placed.tier == Tier::MariaDb,
+                writes: !compiled.analysis.writes.is_empty(),
+            },
+        )
+        .await?;
+    }
     // A staged rollout: the active version stays for most
     // callers; it must take the same parameters, in the same language,
     // with the same rights, so one wrapper can hold both.
@@ -650,6 +776,34 @@ pub async fn deploy_at(
                 .find(|v| v.version == active)
                 .cloned()
                 .ok_or_else(|| blocked(format!("needs the active version {active}")))?;
+            let mut spec = spec;
+            if spec.by == crate::rollout::RolloutBy::Key(None) {
+                // `BY KEY p`: the pick reads argument p, a whole number
+                // or text (its text is the same in MariaDB and here).
+                let name = d.rollout_key.clone().unwrap_or_default();
+                let at = compiled.ir.as_ref().and_then(|f| {
+                    f.params
+                        .iter()
+                        .position(|p| p.name.eq_ignore_ascii_case(&name))
+                        .map(|i| (i, f.params[i].ty))
+                });
+                match at {
+                    Some((
+                        i,
+                        sprig_logic_compile::ir::Ty::Int | sprig_logic_compile::ir::Ty::Str,
+                    )) => {
+                        spec.by = crate::rollout::RolloutBy::Key(u16::try_from(i).ok());
+                    }
+                    Some(_) => {
+                        return Err(blocked(format!(
+                            "by key reads a whole-number or text parameter ({name} isn't)"
+                        )));
+                    }
+                    None => {
+                        return Err(blocked(format!("by key needs a parameter {name}")));
+                    }
+                }
+            }
             Some((spec, av))
         }
         (Some(_), _) => {
@@ -797,6 +951,17 @@ pub async fn deploy_at(
                         &crate::rollout::user_condition(module.module_id, spec.pct),
                         spec.pct,
                     ),
+                    crate::rollout::RolloutBy::Key(i) => deploy::rollout_wrapper(
+                        t.shard_schema,
+                        &active_side,
+                        &cand_side,
+                        &crate::rollout::key_condition(
+                            module.module_id,
+                            spec.pct,
+                            &deploy::wrapper_param(f, i.unwrap_or(0)),
+                        ),
+                        spec.pct,
+                    ),
                     // Decided here: one tenant, one pick.
                     crate::rollout::RolloutBy::Tenant => {
                         let cand =
@@ -815,6 +980,32 @@ pub async fn deploy_at(
                         )
                     }
                 };
+                // The call entry picks as the wrapper does.
+                let cond = match spec.by {
+                    crate::rollout::RolloutBy::User => {
+                        crate::rollout::user_condition(module.module_id, spec.pct)
+                    }
+                    crate::rollout::RolloutBy::Key(i) => crate::rollout::key_condition(
+                        module.module_id,
+                        spec.pct,
+                        &deploy::wrapper_param(f, i.unwrap_or(0)),
+                    ),
+                    crate::rollout::RolloutBy::Tenant => {
+                        if crate::rollout::picks_candidate(*spec, "", at.tenant, module.module_id) {
+                            "TRUE".to_owned()
+                        } else {
+                            "FALSE".to_owned()
+                        }
+                    }
+                };
+                let entry_name = sprig_logic_compile::link::call_entry(module.module_id);
+                if let Some(r) = plan.routines.iter_mut().find(|r| r.name == entry_name) {
+                    r.sql = deploy::call_entry(
+                        t.shard_schema,
+                        &active_side,
+                        Some((&cand_side, cond.as_str())),
+                    );
+                }
                 if let Some(last) = plan.routines.last_mut() {
                     last.sql = sql;
                 }
@@ -936,6 +1127,12 @@ pub struct Bind<'a> {
     pub definer: String,
     /// Now, Unix ms (schedules).
     pub now_ms: u64,
+    /// The database's streams, for a compiled `db.publish`.
+    pub streams: StreamList,
+    /// Validations and triggers: the tables' columns to compile against
+    /// instead of reading them from the first shard (the columns an
+    /// `ALTER TABLE` deployed together with this version leaves).
+    pub columns: Option<&'a StaticColumns>,
 }
 
 /// A bound deploy whose routines are on every shard, waiting for the
@@ -969,12 +1166,28 @@ pub struct Pending {
     pub definer: String,
     /// `CHECK` enforcement: the constraint name and message.
     pub check: Option<(String, String)>,
+    /// An after-commit trigger's staged rollout: the active version,
+    /// which keeps the rows outside the candidate's share of keys, and
+    /// the stage.
+    pub staged: Option<(u64, crate::rollout::RolloutSpec)>,
 }
 
 impl Pending {
     /// Notes for the client.
     #[must_use]
     pub fn notes(&self) -> Vec<String> {
+        let mut v = self.notes_inner();
+        if let Some((active, spec)) = self.staged {
+            v.push(format!(
+                "version {} is the candidate for the rows whose primary key falls in {}% of keys; \
+                 version {active} runs the rest. ALTER TRIGGER ... ROLLOUT TO n | PROMOTE | ABORT",
+                self.version, spec.pct
+            ));
+        }
+        v
+    }
+
+    fn notes_inner(&self) -> Vec<String> {
         let mut v = vec![format!(
             "{} module {} version {}: {}",
             self.kind.as_str(),
@@ -1069,11 +1282,17 @@ pub async fn deploy_bound(
     let (table, object_id) = b
         .table
         .ok_or_else(|| SprigError::internal("a validation or trigger without its table"))?;
-    let cols = {
+    let cols = if let Some(c) = b.columns {
+        c.clone()
+    } else {
         let s = shards.session(&first).await?;
         columns(s, &first).await?
     };
-    if !sprig_logic_compile::Columns::has_table(&cols, table) {
+    let env = crate::calls::Env::new(cols, b.db_name)
+        .with_callees(crate::calls::callees(t.catalog, t.catalog_schema, t.db_id).await?)
+        .with_streams(&b.streams);
+    let cols = &env.cols;
+    if !sprig_logic_compile::Columns::has_table(cols, table) {
         return Err(SprigError::standard(
             1146,
             *b"42S02",
@@ -1087,17 +1306,8 @@ pub async fn deploy_bound(
         compile_max_cost: t.compile_max_cost,
         definer_security: true,
     };
-    let compiled = compile_bound(d, table, &cols, &opts)?;
-    if d.runtime == sprig_logic_compile::Runtime::Javascript {
-        // QuickJS must accept it too: the engine tier defines the
-        // language, and test runs run it there.
-        sprig_logic_js::Program::new(
-            d.runtime.as_str(),
-            &d.name,
-            &d.body,
-            crate::testrun::js_row_sig(&d.body),
-        )?;
-    }
+    let compiled = compile_bound(d, table, &env, &opts)?;
+    bound_engine_check(d)?;
     let placed = placement::place(&compiled, d.tier, t.single_shard)?;
     let (Some(f), Some(p), Tier::MariaDb) = (&compiled.ir, &compiled.plsql, placed.tier) else {
         let why: Vec<String> = placed.reasons.iter().map(ToString::to_string).collect();
@@ -1113,7 +1323,39 @@ pub async fn deploy_bound(
             }
         )));
     };
-    let bound = enforce::bind_row(f, table, &cols)?;
+    let bound = enforce::bind_row(f, table, cols)?;
+    // `SPRIG_ROLLOUT = n` on an after-commit trigger: the new version is
+    // the candidate for the rows whose primary key falls in n% of keys;
+    // the worker picks per event (`crate::triggers::maria`). Both
+    // versions' entries stay on the shards; any other deploy ends it.
+    let staged = match (d.rollout, module.active_version) {
+        (Some(spec), Some(active)) if d.kind == Kind::Trigger && exists && active != version => {
+            let prev = store.binding(t.catalog, module.module_id).await?;
+            let same_events = prev.as_ref().is_some_and(|p| {
+                p.events == d.events.join(",")
+                    && p.when_fields == d.when_fields
+                    && p.object_id == Some(object_id)
+            });
+            if !same_events {
+                return Err(SprigError::new(
+                    SprigCode::LogicRolloutBlocked,
+                    format!(
+                        "{}: a staged rollout keeps the trigger's table, events and FOR UPDATE OF \
+                         columns; deploy without SPRIG_ROLLOUT to switch at once",
+                        d.name
+                    ),
+                ));
+            }
+            Some((
+                active,
+                crate::rollout::RolloutSpec {
+                    pct: spec.pct,
+                    by: crate::rollout::RolloutBy::Key(None),
+                },
+            ))
+        }
+        _ => None,
+    };
     let mut binding = match store.binding(t.catalog, module.module_id).await? {
         Some(x) => x,
         None => BindingRow {
@@ -1201,7 +1443,13 @@ pub async fn deploy_bound(
                         kind: "TRIGGER",
                         name: name.clone(),
                         sql: enforce::validation_trigger(
-                            &first, &name, table, ev, &p.entry, &bound,
+                            &first,
+                            &name,
+                            table,
+                            ev,
+                            &p.entry,
+                            &bound,
+                            t.budget_ms,
                         ),
                         oracle: false,
                     });
@@ -1286,6 +1534,7 @@ pub async fn deploy_bound(
         schedule: None,
         definer: b.definer.clone(),
         check,
+        staged,
     })
 }
 
@@ -1312,7 +1561,11 @@ fn arg_literal(v: &serde_json::Value) -> String {
 
 /// The schedule's own routine, `__sprig_l<s>_v<v>`: `SQL SECURITY
 /// DEFINER`, so the procedure it calls runs with the schedule's
-/// definer's rights, whoever calls it (the worker, as `sprig_ctl`).
+/// definer's rights, whoever calls it (the worker, as `sprig_ctl`). It
+/// calls the target's call entry (`target` is its name), not its wrapper,
+/// so the target runs under the run's `logic.job_budget_ms` (the worker's
+/// `SET STATEMENT`) rather than the wrapper's `logic.function_budget_ms`;
+/// in its own transaction, rolled back on an error, as the wrapper's.
 #[must_use]
 pub fn schedule_routine(
     schema: &str,
@@ -1320,10 +1573,15 @@ pub fn schedule_routine(
     target: &str,
     args: &[serde_json::Value],
 ) -> String {
-    let list: Vec<String> = args.iter().map(arg_literal).collect();
+    let mut list: Vec<String> = args.iter().map(arg_literal).collect();
+    list.push("v__event".to_owned());
+    list.push("v__result".to_owned());
     format!(
         "CREATE OR REPLACE PROCEDURE `{}`.`{}`()\n  SQL SECURITY DEFINER\n  COMMENT 'sprig logic schedule'\n\
-         BEGIN\n  CALL `{}`({});\nEND",
+         BEGIN\n  DECLARE v__event VARCHAR(64);\n  DECLARE v__result LONGTEXT;\n  DECLARE v__own INT DEFAULT 0;\n  \
+         DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN IF v__own = 1 THEN ROLLBACK; END IF; RESIGNAL; END;\n  \
+         IF @@in_transaction = 0 AND @@autocommit = 1 THEN START TRANSACTION; SET v__own = 1; END IF;\n  \
+         CALL `{}`({});\n  IF v__own = 1 THEN COMMIT; END IF;\nEND",
         schema.replace('`', "``"),
         name.replace('`', "``"),
         target.replace('`', "``"),
@@ -1395,7 +1653,12 @@ async fn deploy_schedule(
             .await?;
     }
     let (_, entry) = sprig_logic_compile::plsql::names(module.module_id, version);
-    let sql = schedule_routine(first, &entry, &spec.target.name, &spec.args);
+    let sql = schedule_routine(
+        first,
+        &entry,
+        &sprig_logic_compile::link::call_entry(target.module_id),
+        &spec.args,
+    );
     let plan = Plan {
         schema: first.to_owned(),
         routines: vec![Routine {
@@ -1414,6 +1677,9 @@ async fn deploy_schedule(
         reads: Vec::new(),
         writes: Vec::new(),
         cost: 1,
+        calls: Vec::new(),
+        reaches: Vec::new(),
+        call_depth: 0,
     };
     store
         .add_version(
@@ -1475,6 +1741,7 @@ async fn deploy_schedule(
         }),
         definer: b.definer.clone(),
         check: None,
+        staged: None,
     })
 }
 
@@ -1501,9 +1768,25 @@ pub async fn finish(
     if let Some(s) = &p.schedule {
         store.put_schedule(catalog, s).await?;
     }
-    store
-        .activate(catalog, p.module_id, p.version, catalog_version)
+    if let Some((active, spec)) = p.staged {
+        // The candidate: the active version keeps the other rows.
+        crate::rollout::put(
+            catalog,
+            catalog_schema,
+            p.module_id,
+            active,
+            p.version,
+            spec,
+        )
         .await?;
+    } else {
+        if p.kind == Kind::Trigger {
+            crate::rollout::clear(catalog, catalog_schema, p.module_id).await?;
+        }
+        store
+            .activate(catalog, p.module_id, p.version, catalog_version)
+            .await?;
+    }
     let _ = store
         .log(
             catalog,
@@ -1603,6 +1886,32 @@ mod tests {
     }
 
     #[test]
+    fn javascript_helpers_make_a_computed_column_and_try_does_not() {
+        let c = call("ALTER TABLE products ADD COLUMN c DOUBLE AS (net(price, stock)) STORED");
+        // An arrow helper and a helper with several returns: one CASE.
+        let body = "const tax = (x) => x * 0.2;
+            function gross(a) { if (a > 100) return a * 0.95; return a; }
+            return gross(price * stock) + tax(price * stock);";
+        let expr = computed_column("net", "javascript", body, &net_sig(), &c).unwrap();
+        assert!(expr.contains("CASE") && expr.contains("(price)"), "{expr}");
+        // `try` and loops have no expression form: 39862 with the reason.
+        for (body, why) in [
+            (
+                "try { return price * stock; } catch (e) { return 0; }",
+                "try/catch",
+            ),
+            (
+                "let n = 0; do { n++; } while (n < stock); return n * price;",
+                "a loop",
+            ),
+        ] {
+            let e = computed_column("net", "javascript", body, &net_sig(), &c).unwrap_err();
+            assert_eq!(e.code(), Some(SprigCode::LogicUnsupported), "{body}");
+            assert!(e.message.contains(why), "{}", e.message);
+        }
+    }
+
+    #[test]
     fn nondeterministic_code_makes_no_computed_column() {
         for (stored, sql) in [
             (
@@ -1625,10 +1934,25 @@ mod tests {
                 assert!(e.message.contains("js.nondeterministic"), "{}", e.message);
             }
         }
-        // Lua has no compiler front end.
+        // Lua: arithmetic on a NULL argument (sprig.null) is Lua's error,
+        // which a generated column can't raise; tested first, it computes.
         let c = call("ALTER TABLE p ADD COLUMN c DOUBLE AS (net(price, stock))");
         let e = computed_column("net", "lua", "return price * stock", &net_sig(), &c).unwrap_err();
-        assert!(e.message.contains("lua.front_end"), "{}", e.message);
+        assert_eq!(e.code(), Some(SprigCode::LogicUnsupported), "{}", e.message);
+        assert!(e.message.contains("39865"), "{}", e.message);
+        let expr = computed_column(
+            "net",
+            "lua",
+            "if price == sprig.null or stock == sprig.null then return nil end
+             return price * stock * 2",
+            &net_sig(),
+            &c,
+        )
+        .unwrap();
+        assert!(expr.contains("(price)") && expr.contains("CASE"), "{expr}");
+        let e = computed_column("net", "lua", "return math.random() * price", &net_sig(), &c)
+            .unwrap_err();
+        assert!(e.message.contains("lua.nondeterministic"), "{}", e.message);
     }
 
     fn sales() -> StaticColumns {
@@ -1675,7 +1999,7 @@ mod tests {
             enforce::plan_validation(f, &bound, &d.events, 7, 1).0,
             Enforcement::Triggers
         ));
-        let t = enforce::validation_trigger("s", "tg", "sales", "update", "e", &bound);
+        let t = enforce::validation_trigger("s", "tg", "sales", "update", "e", &bound, 5000);
         assert!(
             t.contains("NEW.`qty`") && t.contains("OLD.`qty`") && t.contains("'update'"),
             "{t}"
@@ -1703,5 +2027,84 @@ mod tests {
         d.runtime = sprig_logic_compile::Runtime::Lua;
         let c = compile_bound(&d, "sales", &sales(), &opts).unwrap();
         assert!(!c.compilable());
+        // Lua sees the row through `ctx`, as its test runs give it.
+        d.body = "if ctx.old ~= sprig.null and ctx.old.qty ~= sprig.null
+                     and ctx.row.qty ~= sprig.null and ctx.row.qty < ctx.old.qty then
+                    sprig.reject('qty went down')
+                  end"
+        .to_owned();
+        let c = compile_bound(&d, "sales", &sales(), &opts).unwrap();
+        assert!(c.compilable(), "{:?}", c.analysis.reasons);
+        let names: Vec<&str> =
+            c.ir.as_ref()
+                .unwrap()
+                .params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect();
+        assert_eq!(names, ["old_qty", "qty", "op"]);
+    }
+
+    #[test]
+    fn javascript_try_helpers_and_do_while_in_validations_and_triggers() {
+        let opts = Options::default();
+        // A helper with several returns over the new row only: still a
+        // CHECK with one message.
+        let d = crate::declare::parse(
+            "CREATE VALIDATION qty_cap ON sales FOR INSERT, UPDATE LANGUAGE javascript AS $$
+             function cap(status) { if (status === 'bulk') return 1000; return 10; }
+             export default function (row) { if (row.qty > cap(row.status)) sprig.reject('too many'); }
+             $$",
+        )
+        .unwrap();
+        let c = compile_bound(&d, "sales", &sales(), &opts).unwrap();
+        assert!(c.compilable(), "{:?}", c.analysis.reasons);
+        let f = c.ir.as_ref().unwrap();
+        let bound = enforce::bind_row(f, "sales", &sales()).unwrap();
+        assert!(matches!(
+            enforce::plan_validation(f, &bound, &d.events, 7, 1).0,
+            Enforcement::Check { .. }
+        ));
+        // `try`, `finally` and `do`: BEFORE triggers calling the routine.
+        let d = crate::declare::parse(
+            "CREATE VALIDATION steps ON sales FOR INSERT, UPDATE LANGUAGE javascript AS $$
+             export default function (row, old) {
+               let n = 0;
+               do { n++; } while (n < row.qty && n < 5);
+               try {
+                 if (old !== null && old.qty > row.qty) throw new Error('falls');
+               } catch (e) {
+                 sprig.reject(`qty ${e.message} after ${n} steps`);
+               } finally {
+                 n = 0;
+               }
+             }
+             $$",
+        )
+        .unwrap();
+        let c = compile_bound(&d, "sales", &sales(), &opts).unwrap();
+        assert!(c.compilable(), "{:?}", c.analysis.reasons);
+        let f = c.ir.as_ref().unwrap();
+        let bound = enforce::bind_row(f, "sales", &sales()).unwrap();
+        assert!(matches!(
+            enforce::plan_validation(f, &bound, &d.events, 7, 1).0,
+            Enforcement::Triggers
+        ));
+        // An after-commit trigger catching a duplicate key.
+        let d = crate::declare::parse(
+            "CREATE TRIGGER copy AFTER COMMIT ON sales FOR INSERT LANGUAGE javascript AS $$
+             export default function (row) {
+               const twice = (q) => q * 2;
+               try {
+                 db.exec('INSERT INTO sales (id, qty, status) VALUES (?, ?, ?)', [row.id + 1000, twice(row.qty), 'copy']);
+               } catch {
+                 db.exec('UPDATE sales SET qty = qty + 1 WHERE id = ?', [row.id + 1000]);
+               }
+             }
+             $$",
+        )
+        .unwrap();
+        let c = compile_bound(&d, "sales", &sales(), &opts).unwrap();
+        assert!(c.compilable(), "{:?}", c.analysis.reasons);
     }
 }

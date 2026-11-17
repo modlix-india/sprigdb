@@ -23,17 +23,17 @@
 //! ```
 //!
 //! **Share views run as their parent's share definer.** A child tenant's
-//! read-through share view (`__sprig_share_<id>`, chapter 42,
+//! read-through share view (`__sprig_share_<id>`,
 //! `sprig_inherit::upstream`) lives in the child's schema but runs as the
 //! parent's share definer `t<parent>_sprig_share`
-//! ([`sprig_common::names::share_definer_account`], decision RL70), a
+//! ([`sprig_common::names::share_definer_account`]), a
 //! locked account with `SELECT` only on the parent's relations its share
 //! views read, so it can read the parent's shared table and nothing of the
 //! child's. [`migrate`] never moves one to a child account (every read of
-//! the inherited table would fail with 1356, RL68). [`repair_shares`]
+//! the inherited table would fail with 1356). [`repair_shares`]
 //! (part of [`migrate`], and the drift sweep's check) re-points a share
 //! view whose definer is anything else (the share's creator
-//! `t<parent>_u<id>` before RL70, a child account an older build moved it
+//! `t<parent>_u<id>` in older builds, a child account an older build moved it
 //! to) to the share definer, creating the account when it is missing and
 //! granting it `SELECT` on exactly the parent's relations the view's text
 //! names:
@@ -139,7 +139,7 @@ pub fn is_share_view(kind: StoredKind, name: &str) -> bool {
 
 /// Whether `definer` (`user@host`) is `parent`'s share definer
 /// (`t<parent>_sprig_share@%`): the definer a share view in a child of
-/// `parent` must have (decision RL70).
+/// `parent` must have.
 #[must_use]
 pub fn is_share_definer(parent: Option<TenantId>, definer: &str) -> bool {
     let (user, host) = definer.rsplit_once('@').unwrap_or((definer, "%"));
@@ -660,7 +660,7 @@ mod tests {
             vec![
                 // The parent's share definer: kept.
                 row("VIEW", "__sprig_share_4", "t3_sprig_share@%"),
-                // The share's creator (before RL70), a grandparent's
+                // The share's creator (older builds), a grandparent's
                 // account or share definer, the child's own account (an
                 // older build moved it), a role, sprig_ctl, another host:
                 // re-pointed.

@@ -129,6 +129,7 @@ The token is printed once. Save it in a file and pass it with `--token-file`.
 | `space` | Spaces and shares |
 | `inherit` | Inherited tables, shares, tree-wide ids and delete blockers |
 | `txn` | In-doubt distributed transactions |
+| `catalog` | Catalog contract migrations |
 | `sink` | Sinks, their dead letters and connections |
 | `graph` | Graphs and their partitioning |
 | `search` | Search indexes on workers |
@@ -174,6 +175,10 @@ sprigctl tenant list
 sprigctl tenant show acme              # state, ancestry, catalog cluster, versions
 sprigctl tenant delete acme            # a leaf tenant; drops its catalog
 sprigctl tenant user add acme admin --password 's3cret-Passw0rd' [--host '%'] [--native] [--if-not-exists]
+sprigctl tenant issuer put acme --spec issuer.json   # register or replace an identity provider issuer
+sprigctl tenant issuer list acme
+sprigctl tenant issuer disable acme https://login.example.com/realms/acme
+sprigctl tenant token-login acme billing [--host '%'] [--off]   # the account's token login method
 sprigctl tenant settings acme [--all]  # its own setting rows; --all adds its ancestors'
 sprigctl tenant suspend acme --reason "invoice overdue"   # it and its subtree: logins 39303, sessions closed
 sprigctl tenant resume acme
@@ -181,6 +186,7 @@ sprigctl tenant resume acme
 
 - `create` without `--cluster` homes the tenant in the least busy DC its parent's residency allows; with `--cluster`, on that cluster of the controller's DC.
 - `user add` creates a user in the tenant's catalog; the user logs in as `acme.admin`. `--native` also stores a `mysql_native_password` verifier, used where the tenant's `auth.mysql_native_password` is on. Inside a tenant, administrators can also use `CREATE USER`; see [Accounts and logins](../security/accounts-and-logins.md).
+- `issuer` registers the OIDC providers and other JWT issuers whose tokens log in to the tenant, with the claim mappings that name accounts; `token-login` lets an account log in with their tokens. See [Logins with identity provider tokens](../security/external-tokens.md).
 - `delete` refuses a tenant with children (39362).
 - `suspend` needs a reason. Logins to the tenant and every tenant below it fail with 39303, open sessions get 39306 at their next statement, and triggers, sinks and scheduled runs wait until `resume`; housekeeping such as TTL expiry goes on. See [Tenant administration](../security/tenant-administration.md#suspension).
 
@@ -305,6 +311,8 @@ sprigctl gateway show gw-1
 sprigctl gateway drain gw-1        # readiness off, listeners closed, work finished, exit
 ```
 
+A gateway whose peer listener for calls from other processes is down shows `ready (degraded)`, with the reason on the next lines; in `-o json` it has `degraded`. It still serves clients, but workers can't reach it to run triggers.
+
 See [Upgrades](../operate/upgrades.md).
 
 ### check
@@ -357,6 +365,15 @@ sprigctl txn resolve <dtid>            # finish it now, by its recorded decision
 ```
 
 A transaction is in doubt while one of its XA branches is prepared. The controller's resolver finishes such branches on its own; `resolve` does the same at once. The recorded decision commits it; with none recorded it is aborted. You never pick the outcome.
+
+### catalog
+
+```sh
+sprigctl catalog contracts show
+sprigctl catalog contracts run --reason "<why>" --operator <who> [--tenant acme]
+```
+
+`show` lists which catalog formats the running processes read and what holds each module's contract migrations back. `run` runs contracts before `catalog.contract_delay_days` is over, with the reason recorded. See [Upgrades](../operate/upgrades.md#catalog-format-migrations).
 
 ### sink
 

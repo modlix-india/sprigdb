@@ -1,6 +1,4 @@
-//! Materialized copies and asynchronous orphaning (chapter 42,
-//! "Materialized copies" and "Parent deletes and orphans"; build step 8
-//! and the asynchronous half of step 9).
+//! Materialized copies and asynchronous orphaning across tenants.
 //!
 //! A materialized edge keeps the rows its parent shares in a **copy**, a
 //! table `__sprig_ih_<object id>` in the child's physical schema, next to
@@ -35,7 +33,7 @@
 //!     below t: read the source's merged view of K now (writer), filtered by
 //!     the share and cut to its columns; upsert what is there, tombstone
 //!     what isn't, each write guarded by _sprig_src_v
-//!   hierarchy pass, parents first (decision T28): for each tenant x below
+//!   hierarchy pass, parents first: for each tenant x below
 //!     t that inherits db.table with a record hierarchy: under x's lock,
 //!     reconcile x's root space and the spaces below it for K
 //! seed(copy): create the tables; read the source's whole view; upsert it;
@@ -56,7 +54,7 @@
 //! Orphaning across tenants doesn't know why a record left the parent's
 //! view. It orphans an override when the record no longer exists above
 //! (deleted, hidden, or an orphan reset), and only hides it when the
-//! record is merely filtered out, as the chapter wants for filter changes.
+//! record is merely filtered out, as a filter change should.
 //! The override keeps the values stored when it was written; only the
 //! `keep` policy is applied.
 
@@ -114,7 +112,7 @@ pub struct CopyInfo {
     /// When it was seeded (ms).
     pub seeded_ms: u64,
     /// When it became its subscribers' source in change streams
-    /// ([`crate::handover`], decision RL71).
+    /// ([`crate::handover`]).
     pub handover: Handover,
 }
 
@@ -216,7 +214,7 @@ pub fn read_sql(
 }
 
 /// `ALTER TABLE` adding the handover columns to a state table made
-/// before RL71.
+/// before copies recorded their handover.
 #[must_use]
 pub fn state_upgrade_ddl(schema: &str) -> String {
     format!(
@@ -251,7 +249,7 @@ pub async fn load_states<Q: Queryable + Send>(
     };
     let mut r: std::result::Result<Vec<Row>, _> = c.query(read(true)).await;
     if matches!(&r, Err(mysql_async::Error::Server(s)) if s.code == 1054) {
-        // A state table the worker hasn't upgraded yet (RL71).
+        // A state table the worker hasn't upgraded yet.
         r = c.query(read(false)).await;
     }
     let rows = match r {
@@ -365,6 +363,20 @@ pub trait CopyEnv: Send + Sync {
 
     /// Milliseconds since the Unix epoch.
     fn now_ms(&self) -> u64;
+
+    /// Removes dropped shares `ids` from `tenant`'s catalog once their
+    /// cleanup in the children is done, in one versioned catalog change
+    /// (rows still `dropping` only), as the parent's own statement would
+    /// ([`crate::sweep`]).
+    ///
+    /// # Errors
+    /// The catalog's.
+    async fn purge_shares(&self, tenant: TenantId, ids: &[u64]) -> Result<()> {
+        let _ = (tenant, ids);
+        Err(SprigError::internal(
+            "this copy worker can't change catalogs",
+        ))
+    }
 }
 
 /// One copy the family keeps.
@@ -681,8 +693,19 @@ pub struct Maintainer {
     views_at: Vec<(TenantId, u64)>,
     /// Root tenants whose `inherit_refs` this maintainer made sure of.
     refs_ready: BTreeSet<u64>,
+    /// The sweep of dropped shares ([`crate::sweep`]).
+    sweeper: Arc<Sweeper>,
     /// What it did so far.
     pub counts: Counts,
+}
+
+/// The sweep of dropped shares runs beside the copies, one pass at a time:
+/// its cleanup may wait on a child's row locks, which must not hold up
+/// the copies.
+#[derive(Default)]
+struct Sweeper {
+    running: std::sync::atomic::AtomicBool,
+    seen: std::sync::Mutex<crate::sweep::Seen>,
 }
 
 impl std::fmt::Debug for Maintainer {
@@ -724,8 +747,40 @@ impl Maintainer {
             views: BTreeSet::new(),
             views_at: Vec::new(),
             refs_ready: BTreeSet::new(),
+            sweeper: Arc::default(),
             counts: Counts::default(),
         }
+    }
+
+    /// Starts a sweep of the family's dropped shares in the background
+    /// ([`crate::sweep`]) unless one is running or none is `dropping`.
+    fn sweep_dropped(&self) {
+        use std::sync::atomic::Ordering;
+        let any = self
+            .family
+            .cats
+            .values()
+            .any(|c| state_of(c).is_some_and(|s| s.dropping().next().is_some()));
+        if !any || self.sweeper.running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let env = Arc::clone(&self.env);
+        let family = self.family.clone();
+        let sweeper = Arc::clone(&self.sweeper);
+        tokio::spawn(async move {
+            let mut seen = std::mem::take(
+                &mut *sweeper
+                    .seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            crate::sweep::sweep_family(env.as_ref(), &family, &mut seen).await;
+            *sweeper
+                .seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = seen;
+            sweeper.running.store(false, Ordering::Release);
+        });
     }
 
     /// The family as last refreshed.
@@ -752,6 +807,7 @@ impl Maintainer {
     /// The catalogs' and backends'.
     pub async fn refresh(&mut self) -> Result<usize> {
         self.family = load_family(self.env.as_ref(), self.root).await?;
+        self.sweep_dropped();
         // A catalog change may have dropped share views (a parent's DROP
         // SHARE drops them on every child, and share ids are reused): they
         // are made again before their next read.
@@ -810,7 +866,7 @@ impl Maintainer {
                     .await
                     .map_err(exec_err)?;
                     // The table too, once no copy of the object is left
-                    // in it (bugfix-55: it stayed, empty, for ever).
+                    // in it (it used to stay, empty, for ever).
                     let left: Option<u64> = c
                         .query_first(format!(
                             "SELECT COUNT(*) FROM {}.{} WHERE object_id = {}",
@@ -1071,7 +1127,7 @@ impl Maintainer {
     }
 
     /// Writes `e`'s state row in one statement: with `serving`, the flip
-    /// and its handover together (RL71).
+    /// and its handover together.
     async fn set_state(&mut self, e: &CopyEdge, serving: bool, handover: &Handover) -> Result<()> {
         let now = self.env.now_ms();
         let mut c = self.env.conn(e.key.tenant).await?;
@@ -1237,6 +1293,26 @@ impl Maintainer {
         self.counts.seeds += 1;
         metrics::counter!("sprig_inherit_copy_seeds_total").increment(1);
         tracing::info!(tenant = %e.key.tenant, object = %e.key.object, share = e.key.share, rows = rows.len(), "copy seeded");
+        // What a (re)seed changed in this copy (a share's filter that now
+        // hides or shows records, its columns) changed this tenant's view:
+        // the copies made from it below follow, as for a change of the
+        // source's rows, parents first.
+        let below = self.family.edges.iter().any(|x| {
+            x.key != e.key
+                && x.db_name.eq_ignore_ascii_case(&e.db_name)
+                && x.table.eq_ignore_ascii_case(&e.table)
+                && self.family.at_or_above(e.key.tenant, x.source_tenant)
+                && self
+                    .copies
+                    .ready(x.key, x.object_version, x.share_version)
+                    .is_some()
+        });
+        if below {
+            let keys: Vec<KeyLit> = present.into_iter().chain(gone).collect();
+            for part in keys.chunks(500) {
+                Box::pin(self.on_keys(e.key.tenant, &e.db_name, &e.table, part)).await?;
+            }
+        }
         Ok(())
     }
 
@@ -1304,7 +1380,7 @@ impl Maintainer {
         Ok(())
     }
 
-    /// The hierarchy pass of [`Self::on_keys`] (decision T28): every tenant
+    /// The hierarchy pass of [`Self::on_keys`]: every tenant
     /// below `tenant` that inherits `db.table` through unbroken tenant
     /// edges and has its record hierarchy brings its paths of `keys` up to
     /// date, parents first, each in one transaction under its lock. A
@@ -1374,7 +1450,7 @@ impl Maintainer {
                 continue;
             };
             // Paths here must follow the committed change whatever its
-            // size (decision T29); the size is reported instead.
+            // size; the size is reported instead.
             ctx.limits.max_move_rows = u64::MAX;
             let Some(h) = crate::hier::hierarchy_of(&ctx, &xo) else {
                 continue;
@@ -1500,7 +1576,7 @@ impl Maintainer {
             };
             let mut c = self.env.conn(x).await?;
             // A record hierarchy's path-only overrides go with their
-            // records (decision T26), never orphaned.
+            // records, never orphaned.
             if crate::hier::has_paths(&xo) {
                 c.query_drop(format!(
                     "DELETE FROM {}.{} WHERE `_sprig_space` = {} AND `_sprig_state` = 'ovr' AND \
@@ -1797,7 +1873,7 @@ impl Maintainer {
     }
 
     /// Claims for the references `x`'s new orphans `lost` now hold as
-    /// their own (decision IG7's index), so a delete of a referenced key
+    /// their own (in the `inherit_refs` index), so a delete of a referenced key
     /// anywhere above sees them.
     async fn claim_orphans(
         &mut self,
@@ -1949,7 +2025,7 @@ impl Maintainer {
 }
 
 /// A child's own columns added to an object it receives through a
-/// serving materialized copy (decision T20): the copy gets the same
+/// serving materialized copy: the copy gets the same
 /// columns, `NULL` (the parent has no values for them), and its state
 /// moves to the object's new version, so reads keep using it instead of
 /// failing with 39889 until the worker reseeds (across clusters, read
@@ -2050,13 +2126,27 @@ pub(crate) async fn keep_serving(
         }
     }
     if !adds.is_empty() {
-        r.ctl(&format!(
-            "ALTER TABLE {}.{} {}",
-            q(&schema),
-            q(&copy_table(o.object_id)),
-            adds.join(", ")
-        ))
-        .await?;
+        let altered = r
+            .ctl(&format!(
+                "ALTER TABLE {}.{} {}",
+                q(&schema),
+                q(&copy_table(o.object_id)),
+                adds.join(", ")
+            ))
+            .await;
+        match altered {
+            Ok(()) => {}
+            // The copy worker saw the child's new columns first and is
+            // making the copy again (dropped: 1146; made with them: 1060).
+            // Its seed brings every column and its own state, so there is
+            // nothing left to keep serving, and the statement stands.
+            Err(e) if matches!(sprig_catalog::ddl::errno(&e), Some(1146 | 1060)) => {
+                tracing::info!(tenant = %t, table = %o.table, error = %e.message,
+                    "copy being seeded again; not kept serving");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
     }
     r.ctl(&format!(
         "UPDATE {}.{} SET object_version = {} WHERE object_id = {} AND share_key = {UPSTREAM} \

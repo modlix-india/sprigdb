@@ -17,7 +17,7 @@ const SPEC: SinkSpec = {
 };
 
 describe('Studio round 7: messaging statements', () => {
-  it('asks for every queue in one mq_info call (ST66)', () => {
+  it('asks for every queue in one mq_info call', () => {
     expect(mqInfoAll()).toBe('CALL sprig.mq_info(NULL)');
     expect(mqInfoAll('/')).toBe('CALL sprig.mq_info(NULL)');
     expect(mqInfoAll('shop')).toBe("CALL sprig.mq_info(NULL, 'shop')");
@@ -33,7 +33,7 @@ describe('Studio round 7: messaging statements', () => {
     expect(m.get('a')).toEqual({ ready: 2, unacked: 1, consumers: 0 });
     expect(m.get('b')).toEqual({ ready: 0, unacked: 0, consumers: 3 });
   });
-  it('tests an unsaved connection with TEST CREATE CONNECTION, masked on screen (ST68)', () => {
+  it('tests an unsaved connection with TEST CREATE CONNECTION, masked on screen', () => {
     const opts = [{ key: 'url', value: 'https://h.example.com/in' }];
     const creds = [{ key: 'token', value: 's3cret' }];
     expect(testNewConnection('crm', 'webhook', opts, creds, true)).toBe(
@@ -42,7 +42,7 @@ describe('Studio round 7: messaging statements', () => {
     expect(testNewConnection('crm', 'webhook', opts, creds)).toContain("token = 's3cret'");
     expect(() => testNewConnection('crm', 'webhook', [], creds)).toThrow(/needs url/);
   });
-  it('writes CREATE SINK for each target, and its dry run (ST69, ST70)', () => {
+  it('writes CREATE SINK for each target, and its dry run', () => {
     expect(createSink(SPEC)).toBe('CREATE SINK `out7` FROM STREAM `orders` TO WEBHOOK CONNECTION `hook`');
     expect(
       createSink({

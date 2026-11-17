@@ -18,6 +18,10 @@
 
 use std::fmt;
 
+/// The longest stream record key (the outbox's `k VARBINARY(4096)`), as
+/// every publish path checks it.
+pub const MAX_KEY_BYTES: u64 = 4096;
+
 /// A local variable's index into [`Function::locals`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LocalId(pub u32);
@@ -231,6 +235,9 @@ pub enum Builtin {
     ToJson,
     /// The number of elements of a JSON array or members of an object.
     JsonLength,
+    /// A JSON value as compact text (`{"a":1}`), as `JSON.stringify` and
+    /// the engine tier's `db.publish` write it.
+    JsonText,
     /// Absolute value.
     Abs,
     /// Round down, `Float` to `Float`.
@@ -249,6 +256,12 @@ pub enum Builtin {
     Min,
     /// Length in code points.
     Len,
+    /// Length in bytes of the text's UTF-8 (Lua's `#`).
+    ByteLen,
+    /// Upper case of ASCII letters only (Lua 5.1's `string.upper`).
+    AsciiUpper,
+    /// Lower case of ASCII letters only (Lua 5.1's `string.lower`).
+    AsciiLower,
     /// Upper case.
     Upper,
     /// Lower case.
@@ -265,7 +278,50 @@ pub enum Builtin {
     /// arithmetic operators refuse a null operand, so the KIRun front end
     /// wraps every operand that may be `NULL`.
     NotNull,
+    // Parsed JSON (triggers on streams and queues). A parsed value is JSON
+    // text whose JSON `null` is the text `null`; `NULL` is JavaScript's
+    // `undefined` (a missing member). Where JavaScript's meaning can't be
+    // kept for the value at hand, these raise 39876 ([`ENGINE_RERUN`]) and
+    // the record runs again in the engine tier.
+    /// `JSON.parse(text)`: `[text]`, `Str`. `NULL` parses as `null`.
+    JsonParse,
+    /// `v.name` or `v[i]`: `[v, Lit(Str(name)) or an Int index,
+    /// Lit(Bool(optional))]`. A member of an object (`NULL` when missing),
+    /// an element of an array; `?.` of `null` or `undefined` is `NULL`.
+    JsonGet,
+    /// `v.length` of an array or a string: `[v]`.
+    JsonLen,
+    /// A string's text: `[v, Lit(Bool(nullable))]`; with `nullable`,
+    /// `null` and `undefined` are `NULL`.
+    JsonAsStr,
+    /// A number, as a double: `[v, Lit(Bool(nullable))]`.
+    JsonAsNum,
+    /// A whole number within ±2^53: `[v, Lit(Bool(nullable))]`.
+    JsonAsInt,
+    /// A boolean: `[v, Lit(Bool(nullable))]`.
+    JsonAsBool,
+    /// JavaScript's truthiness of a parsed value: `[v]`, never `NULL`.
+    JsonTruthy,
+    /// Whether the value is of a kind: `[v, Lit(Str(kind))]`, kind one
+    /// of `string`, `number`, `boolean`, `null`, `undefined`, `object`
+    /// (an object, not an array or `null`), `array`; never `NULL`.
+    JsonKind,
+    /// `String(v)`: `[v, Lit(Bool(null_as_null))]`; with `null_as_null`
+    /// (a publish's value), `null` and `undefined` are `NULL`.
+    JsonToStr,
 }
+
+/// The error number compiled code raises when a record must run in the
+/// engine tier instead (a parsed JSON value it can't treat as JavaScript
+/// would); the gateway rolls the run back to its savepoint and runs the
+/// engine tier.
+pub const ENGINE_RERUN: u16 = 39876;
+
+/// The text that starts [`ENGINE_RERUN`]'s message.
+pub const ENGINE_RERUN_TEXT: &str = "this record runs in the engine tier";
+
+/// Log lines a run keeps ([`Stmt::Log`]), as the engine tier keeps.
+pub const MAX_LOG_LINES: usize = 100;
 
 impl Builtin {
     /// The name used in printed IR.
@@ -280,6 +336,7 @@ impl Builtin {
             Builtin::JsonStr => "json_str",
             Builtin::ToJson => "to_json",
             Builtin::JsonLength => "json_len",
+            Builtin::JsonText => "json_text",
             Builtin::Abs => "abs",
             Builtin::Floor => "floor",
             Builtin::Ceil => "ceil",
@@ -289,6 +346,9 @@ impl Builtin {
             Builtin::Max => "max",
             Builtin::Min => "min",
             Builtin::Len => "len",
+            Builtin::ByteLen => "byte_len",
+            Builtin::AsciiUpper => "ascii_upper",
+            Builtin::AsciiLower => "ascii_lower",
             Builtin::Upper => "upper",
             Builtin::Lower => "lower",
             Builtin::Contains => "contains",
@@ -296,6 +356,16 @@ impl Builtin {
             Builtin::EndsWith => "ends_with",
             Builtin::IndexOf => "index_of",
             Builtin::NotNull => "not_null",
+            Builtin::JsonParse => "json_parse",
+            Builtin::JsonGet => "json_get",
+            Builtin::JsonLen => "json_len_of",
+            Builtin::JsonAsStr => "json_as_str",
+            Builtin::JsonAsNum => "json_as_num",
+            Builtin::JsonAsInt => "json_as_int",
+            Builtin::JsonAsBool => "json_as_bool",
+            Builtin::JsonTruthy => "json_truthy",
+            Builtin::JsonKind => "json_kind",
+            Builtin::JsonToStr => "json_to_str",
         }
     }
 }
@@ -412,6 +482,44 @@ pub struct ErrorSpec {
     pub code: u16,
     /// The message, `Str`; cut to 128 characters.
     pub message: Expr,
+    /// What a JavaScript `catch` sees of a 39865, when that isn't the
+    /// name `Error` with `message`: the error's name (`TypeError`,
+    /// `RangeError`; empty for a thrown value that isn't an error object)
+    /// and its message, uncut.
+    pub catch: Option<(String, Expr)>,
+}
+
+impl ErrorSpec {
+    /// An error with the name `Error` for a `catch`.
+    #[must_use]
+    pub fn new(code: u16, message: Expr) -> Self {
+        Self {
+            code,
+            message,
+            catch: None,
+        }
+    }
+}
+
+/// Where a [`Stmt::Try`] keeps the error it caught: locals of the
+/// function, all set when `flag` is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Caught {
+    /// `Bool`: whether an error was caught (`false` when the body ended
+    /// without one).
+    pub flag: LocalId,
+    /// `Int`: its error number.
+    pub code: LocalId,
+    /// `Str`: its SQLSTATE.
+    pub state: LocalId,
+    /// `Str`: its message as MariaDB carries it.
+    pub text: LocalId,
+    /// `Str`: the message a JavaScript `catch` sees (the code's own
+    /// error's, uncut; a database error's text).
+    pub message: LocalId,
+    /// `Str`: the error's name for a `catch` (`Error`, `TypeError`; empty
+    /// for a thrown value that isn't an error object).
+    pub name: LocalId,
 }
 
 /// What an embedded SQL statement returns.
@@ -438,6 +546,34 @@ pub enum SqlShape {
     Exec {
         /// The `Int` local the count lands in.
         affected: LocalId,
+    },
+    /// `db.call`: the statement is `CALL <call entry>(` and the bind
+    /// values separated by `, `; the generator adds the event and result
+    /// variables and `)`. Each field lands in its local, read from the
+    /// result as the callee's wrapper reads it (`Int` through `CAST AS
+    /// SIGNED`, `Float` through `CAST AS DOUBLE`, `Str` through
+    /// `JSON_VALUE`); a field the event lacks is `NULL`.
+    Call {
+        /// The `Str` local the event's name lands in.
+        event: LocalId,
+        /// The `Json` local the callee's own result object lands in.
+        result: LocalId,
+        /// Field name and the local it lands in, in the wrapper's order.
+        into: Vec<(String, LocalId)>,
+    },
+    /// `db.publish`: the statement is an `INSERT` of binds key, value and
+    /// headers into a stream's outbox; before it, as the gateway checks a
+    /// publish, a key longer than [`MAX_KEY_BYTES`] or a record (key, value
+    /// and headers together) longer than `max_bytes` raises 39944 and, on
+    /// a compacted stream, a key that is `NULL` raises 39955. Both count as
+    /// errors of the data operation.
+    Publish {
+        /// The `Int` local the count lands in.
+        affected: LocalId,
+        /// `stream.max_message_bytes`.
+        max_bytes: u64,
+        /// A compacted stream.
+        compact: bool,
     },
 }
 
@@ -511,6 +647,30 @@ pub enum Stmt {
     Return,
     /// A data operation.
     Db(DbOp),
+    /// Runs `body`; an error it raises that JavaScript can catch is kept
+    /// in `caught` (its flag set) and the statement ends normally; any
+    /// other error goes on. Catchable: the code's own `throw` (39865), any
+    /// error of a data operation except a budget (39864), and an error
+    /// raised again by [`Stmt::Rethrow`]. Not catchable: `sprig.reject`
+    /// (39863 raised by the code), budgets, and runtime errors of the
+    /// code's own arithmetic (39866, overflow, division by zero), which
+    /// JavaScript doesn't throw.
+    Try {
+        /// The protected statements.
+        body: Block,
+        /// Where the error is kept.
+        caught: Caught,
+    },
+    /// Raises the error a [`Stmt::Try`] kept, again (catchable again).
+    Rethrow(Caught),
+    /// Runs `body` once; [`Stmt::Leave`] with its label leaves it.
+    Block(u32, Block),
+    /// Leaves the enclosing [`Stmt::Block`] with this label, through any
+    /// loops in between.
+    Leave(u32),
+    /// Writes a log line (`console.log`, `ctx.log`), `Str`: the run keeps
+    /// the first [`MAX_LOG_LINES`] (triggers on streams and queues).
+    Log(Expr),
 }
 
 /// A parameter.
@@ -618,17 +778,34 @@ impl Function {
                 | Builtin::Present
                 | Builtin::Contains
                 | Builtin::StartsWith
-                | Builtin::EndsWith => Ty::Bool,
+                | Builtin::EndsWith
+                | Builtin::JsonAsBool
+                | Builtin::JsonTruthy
+                | Builtin::JsonKind => Ty::Bool,
                 Builtin::ToFloat
+                | Builtin::JsonAsNum
                 | Builtin::JsonNum
                 | Builtin::Floor
                 | Builtin::Ceil
                 | Builtin::Round
                 | Builtin::Sqrt
                 | Builtin::Pow => Ty::Float,
-                Builtin::ToStr | Builtin::JsonStr | Builtin::Upper | Builtin::Lower => Ty::Str,
-                Builtin::ToJson => Ty::Json,
-                Builtin::JsonLength | Builtin::Len | Builtin::IndexOf => Ty::Int,
+                Builtin::ToStr
+                | Builtin::JsonStr
+                | Builtin::JsonText
+                | Builtin::Upper
+                | Builtin::Lower
+                | Builtin::AsciiUpper
+                | Builtin::AsciiLower
+                | Builtin::JsonAsStr
+                | Builtin::JsonToStr => Ty::Str,
+                Builtin::ToJson | Builtin::JsonParse | Builtin::JsonGet => Ty::Json,
+                Builtin::JsonLength
+                | Builtin::Len
+                | Builtin::ByteLen
+                | Builtin::IndexOf
+                | Builtin::JsonAsInt
+                | Builtin::JsonLen => Ty::Int,
                 Builtin::Abs | Builtin::NotNull => {
                     args.first().map_or(Ty::Float, |a| self.ty_of(a))
                 }
@@ -654,14 +831,106 @@ impl Function {
         }
         fn stmt(s: &Stmt) -> usize {
             1 + match s {
-                Stmt::Assign(_, e) => expr(e),
+                Stmt::Assign(_, e) | Stmt::Log(e) => expr(e),
                 Stmt::If(c, a, b) => expr(c) + block(a) + block(b),
                 Stmt::While { cond, body, .. } => expr(cond) + block(body),
                 Stmt::Emit(_, f) => f.iter().map(|(_, e)| expr(e)).sum(),
                 Stmt::Throw(e) => expr(&e.message),
                 Stmt::Db(DbOp::Sql { binds, .. }) => binds.iter().map(expr).sum(),
-                Stmt::Break | Stmt::Continue | Stmt::Return => 0,
+                Stmt::Try { body, .. } | Stmt::Block(_, body) => block(body),
+                Stmt::Break | Stmt::Continue | Stmt::Return | Stmt::Rethrow(_) | Stmt::Leave(_) => {
+                    0
+                }
             }
+        }
+        block(&self.body)
+    }
+
+    /// Calls `f` on every expression of the body, nested ones included.
+    pub fn each_expr(&self, f: &mut dyn FnMut(&Expr)) {
+        fn block(b: &Block, f: &mut dyn FnMut(&Expr)) {
+            for s in b {
+                stmt(s, f);
+            }
+        }
+        fn stmt(s: &Stmt, f: &mut dyn FnMut(&Expr)) {
+            match s {
+                Stmt::Assign(_, e) | Stmt::Log(e) => e.walk(f),
+                Stmt::If(c, a, b) => {
+                    c.walk(f);
+                    block(a, f);
+                    block(b, f);
+                }
+                Stmt::While { cond, body, .. } => {
+                    cond.walk(f);
+                    block(body, f);
+                }
+                Stmt::Emit(_, fs) => fs.iter().for_each(|(_, e)| e.walk(f)),
+                Stmt::Throw(e) => {
+                    e.message.walk(f);
+                    if let Some((_, m)) = &e.catch {
+                        m.walk(f);
+                    }
+                }
+                Stmt::Db(DbOp::Sql { binds, .. }) => binds.iter().for_each(|e| e.walk(f)),
+                Stmt::Try { body, .. } | Stmt::Block(_, body) => block(body, f),
+                Stmt::Break | Stmt::Continue | Stmt::Return | Stmt::Rethrow(_) | Stmt::Leave(_) => {
+                }
+            }
+        }
+        block(&self.body, f);
+    }
+
+    /// Whether the code can raise [`ENGINE_RERUN`] (it reads parsed JSON,
+    /// or raises it itself).
+    #[must_use]
+    pub fn may_rerun(&self) -> bool {
+        fn raises(b: &Block) -> bool {
+            b.iter().any(|s| match s {
+                Stmt::Throw(e) => e.code == ENGINE_RERUN,
+                Stmt::If(_, a, c) => raises(a) || raises(c),
+                Stmt::While { body, .. } | Stmt::Try { body, .. } | Stmt::Block(_, body) => {
+                    raises(body)
+                }
+                _ => false,
+            })
+        }
+        if raises(&self.body) {
+            return true;
+        }
+        let mut hit = false;
+        self.each_expr(&mut |e| {
+            if let Expr::Builtin(b, _) = e
+                && matches!(
+                    b,
+                    Builtin::JsonParse
+                        | Builtin::JsonGet
+                        | Builtin::JsonLen
+                        | Builtin::JsonAsStr
+                        | Builtin::JsonAsNum
+                        | Builtin::JsonAsInt
+                        | Builtin::JsonAsBool
+                        | Builtin::JsonToStr
+                )
+            {
+                hit = true;
+            }
+        });
+        hit
+    }
+
+    /// Whether the code writes log lines ([`Stmt::Log`]).
+    #[must_use]
+    pub fn logs(&self) -> bool {
+        fn block(b: &Block) -> bool {
+            b.iter().any(|s| match s {
+                Stmt::Log(_) => true,
+                Stmt::If(_, a, c) => block(a) || block(c),
+                Stmt::While { body, .. } | Stmt::Try { body, .. } | Stmt::Block(_, body) => {
+                    block(body)
+                }
+                _ => false,
+            })
         }
         block(&self.body)
     }
@@ -791,6 +1060,24 @@ impl Printer<'_> {
                 let t = format!("throw({}, {})", e.code, self.expr(&e.message));
                 self.line(d, &t);
             }
+            Stmt::Try { body, caught } => {
+                let t = format!("try -> {}", self.f.local_def(caught.flag).name);
+                self.line(d, &t);
+                self.block(body, d + 1);
+            }
+            Stmt::Rethrow(c) => {
+                let t = format!("rethrow {}", self.f.local_def(c.flag).name);
+                self.line(d, &t);
+            }
+            Stmt::Block(l, body) => {
+                self.line(d, &format!("block b{l}"));
+                self.block(body, d + 1);
+            }
+            Stmt::Leave(l) => self.line(d, &format!("leave b{l}")),
+            Stmt::Log(e) => {
+                let t = format!("log {}", self.expr(e));
+                self.line(d, &t);
+            }
             Stmt::Db(DbOp::Sql {
                 stmt, binds, shape, ..
             }) => {
@@ -810,6 +1097,27 @@ impl Printer<'_> {
                     SqlShape::Exec { affected } => {
                         format!("{} := db.exec({call})", self.f.local_def(*affected).name)
                     }
+                    SqlShape::Call {
+                        event,
+                        result,
+                        into,
+                    } => {
+                        let names: Vec<&str> = [*event, *result]
+                            .into_iter()
+                            .chain(into.iter().map(|(_, l)| *l))
+                            .map(|l| self.f.local_def(l).name.as_str())
+                            .collect();
+                        format!("({}) := db.call({call})", names.join(", "))
+                    }
+                    SqlShape::Publish {
+                        affected,
+                        max_bytes,
+                        compact,
+                    } => format!(
+                        "{} := db.publish({call}, max {max_bytes}{})",
+                        self.f.local_def(*affected).name,
+                        if *compact { ", compact" } else { "" }
+                    ),
                 };
                 self.line(d, &t);
             }

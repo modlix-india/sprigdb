@@ -492,7 +492,13 @@ Set them with `SPRIG SET` at the scopes each allows; see [Settings](../sql/setti
 - **Tables only.** Inheritable objects are SQL tables. Collections and key-value namespaces can't be inheritable yet.
 - **Unsharded tables for read-through across tenants.** Read-through between tenants needs both databases on the same cluster and unsharded; other placements need materialized shares (39889 otherwise).
 - **Reads cost more per level.** Each read-through level adds a little to every query on the table, so a point read several levels down takes longer than on a plain table. Materialized shares stop the chain at the copy. A single-table `SELECT` with `key = value` or `key IN (...)` pushes the key into every level.
-- **Instances live in members.** A member's instances use the member's shards, quotas and residency, and move with the member.
+- **Instances live in members.** A member's instances use the member's shards, quotas and residency, and move with the member. `CREATE SINK`, `ALTER SINK` and `DROP SINK ... FOR EACH TENANT` reach members homed in other data centres too: the gateway calls a gateway in each member's home data centre (counted in `sprig_inherit_remote_calls_total`), so the sink's instances are created, changed and dropped wherever its members live.
+- **Members in other data centres.** Every `FOR EACH TENANT` statement reaches members homed in other data centres, not only sinks. The gateway asks a gateway in each member's home data centre to act on the members it indexes, and the instances stay where the members live:
+  - `DROP TRIGGER` removes the instances there too, and its note ("N instance(s) removed") counts them;
+  - an override `FOR TENANT` or `FOR SUBTREE` applies there at once ("applied to N instance(s)");
+  - `SHOW INHERITED DEFINITIONS` counts those members;
+  - a broadcast (`INSERT ... FOR ALL TENANTS`) reaches each of them once;
+  - a new exchange, queue, binding or queue trigger, and `UNBIND`, reach their virtual hosts in the background. The statement's note ("N member(s) updated now") counts only this data centre's members.
 
 ## Errors
 

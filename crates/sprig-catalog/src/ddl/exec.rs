@@ -22,6 +22,7 @@ use sprig_common::ids::{ClusterId, TenantId};
 use sprig_common::names::{SchemaName, quote};
 use sprig_common::{ErrorKind, Result, SprigCode, SprigError};
 
+use crate::pool_wait::Bounded as _;
 use crate::store::{DatabaseRow, ObjectKind};
 
 /// What a physical statement does, so in-memory executors can model it and
@@ -403,7 +404,7 @@ impl MariaExecutor {
     }
 
     async fn conn(&self) -> Result<mysql_async::Conn> {
-        match tokio::time::timeout(self.read_timeout, self.pool.get_conn()).await {
+        match tokio::time::timeout(self.read_timeout, self.pool.get_conn_bounded()).await {
             Ok(Ok(c)) => Ok(c),
             Ok(Err(e)) => Err(unavailable("cluster unreachable").with_source(e)),
             Err(_) => Err(unavailable("cluster connection timed out")),

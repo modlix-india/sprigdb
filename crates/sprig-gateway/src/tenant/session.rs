@@ -341,6 +341,18 @@ impl TenantSession {
         ) == 1
     }
 
+    /// `catalog.ddl_wait_ms` for the tenant: how long its DDL waits for a
+    /// target another DDL holds. `None` outside a tenant's catalog.
+    #[must_use]
+    pub fn ddl_wait(&self) -> Option<std::time::Duration> {
+        let cat = self.cat.as_ref()?;
+        Some(std::time::Duration::from_millis(self.svc.settings.get(
+            &sprig_catalog::ddl::DDL_WAIT_MS,
+            &cat.setting_ctx(&self.svc.dc),
+            Some(&cat.settings),
+        )))
+    }
+
     /// `gateway.long_data_max_bytes` as the live watch last saw it.
     #[must_use]
     pub fn long_data_max(&self) -> usize {

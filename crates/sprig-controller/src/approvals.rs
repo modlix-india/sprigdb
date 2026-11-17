@@ -3,7 +3,7 @@
 //! that never revisit a held decision, the decision-log hook, and the
 //! `approvals` loop that runs timers, appliers and gauges.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
@@ -650,13 +650,81 @@ impl fmt::Display for ApprovalKey {
     }
 }
 
+/// How long a tenant whose last pass found nothing to do is left alone:
+/// it is passed again after this, or at once when an item of it changes in
+/// this process. Items raised or acted on by another controller are seen
+/// within this time; their timers (escalation, expiry) run in hours.
+pub const IDLE_RECHECK: Duration = Duration::from_secs(300);
+
+/// Tenants whose last approvals pass found nothing to do: no item open
+/// (in any state the loop acts on) after the producers ran. Their passes
+/// are skipped, without reading anything, until [`IDLE_RECHECK`] has
+/// passed or a hook event names the tenant (an item raised, acted on,
+/// applied, in this process). With thousands of tenants, most have no
+/// item, and each full pass reads the tenant's items, its parked index
+/// candidates and purges old items.
+#[derive(Debug, Default)]
+pub struct IdleTenants {
+    since: Mutex<HashMap<TenantId, i64>>,
+}
+
+impl IdleTenants {
+    /// Whether `tenant`'s pass may be skipped at `now_us`.
+    fn skip(&self, tenant: TenantId, now_us: i64) -> bool {
+        let recheck = i64::try_from(IDLE_RECHECK.as_micros()).unwrap_or(i64::MAX);
+        self.since
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&tenant)
+            .is_some_and(|&t| now_us >= t && now_us - t < recheck)
+    }
+
+    /// Records a full pass of `tenant`: idle from `now_us`, or busy.
+    fn passed(&self, tenant: TenantId, idle: bool, now_us: i64) {
+        let mut g = self.since.lock().unwrap_or_else(PoisonError::into_inner);
+        if idle {
+            g.insert(tenant, now_us);
+        } else {
+            g.remove(&tenant);
+        }
+    }
+
+    /// `tenant` has work again: its next pass runs in full.
+    pub fn wake(&self, tenant: TenantId) {
+        self.since
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&tenant);
+    }
+
+    /// How many tenants are idle now.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.since
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+}
+
+#[async_trait::async_trait]
+impl Hook for IdleTenants {
+    async fn event(&self, ev: &Event) {
+        if let Some(t) = ev.rec.tenant() {
+            self.wake(t);
+        }
+    }
+}
+
 /// The `approvals` loop (escalation and auto-apply): on the
 /// DC leader, every `approvals.tick_seconds`, per tenant homed here and
-/// for the DC tier.
+/// for the DC tier. With [`ApprovalsLoop::with_idle`], tenants with
+/// nothing to do are skipped ([`IdleTenants`]).
 pub struct ApprovalsLoop {
     a: Arc<ControllerApprovals>,
     seen: Mutex<BTreeMap<ApprovalKey, Vec<Recommendation>>>,
     notifier: Option<Arc<notify::Notifier>>,
+    idle: Option<Arc<IdleTenants>>,
 }
 
 impl fmt::Debug for ApprovalsLoop {
@@ -673,7 +741,16 @@ impl ApprovalsLoop {
             a,
             seen: Mutex::new(BTreeMap::new()),
             notifier: None,
+            idle: None,
         }
+    }
+
+    /// Skips tenants with nothing to do; `idle` must also be a hook of the
+    /// hub, so an item changed in this process wakes its tenant at once.
+    #[must_use]
+    pub fn with_idle(mut self, idle: Arc<IdleTenants>) -> Self {
+        self.idle = Some(idle);
+        self
     }
 
     /// Sends the daily digests.
@@ -762,6 +839,11 @@ impl Reconciler for ApprovalsLoop {
                 }
             }
         }
+        if let (Some(t), Some(idle)) = (tenant, &self.idle)
+            && idle.skip(t, self.a.hub.now())
+        {
+            return Ok(Outcome::RequeueAfter(tick));
+        }
         let store: Arc<dyn RecStore> = match tenant {
             Some(t) => self.a.hub.stores().tenant(t),
             None => match self.a.hub.stores().dc(&self.a.dc) {
@@ -786,6 +868,9 @@ impl Reconciler for ApprovalsLoop {
         }
         if let Some(n) = &self.notifier {
             n.digest(tenant, &live, self.a.hub.now()).await;
+        }
+        if let (Some(t), Some(idle)) = (tenant, &self.idle) {
+            idle.passed(t, live.is_empty(), self.a.hub.now());
         }
         let all: Vec<Recommendation> = {
             let mut g = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
@@ -895,5 +980,33 @@ mod tests {
             vec![TenantId(1), TenantId(42)]
         );
         assert_eq!(ancestors_of("/5/", TenantId(5)), Vec::<TenantId>::new());
+    }
+
+    #[test]
+    fn idle_tenants_are_skipped_until_a_recheck_or_an_event() {
+        let idle = IdleTenants::default();
+        let t = TenantId(7);
+        let us = |s: i64| s * 1_000_000;
+        assert!(!idle.skip(t, us(0)), "never passed: not idle");
+        idle.passed(t, true, us(0));
+        assert!(idle.skip(t, us(1)));
+        assert!(idle.skip(t, us(299)));
+        assert!(!idle.skip(t, us(300)), "the recheck is due");
+        // The recheck's pass finds nothing again: skipped for another
+        // IDLE_RECHECK.
+        idle.passed(t, true, us(300));
+        assert!(idle.skip(t, us(301)));
+        assert!(!idle.skip(t, us(600)));
+        // A busy pass, or a wake: passed in full next time.
+        idle.passed(t, false, us(310));
+        assert!(!idle.skip(t, us(311)));
+        idle.passed(t, true, us(320));
+        assert!(idle.skip(t, us(321)));
+        idle.wake(t);
+        assert!(!idle.skip(t, us(322)));
+        assert_eq!(idle.count(), 0);
+        // A clock that went back: passed in full.
+        idle.passed(t, true, us(400));
+        assert!(!idle.skip(t, us(399)));
     }
 }

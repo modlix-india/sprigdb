@@ -250,10 +250,10 @@ impl L<'_> {
             let Ok(ix) = u16::try_from(i) else { continue };
             let v = || Expr::Param(ix);
             let fail = |what: String| {
-                vec![Stmt::Throw(ErrorSpec {
-                    code: SprigCode::LogicRuntimeError.number(),
-                    message: Expr::Lit(Literal::Str(format!("{fname}: argument {name} {what}"))),
-                })]
+                vec![Stmt::Throw(ErrorSpec::new(
+                    SprigCode::LogicRuntimeError.number(),
+                    Expr::Lit(Literal::Str(format!("{fname}: argument {name} {what}"))),
+                ))]
             };
             let nullable = match &p.schema.ty {
                 Some(crate::kirun::model::TypeSpec::One(t)) => t.eq_ignore_ascii_case("NULL"),
@@ -720,12 +720,12 @@ impl L<'_> {
                     if let Some(found) = self.missing_row_guard(r) {
                         out.push(Stmt::If(
                             Expr::Unary(UnOp::Not, Box::new(Expr::Local(found))),
-                            vec![Stmt::Throw(ErrorSpec {
-                                code: SprigCode::LogicRuntimeError.number(),
-                                message: Expr::Lit(Literal::Str(format!(
+                            vec![Stmt::Throw(ErrorSpec::new(
+                                SprigCode::LogicRuntimeError.number(),
+                                Expr::Lit(Literal::Str(format!(
                                     "step {s}: result {fname} reads a column of a row that wasn't found"
                                 ))),
-                            })],
+                            ))],
                             Vec::new(),
                         ));
                     }

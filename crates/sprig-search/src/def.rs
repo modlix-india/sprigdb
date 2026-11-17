@@ -133,11 +133,15 @@ pub enum Source {
     Path,
     /// A path in a key-value value.
     KvValue,
+    /// A field of a key-value hash, by its exact name (`source_ref`).
+    KvField,
     /// Every string of the document (`dynamic: true`, `$**`).
     Dynamic,
 }
 
 /// One field of an index.
+// Each flag is a field option of the DDL.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FieldDef {
     /// Order in the Tantivy schema (`f<field_no>`).
@@ -171,6 +175,14 @@ pub struct FieldDef {
     /// The generation that added it.
     #[serde(default)]
     pub added_generation: u32,
+    /// Keyword values are split at this separator and trimmed (Redis
+    /// `TAG` fields); `None` keeps each value whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub separator: Option<String>,
+    /// Split keyword values keep their case; otherwise they are lowercased
+    /// when indexed and queried.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub case_sensitive: bool,
 }
 
 fn one() -> f64 {
@@ -194,6 +206,34 @@ impl FieldDef {
             sort: false,
             facet: false,
             added_generation: 1,
+            separator: None,
+            case_sensitive: false,
+        }
+    }
+
+    /// The values a stored value indexes as: split at the separator,
+    /// trimmed, empty parts dropped, lowercased unless case-sensitive
+    /// (fields with a separator); else the value itself.
+    #[must_use]
+    pub fn split_value(&self, v: &str) -> Vec<String> {
+        let Some(sep) = self.separator.as_deref().filter(|s| !s.is_empty()) else {
+            return vec![v.to_owned()];
+        };
+        v.split(sep)
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(|p| self.tag_case(p))
+            .collect()
+    }
+
+    /// A tag as indexed: lowercased unless the field is case-sensitive
+    /// (fields with a separator only).
+    #[must_use]
+    pub fn tag_case(&self, v: &str) -> String {
+        if self.separator.is_some() && !self.case_sensitive {
+            v.to_lowercase()
+        } else {
+            v.to_owned()
         }
     }
 
@@ -269,6 +309,10 @@ pub struct IndexDef {
     /// The definition as given (DDL text, or the BSON as JSON).
     #[serde(default)]
     pub given: Json,
+    /// Key-value namespaces: only keys starting with one of these are
+    /// indexed (Redis `FT.CREATE ... PREFIX`); empty indexes every key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_prefixes: Vec<String>,
 }
 
 fn gen1() -> u32 {
@@ -318,7 +362,25 @@ impl IndexDef {
             partitions: parts(),
             definer_user_id: 0,
             given: Json::Null,
+            key_prefixes: Vec::new(),
         }
+    }
+
+    /// Whether the index reads hash fields (a key-value namespace's hash
+    /// keys, besides string keys' values).
+    #[must_use]
+    pub fn has_hash_fields(&self) -> bool {
+        self.model == Model::Kv && self.fields.iter().any(|f| f.source == Source::KvField)
+    }
+
+    /// Whether `key` is one the index covers (its prefixes).
+    #[must_use]
+    pub fn covers_key(&self, key: &[u8]) -> bool {
+        self.key_prefixes.is_empty()
+            || self
+                .key_prefixes
+                .iter()
+                .any(|p| key.starts_with(p.as_bytes()))
     }
 
     /// Adds a field, numbering it.
@@ -483,15 +545,26 @@ impl IndexDef {
                 "text indexes with a language_override are not supported",
             ));
         }
+        // Non-text keys (`{title: "text", age: 1}`) are kept in `given`, in
+        // order, so `listIndexes` shows the key as given; the search copy
+        // holds only the text, and the document filter checks the rest.
+        let mut compound = false;
         for (path, v) in key {
             if v.as_str() != Some("text") {
                 // MongoDB's own `_fts`/`_ftsx` form, as listIndexes shows it.
                 if path == "_fts" || path == "_ftsx" {
                     continue;
                 }
-                return Err(unsupported(
-                    "compound text indexes with non-text keys are not supported",
-                ));
+                if !v
+                    .as_f64()
+                    .is_some_and(|n| (n.abs() - 1.0).abs() < f64::EPSILON)
+                {
+                    return Err(unsupported(format!(
+                        "a text index's other keys must be 1 or -1 (key '{path}')"
+                    )));
+                }
+                compound = true;
+                continue;
             }
             if path == "$**" {
                 d.dynamic = true;
@@ -516,7 +589,37 @@ impl IndexDef {
         if d.fields.is_empty() && !d.dynamic {
             return Err(bad("a text index needs at least one text key"));
         }
+        if compound {
+            d.given = serde_json::json!({
+                "key": key.iter().map(|(k, v)| serde_json::json!([k, v])).collect::<Vec<_>>()
+            });
+        }
         Ok(d)
+    }
+
+    /// A `text` index's key as `listIndexes` shows it: the non-text keys in
+    /// their places and `_fts: "text", _ftsx: 1` where the first text key
+    /// was, as MongoDB prints it. `None` for a key of text keys only.
+    #[must_use]
+    pub fn mongo_text_key(&self) -> Option<Vec<(String, Json)>> {
+        let parts = self.given.get("key")?.as_array()?;
+        let mut out: Vec<(String, Json)> = Vec::new();
+        let mut fts = false;
+        for p in parts {
+            let (Some(k), Some(v)) = (p.get(0).and_then(Json::as_str), p.get(1)) else {
+                continue;
+            };
+            if v.as_str() == Some("text") || k == "_fts" || k == "_ftsx" {
+                if !fts {
+                    out.push(("_fts".to_owned(), Json::from("text")));
+                    out.push(("_ftsx".to_owned(), Json::from(1)));
+                    fts = true;
+                }
+            } else {
+                out.push((k.to_owned(), v.clone()));
+            }
+        }
+        Some(out)
     }
 }
 
@@ -701,11 +804,36 @@ mod tests {
         assert_eq!(d.default_analyzer, "mongo_french");
         assert!((d.fields[0].boost - 10.0).abs() < f64::EPSILON);
         d.check(&[]).unwrap();
+        // Compound: the other keys keep their places in listIndexes' key.
+        let c = IndexDef::from_mongo_text(
+            "t",
+            "d",
+            "c",
+            &[
+                ("a".into(), json!(1)),
+                ("b".into(), json!("text")),
+                ("c".into(), json!("text")),
+                ("z".into(), json!(-1)),
+            ],
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(c.fields.len(), 2);
+        let k: Vec<String> = c
+            .mongo_text_key()
+            .unwrap()
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        assert_eq!(k, ["a=1", "_fts=\"text\"", "_ftsx=1", "z=-1"]);
+        assert!(d.mongo_text_key().is_none());
         let e = IndexDef::from_mongo_text(
             "t",
             "d",
             "c",
-            &[("a".into(), json!(1)), ("b".into(), json!("text"))],
+            &[("a".into(), json!("2d")), ("b".into(), json!("text"))],
             &[],
             None,
             None,

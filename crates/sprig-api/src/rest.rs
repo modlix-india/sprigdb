@@ -412,6 +412,27 @@ pub static ROUTES: &[Route] = &[
         "NameRequest"
     ),
     r!(
+        "sprig.admin.v1.Users",
+        "SetTokenLogin",
+        "POST",
+        "/admin/v1/tenants/{name}/users:setTokenLogin",
+        "NameRequest"
+    ),
+    r!(
+        "sprig.admin.v1.Users",
+        "ListIssuers",
+        "GET",
+        "/admin/v1/tenants/{name}/issuers",
+        "NameRequest"
+    ),
+    r!(
+        "sprig.admin.v1.Users",
+        "PutIssuer",
+        "POST",
+        "/admin/v1/tenants/{name}/issuers",
+        "NameRequest"
+    ),
+    r!(
         "sprig.admin.v1.Settings",
         "ListSettingKeys",
         "GET",

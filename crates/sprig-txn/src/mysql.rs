@@ -125,6 +125,7 @@ impl MyConn {
             vars: Vec::new(),
             charset: None,
             timestamp_us: Some(rec.timestamp_us),
+            db: None,
         });
     }
 
@@ -658,6 +659,9 @@ impl ClusterAdmin for MyAdmin {
                     && cs.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
                 {
                     c.query_drop(format!("SET NAMES {cs}")).await?;
+                }
+                if let Some(u) = r.use_sql() {
+                    c.query_drop(u).await?;
                 }
                 c.query_drop(r.replay_sql()).await?;
                 let n = c.affected_rows();

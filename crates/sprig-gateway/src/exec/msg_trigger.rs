@@ -41,6 +41,7 @@ use mysql_async::prelude::Queryable;
 use serde_json::{Value, json};
 use sprig_catalog::CatalogLocator;
 use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::ObjectKind;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_logic::declare::{Declaration, SourceKind};
@@ -59,8 +60,57 @@ use super::offsets::find_stream;
 use super::tenant::Step;
 use crate::pipeline::{ExecCtx, ResultSink, RowFormat, Wire};
 
+/// A trigger run's `db`: the session's, keeping the code's log lines
+/// (`console.log`, `ctx.log`) for the run log (`logic_log`), at most
+/// [`sprig_logic::engine::engine::MAX_LOG_LINES`] a run.
+struct LoggedDb {
+    db: ChannelDb,
+    lines: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl sprig_logic::engine::bridge::DbBridge for LoggedDb {
+    async fn exec(&self, op: DbOp) -> Result<sprig_logic::engine::bridge::Reply> {
+        self.db.exec(op).await
+    }
+
+    fn log(&self, line: &str) {
+        let mut v = self
+            .lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if v.len() < sprig_logic::engine::engine::MAX_LOG_LINES {
+            v.push(line.to_owned());
+        }
+    }
+}
+
+/// Where a compiled trigger keeps its log lines.
+const LOG_VAR: &str = sprig_logic::compiler::plsql::LOG_VAR;
+
 /// The marked statement's start.
 pub(crate) const MARK: &str = "/* sprig message trigger ";
+
+/// How long a trigger's rollout is cached.
+const ROLLOUT_TTL: Duration = Duration::from_secs(5);
+
+type RolloutCache = std::collections::HashMap<
+    (u64, u64),
+    (std::time::Instant, Option<sprig_logic::rollout::Rollout>),
+>;
+
+/// Triggers' rollouts by tenant and module (`None`: none), read at most
+/// every [`ROLLOUT_TTL`].
+static ROLLOUTS: std::sync::LazyLock<std::sync::Mutex<RolloutCache>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Forgets a trigger's cached rollout (after `ALTER TRIGGER ... ROLLOUT`
+/// through this gateway).
+pub(super) fn forget_rollout(tenant: u64, module: u64) {
+    if let Ok(mut m) = ROLLOUTS.lock() {
+        m.remove(&(tenant, module));
+    }
+}
 
 /// This process's nonce: only statements carrying it are runs.
 #[must_use]
@@ -171,9 +221,15 @@ impl PassSession {
         let svc = Arc::clone(ts.services());
         let tenant = ts.tenant;
         let ep = svc.locator.writer(tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-        })?;
+        let catalog_conn = || {
+            let pool = ep.pool.clone();
+            async move {
+                pool.get_conn_bounded().await.map_err(|e| {
+                    SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable")
+                        .with_source(e)
+                })
+            }
+        };
         let source_db = src.db.clone().unwrap_or_else(|| db.clone());
         // `ON STREAM s FAN IN` reads every member instance of
         // the inherited stream `s` below this tenant.
@@ -269,7 +325,8 @@ impl PassSession {
                 {
                     return Err(denied(ts, "SELECT and DELETE", &source_db, &src.name));
                 }
-                let id: Option<u64> = conn
+                let id: Option<u64> = catalog_conn()
+                    .await?
                     .exec_first(
                         format!(
                             "SELECT object_id FROM {}.mq_queues WHERE db_id = ? AND name = ? \
@@ -299,6 +356,46 @@ impl PassSession {
                 (r, id, None)
             }
         };
+        // The compiled tier's routines go on every shard of the trigger's
+        // database, through `sprig_ctl`, with the definer as `DEFINER`.
+        let streams = super::logic::logic_streams(ts, &cat, row.db_id);
+        let template = ts.schema_of(Some(&db));
+        let layout = super::router::ddl_layout(ts);
+        let shard_list: Vec<(String, sprig_common::ids::ClusterId)> = {
+            let from_layout = match (&layout, &template) {
+                (Some(l), Some(t)) => l(t, None),
+                (Some(l), None) => sprig_catalog::ddl::shard_schemas(tenant, &row)
+                    .first()
+                    .map(ToString::to_string)
+                    .and_then(|f| l(&f, None)),
+                _ => None,
+            };
+            match (from_layout.filter(|v| !v.is_empty()), template) {
+                (Some(v), _) => v,
+                (None, Some(t)) => vec![(t, self.target.cluster.clone())],
+                (None, None) => Vec::new(),
+            }
+        };
+        let single_shard = shard_list.len() == 1;
+        let mut shards = super::logic_bound::CtlShards {
+            list: shard_list,
+            conns: std::collections::HashMap::new(),
+            locator: Arc::clone(&svc.locator),
+        };
+        let account = sprig_auth::authz::backend::account(tenant, user);
+        let compile = (!shards.list.is_empty()).then(|| sprig_logic::messages::MsgCompile {
+            shards: &mut shards,
+            single_shard,
+            definer: format!("`{}`@`%`", account.replace('`', "``")),
+            db_name: &row.name,
+            streams,
+            max_loop_iterations: 100_000,
+            compile_max_cost: 100_000,
+        });
+        // Taken after the chain's loads above and given back before the
+        // fan-in attach below, which take catalog connections of their own
+        // from the same pool (4 per cluster).
+        let mut conn = catalog_conn().await?;
         let deployed = sprig_logic::messages::deploy(
             &decl,
             sprig_logic::messages::MsgTarget {
@@ -311,9 +408,11 @@ impl PassSession {
                 source_db: (source_db_row.db_id.0, &source_db_row.name),
                 object_id,
                 fanin_declarer: fanin_def.as_ref().map_or(0, |d| d.declarer.0),
+                compile,
             },
         )
         .await?;
+        shards.release();
         let mut notes = deployed.notes();
         // A new stream trigger reads what is published from now on.
         if let Some(def) = &stream_def {
@@ -326,7 +425,7 @@ impl PassSession {
                     let cluster = svc.locator.cluster(tenant).await?;
                     let pool = svc.locator.ctl_pool(&cluster).await?;
                     let mut c = pool
-                        .get_conn()
+                        .get_conn_bounded()
                         .await
                         .map_err(sprig_streams::maria::map_err)?;
                     let reader = sprig_streams::read::LogReader { schema };
@@ -348,6 +447,7 @@ impl PassSession {
                 ));
             }
         }
+        drop(conn);
         if let Some(def) = &fanin_def {
             let n = crate::inherited::fanin_triggers::attach_existing(
                 &svc,
@@ -554,7 +654,29 @@ impl PassSession {
         req: &RunRequest,
         field: &str,
         event: Value,
-    ) -> Result<Vec<String>> {
+    ) -> (Result<()>, Vec<String>) {
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let r = self
+            .run_version_logged(cx, req, field, event, Arc::clone(&lines))
+            .await;
+        let logs = std::mem::take(
+            &mut *lines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        (r, logs)
+    }
+
+    /// [`Self::run_version`], keeping the code's log lines in `lines`.
+    #[allow(clippy::too_many_lines)]
+    async fn run_version_logged(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        req: &RunRequest,
+        field: &str,
+        event: Value,
+        lines: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Result<()> {
         let (svc, tenant, cat, user) = {
             let ts = self
                 .tenant
@@ -577,10 +699,10 @@ impl PassSession {
             v
         } else {
             let ep = svc.locator.writer(tenant).await?;
-            let mut conn = ep.pool.get_conn().await.map_err(|e| {
+            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
                 SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
             })?;
-            sprig_logic::invoke::load(
+            sprig_logic::invoke::load_any(
                 &mut conn,
                 ep.store.schema(),
                 tenant.0,
@@ -589,6 +711,20 @@ impl PassSession {
             )
             .await?
         };
+        // A compiled version runs in MariaDB; a record it hands back (39876)
+        // runs below, in the engine tier.
+        if v.tier == "mariadb"
+            && let Some(entry) = messages::CompiledEntry::of(&v.signature)
+            && let Some(db) = cat.databases.get(sprig_common::ids::DbId(v.db_id))
+        {
+            let db = db.name.clone();
+            if self
+                .run_compiled(cx, req, &entry, &db, &event, &lines)
+                .await?
+            {
+                return Ok(());
+            }
+        }
         let program = v.program.as_ref().ok_or_else(|| {
             SprigError::new(
                 SprigCode::LogicEngineUnavailable,
@@ -624,7 +760,10 @@ impl PassSession {
         };
         let (tx, mut rx) = mpsc::channel::<DbRequest>(1);
         let host = Host {
-            db: Arc::new(ChannelDb(tx)),
+            db: Arc::new(LoggedDb {
+                db: ChannelDb(tx),
+                lines,
+            }),
             outbound: Arc::new(HttpOutbound::new(policy)),
             default_db: db_row.map(|r| r.name.clone()),
             info: ctx,
@@ -674,7 +813,169 @@ impl PassSession {
                 format!("{}: {msg}", outcome.event),
             ));
         }
-        Ok(Vec::new())
+        Ok(())
+    }
+
+    /// The trigger's rollout, if it has one (cached).
+    async fn trigger_rollout(&mut self, module: u64) -> Option<sprig_logic::rollout::Rollout> {
+        let ts = self.tenant.as_deref()?;
+        let tenant = ts.tenant.0;
+        if let Ok(m) = ROLLOUTS.lock()
+            && let Some((at, r)) = m.get(&(tenant, module))
+            && at.elapsed() < ROLLOUT_TTL
+        {
+            return r.clone();
+        }
+        let svc = Arc::clone(ts.services());
+        let ep = svc.locator.writer(ts.tenant).await.ok()?;
+        let mut conn = ep.pool.get_conn_bounded().await.ok()?;
+        let r = sprig_logic::rollout::get(&mut conn, ep.store.schema(), module)
+            .await
+            .ok()?;
+        if let Ok(mut m) = ROLLOUTS.lock() {
+            m.insert((tenant, module), (std::time::Instant::now(), r.clone()));
+        }
+        r
+    }
+
+    /// The version a run of `event` takes: the worker's (the active one),
+    /// or, in a rollout, the candidate when the event's key falls in its
+    /// share ([`sprig_logic::rollout::key_picks_candidate`]). With the
+    /// module when it is in a rollout, so the run is counted.
+    async fn pick_version(
+        &mut self,
+        req: &RunRequest,
+        event: &Value,
+        message_id: Option<&str>,
+    ) -> (RunRequest, Option<u64>) {
+        let module = req.source.module_id;
+        let Some(r) = self.trigger_rollout(module).await else {
+            return (req.clone(), None);
+        };
+        if r.active_version != req.version {
+            return (req.clone(), None);
+        }
+        let key = messages::rollout_key(event, message_id);
+        let mut picked = req.clone();
+        if sprig_logic::rollout::key_picks_candidate(r.spec(), key.as_deref(), module) {
+            picked.version = r.candidate_version;
+        }
+        (picked, Some(module))
+    }
+
+    /// Counts a run of a trigger in a rollout (the automatic rollback
+    /// reads the numbers).
+    async fn count_run(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        counted: Option<u64>,
+        req: &RunRequest,
+        started: std::time::Instant,
+        reply: &RunReply,
+    ) {
+        if let Some(module) = counted {
+            let failed =
+                matches!(reply.outcome, RunOutcome::Failed | RunOutcome::Dead) && !reply.transient;
+            self.rollout_count(cx, module, req.version, started.elapsed(), failed)
+                .await;
+        }
+    }
+
+    /// A compiled trigger version, in this session's transaction: its
+    /// entry procedure with the event's fields, after a savepoint, under
+    /// `logic.trigger_budget_ms`. `Ok(false)` when the code handed the
+    /// record back (39876): the savepoint is rolled back and the caller
+    /// runs it in the engine tier.
+    async fn run_compiled(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        req: &RunRequest,
+        entry: &messages::CompiledEntry,
+        db: &str,
+        event: &Value,
+        lines: &Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Result<bool> {
+        const SAVEPOINT: &str = "__sprig_compiled";
+        self.trigger_stmt(cx, &format!("SAVEPOINT {SAVEPOINT}"))
+            .await?;
+        let call = entry.call(db, req.source.module_id, req.version, event);
+        let budget = req.budget_ms.max(1);
+        let timed = format!(
+            "SET STATEMENT max_statement_time = {} FOR {call}",
+            Duration::from_millis(budget).as_secs_f64()
+        );
+        // The entry procedure's name is reserved (`__sprig_`): only the
+        // gateway's own statements may name it.
+        if let Err(e) = self.run_checked(cx, &timed, true).await.map(|_| ()) {
+            let n = messages::error_number(&e);
+            if n == messages::ENGINE_RERUN {
+                tracing::debug!(binding = req.source.binding_id, reason = %e.message, "compiled trigger: this record runs in the engine tier");
+                self.trigger_stmt(cx, &format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}"))
+                    .await?;
+                return Ok(false);
+            }
+            // The lines written before the error, as the engine tier
+            // keeps a failed run's: the entry keeps them in the variable as
+            // it goes, emptied when it starts.
+            if entry.log
+                && let Ok(mut got) = self
+                    .run_checked(cx, &format!("SELECT {LOG_VAR}"), false)
+                    .await
+                && let Some(Some(l)) = got.rows.pop().and_then(|r| r.into_iter().next())
+            {
+                let logged: Vec<String> = serde_json::from_slice(&l).unwrap_or_default();
+                let mut v = lines
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                v.extend(logged);
+                v.truncate(sprig_logic::engine::engine::MAX_LOG_LINES);
+            }
+            if matches!(n, 1969 | 3024) {
+                return Err(SprigError::new(
+                    SprigCode::LogicBudgetExceeded,
+                    format!("the run ran past logic.trigger_budget_ms = {budget} ms"),
+                ));
+            }
+            return Err(e);
+        }
+        let read = if entry.log {
+            "SELECT @__sprig_e, @__sprig_r, @__sprig_l"
+        } else {
+            "SELECT @__sprig_e, @__sprig_r"
+        };
+        let mut got = self.run_checked(cx, read, false).await?;
+        let row = got.rows.pop().unwrap_or_default();
+        let text = |i: usize| {
+            row.get(i)
+                .cloned()
+                .flatten()
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+        };
+        if let Some(l) = text(2) {
+            let logged: Vec<String> = serde_json::from_str(&l).unwrap_or_default();
+            let mut v = lines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            v.extend(logged);
+            v.truncate(sprig_logic::engine::engine::MAX_LOG_LINES);
+        }
+        let ev = text(0).unwrap_or_else(|| "output".to_owned());
+        // An `error` or `reject` event fails the run, as in the engine
+        // tier (39865).
+        if matches!(ev.as_str(), "error" | "reject") {
+            let result: Value = text(1)
+                .and_then(|r| serde_json::from_str(&r).ok())
+                .unwrap_or(Value::Null);
+            let msg = result
+                .get("message")
+                .and_then(Value::as_str)
+                .map_or_else(|| result.to_string(), str::to_owned);
+            return Err(SprigError::new(
+                SprigCode::LogicUserError,
+                format!("{ev}: {msg}"),
+            ));
+        }
+        Ok(true)
     }
 
     /// A dead letter's replay: its event with the active version, in
@@ -711,12 +1012,10 @@ impl PassSession {
             SourceKind::Stream => "record",
             SourceKind::Queue => "message",
         };
-        match self.run_version(cx, req, arg, rp.event.clone()).await {
-            Ok(logs) => match self.trigger_stmt(cx, "COMMIT").await {
-                Ok(()) => RunReply {
-                    logs,
-                    ..RunReply::of(RunOutcome::Ok)
-                },
+        let (ran, logs) = self.run_version(cx, req, arg, rp.event.clone()).await;
+        let reply = match ran {
+            Ok(()) => match self.trigger_stmt(cx, "COMMIT").await {
+                Ok(()) => RunReply::of(RunOutcome::Ok),
                 Err(e) => {
                     self.rollback_quietly(cx).await;
                     RunReply::failed(&e)
@@ -726,7 +1025,8 @@ impl PassSession {
                 self.rollback_quietly(cx).await;
                 RunReply::failed(&e)
             }
-        }
+        };
+        RunReply { logs, ..reply }
     }
 
     /// One record of a stream (see the module docs).
@@ -798,12 +1098,13 @@ impl PassSession {
                 }
             };
         }
-        match self.run_version(cx, req, "record", event).await {
-            Ok(logs) => match self.trigger_stmt(cx, "COMMIT").await {
-                Ok(()) => RunReply {
-                    logs,
-                    ..RunReply::of(RunOutcome::Ok)
-                },
+        // In a rollout, the record's key picks the version.
+        let (picked, counted) = self.pick_version(req, &event, None).await;
+        let started = std::time::Instant::now();
+        let (ran, logs) = self.run_version(cx, &picked, "record", event).await;
+        let reply = match ran {
+            Ok(()) => match self.trigger_stmt(cx, "COMMIT").await {
+                Ok(()) => RunReply::of(RunOutcome::Ok),
                 Err(e) => {
                     self.rollback_quietly(cx).await;
                     RunReply::failed(&e)
@@ -813,7 +1114,10 @@ impl PassSession {
                 self.rollback_quietly(cx).await;
                 RunReply::failed(&e)
             }
-        }
+        };
+        let reply = RunReply { logs, ..reply };
+        self.count_run(cx, counted, &picked, started, &reply).await;
+        reply
     }
 
     /// The next message of a queue (see the module docs).
@@ -911,6 +1215,8 @@ impl PassSession {
             r.attempts = attempts;
             r
         };
+        // The code's log lines, also when the run fails.
+        let mut code_logs = Vec::new();
         let failure = if let Err(e) = self.trigger_stmt(cx, "START TRANSACTION").await {
             e
         } else {
@@ -937,7 +1243,25 @@ impl PassSession {
                     v.release(&t, false);
                     return with_id(RunReply::of(RunOutcome::Moved));
                 }
-                match self.run_version(cx, req, "message", event.clone()).await {
+                // In a rollout, the message's key picks the version.
+                let (picked, counted) = self.pick_version(req, &event, Some(&message_id)).await;
+                let started = std::time::Instant::now();
+                let (ran, logs) = self
+                    .run_version(cx, &picked, "message", event.clone())
+                    .await;
+                code_logs.clone_from(&logs);
+                let ok = RunReply::of(RunOutcome::Ok);
+                let failed = RunReply::of(RunOutcome::Failed);
+                let counted_ok = ran.is_ok();
+                self.count_run(
+                    cx,
+                    counted,
+                    &picked,
+                    started,
+                    if counted_ok { &ok } else { &failed },
+                )
+                .await;
+                match ran.map(|()| logs) {
                     Ok(logs) => match self.trigger_stmt(cx, "COMMIT").await {
                         Ok(()) => {
                             v.release(&t, true);
@@ -960,7 +1284,10 @@ impl PassSession {
                 }
             }
         };
-        let mut reply = with_id(RunReply::failed(&failure));
+        let mut reply = with_id(RunReply {
+            logs: code_logs,
+            ..RunReply::failed(&failure)
+        });
         // An inherited trigger whose sprig_inherited lost a
         // privilege waits for the grant (39242, marked by `on_run`): its
         // message goes back without counting, never to the dead letters.
@@ -993,7 +1320,7 @@ impl PassSession {
                     .ok_or_else(|| SprigError::internal("no tenant"))?;
                 ts.services().locator.writer(tenant).await?
             };
-            let mut conn = ep.pool.get_conn().await.map_err(|e| {
+            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
                 SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
             })?;
             let store = sprig_logic::LogicStore::new(ep.store.schema());

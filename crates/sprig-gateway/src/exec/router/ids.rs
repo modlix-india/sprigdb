@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use mysql_async::prelude::Queryable;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::{ClusterId, TenantId};
 use sprig_common::names::SchemaName;
 use sprig_common::{ErrorKind, Result, SprigCode, SprigError};
@@ -220,7 +221,7 @@ async fn first_value(src: &GwSequences, f: &IdFill) -> Result<i128> {
             .await
             .map_err(|e| unavailable(&e))?;
         let mut c = pool
-            .get_conn()
+            .get_conn_bounded()
             .await
             .map_err(|e| unavailable(&SprigError::internal(e.to_string())))?;
         let sql = format!(

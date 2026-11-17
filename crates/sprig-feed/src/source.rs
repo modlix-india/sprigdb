@@ -51,7 +51,7 @@ pub struct RawRow {
     /// The row after.
     pub after: Option<RowImage>,
     /// The operation hint (`o=`) of the statement's SprigDB comment, when
-    /// it had one (chapter 38, "Statement comments"): a replacement shows
+    /// it had one: a replacement shows
     /// as `r` on an update.
     pub hint: Option<OpHint>,
 }
@@ -94,7 +94,7 @@ pub struct RawTxn {
     /// Statement-format DML ran in this tenant schema.
     pub statement_dml: Option<String>,
     /// The group writes `__sprig_mover_pos` or `__sprig_ref_pos`: it is an
-    /// applier's (filter rule 2).
+    /// applier's (the tail's filter rule 2).
     pub apply: bool,
     /// The XA role of the group, if any.
     pub xa: Option<XaMark>,
@@ -192,9 +192,23 @@ pub trait Clusters: Send + Sync {
     /// # Errors
     /// Connection errors (retryable).
     async fn position(&self, cluster: &ClusterId) -> Result<GtidPos>;
+
+    /// The position a stopping consumer reads on past ([`crate::drain`]):
+    /// [`Self::position`] in the GTID domains a purge on the dump's node
+    /// can take from it. The default: every domain. A Galera cluster's
+    /// keeps only its shared domain: the writer pool's node need not be
+    /// the one the dump reads (its own local domain isn't in the feed),
+    /// and a node-local domain the reader lags in is added at its next
+    /// dump start when purged ([`crate::local_domains`]).
+    ///
+    /// # Errors
+    /// Connection errors (retryable).
+    async fn drain_position(&self, cluster: &ClusterId) -> Result<GtidPos> {
+        self.position(cluster).await
+    }
 }
 
-/// What a cluster-wide dump keeps ([`Clusters::open_scope`]; R9, r9feed).
+/// What a cluster-wide dump keeps ([`Clusters::open_scope`]).
 ///
 /// A row of `schema`.`table` is kept when the schema is a tenant's and:
 /// the tenant is kept whole (`tenants`), or the table is one of `tables`

@@ -7,7 +7,9 @@
 //! registry's writer pools as `sprig_ctl` with a budget of its own
 //! ([`POOL_MAX`] per cluster), finding anchors through the DC tier's shard
 //! maps exactly as the controller's `txn_resolver` loop does. It never
-//! scans or sweeps: only cutovers call it.
+//! scans or sweeps: only cutovers call it. Held branches (Sprig 2PC) on a
+//! cluster whose relay writer holds the relay lease are that writer's: the
+//! drain leaves them to its fence (`NoRelayLease`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +18,7 @@ use sprig_cluster::registry::ClusterRegistry;
 use sprig_common::Result;
 use sprig_common::ids::{ClusterId, TenantId};
 use sprig_controller::catalogs::{ClusterPools, RegistryPools};
-use sprig_controller::txn_resolver::CtlPools;
+use sprig_controller::txn_resolver::{CtlPools, NoRelayLease};
 use sprig_meta::MetaStore;
 use sprig_mover::{Drained, PreparedDrain};
 use sprig_shard::{ShardMapStore, TenantMaps};
@@ -52,7 +54,12 @@ impl ResolverDrain {
             id: format!("mover:{worker}"),
             ..ResolverConfig::default()
         };
-        Self(Arc::new(Resolver::new(admin, Arc::new(locator), cfg)))
+        let r = Resolver::new(admin, Arc::new(locator), cfg);
+        // A relayed cluster's held branches are its relay writer's while
+        // it holds the lease: the drain doesn't replay them around the
+        // fence.
+        r.set_redo_guard(Arc::new(NoRelayLease(Arc::clone(dc))));
+        Self(Arc::new(r))
     }
 }
 

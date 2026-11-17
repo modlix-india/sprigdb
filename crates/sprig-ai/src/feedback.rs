@@ -115,6 +115,40 @@ pub trait FeedbackStore: Send + Sync {
     /// The tenant's latest outcomes and notes, newest first, at most
     /// `limit`.
     async fn recent(&self, limit: u32) -> Result<Vec<Note>>;
+    /// The proposal `proposal_id` (its id as the stream showed it) in one
+    /// of `user`'s conversations, with the outcome already recorded for
+    /// it, if any; `None` when there is no such proposal. Stores that
+    /// keep no proposals answer `None`.
+    async fn proposal(&self, _user: UserId, _proposal_id: &str) -> Result<Option<Found>> {
+        Ok(None)
+    }
+}
+
+/// A stored proposal, as [`FeedbackStore::proposal`] finds it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Found {
+    /// Its message id in `ai_messages`.
+    pub msg_id: u64,
+    /// The assistant that proposed it.
+    pub role: Role,
+    /// The proposal as stored: `{id, kind, tool_use_id, body}`.
+    pub proposal: Value,
+    /// The latest outcome recorded for it.
+    pub decided: Option<Outcome>,
+}
+
+impl Found {
+    /// The proposal's kind (`sql`, `recommendation`, ...).
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        self.proposal["kind"].as_str().unwrap_or_default()
+    }
+
+    /// The tool's input, as the model gave it.
+    #[must_use]
+    pub fn body(&self) -> &Value {
+        &self.proposal["body"]
+    }
 }
 
 fn clip(s: &str, n: usize) -> String {
@@ -262,6 +296,37 @@ impl FeedbackStore for MemoryAudit {
         Ok(Some((role, kind)))
     }
 
+    async fn proposal(&self, user: UserId, proposal_id: &str) -> Result<Option<Found>> {
+        let m = self.lock();
+        let Some((conv, msg)) = m
+            .msgs
+            .iter()
+            .find(|(_, s)| s.kind == MsgKind::Proposal && s.body["id"] == proposal_id)
+        else {
+            return Ok(None);
+        };
+        let Some(role) = m
+            .convs
+            .get(conv)
+            .filter(|c| c.user == user.0)
+            .map(|c| c.role)
+        else {
+            return Ok(None);
+        };
+        let decided = m
+            .feedback
+            .iter()
+            .rev()
+            .find(|f| f.proposal == Some(msg.id) && f.outcome.is_some())
+            .and_then(|f| f.outcome);
+        Ok(Some(Found {
+            msg_id: msg.id,
+            role,
+            proposal: msg.body.clone(),
+            decided,
+        }))
+    }
+
     async fn recent(&self, limit: u32) -> Result<Vec<Note>> {
         let m = self.lock();
         Ok(m.feedback
@@ -392,6 +457,39 @@ impl FeedbackStore for CatalogAudit {
             })
             .collect())
     }
+
+    async fn proposal(&self, user: UserId, proposal_id: &str) -> Result<Option<Found>> {
+        let mut c = self.conn().await?;
+        let row: Option<(u64, String, String, Option<String>)> = c
+            .exec_first(
+                format!(
+                    "SELECT m.msg_id, c.role, CAST(m.body AS CHAR), \
+                     (SELECT f.outcome FROM {} f WHERE f.proposal_id = m.msg_id \
+                      AND f.outcome IS NOT NULL ORDER BY f.fb_id DESC LIMIT 1) \
+                     FROM {} c JOIN {} m ON m.conv_id = c.conv_id \
+                     WHERE c.user_id = ? AND m.kind = 'proposal' \
+                     AND JSON_UNQUOTE(JSON_EXTRACT(m.body, '$.id')) = ?",
+                    self.t("ai_feedback"),
+                    self.t("ai_conversations"),
+                    self.t("ai_messages")
+                ),
+                (user.0, proposal_id),
+            )
+            .await
+            .map_err(unavailable)?;
+        let Some((msg_id, role, body, decided)) = row else {
+            return Ok(None);
+        };
+        let (Some(role), Ok(proposal)) = (Role::parse(&role), serde_json::from_str(&body)) else {
+            return Ok(None);
+        };
+        Ok(Some(Found {
+            msg_id,
+            role,
+            proposal,
+            decided: decided.as_deref().and_then(Outcome::parse),
+        }))
+    }
 }
 
 /// A feedback row as a [`Note`]: its vote, outcome and note, and the
@@ -465,6 +563,13 @@ mod tests {
                 .unwrap(),
             None
         );
+        // The proposal, its owner's only, with what became of it.
+        assert_eq!(a.proposal(bob, "p-1").await.unwrap(), None);
+        let f = a.proposal(ann, "p-1").await.unwrap().unwrap();
+        assert_eq!((f.role, f.kind()), (Role::Data, "sql"));
+        assert_eq!(f.body()["db"], "shop");
+        assert_eq!(f.decided, Some(Outcome::Dismissed));
+        assert_eq!(a.proposal(ann, "nope").await.unwrap(), None);
         let notes = a.recent(PROMPT_NOTES).await.unwrap();
         assert_eq!(notes.len(), 2);
         let p = prompt(&notes).unwrap();

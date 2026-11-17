@@ -31,7 +31,7 @@
 //!   that; otherwise incoming hops scatter the `rev` key, which is exact.
 //!   Write statements never read asynchronous mirrors.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
 use async_trait::async_trait;
@@ -262,7 +262,7 @@ pub async fn write_pos<Q: Queryable + Send>(
 /// the binlog position when it starts; were the applier's own position
 /// writes logged, that position would always be one transaction past the
 /// applier's latest row, so every read with an incoming hop waited for its
-/// next write (about half a second, G84). The rows are read only on the
+/// next write (about half a second). The rows are read only on the
 /// catalog's writer; a new writer after a failover has older rows (or
 /// none) until the applier's next write, and reads scatter meanwhile.
 const NO_BINLOG: &str = "SET STATEMENT sql_log_bin = 0 FOR ";
@@ -279,6 +279,27 @@ pub async fn clear_pos<Q: Queryable + Send>(q: &mut Q, catalog: &str, graph: u64
     ))
     .await
     .map_err(backend_error)
+}
+
+/// Deletes the position rows of graphs the catalog no longer has: a graph
+/// dropped while an applier still served it, whose next position write
+/// put the rows back after `DROP GRAPH` deleted them. The number deleted.
+///
+/// # Errors
+/// A backend error (1146 before the catalog's migration 3).
+pub async fn clear_orphan_pos(q: &mut Conn, catalog: &str) -> Result<u64> {
+    let c = quote(catalog);
+    let sql = format!(
+        "{NO_BINLOG}DELETE FROM {c}.{POS_TABLE} \
+         WHERE graph_id NOT IN (SELECT graph_id FROM {c}.graphs)"
+    );
+    if q.query_drop(sql.as_str()).await.is_err() {
+        // Without `BINLOG ADMIN` (or `SUPER`): logged, as the writes.
+        q.query_drop(sql.replacen(NO_BINLOG, "", 1))
+            .await
+            .map_err(backend_error)?;
+    }
+    Ok(q.affected_rows())
 }
 
 /// One edge row change seen in a shard's binlog.
@@ -366,9 +387,34 @@ pub async fn apply_batch(
     changes: &[EdgeChange],
     now_us: u64,
 ) -> Result<Applied> {
+    apply_any(conns, layout, changes, now_us, false).await
+}
+
+/// [`apply_batch`] for a typed graph (`crate::typed`): each change's
+/// type names its edge and mirror tables, and the mirror row takes the
+/// source's class from the edge row.
+///
+/// # Errors
+/// Backend errors (the batch is rolled back everywhere).
+pub async fn apply_batch_typed(
+    conns: &mut dyn ApplyConns,
+    layout: &GraphShards,
+    changes: &[EdgeChange],
+    now_us: u64,
+) -> Result<Applied> {
+    apply_any(conns, layout, changes, now_us, true).await
+}
+
+async fn apply_any(
+    conns: &mut dyn ApplyConns,
+    layout: &GraphShards,
+    changes: &[EdgeChange],
+    now_us: u64,
+    typed: bool,
+) -> Result<Applied> {
     let changes = coalesce(changes);
     let mut open: HashMap<(String, Role), Conn> = HashMap::new();
-    let r = apply_in(conns, layout, &changes, now_us, &mut open).await;
+    let r = apply_in(conns, layout, &changes, now_us, &mut open, typed).await;
     // Mirror writes commit before the locks on their edges go.
     let mut order: Vec<(String, Role)> = open.keys().cloned().collect();
     order.sort_by_key(|(c, r)| (*r == Role::Check, c.clone()));
@@ -427,8 +473,24 @@ async fn apply_in(
     changes: &[EdgeChange],
     now_us: u64,
     open: &mut HashMap<(String, Role), Conn>,
+    typed: bool,
 ) -> Result<Applied> {
     let mut out = Applied::default();
+    let g = layout.graph;
+    let edges_of = |i: usize, t: u32| {
+        if typed {
+            crate::typed::edge_table(&layout.shards[i].schema, g, t)
+        } else {
+            layout.shards[i].tables.edges.clone()
+        }
+    };
+    let mirrors_of = |j: usize, t: u32| {
+        if typed {
+            crate::typed::mirror_table(&layout.shards[j].schema, g, t)
+        } else {
+            layout.shards[j].tables.mirrors.clone()
+        }
+    };
     let touch = |i: usize, out: &mut Applied| {
         let s = &layout.shards[i];
         let t = (s.shard, s.epoch, s.cluster.clone());
@@ -437,24 +499,28 @@ async fn apply_in(
         }
     };
     // Inserted edges: still there? Locked until their mirrors commit.
-    let mut by_src: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
+    // (A typed graph's tables are per type; the JSON graph's one table
+    // takes every type, so its key's type is 0.)
+    let mut by_src: BTreeMap<(usize, u32), Vec<u64>> = BTreeMap::new();
     for c in changes.iter().filter(|c| c.live) {
         by_src
-            .entry(layout.index_of(c.src_rk))
+            .entry((layout.index_of(c.src_rk), if typed { c.rtype } else { 0 }))
             .or_default()
             .push(c.id);
     }
-    let mut present: HashSet<u64> = HashSet::new();
-    for (i, edge_ids) in by_src {
+    // Present edges, with the source's class (typed graphs).
+    let mut present: HashMap<u64, u64> = HashMap::new();
+    for ((i, t), edge_ids) in by_src {
         touch(i, &mut out);
         let s = &layout.shards[i];
+        let table = edges_of(i, t);
         begin(conns, open, &s.cluster, Role::Check).await?;
         let c = conn(open, &s.cluster, Role::Check)?;
+        let cls = if typed { "src_cls" } else { "0" };
         for batch in edge_ids.chunks(1000) {
-            let found: Vec<u64> = c
+            let found: Vec<(u64, u64)> = c
                 .query(format!(
-                    "SELECT id FROM {} WHERE id IN ({}) LOCK IN SHARE MODE",
-                    s.tables.edges,
+                    "SELECT id, {cls} FROM {table} WHERE id IN ({}) LOCK IN SHARE MODE",
                     ids(batch)
                 ))
                 .await
@@ -463,52 +529,69 @@ async fn apply_in(
         }
     }
     // Mirrors: upserts for present edges, deletes for the rest.
-    let mut put: BTreeMap<usize, Vec<&EdgeChange>> = BTreeMap::new();
-    let mut gone: BTreeMap<usize, Vec<&EdgeChange>> = BTreeMap::new();
+    let mut put: BTreeMap<(usize, u32), Vec<&EdgeChange>> = BTreeMap::new();
+    let mut gone: BTreeMap<(usize, u32), Vec<&EdgeChange>> = BTreeMap::new();
     for c in changes {
-        let j = layout.index_of(c.dst_rk);
-        if c.live && present.contains(&c.id) {
-            put.entry(j).or_default().push(c);
+        let k = (layout.index_of(c.dst_rk), if typed { c.rtype } else { 0 });
+        if c.live && present.contains_key(&c.id) {
+            put.entry(k).or_default().push(c);
         } else {
-            gone.entry(j).or_default().push(c);
+            gone.entry(k).or_default().push(c);
         }
     }
-    for (j, rows) in put {
+    for ((j, t), rows) in put {
         touch(j, &mut out);
         let s = &layout.shards[j];
+        let table = mirrors_of(j, t);
         begin(conns, open, &s.cluster, Role::Write).await?;
         let c = conn(open, &s.cluster, Role::Write)?;
         for batch in rows.chunks(500) {
-            let mut sql = format!(
-                "INSERT INTO {} (dst, type, src, id, src_rk, _v, _sprig_rk) VALUES ",
-                s.tables.mirrors
-            );
+            let mut sql = if typed {
+                format!(
+                    "INSERT INTO {table} (dst, src, id, src_cls, src_rk, _v, _sprig_rk) VALUES "
+                )
+            } else {
+                format!("INSERT INTO {table} (dst, type, src, id, src_rk, _v, _sprig_rk) VALUES ")
+            };
             for (k, e) in batch.iter().enumerate() {
                 if k > 0 {
                     sql.push_str(", ");
                 }
-                let _ = write!(
-                    sql,
-                    "({}, {}, {}, {}, {}, {now_us}, {})",
-                    e.dst, e.rtype, e.src, e.id, e.src_rk, e.dst_rk
-                );
+                let second = if typed {
+                    present.get(&e.id).copied().unwrap_or(0)
+                } else {
+                    u64::from(e.rtype)
+                };
+                if typed {
+                    let _ = write!(
+                        sql,
+                        "({}, {}, {}, {second}, {}, {now_us}, {})",
+                        e.dst, e.src, e.id, e.src_rk, e.dst_rk
+                    );
+                } else {
+                    let _ = write!(
+                        sql,
+                        "({}, {second}, {}, {}, {}, {now_us}, {})",
+                        e.dst, e.src, e.id, e.src_rk, e.dst_rk
+                    );
+                }
             }
             sql.push_str(" ON DUPLICATE KEY UPDATE src_rk = VALUES(src_rk)");
             c.query_drop(sql).await.map_err(backend_error)?;
             out.upserts += batch.len() as u64;
         }
     }
-    for (j, rows) in gone {
+    for ((j, t), rows) in gone {
         touch(j, &mut out);
         let s = &layout.shards[j];
+        let table = mirrors_of(j, t);
         begin(conns, open, &s.cluster, Role::Write).await?;
         let c = conn(open, &s.cluster, Role::Write)?;
         for batch in rows.chunks(1000) {
             let dsts: Vec<u64> = batch.iter().map(|e| e.dst).collect();
             let eids: Vec<u64> = batch.iter().map(|e| e.id).collect();
             c.query_drop(format!(
-                "DELETE FROM {} WHERE dst IN ({}) AND id IN ({})",
-                s.tables.mirrors,
+                "DELETE FROM {table} WHERE dst IN ({}) AND id IN ({})",
                 ids(&dsts),
                 ids(&eids)
             ))

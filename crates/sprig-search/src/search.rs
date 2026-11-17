@@ -7,6 +7,16 @@
 //!   each partition scores its top k through a statistics provider returning
 //!     the global values
 //!   merge by (score desc, partition, key)
+//! matched: N, T[f] and n[t] of the documents the query matches only (a
+//!   caller bound by row-level security searches within its visible hits)
+//! plain: N = 1, n[t] = 1, T[f] = PLAIN_AVERAGE_LENGTH: no statistics of
+//!   the index at all
+//! expansions: a prefix or fuzzy term becomes the most frequent
+//!   max_expansions terms it matches, counted over every document, or,
+//!   when the query is restricted to keys, over those keys' documents
+//!   only (a bound caller's terms depend on no row it can't read)
+//! every(query, max): every hit with every term each prefix or fuzzy
+//!   term matches (the candidates a bound caller re-reads)
 //! ```
 //!
 //! Each document is in exactly one partition, so the sums are the
@@ -21,8 +31,8 @@ use std::sync::Mutex;
 
 use sprig_common::{Result, SprigCode, SprigError};
 use tantivy::collector::{Count, DocSetCollector, TopDocs};
-use tantivy::query::{Bm25StatisticsProvider, Query};
-use tantivy::schema::{Field, Value};
+use tantivy::query::{Bm25StatisticsProvider, BooleanQuery, Occur, Query, TermQuery, TermSetQuery};
+use tantivy::schema::{Field, IndexRecordOption, Value};
 use tantivy::{DocAddress, Searcher, TantivyDocument, Term};
 
 use crate::build::{Builder, Expander, Expansion, TermBase};
@@ -37,7 +47,18 @@ pub enum Scoring {
     Global,
     /// Each partition's own statistics (`local`).
     Local,
+    /// Statistics of the documents the query matches, and of no other: a
+    /// caller that row-level security binds searches within the hits it
+    /// may see, so its scores depend on nothing it can't read.
+    Matched,
+    /// No statistics of the index: every term weighs the same, and field
+    /// lengths compare with [`PLAIN_AVERAGE_LENGTH`]. A bound caller's
+    /// search that matches more than the gateway rechecks.
+    Plain,
 }
+
+/// The average field length, in tokens, that [`Scoring::Plain`] assumes.
+pub const PLAIN_AVERAGE_LENGTH: u64 = 16;
 
 /// One hit.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -159,6 +180,124 @@ impl Bm25StatisticsProvider for GlobalStats {
     }
 }
 
+/// BM25 statistics of the documents `query` matches ([`Scoring::Matched`]):
+/// their number, their tokens per field (from the field norms) and, per
+/// term, how many of them hold it. Terms and fields are counted when
+/// Tantivy first asks for them.
+struct MatchedStats {
+    searchers: Vec<Searcher>,
+    query: Box<dyn Query>,
+    /// The matched documents of each searcher, by segment.
+    docs: Vec<Vec<DocAddress>>,
+    num_docs: u64,
+    tokens: Mutex<HashMap<Field, u64>>,
+    freq: Mutex<HashMap<Term, u64>>,
+}
+
+impl MatchedStats {
+    fn new(searchers: &[Searcher], query: &dyn Query) -> Result<Self> {
+        let mut docs = Vec::with_capacity(searchers.len());
+        let mut num_docs = 0u64;
+        for s in searchers {
+            let mut d: Vec<DocAddress> = s
+                .search(query, &DocSetCollector)
+                .map_err(terr)?
+                .into_iter()
+                .collect();
+            d.sort_unstable();
+            num_docs += d.len() as u64;
+            docs.push(d);
+        }
+        Ok(Self {
+            searchers: searchers.to_vec(),
+            query: query.box_clone(),
+            docs,
+            num_docs,
+            tokens: Mutex::new(HashMap::new()),
+            freq: Mutex::new(HashMap::new()),
+        })
+    }
+}
+
+impl Bm25StatisticsProvider for MatchedStats {
+    fn total_num_tokens(&self, field: Field) -> tantivy::Result<u64> {
+        let mut cache = self
+            .tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(n) = cache.get(&field) {
+            return Ok(*n);
+        }
+        let mut n = 0u64;
+        for (s, docs) in self.searchers.iter().zip(&self.docs) {
+            let mut norms: Option<(u32, tantivy::fieldnorm::FieldNormReader)> = None;
+            for a in docs {
+                let reader = match &norms {
+                    Some((seg, r)) if *seg == a.segment_ord => r,
+                    _ => {
+                        // A field without norms: one token per document.
+                        let Ok(r) = s.segment_reader(a.segment_ord).get_fieldnorms_reader(field)
+                        else {
+                            n += 1;
+                            continue;
+                        };
+                        &norms.insert((a.segment_ord, r)).1
+                    }
+                };
+                n += u64::from(reader.fieldnorm(a.doc_id));
+            }
+        }
+        cache.insert(field, n);
+        Ok(n)
+    }
+
+    fn total_num_docs(&self) -> tantivy::Result<u64> {
+        // Never 0: BM25 divides by it.
+        Ok(self.num_docs.max(1))
+    }
+
+    fn doc_freq(&self, term: &Term) -> tantivy::Result<u64> {
+        let mut cache = self
+            .freq
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(n) = cache.get(term) {
+            return Ok(*n);
+        }
+        let q = BooleanQuery::new(vec![
+            (Occur::Must, self.query.box_clone()),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(term.clone(), IndexRecordOption::Basic)),
+            ),
+        ]);
+        let mut n = 0u64;
+        for s in &self.searchers {
+            n += s.search(&q, &Count)? as u64;
+        }
+        cache.insert(term.clone(), n);
+        Ok(n)
+    }
+}
+
+/// [`Scoring::Plain`]'s statistics: one document holding every term, of
+/// [`PLAIN_AVERAGE_LENGTH`] tokens in every field.
+struct PlainStats;
+
+impl Bm25StatisticsProvider for PlainStats {
+    fn total_num_tokens(&self, _field: Field) -> tantivy::Result<u64> {
+        Ok(PLAIN_AVERAGE_LENGTH)
+    }
+
+    fn total_num_docs(&self) -> tantivy::Result<u64> {
+        Ok(1)
+    }
+
+    fn doc_freq(&self, _term: &Term) -> tantivy::Result<u64> {
+        Ok(1)
+    }
+}
+
 /// A partition's statistics for `query`'s terms (the `Stats` RPC).
 ///
 /// # Errors
@@ -209,15 +348,75 @@ fn within(a: &str, b: &str, max: usize) -> bool {
     prev[b.len()] <= max
 }
 
-/// Expands over a set of searchers (every partition of the index).
-struct Over<'a>(&'a [Searcher]);
+/// The documents of each searcher, by segment, ascending.
+type DocsBySegment = Vec<BTreeMap<u32, Vec<u32>>>;
+
+/// Expands over a set of searchers (every partition of the index), or
+/// over some documents of them only.
+struct Over<'a> {
+    searchers: &'a [Searcher],
+    /// Count only these documents: a query restricted to keys (a caller
+    /// bound by row-level security) chooses its terms among the
+    /// documents it may see.
+    within: Option<DocsBySegment>,
+}
+
+/// How many of `ids` (ascending) hold the term of `info`.
+fn freq_within(
+    inv: &tantivy::InvertedIndexReader,
+    info: &tantivy::postings::TermInfo,
+    ids: &[u32],
+) -> Result<u64> {
+    use tantivy::{DocSet, TERMINATED};
+    let mut p = inv
+        .read_postings_from_terminfo(info, IndexRecordOption::Basic)
+        .map_err(terr)?;
+    let mut n = 0u64;
+    if (info.doc_freq as usize) <= ids.len() {
+        // Walk the postings; look each document up.
+        let mut d = p.doc();
+        while d != TERMINATED {
+            if ids.binary_search(&d).is_ok() {
+                n += 1;
+            }
+            d = p.advance();
+        }
+    } else {
+        // Seek each document in the postings (only forward: a seek past
+        // one document may land beyond the next).
+        for &id in ids {
+            let mut d = p.doc();
+            if d < id {
+                d = p.seek(id);
+            }
+            if d == TERMINATED {
+                break;
+            }
+            if d == id {
+                n += 1;
+            }
+        }
+    }
+    Ok(n)
+}
 
 impl Expander for Over<'_> {
     fn expand(&self, base: &TermBase, how: &Expansion, max: usize) -> Result<Vec<String>> {
         let pre = base.value_prefix();
         let mut found: BTreeMap<String, u64> = BTreeMap::new();
-        for s in self.0 {
-            for seg in s.segment_readers() {
+        for (i, s) in self.searchers.iter().enumerate() {
+            for (ord, seg) in s.segment_readers().iter().enumerate() {
+                let ids = match &self.within {
+                    None => None,
+                    Some(w) => match w
+                        .get(i)
+                        .zip(u32::try_from(ord).ok())
+                        .and_then(|(m, o)| m.get(&o))
+                    {
+                        Some(ids) if !ids.is_empty() => Some(ids.as_slice()),
+                        _ => continue,
+                    },
+                };
                 let inv = seg.inverted_index(base.field).map_err(terr)?;
                 let dict = inv.terms();
                 let start: Vec<u8> = match how {
@@ -243,8 +442,13 @@ impl Expander for Over<'_> {
                         Expansion::Fuzzy(w, d) => within(w, text, usize::from(*d)),
                     };
                     if keep {
-                        *found.entry(text.to_owned()).or_default() +=
-                            u64::from(st.value().doc_freq);
+                        let n = match ids {
+                            None => u64::from(st.value().doc_freq),
+                            Some(ids) => freq_within(&inv, st.value(), ids)?,
+                        };
+                        if n > 0 {
+                            *found.entry(text.to_owned()).or_default() += n;
+                        }
                     }
                 }
             }
@@ -257,6 +461,29 @@ impl Expander for Over<'_> {
         out.sort();
         Ok(out)
     }
+}
+
+/// The key sets `q` is restricted to: `Keys` among the clauses every
+/// match must meet (`must` and `filter` of `Bool`s, all the way down).
+fn key_sets<'q>(q: &'q SearchQuery, out: &mut Vec<&'q [Key]>) {
+    match q {
+        SearchQuery::Keys(k) => out.push(k),
+        SearchQuery::Bool { must, filter, .. } => {
+            for x in must.iter().chain(filter) {
+                key_sets(x, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The refusal of a search matching more than `max` documents, without
+/// the count (it would include rows the caller may not see).
+fn window_exceeded(max: usize) -> SprigError {
+    SprigError::new(
+        SprigCode::SearchWindowExceeded,
+        format!("the search matched more than search.max_window ({max}) rows"),
+    )
 }
 
 /// A search index's partitions.
@@ -370,8 +597,55 @@ impl SearchIndex {
         searchers: &[Searcher],
         max_expansions: usize,
     ) -> Result<Box<dyn Query>> {
-        let ex = Over(searchers);
+        let ex = self.expander(q, searchers)?;
         Builder::new(&self.schema, &ex, max_expansions).build(q)
+    }
+
+    /// The expander of `q`: over every document, or, when `q` is
+    /// restricted to keys, over those keys' documents only, so the
+    /// prefix and fuzzy terms chosen depend on nothing else.
+    fn expander<'s>(&self, q: &SearchQuery, searchers: &'s [Searcher]) -> Result<Over<'s>> {
+        let mut sets = Vec::new();
+        key_sets(q, &mut sets);
+        let Some((first, rest)) = sets.split_first() else {
+            return Ok(Over {
+                searchers,
+                within: None,
+            });
+        };
+        let docs = |keys: &[Key]| -> Result<Vec<std::collections::HashSet<DocAddress>>> {
+            let q = TermSetQuery::new(
+                keys.iter()
+                    .map(|k| Term::from_field_bytes(self.schema.key, &k.0)),
+            );
+            searchers
+                .iter()
+                .map(|s| s.search(&q, &DocSetCollector).map_err(terr))
+                .collect()
+        };
+        let mut all = docs(first)?;
+        for keys in rest {
+            for (mine, other) in all.iter_mut().zip(docs(keys)?) {
+                mine.retain(|a| other.contains(a));
+            }
+        }
+        let within = all
+            .into_iter()
+            .map(|set| {
+                let mut m: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+                for a in set {
+                    m.entry(a.segment_ord).or_default().push(a.doc_id);
+                }
+                for ids in m.values_mut() {
+                    ids.sort_unstable();
+                }
+                m
+            })
+            .collect();
+        Ok(Over {
+            searchers,
+            within: Some(within),
+        })
     }
 
     fn key_of(&self, s: &Searcher, a: DocAddress) -> Result<Key> {
@@ -398,21 +672,23 @@ impl SearchIndex {
         if k == 0 {
             return Ok(Vec::new());
         }
-        let stats = match scoring {
+        let stats: Option<Box<dyn Bm25StatisticsProvider>> = match scoring {
             Scoring::Global => {
                 let parts = searchers
                     .iter()
                     .map(|s| part_stats(s, query.as_ref()))
                     .collect::<Result<Vec<_>>>()?;
-                Some(GlobalStats::sum(&parts, searchers.clone()))
+                Some(Box::new(GlobalStats::sum(&parts, searchers.clone())))
             }
             Scoring::Local => None,
+            Scoring::Matched => Some(Box::new(MatchedStats::new(&searchers, query.as_ref())?)),
+            Scoring::Plain => Some(Box::new(PlainStats)),
         };
         let mut hits = Vec::new();
         for (i, s) in searchers.iter().enumerate() {
             let c = TopDocs::with_limit(k).order_by_score();
             let top = match &stats {
-                Some(g) => s.search_with_statistics_provider(query.as_ref(), &c, g),
+                Some(g) => s.search_with_statistics_provider(query.as_ref(), &c, g.as_ref()),
                 None => s.search(query.as_ref(), &c),
             }
             .map_err(terr)?;
@@ -436,14 +712,45 @@ impl SearchIndex {
     pub fn all(&self, q: &SearchQuery, max: usize, max_expansions: usize) -> Result<Vec<Hit>> {
         let n = self.count(q, max_expansions)?;
         if n > max as u64 {
-            return Err(SprigError::new(
-                SprigCode::SearchWindowExceeded,
-                // No count: it would include rows the caller may not see.
-                format!("the search matched more than search.max_window ({max}) rows"),
-            ));
+            return Err(window_exceeded(max));
         }
         #[allow(clippy::cast_possible_truncation)]
         self.top(q, n as usize, Scoring::Global, max_expansions)
+    }
+
+    /// Every hit, up to `max` (39827 past it), with each prefix and fuzzy
+    /// term expanded to **every** term it matches rather than the most
+    /// frequent `search.max_expansions`: the hits a caller bound by
+    /// row-level security re-reads before its terms are chosen among the
+    /// rows it may see. Scores are 0 and the order is the key order.
+    ///
+    /// # Errors
+    /// As [`SearchIndex::all`].
+    pub fn every(&self, q: &SearchQuery, max: usize) -> Result<Vec<Hit>> {
+        let searchers = self.searchers();
+        let ex = self.expander(q, &searchers)?;
+        let query = Builder::new(&self.schema, &ex, usize::MAX)
+            .every_term()
+            .build(q)?;
+        let mut n = 0u64;
+        for s in &searchers {
+            n += s.search(query.as_ref(), &Count).map_err(terr)? as u64;
+        }
+        if n > max as u64 {
+            return Err(window_exceeded(max));
+        }
+        let mut hits = Vec::new();
+        for (i, s) in searchers.iter().enumerate() {
+            for a in s.search(query.as_ref(), &DocSetCollector).map_err(terr)? {
+                hits.push(Hit {
+                    score: 0.0,
+                    part: self.parts[i].no,
+                    key: self.key_of(s, a)?,
+                });
+            }
+        }
+        hits.sort_by(order);
+        Ok(hits)
     }
 
     /// Matching documents.

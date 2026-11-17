@@ -4,6 +4,8 @@
 import type { ComponentType, SVGProps } from 'react';
 import type { MessageId } from '../i18n/en';
 import {
+  BookOpen,
+  LayoutDashboard,
   Database,
   GitFork,
   Send,
@@ -43,6 +45,8 @@ export interface Section {
   operatorOnly?: boolean;
   /** A section that only switches the side panel (no page of its own). */
   panel?: 'saved' | 'history';
+  /** A page section whose side panel is its own list instead of links and the database tree. */
+  side?: 'dashboards';
   testId?: string;
 }
 
@@ -82,6 +86,16 @@ export const SECTIONS: Section[] = [
     links: [],
     owns: () => false,
     panel: 'history',
+  },
+  {
+    id: 'dashboards',
+    label: 'nav.dashboards',
+    icon: LayoutDashboard,
+    to: 'd',
+    links: [],
+    owns: (rel) => starts(rel, 'd'),
+    side: 'dashboards',
+    testId: 'nav-dashboards',
   },
   {
     id: 'messaging',
@@ -133,6 +147,14 @@ export const SECTIONS: Section[] = [
     owns: (rel) => starts(rel, 'access', 'policies', 'security'),
   },
   {
+    id: 'docs',
+    label: 'nav.docs',
+    icon: BookOpen,
+    to: 'docs',
+    links: [],
+    owns: (rel) => starts(rel, 'docs'),
+  },
+  {
     id: 'operator',
     label: 'nav.operator',
     icon: ServerCog,
@@ -148,8 +170,12 @@ export const SECTIONS: Section[] = [
     label: 'nav.settings',
     icon: Settings,
     to: 'settings',
-    links: [],
-    owns: (rel) => starts(rel, 'settings'),
+    links: [
+      { label: 'nav.settings', to: 'settings' },
+      { label: 'nav.glossary', to: 'glossary' },
+      { label: 'nav.digests', to: 'digests' },
+    ],
+    owns: (rel) => starts(rel, 'settings', 'glossary', 'digests'),
     bottom: true,
   },
 ];

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use sprig_cluster::failover::writer::{WriterLease, writer_lease_key};
-use sprig_common::ids::NodeId;
+use sprig_common::ids::{DcId, NodeId};
 use sprig_meta::conformance::unique_tier;
 use sprig_meta::{MemStore, Op, Txn};
 
@@ -173,6 +173,85 @@ async fn catalog_migrations_wait_while_a_cutover_holds_the_catalog() {
     let e = not_held(&loc, t).await.unwrap_err();
     assert_eq!(e.code(), Some(SprigCode::CatalogUnavailable));
     assert!(e.retryable && e.to_string().contains("job-42"), "{e}");
+}
+
+/// A child homed here reads an ancestor homed in another DC: its catalog
+/// is found through the directory's `home_dc` and the home DC's map, not
+/// through a standby's map here (whose copy may still be incomplete);
+/// `cluster_of` stays this DC's own map.
+#[tokio::test]
+async fn an_ancestor_homed_in_another_dc_is_found_through_its_home() {
+    let ams1 = DcId::new("ams1").unwrap();
+    let fra1 = DcId::new("fra1").unwrap();
+    let here = MemStore::new(Tier::Dc(ams1));
+    let global = here.with_tier(Tier::Global);
+    let dc: Arc<dyn MetaStore> = Arc::new(here.clone());
+    let put = |key: sprig_meta::Key, value: Vec<u8>| Txn {
+        when: vec![],
+        then: vec![Op::Put {
+            key,
+            value,
+            lease: None,
+        }],
+        otherwise: vec![],
+    };
+    let entry = |id: u64, home: &str| {
+        put(
+            Tier::Global.key(&format!("tenants/{id}")).unwrap(),
+            serde_json::to_vec(&serde_json::json!({
+                "v": 1, "tenant_id": id, "name": format!("t{id}"), "state": "active",
+                "home_dc": home, "epoch": 1
+            }))
+            .unwrap(),
+        )
+    };
+    let map = |tier: &Tier, t: TenantId, cluster: &str, role: MapRole| {
+        let mut m = ShardMap::catalog(t, ClusterId::new(cluster).unwrap(), 1);
+        m.role = role;
+        put(
+            ShardMap::catalog_key(tier, t).unwrap(),
+            Record::new(m).encode().unwrap(),
+        )
+    };
+    let (parent, child, gone) = (TenantId(41), TenantId(42), TenantId(43));
+    for t in [
+        entry(41, "fra1"),
+        entry(42, "ams1"),
+        map(&Tier::Dc(fra1.clone()), parent, "fra1-c1", MapRole::Home),
+        // The parent's standby here, its copy still streaming.
+        map(here.tier(), parent, "ams1-c1", MapRole::Standby),
+        map(here.tier(), child, "ams1-c1", MapRole::Home),
+    ] {
+        here.txn(t).await.unwrap();
+    }
+    let pools: Arc<dyn ClusterPools> = Arc::new(StaticPools::new());
+    let plain = ShardMapLocator::new(Arc::clone(&dc), Arc::clone(&pools), default_naming());
+    let loc = plain.clone().with_directory(Arc::new(global));
+    let c = |s: &str| Some(ClusterId::new(s).unwrap());
+    // Followed to the home DC's map.
+    assert_eq!(loc.catalog_cluster(parent).await.unwrap(), c("fra1-c1"));
+    // This DC's own map, for bootstrap, placement and deletion.
+    assert_eq!(loc.cluster_of(parent).await.unwrap(), c("ams1-c1"));
+    // A tenant homed here: its own map.
+    assert_eq!(loc.catalog_cluster(child).await.unwrap(), c("ams1-c1"));
+    // Without the directory, as before.
+    assert_eq!(plain.catalog_cluster(parent).await.unwrap(), c("ams1-c1"));
+    // Nowhere: 39072.
+    assert_eq!(loc.catalog_cluster(gone).await.unwrap(), None);
+    let e = loc.writer(gone).await.unwrap_err();
+    assert_eq!(e.code(), Some(SprigCode::TenantNotReady));
+    // The home DC's map gone (a move in flight): this DC's map still
+    // points somewhere.
+    here.txn(Txn {
+        when: vec![],
+        then: vec![Op::Delete(
+            ShardMap::catalog_key(&Tier::Dc(fra1), parent).unwrap(),
+        )],
+        otherwise: vec![],
+    })
+    .await
+    .unwrap();
+    assert_eq!(loc.catalog_cluster(parent).await.unwrap(), c("ams1-c1"));
 }
 
 /// A sequence seen in a live move: a cutover

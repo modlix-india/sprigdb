@@ -2,7 +2,7 @@
 title: Audit
 audience: [dba, operator]
 sidebar:
-  order: 7
+  order: 8
 ---
 
 # Audit
@@ -61,7 +61,7 @@ Fix the sink, and the spool drains within seconds.
 
 ### Logins and accounts (tenant streams)
 
-Recorded by every gateway for every protocol that logs in with a password or key (MySQL, MariaDB, HTTP Basic and API keys, and the others through the same login service), and by account changes from any client:
+Recorded by every gateway for every protocol that logs in with a password, key or identity provider token (MySQL, MariaDB, HTTP Basic and API keys, and the others through the same login service), and by account changes from any client:
 
 | Event | When |
 |---|---|
@@ -79,6 +79,10 @@ Recorded by every gateway for every protocol that logs in with a password or key
 | `authz.default_roles_set` | `SET DEFAULT ROLE` |
 | `auth.verifiers_added` | SCRAM verifiers were added at a login |
 | `auth.handoff` | A login was decided in another data centre because of the tenant's [residency](residency.md) |
+| `auth.token_roles_ignored` | A token login's role mappings named roles the tenant doesn't define; they were ignored, and `detail` names them |
+| `auth.user_created_jit` | An account was created at its first login with an identity provider's token, with the issuer in `detail` (see [Logins with identity provider tokens](external-tokens.md)) |
+| `admin.issuer_changed` | An identity provider issuer was registered, replaced or disabled (`sprigctl tenant issuer`) |
+| `admin.token_login_changed` | An account's `token` login method was added or removed (`sprigctl tenant token-login`) |
 
 Each event carries:
 
@@ -90,8 +94,8 @@ Each event carries:
 | `actor` | The administrator who acted, when not the user, with their tenant |
 | `client_ip`, `gateway` | Where the request came from, and which gateway decided |
 | `protocol` | `mysql`, `mariadb`, `http`, or `admin` for account changes |
-| `mechanism` | `caching_sha2_password` (fast or full path), `native`, `basic`, `api_key` |
-| `outcome`, `reason`, `detail` | `ok` or `refused`, why, and more (never a secret) |
+| `mechanism` | `caching_sha2_password` (fast or full path), `native`, `basic`, `api_key`, or `jwt` for an identity provider's token |
+| `outcome`, `reason`, `detail` | `ok` or `refused`, why, and more (never a secret). For a token login, `detail` names the issuer, or why the token was refused (`token: expired`, `token: wrong audience`, ...) |
 
 A change made by an administrator of an ancestor tenant is written to both tenants' streams: the target tenant sees who changed its account, and the ancestor sees what its administrator did.
 

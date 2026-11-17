@@ -1,0 +1,46 @@
+# A floating address for two load balancers (RUNBOOK.md, "Two load
+# balancers"): keepalived (VRRP) on each balancer VM, next to its Envoy
+# (compose.lb.yaml). The address moves to the other VM within about 3 s when
+# a VM, its network or its Envoy stops answering. Copy to lb/keepalived.conf
+# on each balancer VM and set the values marked <...>; the two files differ
+# only in router_id, priority, unicast_src_ip and unicast_peer.
+#
+# Not rehearsed yet: keepalived (GPL-2.0-or-later, run unmodified as its own
+# program) needs an image approved for the bundle. In a cloud, a VRRP
+# address usually can't move by ARP alone: use the cloud's TCP load
+# balancer instead, or a notify_master script that moves a secondary
+# private address through the cloud's API.
+
+global_defs {
+    router_id sprig_lb1                    # sprig_lb2 on the other VM
+    enable_script_security
+    script_user root
+}
+
+# Envoy answers /ready on its admin port when its listeners are up.
+vrrp_script envoy_ready {
+    script "/usr/bin/wget -q -T 1 -O /dev/null http://127.0.0.1:9901/ready"
+    interval 1
+    fall 2
+    rise 2
+}
+
+vrrp_instance sprig_lb {
+    state BACKUP                           # both BACKUP: the higher priority wins the election
+    nopreempt                              # a returning VM doesn't take the address back
+    interface <eth0>                       # the interface of the private network
+    virtual_router_id 51                   # unique on this network
+    priority 100                           # 90 on the other VM
+    advert_int 1
+    # Unicast: clouds and many switches drop VRRP multicast.
+    unicast_src_ip <10.0.0.21>             # this VM's private address
+    unicast_peer {
+        <10.0.0.22>                        # the other balancer VM
+    }
+    virtual_ipaddress {
+        <10.0.0.20/24> dev <eth0>          # the address clients use (SPRIG_PUBLIC_HOST resolves to it)
+    }
+    track_script {
+        envoy_ready
+    }
+}

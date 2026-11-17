@@ -1,0 +1,23 @@
+# keepalived next to the load balancer (RUNBOOK.md, "Two load balancers"):
+# one floating address for two balancer VMs. On each balancer VM, with
+# compose.lb.yaml:
+#
+#   cp config/keepalived.conf.example lb/keepalived.conf   # then edit it
+#   KEEPALIVED_IMAGE=<an approved image> docker compose -f compose.lb.yaml -f compose.lb-vip.example.yaml up -d
+#
+# Envoy listens on every address of the VM (SPRIG_LB_BIND_IP=0.0.0.0), so
+# it serves the floating address on whichever VM holds it. keepalived runs
+# on the host's network with the capabilities VRRP needs.
+
+services:
+  vip:
+    image: "${KEEPALIVED_IMAGE:?set KEEPALIVED_IMAGE to a keepalived image approved for the bundle}"
+    restart: unless-stopped
+    network_mode: host
+    cap_add: [NET_ADMIN, NET_BROADCAST, NET_RAW]
+    mem_limit: 64m
+    command: [keepalived, --dont-fork, --log-console, --vrrp, --use-file, /etc/keepalived/keepalived.conf]
+    volumes:
+      - ./lb/keepalived.conf:/etc/keepalived/keepalived.conf:ro
+    depends_on:
+      lb: { condition: service_healthy }

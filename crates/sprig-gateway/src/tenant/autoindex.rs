@@ -22,6 +22,7 @@
 use mysql_async::prelude::Queryable;
 use mysql_async::{Pool, Row};
 use sprig_catalog::CatalogLocator;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::Namespace;
 use sprig_common::Result;
 use sprig_common::names::{is_auto_index, quote};
@@ -97,11 +98,17 @@ async fn room(
     let Ok(schemas) = map.physical(db, Purpose::Ddl) else {
         return Ok(Vec::new());
     };
-    let mut conn = ctl.get_conn().await.map_err(backend)?;
+    // A `sprig_ctl` connection per step: the catalog reads and writes
+    // between them take catalog connections, which a task holding a
+    // `sprig_ctl` one mustn't wait for.
     let mut dropped = Vec::new();
+    let mut values_read: Option<Vec<(String, f64)>> = None;
     for schema in &schemas.0 {
         let schema = schema.to_string();
-        let names: Vec<String> = conn
+        let names: Vec<String> = ctl
+            .get_conn_bounded()
+            .await
+            .map_err(backend)?
             .exec(
                 "SELECT INDEX_NAME FROM information_schema.STATISTICS \
                  WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? GROUP BY INDEX_NAME",
@@ -113,10 +120,13 @@ async fn room(
         {
             continue;
         }
-        let values = values(ts, db, table).await.unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "auto_indexes unreadable; every automatic index counts as worthless");
-            Vec::new()
-        });
+        if values_read.is_none() {
+            values_read = Some(values(ts, db, table).await.unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "auto_indexes unreadable; every automatic index counts as worthless");
+                Vec::new()
+            }));
+        }
+        let values = values_read.as_deref().unwrap_or_default();
         let existing: Vec<ExistingIndex> = names
             .iter()
             .map(|n| ExistingIndex {
@@ -127,7 +137,12 @@ async fn room(
                     .map(|(_, v)| *v),
             })
             .collect();
-        for x in sprig_sql::names::make_room(&existing, adding) {
+        let drops = sprig_sql::names::make_room(&existing, adding);
+        if drops.is_empty() {
+            continue;
+        }
+        let mut conn = ctl.get_conn_bounded().await.map_err(backend)?;
+        for x in drops {
             conn.query_drop(format!(
                 "ALTER TABLE {}.{} DROP INDEX IF EXISTS {}",
                 quote(&schema),
@@ -171,7 +186,7 @@ fn object_id(ts: &TenantSession, db: &str, table: &str) -> Option<u64> {
 
 async fn catalog_conn(ts: &TenantSession) -> Result<(mysql_async::Conn, String)> {
     let ep = ts.services().locator.writer(ts.tenant).await?;
-    let conn = ep.pool.get_conn().await.map_err(backend)?;
+    let conn = ep.pool.get_conn_bounded().await.map_err(backend)?;
     Ok((conn, ep.store.schema().to_owned()))
 }
 

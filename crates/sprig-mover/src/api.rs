@@ -200,8 +200,13 @@ pub struct JobSpec {
     pub routing: Routing,
     /// When to cut over.
     pub cutover: CutoverMode,
-    /// Verification.
+    /// Verification, when the job chose it ([`JobSpec::with_verify`]).
     pub verify: VerifyMode,
+    /// Whether `mover.verify_mode`, as the worker resolves it for the
+    /// job's tenant, decides the verification instead of `verify`. Jobs
+    /// recorded before the field existed chose their own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verify_from_settings: bool,
     /// The balancer's decision row, when the balancer planned the job.
     #[serde(default)]
     pub decision_id: Option<u64>,
@@ -247,6 +252,7 @@ impl JobSpec {
             routing: Routing::Whole,
             cutover: CutoverMode::Auto,
             verify: VerifyMode::Full,
+            verify_from_settings: true,
             decision_id: None,
             requested_by: None,
             max_hold_ms: None,
@@ -288,6 +294,7 @@ impl JobSpec {
             routing: Routing::Whole,
             cutover: CutoverMode::Auto,
             verify: VerifyMode::Full,
+            verify_from_settings: true,
             decision_id: None,
             requested_by: None,
             max_hold_ms: None,
@@ -313,7 +320,19 @@ impl JobSpec {
     #[must_use]
     pub fn with_verify(mut self, mode: VerifyMode) -> Self {
         self.verify = mode;
+        self.verify_from_settings = false;
         self
+    }
+
+    /// The verification the job runs: its own mode, or `setting`
+    /// (`mover.verify_mode`) when it didn't choose one.
+    #[must_use]
+    pub fn verify_mode(&self, setting: VerifyMode) -> VerifyMode {
+        if self.verify_from_settings {
+            setting
+        } else {
+            self.verify
+        }
     }
 
     /// The same spec with its own hold budget (see [`JobSpec::max_hold_ms`]).
@@ -380,6 +399,7 @@ impl JobSpec {
             routing: Routing::HashRange { group },
             cutover: CutoverMode::Auto,
             verify: VerifyMode::Full,
+            verify_from_settings: true,
             decision_id: None,
             requested_by: None,
             max_hold_ms: None,

@@ -6,7 +6,8 @@
 //!   `expireAfterSeconds`: exactly the documents `{path: {$lt: cutoff}}`
 //!   matches, since `$lt` with a date compares only dates and looks into
 //!   one level of arrays. Other values (strings, numbers, timestamps,
-//!   null, missing, nested arrays) never expire.
+//!   null, missing, nested arrays) never expire. A TTL index with a
+//!   `partialFilterExpression` expires only the documents it also matches.
 //! - **Deletes.** [`Engine::expire_batch`] reads up to a batch of matching
 //!   documents in key order from a position and deletes them by `_id` and
 //!   `_v`, so a document changed since the read (a refreshed date) stays.
@@ -140,15 +141,16 @@ fn invalid(m: impl Into<String>) -> MongoError {
     MongoError::new(code::INVALID_OPTIONS, m)
 }
 
-/// `collMod`'s `index: {name | keyPattern, expireAfterSeconds}` on `m`:
-/// changes the index in place and returns the reply's fields
-/// (`expireAfterSeconds_old` when it had one, `expireAfterSeconds_new`).
-/// The caller saves `m`.
+/// `collMod`'s `index: {name | keyPattern, expireAfterSeconds, hidden}` on
+/// `m`: changes the index in place and returns the reply's fields
+/// (`expireAfterSeconds_old` when it had one, `expireAfterSeconds_new`,
+/// `hidden_old`, `hidden_new`). The caller saves `m` and runs
+/// [`hidden_ddl`].
 ///
 /// # Errors
 /// 14 for wrong types; 40415 for an unknown field; 72 for a missing or
 /// doubled identifier, nothing to change, a negative value, `_id` or a
-/// compound index; 27 for no such index; 39662 for `hidden`, `unique` and
+/// compound index (TTL); 27 for no such index; 39662 for `unique` and
 /// `prepareUnique`, which aren't built.
 pub fn coll_mod_index(m: &mut CollMeta, ns: &Ns, index: &Bson) -> Result<Document, MongoError> {
     let Bson::Document(spec) = index else {
@@ -178,23 +180,39 @@ pub fn coll_mod_index(m: &mut CollMeta, ns: &Ns, index: &Bson) -> Result<Documen
         (Some(_), Some(_)) => return Err(invalid("Cannot specify both key pattern and name.")),
         _ => {}
     }
-    let Some(v) = spec.get("expireAfterSeconds") else {
-        if ["hidden", "unique", "prepareUnique"]
-            .iter()
-            .any(|k| spec.contains_key(*k))
-        {
+    if ["unique", "prepareUnique"]
+        .iter()
+        .any(|k| spec.contains_key(*k))
+    {
+        return Err(MongoError::new(
+            code::SPRIG_DOC_FEATURE_UNSUPPORTED,
+            "collMod's index options unique and prepareUnique are not supported in this release",
+        ));
+    }
+    let hidden = match spec.get("hidden") {
+        None => None,
+        Some(Bson::Boolean(b)) => Some(*b),
+        Some(other) => {
             return Err(MongoError::new(
-                code::SPRIG_DOC_FEATURE_UNSUPPORTED,
-                "collMod's index options hidden, unique and prepareUnique are not supported in this release",
+                code::TYPE_MISMATCH,
+                format!(
+                    "BSON field 'collMod.index.hidden' is the wrong type '{}', expected type 'bool'",
+                    crate::update::type_name(other)
+                ),
             ));
         }
+    };
+    let expire = spec.get("expireAfterSeconds");
+    if expire.is_none() && hidden.is_none() {
         return Err(invalid(
             "no expireAfterSeconds, hidden, unique, or prepareUnique field",
         ));
-    };
-    let secs = match seconds(v) {
-        Ok(n) => n,
-        Err(None) => {
+    }
+    let secs = match expire.map(seconds) {
+        None => None,
+        Some(Ok(n)) => Some(n),
+        Some(Err(None)) => {
+            let v = expire.unwrap_or(&Bson::Null);
             return Err(MongoError::new(
                 code::TYPE_MISMATCH,
                 format!(
@@ -203,7 +221,7 @@ pub fn coll_mod_index(m: &mut CollMeta, ns: &Ns, index: &Bson) -> Result<Documen
                 ),
             ));
         }
-        Err(Some(w)) => {
+        Some(Err(Some(w))) => {
             return Err(invalid(format!(
                 "TTL index 'expireAfterSeconds' option {w}"
             )));
@@ -212,7 +230,11 @@ pub fn coll_mod_index(m: &mut CollMeta, ns: &Ns, index: &Bson) -> Result<Documen
     let found = match (name, key) {
         (Some(Bson::String(n)), _) => {
             if n == "_id_" {
-                return Err(invalid("the _id field does not support TTL indexes"));
+                return Err(invalid(if secs.is_some() {
+                    "the _id field does not support TTL indexes"
+                } else {
+                    "cannot modify hidden field of an _id index"
+                }));
             }
             m.indexes.iter().position(|i| &i.name == n && !i.is_auto())
         }
@@ -227,7 +249,11 @@ pub fn coll_mod_index(m: &mut CollMeta, ns: &Ns, index: &Bson) -> Result<Documen
         }
         (None, Some(Bson::Document(k))) => {
             if k.len() == 1 && k.contains_key("_id") {
-                return Err(invalid("the _id field does not support TTL indexes"));
+                return Err(invalid(if secs.is_some() {
+                    "the _id field does not support TTL indexes"
+                } else {
+                    "cannot modify hidden field of an _id index"
+                }));
             }
             m.indexes
                 .iter()
@@ -256,18 +282,56 @@ pub fn coll_mod_index(m: &mut CollMeta, ns: &Ns, index: &Bson) -> Result<Documen
         ));
     };
     let idx = &mut m.indexes[pos];
-    if idx.key.len() > 1 {
+    if secs.is_some() && idx.key.len() > 1 {
         return Err(invalid(
             "TTL indexes are single-field indexes, compound indexes do not support TTL",
         ));
     }
     let mut reply = Document::new();
-    if let Some(old) = idx.expire_after {
-        reply.insert("expireAfterSeconds_old", old);
+    // `hidden`: kept in the index's options (listIndexes shows it); the
+    // caller marks the MariaDB index IGNORED, so no plan uses it while
+    // writes keep it current, as MongoDB's hidden indexes.
+    if let Some(h) = hidden {
+        let old = idx.extra.get_bool("hidden").unwrap_or(false);
+        if h {
+            idx.extra.insert("hidden", true);
+        } else {
+            idx.extra.remove("hidden");
+        }
+        reply.insert("hidden_old", old);
+        reply.insert("hidden_new", h);
     }
-    reply.insert("expireAfterSeconds_new", secs);
-    idx.expire_after = Some(secs);
+    if let Some(secs) = secs {
+        if let Some(old) = idx.expire_after {
+            reply.insert("expireAfterSeconds_old", old);
+        }
+        reply.insert("expireAfterSeconds_new", secs);
+        idx.expire_after = Some(secs);
+    }
     Ok(reply)
+}
+
+/// The MariaDB statement that matches a `collMod` `hidden` change on
+/// `m`'s index of `spec` (`IGNORED` hides it from every plan); `None` when
+/// the change set no `hidden`.
+#[must_use]
+pub fn hidden_ddl(m: &CollMeta, db: &str, spec: &Bson, reply: &Document) -> Option<String> {
+    let hidden = reply.get_bool("hidden_new").ok()?;
+    let spec = spec.as_document()?;
+    let idx = m.indexes.iter().find(|i| {
+        match (spec.get_str("name"), spec.get_document("keyPattern")) {
+            (Ok(n), _) => i.name == n,
+            (_, Ok(k)) => i.key_doc() == *k,
+            _ => false,
+        }
+    })?;
+    Some(format!(
+        "ALTER TABLE {}.{} ALTER INDEX {} {}",
+        crate::sql::ident(db),
+        crate::sql::ident(&m.table),
+        crate::sql::ident(&idx.mariadb_name()),
+        if hidden { "IGNORED" } else { "NOT IGNORED" }
+    ))
 }
 
 /// What one [`Engine::expire_batch`] did.
@@ -301,7 +365,18 @@ impl Engine {
         after: Option<Vec<u8>>,
         batch: usize,
     ) -> Result<Expired, MongoError> {
-        let pred = filter::parse(&doc! {path: {"$lt": DateTime::from_millis(cutoff_ms)}})?;
+        let mut f = doc! {path: {"$lt": DateTime::from_millis(cutoff_ms)}};
+        // A partial TTL index expires only the documents its filter
+        // matches (the recheck below applies it exactly).
+        if let Some(pf) = m
+            .indexes
+            .iter()
+            .filter(|i| ttl_of(i).is_some_and(|(p, _)| p == path))
+            .find_map(|i| i.extra.get_document(crate::meta::PARTIAL_FILTER).ok())
+        {
+            f = doc! {"$and": [f, pf.clone()]};
+        }
+        let pred = filter::parse(&f)?;
         let sqlp = translate(&pred, m);
         let order = capped::KeyOrder::of(m);
         let n = if sqlp.exact {
@@ -521,6 +596,14 @@ mod tests {
         );
         assert_eq!(c(doc! {"name": "at_1"}), code::INVALID_OPTIONS);
         assert_eq!(
+            c(doc! {"name": "p_1_q_1", "hidden": 1}),
+            code::TYPE_MISMATCH
+        );
+        assert_eq!(
+            c(doc! {"name": "_id_", "hidden": true}),
+            code::INVALID_OPTIONS
+        );
+        assert_eq!(
             c(doc! {"name": "p_1_q_1", "expireAfterSeconds": 5}),
             code::INVALID_OPTIONS
         );
@@ -538,5 +621,12 @@ mod tests {
                 .code,
             code::TYPE_MISMATCH
         );
+        // `hidden`, on any index but `_id`, compound ones included.
+        let h = Bson::Document(doc! {"name": "p_1_q_1", "hidden": true});
+        let r = coll_mod_index(&mut m, &ns, &h).unwrap();
+        assert_eq!(r, doc! {"hidden_old": false, "hidden_new": true});
+        assert_eq!(m.indexes[2].spec().get_bool("hidden"), Ok(true));
+        let ddl = hidden_ddl(&m, "d", &h, &r).unwrap();
+        assert!(ddl.ends_with("IGNORED") && !ddl.contains("NOT"), "{ddl}");
     }
 }

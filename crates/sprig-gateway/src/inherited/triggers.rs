@@ -29,6 +29,7 @@ use sprig_auth::admin::NewUser;
 use sprig_auth::authz::privilege::{Action, ActionSet, PrivName, parse_privilege};
 use sprig_auth::authz::store::{AuthzStore, Grantee, PrivTarget};
 use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::{Namespace, ObjectKind};
 use sprig_catalog::version::VersionKind;
 use sprig_catalog::{CatalogLocator, ChangeOpts, TenantCatalog};
@@ -128,7 +129,10 @@ fn body_of(chain: &Chain, g: &Definition) -> (String, String) {
     }
 }
 
-/// See the module docs.
+/// See the module docs. Whether every trigger is settled: `false` when
+/// another deploy (the rollout, another gateway, another session's
+/// publish) is still making one, so the caller doesn't record the
+/// instance as up to date and its next use looks again.
 ///
 /// # Errors
 /// The catalog's and the deploy's (an inherited body that no longer
@@ -138,10 +142,10 @@ pub async fn ensure_for_stream(
     chain: &Chain,
     stream_def: &Definition,
     si: &StreamInstance,
-) -> Result<()> {
+) -> Result<bool> {
     let triggers = on_stream(chain, stream_def);
     if triggers.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
     let db_id = si.stream.db.0;
     ensure_for(
@@ -163,6 +167,7 @@ pub async fn ensure_for_stream(
 
 /// The inherited triggers of the member's queue instance (`queue_def`'s
 /// instance, queue `queue_id` of database `db`); see the module docs.
+/// Whether every trigger is settled, as [`ensure_for_stream`].
 ///
 /// # Errors
 /// The catalog's and the deploy's.
@@ -172,10 +177,10 @@ pub async fn ensure_for_queue(
     queue_def: &Definition,
     db: (u32, &str),
     queue_id: u64,
-) -> Result<()> {
+) -> Result<bool> {
     let triggers = on_queue(chain, queue_def);
     if triggers.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
     ensure_for(
         svc,
@@ -200,7 +205,7 @@ async fn ensure_for(
     chain: &Chain,
     triggers: Vec<Arc<Definition>>,
     src: Source<'_>,
-) -> Result<()> {
+) -> Result<bool> {
     let t = src.tenant;
     let cat = catalog(svc, t).await?;
     let st = super::state_of(&cat);
@@ -208,10 +213,11 @@ async fn ensure_for(
     let schema = ep.store.schema().to_owned();
     let mstore = MsgStore::new(&schema);
     let dc = svc.locator.dc_store();
+    let mut settled = true;
     for g in triggers {
         let key = g.key();
         let disabled = chain.disabled(key);
-        let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
         let row = match st.instances.get(&key) {
             Some(i) => Some((**i).clone()),
             None => mstore.instance(&mut conn, key).await?,
@@ -265,6 +271,16 @@ async fn ensure_for(
         }
         // A new instance, or a new body.
         let instance_id = if let Some(i) = &row {
+            if i.state == InstanceState::Creating
+                && !mstore.take_over(&mut conn, key, CLAIM_ABANDONED_MS).await?
+            {
+                // Another deploy claimed it and is making it now (the
+                // rollout, or a publish on another connection or gateway).
+                // Deploying it here too would race that one for the
+                // module's version and fail with 39869.
+                settled = false;
+                continue;
+            }
             i.instance_id
         } else {
             let id = ep.store.next_object_id(&mut conn).await?.0;
@@ -286,6 +302,7 @@ async fn ensure_for(
                 .await?;
             if !claimed {
                 // Another gateway is deploying it.
+                settled = false;
                 continue;
             }
             id
@@ -303,8 +320,23 @@ async fn ensure_for(
         } else {
             Vec::new()
         };
+        // The account and the deploy take catalog connections of their own
+        // from the same pool (4 per cluster); this one isn't held across
+        // them (with the stream's, a first publish needed 3 at once).
+        drop(conn);
         let run_as = ensure_run_as(svc, t, &g, binding.is_none(), &extra).await?;
-        let deployed = deploy(svc, t, &g, &text, src, run_as).await?;
+        let deployed = match deploy(svc, t, &g, &text, src, run_as).await {
+            Ok(d) => d,
+            Err(e) if e.code() == Some(SprigCode::LogicVersionConflict) => {
+                // A new body deployed by two at once: the other one took
+                // the version and finishes the instance.
+                tracing::debug!(tenant = %t, def = %key, "inherited trigger being deployed by another session");
+                settled = false;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
         // A new stream trigger's position.
         if let Some(si) = src.stream {
             stream_positions(svc, &mut conn, &schema, &g, si, deployed.binding_id).await?;
@@ -341,8 +373,12 @@ async fn ensure_for(
             .increment(u64::from(row.is_none()));
         tracing::info!(tenant = %t, def = %key, binding = deployed.binding_id, version = deployed.version, source = src.kind.as_str(), "inherited trigger deployed");
     }
-    Ok(())
+    Ok(settled)
 }
+
+/// A `creating` instance row nobody finished for this long was left by a
+/// gateway that stopped while deploying it; the next use takes it over.
+const CLAIM_ABANDONED_MS: u64 = 30_000;
 
 /// A new stream trigger's consumer group: from the start when the stream
 /// instance came after the trigger, else at each partition's end.
@@ -367,7 +403,7 @@ async fn stream_positions(
                 let cluster = svc.locator.cluster(t).await?;
                 let pool = svc.locator.ctl_pool(&cluster).await?;
                 let mut c = pool
-                    .get_conn()
+                    .get_conn_bounded()
                     .await
                     .map_err(sprig_streams::maria::map_err)?;
                 let reader = sprig_streams::read::LogReader { schema: lschema };
@@ -460,14 +496,14 @@ async fn deploy(
         .cloned()
         .ok_or_else(|| SprigError::internal("an instance without its database"))?;
     let ep = svc.locator.writer(t).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
     // A member's own trigger of the name shadows the inherited one.
     let store = sprig_logic::LogicStore::new(ep.store.schema());
     let _ = sprig_catalog::Migrator::new(&[sprig_logic::catalog::LOGIC_MODULE])?
         .run(
             &mut conn,
             ep.store.schema(),
-            &sprig_catalog::migrate::MigrateOpts::default(),
+            &sprig_catalog::migrate::MigrateOpts::existing(),
         )
         .await?;
     if let Some(m) = store
@@ -493,6 +529,7 @@ async fn deploy(
             source_db: (db_row.db_id.0, &db_row.name),
             object_id: src.object_id,
             fanin_declarer: 0,
+            compile: None,
         },
     )
     .await
@@ -788,7 +825,7 @@ async fn mark_blocked(svc: &TenantServices, t: TenantId, binding: u64, why: Opti
     use mysql_async::prelude::Queryable;
     let r = async {
         let ep = svc.locator.writer(t).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
         // `?` is the reason; NULL removes it.
         let set = "IF(? IS NULL, JSON_REMOVE(physical, '$.blocked'), \
                    JSON_SET(physical, '$.blocked', ?))";

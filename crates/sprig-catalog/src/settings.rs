@@ -136,6 +136,23 @@ pub static BOOTSTRAP_TIMEOUT_MINUTES: Setting<u64> = Setting {
 };
 sprig_settings::register!(BOOTSTRAP_TIMEOUT_MINUTES);
 
+/// `catalog.contract_delay_days`: how long after a catalog module's last
+/// expand migration its contract migrations may run. The migrator holds a
+/// contract back until then, whatever its ceiling allows, unless an
+/// override with a reason is given (`crate::migrate::ContractOverride`,
+/// recorded in the module's history).
+pub static CONTRACT_DELAY_DAYS: Setting<u64> = Setting {
+    key: "catalog.contract_delay_days",
+    default: 7,
+    scopes: Scopes(0b10_0000),
+    hard: HardBounds::range(0, 3650),
+    apply: Apply::Live,
+    operator_only: true,
+    owner: 8,
+    doc: "Days after a catalog module's last expand migration before its contract migrations may run; only an override with a recorded reason runs one earlier",
+};
+sprig_settings::register!(CONTRACT_DELAY_DAYS);
+
 // ---- who writes, and what they need ----
 
 /// Who changes a setting; recorded as the row's `set_by`.

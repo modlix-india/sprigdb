@@ -36,6 +36,20 @@ pub trait Columns {
     fn column(&self, table: &str, column: &str) -> Option<Ty>;
     /// Whether the table exists.
     fn has_table(&self, table: &str) -> bool;
+    /// The logic function or procedure `name` of the code's database, for
+    /// a compiled `db.call`: `Err` says why calls of it can't compile.
+    /// `None` when the compiler wasn't told of any.
+    fn callee(&self, name: &str) -> Option<std::result::Result<crate::link::Callee, String>> {
+        let _ = name;
+        None
+    }
+    /// Stream `name` of the code's database, for a compiled `db.publish`:
+    /// `Err` says why publishing to it can't compile. `None` when the
+    /// compiler wasn't told of any.
+    fn stream(&self, name: &str) -> Option<std::result::Result<crate::link::StreamTarget, String>> {
+        let _ = name;
+        None
+    }
 }
 
 /// A fixed map of tables to typed columns.
@@ -69,6 +83,13 @@ impl StaticColumns {
             .entry(table.to_ascii_lowercase())
             .or_default()
             .insert(column.to_ascii_lowercase(), ty);
+    }
+
+    /// Removes a column; its type, if it was there.
+    pub fn remove(&mut self, table: &str, column: &str) -> Option<Ty> {
+        self.tables
+            .get_mut(&table.to_ascii_lowercase())?
+            .remove(&column.to_ascii_lowercase())
     }
 }
 
@@ -124,6 +145,10 @@ pub struct Bound {
     pub binds: usize,
     /// For reads: the select list's names and types.
     pub columns: Vec<(String, Ty)>,
+    /// Per bind variable, the type of the column it is written to or
+    /// compared with (`INSERT ... (c) VALUES (?)`, `SET c = ?`, `c = ?`,
+    /// `c IN (?, ...)`, `c BETWEEN ? AND ?`), when the text says.
+    pub targets: Vec<Option<Ty>>,
 }
 
 const BIND: &str = "__sprig_bind_";
@@ -260,6 +285,7 @@ pub fn bind(text: &str, want: Want, cat: &dyn Columns, at: &str) -> Result<Bound
         .filter(|t| !writes.contains(t) || want == Want::Read)
         .cloned()
         .collect();
+    let targets = placeholder_targets(&stmt, &tables, cat, n);
     let rendered = stmt.to_string();
     let mut parts = Vec::with_capacity(n + 1);
     let mut rest = rendered.as_str();
@@ -287,7 +313,155 @@ pub fn bind(text: &str, want: Want, cat: &dyn Columns, at: &str) -> Result<Bound
         },
         binds: n,
         columns,
+        targets,
     })
+}
+
+/// The bind variable `e` is, by number.
+fn bind_no(e: &SqlExpr) -> Option<usize> {
+    match e {
+        SqlExpr::Identifier(i) if i.quote_style.is_none() => {
+            i.value.strip_prefix(BIND)?.parse().ok()
+        }
+        SqlExpr::Nested(x) => bind_no(x),
+        _ => None,
+    }
+}
+
+/// The column `e` names, unqualified.
+fn column_of(e: &SqlExpr) -> Option<String> {
+    match e {
+        SqlExpr::Identifier(i) if !i.value.starts_with(BIND) => Some(i.value.to_ascii_lowercase()),
+        SqlExpr::CompoundIdentifier(v) => v.last().map(|i| i.value.to_ascii_lowercase()),
+        SqlExpr::Nested(x) => column_of(x),
+        _ => None,
+    }
+}
+
+/// See [`Bound::targets`]. A column name found in more than one of the
+/// statement's tables with different types gives no type.
+fn placeholder_targets(
+    stmt: &Statement,
+    tables: &BTreeSet<String>,
+    cat: &dyn Columns,
+    n: usize,
+) -> Vec<Option<Ty>> {
+    let mut out: Vec<Option<Ty>> = vec![None; n];
+    let ty_in = |table: &str, c: &str| cat.column(&table.to_ascii_lowercase(), c);
+    let ty_any = |c: &str| {
+        let mut found: Vec<Ty> = tables.iter().filter_map(|t| cat.column(t, c)).collect();
+        found.dedup();
+        (found.len() == 1).then(|| found[0])
+    };
+    let mut set = |k: Option<usize>, t: Option<Ty>| {
+        if let (Some(k), Some(t)) = (k, t)
+            && k < n
+        {
+            out[k] = Some(t);
+        }
+    };
+    match stmt {
+        Statement::Insert(ins) => {
+            if let TableObject::TableName(t) = &ins.table {
+                let table = name_parts(t).join(".");
+                let cols: Vec<String> = ins
+                    .columns
+                    .iter()
+                    .map(|c| name_parts(c).join(".").to_ascii_lowercase())
+                    .collect();
+                if let Some(q) = &ins.source
+                    && let SetExpr::Values(v) = q.body.as_ref()
+                {
+                    for row in &v.rows {
+                        for (j, e) in row.content.iter().enumerate() {
+                            if let Some(c) = cols.get(j) {
+                                set(bind_no(e), ty_in(&table, c));
+                            }
+                        }
+                    }
+                }
+                for a in &ins.assignments {
+                    if let sqlparser::ast::AssignmentTarget::ColumnName(c) = &a.target
+                        && let Some(c) = name_parts(c).last()
+                    {
+                        set(bind_no(&a.value), ty_in(&table, &c.to_ascii_lowercase()));
+                    }
+                }
+            }
+        }
+        Statement::Update(up) => {
+            for a in &up.assignments {
+                if let sqlparser::ast::AssignmentTarget::ColumnName(c) = &a.target
+                    && let Some(c) = name_parts(c).last()
+                {
+                    set(bind_no(&a.value), ty_any(&c.to_ascii_lowercase()));
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut arith: Vec<usize> = Vec::new();
+    let _ = sqlparser::ast::visit_expressions(stmt, |e: &SqlExpr| {
+        match e {
+            SqlExpr::BinaryOp {
+                left,
+                op:
+                    BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::Spaceship,
+                right,
+            } => {
+                if let Some(c) = column_of(left) {
+                    set(bind_no(right), ty_any(&c));
+                }
+                if let Some(c) = column_of(right) {
+                    set(bind_no(left), ty_any(&c));
+                }
+            }
+            // Arithmetic: the bind is a number whatever the column (text
+            // converts to a number in both tiers' SQL, but not in the
+            // compiled tier's typed read, which runs it in the engine tier).
+            SqlExpr::BinaryOp {
+                left,
+                op:
+                    BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Modulo,
+                right,
+            } => {
+                arith.extend([left, right].into_iter().filter_map(|x| bind_no(x)));
+            }
+            SqlExpr::InList { expr, list, .. } => {
+                if let Some(c) = column_of(expr) {
+                    for x in list {
+                        set(bind_no(x), ty_any(&c));
+                    }
+                }
+            }
+            SqlExpr::Between {
+                expr, low, high, ..
+            } => {
+                if let Some(c) = column_of(expr) {
+                    set(bind_no(low), ty_any(&c));
+                    set(bind_no(high), ty_any(&c));
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    for k in arith {
+        if k < n && out[k].is_none() {
+            out[k] = Some(Ty::Float);
+        }
+    }
+    out
 }
 
 fn name_parts(o: &ObjectName) -> Vec<String> {

@@ -18,6 +18,8 @@
 //! - [`pgq`]: SQL/PGQ `GRAPH_TABLE` in SQL statements.
 //! - [`gql`]: the GQL subset, rewritten into Cypher before parsing.
 //! - [`temporal`]: temporal and spatial values.
+//! - [`typed`]: typed storage: a table per label set and per relationship
+//!   type, a column per property key and value type.
 //! - [`access`]: per-label and per-type read grants.
 //! - [`semantic`]: compile-time semantic checks (the TCK's errors).
 //! - [`mirror`]: asynchronous mirrors: the applier's steps and the
@@ -46,6 +48,7 @@ pub mod semantic;
 pub mod settings;
 pub mod store;
 pub mod temporal;
+pub mod typed;
 pub mod value;
 
 pub use exec::{Budgets, Output, RowSink, VecSink, run_stream, streamable};

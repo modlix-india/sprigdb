@@ -88,7 +88,6 @@ fn the_guard_refuses_what_it_cant_show_exact() {
     for sql in [
         "SELECT c.cid + 1 FROM customers c",
         "SELECT UPPER(name) FROM customers",
-        "SELECT region, COUNT(*) FROM customers GROUP BY region HAVING COUNT(*) > 1",
         "SELECT * FROM customers",
         "SELECT cid FROM customers WHERE cid IN (SELECT cid FROM orders)",
         "SELECT c.cid FROM customers c RIGHT JOIN orders o ON o.cid = c.cid",
@@ -117,6 +116,108 @@ fn the_guard_refuses_what_it_cant_show_exact() {
         )
         .unwrap_err()
         .contains("ambiguous")
+    );
+}
+
+/// Aggregating statements with `HAVING` or expressions over their
+/// aggregates: the plan computes the groups and aggregates, MariaDB the
+/// rest over a temporary table of them.
+#[test]
+fn having_and_expressions_over_aggregates_are_finished_by_mariadb() {
+    let q = translate(
+        "SELECT c.region, SUM(o.amount) * 2 AS dbl, COUNT(*), ROUND(AVG(o.qty), 1) \
+         FROM customers c JOIN orders o ON o.cid = c.cid WHERE o.qty > 1 \
+         GROUP BY c.region HAVING dbl > 10 AND COUNT(*) >= 2 \
+         ORDER BY SUM(o.amount) DESC, 1 LIMIT 3",
+        &tables(),
+    )
+    .unwrap();
+    let f = q.finish.as_ref().unwrap();
+    assert_eq!(
+        q.items,
+        [
+            Item::Col(ColRef {
+                scan: 0,
+                col: "region".into()
+            }),
+            Item::Agg(Agg::Sum(ColRef {
+                scan: 1,
+                col: "amount".into()
+            })),
+            Item::Agg(Agg::CountStar),
+            Item::Agg(Agg::Avg(ColRef {
+                scan: 1,
+                col: "qty".into()
+            })),
+        ]
+    );
+    assert!(q.order.is_empty() && q.limit.is_none() && !q.distinct);
+    assert_eq!(q.scans[1].filter, ["(o.qty > 1)"]);
+    assert_eq!(
+        f.inner,
+        "SELECT c.region AS g0, SUM(o.amount) AS a0, COUNT(*) AS a1, AVG(o.qty) AS a2 \
+         FROM customers c JOIN orders o ON o.cid = c.cid WHERE o.qty > 1 GROUP BY c.region"
+    );
+    assert_eq!(f.table, "`t1_d1`.`__sprig_fin`");
+    assert_eq!(
+        f.outer,
+        "SELECT g0, a0 * 2 AS dbl, a1, ROUND(a2, 1) FROM `t1_d1`.`__sprig_fin` \
+         WHERE (a0 * 2) > 10 AND a1 >= 2 ORDER BY a0 DESC, 1 LIMIT 3"
+    );
+    // An aggregate only HAVING names is computed too.
+    let q = translate(
+        "SELECT region FROM customers GROUP BY region HAVING MAX(cid) > 3",
+        &tables(),
+    )
+    .unwrap();
+    assert_eq!(q.items.len(), 2);
+    assert_eq!(
+        q.finish.unwrap().outer,
+        "SELECT g0 FROM `t1_d1`.`__sprig_fin` WHERE a0 > 3"
+    );
+    // A statement the plan computes alone has no finishing step.
+    let q = translate(
+        "SELECT region, COUNT(*) FROM customers GROUP BY region",
+        &tables(),
+    )
+    .unwrap();
+    assert!(q.finish.is_none());
+    // Still refused: an ungrouped column, a window or subquery, DISTINCT,
+    // an alias that is also a column, an aggregate of an expression, LIMIT
+    // without an order.
+    for sql in [
+        "SELECT region, COUNT(*) FROM customers GROUP BY region HAVING name > 'a'",
+        "SELECT region, COUNT(*) + cid FROM customers GROUP BY region",
+        "SELECT region, COUNT(*) FROM customers GROUP BY region \
+         HAVING COUNT(*) > (SELECT 1 FROM orders)",
+        "SELECT DISTINCT COUNT(*) + 1 FROM customers GROUP BY region",
+        "SELECT region AS name, COUNT(*) FROM customers GROUP BY region HAVING name > 'a'",
+        "SELECT region, SUM(cid + 1) * 2 FROM customers GROUP BY region",
+        "SELECT region, COUNT(*) * 2 FROM customers GROUP BY region LIMIT 2",
+        "SELECT region, COUNT(*) FROM customers GROUP BY region WITH ROLLUP HAVING COUNT(*) > 1",
+    ] {
+        assert!(translate(sql, &tables()).is_err(), "accepted: {sql}");
+    }
+}
+
+#[test]
+fn finishing_literals_keep_bytes_and_numbers() {
+    let b = |s: &str| Bytes::copy_from_slice(s.as_bytes());
+    assert_eq!(literal(ct::NEWDECIMAL, Some(&b("-12.3400"))), "-12.3400");
+    assert_eq!(literal(ct::LONGLONG, Some(&b("42"))), "42");
+    assert_eq!(literal(ct::LONGLONG, None), "NULL");
+    assert_eq!(
+        literal(ct::VAR_STRING, Some(&b("a'b"))),
+        "CAST(X'612762' AS BINARY)"
+    );
+    assert_eq!(
+        literal(ct::DATE, Some(&b("2026-11-16"))),
+        "CAST(X'323032362D31312D3136' AS BINARY)"
+    );
+    // Text that isn't a number, in a numeric column, goes as bytes.
+    assert_eq!(
+        literal(ct::LONG, Some(&b("1;DROP"))),
+        "CAST(X'313B44524F50' AS BINARY)"
     );
 }
 

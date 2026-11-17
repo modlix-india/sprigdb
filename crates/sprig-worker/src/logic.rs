@@ -1,4 +1,4 @@
-//! Logic jobs (chapter 41, R7 order 5) on chapter 23's job runtime:
+//! Logic jobs on the control plane's job runtime:
 //!
 //! - `logic_trigger`: one per after-commit binding, long-running. It
 //!   reads the tenant's feed from the binding's subscription checkpoint
@@ -23,6 +23,7 @@ use mysql_async::prelude::Queryable;
 use serde_json::{Value, json};
 use sprig_binlog::GtidPos;
 use sprig_catalog::CatalogLocator;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_cluster::registry::ClusterRegistry;
 use sprig_common::ids::{ClusterId, TenantId};
 use sprig_common::{Result, SprigCode, SprigError};
@@ -55,9 +56,9 @@ pub struct LogicEnv {
     pub locator: Arc<ShardMapLocator>,
     /// Binlog sources for the feed.
     pub clusters: Arc<RegistryClusters>,
-    /// The worker's shared reader, keeping each tenant whole (R9,
-    /// r9feed2): after-commit triggers and search copies read through it,
-    /// one dump per cluster however many bindings and indexes.
+    /// The worker's shared reader, keeping each tenant whole: after-commit
+    /// triggers and search copies read through it, one dump per cluster
+    /// however many bindings and indexes.
     pub feed: Arc<dyn Clusters>,
     /// The runner's settings, following the worker's live settings
     /// ([`crate::settings::WorkerSettings::run_opts`]).
@@ -65,11 +66,21 @@ pub struct LogicEnv {
     /// The worker's live settings: `logic.trigger_budget_ms` when a
     /// trigger job starts, `logic.job_budget_ms` per scheduled run.
     pub settings: crate::settings::WorkerSettings,
-    /// Chapter 29 (RLS round 5, RL50): the DC's gateways and the global
-    /// tier (tenant names), for checking an after-commit trigger's events
-    /// against its definer's row policies. `None`: a bound definer's
-    /// events wait.
+    /// Row-level security: the DC's gateways and the global tier (tenant
+    /// names), for checking an after-commit trigger's events against its
+    /// definer's row policies. `None`: a bound definer's events wait.
     pub gateways: Option<(Arc<dyn sprig_sinks::peer::SinkPeer>, Arc<dyn MetaStore>)>,
+}
+
+impl LogicEnv {
+    /// `rls` reading definers' tenant subtrees from the global tier, when
+    /// this environment has it.
+    fn with_tree(&self, rls: crate::sinks::RlsCatalogs) -> crate::sinks::RlsCatalogs {
+        match &self.gateways {
+            Some((_, global)) => rls.with_tree(Arc::clone(global), self.settings.clone()),
+            None => rls,
+        }
+    }
 }
 
 impl std::fmt::Debug for LogicEnv {
@@ -168,7 +179,7 @@ impl Clusters for RegistryClusters {
 
     async fn position(&self, cluster: &ClusterId) -> Result<GtidPos> {
         let pool = self.pools.writer(cluster).await?;
-        let mut c = pool.get_conn().await.map_err(|e| {
+        let mut c = pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::BackendUnavailable, format!("{cluster}: {e}"))
         })?;
         let p: Option<String> = c
@@ -178,6 +189,15 @@ impl Clusters for RegistryClusters {
                 SprigError::new(SprigCode::BackendUnavailable, format!("{cluster}: {e}"))
             })?;
         p.unwrap_or_default().parse()
+    }
+
+    async fn drain_position(&self, cluster: &ClusterId) -> Result<GtidPos> {
+        let mut p = self.position(cluster).await?;
+        // Galera: only the shared domain (see the trait).
+        if let Some(d) = self.access(cluster).await?.domain {
+            p.retain_domains(|x| x == d);
+        }
+        Ok(p)
     }
 }
 
@@ -191,10 +211,13 @@ impl CatalogPools for Catalogs {
     }
 }
 
-/// Shards are where the tenant's catalog is (R1 moves them together).
+/// Shards are where the tenant's catalog is (a move takes them together).
+/// A tenant on Sprig 2PC's relay path reaches them through the relay
+/// writer ([`crate::relay_pools`]).
 struct TenantShards {
     locator: Arc<ShardMapLocator>,
     pools: Arc<dyn ClusterPools>,
+    dc: Arc<dyn MetaStore>,
 }
 
 #[async_trait]
@@ -208,7 +231,8 @@ impl ShardPools for TenantShards {
             e.retryable = true;
             e
         })?;
-        self.pools.writer(&cluster).await
+        let direct = self.pools.writer(&cluster).await?;
+        crate::relay_pools::shard_pool(&self.dc, tenant, &cluster, direct).await
     }
 }
 
@@ -218,16 +242,14 @@ fn spec_u64(spec: &Value, k: &str) -> std::result::Result<u64, String> {
         .ok_or_else(|| format!("spec.{k} is missing"))
 }
 
-/// Chapter 29 (RL37, RLS round 5 RL50): an after-commit trigger's code
-/// gets a changed row's images as its definer (the user who deployed the
-/// active version). While the table's policies bind that user, each event
+/// Row-level security: an after-commit trigger's code gets a changed row's
+/// images as its definer (the user who deployed the active version). While the table's policies bind that user, each event
 /// is checked on a gateway in a session of the definer (`SinkSql`
 /// `Images`): an insert runs when its new row is visible, a delete when its
 /// old row is, an update as an update (both), a delete (only the old row)
 /// or an insert (only the new row); hidden rows are passed over. An event
 /// that became an op the binding doesn't listen to is passed over too
 /// (the job widens an INSERT- or DELETE-only binding to updates for this).
-/// Before RL50 the events waited while the definer was bound.
 struct DefinerGuard {
     rls: crate::sinks::RlsCatalogs,
     locator: Arc<dyn CatalogLocator>,
@@ -289,7 +311,7 @@ impl DefinerGuard {
             return Ok(u);
         }
         let ep = self.locator.writer(self.tenant).await?;
-        let mut c = ep.pool.get_conn().await.map_err(|e| {
+        let mut c = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
         let schema = sprig_common::names::quote(ep.store.schema());
@@ -320,7 +342,7 @@ impl DefinerGuard {
 #[async_trait]
 impl RunGuard for DefinerGuard {
     async fn check(&self) -> Result<()> {
-        // RL50: bound definers' events are filtered (`shown`), not held.
+        // Bound definers' events are filtered (`shown`), not held.
         self.definer().await.map(|_| ())
     }
 
@@ -373,7 +395,11 @@ impl LogicTrigger {
             .map_err(|e| e.to_string())?;
         let store = LogicStore::new(ep.store.schema());
         let (b, module) = {
-            let mut c = ep.pool.get_conn().await.map_err(|e| e.to_string())?;
+            let mut c = ep
+                .pool
+                .get_conn_bounded()
+                .await
+                .map_err(|e| e.to_string())?;
             let b = store
                 .binding_by_id(&mut c, binding_id)
                 .await
@@ -395,7 +421,7 @@ impl LogicTrigger {
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
             .collect();
-        // RL50: an update can become an insert or a delete for a definer
+        // An update can become an insert or a delete for a definer
         // the table's policies bind, so an INSERT- or DELETE-only binding
         // on a table reads updates too; the guard passes over what the
         // binding doesn't listen to.
@@ -426,7 +452,7 @@ impl LogicTrigger {
         let tail = TenantTail::start(
             tenant,
             start,
-            // R9 (r9feed2): through the worker's shared reader.
+            // Through the worker's shared reader.
             Arc::clone(&env.feed),
             Arc::new(MetaPlacement::new(Arc::clone(&env.dc))),
             Arc::new(CatalogResolver::new(Arc::new(Catalogs(Arc::clone(
@@ -442,6 +468,12 @@ impl LogicTrigger {
             tenant,
             module.module_id,
         ));
+        // The table's and the module's database's `logic.trigger_*` rows
+        // too, over the tenant's.
+        let scope = crate::settings::LogicScope::db(tenant, module.db_id).with_object(b.object_id);
+        // As committed now (a database's budget set just before the
+        // trigger was created), then followed while the job runs.
+        env.settings.refresh_tenant(tenant).await;
         let apply = Arc::new(MariaApply {
             tenant,
             binding_id,
@@ -449,14 +481,16 @@ impl LogicTrigger {
             pools: Arc::new(TenantShards {
                 locator: Arc::clone(&env.locator),
                 pools: Arc::clone(&env.pools),
+                dc: Arc::clone(&env.dc),
             }),
             versions,
-            budget: env.settings.trigger_budget_for(tenant),
-            // RL37, RL50: the code gets the changed rows its definer may
-            // see (each event checked while the table's policies bind it).
+            budget: env.settings.trigger_budget_for(scope),
+            live_budget: Some(env.settings.live_trigger_budget(scope)),
+            // The code gets the changed rows its definer may see (each
+            // event checked while the table's policies bind it).
             guard: match (
                 b.object_id,
-                crate::sinks::RlsCatalogs::new(Arc::clone(&env.locator)),
+                crate::sinks::RlsCatalogs::new(Arc::clone(&env.locator)).map(|r| env.with_tree(r)),
             ) {
                 (Some(object), Some(rls)) => Some(Arc::new(DefinerGuard {
                     rls,
@@ -481,6 +515,7 @@ impl LogicTrigger {
             binding_id,
             module_id: module.module_id,
             subs,
+            clusters: Some(Arc::clone(&env.feed)),
         });
         let stats = Arc::new(Stats::default());
         tracing::info!(%tenant, binding = binding_id, job = %cx.job_id, "after-commit trigger started");
@@ -491,10 +526,10 @@ impl LogicTrigger {
         )
         .await;
         let stop = cx.cancel.clone();
-        // The tenant's own `logic.trigger_*` rows too (decision RF3); the
+        // The tenant's own `logic.trigger_*` rows too; the
         // env's options (tests' overrides) when no settings mirror runs.
         let opts = if env.settings.live().is_some() {
-            env.settings.run_opts_for(tenant)
+            env.settings.run_opts_for(scope)
         } else {
             env.opts.clone()
         };
@@ -511,8 +546,8 @@ impl LogicTrigger {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         let mut last_replay = Instant::now();
         let mut last_purge = Instant::now();
-        // bugfix-34: a trigger whose module was dropped (its database
-        // dropped, say) ends; before, it ran until the worker stopped.
+        // A trigger whose module was dropped (its database dropped, say)
+        // ends; before, it ran until the worker stopped.
         let mut last_check = Instant::now();
         let mut ended = None;
         let result = loop {
@@ -531,6 +566,10 @@ impl LogicTrigger {
                     // Ok(false): the job was lost, and progress() fired the cancel.
                     if let Err(e) = cx.progress(p).await {
                         tracing::warn!(error = %e, "trigger progress not written");
+                    }
+                    // Stopping: the runner drains; nothing new starts.
+                    if cx.cancel.is_cancelled() {
+                        continue;
                     }
                     if last_replay.elapsed() > Duration::from_secs(3) {
                         last_replay = Instant::now();
@@ -566,7 +605,7 @@ impl LogicTrigger {
 /// is gone or no longer active. `None` while both are active, or when the
 /// catalog can't be read (the next check tries again).
 async fn gone(pool: &Pool, store: &LogicStore, binding_id: u64, module_id: u64) -> Option<String> {
-    let mut c = pool.get_conn().await.ok()?;
+    let mut c = pool.get_conn_bounded().await.ok()?;
     let b = store.binding_by_id(&mut c, binding_id).await.ok()?;
     let m = store.module_by_id(&mut c, module_id).await.ok()?;
     match (b, m) {
@@ -583,7 +622,7 @@ async fn purge(env: &LogicEnv, tenant: TenantId, binding_id: u64, store: &LogicS
     let Ok(ep) = env.locator.writer(tenant).await else {
         return;
     };
-    if let Ok(mut c) = ep.pool.get_conn().await {
+    if let Ok(mut c) = ep.pool.get_conn_bounded().await {
         let _ = store.purge(&mut c, 14, 14, 10_000).await;
         let schemas: Vec<String> = c
             .exec(
@@ -603,6 +642,10 @@ async fn purge(env: &LogicEnv, tenant: TenantId, binding_id: u64, store: &LogicS
 impl JobHandler for LogicTrigger {
     fn kind(&self) -> &'static str {
         "logic_trigger"
+    }
+
+    fn drains(&self) -> bool {
+        true
     }
 
     fn class(&self) -> JobClass {
@@ -648,24 +691,28 @@ impl JobHandler for LogicSchedule {
             .writer(tenant)
             .await
             .map_err(|e| e.to_string())?;
-        let mut catalog = ep.pool.get_conn().await.map_err(|e| e.to_string())?;
         let cluster = env
             .locator
             .cluster_of(tenant)
             .await
             .map_err(|e| e.to_string())?
             .ok_or("the tenant has no shard map here")?;
-        let pool = env
+        // The run's statements write the tenant's tables: for a tenant on
+        // Sprig 2PC's relay path, through the relay writer.
+        let direct = env
             .pools
             .writer(&cluster)
             .await
             .map_err(|e| e.to_string())?;
-        let mut shard = pool.get_conn().await.map_err(|e| e.to_string())?;
+        let pool = crate::relay_pools::shard_pool(&env.dc, tenant, &cluster, direct)
+            .await
+            .map_err(|e| e.to_string())?;
         let store = LogicStore::new(ep.store.schema());
-        // Chapter 29 (RL42): the run applies its definer's policies in
+        // Row-level security: the run applies its definer's policies in
         // MariaDB (policy views and write triggers), not an internal
         // session's (every row).
         let rls = crate::sinks::RlsCatalogs::new(Arc::clone(&env.locator))
+            .map(|r| env.with_tree(r))
             .ok_or("the worker can't load row-level security catalogs")?;
         let guard = DefinerGuard {
             rls,
@@ -678,13 +725,31 @@ impl JobHandler for LogicSchedule {
             gateways: None,
             binding_id: 0,
         };
+        // The definer and its policies are read (catalog connections of
+        // their own, from the same pool) before the run's connections are
+        // taken.
         let ctx = guard.context().await.map_err(|e| e.to_string())?;
+        let mut catalog = ep
+            .pool
+            .get_conn_bounded()
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut shard = pool.get_conn_bounded().await.map_err(|e| e.to_string())?;
         if let Some(x) = &ctx {
             shard
                 .exec_drop("SET @sprig_rls = ?", (x.as_str(),))
                 .await
                 .map_err(|e| e.to_string())?;
         }
+        // The module's database's `logic.job_budget_ms` too, over the
+        // tenant's, as committed now.
+        env.settings.refresh_tenant(tenant).await;
+        let budget = match store.module_by_id(&mut catalog, module_id).await {
+            Ok(Some(m)) => env
+                .settings
+                .job_budget_for(crate::settings::LogicScope::db(tenant, m.db_id)),
+            _ => env.settings.job_budget_for(tenant),
+        };
         let end = sprig_logic::schedule::run(
             &mut catalog,
             &store,
@@ -692,7 +757,7 @@ impl JobHandler for LogicSchedule {
             &schema,
             module_id,
             run,
-            env.settings.job_budget_for(tenant),
+            budget,
         )
         .await;
         // The pooled sprig_ctl connection mustn't keep the context.

@@ -1,6 +1,6 @@
-//! Test helpers for the feed's consumers (R9, feedcancel): a real
-//! [`TenantTail`] over a fixed binlog whose catalog lookups are slow, to
-//! show that a consumer's timers never cost a change (decision r9-131).
+//! Test helpers for the feed's consumers: a real [`TenantTail`] over a
+//! fixed binlog whose catalog lookups are slow, to show that a consumer's
+//! timers never cost a change.
 //!
 //! Transaction `k` (from 1) inserts one row, `k = k`, into a table of its
 //! own (`n<k>`), so every transaction needs a catalog lookup before the

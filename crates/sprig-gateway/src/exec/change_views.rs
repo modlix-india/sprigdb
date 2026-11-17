@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use sprig_auth::authz::rls::RlsState;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::ClusterId;
 use sprig_common::{Result, SprigError};
 use sprig_sql::rls::triggers::{TriggerPolicy, TriggerSpec};
@@ -88,7 +89,6 @@ impl PassSession {
             &table_schema,
         )
         .await?;
-        let cols = crate::tenant::rls_streams::json_table_columns(&columns);
         let state = RlsState::of(&cat).cloned();
         let filtered = state
             .as_ref()
@@ -98,36 +98,13 @@ impl PassSession {
             .as_ref()
             .map(|s| s.policies_of(object).cloned().collect())
             .unwrap_or_default();
-        // A policy reading a column the record carries in another form
-        // (base64) can't be evaluated on the image: its term is FALSE.
-        let opaque: Vec<String> = columns
-            .iter()
-            .filter(|c| c.opaque)
-            .map(|c| c.name.to_lowercase())
-            .collect();
-        let reads_opaque = |e: &str| {
-            let l = e.to_lowercase();
-            opaque.iter().any(|c| {
-                l.match_indices(c.as_str()).any(|(i, _)| {
-                    let before = l[..i].chars().next_back();
-                    let after = l[i + c.len()..].chars().next();
-                    let word = |x: Option<char>| {
-                        x.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
-                    };
-                    !word(before) && !word(after)
-                })
-            })
-        };
         let tp: Vec<TriggerPolicy<'_>> = policies
             .iter()
             .map(|p| TriggerPolicy {
                 id: p.policy_id,
                 restrictive: p.restrictive,
                 commands: p.commands,
-                using: p
-                    .using_expr
-                    .as_deref()
-                    .map(|e| if reads_opaque(e) { "FALSE" } else { e }),
+                using: p.using_expr.as_deref(),
                 check: p.check_expr.as_deref(),
             })
             .collect();
@@ -164,10 +141,22 @@ impl PassSession {
                 lex,
                 physical: &physical,
             };
+            // Records carry some columns in another form than the table
+            // (base64, an ENUM's index, a TIMESTAMP in UTC): the
+            // predicate reads them back, or hides every record.
+            let decode = |ok: &str| {
+                let f = crate::tenant::rls_streams::decode(
+                    &columns,
+                    ok,
+                    sprig_streams::read::FILTER_QUAL,
+                    lex,
+                );
+                (f.columns, f.predicate)
+            };
             let view = spec.change_view_statement(
                 &view_name(def.id.0),
                 &sprig_streams::model::log_table(def.id),
-                &cols,
+                &decode,
                 &definer,
                 filtered,
             )?;
@@ -185,7 +174,7 @@ impl PassSession {
             stmts
         };
         let pool = svc.locator.ctl_pool(&own_cluster).await?;
-        let mut conn = pool.get_conn().await.map_err(|e| {
+        let mut conn = pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(
                 sprig_common::SprigCode::BackendUnavailable,
                 format!("sprig_ctl on {own_cluster}: {e}"),

@@ -1,5 +1,5 @@
 //! The Cypher syntax tree.
-//! The executor runs it after [`crate::bind`] checks names and marks what
+//! The executor runs it after [`crate::semantic`] checks names and marks what
 //! the planner needs, so it doubles as the graph IR of this build.
 
 use crate::value::Value;
@@ -115,7 +115,7 @@ pub enum Clause {
 }
 
 /// Whether an index or constraint is on nodes or relationships.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Entity {
     /// `FOR (n:Label)`.
     Node,

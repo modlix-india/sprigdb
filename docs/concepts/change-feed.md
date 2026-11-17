@@ -33,9 +33,9 @@ Tokens keep working when SprigDB moves the tenant's data. When the mover cuts a 
 
 ### How far back it reaches
 
-The feed can only read what the binlogs still hold. Each cluster keeps binlogs for `binlog_expire_logs_seconds` (a MariaDB setting); SprigDB warns when a cluster keeps less than `cluster.min_binlog_retention_hours` (24). A resume token older than the oldest binlog fails with 39800 `ER_SPRIG_FEED_HISTORY_LOST`, and the consumer must start again from now.
+The feed can only read what the binlogs still hold. Each cluster keeps binlogs for `binlog_expire_logs_seconds` (a MariaDB setting); SprigDB warns when a cluster keeps less than `cluster.min_binlog_retention_hours` (24). A resume token older than the oldest binlog fails with 39800 `ER_SPRIG_FEED_HISTORY_LOST`, and the consumer must start again from now. The message names the missing GTID domain and the node, and `sprig_feed_history_lost_total{node}` counts each refusal: alert on any increase. On Galera, purged node-local GTID domains that hold no tenant writes don't stop a reader.
 
-The feed can't start at a point in time: MariaDB has no index of binlog positions by time. Start from now, or after a token.
+A stream can also start at a point in time, within the same history; see [Starting at a point in time](#starting-at-a-point-in-time).
 
 ### What a cluster must have
 
@@ -95,7 +95,7 @@ Supported:
 - pipeline stages that work on one event at a time: `$match`, `$project`, `$addFields`, `$set`, `$unset`, `$replaceRoot`, `$replaceWith`;
 - `showExpandedEvents` for `create`, `createIndexes`, `dropIndexes` and `modify`.
 
-`startAtOperationTime` isn't supported. `watch()` on a collection without `WATCH` fails with 13 `Unauthorized`; a database stream leaves such collections out. Documents a TTL index deletes appear as `delete` events. See [MongoDB](../connect/mongodb.md).
+`startAtOperationTime` starts a stream at a time, as `start_at_hlc` does below. `watch()` on a collection without `WATCH` fails with 13 `Unauthorized`; a database stream leaves such collections out. Documents a TTL index deletes appear as `delete` events. See [MongoDB](../connect/mongodb.md).
 
 ### Server-Sent Events, WebSocket and NDJSON
 
@@ -137,9 +137,21 @@ data: {"resume_token":"01000000000000002a...","object":"orders","model":"table",
 
 When nothing changes for `api.stream.heartbeat_seconds` (15), the stream sends a `heartbeat` event carrying the latest token, so a quiet stream still moves its resume point on. Changes to rows you may not see also move the token on, without showing you the row.
 
+### Starting at a point in time
+
+Instead of a resume token, a stream can start at a time: `start_at_hlc`, a hybrid logical clock value (the `commit_hlc` of an event, for example), as a query parameter (`?start_at_hlc=...`) or the `Changes.Watch` field. The stream sends the tenant's changes committed at or after it. A MongoDB change stream does the same with `startAtOperationTime`. Both work at a gateway in another data centre, which relays the stream from the tenant's home data centre, and on Galera clusters.
+
+- Give either `start_after` (or `Last-Event-ID`) or `start_at_hlc`, not both: 39801.
+- SprigDB finds the binlog position from an index it records every 10 seconds per cluster, so the stream starts slightly before the time and leaves out the earlier events.
+- A time older than the time index reaches back, or than the tenant's move to its current cluster, fails with 39800. A cluster that has no index yet (just added or upgraded, or a Galera cluster without `wsrep_gtid_mode`) fails with 39802.
+
 ### gRPC
 
 The same stream is the `Changes.Watch` server-streaming call of the `sprig.v1` API, one `ChangeEvent` message per event, on the gateway's HTTP ports. See [REST and gRPC](../connect/rest-and-grpc.md).
+
+### From another data centre
+
+A change stream opened at a gateway outside the tenant's home data centre (over HTTP, gRPC or MongoDB) is relayed from a gateway in the home data centre, where the tenant's feed is read; the client sees the same events and tokens. If the client reads too slowly, the stream ends with 39790 as usual. If the home data centre's gateway goes away, the stream ends with 39788 `ER_SPRIG_FORWARD_FAILED` (retryable): reconnect and resume from the last token. Relayed streams are counted in `sprig_api_change_streams_forwarded_total`, and MongoDB's in `sprig_mongo_change_streams_relayed_total`. A relayed MongoDB stream applies the session's privileges and row-level security at the gateway the client is connected to.
 
 ### Limits
 
@@ -149,6 +161,8 @@ The same stream is the `Changes.Watch` server-streaming call of the `sprig.v1` A
 | `api.stream.max_buffered_events` | 10000 | A client further behind gets 39790 `ER_SPRIG_STREAM_SLOW_CONSUMER`, and the stream ends; resume from the last token |
 | `api.stream.heartbeat_seconds` | 15 | Heartbeat interval on a quiet stream |
 
+The three settings can be set for a tenant or globally. A `Sprig-Space` header (gRPC metadata `sprig-space`) makes the subscriber's session act in that space, as `USE SPACE` does.
+
 ## Errors
 
 | Code | Name | When |
@@ -156,14 +170,14 @@ The same stream is the `Changes.Watch` server-streaming call of the `sprig.v1` A
 | 1142 | `ER_TABLEACCESS_DENIED_ERROR` | A named table you can't read (`SELECT command denied`) or watch (`WATCH command denied`) |
 | 13 | `Unauthorized` (MongoDB) | `watch()` on a collection without `WATCH` |
 | 39800 | `ER_SPRIG_FEED_HISTORY_LOST` | The start point is older than the history the binlogs keep |
-| 39801 | `ER_SPRIG_FEED_BAD_RESUME_TOKEN` | The token is malformed or belongs to another tenant |
-| 39802 | `ER_SPRIG_FEED_SOURCE_UNSUPPORTED` | A cluster's binlog settings don't meet the feed's needs, or a start by time was asked for |
+| 39801 | `ER_SPRIG_FEED_BAD_RESUME_TOKEN` | The token is malformed or belongs to another tenant, or both a token and `start_at_hlc` were given |
+| 39802 | `ER_SPRIG_FEED_SOURCE_UNSUPPORTED` | A cluster's binlog settings don't meet the feed's needs, or `start_at_hlc` on a cluster without a time index yet |
 | 39780 | `ER_SPRIG_RATE_LIMITED` | Too many open streams for the tenant on this gateway |
 | 39790 | `ER_SPRIG_STREAM_SLOW_CONSUMER` | The client fell too far behind; resume from the last token |
+| 39788 | `ER_SPRIG_FORWARD_FAILED` | A stream relayed from the home data centre lost its gateway there; resume from the last token |
 
 ## Not supported yet
 
-- Starting a stream at a point in time (`start_at_hlc`, MongoDB's `startAtOperationTime`).
 - A SQL statement for subscribing to changes. Use one of the transports above, a change topic or a sink.
 
 ## Related

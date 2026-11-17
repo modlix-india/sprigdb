@@ -35,6 +35,7 @@ use sprig_common::names::{SchemaName, quote};
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_settings::{Bounds, Entry};
 
+use crate::pool_wait::Bounded as _;
 use crate::sql::{bytes_col, col, json_col, map_err, time_col, to_datetime};
 use crate::version::VersionKind;
 
@@ -1609,7 +1610,7 @@ impl Store {
         opts.with_consistent_snapshot(true)
             .with_isolation_level(mysql_async::IsolationLevel::RepeatableRead)
             .with_readonly(true);
-        pool.start_transaction(opts).await.map_err(map_err)
+        pool.start_transaction_bounded(opts).await.map_err(map_err)
     }
 
     /// [`snapshot`](Self::snapshot)'s reads, inside a transaction from

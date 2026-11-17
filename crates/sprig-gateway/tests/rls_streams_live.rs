@@ -292,7 +292,7 @@ async fn row_level_security_on_streamed_rows() {
     }
     // DROP DATABASE leaves a database's triggers and sinks behind: drop
     // them by name first.
-    for t in ["t_mgr", "a_mgr", "t_alice", "a_alice", "a_ev"] {
+    for t in ["t_mgr", "a_mgr", "t_alice", "a_alice", "a_ev", "a_tree"] {
         let _ = run(&mut admin, &format!("DROP TRIGGER {DB}.{t}")).await;
     }
     let _ = run(&mut admin, &format!("DROP DATABASE IF EXISTS {DB}")).await;
@@ -907,6 +907,65 @@ async fn row_level_security_on_streamed_rows() {
         !wrote,
         String::new,
     );
+
+    // 6b. Worker-run code reads its definer's tenant subtree: mgr's
+    // after-commit trigger on `events3` writes each event into `docs3`,
+    // forced, whose policy keeps rows of the tenant's subtree. A row of
+    // the tenant passes MariaDB's check; a row of tenant 1 doesn't. Before,
+    // the worker's context had empty subtree sets and every write failed.
+    if let Some(tid) = std::env::var("SPRIG_TEST_RLS_TENANT_ID")
+        .ok()
+        .and_then(|t| t.parse::<u64>().ok())
+    {
+        for s in [
+            format!("CREATE TABLE {DB}.events3 (id INT PRIMARY KEY, tid BIGINT, body VARCHAR(64))"),
+            format!("CREATE TABLE {DB}.docs3 (id INT PRIMARY KEY, tid BIGINT, note VARCHAR(64))"),
+            format!("ALTER TABLE {DB}.docs3 ENABLE ROW LEVEL SECURITY"),
+            format!("ALTER TABLE {DB}.docs3 FORCE ROW LEVEL SECURITY"),
+            format!(
+                "CREATE POLICY tree ON {DB}.docs3 FOR ALL TO PUBLIC USING \
+                 (SPRIG_TENANT_IN_SUBTREE(tid))"
+            ),
+            format!("GRANT INSERT, SELECT ON {DB}.events3 TO 'rlss_writer'@'%'"),
+        ] {
+            must(&mut admin, &s).await;
+        }
+        must(&mut mgr, &format!(
+            r#"CREATE TRIGGER {DB}.a_tree AFTER COMMIT ON {DB}.events3 FOR INSERT LANGUAGE kirun AS '{{"namespace":"App","name":"Tree","parameters":{{"id":{{"parameterName":"id","schema":{{"type":["INTEGER"]}}}},"tid":{{"parameterName":"tid","schema":{{"type":["LONG"]}}}},"body":{{"parameterName":"body","schema":{{"type":["STRING"]}}}}}},"steps":{{"ins":{{"statementName":"ins","namespace":"Sprig.Db","name":"Exec","parameterMap":{{"sql":{{"s":{{"key":"s","type":"VALUE","value":"INSERT INTO docs3 (id, tid, note) VALUES (?, ?, ?)"}}}},"args":{{"a":{{"key":"a","type":"EXPRESSION","order":1,"expression":"Arguments.id"}},"b":{{"key":"b","type":"EXPRESSION","order":2,"expression":"Arguments.tid"}},"c":{{"key":"c","type":"EXPRESSION","order":3,"expression":"Arguments.body"}}}}}}}}}}}}'"#
+        )).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        must(
+            &mut writer,
+            &format!(
+                "INSERT INTO {DB}.events3 VALUES (1, {tid}, 'in-tree'), (2, 1, 'out-of-tree')"
+            ),
+        )
+        .await;
+        let mut notes = Vec::new();
+        for _ in 0..30 {
+            notes = texts(&mut admin, &format!("SELECT note FROM {DB}.docs3")).await;
+            if notes.iter().any(|x| x == "in-tree") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        // Give the second event the same time to (not) arrive.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let notes2 = texts(&mut admin, &format!("SELECT note FROM {DB}.docs3")).await;
+        ck.ok(
+            "worker-run code writes a row of its definer's subtree",
+            notes.iter().any(|x| x == "in-tree"),
+            || format!("{notes:?}"),
+        );
+        ck.ok(
+            "LEAK: worker-run code writes a row outside its definer's subtree",
+            !notes2.iter().any(|x| x == "out-of-tree"),
+            || format!("{notes2:?}"),
+        );
+        let _ = run(&mut admin, &format!("DROP TRIGGER {DB}.a_tree")).await;
+    } else {
+        eprintln!("6b skipped: set SPRIG_TEST_RLS_TENANT_ID");
+    }
 
     // 5. Dead letters: a record the stream trigger fails on for good
     // keeps the change record; alice (bound) gets it without the event,

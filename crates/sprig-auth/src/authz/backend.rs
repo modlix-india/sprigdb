@@ -26,7 +26,9 @@
 //!
 //! **Roles.** A user's account gets its own privileges plus those of
 //! every role granted to it, active or not; the gateway enforces which
-//! roles are active. MariaDB roles and combined roles (one active role per
+//! roles are active. A user with the `token` method also gets those of
+//! every role an active issuer's role mapping can name (its token roles,
+//! [`crate::oidc::roles`]), held the same way. MariaDB roles and combined roles (one active role per
 //! MariaDB session) are not used yet.
 //!
 //! **Credentials.** Accounts have a password derived from a secret
@@ -46,6 +48,18 @@
 //!
 //! Every statement is idempotent or its "nothing to do" error is ignored,
 //! so gateways may reconcile the same tenant at once.
+//!
+//! **Login hosts** ([`LoginHosts`]). A tenant on Sprig 2PC's relay path
+//! reaches a cluster with relays only through the relay writer, and MariaDB
+//! enforces it: each account also exists at every relay host of the
+//! cluster (same password and grants), and the account at `'%'` is locked.
+//! A login from a relay host matches the account at that host; a login
+//! from anywhere else matches only the locked `'%'` account and is refused
+//! (4151). The `'%'` accounts keep their grants because they stay the
+//! definers of the tenant's stored code and views. Accounts at hosts that
+//! are no longer wanted are dropped, after `'%'` is unlocked when the tenant
+//! leaves the relay path, and before it is locked only once the relay
+//! hosts' accounts exist.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -394,6 +408,9 @@ pub fn desired_on(
     };
     let mut out = BackendState::new();
     let tenant_pattern = format!("t{tenant}\\_d%");
+    // Token roles: a user taking tokens may be given any role an active
+    // issuer's role mapping can name.
+    let token_roles = crate::oidc::roles::possible_roles(auth.issuers(), state);
     for u in auth.users() {
         let uid = u.row.user_id;
         let mut grants: BTreeMap<BackendTarget, ActionSet> = BTreeMap::new();
@@ -406,7 +423,14 @@ pub fn desired_on(
         };
         let compiled_tenant;
         if state.is_migrated() {
-            let roles = state.closure(&state.granted_roles(uid));
+            let mut direct = state.granted_roles(uid);
+            if u.row
+                .auth_methods
+                .contains(crate::store::AuthMethods::TOKEN)
+            {
+                direct.extend(token_roles.iter().copied());
+            }
+            let roles = state.closure(&direct);
             let grantees: Vec<Grantee> = std::iter::once(Grantee::User(uid))
                 .chain(roles.into_iter().map(Grantee::Role))
                 .collect();
@@ -726,12 +750,52 @@ fn redo_marker_grants(grants: &mut BTreeMap<BackendTarget, ActionSet>, tenant_pa
 /// # Errors
 /// A backend error.
 pub async fn read_have(conn: &mut Conn, tenant: TenantId) -> Result<BackendState> {
+    read_have_at(conn, tenant, ANY_HOST).await
+}
+
+/// The host part of the accounts every tenant has: any host.
+pub const ANY_HOST: &str = "%";
+
+/// Where a tenant's per-user accounts may log in from on a cluster.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub enum LoginHosts {
+    /// Any host: the accounts at `'%'`, unlocked.
+    #[default]
+    Anywhere,
+    /// Only these hosts (Sprig 2PC's relay hosts): the accounts at each,
+    /// and the `'%'` accounts locked.
+    Only(Vec<String>),
+}
+
+impl LoginHosts {
+    /// The hosts besides `'%'` the accounts must exist at.
+    #[must_use]
+    pub fn hosts(&self) -> &[String] {
+        match self {
+            Self::Anywhere => &[],
+            Self::Only(h) => h,
+        }
+    }
+
+    /// Whether the `'%'` accounts are locked.
+    #[must_use]
+    pub const fn locks_any(&self) -> bool {
+        matches!(self, Self::Only(_))
+    }
+}
+
+/// The tenant's per-user accounts at `host` and their grants, read as
+/// `sprig_ctl`.
+///
+/// # Errors
+/// A backend error.
+pub async fn read_have_at(conn: &mut Conn, tenant: TenantId, host: &str) -> Result<BackendState> {
     let like = format!("t{tenant}\\_u%");
     let mut have = BackendState::new();
     let users: Vec<String> = conn
         .exec(
-            "SELECT User FROM mysql.global_priv WHERE User LIKE ? AND Host = '%'",
-            (&like,),
+            "SELECT User FROM mysql.global_priv WHERE User LIKE ? AND Host = ?",
+            (&like, host),
         )
         .await
         .map_err(crate::store::map_err)?;
@@ -741,8 +805,8 @@ pub async fn read_have(conn: &mut Conn, tenant: TenantId) -> Result<BackendState
     let cols = BACKEND_DB_COLUMNS.join(", ");
     let rows: Vec<Row> = conn
         .exec(
-            format!("SELECT User, Db, {cols} FROM mysql.db WHERE User LIKE ? AND Host = '%'"),
-            (&like,),
+            format!("SELECT User, Db, {cols} FROM mysql.db WHERE User LIKE ? AND Host = ?"),
+            (&like, host),
         )
         .await
         .map_err(crate::store::map_err)?;
@@ -763,8 +827,8 @@ pub async fn read_have(conn: &mut Conn, tenant: TenantId) -> Result<BackendState
     let rows: Vec<(String, String, String, String)> = conn
         .exec(
             "SELECT User, Db, Table_name, Table_priv FROM mysql.tables_priv \
-             WHERE User LIKE ? AND Host = '%'",
-            (&like,),
+             WHERE User LIKE ? AND Host = ?",
+            (&like, host),
         )
         .await
         .map_err(crate::store::map_err)?;
@@ -779,8 +843,8 @@ pub async fn read_have(conn: &mut Conn, tenant: TenantId) -> Result<BackendState
     let rows: Vec<(String, String, String, String, String)> = conn
         .exec(
             "SELECT User, Db, Table_name, Column_name, Column_priv FROM mysql.columns_priv \
-             WHERE User LIKE ? AND Host = '%'",
-            (&like,),
+             WHERE User LIKE ? AND Host = ?",
+            (&like, host),
         )
         .await
         .map_err(crate::store::map_err)?;
@@ -795,8 +859,8 @@ pub async fn read_have(conn: &mut Conn, tenant: TenantId) -> Result<BackendState
     let rows: Vec<(String, String, String, String, String)> = conn
         .exec(
             "SELECT User, Db, Routine_name, Routine_type, Proc_priv FROM mysql.procs_priv \
-             WHERE User LIKE ? AND Host = '%'",
-            (&like,),
+             WHERE User LIKE ? AND Host = ?",
+            (&like, host),
         )
         .await
         .map_err(crate::store::map_err)?;
@@ -875,14 +939,30 @@ pub fn plan(
     key: &BackendKey,
     full: bool,
 ) -> (Vec<Zeroizing<String>>, ReconcileReport) {
+    plan_at(want, have, key, full, ANY_HOST, false)
+}
+
+/// [`plan`] for the accounts at `host`; `locked`: new accounts are created
+/// locked (the `'%'` accounts of a tenant on the relay path).
+#[must_use]
+pub fn plan_at(
+    want: &BackendState,
+    have: &BackendState,
+    key: &BackendKey,
+    full: bool,
+    host: &str,
+    locked: bool,
+) -> (Vec<Zeroizing<String>>, ReconcileReport) {
     let mut out = Vec::new();
     let mut rep = ReconcileReport::default();
+    let host = host.replace('\\', "\\\\").replace('\'', "\\'");
+    let lock = if locked { " ACCOUNT LOCK" } else { "" };
     for (acct, grants) in want {
-        let who = format!("'{acct}'@'%'");
+        let who = format!("'{acct}'@'{host}'");
         let found = have.get(acct);
         if found.is_none() {
             out.push(Zeroizing::new(format!(
-                "CREATE USER IF NOT EXISTS {who} IDENTIFIED BY '{}' REQUIRE SSL",
+                "CREATE USER IF NOT EXISTS {who} IDENTIFIED BY '{}' REQUIRE SSL{lock}",
                 key.password(acct).as_str()
             )));
             rep.created += 1;
@@ -938,7 +1018,9 @@ pub fn plan(
     }
     for acct in have.keys() {
         if !want.contains_key(acct) {
-            out.push(Zeroizing::new(format!("DROP USER IF EXISTS '{acct}'@'%'")));
+            out.push(Zeroizing::new(format!(
+                "DROP USER IF EXISTS '{acct}'@'{host}'"
+            )));
             rep.dropped += 1;
             rep.changed.insert(acct.clone());
         }
@@ -967,8 +1049,10 @@ pub async fn reconcile(
     key: &BackendKey,
     full: bool,
 ) -> Result<ReconcileReport> {
-    let have = read_have(conn, tenant).await?;
-    let (stmts, rep) = plan(want, &have, key, full);
+    reconcile_at(conn, tenant, want, key, full, &LoginHosts::Anywhere).await
+}
+
+async fn run_all(conn: &mut Conn, stmts: Vec<Zeroizing<String>>) -> Result<()> {
     for s in stmts {
         if let Err(e) = conn.query_drop(s.as_str()).await {
             if benign(&e) {
@@ -977,6 +1061,96 @@ pub async fn reconcile(
             // Never echo the statement: it may hold a password.
             return Err(crate::store::map_err(e));
         }
+    }
+    Ok(())
+}
+
+fn merge(into: &mut ReconcileReport, r: ReconcileReport) {
+    into.statements += r.statements;
+    into.created += r.created;
+    into.dropped += r.dropped;
+    into.changed.extend(r.changed);
+}
+
+/// The lock statements moving the tenant's `'%'` accounts in `want` from
+/// `locked` (those locked now) to `lock` (all locked, or none).
+#[must_use]
+pub fn plan_locks(
+    want: &BackendState,
+    locked: &BTreeSet<String>,
+    lock: bool,
+) -> Vec<Zeroizing<String>> {
+    want.keys()
+        .filter(|a| locked.contains(*a) != lock)
+        .map(|a| {
+            Zeroizing::new(format!(
+                "ALTER USER '{a}'@'%' ACCOUNT {}",
+                if lock { "LOCK" } else { "UNLOCK" }
+            ))
+        })
+        .collect()
+}
+
+/// [`reconcile`] with the accounts' login hosts ([`LoginHosts`]).
+///
+/// ```text
+/// '%' accounts: grants as wanted; created locked under Only
+/// Anywhere: unlock the '%' accounts first
+/// each wanted relay host: the accounts and grants as wanted
+/// Only: then lock the '%' accounts
+/// every other host: its accounts dropped
+/// ```
+///
+/// # Errors
+/// A backend error other than the "already done" ones.
+pub async fn reconcile_at(
+    conn: &mut Conn,
+    tenant: TenantId,
+    want: &BackendState,
+    key: &BackendKey,
+    full: bool,
+    hosts: &LoginHosts,
+) -> Result<ReconcileReport> {
+    let like = format!("t{tenant}\\_u%");
+    let have = read_have_at(conn, tenant, ANY_HOST).await?;
+    let (stmts, mut rep) = plan_at(want, &have, key, full, ANY_HOST, hosts.locks_any());
+    run_all(conn, stmts).await?;
+    let others: Vec<String> = conn
+        .exec(
+            "SELECT DISTINCT Host FROM mysql.global_priv WHERE User LIKE ? AND Host <> '%'",
+            (&like,),
+        )
+        .await
+        .map_err(crate::store::map_err)?;
+    let locked: BTreeSet<String> = conn
+        .exec::<String, _, _>(
+            "SELECT User FROM mysql.global_priv WHERE User LIKE ? AND Host = '%' \
+             AND JSON_VALUE(Priv, '$.account_locked') IN ('1', 'true')",
+            (&like,),
+        )
+        .await
+        .map_err(crate::store::map_err)?
+        .into_iter()
+        .collect();
+    let mut locks = plan_locks(want, &locked, hosts.locks_any());
+    if !hosts.locks_any() {
+        rep.statements += locks.len();
+        run_all(conn, std::mem::take(&mut locks)).await?;
+    }
+    for h in hosts.hosts() {
+        let have = read_have_at(conn, tenant, h).await?;
+        let (stmts, r) = plan_at(want, &have, key, full, h, false);
+        run_all(conn, stmts).await?;
+        merge(&mut rep, r);
+    }
+    rep.statements += locks.len();
+    run_all(conn, locks).await?;
+    let empty = BackendState::new();
+    for h in others.iter().filter(|h| !hosts.hosts().contains(h)) {
+        let have = read_have_at(conn, tenant, h).await?;
+        let (stmts, r) = plan_at(&empty, &have, key, false, h, false);
+        run_all(conn, stmts).await?;
+        merge(&mut rep, r);
     }
     if rep.statements > 0 {
         metrics::counter!("sprig_auth_reconcile_statements_total").increment(rep.statements as u64);
@@ -1247,5 +1421,60 @@ mod tests {
             parse_set("Select,Show view,Grant"),
             ActionSet::of(&[Action::Select, Action::ShowView])
         );
+    }
+
+    #[test]
+    fn relay_hosts_get_the_same_accounts_and_any_host_is_locked() {
+        let k = BackendKey::new(b"0123456789abcdef").unwrap_or_else(|_| unreachable!());
+        let mut grants = BTreeMap::new();
+        grants.insert(
+            BackendTarget::Db("t1\\_d%".into()),
+            ActionSet::of(&[Action::Select, Action::Insert]),
+        );
+        let mut want = BackendState::new();
+        want.insert("t1_u1".to_owned(), grants.clone());
+        // A new account at '%' of a relayed tenant is created locked.
+        let (s, r) = plan_at(&want, &BackendState::new(), &k, false, ANY_HOST, true);
+        assert!(
+            s[0].ends_with("REQUIRE SSL ACCOUNT LOCK"),
+            "{}",
+            s[0].as_str()
+        );
+        assert!(s[0].starts_with("CREATE USER IF NOT EXISTS 't1_u1'@'%'"));
+        assert_eq!(r.created, 1);
+        // At a relay host: the same password and grants, not locked.
+        let (s, _) = plan_at(&want, &BackendState::new(), &k, false, "10.0.0.9", false);
+        let text: Vec<&str> = s.iter().map(|x| x.as_str()).collect();
+        assert_eq!(
+            text[0],
+            format!(
+                "CREATE USER IF NOT EXISTS 't1_u1'@'10.0.0.9' IDENTIFIED BY '{}' REQUIRE SSL",
+                k.password("t1_u1").as_str()
+            )
+        );
+        assert_eq!(
+            text[1],
+            "GRANT SELECT, INSERT ON `t1\\_d%`.* TO 't1_u1'@'10.0.0.9'"
+        );
+        // A host no longer wanted: its accounts go.
+        let (s, r) = plan_at(&BackendState::new(), &want, &k, false, "10.0.0.8", false);
+        assert_eq!(s[0].as_str(), "DROP USER IF EXISTS 't1_u1'@'10.0.0.8'");
+        assert_eq!(r.dropped, 1);
+        // A quote in a host can't end the literal.
+        let (s, _) = plan_at(&BackendState::new(), &want, &k, false, "a'b", false);
+        assert_eq!(s[0].as_str(), "DROP USER IF EXISTS 't1_u1'@'a\\'b'");
+        // Locks: only the accounts whose state differs.
+        let locked: BTreeSet<String> = BTreeSet::new();
+        let l = plan_locks(&want, &locked, true);
+        assert_eq!(l[0].as_str(), "ALTER USER 't1_u1'@'%' ACCOUNT LOCK");
+        assert!(plan_locks(&want, &locked, false).is_empty());
+        let locked: BTreeSet<String> = ["t1_u1".to_owned()].into();
+        assert!(plan_locks(&want, &locked, true).is_empty());
+        assert_eq!(
+            plan_locks(&want, &locked, false)[0].as_str(),
+            "ALTER USER 't1_u1'@'%' ACCOUNT UNLOCK"
+        );
+        assert_eq!(LoginHosts::Only(vec!["h".into()]).hosts(), ["h".to_owned()]);
+        assert!(LoginHosts::Anywhere.hosts().is_empty() && !LoginHosts::Anywhere.locks_any());
     }
 }

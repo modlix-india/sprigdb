@@ -1,10 +1,9 @@
-//! The search role (chapter 39, "Placement of copies", "Snapshots, seeding
-//! and rebuilds"; build steps 5, 6 and 12; R5 round 6): copies of search
-//! indexes on this worker, the `SearchPartition` service gateways query,
-//! and the `search_copy` job that keeps one copy.
+//! The search role: copies of search indexes on this worker, the
+//! `SearchPartition` service gateways query, and the `search_copy` job that
+//! keeps one copy.
 //!
 //! A worker has the role when `SPRIG_SEARCH_LISTEN` names its address
-//! (`host:port`; 7401 in the design); it then offers slots of class
+//! (`host:port`, usually port 7401); it then offers slots of class
 //! `search`, and only such workers get copies. Files live under
 //! `SPRIG_SEARCH_DIR` (default `<temp>/sprig-search/<worker id>`),
 //! snapshots under `SPRIG_SEARCH_SNAPSHOTS` when set.
@@ -517,7 +516,7 @@ impl SearchRole {
     }
 }
 
-/// `search.*` values the role reads (process scope, decision S8).
+/// `search.*` values the role reads (process scope).
 mod sprig_gateway_free {
     use std::time::Duration;
 
@@ -579,6 +578,22 @@ impl Seeder for GatewaySeeder {
                 generation: self.generation,
                 after: after.cloned(),
                 limit,
+                keys: None,
+            },
+        )
+        .await
+    }
+
+    async fn fetch(&mut self, keys: &[Key]) -> Result<Vec<SearchRecord>> {
+        seed_call(
+            &self.gateways,
+            &SeedRequest {
+                tenant: self.tenant,
+                index: self.index,
+                generation: self.generation,
+                after: None,
+                limit: keys.len(),
+                keys: Some(keys.to_vec()),
             },
         )
         .await
@@ -632,6 +647,7 @@ impl CopyHost for WorkerHost {
                 generation: def.generation,
                 after: None,
                 limit: 0,
+                keys: None,
             },
         )
         .await;

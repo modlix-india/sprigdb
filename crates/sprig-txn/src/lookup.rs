@@ -4,7 +4,8 @@
 //! coordinator (XA across clusters, last-resource commit with Galera).
 //!
 //! - **Pre**: one plain transaction per cluster on its own connection,
-//!   with `lookup.lock_wait_seconds`, committed before Main.
+//!   with `lookup.lock_wait_seconds` (the owner table's, set before each
+//!   claim with `DistTxn::set_lock_wait`), committed before Main.
 //! - **Main**: the coordinator's branch on the target's cluster; every
 //!   statement goes through the write rule.
 //! - **Post**: buffered, run in their own short transaction after Main
@@ -80,6 +81,8 @@ pub struct DistTxn<B: TxnBackend = MyBackend> {
     anchor_of: AnchorOf,
     lock_wait_seconds: u64,
     pre: BTreeMap<ClusterId, B::Conn>,
+    /// The lock wait each Pre session last set.
+    pre_wait: BTreeMap<ClusterId, u64>,
     post: Vec<(Target, String, Params)>,
     /// Post statements that failed in the last commit (orphans left for
     /// the scan).
@@ -128,9 +131,17 @@ where
             anchor_of,
             lock_wait_seconds,
             pre: BTreeMap::new(),
+            pre_wait: BTreeMap::new(),
             post: Vec::new(),
             post_failures: 0,
         }
+    }
+
+    /// Sets `lookup.lock_wait_seconds` for the Pre statements that follow
+    /// (the owner table's value, resolved per claim): a Pre session already
+    /// open with another value sets it again before its next statement.
+    pub fn set_lock_wait(&mut self, seconds: u64) {
+        self.lock_wait_seconds = seconds.max(1);
     }
 
     /// The coordinator, for the transaction's other statements.
@@ -157,6 +168,7 @@ where
     /// coordinator's commit error (39443, 39441, ...).
     pub async fn commit(&mut self) -> Result<(CommitOutcome, u64)> {
         let pre = std::mem::take(&mut self.pre);
+        self.pre_wait.clear();
         let mut it = pre.into_iter();
         while let Some((_, mut c)) = it.next() {
             if let Err(e) = c.run("COMMIT").await {
@@ -203,6 +215,7 @@ where
         for (_, mut c) in std::mem::take(&mut self.pre) {
             let _ = c.run("ROLLBACK").await;
         }
+        self.pre_wait.clear();
         self.post.clear();
         self.txn.rollback().await
     }
@@ -247,11 +260,22 @@ where
             .map_err(|e| sql_err(&e))?;
             c.run("START TRANSACTION").await.map_err(|e| sql_err(&e))?;
             self.pre.insert(t.cluster.clone(), c);
+            self.pre_wait
+                .insert(t.cluster.clone(), self.lock_wait_seconds.max(1));
         }
+        let want = self.lock_wait_seconds.max(1);
         let c = self
             .pre
             .get_mut(&t.cluster)
             .ok_or_else(|| SprigError::internal("pre session vanished"))?;
+        // Another owner table's claim on the same cluster: its lock wait
+        // (the variable may change inside a transaction).
+        if self.pre_wait.get(&t.cluster) != Some(&want) {
+            c.run(&format!("SET SESSION innodb_lock_wait_timeout = {want}"))
+                .await
+                .map_err(|e| sql_err(&e))?;
+            self.pre_wait.insert(t.cluster.clone(), want);
+        }
         c.query(sql, params).await.map_err(|e| sql_err(&e))
     }
 

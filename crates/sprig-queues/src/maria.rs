@@ -144,10 +144,18 @@ fn id16(v: &[u8]) -> MsgId {
     a
 }
 
+/// Where a store's connections come from at each use, when it isn't
+/// always its own pool: the gateway passes one that goes through Sprig
+/// 2PC's relay writer while the tenant is on the relay path.
+pub type PoolRoute =
+    Arc<dyn Fn() -> futures::future::BoxFuture<'static, Result<Pool, String>> + Send + Sync>;
+
 /// The store of one shard schema.
 #[derive(Clone)]
 pub struct MariaStore {
     pool: Pool,
+    /// Chooses the pool at each use (see [`PoolRoute`]); `pool` when unset.
+    route: Option<PoolRoute>,
     /// `sprig_ctl` pools of the cluster's replicas (`queue.confirm_mode =
     /// replica`).
     replicas: Vec<Pool>,
@@ -181,11 +189,28 @@ impl MariaStore {
         let q = quote(&schema);
         Self {
             pool,
+            route: None,
             replicas: Vec::new(),
             confirm_replica: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             schema,
             q,
             stale: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Takes each connection from the pool `route` gives at that moment
+    /// instead of the store's own.
+    #[must_use]
+    pub fn with_route(mut self, route: PoolRoute) -> Self {
+        self.route = Some(route);
+        self
+    }
+
+    /// The pool to take a connection from now.
+    async fn pool_now(&self) -> Result<Pool, StoreError> {
+        match &self.route {
+            Some(r) => r().await.map_err(StoreError::Failed),
+            None => Ok(self.pool.clone()),
         }
     }
 
@@ -271,7 +296,12 @@ impl MariaStore {
     /// # Errors
     /// A backend error.
     pub async fn ensure(&self) -> Result<(), StoreError> {
-        let mut c = self.pool.get_conn().await.map_err(|e| self.fail(&e))?;
+        let mut c = self
+            .pool_now()
+            .await?
+            .get_conn()
+            .await
+            .map_err(|e| self.fail(&e))?;
         // A schema a mover has fenced (its tables renamed to
         // `__sprig_f_*`) must not get fresh, empty queue tables: writes
         // there would be lost when the move commits.
@@ -300,7 +330,11 @@ impl MariaStore {
     }
 
     async fn conn(&self) -> Result<mysql_async::Conn, StoreError> {
-        self.pool.get_conn().await.map_err(|e| self.fail(&e))
+        self.pool_now()
+            .await?
+            .get_conn()
+            .await
+            .map_err(|e| self.fail(&e))
     }
 }
 
@@ -800,15 +834,27 @@ impl MsgStore for MariaStore {
         Ok(rows.into_iter().filter_map(outbox_of).collect())
     }
 
-    async fn purge_ledger(&self, before_ms: i64) -> Result<u64, StoreError> {
+    async fn purge_ledger(
+        &self,
+        before_ms: i64,
+        changes_before_ms: i64,
+    ) -> Result<u64, StoreError> {
         let mut c = self.conn().await?;
+        // Byte 7's high nibble is the UUID version: 8 marks a change
+        // exchange's id (`store::is_change_id`), kept longer.
         c.exec_drop(
             format!(
-                "DELETE FROM {} WHERE at_ms < ? AND out_id NOT IN (SELECT out_id FROM {}) LIMIT 5000",
+                "DELETE FROM {} WHERE at_ms < ? AND out_id NOT IN (SELECT out_id FROM {}) \
+                 AND IF(ASCII(SUBSTRING(out_id, 7, 1)) >> 4 = 8, at_ms < ?, at_ms < ?) LIMIT {}",
                 self.t("__sprig_qf"),
-                self.t("__sprig_qo")
+                self.t("__sprig_qo"),
+                crate::store::LEDGER_PURGE_BATCH
             ),
-            (before_ms,),
+            (
+                before_ms.max(changes_before_ms),
+                changes_before_ms,
+                before_ms,
+            ),
         )
         .await
         .map_err(|e| self.fail(&e))?;

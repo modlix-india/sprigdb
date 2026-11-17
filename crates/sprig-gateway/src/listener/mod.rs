@@ -21,7 +21,9 @@
 //!
 //! Each connection runs in its own task: the PROXY header from trusted
 //! peers, then TLS by mode. Client-speaks-first protocols detect a TLS
-//! `ClientHello` from the first byte; the MySQL family is told what to offer
+//! `ClientHello` from its record header (`16 03 0x`, then a handshake
+//! message of type 1), not from the first byte alone, which a MongoDB
+//! message's length can also start with; the MySQL family is told what to offer
 //! in-protocol ([`InProtocolTls`](crate::frontend::InProtocolTls)).
 //!
 //! [`live::follow`] re-applies the listeners whenever their settings change

@@ -6,6 +6,7 @@
 //! slow a decision: channels run on spawned tasks and count their results
 //! in `sprig_approvals_notifications_total`.
 
+use sprig_catalog::pool_wait::Bounded as _;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -127,7 +128,7 @@ impl Notifier {
         let schema = ep.store.schema().to_owned();
         let mut c = ep
             .pool
-            .get_conn()
+            .get_conn_bounded()
             .await
             .map_err(|e| SprigError::internal("stream: catalog unavailable").with_source(e))?;
         let db: Option<u32> = c
@@ -292,7 +293,7 @@ impl Notifier {
         let Ok(ep) = self.locator.writer(t).await else {
             return Vec::new();
         };
-        let Ok(mut c) = ep.pool.get_conn().await else {
+        let Ok(mut c) = ep.pool.get_conn_bounded().await else {
             return Vec::new();
         };
         SqlRecs::new(t, ep.store.schema())
@@ -450,6 +451,57 @@ impl Notifier {
                 }
             }
         });
+    }
+}
+
+impl Notifier {
+    /// Emails a tenant's AI digest to its approvals subscribers (delivery
+    /// `immediate` or `digest`) through `approvals.smtp_url`. Returns
+    /// `sent`, `skipped` (no SMTP, no subscriber) or `failed`.
+    pub async fn ai_digest(
+        &self,
+        tenant: TenantId,
+        subject: &str,
+        body: &str,
+        id: &str,
+    ) -> &'static str {
+        let cfg = match self.smtp().await {
+            Ok(Some(c)) => c,
+            Ok(None) => return "skipped",
+            Err(e) => {
+                tracing::warn!(error = %e, "AI digest: email misconfigured");
+                return "failed";
+            }
+        };
+        let to: Vec<String> = self
+            .subscriptions(tenant)
+            .await
+            .into_iter()
+            .filter(|s| s.delivery == "immediate" || s.delivery == "digest")
+            .map(|s| s.email)
+            .collect();
+        if to.is_empty() {
+            return "skipped";
+        }
+        let mail = Mail {
+            to,
+            subject: subject.to_owned(),
+            body: body.to_owned(),
+        };
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros(),
+        )
+        .unwrap_or(0);
+        match sprig_approvals::smtp::send(&cfg, &mail, &rfc2822(now), id).await {
+            Ok(()) => "sent",
+            Err(e) => {
+                tracing::warn!(error = %e, "AI digest: email not sent");
+                "failed"
+            }
+        }
     }
 }
 

@@ -18,7 +18,7 @@ use sprig_common::{Result, SprigCode, SprigError};
 
 use crate::catalog::LogicStore;
 use crate::declare::{Declaration, Kind, Param, TierPref};
-use crate::rollout::{RolloutOp, RolloutSpec};
+use crate::rollout::{RolloutBy, RolloutOp, RolloutSpec};
 
 /// A parsed rollback.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +148,7 @@ impl Rollback {
             params: Vec::new(),
             returns: None,
             rollout: None,
+            rollout_key: None,
         }
     }
 }
@@ -200,10 +201,22 @@ pub async fn resolve(
                 })?;
             match op {
                 RolloutOp::To(pct, by) => {
-                    stage = Some(RolloutSpec {
-                        pct,
-                        by: by.unwrap_or(ro.by),
-                    });
+                    let by = match (by, ro.by) {
+                        // `BY KEY` keeps the parameter the deploy named.
+                        (Some(RolloutBy::Key(None)), k @ RolloutBy::Key(Some(_))) | (None, k) => k,
+                        (Some(RolloutBy::Key(None)), _) => {
+                            return Err(SprigError::new(
+                                SprigCode::LogicSyntax,
+                                format!(
+                                    "{}'s rollout isn't by key: deploy the candidate WITH \
+                                     (SPRIG_ROLLOUT = n, SPRIG_ROLLOUT_BY = 'key:<parameter>')",
+                                    r.name
+                                ),
+                            ));
+                        }
+                        (Some(b), _) => b,
+                    };
+                    stage = Some(RolloutSpec { pct, by });
                     Some(ro.candidate_version)
                 }
                 RolloutOp::Promote => Some(ro.candidate_version),
@@ -286,6 +299,7 @@ pub async fn resolve(
         params,
         returns: sig["returns"].as_str().map(str::to_owned),
         rollout: stage,
+        rollout_key: None,
     };
     Ok((d, target.version))
 }

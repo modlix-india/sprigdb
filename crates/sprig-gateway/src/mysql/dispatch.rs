@@ -575,10 +575,32 @@ impl CommandLoop {
             End::Killed => {
                 handle.flags().take_kill_query();
                 self.exec.abandoned(&mut cx, Abandon::Killed).await;
-                if !silent {
-                    sink.error(&interrupted()).await?;
+                // A killed `COMMIT` whose distributed commit was finished
+                // answers how it ended; 1317 only while that is unknown.
+                match self.exec.take_cut_commit() {
+                    Some(Ok(())) => {
+                        self.status
+                            .remove(StatusFlags::IN_TRANS | StatusFlags::IN_TRANS_READONLY);
+                        if !silent {
+                            sink.ok(OkPacket::new(self.status)).await?;
+                        }
+                        Ran::Done(ExecSummary::default())
+                    }
+                    Some(Err(e)) => {
+                        self.status
+                            .remove(StatusFlags::IN_TRANS | StatusFlags::IN_TRANS_READONLY);
+                        if !silent {
+                            sink.error(&e).await?;
+                        }
+                        Ran::Failed
+                    }
+                    None => {
+                        if !silent {
+                            sink.error(&interrupted()).await?;
+                        }
+                        Ran::Failed
+                    }
                 }
-                Ran::Failed
             }
             End::Gone => {
                 self.exec.abandoned(&mut cx, Abandon::ClientGone).await;
@@ -817,6 +839,10 @@ impl CommandLoop {
             principal,
             persona,
         });
+        // SPRIG_CLAIM() and token roles: the claims of the issuer's token
+        // the login used, here or in the DC it was handed to.
+        self.exec
+            .set_claims(login.token().map(|t| std::sync::Arc::clone(&t.claims)));
         self.session.set_state(SessionState::Ready);
         self.session.end_command();
         if let Some(db) = cu

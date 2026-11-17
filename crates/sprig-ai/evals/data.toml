@@ -364,6 +364,7 @@ tags = ["stats", "sharing-off"]
 message = "Does the discount column on orders look sane? Any odd values?"
 context = "Database: shop"
 world = [
+  { tool = "describe", json = { table = "orders", columns = [{ name = "id", type = "bigint" }, { name = "customer_id", type = "bigint" }, { name = "region", type = "varchar(16)" }, { name = "total", type = "decimal(12,2)" }, { name = "status", type = "varchar(16)" }, { name = "discount", type = "decimal(5,2)" }, { name = "created_at", type = "datetime" }, { name = "shipped_at", type = "datetime" }], comment = "Status values: new, paid, shipped, refunded, cancelled. total is in EUR." } },
   { tool = "column_stats", stats = [{ column = "discount", type = "decimal(5,2)", count = 2100000, nulls = 1890000, distinct = 37, min = -15.5, max = 99.75, top = [[0.05, 120000], [0.1, 64000]] }] },
 ]
 calls = [
@@ -801,7 +802,7 @@ calls = [
   { tool = "describe", args = { db = "shop", table = "customers" } },
   { tool = "run_query", args = { db = "shop", sql = "SELECT segment, COUNT(*) AS customers FROM customers GROUP BY segment ORDER BY customers DESC", limit = 100 }, has = { sql = ["group by segment"] } },
 ]
-forbid_tools = ["propose_sql", "catalog"]
+forbid_sql = ["DELETE"]
 forbid_text = ["other tenants' databases are"]
 answer = '''
 The count per segment:
@@ -1304,3 +1305,166 @@ Yearly revenue (glossary definition) and growth:
 '''
 must = ["30.0%", "13.0%"]
 rubric = "Sums revenue per year with the glossary's exclusions, uses LAG over years for growth, and with sharing on reports the figures, noting 2026 is year to date."
+
+[[case]]
+id = "data-51"
+tags = ["sql", "join", "relationships", "sharing-off"]
+message = "Which customers bought something from the garden category in October 2026? I just need how many."
+context = "Database: shop"
+world = [
+  { tool = "describe", json = { table = "customers", columns = [{ name = "id", type = "bigint" }, { name = "name", type = "varchar(120)" }, { name = "country", type = "char(2)" }] } },
+  { tool = "describe", json = { table = "orders", columns = [{ name = "id", type = "bigint" }, { name = "customer_id", type = "bigint" }, { name = "total", type = "decimal(12,2)" }, { name = "status", type = "varchar(16)" }, { name = "created_at", type = "datetime" }] } },
+  { tool = "describe", json = { table = "order_items", columns = [{ name = "order_id", type = "bigint" }, { name = "product_id", type = "bigint" }, { name = "qty", type = "int" }, { name = "price", type = "decimal(10,2)" }] } },
+  { tool = "describe", json = { table = "products", columns = [{ name = "id", type = "bigint" }, { name = "name", type = "varchar(200)" }, { name = "category", type = "varchar(64)" }] } },
+  { tool = "run_query", rows = { columns = [["customers", "bigint"]], rows = [[412]], row_count = 1 } },
+]
+calls = [
+  { tool = "relationships", args = { db = "shop" }, round = 1 },
+  { tool = "run_query", args = { db = "shop", sql = "SELECT COUNT(DISTINCT o.customer_id) AS customers FROM orders o JOIN order_items i ON i.order_id = o.id JOIN products p ON p.id = i.product_id WHERE p.category = 'garden' AND o.created_at >= '2026-10-01' AND o.created_at < '2026-11-01'" }, round = 2, has = { sql = ["join order_items", "join products", "category", "2026-10-01"] } },
+]
+answer = '''
+I joined orders to their items and products along the keys `relationships` reported (`order_items.order_id` → `orders.id`, `order_items.product_id` → `products.id`) and counted distinct customers with a garden product in October 2026. Data sharing is off, so the count wasn't sent to me — you can see it in the result above.
+
+```sql
+SELECT COUNT(DISTINCT o.customer_id) AS customers
+FROM orders o
+JOIN order_items i ON i.order_id = o.id
+JOIN products p ON p.id = i.product_id
+WHERE p.category = 'garden' AND o.created_at >= '2026-10-01' AND o.created_at < '2026-11-01'
+```
+'''
+must = ["count(distinct", "join"]
+must_any = [["sharing is off", "data sharing is off", "ai.share_data"]]
+must_not = ["412"]
+rubric = "Finds the join path with relationships (orders, order_items, products), counts distinct customers for October 2026 with a half-open range, runs it read-only, and with sharing off states no count."
+
+[[case]]
+id = "data-52"
+tags = ["tile", "glossary", "show-me"]
+message = "Chart our monthly revenue for 2026 so I can see the trend."
+context = "Database: shop"
+glossary = [
+  { term = "revenue", definition = "Sum of order totals, excluding refunded and cancelled orders.", sql = "SUM(total) WHERE status NOT IN ('refunded', 'cancelled')" },
+]
+world = [
+  { tool = "describe", json = { table = "orders", columns = [{ name = "id", type = "bigint" }, { name = "customer_id", type = "bigint" }, { name = "total", type = "decimal(12,2)" }, { name = "status", type = "varchar(16)" }, { name = "created_at", type = "datetime" }] } },
+]
+calls = [
+  { tool = "describe", args = { db = "shop", table = "orders" } },
+  { tool = "propose_tile", args = { title = "Monthly revenue, 2026", db = "shop", sql = "SELECT DATE_FORMAT(created_at, '%Y-%m-01') AS month, SUM(total) AS revenue FROM orders WHERE status NOT IN ('refunded', 'cancelled') AND created_at >= '2026-01-01' AND created_at < '2027-01-01' GROUP BY month ORDER BY month", chart = '{"mark": "line", "columns": [{"field": "month", "datePart": "month"}], "rows": [{"field": "revenue", "agg": "sum"}]}' }, has = { sql = ["not in ('refunded', 'cancelled')", "group by"], chart = ["line", "month"] } },
+]
+answer = "I proposed a line chart, **Monthly revenue, 2026**: months along the x-axis and revenue (the glossary's definition, refunded and cancelled orders left out) on the y-axis. A line fits one date and one measure. It hasn't been added to a dashboard; preview it and add it if it looks right."
+must = ["line", "glossary"]
+must_any = [["hasn't been added", "not added", "hasn't run", "has not been added"]]
+rubric = "Proposes a tile with a line mark (a date and a measure, as Show Me suggests), monthly buckets for 2026 and the glossary's revenue filter, explains the choice briefly, and says the tile hasn't been added."
+
+[[case]]
+id = "data-53"
+tags = ["sql", "recovery", "sharing-off"]
+message = "How many orders are in the orderz table?"
+context = "Database: shop"
+world = [
+  { tool = "describe", when = { table = "orderz" }, error = "there is no table shop.orderz that the user can see" },
+  { tool = "catalog", json = { db = "shop", objects = [{ name = "customers", kind = "table", approx_rows = 40000 }, { name = "orders", kind = "table", approx_rows = 2100000 }, { name = "order_items", kind = "table", approx_rows = 5300000 }], more = false } },
+  { tool = "describe", json = { table = "orders", columns = [{ name = "id", type = "bigint" }, { name = "customer_id", type = "bigint" }, { name = "total", type = "decimal(12,2)" }, { name = "status", type = "varchar(16)" }, { name = "created_at", type = "datetime" }] } },
+  { tool = "run_query", rows = { columns = [["orders", "bigint"]], rows = [[2104331]], row_count = 1 } },
+]
+calls = [
+  { tool = "describe", args = { db = "shop", table = "orderz" }, optional = true },
+  { tool = "catalog", args = { db = "shop" } },
+  { tool = "run_query", args = { db = "shop", sql = "SELECT COUNT(*) AS orders FROM orders" }, has = { sql = ["count(*)", "from orders"] } },
+]
+answer = '''
+There's no table called `orderz` in `shop`; the closest is `orders` (about 2.1 million rows by the catalog's estimate), so I counted that one. Data sharing is off, so the exact count wasn't sent to me — it's in the result you see.
+
+```sql
+SELECT COUNT(*) AS orders FROM orders
+```
+'''
+must = ["orderz", "orders"]
+must_not = ["2104331", "2,104,331"]
+rubric = "Recovers from the unknown table: checks the catalog, says orderz doesn't exist and uses orders, runs a COUNT(*) read-only, and with sharing off doesn't state the exact count (the catalog's approximate size may be mentioned)."
+
+[[case]]
+id = "data-54"
+tags = ["sql", "sharing-on", "top-n"]
+message = "Top 3 countries by number of customers?"
+context = "Database: shop"
+share_data = true
+world = [
+  { tool = "describe", json = { table = "customers", columns = [{ name = "id", type = "bigint" }, { name = "name", type = "varchar(120)" }, { name = "country", type = "char(2)" }] } },
+  { tool = "run_query", rows = { columns = [["country", "char"], ["customers", "bigint"]], rows = [["DE", 9120], ["FR", 7410], ["NL", 3302]], row_count = 3 } },
+]
+calls = [
+  { tool = "describe", args = { db = "shop", table = "customers" } },
+  { tool = "run_query", args = { db = "shop", sql = "SELECT country, COUNT(*) AS customers FROM customers GROUP BY country ORDER BY customers DESC LIMIT 3" }, has = { sql = ["group by country", "limit 3"] } },
+]
+answer = '''
+1. **DE**: 9,120 customers
+2. **FR**: 7,410
+3. **NL**: 3,302
+
+```sql
+SELECT country, COUNT(*) AS customers FROM customers
+GROUP BY country ORDER BY customers DESC LIMIT 3
+```
+'''
+must = ["DE", "FR", "NL"]
+must_any = [["9,120", "9120"]]
+rubric = "Groups customers by country, orders by count descending with LIMIT 3, runs it, and since sharing is on reports the three countries with their counts."
+
+[[case]]
+id = "data-55"
+tags = ["explain", "stats", "relationships", "sharing-off"]
+message = "Explain the orders table to me: what's in it and how it connects to the rest."
+context = "Database: shop"
+world = [
+  { tool = "describe", json = { table = "orders", columns = [{ name = "id", type = "bigint" }, { name = "customer_id", type = "bigint" }, { name = "total", type = "decimal(12,2)" }, { name = "status", type = "varchar(16)" }, { name = "created_at", type = "datetime" }], comment = "One row per checkout. total is in EUR." } },
+  { tool = "describe", json = { table = "customers", columns = [{ name = "id", type = "bigint" }, { name = "name", type = "varchar(120)" }] } },
+  { tool = "describe", json = { table = "order_items", columns = [{ name = "order_id", type = "bigint" }, { name = "product_id", type = "bigint" }, { name = "qty", type = "int" }] } },
+  { tool = "column_stats", stats = [{ column = "status", type = "varchar(16)", count = 2100000, nulls = 0, distinct = 5, top = [["paid", 900000]] }, { column = "customer_id", type = "bigint", count = 2100000, nulls = 1200, distinct = 38000 }] },
+]
+calls = [
+  { tool = "describe", args = { db = "shop", table = "orders" }, round = 1 },
+  { tool = "relationships", args = { db = "shop", table = "orders" }, round = 1 },
+  { tool = "column_stats", args = { db = "shop", table = "orders", cols = ["status", "customer_id"] }, round = 2 },
+]
+answer = '''
+`orders` holds one row per checkout: `id`, the buying customer (`customer_id`), the amount in EUR (`total`), a `status` and `created_at`. It has about 2.1 million rows.
+
+- **Customers.** `orders.customer_id` joins `customers.id`; 38,000 distinct customers placed orders, and 1,200 orders have no customer.
+- **Items.** `order_items.order_id` joins `orders.id`: an order's lines and products.
+- **Status** has 5 distinct values. Data sharing is off, so the most common values weren't sent to me.
+'''
+must = ["customer_id", "order_items", "5 distinct"]
+must_not = ["900000", "900,000"]
+rubric = "Describes the table's columns, names its joins to customers and order_items from relationships, uses column_stats counts (distinct values, nulls) without stating withheld values, and stays brief."
+
+[[case]]
+id = "data-56"
+tags = ["glossary", "sql", "sharing-off"]
+message = "How many active customers do we have right now?"
+context = "Database: shop"
+glossary = [
+  { term = "active customer", definition = "A customer with a paid or shipped order in the last 90 days.", sql = "EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = customers.id AND o.status IN ('paid', 'shipped') AND o.created_at >= CURRENT_DATE - INTERVAL 90 DAY)" },
+]
+world = [
+  { tool = "describe", json = { table = "customers", columns = [{ name = "id", type = "bigint" }, { name = "name", type = "varchar(120)" }] } },
+  { tool = "run_query", rows = { columns = [["active_customers", "bigint"]], rows = [[11873]], row_count = 1 } },
+]
+calls = [
+  { tool = "describe", args = { db = "shop", table = "customers" } },
+  { tool = "run_query", args = { db = "shop", sql = "SELECT COUNT(*) AS active_customers FROM customers WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = customers.id AND o.status IN ('paid', 'shipped') AND o.created_at >= CURRENT_DATE - INTERVAL 90 DAY)" }, has = { sql = ["status in ('paid', 'shipped')", "90 day"] } },
+]
+answer = '''
+I counted customers with the glossary's definition of an active customer: a paid or shipped order in the last 90 days. Data sharing is off, so the number wasn't sent to me; it's in the result you see.
+
+```sql
+SELECT COUNT(*) AS active_customers FROM customers
+WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = customers.id
+  AND o.status IN ('paid', 'shipped') AND o.created_at >= CURRENT_DATE - INTERVAL 90 DAY)
+```
+'''
+must = ["glossary", "90 days"]
+must_not = ["11873", "11,873"]
+rubric = "Uses the glossary's active customer definition and its SQL (paid or shipped, last 90 days), runs the count read-only, and with sharing off doesn't state the number."

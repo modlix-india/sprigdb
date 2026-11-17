@@ -73,6 +73,7 @@ pub(super) use self::binary::param_lit;
 pub(super) use self::fk_ddl::FkDdl;
 pub(crate) use self::layout::ShardingExtension;
 pub(super) use self::lookup_ddl::LookupDdl;
+pub(crate) use self::txn::RelayAdmin;
 
 /// The longest a statement waits for a mover's hold.
 const MAX_HOLD_WAIT: Duration = Duration::from_secs(10);
@@ -135,6 +136,9 @@ pub(crate) struct Configs {
     generation: u64,
     pub(crate) router: sprig_router::RouterConfig,
     txn: TxnConfig,
+    /// Sprig 2PC through the agents' relays (`txn.non_xa_policy =
+    /// sprig_2pc` and `txn.sprig_2pc_path = relay`).
+    relay: bool,
 }
 
 static SERVICES: OnceLock<Services> = OnceLock::new();
@@ -237,8 +241,15 @@ pub(crate) struct RouterState {
     sql_ps: HashMap<String, sql_prepare::Held>,
     /// The texts of SQL-level prepared statements MariaDB holds (tenants
     /// without shards), by folded name: an `EXECUTE` is checked against
-    /// the session's row-level security of the moment (S163).
+    /// the session's row-level security of the moment.
     sql_texts: HashMap<String, bytes::Bytes>,
+    /// A client's `COMMIT` statement is running on the coordinator; still
+    /// set when `KILL QUERY` dropped it.
+    commit_running: bool,
+    /// How a client's `COMMIT` that `KILL QUERY` cut short ended, once
+    /// finished: the front end answers it in place of 1317
+    /// ([`Self::take_cut_commit`]).
+    cut_commit: Option<sprig_txn::Interrupted>,
 }
 
 impl std::fmt::Debug for RouterState {
@@ -278,12 +289,33 @@ impl RouterState {
                 bs.abandon(drain).await;
             }
         }
+        // A `COMMIT` cut short goes on from where it stopped: a rollback
+        // after its commit point would leave it half applied.
+        let commit = std::mem::take(&mut self.commit_running);
+        if let Some(c) = self.coord.as_mut()
+            && c.interrupted()
+        {
+            let ended = Box::pin(c.finish_interrupted()).await;
+            // A client's `COMMIT` answers how it ended.
+            self.cut_commit = commit.then_some(ended);
+        }
     }
 
-    /// Ends the session's router state: an open transaction rolls back.
+    /// How the client's `COMMIT` that [`Self::abandon_in_flight`] just
+    /// finished ended: `Some(Ok)` committed, `Some(Err)` rolled back
+    /// (39443). `None` when no `COMMIT` was cut or its outcome is still
+    /// unknown after `txn.commit_resolve_timeout_ms`: the front end
+    /// answers 1317.
+    pub(crate) fn take_cut_commit(&mut self) -> Option<Result<()>> {
+        self.cut_commit.take()?.commit_answer()
+    }
+
+    /// Ends the session's router state: a commit cut short is finished,
+    /// an open transaction rolls back, and phase 2 stragglers are waited
+    /// for.
     pub(crate) async fn close(&mut self) {
         if let Some(c) = self.coord.as_mut() {
-            let _ = c.rollback().await;
+            Box::pin(c.close()).await;
         }
         for (_, mut bs) in self.others.drain() {
             bs.close().await;
@@ -590,6 +622,7 @@ impl PassSession {
 
     /// The coordinator, made for the session's first sharded statement,
     /// with the clusters' capabilities and the session's state current.
+    #[allow(clippy::too_many_lines)] // one set-up, step by step
     async fn ensure_coord(&mut self, cx: &ExecCtx<'_>, layout: &TenantLayout) {
         let _ = self.bs(cx);
         let (Some(ts), Some(bs)) = (self.tenant.as_deref(), self.bs.as_ref()) else {
@@ -616,8 +649,10 @@ impl PassSession {
                 admin: Arc::clone(&rs.admin),
                 svc: Arc::clone(&svc),
                 cat: Mutex::new(None),
+                relay: Arc::new(Mutex::new(None)),
+                relayed: Arc::new(Mutex::new(HashMap::new())),
             });
-            let txn = TxnCoordinator::new(
+            let mut txn = TxnCoordinator::new(
                 Arc::clone(&f),
                 Arc::clone(&rs.dtids),
                 ts.tenant,
@@ -626,8 +661,12 @@ impl PassSession {
                     ..TxnConfig::default()
                 },
             );
-            // `lookup.lock_wait_seconds`: Pre sessions' lock wait, at the
-            // tenant's value when the session's coordinator is made.
+            if let Some(h) = txn::pause_hooks() {
+                txn.set_hooks(h);
+            }
+            // `lookup.lock_wait_seconds`: Pre sessions' lock wait, the
+            // tenant's value until each claim sets its owner table's
+            // (`GwBackend::lookup_claim`).
             let lock_wait = crate::tenant::lookups_sql::settings(&svc, ts.tenant).lock_wait_seconds;
             self.router.coord = Some(DistTxn::new(
                 txn,
@@ -649,6 +688,7 @@ impl PassSession {
             return;
         };
         *f.vars.lock().unwrap_or_else(PoisonError::into_inner) = bs.vars().clone();
+        *f.relay.lock().unwrap_or_else(PoisonError::into_inner) = bs.relay();
         *f.cat.lock().unwrap_or_else(PoisonError::into_inner) = ts.catalog().cloned();
         let missing: Vec<ClusterId> = {
             let caps = f.caps.lock().unwrap_or_else(PoisonError::into_inner);
@@ -727,13 +767,28 @@ impl PassSession {
             |k, cx| svc.settings.get(k, cx, Some(&cat.settings)).into_owned(),
             &rs.coordinator_id,
         );
+        let relay = txn.policy == sprig_txn::NonXaPolicy::Sprig2pc
+            && sprig_txn::settings::relay_path(&svc.settings.get(
+                &sprig_txn::settings::SPRIG_2PC_PATH,
+                &ctx,
+                Some(&cat.settings),
+            ));
         self.router.cfg = Some(Configs {
             version: cat.version,
             generation,
             router,
             txn,
+            relay,
         });
         router
+    }
+
+    /// The tenant whose backend connections go through the agents' relays
+    /// (Sprig 2PC's relay path), resolved with the router's settings.
+    pub(crate) fn relay_tenant(&mut self) -> Option<sprig_common::ids::TenantId> {
+        let tenant = self.tenant.as_deref()?.tenant;
+        self.router_cfg();
+        self.router.cfg.as_ref()?.relay.then_some(tenant)
     }
 
     /// The shard reference of the session's default schema (unsharded
@@ -826,7 +881,9 @@ impl PassSession {
                         .ok_or_else(|| SprigError::internal("no router factory"))?;
                     let cat = f.cat.lock().unwrap_or_else(PoisonError::into_inner).clone();
                     ensure_accounts(&f.svc, cat.as_ref(), c).await?;
-                    let bs = session_on(&f.backends, &f.target, &f.opts, &f.main, c, main.vars());
+                    let mut bs =
+                        session_on(&f.backends, &f.target, &f.opts, &f.main, c, main.vars());
+                    bs.set_relay(f.relay_now());
                     self.router.others.insert(c.clone(), bs);
                 }
                 let o = self
@@ -1065,7 +1122,12 @@ impl PassSession {
                 res
             }
             (Some(crate::backend::Effect::Commit), _) => {
+                // Left set if `KILL QUERY` drops the commit (see
+                // `abandon_in_flight`).
+                self.router.commit_running = true;
+                self.router.cut_commit = None;
                 let r = coord.commit().await.map(|_| ());
+                self.router.commit_running = false;
                 if let Err(e) = &r
                     && e.code() == Some(SprigCode::CommitOutcomeUnknown)
                 {
@@ -1150,7 +1212,8 @@ impl PassSession {
         if let Some(e) = self.moved_under(&layout, &text).await {
             return self.fail(out, &e).await;
         }
-        if let Some(step) = self.txn_control(cx, &text, more, out).await? {
+        // Boxed: the coordinator's commit is a large future.
+        if let Some(step) = Box::pin(self.txn_control(cx, &text, more, out)).await? {
             return Ok(step);
         }
         // Statements that end a coordinator transaction first: `SET
@@ -1228,7 +1291,7 @@ impl PassSession {
         {
             return Box::pin(self.load_data(cx, ld, more, mapper, map, out)).await;
         }
-        // Workload capture (chapter 17): the statement with the shards it
+        // Workload capture: the statement with the shards it
         // visited, so the advisor sees reads that scatter.
         let mut wl_pending = self.wl_start(original);
         loop {

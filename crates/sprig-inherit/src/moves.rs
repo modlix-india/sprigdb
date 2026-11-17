@@ -1,12 +1,12 @@
-//! Moving a tenant subtree while shares reach it (chapter 42, "Tenants
-//! are spaces": moves). A tenant's root space receives shares only from
-//! its parent tenant, so a move is refused with 39361 while the moved
-//! root receives a share from a parent that would stop being its
-//! ancestor; the administrator drops those shares first. Shares inside the
+//! Moving a tenant subtree while shares reach it. A tenant's root space
+//! receives shares only from its parent tenant, so a move is refused with 39361
+//! while the moved root receives a share from a parent that would stop being
+//! its ancestor; the administrator drops those shares first. Shares inside the
 //! moved subtree are unaffected.
 //!
-//! Chapter 23's `MoveTenantTree` is not built yet; it calls [`check`]
-//! before its step 2, with the snapshots it already reads.
+//! The control plane's `MoveTenantTree` is not built yet; it is to call
+//! [`check`] before it records the move, with the snapshots it already
+//! reads.
 
 use sprig_catalog::TenantCatalog;
 use sprig_common::ids::TenantId;

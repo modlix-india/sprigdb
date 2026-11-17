@@ -830,6 +830,10 @@ impl SessionExec for LimitedSession {
         self.inner.abandoned(cx, why).await;
     }
 
+    fn take_cut_commit(&mut self) -> Option<Result<()>> {
+        self.inner.take_cut_commit()
+    }
+
     async fn close(&mut self) {
         self.inner.close().await;
     }

@@ -108,6 +108,8 @@ struct ClusterState {
     probing_since: Option<Instant>,
     last_pass: Option<Instant>,
     heartbeat: Option<(sprig_common::ids::NodeId, HeartbeatWriter)>,
+    /// When the change feed's time index was last written here.
+    time_marked: Option<Instant>,
     /// The `sprig_ctl` reference `sprig_gw` was last made sure of with,
     /// when, and whether that worked.
     gw_checked: Option<(String, Instant, bool)>,
@@ -438,8 +440,11 @@ impl ClusterMonitor {
                 )),
             }
         }
-        if rec.topology != TopologyKind::Galera {
+        if rec.topology == TopologyKind::Galera {
+            time_mark(&mut st, &eps, settings.probe_timeout, true).await;
+        } else {
             beat(&mut st, &eps, settings.probe_timeout).await;
+            time_mark(&mut st, &eps, settings.probe_timeout, false).await;
         }
         let started = Instant::now();
         let mut probes = Prober::with_clock(settings.probe_timeout, Arc::clone(&self.clock))
@@ -724,6 +729,54 @@ async fn beat(st: &mut ClusterState, eps: &[NodeEndpoint], timeout: Duration) {
     if let Err(e) = r {
         tracing::debug!(node = %writer, error = %e, "heartbeat failed");
         st.heartbeat = None;
+    }
+}
+
+/// Writes the change feed's time index on the cluster's writable node
+/// (`sprig_cluster::sys::feed_time_mark`), at most once per step: a
+/// change stream that starts at a time reads from the position written
+/// before it. On a Galera cluster (`galera`): a synced node, and only
+/// with `wsrep_gtid_mode` on, keeping the cluster's own GTID domain (the
+/// same positions on every node); without it, positions are a node's own
+/// and the cluster gets no index.
+async fn time_mark(st: &mut ClusterState, eps: &[NodeEndpoint], timeout: Duration, galera: bool) {
+    let step = Duration::from_secs(sprig_cluster::sys::FEED_TIME_STEP_SECONDS);
+    if st.time_marked.is_some_and(|t| t.elapsed() < step) {
+        return;
+    }
+    let Some((writer, domain)) = st.last_probes.iter().find_map(|p| {
+        let f = p.facts()?;
+        if f.is_replica() || !f.writable() {
+            return None;
+        }
+        if !galera {
+            return Some((p.node.clone(), None));
+        }
+        let g = f.galera.as_ref()?;
+        let synced = g.ready
+            && g.local_state == sprig_cluster::probe::GaleraLocalState::Synced
+            && g.cluster_status == "Primary";
+        match (synced && g.gtid_mode, g.gtid_domain_id) {
+            (true, Some(d)) => Some((p.node.clone(), Some(d))),
+            _ => None,
+        }
+    }) else {
+        return;
+    };
+    let Some(ep) = eps.iter().find(|e| e.node == writer) else {
+        return;
+    };
+    let r = match ProbeSession::connect(ep, timeout).await {
+        Ok(mut s) => {
+            let r = sprig_cluster::sys::feed_time_mark(&mut s, domain).await;
+            s.close().await;
+            r
+        }
+        Err(e) => Err(e),
+    };
+    match r {
+        Ok(()) => st.time_marked = Some(Instant::now()),
+        Err(e) => tracing::debug!(node = %writer, error = %e, "feed time index not written"),
     }
 }
 

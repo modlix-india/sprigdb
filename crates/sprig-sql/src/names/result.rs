@@ -19,7 +19,12 @@
 //!
 //! Rows stream one by one, except `SHOW INDEX`, which holds the rows of
 //! one index (consecutive in MariaDB's output) until it knows whether any
-//! of its columns is hidden.
+//! of its columns is hidden. On 3306 it holds the whole table's indexes:
+//! one still named after a functional key part's hidden column (a table
+//! made before unnamed functional indexes got MySQL's names) shows
+//! MySQL's name, `functional_index` or the first free
+//! `functional_index_<n>` in key order, as `SHOW CREATE TABLE` shows it,
+//! so every name of the table must be known first.
 
 use bytes::Bytes;
 use sprig_proto_mysql::ColumnDef;
@@ -151,6 +156,9 @@ pub struct ResultMapper {
     /// in MySQL's names ([`crate::compat::sqlmode::stored_program_view`]).
     sql_mode_cols: Vec<usize>,
     group: Vec<TextRow>,
+    /// 3306 `SHOW INDEX`: the visible indexes of the current table, held
+    /// until the table ends (module docs).
+    table: Vec<Vec<TextRow>>,
     foreign: u64,
     hidden: u64,
 }
@@ -165,6 +173,7 @@ impl ResultMapper {
             fixed: None,
             sql_mode_cols: Vec::new(),
             group: Vec::new(),
+            table: Vec::new(),
             foreign: 0,
             hidden: 0,
         }
@@ -311,6 +320,7 @@ impl ResultMapper {
         if !self.group.is_empty() {
             self.flush_index(ctx, out);
         }
+        self.flush_table(out);
     }
 
     /// [`ResultMapper::row`] on a text-row packet: decodes it, maps it and
@@ -418,9 +428,52 @@ impl ResultMapper {
             self.hidden += group.len() as u64;
             return;
         }
-        for r in group {
-            let r = self.scrub_row(r, ctx);
-            out.push(r);
+        let rows: Vec<TextRow> = group.into_iter().map(|r| self.scrub_row(r, ctx)).collect();
+        if self.persona != Persona::MySql84 {
+            out.extend(rows);
+            return;
+        }
+        // 3306: an index of another table ends the held one.
+        let table_of = |r: &TextRow| self.role_value(r, Role::IndexTable);
+        if let (Some(held), Some(first)) = (self.table.first(), rows.first())
+            && held.first().map(table_of) != Some(table_of(first))
+        {
+            self.flush_table(out);
+        }
+        self.table.push(rows);
+    }
+
+    /// Pushes the held indexes of one table (3306), each one named after a
+    /// functional key part's hidden column renamed as MySQL names it: the
+    /// first of `functional_index`, `functional_index_2`, ... that the
+    /// table's other indexes don't use, in key order (module docs).
+    fn flush_table(&mut self, out: &mut Vec<TextRow>) {
+        let held = std::mem::take(&mut self.table);
+        if held.is_empty() {
+            return;
+        }
+        let Some(col) = self.roles.iter().position(|r| *r == Some(Role::IndexName)) else {
+            out.extend(held.into_iter().flatten());
+            return;
+        };
+        let name_of = |g: &Vec<TextRow>| {
+            g.first()
+                .and_then(|r| r.get(col).cloned().flatten())
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default()
+        };
+        let mut taken: Vec<String> = held.iter().map(name_of).collect();
+        for mut g in held {
+            let name = name_of(&g);
+            if crate::compat::fxindex::is_fx_column(&name) {
+                let shown = Bytes::from(crate::compat::fxindex::next_functional_name(&mut taken));
+                for r in &mut g {
+                    if let Some(cell) = r.get_mut(col) {
+                        *cell = Some(shown.clone());
+                    }
+                }
+            }
+            out.extend(g);
         }
     }
 
@@ -455,6 +508,9 @@ impl ResultMapper {
                 Role::CreateTable => {
                     // 3306: functional key parts as MySQL writes them,
                     // before their hidden columns are filtered.
+                    // Embedded columns' clauses, read from their hidden
+                    // columns before those are filtered.
+                    let s = crate::embedcol::show_create(&s);
                     let fx;
                     let src: &str = if self.persona == Persona::MySql84 {
                         fx = crate::compat::schema::mysql_functional_parts(&s);

@@ -35,6 +35,7 @@ use bytes::Bytes;
 use mysql_async::prelude::Queryable;
 use mysql_async::{Row, TxOpts};
 use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::{DatabaseRow, DbState, Namespace, ObjectKind, ObjectRow, ObjectState};
 use sprig_catalog::{CatalogLocator, Target, TenantCatalog};
 use sprig_common::ids::{DbId, GroupId, ObjectId, TenantId};
@@ -281,7 +282,7 @@ async fn pin(
     let svc = Arc::clone(ts.services());
     let ep = svc.locator.writer(ts.tenant).await?;
     let schema = ep.store.schema().to_owned();
-    let mut conn = ep.pool.get_conn().await.map_err(backend)?;
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(backend)?;
     sprig_shard::groups::migrate(&mut conn, &schema).await?;
     let mut tx = conn
         .start_transaction(TxOpts::default())
@@ -342,7 +343,7 @@ async fn unpin(
     need_alter(ts, &d, &o)?;
     let ep = ts.services().locator.writer(ts.tenant).await?;
     let schema = ep.store.schema().to_owned();
-    let mut conn = ep.pool.get_conn().await.map_err(backend)?;
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(backend)?;
     let mut tx = conn
         .start_transaction(TxOpts::default())
         .await
@@ -543,7 +544,7 @@ async fn show_advice(
     let columns = advice_columns(charset);
     let ep = ts.services().locator.writer(ts.tenant).await?;
     let schema = ep.store.schema().replace('`', "``");
-    let mut conn = ep.pool.get_conn().await.map_err(backend)?;
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(backend)?;
     let r: std::result::Result<Option<Row>, _> = conn
         .query_first(format!(
             "SELECT run_id, cause, mode, status, verdict, best_score, runner_up_score, \
@@ -626,7 +627,7 @@ async fn show_pins(
 ) -> Result<PinAnswer> {
     let ep = ts.services().locator.writer(ts.tenant).await?;
     let schema = ep.store.schema().to_owned();
-    let mut conn = ep.pool.get_conn().await.map_err(backend)?;
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(backend)?;
     let pins = PinStore.rows(&mut conn, &schema, false).await?;
     let mut rows = Vec::new();
     for r in pins {

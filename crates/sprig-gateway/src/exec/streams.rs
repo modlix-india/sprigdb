@@ -23,6 +23,7 @@ use bytes::Bytes;
 use mysql_async::prelude::Queryable;
 use sprig_auth::authz::{Action, Target};
 use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::{Namespace, ObjectKind, ObjectState, SettingRow, SettingScope};
 use sprig_catalog::version::VersionKind;
 use sprig_catalog::{CatalogLocator, TenantCatalog};
@@ -88,7 +89,9 @@ impl GwHost<'_> {
     async fn ctl(&self, cluster: &ClusterId) -> Result<mysql_async::Conn> {
         let ts = self.ts().ok_or_else(|| SprigError::internal("no tenant"))?;
         let pool = ts.services().locator.ctl_pool(cluster).await?;
-        pool.get_conn().await.map_err(sprig_streams::maria::map_err)
+        pool.get_conn_bounded()
+            .await
+            .map_err(sprig_streams::maria::map_err)
     }
 }
 
@@ -256,6 +259,22 @@ impl Host for GwHost<'_> {
         }
     }
 
+    fn stream_max_bytes(&self, def: &StreamDef) -> u64 {
+        use sprig_streams::settings as s;
+        let Some(ts) = self.ts() else {
+            return s::MAX_MESSAGE_BYTES.default;
+        };
+        let svc = ts.services();
+        // The stream's own scope (`ALTER STREAM ... SET`), then its
+        // database's and up, as Kafka's produce reads it.
+        let ctx = self
+            .cat
+            .object_ctx(&svc.dc, ObjectId(def.id.0))
+            .with_db(def.db);
+        svc.settings
+            .get(&s::MAX_MESSAGE_BYTES, &ctx, Some(&self.cat.settings))
+    }
+
     fn change_topic_on(&self, _db: DbId, object: ObjectId) -> bool {
         let Some(ts) = self.ts() else {
             return false;
@@ -297,7 +316,7 @@ impl Host for GwHost<'_> {
     async fn next_id(&mut self) -> Result<u64> {
         let ts = self.ts().ok_or_else(|| SprigError::internal("no tenant"))?;
         let ep = ts.services().locator.writer(self.cat.tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(|e| {
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
         Ok(ep.store.next_object_id(&mut conn).await?.0)
@@ -316,7 +335,7 @@ impl Host for GwHost<'_> {
         };
         if !self.migrated {
             let ep = svc.locator.writer(tenant).await?;
-            let mut conn = ep.pool.get_conn().await.map_err(|e| {
+            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
                 SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
             })?;
             sprig_streams::store::migrate(&mut conn, ep.store.schema()).await?;
@@ -439,6 +458,29 @@ impl Host for GwHost<'_> {
     }
 }
 
+/// A bound value of a prepared publish as a literal: text as
+/// `_utf8mb4 X'..'` (the engine tier's form), other bytes as `X'..'`, so
+/// no `sql_mode` changes them and the stream layer measures them exactly.
+/// Numbers, times and `NULL` as for a prepared search.
+pub(super) fn param_literal(p: &sprig_proto_mysql::command::BoundParam) -> String {
+    use sprig_proto_mysql::Value;
+    use sprig_proto_mysql::command::ParamValue;
+    use std::fmt::Write as _;
+    let ParamValue::Value(Value::Bytes(b)) = &p.value else {
+        return super::search::param_literal(p);
+    };
+    let mut h = String::with_capacity(b.len() * 2 + 12);
+    if std::str::from_utf8(b).is_ok() {
+        h.push_str("_utf8mb4 ");
+    }
+    h.push_str("X'");
+    for x in b {
+        let _ = write!(h, "{x:02X}");
+    }
+    h.push('\'');
+    h
+}
+
 /// The tenant's streams at `cat`.
 fn state_of(cat: &TenantCatalog) -> (StreamsState, bool) {
     match cat.ext.get::<StreamsState>(MODULE) {
@@ -531,6 +573,22 @@ impl PassSession {
                 super::types::send_rows(out, &rows, format, status).await?;
                 Ok(Some(step))
             }
+            Ok(Handled::Publish(p)) => {
+                let r = Box::pin(self.publish_rows(cx, &p, &lex)).await;
+                let status = self.streams_status(more);
+                match r {
+                    Ok(affected) => {
+                        let mut ok = OkPacket::new(status);
+                        ok.affected_rows = affected;
+                        out.ok(ok).await?;
+                        Ok(Some(Step {
+                            errored: false,
+                            status: Some(status),
+                        }))
+                    }
+                    Err(e) => Ok(Some(self.fail(out, &e).await?)),
+                }
+            }
             Ok(Handled::Forward { sql, compact, .. }) => {
                 if let Some(ts) = self.tenant.as_deref_mut() {
                     ts.types.internal = true;
@@ -548,6 +606,123 @@ impl PassSession {
                 r.map(Some)
             }
         }
+    }
+
+    /// A publish whose sizes the text doesn't tell: its rows evaluated in
+    /// this session under the user's rights, each record measured, then
+    /// written to the outbox as literals, in the session's transaction (one
+    /// of its own when the rows take more than one statement). The rows
+    /// affected.
+    async fn publish_rows(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        p: &sprig_streams::sql::PublishRows,
+        lex: &sprig_sql::lex::LexOptions,
+    ) -> Result<u64> {
+        let query = super::inherit_msg::rows_query(&p.source, lex)?;
+        let rows = self.run_checked(cx, &query, false).await?.rows;
+        let inserts = p.inserts(&rows)?;
+        let own = inserts.len() > 1 && !self.offsets_in_transaction();
+        if own {
+            self.run_checked(cx, "START TRANSACTION", true).await?;
+        }
+        let mut affected = 0;
+        for sql in &inserts {
+            match self.run_checked(cx, sql, true).await {
+                Ok(c) => affected += c.affected.unwrap_or(0),
+                Err(e) => {
+                    if own {
+                        let _ = self.run_checked(cx, "ROLLBACK", true).await;
+                    }
+                    if p.compact && e.message.contains("sprig_sc_needs_key") {
+                        return Err(SprigError::new(
+                            SprigCode::StreamCompactNeedsKey,
+                            "ER_SPRIG_STREAM_COMPACT_NEEDS_KEY: a record without a key on a compacted stream",
+                        ));
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        if own {
+            self.run_checked(cx, "COMMIT", true).await?;
+        }
+        Ok(affected)
+    }
+
+    /// Whether `sql` publishes into one of the tenant's streams (an
+    /// `INSERT` into a stream, which MariaDB itself can't prepare: the
+    /// stream is no table of its own). Never for the gateway's own
+    /// statements or a session that must change its password.
+    pub(super) fn stream_publish(&self, sql: &[u8]) -> bool {
+        let Some(ts) = self.tenant.as_deref() else {
+            return false;
+        };
+        if ts.types.internal || ts.principal.must_change_password {
+            return false;
+        }
+        let Some(cat) = ts.catalog().map(Arc::clone) else {
+            return false;
+        };
+        let (state, _) = state_of(&cat);
+        let Ok(text) = std::str::from_utf8(sql) else {
+            return false;
+        };
+        let lctn = ts.lower_case_table_names();
+        let current = self.current_logical();
+        let (lex, _) = self.lex_opts();
+        let ctx = Ctx {
+            state: &state,
+            lex,
+            lctn,
+            current: current.as_deref(),
+            mysql: false,
+        };
+        let db_id = |n: &str| cat.database(&database_key(n, lctn)).map(|d| d.db_id);
+        sprig_streams::sql::publishes(text, &ctx, &db_id)
+    }
+
+    /// `COM_STMT_PREPARE` of a publish into one of the tenant's streams:
+    /// kept as text and run at each execute with the bound values written
+    /// in as literals, so the stream layer measures every record as it
+    /// does for a text statement. `None` for any other statement.
+    pub(super) fn streams_prepare(
+        &mut self,
+        sql: &Bytes,
+        charset: u16,
+    ) -> Option<crate::pipeline::ExecSummary> {
+        if !self.stream_publish(sql) {
+            return None;
+        }
+        let (lex, _) = self.lex_opts();
+        let params = sprig_sql::lex::lex(sql, &lex)
+            .map(|t| {
+                t.iter()
+                    .filter(|t| t.kind == sprig_sql::lex::TokenKind::Param)
+                    .count()
+            })
+            .unwrap_or(0);
+        let n = u16::try_from(params).ok()?;
+        let mut st = super::stmt::Stmt::deferred(sql.clone(), Vec::new());
+        st.params = n;
+        st.deferred_params = true;
+        st.stream_params = true;
+        st.client = Some(sql.clone());
+        let stmt = self.stmts.insert(st);
+        metrics::gauge!("sprig_mysql_prepared_statements", "persona" => self.persona.as_str())
+            .increment(1.0);
+        Some(crate::pipeline::ExecSummary {
+            status: None,
+            prepared: Some(crate::pipeline::PreparedMeta {
+                stmt,
+                params: (0..n)
+                    .map(|_| crate::pipeline::text_column("?", charset))
+                    .collect(),
+                columns: Vec::new(),
+                warnings: 0,
+            }),
+            db: None,
+        })
     }
 
     /// After a successful `ALTER TABLE t SPRIG SET | RESET (...)` naming

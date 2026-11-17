@@ -400,6 +400,73 @@ impl StatsSnapshot {
     pub(crate) fn rows(&self) -> usize {
         self.tables.iter().map(|t| t.2.len()).sum()
     }
+
+    /// The snapshot as a journal entry, so it can be put back after the
+    /// controller stops ([`super::journal`]).
+    pub(crate) fn to_entry(
+        &self,
+        node: &str,
+        t: &IndexTarget,
+        columns: &[String],
+        index: &str,
+        taken_at_ms: u64,
+    ) -> super::journal::StatsEntry {
+        super::journal::StatsEntry {
+            node: node.to_owned(),
+            schema: t.schema.clone(),
+            table: t.table.clone(),
+            columns: columns.to_vec(),
+            index: index.to_owned(),
+            taken_at_ms,
+            stats: self
+                .tables
+                .iter()
+                .map(|(stat, names, rows, _)| super::journal::StatTable {
+                    table: (*stat).to_owned(),
+                    columns: names.clone(),
+                    rows: rows.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The snapshot a journal entry holds. The entry's statistics tables
+    /// must be the three this module reads, and every value hex digits:
+    /// the restore writes them into SQL text.
+    ///
+    /// # Errors
+    /// Why the entry can't be a snapshot.
+    pub(crate) fn from_entry(e: &super::journal::StatsEntry) -> Result<Self, String> {
+        let t = IndexTarget {
+            schema: e.schema.clone(),
+            table: e.table.clone(),
+            pk: Vec::new(),
+        };
+        let mut out = Self::default();
+        for st in &e.stats {
+            let Some(stat) = STAT_TABLES.iter().find(|s| **s == st.table) else {
+                return Err(format!("not a statistics table: {}", st.table));
+            };
+            for r in &st.rows {
+                if r.len() != st.columns.len() {
+                    return Err(format!("a row of mysql.{stat} has the wrong width"));
+                }
+                if r.iter()
+                    .flatten()
+                    .any(|h| !h.bytes().all(|b| b.is_ascii_hexdigit()))
+                {
+                    return Err(format!("a value of mysql.{stat} isn't hexadecimal"));
+                }
+            }
+            out.tables.push((
+                stat,
+                st.columns.clone(),
+                st.rows.clone(),
+                stats_where(stat, &t, &e.columns, &e.index),
+            ));
+        }
+        Ok(out)
+    }
 }
 
 /// A GTID position as `domain → (server_id, seq)`.

@@ -1,6 +1,6 @@
 //! What a statement needs from the session, and the pieces every plan
-//! shares: name resolution, a space's [`Chain`] of levels (chapter 42,
-//! `view(o, s)`), and the edge from the parent tenant.
+//! shares: name resolution, a space's [`Chain`] of levels (`view(o, s)`),
+//! and the edge from the parent tenant.
 
 use std::sync::Arc;
 
@@ -35,7 +35,7 @@ pub struct Limits {
     /// `inherit.merge`: `None` for `auto`.
     pub merge: Option<MergeMode>,
     /// `hierarchy.max_move_rows`: the most rows one reconcile of a space
-    /// may rewrite (39715 past it; decision T29).
+    /// may rewrite (39715 past it).
     pub max_move_rows: u64,
 }
 
@@ -54,14 +54,14 @@ impl Default for Limits {
     }
 }
 
-/// The session's rights the extension statements check (chapter 29's
+/// The session's rights the extension statements check (other
 /// statements are checked by the gateway as usual).
 pub trait Privileges: Send + Sync {
     /// May create and drop spaces and set home spaces: `CREATE USER` or
     /// `SPRIG_TENANT_ADMIN` on the tenant.
     fn space_admin(&self) -> bool;
     /// Holds `ALTER` on the object (creating, changing and dropping its
-    /// shares; chapter 29's `SHARE` privilege is not built).
+    /// shares; a separate `SHARE` privilege is not built).
     fn alter(&self, db_name: &str, db: DbId, object: ObjectId) -> bool;
 }
 
@@ -103,11 +103,11 @@ pub struct Ctx<'a> {
     pub limits: Limits,
     /// Rights.
     pub privileges: &'a dyn Privileges,
-    /// Lowercase names of typed and hierarchical tables (chapter 32).
+    /// Lowercase names of typed and hierarchical tables.
     pub typed: &'a [String],
     /// The materialized copies that are serving ([`crate::copy`]).
     pub copies: &'a CopyStates,
-    /// The statement is chapter 32's own (a type plan's): its DDL is the
+    /// The statement is the type layer's own (a type plan's): its DDL is the
     /// type layer's business, and its typed tables are planned already.
     pub from_types: bool,
 }
@@ -171,7 +171,7 @@ pub fn state_of(cat: &TenantCatalog) -> Option<&InheritState> {
 ///
 /// # Errors
 /// 39889 when the database is sharded (cross-tenant edges need one
-/// schema per side in R6); `Internal` when it has no placement.
+/// schema per side); `Internal` when it has no placement.
 pub fn physical_schema(cat: &TenantCatalog, db_name: &str, lctn: bool) -> Result<String> {
     let d = cat
         .database(&database_key(db_name, lctn))
@@ -255,7 +255,7 @@ pub fn tenant_edge(
 }
 
 impl Ctx<'_> {
-    /// The tenant's types (chapter 32), if any.
+    /// The tenant's types, if any.
     #[must_use]
     pub fn types(&self) -> Option<&sprig_types::TypesState> {
         self.cat

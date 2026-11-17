@@ -14,8 +14,12 @@
 //!
 //! Each chunk map has, in this order: `chunk_id` (bytes, 16), `version`,
 //! `page`, `title`, `heading_path` (text), `audience` (array of text),
-//! `text`, `tokens` (unsigned), `terms` (array of text) and `embedding`
-//! (bytes: [`DIM`] IEEE half-precision values, little-endian).
+//! `text`, `tokens` (unsigned), `terms` (array of text), `embedding`
+//! (bytes: [`DIM`] IEEE half-precision values, little-endian) and `seq`
+//! (unsigned: the chunk's position in its page, from 1).
+//!
+//! **Formats.** Format 2 added `seq`. Format 1 packs (no `seq`) are still
+//! read, their chunks with `seq` 0: their order within a page is unknown.
 //!
 //! The same pages, chunking and model give the same bytes: pages are read
 //! in path order, chunking is fixed, embeddings are computed in `f32` and
@@ -32,8 +36,11 @@ use crate::page::Page;
 
 /// The first bytes of every pack.
 pub const MAGIC: &[u8; 8] = b"SPRIGDOC";
-/// The format this crate writes and reads.
-pub const FORMAT: u16 = 1;
+/// The format this crate writes. It reads this one and every older one
+/// down to [`OLDEST_FORMAT`].
+pub const FORMAT: u16 = 2;
+/// The oldest format this crate reads.
+pub const OLDEST_FORMAT: u16 = 1;
 /// Embedding dimensions.
 pub const DIM: usize = 384;
 
@@ -63,6 +70,10 @@ pub struct Chunk {
     /// values (empty until embedded).
     #[serde(with = "f16_bytes")]
     pub embedding: Vec<f16>,
+    /// The chunk's position in its page, from 1; 0 when unknown (a chunk
+    /// read from a format 1 pack). Last in the map.
+    #[serde(default)]
+    pub seq: u16,
 }
 
 impl Chunk {
@@ -108,14 +119,14 @@ pub fn chunk_id(version: &str, page: &str, heading_path: &str, occurrence: usize
     id
 }
 
-/// Cuts every page into chunks with their ids, terms and token counts, in
-/// page order then position (embeddings left empty).
+/// Cuts every page into chunks with their ids, terms, token counts and
+/// positions, in page order then position (embeddings left empty).
 #[must_use]
 pub fn chunk_pages(version: &str, pages: &[Page]) -> Vec<Chunk> {
     let mut out = Vec::new();
     for page in pages {
         let mut seen: HashMap<String, usize> = HashMap::new();
-        for c in chunk::chunk_page(page) {
+        for (i, c) in chunk::chunk_page(page).into_iter().enumerate() {
             let heading_path = c.heading_path.join(PATH_SEP);
             let n = seen.entry(heading_path.clone()).or_insert(0);
             let id = chunk_id(version, &page.path, &heading_path, *n);
@@ -131,6 +142,7 @@ pub fn chunk_pages(version: &str, pages: &[Page]) -> Vec<Chunk> {
                 tokens: u16::try_from(c.tokens).unwrap_or(u16::MAX),
                 text: c.text,
                 embedding: Vec::new(),
+                seq: u16::try_from(i + 1).unwrap_or(u16::MAX),
             });
         }
     }
@@ -159,8 +171,10 @@ pub enum PackError {
     /// The file doesn't start with [`MAGIC`].
     #[error("not a docs pack")]
     BadMagic,
-    /// A format this build doesn't read.
-    #[error("pack format {0} is not supported (this build reads format {FORMAT})")]
+    /// A format this build doesn't read (or write).
+    #[error(
+        "pack format {0} is not supported (this build reads formats {OLDEST_FORMAT} to {FORMAT})"
+    )]
     Format(u16),
     /// The trailing SHA-256 doesn't match the contents: the file was
     /// changed or damaged.
@@ -172,13 +186,28 @@ pub enum PackError {
 }
 
 impl Pack {
-    /// The pack's bytes. Chunks are sorted by `chunk_id` first.
+    /// The pack's bytes, in [`FORMAT`]. Chunks are sorted by `chunk_id`
+    /// first.
     ///
     /// # Errors
     ///
     /// Two chunks share an id, a chunk's embedding doesn't have [`DIM`]
     /// values, or a string is too long for the header.
     pub fn to_bytes(&self) -> Result<Vec<u8>, PackError> {
+        self.to_bytes_as(FORMAT)
+    }
+
+    /// The pack's bytes in `format`: format 1 leaves the positions out,
+    /// as a release before format 2 wrote it (for tests of older packs).
+    ///
+    /// # Errors
+    ///
+    /// [`PackError::Format`] for a format outside [`OLDEST_FORMAT`] to
+    /// [`FORMAT`]; otherwise as [`Pack::to_bytes`].
+    pub fn to_bytes_as(&self, format: u16) -> Result<Vec<u8>, PackError> {
+        if !(OLDEST_FORMAT..=FORMAT).contains(&format) {
+            return Err(PackError::Format(format));
+        }
         let mut chunks: Vec<&Chunk> = self.chunks.iter().collect();
         chunks.sort_by_key(|c| c.chunk_id);
         if let Some(w) = chunks.windows(2).find(|w| w[0].chunk_id == w[1].chunk_id) {
@@ -191,7 +220,7 @@ impl Pack {
         }
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&FORMAT.to_le_bytes());
+        out.extend_from_slice(&format.to_le_bytes());
         put_str(&mut out, &self.version)?;
         put_str(&mut out, &self.model_id)?;
         out.extend_from_slice(&self.model_sha256);
@@ -207,7 +236,18 @@ impl Pack {
                     c.embedding.len()
                 )));
             }
-            ciborium::into_writer(c, &mut out).map_err(|e| PackError::Invalid(e.to_string()))?;
+            if format >= 2 {
+                ciborium::into_writer(c, &mut out)
+                    .map_err(|e| PackError::Invalid(e.to_string()))?;
+            } else {
+                let mut v = ciborium::Value::serialized(c)
+                    .map_err(|e| PackError::Invalid(e.to_string()))?;
+                if let ciborium::Value::Map(m) = &mut v {
+                    m.retain(|(k, _)| k.as_text() != Some("seq"));
+                }
+                ciborium::into_writer(&v, &mut out)
+                    .map_err(|e| PackError::Invalid(e.to_string()))?;
+            }
         }
         let digest = Sha256::digest(&out);
         out.extend_from_slice(&digest);
@@ -233,7 +273,7 @@ impl Pack {
         }
         let mut r = &body[8..];
         let format = u16::from_le_bytes(take::<2>(&mut r)?);
-        if format != FORMAT {
+        if !(OLDEST_FORMAT..=FORMAT).contains(&format) {
             return Err(PackError::Format(format));
         }
         let version = get_str(&mut r)?;
@@ -242,8 +282,11 @@ impl Pack {
         let count = u32::from_le_bytes(take::<4>(&mut r)?);
         let mut chunks = Vec::with_capacity(usize::try_from(count).unwrap_or(0).min(1 << 16));
         for i in 0..count {
-            let c: Chunk = ciborium::from_reader(&mut r)
+            let mut c: Chunk = ciborium::from_reader(&mut r)
                 .map_err(|e| PackError::Invalid(format!("chunk {i}: {e}")))?;
+            if format < 2 {
+                c.seq = 0;
+            }
             if c.embedding.len() != DIM {
                 return Err(PackError::Invalid(format!(
                     "chunk {i}: embedding has {} values",
@@ -436,10 +479,37 @@ mod tests {
         );
         // A consistent checksum over a bad body is still refused.
         let mut b = bytes[..bytes.len() - 32].to_vec();
-        b[8] = 2;
+        b[8] = 3;
         let d = Sha256::digest(&b);
         b.extend_from_slice(&d);
-        assert_eq!(Pack::from_bytes(&b), Err(PackError::Format(2)));
+        assert_eq!(Pack::from_bytes(&b), Err(PackError::Format(3)));
+    }
+
+    #[test]
+    fn chunks_know_their_place_and_old_packs_still_read() {
+        let p = sample();
+        // In page order, from 1.
+        let seqs: Vec<u16> = p.chunks.iter().map(|c| c.seq).collect();
+        assert_eq!(
+            seqs,
+            (1..=u16::try_from(p.chunks.len()).unwrap()).collect::<Vec<_>>()
+        );
+        let v2 = p.to_bytes().expect("write");
+        assert_eq!(u16::from_le_bytes([v2[8], v2[9]]), 2);
+        // Format 1: no positions written; read back with seq 0.
+        let v1 = p.to_bytes_as(1).expect("write v1");
+        assert_eq!(u16::from_le_bytes([v1[8], v1[9]]), 1);
+        assert!(v1.len() < v2.len());
+        let back = Pack::from_bytes(&v1).expect("read v1");
+        assert!(back.chunks.iter().all(|c| c.seq == 0));
+        let mut want = p.clone();
+        want.chunks.sort_by_key(|c| c.chunk_id);
+        for c in &mut want.chunks {
+            c.seq = 0;
+        }
+        assert_eq!(back, want);
+        assert_eq!(p.to_bytes_as(3), Err(PackError::Format(3)));
+        assert_eq!(p.to_bytes_as(0), Err(PackError::Format(0)));
     }
 
     #[test]

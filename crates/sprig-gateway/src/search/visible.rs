@@ -12,6 +12,30 @@
 //! facets := the copy's facets over (query AND _key IN visible)
 //! ```
 //!
+//! Ranked hits for such a caller are scored over the hits it may see, so
+//! no score moves with rows hidden from it (the copy's term statistics
+//! count every row):
+//!
+//! ```text
+//! candidates(query): every hit; None past search.max_window
+//! the front end keeps the hits whose rows its session reads
+//! rescore(query, visible, k): the best k of them, with BM25 statistics
+//!   of the visible hits alone (Scoring::Matched)
+//! past the window: plain_top(query, k): the best k with no statistics of
+//!   the index (Scoring::Plain); the front end leaves out hidden hits
+//! ```
+//!
+//! Prefix and fuzzy terms (`trai*`, `runing~1`) become the most frequent
+//! `search.max_expansions` terms they match. For a bound caller those
+//! terms are chosen among the rows it may see:
+//!
+//! ```text
+//! candidates: every_hit (Op::Every): every term each one matches
+//! rescore, counts, facets: query AND _key IN visible; the copy chooses
+//!   the terms by their frequency in the visible hits alone
+//! past the window (plain_top): chosen over every row; see plain_top
+//! ```
+//!
 //! Callers no policy binds keep the single call to the copy. A front end
 //! that can't tell whether a policy binds (`None`) takes the visible path.
 
@@ -20,10 +44,11 @@ use std::sync::Arc;
 use sprig_catalog::TenantCatalog;
 use sprig_common::ids::TenantId;
 use sprig_common::{Result, SprigCode, SprigError};
-use sprig_search::Hit;
 use sprig_search::def::IndexDef;
 use sprig_search::query::SearchQuery;
+use sprig_search::rpc::Op;
 use sprig_search::schema::Key;
+use sprig_search::{Hit, Scoring};
 
 use super::{Consistency, SearchService};
 
@@ -61,7 +86,7 @@ pub async fn all_hits(
     consistency: Consistency,
 ) -> Result<Vec<Hit>> {
     let max = svc.knobs().max_window;
-    crate::exec::search::run_search(svc, tenant, cat, def, query, None, consistency)
+    every_hit(svc, tenant, cat, def, query, consistency)
         .await
         .map_err(|e| {
             if e.code() == Some(SprigCode::SearchWindowExceeded) {
@@ -71,6 +96,109 @@ pub async fn all_hits(
                 e
             }
         })
+}
+
+/// Every hit of `query` a bound caller could see, for it to re-read: each
+/// prefix and fuzzy term expanded to every term it matches (`Op::Every`),
+/// so no hidden row's words push a visible row's word out of the
+/// `search.max_expansions` chosen. The copy's 39827 past
+/// `search.max_window` (it counts hidden rows: worded without the count).
+///
+/// # Errors
+/// 39827; the copy's.
+pub async fn every_hit(
+    svc: &Arc<SearchService>,
+    tenant: TenantId,
+    cat: &TenantCatalog,
+    def: &Arc<IndexDef>,
+    query: SearchQuery,
+    consistency: Consistency,
+) -> Result<Vec<Hit>> {
+    let max = svc.knobs().max_window;
+    crate::exec::search::run_op(svc, tenant, cat, def, query, Op::Every { max }, consistency).await
+}
+
+/// Every hit of `query` for a bound caller to re-read; `None` when it
+/// matches more than `search.max_window` documents.
+///
+/// # Errors
+/// The copy's, other than 39827.
+pub async fn candidates(
+    svc: &Arc<SearchService>,
+    tenant: TenantId,
+    cat: &TenantCatalog,
+    def: &Arc<IndexDef>,
+    query: SearchQuery,
+    consistency: Consistency,
+) -> Result<Option<Vec<Hit>>> {
+    match every_hit(svc, tenant, cat, def, query, consistency).await {
+        Ok(h) => Ok(Some(h)),
+        Err(e) if e.code() == Some(SprigCode::SearchWindowExceeded) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The best `k` (every one: `None`) of the `visible` hits of `query`,
+/// scored with statistics of those hits alone.
+///
+/// # Errors
+/// The copy's.
+#[allow(clippy::too_many_arguments)]
+pub async fn rescore(
+    svc: &Arc<SearchService>,
+    tenant: TenantId,
+    cat: &TenantCatalog,
+    def: &Arc<IndexDef>,
+    query: SearchQuery,
+    visible: Vec<Key>,
+    k: Option<usize>,
+    consistency: Consistency,
+) -> Result<Vec<Hit>> {
+    if visible.is_empty() {
+        return Ok(Vec::new());
+    }
+    metrics::counter!("sprig_rls_search_rechecks_total", "scoring" => "matched").increment(1);
+    let k = k.unwrap_or(visible.len()).min(visible.len());
+    let op = Op::Top {
+        k,
+        scoring: Scoring::Matched,
+    };
+    crate::exec::search::run_op(
+        svc,
+        tenant,
+        cat,
+        def,
+        within(query, visible),
+        op,
+        consistency,
+    )
+    .await
+}
+
+/// The best `k` hits of `query` with no statistics of the index (a bound
+/// caller's search past the window); hidden ones included, for the front
+/// end to leave out. Its prefix and fuzzy terms are still the most
+/// frequent over every row (the visible rows aren't known past the
+/// window): with more than `search.max_expansions` such terms, hidden
+/// rows' words can take the places of a visible row's word.
+///
+/// # Errors
+/// The copy's.
+pub async fn plain_top(
+    svc: &Arc<SearchService>,
+    tenant: TenantId,
+    cat: &TenantCatalog,
+    def: &Arc<IndexDef>,
+    query: SearchQuery,
+    k: usize,
+    consistency: Consistency,
+) -> Result<Vec<Hit>> {
+    metrics::counter!("sprig_rls_search_rechecks_total", "scoring" => "plain").increment(1);
+    let op = Op::Top {
+        k,
+        scoring: Scoring::Plain,
+    };
+    crate::exec::search::run_op(svc, tenant, cat, def, query, op, consistency).await
 }
 
 /// `query` restricted to the documents with these keys.

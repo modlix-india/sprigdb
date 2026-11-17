@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { dependentsFromRows, noDependents, showDependents } from './declaration';
 
-describe('Studio round 7: SHOW DEPENDENTS (ST67)', () => {
+describe('SHOW DEPENDENTS', () => {
   it('asks only of functions and procedures', () => {
     expect(showDependents('shop', 'function', 'rate')).toBe('SHOW DEPENDENTS OF FUNCTION `shop`.`rate`');
     expect(showDependents('shop', 'PROCEDURE', 'nightly')).toBe('SHOW DEPENDENTS OF PROCEDURE `shop`.`nightly`');

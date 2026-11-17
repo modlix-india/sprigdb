@@ -26,7 +26,9 @@ use hyper::{Method, Response};
 use prost_types::value::Kind;
 use serde_json::{Map, Value, json};
 use sprig_ai::ToolHost;
-use sprig_ai::tools::{Column, ColumnStats, ResultSet, Source, ToolBody, ToolOutput, ToolSpec};
+use sprig_ai::tools::{
+    Column, ColumnStats, ProposalCheck, ResultSet, Source, ToolBody, ToolOutput, ToolSpec,
+};
 use sprig_api::proto::v1::ExecuteResponse;
 use sprig_common::{Result, SprigCode, SprigError};
 use tokio::sync::mpsc;
@@ -35,6 +37,8 @@ use tonic::body::Body;
 use super::super::super::Core;
 use super::super::super::sql::{CHANNEL_DEPTH, Caller, Caps, SqlCall, collect};
 use super::super::{quote_literal, run_sql};
+
+mod skills;
 
 /// Rows `column_stats` reads per table at most.
 pub const STATS_SAMPLE_ROWS: u64 = 100_000;
@@ -54,6 +58,10 @@ pub struct GatewayHost {
     core: Arc<Core>,
     caller: Caller,
     share_data: bool,
+    /// The assistant the tools run for: the administration assistant's
+    /// `decision_log` and `metrics_trend` read the DC's, the DBA's its
+    /// tenant's.
+    role: Option<sprig_ai::Role>,
 }
 
 impl std::fmt::Debug for GatewayHost {
@@ -180,7 +188,19 @@ impl GatewayHost {
             core,
             caller,
             share_data,
+            role: None,
         }
+    }
+
+    /// The same host for `role`'s turns.
+    #[must_use]
+    pub fn for_role(mut self, role: sprig_ai::Role) -> Self {
+        self.role = Some(role);
+        self
+    }
+
+    fn admin(&self) -> bool {
+        self.role == Some(sprig_ai::Role::Admin)
     }
 
     async fn sql(&self, db: &str, sql: String) -> Result<ExecuteResponse> {
@@ -188,7 +208,12 @@ impl GatewayHost {
     }
 
     /// `sql` in a read-only transaction that is rolled back.
-    async fn read_only(&self, db: &str, sql: String, caps: Caps) -> Result<ExecuteResponse> {
+    pub(crate) async fn read_only(
+        &self,
+        db: &str,
+        sql: String,
+        caps: Caps,
+    ) -> Result<ExecuteResponse> {
         let engine = &self.core.engine;
         let t = engine.begin(&self.caller, db, true).await?;
         let (tx, rx) = mpsc::channel(CHANNEL_DEPTH);
@@ -338,7 +363,7 @@ impl GatewayHost {
         let columns: Vec<Value> = objects(&r).into_iter().map(Value::Object).collect();
         if columns.is_empty() {
             return Err(tool_error(format!(
-                "there is no table {db}.{table} that the user can see"
+                "there is no table {db}.{table} that the user can see (or no database {db})"
             )));
         }
         let q = format!("{}.{}", ident(db), ident(table));
@@ -347,6 +372,27 @@ impl GatewayHost {
             .await
             .map(|r| index_list(&objects(&r)))
             .unwrap_or_default();
+        // Foreign keys out of the table and into it, so the model joins on
+        // declared keys.
+        let (foreign_keys, referenced_by) = match self.fks(db).await {
+            Ok(fks) => {
+                let key = |f: &sprig_ai::tools::joins::Fk| {
+                    json!({"column": f.column, "references": format!("{}.{}", f.ref_table, f.ref_column),
+                           "from": format!("{}.{}", f.table, f.column), "constraint": f.name})
+                };
+                (
+                    fks.iter()
+                        .filter(|f| f.table.eq_ignore_ascii_case(table))
+                        .map(key)
+                        .collect::<Vec<_>>(),
+                    fks.iter()
+                        .filter(|f| f.ref_table.eq_ignore_ascii_case(table))
+                        .map(key)
+                        .collect::<Vec<_>>(),
+                )
+            }
+            Err(_) => (Vec::new(), Vec::new()),
+        };
         let definition = match self.sql("-", format!("SHOW CREATE TABLE {q}")).await {
             Ok(r) => result_set(&r)
                 .rows
@@ -359,13 +405,114 @@ impl GatewayHost {
         Ok(ToolOutput {
             body: ToolBody::Json(json!({
                 "db": db, "table": table, "columns": columns,
-                "indexes": indexes, "definition": definition,
+                "indexes": indexes, "foreign_keys": foreign_keys,
+                "referenced_by": referenced_by, "definition": definition,
             })),
             sources: vec![source(
                 "table",
                 format!("{db}.{table}"),
                 format!("{db}.{table}"),
             )],
+        })
+    }
+
+    /// The declared foreign keys of `db`, as the caller sees them.
+    async fn fks(&self, db: &str) -> Result<Vec<sprig_ai::tools::joins::Fk>> {
+        let r = self
+            .sql(
+                "-",
+                format!(
+                    "SELECT CONSTRAINT_NAME AS name, TABLE_NAME AS t, COLUMN_NAME AS c, \
+                     REFERENCED_TABLE_NAME AS rt, REFERENCED_COLUMN_NAME AS rc \
+                     FROM information_schema.KEY_COLUMN_USAGE \
+                     WHERE TABLE_SCHEMA = {} AND REFERENCED_TABLE_NAME IS NOT NULL \
+                     ORDER BY TABLE_NAME, CONSTRAINT_NAME, ORDINAL_POSITION LIMIT 2000",
+                    quote_literal(db)
+                ),
+            )
+            .await?;
+        let text = |m: &Map<String, Value>, k: &str| {
+            m.get(k).and_then(Value::as_str).unwrap_or("").to_owned()
+        };
+        Ok(objects(&r)
+            .iter()
+            .map(|m| sprig_ai::tools::joins::Fk {
+                name: text(m, "name"),
+                table: text(m, "t"),
+                column: text(m, "c"),
+                ref_table: text(m, "rt"),
+                ref_column: text(m, "rc"),
+            })
+            .collect())
+    }
+
+    async fn relationships(&self, input: &Value) -> Result<ToolOutput> {
+        use sprig_ai::tools::joins::{Col, relationships};
+        let db = s(input, "db");
+        let only = Some(s(input, "table")).filter(|t| !t.is_empty());
+        let r = self
+            .sql(
+                "-",
+                format!(
+                    "SELECT TABLE_NAME AS t, COLUMN_NAME AS c, DATA_TYPE AS ty, COLUMN_KEY AS k \
+                     FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = {} \
+                     ORDER BY TABLE_NAME, ORDINAL_POSITION LIMIT 20000",
+                    quote_literal(db)
+                ),
+            )
+            .await?;
+        let cols: Vec<Col> = objects(&r)
+            .iter()
+            .map(|m| {
+                let text = |k: &str| m.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+                Col {
+                    table: text("t"),
+                    column: text("c"),
+                    ty: text("ty"),
+                    primary: text("k") == "PRI",
+                }
+            })
+            .collect();
+        if cols.is_empty() {
+            return Err(tool_error(format!(
+                "there is no database {db} with tables the user can see"
+            )));
+        }
+        if let Some(t) = only
+            && !cols.iter().any(|c| c.table.eq_ignore_ascii_case(t))
+        {
+            return Err(tool_error(format!(
+                "there is no table {db}.{t} that the user can see"
+            )));
+        }
+        let fks = self.fks(db).await.unwrap_or_default();
+        let mut body = relationships(&cols, &fks, only);
+        body["db"] = json!(db);
+        Ok(ToolOutput {
+            body: ToolBody::Json(body),
+            sources: vec![source("database", db, db)],
+        })
+    }
+
+    /// A tile's query, planned as the caller in a read-only transaction
+    /// and never run: one that doesn't plan goes back to the model.
+    async fn check_tile(&self, input: &Value) -> Result<ProposalCheck> {
+        let (db, sql) = (s(input, "db"), s(input, "sql"));
+        let caps = Caps {
+            timeout: Some(self.timeout(db)),
+            ..Caps::default()
+        };
+        self.read_only(db, format!("EXPLAIN {sql}"), caps)
+            .await
+            .map_err(|e| {
+                tool_error(format!(
+                    "the tile's query doesn't plan: {}. Fix it (describe the tables to check the names) and propose the tile again.",
+                    e.message
+                ))
+            })?;
+        Ok(ProposalCheck {
+            checks: Some(json!({"planned": true, "ran": false})),
+            generated: None,
         })
     }
 
@@ -437,8 +584,59 @@ impl GatewayHost {
             };
             let _ = write!(sql, " LIKE {}", quote_literal(&pat));
         }
+        // As the values resolve for a table or a database: where each
+        // comes from (its SOURCE_SCOPE) is what a DBA needs before
+        // proposing a change at the narrowest scope.
+        match (s(input, "db"), s(input, "table")) {
+            ("", "") => {}
+            ("", _) => return Err(tool_error("table needs db")),
+            (db, "") => {
+                let _ = write!(sql, " FOR DATABASE {}", ident(db));
+            }
+            (db, table) => {
+                let _ = write!(sql, " FOR TABLE {}.{}", ident(db), ident(table));
+            }
+        }
         let r = self.sql("-", sql).await?;
         let mut rows = objects(&r);
+        // `SHOW SPRIG SETTINGS` lists the keys a tenant may set; the
+        // process-wide ones (`backend.*`, `gateway.*`, ...) come from this
+        // gateway's live settings, without operator-only keys.
+        if !key.is_empty()
+            && let super::super::StudioSource::Live { live, dc } = &self.core.studio.source
+            && let Ok(reg) = sprig_settings::Registry::global()
+        {
+            let pat = if key.ends_with('.') || !key.contains('.') {
+                format!("{key}%")
+            } else {
+                key.to_owned()
+            };
+            let snap = live.snapshot();
+            let ctx = sprig_settings::SettingCtx::process(dc);
+            let mut process: Vec<_> = reg
+                .iter()
+                .filter(|d| {
+                    !d.operator_only()
+                        && !d.scopes().contains(sprig_settings::ScopeKind::Tenant)
+                        && sprig_sql::settings_stmt::like_matches(&pat, d.key())
+                })
+                .collect();
+            process.sort_by_key(|d| d.key());
+            for d in process {
+                if let Ok(res) = snap.resolve(d.key(), &ctx) {
+                    let mut m = Map::new();
+                    m.insert("SETTING_SCOPE".into(), json!("process"));
+                    m.insert("SETTING_NAME".into(), json!(d.key()));
+                    m.insert(
+                        "VALUE".into(),
+                        json!(sprig_settings::show_value(&res.value)),
+                    );
+                    m.insert("SOURCE_SCOPE".into(), json!(res.source.to_string()));
+                    m.insert("DOC".into(), json!(d.doc()));
+                    rows.push(m);
+                }
+            }
+        }
         let more = rows.len() > 200;
         rows.truncate(200);
         Ok(ToolOutput {
@@ -628,17 +826,97 @@ impl GatewayHost {
         })
     }
 
+    /// `decision_log`: the DC's log for the administration assistant, the
+    /// tenant's own for the DBA.
+    async fn decision_log(&self, input: &Value) -> Result<ToolOutput> {
+        let subject = s(input, "subject").trim();
+        let days = input["days"].as_u64().unwrap_or(30).clamp(1, 90);
+        let path = if self.admin() {
+            format!(
+                "/admin/v1/ai/decisions?subject={}&days={days}",
+                super::pct(subject)
+            )
+        } else {
+            let t = self.tenant_name()?;
+            if subject.parse::<u64>().is_ok() {
+                format!("/admin/v1/tenants/{t}/decisions/{subject}")
+            } else {
+                format!(
+                    "/admin/v1/tenants/{t}/decisions?subject={}&days={days}",
+                    super::pct(subject)
+                )
+            }
+        };
+        let v = self.forward(&path).await?;
+        let mut sources: Vec<Source> = v["entries"]
+            .as_array()
+            .or_else(|| v["decisions"].as_array())
+            .into_iter()
+            .flatten()
+            .take(10)
+            .map(|e| {
+                let id = e["id"]
+                    .as_str()
+                    .map_or_else(|| e["decision_id"].to_string(), str::to_owned);
+                source("decision", e["kind"].as_str().unwrap_or("decision"), id)
+            })
+            .collect();
+        if v.get("decision_id").is_some() {
+            sources.push(source("decision", subject, subject));
+        }
+        Ok(ToolOutput {
+            body: ToolBody::Json(v),
+            sources,
+        })
+    }
+
+    /// `metrics_trend`: the controller's metric history.
+    async fn metrics_trend(&self, input: &Value) -> Result<ToolOutput> {
+        let mut q = format!(
+            "name={}&days={}",
+            super::pct(s(input, "name")),
+            input["days"].as_u64().unwrap_or(7).clamp(1, 30)
+        );
+        for l in input["labels"].as_array().into_iter().flatten() {
+            if let Some(l) = l.as_str() {
+                let _ = write!(q, "&label={}", super::pct(l));
+            }
+        }
+        Ok(ToolOutput {
+            body: ToolBody::Json(self.forward(&format!("/admin/v1/ai/metrics?{q}")).await?),
+            sources: vec![source("metric", s(input, "name"), "metrics_trend")],
+        })
+    }
+
     async fn compile_logic(&self, input: &Value) -> Result<ToolOutput> {
         let db = s(input, "db");
         let r = super::super::logic::compile(
             &self.core,
             &self.caller,
             db,
-            &json!({"sql": s(input, "source")}),
+            &json!({"sql": draft_declaration(s(input, "source"))}),
         )
         .await?;
         Ok(ToolOutput::json(reply_json(r).await?))
     }
+}
+
+/// `compile_logic`'s source as a declaration: a KIRun definition alone
+/// is compiled as a function named after it (or `ai_draft`).
+fn draft_declaration(source: &str) -> String {
+    let t = source.trim();
+    if !t.starts_with('{') {
+        return source.to_owned();
+    }
+    let name = serde_json::from_str::<Value>(t)
+        .ok()
+        .and_then(|v| v["name"].as_str().map(str::to_owned))
+        .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or_else(|| "ai_draft".to_owned());
+    format!(
+        "CREATE FUNCTION {name} LANGUAGE kirun AS {}",
+        quote_literal(t)
+    )
 }
 
 /// A count that came back as a float.
@@ -686,11 +964,26 @@ fn index_list(rows: &[Map<String, Value>]) -> Vec<Value> {
 
 #[async_trait]
 impl ToolHost for GatewayHost {
+    async fn check_proposal(&self, spec: &ToolSpec, input: &Value) -> Result<ProposalCheck> {
+        match spec.name {
+            "propose_sql" => {
+                check_proposed_sql(input)?;
+                Ok(ProposalCheck::default())
+            }
+            "propose_policy" | "propose_logic" | "generate_rows" => {
+                self.check_skill(spec.name, input).await
+            }
+            "propose_tile" => self.check_tile(input).await,
+            _ => Ok(ProposalCheck::default()),
+        }
+    }
+
     async fn call(&self, spec: &ToolSpec, input: &Value) -> Result<ToolOutput> {
         match spec.name {
             "search_docs" => self.search_docs(input).await,
             "catalog" => self.catalog(input).await,
             "describe" => self.describe(input).await,
+            "relationships" => self.relationships(input).await,
             "workload" => {
                 let q = format!("hours={}&limit=20", input["hours"].as_u64().unwrap_or(24));
                 let r = super::super::workload::list(&self.core, &self.caller, &q).await?;
@@ -759,35 +1052,131 @@ impl ToolHost for GatewayHost {
             }
             "column_stats" => self.column_stats(input).await,
             "run_query" => self.run_query(input).await,
+            "test_policy" if !s(input, "policy").trim().is_empty() => self.try_policy(input).await,
             "test_policy" => self.test_policy(input).await,
+            "sensitive_columns" => self.sensitive_columns(input).await,
             "compile_logic" => self.compile_logic(input).await,
-            "decision_log" => {
-                let t = self.tenant_name()?;
-                let subject = s(input, "subject");
-                if !safe(subject) {
-                    return Err(tool_error(
-                        "decision_log takes a decision id, as the approvals inbox or a shard move names it",
-                    ));
-                }
-                Ok(ToolOutput {
-                    body: ToolBody::Json(
-                        self.forward(&format!("/admin/v1/tenants/{t}/decisions/{subject}"))
-                            .await?,
-                    ),
-                    sources: vec![source("decision", subject, subject)],
-                })
-            }
+            "decision_log" => self.decision_log(input).await,
+            "check_ddl" => Ok(ToolOutput {
+                body: ToolBody::Json(super::schema_check::check_ddl_json(
+                    s(input, "sql"),
+                    s(input, "db"),
+                )),
+                sources: vec![source("rules", "SprigDB's schema rules", "check_ddl")],
+            }),
+            "migration_check" => migration_check(input),
+            "metrics_trend" if self.admin() => self.metrics_trend(input).await,
             "metrics_trend" => Err(tool_error(
-                "the controller's metric history isn't available in this release; ask the operator to check the metrics in their monitoring system",
+                "the metric history is for the administration assistant",
             )),
             other => Err(tool_error(format!("{other} isn't a read tool"))),
         }
     }
 }
 
+/// `migration_check`: a deterministic report, run on the text the model
+/// passed; nothing is read from the tenant.
+fn migration_check(input: &Value) -> Result<ToolOutput> {
+    use super::schema_check as sc;
+    let db = Some(s(input, "db"))
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or("app");
+    let report = match s(input, "source") {
+        "mongodb" => {
+            let colls: Value = serde_json::from_str(s(input, "schema"))
+                .map_err(|e| tool_error(format!("schema isn't JSON: {e}")))?;
+            sc::mongo_report(&colls, db)
+        }
+        source @ ("mysql" | "mariadb") => {
+            let ddl = s(input, "schema");
+            if ddl.len() > sc::MAX_TEXT {
+                return Err(tool_error(format!(
+                    "schema is longer than {} bytes; check it in parts",
+                    sc::MAX_TEXT
+                )));
+            }
+            sc::mysql_report(ddl, db, source)
+        }
+        other => return Err(tool_error(format!("unknown source {other}"))),
+    };
+    Ok(ToolOutput {
+        body: ToolBody::Json(report),
+        sources: vec![source(
+            "rules",
+            "SprigDB's migration rules",
+            "migration_check",
+        )],
+    })
+}
+
+/// Statement kinds whose text `check_ddl`'s rules apply to.
+fn is_schema_change(sql: &str) -> bool {
+    let w: Vec<String> = sql
+        .split_whitespace()
+        .take(2)
+        .map(str::to_ascii_uppercase)
+        .collect();
+    matches!(
+        w.first().map(String::as_str),
+        Some("CREATE" | "ALTER" | "RENAME")
+    ) && !matches!(
+        w.get(1).map(String::as_str),
+        Some("USER" | "ROLE" | "TENANT" | "SPRIG")
+    )
+}
+
+/// The check a proposed statement gets before the user sees it: a schema
+/// change must pass `check_ddl`'s rules, so a proposed `CREATE TABLE`
+/// always parses on SprigDB.
+///
+/// # Errors
+/// What the rules found, for the model to fix.
+pub fn check_proposed_sql(input: &Value) -> Result<()> {
+    let sql = s(input, "sql");
+    if !is_schema_change(sql) {
+        return Ok(());
+    }
+    let r = super::schema_check::check_sql(
+        sql,
+        s(input, "db"),
+        sprig_proto_mysql::packets::Persona::MySql84,
+        true,
+    );
+    if !r.has_errors() {
+        return Ok(());
+    }
+    let errs: Vec<String> = r
+        .findings
+        .iter()
+        .filter(|f| f.level == super::schema_check::Level::Error)
+        .map(|f| format!("{} ({}): {}", f.at, f.rule, f.message))
+        .collect();
+    Err(tool_error(format!(
+        "not proposed: the statement fails SprigDB's schema rules. Fix it and propose again. {}",
+        errs.join("; ")
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proposed_schema_changes_are_checked() {
+        let ok = json!({"db": "shop", "sql": "CREATE TABLE t (id BIGINT PRIMARY KEY, a INT)"});
+        assert!(check_proposed_sql(&ok).is_ok());
+        let bad =
+            json!({"db": "shop", "sql": "CREATE TABLE t (id INT PRIMARY KEY) ENGINE=BLACKHOLE"});
+        let e = check_proposed_sql(&bad).unwrap_err();
+        assert!(e.message.contains("BLACKHOLE"), "{}", e.message);
+        let broken = json!({"db": "shop", "sql": "CREATE TABLE t (id INT PRIMARY KEY,, a)"});
+        assert!(check_proposed_sql(&broken).is_err());
+        // Data changes and other statements aren't held to the DDL rules.
+        let dml = json!({"db": "shop", "sql": "DELETE FROM t WHERE id = 1"});
+        assert!(check_proposed_sql(&dml).is_ok());
+        let pin = json!({"db": "shop", "sql": "SPRIG PIN t SHARD KEY (id)"});
+        assert!(check_proposed_sql(&pin).is_ok());
+    }
 
     #[test]
     fn index_rows_group_by_name() {

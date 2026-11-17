@@ -465,7 +465,10 @@ async fn four_shards_with_mirrors_agree_with_memory() {
     // A ring of 60 with chords, so paths cross shards many times.
     let ring = "UNWIND range(0, 59) AS i CREATE (:R {i: i})";
     let link = "MATCH (a:R), (b:R) WHERE b.i = (a.i + 1) % 60 OR b.i = (a.i * 7) % 60 CREATE (a)-[:NEXT {w: a.i}]->(b)";
-    for q in [ring, link] {
+    // A hub with more incoming links than a joined read joins.
+    let hub = "CREATE (:H {i: 1000})";
+    let spokes = "MATCH (h:H {i: 1000}) UNWIND range(0, 199) AS i CREATE (:L {i: i, d: i % 17})-[:TO {w: i}]->(h)";
+    for q in [ring, link, hub, spokes] {
         live.run(q).await;
         execute(&mut mem, q, &Params::new(), &Budgets::default())
             .await
@@ -479,6 +482,26 @@ async fn four_shards_with_mirrors_agree_with_memory() {
         "MATCH (a:R {i: 1}), (b:R {i: 31}) MATCH p = shortestPath((a)-[:NEXT*]->(b)) RETURN length(p)",
         "MATCH (a:R {i: 3})-[:NEXT]-(x) RETURN x.i ORDER BY x.i",
         "MATCH (x:R)<-[:NEXT]-(y:R) WHERE x.i < 4 RETURN x.i, count(y) ORDER BY x.i",
+        // Walks read ahead in one recursive statement: trails through the
+        // ring's cycles, relationship lists, end labels and a hop after.
+        "MATCH (a:R {i: 5})-[:NEXT*0..5]->(x) RETURN x.i, count(*) AS c ORDER BY x.i",
+        "MATCH (a:R {i: 2})-[r:NEXT*1..3]->(x) RETURN x.i, [e IN r | e.w] AS ws ORDER BY x.i, ws",
+        "MATCH (a:R) WHERE a.i < 3 MATCH (a)-[:NEXT*0..4]->(x:R), (x)-[:NEXT]->(y) RETURN a.i, x.i, y.i, count(*) AS c ORDER BY a.i, x.i, y.i",
+        // Shortest paths to many ends: the last level read from the ends.
+        "MATCH (a:R {i: 5}), (b:R) WHERE b.i IN [11, 23, 31, 47, 58, 6] MATCH p = shortestPath((a)-[:NEXT*1..3]-(b)) RETURN b.i, length(p) ORDER BY b.i",
+        "MATCH (a:R {i: 5}), (b:R) WHERE b.i IN [11, 23, 31, 47, 58, 6] MATCH p = shortestPath((a)-[:NEXT*1..4]->(b)) RETURN b.i, length(p), [n IN nodes(p) | n.i][0] AS s ORDER BY b.i",
+        // A start with more links than are joined: the same statement
+        // gives them unjoined, and the far nodes are read by id.
+        "MATCH (h:H {i: 1000})<-[:TO]-(l) WITH l ORDER BY l.d DESC, l.i LIMIT 5 RETURN l.i, l.d",
+        "MATCH (h:H {i: 1000})<-[t:TO]-(l:L) WHERE l.i < 190 RETURN count(*) AS c, sum(t.w) AS w",
+        "MATCH (l:L) WHERE l.i < 3 MATCH (l)-[:TO]->(h)<-[:TO]-(o) RETURN l.i, count(o) AS c ORDER BY l.i",
+        // A later pattern's start scanned with the first pattern's read.
+        "MATCH (a:R {i: 5}), (b:L {d: 3}) WHERE NOT a = b RETURN a.i, b.i ORDER BY b.i",
+        "MATCH (a:R {i: 5}), (b:R) WHERE b.i IN [6, 35] MATCH p = shortestPath((a)-[:NEXT*1..3]-(b)) RETURN b.i, length(p) ORDER BY b.i",
+        // A hop's next hop read along with it.
+        "MATCH (a:R) WHERE a.i < 4 OPTIONAL MATCH (a)-[r:NEXT]->(b:R)-[:NEXT]->(c:R) RETURN a.i, b.i, c.i, r.w ORDER BY a.i, b.i, c.i",
+        "MATCH (l:L) WHERE l.i < 4 OPTIONAL MATCH (l)-[:TO]->(h:H)-[:NEXT]->(x) RETURN l.i, h.i, x.i ORDER BY l.i",
+        "MATCH (a:R {i: 7})-[:NEXT]->(b)-[:NEXT]->(c)-[:NEXT]->(d:R) RETURN b.i, c.i, d.i ORDER BY b.i, c.i, d.i",
     ];
     let mut agree = 0;
     for q in CORPUS.iter().chain(extra.iter()) {

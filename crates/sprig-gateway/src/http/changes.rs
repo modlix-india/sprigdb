@@ -4,10 +4,13 @@
 //! NDJSON (anything else).
 //!
 //! ```text
-//! watch(caller, database, objects, start_after | Last-Event-ID | now):
+//! watch(caller, database, objects, start_after | Last-Event-ID | start_at_hlc | now):
 //!   every requested table: SELECT, then WATCH (the image check below, no
 //!     image), else 1142 naming the missing one
-//!   tail the tenant's feed (TenantTail) from the token or now
+//!   tail the tenant's feed (TenantTail) from the token, now, or for
+//!     start_at_hlc the feed time index's last position 30 s or more before
+//!     it (__sprig_sys.__sprig_feed_time on the tenant's cluster, a row per
+//!     10 s), leaving out the tenant's events stamped before start_at_hlc
 //!   per batch of feed events (up to 256, or what arrived within 20 ms):
 //!     events of the database (of `objects` when given; internal tables never)
 //!     the images checked in one session of the caller (exec::rls_images):
@@ -26,14 +29,24 @@
 //! stream on (heartbeats carry it), so a resumed stream never sees it
 //! either.
 //!
-//! Limits: at most `api.stream.max_per_tenant`
+//! Limits, read at the tenant's scope: at most `api.stream.max_per_tenant`
 //! open streams per tenant on a gateway (39780 past it); a client more than
 //! `api.stream.max_buffered_events` behind gets 39790 and the stream ends
 //! (it resumes from its last token); heartbeats every
-//! `api.stream.heartbeat_seconds`. `start_at_hlc` is refused (39802): the
-//! feed can't position by time (MariaDB keeps no index of binlog positions
-//! by time, and reading a binlog file from its start to find one took
-//! minutes on a busy cluster).
+//! `api.stream.heartbeat_seconds`. `start_at_hlc` older than the time
+//! index (or than the tenant's move to its cluster) is 39800; a cluster
+//! without an index yet, 39802 (MariaDB keeps no index of binlog positions
+//! by time, so the controller writes one). On a Galera cluster the index
+//! keeps the cluster's shared GTID domain (`wsrep_gtid_mode`), and the
+//! node the feed reads adds its own local domains; a Galera cluster
+//! without `wsrep_gtid_mode` has no index (39802).
+//!
+//! A `Sprig-Space` header (gRPC `sprig-space`) makes the subscriber's
+//! sessions act in that space, as `USE SPACE` does.
+//!
+//! A stream of a tenant homed in another data centre is opened on a
+//! gateway there and relayed ([`relay`]): the home DC's gateway decides
+//! the credentials, applies the limits and reads the feed.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -54,6 +67,9 @@ use super::sql::{Caller, SqlCall, collect};
 use crate::exec::rls_images::{ImagesRequest, TableImages, answer, statement};
 
 mod inherit;
+mod relay;
+
+pub use relay::serve as serve_relayed;
 
 /// Events read from the feed per batch at most.
 const DEPTH: usize = 256;
@@ -126,10 +142,14 @@ pub struct WatchSpec {
     pub objects: Vec<String>,
     /// A resume token, or empty for now.
     pub start_after: String,
-    /// Not supported (39802 when set).
+    /// Events stamped at or after it (0: unused); read from the feed's
+    /// time index.
     pub start_at_hlc: u64,
     /// Whole rows after updates.
     pub full_document: bool,
+    /// The space the subscriber reads in (the `Sprig-Space` header,
+    /// gRPC metadata `sprig-space`), as after `USE SPACE`.
+    pub space: Option<String>,
 }
 
 /// One event (or heartbeat) as the API's `ChangeEvent`.
@@ -235,7 +255,10 @@ async fn check(core: &Core, caller: &Caller, req: &ImagesRequest) -> Result<Vec<
         multi: false,
     };
     let c = caller.clone();
-    let task = tokio::spawn(async move { engine.run(&c, call, None, tx).await });
+    let space = super::sql::call_space();
+    let task = tokio::spawn(super::sql::SPACE.scope(space, async move {
+        engine.run(&c, call, None, tx).await;
+    }));
     let resp = collect(rx, 64 << 20, None).await;
     let _ = task.await;
     let resp = resp?;
@@ -289,8 +312,28 @@ fn denied_watch(caller: &Caller, db: &str, table: &str) -> SprigError {
 /// 1142 for a requested table the caller can't read; 39801 for a bad or
 /// foreign token; 39802 for `start_at_hlc`; 39780 past
 /// `api.stream.max_per_tenant`; the feed's.
-#[allow(clippy::too_many_lines)] // the steps of the module docs, in order
 pub async fn open(
+    core: &Arc<Core>,
+    caller: Caller,
+    spec: WatchSpec,
+) -> Result<mpsc::Receiver<Result<WatchEvent>>> {
+    // A tenant homed in another DC: its home DC's gateway serves the
+    // stream, this one relays it.
+    if let (Some(svc), Some(tenant)) = (core.engine.tenants.as_ref(), caller.principal.tenant)
+        && let Some(home) = relay::remote_home(svc, tenant).await?
+    {
+        return relay::forward(core, &caller, &spec, &home).await;
+    }
+    open_here(core, caller, spec).await
+}
+
+/// [`open`] on this gateway, whatever the tenant's home (a stream relayed
+/// from another DC is never relayed again).
+///
+/// # Errors
+/// As [`open`].
+#[allow(clippy::too_many_lines)] // the steps of the module docs, in order
+async fn open_here(
     core: &Arc<Core>,
     caller: Caller,
     spec: WatchSpec,
@@ -306,13 +349,29 @@ pub async fn open(
             "change streams are for tenant users",
         )
     })?;
-    if spec.start_at_hlc != 0 {
+    if spec.start_at_hlc != 0 && !spec.start_after.is_empty() {
         return Err(SprigError::new(
-            SprigCode::FeedSourceUnsupported,
-            "ER_SPRIG_FEED_SOURCE_UNSUPPORTED: start_at_hlc isn't supported; use start_after",
+            SprigCode::FeedBadResumeToken,
+            "ER_SPRIG_FEED_BAD_RESUME_TOKEN: give start_after or start_at_hlc, not both",
         ));
     }
-    let limits = core.engine.settings();
+    // The stream limits, at the tenant's scope when set there.
+    let limits = {
+        let cat = svc
+            .cache
+            .get(tenant, sprig_catalog::Freshness::Latest)
+            .await?;
+        let ctx = cat.setting_ctx(&svc.dc);
+        let get = |k: &'static sprig_settings::Setting<u64>| {
+            svc.settings.get(k, &ctx, Some(&cat.settings))
+        };
+        let us = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
+        Limits {
+            streams: us(get(&super::settings::STREAM_MAX_PER_TENANT)),
+            heartbeat: Duration::from_secs(get(&super::settings::STREAM_HEARTBEAT_SECONDS)),
+            buffer: us(get(&super::settings::STREAM_MAX_BUFFERED_EVENTS)),
+        }
+    };
     if spec.database.is_empty() {
         return Err(SprigError::standard(
             1046,
@@ -335,19 +394,25 @@ pub async fn open(
             plain_binary: false,
             watch: false,
         };
-        let ok = check(core, &caller, &req).await?;
+        let ok = super::sql::SPACE
+            .scope(spec.space.clone(), check(core, &caller, &req))
+            .await?;
         if let Some(i) = ok.iter().position(|v| !v.first().copied().unwrap_or(false)) {
             return Err(denied(&caller, &spec.database, &spec.objects[i]));
         }
         req.watch = true;
-        let ok = check(core, &caller, &req).await?;
+        let ok = super::sql::SPACE
+            .scope(spec.space.clone(), check(core, &caller, &req))
+            .await?;
         if let Some(i) = ok.iter().position(|v| !v.first().copied().unwrap_or(false)) {
             return Err(denied_watch(&caller, &spec.database, &spec.objects[i]));
         }
     }
-    let slot = Slot::take(tenant, limits.change_streams_max)?;
+    let slot = Slot::take(tenant, limits.streams)?;
     let (clusters, placement, names) = feed(&svc)?;
-    let start = if spec.start_after.is_empty() {
+    let start = if spec.start_at_hlc != 0 {
+        start_at(&svc, &clusters, &placement, tenant, spec.start_at_hlc).await?
+    } else if spec.start_after.is_empty() {
         StartAt::Now
     } else {
         let t = ResumeToken::from_hex(&spec.start_after)?;
@@ -368,7 +433,7 @@ pub async fn open(
         TailOptions {
             progress_every: Duration::from_millis(500),
             // Materialized copies of inherited tables (`__sprig_ih_<id>`):
-            // what a child reads through them changes there (RL69).
+            // what a child reads through them changes there.
             keep_internal: vec!["__sprig_ih_".to_owned()],
             ..TailOptions::default()
         },
@@ -379,6 +444,8 @@ pub async fn open(
     // own feed; their feeds are tailed from now.
     let above = inherit::ancestor_tails(&svc, tenant, &clusters, &placement, &names).await;
     let first = if spec.start_after.is_empty() {
+        // From now, or from the time index's position before
+        // `start_at_hlc`.
         let segment = placement
             .history(tenant)
             .await?
@@ -398,9 +465,10 @@ pub async fn open(
         spec.start_after.clone()
     };
     // One slot more than the buffer: the slow-consumer error's.
-    let (tx, rx) = mpsc::channel(limits.change_buffer.max(16) + 1);
+    let (tx, rx) = mpsc::channel(limits.buffer.max(16) + 1);
     let core = Arc::clone(core);
-    tokio::spawn(async move {
+    let space = spec.space.clone();
+    tokio::spawn(super::sql::SPACE.scope(space, async move {
         let _slot = slot;
         metrics::gauge!("sprig_api_change_streams").increment(1.0);
         let r = run(
@@ -409,7 +477,7 @@ pub async fn open(
             &spec,
             (tail, above),
             first,
-            limits.change_heartbeat,
+            limits.heartbeat,
             &tx,
         )
         .await;
@@ -417,8 +485,122 @@ pub async fn open(
             let _ = tx.try_send(Err(e));
         }
         metrics::gauge!("sprig_api_change_streams").decrement(1.0);
-    });
+    }));
     Ok(rx)
+}
+
+/// A stream's limits, read at the tenant's scope
+/// (`api.stream.max_per_tenant`, `heartbeat_seconds`,
+/// `max_buffered_events`).
+struct Limits {
+    streams: usize,
+    heartbeat: Duration,
+    buffer: usize,
+}
+
+/// Seconds before `start_at_hlc` the time index's position must lie:
+/// transactions before it committed by then, so none of them carries a
+/// commit stamp at or after the start (statement stamps come from the
+/// gateways' clocks, a little apart from the database's).
+const START_MARGIN_SECONDS: u64 = 30;
+
+/// Where a stream starting at `hlc` reads from: the tenant's cluster at
+/// the feed time index's last position at least
+/// [`START_MARGIN_SECONDS`] before it (`__sprig_sys.__sprig_feed_time`,
+/// written by the controller every 10 s); the stream then leaves out the
+/// tenant's events stamped before `hlc`. A Galera cluster's rows hold its
+/// shared GTID domain alone; the node the feed reads adds its own local
+/// domains as they are now (they never hold a tenant's writes).
+///
+/// # Errors
+/// 39800 when `hlc` is older than the index (or than the tenant's last
+/// move to its cluster); 39802 when the cluster has no index yet; the
+/// cluster's.
+pub(crate) async fn start_at(
+    svc: &crate::tenant::TenantServices,
+    clusters: &Arc<dyn Clusters>,
+    placement: &Arc<dyn PlacementView>,
+    tenant: TenantId,
+    hlc: u64,
+) -> Result<StartAt> {
+    use mysql_async::prelude::Queryable;
+    use sprig_catalog::pool_wait::Bounded as _;
+    let secs = sprig_feed::hlc::Hlc(hlc).secs();
+    let (cluster, _) = placement.current(tenant).await?;
+    // A start before the tenant's last move would need the old cluster's
+    // binlogs.
+    if let Some(h) = placement
+        .history(tenant)
+        .await?
+        .iter()
+        .rev()
+        .find(|h| h.to_cluster == cluster)
+        && h.hlc_floor > hlc
+    {
+        return Err(SprigError::new(
+            SprigCode::FeedHistoryLost,
+            "ER_SPRIG_FEED_HISTORY_LOST: start_at_hlc is before the tenant moved to its cluster; \
+             start later",
+        ));
+    }
+    let pool = svc.locator.ctl_pool(&cluster).await?;
+    let mut c = pool.get_conn_bounded().await.map_err(|e| {
+        SprigError::new(
+            SprigCode::BackendUnavailable,
+            format!("sprig_ctl on {cluster}: {e}"),
+        )
+    })?;
+    let t = sprig_cluster::sys::feed_time_table();
+    let rows: std::result::Result<Vec<(u64, String)>, _> = c
+        .exec(
+            format!(
+                "(SELECT bucket, pos FROM {t} WHERE bucket <= ? ORDER BY bucket DESC LIMIT 1) \
+                 UNION ALL (SELECT bucket, '' FROM {t} ORDER BY bucket LIMIT 1)"
+            ),
+            (secs.saturating_sub(START_MARGIN_SECONDS),),
+        )
+        .await;
+    drop(c);
+    let rows = match rows {
+        Ok(r) => r,
+        Err(mysql_async::Error::Server(e)) if e.code == 1146 => Vec::new(),
+        Err(e) => {
+            return Err(SprigError::new(
+                SprigCode::BackendUnavailable,
+                format!("the feed time index on {cluster}: {e}"),
+            ));
+        }
+    };
+    let found = rows.iter().find(|(_, p)| !p.is_empty());
+    match (found, rows.last()) {
+        (Some((_, pos)), _) => {
+            let mut pos: sprig_binlog::GtidPos = pos.parse()?;
+            if svc.locator.is_galera(&cluster).await? {
+                let now = clusters.position(&cluster).await?;
+                for g in now.iter() {
+                    if pos.get(g.domain).is_none() {
+                        pos.update(*g);
+                    }
+                }
+            }
+            Ok(StartAt::At { cluster, pos })
+        }
+        (None, Some((oldest, _))) => Err(SprigError::new(
+            SprigCode::FeedHistoryLost,
+            format!(
+                "ER_SPRIG_FEED_HISTORY_LOST: start_at_hlc is older than the feed's time index \
+                 (its oldest position is at unix second {oldest}, and a start needs one \
+                 {START_MARGIN_SECONDS} s before it)"
+            ),
+        )),
+        (None, None) => Err(SprigError::new(
+            SprigCode::FeedSourceUnsupported,
+            format!(
+                "ER_SPRIG_FEED_SOURCE_UNSUPPORTED: cluster {cluster} has no feed time index yet; \
+                 use start_after"
+            ),
+        )),
+    }
 }
 
 fn op_name(op: Op) -> &'static str {
@@ -449,12 +631,12 @@ struct Pending {
     probe: Option<usize>,
     /// An inheritable object's event, mapped to the subscriber's space.
     mapped: Option<inherit::Mapped>,
-    /// Sent by its copy's handover (RL71), whatever the view reads now.
+    /// Sent by its copy's handover, whatever the view reads now.
     counted: bool,
 }
 
-/// Changes held while a copy's first seed runs (RL71), at most; past it
-/// the oldest are decided as before RL71.
+/// Changes held while a copy's first seed runs, at most; past it the
+/// oldest are decided by what the view reads now.
 const HOLD_MAX: usize = 10_000;
 
 /// Puts event `e` (classified as `inherited`) into the batch's image
@@ -482,7 +664,7 @@ fn add_pending(
     };
     let (mut before, mut after, mut probe) = (None, None, None);
     // An inheritable object's layer images aren't its records: they aren't
-    // checked (RL64).
+    // checked.
     match e.op {
         _ if inherited.is_some() => {}
         Op::Insert => after = image(e.after.as_ref()).map(|m| push(Some(m))),
@@ -575,8 +757,7 @@ fn shown(p: &Pending, seen: &[Vec<bool>], full: bool) -> Option<WatchEvent> {
 }
 
 /// An inheritable object's event `p` as the subscriber sees it
-/// ([`inherit::decide`]); `was_visible`: its record just before the change
-/// (RL64).
+/// ([`inherit::decide`]); `was_visible`: its record just before the change.
 fn mapped_event(
     p: &Pending,
     m: &inherit::Mapped,
@@ -669,9 +850,9 @@ async fn run(
     let mut tail = own_feed(tail);
     let mut last = first;
     let mut quiet = tokio::time::Instant::now();
-    // What the stream last knew of inherited records' visibility (RL64).
+    // What the stream last knew of inherited records' visibility.
     let mut known = inherit::Seen::default();
-    // Changes waiting for a copy's first seed to end (RL71).
+    // Changes waiting for a copy's first seed to end.
     let mut held: Vec<(Box<sprig_feed::ChangeEvent>, inherit::Mapped)> = Vec::new();
     loop {
         let mut until = quiet + heartbeat;
@@ -733,6 +914,11 @@ async fn run(
                 FeedItem::Event(mut e) => {
                     if own {
                         last = e.token.to_hex();
+                        // A stream that starts at a time reads from a
+                        // little before it.
+                        if e.hlc < spec.start_at_hlc {
+                            continue;
+                        }
                     } else {
                         // A parent tenant's change: resumable as this
                         // tenant's position.
@@ -764,8 +950,7 @@ async fn run(
             }
         }
         // Changes of a tenant edge's source or copy: the copies' handovers
-        // decide which side sends each (RL71), read now that the batch is
-        // here.
+        // decide which side sends each, read now that the batch is here.
         if let (Some(m), Some(svc)) = (&mapper, core.engine.tenants.as_ref()) {
             let mut edges: HashMap<String, Vec<Option<Handover>>> = HashMap::new();
             let mut keep = Vec::with_capacity(pending.len());
@@ -819,10 +1004,10 @@ async fn run(
             inherit::read(core, caller, &spec.database, &keys).await?
         };
         // Records gone from the subscriber's view whose key the stream
-        // doesn't know: were they visible before the change (RL64)? Every
-        // other event: does the subscriber's view read the changed row now
-        // (RL69)? A probe per event (by its index in `pending`, and
-        // whether it asks only that).
+        // doesn't know: were they visible before the change? Every other
+        // event: does the subscriber's view read the changed row now? A
+        // probe per event (by its index in `pending`, and whether it asks
+        // only that).
         let readable = |p: &Pending| {
             p.probe
                 .is_some_and(|i| seen[p.table].get(i).copied().unwrap_or(false))
@@ -979,11 +1164,12 @@ pub async fn rest(
             hdr(&req, "host"),
         )
         .await?;
-    let spec = spec_of(
+    let mut spec = spec_of(
         database,
         req.uri().query(),
         hdr(&req, "last-event-id").as_deref(),
     );
+    spec.space = hdr(&req, "sprig-space").filter(|s| !s.is_empty());
     let ws = hdr(&req, "upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket"));
     let sse = hdr(&req, "accept").is_some_and(|a| a.contains("text/event-stream"));
     if ws && req.version() != hyper::Version::HTTP_11 {

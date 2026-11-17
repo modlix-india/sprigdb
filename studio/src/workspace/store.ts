@@ -22,7 +22,10 @@ export type DocKind =
   | 'inheritance'
   | 'access'
   | 'security'
-  | 'settings';
+  | 'settings'
+  | 'docs'
+  | 'dashboard'
+  | 'assistant';
 
 export interface Doc {
   /** The tab's route, relative to the tenant base (`q/<id>` for query tabs). */
@@ -95,6 +98,10 @@ const TITLES: Record<string, [DocKind, string]> = {
   policies: ['access', 'Roles and policies'],
   security: ['security', 'Security'],
   settings: ['settings', 'Settings'],
+  docs: ['docs', 'Docs'],
+  d: ['dashboard', 'Dashboards'],
+  glossary: ['assistant', 'Glossary'],
+  digests: ['assistant', 'Digests'],
 };
 
 const OBJECT_KINDS: Record<string, DocKind> = {
@@ -117,6 +124,8 @@ export function describe(rel: string): Doc | null {
   }
   if (parts[0] === 'logic' && parts[2] === 'new') return { rel, kind: 'logic', title: `New ${parts[3] ?? 'module'}` };
   if (parts[0] === 'logic' && parts.length === 4) return { rel, kind: 'logic', title: parts[3]! };
+  if (parts[0] === 'd' && parts.length === 2) return { rel, kind: 'dashboard', title: 'Dashboard' };
+  if (parts[0] === 'd' && parts[2] === 'tile') return { rel, kind: 'dashboard', title: parts[3] === 'new' ? 'New tile' : 'Edit tile' };
   if (parts[0] === 'access') return { rel, kind: 'access', title: parts[1] ?? 'Access' };
   return { rel, kind: 'home', title: parts[parts.length - 1] || 'Page' };
 }

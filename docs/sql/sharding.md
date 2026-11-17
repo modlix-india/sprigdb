@@ -16,6 +16,7 @@ You don't declare sharding in `CREATE TABLE`. There is no `SHARD KEY`, `DISTRIBU
 - to fix a table's place in every design the advisor makes, use [`SPRIG PIN`](#sprig-pin);
 - to see the design, use [`SPRIG SHOW ADVICE`](#sprig-show-advice) and [`SPRIG SHOW PINS`](#sprig-show-pins);
 - to approve or ignore a sharding recommendation, use [`SPRIG APPROVE RECOMMENDATION`](explain-and-workload.md#sprig-approve-recommendation);
+- to make a unique key hold across shards, add it with `ALTER TABLE … ADD UNIQUE` and manage its [lookup index](#unique-keys-and-lookup-indexes);
 - to list groups and shards, split, merge or re-key by hand, use `sprigctl shard list | split | merge | rekey` and `sprigctl advisor run | show | apply` (see [sprigctl](../tools/sprigctl.md)), or Studio's shards view.
 
 `SHOW SHARDS` and `SHOW TABLE GROUPS` don't exist.
@@ -147,6 +148,86 @@ A tenant the advisor hasn't run for yet gets no rows. After a run, each table of
 
 The advisor's behaviour is set by the `advisor.*` settings (operator-only bounds, tenant values): `advisor.mode`, `advisor.min_confidence`, `advisor.min_observe_hours`, `advisor.window_days` and others. See the [settings reference](../reference/settings.md#advisor) and [Sharding advisor](../performance/sharding-advisor.md).
 
+## Unique keys and lookup indexes
+
+On a sharded table, MariaDB checks a unique key on each shard alone. When the key doesn't include the distribution key, SprigDB makes it unique across shards with a global lookup index: a table that maps each key value to the shard holding its row. Reads with `=` or `IN` on every column of the key then go to one shard instead of all of them, and `EXPLAIN FORMAT=SPRIG` shows a `Lookup` step.
+
+**Creating one.** `ALTER TABLE t ADD UNIQUE KEY k (col)` or `CREATE UNIQUE INDEX k ON t (col)` on a sharded table adds the key on every shard, then builds the lookup while writes go on. The client waits for the whole build, as for any `ALTER TABLE`.
+
+- If values repeat across shards, the statement fails with 1062 `Duplicate entry 'x' for key 'k' (and N more values)`, the key is dropped again, and nothing changes. An `advisor.lookup` approval item lists up to 10 of the values. Fix the data, then approve the item to build again.
+- `ADD UNIQUE` can't share an `ALTER TABLE` with other kinds of change.
+- Keys of several columns get a lookup too. A statement uses it when it names every column with `=` or `IN`, or as `(a, b) = (v, w)` or `(a, b) IN (...)`.
+- A table that follows its parent in a table group keeps its unique keys per shard.
+- If a gateway or controller stops during a build, the controller finishes the build. The client sees a lost connection.
+
+The sharding advisor also proposes lookups for single-column unique keys whose reads scatter over shards; see [Sharding advisor](../performance/sharding-advisor.md#lookup-indexes).
+
+**Writes.** Writes keep the lookup current in the same transaction. An `UPDATE` that sets a lookup column to a literal value is allowed, and a clash fails with 1062. These still fail with 39420 (reason `lookup`): an `UPDATE` that sets a lookup column to an expression or uses `ORDER BY` or `LIMIT`, `INSERT IGNORE`, and a primary-key change on a table with lookups.
+
+**Dropping.** `ALTER TABLE t DROP INDEX k` and `DROP INDEX k ON t` drop the key's lookup first. `DROP TABLE` and `DROP DATABASE` drop their tables' lookups.
+
+**Grants.** Table-level grants on a table reach its lookup tables. Right after a new lookup is built, a user with table-level grants can get 1142 once.
+
+MongoDB unique indexes on sharded collections stay unique per shard.
+
+### SPRIG SHOW LOOKUP INDEXES
+
+```sql
+SPRIG SHOW LOOKUP INDEXES [FROM [db_name.]table_name]
+```
+
+Also written `SHOW SPRIG LOOKUP INDEXES`. Lists the lookups of the tables you hold a privilege on. `information_schema.SPRIG_LOOKUP_INDEXES` has the same rows.
+
+| Column | Meaning |
+|---|---|
+| `TABLE_SCHEMA`, `TABLE_NAME` | The table |
+| `INDEX_NAME` | The unique key the lookup belongs to |
+| `COLUMN_NAME` | The key's columns |
+| `IS_UNIQUE` | Whether the lookup checks uniqueness |
+| `ORIGIN` | Where it came from: the table's DDL or the advisor |
+| `STATE` | `building`, `write_only`, `backfilling`, `public` or `dropping`; reads use it only when `public` |
+| `CONFLICTS` | Duplicates the last build found |
+| `LOOKUP_ID` | Its id |
+| `UPDATED_AT` | Its last change |
+
+A tenant without sharded tables has no lookups:
+
+```sql test
+CREATE TABLE accounts (id INT PRIMARY KEY, email VARCHAR(100), UNIQUE KEY uk_email (email));
+SPRIG SHOW LOOKUP INDEXES;
+SELECT COUNT(*) AS lookups FROM information_schema.SPRIG_LOOKUP_INDEXES;
+```
+
+```text output
+lookups
+0
+```
+
+### SPRIG REBUILD LOOKUP INDEX
+
+```sql
+SPRIG REBUILD LOOKUP INDEX index_name ON [db_name.]table_name
+```
+
+Repairs a lookup: adds missing entries, fixes stale ones and removes orphans. When the table has a unique key `index_name` but no lookup, it builds one. Use it to make an existing unique key global on a table the advisor sharded. **Privileges:** `ALTER` on the table.
+
+### SPRIG DROP LOOKUP INDEX
+
+```sql
+SPRIG DROP LOOKUP INDEX index_name ON [db_name.]table_name
+```
+
+Drops only the lookup. The shards' unique key stays, unique per shard. **Privileges:** `ALTER` on the table.
+
+Both statements work as prepared statements, without `?` placeholders. On a table that isn't sharded, they fail with 39420:
+
+```sql test-error
+-- accounts isn't sharded: 39420 (lookup)
+SPRIG REBUILD LOOKUP INDEX uk_email ON accounts;
+```
+
+The `lookup.*` settings tune lookups: `lookup.lock_wait_seconds` (5, the lock wait when a write claims a key value), `lookup.build_lease_seconds` (30, after which the controller finishes a stopped build), `lookup.backfill_chunk_rows` (1000), `lookup.publish_timeout_ms` (10000, how long gateways get to load a change) and `lookup.orphan_scan_hours` (24; 0 turns the orphan scan off). See the [settings reference](../reference/settings.md).
+
 ## Shard counts and min_shards
 
 Every table group starts with one shard and splits when a shard passes `sharding.split_size_gb` (default 32 GB), or carries more than `sharding.split_write_share_pct` of a hot cluster's writes for `sharding.split_sustain_minutes`. Quiet neighbours below `sharding.merge_size_gb` merge. `sharding.min_shards` pre-splits each group into at least that many shards. These keys are operator-only: a tenant session can read them with `SHOW SPRIG SETTINGS LIKE 'sharding.%'` but can't set them; an operator sets them with `sprigctl settings`.
@@ -187,7 +268,7 @@ ERROR 39420 (HY000): Statement not distributable (window_function): a window fun
 | `locking` | `LOCK TABLES` or `HANDLER` on a sharded table |
 | `auto_increment`, `insert_key` | An `INSERT` row without its key value, a zero key, or a key value that isn't a literal of the key's type |
 | `cross_cluster` | A write or join that needs one cluster but spans several |
-| `lookup`, `foreign_key` | A write that would leave a unique lookup index or a gateway-kept foreign key unchecked |
+| `lookup`, `foreign_key` | A write that would leave a unique lookup index or a gateway-kept foreign key unchecked; a lookup statement on a table that isn't sharded |
 | `routine` | A stored function or UDF in a statement across shards |
 | `fulltext_relevance` | MariaDB `FULLTEXT` relevance compared across shards |
 | `schema_skew` | Shards answered with different columns (a DDL change in flight) |
@@ -208,6 +289,10 @@ Inserts into a sharded table take `AUTO_INCREMENT` values from per-table ID bloc
 
 A foreign key whose two tables live on one shard (one group, joined through the key) stays a MariaDB foreign key. When the two tables are in different groups, SprigDB keeps the key itself: `ALTER TABLE … ADD FOREIGN KEY` checks existing rows (an orphan fails with 1452 and nothing changes), and every later write is checked by the gateway. Actions it can't run across shards fail with 39462 `ER_SPRIG_FK_ACTION_NOT_DISTRIBUTED`.
 
+**Rows without their parent.** A table that follows its parent in a group (such as `invoice_lines` routed through `invoices`) needs the parent row to find its shard. With `foreign_key_checks = 0`, as a dump restore sets it, a child row whose parent doesn't exist yet is still accepted: it waits on the group's first shard and every read of the child sees it. When the parent row arrives (by `INSERT`, or by an `UPDATE` of the parent's referenced column), the waiting rows move to the parent's shard in the same write. A controller sweep every `sharding.check_interval_seconds` (60) moves any that writes missed. These moves don't count in the statement's affected rows. With checks on, a missing parent fails with 1452, as in MariaDB.
+
+While child rows wait, inserting a parent row on another cluster than the group's first shard fails with 39420 (reason `cross_cluster`). Keys of several columns, and parents that themselves follow a parent, aren't covered: their rows still need the parent first.
+
 ### Transactions across shards
 
 A transaction that writes on one cluster commits there, exactly as MariaDB. One that writes on several clusters commits with XA two-phase commit when the clusters support it. `txn.non_xa_policy` (`reject`, `best_effort` or `sprig_2pc`) decides what happens when a cluster lacks XA. A transaction may span at most `txn.max_branches` clusters (default 32). See [MySQL compatibility](overview.md#transactions-across-shards) for the isolation rules and errors.
@@ -226,6 +311,7 @@ A table pinned `REFERENCE` stays unsharded, on one cluster, exactly like a table
 |---|---|---|
 | 1064 | (`42000`) | Syntax error in a pin statement |
 | 1072 | (`42000`) | A pin names a column the table doesn't have |
+| 1062 | (`23000`) | A lookup build found values repeated across shards; the message counts the others |
 | 1142 | (`42000`) | Missing `ALTER` on the table or the `COLOCATE WITH` parent |
 | 1146 | (`42S02`) | The table doesn't exist |
 | 39410 | `ER_SPRIG_PIN_CONFLICT` | The pin breaks a conflict rule |

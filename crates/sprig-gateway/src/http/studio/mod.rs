@@ -17,6 +17,7 @@
 //! | `POST /v1/databases/{db}/cursors`, `POST /v1/cursors/{h}:fetch`, `:close` | `Cursors` ([`cursors`]) |
 //! | `/v1/ops/...` | Operator mode: the Admin API for logins in `studio.operator_logins` ([`ops`]) |
 //! | `/v1/library`, `/v1/library/saved[:delete]`, `/v1/library/history[:clear]` | The caller's saved queries and history ([`library`]) |
+//! | `/v1/dashboards...` | Dashboards and their tiles, run as the viewer ([`dashboards`]) |
 //! | `GET /v1/shards`, `/v1/shards/advisor[/{run}]` | The shards view: table groups, keys, maps, advisor runs ([`shards`]) |
 //! | `/v1/ai/...` | The AI assistants: chat (NDJSON), conversations, feedback, glossary ([`ai`]) |
 //! | `GET /v1/openapi.json` | The data API's document with these routes added |
@@ -37,6 +38,8 @@ pub mod accounts;
 pub mod ai;
 pub mod catalog;
 pub mod cursors;
+// Dashboards and tiles.
+pub mod dashboards;
 pub mod exports;
 pub mod grants;
 pub mod library;
@@ -614,12 +617,16 @@ pub fn session_client(authorization: Option<&str>) -> Option<String> {
     v.get("cli").and_then(Value::as_str).map(str::to_owned)
 }
 
-/// Every claim of the session token in `authorization`, read without
-/// checking the signature: only for a caller already verified. What
+/// Every claim of the session token, or of the issuer's token (an
+/// external token), in `authorization`, read without checking the
+/// signature: only for a caller already verified with that header. What
 /// `SPRIG_CLAIM('k')` reads in that caller's statements.
 #[must_use]
 pub fn session_claims(authorization: Option<&str>) -> Option<Value> {
-    let t = bearer(authorization)?.strip_prefix(ACCESS_PREFIX)?;
+    let b = bearer(authorization)?;
+    let t = b
+        .strip_prefix(ACCESS_PREFIX)
+        .or_else(|| sprig_auth::oidc::Jws::looks_like(b.as_bytes()).then_some(b))?;
     let payload = t.split('.').nth(1)?;
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload)
@@ -824,7 +831,7 @@ fn rows_of(r: &ExecuteResponse) -> Vec<Vec<Option<String>>> {
 ///
 /// # Errors
 /// The request, unchanged, when it isn't Studio's.
-#[allow(clippy::result_large_err)] // the request goes back to the REST router
+#[allow(clippy::result_large_err, clippy::too_many_lines)] // the request goes back to the REST router; one arm per route
 pub async fn handle(
     core: &Arc<Core>,
     info: &ConnInfo,
@@ -888,11 +895,24 @@ pub async fn handle(
         (_, p) if logic::is_logic_path(p) => logic::route(core, info, req).await,
         (_, p) if messaging::is_messaging_path(p) => messaging::route(core, info, req).await,
         (_, p) if library::is_library_path(p) => library::route(core, info, req).await,
+        (_, p) if dashboards::is_dashboards_path(p) => dashboards::route(core, info, req).await,
         (_, p) if ai::is_ai_path(p) => ai::route(core, info, req).await,
         (_, ai::mcp::PATH) => Ok(ai::mcp::route(core, info, req).await),
         ("POST", "/v1/policies:testAs") => policies::test_as(core, info, req).await,
         ("POST", crate::docs::http::PATH) => {
             return Ok(crate::docs::http::search(core, info, req).await);
+        }
+        ("GET", p)
+            if p == crate::docs::http::PAGES
+                || p.starts_with(&format!("{}/", crate::docs::http::PAGES)) =>
+        {
+            return Ok(crate::docs::http::page(core, info, req).await);
+        }
+        (m, p) if crate::http::retrieval::route(m, p).is_some() => {
+            let Some((db, index)) = crate::http::retrieval::route(m, p) else {
+                return Err(req);
+            };
+            return Ok(crate::http::retrieval::search(core, info, req, &db, &index).await);
         }
         ("GET", p) if p == "/v1/shards" || p.starts_with("/v1/shards/") => {
             match core
@@ -1228,6 +1248,8 @@ async fn whoami(
     let privs = grants::Privileges::of(&grants);
     let tenants = tenant_tree(core, p, privs.tenant_admin).await;
     let limits = core.studio.limits_for(p.tenant);
+    let platform_roles = ops::roles(core, &caller);
+    let ai = ai::whoami_json(&core.studio, p.tenant, !platform_roles.is_empty());
     let out = json!({
         "principal": {
             "tenant": p.tenant_name,
@@ -1252,8 +1274,9 @@ async fn whoami(
         "tenants": tenants,
         "grants": grants,
         "privileges": privs.to_json(),
-        "platform_roles": ops::roles(core, &caller),
+        "platform_roles": platform_roles,
         "studio": core.studio.client_for(cfg, p.tenant),
+        "ai": ai,
         "gateway": {
             "id": core.engine.gateway_id,
             "dc": core.engine.dc,

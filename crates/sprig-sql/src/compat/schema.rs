@@ -182,6 +182,27 @@ pub fn mysql_functional_parts(text: &str) -> String {
     if exprs.is_empty() {
         return text.to_owned();
     }
+    // A key MariaDB named after its hidden column (made before the
+    // gateway named unnamed functional indexes) shows MySQL's name, in key
+    // order, so the text stays valid DDL.
+    let key_name = |line: &str| -> Option<(usize, usize)> {
+        let t = line.trim_start();
+        let lead = line.len() - t.len();
+        let after = if t.starts_with("KEY `") {
+            4
+        } else if t.starts_with("UNIQUE KEY `") {
+            11
+        } else {
+            return None;
+        };
+        let from = lead + after;
+        let end = line[from + 1..].find("` ").map(|i| from + 1 + i + 1)?;
+        Some((from, end))
+    };
+    let mut taken: Vec<String> = text
+        .split('\n')
+        .filter_map(|l| key_name(l).map(|(a, b)| l[a + 1..b - 1].to_owned()))
+        .collect();
     text.split('\n')
         .filter(|line| {
             !column_line_name(line).is_some_and(|(n, _)| super::fxindex::is_fx_column(&n))
@@ -189,11 +210,23 @@ pub fn mysql_functional_parts(text: &str) -> String {
         .map(|line| {
             let t = line.trim_start();
             if t.starts_with("KEY ") || t.starts_with("UNIQUE KEY ") {
-                let mut l = line.to_owned();
+                let (head, rest) = match key_name(line) {
+                    Some((a, b)) => {
+                        let name = &line[a + 1..b - 1];
+                        let shown = if super::fxindex::is_fx_column(name) {
+                            format!("`{}`", super::fxindex::next_functional_name(&mut taken))
+                        } else {
+                            line[a..b].to_owned()
+                        };
+                        (format!("{}{shown}", &line[..a]), &line[b..])
+                    }
+                    None => (String::new(), line),
+                };
+                let mut l = rest.to_owned();
                 for (q, e) in &exprs {
                     l = l.replace(q.as_str(), &format!("({e})"));
                 }
-                l
+                head + &l
             } else {
                 line.to_owned()
             }

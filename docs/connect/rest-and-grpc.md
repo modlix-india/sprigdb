@@ -50,15 +50,24 @@ A request whose `content-type` starts with `application/grpc` goes to gRPC; anyt
 
 ## Authenticate
 
-Every data call carries an `Authorization` header (gRPC: `authorization` metadata). Three credentials work:
+Every data call carries an `Authorization` header (gRPC: `authorization` metadata). Four credentials work:
 
 | Credential | Header | Notes |
 |---|---|---|
 | Password | `Authorization: Basic base64(acme.app:<password>)` | Checked like a MySQL login of the same user, on every request; after the first, a request costs two SHA-256 hashes |
 | API key | `Authorization: Bearer sprig_acme_<key-id>_<secret>` | The key names its tenant and user |
 | Session token | `Authorization: Bearer sprigat_...` | From `POST /v1/auth/login`, short-lived |
+| Identity provider token | `Authorization: Bearer eyJ...` | A JWT from an issuer the tenant registered; name the tenant with its host name or `x-sprig-tenant`. See [Identity provider tokens](#identity-provider-tokens) |
 
-With Basic, the user name names the tenant: `acme.app` is user `app` of tenant `acme`. Alternatively send the plain user name with the header `x-sprig-tenant: acme`.
+With Basic, the user name names the tenant: `acme.app` is user `app` of tenant `acme`. Alternatively send the plain user name with the header `x-sprig-tenant: acme`, on HTTP/1.1, HTTP/2 and gRPC alike. On a [tenant endpoint](../security/tls.md#tenant-endpoints-by-server-name) (`acme.db.example.com`) the host name names the tenant, and the header is ignored.
+
+```sh
+curl -s -u 'app:<password>' -H 'x-sprig-tenant: acme' \
+  https://db.example.com:8443/v1/databases/shop/sql:query \
+  -H 'content-type: application/json' -d '{"sql": "SELECT CURRENT_USER()"}'
+```
+
+An account with the `token` login method can also send an identity provider's token as the Basic password, for clients that can only send Basic; see [Identity provider tokens](#identity-provider-tokens).
 
 The checks are those of every other protocol: account locks, expired passwords (refused with 1862, since HTTP has no sandbox mode), `REQUIRE SSL`, `auth.require_tls`, failure delays and the per-address limit.
 
@@ -67,6 +76,7 @@ Client-certificate requirements are checked too, on Basic, on API keys and on th
 | Refusal | Status | Body `code` |
 |---|---|---|
 | Wrong or missing credentials, locked or expired account | 401, with `WWW-Authenticate: Basic realm="sprigdb", Bearer` | 1045, 3118, 3955 or 1862 |
+| An identity provider's token, with no tenant host name or `x-sprig-tenant` | 401 | 39786 |
 | Tenant suspended | 403 | 39303 |
 | Too many failed logins from your address | 429, with `Retry-After` | 39300 |
 | Credentials can't be checked right now | 503, with `Retry-After` | 39301 |
@@ -110,6 +120,20 @@ curl https://db.example.com:8443/v1/auth/login -H 'content-type: application/jso
 
 With `"refresh_transport": "body"` the refresh token comes in the body; otherwise it is set as an `HttpOnly` cookie, and later cookie calls need the `X-Sprig-CSRF` header. `POST /v1/auth/refresh` rotates it and `POST /v1/auth/logout` ends the session. When the tenant requires a second factor (`auth.mfa_required`), the login answers with a challenge that `POST /v1/auth/mfa` completes. A password login over plain HTTP from another host is refused with 403 (39921), unless `studio.allow_insecure_http` is on.
 
+### Identity provider tokens
+
+A tenant can register OIDC providers and other JWT issuers whose tokens log in. Send the token as a bearer token, and name the tenant with the `x-sprig-tenant` header (or connect to the tenant's endpoint, `acme.db.example.com`):
+
+```sh
+curl -s https://db.example.com:8443/v1/databases/shop/sql:query \
+  -H "Authorization: Bearer $TOKEN" -H 'x-sprig-tenant: acme' \
+  -H 'content-type: application/json' -d '{"sql": "SELECT COUNT(*) FROM orders"}'
+```
+
+The token's claims name the account, and row-level security policies read them with `SPRIG_CLAIM`. A refused token gets 401 with 1045; the reason is in the audit log.
+
+A client that can only send HTTP Basic can send the token as the password of an account with the `token` login method: `curl -u "acme.billing:$TOKEN" ...`. The login name names the account, the token's user mapping must name the same one, and the request gets the token's claims and token roles as with `Bearer`. See [Logins with identity provider tokens](../security/external-tokens.md#rest-and-grpc).
+
 ## Run SQL
 
 `POST /v1/databases/{database}/sql:query` runs SQL and streams the results. `{database}` is the database `USE` would name; `-` means none.
@@ -148,6 +172,8 @@ Without that header, the same objects come as one JSON array.
 | `timeout_ms` | int | none | Statement timeout; past it the statement is killed with 3024 |
 | `language` | string | `sql` | `sql`, `cypher`, `gql` or `mongo` |
 | `output` | string | `relaxed_ejson` | For `mongo`: `relaxed_ejson` or `canonical_ejson` |
+
+**Spaces.** A `Sprig-Space: <space>` header (gRPC metadata `sprig-space`) makes the call's session act in that [space](../sql/inheritance.md#use-space), as `USE SPACE` would. It applies to SQL calls, the other REST APIs and change streams. An unknown space fails with 39880 `ER_SPRIG_SPACE_NOT_FOUND`. A space outside your home space's subtree fails with 39884. A transaction keeps the space its `Begin` call named.
 
 There are no bound parameters: the statement is SQL text. Quote values yourself, or call a [logic function](../data-models/logic.md) with `POST /v1/databases/{database}/functions/{name}:call`.
 
@@ -198,7 +224,7 @@ curl -u 'acme.app:<password>' -X POST https://db.example.com:8443/v1/transaction
 ```
 
 - `{"read_only": true}` in `Begin` starts a read-only transaction.
-- A handle lives on the gateway that opened it. A call that reaches another gateway is forwarded there with your credentials, so any gateway accepts it.
+- A handle lives on the gateway that opened it. A call that reaches another gateway is forwarded there with your credentials, so any gateway accepts it. That includes an identity provider token whose tenant came from the host name or `x-sprig-tenant`: the forwarded call names the tenant and the account itself.
 - A handle idle for `api.txn.idle_timeout_ms` (10 s), or older than `api.txn.max_lifetime_ms` (60 s), is rolled back; using it afterwards fails with 39782.
 - Only the principal that opened a handle may use it (39783). An unknown handle is 39781.
 - At most `api.txn.max_open_per_tenant` handles per tenant are open on a gateway.
@@ -208,7 +234,7 @@ curl -u 'acme.app:<password>' -X POST https://db.example.com:8443/v1/transaction
 | Area | Routes | See |
 |---|---|---|
 | Catalog | `GET /v1/catalog`, `GET /v1/databases/{database}/catalog`, `GET /v1/databases/{database}/catalog/{kind}/{name}` | Databases, tables, views, routines and graphs you can see |
-| Cursors | `POST /v1/databases/{database}/cursors`, `POST /v1/cursors/{cursor}:fetch`, `POST /v1/cursors/{cursor}:close` | Page through a large read: `{sql, skip, page_rows}`, then `fetch` until `done` |
+| Cursors | `POST /v1/databases/{database}/cursors`, `POST /v1/cursors/{cursor}:fetch`, `POST /v1/cursors/{cursor}:close` | Page through a large read: `{sql, skip, page_rows}`, then `fetch` until `done`. A cursor lives on the gateway that opened it; a `fetch` or `close` that reaches another gateway is forwarded there, with any credentials, an identity provider token named by its host or `x-sprig-tenant` included |
 | Exports | `POST /v1/exports:ticket`, then a form `POST /v1/exports` | CSV or NDJSON downloads for a browser session |
 | Change streams | `GET /v1/databases/{database}/changes` | Server-Sent Events (`Accept: text/event-stream`), WebSocket, or NDJSON. Needs `SELECT` and `WATCH` on the tables; a named table without them fails with 1142. See [Change feed](../concepts/change-feed.md) |
 | Key-value | `/v1/databases/{database}/namespaces/{namespace}:get`, `:put`, `:delete`, `:scan`, `:exec`, `:geoSearch` | [Key-value](../data-models/key-value.md) |
@@ -269,7 +295,7 @@ Responses with 429 and 503 carry `Retry-After`. An error after a streamed answer
 |---|---|---|
 | 400 | 39785 | A `sql:execute` result over `api.rest.max_buffered_bytes`; use `sql:query` |
 | 400 | 39794 | An unknown `language`, or a graph or MongoDB statement with a transaction handle or `multi_statements` |
-| 401 | 1045 and others | See [Authenticate](#authenticate) |
+| 401 | 1045, 39786 and others | See [Authenticate](#authenticate) |
 | 403 | 39783 | Another principal's transaction handle |
 | 409 | 39781, 39782 | An unknown or expired transaction handle |
 | 413 | 39787 | A request over `api.max_request_bytes` |

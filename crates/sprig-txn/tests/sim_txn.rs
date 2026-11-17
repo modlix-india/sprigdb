@@ -111,6 +111,7 @@ struct Stats {
     partial: AtomicU64,
     no_answer: AtomicU64,
     crashes: AtomicU64,
+    clients_gone: AtomicU64,
     resolver_commits: AtomicU64,
     resolver_rollbacks: AtomicU64,
     sprig_2pc: AtomicU64,
@@ -1178,7 +1179,9 @@ impl TxnBackend for SimBackend {
     }
 }
 
-/// Crashes the gateway at the seed's coordinator step.
+/// Crashes the gateway at the seed's coordinator step; with
+/// `client_gone`, the client of every n-th transaction at that step goes
+/// away instead (the gateway lives on).
 struct CrashHooks {
     world: World,
     gw: Node,
@@ -1186,24 +1189,54 @@ struct CrashHooks {
     seen: Mutex<HashMap<Point, u32>>,
     fired: AtomicBool,
     restart_after: Duration,
+    client_gone: bool,
+}
+
+/// One session's hooks: a client that goes away cuts its own session's
+/// statement.
+struct SessionHooks {
+    inner: Arc<CrashHooks>,
+    cut: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl TxnHooks for SessionHooks {
+    async fn at(&self, dtid: Option<Dtid>, p: Point) {
+        if self.inner.client_gone {
+            if self.inner.hit(p, true) {
+                bump(&STATS.clients_gone);
+                self.inner
+                    .world
+                    .record(format!("CLIENT GONE at {p:?} of {dtid:?}"));
+                self.cut.notify_one();
+                std::future::pending::<()>().await;
+            }
+            return;
+        }
+        self.inner.at(dtid, p).await;
+    }
+}
+
+impl CrashHooks {
+    /// Whether `p` is the step to act on this time.
+    fn hit(&self, p: Point, every: bool) -> bool {
+        let Some((tp, n)) = self.target else {
+            return false;
+        };
+        if tp != p || self.fired.load(Ordering::SeqCst) {
+            return false;
+        }
+        let mut seen = self.seen.lock().unwrap();
+        let c = seen.entry(p).or_insert(0);
+        *c += 1;
+        if every { c.is_multiple_of(n) } else { *c == n }
+    }
 }
 
 #[async_trait::async_trait]
 impl TxnHooks for CrashHooks {
     async fn at(&self, dtid: Option<Dtid>, p: Point) {
-        let Some((tp, n)) = self.target else {
-            return;
-        };
-        if tp != p || self.fired.load(Ordering::SeqCst) {
-            return;
-        }
-        let hit = {
-            let mut seen = self.seen.lock().unwrap();
-            let c = seen.entry(p).or_insert(0);
-            *c += 1;
-            *c == n
-        };
-        if !hit {
+        if !self.hit(p, false) {
             return;
         }
         self.fired.store(true, Ordering::SeqCst);
@@ -1296,6 +1329,9 @@ struct Scenario {
     fence: bool,
     /// A second gateway writes the same rows.
     gw2: bool,
+    /// At the `crash` step the client goes away instead of the gateway
+    /// crashing.
+    client_gone: bool,
 }
 
 impl Scenario {
@@ -1338,6 +1374,7 @@ impl Scenario {
             ryw: None,
             fence: false,
             gw2: false,
+            client_gone: false,
         }
     }
 
@@ -1455,9 +1492,18 @@ async fn session(
     sc: Scenario,
     cfg: TxnConfig,
 ) {
-    let mut txn = TxnCoordinator::new(backend.clone(), dtids, TENANT, cfg);
-    txn.set_hooks(hooks);
-    txn.set_clock(clock);
+    let cut = Arc::new(tokio::sync::Notify::new());
+    let hooks: Arc<dyn TxnHooks> = Arc::new(SessionHooks {
+        inner: hooks,
+        cut: cut.clone(),
+    });
+    let open = || {
+        let mut t = TxnCoordinator::new(backend.clone(), dtids.clone(), TENANT, cfg.clone());
+        t.set_hooks(hooks.clone());
+        t.set_clock(clock.clone());
+        t
+    };
+    let mut txn = open();
     let rng = world.rng();
     while world.elapsed() < HORIZON {
         let mut pool = sc.clusters();
@@ -1467,15 +1513,27 @@ async fn session(
         let tag = log.start(pool.clone());
         txn.begin(BeginOptions::default()).unwrap();
         let mut result = None;
+        let mut gone = false;
         'stmts: for &i in &pool {
             let c = cid(i);
-            let b = match txn.branch(&c, &shard_ref(i), Intent::Write).await {
-                Ok(b) => b,
-                Err(e) => {
-                    result = Some(Res::Failed(code_of(&e)));
-                    break;
-                }
+            let sr = shard_ref(i);
+            let opened = tokio::select! {
+                biased;
+                r = txn.branch(&c, &sr, Intent::Write) => Some(r.map(|_| ())),
+                () = cut.notified() => None,
             };
+            let Some(opened) = opened else {
+                gone = true;
+                break;
+            };
+            if let Err(e) = opened {
+                result = Some(Res::Failed(code_of(&e)));
+                break;
+            }
+            let b = txn
+                .branch(&c, &sr, Intent::Write)
+                .await
+                .expect("the branch just opened");
             let mut stmts = vec![Stmt::Insert {
                 t: T.to_owned(),
                 k: tag,
@@ -1517,14 +1575,32 @@ async fn session(
             }
             world.chaos_yield().await;
         }
-        if let Some(r) = result {
+        if gone {
+            // The client went away: the gateway ends the session (its
+            // transaction is decided as the coordinator left it), and the
+            // client logs in again. It never got an answer.
+            log.set_dtid(tag, txn.dtid());
+            txn.close().await;
+            txn = open();
+        } else if let Some(r) = result {
             if txn.in_txn() {
                 txn.rollback().await.unwrap();
             }
             log.finish(tag, r);
         } else {
             log.set_dtid(tag, txn.dtid());
-            let r = match txn.commit().await {
+            let committed = tokio::select! {
+                biased;
+                r = txn.commit() => Some(r),
+                () = cut.notified() => None,
+            };
+            let Some(committed) = committed else {
+                txn.close().await;
+                txn = open();
+                world.sleep(Duration::from_millis(rng.range(1..200))).await;
+                continue;
+            };
+            let r = match committed {
                 Ok(o) => {
                     if o.stragglers > 0 {
                         STATS
@@ -1616,6 +1692,9 @@ enum Kind {
     /// orphaned statements; `fence`: the relays; `ryw`:
     /// read each row back after an OK commit.
     Isolation { fence: bool, ryw: Option<bool> },
+    /// Sprig 2PC whose clients go away at a coordinator step (every n-th
+    /// transaction there); `fence`: with the relays.
+    ClientGone { fence: bool },
 }
 
 const GALERA: [usize; 3] = [2, 3, 4];
@@ -1681,6 +1760,26 @@ async fn run(world: World, plan: FaultPlan, kind: Kind) -> Result<(), String> {
         Kind::Xa => Scenario::random(world.rng()),
         Kind::Sprig => Scenario::sprig(world.rng()),
         Kind::Isolation { fence, ryw } => Scenario::isolation(world.rng(), fence, ryw),
+        Kind::ClientGone { fence } => {
+            const POINTS: [Point; 7] = [
+                Point::BranchOpened,
+                Point::BeforePrepare,
+                Point::Prepared,
+                Point::PendingRecorded,
+                Point::BeforeCommitPoint,
+                Point::CommitPoint,
+                Point::Phase2Branch,
+            ];
+            let rng = world.rng();
+            let mut sc = if fence {
+                Scenario::isolation(rng, true, Some(true))
+            } else {
+                Scenario::sprig(rng)
+            };
+            sc.crash = Some((*rng.pick(&POINTS), u32::try_from(1 + rng.below(3)).unwrap()));
+            sc.client_gone = true;
+            sc
+        }
     };
     if sc.rmw {
         // MariaDB runs a statement on after its client went away.
@@ -1707,8 +1806,8 @@ async fn run(world: World, plan: FaultPlan, kind: Kind) -> Result<(), String> {
     });
     setup(&env).await;
     world.record(format!(
-        "scenario policy={:?} all_xa={} crash={:?} hot={} rmw={} ryw={:?} fence={} gw2={}",
-        sc.policy, sc.all_xa, sc.crash, sc.hot, sc.rmw, sc.ryw, sc.fence, sc.gw2
+        "scenario policy={:?} all_xa={} crash={:?} hot={} rmw={} ryw={:?} fence={} gw2={} client_gone={}",
+        sc.policy, sc.all_xa, sc.crash, sc.hot, sc.rmw, sc.ryw, sc.fence, sc.gw2, sc.client_gone
     ));
     let locator = Arc::new(StaticLocator::new());
     for i in 0..CLUSTERS.len() {
@@ -1725,6 +1824,7 @@ async fn run(world: World, plan: FaultPlan, kind: Kind) -> Result<(), String> {
         seen: Mutex::new(HashMap::new()),
         fired: AtomicBool::new(false),
         restart_after: Duration::from_millis(world.rng().range(200..5000)),
+        client_gone: sc.client_gone,
     });
     let rcfg = ResolverConfig {
         interval: Duration::from_secs(2),
@@ -1784,6 +1884,7 @@ async fn run(world: World, plan: FaultPlan, kind: Kind) -> Result<(), String> {
             seen: Mutex::new(HashMap::new()),
             fired: AtomicBool::new(false),
             restart_after: Duration::ZERO,
+            client_gone: false,
         });
         spawn_gateway(&world, &Node::from("gw2"), &env, &log, &sc, &quiet, 1 << 20);
     }
@@ -2104,6 +2205,41 @@ fn sprig_2pc_survives_coordinator_and_participant_crashes_on_galera() {
     print_totals("sprig_2pc");
 }
 
+/// A client that goes away at any coordinator step, its statement cut
+/// short and its session closed while the gateway lives on, leaves its
+/// transaction all or nothing: on Galera only (the gateway holds the
+/// branches) and with the relay fence, under the same random faults.
+#[test]
+fn sprig_2pc_survives_clients_that_go_away_mid_transaction() {
+    let nodes: Vec<Node> = ["gw", "ctl", "a1", "b1", "b2", "g1n1", "g2n1", "g3n1"]
+        .into_iter()
+        .map(Node::from)
+        .collect();
+    Sim::new("txn_sprig2pc_client_gone")
+        .seeds(200)
+        .max_time(Duration::from_secs(3600))
+        .run_with_faults(
+            move |rng| {
+                let n = rng.index(4);
+                FaultPlan::random(rng, &nodes, HORIZON, n)
+            },
+            |w, plan| async move {
+                run(w, plan, Kind::ClientGone { fence: false })
+                    .await
+                    .map_err(Into::into)
+            },
+        );
+    Sim::new("txn_sprig2pc_fence_client_gone")
+        .seeds(200)
+        .max_time(Duration::from_secs(3600))
+        .run_with_faults(isolation_plan, |w, plan| async move {
+            run(w, plan, Kind::ClientGone { fence: true })
+                .await
+                .map_err(Into::into)
+        });
+    print_totals("sprig_2pc_client_gone");
+}
+
 const FENCED_NODES: [&str; 11] = [
     "gw", "gw2", "ctl", "a1", "b1", "b2", "g1n1", "g2n1", "g3n1", "g1a", "g2a",
 ];
@@ -2200,7 +2336,7 @@ fn print_totals(what: &str) {
          runs {} (determinism reruns included), txns {}, committed {} \
          (xa_2pc {}, sprig_2pc {}, best_effort {}), rejected 39440 {}, rolled back {}, outcome unknown \
          39441 {}, partial 39442 {}, no answer (gateway crashed) {}; gateway crashes at a \
-         coordinator step {}; resolver XA COMMIT {}, XA ROLLBACK {}, redo replays {}, redo drops {}; \
+         coordinator step {}, clients gone at a coordinator step {}; resolver XA COMMIT {}, XA ROLLBACK {}, redo replays {}, redo drops {}; \
          relay fence: tenants fenced {}, connections ended {}, connections refused {}, agent \
          replays {}, agent redo deletes (finished and dropped) {}; hot-row appends {}; phase-2 stragglers {}, read-backs {}, \
          settles refused (39449) {}",
@@ -2216,6 +2352,7 @@ fn print_totals(what: &str) {
         g(&s.partial),
         g(&s.no_answer),
         g(&s.crashes),
+        g(&s.clients_gone),
         g(&s.resolver_commits),
         g(&s.resolver_rollbacks),
         g(&s.redo_replays),

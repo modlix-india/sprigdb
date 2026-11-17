@@ -1,4 +1,4 @@
-//! The k-way merge across clusters (chapter 38, "Merging across shards").
+//! The k-way merge across clusters.
 //!
 //! Each input is one cluster's feed of a scope, in key order; its
 //! **frontier** is the key of the last thing it yielded, an item or a
@@ -8,9 +8,8 @@
 //! range is held by a move, nothing above the hold's floor is emitted, so
 //! the order stays causal across the move.
 //!
-//! R1's tenant feed ([`crate::tail`]) has one input at a time (a tenant
-//! lives on one cluster); this is the merge the multi-cluster feed (R5,
-//! build step 12) runs.
+//! The tenant feed ([`crate::tail`]) has one input at a time (a tenant
+//! lives on one cluster); this is the merge the multi-cluster feed runs.
 
 use std::cmp::Ordering;
 use std::collections::VecDeque;
@@ -171,7 +170,7 @@ mod tests {
         }
     }
 
-    /// The chapter's worked example: c1 has T(105); c2 has heartbeat 103,
+    /// c1 has T(105); c2 has heartbeat 103,
     /// T(104), heartbeat 110.
     #[test]
     fn worked_example() {

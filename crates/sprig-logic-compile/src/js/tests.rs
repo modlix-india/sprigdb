@@ -29,6 +29,7 @@ fn sig(params: &[(&str, Ty)], returns: Option<Ty>) -> Signature {
         params: params.iter().map(|(n, t)| ((*n).to_owned(), *t)).collect(),
         returns,
         row: None,
+        on: None,
     }
 }
 
@@ -245,8 +246,12 @@ fn what_runs_in_the_engine_tier() {
     let s = sig(&[("x", Ty::Int), ("t", Ty::Str)], None);
     for (src, code) in [
         (
-            "try { return {a: 1}; } catch (e) { return {a: 2}; }",
-            "js.try",
+            "try { db.exec('DELETE FROM orders WHERE id = ?', [x]); } catch (e) { return {m: e.message}; } return {};",
+            "js.catch_value",
+        ),
+        (
+            "try { return {a: 1}; } catch (e) { return {e}; }",
+            "js.catch_value",
         ),
         ("return { u: t.toUpperCase() };", "js.nullable_receiver"),
         ("return { r: fetch('http://x') };", "js.call"),
@@ -265,9 +270,14 @@ fn what_runs_in_the_engine_tier() {
         ("return { s: x == '1' };", "js.loose_equality"),
         ("return { s: t < 'b' };", "js.compare"),
         (
-            "function h(a) { return a; } return { v: h(x) };",
+            "function h(a) { if (a > 0) return h(a - 1); return 0; } return { v: h(x) };",
+            "js.recursion",
+        ),
+        (
+            "function h(a) { let b = a; return b; } return { v: x > 0 && h(x) > 1 };",
             "js.helper",
         ),
+        ("const h = (a) => a; return { v: h };", "js.helper"),
         (
             "import fs from 'fs'; export default function (x, t) { return {}; }",
             "js.import",
@@ -603,4 +613,742 @@ fn a_javascript_function_is_a_computed_expression() {
         "{}",
         e.text
     );
+}
+
+/// A database for the interpreter: `INSERT` fails with a duplicate key for
+/// id 1, `SELECT` finds nothing.
+struct FakeDb;
+
+impl interp::Db for FakeDb {
+    fn query(&mut self, _: &str, _: &[Value]) -> sprig_common::Result<Vec<Vec<Option<String>>>> {
+        Ok(Vec::new())
+    }
+    fn exec(&mut self, sql: &str, binds: &[Value]) -> sprig_common::Result<u64> {
+        if sql.starts_with("INSERT") && binds.first() == Some(&Value::Int(1)) {
+            return Err(sprig_common::SprigError::backend(
+                1062,
+                *b"23000",
+                "Duplicate entry '1' for key 'PRIMARY'",
+            ));
+        }
+        Ok(1)
+    }
+}
+
+fn run_db(c: &Compiled, args: &[Value]) -> std::result::Result<(String, serde_json::Value), u16> {
+    let f = c.ir.as_ref().unwrap();
+    interp::run(f, args, &mut FakeDb, &interp::Limits::default())
+        .map(|o| (o.event, o.result))
+        .map_err(|e| match e.kind {
+            sprig_common::ErrorKind::Sprig(c) => c.number(),
+            sprig_common::ErrorKind::Backend { errno, .. }
+            | sprig_common::ErrorKind::Standard { errno, .. } => errno,
+        })
+}
+
+fn compiles(src: &str, s: &Signature) -> Compiled {
+    let c = js(src, s);
+    assert!(c.compilable(), "{src}: {:#?}", c.analysis.reasons);
+    c
+}
+
+#[test]
+fn try_catch_sees_the_error_objects_name_and_message() {
+    let s = sig(&[("x", Ty::Int)], None);
+    let c = compiles(
+        "let r = 'none';
+         try {
+           if (x < 0) throw new Error('neg ' + x);
+           if (x === 0) throw new RangeError('zero');
+           r = 'ok';
+         } catch (e) {
+           r = e.name + ':' + e.message;
+         }
+         return { r };",
+        &s,
+    );
+    assert_eq!(
+        run(&c, &[Value::Int(-2)]),
+        Ok(("output".into(), json!({"r": "Error:neg -2"})))
+    );
+    assert_eq!(
+        run(&c, &[Value::Int(0)]),
+        Ok(("output".into(), json!({"r": "RangeError:zero"})))
+    );
+    assert_eq!(
+        run(&c, &[Value::Int(5)]),
+        Ok(("output".into(), json!({"r": "ok"})))
+    );
+    let p = c.plsql.unwrap().procedure;
+    assert!(p.contains("GET DIAGNOSTICS CONDITION 1"), "{p}");
+    assert!(p.contains("v__src INT := 0;"), "{p}");
+}
+
+#[test]
+fn finally_runs_on_every_way_out() {
+    let s = sig(&[("x", Ty::Int)], None);
+    let c = compiles(
+        "let log = '';
+         function step(t) { log = log + t; }
+         for (let i = 0; i < 3; i++) {
+           try {
+             step('t' + i);
+             if (i === 1) continue;
+             if (i === 2) break;
+             step('a');
+           } finally {
+             step('f');
+           }
+           step('n');
+         }
+         try {
+           return { log, v: x };
+         } finally {
+           log = log + 'X';
+         }",
+        &s,
+    );
+    assert_eq!(
+        run(&c, &[Value::Int(1)]),
+        Ok(("output".into(), json!({"log": "t0afnt1ft2f", "v": 1})))
+    );
+}
+
+#[test]
+fn finally_overrides_and_swallows_and_errors_go_on() {
+    let s = sig(&[("x", Ty::Int)], None);
+    let c = compiles(
+        "function f1() { try { return 1; } finally { return 2; } }
+         function f2(a) {
+           try { if (a > 0) throw new Error('x'); return 'n'; }
+           finally { if (a > 1) return 'swallowed'; }
+         }
+         let out = '';
+         try { out = f2(x); } catch (e) { out = 'caught ' + e.message; }
+         return { a: f1(), b: out };",
+        &s,
+    );
+    for (x, b) in [(0, "n"), (1, "caught x"), (2, "swallowed")] {
+        assert_eq!(
+            run(&c, &[Value::Int(x)]),
+            Ok(("output".into(), json!({"a": 2, "b": b}))),
+            "x = {x}"
+        );
+    }
+}
+
+#[test]
+fn a_caught_error_thrown_again_reaches_the_outer_catch() {
+    let s = sig(&[("x", Ty::Int)], None);
+    let c = compiles(
+        "try {
+           try { throw new TypeError('inner'); }
+           catch (e) { if (x > 0) throw e; return { w: 'kept ' + e.name }; }
+         } catch (e2) { return { w: 'outer ' + e2.name + ' ' + e2.message }; }",
+        &s,
+    );
+    assert_eq!(
+        run(&c, &[Value::Int(0)]),
+        Ok(("output".into(), json!({"w": "kept TypeError"})))
+    );
+    assert_eq!(
+        run(&c, &[Value::Int(1)]),
+        Ok(("output".into(), json!({"w": "outer TypeError inner"})))
+    );
+    // Uncaught, it is the function's error.
+    let c = compiles(
+        "try { throw new Error('a'); } catch (e) { if (x > 0) throw e; } return {};",
+        &s,
+    );
+    assert_eq!(run(&c, &[Value::Int(1)]), Err(39865));
+    assert_eq!(run(&c, &[Value::Int(0)]), Ok(("output".into(), json!({}))));
+}
+
+#[test]
+fn reject_and_budgets_are_not_caught() {
+    let s = sig(&[("x", Ty::Int)], None);
+    let c = compiles(
+        "try { if (x === 1) sprig.reject('no'); } catch (e) { return { c: 1 }; }
+         return { c: 0 };",
+        &s,
+    );
+    assert_eq!(run(&c, &[Value::Int(1)]), Err(39863));
+    assert_eq!(
+        run(&c, &[Value::Int(0)]),
+        Ok(("output".into(), json!({"c": 0})))
+    );
+    let c = compiles(
+        "let n = 0;
+         try { while (true) { n++; } } catch (e) { return { c: 1 }; } finally { n = 0; }
+         return { n };",
+        &s,
+    );
+    assert_eq!(run(&c, &[Value::Int(0)]), Err(39864));
+    // Arithmetic JavaScript doesn't throw on isn't caught either.
+    let c = compiles(
+        "let q = 0; try { q = 10 % x; } catch (e) { return { c: 1 }; } return { q };",
+        &s,
+    );
+    assert_eq!(run(&c, &[Value::Int(0)]), Err(39866));
+}
+
+#[test]
+fn a_null_row_and_database_errors_are_caught() {
+    let s = sig(&[("x", Ty::Int)], None);
+    let c = compiles(
+        "const p = db.sqlOne('SELECT stock FROM products WHERE id = ?', [x]);
+         try { return { s: p.stock }; } catch (e) { return { n: e.name, m: e.message }; }",
+        &s,
+    );
+    assert_eq!(
+        run_db(&c, &[Value::Int(7)]),
+        Ok((
+            "output".into(),
+            json!({"n": "TypeError", "m": "cannot read property 'stock' of null"})
+        ))
+    );
+    let c = compiles(
+        "let ok = true;
+         try { db.exec('INSERT INTO orders (id, product_id, qty) VALUES (?, ?, ?)', [x, 1, 1]); }
+         catch (e) { ok = false; }
+         return { ok };",
+        &s,
+    );
+    assert_eq!(
+        run_db(&c, &[Value::Int(1)]),
+        Ok(("output".into(), json!({"ok": false})))
+    );
+    assert_eq!(
+        run_db(&c, &[Value::Int(2)]),
+        Ok(("output".into(), json!({"ok": true})))
+    );
+    // Through a `finally`, a database error keeps its number.
+    let c = compiles(
+        "let n = 0;
+         try { db.exec('INSERT INTO orders (id, product_id, qty) VALUES (?, ?, ?)', [x, 1, 1]); }
+         finally { n = 1; }
+         return { n };",
+        &s,
+    );
+    assert_eq!(run_db(&c, &[Value::Int(1)]), Err(1062));
+    assert_eq!(
+        run_db(&c, &[Value::Int(2)]),
+        Ok(("output".into(), json!({"n": 1})))
+    );
+}
+
+#[test]
+fn do_while_runs_once_then_tests() {
+    let s = sig(&[("x", Ty::Int)], None);
+    let c = compiles(
+        "let i = 0; let s = 0;
+         do { i++; if (i === 2) continue; s += i; } while (i < x);
+         return { i, s };",
+        &s,
+    );
+    assert_eq!(
+        run(&c, &[Value::Int(0)]),
+        Ok(("output".into(), json!({"i": 1, "s": 1})))
+    );
+    assert_eq!(
+        run(&c, &[Value::Int(3)]),
+        Ok(("output".into(), json!({"i": 3, "s": 4})))
+    );
+}
+
+#[test]
+fn helpers_are_inlined_with_their_closures() {
+    let s = sig(&[("x", Ty::Int)], None);
+    let c = compiles(
+        "const tax = (p) => p * 0.25;
+         function net(p, q) { const g = p * q; return g + tax(g); }
+         function label(n) { if (n > 100) return 'big'; if (n > 10) return 'mid'; return 'small'; }
+         let total = 0;
+         for (let i = 1; i <= x; i++) total += net(i, 2);
+         if (label(total) === 'mid') total = total + 1000;
+         return { total, l: label(total), t: tax(4) };",
+        &s,
+    );
+    assert_eq!(
+        run(&c, &[Value::Int(3)]),
+        Ok((
+            "output".into(),
+            json!({"total": 1015.0, "l": "big", "t": 1.0})
+        ))
+    );
+    assert_eq!(
+        run(&c, &[Value::Int(1)]),
+        Ok((
+            "output".into(),
+            json!({"total": 2.5, "l": "small", "t": 1.0})
+        ))
+    );
+    // A helper in a loop's test runs before each test.
+    let c = compiles(
+        "function more(i) { if (i < x) return true; return false; }
+         let i = 0; while (more(i)) { i++; } return { i };",
+        &s,
+    );
+    assert_eq!(
+        run(&c, &[Value::Int(4)]),
+        Ok(("output".into(), json!({"i": 4})))
+    );
+    // Module form: helpers beside the default export see module scope only.
+    let c = compiles(
+        "import { db } from 'sprig:db';
+         const twice = (n) => n * 2;
+         function pick(a, b) { if (a > b) { return a; } return b; }
+         export default function (x) { return { v: pick(twice(x), 10) }; }",
+        &s,
+    );
+    assert_eq!(
+        run(&c, &[Value::Int(7)]),
+        Ok(("output".into(), json!({"v": 14})))
+    );
+    assert_eq!(
+        run(&c, &[Value::Int(2)]),
+        Ok(("output".into(), json!({"v": 10})))
+    );
+}
+
+/// The compiler's view with one callee and two streams.
+struct Linked {
+    cols: StaticColumns,
+}
+
+impl crate::sql::Columns for Linked {
+    fn column(&self, table: &str, column: &str) -> Option<Ty> {
+        self.cols.column(table, column)
+    }
+    fn has_table(&self, table: &str) -> bool {
+        self.cols.has_table(table)
+    }
+    fn callee(&self, name: &str) -> Option<std::result::Result<crate::link::Callee, String>> {
+        match name {
+            "price" => Some(Ok(crate::link::Callee {
+                module_id: 31,
+                name: "price".into(),
+                params: vec![Ty::Int],
+                fields: vec![("price".into(), Ty::Float), ("ok".into(), Ty::Int)],
+                reads: vec!["products".into()],
+                writes: Vec::new(),
+                reaches: vec![40],
+                depth: 1,
+            })),
+            "deep" => Some(Ok(crate::link::Callee {
+                module_id: 32,
+                name: "deep".into(),
+                params: Vec::new(),
+                fields: Vec::new(),
+                reads: Vec::new(),
+                writes: Vec::new(),
+                reaches: Vec::new(),
+                depth: 8,
+            })),
+            "engine_only" => Some(Err("engine_only runs in the engine tier".into())),
+            _ => None,
+        }
+    }
+    fn stream(&self, name: &str) -> Option<std::result::Result<crate::link::StreamTarget, String>> {
+        (name == "orders_s").then(|| {
+            Ok(crate::link::StreamTarget {
+                name: "orders_s".into(),
+                outbox: "__sprig_eo_5".into(),
+                max_bytes: 20,
+                compact: true,
+            })
+        })
+    }
+}
+
+fn linked(src: &str, module: u64) -> Compiled {
+    let opts = Options {
+        module_id: module,
+        ..Options::default()
+    };
+    compile_with(
+        "f",
+        src,
+        &sig(&[("x", Ty::Int)], None),
+        &Linked { cols: cat() },
+        &opts,
+    )
+    .unwrap()
+}
+
+/// Answers a call of `price` and records statements.
+#[derive(Default)]
+struct CallDb {
+    seen: Vec<String>,
+}
+
+impl interp::Db for CallDb {
+    fn query(&mut self, _: &str, _: &[Value]) -> sprig_common::Result<Vec<Vec<Option<String>>>> {
+        Ok(Vec::new())
+    }
+    fn exec(&mut self, sql: &str, _: &[Value]) -> sprig_common::Result<u64> {
+        self.seen.push(sql.to_owned());
+        Ok(1)
+    }
+    fn call(
+        &mut self,
+        sql: &str,
+        binds: &[Value],
+    ) -> sprig_common::Result<(String, Option<String>)> {
+        self.seen.push(sql.to_owned());
+        Ok(match binds.first() {
+            Some(Value::Int(7)) => (
+                "output".into(),
+                Some(r#"{"price": 2.5, "ok": true}"#.into()),
+            ),
+            _ => ("missing".into(), Some("{}".into())),
+        })
+    }
+}
+
+#[test]
+fn db_call_compiles_into_the_callee_call_entry() {
+    let c = linked(
+        "const r = db.call('price', x);
+         return { e: r.event, p: r.fields.price, ok: r.fields.ok, all: r };",
+        9,
+    );
+    assert!(c.compilable(), "{:?}", c.analysis.reasons);
+    let p = c.plsql.as_ref().unwrap();
+    assert!(
+        p.procedure
+            .contains("CALL `__sprig_l31_call`((p_x), v_r_event, v_r_result);"),
+        "{}",
+        p.procedure
+    );
+    assert!(
+        p.procedure
+            .contains("v_r_price := CAST(JSON_VALUE(v_r_result, '$.\"price\"') AS DOUBLE);"),
+        "{}",
+        p.procedure
+    );
+    assert_eq!(c.analysis.reads, vec!["products".to_owned()]);
+    assert_eq!(c.analysis.calls.len(), 1);
+    assert_eq!(c.analysis.calls[0].module, 31);
+    assert_eq!(c.analysis.reaches, vec![31, 40]);
+    assert_eq!(c.analysis.call_depth, 2);
+    let f = c.ir.as_ref().unwrap();
+    let mut db = CallDb::default();
+    let o = interp::run(f, &[Value::Int(7)], &mut db, &interp::Limits::default()).unwrap();
+    assert_eq!(
+        o.result,
+        json!({"e": "output", "p": 2.5, "ok": 1,
+               "all": {"event": "output", "fields": {"price": 2.5, "ok": 1}}})
+    );
+    assert_eq!(db.seen, vec!["CALL `__sprig_l31_call`(?".to_owned()]);
+    let o = interp::run(f, &[Value::Int(8)], &mut db, &interp::Limits::default()).unwrap();
+    assert_eq!(o.result["e"], json!("missing"));
+    assert_eq!(o.result["p"], json!(null));
+}
+
+#[test]
+fn db_call_stays_in_the_engine_tier_when_it_must() {
+    for (src, module, code) in [
+        ("db.call('price', x); return {};", 40, "js.recursion"),
+        ("db.call('price', x); return {};", 31, "js.recursion"),
+        ("db.call('deep'); return {};", 9, "db.call"),
+        ("db.call('engine_only', x); return {};", 9, "db.call"),
+        ("db.call('nothing', x); return {};", 9, "db.call"),
+        (
+            "const r = db.call('price', x); return { n: r.fields.nope };",
+            9,
+            "js.member",
+        ),
+        ("db.call('price'); return {};", 9, "db.call"),
+        ("const n = 'price'; db.call(n, x); return {};", 9, "db.call"),
+        (
+            "return { v: x > 0 ? db.call('price', x).fields.price : 0 };",
+            9,
+            "js.db",
+        ),
+        (
+            "return { v: db.call('price', x).fields.nope };",
+            9,
+            "js.member",
+        ),
+        ("return { v: db.call('price', x).nope };", 9, "js.member"),
+        (
+            "return { v: db.publish('orders_s', 'k', 'v').nope };",
+            9,
+            "js.member",
+        ),
+        ("db.commitOffset('g', 's', 0, 1); return {};", 9, "js.db"),
+        ("db.mq.ack('t'); return {};", 9, "*"),
+        (
+            "db.publish('elsewhere', 'k', 'v'); return {};",
+            9,
+            "db.publish",
+        ),
+        (
+            "db.publish('orders_s', 'k', 'v', ['h']); return {};",
+            9,
+            "db.publish",
+        ),
+        (
+            "db.publish('orders_s', 'k', 'v', null, {tenant: 'a'}); return {};",
+            9,
+            "db.publish",
+        ),
+    ] {
+        let c = linked(src, module);
+        assert!(!c.compilable(), "{src}");
+        assert!(
+            code == "*" || c.analysis.reasons.iter().any(|r| r.code == code),
+            "{src}: {:?}",
+            c.analysis.reasons
+        );
+    }
+}
+
+#[test]
+fn db_publish_writes_the_outbox_after_the_gateway_checks() {
+    let c = linked(
+        "const a = db.publish('orders_s', x, { id: x }, { h: 'v' });
+         db.publish('orders_s', null, 'gone');
+         return { a: a.affected };",
+        9,
+    );
+    assert!(c.compilable(), "{:?}", c.analysis.reasons);
+    let p = c.plsql.as_ref().unwrap();
+    assert!(
+        p.procedure
+            .contains("INSERT INTO `__sprig_eo_5` (k, v, headers) VALUES ("),
+        "{}",
+        p.procedure
+    );
+    assert!(p.procedure.contains("fail(39944"), "{}", p.procedure);
+    assert!(p.procedure.contains("fail(39955"), "{}", p.procedure);
+    assert!(p.procedure.contains("JSON_COMPACT("), "{}", p.procedure);
+    assert_eq!(c.analysis.writes, vec!["orders_s".to_owned()]);
+    let f = c.ir.as_ref().unwrap();
+    // The first publish fits (key "7", value {"id":7} and headers
+    // {"h":"v"}: 18 bytes); the second has no key on a compacted stream.
+    let mut db = CallDb::default();
+    let e = interp::run(f, &[Value::Int(7)], &mut db, &interp::Limits::default()).unwrap_err();
+    assert_eq!(e.code().map(sprig_common::SprigCode::number), Some(39955));
+    assert_eq!(db.seen.len(), 1);
+    // Key, value and headers of 36 bytes are above the stream's 20.
+    let e = interp::run(
+        f,
+        &[Value::Int(1_234_567_890)],
+        &mut CallDb::default(),
+        &interp::Limits::default(),
+    )
+    .unwrap_err();
+    assert_eq!(e.code().map(sprig_common::SprigCode::number), Some(39944));
+}
+
+#[test]
+fn db_call_and_db_publish_compile_inside_expressions() {
+    let c = linked(
+        "const t = 'p:' + db.call('price', x).event;
+         if (db.call('price', x + 1).event === 'output') {
+           return { t, a: db.publish('orders_s', 'k', 'v').affected };
+         }
+         return { t, p: db.call('price', x).fields.price, all: db.call('price', x) };",
+        9,
+    );
+    assert!(c.compilable(), "{:?}", c.analysis.reasons);
+    let f = c.ir.as_ref().unwrap();
+    let mut db = CallDb::default();
+    let o = interp::run(f, &[Value::Int(7)], &mut db, &interp::Limits::default()).unwrap();
+    assert_eq!(
+        o.result,
+        json!({"t": "p:output", "p": 2.5,
+               "all": {"event": "output", "fields": {"price": 2.5, "ok": 1}}})
+    );
+    // Each call once, in the order JavaScript makes them.
+    assert_eq!(db.seen.len(), 4, "{:?}", db.seen);
+    let mut db = CallDb::default();
+    let o = interp::run(f, &[Value::Int(6)], &mut db, &interp::Limits::default()).unwrap();
+    assert_eq!(o.result["a"], json!(1));
+    assert_eq!(db.seen.len(), 3, "{:?}", db.seen);
+}
+
+/// A trigger on a stream: its arguments by parameter name, from a record.
+fn record_args(c: &Compiled, rec: &serde_json::Value) -> Vec<Value> {
+    c.ir.as_ref()
+        .unwrap()
+        .params
+        .iter()
+        .map(|p| {
+            let v = rec
+                .as_object()
+                .unwrap()
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&p.name))
+                .map_or(serde_json::Value::Null, |(_, v)| v.clone());
+            match (p.ty, v) {
+                (_, serde_json::Value::Null) => Value::Null,
+                (Ty::Json, v) => Value::Json(v),
+                (_, serde_json::Value::String(t)) => Value::Str(t),
+                (_, serde_json::Value::Bool(b)) => Value::Bool(b),
+                (_, v) => v.as_i64().map_or_else(|| Value::from_json(v), Value::Int),
+            }
+        })
+        .collect()
+}
+
+fn run_logs(c: &Compiled, args: &[Value]) -> std::result::Result<Vec<String>, u16> {
+    let f = c.ir.as_ref().unwrap();
+    interp::run(f, args, &mut interp::NoDb, &interp::Limits::default())
+        .map(|o| o.logs)
+        .map_err(|e| {
+            println!("error: {e}");
+            e.code().map_or(0, sprig_common::SprigCode::number)
+        })
+}
+
+#[test]
+fn stream_triggers_read_the_record_and_parsed_json() {
+    let s = Signature::message(MsgSource::Stream);
+    let c = js(
+        "export default function (ctx) {
+           const r = ctx.record;
+           const e = JSON.parse(r.value);
+           if (e === null) { console.log('tombstone', r.key); return; }
+           const kind = e.type ?? 'none';
+           let total = 0;
+           for (const it of e.items ?? []) { total += it.qty * 2; }
+           console.log(kind, e.user?.name, total, r.offset, typeof e.n === 'number', e.tags.length);
+           if (e.flag) console.log('flagged ' + e.n);
+           console.log(ctx.record.headers['x-src'] ?? 'nosrc', e.n == 3);
+         }",
+        &s,
+    );
+    // `e.items ?? []` mixes an array literal with parsed JSON: refused.
+    assert!(
+        reasons(&c).contains(&"js.dynamic_types".to_owned()),
+        "{:?}",
+        reasons(&c)
+    );
+    let c = js(
+        "export default function (ctx) {
+           const r = ctx.record;
+           const e = JSON.parse(r.value);
+           if (e === null) { console.log('tombstone', r.key); return; }
+           const kind = e.type ?? 'none';
+           let total = 0;
+           if (Array.isArray(e.items)) { for (const it of e.items) { total += it.qty * 2; } }
+           console.log(kind, e.user?.name, total, r.offset, typeof e.n === 'number', e.tags.length);
+           if (e.flag) console.log('flagged ' + e.n);
+           console.log(ctx.record.headers['x-src'] ?? 'nosrc', e.n == 3);
+         }",
+        &s,
+    );
+    assert!(c.compilable(), "{:?}", c.analysis.reasons);
+    let names: Vec<&str> =
+        c.ir.as_ref()
+            .unwrap()
+            .params
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+    assert_eq!(names, ["value", "key", "offset", "headers"]);
+    let rec = |value: serde_json::Value| json!({"key": "k1", "value": value, "offset": 7, "headers": {"x-src": "app"}});
+    let v = json!({"type": "add", "user": {"name": "ann"}, "items": [{"qty": 2}, {"qty": 1.5}],
+                   "n": 3, "tags": ["a", "b"], "flag": 1});
+    assert_eq!(
+        run_logs(
+            &c,
+            &record_args(&c, &rec(serde_json::Value::String(v.to_string())))
+        ),
+        Ok(vec![
+            "add ann 7 7 true 2".to_owned(),
+            "flagged 3".to_owned(),
+            "app true".to_owned(),
+        ])
+    );
+    // A tombstone parses as null.
+    assert_eq!(
+        run_logs(&c, &record_args(&c, &rec(serde_json::Value::Null))),
+        Ok(vec!["tombstone k1".to_owned()])
+    );
+    // A missing member is undefined: `?.` of it too.
+    let v = json!({"n": "3", "tags": "ab"});
+    assert_eq!(
+        run_logs(
+            &c,
+            &record_args(&c, &rec(serde_json::Value::String(v.to_string())))
+        ),
+        Err(39876),
+        "`e.n == 3` with a string n converts: the engine tier"
+    );
+    let v = json!({"n": 4, "tags": "abc", "flag": ""});
+    assert_eq!(
+        run_logs(
+            &c,
+            &record_args(&c, &rec(serde_json::Value::String(v.to_string())))
+        ),
+        Ok(vec![
+            "none undefined 0 7 true 3".to_owned(),
+            "app false".to_owned()
+        ])
+    );
+    // Not JSON: the engine tier throws its own SyntaxError.
+    assert_eq!(
+        run_logs(&c, &record_args(&c, &rec(json!("{nope")))),
+        Err(39876)
+    );
+    // The generated code has the log parameter and the helpers.
+    let p = c.plsql.as_ref().unwrap();
+    assert!(
+        p.procedure.contains("p__log OUT LONGTEXT"),
+        "{}",
+        p.procedure
+    );
+    let body = p.package_body.as_deref().unwrap_or_default();
+    for f in ["j_parse", "j_get", "j_at", "j_truthy", "j_text"] {
+        assert!(body.contains(&format!("FUNCTION {f}(")), "{f}");
+    }
+}
+
+#[test]
+fn queue_triggers_bind_parsed_values_by_column() {
+    let s = Signature::message(MsgSource::Queue);
+    let c = js(
+        "const job = JSON.parse(ctx.message.body);
+         db.exec('INSERT INTO orders (id, product_id, qty, note) VALUES (?, ?, ?, ?)',
+                 [job.id, job.product, job.qty, job.note]);
+         if (ctx.message.redelivered) console.log('again ' + ctx.message.deliveryCount);",
+        &s,
+    );
+    assert!(c.compilable(), "{:?}", c.analysis.reasons);
+    let f = c.ir.as_ref().unwrap();
+    let names: Vec<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["body", "redelivered", "deliverycount"]);
+    let Some(crate::ir::Stmt::Db(crate::ir::DbOp::Sql { binds, .. })) =
+        f.body.iter().find(|s| matches!(s, crate::ir::Stmt::Db(_)))
+    else {
+        panic!("no statement: {f}");
+    };
+    let kinds: Vec<&str> = binds
+        .iter()
+        .map(|b| match b {
+            Expr::Builtin(b, _) => b.name(),
+            _ => "?",
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        ["json_as_int", "json_as_int", "json_as_int", "json_as_str"]
+    );
+    // Where the column isn't known, the value must be converted first.
+    let c = js(
+        "const job = JSON.parse(ctx.message.body);
+         db.exec('INSERT INTO orders VALUES (?, ?, ?, ?)', [job.id, 1, 1, 'x']);",
+        &s,
+    );
+    assert_eq!(reasons(&c), ["db.json_bind"]);
+    // Elsewhere, JSON.parse stays in the engine tier.
+    let c = js(
+        "return { n: JSON.parse(t).n };",
+        &sig(&[("t", Ty::Str)], None),
+    );
+    assert_eq!(reasons(&c), ["js.json_parse"]);
 }

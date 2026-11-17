@@ -752,6 +752,217 @@ async fn corpus(db: &Database) -> Vec<(String, Bson)> {
     out.extend(bulk_corpus(db).await);
     out.extend(stream_corpus(db).await);
     out.extend(retry_corpus(db).await);
+    out.extend(scope_corpus(db).await);
+    out
+}
+
+/// What [`scope_corpus`] compares of a reply: counts, write error codes,
+/// the documents of a first batch (index specs with their collation's
+/// locale and strength only: MongoDB lists every collation field), and
+/// `findAndModify`'s `_id`.
+fn scope_view(d: &Document) -> Bson {
+    let mut v = Document::new();
+    for k in ["n", "nModified", "numIndexesAfter", "values"] {
+        if let Some(x) = d.get(k) {
+            v.insert(k, x.clone());
+        }
+    }
+    if let Ok(w) = d.get_array("writeErrors") {
+        let codes: Vec<Bson> = w
+            .iter()
+            .filter_map(|e| e.as_document()?.get("code").cloned())
+            .collect();
+        v.insert("errors", codes);
+    }
+    if let Ok(b) = d
+        .get_document("cursor")
+        .and_then(|c| c.get_array("firstBatch"))
+    {
+        let docs: Vec<Bson> = b
+            .iter()
+            .filter_map(Bson::as_document)
+            .map(|x| {
+                let mut y = x.clone();
+                y.remove("v");
+                if let Ok(c) = x.get_document("collation") {
+                    let mut z = Document::new();
+                    for k in ["locale", "strength"] {
+                        if let Some(f) = c.get(k) {
+                            z.insert(k, f.clone());
+                        }
+                    }
+                    y.insert("collation", z);
+                }
+                Bson::Document(y)
+            })
+            .collect();
+        v.insert("batch", docs);
+    }
+    if let Some(x) = d.get("value") {
+        v.insert(
+            "value",
+            x.as_document()
+                .and_then(|x| x.get("_id").cloned())
+                .unwrap_or(Bson::Null),
+        );
+    }
+    Bson::Document(v)
+}
+
+/// Sparse and partial unique indexes, which are unique over the documents
+/// they hold only, and a collection's default collation, which commands
+/// without their own use.
+async fn scope_corpus(db: &Database) -> Vec<(String, Bson)> {
+    let steps: Vec<(&str, Document)> = vec![
+        (
+            "sparse seed",
+            doc! {"insert": "sp", "documents": [{"_id": 1}, {"_id": 2}]},
+        ),
+        (
+            "sparse unique",
+            doc! {"createIndexes": "sp", "indexes": [{"key": {"email": 1}, "name": "e", "unique": true, "sparse": true}]},
+        ),
+        (
+            "sparse inserts",
+            doc! {"insert": "sp", "ordered": false, "documents": [
+            {"_id": 3}, {"_id": 4, "email": "a"}, {"_id": 5, "email": "a"},
+            {"_id": 6, "email": null}, {"_id": 7, "email": null}]},
+        ),
+        (
+            "sparse update into a duplicate",
+            doc! {"update": "sp", "updates": [{"q": {"_id": 1}, "u": {"$set": {"email": "a"}}}]},
+        ),
+        (
+            "sparse unset frees it",
+            doc! {"update": "sp", "updates": [
+            {"q": {"_id": 4}, "u": {"$unset": {"email": 1}}},
+            {"q": {"_id": 1}, "u": {"$set": {"email": "a"}}}]},
+        ),
+        (
+            "partial seed",
+            doc! {"insert": "pa", "documents": [
+            {"_id": 1, "kind": "B", "u": 1}, {"_id": 2, "kind": "B", "u": 1}, {"_id": 3, "u": 1}]},
+        ),
+        (
+            "partial unique over duplicates outside it",
+            doc! {"createIndexes": "pa", "indexes": [{"key": {"u": 1}, "name": "u_1", "unique": true,
+            "partialFilterExpression": {"kind": "A"}}]},
+        ),
+        (
+            "partial inserts",
+            doc! {"insert": "pa", "ordered": false, "documents": [
+            {"_id": 4, "kind": "A", "u": 1}, {"_id": 5, "kind": "A", "u": 1}, {"_id": 6, "kind": "B", "u": 1}]},
+        ),
+        (
+            "partial update into it",
+            doc! {"update": "pa", "updates": [{"q": {"_id": 6}, "u": {"$set": {"kind": "A"}}}]},
+        ),
+        (
+            "partial with $type, $gt, $exists, $or and booleans",
+            doc! {"createIndexes": "pa", "indexes": [{"key": {"e": 1}, "name": "e_1", "unique": true,
+            "partialFilterExpression": {"e": {"$type": "string"}, "n": {"$gt": 5},
+                "$or": [{"live": true}, {"tier": {"$in": ["gold", 3]}}]}}]},
+        ),
+        (
+            "partial typed inserts",
+            doc! {"insert": "pa", "ordered": false, "documents": [
+            {"_id": 10, "e": 1, "n": 9, "live": true}, {"_id": 11, "e": 1, "n": 9, "live": true},
+            {"_id": 12, "e": "x", "n": 5, "live": true}, {"_id": 13, "e": "x", "n": 5, "live": true},
+            {"_id": 14, "e": "x", "n": 9, "live": false}, {"_id": 15, "e": "x", "n": 9, "live": false},
+            {"_id": 16, "e": "x", "n": 9, "live": true}, {"_id": 17, "e": "x", "n": 6.5, "tier": "gold"},
+            {"_id": 18, "e": "x", "n": 9, "tier": 4}]},
+        ),
+        (
+            "partial same key, other filter",
+            doc! {"createIndexes": "pa", "indexes": [{"key": {"u": 1}, "name": "u_c", "unique": true,
+            "partialFilterExpression": {"kind": "C"}}]},
+        ),
+        (
+            "partial same name, other filter",
+            doc! {"createIndexes": "pa", "indexes": [{"key": {"u": 1}, "name": "u_1", "unique": true,
+            "partialFilterExpression": {"kind": "D"}}]},
+        ),
+        (
+            "partial $ne refused",
+            doc! {"createIndexes": "pa", "indexes": [{"key": {"x": 1}, "name": "x_1",
+            "partialFilterExpression": {"x": {"$ne": 1}}}]},
+        ),
+        (
+            "partial and sparse refused",
+            doc! {"createIndexes": "pa", "indexes": [{"key": {"x": 1}, "name": "x_1", "sparse": true,
+            "partialFilterExpression": {"x": 1}}]},
+        ),
+        ("partial listIndexes", doc! {"listIndexes": "pa"}),
+        ("partial drop", doc! {"dropIndexes": "pa", "index": "u_1"}),
+        (
+            "partial free after the drop",
+            doc! {"insert": "pa", "documents": [{"_id": 20, "kind": "A", "u": 1}]},
+        ),
+        (
+            "collation create",
+            doc! {"create": "co", "collation": {"locale": "en_US", "strength": 1}},
+        ),
+        (
+            "collation seed",
+            doc! {"insert": "co", "documents": [
+            {"_id": 1, "name": "alpha"}, {"_id": 2, "name": "Zeta"}, {"_id": 3, "name": "Alpha"}, {"_id": 4, "name": "beta"}]},
+        ),
+        (
+            "collation find sort",
+            doc! {"find": "co", "sort": {"name": 1, "_id": 1}},
+        ),
+        (
+            "collation find eq",
+            doc! {"find": "co", "filter": {"name": "ALPHA"}, "sort": {"_id": 1}},
+        ),
+        (
+            "collation find simple",
+            doc! {"find": "co", "filter": {"name": "ALPHA"}, "collation": {"locale": "simple"}},
+        ),
+        (
+            "collation count",
+            doc! {"count": "co", "query": {"name": "alpha"}},
+        ),
+        (
+            "collation distinct",
+            doc! {"distinct": "co", "key": "name", "query": {"name": "BETA"}},
+        ),
+        (
+            "collation aggregate",
+            doc! {"aggregate": "co", "pipeline": [{"$match": {"name": {"$in": ["ZETA"]}}}], "cursor": {}},
+        ),
+        (
+            "collation update",
+            doc! {"update": "co", "updates": [
+            {"q": {"name": "alpha"}, "u": {"$set": {"hit": 1}}, "multi": true},
+            {"q": {"name": "ALPHA"}, "u": {"$set": {"hit": 2}}, "multi": true, "collation": {"locale": "simple"}}]},
+        ),
+        (
+            "collation findAndModify",
+            doc! {"findAndModify": "co", "query": {"name": "BETA"}, "update": {"$set": {"hit": 3}}},
+        ),
+        (
+            "collation delete",
+            doc! {"delete": "co", "deletes": [{"q": {"name": "ZETA"}, "limit": 1}]},
+        ),
+        (
+            "collation index",
+            doc! {"createIndexes": "co", "indexes": [{"key": {"name": 1}, "name": "name_1"}]},
+        ),
+        ("collation listIndexes", doc! {"listIndexes": "co"}),
+        (
+            "collation invalid",
+            doc! {"create": "co2", "collation": {"locale": "en", "strength": 9}},
+        ),
+    ];
+    let mut out = Vec::new();
+    for (name, cmd) in steps {
+        let r = match db.run_command(cmd).await {
+            Ok(d) => scope_view(&d),
+            Err(e) => Bson::String(format!("error {}", code_of(&e))),
+        };
+        out.push((name.to_owned(), r));
+    }
     out
 }
 

@@ -1,0 +1,9 @@
+# Laravel 12.36.1, tests/Integration/Database with DB_CONNECTION=mysql: tests that pass on
+# MySQL 8.4.11 and not through 3306 (tab, reason). Names are <class>.<test>, as run.sh writes them.
+# 17-18 Nov 2026, laptop (one phpunit per test file, PHP 8.4.14 with pdo_mysql, Symfony Console
+# 7.3): MySQL 8.4.11 813 pass, 7 fail, 203 skip; a debug gateway 808 pass, 12 fail, 203 skip.
+Illuminate\Tests\Integration\Database\MySql\FulltextTest.testWhereFulltextWithBooleanMode	a FULLTEXT index becomes a search index; MATCH ... IN BOOLEAN MODE with its operators finds nothing
+Illuminate\Tests\Integration\Database\MySql\FulltextTest.testWhereFulltextWithExpandedQuery	WITH QUERY EXPANSION is refused (39823)
+Illuminate\Tests\Integration\Database\SchemaBuilderSchemaNameTest.testDropIfExists with data set "with prefix"	DROP TABLE IF EXISTS in a database that doesn't exist fails with 1049; MySQL only warns
+Illuminate\Tests\Integration\Database\SchemaBuilderSchemaNameTest.testDropIfExists with data set "without prefix"	DROP TABLE IF EXISTS in a database that doesn't exist fails with 1049; MySQL only warns
+Illuminate\Tests\Integration\Database\SchemaBuilderTest.testGetFullTextIndexes	a FULLTEXT index on two columns is listed as one index in SHOW INDEX / information_schema, not two; not investigated

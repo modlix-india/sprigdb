@@ -200,6 +200,8 @@ async fn data(
     let tenant = header(&req, TENANT_HEADER);
     let host = header(&req, "host");
     let client_dc = header(&req, "sprig-dc");
+    // The data-inheritance space the call's session acts in.
+    let space = header(&req, "sprig-space").filter(|s| !s.is_empty());
     let ndjson = header(&req, "accept").is_some_and(|a| a.contains("application/x-ndjson"));
     let api = core.engine.settings();
     let body = parse_json(&read_body(req, api.max_request).await?)?;
@@ -220,7 +222,9 @@ async fn data(
             Bytes::from(reply.body_json),
         ));
     }
-    let (status_code, v) = run_local(core, &caller, rpc, &m, &body, ndjson).await?;
+    let (status_code, v) = super::sql::SPACE
+        .scope(space, run_local(core, &caller, rpc, &m, &body, ndjson))
+        .await?;
     match v {
         Local::Json(v) => Ok(json_response(status_code, &v)),
         Local::Rows(v, rows) => Ok(sprig_common::cpu::heavy(rows, || {
@@ -272,7 +276,10 @@ async fn forward_if_remote(
     })?;
     metrics::counter!("sprig_api_txn_forwarded_total").increment(1);
     let req = ForwardRequest {
-        authorization: caller.authorization.clone().unwrap_or_default(),
+        authorization: super::auth::forwarded_authorization(
+            caller.authorization.as_deref(),
+            &caller.principal,
+        ),
         method: rpc.to_owned(),
         request_json: request_json(m, body).to_string(),
         client_addr: caller.peer.to_string(),
@@ -320,10 +327,11 @@ async fn run_local(
             // `language`: sql (default), cypher, gql or mongo;
             // `output`: canonical_ejson for mongo.
             let language = super::lang::with_output(&s(body, "language"), &s(body, "output"));
-            tokio::spawn(async move {
+            let space = super::sql::call_space();
+            tokio::spawn(super::sql::SPACE.scope(space, async move {
                 e2.run_in(&c2, &language, call, txn.as_deref(), caps, tx)
                     .await;
-            });
+            }));
             if rpc == "Sql.Query" && ndjson {
                 return Ok((200, Local::Stream(ndjson_response(rx))));
             }

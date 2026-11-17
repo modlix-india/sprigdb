@@ -193,6 +193,8 @@ The physical names follow one pattern:
 
 SprigDB rewrites schema names in both directions, so you never see a physical name: errors, `SHOW CREATE TABLE`, `information_schema` and `SHOW GRANTS` all use your logical names. Table, column and index names are never changed. A new database starts with one shard per table group; see [Shards and table groups](shards-and-table-groups.md) for how it grows.
 
+`DROP DATABASE` removes all of it: the database's own schemas and every shard of its table groups, on whichever clusters they are, and the groups themselves. See [Dropping a database](shards-and-table-groups.md#dropping-a-database).
+
 ### Reserved names
 
 These names fail with 39050 `ER_SPRIG_RESERVED_NAME`:

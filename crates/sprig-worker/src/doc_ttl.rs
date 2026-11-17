@@ -43,6 +43,7 @@ use bson::Document;
 use mysql_async::prelude::Queryable;
 use serde_json::{Value, json};
 use sprig_catalog::placement::{MapRole, RangeState, ShardMap};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::{ClusterId, TenantId};
 use sprig_common::names::SchemaName;
 use sprig_controller::catalogs::ClusterPools;
@@ -183,7 +184,7 @@ async fn ttl_indexes(
     let idx: Vec<mysql_async::Row> = conn
         .query(format!(
             "SELECT i.collection_id, i.index_id, i.name, i.key_pattern, i.expire_seconds, \
-             i.mariadb_name, i.is_unique, i.is_sparse, i.origin FROM {q}.doc_indexes i \
+             i.mariadb_name, i.is_unique, i.is_sparse, i.origin, i.options FROM {q}.doc_indexes i \
              WHERE i.state = 'ready' AND i.collection_id IN \
              (SELECT collection_id FROM {q}.doc_indexes WHERE expire_seconds IS NOT NULL) \
              ORDER BY i.collection_id, i.index_id"
@@ -191,7 +192,7 @@ async fn ttl_indexes(
         .await?;
     let mut by_coll: BTreeMap<u64, Vec<IndexDef>> = BTreeMap::new();
     for r in idx {
-        let Ok((cid, id, name, key, expire, mariadb, uniq, sparse, origin)) =
+        let Ok((cid, id, name, key, expire, mariadb, uniq, sparse, origin, opts)) =
             mysql_async::from_row_opt::<(
                 u64,
                 u32,
@@ -202,10 +203,16 @@ async fn ttl_indexes(
                 i8,
                 i8,
                 String,
+                Option<Vec<u8>>,
             )>(r)
         else {
             continue;
         };
+        // The index's other options: a partial TTL index expires only
+        // the documents its filter matches.
+        let extra = opts
+            .and_then(|b| bson::from_slice::<Document>(&b).ok())
+            .unwrap_or_default();
         let Ok(k) = bson::from_slice::<Document>(&key) else {
             continue;
         };
@@ -225,7 +232,7 @@ async fn ttl_indexes(
             sparse: sparse != 0,
             expire_after: expire,
             origin,
-            extra: Document::new(),
+            extra,
             mariadb,
             auto_index_id: None,
         });
@@ -317,6 +324,18 @@ struct Pace {
 }
 
 impl DocTtl {
+    /// A connection for `tenant`'s deletes on `cluster`. A transaction's
+    /// update of the same document can be a held branch's row: for a
+    /// tenant on Sprig 2PC's relay path the deletes go through the relay
+    /// writer. `None` when none can be had now (tried at the next pass).
+    async fn conn(&self, tenant: TenantId, cluster: &ClusterId) -> Option<mysql_async::Conn> {
+        let direct = self.0.pools.writer(cluster).await.ok()?;
+        let pool = crate::relay_pools::shard_pool(&self.0.dc, tenant, cluster, direct)
+            .await
+            .ok()?;
+        pool.get_conn_bounded().await.ok()
+    }
+
     /// Every TTL collection of tenants homed here, by cluster scan.
     async fn discover(&self, clusters: &[ClusterId]) -> Vec<TtlColl> {
         let mut out = Vec::new();
@@ -325,7 +344,7 @@ impl DocTtl {
             let Ok(pool) = self.0.pools.writer(cluster).await else {
                 continue;
             };
-            let Ok(mut conn) = pool.get_conn().await else {
+            let Ok(mut conn) = pool.get_conn_bounded().await else {
                 continue;
             };
             let schemas: Vec<String> = match conn
@@ -374,7 +393,7 @@ impl DocTtl {
             let Ok(pool) = self.0.pools.writer(cluster).await else {
                 continue;
             };
-            let Ok(mut conn) = pool.get_conn().await else {
+            let Ok(mut conn) = pool.get_conn_bounded().await else {
                 continue;
             };
             let found: Vec<String> = conn
@@ -456,7 +475,7 @@ impl DocTtl {
         }
         let started = Instant::now();
         let mut pace: HashMap<u64, Pace> = HashMap::new();
-        let mut conns: HashMap<ClusterId, Ctl> = HashMap::new();
+        let mut conns: HashMap<(TenantId, ClusterId), Ctl> = HashMap::new();
         let mut total = 0u64;
         while items.iter().any(|i| !i.done) && !cx.cancel.is_cancelled() {
             if started.elapsed() > budget {
@@ -486,18 +505,15 @@ impl DocTtl {
                         }
                     }
                 }
-                let sql = if let Some(c) = conns.get_mut(&it.cluster) {
+                let key = (tenant, it.cluster.clone());
+                let sql = if let Some(c) = conns.get_mut(&key) {
                     c
                 } else {
-                    let conn = match self.0.pools.writer(&it.cluster).await {
-                        Ok(pool) => pool.get_conn().await.ok(),
-                        Err(_) => None,
-                    };
-                    let Some(conn) = conn else {
+                    let Some(conn) = self.conn(tenant, &it.cluster).await else {
                         it.done = true;
                         continue;
                     };
-                    conns.entry(it.cluster.clone()).or_insert(Ctl(conn))
+                    conns.entry(key).or_insert(Ctl(conn))
                 };
                 let ns = Ns {
                     db: it.schema.clone(),
@@ -529,7 +545,7 @@ impl DocTtl {
                     }
                     Err(e) => {
                         tracing::warn!(tenant = %tenant, schema = %it.schema, coll = %it.coll.meta.name, error = %e.message, "TTL batch failed; retried next pass");
-                        conns.remove(&it.cluster);
+                        conns.remove(&(tenant, it.cluster.clone()));
                         it.done = true;
                     }
                 }

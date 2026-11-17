@@ -681,6 +681,7 @@ fn req(statement: DdlStatement, sql: &str) -> DdlRequest<'_> {
         current_db: Some("shop"),
         user: Some(UserId(1)),
         lower_case_table_names: false,
+        wait: None,
     }
 }
 

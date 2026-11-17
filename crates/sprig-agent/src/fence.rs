@@ -33,6 +33,17 @@
 //! promoted, or a promoted replica whose peers haven't reattached yet,
 //! makes its first commit wait out `rpl_semi_sync_master_timeout`.
 //!
+//! **Restart hand-over.** A writer agent told its restart is coming
+//! (SIGUSR1, which `sprig-vm.sh upgrade` sends before it replaces the
+//! agent) doesn't fence its node when it stops. It records, under its
+//! writer lease, until when it may be left writable (`leases/handover/
+//! <cluster>`: the shorter of its permit's and its lease's time left, less
+//! a margin) and exits without handing the lease back. Its successor (the
+//! same agent id) finds its own lease and that record, and keeps the node
+//! writable until then instead of fencing at once; it takes the lease over
+//! with its first permit. Writes go on through the restart. If it isn't
+//! back in time, it fences as usual.
+//!
 //! **Not yet.** The writer lease goes to whichever agent's node doesn't
 //! replicate, not to a writer the cluster record names: these records
 //! don't carry one yet. Two nodes that both stopped
@@ -40,8 +51,8 @@
 //! missing.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +77,13 @@ pub const PERIOD: Duration = Duration::from_millis(200);
 /// The registration and writer-lease TTL (`failover.writer_lease_seconds`'s
 /// default).
 pub const LEASE_TTL: Duration = Duration::from_secs(10);
+
+/// How long a restart announced with SIGUSR1 stays announced.
+pub const HANDOVER_ARMED_FOR: Duration = Duration::from_secs(60);
+/// Taken off the time a stopping writer's permit and lease have left.
+const HANDOVER_MARGIN: Duration = Duration::from_millis(500);
+/// A shorter window isn't worth handing over: the agent fences instead.
+const HANDOVER_MIN: Duration = Duration::from_secs(1);
 
 fn invalid(msg: String) -> SprigError {
     SprigError::new(SprigCode::ConfigInvalid, msg)
@@ -337,6 +355,65 @@ fn lease_epoch(v: &FailoverView, node: &str) -> u64 {
     }
 }
 
+/// `leases/handover/<cluster>`: a stopping writer agent's note to its
+/// successor, bound to its writer lease (see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Handover {
+    agent: String,
+    node: String,
+    /// Until when (Unix milliseconds) the node may stay writable.
+    until_ms: u64,
+}
+
+impl sprig_meta::Versioned for Handover {
+    const V: u32 = 1;
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Announces a restart: a stop within [`HANDOVER_ARMED_FOR`] hands a
+/// writer's node over instead of fencing it (what SIGUSR1 does).
+pub fn arm_handover(flag: &AtomicU64) {
+    let until =
+        unix_ms().saturating_add(u64::try_from(HANDOVER_ARMED_FOR.as_millis()).unwrap_or(u64::MAX));
+    flag.store(until, Ordering::SeqCst);
+    tracing::info!(
+        secs = HANDOVER_ARMED_FOR.as_secs(),
+        "restart announced: a stop in the next seconds leaves a writer's node writable for its successor"
+    );
+}
+
+/// How long a stopping writer may leave its node writable: its permit's
+/// and its lease's time left, less a margin; `None` when that is too short.
+fn handover_window(permit_left: Duration, lease_left: Duration) -> Option<Duration> {
+    let w = permit_left.min(lease_left).saturating_sub(HANDOVER_MARGIN);
+    (w >= HANDOVER_MIN).then_some(w)
+}
+
+/// How long a starting agent keeps its node writable without a permit:
+/// only when the writer lease is still its own (same agent and node, not
+/// claimed by the controller) and its predecessor's hand-over names it,
+/// until the hand-over's end, at most one lease TTL.
+fn handover_grace(
+    lease: Option<&WriterLease>,
+    h: Option<&Handover>,
+    agent: &str,
+    node: &str,
+    now_ms: u64,
+) -> Option<Duration> {
+    let lease = lease?;
+    let h = h?;
+    if lease.agent != agent || lease.node_id != node || h.agent != agent || h.node != node {
+        return None;
+    }
+    let left = h.until_ms.checked_sub(now_ms).filter(|l| *l > 0)?;
+    Some(Duration::from_millis(left).min(LEASE_TTL))
+}
+
 /// The agent's fence (see the module docs).
 pub struct AgentFence {
     agent_id: String,
@@ -347,6 +424,8 @@ pub struct AgentFence {
     keeper: Arc<PermitKeeper>,
     /// Set while `node_rebuild` works on the node: never take the lease.
     hold: Arc<AtomicBool>,
+    /// Until when (Unix ms) a restart is announced ([`arm_handover`]).
+    handover: Arc<AtomicU64>,
     /// The internal service's URL, published in the registration.
     internal_url: Option<String>,
     rebuild: Option<Arc<crate::rebuild::RebuildService>>,
@@ -383,6 +462,7 @@ impl AgentFence {
             target,
             keeper,
             hold: Arc::new(AtomicBool::new(false)),
+            handover: Arc::new(AtomicU64::new(0)),
             internal_url: None,
             rebuild: None,
         }
@@ -392,6 +472,119 @@ impl AgentFence {
     #[must_use]
     pub fn hold(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.hold)
+    }
+
+    /// Uses `flag` for restart announcements ([`arm_handover`]): the
+    /// role's SIGUSR1 listener sets it.
+    #[must_use]
+    pub fn with_handover_flag(mut self, flag: Arc<AtomicU64>) -> Self {
+        self.handover = flag;
+        self
+    }
+
+    fn handover_armed(&self) -> bool {
+        self.handover.load(Ordering::SeqCst) > unix_ms()
+    }
+
+    /// Stopping as the writer with a restart announced: records the
+    /// hand-over under the writer lease, if the lease is still this
+    /// agent's and the window is long enough. Returns whether it did.
+    async fn hand_over(&self, writer: &Held, handover_key: &sprig_meta::Key) -> bool {
+        let Some(s) = writer.session.as_ref() else {
+            return false;
+        };
+        let Some(window) = handover_window(
+            self.keeper.holder().remaining(),
+            writer.remaining(&*self.clock),
+        ) else {
+            tracing::warn!(
+                "restart announced, but the permit or the writer lease is about to end: fencing as usual"
+            );
+            return false;
+        };
+        let bounded = Duration::from_millis(800);
+        let Ok(Ok(Some(kv))) = tokio::time::timeout(
+            bounded,
+            self.store.get(&writer.key, Consistency::Linearizable),
+        )
+        .await
+        else {
+            return false;
+        };
+        let ours = Record::<WriterLease>::decode(&kv.value).is_ok_and(|r| {
+            r.body.agent == self.agent_id && r.body.node_id == self.target.node.as_str()
+        });
+        if !ours {
+            return false;
+        }
+        let until_ms =
+            unix_ms().saturating_add(u64::try_from(window.as_millis()).unwrap_or(u64::MAX));
+        let Ok(value) = Record::new(Handover {
+            agent: self.agent_id.clone(),
+            node: self.target.node.to_string(),
+            until_ms,
+        })
+        .encode() else {
+            return false;
+        };
+        let r = tokio::time::timeout(
+            bounded,
+            self.store.txn(Txn {
+                when: vec![Cmp::ModRev(writer.key.clone(), kv.mod_revision)],
+                then: vec![Op::Put {
+                    key: handover_key.clone(),
+                    value,
+                    lease: Some(s.lease()),
+                }],
+                otherwise: Vec::new(),
+            }),
+        )
+        .await;
+        let done = matches!(r, Ok(Ok(ref t)) if t.succeeded);
+        if done {
+            tracing::info!(
+                cluster = %self.target.cluster,
+                window_ms = window.as_millis(),
+                "restart hand-over: the node stays writable and the writer lease is kept for the next agent"
+            );
+        }
+        done
+    }
+
+    /// A starting agent: how long its predecessor's hand-over lets the
+    /// node stay writable (see [`handover_grace`]).
+    async fn read_handover(
+        &self,
+        writer_key: &sprig_meta::Key,
+        handover_key: &sprig_meta::Key,
+    ) -> Option<Duration> {
+        let bounded = Duration::from_millis(800);
+        let get = |k: &sprig_meta::Key| {
+            let k = k.clone();
+            let store = Arc::clone(&self.store);
+            async move {
+                match tokio::time::timeout(bounded, store.get(&k, Consistency::Linearizable)).await
+                {
+                    Ok(Ok(Some(kv))) => Some(kv.value),
+                    _ => None,
+                }
+            }
+        };
+        let lease = get(writer_key)
+            .await
+            .and_then(|v| Record::<WriterLease>::decode(&v).ok())
+            .map(|r| r.body);
+        let h = get(handover_key)
+            .await
+            .and_then(|v| Record::<Handover>::decode(&v).ok())
+            .map(|r| r.body);
+        handover_grace(
+            lease.as_ref(),
+            h.as_ref(),
+            &self.agent_id,
+            self.target.node.as_str(),
+            unix_ms(),
+        )
     }
 
     /// Publishes the internal service at `url` and lets the rebuild
@@ -505,6 +698,15 @@ impl AgentFence {
             .store
             .tier()
             .key(&format!("cluster-failover/{}", self.target.cluster))?;
+        let handover_key = self
+            .store
+            .tier()
+            .key(&format!("leases/handover/{}", self.target.cluster))?;
+        // A predecessor's restart hand-over: until when the node stays
+        // writable while this agent gets its permit and lease (checked
+        // once, on the first round that reads the node).
+        let mut grace: Option<std::time::Instant> = None;
+        let mut grace_checked = false;
         tracing::info!(agent = %self.agent_id, dc = %self.dc, cluster = %self.target.cluster, node = %self.target.node, addr = %self.target.addr, "agent fencing its node");
         let bounded = Duration::from_millis(800);
         while !stop.is_cancelled() {
@@ -638,7 +840,33 @@ impl AgentFence {
                     .map(|v| v != "0" && !v.eq_ignore_ascii_case("off")),
                 None => None,
             };
-            if serve {
+            if !grace_checked && read_only.is_some() && replicating.is_some() {
+                grace_checked = true;
+                if read_only == Some(false)
+                    && replicating == Some(false)
+                    && !serve
+                    && let Some(left) = self.read_handover(&writer.key, &handover_key).await
+                {
+                    grace = Some(self.clock.now() + left);
+                    tracing::info!(cluster = %label, left_ms = left.as_millis(), "restart hand-over: the node stays writable while the permit and the writer lease come back");
+                }
+            }
+            let in_grace = !serve && grace.is_some_and(|g| self.clock.now() < g);
+            if serve && grace.take().is_some() {
+                tracing::info!(cluster = %label, "restart hand-over done: permit and writer lease back, the node never fenced");
+                let _ = tokio::time::timeout(
+                    bounded,
+                    self.store.txn(Txn {
+                        when: Vec::new(),
+                        then: vec![Op::Delete(handover_key.clone())],
+                        otherwise: Vec::new(),
+                    }),
+                )
+                .await;
+            }
+            if in_grace {
+                // The predecessor's permit and lease still cover the node.
+            } else if serve {
                 if read_only != Some(false)
                     && let Some(c) = conn.as_mut()
                 {
@@ -673,6 +901,9 @@ impl AgentFence {
                     tracing::info!(cluster = %label, "a replica attached: semi-sync's primary side on");
                 }
             } else if serving != Some(false) || read_only == Some(false) {
+                if grace.take().is_some() {
+                    tracing::warn!(cluster = %label, "restart hand-over ended before the permit and the writer lease were back: fencing");
+                }
                 match fence_node(&self.target.endpoint).await {
                     Ok(killed) => {
                         tracing::warn!(cluster = %label, permit, lease_held, ?replicating, killed, "fenced: read_only ON, tenant sessions killed");
@@ -680,12 +911,11 @@ impl AgentFence {
                     Err(e) => tracing::warn!(error = %e, "fence failed; trying again"),
                 }
             }
-            serving = Some(serve);
-            metrics::gauge!("sprig_agent_fenced", "cluster" => label.clone()).set(if serve {
-                0.0
-            } else {
-                1.0
-            });
+            if !in_grace {
+                serving = Some(serve);
+            }
+            metrics::gauge!("sprig_agent_fenced", "cluster" => label.clone())
+                .set(if serve || in_grace { 0.0 } else { 1.0 });
             metrics::gauge!("sprig_agent_writer_lease_remaining_seconds", "cluster" => label.clone())
                 .set(writer.remaining(&*self.clock).as_secs_f64());
             tokio::select! {
@@ -693,10 +923,25 @@ impl AgentFence {
                 () = tokio::time::sleep(PERIOD) => {}
             }
         }
-        // Stopping: the node fences itself, the leases are handed back.
-        let _ = fence_node(&self.target.endpoint).await;
-        for h in [registration, writer] {
-            if let Some(s) = h.session {
+        // Stopping: the node fences itself, the leases are handed back;
+        // unless a restart was announced and this node is the writer: then
+        // the node stays writable and the writer lease is left to run, for
+        // the next agent to take over (the module docs).
+        let handed_over = serving == Some(true)
+            && self.handover_armed()
+            && self.hand_over(&writer, &handover_key).await;
+        if !handed_over {
+            let _ = fence_node(&self.target.endpoint).await;
+        }
+        if let Some(s) = registration.session {
+            let _ = s.close().await;
+        }
+        if let Some(s) = writer.session {
+            if handed_over {
+                // Dropped, not closed: the lease runs out by itself unless
+                // the next agent takes the key over first.
+                drop(s);
+            } else {
                 let _ = s.close().await;
             }
         }
@@ -732,5 +977,96 @@ mod tests {
         assert!(!kept_out(&v, "db2"), "rejoined: not kept out");
         let fresh = view(r#"{"v":1,"state":"healthy"}"#);
         assert_eq!(lease_epoch(&fresh, "db1"), 0, "no failover yet");
+    }
+
+    fn lease(agent: &str, node: &str) -> WriterLease {
+        WriterLease {
+            node_id: node.into(),
+            agent: agent.into(),
+            writer_epoch: 3,
+        }
+    }
+
+    fn note(agent: &str, node: &str, until_ms: u64) -> Handover {
+        Handover {
+            agent: agent.into(),
+            node: node.into(),
+            until_ms,
+        }
+    }
+
+    /// A restarted writer agent keeps its node writable only while its own
+    /// lease and its predecessor's note say so, and never past one lease TTL.
+    #[test]
+    fn a_restart_hand_over_covers_only_the_same_agent_and_node() {
+        let now = 1_000_000;
+        let (l, h) = (lease("agt-1", "db1"), note("agt-1", "db1", now + 3_000));
+        assert_eq!(
+            handover_grace(Some(&l), Some(&h), "agt-1", "db1", now),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            handover_grace(None, Some(&h), "agt-1", "db1", now),
+            None,
+            "no lease"
+        );
+        assert_eq!(
+            handover_grace(Some(&l), None, "agt-1", "db1", now),
+            None,
+            "no note"
+        );
+        assert_eq!(
+            handover_grace(Some(&l), Some(&h), "agt-1", "db1", now + 3_000),
+            None,
+            "the note has run out"
+        );
+        let claimed = lease("controller:ctl-1", "db1");
+        assert_eq!(
+            handover_grace(Some(&claimed), Some(&h), "agt-1", "db1", now),
+            None,
+            "a failover claimed the lease"
+        );
+        let other = lease("agt-2", "db2");
+        assert_eq!(
+            handover_grace(Some(&other), Some(&h), "agt-1", "db1", now),
+            None
+        );
+        let foreign = note("agt-2", "db1", now + 3_000);
+        assert_eq!(
+            handover_grace(Some(&l), Some(&foreign), "agt-1", "db1", now),
+            None
+        );
+        let long = note("agt-1", "db1", now + 60_000);
+        assert_eq!(
+            handover_grace(Some(&l), Some(&long), "agt-1", "db1", now),
+            Some(LEASE_TTL),
+            "never past one lease TTL"
+        );
+    }
+
+    /// A stopping writer hands over only what its permit and lease still
+    /// cover, less the margin.
+    #[test]
+    fn the_hand_over_window_is_the_shorter_of_permit_and_lease() {
+        let s = Duration::from_secs;
+        assert_eq!(
+            handover_window(s(4), s(9)),
+            Some(Duration::from_millis(3_500))
+        );
+        assert_eq!(
+            handover_window(s(9), s(2)),
+            Some(Duration::from_millis(1_500))
+        );
+        assert_eq!(handover_window(Duration::from_millis(1_200), s(9)), None);
+        assert_eq!(handover_window(Duration::ZERO, s(9)), None);
+    }
+
+    #[test]
+    fn an_announced_restart_expires() {
+        let flag = AtomicU64::new(0);
+        assert!(flag.load(Ordering::SeqCst) <= unix_ms());
+        arm_handover(&flag);
+        let until = flag.load(Ordering::SeqCst);
+        assert!(until > unix_ms() + 50_000 && until <= unix_ms() + 60_000);
     }
 }

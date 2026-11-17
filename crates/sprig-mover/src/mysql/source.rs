@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use mysql_async::prelude::Queryable;
 use mysql_async::{Params, Pool, Row as MyRow};
 use sprig_binlog::GtidPos;
+use sprig_cluster::NodeEndpoint;
+use sprig_cluster::failover::relay_pools::TenantRelays;
 use sprig_cluster::fence::{
     self, FenceMethod, FenceOptions, FenceReceipt, FenceRequest, FenceScope, RenamedTable,
     fenced_name,
@@ -69,6 +71,9 @@ pub struct MysqlSource {
     drain: Option<Arc<dyn PreparedDrain>>,
     /// A re-key's source: digests leave `_sprig_rk` out.
     rekey: bool,
+    /// Relay leases: a tenant on Sprig 2PC's relay path is fenced through
+    /// the cluster's relay writer; `None` always fences directly.
+    relays: Option<TenantRelays>,
 }
 
 impl std::fmt::Debug for MysqlSource {
@@ -133,6 +138,10 @@ pub const MOVED_INTERNAL: &[&str] = &[
 /// (`__sprig_gm_`), routed by `_sprig_rk` like a group's tables, and the id
 /// counter (`__sprig_gq_`, copied whole with its default-group schema),
 /// and the uniqueness claims (`__sprig_gu_`, routed by the claim's hash);
+/// a typed graph's tables (`__sprig_gn_<graph>_<class>`,
+/// `__sprig_ge_<graph>_<type>`, `__sprig_gm_<graph>_<type>`, the directory
+/// `__sprig_gd_` and the values table `__sprig_gv_`), every row with its
+/// node's `_sprig_rk`;
 /// and the key-value element tables (`__sprig_ke_<ns>`,
 /// `__sprig_kz_<ns>`), grouped with their key table on `_sprig_dk`, every
 /// row carrying its key's `_sprig_rk`; and the engines' tables in each
@@ -141,8 +150,10 @@ pub const MOVED_INTERNAL: &[&str] = &[
 /// retryable-write records and transaction outcomes, search index
 /// definitions, vector side tables), Redis scripts (`__sprig_redis_`),
 /// models (`__sprig_dim_`) and the inheritance broadcast logs and retry
-/// lists (`__sprig_ib_`, `__sprig_ibr_`). The inheritance materialized
-/// copies (`__sprig_ih_`) stay behind: a target
+/// lists (`__sprig_ib_`, `__sprig_ibr_`); and the retrieval indexes' chunk
+/// tables (`__sprig_rx_<index>`), routed by `_sprig_rk` (each chunk carries
+/// its row's), except in a re-key ([`RETRIEVAL_PREFIX`]). The inheritance
+/// materialized copies (`__sprig_ih_`) stay behind: a target
 /// without them reads through and seeds them again.
 pub const MOVED_INTERNAL_PREFIXES: &[&str] = &[
     "__sprig_doc_",
@@ -160,7 +171,15 @@ pub const MOVED_INTERNAL_PREFIXES: &[&str] = &[
     "__sprig_gm_",
     "__sprig_gq_",
     "__sprig_gu_",
+    "__sprig_gd_",
+    "__sprig_gv_",
+    RETRIEVAL_PREFIX,
 ];
+
+/// The retrieval indexes' chunk tables. A re-key leaves them behind: the
+/// new key's hash can't be computed from a chunk, so the worker fills the
+/// new shards' tables again.
+pub const RETRIEVAL_PREFIX: &str = "__sprig_rx_";
 
 /// `SET NAMES` for a stored program's `character_set_client` and
 /// `collation_connection` (`SHOW CREATE` columns 3 and 4), so the target
@@ -223,7 +242,16 @@ impl MysqlSource {
             known: Mutex::new(Vec::new()),
             drain: None,
             rekey: false,
+            relays: None,
         }
+    }
+
+    /// For a tenant on Sprig 2PC's relay path, the rename fence goes
+    /// through the cluster's relay writer, found with `relays`.
+    #[must_use]
+    pub fn with_relays(mut self, relays: Option<TenantRelays>) -> Self {
+        self.relays = relays;
+        self
     }
 
     /// Finishes the tenant's prepared distributed-transaction branches
@@ -284,6 +312,7 @@ impl MysqlSource {
             .into_iter()
             .filter_map(|r| r.get::<String, _>(0))
             .filter(|n| !internal(n))
+            .filter(|n| !(self.rekey && n.starts_with(RETRIEVAL_PREFIX)))
             .filter(|n| self.spec_tables.as_ref().is_none_or(|ts| ts.contains(n)))
             .collect())
     }
@@ -346,6 +375,85 @@ impl MysqlSource {
             pk,
             create_sql,
         })
+    }
+
+    /// The writer endpoint through the relay writer, for a tenant on Sprig
+    /// 2PC's relay path; `None` for any other tenant.
+    ///
+    /// # Errors
+    /// Retryable while the cluster has relays but no ready relay writer.
+    async fn relayed_writer(&self) -> Result<Option<NodeEndpoint>> {
+        let Some(relays) = &self.relays else {
+            return Ok(None);
+        };
+        Ok(relays
+            .route_with(
+                self.tenant,
+                &self.access.cluster,
+                &self.pool,
+                &self.access.writer.opts,
+            )
+            .await?
+            .map(|r| NodeEndpoint {
+                node: r.node,
+                opts: r.opts,
+            }))
+    }
+
+    /// Held branches (Sprig 2PC's redo rows) of the tenant on this cluster
+    /// that no holder finished and whose rows are in `schemas`: those in
+    /// the schemas' own redo tables, and those elsewhere whose statements
+    /// name one of them. Read right after a rename fence, when a live
+    /// holder of such rows would have kept the rename waiting: what is
+    /// left waits for the relay's recovery, which can't replay into
+    /// renamed tables.
+    async fn pending_held(&self, schemas: &[String]) -> Result<u64> {
+        /// The redo table (`sprig_txn::redo::REDO_TABLE`).
+        const REDO: &str = "__sprig_redo";
+        /// Its finished-branch marker row's `seq` (`sprig_txn::redo::MARK_SEQ`).
+        const MARK: u64 = 1 << 63;
+        let fenced = fenced_name(REDO);
+        let tables = self
+            .rows(
+                "SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA LIKE ? AND TABLE_NAME IN (?, ?)",
+                vec![
+                    Value::Bytes(format!("t{}\\_%", self.tenant).into_bytes()),
+                    Value::Bytes(REDO.as_bytes().to_vec()),
+                    Value::Bytes(fenced.as_bytes().to_vec()),
+                ],
+            )
+            .await?;
+        let mut n = 0;
+        for t in tables {
+            let (Some(s), Some(name)) = (t.get::<String, _>(0), t.get::<String, _>(1)) else {
+                continue;
+            };
+            let own = schemas.contains(&s);
+            let mut q = format!(
+                "SELECT COUNT(DISTINCT r.dtid) FROM {t} r WHERE r.seq < {MARK} \
+                 AND NOT EXISTS (SELECT 1 FROM {t} m WHERE m.dtid = r.dtid AND m.seq = {MARK})",
+                t = qualified(&s, &name)
+            );
+            let mut p = Vec::new();
+            if !own {
+                if schemas.is_empty() {
+                    continue;
+                }
+                q.push_str(" AND (");
+                for (i, x) in schemas.iter().enumerate() {
+                    if i > 0 {
+                        q.push_str(" OR ");
+                    }
+                    q.push_str("LOCATE(?, r.stmt) > 0");
+                    p.push(Value::Bytes(x.as_bytes().to_vec()));
+                }
+                q.push(')');
+            }
+            let rows = self.rows(&q, p).await?;
+            n += rows.first().and_then(|r| r.get::<u64, _>(0)).unwrap_or(0);
+        }
+        Ok(n)
     }
 
     async fn ensure_sys(&self) -> Result<()> {
@@ -778,13 +886,42 @@ impl SourceIo for MysqlSource {
     async fn fence(&self, deadline: Duration) -> Result<Fenced> {
         let schemas = self.schemas().await?;
         let req = self.fence_request(schemas, deadline);
+        // A tenant on Sprig 2PC's relay path: the rename goes through the
+        // relay writer, so a lost holder's fence ends it before the held
+        // rows' locks go, and refuses it until the branch is replayed.
+        let relayed = self.relayed_writer().await?;
         let r = fence::fence(
             &req,
-            &self.access.writer,
+            relayed.as_ref().unwrap_or(&self.access.writer),
             &self.access.nodes,
             &FenceOptions::default(),
         )
         .await?;
+        if relayed.is_some() {
+            let pending = self.pending_held(&req.schemas).await;
+            if !matches!(pending, Ok(0)) {
+                // Our own rename goes back at once, directly: renaming
+                // back only lets the relay's recovery replay into the
+                // tables again.
+                if let Err(e) =
+                    fence::unfence(&r, &self.access.writer, &FenceOptions::default()).await
+                {
+                    tracing::error!(tenant = %self.tenant, cluster = %self.access.cluster,
+                        error = %e, "a fence over held branches couldn't be undone");
+                }
+                let why = match pending {
+                    Ok(n) => format!(
+                        "{n} held distributed-transaction branches of tenant {} touching the moving \
+                         schemas wait for the relay's recovery on {}",
+                        self.tenant, self.access.cluster
+                    ),
+                    Err(e) => format!("held branches can't be checked: {e}"),
+                };
+                let mut e = SprigError::new(SprigCode::ClusterFenceFailed, why);
+                e.retryable = true;
+                return Err(e);
+            }
+        }
         let pos: GtidPos = r.writer_pos.0.parse()?;
         let receipt = serde_json::to_value(&r).map_err(|e| SprigError::internal(e.to_string()))?;
         Ok(Fenced {
@@ -810,6 +947,9 @@ impl SourceIo for MysqlSource {
         }
         let r: FenceReceipt = serde_json::from_value(receipt.clone())
             .map_err(|e| SprigError::internal(format!("bad fence receipt: {e}")))?;
+        // Always directly, also for a tenant on the relay path: renaming
+        // back writes no rows, and a relay that is recovering the tenant
+        // (and refusing its connections) may need the tables back first.
         fence::unfence(&r, &self.access.writer, &FenceOptions::default()).await
     }
 
@@ -928,6 +1068,7 @@ mod tests {
             "__sprig_ibr_41",
             "__sprig_ke_cart",
             "__sprig_qf",
+            "__sprig_rx_7",
             "orders",
         ] {
             assert!(!internal(t), "{t} must move");

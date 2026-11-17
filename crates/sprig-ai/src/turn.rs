@@ -39,7 +39,7 @@ use crate::provider::{
 };
 use crate::role::Role;
 use crate::settings::TurnSettings;
-use crate::tools::{Effect, Proposal, Source, ToolHost, ToolRegistry};
+use crate::tools::{Effect, Proposal, ResultSet, Source, ToolHost, ToolRegistry};
 
 /// Refused tool calls (role, input) after which a turn ends with 39996.
 pub const MAX_DENIALS: u32 = 3;
@@ -153,6 +153,17 @@ pub enum TurnEvent {
         /// The gate withheld rows or values, or cut the result.
         reduced: bool,
     },
+    /// A read tool's rows (`run_query`), whole as the tool returned them,
+    /// for the user only: the provider gets what the egress gate let
+    /// through. Sent only by an agent built [`Agent::showing_results`].
+    Result {
+        /// The call's id.
+        id: String,
+        /// The tool.
+        name: String,
+        /// The rows.
+        result: ResultSet,
+    },
     /// A proposal for the user.
     Proposal(Proposal),
     /// Usage so far in this call.
@@ -163,6 +174,10 @@ pub enum TurnEvent {
     End {
         /// Why.
         stop: Stop,
+        /// The stored id of the turn's answer (its last `assistant`
+        /// message), for feedback; `None` when the turn keeps no
+        /// conversation or the message wasn't stored.
+        message: Option<u64>,
     },
 }
 
@@ -231,6 +246,8 @@ pub struct Agent {
     provider: Arc<dyn Provider>,
     tools: Arc<ToolRegistry>,
     audit: Arc<dyn AuditStore>,
+    /// The surface shows read results to the user ([`TurnEvent::Result`]).
+    show_results: bool,
 }
 
 impl std::fmt::Debug for Agent {
@@ -241,15 +258,32 @@ impl std::fmt::Debug for Agent {
     }
 }
 
+/// The text put between the answers of two model calls in one turn, so
+/// the words before a tool round and after it don't run together.
+pub const CALL_BREAK: &str = "\n\n";
+
 /// Forwards a provider's deltas as turn events.
 struct Forward<'a> {
     sink: &'a mut dyn TurnSink,
+    /// An earlier call of this turn streamed text: the first text of this
+    /// call starts with [`CALL_BREAK`].
+    pending_break: bool,
+    /// This call streamed text.
+    wrote: bool,
 }
 
 impl ChatSink for Forward<'_> {
     fn delta(&mut self, d: Delta) -> Result<()> {
         match d {
-            Delta::Text(t) => self.sink.event(TurnEvent::Text(t)),
+            Delta::Text(t) if t.is_empty() => Ok(()),
+            Delta::Text(t) => {
+                self.wrote = true;
+                if std::mem::take(&mut self.pending_break) {
+                    self.sink.event(TurnEvent::Text(format!("{CALL_BREAK}{t}")))
+                } else {
+                    self.sink.event(TurnEvent::Text(t))
+                }
+            }
             Delta::Thinking(t) => self.sink.event(TurnEvent::Thinking(t)),
             Delta::Usage(u) => self.sink.event(TurnEvent::Usage(u)),
             // Announced when the call runs.
@@ -267,6 +301,8 @@ struct Called {
     proposal: Option<Proposal>,
     sources: Vec<Source>,
     stored: Value,
+    /// A result with rows, for the user only (never the provider).
+    rows: Option<ResultSet>,
 }
 
 /// Appends user text: into the last message when it is the user's (after
@@ -293,20 +329,36 @@ impl Agent {
             provider,
             tools,
             audit,
+            show_results: false,
         }
     }
 
+    /// The same agent for a surface that shows the user every result with
+    /// rows in full ([`TurnEvent::Result`], the chat). The model is told
+    /// the user sees them, so with sharing off it describes the result's
+    /// shape instead of offering the same query again.
+    #[must_use]
+    pub fn showing_results(mut self) -> Self {
+        self.show_results = true;
+        self
+    }
+
+    /// Stores a message of `conv`; its id, or `None` without a
+    /// conversation or when storing failed (logged, the turn goes on).
     async fn record(
         &self,
         conv: Option<ConvId>,
         kind: MsgKind,
         body: Value,
         hash: Option<[u8; 32]>,
-    ) {
-        if let Some(c) = conv
-            && let Err(e) = self.audit.append(c, kind, &body, hash).await
-        {
-            tracing::warn!(error = %e, kind = kind.as_str(), "an AI message wasn't recorded");
+    ) -> Option<u64> {
+        let c = conv?;
+        match self.audit.append(c, kind, &body, hash).await {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!(error = %e, kind = kind.as_str(), "an AI message wasn't recorded");
+                None
+            }
         }
     }
 
@@ -341,7 +393,8 @@ impl Agent {
                 share_data: cfg.share_data,
             },
             req.scrubber.clone(),
-        );
+        )
+        .with_results_shown(self.show_results);
         // Every role is budgeted: a tenant role against its tenant's and
         // user's usage, the administration roles against every operator's
         // and the operator's (the system store's `usage_today`).
@@ -365,6 +418,10 @@ impl Agent {
         let mut sources: Vec<Source> = Vec::new();
         let mut sent = Vec::new();
         let mut tools_called: Vec<String> = Vec::new();
+        // Text streamed by an earlier model call of this turn.
+        let mut streamed_text = false;
+        // The stored id of the newest answer message.
+        let mut answer: Option<u64> = None;
         let stop = loop {
             cfg.budget.check(used, usage.billable())?;
             let left = cfg.budget.remaining(used, usage.billable());
@@ -383,9 +440,13 @@ impl Agent {
             };
             gate.check(&mut creq)?;
             let call = {
-                let mut fwd = Forward { sink: &mut *sink };
+                let mut fwd = Forward {
+                    sink: &mut *sink,
+                    pending_break: streamed_text,
+                    wrote: false,
+                };
                 let chat = self.provider.chat(creq, &mut fwd);
-                tokio::select! {
+                let r = tokio::select! {
                     biased;
                     () = cancel.cancelled() => None,
                     r = tokio::time::timeout_at(deadline, chat) => match r {
@@ -396,7 +457,9 @@ impl Agent {
                             true,
                         ))),
                     },
-                }
+                };
+                streamed_text |= fwd.wrote;
+                r
             };
             let outcome = match call {
                 None => break Stop::Other("stopped".to_owned()),
@@ -442,13 +505,14 @@ impl Agent {
                 Some(outcome.sent.sha256),
             )
             .await;
-            self.record(
-                req.conv,
-                MsgKind::Assistant,
-                serde_json::to_value(&outcome.message).unwrap_or(Value::Null),
-                None,
-            )
-            .await;
+            answer = self
+                .record(
+                    req.conv,
+                    MsgKind::Assistant,
+                    serde_json::to_value(&outcome.message).unwrap_or(Value::Null),
+                    None,
+                )
+                .await;
             let calls: Vec<(String, String, Value)> = outcome
                 .message
                 .tool_calls()
@@ -539,6 +603,13 @@ impl Agent {
                     None,
                 )
                 .await;
+                if let Some(rs) = c.rows {
+                    sink.event(TurnEvent::Result {
+                        id: id.clone(),
+                        name: name.clone(),
+                        result: rs,
+                    })?;
+                }
                 sink.event(TurnEvent::ToolEnd {
                     id: id.clone(),
                     name: name.clone(),
@@ -567,7 +638,10 @@ impl Agent {
         if !sources.is_empty() {
             sink.event(TurnEvent::Sources(sources.clone()))?;
         }
-        sink.event(TurnEvent::End { stop: stop.clone() })?;
+        sink.event(TurnEvent::End {
+            stop: stop.clone(),
+            message: answer,
+        })?;
         self.audit_event(&req, role, &tools_called, &sent, stop.label());
         crate::metrics::turn(role, started.elapsed());
         Ok(TurnResult {
@@ -640,6 +714,7 @@ impl Agent {
     }
 
     /// Checks and runs one call.
+    #[allow(clippy::too_many_lines)] // checked, proposed or read: one path each
     async fn call(
         &self,
         gate: &EgressGate,
@@ -661,6 +736,7 @@ impl Agent {
             proposal: None,
             sources: Vec::new(),
             stored: json!({"error": msg}),
+            rows: None,
         };
         let spec = match self.tools.check(role, name, input) {
             Ok(s) => s,
@@ -670,11 +746,42 @@ impl Agent {
             }
         };
         if spec.effect == Effect::Propose {
+            // The host checks it (statements parse and pass SprigDB's
+            // rules, a policy is tried as its test users, logic compiled,
+            // rows generated); what it finds rides on the proposal, and a
+            // failure goes back to the model to fix.
+            let checked =
+                match tokio::time::timeout(TOOL_TIMEOUT, host.check_proposal(&spec, input)).await {
+                    Ok(Ok(c)) => c,
+                    Ok(Err(e)) => {
+                        crate::metrics::tool_call(name, "error");
+                        return fail(&e.message, false);
+                    }
+                    Err(_) => {
+                        crate::metrics::tool_call(name, "error");
+                        return fail(
+                            &format!(
+                                "checking {name} took longer than {}s",
+                                TOOL_TIMEOUT.as_secs()
+                            ),
+                            false,
+                        );
+                    }
+                };
             return match ToolRegistry::propose(&spec, id, input) {
-                Ok(p) => {
+                Ok(mut p) => {
+                    p.checks = checked.checks;
+                    p.generated = checked.generated;
                     crate::metrics::tool_call(name, "proposed");
                     crate::metrics::proposal(p.kind.as_str(), "shown");
-                    let note = ToolRegistry::proposal_note(&p);
+                    // The note passes the gate like a result (secrets
+                    // masked); it never holds what was generated.
+                    let note = gate
+                        .tool_result(
+                            &spec,
+                            &crate::tools::ToolOutput::json(ToolRegistry::proposal_note(&p)),
+                        )
+                        .stored;
                     Called {
                         result: Block::ToolResult {
                             tool_use_id: id.to_owned(),
@@ -687,6 +794,7 @@ impl Agent {
                         proposal: Some(p),
                         sources: Vec::new(),
                         stored: note,
+                        rows: None,
                     }
                 }
                 Err(e) => fail(&e.message, false),
@@ -699,7 +807,12 @@ impl Agent {
                     crate::metrics::egress_reduced(role);
                 }
                 crate::metrics::tool_call(name, "ok");
+                let rows = match &out.body {
+                    crate::tools::ToolBody::Rows(rs) if self.show_results => Some(rs.clone()),
+                    _ => None,
+                };
                 Called {
+                    rows,
                     result: Block::ToolResult {
                         tool_use_id: id.to_owned(),
                         content: g.content,
@@ -715,12 +828,21 @@ impl Agent {
             }
             Ok(Err(e)) => {
                 crate::metrics::tool_call(name, "error");
-                fail(&e.message, false)
+                // An instructive error: what failed, then what to try, so
+                // the model recovers instead of giving up.
+                fail(
+                    &format!("{} {}", e.message, crate::tools::builtin::hint(name)),
+                    false,
+                )
             }
             Err(_) => {
                 crate::metrics::tool_call(name, "error");
                 fail(
-                    &format!("{name} took longer than {}s", TOOL_TIMEOUT.as_secs()),
+                    &format!(
+                        "{name} took longer than {}s. {}",
+                        TOOL_TIMEOUT.as_secs(),
+                        crate::tools::builtin::hint(name)
+                    ),
                     false,
                 )
             }
@@ -728,5 +850,7 @@ impl Agent {
     }
 }
 
+#[cfg(test)]
+mod data_tests;
 #[cfg(test)]
 mod tests;

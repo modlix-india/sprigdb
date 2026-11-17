@@ -24,6 +24,7 @@
 //! `SPRIG_SINK_ADMIN` or `SPRIG_TENANT_ADMIN`, or being the sink's owner
 //! (1227 otherwise).
 
+use sprig_catalog::pool_wait::Bounded as _;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -209,7 +210,7 @@ async fn catalog(
         .ok_or_else(|| SprigError::standard(1049, *b"42000", format!("Unknown database '{db}'")))?;
     let db_id = row.db_id.0;
     let ep = sprig_catalog::CatalogLocator::writer(&*svc.locator, tid).await?;
-    let conn = ep.pool.get_conn().await.map_err(|e| {
+    let conn = ep.pool.get_conn_bounded().await.map_err(|e| {
         SprigError::new(
             SprigCode::CatalogUnavailable,
             "the tenant's catalog is unreachable",

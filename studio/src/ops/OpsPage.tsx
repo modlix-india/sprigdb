@@ -8,6 +8,7 @@ import { errorText } from '../api/errors';
 import { useSession } from '../auth/session';
 import { RecoveryCodes } from '../auth/Factors';
 import { QrCode } from '../auth/QrCode';
+import { Incidents } from '../ai/IncidentsView';
 import {
   confirmTyped,
   fmtMs,
@@ -28,7 +29,7 @@ import {
   type Placement,
 } from './ops';
 
-const AREAS = ['dcs', 'clusters', 'tenants', 'moves', 'jobs', 'failovers', 'txns'] as const;
+const AREAS = ['dcs', 'clusters', 'tenants', 'moves', 'jobs', 'failovers', 'txns', 'incidents'] as const;
 type Area = (typeof AREAS)[number];
 
 function ops<T>(path: string, init?: { body: unknown }): Promise<T> {
@@ -575,6 +576,7 @@ export function OpsPage() {
               {area === 'jobs' && <Jobs />}
               {area === 'failovers' && <Raw path="failovers" label="Failovers" />}
               {area === 'txns' && <Raw path="txns" label="In-doubt transactions" />}
+              {area === 'incidents' && <Incidents fetch={ops} />}
             </>
           )}
         </div>

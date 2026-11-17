@@ -1,0 +1,30 @@
+ ❯ 1 sql shop │ ◔ Dashboard │ ◈ Admin │ ⚑ Inbox
+┌ Explorer ──────────────────┐┌ Editor [sql] ──────────────────────────────────────────────────────┐
+│▾ shop                      ││ 1 SELECT order_id, status                                          │
+│  ▾ tables 2                ││ 2 FROM orders                                                      │
+│    ▸ orders ~3 rows        ││ 3 WHERE status = 'paid';                                           │
+│      order_items           │└────────────────────────────────────────────────────────────────────┘
+│  ▸ views 1                 │┌ * Assistant · DBA · schema only ─────────────────────────── Ctrl-A ┐
+│  ▸ streams 1               ││now asking the DBA assistant (a new conversation)                   │
+│▸ hr                        ││you  why is this slow?                                              │
+│                            ││▸ read workload · shop                                              │
+│                            ││▸ explained · shop                                                  │
+│                            ││No index starts with status or created_at, so all 2.1 M orders are  │
+│                            ││read.                                                               │
+│                            ││┌ proposed ────────────────────────────────────────────────────────┐│
+│                            │││ CREATE INDEX orders_status_created ON shop.orders (status,       ││
+│                            │││ created_at);                                                     ││
+│                            │││ ~180 MB · p95 4.2 s -> ~40 ms · writes +3%                       ││
+│                            │││ Reads only the matching orders.                                  ││
+│                            ││└──────────────────────────────────────────────────────────────────┘│
+│                            ││ Enter run (asks first)   e edit  d dismiss  y copy  ? what was sent│
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││                                                                    │
+│                            ││› ask a follow-up...                                                │
+└────────────────────────────┘└────────────────────────────────────────────────────────────────────┘
+ dev  127.0.0.1:8080 db shop  1 proposal to review: Enter runs (asks first), e edits, d dismisses

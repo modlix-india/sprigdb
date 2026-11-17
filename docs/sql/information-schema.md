@@ -126,6 +126,7 @@ SHOW ENGINE INNODB STATUS;
 |---|---|---|
 | `SHOW SPRIG SETTINGS [LIKE …] [FOR …]` | Settings and their sources | [Settings](settings.md#show-sprig-settings) |
 | `SPRIG SHOW PINS`, `SPRIG SHOW ADVICE` | Sharding pins; the sharding advisor's design | [Sharding](sharding.md#sprig-show-pins) |
+| `SPRIG SHOW LOOKUP INDEXES` | Global lookup indexes of sharded tables | [Sharding](sharding.md#sprig-show-lookup-indexes) |
 | `SHOW SPRIG RECOMMENDATIONS` | Recommendations awaiting a decision | [EXPLAIN and workload](explain-and-workload.md#show-sprig-recommendations) |
 | `SHOW POLICIES`, `SHOW CREATE POLICY` | Row-level security policies | [Row-level security](row-level-security.md#show-policies) |
 | `SHOW SEARCH INDEXES` | Search indexes and their fields | [Search and vectors](search-and-vectors.md#show-search-indexes) |
@@ -142,6 +143,7 @@ SHOW ENGINE INNODB STATUS;
 |---|---|---|
 | `information_schema.SPRIG_SETTINGS` | `SETTING_SCOPE`, `TABLE_SCHEMA`, `TABLE_NAME`, `SETTING_NAME`, `VALUE`, `SOURCE_SCOPE`, `BOUNDS`, `CLAMPED` | [Settings](settings.md#information_schemasprig_settings) |
 | `information_schema.SPRIG_ROW_POLICIES` | `TABLE_SCHEMA`, `TABLE_NAME`, `POLICY_NAME`, `POLICY_MODE`, `COMMANDS`, `ROLES`, `USING_EXPR`, `CHECK_EXPR`, `RLS_ENABLED`, `RLS_FORCED` | [Row-level security](row-level-security.md#information_schemasprig_row_policies) |
+| `information_schema.SPRIG_LOOKUP_INDEXES` | `TABLE_SCHEMA`, `TABLE_NAME`, `INDEX_NAME`, `COLUMN_NAME`, `IS_UNIQUE`, `ORIGIN`, `STATE`, `CONFLICTS`, `LOOKUP_ID`, `UPDATED_AT` | [Sharding](sharding.md#sprig-show-lookup-indexes) |
 
 Both are built per query from the tenant's catalog. They can't be used inside a view or stored program (39051). `SPRIG_SETTINGS` over 10,000 rows fails with 39052.
 

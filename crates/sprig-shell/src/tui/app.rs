@@ -4,6 +4,7 @@
 //! runtime in [`crate::tui`] carries out, sending [`Msg`]s back. That keeps
 //! every screen testable with ratatui's `TestBackend`.
 
+use crate::tui::assistant::{self, Act as AiAct, Assistant, Item as AiItem, State as AiState};
 use crate::tui::icons::{self, Icon};
 use crate::tui::palette::{self, Action as PalAction, Item as PalItem};
 use crate::tui::theme;
@@ -121,6 +122,8 @@ pub enum Pending {
     Inbox(InboxAction),
     /// A table tab's staged changes, in its database.
     TableApply(TabId, String, Vec<ApplyStmt>),
+    /// The assistant's proposal (its id and its item in the pane).
+    AiAccept(String, usize),
 }
 
 /// A popup.
@@ -240,6 +243,18 @@ pub enum Effect {
     TableApply(TabId, String, Vec<ApplyStmt>),
     /// Put text on the terminal's clipboard (OSC 52).
     Copy(String),
+    /// Ask the assistant: `POST /v1/ai/chat` with this body.
+    AiChat(Value),
+    /// Stop the assistant's answer.
+    AiStop,
+    /// Accept a proposal (`confirm: true`, after the user confirmed).
+    AiAccept(String),
+    /// Dismiss a proposal.
+    AiDismiss(String),
+    /// Send feedback (`POST /v1/ai/feedback`).
+    AiFeedback(Value),
+    /// Read what a conversation sent (`?payloads=true`).
+    AiSent(String),
     /// Quit.
     Quit,
 }
@@ -288,6 +303,14 @@ pub enum Msg {
     TableApplied(TabId, Result<Vec<Conflict>, ShellError>),
     /// A line for the status bar.
     Status(String),
+    /// One line of the assistant's answer.
+    Ai(Value),
+    /// The answer ended (the error that ended it, if any).
+    AiDone(Option<ShellError>),
+    /// A proposal's accept reply.
+    AiAccepted(String, Result<Value, ShellError>),
+    /// A conversation with its payloads ("what was sent").
+    AiSent(Result<Value, ShellError>),
 }
 
 /// The Dashboard screen's state.
@@ -388,6 +411,8 @@ pub struct App {
     pub inbox: Inbox,
     /// The user can use operator views (an admin profile).
     pub operator: bool,
+    /// The assistant pane (Ctrl-A).
+    pub assistant: Assistant,
     /// Next tab id.
     pub next_id: TabId,
     /// Quit after this frame.
@@ -436,6 +461,7 @@ impl App {
             admin: AdminState::default(),
             inbox: Inbox::default(),
             operator,
+            assistant: Assistant::default(),
             quit: false,
         }
     }
@@ -499,6 +525,16 @@ impl App {
                 self.completion = None;
                 return Vec::new();
             }
+            KeyCode::Char('a')
+                if ctrl(&k)
+                    && self.fixed().is_none()
+                    && self
+                        .tabs
+                        .get(self.screen)
+                        .is_some_and(|t| t.table.is_none()) =>
+            {
+                return self.toggle_assistant();
+            }
             KeyCode::F(6) => return self.switch(-1),
             KeyCode::F(7) => return self.switch(1),
             KeyCode::Char(c @ '1'..='9') if alt(&k) => {
@@ -557,6 +593,13 @@ impl App {
                         Pending::TableApply(id, db, stmts) => {
                             self.status = format!("applying {} change(s)...", stmts.len());
                             vec![Effect::TableApply(id, db, stmts)]
+                        }
+                        Pending::AiAccept(id, item) => {
+                            if let Some(p) = self.assistant.proposal_mut(item) {
+                                p.state = AiState::Running;
+                            }
+                            self.assistant.selected = None;
+                            vec![Effect::AiAccept(id)]
                         }
                     }
                 }
@@ -1172,6 +1215,11 @@ impl App {
                 _ => return self.table_key(k),
             }
         }
+        // The assistant pane has the keys (F-keys keep their meaning).
+        if self.assistant.open && self.focus == Focus::Results && !matches!(k.code, KeyCode::F(_)) {
+            let act = self.assistant.key(k);
+            return self.assistant_act(act);
+        }
         // Keys for every pane of a data tab.
         match k.code {
             KeyCode::Char('c') if ctrl(&k) => {
@@ -1247,6 +1295,118 @@ impl App {
             Focus::Results => {
                 self.results_key(k);
                 Vec::new()
+            }
+        }
+    }
+
+    /// Ctrl-A: opens the assistant in place of the results with the keys,
+    /// gives it the keys, or closes it.
+    fn toggle_assistant(&mut self) -> Vec<Effect> {
+        self.completion = None;
+        if self.assistant.open && self.focus == Focus::Results {
+            self.assistant.open = false;
+            self.focus = Focus::Editor;
+        } else {
+            self.assistant.open = true;
+            self.focus = Focus::Results;
+        }
+        Vec::new()
+    }
+
+    /// Carries out what a key in the assistant pane asked for.
+    fn assistant_act(&mut self, act: AiAct) -> Vec<Effect> {
+        match act {
+            AiAct::None => Vec::new(),
+            AiAct::Leave => {
+                self.focus = Focus::Editor;
+                Vec::new()
+            }
+            AiAct::Stop => vec![Effect::AiStop],
+            AiAct::Send(text) => {
+                let (db, query) = match self.tabs.get(self.screen) {
+                    Some(t) => (
+                        t.database.clone(),
+                        (t.lang == Lang::Sql).then(|| t.editor.text()),
+                    ),
+                    None => (None, None),
+                };
+                let body = self.assistant.body(&text, db.as_deref(), query.as_deref());
+                self.assistant.items.push(AiItem::User(text));
+                self.assistant.running = true;
+                self.assistant.selected = None;
+                self.status = String::from("asking the assistant...");
+                vec![Effect::AiChat(body)]
+            }
+            AiAct::Run(i) => {
+                let Some(AiItem::Proposal(p)) = self.assistant.items.get(i).cloned() else {
+                    return Vec::new();
+                };
+                if !p.runnable() {
+                    // Advice and glossary terms: accepting changes no data.
+                    if let Some(x) = self.assistant.proposal_mut(i) {
+                        x.state = AiState::Running;
+                    }
+                    self.assistant.selected = None;
+                    return vec![Effect::AiAccept(p.id)];
+                }
+                let shown = redact(&p.sql, Lang::Sql);
+                self.dialog = Some(Dialog::Confirm(
+                    format!(
+                        "The assistant's proposal — run it as you{}?\n\n{}",
+                        p.db.as_deref()
+                            .map(|d| format!(" in {d}"))
+                            .unwrap_or_default(),
+                        crate::tui::clip(&shown, 600)
+                    ),
+                    Pending::AiAccept(p.id, i),
+                ));
+                Vec::new()
+            }
+            AiAct::Edit(i) => {
+                let Some(AiItem::Proposal(p)) = self.assistant.items.get(i).cloned() else {
+                    return Vec::new();
+                };
+                if let Some(x) = self.assistant.proposal_mut(i) {
+                    x.state = AiState::Edited;
+                }
+                self.assistant.selected = None;
+                if let Some(t) = self.tabs.get_mut(self.screen) {
+                    t.editor.set_text(&p.sql);
+                    if let Some(db) = &p.db
+                        && t.database.as_deref() != Some(db.as_str())
+                    {
+                        self.status =
+                            format!("in the editor; it was written for {db} (USE {db} first)");
+                    } else {
+                        self.status = String::from("in the editor; F5 runs it");
+                    }
+                }
+                self.focus = Focus::Editor;
+                vec![Effect::AiFeedback(serde_json::json!({
+                    "proposal_id": p.id, "outcome": "accepted", "note": "put in the editor, not run",
+                }))]
+            }
+            AiAct::Dismiss(i) => {
+                let Some(AiItem::Proposal(p)) = self.assistant.items.get(i).cloned() else {
+                    return Vec::new();
+                };
+                if let Some(x) = self.assistant.proposal_mut(i) {
+                    x.state = AiState::Dismissed;
+                }
+                self.assistant.selected = self.assistant.waiting().last().copied();
+                vec![Effect::AiDismiss(p.id)]
+            }
+            AiAct::Copy(text) => {
+                self.status = String::from("copied");
+                vec![Effect::Copy(text)]
+            }
+            AiAct::Sent => {
+                if let Some(c) = self.assistant.conversation.clone() {
+                    vec![Effect::AiSent(c)]
+                } else {
+                    self.status = String::from("nothing was sent yet");
+                    Vec::new()
+                }
             }
         }
     }
@@ -1687,6 +1847,57 @@ impl App {
                     return fx;
                 }
             }
+            Msg::Ai(v) => self.assistant.apply(&v),
+            Msg::AiDone(e) => {
+                let cancelled = e
+                    .as_ref()
+                    .is_some_and(|x| x.is(crate::error::ShellCode::Cancelled));
+                self.assistant.done(if cancelled {
+                    None
+                } else {
+                    e.map(|x| x.to_string())
+                });
+                if cancelled {
+                    self.assistant
+                        .items
+                        .push(AiItem::Note("stopped".to_owned()));
+                }
+                let n = self.assistant.waiting().len();
+                self.status = if n > 0 {
+                    format!(
+                        "{n} proposal{} to review: Enter runs (asks first), e edits, d dismisses",
+                        if n == 1 { "" } else { "s" }
+                    )
+                } else {
+                    String::from("answered")
+                };
+            }
+            Msg::AiAccepted(id, r) => {
+                let i = self
+                    .assistant
+                    .items
+                    .iter()
+                    .position(|it| matches!(it, AiItem::Proposal(p) if p.id == id));
+                let state = match r {
+                    Ok(v) => accepted_text(&v),
+                    Err(e) => AiState::Failed(e.to_string()),
+                };
+                self.status = match &state {
+                    AiState::Failed(e) => format!("the proposal failed: {e}"),
+                    _ => String::from("done"),
+                };
+                let ddl = matches!(state, AiState::Accepted(_));
+                if let Some(p) = i.and_then(|i| self.assistant.proposal_mut(i)) {
+                    p.state = state;
+                }
+                if ddl {
+                    return vec![Effect::LoadCatalog];
+                }
+            }
+            Msg::AiSent(r) => match r {
+                Ok(v) => self.dialog = Some(Dialog::Cell(assistant::sent_text(&v))),
+                Err(e) => self.status = format!("what was sent: {e}"),
+            },
             Msg::TabOpened(t) => {
                 self.next_id = self.next_id.max(t.id + 1);
                 self.tabs.push(*t);
@@ -1955,6 +2166,14 @@ impl App {
                 f.render_widget(Paragraph::new(items).block(Block::bordered()), popup);
             }
         }
+        if self.assistant.open {
+            self.assistant.draw(
+                f,
+                res_area,
+                focus == Focus::Results && self.dialog.is_none(),
+            );
+            return;
+        }
         let title = t.results.title();
         let block = Self::pane(title, focus == Focus::Results);
         t.results.draw(f, res_area, block);
@@ -2111,6 +2330,9 @@ impl App {
         if let Some(n) = self.inbox.count().filter(|n| *n > 0) {
             spans.push(Span::styled(format!(" ⚑ {n} to approve "), theme::badge()));
         }
+        if self.assistant.running {
+            spans.push(Span::styled(" * working... ", theme::accent()));
+        }
         spans.push(Span::styled(format!(" {}", self.status), theme::muted()));
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
@@ -2251,6 +2473,7 @@ fn help_lines() -> Vec<Line<'static>> {
         "Admin         sprigctl commands; Up/Down history",
         "Inbox         a approve, w window, i ignore, s snooze, c comment",
         "Ctrl-K, Ctrl-P search everything; ?question writes an ASK (runs nothing)",
+        "Ctrl-A        the assistant; on a proposal: Enter run (asks), e edit, d drop",
         "Ctrl-S        save the editor's text under a name",
         "Enter, r      (explorer) open a table's view, or run a SELECT on it",
         "Table view    / filter, = by cell, e edit, o add, d delete, n p page",
@@ -2260,4 +2483,54 @@ fn help_lines() -> Vec<Line<'static>> {
     .into_iter()
     .map(Line::from)
     .collect()
+}
+
+/// What accepting a proposal did, from the accept route's reply.
+fn accepted_text(v: &Value) -> AiState {
+    if v.get("outcome").and_then(Value::as_str) == Some("failed") {
+        let e = v.get("error").cloned().unwrap_or(Value::Null);
+        return AiState::Failed(
+            e.get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("it failed")
+                .to_owned(),
+        );
+    }
+    if let Some(ran) = v.get("ran").and_then(Value::as_array) {
+        let last = ran
+            .last()
+            .and_then(|r| r.get("results"))
+            .and_then(Value::as_array)
+            .and_then(|r| r.last().cloned())
+            .unwrap_or(Value::Null);
+        let rows = last
+            .get("rows")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let affected = last.get("affected_rows").and_then(|a| {
+            a.as_str()
+                .map(str::to_owned)
+                .or_else(|| a.as_u64().map(|n| n.to_string()))
+        });
+        let what = if rows > 0 {
+            format!("{rows} row{}", if rows == 1 { "" } else { "s" })
+        } else {
+            format!(
+                "{} rows affected",
+                affected.unwrap_or_else(|| "0".to_owned())
+            )
+        };
+        return AiState::Accepted(format!(
+            "ran {} statement{} · {what}",
+            ran.len(),
+            if ran.len() == 1 { "" } else { "s" }
+        ));
+    }
+    if v.get("approvals").is_some() {
+        return AiState::Accepted("filed in the approvals inbox".to_owned());
+    }
+    if let Some(t) = v.get("term").and_then(Value::as_str) {
+        return AiState::Accepted(format!("the glossary term {t} is accepted"));
+    }
+    AiState::Accepted("accepted".to_owned())
 }

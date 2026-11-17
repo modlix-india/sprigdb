@@ -185,6 +185,9 @@ pub struct Declaration {
     /// ([`crate::rollout`]): the new version is the candidate
     /// for n% of callers.
     pub rollout: Option<crate::rollout::RolloutSpec>,
+    /// `SPRIG_ROLLOUT_BY = 'key:<parameter>'`: the parameter, lower case
+    /// (the deploy finds its position).
+    pub rollout_key: Option<String>,
 }
 
 /// One declared parameter: `[IN] name type`.
@@ -619,7 +622,10 @@ pub fn parse(sql: &str) -> Result<Declaration> {
         params: Vec::new(),
         returns: None,
         rollout: None,
+        rollout_key: None,
     };
+    // `SPRIG_ROLLOUT_BY = 'user' | 'tenant'` was given.
+    let mut by_caller = false;
     match kind {
         Kind::Function | Kind::Procedure => {
             // The parameter list: `[IN] name type`, split at top-level
@@ -878,10 +884,20 @@ pub fn parse(sql: &str) -> Result<Declaration> {
                             pct = Some(n);
                         }
                         "sprig_rollout_by" => {
-                            by =
-                                Some(crate::rollout::RolloutBy::parse(&val).ok_or_else(|| {
-                                    syntax("SPRIG_ROLLOUT_BY is 'user' or 'tenant'")
-                                })?);
+                            by = Some(crate::rollout::RolloutBy::parse(&val).ok_or_else(|| {
+                                syntax(
+                                    "SPRIG_ROLLOUT_BY is 'user', 'tenant' or \
+                                         'key:<parameter>'",
+                                )
+                            })?);
+                            d.rollout_key = crate::rollout::key_param(&val);
+                            by_caller = matches!(
+                                by,
+                                Some(
+                                    crate::rollout::RolloutBy::User
+                                        | crate::rollout::RolloutBy::Tenant
+                                )
+                            );
                         }
                         other => {
                             return Err(syntax(format!(
@@ -922,10 +938,31 @@ pub fn parse(sql: &str) -> Result<Declaration> {
         }
     }
     d.runtime = language.ok_or_else(|| syntax("LANGUAGE is missing"))?;
-    if d.rollout.is_some() && !matches!(kind, Kind::Function | Kind::Procedure) {
-        return Err(syntax(
-            "SPRIG_ROLLOUT stages functions and procedures; other kinds switch at once",
-        ));
+    let on_message = kind == Kind::Trigger && d.source.is_some();
+    if let Some(r) = d.rollout.as_mut() {
+        use crate::rollout::RolloutBy;
+        if kind == Kind::Trigger {
+            // A trigger rolls out by key: a stream record's key, a queue
+            // message's id, an after-commit trigger's row's primary key.
+            if by_caller || d.rollout_key.is_some() {
+                return Err(syntax(if on_message {
+                    "a trigger on a stream or queue rolls out by key: SPRIG_ROLLOUT_BY = 'key'"
+                } else {
+                    "an after-commit trigger rolls out by its row's key: SPRIG_ROLLOUT_BY = 'key'"
+                }));
+            }
+            r.by = RolloutBy::Key(None);
+            d.rollout_key = None;
+        } else if !matches!(kind, Kind::Function | Kind::Procedure) {
+            return Err(syntax(
+                "SPRIG_ROLLOUT stages functions, procedures and triggers; validations, \
+                 computed columns and schedules switch at once",
+            ));
+        } else if r.by == RolloutBy::Key(None) && d.rollout_key.is_none() {
+            return Err(syntax(
+                "SPRIG_ROLLOUT_BY = 'key:<parameter>' names the parameter that keys the pick",
+            ));
+        }
     }
     Ok(d)
 }
@@ -986,6 +1023,43 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn rollout_by_key() {
+        use crate::rollout::RolloutBy;
+        let d = parse(
+            "CREATE OR REPLACE FUNCTION f(cust BIGINT) LANGUAGE javascript \
+             WITH (SPRIG_ROLLOUT = 20, SPRIG_ROLLOUT_BY = 'key:Cust') AS $$ return 1; $$",
+        )
+        .unwrap();
+        assert_eq!(d.rollout.unwrap().by, RolloutBy::Key(None));
+        assert_eq!(d.rollout_key.as_deref(), Some("cust"));
+        let d = parse(
+            "CREATE OR REPLACE TRIGGER g ON STREAM s LANGUAGE javascript \
+             WITH (SPRIG_ROLLOUT = 10) AS $$ 1 $$",
+        )
+        .unwrap();
+        assert_eq!(d.rollout.unwrap().by, RolloutBy::Key(None));
+        for bad in [
+            "CREATE FUNCTION f(k INT) LANGUAGE javascript WITH (SPRIG_ROLLOUT = 5, \
+             SPRIG_ROLLOUT_BY = 'key') AS $$ 1 $$",
+            "CREATE TRIGGER g ON QUEUE q LANGUAGE javascript WITH (SPRIG_ROLLOUT = 5, \
+             SPRIG_ROLLOUT_BY = 'user') AS $$ 1 $$",
+            "CREATE TRIGGER g AFTER COMMIT ON t FOR INSERT LANGUAGE javascript \
+             WITH (SPRIG_ROLLOUT = 5, SPRIG_ROLLOUT_BY = 'user') AS $$ 1 $$",
+            "CREATE VALIDATION v ON t FOR INSERT LANGUAGE javascript \
+             WITH (SPRIG_ROLLOUT = 5) AS $$ 1 $$",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        // An after-commit trigger rolls out by its row's key.
+        let d = parse(
+            "CREATE OR REPLACE TRIGGER g AFTER COMMIT ON t FOR INSERT LANGUAGE javascript \
+             WITH (SPRIG_ROLLOUT = 20) AS $$ 1 $$",
+        )
+        .unwrap();
+        assert_eq!(d.rollout.unwrap().by, RolloutBy::Key(None));
     }
 
     #[test]

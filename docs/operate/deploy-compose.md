@@ -316,6 +316,8 @@ Kafka clients use the balancer only for their first connection. Kafka's metadata
 | `upgrade <image>`, `rollback` | Takes a backup, then replaces the controller, worker, agent and gateway in turn; see [Upgrades](upgrades.md) |
 | `rotate-certs`, `reload-certs` | New certificates from the same CA, with no restart |
 | `etcd-rejoin` | Re-adds a member that lost its data |
+| `db-stream`, `db-seed [node]` | With `compose.db-ha.yaml`: streams a copy of this VM's MariaDB node, and replaces another VM's node with it, for example `ssh vm1 'cd /opt/sprigdb && ./sprig-vm.sh db-stream' \| ./sprig-vm.sh db-seed`. The seeded node then replicates from the writer |
+| `restart-agent` | Restarts the node agent. Writes on the writer's node go on while it restarts |
 | `etcd-defrag` | Defragments etcd; run it daily from cron or a systemd timer |
 | `monitoring-config` | Writes Prometheus targets for every VM; see [Monitoring](monitoring.md) |
 | `lb-config`, `lb-up` | Writes the Envoy configuration and starts the balancer |

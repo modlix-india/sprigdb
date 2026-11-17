@@ -502,8 +502,10 @@ impl CatalogRecStore {
 
     async fn migrate(&self, conn: &mut Conn) -> Result<()> {
         let ep = self.locator.writer(self.tenant).await?;
+        // The catalog must exist: a dropped one (a deleted tenant) isn't
+        // made again without its owner mark.
         Migrator::new(&[APPROVALS_MODULE])?
-            .run(conn, ep.store.schema(), &MigrateOpts::default())
+            .run(conn, ep.store.schema(), &MigrateOpts::existing())
             .await?;
         Ok(())
     }

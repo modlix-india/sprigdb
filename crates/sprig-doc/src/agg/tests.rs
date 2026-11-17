@@ -172,3 +172,42 @@ fn meta_survives_project_and_replace_root() {
     let out = run(docs, vec![doc! {"$group": {"_id": "$a"}}, meta]);
     assert_eq!(out[0].get("s"), Some(&Bson::Null));
 }
+
+#[test]
+fn elem_match_projection() {
+    let now = DateTime::from_millis(0);
+    let d = doc! {"_id": 1, "name": "t", "arr": [{"tag": "t1"}, {"tag": "t2"}], "n": [1, 5, 9]};
+    // On its own it is an inclusion projection: `_id` and the element.
+    let p = Projection::parse(&doc! {"arr": {"$elemMatch": {"tag": "t2"}}}).unwrap();
+    assert_eq!(
+        p.apply(&d, now).unwrap(),
+        doc! {"_id": 1, "arr": [{"tag": "t2"}]}
+    );
+    // Operators on values, as the query operator takes them.
+    let p = Projection::parse(&doc! {"n": {"$elemMatch": {"$gte": 4}}}).unwrap();
+    assert_eq!(p.apply(&d, now).unwrap(), doc! {"_id": 1, "n": [5]});
+    let p = Projection::parse(&doc! {"n": {"$elemMatch": {"$in": [9]}}, "name": 1}).unwrap();
+    assert_eq!(
+        p.apply(&d, now).unwrap(),
+        doc! {"_id": 1, "name": "t", "n": [9]}
+    );
+}
+
+#[test]
+fn nested_and_positional_projections() {
+    let now = DateTime::from_millis(0);
+    let d = doc! {"_id": 1, "name": "t", "account": {"amount": 25, "owner": "o"}, "ev": [{"k": "a"}, {"k": "b"}]};
+    // A nested document is a dotted path.
+    let p = Projection::parse(&doc! {"name": 1, "account": {"amount": 1}}).unwrap();
+    assert_eq!(
+        p.apply(&d, now).unwrap(),
+        doc! {"_id": 1, "name": "t", "account": {"amount": 25}}
+    );
+    // `ev.$` keeps the element the query matched.
+    let q = filter::parse(&doc! {"ev": {"$elemMatch": {"k": "b"}}}).unwrap();
+    let p = Projection::parse(&doc! {"ev.$": 1}).unwrap().with_query(&q);
+    assert_eq!(
+        p.apply(&d, now).unwrap(),
+        doc! {"_id": 1, "ev": [{"k": "b"}]}
+    );
+}

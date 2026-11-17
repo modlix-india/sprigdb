@@ -214,8 +214,25 @@ pub enum Cmd {
     /// consumers): write what is in flight, then stop without failing the
     /// commands that wait; the slot passes them on.
     HandOff(String),
+    /// Whether the slot may stop now with nothing lost (its vhost is
+    /// closing for want of use).
+    Quiet(oneshot::Sender<Quiet>),
     /// Stop (lease lost, gateway stopping).
     Stop,
+}
+
+/// A slot's answer to [`Cmd::Quiet`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quiet {
+    /// Consumers, deliveries out, writes in flight or an `x-expires`
+    /// clock: it must keep running.
+    Busy,
+    /// It may stop. `expires_at`: when the message at the head expires;
+    /// someone must start the owner again then, to dead-letter it.
+    Idle {
+        /// Milliseconds since the epoch.
+        expires_at: Option<i64>,
+    },
 }
 
 /// What an owner tells the engine.
@@ -617,6 +634,8 @@ pub fn fail(c: Cmd, err: &MqError) {
         // Unanswered (the sender dropped): the caller knows the
         // owner couldn't say, instead of reading "0 ready, 0 consumers".
         Cmd::Info(r) => drop(r),
+        // Unanswered: the caller takes the slot as busy.
+        Cmd::Quiet(r) => drop(r),
         Cmd::Credit { .. }
         | Cmd::Cancel(_)
         | Cmd::Settle(..)
@@ -766,6 +785,27 @@ impl Core {
 
     fn needs_write(&self) -> bool {
         self.batch_rows() > 0 || self.hwm_dirty
+    }
+
+    /// [`Cmd::Quiet`]'s answer. An `x-expires` queue counts as busy: its
+    /// clock runs only while an owner does, so stopping the owner would
+    /// keep the queue past its expiry.
+    fn quiet(&self) -> Quiet {
+        let busy = !self.consumers.is_empty()
+            || !self.unacked.is_empty()
+            || self.needs_write()
+            || !self.confirms_now.is_empty()
+            || !self.deferred_gets.is_empty()
+            || self.handoff.is_some()
+            || self.live_at > self.now()
+            || self.p.cfg.expires_ms.is_some();
+        if busy {
+            Quiet::Busy
+        } else {
+            Quiet::Idle {
+                expires_at: self.ready.values().next().and_then(|e| e.expires_at_ms),
+            }
+        }
     }
 
     fn token(&self, e: &Entry) -> Option<String> {
@@ -1785,6 +1825,9 @@ impl Core {
             Cmd::Verify { id } => self.check_hold(id.seq),
             Cmd::Reconfigure(cfg) => self.p.cfg = *cfg,
             Cmd::HandOff(to) => self.handoff = Some(to),
+            Cmd::Quiet(reply) => {
+                let _ = reply.send(self.quiet());
+            }
             Cmd::Stop => self.deleted = true,
         }
         Ok(())

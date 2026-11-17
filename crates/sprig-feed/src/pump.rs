@@ -1,5 +1,4 @@
-//! A feed read by a task of its own, its items through a bounded channel
-//! (R9, feedcancel; decision r9-131).
+//! A feed read by a task of its own, its items through a bounded channel.
 //!
 //! [`TenantTail::next`] isn't cancel-safe. It takes a transaction from
 //! its source and then waits for catalog lookups (a new table's first row

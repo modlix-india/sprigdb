@@ -70,7 +70,7 @@ pub async fn migrate(
         SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
     })?;
     let report = Migrator::new(&[AUTH_MODULE, AUTHZ_MODULE])?
-        .run(&mut conn, ep.store.schema(), &MigrateOpts::default())
+        .run(&mut conn, ep.store.schema(), &MigrateOpts::existing())
         .await?;
     drop(conn);
     if report.applied.is_empty() {

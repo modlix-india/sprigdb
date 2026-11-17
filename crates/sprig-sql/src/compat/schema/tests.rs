@@ -392,6 +392,14 @@ fn functional_parts_show_as_mysql_writes_them() {
         mysql_functional_parts("CREATE TABLE `t` (\n  `a` int\n)"),
         "CREATE TABLE `t` (\n  `a` int\n)"
     );
+    // A key MariaDB named after its hidden column (a table made before
+    // unnamed functional indexes were named) shows MySQL's name; the text
+    // stays valid DDL.
+    let old = "CREATE TABLE `v` (\n  `a` int(11) DEFAULT NULL,\n  `_sprig_fx_00000001` bigint(20) GENERATED ALWAYS AS (`a` + 1) VIRTUAL INVISIBLE,\n  `_sprig_fx_00000002` bigint(20) GENERATED ALWAYS AS (`a` + 2) VIRTUAL INVISIBLE,\n  UNIQUE KEY `_sprig_fx_00000002` (`_sprig_fx_00000002`),\n  KEY `functional_index` (`a`),\n  KEY `_sprig_fx_00000001` (`_sprig_fx_00000001`,`a`)\n) ENGINE=InnoDB";
+    assert_eq!(
+        mysql_functional_parts(old),
+        "CREATE TABLE `v` (\n  `a` int(11) DEFAULT NULL,\n  UNIQUE KEY `functional_index_2` (((`a` + 2))),\n  KEY `functional_index` (`a`),\n  KEY `functional_index_3` (((`a` + 1)),`a`)\n) ENGINE=InnoDB"
+    );
 }
 
 #[test]

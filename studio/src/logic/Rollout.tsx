@@ -1,16 +1,25 @@
-// A function's or procedure's staged rollout, and dropping a module with what
-// still uses it. The stage and each version's numbers come from
-// `GET .../rollout` every 5 s; moving, promoting and aborting are the
+// A function's, procedure's or trigger's staged rollout, and dropping a
+// module with what still uses it. The stage and each version's numbers come
+// from `GET .../rollout` every 5 s; moving, promoting and aborting are the
 // statements a SQL client runs (`ALTER ... ROLLOUT TO n | PROMOTE | ABORT`),
-// shown before they run. When the gateway rolled a candidate back by itself,
-// the reason is the module's newest such log line.
+// shown before they run. A trigger's rollout picks by record key, so it has
+// no "Pick by". When the gateway rolled a candidate back by itself, the
+// reason is the module's newest such log line.
 
 import { useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorText, isApiError } from '../api/errors';
 import { execute } from '../api/sql';
-import { autoRollback, getRollout, logs as fetchLogs, type VersionStats } from './api';
-import { dependentsFromRows, dependentsOf, dropStatement, noDependents, rolloutStatement, showDependents, type Dependents, type LogicKind, type RolloutBy } from './declaration';
+import { autoRollback, getRollout, logs as fetchLogs, type RolloutRow, type VersionStats } from './api';
+import { dependentsFromRows, dependentsOf, dropStatement, noDependents, rolloutStatement, showDependents, type Dependents, type RolloutBy, type RolloutKind } from './declaration';
+
+/** What a stage's pick is keyed on, in words. */
+export function pickedBy(by: RolloutRow['by'], kind: RolloutKind): string {
+  if (by === 'tenant') return 'tenant (each tenant gets one version)';
+  if (by === 'user') return 'caller (each account keeps its version)';
+  if (kind === 'trigger') return 'record key (each key keeps its version: a stream record’s key, a queue message’s id, a table row’s primary key)';
+  return `argument${by.key === null ? '' : ` ${by.key + 1}`} (each value keeps its version, whoever calls)`;
+}
 
 /** A statement shown before it runs, with an optional explanation. */
 export function useAsk() {
@@ -64,7 +73,10 @@ function Histogram({ s, bounds }: Readonly<{ s: VersionStats; bounds: number[] }
   );
 }
 
-export function RolloutView({ db, kind, name, routines }: Readonly<{ db: string; kind: LogicKind; name: string; routines: boolean }>) {
+export function RolloutView({ db, kind, name, routines }: Readonly<{ db: string; kind: RolloutKind; name: string; routines: boolean }>) {
+  const trigger = kind === 'trigger';
+  // A trigger counts runs of records or rows, not calls.
+  const calls = trigger ? 'runs' : 'calls';
   const qc = useQueryClient();
   const q = useQuery({
     queryKey: ['logic-rollout', db, kind, name],
@@ -87,9 +99,13 @@ export function RolloutView({ db, kind, name, routines }: Readonly<{ db: string;
     }
     const note =
       a === 'promote'
-        ? 'The candidate becomes the active version for every caller (recompiled and redeployed as a rollback is).'
+        ? trigger
+          ? 'The candidate becomes the active version for every record and row; running workers take it within 5 seconds.'
+          : 'The candidate becomes the active version for every caller (recompiled and redeployed as a rollback is).'
         : a === 'abort'
-          ? 'Every caller goes back to the active version; the candidate is retired.'
+          ? trigger
+            ? 'Every record and row goes back to the active version; the candidate is retired.'
+            : 'Every caller goes back to the active version; the candidate is retired.'
           : undefined;
     if (!(await confirm.ask(sql, note))) return;
     try {
@@ -124,15 +140,26 @@ export function RolloutView({ db, kind, name, routines }: Readonly<{ db: string;
           <dt>Candidate</dt>
           <dd>v{r.candidate_version}</dd>
           <dt>Share</dt>
-          <dd data-testid="logic-rollout-pct">{r.pct}% of callers</dd>
+          <dd data-testid="logic-rollout-pct">
+            {r.pct}% of {trigger ? 'keys' : 'callers'}
+          </dd>
           <dt>Picked by</dt>
-          <dd>{r.by === 'tenant' ? 'tenant (each tenant gets one version)' : 'caller (each account keeps its version)'}</dd>
+          <dd data-testid="logic-rollout-by">{pickedBy(r.by, kind)}</dd>
           <dt>Since</dt>
           <dd className="mono">{r.started_at}</dd>
         </dl>
       ) : (
         <p className="muted" data-testid="logic-rollout-none">
-          No rollout: every call runs v{v.active_version ?? '–'}. Deploy with &quot;Deploy as a rollout&quot; to try a new version on a share of callers.
+          {trigger ? (
+            <>
+              No rollout: every record and row runs v{v.active_version ?? '–'}. Deploy a new version with <code>WITH (SPRIG_ROLLOUT = n)</code> to try it on a share
+              of keys.
+            </>
+          ) : (
+            <>
+              No rollout: every call runs v{v.active_version ?? '–'}. Deploy with &quot;Deploy as a rollout&quot; to try a new version on a share of callers.
+            </>
+          )}
         </p>
       )}
       {back && (
@@ -150,15 +177,17 @@ export function RolloutView({ db, kind, name, routines }: Readonly<{ db: string;
           <label className="row">
             Move to <input value={to} onChange={(e) => setTo(e.target.value)} size={4} inputMode="numeric" data-testid="logic-rollout-to" />%
           </label>
-          <label className="row">
-            Pick by
-            <select value={by} onChange={(e) => setBy(e.target.value as '' | RolloutBy)}>
-              <option value="">as now</option>
-              <option value="user">caller</option>
-              <option value="tenant">tenant</option>
-            </select>
-          </label>
-          <button onClick={() => void act({ to: Number(to), by: by || undefined })} data-testid="logic-rollout-move">
+          {!trigger && (
+            <label className="row">
+              Pick by
+              <select value={by} onChange={(e) => setBy(e.target.value as '' | RolloutBy)}>
+                <option value="">as now</option>
+                <option value="user">caller</option>
+                <option value="tenant">tenant</option>
+              </select>
+            </label>
+          )}
+          <button onClick={() => void act({ to: Number(to), by: (!trigger && by) || undefined })} data-testid="logic-rollout-move">
             Move…
           </button>
           <button className="primary" onClick={() => void act('promote')} data-testid="logic-rollout-promote">
@@ -174,14 +203,14 @@ export function RolloutView({ db, kind, name, routines }: Readonly<{ db: string;
           {msg.text}
         </p>
       )}
-      <h4 style={{ margin: 0 }}>Calls per version</h4>
+      <h4 style={{ margin: 0 }}>{trigger ? 'Runs' : 'Calls'} per version</h4>
       {v.stats.length ? (
-        <div className="table-scroll" tabIndex={0} role="region" aria-label="Calls per version">
+        <div className="table-scroll" tabIndex={0} role="region" aria-label={`${trigger ? 'Runs' : 'Calls'} per version`}>
           <table className="table" data-testid="logic-rollout-stats">
             <thead>
               <tr>
                 <th>Version</th>
-                <th>Calls</th>
+                <th>{trigger ? 'Runs' : 'Calls'}</th>
                 <th>Errors</th>
                 <th>Error rate</th>
                 <th>Mean</th>
@@ -212,12 +241,14 @@ export function RolloutView({ db, kind, name, routines }: Readonly<{ db: string;
           </table>
         </div>
       ) : (
-        <p className="muted">No calls counted yet.</p>
+        <p className="muted">No {calls} counted yet.</p>
       )}
       <p className="muted">
-        The pick is a hash of the caller&apos;s account (or tenant) and the module, so an application that connects with one account gets all of one
-        version or all of the other. The gateway rolls a candidate back by itself once it has {v.min_calls} calls and its error rate is above 1% and
-        twice the active version&apos;s, or its p95 is twice the active one&apos;s.
+        {trigger
+          ? 'The pick is a hash of the record’s key and the module, so a key gets the same version on every run; a record without a key gets the active version.'
+          : 'The pick is a hash of the caller’s account (or tenant) and the module, so an application that connects with one account gets all of one version or all of the other.'}{' '}
+        The gateway rolls a candidate back by itself once it has {v.min_calls} {calls} and its error rate is above 1% and twice the active version&apos;s,
+        or its p95 is twice the active one&apos;s.
       </p>
       {confirm.node}
     </section>

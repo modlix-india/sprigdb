@@ -279,9 +279,9 @@ pub const SHARE_DEFINER_SUFFIX: &str = "sprig_share";
 
 /// The account a tenant's cross-tenant share views run as, in its
 /// children's schemas: `t<tenant>_sprig_share` (host `%`), created locked
-/// by SprigDB and granted `SELECT` only on what those views read
-/// (chapter 42, decision RL70). It belongs to no user, so dropping or
-/// renaming a user never breaks a child's view.
+/// by SprigDB and granted `SELECT` only on what those views read. It
+/// belongs to no user, so dropping or renaming a user never breaks a
+/// child's view.
 #[must_use]
 pub fn share_definer_account(tenant: TenantId) -> String {
     format!("t{tenant}_{SHARE_DEFINER_SUFFIX}")

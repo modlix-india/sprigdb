@@ -127,6 +127,11 @@ pub struct PolicyRow {
     pub created_by: UserId,
     /// The auth version of its last change.
     pub changed_version: u64,
+    /// The `USING` and `WITH CHECK` texts the row holds, when its MongoDB
+    /// forms compile to other SQL now (a translator fix since it was
+    /// created): [`Self::using_expr`] and [`Self::check_expr`] are then the
+    /// new SQL, and the row is rewritten (see [`set_mongo_compiler`]).
+    pub stored_exprs: Option<(Option<String>, Option<String>)>,
 }
 
 impl PolicyRow {
@@ -242,6 +247,15 @@ impl RlsState {
     #[must_use]
     pub fn any_enabled(&self) -> bool {
         self.security.values().any(|s| s.enabled)
+    }
+
+    /// Policies whose row still holds SQL their MongoDB forms no longer
+    /// compile to ([`PolicyRow::stored_exprs`]).
+    pub fn recompiled(&self) -> impl Iterator<Item = &PolicyRow> {
+        self.rows
+            .policies
+            .iter()
+            .filter(|p| p.stored_exprs.is_some())
     }
 }
 
@@ -605,7 +619,11 @@ impl RlsStore {
                     .get_opt::<Option<String>, usize>(11)
                     .and_then(Result::ok)
                     .flatten(),
+                stored_exprs: None,
             });
+        }
+        for p in &mut policies {
+            compile_mongo(p);
         }
         let rows: Vec<Row> = q
             .query(format!(
@@ -766,6 +784,47 @@ impl RlsStore {
                 version,
                 object.0,
                 name,
+            )
+                .into(),
+        )
+        .await
+        .map(|n| n > 0)
+    }
+
+    /// Rewrites policy `p`'s row with the SQL its MongoDB forms compile to
+    /// now ([`PolicyRow::stored_exprs`] holds what the row had), at auth
+    /// version `version`, keeping the forms. `false` when the row no longer
+    /// holds that text (another gateway rewrote it, or it changed): a
+    /// no-op, so running it twice is harmless.
+    ///
+    /// # Errors
+    /// A backend error.
+    pub async fn recompiled<Q: Queryable + Send>(
+        &self,
+        q: &mut Q,
+        p: &PolicyRow,
+        version: u64,
+    ) -> Result<bool> {
+        let Some((old_using, old_check)) = &p.stored_exprs else {
+            return Ok(false);
+        };
+        affected(
+            q,
+            format!(
+                "UPDATE {} SET using_expr = ?, check_expr = ?, changed_version = ? \
+                 WHERE policy_id = ? AND using_expr <=> ? AND check_expr <=> ? \
+                 AND CAST(using_mongo AS CHAR) <=> ? AND CAST(check_mongo AS CHAR) <=> ?",
+                self.policies
+            ),
+            (
+                p.using_expr.as_deref(),
+                p.check_expr.as_deref(),
+                version,
+                p.policy_id,
+                old_using.as_deref(),
+                old_check.as_deref(),
+                p.using_mongo.as_deref(),
+                p.check_mongo.as_deref(),
             )
                 .into(),
         )
@@ -1184,6 +1243,98 @@ pub fn narrow(
     }
 }
 
+/// Tenant `root` and every tenant below it, sorted, from the global
+/// tier's directory: the `tenants/<id>` records, whose `path` lists each
+/// tenant's ancestors. What `SPRIG_TENANT_IN_SUBTREE` and
+/// `SPRIG_TENANT_MANAGED` read for a user of `root`, in the gateway and
+/// for worker-run code alike.
+///
+/// # Errors
+/// The directory's.
+pub async fn directory_subtree(global: &dyn sprig_meta::MetaStore, root: u64) -> Result<Vec<u64>> {
+    use sprig_meta::{ListOpts, Record, Versioned};
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct Entry {
+        #[serde(default)]
+        path: String,
+    }
+    impl Versioned for Entry {
+        const V: u32 = 1;
+    }
+    let prefix = global.tier().key("tenants/")?;
+    let mark = format!("/{root}/");
+    let mut out = vec![root];
+    let mut opts = ListOpts::default();
+    loop {
+        let page = global.list(&prefix, opts.clone()).await?;
+        for kv in &page.kvs {
+            let key = kv.key.to_string();
+            let Some(id) = key.rsplit('/').next().and_then(|x| x.parse::<u64>().ok()) else {
+                continue;
+            };
+            if id == root {
+                continue;
+            }
+            if let Ok(r) = Record::<Entry>::decode(&kv.value)
+                && r.body.path.contains(&mark)
+            {
+                out.push(id);
+            }
+        }
+        if !page.more {
+            break;
+        }
+        opts.at = Some(page.revision);
+        opts.after = page.kvs.last().map(|kv| kv.key.clone());
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
+/// Compiles a stored MongoDB form (relaxed extended JSON) to the SQL of
+/// a policy: `None` for a form that can't be compiled.
+pub type MongoCompiler = fn(&str) -> Option<String>;
+
+fn mongo_compiler() -> &'static std::sync::OnceLock<MongoCompiler> {
+    static C: std::sync::OnceLock<MongoCompiler> = std::sync::OnceLock::new();
+    &C
+}
+
+/// Sets the compiler of stored MongoDB forms for this process (the
+/// document engine's translator; the first call wins). With one set, every
+/// policy loaded from the catalog that has a MongoDB form gets the SQL the
+/// form compiles to now, so a translator fix reaches policies created
+/// before it in the rewrite, change filters and MariaDB's checks alike;
+/// the stored text is kept in [`PolicyRow::stored_exprs`] until the row is
+/// rewritten ([`RlsStore::recompiled`]). A form that no longer compiles
+/// hides every row (`FALSE`).
+pub fn set_mongo_compiler(f: MongoCompiler) {
+    let _ = mongo_compiler().set(f);
+}
+
+/// [`set_mongo_compiler`]'s step for one loaded row.
+fn compile_mongo(p: &mut PolicyRow) {
+    let Some(f) = mongo_compiler().get() else {
+        return;
+    };
+    if p.using_mongo.is_none() && p.check_mongo.is_none() {
+        return;
+    }
+    let now = |m: &Option<String>, stored: &Option<String>| match m {
+        Some(m) => Some(f(m).unwrap_or_else(|| "FALSE".to_owned())),
+        None => stored.clone(),
+    };
+    let using = now(&p.using_mongo, &p.using_expr);
+    let check = now(&p.check_mongo, &p.check_expr);
+    if using == p.using_expr && check == p.check_expr {
+        return;
+    }
+    let old_using = std::mem::replace(&mut p.using_expr, using);
+    let old_check = std::mem::replace(&mut p.check_expr, check);
+    p.stored_exprs = Some((old_using, old_check));
+}
+
 /// `sprig-auth`'s row-level security catalog module.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RlsExtension;
@@ -1250,7 +1401,45 @@ mod tests {
             check_mongo: None,
             created_by: UserId(1),
             changed_version: 1,
+            stored_exprs: None,
         }
+    }
+
+    #[test]
+    fn mongo_forms_compile_again_when_loaded() {
+        set_mongo_compiler(|m| (m == r#"{"a":1}"#).then(|| "new_a".to_owned()));
+        let mongo = |u: Option<&str>, c: Option<&str>, m: Option<&str>, mc: Option<&str>| {
+            let mut p = pol(1, false, cmd::SELECT, vec![], u, c);
+            p.using_mongo = m.map(str::to_owned);
+            p.check_mongo = mc.map(str::to_owned);
+            compile_mongo(&mut p);
+            p
+        };
+        // Stored before a translator fix: the new SQL, the old kept.
+        let p = mongo(Some("old_a"), None, Some(r#"{"a":1}"#), None);
+        assert_eq!(p.using_expr.as_deref(), Some("new_a"));
+        assert_eq!(p.stored_exprs, Some((Some("old_a".into()), None)));
+        // Already current: nothing to rewrite.
+        let p = mongo(Some("new_a"), None, Some(r#"{"a":1}"#), None);
+        assert_eq!(p.stored_exprs, None);
+        // A form that doesn't compile any more hides every row.
+        let p = mongo(Some("old_b"), Some("chk"), Some(r#"{"b":1}"#), None);
+        assert_eq!(p.using_expr.as_deref(), Some("FALSE"));
+        assert_eq!(p.check_expr.as_deref(), Some("chk"));
+        // SQL-only policies are left alone.
+        let p = mongo(Some("x = 1"), None, None, None);
+        assert_eq!(
+            (p.using_expr.as_deref(), p.stored_exprs),
+            (Some("x = 1"), None)
+        );
+        let st = RlsState::new(RlsRows {
+            policies: vec![
+                mongo(Some("old_a"), None, Some(r#"{"a":1}"#), None),
+                mongo(Some("x = 1"), None, None, None),
+            ],
+            security: Vec::new(),
+        });
+        assert_eq!(st.recompiled().count(), 1);
     }
 
     fn exprs<'a>(c: &Combination<'a>) -> Vec<&'a str> {

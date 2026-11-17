@@ -38,6 +38,8 @@ pub mod galera;
 pub mod internal_tls;
 pub mod primary_replica;
 pub mod rebuild;
+pub mod relay;
+pub mod relay_pools;
 pub mod topology;
 pub mod writer;
 

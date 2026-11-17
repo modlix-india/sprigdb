@@ -584,8 +584,8 @@ meaning = "Under `txn.non_xa_policy = sprig_2pc`, a branch on a cluster without 
 what_to_do = "Compute such values in the application and pass them as literals, add `ORDER BY` to limited writes, then retry the transaction."
 
 [ER_SPRIG_HELD_BRANCH_FENCED]
-meaning = "A node's agent refuses the tenant's connections to that node while it recovers a held branch whose holder was lost. Declared for this case; no current path raises it."
-what_to_do = "Retry after a short delay; recovery finishes on its own."
+meaning = "On a tenant whose distributed commits go through the relay (`txn.sprig_2pc_path = relay`), no relay writer of the cluster was ready within `backend.acquire_timeout_ms` (during a takeover, or with every node agent down), or the tenant's held rows on that node are fenced while a branch whose holder was lost is recovered. The statement didn't run; statements never go around the relay."
+what_to_do = "Retry with backoff; a takeover or recovery finishes on its own. If it lasts, check that the cluster's node agents are up, that their `relay_addr` is reachable, and that one of them holds the relay."
 
 [ER_SPRIG_PHASE2_PENDING]
 meaning = "A branch of the session's last distributed commit is still being finished on the cluster this statement needs (phase 2 outlasted `txn.phase2_wait_ms`, and settling it took longer than `txn.commit_resolve_timeout_ms`). The statement didn't run."
@@ -992,8 +992,8 @@ meaning = "A buffered REST result is larger than `api.rest.max_buffered_bytes`."
 what_to_do = "Stream the result with `sql:query` and `Accept: application/x-ndjson`, or page through it with `LIMIT`."
 
 [ER_SPRIG_TENANT_AMBIGUOUS]
-meaning = "The credential doesn't name exactly one tenant. Declared for this case; no current path raises it."
-what_to_do = "Name the tenant in the login (`acme.app`) or the `x-sprig-tenant` header."
+meaning = "A REST or gRPC request carries an identity provider's token (a JWT bearer token) but doesn't say which tenant it is for: it reached no tenant host name under `listener.tenant_sni_suffixes`, and has no `x-sprig-tenant` header. The tenant must be known before the token can be checked against its issuers."
+what_to_do = "Send the header `x-sprig-tenant: <tenant>` (gRPC: metadata), or call the tenant's endpoint (`acme.db.example.com`)."
 
 [ER_SPRIG_REQUEST_TOO_LARGE]
 meaning = "The request body is larger than `api.max_request_bytes`, or a Studio text is longer than its limit."
@@ -1040,8 +1040,8 @@ meaning = "The resume token is malformed or belongs to another tenant (MongoDB c
 what_to_do = "Use a token your own stream returned, unchanged; start without a token if you don't have one."
 
 [ER_SPRIG_FEED_SOURCE_UNSUPPORTED]
-meaning = "The change stream can't run as asked: the caller isn't a tenant user, an unsupported start option such as `start_at_hlc` was given, or the cluster's binlog settings don't meet the feed's requirements."
-what_to_do = "Use `start_after` with a token, call as a tenant user, and on the cluster use `binlog_format = ROW` with full row images."
+meaning = "The change stream can't run as asked: the caller isn't a tenant user, the cluster's binlog settings don't meet the feed's requirements, or a stream asked to start at a time (`start_at_hlc`, MongoDB's `startAtOperationTime`) on a cluster that has no time index yet (just added or upgraded, or a Galera cluster without `wsrep_gtid_mode`)."
+what_to_do = "Call as a tenant user, and on the cluster use `binlog_format = ROW` with full row images. For a start time on a new cluster, wait until its time index has caught up, or start with a resume token (`start_after`) instead."
 
 [ER_SPRIG_FEED_SUBSCRIPTION_EXISTS]
 meaning = "A change-feed subscription with that name already exists."
@@ -1076,8 +1076,8 @@ meaning = "The search query string or an operator in it is malformed, or a reque
 what_to_do = "Correct the query at the point the message names."
 
 [ER_SPRIG_SEARCH_UNSUPPORTED]
-meaning = "The search asks for a feature SprigDB doesn't offer, such as sorting by anything but score in `Search.Query`, `WITH QUERY EXPANSION`, or a MariaDB `FULLTEXT` index while `search.fulltext_ddl` is `reject`."
-what_to_do = "Use a supported form: `CREATE SEARCH INDEX` instead of `FULLTEXT`, and sort results in the application if needed."
+meaning = "The search asks for a feature SprigDB doesn't offer, such as sorting by anything but score in `Search.Query`, `WITH QUERY EXPANSION`, a MariaDB `FULLTEXT` index while `search.fulltext_ddl` is `reject`, or, over Redis, an `FT.*` option SprigDB doesn't offer: `ON JSON`, `GEO`, `VECTOR` or `GEOSHAPE` fields, `PHONETIC`, custom `STOPWORDS`, an unknown `LANGUAGE`, `FILTER` or `TEMPORARY` in `FT.CREATE`, `HIGHLIGHT`, `SUMMARIZE` or `GEOFILTER` in `FT.SEARCH`, or `WITHCURSOR` in `FT.AGGREGATE`. Redis clients get an error starting `SPRIG SEARCH_UNSUPPORTED 39823`."
+what_to_do = "Use a supported form: `CREATE SEARCH INDEX` instead of `FULLTEXT`, and sort results in the application if needed. With `FT.*`, drop the option the message names: index hashes with `ON HASH` and `TEXT`, `TAG` or `NUMERIC` fields, page with `LIMIT` instead of a cursor, and highlight in the application. A retry won't help."
 
 [ER_SPRIG_SEARCH_INDEX_NOT_READY]
 meaning = "The search index is still being built, so it can't answer yet."
@@ -1092,8 +1092,8 @@ meaning = "The search asked for read-your-writes consistency, and the index didn
 what_to_do = "Retry, or use the default consistency for searches that can accept a short lag."
 
 [ER_SPRIG_SEARCH_WINDOW_EXCEEDED]
-meaning = "The search would have to read more hits than `search.max_window`, for example deep paging, or counts and facets for a user bound by row-level security."
-what_to_do = "Narrow the query, ask for fewer results or a smaller offset, or ask for no facets."
+meaning = "The search would have to read more hits than `search.max_window`, for example deep paging, or counts and facets for a user bound by row-level security. Also a warning, not an error, from `RETRIEVE()` and the retrieval REST search: a user that row-level security restricts searched words that match more than 1,000 chunks in one shard, so the hits come from the vector list alone, without a keyword ranking."
+what_to_do = "Narrow the query, ask for fewer results or a smaller offset, or ask for no facets. For the retrieval warning, use rarer or more specific words, or add a filter on the index's `FILTERS` columns."
 
 [ER_SPRIG_SEARCH_ANALYZER_UNKNOWN]
 meaning = "The search index or query names an analyser or language that isn't defined, or a MongoDB `$language` other than the text index's default."
@@ -1132,8 +1132,8 @@ meaning = "A document's `_id`, once encoded, is longer than 1,024 bytes. MongoDB
 what_to_do = "Use a shorter `_id`, such as an `ObjectId` or a hash of the long value, and keep the long value in another field."
 
 [ER_SPRIG_DOC_FEATURE_UNSUPPORTED]
-meaning = "A MongoDB command, operator or option that this release doesn't support, such as `$where`, `mapReduce`, capped or time-series collections, `startAtOperationTime` on a change stream, or some `explain` targets. The message names it. MongoDB clients see `codeName` `SprigDocFeatureUnsupported`."
-what_to_do = "Rewrite the operation without the feature the message names, for example with an aggregation pipeline instead of `$where` or `mapReduce`. A retry won't help."
+meaning = "A MongoDB feature that this release doesn't support, such as views, time-series or clustered collections, Queryable Encryption, `2d` or `geoHaystack` indexes, a compound `2dsphere` index, or some `explain` targets. The message names it. MongoDB clients see `codeName` `SprigDocFeatureUnsupported`."
+what_to_do = "Rewrite the operation without the feature the message names: run a view's pipeline as an aggregation, use an ordinary collection with an index on the time field instead of a time-series one, and `2dsphere` with GeoJSON points instead of `2d`. A retry won't help."
 
 [ER_SPRIG_SHARD_KEY_ARRAY]
 meaning = "Reserved: this release doesn't return it. It is kept for an array value in a collection's shard key field."
@@ -1168,8 +1168,8 @@ meaning = "A Lua scripting feature SprigDB doesn't offer, such as `SCRIPT DEBUG`
 what_to_do = "Debug scripts outside SprigDB, and send scripts as Lua source."
 
 [ER_SPRIG_REDIS_RESTRICTED]
-meaning = "A Redis administrative command SprigDB doesn't offer, such as `CONFIG SET`, `ACL SETUSER`, some `CLIENT` subcommands, or a command SprigDB doesn't list. Clients get an error starting `SPRIG REDIS_RESTRICTED 39842`."
-what_to_do = "Manage SprigDB through SQL, the Admin API or `sprigctl` instead. A retry won't help."
+meaning = "A Redis administrative command SprigDB doesn't offer, such as `CONFIG SET`, `ACL SETUSER`, some `CLIENT` subcommands, `MODULE`, or a command SprigDB doesn't list, including the `FT.*` commands outside the ten it answers (`FT.PROFILE`, `FT.CURSOR`, `FT.CONFIG`, aliases, spelling, dictionaries, synonyms and suggestions). Clients get an error starting `SPRIG REDIS_RESTRICTED 39842`."
+what_to_do = "Manage SprigDB through SQL, the Admin API or `sprigctl` instead. For those `FT.*` commands, change the client: page with `FT.SEARCH ... LIMIT` instead of `FT.CURSOR`, use the index's own name instead of an alias, and turn off a client library's check for a search module. A retry won't help."
 
 [ER_SPRIG_REDIS_MULTI_TOO_LARGE]
 meaning = "A `MULTI` block queued more commands than `redis.max_multi_commands`. The command that went over the limit gets this error, and `EXEC` then fails with `EXECABORT`."
@@ -1204,8 +1204,8 @@ meaning = "Logic code failed to parse or type-check at deploy; the message gives
 what_to_do = "Fix the code at the line and column named, and deploy again; `sprigctl logic compile` checks it without deploying."
 
 [ER_SPRIG_LOGIC_UNSUPPORTED]
-meaning = "The code can't run in any tier: for example procedural SQL that would span shards, or a dry run of something that isn't a function or procedure."
-what_to_do = "Rewrite the code so it touches one shard per call, or move it into a language the engine runs (JavaScript, Lua or KIRun)."
+meaning = "The code can't run in any tier: a validation, after-commit trigger or computed column whose code doesn't compile into MariaDB (these kinds have no engine tier; the message lists the reasons), procedural SQL that would span shards, a dry run of a stream or queue trigger or a schedule, which only a deploy places, or a statement refused inside a test run."
+what_to_do = "Remove the reasons the message lists, so the code compiles (for Lua, test a column or argument for `sprig.null` before comparing it or doing arithmetic on it), or rewrite procedural SQL so it touches one shard per call."
 
 [ER_SPRIG_LOGIC_VALIDATION_FAILED]
 meaning = "A validation rejected the write; MongoDB clients see 121, `DocumentValidationFailure`."
@@ -1236,8 +1236,8 @@ meaning = "Another session is deploying the same module at the same time and too
 what_to_do = "Retry the deploy once the other finishes."
 
 [ER_SPRIG_LOGIC_ROLLOUT_BLOCKED]
-meaning = "A staged rollout can't stage this version: it changes the parameters, the language or the rights, or the candidate was rolled back after failing its checks."
-what_to_do = "Deploy without `SPRIG_ROLLOUT` to switch at once, or keep the signature and rights unchanged for a staged rollout."
+meaning = "A staged rollout can't stage this version: a function's or procedure's candidate changes the parameters, the language or the rights, or keys the rollout on a parameter that doesn't exist or isn't a whole number or text (`SPRIG_ROLLOUT_BY = 'key:<parameter>'`); a trigger's candidate reads another stream or queue, or, for an after-commit trigger, changes the table, the events or the `UPDATE OF` columns; or the candidate was rolled back after failing its checks."
+what_to_do = "Deploy without `SPRIG_ROLLOUT` to switch at once, or keep what the message names unchanged for a staged rollout; for a rollout by key, name a whole-number or text parameter."
 
 [ER_SPRIG_LOGIC_ENGINE_BUSY]
 meaning = "The logic engine's queue on this gateway is full."
@@ -1544,16 +1544,16 @@ meaning = "Docs search (the REST call, the `sprig_docs` database or `sprig_docs.
 what_to_do = "Retry shortly after an upgrade: the controller loads the pack into every cluster at start. If it lasts, check `docs.enabled`, that the controller found a valid pack (`docs.pack_path`, the `docs.pack.unavailable` event) and that `sprig_ctl` may manage `__sprig_docs`; for `sprig_docs.embed`, check `docs.embed_queries` and `docs.model_dir`."
 
 [ER_SPRIG_AI_NOT_CONFIGURED]
-meaning = "The assistant has no model: `ai.model.<role>` is empty or names a provider that doesn't exist, or the provider's record can't be used (its base URL is invalid, or its key doesn't open with this process's master key file)."
+meaning = "The assistant or AI function has no model: `ai.model.<role>` (for the AI functions, `ai.functions.model`, else `ai.model.data`) is empty or names a provider that doesn't exist, an AI function names a model not listed in `ai.functions.models`, or the provider's record can't be used (its base URL is invalid, or its key doesn't open with this process's master key file)."
 what_to_do = "An operator sets `ai.model.<role>` to `provider/model` (for example `anthropic/claude-opus-5-5`) after adding the provider. If the message names the key, check that the process has the master key file the key was sealed with, or set the key again."
 
 [ER_SPRIG_AI_DISABLED]
-meaning = "The AI assistants are turned off for the tenant (`ai.enabled` is off, the default)."
-what_to_do = "A tenant admin turns on `ai.enabled` once an operator has configured a provider. Decide `ai.share_data` at the same time: it stays off unless you want rows and results sent to the provider."
+meaning = "The AI assistants are turned off for the tenant (`ai.enabled` is off, the default), or, for the AI functions in SQL and MongoDB aggregation, `ai.functions.enabled` is off (the default)."
+what_to_do = "A tenant admin turns on `ai.enabled` (or `ai.functions.enabled` for the functions) once an operator has configured a provider. Decide `ai.share_data` at the same time: it stays off unless you want rows and results sent to the provider."
 
 [ER_SPRIG_AI_BUDGET_EXCEEDED]
-meaning = "The tenant's (`ai.budget.tenant_tokens_day`) or the user's (`ai.budget.user_tokens_day`) daily AI token budget is used up, so the turn stopped before calling the model. Tokens counted are input read or written uncached and output; budgets reset at 00:00 UTC."
-what_to_do = "Wait for the next UTC day, or ask a tenant admin to raise the budget the message names. Shorter conversations and fewer tool rounds use fewer tokens."
+meaning = "The tenant's (`ai.budget.tenant_tokens_day`) or the user's (`ai.budget.user_tokens_day`) daily AI token budget is used up, so the turn or the AI function stopped before calling the model; an AI function also stops when one statement would send more than `ai.functions.max_inputs` distinct inputs. Tokens counted are input read or written uncached and output; budgets reset at 00:00 UTC."
+what_to_do = "Wait for the next UTC day, or ask a tenant admin to raise the budget the message names. Shorter conversations and fewer tool rounds use fewer tokens. For AI functions, narrow the statement to fewer rows, or set `ai.functions.on_budget = null` to get NULL for the rows left instead of an error."
 
 [ER_SPRIG_AI_PROVIDER_ERROR]
 meaning = "The AI provider failed: it couldn't be reached, answered with an error, broke off its answer, or the turn ran past `ai.timeout_seconds`. Network errors, rate limits, overloads and server errors were already retried twice."
@@ -1564,7 +1564,7 @@ meaning = "The model declined the request; its explanation, when the provider gi
 what_to_do = "Rephrase the request, or ask for something narrower. Refusals aren't retried automatically."
 
 [ER_SPRIG_AI_EGRESS_DENIED]
-meaning = "The request would have sent rows or values (a result, a sample) to the AI provider while `ai.share_data` is off for the tenant or database."
+meaning = "The request would have sent rows or values (a result, a sample, the inputs of an AI function using a provider model) to the AI provider while `ai.share_data` is off for the tenant or database."
 what_to_do = "Leave the data out, or ask a tenant admin to turn on `ai.share_data` for the database if sending rows to the provider is acceptable."
 
 [ER_SPRIG_AI_TOOL_DENIED]
@@ -1582,107 +1582,6 @@ what_to_do = "Note the time, gateway and statement, find the error in that proce
 # Codes not raised by this build. Kept for when they are; the generator
 # shows only codes in SprigCode.
 
-[ER_SPRIG_ROLE_ACTIVATION_TIMEOUT]
-meaning = "Combined role not ready."
-
-[ER_SPRIG_TOO_MANY_ROLE_SETS]
-meaning = "Too many active-role sets."
-
-[ER_SPRIG_GRANT_TARGET_MISMATCH]
-meaning = "Role cycle; wrong resource kind."
-
-[ER_SPRIG_REDIS_ACL_UNSUPPORTED]
-meaning = "Redis rule SprigDB can't represent."
-
-[ER_SPRIG_GRANT_OUTSIDE_SUBTREE]
-meaning = "Grant up or sideways the tree."
-
-[ER_SPRIG_TENANT_NOT_IN_SUBTREE]
-meaning = "USE TENANT or management outside the subtree."
-
-[ER_SPRIG_STALE_EPOCH]
-meaning = "An internal request names an older epoch."
-
-[ER_SPRIG_KEY_CHANGE_TOO_LARGE]
-meaning = "A key update would move too many rows."
-
-[ER_SPRIG_SHARD_UNAVAILABLE]
-meaning = "HY000."
-
-[ER_SPRIG_EXPLAIN_NOTE]
-meaning = "HY000."
-
-[ER_SPRIG_XA_NOT_SUPPORTED]
-meaning = "HY000."
-
-[ER_SPRIG_CLAUSE_IGNORED]
-meaning = "ENCRYPTION, AUTOEXTEND_SIZE, SECONDARY_ENGINE."
-
-[ER_SPRIG_TYPE_NOT_FOUND]
-meaning = "Unknown type."
-
-[ER_SPRIG_TYPE_MISMATCH]
-meaning = "Upsert meets an unrelated type."
-
-[ER_SPRIG_TYPE_VALIDATION_FAILED]
-meaning = "Schema failure (MongoDB: 121)."
-
-[ER_SPRIG_KV_TARGET_EXISTS]
-meaning = "ALREADY_EXISTS."
-
-[ER_SPRIG_KV_SUBTREE_TOO_LARGE]
-meaning = "FAILED_PRECONDITION."
-
-[ER_SPRIG_KV_TXN_TOO_LARGE]
-meaning = "INVALID_ARGUMENT."
-
-[ER_SPRIG_KV_FILTER_UNSUPPORTED]
-meaning = "INVALID_ARGUMENT."
-
-[ER_SPRIG_KV_SQL_READ_ONLY]
-meaning = "FAILED_PRECONDITION."
-
-[ER_SPRIG_PAGE_TOKEN_INVALID]
-meaning = "INVALID_ARGUMENT."
-
-[ER_SPRIG_FEED_STALLED]
-meaning = "Scope stalled feed.stall_seconds (6, resumable)."
-
-[ER_SPRIG_FEED_CONSUMER_TOO_SLOW]
-meaning = "Edge buffer overflowed."
-
-[ER_SPRIG_FEED_RESIDENCY]
-meaning = "Tenant's data may not be served here."
-
-[ER_SPRIG_FEED_TOO_MANY_READERS]
-meaning = "No catch-up slot (retryable)."
-
-[ER_SPRIG_FEED_INVALIDATED]
-meaning = "Watched object dropped or renamed."
-
-[ER_SPRIG_FEED_DIVERGED]
-meaning = "Failover lost delivered transactions (280)."
-
-[ER_SPRIG_REDIS_TLS_REQUIRED]
-meaning = "SPRIG, then close."
-
-[ER_SPRIG_REDIS_CROSS_SHARD_TOO_LARGE]
-meaning = "SPRIG past redis.max_cross_shard_elements."
-
-[ER_SPRIG_REDIS_OUTPUT_BUFFER_LIMIT]
-meaning = "Logged; the client is closed, as Redis does."
-
-[ER_SPRIG_GRAPH_PLUGIN_FAILED]
-meaning = "Internal; the call falls back."
-
-[ER_SPRIG_GRAPH_ALGO_FAILED]
-meaning = "SprigAlgoFailed."
-
-[ER_SPRIG_BOLT_TLS_REQUIRED]
-meaning = "Closed before the handshake."
-
-[ER_SPRIG_STUDIO_VERSION_MISMATCH]
-meaning = "Studio needs a newer API (409)."
-
 [ER_SPRIG_EMBEDDING_FAILED]
-meaning = "An embedded column or retrieval index can't be filled (dimension, model)."
+meaning = "An embedded column's declaration or change was refused: its source isn't a function of the row (`RAND()`, `NOW()`, a variable, a subquery), its `USING MODEL` alias isn't in `ai.embedding_models`, `VECTOR(n)` isn't the model's dimensions, it asks for `ON CHANGE SYNC` or a provider's model (neither is available yet), its table has no primary key, its name is too long, a re-embedding of it is still running, or a `CHANGE`, `RENAME COLUMN`, `ALTER COLUMN` or plain `MODIFY` would change it. `AI_EMBED` (and `$aiEmbed`) raise it for a model alias that isn't an embedding model, or when the bundled model can't be loaded on the gateway. `CREATE RETRIEVAL INDEX` raises it for a provider's model (not available yet), an unknown alias, a text, title or filter column of a type it can't use, or a table without a primary key; a retrieval index whose worker fails (a column it reads was dropped, the model isn't available) shows it as its error."
+what_to_do = "Read the message: it names the column and the reason. Use an alias `ai.embedding_models` lists (`local:bge-small` is bundled) with its dimensions (384), declare `ON CHANGE ASYNC`, give the table a primary key, or wait for the running re-embedding. To change an embedded column, use `MODIFY COLUMN ... GENERATED BY EMBEDDING` with the new model or source, or drop it and add it again. For `AI_EMBED`, name `local:bge-small` (or no model); if the bundled model doesn't load, check that `docs.model_dir` points at its files. For a retrieval index, `SHOW RETRIEVAL INDEXES` shows the reason; fix the column or the model, or drop the index and create it again."

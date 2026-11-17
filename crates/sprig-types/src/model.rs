@@ -1,6 +1,5 @@
-//! The type catalog in memory (chapter 32, "Interfaces" and "In-memory
-//! state"): types with their chains, descendants and field owners, and
-//! record hierarchies, per logical database.
+//! The type catalog in memory: types with their chains, descendants and field
+//! owners, and record hierarchies, per logical database.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -200,7 +199,7 @@ pub struct TypeDef {
     /// A discriminated root's comparison operand: the column under its
     /// character set's binary collation (`(`vtype` COLLATE utf8mb4_bin)`),
     /// as the generated type columns compare it. Kept so merged views of
-    /// inheritable trees (chapter 42) can type rows the same way.
+    /// inheritable trees can type rows the same way.
     pub disc_operand: Option<String>,
     /// State.
     pub state: TypeState,
@@ -753,7 +752,7 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 pub(crate) mod fleet {
-    //! Kiran's example: `vehicle` typed by its `vtype` column.
+    //! An example: `vehicle` typed by its `vtype` column.
     use super::fixtures::field;
     use super::*;
 

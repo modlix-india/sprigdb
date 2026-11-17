@@ -70,6 +70,10 @@ export const en = {
   'nav.policies': 'Roles and policies',
   'nav.security': 'Security',
   'nav.operator': 'Operator mode',
+  'nav.docs': 'Docs',
+  'nav.dashboards': 'Dashboards',
+  'nav.glossary': 'Glossary',
+  'nav.digests': 'Digests',
   'ops.dcs': 'Data centers',
   'ops.clusters': 'Clusters',
   'ops.tenants': 'Tenants and placement',
@@ -78,6 +82,7 @@ export const en = {
   'ops.failovers': 'Failovers',
   'ops.txns': 'In-doubt transactions',
   'ops.leave': 'Leave operator mode',
+  'ops.incidents': 'Incidents',
   'ops.legacyDeprecated':
     'This operator mode (a Studio login listed in studio.operator_logins, using the gateway\'s token) is deprecated and will be removed in the release after Phase 1. Sign in as a named operator instead.',
   'mfa.title': 'Second factor',

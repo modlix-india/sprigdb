@@ -1,11 +1,9 @@
-//! Change streams (chapter 30 step 9; chapter 38 step 14; chapter 31
-//! step 14, "Sharding, SQL reads and change events").
+//! Change streams.
 //!
 //! An `aggregate` whose first stage is `$changeStream` (what drivers'
 //! `watch()` sends) opens a tailable `awaitData` cursor over the tenant's
-//! change feed: a [`TenantTail`] (chapter 38, "As built in R1") read by a
-//! task of its own, which keeps the stream's events and progress tokens
-//! in a bounded queue. `getMore` waits up to its `maxTimeMS` (default
+//! change feed: a [`TenantTail`] read by a task of its own, which keeps
+//! the stream's events and progress tokens in a bounded queue. `getMore` waits up to its `maxTimeMS` (default
 //! 1 s) for events and answers with the batch and `postBatchResumeToken`.
 //!
 //! - **Rendering.** A row change of a collection's table becomes
@@ -28,24 +26,34 @@
 //!   `$replaceRoot`, `$replaceWith`) run on each batch.
 //!
 //! - **Replacements.** The document engine sends a replacement's `UPDATE`
-//!   with chapter 38's statement comment (`o=r`), which the feed keeps as
+//!   with the feed's statement comment (`o=r`), which the feed keeps as
 //!   the row's operation hint, so it shows as a `replace` event with the
-//!   new document (`decisions/r5-interim.md` D14).
+//!   new document.
 //!
-//! - **`showExpandedEvents`** (R5 round 4): `create`, `createIndexes`,
+//! - **`showExpandedEvents`**: `create`, `createIndexes`,
 //!   `dropIndexes` and `modify` (a `collMod` sets a table comment) from
 //!   the feed's DDL statements, with `collectionUUID` and
 //!   `operationDescription`; `rename` carries `to`.
-//! - **Pre- and post-images** (R5 round 4): `whenAvailable` and
+//! - **Pre- and post-images**: `whenAvailable` and
 //!   `required` follow the collection's `changeStreamPreAndPostImages`
 //!   option (`null`, or the stream fails with 280, when it is off).
-//! - **One dump per cluster** (R9, r9feed2): every stream's tail reads
+//! - **One dump per cluster**: every stream's tail reads
 //!   through the gateway's shared reader ([`feed_parts`]), not a binlog
 //!   dump of its own.
 //!
-//! Not built: `startAtOperationTime` (the feed can't position by time yet),
-//! `shardCollection` events, and the k-way merge across clusters (R1 keeps
-//! a tenant on one cluster at a time).
+//! - **`startAtOperationTime`** (a cluster time `T`, `seconds << 32 |
+//!   increment` as the feed's HLC stamps): the tail starts where
+//!   `Changes.Watch`'s `start_at_hlc` does, at the feed time index's last
+//!   position 30 s or more before `T` on the tenant's cluster, and the
+//!   stream leaves out events stamped before `T`. A Galera cluster's index
+//!   keeps its shared GTID domain. A tenant homed in another DC starts
+//!   from the time index there (the relay), and this gateway leaves out
+//!   the relayed events stamped before `T`. Older than the index or than
+//!   the tenant's last move: 286; a cluster without an index (a Galera
+//!   cluster without `wsrep_gtid_mode`, or not written yet): 39802.
+//!
+//! Not built: `shardCollection` events, and the k-way merge across clusters
+//! (a tenant lives on one cluster at a time).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -247,6 +255,9 @@ pub struct ChangeFeed {
     clusters: Arc<dyn Clusters>,
     placement: Arc<dyn PlacementView>,
     names: Arc<dyn Resolver>,
+    /// The tenant services: a tenant homed in another DC gets its feed
+    /// relayed from there ([`super::feed_relay`]).
+    relay: Option<Arc<crate::tenant::TenantServices>>,
 }
 
 impl std::fmt::Debug for ChangeFeed {
@@ -271,7 +282,39 @@ impl ChangeFeed {
             clusters,
             placement,
             names,
+            relay: None,
         })
+    }
+
+    /// The same feed relaying the tails of tenants homed in other DCs
+    /// from a gateway there.
+    #[must_use]
+    pub fn with_relay(mut self, svc: Arc<crate::tenant::TenantServices>) -> Self {
+        self.relay = Some(svc);
+        self
+    }
+}
+
+/// Where a stream's items come from: this gateway's tail, or a tail of the
+/// tenant's home DC relayed here.
+enum Tail {
+    Local(Box<TenantTail>),
+    Relayed(mpsc::Receiver<Result<FeedItem>>),
+}
+
+impl Tail {
+    /// The next item (cancel-safe, as the stream's task races it).
+    async fn next(&mut self) -> Result<FeedItem> {
+        match self {
+            Self::Local(t) => t.next().await,
+            Self::Relayed(rx) => rx.recv().await.unwrap_or_else(|| {
+                Err(SprigError::new(
+                    SprigCode::ForwardFailed,
+                    "ER_SPRIG_FORWARD_FAILED: the relayed change feed ended; resume from the \
+                     last token",
+                ))
+            }),
+        }
     }
 }
 
@@ -281,9 +324,8 @@ pub(crate) type FeedParts = (Arc<dyn Clusters>, Arc<dyn PlacementView>, Arc<dyn 
 /// The gateway's feed parts, one set per process, for every change
 /// consumer in it: MongoDB change streams, the HTTP, gRPC and WebSocket
 /// change streams, Redis keyspace notifications, the change exchange and
-/// chapter 39's search runtimes. Their tails read through one shared
-/// reader (R9, r9feed2: `sprig_feed::shared`, a view keeping each tenant
-/// whole), so the gateway keeps one binlog dump per cluster however many
+/// search runtimes. Their tails read through one shared reader
+/// (`sprig_feed::shared`, a view keeping each tenant whole), so the gateway keeps one binlog dump per cluster however many
 /// streams it serves. The first call's stores are the process's.
 ///
 /// # Errors
@@ -303,7 +345,7 @@ pub(crate) fn feed_parts(
     )?));
     let shared = SharedFeed::new(inner, SharedOpts::default());
     let parts: FeedParts = (
-        shared.view(Kept::All),
+        shared.view(Kept::All).named("gateway"),
         Arc::new(MetaPlacement::new(dc)),
         Arc::new(CatalogResolver::new(Arc::new(Catalogs(catalogs)))),
     );
@@ -363,9 +405,9 @@ pub struct StreamSpec {
     /// `dropIndexes`, `modify`) and the fields MongoDB 6.0 added
     /// (`collectionUUID`, `operationDescription`).
     pub expanded: bool,
-    /// Chapter 29 (RL34): the documents the stream's session may see, by
-    /// its row-level security policies when the stream opened. `None`: no
-    /// row event shows.
+    /// The documents the stream's session may see, by its row-level
+    /// security policies when the stream opened. `None`: no row event
+    /// shows.
     pub visibility: Option<Arc<crate::tenant::rls::DocViews>>,
 }
 
@@ -447,8 +489,8 @@ pub struct ChangeStream {
     pub token: String,
     pipeline: Vec<Document>,
     done: bool,
-    /// Chapter 29 (RL41): the digest of the row-level security views the
-    /// stream opened with ([`crate::tenant::rls::DocViews::fingerprint`]).
+    /// The digest of the row-level security views the stream opened with
+    /// ([`crate::tenant::rls::DocViews::fingerprint`]).
     pub policies: u64,
 }
 
@@ -477,7 +519,7 @@ fn parse_token(v: &Bson, tenant: TenantId) -> std::result::Result<ResumeToken, M
     Ok(t)
 }
 
-/// Chapter 38's codes in MongoDB's terms: a lost history is 286
+/// The feed's error codes in MongoDB's terms: a lost history is 286
 /// `ChangeStreamHistoryLost`, a bad token 260 `InvalidResumeToken`.
 fn feed_error(e: &SprigError) -> MongoError {
     match e.kind {
@@ -694,7 +736,7 @@ async fn render_inner(
             },
         );
     }
-    // Chapter 29 (RL34): events of documents the session may not see
+    // Row-level security: events of documents the session may not see
     // are dropped; an update that hides a document arrives as a delete,
     // one that shows it as an insert (`rls.stream_visibility_events`).
     let mut op = e.op;
@@ -834,7 +876,36 @@ impl ChangeFeed {
         resume: Option<&Bson>,
     ) -> std::result::Result<ChangeStream, MongoError> {
         let tenant = spec.tenant;
+        // `startAtOperationTime` comes as its timestamp ([`parse_stage`]).
+        let from = match resume {
+            Some(Bson::Timestamp(t)) => (u64::from(t.time) << 32) | u64::from(t.increment),
+            _ => 0,
+        };
+        // A tenant homed in another DC: its home's reader tails it (from
+        // the time index there, for `startAtOperationTime`), and the items
+        // are rendered here, those stamped before the time left out.
+        if let Some(svc) = &self.relay
+            && let Some(home) = super::feed_relay::remote_home(svc, tenant)
+                .await
+                .map_err(|e| feed_error(&e))?
+        {
+            let after = match resume {
+                Some(Bson::Timestamp(_)) | None => None,
+                Some(v) => Some(parse_token(v, tenant)?),
+            };
+            let (token, rx) = super::feed_relay::open(svc, &home, tenant, after.as_ref(), from)
+                .await
+                .map_err(|e| feed_error(&e))?;
+            let first = after.as_ref().map(ResumeToken::to_hex);
+            return Ok(Self::stream(
+                Tail::Relayed(rx),
+                spec,
+                first.unwrap_or(token),
+                from,
+            ));
+        }
         let start = match resume {
+            Some(Bson::Timestamp(_)) => self.start_at(tenant, from).await?,
             Some(v) => StartAt::After(parse_token(v, tenant)?),
             None => StartAt::Now,
         };
@@ -878,40 +949,73 @@ impl ChangeFeed {
                 .to_hex()
             }
         };
+        Ok(Self::stream(Tail::Local(Box::new(tail)), spec, token, from))
+    }
+
+    /// Where a stream from cluster time `hlc` starts: the feed time
+    /// index's position before it on the tenant's cluster, as
+    /// `Changes.Watch`'s `start_at_hlc`.
+    ///
+    /// # Errors
+    /// 286 before the index or the tenant's last move; 39802 without an
+    /// index; 39662 without the tenant services (a test feed).
+    async fn start_at(
+        &self,
+        tenant: TenantId,
+        hlc: u64,
+    ) -> std::result::Result<StartAt, MongoError> {
+        let Some(svc) = &self.relay else {
+            return Err(MongoError::new(
+                code::SPRIG_DOC_FEATURE_UNSUPPORTED,
+                "startAtOperationTime needs the tenant services; resume with a token",
+            ));
+        };
+        crate::http::changes::start_at(svc, &self.clusters, &self.placement, tenant, hlc)
+            .await
+            .map_err(|e| feed_error(&e))
+    }
+
+    /// The stream over `tail`, its token starting at `token`; events
+    /// stamped before `from` (`startAtOperationTime`) are left out.
+    fn stream(tail: Tail, spec: StreamSpec, token: String, from: u64) -> ChangeStream {
         let (tx, rx) = mpsc::channel(QUEUE);
         let stop = CancellationToken::new();
         let pipeline = spec.pipeline.clone();
         let policies = crate::tenant::rls::DocViews::fingerprint(spec.visibility.as_deref());
-        tokio::spawn(run(tail, spec, tx, stop.clone()));
+        tokio::spawn(run(tail, spec, tx, stop.clone(), from));
         metrics::gauge!("sprig_mongo_cursors_open", "kind" => "change_stream").increment(1.0);
-        Ok(ChangeStream {
+        ChangeStream {
             rx,
             stop,
             token,
             pipeline,
             done: false,
             policies,
-        })
+        }
     }
 }
 
 async fn run(
-    mut tail: TenantTail,
+    mut tail: Tail,
     spec: StreamSpec,
     tx: mpsc::Sender<Item>,
     stop: CancellationToken,
+    from: u64,
 ) {
     loop {
         // The tail is raced only against the stream's end, which drops it
         // for good (a resumed stream starts from the client's token), so a
-        // half-read item is never lost here (decision r9-131). The
-        // client's waits are on the channel.
+        // half-read item is never lost here. The client's waits are on the
+        // channel.
         let item = tokio::select! {
             () = stop.cancelled() => break,
             () = tx.closed() => break,
             i = tail.next() => i,
         };
         let out = match item {
+            // Before `startAtOperationTime`: the tail starts a little
+            // earlier (the time index's margin).
+            Ok(FeedItem::Event(e)) if e.hlc < from => Item::Progress(e.token.to_hex()),
             Ok(FeedItem::Event(e)) => match render(&spec, &e).await {
                 Ok(Some((d, false))) => Item::Event(Box::new(d), e.token.to_hex()),
                 Ok(Some((d, true))) => Item::Invalidate(Box::new(d), e.token.to_hex()),
@@ -1022,7 +1126,9 @@ impl ChangeStream {
 /// The options of a `$changeStream` stage.
 ///
 /// # Errors
-/// 9 for unknown options or values; 39662 for `startAtOperationTime`.
+/// 9 for unknown options or values; 40674 for `startAtOperationTime`
+/// with `resumeAfter` or `startAfter`. `startAtOperationTime` comes back
+/// as the resume value, a `Timestamp` (a token is a document).
 pub fn parse_stage(
     st: &Document,
 ) -> std::result::Result<(Images, Images, Option<Bson>, bool), MongoError> {
@@ -1030,6 +1136,7 @@ pub fn parse_stage(
     let mut before = Images::Off;
     let mut resume = None;
     let mut all = false;
+    let mut kinds = 0;
     for (k, v) in st {
         match k.as_str() {
             "fullDocument" => {
@@ -1059,14 +1166,21 @@ pub fn parse_stage(
                     }
                 };
             }
-            "resumeAfter" | "startAfter" => resume = Some(v.clone()),
+            "resumeAfter" | "startAfter" => {
+                kinds += 1;
+                resume = Some(v.clone());
+            }
             "allChangesForCluster" => all = v.as_bool().unwrap_or(false),
             "showExpandedEvents" | "allowToRunOnConfigDB" | "allowToRunOnSystemNS" => {}
             "startAtOperationTime" => {
-                return Err(MongoError::new(
-                    code::SPRIG_DOC_FEATURE_UNSUPPORTED,
-                    "startAtOperationTime is not supported in this release; resume with a token",
-                ));
+                let Bson::Timestamp(t) = v else {
+                    return Err(MongoError::new(
+                        code::TYPE_MISMATCH,
+                        "startAtOperationTime must be a timestamp",
+                    ));
+                };
+                kinds += 1;
+                resume = Some(Bson::Timestamp(*t));
             }
             other => {
                 return Err(MongoError::new(
@@ -1075,6 +1189,12 @@ pub fn parse_stage(
                 ));
             }
         }
+    }
+    if kinds > 1 {
+        return Err(MongoError::new(
+            40674,
+            "Only one type of resume option is allowed, but multiple were found.",
+        ));
     }
     Ok((full, before, resume, all))
 }
@@ -1138,11 +1258,30 @@ mod tests {
                 .unwrap();
         assert_eq!((f, b, all), (Images::On, Images::Off, false));
         assert!(r.is_some());
+        let (_, _, r, _) =
+            parse_stage(&doc! {"startAtOperationTime": Timestamp { time: 7, increment: 2 }})
+                .unwrap();
         assert_eq!(
-            parse_stage(&doc! {"startAtOperationTime": Timestamp { time: 1, increment: 0 }})
+            r,
+            Some(Bson::Timestamp(Timestamp {
+                time: 7,
+                increment: 2
+            }))
+        );
+        assert_eq!(
+            parse_stage(&doc! {"startAtOperationTime": 1})
                 .unwrap_err()
                 .code,
-            39662
+            code::TYPE_MISMATCH
+        );
+        assert_eq!(
+            parse_stage(
+                &doc! {"startAtOperationTime": Timestamp { time: 1, increment: 0 },
+                "resumeAfter": {"_data": "00"}}
+            )
+            .unwrap_err()
+            .code,
+            40674
         );
         assert!(check_pipeline(&[doc! {"$match": {"operationType": "insert"}}]).is_ok());
         assert!(check_pipeline(&[doc! {"$group": {"_id": 1}}]).is_err());

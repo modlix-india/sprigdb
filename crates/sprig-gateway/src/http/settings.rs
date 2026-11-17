@@ -67,7 +67,7 @@ key!(
     STREAM_MAX_PER_TENANT,
     "api.stream.max_per_tenant",
     1000,
-    Scopes::PROCESS,
+    Scopes::TREE,
     0,
     1_000_000,
     "Open change streams per tenant per gateway"
@@ -76,7 +76,7 @@ key!(
     STREAM_HEARTBEAT_SECONDS,
     "api.stream.heartbeat_seconds",
     15,
-    Scopes::PROCESS,
+    Scopes::TREE,
     1,
     3600,
     "Heartbeat when no change event arrives"
@@ -85,7 +85,7 @@ key!(
     STREAM_MAX_BUFFERED_EVENTS,
     "api.stream.max_buffered_events",
     10_000,
-    Scopes::PROCESS,
+    Scopes::TREE,
     16,
     10_000_000,
     "Change events buffered for a slow client"

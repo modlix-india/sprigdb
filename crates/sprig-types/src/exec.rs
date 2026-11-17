@@ -3,9 +3,9 @@
 //! multi-statement plan runs in.
 //!
 //! The gateway's runner sends each statement through its own tenant path
-//! (chapter 07's names, chapter 29's checks, chapter 17's router), so the
-//! statements here use logical names, and a typed write is planned by the
-//! router like any other once the tenant has shards.
+//! (name mapping, access checks, the router), so the statements here use
+//! logical names, and a typed write is planned by the router like any other
+//! once the tenant has shards.
 
 use sprig_common::ids::{DbId, ObjectId};
 use sprig_common::{Result, SprigCode, SprigError};
@@ -107,11 +107,10 @@ pub trait Runner: Send {
     /// The catalog's.
     async fn commit_types(&mut self, change: &TypesChange) -> Result<()>;
 
-    /// After type DDL changed the tables of the tree rooted at `root`
-    /// (chapter 42, typed tables in inheritance groups): when the tree is
-    /// inheritable, its new tables and columns follow
-    /// (`SPRIG INHERITABLE KEY (key)` again on the root). A no-op
-    /// otherwise.
+    /// After type DDL changed the tables of the tree rooted at `root` (typed
+    /// tables in inheritance groups): when the tree is inheritable, its new
+    /// tables and columns follow (`SPRIG INHERITABLE KEY (key)` again on the
+    /// root). A no-op otherwise.
     ///
     /// # Errors
     /// The inheritance layer's.
@@ -120,7 +119,7 @@ pub trait Runner: Send {
         Ok(())
     }
 
-    /// Whether the tree rooted at `root` is inheritable (chapter 42).
+    /// Whether the tree rooted at `root` is inheritable.
     ///
     /// # Errors
     /// The catalog's.
@@ -130,19 +129,19 @@ pub trait Runner: Send {
     }
 
     /// `true`: the following statements run on the physical tables, every
-    /// space's layer rows included, instead of through chapter 42's merged
-    /// views; `false`: back through them. A drop on an inheritable type
-    /// tree changes the rows of every space (decision T18). A no-op where
-    /// there is no inheritance layer.
+    /// space's layer rows included, instead of through the inheritance layer's
+    /// merged views; `false`: back through them. A drop on an inheritable type
+    /// tree changes the rows of every space. A no-op where there is no
+    /// inheritance layer.
     fn set_physical(&mut self, on: bool) {
         let _ = on;
     }
 
     /// A structural change of the record hierarchy of `table`, which is
-    /// inheritable ([`Runner::tree_inheritable`]): chapter 42 serializes
-    /// the plan ([`HierChange::Lock`]) and brings the paths of every space
-    /// below the session's up to date (decision T22). A no-op where there
-    /// is no inheritance layer.
+    /// inheritable ([`Runner::tree_inheritable`]): the inheritance layer
+    /// serializes the plan ([`HierChange::Lock`]) and brings the paths of every
+    /// space below the session's up to date. A no-op where there is no
+    /// inheritance layer.
     ///
     /// # Errors
     /// The inheritance layer's: 39711-39716 when a space below would get a
@@ -176,7 +175,7 @@ pub trait Runner: Send {
     }
 
     /// Whether the session's `innodb_snapshot_isolation` is on (MariaDB
-    /// 11.8's default; the MySQL persona turns it off, decision D9). Asked
+    /// 11.8's default; the MySQL persona turns it off). Asked
     /// only by a plan inside a client's transaction ([`Txn::begin`]).
     ///
     /// # Errors
@@ -209,7 +208,7 @@ pub enum HierChange {
 
 impl HierChange {
     /// The words after `ALTER TABLE t SPRIG RECONCILE HIERARCHY` that
-    /// carry the change to chapter 42.
+    /// carry the change to the inheritance layer.
     #[must_use]
     pub fn clause(&self) -> String {
         match self {
@@ -226,7 +225,7 @@ impl HierChange {
 /// inside another plan's bracket (a hierarchy's type plan runs the
 /// inheritance layer's delete), and with one shared name the inner
 /// `RELEASE` dropped the outer savepoint too, so the outer one failed with
-/// 1305 (decision RL66).
+/// 1305.
 pub const SAVEPOINT: &str = "sprig_types";
 
 /// A savepoint name no other open bracket of the process uses.
@@ -246,7 +245,7 @@ pub const PLAN_ISOLATION: &str = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED
 pub const SNAPSHOT_ISOLATION_READ: &str = "SELECT @@session.innodb_snapshot_isolation";
 
 /// Turns the snapshot-isolation check off for a plan inside a client's
-/// transaction ([`Txn`], bugfix-54).
+/// transaction ([`Txn`]).
 pub const SNAPSHOT_ISOLATION_OFF: &str = "SET SESSION innodb_snapshot_isolation = OFF";
 
 /// Turns it back on after the plan.
@@ -261,7 +260,7 @@ pub const SNAPSHOT_ISOLATION_ON: &str = "SET SESSION innodb_snapshot_isolation =
 /// `REPEATABLE READ` snapshot, and MariaDB 11.8's
 /// `innodb_snapshot_isolation` then fails the plan's later writes with
 /// 1020 when another session (a parent tenant, the copy worker) changed
-/// those rows in between (decision T17).
+/// those rows in between.
 ///
 /// Inside the client's transaction the isolation can't change, and a
 /// retry can't help: MariaDB's 1020 rolls back the whole transaction (the
@@ -270,7 +269,7 @@ pub const SNAPSHOT_ISOLATION_ON: &str = "SET SESSION innodb_snapshot_isolation =
 /// check on, the bracket turns it off for the plan's statements
 /// ([`SNAPSHOT_ISOLATION_OFF`]) and on again after them: the plan's writes
 /// then act on the latest committed rows, as a single MariaDB statement
-/// that opened no snapshot does (bugfix-54).
+/// that opened no snapshot does.
 #[derive(Debug)]
 pub struct Txn {
     /// The savepoint inside the client's transaction; `None` for the

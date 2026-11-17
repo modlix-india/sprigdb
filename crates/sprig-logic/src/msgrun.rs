@@ -96,6 +96,70 @@ pub struct MsgStats {
     pub dead: AtomicU64,
     /// Records skipped because retention removed them first.
     pub skipped: AtomicU64,
+    /// The code's own log lines this minute (see [`CODE_LOG_PER_MINUTE`]).
+    pub code_log: std::sync::Mutex<CodeLog>,
+}
+
+/// At most this many of the code's own log lines (`console.log`,
+/// `ctx.log`, Lua's `log`) go to the run log (`logic_log`) per trigger
+/// job and minute; the rest are counted in one line.
+pub const CODE_LOG_PER_MINUTE: u32 = 60;
+
+/// One minute's budget of the code's log lines.
+#[derive(Debug, Default)]
+pub struct CodeLog {
+    since: Option<std::time::Instant>,
+    used: u32,
+    dropped: u32,
+}
+
+impl CodeLog {
+    /// Takes `n` lines: how many may be written now, and the count of a
+    /// finished minute's dropped lines to report.
+    fn take(&mut self, n: u32) -> (u32, u32) {
+        let now = std::time::Instant::now();
+        let mut report = 0;
+        if self
+            .since
+            .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(60))
+        {
+            report = std::mem::take(&mut self.dropped);
+            self.since = Some(now);
+            self.used = 0;
+        }
+        let ok = n.min(CODE_LOG_PER_MINUTE.saturating_sub(self.used));
+        self.used += ok;
+        self.dropped += n - ok;
+        (ok, report)
+    }
+}
+
+/// Writes the log lines a run's code wrote to the run log, `info`, each
+/// with where it ran (`at`), within [`CODE_LOG_PER_MINUTE`].
+async fn code_log(gw: &dyn Gateway, stats: &MsgStats, at: &str, reply: &RunReply) {
+    if reply.logs.is_empty() {
+        return;
+    }
+    let n = u32::try_from(reply.logs.len()).unwrap_or(u32::MAX);
+    let (ok, dropped) = stats
+        .code_log
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take(n);
+    if dropped > 0 {
+        gw.note(
+            "warn",
+            &format!(
+                "{dropped} more log lines of the code were dropped in a minute (at most \
+                 {CODE_LOG_PER_MINUTE} a minute go to the run log)"
+            ),
+        )
+        .await;
+    }
+    for line in reply.logs.iter().take(ok as usize) {
+        let line: String = line.chars().take(1000).collect();
+        gw.note("info", &format!("{at}: {line}")).await;
+    }
 }
 
 impl MsgStats {
@@ -120,6 +184,9 @@ pub struct Template {
     pub req: RunRequest,
     /// The active version.
     pub version: Arc<AtomicU64>,
+    /// `logic.trigger_budget_ms` as it resolves at each run (the request's
+    /// budget and lease follow it); `None` keeps the request's.
+    pub budget: Option<crate::triggers::LiveBudget>,
 }
 
 impl Template {
@@ -127,6 +194,11 @@ impl Template {
         let mut r = self.req.clone();
         r.version = self.version.load(Ordering::Relaxed);
         r.record = record;
+        if let Some(b) = &self.budget {
+            let ms = u64::try_from((b.0)().as_millis()).unwrap_or(30_000);
+            r.budget_ms = ms;
+            r.lease_ms = 30_000.max(ms.saturating_add(5_000));
+        }
         r
     }
 }
@@ -183,6 +255,13 @@ async fn run_record(
                 continue;
             }
         };
+        code_log(
+            gw,
+            stats,
+            &format!("partition {} offset {}", r.partition, r.offset),
+            &reply,
+        )
+        .await;
         match reply.outcome {
             RunOutcome::Ok => {
                 stats.ran.fetch_add(1, Ordering::Relaxed);
@@ -418,6 +497,13 @@ pub async fn run_queue(
                     }
                     Ok(r) => {
                         errs = 0;
+                        code_log(
+                            &*gw,
+                            &stats,
+                            &format!("message {}", r.message_id.as_deref().unwrap_or("?")),
+                            &r,
+                        )
+                        .await;
                         match r.outcome {
                             RunOutcome::Ok => {
                                 idle = 0;

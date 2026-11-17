@@ -11,9 +11,8 @@
 //! `sprig.next_user_id`; format 2 adds `api_keys`, format 3 adds
 //! `scram_sha_512` to `verifiers.mechanism`, and format 4 adds
 //! `token_sessions` ([`crate::token`]), format 5 `user_factors`
-//! ([`crate::mfa`]). The other identity tables (`oidc_issuers`,
-//! `claim_mappings`) arrive as later expand migrations with the features
-//! that use them.
+//! ([`crate::mfa`]), format 6 `users.require_subject` and `require_issuer`,
+//! and format 7 `oidc_issuers` and `claim_mappings` ([`crate::oidc`]).
 //!
 //! **Versioning.** `users` and `verifiers` are versioned by the tenant's
 //! auth version ([`VersionKind::Auth`](sprig_catalog::VersionKind)).
@@ -156,6 +155,15 @@ pub static AUTH_MIGRATIONS: &[Migration] = &[
         phase: Phase::Expand,
         name: "users.require_subject and users.require_issuer",
         statements: &[ALTER_USERS_REQUIRE_DN],
+    },
+    Migration {
+        format: 7,
+        phase: Phase::Expand,
+        name: "oidc_issuers and claim_mappings",
+        statements: &[
+            crate::oidc::store::DDL_OIDC_ISSUERS,
+            crate::oidc::store::DDL_CLAIM_MAPPINGS,
+        ],
     },
 ];
 

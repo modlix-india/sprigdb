@@ -49,6 +49,25 @@ pub const CONTEXT_VAR: &str = "sprig_rls";
 /// checked.
 pub const MERGED_LAYERS_KEY: &str = "m";
 
+/// The format of a table's write checks and of everything deployed with
+/// them (the policy views, the context function, the change topic's
+/// filter view). Raised whenever their rendering changes: a deployment of
+/// an older format is redeployed when a gateway next checks the table, so
+/// no deployed object keeps an older rendering. The trigger bodies carry
+/// it as their label ([`format_label`]); they are written last, so a
+/// labelled trigger means the rest was written first.
+///
+/// Format 2: claims and attributes read as `COALESCE(JSON_VALUE(..),
+/// JSON_QUERY(..))`, and change filter views decode `ENUM`, `SET`, binary,
+/// `TIMESTAMP` and `DECIMAL` values as the table types them.
+pub const CHECKS_FORMAT: u32 = 2;
+
+/// The label of [`CHECKS_FORMAT`]'s trigger bodies.
+#[must_use]
+pub fn format_label() -> String {
+    format!("__sprig_rls_f{CHECKS_FORMAT}")
+}
+
 /// A policy as the triggers need it.
 #[derive(Debug, Clone, Copy)]
 pub struct TriggerPolicy<'a> {
@@ -114,6 +133,15 @@ fn lookup(ctx: &str, path: &str) -> String {
     format!("JSON_VALUE({ctx}, {})", sql_string(path, false))
 }
 
+/// A claim or attribute, which may be any JSON value: a scalar as
+/// `JSON_VALUE` reads it (`true` is `1`), an array or object as its JSON
+/// text (`JSON_VALUE` alone would be `NULL`), as the gateway's rewrite
+/// binds them.
+fn lookup_any(ctx: &str, path: &str) -> String {
+    let p = sql_string(path, false);
+    format!("COALESCE(JSON_VALUE({ctx}, {p}), JSON_QUERY({ctx}, {p}))")
+}
+
 fn json_key(k: &str) -> String {
     let mut s = String::from("\"");
     for ch in k.chars() {
@@ -135,8 +163,10 @@ impl Binder for JsonBinder<'_> {
             "SPRIG_TENANT_ID" => lookup(c, "$.s.tid"),
             "SPRIG_HOME_TENANT_ID" => lookup(c, "$.s.htid"),
             "SPRIG_SESSION_SPACE" => lookup(c, "$.s.space"),
-            "SPRIG_CLAIM" => lookup(c, &format!("$.s.claims.{}", json_key(arg.unwrap_or("")))),
-            "SPRIG_USER_ATTR" => lookup(c, &format!("$.s.attrs.{}", json_key(arg.unwrap_or("")))),
+            "SPRIG_CLAIM" => lookup_any(c, &format!("$.s.claims.{}", json_key(arg.unwrap_or("")))),
+            "SPRIG_USER_ATTR" => {
+                lookup_any(c, &format!("$.s.attrs.{}", json_key(arg.unwrap_or(""))))
+            }
             other => return Err(invalid(format!("{other}() can't be bound in MariaDB"))),
         })
     }
@@ -230,8 +260,9 @@ impl TriggerSpec<'_> {
         );
         format!(
             "CREATE OR REPLACE DEFINER = {definer} TRIGGER {name} BEFORE {event} ON \
-             {table} FOR EACH ROW BEGIN IF NOT COALESCE({guard} OR {ok}, FALSE) THEN \
+             {table} FOR EACH ROW {label}: BEGIN IF NOT COALESCE({guard} OR {ok}, FALSE) THEN \
              SIGNAL SQLSTATE '42000' SET MYSQL_ERRNO = 39363, MESSAGE_TEXT = {msg}; END IF; END",
+            label = format_label(),
             definer = self.definer,
             name = quote(name),
             table = quote(self.table),
@@ -250,11 +281,10 @@ impl TriggerSpec<'_> {
     }
 
     /// [`TriggerSpec::statements`] for a table whose rows may be layer
-    /// rows of an inheritable table (`layered`, chapter 42). A layer row
-    /// isn't always a new record: writing an override (`_sprig_state =
-    /// 'ovr'`) is an update of an inherited record, and writing a hide
-    /// marker (`'hide'`) is its delete, so they are checked as such
-    /// (decision RL65):
+    /// rows of an inheritable table (`layered`). A layer row isn't always a
+    /// new record: writing an override (`_sprig_state = 'ovr'`) is an update
+    /// of an inherited record, and writing a hide marker (`'hide'`) is its
+    /// delete, so they are checked as such:
     ///
     /// ```text
     /// INSERT of an ovr row              → CHECK(UPDATE)(NEW)
@@ -439,9 +469,11 @@ impl TriggerSpec<'_> {
     /// reader (by the context `__sprig_rls_ctx()` of its connection) the
     /// records whose row images its `SELECT` policies show, an update that
     /// hides or shows the row as a delete or an insert
-    /// (`sprig_streams::read`'s rules). `columns` is the table's `JSON_TABLE`
-    /// column list; `filtered` false (security off) makes a plain view of the
-    /// log.
+    /// (`sprig_streams::read`'s rules). `decode` turns the policies'
+    /// combination, rendered over `` `__sprig_ci` ``, into the predicate
+    /// over a record's image and the `JSON_TABLE` column list it reads
+    /// (records carry some columns in another form than the table);
+    /// `filtered` false (security off) makes a plain view of the log.
     ///
     /// # Errors
     /// 39364 if a stored expression can't be rendered.
@@ -449,7 +481,7 @@ impl TriggerSpec<'_> {
         &self,
         view: &str,
         log: &str,
-        columns: &str,
+        decode: &dyn Fn(&str) -> (String, String),
         definer: &str,
         filtered: bool,
     ) -> Result<String, SprigError> {
@@ -467,7 +499,7 @@ impl TriggerSpec<'_> {
         }
         let ctx = format!("{}()", quote(super::views::CTX_FUNCTION));
         let qual = "`__sprig_ci`";
-        let ok = self.combination(1, Clause::Using, qual, &ctx)?;
+        let (columns, ok) = decode(&self.combination(1, Clause::Using, qual, &ctx)?);
         let guard = self.guard(&ctx);
         let v = "CONVERT(`__sprig_cl`.v USING utf8mb4)";
         let vis = |path: &str| {
@@ -547,12 +579,13 @@ mod tests {
         assert_eq!(s.len(), 3);
         assert!(s[0].starts_with(
             "CREATE OR REPLACE DEFINER = `t42_u7`@`%` TRIGGER `__sprig_rls_bi_77` \
-             BEFORE INSERT ON `orders`"
+             BEFORE INSERT ON `orders` FOR EACH ROW __sprig_rls_f2: BEGIN IF NOT"
         ));
+        assert!(s.iter().all(|t| t.contains(" __sprig_rls_f2: BEGIN ")));
         assert!(
             s[0].contains(
                 "((JSON_CONTAINS(@sprig_rls, '3', '$.p') AND (NEW.owner = \
-             JSON_VALUE(@sprig_rls, '$.s.claims.\"sub\"')))) AND (NOT JSON_CONTAINS(@sprig_rls, \
+             COALESCE(JSON_VALUE(@sprig_rls, '$.s.claims.\"sub\"'), JSON_QUERY(@sprig_rls, '$.s.claims.\"sub\"'))))) AND (NOT JSON_CONTAINS(@sprig_rls, \
              '4', '$.p') OR (NEW.amount < 100)))"
             ),
             "{}",
@@ -572,7 +605,7 @@ mod tests {
         assert!(
             v[1].contains(
                 "VIEW `__sprig_rls_orders` AS SELECT * FROM `orders` WHERE COALESCE((`__sprig_rls_ctx`() IS NULL"
-            ) && v[1].contains("`orders`.owner = JSON_VALUE(`__sprig_rls_ctx`(), '$.s.claims.\"sub\"')")
+            ) && v[1].contains("`orders`.owner = COALESCE(JSON_VALUE(`__sprig_rls_ctx`(), '$.s.claims.\"sub\"'), JSON_QUERY(`__sprig_rls_ctx`(), '$.s.claims.\"sub\"'))")
                 && !v[1].contains("@sprig_rls"),
             "{}",
             v[1]
@@ -606,7 +639,7 @@ mod tests {
     }
 
     /// An inheritable table's triggers: overrides and hide markers are
-    /// checked as the update and the delete they are (RL65).
+    /// checked as the update and the delete they are.
     #[test]
     fn layered_triggers_check_markers_as_updates_and_deletes() {
         let pols = [
@@ -641,7 +674,7 @@ mod tests {
         assert!(
             l[0].contains("CASE NEW.`_sprig_state` WHEN 'ovr' THEN ((JSON_CONTAINS(@sprig_rls, '3', '$.p') AND (NEW.owner")
                 && l[0].contains("WHEN 'hide' THEN ((JSON_CONTAINS(@sprig_rls, '3', '$.p') AND (NEW.owner")
-                && l[0].contains("ELSE (((JSON_CONTAINS(@sprig_rls, '3', '$.p') AND (NEW.owner = JSON_VALUE(@sprig_rls, '$.s.claims.\"sub\"')))) AND (NOT JSON_CONTAINS(@sprig_rls, '4', '$.p') OR (NEW.amount < 100))) END"),
+                && l[0].contains("ELSE (((JSON_CONTAINS(@sprig_rls, '3', '$.p') AND (NEW.owner = COALESCE(JSON_VALUE(@sprig_rls, '$.s.claims.\"sub\"'), JSON_QUERY(@sprig_rls, '$.s.claims.\"sub\"'))))) AND (NOT JSON_CONTAINS(@sprig_rls, '4', '$.p') OR (NEW.amount < 100))) END"),
             "{}",
             l[0]
         );

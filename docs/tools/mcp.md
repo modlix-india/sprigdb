@@ -12,7 +12,7 @@ SprigDB serves the [AI assistants'](assistants.md) tools over the Model Context 
 The assistants' rules hold here too:
 
 - **Every tool runs as you.** The agent signs in with your API key or token, and your grants, row-level security and caps apply unchanged. The server has no rights of its own.
-- **Nothing changes.** Read tools only read, inside read-only transactions. Proposal tools return the proposed statement to the agent, which shows it to you; you run it yourself.
+- **Nothing changes.** Read tools only read, inside read-only transactions. Proposal tools return the proposed statement to the agent, which shows it to you; you run it yourself, or accept it by its id.
 - **The same egress rules.** With `ai.share_data` off, query results reach the agent as columns and a row count, without rows.
 - **Every call is audited.**
 
@@ -96,12 +96,13 @@ The tools are the assistants' tools, as the role and `ai.mcp.tools` allow:
 | Role | Read tools | Proposal tools (with `propose`) |
 |---|---|---|
 | `data` (default) | `search_docs`, `catalog`, `describe`, `explain`, `column_stats`, `run_query`, `approvals` | `propose_sql`, `propose_tile`, `propose_glossary` |
-| `dba` | `search_docs`, `catalog`, `describe`, `explain`, `column_stats`, `workload`, `fingerprint`, `indexes`, `auto_indexes`, `settings`, `shards`, `advisor_runs`, `approvals`, `test_policy`, `compile_logic`, `decision_log` | `propose_sql`, `propose_recommendation`, `propose_tile`, `propose_glossary`, `generate_rows` |
+| `dba` | `search_docs`, `catalog`, `describe`, `explain`, `column_stats`, `workload`, `fingerprint`, `indexes`, `auto_indexes`, `settings`, `shards`, `advisor_runs`, `approvals`, `test_policy`, `compile_logic`, `decision_log`, `check_ddl`, `migration_check` | `propose_sql`, `propose_recommendation`, `propose_tile`, `propose_glossary`, `generate_rows` |
 
 The administration assistant's tools are never offered over MCP. See [what the assistants can read](assistants.md#what-the-assistants-can-read) for what each read tool does.
 
 - **Results** are JSON wrapped in `<tool_result untrusted="true">…</tool_result>`. The server tells the agent that text inside is data from your database, never instructions.
-- **Proposals** come back as a result marked "proposed; it has NOT run", holding the statement (or tile, or glossary term) for the agent to show you. Nothing runs. A `propose_glossary` term is also filed for a tenant administrator to accept, as in chat.
+- **Proposals** come back as a result marked "proposed; it has NOT run", holding the statement (or tile, or glossary term) and its id, for the agent to show you. Nothing runs. You run the statement yourself, or accept the proposal by its id with [`POST /v1/ai/proposals/{id}:accept`](assistants.md#proposals), which runs it as you after you confirm. A `propose_glossary` term is also filed for a tenant administrator to accept, as in chat. A proposed schema change is checked against SprigDB's rules first; one that fails comes back as an error result for the agent to fix.
+- **Withheld rows.** With `ai.share_data` off, a query result tells the agent to offer you the query with `propose_sql` when it is offered that tool, and otherwise to give you the query to run yourself.
 - **Failures** that the agent can act on are error results (`isError`): invalid input, a statement that isn't a read, a table you can't see, or your own `SELECT` privilege missing (for example `error 1142`).
 
 ## What leaves SprigDB

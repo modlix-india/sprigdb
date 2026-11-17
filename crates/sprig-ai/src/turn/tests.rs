@@ -169,7 +169,8 @@ async fn a_turn_reads_as_the_caller_proposes_and_answers() {
     assert!(matches!(
         ev.last(),
         Some(TurnEvent::End {
-            stop: Stop::EndTurn
+            stop: Stop::EndTurn,
+            ..
         })
     ));
     assert!(matches!(&ev[ev.len() - 2], TurnEvent::Sources(s) if s.len() == 1));
@@ -213,6 +214,15 @@ async fn a_turn_reads_as_the_caller_proposes_and_answers() {
         .unwrap();
     assert!(note.sent_hash.is_some());
     assert!(note.body["payload"].is_string());
+    // The end names the stored answer: the turn's last assistant message.
+    let answer = stored
+        .iter()
+        .rfind(|m| m.kind == MsgKind::Assistant)
+        .unwrap();
+    assert!(matches!(
+        ev.last(),
+        Some(TurnEvent::End { message: Some(id), .. }) if *id == answer.id
+    ));
     let used = audit.usage_today(UserId(9)).await.unwrap();
     assert_eq!(used.user, 240);
 }
@@ -440,4 +450,75 @@ async fn a_stopped_turn_sends_nothing() {
         .await
         .unwrap();
     assert_eq!(out.stop, Stop::Other("stopped".into()));
+}
+
+#[tokio::test]
+async fn text_of_later_model_calls_starts_on_a_new_paragraph() {
+    let p = Arc::new(ScriptedProvider::new(
+        [
+            Reply::Tools(
+                "Let me look.".into(),
+                vec![call(
+                    "t1",
+                    "describe",
+                    json!({"db": "shop", "table": "orders"}),
+                )],
+            ),
+            Reply::Text("It has an id.".into()),
+        ],
+        usage(),
+    ));
+    let audit = Arc::new(MemoryAudit::default());
+    let host = Arc::new(Host::default());
+    let mut ev = Vec::new();
+    let r = agent(&p, &audit)
+        .run(
+            &cfg(Role::Dba),
+            req(Role::Dba, host, "What is in orders?"),
+            &mut ev,
+        )
+        .await
+        .unwrap();
+    let text: String = ev
+        .iter()
+        .filter_map(|e| match e {
+            TurnEvent::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "Let me look.\n\nIt has an id.");
+    // The stored answer is the model's own text, without the break.
+    assert_eq!(r.text(), "It has an id.");
+}
+
+#[tokio::test]
+async fn a_call_without_text_before_adds_no_break() {
+    let p = Arc::new(ScriptedProvider::new(
+        [
+            Reply::Tools(
+                String::new(),
+                vec![call(
+                    "t1",
+                    "describe",
+                    json!({"db": "shop", "table": "orders"}),
+                )],
+            ),
+            Reply::Text("It has an id.".into()),
+        ],
+        usage(),
+    ));
+    let audit = Arc::new(MemoryAudit::default());
+    let mut ev = Vec::new();
+    agent(&p, &audit)
+        .run(
+            &cfg(Role::Dba),
+            req(Role::Dba, Arc::new(Host::default()), "What is in orders?"),
+            &mut ev,
+        )
+        .await
+        .unwrap();
+    assert!(
+        ev.contains(&TurnEvent::Text("It has an id.".into())),
+        "{ev:?}"
+    );
 }

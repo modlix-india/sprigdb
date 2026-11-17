@@ -13,15 +13,15 @@ Applications connect to SprigDB with the clients they already use: MySQL and Mar
 
 | Protocol | Port | On by default | TLS by default | Logins | Reaches |
 |---|---|---|---|---|---|
-| [MySQL 8.4](mysql-and-mariadb.md) | 3306 | yes | required | `caching_sha2_password`; `mysql_native_password` when the tenant allows it; `mysql_clear_password` over TLS | Everything, through SQL |
+| [MySQL 8.4](mysql-and-mariadb.md) | 3306 | yes | required | `caching_sha2_password`; `mysql_native_password` when the tenant allows it; `mysql_clear_password` over TLS; identity provider tokens | Everything, through SQL |
 | [MariaDB](mysql-and-mariadb.md) | 3307 | yes | required | As 3306 | Everything, through SQL |
-| [MongoDB](mongodb.md) | 27017 | no | required | SCRAM-SHA-256 | Collections, with search and vector indexes |
-| [Redis](redis.md) | 6379 | no | required | `AUTH` and `HELLO ... AUTH` with a password | Key-value namespaces |
+| [MongoDB](mongodb.md) | 27017 | no | required | SCRAM-SHA-256, MONGODB-OIDC | Collections, with search and vector indexes |
+| [Redis](redis.md) | 6379 | no | required | `AUTH` and `HELLO ... AUTH` with a password or an identity provider token | Key-value namespaces |
 | [Bolt](bolt-and-cypher.md) | 7687 | no | required | `basic` | Graphs, in Cypher |
 | [Kafka](kafka.md) | 9092 | no | required | SASL SCRAM-SHA-512, SCRAM-SHA-256, PLAIN | Event streams, and change topics of tables |
 | [AMQP 0-9-1 and 1.0](amqp.md) | 5672 | no | off | SASL PLAIN, AMQPLAIN | Exchanges and queues |
 | [AMQP over TLS](amqp.md) | 5671 | no | required | As 5672 | Exchanges and queues |
-| [HTTP: REST and gRPC](rest-and-grpc.md) | 8080 | yes | off | HTTP Basic, API keys, session tokens | SQL, Cypher, MongoDB commands, key-value, search, vectors, change streams, logic |
+| [HTTP: REST and gRPC](rest-and-grpc.md) | 8080 | yes | off | HTTP Basic, API keys, session tokens, identity provider tokens | SQL, Cypher, MongoDB commands, key-value, search, vectors, change streams, logic |
 | [HTTPS: REST and gRPC](rest-and-grpc.md) | 8443 | yes | required | As 8080 | As 8080 |
 
 Port 9180 serves `/metrics`, `/healthz` and `/readyz` for monitoring; it takes no client logins. See [Monitoring](../operate/monitoring.md).
@@ -72,7 +72,7 @@ A tenant can also insist on TLS for its users: `auth.require_tls`, or `REQUIRE S
 
 ## One user, every protocol
 
-A SprigDB account is a user of a tenant, created with SQL (`CREATE USER`) or from the MongoDB user commands, and the same user and password log in on every protocol.
+A SprigDB account is a user of a tenant, created with SQL (`CREATE USER`) or from the MongoDB user commands, and the same user and password log in on every protocol. Accounts can also log in with tokens from an identity provider the tenant registers; see [Logins with identity provider tokens](../security/external-tokens.md).
 
 ### The login name
 

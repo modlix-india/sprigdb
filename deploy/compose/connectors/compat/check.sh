@@ -111,7 +111,16 @@ c_mysql_show_answers() {
       -e 's/\t[^\t@]+@%\t/\t(user)\t/' -e 's/DEFINER=`[^`]*`@`%`/DEFINER=(user)/'
 }
 
-CHECKS=${SPRIG_COMPAT_CHECKS:-"sql_mode max_execution_time errors show_index show_grants roles gis stored_mode group_by int_meta mysql_compat mysql_ddl session_status perf_schema mysql_stored mysql_json_index mysql_ddl_answers mysql_show_answers"}
+# Engines other than InnoDB stored as InnoDB, with MySQL's warnings (the
+# reference has them in disabled_storage_engines; 3306 only, run with
+# `mysql -vv` for the warning counts and info lines).
+c_mysql_engines() {
+  base_args "$SPRIG_USER" "$SPRIG_PASSWORD"
+  sed "s/@DB@/$DB/g" "$(corpus mysql_engines)" | mysql "${ARGS[@]}" -vv --column-names 2>&1 |
+    grep -v 'Using a password' | normalize
+}
+
+CHECKS=${SPRIG_COMPAT_CHECKS:-"sql_mode max_execution_time errors show_index show_grants roles gis stored_mode group_by int_meta mysql_compat mysql_ddl session_status perf_schema mysql_stored mysql_json_index mysql_ddl_answers mysql_show_answers mysql_engines"}
 for check in $CHECKS; do
   if [[ $check == gis && $SPRIG_PERSONA != mysql ]]; then
     emit gis n/a "MySQL's SRID 4326 semantics are the MySQL persona's only"
@@ -131,6 +140,10 @@ for check in $CHECKS; do
   fi
   if [[ $check == mysql_show_answers && $SPRIG_PERSONA != mysql ]]; then
     emit mysql_show_answers n/a "MySQL's info lines, Language column and trigger heads are 3306's"
+    continue
+  fi
+  if [[ $check == mysql_engines && $SPRIG_PERSONA != mysql ]]; then
+    emit mysql_engines n/a "MySQL's warnings for a substituted engine are 3306's; 3307 gives MariaDB's note"
     continue
   fi
   if [[ $check == perf_schema && $SPRIG_PERSONA != mysql ]]; then

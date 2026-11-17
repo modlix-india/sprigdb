@@ -6,8 +6,9 @@
 //!    cluster, none held; every member supplies the new key from one
 //!    column of its own whose type the router routes (integer, decimal,
 //!    `CHAR`/`VARCHAR` under one collation, `BINARY`/`VARBINARY`), the
-//!    same class in every member; no member owns a lookup index (its
-//!    rows hold the old hash and would need a rebuild).
+//!    same class in every member; every lookup index a member owns is
+//!    `public` (one a job is building or dropping makes the re-key wait,
+//!    39470).
 //! 2. **Next routing.** Each member's `group_members.next_routing` gets the
 //!    new key, its column, the first new shard id and the job; the group
 //!    becomes `rekeying` (no split or merge touches it) and the catalog
@@ -22,8 +23,12 @@
 //!    compare-and-put of the group's map that replaces all ranges.
 //! 4. **Finish** ([`ShardingLoop::rekey_follow`], every tick). Between
 //!    the cutover and this step gateways route by the members' next
-//!    routing, because every range of the map is a new shard. Once the job
-//!    has committed, the catalog's key becomes the new one (`key_spec`,
+//!    routing, because every range of the map is a new shard. Their lookup
+//!    indexes still name owners by the old key's hashes: gateways stop
+//!    routing through them at the cutover, keep claiming (1062 as before)
+//!    and check owners on every shard. Once the job has committed, every
+//!    such lookup is rebuilt (its rows take the new hashes), then the
+//!    catalog's key becomes the new one (`key_spec`,
 //!    members `columns` on the new column, `next_routing` cleared, group
 //!    `active`), the version moves, and `_sprig_rk_prev` is dropped from
 //!    the new shards. A job that ended without committing clears
@@ -37,7 +42,7 @@ use std::collections::BTreeMap;
 use mysql_async::prelude::Queryable as _;
 use serde_json::{Value, json};
 use sprig_balancer::decisions::{Mode, NewDecision, Outcome};
-use sprig_common::ids::{ClusterId, DbId, GroupId, JobId, ShardId, TenantId};
+use sprig_common::ids::{ClusterId, DbId, GroupId, JobId, ObjectId, ShardId, TenantId};
 use sprig_common::names::SchemaName;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_mover::{HashRange, JobSpec, Mover as _};
@@ -64,6 +69,9 @@ pub struct RekeyRequest {
     pub shards: Option<u32>,
     /// The cluster for the new shards (default: the group's).
     pub to: Option<String>,
+    /// Why, for the decision log: `manual` when `None`; `periodic` when
+    /// the advisor's periodic run starts it.
+    pub reason: Option<String>,
 }
 
 /// One member as the re-key sees it.
@@ -145,22 +153,31 @@ impl ShardingLoop {
         if members.is_empty() {
             return Err(not_allowed(format!("table group {group} has no members")));
         }
-        let lookups: Vec<(u64, String)> = c
+        // The members' lookup indexes are rebuilt after the cutover; one
+        // that a job is building or dropping now makes the re-key wait.
+        let lookups: Vec<(u64, String, String)> = c
             .exec(
                 format!(
-                    "SELECT l.object_id, l.index_name FROM `{cat}`.lookup_indexes l \
+                    "SELECT l.object_id, l.index_name, l.state FROM `{cat}`.lookup_indexes l \
                      JOIN `{cat}`.group_members m ON m.object_id = l.object_id \
-                     WHERE m.group_id = ? AND l.state <> 'dropping'"
+                     WHERE m.group_id = ?"
                 ),
                 (group,),
             )
             .await
             .unwrap_or_default();
-        if let Some((o, name)) = lookups.first() {
-            return Err(not_allowed(format!(
-                "object {o} of group {group} owns lookup index {name}: a re-key would have to \
-                 rebuild it, which isn't built yet; drop the index first"
-            )));
+        // Given back before the first shard's columns are read below: the
+        // shard's connection comes from the same budget, and a task holds
+        // one connection of a budget at a time.
+        drop(c);
+        if let Some((o, name, state)) = lookups.iter().find(|l| l.2 != "public") {
+            return Err(SprigError::new(
+                SprigCode::ShardBusy,
+                format!(
+                    "lookup index {name} of object {o} in group {group} is {state}; retry the \
+                     re-key when its job ends"
+                ),
+            ));
         }
         let old_cols: BTreeMap<u64, Vec<String>> = members
             .iter()
@@ -305,9 +322,11 @@ impl ShardingLoop {
                 format!("a job of group {group} runs; retry when it finishes"),
             ));
         }
+        let mut c = self.conn(&home).await?;
         let ddl_rows = sprig_catalog::store::Store::for_tenant(tenant)
             .settings_of(&mut c, sprig_catalog::store::SettingScope::Tenant)
             .await?;
+        drop(c);
         let source_schemas: Vec<SchemaName> = map
             .ranges
             .iter()
@@ -396,7 +415,7 @@ impl ShardingLoop {
                     subject_id: format!("t{tenant}/g{group}"),
                     mode: Mode::Applied,
                     outcome: Outcome::Proposed,
-                    reason_code: "manual".into(),
+                    reason_code: req.reason.clone().unwrap_or_else(|| "manual".into()),
                     summary: summary.chars().take(512).collect(),
                     evidence: json!({
                         "requested_by": actor,
@@ -405,6 +424,7 @@ impl ShardingLoop {
                         "shards": n,
                         "from": from.to_string(),
                         "to": to.to_string(),
+                        "lookups_rebuilt_after_cutover": lookups.iter().map(|l| &l.1).collect::<Vec<_>>(),
                     }),
                     alternatives: None,
                     job_id: None,
@@ -421,6 +441,7 @@ impl ShardingLoop {
         // the submit; the members carry the first new shard, which is
         // enough to tell the cutover happened, and the follow step finds
         // the job by group and kind.
+        let mut c = self.conn(&home).await?;
         let mut tx = c
             .start_transaction(mysql_async::TxOpts::default())
             .await
@@ -533,7 +554,7 @@ impl ShardingLoop {
         if groups.is_empty() {
             return Ok(out);
         }
-        let jobs = self.jobs.all().await?;
+        let mut pending = Vec::with_capacity(groups.len());
         for g in groups {
             let next: Vec<(u64, String, String)> = c
                 .exec(
@@ -547,6 +568,13 @@ impl ShardingLoop {
                 )
                 .await
                 .map_err(|e| db_err("next routing", &e))?;
+            pending.push((g, next));
+        }
+        // Back before the finish or undo, which take their own from the
+        // same pool.
+        drop(c);
+        let jobs = self.jobs.all().await?;
+        for (g, next) in pending {
             let from = next
                 .iter()
                 .filter_map(|(_, _, j)| serde_json::from_str::<Value>(j).ok())
@@ -568,6 +596,13 @@ impl ShardingLoop {
             let cut = from > 0 && map.ranges.iter().all(|r| u64::from(r.shard.0) >= from);
             let ended = job.is_none_or(|r| r.state.is_terminal());
             if cut {
+                // The members' lookups first, while gateways still treat
+                // them as re-keyed (no routing, owner checks everywhere).
+                let owners: Vec<ObjectId> = next.iter().map(|(o, _, _)| ObjectId(*o)).collect();
+                for (name, r) in self.rehash_lookups(tenant, &home, &owners).await? {
+                    tracing::info!(tenant = %tenant, group = g, lookup = %name, rows = r.rows,
+                        repaired = r.repaired, "re-key: lookup index rebuilt for the new key");
+                }
                 self.rekey_finish(tenant, g, &next, &map).await?;
                 metrics::counter!("sprig_advisor_rekeys_total", "outcome" => "finished")
                     .increment(1);

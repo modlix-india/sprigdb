@@ -3267,30 +3267,49 @@ fn plan_insert(stmt: &Statement, src_in: &Src<'_>, cx: &PlanCtx<'_>) -> R<Plan> 
             return reject(Reason::AutoIncrement, "an INSERT without the key column");
         };
         let shard = route_value(&a.value, entry, class, zero_generates)?;
+        // Rows waiting for this parent row move to its shard.
+        let adopt = if entry.orphan_children.is_empty() {
+            Vec::new()
+        } else {
+            let h = key_literal(&a.value, class)
+                .and_then(|k| entry.group.hash_of(&k))
+                .ok_or_else(|| {
+                    Rejection::new(Reason::InsertKey, "a key whose hash can't be known here")
+                })?;
+            parents::adoption(entry, &[(shard, h)], &|_, c| {
+                ins.assignments
+                    .iter()
+                    .find(|x| assigns_key(&x.target, c))
+                    .map(|x| x.value.clone())
+            })?
+        };
         let near = entry.group.shards.get(shard).map(|s| s.cluster.as_str());
-        if let Some(fkw) = fk::insert_work(
+        let fkw = fk::insert_work(
             ins,
             entry,
             &[] as &[Box<Vec<Expr>>],
             &default_schema,
             near,
             cx,
-        )? {
+        )?;
+        if fkw.is_some() || !adopt.is_empty() {
             let ts = if src_in.template { None } else { text_src };
+            let mut targets = vec![one_shard_insert(
+                stmt,
+                ts,
+                entry,
+                shard,
+                loc,
+                &default_schema,
+            )];
+            targets.extend(adopt);
             return Ok(Plan::Write(WritePlan {
                 kind: WriteKind::Insert,
-                targets: vec![one_shard_insert(
-                    stmt,
-                    ts,
-                    entry,
-                    shard,
-                    loc,
-                    &default_schema,
-                )],
+                targets,
                 rows: 1,
                 claims: Vec::new(),
                 releases: Vec::new(),
-                fk: Some(fkw),
+                fk: fkw,
                 limited: None,
             }));
         }
@@ -3327,7 +3346,39 @@ fn plan_insert(stmt: &Statement, src_in: &Src<'_>, cx: &PlanCtx<'_>) -> R<Plan> 
         .and_then(|(s, _)| entry.group.shards.get(*s))
         .map(|s| s.cluster.as_str());
     let fkw = fk::insert_work(ins, entry, &values.rows, &default_schema, near, cx)?;
-    if by_shard.len() == 1 {
+    // Rows waiting for these parent rows move to their shards, after them.
+    let adopt = if entry.orphan_children.is_empty() {
+        Vec::new()
+    } else {
+        let mut placed = vec![(0usize, 0u64); values.rows.len()];
+        for (shard, rows) in &by_shard {
+            for &r in rows {
+                let h = values.rows[r]
+                    .get(pos)
+                    .and_then(|v| key_literal(v, class))
+                    .and_then(|k| entry.group.hash_of(&k))
+                    .ok_or_else(|| {
+                        Rejection::new(Reason::InsertKey, "a key whose hash can't be known here")
+                    })?;
+                placed[r] = (*shard, h);
+            }
+        }
+        let at = |c: &str| -> Option<usize> {
+            if ins.columns.is_empty() {
+                entry.columns.iter().position(|x| x.eq_ignore_ascii_case(c))
+            } else {
+                ins.columns.iter().position(|n| {
+                    ident_parts(n)
+                        .and_then(|p| p.last().map(|i| i.value.eq_ignore_ascii_case(c)))
+                        .unwrap_or(false)
+                })
+            }
+        };
+        parents::adoption(entry, &placed, &|r, c| {
+            values.rows.get(r)?.get(at(c)?).cloned()
+        })?
+    };
+    if by_shard.len() == 1 && adopt.is_empty() {
         if claims.is_empty() && fkw.is_none() {
             let t = one_shard_insert(stmt, text_src, entry, by_shard[0].0, loc, &default_schema);
             return Ok(Plan::Pass(t));
@@ -3367,6 +3418,7 @@ fn plan_insert(stmt: &Statement, src_in: &Src<'_>, cx: &PlanCtx<'_>) -> R<Plan> 
             &default_schema,
         ));
     }
+    targets.extend(adopt);
     Ok(Plan::Write(WritePlan {
         kind: WriteKind::Insert,
         targets,
@@ -3727,10 +3779,26 @@ fn plan_update_delete(stmt: &Statement, src: &Src<'_>, cx: &PlanCtx<'_>) -> R<Pl
         .get(shard_list[0])
         .map(|s| s.cluster.as_str());
     let fkw = fk::update_delete_work(&dml, entry, &rel.default_schema, near, cx)?;
-    if (!releases.is_empty() || fkw.is_some()) && shard_list.len() == 1 {
+    // An UPDATE of a parent's referenced column: rows waiting in the
+    // orphanage for the new value go to their parents' shards in the same
+    // write. A limited one leaves them to the controller's sweep.
+    let adopt = if kind == WriteKind::Update && !shards.is_empty() && !(order_by || limit) {
+        let parent = match &twjs[0].relation {
+            TableFactor::Table { name, .. } => ident_parts(name)
+                .and_then(|p| p.last().map(|i| i.value.clone()))
+                .unwrap_or_else(|| entry.name.clone()),
+            _ => entry.name.clone(),
+        };
+        parents::update_adoption(entry, &parent, &assignments, &shard_list)
+    } else {
+        Vec::new()
+    };
+    if (!releases.is_empty() || fkw.is_some() || !adopt.is_empty()) && shard_list.len() == 1 {
+        let mut targets = vec![make(shard_list[0], (!src.template).then_some(src))];
+        targets.extend(adopt);
         return Ok(Plan::Write(WritePlan {
             kind,
-            targets: vec![make(shard_list[0], (!src.template).then_some(src))],
+            targets,
             rows: 0,
             claims: Vec::new(),
             releases,
@@ -3777,6 +3845,7 @@ fn plan_update_delete(stmt: &Statement, src: &Src<'_>, cx: &PlanCtx<'_>) -> R<Pl
         targets: shards
             .into_iter()
             .map(|s| make(s, (!src.template).then_some(src)))
+            .chain(adopt)
             .collect(),
         rows: 0,
         claims: Vec::new(),

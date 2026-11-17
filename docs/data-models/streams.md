@@ -21,7 +21,7 @@ A stream belongs to one database of one tenant, like a table. In MariaDB it is t
 | Log | Sequenced records: partition, offset, timestamp, key, value, headers | The database's default shard |
 | Checkpoints | Each partition's next offset and log start, and the stream's leader epoch | Beside the log |
 
-A publish is a plain insert into the outbox, inside your transaction. A background **sequencer**, running in a `sprigdb worker`, reads committed outbox rows from the change feed in commit order, gives each record its partition offset and appends it to the log. It appends in batches, each written when its oldest record has waited 10 ms or it holds 1,000 records. Records become readable a few tens of milliseconds after the commit. Rolled-back records never appear, and offsets have no gaps except those that compaction leaves.
+A publish is a plain insert into the outbox, inside your transaction. A background **sequencer**, running in a `sprigdb worker`, reads committed outbox rows from the change feed in commit order, gives each record its partition offset and appends it to the log. It appends in batches, each written when its oldest record has waited `stream.sequencer_batch_ms` (10 ms; data centre or global, applied live) or it holds 1,000 records. Records become readable a few tens of milliseconds after the commit. Rolled-back records never appear, and offsets have no gaps except those that compaction leaves.
 
 The log is partitioned by day, so time retention drops whole day partitions rather than deleting rows. Every stream has its own sequencer. When the tenant moves to another cluster, its streams move with it and keep their offsets.
 
@@ -136,6 +136,32 @@ The update and the record commit together. If the transaction rolls back, nothin
 - Without a column list, two values mean `(key, value)` and three mean `(key, value, headers)`.
 - `ts` and `partition_no` are optional. Without `ts`, the record gets the time of the insert.
 - Publishing needs `INSERT` on the stream or its database.
+- Prepared statements work too, whether a driver prepares `INSERT INTO order_events (key, value) VALUES (?, ?)` or you use SQL's `PREPARE`, `EXECUTE ... USING` and `EXECUTE IMMEDIATE` (below). Each execute publishes one record per row, and the size limit is checked on the values of each execute.
+- Values that aren't literals, such as function calls or an `INSERT ... SELECT`, are computed by a `SELECT` first, so such a publish costs one more round trip.
+
+With SQL's own prepared statements:
+
+```sql test
+PREPARE pub FROM 'INSERT INTO order_events (key, value) VALUES (?, ?)';
+SET @k = '7101', @v = JSON_OBJECT('type', 'order.created', 'order_id', 7101);
+EXECUTE pub USING @k, @v;
+EXECUTE pub USING '7102', JSON_OBJECT('type', 'order.created', 'order_id', 7102);
+DEALLOCATE PREPARE pub;
+EXECUTE IMMEDIATE 'INSERT INTO order_events (key, value) VALUES (?, ?)'
+  USING '7103', JSON_OBJECT('type', 'order.created', 'order_id', 7103);
+DO SLEEP(3);
+SELECT CAST(key AS CHAR) AS k, CAST(value AS CHAR) AS v FROM order_events
+WHERE key IN ('7101', '7102', '7103') ORDER BY k;
+```
+
+```text output
+k	v
+7101	{"type": "order.created", "order_id": 7101}
+7102	{"type": "order.created", "order_id": 7102}
+7103	{"type": "order.created", "order_id": 7103}
+```
+
+The text to prepare can be a literal or a variable. A wrong number of values fails with 1210, as in MariaDB.
 
 A stream is append-only:
 
@@ -151,7 +177,7 @@ Refused forms:
 | `INSERT ... ON DUPLICATE KEY UPDATE` | 39941 |
 | `INSERT ... SET col = ...` | 1235: use `VALUES` or `SELECT` |
 | An insert into a change topic | 39941 |
-| A literal larger than `stream.max_message_bytes` | `ER_SPRIG_STREAM_RECORD_TOO_LARGE` (39944) |
+| A record whose key, value and headers together are larger than `stream.max_message_bytes`, or a key over 4,096 bytes, from any insert shape (`VALUES`, `SELECT`, logic) | `ER_SPRIG_STREAM_RECORD_TOO_LARGE` (39944) |
 | A record without a key on a compacted stream | `ER_SPRIG_STREAM_COMPACT_NEEDS_KEY` (39955) |
 
 Logic code publishes the same way. `db.publish(stream, key, value, headers?)` in JavaScript and Lua, and `Sprig.Db.Publish` in KIRun, run that `INSERT` through the caller's session, so the record is part of the caller's transaction. In logic, a `null` value is a tombstone. See [Logic](logic.md).
@@ -355,7 +381,7 @@ Each record is one row change, in commit order. Its key is the JSON of the row's
 ```
 
 - `op` is `c` (insert), `u` (update) or `d` (delete). A schema change is `ddl`, with the statement in `ddl`, and a `TRUNCATE` is `t`; both go to partition 0 without a key.
-- Internal columns never appear. `DECIMAL` values are JSON numbers, so trailing zeros are lost (`49.90` is `49.9`). Binary and spatial values are base64, and dates and times are MariaDB's text.
+- Internal columns never appear. `DECIMAL` values are JSON numbers, so trailing zeros are lost (`49.90` is `49.9`); a value a double can't hold exactly, such as `12345678901234567890.1234567891`, is a JSON string instead. `ENUM` values are the member's index and `SET` values a bitmap. Binary and spatial values are base64, and dates and times are MariaDB's text.
 - Change topics are written only by SprigDB: publishing into one is 39941.
 - Reading a change topic needs `SELECT` on its table. A reader bound by the table's [row-level security](../security/row-level-security.md) policies sees only the changes those policies show it; an update that hides or reveals a row reaches that reader as a delete or an insert. Offsets aren't renumbered, so filtered records leave gaps.
 
@@ -414,7 +440,7 @@ Every reader of the stream in the owning tenant sees every tenant's records. Rou
 |---|---|---|
 | Stream name | 1 to 249 characters of `[a-zA-Z0-9._-]` | 1103 |
 | Partitions of a new stream | 1 to 10,000 (`stream.partitions_default` bounds) | |
-| Record size | `stream.max_message_bytes`, 1 MiB by default, at most 1 GiB | 39944 |
+| Record size (key, value and headers) | `stream.max_message_bytes`, 1 MiB by default, at most 1 GiB; the stream's own setting comes first | 39944 |
 | Key size | 4,096 bytes | 39944 |
 | Time retention | 1 hour to 87,600 hours (10 years) | 1231 from `ALTER STREAM ... SET` |
 | Kafka produce batch, uncompressed | 64 MiB | |

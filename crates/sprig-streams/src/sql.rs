@@ -14,10 +14,19 @@
 //!     at the stream's scope); the feed subscription stream:<id> for the
 //!     controller, which starts the sequencer job
 //! INSERT INTO s (key, value, headers) ...:
-//!   INSERT on the stream (by name, or the database); literals above
-//!   stream.max_message_bytes: 39944; ON DUPLICATE KEY: 39941; change topic: 39941
-//!   → INSERT INTO `__sprig_eo_<id>` (k, v, headers) ... through the session,
-//!     inside its transaction
+//!   INSERT on the stream (by name, or the database); ON DUPLICATE KEY:
+//!   39941; change topic: 39941; a key above 4096 bytes, or a record (key,
+//!   value and headers) above stream.max_message_bytes (the stream's own
+//!   value, else its database's and up): 39944
+//!   VALUES rows whose values are literals (any form: strings, N'..',
+//!   X'..', 0x.., B'..', _charset'..', numbers, CONCAT of literals):
+//!     measured from the text
+//!     → INSERT INTO `__sprig_eo_<id>` (k, v, headers) ... through the
+//!       session, inside its transaction
+//!   anything else (functions, columns, INSERT ... SELECT): the session
+//!     evaluates the rows under the user's rights ([`Handled::Publish`]),
+//!     measures them and inserts their values as hex literals
+//!   prepared, with ?: run as text at each execute, the values written in
 //! SELECT ... FROM s: SELECT on the stream; a change topic: SELECT on its
 //!   source table, and 39366 when the authorization engine filters that
 //!   table's rows (row-level security isn't applied to streams yet)
@@ -178,6 +187,12 @@ pub trait Host: Send {
     fn settings(&self, db: DbId) -> StmtSettings;
     /// Whether `stream.change_topic` is on for table `object` of `db`.
     fn change_topic_on(&self, db: DbId, object: ObjectId) -> bool;
+    /// `stream.max_message_bytes` for a publish into `def`: at the
+    /// stream's own scope, then its database's and up. By default the
+    /// database's.
+    fn stream_max_bytes(&self, def: &StreamDef) -> u64 {
+        self.settings(def.db).max_message_bytes
+    }
     /// The session's user, for "command denied" errors.
     fn user(&self) -> (String, String);
 
@@ -264,6 +279,98 @@ pub enum Handled {
         /// record (39955).
         compact: bool,
     },
+    /// A publish whose sizes the text doesn't tell: the session evaluates
+    /// [`PublishRows::source`] under the user's rights, then writes the rows
+    /// [`PublishRows::inserts`] makes of what came back.
+    Publish(PublishRows),
+}
+
+/// A publish whose rows MariaDB evaluates first ([`Handled::Publish`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishRows {
+    /// The rows as the client wrote them: `VALUES (...), ...` or a query.
+    pub source: String,
+    /// The outbox column each value goes to, in order.
+    pub columns: Vec<&'static str>,
+    /// The statement up to its column list, with the outbox as its target
+    /// (`INSERT [IGNORE] INTO [db.]__sprig_eo_<id>`).
+    pub head: String,
+    /// `stream.max_message_bytes`.
+    pub max_bytes: u64,
+    /// A compacted stream (4025 from the insert means a keyless record).
+    pub compact: bool,
+}
+
+/// The largest insert text [`PublishRows::inserts`] makes before it starts
+/// another statement (below MariaDB's default `max_allowed_packet`).
+pub const INSERT_BATCH_BYTES: usize = 8 << 20;
+
+impl PublishRows {
+    /// The outbox inserts for `rows` (each value's bytes, `None` for
+    /// `NULL`), after each record's size check: one statement, or more for
+    /// rows past [`INSERT_BATCH_BYTES`] of text. Empty for no rows.
+    ///
+    /// # Errors
+    /// 1136 for a row with another number of values; 39944.
+    pub fn inserts(&self, rows: &[Vec<Option<Vec<u8>>>]) -> Result<Vec<String>> {
+        use std::fmt::Write as _;
+        let cols = self.columns.join(", ");
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        for (n, row) in rows.iter().enumerate() {
+            if row.len() != self.columns.len() {
+                return Err(SprigError::standard(
+                    1136,
+                    *b"21S01",
+                    format!("Column count doesn't match value count at row {}", n + 1),
+                ));
+            }
+            let len = |c: &str| {
+                self.columns
+                    .iter()
+                    .zip(row)
+                    .filter(|(name, _)| **name == c)
+                    .map(|(_, v)| v.as_ref().map_or(0, Vec::len) as u64)
+                    .sum::<u64>()
+            };
+            let key = len("k");
+            crate::publish::check_size(key, key + len("v") + len("headers"), self.max_bytes)?;
+            if cur.is_empty() {
+                let _ = write!(cur, "{} ({cols}) VALUES ", self.head);
+            } else {
+                cur.push_str(", ");
+            }
+            cur.push('(');
+            for (i, (c, v)) in self.columns.iter().zip(row).enumerate() {
+                if i > 0 {
+                    cur.push_str(", ");
+                }
+                match v {
+                    None => cur.push_str("NULL"),
+                    Some(b) => {
+                        // Key and value are bytes; the other columns read
+                        // text.
+                        if !matches!(*c, "k" | "v") {
+                            cur.push_str("_utf8mb4 ");
+                        }
+                        cur.push_str("X'");
+                        for x in b {
+                            let _ = write!(cur, "{x:02X}");
+                        }
+                        cur.push('\'');
+                    }
+                }
+            }
+            cur.push(')');
+            if cur.len() >= INSERT_BATCH_BYTES {
+                out.push(std::mem::take(&mut cur));
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+        Ok(out)
+    }
 }
 
 fn not_found(db: &str, name: &str) -> SprigError {
@@ -315,6 +422,26 @@ fn stream_of(
     let db = host.db_id(db_name)?;
     let s = cx.state.get(db, &q.name, cx.lctn)?;
     (s.state == StreamState::Active).then(|| (db_name.to_owned(), std::sync::Arc::clone(s)))
+}
+
+/// Whether `sql` publishes into an active stream of `cx.state` (an
+/// `INSERT` naming one); `db_id` resolves a database's name. Prepared
+/// statements use it: such a statement runs as text, with its parameters
+/// written in, so its records are measured as literals.
+#[must_use]
+pub fn publishes(sql: &str, cx: &Ctx<'_>, db_id: &dyn Fn(&str) -> Option<DbId>) -> bool {
+    if cx.state.is_empty() {
+        return false;
+    }
+    let Ok(Stmt::Insert(i)) = grammar::classify(sql.as_bytes(), &cx.lex) else {
+        return false;
+    };
+    let Some(db) = i.target.db.as_deref().or(cx.current).and_then(db_id) else {
+        return false;
+    };
+    cx.state
+        .get(db, &i.target.name, cx.lctn)
+        .is_some_and(|s| s.state == StreamState::Active)
 }
 
 /// Handles one statement of a tenant session.
@@ -715,16 +842,6 @@ fn publish(
     if !host.allowed(Privilege::Insert, db_name, None, &s.name) {
         return Err(denied(host, Privilege::Insert, &s.name));
     }
-    let max = host.settings(s.db).max_message_bytes;
-    if i.longest_literal as u64 > max {
-        return Err(SprigError::new(
-            SprigCode::StreamRecordTooLarge,
-            format!(
-                "ER_SPRIG_STREAM_RECORD_TOO_LARGE: a value of {} bytes is above stream.max_message_bytes ({max})",
-                i.longest_literal
-            ),
-        ));
-    }
     let target = match &i.target.db {
         Some(d) => format!(
             "{}.{}",
@@ -736,33 +853,67 @@ fn publish(
     let mut out = String::with_capacity(sql.len() + 32);
     out.push_str(&sql[..i.target.range.start]);
     out.push_str(&target);
-    if let Some(cols) = &i.columns {
-        {
-            let mut last = i.target.range.end;
-            for (name, r) in cols {
-                let col = outbox_column(name).ok_or_else(|| {
-                    SprigError::standard(
-                        1054,
-                        *b"42S22",
-                        format!("Unknown column '{name}' in 'field list'"),
-                    )
-                })?;
-                out.push_str(&sql[last..r.start]);
-                out.push_str(col);
-                last = r.end;
-            }
-            out.push_str(&sql[last..]);
+    let head = out.clone();
+    let columns: Vec<&'static str> = if let Some(cols) = &i.columns {
+        let mut last = i.target.range.end;
+        let mut names = Vec::with_capacity(cols.len());
+        for (name, r) in cols {
+            let col = outbox_column(name).ok_or_else(|| {
+                SprigError::standard(
+                    1054,
+                    *b"42S22",
+                    format!("Unknown column '{name}' in 'field list'"),
+                )
+            })?;
+            out.push_str(&sql[last..r.start]);
+            out.push_str(col);
+            last = r.end;
+            names.push(col);
         }
+        out.push_str(&sql[last..]);
+        names
     } else {
-        {
-            let cols = if i.first_row_arity == Some(2) {
-                " (k, v)"
-            } else {
-                " (k, v, headers)"
-            };
-            out.push_str(cols);
-            out.push_str(&sql[i.after_target..]);
-        }
+        let cols: &[&'static str] = if i.first_row_arity == Some(2) {
+            &["k", "v"]
+        } else {
+            &["k", "v", "headers"]
+        };
+        out.push_str(" (");
+        out.push_str(&cols.join(", "));
+        out.push(')');
+        out.push_str(&sql[i.after_target..]);
+        cols.to_vec()
+    };
+    // Every record's size, from the text when it tells (any literal
+    // form), else from the rows MariaDB evaluates.
+    let max = host.stream_max_bytes(s);
+    let measured = i.rows.as_ref().and_then(|rows| {
+        rows.iter()
+            .map(|row| {
+                let len = |c: &str| -> Option<u64> {
+                    columns
+                        .iter()
+                        .zip(row)
+                        .filter(|(name, _)| **name == c)
+                        .map(|(_, v)| v.bytes())
+                        .sum()
+                };
+                let key = len("k")?;
+                Some((key, key + len("v")? + len("headers")?))
+            })
+            .collect::<Option<Vec<_>>>()
+    });
+    let Some(sizes) = measured else {
+        return Ok(Handled::Publish(PublishRows {
+            source: sql[i.source_start..].to_owned(),
+            columns,
+            head,
+            max_bytes: max,
+            compact: s.cleanup == Cleanup::Compact,
+        }));
+    };
+    for (key, record) in sizes {
+        crate::publish::check_size(key, record, max)?;
     }
     let _ = cx;
     Ok(Handled::Forward {

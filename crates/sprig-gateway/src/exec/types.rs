@@ -23,6 +23,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::ObjectKind;
 use sprig_catalog::version::VersionKind;
 use sprig_catalog::{CatalogLocator, Namespace, TenantCatalog};
@@ -524,7 +525,7 @@ impl Runner for GwRunner<'_, '_, '_> {
         let tenant = ts.tenant;
         if !self.migrated {
             let ep = svc.locator.writer(tenant).await?;
-            let mut conn = ep.pool.get_conn().await.map_err(|e| {
+            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
                 SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
             })?;
             sprig_types::store::migrate(&mut conn, ep.store.schema()).await?;

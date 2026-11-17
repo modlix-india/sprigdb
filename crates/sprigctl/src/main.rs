@@ -32,6 +32,8 @@
 //!   transactions; see [`txn`].
 //! - `sprigctl ai provider add|list|test|remove`: the AI assistants'
 //!   providers; see [`ai`].
+//! - `sprigctl catalog contracts [show|run]`: catalog contract
+//!   migrations and their audited early run; see [`catalog`].
 //!
 //! Every other command group is hidden, and prints "not available in this version",
 //! exiting with status 1.
@@ -46,6 +48,7 @@
 
 // AI providers.
 mod ai;
+mod catalog;
 mod check;
 mod client;
 mod cluster;
@@ -56,6 +59,8 @@ mod gateway;
 mod graph;
 mod index;
 mod inherit;
+// Token issuers (external tokens).
+mod issuer;
 mod search;
 // Approvals and recommendations.
 mod logic;
@@ -196,6 +201,7 @@ fn tenant_group() -> Command {
         );
     g = placement::add_pin_cmds(g);
     g = suspend::add_cmds(g);
+    g = issuer::add_cmds(g);
     // Moves between DCs and traffic (crate::dcmove).
     g = g
         .subcommand(dcmove::move_command())
@@ -506,6 +512,7 @@ fn cli() -> Command {
         .subcommand(space::group())
         .subcommand(inherit::group())
         .subcommand(txn::group())
+        .subcommand(catalog::group())
         .subcommand(ai::group())
         .subcommand(sink::group())
         .subcommand(graph::group())
@@ -565,7 +572,9 @@ fn main() -> ExitCode {
     let implemented = match group {
         "dc" | "cluster" | "settings" | "index" | "job" | "gateway" | "check" | "advisor"
         | "shard" | "space" | "txn" | "sink" | "graph" | "search" | "recommendations"
-        | "inherit" | "login" | "logout" | "whoami" | "operator" | "token" | "ai" => true,
+        | "inherit" | "login" | "logout" | "whoami" | "operator" | "token" | "ai" | "catalog" => {
+            true
+        }
         "explain" => matches!(name.as_str(), "query" | "decision" | "placement"),
         "tenant" => !TENANT_LATER.contains(&name.as_str()),
         "logic" => logic::implemented(&name),
@@ -638,6 +647,9 @@ fn main() -> ExitCode {
                 .await
                 .map(|()| ExitCode::SUCCESS),
             "txn" => txn::run(&client, sub, output(&matches))
+                .await
+                .map(|()| ExitCode::SUCCESS),
+            "catalog" => catalog::run(&client, sub, output(&matches))
                 .await
                 .map(|()| ExitCode::SUCCESS),
             "ai" => ai::run(&client, sub, matches.get_flag("dry-run"), output(&matches))
@@ -1060,6 +1072,14 @@ async fn run_tenant(
         }
         "suspend" | "resume" => {
             suspend::run(c, cmd, sub, m.get_flag("dry-run"), out).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        "issuer" => {
+            issuer::run_issuer(c, sub, m.get_flag("dry-run"), out).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        "token-login" => {
+            issuer::run_token_login(c, sub, m.get_flag("dry-run"), out).await?;
             Ok(ExitCode::SUCCESS)
         }
         "failover" | "standby" => {

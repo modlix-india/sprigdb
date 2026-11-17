@@ -74,6 +74,7 @@ use sprig_auth::authz::{
     Target,
 };
 use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::{DbState, Namespace, ObjectKind, ObjectState};
 use sprig_catalog::{Freshness, TenantCatalog};
 use sprig_common::ids::{ClusterId, DbId, RoleId, TenantId};
@@ -265,7 +266,25 @@ impl AuthzServices {
         // catalog version) narrows or widens grants now.
         let digest =
             placement.as_ref().map_or(0, |p| p.0) ^ super::rls::enforcement_digest(svc, cat);
-        let versions = (cat.version, cat.auth_version, digest);
+        // Where the accounts log in from moves with the tenant's path and
+        // its clusters' relays, not the catalog: every cluster of the
+        // tenant follows a change (a read fanning out to another cluster
+        // logs in there without reconciling it first).
+        let mut clusters = vec![cluster.clone()];
+        for c in placement
+            .as_ref()
+            .map(|p| p.1.as_slice())
+            .unwrap_or_default()
+        {
+            if !clusters.contains(c) {
+                clusters.push(c.clone());
+            }
+        }
+        let mut hosts = std::collections::hash_map::DefaultHasher::new();
+        for c in &clusters {
+            (c, login_hosts(svc, cat, c).await.ok()).hash(&mut hosts);
+        }
+        let versions = (cat.version, cat.auth_version, digest ^ hosts.finish());
         let every = Duration::from_secs(svc.settings.get(
             &sprig_auth::authz::settings::RECONCILE_INTERVAL_SECONDS,
             &cat.setting_ctx(&svc.dc),
@@ -327,6 +346,7 @@ impl AuthzServices {
         };
         // The name pairs stored code looks up.
         super::stored_names::sync_logged(svc, cat, cluster).await;
+        let hosts = login_hosts(svc, cat, cluster).await?;
         let Some(engine) = engine_for(svc, cat) else {
             return Ok(());
         };
@@ -343,7 +363,7 @@ impl AuthzServices {
             }
         }
         // Accounts with table-level grants reach those tables' global
-        // lookup indexes (chapter 19, Q50).
+        // lookup indexes.
         if let Err(e) = super::lookups_sql::add_lookup_grants(svc, cat, cluster, &mut want).await {
             tracing::warn!(tenant = %cat.tenant, %cluster, error = %e, "lookup tables' grants not placed; table-level users' writes to tables with lookups fail until the next reconcile");
         }
@@ -355,6 +375,7 @@ impl AuthzServices {
         let hash = {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             want.hash(&mut h);
+            hosts.hash(&mut h);
             h.finish()
         };
         if !sweep && lock(&self.applied).get(&key) == Some(&hash) {
@@ -374,16 +395,20 @@ impl AuthzServices {
         // A deletion that began while this reconcile waited.
         self.refuse_gone(cat.tenant)?;
         let pool = svc.locator.ctl_pool(cluster).await?;
-        let mut conn = pool.get_conn().await.map_err(|e| {
+        let mut conn = pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(
                 sprig_common::SprigCode::BackendUnavailable,
                 format!("sprig_ctl on {cluster}: {e}"),
             )
         })?;
         let started = std::time::Instant::now();
-        let rep = backend::reconcile(&mut conn, cat.tenant, &want, &per_user.key, full).await?;
-        // Share views run as their parent's share definer (RL68, RL70): a
-        // full reconcile moves other stored code off non-tenant definers;
+        let rep = backend::reconcile_at(&mut conn, cat.tenant, &want, &per_user.key, full, &hosts)
+            .await?;
+        if rep.statements > 0 && hosts.locks_any() {
+            tracing::info!(tenant = %cat.tenant, %cluster, hosts = ?hosts.hosts(), "backend accounts log in only from the cluster's relays");
+        }
+        // Share views run as their parent's share definer: a full
+        // reconcile moves other stored code off non-tenant definers;
         // it and the drift sweep re-point share views with another definer
         // (an older build's) and give the definer what it lacks.
         if full || sweep {
@@ -447,6 +472,39 @@ impl AuthzServices {
     }
 }
 
+/// Where `cat`'s per-user accounts on `cluster` may log in from: only the
+/// hosts of the cluster's relays for a tenant on Sprig 2PC's relay path
+/// (`txn.non_xa_policy = sprig_2pc` and `txn.sprig_2pc_path = relay`) once
+/// the cluster has relays that published them; anywhere otherwise.
+///
+/// # Errors
+/// The cluster's view can't be read.
+async fn login_hosts(
+    svc: &TenantServices,
+    cat: &TenantCatalog,
+    cluster: &ClusterId,
+) -> Result<backend::LoginHosts> {
+    let ctx = cat.setting_ctx(&svc.dc);
+    let relayed = svc.settings.get(
+        &sprig_txn::settings::NON_XA_POLICY,
+        &ctx,
+        Some(&cat.settings),
+    ) == "sprig_2pc"
+        && sprig_txn::settings::relay_path(&svc.settings.get(
+            &sprig_txn::settings::SPRIG_2PC_PATH,
+            &ctx,
+            Some(&cat.settings),
+        ));
+    if !relayed {
+        return Ok(backend::LoginHosts::Anywhere);
+    }
+    Ok(match svc.locator.relay_hosts(cluster).await? {
+        Some(h) if !h.is_empty() => backend::LoginHosts::Only(h),
+        // No relays, or relays of a build that doesn't publish its hosts.
+        _ => backend::LoginHosts::Anywhere,
+    })
+}
+
 /// The accounts of `want` whose database-level grants (`mysql.db`)
 /// differ from what `seen` last recorded for `key`, and records `want`'s
 /// The first call for a key records only.
@@ -494,7 +552,7 @@ async fn placement_on(
 ) -> Result<backend::Placement> {
     use mysql_async::prelude::Queryable;
     let pool = svc.locator.ctl_pool(cluster).await?;
-    let mut conn = pool.get_conn().await.map_err(|e| {
+    let mut conn = pool.get_conn_bounded().await.map_err(|e| {
         SprigError::new(
             sprig_common::SprigCode::BackendUnavailable,
             format!("sprig_ctl on {cluster}: {e}"),
@@ -566,6 +624,9 @@ pub struct SessionAuthz {
     /// The engine, from the first compile on (`None` before, and for an
     /// unknown `auth.authorizer`).
     engine: std::sync::OnceLock<Option<Arc<dyn Authorizer>>>,
+    /// The token roles at an auth version: what the role mappings of the
+    /// session's token give it ([`token_roles`]).
+    token: Mutex<Option<(u64, Vec<RoleId>)>>,
 }
 
 impl SessionAuthz {
@@ -585,6 +646,31 @@ impl SessionAuthz {
     pub fn active(&self) -> Vec<RoleId> {
         lock(&self.active).clone().unwrap_or_default()
     }
+
+    /// Forgets the token roles (the session's claims changed).
+    pub fn forget_token_roles(&self) {
+        *lock(&self.token) = None;
+        self.invalidate();
+    }
+}
+
+/// The session's token roles at `cat`: the role mappings of its verified
+/// token's issuer, evaluated on its claims at each auth version, as roles
+/// the tenant defines. Empty without a token.
+#[must_use]
+pub fn token_roles(ts: &TenantSession, cat: &TenantCatalog) -> Vec<RoleId> {
+    let Some(claims) = ts.rls.claims.as_deref() else {
+        return Vec::new();
+    };
+    let mut t = lock(&ts.authz.token);
+    if let Some((v, roles)) = &*t
+        && *v == cat.auth_version
+    {
+        return roles.clone();
+    }
+    let roles = sprig_auth::oidc::roles::session_roles(cat, claims);
+    *t = Some((cat.auth_version, roles.clone()));
+    roles
 }
 
 /// `CURRENT_ROLE()` for the session: the active roles, as MySQL 8.4 prints
@@ -644,6 +730,9 @@ pub fn privileges(ts: &TenantSession, cat: &TenantCatalog) -> Arc<dyn SessionGra
     let Some(engine) = session_engine(ts, cat) else {
         return nothing();
     };
+    // Token roles are granted for the session's life and active from
+    // login with the default roles; SET ROLE may drop them.
+    let token = token_roles(ts, cat);
     let active = {
         let mut a = lock(&ts.authz.active);
         let all = || {
@@ -654,9 +743,22 @@ pub fn privileges(ts: &TenantSession, cat: &TenantCatalog) -> Arc<dyn SessionGra
             )
         };
         if a.is_none() {
-            *a = Some(engine.active_roles(cat, user, None, all()));
+            let mut at_login = engine.active_roles(cat, user, None, all());
+            for r in &token {
+                if !at_login.contains(r) {
+                    at_login.push(*r);
+                }
+            }
+            *a = Some(at_login);
         }
-        engine.active_roles(cat, user, a.as_deref(), false)
+        let chosen = a.as_deref().unwrap_or_default();
+        let mut active = engine.active_roles(cat, user, Some(chosen), false);
+        for r in chosen {
+            if token.contains(r) && !active.contains(r) {
+                active.push(*r);
+            }
+        }
+        active
     };
     let mut g = lock(&ts.authz.compiled);
     if let Some((a, c, roles, p)) = &*g
@@ -779,6 +881,7 @@ pub async fn account_statement(
     let client_host = ts.principal.client_ip.to_string();
     let lctn = ts.lower_case_table_names();
     let active = ts.authz.active();
+    let token = token_roles(ts, cat);
     let policy = sprig_auth::SettingsPolicy::new(svc.settings.clone(), svc.dc.clone());
     let audit = sprig_auth::audit::LogAudit::default();
     let tenant_name = ts.principal.tenant_name.clone();
@@ -799,6 +902,7 @@ pub async fn account_statement(
             lower_case_table_names: lctn,
             privileges: &*compiled,
             active_roles: &active,
+            token_roles: &token,
             hashing,
             unsafe_error,
             partial_revokes,
@@ -1241,7 +1345,7 @@ fn rls_context_now(ts: &TenantSession, cat: &TenantCatalog) -> Option<String> {
     ))
 }
 
-/// MySQL's 1615: the gateway prepares the client's text again (RL24).
+/// MySQL's 1615: the gateway prepares the client's text again.
 fn needs_reprepare() -> SprigError {
     SprigError::standard(
         1615,
@@ -1290,7 +1394,7 @@ pub fn recheck(ts: &TenantSession, persona: Persona, rc: &Recheck) -> Result<()>
     let r = check_text(&cx, rc.kind, &rc.text, rc.lex);
     // A table whose policies bind the session since the prepare (a policy
     // created or row security enabled): the text has no predicates for it.
-    // Prepared again, it takes the rewrite as a fresh prepare does (S161).
+    // Prepared again, it takes the rewrite as a fresh prepare does.
     // An engine without the gateway's rewrite keeps 39366.
     if r.as_ref()
         .is_err_and(|e| e.code() == Some(sprig_common::SprigCode::RlsUnsupported))

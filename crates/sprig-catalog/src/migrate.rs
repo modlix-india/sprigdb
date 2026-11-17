@@ -24,10 +24,20 @@
 //!
 //! **Gating.** Upgrade orchestration decides how far each module
 //! may go and passes it as a [`Ceiling`]: expand to `F` once every
-//! registered component reads `F`, contract to `F` after
-//! `catalog.contract_delay_days` with no older reader registered. The
-//! migrator itself applies whatever the ceilings allow, in order, and stops
-//! a module at the first migration its ceiling refuses.
+//! registered component reads `F`, contract to `F` with no older reader
+//! registered. The migrator itself applies whatever the ceilings allow, in
+//! order, and stops a module at the first migration its ceiling refuses.
+//!
+//! **The contract delay.** Whatever the ceiling says, a contract runs only
+//! once [`MigrateOpts::contract_delay`] (`catalog.contract_delay_days`) has
+//! passed since the module's last expand was recorded: the expand phase
+//! of the upgrade must have been in service that long, so a rollback to
+//! the older binary is still possible until then. A contract held back is
+//! reported in [`MigrateReport::delayed`] with the time it may run. A
+//! module whose history has no expand time is held back too. Only an
+//! explicit [`ContractOverride`] with a reason lets a contract run early;
+//! the reason, who gave it and the expand time are recorded in that
+//! migration's history entry and logged as a warning.
 //!
 //! **Where state lives.** In the catalog's internal keys:
 //! `sprig.catalog_format` holds every module's
@@ -53,6 +63,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use mysql_async::Conn;
@@ -262,6 +273,24 @@ pub struct HistoryEntry {
     pub at: String,
     /// Who ran it (process id, such as `controller:mum1/ctl-2`).
     pub by: String,
+    /// A contract run before the contract delay was over: the override
+    /// that allowed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_override: Option<DelayOverride>,
+}
+
+/// The record of a contract run early ([`ContractOverride`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelayOverride {
+    /// Why.
+    pub reason: String,
+    /// Who decided (an operator, such as `op:alice`).
+    pub by: String,
+    /// When the module's last expand was recorded (RFC 3339 UTC), if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expand_at: Option<String>,
+    /// The delay in force, in seconds.
+    pub delay_secs: u64,
 }
 
 /// The value of `sprig.migration.<module>`.
@@ -305,6 +334,28 @@ impl Ceiling {
     }
 }
 
+/// Set by [`never_create_schemas`].
+static NEVER_CREATE: AtomicBool = AtomicBool::new(false);
+
+/// From now on, no migration run in this process creates a missing schema,
+/// whatever its [`MigrateOpts::create_schema`] says: each refuses as
+/// [`MigrateOpts::existing`] does (39072). For processes whose migrations
+/// only bring catalogs that bootstrap made to their newest formats
+/// (gateways and workers). Their runs come from many crates' module
+/// helpers; one of them running after the tenant's deletion dropped the
+/// catalog, or before bootstrap claimed it, made the schema without its
+/// owner mark, which bootstrap then refused as another tenant's.
+pub fn never_create_schemas() {
+    NEVER_CREATE.store(true, Ordering::Relaxed);
+}
+
+/// Whether this process's migration runs may create a missing schema (see
+/// [`never_create_schemas`]).
+#[must_use]
+pub fn schemas_created_here() -> bool {
+    !NEVER_CREATE.load(Ordering::Relaxed)
+}
+
 /// Options of one migration run.
 #[derive(Debug, Clone)]
 pub struct MigrateOpts {
@@ -319,11 +370,135 @@ pub struct MigrateOpts {
     pub default_ceiling: Ceiling,
     /// Recorded in the history, such as `controller:mum1/ctl-2`.
     pub applied_by: String,
+    /// How long after a module's last expand its contracts may run
+    /// (`catalog.contract_delay_days`; module docs).
+    pub contract_delay: Duration,
+    /// Lets contracts run before `contract_delay` is over, recorded with
+    /// its reason. `None` (the default): they wait.
+    pub contract_override: Option<ContractOverride>,
+    /// Whether a missing schema is created (without an owner mark).
+    /// `false` for a tenant's catalog outside bootstrap
+    /// ([`existing`](Self::existing)): only bootstrap creates a catalog,
+    /// with its mark. A loop migrating a catalog that was just dropped
+    /// (a deleted tenant) or isn't claimed yet (a new tenant, after its
+    /// placement) made an unmarked schema, which bootstrap then refused
+    /// as another tenant's (39072).
+    pub create_schema: bool,
+}
+
+/// An explicit decision to run contracts before the contract delay is
+/// over (module docs), such as a fix that can't wait a week on a
+/// deployment that won't roll back. Its reason is required.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractOverride {
+    reason: String,
+    by: String,
+}
+
+impl ContractOverride {
+    /// An override by `by` (an operator, such as `op:alice`) for `reason`.
+    ///
+    /// # Errors
+    /// 39084 if the reason or the operator is blank: an override is
+    /// audited, so it must say why and who.
+    pub fn new(reason: &str, by: &str) -> Result<Self> {
+        let (reason, by) = (reason.trim(), by.trim());
+        if reason.is_empty() || by.is_empty() {
+            return Err(SprigError::new(
+                SprigCode::SettingBadValue,
+                "overriding catalog.contract_delay_days needs a reason and who decided",
+            ));
+        }
+        Ok(Self {
+            reason: reason.to_owned(),
+            by: by.to_owned(),
+        })
+    }
+
+    /// Why.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    /// Who decided.
+    #[must_use]
+    pub fn by(&self) -> &str {
+        &self.by
+    }
+}
+
+/// `days` as the contract delay.
+#[must_use]
+pub fn contract_delay_of_days(days: u64) -> Duration {
+    Duration::from_secs(days.saturating_mul(86_400))
+}
+
+/// When a contract may run, given when its module's last expand was
+/// recorded: `Ok(())` now, or `Err(Some(t))` from `t` on, or `Err(None)`
+/// never without an override (no expand time is known).
+///
+/// # Errors
+/// See above: not an error, the reason it waits.
+pub fn contract_due(
+    expand_at: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+    delay: Duration,
+) -> std::result::Result<(), Option<std::time::SystemTime>> {
+    let Some(at) = expand_at else {
+        return Err(None);
+    };
+    let due = at.checked_add(delay).ok_or(None)?;
+    if now >= due { Ok(()) } else { Err(Some(due)) }
+}
+
+/// When `hist`'s last expand below `format` was recorded.
+fn last_expand_at(hist: &ModuleHistory, format: u32) -> Option<std::time::SystemTime> {
+    hist.history
+        .iter()
+        .filter(|h| h.phase == Phase::Expand && h.format < format)
+        .max_by_key(|h| h.format)
+        .and_then(|h| parse_rfc3339(&h.at))
+}
+
+/// The times [`crate::sql::rfc3339`] writes (`2026-11-16T10:00:00.000000Z`,
+/// fraction optional).
+#[allow(clippy::many_single_char_names)]
+fn parse_rfc3339(s: &str) -> Option<std::time::SystemTime> {
+    let s = s.strip_suffix('Z')?;
+    let (date, time) = s.split_once('T')?;
+    let mut d = date.splitn(3, '-').map(str::parse::<u32>);
+    let (y, mo, da) = (d.next()?.ok()?, d.next()?.ok()?, d.next()?.ok()?);
+    let (hms, frac) = time.split_once('.').unwrap_or((time, "0"));
+    let mut t = hms.splitn(3, ':').map(str::parse::<u32>);
+    let (h, mi, se) = (t.next()?.ok()?, t.next()?.ok()?, t.next()?.ok()?);
+    let us: u32 = format!("{frac:0<6}").get(..6)?.parse().ok()?;
+    crate::sql::from_datetime(&mysql_async::Value::Date(
+        u16::try_from(y).ok()?,
+        u8::try_from(mo).ok()?,
+        u8::try_from(da).ok()?,
+        u8::try_from(h).ok()?,
+        u8::try_from(mi).ok()?,
+        u8::try_from(se).ok()?,
+        us,
+    ))
+}
+
+impl MigrateOpts {
+    /// The defaults, for a schema that must already exist: a missing
+    /// one is 39072, not created.
+    #[must_use]
+    pub fn existing() -> Self {
+        Self {
+            create_schema: false,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for MigrateOpts {
-    /// Expands only, as far as this binary knows: contracts need step
-    /// 12's delay and reader checks, so they never run by default.
+    /// Expands only, as far as this binary knows: contracts need the
+    /// contract delay and the reader checks, so they never run by default.
     fn default() -> Self {
         Self {
             lock_timeout: Duration::from_secs(30),
@@ -331,6 +506,9 @@ impl Default for MigrateOpts {
             ceilings: BTreeMap::new(),
             default_ceiling: Ceiling::EXPAND_ONLY,
             applied_by: "system".to_owned(),
+            contract_delay: contract_delay_of_days(crate::settings::CONTRACT_DELAY_DAYS.default),
+            contract_override: None,
+            create_schema: true,
         }
     }
 }
@@ -353,10 +531,23 @@ pub struct MigrationRef {
 pub struct MigrateReport {
     /// Migrations applied, in order.
     pub applied: Vec<MigrationRef>,
-    /// Per module, the first migration a ceiling held back.
+    /// Per module, the first migration a ceiling or the contract delay
+    /// held back.
     pub blocked: Vec<MigrationRef>,
+    /// The contracts among `blocked` that the contract delay held back.
+    pub delayed: Vec<Delayed>,
     /// Every module's state after the run.
     pub state: FormatState,
+}
+
+/// A contract the contract delay held back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delayed {
+    /// The contract.
+    pub migration: MigrationRef,
+    /// When it may run (RFC 3339 UTC); `None`: the module's history has
+    /// no expand time, so only an override runs it.
+    pub due: Option<String>,
 }
 
 /// Runs modules' migrations on catalog schemas.
@@ -393,6 +584,8 @@ impl Migrator {
                 )));
             }
         }
+        // The process reads these: its reader record lists them.
+        crate::readers::declare(&modules);
         Ok(Self {
             modules,
             clock: Arc::new(SystemClock),
@@ -441,6 +634,7 @@ impl Migrator {
             return Ok(MigrateReport {
                 applied: Vec::new(),
                 blocked: Vec::new(),
+                delayed: Vec::new(),
                 state,
             });
         }
@@ -537,6 +731,15 @@ impl Migrator {
             .await
             .map_err(map_err)?;
         if exists.unwrap_or(0) == 0 {
+            if !opts.create_schema || !schemas_created_here() {
+                return Err(SprigError::new(
+                    SprigCode::TenantNotReady,
+                    format!(
+                        "the catalog schema {schema} doesn't exist (not bootstrapped yet, or \
+                         dropped); migrations don't create it"
+                    ),
+                ));
+            }
             exec_text(
                 conn,
                 opts,
@@ -553,6 +756,7 @@ impl Migrator {
         let mut report = MigrateReport {
             applied: Vec::new(),
             blocked: Vec::new(),
+            delayed: Vec::new(),
             state: FormatState::new(),
         };
         for module in &self.modules {
@@ -574,6 +778,14 @@ impl Migrator {
                     report.blocked.push(r);
                     break;
                 }
+                let overridden = match self.contract_gate(conn, schema, opts, &r).await? {
+                    Ok(o) => o,
+                    Err(d) => {
+                        report.delayed.push(d);
+                        report.blocked.push(r);
+                        break;
+                    }
+                };
                 refuse_fenced(conn, schema).await?;
                 tracing::info!(schema, module = module.name, format = m.format, phase = ?m.phase, name = m.name, "applying catalog migration");
                 for stmt in m.statements {
@@ -581,12 +793,57 @@ impl Migrator {
                 }
                 current = current.after(m);
                 state.insert(module.name.to_owned(), current);
-                self.record(conn, opts, module.name, m, &state).await?;
+                self.record(conn, opts, module.name, m, &state, overridden)
+                    .await?;
                 report.applied.push(r);
             }
         }
         report.state = state;
         Ok(report)
+    }
+
+    /// The contract delay (module docs) for migration `r`: `Ok(None)` when
+    /// it may run (an expand, or a contract past the delay), `Ok(Some(o))`
+    /// when only the run's override lets it run early (recorded as `o`),
+    /// `Err(d)` when it waits.
+    async fn contract_gate(
+        &self,
+        conn: &mut Conn,
+        schema: &str,
+        opts: &MigrateOpts,
+        r: &MigrationRef,
+    ) -> Result<std::result::Result<Option<DelayOverride>, Delayed>> {
+        if r.phase != Phase::Contract {
+            return Ok(Ok(None));
+        }
+        let hist = read_history(conn, schema, r.module).await?;
+        let expand_at = last_expand_at(&hist, r.format);
+        let Err(due) = contract_due(expand_at, self.clock.wall(), opts.contract_delay) else {
+            return Ok(Ok(None));
+        };
+        let Some(o) = &opts.contract_override else {
+            let due = due.map(rfc3339);
+            tracing::info!(
+                schema,
+                module = r.module,
+                format = r.format,
+                name = r.name,
+                due = due.as_deref().unwrap_or("unknown"),
+                "catalog contract migration waits for catalog.contract_delay_days"
+            );
+            return Ok(Err(Delayed {
+                migration: r.clone(),
+                due,
+            }));
+        };
+        let rec = DelayOverride {
+            reason: o.reason.clone(),
+            by: o.by.clone(),
+            expand_at: expand_at.map(rfc3339),
+            delay_secs: opts.contract_delay.as_secs(),
+        };
+        tracing::warn!(schema, module = r.module, format = r.format, name = r.name, by = %rec.by, reason = %rec.reason, expand_at = rec.expand_at.as_deref().unwrap_or("unknown"), "catalog contract migration runs before catalog.contract_delay_days is over, by override");
+        Ok(Ok(Some(rec)))
     }
 
     /// Records `m` in `sprig.migration.<module>` and the new state in
@@ -598,6 +855,7 @@ impl Migrator {
         module: &str,
         m: &Migration,
         state: &FormatState,
+        delay_override: Option<DelayOverride>,
     ) -> Result<()> {
         let now = self.clock.wall();
         let key = migration_key(module);
@@ -637,6 +895,7 @@ impl Migrator {
                 name: m.name.to_owned(),
                 at: rfc3339(now),
                 by: opts.applied_by.clone(),
+                delay_override,
             });
             let hist_json = serde_json::to_string(&hist)
                 .map_err(|e| SprigError::internal(format!("encoding migration history: {e}")))?;
@@ -999,6 +1258,7 @@ mod tests {
                 name: "x".to_owned(),
                 at: "2026-11-08T00:00:00.000000Z".to_owned(),
                 by: "system".to_owned(),
+                delay_override: None,
             }],
         };
         let j = serde_json::to_value(&h).unwrap();
@@ -1007,5 +1267,81 @@ mod tests {
         assert_eq!(serde_json::from_value::<ModuleHistory>(j).unwrap(), h);
         assert!(lock_name(&"x".repeat(60)).is_err());
         assert_eq!(lock_name("t42_sprig").unwrap(), "sprig_migrate.t42_sprig");
+        // Entries written before the override field read back without it.
+        let old: HistoryEntry = serde_json::from_str(
+            r#"{"format":1,"phase":"expand","name":"x","at":"2026-11-08T00:00:00.000000Z","by":"system"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.delay_override, None);
+    }
+
+    #[test]
+    fn rfc3339_times_parse_back() {
+        let t = std::time::UNIX_EPOCH + Duration::from_micros(1_794_000_123_456_789);
+        assert_eq!(parse_rfc3339(&rfc3339(t)), Some(t));
+        let whole = std::time::UNIX_EPOCH + Duration::from_secs(1_794_000_000);
+        assert_eq!(parse_rfc3339(&rfc3339(whole)), Some(whole));
+        assert_eq!(
+            parse_rfc3339("2026-11-08T00:00:00Z"),
+            parse_rfc3339("2026-11-08T00:00:00.000000Z")
+        );
+        assert!(parse_rfc3339("2026-11-08 00:00:00").is_none());
+        assert!(parse_rfc3339("yesterday").is_none());
+    }
+
+    #[test]
+    fn contracts_wait_for_the_delay_after_the_last_expand() {
+        let day = Duration::from_secs(86_400);
+        let at = std::time::UNIX_EPOCH + Duration::from_secs(1_794_000_000);
+        let week = contract_delay_of_days(7);
+        assert_eq!(week, day * 7);
+        assert_eq!(contract_due(Some(at), at, week), Err(Some(at + week)));
+        assert_eq!(
+            contract_due(Some(at), at + week - Duration::from_secs(1), week),
+            Err(Some(at + week))
+        );
+        assert_eq!(contract_due(Some(at), at + week, week), Ok(()));
+        assert_eq!(contract_due(Some(at), at, Duration::ZERO), Ok(()));
+        // No known expand time: only an override runs it.
+        assert_eq!(contract_due(None, at, Duration::ZERO), Err(None));
+        // The last expand below the contract counts, not a later one.
+        let entry = |format, phase, at: &str| HistoryEntry {
+            format,
+            phase,
+            name: "x".to_owned(),
+            at: at.to_owned(),
+            by: "system".to_owned(),
+            delay_override: None,
+        };
+        let h = ModuleHistory {
+            state: ModuleFormat::default(),
+            history: vec![
+                entry(1, Phase::Expand, "2026-11-01T00:00:00.000000Z"),
+                entry(2, Phase::Expand, "2026-11-08T00:00:00.000000Z"),
+                entry(3, Phase::Contract, "2026-11-15T00:00:00.000000Z"),
+                entry(4, Phase::Expand, "2026-11-16T00:00:00.000000Z"),
+            ],
+        };
+        assert_eq!(
+            last_expand_at(&h, 3),
+            parse_rfc3339("2026-11-08T00:00:00.000000Z")
+        );
+        assert_eq!(
+            last_expand_at(&h, 5),
+            parse_rfc3339("2026-11-16T00:00:00.000000Z")
+        );
+        assert_eq!(last_expand_at(&ModuleHistory::default(), 3), None);
+        // The default is the setting's.
+        assert_eq!(MigrateOpts::default().contract_delay, week);
+        assert_eq!(MigrateOpts::default().contract_override, None);
+    }
+
+    #[test]
+    fn an_override_needs_a_reason_and_an_operator() {
+        let e = ContractOverride::new("  ", "op:alice").unwrap_err();
+        assert_eq!(e.code(), Some(SprigCode::SettingBadValue));
+        assert!(ContractOverride::new("hotfix 7", "").is_err());
+        let o = ContractOverride::new(" hotfix 7 ", "op:alice").unwrap();
+        assert_eq!((o.reason(), o.by()), ("hotfix 7", "op:alice"));
     }
 }

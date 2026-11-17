@@ -6,6 +6,7 @@
 import type { SVGProps } from 'react';
 
 export {
+  BookOpen,
   Braces,
   ChevronDown,
   ChevronRight,
@@ -28,6 +29,8 @@ export {
   Share2,
   Shield,
   ShieldCheck,
+  Siren,
+  Sparkles,
   SquareFunction,
   SquareTerminal,
   Star,
@@ -37,6 +40,7 @@ export {
   Users,
   X,
   Zap,
+  LayoutDashboard,
 } from 'lucide-react';
 
 type IconProps = SVGProps<SVGSVGElement> & { size?: number };

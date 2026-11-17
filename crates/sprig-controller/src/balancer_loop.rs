@@ -37,6 +37,10 @@
 //! **Settings** are resolved at DC scope (and cluster scope for the
 //! per-cluster keys); each tenant's knobs also read its own catalog rows
 //! through [`crate::tenant_scopes`].
+//!
+//! **Decision retention.** Once a day the loop deletes each active tenant
+//! homed here its decision rows older than its `decisions.retention_days`
+//! (tenant or global scope), through the decision log's purge.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -99,6 +103,28 @@ pub struct BalancerLoop {
     scopes: Option<Arc<crate::tenant_scopes::TenantScopes>>,
     /// `balancer.mode = approve` holds a tenant's moves.
     pub approvals: std::sync::OnceLock<Arc<crate::approvals::ControllerApprovals>>,
+    /// When the decision log was last purged.
+    last_purge: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+/// How often the decision log is purged.
+const PURGE_EVERY: Duration = Duration::from_secs(24 * 3600);
+
+/// `decisions.retention_days` for tenant `t`: its own catalog rows over
+/// the etcd scopes.
+fn retention_days(
+    etcd: &MemSettings<'_>,
+    rows: Option<&sprig_settings::TenantSettings>,
+    dc: &DcId,
+    t: TenantId,
+) -> u32 {
+    let ctx = SettingCtx::process(dc).for_tenant(t, &[]);
+    crate::tenant_scopes::get(
+        etcd,
+        rows,
+        &sprig_balancer::settings::DECISIONS_RETENTION_DAYS,
+        &ctx,
+    )
 }
 
 impl std::fmt::Debug for BalancerLoop {
@@ -155,7 +181,57 @@ impl BalancerLoop {
             exec,
             scopes: None,
             approvals: std::sync::OnceLock::new(),
+            last_purge: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The daily retention pass: each active tenant homed here loses its
+    /// decisions older than its `decisions.retention_days`. Returns the
+    /// rows deleted.
+    async fn purge_decisions(&self) -> u64 {
+        {
+            let mut last = self
+                .last_purge
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if last.is_some_and(|t| t.elapsed() < PURGE_EVERY) {
+                return 0;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        let Some(live) = &self.live else { return 0 };
+        let tenants = match self.dir.list().await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(error = %e, "decision retention: tenant list");
+                return 0;
+            }
+        };
+        let now_us = self
+            .clock
+            .wall()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX));
+        let mut deleted = 0;
+        for e in tenants.iter().map(crate::tree::StoredEntry::body) {
+            if e.home_dc != self.dc || e.state != crate::tree::TenantState::Active {
+                continue;
+            }
+            let t = e.tenant_id;
+            let rows = match &self.scopes {
+                Some(s) => s.get(t).await,
+                None => None,
+            };
+            let days = retention_days(&live.snapshot(), rows.as_deref(), &self.dc, t);
+            match self.log.purge(t, days, now_us).await {
+                Ok(n) => deleted += n,
+                Err(e) => tracing::debug!(tenant = %t, error = %e, "decision retention"),
+            }
+        }
+        if deleted > 0 {
+            tracing::info!(deleted, "decision retention: old decisions deleted");
+        }
+        deleted
     }
 
     /// The tenants under `approve` whose planned move is
@@ -576,6 +652,21 @@ impl BalancerLoop {
         Ok(report)
     }
 
+    /// How full each cluster was in the last run, 0 to 1, with its
+    /// bottleneck dimension: `(cluster, dimension, value)`.
+    pub async fn fullness(&self) -> Vec<(String, String, f64)> {
+        let g = self.inner.lock().await;
+        g.last_report
+            .as_ref()
+            .map(|r| {
+                r.fullness
+                    .iter()
+                    .map(|(c, f)| (c.to_string(), f.bottleneck.to_string(), f.value))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The tenant's storage in the last fleet view (for the
     /// `migration.auto_size_limit_gb` guard); `None` before a run or for a
     /// tenant not homed here.
@@ -654,6 +745,76 @@ impl BalancerLoop {
                     format!("tenant {tenant} has no decision {id}"),
                 )
             })
+    }
+
+    /// `tenant`'s newest decisions of the last `days` days about
+    /// `subject`: a decision id, or words matched against the subject,
+    /// kind, reason and summary. With no match, the newest decisions and a
+    /// note saying so.
+    ///
+    /// # Errors
+    /// An unknown tenant; the catalog's; a timeout.
+    pub async fn search_decisions(
+        &self,
+        tenant: &str,
+        subject: &str,
+        days: u64,
+    ) -> Result<(Vec<DecisionRow>, Option<String>)> {
+        let t = self.tenant_id(tenant).await?;
+        if let Ok(id) = subject.trim().parse::<u64>() {
+            let one = tokio::time::timeout(CALL_TIMEOUT, self.log.get(t, id))
+                .await
+                .unwrap_or_else(|_| Err(timed_out("decision read")))?;
+            return Ok((one.into_iter().collect(), None));
+        }
+        let now_us = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_micros()),
+        )
+        .unwrap_or(i64::MAX);
+        let since = now_us - i64::try_from(days.clamp(1, 90)).unwrap_or(30) * 86_400_000_000;
+        let words: Vec<String> = subject
+            .to_lowercase()
+            .split(|c: char| c.is_whitespace() || matches!(c, ',' | '?' | '!' | '\'' | '"'))
+            .filter(|w| {
+                w.len() >= 3
+                    && !matches!(
+                        *w,
+                        "why"
+                            | "did"
+                            | "does"
+                            | "the"
+                            | "and"
+                            | "for"
+                            | "what"
+                            | "when"
+                            | "how"
+                            | "recent"
+                            | "all"
+                            | "this"
+                            | "that"
+                            | "decision"
+                            | "decisions"
+                    )
+            })
+            .map(str::to_owned)
+            .collect();
+        let hits = tokio::time::timeout(CALL_TIMEOUT, self.log.search(t, &words, since, 50))
+            .await
+            .unwrap_or_else(|_| Err(timed_out("decision search")))?;
+        if !hits.is_empty() || words.is_empty() {
+            return Ok((hits, None));
+        }
+        let recent = tokio::time::timeout(CALL_TIMEOUT, self.log.search(t, &[], since, 50))
+            .await
+            .unwrap_or_else(|_| Err(timed_out("decision search")))?;
+        Ok((
+            recent,
+            Some(format!(
+                "nothing matched {subject:?}; the newest decisions of the last {days} days follow"
+            )),
+        ))
     }
 
     async fn tenant_id(&self, name: &str) -> Result<TenantId> {
@@ -895,6 +1056,7 @@ impl Reconciler for Arc<BalancerLoop> {
         // This DC's spare capacity for least-busy
         // placement and relief moves.
         self.publish_dc_load(&cx.global).await;
+        self.purge_decisions().await;
         // Draining clusters whose shards have all moved away become
         // `drained`.
         if let Ok(l) = cx.leader() {

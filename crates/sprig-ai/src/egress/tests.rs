@@ -333,3 +333,82 @@ fn the_scrubber_leaves_english_prose_alone() {
     let out = s.text("show tables from shop");
     assert!(!out.contains("shop"), "{out}");
 }
+
+#[test]
+fn docs_reach_the_admin_roles_unscrubbed_with_secrets_masked() {
+    // SprigDB's own docs put setting names and error names in code spans
+    // and show example statements; the scrubber turned them all into
+    // `name#…` and `statement#…`, so the operator's assistant couldn't
+    // read the page it cited.
+    let docs = Arc::clone(ToolRegistry::builtin().get("search_docs").unwrap());
+    assert_eq!(docs.shares, crate::tools::Shares::Docs);
+    let text = "A statement that can't get a backend connection within \
+        `backend.acquire_timeout_ms` (2000) fails with `ER_SPRIG_BACKEND_POOL_TIMEOUT` (39031).\n\
+        SELECT * FROM sprig_docs.chunks WHERE page = 'x';\n\
+        CREATE USER 'ops'@'%' IDENTIFIED BY 'hunter2-secret';";
+    let out = ToolOutput {
+        body: ToolBody::Json(json!({"hits": [{"page": "performance/limits.md", "text": text}]})),
+        sources: Vec::new(),
+    };
+    let r = gate(Role::Admin, false).tool_result(&docs, &out);
+    assert!(
+        r.content.contains("`backend.acquire_timeout_ms`"),
+        "{}",
+        r.content
+    );
+    assert!(r.content.contains("`ER_SPRIG_BACKEND_POOL_TIMEOUT`"));
+    assert!(r.content.contains("SELECT * FROM sprig_docs.chunks"));
+    assert!(!r.content.contains("name#") && !r.content.contains("statement#"));
+    assert!(!r.content.contains("hunter2-secret"));
+    assert!(!r.reduced);
+    // What the scrubber knows is still replaced, in code spans and
+    // statements too.
+    let mut sc = Scrubber::new(&[7; 32]);
+    sc.add(NameKind::Table, "zqorders");
+    let g = EgressGate::new(
+        EgressPolicy {
+            role: Role::Admin,
+            share_data: false,
+        },
+        Some(Arc::new(sc)),
+    );
+    let out = ToolOutput {
+        body: ToolBody::Json(
+            json!({"text": "see `zqorders`: SELECT * FROM shop.zqorders WHERE id = 12345678"}),
+        ),
+        sources: Vec::new(),
+    };
+    let r = g.tool_result(&docs, &out);
+    assert!(
+        !r.content.contains("zqorders") && !r.content.contains("12345678"),
+        "{}",
+        r.content
+    );
+    assert!(r.content.contains("SELECT * FROM shop.table#"));
+    // Other tools' results are still scrubbed for the administration roles.
+    let settings = Arc::clone(ToolRegistry::builtin().get("settings").unwrap());
+    let out = ToolOutput {
+        body: ToolBody::Json(json!({"note": "see `backend.acquire_timeout_ms`"})),
+        sources: Vec::new(),
+    };
+    let r = gate(Role::Admin, false).tool_result(&settings, &out);
+    assert!(r.content.contains("name#"));
+}
+
+#[test]
+fn withheld_rows_say_what_to_offer_by_channel() {
+    let out = ToolOutput {
+        body: ToolBody::Rows(rows(2)),
+        sources: Vec::new(),
+    };
+    let chat = gate(Role::Dba, false).tool_result(&run_query(), &out);
+    let why = chat.stored["rows_withheld"].as_str().unwrap();
+    assert!(why.contains("propose_sql"), "{why}");
+    assert!(!why.contains("run_query"), "{why}");
+    let mcp = gate(Role::Data, false)
+        .with_proposals(false)
+        .tool_result(&run_query(), &out);
+    let why = mcp.stored["rows_withheld"].as_str().unwrap();
+    assert!(!why.contains("propose_sql"), "{why}");
+    assert!(why.contains("SQL client"), "{why}");
+}

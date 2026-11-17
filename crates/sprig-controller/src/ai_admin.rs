@@ -19,6 +19,7 @@
 //! than the tenant's `ai.audit_payload_days` are dropped from their
 //! notes, keeping each payload's SHA-256.
 
+use sprig_catalog::pool_wait::Bounded as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -481,7 +482,7 @@ impl Reconciler for AiPurgeLoop {
         // Only tenants that used the assistants: the check never creates
         // the module.
         let have: Option<u64> = {
-            let mut conn = ep.pool.get_conn().await.map_err(|e| {
+            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
                 SprigError::new(
                     SprigCode::CatalogUnavailable,
                     "the tenant's catalog is unreachable",

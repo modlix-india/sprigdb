@@ -1,5 +1,5 @@
 //! The entry point over a scripted runner: the statements each plan sends
-//! (chapter 32, "Testing": golden tests for writes, DDL and metadata).
+//! (golden tests for writes, DDL and metadata).
 
 use std::sync::Arc;
 
@@ -77,7 +77,7 @@ async fn plain_statements_are_not_typed() {
 
 /// Names that merely start with `sprig_` (the connector matrix's dump
 /// databases `sprig_dump_*`) are not `SPRIG_*` calls: only the real
-/// function names, in call position, are (r4fix).
+/// function names, in call position, are.
 #[tokio::test]
 async fn sprig_prefixed_names_are_not_functions() {
     let mut f = Fake::default();
@@ -133,7 +133,7 @@ async fn inserts_write_each_level() {
     let Handled::Ok(d) = h else { panic!("{h:?}") };
     assert_eq!(d.affected_rows, 2);
     assert_eq!(d.info, "Records: 2  Duplicates: 0  Warnings: 0");
-    // The plan's own transaction runs at READ COMMITTED (decision T17).
+    // The plan's own transaction runs at READ COMMITTED.
     assert_eq!(f.plan_isolation, 1);
     assert_eq!(
         f.log,
@@ -169,7 +169,7 @@ async fn inserts_write_each_level() {
     );
 }
 
-/// bugfix-54 (T17's leftover): inside a client's transaction on a session
+/// Regression: inside a client's transaction on a session
 /// with MariaDB's snapshot-isolation check on, the plan runs with the check
 /// off and turns it on again, whether the plan succeeds or fails. A 1020
 /// would roll back the client's whole transaction, savepoint included.
@@ -249,7 +249,7 @@ fn numbered(log: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// RL66: a plan inside another plan's bracket, both inside the client's
+/// Regression: a plan inside another plan's bracket, both inside the client's
 /// transaction, uses its own savepoint, so the inner `RELEASE` leaves the
 /// outer savepoint alone (it failed with 1305 when both had one name).
 #[tokio::test]
@@ -529,7 +529,7 @@ async fn drops_need_cascade_and_go_deepest_first() {
     assert_eq!(e.protocol().mysql_errno, 39707);
     let mut f = Fake::default();
     run("DROP TABLE vehicle CASCADE", &mut f).await.unwrap();
-    // The rows stay, as the root's (T8, the lead's choice of 12 November).
+    // The rows stay, as the root's.
     assert_eq!(
         f.log,
         [
@@ -594,8 +594,7 @@ async fn metadata_shows_logical_tables() {
     assert_eq!(ct.inherits[0].name, "asset");
 }
 
-// Discriminator columns (inheritance plan step 8, Kiran's answer Q2 of 12
-// November 2026): `vehicle` typed by its own `vtype` column.
+// Discriminator columns: `vehicle` typed by its own `vtype` column.
 
 mod discriminator {
     use super::*;

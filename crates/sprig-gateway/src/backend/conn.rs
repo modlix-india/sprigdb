@@ -44,6 +44,9 @@ pub struct ConnectSpec {
     pub net_write_timeout_secs: u64,
     /// `wait_timeout` for the connection, above `backend.idle_timeout_seconds`.
     pub wait_timeout_secs: u64,
+    /// Sprig 2PC's relay preamble, sent before the MySQL exchange: `addr`
+    /// is then the relay's.
+    pub preamble: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for ConnectSpec {
@@ -266,6 +269,8 @@ pub struct BackendConn {
     pub created_at: Instant,
     /// The node.
     pub node: NodeKey,
+    /// Through Sprig 2PC's relay: closed without `COM_QUIT`.
+    pub relayed: bool,
     /// The allowed variables' values right after initialization.
     pub baseline: Arc<Baseline>,
     /// `@@global.max_prepared_stmt_count` at connect.
@@ -326,6 +331,7 @@ pub async fn connect(
     cfg.compress = spec.compress;
     cfg.extra_caps = spec.mariadb_caps;
     cfg.connect_timeout = spec.connect_timeout;
+    cfg.preamble.clone_from(&spec.preamble);
     cfg.attrs
         .push(("program_name".to_owned(), "sprig-gateway".to_owned()));
     let deadline = Instant::now() + spec.connect_timeout;
@@ -372,6 +378,7 @@ pub async fn connect(
         stmt_cache: StmtCache::default(),
         created_at: Instant::now(),
         node: spec.node.clone(),
+        relayed: spec.preamble.is_some(),
         baseline: Arc::new(baseline),
         max_prepared,
         probe_cost: None,

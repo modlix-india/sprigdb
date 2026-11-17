@@ -1,6 +1,5 @@
-//! Inherited messaging objects (chapter 42, "Inherited messaging objects
-//! (`FOR EACH TENANT`)"; R9, build steps 14–19): the machinery every kind
-//! shares.
+//! Inherited messaging objects (`FOR EACH TENANT`): the machinery every
+//! kind shares.
 //!
 //! - [`model`]: definitions, overrides and instances; membership
 //!   ([`Scope::reaches`]) and override resolution ([`Chain::effective`],

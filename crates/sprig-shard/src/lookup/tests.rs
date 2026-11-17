@@ -31,6 +31,7 @@ pub(crate) fn email_lookup() -> LookupIndex {
         group: GroupId(9),
         state: LookupState::Public,
         auto_index_id: None,
+        rehashing: false,
     }
 }
 

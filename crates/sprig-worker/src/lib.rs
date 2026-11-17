@@ -9,6 +9,10 @@
 //! etcd scopes when it uses them ([`settings`]). Automatic index builds
 //! don't run here yet.
 
+// Embedded columns: the `ai_embed` jobs.
+pub mod ai_embed;
+// Retrieval indexes: the `ai_retrieval` jobs.
+pub mod ai_retrieval;
 // The asynchronous graph mirror applier and the `queue.change_exchange`
 // forwarders.
 pub mod change_exchange;
@@ -26,6 +30,7 @@ pub mod permit;
 pub mod queue_forwarder;
 // Recovery: errant_extract and node_rebuild.
 pub mod recovery;
+mod relay_pools;
 pub mod runtime;
 // The search role.
 pub mod search;
@@ -60,6 +65,8 @@ use sprig_shard::TenantMaps;
 #[allow(clippy::too_many_lines)] // one wiring sequence
 pub async fn run(ctx: RoleContext) -> Result<()> {
     let role = Role::Worker;
+    // As in a gateway: only bootstrap creates a tenant's catalog.
+    sprig_catalog::migrate::never_create_schemas();
     let cfg = &ctx.config;
     let tls = cfg.tls.as_ref().map(EtcdTls::from_files).transpose()?;
     let tiers = connect_tiers(
@@ -82,6 +89,7 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
     let sweep_registry = registry.clone();
     let ttl_registry = registry.clone();
     let ttl_dc = dc.clone();
+    let sweep_dc = dc.clone();
     let recovery_env = recovery::RecoveryEnv {
         dc: dc.clone(),
         registry: registry.clone(),
@@ -99,6 +107,25 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
     .await?
     else {
         return Ok(());
+    };
+    // The administration agent: this worker's error counts, written to
+    // the DC tier while `ai.admin.enabled` is on.
+    let _intake = {
+        let (l, node_dc) = (live.live().cloned(), cfg.node.dc.clone());
+        sprig_ai::incidents::intake::spawn(
+            dc.clone(),
+            "worker",
+            &cfg.node.id(),
+            Arc::new(move || {
+                l.as_ref().is_some_and(|l| {
+                    l.get(
+                        &sprig_ai::settings::ADMIN_ENABLED,
+                        &sprig_settings::SettingCtx::process(&node_dc),
+                    )
+                })
+            }),
+            ctx.shutdown.clone(),
+        )
     };
     let settings = live.live().map_or_else(MoverSettings::default, |l| {
         MoverSettings::resolve(
@@ -125,7 +152,13 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         // Splits, merges and shard moves cut over on the
         // table groups' maps in this DC's tier.
         .with_group_maps(dc.clone())
-        .with_drain(drain);
+        .with_drain(drain)
+        // A tenant on Sprig 2PC's relay path is fenced through the relay
+        // writer.
+        .with_relays(sprig_cluster::failover::relay_pools::TenantRelays::new(
+            dc.clone(),
+            sprig_txn::fence::wire::preamble,
+        ));
     // Each job's `mover.*` from the live settings, followed while it runs.
     if let Some(l) = live.live() {
         factory = factory.with_live_settings(l.clone(), cfg.node.dc.clone());
@@ -150,6 +183,15 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         .id
         .clone()
         .unwrap_or_else(|| format!("worker-{}", std::process::id()));
+    // The catalog formats this build reads, for the controller's
+    // contract migrations.
+    let _reader = tokio::spawn(sprig_catalog::readers::keep(
+        dc_logic.clone(),
+        Arc::new(SystemClock),
+        "worker",
+        worker.clone(),
+        ctx.shutdown.clone(),
+    ));
     let mut opts = WorkerOpts::new(&worker);
     opts.lease = settings.job_lease;
     // Mover jobs (cutovers, moves between DCs) run only while the worker
@@ -177,10 +219,13 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
     );
     // Shards get their own connection budget: a trigger holds a shard's
     // connection while it runs, and must never wait for a catalog one
-    // from the same budget.
+    // from the same budget. A run may hold one for its whole budget
+    // (`logic.job_budget_ms`, 5 minutes by default), so a wait for one ends
+    // only after 10 minutes, not the default 20 s.
     let shard_pools: Arc<dyn sprig_controller::catalogs::ClusterPools> = Arc::new(
         sprig_controller::catalogs::RegistryPools::new(registry_logic.clone(), None)
-            .budget("logic_shards", 16),
+            .budget("logic_shards", 16)
+            .wait_limit(std::time::Duration::from_secs(600)),
     );
     let registry_clusters = Arc::new(logic::RegistryClusters::new(
         registry_logic.clone(),
@@ -204,14 +249,18 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
             sprig_controller::catalogs::default_naming(),
         )),
         clusters: registry_clusters,
-        feed: shared_feed.view(sprig_feed::shared::Kept::All),
+        // Each consumer reads through a view named for it: the reader's
+        // detach and catch-up logs and metrics say whose.
+        feed: shared_feed
+            .view(sprig_feed::shared::Kept::All)
+            .named("trigger"),
         opts: live.run_opts(),
         settings: live.clone(),
         // Set below, once the gateways are known.
         gateways: None,
     };
     // The copy worker: one job per tenant tree, through the shared
-    // reader (R9, r9feed3).
+    // reader.
     let inherit_env = Arc::new(
         inherit::LiveEnv::new(
             dc_logic.clone(),
@@ -220,15 +269,20 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
             Arc::clone(&env.pools),
             Arc::clone(&env.clusters),
         )?
-        .with_feed(Arc::clone(&env.feed)),
+        .with_feed(
+            shared_feed
+                .view(sprig_feed::shared::Kept::All)
+                .named("copy_worker"),
+        ),
     );
     // The graph mirror applier: one job per tenant, through the shared
-    // reader's view of the edge tables (R9, r9feed3).
+    // reader's view of the edge tables.
     let graph_mirror_env = graph_mirror::GraphMirrorEnv {
         dc: dc_logic.clone(),
         pools: Arc::clone(&env.pools),
         locator: Arc::clone(&env.locator),
         clusters: graph_mirror::shared_view(&shared_feed),
+        maps: sprig_shard::ShardMapCache::spawn(dc_logic.clone())?,
     };
     // Stream sequencers, on the logic jobs' pools and the
     // shared reader.
@@ -279,7 +333,9 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
             dc: dc_logic.clone(),
             registry: registry_search,
             // Search copies read through the shared reader.
-            clusters: Arc::clone(&env.feed),
+            clusters: shared_feed
+                .view(sprig_feed::shared::Kept::All)
+                .named("search"),
             locator: Arc::clone(&env.locator),
             gateways: Arc::clone(&msg_env.gateways),
             tls: cfg
@@ -315,9 +371,41 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
                 Arc::clone(&msg_env.gateways) as Arc<dyn sprig_sinks::peer::SinkPeer>,
                 Arc::clone(&global),
             )),
+            feed: shared_feed
+                .view(sprig_feed::shared::Kept::All)
+                .named("change_exchange"),
             ..env.clone()
         })))
-        .with_handler(Arc::new(logic::LogicSchedule(env)))
+        // Embedded columns: one job per column, through the shared
+        // reader.
+        .with_handler(Arc::new(ai_embed::AiEmbed(ai_embed::EmbedEnv {
+            logic: logic::LogicEnv {
+                feed: shared_feed
+                    .view(sprig_feed::shared::Kept::All)
+                    .named("ai_embed"),
+                ..env.clone()
+            },
+            maps: graph_mirror_env.maps.clone(),
+        })))
+        // Retrieval indexes: one job per index, the same machinery.
+        .with_handler(Arc::new(ai_retrieval::AiRetrieval(ai_embed::EmbedEnv {
+            logic: logic::LogicEnv {
+                feed: shared_feed
+                    .view(sprig_feed::shared::Kept::All)
+                    .named("ai_retrieval"),
+                ..env.clone()
+            },
+            maps: graph_mirror_env.maps.clone(),
+        })))
+        // Scheduled runs read definers' tenant subtrees from the global
+        // tier.
+        .with_handler(Arc::new(logic::LogicSchedule(logic::LogicEnv {
+            gateways: Some((
+                Arc::clone(&msg_env.gateways) as Arc<dyn sprig_sinks::peer::SinkPeer>,
+                Arc::clone(&global),
+            )),
+            ..env
+        })))
         .with_handler(Arc::new(inherit::InheritCopy(inherit_env)))
         .with_handler(Arc::new(graph_mirror::GraphMirror(graph_mirror_env)))
         .with_handler(Arc::new(streams::StreamSequencer(streams_env)))
@@ -331,6 +419,7 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
                     .budget("kv_sweep", 2),
             ),
             settings: Some(live.clone()),
+            dc: Some(sweep_dc),
         }))
         .with_handler(Arc::new(doc_ttl::DocTtl(doc_ttl::DocTtlEnv {
             dc: ttl_dc,

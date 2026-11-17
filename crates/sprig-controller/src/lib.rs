@@ -56,6 +56,7 @@ pub mod autoindex_admin;
 pub mod autoindex_doc;
 pub mod autoindex_env;
 pub mod autoindex_loop;
+pub mod autoindex_stats;
 pub mod autoindex_validate;
 pub mod autoindex_workload;
 // The BackupMissed alert's gauge, from the backup tools' records.
@@ -63,6 +64,7 @@ pub mod backups;
 pub mod balancer_loop;
 pub mod catalog_reconciler;
 pub mod catalogs;
+pub mod contracts;
 pub mod dc;
 // Automatic moves between DCs.
 pub mod dc_migrate;
@@ -96,6 +98,8 @@ pub mod streams_loop;
 pub mod graph_mirror_loop;
 // `queue.change_exchange` forwarders.
 pub mod change_exchange_loop;
+// Embedded columns' embedding jobs.
+pub mod ai_embed_loop;
 // Search copies on workers.
 pub mod search_loop;
 // The feed-driven queue outbox forwarder jobs.
@@ -117,6 +121,9 @@ pub mod workload_rollup;
 pub mod write_load;
 // AI providers in the Admin API and the payload purge.
 pub mod ai_admin;
+pub mod ai_digest;
+pub mod ai_health;
+pub mod ai_incidents;
 pub mod ai_system;
 
 use std::sync::Arc;
@@ -235,12 +242,24 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         Arc::clone(&clock),
     ));
     // Tenant catalogs: found through their shard maps, changed with
-    // versions allocated in the directory.
+    // versions allocated in the directory. An ancestor homed in another
+    // DC is followed to its home's map and cluster: through the one etcd,
+    // or in two tiers through that DC's controllers (the relay).
+    let homes: Arc<dyn MetaStore> = if two_tier(&cfg.meta) {
+        Arc::new(sprig_meta::relay::RoutedStore::new(
+            Arc::clone(&stores.dc),
+            Arc::clone(&stores.global),
+        ))
+    } else {
+        Arc::clone(&stores.dc)
+    };
+    let catalog_registry = ClusterRegistry::new(Arc::clone(&stores.global), Arc::clone(&homes))?;
     let pools: Arc<dyn ClusterPools> = Arc::new(RegistryPools::new(
-        registry.clone(),
+        catalog_registry.clone(),
         Some(Arc::clone(&monitor)),
     ));
-    let locator = ShardMapLocator::new(Arc::clone(&stores.dc), pools, default_naming());
+    let locator = ShardMapLocator::new(Arc::clone(&homes), pools, default_naming())
+        .with_directory(Arc::clone(&stores.global));
     let versioner = Versioner::new(
         MariaBackend::new(Arc::new(locator.clone())).with_clock(Arc::clone(&clock)),
         Arc::new(DirectoryAllocator::new(Arc::clone(&stores.global))),
@@ -255,9 +274,12 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             Some(settings.live.clone()),
             Arc::clone(&clock),
         )
-        .with_group_maps(Arc::new(sprig_shard::ShardMapStore::new(Arc::clone(
-            &stores.dc,
-        ))))
+        // Shard maps, and the tables of table groups, which the default
+        // shard doesn't hold.
+        .with_group_maps(Arc::new(catalog_reconciler::CatalogGroupMaps::new(
+            sprig_shard::ShardMapStore::new(Arc::clone(&stores.dc)),
+            Arc::new(locator.clone()),
+        )))
         // A crashed gateway's DDL job goes within about a minute.
         .with_owners(Arc::new(sprig_catalog::ddl::ProcessOwners::new(
             Arc::clone(&stores.dc),
@@ -280,13 +302,14 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
     // so they can never starve the short calls of every other loop
     // (see the `catalogs` module docs).
     let ai_sessions = ShardMapLocator::new(
-        Arc::clone(&stores.dc),
+        Arc::clone(&homes),
         Arc::new(
-            RegistryPools::new(registry.clone(), Some(Arc::clone(&monitor)))
+            RegistryPools::new(catalog_registry.clone(), Some(Arc::clone(&monitor)))
                 .budget("autoindex", autoindex_loop::SESSIONS),
         ),
         default_naming(),
-    );
+    )
+    .with_directory(Arc::clone(&stores.global));
     let indexes = Arc::new(
         autoindex_admin::AutoIndexService::new(
             Directory::new(Arc::clone(&stores.global)),
@@ -360,16 +383,24 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
     );
     let marker: Arc<dyn sprig_advisor::autoindex::validate::NodeMarker> =
         Arc::new(autoindex_validate::LogMarker);
+    // Validations' statistics snapshots, kept in the DC tier until they
+    // are back on their node.
+    let ai_stats: Arc<dyn sprig_advisor::autoindex::validate::journal::StatsJournal> = Arc::new(
+        autoindex_stats::EtcdStatsJournal::new(Arc::clone(&stores.dc)),
+    );
     let auto_index = autoindex_loop::AutoIndexLoop::new(
         ai_env,
         autoindex_loop::AutoIndexHooks {
             candidates: Arc::new(ai_eval),
-            validation: Arc::new(autoindex_validate::SampleValidation::new(
-                Arc::clone(&catalog_locator),
-                registry,
-                keyring.clone(),
-                Arc::clone(&marker),
-            )),
+            validation: Arc::new(
+                autoindex_validate::SampleValidation::new(
+                    Arc::clone(&catalog_locator),
+                    registry,
+                    keyring.clone(),
+                    Arc::clone(&marker),
+                )
+                .with_stats_journal(Arc::clone(&ai_stats)),
+            ),
             workload: Arc::new(autoindex_workload::ObserveSource::new(
                 workload_store,
                 catalog_locator,
@@ -381,6 +412,7 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             marker,
             decisions: Arc::new(sprig_advisor::autoindex::store::LogDecisions),
             docs: Some(Arc::new(autoindex_doc::DocRegistry::new(versioner.clone()))),
+            stats: Some(ai_stats),
         },
         Directory::new(Arc::clone(&stores.global)),
         dc.clone(),
@@ -503,6 +535,9 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         dc.clone(),
         read_secret(cfg.controller.approvals_webhook_secret_file.as_deref())?,
     )));
+    // Tenants with no approvals item: the loop skips them until one
+    // changes (this hook) or a recheck is due.
+    let idle_approvals = Arc::new(approvals::IdleTenants::default());
     let approvals = {
         let stores_ = sprig_approvals::LocatorStores::new(Arc::new(locator.clone()))
             .with_dc(dc.clone(), Arc::clone(&stores.dc))
@@ -514,7 +549,8 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
                 )),
                 dc.clone(),
             )))
-            .with_hook(Arc::clone(&notifier) as Arc<dyn sprig_approvals::Hook>);
+            .with_hook(Arc::clone(&notifier) as Arc<dyn sprig_approvals::Hook>)
+            .with_hook(Arc::clone(&idle_approvals) as Arc<dyn sprig_approvals::Hook>);
         let a = Arc::new(
             approvals::ControllerApprovals::new(
                 Arc::new(hub),
@@ -533,6 +569,20 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             Arc::new(approvals::DcMoveProgress::new(Directory::new(Arc::clone(
                 &stores.global,
             )))),
+        );
+        // The administration agent's advice: approving it acknowledges it.
+        a.register(
+            sprig_approvals::Kind::AiIncidentAdvice,
+            Arc::new(ai_incidents::Acknowledge),
+        );
+        a.register(
+            sprig_approvals::Kind::AiHealthWarning,
+            Arc::new(ai_incidents::Acknowledge),
+        );
+        // A tenant assistant's advice: approving it acknowledges it too.
+        a.register(
+            sprig_approvals::Kind::AiDbaAdvice,
+            Arc::new(ai_incidents::Acknowledge),
         );
         a
     };
@@ -573,8 +623,77 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         )
         .with_tenant_scopes(Arc::clone(&tenant_scopes)),
     );
+    // The administration agent: this process's error counts, and the
+    // DC leader's intake of every process's.
+    let _intake = {
+        let (live, dc) = (settings.live.clone(), dc.clone());
+        sprig_ai::incidents::intake::spawn(
+            Arc::clone(&stores.dc),
+            "controller",
+            &cfg.node.id(),
+            Arc::new(move || {
+                live.get(
+                    &sprig_ai::settings::ADMIN_ENABLED,
+                    &sprig_settings::SettingCtx::process(&dc),
+                )
+            }),
+            ctx.shutdown.clone(),
+        )
+    };
+    let incident_env: Arc<dyn ai_incidents::IncidentEnv> =
+        Arc::new(ai_incidents::ControllerEnv::new(
+            dc.clone(),
+            Arc::clone(&stores.dc),
+            Arc::clone(&stores.global),
+            cfg.controller.workload_key_file.as_deref(),
+            RegistryPools::new(
+                ClusterRegistry::new(Arc::clone(&stores.global), Arc::clone(&stores.dc))?,
+                Some(Arc::clone(&monitor)),
+            )
+            .budget("ai_incidents", 1),
+            Some((settings.live.clone(), dc.clone())),
+        )?);
+    // The administration agent's metric history, health checks,
+    // write-ups and upgrade checks.
+    let ai_health = Arc::new(ai_health::HealthLoop::new(
+        dc.clone(),
+        &stores.dc,
+        ai_incidents::Knobs::Live(settings.live.clone(), dc.clone()),
+        Arc::clone(approvals.hub()),
+        Arc::clone(&incident_env),
+        Arc::new(ai_health::ControllerHealth::new(ai_health::HealthSources {
+            dc: dc.clone(),
+            dc_store: Arc::clone(&stores.dc),
+            global: Arc::clone(&stores.global),
+            registry: ClusterRegistry::new(Arc::clone(&stores.global), Arc::clone(&stores.dc))?,
+            monitor: Arc::clone(&monitor),
+            balancer: Arc::clone(&balancer),
+            sizes: sharding.sharding().ai_sizes.clone(),
+            live: Some((settings.live.clone(), dc.clone())),
+            locator: Arc::new(locator.clone()),
+            pools: RegistryPools::new(
+                ClusterRegistry::new(Arc::clone(&stores.global), Arc::clone(&stores.dc))?,
+                Some(Arc::clone(&monitor)),
+            )
+            .budget("ai_health", 1),
+            clock: Arc::clone(&clock),
+        })),
+    ));
+    // Contract migrations, once every registered reader reads the new
+    // format and catalog.contract_delay_days has passed (or an override).
+    // Other DCs' readers are read through `homes` (the relay in two tiers).
+    let contracts = Arc::new(contracts::ContractPass::new(
+        Directory::new(Arc::clone(&stores.global)),
+        Arc::new(locator.clone()),
+        Arc::clone(&stores.global),
+        Arc::clone(&homes),
+        dc.clone(),
+        Some(settings.live.clone()),
+        Arc::clone(&clock),
+    ));
     let rt = Runtime::new(stores.clone(), Arc::clone(&clock), me)
         .with_settings(settings.control.clone())
+        .with_loop(Loop::new(contracts::ContractLoop(Arc::clone(&contracts))))
         .with_loop(Loop::new(dispatch::Dispatch))
         .with_loop(Loop::new(dispatch::JobGc))
         .with_loop(Loop::new(RegistryLoop::new(Arc::clone(&monitor))))
@@ -605,6 +724,7 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         .with_loop(Loop::new(streams_loop::StreamsLoop))
         .with_loop(Loop::new(graph_mirror_loop::GraphMirrorLoop))
         .with_loop(Loop::new(change_exchange_loop::ChangeExchangeLoop))
+        .with_loop(Loop::new(ai_embed_loop::AiEmbedLoop))
         .with_loop(Loop::new(search_loop::SearchPlacementLoop))
         .with_loop(Loop::new(queue_forwarder_loop::QueueForwarderLoop))
         .with_loop(Loop::new(kv_sweep_loop::KvSweepLoop::new(Some((
@@ -639,9 +759,35 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             )),
             Some((settings.live.clone(), dc.clone())),
         )))
+        // The administration agent's health checks and write-ups.
+        .with_loop(Loop::from_arc(Arc::clone(&ai_health)))
+        // Tenant digests (ai.digest), from statistics only.
+        .with_loop(Loop::new(ai_digest::DigestLoop::new(
+            Directory::new(Arc::clone(&stores.global)),
+            Arc::new(locator.clone()),
+            dc.clone(),
+            Some(settings.live.clone()),
+            Arc::clone(&incident_env),
+            RegistryPools::new(
+                ClusterRegistry::new(Arc::clone(&stores.global), Arc::clone(&stores.dc))?,
+                Some(Arc::clone(&monitor)),
+            )
+            .budget("ai_digest", 1),
+            Some(Arc::clone(&notifier)),
+        )))
+        // The administration agent's incident intake: triage and advice.
+        .with_loop(Loop::new(ai_incidents::IncidentLoop::new(
+            dc.clone(),
+            Arc::clone(&stores.dc),
+            ai_incidents::Knobs::Live(settings.live.clone(), dc.clone()),
+            Arc::clone(approvals.hub()),
+            Arc::clone(&incident_env),
+        )))
         // Approvals: escalation, auto-apply, appliers, expiry, gauges.
         .with_loop(Loop::new(
-            approvals::ApprovalsLoop::new(Arc::clone(&approvals)).with_notifier(Arc::clone(&notifier)),
+            approvals::ApprovalsLoop::new(Arc::clone(&approvals))
+                .with_notifier(Arc::clone(&notifier))
+                .with_idle(Arc::clone(&idle_approvals)),
         ))
         // The same for DC failover items in the global tier.
         .with_loop(Loop::new(approvals::GlobalApprovalsLoop::new(Arc::clone(&approvals))))
@@ -784,7 +930,8 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             .with_sharding(sharding.sharding())
             .with_failover(Arc::clone(&failover))
             .with_residency(residency)
-            .with_search_catalog(versioner.clone()),
+            .with_search_catalog(versioner.clone())
+            .with_contracts(contracts),
     );
     // The `Recommendations` service beside the Admin API.
     let dc_token = cfg
@@ -817,11 +964,23 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             .merge(recs)
             .merge(operators::http::router(operators))
             .merge(ai_admin::router(ai_admin))
+            .merge(ai_incidents::router(Arc::new(
+                ai_incidents::IncidentsApi::new(Arc::clone(&reg_store), incident_env),
+            )))
+            .merge(ai_health::router(ai_health))
             .layer(axum::middleware::from_fn_with_state(
                 guard,
                 operators::guard::layer,
             )),
         admin_tls,
+        ctx.shutdown.clone(),
+    ));
+    // The catalog formats this process reads, for the contract pass.
+    let _reader = tokio::spawn(sprig_catalog::readers::keep(
+        Arc::clone(&reg_store),
+        Arc::clone(&clock),
+        "controller",
+        cfg.node.id(),
         ctx.shutdown.clone(),
     ));
     // Gateways find the leader's Admin API here.
@@ -957,6 +1116,20 @@ async fn prepare_deployment(
             () = tokio::time::sleep(BOOTSTRAP_WAIT) => {}
         }
     }
+}
+
+/// Whether `[meta]` names a global tier apart from the DC's (two tiers:
+/// other DCs' tiers are read through their controllers' relay).
+fn two_tier(meta: &sprig_common::config::MetaConfig) -> bool {
+    let norm = |v: &[String]| {
+        let mut v: Vec<String> = v
+            .iter()
+            .map(|s| s.trim_end_matches('/').to_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    !meta.global_seeds.is_empty() && norm(&meta.global_seeds) != norm(&meta.dc_seeds)
 }
 
 #[cfg(test)]

@@ -102,7 +102,11 @@ async fn stores() -> (Arc<dyn MetaStore>, Arc<dyn MetaStore>) {
             let cfg = EtcdConfig::new(vec![url]);
             (
                 Arc::new(EtcdStore::connect(unique_tier(), &cfg).await.unwrap()),
-                Arc::new(EtcdStore::connect(unique_tier(), &cfg).await.unwrap()),
+                // The global tier has one fixed root (`/sprig/g/`) on any
+                // etcd, and DC records, the tenant directory and least-busy
+                // placement require it; a shared etcd's global tier mustn't
+                // be written or wiped by a test, so it stays in memory.
+                Arc::new(MemStore::new(Tier::Global)),
             )
         }
         _ => (
@@ -742,8 +746,11 @@ async fn live_bootstrap_tree_settings_and_delete() {
         // c's catalog lists a live database: cleanup waits.
         assert_eq!(e.unwrap().state, "deleting");
         assert!(env.service.directory().get(idc).await.unwrap().is_some());
-        let e = env.service.cleanup(idc, &[]).await.unwrap_err();
-        assert_eq!(code(&e), 39072);
+        // (No dropper is set here, so the database stays.)
+        assert_eq!(
+            env.service.cleanup(idc, &[]).await.unwrap(),
+            Cleanup::WaitingForDatabases(1)
+        );
         let mut conn = pool.get_conn().await.unwrap();
         conn.query_drop(format!(
             "UPDATE `{}`.`databases` SET state = 'dropped'",
@@ -979,6 +986,137 @@ async fn live_tenant_ids_stay_in_the_deployments_range() {
             }
             let _ = conn.disconnect().await;
             drop(live);
+        }
+    })
+    .await;
+}
+
+/// A create that half happened, then its retry (a regression: it failed
+/// with 39072 "its mark is ''" for a fresh id):
+///
+/// 1. The first try's bootstrap stopped after the catalog and its
+///    migrations (a client timeout, a crash): the same request again
+///    finishes the tenant with its id, while the `tenant_bootstrap` loop
+///    bootstraps it at the same moment.
+/// 2. Another bootstrap's `CREATE DATABASE` caught in the middle: the
+///    schema is there and its comment isn't yet (MariaDB writes it just
+///    after making the schema; simulated here for 150 ms). The retry
+///    adopts it once the mark shows, instead of refusing the tenant's own
+///    catalog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_a_half_done_create_and_its_retry() {
+    let Some(url) = std::env::var(MARIADB_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    else {
+        eprintln!("skipped live_a_half_done_create_and_its_retry: set {MARIADB_ENV} to run it");
+        return;
+    };
+    let pools = StaticPools::new().with_url(cid("lt-c1"), &url).unwrap();
+    with_env(pools, Some(&url), |env| {
+        let url = url.clone();
+        async move {
+            let opts = mysql_async::Opts::from_url(&url).unwrap();
+            let mut conn = mysql_async::Conn::new(opts.clone()).await.unwrap();
+            let entry = |n: &'static str| {
+                let env = Arc::clone(&env);
+                async move {
+                    env.service
+                        .directory()
+                        .create(
+                            &NewTenant {
+                                name: env.name(n),
+                                parent: None,
+                                home_dc: env.service.dc().clone(),
+                                placement_hint: None,
+                            },
+                            4,
+                            SystemTime::now(),
+                        )
+                        .await
+                        .unwrap()
+                }
+            };
+
+            // 1. The first try made the entry, claimed the catalog and ran
+            //    the migrations, then stopped.
+            let a = entry("a").await;
+            let id = a.body().tenant_id;
+            let schema = env.locator.schema(id);
+            let mark = owner_mark(a.body());
+            let pool = mysql_async::Pool::new(opts.clone());
+            assert_eq!(
+                claim_catalog(&pool, &schema, &mark).await.unwrap(),
+                CatalogClaim::Created
+            );
+            create_catalog(
+                &pool,
+                &schema,
+                &env.service.migrator,
+                &MigrateOpts::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                env.service
+                    .directory()
+                    .get(id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .body()
+                    .state,
+                TenantState::Creating
+            );
+            // The retry, with the loop's runs alongside.
+            let retry = env.create("a", None, None);
+            let loops = futures::future::join_all((0..3).map(|_| env.service.bootstrap(id, &[])));
+            let (retry, loops) = tokio::join!(retry, loops);
+            let retry = retry.unwrap();
+            assert!(!retry.created, "the same tenant, not a new one");
+            assert_eq!(retry.tenant.tenant_id, id);
+            assert_eq!(retry.tenant.state, "active");
+            for r in loops {
+                assert_eq!(r.unwrap().entry.tenant_id, id);
+            }
+            assert_eq!(mark_of(&mut conn, schema.clone()).await, Some(mark));
+            assert!(
+                env.service.bootstrapping.lock().unwrap().is_empty(),
+                "no turn left behind"
+            );
+
+            // 2. A schema whose comment comes 150 ms after it.
+            let b = entry("b").await;
+            let id_b = b.body().tenant_id;
+            let schema_b = env.locator.schema(id_b);
+            let mark_b = owner_mark(b.body());
+            conn.query_drop(format!(
+                "CREATE DATABASE `{schema_b}` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"
+            ))
+            .await
+            .unwrap();
+            let late = {
+                let (opts, schema_b, mark_b) = (opts.clone(), schema_b.clone(), mark_b.clone());
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    let mut c = mysql_async::Conn::new(opts).await.unwrap();
+                    c.query_drop(format!("ALTER DATABASE `{schema_b}` COMMENT '{mark_b}'"))
+                        .await
+                        .unwrap();
+                    let _ = c.disconnect().await;
+                })
+            };
+            let got = env.create("b", None, None).await.unwrap();
+            late.await.unwrap();
+            assert_eq!(got.tenant.tenant_id, id_b);
+            assert_eq!(got.tenant.state, "active");
+            assert_eq!(mark_of(&mut conn, schema_b).await, Some(mark_b));
+
+            for n in ["a", "b"] {
+                env.service.delete(&env.name(n), &[]).await.unwrap();
+            }
+            pool.disconnect().await.unwrap();
+            let _ = conn.disconnect().await;
         }
     })
     .await;

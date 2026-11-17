@@ -12,6 +12,8 @@ import { SECTIONS, resolve } from './sections';
 import { useWorkspace } from './store';
 import { DOC_ICON } from './WorkspaceTabs';
 import type { MessageId } from '../i18n/en';
+import { ask, useAssistant, useRoles } from '../ai/store';
+import { BookOpen, Sparkles } from '../icons';
 
 interface Item {
   id: string;
@@ -59,6 +61,9 @@ function PaletteBody({ onClose }: { onClose: () => void }) {
   const me = useSession((s) => s.me);
   const dbs = useDatabases();
   const docs = useWorkspace((s) => s.docs);
+  const aiRoles = useRoles();
+  const aiRoleKey = aiRoles.join(',');
+  const aiRole = useAssistant((s) => s.role);
   const [q, setQ] = useState('');
   const [sel, setSel] = useState(0);
   const input = useRef<HTMLInputElement>(null);
@@ -122,8 +127,34 @@ function PaletteBody({ onClose }: { onClose: () => void }) {
       .map((it) => ({ it, s: Math.max(score(q, it.label) ?? -1, (score(q, it.hint) ?? -1) - 400) }))
       .filter((x) => x.s >= 0);
     scored.sort((a, b) => b.s - a.s);
-    return scored.slice(0, 50).map((x) => x.it);
-  }, [items, q]);
+    const out = scored.slice(0, 50).map((x) => x.it);
+    // A question for the assistant, or words to look up in the docs.
+    const text = q.replace(/^\?/, '').trim();
+    if (text) {
+      const extra: Item[] = [];
+      if (aiRoles.length) {
+        const role = aiRoles.includes(aiRole) ? aiRole : aiRoles[0]!;
+        extra.push({
+          id: 'ai:ask',
+          label: `Ask the assistant: ${text}`,
+          hint: t('palette.kind.command'),
+          icon: Sparkles,
+          run: () => ask({ role, text }),
+        });
+      }
+      extra.push({
+        id: 'ai:docs',
+        label: `Search docs: ${text}`,
+        hint: t('palette.kind.command'),
+        icon: BookOpen,
+        run: () => void navigate(`${base}/docs?q=${encodeURIComponent(text)}`),
+      });
+      // `?question` puts the assistant first.
+      return q.startsWith('?') ? [...extra, ...out] : [...out, ...extra];
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [items, q, aiRoleKey, aiRole, base]);
 
   const pick = (it: Item | undefined) => {
     if (!it) return;

@@ -38,6 +38,7 @@ use mysql_async::prelude::Queryable;
 use serde_json::{Value, json};
 use sprig_catalog::CatalogLocator;
 use sprig_catalog::ddl::{database_key, shard_schemas};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::version::VersionKind;
 use sprig_common::ids::TenantId;
 use sprig_common::names::quote;
@@ -230,7 +231,7 @@ pub async fn ensure_vhost(
     // catalog load that starts before a module's tables exist fails with 1412
     // when it reads them (seen when they ran together).
     {
-        let mut c = ep.pool.get_conn().await.map_err(cat_err)?;
+        let mut c = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
         sprig_catalog::Migrator::new(&[
             sprig_inherit::msg::store::MSG_MODULE,
             sprig_queues::catalog::MQ_MODULE,
@@ -238,7 +239,7 @@ pub async fn ensure_vhost(
         .run(
             &mut c,
             ep.store.schema(),
-            &sprig_catalog::migrate::MigrateOpts::default(),
+            &sprig_catalog::migrate::MigrateOpts::existing(),
         )
         .await?;
     }
@@ -256,7 +257,7 @@ pub async fn ensure_vhost(
         .iter()
         .any(|d| d.kind == DefKind::Queue)
         .then(|| tokio::spawn(warm_store(Arc::clone(svc), t, Arc::clone(&row))));
-    let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
     let mstore = MsgStore::new(ep.store.schema());
     let st = super::state_of(&cat);
     let mq = cat
@@ -485,6 +486,8 @@ pub async fn ensure_vhost(
             .await?;
         tracing::info!(tenant = %t, db = %db_name, changes = all.len(), arguments = arg_updates.len(), ms = started.elapsed().as_millis(), prepared_ms, "inherited exchanges, queues and bindings applied");
     }
+    // A trigger another deploy is still making: the next use looks again.
+    let mut settled = true;
     for (d, id) in &instances {
         super::put_index(
             svc,
@@ -499,7 +502,9 @@ pub async fn ensure_vhost(
         )
         .await?;
         if d.kind == DefKind::Queue {
-            super::triggers::ensure_for_queue(svc, chain, d, (row.db_id.0, &row.name), *id).await?;
+            settled &=
+                super::triggers::ensure_for_queue(svc, chain, d, (row.db_id.0, &row.name), *id)
+                    .await?;
             // Its FOR EACH TENANT sinks, as for streams.
             super::sinks::ensure_for_queue(svc, chain, d, t).await;
         }
@@ -507,15 +512,65 @@ pub async fn ensure_vhost(
     if let Some(h) = store_warm {
         let _ = h.await;
     }
-    applied_map()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert((t, db_key(db)), sig);
+    if settled {
+        applied_map()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((t, db_key(db)), sig);
+    }
     // inherit.broadcast_replay, for instances made just now.
     for d in fresh {
         tokio::spawn(super::broadcast::replay(Arc::clone(svc), d, t));
     }
     Ok(true)
+}
+
+/// Re-applies database `db`'s inherited exchanges, queues and bindings in
+/// every member of `declarer`'s definitions that this DC indexes with
+/// instances there, in the background (a new definition, an override);
+/// with `unbind`, only removes that binding in each. The number of
+/// members.
+///
+/// # Errors
+/// The declarer's catalog's and the store's.
+pub async fn rollout_here(
+    svc: &Arc<TenantServices>,
+    declarer: TenantId,
+    db: &str,
+    unbind: Option<BindingSpec>,
+) -> Result<usize> {
+    let mut members: BTreeSet<TenantId> = BTreeSet::new();
+    let dcat = catalog(svc, declarer).await?;
+    let dchain = super::chain(svc, &dcat).await?;
+    for d in declared_in(&dchain, db) {
+        for e in super::instances_of(svc, d.key()).await? {
+            members.insert(e.tenant);
+        }
+    }
+    let n = members.len();
+    let svc = Arc::clone(svc);
+    let db = db.to_owned();
+    tokio::spawn(async move {
+        for t in members {
+            forget_applied(t, Some(&db));
+            let r = async {
+                if let Some(b) = &unbind {
+                    // Only the binding goes; the vhost's other instances are
+                    // applied at its next use (a drop is often followed by
+                    // more drops).
+                    return remove_binding(&svc, t, &db, b).await.map(|()| true);
+                }
+                let cat = catalog(&svc, t).await?;
+                let chain = super::chain(&svc, &cat).await?;
+                Box::pin(ensure_vhost(&svc, &chain, &db, Cause::Declare)).await
+            }
+            .await;
+            if let Err(e) = r {
+                tracing::warn!(tenant = %t, %db, error = %e, "inherited exchanges and queues not updated; the next use retries");
+            }
+        }
+    });
+    Ok(n)
 }
 
 /// Makes the queue store's tables in the shard schema of database `row`
@@ -590,7 +645,7 @@ pub async fn remove(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) ->
         }
     }
     let ep = svc.locator.writer(t).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
     MsgStore::new(ep.store.schema())
         .delete_instance(&mut conn, def.key())
         .await?;
@@ -943,7 +998,7 @@ pub async fn deliver_outbox(
     let cluster = svc.locator.cluster(t).await?;
     let pool = svc.locator.ctl_pool(&cluster).await?;
     let mut c = pool
-        .get_conn()
+        .get_conn_bounded()
         .await
         .map_err(sprig_streams::maria::map_err)?;
     c.query_drop(format!(

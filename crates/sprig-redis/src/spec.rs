@@ -319,6 +319,33 @@ pub const ALL: &[Spec] = specs! {
     "xautoclaim" -6 "wx" 1 1 1;
     "xinfo" -2 "rx" 0 0 0;
     "xsetid" -3 "wx" 1 1 1;
+    // RediSearch, on SprigDB's search indexes (crate::search).
+    "ft.create" -5 "ws" 0 0 0;
+    "ft.alter" -6 "ws" 0 0 0;
+    "ft.dropindex" -2 "ws" 0 0 0;
+    "ft.search" -3 "rs" 0 0 0;
+    "ft.aggregate" -3 "rs" 0 0 0;
+    "ft.info" 2 "rs" 0 0 0;
+    "ft._list" 1 "rs" 0 0 0;
+    "ft.explain" -3 "rs" 0 0 0;
+    "ft.explaincli" -3 "rs" 0 0 0;
+    "ft.tagvals" 3 "rs" 0 0 0;
+    "ft.profile" -5 "rsx" 0 0 0;
+    "ft.cursor" -3 "rsx" 0 0 0;
+    "ft.aliasadd" 3 "wsx" 0 0 0;
+    "ft.aliasupdate" 3 "wsx" 0 0 0;
+    "ft.aliasdel" 2 "wsx" 0 0 0;
+    "ft.spellcheck" -3 "rsx" 0 0 0;
+    "ft.dictadd" -3 "wsx" 0 0 0;
+    "ft.dictdel" -3 "wsx" 0 0 0;
+    "ft.dictdump" 2 "rsx" 0 0 0;
+    "ft.synupdate" -4 "wsx" 0 0 0;
+    "ft.syndump" 2 "rsx" 0 0 0;
+    "ft.sugadd" -4 "wsx" 0 0 0;
+    "ft.sugget" -3 "rsx" 0 0 0;
+    "ft.sugdel" 3 "wsx" 0 0 0;
+    "ft.suglen" 2 "rsx" 0 0 0;
+    "ft.config" -2 "rsx" 0 0 0;
 };
 
 /// The spec of a lower-case name.

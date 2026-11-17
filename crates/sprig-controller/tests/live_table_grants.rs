@@ -80,7 +80,7 @@ fn env() -> Option<Env> {
         move_to: std::env::var("SPRIG_TEST_TABLE_GRANTS_MOVE_TO")
             .unwrap_or_else(|_| "dc-a-c2".to_owned()),
         // The clusters' writers: no default, so a private deployment's
-        // run never reaches the shared dev nodes (R9 r9feed4).
+        // run never reaches the shared dev nodes.
         nodes: std::env::var("SPRIG_TEST_TABLE_GRANTS_NODES")
             .ok()?
             .split(',')

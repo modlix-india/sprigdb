@@ -77,6 +77,7 @@ fn lookup_def() -> LookupIndex {
         group: GroupId(9),
         state: LookupState::Building,
         auto_index_id: None,
+        rehashing: false,
     }
 }
 

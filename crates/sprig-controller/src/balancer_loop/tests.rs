@@ -159,3 +159,32 @@ async fn live_run_builds_the_view_and_explains() {
             .unwrap();
     }
 }
+
+#[test]
+fn decision_retention_reads_the_tenants_own_days() {
+    use sprig_settings::{Entry, Level, Registry, TenantScope, TenantSettings, Value};
+    let reg = Registry::global().unwrap();
+    let dc = DcId::new("mum1").unwrap();
+    let t = TenantId(31);
+    let mut etcd = MemSettings::new(reg);
+    assert_eq!(retention_days(&etcd, None, &dc, t), 180);
+    etcd.set_value(
+        Level::Global,
+        &SettingCtx::process(&dc),
+        "decisions.retention_days",
+        &Value::Int(90),
+    )
+    .unwrap();
+    assert_eq!(retention_days(&etcd, None, &dc, t), 90);
+    let mut b = TenantSettings::builder(reg, t, 1);
+    b.put(
+        TenantScope::Tenant,
+        "decisions.retention_days",
+        Entry {
+            value: Some(Value::Int(7)),
+            bounds: None,
+        },
+    );
+    let rows = b.build();
+    assert_eq!(retention_days(&etcd, Some(&rows), &dc, t), 7);
+}

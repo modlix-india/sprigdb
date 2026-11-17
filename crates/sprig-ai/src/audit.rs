@@ -15,6 +15,7 @@
 //! - **The administration assistant's** conversations are kept the same
 //!   way in a system schema instead ([`system`]).
 
+use sprig_catalog::pool_wait::Bounded as _;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -429,7 +430,7 @@ impl CatalogAudit {
 
     /// A connection, after creating the module the first time.
     pub(crate) async fn conn(&self) -> Result<mysql_async::Conn> {
-        let mut conn = self.pool.get_conn().await.map_err(unavailable)?;
+        let mut conn = self.pool.get_conn_bounded().await.map_err(unavailable)?;
         self.ready
             .get_or_try_init(|| async {
                 let have: Option<u64> = conn

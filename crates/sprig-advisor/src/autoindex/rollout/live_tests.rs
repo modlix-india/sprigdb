@@ -740,6 +740,7 @@ fn ocx<'a>(
         decisions: &LogDecisions,
         now,
         removals: None,
+        stats: None,
     }
 }
 

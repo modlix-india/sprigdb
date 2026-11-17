@@ -133,7 +133,7 @@ It may not use placeholders (`?`), user or system variables, stored functions, n
 | `SPRIG_TENANT_IN_SUBTREE(expr)` | True when `expr` is the session's tenant or one of its descendants |
 | `SPRIG_TENANT_MANAGED(expr)` | True when `expr` is a tenant the user administers |
 | `SPRIG_USER_ATTR('key')` | An attribute stored on the user account (`CREATE USER ... ATTRIBUTE '{json}'`) |
-| `SPRIG_CLAIM('key')` | A fixed claim of the SprigDB session token that authenticated the statement (REST, gRPC, Studio), such as `sub`, `ten` or `amr`; `NULL` without one. No custom claims |
+| `SPRIG_CLAIM('key')` | A claim of the token the session logged in with: an identity provider's token (any of its claims, on MySQL, MariaDB, Redis, MongoDB, REST and gRPC), or SprigDB's own session token (REST, gRPC, Studio: `sub`, `ten`, `amr`, ...); `NULL` without one |
 | `SPRIG_SESSION_SPACE()` | The session's space, for [data inheritance](../data-models/inheritance.md) |
 
 The values are bound into the statement as literals by the gateway, so they cost nothing at run time. `SPRIG_TENANT_IN_SUBTREE` and `SPRIG_TENANT_MANAGED` become `IN` lists of tenant ids up to `rls.inline_subtree_max` (1000) tenants; above that, they read a table of the subtree that gateways keep on each cluster.
@@ -206,8 +206,11 @@ Policies are table policies, so they apply wherever the table's rows go:
 | MongoDB drivers | Collections are tables: reads and writes go through the same rewrite and checks. MongoDB commands create policies in filter form (below) |
 | Change streams, Kafka change topics, stream triggers, sinks | Each change record is filtered by the reader's `SELECT` policies, over its before and after images: an update whose row becomes visible arrives as an insert, one that becomes hidden as a delete |
 | Redis keyspace notifications | Filtered the same way, per key |
+| Redis hashes, sets, lists and sorted sets | Their elements follow the policies of the key-value table, so a user sees only the elements of keys they may read |
 | Search | Hits are re-read through your session; counts and facets count only the hits you can see |
 | `LOAD DATA` into a protected table | MariaDB's write checks |
+
+Change records carry some columns in another form than the table, and the filter reads them back as the table types them: binary strings (such as a key-value table's key) as their bytes, `TIMESTAMP` values in the reader's time zone, and `ENUM` and `SET` values as their members' text when the policy compares them with string literals. A policy that uses an `ENUM` or `SET` column any other way, or reads a bit, spatial or vector column, hides every change record of the table from the users it binds; the table itself is filtered as usual.
 
 ### Policies from MongoDB drivers
 
@@ -221,7 +224,7 @@ db.runCommand({ sprigRowSecurity: "orders", enable: true, force: false });
 db.runCommand({ sprigDropPolicy: "orders", name: "own", ifExists: true });
 ```
 
-A filter may use equality, `$in`, `$gt`, `$gte`, `$lt`, `$lte`, `$ne`, `$nin`, `$exists: true`, `$and` and `$or`, and the session values `$$USER`, `$$USER_ID`, `$$TENANT_ID`, `$$HOME_TENANT_ID`, `$$SESSION_SPACE`, `$$CLAIM.<key>` and `$$ATTR.<key>`. Other operators are refused with 39364. Where MongoDB's matching needs more than the translation can express, the document stays hidden: a policy filter is never wider than MongoDB's own match.
+A filter may use equality, `$in`, `$gt`, `$gte`, `$lt`, `$lte`, `$ne`, `$nin`, `$exists: true`, `$and` and `$or`, and the session values `$$USER`, `$$USER_ID`, `$$TENANT_ID`, `$$HOME_TENANT_ID`, `$$SESSION_SPACE`, `$$CLAIM.<key>` and `$$ATTR.<key>`. Other operators are refused with 39364. Where MongoDB's matching needs more than the translation can express, the document stays hidden: a policy filter is never wider than MongoDB's own match. The SQL a MongoDB filter becomes is compiled again by each new release from the stored filter, so a translation fix also applies to policies created before it.
 
 ## Statements a protected table refuses
 
@@ -230,9 +233,13 @@ Some statements can't be rewritten safely. Naming a protected table that binds t
 - `CALL`, `PREPARE`, `EXECUTE`, `HANDLER`, `CHECKSUM`, `LOAD DATA ... REPLACE`;
 - `CREATE VIEW`, `PROCEDURE`, `FUNCTION`, `TRIGGER`, `EVENT`, or `CREATE TABLE ... SELECT` over a protected table, and stored code with dynamic SQL;
 - a statement the gateway's parser can't read;
-- a change topic of a protected table read whole by a principal the policies bind (it is read record by record instead where possible).
+- a change topic of a protected table read whole by a principal the policies bind (it is read record by record instead where possible);
+- `SHOW INDEX` of a protected table, and `SHOW TABLE STATUS` of a database that holds one, because their row counts and cardinalities include hidden rows. With `LIKE`, `SHOW TABLE STATUS` is refused only when the pattern matches a protected table; with `WHERE`, whenever the database holds one. Other tables and databases answer as usual. `information_schema.TABLES` and `STATISTICS` work everywhere, with `NULL` row counts for protected tables;
+- `ALTER TABLE`, `RENAME TABLE`, `CREATE INDEX` and `DROP INDEX` of a protected table, since a failed change can reveal a hidden row (a duplicate key, a value that doesn't convert). Make schema changes as an account the table's policies don't bind: a manager while the table isn't forced, or a holder of `BYPASS RLS`.
 
-DDL, `SHOW`, `DESCRIBE` and transaction statements are not affected.
+`DROP TABLE` and `TRUNCATE` work on a protected table for anyone with the `DROP` privilege on it, bound or not: they take the table whole and reveal no row. A new table of the same name starts without the dropped table's policies.
+
+`DESCRIBE`, `SHOW CREATE TABLE`, other `SHOW` statements, other DDL and transaction statements are not affected.
 
 ## Test as a user
 
@@ -251,7 +258,7 @@ The rules:
 - The caller holds `SPRIG_TENANT_ADMIN` over the user's tenant (their own or a descendant), the user doesn't administer the caller's tenant, `studio.view_as` is `on` at the user's tenant, and the caller isn't impersonating. Else `ER_SPRIG_STUDIO_VIEW_AS_DENIED` (39930).
 - The statement is one read-only statement: `SELECT`, `WITH`, `TABLE`, `VALUES` or `SHOW`, without `INTO` or locking clauses. Else `ER_SPRIG_STUDIO_VIEW_AS_NOT_READ_ONLY` (39931).
 - It runs as the user, with their privileges, policies and session values, capped by `studio.max_result_rows` and `studio.statement_timeout_ms`.
-- Optional `claims` and `attributes` stand in for `SPRIG_CLAIM` and `SPRIG_USER_ATTR` values, so you can test policies that use them. Real sessions carry only the fixed token claims, so a policy that tests any other claim key never matches outside the tester.
+- Optional `claims` and `attributes` stand in for `SPRIG_CLAIM` and `SPRIG_USER_ATTR` values, so you can test policies that use them. Real sessions carry the claims of the token they logged in with: every claim of an identity provider's token, or the fixed claims of a SprigDB session token.
 - The reply lists every policy the rewrite applied, with its predicate as bound for this run.
 - Every test is audited as `studio.view_as`, with the caller, the user and a hash of the statement.
 
@@ -259,9 +266,9 @@ The rules:
 
 - **Managers are exempt by default.** Anyone with `ALTER` on a table bypasses its policies until you `FORCE` it. Grant `ALTER` sparingly on protected tables, or force them.
 - **`BYPASS RLS` and `SPRIG_TENANT_ADMIN`.** `BYPASS RLS` skips every policy it covers. A tenant's first administrator holds `ALL` on `*.*`, which includes `ALTER`, so they are a manager of every table and see all rows of unforced tables.
-- **Claims and attributes.** `SPRIG_USER_ATTR('key')` reads the account's attributes, which an administrator sets with `CREATE USER` or `ALTER USER ... ATTRIBUTE '{json}'` (or `COMMENT 'text'`, read as `SPRIG_USER_ATTR('comment')`); see [Accounts and logins](accounts-and-logins.md#users-and-passwords). `SPRIG_CLAIM('key')` reads the fixed claims of the SprigDB session token that authenticated the statement, over REST, gRPC or Studio: `sub` (`<tenant id>:<user id>`), `ten` (the tenant's name), `sid` (the session id), `amr` (the login methods, an array), `cli` (`studio`, `api` or `cli`), `iat` and `exp` (Unix seconds), `act` while an administrator impersonates the user, and `iss` and `aud` (always `sprigdb`). Sessions without a session token (MySQL and the other wire protocols, HTTP Basic, API keys) have no claims, so `SPRIG_CLAIM` returns `NULL` there, and a policy that relies on a claim hides rows from them. Tokens from external identity providers (JWT, OIDC) aren't accepted, so there are no custom claims: use attributes for per-user values.
+- **Claims and attributes.** `SPRIG_USER_ATTR('key')` reads the account's attributes, which an administrator sets with `CREATE USER` or `ALTER USER ... ATTRIBUTE '{json}'` (or `COMMENT 'text'`, read as `SPRIG_USER_ATTR('comment')`); see [Accounts and logins](accounts-and-logins.md#users-and-passwords). `SPRIG_CLAIM('key')` reads a top-level claim of the token the session logged in with. For a token from an identity provider the tenant registered, that is any of the token's verified claims, unchanged, on MySQL, MariaDB, Redis, MongoDB, REST and gRPC; see [Logins with identity provider tokens](external-tokens.md#claims-in-row-level-security). For SprigDB's own session token (REST, gRPC, Studio) it is one of its fixed claims: `sub` (`<tenant id>:<user id>`), `ten` (the tenant's name), `sid` (the session id), `amr` (the login methods, an array), `cli` (`studio`, `api` or `cli`), `iat` and `exp` (Unix seconds), `act` while an administrator impersonates the user, and `iss` and `aud` (always `sprigdb`). Sessions without a token (password logins on any protocol, HTTP Basic, API keys) have no claims, so `SPRIG_CLAIM` returns `NULL` there, and a policy that relies on a claim hides rows from them. Claims come from whoever issued the token: trust only issuers whose claims you would let decide what a user sees.
 - **Constraint errors.** A plain `INSERT` whose key collides with a hidden row fails with the duplicate-key error, which tells the user that a row with that key exists. Don't rely on row-level security to keep the existence of keys secret; use keys that reveal nothing.
-- **Stored code.** `SQL SECURITY DEFINER` routines over protected tables run under their definer's policies while they run, and the caller's again afterwards. Views and routines can't be created over protected tables (39366).
+- **Stored code.** Views and routines over protected tables are pointed at the policy views when they're created, so `SQL SECURITY DEFINER` routines run under their definer's policies while they run, and the caller's again afterwards. Code that couldn't be pointed (a table without its policy view, or a failed repoint) is refused to bound sessions with 39366 until it's fixed. For a few milliseconds after a `CREATE`, a call that reaches another gateway runs with the caller's policies.
 - **Search indexes and analytics copies** are filled without row-level security; queries re-check results through your session, but treat index storage as containing every row.
 - **`rls.backend_enforcement = off`** leaves the gateway as the only enforcement. Keep the default unless you have measured the cost of the triggers.
 
@@ -270,13 +277,12 @@ The rules:
 | Setting | Type | Default | Scopes | Meaning |
 |---|---|---|---|---|
 | `rls.backend_enforcement` | text | `views` | database, tenant, global | `views`, `triggers` or `off` |
-| `rls.inline_subtree_max` | int | 1000 | tenant, dc, global | Tenant ids inlined for `SPRIG_TENANT_IN_SUBTREE` and `SPRIG_TENANT_MANAGED` |
+| `rls.inline_subtree_max` | int | 1000 | tenant, dc, global | Tenant ids inlined for `SPRIG_TENANT_IN_SUBTREE` and `SPRIG_TENANT_MANAGED`. Above it, sessions read the ids from a table. After-commit triggers and schedules get their definer's subtree and managed tenants inline at any size, up to 100,000 tenants; beyond that the sets are empty for them, so such a policy hides every row from that code (it fails closed) |
 | `studio.view_as` | text | `on` | tenant, dc, global | Allow the row-level security tester |
 
 ## Not supported yet
 
-- **Custom claims.** SprigDB doesn't accept JWT or OIDC tokens from an external identity provider, so `SPRIG_CLAIM` reads only the fixed claims of SprigDB's own session tokens. Put per-user values in account attributes and read them with `SPRIG_USER_ATTR`.
-- **Claims on other logins.** MySQL, MariaDB and the other wire protocols, HTTP Basic and API keys carry no token, so `SPRIG_CLAIM` returns `NULL` there.
+- **Claims without a token.** Password logins (HTTP Basic with a password among them) and API keys carry no token, so `SPRIG_CLAIM` returns `NULL` there; put per-user values in account attributes and read them with `SPRIG_USER_ATTR`.
 
 ## Related
 

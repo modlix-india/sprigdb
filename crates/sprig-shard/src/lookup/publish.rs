@@ -1,8 +1,8 @@
-//! Waiting for every gateway to load a lookup state change (Q44's
-//! follow-up): the job raises the tenant's catalog version, then asks the
-//! gateways of the tenant's DC to acknowledge it through the DC tier, the
-//! same registration and version keys the gateways keep for chapter 31's
-//! publication wait (`sprig-gateway::mongo::publish`):
+//! Waiting for every gateway to load a lookup state change: the job raises
+//! the tenant's catalog version, then asks the gateways of the tenant's DC
+//! to acknowledge it through the DC tier, the same registration and version
+//! keys the gateways keep for the MongoDB publication wait
+//! (`sprig-gateway::mongo::publish`):
 //!
 //! ```text
 //! doc-gw/<gateway>              a gateway's presence, under its lease

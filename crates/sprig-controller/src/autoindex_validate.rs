@@ -53,6 +53,7 @@ use sprig_advisor::autoindex::store::{
 };
 use sprig_advisor::autoindex::validate::canary::CanaryValidator;
 use sprig_advisor::autoindex::validate::galera::RsuValidator;
+use sprig_advisor::autoindex::validate::journal::StatsJournal;
 use sprig_advisor::autoindex::validate::replica::ReplicaValidator;
 use sprig_advisor::autoindex::validate::{
     Method, NodeMarker, ValidationPlan, ValidationReport, Validator, covering_variant, method_for,
@@ -90,6 +91,7 @@ pub struct SampleValidation {
     registry: ClusterRegistry,
     keyring: Option<Arc<dyn TenantKeyring>>,
     marker: Arc<dyn NodeMarker>,
+    stats: Option<Arc<dyn StatsJournal>>,
 }
 
 impl std::fmt::Debug for SampleValidation {
@@ -116,7 +118,16 @@ impl SampleValidation {
             registry,
             keyring,
             marker,
+            stats: None,
         }
+    }
+
+    /// Replica and RSU validations journal their statistics snapshot in
+    /// `journal` until it is back ([`crate::autoindex_stats`]).
+    #[must_use]
+    pub fn with_stats_journal(mut self, journal: Arc<dyn StatsJournal>) -> Self {
+        self.stats = Some(journal);
+        self
     }
 }
 
@@ -203,17 +214,22 @@ fn validator(
     o: &ObjectEnv,
     online_build: bool,
     marker: &Arc<dyn NodeMarker>,
+    stats: Option<&Arc<dyn StatsJournal>>,
 ) -> Result<Box<dyn Validator>> {
     let no_node = || SprigError::new(SprigCode::ClusterUnavailable, "no node to validate on");
     Ok(match (method, &o.view.nodes) {
-        (Method::Replica, Nodes::PrimaryReplica { writer, replicas }) => Box::new(
-            ReplicaValidator::new(
+        (Method::Replica, Nodes::PrimaryReplica { writer, replicas }) => {
+            let mut v = ReplicaValidator::new(
                 replicas.first().ok_or_else(no_node)?.clone(),
                 Arc::clone(marker),
             )
             // A cut-off validation's leftover is dropped first.
-            .with_writer(writer.clone()),
-        ),
+            .with_writer(writer.clone());
+            if let Some(j) = stats {
+                v = v.with_stats_journal(Arc::clone(j));
+            }
+            Box::new(v)
+        }
         (Method::GaleraRsu, Nodes::Galera { nodes, writer }) => {
             let node = nodes
                 .iter()
@@ -228,6 +244,9 @@ fn validator(
             // A cut-off validation's leftover is dropped first.
             if let Some(w) = nodes.iter().find(|n| &n.node == writer) {
                 v = v.with_writer(w.clone());
+            }
+            if let Some(j) = stats {
+                v = v.with_stats_journal(Arc::clone(j));
             }
             Box::new(v)
         }
@@ -341,7 +360,7 @@ impl ValidationHook for SampleValidation {
         let method = method_for(derived.as_ref().and_then(|d| d.validation), samples);
         let online = derived.as_ref().is_none_or(|d| d.online_index_build)
             || matches!(object.view.nodes, Nodes::Single { .. });
-        let v = validator(method, object, online, &self.marker)?;
+        let v = validator(method, object, online, &self.marker, self.stats.as_ref())?;
         let plan = ValidationPlan {
             candidate_id: row.candidate_id,
             candidate,

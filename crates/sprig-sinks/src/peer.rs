@@ -125,13 +125,13 @@ pub enum SqlOp {
     /// A change exchange's publishes, each
     /// a `CALL sprig.mq_publish(...)` (39235 otherwise), autocommit, in
     /// order, in one session of the setting's user; each statement's error
-    /// is its own result's. (Workers before R9 r9feed4; now
+    /// is its own result's. (Sent by older workers; newer ones send
     /// [`SqlOp::PublishBatch`].)
     Publish {
         /// The calls.
         statements: Vec<String>,
     },
-    /// A change exchange's publishes (R9 r9feed4), as the request's user,
+    /// A change exchange's publishes, as the request's user,
     /// whose write permission on the exchange applies: each message, in
     /// order, as its message id. Each queue takes a message of an id only
     /// once (its messages and its forward ledger), so a publish repeated

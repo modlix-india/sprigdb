@@ -56,6 +56,8 @@ jobs:
       # rustup reads rust-toolchain.toml and installs the pinned toolchain.
       - run: rustup toolchain install
       - run: cargo fmt --all --check
+      # Comments explain the code themselves instead of citing design notes.
+      - run: deploy/ci/no-design-refs.sh
 
   clippy:
     name: S0 clippy
@@ -88,10 +90,19 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
+      # No Studio build here; without SPRIG_STUDIO_DIST=none sprig-studio's
+      # build script watches a missing studio/dist, reruns on every cargo
+      # call and rebuilds the gateway for nextest.
       - run: cargo build --workspace --locked
+        env:
+          SPRIG_STUDIO_DIST: none
       # No SPRIG_TEST_* variables: integration tests skip themselves.
       - run: cargo nextest run --workspace --locked --no-fail-fast --no-tests=pass
+        env:
+          SPRIG_STUDIO_DIST: none
       - run: cargo test --workspace --locked --doc
+        env:
+          SPRIG_STUDIO_DIST: none
 
   studio:
     # Studio's type check, lint, unit tests, licence and
@@ -259,12 +270,15 @@ jobs:
       - name: Run every target for FUZZ_SECONDS
         run: |
           set -euo pipefail
+          # cargo-fuzz defaults to the triple it was built for; the prebuilt binary is
+          # musl, and AddressSanitizer can't link against static musl. Pin glibc.
+          tgt=x86_64-unknown-linux-gnu
           for crate in crates/sprig-proto-mysql/fuzz crates/sprig-sql/fuzz; do
             ( cd "$crate"
-              cargo +nightly fuzz build -O
+              cargo +nightly fuzz build -O --target "$tgt"
               for t in $(cargo +nightly fuzz list); do
                 mkdir -p "work/$t" "regressions/$t"
-                cargo +nightly fuzz run -O "$t" "work/$t" "corpus/$t" "regressions/$t" -- \
+                cargo +nightly fuzz run -O --target "$tgt" "$t" "work/$t" "corpus/$t" "regressions/$t" -- \
                   -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=2048 -timeout=10
               done )
           done
@@ -282,7 +296,11 @@ jobs:
       github.event_name == 'schedule' ||
       github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # 60, not 40: the first run took 38 minutes with no deployment and every
+    # gateway test failing at once. The build is about 12 minutes, the tests
+    # about 20 (the longest simulations alone take 5), and the deployment,
+    # the gateway suites and the exclusive pass add about 10.
+    timeout-minutes: 60
     env:
       SPRIG_TEST_STRICT: "1"
       SPRIG_TEST_DOCKER: "1"
@@ -295,6 +313,14 @@ jobs:
       SPRIG_TEST_TOXIPROXY: http://127.0.0.1:18474
       SPRIG_TEST_FAULTD: sprigdb-dev-faultd-1
       SPRIG_TEST_ELLE: "1"
+      # Two throwaway binlog servers (started below): tests change the
+      # first's globals and pause the second.
+      SPRIG_TEST_BINLOG_SCRATCH: mysql://root:sprig-dev-root@127.0.0.1:13501
+      SPRIG_TEST_BINLOG_PAUSE: sprig-ci-scratch-2=mysql://root:sprig-dev-root@127.0.0.1:13502
+      # No Studio build here. Without this, sprig-studio's build script
+      # watches a missing studio/dist and reruns on every cargo call, which
+      # rebuilt the gateway in the test step (6 minutes in the first run).
+      SPRIG_STUDIO_DIST: none
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
@@ -317,28 +343,61 @@ jobs:
         run: |
           docker compose --profile faults up -d --build toxiproxy faultd
           docker compose --profile elle build elle
+      - name: Start the binlog scratch servers
+        run: |
+          for n in 1 2; do
+            docker run -d --name "sprig-ci-scratch-$n" --memory 768m \
+              -p "127.0.0.1:1350$n:3306" -e MARIADB_ROOT_PASSWORD=sprig-dev-root \
+              -v "$PWD/deploy/compose/mariadb/binlog.cnf:/etc/mysql/conf.d/10-binlog.cnf:ro" \
+              mariadb:11.8 --server-id="50$n" --gtid-domain-id="5$n"
+          done
       - run: cargo build --workspace --all-targets --locked
       - name: Wait for every service to be healthy
         working-directory: deploy/compose
-        run: docker compose --profile all up -d --wait --wait-timeout 300
-      - run: cargo nextest run --workspace --locked --no-fail-fast --no-tests=pass
-      - name: Collect Compose logs
+        run: |
+          docker compose --profile all up -d --wait --wait-timeout 300
+          for n in 1 2; do
+            timeout 120 bash -c "until docker exec sprig-ci-scratch-$n healthcheck.sh --connect --innodb_initialized; do sleep 2; done"
+          done
+      # A controller, worker and gateway (catalog mode, tenants acme and
+      # globex) with the http, https and mongo listeners, for the gateway
+      # suites; the SPRIG_TEST_* variables they read go to $GITHUB_ENV.
+      # .config/nextest.toml lists the suites this can't serve.
+      - name: Start the deployment
+        run: |
+          deploy/compose/integration.sh up
+          cat deploy/compose/.gateway-dev/test-env >> "$GITHUB_ENV"
+      - name: Tests
+        id: tests
+        run: cargo nextest run --workspace --locked --no-tests=pass --profile ci-s1
+      # Tests that disturb the shared servers for everyone (a Galera node
+      # cut off, a desynced node) or measure timings: alone, afterwards,
+      # also when the first pass failed.
+      - name: Exclusive tests, one at a time
+        if: ${{ !cancelled() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure') }}
+        run: cargo nextest run --workspace --locked --no-tests=pass --profile ci-s1-exclusive
+      - name: Collect Compose and deployment logs
         if: failure()
         working-directory: deploy/compose
         run: |
           mkdir -p "$SPRIG_TEST_LOG_DIR"
           docker compose --profile all --profile faults ps --all > "$SPRIG_TEST_LOG_DIR/compose-ps.txt"
           docker compose --profile all --profile faults logs --no-color --timestamps > "$SPRIG_TEST_LOG_DIR/compose.log"
+          cp .gateway-dev/*.log "$SPRIG_TEST_LOG_DIR/" 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
           name: s1-logs
           path: target/test-logs
           if-no-files-found: ignore
-      - name: Stop Compose
+      - name: Stop
         if: always()
-        working-directory: deploy/compose
-        run: docker compose --profile all --profile faults down -v --timeout 10
+        run: |
+          # The runner is thrown away: no tenant clean-up (gateway-dev.sh
+          # down would wait for each tenant's deletion).
+          pkill -f "target/debug/sprigdb" || true
+          docker rm -f sprig-ci-scratch-1 sprig-ci-scratch-2 || true
+          docker compose --project-directory deploy/compose --profile all --profile faults down -v --timeout 10
 
   simulation:
     name: S1 simulation (seeded)
@@ -479,7 +538,7 @@ jobs:
   # configured then; per-target outcomes go in an overlay file named by
   # SPRIG_CONN_EXPECTED_OVERLAY.
   connectors:
-    name: M0.2 connector matrix and latency gate (gateway)
+    name: Connector matrix and latency gate (gateway)
     needs: [integration]
     if: false
     runs-on: ubuntu-latest
@@ -549,7 +608,7 @@ jobs:
   # timed on a second gateway (deploy/compose/m05, README there). Both suites
   # are security controls: they run on pull requests and on main.
   m03:
-    name: M0.3 and M0.5 tenants, names, settings and isolation (gateway)
+    name: Tenants, names, settings and isolation (gateway)
     needs: [integration]
     if: >-
       github.event_name == 'workflow_dispatch' ||
@@ -586,12 +645,12 @@ jobs:
           done
       - name: Start the gateway
         run: deploy/compose/gateway-dev.sh up
-      - name: M0.3 harness, both ports
+      - name: Tenant harness, both ports
         run: |
           export SPRIG_M03_BUILD=0 SPRIG_M03_BACKEND=mysql://root:sprig-dev-root@127.0.0.1:13301
           deploy/compose/m03/run.sh 127.0.0.1 13307 mariadb acme.app globex.app sprig-dev-app
           deploy/compose/m03/run.sh 127.0.0.1 13306 mysql acme.app globex.app sprig-dev-app
-      - name: M0.5 isolation suite (both personas, a second gateway for propagation)
+      - name: Isolation suite (both personas, a second gateway for propagation)
         run: deploy/compose/m05/run.sh
       - uses: actions/upload-artifact@v4
         if: always()
@@ -620,7 +679,7 @@ jobs:
   # memory caps) and 30 to 40 minutes. To enable: drop `if: false`, or
   # narrow it to workflow_dispatch and schedule.
   m04:
-    name: M0.4 automatic indexing scenarios (gateway, three topologies)
+    name: Automatic indexing scenarios (gateway, three topologies)
     needs: [integration]
     if: false
     runs-on: ubuntu-latest

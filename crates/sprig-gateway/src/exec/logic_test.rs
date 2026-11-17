@@ -22,6 +22,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use sprig_catalog::CatalogLocator;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_logic::engine::bridge::{self as eb, DbBridge, DbOp, Reply};
 use sprig_logic::engine::kirun::Host;
@@ -270,7 +271,7 @@ impl PassSession {
             }
         } else {
             let name = req.name.clone().unwrap_or_default();
-            let mut conn = ep.pool.get_conn().await.map_err(|e| {
+            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
                 SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
             })?;
             let l =
@@ -625,7 +626,7 @@ impl PassSession {
                 };
                 let found = match id {
                     Some(id) => {
-                        let mut conn = ep.pool.get_conn().await.map_err(|e| {
+                        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
                             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable")
                                 .with_source(e)
                         })?;

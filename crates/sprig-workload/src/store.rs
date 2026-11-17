@@ -198,7 +198,7 @@ fn take<T: mysql_async::prelude::FromValue>(row: &mut Row, idx: usize, name: &st
 /// closes it at once, returning the rows it changed. Kept in the driver's
 /// statement cache, every batch size stayed prepared on the catalog's
 /// server: a 500-row `REPLACE` holds about 5 MB there, and a catalog
-/// connection (128 cached statements) reached 40-70 MB (r1-interim GR10).
+/// connection (128 cached statements) reached 40-70 MB.
 async fn exec_batch<Q, P>(q: &mut Q, sql: String, params: P) -> Result<u64>
 where
     Q: Queryable + Send,

@@ -316,6 +316,75 @@ async fn reread(
                 );
             }
         }
+    } else if def.has_hash_fields() {
+        // A namespace's live hashes (a row is the object of their fields)
+        // and string keys.
+        let elems = format!("{}.{}", q(&def.db), q(&format!("__sprig_ke_{}", def.table)));
+        for chunk in hits.chunks(500) {
+            let list: Vec<String> = chunk
+                .iter()
+                .map(|h| sprig_doc::sql::bin_lit(&h.key.0))
+                .collect();
+            let rows = sql
+                .query(&format!(
+                    "SELECT t.k, t.type, t.v, e.e, e.v FROM {table} AS t LEFT JOIN {elems} AS e \
+                     ON e.k = t.k AND e.g = t.g AND t.type = 'hash' WHERE t.k IN ({}) \
+                     AND t.type IN ('string', 'hash') \
+                     AND (t.expires_at IS NULL OR t.expires_at > NOW(3)) ORDER BY t.k, e.o, e.e",
+                    list.join(", ")
+                ))
+                .await
+                .map_err(|e| sql_err(&e))?;
+            let mut by_key: Vec<(Vec<u8>, Value)> = Vec::new();
+            for r in rows {
+                let col = |i: usize| r.get(i).cloned().flatten();
+                let k = col(0).unwrap_or_default();
+                let string = col(1).as_deref() == Some(b"string".as_slice());
+                if by_key.last().is_none_or(|(x, _)| *x != k) {
+                    let v = if string {
+                        sprig_search::copy::kv_value(&col(2).unwrap_or_default())
+                    } else {
+                        Value::Object(serde_json::Map::new())
+                    };
+                    by_key.push((k.clone(), v));
+                }
+                if let (Some(e), Some((_, Value::Object(m)))) = (col(3), by_key.last_mut()) {
+                    m.insert(
+                        String::from_utf8_lossy(&e).into_owned(),
+                        Value::String(
+                            String::from_utf8_lossy(&col(4).unwrap_or_default()).into_owned(),
+                        ),
+                    );
+                }
+            }
+            for (k, value) in by_key {
+                let key = match std::str::from_utf8(&k) {
+                    Ok(t) => json!({"k": t}),
+                    Err(_) => {
+                        json!({"k_base64": base64::engine::general_purpose::STANDARD.encode(&k)})
+                    }
+                };
+                let mut t = HashMap::new();
+                for f in texts {
+                    let got = if f.source == sprig_search::Source::KvField {
+                        value.get(&f.source_ref).and_then(Value::as_str)
+                    } else {
+                        None
+                    };
+                    if let Some(x) = got {
+                        t.insert(f.name.clone(), x.to_owned());
+                    }
+                }
+                out.insert(
+                    Key(k),
+                    Seen {
+                        key,
+                        row: with_row.then_some(value),
+                        texts: t,
+                    },
+                );
+            }
+        }
     } else if def.model == Model::Kv {
         // A namespace's live string keys.
         for chunk in hits.chunks(500) {
@@ -538,29 +607,36 @@ async fn run(
     let analyzers = &scat::state(&cat).analyzers;
     // For a caller a row policy on the object binds, facets count only the
     // rows it may see (the copy's own counts include rows hidden from it).
+    // Such a caller's hits are also ranked over the rows it may see (the
+    // copy's term statistics count every row): its visible hits with
+    // their own statistics, or past search.max_window, plain scores.
     let visible_only = visible::needs_visible(&def, sql.row_policy_binds(def.object_id));
     let mut facet_out = serde_json::Map::new();
-    if visible_only && !facets.is_empty() {
-        let all = visible::all_hits(svc, tenant, &cat, &def, query.clone(), consistency).await?;
-        let seen = reread(sql, &def, &all, &[], false).await?;
-        let keys: Vec<Key> = all
-            .iter()
-            .filter(|h| seen.contains_key(&h.key))
-            .map(|h| h.key.clone())
-            .collect();
-        let ops: Vec<Op> = facets.iter().map(|(_, o)| o.clone()).collect();
-        let (answers, _) = svc
-            .query(
-                tenant,
-                &def,
-                analyzers,
-                visible::within(query.clone(), keys),
-                ops,
-                consistency,
-            )
-            .await?;
-        put_facets(&mut facet_out, &facets, answers);
-    }
+    let (ranked, scoring) = if visible_only {
+        match visible::candidates(svc, tenant, &cat, &def, query.clone(), consistency).await? {
+            Some(all) => {
+                let seen = reread(sql, &def, &all, &[], false).await?;
+                let keys: Vec<Key> = all
+                    .iter()
+                    .filter(|h| seen.contains_key(&h.key))
+                    .map(|h| h.key.clone())
+                    .collect();
+                let within = visible::within(query.clone(), keys);
+                if !facets.is_empty() {
+                    let ops: Vec<Op> = facets.iter().map(|(_, o)| o.clone()).collect();
+                    let (answers, _) = svc
+                        .query(tenant, &def, analyzers, within.clone(), ops, consistency)
+                        .await?;
+                    put_facets(&mut facet_out, &facets, answers);
+                }
+                (within, sprig_search::Scoring::Matched)
+            }
+            None if !facets.is_empty() => return Err(visible::too_many(knobs.max_window)),
+            None => (query.clone(), sprig_search::Scoring::Plain),
+        }
+    } else {
+        (query.clone(), knobs.scoring)
+    };
     // Ranked hits, fetched deeper while hidden rows leave the page short.
     let mut k = (cursor.as_ref().map_or(0, |c| c.p + 1) + limit)
         .saturating_mul(knobs.overfetch.max(1))
@@ -569,15 +645,12 @@ async fn run(
     let mut first = !visible_only;
     let mut applied;
     let (page, next) = loop {
-        let mut ops = vec![Op::Top {
-            k,
-            scoring: knobs.scoring,
-        }];
+        let mut ops = vec![Op::Top { k, scoring }];
         if first {
             ops.extend(facets.iter().map(|(_, o)| o.clone()));
         }
         let (answers, ap) = svc
-            .query(tenant, &def, analyzers, query.clone(), ops, consistency)
+            .query(tenant, &def, analyzers, ranked.clone(), ops, consistency)
             .await?;
         applied = ap;
         let mut it = answers.into_iter();

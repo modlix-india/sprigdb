@@ -8,12 +8,24 @@
 //! - [`ToolHost`]: runs **read** tools, built for one signed-in caller so
 //!   every call has exactly that caller's rights. The gateway implements
 //!   it over its SQL engine and routes.
-//! - **Proposals.** A [`Effect::Propose`] tool never reaches the host: the
-//!   registry turns the call into a [`Proposal`] for the user to review
-//!   and run. Nothing an assistant does changes state by itself.
+//! - **Proposals.** A [`Effect::Propose`] tool never reaches the host's
+//!   [`ToolHost::call`]: the registry turns the call into a [`Proposal`]
+//!   for the user to review and run. Nothing an assistant does changes
+//!   state by itself. Before it is shown, the host may check it
+//!   ([`ToolHost::check_proposal`]): try a policy as test users, compile
+//!   logic, generate test rows. A failed check comes back to the model to
+//!   fix; the check's counts ride on the proposal.
+//! - [`chart`]: Show Me's rules, which chart marks fit a tile's shelves;
+//! - [`joins`]: declared and inferred joins behind `relationships`;
+//! - [`sensitive`]: the deterministic scanner behind `sensitive_columns`;
+//!   [`testdata`]: the test-row generator behind `generate_rows`.
 
 pub mod builtin;
+pub mod chart;
+pub mod joins;
 pub mod schema;
+pub mod sensitive;
+pub mod testdata;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
@@ -46,6 +58,10 @@ pub enum Shares {
     Stats,
     /// Rows; sent only with `ai.share_data`, else reduced to their shape.
     Rows,
+    /// SprigDB's own documentation: public text that holds nothing of a
+    /// tenant's, so the administration roles' scrubber leaves its names
+    /// alone (secrets are still masked).
+    Docs,
 }
 
 /// One tool.
@@ -188,6 +204,30 @@ pub trait ToolHost: Send + Sync {
     /// Whatever the call failed with (no privilege, no such table, a
     /// timeout); the model sees the message and may try another way.
     async fn call(&self, spec: &ToolSpec, input: &Value) -> Result<ToolOutput>;
+
+    /// Checks proposal tool `spec`'s input before it becomes a proposal,
+    /// as the caller and without changing anything: a proposed statement
+    /// must parse and pass SprigDB's own rules, a policy is tried as its
+    /// test users, logic is compiled, test rows are generated. What it
+    /// finds rides on the proposal. The default checks nothing.
+    ///
+    /// # Errors
+    /// What is wrong (a statement that doesn't parse, logic that doesn't
+    /// compile), for the model to fix; the proposal isn't shown.
+    async fn check_proposal(&self, _spec: &ToolSpec, _input: &Value) -> Result<ProposalCheck> {
+        Ok(ProposalCheck::default())
+    }
+}
+
+/// What a host's [`ToolHost::check_proposal`] adds to a proposal.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProposalCheck {
+    /// What the check found, for the user and the model: counts, compile
+    /// results, a summary. Never row values.
+    pub checks: Option<Value>,
+    /// What only the user gets (generated statements, which may hold
+    /// existing keys). It is never sent to the provider.
+    pub generated: Option<Value>,
 }
 
 /// A host that runs nothing: every read tool fails. For surfaces with no
@@ -248,6 +288,12 @@ pub struct Proposal {
     pub tool_use_id: String,
     /// The tool's input, as the model gave it.
     pub body: Value,
+    /// The host's check ([`ProposalCheck::checks`]), when there was one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<Value>,
+    /// What only the user gets ([`ProposalCheck::generated`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated: Option<Value>,
 }
 
 /// The tools, by name.
@@ -302,6 +348,14 @@ impl ToolRegistry {
             }
         }
         Ok(Self { tools })
+    }
+
+    /// A registry without tools, for turns that only write (a digest).
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            tools: BTreeMap::new(),
+        }
     }
 
     /// The built-in tools.
@@ -369,17 +423,24 @@ impl ToolRegistry {
             kind,
             tool_use_id: tool_use_id.to_owned(),
             body: input.clone(),
+            checks: None,
+            generated: None,
         })
     }
 
-    /// What the model is told about a proposal: it was shown, not run.
+    /// What the model is told about a proposal: it was shown, not run,
+    /// and what the host's check found (never [`Proposal::generated`]).
     #[must_use]
     pub fn proposal_note(p: &Proposal) -> Value {
-        json!({
+        let mut note = json!({
             "proposal_id": p.id,
             "status": "shown to the user; it has not run",
             "next": "The user reviews it and decides. Don't claim it was applied.",
-        })
+        });
+        if let Some(c) = &p.checks {
+            note["checks"] = c.clone();
+        }
+        note
     }
 }
 

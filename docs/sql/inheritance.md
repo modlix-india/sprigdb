@@ -194,7 +194,7 @@ An unknown share fails with 39887. **Privileges:** `ALTER` on the table.
 DROP SHARE [IF EXISTS] share_name
 ```
 
-The receivers stop seeing the shared rows; their own rows and overrides stay.
+The receivers stop seeing the shared rows. Their own rows stay, and their overrides of shared rows become their own rows, with the values they had. Rows they had hidden aren't kept hidden, so if the table is shared again later, they see every row of the new share. If a crash cuts the clean-up short, the next statement on the table finishes it.
 
 ### SPRIG RESET
 
@@ -246,6 +246,17 @@ SPRIG CHECK REFERENCES products WHERE id = 2;
 DROP SHARE products_eu;
 DROP SPACE docs_eu CASCADE;
 ```
+
+### Row-level security on inheritable tables
+
+A tenant's own [row-level security policies](row-level-security.md) on an inheritable table filter its merged view, whichever level each row comes from: its own rows, a parent space, a parent tenant's share or a copy of one. Policies see the merged values, so an override counts: a row a space overrode to another owner is hidden from the users the policy no longer matches. A parent tenant's policies bind only the parent's own users; what a child tenant receives is decided by the share's `WHERE` and `COLUMNS`, and then by the child's own policies.
+
+- `UPDATE` and `DELETE` touch only rows the policies show, and their affected-row counts leave hidden rows out.
+- Overriding an inherited row is checked with the `UPDATE` policies' `WITH CHECK`, and hiding one with the `DELETE` policies' `USING`; an `INSERT` policy isn't needed. A failed check is 39363.
+- Foreign-key checks between inheritable tables read every row, whatever the policies show.
+- As for any table, inserting a key that exists but is hidden fails with 1062.
+
+A change stream on an inheritable table sends a delete only for a row the subscriber could see just before.
 
 ### What isn't supported
 

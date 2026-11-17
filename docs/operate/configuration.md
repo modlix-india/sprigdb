@@ -173,6 +173,8 @@ The node agent runs beside a MariaDB node that SprigDB manages on a VM. See [Dep
 | `credentials` | text | the cluster's `sprig_ctl` reference | `SPRIGDB_AGENT_CREDENTIALS` | Secret reference of the account the agent fences with, `file:<path>#<table>`. It needs `READ_ONLY ADMIN` and `CONNECTION ADMIN`. |
 | `internal_addr` | socket address | none | `SPRIGDB_AGENT_INTERNAL_ADDR` | Where the agent's internal service listens: the backup stream and rebuild calls. Unset: the node can neither be rebuilt nor be a rebuild's source. |
 | `internal_advertise` | text | `http://` and the bound address | `SPRIGDB_AGENT_INTERNAL_ADVERTISE` | The URL other agents and workers reach the service at. |
+| `relay_addr` | socket address | none | `SPRIGDB_AGENT_RELAY_ADDR` | On a Galera node, where the relay for distributed transactions listens (port 7404 by convention); see [Shards and table groups](../concepts/shards-and-table-groups.md#the-relay-path). Needs `internal_addr` too. Unset: no relay on this node. |
+| `relay_advertise` | text | the bound address | `SPRIGDB_AGENT_RELAY_ADVERTISE` | The `host:port` gateways reach the relay at. |
 
 ### `[agent.rebuild]`
 

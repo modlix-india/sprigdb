@@ -213,3 +213,46 @@ fn positional() {
 }
 
 use std::str::FromStr;
+
+#[test]
+fn positional_paths_resolve_against_the_original_document() {
+    // The first path changes the field the query matched on; the second
+    // still lands in the same element.
+    let d = doc! {"_id": 1, "children": [{"name": "foo"}, {"name": "x"}]};
+    let r = up_q(
+        d,
+        doc! {"$set": {"children.$.name": "bar", "children.$.at": 7}},
+        doc! {"children.name": "foo"},
+    )
+    .unwrap();
+    assert_eq!(
+        r.get_array("children").unwrap()[0],
+        Bson::Document(doc! {"name": "bar", "at": 7})
+    );
+    // A query with `$elemMatch` on the array picks the element too.
+    let d = doc! {"_id": 1, "arr": [{"k": 1, "v": "a"}, {"k": 2, "v": "b"}]};
+    let r = up_q(
+        d,
+        doc! {"$set": {"arr.$.v": "z"}},
+        doc! {"arr": {"$elemMatch": {"k": 2}}},
+    )
+    .unwrap();
+    assert_eq!(
+        r.get_array("arr").unwrap()[1],
+        Bson::Document(doc! {"k": 2, "v": "z"})
+    );
+}
+
+#[test]
+fn pull_with_a_logical_query_on_the_elements() {
+    let d = doc! {"_id": 1, "t": [{"n": "eggs"}, {"n": "bacon"}, {"n": "coffee"}]};
+    let r = up(
+        d,
+        doc! {"$pull": {"t": {"$or": [{"n": "eggs"}, {"n": "bacon"}]}}},
+    )
+    .unwrap();
+    assert_eq!(r.get_array("t").unwrap().len(), 1);
+    let d = doc! {"_id": 1, "v": [1, 5, 9]};
+    let r = up(d, doc! {"$pull": {"v": {"$gte": 5}}}).unwrap();
+    assert_eq!(r.get_array("v").unwrap(), &vec![Bson::Int32(1)]);
+}

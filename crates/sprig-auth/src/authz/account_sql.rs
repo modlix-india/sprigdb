@@ -35,6 +35,7 @@ use sprig_proto_mysql::Persona;
 use super::compile::{CompiledPrivileges, Target};
 use super::privilege::{
     Action, ActionSet, Level, ObjectType, PrivName, all_at, grantable_at, parse_privilege,
+    revoke_ends_all,
 };
 use super::show;
 use super::state::AuthzState;
@@ -112,6 +113,10 @@ pub struct AccountCtx<'a> {
     pub privileges: &'a dyn super::authorizer::SessionGrants,
     /// The session's active roles.
     pub active_roles: &'a [RoleId],
+    /// The roles the session's token gives it for its life (its
+    /// issuer's role mapping): `SET ROLE` may name them, and `DEFAULT` and `ALL`
+    /// include them.
+    pub token_roles: &'a [RoleId],
     /// The tenant's name, for audit events.
     pub tenant_name: Option<&'a str>,
     /// Resolution of the `auth.*` keys (the password rules).
@@ -1051,6 +1056,24 @@ pub async fn execute(cx: &AccountCtx<'_>, stmt: &AccountStmt) -> Result<Outcome>
                     }
                     _ => {}
                 }
+                // WATCH held only through ALL ends with ALL (see
+                // `revoke_ends_all`), when the session may grant it.
+                if matches!(
+                    target,
+                    PrivTarget::Database(_) | PrivTarget::Object { .. } | PrivTarget::Named { .. }
+                ) {
+                    let mut have = held(&state, grantee, &target);
+                    if let Some(t) = cx.twin(&target) {
+                        have = have.union(held(&state, grantee, &t));
+                    }
+                    if revoke_ends_all(have, actions, level, kind)
+                        && cx
+                            .may_grant(&target, ActionSet::of(&[Action::Watch]), &db, &table)
+                            .is_ok()
+                    {
+                        actions = actions.with(Action::Watch);
+                    }
+                }
                 if !actions.is_empty() {
                     ops.push(Op::Revoke {
                         grantee,
@@ -1169,9 +1192,17 @@ pub async fn execute(cx: &AccountCtx<'_>, stmt: &AccountStmt) -> Result<Outcome>
             version = apply(cx, ops).await?;
         }
         AccountStmt::SetRole(choice) => {
-            let granted = state.granted_roles(cx.user);
+            let with_token = |mut v: Vec<RoleId>| {
+                for r in cx.token_roles {
+                    if !v.contains(r) {
+                        v.push(*r);
+                    }
+                }
+                v
+            };
+            let granted = with_token(state.granted_roles(cx.user));
             let chosen = match choice {
-                RoleChoice::Default => state.default_roles(cx.user),
+                RoleChoice::Default => with_token(state.default_roles(cx.user)),
                 c => choose(cx, &state, c, &granted, &cx.me())?,
             };
             return Ok(Outcome::SetRole(chosen));
@@ -1690,15 +1721,68 @@ fn show_grants(
     let Some(grantee) = grantee else {
         return Err(no_such_grant(&acc, None));
     };
+    // The session's token roles are granted to its own account for the
+    // session's life: listed with the account's roles, and usable in USING.
+    let session_roles: &[RoleId] = if own { cx.token_roles } else { &[] };
+    // Each USING role must be granted to the account itself (MySQL's 3530
+    // otherwise, even for a role granted through another role).
+    let direct: Vec<RoleId> = state.edges_of(grantee).iter().map(|e| e.role).collect();
     let mut extra = Vec::new();
     for r in using {
         let id = state
             .role_named(&r.name, &r.host)
+            .filter(|id| direct.contains(id) || session_roles.contains(id))
             .ok_or_else(|| role_not_granted(cx.persona, r, &acc))?;
         extra.push(id);
     }
+    // MySQL's `SHOW GRANTS` and `SHOW GRANTS FOR CURRENT_USER()` without
+    // USING show the session's active roles' privileges as the account's.
+    let current = matches!(account, None | Some(UserSpec::Current));
+    if current && using.is_empty() && cx.persona == Persona::MySql84 {
+        extra = cx.active_roles.to_vec();
+    }
     let lines = if state.is_migrated() {
-        show::render(state, cx.snapshot, grantee, &acc, &extra, cx.persona)
+        let mut lines = show::render_for_session(
+            state,
+            cx.snapshot,
+            grantee,
+            &acc,
+            &extra,
+            session_roles,
+            cx.persona,
+        );
+        // MariaDB's `SHOW GRANTS` adds the lines of the active role
+        // (each active role here) before `SET DEFAULT ROLE`.
+        if account.is_none() && cx.persona == Persona::MariaDb {
+            let mut active: Vec<(String, String, RoleId)> = cx
+                .active_roles
+                .iter()
+                .filter_map(|&r| {
+                    state
+                        .role(r)
+                        .map(|row| (row.name.clone(), row.host.clone(), r))
+                })
+                .collect();
+            active.sort();
+            let at = lines
+                .iter()
+                .position(|l| l.starts_with("SET DEFAULT ROLE"))
+                .unwrap_or(lines.len());
+            let mut role_lines = Vec::new();
+            for (name, host, r) in active {
+                let a = AccountRef { name, host };
+                role_lines.extend(show::render(
+                    state,
+                    cx.snapshot,
+                    Grantee::Role(r),
+                    &a,
+                    &[],
+                    cx.persona,
+                ));
+            }
+            lines.splice(at..at, role_lines);
+        }
+        lines
     } else {
         vec![format!(
             "GRANT ALL PRIVILEGES ON *.* TO `{}`@`{}` WITH GRANT OPTION",

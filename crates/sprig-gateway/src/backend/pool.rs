@@ -29,6 +29,12 @@ pub struct PoolKey {
     /// MariaDB extended capability bits the connections negotiate (only
     /// for 3307 sessions whose client has them).
     pub mariadb_caps: u64,
+    /// Connections through Sprig 2PC's relay, for this tenant (its
+    /// preamble names it); `node` is then the relay writer.
+    pub relay: Option<sprig_common::ids::TenantId>,
+    /// Connections of transaction branches (`SessionOpts::txn_branch`),
+    /// kept apart from the sessions' own.
+    pub branch: bool,
 }
 
 impl PoolKey {
@@ -197,6 +203,14 @@ pub(crate) fn close_all(conns: Vec<BackendConn>) {
     if let Ok(h) = tokio::runtime::Handle::try_current() {
         h.spawn(async move {
             for mut c in conns {
+                // Never COM_QUIT a relayed connection that may hold a
+                // branch: MariaDB would end the session (and roll back the
+                // held branch) before the relay hears the client went;
+                // closing the socket lets the relay decide. An idle one
+                // outside a transaction quits as usual.
+                if c.relayed && (c.client.in_transaction() || !c.client.is_idle()) {
+                    continue;
+                }
                 let _ = tokio::time::timeout(Duration::from_secs(1), c.client.quit()).await;
             }
         });

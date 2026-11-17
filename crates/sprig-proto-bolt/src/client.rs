@@ -91,6 +91,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> BoltClient<S> {
         })
     }
 
+    /// Keep-alive (NOOP) chunks the server sent so far.
+    #[must_use]
+    pub fn keepalives(&self) -> u64 {
+        self.dechunk.keepalives
+    }
+
     /// Sends one request.
     ///
     /// # Errors

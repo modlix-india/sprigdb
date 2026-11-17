@@ -18,6 +18,7 @@
 //! Shard maps come over the gateway's internal credential; without it the
 //! groups still show, with `maps_error` saying why.
 
+use sprig_catalog::pool_wait::Bounded as _;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -52,7 +53,7 @@ async fn catalog(
         return Err(invalid("the shards view needs a tenant login"));
     };
     let ep = sprig_catalog::CatalogLocator::writer(&*svc.locator, tid).await?;
-    let conn = ep.pool.get_conn().await.map_err(|e| {
+    let conn = ep.pool.get_conn_bounded().await.map_err(|e| {
         SprigError::new(
             SprigCode::CatalogUnavailable,
             "the tenant's catalog is unreachable",

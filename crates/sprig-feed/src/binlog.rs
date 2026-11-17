@@ -1,5 +1,4 @@
-//! [`TxnSource`] and [`Clusters`] on `sprig-binlog` (chapter 38, "The
-//! cluster reader").
+//! [`TxnSource`] and [`Clusters`] on `sprig-binlog`.
 //!
 //! A [`BinlogTxns`] is one dump connection (`sprig_repl`) asking for
 //! `ANNOTATE_ROWS` events, decoding rows only for one tenant's schemas and
@@ -23,13 +22,14 @@ use sprig_common::names::SchemaName;
 use sprig_common::{ErrorKind, Result, SprigCode, SprigError};
 use tokio::time::Instant;
 
+use crate::local_domains::{self, Plan};
 use crate::source::{
     Clusters, DumpScope, RawDdl, RawRow, RawTxn, RowKind, SourceItem, TableShape, TxnSource, XaMark,
 };
 
 /// The internal schema.
 pub const SYS_SCHEMA: &str = "__sprig_sys";
-/// The applier position tables (filter rule 2).
+/// The applier position tables (the tail's filter rule 2).
 pub const APPLY_TABLES: [&str; 2] = ["__sprig_mover_pos", "__sprig_ref_pos"];
 /// How often groups without the tenant's changes surface as progress.
 pub const IDLE_EVERY: Duration = Duration::from_millis(200);
@@ -155,6 +155,79 @@ fn history_lost(e: SprigError) -> SprigError {
     }
 }
 
+/// Whether `e` is the node refusing the start position (1236). Only the
+/// server's own error: a message that merely contains the number (a GTID
+/// sequence, say) isn't one.
+fn refused(e: &SprigError) -> bool {
+    matches!(e.kind, ErrorKind::Backend { errno: 1236, .. })
+}
+
+/// A start refused for events the reader needs: 39800, logged as an error
+/// and counted in `sprig_feed_history_lost_total`.
+fn lost(node: &str, why: String) -> SprigError {
+    tracing::error!(node, why = %why, "change feed: binlog events this reader needs are purged");
+    metrics::counter!("sprig_feed_history_lost_total", "node" => node.to_owned()).increment(1);
+    SprigError::new(SprigCode::FeedHistoryLost, why)
+}
+
+/// Starts a dump on `src` after `from`. When the node refuses it (1236),
+/// reads the node's binary logs ([`local_domains`]): purged node-local
+/// domains of a Galera node are added to the position (logged, and counted
+/// in `sprig_feed_local_domains_added_total`) and the dump starts again
+/// from there; a purge of events the reader needs is 39800, logged and
+/// counted. Returns the stream and the position it started from.
+async fn open_dump(
+    src: &BinlogSource,
+    from: &GtidPos,
+    opts: &StreamOptions,
+) -> Result<(BinlogStream, GtidPos)> {
+    let refusal = match BinlogStream::connect(src, from, opts).await {
+        Ok(s) => return Ok((s, from.clone())),
+        Err(e) if refused(&e) => e,
+        Err(e) => return Err(e),
+    };
+    let node = format!("{}:{}", src.host, src.port);
+    let logs = match local_domains::inspect(src, from).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(node, %from, error = %e, "binlog dump refused, and the node's binary log list couldn't be read");
+            return Err(history_lost(refusal));
+        }
+    };
+    match local_domains::plan(from, &logs) {
+        Plan::Start { pos, added } => {
+            for (new, old) in &added {
+                tracing::warn!(
+                    node,
+                    %from,
+                    domain = new.domain,
+                    old = old.map(|g| g.to_string()).unwrap_or_default(),
+                    %new,
+                    "binlog dump refused: the node purged the start of a GTID domain that holds only its own local writes; reading on with that domain from where the binary log holding the position starts"
+                );
+                metrics::counter!(
+                    "sprig_feed_local_domains_added_total",
+                    "node" => node.clone(),
+                    "domain" => new.domain.to_string()
+                )
+                .increment(1);
+            }
+            match BinlogStream::connect(src, &pos, opts).await {
+                Ok(s) => Ok((s, pos)),
+                Err(e) if refused(&e) => Err(lost(
+                    &node,
+                    format!(
+                        "node {node} refused a dump from {pos} too, after its local domains were added: {e}"
+                    ),
+                )),
+                Err(e) => Err(e),
+            }
+        }
+        Plan::Lost(why) => Err(lost(&node, format!("{why} (dump from {from})"))),
+        Plan::Other => Err(history_lost(refusal)),
+    }
+}
+
 #[derive(Debug)]
 struct Group {
     txn: RawTxn,
@@ -165,7 +238,7 @@ struct Group {
 }
 
 /// One open binlog dump in `sprig_feed_binlog_dumps` (node, kind): +1
-/// while it lives (R9, r9feed: "dumps per node").
+/// while it lives ("dumps per node").
 struct DumpGauge {
     node: String,
     kind: &'static str,
@@ -212,10 +285,12 @@ impl std::fmt::Debug for BinlogTxns {
 
 impl BinlogTxns {
     /// Starts a dump on `src` after `from` for `tenant`, presenting
-    /// `server_id`.
+    /// `server_id`. A Galera node's purged local domains are added to the
+    /// position ([`local_domains`]).
     ///
     /// # Errors
-    /// 39800 when the node lacks `from`; the reader's errors.
+    /// 39800 when the node no longer has events after `from` that the
+    /// reader needs; the reader's errors.
     pub async fn connect(
         src: &BinlogSource,
         tenant: TenantId,
@@ -228,14 +303,12 @@ impl BinlogTxns {
             is_tenant_schema(schema, tenant)
                 || (schema == SYS_SCHEMA && APPLY_TABLES.contains(&table))
         }));
-        let stream = BinlogStream::connect(src, from, &opts)
-            .await
-            .map_err(history_lost)?;
+        let (stream, pos) = open_dump(src, from, &opts).await?;
         Ok(Self {
             stream,
             tenant,
             scope: None,
-            pos: from.clone(),
+            pos,
             group: None,
             shapes: HashMap::new(),
             quiet_since: None,
@@ -247,10 +320,13 @@ impl BinlogTxns {
     /// cluster, keeping what `scope` says (and the applier marks): rows of
     /// its internal tables in every tenant's shard and reference schemas,
     /// and everything of the tenants it keeps whole, with their DDL and
-    /// statement-format DML. [`crate::shared`] splits it by tenant.
+    /// statement-format DML. [`crate::shared`] splits it by tenant. A
+    /// Galera node's purged local domains are added to the position
+    /// ([`local_domains`]).
     ///
     /// # Errors
-    /// 39800 when the node lacks `from`; the reader's errors.
+    /// 39800 when the node no longer has events after `from` that the
+    /// reader needs; the reader's errors.
     pub async fn connect_scope(
         src: &BinlogSource,
         scope: Arc<DumpScope>,
@@ -266,9 +342,7 @@ impl BinlogTxns {
             }
             keep.keeps(schema, table)
         }));
-        let stream = BinlogStream::connect(src, from, &opts)
-            .await
-            .map_err(history_lost)?;
+        let (stream, pos) = open_dump(src, from, &opts).await?;
         let kind = if scope.only.is_some() {
             "catchup"
         } else {
@@ -278,7 +352,7 @@ impl BinlogTxns {
             stream,
             tenant: TenantId(0),
             scope: Some(scope),
-            pos: from.clone(),
+            pos,
             group: None,
             shapes: HashMap::new(),
             quiet_since: None,
@@ -501,7 +575,7 @@ pub struct StaticClusters {
     next_server_id: Arc<AtomicU32>,
 }
 
-/// The first binlog client server id the feed presents (chapter 10's
+/// The first binlog client server id the feed presents (the mover's
 /// `mover.server_id_base` is 4000000000; the feed takes the range above
 /// 4100000000).
 pub const SERVER_ID_BASE: u32 = 4_100_000_000;

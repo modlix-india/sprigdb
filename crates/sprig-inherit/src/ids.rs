@@ -1,12 +1,11 @@
-//! One id sequence per table for the whole tree (Kiran's decision 3, 11
-//! November 2026).
+//! One id sequence per table for the whole tree.
 //!
 //! Each tenant's copy of an inheritable table used to keep its own
 //! `AUTO_INCREMENT` counter, so a child's new row could take an id its
 //! parent already used and hide the parent's row in its view (nearest level
 //! wins). Now every `INSERT` into an inheritable object with an
 //! `AUTO_INCREMENT` column takes the generated values from one sequence
-//! for the table's whole tree: chapter 19's ID blocks, kept in the
+//! for the table's whole tree: a global sequence's ID blocks, kept in the
 //! catalog of the tree's **root** tenant (the topmost tenant from which
 //! the table is shared down to this one), keyed by the root's object id.
 //! An id then names the same row at every level, and foreign keys are
@@ -41,7 +40,7 @@ use crate::view::q;
 use crate::{Handled, Runner};
 
 /// Tree sequences' ids in the root's `sequences`: the root object's id
-/// with this bit, apart from chapter 19's (an object's own id).
+/// with this bit, apart from the object's own sequence (its own id).
 pub const TREE_SEQ: u64 = 1 << 62;
 
 /// A table's tree sequence.

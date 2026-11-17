@@ -181,13 +181,20 @@ async fn the_stream_has_one_line_per_event() {
     assert_eq!(r.lines[0]["share_data"], false);
     let end = r.lines.last().unwrap();
     assert_eq!(end["stop"], "end_turn");
+    // The end line names the stored answer: the last assistant message.
+    let stored = r.audit.messages(ConvId(1)).await.unwrap();
+    let answer = stored
+        .iter()
+        .rfind(|m| m.kind == MsgKind::Assistant)
+        .unwrap();
+    assert_eq!(end["message_id"], answer.id.to_string());
     let text: String = r
         .lines
         .iter()
         .filter(|l| l["type"] == "text")
         .map(|l| l["text"].as_str().unwrap())
         .collect();
-    assert_eq!(text, "Let me look.It has an email column.");
+    assert_eq!(text, "Let me look.\n\nIt has an email column.");
     assert_eq!(*r.host.calls.lock().unwrap(), ["describe"]);
 }
 
@@ -445,8 +452,17 @@ fn every_event_maps_to_a_typed_line() {
     use sprig_ai::provider::Stop;
     let lines = chat::event_json(&TurnEvent::End {
         stop: Stop::Other("max_tool_rounds".into()),
+        message: None,
     });
     assert_eq!(lines[0]["detail"], "max_tool_rounds");
+    assert!(lines[0].get("message_id").is_none());
+    // The stored answer's id, as conversation reads show it.
+    let end = TurnEvent::End {
+        stop: Stop::EndTurn,
+        message: Some(12),
+    };
+    assert_eq!(chat::event_json(&end)[0]["message_id"], "12");
+    assert_eq!(chat::event_json_as(&end, true)[0]["message_id"], "a12");
     let lines = chat::event_json(&TurnEvent::ToolEnd {
         id: "a".into(),
         name: "describe".into(),
@@ -454,6 +470,22 @@ fn every_event_maps_to_a_typed_line() {
         reduced: false,
     });
     assert_eq!(lines[0]["type"], "tool_end");
+    // A query's rows reach the user whole.
+    let lines = chat::event_json(&TurnEvent::Result {
+        id: "q".into(),
+        name: "run_query".into(),
+        result: sprig_ai::tools::ResultSet {
+            columns: vec![sprig_ai::tools::Column {
+                name: "n".into(),
+                ty: "bigint".into(),
+            }],
+            rows: vec![vec![serde_json::json!(42)]],
+            row_count: 1,
+            truncated: false,
+        },
+    });
+    assert_eq!(lines[0]["type"], "result");
+    assert_eq!(lines[0]["result"]["rows"][0][0], 42);
     assert_eq!(super::pct("a b/ü"), "a%20b%2F%C3%BC");
 }
 
@@ -629,4 +661,26 @@ async fn admin_turns_are_budgeted_too() {
     )
     .await;
     assert_eq!(admin.usage_today(UserId(9)).await.unwrap().user, 120);
+}
+
+#[test]
+fn whoami_lists_the_roles_with_a_model() {
+    let models = |d: &str, a: &str| {
+        vec![
+            (Role::Data, d.to_owned()),
+            (Role::Dba, String::new()),
+            (Role::Admin, a.to_owned()),
+        ]
+    };
+    assert_eq!(
+        super::ai_roles(true, true, &models("anthropic/m", "")),
+        ["data"]
+    );
+    // An operator without a tenant gets only the administration role.
+    assert_eq!(
+        super::ai_roles(true, false, &models("anthropic/m", "anthropic/m")),
+        ["admin"]
+    );
+    // No provider store: nothing, whatever the settings say.
+    assert!(super::ai_roles(false, true, &models("anthropic/m", "anthropic/m")).is_empty());
 }

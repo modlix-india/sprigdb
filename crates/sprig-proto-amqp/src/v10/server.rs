@@ -262,6 +262,12 @@ where
         }
     };
     write(&mut wr, &mut out).await?;
+    // The vhost's own limit (its tenant's or database's), else the
+    // listener's: links advertise it and transfers are held to it.
+    let mut cfg = cfg.clone();
+    if let Some(max) = svc.backend.max_message_bytes(&principal, &vhost_name).await {
+        cfg.max_message_bytes = max;
+    }
     let mut conn = Conn {
         svc,
         cfg: cfg.clone(),

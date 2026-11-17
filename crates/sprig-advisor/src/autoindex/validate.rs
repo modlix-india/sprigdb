@@ -30,6 +30,7 @@
 
 pub mod canary;
 pub mod galera;
+pub mod journal;
 pub(crate) mod node;
 pub mod orphans;
 pub mod replica;

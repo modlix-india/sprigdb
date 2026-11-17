@@ -1,4 +1,4 @@
-//! The `inherit.*` keys this crate reads (chapter 42, "Configuration").
+//! The `inherit.*` keys this crate reads.
 //! The gateway resolves them at tenant scope for each statement
 //! ([`crate::Limits`]). The `copy_*`, `federated_*` keys belong to the
 //! materialized and federated modes, which are not built, and are not
@@ -77,8 +77,8 @@ pub static READ_THROUGH_MAX_DEPTH: Setting<u64> = Setting {
 sprig_settings::register!(READ_THROUGH_MAX_DEPTH);
 
 /// `inherit.sync_orphan_max_rows`: rows per key orphaned in the deleting
-/// transaction (R6 orphans every row synchronously; the key is read for
-/// the decision log only).
+/// transaction (every row is orphaned synchronously for now; the key is
+/// registered but not enforced yet).
 pub static SYNC_ORPHAN_MAX_ROWS: Setting<u64> = Setting {
     key: "inherit.sync_orphan_max_rows",
     default: 1000,

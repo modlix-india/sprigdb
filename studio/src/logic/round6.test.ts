@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { autoRollback } from './api';
+import { pickedBy } from './Rollout';
 import { declaration, dependentsOf, dropStatement, rolloutStatement } from './declaration';
 import { argValue, budgetLines, jsonField, kirunParams, mocks, parseParams, snapshotRows } from './testrun';
 
-describe('test runs (round 6, RC13–RC17)', () => {
+describe('test runs', () => {
   it('reads parameters from the form and from a KIRun definition', () => {
     expect(parseParams('a BIGINT, n DECIMAL(10,2), IN `s` VARCHAR(40)')).toEqual([
       { name: 'a', type: 'BIGINT' },
@@ -57,7 +58,7 @@ describe('test runs (round 6, RC13–RC17)', () => {
   });
 });
 
-describe('rollout and drop (round 6, RC18–RC22)', () => {
+describe('rollout and drop', () => {
   const form = { kind: 'function' as const, name: 'f', runtime: 'javascript' as const, params: 'a BIGINT', returns: 'BIGINT', security: 'invoker' as const, tier: 'auto' as const, body: 'return a;' };
   it('deploys as a stage', () => {
     expect(declaration('shop', { ...form, rollout: { pct: 10, by: 'user' } })).toContain("WITH (SPRIG_TIER = 'auto', SPRIG_ROLLOUT = 10) AS");
@@ -71,6 +72,16 @@ describe('rollout and drop (round 6, RC18–RC22)', () => {
     expect(rolloutStatement('shop', 'function', 'f', 'promote')).toBe('ALTER FUNCTION `shop`.`f` ROLLOUT PROMOTE');
     expect(rolloutStatement('shop', 'function', 'f', 'abort')).toBe('ALTER FUNCTION `shop`.`f` ROLLOUT ABORT');
     expect(() => rolloutStatement('shop', 'function', 'f', { to: 0 })).toThrow();
+  });
+  it('moves a trigger’s rollout, which picks by record key alone', () => {
+    expect(rolloutStatement('shop', 'trigger', 't', { to: 50 })).toBe('ALTER TRIGGER `shop`.`t` ROLLOUT TO 50');
+    expect(rolloutStatement('shop', 'trigger', 't', 'promote')).toBe('ALTER TRIGGER `shop`.`t` ROLLOUT PROMOTE');
+    expect(rolloutStatement('shop', 'trigger', 't', 'abort')).toBe('ALTER TRIGGER `shop`.`t` ROLLOUT ABORT');
+    expect(() => rolloutStatement('shop', 'trigger', 't', { to: 50, by: 'tenant' })).toThrow(/record key/);
+    expect(pickedBy({ key: null }, 'trigger')).toMatch(/^record key/);
+    expect(pickedBy({ key: 0 }, 'function')).toMatch(/^argument 1 /);
+    expect(pickedBy('tenant', 'function')).toMatch(/^tenant/);
+    expect(pickedBy('user', 'procedure')).toMatch(/^caller/);
   });
   it('drops with RESTRICT, then CASCADE, and reads 39875', () => {
     expect(dropStatement('shop', 'function', 'f', false)).toBe('DROP FUNCTION `shop`.`f` RESTRICT');

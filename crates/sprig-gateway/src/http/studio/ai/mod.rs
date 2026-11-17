@@ -9,6 +9,9 @@
 //! | `GET /v1/ai/glossary?status=` | The tenant glossary (`accepted`, `proposed` or `all`) |
 //! | `POST /v1/ai/glossary` | Adds or replaces an accepted term `{term, definition, sql?, tables?}` (tenant administrators) |
 //! | `POST /v1/ai/glossary/{term}:accept`, `:reject`, `:delete` | Decides a proposal, or deletes a term (tenant administrators) |
+//! | `GET /v1/ai/digests?limit=` | The tenant's digests, newest first (tenant administrators) |
+//! | `GET /v1/ai/digests/{id}?payloads=` | One digest: its facts, the model's words, and what was sent to word it (`payloads=true` adds the exact payloads) |
+//! | `POST /v1/ai/proposals/{id}:accept`, `:dismiss` | Acts on a proposal `{confirm?, note?}`: runs a statement as the caller, files advice, accepts a term ([`proposals`]) |
 //! | `POST`, `DELETE /v1/mcp` | The MCP server: the tenant assistants' tools for outside agents ([`mcp`]) |
 //!
 //! **Who.** Every route runs as the signed-in caller (a Studio session,
@@ -40,6 +43,8 @@ pub mod ask;
 pub mod chat;
 pub mod host;
 pub mod mcp;
+pub mod proposals;
+pub mod schema_check;
 pub mod system;
 
 #[cfg(test)]
@@ -153,6 +158,18 @@ fn service() -> Result<Arc<AiService>, SprigError> {
     })
 }
 
+/// The provider and model a `provider/model` value names, for the AI
+/// functions in statements.
+///
+/// # Errors
+/// 39990 without a provider store, or when the value names no provider.
+pub(crate) async fn provider_for(
+    model: &str,
+) -> Result<(Arc<dyn sprig_ai::Provider>, String), SprigError> {
+    let svc = service()?;
+    svc.providers.for_role(Role::Data, model, &*svc.keys).await
+}
+
 // ---- settings ----
 
 /// The `ai.*` values for a caller: the tenant's (and database's) scopes,
@@ -173,6 +190,63 @@ impl Lookup for GatewayLookup<'_> {
     fn text(&self, s: &'static Setting<std::borrow::Cow<'static, str>>) -> String {
         self.st.tenant_get(s, self.tenant, self.db).to_string()
     }
+}
+
+/// `WhoAmI`'s `ai`: whether the assistants are on for the caller's tenant
+/// (`ai.enabled`), whether results may leave (`ai.share_data` at the
+/// tenant's scope; a database may differ, and each turn's `start` line says
+/// what applied), and the roles the caller may chat with that have a model
+/// (`ai.model.<role>`) on a gateway with a provider store. Studio shows the
+/// assistant's controls only when a role is listed.
+pub(crate) fn whoami_json(st: &StudioState, tenant: Option<TenantId>, operator: bool) -> Value {
+    let l = GatewayLookup {
+        st,
+        tenant,
+        db: None,
+    };
+    let g = GatewayLookup {
+        st,
+        tenant: None,
+        db: None,
+    };
+    let model = |l: &GatewayLookup<'_>, r: Role| TurnSettings::read(l, r).model;
+    let roles = ai_roles(
+        SERVICE.get().is_some(),
+        tenant.is_some(),
+        &[
+            (Role::Data, model(&l, Role::Data)),
+            (Role::Dba, model(&l, Role::Dba)),
+            (
+                Role::Admin,
+                if operator {
+                    model(&g, Role::Admin)
+                } else {
+                    String::new()
+                },
+            ),
+        ],
+    );
+    json!({
+        "enabled": tenant.is_some() && l.flag(&sprig_ai::settings::ENABLED),
+        "share_data": tenant.is_some() && l.flag(&sprig_ai::settings::SHARE_DATA),
+        "roles": roles,
+    })
+}
+
+/// The roles [`whoami_json`] lists: a tenant role when the caller has a
+/// tenant and the role has a model, the administration role when it has
+/// one (the caller passes an empty model unless they are an operator);
+/// none without a provider store.
+pub(crate) fn ai_roles(
+    installed: bool,
+    tenant: bool,
+    models: &[(Role, String)],
+) -> Vec<&'static str> {
+    models
+        .iter()
+        .filter(|(r, m)| installed && !m.trim().is_empty() && (tenant || !r.is_tenant()))
+        .map(|(r, _)| r.as_str())
+        .collect()
 }
 
 // ---- tenant stores ----
@@ -270,6 +344,24 @@ pub(super) async fn route(
                 return Err(invalid("POST /v1/ai/glossary/{term}:accept|reject|delete"));
             };
             glossary_verb(core, &caller, term, verb).await
+        }
+        ("GET", "digests") => digests(core, &caller, None, &query).await,
+        ("GET", r) if r.starts_with("digests/") => {
+            let id = r.trim_start_matches("digests/");
+            digests(core, &caller, Some(id), &query).await
+        }
+        ("POST", r) if r.starts_with("proposals/") => {
+            let seg = r.trim_start_matches("proposals/");
+            let Some((id, verb)) = seg.rsplit_once(':') else {
+                return Err(invalid("POST /v1/ai/proposals/{id}:accept|dismiss"));
+            };
+            let raw = read_body(req).await?;
+            let b = if raw.iter().all(u8::is_ascii_whitespace) {
+                json!({})
+            } else {
+                parse_json(&raw)?
+            };
+            proposals::route(core, &caller, id, verb, &b).await
         }
         _ => Err(invalid(format!("no route {method} {path}"))),
     }
@@ -446,13 +538,14 @@ async fn chat_route(
         }
     };
     let cfg = TurnConfig::from_settings(role, &settings, model);
-    let host = Arc::new(host::GatewayHost::new(
-        Arc::clone(core),
-        caller.clone(),
-        settings.share_data,
-    ));
+    let host = Arc::new(
+        host::GatewayHost::new(Arc::clone(core), caller.clone(), settings.share_data)
+            .for_role(role),
+    );
     let turn = chat::Turn {
-        agent: Agent::new(provider, ToolRegistry::builtin(), audit),
+        // The chat shows the user every result in full; the model gets
+        // what the egress gate lets through.
+        agent: Agent::new(provider, ToolRegistry::builtin(), audit).showing_results(),
         cfg,
         req: TurnRequest {
             tenant: if role.is_tenant() {
@@ -747,6 +840,97 @@ async fn feedback_route(
 ) -> Result<Response<Body>, SprigError> {
     let v = views(core, caller).await?;
     Ok(json_response(200, &feedback_json(&v, b).await?))
+}
+
+fn digest_json(d: &sprig_ai::digest::Digest, whole: bool) -> Value {
+    let mut v = json!({
+        "id": d.id.to_string(),
+        "cadence": d.cadence.as_str(),
+        "from_ms": d.from_ms,
+        "to_ms": d.to_ms,
+        "status": d.status.as_str(),
+        "model": d.model,
+        "note": d.note,
+        "conversation": d.conversation.map(|c| c.to_string()),
+        "emailed_ms": d.emailed_ms,
+        "created_ms": d.created_ms,
+        "notable": d.facts.notable(),
+    });
+    if whole {
+        v["body"] = json!(d.body());
+        v["facts_text"] = json!(d.facts_text);
+        v["text"] = json!(d.text);
+        v["facts"] = json!(d.facts);
+        v["usage"] = d.usage.clone();
+    }
+    v
+}
+
+/// `GET /v1/ai/digests[/{id}]`: the tenant's digests, for its
+/// administrators (a digest covers every database of the tenant).
+async fn digests(
+    core: &Arc<Core>,
+    caller: &Caller,
+    id: Option<&str>,
+    query: &str,
+) -> Result<Response<Body>, SprigError> {
+    use sprig_ai::digest::{CatalogDigests, DigestStore};
+    let (Some(svc), Some(tid)) = (&core.studio.tenants, caller.principal.tenant) else {
+        return Err(invalid("digests need a tenant login"));
+    };
+    if !tenant_admin(core, caller).await? {
+        return Err(SprigError::standard(
+            1227,
+            *b"42000",
+            "Access denied; the tenant's digests need SPRIG_TENANT_ADMIN",
+        ));
+    }
+    let ep = sprig_catalog::CatalogLocator::writer(&*svc.locator, tid).await?;
+    let schema = ep.store.schema().to_owned();
+    let store = CatalogDigests::new(ep.pool.clone(), schema.clone());
+    let have = store.exists().await?;
+    let Some(id) = id else {
+        let limit = query_value(query, "limit")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(20)
+            .clamp(1, MAX_LIST);
+        let list = if have {
+            store.list(limit).await?
+        } else {
+            Vec::new()
+        };
+        return Ok(json_response(
+            200,
+            &json!({"digests": list.iter().map(|d| digest_json(d, false)).collect::<Vec<_>>()}),
+        ));
+    };
+    let n: u64 = id
+        .parse()
+        .map_err(|_| invalid("digests/{id} takes a digest id"))?;
+    let d = if have { store.get(n).await? } else { None }
+        .ok_or_else(|| invalid(format!("there is no digest {id}")))?;
+    let mut v = digest_json(&d, true);
+    // What was sent to word it: the stored turn's notes.
+    if let Some(c) = d.conversation {
+        let payloads = query_value(query, "payloads") == Some("true");
+        let audit = CatalogAudit::new(ep.pool.clone(), schema);
+        let sent: Vec<Value> = audit
+            .messages(ConvId(c))
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| m.kind == sprig_ai::MsgKind::SystemNote)
+            .map(|m| {
+                let mut body = m.body;
+                if !payloads && let Some(o) = body.as_object_mut() {
+                    o.remove("payload");
+                }
+                body
+            })
+            .collect();
+        v["sent"] = Value::Array(sent);
+    }
+    Ok(json_response(200, &v))
 }
 
 async fn glossary_list(

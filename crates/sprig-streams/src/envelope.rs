@@ -17,8 +17,9 @@
 //! key-value namespaces, Redis structures and graphs wait for their
 //! models' feed decoding. `source.tenant` is the tenant id.
 //! `DECIMAL` values are JSON numbers (trailing zeros are lost: `49.90` is
-//! `49.9`); binary strings and spatial values are base64; temporal values
-//! are their MariaDB text.
+//! `49.9`), or their text when a double can't hold them exactly
+//! (`"12345678901234567890.1234567891"`); binary strings and spatial
+//! values are base64; temporal values are their MariaDB text.
 
 use serde_json::{Map, Value as J, json};
 use sprig_binlog::Value;
@@ -36,11 +37,7 @@ pub fn json_of(v: &Value) -> J {
         Value::UInt(u) => json!(u),
         Value::Float(f) => json!(f),
         Value::Double(d) => json!(d),
-        Value::Decimal(s) => s
-            .parse::<f64>()
-            .ok()
-            .and_then(serde_json::Number::from_f64)
-            .map_or_else(|| J::String(s.clone()), J::Number),
+        Value::Decimal(s) => decimal(s),
         Value::Bit(b) | Value::Set(b) => json!(b),
         Value::Year(y) => json!(y),
         Value::Enum(e) => json!(e),
@@ -51,6 +48,34 @@ pub fn json_of(v: &Value) -> J {
         Value::String(b) => J::String(String::from_utf8_lossy(b).into_owned()),
         Value::Bytes(b) | Value::Geometry(b) => J::String(base64(b)),
     }
+}
+
+/// A `DECIMAL` as a JSON number when a double holds it exactly, else as
+/// its text: a rounded number would decide differently from the table in
+/// a reader's row-level security policy (`amount <= 12345678901234567000`
+/// passing a row whose amount is `12345678901234567890.12`), and would
+/// tell the reader a value the row doesn't have.
+fn decimal(s: &str) -> J {
+    s.parse::<f64>()
+        .ok()
+        .filter(|f| f.is_finite() && same_decimal(s, &format!("{f}")))
+        .and_then(serde_json::Number::from_f64)
+        .map_or_else(|| J::String(s.to_owned()), J::Number)
+}
+
+/// Whether two plain decimal texts (no exponent) are the same number.
+fn same_decimal(a: &str, b: &str) -> bool {
+    fn norm(s: &str) -> Option<(bool, &str, &str)> {
+        let (neg, s) = s.strip_prefix('-').map_or((false, s), |r| (true, r));
+        let (int, frac) = s.split_once('.').unwrap_or((s, ""));
+        if !int.bytes().chain(frac.bytes()).all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let int = int.trim_start_matches('0');
+        let frac = frac.trim_end_matches('0');
+        Some((neg && !(int.is_empty() && frac.is_empty()), int, frac))
+    }
+    matches!((norm(a), norm(b)), (Some(x), Some(y)) if x == y)
 }
 
 /// Standard base64 with padding.
@@ -234,6 +259,24 @@ mod tests {
         let d = record_of(&event(Op::Truncate), &cx).unwrap();
         assert_eq!(d.partition, PartitionNo(0));
         assert!(d.key.is_none());
+    }
+
+    #[test]
+    fn decimals_stay_exact() {
+        let d = |s: &str| json_of(&Value::Decimal(s.to_owned()));
+        assert_eq!(d("49.90"), json!(49.9));
+        assert_eq!(d("-12.340"), json!(-12.34));
+        assert_eq!(d("0.000"), json!(0.0));
+        assert_eq!(d("-0.00"), json!(0.0));
+        assert_eq!(
+            d("12345678901234567890.1234567891"),
+            json!("12345678901234567890.1234567891")
+        );
+        assert_eq!(d("9007199254740993"), json!("9007199254740993"));
+        assert_eq!(
+            d("0.1000000000000000055511151231257827"),
+            json!("0.1000000000000000055511151231257827")
+        );
     }
 
     #[test]

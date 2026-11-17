@@ -1,4 +1,4 @@
-//! Global lookup indexes in SQL (chapter 19): the gateway's side of
+//! Global lookup indexes in SQL: the gateway's side of
 //! `sprig_shard::lookup::admin`.
 //!
 //! - **`SPRIG SHOW LOOKUP INDEXES [FROM t]`** (also `SHOW SPRIG LOOKUP
@@ -23,7 +23,8 @@
 //!
 //! A unique lookup whose build fails because its values repeat across
 //! shards raises an `advisor.lookup` approvals item naming the table, the
-//! key and up to 10 of the values ([`raise_duplicates`]); approving it
+//! key and up to 10 of the values, through the controller so that it
+//! notifies ([`raise_duplicates`]); approving it
 //! once the values are fixed builds the lookup (the controller's sharding
 //! loop applies it).
 
@@ -36,6 +37,7 @@ use bytes::Bytes;
 use mysql_async::Conn;
 use mysql_async::prelude::Queryable;
 use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::{DbState, Namespace, ObjectKind, ObjectState};
 use sprig_catalog::{CatalogLocator, Target, TenantCatalog, VersionKind};
 use sprig_common::ids::{ClusterId, DbId, GroupId, ObjectId, TenantId};
@@ -73,6 +75,30 @@ pub fn settings(svc: &TenantServices, tenant: TenantId) -> LookupSettings {
     } else {
         let ctx = sprig_settings::SettingCtx::process(&svc.dc).for_tenant(tenant, &[]);
         LookupSettings::resolve(&ctx, |k, c| svc.settings.get(k, c, None))
+    }
+}
+
+/// `lookup.lock_wait_seconds` for claims and owner checks on `owner`'s
+/// lookups, at the owner table's scope, with `cat`'s rows.
+#[must_use]
+pub fn lock_wait_in(svc: &TenantServices, cat: &TenantCatalog, owner: ObjectId) -> u64 {
+    let ctx = cat.object_ctx(&svc.dc, owner);
+    svc.settings
+        .get(
+            &sprig_shard::lookup::settings::LOCK_WAIT_SECONDS,
+            &ctx,
+            Some(&cat.settings),
+        )
+        .max(1)
+}
+
+/// [`lock_wait_in`] with `tenant`'s cached catalog; without it, the
+/// tenant's value from the etcd scopes.
+#[must_use]
+pub fn lock_wait_seconds(svc: &TenantServices, tenant: TenantId, owner: ObjectId) -> u64 {
+    match svc.cache.cached(tenant) {
+        Some(cat) => lock_wait_in(svc, &cat, owner),
+        None => settings(svc, tenant).lock_wait_seconds,
     }
 }
 
@@ -140,7 +166,7 @@ impl LookupHost for GwHost {
     async fn catalog(&self) -> Result<Conn> {
         let ep = self.svc.locator.writer(self.tenant).await?;
         let schema = ep.store.schema().to_owned();
-        let mut c = ep.pool.get_conn().await.map_err(catalog_err)?;
+        let mut c = ep.pool.get_conn_bounded().await.map_err(catalog_err)?;
         sprig_shard::groups::migrate(&mut c, &schema).await?;
         c.query_drop(format!("USE {}", sprig_common::names::quote(&schema)))
             .await
@@ -148,10 +174,23 @@ impl LookupHost for GwHost {
         Ok(c)
     }
 
+    /// Builds write the tenant's lookup rows: for a tenant on Sprig 2PC's
+    /// relay path, through the cluster's relay writer, so the relay fence
+    /// ends them with the tenant's own connections.
     async fn pools(&self, clusters: &[ClusterId]) -> Result<Pools> {
+        let dc = self.svc.locator.dc_store();
         let mut m = HashMap::new();
         for c in clusters {
-            m.insert(c.clone(), self.svc.locator.ctl_pool(c).await?);
+            let direct = self.svc.locator.ctl_pool(c).await?;
+            let pool = sprig_cluster::failover::relay_pools::tenant_pool(
+                &dc,
+                self.tenant,
+                c,
+                direct,
+                sprig_txn::fence::wire::preamble,
+            )
+            .await?;
+            m.insert(c.clone(), pool);
         }
         Ok(Arc::new(m))
     }
@@ -168,6 +207,10 @@ impl LookupHost for GwHost {
         Ok(())
     }
 
+    fn lock_wait_seconds(&self, _db: DbId, owner: ObjectId) -> u64 {
+        lock_wait_seconds(&self.svc, self.tenant, owner)
+    }
+
     async fn duplicates(&self, report: &DuplicateReport) {
         if let Err(e) = raise_duplicates(&self.svc, self.tenant, report, self.ddl).await {
             tracing::warn!(tenant = %self.tenant, table = %report.table, key = %report.key,
@@ -181,6 +224,12 @@ impl LookupHost for GwHost {
 /// for an approval with no timers: approving it after the values are
 /// fixed builds the lookup. A live item for the same target is refreshed
 /// with the new evidence instead of a second one.
+///
+/// The item is raised through the controller's approval gate
+/// (`/admin/v1/recommendations:gate`), whose hooks notify, as for the
+/// controller's own items. When the controller can't be reached (or
+/// refuses), the gateway writes the item into the tenant's catalog itself:
+/// it is there for people, but no notification goes out.
 ///
 /// # Errors
 /// The catalog's.
@@ -212,6 +261,53 @@ pub async fn raise_duplicates(
         (r.action_text(&db_name), r.machine())
     };
     machine["ddl"] = serde_json::Value::Bool(ddl);
+    let summary = r.summary(&db_name, ddl);
+    if let Some(admin) = crate::tenant::rec_sql::admin() {
+        // The gate prefixes `t<tenant>/`.
+        let target = r.target(tenant);
+        let target = target
+            .strip_prefix(&format!("t{tenant}/"))
+            .unwrap_or(&target);
+        let body = serde_json::json!({
+            "op": "check",
+            "kind": Kind::AdvisorLookup.as_str(),
+            "tenant": tenant.0,
+            "db": db_name,
+            "target": target,
+            "action": text,
+            "machine": machine,
+            "evidence": r.evidence(),
+            "summary": summary,
+            "score": score,
+            "object": r.owner.0,
+            "object_name": r.table,
+        });
+        match admin
+            .forward_internal(
+                &hyper::Method::POST,
+                "/admin/v1/recommendations:gate",
+                Bytes::from(body.to_string()),
+            )
+            .await
+        {
+            Ok(reply) if reply.status < 300 => {
+                let v: serde_json::Value = serde_json::from_slice(&reply.body).unwrap_or_default();
+                tracing::info!(tenant = %tenant, table = %r.table, key = %r.key,
+                    values = r.found.values, why = %v.get("why").and_then(serde_json::Value::as_str).unwrap_or(""),
+                    "approvals item raised for a lookup's duplicates, through the controller");
+                return Ok(());
+            }
+            Ok(reply) => {
+                tracing::warn!(tenant = %tenant, status = reply.status,
+                    body = %String::from_utf8_lossy(&reply.body),
+                    "the controller refused a lookup's duplicates item; writing it without a notification");
+            }
+            Err(e) => {
+                tracing::warn!(tenant = %tenant, error = %e,
+                    "the controller is unreachable; writing a lookup's duplicates item without a notification");
+            }
+        }
+    }
     let p = Proposal {
         kind: Kind::AdvisorLookup,
         subject,
@@ -219,7 +315,7 @@ pub async fn raise_duplicates(
         action: Action { text, machine },
         evidence: r.evidence(),
         score,
-        summary: r.summary(&db_name, ddl),
+        summary,
         emergency: false,
     };
     let locator: Arc<dyn sprig_catalog::CatalogLocator> = svc.locator.clone();
@@ -448,7 +544,7 @@ pub async fn drop_owned(
 pub async fn records(svc: &Arc<TenantServices>, tenant: TenantId) -> Result<Vec<LookupRecord>> {
     let ep = svc.locator.writer(tenant).await?;
     let schema = ep.store.schema().to_owned();
-    let mut c = ep.pool.get_conn().await.map_err(catalog_err)?;
+    let mut c = ep.pool.get_conn_bounded().await.map_err(catalog_err)?;
     let has: Option<u64> = c
         .exec_first(
             "SELECT COUNT(*) FROM information_schema.TABLES \
@@ -489,7 +585,7 @@ fn schema_db(tenant: TenantId, schema: &str) -> Option<DbId> {
 }
 
 /// Grants on the lookup tables of the tables accounts hold table or
-/// column grants on (Q50): a user granted only some tables reaches their
+/// column grants on: a user granted only some tables reaches their
 /// lookups the way a database-wide grant does, and no others.
 ///
 /// - `SELECT` on the owner gives `SELECT` on its lookup tables (routing
@@ -599,7 +695,7 @@ pub async fn add_lookup_grants(
         return Ok(());
     }
     let pool = svc.locator.ctl_pool(cluster).await?;
-    let mut conn = pool.get_conn().await.map_err(|e| {
+    let mut conn = pool.get_conn_bounded().await.map_err(|e| {
         SprigError::new(
             SprigCode::BackendUnavailable,
             format!("sprig_ctl on {cluster}: {e}"),
@@ -981,7 +1077,7 @@ pub async fn execute(
                 .ok_or_else(|| SprigError::internal("a group without shards"))?;
             let schema = sprig_shard::shard_schema(ts.tenant, m.db, m.group, r0.shard);
             let pool = svc.locator.ctl_pool(&r0.cluster).await?;
-            let mut sc = pool.get_conn().await.map_err(catalog_err)?;
+            let mut sc = pool.get_conn_bounded().await.map_err(catalog_err)?;
             let shape = owner_shape(&mut sc, &schema, &tname).await?;
             let Some((key, cols)) = lookup_keys(&shape, &m.key)
                 .into_iter()
@@ -996,6 +1092,8 @@ pub async fn execute(
                     ),
                 ));
             };
+            // Back before the build, which takes connections of its own.
+            drop(sc);
             let r = build_for_key(&svc, ts.tenant, object, &tname, &key, &cols, false).await?;
             Ok(LookupAnswer::Ok { affected: r.rows })
         }

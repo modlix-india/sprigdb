@@ -17,6 +17,14 @@
 //!   [`PeerHandoff`] is the calling side. A
 //!   gateway of another DC is found in that DC's tier of the one etcd
 //!   (single-etcd mode, like the locator's remote maps).
+//! - `WatchChanges`: a change stream of a tenant homed in this DC, opened
+//!   at a gateway of another DC, served here and relayed there
+//!   ([`crate::http::changes`]).
+//! - `InheritedMembers`: a declarer's `FOR EACH TENANT` change for the
+//!   members this DC indexes ([`crate::inherited::remote`]).
+//! - `TailFeed`: the change feed of a tenant homed in this DC, for a
+//!   MongoDB change stream opened at a gateway of another DC
+//!   ([`crate::mongo::feed_relay`]).
 //!
 //! **Transport.** With `[tls]` in `sprigdb.toml` (the process identity from
 //! the internal CA) the listener requires client certificates signed by
@@ -24,6 +32,14 @@
 //! `[tls]` (development) the listener serves plaintext and only on a
 //! loopback address; a non-loopback `listener.peer.bind` without `[tls]`
 //! leaves the peer service off.
+//!
+//! **An off peer service is reported** ([`report_off`]): `/readyz?verbose`
+//! shows check `peer`, failing while workers are registered (they run
+//! triggers and sinks by calling a gateway here), and the registration
+//! record lists `degraded.peer` with the reason, which `sprigctl gateway
+//! list` shows. Readiness itself stays `ready`: clients' statements still
+//! work, and an off peer service is a configuration to fix, not a reason
+//! to take the gateway out of a load balancer.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -37,7 +53,9 @@ use sprig_api::proto::internal::gateway_peer_client::GatewayPeerClient;
 use sprig_api::proto::internal::gateway_peer_server::{GatewayPeer, GatewayPeerServer};
 use sprig_api::proto::internal::{
     DrainReply, DrainRequest, ForwardReply, ForwardRequest, HandoffLoginReply, HandoffLoginRequest,
-    KillReply, KillRequest, ListSessionsReply, ListSessionsRequest, SessionRow,
+    InheritedMembersReply, InheritedMembersRequest, KillReply, KillRequest, ListSessionsReply,
+    ListSessionsRequest, SessionRow, TailFeedMessage, TailFeedRequest, WatchChangesEvent,
+    WatchChangesRequest,
 };
 use sprig_auth::handoff::{HandoffResult, HandoffStart, HandoffTarget, PrincipalWire};
 use sprig_common::ids::{ConnId, DcId, TenantId};
@@ -175,14 +193,67 @@ pub trait PeerHost: Send + Sync + 'static {
             &SprigError::new(SprigCode::AuthUnavailable, "this gateway decides no logins"),
         ))
     }
+    /// Serves a change stream relayed by a gateway of another DC: the
+    /// first message says whether it opened. Hosts without tenant catalogs
+    /// refuse it.
+    async fn watch_changes(
+        &self,
+        req: WatchChangesRequest,
+    ) -> tokio::sync::mpsc::Receiver<WatchChangesEvent> {
+        let _ = req;
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (_, body) = sprig_api::status::to_rest(&SprigError::new(
+            SprigCode::ForwardFailed,
+            "this gateway serves no change streams",
+        ));
+        let _ = tx.try_send(WatchChangesEvent {
+            error_json: serde_json::to_string(&body).unwrap_or_default(),
+            ..WatchChangesEvent::default()
+        });
+        rx
+    }
+    /// Applies a declarer's `FOR EACH TENANT` change to the members this
+    /// DC indexes. Hosts without tenant catalogs refuse it.
+    async fn inherited_members(
+        &self,
+        req: InheritedMembersRequest,
+    ) -> Result<InheritedMembersReply> {
+        let _ = req;
+        Err(SprigError::new(
+            SprigCode::ForwardFailed,
+            "this gateway serves no tenant catalogs",
+        ))
+    }
+    /// Serves a tenant's feed tail to a gateway of another DC: the first
+    /// message says whether it opened. Hosts without tenant catalogs
+    /// refuse it.
+    async fn tail_feed(
+        &self,
+        req: TailFeedRequest,
+    ) -> tokio::sync::mpsc::Receiver<TailFeedMessage> {
+        let _ = req;
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (_, body) = sprig_api::status::to_rest(&SprigError::new(
+            SprigCode::ForwardFailed,
+            "this gateway serves no change feeds",
+        ));
+        let _ = tx.try_send(TailFeedMessage {
+            error_json: serde_json::to_string(&body).unwrap_or_default(),
+            ..TailFeedMessage::default()
+        });
+        rx
+    }
 }
 
 /// A handoff's result as the reply carries it.
 fn reply_of(r: &HandoffResult) -> HandoffLoginReply {
     match r {
-        HandoffResult::Accepted(p) => HandoffLoginReply {
+        HandoffResult::Accepted(p, token) => HandoffLoginReply {
             accepted: true,
-            principal_json: serde_json::to_string(&PrincipalWire::of(p)).unwrap_or_default(),
+            // The verified token (claims and roles) crosses with the
+            // principal.
+            principal_json: serde_json::to_string(&PrincipalWire::accepted(p, token.as_deref()))
+                .unwrap_or_default(),
             ..HandoffLoginReply::default()
         },
         HandoffResult::Refused(e) => HandoffLoginReply {
@@ -203,7 +274,10 @@ fn result_of(r: &HandoffLoginReply) -> Result<HandoffResult> {
     if r.accepted {
         let w: PrincipalWire = serde_json::from_str(&r.principal_json)
             .map_err(|e| SprigError::internal(format!("handoff reply: {e}")))?;
-        return Ok(HandoffResult::Accepted(Box::new(w.principal()?)));
+        return Ok(HandoffResult::Accepted(
+            Box::new(w.principal()?),
+            w.verified_token()?.map(Box::new),
+        ));
     }
     let mut sqlstate = *b"HY000";
     if r.sql_state.len() == 5 {
@@ -309,6 +383,54 @@ impl GatewayPeer for Service {
             .map_err(|e| tonic::Status::invalid_argument(format!("start_json: {e}")))?;
         let result = self.host.handoff(start, Zeroizing::new(r.password)).await;
         Ok(tonic::Response::new(reply_of(&result)))
+    }
+
+    type WatchChangesStream = std::pin::Pin<
+        Box<
+            dyn futures::Stream<Item = std::result::Result<WatchChangesEvent, tonic::Status>>
+                + Send,
+        >,
+    >;
+
+    async fn watch_changes(
+        &self,
+        req: tonic::Request<WatchChangesRequest>,
+    ) -> std::result::Result<tonic::Response<Self::WatchChangesStream>, tonic::Status> {
+        let rx = self.host.watch_changes(req.into_inner()).await;
+        let events =
+            futures::stream::unfold(
+                rx,
+                |mut rx| async move { rx.recv().await.map(|m| (Ok(m), rx)) },
+            );
+        Ok(tonic::Response::new(Box::pin(events)))
+    }
+
+    async fn inherited_members(
+        &self,
+        req: tonic::Request<InheritedMembersRequest>,
+    ) -> std::result::Result<tonic::Response<InheritedMembersReply>, tonic::Status> {
+        self.host
+            .inherited_members(req.into_inner())
+            .await
+            .map(tonic::Response::new)
+            .map_err(|e| tonic::Status::unavailable(e.to_string()))
+    }
+
+    type TailFeedStream = std::pin::Pin<
+        Box<dyn futures::Stream<Item = std::result::Result<TailFeedMessage, tonic::Status>> + Send>,
+    >;
+
+    async fn tail_feed(
+        &self,
+        req: tonic::Request<TailFeedRequest>,
+    ) -> std::result::Result<tonic::Response<Self::TailFeedStream>, tonic::Status> {
+        let rx = self.host.tail_feed(req.into_inner()).await;
+        let items =
+            futures::stream::unfold(
+                rx,
+                |mut rx| async move { rx.recv().await.map(|m| (Ok(m), rx)) },
+            );
+        Ok(tonic::Response::new(Box::pin(items)))
     }
 }
 
@@ -597,6 +719,54 @@ impl Peers {
         result_of(&reply)
     }
 
+    /// `WatchChanges` on gateway `rec`: the stream of its messages.
+    ///
+    /// # Errors
+    /// 39788 when it can't be reached.
+    pub async fn watch_changes(
+        &self,
+        rec: &GatewayRecord,
+        req: WatchChangesRequest,
+    ) -> Result<tonic::Streaming<WatchChangesEvent>> {
+        let mut c = self.client(rec)?;
+        Ok(c.watch_changes(req)
+            .await
+            .map_err(|e| unavailable("change stream relay", e))?
+            .into_inner())
+    }
+
+    /// `TailFeed` on gateway `rec`: the stream of its messages.
+    ///
+    /// # Errors
+    /// 39788 when it can't be reached.
+    pub async fn tail_feed(
+        &self,
+        rec: &GatewayRecord,
+        req: TailFeedRequest,
+    ) -> Result<tonic::Streaming<TailFeedMessage>> {
+        let mut c = self.client(rec)?;
+        Ok(c.tail_feed(req)
+            .await
+            .map_err(|e| unavailable("feed relay", e))?
+            .into_inner())
+    }
+
+    /// `InheritedMembers` on gateway `rec`.
+    ///
+    /// # Errors
+    /// 39788 when it can't be reached or fails.
+    pub async fn inherited_members(
+        &self,
+        rec: &GatewayRecord,
+        req: InheritedMembersRequest,
+    ) -> Result<InheritedMembersReply> {
+        let mut c = self.client(rec)?;
+        Ok(c.inherited_members(req)
+            .await
+            .map_err(|e| unavailable("inherited members", e))?
+            .into_inner())
+    }
+
     /// Every gateway's sessions (for operators).
     ///
     /// # Errors
@@ -656,6 +826,103 @@ impl HandoffTarget for PeerHandoff {
     }
 }
 
+/// How often a gateway whose peer service is off looks for workers.
+pub const OFF_CHECK_PERIOD: Duration = Duration::from_secs(30);
+
+/// Why the peer service is off on `bind`, and what turns it on.
+#[must_use]
+pub fn off_reason(bind: SocketAddr) -> String {
+    format!(
+        "the peer service is off: listener.peer.bind is {bind}, not a loopback address, and \
+         sprigdb.toml has no [tls] (mutual TLS); set [tls], or bind it to 127.0.0.1 when \
+         every process runs on this host"
+    )
+}
+
+/// The `/readyz?verbose` check of a peer service that is off: whether it
+/// passes and its text. `workers` is the number of workers registered in
+/// the DC (`None`: unknown). Workers run triggers and sinks by calling a
+/// gateway's peer service, so with workers it fails (the gateway is
+/// degraded); with none, nothing needs it yet and it passes.
+#[must_use]
+pub fn off_check(bind: SocketAddr, workers: Option<usize>) -> (bool, String) {
+    let why = off_reason(bind);
+    match workers {
+        Some(0) => (
+            true,
+            format!("off; no worker is registered, so no trigger or sink needs it ({why})"),
+        ),
+        Some(n) => (
+            false,
+            format!(
+                "degraded: {n} registered worker(s) can't run triggers or sinks through this \
+                 gateway ({why})"
+            ),
+        ),
+        None => (
+            false,
+            format!(
+                "degraded: workers can't run triggers or sinks through this gateway, if any \
+                 run ({why})"
+            ),
+        ),
+    }
+}
+
+/// The number of workers registered in the DC (`workers/<id>`).
+///
+/// # Errors
+/// The store's.
+pub async fn registered_workers(store: &dyn MetaStore) -> Result<usize> {
+    let prefix = store.tier().key("workers/")?;
+    let mut n = 0;
+    let mut opts = sprig_meta::ListOpts::default();
+    loop {
+        let page = store.list(&prefix, opts.clone()).await?;
+        n += page.kvs.len();
+        if !page.more {
+            return Ok(n);
+        }
+        opts.at = Some(page.revision);
+        opts.after = page.kvs.last().map(|kv| kv.key.clone());
+    }
+}
+
+/// Reports a peer service that is off until `stop`: the `peer` check of
+/// `/readyz?verbose`, and `degraded.peer` in the registration record
+/// when workers are registered (they can't run triggers or sinks through
+/// this gateway). Looks for workers every [`OFF_CHECK_PERIOD`].
+pub async fn report_off(
+    bind: SocketAddr,
+    store: Arc<dyn MetaStore>,
+    health: sprig_common::telemetry::Health,
+    registrar: registry::Registrar,
+    stop: CancellationToken,
+) {
+    let mut tick = tokio::time::interval(OFF_CHECK_PERIOD);
+    let mut last: Option<bool> = None;
+    loop {
+        tokio::select! {
+            () = stop.cancelled() => return,
+            _ = tick.tick() => {}
+        }
+        let workers = match registered_workers(store.as_ref()).await {
+            Ok(n) => Some(n),
+            Err(e) => {
+                tracing::debug!(error = %e, "can't count the registered workers");
+                None
+            }
+        };
+        let (ok, detail) = off_check(bind, workers);
+        health.set_check("peer", ok, detail.clone());
+        registrar.set_degraded("peer", (!ok).then(|| detail.clone()));
+        if last != Some(ok) && !ok {
+            tracing::warn!(%bind, "{detail}");
+        }
+        last = Some(ok);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -668,6 +935,69 @@ mod tests {
     use sprig_meta::{MemStore, Op, Record, Txn};
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_peer_service_that_is_off_degrades_the_gateway_only_when_workers_run() {
+        let bind: SocketAddr = "0.0.0.0:7403".parse().unwrap();
+        let (ok, text) = off_check(bind, Some(0));
+        assert!(ok, "{text}");
+        assert!(text.contains("no worker is registered"), "{text}");
+        assert!(
+            text.contains("listener.peer.bind is 0.0.0.0:7403"),
+            "{text}"
+        );
+        let (ok, text) = off_check(bind, Some(2));
+        assert!(!ok);
+        assert!(
+            text.starts_with("degraded: 2 registered worker(s) can't run triggers or sinks"),
+            "{text}"
+        );
+        assert!(text.contains("[tls]"), "{text}");
+        assert!(!off_check(bind, None).0);
+
+        // Workers are counted from their registrations.
+        let store: Arc<dyn MetaStore> = Arc::new(MemStore::new(Tier::Dc(dc("dc-a"))));
+        assert_eq!(registered_workers(store.as_ref()).await.unwrap(), 0);
+        for id in ["w1", "w2"] {
+            let k = store.tier().key(&format!("workers/{id}")).unwrap();
+            store
+                .txn(Txn {
+                    when: Vec::new(),
+                    then: vec![Op::Put {
+                        key: k,
+                        value: b"{}".to_vec(),
+                        lease: None,
+                    }],
+                    otherwise: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(registered_workers(store.as_ref()).await.unwrap(), 2);
+
+        // The record names the degraded part until it is cleared.
+        let r = registry::Registrar::new(GatewayRecord {
+            gateway_id: "gw-1".into(),
+            slot: 0,
+            version: "test".into(),
+            addr: "127.0.0.1".into(),
+            listeners: std::collections::BTreeMap::new(),
+            state: registry::GatewayState::Ready,
+            catalog_formats: vec![],
+            authorizers: vec![],
+            load: registry::Load::default(),
+            kafka_host: None,
+            degraded: std::collections::BTreeMap::new(),
+        });
+        r.set_degraded("peer", Some(text.clone()));
+        assert_eq!(r.record().degraded.get("peer"), Some(&text));
+        let json = serde_json::to_value(r.record()).unwrap();
+        assert!(json["degraded"]["peer"].is_string(), "{json}");
+        r.set_degraded("peer", None);
+        assert!(r.record().degraded.is_empty());
+        let json = serde_json::to_value(r.record()).unwrap();
+        assert!(json.get("degraded").is_none(), "{json}");
+    }
 
     fn dc(s: &str) -> DcId {
         DcId::new(s).unwrap()
@@ -693,13 +1023,70 @@ mod tests {
         async fn forwarded(&self, _req: ForwardRequest) -> ForwardReply {
             ForwardReply::default()
         }
+        /// Opens for database `d`, then one event 6 s later (past the
+        /// peer call timeout); refuses any other database.
+        async fn watch_changes(
+            &self,
+            req: WatchChangesRequest,
+        ) -> tokio::sync::mpsc::Receiver<WatchChangesEvent> {
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            tokio::spawn(async move {
+                if req.database != "d" {
+                    let (_, body) = sprig_api::status::to_rest(&SprigError::standard(
+                        1044,
+                        *b"42000",
+                        "Access denied",
+                    ));
+                    let _ = tx
+                        .send(WatchChangesEvent {
+                            error_json: serde_json::to_string(&body).unwrap(),
+                            ..WatchChangesEvent::default()
+                        })
+                        .await;
+                    return;
+                }
+                let _ = tx
+                    .send(WatchChangesEvent {
+                        opened: true,
+                        ..WatchChangesEvent::default()
+                    })
+                    .await;
+                tokio::time::sleep(CALL_TIMEOUT + Duration::from_secs(1)).await;
+                let _ = tx
+                    .send(WatchChangesEvent {
+                        op: "insert".into(),
+                        resume_token: "t1".into(),
+                        ..WatchChangesEvent::default()
+                    })
+                    .await;
+            });
+            rx
+        }
         async fn handoff(
             &self,
             start: HandoffStart,
             password: Zeroizing<Vec<u8>>,
         ) -> HandoffResult {
             self.seen.lock().unwrap().push(start.source_dc.clone());
-            if password.as_slice() != b"pw" {
+            // A MySQL login with a token as its password, or a token login
+            // naming its account: the verified token crosses back.
+            let token =
+                (start.token_login.is_some() || password.as_slice() == b"pw-token").then(|| {
+                    Box::new(sprig_auth::oidc::VerifiedToken {
+                        issuer_id: 3,
+                        issuer: "https://idp.example".into(),
+                        kind: sprig_auth::oidc::IssuerKind::Oidc,
+                        jit_users: false,
+                        claims: Arc::new(serde_json::json!({
+                            "iss": "https://idp.example", "sub": "alice",
+                            "org": "o-1", "groups": ["gate"]
+                        })),
+                        user: Some("alice".into()),
+                        roles: vec!["r_gate".into()],
+                        expires: std::time::UNIX_EPOCH + Duration::from_secs(4_000_000_000),
+                    })
+                });
+            if token.is_none() && password.as_slice() != b"pw" {
                 return HandoffResult::Refused(ErrPacket::access_denied(
                     Persona::MySql84,
                     "acme.alice",
@@ -707,22 +1094,25 @@ mod tests {
                     true,
                 ));
             }
-            HandoffResult::Accepted(Box::new(Principal {
-                tenant: Some(TenantId(42)),
-                tenant_name: Some("acme".into()),
-                user_id: Some(sprig_common::ids::UserId(1)),
-                user: "alice".into(),
-                host: "%".into(),
-                client_ip: start.client_ip,
-                must_change_password: false,
-                limits: sprig_auth::store::AccountLimits::default(),
-                auth_version: 7,
-                backend: BackendTarget {
-                    cluster: sprig_common::ids::ClusterId::new("fra1-c1").unwrap(),
-                    user: "t42_u1".into(),
-                    credentials: "file:/etc/sprigdb/creds/fra1.toml".parse().unwrap(),
-                },
-            }))
+            HandoffResult::Accepted(
+                Box::new(Principal {
+                    tenant: Some(TenantId(42)),
+                    tenant_name: Some("acme".into()),
+                    user_id: Some(sprig_common::ids::UserId(1)),
+                    user: "alice".into(),
+                    host: "%".into(),
+                    client_ip: start.client_ip,
+                    must_change_password: false,
+                    limits: sprig_auth::store::AccountLimits::default(),
+                    auth_version: 7,
+                    backend: BackendTarget {
+                        cluster: sprig_common::ids::ClusterId::new("fra1-c1").unwrap(),
+                        user: "t42_u1".into(),
+                        credentials: "file:/etc/sprigdb/creds/fra1.toml".parse().unwrap(),
+                    },
+                }),
+                token,
+            )
         }
     }
 
@@ -733,6 +1123,38 @@ mod tests {
             "can_handle_expired_password": false, "source_dc": "nyc1"
         }))
         .unwrap()
+    }
+
+    /// A token login (MySQL's token as password, and an HTTP bearer token
+    /// handed off) keeps its verified claims and roles over `HandoffLogin`.
+    async fn token_handoffs_keep_claims_and_roles(target: &PeerHandoff, ip: IpAddr) {
+        let mut token_start = start(ip);
+        token_start.login_name = Vec::new();
+        token_start.token_login = Some(sprig_auth::handoff::TokenStart {
+            protocol: sprig_auth::oidc::TokenProtocol::Http,
+            tenant: "acme".into(),
+        });
+        for (s, pw) in [
+            (start(ip), b"pw-token".to_vec()),
+            (token_start, b"eyJ.token".to_vec()),
+        ] {
+            let r = target
+                .login(&dc("fra1"), s, Zeroizing::new(pw))
+                .await
+                .unwrap();
+            let HandoffResult::Accepted(p, Some(t)) = r else {
+                panic!("no token: {r:?}");
+            };
+            assert_eq!(p.user, "alice");
+            assert_eq!(t.claims["org"], "o-1");
+            assert_eq!(t.claims["groups"][0], "gate");
+            assert_eq!(t.roles, ["r_gate"]);
+            assert_eq!(t.issuer, "https://idp.example");
+            assert_eq!(
+                t.expires,
+                std::time::UNIX_EPOCH + Duration::from_secs(4_000_000_000)
+            );
+        }
     }
 
     /// `HandoffLogin` over real gRPC on loopback: nyc1's `PeerHandoff`
@@ -767,6 +1189,7 @@ mod tests {
             authorizers: Vec::new(),
             load: registry::Load::default(),
             kafka_host: None,
+            degraded: std::collections::BTreeMap::new(),
         };
         let put = |r: &GatewayRecord| {
             let fra1 = Arc::clone(&fra1);
@@ -792,9 +1215,10 @@ mod tests {
             .login(&dc("fra1"), start(ip), Zeroizing::new(b"pw".to_vec()))
             .await
             .unwrap();
-        let HandoffResult::Accepted(p) = r else {
+        let HandoffResult::Accepted(p, none) = r else {
             panic!("refused: {r:?}");
         };
+        assert!(none.is_none(), "a password login carries no token");
         assert_eq!(
             (p.user.as_str(), p.tenant, p.client_ip),
             ("alice", Some(TenantId(42)), ip)
@@ -803,6 +1227,7 @@ mod tests {
             p.backend.credentials.to_string(),
             "file:/etc/sprigdb/creds/fra1.toml"
         );
+        token_handoffs_keep_claims_and_roles(&target, ip).await;
         let r = target
             .login(&dc("fra1"), start(ip), Zeroizing::new(b"no".to_vec()))
             .await
@@ -813,7 +1238,7 @@ mod tests {
         );
         assert_eq!(
             host.seen.lock().unwrap().as_slice(),
-            [dc("nyc1"), dc("nyc1")]
+            [dc("nyc1"), dc("nyc1"), dc("nyc1"), dc("nyc1")]
         );
         // No ready gateway in the DC: an error, so the source tries the
         // next allowed DC (and 39301 when none answers).
@@ -830,6 +1255,63 @@ mod tests {
                 .await
                 .is_err()
         );
+        stop.cancel();
+        let _ = task.await;
+    }
+
+    /// A change stream relayed from another DC outlives the peer call
+    /// timeout; a refusal comes back as the first message; a host without
+    /// tenant catalogs refuses `InheritedMembers`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn change_streams_cross_to_a_gateway_of_the_home_dc() {
+        let mem: Arc<dyn MetaStore> = Arc::new(MemStore::new(Tier::Dc(dc("nyc1"))));
+        let host = Arc::new(Fra1 {
+            sessions: Arc::new(SessionTable::new(Arc::new(SystemClock))),
+            seen: Mutex::new(Vec::new()),
+        });
+        let stop = CancellationToken::new();
+        let (addr, task) = serve(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            Arc::clone(&host) as Arc<dyn PeerHost>,
+            stop.clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let rec = GatewayRecord {
+            gateway_id: "fra1-gw".into(),
+            slot: 1,
+            version: "test".into(),
+            addr: "127.0.0.1".into(),
+            listeners: [("peer".to_owned(), addr.port())].into(),
+            state: registry::GatewayState::Ready,
+            catalog_formats: Vec::new(),
+            authorizers: Vec::new(),
+            load: registry::Load::default(),
+            kafka_host: None,
+            degraded: std::collections::BTreeMap::new(),
+        };
+        let peers = Peers::new(Arc::clone(&mem), None);
+        let req = |db: &str| WatchChangesRequest {
+            database: db.into(),
+            ..WatchChangesRequest::default()
+        };
+        let mut s = peers.watch_changes(&rec, req("d")).await.unwrap();
+        assert!(s.message().await.unwrap().unwrap().opened);
+        let t0 = std::time::Instant::now();
+        let ev = s.message().await.unwrap().unwrap();
+        assert_eq!((ev.op.as_str(), ev.resume_token.as_str()), ("insert", "t1"));
+        assert!(t0.elapsed() > CALL_TIMEOUT, "{:?}", t0.elapsed());
+        assert!(s.message().await.unwrap().is_none(), "then the end");
+        let mut s = peers.watch_changes(&rec, req("other")).await.unwrap();
+        let m = s.message().await.unwrap().unwrap();
+        assert!(!m.opened && m.error_json.contains("1044"), "{m:?}");
+        let e = peers
+            .inherited_members(&rec, InheritedMembersRequest::default())
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Some(SprigCode::ForwardFailed));
         stop.cancel();
         let _ = task.await;
     }

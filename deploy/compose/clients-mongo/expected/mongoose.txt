@@ -6,9 +6,28 @@
 # (deploy/compose/ci/outcomes.py; the target is always "sprig"). A test that
 # fails on MongoDB too is never counted against SprigDB.
 #
-# From the partial runs on the laptop (152 of about 4,000 tests). The full
-# suite is defined in CI, not yet run.
-# Capped collections and $where are supported now (sprig-doc's capped.rs and
-# serverjs.rs; mongo.server_js is on by default): their entries were removed
-# on 13 Nov 2026 from the code, not from a new run of the suite.
-sprig fail *elemMatch*DBRef* :: $elemMatch on a DBRef's $id; not investigated
+# From the whole suite run on a laptop on 15, 16 and 17 Nov 2026 (test/*.test.js
+# and test/docs/*.test.js, 4,220 tests, with START_REPLICA_SET=1, as CI also
+# sets it): every test that passes on MongoDB 8.0.34 and fails through
+# SprigDB is listed here. 17 Nov: 4,129 of MongoDB's 4,161 pass; the 32
+# below are the rest.
+
+# Legacy `2d` indexes are not built (a non-goal of the geo work); `$near`,
+# `$nearSphere` and `$within` on legacy pairs need one.
+sprig fail *query casting $near*with * :: legacy 2d indexes are not built
+sprig fail *query casting $within* :: legacy 2d indexes are not built
+sprig fail *querying: 2d*$maxDistance with arrays :: legacy 2d indexes are not built
+sprig fail *querying: 2d*$near (gh-309) :: legacy 2d indexes are not built
+sprig fail *querying: 2d*$nearSphere with arrays* :: legacy 2d indexes are not built
+sprig fail *querying: 2d*$within arrays* :: legacy 2d indexes are not built
+sprig fail *2d indexed field without value is saved* :: legacy 2d indexes are not built
+
+# Time-series and clustered collections are refused (designs only).
+sprig fail *createCollection()*enforces expire* :: time-series collections are refused
+sprig fail *mongodb actually removes expired documents* :: time-series collections are refused
+sprig fail *createCollection()*respects timeseries* :: time-series collections are refused
+sprig fail *avoids trying to drop timeseries collections* :: time-series collections are refused
+sprig fail *createCollection()*respects clusteredIndex* :: clustered collections are refused
+
+# The test reads the host from a URI without credentials; SprigDB needs a login.
+sprig fail *openUri*with mongoose.createConnection()* :: the test's URI pattern doesn't allow user:password@

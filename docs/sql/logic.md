@@ -20,7 +20,87 @@ Each version runs in one of two **tiers**:
 
 SprigDB picks the tier (`SPRIG_TIER = 'auto'`): code that can't compile to SQL, such as code with outbound `fetch` calls or loops it can't bound, runs in the engine tier. After a declaration, `SHOW WARNINGS` lists one note per line of the placement: the module, the version, the tier and each reason for the engine tier.
 
-Budgets are settings, per object, database or tenant: `logic.function_budget_ms` (5000 ms per synchronous call), `logic.trigger_budget_ms`, `logic.job_budget_ms`, `logic.kirun_max_steps`, `logic.max_data_ops` (1000 `db` calls per invocation), `logic.max_rows_read`, `logic.max_loop_iterations` and `logic.memory_limit_mb`. Workers read `logic.trigger_budget_ms` and `logic.job_budget_ms` per tenant, so set those on the tenant or globally. Outbound `fetch` reaches only the hosts in `logic.outbound_allowlist`. See the [settings reference](../reference/settings.md#logic).
+JavaScript compiles to the MariaDB tier with `try`/`catch`/`finally`, helper functions declared in the same source, `do ... while` loops, and, in functions, procedures, validations and after-commit triggers, `db.call` and `db.publish`. These keep it in the engine tier, each shown as a reason:
+
+| Reason | Why |
+|---|---|
+| `js.catch_value` | A `catch` reads the database error it caught (its message), which SQL handlers can't pass on |
+| `js.recursion` | A helper function calls itself, directly or through another; or `db.call`s form a cycle or nest deeper than 8 |
+| `js.db` | A `db` call that can't compile: `db.commitOffset` or `db.mq.*`; a `db.call` or `db.publish` naming another database, or a name that isn't a literal; a callee in the engine tier, or mid-rollout with versions of different shapes; JSON arguments; a change topic; a `db.call` or `db.publish` in an operand of `&&`, `\|\|`, `??` or `?:`, which may not run |
+| `js.member` | Reading a field the callee never returns, or a column the table doesn't have |
+| `js.call` | Another built-in call that only the engine tier runs |
+
+**Compiled calls.** `db.call(name, ...args)` and `db.publish` compile as a statement of their own, as a declaration's initializer (`const r = db.call(...)`), or inside a larger expression (`return db.call(...).fields.value`). The one exception in JavaScript is an operand of `&&`, `||`, `??` or `?:`, where JavaScript may skip the call: that keeps the code in the engine tier with a `js.db` reason, so make the call in a statement of its own first. Lua has no such exception; see [Lua in the MariaDB tier](#lua-in-the-mariadb-tier).
+
+```sql test
+CREATE OR REPLACE FUNCTION add_tax(amount DOUBLE) RETURNS DOUBLE LANGUAGE javascript AS
+  'return amount * 1.2;';
+CREATE OR REPLACE FUNCTION gross_total(net DOUBLE, qty INT) RETURNS DOUBLE LANGUAGE javascript AS
+  'return db.call("add_tax", net * qty).fields.value;';
+SELECT gross_total(10, 3) AS g;
+```
+
+```text output
+g
+36
+```
+
+```sql test
+EXPLAIN FUNCTION gross_total;
+```
+
+```text output
+Version	State	Tier	Placement
+1	active (live)	mariadb	tier mariadb, route any shard, cost 1
+```
+
+A compiled `db.call` goes through a hidden entry, `` `__sprig_l<module>_call` ``, so it follows the callee's deploys, rollbacks and rollout stage; that name can appear in MariaDB errors such as 1370 and 1305. Nested compiled calls stay fast: three levels deep cost about 1.3 ms against 4.8 ms in the engine tier, and twenty about 1.3 ms against 15 ms. Redeploying a callee so that its compiled callers no longer fit (other parameters or result) is refused with 39875, naming the callers; redeploy them `WITH (SPRIG_TIER = 'engine')` first, then the callee. A compiled `db.publish` checks the stream's `stream.max_message_bytes`, as read when the code was deployed (39944), so redeploy it after changing the limit (until then it keeps the old limit, refusing or accepting by it); the engine tier reads the current limit, and a compacted stream's key (39955). Computed columns still refuse `db.call`, and sink transforms have no `db`.
+
+`EXPLAIN FUNCTION` lists every reason with its place in the source and a message, for example `js.db: the arguments must be an array literal`.
+
+**Order of evaluation.** Compiled JavaScript reads operands left to right, as JavaScript does, also when a helper function changes a variable that the same expression reads. Here `n + bump()` adds the value `n` had before `bump` ran, in both tiers:
+
+```sql test
+DELIMITER //
+CREATE OR REPLACE FUNCTION eval_order(start INT) RETURNS TEXT LANGUAGE javascript AS $$
+let n = start;
+function bump() { n = n + 2; return 1; }
+const a = n + bump();
+const b = `${n}-${bump()}`;
+return a + ':' + b + ':' + Math.max(n, bump());
+$$ //
+DELIMITER ;
+SELECT eval_order(1) AS r;
+```
+
+```text output
+r
+2:3-1:5
+```
+
+```sql test
+CREATE OR REPLACE FUNCTION safe_ratio(a DOUBLE, b DOUBLE) RETURNS DOUBLE LANGUAGE javascript AS '
+function ratio(x, y) { if (y === 0) throw new Error("zero"); return x / y; }
+try { return ratio(a, b); } catch (e) { return null; } finally { }
+';
+SELECT safe_ratio(6, 3) AS r, safe_ratio(1, 0) AS z;
+```
+
+```text output
+r	z
+2	NULL
+```
+
+```sql test
+EXPLAIN FUNCTION safe_ratio;
+```
+
+```text output
+Version	State	Tier	Placement
+1	active (live)	mariadb	tier mariadb, route any shard, cost 0
+```
+
+Budgets are settings, per object, database or tenant: `logic.function_budget_ms` (5000 ms per synchronous call, and per row for a validation), `logic.trigger_budget_ms`, `logic.job_budget_ms`, `logic.kirun_max_steps`, `logic.max_data_ops` (1000 `db` calls per invocation), `logic.max_rows_read`, `logic.max_loop_iterations` and `logic.memory_limit_mb`. Workers read `logic.trigger_budget_ms` at each run of a trigger and `logic.job_budget_ms` at each fire of a schedule, so a change applies from the next run and a run already going keeps its budget. The wall-time budgets bind compiled code too: it stops with 39864 at the budget, which no `catch` or `pcall` can catch, even in a loop of many short statements. Compiled code reads the budget when it is deployed, takes your session's `max_statement_time` when that is smaller, and shares what is left with the compiled code it calls. When your session's limit is the tighter one, MariaDB's timer may fire first and you get MariaDB's 3024, as on plain MySQL or MariaDB; either way the call stops and its writes roll back; see [Budgets and limits](../data-models/logic.md#budgets-and-limits). Outbound `fetch` reaches only the hosts in `logic.outbound_allowlist`. See the [settings reference](../reference/settings.md#logic).
 
 ## Statements
 
@@ -35,8 +115,9 @@ Budgets are settings, per object, database or tenant: `logic.function_budget_ms`
 | [`ALTER TABLE … ADD c type AS (f(…))`](#computed-columns) | A computed column from a function |
 | [`CALL`, `SELECT f(…)`](#calling-functions-and-procedures) | Call code |
 | [`TEST FUNCTION \| PROCEDURE \| TRIGGER \| VALIDATION`](#test) | Run code in a sandbox that never writes |
-| [`ALTER FUNCTION \| PROCEDURE … ROLLOUT`](#staged-rollouts) | Move a staged rollout |
+| [`ALTER FUNCTION \| PROCEDURE \| TRIGGER … ROLLOUT`](#staged-rollouts) | Move a staged rollout |
 | [`ALTER FUNCTION \| PROCEDURE … ROLLBACK`](#alter--rollback) | Make an earlier version active |
+| [`ALTER TRIGGER … DISABLE \| ENABLE`](#alter-trigger--disable-and-enable) | Pause or resume a trigger |
 | [`DROP FUNCTION \| PROCEDURE \| VALIDATION \| TRIGGER \| SCHEDULE`](#drop) | Remove code |
 | [`SHOW DEPENDENTS OF FUNCTION \| PROCEDURE`](#show-dependents) | What a `DROP` would affect |
 
@@ -65,7 +146,7 @@ CREATE [OR REPLACE] {FUNCTION | PROCEDURE} [db_name.]name
 protocol: sql | http | grpc | mongo | redis
 option:   SPRIG_TIER = {'auto' | 'mariadb' | 'engine'}
         | SPRIG_ROLLOUT = n            -- 1 to 100
-        | SPRIG_ROLLOUT_BY = {'user' | 'tenant'}
+        | SPRIG_ROLLOUT_BY = {'user' | 'tenant' | 'key:param_name'}
 ```
 
 The clauses may come in any order before `AS`.
@@ -82,7 +163,7 @@ The clauses may come in any order before `AS`.
 | `EXPOSE (…)` | `(sql)` | The protocols that may call it: SQL, REST (`http`), gRPC, MongoDB, Redis |
 | `SPRIG_TIER` | `'auto'` | `'mariadb'` requires the MariaDB tier and fails with 39868 if the code can't compile to SQL; `'engine'` always uses the engine tier |
 | `SPRIG_ROLLOUT` | 100 | Stage the new version for this percentage of callers; see [Staged rollouts](#staged-rollouts) |
-| `SPRIG_ROLLOUT_BY` | `'user'` | Pick callers by account or by tenant; only with `SPRIG_ROLLOUT` |
+| `SPRIG_ROLLOUT_BY` | `'user'` | Pick callers by account, by tenant, or by the value of one argument (`'key:customer'`); only with `SPRIG_ROLLOUT` |
 | `COMMENT` | | Accepted and not stored |
 | `AS` | | The body: a quoted string or text between `$$` markers |
 
@@ -122,6 +203,67 @@ end
 return { total = p.price * qty + 40 }
 $$;
 ```
+
+### Lua in the MariaDB tier
+
+Lua code compiles to the MariaDB tier when it stays in the subset that [Logic](../data-models/logic.md#lua) lists, with Lua 5.1's meaning: `nil` and `sprig.null` stay apart, Lua's runtime errors are 39865, text is bytes, and `error` and `assert` messages carry Lua's `name:line:` position. `quote_lua` above compiles. These keep Lua code in the engine tier, each shown as a reason:
+
+| Reason | Why |
+|---|---|
+| `lua.helper` | A helper that changes a variable of its caller, called inside a larger expression (`count + bump(1)`); call it in a statement of its own |
+| `lua.recursion` | A helper function that calls itself |
+| `lua.db` | `db.commitOffset` or `db.mq.*`; a `db.sqlOne` result used without a local of its own |
+| `lua.json` | A JSON column or a decoded value used as a table; a table as a published value |
+| `lua.table`, `lua.pairs` | `t[k]`, `pairs`, `table.*`, a table with both names and items |
+| `lua.nil_field` | A record field that may be `nil` where the record leaves the code |
+| `lua.null_kinds` | A value that may be `nil` on one path and `sprig.null` on another, tested where the difference matters |
+| `lua.string`, `lua.pattern` | `string.format`, `string.sub`, `string.rep`; `find`, `match`, `gmatch` and `gsub` |
+| `lua.math`, `lua.nondeterministic` | `math.huge`, `math.sqrt`, `math.random` |
+| `lua.pcall`, `lua.pcall_value` | `xpcall`, `pcall` of a library function; reading the error `pcall` caught when its text may come from the database or from Lua itself |
+| `lua.error_value` | `error` with a level other than 0 or 1, or a message that isn't text |
+| `lua.vararg` | `...` |
+| `lua.parse` | Source that SprigDB's Lua parser doesn't accept (every source is still checked with Lua itself) |
+
+Unlike JavaScript, a `db.call` or `db.publish` inside an operand that runs only sometimes compiles: the call is placed under the operand's condition, so it runs only when Lua would run it. Here the call runs only for a positive amount:
+
+```sql test
+CREATE OR REPLACE FUNCTION gross_or_zero(net DOUBLE) RETURNS DOUBLE LANGUAGE lua AS $$
+return net > 0 and db.call('add_tax', net).fields.value or 0
+$$;
+SELECT gross_or_zero(10) AS g, gross_or_zero(-1) AS z;
+```
+
+```text output
+g	z
+12	0
+```
+
+```sql test
+EXPLAIN FUNCTION gross_or_zero;
+```
+
+```text output
+Version	State	Tier	Placement
+1	active (live)	mariadb	tier mariadb, route any shard, cost 1
+```
+
+A helper that changes its caller's variables compiles only as a whole statement. Inside an expression, it keeps the code in the engine tier:
+
+```sql test
+CREATE OR REPLACE FUNCTION count_up(n INT) RETURNS INT LANGUAGE lua AS $$
+local count = n
+local function bump(k) count = count + k return count end
+return count + bump(1)
+$$;
+EXPLAIN FUNCTION count_up;
+```
+
+```text output
+Version	State	Tier	Placement
+1	active (live)	engine	tier engine, cost 0\n  reason lua.helper at line 4, column 16: a helper that changes the caller's variables, called inside an expression: call it in a statement of its own
+```
+
+Written as `local b = bump(1)` followed by `return count + b`, the same function compiles.
 
 ### KIRun
 
@@ -176,7 +318,7 @@ SELECT quote_js(7, 1000);
 CREATE [OR REPLACE] VALIDATION [db_name.]name
     ON [db_name.]table_name
     FOR {INSERT | UPDATE} [, {INSERT | UPDATE}]
-    LANGUAGE {kirun | javascript}
+    LANGUAGE {kirun | javascript | lua}
     [other clauses as for CREATE FUNCTION]
     AS body
 ```
@@ -196,7 +338,9 @@ JavaScript code can read the row in any of these forms:
 
 `row` is the row after the write. `old` is the row before it, and `null` for an insert, so test it before reading a column of it (`old !== null && old.status === 'shipped'`); reading a column of `null` throws, as in JavaScript. `sprig.reject(message)` or `throw new Error(message)` refuses the write.
 
-When the body is one expression whose only failure is a `reject` with a constant message, and it uses no `old_` or `op` parameter, SprigDB enforces it as a MariaDB `CHECK` constraint. Otherwise it installs `BEFORE INSERT` and `BEFORE UPDATE` triggers. Validations always run with the definer's rights (`SQL SECURITY INVOKER` fails with 39861), and must compile to the MariaDB tier: one that can't is refused with 39862. KIRun and JavaScript validations compile; a Lua validation is refused with 39862.
+Lua code gets one argument, `ctx`, written as a body alone or as `return function (ctx) … end`: `ctx.row` is the row after the write, `ctx.old` the row before it (`sprig.null` for an insert), and `ctx.trigger.after`, `.before` and `.op` are there too. A `NULL` column is `sprig.null`, so comparing it or doing arithmetic on it without a test fails the write with 39865, as Lua would. `sprig.reject(message)` or `error(message)` refuses the write.
+
+When the body is one expression whose only failure is a `reject` with a constant message, and it uses no `old_` or `op` parameter, SprigDB enforces it as a MariaDB `CHECK` constraint. Otherwise it installs `BEFORE INSERT` and `BEFORE UPDATE` triggers. In Lua, a body like `if q ~= sprig.null and q <= 0 then sprig.reject('…') end` becomes a `CHECK`; without the test for `sprig.null`, a path can fail with Lua's error, so it becomes triggers. Validations always run with the definer's rights (`SQL SECURITY INVOKER` fails with 39861), and must compile to the MariaDB tier, in any of the three languages: one that can't is refused with 39862, with the reasons.
 
 **Privileges:** `TRIGGER` on the table.
 
@@ -236,20 +380,68 @@ DELIMITER ;
 
 Because it reads `old`, this validation becomes `BEFORE INSERT` and `BEFORE UPDATE` triggers rather than a `CHECK` constraint; the deploy notes say which.
 
+A Lua rule on the note:
+
+```sql test
+CREATE OR REPLACE VALIDATION note_rules ON orders FOR INSERT, UPDATE LANGUAGE lua AS $$
+local n = ctx.row.note
+if n ~= sprig.null and string.len(n) > 32 then sprig.reject('note is longer than 32 bytes') end
+$$;
+```
+
+```sql test-error
+-- 39863 ER_SPRIG_LOGIC_VALIDATION_FAILED: note is longer than 32 bytes
+INSERT INTO orders VALUES (102, 7, 1, 'a note that is far too long to keep here');
+```
+
+### Changing columns under compiled code
+
+Validations and after-commit triggers in the MariaDB tier are compiled against the table's columns. `ALTER TABLE ... MODIFY`, `CHANGE`, `RENAME COLUMN`, `DROP COLUMN` or `ALTER COLUMN ... TYPE` compiles each of them again against the columns the statement would leave:
+
+- If each still reads the same columns with compatible types, the statement runs. Examples: a column it doesn't read, `INT` to `BIGINT`, `VARCHAR(16)` to `VARCHAR(64)`, `DOUBLE` to `DECIMAL`.
+- If a column it reads only changes type, the statement runs as well. Each such validation or trigger is compiled for the new type and deployed as a new version, on behalf of its owner, who stays its `DEFINER`. The statement returns a note per module.
+- If a column it reads is renamed or dropped, or gets a type the compiler can't handle, the statement is refused with 39481 `ER_SPRIG_DDL_UNSUPPORTED`. The message names the validation or trigger and why, for example `would no longer compile`. To make such a change, drop the validation or trigger, change the table, and create it again.
+
+```sql test
+CREATE TABLE order_lines (id INT PRIMARY KEY, qty INT, memo VARCHAR(16));
+CREATE VALIDATION qty_ok ON order_lines FOR INSERT, UPDATE LANGUAGE javascript
+  AS 'if (row.qty <= 0) sprig.reject("qty must be positive");';
+ALTER TABLE order_lines MODIFY qty BIGINT;        -- the validation still reads an integer
+ALTER TABLE order_lines MODIFY memo VARCHAR(64);  -- a column it doesn't read
+```
+
+A type change of a column the validation reads redeploys it:
+
+```sql test
+ALTER TABLE order_lines MODIFY qty DOUBLE;
+SHOW WARNINGS;
+```
+
+```text output
+Level	Code	Message
+Note	1105	validation qty_ok was recompiled for the new column types and deployed as a new version (the columns it reads would change under it: qty (i64 becomes f64))
+```
+
+```sql test-error
+ALTER TABLE order_lines RENAME COLUMN qty TO quantity;  -- 39481: it would no longer compile
+```
+
+The type change and the new versions are one DDL job: each new version is compiled and deployed on every shard before the `ALTER` runs, and a `CHECK` validation's new constraint replaces the old one in the same `ALTER TABLE`, so no write after the statement is judged or handled by a version compiled for the old types. If any new version fails to compile or deploy, the statement is refused before anything changes. If the `ALTER` itself fails, for example on a value out of the new type's range, the client gets its error, the validations' old versions stay active, and an after-commit trigger is deployed again for the columns as they are. A column change under an after-commit trigger takes about 2.5 seconds longer, while workers move to the trigger's new version.
+
 ## CREATE TRIGGER … AFTER COMMIT
 
 ```sql
 CREATE [OR REPLACE] TRIGGER [db_name.]name
     AFTER COMMIT ON [db_name.]table_name
     FOR event [, event] ...
-    LANGUAGE {kirun | javascript}
+    LANGUAGE {kirun | javascript | lua}
     [other clauses as for CREATE FUNCTION]
     AS body
 
 event: INSERT | UPDATE [OF (column [, column] ...)] | DELETE
 ```
 
-An after-commit trigger runs once for each committed row change, outside the writing transaction. It reads the tenant's change feed, so it never slows the write and never sees rolled-back rows. `UPDATE OF (columns)` fires only when one of those columns changed. The code reads the row as a validation does, in KIRun or JavaScript; for a `DELETE`, `row` is the deleted row.
+An after-commit trigger runs once for each committed row change, outside the writing transaction. It reads the tenant's change feed, so it never slows the write and never sees rolled-back rows. `UPDATE OF (columns)` fires only when one of those columns changed. The code reads the row as a validation does, in KIRun, JavaScript or Lua; for a `DELETE`, `row` (Lua: `ctx.row`) is the deleted row.
 
 Delivery:
 
@@ -257,7 +449,7 @@ Delivery:
 - Each change runs exactly once: a marker commits with the trigger's own writes, so a retried change does nothing twice.
 - A failure is retried with backoff from `logic.trigger_retry_initial_ms` (1 s) to `logic.trigger_retry_max_ms` (5 min). After `logic.trigger_max_attempts` failures (default 10), the change goes to the dead letters and the lane moves on.
 
-Triggers always run with the definer's rights. An after-commit trigger must compile to the MariaDB tier: KIRun and JavaScript triggers compile, and a Lua after-commit trigger is refused with 39862. A `CREATE TRIGGER` without `AFTER COMMIT`, `ON STREAM` or `ON QUEUE` is an ordinary MariaDB trigger.
+Triggers always run with the definer's rights. An after-commit trigger must compile to the MariaDB tier, in any of the three languages; one that can't is refused with 39862. A new version can be staged by row key; see [Staged rollouts](#staged-rollouts). A `CREATE TRIGGER` without `AFTER COMMIT`, `ON STREAM` or `ON QUEUE` is an ordinary MariaDB trigger.
 
 **Privileges:** `TRIGGER` and `SELECT` on the table. The code receives the changed rows as its definer, so it needs the right to read them.
 
@@ -284,6 +476,14 @@ $$ //
 DELIMITER ;
 ```
 
+In Lua, for updates of the quantity only:
+
+```sql test
+CREATE TRIGGER audit_qty_lua AFTER COMMIT ON orders FOR UPDATE OF (qty) LANGUAGE lua AS $$
+db.exec('INSERT INTO audit (order_id, qty) VALUES (?, ?)', ctx.row.id, ctx.row.qty)
+$$;
+```
+
 ## CREATE TRIGGER … ON STREAM and ON QUEUE
 
 ```sql
@@ -300,14 +500,18 @@ CREATE [OR REPLACE] TRIGGER [db_name.]name
 | `ON STREAM s FAN IN` | `s` is an inherited stream definition; the trigger reads every member tenant's instance below your tenant. Needs `SPRIG_FAN_IN` |
 | `ON QUEUE q` | As one more competing consumer of the queue: each message is acknowledged in the same transaction as the code's writes |
 
-Stream and queue triggers always run in the engine tier, as the definer. JavaScript and Lua code gets one argument, `ctx` (also a global):
+Stream and queue triggers run as the definer. JavaScript and Lua triggers compile to the MariaDB tier when the code stays in the compilable subset, including `JSON.parse` and `cjson.decode` of the record or message, and the deploy's note says `tier mariadb`. A record or message whose JSON the compiled code can't read as the language would runs in the engine tier instead, alone and in the same transaction, so the result is the same. KIRun triggers, instances of inherited triggers, and code that reads `ctx.user`, `ctx.tenant`, `ctx.database` or `ctx.trigger` run in the engine tier; [Logic](../data-models/logic.md#compiled-triggers) lists the rest. `WITH (SPRIG_TIER = 'engine')` keeps a trigger in the engine tier, and `SPRIG_TIER = 'mariadb'` refuses one that can't compile (39868).
+
+JavaScript and Lua code gets one argument, `ctx` (also a global):
 
 - `ctx.record`: `stream`, `partition`, `offset`, `key`, `value`, `headers`, `timestamp`;
-- `ctx.message`: `queue`, `exchange`, `routingKey`, `body`, `properties`, `redelivered`, `deliveryCount`.
+- `ctx.message`: `queue`, `exchange`, `routingKey`, `body`, `properties`, `redelivered`, `deliveryCount`, `vhost`.
 
 KIRun parameters bind by name to those fields, or to `record`, `message` or `ctx` for the whole object.
 
 After `logic.trigger_max_attempts` failures, a stream record goes to the dead letters and the offset moves past it. A queue message is written to the trigger's dead letters and then rejected, so the queue also sends it to its dead-letter exchange when it has one. Until then, each failure returns the message to the queue with its delivery count raised. `FAN IN` isn't allowed on queues.
+
+A new version can be staged by record key, or by message id for a queue; see [Staged rollouts](#staged-rollouts).
 
 A trigger on an inherited stream for every member tenant takes `FOR EACH TENANT GRANTS (…)`; see [FOR EACH TENANT](streams-queues-sinks.md#for-each-tenant). The streams and queues themselves are in [Streams, queues and sinks](streams-queues-sinks.md).
 
@@ -347,7 +551,7 @@ CREATE [OR REPLACE] SCHEDULE [db_name.]name
 | `OVERLAP QUEUE` | | One fire waits and runs when the previous run ends |
 | `DO CALL` | | The procedure and its arguments: string, number, `TRUE`, `FALSE` or `NULL` literals |
 
-Each fire runs once, on a worker, within `logic.job_budget_ms` (5 minutes by default), with the definer's rights. A fire late by more than the misfire window is recorded as misfired and skipped. A malformed cron text or zone fails with 39873 `ER_SPRIG_LOGIC_SCHEDULE_INVALID`. `SPRIG_ROLLOUT` isn't allowed on schedules, validations or triggers: they switch versions at once.
+Each fire runs once, on a worker, within `logic.job_budget_ms` (5 minutes by default), with the definer's rights. Schedules created before this release keep `logic.function_budget_ms` until you re-create them with `CREATE OR REPLACE SCHEDULE`; from then on they use `logic.job_budget_ms`. A fire late by more than the misfire window is recorded as misfired and skipped. A malformed cron text or zone fails with 39873 `ER_SPRIG_LOGIC_SCHEDULE_INVALID`. `SPRIG_ROLLOUT` isn't allowed on validations, computed columns or schedules (39861): they switch versions at once.
 
 **Privileges:** `CREATE ROUTINE` on the database.
 
@@ -367,10 +571,10 @@ CREATE SCHEDULE nightly_restock CRON '0 3 * * *' TIME ZONE 'Europe/London' DO CA
 ALTER TABLE [db_name.]table_name ADD [COLUMN] column_name type [GENERATED ALWAYS] AS (function_name(arg [, arg] ...)) [column_options]
 ```
 
-When `function_name` is a KIRun or JavaScript function that reduces to one expression, SprigDB puts the expression, with the arguments in place of the parameters, into the column definition, and the statement runs as ordinary DDL: the column is a MariaDB generated column. A KIRun function's `output` event must have exactly one field, the value, and every path through its steps must end in that event or in an argument check (which gives `NULL`). A JavaScript function returns the value. `STORED` and `VIRTUAL` columns both work.
+When `function_name` is a KIRun, JavaScript or Lua function that reduces to one expression, SprigDB puts the expression, with the arguments in place of the parameters, into the column definition, and the statement runs as ordinary DDL: the column is a MariaDB generated column. A KIRun function's `output` event must have exactly one field, the value, and every path through its steps must end in that event or in an argument check (which gives `NULL`). A JavaScript or Lua function returns the value. `STORED` and `VIRTUAL` columns both work.
 
 - A wrong argument count fails with 39874 `ER_SPRIG_LOGIC_SIGNATURE_MISMATCH`.
-- A function with no expression form fails with 39862 `ER_SPRIG_LOGIC_UNSUPPORTED`: data access, loops, or a Lua function.
+- A function with no expression form fails with 39862 `ER_SPRIG_LOGIC_UNSUPPORTED`: data access, loops, or a Lua function that may raise Lua's error, such as arithmetic on an argument that may be `NULL` (test it first: `if price == sprig.null then return nil end`).
 - A JavaScript function that isn't deterministic fails with 39862 and the reason `js.nondeterministic`: `Math.random()`, `Date.now()`, `Date()`, `performance.now()` and `crypto.*` give a different value on each call.
 - A new version of the function with the same parameters deploys, and the column keeps the expression of the version it was made from (a note says so). A new version with different parameters fails with 39875 and names the columns.
 
@@ -474,18 +678,34 @@ Every `CREATE OR REPLACE` of a function or procedure records a new version and m
 ### Staged rollouts
 
 ```sql
-CREATE OR REPLACE FUNCTION ... WITH (SPRIG_ROLLOUT = n [, SPRIG_ROLLOUT_BY = {'user' | 'tenant'}]) AS ...
+CREATE OR REPLACE {FUNCTION | PROCEDURE} ...
+    WITH (SPRIG_ROLLOUT = n [, SPRIG_ROLLOUT_BY = {'user' | 'tenant' | 'key:param_name'}]) AS ...
+CREATE OR REPLACE TRIGGER ... WITH (SPRIG_ROLLOUT = n [, SPRIG_ROLLOUT_BY = 'key']) AS ...
 
-ALTER {FUNCTION | PROCEDURE} [db_name.]name ROLLOUT TO n [PERCENT] [BY {USER | TENANT}]
-ALTER {FUNCTION | PROCEDURE} [db_name.]name ROLLOUT PROMOTE      -- same as TO 100
-ALTER {FUNCTION | PROCEDURE} [db_name.]name ROLLOUT ABORT        -- same as TO 0
+ALTER {FUNCTION | PROCEDURE} [db_name.]name ROLLOUT TO n [PERCENT] [BY {USER | TENANT | KEY}]
+ALTER TRIGGER [db_name.]name ROLLOUT TO n [PERCENT] [BY KEY]
+ALTER {FUNCTION | PROCEDURE | TRIGGER} [db_name.]name ROLLOUT PROMOTE      -- same as TO 100
+ALTER {FUNCTION | PROCEDURE | TRIGGER} [db_name.]name ROLLOUT ABORT        -- same as TO 0
 ```
 
-With `SPRIG_ROLLOUT = n` (1 to 99), the new version is the **candidate** for `n` percent of callers, and the active version answers the rest. Callers are picked by a hash of their account (`BY USER`, the default) or of the tenant (`BY TENANT`), so a caller keeps its version during a stage, and a larger stage keeps everyone the smaller one had. `ROLLOUT TO` moves the stage; `PROMOTE` makes the candidate active; `ABORT` returns everyone to the active version.
+With `SPRIG_ROLLOUT = n` (1 to 99), the new version is the **candidate** for `n` percent of callers, and the active version answers the rest. The pick is a hash of a key and the module, so a key keeps its version during a stage, and a larger stage keeps every key the smaller one had:
 
-Gateways count calls, errors and latency per version. When the candidate has enough calls and its error rate is above twice the active version's and above 1%, or its p95 latency is above twice the active version's, SprigDB aborts the rollout on its own and records why in the logic log. Stages don't advance on their own.
+| Code | `SPRIG_ROLLOUT_BY` | Key |
+|---|---|---|
+| Function, procedure | `'user'` (default) | The caller's account |
+| Function, procedure | `'tenant'` | The tenant: one version for all its callers |
+| Function, procedure | `'key:param_name'` | The value of that argument of the call, whoever calls (`NULL` is the empty key). It must be a whole-number or text parameter (39870 otherwise) |
+| Trigger `ON STREAM` | `'key'` (the only value) | The record's key; a record without a key runs the active version |
+| Trigger `ON QUEUE` | `'key'` | The message's `message-id` property, or its own id when it has none |
+| Trigger `AFTER COMMIT` | `'key'` | The row's primary key as text, such as `id=7` (`a=1,b='x'` for several columns), so a row's insert, updates and delete run one version |
 
-**Privileges:** `ALTER ROUTINE` on the database for `ALTER … ROLLOUT`; `CREATE ROUTINE` on the database for the `CREATE OR REPLACE` that starts a rollout.
+`ROLLOUT TO` moves the stage, keeping its key unless `BY` names another; `PROMOTE` makes the candidate active; `ABORT` returns everyone to the active version. `BY KEY` keeps the parameter chosen at deploy, so on a function whose stage was switched to `BY USER` or `BY TENANT` it fails with 39861. A trigger takes only `BY KEY` (39861 otherwise). Workers take a trigger's promoted candidate within a few seconds. A deploy without `SPRIG_ROLLOUT`, or a rollback, ends a rollout.
+
+The candidate must keep the active version's parameters, language and `SQL SECURITY` (functions and procedures), the stream or queue (triggers on them), or the table, the events and the `UPDATE OF` columns (after-commit triggers); otherwise the deploy fails with 39870 `ER_SPRIG_LOGIC_ROLLOUT_BLOCKED`. Validations, computed columns and schedules can't be staged (39861).
+
+Gateways count calls, errors and latency per version, and workers count each trigger version's runs and failures. When the candidate has enough calls and its error rate is above twice the active version's and above 1%, or its p95 latency is above twice the active version's, SprigDB aborts the rollout on its own and records why in the logic log. Stages don't advance on their own.
+
+**Privileges:** `ALTER ROUTINE` on the database for `ALTER {FUNCTION | PROCEDURE} … ROLLOUT`, and `ALTER ROUTINE`, `CREATE ROUTINE` or `TRIGGER` for `ALTER TRIGGER … ROLLOUT`; the privileges of the `CREATE OR REPLACE` that starts a rollout.
 
 ```sql test
 DELIMITER //
@@ -494,6 +714,21 @@ CREATE OR REPLACE FUNCTION net(price DOUBLE, qty INT) RETURNS DOUBLE LANGUAGE js
 DELIMITER ;
 ALTER FUNCTION net ROLLOUT TO 50 PERCENT;
 ALTER FUNCTION net ROLLOUT ABORT;
+```
+
+A rollout of an after-commit trigger, by row key:
+
+```sql test
+DELIMITER //
+CREATE OR REPLACE TRIGGER audit_orders_js AFTER COMMIT ON orders FOR INSERT, UPDATE, DELETE LANGUAGE javascript
+  WITH (SPRIG_ROLLOUT = 20) AS $$
+export default function (row, old, op) {
+  db.exec('INSERT INTO audit (order_id, qty) VALUES (?, ?)', [row.id, op === 'delete' ? 0 : row.qty]);
+}
+$$ //
+DELIMITER ;
+ALTER TRIGGER audit_orders_js ROLLOUT TO 50 PERCENT;
+ALTER TRIGGER audit_orders_js ROLLOUT PROMOTE;
 ```
 
 ### ALTER … ROLLBACK
@@ -507,6 +742,28 @@ Makes an earlier version active again, at once. The version's own source is comp
 ```sql
 ALTER FUNCTION net ROLLBACK;
 ALTER FUNCTION shop.quote_js ROLLBACK TO VERSION 1;
+```
+
+## ALTER TRIGGER … DISABLE and ENABLE
+
+```sql
+ALTER TRIGGER [db_name.]name {DISABLE | ENABLE}
+```
+
+Pauses or resumes an after-commit trigger or a trigger on a stream or queue.
+
+- `DISABLE` stops the trigger's job within 5 seconds and keeps its position: its place in the change feed, its consumer group's offsets on a stream. A queue trigger stops taking messages.
+- `ENABLE` resumes from that position. What was committed or published while the trigger was off then runs, each change, record or message once and in order.
+- Both answer with a note. A repeat (`DISABLE` of a disabled trigger) changes nothing and says so in a note. Each change of state writes a line to the trigger's log (`disabled by app@%`, `enabled by app@%`).
+- A `CREATE OR REPLACE` keeps a disabled trigger disabled. Dead letters replayed while it is off run after `ENABLE`.
+- An after-commit trigger left disabled after its cluster purged the binary logs it needs can't resume: after `ENABLE`, its job fails with 39800 `ER_SPRIG_FEED_HISTORY_LOST`. Drop and re-create it to start from now.
+- A name that isn't a logic trigger, such as an ordinary MariaDB trigger, fails with 39860. An inherited trigger's instance fails with 39862: use `ALTER INHERITED TRIGGER … DISABLE | ENABLE` (see [Inheritance in SQL](inheritance.md)).
+
+**Privileges:** as for `DROP TRIGGER`: `ALTER ROUTINE`, `CREATE ROUTINE` or `TRIGGER` on the database.
+
+```sql test
+ALTER TRIGGER audit_qty_lua DISABLE;
+ALTER TRIGGER audit_qty_lua ENABLE;
 ```
 
 ## DROP
@@ -558,7 +815,7 @@ DROP FUNCTION net_value CASCADE;
 
 ## Logs and dead letters
 
-What triggers and schedules did, and the events that kept failing, aren't SQL tables. Read and settle them with:
+What triggers and schedules did, and the events that kept failing, aren't SQL tables. A run's log holds its errors. The lines code writes (`console.log`, `info`, `warn`, `error` and `debug`, `ctx.log`, Lua `log` and `print`) are kept only for stream and queue triggers, in both tiers and also when a run fails: at most 100 lines a run and 60 a minute per trigger (a line says how many more were dropped), with each record's partition and offset or the message's id. Other kinds drop them, and their deploy notes say so (`js.log`, `lua.log`); a test run's report has them for every kind. See [Logic](../data-models/logic.md#what-code-can-use). Read and settle them with:
 
 - `sprigctl logic logs [name] [--follow]`;
 - `sprigctl logic dead-letters list | replay | discard` (replay sends them back to the trigger in order, with the active version);
@@ -575,7 +832,7 @@ Reading logs and dead letters needs `ALTER ROUTINE`, `CREATE ROUTINE` or `ALL` o
 | 39789 | `ER_SPRIG_FUNCTION_NOT_EXPOSED` | A call over a protocol the function's `EXPOSE` doesn't name |
 | 39860 | `ER_SPRIG_LOGIC_NOT_FOUND` | Unknown function, version or binding; a call of dropped code |
 | 39861 | `ER_SPRIG_LOGIC_SYNTAX` | The declaration or the body doesn't parse, or a clause isn't allowed for the kind |
-| 39862 | `ER_SPRIG_LOGIC_UNSUPPORTED` | The code can run in no tier, such as a validation that needs the engine tier; a refused statement in a test run |
+| 39862 | `ER_SPRIG_LOGIC_UNSUPPORTED` | The code can run in no tier, such as a validation, after-commit trigger or computed column that doesn't compile; a refused statement in a test run |
 | 39863 | `ER_SPRIG_LOGIC_VALIDATION_FAILED` | A validation rejected the row |
 | 39864 | `ER_SPRIG_LOGIC_BUDGET_EXCEEDED` | A budget (time, steps, rows, data operations, memory) ran out |
 | 39865 | `ER_SPRIG_LOGIC_USER_ERROR` | The code threw, or a `SELECT f()` got an `error` event |
@@ -583,7 +840,7 @@ Reading logs and dead letters needs `ALTER ROUTINE`, `CREATE ROUTINE` or `ALL` o
 | 39867 | `ER_SPRIG_LOGIC_OUTBOUND_DENIED` | `fetch` to a host outside `logic.outbound_allowlist`, or to an internal address |
 | 39868 | `ER_SPRIG_LOGIC_TIER_UNAVAILABLE` | `SPRIG_TIER = 'mariadb'` for code that can't compile to SQL |
 | 39869 | `ER_SPRIG_LOGIC_VERSION_CONFLICT` | Another deploy of the module ran at the same time |
-| 39870 | `ER_SPRIG_LOGIC_ROLLOUT_BLOCKED` | A version that can't be staged (other parameters, language or rights), or a candidate already rolled back automatically |
+| 39870 | `ER_SPRIG_LOGIC_ROLLOUT_BLOCKED` | A version that can't be staged (other parameters, language or rights; a key that isn't a whole-number or text parameter; a trigger's candidate on another stream, queue or table, or with other events or `UPDATE OF` columns), or a candidate already rolled back automatically |
 | 39871 | `ER_SPRIG_LOGIC_ENGINE_BUSY` | The engine's queue is full; retry |
 | 39872 | `ER_SPRIG_LOGIC_CALL_DEPTH` | Nested `db.call` too deep |
 | 39873 | `ER_SPRIG_LOGIC_SCHEDULE_INVALID` | A bad cron text or time zone |

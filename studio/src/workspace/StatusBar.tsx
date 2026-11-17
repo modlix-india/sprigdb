@@ -5,6 +5,7 @@ import { useSession } from '../auth/session';
 import { useTabs } from '../editor/tabs';
 import { Mascot } from '../app/Mascot';
 import { useRel } from './WorkspaceTabs';
+import { toggleDock, useAssistant } from '../ai/store';
 
 /** The status bar: connection, tenant, database and gateway,
  * with the mascot showing whether Studio is busy. */
@@ -20,6 +21,8 @@ export function StatusBar() {
   const db =
     parts[0] === 'db' ? parts[1] : parts[0] === 'q' ? (tabs.find((t) => t.id === parts[1])?.db ?? null) : null;
   const connected = status === 'active';
+  const dockOpen = useAssistant((s) => s.open);
+  const answering = useAssistant((s) => !!s.running);
   return (
     <footer className="statusbar" aria-label={intl.formatMessage({ id: 'status.label' })}>
       <Mascot pose={!connected ? 'sleeping' : busy ? 'working' : 'avatar'} size={18} />
@@ -43,6 +46,17 @@ export function StatusBar() {
       )}
       <span className="grow" />
       <span>{me?.principal.login}</span>
+      <button
+        className="status-assistant"
+        aria-pressed={dockOpen}
+        aria-keyshortcuts="Control+I Meta+I"
+        title="Assistant (Ctrl/⌘ I)"
+        onClick={toggleDock}
+        data-testid="status-assistant"
+      >
+        <Mascot pose={answering ? 'working' : 'idea'} size={18} />
+        Assistant
+      </button>
     </footer>
   );
 }

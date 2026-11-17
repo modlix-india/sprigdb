@@ -1,9 +1,8 @@
-//! Type DDL (chapter 32, "Joined storage", "State machines"; build step 3):
-//! `CREATE TABLE ... INHERITS`, `ALTER TABLE` and `DROP TABLE` on typed
-//! tables, and `DROP TABLE` of a table with a hierarchy.
+//! Type DDL: `CREATE TABLE ... INHERITS`, `ALTER TABLE` and `DROP TABLE` on
+//! typed tables, and `DROP TABLE` of a table with a hierarchy.
 //!
-//! The physical statements run through the executor's DDL path (chapter
-//! 08's engine, chapter 21's when the tenant has shards), one at a time;
+//! The physical statements run through the executor's DDL path (the DDL
+//! engine, the sharded one when the tenant has shards), one at a time;
 //! the `types` rows follow in one versioned catalog change. A table becomes
 //! a root when its first subtype is created: it gains the invisible
 //! `_type` and `_type_path` columns, whose defaults describe the root, and
@@ -56,8 +55,8 @@ pub fn nn_name(table: &str, column: &str) -> String {
     )
 }
 
-/// One `NOT NULL` check of single-table storage (chapter 32, "Single-table
-/// storage"): rows whose path starts with `path` need `column`.
+/// One `NOT NULL` check of single-table storage: rows whose path starts with
+/// `path` need `column`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NnCheck {
     pub(crate) name: String,
@@ -356,7 +355,8 @@ async fn disc_map(
         .clone()
         .ok_or_else(|| SprigError::internal("a root without a discriminator"))?;
     // The operand the catalog keeps, else read (a read of the root goes
-    // through chapter 42's merged view when the tree is inheritable).
+    // through the inheritance layer's merged view when the tree is
+    // inheritable).
     let operand = match &root.disc_operand {
         Some(o) => o.clone(),
         None => disc_operand(db, &root.name, &col, r).await?,
@@ -462,7 +462,7 @@ async fn adopt_rows(
                 .map(|k| format!("e.{q} = r.{q}", q = quote(k)))
                 .collect();
             // Keys first, then plain VALUES: the tables may be inheritable
-            // (chapter 42 refuses INSERT ... SELECT into them).
+            // (the inheritance layer refuses INSERT ... SELECT into them).
             let found = r
                 .query(&format!(
                     "SELECT {} FROM {root} AS r WHERE {holds} AND NOT EXISTS (SELECT 1 FROM {e} \
@@ -665,7 +665,7 @@ fn disc_mismatch(msg: impl Into<String>) -> SprigError {
 ///
 /// # Errors
 /// 39701, 39702, 39708, 39710, 39717, or a step's error.
-#[allow(clippy::too_many_lines)] // the chapter's steps in order
+#[allow(clippy::too_many_lines)] // the plan's steps in order
 pub async fn create(ct: &CreateTable, ctx: &Ctx<'_>, r: &mut dyn Runner) -> Result<Done> {
     if ct.temporary {
         return Err(unsupported("a temporary table can't be typed"));
@@ -1481,7 +1481,7 @@ async fn fill_operands(
 
 /// The type the rows of dropped subtype `t` become: under a discriminator
 /// the root (their values are undeclared once the type columns are
-/// regenerated: Kiran's Q2), else the nearest type above that rows may
+/// regenerated), else the nearest type above that rows may
 /// have ([`heir`]). `None`: every type above is abstract.
 fn successor(types: &DbTypes, root: &Arc<TypeDef>, t: &TypeDef) -> Option<Arc<TypeDef>> {
     if root.discriminator.is_some() {
@@ -1676,11 +1676,10 @@ pub async fn drop(dt: &DropTable, ctx: &Ctx<'_>, r: &mut dyn Runner) -> Result<D
             .await?;
         }
     }
-    // An inheritable tree (chapter 42): chapter 42 refused the drop already
+    // An inheritable tree: the inheritance layer refused the drop already
     // when the tree is shared (39895) or received from the parent tenant
     // (39897); what is left is this tenant's own, and the drop changes
-    // every space's rows, so its statements run on the physical tables
-    // (decision T18).
+    // every space's rows, so its statements run on the physical tables.
     let mut physical = false;
     for (db, types, ids) in &groups {
         if let Some(t) = ids.iter().find_map(|i| types.by_id(*i))
@@ -1714,8 +1713,8 @@ async fn drop_groups(
             .filter_map(|i| types.by_id(*i).cloned())
             .collect();
         doomed.sort_by(|a, b| b.depth.cmp(&a.depth).then(a.id.cmp(&b.id)));
-        // Rows of dropped subtypes whose root stays are kept (the lead's
-        // choice on T8, 12 November 2026), as rows of their successor.
+        // Rows of dropped subtypes whose root stays are kept, as rows of
+        // their successor.
         let mut tops: Vec<(Arc<TypeDef>, Arc<TypeDef>, Arc<TypeDef>)> = Vec::new();
         for t in doomed
             .iter()
@@ -1856,11 +1855,11 @@ fn root_named(ctx: &Ctx<'_>, table: &Name) -> Result<(Arc<DbTypes>, Arc<TypeDef>
 }
 
 /// `ALTER TABLE root ADD DISCRIMINATOR (c) [VALUES (subtype = v, ...)]`: a
-/// hierarchy typed by SprigDB's `_type` takes a discriminator column
-/// (chapter 32, "Discriminator columns"), online. A subtype's value is the
-/// one given, or the one value its rows hold. Every row must already agree
-/// with the mapping (39717 otherwise, nothing changed): a `CHECK` holds
-/// writes to it while `_type` and `_type_path` become generated columns.
+/// hierarchy typed by SprigDB's `_type` takes a discriminator column online. A
+/// subtype's value is the one given, or the one value its rows hold. Every row
+/// must already agree with the mapping (39717 otherwise, nothing changed): a
+/// `CHECK` holds writes to it while `_type` and `_type_path` become generated
+/// columns.
 ///
 /// # Errors
 /// 39710, 39717, 1054, or a step's error.
@@ -1871,10 +1870,10 @@ pub async fn add_discriminator(
 ) -> Result<Done> {
     let (types, root) = root_named(ctx, &d.table)?;
     let db = d.table.db.as_deref();
-    // An inheritable tree (decision T19): every space's rows are checked
-    // and converted, on the physical table; child tenants follow at their
-    // next statement. Chapter 42 refused it already in a tenant that
-    // receives the tree (39897).
+    // An inheritable tree: every space's rows are checked and converted, on the
+    // physical table; child tenants follow at their next statement. The
+    // inheritance layer refused it already in a tenant that receives the tree
+    // (39897).
     let physical = r.tree_inheritable(db, &root.name).await?;
     if physical {
         r.set_physical(true);
@@ -2089,7 +2088,7 @@ async fn add_discriminator_rows(
 }
 
 /// A child tenant's copy of an inherited type tree whose parent added or
-/// dropped the tree's discriminator (decision T19): the child's physical
+/// dropped the tree's discriminator: the child's physical
 /// root table in `schema` is converted the same way, and the types the
 /// child must write are returned (none when nothing differs). Inherited
 /// subtypes take the parent's values; the child's own subtypes keep their
@@ -2290,8 +2289,8 @@ pub async fn drop_discriminator(table: &Name, ctx: &Ctx<'_>, r: &mut dyn Runner)
     if root.storage == Storage::SingleTable {
         return Err(single_needs_discriminator());
     }
-    // An inheritable tree: on the physical table, every space's rows
-    // (decision T19); child tenants follow at their next statement.
+    // An inheritable tree: on the physical table, every space's rows;
+    // child tenants follow at their next statement.
     let physical = r.tree_inheritable(db, &root.name).await?;
     if physical {
         r.set_physical(true);

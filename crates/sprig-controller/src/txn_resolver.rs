@@ -81,6 +81,36 @@ impl PoolSource for CtlPools {
     }
 }
 
+/// [`sprig_txn::RedoGuard`] for resolvers outside the relay fence (this
+/// loop's and the cutovers' drains): a held branch is finished directly
+/// only while no relay writer holds the cluster's relay lease. Without one
+/// nothing else writes a relayed tenant's rows (its accounts log in only
+/// through a relay, which admits nobody, and the other system writers go
+/// through the relay too), and a replay here and the next writer's
+/// start-up recovery are kept apart by the redo marker. Once a writer
+/// holds the lease, it owns the cluster's held branches. An unreadable
+/// lease counts as held.
+pub struct NoRelayLease(pub Arc<dyn sprig_meta::MetaStore>);
+
+impl std::fmt::Debug for NoRelayLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NoRelayLease").finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl sprig_txn::RedoGuard for NoRelayLease {
+    async fn may_finish(&self, cluster: &ClusterId) -> bool {
+        let Ok(k) = sprig_cluster::failover::relay::relay_lease_key(self.0.tier(), cluster) else {
+            return false;
+        };
+        matches!(
+            self.0.get(&k, sprig_meta::Consistency::Linearizable).await,
+            Ok(None)
+        )
+    }
+}
+
 /// Whether the resolver looks at a cluster in `state`: anything that may
 /// hold tenant data.
 #[must_use]
@@ -97,6 +127,9 @@ pub struct ResolverLoop {
     registry: ClusterRegistry,
     live: Option<LiveSettings>,
     resolver: Arc<Resolver>,
+    /// The DC tier, for Sprig 2PC's relay leases: a cluster whose relay
+    /// writer holds its lease has its redo rows recovered by that relay.
+    relays: Option<Arc<dyn sprig_meta::MetaStore>>,
 }
 
 impl std::fmt::Debug for ResolverLoop {
@@ -124,6 +157,7 @@ impl ResolverLoop {
             registry,
             live,
             resolver: Arc::new(Resolver::new(admin, locator, cfg)),
+            relays: None,
         }
     }
 
@@ -148,13 +182,11 @@ impl ResolverLoop {
             TenantMaps::new(Arc::clone(&stores.dc)),
             Arc::clone(&admin) as Arc<dyn sprig_txn::GroupSchemas>,
         );
-        Ok(Self::new(
-            dc.clone(),
-            registry,
-            admin,
-            Arc::new(locator),
-            Some(live),
-        ))
+        let mut me = Self::new(dc.clone(), registry, admin, Arc::new(locator), Some(live));
+        me.resolver
+            .set_redo_guard(Arc::new(NoRelayLease(Arc::clone(&stores.dc))));
+        me.relays = Some(Arc::clone(&stores.dc));
+        Ok(me)
     }
 
     /// The resolver, for drains and operator commands.
@@ -236,7 +268,27 @@ impl Reconciler for ResolverLoop {
         } else if scan.listed > 0 {
             tracing::debug!(cluster = %key, ?scan, "resolver scan");
         }
-        // Sprig 2PC: held branches whose transaction was lost.
+        // Sprig 2PC: held branches whose transaction was lost. Where a
+        // relay writer holds the cluster's relay lease, it recovers them
+        // inside its fence; without one (no relay, or between holders,
+        // when relayed tenants can't connect) the resolver does.
+        if let Some(store) = &self.relays {
+            let leased = match sprig_cluster::failover::relay::relay_lease_key(store.tier(), key) {
+                Ok(k) => store
+                    .get(&k, sprig_meta::Consistency::Linearizable)
+                    .await
+                    .map(|v| v.is_some()),
+                Err(e) => Err(e),
+            };
+            match leased {
+                Ok(l) => self.resolver.mark_fenced(key, l),
+                // Unknown: leave the rows for the next pass.
+                Err(e) => {
+                    tracing::warn!(cluster = %key, error = %e, "relay lease unreadable");
+                    self.resolver.mark_fenced(key, true);
+                }
+            }
+        }
         match self.resolver.scan_redo(key).await {
             Ok(r) if r.replayed + r.dropped + r.hazards + r.unresolved > 0 => {
                 tracing::info!(cluster = %key, ?r, "resolver redo scan");

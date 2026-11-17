@@ -1,7 +1,6 @@
-//! Schema changes while an object is shared (chapter 42; Kiran's decision
-//! N7 of 8 November 2026): while any share of an inheritable object exists,
-//! only additive changes are allowed; destructive ones fail with 39895,
-//! naming the shares that block them.
+//! Schema changes while an object is shared: while any share of an inheritable
+//! object exists, only additive changes are allowed; destructive ones fail with
+//! 39895, naming the shares that block them.
 //!
 //! | Allowed while shared | Refused while shared |
 //! |---|---|
@@ -12,9 +11,9 @@
 //! Anything this module can't classify (a statement sqlparser-rs can't
 //! read, an operation not in the table) counts as destructive. The gateway
 //! refuses early, from its snapshot; [`SharedCheck`] refuses again in
-//! chapter 21's prepare phase, under the catalog lock, from the catalog
+//! the DDL engine's prepare phase, under the catalog lock, from the catalog
 //! itself, so a share created by another session in between is seen
-//! (decision I7). `DROP TABLE`, `RENAME TABLE`, `TRUNCATE` and `DROP
+//! too. `DROP TABLE`, `RENAME TABLE`, `TRUNCATE` and `DROP
 //! DATABASE` are destructive by kind; an `ALTER TABLE` is marked
 //! destructive by this module ([`DESTRUCTIVE`]) when it classifies it,
 //! because the engine can't read column types.
@@ -48,8 +47,8 @@ tokio::task_local! {
     pub static DESTRUCTIVE: String;
 }
 
-/// Chapter 42's prepare-phase check (see the module docs), registered on
-/// the gateway's DDL engine.
+/// The prepare-phase check for shared objects (see the module docs), registered
+/// on the gateway's DDL engine.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SharedCheck;
 
@@ -359,7 +358,7 @@ pub(crate) async fn show_columns(r: &mut dyn Runner, layer: &str) -> Result<Vec<
 }
 
 /// User `UNIQUE` keys as `SHOW INDEX` lists them (the `_sprig_space` part
-/// is hidden by chapter 07).
+/// is hidden by the name layer).
 pub(crate) async fn show_uniques(
     r: &mut dyn Runner,
     layer: &str,
@@ -677,7 +676,7 @@ pub async fn alter(sql: &str, n: &Name, ctx: &Ctx<'_>, r: &mut dyn Runner) -> Re
         refuse_if_received(ctx, &res.obj, &format!("ALTER TABLE ({why})"))?;
     }
     // A column a descendant tenant already has would come down to it
-    // (question Q3; the default: refuse the parent's change).
+    // (the parent's change is refused).
     if let Ok(Statement::AlterTable(at)) = parse_one(sql) {
         for op in &at.operations {
             if let AlterTableOperation::AddColumn { column_def, .. } = op {
@@ -691,7 +690,7 @@ pub async fn alter(sql: &str, n: &Name, ctx: &Ctx<'_>, r: &mut dyn Runner) -> Re
     };
     follow_columns(ctx, r, &res).await?;
     // Only columns added (a child's own, a single-table subtype's): a
-    // serving copy from the parent tenant keeps serving (decision T20).
+    // serving copy from the parent tenant keeps serving.
     if only_adds(sql) && ctx.up_edge(&res.obj)?.is_some() {
         let added: Vec<String> = show_columns(r, &res.layer)
             .await?
@@ -723,8 +722,7 @@ pub(crate) async fn follow_columns(
         .into_iter()
         .map(|c| c.name)
         .collect();
-    // A record hierarchy's invisible path columns are fields too
-    // (decision T22).
+    // A record hierarchy's invisible path columns are fields too.
     if crate::hier::probe_paths(r, &res.layer).await {
         cols.extend(crate::hier::PATH_COLUMNS.iter().map(|c| (*c).to_owned()));
     }

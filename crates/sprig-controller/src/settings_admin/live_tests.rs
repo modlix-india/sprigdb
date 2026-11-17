@@ -176,7 +176,9 @@ async fn live_settings_through_the_service() {
                 &CreateTenantRequest {
                     name: name.clone(),
                     parent: None,
-                    cluster: None,
+                    // On lt-c1: least-busy placement (no hint) reads DC
+                    // records, which only the real global tier holds.
+                    cluster: Some(ClusterId::new("lt-c1").unwrap()),
                 },
                 &[],
             )

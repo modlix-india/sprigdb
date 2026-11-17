@@ -78,6 +78,11 @@ pub struct RedoStmt {
     pub charset: Option<String>,
     /// `@@timestamp` the branch ran under (micros since the epoch).
     pub timestamp_us: Option<u64>,
+    /// The session's default database when it ran: statements on a
+    /// database's unsharded tables name them without a schema, and a
+    /// replay's connection has none of its own (`USE` before the
+    /// statement).
+    pub db: Option<String>,
 }
 
 impl RedoStmt {
@@ -90,6 +95,9 @@ impl RedoStmt {
         }
         if let Some(c) = &self.charset {
             let _ = write!(s, "\ncharset={c}");
+        }
+        if let Some(d) = &self.db {
+            let _ = write!(s, "\ndb={d}");
         }
         for (k, v) in &self.vars {
             let _ = write!(s, "\nvar.{k}={v}");
@@ -113,6 +121,7 @@ impl RedoStmt {
                 "insert_id" => r.insert_id = v.parse().unwrap_or(0),
                 "ts" => r.timestamp_us = v.parse().ok(),
                 "charset" => r.charset = Some(v.to_owned()),
+                "db" => r.db = Some(v.to_owned()),
                 _ => {
                     if let Some(name) = k.strip_prefix("var.") {
                         r.vars.push((name.to_owned(), v.to_owned()));
@@ -121,6 +130,16 @@ impl RedoStmt {
             }
         }
         r
+    }
+
+    /// `USE` of the statement's default database, when it had one with a
+    /// name that needs no escaping beyond backquotes.
+    #[must_use]
+    pub fn use_sql(&self) -> Option<String> {
+        self.db
+            .as_deref()
+            .filter(|d| !d.is_empty() && !d.contains('\n'))
+            .map(|d| format!("USE `{}`", d.replace('`', "``")))
     }
 
     /// The statement as replayed: `SET STATEMENT … FOR <sql>` with its
@@ -413,9 +432,14 @@ mod tests {
             ],
             charset: Some("utf8mb4".into()),
             timestamp_us: Some(1_700_000_000_123_456),
+            db: Some("t1_d1_g1_s1".into()),
         };
         let back = RedoStmt::from_ctx(s.sql.clone(), &s.ctx());
         assert_eq!(back, s);
+        assert_eq!(s.use_sql().as_deref(), Some("USE `t1_d1_g1_s1`"));
+        // Rows written before the database was recorded replay without it.
+        let old = RedoStmt::from_ctx(s.sql.clone(), "affected=1\ninsert_id=0");
+        assert_eq!(old.use_sql(), None);
         assert_eq!(
             s.replay_sql(),
             "SET STATEMENT timestamp=1700000000.123456, insert_id=41, \

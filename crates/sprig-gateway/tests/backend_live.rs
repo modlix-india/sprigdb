@@ -313,9 +313,19 @@ async fn pool_reuse_replays_session_state() {
     assert_eq!(r.cell(0, 1), Some(db.as_str()));
     assert_eq!(r.cell(0, 2), None);
     assert_eq!(r.cell(0, 3), Some("0"));
+    // The MySQL persona's backend sql_mode: MySQL 8.4's, run without
+    // ONLY_FULL_GROUP_BY (the gateway checks it) and with
+    // TIME_ROUND_FRACTIONAL; the client's view is the gateway's.
+    let mode = r.cell(0, 4).unwrap();
     assert!(
-        r.cell(0, 4).unwrap().contains("ONLY_FULL_GROUP_BY"),
-        "MySQL persona baseline"
+        mode.contains("NO_ZERO_DATE")
+            && mode.contains("TIME_ROUND_FRACTIONAL")
+            && !mode.contains("ONLY_FULL_GROUP_BY"),
+        "MySQL persona baseline: {mode}"
+    );
+    assert_eq!(
+        b.vars().client_sql_mode.as_deref(),
+        Some(sprig_gateway::backend::state::persona::MYSQL84_SQL_MODE)
     );
     assert_eq!(r.cell(0, 5), Some("utf8mb4"));
     assert_eq!(r.cell(0, 6), Some("0"));
@@ -461,8 +471,10 @@ async fn writer_selection_per_topology() {
         assert_eq!(w.node.as_str(), "n1");
     }
     if let Some(u) = urls(skip::MARIADB_REPLICATION) {
-        // Replicas first in the record: the checks must still find the primary.
-        let addrs = vec![u[1].addr.clone(), u[0].addr.clone(), u[2].addr.clone()];
+        // The registered writer (the record's first node) is the writer
+        // while nothing is published; the checks may only veto it
+        // (backend/writer.rs, the 9 November replica-1 incident).
+        let addrs = vec![u[0].addr.clone(), u[1].addr.clone(), u[2].addr.clone()];
         let rig = rig(
             TopologyKind::PrimaryReplica,
             &u[0].user,
@@ -472,7 +484,7 @@ async fn writer_selection_per_topology() {
         );
         let mut s = rig.session(Persona::MariaDb);
         ok(&mut s, "SELECT 1").await; // starts the monitor
-        rig.wait_roles(&[NodeRole::Replica, NodeRole::Writer, NodeRole::Replica])
+        rig.wait_roles(&[NodeRole::Writer, NodeRole::Replica, NodeRole::Replica])
             .await;
         let w = rig
             .backends
@@ -483,7 +495,29 @@ async fn writer_selection_per_topology() {
         let r = run_as(&mut s, &StmtInfo::write(), "SELECT @@server_id")
             .await
             .unwrap();
-        assert_eq!(r.out.node.node.as_str(), "n2", "writes go to the primary");
+        assert_eq!(r.out.node.node.as_str(), "n1", "writes go to the primary");
+        s.close().await;
+
+        // A replica registered first: the gateway never nominates another
+        // node, so writes are refused (39100) instead of guessed.
+        let addrs = vec![u[1].addr.clone(), u[0].addr.clone(), u[2].addr.clone()];
+        let rig2 = crate::rig(
+            TopologyKind::PrimaryReplica,
+            &u[0].user,
+            &u[0].pass,
+            &addrs,
+            fast_settings(),
+        );
+        let mut s = rig2.session(Persona::MariaDb);
+        ok(&mut s, "SELECT 1").await;
+        rig2.wait_roles(&[NodeRole::Replica, NodeRole::Writer, NodeRole::Replica])
+            .await;
+        let e = rig2
+            .backends
+            .writer(&rig2.target.cluster, ShardId(0))
+            .await
+            .unwrap_err();
+        assert_eq!(e.protocol().mysql_errno, 39100, "{e}");
         s.close().await;
     }
     if let Some(u) = urls(skip::MARIADB_GALERA) {
@@ -1312,6 +1346,8 @@ async fn lowered_limits_converge() {
         account: rig.target.user.clone(),
         found_rows: false,
         mariadb_caps: 0,
+        relay: None,
+        branch: false,
     };
     assert_eq!(rig.backends.pools().stats(&key).idle, 4);
     rig.settings.set(BackendSettings {
@@ -2001,4 +2037,277 @@ async fn probes_measure_rows_examined_on_the_same_connection() {
     ok(&mut a, "COMMIT").await;
 
     ok(&mut a, &format!("DROP DATABASE {db}")).await;
+}
+
+/// Every COMMIT a Galera node answers OK has its writes in the table.
+/// Two sessions per node append to four shared rows
+/// (`INSERT … ON DUPLICATE KEY UPDATE`) and read another row in the same
+/// transaction, so other nodes' write sets keep aborting transactions
+/// mid-statement. Galera sometimes answers such a transaction's statements
+/// and its COMMIT with OK although it was rolled back (the 15 November CI
+/// loss); the gateway must answer 1213 instead. One session per node runs
+/// with `autocommit = 0` and prepared writes, where a statement after the
+/// abort opens a new transaction. Each node is a cluster of its own here so
+/// that sessions write on all three.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn galera_commits_answered_ok_are_kept() {
+    let u = need!(skip::MARIADB_GALERA, "galera_commits_answered_ok_are_kept");
+    // Counts the gateway's "wrote nothing" warnings (process-wide: the
+    // sessions run on the runtime's worker threads).
+    let silent = SilentAborts::default();
+    {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let _ = tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(silent.clone()),
+        );
+    }
+    let secs: u64 = skip::var("SPRIG_TEST_GALERA_ACK_SECS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40);
+    let rigs: Vec<Rig> = u
+        .iter()
+        .map(|x| {
+            rig(
+                TopologyKind::Galera,
+                &x.user,
+                &x.pass,
+                std::slice::from_ref(&x.addr),
+                fast_settings(),
+            )
+        })
+        .collect();
+    let db = unique_ident("sprig_bt");
+    let mut a = rigs[0].session(Persona::MariaDb);
+    ok(&mut a, &format!("CREATE DATABASE {db}")).await;
+    ok(
+        &mut a,
+        &format!("CREATE TABLE {db}.la (k INT PRIMARY KEY, v TEXT NOT NULL)"),
+    )
+    .await;
+    for r in &rigs {
+        // A cluster's monitor starts with its first statement.
+        let mut s = r.session(Persona::MariaDb);
+        ok(&mut s, "SELECT 1").await;
+        s.close().await;
+        r.wait_roles(&[NodeRole::Galera]).await;
+    }
+    let next = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let end = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let mut workers = Vec::new();
+    for (n, r) in rigs.iter().enumerate() {
+        for w in 0..2u64 {
+            let mut s = r.session(Persona::MariaDb);
+            let (db, next) = (db.clone(), Arc::clone(&next));
+            let mut seed = (n as u64) * 7919 + w * 104_729 + 17;
+            // Every second session runs with autocommit = 0, as JDBC and
+            // Hibernate clients often do: no BEGIN, its first write opens
+            // the transaction, and a second write follows the read, all
+            // three prepared.
+            let ac0 = w == 1;
+            workers.push(tokio::spawn(async move {
+                let mut rnd = move |m: u64| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    seed % m
+                };
+                if ac0 {
+                    ok(&mut s, "SET autocommit = 0").await;
+                }
+                let insert = format!("INSERT INTO {db}.la (k, v) VALUES (?, ?) ON DUPLICATE KEY UPDATE v = CONCAT(v, ',', VALUES(v))");
+                let (mut acked, mut refused, mut unavailable) = (Vec::new(), 0u32, 0u32);
+                while tokio::time::Instant::now() < end {
+                    let (k, other, k2) = (rnd(4), rnd(4), rnd(4));
+                    let v = next.fetch_add(2, std::sync::atomic::Ordering::SeqCst);
+                    // The read is a prepared statement (COM_STMT_EXECUTE):
+                    // Galera's silent aborts were seen there, never with
+                    // text statements alone.
+                    let read = Op::Prepared(format!("SELECT v FROM {db}.la WHERE k = {other}"));
+                    let steps = if ac0 {
+                        vec![
+                            Op::Insert(insert.clone(), k, v),
+                            read,
+                            Op::Insert(insert.clone(), k2, v + 1),
+                            Op::Text("COMMIT".to_owned()),
+                        ]
+                    } else {
+                        vec![
+                            Op::Text("BEGIN".to_owned()),
+                            Op::Text(format!("INSERT INTO {db}.la (k, v) VALUES ({k}, '{v}') ON DUPLICATE KEY UPDATE v = CONCAT(v, ',', VALUES(v))")),
+                            read,
+                            Op::Text("COMMIT".to_owned()),
+                        ]
+                    };
+                    let mut committed = true;
+                    for op in &steps {
+                        let r = match op {
+                            Op::Prepared(sql) => execute_no_params(&mut s, sql).await,
+                            Op::Insert(sql, k, v) => execute_insert(&mut s, sql, *k, *v).await,
+                            Op::Text(sql) => run(&mut s, sql).await.map(|res| res.out.error),
+                        };
+                        // Anything but OK leaves the transaction
+                        // unacknowledged: conflicts (1213 and the like),
+                        // and, when a node leaves the primary component,
+                        // 1047 or the gateway's own errors.
+                        match r {
+                            Ok(None) => {}
+                            Ok(Some(e)) => {
+                                if !matches!(e.code, 1213 | 1205 | 1020 | 1180) {
+                                    unavailable += 1;
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                }
+                                committed = false;
+                                break;
+                            }
+                            // A conflict the gateway answers itself (a
+                            // write's transaction check that failed).
+                            Err(e) if matches!(code(&e), 1213 | 1205 | 1020 | 1180) => {
+                                committed = false;
+                                break;
+                            }
+                            Err(_) => {
+                                unavailable += 1;
+                                committed = false;
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                break;
+                            }
+                        }
+                    }
+                    if committed {
+                        acked.push((k, v));
+                        if ac0 {
+                            acked.push((k2, v + 1));
+                        }
+                    } else {
+                        refused += 1;
+                        let _ = run(&mut s, "ROLLBACK").await;
+                    }
+                }
+                s.close().await;
+                (acked, refused, unavailable)
+            }));
+        }
+    }
+    let (mut acked, mut refused, mut unavailable) = (Vec::new(), 0, 0);
+    for h in workers {
+        let (a, r, o) = h.await.unwrap();
+        acked.extend(a);
+        refused += r;
+        unavailable += o;
+    }
+    // Every node has applied every write set before the read.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let rows = ok(&mut a, &format!("SELECT k, v FROM {db}.la")).await;
+    let lists: std::collections::BTreeMap<u64, Vec<u64>> = rows
+        .rows
+        .iter()
+        .map(|r| {
+            (
+                r[0].as_deref().unwrap().parse().unwrap(),
+                r[1].as_deref()
+                    .unwrap()
+                    .split(',')
+                    .filter_map(|x| x.parse().ok())
+                    .collect(),
+            )
+        })
+        .collect();
+    let lost: Vec<_> = acked
+        .iter()
+        .filter(|(k, v)| !lists.get(k).is_some_and(|l| l.contains(v)))
+        .collect();
+    eprintln!(
+        "{secs} s: {} commits answered OK, {refused} transactions refused ({unavailable} by an \
+         unavailable node), {} rolled back by Galera without an error; lost {lost:?}",
+        acked.len(),
+        silent.0.load(std::sync::atomic::Ordering::SeqCst)
+    );
+    ok(&mut a, &format!("DROP DATABASE {db}")).await;
+    a.close().await;
+    assert!(
+        lost.is_empty(),
+        "commits answered OK but not kept: {lost:?}"
+    );
+    assert!(refused > 0, "the sessions conflicted");
+}
+
+/// Counts the gateway's warnings about a Galera COMMIT answered OK that
+/// wrote nothing.
+#[derive(Clone, Default)]
+struct SilentAborts(Arc<std::sync::atomic::AtomicU64>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SilentAborts {
+    fn on_event(&self, e: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Msg(bool);
+        impl tracing::field::Visit for Msg {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                if f.name() == "message" && format!("{v:?}").contains("wrote nothing") {
+                    self.0 = true;
+                }
+            }
+        }
+        let mut m = Msg(false);
+        e.record(&mut m);
+        if m.0 {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// One statement of [`galera_commits_answered_ok_are_kept`]'s transactions.
+enum Op {
+    /// A text statement.
+    Text(String),
+    /// A prepared statement without parameters.
+    Prepared(String),
+    /// A prepared `INSERT` of `(k, v)`.
+    Insert(String, u64, u64),
+}
+
+/// Runs `sql`, an `INSERT` with two parameters, as a prepared statement
+/// with `k` and `v` (as text) bound: the server's error, if any.
+async fn execute_insert(
+    bs: &mut BackendSession,
+    sql: &str,
+    k: u64,
+    v: u64,
+) -> Result<Option<ErrPacket>, SprigError> {
+    let info = StmtInfo::classify(sql.as_bytes());
+    let v = v.to_string();
+    bs.execute(&info, sql.as_bytes(), &mut |st| {
+        // COM_STMT_EXECUTE, no cursor, one iteration, a null bitmap of one
+        // byte, the types (LONGLONG unsigned, VAR_STRING), then the values.
+        let mut p = vec![0x17];
+        p.extend_from_slice(&st.id.to_le_bytes());
+        p.push(0);
+        p.extend_from_slice(&1u32.to_le_bytes());
+        p.extend_from_slice(&[0, 1, 0x08, 0x80, 0xfd, 0]);
+        p.extend_from_slice(&k.to_le_bytes());
+        p.push(u8::try_from(v.len()).unwrap());
+        p.extend_from_slice(v.as_bytes());
+        Ok(bytes::Bytes::from(p))
+    })
+    .await?;
+    while bs.next().await?.is_some() {}
+    Ok(bs.finish().await?.error)
+}
+
+/// Runs `sql`, which has no parameters, as a prepared statement: the
+/// server's error, if any.
+async fn execute_no_params(
+    bs: &mut BackendSession,
+    sql: &str,
+) -> Result<Option<ErrPacket>, SprigError> {
+    let info = StmtInfo::classify(sql.as_bytes());
+    bs.execute(&info, sql.as_bytes(), &mut |st| {
+        // COM_STMT_EXECUTE, no cursor, one iteration, no parameters.
+        let mut p = vec![0x17];
+        p.extend_from_slice(&st.id.to_le_bytes());
+        p.push(0);
+        p.extend_from_slice(&1u32.to_le_bytes());
+        Ok(bytes::Bytes::from(p))
+    })
+    .await?;
+    while bs.next().await?.is_some() {}
+    Ok(bs.finish().await?.error)
 }

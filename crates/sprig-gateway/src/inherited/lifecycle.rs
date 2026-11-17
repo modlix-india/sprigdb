@@ -23,6 +23,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sprig_catalog::CatalogLocator;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::version::VersionKind;
 use sprig_common::ids::TenantId;
 use sprig_common::{Result, SprigCode, SprigError};
@@ -77,12 +78,18 @@ pub async fn remove_all(svc: &Arc<TenantServices>, def: &Definition) -> Result<u
             continue;
         }
         let ep = svc.locator.writer(t).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
-        let st = MsgStore::new(ep.store.schema());
-        if !st.migrated(&mut conn).await? {
-            continue;
-        }
-        if let Some(i) = st.instance(&mut conn, def.key()).await?
+        let found = {
+            let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
+            let st = MsgStore::new(ep.store.schema());
+            if st.migrated(&mut conn).await? {
+                st.instance(&mut conn, def.key()).await?
+            } else {
+                None
+            }
+        };
+        // The connection went back first: `remove_one` takes its own from
+        // the same pool.
+        if let Some(i) = found
             && i.state != InstanceState::Detached
         {
             tracing::info!(tenant = %t, def = %def.key(), state = i.state.as_str(), "removing an instance the index didn't list");
@@ -257,10 +264,12 @@ pub async fn database_dropped(
     if gone.is_empty() {
         return Ok(0);
     }
-    let ep = svc.locator.writer(t).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
-    let st = MsgStore::new(ep.store.schema());
+    // The chain may load an ancestor's catalog from the same pool: before
+    // this function's catalog connection is taken.
     let chain = super::chain(svc, &cat).await?;
+    let ep = svc.locator.writer(t).await?;
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
+    let st = MsgStore::new(ep.store.schema());
     for i in &gone {
         let triggers = match chain.def(i.def) {
             Some(d) if d.kind == DefKind::Stream => super::triggers::on_stream(&chain, &d),
@@ -286,6 +295,8 @@ pub async fn database_dropped(
         super::streams::forget_applied(t, i.def);
     }
     super::mq::forget_applied(t, Some(db));
+    // The change takes its own catalog connection.
+    drop(conn);
     // Every gateway reads the rows at the member's next version.
     let c = svc.catalog.change(t, VersionKind::Catalog).await?;
     c.commit().await?;
@@ -308,26 +319,30 @@ pub async fn detach(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) ->
         ));
     }
     let ep = svc.locator.writer(t).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(cat_err)?;
     let st = MsgStore::new(ep.store.schema());
-    let Some(i) = st.instance(&mut conn, def.key()).await? else {
-        return Err(super::target_err(format!(
-            "this tenant has no instance of {} {}.{} to detach",
-            def.kind.as_str(),
-            def.db_name,
-            def.name
-        )));
-    };
-    st.set_instance(
-        &mut conn,
-        def.key(),
-        InstanceState::Detached,
-        i.def_version,
-        &i.definition,
-    )
-    .await?;
+    {
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
+        let Some(i) = st.instance(&mut conn, def.key()).await? else {
+            return Err(super::target_err(format!(
+                "this tenant has no instance of {} {}.{} to detach",
+                def.kind.as_str(),
+                def.db_name,
+                def.name
+            )));
+        };
+        st.set_instance(
+            &mut conn,
+            def.key(),
+            InstanceState::Detached,
+            i.def_version,
+            &i.definition,
+        )
+        .await?;
+    }
     super::delete_index(svc, t, def.key()).await?;
-    // The member's inherited triggers reading it stop.
+    // The member's inherited triggers reading it stop. The snapshot and
+    // the chain may load catalogs from the same pool, so no catalog
+    // connection is held meanwhile.
     let cat = catalog(svc, t).await?;
     let chain = super::chain(svc, &cat).await?;
     let triggers = match def.kind {
@@ -335,6 +350,7 @@ pub async fn detach(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) ->
         DefKind::Queue => super::triggers::on_queue(&chain, def),
         _ => Vec::new(),
     };
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
     let mut stopped = 0;
     for g in triggers {
         if let Some(gi) = st.instance(&mut conn, g.key()).await? {
@@ -350,6 +366,7 @@ pub async fn detach(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) ->
             stopped += 1;
         }
     }
+    drop(conn);
     // Every gateway reads the row at the member's next version.
     let c = svc.catalog.change(t, VersionKind::Catalog).await?;
     c.commit().await?;

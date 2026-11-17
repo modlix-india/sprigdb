@@ -21,6 +21,10 @@
 //! - [`providers`]: provider records in etcd, with keys sealed by [`keys`];
 //! - [`tools`]: tool specs, the built-in registry, input checks;
 //! - [`egress`]: the egress gate;
+//! - [`embedding`]: embedded columns' model aliases, keys, catalog rows
+//!   and metrics;
+//! - [`retrieval`]: retrieval indexes' catalog rows, chunk tables, keys
+//!   and metrics;
 //! - [`settings`]: the `ai.*` keys;
 //! - [`budget`]: daily token budgets;
 //! - [`audit`]: conversations, messages and usage in the tenant catalog,
@@ -28,27 +32,44 @@
 //!   ([`audit::system`]);
 //! - [`feedback`]: votes on answers and proposal outcomes, and the prompt
 //!   notes made of them;
+//! - [`functions`]: the AI functions in statements (`AI_CLASSIFY` and
+//!   the others, and their MongoDB operators): evaluation, cache, budgets;
 //! - [`glossary`]: the tenant's business terms;
+//! - [`dashboards`]: dashboards and their tiles, shared or not, run as
+//!   the viewer;
+//! - [`incidents`]: the administration agent's error intake, triage and
+//!   advice;
+//! - [`admin`]: its metric history, health rules, upgrade readiness and
+//!   incident write-ups;
 //! - [`mcp`]: the MCP server's tools and calls, without the transport;
+//! - [`digest`]: tenant digests from statistics, worded by the data
+//!   assistant's model;
 //! - [`turn`]: one chat turn, provider and tools in a loop;
 //! - [`mod@metrics`]: the `sprig_ai_*` metrics;
 //! - `eval` (feature `eval`, and in tests): the evaluation sets and their
 //!   runner.
 
+pub mod admin;
 pub mod audit;
 pub mod budget;
+pub mod dashboards;
+pub mod digest;
 pub mod egress;
+pub mod embedding;
 pub mod error;
 #[cfg(any(test, feature = "eval"))]
 pub mod eval;
 pub mod feedback;
+pub mod functions;
 pub mod glossary;
+pub mod incidents;
 pub mod keys;
 pub mod mcp;
 pub mod metrics;
 pub mod prompt;
 pub mod provider;
 pub mod providers;
+pub mod retrieval;
 pub mod role;
 pub mod settings;
 pub mod sql_guard;

@@ -1,5 +1,4 @@
-//! Record hierarchies across tenants (decisions T27 and T28; T22's piece
-//! 7).
+//! Record hierarchies across tenants.
 //!
 //! A child tenant's root space inherits its parent tenant's root space, so
 //! a structural change in a tenant's root space reaches every tenant below

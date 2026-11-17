@@ -182,6 +182,13 @@ pub static LOGIC_MIGRATIONS: &[Migration] = &[
         name: "logic_rollouts, logic_version_stats",
         statements: &[crate::rollout::DDL_ROLLOUTS, crate::rollout::DDL_STATS],
     },
+    // Rollout by key: a function's argument, a trigger's record key.
+    Migration {
+        format: 6,
+        phase: Phase::Expand,
+        name: "logic_rollouts.by_key holds keys",
+        statements: &[crate::rollout::DDL_ROLLOUTS_BY_KEY],
+    },
 ];
 
 /// The module, for [`Migrator::new`](sprig_catalog::Migrator::new) and
@@ -877,6 +884,34 @@ impl LogicStore {
             .await
             .map_err(map_err)?;
         r.map(module_row).transpose()
+    }
+
+    /// Sets a live module `active` or `disabled`; whether it was in the
+    /// other state (a dropped module is never changed).
+    ///
+    /// # Errors
+    /// 39070 or a backend error.
+    pub async fn set_module_state(
+        &self,
+        c: &mut Conn,
+        module_id: u64,
+        enabled: bool,
+    ) -> Result<bool> {
+        let (to, from) = if enabled {
+            ("active", "disabled")
+        } else {
+            ("disabled", "active")
+        };
+        c.exec_drop(
+            format!(
+                "UPDATE {} SET state = ? WHERE module_id = ? AND state = ?",
+                self.modules
+            ),
+            (to, module_id, from),
+        )
+        .await
+        .map_err(map_err)?;
+        Ok(c.affected_rows() > 0)
     }
 
     /// A version's source text.

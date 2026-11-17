@@ -57,7 +57,7 @@ use sprig_catalog::ddl::{
     object_key, shard_schemas,
 };
 use sprig_catalog::store::{DbState, ObjectKind, ObjectState, PurgeReport, Snapshot};
-use sprig_common::ids::{ClusterId, DbId, DcId, GroupId, TenantId};
+use sprig_common::ids::{ClusterId, DbId, DcId, GroupId, ObjectId, TenantId};
 use sprig_common::names::{SchemaName, is_internal_object};
 use sprig_common::time::Clock;
 use sprig_common::{Result, SprigError};
@@ -367,6 +367,79 @@ pub trait GroupMaps: Send + Sync {
     /// # Errors
     /// The store's.
     async fn groups(&self, tenant: TenantId) -> Result<BTreeSet<GroupId>>;
+
+    /// The tables that are members of a table group other than their
+    /// database's default one (and their triggers): they live in the
+    /// group's shard schemas, perhaps on other clusters, never in the
+    /// database's default shard, so a pass doesn't report them missing
+    /// there. `None` when unknown (then nothing is left out).
+    ///
+    /// # Errors
+    /// The catalog's.
+    async fn grouped(&self, tenant: TenantId) -> Result<Option<BTreeSet<ObjectId>>> {
+        let _ = tenant;
+        Ok(None)
+    }
+}
+
+/// [`GroupMaps`] from the DC tier's shard maps, and the members from the
+/// tenant's catalog (`group_members` of groups that aren't a database's
+/// default group and aren't retired).
+pub struct CatalogGroupMaps {
+    maps: sprig_shard::ShardMapStore,
+    locator: Arc<dyn sprig_catalog::CatalogLocator>,
+}
+
+impl CatalogGroupMaps {
+    /// Maps in `maps`, catalogs through `locator`.
+    #[must_use]
+    pub fn new(
+        maps: sprig_shard::ShardMapStore,
+        locator: Arc<dyn sprig_catalog::CatalogLocator>,
+    ) -> Self {
+        Self { maps, locator }
+    }
+}
+
+#[async_trait::async_trait]
+impl GroupMaps for CatalogGroupMaps {
+    async fn groups(&self, tenant: TenantId) -> Result<BTreeSet<GroupId>> {
+        self.maps.groups(tenant).await
+    }
+
+    async fn grouped(&self, tenant: TenantId) -> Result<Option<BTreeSet<ObjectId>>> {
+        use mysql_async::prelude::Queryable;
+        use sprig_catalog::pool_wait::Bounded as _;
+        let ep = self.locator.writer(tenant).await?;
+        let cat = sprig_common::names::quote(ep.store.schema());
+        let mut c = ep.pool.get_conn_bounded().await.map_err(|e| {
+            SprigError::new(
+                sprig_common::SprigCode::CatalogUnavailable,
+                "catalog unreachable",
+            )
+            .with_source(e)
+        })?;
+        let ids: Vec<u64> = match c
+            .query(format!(
+                "SELECT m.object_id FROM {cat}.group_members m \
+                 JOIN {cat}.table_groups g ON g.group_id = m.group_id \
+                 WHERE g.kind <> 'default' AND g.state <> 'retired'"
+            ))
+            .await
+        {
+            Ok(v) => v,
+            // A tenant that never had a table group.
+            Err(mysql_async::Error::Server(e)) if e.code == 1146 => Vec::new(),
+            Err(e) => {
+                return Err(SprigError::new(
+                    sprig_common::SprigCode::CatalogUnavailable,
+                    "catalog unreachable",
+                )
+                .with_source(e));
+            }
+        };
+        Ok(Some(ids.into_iter().map(ObjectId).collect()))
+    }
 }
 
 #[async_trait::async_trait]
@@ -617,6 +690,7 @@ where
                     current_db: None,
                     user: None,
                     lower_case_table_names: lctn,
+                    wait: None,
                 };
                 match self.engine.execute(&req, &*exec).await {
                     Ok(_) => {
@@ -636,7 +710,18 @@ where
             return Ok(report);
         }
 
-        // 2. Databases against their schemas.
+        // 2. Databases against their schemas. Members of table groups
+        // live in their groups' shard schemas, not the default one.
+        let grouped: BTreeSet<ObjectId> = match &self.group_maps {
+            Some(m) => match m.grouped(tenant).await {
+                Ok(g) => g.unwrap_or_default(),
+                Err(e) => {
+                    report.errors.push(format!("group members: {e}"));
+                    BTreeSet::new()
+                }
+            },
+            None => BTreeSet::new(),
+        };
         let held: BTreeSet<DbId> = held_databases(&snap);
         for db in snap
             .databases
@@ -693,10 +778,12 @@ where
                     })
                     .cloned()
                     .collect();
-                for o in rows
-                    .iter()
-                    .filter(|o| o.state == ObjectState::Active && sql_object(o.kind))
-                {
+                for o in rows.iter().filter(|o| {
+                    o.state == ObjectState::Active
+                        && sql_object(o.kind)
+                        && !grouped.contains(&o.object_id)
+                        && !o.parent_id.is_some_and(|p| grouped.contains(&p))
+                }) {
                     if !physical.contains(&(o.namespace, o.name_key.clone())) {
                         let name = format!("{}.{}", db.name, o.name);
                         self.decide(

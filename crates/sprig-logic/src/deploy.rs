@@ -23,8 +23,11 @@
 //! The **wrapper** is an ordinary procedure with the logical name, so a
 //! client's `CALL db.name(args)` works through the existing CALL path: it
 //! calls the entry procedure under `SET STATEMENT max_statement_time` (the
-//! wall budget) and returns one row, `event` and then the fields of every
-//! event. An engine-tier version's wrapper returns the marker row the
+//! wall budget, or the caller's `max_statement_time` when that is less)
+//! and returns one row, `event` and then the fields of every event. Inside
+//! a routine `SET STATEMENT` starts no timer of MariaDB's: it passes the
+//! budget to the entry procedure, which keeps its own deadline
+//! (`sprig_logic_compile::plsql`). An engine-tier version's wrapper returns the marker row the
 //! gateway runs it from ([`crate::invoke`]), then fails with 39876 for a
 //! caller the gateway doesn't serve.
 
@@ -138,6 +141,15 @@ pub struct WrapperSpec<'a> {
     pub version: u64,
 }
 
+/// The wrapper's (and call entry's) name for parameter `i`.
+#[must_use]
+pub fn wrapper_param(f: &Function, i: u16) -> String {
+    wrapper_params(f)
+        .into_iter()
+        .nth(usize::from(i))
+        .map_or_else(|| "NULL".to_owned(), |(n, _)| n)
+}
+
 fn wrapper_params(f: &Function) -> Vec<(String, Ty)> {
     let mut out: Vec<(String, Ty)> = Vec::new();
     for p in &f.params {
@@ -183,6 +195,22 @@ fn header_with(w: &WrapperSpec<'_>, schema: &str, comment: &str) -> String {
     )
 }
 
+/// The wall budget `budget_ms` as a declaration of `v__budget` (seconds)
+/// and the statement that lowers it to the caller's `max_statement_time`
+/// when that is set and less: a client's own limit, or what is left of a
+/// caller's budget, only ever shortens it. The entry procedure is then
+/// called under `SET STATEMENT max_statement_time = v__budget`.
+#[must_use]
+pub fn budget_lines(budget_ms: u64) -> (String, &'static str) {
+    #[allow(clippy::cast_precision_loss)] // milliseconds, far below 2^52
+    let secs = budget_ms.max(1) as f64 / 1000.0;
+    (
+        format!("DECLARE v__budget DOUBLE DEFAULT {secs};"),
+        "IF @@max_statement_time > 0 AND @@max_statement_time < v__budget THEN \
+         SET v__budget = @@max_statement_time; END IF;",
+    )
+}
+
 /// The compiled-tier wrapper.
 #[must_use]
 pub fn wrapper(w: &WrapperSpec<'_>, schema: &str, entry: &str) -> String {
@@ -219,16 +247,17 @@ fn wrapper_body(w: &WrapperSpec<'_>, entry: &str) -> String {
         };
         select.push(format!("{v} AS {}", bq(n)));
     }
-    let secs = w.budget_ms.max(1) as f64 / 1000.0;
+    let (budget, lower) = budget_lines(w.budget_ms);
     // Privileges and transactions: a call in autocommit runs
     // in its own transaction, rolled back on an error, as the engine tier
     // and `Functions.Call` run theirs.
     format!(
         "BEGIN\n  DECLARE v__event VARCHAR(64);\n  DECLARE v__result LONGTEXT;\n  \
-         DECLARE v__own INT DEFAULT 0;\n  \
+         DECLARE v__own INT DEFAULT 0;\n  {budget}\n  \
          DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN IF v__own = 1 THEN ROLLBACK; END IF; RESIGNAL; END;\n  \
+         {lower}\n  \
          IF @@in_transaction = 0 AND @@autocommit = 1 THEN START TRANSACTION; SET v__own = 1; END IF;\n  \
-         SET STATEMENT max_statement_time = {secs} FOR CALL {}({call_args}v__event, v__result);\n  \
+         SET STATEMENT max_statement_time = v__budget FOR CALL {}({call_args}v__event, v__result);\n  \
          IF v__own = 1 THEN COMMIT; END IF;\n  \
          SELECT {};\nEND",
         bq(entry),
@@ -290,6 +319,88 @@ impl Side<'_> {
             None => engine_wrapper_body(&self.spec),
         }
     }
+
+    /// The call entry's statement for this version.
+    fn call(&self) -> String {
+        let Some(e) = &self.entry else {
+            let msg: String = format!(
+                "{} version {} runs in the engine tier, which compiled code can't call",
+                self.spec.name, self.spec.version
+            )
+            .chars()
+            .take(128)
+            .collect();
+            return format!(
+                "SIGNAL SQLSTATE 'HY000' SET MYSQL_ERRNO = {}, MESSAGE_TEXT = {}",
+                SprigCode::LogicEngineUnavailable.number(),
+                quote(&msg)
+            );
+        };
+        let mut args: Vec<String> = wrapper_params(self.spec.func)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        args.push("p__event".to_owned());
+        args.push("p__result".to_owned());
+        format!("CALL {}({})", bq(e), args.join(", "))
+    }
+}
+
+/// A module's call entry, `__sprig_l<module>_call`: what compiled code's
+/// `db.call` calls. It takes the wrapper's parameters and two `OUT`
+/// parameters, the event's name and the result object, returns no result
+/// set and starts no transaction, so it runs inside the caller's. It calls
+/// the version a call of the wrapper would run: the active one, or, in a
+/// staged rollout, the candidate when `condition` (the wrapper's pick)
+/// holds. A version in the engine tier raises 39876.
+#[must_use]
+pub fn call_entry(schema: &str, active: &Side<'_>, candidate: Option<(&Side<'_>, &str)>) -> String {
+    let w = &active.spec;
+    let mut params: Vec<String> = wrapper_params(w.func)
+        .iter()
+        .map(|(n, t)| format!("IN {n} {}", sql_type(*t)))
+        .collect();
+    params.push("OUT p__event VARCHAR(64)".to_owned());
+    params.push("OUT p__result LONGTEXT".to_owned());
+    let comment = match candidate {
+        Some((c, _)) => format!(
+            "sprig logic module {} call entry: version {}, candidate version {}",
+            w.module_id, w.version, c.spec.version
+        ),
+        None => format!(
+            "sprig logic module {} call entry: version {}",
+            w.module_id, w.version
+        ),
+    };
+    let body = match candidate {
+        Some((c, cond)) => format!(
+            "BEGIN\n  IF {cond} THEN\n    {};\n  ELSE\n    {};\n  END IF;\nEND",
+            c.call(),
+            active.call()
+        ),
+        None => format!("BEGIN\n  {};\nEND", active.call()),
+    };
+    format!(
+        "CREATE OR REPLACE PROCEDURE {}.{}({})\n  SQL SECURITY {}\n  COMMENT {}\n{body}",
+        bq(schema),
+        bq(&sprig_logic_compile::link::call_entry(w.module_id)),
+        params.join(", "),
+        if w.definer_security {
+            "DEFINER"
+        } else {
+            "INVOKER"
+        },
+        quote(&comment)
+    )
+}
+
+fn call_entry_routine(schema: &str, side: &Side<'_>) -> Routine {
+    Routine {
+        kind: "PROCEDURE",
+        name: sprig_logic_compile::link::call_entry(side.spec.module_id),
+        sql: call_entry(schema, side, None),
+        oracle: false,
+    }
 }
 
 /// A staged rollout's wrapper ([`crate::rollout`]): one procedure under
@@ -316,7 +427,8 @@ pub fn rollout_wrapper(
     )
 }
 
-/// The plan for a compiled version: its PL/SQL, then the wrapper.
+/// The plan for a compiled version: its PL/SQL, the call entry, then the
+/// wrapper.
 #[must_use]
 pub fn plan_compiled(schema: &str, p: &plsql::Plsql, w: &WrapperSpec<'_>) -> Plan {
     let mut routines = Vec::new();
@@ -340,6 +452,13 @@ pub fn plan_compiled(schema: &str, p: &plsql::Plsql, w: &WrapperSpec<'_>) -> Pla
         sql: qualify(&p.procedure, "PROCEDURE", &p.entry, schema),
         oracle: true,
     });
+    routines.push(call_entry_routine(
+        schema,
+        &Side {
+            spec: w.clone(),
+            entry: Some(p.entry.clone()),
+        },
+    ));
     routines.push(Routine {
         kind: "PROCEDURE",
         name: w.name.to_owned(),
@@ -452,10 +571,11 @@ pub fn select_function(
         let mut call_args: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
         call_args.push("v__event".to_owned());
         call_args.push("v__result".to_owned());
+        let (budget, lower) = budget_lines(w.budget_ms);
         format!(
             "BEGIN\n  DECLARE v__event VARCHAR(64);\n  DECLARE v__result LONGTEXT;\n  \
-                 DECLARE v__msg VARCHAR(128);\n  \
-                 CALL {}({});\n  \
+                 DECLARE v__msg VARCHAR(128);\n  {budget}\n  {lower}\n  \
+                 SET STATEMENT max_statement_time = v__budget FOR CALL {}({});\n  \
                  IF v__event <> 'output' THEN\n    \
                  SET v__msg = LEFT(CONCAT(v__event, ': ', COALESCE(JSON_VALUE(v__result, '$.message'), v__result)), 128);\n    \
                  SIGNAL SQLSTATE 'HY000' SET MYSQL_ERRNO = {}, MESSAGE_TEXT = v__msg;\n  \
@@ -504,17 +624,27 @@ pub fn plan_select(schema: &str, name: &str, sql: String, definer: &str) -> Plan
     }
 }
 
-/// The plan for an engine-tier version: only its wrapper.
+/// The plan for an engine-tier version: its call entry (which raises
+/// 39876) and its wrapper.
 #[must_use]
 pub fn plan_engine(schema: &str, w: &WrapperSpec<'_>) -> Plan {
     Plan {
         schema: schema.to_owned(),
-        routines: vec![Routine {
-            kind: "PROCEDURE",
-            name: w.name.to_owned(),
-            sql: engine_wrapper(w, schema),
-            oracle: false,
-        }],
+        routines: vec![
+            call_entry_routine(
+                schema,
+                &Side {
+                    spec: w.clone(),
+                    entry: None,
+                },
+            ),
+            Routine {
+                kind: "PROCEDURE",
+                name: w.name.to_owned(),
+                sql: engine_wrapper(w, schema),
+                oracle: false,
+            },
+        ],
         definer: None,
     }
 }
@@ -838,7 +968,8 @@ mod tests {
         };
         let s = wrapper(&w, "t42_d1", "__sprig_l44_v1");
         assert!(s.starts_with("CREATE OR REPLACE PROCEDURE `t42_d1`.`quote`(IN p_productid BIGINT, IN p_qty BIGINT)"), "{s}");
-        assert!(s.contains("SET STATEMENT max_statement_time = 5 FOR CALL `__sprig_l44_v1`(p_productid, p_qty, v__event, v__result);"), "{s}");
+        assert!(s.contains("DECLARE v__budget DOUBLE DEFAULT 5;"), "{s}");
+        assert!(s.contains("SET STATEMENT max_statement_time = v__budget FOR CALL `__sprig_l44_v1`(p_productid, p_qty, v__event, v__result);"), "{s}");
         assert!(s.contains("SELECT v__event AS `event`, CAST(JSON_VALUE(v__result, '$.\"total\"') AS DOUBLE) AS `total`, JSON_VALUE(v__result, '$.\"message\"') AS `message`;"), "{s}");
         let e = engine_wrapper(&w, "t42_d1");
         assert!(e.contains("MYSQL_ERRNO = 39876"), "{e}");

@@ -1,9 +1,8 @@
-//! Resolution of physical names to logical ones (chapter 38, "Resolution").
+//! Resolution of physical names to logical ones.
 //!
 //! A schema name parses into tenant, database, group and shard; the
 //! database's logical name and the table's object id come from the
-//! tenant's catalog (`t<tenant>_sprig.databases` and `objects`, chapter
-//! 08). Inside a shard schema a table keeps its logical name.
+//! tenant's catalog (`t<tenant>_sprig.databases` and `objects`). Inside a shard schema a table keeps its logical name.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -88,7 +87,7 @@ type ObjectKey = (TenantId, DbId, String);
 
 /// Names from the tenant catalog, cached. Names found are kept for the
 /// process's life: a renamed database shows its old name until restart
-/// (R1; chapter 08's catalog cache replaces this).
+/// (a shared catalog cache is to replace this).
 pub struct CatalogResolver {
     pools: Arc<dyn CatalogPools>,
     dbs: Mutex<HashMap<(TenantId, DbId), String>>,

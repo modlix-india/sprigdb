@@ -1,7 +1,8 @@
-//! The relay's `RemoteMaps`, served side: every controller answers reads of its own DC tier's `shardmaps/`
-//! and `clusters/` for processes in other DCs (`sprig_meta::relay`'s
-//! client), on `[controller] internal_addr`. Nothing else of the tier is
-//! served, and nothing is written.
+//! The relay's `RemoteMaps`, served side: every controller answers reads
+//! of its own DC tier's `shardmaps/`, `clusters/`, `gateways/`,
+//! `catalog-readers/`, `workers/` and `controllers/` for processes in other
+//! DCs (`sprig_meta::relay`'s client), on `[controller] internal_addr`.
+//! Nothing else of the tier is served, and nothing is written.
 
 use std::sync::Arc;
 
@@ -31,7 +32,7 @@ fn key_of(dc: &dyn MetaStore, body: &Bytes) -> std::result::Result<Key, Response
     if !served(tier, &req.key) {
         return Err(reply(
             StatusCode::FORBIDDEN,
-            b"the relay serves only this DC's shardmaps/ and clusters/".to_vec(),
+            b"the relay serves only this DC's shardmaps/, clusters/, gateways/, catalog-readers/, workers/ and controllers/".to_vec(),
         ));
     }
     let rel = req
@@ -202,6 +203,23 @@ mod tests {
             }
         }
         assert!(saw_home, "the relayed watch saw the map turn home");
+        // The DC's gateways (login hand-offs, relayed change streams and
+        // member calls find them so).
+        put(
+            &*ams1,
+            ams_tier.key("gateways/gw-ams1").expect("k"),
+            "{\"v\":1,\"gateway_id\":\"gw-ams1\"}",
+        )
+        .await;
+        let gws = view
+            .list(
+                &view.tier().key("gateways/").expect("k"),
+                ListOpts::default(),
+            )
+            .await
+            .expect("list");
+        assert_eq!(gws.kvs.len(), 1);
+        assert!(String::from_utf8_lossy(&gws.kvs[0].value).contains("gw-ams1"));
         // Writes never go through the relay.
         let own = fra1.tier().key("shardmaps/7/0").expect("k");
         put(&*routed, own.clone(), "{\"v\":1}").await;
@@ -211,5 +229,77 @@ mod tests {
                 .expect("g")
                 .is_some()
         );
+    }
+    /// The contract pass in fra1 sees ams1's running processes and their
+    /// reader records through the relay: a process there without a record
+    /// holds contracts back, and once each has one, none is unregistered.
+    #[tokio::test]
+    async fn the_contract_pass_sees_another_dcs_readers_through_the_relay() {
+        let global: Arc<dyn MetaStore> = Arc::new(MemStore::new(Tier::Global));
+        let ams1: Arc<dyn MetaStore> = Arc::new(MemStore::new(Tier::Dc(dc("ams1"))));
+        let fra1: Arc<dyn MetaStore> = Arc::new(MemStore::new(Tier::Dc(dc("fra1"))));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = l.local_addr().expect("addr");
+        let app = router(Arc::clone(&ams1));
+        tokio::spawn(async move { axum::serve(l, app).await });
+        put(
+            &*global,
+            Tier::Global.key("dc-observe/ams1").expect("k"),
+            &format!("{{\"v\":1,\"controllers\":[\"http://{addr}\"],\"writers\":[]}}"),
+        )
+        .await;
+        for d in ["ams1", "fra1"] {
+            put(
+                &*global,
+                Tier::Global.key(&format!("dcs/{d}")).expect("k"),
+                "{\"v\":1}",
+            )
+            .await;
+        }
+        let t = ams1.tier().clone();
+        for (k, v) in [
+            ("gateways/gw-a", "{\"v\":1}"),
+            ("workers/wk-a", "{\"v\":1}"),
+            ("controllers/ctl-a", "{\"v\":1}"),
+            (
+                "catalog-readers/gateway/gw-a",
+                "{\"v\":1,\"role\":\"gateway\",\"node\":\"gw-a\",\"build\":\"b\",\"formats\":{\"m\":2}}",
+            ),
+        ] {
+            put(&*ams1, t.key(k).expect("k"), v).await;
+        }
+        let routed: Arc<dyn MetaStore> =
+            Arc::new(RoutedStore::new(Arc::clone(&fra1), Arc::clone(&global)));
+        let scan = sprig_catalog::readers::scan(&*global, &routed)
+            .await
+            .expect("scan");
+        assert_eq!(scan.readers.len(), 1, "{scan:?}");
+        assert_eq!(scan.readers[0].0, "ams1");
+        let mut un = scan.unregistered.clone();
+        un.sort();
+        assert_eq!(
+            un,
+            vec![
+                "controller ctl-a (dc ams1)".to_owned(),
+                "worker wk-a (dc ams1)".to_owned()
+            ]
+        );
+        for (role, node) in [("worker", "wk-a"), ("controller", "ctl-a")] {
+            put(
+                &*ams1,
+                t.key(&format!("catalog-readers/{role}/{node}")).expect("k"),
+                &format!(
+                    "{{\"v\":1,\"role\":\"{role}\",\"node\":\"{node}\",\"build\":\"b\",\"formats\":{{\"m\":2}}}}"
+                ),
+            )
+            .await;
+        }
+        let scan = sprig_catalog::readers::scan(&*global, &routed)
+            .await
+            .expect("scan");
+        assert_eq!(scan.readers.len(), 3, "{scan:?}");
+        assert!(scan.unregistered.is_empty(), "{scan:?}");
     }
 }

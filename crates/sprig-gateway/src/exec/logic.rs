@@ -23,6 +23,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use sprig_catalog::CatalogLocator;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_logic::deploy::Session;
 use sprig_logic::engine::bridge::{self as eb, ColKind, Column, DbBridge, DbOp, Reply};
@@ -52,8 +53,6 @@ tokio::task_local! {
     static LOGIC_DEPTH: u32;
 }
 
-/// `logic.function_budget_ms`'s default.
-const FUNCTION_BUDGET_MS: u64 = 5000;
 /// `logic.max_loop_iterations`'s default.
 const MAX_LOOP_ITERATIONS: u64 = 100_000;
 /// `logic.compile_max_cost`'s default.
@@ -219,6 +218,7 @@ impl PassSession {
         // Every shard of the database:
         // a sharded database gets the routines on each, all or nothing.
         let shard_list = shard_list(ts, &self.target.cluster, &db, &row)?;
+        let streams = logic_streams(ts, &catalog, row.db_id);
         let schema = shard_list[0].0.clone();
         let single_shard = shard_list.len() == 1;
         let user = match auto {
@@ -257,7 +257,7 @@ impl PassSession {
         let svc = Arc::clone(ts.services());
         let tenant = ts.tenant;
         let ep = svc.locator.writer(tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(|e| {
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
         // The routines are created as `sprig_ctl` with the user as
@@ -266,25 +266,33 @@ impl PassSession {
         // the MySQL persona (its `sql_mode` tracking resets it).
         let account = sprig_auth::authz::backend::account(tenant, user);
         let definer = format!("`{}`@`%`", account.replace('`', "``"));
-        let ctl_pool = svc.locator.ctl_pool(&self.target.cluster).await?;
-        let mut ctl = sprig_logic::deploy::ConnSession(
-            ctl_pool
-                .get_conn()
-                .await
-                .map_err(sprig_logic::deploy::conn_err)?,
-        );
-        // The columns are read as the deploying user sees them; an
-        // automatic rollback reads them as `sprig_ctl` (a second
-        // connection: the first creates the routines).
-        let mut ctl_cols = match auto {
-            Some(_) => Some(sprig_logic::deploy::ConnSession(
-                ctl_pool
-                    .get_conn()
+        // One `sprig_ctl` connection per cluster for the whole deploy,
+        // taken after the catalog's (see `GatewayLocator`'s pool order):
+        // the routines' creator, the shards' sessions and an automatic
+        // rollback's column reader share it. The catalog connection stays
+        // held across it: the deploy records its versions there around the
+        // routines' creation, in `sprig_logic`'s one pass.
+        let mut shards = (!single_shard).then(|| super::logic_bound::CtlShards {
+            list: shard_list.clone(),
+            conns: std::collections::HashMap::new(),
+            locator: Arc::clone(&svc.locator),
+        });
+        let shared = match shards.as_mut() {
+            // The first shard's: the columns are read there.
+            Some(sh) => sh.shared(&shard_list[0].1).await?,
+            None => super::logic_bound::SharedCtl::new(
+                svc.locator
+                    .ctl_pool(&self.target.cluster)
+                    .await?
+                    .get_conn_bounded()
                     .await
                     .map_err(sprig_logic::deploy::conn_err)?,
-            )),
-            None => None,
+            ),
         };
+        let mut ctl = shared.clone();
+        // The columns are read as the deploying user sees them; an
+        // automatic rollback reads them as `sprig_ctl`.
+        let mut ctl_cols = auto.map(|_| shared.clone());
         let _ = self.bs(cx);
         let Some(bs) = self.bs.as_mut() else {
             return Err(SprigError::internal("no backend session"));
@@ -294,6 +302,16 @@ impl PassSession {
             Some(c) => c,
             None => &mut user_session,
         };
+        // The wall budget a compiled version's wrapper sets for each call:
+        // `logic.function_budget_ms` for the database, as the engine tier
+        // reads it per call (a later change reaches compiled code when it
+        // is deployed again). Calls it makes into other compiled code run
+        // inside that budget, as an engine-tier call's nested calls do.
+        let budget_ms = svc.settings.get(
+            &sprig_logic::settings::FUNCTION_BUDGET_MS,
+            &catalog.setting_ctx(&svc.dc).with_db(row.db_id),
+            Some(&catalog.settings),
+        );
         let (decl, fixed) = match &rollback {
             Some(r) => {
                 let store = sprig_logic::LogicStore::new(ep.store.schema());
@@ -303,11 +321,6 @@ impl PassSession {
             }
             None => (decl, None),
         };
-        let mut shards = (!single_shard).then(|| super::logic_bound::CtlShards {
-            list: shard_list.clone(),
-            conns: std::collections::HashMap::new(),
-            locator: Arc::clone(&svc.locator),
-        });
         let outcome = service::deploy_at(
             &decl,
             Target {
@@ -318,7 +331,7 @@ impl PassSession {
                 shard_schema: &schema,
                 single_shard,
                 user_id: user.0,
-                budget_ms: FUNCTION_BUDGET_MS,
+                budget_ms,
                 max_loop_iterations: MAX_LOOP_ITERATIONS,
                 compile_max_cost: COMPILE_MAX_COST,
             },
@@ -333,6 +346,8 @@ impl PassSession {
                     .as_mut()
                     .map(|s| s as &mut dyn sprig_logic::deploy::ShardSessions),
                 tenant: tenant.0,
+                db_name: &row.name,
+                streams,
             },
         )
         .await?;
@@ -411,6 +426,55 @@ impl PassSession {
         }
         Ok(notes)
     }
+}
+
+/// The streams of database `db` as a compiled `db.publish` sees them:
+/// each event stream's outbox, `stream.max_message_bytes` and whether it
+/// is compacted; a change topic or a stream that isn't active can't be
+/// published to from compiled code (the engine tier answers those).
+pub(super) fn logic_streams(
+    ts: &crate::tenant::session::TenantSession,
+    cat: &sprig_catalog::TenantCatalog,
+    db: sprig_common::ids::DbId,
+) -> service::StreamList {
+    let Some(state) = cat
+        .ext
+        .get::<sprig_streams::StreamsState>(sprig_streams::MODULE)
+    else {
+        return Vec::new();
+    };
+    let svc = ts.services();
+    state
+        .of_db(db)
+        .map(|s| {
+            // The stream's own value, else its database's and up, as an
+            // `INSERT INTO <stream>` reads it.
+            let ctx = cat
+                .object_ctx(&svc.dc, sprig_common::ids::ObjectId(s.id.0))
+                .with_db(db);
+            let max = svc.settings.get(
+                &sprig_streams::settings::MAX_MESSAGE_BYTES,
+                &ctx,
+                Some(&cat.settings),
+            );
+            let t = if s.kind == sprig_streams::StreamKind::Changes {
+                Err(format!(
+                    "{} is a change topic, which only SprigDB writes",
+                    s.name
+                ))
+            } else if s.state != sprig_streams::StreamState::Active {
+                Err(format!("stream {} isn't active", s.name))
+            } else {
+                Ok(sprig_logic::compiler::link::StreamTarget {
+                    name: s.name.clone(),
+                    outbox: s.outbox_table(),
+                    max_bytes: max,
+                    compact: s.cleanup == sprig_streams::Cleanup::Compact,
+                })
+            };
+            (s.name.clone(), t)
+        })
+        .collect()
 }
 
 /// Every shard schema of database `db`: the session's own schema (the default group's shard, where
@@ -967,7 +1031,7 @@ impl PassSession {
             v
         } else {
             let ep = svc.locator.writer(tenant).await?;
-            let mut conn = ep.pool.get_conn().await.map_err(|e| {
+            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
                 SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
             })?;
             invoke::load(
@@ -1286,7 +1350,7 @@ impl PassSession {
         };
         let svc = Arc::clone(ts.services());
         let ep = svc.locator.writer(ts.tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(|e| {
+        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
         let store = sprig_logic::LogicStore::new(ep.store.schema());
@@ -1461,7 +1525,7 @@ impl PassSession {
         let svc = Arc::clone(ts.services());
         let ep = svc.locator.writer(ts.tenant).await?;
         let callable = {
-            let mut conn = ep.pool.get_conn().await.map_err(|e| {
+            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
                 SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
             })?;
             sprig_logic::LogicStore::new(ep.store.schema())

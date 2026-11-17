@@ -45,6 +45,18 @@ pub(crate) fn snapshot(
     auth: TenantAuth,
     auth_version: u64,
 ) -> Arc<TenantCatalog> {
+    snapshot_with(tenant, auth, auth_version, Vec::new())
+}
+
+/// [`snapshot`] with more modules' states (such as `authz`'s).
+pub(crate) fn snapshot_with(
+    tenant: TenantId,
+    auth: TenantAuth,
+    auth_version: u64,
+    more: Vec<(&'static str, Arc<dyn ExtState>)>,
+) -> Arc<TenantCatalog> {
+    let mut ext = vec![("auth", Arc::new(auth) as Arc<dyn ExtState>)];
+    ext.extend(more);
     let loaded = Loaded {
         snapshot: Snapshot {
             versions: Versions {
@@ -57,7 +69,7 @@ pub(crate) fn snapshot(
             objects: Vec::new(),
             settings: Vec::new(),
         },
-        ext: vec![("auth", Arc::new(auth) as Arc<dyn ExtState>)],
+        ext,
     };
     Arc::new(TenantCatalog::build(registry(), tenant, loaded))
 }
@@ -765,8 +777,8 @@ fn shape(seen: &[Vec<u8>]) -> Vec<(u8, usize)> {
     seen.iter().map(|p| (p[0], p.len())).collect()
 }
 
-/// Unknown users of a tenant look like its accounts on every plugin path
-/// (loginerr): with `auth.mysql_native_password` on, a client asking for
+/// Unknown users of a tenant look like its accounts on every plugin path:
+/// with `auth.mysql_native_password` on, a client asking for
 /// native gets native from an unknown user, as from an account whose
 /// password was set with both verifiers; with it off, both get
 /// `caching_sha2_password`. Also for libmysqlclient's empty placeholder

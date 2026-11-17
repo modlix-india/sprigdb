@@ -13,6 +13,12 @@ ignore = [
     # gemm, candle's matrix multiplication (sprig-embed), and no gemm release
     # drops it yet.
     { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained build-time macro used by gemm (candle)" },
+    # chrono, chrono-tz and humantime were marked unmaintained in November 2026 (no known
+    # vulnerability). Replacing them (jiff or time) touches many crates' Cargo.toml and waits
+    # for Kiran's decision (bugfix-interim, lead's note of 17 Nov).
+    { id = "RUSTSEC-2026-0543", reason = "chrono: unmaintained, not vulnerable; replacement pending Kiran's decision" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz: unmaintained, not vulnerable; replacement pending Kiran's decision" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime: unmaintained, not vulnerable; replacement pending Kiran's decision" },
 ]
 
 [licenses]

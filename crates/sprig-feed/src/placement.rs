@@ -26,7 +26,7 @@ pub trait PlacementView: Send + Sync {
     async fn history(&self, tenant: TenantId) -> Result<Vec<Handoff>>;
 }
 
-/// [`PlacementView`] on the DC tier: chapter 15's tenant map and the
+/// [`PlacementView`] on the DC tier: the tenant map and the
 /// handoff records next to it.
 #[derive(Clone)]
 pub struct MetaPlacement {

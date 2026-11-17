@@ -5,6 +5,9 @@
 //! ```text
 //! 1. every target fingerprint's predicted improvement (cost model) must be
 //!    at least min_improvement_pct × estimate_margin (45% by default)
+//!    then, unless a validation of this process runs on the table: a
+//!    cut-off canary's leftover of this index (its build killed, the index
+//!    dropped, binary log on; see `orphans`)
 //! 2. EXPLAIN FORMAT=JSON each target's sampled statements on the node: the
 //!    plan must read at least explain_rows_tolerance × the rows the model
 //!    assumed (else the benefit is overstated)
@@ -221,6 +224,30 @@ impl Validator for CanaryValidator {
             return finish(r);
         }
 
+        // A canary of this row cut off by a controller restart left its
+        // index (or its build) behind, which would also skew the EXPLAIN
+        // below. Unless a validation of this process runs on the table, it
+        // goes first. This one registers itself.
+        let others = super::orphans::is_running(&self.node.node, t);
+        let _running = super::orphans::running(&self.node.node, t);
+        if !others {
+            match super::orphans::clear_canary_leftover(&self.node, t, &name, set.ddl_lock_wait)
+                .await
+            {
+                Ok(l) if l.is_empty() && l.killed.is_empty() => {}
+                Ok(l) => r.node_check.ok(format!(
+                    "leftover of a cut-off canary dropped first: indexes {:?}, builds killed {:?}",
+                    l.indexes, l.killed
+                )),
+                Err(e) => {
+                    abort(
+                        &mut r,
+                        format!("leftover of an earlier canary not dropped: {e}"),
+                    );
+                    return finish(r);
+                }
+            }
+        }
         // 2. EXPLAIN, on a read-only session.
         let mut conn = match sprig_cluster::ProbeSession::connect(
             &self.node,

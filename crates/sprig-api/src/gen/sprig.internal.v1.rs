@@ -131,6 +131,145 @@ pub struct HandoffLoginReply {
     #[prost(string, tag = "5")]
     pub error_message: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchChangesRequest {
+    /// The client's Authorization header, verified again here.
+    #[prost(string, tag = "1")]
+    pub authorization: ::prost::alloc::string::String,
+    /// The tenant for credentials that don't name it (x-sprig-tenant).
+    #[prost(string, tag = "2")]
+    pub tenant: ::prost::alloc::string::String,
+    /// The client address the first gateway saw.
+    #[prost(string, tag = "3")]
+    pub client_addr: ::prost::alloc::string::String,
+    /// The client's TLS, as the first gateway saw it: whether it used TLS,
+    /// the server name it asked for, and a verified client certificate's
+    /// subject and issuer (empty without one).
+    #[prost(bool, tag = "4")]
+    pub tls: bool,
+    #[prost(string, tag = "5")]
+    pub sni: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub client_subject: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub client_issuer: ::prost::alloc::string::String,
+    /// What to watch (sprig.v1.WatchRequest's fields).
+    #[prost(string, tag = "8")]
+    pub database: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "9")]
+    pub objects: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "10")]
+    pub start_after: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "11")]
+    pub start_at_hlc: u64,
+    #[prost(bool, tag = "12")]
+    pub full_document: bool,
+    /// The space the subscriber reads in (Sprig-Space).
+    #[prost(string, tag = "13")]
+    pub space: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchChangesEvent {
+    /// The first message: the stream opened.
+    #[prost(bool, tag = "1")]
+    pub opened: bool,
+    /// An event or heartbeat (sprig.v1.ChangeEvent's fields).
+    #[prost(string, tag = "2")]
+    pub resume_token: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub commit_hlc: u64,
+    #[prost(string, tag = "4")]
+    pub object: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub op: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub key: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub after: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub update: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub ddl: ::prost::alloc::string::String,
+    /// The stream didn't open, or ended, with this error: the REST error
+    /// body as JSON (sprig.v1's ErrorBody). The last message.
+    #[prost(string, tag = "10")]
+    pub error_json: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InheritedMembersRequest {
+    /// "drop_sink": drop the members' instances of sink definition
+    /// `object_id` of declarer `tenant_id`, with the connections only they
+    /// use; "rollout": the members holding an instance of stream or queue
+    /// definition `object_id` apply its sinks and derived state again;
+    /// "drop_trigger": the members' instances of trigger definition
+    /// `object_id` stop and go; "override": an override FOR TENANT
+    /// `target_tenant_id` (FOR SUBTREE with `subtree`) of definition
+    /// `object_id` reaches the members it applies to; "count": only count the
+    /// instances of definition `object_id`; "broadcast": deliver broadcast
+    /// `payload` of definition `object_id` to member `target_tenant_id`.
+    #[prost(string, tag = "1")]
+    pub op: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub tenant_id: u64,
+    #[prost(uint64, tag = "3")]
+    pub object_id: u64,
+    /// The declarer's catalog version the change reached: the callee reads
+    /// the declarer's catalog at least at it (0: as its cache has it).
+    #[prost(uint64, tag = "4")]
+    pub catalog_version: u64,
+    /// The member an override or a broadcast is for.
+    #[prost(uint64, tag = "5")]
+    pub target_tenant_id: u64,
+    /// An override FOR SUBTREE.
+    #[prost(bool, tag = "6")]
+    pub subtree: bool,
+    /// A broadcast: its record as JSON (id, publisher, key, value, headers,
+    /// WITH INSTANCE).
+    #[prost(bytes = "vec", tag = "7")]
+    pub payload: ::prost::alloc::vec::Vec<u8>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InheritedMembersReply {
+    /// The member instances this DC reached (for "count", has; for
+    /// "broadcast", 1 when delivered, 0 when skipped).
+    #[prost(uint64, tag = "1")]
+    pub instances: u64,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TailFeedRequest {
+    #[prost(uint64, tag = "1")]
+    pub tenant_id: u64,
+    /// Resume after this token (hex); empty: from now.
+    #[prost(string, tag = "2")]
+    pub start_after: ::prost::alloc::string::String,
+    /// The calling gateway's DC: a tenant's tail goes only to its allowed DCs.
+    #[prost(string, tag = "3")]
+    pub caller_dc: ::prost::alloc::string::String,
+    /// Start at this HLC time (MongoDB's `startAtOperationTime`) through the
+    /// home cluster's feed time index; 0: `start_after`, or from now.
+    #[prost(uint64, tag = "4")]
+    pub start_at_hlc: u64,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TailFeedMessage {
+    /// The first message: the tail opened; `item` holds its starting token
+    /// (hex, UTF-8).
+    #[prost(bool, tag = "1")]
+    pub opened: bool,
+    /// A feed item, JSON (sprig-gateway's mongo::feed_relay format).
+    #[prost(bytes = "vec", tag = "2")]
+    pub item: ::prost::alloc::vec::Vec<u8>,
+    /// The tail didn't open, or ended, with this error: the REST error body
+    /// as JSON. The last message.
+    #[prost(string, tag = "3")]
+    pub error_json: ::prost::alloc::string::String,
+}
 /// Generated client implementations.
 pub mod gateway_peer_client {
     #![allow(
@@ -335,6 +474,93 @@ pub mod gateway_peer_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// A change stream of a tenant homed in this gateway's DC, opened at a
+        /// gateway of another DC: authenticated again and served here; the
+        /// calling gateway relays the events to its client. The first message
+        /// says whether the stream opened.
+        pub async fn watch_changes(
+            &mut self,
+            request: impl tonic::IntoRequest<super::WatchChangesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::WatchChangesEvent>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sprig.internal.v1.GatewayPeer/WatchChanges",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("sprig.internal.v1.GatewayPeer", "WatchChanges"),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
+        /// A FOR EACH TENANT definition's change reaching the members this
+        /// gateway's DC indexes: the declarer's gateway asks a gateway of every
+        /// other DC.
+        pub async fn inherited_members(
+            &mut self,
+            request: impl tonic::IntoRequest<super::InheritedMembersRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::InheritedMembersReply>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sprig.internal.v1.GatewayPeer/InheritedMembers",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("sprig.internal.v1.GatewayPeer", "InheritedMembers"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// A tenant homed in this gateway's DC: its change feed's items, read by
+        /// this DC's shared reader, for a gateway of another DC that renders them
+        /// for its own client (a MongoDB change stream opened there). The first
+        /// message says whether the tail opened.
+        pub async fn tail_feed(
+            &mut self,
+            request: impl tonic::IntoRequest<super::TailFeedRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::TailFeedMessage>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sprig.internal.v1.GatewayPeer/TailFeed",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("sprig.internal.v1.GatewayPeer", "TailFeed"));
+            self.inner.server_streaming(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -385,6 +611,47 @@ pub mod gateway_peer_server {
             tonic::Response<super::HandoffLoginReply>,
             tonic::Status,
         >;
+        /// Server streaming response type for the WatchChanges method.
+        type WatchChangesStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::WatchChangesEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// A change stream of a tenant homed in this gateway's DC, opened at a
+        /// gateway of another DC: authenticated again and served here; the
+        /// calling gateway relays the events to its client. The first message
+        /// says whether the stream opened.
+        async fn watch_changes(
+            &self,
+            request: tonic::Request<super::WatchChangesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::WatchChangesStream>,
+            tonic::Status,
+        >;
+        /// A FOR EACH TENANT definition's change reaching the members this
+        /// gateway's DC indexes: the declarer's gateway asks a gateway of every
+        /// other DC.
+        async fn inherited_members(
+            &self,
+            request: tonic::Request<super::InheritedMembersRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::InheritedMembersReply>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the TailFeed method.
+        type TailFeedStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::TailFeedMessage, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// A tenant homed in this gateway's DC: its change feed's items, read by
+        /// this DC's shared reader, for a gateway of another DC that renders them
+        /// for its own client (a MongoDB change stream opened there). The first
+        /// message says whether the tail opened.
+        async fn tail_feed(
+            &self,
+            request: tonic::Request<super::TailFeedRequest>,
+        ) -> std::result::Result<tonic::Response<Self::TailFeedStream>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct GatewayPeerServer<T> {
@@ -679,6 +946,143 @@ pub mod gateway_peer_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sprig.internal.v1.GatewayPeer/WatchChanges" => {
+                    #[allow(non_camel_case_types)]
+                    struct WatchChangesSvc<T: GatewayPeer>(pub Arc<T>);
+                    impl<
+                        T: GatewayPeer,
+                    > tonic::server::ServerStreamingService<super::WatchChangesRequest>
+                    for WatchChangesSvc<T> {
+                        type Response = super::WatchChangesEvent;
+                        type ResponseStream = T::WatchChangesStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::WatchChangesRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as GatewayPeer>::watch_changes(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = WatchChangesSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sprig.internal.v1.GatewayPeer/InheritedMembers" => {
+                    #[allow(non_camel_case_types)]
+                    struct InheritedMembersSvc<T: GatewayPeer>(pub Arc<T>);
+                    impl<
+                        T: GatewayPeer,
+                    > tonic::server::UnaryService<super::InheritedMembersRequest>
+                    for InheritedMembersSvc<T> {
+                        type Response = super::InheritedMembersReply;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::InheritedMembersRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as GatewayPeer>::inherited_members(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = InheritedMembersSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sprig.internal.v1.GatewayPeer/TailFeed" => {
+                    #[allow(non_camel_case_types)]
+                    struct TailFeedSvc<T: GatewayPeer>(pub Arc<T>);
+                    impl<
+                        T: GatewayPeer,
+                    > tonic::server::ServerStreamingService<super::TailFeedRequest>
+                    for TailFeedSvc<T> {
+                        type Response = super::TailFeedMessage;
+                        type ResponseStream = T::TailFeedStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::TailFeedRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as GatewayPeer>::tail_feed(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = TailFeedSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

@@ -31,6 +31,15 @@
 //!   `graph.mirror_max_wait_ms`; a missing or stale row (the applier isn't
 //!   serving the graph) answers `false` at once. So mirrors never hide an
 //!   edge committed before the statement.
+//! - **Adaptive wait** ([`Lagging`]). When two gates of a graph in a row
+//!   waited the whole budget and still found the applier behind, the
+//!   graph's gates stop waiting for a while: each reads the positions
+//!   once and scatters at once unless they are already fresh. Then one
+//!   gate (the probe) waits the budget again; if the applier still lags,
+//!   the next pause is twice as long (1 s up to 16 s), and a fresh gate
+//!   ends the pauses. Without this, a lagging applier (writes in the mix,
+//!   a slow etcd) made almost every read pay the whole budget before
+//!   scattering anyway.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -78,6 +87,124 @@ pub(crate) struct CatalogGate {
 /// Per (tenant, graph): the positions its last fresh gate read, and when.
 type FreshSeen = HashMap<(u64, u64), (Vec<mirror::PosRow>, Instant)>;
 
+/// Gates in a row that waited the whole budget for a lagging applier
+/// before a graph's gates pause their waits.
+const LAG_STREAK: u32 = 2;
+
+/// The first pause of waits; it doubles after every probe that lagged.
+const SKIP_FIRST: Duration = Duration::from_secs(1);
+
+/// The longest pause of waits.
+const SKIP_MAX: Duration = Duration::from_secs(16);
+
+/// Per (tenant, graph): whether its applier lags behind the gates'
+/// budget (see the module docs).
+#[derive(Debug, Default)]
+pub(crate) struct Lagging {
+    /// Gates in a row that waited the whole budget and found it behind.
+    streak: u32,
+    /// Gates don't wait until then.
+    skip_until: Option<Instant>,
+    /// The next pause.
+    skip_for: Duration,
+    /// A gate is waiting to see whether the applier caught up.
+    probing: bool,
+}
+
+/// What a gate whose first read wasn't fresh does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Plan {
+    /// Wait up to the budget.
+    Wait,
+    /// Wait up to the budget, as the probe of a pause that ended.
+    Probe,
+    /// Don't wait: scatter.
+    Skip,
+}
+
+impl Lagging {
+    /// The plan of a gate that would wait, at `now`.
+    pub(crate) fn plan(&mut self, now: Instant) -> Plan {
+        match self.skip_until {
+            None => Plan::Wait,
+            Some(t) if now < t || self.probing => Plan::Skip,
+            Some(_) => {
+                self.probing = true;
+                Plan::Probe
+            }
+        }
+    }
+
+    /// A gate found the mirrors fresh: waits resume.
+    pub(crate) fn fresh(&mut self) {
+        *self = Self::default();
+    }
+
+    /// A gate (`probe` or not) waited the whole budget and the applier
+    /// was still behind.
+    pub(crate) fn lagged(&mut self, now: Instant, probe: bool) {
+        if probe {
+            self.probing = false;
+        }
+        self.streak = self.streak.saturating_add(1);
+        if self.streak < LAG_STREAK {
+            return;
+        }
+        self.skip_for = if self.skip_for.is_zero() {
+            SKIP_FIRST
+        } else if probe {
+            self.skip_for.saturating_mul(2).min(SKIP_MAX)
+        } else {
+            self.skip_for
+        };
+        let until = now + self.skip_for;
+        self.skip_until = Some(self.skip_until.map_or(until, |t| t.max(until)));
+    }
+
+    /// A probe ended without an answer (an error, no connection).
+    pub(crate) fn probe_ended(&mut self) {
+        self.probing = false;
+    }
+}
+
+/// [`Lagging`] of every graph this process gates.
+fn lagging() -> &'static Mutex<HashMap<(u64, u64), Lagging>> {
+    static C: std::sync::OnceLock<Mutex<HashMap<(u64, u64), Lagging>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// What a gate found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Found {
+    /// Fresh: the statement uses the mirrors.
+    Fresh,
+    /// Behind after the wait, or not served at all.
+    Lag,
+    /// Behind, and the graph's waits are paused.
+    Skipped,
+    /// No gate connection in time.
+    Busy,
+}
+
+/// Clears a probe's mark if it ends without an answer.
+struct ProbeGuard {
+    key: (u64, u64),
+    armed: bool,
+}
+
+impl Drop for ProbeGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(l) = lagging()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_mut(&self.key)
+        {
+            l.probe_ended();
+        }
+    }
+}
+
 /// The positions each graph's last fresh gate read, and when.
 fn fresh_seen() -> &'static Mutex<FreshSeen> {
     static C: std::sync::OnceLock<Mutex<FreshSeen>> = std::sync::OnceLock::new();
@@ -108,29 +235,39 @@ impl MirrorGate for CatalogGate {
         let started = Instant::now();
         let r = self.poll(layout, started).await;
         let outcome = match r {
-            Ok(true) => "ok",
-            Ok(false) => "lag",
+            Ok(Found::Fresh) => "ok",
+            Ok(Found::Lag) => "lag",
+            Ok(Found::Skipped) => "skipped",
+            Ok(Found::Busy) => "busy",
             Err(_) => "error",
         };
         metrics::counter!("sprig_graph_mirror_waits_total", "outcome" => outcome).increment(1);
         metrics::histogram!("sprig_graph_mirror_wait_seconds")
             .record(started.elapsed().as_secs_f64());
-        r.unwrap_or(false)
+        matches!(r, Ok(Found::Fresh))
     }
 }
 
 impl CatalogGate {
-    async fn poll(&self, layout: &GraphShards, started: Instant) -> Result<bool> {
+    /// Whether the mirrors are fresh; [`Found::Busy`] when no gate
+    /// connection came within [`GATE_CONN_WAIT`] (the statement scatters,
+    /// as on a lag).
+    async fn poll(&self, layout: &GraphShards, started: Instant) -> Result<Found> {
         let none = BTreeMap::new();
-        // The catalog's connection and its first positions, at the same
-        // time as the target below.
+        // The catalog's pool and its first positions, at the same time as
+        // the target below.
         let catalog_key = format!("catalog:{}", self.tenant);
         let first = async {
             let ep = self.graphs.svc.locator.writer(self.tenant).await?;
-            let mut c = gate_conn(&catalog_key, &ep.pool).await?;
+            let Some(pool) = gate_pool(&catalog_key, &ep.pool).await? else {
+                return Ok(None);
+            };
             let schema = ep.store.schema().to_owned();
+            let Some(mut c) = gate_conn(&pool).await? else {
+                return Ok(None);
+            };
             let rows = mirror::read_pos(&mut c, &schema, self.graph).await?;
-            Ok::<_, SprigError>((c, schema, rows))
+            Ok::<_, SprigError>(Some((pool, schema, rows)))
         };
         // The target: every transaction committed on the shards' clusters
         // before the statement (their binlog positions now), and the
@@ -148,14 +285,18 @@ impl CatalogGate {
                 }
                 let cluster = ClusterId::new(&s.cluster)
                     .map_err(|e| SprigError::internal(format!("cluster id {}: {e}", s.cluster)))?;
-                let pool = self.graphs.pool(&cluster).await?;
+                let ctl = self.graphs.pool(&cluster).await?;
                 let key = format!("cluster:{}", s.cluster);
-                let mut pc = gate_conn(&key, &pool).await?;
+                let Some(pool) = gate_pool(&key, &ctl).await? else {
+                    return Ok(None);
+                };
+                let Some(mut pc) = gate_conn(&pool).await? else {
+                    return Ok(None);
+                };
                 let now: Option<String> = pc
                     .query_first("SELECT @@gtid_binlog_pos")
                     .await
                     .map_err(backend_error)?;
-                gate_conn_back(key, pc);
                 // Both positions: `reached` keeps each domain's highest.
                 let t = targets.entry(s.cluster.clone()).or_default();
                 if !t.is_empty() {
@@ -163,34 +304,34 @@ impl CatalogGate {
                 }
                 t.push_str(&now.unwrap_or_default());
             }
-            Ok::<_, SprigError>(targets)
+            Ok::<_, SprigError>(Some(targets))
         };
         let (targets, first) = futures::join!(target, first);
-        let targets = targets?;
-        let (mut c, schema, rows) = first?;
-        let fresh = self
-            .wait_fresh(&mut c, &schema, layout, &targets, &none, started, rows)
-            .await;
-        if fresh.is_ok() {
-            gate_conn_back(catalog_key, c);
-        }
-        fresh
+        let (Some(targets), Some((pool, schema, rows))) = (targets?, first?) else {
+            return Ok(Found::Busy);
+        };
+        self.wait_fresh(&pool, &schema, layout, &targets, &none, started, rows)
+            .await
     }
 
     /// Reads the positions again until they reach `targets` (see
-    /// [`Self::poll`]).
+    /// [`Self::poll`]), a gate connection for each read: none is held
+    /// while the gate sleeps.
     #[allow(clippy::too_many_arguments)] // the poll's state
     async fn wait_fresh(
         &self,
-        c: &mut mysql_async::Conn,
+        pool: &mysql_async::Pool,
         schema: &str,
         layout: &GraphShards,
         targets: &BTreeMap<String, String>,
         none: &BTreeMap<String, String>,
         started: Instant,
         first: Vec<mirror::PosRow>,
-    ) -> Result<bool> {
+    ) -> Result<Found> {
+        let key = (self.tenant.0, self.graph);
         let mut rows = first;
+        let mut probe = ProbeGuard { key, armed: false };
+        let mut planned = false;
         // The first read also tells whether the applier serves the graph
         // at all (else scatter without waiting).
         loop {
@@ -198,50 +339,114 @@ impl CatalogGate {
                 fresh_seen()
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .insert((self.tenant.0, self.graph), (rows, Instant::now()));
-                return Ok(true);
+                    .insert(key, (rows, Instant::now()));
+                if let Some(l) = lagging()
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get_mut(&key)
+                {
+                    l.fresh();
+                }
+                probe.armed = false;
+                return Ok(Found::Fresh);
             }
             // Not serving the graph (or behind a map change): no wait.
-            if !mirror::fresh(&rows, layout, none) || started.elapsed() >= self.wait {
-                return Ok(false);
+            if !mirror::fresh(&rows, layout, none) {
+                return Ok(Found::Lag);
+            }
+            if !planned {
+                planned = true;
+                let plan = lagging()
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .entry(key)
+                    .or_default()
+                    .plan(Instant::now());
+                match plan {
+                    Plan::Skip => return Ok(Found::Skipped),
+                    Plan::Probe => probe.armed = true,
+                    Plan::Wait => {}
+                }
+            }
+            if started.elapsed() >= self.wait {
+                lagging()
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .entry(key)
+                    .or_default()
+                    .lagged(Instant::now(), probe.armed);
+                probe.armed = false;
+                return Ok(Found::Lag);
             }
             tokio::time::sleep(Duration::from_millis(15)).await;
-            rows = mirror::read_pos(c, schema, self.graph).await?;
+            let Some(mut c) = gate_conn(pool).await? else {
+                return Ok(Found::Busy);
+            };
+            rows = mirror::read_pos(&mut c, schema, self.graph).await?;
         }
     }
 }
 
-/// Idle connections of mirror gates, by what they reach: the gate's two
-/// small reads skip the pool (a pooled connection is reset when it goes
-/// back, and taking one cost a millisecond a statement).
-fn gate_conns() -> &'static Mutex<HashMap<String, Vec<mysql_async::Conn>>> {
-    static C: std::sync::OnceLock<Mutex<HashMap<String, Vec<mysql_async::Conn>>>> =
+/// Connections of mirror gates, by what they reach: a small pool of their
+/// own per target, whose connections go back without a reset (the gate's
+/// reads are plain SELECTs). Gates once kept idle connections taken from
+/// the gateway's `sprig_ctl` and catalog pools (4 connections each) in a
+/// cache of their own: under 32 concurrent Bolt sessions the cache held
+/// all 4, and every gate that missed it waited on the pool forever (the
+/// SF1 benchmark's `ConnectionReadTimeoutException`).
+fn gate_pools() -> &'static Mutex<HashMap<String, mysql_async::Pool>> {
+    static C: std::sync::OnceLock<Mutex<HashMap<String, mysql_async::Pool>>> =
         std::sync::OnceLock::new();
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Idle gate connections kept per target.
-const GATE_CONNS: usize = 16;
+/// Connections one gate pool opens at most.
+const GATE_POOL_MAX: usize = 16;
 
-/// A gate connection to what `key` names, idle or from `pool`.
-async fn gate_conn(key: &str, pool: &mysql_async::Pool) -> Result<mysql_async::Conn> {
-    let idle = gate_conns()
+/// How long a gate waits for a connection before it gives up (the
+/// statement scatters its incoming hops instead).
+const GATE_CONN_WAIT: Duration = Duration::from_millis(250);
+
+/// The gate pool of what `key` names, made once with `base`'s options;
+/// `None` when `base` gave no connection within [`GATE_CONN_WAIT`].
+async fn gate_pool(key: &str, base: &mysql_async::Pool) -> Result<Option<mysql_async::Pool>> {
+    if let Some(p) = gate_pools()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .get_mut(key)
-        .and_then(Vec::pop);
-    match idle {
-        Some(c) => Ok(c),
-        None => pool.get_conn().await.map_err(backend_error),
+        .get(key)
+    {
+        return Ok(Some(p.clone()));
     }
+    let Ok(c) = tokio::time::timeout(GATE_CONN_WAIT, base.get_conn()).await else {
+        return Ok(None);
+    };
+    let opts = c.map_err(backend_error)?.opts().clone();
+    let pool = mysql_async::Pool::new(
+        mysql_async::OptsBuilder::from_opts(opts).pool_opts(
+            mysql_async::PoolOpts::new()
+                .with_constraints(
+                    mysql_async::PoolConstraints::new(0, GATE_POOL_MAX).unwrap_or_default(),
+                )
+                .with_inactive_connection_ttl(Duration::from_secs(60))
+                .with_abs_conn_ttl(Some(Duration::from_secs(15 * 60)))
+                .with_reset_connection(false),
+        ),
+    );
+    Ok(Some(
+        gate_pools()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(key.to_owned())
+            .or_insert(pool)
+            .clone(),
+    ))
 }
 
-/// Keeps a gate connection whose reads succeeded for the next gate.
-fn gate_conn_back(key: String, c: mysql_async::Conn) {
-    let mut m = gate_conns().lock().unwrap_or_else(PoisonError::into_inner);
-    let v = m.entry(key).or_default();
-    if v.len() < GATE_CONNS {
-        v.push(c);
+/// A connection of a gate pool; `None` after [`GATE_CONN_WAIT`].
+async fn gate_conn(pool: &mysql_async::Pool) -> Result<Option<mysql_async::Conn>> {
+    match tokio::time::timeout(GATE_CONN_WAIT, pool.get_conn()).await {
+        Ok(c) => c.map(Some).map_err(backend_error),
+        Err(_) => Ok(None),
     }
 }
 
@@ -465,9 +670,13 @@ impl GatewayGraphs {
                 return Ok(true); // someone else finished, or async again
             }
             let ep = self.svc.locator.writer(g.tenant).await?;
-            let mut c = ep.pool.get_conn().await.map_err(backend_error)?;
             let schema = ep.store.schema().to_owned();
-            let rows = mirror::read_pos(&mut c, &schema, g.graph_id).await?;
+            // Not held across the mode change (a catalog change of its own
+            // from the same pool) or the wait.
+            let rows = {
+                let mut c = ep.pool.get_conn().await.map_err(backend_error)?;
+                mirror::read_pos(&mut c, &schema, g.graph_id).await?
+            };
             // The map may have changed since: compare against the targets
             // of the clusters it uses now (a new cluster's position was
             // read by the applier after the change, so any row will do).
@@ -483,6 +692,7 @@ impl GatewayGraphs {
                 .collect();
             if mirror::fresh(&rows, &now.shards, &t) {
                 self.set_mirror(&now, "sync", true).await?;
+                let mut c = ep.pool.get_conn().await.map_err(backend_error)?;
                 mirror::clear_pos(&mut c, &schema, g.graph_id).await?;
                 return Ok(true);
             }
@@ -491,5 +701,56 @@ impl GatewayGraphs {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn waits_pause_after_two_lags_and_a_probe_decides() {
+        let t0 = Instant::now();
+        let mut l = Lagging::default();
+        assert_eq!(l.plan(t0), Plan::Wait);
+        l.lagged(t0, false);
+        // One lag isn't a streak yet.
+        assert_eq!(l.plan(t0), Plan::Wait);
+        l.lagged(t0, false);
+        // Paused for a second: gates don't wait.
+        assert_eq!(l.plan(t0 + Duration::from_millis(500)), Plan::Skip);
+        // The pause ended: one probe waits, the others still skip.
+        let t1 = t0 + SKIP_FIRST;
+        assert_eq!(l.plan(t1), Plan::Probe);
+        assert_eq!(l.plan(t1), Plan::Skip);
+        // The probe lagged too: the next pause is twice as long.
+        l.lagged(t1, true);
+        assert_eq!(l.plan(t1 + Duration::from_millis(1_900)), Plan::Skip);
+        let t2 = t1 + SKIP_FIRST * 2;
+        assert_eq!(l.plan(t2), Plan::Probe);
+        // A probe without an answer lets the next gate probe.
+        l.probe_ended();
+        assert_eq!(l.plan(t2), Plan::Probe);
+        // Fresh: waits resume.
+        l.fresh();
+        assert_eq!(l.plan(t2), Plan::Wait);
+    }
+
+    #[test]
+    fn pauses_stop_growing_at_the_maximum() {
+        let mut t = Instant::now();
+        let mut l = Lagging::default();
+        l.lagged(t, false);
+        l.lagged(t, false);
+        for _ in 0..10 {
+            t += SKIP_MAX;
+            assert_eq!(l.plan(t), Plan::Probe);
+            l.lagged(t, true);
+        }
+        assert_eq!(l.skip_for, SKIP_MAX);
+        assert_eq!(
+            l.plan(t + SKIP_MAX.saturating_sub(Duration::from_millis(1))),
+            Plan::Skip
+        );
     }
 }

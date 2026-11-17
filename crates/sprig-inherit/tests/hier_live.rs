@@ -1,4 +1,4 @@
-//! Record hierarchies on inheritable tables (decision T22) through a
+//! Record hierarchies on inheritable tables through a
 //! running gateway: spaces `root > s1 > s2` of one tenant share a table
 //! with a hierarchy (`parent_id`).
 //!
@@ -8,7 +8,7 @@
 //! and `SPRIG_ANCESTORS` are compared with the model and with a
 //! brute-force recursive CTE over the same level's rows.
 //!
-//! - T22's case: `s1` overrides a row's parent, then the root moves a row
+//! - The override case: `s1` overrides a row's parent, then the root moves a row
 //!   under it; `s1`'s path follows `s1`'s tree.
 //! - Random steps at every level: inserts, moves, `parent_id` overrides,
 //!   own rows, deletes, resets; cycles only a lower level would see are
@@ -880,7 +880,7 @@ async fn refusals(e: &mut Env) {
     .await;
 }
 
-/// A user whose grants name single tables (decision T27): its structural
+/// A user whose grants name single tables: its structural
 /// changes are serialized too, since the system takes the lock. One such
 /// session holds a move open in a transaction; another's move waits for
 /// its commit. Then two such users and two `app` sessions write at once.
@@ -988,7 +988,7 @@ async fn run(addr: &str, tag: &str) {
     let mut e = Env::open(addr, tag).await;
     let start = Instant::now();
     t22_case(&mut e).await;
-    eprintln!("[{tag}] T22's case: {:?}", start.elapsed());
+    eprintln!("[{tag}] override case: {:?}", start.elapsed());
     let steps: usize = std::env::var("SPRIG_TEST_HL_STEPS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1031,7 +1031,7 @@ async fn hierarchies_across_spaces_mariadb() {
 
 // ------------------------------------------------------------ across tenants
 
-/// `a,b,c`: tenants `a > b > c`, each with the user `app` (decision T28).
+/// `a,b,c`: tenants `a > b > c`, each with the user `app`.
 const TENANTS: &str = "SPRIG_TEST_HL_TENANTS";
 
 fn tenant_line(test: &str) -> Option<Vec<String>> {
@@ -1263,7 +1263,7 @@ async fn path_at(c: &mut Conn, t: &str, k: i64) -> Option<String> {
     .and_then(|r| r[0].clone())
 }
 
-/// T22's case across tenants, and the refusals only a child tenant sees.
+/// The override case across tenants, and the refusals only a child tenant sees.
 async fn tenants_case(m: &mut Multi) {
     let t = "ta";
     m.table(t).await;
@@ -1563,7 +1563,7 @@ async fn tenants_concurrent(m: &mut Multi, ops: usize) {
 /// `b`'s own row 1000003 moves row 2, above it; 1000003 and 1000004 get
 /// their paths at every level below. (A child tenant's policies filter its
 /// own layer rows; rows it reads from its parent are not filtered by them,
-/// a gap of chapter 29 with chapter 42 reported in decision T31.)
+/// a known gap between row-level security and inheritance.)
 async fn tenants_rls(m: &mut Multi) {
     let t = "tl";
     m.table(t).await;
@@ -1639,7 +1639,7 @@ async fn tenants_rls(m: &mut Multi) {
     exec(b, &format!("DROP USER '{u}'@'%'")).await;
 }
 
-/// `hierarchy.max_move_rows` bounds a reconcile (decision T29): `b1` hangs
+/// `hierarchy.max_move_rows` bounds a reconcile: `b1` hangs
 /// a large subtree under 10, so `b`'s move of 10 rewrites its paths in
 /// `b1`; past the bound it is refused (39715), and allowed again once the
 /// setting is reset, without a restart.
@@ -1694,7 +1694,7 @@ async fn run_tenants(addr: &str, tag: &str) {
     let start = Instant::now();
     tenants_case(&mut m).await;
     eprintln!(
-        "[{tag}] tenants: T22's case and refusals: {:?}",
+        "[{tag}] tenants: override case and refusals: {:?}",
         start.elapsed()
     );
     let steps: usize = std::env::var("SPRIG_TEST_HL_TSTEPS")

@@ -25,12 +25,17 @@
 //! anything else is left out (an offset gap; nothing is renumbered)
 //! ```
 //!
-//! A policy that reads a binary, bit, spatial or vector column (the record
-//! carries it as base64) hides every image of the table.
+//! Records carry some columns in another form than the table (binary
+//! strings as base64, an `ENUM`'s index, a `SET`'s bitmap, a `TIMESTAMP`
+//! in UTC): [`decode`] reads them back as the table shows them, and a
+//! policy reading a column that can't be read back (bit, spatial, vector,
+//! an `ENUM` or `SET` used other than against string literals) hides
+//! every image of the table.
 
 use sprig_auth::authz::{Action, SessionGrants, Target};
 use sprig_catalog::TenantCatalog;
 use sprig_catalog::ddl::database_key;
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_streams::model::{StreamDef, StreamKind};
 
@@ -136,6 +141,26 @@ pub struct FilterColumn {
     /// A binary string column's own type, for images that carry its bytes
     /// as a plain JSON string (keyspace notifications' keys).
     pub plain: Option<String>,
+    /// How the record carries the value when it isn't as the table types
+    /// it (an `ENUM`'s index, a `SET`'s bitmap, a `TIMESTAMP` in UTC).
+    pub carried: Carried,
+}
+
+/// How a change record carries a column the table types otherwise
+/// ([`decode`] reads it back as the table shows it).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Carried {
+    /// As the table types it (or base64 for binary strings, see
+    /// [`FilterColumn::plain`]).
+    #[default]
+    AsIs,
+    /// An `ENUM`: its 1-based member index (0: the empty error value),
+    /// with the members and the column's `CHARACTER SET .. COLLATE ..`.
+    Enum(Vec<String>, String),
+    /// A `SET`: its bitmap, with the members and character set.
+    Set(Vec<String>, String),
+    /// A `TIMESTAMP`: its UTC date and time.
+    Utc,
 }
 
 /// The `JSON_TABLE` type of a column from `information_schema.COLUMNS`
@@ -155,20 +180,64 @@ pub fn json_table_type(
         _ => base.to_owned(),
     };
     match dt.as_str() {
+        // Records carry a TIMESTAMP in UTC: read as a DATETIME, which
+        // [`decode`] moves to the session's time zone.
+        "timestamp" => (
+            column_type
+                .to_ascii_lowercase()
+                .replace("timestamp", "datetime"),
+            false,
+        ),
         "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" | "decimal"
-        | "numeric" | "float" | "double" | "real" | "date" | "datetime" | "timestamp" | "time"
-        | "year" => (
+        | "numeric" | "float" | "double" | "real" | "date" | "datetime" | "time" | "year" => (
             column_type.to_ascii_lowercase().replace(" zerofill", ""),
             false,
         ),
         "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" => {
             (text_of(&column_type.to_ascii_lowercase()), false)
         }
-        // JSON_TABLE takes no ENUM or SET: their text, compared as text.
-        "enum" | "set" => (text_of("text"), false),
+        // JSON_TABLE takes no ENUM or SET; records carry an index or a
+        // bitmap, which [`decode`] turns into the members' text.
+        "enum" | "set" => ("bigint unsigned".to_owned(), false),
         "uuid" | "inet4" | "inet6" => ("varchar(64) character set ascii".to_owned(), false),
         _ => ("longtext".to_owned(), true),
     }
+}
+
+/// How a record carries a column of `DATA_TYPE` `data_type` and
+/// `COLUMN_TYPE` `column_type` ([`Carried`]).
+#[must_use]
+pub fn carried_of(
+    data_type: &str,
+    column_type: &str,
+    charset: Option<&str>,
+    collation: Option<&str>,
+) -> Carried {
+    let text = match (charset, collation) {
+        (Some(cs), Some(co)) => format!("{cs} COLLATE {co}"),
+        (Some(cs), None) => cs.to_owned(),
+        _ => "utf8mb4".to_owned(),
+    };
+    match data_type.to_ascii_lowercase().as_str() {
+        "enum" => Carried::Enum(members(column_type), text),
+        "set" => Carried::Set(members(column_type), text),
+        "timestamp" => Carried::Utc,
+        _ => Carried::AsIs,
+    }
+}
+
+/// The members of `enum('a','b')` or `set(...)`, as `COLUMN_TYPE` spells
+/// them.
+fn members(column_type: &str) -> Vec<String> {
+    let opts = sprig_sql::lex::LexOptions::mariadb();
+    let src = column_type.as_bytes();
+    sprig_sql::lex::lex(src, &opts)
+        .unwrap_or_default()
+        .iter()
+        .filter(|t| t.kind == sprig_sql::lex::TokenKind::String)
+        .filter_map(|t| sprig_sql::lex::string_value(t.bytes(src), false))
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .collect()
 }
 
 /// An `information_schema.COLUMNS` row as [`filter_columns`] reads it.
@@ -206,7 +275,7 @@ pub async fn filter_columns(
         return Ok(std::sync::Arc::clone(c));
     }
     let pool = svc.locator.ctl_pool(cluster).await?;
-    let mut conn = pool.get_conn().await.map_err(|e| {
+    let mut conn = pool.get_conn_bounded().await.map_err(|e| {
         SprigError::new(
             SprigCode::BackendUnavailable,
             format!("sprig_ctl on {cluster}: {e}"),
@@ -244,6 +313,7 @@ pub async fn filter_columns(
                 ty,
                 opaque: opaque || odd,
                 plain: (binary && !odd).then(|| ct.to_ascii_lowercase()),
+                carried: carried_of(&dt, &ct, cs.as_deref(), co.as_deref()),
             }
         })
         .collect();
@@ -253,27 +323,6 @@ pub async fn filter_columns(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(key, std::sync::Arc::clone(&cols));
     Ok(cols)
-}
-
-/// The columns a predicate rendered over `qual` reads (lower case).
-fn columns_read(rendered: &str, qual: &str) -> Vec<String> {
-    let q = format!("{qual}.");
-    let mut out = Vec::new();
-    let mut rest = rendered;
-    while let Some(at) = rest.find(&q) {
-        let after = &rest[at + q.len()..];
-        let col = if let Some(r) = after.strip_prefix('`') {
-            r.split('`').next().unwrap_or_default().to_owned()
-        } else {
-            after
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
-                .collect()
-        };
-        out.push(col.to_lowercase());
-        rest = after;
-    }
-    out
 }
 
 /// The `JSON_TABLE` column list of `columns`.
@@ -343,85 +392,405 @@ pub async fn record_filter(
             .ok_or_else(|| SprigError::internal("a protected table the resolver can't find"))?;
         r.predicate(key, &[sprig_sql::rls::Cmd::Select], qual)?
     };
-    let (columns, predicate) = decode_binary(columns, predicate, qual);
-    let opaque: Vec<String> = columns
-        .iter()
-        .filter(|c| c.opaque)
-        .map(|c| c.name.to_lowercase())
-        .collect();
-    let predicate = if columns_read(&predicate, qual)
-        .iter()
-        .any(|c| opaque.contains(c))
-    {
-        "FALSE".to_owned()
-    } else {
-        predicate
-    };
-    Ok(Some(sprig_streams::read::RecordFilter {
-        columns: json_table_columns(&columns),
-        predicate,
-    }))
+    Ok(Some(decode(columns, &predicate, qual, lex)))
 }
 
-/// Binary string columns (`BINARY`, `VARBINARY`, the `BLOB`s) that
-/// `predicate` reads, decoded from the image's base64 rather than hiding
-/// the record (a key-value namespace's key `k` is `VARBINARY`, so key
-/// policies would otherwise hide every change of a namespace): each is read
-/// from the image as text and every reference `qual.c` in the predicate
-/// becomes `FROM_BASE64(qual.c)`. Bit, spatial and vector columns stay
-/// opaque.
-fn decode_binary(
+/// `predicate` (rendered over `qual`) as it must read change records'
+/// images, with the `JSON_TABLE` columns to read them: each reference
+/// `qual.c` becomes the value the table itself would give, or the whole
+/// predicate is `FALSE` (fail closed) when that can't be had.
+///
+/// ```text
+/// binary string (BINARY, VARBINARY, BLOBs)  base64 in the record → FROM_BASE64(ref)
+/// ENUM, SET (index, bitmap in the record)   → the members' text (ELT, MAKE_SET)
+///   in the column's character set and collation, where the column is
+///   compared with string literals only (=, <>, <, IN, LIKE, IS NULL,
+///   FIND_IN_SET); any other use (arithmetic, a number, another column,
+///   a function) could read the index on the table → FALSE
+/// TIMESTAMP (UTC text in the record)         → the session's time zone (FROM_UNIXTIME)
+/// bit, spatial, vector, odd names            → FALSE
+/// ```
+#[must_use]
+pub fn decode(
     columns: &[FilterColumn],
-    mut predicate: String,
+    predicate: &str,
     qual: &str,
-) -> (Vec<FilterColumn>, String) {
-    let read = columns_read(&predicate, qual);
-    let mut out = columns.to_vec();
-    for c in &mut out {
-        if c.opaque && c.plain.is_some() && read.contains(&c.name.to_lowercase()) {
-            c.opaque = false;
-            "longtext CHARACTER SET ascii".clone_into(&mut c.ty);
-            predicate = map_column(&predicate, qual, &c.name, |r| format!("FROM_BASE64({r})"));
-        }
+    lex: sprig_sql::lex::LexOptions,
+) -> sprig_streams::read::RecordFilter {
+    use sprig_sql::lex::TokenKind;
+    let closed = || sprig_streams::read::RecordFilter {
+        columns: json_table_columns(columns),
+        predicate: "FALSE".to_owned(),
+    };
+    let src = predicate.as_bytes();
+    let Ok(all) = sprig_sql::lex::lex(src, &lex) else {
+        return closed();
+    };
+    if all
+        .iter()
+        .any(|t| matches!(t.kind, TokenKind::Unterminated | TokenKind::Other))
+    {
+        return closed();
     }
-    (out, predicate)
+    let nt: Vec<sprig_sql::lex::Token> = all.into_iter().filter(|t| !t.kind.is_trivia()).collect();
+    let toks = Toks { nt: &nt, src };
+    let qname = qual.trim_matches('`').to_ascii_lowercase();
+    let mut out = columns.to_vec();
+    let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    let mut i = 0;
+    while i + 2 < nt.len() {
+        if !(toks.ident(i).as_deref() == Some(qname.as_str())
+            && toks.is(i + 1, TokenKind::Punct, ".")
+            && nt[i + 2].kind.is_ident_like())
+        {
+            i += 1;
+            continue;
+        }
+        let name = toks.ident(i + 2).unwrap_or_default();
+        let range = nt[i].start as usize..nt[i + 2].end as usize;
+        let r = &predicate[range.clone()];
+        if let Some(at) = columns.iter().position(|c| c.name.to_lowercase() == name) {
+            let c = &columns[at];
+            let text = if c.opaque {
+                if c.plain.is_none() {
+                    return closed();
+                }
+                out[at].opaque = false;
+                "longtext CHARACTER SET ascii".clone_into(&mut out[at].ty);
+                format!("FROM_BASE64({r})")
+            } else {
+                match &c.carried {
+                    Carried::AsIs => r.to_owned(),
+                    Carried::Utc => format!(
+                        "COALESCE(FROM_UNIXTIME(TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', {r})) \
+                         + INTERVAL MICROSECOND({r}) MICROSECOND, {r})"
+                    ),
+                    Carried::Enum(m, cs) | Carried::Set(m, cs) => {
+                        if !toks.compared_as_text(i, i + 2) {
+                            return closed();
+                        }
+                        let list = m
+                            .iter()
+                            .map(|x| sprig_sql::rls::sql_string(x, lex.no_backslash_escapes))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let (cs, co) = cs.split_once(" COLLATE ").unwrap_or((cs.as_str(), ""));
+                        let inner = if matches!(c.carried, Carried::Enum(..)) {
+                            format!("ELT({r} + 1, '', {list})")
+                        } else if m.is_empty() {
+                            "''".to_owned()
+                        } else {
+                            format!("MAKE_SET({r}, {list})")
+                        };
+                        if co.is_empty() {
+                            format!("CONVERT({inner} USING {cs})")
+                        } else {
+                            format!("CONVERT({inner} USING {cs}) COLLATE {co}")
+                        }
+                    }
+                }
+            };
+            edits.push((range, text));
+        }
+        i += 3;
+    }
+    let mut s = String::with_capacity(predicate.len() + 64 * edits.len());
+    let mut at = 0;
+    for (range, text) in edits {
+        s.push_str(&predicate[at..range.start]);
+        s.push_str(&text);
+        at = range.end;
+    }
+    s.push_str(&predicate[at..]);
+    sprig_streams::read::RecordFilter {
+        columns: json_table_columns(&out),
+        predicate: s,
+    }
 }
 
-/// `rendered` with each reference `qual.name` (bare or quoted, any case)
-/// replaced by `with(reference)`.
-fn map_column(rendered: &str, qual: &str, name: &str, with: impl Fn(&str) -> String) -> String {
-    let q = format!("{qual}.");
-    let mut out = String::with_capacity(rendered.len() + 16);
-    let mut rest = rendered;
-    while let Some(at) = rest.find(&q) {
-        let after = &rest[at + q.len()..];
-        let (col, len) = if let Some(r) = after.strip_prefix('`') {
-            let c = r.split('`').next().unwrap_or_default();
-            (c.to_owned(), c.len() + 2)
-        } else {
-            let c: String = after
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
-                .collect();
-            let n = c.len();
-            (c, n)
-        };
-        out.push_str(&rest[..at]);
-        let reference = &rest[at..at + q.len() + len];
-        if col.eq_ignore_ascii_case(name) {
-            out.push_str(&with(reference));
-        } else {
-            out.push_str(reference);
-        }
-        rest = &rest[at + q.len() + len..];
+/// A predicate's tokens without trivia, for [`decode`].
+struct Toks<'a> {
+    nt: &'a [sprig_sql::lex::Token],
+    src: &'a [u8],
+}
+
+impl Toks<'_> {
+    fn text(&self, i: usize) -> Option<&str> {
+        self.nt
+            .get(i)
+            .and_then(|t| std::str::from_utf8(t.bytes(self.src)).ok())
     }
-    out.push_str(rest);
-    out
+
+    fn is(&self, i: usize, kind: sprig_sql::lex::TokenKind, text: &str) -> bool {
+        self.nt.get(i).is_some_and(|t| t.kind == kind)
+            && self.text(i).is_some_and(|x| x.eq_ignore_ascii_case(text))
+    }
+
+    fn word(&self, i: usize, w: &str) -> bool {
+        self.is(i, sprig_sql::lex::TokenKind::Word, w)
+    }
+
+    /// An identifier's value, lower case.
+    fn ident(&self, i: usize) -> Option<String> {
+        let t = self.nt.get(i).filter(|t| t.kind.is_ident_like())?;
+        let v = sprig_sql::lex::ident_value(t.bytes(self.src));
+        Some(String::from_utf8_lossy(&v).to_lowercase())
+    }
+
+    /// Where an expression may start: nothing, `(`, or a logical keyword.
+    fn opens(&self, i: Option<usize>) -> bool {
+        let Some(i) = i else { return true };
+        self.is(i, sprig_sql::lex::TokenKind::Punct, "(")
+            || ["AND", "OR", "XOR", "WHEN", "THEN", "ELSE", "WHERE", "ON"]
+                .iter()
+                .any(|w| self.word(i, w))
+    }
+
+    /// Where an expression may end: nothing, `)`, or a logical keyword.
+    fn closes(&self, i: usize) -> bool {
+        i >= self.nt.len()
+            || self.is(i, sprig_sql::lex::TokenKind::Punct, ")")
+            || ["AND", "OR", "XOR", "THEN", "ELSE", "END", "WHEN"]
+                .iter()
+                .any(|w| self.word(i, w))
+    }
+
+    fn comparison(&self, i: usize) -> bool {
+        self.nt
+            .get(i)
+            .is_some_and(|t| t.kind == sprig_sql::lex::TokenKind::Op)
+            && self
+                .text(i)
+                .is_some_and(|x| matches!(x, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "<=>"))
+    }
+
+    /// The `)` closing the `(` at `open`.
+    fn close_of(&self, open: usize) -> Option<usize> {
+        use sprig_sql::lex::TokenKind;
+        let mut depth = 0usize;
+        for k in open..self.nt.len() {
+            if self.is(k, TokenKind::Punct, "(") {
+                depth += 1;
+            } else if self.is(k, TokenKind::Punct, ")") {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(k);
+                }
+            }
+        }
+        None
+    }
+
+    /// A call at `i` whose value is always a string: `JSON_VALUE(..)` or
+    /// `JSON_QUERY(..)` (how MariaDB's side reads session values), or
+    /// `COALESCE` of such calls and string literals. The index after it.
+    fn string_call(&self, i: usize) -> Option<usize> {
+        use sprig_sql::lex::TokenKind;
+        if !self.is(i + 1, TokenKind::Punct, "(") {
+            return None;
+        }
+        let close = self.close_of(i + 1)?;
+        if self.word(i, "JSON_VALUE") || self.word(i, "JSON_QUERY") {
+            return Some(close + 1);
+        }
+        if !self.word(i, "COALESCE") {
+            return None;
+        }
+        let mut k = i + 2;
+        loop {
+            k = self.literal(k)?;
+            if k == close {
+                return Some(close + 1);
+            }
+            if !self.is(k, TokenKind::Punct, ",") {
+                return None;
+            }
+            k += 1;
+        }
+    }
+
+    /// A string literal at `i` (an introducer, the string, a `COLLATE`),
+    /// or a [`Self::string_call`]: the index after it.
+    fn literal(&self, mut i: usize) -> Option<usize> {
+        use sprig_sql::lex::TokenKind;
+        if let Some(e) = self.string_call(i) {
+            return Some(e);
+        }
+        if self.nt.get(i).is_some_and(|t| t.kind == TokenKind::Word)
+            && self.text(i).is_some_and(|x| x.starts_with('_'))
+        {
+            i += 1;
+        }
+        if !self
+            .nt
+            .get(i)
+            .is_some_and(|t| matches!(t.kind, TokenKind::String | TokenKind::NationalString))
+        {
+            return None;
+        }
+        i += 1;
+        if self.word(i, "COLLATE") && self.nt.get(i + 1).is_some_and(|t| t.kind.is_ident_like()) {
+            i += 2;
+        }
+        Some(i)
+    }
+
+    /// A string literal ending at `end` (inclusive): the index of its
+    /// first token.
+    fn literal_back(&self, mut end: usize) -> Option<usize> {
+        use sprig_sql::lex::TokenKind;
+        if self.is(end, TokenKind::Punct, ")") {
+            // A string call ending here.
+            return (0..end)
+                .rev()
+                .find(|&k| self.string_call(k) == Some(end + 1));
+        }
+        if end >= 2 && self.nt[end].kind.is_ident_like() && self.word(end - 1, "COLLATE") {
+            end -= 2;
+        }
+        if !matches!(
+            self.nt.get(end)?.kind,
+            TokenKind::String | TokenKind::NationalString
+        ) {
+            return None;
+        }
+        if end >= 1
+            && self.nt[end - 1].kind == TokenKind::Word
+            && self.text(end - 1).is_some_and(|x| x.starts_with('_'))
+        {
+            return Some(end - 1);
+        }
+        Some(end)
+    }
+
+    /// Whether the reference at tokens `a..=b` is compared with string
+    /// literals only, so that its text decides as the column does on the
+    /// table: `ref op 'x'`, `'x' op ref`, `ref [NOT] IN ('x', ...)`,
+    /// `ref [NOT] LIKE 'x' [ESCAPE 'y']`, `ref IS [NOT] NULL`,
+    /// `FIND_IN_SET('x', ref)`.
+    fn compared_as_text(&self, first: usize, last: usize) -> bool {
+        use sprig_sql::lex::TokenKind;
+        let before = first.checked_sub(1);
+        let after = last + 1;
+        // FIND_IN_SET('x', ref)
+        if let Some(comma) = before
+            && self.is(comma, TokenKind::Punct, ",")
+            && self.is(after, TokenKind::Punct, ")")
+            && comma >= 1
+            && let Some(lit) = self.literal_back(comma - 1)
+            && lit >= 2
+            && self.is(lit - 1, TokenKind::Punct, "(")
+            && self.word(lit - 2, "FIND_IN_SET")
+        {
+            return true;
+        }
+        // 'x' op ref
+        if let Some(op) = before
+            && self.comparison(op)
+            && op >= 1
+            && let Some(lit) = self.literal_back(op - 1)
+        {
+            return self.opens(lit.checked_sub(1)) && self.closes(after);
+        }
+        if !self.opens(before) {
+            return false;
+        }
+        let mut pos = after;
+        // ref op 'x'
+        if self.comparison(pos) {
+            return self.literal(pos + 1).is_some_and(|end| self.closes(end));
+        }
+        if self.word(pos, "IS") {
+            pos += 1;
+            if self.word(pos, "NOT") {
+                pos += 1;
+            }
+            return self.word(pos, "NULL") && self.closes(pos + 1);
+        }
+        if self.word(pos, "NOT") {
+            pos += 1;
+        }
+        if self.word(pos, "LIKE") {
+            let Some(mut end) = self.literal(pos + 1) else {
+                return false;
+            };
+            if self.word(end, "ESCAPE") {
+                let Some(escape) = self.literal(end + 1) else {
+                    return false;
+                };
+                end = escape;
+            }
+            return self.closes(end);
+        }
+        if self.word(pos, "IN") && self.is(pos + 1, TokenKind::Punct, "(") {
+            let mut at = pos + 2;
+            loop {
+                let Some(next) = self.literal(at) else {
+                    return false;
+                };
+                if self.is(next, TokenKind::Punct, ",") {
+                    at = next + 1;
+                    continue;
+                }
+                return self.is(next, TokenKind::Punct, ")") && self.closes(next + 1);
+            }
+        }
+        false
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const Q: &str = "`__sprig_ci`";
+
+    fn lex() -> sprig_sql::lex::LexOptions {
+        sprig_sql::lex::LexOptions::mariadb()
+    }
+
+    fn col(name: &str, ty: &str) -> FilterColumn {
+        FilterColumn {
+            name: name.into(),
+            ty: ty.into(),
+            opaque: false,
+            plain: None,
+            carried: Carried::AsIs,
+        }
+    }
+
+    fn cols() -> Vec<FilterColumn> {
+        let (ty, opaque) = json_table_type("varbinary", "varbinary(16)", None, None);
+        vec![
+            col("owner", "varchar(64)"),
+            FilterColumn {
+                opaque,
+                plain: Some("varbinary(16)".into()),
+                ..col("b", &ty)
+            },
+            FilterColumn {
+                carried: carried_of(
+                    "enum",
+                    "enum('public','secret','it''s')",
+                    Some("utf8mb4"),
+                    Some("utf8mb4_general_ci"),
+                ),
+                ..col("st", "bigint unsigned")
+            },
+            FilterColumn {
+                carried: carried_of("set", "set('a','secret')", Some("utf8mb4"), None),
+                ..col("tags", "bigint unsigned")
+            },
+            FilterColumn {
+                carried: carried_of("timestamp", "timestamp(3)", None, None),
+                ..col("ts", "datetime(3)")
+            },
+            FilterColumn {
+                opaque: true,
+                ..col("g", "longtext")
+            },
+        ]
+    }
 
     #[test]
     fn column_types() {
@@ -441,6 +810,7 @@ mod tests {
             json_table_type("int", "int(10) unsigned zerofill", None, None),
             ("int(10) unsigned".to_owned(), false)
         );
+        // Records carry an ENUM's index and a SET's bitmap.
         assert_eq!(
             json_table_type(
                 "enum",
@@ -449,50 +819,118 @@ mod tests {
                 Some("utf8mb4_bin")
             )
             .0,
-            "text CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"
+            "bigint unsigned"
+        );
+        assert_eq!(
+            json_table_type("timestamp", "timestamp(3)", None, None).0,
+            "datetime(3)"
         );
         assert!(json_table_type("varbinary", "varbinary(16)", None, None).1);
         assert!(json_table_type("point", "point", None, None).1);
+        assert_eq!(
+            carried_of(
+                "enum",
+                "enum('a','it''s')",
+                Some("utf8mb4"),
+                Some("utf8mb4_bin")
+            ),
+            Carried::Enum(
+                vec!["a".into(), "it's".into()],
+                "utf8mb4 COLLATE utf8mb4_bin".into()
+            )
+        );
     }
 
     #[test]
-    fn columns_a_predicate_reads() {
-        let r = "(`__sprig_ci`.`owner` = 'a') AND (`__sprig_ci`.Blob_C IS NULL)";
-        assert_eq!(columns_read(r, "`__sprig_ci`"), vec!["owner", "blob_c"]);
-        let cols = vec![
-            FilterColumn {
-                name: "owner".into(),
-                ty: "varchar(64)".into(),
-                opaque: false,
-                plain: None,
-            },
-            FilterColumn {
-                name: "b".into(),
-                ty: "longtext".into(),
-                opaque: true,
-                plain: Some("varbinary(16)".into()),
-            },
-        ];
-        assert_eq!(
-            json_table_columns(&cols),
-            "`owner` varchar(64) PATH '$.\"owner\"', `b` longtext PATH '$.__sprig_none'"
-        );
-        // A binary column the predicate reads is decoded from base64.
-        let (c2, p2) = decode_binary(
-            &cols,
-            "(`__sprig_ci`.b LIKE 'a:%') AND (`__sprig_ci`.`B` <> `__sprig_ci`.bx)".to_owned(),
-            "`__sprig_ci`",
+    fn binary_columns_are_decoded_from_base64() {
+        let f = decode(
+            &cols(),
+            "(`__sprig_ci`.b LIKE 'a:%') AND (`__sprig_ci`.`B` <> `__sprig_ci`.owner)",
+            Q,
+            lex(),
         );
         assert_eq!(
-            p2,
-            "(FROM_BASE64(`__sprig_ci`.b) LIKE 'a:%') AND (FROM_BASE64(`__sprig_ci`.`B`) <> `__sprig_ci`.bx)"
+            f.predicate,
+            "(FROM_BASE64(`__sprig_ci`.b) LIKE 'a:%') AND (FROM_BASE64(`__sprig_ci`.`B`) <> `__sprig_ci`.owner)"
+        );
+        assert!(
+            f.columns
+                .contains("`b` longtext CHARACTER SET ascii PATH '$.\"b\"'")
+        );
+        // Not read: stays unread.
+        let f = decode(&cols(), "`__sprig_ci`.owner = 'x'", Q, lex());
+        assert!(f.columns.contains("`b` longtext PATH '$.__sprig_none'"));
+        assert_eq!(f.predicate, "`__sprig_ci`.owner = 'x'");
+        // A string literal naming the qualifier is left alone.
+        let f = decode(&cols(), "`__sprig_ci`.owner = '`__sprig_ci`.b'", Q, lex());
+        assert_eq!(f.predicate, "`__sprig_ci`.owner = '`__sprig_ci`.b'");
+    }
+
+    #[test]
+    fn other_opaque_columns_hide_everything() {
+        let f = decode(&cols(), "`__sprig_ci`.g IS NOT NULL OR TRUE", Q, lex());
+        assert_eq!(f.predicate, "FALSE");
+    }
+
+    #[test]
+    fn enums_and_sets_read_as_their_members_text() {
+        let f = decode(&cols(), "(`__sprig_ci`.st <> 'secret')", Q, lex());
+        assert_eq!(
+            f.predicate,
+            "(CONVERT(ELT(`__sprig_ci`.st + 1, '', 'public', 'secret', 'it''s') USING utf8mb4) \
+             COLLATE utf8mb4_general_ci <> 'secret')"
+        );
+        let f = decode(
+            &cols(),
+            "FIND_IN_SET('secret', `__sprig_ci`.tags) = 0",
+            Q,
+            lex(),
         );
         assert_eq!(
-            json_table_columns(&c2),
-            "`owner` varchar(64) PATH '$.\"owner\"', `b` longtext CHARACTER SET ascii PATH '$.\"b\"'"
+            f.predicate,
+            "FIND_IN_SET('secret', CONVERT(MAKE_SET(`__sprig_ci`.tags, 'a', 'secret') USING utf8mb4)) = 0"
         );
-        // Not read: stays opaque.
-        let (c3, _) = decode_binary(&cols, "`__sprig_ci`.owner = 'x'".to_owned(), "`__sprig_ci`");
-        assert!(c3[1].opaque);
+        for ok in [
+            "'public' = `__sprig_ci`.st",
+            "`__sprig_ci`.st IN ('public', _utf8mb4'x')",
+            "`__sprig_ci`.st NOT IN ('secret')",
+            "`__sprig_ci`.st LIKE 'p%' ESCAPE '!'",
+            "`__sprig_ci`.st IS NOT NULL AND `__sprig_ci`.owner = 'a'",
+            "NOT (`__sprig_ci`.st = 'secret' COLLATE utf8mb4_bin)",
+            "CASE WHEN `__sprig_ci`.st = 'a' THEN 1 ELSE 0 END",
+            "`__sprig_ci`.st = JSON_VALUE(`__sprig_rls_ctx`(), '$.s.user')",
+            "COALESCE(JSON_VALUE(@c, '$.a'), JSON_QUERY(@c, '$.a')) <> `__sprig_ci`.st",
+        ] {
+            assert_ne!(decode(&cols(), ok, Q, lex()).predicate, "FALSE", "{ok}");
+        }
+        // Where the table could compare the index, nothing shows.
+        for bad in [
+            "`__sprig_ci`.st <> 1",
+            "`__sprig_ci`.st + 0 = 2",
+            "`__sprig_ci`.st = 'a' + 0",
+            "`__sprig_ci`.st",
+            "NOT `__sprig_ci`.st = 'a'",
+            "`__sprig_ci`.st = `__sprig_ci`.owner",
+            "`__sprig_ci`.st IN (1, 'a')",
+            "`__sprig_ci`.st IS TRUE",
+            "CONCAT(`__sprig_ci`.st, '') = 'a'",
+            "-`__sprig_ci`.st < 'a'",
+            "`__sprig_ci`.tags & 2",
+            "`__sprig_ci`.st = COALESCE(JSON_VALUE(@c, '$.a'), 1)",
+            "`__sprig_ci`.st = ABS(JSON_VALUE(@c, '$.a'))",
+        ] {
+            assert_eq!(decode(&cols(), bad, Q, lex()).predicate, "FALSE", "{bad}");
+        }
+    }
+
+    #[test]
+    fn timestamps_move_to_the_session_time_zone() {
+        let f = decode(&cols(), "`__sprig_ci`.ts <= NOW()", Q, lex());
+        assert_eq!(
+            f.predicate,
+            "COALESCE(FROM_UNIXTIME(TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', `__sprig_ci`.ts)) \
+             + INTERVAL MICROSECOND(`__sprig_ci`.ts) MICROSECOND, `__sprig_ci`.ts) <= NOW()"
+        );
+        assert!(f.columns.contains("`ts` datetime(3) PATH '$.\"ts\"'"));
     }
 }

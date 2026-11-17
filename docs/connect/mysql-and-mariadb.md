@@ -77,6 +77,8 @@ The database in the connection (`shop` above, or `CONNECT_WITH_DB` from a driver
 
 The same user and password work on every SprigDB protocol. See [Connect to SprigDB](overview.md#one-user-every-protocol).
 
+An account with the `token` login method can also log in with a token from the tenant's identity provider: send the token as the password, over TLS, with the default plugin or `mysql_clear_password`. The token's claims are then available to row-level security policies through `SPRIG_CLAIM`. See [Logins with identity provider tokens](../security/external-tokens.md#mysql-and-mariadb).
+
 ### Authentication plugins
 
 | Plugin | Supported | Notes |
@@ -183,7 +185,7 @@ Clients that don't support MySQL 4.1 authentication get 1251.
 | Temporary tables, `LOCK TABLES`, `GET_LOCK()`, `HANDLER` | yes | The session keeps its backend connection while they exist |
 | `SET NAMES`, character sets and collations | yes | |
 | `USE` | yes | |
-| `KILL [CONNECTION \| QUERY] id` | yes | Ids are the gateway's connection ids. You can kill your own user's sessions, and with `CONNECTION_ADMIN` any session of your tenant; another user's session otherwise fails with 1095. A killed statement returns 1317 |
+| `KILL [CONNECTION \| QUERY] id` | yes | Ids are the gateway's connection ids. You can kill your own user's sessions, and with `CONNECTION_ADMIN` any session of your tenant; another user's session otherwise fails with 1095. A killed statement returns 1317. A `COMMIT` of a transaction across shards that is killed still finishes, and answers its outcome: OK, or 39443 when it rolled back; 1317 only when the outcome is still unknown after `txn.commit_resolve_timeout_ms` |
 | `SHOW [FULL] PROCESSLIST` | yes | Your own user's sessions on this gateway |
 | Compression | yes | zlib on both; zstd on 3306 |
 | Query attributes | 3306 | |
@@ -293,6 +295,39 @@ const [rows] = await conn.execute('SELECT * FROM orders WHERE id = ?', [1]);
 - **Large statements** of `gateway.large_statement_bytes` (1 MiB) or more run on a separate thread, so they don't hold up other sessions.
 - **A gateway that drains** (for an upgrade or a shutdown) answers the next command with 39000 and closes the connection. Reconnect; another gateway takes the session.
 
+### Functional indexes and column dependencies on 3306
+
+On 3306, an unnamed functional index is named as MySQL names it: `functional_index`, then `functional_index_2` and so on. The name shows in `SHOW INDEX`, `SHOW CREATE TABLE` and `information_schema.STATISTICS`, and `DROP INDEX` takes it:
+
+```sql test
+CREATE TABLE codes (id INT PRIMARY KEY, code VARCHAR(20),
+  INDEX ((CAST(code AS SIGNED))), INDEX ((UPPER(code))));
+SELECT INDEX_NAME FROM information_schema.STATISTICS
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'codes' ORDER BY INDEX_NAME;
+```
+
+```text output
+INDEX_NAME
+functional_index
+functional_index_2
+PRIMARY
+```
+
+A value the index's expression can't convert fails as on MySQL, with 3751 (or 3752 for a value out of range), naming the index:
+
+```sql test-error
+-- 3751: Data truncated for functional index 'functional_index' at row 1
+INSERT INTO codes (id, code) VALUES (1, 'abc');
+```
+
+Renaming or dropping a column that a `CHECK` constraint or another column's default expression uses fails, as on MySQL, with 3959 or 3766. On 3307, MariaDB's own behaviour applies: a rename changes the definitions too, and a drop fails with 1054. A check that uses only the dropped column is dropped with it on both ports.
+
+```sql test-error
+-- 3959: Check constraint 'ranges_chk_1' uses column 'lo', hence column cannot be dropped or renamed.
+CREATE TABLE ranges (id INT PRIMARY KEY, lo INT, hi INT, CHECK (lo <= hi));
+ALTER TABLE ranges RENAME COLUMN lo TO low;
+```
+
 ## Errors you may see
 
 | Code | Name | When | What to do |
@@ -304,7 +339,7 @@ const [rows] = await conn.execute('SELECT * FROM orders WHERE id = ?', [1]);
 | 1227 | `ER_SPECIFIC_ACCESS_DENIED_ERROR` | Replication or server-administration commands; `SET GLOBAL` without `SYSTEM_VARIABLES_ADMIN`, or of a variable a tenant can't set | |
 | 1243 | `ER_UNKNOWN_STMT_HANDLER` | `EXECUTE` or `DEALLOCATE PREPARE` of a name the session hasn't prepared | `PREPARE` it first |
 | 1251 | `ER_NOT_SUPPORTED_AUTH_MODE` | A client without 4.1 authentication | Upgrade the client |
-| 1317 | `ER_QUERY_INTERRUPTED` | `KILL QUERY` stopped the statement | |
+| 1317 | `ER_QUERY_INTERRUPTED` | `KILL QUERY` stopped the statement; for a killed distributed `COMMIT`, its outcome is unknown | |
 | 3159 | `ER_SECURE_TRANSPORT_REQUIRED` | No TLS on a listener that requires it | Enable TLS in the client |
 | 3948 / 4166 | Local files disabled | `LOAD DATA LOCAL` without the client option, or with `sql.local_infile` off | Enable local files in the client |
 | 39000 | `ER_SPRIG_GATEWAY_DRAINING` | The gateway is shutting down | Reconnect |

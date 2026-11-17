@@ -1,7 +1,6 @@
-//! Inherited messaging objects in a tenant session (chapter 42,
-//! "Inherited messaging objects (`FOR EACH TENANT`)"; chapters 45 and 41;
-//! R9). Runs before the stream layer ([`PassSession::tenant_streams`]) and
-//! chapter 41's declarations:
+//! Inherited messaging objects (`FOR EACH TENANT`) in a tenant session.
+//! Runs before the stream layer ([`PassSession::tenant_streams`]) and the
+//! logic layer's declarations:
 //!
 //! ```text
 //! CREATE STREAM s FOR EACH TENANT [scope] ...      a definition: inherited_defs
@@ -10,7 +9,7 @@
 //!   [GRANTS (...)] LANGUAGE ... AS ...            a trigger definition; existing
 //!                                                 instances get it in the background
 //! ALTER STREAM s PARTITIONS n | SET (...)          changes the definition
-//! DROP STREAM s [IMMEDIATE] | DROP TRIGGER g        drops it (chapter 42, "Dropping")
+//! DROP STREAM s [IMMEDIATE] | DROP TRIGGER g        drops it
 //! INSERT INTO s ...                  in a member: into its own instance (created
 //!                                    on first publish); headers stamped
 //! INSERT INTO s FOR TENANT t ...     in an ancestor: into t's instance
@@ -40,6 +39,7 @@ use serde_json::{Map, Value, json};
 use sprig_auth::authz::{Action, Target};
 use sprig_catalog::TenantCatalog;
 use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::ObjectKind;
 use sprig_common::ids::TenantId;
 use sprig_common::{Result, SprigCode, SprigError};
@@ -265,8 +265,8 @@ enum Dest {
 }
 
 impl PassSession {
-    /// Chapter 42's step of [`PassSession::tenant_text`]: `None` when the
-    /// statement isn't about inherited messaging objects.
+    /// The inherited-messaging step of [`PassSession::tenant_text`]: `None`
+    /// when the statement isn't about inherited messaging objects.
     #[allow(clippy::too_many_lines)]
     pub(super) async fn tenant_inherit_msg(
         &mut self,
@@ -700,7 +700,7 @@ impl PassSession {
                     ),
                 )
             })?;
-        // Chapter 41's checks: code in the trigger's database, reading the
+        // The trigger checks: code in the trigger's database, reading the
         // stream; GRANTS are down-tree grants in every member.
         let lctn = ts.lower_case_table_names();
         let grants = crate::tenant::authz::privileges(ts, cat);
@@ -851,8 +851,8 @@ impl PassSession {
             .filter_map(|j| word(j).map(|w| w.to_ascii_lowercase()))
             .collect();
         // A member's instance: only ALTER INHERITED changes it. Not the
-        // declarer's own instance of an `INCLUDING SELF` definition
-        // (bugfix-39): there the statement names the definition, which
+        // declarer's own instance of an `INCLUDING SELF` definition:
+        // there the statement names the definition, which
         // the declarer could otherwise never drop (nor, by the 39895
         // guard, its database).
         if own.def(&db, kind, &name).is_none()
@@ -967,8 +967,7 @@ impl PassSession {
         )))
     }
 
-    /// `DROP STREAM | TRIGGER` of a definition (chapter 42, "Dropping a
-    /// definition"). A stream: refused while trigger definitions read it
+    /// `DROP STREAM | TRIGGER` of a definition. A stream: refused while trigger definitions read it
     /// (unless `CASCADE`); with `IMMEDIATE` every instance goes now, else
     /// the definition is `dropping` until `inherit.drop_grace_hours`.
     /// A trigger: its instances' jobs stop and it goes now (it holds no
@@ -1191,7 +1190,7 @@ pub(super) fn check_quota(svc: &TenantServices, cat: &TenantCatalog, own: &MsgSt
 pub(super) async fn next_object_id(svc: &TenantServices, t: TenantId) -> Result<u64> {
     use sprig_catalog::CatalogLocator;
     let ep = svc.locator.writer(t).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(|e| {
+    let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
         SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
     })?;
     Ok(ep.store.next_object_id(&mut conn).await?.0)
@@ -1199,97 +1198,35 @@ pub(super) async fn next_object_id(svc: &TenantServices, t: TenantId) -> Result<
 
 /// Every member holding an instance of stream definition `def` re-applies
 /// its derived state (settings, triggers, sinks) now, in the background;
-/// for a queue definition, its sinks (r9fanin). The number of instances.
+/// for a queue definition, its sinks. The number of instances.
 pub(super) async fn rollout(svc: &Arc<TenantServices>, def: DefKey) -> Result<usize> {
-    let entries = inherited::instances_of(svc, def).await?;
-    let n = entries.len();
+    // A stream's derived state, or a queue's sinks.
+    let n = crate::inherited::remote::rollout_here(svc, def).await?;
+    // Members in other DCs: their DC's gateways do the same.
     let svc = Arc::clone(svc);
     tokio::spawn(async move {
-        for e in entries {
-            // A stream's derived state, or (R9, r9fanin) a queue's sinks.
-            let r = Box::pin(crate::inherited::sinks::reapply_source(&svc, e.tenant, def))
-                .await
-                .and_then(|reached| {
-                    if reached {
-                        Ok(())
-                    } else {
-                        Err(SprigError::internal("the definition is gone"))
-                    }
-                });
-            if let Err(err) = r {
-                tracing::warn!(tenant = %e.tenant, def = %def, error = %err, "inherited instance not updated; its next use retries");
-            }
-        }
+        crate::inherited::remote::in_other_dcs(
+            &svc,
+            crate::inherited::remote::MemberOp::Rollout,
+            def,
+        )
+        .await;
     });
     Ok(n)
 }
 
 /// Stops and forgets every member's instance of trigger definition `g`:
-/// its job's index entry and its instance row (the member's module keeps
-/// its versions for the record). The number of instances.
+/// this DC's members, then those other DCs index (each DC's gateways stop
+/// their own). The number of instances.
 async fn drop_trigger_instances(svc: &Arc<TenantServices>, g: DefKey) -> Result<usize> {
-    use sprig_catalog::CatalogLocator;
-    // Trigger instances live with the members' stream instances.
-    let prefix = svc.locator.dc_store().tier().key("inherit-instances/")?;
-    let page = svc
-        .locator
-        .dc_store()
-        .list(
-            &prefix,
-            sprig_meta::ListOpts {
-                limit: 1_000_000,
-                ..sprig_meta::ListOpts::default()
-            },
-        )
-        .await?;
-    let tenants: std::collections::BTreeSet<TenantId> = page
-        .kvs
-        .iter()
-        .filter_map(|kv| {
-            sprig_meta::Record::<inherited::InstanceIndex>::decode(&kv.value)
-                .ok()
-                .map(|r| r.body.tenant)
-        })
-        .collect();
-    let mut n = 0;
-    for t in tenants {
-        // A member deleted since has nothing left to stop.
-        if inherited::dir_entry(svc, t).await?.is_none() {
-            continue;
-        }
-        let ep = svc.locator.writer(t).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-        })?;
-        let store = sprig_inherit::msg::MsgStore::new(ep.store.schema());
-        if let Some(i) = store.instance(&mut conn, g).await? {
-            if let Some(b) = i
-                .physical
-                .as_ref()
-                .and_then(|p| p.get("binding"))
-                .and_then(Value::as_u64)
-            {
-                sprig_logic::messages::delete_index(svc.locator.dc_store().as_ref(), t, b).await?;
-                // The job ends at its next check; its module stays, marked.
-                let _ = conn
-                    .exec_drop(
-                        format!(
-                            "UPDATE {}.logic_modules SET state = 'dropped' WHERE module_id = ?",
-                            sprig_common::names::quote(ep.store.schema())
-                        ),
-                        (i.physical
-                            .as_ref()
-                            .and_then(|p| p.get("module"))
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),),
-                    )
-                    .await;
-            }
-            store.delete_instance(&mut conn, g).await?;
-            n += 1;
-        }
-    }
-    Ok(n)
+    let here = crate::inherited::remote::drop_trigger_here(svc, g).await?;
+    let there = crate::inherited::remote::in_other_dcs(
+        svc,
+        crate::inherited::remote::MemberOp::DropTrigger,
+        g,
+    )
+    .await;
+    Ok(here + usize::try_from(there).unwrap_or(0))
 }
 
 impl PassSession {
@@ -1578,7 +1515,7 @@ impl PassSession {
                 }
                 if in_txn {
                     // Through this tenant's cross-tenant outbox: the record
-                    // exists only if the transaction commits (chapter 42).
+                    // exists only if the transaction commits.
                     let strict = svc.settings.get(
                         &sprig_inherit::msg::settings::CROSS_TENANT_MESSAGING_STRICT,
                         &cat.setting_ctx(&svc.dc),
@@ -1645,7 +1582,7 @@ impl PassSession {
                     let cluster = svc.locator.cluster(si.tenant).await?;
                     let pool = svc.locator.ctl_pool(&cluster).await?;
                     let mut c = pool
-                        .get_conn()
+                        .get_conn_bounded()
                         .await
                         .map_err(sprig_streams::maria::map_err)?;
                     c.query_drop(ins)
@@ -1670,7 +1607,7 @@ impl PassSession {
         Ok(Reply::Ok(total, notes))
     }
 
-    /// `ALTER INHERITED ...` (chapter 42, "Overrides: nearest level wins").
+    /// `ALTER INHERITED ...`: overrides, the nearest level wins.
     #[allow(clippy::too_many_lines)]
     async fn inherit_alter(
         &mut self,
@@ -1923,87 +1860,24 @@ impl PassSession {
         }
         let v = inherited::commit(svc, me, &writes).await?;
         self.after_own_change(v).await?;
-        // Members with an instance apply it now.
-        let stream_key = match def.kind {
-            DefKind::Stream => Some(def.key()),
-            DefKind::Trigger => {
-                let spec: TriggerSpec =
-                    serde_json::from_value(def.definition.clone()).unwrap_or_default();
-                chain
-                    .resolve(&spec.source_db, DefKind::Stream, &spec.source_name)
-                    .or_else(|| {
-                        own.def(&spec.source_db, DefKind::Stream, &spec.source_name)
-                            .cloned()
-                    })
-                    .map(|d| d.key())
-            }
-            _ => None,
-        };
-        let mut reached = 0;
-        // Exchanges, queues, bindings and triggers on queues: the members'
-        // vhosts apply it now.
-        let mq_db = match def.kind {
-            DefKind::Exchange | DefKind::Queue | DefKind::Binding => Some(def.db_name.clone()),
-            DefKind::Trigger => {
-                let spec: TriggerSpec =
-                    serde_json::from_value(def.definition.clone()).unwrap_or_default();
-                (spec.source_kind == "queue").then_some(spec.source_db)
-            }
-            _ => None,
-        };
-        if let Some(mdb) = mq_db {
-            let mut members = std::collections::BTreeSet::new();
-            for d in inherited::mq::declared_in(chain, &mdb)
-                .into_iter()
-                .chain(inherited::mq::defs_in(chain, &mdb))
-            {
-                for e in inherited::instances_of(svc, d.key()).await? {
-                    members.insert(e.tenant);
-                }
-            }
-            for t in members {
-                let hit = t == target
-                    || (applies == AppliesTo::Subtree
-                        && inherited::dir_entry(svc, t)
-                            .await?
-                            .is_some_and(|d| d.path_ids().contains(&target.0)));
-                if !hit {
-                    continue;
-                }
-                inherited::mq::forget_applied(t, Some(&mdb));
-                let tcat = inherited::catalog(svc, t).await?;
-                let tchain = inherited::chain(svc, &tcat).await?;
-                if Box::pin(inherited::mq::ensure_vhost(
-                    svc,
-                    &tchain,
-                    &mdb,
-                    Cause::Declare,
-                ))
-                .await?
-                {
-                    reached += 1;
-                }
-            }
-        }
-        if let Some(sk) = stream_key {
-            for e in inherited::instances_of(svc, sk).await? {
-                let hit = e.tenant == target
-                    || (applies == AppliesTo::Subtree
-                        && inherited::dir_entry(svc, e.tenant)
-                            .await?
-                            .is_some_and(|d| d.path_ids().contains(&target.0)));
-                if !hit {
-                    continue;
-                }
-                streams::forget_applied(e.tenant, sk);
-                let tcat = inherited::catalog(svc, e.tenant).await?;
-                let tchain = inherited::chain(svc, &tcat).await?;
-                if let Some(d) = tchain.def(sk) {
-                    Box::pin(streams::ensure(svc, &tchain, &d, Cause::Declare)).await?;
-                    reached += 1;
-                }
-            }
-        }
+        // Members with an instance apply it now: this DC's, then those
+        // other DCs index.
+        let mut reached =
+            inherited::remote::apply_override_here(svc, chain, &def, target, applies).await?;
+        reached += usize::try_from(
+            inherited::remote::in_other_dcs(
+                svc,
+                inherited::remote::MemberOp::Override {
+                    by: me,
+                    version: v,
+                    target,
+                    subtree: applies == AppliesTo::Subtree,
+                },
+                def.key(),
+            )
+            .await,
+        )
+        .unwrap_or(0);
         Ok(Reply::Ok(
             0,
             vec![format!(
@@ -2033,9 +1907,23 @@ impl PassSession {
             ShowInherited::Definitions => {
                 let mut rows = Vec::new();
                 for d in own.defs.values() {
-                    let n = inherited::instances_of(svc, d.key())
+                    let counted =
+                        matches!(d.kind, DefKind::Stream | DefKind::Exchange | DefKind::Queue);
+                    let mut n = inherited::instances_of(svc, d.key())
                         .await
                         .map_or(0, |v| v.len());
+                    // Members homed in other DCs: their DCs count them.
+                    if counted {
+                        n += usize::try_from(
+                            inherited::remote::in_other_dcs(
+                                svc,
+                                inherited::remote::MemberOp::Count,
+                                d.key(),
+                            )
+                            .await,
+                        )
+                        .unwrap_or(0);
+                    }
                     rows.push(vec![
                         Some(d.kind.as_str().to_owned()),
                         Some(d.db_name.clone()),
@@ -2043,16 +1931,7 @@ impl PassSession {
                         Some(serde_json::to_string(&d.scope).unwrap_or_default()),
                         Some(d.def_version.to_string()),
                         Some(d.state.as_str().to_owned()),
-                        Some(
-                            if matches!(
-                                d.kind,
-                                DefKind::Stream | DefKind::Exchange | DefKind::Queue
-                            ) {
-                                n.to_string()
-                            } else {
-                                "-".into()
-                            },
-                        ),
+                        Some(if counted { n.to_string() } else { "-".into() }),
                     ]);
                 }
                 Ok(Reply::Rows(
@@ -2074,7 +1953,7 @@ impl PassSession {
                 let live: std::collections::BTreeMap<DefKey, sprig_inherit::msg::Instance> = {
                     use sprig_catalog::CatalogLocator;
                     let ep = svc.locator.writer(me).await?;
-                    let mut conn = ep.pool.get_conn().await.map_err(|e| {
+                    let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
                         SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable")
                             .with_source(e)
                     })?;
@@ -2126,7 +2005,7 @@ impl PassSession {
                                             p.get("waiting_config").is_some()
                                                 || p.get("error").is_some()
                                         }) {
-                                            // R9 (r9more): an inherited sink waiting for its
+                                            // An inherited sink waiting for its
                                             // member's configuration (39241), or not deployable.
                                             if p.get("waiting_config").is_some() {
                                                 "waiting_config".to_owned()
@@ -2269,8 +2148,8 @@ impl PassSession {
 
 impl PassSession {
     /// `INSERT INTO db.s IN TENANT a ...`: a descendant's session publishes
-    /// into an ancestor's ordinary stream (chapter 45, "One platform
-    /// stream for every client"): only when the stream's owner set
+    /// into an ancestor's ordinary stream (one platform stream for every
+    /// client): only when the stream's owner set
     /// `stream.descendant_publish = on`; with `stream.descendant_key =
     /// origin` every record's key is the publishing tenant's name (39957
     /// for another); `x-sprig-origin-tenant` is stamped; under
@@ -2450,7 +2329,7 @@ impl PassSession {
         let cluster = svc.locator.cluster(owner).await?;
         let pool = svc.locator.ctl_pool(&cluster).await?;
         let mut c = pool
-            .get_conn()
+            .get_conn_bounded()
             .await
             .map_err(sprig_streams::maria::map_err)?;
         c.query_drop(ins)
@@ -2521,8 +2400,7 @@ impl PassSession {
 
 impl PassSession {
     /// `CREATE EXCHANGE | QUEUE ... FOR EACH TENANT`, `BIND QUEUE |
-    /// EXCHANGE ... FOR EACH TENANT` (chapter 50, "Inherited exchanges,
-    /// queues and bindings"): definitions in this tenant; members make
+    /// EXCHANGE ... FOR EACH TENANT`: definitions in this tenant; members make
     /// their instances on first use.
     #[allow(clippy::too_many_lines)]
     async fn define_mq(
@@ -2632,8 +2510,8 @@ impl PassSession {
                 arguments,
             } => {
                 let db = db_of(db)?;
-                // Both ends are definitions of this tenant (chapter 50: a
-                // binding between two inherited objects is inherited).
+                // Both ends are definitions of this tenant (a binding
+                // between two inherited objects is inherited).
                 let dk = if dest_kind == "exchange" {
                     DefKind::Exchange
                 } else {
@@ -2799,7 +2677,7 @@ impl PassSession {
 
     /// A `sprig.mq_publish` in this session naming an inherited exchange
     /// (or, through the default exchange, an inherited queue) of vhost
-    /// database `db` (chapter 50, "Publishing by target tenant"):
+    /// database `db` (publishing by target tenant):
     /// `Some(routed)` when it was handled here (a targeted publish, or a
     /// refusal), `None` to go on with the ordinary path, with `m` stamped
     /// when it goes into this tenant's own instance.
@@ -2960,8 +2838,7 @@ impl PassSession {
 
 impl PassSession {
     /// `INSERT INTO s FOR ALL TENANTS [WITH INSTANCE] [UNDER t] ...` (or
-    /// `FOR TENANT '*'`): each row is one broadcast (chapter 42,
-    /// "Broadcast"): its log row now, or, inside a transaction, a row of
+    /// `FOR TENANT '*'`): each row is one broadcast: its log row now, or, inside a transaction, a row of
     /// this tenant's cross-tenant outbox that becomes it at commit.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn inherit_broadcast(
@@ -3082,7 +2959,7 @@ impl PassSession {
 }
 
 impl PassSession {
-    /// `SELECT ... FROM s FAN IN ...` (chapter 42, "Fan-in"): the members'
+    /// `SELECT ... FROM s FAN IN ...`: the members'
     /// instances as one derived table (see [`inherited::fanin`]).
     async fn fan_in_select(
         &mut self,
@@ -3140,52 +3017,23 @@ impl PassSession {
 /// Re-applies database `db`'s inherited exchanges, queues and bindings in
 /// every member of `declarer`'s definitions that has instances there, in
 /// the background (a new definition, an override); with `unbind`, also
-/// removes that binding in each first. The number of members.
+/// removes that binding in each first. Members homed in other DCs: a
+/// gateway of each other DC does the same for the members its DC indexes.
+/// The number of members in this DC.
 async fn mq_rollout(
     svc: &Arc<TenantServices>,
     declarer: TenantId,
     db: &str,
     unbind: Option<&sprig_inherit::msg::BindingSpec>,
 ) -> Result<usize> {
-    let mut members: std::collections::BTreeSet<TenantId> = std::collections::BTreeSet::new();
-    let dcat = inherited::catalog(svc, declarer).await?;
-    let dchain = inherited::chain(svc, &dcat).await?;
-    for d in inherited::mq::declared_in(&dchain, db) {
-        for e in inherited::instances_of(svc, d.key()).await? {
-            members.insert(e.tenant);
-        }
-    }
-    let n = members.len();
+    let n = inherited::mq::rollout_here(svc, declarer, db, unbind.cloned()).await?;
+    let p = inherited::remote::MqRolloutPayload {
+        db: db.to_owned(),
+        unbind: unbind.cloned(),
+    };
     let svc = Arc::clone(svc);
-    let db = db.to_owned();
-    let unbind = unbind.cloned();
     tokio::spawn(async move {
-        for t in members {
-            inherited::mq::forget_applied(t, Some(&db));
-            let r = async {
-                if let Some(b) = &unbind {
-                    // Only the binding goes; the vhost's other instances are
-                    // applied at its next use (a drop is often followed by
-                    // more drops).
-                    return inherited::mq::remove_binding(&svc, t, &db, b)
-                        .await
-                        .map(|()| true);
-                }
-                let cat = inherited::catalog(&svc, t).await?;
-                let chain = inherited::chain(&svc, &cat).await?;
-                Box::pin(inherited::mq::ensure_vhost(
-                    &svc,
-                    &chain,
-                    &db,
-                    Cause::Declare,
-                ))
-                .await
-            }
-            .await;
-            if let Err(e) = r {
-                tracing::warn!(tenant = %t, %db, error = %e, "inherited exchanges and queues not updated; the next use retries");
-            }
-        }
+        inherited::remote::mq_rollout_in_other_dcs(&svc, declarer, &p).await;
     });
     Ok(n)
 }
@@ -3194,8 +3042,8 @@ async fn mq_rollout(
 const NO_INSTANCE: u64 = u64::MAX - 42;
 
 /// A read naming an inherited stream the member has no instance of yet:
-/// the statement with that stream as an empty table (chapter 42: reads
-/// never create an instance; an instance not created yet has no records).
+/// the statement with that stream as an empty table (reads never create
+/// an instance; an instance not created yet has no records).
 /// `None` when the read names none.
 fn empty_reads(
     sql: &str,

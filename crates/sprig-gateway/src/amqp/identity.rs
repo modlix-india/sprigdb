@@ -14,13 +14,19 @@
 //! `EXTERNAL` takes the user name from a verified client certificate
 //! (`amqp.cert_login_field`); only an account that asks for a certificate
 //! may log in that way, without a password.
+//!
+//! Residency: a tenant pinned to other DCs has `PLAIN` logins handed to
+//! an allowed DC (as HTTP Basic); `EXTERNAL` has no password to hand
+//! over, so it is refused there (39301 naming the DCs, 39302 with
+//! `deny_remote_access`) without loading the account.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use sprig_auth::LoginSource;
 use sprig_auth::account::parse_login;
-use sprig_auth::mysql::{LoginRequest, LoginService, MysqlLogin, Principal as AuthPrincipal};
+use sprig_auth::handoff::ResidentLogin;
+use sprig_auth::mysql::{LoginRequest, LoginService, Principal as AuthPrincipal};
 use sprig_auth::store::LoginForm;
 use sprig_common::ids::DcId;
 use sprig_proto_amqp::auth::{AuthFailure, ConnInfo, Credentials, Identity, Principal};
@@ -104,7 +110,7 @@ fn principal(p: &AuthPrincipal) -> Principal {
 }
 
 async fn decide(
-    mut login: MysqlLogin,
+    mut login: ResidentLogin,
     outcome: Outcome,
     path: AuthPath,
 ) -> Result<Principal, AuthFailure> {
@@ -151,17 +157,22 @@ impl Identity for AmqpIdentity {
             // login.
             Credentials::External { login } => {
                 let name = self.login_name(c, &login);
-                let l = self.svc.start_http(request(name)).await;
+                let req = request(name);
+                if let Some(e) = self.svc.local_only(&req, "EXTERNAL").await {
+                    return Err(AuthFailure(e.to_string()));
+                }
+                let l = self.svc.start_http(req).await;
                 let outcome = if l.certificate_account() {
                     Outcome::Verified
                 } else {
                     Outcome::WrongCredentials
                 };
-                return decide(l, outcome, AuthPath::Full).await;
+                return decide(ResidentLogin::Local(Box::new(l)), outcome, AuthPath::Full).await;
             }
         };
         let name = self.login_name(c, &user);
-        let mut login = self.svc.start_http(request(name)).await;
+        // Decided here, handed to an allowed DC, or refused (residency).
+        let mut login = self.svc.begin_http(request(name)).await;
         let (outcome, path) = if login.check_clear_fast(&password) {
             (Outcome::Verified, AuthPath::Fast)
         } else if login.check_password(Zeroizing::new(password)).await {

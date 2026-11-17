@@ -748,8 +748,15 @@ async fn verify(
                     if l.unique {
                         let mut txn = DirectTxn::new(Arc::clone(pools), BACKFILL_LOCK_WAIT_SECS);
                         let r = super::claim(&mut txn, p, l, &value, &owner).await;
+                        // A lookup a re-key rebuilds raises 1062 where a new
+                        // one counts the conflict: both are a real duplicate.
+                        let dup = match &r {
+                            Ok(super::ClaimResult::ConflictCounted) => true,
+                            Err(e) => l.rehashing && errno(e) == Some(1062),
+                            Ok(_) => false,
+                        };
                         match r {
-                            Ok(super::ClaimResult::ConflictCounted) => {
+                            _ if dup => {
                                 // A real duplicate: counted, and the
                                 // verification goes on, so the failure
                                 // can name every value to fix.
@@ -1001,11 +1008,13 @@ pub async fn orphan_scan(
                     }
                     Err(e) => {
                         t.rollback().await;
+                        metrics::counter!("sprig_lookup_orphans_removed_total").increment(removed);
                         return Err(e);
                     }
                 }
             }
         }
     }
+    metrics::counter!("sprig_lookup_orphans_removed_total").increment(removed);
     Ok(removed)
 }

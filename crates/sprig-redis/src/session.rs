@@ -502,6 +502,9 @@ impl Session {
                 Box::pin(self.eval(name, a, in_txn)).await
             }
             "fcall" | "fcall_ro" => Box::pin(self.fcall(name, a, in_txn)).await,
+            _ if name.starts_with("ft.") && !spec.has('x') => {
+                Ok(vec![Box::pin(self.ft(name, a, in_txn)).await])
+            }
             "script" => Ok(vec![self.script(a).await]),
             "function" => Ok(vec![self.function(a).await]),
             "blpop" | "brpop" | "blmove" | "brpoplpush" | "blmpop" | "bzpopmin" | "bzpopmax"
@@ -1972,6 +1975,46 @@ impl Session {
             )
             .await?;
         Ok(vec![out])
+    }
+
+    /// An `FT.*` command, through the gateway's hook.
+    async fn ft(&mut self, name: &str, a: &[Bytes], in_txn: bool) -> Frame {
+        if in_txn {
+            return Frame::err(&format!(
+                "{} isn't allowed inside MULTI or scripts",
+                name.to_ascii_uppercase()
+            ));
+        }
+        let env = Arc::clone(&self.env);
+        let Some(hook) = env.search() else {
+            return reply::sprig(
+                sprig_common::SprigCode::SearchUnavailable,
+                "search isn't running on this gateway",
+            );
+        };
+        // FT.CREATE needs the namespace's tables.
+        if let Err(e) = self.ensure_db(self.db).await {
+            return reply::backend(&e);
+        }
+        let resp3 = self.resp3();
+        let db = self.db;
+        let Some(login) = self.login.as_mut() else {
+            return Frame::error("NOAUTH Authentication required.");
+        };
+        let database = env.config().logical_database;
+        let scope = login.scope.clone();
+        hook.ft(
+            login.sql.as_mut(),
+            crate::search::FtCall {
+                command: name,
+                args: &a[1..],
+                scope: &scope,
+                database: &database,
+                db,
+                resp3,
+            },
+        )
+        .await
     }
 
     /// `FCALL` of a logic-layer function, through the gateway's hook.

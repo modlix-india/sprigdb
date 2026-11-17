@@ -258,7 +258,9 @@ async fn live_autoindex_admin() {
                 &CreateTenantRequest {
                     name: name.clone(),
                     parent: None,
-                    cluster: None,
+                    // On lt-c1: least-busy placement (no hint) reads DC
+                    // records, which only the real global tier holds.
+                    cluster: Some(sprig_common::ids::ClusterId::new("lt-c1").unwrap()),
                 },
                 &[],
             )

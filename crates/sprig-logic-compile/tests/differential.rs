@@ -338,6 +338,7 @@ impl Suite {
         };
         let lim = Limits {
             max_loop_iterations: max_loops,
+            ..Limits::default()
         };
         interp::run(c.ir.as_ref().unwrap(), args, &mut db, &lim)
             .map(|o| (o.event, o.result))

@@ -1,5 +1,5 @@
 //! The gateway's registration against a real etcd while its write-load
-//! report is far over the 64 KiB record limit (r1diff, R1 gate GR7: the
+//! report is far over the 64 KiB record limit (a regression: the
 //! report reached 83,638 bytes and every registration write failed, every
 //! 5 s, for hours).
 //!
@@ -112,6 +112,7 @@ async fn registration_keeps_refreshing_with_a_huge_load_report() {
         authorizers: vec![],
         load: Load::default(),
         kafka_host: None,
+        degraded: std::collections::BTreeMap::new(),
     });
     let task = r
         .start(

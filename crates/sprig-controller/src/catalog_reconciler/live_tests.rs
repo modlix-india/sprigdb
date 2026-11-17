@@ -28,6 +28,18 @@ use sprig_meta::{MemStore, MetaStore, Op, Tier, Txn};
 
 use super::*;
 
+/// No table group has a shard map, so a shard schema of a group other than
+/// a database's default one is an orphan (without group maps the reconciler
+/// treats every such schema as known).
+struct NoGroupMaps;
+
+#[async_trait::async_trait]
+impl GroupMaps for NoGroupMaps {
+    async fn groups(&self, _tenant: TenantId) -> Result<BTreeSet<GroupId>> {
+        Ok(BTreeSet::new())
+    }
+}
+
 const MARIADB_ENV: &str = "SPRIG_TEST_MARIADB_SINGLE";
 
 fn unique() -> (TenantId, String) {
@@ -127,6 +139,7 @@ async fn live_reconciler_repairs_crashes_and_outside_changes() {
             current_db: Some("billing"),
             user: None,
             lower_case_table_names: false,
+            wait: None,
         };
         let table = |name: &str| DdlStatement::CreateObject {
             kind: ObjectKind::Table,
@@ -226,7 +239,8 @@ async fn live_reconciler_repairs_crashes_and_outside_changes() {
             None,
             Arc::new(SystemClock),
         )
-        .with_config(cfg);
+        .with_config(cfg)
+        .with_group_maps(Arc::new(NoGroupMaps));
         let r = rec.pass(tenant).await.unwrap();
         assert!(r.errors.is_empty(), "{:?}", r.errors);
         let mut labels: Vec<&str> = r.resolved.iter().map(|(_, r)| r.label()).collect();

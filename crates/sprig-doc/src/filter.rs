@@ -183,6 +183,12 @@ fn bad(msg: impl Into<String>) -> MongoError {
     MongoError::new(code::BAD_VALUE, msg)
 }
 
+/// A DBRef's fields `$ref`, `$id` and `$db`: field names in a filter, not
+/// operators (`{members: {$elemMatch: {$id: x}}}`).
+fn is_dbref_field(k: &str) -> bool {
+    matches!(k, "$ref" | "$id" | "$db")
+}
+
 /// Parses a filter document.
 ///
 /// # Errors
@@ -191,7 +197,7 @@ fn bad(msg: impl Into<String>) -> MongoError {
 pub fn parse(filter: &Document) -> Result<Pred, MongoError> {
     let mut all = Vec::new();
     for (k, v) in filter {
-        if let Some(op) = k.strip_prefix('$') {
+        if let Some(op) = k.strip_prefix('$').filter(|_| !is_dbref_field(k)) {
             match op {
                 "and" | "or" | "nor" => {
                     let Bson::Array(a) = v else {
@@ -350,6 +356,7 @@ fn parse_ops(d: &Document) -> Result<Vec<FieldOp>, MongoError> {
                 let ops_only = !e.is_empty()
                     && e.keys().all(|k| {
                         k.starts_with('$')
+                            && !is_dbref_field(k)
                             && !matches!(k.as_str(), "$and" | "$or" | "$nor" | "$expr")
                     });
                 if e.contains_key("$where") {

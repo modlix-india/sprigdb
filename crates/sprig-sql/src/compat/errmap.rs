@@ -144,6 +144,13 @@ pub fn to_mysql(e: &WireError) -> Option<WireError> {
                 ))
             }
         }
+        // A trigger's FOLLOWS or PRECEDES naming no trigger of that timing
+        // and event: MySQL's number, and its full stop.
+        4031 if e.message.starts_with("Referenced trigger ") => Some(WireError::new(
+            3011,
+            *b"HY000",
+            format!("{}.", e.message.trim_end().trim_end_matches('.')),
+        )),
         1451 if e.message.trim_end()
             == "Cannot delete or update a parent row: a foreign key constraint fails" =>
         {
@@ -319,6 +326,14 @@ pub fn reworded(e: &WireError) -> Option<WireError> {
 /// multi-table updates.
 #[must_use]
 pub fn dup_key_table(sql: &[u8], opts: &crate::lex::LexOptions) -> Option<String> {
+    dml_target(sql, opts).map(|(_, t)| t)
+}
+
+/// The target of a single-table `INSERT`, `REPLACE`, `UPDATE` or `LOAD
+/// DATA`: its database, when the statement names one, and its name.
+/// `None` for other statements and multi-table updates.
+#[must_use]
+pub fn dml_target(sql: &[u8], opts: &crate::lex::LexOptions) -> Option<(Option<String>, String)> {
     use crate::lex::{self, TokenKind};
     let head = sql.trim_ascii_start();
     let starts = |w: &[u8]| head.len() >= w.len() && head[..w.len()].eq_ignore_ascii_case(w);
@@ -353,10 +368,11 @@ pub fn dup_key_table(sql: &[u8], opts: &crate::lex::LexOptions) -> Option<String
             .then(|| String::from_utf8_lossy(&lex::ident_value(tk.bytes(sql))).into_owned())
     };
     let mut name = name_at(j)?;
+    let mut db = None;
     if t.get(j + 1)
         .is_some_and(|tk| tk.kind == TokenKind::Punct && tk.bytes(sql) == b".")
     {
-        name = name_at(j + 2)?;
+        db = Some(std::mem::replace(&mut name, name_at(j + 2)?));
         j += 2;
     }
     // A single-table UPDATE sets right after its table (or alias).
@@ -369,7 +385,7 @@ pub fn dup_key_table(sql: &[u8], opts: &crate::lex::LexOptions) -> Option<String
             return None;
         }
     }
-    Some(name)
+    Some((db, name))
 }
 
 /// A `1062`'s message with MySQL's `'table.key'` form, given the target
@@ -421,6 +437,21 @@ mod tests {
                 3024,
                 *b"HY000",
                 "Query execution was interrupted, maximum statement execution time exceeded"
+                    .to_owned()
+            ))
+        );
+        // A trigger's FOLLOWS naming another timing's trigger (both servers'
+        // texts measured on 15 November 2026).
+        assert_eq!(
+            map(
+                4031,
+                b"HY000",
+                "Referenced trigger 'tf1' for the given action time and event type does not exist"
+            ),
+            Some((
+                3011,
+                *b"HY000",
+                "Referenced trigger 'tf1' for the given action time and event type does not exist."
                     .to_owned()
             ))
         );
@@ -602,6 +633,14 @@ mod tests {
         );
         assert_eq!(t("SELECT 1"), None);
         assert_eq!(
+            dml_target(b"insert ignore into shop.`Orders` (a) values (1)", &o),
+            Some((Some("shop".to_owned()), "Orders".to_owned()))
+        );
+        assert_eq!(
+            dml_target(b"UPDATE p SET u = 1", &o),
+            Some((None, "p".to_owned()))
+        );
+        assert_eq!(
             dup_key_message("Duplicate entry '1' for key 'PRIMARY'", "p").as_deref(),
             Some("Duplicate entry '1' for key 'p.PRIMARY'")
         );
@@ -617,7 +656,7 @@ mod tests {
     }
 
     // Captured from MySQL 8.4.11 and MariaDB 11.8 on 15 November 2026
-    // (SQLancer found it, r1diff GR8): `CREATE UNIQUE INDEX i0 ON t1(c0)
+    // (SQLancer found it): `CREATE UNIQUE INDEX i0 ON t1(c0)
     // INVISIBLE` where `c0` is NOT NULL and t1 has no primary key.
     #[test]
     fn an_invisible_primary_key_reads_mysql() {

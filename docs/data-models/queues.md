@@ -195,6 +195,7 @@ COMMIT;
 - `properties` is a JSON object with RabbitMQ's property names: `content_type`, `content_encoding`, `headers` (an object), `delivery_mode`, `priority`, `correlation_id`, `reply_to`, `expiration`, `message_id`, `timestamp`, `type`, `user_id`, `app_id`. `NULL` means none. Messages are persistent unless `delivery_mode` is 1.
 - With `mandatory = 1`, a message that reaches no queue is an error (`ER_SPRIG_MQ_UNROUTABLE`, 39255).
 - `vhost` is a virtual host name; `NULL` or absent means `/`.
+- A message above `amqp.max_message_bytes` is refused with 39257 before it is routed, whether or not it would reach a queue. The limit is the virtual host's: its database's value first, then the tenant's, the data centre's and the global one. Without `vhost`, that is `/` (the database `amqp.default_vhost_database` names), not the session's current database.
 
 The example above needs the exchange `orders`, declared by an AMQP client. You can try the call in any database without one: the default exchange `""` routes to the queue named by the routing key, and here no queue `billing` exists yet, so the message reaches none. `DATABASE()` names the current database as the virtual host.
 
@@ -211,6 +212,20 @@ With `mandatory` set to 1, the same publish fails:
 
 ```sql test-error
 CALL sprig.mq_publish('', 'billing', 'hello', NULL, 1, DATABASE());  -- ER_SPRIG_MQ_UNROUTABLE (39255)
+```
+
+A message over the virtual host's `amqp.max_message_bytes` fails before routing:
+
+```sql test
+ALTER DATABASE SPRIG SET (amqp.max_message_bytes = 100);
+```
+
+```sql test-error
+CALL sprig.mq_publish('', 'billing', REPEAT('x', 200), NULL, 0, DATABASE());  -- ER_SPRIG_MQ_MESSAGE_TOO_LARGE (39257)
+```
+
+```sql test
+ALTER DATABASE SPRIG RESET (amqp.max_message_bytes);
 ```
 
 ### Take and acknowledge inside a transaction
@@ -295,7 +310,7 @@ To publish every committed change of a table to an exchange, set `queue.change_e
 ALTER TABLE orders SPRIG SET (queue.change_exchange = 'orders.changes');
 ```
 
-Each change is published to that exchange, in the table's database, with routing key `<db>.<table>.<op>` (for example `shop.orders.u`) and the [change topic](streams.md) envelope as a JSON body. Changes are published as the user who ran the `ALTER TABLE`, so that user's privileges and row-level security decide what is sent: an update that hides or reveals a row goes out as a delete or an insert. Delivery is at least once, in commit order. Reset the setting to stop. Consumers that need replay should read a change topic instead. See [Change feed](../concepts/change-feed.md).
+Each change is published to that exchange, in the table's database, with routing key `<db>.<table>.<op>` (for example `shop.orders.u`) and the [change topic](streams.md) envelope as a JSON body. Changes are published as the user who ran the `ALTER TABLE`, so that user's privileges and row-level security decide what is sent: an update that hides or reveals a row goes out as a delete or an insert. Each change goes into each queue exactly once, in commit order: it has a fixed message id, and a queue takes an id only once, even when the change is published again after a crash (within a day). Reset the setting to stop. Consumers that need replay should read a change topic instead. See [Change feed](../concepts/change-feed.md).
 
 ## Queues for every tenant
 

@@ -14,16 +14,22 @@
 //!          COMMIT
 //! ```
 //!
+//! Each transaction's own GTID is read after its commit (`@@last_gtid`,
+//! compared with its value before, so a transaction that logged nothing
+//! names none): the sequencer tells its own writes in the feed by them
+//! ([`LogStore::take_own`]).
+//!
 //! Statements are text with hex literals, so batches of any size share no
 //! prepared-statement shapes. The pool comes from a [`PoolSource`] on every
 //! call, so after a move the log is written on the tenant's new cluster.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use mysql_async::prelude::Queryable;
 use mysql_async::{Pool, TxOpts};
+use sprig_binlog::{Gtid, GtidPos};
 use sprig_common::names::quote;
 use sprig_common::{Result, SprigCode, SprigError};
 
@@ -104,6 +110,8 @@ pub struct MariaLog {
     stream: StreamId,
     schema: String,
     outbox_schemas: Vec<String>,
+    /// GTIDs of its own commits not yet taken ([`LogStore::take_own`]).
+    own: Mutex<Vec<Gtid>>,
 }
 
 impl std::fmt::Debug for MariaLog {
@@ -129,6 +137,22 @@ impl MariaLog {
             stream,
             schema: schema.into(),
             outbox_schemas,
+            own: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Notes the GTID of a commit on `c` whose session GTID was `before`
+    /// (unchanged: the commit logged nothing).
+    async fn note_own(&self, c: &mut mysql_async::Conn, before: Option<String>) {
+        let after: Option<String> = c.query_first("SELECT @@last_gtid").await.ok().flatten();
+        if after.is_some()
+            && after != before
+            && let Some(g) = after.as_deref().and_then(|a| a.parse::<Gtid>().ok())
+        {
+            self.own
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(g);
         }
     }
 
@@ -216,7 +240,12 @@ impl LogStore for MariaLog {
         .await
         .map_err(map_err)?;
         let start = Start::decode(resume)?;
+        let before: Option<String> = tx
+            .query_first("SELECT @@last_gtid")
+            .await
+            .map_err(map_err)?;
         tx.commit().await.map_err(map_err)?;
+        self.note_own(&mut c, before).await;
         Ok(Acquired { epoch, start })
     }
 
@@ -227,17 +256,18 @@ impl LogStore for MariaLog {
             .start_transaction(TxOpts::default())
             .await
             .map_err(map_err)?;
-        let now: Option<u32> = tx
+        let now: Option<(u32, Option<String>)> = tx
             .exec_first(
                 format!(
-                    "SELECT leader_epoch FROM {} WHERE stream_id = ? AND partition_no = ? FOR UPDATE",
+                    "SELECT leader_epoch, @@last_gtid FROM {} WHERE stream_id = ? AND partition_no = ? FOR UPDATE",
                     self.ckpt()
                 ),
                 (self.stream.0, SHARD_ROW),
             )
             .await
             .map_err(map_err)?;
-        let now = LeaderEpoch(now.unwrap_or(0));
+        let (now, before) = now.unwrap_or((0, None));
+        let now = LeaderEpoch(now);
         if now != epoch {
             tx.rollback().await.map_err(map_err)?;
             return Ok(AppendOutcome::Fenced { now });
@@ -354,6 +384,7 @@ impl LogStore for MariaLog {
         .await
         .map_err(map_err)?;
         tx.commit().await.map_err(map_err)?;
+        self.note_own(&mut c, before).await;
         Ok(AppendOutcome::Appended(out))
     }
 
@@ -362,10 +393,19 @@ impl LogStore for MariaLog {
             return Ok(());
         }
         let mut c = self.conn().await?;
+        // One transaction: one write of its own after the append.
+        let mut tx = c
+            .start_transaction(TxOpts::default())
+            .await
+            .map_err(map_err)?;
+        let before: Option<String> = tx
+            .query_first("SELECT @@last_gtid")
+            .await
+            .map_err(map_err)?;
         for schema in &self.outbox_schemas {
             for chunk in outbox_ids.chunks(1000) {
                 let ids: Vec<String> = chunk.iter().map(|i| hex_literal(i)).collect();
-                c.query_drop(format!(
+                tx.query_drop(format!(
                     "DELETE FROM {}.{} WHERE event_id IN ({})",
                     quote(schema),
                     quote(&outbox_table(self.stream)),
@@ -375,7 +415,22 @@ impl LogStore for MariaLog {
                 .map_err(map_err)?;
             }
         }
+        tx.commit().await.map_err(map_err)?;
+        self.note_own(&mut c, before).await;
         Ok(())
+    }
+
+    fn take_own(&self) -> Vec<Gtid> {
+        std::mem::take(&mut *self.own.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    async fn position(&self) -> Result<Option<GtidPos>> {
+        let mut c = self.conn().await?;
+        let pos: Option<String> = c
+            .query_first("SELECT @@gtid_binlog_pos")
+            .await
+            .map_err(map_err)?;
+        Ok(pos.and_then(|p| p.parse().ok()))
     }
 }
 

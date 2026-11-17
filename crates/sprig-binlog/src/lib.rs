@@ -53,7 +53,7 @@ pub use event::{
 };
 pub use file::BinlogFile;
 pub use gtid::{Gtid, GtidPos};
-pub use stream::{BinlogSource, BinlogStream, StreamOptions};
+pub use stream::{BinlogSource, BinlogStream, SourceSession, StreamOptions};
 pub use table_map::{Column, ColumnType, TableMap};
 pub use tls::BinlogTls;
 pub use value::{Date, DateTime, RowImage, Time, Timestamp, Value};

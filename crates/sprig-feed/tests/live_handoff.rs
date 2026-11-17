@@ -1,6 +1,5 @@
 //! A feed consumer resumes across tenant moves with no lost or duplicated
-//! events (chapter 38; chapter 48, R1 done-when 4; chapter 10's invariant
-//! 8 on real clusters).
+//! events, on real clusters.
 //!
 //! Needs the Compose stack with its clusters registered in etcd
 //! (`deploy/compose/gateway-dev.sh up`):

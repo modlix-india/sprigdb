@@ -311,6 +311,16 @@ impl MysqlClient {
                     source,
                 })?;
             let _ = tcp.set_nodelay(true);
+            let mut tcp = tcp;
+            if let Some(p) = &cfg.preamble {
+                use tokio::io::AsyncWriteExt as _;
+                tcp.write_all(p)
+                    .await
+                    .map_err(|source| ClientError::Connect {
+                        addr: addr.to_owned(),
+                        source,
+                    })?;
+            }
             let host = host_of(addr);
             Self::handshake(ClientStream::Plain(tcp), host, cfg).await
         })

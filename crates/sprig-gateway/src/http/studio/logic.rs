@@ -6,7 +6,7 @@
 //! | `GET /v1/databases/{db}/logic` | The database's modules (`logic_modules`): kind, runtime, security, tier preference, active version, state |
 //! | `GET /v1/databases/{db}/logic/{kind}/{name}` | One module with its versions (tier, placement, state, compiler), the active version's source, its binding and schedule, and, for routine administrators, the generated PL/SQL |
 //! | `GET /v1/databases/{db}/logic/{kind}/{name}/versions/{v}` | One version's source (and PL/SQL for routine administrators) |
-//! | `POST /v1/databases/{db}/logic:compile` | `Logic.Compile`: a dry run of a `CREATE FUNCTION | PROCEDURE ... LANGUAGE ...` declaration against the database's columns: tier, reasons with where they are, lints, cost, tables read and written, the signature, and the PL/SQL for routine administrators. Nothing is recorded or deployed |
+//! | `POST /v1/databases/{db}/logic:compile` | `Logic.Compile`: a dry run of a `CREATE FUNCTION | PROCEDURE ... LANGUAGE ...` declaration against the database's columns: tier, reasons with where they are, lints, cost, tables read and written, the signature, and the PL/SQL for routine administrators; a `CREATE VALIDATION` or `CREATE TRIGGER ... AFTER COMMIT` gets the deploy's checks against its table (it compiles into MariaDB, its parameters name columns) and how it would be enforced. Nothing is recorded or deployed |
 //! | `GET .../{kind}/{name}/rollout` | A function's or procedure's staged rollout (active and candidate versions, share, key) and each version's calls, errors, mean, p95 and latency histogram |
 //! | `GET .../{kind}/{name}/logs?after=&limit=` | `Logic.TailLogs`: what the module's triggers and schedules did (`logic_log`), newest first, after an id (Studio polls it) |
 //! | `GET .../{kind}/{name}/deadLetters?state=` | The module's dead letters (`logic_dead_letters` of its binding) |
@@ -26,6 +26,7 @@
 //! `SPRIG_TENANT_ADMIN` (1044 otherwise): Studio shows the generated PL/SQL
 //! only to users with alter routine.
 
+use sprig_catalog::pool_wait::Bounded as _;
 use std::sync::Arc;
 
 use hyper::body::Incoming;
@@ -151,7 +152,7 @@ async fn store(
         .ok_or_else(|| SprigError::standard(1049, *b"42000", format!("Unknown database '{db}'")))?;
     let db_id = row.db_id.0;
     let ep = sprig_catalog::CatalogLocator::writer(&*svc.locator, tid).await?;
-    let conn = ep.pool.get_conn().await.map_err(|e| {
+    let conn = ep.pool.get_conn_bounded().await.map_err(|e| {
         SprigError::new(
             SprigCode::CatalogUnavailable,
             "the tenant's catalog is unreachable",
@@ -658,10 +659,38 @@ pub(super) async fn compile(
             ));
         }
     };
+    // A validation or an after-commit trigger: the deploy's checks against
+    // its table, nothing recorded.
+    if matches!(decl.kind, Kind::Validation | Kind::Trigger)
+        && decl.source.is_none()
+        && let Some(t) = &decl.table
+    {
+        let tdb = t.db.as_deref().or(decl.db.as_deref()).unwrap_or(db);
+        let cols = columns(core, caller, tdb).await?;
+        let opts = Options {
+            module_id: 0,
+            version: 0,
+            max_loop_iterations: MAX_LOOP_ITERATIONS,
+            compile_max_cost: COMPILE_MAX_COST,
+            definer_security: true,
+        };
+        let v = match sprig_logic::service::check_bound(&decl, tdb, &t.name, &cols, &opts) {
+            Ok(notes) => json!({
+                "ok": true, "kind": decl.kind.as_str(), "name": decl.name,
+                "runtime": decl.runtime.as_str(), "table": t.name, "tier": "mariadb",
+                "notes": notes, "diagnostics": [],
+            }),
+            Err(e) => json!({
+                "ok": false, "kind": decl.kind.as_str(), "name": decl.name,
+                "diagnostics": [diagnostic(&e)],
+            }),
+        };
+        return Ok(json_response(200, &v));
+    }
     if !matches!(decl.kind, Kind::Function | Kind::Procedure) || decl.source.is_some() {
         return Err(SprigError::new(
             SprigCode::LogicUnsupported,
-            "a dry run compiles functions and procedures; deploy validations, triggers and schedules to see their placement",
+            "a dry run compiles functions, procedures, validations and after-commit triggers; deploy stream and queue triggers and schedules to see their placement",
         ));
     }
     let cols = columns(core, caller, decl.db.as_deref().unwrap_or(db)).await?;
@@ -677,8 +706,18 @@ pub async fn dry_run(d: &Declaration, cols: &StaticColumns, show_plsql: bool) ->
         compile_max_cost: COMPILE_MAX_COST,
         definer_security: d.definer_security,
     };
+    // As a deploy compiles it: JavaScript and Lua with the declaration's
+    // signature (parameter types and `RETURNS`).
     let compiled = if d.runtime == Runtime::Javascript {
         sprig_logic::compiler::js::compile_with(
+            &d.name,
+            &d.body,
+            &sprig_logic::service::js_signature(d),
+            cols,
+            &opts,
+        )
+    } else if d.runtime == Runtime::Lua {
+        sprig_logic::compiler::lua::compile_with(
             &d.name,
             &d.body,
             &sprig_logic::service::js_signature(d),
@@ -713,6 +752,19 @@ pub async fn dry_run(d: &Declaration, cols: &StaticColumns, show_plsql: bool) ->
     if engine
         && script
         && let Err(e) = sprig_logic::service::script_check(d)
+    {
+        diagnostics.push(diagnostic(&e));
+    }
+    // Compiled into MariaDB: a deploy still has the engine's runtime accept
+    // the source, since the engine tier defines the language.
+    if !engine
+        && script
+        && let Err(e) = sprig_logic_js::Program::new(
+            d.runtime.as_str(),
+            &d.name,
+            &d.body,
+            sprig_logic::service::script_sig(d),
+        )
     {
         diagnostics.push(diagnostic(&e));
     }
@@ -826,6 +878,29 @@ mod tests {
         // Not shown without the routine privilege.
         let hidden = dry_run(&d, &cols, false).await;
         assert!(hidden["plsql"].is_null());
+        // Lua compiles into MariaDB with the declaration's signature, as a
+        // deploy does: the mariadb tier, its parameters and the routine.
+        let lua = sprig_logic::declare::parse(
+            "CREATE FUNCTION add_tax(p INT, rate INT) RETURNS INT LANGUAGE lua AS $$ \
+             local t = p * rate \
+             if t > 10 then return p + t end \
+             return p + 1 $$",
+        )
+        .unwrap();
+        let v = dry_run(&lua, &cols, true).await;
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["runtime"], "lua");
+        assert_eq!(v["tier"], "mariadb", "{v}");
+        assert_eq!(v["signature"]["params"][1]["name"], "rate", "{v}");
+        assert_eq!(v["signature"]["params"][0]["type"], "i64", "{v}");
+        assert!(v["plsql"].as_str().is_some_and(|p| !p.is_empty()), "{v}");
+        // Outside the subset: the engine tier with the parser's reason.
+        let lua = sprig_logic::declare::parse(
+            "CREATE FUNCTION co() RETURNS INT LANGUAGE lua AS $$ return coroutine.wrap(function() end) and 1 $$",
+        )
+        .unwrap();
+        let v = dry_run(&lua, &cols, true).await;
+        assert_eq!(v["tier"], "engine", "{v}");
         // A KIRun definition that isn't JSON is a diagnostic, not a 500.
         let bad = sprig_logic::declare::parse("CREATE PROCEDURE p LANGUAGE kirun AS '{not json'");
         if let Ok(bad) = bad {

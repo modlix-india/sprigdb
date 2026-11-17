@@ -63,8 +63,10 @@ impl StreamsEnv {
             dc: Arc::clone(&env.dc),
             pools: Arc::clone(&env.pools),
             locator: Arc::clone(&env.locator),
-            outboxes: feed.view(Kept::Tables(vec![OUTBOXES.to_owned()].into())),
-            whole: feed.view(Kept::All),
+            outboxes: feed
+                .view(Kept::Tables(vec![OUTBOXES.to_owned()].into()))
+                .named("stream_sequencer"),
+            whole: feed.view(Kept::All).named("stream_sequencer"),
             settings: env.settings.clone(),
         }
     }
@@ -193,6 +195,10 @@ pub struct StreamSequencer(pub StreamsEnv);
 impl JobHandler for StreamSequencer {
     fn kind(&self) -> &'static str {
         JOB_KIND
+    }
+
+    fn drains(&self) -> bool {
+        true
     }
 
     fn class(&self) -> JobClass {

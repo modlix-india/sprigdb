@@ -1,7 +1,6 @@
-//! What schema tools see (chapter 42, "Security notes"; chapter 07's
-//! hiding rules): an inheritable object looks like the table the client
-//! created. Its `_sprig_` columns and indexes are hidden by chapter 07;
-//! `SHOW CREATE TABLE` gets back the primary and unique keys chapter 07
+//! What schema tools see: an inheritable object looks like the table the client
+//! created. Its `_sprig_` columns and indexes are hidden by the name layer;
+//! `SHOW CREATE TABLE` gets back the primary and unique keys the name layer
 //! drops because `_sprig_space` widened them. `SELECT *` (also `mysqldump`'s
 //! read) sees the session space's merged view, so a dump of a space is its
 //! merged data as plain tables.
@@ -49,7 +48,7 @@ fn row(vals: Vec<Option<String>>) -> Vec<Option<Vec<u8>>> {
         .collect()
 }
 
-/// Puts the key lines chapter 07 hid back into a `CREATE TABLE` text.
+/// Puts the key lines the name layer hid back into a `CREATE TABLE` text.
 #[must_use]
 pub fn restore_keys(text: &str, key: &[String], uniques: &[crate::model::UniqueKey]) -> String {
     let lines: Vec<&str> = text.lines().collect();
@@ -156,9 +155,8 @@ pub fn shares(ctx: &Ctx<'_>) -> Rows {
             |o| format!("{}.{}", ctx.db_name(o.db).unwrap_or_default(), o.table),
         )
     };
-    // A copy's state and how far behind it may be (chapter 42,
-    // "Materialized copies"): now minus when the worker last had nothing
-    // left to apply.
+    // A copy's state and how far behind it may be: now minus when the worker
+    // last had nothing left to apply.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
@@ -280,7 +278,7 @@ pub fn create_share_text(ctx: &Ctx<'_>, s: &crate::model::Share) -> String {
 }
 
 /// `SHOW CREATE SHARE n`: the share as created, from which space, its
-/// merge mode, and the foreign-key group it carries (decision IG3).
+/// merge mode, and the foreign-key group it carries.
 ///
 /// # Errors
 /// 39887 when this tenant made no share of that name.

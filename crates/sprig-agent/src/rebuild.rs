@@ -884,7 +884,17 @@ pub fn serve(
     stop: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let tls = state.tls.clone();
-    let app = router(state);
+    serve_router(listener, router(state), tls, stop)
+}
+
+/// Serves `app` on `listener` until `stop`: over mutual TLS with `tls`,
+/// else plain HTTP (the relay role's holder calls use it too).
+pub fn serve_router(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    tls: Option<InternalTls>,
+    stop: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let stopped = {
             let stop = stop.clone();

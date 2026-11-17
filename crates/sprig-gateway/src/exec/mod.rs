@@ -26,13 +26,20 @@
 
 // `ASK '<question>'`: an assistant's proposed query, never run.
 mod ask;
+// AI functions in statements (`AI_CLASSIFY(...)` and the others).
+mod ai_fn;
 mod capture;
 mod compat_sink;
 mod dc;
 // A dropped database's sinks and logic modules go with it.
 mod dropdb;
+// Embedded columns in table DDL.
+mod embed_ddl;
 // The read-only `sprig_docs` database.
 mod docs;
+// Retrieval indexes: their DDL and `RETRIEVE()`.
+mod retrieval;
+pub(crate) use retrieval::KEY_JSON_HINT as RETRIEVE_KEY_JSON_HINT;
 mod fence;
 // A mover's fence never reaches clients as 1146 or 1049.
 mod fence_retry;
@@ -69,8 +76,7 @@ mod inherit_types;
 mod inherit_msg;
 // FOR EACH TENANT connections and sinks.
 mod inherit_sinks;
-// Change streams: was an inherited record visible before a change
-// (decision RL64).
+// Change streams: was an inherited record visible before a change.
 pub(crate) mod inherit_probe;
 pub(crate) mod types;
 // Event streams.
@@ -103,6 +109,8 @@ mod lateral;
 mod fxindex;
 // MySQL's DDL answers that need a lookup.
 mod mysql_ddl;
+// Storage engines other than InnoDB.
+pub(crate) mod engine;
 // `SET GLOBAL` server-wide assignments as tenant defaults.
 mod set_global;
 // A `DEFINER` naming another account.
@@ -199,12 +207,14 @@ impl Executor for PassThrough {
             subst: Vec::new(),
             wl: None,
             wl_multi: false,
+            wl_text: None,
             router: router::RouterState::default(),
             packet_limit: None,
             placement_memo: follow::PlacementMemo::default(),
             point_memo: point::PointMemo::default(),
             status: status::SessionStatus::default(),
             globals_applied: false,
+            column_change_running: false,
         })
     }
 }
@@ -227,6 +237,11 @@ pub struct PassSession {
     wl: Option<crate::workload::SessionCapture>,
     /// The current `COM_QUERY` holds several statements: none is probed.
     wl_multi: bool,
+    /// The client's own text of the current statement when a rewrite put
+    /// data into it (`performance_schema` and `sys` tables): workload
+    /// capture fingerprints this, as MySQL's digests show the client's
+    /// statement.
+    wl_text: Option<Vec<u8>>,
     /// The router: the session's connections to other clusters and the
     /// transaction coordinator, for tenants with sharded tables.
     router: router::RouterState,
@@ -242,6 +257,10 @@ pub struct PassSession {
     /// The tenant's `compat.global.*` defaults were given to the session:
     /// at its first request, and again after a reset.
     globals_applied: bool,
+    /// An `ALTER TABLE` whose compiled validations or triggers are
+    /// recompiled afterwards runs now: its own column check is done
+    /// (`logic_bound`).
+    column_change_running: bool,
 }
 
 impl std::fmt::Debug for PassSession {
@@ -342,6 +361,9 @@ impl PassSession {
     /// tenant session opens it in the schema of its current logical
     /// database.
     fn bs(&mut self, cx: &ExecCtx<'_>) -> &mut BackendSession {
+        // Sprig 2PC's relay path: every connection of the tenant to a
+        // cluster with relays goes through its relay writer.
+        let relay = self.relay_tenant();
         let backends = &self.backends;
         let target = &self.target;
         let persona = self.persona;
@@ -349,7 +371,7 @@ impl PassSession {
             Some(ts) => ts.schema_of(ts.current.as_deref().or(cx.db)),
             None => cx.db.map(str::to_owned),
         };
-        self.bs.get_or_insert_with(|| {
+        let bs = self.bs.get_or_insert_with(|| {
             backends.session(
                 target.clone(),
                 SessionOpts {
@@ -358,10 +380,16 @@ impl PassSession {
                     mariadb_caps: mariadb_caps(persona, cx.proto.caps),
                     collation: cx.proto.collation,
                     schema,
+                    relay,
                     ..SessionOpts::default()
                 },
             )
-        })
+        });
+
+        if bs.relay() != relay {
+            bs.set_relay(relay);
+        }
+        bs
     }
 
     fn backend_caps(&self, cx: &ExecCtx<'_>) -> Caps {
@@ -575,6 +603,7 @@ impl PassSession {
         let backend_caps = self.backend_caps(cx);
         // One statement per execute: probes allowed.
         self.wl_multi = false;
+        self.wl_text = None;
         let s = self.stmts.get_mut(stmt)?;
         if let Some(text) = s.deferred.clone() {
             // A search text: the bound values as literals.
@@ -599,10 +628,15 @@ impl PassSession {
                         )
                     })?
             } else if s.deferred_params {
+                let literal = if s.stream_params {
+                    streams::param_literal
+                } else {
+                    search::param_literal
+                };
                 let values: Vec<String> = s
                     .params_for_backend(params, persona)?
                     .iter()
-                    .map(search::param_literal)
+                    .map(literal)
                     .collect();
                 std::str::from_utf8(&text)
                     .ok()
@@ -1226,6 +1260,10 @@ impl SessionExec for PassSession {
         }
     }
 
+    fn take_cut_commit(&mut self) -> Option<Result<()>> {
+        self.router.take_cut_commit()
+    }
+
     async fn abandoned(&mut self, _cx: &mut ExecCtx<'_>, why: Abandon) {
         // The router's statements on other connections too.
         self.router.abandon_in_flight(DRAIN_TIMEOUT).await;
@@ -1282,8 +1320,10 @@ impl SessionExec for PassSession {
 
     fn set_claims(&mut self, claims: Option<std::sync::Arc<serde_json::Value>>) {
         // SPRIG_CLAIM() reads the caller's verified token.
+        // Its role mappings give the session's token roles.
         if let Some(ts) = self.tenant.as_deref_mut() {
             ts.rls.claims = claims;
+            ts.authz.forget_token_roles();
         }
     }
 
@@ -1617,10 +1657,24 @@ impl PassSession {
                     .filter(|l| compat_sink::IntMetaSink::wanted(l));
                 match (dup_table.as_deref(), logical) {
                     (Some(table), _) => {
-                        let mut wrapped = compat_sink::DupKeySink { inner: out, table };
-                        self.execute(cx, stmt, &raw, &params, &mut wrapped)
-                            .await
-                            .map_err(|e| compat_sink::map(e, Some(table)))
+                        let mut wrapped = compat_sink::DupKeySink::new(&mut *out, table);
+                        let r = self.execute(cx, stmt, &raw, &params, &mut wrapped).await;
+                        // A value that doesn't fit a functional index:
+                        // MySQL's 3752 or 3751 naming the index.
+                        let r = match (wrapped.take_held(), r) {
+                            (Some(e), Ok(summary)) => {
+                                let sql = self
+                                    .stmts
+                                    .get_mut(stmt)
+                                    .ok()
+                                    .and_then(|s| s.logical.clone())
+                                    .unwrap_or_default();
+                                let e = Box::pin(self.fx_dml_error(cx, &sql, e)).await;
+                                out.error(&e).await.map(|()| summary)
+                            }
+                            (_, r) => r,
+                        };
+                        r.map_err(|e| compat_sink::map(e, Some(table)))
                     }
                     (None, Some(l)) => {
                         let lex = self.lex_opts().0;

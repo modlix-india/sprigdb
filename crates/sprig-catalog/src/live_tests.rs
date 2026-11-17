@@ -412,12 +412,32 @@ async fn live_migrations_are_idempotent_concurrent_and_recorded() {
             .run(&mut conn, &schema, &MigrateOpts::default())
             .await
             .unwrap();
-        let opts = MigrateOpts {
+        // The ceiling allows the contract, but the contract delay holds it
+        // back: the expands were recorded just now.
+        let mut opts = MigrateOpts {
             ceilings: BTreeMap::from([("test_ext".to_owned(), Ceiling::NONE)]),
             ..MigrateOpts::default()
         };
         let r = m.run(&mut conn, &schema, &opts).await.unwrap();
+        assert!(r.applied.is_empty(), "{r:?}");
+        assert_eq!(r.delayed.len(), 1, "{r:?}");
+        assert_eq!(r.delayed[0].migration.format, 3);
+        assert!(r.delayed[0].due.is_some());
+        assert_eq!(r.state["test_ext"].compat, 1);
+        // Six days later it still waits; a day after that it may run.
+        let clock = Arc::new(sprig_common::time::ManualClock::new());
+        clock.advance(Duration::from_secs(6 * 86_400));
+        let later = Migrator::new(&[ext])
+            .unwrap()
+            .with_clock(Arc::clone(&clock) as Arc<dyn sprig_common::time::Clock>);
+        let r = later.run(&mut conn, &schema, &opts).await.unwrap();
+        assert_eq!(r.delayed.len(), 1, "{r:?}");
+        // An override with a reason runs it now, and the history says so.
+        opts.contract_override =
+            Some(migrate::ContractOverride::new("hotfix, no rollback", "op:test").unwrap());
+        let r = m.run(&mut conn, &schema, &opts).await.unwrap();
         assert_eq!(r.applied.len(), 1);
+        assert!(r.delayed.is_empty());
         assert_eq!(
             r.state["test_ext"],
             ModuleFormat {
@@ -445,6 +465,17 @@ async fn live_migrations_are_idempotent_concurrent_and_recorded() {
             .await
             .unwrap();
         assert_eq!(hist.history.len(), 3);
+        let o = hist.history[2]
+            .delay_override
+            .as_ref()
+            .expect("override recorded");
+        assert_eq!(
+            (o.reason.as_str(), o.by.as_str()),
+            ("hotfix, no rollback", "op:test")
+        );
+        assert_eq!(o.delay_secs, 7 * 86_400);
+        assert!(o.expand_at.is_some());
+        assert!(hist.history[..2].iter().all(|h| h.delay_override.is_none()));
     })
     .await;
 }
@@ -476,6 +507,42 @@ async fn live_a_crash_between_statements_and_record_reruns_safely() {
         // Re-running kept the existing internal keys.
         let store = Store::new(&schema);
         assert_eq!(store.next_db_id(&mut conn).await.unwrap(), DbId(5));
+    })
+    .await;
+}
+
+/// `MigrateOpts::existing()`: a missing catalog schema is 39072
+/// and isn't made. A loop migrating a catalog that cleanup had just dropped
+/// made it again without an owner mark; only bootstrap makes a catalog,
+/// with its mark.
+#[tokio::test]
+async fn live_existing_only_never_creates_the_schema() {
+    with_schema("live_existing_only", |pool, schema| async move {
+        let mut conn = pool.get_conn().await.unwrap();
+        let e = Migrator::new(&[])
+            .unwrap()
+            .run(&mut conn, &schema, &MigrateOpts::existing())
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Some(SprigCode::TenantNotReady), "{e}");
+        let n: Option<i64> = conn
+            .exec_first(
+                "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?",
+                (schema.clone(),),
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, Some(0), "the schema wasn't made");
+        // Once it exists, the same options migrate it.
+        conn.query_drop(format!("CREATE DATABASE `{schema}`"))
+            .await
+            .unwrap();
+        let r = Migrator::new(&[])
+            .unwrap()
+            .run(&mut conn, &schema, &MigrateOpts::existing())
+            .await
+            .unwrap();
+        assert!(!r.applied.is_empty());
     })
     .await;
 }

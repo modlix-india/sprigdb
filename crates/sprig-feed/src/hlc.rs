@@ -1,4 +1,4 @@
-//! HLC stamps and the clamp (chapter 38, "The cluster reader").
+//! HLC stamps and the clamp.
 //!
 //! An HLC stamp has MongoDB's `Timestamp` layout: seconds since the Unix
 //! epoch in the high 32 bits, a counter in the low 32. Every transaction

@@ -43,6 +43,8 @@ pub mod lang;
 /// Live `vector.*` and `analytics.*` settings.
 pub mod model_settings;
 pub mod rest;
+// Retrieval index searches.
+pub mod retrieval;
 // Search.Query.
 pub mod search;
 pub mod settings;
@@ -159,7 +161,14 @@ impl Core {
             });
         }
         let creds = info.credentials(authorization.clone(), tenant, host);
-        let principal = self.auth.authenticate(&creds).await?;
+        let (principal, basic_token) = self.auth.authenticate_login(&creds).await?;
+        // A `Basic` password verified as an issuer's token: the request
+        // carries it as its bearer token, so its claims reach the session
+        // (`SPRIG_CLAIM()`, token roles) as a bearer token's do.
+        let authorization = match basic_token {
+            Some(t) => Some(format!("Bearer {t}")),
+            None => authorization,
+        };
         Ok(Caller {
             principal,
             peer: info.peer,

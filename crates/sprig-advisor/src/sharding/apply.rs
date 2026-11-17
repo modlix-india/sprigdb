@@ -537,6 +537,7 @@ async fn regroup(
 ) -> Result<u64> {
     // What is still to move.
     let mut moves: Vec<(String, String, String)> = Vec::new(); // (from, to, table)
+    let mut moved: Vec<(Obj, String, String)> = Vec::new(); // (object, from, to)
     for g in groups {
         for (o, db, name, _) in &g.members {
             let from = located
@@ -553,6 +554,7 @@ async fn regroup(
                 .await
                 .map_err(|e| db_err("look up a table", &e))?;
             if there.unwrap_or(0) == 0 {
+                moved.push((*o, from.clone(), to.clone()));
                 moves.push((from, to, name.clone()));
             }
         }
@@ -605,6 +607,9 @@ async fn regroup(
     if moves.is_empty() {
         return Ok(0);
     }
+    // The tables' retrieval chunk tables go in the same `RENAME`, so the
+    // index arrives with its rows and isn't filled again.
+    let chunks = chunk_tables(c, ctx.tenant, &moved).await?;
     let mut trig: Vec<(String, String, String)> = Vec::new(); // (to schema, name, body)
     // Policy views: (from, to, view, definer account, text).
     let mut pviews: Vec<(String, String, String, String, String)> = Vec::new();
@@ -649,6 +654,7 @@ async fn regroup(
         let wait = budget.as_secs().max(1);
         let pairs = moves
             .iter()
+            .chain(&chunks)
             .map(|(f, to, t)| format!("{}.{} TO {}.{}", quote(f), quote(t), quote(to), quote(t)))
             .collect::<Vec<_>>()
             .join(", ");
@@ -707,8 +713,72 @@ async fn regroup(
         }
     }
     released?;
-    tracing::info!(tenant = %ctx.tenant, tables = moves.len(), held_ms = held, "regrouped");
+    tracing::info!(tenant = %ctx.tenant, tables = moves.len(), chunk_tables = chunks.len(), held_ms = held, "regrouped");
     Ok(held)
+}
+
+/// The tenant catalog's retrieval index table (its rows name each index's
+/// source table by object id; the AI crate's `retrieval::store::TABLE`).
+const RETRIEVAL_INDEXES: &str = "ai_retrieval_indexes";
+
+/// A retrieval index's chunk table, `__sprig_rx_<index>` (the mover's
+/// `RETRIEVAL_PREFIX`, the AI crate's `retrieval::table_name`).
+fn chunk_table(index: u64) -> String {
+    format!("__sprig_rx_{index}")
+}
+
+/// The chunk tables of the retrieval indexes over the tables `moved`
+/// (object, from schema, to schema) that are in the old schema and not yet
+/// in the new one, as `RENAME` pairs (from, to, name). None when the tenant
+/// has no retrieval index.
+async fn chunk_tables(
+    c: &mut Conn,
+    tenant: TenantId,
+    moved: &[(Obj, String, String)],
+) -> Result<Vec<(String, String, String)>> {
+    if moved.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cat = catalog(tenant);
+    let ids = moved
+        .iter()
+        .map(|m| m.0.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rows: Vec<(u64, u64)> = match c
+        .query(format!(
+            "SELECT index_id, object_id FROM {}.{} WHERE object_id IN ({ids}) ORDER BY index_id",
+            quote(&cat),
+            quote(RETRIEVAL_INDEXES)
+        ))
+        .await
+    {
+        Ok(r) => r,
+        // The catalog module is made on the first index.
+        Err(mysql_async::Error::Server(e)) if e.code == 1146 => return Ok(Vec::new()),
+        Err(e) => return Err(db_err("read the retrieval indexes", &e)),
+    };
+    let mut out = Vec::new();
+    for (index, object) in rows {
+        let Some((_, from, to)) = moved.iter().find(|m| m.0 == object) else {
+            continue;
+        };
+        let name = chunk_table(index);
+        let here: Vec<String> = c
+            .exec(
+                "SELECT TABLE_SCHEMA FROM information_schema.TABLES WHERE TABLE_NAME = ? \
+                 AND TABLE_SCHEMA IN (?, ?)",
+                (&name, from, to),
+            )
+            .await
+            .map_err(|e| db_err("look up a chunk table", &e))?;
+        // Already in the new schema (the worker made one there): the old
+        // one stays, and the worker drops it.
+        if here.iter().any(|s| s == from) && !here.iter().any(|s| s == to) {
+            out.push((from.clone(), to.clone(), name));
+        }
+    }
+    Ok(out)
 }
 
 /// One chunk of a column member's back-fill; returns the rows written and
@@ -1090,5 +1160,11 @@ mod tests {
                 assert_eq!(a, c);
             }
         }
+    }
+
+    #[test]
+    fn chunk_tables_are_named_as_the_mover_and_worker_name_them() {
+        assert_eq!(chunk_table(7), "__sprig_rx_7");
+        assert!(chunk_table(7).starts_with(sprig_common::names::INTERNAL_OBJECT_PREFIX));
     }
 }

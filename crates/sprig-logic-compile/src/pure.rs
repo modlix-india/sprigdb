@@ -105,6 +105,9 @@ struct St {
     conds: Vec<String>,
     end: Option<End>,
     done: bool,
+    /// Leaving the [`Stmt::Block`] with this label (an inlined helper's
+    /// `return`): the statements up to its end are skipped.
+    left: Option<u32>,
 }
 
 struct Cx<'a> {
@@ -365,6 +368,14 @@ impl Cx<'_> {
                 Sql::new(format!("{f}({})", list.join(", ")), ty)
             }
             Builtin::Len => Sql::new(format!("CHAR_LENGTH({})", one(&v)?.text), Ty::Int),
+            Builtin::ByteLen => Sql::new(
+                format!("OCTET_LENGTH(CONVERT({} USING utf8mb4))", one(&v)?.text),
+                Ty::Int,
+            ),
+            Builtin::AsciiUpper | Builtin::AsciiLower => Sql::new(
+                crate::plsql::ascii_case(&one(&v)?.text, b == Builtin::AsciiUpper),
+                Ty::Str,
+            ),
             Builtin::Upper => Sql::new(format!("UPPER({})", one(&v)?.text), Ty::Str),
             Builtin::Lower => Sql::new(format!("LOWER({})", one(&v)?.text), Ty::Str),
             Builtin::Contains => {
@@ -398,7 +409,21 @@ impl Cx<'_> {
                     Ty::Int,
                 )
             }
-            Builtin::JsonNum | Builtin::JsonStr | Builtin::ToJson | Builtin::JsonLength => {
+            Builtin::JsonNum
+            | Builtin::JsonStr
+            | Builtin::ToJson
+            | Builtin::JsonLength
+            | Builtin::JsonText
+            | Builtin::JsonParse
+            | Builtin::JsonGet
+            | Builtin::JsonLen
+            | Builtin::JsonAsStr
+            | Builtin::JsonAsNum
+            | Builtin::JsonAsInt
+            | Builtin::JsonAsBool
+            | Builtin::JsonTruthy
+            | Builtin::JsonKind
+            | Builtin::JsonToStr => {
                 return Err("JSON values".into());
             }
         })
@@ -409,7 +434,7 @@ impl Cx<'_> {
         for stmt in block {
             let mut next = Vec::new();
             for mut s in states {
-                if s.done {
+                if s.done || s.left.is_some() {
                     next.push(s);
                     continue;
                 }
@@ -437,6 +462,20 @@ impl Cx<'_> {
                         return Err("a loop".into());
                     }
                     Stmt::Db(_) => return Err("data access".into()),
+                    Stmt::Log(_) => return Err("log lines".into()),
+                    Stmt::Try { .. } | Stmt::Rethrow(_) => return Err("try/catch".into()),
+                    Stmt::Block(l, body) => {
+                        for mut t in self.block(body, s)? {
+                            if t.left == Some(*l) {
+                                t.left = None;
+                            }
+                            next.push(t);
+                        }
+                    }
+                    Stmt::Leave(l) => {
+                        s.left = Some(*l);
+                        next.push(s);
+                    }
                     Stmt::Emit(name, fields) => {
                         if s.end.is_none() {
                             let mut fs = Vec::with_capacity(fields.len());
@@ -487,6 +526,7 @@ pub fn paths(f: &Function, params: &[Option<Sql>]) -> std::result::Result<Paths,
         conds: Vec::new(),
         end: None,
         done: false,
+        left: None,
     };
     let states = cx.block(&f.body, start)?;
     let output_fields = f.event("output").is_some_and(|e| !e.fields.is_empty());

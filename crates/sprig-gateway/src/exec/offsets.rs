@@ -25,8 +25,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use mysql_async::prelude::Queryable;
 use sprig_auth::authz::{Action, Target};
-use sprig_catalog::CatalogLocator;
 use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::ObjectKind;
 use sprig_common::ids::ClusterId;
 use sprig_common::names::SchemaName;
@@ -49,6 +49,9 @@ pub(super) struct Collect {
     /// The columns' MySQL types (`LATERAL`'s gateway apply inlines numbers
     /// as numbers).
     pub(super) types: Vec<u8>,
+    /// The columns as sent (the AI functions' gateway step keeps the
+    /// other columns' metadata).
+    pub(super) defs: Vec<ColumnDef>,
     pub(super) rows: Vec<Vec<Option<Vec<u8>>>>,
     pub(super) affected: Option<u64>,
     pub(super) error: Option<SprigError>,
@@ -61,6 +64,7 @@ impl Collect {
             wire,
             columns: Vec::new(),
             types: Vec::new(),
+            defs: Vec::new(),
             rows: Vec::new(),
             affected: None,
             error: None,
@@ -80,6 +84,7 @@ impl ResultSink for Collect {
             .map(|c| String::from_utf8_lossy(&c.name).into_owned())
             .collect();
         self.types = columns.iter().map(|c| c.col_type).collect();
+        self.defs = columns.to_vec();
         Ok(())
     }
     async fn row(&mut self, values: RowValues<'_>) -> Result<()> {
@@ -407,10 +412,12 @@ impl PassSession {
         let catalog_cluster = svc.locator.cluster(tenant).await?;
         let call = offsets::call_sql(&schema, c);
         if !in_txn {
-            let ep = svc.locator.writer(tenant).await?;
-            let mut conn = ep
-                .pool
-                .get_conn()
+            // A transaction's commit of the same group can be a held
+            // branch's row: through the relay writer for a tenant on the
+            // relay path.
+            let pool = svc.locator.tenant_catalog_pool(tenant).await?;
+            let mut conn = pool
+                .get_conn_bounded()
                 .await
                 .map_err(sprig_streams::maria::map_err)?;
             if let Err(e) = conn.query_drop(&call).await {
@@ -493,7 +500,7 @@ impl PassSession {
             .ok_or_else(|| SprigError::internal("no tenant"))?;
         let pool = ts.services().locator.ctl_pool(cluster).await?;
         let mut conn = pool
-            .get_conn()
+            .get_conn_bounded()
             .await
             .map_err(sprig_streams::maria::map_err)?;
         for s in offsets::grant_sql(schema, tenant, user) {

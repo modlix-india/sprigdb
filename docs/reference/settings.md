@@ -9,12 +9,13 @@ source: the settings registry (sprig-settings)
 
 Every setting SprigDB declares, with its default, the scopes that may set it, hard bounds and when a change applies. Settings resolve from the most specific scope: object, database, tenant and its ancestors, cluster, data center, global, then the built-in default. Read them with `SHOW SPRIG SETTINGS`, change them with `ALTER TENANT|DATABASE|TABLE … SPRIG SET (key = value)` or `sprigctl settings`.
 
-713 settings in 61 groups.
+754 settings in 61 groups.
 
 ## `advisor`
 
 | Key | Type | Default | Scopes | Bounds | Applies | Description |
 |---|---|---|---|---|---|---|
+| `advisor.interval_hours` | float | `24` | tenant, global (operator only) | 0 to 8760 | live | Periodic runs |
 | `advisor.lookup_eval_minutes` | int | `5` | tenant, global (operator only) | 1 to 1440 | live | Period of the lookup proposals |
 | `advisor.lookup_min_runs` | int | `100` | tenant, global (operator only) | 1 to 1000000000 | live | Reads of a column before a lookup index is proposed |
 | `advisor.lookup_penalty` | float | `0.1` | tenant, global (operator only) | 0 to 1 | live | Credit lost per lookup a statement needs |
@@ -27,6 +28,9 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `advisor.min_observe_hours` | float | `24` | tenant, global (operator only) | 0 to 8760 | live | History needed for a design |
 | `advisor.min_units` | int | `10000` | tenant, global (operator only) | 0 to 1000000000 | live | Sampled units needed |
 | `advisor.mode` | text | `on` | tenant, dc, global (operator only) | on, approve, recommend, off | live | Sharding advisor: on, approve (held for approval), recommend or off |
+| `advisor.rekey_cooldown_days` | float | `14` | tenant, global (operator only) | 0 to 3650 | live | Minimum days between re-keys of a group |
+| `advisor.rekey_min_gain_pct` | float | `15` | tenant, global (operator only) | 0 to 100 | live | Gain in points needed to re-key |
+| `advisor.rekey_sustain_runs` | int | `3` | tenant, global (operator only) | 1 to 100 | live | Consecutive runs that must agree |
 | `advisor.txn_weight` | float | `2` | tenant, global (operator only) | 0 to 100 | live | Weight of a write transaction |
 | `advisor.window_days` | float | `7` | tenant, global (operator only) | 0 to 365 | live | Statistics window |
 
@@ -34,14 +38,33 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 
 | Key | Type | Default | Scopes | Bounds | Applies | Description |
 |---|---|---|---|---|---|---|
+| `ai.admin.check_interval` | text | `1h` | global (operator only) | 15m, 30m, 1h, 2h, 3h, 6h, 12h, 24h | live | How often the administration agent's health checks run over the metric history in each DC: 15m, 30m, 1h, 2h, 3h, 6h, 12h or 24h |
+| `ai.admin.enabled` | bool | `false` | global (operator only) | - | live | Turn on the administration agent: processes report error counts (codes, components, spans; never names or data), new or rising errors get triage and advice, the DC leader keeps a metric history and runs health checks, and failovers get write-ups, all as advice in the approvals inbox. Needs ai.model.admin to word them |
+| `ai.admin.max_advice_hour` | int | `10` | global (operator only) | 0 to 1000 | live | Advice items the administration agent may file per hour in each DC, counted apart for incident advice, health warnings and write-ups; repeats only update their counts |
+| `ai.admin.max_triage_hour` | int | `60` | global (operator only) | 0 to 10000 | live | Incidents the administration agent may send to triage per hour in each DC; the rest wait for the next hour |
 | `ai.audit_payload_days` | int | `30` | tenant, global | 0 to 3650 | live | Days the exact payloads sent to the AI provider are kept with the conversation; 0 keeps only their hashes |
 | `ai.budget.tenant_tokens_day` | int | `2000000` | tenant, global | 0 to 1000000000000 | live | Tokens all of a tenant's assistant turns may use per UTC day before they stop; 0 allows none |
 | `ai.budget.user_tokens_day` | int | `200000` | tenant, global | 0 to 1000000000000 | live | Tokens one user's assistant turns may use per UTC day before they stop; 0 allows none |
+| `ai.digest` | text | `off` | tenant, global | off, weekly, daily | live | A digest of the tenant's week or day, built from statistics only (schema and data-volume changes, the slowest statements, new automatic indexes, movements in the tenant's own workload numbers, recommendations waiting for review) and worded by the data assistant's model: off, weekly or daily. Read with GET /v1/ai/digests; ai.enabled must be on too |
+| `ai.digest_email` | bool | `false` | tenant, global | - | live | Also email each digest to the tenant's approvals subscribers (approval_subscriptions with delivery immediate or digest), through approvals.smtp_url |
 | `ai.effort.admin` | text | `medium` | global (operator only) | low, medium, high, xhigh, max | live | The administration agent's effort: low, medium, high, xhigh or max, for models that support it |
 | `ai.effort.data` | text | `medium` | global (operator only) | low, medium, high, xhigh, max | live | The data specialist's effort: low, medium, high, xhigh or max |
 | `ai.effort.dba` | text | `medium` | global (operator only) | low, medium, high, xhigh, max | live | The DBA assistant's effort: low, medium, high, xhigh or max |
 | `ai.effort.triage` | text | `low` | global (operator only) | low, medium, high, xhigh, max | live | The triage model's effort: low, medium, high, xhigh or max |
+| `ai.embedding.backfill_rows_per_s` | int | `500` | tenant, global | 1 to 1000000 | live | Existing rows an embedded column's backfill embeds per second at most |
+| `ai.embedding.batch_rows` | int | `64` | global (operator only) | 1 to 1024 | live | Inputs the embedding worker sends to the model at once |
+| `ai.embedding.max_input_bytes` | int | `65536` | global (operator only) | 256 to 16777216 | live | A source value longer than this is cut to this many bytes before it is embedded |
+| `ai.embedding.rows_per_s` | int | `2000` | tenant, global | 1 to 1000000 | live | Rows one embedded column embeds per second at most, changes and backfill together |
+| `ai.embedding_models` | text | `{"local:bge-small":{"provider":"local","model":"BAAI/bge-small-en-v1.5","dimensions":384}}` | global (operator only) | - | live | Embedding model aliases offered to tenants, a JSON object: alias to {provider, model, dimensions}; provider local is the bundled model |
 | `ai.enabled` | bool | `false` | tenant, global | - | live | Turn on the tenant's AI assistants. Off until a provider is configured and a tenant admin turns it on |
+| `ai.functions.cache_days` | int | `30` | tenant, global | 0 to 3650 | live | Days an AI function's answer from a provider is reused for the same function, model, arguments and input; 0 turns the cache off |
+| `ai.functions.cache_max_entries` | int | `100000` | tenant, global (operator only) | 0 to 100000000 | live | Answers the tenant's AI function cache keeps; past it the least recently used go first |
+| `ai.functions.enabled` | bool | `false` | tenant, global | - | live | Turn on the AI functions in SQL (AI_EMBED, AI_CLASSIFY, AI_EXTRACT, AI_SUMMARIZE, AI_COMPLETE) and their MongoDB aggregation operators for the tenant. Provider models also need ai.share_data, since their inputs are row values |
+| `ai.functions.max_inputs` | int | `10000` | tenant, global (operator only) | 1 to 1000000 | live | Distinct inputs one statement may send to a provider through AI functions (cache hits and the bundled model don't count); more fail the statement with 39992 before anything is sent |
+| `ai.functions.max_output_tokens` | int | `1024` | global (operator only) | 64 to 32000 | live | Output tokens one provider call of an AI function may produce |
+| `ai.functions.model` | text | `` | global (operator only) | - | live | provider/model that AI_CLASSIFY, AI_EXTRACT, AI_SUMMARIZE and AI_COMPLETE use when the call names none; empty: ai.model.data |
+| `ai.functions.models` | text | `` | global (operator only) | - | live | Other provider/model values an AI function's model argument may name, comma-separated; the default model is always allowed |
+| `ai.functions.on_budget` | text | `error` | tenant, global | error, null | live | What an AI function does when the daily token budget is spent: error fails the statement with 39992; null gives NULL for the rows not yet answered |
 | `ai.max_output_tokens` | int | `16000` | global (operator only) | 256 to 128000 | live | Output tokens one model call may produce, reasoning included |
 | `ai.max_tool_rounds` | int | `12` | global (operator only) | 0 to 100 | live | Tool rounds one assistant turn may take |
 | `ai.mcp.calls_per_minute` | int | `120` | tenant, global | 1 to 100000 | live | MCP tool calls one user may make per minute; more are refused until the minute is over |
@@ -51,6 +74,8 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `ai.model.data` | text | `` | global (operator only) | - | live | provider/model for the data specialist; empty: none |
 | `ai.model.dba` | text | `` | global (operator only) | - | live | provider/model for the DBA assistant; empty: none |
 | `ai.model.triage` | text | `` | global (operator only) | - | live | provider/model that screens administration intake for noise; empty: none |
+| `ai.retrieval.candidates` | int | `40` | global (operator only) | 5 to 1000 | live | Hits a retrieval index search takes from each shard's full-text list and vector list before fusing them |
+| `ai.retrieval.max_chunks_per_row` | int | `64` | global (operator only) | 1 to 10000 | live | Chunks a retrieval index keeps of one row at most; the rest of a longer text isn't indexed |
 | `ai.share_data` | bool | `false` | database, tenant, global | - | live | Let the assistants send rows, results and value statistics to the AI provider; off sends schema, plans and statistics without values |
 | `ai.timeout_seconds` | int | `120` | global (operator only) | 5 to 3600 | live | Wall time of one assistant turn, model calls and tools together |
 
@@ -94,9 +119,9 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `api.max_concurrent_streams` | int | `100` | dc, global | 1 to 10000 | live | HTTP/2 streams per connection |
 | `api.max_request_bytes` | int | `16777216` | dc, global | 1024 to 1073741824 | live | Largest request body |
 | `api.rest.max_buffered_bytes` | int | `16777216` | dc, global | 1024 to 1073741824 | live | Largest non-streamed REST result |
-| `api.stream.heartbeat_seconds` | int | `15` | dc, global | 1 to 3600 | live | Heartbeat when no change event arrives |
-| `api.stream.max_buffered_events` | int | `10000` | dc, global | 16 to 10000000 | live | Change events buffered for a slow client |
-| `api.stream.max_per_tenant` | int | `1000` | dc, global | 0 to 1000000 | live | Open change streams per tenant per gateway |
+| `api.stream.heartbeat_seconds` | int | `15` | tenant, dc, global | 1 to 3600 | live | Heartbeat when no change event arrives |
+| `api.stream.max_buffered_events` | int | `10000` | tenant, dc, global | 16 to 10000000 | live | Change events buffered for a slow client |
+| `api.stream.max_per_tenant` | int | `1000` | tenant, dc, global | 0 to 1000000 | live | Open change streams per tenant per gateway |
 | `api.stream_batch_rows` | int | `500` | dc, global | 1 to 1000000 | live | Rows per streamed batch |
 | `api.txn.idle_timeout_ms` | int | `10000` | dc, global | 100 to 3600000 | live | Idle time before a transaction handle expires |
 | `api.txn.max_lifetime_ms` | int | `60000` | dc, global | 100 to 86400000 | live | Longest life of a transaction handle |
@@ -154,6 +179,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `auth.impersonation_max_minutes` | int | `60` | tenant, dc, global | 1 to 1440 | live | Longest impersonation session |
 | `auth.ip_block_seconds` | int | `300` | dc, global | 1 to 86400 | live | How long an address with too many failed logins is refused |
 | `auth.ip_failures_per_minute` | int | `30` | dc, global | 0 to 1000000 | live | Failed logins per source address per minute before it is refused; 0 never |
+| `auth.jwks_refresh_seconds` | int | `3600` | tenant, dc, global | 60 to 604800 | live | Refresh period of issuers' key sets; cached keys serve twice as long while the issuer fails |
 | `auth.mfa_challenge_seconds` | int | `300` | tenant, dc, global | 30 to 3600 | live | Life of a second-factor challenge |
 | `auth.mfa_required` | text | `off` | tenant, dc, global | off, admins, all | live | Second factor for HTTP logins: off, admins or all |
 | `auth.mysql_native_password` | bool | `false` | tenant, dc, global | - | live | Store and accept mysql_native_password verifiers |
@@ -168,6 +194,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `auth.require_tls` | bool | `false` | tenant, dc, global | - | live | Refuse users who connected without TLS |
 | `auth.scram_sha256_iterations` | int | `15000` | tenant, dc, global | 5000 to 1000000 | live | PBKDF2 iterations of new SCRAM-SHA-256 verifiers |
 | `auth.scram_sha512_iterations` | int | `15000` | tenant, dc, global | 5000 to 1000000 | live | PBKDF2 iterations of new SCRAM-SHA-512 verifiers |
+| `auth.token_clock_skew_seconds` | int | `60` | tenant, dc, global | 0 to 600 | live | Clock skew allowed on external tokens' exp, nbf and iat |
 | `auth.token_key_rotation_days` | int | `30` | dc, global (operator only) | 1 to 365 | live | Signing-key rotation |
 | `auth.token_ttl_seconds` | int | `900` | tenant, dc, global | 60 to 86400 | live | Access-token lifetime |
 | `auth.unsafe_privilege_action` | text | `warn` | tenant, dc, global | warn, error | live | warn (drop server-wide privileges with 39350) or error (refuse with 1227) |
@@ -302,6 +329,8 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `catalog.cache_max_mb` | int | `512` | dc, global (operator only) | 1 to 1048576 | live | Catalog cache memory per gateway |
 | `catalog.cache_max_tenants` | int | `20000` | dc, global (operator only) | 1 to 10000000 | live | Tenants cached per gateway |
 | `catalog.cache_ttl_seconds` | int | `300` | dc, global (operator only) | 1 to 86400 | live | Backstop for missed watch events: re-read the directory entry after this long |
+| `catalog.contract_delay_days` | int | `7` | global (operator only) | 0 to 3650 | live | Days after a catalog module's last expand migration before its contract migrations may run; only an override with a recorded reason runs one earlier |
+| `catalog.ddl_wait_ms` | int | `10000` | tenant, dc, global | 0 to 3600000 | live | Wait for a pending DDL job |
 | `catalog.orphan_retention_days` | int | `7` | dc, global (operator only) | 0 to 3650 | live | Quarantine before dropping an empty orphan |
 | `catalog.reconcile_interval_seconds` | int | `300` | dc, global (operator only) | 1 to 86400 | live | Reconciler period per tenant |
 | `catalog.stuck_state_minutes` | int | `15` | dc, global (operator only) | 1 to 10080 | live | Age at which a transient state is stuck |
@@ -331,6 +360,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 
 | Key | Type | Default | Scopes | Bounds | Applies | Description |
 |---|---|---|---|---|---|---|
+| `compat.engine_substitution` | text | `innodb` | tenant, global | innodb, reject | live | innodb: a MyISAM, MEMORY, Aria, CSV or ARCHIVE table is created as InnoDB, with the server's warning; reject: the statement fails (3161 on 3306, 1290 on 3307) |
 | `compat.global.max_execution_time` | text | `` | tenant, dc, global | - | new sessions | The tenant's default max_execution_time in ms for new 3306 sessions (SET GLOBAL); empty: 0 |
 | `compat.global.sql_mode` | text | `` | tenant, dc, global | - | new sessions | The tenant's default sql_mode for new sessions (SET GLOBAL sql_mode); empty: the persona's |
 | `compat.global.time_zone` | text | `` | tenant, dc, global | - | new sessions | The tenant's default time_zone for new sessions (SET GLOBAL time_zone); empty: the server's |
@@ -355,6 +385,12 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | Key | Type | Default | Scopes | Bounds | Applies | Description |
 |---|---|---|---|---|---|---|
 | `ddl.mover_wait_minutes` | int | `120` | tenant, dc, global (operator only) | 0 to 1440 | live | How long DDL waits for mover jobs |
+
+## `decisions`
+
+| Key | Type | Default | Scopes | Bounds | Applies | Description |
+|---|---|---|---|---|---|---|
+| `decisions.retention_days` | int | `180` | tenant, global (operator only) | 1 to 36500 | live | Decision log retention |
 
 ## `doc`
 
@@ -452,6 +488,14 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `graph.max_time_ms` | int | `30000` | object, database, tenant, global | 1 to 86400000 | live | Wall time of one graph statement, in milliseconds |
 | `graph.mirror` | text | `async` | object, database, tenant, global | off, async, sync | live | Mirrors of incoming relationships: off, async or sync |
 | `graph.mirror_max_wait_ms` | int | `1000` | object, database, tenant, global | 0 to 60000 | live | Wait for the mirror applier to reach the session's causal target before scattering |
+| `graph.session_pool` | int | `96` | dc, global | 4 to 4096 | live | Connections per cluster that a gateway's Bolt sessions take from |
+| `graph.slot_wait_ms` | int | `250` | dc, global | 0 to 60000 | live | How long a graph statement waits for a graph slot before it runs without one, in milliseconds |
+| `graph.slots` | int | `0` | dc, global | 0 to 4096 | live | Graph statements one gateway runs at once (0: three per CPU, at least 12); more wait graph.slot_wait_ms |
+| `graph.spare_wait_ms` | int | `50` | dc, global | 0 to 10000 | live | How long a graph read waits for a spare connection before it reads its shards one after another, in milliseconds |
+| `graph.spares` | int | `32` | dc, global | 0 to 4096 | live | Spare connections all auto-commit graph reads of one gateway hold at once, per cluster |
+| `graph.spares_per_read` | int | `3` | dc, global | 0 to 64 | live | Spare connections one auto-commit graph read takes per cluster |
+| `graph.storage` | text | `json` | object, database, tenant, global | json, typed | live | How new native graphs store their elements: json or typed (a table per label set and relationship type) |
+| `graph.traversal_tier` | text | `auto` | object, database, tenant, cluster, dc, global | auto, cte, gateway, plugin | live | Traversal tier: auto, cte, gateway or plugin |
 
 ## `hierarchy`
 
@@ -601,6 +645,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `lookup.backfill_chunk_rows` | int | `1000` | tenant, dc, global | 10 to 100000 | live | Owner rows per back-fill and verification chunk |
 | `lookup.build_lease_seconds` | int | `30` | tenant, dc, global | 5 to 3600 | live | A lookup build untouched this long is taken over |
 | `lookup.lock_wait_seconds` | int | `5` | object, database, tenant, global | 1 to 3600 | live | Lock wait for claims and owner checks |
+| `lookup.orphan_scan_hours` | int | `24` | tenant, dc, global | 0 to 8760 | live | Hours between orphan scans of each lookup (0: off) |
 | `lookup.publish_timeout_ms` | int | `10000` | tenant, dc, global | 100 to 600000 | live | Wait for every gateway to acknowledge a lookup state change |
 
 ## `meta`
@@ -661,6 +706,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `mover.job_lease_seconds` | int | `10` | cluster, dc, global (operator only) | 2 to 3600 | live | Worker lease |
 | `mover.max_copies_per_cluster` | int | `2` | cluster, dc, global (operator only) | 1 to 64 | live | Concurrent copies reading or writing one cluster |
 | `mover.max_cutover_attempts` | int | `5` | cluster, dc, global (operator only) | 1 to 1000 | live | Then pause and alert |
+| `mover.max_pause_minutes` | int | `60` | cluster, dc, global (operator only) | 1 to 100000 | live | Longest tolerated unreachable target |
 | `mover.ready_max_lag_ms` | int | `1000` | cluster, dc, global (operator only) | 1 to 600000 | live | Lag needed before cutover |
 | `mover.ready_sustain_seconds` | int | `60` | cluster, dc, global (operator only) | 0 to 86400 | live | How long that lag must hold |
 | `mover.server_id_base` | int | `4000000000` | dc, global (operator only) | 1000000 to 4199999000 | live | First binlog client server id of the mover's jobs (a job adds an offset from its id) |
@@ -672,6 +718,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `mover.tick_interval_ms` | int | `250` | cluster, dc, global (operator only) | 10 to 60000 | live | Lag tick period |
 | `mover.txn_grace_ms` | int | `300` | cluster, dc, global (operator only) | 0 to 60000 | live | Grace for open transactions at hold |
 | `mover.verify_max_repairs` | int | `3` | cluster, dc, global (operator only) | 0 to 1000 | live | Repairs before failing |
+| `mover.verify_mode` | text | `full` | tenant, cluster, dc, global (operator only) | full, sample, off | live | full, sample or off |
 
 ## `names`
 
@@ -716,6 +763,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `queue.owner_move_after_seconds` | int | `60` | dc, global | 0 to 86400 | live | Consumers on another gateway this long move a queue's owner there |
 | `queue.owner_move_cooldown_seconds` | int | `300` | dc, global | 0 to 86400 | live | Least time between two moves of one queue's owner |
 | `queue.takeover_grace_ms` | int | `2000` | dc, global | 0 to 60000 | live | Re-attachment window after an owner takeover, in ms |
+| `queue.vhost_idle_close_seconds` | int | `300` | dc, global | 0 to 86400 | live | Close a gateway's idle vhost after this many seconds without connections, consumers or work (0 = never) |
 | `queue.write_batch_max_rows` | int | `500` | dc, global | 1 to 100000 | live | Rows per queue owner write batch |
 
 ## `reads`
@@ -904,6 +952,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `stream.produce_wait_ms` | int | `2000` | tenant, global | 0 to 600000 | live | How long a Kafka produce waits for its records' offsets |
 | `stream.retention_bytes` | int | `0` | object, database, tenant, global | 0 to 9223372036854776000 | live | Size retention per partition; 0 = none |
 | `stream.retention_hours` | int | `168` | object, database, tenant, global | 1 to 87600 | live | Time retention of a stream's records |
+| `stream.sequencer_batch_ms` | int | `10` | dc, global | 0 to 10000 | live | Batching window of a stream sequencer |
 | `stream.sequencer_lag_alert_seconds` | int | `60` | dc, global | 1 to 86400 | live | Lag past which a stream sequencer counts as lagging |
 | `stream.tombstone_hours` | int | `24` | object, database, tenant, global | 0 to 87600 | live | How long tombstones stay on compacted streams |
 
@@ -965,15 +1014,6 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `tls.bundles.default.key_path` | text | `` | dc, global | - | live | PEM private key of the default bundle; watched for changes |
 | `tls.min_version` | text | `1.2` | dc, global | 1.2, 1.3 | rebind | Lowest TLS version client listeners accept |
 
-## `tuning`
-
-| Key | Type | Default | Scopes | Bounds | Applies | Description |
-|---|---|---|---|---|---|---|
-| `tuning.interval_minutes` | int | `15` | cluster, dc, global (operator only) | 1 to 10080 | live | Tuning pass period |
-| `tuning.memory_budget_pct` | int | `10` | cluster, dc, global (operator only) | 1 to 90 | live | Server memory the table and routine caches may use |
-| `tuning.min_change_pct` | int | `20` | cluster, dc, global (operator only) | 0 to 1000 | live | Smallest change worth applying or recommending |
-| `tuning.table_open_cache_mode` | text | `auto` | cluster, dc, global (operator only) | auto, recommend, off | live | auto, recommend or off |
-
 ## `txn`
 
 | Key | Type | Default | Scopes | Bounds | Applies | Description |
@@ -987,6 +1027,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `txn.prepare_timeout_ms` | int | `5000` | tenant, cluster, dc, global | 100 to 600000 | live | Deadline for each prepare |
 | `txn.resolver_interval_seconds` | int | `10` | dc, global | 1 to 3600 | live | Resolver scan interval |
 | `txn.resolver_min_age_seconds` | int | `30` | dc, global | 1 to 86400 | live | Prepared this long before the resolver acts |
+| `txn.sprig_2pc_path` | text | `gateway` | tenant, dc, global | gateway, relay | live | Under txn.non_xa_policy = sprig_2pc, who holds a held branch: gateway (the gateway session's own connection; if the gateway dies after the commit point, other writers can change those rows before the replay) or relay (every connection of the tenant to a Galera cluster with agent relays passes the relay writer, which keeps a lost holder's rows fenced until they are recovered; a cluster without a ready relay then refuses a second writer with 39440) |
 
 ## `types`
 
@@ -1013,16 +1054,16 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | Key | Type | Default | Scopes | Bounds | Applies | Description |
 |---|---|---|---|---|---|---|
 | `workload.bucket_minutes` | int | `60` | dc, global | 1 to 1440 | live | Statistics bucket size |
-| `workload.capture_samples` | bool | `true` | object, database, tenant, global | - | live | Parameter capture switch |
+| `workload.capture_samples` | bool | `true` | database, tenant, global | - | live | Parameter capture switch |
 | `workload.examined_sample_rate` | float | `0.02` | dc, global | 0 to 1 | live | Probe rate for watched fingerprints |
 | `workload.flush_seconds` | int | `900` | dc, global | 1 to 86400 | live | Partial flush period |
 | `workload.full_probe_ms` | int | `100` | dc, global | 0 to 3600000 | live | Mean latency from which every execution is probed |
-| `workload.max_fingerprints_per_tenant` | int | `10000` | tenant, global | 10 to 10000000 | live | Cap; the rest count as other |
+| `workload.max_fingerprints_per_tenant` | int | `10000` | dc, global | 10 to 10000000 | live | Cap; the rest count as other |
 | `workload.max_in_list_values` | int | `1000` | dc, global | 1 to 1000000 | live | IN values kept in a sample |
 | `workload.max_memory_mb` | int | `128` | dc, global | 1 to 65536 | live | Recorder memory per gateway |
 | `workload.max_samples_per_fingerprint` | int | `50` | dc, global | 0 to 10000 | live | Stored samples kept |
 | `workload.max_text_bytes` | int | `4096` | dc, global | 64 to 1048576 | live | Longest normalized text |
-| `workload.retention_days` | int | `30` | tenant, global | 1 to 3650 | live | Stats retention |
+| `workload.retention_days` | int | `30` | dc, global | 1 to 3650 | live | Stats retention |
 | `workload.rollup_delay_minutes` | int | `10` | dc, global | 0 to 1440 | live | Wait after a bucket closes |
 | `workload.sample_rate` | float | `0.01` | dc, global | 0 to 1 | live | Capture rate for watched fingerprints |
 | `workload.sample_retention_days` | int | `7` | dc, global | 1 to 365 | live | Sample lifetime |

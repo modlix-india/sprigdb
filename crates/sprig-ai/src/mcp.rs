@@ -308,7 +308,8 @@ pub async fn call(
         )
         .await;
     }
-    let called = run(env, role, spec, &id, &args).await;
+    let can_propose = tools.iter().any(|s| s.name == "propose_sql");
+    let called = run(env, role, spec, &id, &args, can_propose).await;
     crate::metrics::mcp_tool_call(role, spec.name, called.outcome);
     if let Some(a) = audit {
         if let Some(p) = &called.proposal {
@@ -343,7 +344,15 @@ fn unwrap(text: &str) -> Value {
     serde_json::from_str(&inner).unwrap_or(Value::String(inner))
 }
 
-async fn run(env: &dyn McpEnv, role: Role, spec: &ToolSpec, id: &str, args: &Value) -> Called {
+#[allow(clippy::too_many_lines)] // checked, proposed or read: one path each
+async fn run(
+    env: &dyn McpEnv,
+    role: Role,
+    spec: &ToolSpec,
+    id: &str,
+    args: &Value,
+    can_propose: bool,
+) -> Called {
     let fail = |m: &str, outcome: &'static str| Called {
         result: error_result(m),
         outcome,
@@ -356,10 +365,36 @@ async fn run(env: &dyn McpEnv, role: Role, spec: &ToolSpec, id: &str, args: &Val
         Err(e) => return fail(&e.message, "denied"),
     };
     if spec.effect == Effect::Propose {
-        let p = match ToolRegistry::propose(&spec, id, args) {
+        let db = args
+            .get("db")
+            .and_then(Value::as_str)
+            .filter(|d| !d.is_empty());
+        let share_data = env.share_data(db);
+        let checked = match tokio::time::timeout(
+            TOOL_TIMEOUT,
+            env.host(share_data).check_proposal(&spec, args),
+        )
+        .await
+        {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => return fail(&error_text(&e), "error"),
+            Err(_) => {
+                return fail(
+                    &format!(
+                        "checking {} took longer than {}s",
+                        spec.name,
+                        TOOL_TIMEOUT.as_secs()
+                    ),
+                    "error",
+                );
+            }
+        };
+        let mut p = match ToolRegistry::propose(&spec, id, args) {
             Ok(p) => p,
             Err(e) => return fail(&e.message, "error"),
         };
+        p.checks = checked.checks;
+        p.generated = checked.generated;
         crate::metrics::proposal(p.kind.as_str(), "shown");
         let mut filed = Value::Null;
         if p.kind == ProposalKind::Glossary {
@@ -370,13 +405,24 @@ async fn run(env: &dyn McpEnv, role: Role, spec: &ToolSpec, id: &str, args: &Val
                 }
             }
         }
+        let mut proposal = json!({"id": p.id, "kind": p.kind.as_str(), "body": p.body});
+        if let Some(c) = &p.checks {
+            proposal["checks"] = c.clone();
+        }
+        // Generated statements may hold existing keys: values, so they go
+        // to an outside agent only with data sharing on.
+        if share_data && let Some(g) = &p.generated {
+            proposal["generated"] = g.clone();
+        }
         let note = json!({
-            "proposal": {"id": p.id, "kind": p.kind.as_str(), "body": p.body},
+            "proposal": proposal,
             "filed": filed,
             "status": "proposed; it has NOT run",
-            "next": "Show this to the user. They review it and run it themselves (a statement in \
-                     their SQL client or SprigDB Studio; a glossary term is accepted by a tenant \
-                     administrator). Never say it was applied.",
+            "next": "Show this to the user. They review it and decide: they run a statement \
+                     themselves in their SQL client or SprigDB Studio, or accept the proposal by \
+                     its id (POST /v1/ai/proposals/{id}:accept, as themselves, after confirming), \
+                     which also files a recommendation in the approvals inbox; a glossary term is \
+                     accepted by a tenant administrator. Never say it was applied.",
         });
         return Called {
             result: text_result(wrap(&note.to_string()), false),
@@ -390,7 +436,7 @@ async fn run(env: &dyn McpEnv, role: Role, spec: &ToolSpec, id: &str, args: &Val
         .and_then(Value::as_str)
         .filter(|d| !d.is_empty());
     let share_data = env.share_data(db);
-    let gate = EgressGate::new(EgressPolicy { role, share_data }, None);
+    let gate = EgressGate::new(EgressPolicy { role, share_data }, None).with_proposals(can_propose);
     let host = env.host(share_data);
     match tokio::time::timeout(TOOL_TIMEOUT, host.call(&spec, args)).await {
         Ok(Ok(out)) => {

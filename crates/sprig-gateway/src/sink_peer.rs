@@ -18,11 +18,13 @@
 //! Images {tables}       which row images the user may see: rows
 //!                       (t, i, v) of crate::exec::rls_images
 //! Publish {statements}  a change exchange's CALL sprig.mq_publish
-//!                       calls, autocommit, in order (workers before r9feed4)
+//!                       calls, autocommit, in order (older workers)
 //! PublishBatch {vhost, exchange, messages}
 //!                       a change exchange's messages, each as its message
 //!                       id, through the queue engine as the user, in order,
-//!                       up to the first that fails (R9 r9feed4)
+//!                       up to the first that fails; to an
+//!                       exchange inherited from a declarer, into the
+//!                       tenant's own instance, stamped
 //! ```
 
 use std::net::SocketAddr;
@@ -267,12 +269,19 @@ async fn publish_batch(
         s.retryable = true;
         s
     };
-    // An exchange inherited from a declarer (chapter 42) takes the
-    // statement path, which targets or stamps the message as
-    // `sprig.mq_publish` does there; at least once (no message ids).
-    if inherited_exchange(&svc, tenant, vhost, exchange, &messages).await? {
-        return publish_statements(engine, caller, vhost, exchange, messages).await;
-    }
+    // An exchange inherited from a declarer: the messages go into this
+    // tenant's own instance, stamped as `sprig.mq_publish` does there,
+    // each as its id. A batch with a message that names another tenant, or that `sprig.mq_publish` would refuse, takes
+    // the statement path as before: at least once.
+    let my_name = caller.principal.tenant_name.clone().unwrap_or_default();
+    let own = match inherited_exchange(&svc, (tenant, &my_name), vhost, exchange, &messages).await?
+    {
+        Inherited::No => None,
+        Inherited::Own(own) => Some(own),
+        Inherited::Statements => {
+            return publish_statements(engine, caller, vhost, exchange, messages).await;
+        }
+    };
     let mq = svc.mq.get().cloned().ok_or_else(|| {
         let mut e = SprigError::new(
             SprigCode::ForwardFailed,
@@ -298,14 +307,30 @@ async fn publish_batch(
         let id = sprig_sinks::peer::publish_id(&m.id).ok_or_else(|| {
             SprigError::internal(format!("message id {:?} isn't 32 hex digits", m.id))
         })?;
-        let msg = sprig_queues::sql::message(
+        let mut msg = sprig_queues::sql::message(
             exchange,
             &m.routing_key,
             m.body.into_bytes(),
             m.properties.as_deref(),
         )
         .map_err(|e| mq_err(&e))?;
+        if let Some(own) = &own
+            && own.names(&msg)
+        {
+            msg = own.stamp(&msg)?;
+        }
         msgs.push((msg, id));
+    }
+    if let Some(own) = &own {
+        // The member's instance of the inherited definitions, as a
+        // publish there makes it.
+        Box::pin(crate::inherited::mq::ensure_vhost(
+            &svc,
+            &own.chain,
+            &own.db,
+            sprig_inherit::msg::Cause::Publish,
+        ))
+        .await?;
     }
     let results = v
         .publish_batch_once(msgs)
@@ -328,16 +353,59 @@ async fn publish_batch(
     })
 }
 
-/// Whether `exchange` of `vhost` (a database) is, for any of `messages`,
-/// one of the inherited definitions `sprig.mq_publish` routes itself
-/// (`exec::inherit_msg`).
+/// How a batch's messages meet the inherited definitions
+/// `sprig.mq_publish` routes itself (`exec::inherit_msg`).
+enum Inherited {
+    /// None of them names one.
+    No,
+    /// Some name one that reaches this tenant, without naming another
+    /// tenant: they go into this tenant's own instance, stamped.
+    Own(OwnInstance),
+    /// One names another tenant (or every member), or a definition that
+    /// doesn't reach this tenant: the statement path decides.
+    Statements,
+}
+
+/// A member's own instance of inherited definitions, for a batch.
+struct OwnInstance {
+    chain: sprig_inherit::msg::Chain,
+    /// The vhost's database.
+    db: String,
+    /// This tenant's name, stamped on its messages.
+    me: String,
+}
+
+impl OwnInstance {
+    /// Whether `m` names an inherited definition.
+    fn names(&self, m: &sprig_proto_amqp::message::Message) -> bool {
+        crate::inherited::mq::named_def(&self.chain, &self.db, &m.exchange, &m.routing_key)
+            .is_some()
+    }
+
+    /// `m` with the tenant headers set to this tenant, its routing key
+    /// without an `@me:` prefix, as `exec::inherit_msg` stamps a publish
+    /// into a tenant's own instance.
+    fn stamp(
+        &self,
+        m: &sprig_proto_amqp::message::Message,
+    ) -> Result<sprig_proto_amqp::message::Message> {
+        let key =
+            crate::inherited::mq::target_of(m).map_or_else(|| m.routing_key.clone(), |(_, k)| k);
+        crate::inherited::mq::stamp(m, &key, &self.me, &self.me)
+            .map_err(|e| SprigError::standard(3140, *b"22032", e.text))
+    }
+}
+
+/// How `messages` to `exchange` of `vhost` meet the inherited
+/// definitions (see [`Inherited`]): the cases of
+/// `PassSession::inherit_mq_publish`, decided for the whole batch.
 async fn inherited_exchange(
     svc: &Arc<crate::tenant::TenantServices>,
-    tenant: u64,
+    (tenant, my_name): (u64, &str),
     vhost: &str,
     exchange: &str,
     messages: &[sprig_sinks::peer::PublishMessage],
-) -> Result<bool> {
+) -> Result<Inherited> {
     let cat = svc
         .cache
         .get(
@@ -346,11 +414,48 @@ async fn inherited_exchange(
         )
         .await?;
     if crate::inherited::state_of(&cat).is_empty() && cat.ancestry.is_empty() {
-        return Ok(false);
+        return Ok(Inherited::No);
     }
+    let db = sprig_proto_amqp::mem::default_database(
+        vhost,
+        &svc.settings.get(
+            &crate::amqp::DEFAULT_VHOST_DATABASE,
+            &cat.setting_ctx(&svc.dc),
+            Some(&cat.settings),
+        ),
+    );
     let chain = crate::inherited::chain(svc, &cat).await?;
-    Ok(messages.iter().any(|m| {
-        crate::inherited::mq::named_def(&chain, vhost, exchange, &m.routing_key).is_some()
+    let me = cat.tenant;
+    let reaching = crate::inherited::mq::defs_in(&chain, &db);
+    let mut any = false;
+    for m in messages {
+        let msg = sprig_queues::sql::message(
+            exchange,
+            &m.routing_key,
+            m.body.as_bytes().to_vec(),
+            m.properties.as_deref(),
+        )
+        .map_err(|e| SprigError::internal(e.text))?;
+        let Some((kind, name)) =
+            crate::inherited::mq::named_def(&chain, &db, &msg.exchange, &msg.routing_key)
+        else {
+            continue;
+        };
+        let mine = reaching.iter().any(|d| d.kind == kind && d.name == name);
+        let other = crate::inherited::mq::target_of(&msg)
+            .is_some_and(|(t, _)| t != my_name && t != me.0.to_string());
+        if !mine || other {
+            return Ok(Inherited::Statements);
+        }
+        any = true;
+    }
+    if !any {
+        return Ok(Inherited::No);
+    }
+    Ok(Inherited::Own(OwnInstance {
+        chain,
+        db,
+        me: my_name.to_owned(),
     }))
 }
 

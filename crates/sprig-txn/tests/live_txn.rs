@@ -130,13 +130,16 @@ async fn q(url: &str, sql: &str) -> Vec<mysql_async::Row> {
 }
 
 /// The capability probe's XA check, reduced: `XA START` works (1235 on Galera).
+/// The xid is this process's own: tests run in parallel (nextest runs each
+/// in its own process), and two probes with one xid get 1440 (`XAER_DUPID`).
 async fn probe_xa(url: &str) -> bool {
     let mut c = mysql_async::Conn::new(Opts::from_url(url).unwrap())
         .await
         .unwrap();
-    let ok = match c.query_drop("XA START 'r1txn-probe'").await {
+    let xid = format!("'r1txn-probe-{}-{}'", std::process::id(), c.id());
+    let ok = match c.query_drop(format!("XA START {xid}")).await {
         Ok(()) => {
-            c.query_drop("XA END 'r1txn-probe'; XA ROLLBACK 'r1txn-probe'")
+            c.query_drop(format!("XA END {xid}; XA ROLLBACK {xid}"))
                 .await
                 .unwrap();
             true

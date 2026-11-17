@@ -9,6 +9,7 @@ import { json } from '../api/client';
 import { errorText } from '../api/errors';
 import { ResultBuffer } from '../results/buffer';
 import { Chart } from '../results/Chart';
+import { AskButton } from '../ai/AskButton';
 
 export interface FingerprintRow {
   id: string;
@@ -129,9 +130,29 @@ export function Fingerprints() {
                 <td>{f.unsargable.length ? f.unsargable.length : '—'}</td>
                 <td>{f.caller === 'studio' ? 'Studio' : f.caller ?? 'Application'}</td>
                 <td>
-                  <button onClick={() => setOpen(f.id)} aria-label={`Latency series of ${f.id}`}>
-                    Series
-                  </button>
+                  <div className="row" style={{ flexWrap: 'nowrap' }}>
+                    <button onClick={() => setOpen(f.id)} aria-label={`Latency series of ${f.id}`}>
+                      Series
+                    </button>
+                    <AskButton
+                      label="Why is this slow?"
+                      role="dba"
+                      testId="ask-slow-fingerprint"
+                      options={() => ({
+                        text: `Why is this statement slow (fingerprint ${f.id}), and what would make it faster?`,
+                        chips: [
+                          ...(f.db ? [{ id: `db:${f.db}`, kind: 'database' as const, label: f.db, ref: f.db }] : []),
+                          { id: `query:${f.id}`, kind: 'query' as const, label: `fingerprint ${f.id.slice(0, 8)}`, ref: f.text },
+                          {
+                            id: `note:${f.id}`,
+                            kind: 'note' as const,
+                            label: 'its workload',
+                            ref: `Fingerprint ${f.id}: ${f.runs} runs, p50 ${f.p50_ms} ms, p95 ${f.p95_ms} ms, ${f.total_ms} ms in all, ${f.examined_per_returned ?? 'unknown'} rows examined per row returned.`,
+                          },
+                        ],
+                      })}
+                    />
+                  </div>
                 </td>
               </tr>
             ))}

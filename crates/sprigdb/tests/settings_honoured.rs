@@ -1,5 +1,5 @@
 //! Every registered setting is honoured as declared, as far as the source
-//! shows it mechanically (bugfix "setfix", 13 Nov 2026):
+//! shows it mechanically:
 //!
 //! - **read**: something besides its declaration and registration names
 //!   the setting's static or its key, so a value someone sets does
@@ -34,6 +34,29 @@ const KNOWN_UNREAD: &[(&str, &str)] = &[(
     "sink.kafka.offsets_topic",
     "read only through the sink.* option merge, by key",
 )];
+
+/// Keys marked `Unbuilt` whose only reader is a library in the file that
+/// declares them, which nothing outside it calls yet: the key stays hidden
+/// until something wires the library. The test fails once another file
+/// names one (unmark it then).
+const UNBUILT_LIBRARY_READS: &[(&str, &str)] = &[
+    (
+        "tuning.interval_minutes",
+        "sprig-cluster's tuner; the tuning pass isn't scheduled",
+    ),
+    (
+        "tuning.memory_budget_pct",
+        "sprig-cluster's tuner; the tuning pass isn't scheduled",
+    ),
+    (
+        "tuning.min_change_pct",
+        "sprig-cluster's tuner; the tuning pass isn't scheduled",
+    ),
+    (
+        "tuning.table_open_cache_mode",
+        "sprig-cluster's tuner; the tuning pass isn't scheduled",
+    ),
+];
 
 /// Keys tenants may set whose reading files show no tenant context, each
 /// read per tenant in a way the scan can't see. Real gaps (read at dc and
@@ -335,6 +358,10 @@ fn tenant_context(text: &str) -> bool {
         "dyn Fn(&",
         "impl Fn(&'static",
         "SettingCtx<'_>",
+        // A reader handed in as a `Lookup` (the AI keys' `FnSettings::read`
+        // and its kin): the same, the caller picks the context (the
+        // gateway's is the tenant's, or its database's).
+        "l: &dyn Lookup",
     ]
     .iter()
     .any(|m| text.contains(m))
@@ -375,6 +402,12 @@ fn registered_settings_are_honoured_as_declared() {
             Mark::Unbuilt => assert!(!listed.contains(k), "{k} is marked unbuilt but listed"),
             Mark::Restart => assert!(listed.contains(k), "{k} is marked restart but not listed"),
         }
+    }
+    for (k, _) in UNBUILT_LIBRARY_READS {
+        assert!(
+            unbuilt.contains(k),
+            "{k} is in UNBUILT_LIBRARY_READS but not marked unbuilt (remove it there)"
+        );
     }
     let keys: Vec<&str> = listed
         .iter()
@@ -445,7 +478,8 @@ fn registered_settings_are_honoured_as_declared() {
             }
         }
         if unbuilt.contains(key) {
-            if !readers.is_empty() {
+            let library = UNBUILT_LIBRARY_READS.iter().any(|(k, _)| k == key);
+            if readers.iter().any(|&fi| !(library && fi == decl.file)) {
                 unbuilt_read.insert((*key).to_owned());
             }
             continue;

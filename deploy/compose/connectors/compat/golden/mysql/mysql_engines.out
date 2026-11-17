@@ -1,0 +1,223 @@
+--------------
+-- Engines other than InnoDB become InnoDB, with the warnings MySQL 8.4 gives
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+-- when the engine is in disabled_storage_engines and the session allows
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+-- substitution. The reference runs with MyISAM, MEMORY, CSV and ARCHIVE
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+-- disabled; MySQL substitutes only without NO_ENGINE_SUBSTITUTION, the
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+-- gateway always does. Not here, where MySQL differs on purpose:
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+-- CREATE TABLE ... ENGINE=MyISAM AS SELECT warns and still makes a MyISAM
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+-- table, and a disabled default_storage_engine fails with 3161 even
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+-- without NO_ENGINE_SUBSTITUTION; the gateway makes InnoDB tables.
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+SET sql_mode = ''
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+CREATE TABLE c_me_my (a int, KEY k (a DESC)) ENGINE=MyISAM
+--------------
+
+Query OK, 0 rows affected, 2 warnings
+
+--------------
+SHOW WARNINGS
+--------------
+
+Level	Code	Message
+Warning	3161	Storage engine MyISAM is disabled (Table creation is disallowed).
+Warning	1266	Using storage engine InnoDB for table 'c_me_my'
+2 rows in set
+
+--------------
+SHOW CREATE TABLE c_me_my
+--------------
+
+Table	Create Table
+c_me_my	CREATE TABLE `c_me_my` (
+  `a` int DEFAULT NULL,
+  KEY `k` (`a` DESC)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+1 row in set
+
+--------------
+CREATE TABLE c_me_mem (a int) ENGINE = MEMORY COMMENT 'm'
+--------------
+
+Query OK, 0 rows affected, 2 warnings
+
+--------------
+SHOW WARNINGS
+--------------
+
+Level	Code	Message
+Warning	3161	Storage engine MEMORY is disabled (Table creation is disallowed).
+Warning	1266	Using storage engine InnoDB for table 'c_me_mem'
+2 rows in set
+
+--------------
+CREATE TABLE c_me_heap (a int) ENGINE=heap
+--------------
+
+Query OK, 0 rows affected, 2 warnings
+
+--------------
+SHOW WARNINGS
+--------------
+
+Level	Code	Message
+Warning	3161	Storage engine MEMORY is disabled (Table creation is disallowed).
+Warning	1266	Using storage engine InnoDB for table 'c_me_heap'
+2 rows in set
+
+--------------
+CREATE TABLE c_me_csv (a int NOT NULL) ENGINE CSV
+--------------
+
+Query OK, 0 rows affected, 2 warnings
+
+--------------
+SHOW WARNINGS
+--------------
+
+Level	Code	Message
+Warning	3161	Storage engine CSV is disabled (Table creation is disallowed).
+Warning	1266	Using storage engine InnoDB for table 'c_me_csv'
+2 rows in set
+
+--------------
+CREATE TABLE c_me_arch (a int) ENGINE='ARCHIVE'
+--------------
+
+Query OK, 0 rows affected, 2 warnings
+
+--------------
+SELECT TABLE_NAME, ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE 'c\_me\_%' ORDER BY TABLE_NAME
+--------------
+
+TABLE_NAME	ENGINE
+c_me_arch	InnoDB
+c_me_csv	InnoDB
+c_me_heap	InnoDB
+c_me_mem	InnoDB
+c_me_my	InnoDB
+5 rows in set
+
+--------------
+-- ALTER TABLE ... ENGINE= keeps the engine, with warning 1286.
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+INSERT INTO c_me_my VALUES (1), (2)
+--------------
+
+Query OK, 2 rows affected
+Records: 2  Duplicates: 0  Warnings: 0
+
+--------------
+ALTER TABLE c_me_my ENGINE=MyISAM
+--------------
+
+Query OK, 0 rows affected, 1 warning
+Records: 0  Duplicates: 0  Warnings: 1
+
+--------------
+SHOW WARNINGS
+--------------
+
+Level	Code	Message
+Warning	1286	Unknown storage engine 'MyISAM'
+1 row in set
+
+--------------
+ALTER TABLE c_me_my ADD COLUMN b int, ENGINE=MEMORY
+--------------
+
+Query OK, 0 rows affected, 1 warning
+Records: 0  Duplicates: 0  Warnings: 1
+
+--------------
+SHOW WARNINGS
+--------------
+
+Level	Code	Message
+Warning	1286	Unknown storage engine 'MEMORY'
+1 row in set
+
+--------------
+SHOW CREATE TABLE c_me_my
+--------------
+
+Table	Create Table
+c_me_my	CREATE TABLE `c_me_my` (
+  `a` int DEFAULT NULL,
+  `b` int DEFAULT NULL,
+  KEY `k` (`a` DESC)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+1 row in set
+
+--------------
+SELECT TABLE_NAME, ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE 'c\_me\_%' ORDER BY TABLE_NAME
+--------------
+
+TABLE_NAME	ENGINE
+c_me_arch	InnoDB
+c_me_csv	InnoDB
+c_me_heap	InnoDB
+c_me_mem	InnoDB
+c_me_my	InnoDB
+5 rows in set
+
+--------------
+DROP TABLE c_me_my, c_me_mem, c_me_heap, c_me_csv, c_me_arch
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+SET sql_mode = DEFAULT
+--------------
+
+Query OK, 0 rows affected
+
+Bye
