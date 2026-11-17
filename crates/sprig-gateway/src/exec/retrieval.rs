@@ -56,6 +56,11 @@
 //!   a full shard list, the first D; fewer: again with C × 4 (C ≤ 1000)
 //! ```
 //!
+//! A search without its keyword list says so: warning 39827 for each
+//! `RETRIEVE()` call that skipped it (the index and how many of its shards
+//! had too many matches), counted in the statement's result and shown by
+//! `SHOW WARNINGS`. The REST route answers the same warnings in its reply.
+//!
 //! C is `ai.retrieval.candidates` (40). The filter names only `FILTERS`
 //! columns ([`sprig_sql::retrieval::compile_filter`]); it runs on the
 //! chunk table's copies and again on the table itself.
@@ -64,6 +69,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use mysql_async::prelude::Queryable as _;
 use serde_json::json;
@@ -81,16 +87,17 @@ use sprig_common::names::{SchemaName, quote};
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_feed::subs::{Subscription, Subscriptions};
 use sprig_feed::{ResumeToken, StartAt, TailOptions, TenantTail};
-use sprig_proto_mysql::StatusFlags;
 use sprig_proto_mysql::command::QueryAttrs;
 use sprig_proto_mysql::packets::OkPacket;
+use sprig_proto_mysql::{ColumnDef, StatusFlags};
 use sprig_sql::ai_fn::string_literal;
 use sprig_sql::retrieval::{self as sqlrx, Call, Chunking, Create, Shape, Stmt};
 
 use super::PassSession;
 use super::tenant::Step;
-use crate::pipeline::{ExecCtx, ResultSink, RowFormat, Wire};
+use crate::pipeline::{EndOfRows, ExecCtx, ResultSink, RowFormat, RowValues, Wire};
 use crate::tenant::TenantServices;
+use crate::tenant::session::LocalWarning;
 
 /// The comment that asks for the key as one JSON column `key` (the REST
 /// route's statements; honoured only for the gateway's own).
@@ -186,6 +193,100 @@ pub(crate) struct Found {
     db: String,
     table: String,
     hits: Vec<Hit>,
+    /// The shards searched.
+    shards: usize,
+    /// For a caller bound by row-level security: the shards with more
+    /// keyword matches than it ranks ([`MAX_CANDIDATES`]); any makes the
+    /// search skip its keyword list.
+    keyword_skipped: usize,
+}
+
+/// Warning 39827 for a search that skipped its keyword list.
+fn skipped_warning(f: &Found) -> Option<LocalWarning> {
+    (f.keyword_skipped > 0).then(|| {
+        let of = if f.shards == 1 {
+            "its shard has".to_owned()
+        } else {
+            format!("{} of its {} shards have", f.keyword_skipped, f.shards)
+        };
+        LocalWarning {
+            level: "Warning",
+            code: SprigCode::SearchWindowExceeded.number(),
+            message: format!(
+                "RETRIEVE({}.{}): no keyword list: {of} more than {MAX_CANDIDATES} chunks with a \
+                 query word, more than a search under row-level security ranks; the hits come \
+                 from the vector list alone",
+                f.db, f.index.name
+            ),
+        }
+    })
+}
+
+/// The statement's own sink with `n` more warnings in its result.
+struct AddWarnings<'a> {
+    inner: &'a mut dyn ResultSink,
+    n: u16,
+}
+
+#[async_trait]
+impl ResultSink for AddWarnings<'_> {
+    fn wire(&self) -> Wire {
+        self.inner.wire()
+    }
+
+    async fn begin_rows(&mut self, columns: &[ColumnDef], format: RowFormat) -> Result<()> {
+        self.inner.begin_rows(columns, format).await
+    }
+
+    async fn begin_rows_raw(&mut self, defs: &[Bytes], format: RowFormat) -> Result<()> {
+        self.inner.begin_rows_raw(defs, format).await
+    }
+
+    async fn cursor_opened(&mut self, columns: &[ColumnDef], end: EndOfRows) -> Result<()> {
+        self.inner.cursor_opened(columns, end).await
+    }
+
+    async fn row(&mut self, values: RowValues<'_>) -> Result<()> {
+        self.inner.row(values).await
+    }
+
+    async fn raw_row(&mut self, payload: Bytes) -> Result<()> {
+        self.inner.raw_row(payload).await
+    }
+
+    async fn end_rows(&mut self, mut end: EndOfRows) -> Result<()> {
+        end.warnings = end.warnings.saturating_add(self.n);
+        self.inner.end_rows(end).await
+    }
+
+    async fn ok(&mut self, mut ok: OkPacket) -> Result<()> {
+        ok.warnings = ok.warnings.saturating_add(self.n);
+        self.inner.ok(ok).await
+    }
+
+    async fn error(&mut self, err: &SprigError) -> Result<()> {
+        self.inner.error(err).await
+    }
+
+    async fn column_list(&mut self, columns: &[ColumnDef], end: EndOfRows) -> Result<()> {
+        self.inner.column_list(columns, end).await
+    }
+
+    async fn local_infile_request(&mut self, file_name: &[u8]) -> Result<()> {
+        self.inner.local_infile_request(file_name).await
+    }
+
+    async fn local_infile_read(&mut self) -> Result<Bytes> {
+        self.inner.local_infile_read().await
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        self.inner.flush().await
+    }
+
+    fn finished(&self) -> bool {
+        self.inner.finished()
+    }
 }
 
 /// The id of a candidate in fusion, and the row it belongs to.
@@ -866,22 +967,45 @@ impl PassSession {
         let key_json = internal && sql.trim_start().starts_with(KEY_JSON_HINT);
         let wire = out.wire();
         let mut edits = Vec::with_capacity(calls.len());
+        let mut warnings: Vec<LocalWarning> = Vec::new();
         for c in &calls {
             let found = match Box::pin(self.retrieval_search(cx, wire, c)).await {
                 Ok(f) => f,
                 Err(e) => return Ok(Some(self.fail(out, &e).await?)),
             };
+            // Once per index the statement searches.
+            if let Some(w) = skipped_warning(&found)
+                && !warnings.iter().any(|x| x.message == w.message)
+            {
+                warnings.push(w);
+            }
             let alias = (!c.aliased).then_some("retrieve");
             edits.push((
                 c.span.clone(),
                 derived_table(&found, alias, key_json, lex.no_backslash_escapes),
             ));
-            tracing::debug!(db = %found.db, table = %found.table, hits = found.hits.len(), "RETRIEVE answered");
+            tracing::debug!(db = %found.db, table = %found.table, hits = found.hits.len(), skipped = found.keyword_skipped, "RETRIEVE answered");
         }
         let rewritten = Bytes::from(sprig_sql::embedcol::splice(sql, edits));
-        Box::pin(self.tenant_text(cx, &rewritten, attrs, more, format, out))
-            .await
-            .map(Some)
+        let step = if warnings.is_empty() {
+            Box::pin(self.tenant_text(cx, &rewritten, attrs, more, format, out)).await?
+        } else {
+            let mut counted = AddWarnings {
+                inner: out,
+                n: u16::try_from(warnings.len()).unwrap_or(u16::MAX),
+            };
+            Box::pin(self.tenant_text(cx, &rewritten, attrs, more, format, &mut counted)).await?
+        };
+        // The next SHOW WARNINGS answers them. The REST route's statement
+        // always leaves a list (maybe empty), so its SHOW WARNINGS is
+        // answered here and never reaches a backend.
+        if !step.errored
+            && (key_json || !warnings.is_empty())
+            && let Some(ts) = self.tenant.as_deref_mut()
+        {
+            ts.warnings.get_or_insert_with(Vec::new).extend(warnings);
+        }
+        Ok(Some(step))
     }
 
     /// One `RETRIEVE()`'s search (see the module docs), timed and counted.
@@ -1026,8 +1150,8 @@ impl PassSession {
             crate::pipeline::SessionExec::row_policy_binds(self, ix.object_id) != Some(false);
         let depth = per_list * shards.len().max(1);
         let m_lit = string_literal(&match_words(&call.query), false);
-        // Its keyword matches, fetched once.
-        let mut bound_kw: Option<(Vec<(f64, Candidate)>, bool)> = None;
+        // Its keyword matches, fetched once, and the shards with too many.
+        let mut bound_kw: Option<(Vec<(f64, Candidate)>, usize)> = None;
         let limit = usize::try_from(call.limit).unwrap_or(10);
         let weight = sprig_docs::search::keyword_weight(&call.query);
         let and_filter = shard_filter
@@ -1042,9 +1166,9 @@ impl PassSession {
             let mut vecs: Vec<(f64, Candidate)> = Vec::new();
             let mut full = false;
             // Bound: the nearest last distance of a full vector list, and
-            // whether a shard had more keyword matches than it ranks.
+            // the shards with more keyword matches than it ranks.
             let mut vec_edge: Option<f64> = None;
-            let mut over = false;
+            let mut over = 0usize;
             let fetch_kw = !bound || bound_kw.is_none();
             for (schema, cluster) in &shards {
                 let pool = svc.locator.ctl_pool(cluster).await?;
@@ -1097,7 +1221,7 @@ impl PassSession {
                     };
                     if keyword && bound {
                         if rows.len() > MAX_CANDIDATES {
-                            over = true;
+                            over += 1;
                             continue;
                         }
                     } else if rows.len() >= per_list {
@@ -1138,7 +1262,7 @@ impl PassSession {
                     }
                     None => bound_kw = Some((kw.clone(), over)),
                 }
-                if over {
+                if over > 0 {
                     kw.clear();
                 }
             }
@@ -1231,6 +1355,8 @@ impl PassSession {
                         db,
                         table,
                         hits: fuse(&kw, &vecs, weight, limit),
+                        shards: shards.len(),
+                        keyword_skipped: over,
                     },
                     if q_vec.is_some() { "hybrid" } else { "keyword" },
                 ));
@@ -1254,6 +1380,8 @@ impl PassSession {
                         db,
                         table,
                         hits,
+                        shards: shards.len(),
+                        keyword_skipped: 0,
                     },
                     if q_vec.is_some() { "hybrid" } else { "keyword" },
                 ));
@@ -1420,6 +1548,8 @@ mod tests {
             index: ix,
             db: "d".into(),
             table: "t".into(),
+            shards: 1,
+            keyword_skipped: 0,
             hits: vec![Hit {
                 key: vec![Some("7".into())],
                 chunk_no: 0,
@@ -1441,5 +1571,21 @@ mod tests {
         assert_eq!(key_literal(&keys[0], Some("1 OR 1"), false), "'1 OR 1'");
         assert_eq!(key_literal(&keys[0], Some("-3"), false), "-3");
         assert_eq!(key_json(&keys, &[Some("7".into())]), json!({"id": 7}));
+        // A search that kept its keyword list has no warning; one that
+        // skipped it, 39827 naming the index and the shards.
+        assert!(skipped_warning(&found).is_none());
+        found.keyword_skipped = 1;
+        let w = skipped_warning(&found).unwrap();
+        assert_eq!((w.level, w.code), ("Warning", 39827));
+        assert!(
+            w.message.starts_with("RETRIEVE(d.kb): no keyword list: its shard has more than 1000 chunks"),
+            "{}",
+            w.message
+        );
+        found.shards = 3;
+        found.keyword_skipped = 2;
+        let w = skipped_warning(&found).unwrap();
+        assert!(w.message.contains("2 of its 3 shards have more than 1000"), "{}", w.message);
+        assert!(w.message.ends_with("the hits come from the vector list alone"));
     }
 }

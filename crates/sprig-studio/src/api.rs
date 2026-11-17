@@ -517,9 +517,15 @@ fn core_schemas() -> Value {
             "score": {"type": "number"}, "bm25_rank": {"type": "integer", "nullable": true},
             "vector_rank": {"type": "integer", "nullable": true}}),
             &["key", "chunk_no", "text", "score"]),
+        "RetrievalSearchWarning": s(json!({"level": string, "code": int, "message": string}),
+            &["level", "code", "message"]),
         "RetrievalSearchReply": s(json!({"database": string, "index": string,
-            "hits": {"type": "array", "items": {"$ref": "#/components/schemas/RetrievalSearchHit"}}}),
-            &["database", "index", "hits"]),
+            "hits": {"type": "array", "items": {"$ref": "#/components/schemas/RetrievalSearchHit"}},
+            "warnings": {"type": "array", "description": "What SHOW WARNINGS answers after the \
+                search: 39827 when the keyword list was skipped (a caller restricted by row-level \
+                security, past 1,000 keyword matches on a shard); empty without",
+                "items": {"$ref": "#/components/schemas/RetrievalSearchWarning"}}}),
+            &["database", "index", "hits", "warnings"]),
         "DocsSearchReply": s(json!({"version": string,
             "mode": {"type": "string", "enum": ["hybrid", "keyword"]},
             "hits": {"type": "array", "items": {"$ref": "#/components/schemas/DocsSearchHit"}}}),

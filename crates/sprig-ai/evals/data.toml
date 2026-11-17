@@ -364,6 +364,7 @@ tags = ["stats", "sharing-off"]
 message = "Does the discount column on orders look sane? Any odd values?"
 context = "Database: shop"
 world = [
+  { tool = "describe", json = { table = "orders", columns = [{ name = "id", type = "bigint" }, { name = "customer_id", type = "bigint" }, { name = "region", type = "varchar(16)" }, { name = "total", type = "decimal(12,2)" }, { name = "status", type = "varchar(16)" }, { name = "discount", type = "decimal(5,2)" }, { name = "created_at", type = "datetime" }, { name = "shipped_at", type = "datetime" }], comment = "Status values: new, paid, shipped, refunded, cancelled. total is in EUR." } },
   { tool = "column_stats", stats = [{ column = "discount", type = "decimal(5,2)", count = 2100000, nulls = 1890000, distinct = 37, min = -15.5, max = 99.75, top = [[0.05, 120000], [0.1, 64000]] }] },
 ]
 calls = [

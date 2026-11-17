@@ -10,14 +10,19 @@
 //!   `agg` (`size` always counts);
 //! - a **date** is a dimension with a `datePart`;
 //! - **geo** is a field named like a place (`lat`, `country`, ...);
-//! - **lat/lon** is a latitude field (`lat`, `latitude`) and a longitude
-//!   field (`lon`, `lng`, `long`, `longitude`), on any shelf. A bare one
-//!   is always a dimension: a location is never summed.
+//! - **lat/lon** is a latitude field (`latNames`) and a longitude field
+//!   (`lonNames`), on any shelf;
+//! - **country** is a field named in `countryNames` (`country`, `iso2`,
+//!   ...), on any shelf.
 //!
-//! As in Studio, a point map needs a latitude and a longitude: a place
-//! name alone (`country`) would need a filled map, and filled maps aren't
-//! drawn yet (they need region shapes), so Show Me goes on to the next
-//! rule and the check refuses `map-filled`.
+//! A bare latitude, longitude or country is always a dimension: a
+//! location is never summed. The name lists are in `chart-rules.json`,
+//! so Studio reads the same ones.
+//!
+//! As in Studio, a point map needs a latitude and a longitude, and a
+//! filled map (countries coloured by a measure) needs a country field.
+//! Any other place name (`city`, `state`) makes neither, so Show Me goes
+//! on to the next rule and the check refuses both map marks.
 //!
 //! A bare `columns` or `rows` entry (no `agg`, no `datePart`) may be
 //! either: a query that already groups returns its measures as plain
@@ -83,6 +88,12 @@ pub struct Rules {
     pub date_parts: Vec<String>,
     /// Field names taken as geographic.
     pub geo_names: Vec<String>,
+    /// Field names read as a latitude.
+    pub lat_names: Vec<String>,
+    /// Field names read as a longitude.
+    pub lon_names: Vec<String>,
+    /// Field names read as a country (a filled map's regions).
+    pub country_names: Vec<String>,
     /// Each mark's needs.
     pub marks: BTreeMap<String, MarkRule>,
     /// The best mark, in order.
@@ -111,6 +122,8 @@ pub struct Counts {
     pub geo: bool,
     /// A latitude and a longitude field are on the shelves.
     pub lat_lon: bool,
+    /// A country field is on the shelves.
+    pub country: bool,
     /// Dimensions (counted in `dims`) that might be measures: bare
     /// `columns` and `rows` entries.
     pub unknown: u32,
@@ -130,43 +143,33 @@ fn field(v: &Value) -> Option<&str> {
         .filter(|f| !f.trim().is_empty())
 }
 
-fn is_geo(name: &str) -> bool {
+fn named(list: &[String], name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    RULES.geo_names.contains(&n)
+    list.contains(&n)
 }
 
-/// Field names read as a latitude (any case), as in Studio.
-pub const LAT_NAMES: [&str; 2] = ["lat", "latitude"];
-/// Field names read as a longitude (any case), as in Studio.
-pub const LON_NAMES: [&str; 4] = ["lon", "lng", "long", "longitude"];
+fn is_geo(name: &str) -> bool {
+    named(&RULES.geo_names, name)
+}
 
 fn is_lat(name: &str) -> bool {
-    LAT_NAMES.contains(&name.to_ascii_lowercase().as_str())
+    named(&RULES.lat_names, name)
 }
 
 fn is_lon(name: &str) -> bool {
-    LON_NAMES.contains(&name.to_ascii_lowercase().as_str())
+    named(&RULES.lon_names, name)
 }
 
-/// Marks Studio doesn't draw yet, and why.
-pub const NOT_DRAWN: [(&str, &str); 1] = [(
-    "map-filled",
-    "it needs region shapes (the outlines of countries or states), which aren't drawn yet",
-)];
+fn is_country(name: &str) -> bool {
+    named(&RULES.country_names, name)
+}
 
 /// `a, b or c`.
-fn either(names: &[&str]) -> String {
+fn either(names: &[String]) -> String {
     match names.split_last() {
         Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
         _ => names.join(""),
     }
-}
-
-fn not_drawn(mark: &str) -> Option<&'static str> {
-    NOT_DRAWN
-        .iter()
-        .find(|(m, _)| *m == mark)
-        .map(|(_, why)| *why)
 }
 
 /// Counts the dimensions, measures and dates on `spec`'s shelves.
@@ -176,6 +179,7 @@ pub fn counts(spec: &Value) -> Counts {
     let (mut lat, mut lon) = (false, false);
     let mut place = |f: &str, c: &mut Counts| {
         c.geo |= is_geo(f);
+        c.country |= is_country(f);
         lat |= is_lat(f);
         lon |= is_lon(f);
     };
@@ -190,9 +194,13 @@ pub fn counts(spec: &Value) -> Counts {
                 c.dims += 1;
                 if e.get("datePart").is_some_and(|d| !d.is_null()) {
                     c.dates += 1;
-                } else if matches!(shelf, "columns" | "rows") && !is_lat(f) && !is_lon(f) {
-                    // A bare latitude or longitude is a location, never a
-                    // measure.
+                } else if matches!(shelf, "columns" | "rows")
+                    && !is_lat(f)
+                    && !is_lon(f)
+                    && !is_country(f)
+                {
+                    // A bare latitude, longitude or country is a location,
+                    // never a measure.
                     c.unknown += 1;
                 }
             }
@@ -221,15 +229,25 @@ fn fits_exactly(r: &MarkRule, c: Counts) -> bool {
         && (!r.geo || c.geo)
 }
 
+/// Whether a map mark has the place fields it draws by: a point map a
+/// latitude and a longitude, a filled map a country. Other marks have.
+fn placed(mark: &str, c: Counts) -> bool {
+    match mark {
+        "map-point" => c.lat_lon,
+        "map-filled" => c.country,
+        _ => true,
+    }
+}
+
 /// Whether `mark` fits `c`, by its rule, with any of the bare entries
 /// taken as measures. A point map also needs a latitude and a longitude,
-/// and a mark that isn't drawn yet never fits.
+/// and a filled map a country.
 #[must_use]
 pub fn fits(mark: &str, c: Counts) -> bool {
     let Some(r) = RULES.marks.get(mark) else {
         return false;
     };
-    if not_drawn(mark).is_some() || (mark == "map-point" && !c.lat_lon) {
+    if !placed(mark, c) {
         return false;
     }
     (0..=c.unknown).any(|k| {
@@ -279,18 +297,14 @@ fn holds(when: &BTreeMap<String, Value>, c: Counts) -> bool {
 }
 
 /// The best mark for `c` and why: the first rule that holds, skipping
-/// marks that aren't drawn and a point map without a latitude and a
-/// longitude (as Studio's Show Me does).
+/// a point map without a latitude and a longitude and a filled map
+/// without a country (as Studio's Show Me does).
 #[must_use]
 pub fn best(c: Counts) -> (&'static str, &'static str) {
     RULES
         .best
         .iter()
-        .find(|b| {
-            holds(&b.when, c)
-                && not_drawn(&b.mark).is_none()
-                && (b.mark != "map-point" || c.lat_lon)
-        })
+        .find(|b| holds(&b.when, c) && placed(&b.mark, c))
         .map_or(("text-table", ""), |b| (b.mark.as_str(), b.why.as_str()))
 }
 
@@ -307,20 +321,22 @@ pub fn check_fit(spec: &Value) -> Result<(), String> {
         return Ok(());
     }
     let (b, why) = best(c);
-    if let Some(not) = not_drawn(mark) {
-        return Err(format!(
-            "a {mark} chart isn't available: {not}. Use map-point with a latitude and a longitude \
-             field, or another mark; marks that fit: {}. Show Me would pick {b} ({why})",
-            fitting(c).join(", ")
-        ));
-    }
     if mark == "map-point" && !c.lat_lon {
         return Err(format!(
             "a map-point chart needs a latitude field (named {}) and a longitude field (named {}) \
-             on the shelves; a place name alone isn't a point map, and filled maps aren't drawn yet; \
+             on the shelves; a place name alone isn't a point map (a country makes a map-filled); \
              marks that fit: {}. Show Me would pick {b} ({why})",
-            either(&LAT_NAMES),
-            either(&LON_NAMES),
+            either(&RULES.lat_names),
+            either(&RULES.lon_names),
+            fitting(c).join(", ")
+        ));
+    }
+    if mark == "map-filled" && !c.country {
+        return Err(format!(
+            "a map-filled chart colours countries: it needs a country field (named {}) holding \
+             country names or ISO codes; states, provinces and cities aren't drawn; \
+             marks that fit: {}. Show Me would pick {b} ({why})",
+            either(&RULES.country_names),
             fitting(c).join(", ")
         ));
     }
@@ -355,6 +371,17 @@ mod tests {
         for b in &r.best {
             assert!(r.marks.contains_key(&b.mark), "{}", b.mark);
         }
+        // The place-name lists are lower case and geographic.
+        for n in r
+            .lat_names
+            .iter()
+            .chain(&r.lon_names)
+            .chain(&r.country_names)
+        {
+            assert_eq!(*n, n.to_ascii_lowercase());
+            assert!(r.geo_names.contains(n), "{n}");
+        }
+        assert!(!r.lat_names.is_empty() && !r.lon_names.is_empty() && !r.country_names.is_empty());
     }
 
     #[test]
@@ -371,6 +398,7 @@ mod tests {
                 dates: 1,
                 geo: false,
                 lat_lon: false,
+                country: false,
                 unknown: 0
             }
         );
@@ -407,11 +435,13 @@ mod tests {
             json!({"columns": ["day"], "rows": ["hour"], "color": {"field": "n", "agg": "count"}}),
         );
         assert_eq!(best(heat).0, "heatmap");
-        // A place name alone would be a filled map, which isn't drawn: the
-        // next rule.
+        // A country and a measure: a filled map.
         let country = c(json!({"columns": ["country"], "rows": [{"field": "n", "agg": "sum"}]}));
-        assert!(country.geo && !country.lat_lon);
-        assert_eq!(best(country).0, "bar");
+        assert!(country.geo && country.country && !country.lat_lon);
+        assert_eq!(
+            best(country),
+            ("map-filled", "a country and a measure: a filled map")
+        );
         // Nothing: a table, and every mark that needs fields is refused.
         assert_eq!(best(Counts::default()).0, "text-table");
         assert!(check_fit(&json!({"mark": "bar"})).is_err());
@@ -466,27 +496,88 @@ mod tests {
     }
 
     #[test]
-    fn a_filled_map_is_refused_until_it_is_drawn() {
-        let spec = json!({"mark": "map-filled", "columns": ["country"],
-                          "rows": [{"field": "n", "agg": "sum"}]});
-        let c = counts(&spec);
-        assert!(!fits("map-filled", c));
-        assert!(!fitting(c).contains(&"map-filled"));
-        let e = check_fit(&spec).unwrap_err();
-        assert!(
-            e.contains("region shapes") && e.contains("map-point") && e.contains("bar"),
-            "{e}"
-        );
-        // Every not-drawn mark is a mark of the rules.
-        for (m, _) in NOT_DRAWN {
-            assert!(RULES.marks.contains_key(m), "{m}");
+    fn a_filled_map_needs_a_country_field() {
+        let c = |v: Value| counts(&v);
+        // A country field by any of its names, in any case, on any shelf.
+        for name in &RULES.country_names {
+            let upper = name.to_ascii_uppercase();
+            for f in [name.as_str(), upper.as_str()] {
+                let spec = json!({"mark": "map-filled", "columns": [f],
+                                  "rows": [{"field": "n", "agg": "sum"}]});
+                let k = counts(&spec);
+                assert!(k.country && k.geo, "{f}");
+                assert!(fits("map-filled", k), "{f}");
+                assert!(fitting(k).contains(&"map-filled"), "{f}");
+                assert!(check_fit(&spec).is_ok(), "{f}");
+            }
         }
+        // On Colour or Detail too, with the measure on Colour.
+        assert!(
+            check_fit(
+                &json!({"mark": "map-filled", "detail": ["iso3"], "columns": ["region"],
+                              "color": {"field": "n", "agg": "avg"}})
+            )
+            .is_ok()
+        );
+        // A grouped query's bare measure: the country is never taken as one.
+        let bare = c(json!({"columns": ["country_code"], "rows": ["revenue"]}));
+        assert_eq!((bare.dims, bare.unknown), (2, 1));
+        assert!(fits("map-filled", bare));
+        // Other places, or no measure, or two: refused, naming the fields
+        // that would do.
+        for spec in [
+            json!({"mark": "map-filled", "columns": ["state"], "rows": [{"field": "n", "agg": "sum"}]}),
+            json!({"mark": "map-filled", "columns": ["city"], "rows": [{"field": "n", "agg": "sum"}]}),
+            json!({"mark": "map-filled", "columns": ["nation"], "rows": [{"field": "n", "agg": "sum"}]}),
+        ] {
+            let e = check_fit(&spec).unwrap_err();
+            assert!(
+                e.contains("needs a country field")
+                    && e.contains("iso2")
+                    && e.contains("marks that fit"),
+                "{e}"
+            );
+        }
+        for spec in [
+            json!({"mark": "map-filled", "columns": [{"field": "country"}]}),
+            json!({"mark": "map-filled", "columns": [{"field": "country"}],
+                   "rows": [{"field": "a", "agg": "sum"}, {"field": "b", "agg": "sum"}]}),
+        ] {
+            let e = check_fit(&spec).unwrap_err();
+            assert!(e.contains("doesn't fit"), "{e}");
+        }
+        // Show Me: a country with a measure is a filled map; with a latitude
+        // and a longitude too, a point map comes first.
+        let both = c(json!({"columns": ["country", "lng"], "rows": ["lat"],
+                            "size": {"field": "n", "agg": "sum"}}));
+        assert_eq!(best(both).0, "map-point");
+        assert_eq!(
+            best(c(
+                json!({"columns": ["iso2"], "color": {"field": "n", "agg": "sum"}})
+            ))
+            .0,
+            "map-filled"
+        );
     }
 
     #[test]
     fn latitude_and_longitude_names_are_geographic() {
-        for n in LAT_NAMES.iter().chain(LON_NAMES.iter()) {
+        for n in RULES.lat_names.iter().chain(&RULES.lon_names) {
             assert!(is_geo(n), "{n}");
+        }
+    }
+
+    /// The tile tool's description names the place fields the check reads.
+    #[test]
+    fn the_tile_tool_names_the_place_fields() {
+        let d = crate::tools::builtin::PROPOSE_TILE_DOC;
+        for n in RULES
+            .lat_names
+            .iter()
+            .chain(&RULES.lon_names)
+            .chain(&RULES.country_names)
+        {
+            assert!(d.contains(n.as_str()), "{n}");
         }
     }
 }

@@ -486,7 +486,7 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "propose_tile",
-            "Propose a chart for a dashboard: a read-only query returning row-level or grouped rows, and a chart spec as JSON text. The spec has a mark (bar, line, area, point, pie, donut, kpi, text-table, heatmap, ... ) and shelves: columns and rows are lists of {field, agg?, datePart?, axis?, mark?}; color, size and label are {field, agg?}; tooltip and detail are lists; filters are [{field, in}]; sort is {by, dir}; top is a number; stack is none, stack or percent. Every field must be a column the query returns. Choose the mark as Show Me does: a date and measures, line; one dimension and one measure, bar; two measures, point; one measure alone, kpi; two dimensions and a measure, heatmap; parts of a whole with five or fewer categories, pie; a latitude field (lat or latitude) and a longitude field (lon, lng, long or longitude), map-point. A place name alone, such as country or city, is not a map: filled maps aren't drawn yet, so use a bar or a table. SprigDB checks the query's plan without running it; the user previews the tile and decides whether to add it.",
+            PROPOSE_TILE_DOC,
             obj(
                 &[
                     ("dashboard", s("The dashboard; a new one when absent")),
@@ -790,6 +790,10 @@ fn names(sql: &str, word: &str) -> bool {
     }
     false
 }
+
+/// `propose_tile`'s description. It names the place fields the tile check
+/// reads (`chart-rules.json`; a test keeps them in step).
+pub const PROPOSE_TILE_DOC: &str = "Propose a chart for a dashboard: a read-only query returning row-level or grouped rows, and a chart spec as JSON text. The spec has a mark (bar, line, area, point, pie, donut, kpi, text-table, heatmap, ... ) and shelves: columns and rows are lists of {field, agg?, datePart?, axis?, mark?}; color, size and label are {field, agg?}; tooltip and detail are lists; filters are [{field, in}]; sort is {by, dir}; top is a number; stack is none, stack or percent. Every field must be a column the query returns. Choose the mark as Show Me does: a date and measures, line; one dimension and one measure, bar; two measures, point; one measure alone, kpi; two dimensions and a measure, heatmap; parts of a whole with five or fewer categories, pie; a latitude field (lat or latitude) and a longitude field (lon, lng, long or longitude), map-point; a country field (country, country_code, country_name, country_iso, iso2 or iso3) holding country names or ISO codes, and one measure, map-filled, which colours each country by the measure. Name the column so, with an alias if needed. Other place names, such as city or state, are not a map: use a bar or a table. SprigDB checks the query's plan without running it; the user previews the tile and decides whether to add it.";
 
 /// A tile's chart spec: JSON, a known mark, the shelves well formed,
 /// every field one the query names (unless it selects `*`), and a mark

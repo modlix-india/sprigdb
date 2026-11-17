@@ -1,9 +1,12 @@
 {
-  "about": "The chart spec's vocabulary and Show Me's rules, shared by the assistants' tile check (sprig-ai) and Studio's chart editor (a copy in studio/src/dashboards, kept equal by a Studio test). Fields are counted on the shelves: a dimension is a columns, rows or color entry without agg; a measure is a columns, rows, color or size entry with agg (size always counts); a date is a dimension with a datePart; geo is a field whose name is in geoNames. A max of null has no limit.",
+  "about": "The chart spec's vocabulary and Show Me's rules, shared by the assistants' tile check (sprig-ai) and Studio's chart editor (a copy in studio/src/dashboards, kept equal by a Studio test). Fields are counted on the shelves: a dimension is a columns, rows or color entry without agg; a measure is a columns, rows, color or size entry with agg (size always counts); a date is a dimension with a datePart; geo is a field whose name is in geoNames. A point map needs a field named in latNames and one named in lonNames; a filled map needs one named in countryNames (names in any case). A max of null has no limit.",
   "keys": ["mark", "columns", "rows", "color", "size", "label", "detail", "tooltip", "filters", "sort", "top", "facet", "stack", "format"],
   "aggs": ["sum", "avg", "count", "countd", "min", "max", "median", "none"],
   "dateParts": ["year", "quarter", "month", "week", "day", "hour", "exact"],
-  "geoNames": ["lat", "latitude", "lon", "lng", "long", "longitude", "country", "country_code", "state", "province", "city", "postcode", "zip", "geo", "location"],
+  "geoNames": ["lat", "latitude", "lon", "lng", "long", "longitude", "country", "country_code", "country_name", "country_iso", "iso2", "iso3", "state", "province", "city", "postcode", "zip", "geo", "location"],
+  "latNames": ["lat", "latitude"],
+  "lonNames": ["lon", "lng", "long", "longitude"],
+  "countryNames": ["country", "country_code", "country_name", "country_iso", "iso2", "iso3"],
   "marks": {
     "bar": { "dims": [0, 3], "measures": [1, null] },
     "line": { "dims": [1, 3], "measures": [1, null] },
@@ -31,6 +34,7 @@
   },
   "best": [
     { "when": { "geo": true }, "mark": "map-point", "why": "a geographic field: a map" },
+    { "when": { "geo": true, "dims": [1, 2], "measures": [1, 1] }, "mark": "map-filled", "why": "a country and a measure: a filled map" },
     { "when": { "dims": [0, 0], "measures": [1, 1] }, "mark": "kpi", "why": "one measure and nothing else: a KPI" },
     { "when": { "dims": [0, 0], "measures": [2, null] }, "mark": "point", "why": "two measures: a scatter plot" },
     { "when": { "dates": [1, 1], "dims": [1, 2], "measures": [1, null] }, "mark": "line", "why": "a date and measures: a line" },

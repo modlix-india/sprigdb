@@ -7,8 +7,12 @@
 //! search exactly: the caller's privileges, column grants and row-level
 //! security decide which rows' chunks come back. The reply:
 //! `{database, index, hits: [{key, chunk_no, title, text, score,
-//! bm25_rank, vector_rank}]}`, best first; `key` is the source row's
-//! primary key as an object (`{"id": 7}`; binary columns as hexadecimal).
+//! bm25_rank, vector_rank}], warnings: [{level, code, message}]}`, best
+//! first; `key` is the source row's primary key as an object (`{"id": 7}`;
+//! binary columns as hexadecimal). `warnings` is what `SHOW WARNINGS`
+//! answers after the statement (the gateway's own, read in the same
+//! session), empty when there are none: 39827 when the search skipped its
+//! keyword list.
 
 use std::sync::Arc;
 
@@ -165,6 +169,20 @@ fn hit(row: &[Option<Vec<u8>>]) -> Value {
     })
 }
 
+/// One row of `SHOW WARNINGS` (`Level`, `Code`, `Message`).
+fn warning(row: &[Option<Vec<u8>>]) -> Value {
+    let t = |i: usize| {
+        row.get(i)
+            .and_then(Option::as_ref)
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+    };
+    json!({
+        "level": t(0),
+        "code": t(1).and_then(|s| s.parse::<u64>().ok()),
+        "message": t(2),
+    })
+}
+
 /// Answers a search.
 pub async fn search(
     core: &Arc<Core>,
@@ -220,9 +238,17 @@ async fn search_inner(
         .await
         .map_err(|e| SprigError::standard(e.errno.unwrap_or(1105), *b"HY000", &e.message))?;
     let hits: Vec<Value> = rows.iter().map(|r| hit(r)).collect();
+    // The search's warnings, answered by the gateway from the session.
+    let warnings: Vec<Value> = sql
+        .query("SHOW WARNINGS")
+        .await
+        .map_err(|e| SprigError::standard(e.errno.unwrap_or(1105), *b"HY000", &e.message))?
+        .iter()
+        .map(|r| warning(r))
+        .collect();
     Ok(json_response(
         200,
-        &json!({"database": db, "index": index, "hits": hits}),
+        &json!({"database": db, "index": index, "hits": hits, "warnings": warnings}),
     ))
 }
 
@@ -272,6 +298,16 @@ mod tests {
             hit(&row),
             json!({"key": {"id": 7}, "chunk_no": 0, "title": null, "text": "chunk",
                    "score": 0.0325, "bm25_rank": 1, "vector_rank": null})
+        );
+        let w = vec![
+            Some(b"Warning".to_vec()),
+            Some(b"39827".to_vec()),
+            Some(b"RETRIEVE(shop.kb): no keyword list".to_vec()),
+        ];
+        assert_eq!(
+            warning(&w),
+            json!({"level": "Warning", "code": 39827,
+                   "message": "RETRIEVE(shop.kb): no keyword list"})
         );
     }
 }
