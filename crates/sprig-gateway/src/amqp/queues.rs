@@ -418,7 +418,29 @@ impl MqCatalog for GatewayMq {
                 Vec::new()
             }
         };
-        let s = Arc::new(MariaStore::new(pool, schema).with_replicas(replicas));
+        // A message a transaction acked (deleted) through its session can
+        // be a held branch's row: for a tenant on Sprig 2PC's relay path the
+        // store's connections go through the relay writer, chosen again at
+        // each use, so the relay fence covers them too.
+        let route: sprig_queues::maria::PoolRoute = {
+            let svc = Arc::clone(&self.svc);
+            let cluster = cluster.clone();
+            Arc::new(move || {
+                let svc = Arc::clone(&svc);
+                let cluster = cluster.clone();
+                Box::pin(async move {
+                    svc.locator
+                        .tenant_ctl_pool(tenant, &cluster)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+            })
+        };
+        let s = Arc::new(
+            MariaStore::new(pool, schema)
+                .with_replicas(replicas)
+                .with_route(route),
+        );
         s.set_confirm_replica(self.settings(v).confirm_replica);
         // The tenant's feed-driven outbox forwarder, registered while the
         // tables are made; both before the store is used.

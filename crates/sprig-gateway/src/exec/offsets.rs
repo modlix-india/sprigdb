@@ -25,7 +25,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use mysql_async::prelude::Queryable;
 use sprig_auth::authz::{Action, Target};
-use sprig_catalog::CatalogLocator;
 use sprig_catalog::ddl::{database_key, object_key};
 use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::ObjectKind;
@@ -413,9 +412,11 @@ impl PassSession {
         let catalog_cluster = svc.locator.cluster(tenant).await?;
         let call = offsets::call_sql(&schema, c);
         if !in_txn {
-            let ep = svc.locator.writer(tenant).await?;
-            let mut conn = ep
-                .pool
+            // A transaction's commit of the same group can be a held
+            // branch's row: through the relay writer for a tenant on the
+            // relay path.
+            let pool = svc.locator.tenant_catalog_pool(tenant).await?;
+            let mut conn = pool
                 .get_conn_bounded()
                 .await
                 .map_err(sprig_streams::maria::map_err)?;

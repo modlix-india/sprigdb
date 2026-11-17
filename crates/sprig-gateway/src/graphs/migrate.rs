@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use mysql_async::prelude::Queryable;
 use sprig_catalog::version::VersionKind;
 use sprig_catalog::{CatalogLocator, Freshness};
-use sprig_common::ids::ClusterId;
+use sprig_common::ids::{ClusterId, TenantId};
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_graph::ast::Entity;
 use sprig_graph::catalog::{GraphCatalog, Tables, backend_error};
@@ -83,6 +83,7 @@ pub(crate) fn moving_error() -> SprigError {
 /// committed mirrors' clusters first (as the applier does).
 struct PageConns {
     graphs: Arc<GatewayGraphs>,
+    tenant: TenantId,
     conns: HashMap<String, mysql_async::Conn>,
 }
 
@@ -94,7 +95,7 @@ impl ShardConns for PageConns {
                 .map_err(|e| SprigError::internal(format!("cluster id {}: {e}", at.cluster)))?;
             let mut c = self
                 .graphs
-                .pool(&id)
+                .tenant_pool(self.tenant, &id)
                 .await?
                 .get_conn()
                 .await
@@ -310,7 +311,7 @@ impl GatewayGraphs {
                         return Ok(false);
                     }
                     for sh in &now.shards.shards {
-                        let mut c = self.shard_conn(&sh.cluster).await?;
+                        let mut c = self.shard_conn(g.tenant, &sh.cluster).await?;
                         for sql in sprig_graph::typed::base_ddl(&sh.schema, g.graph_id) {
                             c.query_drop(sql).await.map_err(backend_error)?;
                         }
@@ -340,7 +341,7 @@ impl GatewayGraphs {
                     crate::tenant::lookups_sql::publish_wait(&self.svc, g.tenant, cat.version)
                         .await;
                     for sh in &now.shards.shards {
-                        let mut c = self.shard_conn(&sh.cluster).await?;
+                        let mut c = self.shard_conn(g.tenant, &sh.cluster).await?;
                         let t = Tables::of(&sh.schema, g.graph_id);
                         for table in [&t.nodes, &t.edges, &t.labels, &t.mirrors] {
                             c.query_drop(format!("DROP TABLE IF EXISTS {table}"))
@@ -375,6 +376,7 @@ impl GatewayGraphs {
                     }
                     let mut conns = PageConns {
                         graphs: Arc::clone(self),
+                        tenant: g.tenant,
                         conns: HashMap::new(),
                     };
                     let r = {
@@ -406,6 +408,7 @@ impl GatewayGraphs {
                 loop {
                     let mut conns = PageConns {
                         graphs: Arc::clone(self),
+                        tenant: g.tenant,
                         conns: HashMap::new(),
                     };
                     let r = {
@@ -457,10 +460,10 @@ impl GatewayGraphs {
     }
 
     /// A `sprig_ctl` connection to `cluster`.
-    async fn shard_conn(&self, cluster: &str) -> Result<mysql_async::Conn> {
+    async fn shard_conn(&self, tenant: TenantId, cluster: &str) -> Result<mysql_async::Conn> {
         let id = ClusterId::new(cluster)
             .map_err(|e| SprigError::internal(format!("cluster id {cluster}: {e}")))?;
-        self.pool(&id)
+        self.tenant_pool(tenant, &id)
             .await?
             .get_conn()
             .await

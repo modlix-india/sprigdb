@@ -548,6 +548,17 @@ pub struct RunOpts {
     pub live: Option<LiveRunOpts>,
 }
 
+/// `logic.trigger_budget_ms` as it resolves now, for a job that keeps
+/// running while the setting changes.
+#[derive(Clone)]
+pub struct LiveBudget(pub std::sync::Arc<dyn Fn() -> std::time::Duration + Send + Sync>);
+
+impl std::fmt::Debug for LiveBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LiveBudget")
+    }
+}
+
 /// A source of [`RunOpts`] as they resolve now.
 #[derive(Clone)]
 pub struct LiveRunOpts(pub std::sync::Arc<dyn Fn() -> RunOpts + Send + Sync>);

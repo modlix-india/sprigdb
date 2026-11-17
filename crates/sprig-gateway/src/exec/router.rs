@@ -73,6 +73,7 @@ pub(super) use self::binary::param_lit;
 pub(super) use self::fk_ddl::FkDdl;
 pub(crate) use self::layout::ShardingExtension;
 pub(super) use self::lookup_ddl::LookupDdl;
+pub(crate) use self::txn::RelayAdmin;
 
 /// The longest a statement waits for a mover's hold.
 const MAX_HOLD_WAIT: Duration = Duration::from_secs(10);

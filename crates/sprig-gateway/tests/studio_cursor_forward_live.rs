@@ -247,7 +247,9 @@ async fn studio_cursor_forwarded_with_a_bearer_token() {
             "{tenant}.{}",
             var("SPRIG_TEST_CF_USER", "admin")
         )))
-        .pass(Some(var("SPRIG_TEST_CF_PASSWORD", "sprig-dev-app")));
+        .pass(Some(var("SPRIG_TEST_CF_PASSWORD", "sprig-dev-app")))
+        .prefer_socket(false)
+        .ssl_opts(mysql_async::SslOpts::default().with_danger_accept_invalid_certs(true));
     let mut c = mysql_async::Conn::new(opts).await.unwrap();
     let values: Vec<String> = (1..=50).map(|i| format!("({i}, 'v{i}')")).collect();
     for s in [

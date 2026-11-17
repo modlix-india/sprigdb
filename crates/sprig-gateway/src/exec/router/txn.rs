@@ -172,7 +172,7 @@ impl TxnBackend for GwTxn {
     // may be switched on later, so the wrapper decides per call.
     fn admin(&self) -> Arc<dyn ClusterAdmin> {
         Arc::new(RelayAdmin {
-            inner: Arc::clone(&self.admin),
+            inner: Arc::clone(&self.admin) as Arc<dyn ClusterAdmin>,
             relayed: Arc::clone(&self.relayed),
             relay: Arc::clone(&self.relay),
         })
@@ -194,11 +194,12 @@ impl TxnBackend for GwTxn {
 /// The admin of a session on Sprig 2PC's relay path: on clusters whose
 /// branches went through a relay writer, a held branch's prepare, finish
 /// and abandon go to that writer's agent, which registers the holder
-/// before its redo rows exist; everything else is [`GwAdmin`]'s.
-struct RelayAdmin {
-    inner: Arc<GwAdmin>,
-    relayed: Arc<Mutex<HashMap<ClusterId, RelayLease>>>,
-    relay: Arc<Mutex<Option<sprig_common::ids::TenantId>>>,
+/// before its redo rows exist; everything else is `inner`'s ([`GwAdmin`],
+/// or the Bolt coordinator's `sprig_ctl` admin).
+pub(crate) struct RelayAdmin {
+    pub(crate) inner: Arc<dyn ClusterAdmin>,
+    pub(crate) relayed: Arc<Mutex<HashMap<ClusterId, RelayLease>>>,
+    pub(crate) relay: Arc<Mutex<Option<sprig_common::ids::TenantId>>>,
 }
 
 impl RelayAdmin {

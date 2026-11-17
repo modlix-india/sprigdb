@@ -639,7 +639,12 @@ impl CopyEnv for LiveEnv {
             e.retryable = true;
             e
         })?;
-        let pool = self.pools.writer(&cluster).await?;
+        // The copy worker updates the tenant's own rows (overrides it
+        // orphans, references it fills, hierarchy paths), which its
+        // transactions write too: for a tenant on Sprig 2PC's relay path,
+        // through the relay writer.
+        let direct = self.pools.writer(&cluster).await?;
+        let pool = crate::relay_pools::shard_pool(&self.dc, tenant, &cluster, direct).await?;
         pool.get_conn_bounded().await.map_err(|e| {
             let mut x = SprigError::new(SprigCode::BackendUnavailable, format!("{cluster}: {e}"));
             x.retryable = true;

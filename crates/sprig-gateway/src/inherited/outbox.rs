@@ -382,9 +382,11 @@ async fn forward_with(
     // connections of their own. It comes from the holders' pool: from the
     // pool the deliveries use, sixteen commit hooks at once held all four
     // connections and each waited for a fifth forever (seen live: every
-    // outbox of the cluster stopped, the sweeper too).
+    // outbox of the cluster stopped, the sweeper too). The rows are the
+    // tenant's transactions' own, so for a tenant on Sprig 2PC's relay
+    // path it goes through the relay writer.
     let cluster = svc.locator.cluster(tenant).await?;
-    let pool = svc.locator.ctl_hold_pool(&cluster).await?;
+    let pool = svc.locator.tenant_hold_pool(tenant, &cluster).await?;
     let mut c = pool
         .get_conn_bounded()
         .await

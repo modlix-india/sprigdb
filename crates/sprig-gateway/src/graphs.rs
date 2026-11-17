@@ -133,11 +133,16 @@ impl sprig_graph::maria::HoldWait for RouteHolds {
     }
 }
 
+/// A graph's id counters and the `sprig_ctl` pool they were made over.
+type MadeCounters = (Option<String>, Arc<CounterIds>);
+
 /// The gateway's graph services.
 pub struct GatewayGraphs {
     pub(crate) svc: Arc<TenantServices>,
     migrated: Mutex<HashSet<u64>>,
-    counters: Mutex<HashMap<(u64, u64), Arc<CounterIds>>>,
+    /// Each graph's id counters, with the `sprig_ctl` pool they were made
+    /// over (`GatewayLocator::ctl_pool_fingerprint`).
+    counters: Mutex<HashMap<(u64, u64), MadeCounters>>,
     /// Labels and types this process made or looked up since the
     /// snapshot, by (tenant, graph): (labels, types).
     names: Mutex<HashMap<(u64, u64), Names>>,
@@ -668,6 +673,54 @@ impl GatewayGraphs {
         self.svc.locator.ctl_pool(cluster).await
     }
 
+    /// [`Self::pool`] for maintenance of `tenant`'s graph rows (claims,
+    /// typed columns, index changes, a storage move): the rows Bolt
+    /// transactions write, so for a tenant on Sprig 2PC's relay path the
+    /// connections go through the relay writer.
+    ///
+    /// # Errors
+    /// The locator's; a retryable 39030 while no relay writer is ready.
+    pub async fn tenant_pool(
+        &self,
+        tenant: TenantId,
+        cluster: &ClusterId,
+    ) -> Result<mysql_async::Pool> {
+        self.svc.locator.tenant_ctl_pool(tenant, cluster).await
+    }
+
+    /// Where `tenant`'s Bolt branches on `cluster` come from: `None` from
+    /// [`Self::session_pool`], or, for a tenant on Sprig 2PC's relay path,
+    /// a pool of the same size through the cluster's relay writer
+    /// (`sprig_cluster::failover::relay_pools`).
+    ///
+    /// # Errors
+    /// The locator's; a retryable 39030 while the tenant is on the relay
+    /// path and the cluster has no ready relay writer.
+    pub(crate) async fn relay_route(
+        &self,
+        tenant: TenantId,
+        cluster: &ClusterId,
+    ) -> Result<Option<sprig_cluster::failover::relay_pools::Relayed>> {
+        let probe = self.pool(cluster).await?;
+        let size = crate::offload::GraphLimits::now().session_pool;
+        let base = mysql_async::Opts::from(
+            mysql_async::OptsBuilder::from_opts(self.svc.locator.ctl_opts(cluster).await?)
+                .pool_opts(mysql_async::PoolOpts::new().with_constraints(
+                    mysql_async::PoolConstraints::new(0, size).unwrap_or_default(),
+                )),
+        );
+        sprig_cluster::failover::relay_pools::tenant_route_kind(
+            &self.svc.locator.dc_store(),
+            tenant,
+            cluster,
+            &probe,
+            &base,
+            "bolt",
+            sprig_txn::fence::wire::preamble,
+        )
+        .await
+    }
+
     /// The pool Bolt transactions take connections from on `cluster`:
     /// the `sprig_ctl` account, up to `graph.session_pool` connections (a
     /// new size makes a new pool; connections of the old one close as
@@ -714,21 +767,26 @@ impl GatewayGraphs {
     ///
     /// # Errors
     /// The locator's.
+    /// They are made again when the cluster's `sprig_ctl` pool was replaced
+    /// (its writer changed): the old pool is disconnected, and counters
+    /// kept over it failed every write that needed new ids.
     pub async fn counters(&self, g: &GraphRef) -> Result<Arc<CounterIds>> {
-        if let Some(c) = self
+        let pool = self.pool(&g.cluster).await?;
+        let made_over = self.svc.locator.ctl_pool_fingerprint(&g.cluster);
+        if let Some((f, c)) = self
             .counters
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&(g.tenant.0, g.graph_id))
+            && *f == made_over
         {
             return Ok(Arc::clone(c));
         }
-        let pool = self.pool(&g.cluster).await?;
         let c = Arc::new(CounterIds::new(pool, &g.tables(), ID_BLOCK));
         self.counters
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert((g.tenant.0, g.graph_id), Arc::clone(&c));
+            .insert((g.tenant.0, g.graph_id), (made_over, Arc::clone(&c)));
         Ok(c)
     }
 
@@ -1514,7 +1572,7 @@ impl GatewayGraphs {
         for sh in &g.shards.shards {
             let cluster = ClusterId::new(&sh.cluster)
                 .map_err(|e| SprigError::internal(format!("cluster id {}: {e}", sh.cluster)))?;
-            let pool = self.pool(&cluster).await?;
+            let pool = self.tenant_pool(g.tenant, &cluster).await?;
             let mut c = pool.get_conn().await.map_err(backend_error)?;
             c.query_drop(sql(&sh.tables)?)
                 .await
@@ -1711,6 +1769,7 @@ impl GatewayGraphs {
         let mut conns: HashMap<String, mysql_async::Conn> = HashMap::new();
         async fn conn<'a>(
             me: &GatewayGraphs,
+            tenant: TenantId,
             conns: &'a mut HashMap<String, mysql_async::Conn>,
             cluster: &str,
         ) -> Result<&'a mut mysql_async::Conn> {
@@ -1718,7 +1777,7 @@ impl GatewayGraphs {
                 let id = ClusterId::new(cluster)
                     .map_err(|e| SprigError::internal(format!("cluster id {cluster}: {e}")))?;
                 let c = me
-                    .pool(&id)
+                    .tenant_pool(tenant, &id)
                     .await?
                     .get_conn()
                     .await
@@ -1749,7 +1808,7 @@ impl GatewayGraphs {
                     )
                 };
                 let rows: Vec<(u64, u64, String, String, Option<String>)> =
-                    conn(self, &mut conns, &sh.cluster)
+                    conn(self, g.tenant, &mut conns, &sh.cluster)
                         .await?
                         .query(sql)
                         .await
@@ -1774,7 +1833,7 @@ impl GatewayGraphs {
                     };
                     let h = claim_rk(d.id, &key);
                     let at = &layout.shards[layout.index_of(h)];
-                    let c = conn(self, &mut conns, &at.cluster).await?;
+                    let c = conn(self, g.tenant, &mut conns, &at.cluster).await?;
                     c.exec_drop(
                         format!(
                             "INSERT INTO {} (idx, k, owner, owner_rk, _sprig_rk) VALUES (?, ?, ?, ?, ?) \
@@ -1803,7 +1862,7 @@ impl GatewayGraphs {
                     // live with the same key, else an orphan to take over.
                     let os = &layout.shards[layout.index_of(ork)];
                     let other: Option<(String, String, Option<String>)> = if node {
-                        conn(self, &mut conns, &os.cluster)
+                        conn(self, g.tenant, &mut conns, &os.cluster)
                             .await?
                             .query_first(format!(
                                 "SELECT CAST(labels AS CHAR), props, _types FROM {} WHERE id = {o}",
@@ -1812,7 +1871,7 @@ impl GatewayGraphs {
                             .await
                             .map_err(backend_error)?
                     } else {
-                        conn(self, &mut conns, &os.cluster)
+                        conn(self, g.tenant, &mut conns, &os.cluster)
                             .await?
                             .query_first(format!(
                                 "SELECT CAST(type AS CHAR), props, _types FROM {} WHERE id = {o}",
@@ -1846,7 +1905,7 @@ impl GatewayGraphs {
                             ),
                         ));
                     }
-                    let c = conn(self, &mut conns, &at.cluster).await?;
+                    let c = conn(self, g.tenant, &mut conns, &at.cluster).await?;
                     c.exec_drop(
                         format!(
                             "UPDATE {} SET owner = ?, owner_rk = ? WHERE idx = ? AND k = ? AND owner = ?",

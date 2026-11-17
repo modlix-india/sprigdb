@@ -311,3 +311,40 @@ async fn database_rows_reach_trigger_and_job_budgets() {
     );
     stop.cancel();
 }
+
+/// A running trigger job follows its budget: the value it reads at each
+/// run changes when the database's row does, without a new job.
+#[tokio::test]
+async fn a_running_trigger_follows_its_budget() {
+    use sprig_catalog::{SettingRow, SettingScope};
+    use sprig_common::ids::{DbId, TenantId};
+    use sprig_controller::tenant_scopes::build_rows;
+
+    use super::LogicScope;
+
+    let t = TenantId(79);
+    let (s, stop) = seeded_trigger_rows().await;
+    let live = s.live_trigger_budget(LogicScope::db(t, 5));
+    assert_eq!((live.0)(), Duration::from_secs(4));
+    let row = SettingRow {
+        scope: SettingScope::Database(DbId(5)),
+        key: "logic.trigger_budget_ms".into(),
+        value: Some(serde_json::json!(300)),
+        bounds: None,
+        set_by: "op:test".into(),
+        set_at: std::time::SystemTime::UNIX_EPOCH,
+        version: 3,
+    };
+    s.tenant_scopes().unwrap().seed(
+        t,
+        3,
+        build_rows(sprig_settings::Registry::global().unwrap(), t, 3, vec![row]),
+    );
+    assert_eq!((live.0)(), Duration::from_millis(300));
+    // Without tenant scopes (tests' workers), refreshing is a no-op.
+    WorkerSettings::defaults(DcId::new("mum1").unwrap())
+        .unwrap()
+        .refresh_tenant(t)
+        .await;
+    stop.cancel();
+}

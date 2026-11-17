@@ -30,9 +30,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sprig_catalog::pool_wait::Bounded as _;
-use sprig_catalog::{CatalogLocator, Freshness, TenantCatalog};
+use sprig_catalog::{Freshness, TenantCatalog};
 use sprig_common::SprigError;
 use sprig_common::ids::{ObjectId, TenantId};
+use sprig_common::names::SchemaName;
 use sprig_proto_kafka::group::{CommittedOffset, GroupState, GroupStore, StoreError, StoredGroup};
 use sprig_proto_kafka::protocol::err;
 use sprig_proto_kafka::topics::{
@@ -552,15 +553,19 @@ impl CatalogGroups {
 
     /// A connection to the tenant catalog's writer, with the streams
     /// module's tables in place, and the catalog schema.
+    ///
+    /// Committed offsets are rows a tenant's own transactions also write
+    /// (`sprig.commit_offset` in a transaction), so for a tenant on Sprig
+    /// 2PC's relay path the connection goes through the relay writer.
     async fn conn(&self, tenant: u64) -> Result<(mysql_async::Conn, String), StoreError> {
-        let ep = self
+        let pool = self
             .svc
             .locator
-            .writer(TenantId(tenant))
+            .tenant_catalog_pool(TenantId(tenant))
             .await
             .map_err(store_err)?;
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(store_err)?;
-        let schema = ep.store.schema().to_owned();
+        let mut conn = pool.get_conn_bounded().await.map_err(store_err)?;
+        let schema = SchemaName::catalog(TenantId(tenant)).to_string();
         let done = self
             .migrated
             .lock()

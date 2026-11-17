@@ -113,6 +113,9 @@ impl Recording {
                 .collect(),
             charset: vars.vars.get("character_set_client").cloned(),
             timestamp_us: Some(self.timestamp_us),
+            // Writes to a database's unsharded tables go unqualified, to
+            // the session's default schema.
+            db: vars.schema.clone(),
             sql,
         });
     }

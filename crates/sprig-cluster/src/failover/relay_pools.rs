@@ -52,6 +52,8 @@ struct Through {
     relay_addr: String,
     /// The caller's options it was made from.
     base: Opts,
+    /// The caller's pool kind (see [`tenant_pool_of`]).
+    kind: &'static str,
     opts: Opts,
     pool: Pool,
     forwarder: JoinHandle<()>,
@@ -72,10 +74,11 @@ impl Drop for Through {
 #[derive(Default)]
 struct Entry {
     checked: Option<Instant>,
-    /// `None`: straight to the cluster; `Some((addr, node))`: through the
-    /// relay writer at `addr` on `node`; an empty `addr`: through a relay,
-    /// none ready (`node` then says why).
-    relay: Option<(String, String)>,
+    /// `None`: straight to the cluster; `Some((addr, node, url))`: through
+    /// the relay writer at `addr` on `node`, whose agent's internal service
+    /// is `url`; an empty `addr`: through a relay, none ready (`node` then
+    /// says why).
+    relay: Option<(String, String, String)>,
     throughs: Vec<Through>,
 }
 
@@ -97,6 +100,9 @@ pub struct Relayed {
     pub node: NodeId,
     /// The relay's address.
     pub relay_addr: String,
+    /// The relay writer's agent's internal service, where a holder's calls
+    /// go (`RelayLease::internal_url`).
+    pub internal_url: String,
     /// The caller's options, reaching the node through the relay (the
     /// forwarder on 127.0.0.1).
     pub opts: Opts,
@@ -160,17 +166,97 @@ async fn forwarder(
                 if out.write_all(&preamble).await.is_err() {
                     return;
                 }
-                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut out).await;
+                // The greeting names the backend thread (or is the
+                // relay's refusal): passed on, and the thread registered
+                // for [`sever`].
+                let Ok(greeting) = read_packet(&mut out).await else {
+                    return;
+                };
+                if inbound.write_all(&greeting).await.is_err() {
+                    return;
+                }
+                let key = greeting_thread(&greeting).map(|t| (addr.clone(), t));
+                let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+                if let Some(k) = &key {
+                    severs()
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(k.clone(), tx);
+                }
+                tokio::select! {
+                    _ = tokio::io::copy_bidirectional(&mut inbound, &mut out) => {}
+                    () = async {
+                        if rx.await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {}
+                }
+                if let Some(k) = &key {
+                    let mut m = severs().lock().unwrap_or_else(PoisonError::into_inner);
+                    if m.get(k)
+                        .is_some_and(tokio::sync::oneshot::Sender::is_closed)
+                    {
+                        m.remove(k);
+                    }
+                }
             });
         }
     });
     Ok((port, task))
 }
 
+type Severs = Mutex<HashMap<(String, u64), tokio::sync::oneshot::Sender<()>>>;
+
+/// Forwarded connections by relay address and backend thread.
+fn severs() -> &'static Severs {
+    static S: OnceLock<Severs> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// One MySQL packet (header and payload) from `s`.
+async fn read_packet(s: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut head = [0u8; 4];
+    s.read_exact(&mut head).await?;
+    let len = usize::from(head[0]) | usize::from(head[1]) << 8 | usize::from(head[2]) << 16;
+    let mut p = Vec::with_capacity(4 + len);
+    p.extend_from_slice(&head);
+    p.resize(4 + len, 0);
+    s.read_exact(&mut p[4..]).await?;
+    Ok(p)
+}
+
+/// The connection id of a v10 handshake packet (header included).
+fn greeting_thread(p: &[u8]) -> Option<u64> {
+    let body = p.get(4..)?;
+    if body.first() != Some(&10) {
+        return None;
+    }
+    let end = body.get(1..)?.iter().position(|b| *b == 0)? + 2;
+    let id = body.get(end..end + 4)?;
+    Some(u64::from(u32::from_le_bytes([id[0], id[1], id[2], id[3]])))
+}
+
+/// Cuts the forwarded connection of backend `thread` through the relay at
+/// `relay_addr` at once, passing nothing more to the relay: the relay
+/// sees its client go away, as when the holder's process dies, never a
+/// `COM_QUIT`. A holder giving up a connection whose branch may be held
+/// calls it before closing the connection, so the fence keeps the branch
+/// (and its locks) for its recovery instead of the server rolling it back
+/// while other writers wait for its rows. Whether one was cut.
+pub fn sever(relay_addr: &str, thread: u64) -> bool {
+    let tx = severs()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&(relay_addr.to_owned(), thread));
+    tx.is_some_and(|t| t.send(()).is_ok())
+}
+
 /// A route with `base`'s account and session whose connections go
 /// through the relay at `relay_addr`.
 async fn through(
     base: &Opts,
+    kind: &'static str,
     tenant: TenantId,
     relay_addr: &str,
     preamble: Preamble,
@@ -188,26 +274,30 @@ async fn through(
             base.ip_or_hostname().to_owned(),
         ))));
     }
+    // The caller's own pool size, when larger (Bolt sessions' branches).
+    let max = MAX_CONNS.max(base.pool_opts().constraints().max());
     let b = b.pool_opts(
         PoolOpts::new()
-            .with_constraints(PoolConstraints::new(0, MAX_CONNS).unwrap_or_default())
+            .with_constraints(PoolConstraints::new(0, max).unwrap_or_default())
             .with_inactive_connection_ttl(Duration::from_secs(60)),
     );
     let opts = Opts::from(b);
     Ok(Through {
         relay_addr: relay_addr.to_owned(),
         base: base.clone(),
+        kind,
         pool: Pool::new(opts.clone()),
         opts,
         forwarder: task,
     })
 }
 
-fn relayed(t: &Through, node: &str) -> Result<Relayed> {
+fn relayed(t: &Through, node: &str, internal_url: &str) -> Result<Relayed> {
     Ok(Relayed {
         node: NodeId::new(node)
             .map_err(|e| SprigError::internal(format!("relay lease node {node}: {e}")))?,
         relay_addr: t.relay_addr.clone(),
+        internal_url: internal_url.to_owned(),
         opts: t.opts.clone(),
         pool: t.pool.clone(),
     })
@@ -220,7 +310,7 @@ async fn relay_of(
     tenant: TenantId,
     cluster: &ClusterId,
     probe: &Pool,
-) -> Result<Option<(String, String)>> {
+) -> Result<Option<(String, String, String)>> {
     let key = (tenant, cluster.clone());
     let fresh = {
         let m = entries().lock().unwrap_or_else(PoisonError::into_inner);
@@ -235,8 +325,8 @@ async fn relay_of(
     } else {
         let relay = if accounts_locked(probe, tenant).await? {
             match read_relay_state(&**dc, cluster).await? {
-                RelayState::Ready(l) => Some((l.relay_addr, l.node_id)),
-                RelayState::Unavailable(why) => Some((String::new(), why)),
+                RelayState::Ready(l) => Some((l.relay_addr, l.node_id, l.internal_url)),
+                RelayState::Unavailable(why) => Some((String::new(), why, String::new())),
                 RelayState::None => None,
             }
         } else {
@@ -247,12 +337,15 @@ async fn relay_of(
         e.checked = Some(Instant::now());
         e.relay.clone_from(&relay);
         // Routes through another writer (or any, when direct) go.
-        let keep = relay.as_ref().map(|(a, _)| a.clone()).unwrap_or_default();
+        let keep = relay
+            .as_ref()
+            .map(|(a, _, _)| a.clone())
+            .unwrap_or_default();
         e.throughs.retain(|t| t.relay_addr == keep);
         relay
     };
     match relay {
-        Some((a, why)) if a.is_empty() => Err(unavailable(format!(
+        Some((a, why, _)) if a.is_empty() => Err(unavailable(format!(
             "cluster {cluster} has relays but none is ready: {why}"
         ))),
         r => Ok(r),
@@ -277,7 +370,25 @@ pub async fn tenant_route_with(
     base: &Opts,
     preamble: Preamble,
 ) -> Result<Option<Relayed>> {
-    let Some((relay, node)) = relay_of(dc, tenant, cluster, probe).await? else {
+    tenant_route_kind(dc, tenant, cluster, probe, base, "", preamble).await
+}
+
+/// [`tenant_route_with`] for a pool of its own `kind`: callers whose
+/// connections must not come from the same pool (a lock holder's and the
+/// work it waits for) pass different kinds with the same options.
+///
+/// # Errors
+/// As [`tenant_route_with`].
+pub async fn tenant_route_kind(
+    dc: &Arc<dyn MetaStore>,
+    tenant: TenantId,
+    cluster: &ClusterId,
+    probe: &Pool,
+    base: &Opts,
+    kind: &'static str,
+    preamble: Preamble,
+) -> Result<Option<Relayed>> {
+    let Some((relay, node, url)) = relay_of(dc, tenant, cluster, probe).await? else {
         return Ok(None);
     };
     let key = (tenant, cluster.clone());
@@ -286,25 +397,25 @@ pub async fn tenant_route_with(
         if let Some(t) = m.get(&key).and_then(|e| {
             e.throughs
                 .iter()
-                .find(|t| t.relay_addr == relay && t.base == *base)
+                .find(|t| t.relay_addr == relay && t.base == *base && t.kind == kind)
         }) {
-            return relayed(t, &node).map(Some);
+            return relayed(t, &node, &url).map(Some);
         }
     }
-    let t = through(base, tenant, &relay, preamble).await?;
+    let t = through(base, kind, tenant, &relay, preamble).await?;
     let mut m = entries().lock().unwrap_or_else(PoisonError::into_inner);
     let e = m.entry(key).or_default();
     // Another caller may have made one meanwhile: use it, drop ours.
     if let Some(x) = e
         .throughs
         .iter()
-        .find(|x| x.relay_addr == relay && x.base == *base)
+        .find(|x| x.relay_addr == relay && x.base == *base && x.kind == kind)
     {
-        return relayed(x, &node).map(Some);
+        return relayed(x, &node, &url).map(Some);
     }
     tracing::info!(%tenant, %cluster, relay = %relay,
         "sprig_ctl connections of a tenant on the relay path go through the relay writer");
-    let out = relayed(&t, &node)?;
+    let out = relayed(&t, &node, &url)?;
     e.throughs.push(t);
     Ok(Some(out))
 }
@@ -320,6 +431,17 @@ pub async fn tenant_route(
     direct: &Pool,
     preamble: Preamble,
 ) -> Result<Option<Relayed>> {
+    route_of_kind(dc, tenant, cluster, direct, "", preamble).await
+}
+
+async fn route_of_kind(
+    dc: &Arc<dyn MetaStore>,
+    tenant: TenantId,
+    cluster: &ClusterId,
+    direct: &Pool,
+    kind: &'static str,
+    preamble: Preamble,
+) -> Result<Option<Relayed>> {
     if relay_of(dc, tenant, cluster, direct).await?.is_none() {
         return Ok(None);
     }
@@ -330,7 +452,7 @@ pub async fn tenant_route(
             .map_err(|e| unavailable(format!("the tenant's cluster is unreachable: {e}")))?;
         c.opts().clone()
     };
-    tenant_route_with(dc, tenant, cluster, direct, &base, preamble).await
+    tenant_route_kind(dc, tenant, cluster, direct, &base, kind, preamble).await
 }
 
 /// The pool `tenant`'s `sprig_ctl` work on `cluster` takes connections
@@ -346,7 +468,23 @@ pub async fn tenant_pool(
     direct: Pool,
     preamble: Preamble,
 ) -> Result<Pool> {
-    Ok(tenant_route(dc, tenant, cluster, &direct, preamble)
+    tenant_pool_of(dc, tenant, cluster, direct, "", preamble).await
+}
+
+/// [`tenant_pool`] for a pool of its own `kind` (see
+/// [`tenant_route_kind`]).
+///
+/// # Errors
+/// As [`tenant_route_with`].
+pub async fn tenant_pool_of(
+    dc: &Arc<dyn MetaStore>,
+    tenant: TenantId,
+    cluster: &ClusterId,
+    direct: Pool,
+    kind: &'static str,
+    preamble: Preamble,
+) -> Result<Pool> {
+    Ok(route_of_kind(dc, tenant, cluster, &direct, kind, preamble)
         .await?
         .map_or(direct, |r| r.pool))
 }
@@ -393,5 +531,72 @@ impl TenantRelays {
     /// As [`tenant_route_with`].
     pub async fn pool(&self, tenant: TenantId, cluster: &ClusterId, direct: Pool) -> Result<Pool> {
         tenant_pool(&self.dc, tenant, cluster, direct, self.preamble).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_greeting_names_the_backend_thread() {
+        // A v10 handshake: version "11.8.3-MariaDB", connection id 0x01020304.
+        let mut body = vec![10u8];
+        body.extend_from_slice(b"11.8.3-MariaDB\0");
+        body.extend_from_slice(&[4, 3, 2, 1]);
+        body.extend_from_slice(&[0; 8]);
+        let mut p = vec![u8::try_from(body.len()).unwrap(), 0, 0, 0];
+        p.extend_from_slice(&body);
+        assert_eq!(greeting_thread(&p), Some(0x0102_0304));
+        // The relay's refusal (an ERR packet) names none.
+        assert_eq!(greeting_thread(&[9, 0, 0, 0, 0xff, 0x18, 0x9a]), None);
+        assert_eq!(greeting_thread(&[1, 0, 0, 0, 10]), None);
+    }
+
+    #[tokio::test]
+    async fn sever_cuts_a_forwarded_connection_without_passing_anything_on() {
+        use tokio::io::AsyncReadExt;
+        // A stand-in relay: reads the preamble, sends a greeting for
+        // thread 77, then records what else arrives until the client goes.
+        let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = relay.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = relay.accept().await.unwrap();
+            let mut pre = [0u8; 15];
+            s.read_exact(&mut pre).await.unwrap();
+            let mut body = vec![10u8];
+            body.extend_from_slice(b"x\0");
+            body.extend_from_slice(&77u32.to_le_bytes());
+            let mut p = vec![u8::try_from(body.len()).unwrap(), 0, 0, 0];
+            p.extend_from_slice(&body);
+            s.write_all(&p).await.unwrap();
+            let mut rest = Vec::new();
+            let _ = s.read_to_end(&mut rest).await;
+            rest
+        });
+        let (port, task) = forwarder(addr.clone(), b"SPRIGRELAY 1 7\n".to_vec())
+            .await
+            .unwrap();
+        let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let g = read_packet(&mut c).await.unwrap();
+        assert_eq!(greeting_thread(&g), Some(77));
+        // Wait until the forwarder registered the thread, then cut it.
+        let mut cut = false;
+        for _ in 0..100 {
+            if sever(&addr, 77) {
+                cut = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(cut);
+        // A COM_QUIT sent after the cut never reaches the relay.
+        let _ = c.write_all(&[1, 0, 0, 0, 1]).await;
+        let rest = server.await.unwrap();
+        assert!(rest.is_empty(), "the relay got {rest:?}");
+        assert!(!sever(&addr, 77));
+        task.abort();
     }
 }

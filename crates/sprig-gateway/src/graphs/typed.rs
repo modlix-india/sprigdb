@@ -341,6 +341,7 @@ impl GatewayGraphs {
     async fn typed_claim_all(self: &Arc<Self>, g: &GraphRef, d: &IndexDef) -> Result<u64> {
         let mut conns = CtlConns {
             graphs: Arc::clone(self),
+            tenant: g.tenant,
             conns: std::collections::HashMap::new(),
         };
         let (labels, types) = self.names_of(g);
@@ -365,7 +366,7 @@ impl GatewayGraphs {
             let id = ClusterId::new(&sh.cluster)
                 .map_err(|e| SprigError::internal(format!("cluster id {}: {e}", sh.cluster)))?;
             let mut c = self
-                .pool(&id)
+                .tenant_pool(g.tenant, &id)
                 .await?
                 .get_conn()
                 .await
@@ -380,6 +381,7 @@ impl GatewayGraphs {
 /// backfill).
 struct CtlConns {
     graphs: Arc<GatewayGraphs>,
+    tenant: TenantId,
     conns: std::collections::HashMap<String, mysql_async::Conn>,
 }
 
@@ -395,7 +397,7 @@ impl ShardConns for CtlConns {
                 .map_err(|e| SprigError::internal(format!("cluster id {}: {e}", at.cluster)))?;
             let c = self
                 .graphs
-                .pool(&id)
+                .tenant_pool(self.tenant, &id)
                 .await?
                 .get_conn()
                 .await
@@ -524,7 +526,7 @@ impl GatewayGraphs {
             .filter(|x| have.contains(x))
             .collect();
         for (cluster, schema) in shards {
-            let mut c = self.cluster_conn(cluster).await?;
+            let mut c = self.cluster_conn(tenant, cluster).await?;
             for (k, code) in &moved {
                 c.query_drop(sprig_graph::typed::promote_sql(
                     schema, graph, owner, *k, *code,
@@ -541,7 +543,7 @@ impl GatewayGraphs {
             .version;
         crate::tenant::lookups_sql::publish_wait(&self.svc, tenant, v).await;
         for (cluster, schema) in shards {
-            let mut c = self.cluster_conn(cluster).await?;
+            let mut c = self.cluster_conn(tenant, cluster).await?;
             for (k, code) in &moved {
                 for sql in sprig_graph::typed::cleanup_sql(schema, graph, owner, *k, *code) {
                     c.query_drop(sql).await.map_err(backend_error)?;
@@ -552,10 +554,10 @@ impl GatewayGraphs {
         Ok(())
     }
 
-    async fn cluster_conn(&self, cluster: &str) -> Result<mysql_async::Conn> {
+    async fn cluster_conn(&self, tenant: TenantId, cluster: &str) -> Result<mysql_async::Conn> {
         let id = ClusterId::new(cluster)
             .map_err(|e| SprigError::internal(format!("cluster id {cluster}: {e}")))?;
-        self.pool(&id)
+        self.tenant_pool(tenant, &id)
             .await?
             .get_conn()
             .await
@@ -607,7 +609,7 @@ impl DdlConns for GwDdlConns {
     async fn cluster(&self, cluster: &str) -> Result<mysql_async::Conn> {
         let id = ClusterId::new(cluster)
             .map_err(|e| SprigError::internal(format!("cluster id {cluster}: {e}")))?;
-        let pool = self.graphs.pool(&id).await?;
+        let pool = self.graphs.tenant_pool(self.tenant, &id).await?;
         pool.get_conn().await.map_err(backend_error)
     }
 

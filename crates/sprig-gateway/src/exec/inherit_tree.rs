@@ -73,13 +73,16 @@ fn bytes_of(v: mysql_async::Value) -> Option<Vec<u8>> {
     }
 }
 
-/// Runs `sql` as the provisioning account on tenant `t`'s cluster.
+/// Runs `sql` as the provisioning account on tenant `t`'s cluster: a
+/// dropped share's clean-up of `t`'s rows, link checks locking them. For
+/// a tenant on Sprig 2PC's relay path, through the relay writer, since
+/// `t`'s own transactions write the same rows.
 ///
 /// # Errors
 /// The backend's (server errors keep their number).
 pub(crate) async fn ctl_query(svc: &TenantServices, t: TenantId, sql: &str) -> Result<RawRows> {
     let cluster = svc.locator.cluster(t).await?;
-    let pool = svc.locator.ctl_pool(&cluster).await?;
+    let pool = svc.locator.tenant_ctl_pool(t, &cluster).await?;
     let mut conn = pool.get_conn().await.map_err(server_err)?;
     let rows: Vec<mysql_async::Row> = conn.query(sql).await.map_err(server_err)?;
     Ok(rows

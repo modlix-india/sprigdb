@@ -1282,7 +1282,13 @@ pub async fn subtree_sync(
     {
         return Ok(());
     }
-    let pool = svc.locator.ctl_pool(cluster).await?;
+    // The tenant's row policies read these rows inside its own writes, so
+    // a held branch can hold them: for a tenant on Sprig 2PC's relay path
+    // they change through the relay writer.
+    let pool = svc
+        .locator
+        .tenant_ctl_pool(sprig_common::ids::TenantId(tenant), cluster)
+        .await?;
     let mut c = pool.get_conn_bounded().await.map_err(|e| {
         SprigError::new(
             SprigCode::BackendUnavailable,

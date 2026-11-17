@@ -226,6 +226,18 @@ impl WorkerSettings {
         o
     }
 
+    /// Reads `tenant`'s catalog rows again, whatever the cached copy's
+    /// age, so the getters that follow see a change committed a moment
+    /// ago. A job calls it when it starts: the cached copy can be older
+    /// than an `ALTER DATABASE ... SET` made just before the job, and a
+    /// tenant never read yet has none (its rows would be read only in the
+    /// background, after the job took the etcd scopes' values).
+    pub async fn refresh_tenant(&self, tenant: TenantId) {
+        if let Some(s) = &self.scopes {
+            let _ = s.get_fresh(tenant).await;
+        }
+    }
+
     /// `setting` for `tenant`: its own catalog rows over the etcd scopes,
     /// as cached now (a missing copy is read in the background).
     #[must_use]
@@ -284,6 +296,20 @@ impl WorkerSettings {
         Duration::from_millis(
             self.scoped_get(scope.into(), &sprig_logic::settings::TRIGGER_BUDGET_MS),
         )
+    }
+
+    /// [`Self::trigger_budget_for`] as it resolves at each call: a job
+    /// that keeps running follows a change of the setting (the etcd scopes
+    /// at once, the tenant's catalog rows within about a second, as the
+    /// cache checks them).
+    #[must_use]
+    pub fn live_trigger_budget(
+        &self,
+        scope: impl Into<LogicScope>,
+    ) -> sprig_logic::triggers::LiveBudget {
+        let scope = scope.into();
+        let me = self.clone();
+        sprig_logic::triggers::LiveBudget(Arc::new(move || me.trigger_budget_for(scope)))
     }
 
     /// `logic.job_budget_ms` at the global scope.

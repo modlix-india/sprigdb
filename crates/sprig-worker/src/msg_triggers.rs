@@ -597,10 +597,13 @@ impl MsgEnv {
         }
     }
 
+    /// The runs' fixed request, its budget followed at each run. A job
+    /// calls it after [`crate::settings::WorkerSettings::refresh_tenant`],
+    /// so its first runs see a budget set just before the trigger was
+    /// created.
     fn template(&self, tenant: TenantId, l: &Loaded) -> Template {
-        let budget = self
-            .settings
-            .trigger_budget_for(LogicScope::db(tenant, l.source.db_id));
+        let scope = LogicScope::db(tenant, l.source.db_id);
+        let budget = self.settings.trigger_budget_for(scope);
         Template {
             req: RunRequest {
                 tenant: tenant.0,
@@ -615,6 +618,7 @@ impl MsgEnv {
                 replay: None,
             },
             version: Arc::new(AtomicU64::new(l.version)),
+            budget: Some(self.settings.live_trigger_budget(scope)),
         }
     }
 
@@ -801,17 +805,28 @@ impl ShardPool {
 }
 
 /// A tenant's catalog pool, from the locator at each use (see
-/// [`ShardPool`]).
+/// [`ShardPool`]). The trigger's committed offsets are rows the tenant's
+/// own transactions also write (a gateway run commits its position in its
+/// transaction), so for a tenant on Sprig 2PC's relay path its connections
+/// go through the relay writer.
 #[derive(Clone)]
 struct CatalogPool {
     locator: Arc<ShardMapLocator>,
     tenant: TenantId,
+    /// This DC's tier (relay leases).
+    dc: Arc<dyn MetaStore>,
 }
 
 impl CatalogPool {
     async fn get_conn(&self) -> Result<mysql_async::Conn> {
         let ep = self.locator.writer(self.tenant).await?;
-        ep.pool.get_conn_bounded().await.map_err(db_err)
+        let pool = match self.locator.catalog_cluster(self.tenant).await? {
+            Some(cluster) => {
+                crate::relay_pools::shard_pool(&self.dc, self.tenant, &cluster, ep.pool).await?
+            }
+            None => ep.pool,
+        };
+        pool.get_conn_bounded().await.map_err(db_err)
     }
 }
 
@@ -1029,11 +1044,13 @@ impl JobHandler for StreamTrigger {
         };
         let log = def.log.first().ok_or("the stream has no log shard")?;
         let shard = env.shard_pool(tenant).await.map_err(|e| e.to_string())?;
+        env.settings.refresh_tenant(tenant).await;
         let t = env.template(tenant, &l);
         let side: Arc<dyn StreamSide> = Arc::new(MariaSide {
             catalog: CatalogPool {
                 locator: Arc::clone(&env.locator),
                 tenant,
+                dc: Arc::clone(&env.dc),
             },
             schema: l.schema.clone(),
             shard,
@@ -1112,6 +1129,7 @@ async fn run_fan_in(
     l: &Loaded,
     def: (u64, u64),
 ) -> std::result::Result<Value, String> {
+    env.settings.refresh_tenant(tenant).await;
     let t = env.template(tenant, l);
     let log = RunLog {
         catalog: l.catalog.clone(),
@@ -1238,6 +1256,7 @@ async fn fan_in_side(
         catalog: CatalogPool {
             locator: Arc::clone(&env.locator),
             tenant,
+            dc: Arc::clone(&env.dc),
         },
         schema: l.schema.clone(),
         shard,
@@ -1273,6 +1292,7 @@ impl JobHandler for QueueTrigger {
             let _ = messages::delete_index(env.dc.as_ref(), tenant, binding).await;
             return Ok(json!({"end": "gone", "binding": binding}));
         };
+        env.settings.refresh_tenant(tenant).await;
         let t = env.template(tenant, &l);
         let log = RunLog {
             catalog: l.catalog.clone(),

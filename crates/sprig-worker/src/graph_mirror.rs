@@ -183,6 +183,10 @@ type Held = (ClusterId, String, GtidPos, Vec<RawRow>);
 struct PoolConns {
     pools: Arc<dyn ClusterPools>,
     writers: HashMap<String, mysql_async::Pool>,
+    /// This DC's tier and the tenant: the mirror locks and writes the
+    /// tenant's edge rows, so for a tenant on Sprig 2PC's relay path
+    /// connections go through the relay writer.
+    relay: (Arc<dyn MetaStore>, TenantId),
 }
 
 #[async_trait]
@@ -197,6 +201,9 @@ impl ApplyConns for PoolConns {
             self.writers.insert(cluster.to_owned(), p.clone());
             p
         };
+        let id = ClusterId::new(cluster)
+            .map_err(|e| SprigError::internal(format!("cluster id {cluster}: {e}")))?;
+        let pool = crate::relay_pools::shard_pool(&self.relay.0, self.relay.1, &id, pool).await?;
         pool.get_conn()
             .await
             .map_err(sprig_graph::catalog::backend_error)
@@ -836,6 +843,7 @@ impl Applier {
         let mut conns = PoolConns {
             pools: Arc::clone(&self.env.pools),
             writers: std::mem::take(&mut self.writers),
+            relay: (Arc::clone(&self.env.dc), self.tenant),
         };
         let r = self.apply_with(graph, ch, &mut conns).await;
         // A failure may come from a stale pool (a new writer): the loop has

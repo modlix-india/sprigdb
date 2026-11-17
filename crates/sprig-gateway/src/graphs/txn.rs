@@ -12,6 +12,13 @@
 //!   on a replica after the session's causal wait or on the writer.
 //! - **Positions.** After a branch that wrote commits, its `@@last_gtid`
 //!   joins the session's causal target (bookmarks).
+//! - **Sprig 2PC's relay path.** For a tenant on it (its accounts locked on
+//!   the cluster), branches come from a pool through the cluster's relay
+//!   writer (`sprig_cluster::failover::relay_pools`), so they are
+//!   relay-fenced as SQL sessions' branches are: a held branch's prepare,
+//!   finish and abandon go to the writer's agent, and a branch given up
+//!   while it may hold is cut at the forwarder, never closed with
+//!   `COM_QUIT`, so the fence keeps its rows until it is recovered.
 //! - **Shard maps.** Writes record the epoch of every shard they touch; a
 //!   commit whose shards changed epoch in the meantime (a split, merge or
 //!   move cut over) rolls back with 39424, which Bolt drivers retry.
@@ -30,6 +37,8 @@ use sprig_txn::{
     BranchConn, ClusterAdmin, ClusterCaps, Ctl, DbError, DbResult, DtidGen, Intent, ShardRef,
     TxnBackend, TxnConfig, TxnCoordinator,
 };
+
+use sprig_cluster::failover::relay::RelayLease;
 
 use super::GatewayGraphs;
 use crate::tenant::TenantServices;
@@ -86,6 +95,8 @@ pub(crate) struct GraphBranch {
     positions: Positions,
     /// Sprig 2PC: a held branch's record of its writes.
     redo: Option<Redo>,
+    /// The relay it reaches its node through (Sprig 2PC's relay path).
+    relay: Option<String>,
 }
 
 /// What a held branch wrote, for its redo rows (Sprig 2PC).
@@ -137,6 +148,8 @@ impl GraphBranch {
             vars: Vec::new(),
             charset: None,
             timestamp_us: Some(r.timestamp_us),
+            // Graph statements name their schema.
+            db: None,
         });
     }
 }
@@ -150,6 +163,12 @@ impl Drop for GraphBranch {
             && let Some(c) = self.conn.take()
             && let Ok(h) = tokio::runtime::Handle::try_current()
         {
+            // Through a relay: the relay must see its client go, not a
+            // `COM_QUIT` that would have the server roll a held branch
+            // back while other writers wait for its rows.
+            if let Some(a) = &self.relay {
+                sprig_cluster::failover::relay_pools::sever(a, self.thread);
+            }
             h.spawn(async move {
                 let _ = c.disconnect().await;
             });
@@ -242,6 +261,12 @@ pub(crate) struct GraphBackend {
     /// server's default, which the pool's connection reset restores).
     lock_wait: Mutex<Option<u64>>,
     pub(crate) positions: Positions,
+    /// The tenant of the coordinator made last: the one named to a relay
+    /// (Sprig 2PC's relay path).
+    relay: Arc<Mutex<Option<TenantId>>>,
+    /// Clusters whose branches go through a ready relay writer, with its
+    /// lease (where the holder calls go).
+    relayed: Arc<Mutex<HashMap<ClusterId, RelayLease>>>,
 }
 
 impl std::fmt::Debug for GraphBackend {
@@ -259,6 +284,8 @@ impl GraphBackend {
             config: Mutex::new(None),
             lock_wait: Mutex::new(None),
             positions: Arc::new(Mutex::new(Vec::new())),
+            relay: Arc::new(Mutex::new(None)),
+            relayed: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -317,6 +344,7 @@ impl GraphBackend {
 
     /// A coordinator for one transaction of `tenant`.
     pub(crate) fn coordinator(self: &Arc<Self>, tenant: TenantId) -> TxnCoordinator<Self> {
+        *self.relay.lock().unwrap_or_else(PoisonError::into_inner) = Some(tenant);
         let s = &self.graphs.coord;
         let cfg = self
             .config
@@ -355,11 +383,34 @@ impl TxnBackend for GraphBackend {
     }
 
     async fn checkout(&self, cluster: &ClusterId) -> DbResult<GraphBranch> {
-        let pool = self
-            .graphs
-            .session_pool(cluster)
-            .await
-            .map_err(|e| DbError::lost(e.to_string()))?;
+        let tenant = *self.relay.lock().unwrap_or_else(PoisonError::into_inner);
+        let route = match tenant {
+            Some(t) => self
+                .graphs
+                .relay_route(t, cluster)
+                .await
+                .map_err(|e| DbError::new(0, e.to_string()))?,
+            None => None,
+        };
+        let (pool, relay) = if let Some(r) = route {
+            let addr = r.relay_addr.clone();
+            self.relayed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(cluster.clone(), lease_of(&r));
+            (r.pool, Some(addr))
+        } else {
+            self.relayed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(cluster);
+            let p = self
+                .graphs
+                .session_pool(cluster)
+                .await
+                .map_err(|e| DbError::lost(e.to_string()))?;
+            (p, None)
+        };
         let mut c = pool.get_conn().await.map_err(|e| db_error(&e))?;
         let level = *self
             .isolation
@@ -386,16 +437,43 @@ impl TxnBackend for GraphBackend {
             wrote: false,
             positions: Arc::clone(&self.positions),
             redo: None,
+            relay,
         })
     }
 
+    // On clusters whose branches went through a relay writer, a held
+    // branch's prepare, finish and abandon go to that writer's agent, as
+    // for SQL sessions; the rest is the `sprig_ctl` admin's.
     fn admin(&self) -> Arc<dyn ClusterAdmin> {
         let a = self.graphs.coord.admin.get_or_init(|| {
             Arc::new(MyAdmin::over(Arc::new(CtlPools(Arc::clone(
                 &self.graphs.svc,
             )))))
         });
-        Arc::clone(a) as Arc<dyn ClusterAdmin>
+        Arc::new(crate::exec::router::RelayAdmin {
+            inner: Arc::clone(a) as Arc<dyn ClusterAdmin>,
+            relayed: Arc::clone(&self.relayed),
+            relay: Arc::clone(&self.relay),
+        })
+    }
+
+    fn relay_fenced(&self, cluster: &ClusterId) -> bool {
+        self.relayed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(cluster)
+    }
+}
+
+/// The lease a route went through, for the holder calls.
+fn lease_of(r: &sprig_cluster::failover::relay_pools::Relayed) -> RelayLease {
+    RelayLease {
+        node_id: r.node.to_string(),
+        agent: String::new(),
+        relay_addr: r.relay_addr.clone(),
+        internal_url: r.internal_url.clone(),
+        epoch: 0,
+        ready: true,
     }
 }
 

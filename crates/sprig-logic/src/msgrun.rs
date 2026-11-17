@@ -184,6 +184,9 @@ pub struct Template {
     pub req: RunRequest,
     /// The active version.
     pub version: Arc<AtomicU64>,
+    /// `logic.trigger_budget_ms` as it resolves at each run (the request's
+    /// budget and lease follow it); `None` keeps the request's.
+    pub budget: Option<crate::triggers::LiveBudget>,
 }
 
 impl Template {
@@ -191,6 +194,11 @@ impl Template {
         let mut r = self.req.clone();
         r.version = self.version.load(Ordering::Relaxed);
         r.record = record;
+        if let Some(b) = &self.budget {
+            let ms = u64::try_from((b.0)().as_millis()).unwrap_or(30_000);
+            r.budget_ms = ms;
+            r.lease_ms = 30_000.max(ms.saturating_add(5_000));
+        }
         r
     }
 }

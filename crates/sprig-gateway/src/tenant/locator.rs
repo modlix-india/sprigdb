@@ -722,6 +722,111 @@ impl GatewayLocator {
         })
     }
 
+    /// Which `sprig_ctl` pool [`Self::ctl_pool`] hands out for `cluster`
+    /// now (writer node, address and credential); it changes when the pool
+    /// is replaced and the old one disconnected. `None` before the first.
+    #[must_use]
+    pub fn ctl_pool_fingerprint(&self, cluster: &ClusterId) -> Option<String> {
+        self.pools
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(Budget::Ctl, cluster.clone()))
+            .map(|(f, _)| f.clone())
+    }
+
+    /// [`Self::ctl_pool`] for work on `tenant`'s rows on `cluster`. For a
+    /// tenant on Sprig 2PC's relay path it is a pool with the same options
+    /// through the cluster's relay writer
+    /// (`sprig_cluster::failover::relay_pools`), so the relay fence ends
+    /// these connections with the tenant's own when a held branch's holder
+    /// is lost, and refuses them until the branch is replayed.
+    ///
+    /// # Errors
+    /// As [`Self::ctl_pool`]; a retryable 39030 while the tenant is on the
+    /// relay path and the cluster has no ready relay writer.
+    pub async fn tenant_ctl_pool(&self, tenant: TenantId, cluster: &ClusterId) -> Result<Pool> {
+        let direct = self.ctl_pool(cluster).await?;
+        self.through_relay(tenant, cluster, direct, "ctl").await
+    }
+
+    /// [`Self::ctl_hold_pool`] for work on `tenant`'s rows, routed as
+    /// [`Self::tenant_ctl_pool`].
+    ///
+    /// # Errors
+    /// As [`Self::tenant_ctl_pool`].
+    pub async fn tenant_hold_pool(&self, tenant: TenantId, cluster: &ClusterId) -> Result<Pool> {
+        let direct = self.ctl_hold_pool(cluster).await?;
+        // A pool apart from the other routed work: a holder waits for
+        // work that takes connections from those.
+        self.through_relay(tenant, cluster, direct, "hold").await
+    }
+
+    /// The catalog pool of `tenant`'s home cluster ([`Self::catalog_pool`]),
+    /// routed as [`Self::tenant_ctl_pool`]: for the few catalog rows a
+    /// tenant's own transactions also write (`stream_offsets`).
+    ///
+    /// # Errors
+    /// As [`Self::tenant_ctl_pool`].
+    pub async fn tenant_catalog_pool(&self, tenant: TenantId) -> Result<Pool> {
+        let cluster = self.cluster(tenant).await?;
+        let direct = self.catalog_pool(&cluster).await?;
+        self.through_relay(tenant, &cluster, direct, "catalog")
+            .await
+    }
+
+    /// [`Self::ctl_conn`] for a lock on `tenant`'s rows, routed as
+    /// [`Self::tenant_ctl_pool`].
+    ///
+    /// # Errors
+    /// As [`Self::ctl_conn`] and [`Self::tenant_ctl_pool`].
+    pub async fn tenant_ctl_conn(
+        &self,
+        tenant: TenantId,
+        cluster: &ClusterId,
+    ) -> Result<mysql_async::Conn> {
+        let probe = self.ctl_pool(cluster).await?;
+        let base = self.ctl_opts(cluster).await?;
+        let Some(r) = sprig_cluster::failover::relay_pools::tenant_route_with(
+            &self.dc,
+            tenant,
+            cluster,
+            &probe,
+            &base,
+            sprig_txn::fence::wire::preamble,
+        )
+        .await?
+        else {
+            return self.ctl_conn(cluster).await;
+        };
+        mysql_async::Conn::new(r.opts).await.map_err(|e| {
+            let mut err = SprigError::new(
+                SprigCode::BackendUnavailable,
+                format!("cluster {cluster} unreachable through its relay writer"),
+            )
+            .with_source(e);
+            err.retryable = true;
+            err
+        })
+    }
+
+    async fn through_relay(
+        &self,
+        tenant: TenantId,
+        cluster: &ClusterId,
+        direct: Pool,
+        kind: &'static str,
+    ) -> Result<Pool> {
+        sprig_cluster::failover::relay_pools::tenant_pool_of(
+            &self.dc,
+            tenant,
+            cluster,
+            direct,
+            kind,
+            sprig_txn::fence::wire::preamble,
+        )
+        .await
+    }
+
     /// The pool of `sprig_ctl` connections to `cluster`'s writer that the
     /// tenant catalogs there use ([`CatalogLocator::writer`]). Its
     /// connections are not reset when they go back to the pool, so their

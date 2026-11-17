@@ -25,6 +25,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--run-id", required=True, help="the --run id the workload script was given")
     p.add_argument("--results", default=None)
+    p.add_argument("--notes", default="", help="a sentence added to every median's notes")
     a = p.parse_args()
     root = result.results_root(a.results)
     tag = result.slug(a.run_id) + "-run"
@@ -59,7 +60,10 @@ def main():
                      "run": base["run"].replace(tag + str(rs[0]["config"]["run"]), result.slug(a.run_id) + "-median")})
         if not base.get("keep_unpaired"):
             base.pop("pair", None)  # the median is the paired result
-        base["notes"] = ((base.get("notes") or "") + f" Median of {len(vals)} runs ({min(vals)}–{max(vals)}).").strip()
+        notes = base.get("notes") or ""
+        if a.notes and a.notes not in notes:
+            notes += " " + a.notes
+        base["notes"] = (notes + f" Median of {len(vals)} runs ({min(vals)}–{max(vals)}).").strip()
         base.pop("host", None)
         base["host"] = rs[0].get("host")
         print(result.write(base, root))

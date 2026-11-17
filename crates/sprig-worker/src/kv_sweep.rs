@@ -21,10 +21,13 @@ use async_trait::async_trait;
 use mysql_async::prelude::Queryable;
 use serde_json::{Value, json};
 use sprig_catalog::pool_wait::Bounded as _;
+use sprig_common::ids::{ClusterId, TenantId};
+use sprig_common::names::SchemaName;
 use sprig_controller::catalogs::ClusterPools;
 use sprig_controller::dispatch::JobClass;
 use sprig_kv::sweep::{self, SweepOpts, Swept};
 use sprig_kv::{Row, SqlError, SqlRunner};
+use sprig_meta::MetaStore;
 
 use crate::runtime::{JobCtx, JobHandler};
 
@@ -119,6 +122,9 @@ pub struct KvSweep {
     pub pools: Arc<dyn ClusterPools>,
     /// The worker's live settings; `None` reads the job's spec.
     pub settings: Option<crate::settings::WorkerSettings>,
+    /// This DC's tier (relay leases); `None`: every namespace is swept
+    /// straight on its cluster.
+    pub dc: Option<Arc<dyn MetaStore>>,
 }
 
 impl std::fmt::Debug for KvSweep {
@@ -127,9 +133,24 @@ impl std::fmt::Debug for KvSweep {
     }
 }
 
-/// One pass over a cluster; the time until its next expiry.
+/// The tenant of a schema named `t<tenant>_...`.
+fn tenant_of(schema: &str) -> Option<TenantId> {
+    let rest = schema.strip_prefix('t')?;
+    let end = rest.find('_')?;
+    rest[..end].parse().ok().map(TenantId)
+}
+
+/// Where a pass reaches tenants on Sprig 2PC's relay path: this DC's
+/// tier, the cluster and its direct pool.
+type Route<'a> = (&'a Arc<dyn MetaStore>, &'a ClusterId, &'a mysql_async::Pool);
+
+/// One pass over a cluster; the time until its next expiry. A key a
+/// transaction refreshed (`SET`, `EXPIRE`) can be a held branch's row, so
+/// a namespace of a tenant on Sprig 2PC's relay path is swept through the
+/// relay writer (`route`), and skipped this pass while none is ready.
 async fn pass(
     sql: &mut dyn SqlRunner,
+    route: Option<Route<'_>>,
     o: Opts,
     orphans: bool,
     total: &mut Swept,
@@ -137,6 +158,36 @@ async fn pass(
 ) -> Result<Option<Duration>, SqlError> {
     let mut next: Option<Duration> = None;
     for ns in sweep::discover(sql).await? {
+        let tenant = ns
+            .schema
+            .parse::<SchemaName>()
+            .ok()
+            .map(|s| s.tenant())
+            .or_else(|| tenant_of(&ns.schema));
+        let via = match (route, tenant) {
+            (Some((dc, cluster, direct)), Some(t)) => {
+                match crate::relay_pools::shard_route(dc, t, cluster, direct).await {
+                    Ok(None) => None,
+                    Ok(Some(pool)) => match pool.get_conn_bounded().await {
+                        Ok(c) => Some(Ctl(c)),
+                        Err(e) => {
+                            tracing::debug!(%cluster, tenant = %t, error = %e, "sweeper: the relay writer didn't answer; the namespace waits");
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        tracing::debug!(%cluster, tenant = %t, error = %e, "sweeper: no ready relay writer; the namespace waits");
+                        continue;
+                    }
+                }
+            }
+            _ => None,
+        };
+        let mut via = via;
+        let sql: &mut dyn SqlRunner = match via.as_mut() {
+            Some(c) => c,
+            None => &mut *sql,
+        };
         let s = sweep::expired(sql, &ns, o.sweep).await?;
         if s.keys > 0 || s.elements > 0 {
             metrics::counter!("sprig_kv_purged_keys_total").increment(s.keys);
@@ -176,6 +227,7 @@ impl JobHandler for KvSweep {
         let mut tasks = Vec::new();
         for cluster in clusters {
             let pools = Arc::clone(&self.pools);
+            let dc = self.dc.clone();
             let cancel = cx.cancel.clone();
             let (spec, settings) = (cx.spec.clone(), self.settings.clone());
             tasks.push(tokio::spawn(async move {
@@ -191,7 +243,9 @@ impl JobHandler for KvSweep {
                                 let mut sql = Ctl(conn);
                                 let orphans =
                                     last_orphans.is_none_or(|t| t.elapsed() >= o.orphan_every);
-                                match pass(&mut sql, o, orphans, &mut total, &mut orphan_rows).await
+                                let route = dc.as_ref().map(|d| (d, &cluster, &pool));
+                                match pass(&mut sql, route, o, orphans, &mut total, &mut orphan_rows)
+                                    .await
                                 {
                                     Ok(next) => {
                                         if orphans {

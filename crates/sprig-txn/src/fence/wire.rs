@@ -248,6 +248,7 @@ mod tests {
             vars: vec![("sql_mode".into(), "STRICT_TRANS_TABLES".into())],
             charset: Some("utf8mb4".into()),
             timestamp_us: Some(1_794_000_000_123_456),
+            db: Some("t1_d1_g1_s1".into()),
         }];
         for c in [
             HolderCall::Prepare {

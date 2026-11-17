@@ -39,3 +39,26 @@ pub(crate) async fn shard_pool(
     )
     .await
 }
+
+/// Whether `tenant`'s `sprig_ctl` work on `cluster` goes through the
+/// relay writer now: `Some` with the pool to take connections from, or
+/// `None` to use `direct` (and a connection already taken from it).
+///
+/// # Errors
+/// As [`shard_pool`].
+pub(crate) async fn shard_route(
+    dc: &Arc<dyn MetaStore>,
+    tenant: TenantId,
+    cluster: &ClusterId,
+    direct: &Pool,
+) -> Result<Option<Pool>> {
+    Ok(sprig_cluster::failover::relay_pools::tenant_route(
+        dc,
+        tenant,
+        cluster,
+        direct,
+        sprig_txn::fence::wire::preamble,
+    )
+    .await?
+    .map(|r| r.pool))
+}

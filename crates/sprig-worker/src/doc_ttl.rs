@@ -324,6 +324,18 @@ struct Pace {
 }
 
 impl DocTtl {
+    /// A connection for `tenant`'s deletes on `cluster`. A transaction's
+    /// update of the same document can be a held branch's row: for a
+    /// tenant on Sprig 2PC's relay path the deletes go through the relay
+    /// writer. `None` when none can be had now (tried at the next pass).
+    async fn conn(&self, tenant: TenantId, cluster: &ClusterId) -> Option<mysql_async::Conn> {
+        let direct = self.0.pools.writer(cluster).await.ok()?;
+        let pool = crate::relay_pools::shard_pool(&self.0.dc, tenant, cluster, direct)
+            .await
+            .ok()?;
+        pool.get_conn_bounded().await.ok()
+    }
+
     /// Every TTL collection of tenants homed here, by cluster scan.
     async fn discover(&self, clusters: &[ClusterId]) -> Vec<TtlColl> {
         let mut out = Vec::new();
@@ -463,7 +475,7 @@ impl DocTtl {
         }
         let started = Instant::now();
         let mut pace: HashMap<u64, Pace> = HashMap::new();
-        let mut conns: HashMap<ClusterId, Ctl> = HashMap::new();
+        let mut conns: HashMap<(TenantId, ClusterId), Ctl> = HashMap::new();
         let mut total = 0u64;
         while items.iter().any(|i| !i.done) && !cx.cancel.is_cancelled() {
             if started.elapsed() > budget {
@@ -493,18 +505,15 @@ impl DocTtl {
                         }
                     }
                 }
-                let sql = if let Some(c) = conns.get_mut(&it.cluster) {
+                let key = (tenant, it.cluster.clone());
+                let sql = if let Some(c) = conns.get_mut(&key) {
                     c
                 } else {
-                    let conn = match self.0.pools.writer(&it.cluster).await {
-                        Ok(pool) => pool.get_conn_bounded().await.ok(),
-                        Err(_) => None,
-                    };
-                    let Some(conn) = conn else {
+                    let Some(conn) = self.conn(tenant, &it.cluster).await else {
                         it.done = true;
                         continue;
                     };
-                    conns.entry(it.cluster.clone()).or_insert(Ctl(conn))
+                    conns.entry(key).or_insert(Ctl(conn))
                 };
                 let ns = Ns {
                     db: it.schema.clone(),
@@ -536,7 +545,7 @@ impl DocTtl {
                     }
                     Err(e) => {
                         tracing::warn!(tenant = %tenant, schema = %it.schema, coll = %it.coll.meta.name, error = %e.message, "TTL batch failed; retried next pass");
-                        conns.remove(&it.cluster);
+                        conns.remove(&(tenant, it.cluster.clone()));
                         it.done = true;
                     }
                 }

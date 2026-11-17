@@ -781,8 +781,11 @@ impl sprig_inherit::Runner for InhRunner<'_, '_, '_> {
         let svc = Arc::clone(ts.services());
         let cluster = svc.locator.cluster(t).await?;
         // Its own connection: held until the transaction ends, it can't
-        // take a slot of the shared pool another holder waits for.
-        let mut conn = svc.locator.ctl_conn(&cluster).await?;
+        // take a slot of the shared pool another holder waits for. For a
+        // tenant on Sprig 2PC's relay path it goes through the relay
+        // writer, so a lock released by a lost holder can't be taken
+        // again until that holder's held branches are replayed.
+        let mut conn = svc.locator.tenant_ctl_conn(t, &cluster).await?;
         let (row, lock) = sprig_inherit::hier::lock_sql(schema, object);
         let fail = |e: mysql_async::Error| match &e {
             mysql_async::Error::Server(s) if s.code == 1205 => SprigError::standard(

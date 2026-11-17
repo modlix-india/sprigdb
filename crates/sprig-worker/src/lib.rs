@@ -89,6 +89,7 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
     let sweep_registry = registry.clone();
     let ttl_registry = registry.clone();
     let ttl_dc = dc.clone();
+    let sweep_dc = dc.clone();
     let recovery_env = recovery::RecoveryEnv {
         dc: dc.clone(),
         registry: registry.clone(),
@@ -418,6 +419,7 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
                     .budget("kv_sweep", 2),
             ),
             settings: Some(live.clone()),
+            dc: Some(sweep_dc),
         }))
         .with_handler(Arc::new(doc_ttl::DocTtl(doc_ttl::DocTtlEnv {
             dc: ttl_dc,

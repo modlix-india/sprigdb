@@ -462,6 +462,9 @@ impl LogicTrigger {
         // The table's and the module's database's `logic.trigger_*` rows
         // too, over the tenant's.
         let scope = crate::settings::LogicScope::db(tenant, module.db_id).with_object(b.object_id);
+        // As committed now (a database's budget set just before the
+        // trigger was created), then followed while the job runs.
+        env.settings.refresh_tenant(tenant).await;
         let apply = Arc::new(MariaApply {
             tenant,
             binding_id,
@@ -473,6 +476,7 @@ impl LogicTrigger {
             }),
             versions,
             budget: env.settings.trigger_budget_for(scope),
+            live_budget: Some(env.settings.live_trigger_budget(scope)),
             // The code gets the changed rows its definer may see (each
             // event checked while the table's policies bind it).
             guard: match (
@@ -675,9 +679,14 @@ impl JobHandler for LogicSchedule {
             .await
             .map_err(|e| e.to_string())?
             .ok_or("the tenant has no shard map here")?;
-        let pool = env
+        // The run's statements write the tenant's tables: for a tenant on
+        // Sprig 2PC's relay path, through the relay writer.
+        let direct = env
             .pools
             .writer(&cluster)
+            .await
+            .map_err(|e| e.to_string())?;
+        let pool = crate::relay_pools::shard_pool(&env.dc, tenant, &cluster, direct)
             .await
             .map_err(|e| e.to_string())?;
         let store = LogicStore::new(ep.store.schema());
@@ -715,7 +724,8 @@ impl JobHandler for LogicSchedule {
                 .map_err(|e| e.to_string())?;
         }
         // The module's database's `logic.job_budget_ms` too, over the
-        // tenant's.
+        // tenant's, as committed now.
+        env.settings.refresh_tenant(tenant).await;
         let budget = match store.module_by_id(&mut catalog, module_id).await {
             Ok(Some(m)) => env
                 .settings

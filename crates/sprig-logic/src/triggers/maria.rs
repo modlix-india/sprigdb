@@ -251,8 +251,10 @@ pub struct MariaApply {
     pub pools: Arc<dyn ShardPools>,
     /// The active version.
     pub versions: Arc<CatalogVersions>,
-    /// `logic.trigger_budget_ms`.
+    /// `logic.trigger_budget_ms` when the job started.
     pub budget: Duration,
+    /// `logic.trigger_budget_ms` as it resolves at each run, when set.
+    pub live_budget: Option<super::LiveBudget>,
     /// Asked before each attempt; an error (retryable)
     /// makes the event wait, neither run nor dead-lettered.
     pub guard: Option<Arc<dyn RunGuard>>,
@@ -347,7 +349,8 @@ impl MariaApply {
         let mut args = ev.args(params);
         args.push("@__sprig_e".into());
         args.push("@__sprig_r".into());
-        let secs = self.budget.as_secs_f64().max(0.001);
+        let budget = self.live_budget.as_ref().map_or(self.budget, |b| (b.0)());
+        let secs = budget.as_secs_f64().max(0.001);
         c.query_drop(format!(
             "SET STATEMENT max_statement_time = {secs} FOR CALL {schema}.`__sprig_l{}_v{version}`({})",
             self.module_id,
