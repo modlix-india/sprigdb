@@ -228,25 +228,20 @@ impl Meta {
     /// [`Meta::from_comment`] reads the keys in any order.
     #[must_use]
     pub fn comment(&self) -> String {
-        let s = |x: &str| Value::String(x.to_owned()).to_string();
-        let mut out = format!(
-            "{{\"column\":{},\"generation\":{}",
-            s(&self.column),
-            self.generation
-        );
+        let text = |x: &str| Value::String(x.to_owned()).to_string();
+        let mut keys = vec![
+            format!("\"column\":{}", text(&self.column)),
+            format!("\"generation\":{}", self.generation),
+        ];
         if let Some(n) = self.max_input_tokens {
-            out.push_str(&format!(",\"max_input_tokens\":{n}"));
+            keys.push(format!("\"max_input_tokens\":{n}"));
         }
-        out.push_str(&format!(
-            ",\"mode\":{},\"model\":{}",
-            s(self.mode.as_str()),
-            s(&self.model)
-        ));
+        keys.push(format!("\"mode\":{}", text(self.mode.as_str())));
+        keys.push(format!("\"model\":{}", text(&self.model)));
         if self.shadow {
-            out.push_str(",\"shadow\":true");
+            keys.push("\"shadow\":true".to_owned());
         }
-        out.push('}');
-        format!("{COMMENT_TAG}{out}")
+        format!("{COMMENT_TAG}{{{}}}", keys.join(","))
     }
 
     /// From [`Meta::comment`]'s text.

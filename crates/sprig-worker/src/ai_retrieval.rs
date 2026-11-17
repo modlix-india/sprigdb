@@ -41,6 +41,12 @@
 //!       or check ends; in between each committed write adds a row that
 //!       gained chunks and takes away one that lost them. Embeddings are
 //!       counted apart: sprig_retrieval_rows_total{result="indexed"}
+//!   a graceful stop drains (sprig_feed::drain): the round in flight is
+//!     finished, the feed read and handled on (no fill steps) until the
+//!     position has passed the cluster's (read again once passed, until
+//!     nothing more was written), at most STOP_DRAIN after the stop; then
+//!     the position is acknowledged, so a binlog purge right after the
+//!     stop takes nothing the restart needs
 //!
 //! reconcile(shard, rows):
 //!   SELECT pk, text, title, filters, UNHEX(MD5(JSON_ARRAY(text, title,
@@ -57,6 +63,11 @@
 //!   keys the source no longer has: DELETE their chunks WHERE NOT EXISTS
 //!     (the row) — the guard of a delete
 //! ```
+//!
+//! The work that locks the source's rows (the guard, and the clean-ups'
+//! and routing hash catch-up's subqueries) goes, for a tenant on Sprig
+//! 2PC's relay path, through the cluster's relay writer
+//! (`locking_conn_of`); the chunk tables' DDL and plain reads stay direct.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
@@ -75,10 +86,11 @@ use sprig_common::ids::{ClusterId, DbId, GroupId, ShardId, TenantId};
 use sprig_common::names::{SchemaName, quote};
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_controller::dispatch::JobClass;
+use sprig_feed::drain::{STOP_DRAIN, StopDrain};
 use sprig_feed::names::CatalogResolver;
 use sprig_feed::pump::Pump;
 use sprig_feed::subs::Subscriptions;
-use sprig_feed::{FeedItem, MetaPlacement, Op, StartAt, TailOptions, TenantTail};
+use sprig_feed::{FeedItem, MetaPlacement, Op, ResumeToken, StartAt, TailOptions, TenantTail};
 use sprig_sql::retrieval::Chunking;
 
 use crate::ai_embed::{EmbedEnv, Throttle, backend, cut, now_ms, pause};
@@ -112,6 +124,10 @@ pub struct AiRetrieval(pub EmbedEnv);
 impl JobHandler for AiRetrieval {
     fn kind(&self) -> &'static str {
         JOB_KIND
+    }
+
+    fn drains(&self) -> bool {
+        true
     }
 
     fn class(&self) -> JobClass {
@@ -412,8 +428,29 @@ impl Job<'_> {
         self.env.logic.pools.writer(&c).await
     }
 
+    /// A direct connection to shard `s`: chunk table DDL and plain reads.
     async fn conn_of(&self, s: &ShardLoc) -> Result<mysql_async::Conn> {
         let pool = self.pool_of(s).await?;
+        pool.get_conn_bounded()
+            .await
+            .map_err(|e| SprigError::new(SprigCode::BackendUnavailable, format!("retrieval: {e}")))
+    }
+
+    /// A connection for the writes that lock the source's rows (the
+    /// reconcile's guard, `LOCK IN SHARE MODE`, and the source subqueries
+    /// of the clean-ups and the routing hash catch-up, shared locks under
+    /// `REPEATABLE READ`): for a tenant on the relay path, through the
+    /// cluster's relay writer, chosen again at each use, so the fence ends
+    /// it with the tenant's others when a held branch's holder is lost.
+    ///
+    /// # Errors
+    /// As [`Self::conn_of`]; a retryable 39030 while the cluster has
+    /// relays but none is ready.
+    async fn locking_conn_of(&self, s: &ShardLoc) -> Result<mysql_async::Conn> {
+        let c = self.cluster_of(s).await?;
+        let direct = self.env.logic.pools.writer(&c).await?;
+        let pool =
+            crate::relay_pools::shard_pool(&self.env.logic.dc, self.tenant, &c, direct).await?;
         pool.get_conn_bounded()
             .await
             .map_err(|e| SprigError::new(SprigCode::BackendUnavailable, format!("retrieval: {e}")))
@@ -638,8 +675,11 @@ impl Job<'_> {
                 &self.ix.row.key_columns,
                 RK_CATCH_UP,
             );
-            let mut c = self.conn_of(loc).await?;
-            if let Err(e) = c.query_drop(sql).await {
+            let done = match self.locking_conn_of(loc).await {
+                Ok(mut c) => c.query_drop(sql).await.map_err(backend),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = done {
                 tracing::debug!(tenant = %self.tenant, index = self.ix.row.id, %schema, error = %e, "retrieval index: routing hashes not set yet");
             }
         }
@@ -755,7 +795,7 @@ impl Job<'_> {
         let keys: Vec<KeyColumn> = self.ix.row.key_columns.clone();
         let nk = keys.len();
         let nf = self.ix.row.filters.len();
-        let mut c = self.conn_of(s).await?;
+        let mut c = self.locking_conn_of(s).await?;
         let rows: Vec<mysql_async::Row> = c.query(sql).await.map_err(|e| self.source_error(e))?;
         let read = rows.len() as u64;
         let src: Vec<SrcRow> = rows
@@ -1103,7 +1143,7 @@ impl Job<'_> {
             let sql = self.ix.select_sql(&schema, &pred.join(" OR "), None, rk);
             self.reconcile(s, &sql, cancel).await?;
             // The rows that are gone: their chunks, unless the row exists.
-            let mut c = self.conn_of(s).await?;
+            let mut c = self.locking_conn_of(s).await?;
             let mut gone = 0u64;
             for l in &lits {
                 let stmt = format!(
@@ -1144,7 +1184,7 @@ impl Job<'_> {
                 )
             })
             .collect();
-        let mut c = self.conn_of(s).await?;
+        let mut c = self.locking_conn_of(s).await?;
         c.query_drop(format!(
             "DELETE FROM {chunks} WHERE NOT EXISTS (SELECT 1 FROM {} AS s WHERE {})",
             self.ix.source(&schema),
@@ -1431,11 +1471,43 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
     let mut reload = false;
     let mut attempt = 0u32;
     let object = job.ix.row.object_id;
-    loop {
-        if cx.cancel.is_cancelled() {
-            break;
+    // A graceful stop drains: the round in flight goes on, and the feed is
+    // read and handled on, until `hard`, STOP_DRAIN after the cancel.
+    let hard = sprig_common::CancellationToken::new();
+    let _hard = hard.clone().drop_guard();
+    {
+        let (cancel, hard) = (cx.cancel.clone(), hard.clone());
+        tokio::spawn(async move {
+            tokio::select! {
+                () = cancel.cancelled() => {}
+                () = hard.cancelled() => return,
+            }
+            tokio::time::sleep(STOP_DRAIN).await;
+            hard.cancel();
+        });
+    }
+    let mut drain: Option<StopDrain> = None;
+    // The position past every handled item (`last_token` is taken by acks).
+    let mut at: Option<ResumeToken> = None;
+    'serve: loop {
+        if cx.cancel.is_cancelled() && drain.is_none() {
+            let cluster = at.as_ref().map(|t| t.cluster.clone());
+            drain =
+                Some(StopDrain::begin(env.logic.feed.as_ref(), cluster.as_ref(), STOP_DRAIN).await);
         }
-        if reload || checked.elapsed() > Duration::from_secs(5) {
+        if let Some(d) = drain.as_mut() {
+            let finished = match &at {
+                Some(t) => d.done(env.logic.feed.as_ref(), &t.cluster, &t.pos).await,
+                None => true,
+            };
+            if finished || hard.is_cancelled() {
+                tracing::debug!(%tenant, index = id, passed = d.reached(), "retrieval index job drained at its stop");
+                break;
+            }
+        }
+        // While draining, rounds stop at `hard`, not at the cancel.
+        let stop = if drain.is_some() { &hard } else { &cx.cancel };
+        if drain.is_none() && (reload || checked.elapsed() > Duration::from_secs(5)) {
             reload = false;
             checked = Instant::now();
             match load(env, tenant, id).await {
@@ -1480,9 +1552,8 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
         // The shards (and their chunk tables) first.
         if let Err(e) = job.shards().await {
             tracing::warn!(%tenant, index = id, error = %e, "retrieval index: listing shards failed; retrying");
-            if !pause(&cx.cancel, Duration::from_secs(1)).await {
-                break;
-            }
+            // A stop cuts the wait short; its drain starts (or ends) above.
+            let _ = pause(stop, Duration::from_secs(1)).await;
             continue;
         }
         let filling = !job.all_done();
@@ -1493,11 +1564,12 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
         };
         let read = tokio::select! {
             biased;
-            () = cx.cancel.cancelled() => None,
+            () = stop.cancelled() => None,
             r = tokio::time::timeout(wait, feed.next()) => Some(r),
         };
         let first = match read {
-            None => break,
+            // The stop: its drain starts (or ends) above.
+            None => continue,
             Some(Ok(i)) => Some(i?),
             Some(Err(_)) => None,
         };
@@ -1562,7 +1634,7 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
                 }
                 if failed.is_none() {
                     for (s, ks) in &keys {
-                        if let Err(e) = job.reconcile_keys(s, ks, &cx.cancel).await {
+                        if let Err(e) = job.reconcile_keys(s, ks, stop).await {
                             failed = Some(e);
                             break;
                         }
@@ -1572,23 +1644,24 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
                     attempt = 0;
                     break;
                 };
-                if cx.cancel.is_cancelled() {
-                    return Ok(json!({"stopped": "cancelled", "indexed": job.indexed}));
+                if stop.is_cancelled() {
+                    // Out of time: this round stays after the checkpoint.
+                    break 'serve;
                 }
                 attempt += 1;
                 if e.code() == Some(SprigCode::EmbeddingFailed) || (!e.retryable && attempt > 5) {
                     mark_failed(env, tenant, id, &e.to_string()).await;
                     tracing::warn!(%tenant, index = id, error = %e, "retrieval index failed; retrying in 30 s");
-                    if !pause(&cx.cancel, Duration::from_secs(30)).await {
-                        return Ok(json!({"stopped": "cancelled", "indexed": job.indexed}));
+                    if !pause(stop, Duration::from_secs(30)).await {
+                        break 'serve;
                     }
                     return Err(e);
                 }
                 job.shards = None;
                 tracing::warn!(%tenant, index = id, error = %e, attempt, "retrieval round failed; retrying");
                 let wait = Duration::from_millis(200 * u64::from(attempt.min(25)));
-                if !pause(&cx.cancel, wait).await {
-                    return Ok(json!({"stopped": "cancelled", "indexed": job.indexed}));
+                if !pause(stop, wait).await {
+                    break 'serve;
                 }
             }
             job.live.spend(n_keys, Instant::now());
@@ -1596,12 +1669,14 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
                 let _ = job.save_progress().await;
             }
             let w = job.live.wait();
-            if w > Duration::ZERO && !pause(&cx.cancel, w.min(Duration::from_secs(5))).await {
-                break;
+            if w > Duration::ZERO {
+                // A stop cuts the wait short; the round's token is kept.
+                let _ = pause(stop, w.min(Duration::from_secs(5))).await;
             }
         }
         if let Some(t) = items.last().map(|i| i.token().clone()) {
             pending_ack += n_keys;
+            at = Some(t.clone());
             last_token = Some(t);
         }
         if let Some(e) = ended {
@@ -1610,7 +1685,10 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
             }
             return Err(e);
         }
-        // Fill between rounds.
+        // Fill between rounds (not while draining).
+        if drain.is_some() {
+            continue;
+        }
         if filling {
             match job.backfill_step(&cx.cancel).await {
                 Ok(true) => {
@@ -1626,13 +1704,13 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
                     if e.code() == Some(SprigCode::EmbeddingFailed) {
                         mark_failed(env, tenant, id, &e.to_string()).await;
                         if !pause(&cx.cancel, Duration::from_secs(30)).await {
-                            break;
+                            // The stop: its drain starts above.
+                            continue;
                         }
                         return Err(e);
                     }
-                    if !pause(&cx.cancel, Duration::from_secs(1)).await {
-                        break;
-                    }
+                    // A stop cuts the wait short; its drain starts above.
+                    let _ = pause(&cx.cancel, Duration::from_secs(1)).await;
                 }
             }
         } else if job.ix.row.state != State::Ready {

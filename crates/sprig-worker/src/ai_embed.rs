@@ -46,6 +46,15 @@
 //! hash and are passed over; the guard keeps a slow write from replacing a
 //! newer source's vector. No change is lost (the feed is read from the
 //! last checkpoint) and no row is embedded twice for the same source.
+//!
+//! **A graceful stop drains** (`sprig_feed::drain`, as the other feed
+//! consumers): the round in flight is finished, and the feed is read and
+//! handled on (no backfill steps) until its position has passed the
+//! cluster's (read again once passed, until nothing more was written), at
+//! most `STOP_DRAIN` after the stop; then the position is acknowledged, so
+//! a binary log purge right after the stop takes nothing the restart
+//! needs. The vector updates of a tenant on Sprig 2PC's relay path go
+//! through the cluster's relay writer (`write_pool_of`).
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
@@ -64,10 +73,13 @@ use sprig_common::ids::{ClusterId, DbId, GroupId, ShardId, TenantId};
 use sprig_common::names::{SchemaName, quote};
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_controller::dispatch::JobClass;
+use sprig_feed::drain::{STOP_DRAIN, StopDrain};
 use sprig_feed::names::CatalogResolver;
 use sprig_feed::pump::Pump;
 use sprig_feed::subs::Subscriptions;
-use sprig_feed::{ChangeEvent, FeedItem, MetaPlacement, Op, StartAt, TailOptions, TenantTail};
+use sprig_feed::{
+    ChangeEvent, FeedItem, MetaPlacement, Op, ResumeToken, StartAt, TailOptions, TenantTail,
+};
 use sprig_sql::embedcol;
 
 use crate::logic::LogicEnv;
@@ -119,6 +131,10 @@ pub struct AiEmbed(pub EmbedEnv);
 impl JobHandler for AiEmbed {
     fn kind(&self) -> &'static str {
         JOB_KIND
+    }
+
+    fn drains(&self) -> bool {
+        true
     }
 
     fn class(&self) -> JobClass {
@@ -423,6 +439,23 @@ impl Job<'_> {
         self.env.logic.pools.writer(&c).await
     }
 
+    /// The pool the vector `UPDATE`s of shard `s` take connections from:
+    /// [`Self::pool_of`], or, for a tenant on the relay path, one through
+    /// the cluster's relay writer, chosen again at each use. Its own
+    /// transactions write the same rows, so a held branch can hold them;
+    /// through the relay, the fence ends this connection with the tenant's
+    /// others when a holder is lost. Reads of the catalog and
+    /// `information_schema`, and the cutover's `ALTER` (DDL), stay direct.
+    ///
+    /// # Errors
+    /// As [`Self::pool_of`]; a retryable 39030 while the cluster has relays
+    /// but none is ready.
+    async fn write_pool_of(&self, s: &ShardLoc) -> Result<Pool> {
+        let c = self.cluster_of(s).await?;
+        let direct = self.env.logic.pools.writer(&c).await?;
+        crate::relay_pools::shard_pool(&self.env.logic.dc, self.tenant, &c, direct).await
+    }
+
     /// The table's shards: every `t<tenant>_d<db>_g*_s*` schema holding it,
     /// on the cluster its map puts it on (a mover's copy elsewhere is left
     /// alone). Read again every minute.
@@ -536,7 +569,7 @@ impl Job<'_> {
         cancel: &sprig_common::CancellationToken,
     ) -> Result<(Option<Vec<String>>, u64)> {
         let pk = self.pk(s).await?;
-        let pool = self.pool_of(s).await?;
+        let pool = self.write_pool_of(s).await?;
         let mut c = pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::BackendUnavailable, format!("embedding: {e}"))
         })?;
@@ -1069,12 +1102,44 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
     let mut reload = false;
     let mut attempt = 0u32;
     let object = job.col.row.object_id;
-    loop {
-        if cx.cancel.is_cancelled() {
-            break;
+    // A graceful stop drains: the round in flight goes on, and the feed is
+    // read and handled on, until `hard`, STOP_DRAIN after the cancel.
+    let hard = sprig_common::CancellationToken::new();
+    let _hard = hard.clone().drop_guard();
+    {
+        let (cancel, hard) = (cx.cancel.clone(), hard.clone());
+        tokio::spawn(async move {
+            tokio::select! {
+                () = cancel.cancelled() => {}
+                () = hard.cancelled() => return,
+            }
+            tokio::time::sleep(STOP_DRAIN).await;
+            hard.cancel();
+        });
+    }
+    let mut drain: Option<StopDrain> = None;
+    // The position past every handled item (`last_token` is taken by acks).
+    let mut at: Option<ResumeToken> = None;
+    'serve: loop {
+        if cx.cancel.is_cancelled() && drain.is_none() {
+            let cluster = at.as_ref().map(|t| t.cluster.clone());
+            drain =
+                Some(StopDrain::begin(env.logic.feed.as_ref(), cluster.as_ref(), STOP_DRAIN).await);
         }
+        if let Some(d) = drain.as_mut() {
+            let finished = match &at {
+                Some(t) => d.done(env.logic.feed.as_ref(), &t.cluster, &t.pos).await,
+                None => true,
+            };
+            if finished || hard.is_cancelled() {
+                tracing::debug!(%tenant, embedding = id, passed = d.reached(), "embedding job drained at its stop");
+                break;
+            }
+        }
+        // While draining, rounds stop at `hard`, not at the cancel.
+        let stop = if drain.is_some() { &hard } else { &cx.cancel };
         // Every 5 s, or after a DDL of the table: the row again.
-        if reload || checked.elapsed() > Duration::from_secs(5) {
+        if drain.is_none() && (reload || checked.elapsed() > Duration::from_secs(5)) {
             reload = false;
             checked = Instant::now();
             match load(env, tenant, id).await {
@@ -1130,11 +1195,12 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
         };
         let read = tokio::select! {
             biased;
-            () = cx.cancel.cancelled() => None,
+            () = stop.cancelled() => None,
             r = tokio::time::timeout(wait, feed.next()) => Some(r),
         };
         let first = match read {
-            None => break,
+            // The stop: its drain starts (or ends) above.
+            None => continue,
             Some(Ok(i)) => Some(i?),
             Some(Err(_)) => None,
         };
@@ -1185,7 +1251,7 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
             loop {
                 let mut failed = None;
                 for (s, ks) in &keys {
-                    if let Err(e) = job.reconcile_keys(s, ks, &cx.cancel).await {
+                    if let Err(e) = job.reconcile_keys(s, ks, stop).await {
                         failed = Some(e);
                         break;
                     }
@@ -1194,8 +1260,9 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
                     attempt = 0;
                     break;
                 };
-                if cx.cancel.is_cancelled() {
-                    return Ok(json!({"stopped": "cancelled", "embedded": job.embedded}));
+                if stop.is_cancelled() {
+                    // Out of time: this round stays after the checkpoint.
+                    break 'serve;
                 }
                 attempt += 1;
                 if e.code() == Some(SprigCode::EmbeddingFailed) || (!e.retryable && attempt > 5) {
@@ -1204,16 +1271,16 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
                         .set_state(&mut c, id, State::Failed, Some(&e.to_string()))
                         .await;
                     tracing::warn!(%tenant, embedding = id, error = %e, "embedded column failed; retrying in 30 s");
-                    if !pause(&cx.cancel, Duration::from_secs(30)).await {
-                        return Ok(json!({"stopped": "cancelled", "embedded": job.embedded}));
+                    if !pause(stop, Duration::from_secs(30)).await {
+                        break 'serve;
                     }
                     return Err(e);
                 }
                 job.shards = None;
                 tracing::warn!(%tenant, embedding = id, error = %e, attempt, "embedding round failed; retrying");
                 let wait = Duration::from_millis(200 * u64::from(attempt.min(25)));
-                if !pause(&cx.cancel, wait).await {
-                    return Ok(json!({"stopped": "cancelled", "embedded": job.embedded}));
+                if !pause(stop, wait).await {
+                    break 'serve;
                 }
             }
             job.live.spend(n_keys, Instant::now());
@@ -1222,12 +1289,14 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
             }
             // The live rate: the next round waits for the bucket.
             let w = job.live.wait();
-            if w > Duration::ZERO && !pause(&cx.cancel, w.min(Duration::from_secs(5))).await {
-                break;
+            if w > Duration::ZERO {
+                // A stop cuts the wait short; the round's token is kept.
+                let _ = pause(stop, w.min(Duration::from_secs(5))).await;
             }
         }
         if let Some(t) = items.last().map(|i| i.token().clone()) {
             pending_ack += n_keys;
+            at = Some(t.clone());
             last_token = Some(t);
         }
         if let Some(e) = ended {
@@ -1236,8 +1305,8 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
             }
             return Err(e);
         }
-        // Backfill between rounds.
-        if backfilling {
+        // Backfill between rounds (not while draining).
+        if backfilling && drain.is_none() {
             match job.backfill_step(&cx.cancel).await {
                 Ok(true) => {
                     if job.col.row.state == State::Reembedding {
@@ -1246,9 +1315,9 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
                             Ok(false) => {}
                             Err(e) => {
                                 tracing::warn!(%tenant, embedding = id, error = %e, "re-embedding cutover failed; retrying");
-                                if !pause(&cx.cancel, Duration::from_secs(2)).await {
-                                    break;
-                                }
+                                // A stop cuts the wait short; its drain
+                                // starts above.
+                                let _ = pause(&cx.cancel, Duration::from_secs(2)).await;
                             }
                         }
                     } else {
@@ -1268,13 +1337,11 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
                             .set_state(&mut c, id, State::Failed, Some(&e.to_string()))
                             .await;
                         if !pause(&cx.cancel, Duration::from_secs(30)).await {
-                            break;
+                            continue;
                         }
                         return Err(e);
                     }
-                    if !pause(&cx.cancel, Duration::from_secs(1)).await {
-                        break;
-                    }
+                    let _ = pause(&cx.cancel, Duration::from_secs(1)).await;
                 }
             }
         }

@@ -224,7 +224,7 @@ curl -u 'acme.app:<password>' -X POST https://db.example.com:8443/v1/transaction
 ```
 
 - `{"read_only": true}` in `Begin` starts a read-only transaction.
-- A handle lives on the gateway that opened it. A call that reaches another gateway is forwarded there with your credentials, so any gateway accepts it.
+- A handle lives on the gateway that opened it. A call that reaches another gateway is forwarded there with your credentials, so any gateway accepts it. That includes an identity provider token whose tenant came from the host name or `x-sprig-tenant`: the forwarded call names the tenant and the account itself.
 - A handle idle for `api.txn.idle_timeout_ms` (10 s), or older than `api.txn.max_lifetime_ms` (60 s), is rolled back; using it afterwards fails with 39782.
 - Only the principal that opened a handle may use it (39783). An unknown handle is 39781.
 - At most `api.txn.max_open_per_tenant` handles per tenant are open on a gateway.
@@ -234,7 +234,7 @@ curl -u 'acme.app:<password>' -X POST https://db.example.com:8443/v1/transaction
 | Area | Routes | See |
 |---|---|---|
 | Catalog | `GET /v1/catalog`, `GET /v1/databases/{database}/catalog`, `GET /v1/databases/{database}/catalog/{kind}/{name}` | Databases, tables, views, routines and graphs you can see |
-| Cursors | `POST /v1/databases/{database}/cursors`, `POST /v1/cursors/{cursor}:fetch`, `POST /v1/cursors/{cursor}:close` | Page through a large read: `{sql, skip, page_rows}`, then `fetch` until `done` |
+| Cursors | `POST /v1/databases/{database}/cursors`, `POST /v1/cursors/{cursor}:fetch`, `POST /v1/cursors/{cursor}:close` | Page through a large read: `{sql, skip, page_rows}`, then `fetch` until `done`. A cursor lives on the gateway that opened it; a `fetch` or `close` that reaches another gateway is forwarded there, with any credentials, an identity provider token named by its host or `x-sprig-tenant` included |
 | Exports | `POST /v1/exports:ticket`, then a form `POST /v1/exports` | CSV or NDJSON downloads for a browser session |
 | Change streams | `GET /v1/databases/{database}/changes` | Server-Sent Events (`Accept: text/event-stream`), WebSocket, or NDJSON. Needs `SELECT` and `WATCH` on the tables; a named table without them fails with 1142. See [Change feed](../concepts/change-feed.md) |
 | Key-value | `/v1/databases/{database}/namespaces/{namespace}:get`, `:put`, `:delete`, `:scan`, `:exec`, `:geoSearch` | [Key-value](../data-models/key-value.md) |

@@ -166,6 +166,7 @@ The model `local:bge-small` is bundled with SprigDB: BAAI's bge-small-en-v1.5, 3
 - **Only when the source changes.** SprigDB keeps a hash of the text it embedded with each row. An update that leaves the source as it was costs nothing. A source that becomes `NULL` or blank makes the vector `NULL`.
 - **Existing rows.** Declaring the column on a table with rows starts a backfill that embeds them in key order, at most `ai.embedding.backfill_rows_per_s` rows a second (500 by default), while new changes are embedded as they come. A worker that stops carries on where the backfill was.
 - **Exactly once.** The worker records how far it has read the feed only after its writes commit, and writes a vector only if the row's source is still the one it embedded. A worker killed in the middle of a batch is replaced, reads the last changes again and passes over the rows it had already written; a row changed again meanwhile gets the vector of its newest source.
+- **Graceful stops.** A worker stopped gracefully (`SIGTERM`) first finishes the changes written up to its stop, for at most 3 seconds, and records how far it got, so binary logs purged right after the stop take nothing it needs. After a `kill -9`, keep the binary logs until the worker has caught up.
 - **Long inputs.** A source is cut to `ai.embedding.max_input_bytes` (64 KiB) and to the model's 512 tokens, or fewer with `WITH (max_input_tokens = n)`.
 
 ### Searching
