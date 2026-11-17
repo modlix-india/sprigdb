@@ -250,7 +250,7 @@ Multi-document transactions work through the drivers' session API, across collec
 
 ### Change streams
 
-`watch()` on a collection, a database or the whole deployment works, with `fullDocument`, `fullDocumentBeforeChange`, `resumeAfter`, `startAfter` and `showExpandedEvents`. `startAtOperationTime` isn't supported (39662). A stream at a gateway outside the tenant's home data centre is relayed from there, with the same events and resume tokens (see [Change feed](../concepts/change-feed.md#from-another-data-centre)). A stream needs `find` and `changeStream` on what it watches: in SprigDB's terms `SELECT` and `WATCH`. The built-in `read` and `readWrite` roles include both; see [Grants and roles](../security/grants-and-roles.md#change-streams-need-watch). See [Documents](../data-models/documents.md#change-streams).
+`watch()` on a collection, a database or the whole deployment works, with `fullDocument`, `fullDocumentBeforeChange`, `resumeAfter`, `startAfter`, `startAtOperationTime` and `showExpandedEvents`. `startAtOperationTime` leaves out events stamped before the time; a time older than the feed's time index reaches back, or than the tenant's last move to another cluster, fails with 286 `ChangeStreamHistoryLost`, labelled `NonResumableChangeStreamError` (see [Change feed](../concepts/change-feed.md#starting-at-a-point-in-time)). A stream at a gateway outside the tenant's home data centre is relayed from there, with the same events and resume tokens (see [Change feed](../concepts/change-feed.md#from-another-data-centre)). A stream needs `find` and `changeStream` on what it watches: in SprigDB's terms `SELECT` and `WATCH`. The built-in `read` and `readWrite` roles include both; see [Grants and roles](../security/grants-and-roles.md#change-streams-need-watch). See [Documents](../data-models/documents.md#change-streams).
 
 ## Not supported
 
@@ -261,7 +261,6 @@ Multi-document transactions work through the drivers' session API, across collec
 | `mapReduce`, `eval`, the `geoNear` command | 115 `CommandNotSupported` |
 | Multikey, wildcard and `2d` indexes; sparse and partial semantics | See [Indexes](#indexes) |
 | A collection's default collation | Collation per command works |
-| `startAtOperationTime` in change streams | 39662 |
 | Replica-set commands and topology | SprigDB presents a `mongos` |
 
 ## Tested clients

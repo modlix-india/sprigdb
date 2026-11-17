@@ -382,6 +382,48 @@ impl BinlogStream {
     }
 }
 
+/// A plain SQL session on a source's node, with the dump's account and
+/// TLS: for what a reader asks the node when it refuses a dump (which
+/// binary logs it holds, the GTID state each starts at).
+pub struct SourceSession {
+    conn: Conn,
+}
+
+impl fmt::Debug for SourceSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SourceSession").finish_non_exhaustive()
+    }
+}
+
+impl SourceSession {
+    /// Connects to `src`'s node.
+    ///
+    /// # Errors
+    /// `ER_SPRIG_BINLOG_DISCONNECTED` if the node can't be reached in
+    /// `timeout`; TLS and authentication errors.
+    pub async fn open(src: &BinlogSource, timeout: Duration) -> Result<Self> {
+        let conn = Conn::connect(
+            &src.host,
+            src.port,
+            &src.user,
+            &src.password,
+            src.tls.as_ref(),
+            timeout,
+        )
+        .await?;
+        Ok(Self { conn })
+    }
+
+    /// Runs one statement and returns its rows as text (`None` for NULL);
+    /// none for a statement without a result set.
+    ///
+    /// # Errors
+    /// The server's error; a broken connection.
+    pub async fn query(&mut self, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
+        self.conn.query(sql).await
+    }
+}
+
 /// An EOF packet: what ends a non-blocking dump.
 fn is_eof(p: &[u8]) -> bool {
     p.first() == Some(&0xfe) && p.len() < 9

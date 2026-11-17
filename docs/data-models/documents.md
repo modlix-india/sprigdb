@@ -429,7 +429,7 @@ const cs = db.events.watch([ { $match: { operationType: "insert" } } ])
 - Documents in events carry the BSON types the client wrote.
 - `fullDocument: "updateLookup"`, `"whenAvailable"` or `"required"` give updates the document as that update left it, taken from the change itself; MongoDB gives the current document instead.
 - `fullDocumentBeforeChange` needs pre- and post-images on the collection: `db.runCommand({collMod: "events", changeStreamPreAndPostImages: {enabled: true}})`.
-- `resumeAfter` and `startAfter` work, also across a move of the tenant to another cluster. `startAtOperationTime` fails with 39662.
+- `resumeAfter` and `startAfter` work, also across a move of the tenant to another cluster. `startAtOperationTime` starts the stream at a time: events stamped before it are left out. A time older than the feed's time index reaches back, or than the tenant's last move to another cluster, fails with 286 `ChangeStreamHistoryLost`; a cluster with no time index yet fails with 39802. See [Change feed](../concepts/change-feed.md#starting-at-a-point-in-time).
 - Stages after `$changeStream` may be `$match`, `$project`, `$addFields`, `$set`, `$unset`, `$replaceRoot` and `$replaceWith`.
 
 Row-level security applies to streams: a user sees only events for documents a policy lets them read.

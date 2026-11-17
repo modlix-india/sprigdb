@@ -9,7 +9,7 @@ source: the gateway's OpenAPI document (/v1/openapi.json)
 
 The gateway's REST API, as `/v1/openapi.json` describes it on every gateway. Requests authenticate with `Authorization: Bearer <token or API key>` (or HTTP Basic where allowed) and act with the caller's own rights. Statements stream as NDJSON from `POST /v1/databases/{database}/sql:query`. The same services are available over gRPC.
 
-110 operations in 29 services.
+111 operations in 29 services.
 
 ## sprig.admin.v1.Recommendations
 
@@ -116,6 +116,7 @@ The gateway's REST API, as `/v1/openapi.json` describes it on every gateway. Req
 
 | Method | Path | Operation | Description |
 |---|---|---|---|
+| GET | `/v1/docs/pages/{page}` | `Docs.Page` | One page of the product documentation of this release (any signed-in user), rebuilt from the docs pack: its chunks in page order and its Markdown. {page} is the page's path under docs/, slashes included (tools/studio.md) |
 | POST | `/v1/docs:search` | `Docs.Search` | Searches the product documentation of this release (any signed-in user): full-text and embedding hits fused, at most two per page ({query, audience, limit, version}) |
 
 ## sprig.v1.Exports

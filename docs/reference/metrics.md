@@ -9,7 +9,7 @@ source: the metric macros in the source tree, and docs/metrics-help.toml
 
 Every metric SprigDB records, as exported on each process's telemetry port (`/metrics`, Prometheus text) and through OTLP. Counters end in `_total`; durations are histograms in seconds.
 
-519 metrics in 55 groups.
+521 metrics in 55 groups.
 
 ## `sprig_advisor_*`
 
@@ -306,6 +306,8 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_feed_events_total` | counter | `cluster` | sprig-feed | Change events the change feed produced from a cluster's binlog; `cluster` is the cluster. Unit: count. |
 | `sprig_feed_filtered_total` | counter | `reason` | sprig-feed | Binlog changes the change feed left out; `reason` is why: `internal` (SprigDB's own tables), `apply` (writes by a move's apply), `owner` or `noop`. Unit: count. |
 | `sprig_feed_handoffs_total` | counter | - | sprig-feed | Times a change-feed reader followed a tenant's move to another cluster. Unit: count. |
+| `sprig_feed_history_lost_total` | counter | `node` | sprig-feed | Binlog dumps a node refused because events a change-feed reader still needs are purged from its binary logs: those changes are lost to that reader, which fails with 39800 at every retry. The error log names the GTID domain, the reader's position and where the node's oldest binary log starts. Alert on any increase. `node` is the MariaDB node (`host:port`). Unit: count. |
+| `sprig_feed_local_domains_added_total` | counter | `domain`, `node` | sprig-feed | Times a change-feed reader's dump was refused because a Galera node purged the start of one of its node-local GTID domains (its own local writes, such as statements run with `wsrep_on = OFF` or an index built by hand with RSU, never a tenant's changes), and the reader added that domain to its position and read on. `node` is the MariaDB node (`host:port`), `domain` the GTID domain. Unit: count. |
 | `sprig_feed_resumes_total` | counter | `consumer`, `tier` | sprig-feed | Feed subscriptions that resumed from an earlier position; `tier` is `ring` (served from the shared feed reader's in-memory ring of recent groups), `replay` (a subscription a little behind the reader, up to 20,000 groups: the reader reopens its dump at that position and reads those groups again, which the other subscriptions skip) or `binlog` (served by a catch-up dump). Unit: count. |
 | `sprig_feed_ring_groups` | gauge | `cluster` | sprig-feed | Committed transaction groups kept in the shared feed reader's in-memory ring of recent history, for subscriptions that resume; `cluster` is the cluster. Updated about once a second. Unit: count. |
 | `sprig_feed_shared_detached_total` | counter | `cluster`, `consumer` | sprig-feed | Subscriptions the shared feed reader detached because their buffer was full when a group arrived, so a slow consumer never holds up the others; a detached subscription comes back through the ring or a catch-up dump. `cluster` is the cluster. Unit: count. |

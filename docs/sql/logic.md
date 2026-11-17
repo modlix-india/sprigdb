@@ -100,7 +100,7 @@ Version	State	Tier	Placement
 1	active (live)	mariadb	tier mariadb, route any shard, cost 0
 ```
 
-Budgets are settings, per object, database or tenant: `logic.function_budget_ms` (5000 ms per synchronous call), `logic.trigger_budget_ms`, `logic.job_budget_ms`, `logic.kirun_max_steps`, `logic.max_data_ops` (1000 `db` calls per invocation), `logic.max_rows_read`, `logic.max_loop_iterations` and `logic.memory_limit_mb`. Workers read `logic.trigger_budget_ms` and `logic.job_budget_ms` per tenant, so set those on the tenant or globally. Outbound `fetch` reaches only the hosts in `logic.outbound_allowlist`. See the [settings reference](../reference/settings.md#logic).
+Budgets are settings, per object, database or tenant: `logic.function_budget_ms` (5000 ms per synchronous call, and per row for a validation), `logic.trigger_budget_ms`, `logic.job_budget_ms`, `logic.kirun_max_steps`, `logic.max_data_ops` (1000 `db` calls per invocation), `logic.max_rows_read`, `logic.max_loop_iterations` and `logic.memory_limit_mb`. Workers read `logic.trigger_budget_ms` and `logic.job_budget_ms` per tenant, so set those on the tenant or globally. The wall-time budgets bind compiled code too: it stops with 39864 at the budget, which no `catch` or `pcall` can catch, even in a loop of many short statements. Compiled code reads the budget when it is deployed, takes your session's `max_statement_time` when that is smaller, and shares what is left with the compiled code it calls. When your session's limit is the tighter one, MariaDB's timer may fire first and you get MariaDB's 3024, as on plain MySQL or MariaDB; either way the call stops and its writes roll back; see [Budgets and limits](../data-models/logic.md#budgets-and-limits). Outbound `fetch` reaches only the hosts in `logic.outbound_allowlist`. See the [settings reference](../reference/settings.md#logic).
 
 ## Statements
 
@@ -550,7 +550,7 @@ CREATE [OR REPLACE] SCHEDULE [db_name.]name
 | `OVERLAP QUEUE` | | One fire waits and runs when the previous run ends |
 | `DO CALL` | | The procedure and its arguments: string, number, `TRUE`, `FALSE` or `NULL` literals |
 
-Each fire runs once, on a worker, within `logic.job_budget_ms` (5 minutes by default), with the definer's rights. A fire late by more than the misfire window is recorded as misfired and skipped. A malformed cron text or zone fails with 39873 `ER_SPRIG_LOGIC_SCHEDULE_INVALID`. `SPRIG_ROLLOUT` isn't allowed on validations, computed columns or schedules (39861): they switch versions at once.
+Each fire runs once, on a worker, within `logic.job_budget_ms` (5 minutes by default), with the definer's rights. Schedules created before this release keep `logic.function_budget_ms` until you re-create them with `CREATE OR REPLACE SCHEDULE`; from then on they use `logic.job_budget_ms`. A fire late by more than the misfire window is recorded as misfired and skipped. A malformed cron text or zone fails with 39873 `ER_SPRIG_LOGIC_SCHEDULE_INVALID`. `SPRIG_ROLLOUT` isn't allowed on validations, computed columns or schedules (39861): they switch versions at once.
 
 **Privileges:** `CREATE ROUTINE` on the database.
 
@@ -792,7 +792,7 @@ DROP FUNCTION net_value CASCADE;
 
 ## Logs and dead letters
 
-What triggers and schedules did, and the events that kept failing, aren't SQL tables. A run's log holds its errors and the lines its code wrote (`console.log`, `ctx.log`, Lua `log` and `print`); for stream and queue triggers, at most 60 lines a minute per trigger reach the log (a line says how many more were dropped), with each record's partition and offset or the message's id. Read and settle them with:
+What triggers and schedules did, and the events that kept failing, aren't SQL tables. A run's log holds its errors. The lines code writes (`console.log`, `info`, `warn`, `error` and `debug`, `ctx.log`, Lua `log` and `print`) are kept only for stream and queue triggers, in both tiers and also when a run fails: at most 100 lines a run and 60 a minute per trigger (a line says how many more were dropped), with each record's partition and offset or the message's id. Other kinds drop them, and their deploy notes say so (`js.log`, `lua.log`); a test run's report has them for every kind. See [Logic](../data-models/logic.md#what-code-can-use). Read and settle them with:
 
 - `sprigctl logic logs [name] [--follow]`;
 - `sprigctl logic dead-letters list | replay | discard` (replay sends them back to the trigger in order, with the active version);

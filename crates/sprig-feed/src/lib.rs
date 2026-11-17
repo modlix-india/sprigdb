@@ -21,6 +21,9 @@
 //!   can't cancel a read half-way;
 //! - [`subs`]: subscriptions and acknowledged positions;
 //! - [`requirements`]: the binlog settings the feed needs (`feed_source`);
+//! - [`local_domains`]: starts a node refuses because its binary logs are
+//!   purged: a Galera node's purged local domains are skipped, a purge of
+//!   what the reader needs fails loudly;
 //! - [`hlc`]: stamps and clamps.
 //!
 //! Not yet: the shared per-cluster reader
@@ -33,6 +36,7 @@ pub mod binlog;
 pub mod decode;
 pub mod event;
 pub mod hlc;
+pub mod local_domains;
 pub mod merge;
 pub mod names;
 pub mod ownership;

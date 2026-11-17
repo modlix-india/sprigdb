@@ -251,7 +251,7 @@ All three languages reach the same host interface. Every `db` call is one statem
 | `sprig.event(name, fields)` | `System.GenerateEvent` | Ends the call with that event |
 | `sprig.reject(message)` | | Fails the call with 39863 and the message; can't be caught |
 | `ctx` | | `user`, `tenant` (the tenant's id), `database`, `function`, `version`, and `log` |
-| `console.log`, Lua `log` and `print` | | Writes a line to the run's log |
+| `console.log`, `info`, `warn`, `error` and `debug`; Lua `log`, `print` and `ctx.log` | | Writes a line to the run's log, where the kind has one (below) |
 
 Rules for `db` statements:
 
@@ -263,7 +263,18 @@ Rules for `db` statements:
 
 An error from a `db` or `fetch` call that the code doesn't catch fails the call with the original error, so a missing privilege is still 1142. Caught in JavaScript, it is an `Error` with `code` and `sqlState`; in Lua, an error value whose text is the message. An exception the code throws and doesn't catch fails the call with 39865 and its text. KIRun's `catchErrors` steps can catch `db` and outbound errors, but never a budget error.
 
-Lines the code logs go to the gateway's own log at debug level, and into the report of a test run (up to 100 lines per run). Compiled JavaScript drops them.
+Lines your code logs are kept only where a run has a log of its own: a trigger on a stream or queue, and a test run. Every other kind drops them, and its deploy notes say so (`js.log` or `lua.log`: "log lines are dropped in the compiled tier").
+
+| Kind | In the engine tier | Compiled into MariaDB | When the run fails |
+|---|---|---|---|
+| Function or procedure | Dropped (only the gateway's own log has them, at debug level) | Dropped, with a deploy note | The same |
+| Validation | (always compiled) | Dropped, with a deploy note | The same |
+| After-commit trigger | (always compiled) | Dropped, with a deploy note | The same |
+| Trigger on a stream or queue | The module's log, at level `info`, with the record's partition and offset or the message's id | The same | Kept, in both tiers |
+| Computed column | (always compiled) | Dropped, with a deploy note | |
+| Any kind in a test run | The report's `logs`, up to 1,000 lines | (test runs use the engine tier) | Kept |
+
+A stream or queue trigger keeps at most 100 lines per run and 60 a minute per trigger; then one line says how many more were dropped. KIRun code has no log lines (`System.Print` is refused).
 
 ## Validations
 
@@ -516,7 +527,7 @@ CREATE SCHEDULE nightly_restock CRON '0 3 * * *' TIME ZONE 'Europe/London' DO CA
 
 - **Cron text.** Five fields, `minute hour day-of-month month day-of-week`; each is `*`, a number, a range `a-b`, a list `a,b` or a step `*/n` or `a-b/n`. Months and days may be named (`JAN`, `MON`), and day 7 is Sunday, like 0. When both day fields are restricted, a day matching either fires. `@hourly`, `@daily`, `@weekly`, `@monthly` and `@yearly` are short forms. A bad text or zone fails with 39873 `ER_SPRIG_LOGIC_SCHEDULE_INVALID`.
 - **Time zone.** An IANA name; `UTC` by default. A time the clocks skip fires once, at the next valid minute; a time they repeat fires once, the first time.
-- **One run per fire.** Each fire runs once on a worker, even across a controller failover or a worker restart, within `logic.job_budget_ms` (5 minutes). A fire more than 5 minutes late is recorded as misfired and skipped.
+- **One run per fire.** Each fire runs once on a worker, even across a controller failover or a worker restart, within `logic.job_budget_ms` (5 minutes). A fire more than 5 minutes late is recorded as misfired and skipped. Schedules created before this release keep `logic.function_budget_ms` until you re-create them with `CREATE OR REPLACE SCHEDULE`; from then on they use `logic.job_budget_ms`.
 - **Overlap.** With `OVERLAP SKIP` (the default), a fire while the previous run is still going is skipped. With `OVERLAP QUEUE`, one fire waits and runs when the previous run ends.
 - **The procedure** must be in the same database (39860 otherwise) and take constant arguments: text, numbers, `TRUE`, `FALSE` or `NULL`. It runs with the schedule creator's rights, and must compile into MariaDB: a procedure in the engine tier fails each run with 39876.
 
@@ -524,7 +535,7 @@ Creating a schedule needs `CREATE ROUTINE` on the database.
 
 ## Budgets and limits
 
-Code in the engine tier runs under budgets. Each is a setting; a run that exceeds one fails with 39864 `ER_SPRIG_LOGIC_BUDGET_EXCEEDED`, naming the setting, and the code can't catch it.
+Code runs under budgets. Each is a setting; a run that exceeds one fails with 39864 `ER_SPRIG_LOGIC_BUDGET_EXCEEDED`, and no `catch` or `pcall` can catch it. The wall-time budgets apply in both tiers; the others are the engine tier's.
 
 | Setting | Default | Scopes | Limits |
 |---|---|---|---|
@@ -541,8 +552,7 @@ A call in a gateway reads the value for the code's own database, so set these on
 
 Some limits are fixed:
 
-- **Compiled code** runs each call under `logic.function_budget_ms`, as read when the version was deployed, so redeploy after changing it. A compiled `db.call` shares its caller's budget, so nested work is bounded by what is left of the caller's. Loops without a static bound are stopped at `logic.max_loop_iterations` (39864). A `SELECT f(…)` of a compiled function is bounded by the statement's own `max_statement_time` instead.
-  - Known limit: a compiled routine that runs many short statements in a loop can overrun its budget. Each statement stays within it, but their total isn't checked yet.
+- **Compiled code** stops at its wall budget with 39864, however many short statements it runs: it checks the time before every data operation and at every loop iteration. Functions, procedures and validations (per row) get `logic.function_budget_ms`, or your session's `max_statement_time` when that is smaller; triggers get `logic.trigger_budget_ms`, and schedules `logic.job_budget_ms`. The value is read when the version is deployed, so deploy the code again after changing the setting. A compiled `db.call` shares what is left of its caller's budget. The message says how much time was left when the code was called. When `logic.function_budget_ms` is the tighter limit, the call fails with 39864. When your session's own `max_statement_time` is the tighter one, MariaDB's timer may fire first and you get MariaDB's 3024, as on plain MySQL or MariaDB. Either way the call stops and its writes roll back. One difference from the engine tier: a single statement that is already running isn't interrupted, so a call from SQL whose last statement runs past the budget succeeds late. Loops without a static bound are also stopped at `logic.max_loop_iterations` (39864).
 - **Engine threads.** JavaScript and Lua calls in the engine tier run on as many threads as the gateway has cores; up to 16 calls per thread may wait for one, and beyond that a call fails at once with 39871 `ER_SPRIG_LOGIC_ENGINE_BUSY`, which you can retry.
 - **Memory.** QuickJS and Lua count their real heap. The KIRun runtime estimates the size of the values each step holds.
 - **Cancellation.** When the client goes away or runs `KILL QUERY`, the run stops.
@@ -564,7 +574,7 @@ ALTER DATABASE SPRIG RESET (logic.function_budget_ms);
 DROP PROCEDURE spin;
 ```
 
-A Lua `pcall` around the loop wouldn't help: once a budget trips, `pcall`, `xpcall` and `coroutine.resume` pass the error on.
+A Lua `pcall` around the loop wouldn't help: once a budget trips, `pcall`, `xpcall` and `coroutine.resume` pass the error on. The same holds for compiled code, where neither `catch` nor `pcall` sees 39864.
 
 ## Outbound HTTP
 
@@ -752,7 +762,7 @@ A function or procedure that others depend on isn't dropped:
 
 ## Logs and dead letters
 
-Each module keeps a **log**: a line for each deploy, each trigger job's start, the first failure of each change, record or message, each dead letter and replay, each scheduled run, and each automatic rollback. Lines your code writes aren't kept in it.
+Each module keeps a **log**: a line for each deploy, each trigger job's start, the first failure of each change, record or message, each dead letter and replay, each scheduled run, and each automatic rollback. Lines your code writes are kept in it only for triggers on streams and queues (see [What code can use](#what-code-can-use)).
 
 A **dead letter** is a change, record or message that failed `logic.trigger_max_attempts` times. It holds the event, the attempts, the last error code and message, and a state: `dead`, `replaying`, `replayed` or `discarded`. Replaying runs dead letters again with the active version, oldest first, in the trigger's own job; each runs once even if you mark it again. If a replay fails, it and every later dead letter of the trigger go back to `dead`, so nothing runs out of order.
 
@@ -807,7 +817,7 @@ Missing privileges are MySQL's 1044 (database level), 1142 (table level) and 137
 - **Rollout of validations, computed columns and schedules**, rollout by session, and automatic stages: those kinds switch at once, and stages move by hand.
 - **Compiled KIRun triggers on streams and queues.** They run in the engine tier.
 - **Pausing a trigger.** Only triggers declared `FOR EACH TENANT` can be disabled and enabled (see [Inheritance](inheritance.md)); drop and re-create any other trigger instead. A re-created stream trigger starts at the end of the stream.
-- **Keeping your code's log lines** in the module's log.
+- **Keeping your code's log lines** for functions, procedures, validations, after-commit triggers and computed columns. Only triggers on streams and queues, and test runs, keep them.
 - **`System.Wait` and `System.Print`** in KIRun code.
 
 ## Related

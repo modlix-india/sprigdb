@@ -35,7 +35,7 @@ Tokens keep working when SprigDB moves the tenant's data. When the mover cuts a 
 
 The feed can only read what the binlogs still hold. Each cluster keeps binlogs for `binlog_expire_logs_seconds` (a MariaDB setting); SprigDB warns when a cluster keeps less than `cluster.min_binlog_retention_hours` (24). A resume token older than the oldest binlog fails with 39800 `ER_SPRIG_FEED_HISTORY_LOST`, and the consumer must start again from now.
 
-The feed can't start at a point in time: MariaDB has no index of binlog positions by time. Start from now, or after a token.
+A stream can also start at a point in time, within the same history; see [Starting at a point in time](#starting-at-a-point-in-time).
 
 ### What a cluster must have
 
@@ -95,7 +95,7 @@ Supported:
 - pipeline stages that work on one event at a time: `$match`, `$project`, `$addFields`, `$set`, `$unset`, `$replaceRoot`, `$replaceWith`;
 - `showExpandedEvents` for `create`, `createIndexes`, `dropIndexes` and `modify`.
 
-`startAtOperationTime` isn't supported. `watch()` on a collection without `WATCH` fails with 13 `Unauthorized`; a database stream leaves such collections out. Documents a TTL index deletes appear as `delete` events. See [MongoDB](../connect/mongodb.md).
+`startAtOperationTime` starts a stream at a time, as `start_at_hlc` does below. `watch()` on a collection without `WATCH` fails with 13 `Unauthorized`; a database stream leaves such collections out. Documents a TTL index deletes appear as `delete` events. See [MongoDB](../connect/mongodb.md).
 
 ### Server-Sent Events, WebSocket and NDJSON
 
@@ -139,11 +139,11 @@ When nothing changes for `api.stream.heartbeat_seconds` (15), the stream sends a
 
 ### Starting at a point in time
 
-Instead of a resume token, a stream can start at a time: `start_at_hlc`, a hybrid logical clock value (the `commit_hlc` of an event, for example), as a query parameter (`?start_at_hlc=...`) or the `Changes.Watch` field. The stream sends the tenant's changes committed at or after it.
+Instead of a resume token, a stream can start at a time: `start_at_hlc`, a hybrid logical clock value (the `commit_hlc` of an event, for example), as a query parameter (`?start_at_hlc=...`) or the `Changes.Watch` field. The stream sends the tenant's changes committed at or after it. A MongoDB change stream does the same with `startAtOperationTime`. Both work at a gateway in another data centre, which relays the stream from the tenant's home data centre, and on Galera clusters.
 
 - Give either `start_after` (or `Last-Event-ID`) or `start_at_hlc`, not both: 39801.
 - SprigDB finds the binlog position from an index it records every 10 seconds per cluster, so the stream starts slightly before the time and leaves out the earlier events.
-- A time older than the time index reaches back, or than the tenant's move to its current cluster, fails with 39800. A cluster that has no index yet (just added or upgraded) fails with 39802.
+- A time older than the time index reaches back, or than the tenant's move to its current cluster, fails with 39800. A cluster that has no index yet (just added or upgraded, or a Galera cluster without `wsrep_gtid_mode`) fails with 39802.
 
 ### gRPC
 
@@ -178,7 +178,6 @@ The three settings can be set for a tenant or globally. A `Sprig-Space` header (
 
 ## Not supported yet
 
-- Starting a MongoDB change stream at a point in time (`startAtOperationTime`).
 - A SQL statement for subscribing to changes. Use one of the transports above, a change topic or a sink.
 
 ## Related

@@ -143,6 +143,7 @@ settings=(
     tls.bundles.default.cert_path tls.bundles.default.key_path
     listener.http.enabled listener.https.enabled
     listener.amqp.enabled listener.amqp.bind
+    listener.mongo.enabled listener.mongo.bind listener.mongo.tls
     workload.flush_seconds
     failover.self_fence
 )
@@ -605,6 +606,10 @@ up() {
     # AMQP for the docs examples, on 13672: 5672 is often taken (a local RabbitMQ).
     set_setting listener.amqp.bind '"127.0.0.1:13672"'
     set_setting listener.amqp.enabled true
+    # MongoDB wire protocol for the docs examples, on 13717 with TLS off: 27017 is often taken.
+    set_setting listener.mongo.bind '"127.0.0.1:13717"'
+    set_setting listener.mongo.tls '"off"'
+    set_setting listener.mongo.enabled true
     # Workload statistics reach the tenants' catalogs within seconds, not
     # 15 minutes (workload.flush_seconds).
     set_setting workload.flush_seconds 10
