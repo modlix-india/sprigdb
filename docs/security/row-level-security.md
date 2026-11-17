@@ -235,7 +235,7 @@ Some statements can't be rewritten safely. Naming a protected table that binds t
 - a statement the gateway's parser can't read;
 - a change topic of a protected table read whole by a principal the policies bind (it is read record by record instead where possible);
 - `SHOW INDEX` of a protected table, and `SHOW TABLE STATUS` of a database that holds one, because their row counts and cardinalities include hidden rows. With `LIKE`, `SHOW TABLE STATUS` is refused only when the pattern matches a protected table; with `WHERE`, whenever the database holds one. Other tables and databases answer as usual. `information_schema.TABLES` and `STATISTICS` work everywhere, with `NULL` row counts for protected tables;
-- `ALTER TABLE`, `RENAME TABLE`, `CREATE INDEX` and `DROP INDEX` of a protected table, since a failed change can reveal a hidden row (a duplicate key, a value that doesn't convert). Make schema changes from an account the policies don't bind, or after `NO FORCE`.
+- `ALTER TABLE`, `RENAME TABLE`, `CREATE INDEX` and `DROP INDEX` of a protected table, since a failed change can reveal a hidden row (a duplicate key, a value that doesn't convert). Make schema changes as an account the table's policies don't bind: a manager while the table isn't forced, or a holder of `BYPASS RLS`.
 
 `DROP TABLE` and `TRUNCATE` work on a protected table for anyone with the `DROP` privilege on it, bound or not: they take the table whole and reveal no row. A new table of the same name starts without the dropped table's policies.
 

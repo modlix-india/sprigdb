@@ -72,6 +72,6 @@ emit() {
     python3 -I "$RESULT_PY" --model "$model" --op "$op" --workload "$workload" --metric "$metric" \
         --value "$value" --unit "$unit" --better "$better" --product "$PRODUCT" \
         --product-version "$VERSION" --competitor "$COMPETITOR" --run "$workload-$variant-$metric-$PRODUCT-$RUN_ID" \
-        ${variant:+--variant "$variant"} --source "logs/$LOGREL" --command "$CMDLINE" ${BENCH_NOTE:+--notes "$BENCH_NOTE"} ${BENCH_CONFIG:+--config "$BENCH_CONFIG"} \
+        ${variant:+--variant "$variant"} --source "logs/$LOGREL" --command "$CMDLINE" ${BENCH_NOTE:+--notes "$BENCH_NOTE"} ${BENCH_CONFIG:+--config "$BENCH_CONFIG"} ${BENCH_DURABILITY:+--durability "$BENCH_DURABILITY"} \
         $([[ ${BENCH_UNPAIRED:-0} == 1 ]] && echo --extra-json '{"pair":false,"keep_unpaired":true}' || { [[ $unpaired == 1 ]] && echo --extra-json '{"pair":false}'; }) "$@"
 }

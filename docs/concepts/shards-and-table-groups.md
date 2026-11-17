@@ -79,6 +79,13 @@ A small table that everything joins, such as countries, currencies or tax rates,
 
 **Not supported yet:** reference tables with a read copy on every cluster, so that each shard can join against a local copy. Today a `REFERENCE` pin behaves exactly like `UNSHARDED`.
 
+### Dropping a database
+
+`DROP DATABASE` takes the database's table groups with it. Every shard of each group is dropped on its own cluster, also when the shards were moved to other clusters than the database's. The groups are removed, so they leave `sprigctl shard list`, and creating the same tables again in a new database lets the advisor group them afresh.
+
+- **During a job.** While one of the database's groups is being split, merged, moved or re-keyed, `DROP DATABASE` fails with 39071 `ER_SPRIG_CATALOG_CONFLICT`, naming the group and the job. Retry when the job has ended (`sprigctl job show <id>`); a job that has passed its cutover doesn't hold the drop.
+- **A shard that can't be dropped.** If a group's cluster can't be reached, the database is still dropped, and the OK carries a warning (`SHOW WARNINGS`, code 1105) that names what was left. The catalog reconciler reports the leftover schema.
+
 ## Shards
 
 A **shard** is one slice of one table group, stored as one MariaDB schema on one cluster:

@@ -118,6 +118,7 @@ def main(argv=None):
     p.add_argument("--competitor", help="the report column this product belongs to")
     p.add_argument("--title")
     p.add_argument("--notes")
+    p.add_argument("--durability", help="what an acknowledged write means for this run, e.g. appendfsync always")
     p.add_argument("--config", action="append", default=[], help="key=value, repeatable")
     p.add_argument("--build")
     p.add_argument("--date")
@@ -132,7 +133,7 @@ def main(argv=None):
         "kind": a.kind, "model": a.model, "op": a.op, "workload": a.workload, "variant": a.variant,
         "metric": a.metric, "value": num(a.value), "total": num(a.total), "unit": a.unit, "better": a.better,
         "product": a.product, "product_version": a.product_version,
-        "competitor": a.competitor or a.product, "title": a.title, "notes": a.notes,
+        "competitor": a.competitor or a.product, "title": a.title, "notes": a.notes, "durability": a.durability,
         "config": dict(kv.split("=", 1) for kv in a.config),
         "source": a.source, "command": a.command or " ".join(sys.argv),
     }

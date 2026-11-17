@@ -175,6 +175,14 @@ The account keeps its other login methods: if it has a password or API keys, the
 
 Over HTTP and MongoDB, when the issuer has `"jit_users": true` and the account its user mapping names doesn't exist, SprigDB creates `'<name>'@'%'` on the first login: with the `token` method only, no password and no privileges of its own. The creation is audited as `auth.user_created_jit`. Give it what it needs through [role mappings](#roles-from-tokens), or grant to it from a script that watches for the event. MySQL, MariaDB and Redis logins never create accounts: the login name must name an existing one.
 
+### End-user layers
+
+An issuer of kind `end_user_layer` is an application's own token service, whose tokens belong to the application's end users. End users aren't database accounts: their tokens log in as the application's service account, which a user mapping names (for example from the `azp` claim).
+
+- `jit_users` is refused on such an issuer with 39998, so no end user ever becomes an account.
+- The token's claims reach `SPRIG_CLAIM` and row-level security unchanged, so policies can filter by end user.
+- Many end users share one account, so a login's `auth.login_succeeded` event names the end user too: `detail` reads `issuer <iss>; end user <sub>`.
+
 ## Log in
 
 ### MySQL and MariaDB
@@ -379,7 +387,7 @@ Other events:
 
 | Event | When |
 |---|---|
-| `auth.login_succeeded` | A token login succeeded; `mechanism` is `jwt` and `detail` names the issuer and the token roles it took (`issuer https://...; token roles reader`) |
+| `auth.login_succeeded` | A token login succeeded; `mechanism` is `jwt` and `detail` names the issuer, the end user for an `end_user_layer` issuer, and the token roles it took (`issuer https://...; token roles reader`) |
 | `auth.token_roles_ignored` | A token login succeeded, but its role mappings named roles the tenant doesn't define; `detail` names them, `reason` is `undefined_role` |
 | `auth.user_created_jit` | An account was created on first login, with the issuer in `detail` |
 | `admin.issuer_changed` | An issuer was created, replaced or disabled, with its id, `active`, `jit_users`, protocols and number of mappings |

@@ -97,6 +97,17 @@ Two related errors:
 - `ER_SPRIG_DDL_SHARD_DRIFT` (39483): the shards of a table disagree on its definition, so the change is refused and nothing changes. The reconciler repairs drift on its own; `sprig_ddl_shard_skew_total` counts what it finds.
 - `ER_SPRIG_DDL_FAILED` (39480): a change ran on some shards and failed on the next. It is finished in the background; don't run it again.
 
+### Dropping a database with table groups
+
+`DROP DATABASE` drops every shard of the database's table groups, on every cluster, and removes the groups (see [Dropping a database](../concepts/shards-and-table-groups.md#dropping-a-database)).
+
+- **39071 `ER_SPRIG_CATALOG_CONFLICT`, "its table group N is being split, merged, moved or re-keyed".** A job on one of the groups hasn't reached its cutover. Wait for the job the message names (`sprigctl job show <id>`), or cancel it, then drop again.
+- **A warning with the OK**, "the shards of database … in its table groups were not all dropped". The database is gone, but a group shard on an unreachable cluster was left. The catalog reconciler reports the leftover schema; check the cluster with `sprigctl cluster show <id>`.
+
+### Reconciler findings for grouped tables
+
+The catalog reconciler compares each database's tables with the database's own schema (`sprig_catalog_reconcile_findings_total{finding}`). Tables the advisor moved into a table group live on the group's shards instead, so they are left out of that comparison and never reported as `object_missing`. Their shards aren't compared with the catalog yet. An `object_missing` finding therefore names a table that isn't in any table group.
+
 ## Write pauses at cutover
 
 **Symptom.** During a move, statements on the moving shard stall for up to about two seconds; a few fail with 1205 (lock wait timeout) or 1213 (deadlock).

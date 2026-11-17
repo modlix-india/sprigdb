@@ -326,6 +326,8 @@ Some statements can't carry the rewrite. On a table that binds the session, thes
 - `CALL`, `PREPARE` and `EXECUTE` of text naming a protected table, `HANDLER`, `CHECKSUM TABLE`, `LOAD DATA … REPLACE`;
 - `CREATE TABLE … SELECT` that reads a protected table, and stored code that uses dynamic SQL (`PREPARE` or `EXECUTE IMMEDIATE`) over one: it is never pointed at the policy views;
 - stored code that couldn't be pointed at the policy views (below), until it's fixed: the message says why (`stored code wasn't pointed at the policy views: …`).
+- `SHOW INDEX` of a protected table, and `SHOW TABLE STATUS` of a database that holds one, whose counts include hidden rows. `SHOW TABLE STATUS … LIKE` is refused only when the pattern matches a protected table, and `… WHERE` whenever the database holds one. Other tables and databases answer as usual, and `information_schema.TABLES` and `STATISTICS` work everywhere (with `NULL` row counts for protected tables);
+- `ALTER TABLE`, `RENAME TABLE`, `CREATE INDEX` and `DROP INDEX` of a protected table: a failing change could reveal a hidden row.
 
 **Views and stored code over protected tables.** A view, procedure, function or trigger that reads a protected table can be created as usual, by any user with the privileges for it, bound by the policies or not. Right after the `CREATE` succeeds, the gateway points it at the table's policy views, so it applies the policies of whoever it runs as: the caller for `SQL SECURITY INVOKER`, its definer for `SQL SECURITY DEFINER` (as on any call). Code written before a table got its policies is pointed when a policy statement runs. For a few milliseconds after a `CREATE`, another gateway may not know about the new code's pointing yet, and a call that lands there runs with the caller's policies.
 
@@ -357,13 +359,46 @@ SET @q = 'SELECT COUNT(*) FROM notes';
 PREPARE s FROM @q;
 ```
 
+Index statistics of a protected table are refused, but other tables answer:
+
+```sql test-error
+-- 39366: SHOW INDEX counts the rows the policies hide
+SHOW INDEX FROM notes;
+```
+
+```sql test
+CREATE TABLE tags (id INT PRIMARY KEY, name VARCHAR(20));
+SHOW INDEX FROM tags;
+SELECT INDEX_NAME FROM information_schema.STATISTICS
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'notes';
+```
+
+A schema change of a protected table is refused to a session its policies bind:
+
+```sql test-error
+-- 39366: the policies of notes bind this session
+ALTER TABLE notes ADD COLUMN due DATE;
+```
+
 ```sql test
 ALTER TABLE notes NO FORCE ROW LEVEL SECURITY;
 ```
 
+`DROP TABLE` and `TRUNCATE` take the table whole and reveal no row, so they work for anyone with the `DROP` privilege, bound or not. A table created later under the same name has none of the dropped table's policies:
+
+```sql test
+CREATE TABLE drafts (id INT PRIMARY KEY, owner VARCHAR(100) NOT NULL);
+INSERT INTO drafts VALUES (1, 'clerk@%');
+CREATE POLICY own_drafts ON drafts FOR SELECT USING (owner = CURRENT_USER());
+ALTER TABLE drafts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE drafts FORCE ROW LEVEL SECURITY;
+TRUNCATE TABLE drafts;
+DROP TABLE drafts;
+```
+
 A statement prepared before its table got policies fails with 39366 when it is executed afterwards. Statements that clients prepare through the protocol (`COM_STMT_PREPARE`, as most drivers do) aren't affected: the gateway prepares them again with the policies.
 
-`LOAD DATA` without `REPLACE` is checked by MariaDB's triggers. DDL, `SHOW`, `DESCRIBE` and transaction statements are unaffected. A statement that names `@sprig_rls` (SprigDB's internal session context) fails with 39050 `ER_SPRIG_RESERVED_NAME`.
+`LOAD DATA` without `REPLACE` is checked by MariaDB's triggers. `DESCRIBE`, `SHOW CREATE TABLE`, other `SHOW` statements, other DDL and transaction statements are unaffected. A statement that names `@sprig_rls` (SprigDB's internal session context) fails with 39050 `ER_SPRIG_RESERVED_NAME`.
 
 ## Errors
 
