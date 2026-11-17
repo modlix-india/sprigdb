@@ -100,7 +100,7 @@ Version	State	Tier	Placement
 1	active (live)	mariadb	tier mariadb, route any shard, cost 0
 ```
 
-Budgets are settings, per object, database or tenant: `logic.function_budget_ms` (5000 ms per synchronous call, and per row for a validation), `logic.trigger_budget_ms`, `logic.job_budget_ms`, `logic.kirun_max_steps`, `logic.max_data_ops` (1000 `db` calls per invocation), `logic.max_rows_read`, `logic.max_loop_iterations` and `logic.memory_limit_mb`. Workers read `logic.trigger_budget_ms` and `logic.job_budget_ms` per tenant, so set those on the tenant or globally. The wall-time budgets bind compiled code too: it stops with 39864 at the budget, which no `catch` or `pcall` can catch, even in a loop of many short statements. Compiled code reads the budget when it is deployed, takes your session's `max_statement_time` when that is smaller, and shares what is left with the compiled code it calls. When your session's limit is the tighter one, MariaDB's timer may fire first and you get MariaDB's 3024, as on plain MySQL or MariaDB; either way the call stops and its writes roll back; see [Budgets and limits](../data-models/logic.md#budgets-and-limits). Outbound `fetch` reaches only the hosts in `logic.outbound_allowlist`. See the [settings reference](../reference/settings.md#logic).
+Budgets are settings, per object, database or tenant: `logic.function_budget_ms` (5000 ms per synchronous call, and per row for a validation), `logic.trigger_budget_ms`, `logic.job_budget_ms`, `logic.kirun_max_steps`, `logic.max_data_ops` (1000 `db` calls per invocation), `logic.max_rows_read`, `logic.max_loop_iterations` and `logic.memory_limit_mb`. Workers read `logic.trigger_budget_ms` at each run of a trigger and `logic.job_budget_ms` at each fire of a schedule, so a change applies from the next run and a run already going keeps its budget. The wall-time budgets bind compiled code too: it stops with 39864 at the budget, which no `catch` or `pcall` can catch, even in a loop of many short statements. Compiled code reads the budget when it is deployed, takes your session's `max_statement_time` when that is smaller, and shares what is left with the compiled code it calls. When your session's limit is the tighter one, MariaDB's timer may fire first and you get MariaDB's 3024, as on plain MySQL or MariaDB; either way the call stops and its writes roll back; see [Budgets and limits](../data-models/logic.md#budgets-and-limits). Outbound `fetch` reaches only the hosts in `logic.outbound_allowlist`. See the [settings reference](../reference/settings.md#logic).
 
 ## Statements
 
@@ -117,6 +117,7 @@ Budgets are settings, per object, database or tenant: `logic.function_budget_ms`
 | [`TEST FUNCTION \| PROCEDURE \| TRIGGER \| VALIDATION`](#test) | Run code in a sandbox that never writes |
 | [`ALTER FUNCTION \| PROCEDURE \| TRIGGER … ROLLOUT`](#staged-rollouts) | Move a staged rollout |
 | [`ALTER FUNCTION \| PROCEDURE … ROLLBACK`](#alter--rollback) | Make an earlier version active |
+| [`ALTER TRIGGER … DISABLE \| ENABLE`](#alter-trigger--disable-and-enable) | Pause or resume a trigger |
 | [`DROP FUNCTION \| PROCEDURE \| VALIDATION \| TRIGGER \| SCHEDULE`](#drop) | Remove code |
 | [`SHOW DEPENDENTS OF FUNCTION \| PROCEDURE`](#show-dependents) | What a `DROP` would affect |
 
@@ -741,6 +742,28 @@ Makes an earlier version active again, at once. The version's own source is comp
 ```sql
 ALTER FUNCTION net ROLLBACK;
 ALTER FUNCTION shop.quote_js ROLLBACK TO VERSION 1;
+```
+
+## ALTER TRIGGER … DISABLE and ENABLE
+
+```sql
+ALTER TRIGGER [db_name.]name {DISABLE | ENABLE}
+```
+
+Pauses or resumes an after-commit trigger or a trigger on a stream or queue.
+
+- `DISABLE` stops the trigger's job within 5 seconds and keeps its position: its place in the change feed, its consumer group's offsets on a stream. A queue trigger stops taking messages.
+- `ENABLE` resumes from that position. What was committed or published while the trigger was off then runs, each change, record or message once and in order.
+- Both answer with a note. A repeat (`DISABLE` of a disabled trigger) changes nothing and says so in a note. Each change of state writes a line to the trigger's log (`disabled by app@%`, `enabled by app@%`).
+- A `CREATE OR REPLACE` keeps a disabled trigger disabled. Dead letters replayed while it is off run after `ENABLE`.
+- An after-commit trigger left disabled after its cluster purged the binary logs it needs can't resume: after `ENABLE`, its job fails with 39800 `ER_SPRIG_FEED_HISTORY_LOST`. Drop and re-create it to start from now.
+- A name that isn't a logic trigger, such as an ordinary MariaDB trigger, fails with 39860. An inherited trigger's instance fails with 39862: use `ALTER INHERITED TRIGGER … DISABLE | ENABLE` (see [Inheritance in SQL](inheritance.md)).
+
+**Privileges:** as for `DROP TRIGGER`: `ALTER ROUTINE`, `CREATE ROUTINE` or `TRIGGER` on the database.
+
+```sql test
+ALTER TRIGGER audit_qty_lua DISABLE;
+ALTER TRIGGER audit_qty_lua ENABLE;
 ```
 
 ## DROP

@@ -423,7 +423,7 @@ $$;
 - **Exactly once.** Each change runs in its own transaction on the table's shard, together with a marker for that change. A change delivered again, after a worker restart or a shard move, finds its marker and does nothing.
 - **Order.** Changes to the same row run in commit order. Different rows run in parallel, in `logic.trigger_lanes` lanes (default 8) by row key.
 - **Failures.** A failed run is retried with doubling waits and jitter, from `logic.trigger_retry_initial_ms` (1 s) up to `logic.trigger_retry_max_ms` (5 minutes). Failures that are transient (a lost connection, a lock wait, a server that is read-only or fenced during a failover) are retried for as long as they last and don't count. After `logic.trigger_max_attempts` (10) counted failures the change goes to the dead letters, and the lane moves on. An `error` or `reject` event counts as a failure (39865).
-- **Time.** One run may take `logic.trigger_budget_ms` (30 s).
+- **Time.** One run may take `logic.trigger_budget_ms` (30 s), as it stands when the run starts. A change applies from the next run.
 - **Compiled only.** After-commit triggers are KIRun, JavaScript or Lua and must compile into MariaDB (39862 otherwise). Code that reads or writes tables compiles only when the table's group has one shard.
 - **Rights.** The trigger runs with its definer's rights. Creating one needs `TRIGGER` and `SELECT` on the table, because the code receives the changed rows. When [row-level security](../security/row-level-security.md) policies bind the definer, the trigger runs only for rows the definer may see: an update that shows or hides a row to the definer arrives as an insert or a delete.
 
@@ -482,7 +482,7 @@ A KIRun definition's parameters bind by name to the fields of the record or mess
 ### How they run
 
 - **Streams.** A new trigger starts at each partition's end: it runs for records published after it was created. It has its own consumer group, `__sprig_logic_<binding>`. Each record runs in one transaction that commits the group's offset and the code's writes together; a second run of the same record finds the offset moved (39877) and does nothing. Partitions run in parallel, each in offset order. `CREATE OR REPLACE` keeps the position; a replacement that reads another stream starts a new one. Records that retention removed before they ran are skipped.
-- **Queues.** The trigger is one more competing consumer. It takes the next message (held for `logic.trigger_budget_ms` plus 5 s), runs the code, and acknowledges the message in the same transaction as the code's writes. `logic.trigger_lanes` loops take messages at once; an empty queue is asked again after 100 ms, doubling to 1 s.
+- **Queues.** The trigger is one more competing consumer. It takes the next message (held for `logic.trigger_budget_ms` plus 5 s, and at least 30 s), runs the code, and acknowledges the message in the same transaction as the code's writes. `logic.trigger_lanes` loops take messages at once; an empty queue is asked again after 100 ms, doubling to 1 s.
 - **Failures.** A failure is retried as for after-commit triggers; transient failures never count. A stream record that fails `logic.trigger_max_attempts` times goes to the dead letters, and the offset moves past it. A queue message's attempts are counted by its delivery count; at the limit it goes to the dead letters and is then rejected, so a queue with a dead-letter exchange gets it there as well. A queue's own `x-delivery-limit` still applies.
 - **Changes.** Each running trigger picks up a new active version within about 5 seconds, and stops when the trigger, its stream or queue, or its database is dropped. A new version can be staged by record key; see [Staged rollout of triggers](#staged-rollout-of-triggers).
 
@@ -548,11 +548,18 @@ Code runs under budgets. Each is a setting; a run that exceeds one fails with 39
 | `logic.max_rows_read` | `100000` | object, database, tenant, global | Rows read in one run |
 | `logic.memory_limit_mb` | `64` | tenant, global | Heap of one run |
 
-A call in a gateway reads the value for the code's own database, so set these on the database, the tenant or globally. Workers read the trigger settings (`logic.trigger_*`) for the trigger's table and database, and `logic.job_budget_ms` for the schedule's database. All of them apply live. See the [settings reference](../reference/settings.md#logic).
+A call in a gateway reads the value for the code's own database, so set these on the database, the tenant or globally. Workers read the trigger settings (`logic.trigger_*`) for the trigger's table and database, and `logic.job_budget_ms` for the schedule's database. A change reaches running jobs without a restart: global and data-centre values at once, database and tenant values within about a second.
+
+- `logic.trigger_budget_ms` is read at each run of a trigger: one change, record or message. A new value applies from the next run, and a run already going keeps the budget it started with. A queue trigger's hold on a message follows it too.
+- `logic.trigger_max_attempts` and the retry waits apply at the next failure.
+- `logic.trigger_lanes` applies when the trigger's job starts again; a running job keeps its lanes.
+- `logic.job_budget_ms` is read at each fire of a schedule.
+
+See the [settings reference](../reference/settings.md#logic).
 
 Some limits are fixed:
 
-- **Compiled code** stops at its wall budget with 39864, however many short statements it runs: it checks the time before every data operation and at every loop iteration. Functions, procedures and validations (per row) get `logic.function_budget_ms`, or your session's `max_statement_time` when that is smaller; triggers get `logic.trigger_budget_ms`, and schedules `logic.job_budget_ms`. The value is read when the version is deployed, so deploy the code again after changing the setting. A compiled `db.call` shares what is left of its caller's budget. The message says how much time was left when the code was called. When `logic.function_budget_ms` is the tighter limit, the call fails with 39864. When your session's own `max_statement_time` is the tighter one, MariaDB's timer may fire first and you get MariaDB's 3024, as on plain MySQL or MariaDB. Either way the call stops and its writes roll back. One difference from the engine tier: a single statement that is already running isn't interrupted, so a call from SQL whose last statement runs past the budget succeeds late. Loops without a static bound are also stopped at `logic.max_loop_iterations` (39864).
+- **Compiled code** stops at its wall budget with 39864, however many short statements it runs: it checks the time before every data operation and at every loop iteration. Functions, procedures and validations (per row) get `logic.function_budget_ms`, or your session's `max_statement_time` when that is smaller; triggers get `logic.trigger_budget_ms`, and schedules `logic.job_budget_ms`. For functions, procedures and validations the value is read when the version is deployed, so deploy the code again after changing the setting. A trigger takes the value in force when each run starts, so it needs no new deploy. A compiled `db.call` shares what is left of its caller's budget. The message says how much time was left when the code was called. When `logic.function_budget_ms` is the tighter limit, the call fails with 39864. When your session's own `max_statement_time` is the tighter one, MariaDB's timer may fire first and you get MariaDB's 3024, as on plain MySQL or MariaDB. Either way the call stops and its writes roll back. One difference from the engine tier: a single statement that is already running isn't interrupted, so a call from SQL whose last statement runs past the budget succeeds late. Loops without a static bound are also stopped at `logic.max_loop_iterations` (39864).
 - **Engine threads.** JavaScript and Lua calls in the engine tier run on as many threads as the gateway has cores; up to 16 calls per thread may wait for one, and beyond that a call fails at once with 39871 `ER_SPRIG_LOGIC_ENGINE_BUSY`, which you can retry.
 - **Memory.** QuickJS and Lua count their real heap. The KIRun runtime estimates the size of the values each step holds.
 - **Cancellation.** When the client goes away or runs `KILL QUERY`, the run stops.
@@ -741,6 +748,46 @@ net
 
 Rolling back or changing a rollout needs `ALTER ROUTINE` on the database; for a trigger's rollout, `CREATE ROUTINE` or `TRIGGER` also does. `sprigctl logic rollback` sends the same statement through a gateway.
 
+## Pausing triggers
+
+`ALTER TRIGGER name DISABLE` pauses a trigger, and `ALTER TRIGGER name ENABLE` resumes it. This works for after-commit triggers and for triggers on streams and queues.
+
+```sql test
+ALTER TRIGGER audit_orders DISABLE;
+DO SLEEP(7);
+INSERT INTO orders (product_id, qty) VALUES (8, 40);
+DO SLEEP(5);
+SELECT COUNT(*) AS audited FROM order_audit WHERE qty = 40;
+```
+
+```text output
+audited
+0
+```
+
+The insert committed, but the paused trigger didn't run for it. After `ENABLE`, it runs:
+
+```sql test
+ALTER TRIGGER audit_orders ENABLE;
+DO SLEEP(5);
+SELECT COUNT(*) AS audited FROM order_audit WHERE qty = 40;
+```
+
+```text output
+audited
+1
+```
+
+- **The position is kept.** `DISABLE` stops the trigger's job within 5 seconds, so a change committed in those seconds may still run. After that, nothing runs. An after-commit trigger keeps its place in the change feed. A stream trigger keeps its consumer group's offsets. A queue trigger stops taking messages, which stay in the queue for its other consumers.
+- **`ENABLE` resumes where the trigger stopped.** A job starts within a few seconds. What was committed or published while the trigger was off then runs, each change, record or message once and in order, followed by new ones.
+- **Notes.** Both answer with a note, such as `after-commit trigger audit_orders disabled; its job ends within 5 s and its position is kept`. Disabling a disabled trigger, or enabling an enabled one, changes nothing and says so in a note.
+- **The log.** Each change of state adds a line to the trigger's log, such as `disabled by app@%` and `enabled by app@%` (see [Logs and dead letters](#logs-and-dead-letters)).
+- **Deploys.** A `CREATE OR REPLACE` of a disabled trigger deploys the new version and keeps the trigger disabled.
+- **Dead letters.** A disabled trigger has no job, so dead letters you replay while it is off run after `ENABLE`.
+- **Off for too long.** An after-commit trigger reads the binary logs. If they were purged while the trigger was off, the trigger can't resume: after `ENABLE`, its job fails with 39800 `ER_SPRIG_FEED_HISTORY_LOST` and runs nothing. The changes it missed can't be run any more; drop and re-create the trigger, which starts at the current position. Each cluster keeps binary logs for `binlog_expire_logs_seconds` (see [Change feed](../concepts/change-feed.md)), so don't keep an after-commit trigger disabled for longer than that. A stream trigger skips records that retention removed meanwhile.
+- **Rights.** The same as `DROP TRIGGER`: `ALTER ROUTINE`, `CREATE ROUTINE` or `TRIGGER` on the database (1044 otherwise).
+- **Not for every trigger.** An ordinary MariaDB trigger can't be paused: `ALTER TRIGGER` of a name that isn't a logic trigger fails with 39860. An inherited trigger's instance fails with 39862; use `ALTER INHERITED TRIGGER … DISABLE` instead (see [Inheritance](inheritance.md)).
+
 ## Dropping logic
 
 `DROP {FUNCTION | PROCEDURE | VALIDATION | TRIGGER | SCHEDULE} [IF EXISTS] name [RESTRICT | CASCADE]` removes a module, every version's routines and MariaDB triggers on every shard, and a validation's `CHECK` constraint. A trigger or schedule stops at its next check. The name can be used again, starting at version 1.
@@ -762,7 +809,7 @@ A function or procedure that others depend on isn't dropped:
 
 ## Logs and dead letters
 
-Each module keeps a **log**: a line for each deploy, each trigger job's start, the first failure of each change, record or message, each dead letter and replay, each scheduled run, and each automatic rollback. Lines your code writes are kept in it only for triggers on streams and queues (see [What code can use](#what-code-can-use)).
+Each module keeps a **log**: a line for each deploy, each `DISABLE` and `ENABLE` of a trigger, each trigger job's start, the first failure of each change, record or message, each dead letter and replay, each scheduled run, and each automatic rollback. Lines your code writes are kept in it only for triggers on streams and queues (see [What code can use](#what-code-can-use)).
 
 A **dead letter** is a change, record or message that failed `logic.trigger_max_attempts` times. It holds the event, the attempts, the last error code and message, and a state: `dead`, `replaying`, `replayed` or `discarded`. Replaying runs dead letters again with the active version, oldest first, in the trigger's own job; each runs once even if you mark it again. If a replay fails, it and every later dead letter of the trigger go back to `dead`, so nothing runs out of order.
 
@@ -816,7 +863,7 @@ Missing privileges are MySQL's 1044 (database level), 1142 (table level) and 137
 - **`SQL SECURITY DEFINER` in the engine tier**, `SELECT f(…)` of engine-tier functions with non-constant arguments or in queries with `FROM`, and prepared `CALL` of engine-tier versions.
 - **Rollout of validations, computed columns and schedules**, rollout by session, and automatic stages: those kinds switch at once, and stages move by hand.
 - **Compiled KIRun triggers on streams and queues.** They run in the engine tier.
-- **Pausing a trigger.** Only triggers declared `FOR EACH TENANT` can be disabled and enabled (see [Inheritance](inheritance.md)); drop and re-create any other trigger instead. A re-created stream trigger starts at the end of the stream.
+- **Resuming a paused trigger from the current position.** `ENABLE` always runs what was committed while the trigger was off. To skip it, drop and re-create the trigger: a re-created stream trigger starts at the end of the stream.
 - **Keeping your code's log lines** for functions, procedures, validations, after-commit triggers and computed columns. Only triggers on streams and queues, and test runs, keep them.
 - **`System.Wait` and `System.Print`** in KIRun code.
 

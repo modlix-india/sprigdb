@@ -23,7 +23,7 @@ for r in $(seq 1 "$RUNS"); do
         [[ $name == test || -z $rps ]] && continue
         VARIANT="cmd=$(echo "$name" | cut -d' ' -f1)"
         RUN_ID_SAVE=$RUN_ID; RUN_ID=$RUN_ID_SAVE-run$r
-        emit kv point redis-benchmark ops_per_s "$rps" "ops/s" higher --config "run=$r" --config "clients=50"
+        emit kv point redis-benchmark ops_per_s "$rps" "ops/s" higher --config "run=$r" --config "clients=50" --config "requests=$REQ"
         RUN_ID=$RUN_ID_SAVE
     done <"$LOGDIR/run$r.csv"
 done

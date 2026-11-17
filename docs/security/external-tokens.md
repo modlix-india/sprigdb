@@ -14,6 +14,7 @@ Applications and people that already sign in to an OpenID Connect (OIDC) identit
 | MySQL and MariaDB | As the password, over TLS | The login name (`acme.billing`) | No |
 | Redis | As the password of `AUTH` | The login name | No |
 | HTTP: REST and gRPC | `Authorization: Bearer <token>` | The token's user mapping | When the issuer has `jit_users` |
+| HTTP, as a Basic password | `Authorization: Basic base64(<login name>:<token>)` | The login name | No |
 | MongoDB | `MONGODB-OIDC` | The token's user mapping | When the issuer has `jit_users` |
 
 Bolt, Kafka and AMQP don't take tokens.
@@ -47,7 +48,7 @@ Issuers belong to a tenant. Operators register them through the Admin API, with 
 | Field | Default | Meaning |
 |---|---|---|
 | `issuer` | required | The exact `iss` value of the issuer's tokens, 1 to 512 characters. It identifies the issuer: writing a document with the same `issuer` replaces the stored one |
-| `kind` | `oidc` | `oidc`, or `end_user_layer` for an application's own token service. Both are verified the same way |
+| `kind` | `oidc` | `oidc`, or `end_user_layer` for an application's own token service, whose tokens belong to its end users. Both are verified the same way; see [End-user layers](#end-user-layers) for what differs |
 | `jwks_url` | none | The URL of the issuer's key set, up to 512 characters. Without it, SprigDB finds the key set by OIDC discovery from `issuer` (see [Key sets](#key-sets)) |
 | `audiences` | required | The `aud` values accepted; at least one, none empty |
 | `algorithms` | `["RS256"]` | The signature algorithms accepted: any of `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, `PS512`, `ES256`, `ES384` and `EdDSA` |
@@ -215,6 +216,23 @@ curl -s https://db.example.com:8443/v1/databases/shop/sql:query \
 
 gRPC takes the same values as `authorization` and `x-sprig-tenant` metadata.
 
+#### As an HTTP Basic password
+
+A client that can only send HTTP Basic, such as a BI tool, `curl -u` or a driver's REST mode, can send the token as the password instead. This works only for an account with the `token` login method, as over MySQL: the login name names the account, and the token's user mapping must name that same account. The tenant comes from the host name on a tenant endpoint, else from the `x-sprig-tenant` header, else from the login name's prefix (`acme.billing`).
+
+```sh
+curl -s https://db.example.com:8443/v1/databases/shop/sql:query \
+  -u "acme.billing:$TOKEN" -H 'content-type: application/json' \
+  -d '{"sql": "SELECT id, status FROM orders WHERE customer_id = 42"}'
+```
+
+- The request gets the token's claims (`SPRIG_CLAIM`) and token roles, exactly as with `Authorization: Bearer`.
+- The issuer must take `http`. A login that the gateway hands to another data centre, for the tenant's [residency](residency.md), is checked there as a MySQL login, so the issuer must also take `mysql`.
+- A password shaped like a token, sent for an account without the `token` method, is checked as a password and carries no claims.
+- No account is created on first login, even with `jit_users`.
+- The audit event is `auth.login_succeeded` with `protocol` `http` and `mechanism` `jwt`.
+- Use HTTPS: the token is sent as it is, on every request.
+
 The gateway tells the bearer credentials apart by their form: `sprig_...` is an API key, `sprigat_...` a SprigDB access token, and any other JWT an issuer's token. Every request is checked; a gateway reuses a token it verified in the last 60 seconds (never past its `exp`) without checking the signature again, and forgets it at any change to the tenant's accounts or issuers. A refused token gets 401 with 1045 in the body.
 
 ### MongoDB
@@ -287,15 +305,17 @@ A login that a gateway hands to another data centre because of the tenant's [res
 
 ## Claims in row-level security
 
-`SPRIG_CLAIM('key')` returns the top-level claim `key` of the token the session logged in with, on all four protocols. Every verified claim is available, unchanged:
+`SPRIG_CLAIM('key')` returns the top-level claim `key` of the token the session logged in with, on all four protocols. Every verified claim is available, always as text (or `NULL`):
 
 | Claim | `SPRIG_CLAIM` returns |
 |---|---|
 | A string | The string |
-| A number | The number |
-| `true`, `false` | `TRUE`, `FALSE` |
+| A number | Its JSON text, as a string: `7` gives `'7'`, `2.5` gives `'2.5'` |
+| `true`, `false` | `'1'`, `'0'` |
 | An array or an object | Its JSON text, as a string |
 | Missing | `NULL` |
+
+Because a number arrives as text, `org_id = SPRIG_CLAIM('org')` compares as MariaDB compares a column with a string, and a boolean claim is tested with `SPRIG_CLAIM('admin') = '1'`. Policies and the session's own queries bind claims the same way, so they always agree.
 
 `SPRIG_CLAIM` works in any query (`SELECT SPRIG_CLAIM('org')`) and in row-level security policies; see [Row-level security](row-level-security.md). This policy shows each token only its own organisation's rows:
 
@@ -395,9 +415,7 @@ See [Metrics](../reference/metrics.md).
 
 ## Not supported yet
 
-- **`end_user_layer` issuers** are verified exactly like `oidc` ones.
-- **A token as an HTTP Basic password** isn't accepted; send it as a bearer token.
-- **Accounts created on first login** over MySQL, MariaDB and Redis.
+- **Accounts created on first login** over MySQL, MariaDB and Redis, or with a token sent as an HTTP Basic password.
 - **Tokens on Bolt, Kafka and AMQP.**
 - **Key sets behind a private certificate authority.** Key sets are fetched only from servers with a publicly trusted certificate, or over plain HTTP on a loopback address.
 - **Managing issuers in SQL or Studio.** Use `sprigctl` or the Admin API.

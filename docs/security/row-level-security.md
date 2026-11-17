@@ -233,9 +233,13 @@ Some statements can't be rewritten safely. Naming a protected table that binds t
 - `CALL`, `PREPARE`, `EXECUTE`, `HANDLER`, `CHECKSUM`, `LOAD DATA ... REPLACE`;
 - `CREATE VIEW`, `PROCEDURE`, `FUNCTION`, `TRIGGER`, `EVENT`, or `CREATE TABLE ... SELECT` over a protected table, and stored code with dynamic SQL;
 - a statement the gateway's parser can't read;
-- a change topic of a protected table read whole by a principal the policies bind (it is read record by record instead where possible).
+- a change topic of a protected table read whole by a principal the policies bind (it is read record by record instead where possible);
+- `SHOW INDEX` of a protected table, and `SHOW TABLE STATUS` of a database that holds one, because their row counts and cardinalities include hidden rows. With `LIKE`, `SHOW TABLE STATUS` is refused only when the pattern matches a protected table; with `WHERE`, whenever the database holds one. Other tables and databases answer as usual. `information_schema.TABLES` and `STATISTICS` work everywhere, with `NULL` row counts for protected tables;
+- `ALTER TABLE`, `RENAME TABLE`, `CREATE INDEX` and `DROP INDEX` of a protected table, since a failed change can reveal a hidden row (a duplicate key, a value that doesn't convert). Make schema changes from an account the policies don't bind, or after `NO FORCE`.
 
-DDL, `SHOW`, `DESCRIBE` and transaction statements are not affected.
+`DROP TABLE` and `TRUNCATE` work on a protected table for anyone with the `DROP` privilege on it, bound or not: they take the table whole and reveal no row. A new table of the same name starts without the dropped table's policies.
+
+`DESCRIBE`, `SHOW CREATE TABLE`, other `SHOW` statements, other DDL and transaction statements are not affected.
 
 ## Test as a user
 
@@ -278,7 +282,7 @@ The rules:
 
 ## Not supported yet
 
-- **Claims without a token.** Password logins, HTTP Basic and API keys carry no token, so `SPRIG_CLAIM` returns `NULL` there; put per-user values in account attributes and read them with `SPRIG_USER_ATTR`.
+- **Claims without a token.** Password logins (HTTP Basic with a password among them) and API keys carry no token, so `SPRIG_CLAIM` returns `NULL` there; put per-user values in account attributes and read them with `SPRIG_USER_ATTR`.
 
 ## Related
 

@@ -465,3 +465,42 @@ fn digests_stay_one_literal_and_are_capped() {
     assert!(text_len <= 1024 && text_len > 1000, "{text_len}");
     assert!(sql.len() < 2_000_000, "{}", sql.len());
 }
+
+#[test]
+fn long_digests_stay_under_the_packet_limit() {
+    // Ten thousand digests with texts near the 1,024-byte cap, full of
+    // quotes and backslashes that quoting doubles: the statement keeps the
+    // most recent that fit and stays under MariaDB's default
+    // `max_allowed_packet` (16 MiB).
+    let v = vars();
+    let text = format!(
+        "SELECT `doc` FROM `c` WHERE JSON_VALUE(`doc`, '$.\"a\\\\b\"') = ? {}",
+        "AND `x` = '\\\\' ".repeat(60)
+    );
+    let d: Vec<PsDigest> = (0..10_000u64)
+        .map(|i| PsDigest {
+            schema: Some("shop".to_owned()),
+            digest: format!("{i:016x}"),
+            text: text.clone(),
+            count: 1,
+            last_seen_us: 1_700_000_000_000_000 + i,
+            ..PsDigest::default()
+        })
+        .collect();
+    let s = PsSession {
+        digests: &d,
+        ..session(&v, &[], None)
+    };
+    let sql = rewrite(
+        b"SELECT COUNT(*) FROM performance_schema.events_statements_summary_by_digest",
+        &LexOptions::mysql84(),
+        &s,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(sql.len() < 16 << 20, "{}", sql.len());
+    let sql = String::from_utf8(sql).unwrap();
+    // The newest is kept, the oldest left out.
+    assert!(sql.contains("\"d\":\"000000000000270f\""));
+    assert!(!sql.contains("\"d\":\"0000000000000000\""));
+}

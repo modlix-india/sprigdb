@@ -624,8 +624,7 @@ fn embedded() -> Option<u64> {
             .filter(|l| {
                 l.starts_with("sprig_retrieval_rows_total{") && l.contains("result=\"indexed\"")
             })
-            .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
-            .map(|v| v as u64)
+            .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
             .sum::<u64>();
     }
     Some(n)

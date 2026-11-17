@@ -226,7 +226,7 @@ async fn studio_cursor_forwarded_with_a_bearer_token() {
         eprintln!("skipped: set SPRIG_TEST_CF_SQL");
         return;
     };
-    let (a, b) = (
+    let (gw_a, gw_b) = (
         var("SPRIG_TEST_CF_HTTP_A", "127.0.0.1:44080"),
         var("SPRIG_TEST_CF_HTTP_B", "127.0.0.1:44090"),
     );
@@ -250,9 +250,9 @@ async fn studio_cursor_forwarded_with_a_bearer_token() {
         .pass(Some(var("SPRIG_TEST_CF_PASSWORD", "sprig-dev-app")))
         .prefer_socket(false)
         .ssl_opts(mysql_async::SslOpts::default().with_danger_accept_invalid_certs(true));
-    let mut c = mysql_async::Conn::new(opts).await.unwrap();
+    let mut conn = mysql_async::Conn::new(opts).await.unwrap();
     let values: Vec<String> = (1..=50).map(|i| format!("({i}, 'v{i}')")).collect();
-    for s in [
+    for stmt in [
         format!("DROP DATABASE IF EXISTS {DB}"),
         format!("CREATE DATABASE {DB}"),
         format!("CREATE TABLE {DB}.t (id INT PRIMARY KEY, v VARCHAR(20))"),
@@ -264,9 +264,9 @@ async fn studio_cursor_forwarded_with_a_bearer_token() {
         format!("GRANT SELECT ON {DB}.t TO cftok"),
         format!("GRANT SELECT ON {DB}.t TO cfother"),
     ] {
-        c.query_drop(&s)
+        conn.query_drop(&stmt)
             .await
-            .unwrap_or_else(|e| panic!("{s}: {e}"));
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
     }
     let key = Key::new();
     let jwks = serve_jwks(key.jwks()).await;
@@ -289,16 +289,16 @@ async fn studio_cursor_forwarded_with_a_bearer_token() {
     ck.ok("the issuer is created", st == 200, || {
         format!("{st} {body}")
     });
-    for u in ["cftok", "cfother"] {
+    for user in ["cftok", "cfother"] {
         let (st, body) = http(
             &admin,
             "POST",
             &format!("/admin/v1/tenants/{tenant}/users:setTokenLogin"),
             &[],
-            &json!({"user": u, "enabled": true}).to_string(),
+            &json!({"user": user, "enabled": true}).to_string(),
         )
         .await;
-        ck.ok(&format!("{u} takes tokens"), st == 200, || {
+        ck.ok(&format!("{user} takes tokens"), st == 200, || {
             format!("{st} {body}")
         });
     }
@@ -311,9 +311,9 @@ async fn studio_cursor_forwarded_with_a_bearer_token() {
     let open_path = format!("/v1/databases/{DB}/cursors");
     let mut opened = (0, Value::Null, String::new());
     for _ in 0..60 {
-        opened = call(&a, &open_path, &tok, &open_body).await;
+        opened = call(&gw_a, &open_path, &tok, &open_body).await;
         let probe = call(
-            &b,
+            &gw_b,
             &format!("/v1/databases/{DB}/sql:query"),
             &tok,
             &json!({"sql": "SELECT 1"}),
@@ -324,63 +324,71 @@ async fn studio_cursor_forwarded_with_a_bearer_token() {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    let (st, v, raw) = opened;
-    let name = v["name"].as_str().unwrap_or("").to_owned();
+    let (st, page, raw) = opened;
+    let name = page["name"].as_str().unwrap_or("").to_owned();
     ck.ok(
         "a: the cursor opens with a bearer token, first page 1..10",
-        st == 200 && !name.is_empty() && ids(&v) == (1..=10).collect::<Vec<_>>(),
+        st == 200 && !name.is_empty() && ids(&page) == (1..=10).collect::<Vec<_>>(),
         || format!("{st} {raw}"),
     );
-    let h = name.strip_prefix("cursors/").unwrap_or(&name).to_owned();
-    let fetch = format!("/v1/cursors/{h}:fetch");
+    let handle = name.strip_prefix("cursors/").unwrap_or(&name).to_owned();
+    let fetch = format!("/v1/cursors/{handle}:fetch");
 
     // Fetched through B: forwarded to A, the next page.
     let before = forwarded_total(telemetry_b.as_deref()).await;
-    let (st, v, raw) = call(&b, &fetch, &tok, &json!({"rows": 10})).await;
+    let (st, page, raw) = call(&gw_b, &fetch, &tok, &json!({"rows": 10})).await;
     ck.ok(
         "b: the fetch is forwarded to a and gives 11..20",
-        st == 200 && ids(&v) == (11..=20).collect::<Vec<_>>() && v["position"] == "20",
+        st == 200 && ids(&page) == (11..=20).collect::<Vec<_>>() && page["position"] == "20",
         || format!("{st} {raw}"),
     );
     let after = forwarded_total(telemetry_b.as_deref()).await;
-    if let (Some(x), Some(y)) = (before, after) {
+    if let (Some(was), Some(now_seen)) = (before, after) {
         ck.ok(
             "b counts the forwarded call (sprig_studio_cursors_forwarded_total)",
-            y >= x + 1.0,
-            || format!("{x} → {y}"),
+            now_seen >= was + 1.0,
+            || format!("{was} → {now_seen}"),
         );
     }
     // And on A itself: the page after.
-    let (st, v, raw) = call(&a, &fetch, &tok, &json!({"rows": 10})).await;
+    let (st, page, raw) = call(&gw_a, &fetch, &tok, &json!({"rows": 10})).await;
     ck.ok(
         "a: the next fetch on a gives 21..30",
-        st == 200 && ids(&v) == (21..=30).collect::<Vec<_>>(),
+        st == 200 && ids(&page) == (21..=30).collect::<Vec<_>>(),
         || format!("{st} {raw}"),
     );
     // Another account's token: as if the cursor didn't exist.
-    let (st, _, raw) = call(&b, &fetch, &other, &json!({"rows": 10})).await;
+    let (st, _, raw) = call(&gw_b, &fetch, &other, &json!({"rows": 10})).await;
     ck.ok(
         "b: another account's token gets 39934",
         st != 200 && raw.contains("39934"),
         || format!("{st} {raw}"),
     );
     // Closed through B; then gone on A.
-    let (st, v, raw) = call(&b, &format!("/v1/cursors/{h}:close"), &tok, &json!({})).await;
+    let (st, page, raw) = call(
+        &gw_b,
+        &format!("/v1/cursors/{handle}:close"),
+        &tok,
+        &json!({}),
+    )
+    .await;
     ck.ok(
         "b: the close is forwarded and closes it",
-        st == 200 && v["closed"] == json!(true),
+        st == 200 && page["closed"] == json!(true),
         || format!("{st} {raw}"),
     );
-    let (st, _, raw) = call(&a, &fetch, &tok, &json!({"rows": 10})).await;
+    let (st, _, raw) = call(&gw_a, &fetch, &tok, &json!({"rows": 10})).await;
     ck.ok(
         "a: the closed cursor is gone",
         st != 200 && (raw.contains("39934") || raw.contains("39935")),
         || format!("{st} {raw}"),
     );
 
-    let _ = c.query_drop(format!("DROP DATABASE IF EXISTS {DB}")).await;
-    let _ = c.query_drop("DROP USER IF EXISTS cftok").await;
-    let _ = c.query_drop("DROP USER IF EXISTS cfother").await;
+    let _ = conn
+        .query_drop(format!("DROP DATABASE IF EXISTS {DB}"))
+        .await;
+    let _ = conn.query_drop("DROP USER IF EXISTS cftok").await;
+    let _ = conn.query_drop("DROP USER IF EXISTS cfother").await;
     eprintln!("{} checks, {} failed", ck.n, ck.failed.len());
     assert!(ck.failed.is_empty(), "{:#?}", ck.failed);
 }

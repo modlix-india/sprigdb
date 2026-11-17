@@ -6,10 +6,11 @@
 # (deploy/compose/ci/outcomes.py; the target is always "sprig"). A test that
 # fails on MongoDB too is never counted against SprigDB.
 #
-# From the whole suite run on a laptop on 15 and 16 Nov 2026 (test/*.test.js
+# From the whole suite run on a laptop on 15, 16 and 17 Nov 2026 (test/*.test.js
 # and test/docs/*.test.js, 4,220 tests, with START_REPLICA_SET=1, as CI also
 # sets it): every test that passes on MongoDB 8.0.34 and fails through
-# SprigDB is listed here.
+# SprigDB is listed here. 17 Nov: 4,129 of MongoDB's 4,161 pass; the 32
+# below are the rest.
 
 # Legacy `2d` indexes are not built (a non-goal of the geo work); `$near`,
 # `$nearSphere` and `$within` on legacy pairs need one.
@@ -27,9 +28,6 @@ sprig fail *mongodb actually removes expired documents* :: time-series collectio
 sprig fail *createCollection()*respects timeseries* :: time-series collections are refused
 sprig fail *avoids trying to drop timeseries collections* :: time-series collections are refused
 sprig fail *createCollection()*respects clusteredIndex* :: clustered collections are refused
-
-# Not built yet.
-sprig fail *Mongo 3.6 options*adds hint option* :: aggregate's hint doesn't order the documents by the index
 
 # The test reads the host from a URI without credentials; SprigDB needs a login.
 sprig fail *openUri*with mongoose.createConnection()* :: the test's URI pattern doesn't allow user:password@

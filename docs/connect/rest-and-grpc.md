@@ -59,7 +59,15 @@ Every data call carries an `Authorization` header (gRPC: `authorization` metadat
 | Session token | `Authorization: Bearer sprigat_...` | From `POST /v1/auth/login`, short-lived |
 | Identity provider token | `Authorization: Bearer eyJ...` | A JWT from an issuer the tenant registered; name the tenant with its host name or `x-sprig-tenant`. See [Identity provider tokens](#identity-provider-tokens) |
 
-With Basic, the user name names the tenant: `acme.app` is user `app` of tenant `acme`. Alternatively send the plain user name with the header `x-sprig-tenant: acme`.
+With Basic, the user name names the tenant: `acme.app` is user `app` of tenant `acme`. Alternatively send the plain user name with the header `x-sprig-tenant: acme`, on HTTP/1.1, HTTP/2 and gRPC alike. On a [tenant endpoint](../security/tls.md#tenant-endpoints-by-server-name) (`acme.db.example.com`) the host name names the tenant, and the header is ignored.
+
+```sh
+curl -s -u 'app:<password>' -H 'x-sprig-tenant: acme' \
+  https://db.example.com:8443/v1/databases/shop/sql:query \
+  -H 'content-type: application/json' -d '{"sql": "SELECT CURRENT_USER()"}'
+```
+
+An account with the `token` login method can also send an identity provider's token as the Basic password, for clients that can only send Basic; see [Identity provider tokens](#identity-provider-tokens).
 
 The checks are those of every other protocol: account locks, expired passwords (refused with 1862, since HTTP has no sandbox mode), `REQUIRE SSL`, `auth.require_tls`, failure delays and the per-address limit.
 
@@ -122,7 +130,9 @@ curl -s https://db.example.com:8443/v1/databases/shop/sql:query \
   -H 'content-type: application/json' -d '{"sql": "SELECT COUNT(*) FROM orders"}'
 ```
 
-The token's claims name the account, and row-level security policies read them with `SPRIG_CLAIM`. A refused token gets 401 with 1045; the reason is in the audit log. See [Logins with identity provider tokens](../security/external-tokens.md#rest-and-grpc).
+The token's claims name the account, and row-level security policies read them with `SPRIG_CLAIM`. A refused token gets 401 with 1045; the reason is in the audit log.
+
+A client that can only send HTTP Basic can send the token as the password of an account with the `token` login method: `curl -u "acme.billing:$TOKEN" ...`. The login name names the account, the token's user mapping must name the same one, and the request gets the token's claims and token roles as with `Bearer`. See [Logins with identity provider tokens](../security/external-tokens.md#rest-and-grpc).
 
 ## Run SQL
 

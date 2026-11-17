@@ -725,6 +725,14 @@ async fn run_inner(c: &mut Conn, name: &str, body: &Document) -> Result<Document
             return Err(e);
         }
     };
+    // A hinted read without a sort of its own comes back in the index's
+    // order, as MongoDB's index scan returns it.
+    let ordered = if hint.is_some() {
+        hinted_order(&engine, &mut s, name, body, &db).await
+    } else {
+        None
+    };
+    let run_body = ordered.as_ref().unwrap_or(body);
     // The workload store (`Fingerprinter::mongo`).
     let wl = super::workload::start(&c.shared.engine, &mut s, tenant, name, body, &db).await;
     let started = Instant::now();
@@ -739,14 +747,14 @@ async fn run_inner(c: &mut Conn, name: &str, body: &Document) -> Result<Document
                 loop {
                     let r = match (&lsid, txn_number) {
                         (Some(l), Some(n)) if super::retry::applies(name, body) => {
-                            Box::pin(super::retry::run(c, &mut s, name, body, &db, l, n)).await
+                            Box::pin(super::retry::run(c, &mut s, name, run_body, &db, l, n)).await
                         }
                         _ => {
                             // MongoDB 9.0's per-operation memory limit.
                             let mem = c.shared.settings().max_operation_memory_bytes;
                             sprig_doc::opmem::scope(
                                 mem,
-                                Box::pin(exec(c, &mut s, name, body, &db, lsid.as_deref())),
+                                Box::pin(exec(c, &mut s, name, run_body, &db, lsid.as_deref())),
                             )
                             .await
                         }
@@ -845,6 +853,106 @@ async fn hint_for(
         }
     }
     Ok(None)
+}
+
+/// Stages that must come first in a pipeline, or that order their own
+/// output: a hint's index order is not added in front of them.
+const SOURCE_STAGES: &[&str] = &[
+    "$geoNear",
+    "$search",
+    "$searchMeta",
+    "$vectorSearch",
+    "$collStats",
+    "$indexStats",
+    "$changeStream",
+    "$documents",
+    "$currentOp",
+    "$listSessions",
+    "$listLocalSessions",
+    "$planCacheStats",
+    "$listSearchIndexes",
+    "$sort",
+];
+
+/// A hinted `find` or `aggregate` that doesn't sort: the command with the
+/// hinted index's key pattern as its order (`find`'s `sort`, or a `$sort`
+/// after the pipeline's leading `$match` stages). MongoDB returns such a
+/// read in index order because it scans the index; MariaDB's `FORCE
+/// INDEX` doesn't promise an order. `None` when nothing changes: no
+/// pattern of plain ascending and descending keys, a sort of its own, a
+/// `$text` match, or a source stage first.
+async fn hinted_order(
+    engine: &sprig_doc::engine::Engine,
+    s: &mut super::sql::SqlSession,
+    name: &str,
+    body: &Document,
+    db: &str,
+) -> Option<Document> {
+    if !matches!(name, "find" | "aggregate") {
+        return None;
+    }
+    let keys = match body.get("hint")? {
+        Bson::Document(k) => k.clone(),
+        Bson::String(n) => {
+            let ns = Ns {
+                db: db.to_owned(),
+                coll: body.get_str(name).ok()?.to_owned(),
+            };
+            let m = engine.meta(s, &ns).await.ok()??;
+            if n == "_id_" {
+                doc! {"_id": 1}
+            } else {
+                m.indexes.iter().find(|i| i.name == *n)?.key_doc()
+            }
+        }
+        _ => return None,
+    };
+    with_index_order(name, body, keys)
+}
+
+/// [`hinted_order`] once the hint's key pattern is known.
+fn with_index_order(name: &str, body: &Document, keys: Document) -> Option<Document> {
+    let plain = |v: &Bson| matches!(as_i64(v), Some(1 | -1));
+    if keys.is_empty() || keys.keys().any(|k| k.starts_with('$')) || !keys.values().all(plain) {
+        return None;
+    }
+    // `$text` orders by score and `$near` by distance.
+    let has_text = |f: &Document| {
+        f.contains_key("$text")
+            || f.values().any(|v| {
+                v.as_document()
+                    .is_some_and(|d| d.contains_key("$near") || d.contains_key("$nearSphere"))
+            })
+    };
+    let mut out = body.clone();
+    if name == "find" {
+        if body.get_document("sort").is_ok_and(|d| !d.is_empty())
+            || body.get_document("filter").is_ok_and(has_text)
+        {
+            return None;
+        }
+        out.insert("sort", keys);
+        return Some(out);
+    }
+    let pipeline = body.get_array("pipeline").ok()?;
+    let mut at = 0;
+    for st in pipeline {
+        let st = st.as_document()?;
+        match st.get_document("$match") {
+            Ok(f) if has_text(f) => return None,
+            Ok(_) => at += 1,
+            Err(_) => break,
+        }
+    }
+    if let Some(next) = pipeline.get(at).and_then(Bson::as_document)
+        && next.keys().any(|k| SOURCE_STAGES.contains(&k.as_str()))
+    {
+        return None;
+    }
+    let mut p = pipeline.clone();
+    p.insert(at, Bson::Document(doc! {"$sort": keys}));
+    out.insert("pipeline", p);
+    Some(out)
 }
 
 /// A read at a snapshot (`snapshot`): on the snapshot's own executor
@@ -2080,4 +2188,51 @@ async fn explain(
 /// Codes not in the shared table.
 mod code {
     pub(crate) use sprig_proto_mongo::errors::code::*;
+}
+
+#[cfg(test)]
+mod hint_order_tests {
+    use super::*;
+
+    #[test]
+    fn a_hinted_read_without_a_sort_takes_the_index_order() {
+        let k = doc! {"qty": -1, "name": -1};
+        // aggregate: a `$sort` after the leading `$match` stages.
+        let b = doc! {"aggregate": "c", "pipeline": [{"$match": {}}, {"$project": {"a": 1}}], "hint": k.clone()};
+        let o = with_index_order("aggregate", &b, k.clone()).unwrap();
+        assert_eq!(
+            o.get_array("pipeline").unwrap()[1],
+            Bson::Document(doc! {"$sort": {"qty": -1, "name": -1}})
+        );
+        let empty = doc! {"aggregate": "c", "pipeline": [], "hint": k.clone()};
+        assert_eq!(
+            with_index_order("aggregate", &empty, k.clone())
+                .unwrap()
+                .get_array("pipeline")
+                .unwrap()
+                .len(),
+            1
+        );
+        // find: the pattern becomes the sort.
+        let f = doc! {"find": "c", "filter": {}, "hint": k.clone()};
+        assert_eq!(
+            with_index_order("find", &f, k.clone())
+                .unwrap()
+                .get_document("sort")
+                .unwrap(),
+            &k
+        );
+        // Left alone: a sort of its own, `$text`, a source stage, other key types.
+        let sorted = doc! {"aggregate": "c", "pipeline": [{"$match": {}}, {"$sort": {"a": 1}}]};
+        assert!(with_index_order("aggregate", &sorted, k.clone()).is_none());
+        let text = doc! {"aggregate": "c", "pipeline": [{"$match": {"$text": {"$search": "x"}}}]};
+        assert!(with_index_order("aggregate", &text, k.clone()).is_none());
+        let geo = doc! {"aggregate": "c", "pipeline": [{"$geoNear": {}}]};
+        assert!(with_index_order("aggregate", &geo, k.clone()).is_none());
+        let fs = doc! {"find": "c", "sort": {"a": 1}};
+        assert!(with_index_order("find", &fs, k.clone()).is_none());
+        assert!(with_index_order("find", &f, doc! {"a": "hashed"}).is_none());
+        assert!(with_index_order("find", &f, doc! {"$natural": 1}).is_none());
+        assert!(with_index_order("count", &f, k).is_none());
+    }
 }

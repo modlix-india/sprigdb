@@ -136,8 +136,32 @@ The update and the record commit together. If the transaction rolls back, nothin
 - Without a column list, two values mean `(key, value)` and three mean `(key, value, headers)`.
 - `ts` and `partition_no` are optional. Without `ts`, the record gets the time of the insert.
 - Publishing needs `INSERT` on the stream or its database.
-- A driver's prepared statement such as `INSERT INTO order_events (key, value) VALUES (?, ?)` works too; the size limit is checked on the values bound at each execute.
+- Prepared statements work too, whether a driver prepares `INSERT INTO order_events (key, value) VALUES (?, ?)` or you use SQL's `PREPARE`, `EXECUTE ... USING` and `EXECUTE IMMEDIATE` (below). Each execute publishes one record per row, and the size limit is checked on the values of each execute.
 - Values that aren't literals, such as function calls or an `INSERT ... SELECT`, are computed by a `SELECT` first, so such a publish costs one more round trip.
+
+With SQL's own prepared statements:
+
+```sql test
+PREPARE pub FROM 'INSERT INTO order_events (key, value) VALUES (?, ?)';
+SET @k = '7101', @v = JSON_OBJECT('type', 'order.created', 'order_id', 7101);
+EXECUTE pub USING @k, @v;
+EXECUTE pub USING '7102', JSON_OBJECT('type', 'order.created', 'order_id', 7102);
+DEALLOCATE PREPARE pub;
+EXECUTE IMMEDIATE 'INSERT INTO order_events (key, value) VALUES (?, ?)'
+  USING '7103', JSON_OBJECT('type', 'order.created', 'order_id', 7103);
+DO SLEEP(3);
+SELECT CAST(key AS CHAR) AS k, CAST(value AS CHAR) AS v FROM order_events
+WHERE key IN ('7101', '7102', '7103') ORDER BY k;
+```
+
+```text output
+k	v
+7101	{"type": "order.created", "order_id": 7101}
+7102	{"type": "order.created", "order_id": 7102}
+7103	{"type": "order.created", "order_id": 7103}
+```
+
+The text to prepare can be a literal or a variable. A wrong number of values fails with 1210, as in MariaDB.
 
 A stream is append-only:
 

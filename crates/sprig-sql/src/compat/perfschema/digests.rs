@@ -124,22 +124,26 @@ fn row(cols: &str, values: &[(&str, String)]) -> String {
 /// The alias of the digests' `JSON_TABLE`.
 const DG: &str = "`_sprig_dg`";
 
+/// Bytes of JSON the digests' literal may hold. Quoting it as an SQL
+/// string at most doubles it, so the statement stays under MariaDB's
+/// default `max_allowed_packet` of 16 MiB. Ten thousand digests with
+/// texts near [`MAX_DIGEST_TEXT`] (the document engine's statements are
+/// that long) passed it, and the read failed with 1153.
+pub(super) const MAX_DIGEST_JSON: usize = 6 << 20;
+
 /// The digests as one `JSON_TABLE` over a single string literal: the
 /// statement stays small and quick to parse whatever the number of
 /// digests (a `UNION ALL` of one `SELECT` per digest took the gateway and
 /// MariaDB seconds at a few thousand, and passed `max_allowed_packet` at
-/// about ten thousand). At most [`MAX_DIGEST_ROWS`], the most recently
-/// seen; texts cut at [`MAX_DIGEST_TEXT`] bytes.
+/// about ten thousand). At most [`MAX_DIGEST_ROWS`] and
+/// [`MAX_DIGEST_JSON`] bytes, the most recently seen first; texts cut at
+/// [`MAX_DIGEST_TEXT`] bytes.
 fn digest_table(digests: &[&PsDigest], nbe: bool) -> String {
     let mut ds: Vec<&PsDigest> = digests.to_vec();
-    if ds.len() > MAX_DIGEST_ROWS {
-        ds.sort_by(|a, b| b.last_seen_us.cmp(&a.last_seen_us));
-        ds.truncate(MAX_DIGEST_ROWS);
-    }
-    let rows: Vec<serde_json::Value> = ds
-        .iter()
-        .map(|d| {
-            serde_json::json!({
+    ds.sort_by(|a, b| b.last_seen_us.cmp(&a.last_seen_us));
+    ds.truncate(MAX_DIGEST_ROWS);
+    let rows = ds.iter().map(|d| {
+        serde_json::json!({
                 "s": d.schema,
                 "d": d.digest,
                 "t": capped_text(&d.text),
@@ -157,10 +161,20 @@ fn digest_table(digests: &[&PsDigest], nbe: bool) -> String {
                 "q95": ps(d.p95_us),
                 "q99": ps(d.p99_us),
                 "q999": ps(d.p999_us),
-            })
         })
-        .collect();
-    let json = serde_json::Value::Array(rows).to_string();
+        .to_string()
+    });
+    let mut json = String::from("[");
+    for r in rows {
+        if json.len() + r.len() + 2 > MAX_DIGEST_JSON {
+            break;
+        }
+        if json.len() > 1 {
+            json.push(',');
+        }
+        json.push_str(&r);
+    }
+    json.push(']');
     let num = |k: &str| format!("{k} DECIMAL(20,0) PATH '$.{k}'");
     let mut cols = vec![
         "s VARCHAR(64) PATH '$.s'".to_owned(),
