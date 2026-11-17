@@ -1578,14 +1578,23 @@ mod tests {
         let w = skipped_warning(&found).unwrap();
         assert_eq!((w.level, w.code), ("Warning", 39827));
         assert!(
-            w.message.starts_with("RETRIEVE(d.kb): no keyword list: its shard has more than 1000 chunks"),
+            w.message.starts_with(
+                "RETRIEVE(d.kb): no keyword list: its shard has more than 1000 chunks"
+            ),
             "{}",
             w.message
         );
         found.shards = 3;
         found.keyword_skipped = 2;
         let w = skipped_warning(&found).unwrap();
-        assert!(w.message.contains("2 of its 3 shards have more than 1000"), "{}", w.message);
-        assert!(w.message.ends_with("the hits come from the vector list alone"));
+        assert!(
+            w.message.contains("2 of its 3 shards have more than 1000"),
+            "{}",
+            w.message
+        );
+        assert!(
+            w.message
+                .ends_with("the hits come from the vector list alone")
+        );
     }
 }

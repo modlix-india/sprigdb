@@ -474,11 +474,7 @@ async fn chunk_tables_both(
 }
 
 /// The index's states seen over `secs` seconds, and its rows indexed then.
-async fn states_for(
-    c: &mut mysql_async::Conn,
-    index: &str,
-    secs: u64,
-) -> (BTreeSet<String>, u64) {
+async fn states_for(c: &mut mysql_async::Conn, index: &str, secs: u64) -> (BTreeSet<String>, u64) {
     let mut states = BTreeSet::new();
     let t = Instant::now();
     while t.elapsed() < Duration::from_secs(secs) {
@@ -1267,7 +1263,11 @@ async fn retrieval_indexes_end_to_end() {
                 )
             })
             .collect();
-        must(&mut c, &format!("INSERT INTO crowd VALUES {}", v.join(", "))).await;
+        must(
+            &mut c,
+            &format!("INSERT INTO crowd VALUES {}", v.join(", ")),
+        )
+        .await;
     }
     must(&mut c, "CREATE RETRIEVAL INDEX kbc ON crowd (body)").await;
     let filled = wait_ready(&mut c, "kbc", Duration::from_secs(400)).await;
@@ -1283,7 +1283,11 @@ async fn retrieval_indexes_end_to_end() {
         "CREATE USER 'rxcrowd'@'%' IDENTIFIED BY 'Rx-crowd-Passw0rd'",
     )
     .await;
-    must(&mut c, &format!("GRANT SELECT ON {DB}.crowd TO 'rxcrowd'@'%'")).await;
+    must(
+        &mut c,
+        &format!("GRANT SELECT ON {DB}.crowd TO 'rxcrowd'@'%'"),
+    )
+    .await;
     must(
         &mut c,
         "CREATE POLICY crowd_alice ON crowd FOR SELECT TO rxcrowd USING (owner = 'alice')",
@@ -1300,9 +1304,9 @@ async fn retrieval_indexes_end_to_end() {
         count == 1
             && shown.len() == 1
             && shown[0].0 == 39827
-            && shown[0]
-                .1
-                .starts_with("RETRIEVE(rx_live.kbc): no keyword list: its shard has more than 1000"),
+            && shown[0].1.starts_with(
+                "RETRIEVE(rx_live.kbc): no keyword list: its shard has more than 1000",
+            ),
         || format!("{count} {shown:?}"),
     );
     ck.ok(
@@ -1701,7 +1705,7 @@ async fn retrieval_indexes_end_to_end() {
             ck.ok("the group was re-keyed", rekeyed, || rk.clone());
             // The new shards get no chunks from the mover, so the worker
             // fills them again: every row embedded once more.
-            let at_cutover = chunk_tables_both(b1, b2, id).await;
+            let after_job = chunk_tables_both(b1, b2, id).await;
             let t = Instant::now();
             let mut ready_in = None;
             while t.elapsed() < Duration::from_secs(300) {
@@ -1715,7 +1719,7 @@ async fn retrieval_indexes_end_to_end() {
             }
             let rows_after = state(&mut c, "kb2").await.1;
             eprintln!(
-                "     re-key: chunk tables {old:?} → at the cutover {at_cutover:?}, states {states:?}, ready again in {:?}, rows indexed {rows_before} → {rows_after}",
+                "     re-key: chunk tables {old:?} → when the job ended {after_job:?}, states {states:?}, ready again in {:?}, rows indexed {rows_before} → {rows_after}",
                 ready_in.map(|d| d.as_millis())
             );
             // Chunks the mover had copied would be checked, not embedded
@@ -1771,9 +1775,11 @@ async fn retrieval_indexes_end_to_end() {
                 "     re-key: old chunk tables left {left} after {} s; now {now:?}; away/wrong rk/orphans {m1:?} {m2:?}",
                 t.elapsed().as_secs()
             );
-            ck.ok("the old shards' chunk tables are dropped", left == 0, || {
-                format!("{left} left: {now:?}")
-            });
+            ck.ok(
+                "the old shards' chunk tables are dropped",
+                left == 0,
+                || format!("{left} left: {now:?}"),
+            );
             ck.ok(
                 "the new shards hold every row's chunks, next to the row",
                 now.len() >= 2

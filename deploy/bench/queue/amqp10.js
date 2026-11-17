@@ -1,5 +1,5 @@
 // AMQP 1.0 checks with rhea: 20 messages sent to /queues/<queue> and settled
-// (accepted), received in order with manual accepts, application properties
+// (accepted), received with manual accepts (the order is recorded), application properties
 // kept, and a released message delivered again. Prints one JSON object of
 // observations; amqp10.sh runs it against a reference and the target and
 // compares them. The queue must exist (amqp10.sh declares it over 0-9-1).
@@ -32,7 +32,7 @@ function receive() {
     ctx.delivery.accept();
     if (got.length === N) {
       out.received = got.length;
-      out.received_in_order = got.join(',') === Array.from({ length: N }, (_, i) => `m${i}`).join(',');
+      out.order = got.join(',');
       out.release_redelivered = got.filter((x) => x === 'm3').length === 1;
       out.properties_kept = props.every((p, k) => p === +got[k].slice(1));
       out.done = true;
