@@ -198,8 +198,9 @@ fn trigger_arg(b: &Bound, event: &str) -> String {
 }
 
 /// A validation's `BEFORE` trigger (created in the default `sql_mode`):
-/// one `CALL` of the entry procedure, then `SIGNAL 39863` for a `reject`
-/// or `error` event.
+/// one `CALL` of the entry procedure under the wall budget `budget_ms`
+/// (or the client's `max_statement_time` when that is less), then `SIGNAL
+/// 39863` for a `reject` or `error` event.
 #[must_use]
 pub fn validation_trigger(
     schema: &str,
@@ -208,14 +209,17 @@ pub fn validation_trigger(
     event: &str,
     entry: &str,
     bound: &[Bound],
+    budget_ms: u64,
 ) -> String {
     let mut args: Vec<String> = bound.iter().map(|b| trigger_arg(b, event)).collect();
     args.push("v__event".into());
     args.push("v__result".into());
+    let (budget, lower) = crate::deploy::budget_lines(budget_ms);
     format!(
         "CREATE OR REPLACE TRIGGER {}.{} BEFORE {} ON {}.{} FOR EACH ROW\n\
          BEGIN\n  DECLARE v__event VARCHAR(64);\n  DECLARE v__result LONGTEXT;\n  DECLARE v__msg VARCHAR(128);\n  \
-         CALL {}({});\n  IF v__event IN ('reject', 'error') THEN\n    \
+         {budget}\n  {lower}\n  \
+         SET STATEMENT max_statement_time = v__budget FOR CALL {}({});\n  IF v__event IN ('reject', 'error') THEN\n    \
          SET v__msg = LEFT(COALESCE(JSON_VALUE(v__result, '$.message'), {}), 128);\n    \
          SIGNAL SQLSTATE 'HY000' SET MYSQL_ERRNO = {}, MESSAGE_TEXT = v__msg;\n  END IF;\nEND",
         bq(schema),
@@ -572,11 +576,13 @@ mod tests {
                 Bound::Old("status".into()),
                 Bound::Op,
             ],
+            300,
         );
         assert!(t.contains("BEFORE UPDATE ON `t1_d1_g1_s1`.`orders`"), "{t}");
+        assert!(t.contains("DECLARE v__budget DOUBLE DEFAULT 0.3;"), "{t}");
         assert!(
             t.contains(
-                "CALL `__sprig_l31_v2`(NEW.`total`, OLD.`status`, 'update', v__event, v__result);"
+                "SET STATEMENT max_statement_time = v__budget FOR CALL `__sprig_l31_v2`(NEW.`total`, OLD.`status`, 'update', v__event, v__result);"
             ),
             "{t}"
         );

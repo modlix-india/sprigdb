@@ -246,13 +246,28 @@ pub fn group_env_with(
     server_id_base: u32,
     drain: Option<Arc<dyn crate::io::PreparedDrain>>,
 ) -> Result<JobEnv> {
+    group_env_inner(src, tgt, rec, route, store, server_id_base, |s| {
+        s.with_drain(drain)
+    })
+}
+
+/// [`group_env_with`], the source finished by `source`.
+fn group_env_inner(
+    src: ClusterAccess,
+    tgt: ClusterAccess,
+    rec: &JobRecord,
+    route: crate::route::ShardRoute,
+    store: Arc<dyn sprig_meta::MetaStore>,
+    server_id_base: u32,
+    source: impl FnOnce(MysqlSource) -> MysqlSource,
+) -> Result<JobEnv> {
     let schemas: Vec<String> = rec
         .spec
         .sources
         .iter()
         .flat_map(|s| s.schemas.iter().cloned())
         .collect();
-    let source = Arc::new(
+    let source = Arc::new(source(
         MysqlSource::new(
             src,
             rec.job_id,
@@ -262,9 +277,8 @@ pub fn group_env_with(
             server_id(server_id_base, rec.job_id),
             false,
         )
-        .with_drain(drain)
         .with_rekey(route.rekey.is_some()),
-    );
+    ));
     let target = Arc::new(
         MysqlTarget::new(tgt, rec.job_id, None, source.clone()).with_route(Arc::new(route)),
     );
@@ -298,6 +312,9 @@ pub struct MysqlEnvFactory {
     /// Tenants' catalog setting rows: set by
     /// [`Self::with_tenant_rows`].
     tenant_rows: Option<Arc<dyn crate::settings::TenantRows>>,
+    /// Relay leases, for tenants on Sprig 2PC's relay path: set by
+    /// [`Self::with_relays`].
+    relays: Option<sprig_cluster::failover::relay_pools::TenantRelays>,
 }
 
 impl std::fmt::Debug for MysqlEnvFactory {
@@ -321,7 +338,19 @@ impl MysqlEnvFactory {
             drain: None,
             live: None,
             tenant_rows: None,
+            relays: None,
         }
+    }
+
+    /// A tenant on Sprig 2PC's relay path has its source fenced through
+    /// the cluster's relay writer, found with `relays`.
+    #[must_use]
+    pub fn with_relays(
+        mut self,
+        relays: sprig_cluster::failover::relay_pools::TenantRelays,
+    ) -> Self {
+        self.relays = Some(relays);
+        self
     }
 
     /// Resolves each job's `mover.*` settings from `live` (the worker's
@@ -414,14 +443,15 @@ impl EnvFactory for MysqlEnvFactory {
             let store = self.group_store.clone().ok_or_else(|| {
                 SprigError::internal("this worker has no shard-map store for hash-range jobs")
             })?;
-            return group_env_with(
+            let (drain, relays) = (self.drain.clone(), self.relays.clone());
+            return group_env_inner(
                 src,
                 tgt,
                 rec,
                 route,
                 store,
                 self.settings(rec).server_id_base,
-                self.drain.clone(),
+                |s| s.with_drain(drain).with_relays(relays),
             );
         }
         let source = Arc::new(
@@ -434,7 +464,8 @@ impl EnvFactory for MysqlEnvFactory {
                 server_id(self.settings(rec).server_id_base, rec.job_id),
                 swap.is_some(),
             )
-            .with_drain(self.drain.clone()),
+            .with_drain(self.drain.clone())
+            .with_relays(self.relays.clone()),
         );
         let mut target = MysqlTarget::new(tgt, rec.job_id, swap, source.clone());
         if rec.spec.cutover == crate::api::CutoverMode::Continuous {

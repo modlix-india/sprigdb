@@ -131,7 +131,7 @@ The stream:
 | `usage` | `usage` | Tokens of one model call |
 | `sources` | `sources: [{kind, title, reference}]` | What the answer drew on: docs pages, tables, queries |
 | `error` | `error: {code, name, message}` | The turn failed, or the model refused (39994) |
-| `end` | `stop` | The turn ended: `end_turn`, `max_tokens`, `refusal` or `other` (`detail` says `max_tool_rounds` or `stopped`) |
+| `end` | `stop`, `message_id` | The turn ended: `end_turn`, `max_tokens`, `refusal` or `other` (`detail` says `max_tool_rounds` or `stopped`). `message_id` is the stored answer's id, the one to rate with `POST /v1/ai/feedback` (an administration conversation's starts with `a`). It is missing when nothing was stored |
 
 Closing the connection stops the turn.
 
@@ -277,7 +277,7 @@ A chart spec is JSON text:
 | `datePart` | `year`, `quarter`, `month`, `week`, `day`, `hour` or `exact` |
 | `sort`, `top`, `stack`, `format` | `{by, dir: asc\|desc}`, a positive number, `none`, `stack` or `percent`, and display formats |
 
-Every field must be a column the query returns (unless it selects `*`), and unknown keys, marks, aggregations and date parts are refused, so the assistant fixes the spec before you see it. It picks the mark with Show Me's rules of thumb: a date and measures, a line; one dimension and one measure, bars; two measures, points; one measure alone, a KPI; two dimensions and a measure, a heatmap; parts of a whole with five or fewer categories, a pie.
+Every field must be a column the query returns (unless it selects `*`), and unknown keys, marks, aggregations and date parts are refused, so the assistant fixes the spec before you see it. It picks the mark with Show Me's rules of thumb: a date and measures, a line; one dimension and one measure, bars; two measures, points; one measure alone, a KPI; two dimensions and a measure, a heatmap; parts of a whole with five or fewer categories, a pie; a latitude and a longitude field, a [point map](dashboards.md#maps). As in Studio, a place name alone, such as `country`, doesn't make a map: the next rule applies, and a `map-filled` tile is refused because filled maps aren't drawn yet.
 
 ## ASK in SQL
 
@@ -404,6 +404,8 @@ POST /v1/ai/feedback
 {"message_id": "42", "vote": "down", "note": "use net revenue"}
 {"proposal_id": "0193…", "outcome": "accepted"}
 ```
+
+An answer's `message_id` is on the `end` line of its stream, and on its `assistant` message when you read the conversation back.
 
 Rate an answer up or down with an optional note (up to 500 characters), or report what became of a proposal: `accepted`, `dismissed` or `failed`. You can rate only your own conversations, administration ones included. The latest 20 outcomes and notes in the tenant are added to every `dba` and `data` prompt: the proposal's kind and a short label, and your note, never an answer's text. Feedback changes prompts, never a model.
 

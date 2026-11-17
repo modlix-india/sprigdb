@@ -61,7 +61,7 @@ pub use coordinator::{
 pub use decision::{Decision, DecisionRow};
 pub use locate::{GroupSchemas, MapLocator};
 pub use redo::{RedoBranch, RedoStmt, Replay};
-pub use resolver::{DrainReport, RedoReport, Resolver, ScanReport, SweepReport};
+pub use resolver::{DrainReport, RedoGuard, RedoReport, Resolver, ScanReport, SweepReport};
 pub use settings::{NonXaPolicy, ResolverConfig, TxnConfig};
 /// The map stores a [`MapLocator`] reads (for roles that build one without
 /// depending on `sprig-shard` themselves).

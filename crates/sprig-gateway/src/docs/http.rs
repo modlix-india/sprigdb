@@ -120,7 +120,10 @@ pub async fn page(core: &Arc<Core>, info: &ConnInfo, req: Request<Incoming>) -> 
 ///
 /// # Errors
 /// A path that isn't under [`PAGES`].
-pub fn page_request(path: &str, query: Option<&str>) -> Result<(String, Option<String>), SprigError> {
+pub fn page_request(
+    path: &str,
+    query: Option<&str>,
+) -> Result<(String, Option<String>), SprigError> {
     let page = path
         .strip_prefix(PAGES)
         .filter(|r| r.is_empty() || r.starts_with('/'))

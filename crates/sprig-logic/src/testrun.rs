@@ -964,14 +964,24 @@ impl Loaded {
     /// 39861 for source the runtime refuses; 39876 for a runtime the
     /// engine tier lacks.
     pub fn program(&self) -> Result<sprig_logic_js::Program> {
-        // A JavaScript validation or after-commit trigger is compiled
-        // by name: its recorded parameters are the columns it reads, but
-        // its code takes the row by name (`row`, `old`, `ctx`, ...).
+        // A JavaScript or Lua validation or after-commit trigger is
+        // compiled by name: its recorded parameters are the columns it
+        // reads, but its code takes the row by name (`row`, `old`, `ctx`,
+        // ...) or `ctx`.
         let sig = if self.runtime == "javascript"
             && matches!(self.kind.as_str(), "validation" | "trigger")
             && self.tier == "mariadb"
         {
             js_row_sig(&self.source)
+        } else if self.runtime == "lua"
+            && matches!(self.kind.as_str(), "validation" | "trigger")
+            && self.tier == "mariadb"
+        {
+            // A Lua one takes `ctx` (`ctx.row`, `ctx.old`, `ctx.trigger`).
+            sprig_logic_js::ScriptSig {
+                params: vec![("ctx".to_owned(), sprig_logic_js::ParamTy::Json)],
+                scalar: false,
+            }
         } else {
             crate::invoke::script_sig(&self.signature)
         };
@@ -1082,6 +1092,30 @@ pub fn draft(
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn a_compiled_lua_validation_tests_with_ctx() {
+        let l = Loaded {
+            module_id: 1,
+            version: 1,
+            name: "ship".into(),
+            kind: "validation".into(),
+            runtime: "lua".into(),
+            tier: "mariadb".into(),
+            source: "if ctx.old ~= sprig.null and ctx.old.total ~= ctx.row.total then \
+                     sprig.reject('no') end"
+                .into(),
+            signature: json!({"params": [{"name": "old_total", "type": "f64"},
+                                         {"name": "total", "type": "f64"},
+                                         {"name": "op", "type": "str"}]}),
+        };
+        let p = l.program().unwrap();
+        assert!(p.coerce("ship", vec![json!({"row": {}})]).is_ok());
+        assert!(
+            p.coerce("ship", vec![json!(1), json!(2), json!("x")])
+                .is_err()
+        );
+    }
 
     #[test]
     fn sql_form() {

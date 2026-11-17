@@ -46,7 +46,9 @@ Without it, any call fails with 39991 `ER_SPRIG_AI_DISABLED`.
 
 ```sql test-error
 SELECT AI_EMBED('red running shoes');  -- 39991 while ai.functions.enabled is off
-``` It is separate from `ai.enabled`, which turns on the assistants.
+```
+
+It is separate from `ai.enabled`, which turns on the assistants.
 
 - **`AI_EMBED` with the bundled model** (`local:bge-small`, the default) runs inside the gateway. Nothing is sent anywhere, no budget is spent, and `ai.share_data` doesn't matter.
 - **Every other call goes to a provider**, so the values in it leave SprigDB. That needs `ai.share_data` on for every database the statement names, and for the session's database (the tenant's value when it names none). Otherwise the statement fails with 39995 `ER_SPRIG_AI_EGRESS_DENIED` before anything is sent.
@@ -54,23 +56,68 @@ SELECT AI_EMBED('red running shoes');  -- 39991 while ai.functions.enabled is of
 
 ## Where they can stand
 
-- **With a literal input** (a string, a number or `NULL`), a call can stand anywhere: in `WHERE`, `ORDER BY`, `INSERT … VALUES`, `UPDATE … SET`. SprigDB answers it before the statement runs and puts the answer in its place.
-- **Over row values** (a column, or an expression of columns), a call must be a whole item of the outermost `SELECT` list, with or without an alias. SprigDB runs the statement with the call's input in that column, reads the rows, answers all their inputs at once, and returns the rows with the answers in that column. Everything else about the statement applies as usual: privileges, row-level security, sharding and the transaction. So a function only ever sees values you can read.
+**With a literal input** (a string, a number or `NULL`), a call can stand anywhere: in `WHERE`, `ORDER BY`, `INSERT … VALUES`, `UPDATE … SET`. SprigDB answers it before the statement runs and puts the answer in its place.
 
-These are refused with 1235, since the statement would act on the inputs rather than the answers:
+**Over row values** (a column, or an expression of columns), a call can stand in these places of the outermost statement:
 
-- a call over row values anywhere else: in `WHERE`, inside another expression, in a subquery, in `INSERT … SELECT` or `UPDATE … SET`;
-- with `SELECT DISTINCT`, `UNION`, `EXCEPT`, `INTERSECT` or `SELECT … INTO`;
-- when `GROUP BY`, `HAVING`, `ORDER BY` or `WINDOW` names the call's column, by alias or by position.
+- the `SELECT` list, as a whole item or inside any expression;
+- the `WHERE` clause of a `SELECT`;
+- the `ORDER BY` of a `SELECT`;
+- the `SET` values of a single-table `UPDATE`, alone or inside an expression.
 
-To filter or sort on an answer, select it and filter in your application, or store it first (for embeddings, use an [embedded column](search-and-vectors.md)).
+```sql
+-- Filter on an answer.
+SELECT id, title FROM tickets
+WHERE created_at > NOW() - INTERVAL 1 DAY
+  AND AI_CLASSIFY(body, 'bug', 'feature request', 'question') = 'bug';
+
+-- Use an answer inside an expression, sort on it, count with it.
+SELECT id, UPPER(AI_CLASSIFY(body, 'bug', 'idea')) AS kind
+FROM tickets ORDER BY kind, id LIMIT 20;
+
+SELECT owner, SUM(AI_CLASSIFY(body, 'bug', 'idea') = 'bug') AS bugs
+FROM tickets GROUP BY owner;
+
+-- Store answers.
+UPDATE tickets
+SET gist = AI_SUMMARIZE(body, 25),
+    kind = COALESCE(AI_CLASSIFY(body, 'bug', 'idea'), 'none')
+WHERE gist IS NULL AND created_at > NOW() - INTERVAL 1 DAY;
+```
+
+How SprigDB runs them:
+
+- **A whole item of the `SELECT` list**, in a statement that doesn't sort, group or deduplicate on it, is answered in its column: SprigDB runs the statement with the call's input in that column, reads the rows, answers all their inputs at once, and returns the rows with the answers in that column.
+- **Anywhere else**, SprigDB first reads the call's distinct inputs, answers them, then runs your statement with each call replaced by a lookup of its answers. The inputs it reads:
+  - for a call in `WHERE`, or inside an aggregate or window function such as `SUM(…)`, the rows of the `FROM` clause that pass the `WHERE` conditions joined to the call's condition by `AND`. A condition joined by `OR`, or the call's own, doesn't narrow them, so `WHERE id < 100 AND AI_CLASSIFY(…) = 'bug'` reads only the rows with `id < 100`, while `WHERE id < 100 OR AI_CLASSIFY(…) = 'bug'` reads every row;
+  - for a call in the `SELECT` list or `ORDER BY`, the rows the statement returns. `LIMIT` holds, unless the statement sorts on an answer or is `SELECT DISTINCT`: then every row before the `LIMIT` is read;
+  - for `UPDATE`, the rows its `WHERE`, `ORDER BY` and `LIMIT` match.
+- **Every read runs as you**, through your session: privileges, row-level security, sharding and your transaction apply as to your own statement. So a function only ever sees values you can read.
+- **An `UPDATE` reads its inputs with `SELECT … FOR UPDATE`, in the transaction it then runs in.** The rows it changes are the rows whose inputs were read, and they stay locked until the transaction ends, model calls included. Outside a transaction, SprigDB starts one for the statement and commits it after the `UPDATE`, or rolls it back if anything fails, so a failed call never leaves half the rows changed. Under row-level security, the read sees the rows your `SELECT` policies allow; the `UPDATE` changes those its `UPDATE` policies allow too.
+- **A `SELECT` outside a transaction** reads its inputs and runs in separate statements. A row whose input changed in between gets `NULL`, so a `WHERE` on it leaves the row out. Inside a transaction (`REPEATABLE READ`, the default) both see the same snapshot.
+
+These are refused with 1235:
+
+- a call over row values in a subquery or derived table, in `FROM` or a join condition, in `GROUP BY`, `HAVING` or `WINDOW`, or in an item that `GROUP BY`, `HAVING` or `WINDOW` names by alias or position;
+- with `UNION`, `EXCEPT`, `INTERSECT` or `SELECT … INTO`;
+- in an `UPDATE`'s `WHERE`, `ORDER BY` or `LIMIT`, so the rows it changes never depend on a model's answer, and in a multiple-table `UPDATE`;
+- in an `UPDATE` whose earlier assignment sets a column the call reads (`SET body = …, gist = AI_SUMMARIZE(body)`), since MariaDB would give it the new value;
+- in `DELETE`, `INSERT`, `REPLACE` (including `INSERT … SELECT`) and any other statement;
+- between two `*` items without an alias (`SELECT t.*, UPPER(AI_SUMMARIZE(b)), u.*`).
+
+```sql
+-- 1235: the rows a DELETE removes can't depend on a model's answer.
+DELETE FROM tickets WHERE AI_CLASSIFY(body, 'spam', 'ok') = 'spam';
+```
+
+To delete or copy on an answer, store it first with `UPDATE … SET`, then use the stored column. For embeddings, an [embedded column](search-and-vectors.md) keeps them up to date by itself.
 
 Other rules:
 
 - The arguments after the input must be literals (1210 otherwise). Calls don't nest (1210).
 - A wrong number of arguments fails with 1582. `AI_CLASSIFY` needs at least two labels, all different (1210). For `AI_CLASSIFY`, a last argument that names a model offered to the functions is the model; any other is a label.
 - They work in plain statements only, not in prepared ones (39051): run them with the text protocol.
-- A statement with calls over its rows may return at most 100,000 rows (39601); add a `LIMIT` or a narrower `WHERE`.
+- A statement with calls over its rows may return, or read the inputs of, at most 100,000 rows (39601); add a `LIMIT` or a narrower `WHERE`. An `UPDATE` with calls may change at most 100,000 rows; update in batches. The answers written into one statement may take at most 8 MiB (39601).
 - The five names are taken: an unqualified call is always the AI function, never a stored function of the same name. A qualified call (`db.ai_embed(…)`) is the stored function.
 
 ## Values
@@ -111,6 +158,7 @@ One statement may send at most `ai.functions.max_inputs` distinct inputs (10,000
 | 39993 `ER_SPRIG_AI_PROVIDER_ERROR` | The provider failed after retries (retryable) |
 | 39994 `ER_SPRIG_AI_REFUSED` | The model declined |
 | 39997 `ER_SPRIG_EMBEDDING_FAILED` | `AI_EMBED` names an alias `ai.embedding_models` doesn't list, or the bundled model couldn't be loaded on the gateway |
+| 39601 `ER_SPRIG_TRANSLATE_LIMIT` | More than 100,000 rows to return, read or change, or more than 8 MiB of answers in one statement |
 | 1210, 1582, 1235 | Wrong arguments, a wrong count, or a call where it can't stand |
 
 ## Audit and metrics

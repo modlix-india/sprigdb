@@ -37,7 +37,13 @@
 .chart-note { padding: 8px; margin: 0; }
 .chart-scroll { overflow: auto; block-size: 100%; }
 .map-wrap { position: relative; block-size: 100%; inline-size: 100%; }
-.map-box { position: absolute; inset: 0; border-radius: 4px; overflow: hidden; }
+/* MapLibre makes the box position: relative; it fills the tile by size. */
+.map-box { inline-size: 100%; block-size: 100%; border-radius: 4px; overflow: hidden; }
+/* The zoom buttons and attribution in the theme's colours. */
+.map-wrap .maplibregl-ctrl-group, .map-wrap .maplibregl-ctrl-attrib { background: var(--bg); color: var(--fg); }
+.map-wrap .maplibregl-ctrl-group button + button { border-block-start-color: var(--border); }
+.map-dark .maplibregl-ctrl-group button .maplibregl-ctrl-icon { filter: invert(1); }
+.map-dark .maplibregl-ctrl-attrib a { color: var(--fg); }
 .map-legend { position: absolute; inset-inline-start: 6px; inset-block-end: 6px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; max-inline-size: 60%; }
 .map-legend ul { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 2px 10px; }
 .map-legend i { display: inline-block; inline-size: 10px; block-size: 10px; border-radius: 50%; margin-inline-end: 4px; vertical-align: -1px; }

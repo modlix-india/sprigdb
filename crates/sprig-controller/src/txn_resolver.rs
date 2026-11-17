@@ -81,6 +81,36 @@ impl PoolSource for CtlPools {
     }
 }
 
+/// [`sprig_txn::RedoGuard`] for resolvers outside the relay fence (this
+/// loop's and the cutovers' drains): a held branch is finished directly
+/// only while no relay writer holds the cluster's relay lease. Without one
+/// nothing else writes a relayed tenant's rows (its accounts log in only
+/// through a relay, which admits nobody, and the other system writers go
+/// through the relay too), and a replay here and the next writer's
+/// start-up recovery are kept apart by the redo marker. Once a writer
+/// holds the lease, it owns the cluster's held branches. An unreadable
+/// lease counts as held.
+pub struct NoRelayLease(pub Arc<dyn sprig_meta::MetaStore>);
+
+impl std::fmt::Debug for NoRelayLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NoRelayLease").finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl sprig_txn::RedoGuard for NoRelayLease {
+    async fn may_finish(&self, cluster: &ClusterId) -> bool {
+        let Ok(k) = sprig_cluster::failover::relay::relay_lease_key(self.0.tier(), cluster) else {
+            return false;
+        };
+        matches!(
+            self.0.get(&k, sprig_meta::Consistency::Linearizable).await,
+            Ok(None)
+        )
+    }
+}
+
 /// Whether the resolver looks at a cluster in `state`: anything that may
 /// hold tenant data.
 #[must_use]
@@ -153,6 +183,8 @@ impl ResolverLoop {
             Arc::clone(&admin) as Arc<dyn sprig_txn::GroupSchemas>,
         );
         let mut me = Self::new(dc.clone(), registry, admin, Arc::new(locator), Some(live));
+        me.resolver
+            .set_redo_guard(Arc::new(NoRelayLease(Arc::clone(&stores.dc))));
         me.relays = Some(Arc::clone(&stores.dc));
         Ok(me)
     }

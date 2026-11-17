@@ -174,10 +174,23 @@ impl LookupHost for GwHost {
         Ok(c)
     }
 
+    /// Builds write the tenant's lookup rows: for a tenant on Sprig 2PC's
+    /// relay path, through the cluster's relay writer, so the relay fence
+    /// ends them with the tenant's own connections.
     async fn pools(&self, clusters: &[ClusterId]) -> Result<Pools> {
+        let dc = self.svc.locator.dc_store();
         let mut m = HashMap::new();
         for c in clusters {
-            m.insert(c.clone(), self.svc.locator.ctl_pool(c).await?);
+            let direct = self.svc.locator.ctl_pool(c).await?;
+            let pool = sprig_cluster::failover::relay_pools::tenant_pool(
+                &dc,
+                self.tenant,
+                c,
+                direct,
+                sprig_txn::fence::wire::preamble,
+            )
+            .await?;
+            m.insert(c.clone(), pool);
         }
         Ok(Arc::new(m))
     }

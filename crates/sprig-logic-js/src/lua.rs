@@ -46,7 +46,7 @@ use sprig_common::{Result, SprigCode, SprigError};
 
 use crate::bridge::Shape;
 use crate::budget::{Budget, Limits, RunState, copy};
-use crate::engine::{self, ScriptSig, SyncHost};
+use crate::engine::{self, ParamTy, ScriptSig, SyncHost};
 use crate::kirun::{Host, Outcome};
 use crate::messaging::MsgOp;
 
@@ -492,6 +492,16 @@ fn run_here(
         let mut a = Vec::with_capacity(args.len());
         for v in args {
             a.push(lua.to_value(v)?);
+        }
+        // A trigger's or a validation's own `ctx` (its parameter, which
+        // hides the global one) logs as the global `ctx` does.
+        if let (Some(LuaValue::Table(t)), [(n, ParamTy::Json)]) =
+            (a.first(), p.sig.params.as_slice())
+            && n == "ctx"
+            && t.raw_get::<LuaValue>("log")?.is_nil()
+            && let LuaValue::Table(gc) = lua.globals().get::<LuaValue>("ctx")?
+        {
+            t.raw_set("log", gc.raw_get::<LuaValue>("log")?)?;
         }
         let r: MultiValue = f.call(MultiValue::from_vec(a.clone()))?;
         let first = r.into_iter().next().unwrap_or(LuaValue::Nil);

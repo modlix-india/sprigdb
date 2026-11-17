@@ -85,6 +85,9 @@ impl sprig_logic::engine::bridge::DbBridge for LoggedDb {
     }
 }
 
+/// Where a compiled trigger keeps its log lines.
+const LOG_VAR: &str = sprig_logic::compiler::plsql::LOG_VAR;
+
 /// The marked statement's start.
 pub(crate) const MARK: &str = "/* sprig message trigger ";
 
@@ -910,6 +913,22 @@ impl PassSession {
                 self.trigger_stmt(cx, &format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}"))
                     .await?;
                 return Ok(false);
+            }
+            // The lines written before the error, as the engine tier
+            // keeps a failed run's: the entry keeps them in the variable as
+            // it goes, emptied when it starts.
+            if entry.log
+                && let Ok(mut got) = self
+                    .run_checked(cx, &format!("SELECT {LOG_VAR}"), false)
+                    .await
+                && let Some(Some(l)) = got.rows.pop().and_then(|r| r.into_iter().next())
+            {
+                let logged: Vec<String> = serde_json::from_slice(&l).unwrap_or_default();
+                let mut v = lines
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                v.extend(logged);
+                v.truncate(sprig_logic::engine::engine::MAX_LOG_LINES);
             }
             if matches!(n, 1969 | 3024) {
                 return Err(SprigError::new(

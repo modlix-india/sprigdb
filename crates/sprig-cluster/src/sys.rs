@@ -60,13 +60,37 @@ pub fn feed_time_ddl() -> String {
 /// the step stays. Rows past [`FEED_TIME_KEEP_SECONDS`] go. Creates the
 /// table on first use.
 ///
+/// `shared_domain` is a Galera cluster's `wsrep_gtid_domain_id` (with
+/// `wsrep_gtid_mode` on): the row keeps that domain alone, whose sequence
+/// numbers are the same on every node, so a feed reading any node can
+/// start there. The node's other domains hold its own local writes, never
+/// a tenant's; a start fills them in from the node it reads.
+///
 /// # Errors
 /// The statements' (a missing privilege on `__sprig_sys`).
-pub async fn feed_time_mark(session: &mut ProbeSession) -> Result<(), ProbeError> {
+pub async fn feed_time_mark(
+    session: &mut ProbeSession,
+    shared_domain: Option<u32>,
+) -> Result<(), ProbeError> {
     let t = feed_time_table();
+    let pos = match shared_domain {
+        None => "@@gtid_binlog_pos".to_owned(),
+        Some(d) => {
+            let all = session
+                .scalar("SELECT @@gtid_binlog_pos")
+                .await?
+                .unwrap_or_default();
+            let kept = domain_only(&all, d);
+            // Nothing written in the cluster's domain yet: no row.
+            if kept.is_empty() {
+                return Ok(());
+            }
+            crate::sql::literal(&kept)
+        }
+    };
     let mark = format!(
         "INSERT IGNORE INTO {t} (bucket, pos, written_at) SELECT UNIX_TIMESTAMP() DIV \
-         {FEED_TIME_STEP_SECONDS} * {FEED_TIME_STEP_SECONDS}, @@gtid_binlog_pos, \
+         {FEED_TIME_STEP_SECONDS} * {FEED_TIME_STEP_SECONDS}, {pos}, \
          UTC_TIMESTAMP(6) FROM DUAL WHERE @@GLOBAL.read_only = 0"
     );
     match session.exec(&mark).await {
@@ -82,6 +106,18 @@ pub async fn feed_time_mark(session: &mut ProbeSession) -> Result<(), ProbeError
              AND @@GLOBAL.read_only = 0 LIMIT 1000"
         ))
         .await
+}
+
+/// The GTIDs of domain `domain` in a `@@gtid_binlog_pos` value
+/// (`domain-server-seq`, comma-separated).
+#[must_use]
+pub fn domain_only(pos: &str, domain: u32) -> String {
+    let want = domain.to_string();
+    pos.split(',')
+        .map(str::trim)
+        .filter(|g| g.split('-').next() == Some(want.as_str()))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// A scratch object of a feature probe: `__sprig_sys.__sprig_probe_<suffix>`.
@@ -138,6 +174,12 @@ mod tests {
         assert_eq!(heartbeat_table(), "`__sprig_sys`.`__sprig_heartbeat`");
         assert_eq!(feed_time_table(), "`__sprig_sys`.`__sprig_feed_time`");
         assert!(feed_time_ddl().contains("bucket BIGINT UNSIGNED NOT NULL PRIMARY KEY"));
+        assert_eq!(
+            domain_only("0-3801-12, 38-3801-907,3802-3802-4", 38),
+            "38-3801-907"
+        );
+        assert_eq!(domain_only("0-1-5", 38), "");
+        assert_eq!(domain_only("", 38), "");
         assert_eq!(scratch("f"), "`__sprig_sys`.`__sprig_probe_f`");
         assert!(ddl()[0].contains("utf8mb4_bin"));
     }

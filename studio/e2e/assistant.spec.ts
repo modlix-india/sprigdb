@@ -318,7 +318,12 @@ test('entry points: palette, Explain this error, Ask for a query, docs', async (
   await page.getByRole('option', { name: 'Search docs: automatic indexing' }).click();
   const hit = page.getByTestId('docs-hit');
   await expect(hit).toContainText('50 times');
-  await expect(hit.getByRole('link')).toHaveAttribute('href', /\/docs\/tools\/automatic-indexing\/#when-an-index-is-proposed$/);
+  // The hit opens Studio's own page of the docs; the website is the second link.
+  await expect(hit.getByRole('link', { name: 'Automatic indexing › When an index is proposed', exact: true })).toHaveAttribute(
+    'href',
+    '/studio/t/acme/docs/p/tools/automatic-indexing.md#when-an-index-is-proposed',
+  );
+  await expect(hit.getByRole('link', { name: /on the website/ })).toHaveAttribute('href', /\/docs\/tools\/automatic-indexing\/#when-an-index-is-proposed$/);
 });
 
 test('Ctrl/Cmd+I in a query tab proposes a diff: Tab accepts it', async ({ page }) => {

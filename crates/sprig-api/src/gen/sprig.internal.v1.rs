@@ -250,6 +250,10 @@ pub struct TailFeedRequest {
     /// The calling gateway's DC: a tenant's tail goes only to its allowed DCs.
     #[prost(string, tag = "3")]
     pub caller_dc: ::prost::alloc::string::String,
+    /// Start at this HLC time (MongoDB's `startAtOperationTime`) through the
+    /// home cluster's feed time index; 0: `start_after`, or from now.
+    #[prost(uint64, tag = "4")]
+    pub start_at_hlc: u64,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

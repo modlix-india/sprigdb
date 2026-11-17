@@ -368,6 +368,14 @@ impl Cx<'_> {
                 Sql::new(format!("{f}({})", list.join(", ")), ty)
             }
             Builtin::Len => Sql::new(format!("CHAR_LENGTH({})", one(&v)?.text), Ty::Int),
+            Builtin::ByteLen => Sql::new(
+                format!("OCTET_LENGTH(CONVERT({} USING utf8mb4))", one(&v)?.text),
+                Ty::Int,
+            ),
+            Builtin::AsciiUpper | Builtin::AsciiLower => Sql::new(
+                crate::plsql::ascii_case(&one(&v)?.text, b == Builtin::AsciiUpper),
+                Ty::Str,
+            ),
             Builtin::Upper => Sql::new(format!("UPPER({})", one(&v)?.text), Ty::Str),
             Builtin::Lower => Sql::new(format!("LOWER({})", one(&v)?.text), Ty::Str),
             Builtin::Contains => {

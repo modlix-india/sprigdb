@@ -237,18 +237,22 @@ fn still_binds(
     before: &StaticColumns,
     after: &StaticColumns,
 ) -> std::result::Result<(), Changed> {
-    let compile = |cols: &StaticColumns| {
-        if runtime == Runtime::Javascript {
-            sprig_logic_compile::js::compile_with(
-                name,
-                source,
-                &sprig_logic_compile::js::Signature::row_of(table),
-                cols,
-                &Options::default(),
-            )
-        } else {
-            sprig_logic_compile::compile(runtime, source, cols, &Options::default())
-        }
+    let compile = |cols: &StaticColumns| match runtime {
+        Runtime::Javascript => sprig_logic_compile::js::compile_with(
+            name,
+            source,
+            &sprig_logic_compile::js::Signature::row_of(table),
+            cols,
+            &Options::default(),
+        ),
+        Runtime::Lua => sprig_logic_compile::lua::compile_with(
+            name,
+            source,
+            &sprig_logic_compile::js::Signature::row_of(table),
+            cols,
+            &Options::default(),
+        ),
+        _ => sprig_logic_compile::compile(runtime, source, cols, &Options::default()),
     };
     let params = |c: &sprig_logic_compile::Compiled| -> Vec<(String, Ty)> {
         c.ir.as_ref()

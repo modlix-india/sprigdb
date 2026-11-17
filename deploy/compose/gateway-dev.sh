@@ -142,6 +142,7 @@ settings=(
     listener.mysql.tls listener.mariadb.tls
     tls.bundles.default.cert_path tls.bundles.default.key_path
     listener.http.enabled listener.https.enabled
+    listener.amqp.enabled listener.amqp.bind
     workload.flush_seconds
     failover.self_fence
 )
@@ -249,7 +250,12 @@ start() {
     # One previous log is kept; a trace-level gateway log grows fast.
     if [[ -f $state/$name.log ]]; then mv -f "$state/$name.log" "$state/$name.log.1"; fi
     local telemetry=$ctl_telemetry_port extra=()
-    if [[ $role == gateway ]]; then telemetry=$gw_telemetry_port; fi
+    # Without [tls] the peer service stays off on a non-loopback bind, and then workers can't
+    # run triggers or sinks; the dev stack binds it on loopback (as advertise_addr is).
+    if [[ $role == gateway ]]; then
+        telemetry=$gw_telemetry_port
+        extra=("SPRIGDB_GATEWAY_LISTEN_OVERRIDE={peer = \"127.0.0.1:7403\"}")
+    fi
     # The worker reads the controller's config under its own node id.
     if [[ $role == worker ]]; then telemetry=$wk_telemetry_port; extra=(SPRIGDB_NODE_ID=wkr-1); fi
     env ${extra[@]+"${extra[@]}"} SPRIGDB_META_DC_SEEDS="[\"$etcd\"]" \
@@ -596,6 +602,9 @@ up() {
     set_setting tls.bundles.default.key_path "\"$root/$certs/server-key.pem\""
     set_setting listener.http.enabled false
     set_setting listener.https.enabled false
+    # AMQP for the docs examples, on 13672: 5672 is often taken (a local RabbitMQ).
+    set_setting listener.amqp.bind '"127.0.0.1:13672"'
+    set_setting listener.amqp.enabled true
     # Workload statistics reach the tenants' catalogs within seconds, not
     # 15 minutes (workload.flush_seconds).
     set_setting workload.flush_seconds 10

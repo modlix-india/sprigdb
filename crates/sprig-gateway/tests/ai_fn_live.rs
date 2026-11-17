@@ -359,7 +359,7 @@ async fn ai_functions_end_to_end() {
 
     // Where a call over rows can't stand; prepared statements.
     let e = c
-        .query_drop("SELECT id FROM tickets WHERE AI_CLASSIFY(body, 'bug', 'idea') = 'bug'")
+        .query_drop("DELETE FROM tickets WHERE AI_CLASSIFY(body, 'bug', 'idea') = 'bug'")
         .await
         .unwrap_err();
     assert_eq!(code(&e), 1235);

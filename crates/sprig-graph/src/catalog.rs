@@ -127,7 +127,28 @@ pub static GRAPH_MIGRATIONS: &[Migration] = &[
         name: "graph_mirror_pos, graphs.mirror_mode",
         statements: &[crate::mirror::DDL_POS, DDL_MIRROR_MODE],
     },
+    Migration {
+        format: 4,
+        phase: Phase::Expand,
+        name: "typed storage: graphs.storage, graph_label_sets, graph_prop_keys, graph_columns",
+        statements: &[
+            DDL_STORAGE,
+            crate::typed::catalog::DDL[0],
+            crate::typed::catalog::DDL[1],
+            crate::typed::catalog::DDL[2],
+        ],
+    },
 ];
+
+/// The layout of a native graph's tables: 1, the JSON document per row
+/// (graphs made before typed storage); 2, typed tables
+/// ([`crate::typed`]). `storage_phase`, `storage_owner` and
+/// `storage_until`: a move from 1 to 2 under way, and its lease.
+const DDL_STORAGE: &str = "ALTER TABLE graphs \
+  ADD COLUMN IF NOT EXISTS storage TINYINT UNSIGNED NOT NULL DEFAULT 1 AFTER mirror_mode, \
+  ADD COLUMN IF NOT EXISTS storage_phase VARCHAR(16) CHARACTER SET ascii NULL AFTER storage, \
+  ADD COLUMN IF NOT EXISTS storage_owner VARCHAR(128) NULL AFTER storage_phase, \
+  ADD COLUMN IF NOT EXISTS storage_until DATETIME(6) NULL AFTER storage_owner";
 
 /// Who keeps a grouped graph's mirrors: `sync`, the writers;
 /// `starting`, still the writers while the worker's applier starts on the
@@ -187,6 +208,14 @@ pub struct GraphDef {
     pub types: BTreeMap<u32, String>,
     /// Indexes and constraints.
     pub indexes: Vec<crate::store::IndexDef>,
+    /// `graphs.storage`: 1 one JSON table set, 2 typed tables
+    /// ([`crate::typed`]).
+    pub storage: u8,
+    /// A typed graph's schema (`storage = 2`, or moving to it).
+    pub typed: Option<Arc<crate::typed::TypedSchema>>,
+    /// A move to typed tables under way: `dual` (writers write both,
+    /// rows are copied), `drop` (the JSON tables go).
+    pub storage_phase: Option<String>,
 }
 
 /// The module's state in a snapshot.
@@ -313,10 +342,41 @@ impl GraphCatalog {
                         labels: BTreeMap::new(),
                         types: BTreeMap::new(),
                         indexes: Vec::new(),
+                        storage: 1,
+                        typed: None,
+                        storage_phase: None,
                     },
                 )
             })
             .collect();
+        // `storage` arrived with migration 4; a catalog without it has
+        // only JSON graphs.
+        match q
+            .query::<(u64, u8, Option<String>), _>(format!(
+                "SELECT graph_id, storage, storage_phase FROM {} \
+                 WHERE storage <> 1 OR storage_phase IS NOT NULL",
+                self.t("graphs")
+            ))
+            .await
+        {
+            Ok(rows) => {
+                for (g, st, phase) in rows {
+                    if let Some(d) = graphs.get_mut(&g) {
+                        d.storage = st;
+                        d.storage_phase = phase;
+                    }
+                }
+            }
+            Err(mysql_async::Error::Server(e)) if e.code == 1054 => {}
+            Err(e) => return Err(map_err(e)),
+        }
+        for d in graphs.values_mut() {
+            if d.storage == crate::typed::STORAGE_TYPED || d.storage_phase.is_some() {
+                d.typed = Some(Arc::new(
+                    crate::typed::catalog::load(q, &self.schema, d.graph_id).await?,
+                ));
+            }
+        }
         let labels: Vec<(u64, u32, String)> = q
             .query(format!(
                 "SELECT graph_id, source_id, label FROM {} WHERE kind = 'label'",
@@ -589,6 +649,36 @@ impl GraphCatalog {
         db: u32,
         group: Option<u32>,
     ) -> Result<()> {
+        self.insert_native_as(q, graph, db, group, 1).await
+    }
+
+    /// [`Self::insert_native_in`] with its storage (`graphs.storage`: 1
+    /// JSON, 2 typed tables).
+    ///
+    /// # Errors
+    /// A backend error.
+    pub async fn insert_native_as<Q: Queryable + Send>(
+        &self,
+        q: &mut Q,
+        graph: u64,
+        db: u32,
+        group: Option<u32>,
+        storage: u8,
+    ) -> Result<()> {
+        if storage != 1 {
+            return q
+                .exec_drop(
+                    format!(
+                        "INSERT INTO {} (graph_id, db_id, kind, group_id, mirror_state, state, \
+                         def_version, storage, created_at, updated_at) \
+                         VALUES (?, ?, 'native', ?, ?, 'active', 1, ?, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))",
+                        self.t("graphs")
+                    ),
+                    (graph, db, group, if group.is_some() { "ready" } else { "none" }, storage),
+                )
+                .await
+                .map_err(map_err);
+        }
         q.exec_drop(
             format!(
                 "INSERT INTO {} (graph_id, db_id, kind, group_id, mirror_state, state, def_version, \
@@ -611,6 +701,9 @@ impl GraphCatalog {
             "graph_indexes",
             "graph_node_sources",
             "graph_edge_sources",
+            "graph_label_sets",
+            "graph_prop_keys",
+            "graph_columns",
             "graphs",
         ] {
             q.exec_drop(
@@ -626,6 +719,92 @@ impl GraphCatalog {
             r => r?,
         }
         Ok(())
+    }
+
+    /// Sets a graph's storage and the phase of its move (in the caller's
+    /// versioned change).
+    ///
+    /// # Errors
+    /// A backend error.
+    pub async fn set_storage<Q: Queryable + Send>(
+        &self,
+        q: &mut Q,
+        graph: u64,
+        storage: u8,
+        phase: Option<&str>,
+    ) -> Result<()> {
+        q.exec_drop(
+            format!(
+                "UPDATE {} SET storage = ?, storage_phase = ?, updated_at = UTC_TIMESTAMP(6) \
+                 WHERE graph_id = ?",
+                self.t("graphs")
+            ),
+            (storage, phase, graph),
+        )
+        .await
+        .map_err(map_err)
+    }
+
+    /// Takes or renews the lease on moving a graph's storage for `owner`,
+    /// for `secs` seconds: whether `owner` holds it (no one else holds a
+    /// lease that hasn't run out). Written outside versioned changes: the
+    /// snapshot doesn't carry it.
+    ///
+    /// # Errors
+    /// A backend error.
+    pub async fn lease_storage<Q: Queryable + Send>(
+        &self,
+        q: &mut Q,
+        graph: u64,
+        owner: &str,
+        secs: u32,
+    ) -> Result<bool> {
+        q.exec_drop(
+            format!(
+                "UPDATE {} SET storage_owner = ?, \
+                 storage_until = UTC_TIMESTAMP(6) + INTERVAL ? SECOND \
+                 WHERE graph_id = ? AND (storage_owner IS NULL OR storage_owner = ? \
+                 OR storage_until IS NULL OR storage_until < UTC_TIMESTAMP(6))",
+                self.t("graphs")
+            ),
+            (owner, secs, graph, owner),
+        )
+        .await
+        .map_err(map_err)?;
+        let held: Option<Option<String>> = q
+            .exec_first(
+                format!(
+                    "SELECT storage_owner FROM {} WHERE graph_id = ?",
+                    self.t("graphs")
+                ),
+                (graph,),
+            )
+            .await
+            .map_err(map_err)?;
+        Ok(held.flatten().as_deref() == Some(owner))
+    }
+
+    /// Gives the lease on moving a graph's storage back, if `owner` holds
+    /// it.
+    ///
+    /// # Errors
+    /// A backend error.
+    pub async fn release_storage<Q: Queryable + Send>(
+        &self,
+        q: &mut Q,
+        graph: u64,
+        owner: &str,
+    ) -> Result<()> {
+        q.exec_drop(
+            format!(
+                "UPDATE {} SET storage_owner = NULL, storage_until = NULL \
+                 WHERE graph_id = ? AND storage_owner = ?",
+                self.t("graphs")
+            ),
+            (graph, owner),
+        )
+        .await
+        .map_err(map_err)
     }
 
     /// Sets who keeps a graph's mirrors and their state:

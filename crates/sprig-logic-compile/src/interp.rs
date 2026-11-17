@@ -7,7 +7,9 @@
 //! statement text of [`crate::ir::BoundSql::with_placeholders`] and its
 //! bind values: the way the engine tier will run embedded SQL.
 //!
-//! Errors are SprigDB errors: 39864 (loop budget), 39865 (thrown), 39866
+//! Errors are SprigDB errors: 39864 (loop or wall budget, the wall checked
+//! at every loop iteration and before every data operation, as the
+//! generated code does), 39865 (thrown), 39866
 //! (runtime: overflow, division by zero, `QueryOne` with many rows, no
 //! event). MariaDB raises 1365 and 1690 for the same runtime errors; the
 //! gateway maps them to 39866.
@@ -138,12 +140,15 @@ pub struct Outcome {
 pub struct Limits {
     /// `logic.max_loop_iterations`, for guarded loops.
     pub max_loop_iterations: u64,
+    /// The wall budget from the start of the run; `None` for none.
+    pub wall: Option<std::time::Duration>,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
             max_loop_iterations: 100_000,
+            wall: None,
         }
     }
 }
@@ -179,6 +184,8 @@ struct Run<'a> {
     event: Option<(String, J)>,
     db: &'a mut dyn Db,
     limits: &'a Limits,
+    /// When the wall budget runs out.
+    deadline: Option<std::time::Instant>,
     src: Src,
     /// The name and message a `catch` sees of the code's last 39865.
     thrown: (String, String),
@@ -186,6 +193,26 @@ struct Run<'a> {
     kept: HashMap<LocalId, (ErrorKind, String)>,
     /// Log lines.
     logs: Vec<String>,
+}
+
+impl Run<'_> {
+    /// 39864 once the wall budget has run out (never caught: it comes from
+    /// the code, not a data operation).
+    fn wall(&mut self) -> Result<()> {
+        match (self.deadline, self.limits.wall) {
+            (Some(d), Some(w)) if std::time::Instant::now() > d => {
+                self.src = Src::Code;
+                Err(SprigError::new(
+                    SprigCode::LogicBudgetExceeded,
+                    format!(
+                        "wall time: the code ran past its wall budget ({} ms left when it was called)",
+                        w.as_millis()
+                    ),
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 fn errno(e: &SprigError) -> u16 {
@@ -229,6 +256,7 @@ pub fn run(f: &Function, args: &[Value], db: &mut dyn Db, limits: &Limits) -> Re
         event: None,
         db,
         limits,
+        deadline: limits.wall.map(|w| std::time::Instant::now() + w),
         src: Src::Code,
         thrown: (String::new(), String::new()),
         kept: HashMap::new(),
@@ -296,6 +324,7 @@ impl Run<'_> {
                             ),
                         ));
                     }
+                    self.wall()?;
                     match self.block(body)? {
                         Flow::Next | Flow::Continue => {}
                         Flow::Break => break,
@@ -345,6 +374,7 @@ impl Run<'_> {
                 shape,
                 origin,
             }) => {
+                self.wall()?;
                 let sql = stmt.with_placeholders();
                 // As the generated code, the binds are part of the
                 // statement.
@@ -873,6 +903,14 @@ fn json_builtin(b: Builtin, a: &[Value]) -> Result<Value> {
         _ => None,
     };
     Ok(match b {
+        // Lua's `cjson.decode` (the flag): `nil` is an error, and the
+        // engine tier's decoder refuses what serde_json refuses.
+        Builtin::JsonParse if flag(1) => match &a0 {
+            V::Str(s) => parsed(
+                serde_json::from_str(s).map_err(|_| rerun("cjson.decode of text it can't read"))?,
+            ),
+            _ => return Err(rerun("cjson.decode of a value that isn't text")),
+        },
         Builtin::JsonParse => match &a0 {
             V::Null => parsed(J::Null),
             V::Str(s) => parsed(
@@ -1071,6 +1109,18 @@ fn builtin(b: Builtin, a: &[Value]) -> Result<Value> {
         }
         Builtin::Len => match a0 {
             V::Str(s) => V::Int(i64::try_from(s.chars().count()).unwrap_or(i64::MAX)),
+            _ => V::Null,
+        },
+        Builtin::ByteLen => match a0 {
+            V::Str(s) => V::Int(i64::try_from(s.len()).unwrap_or(i64::MAX)),
+            _ => V::Null,
+        },
+        Builtin::AsciiUpper => match a0 {
+            V::Str(s) => V::Str(s.to_ascii_uppercase()),
+            _ => V::Null,
+        },
+        Builtin::AsciiLower => match a0 {
+            V::Str(s) => V::Str(s.to_ascii_lowercase()),
             _ => V::Null,
         },
         Builtin::Upper => match a0 {

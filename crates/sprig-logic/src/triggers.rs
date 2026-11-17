@@ -14,7 +14,9 @@
 //!     apply(e): on the event's shard, as sprig_ctl, one transaction:
 //!       INSERT IGNORE __sprig_ldone (binding, event key); nothing inserted
 //!       → already done, ROLLBACK; else CALL the active version's entry
-//!       procedure (SQL SECURITY DEFINER: the binding's definer's rights);
+//!       procedure (SQL SECURITY DEFINER: the binding's definer's rights),
+//!       or a staged rollout's candidate's when the row's key falls in its
+//!       share;
 //!       COMMIT
 //!     failure → retry after min(initial · 2^(n−1), max) with jitter; later
 //!       events of the lane wait; after logic.trigger_max_attempts failures

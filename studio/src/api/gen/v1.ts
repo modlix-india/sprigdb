@@ -1222,6 +1222,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/docs/pages/{page}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One page of the product documentation of this release (any signed-in user), rebuilt from the docs pack: its chunks in page order and its Markdown. {page} is the page's path under docs/, slashes included (tools/studio.md) */
+        get: operations["Docs.Page"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/docs:search": {
         parameters: {
             query?: never;
@@ -1662,6 +1679,7 @@ export interface components {
             input?: {
                 [key: string]: unknown;
             };
+            message_id?: string;
             model?: string;
             name?: string;
             ok?: boolean;
@@ -2061,6 +2079,21 @@ export interface components {
         DeleteVectorsRequest: Record<string, never>;
         /** @description The DeleteVectorsResponse message as JSON (proto3 mapping) */
         DeleteVectorsResponse: Record<string, never>;
+        DocsPage: {
+            audience: string[];
+            chunks: components["schemas"]["DocsPageChunk"][];
+            markdown: string;
+            ordered: boolean;
+            page: string;
+            title: string;
+            version: string;
+        };
+        DocsPageChunk: {
+            chunk_id: string;
+            heading_path: string;
+            seq: number;
+            text: string;
+        };
         DocsSearchHit: {
             audience: string[];
             bm25_rank?: number | null;
@@ -5090,6 +5123,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["UpsertVectorsResponse"];
+                };
+            };
+            /** @description An error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    "Docs.Page": {
+        parameters: {
+            query?: {
+                version?: string;
+            };
+            header?: never;
+            path: {
+                page: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocsPage"];
                 };
             };
             /** @description An error */

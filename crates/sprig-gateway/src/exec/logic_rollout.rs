@@ -94,10 +94,10 @@ fn call_target(text: &[u8]) -> Option<(Option<String>, String)> {
     }
 }
 
-/// Argument `i` of a `CALL`'s text as MariaDB's `CAST(... AS CHAR)` gives
-/// it, when it is a literal: a number, a quoted string, or `NULL`
-/// (`Some(None)`). `None` for anything else.
-fn call_arg(text: &[u8], i: usize) -> Option<Option<String>> {
+/// Argument `i` of a `CALL`'s text as the wrapper's key reads it
+/// (`COALESCE(CAST(... AS CHAR), '')`), when it is a literal: a number, a
+/// quoted string, or `NULL` (the empty text). `None` for anything else.
+fn call_arg(text: &[u8], i: usize) -> Option<String> {
     let s = std::str::from_utf8(text).ok()?;
     let open = s.find('(')?;
     let mut args: Vec<String> = Vec::new();
@@ -123,7 +123,6 @@ fn call_arg(text: &[u8], i: usize) -> Option<Option<String>> {
                     quote = None;
                 }
             }
-            (Some(_), c) => cur.push(c),
             (None, '\'' | '"') => {
                 quote = Some(c);
                 cur.push(c);
@@ -141,12 +140,12 @@ fn call_arg(text: &[u8], i: usize) -> Option<Option<String>> {
                 cur.push(c);
             }
             (None, ',') if depth == 0 => args.push(std::mem::take(&mut cur)),
-            (None, c) => cur.push(c),
+            (_, c) => cur.push(c),
         }
     }
     let a = args.get(i)?.trim();
     if a.eq_ignore_ascii_case("null") {
-        return Some(None);
+        return Some(String::new());
     }
     if let Some(inner) = a
         .strip_prefix('\'')
@@ -174,10 +173,39 @@ fn call_arg(text: &[u8], i: usize) -> Option<Option<String>> {
                 c => out.push(c),
             }
         }
-        return Some(Some(out));
+        return Some(out);
     }
     // A whole number, as MariaDB writes it back.
-    a.parse::<i64>().ok().map(|n| Some(n.to_string()))
+    a.parse::<i64>().ok().map(|n| n.to_string())
+}
+
+/// Ends a trigger's rollout (a trigger on a stream or queue): in the
+/// catalog only, both versions' routines stay.
+async fn abort_trigger_rollout(
+    pool: &mysql_async::Pool,
+    schema: &str,
+    module: u64,
+    name: &str,
+    catalog_version: u64,
+) -> sprig_common::Result<Vec<String>> {
+    let mut conn = pool.get_conn_bounded().await.map_err(|e| {
+        sprig_common::SprigError::new(
+            sprig_common::SprigCode::CatalogUnavailable,
+            "catalog unreachable",
+        )
+        .with_source(e)
+    })?;
+    sprig_logic::messages::rollout_change(
+        &mut conn,
+        schema,
+        module,
+        name,
+        rollout::RolloutOp::Abort,
+        catalog_version,
+        "SprigDB",
+    )
+    .await
+    .map(|n| vec![n])
 }
 
 impl PassSession {
@@ -245,8 +273,7 @@ impl PassSession {
             // it as a literal.
             rollout::RolloutBy::Key(Some(i)) => {
                 let arg = call_arg(original, usize::from(i))?;
-                rollout::bucket(arg.as_deref().unwrap_or(""), e.rollout.module_id)
-                    < u32::from(e.rollout.pct)
+                rollout::bucket(&arg, e.rollout.module_id) < u32::from(e.rollout.pct)
             }
             _ => rollout::picks_candidate(
                 e.rollout.spec(),
@@ -369,26 +396,8 @@ impl PassSession {
             tracing::warn!(module = m, candidate = r.candidate_version, %why, "logic rollout: rolling back the candidate");
             let owner = sprig_common::ids::UserId(module.created_by);
             let done = if module.kind == "trigger" {
-                // A trigger on a stream or queue: its rollout ends in the
-                // catalog; both versions' routines stay.
-                match ep.pool.get_conn_bounded().await {
-                    Ok(mut conn) => sprig_logic::messages::rollout_change(
-                        &mut conn,
-                        &schema,
-                        m,
-                        &module.name,
-                        rollout::RolloutOp::Abort,
-                        catalog.as_ref().map_or(0, |c| c.version),
-                        "SprigDB",
-                    )
-                    .await
-                    .map(|n| vec![n]),
-                    Err(e) => Err(sprig_common::SprigError::new(
-                        sprig_common::SprigCode::CatalogUnavailable,
-                        "catalog unreachable",
-                    )
-                    .with_source(e)),
-                }
+                let version = catalog.as_ref().map_or(0, |c| c.version);
+                abort_trigger_rollout(&ep.pool, &schema, m, &module.name, version).await
             } else {
                 Box::pin(self.logic_deploy_with(cx, &Bytes::from(text.into_bytes()), Some(owner)))
                     .await
@@ -452,13 +461,13 @@ mod tests {
     #[test]
     fn call_arguments_as_keys() {
         let t = b"CALL shop.quote(7, 'cust''o', f(1, 2), NULL, \"a,b\", @v)";
-        assert_eq!(call_arg(t, 0), Some(Some("7".into())));
-        assert_eq!(call_arg(t, 1), Some(Some("cust'o".into())));
+        assert_eq!(call_arg(t, 0), Some("7".into()));
+        assert_eq!(call_arg(t, 1), Some("cust'o".into()));
         assert_eq!(call_arg(t, 2), None);
-        assert_eq!(call_arg(t, 3), Some(None));
-        assert_eq!(call_arg(t, 4), Some(Some("a,b".into())));
+        assert_eq!(call_arg(t, 3), Some(String::new()));
+        assert_eq!(call_arg(t, 4), Some("a,b".into()));
         assert_eq!(call_arg(t, 5), None);
         assert_eq!(call_arg(t, 6), None);
-        assert_eq!(call_arg(b"CALL q(  -42 )", 0), Some(Some("-42".into())));
+        assert_eq!(call_arg(b"CALL q(  -42 )", 0), Some("-42".into()));
     }
 }

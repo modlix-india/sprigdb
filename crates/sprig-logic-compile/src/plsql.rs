@@ -29,6 +29,20 @@
 //! - `GET DIAGNOSTICS` comes first in a handler, before any statement
 //!   that could clear the diagnostics area.
 //!
+//! - `max_statement_time` starts MariaDB's timer only for a client's
+//!   top-level statement: a `SET STATEMENT max_statement_time = b FOR
+//!   CALL` inside a routine (the wrapper, a compiled `db.call`) only sets
+//!   the variable, and a session value doesn't stop a `CALL` of many short
+//!   statements on 11.8. So the entry procedure keeps its own deadline:
+//!   `SYSDATE(6)` at entry plus `@@max_statement_time`, which every
+//!   caller sets with `SET STATEMENT` (the wrapper, a validation's
+//!   trigger, the `SELECT` form, the trigger and schedule runners), checked
+//!   at every loop iteration and before every data operation, failing
+//!   with 39864; none when it is 0. A compiled `db.call` passes what is
+//!   left on as the callee's `max_statement_time`, so nested calls share
+//!   the caller's budget. (`NOW(6)` won't do: it is the time each
+//!   statement of a procedure started.)
+//!
 //! A function with a `try` tracks where an error comes from in `v__src`
 //! (0 the code itself, 1 a data operation, 2 raised again), and its own
 //! errors' name and full message in `v__thrown_name` and `v__thrown`, for
@@ -44,6 +58,12 @@ use crate::ir::{
 
 /// The `sql_mode` routines are created under (stored with each routine).
 pub const SQL_MODE: &str = "ORACLE,STRICT_ALL_TABLES,ERROR_FOR_DIVISION_BY_ZERO";
+
+/// The user variable a trigger's log lines are kept in as they are
+/// written, so a run that fails still has them (an `OUT` parameter is
+/// only set when the procedure ends without an error). The runner passes
+/// it as the `p__log` argument too.
+pub const LOG_VAR: &str = "@__sprig_l";
 
 /// One version's generated text, with logical names: the routines live in
 /// each shard schema of the route's group, and their bodies name tables
@@ -91,13 +111,14 @@ pub fn generate(f: &Function, opts: &Options) -> Plsql {
         guards: 0,
         params: param_names(f),
         has_try: has_try(&f.body),
+        clock: needs_clock(&f.body),
         frames: Vec::new(),
         loops: 0,
     };
     let logs = f.logs();
     let mut body = String::new();
     if logs {
-        body.push_str("  p__log := JSON_ARRAY();\n");
+        let _ = writeln!(body, "  p__log := JSON_ARRAY();\n  SET {LOG_VAR} = NULL;");
     }
     g.block(&f.body, 1, &mut body);
     // No event raised: `output` with no fields, unless `output` declares
@@ -128,6 +149,17 @@ pub fn generate(f: &Function, opts: &Options) -> Plsql {
             "  v__src INT := 0;\n  v__thrown LONGTEXT CHARACTER SET utf8mb4;\n  \
              v__thrown_name VARCHAR(64);\n",
         );
+    }
+    if g.clock {
+        // The wall budget the caller set; none (NULL) when it set none.
+        decl.push_str(
+            "  v__wall_us BIGINT := ROUND(@@max_statement_time * 1000000);\n  \
+             v__deadline DATETIME(6) := CASE WHEN v__wall_us > 0 \
+             THEN SYSDATE(6) + INTERVAL v__wall_us MICROSECOND END;\n",
+        );
+        if calls(&f.body) {
+            decl.push_str("  v__left DOUBLE;\n");
+        }
     }
     let mut params: Vec<String> = f
         .params
@@ -185,6 +217,27 @@ fn param_names(f: &Function) -> Vec<String> {
 
 fn local_name(f: &Function, id: LocalId) -> String {
     format!("v_{}", f.local_def(id).name)
+}
+
+/// Whether a block loops or reads or writes data: then the entry keeps a
+/// deadline (see the module's notes).
+fn needs_clock(b: &Block) -> bool {
+    b.iter().any(|s| match s {
+        Stmt::While { .. } | Stmt::Db(_) => true,
+        Stmt::If(_, a, c) => needs_clock(a) || needs_clock(c),
+        Stmt::Try { body, .. } | Stmt::Block(_, body) => needs_clock(body),
+        _ => false,
+    })
+}
+
+/// Whether a block makes a compiled `db.call`.
+fn calls(b: &Block) -> bool {
+    b.iter().any(|s| match s {
+        Stmt::Db(DbOp::Sql { shape, .. }) => matches!(shape, SqlShape::Call { .. }),
+        Stmt::If(_, a, c) => calls(a) || calls(c),
+        Stmt::While { body, .. } | Stmt::Try { body, .. } | Stmt::Block(_, body) => calls(body),
+        _ => false,
+    })
 }
 
 /// Whether a block holds a [`Stmt::Try`].
@@ -273,6 +326,8 @@ struct Gen<'a> {
     guards: usize,
     params: Vec<String>,
     has_try: bool,
+    /// The entry keeps a deadline (`v__deadline`).
+    clock: bool,
     frames: Vec<Frame>,
     loops: usize,
 }
@@ -281,6 +336,18 @@ impl Gen<'_> {
     fn fail(&mut self, code: u16, msg_sql: &str) -> String {
         self.uses_fail = true;
         format!("{}.fail({code}, {msg_sql})", self.pkg)
+    }
+
+    /// The wall-budget check: 39864 once `v__deadline` has passed. A
+    /// `catch` never sees it (it comes from the code, not a data
+    /// operation).
+    fn wall_check(&mut self, ind: &str, out: &mut String) {
+        let f = self.fail(
+            39864,
+            "CONCAT('wall time: the code ran past its wall budget (', ROUND(v__wall_us / 1000), \
+             ' ms left when it was called)')",
+        );
+        let _ = writeln!(out, "{ind}IF SYSDATE(6) > v__deadline THEN {f}; END IF;");
     }
 
     fn package(&self) -> (Option<String>, Option<String>) {
@@ -476,6 +543,11 @@ impl Gen<'_> {
                         self.opts.max_loop_iterations
                     );
                 }
+                // Every iteration checks the wall budget; a body that starts
+                // with a data operation checks there.
+                if !matches!(body.first(), Some(Stmt::Db(_))) {
+                    self.wall_check(&format!("{ind}  "), out);
+                }
                 self.block(body, d + 1, out);
                 let labelled = matches!(self.frames.pop(), Some(Frame::Loop(_, true)));
                 let whole = &mut *outer;
@@ -541,7 +613,7 @@ impl Gen<'_> {
                 let _ = writeln!(
                     out,
                     "{ind}IF JSON_LENGTH(p__log) < {} THEN p__log := JSON_ARRAY_APPEND(p__log, '$', \
-                     {v}); END IF;",
+                     {v}); SET {LOG_VAR} = p__log; END IF;",
                     crate::ir::MAX_LOG_LINES
                 );
             }
@@ -573,6 +645,7 @@ impl Gen<'_> {
                 shape,
                 origin,
             }) => {
+                self.wall_check(&ind, out);
                 if self.has_try {
                     let _ = writeln!(out, "{ind}v__src := 1;");
                 }
@@ -669,9 +742,18 @@ impl Gen<'_> {
                         into,
                     } => {
                         let res = local_name(self.f, *result);
+                        // The callee's budget is what is left of this one
+                        // (at least 1 µs: 0 is none, as when this one has
+                        // none).
                         let _ = writeln!(
                             out,
-                            "{ind}{text}{}{}, {res});",
+                            "{ind}v__left := CASE WHEN v__deadline IS NULL THEN 0 ELSE \
+                             GREATEST(TIMESTAMPDIFF(MICROSECOND, SYSDATE(6), v__deadline), 1) \
+                             / 1e6 END;"
+                        );
+                        let _ = writeln!(
+                            out,
+                            "{ind}SET STATEMENT max_statement_time = v__left FOR {text}{}{}, {res});",
                             if binds.is_empty() { "" } else { ", " },
                             local_name(self.f, *event)
                         );
@@ -970,6 +1052,9 @@ impl Gen<'_> {
                 format!("{f}({})", a.join(", "))
             }
             Builtin::Len => format!("CHAR_LENGTH({})", self.expr(&a0)),
+            Builtin::ByteLen => format!("OCTET_LENGTH(CONVERT({} USING utf8mb4))", self.expr(&a0)),
+            Builtin::AsciiUpper => ascii_case(&self.expr(&a0), true),
+            Builtin::AsciiLower => ascii_case(&self.expr(&a0), false),
             Builtin::Upper => format!("UPPER({})", self.expr(&a0)),
             Builtin::Lower => format!("LOWER({})", self.expr(&a0)),
             Builtin::Contains => format!(
@@ -1018,6 +1103,8 @@ impl Gen<'_> {
         };
         let v = self.expr(&a0);
         match b {
+            // Lua's `cjson.decode` (the flag) reads less than `JSON.parse`.
+            Builtin::JsonParse if flag(1) == 1 => format!("{pkg}.j_decode({v})"),
             Builtin::JsonParse => format!("{pkg}.j_parse({v})"),
             Builtin::JsonGet => match args.get(1) {
                 Some(Expr::Lit(Literal::Str(k))) => format!(
@@ -1069,6 +1156,11 @@ fn json_helpers(spec: &mut String, body: &mut String) {
     let dot = quote("(?-i)[0-9][.]([^0-9]|$)");
     let escape = quote(r#"(?-i)\\[^"\\/bfnrtu]"#);
     let astral = quote("(?-i)[^\\x{0}-\\x{FFFF}]");
+    // What the engine tier's Lua decoder refuses and MariaDB reads: an
+    // escaped half of a surrogate pair, and numbers past a double's range
+    // (an exponent from 100, or 300 digits: some are only large).
+    let surrogate = quote(r"(?-i)\\u[dD][89a-fA-F]");
+    let huge = quote("(?-i)([eE][+]?0*[1-9][0-9]{2}|[0-9]{300})");
     let fns: Vec<(String, String)> = vec![
         (
             "FUNCTION j_kind(v IN LONGTEXT) RETURN VARCHAR".to_owned(),
@@ -1087,6 +1179,18 @@ fn json_helpers(spec: &mut String, body: &mut String) {
                  EXCEPTION WHEN OTHERS THEN ok := 0;\n    END;\n    \
                  IF ok = 0 THEN {}; END IF;\n    RETURN s;\n  END;",
                 fail("JSON.parse of text MariaDB would read differently")
+            ),
+        ),
+        (
+            "FUNCTION j_decode(s IN LONGTEXT) RETURN LONGTEXT".to_owned(),
+            format!(
+                "ok INT := 1;\n  BEGIN\n    IF s IS NULL THEN {}; END IF;\n    BEGIN\n      \
+                 IF s REGEXP {surrogate} OR REGEXP_REPLACE(s, {strings}, '\"\"') REGEXP {huge} \
+                 THEN ok := 0; END IF;\n    \
+                 EXCEPTION WHEN OTHERS THEN ok := 0;\n    END;\n    \
+                 IF ok = 0 THEN {}; END IF;\n    RETURN j_parse(s);\n  END;",
+                fail("cjson.decode of a value that isn't text"),
+                fail("cjson.decode of text the engine tier reads differently")
             ),
         ),
         (
@@ -1214,4 +1318,22 @@ pub fn embed_raw(s: &str, t: Ty) -> String {
         Ty::Json => format!("JSON_EXTRACT({s}, '$')"),
         Ty::Null => "NULL".to_owned(),
     }
+}
+
+/// ASCII-only case mapping (Lua 5.1's `string.upper` and `lower` in the C
+/// locale): one case-sensitive `REPLACE` per letter, so other letters keep
+/// their case and the expression stays pure.
+#[must_use]
+pub fn ascii_case(x: &str, upper: bool) -> String {
+    // In `sql_mode=ORACLE`, `REPLACE` of `''` is `NULL`.
+    let mut s = x.to_owned();
+    for c in b'a'..=b'z' {
+        let (from, to) = if upper {
+            (c, c.to_ascii_uppercase())
+        } else {
+            (c.to_ascii_uppercase(), c)
+        };
+        s = format!("REPLACE({s}, '{}', '{}')", char::from(from), char::from(to));
+    }
+    format!("(CASE WHEN {x} = '' THEN '' ELSE {s} END)")
 }

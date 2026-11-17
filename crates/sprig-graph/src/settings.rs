@@ -95,6 +95,52 @@ key!(
     "Wait for the mirror applier to reach the session's causal target before scattering"
 );
 
+key!(
+    /// `graph.storage`: how `CREATE GRAPH` stores a new native graph:
+    /// `json`, a JSON document per node and relationship, or `typed`, a
+    /// table per label set and per relationship type with a column per
+    /// property key and value type ([`crate::typed`]). Existing graphs
+    /// keep theirs.
+    STORAGE: Cow<'static, str> = "graph.storage", Cow::Borrowed("json"), Scopes::DATA,
+    HardBounds::one_of(&["json", "typed"]),
+    "How new native graphs store their elements: json or typed (a table per label set and relationship type)"
+);
+key!(
+    /// `graph.slots`: graph statements a gateway runs on blocking threads
+    /// at once; 0 is three per CPU, at least 12 (statements mostly wait
+    /// on MariaDB). More wait up to [`SLOT_WAIT_MS`], then run without a
+    /// slot.
+    SLOTS: u64 = "graph.slots", 0, Scopes::PROCESS, HardBounds::range(0, 4096),
+    "Graph statements one gateway runs at once (0: three per CPU, at least 12); more wait graph.slot_wait_ms"
+);
+key!(
+    /// `graph.slot_wait_ms`.
+    SLOT_WAIT_MS: u64 = "graph.slot_wait_ms", 250, Scopes::PROCESS, HardBounds::range(0, 60_000),
+    "How long a graph statement waits for a graph slot before it runs without one, in milliseconds"
+);
+key!(
+    /// `graph.session_pool`: the connections per cluster Bolt sessions
+    /// take from (a change makes a new pool; the old one drains).
+    SESSION_POOL: u64 = "graph.session_pool", 96, Scopes::PROCESS, HardBounds::range(4, 4096),
+    "Connections per cluster that a gateway's Bolt sessions take from"
+);
+key!(
+    /// `graph.spares`: spare connections all auto-commit graph reads of a
+    /// gateway hold at once per cluster, to read shards in parallel.
+    SPARES: u64 = "graph.spares", 32, Scopes::PROCESS, HardBounds::range(0, 4096),
+    "Spare connections all auto-commit graph reads of one gateway hold at once, per cluster"
+);
+key!(
+    /// `graph.spares_per_read`.
+    SPARES_PER_READ: u64 = "graph.spares_per_read", 3, Scopes::PROCESS, HardBounds::range(0, 64),
+    "Spare connections one auto-commit graph read takes per cluster"
+);
+key!(
+    /// `graph.spare_wait_ms`.
+    SPARE_WAIT_MS: u64 = "graph.spare_wait_ms", 50, Scopes::PROCESS, HardBounds::range(0, 10_000),
+    "How long a graph read waits for a spare connection before it reads its shards one after another, in milliseconds"
+);
+
 /// The budgets from settings, read through `get`.
 #[must_use]
 pub fn budgets(get: &dyn Fn(&'static Setting<u64>) -> u64) -> Budgets {

@@ -59,7 +59,8 @@ export type ChatEvent =
   | { type: 'usage'; usage: Usage }
   | { type: 'sources'; sources: Source[] }
   | { type: 'error'; error: ErrorBody }
-  | { type: 'end'; stop: string; detail?: string };
+  /** `message_id`: the stored answer, for feedback (absent when nothing was stored). */
+  | { type: 'end'; stop: string; detail?: string; message_id?: string };
 
 export type ProposalState = 'shown' | 'running' | 'accepted' | 'failed' | 'dismissed';
 
@@ -216,6 +217,7 @@ export function applyEvent(t: Turn, e: ChatEvent): Turn {
     case 'end':
       return {
         ...t,
+        ...(typeof e.message_id === 'string' && e.message_id ? { messageId: e.message_id } : {}),
         stop: e.stop,
         detail: e.detail,
         status: t.status === 'failed' ? 'failed' : e.detail === 'stopped' ? 'stopped' : 'done',

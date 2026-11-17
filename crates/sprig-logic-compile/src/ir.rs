@@ -256,6 +256,12 @@ pub enum Builtin {
     Min,
     /// Length in code points.
     Len,
+    /// Length in bytes of the text's UTF-8 (Lua's `#`).
+    ByteLen,
+    /// Upper case of ASCII letters only (Lua 5.1's `string.upper`).
+    AsciiUpper,
+    /// Lower case of ASCII letters only (Lua 5.1's `string.lower`).
+    AsciiLower,
     /// Upper case.
     Upper,
     /// Lower case.
@@ -340,6 +346,9 @@ impl Builtin {
             Builtin::Max => "max",
             Builtin::Min => "min",
             Builtin::Len => "len",
+            Builtin::ByteLen => "byte_len",
+            Builtin::AsciiUpper => "ascii_upper",
+            Builtin::AsciiLower => "ascii_lower",
             Builtin::Upper => "upper",
             Builtin::Lower => "lower",
             Builtin::Contains => "contains",
@@ -773,11 +782,8 @@ impl Function {
                 | Builtin::JsonAsBool
                 | Builtin::JsonTruthy
                 | Builtin::JsonKind => Ty::Bool,
-                Builtin::JsonParse | Builtin::JsonGet => Ty::Json,
-                Builtin::JsonAsNum => Ty::Float,
-                Builtin::JsonAsInt | Builtin::JsonLen => Ty::Int,
-                Builtin::JsonAsStr | Builtin::JsonToStr => Ty::Str,
                 Builtin::ToFloat
+                | Builtin::JsonAsNum
                 | Builtin::JsonNum
                 | Builtin::Floor
                 | Builtin::Ceil
@@ -788,9 +794,18 @@ impl Function {
                 | Builtin::JsonStr
                 | Builtin::JsonText
                 | Builtin::Upper
-                | Builtin::Lower => Ty::Str,
-                Builtin::ToJson => Ty::Json,
-                Builtin::JsonLength | Builtin::Len | Builtin::IndexOf => Ty::Int,
+                | Builtin::Lower
+                | Builtin::AsciiUpper
+                | Builtin::AsciiLower
+                | Builtin::JsonAsStr
+                | Builtin::JsonToStr => Ty::Str,
+                Builtin::ToJson | Builtin::JsonParse | Builtin::JsonGet => Ty::Json,
+                Builtin::JsonLength
+                | Builtin::Len
+                | Builtin::ByteLen
+                | Builtin::IndexOf
+                | Builtin::JsonAsInt
+                | Builtin::JsonLen => Ty::Int,
                 Builtin::Abs | Builtin::NotNull => {
                     args.first().map_or(Ty::Float, |a| self.ty_of(a))
                 }
@@ -816,12 +831,11 @@ impl Function {
         }
         fn stmt(s: &Stmt) -> usize {
             1 + match s {
-                Stmt::Assign(_, e) => expr(e),
+                Stmt::Assign(_, e) | Stmt::Log(e) => expr(e),
                 Stmt::If(c, a, b) => expr(c) + block(a) + block(b),
                 Stmt::While { cond, body, .. } => expr(cond) + block(body),
                 Stmt::Emit(_, f) => f.iter().map(|(_, e)| expr(e)).sum(),
                 Stmt::Throw(e) => expr(&e.message),
-                Stmt::Log(e) => expr(e),
                 Stmt::Db(DbOp::Sql { binds, .. }) => binds.iter().map(expr).sum(),
                 Stmt::Try { body, .. } | Stmt::Block(_, body) => block(body),
                 Stmt::Break | Stmt::Continue | Stmt::Return | Stmt::Rethrow(_) | Stmt::Leave(_) => {
@@ -867,9 +881,23 @@ impl Function {
         block(&self.body, f);
     }
 
-    /// Whether the code can raise [`ENGINE_RERUN`] (it reads parsed JSON).
+    /// Whether the code can raise [`ENGINE_RERUN`] (it reads parsed JSON,
+    /// or raises it itself).
     #[must_use]
     pub fn may_rerun(&self) -> bool {
+        fn raises(b: &Block) -> bool {
+            b.iter().any(|s| match s {
+                Stmt::Throw(e) => e.code == ENGINE_RERUN,
+                Stmt::If(_, a, c) => raises(a) || raises(c),
+                Stmt::While { body, .. } | Stmt::Try { body, .. } | Stmt::Block(_, body) => {
+                    raises(body)
+                }
+                _ => false,
+            })
+        }
+        if raises(&self.body) {
+            return true;
+        }
         let mut hit = false;
         self.each_expr(&mut |e| {
             if let Expr::Builtin(b, _) = e

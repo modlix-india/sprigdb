@@ -9,7 +9,15 @@
 //! - a **measure** is a `columns`, `rows`, `color` or `size` entry with
 //!   `agg` (`size` always counts);
 //! - a **date** is a dimension with a `datePart`;
-//! - **geo** is a field named like a place (`lat`, `country`, ...).
+//! - **geo** is a field named like a place (`lat`, `country`, ...);
+//! - **lat/lon** is a latitude field (`lat`, `latitude`) and a longitude
+//!   field (`lon`, `lng`, `long`, `longitude`), on any shelf. A bare one
+//!   is always a dimension: a location is never summed.
+//!
+//! As in Studio, a point map needs a latitude and a longitude: a place
+//! name alone (`country`) would need a filled map, and filled maps aren't
+//! drawn yet (they need region shapes), so Show Me goes on to the next
+//! rule and the check refuses `map-filled`.
 //!
 //! A bare `columns` or `rows` entry (no `agg`, no `datePart`) may be
 //! either: a query that already groups returns its measures as plain
@@ -101,6 +109,8 @@ pub struct Counts {
     pub dates: u32,
     /// A geographic field is on a shelf.
     pub geo: bool,
+    /// A latitude and a longitude field are on the shelves.
+    pub lat_lon: bool,
     /// Dimensions (counted in `dims`) that might be measures: bare
     /// `columns` and `rows` entries.
     pub unknown: u32,
@@ -125,14 +135,54 @@ fn is_geo(name: &str) -> bool {
     RULES.geo_names.contains(&n)
 }
 
+/// Field names read as a latitude (any case), as in Studio.
+pub const LAT_NAMES: [&str; 2] = ["lat", "latitude"];
+/// Field names read as a longitude (any case), as in Studio.
+pub const LON_NAMES: [&str; 4] = ["lon", "lng", "long", "longitude"];
+
+fn is_lat(name: &str) -> bool {
+    LAT_NAMES.contains(&name.to_ascii_lowercase().as_str())
+}
+
+fn is_lon(name: &str) -> bool {
+    LON_NAMES.contains(&name.to_ascii_lowercase().as_str())
+}
+
+/// Marks Studio doesn't draw yet, and why.
+pub const NOT_DRAWN: [(&str, &str); 1] = [(
+    "map-filled",
+    "it needs region shapes (the outlines of countries or states), which aren't drawn yet",
+)];
+
+/// `a, b or c`.
+fn either(names: &[&str]) -> String {
+    match names.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+        _ => names.join(""),
+    }
+}
+
+fn not_drawn(mark: &str) -> Option<&'static str> {
+    NOT_DRAWN
+        .iter()
+        .find(|(m, _)| *m == mark)
+        .map(|(_, why)| *why)
+}
+
 /// Counts the dimensions, measures and dates on `spec`'s shelves.
 #[must_use]
 pub fn counts(spec: &Value) -> Counts {
     let mut c = Counts::default();
+    let (mut lat, mut lon) = (false, false);
+    let mut place = |f: &str, c: &mut Counts| {
+        c.geo |= is_geo(f);
+        lat |= is_lat(f);
+        lon |= is_lon(f);
+    };
     for shelf in ["columns", "rows", "color", "size"] {
         for e in entries(spec.get(shelf)) {
             let Some(f) = field(e) else { continue };
-            c.geo |= is_geo(f);
+            place(f, &mut c);
             let agg = e.get("agg").is_some_and(|a| !a.is_null());
             if agg || shelf == "size" {
                 c.measures += 1;
@@ -140,7 +190,9 @@ pub fn counts(spec: &Value) -> Counts {
                 c.dims += 1;
                 if e.get("datePart").is_some_and(|d| !d.is_null()) {
                     c.dates += 1;
-                } else if matches!(shelf, "columns" | "rows") {
+                } else if matches!(shelf, "columns" | "rows") && !is_lat(f) && !is_lon(f) {
+                    // A bare latitude or longitude is a location, never a
+                    // measure.
                     c.unknown += 1;
                 }
             }
@@ -149,10 +201,11 @@ pub fn counts(spec: &Value) -> Counts {
     for shelf in ["detail", "tooltip", "label"] {
         for e in entries(spec.get(shelf)) {
             if let Some(f) = field(e) {
-                c.geo |= is_geo(f);
+                place(f, &mut c);
             }
         }
     }
+    c.lat_lon = lat && lon;
     c
 }
 
@@ -169,12 +222,16 @@ fn fits_exactly(r: &MarkRule, c: Counts) -> bool {
 }
 
 /// Whether `mark` fits `c`, by its rule, with any of the bare entries
-/// taken as measures.
+/// taken as measures. A point map also needs a latitude and a longitude,
+/// and a mark that isn't drawn yet never fits.
 #[must_use]
 pub fn fits(mark: &str, c: Counts) -> bool {
     let Some(r) = RULES.marks.get(mark) else {
         return false;
     };
+    if not_drawn(mark).is_some() || (mark == "map-point" && !c.lat_lon) {
+        return false;
+    }
     (0..=c.unknown).any(|k| {
         fits_exactly(
             r,
@@ -221,13 +278,19 @@ fn holds(when: &BTreeMap<String, Value>, c: Counts) -> bool {
     })
 }
 
-/// The best mark for `c` and why.
+/// The best mark for `c` and why: the first rule that holds, skipping
+/// marks that aren't drawn and a point map without a latitude and a
+/// longitude (as Studio's Show Me does).
 #[must_use]
 pub fn best(c: Counts) -> (&'static str, &'static str) {
     RULES
         .best
         .iter()
-        .find(|b| holds(&b.when, c))
+        .find(|b| {
+            holds(&b.when, c)
+                && not_drawn(&b.mark).is_none()
+                && (b.mark != "map-point" || c.lat_lon)
+        })
         .map_or(("text-table", ""), |b| (b.mark.as_str(), b.why.as_str()))
 }
 
@@ -244,6 +307,23 @@ pub fn check_fit(spec: &Value) -> Result<(), String> {
         return Ok(());
     }
     let (b, why) = best(c);
+    if let Some(not) = not_drawn(mark) {
+        return Err(format!(
+            "a {mark} chart isn't available: {not}. Use map-point with a latitude and a longitude \
+             field, or another mark; marks that fit: {}. Show Me would pick {b} ({why})",
+            fitting(c).join(", ")
+        ));
+    }
+    if mark == "map-point" && !c.lat_lon {
+        return Err(format!(
+            "a map-point chart needs a latitude field (named {}) and a longitude field (named {}) \
+             on the shelves; a place name alone isn't a point map, and filled maps aren't drawn yet; \
+             marks that fit: {}. Show Me would pick {b} ({why})",
+            either(&LAT_NAMES),
+            either(&LON_NAMES),
+            fitting(c).join(", ")
+        ));
+    }
     Err(format!(
         "a {mark} chart doesn't fit {} dimension(s), {} measure(s) and {} date(s) on the shelves; \
          marks that fit: {}. Show Me would pick {b} ({why}). A measure is a field with agg; a dimension has none",
@@ -290,6 +370,7 @@ mod tests {
                 measures: 1,
                 dates: 1,
                 geo: false,
+                lat_lon: false,
                 unknown: 0
             }
         );
@@ -326,14 +407,11 @@ mod tests {
             json!({"columns": ["day"], "rows": ["hour"], "color": {"field": "n", "agg": "count"}}),
         );
         assert_eq!(best(heat).0, "heatmap");
-        // A geographic field: map.
-        assert_eq!(
-            best(c(
-                json!({"columns": ["country"], "rows": [{"field": "n", "agg": "sum"}]})
-            ))
-            .0,
-            "map-point"
-        );
+        // A place name alone would be a filled map, which isn't drawn: the
+        // next rule.
+        let country = c(json!({"columns": ["country"], "rows": [{"field": "n", "agg": "sum"}]}));
+        assert!(country.geo && !country.lat_lon);
+        assert_eq!(best(country).0, "bar");
         // Nothing: a table, and every mark that needs fields is refused.
         assert_eq!(best(Counts::default()).0, "text-table");
         assert!(check_fit(&json!({"mark": "bar"})).is_err());
@@ -342,5 +420,73 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("marks that fit") && e.contains("heatmap"), "{e}");
+    }
+
+    #[test]
+    fn a_point_map_needs_a_latitude_and_a_longitude() {
+        let c = |v: Value| counts(&v);
+        // Both, in any case and on any shelf: a point map, and Show Me picks it.
+        let ll = c(json!({"columns": ["Longitude"], "rows": ["lat"],
+                          "size": {"field": "n", "agg": "sum"}}));
+        assert!(ll.lat_lon && ll.geo);
+        assert_eq!(
+            ll.unknown, 0,
+            "a bare latitude or longitude is never a measure"
+        );
+        assert_eq!(best(ll).0, "map-point");
+        assert!(fits("map-point", ll));
+        let lng = c(json!({"columns": ["latitude"], "detail": ["lng"]}));
+        assert!(lng.lat_lon);
+        assert!(fits("map-point", lng));
+        assert!(check_fit(&json!({"mark": "map-point", "columns": ["LAT", "long"]})).is_ok());
+        // Only one of them, or a place name: no point map.
+        for spec in [
+            json!({"mark": "map-point", "columns": ["country"], "rows": [{"field": "n", "agg": "sum"}]}),
+            json!({"mark": "map-point", "columns": ["lat"], "rows": [{"field": "n", "agg": "sum"}]}),
+            json!({"mark": "map-point", "columns": ["city", "longitude"]}),
+        ] {
+            let k = counts(&spec);
+            assert!(!k.lat_lon && !fits("map-point", k), "{spec}");
+            assert_ne!(best(k).0, "map-point", "{spec}");
+            let e = check_fit(&spec).unwrap_err();
+            assert!(
+                e.contains("needs a latitude field") && e.contains("marks that fit"),
+                "{e}"
+            );
+        }
+        // Lone place names fall through to the next rule.
+        assert_eq!(
+            best(c(
+                json!({"columns": ["state", "city"], "rows": [{"field": "n", "agg": "sum"}]})
+            ))
+            .0,
+            "heatmap"
+        );
+        assert_eq!(best(c(json!({"columns": ["country"]}))).0, "text-table");
+    }
+
+    #[test]
+    fn a_filled_map_is_refused_until_it_is_drawn() {
+        let spec = json!({"mark": "map-filled", "columns": ["country"],
+                          "rows": [{"field": "n", "agg": "sum"}]});
+        let c = counts(&spec);
+        assert!(!fits("map-filled", c));
+        assert!(!fitting(c).contains(&"map-filled"));
+        let e = check_fit(&spec).unwrap_err();
+        assert!(
+            e.contains("region shapes") && e.contains("map-point") && e.contains("bar"),
+            "{e}"
+        );
+        // Every not-drawn mark is a mark of the rules.
+        for (m, _) in NOT_DRAWN {
+            assert!(RULES.marks.contains_key(m), "{m}");
+        }
+    }
+
+    #[test]
+    fn latitude_and_longitude_names_are_geographic() {
+        for n in LAT_NAMES.iter().chain(LON_NAMES.iter()) {
+            assert!(is_geo(n), "{n}");
+        }
     }
 }

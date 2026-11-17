@@ -70,17 +70,14 @@ fn invalid(m: impl Into<String>) -> SprigError {
 /// `-`, `_`, `.` and `/`, or longer than the column.
 pub fn normalize(path: &str) -> Result<String> {
     let p = path.trim().trim_start_matches('/');
-    let mut p = if p.is_empty() || p.ends_with('/') {
+    let p = if p.is_empty() || p.ends_with('/') {
         format!("{p}README.md")
     } else if p.to_ascii_lowercase().ends_with(".md") {
-        p.to_owned()
+        // `.MD` as `.md`: the extension is three ASCII bytes.
+        format!("{}.md", &p[..p.len() - 3])
     } else {
         format!("{p}.md")
     };
-    if p.ends_with(".MD") {
-        p.truncate(p.len() - 3);
-        p.push_str(".md");
-    }
     let ok = p
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/'));
@@ -155,7 +152,7 @@ impl DocsService {
     /// release a search would read.
     ///
     /// # Errors
-    /// A bad path, or no such page (39790-style request errors); 39989
+    /// A bad path, or no such page (39792); 39989
     /// when docs are unavailable; the backend's.
     pub async fn page(
         &self,
@@ -220,7 +217,14 @@ mod tests {
         assert_eq!(normalize("tools/").unwrap(), "tools/README.md");
         assert_eq!(normalize("").unwrap(), "README.md");
         assert_eq!(normalize("a/B.MD").unwrap(), "a/B.md");
-        for bad in ["../etc/passwd", "a//b.md", "a b.md", "a/./b.md", "a%2e.md", "q?.md"] {
+        for bad in [
+            "../etc/passwd",
+            "a//b.md",
+            "a b.md",
+            "a/./b.md",
+            "a%2e.md",
+            "q?.md",
+        ] {
             assert!(normalize(bad).is_err(), "{bad}");
         }
         assert!(normalize(&"a".repeat(300)).is_err());

@@ -151,7 +151,13 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         // Splits, merges and shard moves cut over on the
         // table groups' maps in this DC's tier.
         .with_group_maps(dc.clone())
-        .with_drain(drain);
+        .with_drain(drain)
+        // A tenant on Sprig 2PC's relay path is fenced through the relay
+        // writer.
+        .with_relays(sprig_cluster::failover::relay_pools::TenantRelays::new(
+            dc.clone(),
+            sprig_txn::fence::wire::preamble,
+        ));
     // Each job's `mover.*` from the live settings, followed while it runs.
     if let Some(l) = live.live() {
         factory = factory.with_live_settings(l.clone(), cfg.node.dc.clone());

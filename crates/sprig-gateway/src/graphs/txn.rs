@@ -516,31 +516,34 @@ pub(crate) struct ReadConns {
     pub(crate) spare_permits: Vec<tokio::sync::OwnedSemaphorePermit>,
 }
 
-/// Spare connections one auto-commit read takes per cluster.
-const SPARES_MAX: usize = 3;
-
-/// How long a read waits for a spare connection before it goes on
-/// without one (its shards' statements then run one after another).
-const SPARE_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
-
-/// Spare connections all reads of the process hold at once per cluster:
-/// a quarter of the session pool, so statements' own connections always
-/// have the rest. A read that finds none free goes on without one.
+/// Spare connections all reads of the process hold at once per cluster
+/// (`graph.spares`, by default a third of the session pool, so
+/// statements' own connections always have the rest). A read that finds
+/// none free goes on without one; one takes at most
+/// `graph.spares_per_read`, waiting `graph.spare_wait_ms` for each.
 ///
 /// Spares once came from the session pool with no bound and no time limit
 /// while the read held its own connection: 32 concurrent Bolt sessions
 /// could hold all 64 and each wait for one more.
 fn spare_budget(cluster: &str) -> Arc<tokio::sync::Semaphore> {
-    static B: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>> = OnceLock::new();
+    type Budget = (
+        Arc<tokio::sync::Semaphore>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    );
+    static B: OnceLock<Mutex<HashMap<String, Budget>>> = OnceLock::new();
+    let want = crate::offload::GraphLimits::now().spares;
     let mut m = B
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    Arc::clone(m.entry(cluster.to_owned()).or_insert_with(|| {
-        Arc::new(tokio::sync::Semaphore::new(
-            crate::graphs::SESSION_POOL_MAX / 4,
-        ))
-    }))
+    let (sem, now) = m.entry(cluster.to_owned()).or_insert_with(|| {
+        (
+            Arc::new(tokio::sync::Semaphore::new(want)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(want)),
+        )
+    });
+    crate::offload::resize(sem, now, want);
+    Arc::clone(sem)
 }
 
 impl std::fmt::Debug for ReadConns {
@@ -618,7 +621,8 @@ impl ShardConns for ReadConns {
         if let Some(c) = idle.pop() {
             return Ok(Some(c));
         }
-        if *made >= SPARES_MAX {
+        let limits = crate::offload::GraphLimits::now();
+        if *made >= limits.spares_per_read {
             return Ok(None);
         }
         let Ok(permit) = spare_budget(&at.cluster).try_acquire_owned() else {
@@ -626,7 +630,7 @@ impl ShardConns for ReadConns {
             return Ok(None);
         };
         *made += 1;
-        match tokio::time::timeout(SPARE_WAIT, pool.get_conn()).await {
+        match tokio::time::timeout(limits.spare_wait, pool.get_conn()).await {
             Ok(Ok(c)) => {
                 self.spare_permits.push(permit);
                 metrics::counter!("sprig_graph_spares_total", "outcome" => "taken").increment(1);
@@ -635,7 +639,7 @@ impl ShardConns for ReadConns {
             Ok(Err(e)) => Err(sprig_graph::catalog::backend_error(e)),
             Err(_) => {
                 // The pool is busy: no more spares for this statement.
-                *made = SPARES_MAX;
+                *made = (*made).max(limits.spares_per_read);
                 metrics::counter!("sprig_graph_spares_total", "outcome" => "busy").increment(1);
                 Ok(None)
             }

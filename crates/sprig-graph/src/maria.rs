@@ -439,6 +439,8 @@ impl ShardConns for OneConn<'_> {
 
 /// One graph over its shards, inside the caller's transaction.
 pub struct MariaStore<'c> {
+    /// A move to typed tables under way: their copy of every write.
+    shadow: Option<Arc<crate::typed::store::Shadow>>,
     conns: &'c mut dyn ShardConns,
     layout: Arc<GraphShards>,
     labels: BTreeMap<u32, String>,
@@ -525,7 +527,7 @@ fn u64_col(v: Option<MyValue>) -> u64 {
 
 /// A node from columns `start..start + 5` of `row`, or `None` when the
 /// left join found nothing.
-fn node_at(row: &mut Row, start: usize) -> Option<NodeRow> {
+pub(crate) fn node_at(row: &mut Row, start: usize) -> Option<NodeRow> {
     let id = row.take::<MyValue, _>(start)?;
     if id == MyValue::NULL {
         return None;
@@ -550,7 +552,7 @@ fn node_at(row: &mut Row, start: usize) -> Option<NodeRow> {
 
 /// An edge from `e.src, e.type, e.dst, e.id, e.dst_rk, e._sprig_rk,
 /// e.props, e._types` at `start`.
-fn edge_at(row: &mut Row, start: usize) -> EdgeRow {
+pub(crate) fn edge_at(row: &mut Row, start: usize) -> EdgeRow {
     EdgeRow {
         src: u64_col(row.take(start)),
         rtype: u32::try_from(u64_col(row.take(start + 1))).unwrap_or(0),
@@ -620,8 +622,17 @@ impl<'c> MariaStore<'c> {
             rode_keys: None,
             pending_scans: Vec::new(),
             scanned: Vec::new(),
+            shadow: None,
             layout,
         }
+    }
+
+    /// While the graph moves to typed tables: every write is made again
+    /// there, in the same transaction, with the same `_v`.
+    #[must_use]
+    pub fn with_shadow(mut self, shadow: Option<Arc<crate::typed::store::Shadow>>) -> Self {
+        self.shadow = shadow;
+        self
     }
 
     /// Routes that meet a range a mover holds wait through `w` (auto-commit
@@ -1555,7 +1566,7 @@ fn nodes_of(rows: Vec<(usize, Vec<Row>)>) -> Vec<NodeRow> {
 
 /// Neo4j's message for a uniqueness violation: the holder, the label (or
 /// type) and the properties (1062, `ConstraintValidationFailed`).
-fn dup_error(d: &IndexDef, what: &str, id: u64) -> SprigError {
+pub(crate) fn dup_error(d: &IndexDef, what: &str, id: u64) -> SprigError {
     SprigError::backend(
         1062,
         *b"23000",
@@ -1585,6 +1596,375 @@ fn merge_nodes(mut v: Vec<NodeRow>, limit: Option<usize>) -> Vec<NodeRow> {
         v.truncate(l);
     }
     v
+}
+
+/// The JSON tables' writes (a moving graph's typed copy follows them in
+/// [`GraphStore`]'s methods).
+impl MariaStore<'_> {
+    async fn insert_nodes_json(&mut self, rows: &[NodeRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for d in self.unique_defs(Entity::Node) {
+            for r in rows {
+                if let Some(k) = Self::node_key(&d, r) {
+                    self.claim(&d, &k, "Node", r.id, r.rk).await?;
+                }
+            }
+        }
+        let mut by: BTreeMap<usize, Vec<&NodeRow>> = BTreeMap::new();
+        for r in rows {
+            by.entry(self.layout.index_of(r.rk)).or_default().push(r);
+        }
+        for (i, part) in by {
+            let t = self.t(i).clone();
+            let mut sql = format!(
+                "INSERT INTO {} (id, part, labels, props, _types, _v, _sprig_rk) VALUES ",
+                t.nodes
+            );
+            let mut params: Vec<MyValue> = Vec::new();
+            let mut lsql = format!(
+                "INSERT IGNORE INTO {} (label, id, _sprig_rk) VALUES ",
+                t.labels
+            );
+            let mut lparams: Vec<MyValue> = Vec::new();
+            for (k, r) in part.iter().enumerate() {
+                if k > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str("(?, ?, ?, ?, ?, ?, ?)");
+                params.extend([
+                    MyValue::from(r.id),
+                    MyValue::from(r.id),
+                    MyValue::from(json_text(&Json::from(r.labels.clone()))),
+                    MyValue::from(json_text(&r.props)),
+                    r.types
+                        .as_ref()
+                        .map_or(MyValue::NULL, |t| MyValue::from(json_text(t))),
+                    MyValue::from(self.now_us),
+                    MyValue::from(r.rk),
+                ]);
+                for l in &r.labels {
+                    if !lparams.is_empty() {
+                        lsql.push_str(", ");
+                    }
+                    lsql.push_str("(?, ?, ?)");
+                    lparams.extend([MyValue::from(*l), MyValue::from(r.id), MyValue::from(r.rk)]);
+                }
+            }
+            let first = part[0].id;
+            if let Err(e) = self.run_at(i, sql, Params::Positional(params)).await {
+                return Err(self.duplicate(e, "Node", first));
+            }
+            if !lparams.is_empty() {
+                self.run_at(i, lsql, Params::Positional(lparams)).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn insert_edges_json(&mut self, rows: &[EdgeRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for d in self.unique_defs(Entity::Relationship) {
+            for r in rows {
+                if let Some(k) = Self::edge_key(&d, r) {
+                    self.claim(&d, &k, "Relationship", r.id, r.src_rk).await?;
+                }
+            }
+        }
+        let mut by: BTreeMap<usize, Vec<&EdgeRow>> = BTreeMap::new();
+        for r in rows {
+            by.entry(self.layout.index_of(r.src_rk))
+                .or_default()
+                .push(r);
+        }
+        for (i, part) in by {
+            let mut sql = format!(
+                "INSERT INTO {} (src, type, dst, id, dst_rk, props, _types, _v, _sprig_rk) VALUES ",
+                self.t(i).edges
+            );
+            let mut params: Vec<MyValue> = Vec::new();
+            for (k, r) in part.iter().enumerate() {
+                if k > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str("(?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                params.extend([
+                    MyValue::from(r.src),
+                    MyValue::from(r.rtype),
+                    MyValue::from(r.dst),
+                    MyValue::from(r.id),
+                    MyValue::from(r.dst_rk),
+                    MyValue::from(json_text(&r.props)),
+                    r.types
+                        .as_ref()
+                        .map_or(MyValue::NULL, |t| MyValue::from(json_text(t))),
+                    MyValue::from(self.now_us),
+                    MyValue::from(r.src_rk),
+                ]);
+            }
+            let first = part[0].id;
+            if let Err(e) = self.run_at(i, sql, Params::Positional(params)).await {
+                return Err(self.duplicate(e, "Relationship", first));
+            }
+        }
+        if !self.write_mirrors() {
+            return Ok(());
+        }
+        // Mirrors on the destinations' shards, in the same transaction.
+        let mut by: BTreeMap<usize, Vec<&EdgeRow>> = BTreeMap::new();
+        for r in rows {
+            by.entry(self.layout.index_of(r.dst_rk))
+                .or_default()
+                .push(r);
+        }
+        for (i, part) in by {
+            let mut sql = format!(
+                "INSERT INTO {} (dst, type, src, id, src_rk, _v, _sprig_rk) VALUES ",
+                self.t(i).mirrors
+            );
+            let mut params: Vec<MyValue> = Vec::new();
+            for (k, r) in part.iter().enumerate() {
+                if k > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str("(?, ?, ?, ?, ?, ?, ?)");
+                params.extend([
+                    MyValue::from(r.dst),
+                    MyValue::from(r.rtype),
+                    MyValue::from(r.src),
+                    MyValue::from(r.id),
+                    MyValue::from(r.src_rk),
+                    MyValue::from(self.now_us),
+                    MyValue::from(r.dst_rk),
+                ]);
+            }
+            self.run_at(i, sql, Params::Positional(params)).await?;
+        }
+        Ok(())
+    }
+
+    async fn update_node_json(&mut self, row: &NodeRow, old_labels: &[u32]) -> Result<()> {
+        let defs: Vec<IndexDef> = self
+            .unique_defs(Entity::Node)
+            .into_iter()
+            .filter(|d| row.labels.contains(&d.token_id) || old_labels.contains(&d.token_id))
+            .collect();
+        if !defs.is_empty() {
+            // The row as the transaction sees it (the caller locked it).
+            let old = self.lock_nodes(&[row.id], true).await?;
+            for d in &defs {
+                let was = old.first().and_then(|o| Self::node_key(d, o));
+                let now = Self::node_key(d, row);
+                if was == now {
+                    continue;
+                }
+                if let Some(k) = &now {
+                    self.claim(d, k, "Node", row.id, row.rk).await?;
+                }
+                if let Some(k) = &was {
+                    self.release(d, k, row.id).await?;
+                }
+            }
+        }
+        let i = self.layout.index_of(row.rk);
+        let t = self.t(i).clone();
+        let r = self
+            .run_at(
+                i,
+                format!(
+                    "UPDATE {} SET labels = ?, props = ?, _types = ?, _v = ? WHERE id = ?",
+                    t.nodes
+                ),
+                Params::Positional(vec![
+                    MyValue::from(json_text(&Json::from(row.labels.clone()))),
+                    MyValue::from(json_text(&row.props)),
+                    row.types
+                        .as_ref()
+                        .map_or(MyValue::NULL, |t| MyValue::from(json_text(t))),
+                    MyValue::from(self.now_us),
+                    MyValue::from(row.id),
+                ]),
+            )
+            .await;
+        if let Err(e) = r {
+            return Err(self.duplicate(e, "Node", row.id));
+        }
+        let removed: Vec<u64> = old_labels
+            .iter()
+            .filter(|l| !row.labels.contains(l))
+            .map(|l| u64::from(*l))
+            .collect();
+        if !removed.is_empty() {
+            self.run_at(
+                i,
+                format!(
+                    "DELETE FROM {} WHERE id = ? AND label IN ({})",
+                    t.labels,
+                    ids_list(&removed)
+                ),
+                Params::Positional(vec![MyValue::from(row.id)]),
+            )
+            .await?;
+        }
+        let added: Vec<u32> = row
+            .labels
+            .iter()
+            .copied()
+            .filter(|l| !old_labels.contains(l))
+            .collect();
+        for l in added {
+            self.run_at(
+                i,
+                format!(
+                    "INSERT IGNORE INTO {} (label, id, _sprig_rk) VALUES (?, ?, ?)",
+                    t.labels
+                ),
+                Params::Positional(vec![
+                    MyValue::from(l),
+                    MyValue::from(row.id),
+                    MyValue::from(row.rk),
+                ]),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn update_edge_json(&mut self, row: &EdgeRow) -> Result<()> {
+        let defs: Vec<IndexDef> = self
+            .unique_defs(Entity::Relationship)
+            .into_iter()
+            .filter(|d| d.token_id == row.rtype)
+            .collect();
+        if !defs.is_empty() {
+            let old = self.edges_on(&[(row.id, row.src_rk)]).await?;
+            for d in &defs {
+                let was = old.first().and_then(|o| Self::edge_key(d, o));
+                let now = Self::edge_key(d, row);
+                if was == now {
+                    continue;
+                }
+                if let Some(k) = &now {
+                    self.claim(d, k, "Relationship", row.id, row.src_rk).await?;
+                }
+                if let Some(k) = &was {
+                    self.release(d, k, row.id).await?;
+                }
+            }
+        }
+        let i = self.layout.index_of(row.src_rk);
+        let sql = format!(
+            "UPDATE {} SET props = ?, _types = ?, _v = ? WHERE id = ?",
+            self.t(i).edges
+        );
+        let r = self
+            .run_at(
+                i,
+                sql,
+                Params::Positional(vec![
+                    MyValue::from(json_text(&row.props)),
+                    row.types
+                        .as_ref()
+                        .map_or(MyValue::NULL, |t| MyValue::from(json_text(t))),
+                    MyValue::from(self.now_us),
+                    MyValue::from(row.id),
+                ]),
+            )
+            .await;
+        if let Err(e) = r {
+            return Err(self.duplicate(e, "Relationship", row.id));
+        }
+        Ok(())
+    }
+
+    async fn delete_edges_json(&mut self, edges: &[EdgeKey]) -> Result<u64> {
+        if edges.is_empty() {
+            return Ok(0);
+        }
+        let defs: Vec<IndexDef> = self
+            .unique_defs(Entity::Relationship)
+            .into_iter()
+            .filter(|d| edges.iter().any(|e| e.rtype == d.token_id))
+            .collect();
+        if !defs.is_empty() {
+            let keys: Vec<(u64, u64)> = edges.iter().map(|e| (e.id, e.src_rk)).collect();
+            for e in self.edges_on(&keys).await? {
+                for d in &defs {
+                    if let Some(k) = Self::edge_key(d, &e) {
+                        self.release(d, &k, e.id).await?;
+                    }
+                }
+            }
+        }
+        let mut n = 0;
+        let mut by: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
+        for e in edges {
+            by.entry(self.layout.index_of(e.src_rk))
+                .or_default()
+                .push(e.id);
+        }
+        for (i, ids) in by {
+            let sql = format!(
+                "DELETE FROM {} WHERE id IN ({})",
+                self.t(i).edges,
+                ids_list(&ids)
+            );
+            n += self.run_at(i, sql, Params::Empty).await?;
+        }
+        if self.write_mirrors() {
+            let mut by: BTreeMap<usize, (Vec<u64>, Vec<u64>)> = BTreeMap::new();
+            for e in edges {
+                let x = by.entry(self.layout.index_of(e.dst_rk)).or_default();
+                x.0.push(e.dst);
+                x.1.push(e.id);
+            }
+            for (i, (dsts, ids)) in by {
+                let sql = format!(
+                    "DELETE FROM {} WHERE dst IN ({}) AND id IN ({})",
+                    self.t(i).mirrors,
+                    ids_list(&dsts),
+                    ids_list(&ids)
+                );
+                self.run_at(i, sql, Params::Empty).await?;
+            }
+        }
+        Ok(n)
+    }
+
+    async fn delete_nodes_json(&mut self, ids: &[u64]) -> Result<u64> {
+        let defs = self.unique_defs(Entity::Node);
+        if !defs.is_empty() && !ids.is_empty() {
+            for o in self.lock_nodes(ids, true).await? {
+                for d in &defs {
+                    if let Some(k) = Self::node_key(d, &o) {
+                        self.release(d, &k, o.id).await?;
+                    }
+                }
+            }
+        }
+        let mut n = 0;
+        for (i, part) in self.layout.by_shard(ids) {
+            let l = ids_list(&part);
+            let t = self.t(i).clone();
+            self.run_at(
+                i,
+                format!("DELETE FROM {} WHERE id IN ({l})", t.labels),
+                Params::Empty,
+            )
+            .await?;
+            n += self
+                .run_at(
+                    i,
+                    format!("DELETE FROM {} WHERE id IN ({l})", t.nodes),
+                    Params::Empty,
+                )
+                .await?;
+        }
+        Ok(n)
+    }
 }
 
 #[async_trait]
@@ -2645,366 +3025,67 @@ impl GraphStore for MariaStore<'_> {
     }
 
     async fn insert_nodes(&mut self, rows: &[NodeRow]) -> Result<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        for d in self.unique_defs(Entity::Node) {
-            for r in rows {
-                if let Some(k) = Self::node_key(&d, r) {
-                    self.claim(&d, &k, "Node", r.id, r.rk).await?;
-                }
-            }
-        }
-        let mut by: BTreeMap<usize, Vec<&NodeRow>> = BTreeMap::new();
-        for r in rows {
-            by.entry(self.layout.index_of(r.rk)).or_default().push(r);
-        }
-        for (i, part) in by {
-            let t = self.t(i).clone();
-            let mut sql = format!(
-                "INSERT INTO {} (id, part, labels, props, _types, _v, _sprig_rk) VALUES ",
-                t.nodes
-            );
-            let mut params: Vec<MyValue> = Vec::new();
-            let mut lsql = format!(
-                "INSERT IGNORE INTO {} (label, id, _sprig_rk) VALUES ",
-                t.labels
-            );
-            let mut lparams: Vec<MyValue> = Vec::new();
-            for (k, r) in part.iter().enumerate() {
-                if k > 0 {
-                    sql.push_str(", ");
-                }
-                sql.push_str("(?, ?, ?, ?, ?, ?, ?)");
-                params.extend([
-                    MyValue::from(r.id),
-                    MyValue::from(r.id),
-                    MyValue::from(json_text(&Json::from(r.labels.clone()))),
-                    MyValue::from(json_text(&r.props)),
-                    r.types
-                        .as_ref()
-                        .map_or(MyValue::NULL, |t| MyValue::from(json_text(t))),
-                    MyValue::from(self.now_us),
-                    MyValue::from(r.rk),
-                ]);
-                for l in &r.labels {
-                    if !lparams.is_empty() {
-                        lsql.push_str(", ");
-                    }
-                    lsql.push_str("(?, ?, ?)");
-                    lparams.extend([MyValue::from(*l), MyValue::from(r.id), MyValue::from(r.rk)]);
-                }
-            }
-            let first = part[0].id;
-            if let Err(e) = self.run_at(i, sql, Params::Positional(params)).await {
-                return Err(self.duplicate(e, "Node", first));
-            }
-            if !lparams.is_empty() {
-                self.run_at(i, lsql, Params::Positional(lparams)).await?;
-            }
+        self.insert_nodes_json(rows).await?;
+        if let Some(sh) = self.shadow.clone() {
+            let now = self.now_us;
+            let mut t = sh.store(&mut *self.conns, now);
+            t.insert_nodes(rows).await?;
+            sh.keep(&t);
         }
         Ok(())
     }
 
     async fn insert_edges(&mut self, rows: &[EdgeRow]) -> Result<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        for d in self.unique_defs(Entity::Relationship) {
-            for r in rows {
-                if let Some(k) = Self::edge_key(&d, r) {
-                    self.claim(&d, &k, "Relationship", r.id, r.src_rk).await?;
-                }
-            }
-        }
-        let mut by: BTreeMap<usize, Vec<&EdgeRow>> = BTreeMap::new();
-        for r in rows {
-            by.entry(self.layout.index_of(r.src_rk))
-                .or_default()
-                .push(r);
-        }
-        for (i, part) in by {
-            let mut sql = format!(
-                "INSERT INTO {} (src, type, dst, id, dst_rk, props, _types, _v, _sprig_rk) VALUES ",
-                self.t(i).edges
-            );
-            let mut params: Vec<MyValue> = Vec::new();
-            for (k, r) in part.iter().enumerate() {
-                if k > 0 {
-                    sql.push_str(", ");
-                }
-                sql.push_str("(?, ?, ?, ?, ?, ?, ?, ?, ?)");
-                params.extend([
-                    MyValue::from(r.src),
-                    MyValue::from(r.rtype),
-                    MyValue::from(r.dst),
-                    MyValue::from(r.id),
-                    MyValue::from(r.dst_rk),
-                    MyValue::from(json_text(&r.props)),
-                    r.types
-                        .as_ref()
-                        .map_or(MyValue::NULL, |t| MyValue::from(json_text(t))),
-                    MyValue::from(self.now_us),
-                    MyValue::from(r.src_rk),
-                ]);
-            }
-            let first = part[0].id;
-            if let Err(e) = self.run_at(i, sql, Params::Positional(params)).await {
-                return Err(self.duplicate(e, "Relationship", first));
-            }
-        }
-        if !self.write_mirrors() {
-            return Ok(());
-        }
-        // Mirrors on the destinations' shards, in the same transaction.
-        let mut by: BTreeMap<usize, Vec<&EdgeRow>> = BTreeMap::new();
-        for r in rows {
-            by.entry(self.layout.index_of(r.dst_rk))
-                .or_default()
-                .push(r);
-        }
-        for (i, part) in by {
-            let mut sql = format!(
-                "INSERT INTO {} (dst, type, src, id, src_rk, _v, _sprig_rk) VALUES ",
-                self.t(i).mirrors
-            );
-            let mut params: Vec<MyValue> = Vec::new();
-            for (k, r) in part.iter().enumerate() {
-                if k > 0 {
-                    sql.push_str(", ");
-                }
-                sql.push_str("(?, ?, ?, ?, ?, ?, ?)");
-                params.extend([
-                    MyValue::from(r.dst),
-                    MyValue::from(r.rtype),
-                    MyValue::from(r.src),
-                    MyValue::from(r.id),
-                    MyValue::from(r.src_rk),
-                    MyValue::from(self.now_us),
-                    MyValue::from(r.dst_rk),
-                ]);
-            }
-            self.run_at(i, sql, Params::Positional(params)).await?;
+        self.insert_edges_json(rows).await?;
+        if let Some(sh) = self.shadow.clone() {
+            let now = self.now_us;
+            let mut t = sh.store(&mut *self.conns, now);
+            t.insert_edges(rows).await?;
+            sh.keep(&t);
         }
         Ok(())
     }
 
     async fn update_node(&mut self, row: &NodeRow, old_labels: &[u32]) -> Result<()> {
-        let defs: Vec<IndexDef> = self
-            .unique_defs(Entity::Node)
-            .into_iter()
-            .filter(|d| row.labels.contains(&d.token_id) || old_labels.contains(&d.token_id))
-            .collect();
-        if !defs.is_empty() {
-            // The row as the transaction sees it (the caller locked it).
-            let old = self.lock_nodes(&[row.id], true).await?;
-            for d in &defs {
-                let was = old.first().and_then(|o| Self::node_key(d, o));
-                let now = Self::node_key(d, row);
-                if was == now {
-                    continue;
-                }
-                if let Some(k) = &now {
-                    self.claim(d, k, "Node", row.id, row.rk).await?;
-                }
-                if let Some(k) = &was {
-                    self.release(d, k, row.id).await?;
-                }
-            }
-        }
-        let i = self.layout.index_of(row.rk);
-        let t = self.t(i).clone();
-        let r = self
-            .run_at(
-                i,
-                format!(
-                    "UPDATE {} SET labels = ?, props = ?, _types = ?, _v = ? WHERE id = ?",
-                    t.nodes
-                ),
-                Params::Positional(vec![
-                    MyValue::from(json_text(&Json::from(row.labels.clone()))),
-                    MyValue::from(json_text(&row.props)),
-                    row.types
-                        .as_ref()
-                        .map_or(MyValue::NULL, |t| MyValue::from(json_text(t))),
-                    MyValue::from(self.now_us),
-                    MyValue::from(row.id),
-                ]),
-            )
-            .await;
-        if let Err(e) = r {
-            return Err(self.duplicate(e, "Node", row.id));
-        }
-        let removed: Vec<u64> = old_labels
-            .iter()
-            .filter(|l| !row.labels.contains(l))
-            .map(|l| u64::from(*l))
-            .collect();
-        if !removed.is_empty() {
-            self.run_at(
-                i,
-                format!(
-                    "DELETE FROM {} WHERE id = ? AND label IN ({})",
-                    t.labels,
-                    ids_list(&removed)
-                ),
-                Params::Positional(vec![MyValue::from(row.id)]),
-            )
-            .await?;
-        }
-        let added: Vec<u32> = row
-            .labels
-            .iter()
-            .copied()
-            .filter(|l| !old_labels.contains(l))
-            .collect();
-        for l in added {
-            self.run_at(
-                i,
-                format!(
-                    "INSERT IGNORE INTO {} (label, id, _sprig_rk) VALUES (?, ?, ?)",
-                    t.labels
-                ),
-                Params::Positional(vec![
-                    MyValue::from(l),
-                    MyValue::from(row.id),
-                    MyValue::from(row.rk),
-                ]),
-            )
-            .await?;
+        self.update_node_json(row, old_labels).await?;
+        if let Some(sh) = self.shadow.clone() {
+            let now = self.now_us;
+            let mut t = sh.store(&mut *self.conns, now);
+            t.update_node(row, old_labels).await?;
+            sh.keep(&t);
         }
         Ok(())
     }
 
     async fn update_edge(&mut self, row: &EdgeRow) -> Result<()> {
-        let defs: Vec<IndexDef> = self
-            .unique_defs(Entity::Relationship)
-            .into_iter()
-            .filter(|d| d.token_id == row.rtype)
-            .collect();
-        if !defs.is_empty() {
-            let old = self.edges_on(&[(row.id, row.src_rk)]).await?;
-            for d in &defs {
-                let was = old.first().and_then(|o| Self::edge_key(d, o));
-                let now = Self::edge_key(d, row);
-                if was == now {
-                    continue;
-                }
-                if let Some(k) = &now {
-                    self.claim(d, k, "Relationship", row.id, row.src_rk).await?;
-                }
-                if let Some(k) = &was {
-                    self.release(d, k, row.id).await?;
-                }
-            }
-        }
-        let i = self.layout.index_of(row.src_rk);
-        let sql = format!(
-            "UPDATE {} SET props = ?, _types = ?, _v = ? WHERE id = ?",
-            self.t(i).edges
-        );
-        let r = self
-            .run_at(
-                i,
-                sql,
-                Params::Positional(vec![
-                    MyValue::from(json_text(&row.props)),
-                    row.types
-                        .as_ref()
-                        .map_or(MyValue::NULL, |t| MyValue::from(json_text(t))),
-                    MyValue::from(self.now_us),
-                    MyValue::from(row.id),
-                ]),
-            )
-            .await;
-        if let Err(e) = r {
-            return Err(self.duplicate(e, "Relationship", row.id));
+        self.update_edge_json(row).await?;
+        if let Some(sh) = self.shadow.clone() {
+            let now = self.now_us;
+            let mut t = sh.store(&mut *self.conns, now);
+            t.update_edge(row).await?;
+            sh.keep(&t);
         }
         Ok(())
     }
 
     async fn delete_edges(&mut self, edges: &[EdgeKey]) -> Result<u64> {
-        if edges.is_empty() {
-            return Ok(0);
-        }
-        let defs: Vec<IndexDef> = self
-            .unique_defs(Entity::Relationship)
-            .into_iter()
-            .filter(|d| edges.iter().any(|e| e.rtype == d.token_id))
-            .collect();
-        if !defs.is_empty() {
-            let keys: Vec<(u64, u64)> = edges.iter().map(|e| (e.id, e.src_rk)).collect();
-            for e in self.edges_on(&keys).await? {
-                for d in &defs {
-                    if let Some(k) = Self::edge_key(d, &e) {
-                        self.release(d, &k, e.id).await?;
-                    }
-                }
-            }
-        }
-        let mut n = 0;
-        let mut by: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
-        for e in edges {
-            by.entry(self.layout.index_of(e.src_rk))
-                .or_default()
-                .push(e.id);
-        }
-        for (i, ids) in by {
-            let sql = format!(
-                "DELETE FROM {} WHERE id IN ({})",
-                self.t(i).edges,
-                ids_list(&ids)
-            );
-            n += self.run_at(i, sql, Params::Empty).await?;
-        }
-        if self.write_mirrors() {
-            let mut by: BTreeMap<usize, (Vec<u64>, Vec<u64>)> = BTreeMap::new();
-            for e in edges {
-                let x = by.entry(self.layout.index_of(e.dst_rk)).or_default();
-                x.0.push(e.dst);
-                x.1.push(e.id);
-            }
-            for (i, (dsts, ids)) in by {
-                let sql = format!(
-                    "DELETE FROM {} WHERE dst IN ({}) AND id IN ({})",
-                    self.t(i).mirrors,
-                    ids_list(&dsts),
-                    ids_list(&ids)
-                );
-                self.run_at(i, sql, Params::Empty).await?;
-            }
+        let n = self.delete_edges_json(edges).await?;
+        if let Some(sh) = self.shadow.clone() {
+            let now = self.now_us;
+            let mut t = sh.store(&mut *self.conns, now);
+            t.delete_edges(edges).await?;
+            sh.keep(&t);
         }
         Ok(n)
     }
 
     async fn delete_nodes(&mut self, ids: &[u64]) -> Result<u64> {
-        let defs = self.unique_defs(Entity::Node);
-        if !defs.is_empty() && !ids.is_empty() {
-            for o in self.lock_nodes(ids, true).await? {
-                for d in &defs {
-                    if let Some(k) = Self::node_key(d, &o) {
-                        self.release(d, &k, o.id).await?;
-                    }
-                }
-            }
-        }
-        let mut n = 0;
-        for (i, part) in self.layout.by_shard(ids) {
-            let l = ids_list(&part);
-            let t = self.t(i).clone();
-            self.run_at(
-                i,
-                format!("DELETE FROM {} WHERE id IN ({l})", t.labels),
-                Params::Empty,
-            )
-            .await?;
-            n += self
-                .run_at(
-                    i,
-                    format!("DELETE FROM {} WHERE id IN ({l})", t.nodes),
-                    Params::Empty,
-                )
-                .await?;
+        let n = self.delete_nodes_json(ids).await?;
+        if let Some(sh) = self.shadow.clone() {
+            let now = self.now_us;
+            let mut t = sh.store(&mut *self.conns, now);
+            t.delete_nodes(ids).await?;
+            sh.keep(&t);
         }
         Ok(n)
     }

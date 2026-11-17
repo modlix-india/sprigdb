@@ -596,6 +596,21 @@ impl GatewayLocator {
             .opts)
     }
 
+    /// Whether `cluster` is a Galera cluster (its registry record's
+    /// topology).
+    ///
+    /// # Errors
+    /// 39104 for an unknown cluster; the registry's.
+    pub async fn is_galera(&self, cluster: &ClusterId) -> Result<bool> {
+        let stored = self.registry.get(cluster).await?.ok_or_else(|| {
+            SprigError::new(
+                SprigCode::ClusterNotFound,
+                format!("no cluster {cluster} in dc {}", self.registry.dc()),
+            )
+        })?;
+        Ok(stored.body().topology == sprig_cluster::record::TopologyKind::Galera)
+    }
+
     /// Connection options of `sprig_ctl` on `cluster`'s replicas: its
     /// nodes other than the writer, for a primary with replicas (the
     /// queues' `queue.confirm_mode = replica`). Empty for one node, Galera

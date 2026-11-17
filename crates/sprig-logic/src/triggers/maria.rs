@@ -2,6 +2,7 @@
 //! on an event's shard with its marker, the catalog's dead letters and
 //! log, the subscription's checkpoint, and dead-letter replays.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,7 @@ use sprig_meta::MetaStore;
 use super::{Applied, Apply, Outcomes, TriggerEvent, subscription_name};
 use crate::catalog::LogicStore;
 use crate::deploy::conn_err;
+use crate::rollout::{Acc, RolloutSpec};
 
 /// Pools of `sprig_ctl` connections to the cluster holding a tenant's
 /// shards now.
@@ -32,13 +34,31 @@ pub trait ShardPools: Send + Sync {
     async fn pool(&self, tenant: TenantId) -> Result<Pool>;
 }
 
-/// The active version of a module and its parameter names, re-read from
-/// the catalog at most every two seconds.
+/// A version and its parameters' names, in call order.
+type Version = (u64, Vec<String>);
+
+/// What [`CatalogVersions`] last read.
+struct Cached {
+    at: Instant,
+    active: Version,
+    /// A staged rollout: the candidate and its stage.
+    candidate: Option<(Version, RolloutSpec)>,
+}
+
+/// The active version of a module and its parameter names, and a staged
+/// rollout's candidate, re-read from the catalog at most every two
+/// seconds. While a rollout runs, each event's row key picks the version
+/// ([`CatalogVersions::pick`]), and the runs of both versions are counted
+/// into `logic_version_stats` at each read, where a candidate that fails
+/// more than the active version is rolled back, as a gateway does for
+/// calls.
 pub struct CatalogVersions {
     locator: Arc<dyn CatalogLocator>,
     tenant: TenantId,
     module_id: u64,
-    cached: Mutex<Option<(Instant, u64, Vec<String>)>>,
+    cached: Mutex<Option<Cached>>,
+    /// Runs per version since the last read, while a rollout runs.
+    counts: Mutex<HashMap<u64, Acc>>,
 }
 
 impl CatalogVersions {
@@ -50,6 +70,7 @@ impl CatalogVersions {
             tenant,
             module_id,
             cached: Mutex::new(None),
+            counts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -58,16 +79,59 @@ impl CatalogVersions {
     /// # Errors
     /// 39860 without an active version; catalog errors.
     pub async fn active(&self) -> Result<(u64, Vec<String>)> {
-        if let Some((at, v, p)) = &*self.cached.lock().unwrap_or_else(PoisonError::into_inner)
-            && at.elapsed() < Duration::from_secs(2)
+        Ok(self.current().await?.0)
+    }
+
+    /// The version that runs an event on the row whose primary key is
+    /// `row_key` (`id=7`; several columns joined by commas): the
+    /// candidate of a staged rollout when the key's bucket falls in its
+    /// share, the active version otherwise.
+    ///
+    /// # Errors
+    /// As [`Self::active`].
+    pub async fn pick(&self, row_key: &str) -> Result<(u64, Vec<String>)> {
+        let (active, candidate) = self.current().await?;
+        Ok(match candidate {
+            Some((c, spec))
+                if crate::rollout::key_picks_candidate(spec, Some(row_key), self.module_id) =>
+            {
+                c
+            }
+            _ => active,
+        })
+    }
+
+    /// Counts one run of `version` while a rollout runs (a run that
+    /// failed for the code, not for a lost connection or a lock wait).
+    pub fn count(&self, version: u64, elapsed: Duration, failed: bool) {
+        let staged = self
+            .cached
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|c| c.candidate.is_some());
+        if staged {
+            self.counts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(version)
+                .or_default()
+                .add(elapsed, failed);
+        }
+    }
+
+    async fn current(&self) -> Result<(Version, Option<(Version, RolloutSpec)>)> {
+        if let Some(c) = &*self.cached.lock().unwrap_or_else(PoisonError::into_inner)
+            && c.at.elapsed() < Duration::from_secs(2)
         {
-            return Ok((*v, p.clone()));
+            return Ok((c.active.clone(), c.candidate.clone()));
         }
         let ep = self.locator.writer(self.tenant).await?;
         let mut c = ep.pool.get_conn().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
-        let store = LogicStore::new(ep.store.schema());
+        let schema = ep.store.schema().to_owned();
+        let store = LogicStore::new(&schema);
         let m = store
             .module_by_id(&mut c, self.module_id)
             .await?
@@ -84,26 +148,91 @@ impl CatalogVersions {
                 format!("module {} has no active version", m.name),
             )
         })?;
+        let params = |sig: &serde_json::Value| -> Vec<String> {
+            sig["params"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|p| p["name"].as_str().map(str::to_owned))
+                .collect()
+        };
         let (sig, _) = store.version_signature(&mut c, self.module_id, v).await?;
-        let params: Vec<String> = sig["params"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|p| p["name"].as_str().map(str::to_owned))
-            .collect();
-        *self.cached.lock().unwrap_or_else(PoisonError::into_inner) =
-            Some((Instant::now(), v, params.clone()));
-        Ok((v, params))
+        let active = (v, params(&sig));
+        let mut rollout = crate::rollout::get(&mut c, &schema, self.module_id)
+            .await?
+            .filter(|r| r.active_version == v);
+        if let Some(r) = rollout.clone() {
+            // The runs counted since the last read, and the automatic
+            // rollback of a candidate that fails more.
+            let counted: Vec<((u64, u64), Acc)> =
+                std::mem::take(&mut *self.counts.lock().unwrap_or_else(PoisonError::into_inner))
+                    .into_iter()
+                    .map(|(ver, a)| ((self.module_id, ver), a))
+                    .collect();
+            if !counted.is_empty() {
+                crate::rollout::flush(&mut c, &schema, &counted).await?;
+            }
+            let stats = crate::rollout::stats(&mut c, &schema, self.module_id).await?;
+            let why = stats
+                .iter()
+                .find(|s| s.version == r.candidate_version)
+                .and_then(|cand| {
+                    let act = stats.iter().find(|s| s.version == r.active_version);
+                    crate::rollout::verdict(act, cand)
+                });
+            if let Some(why) = why {
+                crate::messages::rollout_change(
+                    &mut c,
+                    &schema,
+                    self.module_id,
+                    &m.name,
+                    crate::rollout::RolloutOp::Abort,
+                    0,
+                    "SprigDB",
+                )
+                .await?;
+                let _ = store
+                    .log(
+                        &mut c,
+                        self.module_id,
+                        Some(r.candidate_version),
+                        "warn",
+                        "deploy",
+                        &format!(
+                            "rollout of version {} rolled back by itself (error 39870): {why}; \
+                             version {} runs every row",
+                            r.candidate_version, r.active_version
+                        ),
+                    )
+                    .await;
+                rollout = None;
+            }
+        }
+        let candidate = match rollout {
+            Some(r) => {
+                let (csig, _) = store
+                    .version_signature(&mut c, self.module_id, r.candidate_version)
+                    .await?;
+                Some(((r.candidate_version, params(&csig)), r.spec()))
+            }
+            None => None,
+        };
+        *self.cached.lock().unwrap_or_else(PoisonError::into_inner) = Some(Cached {
+            at: Instant::now(),
+            active: active.clone(),
+            candidate: candidate.clone(),
+        });
+        Ok((active, candidate))
     }
 
-    /// The last version read (0 before the first read).
+    /// The last active version read (0 before the first read).
     #[must_use]
     pub fn last(&self) -> u64 {
         self.cached
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
-            .map_or(0, |(_, v, _)| *v)
+            .map_or(0, |c| c.active.0)
     }
 }
 
@@ -248,8 +377,9 @@ impl MariaApply {
 impl Apply for MariaApply {
     async fn apply(&self, ev: &TriggerEvent) -> Result<Applied> {
         // The version first: reading it takes a catalog connection, which
-        // must never be awaited while this attempt holds a shard's.
-        let (version, params) = self.versions.active().await?;
+        // must never be awaited while this attempt holds a shard's. A
+        // staged rollout picks by the row's key.
+        let (version, params) = self.versions.pick(&ev.row_key).await?;
         let retry = |mut e: SprigError| {
             e.retryable = true;
             e
@@ -284,7 +414,15 @@ impl Apply for MariaApply {
                 .await
                 .map_err(conn_err)?;
         }
+        let started = Instant::now();
         let r = self.attempt(&mut c, ev, version, &params).await;
+        // A rollout's numbers: runs, and failures of the code (not a lost
+        // connection or a lock wait, which are tried again).
+        match &r {
+            Ok(Applied::Ran(_)) => self.versions.count(version, started.elapsed(), false),
+            Err(e) if !transient(e) => self.versions.count(version, started.elapsed(), true),
+            _ => {}
+        }
         // The pooled sprig_ctl connection must not keep the definer's
         // context: other internal work on it would be checked as the
         // definer. A connection that can't be reset is closed.

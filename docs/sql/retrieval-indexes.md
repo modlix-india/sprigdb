@@ -89,13 +89,13 @@ A worker follows the table's [change feed](../concepts/change-feed.md):
 - **Inserts and updates** are indexed within a second or two. An update that doesn't change the text, the title, a filter column or the key costs nothing.
 - **Deletes** remove the row's chunks. A deleted row never shows up in a search even before that, because every hit is checked against the table.
 - **Exactly once.** The worker records how far it has read the feed only after its writes commit, and replaces a row's chunks only if the row still holds the text it embedded. A worker killed in the middle is replaced, reads the last changes again and passes over the rows it had already done.
-- **Shards.** Each shard of the table keeps the chunks of its own rows, next to them. When a shard is split, merged or moved, its new copy is indexed again (state `rebuilding`); meanwhile searches miss that shard's rows.
+- **Shards.** Each shard of the table keeps the chunks of its own rows, next to them, and each chunk carries its row's routing hash. When a shard is split, merged or moved, its chunks move with its rows, so searches find them in the new shards as soon as the move is done. The worker then checks the new shards: it reads each row's hash and embeds again only a row whose chunks are missing or out of date, and the index stays `ready`. Moving a table into a table group moves its chunks with it too. One case makes a shard indexed again from scratch (state `rebuilding`; meanwhile searches miss that shard's rows): a re-key, whose new routing can't be computed from a chunk. A shard that arrives without its chunks for any other reason is filled the same way.
 
 | State | Meaning |
 |---|---|
 | `building` | Existing rows are being indexed |
 | `ready` | Every shard is indexed; changes are followed |
-| `rebuilding` | A shard is being indexed again after a split, merge or move |
+| `rebuilding` | A shard is being indexed again from scratch: after a re-key, or when a shard arrived without its chunks |
 | `failed` | Stopped on an error, shown in `SHOW RETRIEVAL INDEXES`: for example, a column the index reads was dropped, or the model isn't available. The worker tries again every 30 to 60 seconds. |
 
 ## RETRIEVE()
@@ -139,6 +139,14 @@ How a search works:
 3. The candidates' rows are read through your session: rows you can't `SELECT`, rows a row-level security policy hides from you, and rows that no longer exist are dropped. You also need `SELECT` on the text column (and the title column).
 4. The two lists are fused with reciprocal-rank fusion (each chunk scores `1 / (60 + rank)` in each list it is in), keeping at most two chunks of a row. A query that names an exact identifier, such as an error code or a setting key, weighs the full-text list three times, since the model doesn't know such names.
 5. When a policy hid so many candidates that fewer than `limit` hits are left, the search runs again with four times the candidates, up to 1,000 per list and shard.
+
+**Ranking for a user that row-level security restricts.** MariaDB's full-text relevance weighs each word by how many chunks of the whole index contain it, so a plain full-text ranking would depend on rows you can't see. When a row-level security policy on the table applies to you, the full-text list is ranked over the rows you may see alone:
+
+- Every chunk that contains a word of the query is a candidate, at most 1,000 per shard.
+- The candidates whose rows you can read are ranked by BM25, with word counts and lengths taken from those chunks only. Equal scores go to the lower key.
+- Both lists are cut at the same depth (40 per shard), counted in chunks you can see, so how many hidden rows there are changes nothing.
+
+Your hits and ranks are then the same whether or not the hidden rows exist. A query whose words match more than 1,000 chunks in one shard is ranked by the vector list alone for you. Users no policy restricts keep the full-text relevance of the whole index. The nearest-chunk search uses MariaDB's approximate vector index, whose answers can still vary slightly with the rows in the index.
 
 Arguments:
 

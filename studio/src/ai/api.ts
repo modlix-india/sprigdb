@@ -132,3 +132,11 @@ export type DocsReply = Schemas['DocsSearchReply'];
 export function searchDocs(query: string, limit = 12, audience?: 'user' | 'dba' | 'operator'): Promise<DocsReply> {
   return json<DocsReply>('/v1/docs:search', { method: 'POST', body: { query, limit, ...(audience ? { audience } : {}) } });
 }
+
+export type DocsPage = Schemas['DocsPage'];
+
+/** One docs page of this release, rebuilt from the docs pack. */
+export function docsPage(page: string, version?: string): Promise<DocsPage> {
+  const path = page.split('/').map(encodeURIComponent).join('/');
+  return json<DocsPage>(`/v1/docs/pages/${path}${version ? `?version=${encodeURIComponent(version)}` : ''}`);
+}

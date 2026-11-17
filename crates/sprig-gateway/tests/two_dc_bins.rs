@@ -47,6 +47,12 @@
 //! 4. **A move into the standby's DC.** A tenant with its own
 //!    `failover.standby_dcs = 1` gets a job standby in `ams1`; `sprigctl
 //!    tenant move --to ams1` drops the standby first and moves it.
+//! 5. **Change streams from a time.** A `fra1` tenant's `Changes.Watch`
+//!    with `start_at_hlc` and MongoDB stream with `startAtOperationTime`,
+//!    opened at `ams1`, start from `fra1`'s feed time index: a user a row
+//!    policy binds gets her changes after the time and nothing else; a
+//!    time before the index is 39800 (MongoDB 286); a time with a resume
+//!    token is 39801 (MongoDB 40674). `XDC_ONLY=times`.
 
 #![allow(
     clippy::unwrap_used,
@@ -1620,12 +1626,23 @@ struct Stream {
 }
 
 async fn open_stream(port: u16, auth: &str, db: &str, extra: &[(&str, &str)]) -> Stream {
+    open_stream_with(port, auth, db, "", extra).await
+}
+
+/// [`open_stream`] with a query string (`?objects=...`).
+async fn open_stream_with(
+    port: u16,
+    auth: &str,
+    db: &str,
+    query: &str,
+    extra: &[(&str, &str)],
+) -> Stream {
     let mut h = String::new();
     for (k, v) in extra {
         let _ = write!(h, "{k}: {v}\r\n");
     }
     let req = format!(
-        "GET /v1/databases/{db}/changes HTTP/1.1\r\nHost: {H}:{port}\r\nAuthorization: {auth}\r\n{h}\r\n"
+        "GET /v1/databases/{db}/changes{query} HTTP/1.1\r\nHost: {H}:{port}\r\nAuthorization: {auth}\r\n{h}\r\n"
     );
     let mut s = TcpStream::connect((H, port)).await.unwrap();
     s.write_all(req.as_bytes()).await.unwrap();
@@ -1900,6 +1917,247 @@ async fn mongo_and_kafka(c: &mut Checks) {
             .is_ok_and(|(v, _)| v.iter().any(|x| x == "two")),
         || format!("{polled:?}"),
     );
+}
+
+/// Part 5: change streams of a `fra1` tenant from a time, opened at
+/// `ams1`. `Changes.Watch`'s `start_at_hlc` and MongoDB's
+/// `startAtOperationTime` start from `fra1`'s feed time index (the home
+/// gateway's tail), and a user a row policy binds gets only her changes
+/// after the time. Too old a time, and a time with a resume token, are
+/// refused as at home.
+async fn from_a_time(d: &Deployment, c: &mut Checks) {
+    use mongodb::bson::{Document, doc};
+    use mongodb::change_stream::event::OperationType;
+    const T: &str = "xdc-at";
+    d.tenant("fra1", T, None).await;
+    let app = format!("{T}.app");
+    let alice = format!("{T}.xat_alice");
+    run(
+        "fra1",
+        &app,
+        &[
+            "CREATE DATABASE at",
+            "CREATE TABLE at.docs (id INT PRIMARY KEY, owner VARCHAR(64), body VARCHAR(64))",
+            &format!("CREATE USER 'xat_alice'@'%' IDENTIFIED BY '{APP_PW}'"),
+            "GRANT SELECT, WATCH ON at.* TO 'xat_alice'@'%'",
+            "CREATE POLICY own ON at.docs USING (owner = CURRENT_USER())",
+            "ALTER TABLE at.docs ENABLE ROW LEVEL SECURITY",
+            "INSERT INTO at.docs VALUES (1, 'xat_alice@%', 'before'), (2, 'bob@%', 'before')",
+        ],
+    )
+    .await;
+    // The same for MongoDB: a collection whose policy keeps a user's own
+    // documents.
+    let home = mongo_client("fra1", &app).await;
+    let notes = home.database("at").collection::<Document>("notes");
+    let r = notes
+        .insert_many([
+            doc! {"_id": 1, "owner": "xat_alice@%"},
+            doc! {"_id": 2, "owner": "bob@%"},
+        ])
+        .await;
+    c.ok(
+        "fra1: the MongoDB collection's first documents",
+        r.is_ok(),
+        || format!("{r:?}"),
+    );
+    for cmd in [
+        doc! {"sprigCreatePolicy": "notes", "name": "own", "using": {"owner": "$$USER"}},
+        doc! {"sprigRowSecurity": "notes", "enable": true},
+    ] {
+        let r = home.database("at").run_command(cmd).await;
+        c.ok("fra1: the collection's policy", r.is_ok(), || {
+            format!("{r:?}")
+        });
+    }
+    // The controller writes fra1's time index every 10 s, and a start reads
+    // a position 30 s or more before its time: wait for an old enough row.
+    let root = OptsBuilder::default()
+        .ip_or_hostname(H)
+        .tcp_port(ports("fra1").db)
+        .user(Some("root"))
+        .pass(Some(ROOT_PW))
+        .prefer_socket(false);
+    let mut b = Conn::new(root).await.expect("fra1 root");
+    let t0 = Instant::now();
+    loop {
+        let oldest: Option<i64> = b
+            .query_first("SELECT MIN(bucket) FROM __sprig_sys.__sprig_feed_time")
+            .await
+            .ok()
+            .flatten();
+        if oldest.is_some_and(|o| o <= now() - 36) || t0.elapsed() > Duration::from_secs(120) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let _ = b.disconnect().await;
+    // Statement stamps round up to the next second: the time is taken two
+    // seconds after the first writes and a second before the next.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let away = mongo_client("ams1", &app).await;
+    let at = away
+        .database("at")
+        .run_command(doc! {"ping": 1})
+        .await
+        .ok()
+        .and_then(|r| r.get_timestamp("operationTime").ok())
+        .unwrap_or(mongodb::bson::Timestamp {
+            time: u32::try_from(now()).unwrap_or(0),
+            increment: 0,
+        });
+    let hlc = (u64::from(at.time) << 32) | u64::from(at.increment);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    run(
+        "fra1",
+        &app,
+        &[
+            "INSERT INTO at.docs VALUES (3, 'xat_alice@%', 'after'), (4, 'bob@%', 'after')",
+            "UPDATE at.docs SET owner = 'bob@%' WHERE id = 3",
+        ],
+    )
+    .await;
+    let _ = notes
+        .insert_many([
+            doc! {"_id": 3, "owner": "xat_alice@%"},
+            doc! {"_id": 4, "owner": "bob@%"},
+        ])
+        .await;
+    let _ = notes
+        .update_one(doc! {"_id": 3}, doc! {"$set": {"owner": "bob@%"}})
+        .await;
+    let ops = |lines: &[String]| -> Vec<String> {
+        lines
+            .iter()
+            .filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
+            .filter(|v| v.get("op").is_some() && v["op"] != "heartbeat")
+            .map(|v| {
+                let key: Value = v["key"]
+                    .as_str()
+                    .and_then(|k| serde_json::from_str(k).ok())
+                    .unwrap_or_default();
+                format!(
+                    "{}:{}",
+                    v["op"].as_str().unwrap_or("?"),
+                    key["id"].as_i64().unwrap_or(-1)
+                )
+            })
+            .collect()
+    };
+    let q = format!("?objects=docs&start_at_hlc={hlc}");
+    let open = |user: String, query: String| async move {
+        let auth = basic(&user, APP_PW);
+        let mut s = open_stream_with(ports("ams1").http, &auth, "at", &query, &[]).await;
+        if s.status == 200 {
+            let got = s.until(Duration::from_secs(8), |_| false).await;
+            return (s.status, got);
+        }
+        // An error's body may end without a newline.
+        let mut rest = Vec::new();
+        let mut r = s.lines.into_inner();
+        let _ = tokio::time::timeout(Duration::from_secs(3), r.read_to_end(&mut rest)).await;
+        (s.status, vec![String::from_utf8_lossy(&rest).into_owned()])
+    };
+    let (st, got) = open(alice.clone(), q.clone()).await;
+    c.ok(
+        "ams1: a bound user's Changes.Watch from a time gets her insert after it, then its delete as it leaves her view",
+        st == 200 && ops(&got) == ["insert:3", "delete:3"],
+        || format!("{st} {got:?}"),
+    );
+    let (st, got) = open(app.clone(), q.clone()).await;
+    c.ok(
+        "ams1: the administrator's Changes.Watch from the same time gets every change after it, none before",
+        st == 200 && ops(&got) == ["insert:3", "insert:4", "update:3"],
+        || format!("{st} {got:?}"),
+    );
+    let (st, got) = open(
+        app.clone(),
+        format!("?objects=docs&start_at_hlc={}", 1u64 << 32),
+    )
+    .await;
+    c.ok(
+        "ams1: a start_at_hlc before fra1's time index is refused (39800)",
+        st != 200 && got.iter().any(|l| l.contains("39800")),
+        || format!("{st} {got:?}"),
+    );
+    let (st, got) = open(app.clone(), format!("{q}&start_after=00")).await;
+    c.ok(
+        "ams1: start_at_hlc with a resume token is refused (39801)",
+        st != 200 && got.iter().any(|l| l.contains("39801")),
+        || format!("{st} {got:?}"),
+    );
+
+    // MongoDB at ams1.
+    let mine = mongo_client("ams1", &alice).await;
+    let coll = mine.database("at").collection::<Document>("notes");
+    let mut seen = Vec::new();
+    let opened = coll.watch().start_at_operation_time(at).await;
+    match opened {
+        Ok(mut st) => {
+            let t0 = Instant::now();
+            while t0.elapsed() < Duration::from_secs(10) && seen.len() < 3 {
+                match tokio::time::timeout(Duration::from_secs(2), st.next_if_any()).await {
+                    Ok(Ok(Some(ev))) => seen.push(format!(
+                        "{:?}:{}",
+                        ev.operation_type,
+                        ev.document_key
+                            .as_ref()
+                            .and_then(|k| k.get("_id"))
+                            .map(ToString::to_string)
+                            .unwrap_or_default()
+                    )),
+                    Ok(Ok(None)) | Err(_) => {}
+                    Ok(Err(e)) => {
+                        seen.push(format!("error {e}"));
+                        break;
+                    }
+                }
+            }
+            c.ok(
+                "ams1: a bound user's MongoDB stream from startAtOperationTime gets her insert after it, then its delete",
+                seen.len() == 2
+                    && seen[0].starts_with(&format!("{:?}", OperationType::Insert))
+                    && seen[0].ends_with(":3")
+                    && seen[1].starts_with(&format!("{:?}", OperationType::Delete))
+                    && seen[1].ends_with(":3"),
+                || format!("{seen:?}"),
+            );
+        }
+        Err(e) => c.ok(
+            "ams1: a MongoDB stream from startAtOperationTime opens",
+            false,
+            || e.to_string(),
+        ),
+    }
+    let old = coll
+        .watch()
+        .start_at_operation_time(mongodb::bson::Timestamp {
+            time: 1,
+            increment: 0,
+        })
+        .await;
+    let code = |e: &mongodb::error::Error| match e.kind.as_ref() {
+        mongodb::error::ErrorKind::Command(c) => c.code,
+        _ => 0,
+    };
+    c.ok(
+        "ams1: startAtOperationTime before fra1's time index is 286",
+        old.as_ref().is_err_and(|e| code(e) == 286),
+        || format!("{:?}", old.as_ref().err()),
+    );
+    let both = mine
+        .database("at")
+        .run_command(doc! {"aggregate": "notes", "cursor": {},
+            "pipeline": [{"$changeStream": {"startAtOperationTime": at, "resumeAfter": {"_data": "00"}}}]})
+        .await;
+    c.ok(
+        "ams1: startAtOperationTime with resumeAfter is 40674",
+        both.as_ref().is_err_and(|e| code(e) == 40674),
+        || format!("{both:?}"),
+    );
+    mine.shutdown().await;
+    away.shutdown().await;
+    home.shutdown().await;
 }
 
 /// The member's sinks and connections of database `sw`.
@@ -2347,6 +2605,9 @@ async fn bins_two_data_centres() {
     if only.is_empty() || only.contains("streams") {
         change_streams(&d, &mut c).await;
         mongo_and_kafka(&mut c).await;
+    }
+    if only.is_empty() || only.contains("times") {
+        from_a_time(&d, &mut c).await;
     }
     if only.is_empty() || only.contains("sinks") {
         inherited_sinks(&d, &mut c).await;

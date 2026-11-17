@@ -418,7 +418,18 @@ pub fn serve(
                 svc.locator.dc_store(),
                 Arc::clone(&svc.locator) as Arc<dyn sprig_catalog::CatalogLocator>,
             )?;
-            let start = if req.start_after.is_empty() {
+            let start = if req.start_at_hlc != 0 {
+                // `startAtOperationTime` from another DC: the time index of
+                // the tenant's cluster here.
+                crate::http::changes::start_at(
+                    &svc,
+                    &clusters,
+                    &placement,
+                    tenant,
+                    req.start_at_hlc,
+                )
+                .await?
+            } else if req.start_after.is_empty() {
                 StartAt::Now
             } else {
                 StartAt::After(ResumeToken::from_hex(&req.start_after)?)
@@ -533,16 +544,20 @@ pub async fn remote_home(svc: &TenantServices, tenant: TenantId) -> Result<Optio
 }
 
 /// A tail of `tenant`'s feed relayed from a gateway of `home`: its
-/// starting token (hex) and its items.
+/// starting token (hex) and its items. A `start_at_hlc` other than 0
+/// starts at that time through the home cluster's feed time index
+/// (`startAtOperationTime`); the caller leaves out the items stamped
+/// before it.
 ///
 /// # Errors
-/// 39302 under residency; the home gateway's error; 39788 when no gateway
-/// of `home` answers.
+/// 39302 under residency; the home gateway's error (39800, 39802 for a
+/// time it can't start at); 39788 when no gateway of `home` answers.
 pub async fn open(
     svc: &TenantServices,
     home: &DcId,
     tenant: TenantId,
     start_after: Option<&ResumeToken>,
+    start_at_hlc: u64,
 ) -> Result<(String, mpsc::Receiver<Result<FeedItem>>)> {
     if denied(svc, tenant, svc.dc.as_str()).await? {
         return Err(deny(tenant, svc.dc.as_str()));
@@ -560,6 +575,7 @@ pub async fn open(
         tenant_id: tenant.0,
         start_after: start_after.map(ResumeToken::to_hex).unwrap_or_default(),
         caller_dc: svc.dc.to_string(),
+        start_at_hlc,
     };
     let mut last = None;
     for rec in &peers.gateways_in(home).await? {

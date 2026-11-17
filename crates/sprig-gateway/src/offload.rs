@@ -133,18 +133,119 @@ pub fn cpu<R>(size: usize, f: impl FnOnce() -> R) -> R {
 
 // ----- graph statements ------------------------------------------------------
 
-/// How long a graph statement waits for one of [`graph_slots`] before it
-/// runs without one.
-pub const GRAPH_SLOT_WAIT: Duration = Duration::from_secs(1);
+/// The default wait for one of [`graph_slots`] (`graph.slot_wait_ms`).
+pub const GRAPH_SLOT_WAIT: Duration = Duration::from_millis(250);
 
-/// Graph statements on blocking threads at once: the CPUs, at least 4.
-/// More wait up to [`GRAPH_SLOT_WAIT`] for one, then run anyway: a slot
-/// can be held by a statement waiting on a lock another one holds.
+/// The process's graph limits, from the `graph.*` settings
+/// ([`GraphLimits::apply`]): slots and their wait here, the session pool
+/// and spare connections in [`crate::graphs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphLimits {
+    /// `graph.slots` (0: the CPUs, at least 4).
+    pub slots: usize,
+    /// `graph.slot_wait_ms`.
+    pub slot_wait: Duration,
+    /// `graph.session_pool`.
+    pub session_pool: usize,
+    /// `graph.spares`.
+    pub spares: usize,
+    /// `graph.spares_per_read`.
+    pub spares_per_read: usize,
+    /// `graph.spare_wait_ms`.
+    pub spare_wait: Duration,
+}
+
+impl Default for GraphLimits {
+    fn default() -> Self {
+        Self {
+            slots: 0,
+            slot_wait: GRAPH_SLOT_WAIT,
+            session_pool: 96,
+            spares: 32,
+            spares_per_read: 3,
+            spare_wait: Duration::from_millis(50),
+        }
+    }
+}
+
+static LIMITS: Mutex<Option<GraphLimits>> = Mutex::new(None);
+
+impl GraphLimits {
+    /// The limits the settings give, read through `get`.
+    #[must_use]
+    pub fn read(get: &dyn Fn(&'static Setting<u64>) -> u64) -> Self {
+        use sprig_graph::settings as s;
+        let n = |x: &'static Setting<u64>| usize::try_from(get(x)).unwrap_or(usize::MAX);
+        Self {
+            slots: n(&s::SLOTS),
+            slot_wait: Duration::from_millis(get(&s::SLOT_WAIT_MS)),
+            session_pool: n(&s::SESSION_POOL),
+            spares: n(&s::SPARES),
+            spares_per_read: n(&s::SPARES_PER_READ),
+            spare_wait: Duration::from_millis(get(&s::SPARE_WAIT_MS)),
+        }
+    }
+
+    /// The limits now: the last applied, else the defaults.
+    #[must_use]
+    pub fn now() -> Self {
+        LIMITS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .unwrap_or_default()
+    }
+
+    /// Makes these the process's limits: the slot count changes at once
+    /// (a smaller count as running statements give slots back).
+    pub fn apply(self) {
+        let mut m = LIMITS.lock().unwrap_or_else(PoisonError::into_inner);
+        if *m == Some(self) {
+            return;
+        }
+        *m = Some(self);
+        drop(m);
+        resize(graph_slots(), &SLOTS_NOW, slot_count(self.slots));
+    }
+}
+
+/// The slot count `graph.slots = n` means: `n`, or for 0 three per CPU
+/// and at least 12.
+fn slot_count(n: usize) -> usize {
+    if n > 0 {
+        return n;
+    }
+    std::thread::available_parallelism()
+        .map_or(4, std::num::NonZeroUsize::get)
+        .saturating_mul(3)
+        .max(12)
+}
+
+/// The permits [`graph_slots`] is meant to have.
+static SLOTS_NOW: AtomicUsize = AtomicUsize::new(0);
+
+/// Grows or shrinks `sem`, whose size is in `now`, to `want` permits: it
+/// takes away only free permits, and the next call takes the rest.
+pub(crate) fn resize(sem: &Semaphore, now: &AtomicUsize, want: usize) {
+    let have = now.load(Ordering::Relaxed);
+    if want > have {
+        sem.add_permits(want - have);
+        now.store(want, Ordering::Relaxed);
+    } else if want < have {
+        let gone = sem.forget_permits(have - want);
+        now.store(have - gone, Ordering::Relaxed);
+    }
+}
+
+/// Graph statements on blocking threads at once: `graph.slots`, by
+/// default three per CPU, at least 12. More wait up to `graph.slot_wait_ms`
+/// for one, then run anyway: a slot can be held by a statement waiting
+/// on a lock another one holds.
 pub fn graph_slots() -> &'static Arc<Semaphore> {
     static S: OnceLock<Arc<Semaphore>> = OnceLock::new();
     S.get_or_init(|| {
-        let cpus = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-        Arc::new(Semaphore::new(cpus.max(4)))
+        let n = slot_count(GraphLimits::now().slots);
+        SLOTS_NOW.store(n, Ordering::Relaxed);
+        Arc::new(Semaphore::new(n))
     })
 }
 
@@ -156,13 +257,14 @@ pub fn graph_slots() -> &'static Arc<Semaphore> {
 /// the watchdog). `block_in_place` hands the worker's queue to another
 /// thread; the statement's I/O, timers and `KILL QUERY` still work, in
 /// order, on this one. Waits asynchronously for one of [`graph_slots`]
-/// (at most [`GRAPH_SLOT_WAIT`]) first. Outside a multi-threaded runtime
+/// (at most `graph.slot_wait_ms`) first. Outside a multi-threaded runtime
 /// the future runs as is.
 pub async fn run_graph<F: Future>(fut: F) -> F::Output {
     if !multi_thread() {
         return fut.await;
     }
-    let permit = tokio::time::timeout(GRAPH_SLOT_WAIT, Arc::clone(graph_slots()).acquire_owned())
+    let wait = GraphLimits::now().slot_wait;
+    let permit = tokio::time::timeout(wait, Arc::clone(graph_slots()).acquire_owned())
         .await
         .ok()
         .and_then(std::result::Result::ok);

@@ -59,6 +59,12 @@ describe('applyEvent', () => {
     expect(stopped.status).toBe('stopped');
   });
 
+  it('keeps the stored answer’s id from the end line', () => {
+    expect(fold([{ type: 'text', text: 'x' }, { type: 'end', stop: 'end_turn', message_id: 'a40' }]).messageId).toBe('a40');
+    // An older gateway's end line: no id, looked up later.
+    expect(fold([{ type: 'end', stop: 'end_turn' }]).messageId).toBeUndefined();
+  });
+
   it('updates one proposal in place', () => {
     const t = fold([{ type: 'proposal', proposal: { id: 'p9', kind: 'sql', body: {} }, filed: null }]);
     const items = updateProposal([t], 'p9', { state: 'accepted' });

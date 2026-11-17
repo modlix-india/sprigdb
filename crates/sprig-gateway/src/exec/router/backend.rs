@@ -167,7 +167,7 @@ impl GwBackend<'_> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             ensure_accounts(&self.factory.svc, cat.as_ref(), cluster).await?;
-            let bs = session_on(
+            let mut bs = session_on(
                 &self.factory.backends,
                 &self.factory.target,
                 &self.factory.opts,
@@ -175,6 +175,7 @@ impl GwBackend<'_> {
                 cluster,
                 self.main.vars(),
             );
+            bs.set_relay(self.factory.relay_now());
             self.others.insert(cluster.clone(), bs);
         }
         let main_vars = self.main.vars().clone();
@@ -363,6 +364,7 @@ impl sprig_router::ShardBackend for GwBackend<'_> {
             &cluster,
             self.main.vars(),
         );
+        bs.set_relay(self.factory.relay_now());
         bs.set_causal(causal);
         Ok(Some(Box::new(GwStream {
             bs,
@@ -396,6 +398,7 @@ impl sprig_router::ShardBackend for GwBackend<'_> {
             &self.main_cluster,
             self.main.vars(),
         );
+        bs.set_relay(self.factory.relay_now());
         bs.set_causal(self.main.causal().clone());
         Ok(Some(Box::new(GwScratch {
             cluster: self.main_cluster.to_string(),

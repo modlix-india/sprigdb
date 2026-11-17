@@ -2,9 +2,11 @@
 //! gateway, the worker's `ai_retrieval` job filling the chunk tables and
 //! following inserts, updates and deletes, `RETRIEVE()` and the REST
 //! route, `SHOW CREATE` round trips, filters, row-level security hiding
-//! hits from a restricted user, recall@5 on a small corpus, a sharded
-//! table's fused hits against the same table unsharded, a kill -9 of the
-//! worker in the middle of a fill, and `DROP`.
+//! hits from a restricted user, a restricted user's ranks unchanged by
+//! rows hidden from it, recall@5 on a small corpus, an indexed table split
+//! into two shards and merged back (the chunks moved with their rows, nothing embedded
+//! again) and its fused hits against the same table unsharded, a kill -9
+//! of the worker in the middle of a fill, and `DROP`.
 //!
 //! ```sh
 //! export SPRIG_TEST_RX_SQL=127.0.0.1:42306          # a gateway's MySQL port
@@ -12,8 +14,12 @@
 //! export SPRIG_TEST_RX_TENANT=acme SPRIG_TEST_RX_USER=admin SPRIG_TEST_RX_PASSWORD=...
 //! # the backend, to look at the chunk tables (root)
 //! export SPRIG_TEST_RX_BACKEND=mysql://root:...@127.0.0.1:42301
-//! # optional: shards rx_live.many into two (pins are made by the test),
-//! # e.g. sprigctl advisor run/apply and sprigctl shard split
+//! # optional: shards rx_live.many (the test makes the pin): run with
+//! # `group` it applies the advisor's design (the table moves into its
+//! # table group), with `split` it splits the group's shard into two
+//! # (e.g. sprigctl advisor run/apply, sprigctl shard split), with `merge`
+//! # it merges the two back; each waits
+//! # for its jobs to end
 //! export SPRIG_TEST_RX_SHARD_CMD='.../rx.sh shard'
 //! # optional: kills the worker (kill -9) and starts it again
 //! export SPRIG_TEST_RX_KILL='.../rx.sh kill-worker'
@@ -102,6 +108,110 @@ async fn retrieve(
     ))
     .await
     .map_err(|e| e.to_string())
+}
+
+/// Every question's top five of `index` as `c` sees them.
+async fn all_hits(
+    c: &mut mysql_async::Conn,
+    index: &str,
+) -> Vec<Vec<(i64, u32, Option<u32>, Option<u32>)>> {
+    let mut out = Vec::new();
+    for (question, _) in QUESTIONS {
+        out.push(retrieve(c, index, question, 5, None).await.unwrap());
+    }
+    out
+}
+
+/// Every question's whole keyword list of `index` as `c` sees it:
+/// (`id`, `chunk_no`) by `bm25_rank` (from the first 100 hits).
+async fn keyword_lists(c: &mut mysql_async::Conn, index: &str) -> Vec<Vec<(u32, i64, u32)>> {
+    let mut out = Vec::new();
+    for (question, _) in QUESTIONS {
+        let mut v: Vec<(u32, i64, u32)> = retrieve(c, index, question, 100, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|h| h.2.map(|r| (r, h.0, h.1)))
+            .collect();
+        v.sort_unstable();
+        out.push(v);
+    }
+    out
+}
+
+/// The chunks of index `id` that don't sit with their row (`table`, key
+/// `id`) in the same shard schema, those whose `_sprig_rk` isn't their
+/// row's, and the chunk tables in a schema without `table`.
+async fn misplaced(b: &mut mysql_async::Conn, id: u64, table: &str) -> (u64, u64, u64) {
+    let (mut away, mut wrong_rk, mut orphans) = (0, 0, 0);
+    for (s, _) in chunk_tables(b, id).await {
+        let here: Option<u64> = b
+            .exec_first(
+                "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? \
+                 AND TABLE_NAME = ?",
+                (s.as_str(), table),
+            )
+            .await
+            .unwrap();
+        if here.unwrap_or(0) == 0 {
+            orphans += 1;
+            continue;
+        }
+        let has_rk: Option<u64> = b
+            .exec_first(
+                "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? \
+                 AND TABLE_NAME = ? AND COLUMN_NAME = '_sprig_rk'",
+                (s.as_str(), table),
+            )
+            .await
+            .unwrap();
+        away += b
+            .query_first::<u64, _>(format!(
+                "SELECT COUNT(*) FROM `{s}`.`__sprig_rx_{id}` x WHERE NOT EXISTS \
+                 (SELECT 1 FROM `{s}`.`{table}` m WHERE m.id = x.k_id)"
+            ))
+            .await
+            .unwrap()
+            .unwrap_or(99);
+        if has_rk.unwrap_or(0) > 0 {
+            wrong_rk += b
+                .query_first::<u64, _>(format!(
+                    "SELECT COUNT(*) FROM `{s}`.`__sprig_rx_{id}` x JOIN `{s}`.`{table}` m \
+                     ON m.id = x.k_id WHERE NOT (x._sprig_rk <=> m._sprig_rk)"
+                ))
+                .await
+                .unwrap()
+                .unwrap_or(99);
+        }
+    }
+    (away, wrong_rk, orphans)
+}
+
+/// Per question, alice's ten best chunks (ids under 1000) of `index` by
+/// MariaDB's full-text relevance over its whole chunk table (backend).
+async fn relevance(b: &mut Option<mysql_async::Conn>, index: &str) -> Vec<Vec<(i64, u32)>> {
+    let Some(bk) = b.as_mut() else {
+        return Vec::new();
+    };
+    let Some(id) = index_id(bk, index).await else {
+        return Vec::new();
+    };
+    let Some((s, _)) = chunk_tables(bk, id).await.into_iter().next() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (question, _) in QUESTIONS {
+        let m = format!("MATCH(text, title) AGAINST ({})", q(question));
+        out.push(
+            bk.query::<(i64, u32), _>(format!(
+                "SELECT k_id, chunk_no FROM `{s}`.`__sprig_rx_{id}` WHERE k_id < 1000 AND {m} \
+                 ORDER BY {m} DESC, k_id, chunk_no LIMIT 10"
+            ))
+            .await
+            .unwrap_or_default(),
+        );
+    }
+    out
 }
 
 async fn ids(c: &mut mysql_async::Conn, index: &str, query: &str, limit: u32) -> Vec<i64> {
@@ -851,30 +961,285 @@ async fn retrieval_indexes_end_to_end() {
     must(&mut c, "ALTER TABLE articles DISABLE ROW LEVEL SECURITY").await;
     must(&mut c, "DROP USER 'rxreader'@'%'").await;
 
+    // ---- a restricted user's ranks don't move with rows hidden from it ---------------
+    // alice's 20 articles, then 80 of bob's written to crowd the same words
+    // and the same neighbourhood: under a policy, alice's reader must get
+    // exactly the same hits and ranks before and after bob's rows exist.
+    must(
+        &mut c,
+        "CREATE TABLE shared (id INT PRIMARY KEY, title VARCHAR(200), body TEXT, \
+         owner VARCHAR(20) NOT NULL)",
+    )
+    .await;
+    let alice: Vec<String> = CORPUS
+        .iter()
+        .map(|(id, _, t, body)| format!("({id}, {}, {}, 'alice')", q(t), q(body)))
+        .collect();
+    must(
+        &mut c,
+        &format!("INSERT INTO shared VALUES {}", alice.join(", ")),
+    )
+    .await;
+    must(
+        &mut c,
+        "CREATE RETRIEVAL INDEX kbs ON shared (body) TITLE title",
+    )
+    .await;
+    ck.ok(
+        "the shared table's index fills",
+        wait_ready(&mut c, "kbs", Duration::from_secs(240))
+            .await
+            .is_some(),
+        String::new,
+    );
+    for (u, who) in [("rxalice", "alice"), ("rxbob", "bob")] {
+        let _ = run(&mut c, &format!("DROP USER IF EXISTS '{u}'@'%'")).await;
+        must(
+            &mut c,
+            &format!("CREATE USER '{u}'@'%' IDENTIFIED BY 'Rx-shared-Passw0rd'"),
+        )
+        .await;
+        must(&mut c, &format!("GRANT SELECT ON {DB}.shared TO '{u}'@'%'")).await;
+        must(
+            &mut c,
+            &format!(
+                "CREATE POLICY {who}_rows ON shared FOR SELECT TO {u} USING (owner = '{who}')"
+            ),
+        )
+        .await;
+    }
+    must(&mut c, "ALTER TABLE shared ENABLE ROW LEVEL SECURITY").await;
+    let mut ra = login(&addr, "rxalice", "Rx-shared-Passw0rd").await;
+    must(&mut ra, &format!("USE {DB}")).await;
+    let mut rb = login(&addr, "rxbob", "Rx-shared-Passw0rd").await;
+    must(&mut rb, &format!("USE {DB}")).await;
+    let before = all_hits(&mut ra, "kbs").await;
+    let kw_before = keyword_lists(&mut ra, "kbs").await;
+    let relevance_before = relevance(&mut b, "kbs").await;
+    let bob: Vec<String> = (0..80)
+        .map(|i| {
+            let (_, _, t, body) = CORPUS[i % CORPUS.len()];
+            let (_, _, _, other) = CORPUS[(i * 7 + 3) % CORPUS.len()];
+            let words = QUESTIONS[i % QUESTIONS.len()].0;
+            format!(
+                "({}, {}, {}, 'bob')",
+                1000 + i,
+                q(&format!("{t} ({i})")),
+                q(&format!("{words}. {body} {words}. {other}"))
+            )
+        })
+        .collect();
+    must(
+        &mut c,
+        &format!("INSERT INTO shared VALUES {}", bob.join(", ")),
+    )
+    .await;
+    // Every one of bob's rows indexed, and bob's reader finding them.
+    let t = Instant::now();
+    let (mut bob_seen, mut indexed) = (0usize, 0u64);
+    while t.elapsed() < Duration::from_secs(240) {
+        indexed = state(&mut c, "kbs").await.1;
+        bob_seen = 0;
+        for (question, _) in &QUESTIONS[..5] {
+            bob_seen += ids(&mut rb, "kbs", question, 5)
+                .await
+                .iter()
+                .filter(|id| **id >= 1000)
+                .count();
+        }
+        if indexed >= 100 && bob_seen >= 25 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    ck.ok(
+        "bob's rows are indexed and bob's reader finds them",
+        indexed >= 100 && bob_seen >= 25,
+        || format!("rows indexed {indexed}, bob's hits {bob_seen}"),
+    );
+    let bob_hits = all_hits(&mut rb, "kbs").await;
+    ck.ok(
+        "bob's reader never sees alice's rows",
+        bob_hits.iter().flatten().all(|h| h.0 >= 1000),
+        || format!("{bob_hits:?}"),
+    );
+    let after = all_hits(&mut ra, "kbs").await;
+    let kw_after = keyword_lists(&mut ra, "kbs").await;
+    let kw_same = kw_before
+        .iter()
+        .zip(&kw_after)
+        .filter(|(x, y)| x == y)
+        .count();
+    let same = before.iter().zip(&after).filter(|(x, y)| x == y).count();
+    eprintln!(
+        "     alice's reader after bob's 80 rows: the same keyword list for {kw_same}/{n} questions \
+         ({} ranked chunks), the same top five with all ranks for {same}/{n} (the rest differ by the \
+         approximate vector index's answers)",
+        kw_after.iter().map(Vec::len).sum::<usize>(),
+        n = QUESTIONS.len()
+    );
+    ck.ok(
+        "a restricted user's keyword ranks don't change with rows hidden from it",
+        kw_same == QUESTIONS.len() && after.iter().flatten().all(|h| h.0 < 1000),
+        || format!("before {kw_before:?}\nafter {kw_after:?}"),
+    );
+    ck.ok(
+        "a restricted user's hits stay nearly the same (only the vector index's approximation moves)",
+        same * 10 >= QUESTIONS.len() * 8,
+        || format!("before {before:?}\nafter {after:?}"),
+    );
+    ck.ok(
+        "a restricted user still gets five hits per question",
+        after.iter().all(|h| h.len() == 5),
+        || format!("{after:?}"),
+    );
+    // For contrast: MariaDB's relevance over the whole chunk table, which
+    // an unrestricted user's keyword list follows, orders alice's own
+    // chunks differently once bob's rows are there.
+    let relevance_after = relevance(&mut b, "kbs").await;
+    if !relevance_before.is_empty() {
+        let moved = relevance_before
+            .iter()
+            .zip(&relevance_after)
+            .filter(|(x, y)| x != y)
+            .count();
+        eprintln!(
+            "     for contrast: MariaDB's relevance order of alice's chunks moved for {moved}/{} questions",
+            QUESTIONS.len()
+        );
+    }
+    let _ = ra.disconnect().await;
+    let _ = rb.disconnect().await;
+    must(&mut c, "DROP RETRIEVAL INDEX kbs").await;
+    must(&mut c, "DROP TABLE shared").await;
+    must(&mut c, "DROP USER 'rxalice'@'%'").await;
+    must(&mut c, "DROP USER 'rxbob'@'%'").await;
+
     // ---- sharded fusion against the unsharded table -------------------------------
     if let Ok(cmd) = std::env::var("SPRIG_TEST_RX_SHARD_CMD") {
+        // The index first, then the table is grouped and split under it.
         must(&mut c, "CREATE TABLE many LIKE articles").await;
         must(&mut c, "INSERT INTO many SELECT * FROM articles").await;
-        must(&mut c, "SPRIG PIN many SHARD KEY (id)").await;
-        ck.ok("the shard command ran", shell(&cmd), || cmd.clone());
         must(
             &mut c,
             "CREATE RETRIEVAL INDEX kb2 ON many (body) TITLE title FILTERS (product)",
         )
         .await;
         ck.ok(
-            "the sharded index fills",
+            "the index over the table to shard fills",
             wait_ready(&mut c, "kb2", Duration::from_secs(240))
                 .await
                 .is_some(),
             String::new,
         );
-        let shards = match &mut b {
-            Some(b) => match index_id(b, "kb2").await {
-                Some(id) => chunk_tables(b, id).await,
-                None => Vec::new(),
-            },
-            None => Vec::new(),
+        must(&mut c, "SPRIG PIN many SHARD KEY (id)").await;
+        let group = format!("{cmd} group");
+        ck.ok("the table moved into its group", shell(&group), || {
+            group.clone()
+        });
+        let kb2 = match &mut b {
+            Some(b) => index_id(b, "kb2").await,
+            None => None,
+        };
+        // Moved into the group's schema without its chunks: filled again
+        // there; the chunks written before the rows had a routing hash get
+        // it, and the chunk table left behind is dropped.
+        if let (Some(bk), Some(id)) = (b.as_mut(), kb2) {
+            let mut left = (99, 99, 99);
+            let mut grouped = 0;
+            let t = Instant::now();
+            while t.elapsed() < Duration::from_secs(180) {
+                left = misplaced(bk, id, "many").await;
+                // Once no chunk table is left behind, every one is in the group.
+                grouped = if left.2 == 0 {
+                    chunk_tables(bk, id).await.iter().map(|x| x.1).sum::<u64>()
+                } else {
+                    0
+                };
+                if left == (0, 0, 0) && grouped >= 20 && state(&mut c, "kb2").await.0 == "ready" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            eprintln!(
+                "     grouped: chunk tables {:?} after {} ms",
+                chunk_tables(bk, id).await,
+                t.elapsed().as_millis()
+            );
+            ck.ok(
+                "after the move into the group the index is filled there and ready",
+                grouped >= 20 && state(&mut c, "kb2").await.0 == "ready",
+                || format!("{grouped} chunks in the group"),
+            );
+            ck.ok(
+                "every chunk carries its row's routing hash before the split",
+                left.0 == 0 && left.1 == 0,
+                || format!("away, wrong rk: {left:?}"),
+            );
+            ck.ok(
+                "the chunk table left behind in the old schema is dropped",
+                left.2 == 0,
+                || format!("{left:?}"),
+            );
+        } else {
+            ck.ok(
+                "after the move into the group the index is ready again",
+                wait_ready(&mut c, "kb2", Duration::from_secs(240))
+                    .await
+                    .is_some(),
+                String::new,
+            );
+        }
+        let rows_before = state(&mut c, "kb2").await.1;
+        let before = all_hits(&mut c, "kb2").await;
+        let split = format!("{cmd} split");
+        ck.ok("the shard split ran", shell(&split), || split.clone());
+        // At once after the cutover: the chunks are in the new shards, with
+        // their rows, and searches find them.
+        let right_after = all_hits(&mut c, "kb2").await;
+        let found = right_after.iter().filter(|h| h.len() == 5).count();
+        let vec_same = before
+            .iter()
+            .zip(&right_after)
+            .filter(|(x, y)| {
+                let va: HashMap<(i64, u32), Option<u32>> =
+                    x.iter().map(|h| ((h.0, h.1), h.3)).collect();
+                y.iter()
+                    .all(|h| va.get(&(h.0, h.1)).is_none_or(|v| *v == h.3))
+            })
+            .count();
+        eprintln!(
+            "     right after the split: {found}/{} questions with five hits, {vec_same} with the same vector ranks",
+            QUESTIONS.len()
+        );
+        ck.ok(
+            "right after the split searches find every shard's rows",
+            found == QUESTIONS.len() && vec_same == QUESTIONS.len(),
+            || format!("before {before:?}\nafter {right_after:?}"),
+        );
+        let mut states = BTreeSet::new();
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(25) {
+            states.insert(state(&mut c, "kb2").await.0);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let rows_after = state(&mut c, "kb2").await.1;
+        eprintln!(
+            "     after the split: states seen {states:?}, rows indexed {rows_before} → {rows_after}"
+        );
+        ck.ok(
+            "the split leaves the index ready (never rebuilding)",
+            states.len() == 1 && states.contains("ready"),
+            || format!("{states:?}"),
+        );
+        ck.ok(
+            "the split embeds nothing again",
+            rows_after == rows_before,
+            || format!("{rows_before} → {rows_after}"),
+        );
+        let shards = match (&mut b, kb2) {
+            (Some(b), Some(id)) => chunk_tables(b, id).await,
+            _ => Vec::new(),
         };
         eprintln!("     kb2 chunk tables: {shards:?}");
         ck.ok(
@@ -882,6 +1247,19 @@ async fn retrieval_indexes_end_to_end() {
             shards.len() >= 2 || b.is_none(),
             || format!("{shards:?}"),
         );
+        ck.ok(
+            "the chunks moved: 20 rows' chunks over the new shards, none lost",
+            b.is_none() || shards.iter().map(|x| x.1).sum::<u64>() >= 20,
+            || format!("{shards:?}"),
+        );
+        if let (Some(bk), Some(id)) = (b.as_mut(), kb2) {
+            let m = misplaced(bk, id, "many").await;
+            ck.ok(
+                "every chunk is in its row's shard, with its routing hash",
+                m.0 == 0 && m.1 == 0,
+                || format!("away, wrong rk: {m:?}"),
+            );
+        }
         let (mut same_top, mut overlap, mut vec_same) = (0usize, 0f64, 0usize);
         for (question, _) in QUESTIONS {
             let one = retrieve(&mut c, "kb", question, 5, None).await.unwrap();
@@ -921,6 +1299,47 @@ async fn retrieval_indexes_end_to_end() {
             "sharded fusion: vector ranks equal the single shard's",
             vec_same == n,
             || format!("{vec_same}/{n}"),
+        );
+        // And back: the two shards merged into one, the chunks with them.
+        let rows_before = state(&mut c, "kb2").await.1;
+        let before = all_hits(&mut c, "kb2").await;
+        let merge = format!("{cmd} merge");
+        ck.ok("the shards were merged", shell(&merge), || merge.clone());
+        let right_after = all_hits(&mut c, "kb2").await;
+        let found = right_after.iter().filter(|h| h.len() == 5).count();
+        let mut states = BTreeSet::new();
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(20) {
+            states.insert(state(&mut c, "kb2").await.0);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let rows_after = state(&mut c, "kb2").await.1;
+        let shards = match (&mut b, kb2) {
+            (Some(b), Some(id)) => chunk_tables(b, id).await,
+            _ => Vec::new(),
+        };
+        let m = match (&mut b, kb2) {
+            (Some(b), Some(id)) => misplaced(b, id, "many").await,
+            _ => (0, 0, 0),
+        };
+        eprintln!(
+            "     after the merge: {found}/{} questions with five hits, states {states:?}, rows indexed {rows_before} → {rows_after}, chunk tables {shards:?}",
+            QUESTIONS.len()
+        );
+        ck.ok(
+            "after the merge searches find every row at once",
+            found == QUESTIONS.len(),
+            || format!("before {before:?}\nafter {right_after:?}"),
+        );
+        ck.ok(
+            "the merge leaves the index ready and embeds nothing again",
+            states.len() == 1 && states.contains("ready") && rows_after == rows_before,
+            || format!("{states:?} {rows_before} → {rows_after}"),
+        );
+        ck.ok(
+            "after the merge the chunks are in the one shard, with their rows",
+            (b.is_none() || shards.iter().map(|x| x.1).sum::<u64>() >= 20) && m.0 == 0 && m.1 == 0,
+            || format!("{shards:?} {m:?}"),
         );
     } else {
         eprintln!("     (no SPRIG_TEST_RX_SHARD_CMD: sharded fusion not checked)");

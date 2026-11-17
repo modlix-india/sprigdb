@@ -36,7 +36,10 @@
 //! `api.stream.heartbeat_seconds`. `start_at_hlc` older than the time
 //! index (or than the tenant's move to its cluster) is 39800; a cluster
 //! without an index yet, 39802 (MariaDB keeps no index of binlog positions
-//! by time, so the controller writes one).
+//! by time, so the controller writes one). On a Galera cluster the index
+//! keeps the cluster's shared GTID domain (`wsrep_gtid_mode`), and the
+//! node the feed reads adds its own local domains; a Galera cluster
+//! without `wsrep_gtid_mode` has no index (39802).
 //!
 //! A `Sprig-Space` header (gRPC `sprig-space`) makes the subscriber's
 //! sessions act in that space, as `USE SPACE` does.
@@ -408,7 +411,7 @@ async fn open_here(
     let slot = Slot::take(tenant, limits.streams)?;
     let (clusters, placement, names) = feed(&svc)?;
     let start = if spec.start_at_hlc != 0 {
-        start_at(&svc, &placement, tenant, spec.start_at_hlc).await?
+        start_at(&svc, &clusters, &placement, tenant, spec.start_at_hlc).await?
     } else if spec.start_after.is_empty() {
         StartAt::Now
     } else {
@@ -505,7 +508,9 @@ const START_MARGIN_SECONDS: u64 = 30;
 /// the feed time index's last position at least
 /// [`START_MARGIN_SECONDS`] before it (`__sprig_sys.__sprig_feed_time`,
 /// written by the controller every 10 s); the stream then leaves out the
-/// tenant's events stamped before `hlc`.
+/// tenant's events stamped before `hlc`. A Galera cluster's rows hold its
+/// shared GTID domain alone; the node the feed reads adds its own local
+/// domains as they are now (they never hold a tenant's writes).
 ///
 /// # Errors
 /// 39800 when `hlc` is older than the index (or than the tenant's last
@@ -513,6 +518,7 @@ const START_MARGIN_SECONDS: u64 = 30;
 /// cluster's.
 pub(crate) async fn start_at(
     svc: &crate::tenant::TenantServices,
+    clusters: &Arc<dyn Clusters>,
     placement: &Arc<dyn PlacementView>,
     tenant: TenantId,
     hlc: u64,
@@ -567,10 +573,18 @@ pub(crate) async fn start_at(
     };
     let found = rows.iter().find(|(_, p)| !p.is_empty());
     match (found, rows.last()) {
-        (Some((_, pos)), _) => Ok(StartAt::At {
-            cluster,
-            pos: pos.parse()?,
-        }),
+        (Some((_, pos)), _) => {
+            let mut pos: sprig_binlog::GtidPos = pos.parse()?;
+            if svc.locator.is_galera(&cluster).await? {
+                let now = clusters.position(&cluster).await?;
+                for g in now.iter() {
+                    if pos.get(g.domain).is_none() {
+                        pos.update(*g);
+                    }
+                }
+            }
+            Ok(StartAt::At { cluster, pos })
+        }
         (None, Some((oldest, _))) => Err(SprigError::new(
             SprigCode::FeedHistoryLost,
             format!(

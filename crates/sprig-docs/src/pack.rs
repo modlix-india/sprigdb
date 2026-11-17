@@ -172,7 +172,9 @@ pub enum PackError {
     #[error("not a docs pack")]
     BadMagic,
     /// A format this build doesn't read (or write).
-    #[error("pack format {0} is not supported (this build reads formats {OLDEST_FORMAT} to {FORMAT})")]
+    #[error(
+        "pack format {0} is not supported (this build reads formats {OLDEST_FORMAT} to {FORMAT})"
+    )]
     Format(u16),
     /// The trailing SHA-256 doesn't match the contents: the file was
     /// changed or damaged.
@@ -488,7 +490,10 @@ mod tests {
         let p = sample();
         // In page order, from 1.
         let seqs: Vec<u16> = p.chunks.iter().map(|c| c.seq).collect();
-        assert_eq!(seqs, (1..=u16::try_from(p.chunks.len()).unwrap()).collect::<Vec<_>>());
+        assert_eq!(
+            seqs,
+            (1..=u16::try_from(p.chunks.len()).unwrap()).collect::<Vec<_>>()
+        );
         let v2 = p.to_bytes().expect("write");
         assert_eq!(u16::from_le_bytes([v2[8], v2[9]]), 2);
         // Format 1: no positions written; read back with seq 0.

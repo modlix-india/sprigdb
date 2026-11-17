@@ -101,6 +101,7 @@ export const routes = [
       { path: 'access/:area', element: <AccessPage /> },
       { path: 'access', element: <Navigate to="users" replace /> },
       { path: 'docs', element: <DocsPage /> },
+      { path: 'docs/p/*', element: <DocsPage /> },
       { path: 'd', element: <DashboardsRoute /> },
       { path: 'd/:id', element: <DashboardsRoute /> },
       { path: 'd/:id/tile/:tile', element: <TileEditorRoute /> },

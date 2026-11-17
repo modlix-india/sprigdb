@@ -37,6 +37,7 @@ text	mediumtext	NO	MUL	NULL
 tokens	smallint(5) unsigned	NO		NULL	
 terms	text	NO		NULL	
 embedding	vector(384)	NO	MUL	NULL	
+seq	smallint(5) unsigned	NO		0	
 ```
 
 | Column | What |
@@ -51,6 +52,7 @@ embedding	vector(384)	NO	MUL	NULL
 | `tokens` | Its length in the model's tokens |
 | `terms` | The exact identifiers the chunk mentions, for keyword search |
 | `embedding` | The chunk's embedding, 384 numbers |
+| `seq` | The chunk's position in its page, from 1. A page's chunks in `seq` order are the page. 0 in the docs of a release whose pack predates positions |
 
 Keyword search uses the full-text index on `text`:
 
@@ -137,6 +139,36 @@ curl -s -u acme.app:'<password>' -X POST https://sprig.example.com/v1/docs:searc
 - `mode` is `hybrid`, or `keyword` when the question wasn't embedded: `docs.embed_queries` is off, or the gateway couldn't load the model (counted in `sprig_docs_search_degraded_total`). Keyword search still answers.
 - `bm25_rank` and `vector_rank` are the hit's place in each list, or `null` when it wasn't in that list. `score` is the fused score.
 - An empty `query`, an unknown audience, or a `limit` that isn't a positive integer fails with 400. A `version` that isn't loaded fails with 503 and 39989.
+
+## Over REST: GET /v1/docs/pages/{page}
+
+`GET /v1/docs/pages/{page}` returns one page of the docs, rebuilt from the pack: its chunks in page order and the page's Markdown. `{page}` is the page's path under the docs, slashes included, such as `tools/studio.md`. The `.md` may be left out, and a directory means its `README.md`. Add `?version=` for another loaded release. The same callers can use it as search. Studio's Docs panel shows pages this way.
+
+```sh
+curl -s -u acme.app:'<password>' https://sprig.example.com/v1/docs/pages/tools/docs-search.md
+```
+
+```json
+{
+  "version": "0.9.0",
+  "page": "tools/docs-search.md",
+  "title": "Searching the docs",
+  "audience": ["user", "dba", "operator"],
+  "ordered": true,
+  "markdown": "# Searching the docs\n\nEvery SprigDB release carries these pages…",
+  "chunks": [
+    {"chunk_id": "…", "heading_path": "Searching the docs", "text": "Every SprigDB release…", "seq": 1}
+  ]
+}
+```
+
+- `markdown` is the page without its front matter and HTML comments. The headings that chunks keep only in their `heading_path` are written back, and a long section's pieces are joined again.
+- `ordered` is `true` when the chunks came in their `seq` order. A pack from before chunk positions has none: then the chunks are ordered by their headings, siblings by name, `ordered` is `false`, and the page's sections may be out of order.
+- A path that isn't a page path fails with 400, and so does a page the release doesn't have. Docs that aren't loaded fail with 503 and 39989.
+
+### The pack's format
+
+The pack has format 2 since chunk positions (`seq`) were added. The controller still loads a format 1 pack, with every `seq` 0. When it starts, it adds `seq` to a cluster's `__sprig_docs.chunks` table if the table doesn't have it yet. The rows already there get 0, including those of an older release kept for a rollback.
 
 ## Settings
 

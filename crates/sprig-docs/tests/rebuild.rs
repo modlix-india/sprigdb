@@ -54,7 +54,10 @@ fn level(l: &str) -> Option<usize> {
 fn without_empty_sections(mut ls: Vec<String>) -> Vec<String> {
     let mut i = 0;
     while i < ls.len() {
-        let empty = level(&ls[i]).is_some_and(|n| ls.get(i + 1).is_none_or(|next| level(next).is_some_and(|m| m <= n)));
+        let empty = level(&ls[i]).is_some_and(|n| {
+            ls.get(i + 1)
+                .is_none_or(|next| level(next).is_some_and(|m| m <= n))
+        });
         if empty {
             ls.remove(i);
             i = i.saturating_sub(1);
@@ -70,7 +73,11 @@ fn rebuilt(page: &Page) -> String {
     // As read back from the table: in chunk_id order, then by position.
     chunks.sort_by_key(|c| c.chunk_id);
     chunks.sort_by_key(|c| c.seq);
-    rebuild(chunks.iter().map(|c| (c.heading_path.as_str(), c.text.as_str())))
+    rebuild(
+        chunks
+            .iter()
+            .map(|c| (c.heading_path.as_str(), c.text.as_str())),
+    )
 }
 
 fn check(page: &Page) -> Result<(), String> {
@@ -104,7 +111,13 @@ fn every_docs_page_comes_back() {
     let pages = read_pages(&docs).expect("docs");
     assert!(pages.len() > 20, "{} pages", pages.len());
     let bad: Vec<String> = pages.iter().filter_map(|p| check(p).err()).collect();
-    assert!(bad.is_empty(), "{} of {} pages:\n{}", bad.len(), pages.len(), bad.join("\n"));
+    assert!(
+        bad.is_empty(),
+        "{} of {} pages:\n{}",
+        bad.len(),
+        pages.len(),
+        bad.join("\n")
+    );
 }
 
 #[test]
@@ -113,7 +126,10 @@ fn headings_come_from_paths_and_repeated_leads_go() {
         ("Guide", "Intro."),
         ("Guide > Setup", "First. More of setup."),
         ("Guide > Setup", "First.\n\nThe rest of setup."),
-        ("Guide > Setup > Keys", "Keys text.\n\n## Merged\n\nMerged text."),
+        (
+            "Guide > Setup > Keys",
+            "Keys text.\n\n## Merged\n\nMerged text.",
+        ),
         ("Guide > Merged > Deep", "Deep text."),
     ]);
     assert_eq!(

@@ -487,6 +487,39 @@ impl RelayRole {
         ended
     }
 
+    /// Until `stop`: publishes this agent's relay host (again every
+    /// [`HOST_RECHECK`]; `published` once it is in the marker) and ends
+    /// direct logins every [`DIRECT_LOGIN_SWEEP`].
+    async fn hosts_and_sweep(
+        self: Arc<Self>,
+        published: Arc<std::sync::atomic::AtomicBool>,
+        stop: CancellationToken,
+    ) {
+        let bounded = Duration::from_secs(2);
+        let mut checked: Option<Instant> = None;
+        while !stop.is_cancelled() {
+            if checked.is_none_or(|at| at.elapsed() >= HOST_RECHECK)
+                && let Ok(Some(host)) = tokio::time::timeout(bounded, self.own_host()).await
+            {
+                match tokio::time::timeout(bounded, self.publish_host(&host)).await {
+                    Ok(Ok(true)) => {
+                        published.store(true, std::sync::atomic::Ordering::SeqCst);
+                        checked = Some(Instant::now());
+                    }
+                    Ok(Ok(false)) | Err(_) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "relay: the relay host can't be published yet");
+                    }
+                }
+            }
+            let _ = tokio::time::timeout(bounded, self.end_direct_logins()).await;
+            tokio::select! {
+                () = stop.cancelled() => {}
+                () = tokio::time::sleep(DIRECT_LOGIN_SWEEP) => {}
+            }
+        }
+    }
+
     async fn register(&self, reg: &mut Option<Session>) {
         if reg
             .as_ref()
@@ -566,29 +599,14 @@ impl RelayRole {
         let mut unusable_since: Option<Instant> = None;
         let mut last_epoch = 0u64;
         let bounded = Duration::from_secs(2);
-        // The relay host in the marker: (host, when it was last checked).
-        let mut published: Option<(String, Instant)> = None;
-        let mut swept = Instant::now();
+        // The relay host and the direct-login sweep run beside the lease
+        // loop, so a slow node never delays a stand-down.
+        let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let side_task =
+            tokio::spawn(Arc::clone(&self).hosts_and_sweep(Arc::clone(&published), stop.clone()));
         self.set_status("standby");
         while !stop.is_cancelled() {
             let _ = tokio::time::timeout(bounded, self.register(&mut reg)).await;
-            if published
-                .as_ref()
-                .is_none_or(|(_, at)| at.elapsed() >= HOST_RECHECK)
-                && let Ok(Some(host)) = tokio::time::timeout(bounded, self.own_host()).await
-            {
-                match tokio::time::timeout(bounded, self.publish_host(&host)).await {
-                    Ok(Ok(true)) => published = Some((host, Instant::now())),
-                    Ok(Ok(false)) | Err(_) => {}
-                    Ok(Err(e)) => {
-                        tracing::warn!(error = %e, "relay: the relay host can't be published yet");
-                    }
-                }
-            }
-            if swept.elapsed() >= DIRECT_LOGIN_SWEEP {
-                swept = Instant::now();
-                let _ = tokio::time::timeout(bounded, self.end_direct_logins()).await;
-            }
             let usable = Self::usable(&mut conn, &self.target).await;
             if usable {
                 unusable_since = None;
@@ -609,7 +627,7 @@ impl RelayRole {
                     }
                     self.set_status("standby");
                 }
-            } else if usable && published.is_some() {
+            } else if usable && published.load(std::sync::atomic::Ordering::SeqCst) {
                 // Not the writer: is the lease free? (Only once the relay
                 // host is published: relayed tenants' accounts must exist
                 // at this host before gateways log in through it.)
@@ -699,6 +717,7 @@ impl RelayRole {
         if let Some(c) = conn {
             c.close().await;
         }
+        let _ = side_task.await;
         let _ = relay_task.await;
         Ok(())
     }

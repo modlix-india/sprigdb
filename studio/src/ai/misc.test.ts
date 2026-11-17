@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { parseInline, parseMarkdown } from './mdparse';
 import { lineDiff } from './diff';
-import { docsUrl, slug } from './docs';
+import { docsRoute, docsTarget, docsUrl, pagePath, slug } from './docs';
 import { chipsFor } from './context';
 import { availableRoles } from './store';
 import { suggestions } from './AssistantDock';
@@ -35,6 +35,27 @@ describe('markdown', () => {
       { type: 'link', text: 'docs', href: 'https://x.example/a' },
       { type: 'text', text: ' [bad](javascript:alert(1))' },
     ]);
+    // A docs page's relative links only when asked for; never another scheme.
+    expect(parseInline('[a](../x.md#y) [b](#z) ![pic](../img/p.png)')).toEqual([
+      { type: 'text', text: '[a](../x.md#y) [b](#z) ' },
+      { type: 'image', alt: 'pic' },
+    ]);
+    expect(parseInline('[a](../x.md#y) [b](data:text/html,x) [c](//evil.example/x)', true)).toEqual([
+      { type: 'link', text: 'a', href: '../x.md#y' },
+      { type: 'text', text: ' [b](data:text/html,x) [c](//evil.example/x)' },
+    ]);
+  });
+
+  it('parses tables and fences with an info string, as the docs write them', () => {
+    const md = '| Code | Name |\n|---|---|\n| 39989 | `ER_A`<br>`A\\|B` |\n| 1 | x |\nafter\n\n```sql test\nSELECT 1;\n```\n````md\n```\ninner\n```\n````';
+    expect(parseMarkdown(md)).toEqual([
+      { type: 'table', head: ['Code', 'Name'], rows: [['39989', '`ER_A`\n`A|B`'], ['1', 'x']] },
+      { type: 'p', text: 'after' },
+      { type: 'code', lang: 'sql', text: 'SELECT 1;' },
+      { type: 'code', lang: 'md', text: '```\ninner\n```' },
+    ]);
+    // A line starting with a pipe but no delimiter row is a paragraph.
+    expect(parseMarkdown('| not a table')).toEqual([{ type: 'p', text: '| not a table' }]);
   });
 });
 
@@ -59,6 +80,23 @@ describe('docs links', () => {
     expect(docsUrl('tools/studio.md', 'The assistant dock')).toBe('https://modlix-india.github.io/sprigdb/docs/tools/studio/#the-assistant-dock');
     expect(docsUrl('operate/monitoring')).toBe('https://modlix-india.github.io/sprigdb/docs/operate/monitoring/');
     expect(docsUrl('README.md')).toBe('https://modlix-india.github.io/sprigdb/docs/');
+  });
+
+  it('opens docs pages in Studio, following their links', () => {
+    expect(pagePath('tools/studio')).toBe('tools/studio.md');
+    expect(pagePath('/tools/studio.MD')).toBe('tools/studio.md');
+    expect(pagePath('')).toBe('README.md');
+    expect(docsRoute('/t/acme', 'tools/studio.md', 'the-docs-panel')).toBe('/t/acme/docs/p/tools/studio.md#the-docs-panel');
+    expect(docsTarget('tools/studio.md', '../connect/rest-and-grpc.md#tokens')).toEqual({ page: 'connect/rest-and-grpc.md', anchor: 'tokens' });
+    expect(docsTarget('tools/studio.md', 'dashboards.md')).toEqual({ page: 'tools/dashboards.md', anchor: '' });
+    expect(docsTarget('tools/studio.md', '#maps')).toEqual({ page: 'tools/studio.md', anchor: 'maps' });
+    expect(docsTarget('README.md', 'https://modlix-india.github.io/sprigdb/docs/reference/errors/#39989')).toEqual({ page: 'reference/errors.md', anchor: '39989' });
+    expect(docsTarget('README.md', 'https://modlix-india.github.io/sprigdb/docs/')).toEqual({ page: 'README.md', anchor: '' });
+    // Not pages: other sites, schemes, files, and paths above the docs.
+    expect(docsTarget('tools/studio.md', 'https://example.com/x.md')).toBeNull();
+    expect(docsTarget('tools/studio.md', 'javascript:alert(1)')).toBeNull();
+    expect(docsTarget('tools/studio.md', '../img/studio/dock.png')).toBeNull();
+    expect(docsTarget('tools/studio.md', '../../secret.md')).toBeNull();
     expect(slug('`ai.share_data` and you!')).toBe('aishare_data-and-you');
   });
 });

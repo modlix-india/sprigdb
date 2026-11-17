@@ -46,6 +46,8 @@ AS
   v_left_found BOOLEAN;
   v_left_stock BIGINT;
   v_list_rows LONGTEXT;
+  v__wall_us BIGINT := ROUND(@@max_statement_time * 1000000);
+  v__deadline DATETIME(6) := CASE WHEN v__wall_us > 0 THEN SYSDATE(6) + INTERVAL v__wall_us MICROSECOND END;
 BEGIN
   IF (COALESCE((p_orderid <=> NULL), 0) <> 0) THEN
     __sprig_l44_v1_lib.fail(39866, 'Shop.PlaceOrder: argument orderId is null, which its schema doesn''t allow');
@@ -59,11 +61,14 @@ BEGIN
   IF (COALESCE(((COALESCE((p_qty < (-2147483648)), 0) <> 0) OR (COALESCE((p_qty > 2147483647), 0) <> 0)), 0) <> 0) THEN
     __sprig_l44_v1_lib.fail(39866, 'Shop.PlaceOrder: argument qty is out of the INTEGER range');
   END IF;
+  IF SYSDATE(6) > v__deadline THEN __sprig_l44_v1_lib.fail(39864, CONCAT('wall time: the code ran past its wall budget (', ROUND(v__wall_us / 1000), ' ms left when it was called)')); END IF;
   UPDATE products SET stock = stock - (p_qty) WHERE id = (p_productid) AND stock >= (p_qty);
   v_take_affected := ROW_COUNT();
   IF (COALESCE((v_take_affected <=> 1), 0) <> 0) THEN
+    IF SYSDATE(6) > v__deadline THEN __sprig_l44_v1_lib.fail(39864, CONCAT('wall time: the code ran past its wall budget (', ROUND(v__wall_us / 1000), ' ms left when it was called)')); END IF;
     INSERT INTO orders (id, product_id, qty, note) VALUES ((p_orderid), (p_productid), (p_qty), CONCAT('it''s ', (CONCAT(COALESCE('order ', 'null'), COALESCE(COALESCE(CAST(p_orderid AS CHAR), 'null'), 'null')))));
     v_add_affected := ROW_COUNT();
+    IF SYSDATE(6) > v__deadline THEN __sprig_l44_v1_lib.fail(39864, CONCAT('wall time: the code ran past its wall budget (', ROUND(v__wall_us / 1000), ' ms left when it was called)')); END IF;
     BEGIN
       SELECT q.`stock` INTO v_left_stock FROM (SELECT stock FROM products WHERE id = (p_productid)) q;
       v_left_found := TRUE;
@@ -71,6 +76,7 @@ BEGIN
       WHEN NO_DATA_FOUND THEN v_left_found := FALSE; v_left_stock := NULL;
       WHEN TOO_MANY_ROWS THEN __sprig_l44_v1_lib.fail(39866, 'Sprig.Db.QueryOne at step left returned more than one row');
     END;
+    IF SYSDATE(6) > v__deadline THEN __sprig_l44_v1_lib.fail(39864, CONCAT('wall time: the code ran past its wall budget (', ROUND(v__wall_us / 1000), ' ms left when it was called)')); END IF;
     v_list_rows := JSON_ARRAY();
     DECLARE
       CURSOR c_list_rows IS SELECT id, qty, note FROM orders WHERE product_id = (p_productid) ORDER BY id;

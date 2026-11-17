@@ -62,7 +62,8 @@
 //! whole numbers past 2^63 overflow (39866) where JavaScript loses
 //! precision; `length` and `indexOf` count code points; number-to-text is
 //! exact for integers and up to 15 significant digits; `ctx.log` and
-//! `console.log` lines are dropped.
+//! `console.log` lines (and `console.info`, `warn`, `error`, `debug`) are
+//! dropped, except a stream or queue trigger's, which go to its run log.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -526,7 +527,7 @@ fn exits(b: &Block) -> bool {
 }
 
 /// The locals a block assigns.
-fn assigned(b: &Block, out: &mut BTreeSet<LocalId>) {
+fn assigned(b: &[Stmt], out: &mut BTreeSet<LocalId>) {
     for s in b {
         match s {
             Stmt::Assign(l, _) => {
@@ -1923,7 +1924,9 @@ impl<'s, 'c> L<'s, 'c> {
                         out.push(Stmt::Throw(ErrorSpec::new(39863, m)));
                         Ok(())
                     }
-                    Some(["ctx" | "console", "log"]) if self.msg.is_some() => {
+                    Some(
+                        ["ctx", "log"] | ["console", "log" | "info" | "warn" | "error" | "debug"],
+                    ) if self.msg.is_some() => {
                         // Triggers on streams and queues keep their log
                         // lines for the run log.
                         let line = self.log_line(c)?;
@@ -1931,7 +1934,9 @@ impl<'s, 'c> L<'s, 'c> {
                         out.push(Stmt::Log(line));
                         Ok(())
                     }
-                    Some(["ctx" | "console", "log"]) => {
+                    Some(
+                        ["ctx", "log"] | ["console", "log" | "info" | "warn" | "error" | "debug"],
+                    ) => {
                         let at = self.at(c.span);
                         self.lints.push(Reason::new(
                             "js.log",
@@ -1954,6 +1959,9 @@ impl<'s, 'c> L<'s, 'c> {
                 let AssignmentTarget::AssignmentTargetIdentifier(id) = &a.left else {
                     return self.stop("js.assign", a.span, "only variables can be assigned");
                 };
+                // A compound assignment reads the variable before the
+                // right side.
+                let mark = self.pre.len();
                 let rhs = self.val(&a.right)?;
                 let op = match a.operator {
                     AssignmentOperator::Assign => None,
@@ -1964,7 +1972,7 @@ impl<'s, 'c> L<'s, 'c> {
                     AssignmentOperator::Remainder => Some(BinaryOperator::Remainder),
                     _ => return self.stop("js.assign", a.span, "this assignment operator"),
                 };
-                self.assign(id.name.as_str(), op, rhs, a.span, out)
+                self.assign(id.name.as_str(), op, rhs, Some(mark), a.span, out)
             }
             Expression::UpdateExpression(u) => {
                 let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &u.argument else {
@@ -1979,6 +1987,7 @@ impl<'s, 'c> L<'s, 'c> {
                     id.name.as_str(),
                     Some(op),
                     V::lit(Literal::Int(1)),
+                    None,
                     u.span,
                     out,
                 )
@@ -1995,6 +2004,7 @@ impl<'s, 'c> L<'s, 'c> {
         name: &str,
         op: Option<BinaryOperator>,
         rhs: V,
+        read_at: Option<usize>,
         span: Span,
         out: &mut Block,
     ) -> R<()> {
@@ -2009,6 +2019,10 @@ impl<'s, 'c> L<'s, 'c> {
             e: Expr::Local(l),
             ty: self.f.local_def(l).ty,
             nn: self.facts.contains(&Key::L(l)),
+        };
+        let cur = match read_at {
+            Some(mark) if op.is_some() => self.settle(cur, mark),
+            _ => cur,
         };
         let v = match op {
             None => rhs,
@@ -2249,7 +2263,8 @@ impl<'s, 'c> L<'s, 'c> {
     }
 
     fn fields(&mut self, o: &oxc_ast::ast::ObjectExpression<'_>) -> R<Vec<(String, V)>> {
-        let mut out: Vec<(String, V)> = Vec::new();
+        let mut out: Vec<(String, usize)> = Vec::new();
+        let mut read: Vec<(V, usize)> = Vec::new();
         for p in &o.properties {
             let ObjectPropertyKind::ObjectProperty(p) = p else {
                 return self.stop("js.spread", o.span, "spread in an object literal");
@@ -2261,10 +2276,16 @@ impl<'s, 'c> L<'s, 'c> {
                 return self.stop("js.object", p.span, "the key must be a name");
             };
             let v = self.val(&p.value)?;
+            read.push((v, self.pre.len()));
             out.retain(|(n, _)| n.as_str() != k.as_ref());
-            out.push((k.into_owned(), v));
+            out.push((k.into_owned(), read.len() - 1));
         }
-        Ok(out)
+        // Every value is evaluated, a repeated name's too, in order.
+        self.settle_all(&mut read);
+        Ok(out
+            .into_iter()
+            .map(|(k, i)| (k, read[i].0.clone()))
+            .collect())
     }
 
     fn emit(&mut self, name: &str, fields: Vec<(String, V)>, span: Span, out: &mut Block) -> R<()> {
@@ -2446,6 +2467,11 @@ impl<'s, 'c> L<'s, 'c> {
             "reject" => "reject",
             "event" => "event",
             "log" => "log",
+            // `console`'s other methods write the same line.
+            "info" => "info",
+            "warn" => "warn",
+            "error" => "error",
+            "debug" => "debug",
             "abs" => "abs",
             "floor" => "floor",
             "ceil" => "ceil",
@@ -2500,6 +2526,7 @@ impl<'s, 'c> L<'s, 'c> {
         // Parsed JSON arguments: bound as their column's type, once the
         // statement says which.
         let mut parsed: Vec<(usize, V, Span)> = Vec::new();
+        let mut marks: Vec<usize> = Vec::new();
         match c.arguments.get(1).map(|a| a.as_expression()) {
             None => {}
             Some(Some(Expression::ArrayExpression(a))) => {
@@ -2508,6 +2535,7 @@ impl<'s, 'c> L<'s, 'c> {
                         return self.stop("js.spread", a.span, "spread in the arguments");
                     };
                     let v = self.val(x)?;
+                    marks.push(self.pre.len());
                     if self.is_dyn(&v) {
                         parsed.push((binds.len(), v, x.span()));
                         binds.push(Expr::Lit(Literal::Null));
@@ -2521,6 +2549,16 @@ impl<'s, 'c> L<'s, 'c> {
                         );
                     }
                     binds.push(v.e);
+                }
+                // Each argument as it was when read, in order.
+                for i in (0..binds.len()).rev() {
+                    let mark = marks[i];
+                    if let Some(p) = parsed.iter_mut().find(|p| p.0 == i) {
+                        p.1 = self.settle(p.1.clone(), mark);
+                    } else {
+                        let e = std::mem::replace(&mut binds[i], Expr::Lit(Literal::Null));
+                        binds[i] = self.settle_e(e, mark);
+                    }
                 }
             }
             Some(_) => {
@@ -2675,6 +2713,7 @@ impl L<'_, '_> {
             );
         }
         let mut binds = Vec::new();
+        let mut marks: Vec<usize> = Vec::new();
         for a in args {
             let Some(x) = a.as_expression() else {
                 return self.stop("js.spread", c.span, "spread in the arguments");
@@ -2685,7 +2724,10 @@ impl L<'_, '_> {
                 // tier's value to it); another kind runs in the engine tier.
                 let ty = callee.params.get(binds.len()).copied().unwrap_or(Ty::Json);
                 match Self::undyn(v, ty, true) {
-                    Some(r) => binds.push(r.e),
+                    Some(r) => {
+                        binds.push(r.e);
+                        marks.push(self.pre.len());
+                    }
                     None => {
                         return self.stop(
                             "db.json_bind",
@@ -2700,7 +2742,9 @@ impl L<'_, '_> {
                 return self.stop("db.json_bind", x.span(), "JSON values can't be passed yet");
             }
             binds.push(v.e);
+            marks.push(self.pre.len());
         }
+        self.settle_binds(&mut binds, &marks);
         self.tmp += 1;
         let base = if name.is_empty() {
             format!("call{}", self.tmp)
@@ -2900,6 +2944,7 @@ impl L<'_, '_> {
             Some(Ok(t)) => t,
         };
         let mut binds = Vec::new();
+        let mut marks: Vec<usize> = Vec::new();
         for i in 1..=2 {
             let e = match c.arguments.get(i) {
                 None => Expr::Lit(Literal::Null),
@@ -2912,6 +2957,7 @@ impl L<'_, '_> {
                     // `null` as NULL, anything else as its JSON text.
                     if self.is_dyn(&v) {
                         binds.push(Expr::call(Builtin::JsonToStr, vec![v.e, Expr::bool(true)]));
+                        marks.push(self.pre.len());
                         continue;
                     }
                     match v.ty {
@@ -2937,6 +2983,7 @@ impl L<'_, '_> {
                 }
             };
             binds.push(e);
+            marks.push(self.pre.len());
         }
         let absent = |x: &Expression<'_>| match x {
             Expression::NullLiteral(_) => true,
@@ -2963,6 +3010,8 @@ impl L<'_, '_> {
             }
         };
         binds.push(headers);
+        marks.push(self.pre.len());
+        self.settle_binds(&mut binds, &marks);
         self.tmp += 1;
         let base = if name.is_empty() {
             format!("pub{}", self.tmp)
@@ -3222,25 +3271,35 @@ impl L<'_, '_> {
             Expression::NumericLiteral(n) => Ok(V::lit(number(n.value))),
             Expression::StringLiteral(s) => Ok(V::lit(Literal::Str(s.value.as_str().to_owned()))),
             Expression::TemplateLiteral(t) => {
-                let mut acc: Option<Expr> = None;
+                // Each part with where it was read, for the order of
+                // evaluation.
+                let mut parts: Vec<(Expr, usize)> = Vec::new();
                 for (i, q) in t.quasis.iter().enumerate() {
                     let Some(text) = q.value.cooked.as_ref() else {
                         return self.stop("js.template", t.span, "an invalid escape");
                     };
-                    let mut parts = Vec::new();
                     if !text.as_str().is_empty() {
-                        parts.push(Expr::Lit(Literal::Str(text.as_str().to_owned())));
+                        parts.push((
+                            Expr::Lit(Literal::Str(text.as_str().to_owned())),
+                            self.pre.len(),
+                        ));
                     }
                     if let Some(x) = t.expressions.get(i) {
                         let v = self.val(x)?;
-                        parts.push(self.text_of(v, x.span())?);
+                        let e = self.text_of(v, x.span())?;
+                        parts.push((e, self.pre.len()));
                     }
-                    for p in parts {
-                        acc = Some(match acc {
-                            None => p,
-                            Some(a) => Expr::bin(BinOp::Concat, a, p),
-                        });
-                    }
+                }
+                for i in (0..parts.len()).rev() {
+                    let (e, mark) = parts[i].clone();
+                    parts[i].0 = self.settle_e(e, mark);
+                }
+                let mut acc: Option<Expr> = None;
+                for (p, _) in parts {
+                    acc = Some(match acc {
+                        None => p,
+                        Some(a) => Expr::bin(BinOp::Concat, a, p),
+                    });
                 }
                 Ok(V {
                     e: acc.unwrap_or(Expr::Lit(Literal::Str(String::new()))),
@@ -3336,11 +3395,14 @@ impl L<'_, '_> {
                     return Ok(v);
                 }
                 let x = self.val(&b.left)?;
+                let mark = self.pre.len();
                 let y = self.val(&b.right)?;
+                let x = self.settle(x, mark);
                 self.binary(b.operator, x, y, b.span)
             }
             Expression::LogicalExpression(l) => {
                 let x = self.val(&l.left)?;
+                let mark = self.pre.len();
                 let y = match l.operator {
                     LogicalOperator::Or => {
                         self.cond_val(&l.right, self.facts_if(&l.left, false))?
@@ -3350,6 +3412,7 @@ impl L<'_, '_> {
                     }
                     LogicalOperator::Coalesce => self.cond_val(&l.right, BTreeSet::new())?,
                 };
+                let x = self.settle(x, mark);
                 let (xd, yd) = (self.is_dyn(&x), self.is_dyn(&y));
                 if xd || yd {
                     return self.dyn_logical(l.operator, x, y, xd, yd, l.span);
@@ -3403,8 +3466,10 @@ impl L<'_, '_> {
             }
             Expression::ConditionalExpression(c) => {
                 let t = self.test(&c.test)?;
+                let mark = self.pre.len();
                 let a = self.cond_val(&c.consequent, self.facts_if(&c.test, true))?;
                 let b = self.cond_val(&c.alternate, self.facts_if(&c.test, false))?;
+                let t = self.settle_e(t, mark);
                 let (a, b) = match (self.is_dyn(&a), self.is_dyn(&b)) {
                     (true, true) => {
                         return Ok(V {
@@ -3467,8 +3532,10 @@ impl L<'_, '_> {
                             "a parsed JSON value inside an array literal",
                         );
                     }
-                    items.push(v.e);
+                    items.push((v, self.pre.len()));
                 }
+                self.settle_all(&mut items);
+                let items = items.into_iter().map(|(v, _)| v.e).collect();
                 Ok(V {
                     e: Expr::ArrayLit(items),
                     ty: Ty::Json,
@@ -3744,8 +3811,10 @@ impl L<'_, '_> {
                 if v.ty == Ty::Float {
                     ty = Ty::Float;
                 }
-                xs.push(v);
+                xs.push((v, self.pre.len()));
             }
+            self.settle_all(&mut xs);
+            let mut xs: Vec<V> = xs.into_iter().map(|(v, _)| v).collect();
             let e = match b {
                 Builtin::Abs => Expr::call(b, vec![xs.remove(0).e]),
                 Builtin::Max | Builtin::Min => {
@@ -3825,7 +3894,7 @@ impl L<'_, '_> {
                     return self.stop("js.call", c.span, format!("{method} on a non-string"));
                 }
                 self.need_nn(&s, m.span)?;
-                let mut es = vec![s.e];
+                let mut es = vec![(s.e, self.pre.len())];
                 for a in args {
                     let v = self.val(a)?;
                     let v = if self.is_dyn(&v) {
@@ -3840,8 +3909,13 @@ impl L<'_, '_> {
                             format!("{method} takes a non-null string here"),
                         );
                     }
-                    es.push(v.e);
+                    es.push((v.e, self.pre.len()));
                 }
+                for i in (0..es.len()).rev() {
+                    let (e, mark) = es[i].clone();
+                    es[i].0 = self.settle_e(e, mark);
+                }
+                let es = es.into_iter().map(|(e, _)| e).collect();
                 let ty = match b {
                     Builtin::Upper | Builtin::Lower => Ty::Str,
                     Builtin::IndexOf => Ty::Int,
@@ -3919,8 +3993,11 @@ impl L<'_, '_> {
             let Some(x) = a.as_expression() else {
                 return self.stop("js.spread", c.span, "spread arguments");
             };
-            args.push(self.val(x)?);
+            let v = self.val(x)?;
+            args.push((v, self.pre.len()));
         }
+        self.settle_all(&mut args);
+        let args: Vec<V> = args.into_iter().map(|(v, _)| v).collect();
         let text = self
             .src
             .get(start as usize..end as usize)
@@ -3989,10 +4066,44 @@ impl L<'_, '_> {
         self.scopes.push(Vec::new());
         self.inlining.push(start);
         let r = if let Some(e) = single {
+            // The parameters are bound first, so a name in the body that
+            // a parameter shadows doesn't count as a helper call.
             for (i, p) in params.items.iter().enumerate() {
                 if let BindingPattern::BindingIdentifier(b) = &p.pattern {
                     let v = args.get(i).cloned().unwrap_or_else(V::null);
                     self.bind(b.name.as_str(), Var::Val(v));
+                }
+            }
+            // An argument is its value at the call: when the body calls
+            // a helper, whose statements run before the body's value is
+            // read, an argument reading a local is kept in one of its own.
+            let body_text = text
+                .get(e.span().start as usize..e.span().end as usize)
+                .unwrap_or_default();
+            if self.cond == 0 && self.may_call_helper(body_text) {
+                for (i, p) in params.items.iter().enumerate() {
+                    let BindingPattern::BindingIdentifier(b) = &p.pattern else {
+                        continue;
+                    };
+                    let Some(v) = args.get(i).cloned() else {
+                        continue;
+                    };
+                    let mut local = false;
+                    v.e.walk(&mut |x| local |= matches!(x, Expr::Local(_)));
+                    if local {
+                        let parsed = self.is_dyn(&v);
+                        let at = self.pre.len();
+                        let l = self.snapshot(v.e, v.ty, at);
+                        if parsed {
+                            self.dyn_locals.insert(l);
+                        }
+                        let held = V {
+                            e: Expr::Local(l),
+                            ty: v.ty,
+                            nn: v.nn,
+                        };
+                        self.bind(b.name.as_str(), Var::Val(held));
+                    }
                 }
             }
             self.val(e)
@@ -4071,6 +4182,103 @@ impl L<'_, '_> {
                 Ok(V::null())
             }
         }
+    }
+
+    // -- evaluation order -------------------------------------------------------
+    //
+    // JavaScript evaluates operands left to right, and a helper's body runs
+    // in the statements before the one calling it. So an operand read before
+    // a later operand's helper call must keep the value it had then:
+    // `n + bump()` adds the old `n` when `bump` changes it. After the later
+    // operands are lowered, an earlier one whose locals their statements
+    // assign is kept in a local of its own, assigned where it was read.
+
+    /// Whether the statements added since `mark` assign a local `e` reads.
+    fn reads_changed(&self, e: &Expr, mark: usize) -> bool {
+        let Some(after) = self.pre.get(mark..).filter(|a| !a.is_empty()) else {
+            return false;
+        };
+        let mut changed = BTreeSet::new();
+        assigned(after, &mut changed);
+        let mut hit = false;
+        e.walk(&mut |x| {
+            if let Expr::Local(l) = x {
+                hit |= changed.contains(l);
+            }
+        });
+        hit
+    }
+
+    /// `e` in a new local, assigned at `mark` of the statements before.
+    fn snapshot(&mut self, e: Expr, ty: Ty, mark: usize) -> LocalId {
+        self.tmp += 1;
+        let l = self.f.local(&format!("operand{}", self.tmp), ty);
+        let at = mark.min(self.pre.len());
+        self.pre.insert(at, Stmt::Assign(l, e));
+        l
+    }
+
+    /// `v`, read at `mark`, as it was there (see above).
+    fn settle(&mut self, v: V, mark: usize) -> V {
+        if !self.reads_changed(&v.e, mark) {
+            return v;
+        }
+        let parsed = self.is_dyn(&v);
+        let l = self.snapshot(v.e, v.ty, mark);
+        if parsed {
+            self.dyn_locals.insert(l);
+        }
+        V {
+            e: Expr::Local(l),
+            ty: v.ty,
+            nn: v.nn,
+        }
+    }
+
+    /// An operand's IR, read at `mark`, as it was there.
+    fn settle_e(&mut self, e: Expr, mark: usize) -> Expr {
+        if !self.reads_changed(&e, mark) {
+            return e;
+        }
+        let ty = self.f.ty_of(&e);
+        Expr::Local(self.snapshot(e, ty, mark))
+    }
+
+    /// Bind values read in order, each with where it was read: every one
+    /// as it was then.
+    fn settle_binds(&mut self, binds: &mut [Expr], marks: &[usize]) {
+        for i in (0..binds.len().min(marks.len())).rev() {
+            let e = std::mem::replace(&mut binds[i], Expr::Lit(Literal::Null));
+            binds[i] = self.settle_e(e, marks[i]);
+        }
+    }
+
+    /// Operands read in order, each with the length of the statements
+    /// before when it was read: every one as it was then.
+    fn settle_all(&mut self, vs: &mut [(V, usize)]) {
+        for i in (0..vs.len()).rev() {
+            let (v, mark) = vs[i].clone();
+            vs[i].0 = self.settle(v, mark);
+        }
+    }
+
+    /// Whether an expression-form helper's body may call a helper (whose
+    /// statements could change what its arguments read): any name in it
+    /// that names a helper where it was declared.
+    fn may_call_helper(&self, text: &str) -> bool {
+        let is_start = |c: char| c.is_alphabetic() || c == '_' || c == '$';
+        let mut rest = text;
+        while let Some(i) = rest.find(is_start) {
+            let tail = &rest[i..];
+            let n = tail
+                .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+                .unwrap_or(tail.len());
+            if matches!(self.lookup(&tail[..n]), Some(Var::Helper { .. })) {
+                return true;
+            }
+            rest = &tail[n..];
+        }
+        false
     }
 
     fn need_nn(&mut self, v: &V, span: Span) -> R<()> {
@@ -4488,7 +4696,9 @@ impl L<'_, '_> {
         if let Expression::StringLiteral(k) = strip_parens(&m.expression) {
             return self.json_member(v, k.value.as_str(), m.optional, m.span);
         }
+        let mark = self.pre.len();
         let i = self.val(&m.expression)?;
+        let v = self.settle(v, mark);
         if i.ty != Ty::Int {
             return self.stop(
                 "js.member",
@@ -4644,7 +4854,7 @@ impl L<'_, '_> {
             }
         }
         // `x === null` and the like.
-        for (x, lit) in [(&b.left, &b.right), (&b.right, &b.left)] {
+        for (x, lit, left) in [(&b.left, &b.right, true), (&b.right, &b.left, false)] {
             let (is_null, is_undef) = (null(lit), undefined(lit));
             if !is_null && !is_undef {
                 continue;
@@ -4656,11 +4866,7 @@ impl L<'_, '_> {
             if !self.is_dyn(&v) {
                 // Not parsed: the ordinary comparison with null.
                 let n = V::null();
-                let (l, r) = if std::ptr::eq(x, &b.left) {
-                    (v, n)
-                } else {
-                    (n, v)
-                };
+                let (l, r) = if left { (v, n) } else { (n, v) };
                 return self.binary(b.operator, l, r, b.span).map(Some);
             }
             let e = if !strict {
@@ -4824,7 +5030,7 @@ impl L<'_, '_> {
     /// by spaces (QuickJS's formatting for text, numbers, booleans and
     /// `null`).
     fn log_line(&mut self, c: &oxc_ast::ast::CallExpression<'_>) -> R<Expr> {
-        let mut acc: Option<Expr> = None;
+        let mut parts: Vec<(Expr, usize)> = Vec::new();
         for a in &c.arguments {
             let Some(x) = a.as_expression() else {
                 return self.stop("js.spread", c.span, "spread arguments");
@@ -4838,6 +5044,14 @@ impl L<'_, '_> {
                 );
             }
             let t = self.text_of(v, x.span())?;
+            parts.push((t, self.pre.len()));
+        }
+        for i in (0..parts.len()).rev() {
+            let (e, mark) = parts[i].clone();
+            parts[i].0 = self.settle_e(e, mark);
+        }
+        let mut acc: Option<Expr> = None;
+        for (t, _) in parts {
             acc = Some(match acc {
                 None => t,
                 Some(p) => Expr::bin(

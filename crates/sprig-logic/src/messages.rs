@@ -675,7 +675,7 @@ impl CompiledEntry {
         args.push("@__sprig_e".to_owned());
         args.push("@__sprig_r".to_owned());
         if self.log {
-            args.push("@__sprig_l".to_owned());
+            args.push(sprig_logic_compile::plsql::LOG_VAR.to_owned());
         }
         format!(
             "CALL {}.{}({})",
@@ -730,7 +730,7 @@ impl Deployed {
         let mut v = vec![if self.tier == "mariadb" {
             format!(
                 "trigger module {} version {}: tier mariadb (compiled; a record whose JSON it \
-                 can't read as JavaScript does runs in the engine tier)",
+                 can't read as the language does runs in the engine tier)",
                 self.module_id, self.version
             )
         } else {
@@ -1041,27 +1041,24 @@ pub async fn deploy(d: &Declaration, t: MsgTarget<'_>) -> Result<Deployed> {
         (Some(spec), Some(active)) if active != version => Some((active, spec)),
         _ => None,
     };
-    match staged {
-        Some((active, spec)) => {
-            crate::rollout::put(
-                t.catalog,
-                t.catalog_schema,
-                module.module_id,
-                active,
-                version,
-                crate::rollout::RolloutSpec {
-                    pct: spec.pct,
-                    by: crate::rollout::RolloutBy::Key(None),
-                },
-            )
+    if let Some((active, spec)) = staged {
+        crate::rollout::put(
+            t.catalog,
+            t.catalog_schema,
+            module.module_id,
+            active,
+            version,
+            crate::rollout::RolloutSpec {
+                pct: spec.pct,
+                by: crate::rollout::RolloutBy::Key(None),
+            },
+        )
+        .await?;
+    } else {
+        crate::rollout::clear(t.catalog, t.catalog_schema, module.module_id).await?;
+        store
+            .activate(t.catalog, module.module_id, version, t.catalog_version)
             .await?;
-        }
-        None => {
-            crate::rollout::clear(t.catalog, t.catalog_schema, module.module_id).await?;
-            store
-                .activate(t.catalog, module.module_id, version, t.catalog_version)
-                .await?;
-        }
     }
     let row = SourceRow {
         binding_id: binding.binding_id,
@@ -1172,16 +1169,16 @@ async fn place(
         Ok(())
     };
     match d.runtime {
-        Runtime::Javascript => {}
+        Runtime::Javascript | Runtime::Lua => {}
         Runtime::Kirun => {
             let why = "KIRun triggers on streams and queues run in the engine tier";
             refuse_mariadb(why)?;
             return Ok(Placed::engine("kirun.trigger", why));
         }
-        _ => {
-            let why = "no compiler front end for this language yet";
+        Runtime::Sql => {
+            let why = "this language's triggers on streams and queues run in the engine tier";
             refuse_mariadb(why)?;
-            return Ok(Placed::engine("lua.front_end", why));
+            return Ok(Placed::engine("trigger.language", why));
         }
     }
     let Some(c) = c else {
@@ -1215,13 +1212,23 @@ async fn place(
         SourceKind::Stream => MsgSource::Stream,
         SourceKind::Queue => MsgSource::Queue,
     };
-    let compiled = sprig_logic_compile::js::compile_with(
-        &d.name,
-        &d.body,
-        &Signature::message(on),
-        &env,
-        &opts,
-    )?;
+    let compiled = if d.runtime == Runtime::Lua {
+        sprig_logic_compile::lua::compile_with(
+            &d.name,
+            &d.body,
+            &Signature::message(on),
+            &env,
+            &opts,
+        )?
+    } else {
+        sprig_logic_compile::js::compile_with(
+            &d.name,
+            &d.body,
+            &Signature::message(on),
+            &env,
+            &opts,
+        )?
+    };
     let placed = crate::placement::place(&compiled, d.tier, c.single_shard)?;
     let placement = serde_json::to_value(&placed).unwrap_or_default();
     let (Some(f), Some(p), crate::placement::Tier::MariaDb) =
@@ -1281,7 +1288,7 @@ pub async fn rollout_change(
             if !matches!(by, None | Some(RolloutBy::Key(None))) {
                 return Err(SprigError::new(
                     SprigCode::LogicSyntax,
-                    "a trigger on a stream or queue rolls out by key: ROLLOUT TO n [BY KEY]",
+                    "a trigger rolls out by key: ROLLOUT TO n [BY KEY]",
                 ));
             }
             crate::rollout::put(
@@ -1311,7 +1318,7 @@ pub async fn rollout_change(
             crate::rollout::clear(c, schema, module_id).await?;
             (
                 format!(
-                    "{name}: version {} is active for every record (workers take it within 5 s)",
+                    "{name}: version {} is active for every record or row (workers take it within 5 s)",
                     r.candidate_version
                 ),
                 r.candidate_version,
@@ -1321,7 +1328,7 @@ pub async fn rollout_change(
             crate::rollout::clear(c, schema, module_id).await?;
             (
                 format!(
-                    "{name}: rollout of version {} ended; version {} runs every record",
+                    "{name}: rollout of version {} ended; version {} runs every record or row",
                     r.candidate_version, r.active_version
                 ),
                 r.active_version,

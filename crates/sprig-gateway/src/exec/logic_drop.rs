@@ -410,25 +410,13 @@ impl PassSession {
         if !matches!(m.state.as_str(), "active" | "disabled") {
             return Err(not_found());
         }
-        let (b, src) = message_source(&mut conn, &store, &schema, &catalog, a, m.module_id).await?;
-        // `ROLLOUT TO n | PROMOTE | ABORT`: the trigger's rollout by key.
+        // `ROLLOUT TO n | PROMOTE | ABORT`: the trigger's rollout by key
+        // (a stream record's or queue message's, an after-commit row's).
         if let Some(op) = &a.rollout {
-            let op = op
-                .clone()
-                .map_err(|msg| SprigError::new(SprigCode::LogicSyntax, msg))?;
-            let note = sprig_logic::messages::rollout_change(
-                &mut conn,
-                &schema,
-                m.module_id,
-                &a.name,
-                op,
-                catalog.version,
-                &who,
-            )
-            .await?;
-            super::msg_trigger::forget_rollout(tenant.0, m.module_id);
-            return Ok(vec![note]);
+            let at = (tenant.0, m.module_id);
+            return alter_rollout(&mut conn, &schema, at, a, op, catalog.version, &who).await;
         }
+        let (b, src) = message_source(&mut conn, &store, &schema, &catalog, a, m.module_id).await?;
         let changed = store
             .set_module_state(&mut conn, m.module_id, a.enable)
             .await?;
@@ -453,18 +441,7 @@ impl PassSession {
             {
                 tracing::warn!(error = %e, "logic_log line not written");
             }
-            format!(
-                "trigger {} on {} {}.{} {state}{}",
-                a.name,
-                src.kind.as_str(),
-                src.db_name,
-                src.name,
-                if a.enable {
-                    "; it resumes from where it stopped"
-                } else {
-                    "; its job ends within 5 s and its position is kept"
-                }
-            )
+            toggled_note(a, &src, state)
         } else {
             format!("trigger {} was already {state}", a.name)
         };
@@ -599,6 +576,51 @@ impl PassSession {
 
 /// The index entry of a trigger on a stream or a queue after `ALTER TRIGGER
 /// ... ENABLE` (written, so a job starts from the kept position) or
+/// `ALTER TRIGGER ... ROLLOUT ...` of a trigger on a stream or queue: the
+/// rollout's next stage, promotion or end (`sprig_logic::messages`).
+/// `(tenant, module)` names the trigger.
+async fn alter_rollout(
+    conn: &mut mysql_async::Conn,
+    schema: &str,
+    (tenant, module_id): (u64, u64),
+    a: &AlterTrigger,
+    op: &std::result::Result<sprig_logic::rollout::RolloutOp, String>,
+    catalog_version: u64,
+    who: &str,
+) -> Result<Vec<String>> {
+    let op = op
+        .clone()
+        .map_err(|msg| SprigError::new(SprigCode::LogicSyntax, msg))?;
+    let note = sprig_logic::messages::rollout_change(
+        conn,
+        schema,
+        module_id,
+        &a.name,
+        op,
+        catalog_version,
+        who,
+    )
+    .await?;
+    super::msg_trigger::forget_rollout(tenant, module_id);
+    Ok(vec![note])
+}
+
+/// The note of a trigger disabled or enabled.
+fn toggled_note(a: &AlterTrigger, src: &sprig_logic::messages::SourceRow, state: &str) -> String {
+    format!(
+        "trigger {} on {} {}.{} {state}{}",
+        a.name,
+        src.kind.as_str(),
+        src.db_name,
+        src.name,
+        if a.enable {
+            "; it resumes from where it stopped"
+        } else {
+            "; its job ends within 5 s and its position is kept"
+        }
+    )
+}
+
 /// `DISABLE` (removed; the running job ends at its next check of the
 /// module, within 5 s, and its consumer group or queue keeps the position).
 async fn set_indexed(

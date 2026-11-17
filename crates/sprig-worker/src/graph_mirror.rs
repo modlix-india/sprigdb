@@ -165,6 +165,8 @@ fn now_us() -> u64 {
 #[derive(Debug, Clone)]
 struct Served {
     layout: Arc<GraphShards>,
+    /// Typed storage (`graphs.storage = 2`): a table per type.
+    typed: bool,
 }
 
 /// Items from the readers: (cluster, the reader's generation, an item or
@@ -257,28 +259,42 @@ async fn look(
         .get_conn()
         .await
         .map_err(sprig_graph::catalog::backend_error)?;
-    let rows: Vec<(u64, u32, u32)> = match c
-        .query(format!(
-            "SELECT graph_id, db_id, group_id FROM {}.graphs WHERE kind = 'native' \
+    let served = |cols: &str| {
+        format!(
+            "SELECT {cols} FROM {}.graphs WHERE kind = 'native' \
              AND group_id IS NOT NULL AND state = 'active' \
              AND (mirror_mode IN ('starting', 'async') OR mirror_state = 'building')",
             quote(&catalog.1)
-        ))
+        )
+    };
+    let rows: Vec<(u64, u32, u32, u8)> = match c
+        .query(served("graph_id, db_id, group_id, storage"))
         .await
     {
         Ok(r) => r,
-        // Before the catalog's graph migration 3: nothing to serve.
-        Err(mysql_async::Error::Server(e)) if e.code == 1054 || e.code == 1146 => Vec::new(),
+        // Before the catalog's graph migration 4: JSON graphs only.
+        Err(mysql_async::Error::Server(e)) if e.code == 1054 => match c
+            .query::<(u64, u32, u32), _>(served("graph_id, db_id, group_id"))
+            .await
+        {
+            Ok(r) => r.into_iter().map(|(g, d, gr)| (g, d, gr, 1)).collect(),
+            // Before migration 3: nothing to serve.
+            Err(mysql_async::Error::Server(e)) if e.code == 1054 || e.code == 1146 => Vec::new(),
+            Err(e) => return Err(sprig_graph::catalog::backend_error(e)),
+        },
+        Err(mysql_async::Error::Server(e)) if e.code == 1146 => Vec::new(),
         Err(e) => return Err(sprig_graph::catalog::backend_error(e)),
     };
     drop(c);
     let mut graphs = HashMap::new();
-    for (graph, db, group) in rows {
+    for (graph, db, group, storage) in rows {
+        let typed = storage == sprig_graph::typed::STORAGE_TYPED;
         // The watched map, unless a linearizable read after a failed
         // batch already gave a newer one.
         if let Some(s) = current.get(&graph)
             && s.layout.db == db
             && s.layout.group == group
+            && s.typed == typed
             && env
                 .maps
                 .get(tenant, GroupId(group))
@@ -303,6 +319,7 @@ async fn look(
                     mirror_building: false,
                     route: None,
                 }),
+                typed,
             },
         );
     }
@@ -769,8 +786,15 @@ impl Applier {
 
     /// An edge-table row of a served graph as a change.
     fn edge_change(&self, r: &RawRow) -> Option<(u64, EdgeChange)> {
-        let graph: u64 = r.table.table.strip_prefix("__sprig_ge_")?.parse().ok()?;
-        self.graphs.get(&graph)?;
+        // `__sprig_ge_<graph>` (JSON) or `__sprig_ge_<graph>_<type>` (typed).
+        let name = r.table.table.strip_prefix("__sprig_ge_")?;
+        let (graph, ty): (u64, Option<u32>) = match name.split_once('_') {
+            Some((g, t)) => (g.parse().ok()?, Some(t.parse().ok()?)),
+            None => (name.parse().ok()?, None),
+        };
+        if self.graphs.get(&graph)?.typed != ty.is_some() {
+            return None;
+        }
         if !r.table.schema.starts_with(&format!("t{}_", self.tenant)) {
             return None;
         }
@@ -795,7 +819,10 @@ impl Applier {
                 id: col("id")?,
                 src: col("src")?,
                 dst: col("dst")?,
-                rtype: u32::try_from(col("type")?).ok()?,
+                rtype: match ty {
+                    Some(t) => t,
+                    None => u32::try_from(col("type")?).ok()?,
+                },
                 src_rk: col("_sprig_rk")?,
                 dst_rk: col("dst_rk")?,
                 live,
@@ -829,7 +856,11 @@ impl Applier {
             let Some(served) = self.graphs.get(&graph).cloned() else {
                 return Ok(()); // no longer served (dropped, or back to sync)
             };
-            let r = mirror::apply_batch(conns, &served.layout, ch, now_us()).await;
+            let r = if served.typed {
+                mirror::apply_batch_typed(conns, &served.layout, ch, now_us()).await
+            } else {
+                mirror::apply_batch(conns, &served.layout, ch, now_us()).await
+            };
             let stale = match &r {
                 Ok(a) => {
                     // The watched map now: a cutover seen meanwhile runs
@@ -901,6 +932,7 @@ impl Applier {
             graph,
             Served {
                 layout: Arc::new(l),
+                typed: s.typed,
             },
         );
         Ok(())

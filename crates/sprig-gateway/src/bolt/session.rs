@@ -38,7 +38,7 @@ use sprig_graph::ast::{Clause, Query};
 use sprig_graph::bookmark::{self, Bookmark};
 use sprig_graph::catalog::backend_error;
 use sprig_graph::eval::Params;
-use sprig_graph::maria::{GraphShards, MariaStore, ShardConns, check_deleted};
+use sprig_graph::maria::ShardConns;
 use sprig_graph::mirror::MirrorGate;
 use sprig_graph::store::GraphStore;
 use sprig_proto_bolt::PackValue;
@@ -53,6 +53,7 @@ use super::{
 };
 use crate::graphs::mirror::CatalogGate;
 use crate::graphs::txn::{CoordConns, GraphBackend, ReadConns, Touched, check_epochs};
+use crate::graphs::typed::StoreParts;
 use crate::graphs::{GatewayGraphs, GraphRef, RouteHolds};
 use crate::reads::GtidSet;
 
@@ -74,7 +75,7 @@ struct Tx {
     timeout: Option<Duration>,
     /// `BEGIN`'s `tx_metadata`, for `CALL tx.getMetaData()`.
     metadata: Option<BTreeMap<String, sprig_graph::value::Value>>,
-    deleted: Vec<(Arc<GraphShards>, Vec<u64>)>,
+    deleted: Vec<(GraphRef, Vec<u64>)>,
     /// Graphs written, with the shards (and their epochs) written.
     touched: Vec<(GraphRef, Vec<Touched>)>,
     /// Statements run so far.
@@ -824,7 +825,9 @@ impl GwSession {
         let Some(mut g) = graph else {
             return Err(SprigError::internal("graph missing"));
         };
-        // The graph's mirror mode follows `graph.mirror`.
+        // The graph's storage follows `graph.storage` (in the background),
+        // and its mirror mode `graph.mirror`.
+        self.graphs.follow_storage(&g, &cat);
         if self.graphs.follow_mirror_setting(&g, &cat).await {
             cat = self.graphs.catalog(tenant, Freshness::Latest).await?;
             if let Some(now) = self.graphs.resolve(&cat, &g.db, &g.name).await? {
@@ -968,6 +971,7 @@ impl GwSession {
         let settings = &self.graphs.svc.settings;
         let mut budgets =
             sprig_graph::settings::budgets(&|s| settings.get(s, &ctx, Some(&cat.settings)));
+        crate::offload::GraphLimits::read(&|s| settings.get(s, &ctx, Some(&cat.settings))).apply();
         budgets.tier = sprig_graph::exec::TraversalTier::parse(&settings.get(
             &sprig_graph::settings::TRAVERSAL_TIER,
             &ctx,
@@ -1053,16 +1057,23 @@ impl GwSession {
                 let gate = self.gate(&g, &cat);
                 if streams {
                     let (tx, rx) = mpsc::channel(CHANNEL_ROWS);
-                    let layout = Arc::clone(&g.shards);
-                    let indexes = g.def.indexes.clone();
+                    let graphs = Arc::clone(&self.graphs);
+                    let gr = g.clone();
+                    let parts = StoreParts {
+                        labels,
+                        types,
+                        dict,
+                        ids,
+                        indexes: g.def.indexes.clone(),
+                        ops: None,
+                        gate,
+                        holds: None,
+                    };
                     tokio::spawn(crate::offload::run_graph_stream(async move {
                         let r = {
-                            let mut store =
-                                MariaStore::new(&mut rc, layout, labels, types, dict, ids)
-                                    .with_schema(indexes, None)
-                                    .with_gate(gate);
+                            let mut store = graphs.open_store(&gr, &mut rc, parts);
                             let mut sink = ChanSink { tx: tx.clone() };
-                            stream_on(&mut store, visible, &q, &p, &budgets, &mut sink).await
+                            stream_on(&mut *store, visible, &q, &p, &budgets, &mut sink).await
                         };
                         rc.end().await;
                         let end = r.map(|o| summary(o.stats, None)).map_err(|e| failure(&e));
@@ -1076,15 +1087,21 @@ impl GwSession {
                     graphs: Arc::clone(&self.graphs),
                     g: g.clone(),
                 });
+                let parts = StoreParts {
+                    labels,
+                    types,
+                    dict,
+                    ids,
+                    indexes: g.def.indexes.clone(),
+                    ops: Some(self.graphs.schema_ops(&g)),
+                    gate,
+                    holds: Some(holds),
+                };
                 let r = {
-                    let mut store =
-                        MariaStore::new(&mut rc, Arc::clone(&g.shards), labels, types, dict, ids)
-                            .with_schema(g.def.indexes.clone(), Some(self.graphs.schema_ops(&g)))
-                            .with_gate(gate)
-                            .with_holds(Some(holds));
+                    let mut store = self.graphs.open_store(&g, &mut rc, parts);
                     hard_time(
                         budgets.max_time,
-                        run_on(&mut store, visible.clone(), &q, &p, &budgets),
+                        run_on(&mut *store, visible.clone(), &q, &p, &budgets),
                     )
                     .await
                 };
@@ -1107,14 +1124,24 @@ impl GwSession {
                     touched: &mut touched,
                     batches: Some((Arc::clone(&self.graphs), g.clone())),
                 };
+                let parts = StoreParts {
+                    labels,
+                    types,
+                    dict,
+                    ids,
+                    indexes: g.def.indexes.clone(),
+                    ops: Some(self.graphs.schema_ops(&g)),
+                    gate: None,
+                    holds: None,
+                };
                 let r = {
-                    let mut store =
-                        MariaStore::new(&mut cc, Arc::clone(&g.shards), labels, types, dict, ids)
-                            .with_schema(g.def.indexes.clone(), Some(self.graphs.schema_ops(&g)));
-                    run_on(&mut store, visible.clone(), &q, &p, &budgets).await
+                    let mut store = self.graphs.open_store(&g, &mut cc, parts);
+                    run_on(&mut *store, visible.clone(), &q, &p, &budgets).await
                 };
                 match r {
-                    Ok(o) => check_deleted(&mut cc, &g.shards, &o.deleted_nodes)
+                    Ok(o) => self
+                        .graphs
+                        .check_deleted(&g, &mut cc, &o.deleted_nodes)
                         .await
                         .map(|()| o),
                     Err(e) => Err(e),
@@ -1181,7 +1208,18 @@ impl GwSession {
             }
             let (tx, rx) = mpsc::channel(CHANNEL_ROWS);
             let layout = Arc::clone(&g.shards);
-            let indexes = g.def.indexes.clone();
+            let graphs = Arc::clone(&self.graphs);
+            let gr = g.clone();
+            let parts = StoreParts {
+                labels,
+                types,
+                dict,
+                ids,
+                indexes: g.def.indexes.clone(),
+                ops: None,
+                gate,
+                holds: None,
+            };
             tokio::spawn(crate::offload::run_graph_stream(async move {
                 let mut touched = Vec::new();
                 let r = {
@@ -1201,10 +1239,8 @@ impl GwSession {
                             &mut cc
                         }
                     };
-                    let mut store = MariaStore::new(sc, layout, labels, types, dict, ids)
-                        .with_schema(indexes, None)
-                        .with_gate(gate);
-                    stream_on(&mut store, visible, &q, &p, &budgets, &mut sink).await
+                    let mut store = graphs.open_store(&gr, sc, parts);
+                    stream_on(&mut *store, visible, &q, &p, &budgets, &mut sink).await
                 };
                 let _ = back_tx.send(conns);
                 let end = r.map(|o| summary(o.stats, None)).map_err(|e| failure(&e));
@@ -1230,10 +1266,18 @@ impl GwSession {
                     &mut cc
                 }
             };
-            let mut store = MariaStore::new(sc, Arc::clone(&g.shards), labels, types, dict, ids)
-                .with_schema(g.def.indexes.clone(), Some(ops))
-                .with_gate(gate);
-            run_on(&mut store, visible.clone(), &q, &p, &budgets).await
+            let parts = StoreParts {
+                labels,
+                types,
+                dict,
+                ids,
+                indexes: g.def.indexes.clone(),
+                ops: Some(ops),
+                gate,
+                holds: None,
+            };
+            let mut store = self.graphs.open_store(&g, sc, parts);
+            run_on(&mut *store, visible.clone(), &q, &p, &budgets).await
         };
         let Some(t) = self.tx.as_mut() else {
             return Err(SprigError::internal("no transaction"));
@@ -1253,8 +1297,7 @@ impl GwSession {
             }
         }
         if !out.deleted_nodes.is_empty() {
-            t.deleted
-                .push((Arc::clone(&g.shards), out.deleted_nodes.clone()));
+            t.deleted.push((g.clone(), out.deleted_nodes.clone()));
         }
         Ok(StartOrResult::Result(self.result(out, &g.name, &cat)?))
     }
@@ -1555,17 +1598,17 @@ impl BoltSession for GwSession {
             TxConns::Write(c) => c,
         };
         let checked: Result<()> = async {
-            for (layout, ids) in &t.deleted {
+            for (g, ids) in &t.deleted {
                 let mut touched = Vec::new();
                 let mut cc = CoordConns {
                     coord: &mut coord,
                     backend: Arc::clone(&self.backend),
-                    db: DbId(layout.db),
-                    group: GroupId(layout.group),
+                    db: DbId(g.shards.db),
+                    group: GroupId(g.shards.group),
                     touched: &mut touched,
                     batches: None,
                 };
-                check_deleted(&mut cc, layout, ids).await?;
+                self.graphs.check_deleted(g, &mut cc, ids).await?;
             }
             for (g, touched) in &t.touched {
                 if g.shards.group != 0 {

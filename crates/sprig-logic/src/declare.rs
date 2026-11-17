@@ -941,20 +941,22 @@ pub fn parse(sql: &str) -> Result<Declaration> {
     let on_message = kind == Kind::Trigger && d.source.is_some();
     if let Some(r) = d.rollout.as_mut() {
         use crate::rollout::RolloutBy;
-        if on_message {
-            // A trigger on a stream or queue rolls out by each record's
-            // key.
+        if kind == Kind::Trigger {
+            // A trigger rolls out by key: a stream record's key, a queue
+            // message's id, an after-commit trigger's row's primary key.
             if by_caller || d.rollout_key.is_some() {
-                return Err(syntax(
-                    "a trigger on a stream or queue rolls out by key: SPRIG_ROLLOUT_BY = 'key'",
-                ));
+                return Err(syntax(if on_message {
+                    "a trigger on a stream or queue rolls out by key: SPRIG_ROLLOUT_BY = 'key'"
+                } else {
+                    "an after-commit trigger rolls out by its row's key: SPRIG_ROLLOUT_BY = 'key'"
+                }));
             }
             r.by = RolloutBy::Key(None);
             d.rollout_key = None;
         } else if !matches!(kind, Kind::Function | Kind::Procedure) {
             return Err(syntax(
-                "SPRIG_ROLLOUT stages functions, procedures and triggers on streams and \
-                 queues; other kinds switch at once",
+                "SPRIG_ROLLOUT stages functions, procedures and triggers; validations, \
+                 computed columns and schedules switch at once",
             ));
         } else if r.by == RolloutBy::Key(None) && d.rollout_key.is_none() {
             return Err(syntax(
@@ -1045,10 +1047,19 @@ mod tests {
             "CREATE TRIGGER g ON QUEUE q LANGUAGE javascript WITH (SPRIG_ROLLOUT = 5, \
              SPRIG_ROLLOUT_BY = 'user') AS $$ 1 $$",
             "CREATE TRIGGER g AFTER COMMIT ON t FOR INSERT LANGUAGE javascript \
+             WITH (SPRIG_ROLLOUT = 5, SPRIG_ROLLOUT_BY = 'user') AS $$ 1 $$",
+            "CREATE VALIDATION v ON t FOR INSERT LANGUAGE javascript \
              WITH (SPRIG_ROLLOUT = 5) AS $$ 1 $$",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
+        // An after-commit trigger rolls out by its row's key.
+        let d = parse(
+            "CREATE OR REPLACE TRIGGER g AFTER COMMIT ON t FOR INSERT LANGUAGE javascript \
+             WITH (SPRIG_ROLLOUT = 20) AS $$ 1 $$",
+        )
+        .unwrap();
+        assert_eq!(d.rollout.unwrap().by, RolloutBy::Key(None));
     }
 
     #[test]

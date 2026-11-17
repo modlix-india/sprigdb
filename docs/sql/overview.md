@@ -248,7 +248,7 @@ The rules:
 | `CREATE SCHEDULE` | Cron schedules | [Logic](logic.md#create-schedule) |
 | `ALTER TABLE … ADD c type AS (f(…))` | Computed columns from logic functions | [Logic](logic.md#computed-columns) |
 | `TEST FUNCTION \| PROCEDURE \| TRIGGER \| VALIDATION` | Sandboxed test runs | [Logic](logic.md#test) |
-| `ALTER FUNCTION \| PROCEDURE … ROLLOUT TO \| PROMOTE \| ABORT` | Staged rollouts | [Logic](logic.md#staged-rollouts) |
+| `ALTER FUNCTION \| PROCEDURE \| TRIGGER … ROLLOUT TO \| PROMOTE \| ABORT` | Staged rollouts | [Logic](logic.md#staged-rollouts) |
 | `ALTER FUNCTION \| PROCEDURE … ROLLBACK [TO VERSION n]` | Earlier versions | [Logic](logic.md#alter--rollback) |
 | `DROP FUNCTION \| PROCEDURE \| VALIDATION \| TRIGGER \| SCHEDULE … [CASCADE]` | Remove code | [Logic](logic.md#drop) |
 | `SHOW DEPENDENTS OF FUNCTION \| PROCEDURE` | What a drop would affect | [Logic](logic.md#show-dependents) |

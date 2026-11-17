@@ -410,7 +410,25 @@ pub fn schemas() -> Value {
     if let (Value::Object(m), Value::Object(a)) = (&mut v, dashboard_schemas()) {
         m.extend(a);
     }
+    if let (Value::Object(m), Value::Object(a)) = (&mut v, docs_page_schemas()) {
+        m.extend(a);
+    }
     v
+}
+
+/// `GET /v1/docs/pages/{page}`'s reply.
+fn docs_page_schemas() -> Value {
+    let s = |props: Value, req: &[&str]| json!({"type": "object", "properties": props, "required": req});
+    let string = json!({"type": "string"});
+    json!({
+        "DocsPageChunk": s(json!({"chunk_id": string, "heading_path": string, "text": string,
+            "seq": {"type": "integer"}}), &["chunk_id", "heading_path", "text", "seq"]),
+        "DocsPage": s(json!({"version": string, "page": string, "title": string,
+            "audience": {"type": "array", "items": string}, "ordered": {"type": "boolean"},
+            "markdown": string,
+            "chunks": {"type": "array", "items": {"$ref": "#/components/schemas/DocsPageChunk"}}}),
+            &["version", "page", "title", "audience", "ordered", "markdown", "chunks"]),
+    })
 }
 
 fn core_schemas() -> Value {
@@ -502,13 +520,6 @@ fn core_schemas() -> Value {
         "RetrievalSearchReply": s(json!({"database": string, "index": string,
             "hits": {"type": "array", "items": {"$ref": "#/components/schemas/RetrievalSearchHit"}}}),
             &["database", "index", "hits"]),
-        "DocsPageChunk": s(json!({"chunk_id": string, "heading_path": string, "text": string,
-            "seq": int}), &["chunk_id", "heading_path", "text", "seq"]),
-        "DocsPage": s(json!({"version": string, "page": string, "title": string,
-            "audience": {"type": "array", "items": string}, "ordered": {"type": "boolean"},
-            "markdown": string,
-            "chunks": {"type": "array", "items": {"$ref": "#/components/schemas/DocsPageChunk"}}}),
-            &["version", "page", "title", "audience", "ordered", "markdown", "chunks"]),
         "DocsSearchReply": s(json!({"version": string,
             "mode": {"type": "string", "enum": ["hybrid", "keyword"]},
             "hits": {"type": "array", "items": {"$ref": "#/components/schemas/DocsSearchHit"}}}),

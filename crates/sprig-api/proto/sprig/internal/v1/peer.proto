@@ -202,6 +202,9 @@ message TailFeedRequest {
   string start_after = 2;
   // The calling gateway's DC: a tenant's tail goes only to its allowed DCs.
   string caller_dc = 3;
+  // Start at this HLC time (MongoDB's `startAtOperationTime`) through the
+  // home cluster's feed time index; 0: `start_after`, or from now.
+  uint64 start_at_hlc = 4;
 }
 
 message TailFeedMessage {

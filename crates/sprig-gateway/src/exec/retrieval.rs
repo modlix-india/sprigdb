@@ -27,7 +27,8 @@
 //!
 //! ```text
 //! q_vec := embed(query) with the bundled model, here    -- none: keyword only
-//! per shard of the index (as sprig_ctl, on the chunk table):
+//! per shard of the index (as sprig_ctl, on the chunk table): a data
+//!   group's shards are those its map holds now
 //!   bm25 := MATCH(text, title) AGAINST (query) top C [AND filter]
 //!   vec  := VEC_DISTANCE_COSINE(embedding, q_vec) top C [AND filter]
 //! the lists merged across shards by score (and by distance)
@@ -38,6 +39,21 @@
 //! hits := RRF(bm25 weighted keyword_weight(query), vec) over the visible,
 //!   k = 60; at most 2 per row; the first `limit`
 //! fewer than `limit` while a list was full: again with C × 4 (C ≤ 1000)
+//! ```
+//!
+//! **A caller that row-level security binds on the table.** MariaDB's
+//! full-text relevance counts every row of the chunk table, so its order
+//! would depend on rows the caller can't read. Its keyword list is ranked
+//! over the rows it may see alone, and both lists are cut at a depth that
+//! doesn't depend on the others:
+//!
+//! ```text
+//! bm25 := every chunk with a query word (boolean mode, in key order),
+//!   at most 1000 per shard; the visible ones ranked by BM25 with the
+//!   statistics of the visible matches alone (sprig_docs::search::Bm25);
+//!   the best D (D = C × shards); past 1000 on a shard: no keyword list
+//! vec  := as above, the visible ones down to the nearest last distance of
+//!   a full shard list, the first D; fewer: again with C × 4 (C ≤ 1000)
 //! ```
 //!
 //! C is `ai.retrieval.candidates` (40). The filter names only `FILTERS`
@@ -60,7 +76,7 @@ use sprig_catalog::TenantCatalog;
 use sprig_catalog::ddl::{database_key, object_key};
 use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::{Namespace, ObjectKind, ObjectState};
-use sprig_common::ids::{DbId, GroupId, ObjectId, ShardId, TenantId};
+use sprig_common::ids::{DbId, GroupId, ObjectId, TenantId};
 use sprig_common::names::{SchemaName, quote};
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_feed::subs::{Subscription, Subscriptions};
@@ -80,8 +96,40 @@ use crate::tenant::TenantServices;
 /// route's statements; honoured only for the gateway's own).
 pub(crate) const KEY_JSON_HINT: &str = "/* sprig-retrieve:key-json */";
 
-/// The most candidates per list and shard a search widens to.
+/// The most candidates per list and shard a search widens to, and the
+/// most keyword matches per shard a caller bound by row-level security
+/// ranks.
 const MAX_CANDIDATES: usize = 1000;
+
+/// The query's words for a boolean-mode match: letters and digits only,
+/// so nothing in the query reads as an operator.
+fn match_words(query: &str) -> String {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The keyword list of a caller bound by row-level security: `visible`
+/// (every visible chunk with a query word) ranked by BM25 with the
+/// statistics of those chunks alone, the best `depth`. Ties go to the
+/// lower key, so no rank depends on a row the caller can't see.
+fn rank_visible(query: &str, mut visible: Vec<Candidate>, depth: usize) -> Vec<Candidate> {
+    visible.sort_by(|a, b| a.key.cmp(&b.key).then(a.chunk_no.cmp(&b.chunk_no)));
+    visible.dedup_by(|a, b| a.key == b.key && a.chunk_no == b.chunk_no);
+    let none: &[String] = &[];
+    let bm = sprig_docs::search::Bm25::new(visible.iter().map(|c| {
+        (
+            format!("{}\n{}", c.title.as_deref().unwrap_or(""), c.text),
+            none,
+        )
+    }));
+    bm.search(query, depth)
+        .into_iter()
+        .filter_map(|(i, _)| visible.get(i).cloned())
+        .collect()
+}
 
 fn no_db() -> SprigError {
     SprigError::standard(1046, *b"3D000", "No database selected")
@@ -921,22 +969,39 @@ impl PassSession {
                 })
             }
         };
-        // The index's shards and their clusters.
+        // The index's shards and their clusters: a data group's are those
+        // its map holds now (a split's, merge's or move's new shards from
+        // their cutover, with the chunk tables the move carried); a
+        // database's default group's as the index records them.
         let maps = crate::exec::router::map_cache(&svc, tenant).ok();
         let mut shards = Vec::new();
+        let mut groups: HashSet<u32> = HashSet::new();
         for schema in ix.shards() {
-            let Ok(SchemaName::Shard { group, shard, .. }) = schema.parse::<SchemaName>() else {
+            let Ok(SchemaName::Shard {
+                tenant: t,
+                db,
+                group,
+                ..
+            }) = schema.parse::<SchemaName>()
+            else {
                 continue;
             };
-            let mapped = maps
+            match maps
                 .as_ref()
                 .and_then(|m| m.get(tenant, GroupId(group.0)).ok())
-                .and_then(|m| m.shard(ShardId(shard.0)).map(|r| r.cluster.clone()));
-            let cluster = match mapped {
-                Some(c) => c,
-                None => svc.locator.cluster(tenant).await?,
-            };
-            shards.push((schema, cluster));
+            {
+                Some(m) => {
+                    if groups.insert(group.0) {
+                        for r in &m.ranges {
+                            shards.push((
+                                SchemaName::shard(t, db, group, r.shard).to_string(),
+                                r.cluster.clone(),
+                            ));
+                        }
+                    }
+                }
+                None => shards.push((schema, svc.locator.cluster(tenant).await?)),
+            }
         }
         let keys = ix.key_columns.clone();
         let nk = keys.len();
@@ -955,6 +1020,14 @@ impl PassSession {
             Some(&cat.settings),
         );
         let mut per_list = usize::try_from(candidates_setting).unwrap_or(40).max(1);
+        // A caller bound by row-level security on the table (see the
+        // module docs): its lists' depth.
+        let bound =
+            crate::pipeline::SessionExec::row_policy_binds(self, ix.object_id) != Some(false);
+        let depth = per_list * shards.len().max(1);
+        let m_lit = string_literal(&match_words(&call.query), false);
+        // Its keyword matches, fetched once.
+        let mut bound_kw: Option<(Vec<(f64, Candidate)>, bool)> = None;
         let limit = usize::try_from(call.limit).unwrap_or(10);
         let weight = sprig_docs::search::keyword_weight(&call.query);
         let and_filter = shard_filter
@@ -968,6 +1041,11 @@ impl PassSession {
             let mut kw: Vec<(f64, Candidate)> = Vec::new();
             let mut vecs: Vec<(f64, Candidate)> = Vec::new();
             let mut full = false;
+            // Bound: the nearest last distance of a full vector list, and
+            // whether a shard had more keyword matches than it ranks.
+            let mut vec_edge: Option<f64> = None;
+            let mut over = false;
+            let fetch_kw = !bound || bound_kw.is_none();
             for (schema, cluster) in &shards {
                 let pool = svc.locator.ctl_pool(cluster).await?;
                 let mut c = pool.get_conn_bounded().await.map_err(|e| {
@@ -975,14 +1053,27 @@ impl PassSession {
                 })?;
                 let t = format!("{}.{}", quote(schema), quote(&rx::table_name(ix.id)));
                 let head = format!("{}, chunk_no, title, text", kcols.join(", "));
-                let mut queries = vec![(
-                    true,
-                    format!(
-                        "SELECT {head}, MATCH(text, title) AGAINST ({q_lit} IN NATURAL LANGUAGE MODE) AS s \
-                         FROM {t} WHERE MATCH(text, title) AGAINST ({q_lit} IN NATURAL LANGUAGE MODE){and_filter} \
-                         ORDER BY s DESC LIMIT {per_list}"
-                    ),
-                )];
+                let mut queries = Vec::new();
+                if fetch_kw && bound {
+                    queries.push((
+                        true,
+                        format!(
+                            "SELECT {head}, 0 AS s FROM {t} WHERE MATCH(text, title) AGAINST \
+                             ({m_lit} IN BOOLEAN MODE){and_filter} ORDER BY {}, chunk_no LIMIT {}",
+                            kcols.join(", "),
+                            MAX_CANDIDATES + 1
+                        ),
+                    ));
+                } else if fetch_kw {
+                    queries.push((
+                        true,
+                        format!(
+                            "SELECT {head}, MATCH(text, title) AGAINST ({q_lit} IN NATURAL LANGUAGE MODE) AS s \
+                             FROM {t} WHERE MATCH(text, title) AGAINST ({q_lit} IN NATURAL LANGUAGE MODE){and_filter} \
+                             ORDER BY s DESC LIMIT {per_list}"
+                        ),
+                    ));
+                }
                 if let Some(v) = &v_lit {
                     queries.push((
                         false,
@@ -1004,10 +1095,16 @@ impl PassSession {
                             ));
                         }
                     };
-                    if rows.len() >= per_list {
+                    if keyword && bound {
+                        if rows.len() > MAX_CANDIDATES {
+                            over = true;
+                            continue;
+                        }
+                    } else if rows.len() >= per_list {
                         full = true;
                     }
-                    for r in rows {
+                    let last = rows.len();
+                    for (n, r) in rows.into_iter().enumerate() {
                         let b = |i: usize| match r.as_ref(i) {
                             Some(mysql_async::Value::Bytes(b)) => Some(b.clone()),
                             _ => None,
@@ -1025,9 +1122,24 @@ impl PassSession {
                         if keyword {
                             kw.push((score, cand));
                         } else {
+                            if bound && n + 1 == last && last >= per_list {
+                                vec_edge = Some(vec_edge.map_or(score, |e: f64| e.min(score)));
+                            }
                             vecs.push((score, cand));
                         }
                     }
+                }
+            }
+            if bound {
+                match &bound_kw {
+                    Some((k, o)) => {
+                        kw.clone_from(k);
+                        over = *o;
+                    }
+                    None => bound_kw = Some((kw.clone(), over)),
+                }
+                if over {
+                    kw.clear();
                 }
             }
             kw.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -1092,6 +1204,36 @@ impl PassSession {
                             .collect(),
                     );
                 }
+            }
+            if bound {
+                let kw = rank_visible(
+                    &call.query,
+                    kw.into_iter()
+                        .map(|(_, c)| c)
+                        .filter(|c| visible.contains(&c.key))
+                        .collect(),
+                    depth,
+                );
+                let mut vecs: Vec<Candidate> = vecs
+                    .into_iter()
+                    .filter(|(d, _)| vec_edge.is_none_or(|e| *d <= e))
+                    .map(|(_, c)| c)
+                    .filter(|c| visible.contains(&c.key))
+                    .collect();
+                if vecs.len() < depth && vec_edge.is_some() && per_list < MAX_CANDIDATES {
+                    per_list = (per_list * 4).min(MAX_CANDIDATES);
+                    continue;
+                }
+                vecs.truncate(depth);
+                return Ok((
+                    Found {
+                        index: ix,
+                        db,
+                        table,
+                        hits: fuse(&kw, &vecs, weight, limit),
+                    },
+                    if q_vec.is_some() { "hybrid" } else { "keyword" },
+                ));
             }
             let kw: Vec<Candidate> = kw
                 .into_iter()
@@ -1216,6 +1358,37 @@ mod tests {
                 .any(|h| h.text == "3/0" && h.bm25_rank.is_none())
         );
         assert_eq!(fuse(&kw, &v, 1.0, 1).len(), 1);
+    }
+
+    #[test]
+    fn a_bound_callers_keyword_list() {
+        assert_eq!(
+            match_words("reset +my -pass*word (now)"),
+            "reset my pass word now"
+        );
+        assert_eq!(match_words("\"\"@<>"), "");
+        let c = |k: &str, text: &str| Candidate {
+            key: vec![Some(k.to_owned())],
+            chunk_no: 0,
+            title: None,
+            text: text.to_owned(),
+        };
+        let visible = vec![
+            c("3", "parcel tracking for parcels"),
+            c("1", "parcel lost"),
+            c("2", "returns and refunds"),
+            c("1", "parcel lost"),
+        ];
+        let ids = |v: Vec<Candidate>| -> Vec<String> {
+            v.into_iter().map(|c| c.key[0].clone().unwrap()).collect()
+        };
+        // Chunks without a query word drop out; the same chunk twice (two
+        // shards meanwhile) counts once.
+        assert_eq!(ids(rank_visible("parcel", visible.clone(), 10)), ["3", "1"]);
+        assert_eq!(ids(rank_visible("parcel", visible.clone(), 1)), ["3"]);
+        // Equal scores: the lower key first, whatever the input order.
+        let tied = vec![c("9", "refund policy"), c("4", "refund policy")];
+        assert_eq!(ids(rank_visible("refund", tied, 10)), ["4", "9"]);
     }
 
     #[test]

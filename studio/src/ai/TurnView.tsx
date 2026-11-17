@@ -9,7 +9,7 @@ import { CodeView } from './CodeView';
 import { Markdown } from './Markdown';
 import { acceptProposal, dismissProposal, rate, setView, usedInEditor, useAssistant } from './store';
 import { proposalSql, toolLabel, type AiResult, type Block, type Source, type Turn } from './thread';
-import { docsUrl } from './docs';
+import { docsRoute } from './docs';
 
 const FIRST_ROWS = 20;
 
@@ -343,11 +343,8 @@ function SourceLink({ s }: { s: Source }) {
   const { tenant = '' } = useParams();
   const base = `/t/${encodeURIComponent(tenant)}`;
   if (s.kind === 'docs') {
-    return (
-      <a href={docsUrl(s.reference)} target="_blank" rel="noopener noreferrer">
-        {s.title}
-      </a>
-    );
+    // Studio's own page of the release's docs (the website: from there).
+    return <Link to={docsRoute(base, s.reference)}>{s.title}</Link>;
   }
   if (s.kind === 'table' && /^[^.]+\.[^.]+$/.test(s.reference)) {
     const [db, t] = s.reference.split('.') as [string, string];

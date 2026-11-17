@@ -358,6 +358,10 @@ fn tenant_context(text: &str) -> bool {
         "dyn Fn(&",
         "impl Fn(&'static",
         "SettingCtx<'_>",
+        // A reader handed in as a `Lookup` (the AI keys' `FnSettings::read`
+        // and its kin): the same, the caller picks the context (the
+        // gateway's is the tenant's, or its database's).
+        "l: &dyn Lookup",
     ]
     .iter()
     .any(|m| text.contains(m))

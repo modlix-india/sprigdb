@@ -48,6 +48,16 @@ pub(crate) struct GwTxn {
     pub(super) relayed: Arc<Mutex<HashMap<ClusterId, RelayLease>>>,
 }
 
+impl GwTxn {
+    /// The tenant named in relay preambles now (Sprig 2PC's relay path):
+    /// every session the router opens beside the main one takes it, so a
+    /// relayed tenant's fan-out reads and scratch sessions go through the
+    /// relay writer too.
+    pub(super) fn relay_now(&self) -> Option<sprig_common::ids::TenantId> {
+        *self.relay.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 impl std::fmt::Debug for GwTxn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GwTxn")

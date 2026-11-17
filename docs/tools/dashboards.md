@@ -75,6 +75,7 @@ Show Me lights up the chart types that fit the fields on the shelves and greys o
 
 | On the shelves | Show Me suggests |
 |---|---|
+| A latitude and a longitude field | a point map |
 | One measure and nothing else | a KPI |
 | Two or more measures, no dimension | a scatter plot |
 | A date and one or more measures | a line |
@@ -105,11 +106,25 @@ A chart type that doesn't fit its shelves can't be saved; the editor says which 
 | Gauge | one measure, against a second as the target (or a round maximum) |
 | Bullet | a measure and a target measure, per value of a dimension |
 | Gantt | a task, a start date, and an end date or a duration in days on Size |
-| Text table and pivot table | any fields; the pivot puts Rows' dimensions down the side and Columns' across, with subtotals for each value of the first row dimension and a grand total |
+| Text table and pivot table | any fields; the pivot puts Rows' dimensions down the side and Columns' across, with subtotals for each value of the first row dimension and a grand total (see below) |
+| Point map | a latitude and a longitude field, sized by Size and coloured by Colour (see below) |
 
 Any of these can be split into small multiples with **Facet**. Colours come from one colour-blind-safe palette, chosen separately for light and dark themes; a series keeps its colour by its first appearance.
 
-**Not drawn yet:** point and filled maps (`map-point`, `map-filled`). A tile may hold either mark, and Show Me knows when a geographic field (such as `country` or `latitude`) is on a shelf, but Studio shows "Maps are not drawn in Studio yet" in place of the chart.
+**Pivot subtotals and totals** are worked out from the rows of their group, never by adding up the numbers shown. A subtotal of `AVG(price)` is the average over every row of that group, so a group with many rows counts for more than a group with few; a subtotal of `MIN`, `MAX`, `MEDIAN` or `CNTD` is that group's minimum, maximum, median or distinct count. For `SUM` and `COUNT` the two are the same. The same holds for each column group and for the grand total.
+
+### Maps
+
+A **point map** (`map-point`) draws one point per place:
+
+- **Where.** A field named `lat` or `latitude` and one named `lon`, `lng`, `long` or `longitude`, on any shelf. Case doesn't matter. Locations are never summed: Studio treats these fields as dimensions, and rows at the same place make one point, with their measures aggregated.
+- **Size** sizes the points by area. **Colour** colours them: a dimension gives each value a colour from the chart palette, with a legend; a measure gives a single-hue scale. Hovering over a point shows its fields. Rows without a valid latitude and longitude are left out, and the map says how many. A map draws at most 5,000 places.
+- **Base map.** Without `studio.map_tile_url` (the default), the points are drawn on a plain background with lines every 30 degrees, and Studio fetches nothing from outside the gateway. To draw a base map, set `studio.map_tile_url` to an XYZ raster tile template from a tile server you're allowed to use, such as `https://tiles.example.com/{z}/{x}/{y}.png`. Studio adds that server to its Content-Security-Policy and shows its host as the map's attribution. In a dark theme the tiles are dimmed.
+- **Browsers.** Maps need WebGL. MapLibre loads only when a dashboard first shows a map.
+
+Show Me suggests a point map when a latitude and a longitude are on the shelves. A place name alone, such as `country`, doesn't make a point map: Show Me goes on to its next rule. The assistant's tiles follow the same rule: a proposed point map needs both fields, and a proposed filled map is sent back to the assistant until Studio draws them.
+
+A **filled map** (`map-filled`) colours regions such as countries or states. It needs region shapes, and Studio doesn't have any yet. A tile may hold the mark, but Studio shows "needs region shapes" in its place. Use a point map, or another chart, instead.
 
 ## Using a dashboard
 

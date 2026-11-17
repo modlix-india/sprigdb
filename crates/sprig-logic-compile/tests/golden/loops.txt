@@ -114,6 +114,8 @@ AS
   v_count_count BIGINT;
   v_count_index BIGINT;
   v__guard0 BIGINT := 0;
+  v__wall_us BIGINT := ROUND(@@max_statement_time * 1000000);
+  v__deadline DATETIME(6) := CASE WHEN v__wall_us > 0 THEN SYSDATE(6) + INTERVAL v__wall_us MICROSECOND END;
 BEGIN
   IF (COALESCE((p_n <=> NULL), 0) <> 0) THEN
     __sprig_l44_v1_lib.fail(39866, 'Test.Loops: argument n is null, which its schema doesn''t allow');
@@ -141,6 +143,7 @@ BEGIN
   v_downloop_to := (0 + 0e0);
   v_downloop_break := FALSE;
   WHILE (COALESCE(((COALESCE((v_downloop_value > v_downloop_to), 0) <> 0) AND (COALESCE((NOT (COALESCE(v_downloop_break, 0) <> 0)), 0) <> 0)), 0) <> 0) LOOP
+    IF SYSDATE(6) > v__deadline THEN __sprig_l44_v1_lib.fail(39864, CONCAT('wall time: the code ran past its wall budget (', ROUND(v__wall_us / 1000), ' ms left when it was called)')); END IF;
     v_downloop_index := v_downloop_value;
     v_downloop_value := (v_downloop_value + (-5e-1));
     v_ctx_down := (CASE WHEN (COALESCE((v_ctx_down <=> NULL), 0) <> 0) THEN v_downloop_index ELSE (v_ctx_down + __sprig_l44_v1_lib.nn_f(v_downloop_index)) END);
@@ -154,6 +157,7 @@ BEGIN
   WHILE (COALESCE(((COALESCE((v_each_value < v_each_length), 0) <> 0) AND (COALESCE((NOT (COALESCE(v_each_break, 0) <> 0)), 0) <> 0)), 0) <> 0) LOOP
     v__guard0 := v__guard0 + 1;
     IF v__guard0 > 100000 THEN __sprig_l44_v1_lib.fail(39864, 'loop budget: more than 100000 iterations'); END IF;
+    IF SYSDATE(6) > v__deadline THEN __sprig_l44_v1_lib.fail(39864, CONCAT('wall time: the code ran past its wall budget (', ROUND(v__wall_us / 1000), ' ms left when it was called)')); END IF;
     v_each_index := v_each_value;
     v_each_each := (CASE WHEN JSON_TYPE(JSON_EXTRACT(v_each_source, CONCAT('$[', v_each_value, ']'))) = 'NULL' THEN NULL ELSE JSON_EXTRACT(v_each_source, CONCAT('$[', v_each_value, ']')) END);
     v_each_value := (v_each_value + 1);
@@ -164,6 +168,7 @@ BEGIN
   v_range_to := (p_n + 1);
   v_range_break := FALSE;
   WHILE (COALESCE(((COALESCE((v_range_value < v_range_to), 0) <> 0) AND (COALESCE((NOT (COALESCE(v_range_break, 0) <> 0)), 0) <> 0)), 0) <> 0) LOOP
+    IF SYSDATE(6) > v__deadline THEN __sprig_l44_v1_lib.fail(39864, CONCAT('wall time: the code ran past its wall budget (', ROUND(v__wall_us / 1000), ' ms left when it was called)')); END IF;
     v_range_index := v_range_value;
     v_range_value := (v_range_value + 1);
     v_ctx_total := (CASE WHEN (COALESCE((v_ctx_total <=> NULL), 0) <> 0) THEN v_range_index ELSE (v_ctx_total + __sprig_l44_v1_lib.nn_i(v_range_index)) END);
@@ -175,6 +180,7 @@ BEGIN
   v_count_count := 1000;
   v_count_break := FALSE;
   WHILE (COALESCE(((COALESCE((v_count_value < v_count_count), 0) <> 0) AND (COALESCE((NOT (COALESCE(v_count_break, 0) <> 0)), 0) <> 0)), 0) <> 0) LOOP
+    IF SYSDATE(6) > v__deadline THEN __sprig_l44_v1_lib.fail(39864, CONCAT('wall time: the code ran past its wall budget (', ROUND(v__wall_us / 1000), ' ms left when it was called)')); END IF;
     v_count_index := v_count_value;
     v_count_value := (v_count_value + 1);
     IF (COALESCE((v_count_index >= p_stopat), 0) <> 0) THEN

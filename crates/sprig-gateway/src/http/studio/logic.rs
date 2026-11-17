@@ -706,8 +706,18 @@ pub async fn dry_run(d: &Declaration, cols: &StaticColumns, show_plsql: bool) ->
         compile_max_cost: COMPILE_MAX_COST,
         definer_security: d.definer_security,
     };
+    // As a deploy compiles it: JavaScript and Lua with the declaration's
+    // signature (parameter types and `RETURNS`).
     let compiled = if d.runtime == Runtime::Javascript {
         sprig_logic::compiler::js::compile_with(
+            &d.name,
+            &d.body,
+            &sprig_logic::service::js_signature(d),
+            cols,
+            &opts,
+        )
+    } else if d.runtime == Runtime::Lua {
+        sprig_logic::compiler::lua::compile_with(
             &d.name,
             &d.body,
             &sprig_logic::service::js_signature(d),
@@ -742,6 +752,19 @@ pub async fn dry_run(d: &Declaration, cols: &StaticColumns, show_plsql: bool) ->
     if engine
         && script
         && let Err(e) = sprig_logic::service::script_check(d)
+    {
+        diagnostics.push(diagnostic(&e));
+    }
+    // Compiled into MariaDB: a deploy still has the engine's runtime accept
+    // the source, since the engine tier defines the language.
+    if !engine
+        && script
+        && let Err(e) = sprig_logic_js::Program::new(
+            d.runtime.as_str(),
+            &d.name,
+            &d.body,
+            sprig_logic::service::script_sig(d),
+        )
     {
         diagnostics.push(diagnostic(&e));
     }
@@ -855,6 +878,29 @@ mod tests {
         // Not shown without the routine privilege.
         let hidden = dry_run(&d, &cols, false).await;
         assert!(hidden["plsql"].is_null());
+        // Lua compiles into MariaDB with the declaration's signature, as a
+        // deploy does: the mariadb tier, its parameters and the routine.
+        let lua = sprig_logic::declare::parse(
+            "CREATE FUNCTION add_tax(p INT, rate INT) RETURNS INT LANGUAGE lua AS $$ \
+             local t = p * rate \
+             if t > 10 then return p + t end \
+             return p + 1 $$",
+        )
+        .unwrap();
+        let v = dry_run(&lua, &cols, true).await;
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["runtime"], "lua");
+        assert_eq!(v["tier"], "mariadb", "{v}");
+        assert_eq!(v["signature"]["params"][1]["name"], "rate", "{v}");
+        assert_eq!(v["signature"]["params"][0]["type"], "i64", "{v}");
+        assert!(v["plsql"].as_str().is_some_and(|p| !p.is_empty()), "{v}");
+        // Outside the subset: the engine tier with the parser's reason.
+        let lua = sprig_logic::declare::parse(
+            "CREATE FUNCTION co() RETURNS INT LANGUAGE lua AS $$ return coroutine.wrap(function() end) and 1 $$",
+        )
+        .unwrap();
+        let v = dry_run(&lua, &cols, true).await;
+        assert_eq!(v["tier"], "engine", "{v}");
         // A KIRun definition that isn't JSON is a diagnostic, not a 500.
         let bad = sprig_logic::declare::parse("CREATE PROCEDURE p LANGUAGE kirun AS '{not json'");
         if let Ok(bad) = bad {

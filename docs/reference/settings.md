@@ -9,7 +9,7 @@ source: the settings registry (sprig-settings)
 
 Every setting SprigDB declares, with its default, the scopes that may set it, hard bounds and when a change applies. Settings resolve from the most specific scope: object, database, tenant and its ancestors, cluster, data center, global, then the built-in default. Read them with `SHOW SPRIG SETTINGS`, change them with `ALTER TENANT|DATABASE|TABLE … SPRIG SET (key = value)` or `sprigctl settings`.
 
-747 settings in 61 groups.
+754 settings in 61 groups.
 
 ## `advisor`
 
@@ -488,6 +488,13 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `graph.max_time_ms` | int | `30000` | object, database, tenant, global | 1 to 86400000 | live | Wall time of one graph statement, in milliseconds |
 | `graph.mirror` | text | `async` | object, database, tenant, global | off, async, sync | live | Mirrors of incoming relationships: off, async or sync |
 | `graph.mirror_max_wait_ms` | int | `1000` | object, database, tenant, global | 0 to 60000 | live | Wait for the mirror applier to reach the session's causal target before scattering |
+| `graph.session_pool` | int | `96` | dc, global | 4 to 4096 | live | Connections per cluster that a gateway's Bolt sessions take from |
+| `graph.slot_wait_ms` | int | `250` | dc, global | 0 to 60000 | live | How long a graph statement waits for a graph slot before it runs without one, in milliseconds |
+| `graph.slots` | int | `0` | dc, global | 0 to 4096 | live | Graph statements one gateway runs at once (0: three per CPU, at least 12); more wait graph.slot_wait_ms |
+| `graph.spare_wait_ms` | int | `50` | dc, global | 0 to 10000 | live | How long a graph read waits for a spare connection before it reads its shards one after another, in milliseconds |
+| `graph.spares` | int | `32` | dc, global | 0 to 4096 | live | Spare connections all auto-commit graph reads of one gateway hold at once, per cluster |
+| `graph.spares_per_read` | int | `3` | dc, global | 0 to 64 | live | Spare connections one auto-commit graph read takes per cluster |
+| `graph.storage` | text | `json` | object, database, tenant, global | json, typed | live | How new native graphs store their elements: json or typed (a table per label set and relationship type) |
 | `graph.traversal_tier` | text | `auto` | object, database, tenant, cluster, dc, global | auto, cte, gateway, plugin | live | Traversal tier: auto, cte, gateway or plugin |
 
 ## `hierarchy`

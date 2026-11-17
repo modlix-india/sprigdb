@@ -6,12 +6,16 @@
 //! 1. Calls with a literal input are answered first and replaced by their
 //!    values, so they may stand anywhere (`ORDER BY VEC_DISTANCE(v,
 //!    AI_EMBED('red shoes'))`, `INSERT ... VALUES (AI_EMBED('...'))`).
-//! 2. Calls over row values are whole items of the outermost `SELECT`
+//! 2. Calls over row values that are whole items of the outermost `SELECT`
 //!    list: the statement runs through this session with each call's input
 //!    expression in its place (names, privileges, row-level security and
 //!    the transaction apply as to any statement), the rows are read, the
 //!    inputs of each column answered at once, and the rows sent with the
 //!    answers in that column.
+//! 3. Calls over row values anywhere else they may stand (`WHERE`, inside
+//!    expressions, `ORDER BY`, `UPDATE ... SET`) are bound ([`bound`]): their
+//!    distinct inputs are read through this session first, answered, and the
+//!    statement runs with each call replaced by a lookup of its answers.
 //!
 //! The calls' inputs are the caller's own statement's values, so they are
 //! only ever values the caller can read. Settings are the tenant's: the
@@ -50,8 +54,11 @@ use crate::pipeline::{EndOfRows, ExecCtx, ResultSink, RowFormat, RowValues};
 use crate::tenant::TenantServices;
 use crate::tenant::session::LocalWarning;
 
+mod bound;
+
 /// Rows a statement with AI function columns may return at most (they are
-/// held in the gateway while their inputs are answered).
+/// held in the gateway while their inputs are answered); also the rows of
+/// inputs a bound statement may read.
 const MAX_ROWS: usize = 100_000;
 
 /// The longest text a column announces (`MEDIUMTEXT`'s).
@@ -172,6 +179,18 @@ impl FnEnv for GatewayEnv {
     async fn add_usage(&self, usage: &Usage) -> Result<()> {
         functions::cache::add_usage(&self.audit().await?, self.user, usage).await
     }
+}
+
+/// Warning 39992 for `n` values left `NULL` by a spent budget.
+fn budget_warning(f: AiFn, n: usize) -> Option<LocalWarning> {
+    (n > 0).then(|| LocalWarning {
+        level: "Warning",
+        code: 39992,
+        message: format!(
+            "{}: {n} values are NULL because the daily AI token budget is used up (ai.functions.on_budget = null)",
+            f.sql_name()
+        ),
+    })
 }
 
 /// A value as a SQL literal.
@@ -318,18 +337,6 @@ impl PassSession {
         };
         let nbe = lex.no_backslash_escapes;
         let mut warnings: Vec<LocalWarning> = Vec::new();
-        let mut note_nulls = |f: AiFn, n: usize| {
-            if n > 0 {
-                warnings.push(LocalWarning {
-                    level: "Warning",
-                    code: 39992,
-                    message: format!(
-                        "{}: {n} values are NULL because the daily AI token budget is used up (ai.functions.on_budget = null)",
-                        f.sql_name()
-                    ),
-                });
-            }
-        };
         // Every call's arguments, checked before anything runs.
         let mut calls = Vec::with_capacity(plan.calls.len());
         for c in &plan.calls {
@@ -355,11 +362,26 @@ impl PassSession {
             .await
             {
                 Ok((v, r)) => {
-                    note_nulls(call.f, r.budget_nulls);
+                    warnings.extend(budget_warning(call.f, r.budget_nulls));
                     values.push(literal(v.first().and_then(Option::as_ref), nbe));
                 }
                 Err(e) => return self.fail(out, &e).await.map(Some),
             }
+        }
+        // Calls over rows bound by their answers.
+        if plan.bind.is_some() {
+            let b = bound::Bound {
+                plan: &plan,
+                calls: &calls,
+                env: &env,
+                settings: &settings,
+                nbe,
+                values,
+                warnings,
+            };
+            return Box::pin(self.tenant_ai_bound(cx, text, attrs, more, out, b))
+                .await
+                .map(Some);
         }
         let sql = Bytes::from(plan.render(text, &values));
         metrics::counter!("sprig_translator_rules_applied_total", "rule" => "ai_functions")
@@ -418,7 +440,7 @@ impl PassSession {
             let answers = match Box::pin(functions::evaluate(&env, &settings, call, &inputs)).await
             {
                 Ok((a, r)) => {
-                    note_nulls(call.f, r.budget_nulls);
+                    warnings.extend(budget_warning(call.f, r.budget_nulls));
                     a
                 }
                 Err(e) => return self.fail(out, &e).await.map(Some),

@@ -251,7 +251,9 @@ export function stop(): void {
   get().running?.abort();
 }
 
-/** The stored id of a turn's answer, looked up when first needed. */
+/** The stored id of a turn's answer: the stream's end line names it; for
+ * a stream without it (an older gateway), it is looked up in the stored
+ * conversation by the question's position. */
 async function messageIdOf(turn: Turn): Promise<string | undefined> {
   if (turn.messageId) return turn.messageId;
   const conv = get().conversation;

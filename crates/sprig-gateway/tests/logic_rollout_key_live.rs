@@ -1,6 +1,7 @@
 //! Staged rollout by key through a live gateway: a procedure rolled out
-//! `BY KEY` on its argument, and triggers on a stream and a queue rolled
-//! out by each record's or message's key. Each key must get the version
+//! `BY KEY` on its argument, triggers on a stream and a queue rolled out
+//! by each record's or message's key, and an after-commit trigger rolled
+//! out by its row's primary key. Each key must get the version
 //! `CRC32(CONCAT(key, ':', module)) % 100 < share` picks, the same every
 //! time, whether the version runs compiled into MariaDB or in the engine
 //! tier, and whichever way it is reached (a client's `CALL`, a compiled
@@ -23,6 +24,7 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::too_many_lines,
+    clippy::many_single_char_names,
     missing_docs
 )]
 
@@ -349,6 +351,92 @@ $$"
         "after ROLLOUT PROMOTE every record runs the candidate",
         r.is_ok() && rows.len() == 10 && rows.iter().all(|r| r[0].as_deref() == Some("v2")),
         format!("{r:?} {rows:?}"),
+    );
+
+    // ---- an after-commit trigger rolled out by its row's key -------------------------------
+    // The key is the row's primary key as `id=<value>`; the worker picks
+    // per event, so an insert and the update after it run the same
+    // version.
+    must(
+        &mut c,
+        "CREATE TABLE src (id BIGINT PRIMARY KEY, n INT NOT NULL)",
+    )
+    .await;
+    let at = |v: &str, events: &str, with: &str| {
+        format!(
+            "CREATE OR REPLACE TRIGGER ak AFTER COMMIT ON src FOR {events} LANGUAGE javascript \
+             {with} AS $$
+export default function (row) {{
+  db.exec('INSERT INTO seen (src, k, n, v) VALUES (?, ?, ?, ?)', ['a', String(row.id), row.n, '{v}']);
+}}
+$$"
+        )
+    };
+    let r = sql(&mut c, &at("v1", "INSERT, UPDATE", "")).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let r2 = sql(
+        &mut c,
+        &at("v2", "INSERT, UPDATE", "WITH (SPRIG_ROLLOUT = 50)"),
+    )
+    .await;
+    let n2 = notes(&mut c).await;
+    ck.check(
+        "an after-commit trigger's candidate rolls out by its row's key",
+        r.is_ok() && r2.is_ok() && n2.contains("50% of keys"),
+        format!("{r:?} / {r2:?} {n2}"),
+    );
+    let amod = module_of(&n2);
+    let r3 = sql(&mut c, &at("v3", "INSERT", "WITH (SPRIG_ROLLOUT = 10)")).await;
+    ck.check(
+        "a staged rollout that changes the trigger's events is refused (39870)",
+        matches!(&r3, Err((39870, _))),
+        format!("{r3:?}"),
+    );
+    // The worker reads the module again within two seconds.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let values: Vec<String> = (0..40).map(|k| format!("({k}, 0)")).collect();
+    must(
+        &mut c,
+        &format!("INSERT INTO src (id, n) VALUES {}", values.join(", ")),
+    )
+    .await;
+    wait_rows(&mut c, "SELECT k FROM seen WHERE src = 'a'", 40, 90).await;
+    must(&mut c, "UPDATE src SET n = 1").await;
+    let rows = wait_rows(&mut c, "SELECT k, n, v FROM seen WHERE src = 'a'", 80, 90).await;
+    let mut wrong = Vec::new();
+    for r in &rows {
+        let (k, v) = (r[0].clone().unwrap(), r[2].clone().unwrap());
+        let w = want(&format!("id={k}"), amod, 50);
+        if v != w {
+            wrong.push(format!("{k}/{}: {v} want {w}", r[1].clone().unwrap()));
+        }
+    }
+    let on_cand = rows
+        .iter()
+        .filter(|r| r[2].as_deref() == Some("v2"))
+        .count();
+    ck.check(
+        &format!(
+            "each insert and update ran once with its row's version, a row's update as its \
+             insert ({on_cand} of 80 on the candidate)"
+        ),
+        rows.len() == 80 && wrong.is_empty() && on_cand > 0 && on_cand < 80,
+        format!("{} rows, {wrong:?}", rows.len()),
+    );
+    let r = sql(&mut c, "ALTER TRIGGER ak ROLLOUT PROMOTE").await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    must(&mut c, "UPDATE src SET n = 2").await;
+    let rows = wait_rows(
+        &mut c,
+        "SELECT v FROM seen WHERE src = 'a' AND n = 2",
+        40,
+        90,
+    )
+    .await;
+    ck.check(
+        "after ROLLOUT PROMOTE every row runs the candidate",
+        r.is_ok() && rows.len() == 40 && rows.iter().all(|r| r[0].as_deref() == Some("v2")),
+        format!("{r:?} {} rows", rows.len()),
     );
 
     // ---- a queue trigger rolled out by message id -------------------------------------------

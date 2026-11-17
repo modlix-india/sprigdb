@@ -217,7 +217,11 @@ async fn rows_keep_their_place_and_older_packs_load_with_none() {
     }
     for (page, mut s) in seqs {
         s.sort_unstable();
-        assert_eq!(s, (1..=u16::try_from(s.len()).unwrap()).collect::<Vec<_>>(), "{page}");
+        assert_eq!(
+            s,
+            (1..=u16::try_from(s.len()).unwrap()).collect::<Vec<_>>(),
+            "{page}"
+        );
     }
     let fake = Fake::default();
     let mut db = fake.clone();

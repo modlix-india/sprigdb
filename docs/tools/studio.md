@@ -31,7 +31,7 @@ sprigctl settings set studio.session_idle_minutes 15 --scope tenant --tenant acm
 | `studio.path` | text | `/studio` | dc, global | The mount path; a value under `/v1`, `/admin` or `/.well-known`, or `/`, falls back to `/studio`. The Studio that ships with SprigDB is built for `/studio`, so keep the default |
 | `studio.allow_insecure_http` | bool | `false` | dc, global | Allow sign-in over plain HTTP from another computer |
 | `studio.public_origins` | text | empty | dc, global | Extra origins for the Origin check, comma-separated, for a reverse proxy in front of the gateway |
-| `studio.map_tile_url` | text | empty | dc, global | A base-map tile server; its origin is added to the Content-Security-Policy |
+| `studio.map_tile_url` | text | empty | dc, global | A base-map tile server for dashboard maps, as an XYZ template (`https://tiles.example.com/{z}/{x}/{y}.png`); its origin is added to the Content-Security-Policy. Empty: maps have no base map and fetch nothing from outside |
 
 Studio's files are built into the `sprigdb` binary. A binary built without them answers 503 with a page saying so (39932 `ER_SPRIG_STUDIO_NOT_BUILT`).
 
@@ -442,7 +442,7 @@ In a query editor, `Ctrl+I` (`⌘+I`) asks inline: describe the change ("only pa
 
 ### Docs, glossary and digests
 
-- **Docs**, in the activity bar, searches this version's documentation, the same index the assistants cite, and links each result to its published page.
+- **Docs**, in the activity bar, searches this version's documentation, the same index the assistants cite. Each result opens its page in Studio, at its section. The page is rebuilt from the docs that ship with the running release (`GET /v1/docs/pages/{page}`, see [Searching the docs](docs-search.md)), so it works with no internet access and always matches your version. Links between pages stay in Studio, and **Open on the website** opens the published page instead. The pages an assistant cites in an answer, and links to the documentation website in its answers, open in Studio the same way. If the release's docs pack is older than chunk positions, the page says that its sections may be out of order.
 - **Settings > Glossary** lists the tenant's business terms, which the assistants use as written. Everyone can read it; tenant administrators add, edit and delete terms and accept or reject the ones the assistants propose.
 - **Settings > Digests** lists the tenant's daily or weekly digests (`ai.digest`) for tenant administrators: what changed, the facts they were built from, and what was sent to word them.
 

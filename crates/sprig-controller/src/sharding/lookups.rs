@@ -171,10 +171,12 @@ impl LookupHost for CtlHost<'_> {
         Ok(c)
     }
 
+    /// Builds write the tenant's lookup rows: through the relay writer for
+    /// a tenant on Sprig 2PC's relay path.
     async fn pools(&self, clusters: &[ClusterId]) -> Result<Pools> {
         let mut m: std::collections::HashMap<ClusterId, Pool> = std::collections::HashMap::new();
         for c in clusters {
-            m.insert(c.clone(), self.l.pools.pool(c).await?);
+            m.insert(c.clone(), self.l.tenant_pool(self.tenant, c).await?);
         }
         Ok(Arc::new(m))
     }

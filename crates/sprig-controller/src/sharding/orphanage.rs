@@ -237,7 +237,15 @@ impl ShardingLoop {
         }
         let schema = |s: ShardId| quote(&shard_schema(tenant, k.db, k.group, s));
         let child0 = format!("{}.{}", schema(s0), quote(&k.child));
-        let mut c = self.conn(&cluster).await?;
+        // Adoption writes the tenant's rows: through the relay writer for a
+        // tenant on Sprig 2PC's relay path.
+        let mut c = self.tenant_conn(tenant, &cluster).await?;
+        // A multi-table `DELETE c FROM ...` resolves its target alias in the
+        // default database (MariaDB answers 1046 without one), and a new
+        // connection has none.
+        c.query_drop(format!("USE {}", schema(s0)))
+            .await
+            .map_err(db_err("use the orphanage's schema"))?;
         let mut rep = OrphanageReport {
             fk: k.name.clone(),
             ..OrphanageReport::default()

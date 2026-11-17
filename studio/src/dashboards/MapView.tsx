@@ -196,7 +196,11 @@ export default function MapView({ m, pal, format }: { m: PointMap; pal: Palette;
       setHover(null);
     });
     map.current = made;
+    // A tile resized (edit mode, the window): the map follows its box.
+    const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => made.resize());
+    ro?.observe(box.current);
     return () => {
+      ro?.disconnect();
       map.current = null;
       made.remove();
     };
@@ -220,7 +224,7 @@ export default function MapView({ m, pal, format }: { m: PointMap; pal: Palette;
   if (failed) return <p className="muted chart-note">This browser can’t draw maps here ({failed}).</p>;
   const tip = hover ? m.points[hover.i] : null;
   return (
-    <div className="map-wrap" data-testid="point-map" data-points={m.points.length} data-tiles={tiles ? 'on' : 'off'}>
+    <div className={isDark() ? 'map-wrap map-dark' : 'map-wrap'} data-testid="point-map" data-points={m.points.length} data-tiles={tiles ? 'on' : 'off'}>
       <div ref={box} className="map-box" />
       <Legend m={m} pal={pal} format={format} />
       {(m.cut > 0 || m.skipped > 0 || (setting.trim() && !tiles)) && (

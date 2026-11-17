@@ -17,14 +17,19 @@
 //!   f_<col>   <the column's type> NULL, ... -- FILTERS columns, copied
 //!   src_hash  BINARY(16) NOT NULL,          -- MD5 of the row's indexed values
 //!   embedding VECTOR(n) NOT NULL,
+//!   _sprig_rk BIGINT UNSIGNED NOT NULL DEFAULT 0, -- the row's routing hash
 //!   PRIMARY KEY (k_<col>..., chunk_no),
 //!   FULLTEXT KEY ft (text, title),
-//!   VECTOR KEY v (embedding) DISTANCE=cosine)
+//!   VECTOR KEY v (embedding) DISTANCE=cosine,
+//!   KEY _sprig_rk (_sprig_rk))
 //! ```
 //!
 //! The key columns have the source's types, so a key compares exactly as
 //! in the source table. Rows are written only once embedded, so the vector column can be
-//! `NOT NULL` and carry MariaDB's HNSW index. The worker's
+//! `NOT NULL` and carry MariaDB's HNSW index. `_sprig_rk` is the source
+//! row's routing hash, copied when the chunks are written (0 while the
+//! source has none yet), so a shard split, merge or move routes the chunks
+//! with their rows. The worker's
 //! `ai_retrieval` job keeps the table in step with the source from the
 //! change feed; the gateway searches it (`RETRIEVE()` and REST) and checks
 //! every hit against the source table through the caller's session.
@@ -217,16 +222,56 @@ pub fn create_table_sql(
     }
     cols.push("`src_hash` BINARY(16) NOT NULL".to_owned());
     cols.push(format!("`embedding` VECTOR({dims}) NOT NULL"));
+    cols.push(format!("`{RK_COLUMN}` BIGINT UNSIGNED NOT NULL DEFAULT 0"));
     let mut pk: Vec<String> = keys.iter().map(|k| quote(&key_column(&k.name))).collect();
     pk.push("`chunk_no`".to_owned());
     cols.push(format!("PRIMARY KEY ({})", pk.join(", ")));
     cols.push("FULLTEXT KEY `ft` (`text`, `title`)".to_owned());
     cols.push("VECTOR KEY `v` (`embedding`) DISTANCE=cosine".to_owned());
+    cols.push(format!("KEY `{RK_COLUMN}` (`{RK_COLUMN}`)"));
     format!(
         "CREATE TABLE IF NOT EXISTS {}.{} ({}) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
         quote(schema),
         quote(&table_name(id)),
         cols.join(", ")
+    )
+}
+
+/// The routing hash column the chunk table shares with sharded tables.
+pub const RK_COLUMN: &str = "_sprig_rk";
+
+/// Adds [`RK_COLUMN`] to index `id`'s chunk table made before it had one,
+/// in the session's current schema (the shard's: a mover copying the shard
+/// then applies the change to its targets too).
+#[must_use]
+pub fn add_rk_sql(id: u64) -> String {
+    format!(
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS `{RK_COLUMN}` BIGINT UNSIGNED NOT NULL DEFAULT 0, \
+         ADD KEY IF NOT EXISTS `{RK_COLUMN}` (`{RK_COLUMN}`)",
+        quote(&table_name(id))
+    )
+}
+
+/// Sets [`RK_COLUMN`] of the chunks written while their row had no
+/// routing hash (0) from the row, at most `limit` chunks: `source` and
+/// `chunks` are qualified table names, `keys` the source's key columns.
+#[must_use]
+pub fn rk_catch_up_sql(source: &str, chunks: &str, keys: &[KeyColumn], limit: u64) -> String {
+    let on: Vec<String> = keys
+        .iter()
+        .map(|k| {
+            format!(
+                "s.{} = {chunks}.{}",
+                quote(&k.name),
+                quote(&key_column(&k.name))
+            )
+        })
+        .collect();
+    let on = on.join(" AND ");
+    format!(
+        "UPDATE {chunks} SET `{RK_COLUMN}` = (SELECT s.`{RK_COLUMN}` FROM {source} AS s WHERE {on}) \
+         WHERE `{RK_COLUMN}` = 0 AND EXISTS (SELECT 1 FROM {source} AS s WHERE {on} \
+         AND s.`{RK_COLUMN}` > 0) LIMIT {limit}"
     )
 }
 
@@ -455,7 +500,23 @@ mod tests {
         assert!(sql.contains("PRIMARY KEY (`k_n`, `chunk_no`)"));
         assert!(sql.contains("`embedding` VECTOR(384) NOT NULL"));
         assert!(sql.contains("VECTOR KEY `v` (`embedding`) DISTANCE=cosine"));
+        assert!(sql.contains("`_sprig_rk` BIGINT UNSIGNED NOT NULL DEFAULT 0"));
+        assert!(sql.contains("KEY `_sprig_rk` (`_sprig_rk`)"));
         assert_eq!(sub_name(7), "rx:i7");
+        assert_eq!(
+            add_rk_sql(7),
+            "ALTER TABLE `__sprig_rx_7` ADD COLUMN IF NOT EXISTS `_sprig_rk` BIGINT UNSIGNED \
+             NOT NULL DEFAULT 0, ADD KEY IF NOT EXISTS `_sprig_rk` (`_sprig_rk`)"
+        );
+        let up = rk_catch_up_sql("`s1`.`t`", "`s1`.`__sprig_rx_7`", &keys()[1..], 500);
+        assert!(
+            up.starts_with(
+                "UPDATE `s1`.`__sprig_rx_7` SET `_sprig_rk` = (SELECT s.`_sprig_rk` FROM `s1`.`t` \
+                 AS s WHERE s.`id` = `s1`.`__sprig_rx_7`.`k_id` AND s.`n` = `s1`.`__sprig_rx_7`.`k_n`)"
+            ),
+            "{up}"
+        );
+        assert!(up.ends_with("AND s.`_sprig_rk` > 0) LIMIT 500"), "{up}");
     }
 
     #[test]

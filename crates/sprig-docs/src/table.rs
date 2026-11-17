@@ -375,7 +375,9 @@ mod tests {
         assert!(d[1].contains("DISTANCE=cosine"));
         assert!(d[2].contains("ENUM('loading','ready','retired')"));
         assert!(d[1].contains("seq SMALLINT UNSIGNED NOT NULL DEFAULT 0, PRIMARY KEY"));
-        assert!(d[3].starts_with("ALTER TABLE `__sprig_docs`.`chunks` ADD COLUMN IF NOT EXISTS seq"));
+        assert!(
+            d[3].starts_with("ALTER TABLE `__sprig_docs`.`chunks` ADD COLUMN IF NOT EXISTS seq")
+        );
         let s = insert_sql(2);
         assert_eq!(s.matches('?').count(), 22);
         assert!(s.starts_with("INSERT INTO `__sprig_docs`.`chunks` (version, chunk_id"));

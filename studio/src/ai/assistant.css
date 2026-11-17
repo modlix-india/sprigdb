@@ -97,6 +97,17 @@ button.ai-ask { display: inline-flex; align-items: center; gap: 4px; font-size: 
 .ai-diff .del { background: var(--del-bg); }
 /* Glossary, digests, docs. */
 .ai-page { max-inline-size: 960px; }
+.docs-article .ai-md-doc { font-size: 14px; line-height: 1.55; }
+.ai-md-doc h2, .ai-md-doc h3, .ai-md-doc h4, .ai-md-doc h5, .ai-md-doc h6 { margin: 18px 0 6px; scroll-margin-block-start: 12px; }
+.ai-md-doc h2 { font-size: 18px; }
+.ai-md-doc h3 { font-size: 16px; }
+.ai-md-doc h4, .ai-md-doc h5, .ai-md-doc h6 { font-size: 14px; }
+.ai-md-doc p, .ai-md-doc ul, .ai-md-doc ol { margin-block-end: 10px; }
+.ai-md-table { overflow-x: auto; margin: 0 0 10px; }
+.ai-md-table:focus-visible { outline: 2px solid var(--focus); }
+.ai-md-table table { border-collapse: collapse; font-size: 13px; }
+.ai-md-table th, .ai-md-table td { border: 1px solid var(--border); padding: 4px 8px; text-align: start; vertical-align: top; }
+.ai-md-table th { background: var(--bg-raised); }
 .ai-hit { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 12px; background: var(--bg); }
 .ai-hit h3 { margin: 0; font-size: 14px; }
 .ai-hit .ai-md { font-size: 13px; }

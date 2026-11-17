@@ -56,6 +56,8 @@ AS
   v_item_price DOUBLE;
   v_item_stock BIGINT;
   v_sum_value DOUBLE;
+  v__wall_us BIGINT := ROUND(@@max_statement_time * 1000000);
+  v__deadline DATETIME(6) := CASE WHEN v__wall_us > 0 THEN SYSDATE(6) + INTERVAL v__wall_us MICROSECOND END;
 BEGIN
   IF (COALESCE((p_productid <=> NULL), 0) <> 0) THEN
     __sprig_l44_v1_lib.fail(39866, 'Shop.Quote: argument productId is null, which its schema doesn''t allow');
@@ -69,6 +71,7 @@ BEGIN
   IF (COALESCE((p_qty < 1e0), 0) <> 0) THEN
     __sprig_l44_v1_lib.fail(39866, 'Shop.Quote: argument qty is below its minimum 1');
   END IF;
+  IF SYSDATE(6) > v__deadline THEN __sprig_l44_v1_lib.fail(39864, CONCAT('wall time: the code ran past its wall budget (', ROUND(v__wall_us / 1000), ' ms left when it was called)')); END IF;
   BEGIN
     SELECT q.`price`, q.`stock` INTO v_item_price, v_item_stock FROM (SELECT price, stock FROM products WHERE id = (p_productid)) q;
     v_item_found := TRUE;

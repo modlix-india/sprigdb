@@ -30,7 +30,10 @@
 //! [`bucket`]. The gateway picks for each run, so a key gets the same
 //! version whichever tier each version runs in. A record without a key
 //! gets the active version. `ALTER TRIGGER t ROLLOUT TO n | PROMOTE |
-//! ABORT` moves it on.
+//! ABORT` moves it on. After-commit triggers too: the worker picks per
+//! change by the row's primary key as the trigger runner writes it
+//! (`id=7`), counts both versions' runs and rolls a candidate that fails
+//! more back (`crate::triggers::maria::CatalogVersions`).
 //!
 //! So a caller keeps the version it got while the stage lasts, and a
 //! larger stage keeps everyone the smaller one had. The gateway computes

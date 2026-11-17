@@ -24,6 +24,7 @@
     clippy::unwrap_used,
     clippy::too_many_lines,
     clippy::float_cmp,
+    clippy::needless_pass_by_value,
     missing_docs
 )]
 
@@ -554,6 +555,27 @@ fn corpus() -> Vec<Case> {
             ],
             // 5: a number bound to a text column.
             reruns: vec![5],
+        },
+        Case {
+            // Operands are read left to right, also around a helper that
+            // changes a variable, in log lines, binds and computed members.
+            name: "order",
+            on: MsgSource::Stream,
+            js: "const e = JSON.parse(ctx.record.value);
+                 let n = Number(e.n);
+                 let arr = e.a;
+                 function bump() { n = n + 1; return n; }
+                 function other() { arr = e.b; return 0; }
+                 console.log('n', n, bump(), n);
+                 const pick = arr[other()];
+                 console.log('pick', pick);
+                 db.exec('INSERT INTO hits (k, what, n) VALUES (?, ?, ?)',
+                         [ctx.record.key, `${n}/${bump()}/${n}`, n + bump()]);",
+            events: vec![
+                record(1, Some("o1"), Some(r#"{"n":1,"a":[10],"b":[20]}"#), json!({})),
+                record(2, Some("o2"), Some(r#"{"n":5,"a":["x"],"b":["y"]}"#), json!({})),
+            ],
+            reruns: vec![],
         },
         Case {
             name: "jobs",

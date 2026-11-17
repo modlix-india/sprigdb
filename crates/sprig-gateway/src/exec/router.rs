@@ -880,7 +880,9 @@ impl PassSession {
                         .ok_or_else(|| SprigError::internal("no router factory"))?;
                     let cat = f.cat.lock().unwrap_or_else(PoisonError::into_inner).clone();
                     ensure_accounts(&f.svc, cat.as_ref(), c).await?;
-                    let bs = session_on(&f.backends, &f.target, &f.opts, &f.main, c, main.vars());
+                    let mut bs =
+                        session_on(&f.backends, &f.target, &f.opts, &f.main, c, main.vars());
+                    bs.set_relay(f.relay_now());
                     self.router.others.insert(c.clone(), bs);
                 }
                 let o = self

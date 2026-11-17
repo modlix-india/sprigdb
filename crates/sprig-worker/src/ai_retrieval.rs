@@ -13,12 +13,21 @@
 //!   row and the subscription, end
 //!   tail the tenant's feed from the subscription's checkpoint
 //!   loop:
-//!     every 15 s: the source's shard schemas; a shard without the chunk
-//!       table gets it (empty) and is filled again: state rebuilding
+//!     every 15 s, and when a shard map changes: the source's live shards
+//!       (a data group's: those its map holds now, so a split's or move's
+//!       new shards join at the cutover); a shard without the chunk table
+//!       gets it (empty) and is filled again: state rebuilding; a shard
+//!       that arrives with one (a split, merge or move copies the chunk
+//!       tables with their rows, routed by `_sprig_rk`) is checked by the
+//!       same fill, which embeds only what is missing or stale, and the
+//!       state stays; chunks written while their row had no routing hash
+//!       get it from the row; a chunk table whose schema has had no
+//!       source table for a minute is dropped
 //!     a round: the next feed item (up to 200 ms), then what is read,
 //!       up to ROUND items: the table's inserts, updates of the indexed
 //!       columns and deletes, keys by shard; a TRUNCATE sweeps the shard;
-//!       a DDL reloads the row
+//!       a DDL reloads the row; keys of a shard that is no longer live
+//!       (events from before a cutover) go to every live shard
 //!     reconcile(keys) per shard, retried with backoff until done; the
 //!       checkpoint moves after the round, at most every second
 //!     between rounds, while a shard isn't filled: one keyset chunk of it
@@ -28,13 +37,16 @@
 //!
 //! reconcile(shard, rows):
 //!   SELECT pk, text, title, filters, UNHEX(MD5(JSON_ARRAY(text, title,
-//!     filters))) from the source; the stored hash of each row's chunk 0
-//!   same hash: nothing to do; no text: its chunks deleted
+//!     filters))) [, _sprig_rk] from the source; the stored hash (and
+//!     routing hash) of each row's chunk 0
+//!   same hash: nothing to do, or only the chunks' _sprig_rk set (guarded
+//!     as below); no text: its chunks deleted
 //!   else: cut into chunks (CHUNK BY), embedded in batches of
 //!     ai.embedding.batch_rows, then per group of rows one transaction:
-//!       the row's hash again, LOCK IN SHARE MODE (the guard): changed
-//!         since → left to the newer change's event; gone → chunks deleted
-//!       DELETE its chunks; INSERT the new ones
+//!       the row's hash (and _sprig_rk) again, LOCK IN SHARE MODE (the
+//!         guard): changed since → left to the newer change's event;
+//!         gone → chunks deleted
+//!       DELETE its chunks; INSERT the new ones, with the row's _sprig_rk
 //!   keys the source no longer has: DELETE their chunks WHERE NOT EXISTS
 //!     (the row) — the guard of a delete
 //! ```
@@ -76,6 +88,14 @@ const CHUNK: u64 = 200;
 
 /// How often the source's shards are listed again.
 const SHARDS_EVERY: Duration = Duration::from_secs(15);
+
+/// Chunks given their row's routing hash per shard and listing at most.
+const RK_CATCH_UP: u64 = 5000;
+
+/// How long a chunk table stays in a schema without its source table
+/// before it is dropped (the table moved away alone, as into its table
+/// group; a cutover's renames take seconds).
+const ORPHAN_AFTER: Duration = Duration::from_secs(60);
 
 /// `ai_retrieval` (see the module docs).
 #[derive(Debug, Clone)]
@@ -144,6 +164,25 @@ pub fn wants(op: Op, delta: Option<&[String]>, columns: &[String]) -> bool {
                 .any(|c| columns.iter().any(|x| x.eq_ignore_ascii_case(c)))
         }),
         Op::Ddl(_) => false,
+    }
+}
+
+/// Moves the keys and truncates of shards not in `live` to every live
+/// shard.
+fn spread(keys: &mut RoundKeys, truncated: &mut BTreeSet<ShardLoc>, live: &[ShardLoc]) {
+    let stray: Vec<ShardLoc> = keys.keys().filter(|s| !live.contains(s)).cloned().collect();
+    for s in stray {
+        if let Some(ks) = keys.remove(&s) {
+            for l in live {
+                keys.entry(l.clone())
+                    .or_default()
+                    .extend(ks.iter().cloned());
+            }
+        }
+    }
+    if truncated.iter().any(|s| !live.contains(s)) {
+        truncated.retain(|s| live.contains(s));
+        truncated.extend(live.iter().cloned());
     }
 }
 
@@ -219,9 +258,9 @@ impl Index {
             .join(" AND ")
     }
 
-    /// `SELECT pk..., text, title, filters..., hash FROM source WHERE pred
-    /// [ORDER BY pk LIMIT n]`.
-    fn select_sql(&self, schema: &str, pred: &str, order: Option<u64>) -> String {
+    /// `SELECT pk..., text, title, filters..., hash [, _sprig_rk] FROM
+    /// source WHERE pred [ORDER BY pk LIMIT n]`.
+    fn select_sql(&self, schema: &str, pred: &str, order: Option<u64>, rk: bool) -> String {
         let r = &self.row;
         let mut cols: Vec<String> = r.key_columns.iter().map(|k| quote(&k.name)).collect();
         cols.push(quote(&r.text_column));
@@ -237,6 +276,9 @@ impl Index {
             &r.filters,
             None,
         ));
+        if rk {
+            cols.push(quote(retrieval::RK_COLUMN));
+        }
         let mut sql = format!(
             "SELECT {} FROM {} WHERE {pred}",
             cols.join(", "),
@@ -258,6 +300,8 @@ struct SrcRow {
     title: Option<String>,
     filters: Vec<mysql_async::Value>,
     hash: Option<Vec<u8>>,
+    /// Its routing hash, when the source has one.
+    rk: Option<u64>,
 }
 
 fn bytes(r: &mysql_async::Row, i: usize) -> Option<Vec<u8>> {
@@ -270,6 +314,15 @@ fn bytes(r: &mysql_async::Row, i: usize) -> Option<Vec<u8>> {
 
 fn text_of(r: &mysql_async::Row, i: usize) -> Option<String> {
     bytes(r, i).map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
+fn u64_of(r: &mysql_async::Row, i: usize) -> Option<u64> {
+    match r.as_ref(i) {
+        Some(mysql_async::Value::UInt(u)) => Some(*u),
+        Some(mysql_async::Value::Int(n)) => u64::try_from(*n).ok(),
+        Some(mysql_async::Value::Bytes(b)) => std::str::from_utf8(b).ok()?.parse().ok(),
+        _ => None,
+    }
 }
 
 /// `[x,y,...]`, as `VEC_FromText` reads it.
@@ -293,6 +346,12 @@ struct Job<'a> {
     progress: BTreeMap<String, Value>,
     progress_dirty: u64,
     shards: Option<(Instant, Vec<(ShardLoc, ClusterId)>)>,
+    /// The live shard schemas whose source table has `_sprig_rk`.
+    rk: HashSet<String>,
+    /// Shard map changes: the shards are listed again on one.
+    map_changes: tokio::sync::watch::Receiver<u64>,
+    /// Chunk tables in schemas without the source table, since when.
+    orphans: HashMap<String, Instant>,
     indexed: u64,
 }
 
@@ -349,12 +408,21 @@ impl Job<'_> {
             .map_err(|e| SprigError::new(SprigCode::BackendUnavailable, format!("retrieval: {e}")))
     }
 
-    /// The table's shards, each with its chunk table: a shard without one
-    /// gets it and starts filling (state rebuilding once the index was
-    /// ready); a shard gone leaves `progress`.
+    /// The table's live shards, each with its chunk table: a shard without
+    /// one gets it and starts filling (state rebuilding once the index was
+    /// ready); a shard that arrives with one (a split, a merge or a move
+    /// carried it) is checked by the same fill, which embeds only rows
+    /// whose chunks are missing or stale, and the state stays; a shard
+    /// gone leaves `progress`. Listed again every [`SHARDS_EVERY`] and when
+    /// a shard map changes.
     #[allow(clippy::too_many_lines)] // list, then make, then follow
     async fn shards(&mut self) -> Result<Vec<(ShardLoc, ClusterId)>> {
-        if let Some((at, s)) = &self.shards
+        let moved = self.map_changes.has_changed().unwrap_or(false);
+        if moved {
+            self.map_changes.mark_unchanged();
+        }
+        if !moved
+            && let Some((at, s)) = &self.shards
             && at.elapsed() < SHARDS_EVERY
         {
             return Ok(s.clone());
@@ -363,6 +431,8 @@ impl Job<'_> {
         let chunk_table = retrieval::table_name(self.ix.row.id);
         let mut out = Vec::new();
         let mut have: HashSet<String> = HashSet::new();
+        let mut rk_source: HashSet<String> = HashSet::new();
+        let mut rk_chunks: HashSet<String> = HashSet::new();
         for cluster in self.env.logic.pools.sweepable().await? {
             let pool = self.env.logic.pools.writer(&cluster).await?;
             let mut c = pool.get_conn_bounded().await.map_err(|e| {
@@ -381,12 +451,58 @@ impl Job<'_> {
                 )
                 .await
                 .map_err(backend)?;
+            let with_rk: Vec<(String, String)> = c
+                .exec(
+                    "SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.COLUMNS \
+                     WHERE TABLE_SCHEMA LIKE CONCAT(REPLACE(?, '_', '\\_'), '%') \
+                     AND TABLE_NAME IN (?, ?) AND COLUMN_NAME = ?",
+                    (
+                        prefix.as_str(),
+                        self.ix.table.as_str(),
+                        chunk_table.as_str(),
+                        retrieval::RK_COLUMN,
+                    ),
+                )
+                .await
+                .map_err(backend)?;
+            for (schema, table) in with_rk {
+                if table == chunk_table {
+                    rk_chunks.insert(schema);
+                } else {
+                    rk_source.insert(schema);
+                }
+            }
             let mut sources = BTreeSet::new();
+            let mut chunks_here = Vec::new();
             for (schema, table) in rows {
                 if table == chunk_table {
+                    chunks_here.push(schema.clone());
                     have.insert(schema);
                 } else {
                     sources.insert(schema);
+                }
+            }
+            // A chunk table left without its source (the table was moved
+            // into its group alone): dropped once that has lasted.
+            for schema in chunks_here {
+                if sources.contains(&schema) {
+                    self.orphans.remove(&schema);
+                    continue;
+                }
+                let since = *self
+                    .orphans
+                    .entry(schema.clone())
+                    .or_insert_with(Instant::now);
+                if since.elapsed() >= ORPHAN_AFTER {
+                    c.query_drop(format!("USE {}", quote(&schema)))
+                        .await
+                        .map_err(backend)?;
+                    c.query_drop(format!("DROP TABLE IF EXISTS {}", quote(&chunk_table)))
+                        .await
+                        .map_err(backend)?;
+                    self.orphans.remove(&schema);
+                    have.remove(&schema);
+                    tracing::info!(tenant = %self.tenant, index = self.ix.row.id, %schema, "retrieval index: a chunk table without its table dropped");
                 }
             }
             for s in sources {
@@ -406,7 +522,17 @@ impl Job<'_> {
                     group: group.0,
                     shard: shard.0,
                 };
-                if self.cluster_of(&loc).await.is_ok_and(|c| c == cluster) {
+                let live = match self.env.maps.get(self.tenant, GroupId(loc.group)) {
+                    // A data group's shards are those its map holds: a
+                    // split's or move's new shards, being copied, join at
+                    // the cutover.
+                    Ok(m) => m
+                        .shard(ShardId(loc.shard))
+                        .is_some_and(|r| r.cluster == cluster),
+                    // A database's default group: the tenant's cluster.
+                    Err(_) => self.cluster_of(&loc).await.is_ok_and(|c| c == cluster),
+                };
+                if live {
                     out.push((loc, cluster.clone()));
                 }
             }
@@ -414,7 +540,7 @@ impl Job<'_> {
         out.sort();
         // Chunk tables where they are missing; progress follows the shards.
         let mut changed = false;
-        let mut refilling = false;
+        let mut created = false;
         let schemas: BTreeSet<String> = out
             .iter()
             .map(|(s, _)| self.ix.schema(self.tenant, s))
@@ -431,15 +557,29 @@ impl Job<'_> {
                     &r.filters,
                 );
                 let mut c = self.conn_of(loc).await?;
+                // From the shard's schema, so a mover copying the shard
+                // makes the table on its targets too.
+                c.query_drop(format!("USE {}", quote(&schema)))
+                    .await
+                    .map_err(backend)?;
                 c.query_drop(&sql).await.map_err(backend)?;
-                if self.progress.get(&schema).is_some_and(|p| p == "done") {
-                    refilling = true;
-                }
                 self.progress.insert(schema, Value::Null);
+                created = true;
                 changed = true;
-            } else if let std::collections::btree_map::Entry::Vacant(e) =
-                self.progress.entry(schema)
-            {
+                continue;
+            }
+            if !rk_chunks.contains(&schema) {
+                // A chunk table made before it carried the routing hash.
+                let mut c = self.conn_of(loc).await?;
+                c.query_drop(format!("USE {}", quote(&schema)))
+                    .await
+                    .map_err(backend)?;
+                c.query_drop(retrieval::add_rk_sql(self.ix.row.id))
+                    .await
+                    .map_err(backend)?;
+            }
+            if let std::collections::btree_map::Entry::Vacant(e) = self.progress.entry(schema) {
+                // Carried here with its rows: checked, not filled again.
                 e.insert(Value::Null);
                 changed = true;
             }
@@ -457,12 +597,57 @@ impl Job<'_> {
         if changed {
             self.save_progress().await?;
         }
-        if (refilling || changed) && self.ix.row.state == State::Ready && !self.all_done() {
+        if created && self.ix.row.state == State::Ready {
             self.set_state(State::Rebuilding, None).await?;
             tracing::info!(tenant = %self.tenant, index = self.ix.row.id, "retrieval index: a shard is filled again (rebuilding)");
         }
+        // Chunks written while their row had no routing hash yet (before
+        // the table's group was sharded) get it from the row.
+        rk_source.retain(|s| schemas.contains(s));
+        self.rk = rk_source;
+        for (loc, _) in &out {
+            let schema = self.ix.schema(self.tenant, loc);
+            if !self.rk.contains(&schema) {
+                continue;
+            }
+            let sql = retrieval::rk_catch_up_sql(
+                &self.ix.source(&schema),
+                &self.ix.chunks(&schema),
+                &self.ix.row.key_columns,
+                RK_CATCH_UP,
+            );
+            let mut c = self.conn_of(loc).await?;
+            if let Err(e) = c.query_drop(sql).await {
+                tracing::debug!(tenant = %self.tenant, index = self.ix.row.id, %schema, error = %e, "retrieval index: routing hashes not set yet");
+            }
+        }
         self.shards = Some((Instant::now(), out.clone()));
         Ok(out)
+    }
+
+    /// Whether `s` was live at the last listing.
+    fn is_live(&self, s: &ShardLoc) -> bool {
+        self.shards
+            .as_ref()
+            .is_some_and(|(_, v)| v.iter().any(|(l, _)| l == s))
+    }
+
+    /// Feed keys and truncates of shards that aren't live (events from
+    /// before a split, merge or move, read after its cutover) moved to
+    /// every live shard: each brings what it holds of those rows up to
+    /// date, and the others find nothing to do.
+    async fn relocate(
+        &mut self,
+        keys: &mut RoundKeys,
+        truncated: &mut BTreeSet<ShardLoc>,
+    ) -> Result<()> {
+        if keys.keys().chain(truncated.iter()).all(|s| self.is_live(s)) {
+            return Ok(());
+        }
+        self.shards = None;
+        let live: Vec<ShardLoc> = self.shards().await?.into_iter().map(|(s, _)| s).collect();
+        spread(keys, truncated, &live);
+        Ok(())
     }
 
     fn all_done(&self) -> bool {
@@ -515,6 +700,7 @@ impl Job<'_> {
         cancel: &sprig_common::CancellationToken,
     ) -> Result<(Option<Vec<String>>, u64)> {
         let schema = self.ix.schema(self.tenant, s);
+        let has_rk = self.rk.contains(&schema);
         let keys: Vec<KeyColumn> = self.ix.row.key_columns.clone();
         let nk = keys.len();
         let nf = self.ix.row.filters.len();
@@ -543,6 +729,7 @@ impl Job<'_> {
                         })
                         .collect(),
                     hash: bytes(r, nk + 2 + nf),
+                    rk: if has_rk { u64_of(r, nk + 3 + nf) } else { None },
                 }
             })
             .collect();
@@ -554,8 +741,8 @@ impl Job<'_> {
         if src.is_empty() {
             return Ok((last, read));
         }
-        // The stored hashes (chunk 0 of each row).
-        let mut stored: HashMap<Vec<Option<String>>, Vec<u8>> = HashMap::new();
+        // The stored hashes and routing hashes (chunk 0 of each row).
+        let mut stored: HashMap<Vec<Option<String>>, (Vec<u8>, u64)> = HashMap::new();
         for part in src.chunks(500) {
             let pred: Vec<String> = part
                 .iter()
@@ -583,8 +770,9 @@ impl Job<'_> {
                 .map(|k| quote(&retrieval::key_column(&k.name)))
                 .collect();
             let q = format!(
-                "SELECT {}, src_hash FROM {} WHERE chunk_no = 0 AND ({})",
+                "SELECT {}, src_hash, {} FROM {} WHERE chunk_no = 0 AND ({})",
                 kcols.join(", "),
+                quote(retrieval::RK_COLUMN),
                 self.ix.chunks(&schema),
                 pred.join(" OR ")
             );
@@ -594,17 +782,25 @@ impl Job<'_> {
                     .map(|i| keys[i].text(bytes(r, i).as_deref()))
                     .collect();
                 if let Some(h) = bytes(r, nk) {
-                    stored.insert(kt, h);
+                    stored.insert(kt, (h, u64_of(r, nk + 1).unwrap_or(0)));
                 }
             }
         }
         // What each row needs.
         let mut skipped = 0u64;
         let mut work: Vec<RowWork> = Vec::new();
+        // Rows whose chunks are current but for their routing hash.
+        let mut rk_only: Vec<usize> = Vec::new();
         for (i, r) in src.iter().enumerate() {
             let have = stored.get(&r.key_text);
-            if have.is_some() && have.map(Vec::as_slice) == r.hash.as_deref() {
-                skipped += 1;
+            if let Some((h, rk)) = have
+                && Some(h.as_slice()) == r.hash.as_deref()
+            {
+                if has_rk && *rk != r.rk.unwrap_or(0) {
+                    rk_only.push(i);
+                } else {
+                    skipped += 1;
+                }
                 continue;
             }
             let text = r.text.as_deref().unwrap_or("");
@@ -624,7 +820,6 @@ impl Job<'_> {
             }
             work.push((i, chunks));
         }
-        metrics::rows("skipped", skipped);
         // Groups of rows, about a model batch of chunks each, one
         // transaction per group.
         let target = self.batch.max(1);
@@ -643,13 +838,18 @@ impl Job<'_> {
             groups.push(cur);
         }
         let guard = format!(
-            "SELECT {} FROM {} WHERE {} LOCK IN SHARE MODE",
+            "SELECT {}{} FROM {} WHERE {} LOCK IN SHARE MODE",
             retrieval::hash_expr(
                 &self.ix.row.text_column,
                 self.ix.row.title_column.as_deref(),
                 &self.ix.row.filters,
                 None
             ),
+            if has_rk {
+                format!(", {}", quote(retrieval::RK_COLUMN))
+            } else {
+                String::new()
+            },
             self.ix.source(&schema),
             self.ix.key_match(false)
         );
@@ -670,6 +870,7 @@ impl Job<'_> {
                 .iter()
                 .map(|f| quote(&retrieval::filter_column(&f.name))),
         );
+        insert_cols.push(quote(retrieval::RK_COLUMN));
         insert_cols.extend(["`src_hash`", "`embedding`"].map(str::to_owned));
         let marks: Vec<&str> = std::iter::repeat_n("?", insert_cols.len() - 1)
             .chain(std::iter::once("VEC_FromText(?)"))
@@ -701,13 +902,16 @@ impl Job<'_> {
                 .map_err(backend)?;
             for (i, chunks) in &group {
                 let r = &src[*i];
-                let now: Option<Option<Vec<u8>>> = tx
+                let now: Option<mysql_async::Row> = tx
                     .exec_first(&guard, mysql_async::Params::Positional(r.key.clone()))
                     .await
                     .map_err(backend)?;
                 let mine = &r.hash;
                 let gone = now.is_none();
-                if !gone && now.as_ref() != Some(mine) {
+                let now_rk = now.as_ref().and_then(|n| u64_of(n, 1)).unwrap_or(0);
+                if let Some(n) = &now
+                    && bytes(n, 0).as_ref() != mine.as_ref()
+                {
                     superseded += 1;
                     vi += chunks.len();
                     continue;
@@ -732,6 +936,7 @@ impl Job<'_> {
                     });
                     p.push(text.as_str().into());
                     p.extend(r.filters.iter().cloned());
+                    p.push(now_rk.into());
                     p.push(mine.clone().into());
                     p.push(vec_text(v).into());
                     tx.exec_drop(&insert, mysql_async::Params::Positional(p))
@@ -743,6 +948,40 @@ impl Job<'_> {
             }
             tx.commit().await.map_err(backend)?;
         }
+        // Current chunks given their row's routing hash, under the guard.
+        if !rk_only.is_empty() {
+            let set_rk = format!(
+                "UPDATE {} SET {} = ? WHERE {}",
+                self.ix.chunks(&schema),
+                quote(retrieval::RK_COLUMN),
+                self.ix.key_match(true)
+            );
+            for part in rk_only.chunks(200) {
+                let mut tx = c
+                    .start_transaction(TxOpts::default())
+                    .await
+                    .map_err(backend)?;
+                for &i in part {
+                    let r = &src[i];
+                    let now: Option<mysql_async::Row> = tx
+                        .exec_first(&guard, mysql_async::Params::Positional(r.key.clone()))
+                        .await
+                        .map_err(backend)?;
+                    // Changed or gone since: the newer event's to handle.
+                    let Some(now) = now.filter(|n| bytes(n, 0) == r.hash) else {
+                        continue;
+                    };
+                    let mut p = vec![mysql_async::Value::from(u64_of(&now, 1).unwrap_or(0))];
+                    p.extend(r.key.iter().cloned());
+                    tx.exec_drop(&set_rk, mysql_async::Params::Positional(p))
+                        .await
+                        .map_err(backend)?;
+                }
+                tx.commit().await.map_err(backend)?;
+            }
+            skipped += rk_only.len() as u64;
+        }
+        metrics::rows("skipped", skipped);
         metrics::rows("indexed", indexed);
         metrics::rows("cleared", cleared);
         metrics::rows("superseded", superseded);
@@ -803,7 +1042,8 @@ impl Job<'_> {
                 .iter()
                 .map(|l| format!("({})", eq(&|c| quote(&c.name), l)))
                 .collect();
-            let sql = self.ix.select_sql(&schema, &pred.join(" OR "), None);
+            let rk = self.rk.contains(&schema);
+            let sql = self.ix.select_sql(&schema, &pred.join(" OR "), None, rk);
             self.reconcile(s, &sql, cancel).await?;
             // The rows that are gone: their chunks, unless the row exists.
             let mut c = self.conn_of(s).await?;
@@ -886,7 +1126,8 @@ impl Job<'_> {
             }
             _ => "TRUE".to_owned(),
         };
-        let sql = self.ix.select_sql(&schema, &pred, Some(n));
+        let rk = self.rk.contains(&schema);
+        let sql = self.ix.select_sql(&schema, &pred, Some(n), rk);
         let (last, read) = self.reconcile(&s, &sql, cancel).await?;
         self.live.spend(read, Instant::now());
         let pos = match last {
@@ -1084,6 +1325,9 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
         progress,
         progress_dirty: 0,
         shards: None,
+        rk: HashSet::new(),
+        map_changes: env.maps.changes(),
+        orphans: HashMap::new(),
         indexed: 0,
         ix,
     };
@@ -1243,11 +1487,13 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
         backlog_set(&job_key, n_keys);
         if n_keys > 0 || !truncated.is_empty() {
             loop {
-                let mut failed = None;
-                for s in &truncated {
-                    if let Err(e) = job.sweep(s).await {
-                        failed = Some(e);
-                        break;
+                let mut failed = job.relocate(&mut keys, &mut truncated).await.err();
+                if failed.is_none() {
+                    for s in &truncated {
+                        if let Err(e) = job.sweep(s).await {
+                            failed = Some(e);
+                            break;
+                        }
                     }
                 }
                 if failed.is_none() {
@@ -1363,5 +1609,28 @@ mod tests {
         assert!(wants(Op::Update, Some(&["BODY".to_owned()]), &cols));
         assert!(!wants(Op::Update, Some(&["price".to_owned()]), &cols));
         assert_eq!(vec_text(&[0.5, -1.0]), "[0.5,-1]");
+    }
+
+    #[test]
+    fn keys_of_a_shard_gone_go_to_the_live_ones() {
+        let loc = |group, shard| ShardLoc { group, shard };
+        let key = |n: i64| vec![("id".to_owned(), sprig_binlog::Value::Int(n))];
+        let mut keys: RoundKeys = BTreeMap::new();
+        keys.insert(loc(3, 1), vec![key(1), key(2)]);
+        keys.insert(loc(3, 4), vec![key(9)]);
+        let mut truncated: BTreeSet<ShardLoc> = [loc(3, 1)].into();
+        // Shard 1 was split into 4 and 5.
+        let live = [loc(3, 4), loc(3, 5)];
+        spread(&mut keys, &mut truncated, &live);
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[&loc(3, 4)].len(), 3);
+        assert_eq!(keys[&loc(3, 5)], vec![key(1), key(2)]);
+        assert_eq!(truncated, live.clone().into());
+        // Nothing stray: nothing moves.
+        let mut t2 = BTreeSet::new();
+        let before = keys.clone();
+        spread(&mut keys, &mut t2, &live);
+        assert_eq!(keys, before);
+        assert!(t2.is_empty());
     }
 }

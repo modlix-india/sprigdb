@@ -403,18 +403,18 @@ fn placeholder_targets(
     let mut arith: Vec<usize> = Vec::new();
     let _ = sqlparser::ast::visit_expressions(stmt, |e: &SqlExpr| {
         match e {
-            SqlExpr::BinaryOp { left, op, right }
-                if matches!(
-                    op,
+            SqlExpr::BinaryOp {
+                left,
+                op:
                     BinaryOperator::Eq
-                        | BinaryOperator::NotEq
-                        | BinaryOperator::Lt
-                        | BinaryOperator::LtEq
-                        | BinaryOperator::Gt
-                        | BinaryOperator::GtEq
-                        | BinaryOperator::Spaceship
-                ) =>
-            {
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::Spaceship,
+                right,
+            } => {
                 if let Some(c) = column_of(left) {
                     set(bind_no(right), ty_any(&c));
                 }
@@ -425,16 +425,16 @@ fn placeholder_targets(
             // Arithmetic: the bind is a number whatever the column (text
             // converts to a number in both tiers' SQL, but not in the
             // compiled tier's typed read, which runs it in the engine tier).
-            SqlExpr::BinaryOp { left, op, right }
-                if matches!(
-                    op,
+            SqlExpr::BinaryOp {
+                left,
+                op:
                     BinaryOperator::Plus
-                        | BinaryOperator::Minus
-                        | BinaryOperator::Multiply
-                        | BinaryOperator::Divide
-                        | BinaryOperator::Modulo
-                ) =>
-            {
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Modulo,
+                right,
+            } => {
                 arith.extend([left, right].into_iter().filter_map(|x| bind_no(x)));
             }
             SqlExpr::InList { expr, list, .. } => {

@@ -50,6 +50,16 @@ const MAX_LOOP_ITERATIONS: u64 = 100_000;
 /// `logic.compile_max_cost`'s default (validations: `logic.validation_max_cost`).
 const COMPILE_MAX_COST: u64 = 100_000;
 
+/// How stale a worker's view of a trigger binding's active version can be
+/// (`sprig_logic::triggers::maria::CatalogVersions` reads it again after
+/// two seconds), with a margin: a column change waits this long between
+/// an after-commit trigger's new version and the `ALTER TABLE`.
+const TRIGGER_VERSION_STALE: std::time::Duration = std::time::Duration::from_millis(2500);
+
+fn bq(s: &str) -> String {
+    format!("`{}`", s.replace('`', "``"))
+}
+
 /// One `sprig_ctl` connection that several [`Session`]s of one deploy
 /// share: the routines' creator, the reader of the columns and the shard
 /// session of its cluster. A deploy runs one statement at a time, so they
@@ -247,6 +257,37 @@ impl ResultSink for Outcome {
     }
 }
 
+/// A bound deploy between its steps ([`PassSession::logic_prepare_bound`],
+/// then an `ALTER TABLE` when it has one, then
+/// [`PassSession::logic_finish_bound`]).
+struct BoundDeploy {
+    pending: service::Pending,
+    shards: CtlShards,
+    ep: sprig_catalog::store::CatalogEndpoint,
+    catalog_version: u64,
+    svc: Arc<crate::tenant::TenantServices>,
+    tenant: sprig_common::ids::TenantId,
+    first: String,
+    kind: Kind,
+    name: String,
+}
+
+impl BoundDeploy {
+    /// Undoes the new version (its routines and triggers dropped on every
+    /// shard, the version `failed`); the old one stays active.
+    async fn abort(&mut self) {
+        if let Ok(mut conn) = self.ep.pool.get_conn_bounded().await {
+            service::abort(
+                &mut conn,
+                self.ep.store.schema(),
+                &self.pending,
+                &mut self.shards,
+            )
+            .await;
+        }
+    }
+}
+
 impl PassSession {
     /// Answers a bound declaration's outcome: OK with its notes, or the
     /// error.
@@ -310,13 +351,31 @@ impl PassSession {
     /// that user (the module's owner, its `DEFINER`): a validation or
     /// trigger recompiled after its table's columns changed type. Rights
     /// aren't checked then.
-    #[allow(clippy::too_many_lines)]
     async fn logic_deploy_bound_as(
         &mut self,
         cx: &mut ExecCtx<'_>,
         decl: Declaration,
         owner: Option<sprig_common::ids::UserId>,
     ) -> Result<Vec<String>> {
+        let mut d = self.logic_prepare_bound(&decl, owner, None).await?;
+        if let Some(alter) = d.pending.alter.clone() {
+            self.logic_bound_alter(cx, &mut d, &alter).await?;
+        }
+        Self::logic_finish_bound(d).await
+    }
+
+    /// A bound deploy's first step: the checks, then the new version's
+    /// routines (and a validation's `BEFORE` triggers) on every shard, next
+    /// to the old version's (`sprig_logic::service::deploy_bound`). With
+    /// `columns`, it is compiled for those columns rather than the table's
+    /// columns now (an `ALTER TABLE` deployed with it).
+    #[allow(clippy::too_many_lines)]
+    async fn logic_prepare_bound(
+        &mut self,
+        decl: &Declaration,
+        owner: Option<sprig_common::ids::UserId>,
+        columns: Option<&sprig_logic::compiler::StaticColumns>,
+    ) -> Result<BoundDeploy> {
         let current = self.current_logical();
         let Some(ts) = self.tenant.as_deref_mut() else {
             return Err(SprigError::internal("no tenant"));
@@ -458,8 +517,15 @@ impl PassSession {
         let account = sprig_auth::authz::backend::account(tenant, user);
         let definer = format!("`{}`@`%`", account.replace('`', "``"));
         let first = shards.list[0].0.clone();
+        // A validation's wall budget, which its `BEFORE` triggers pass to
+        // the entry procedure: `logic.function_budget_ms` for the database.
+        let budget_ms = svc.settings.get(
+            &sprig_logic::settings::FUNCTION_BUDGET_MS,
+            &catalog.setting_ctx(&svc.dc).with_db(row.db_id),
+            Some(&catalog.settings),
+        );
         let pending = service::deploy_bound(
-            &decl,
+            decl,
             Target {
                 catalog: &mut conn,
                 catalog_schema: ep.store.schema(),
@@ -468,7 +534,7 @@ impl PassSession {
                 shard_schema: &first,
                 single_shard,
                 user_id: user.0,
-                budget_ms: 5000,
+                budget_ms,
                 max_loop_iterations: MAX_LOOP_ITERATIONS,
                 compile_max_cost: COMPILE_MAX_COST,
             },
@@ -478,57 +544,97 @@ impl PassSession {
                 definer,
                 now_ms: now_ms(),
                 streams,
+                columns,
             },
             &mut shards,
         )
         .await?;
-        let mut conn = if let Some(alter) = &pending.alter {
-            // The ALTER is a catalog change of its own, which takes
-            // connections from the same pool (4 per cluster): this one goes
-            // back first (it holds no transaction) and a new one finishes.
-            // So do the shards' `sprig_ctl` ones (the ALTER's DDL takes
-            // more from their pool); the finish takes them again after the
-            // catalog's, in that order.
-            drop(conn);
-            shards.release();
-            let mut sink = Outcome {
-                wire: Wire {
-                    persona: self.persona,
-                    caps: cx.proto.caps,
-                },
-                error: None,
-                done: false,
-            };
-            let text = Bytes::from(alter.clone().into_bytes());
-            let attrs = QueryAttrs::default();
-            let r =
-                Box::pin(self.tenant_text(cx, &text, &attrs, false, RowFormat::Text, &mut sink))
-                    .await;
-            let err = match r {
-                Err(e) => Some(e),
-                Ok(_) => sink.error.take(),
-            };
-            let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-                SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-            })?;
-            if let Some(e) = err {
-                service::abort(&mut conn, ep.store.schema(), &pending, &mut shards).await;
-                return Err(sprig_logic::triggers::map_check_error(e));
-            }
-            conn
-        } else {
-            conn
+        Ok(BoundDeploy {
+            pending,
+            shards,
+            ep,
+            catalog_version: catalog.version,
+            svc,
+            tenant,
+            first,
+            kind: decl.kind,
+            name: decl.name.clone(),
+        })
+    }
+
+    /// Runs `alter` (the version's `ALTER TABLE`: its `CHECK`, or the old
+    /// `CHECK` dropped) through this session's `ALTER TABLE` path, as if
+    /// the client sent it; on an error the new version is undone
+    /// ([`service::abort`]).
+    async fn logic_bound_alter(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        d: &mut BoundDeploy,
+        alter: &str,
+    ) -> Result<()> {
+        // The ALTER is a catalog change of its own, which takes
+        // connections from the same pool (4 per cluster), and the shards'
+        // `sprig_ctl` ones go back too (the ALTER's DDL takes more from
+        // their pool); the finish takes them again after the catalog's,
+        // in that order.
+        d.shards.release();
+        let err = self.run_alter(cx, alter).await;
+        if let Some(e) = err {
+            d.abort().await;
+            return Err(sprig_logic::triggers::map_check_error(e));
+        }
+        Ok(())
+    }
+
+    /// Runs `alter` through this session's `ALTER TABLE` path (the DDL
+    /// engine), as if the client sent it: its error, if any.
+    async fn run_alter(&mut self, cx: &mut ExecCtx<'_>, alter: &str) -> Option<SprigError> {
+        let mut sink = Outcome {
+            wire: Wire {
+                persona: self.persona,
+                caps: cx.proto.caps,
+            },
+            error: None,
+            done: false,
         };
+        let text = Bytes::from(alter.to_owned().into_bytes());
+        let attrs = QueryAttrs::default();
+        let r =
+            Box::pin(self.tenant_text(cx, &text, &attrs, false, RowFormat::Text, &mut sink)).await;
+        match r {
+            Err(e) => Some(e),
+            Ok(_) => sink.error.take(),
+        }
+    }
+
+    /// A bound deploy's last step: the version becomes active, the old
+    /// version's triggers go ([`service::finish`]), and a new trigger's
+    /// feed subscription or a schedule's index is written. The client's
+    /// notes.
+    async fn logic_finish_bound(mut d: BoundDeploy) -> Result<Vec<String>> {
+        let mut conn = d.ep.pool.get_conn_bounded().await.map_err(|e| {
+            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
+        })?;
         service::finish(
             &mut conn,
-            ep.store.schema(),
-            catalog.version,
-            &pending,
-            &mut shards,
+            d.ep.store.schema(),
+            d.catalog_version,
+            &d.pending,
+            &mut d.shards,
         )
         .await?;
+        let BoundDeploy {
+            pending,
+            mut shards,
+            svc,
+            tenant,
+            first,
+            kind,
+            name,
+            ..
+        } = d;
         let mut notes = pending.notes();
-        match decl.kind {
+        match kind {
             Kind::Trigger => {
                 if let Some(b) = &pending.binding {
                     let (cluster, pos) = shards.position().await?;
@@ -562,7 +668,7 @@ impl PassSession {
             }
             _ => {}
         }
-        tracing::info!(module = pending.module_id, version = pending.version, kind = decl.kind.as_str(), name = %decl.name, "logic version deployed");
+        tracing::info!(module = pending.module_id, version = pending.version, kind = kind.as_str(), name = %name, "logic version deployed");
         Ok(notes)
     }
 
@@ -700,37 +806,16 @@ impl PassSession {
         if recompile.is_empty() {
             return Ok(None);
         }
-        // The statement itself, then each validation or trigger again for
-        // the new types. Until its new version is in place (milliseconds
-        // to seconds), the old one gets the column's values converted to
-        // the old type, as before this check existed.
-        let mut sink = Outcome {
-            wire: Wire {
-                persona: self.persona,
-                caps: cx.proto.caps,
-            },
-            error: None,
-            done: false,
-        };
-        self.column_change_running = true;
-        let r = Box::pin(self.tenant_text(
-            cx,
-            text,
-            &QueryAttrs::default(),
-            false,
-            RowFormat::Text,
-            &mut sink,
-        ))
-        .await;
-        self.column_change_running = false;
-        let err = match r {
-            Err(e) => Some(e),
-            Ok(_) => sink.error.take(),
-        };
-        if let Some(e) = err {
-            return self.answer(Err(e), status, out).await.map(Some);
-        }
-        let mut notes = Vec::new();
+        // One DDL job: each new version first, compiled for the columns
+        // the statement leaves, next to the old one (a validation's BEFORE
+        // triggers run both, which is stricter, never weaker); a CHECK
+        // swap rides in the statement itself; an after-commit trigger's
+        // new version is active before the statement (an event before it
+        // reaches the new types exactly, the old column's values as the
+        // statement converts them); then the statement; then the old
+        // validations' triggers go. A write after the statement is never
+        // judged only by a version compiled for the old types.
+        let mut decls = Vec::new();
         for (m, source, b, runtime, w) in recompile {
             let kind = if m.kind == "validation" {
                 Kind::Validation
@@ -770,22 +855,119 @@ impl PassSession {
                 rollout: None,
                 rollout_key: None,
             };
-            let owner = sprig_common::ids::UserId(m.created_by);
-            match Box::pin(self.logic_deploy_bound_as(cx, decl, Some(owner))).await {
+            decls.push((decl, sprig_common::ids::UserId(m.created_by), m.kind, w));
+        }
+        // 1. The new versions' routines and triggers on every shard.
+        let mut prepared: Vec<(BoundDeploy, String, String)> = Vec::new();
+        for (decl, owner, kind, w) in &decls {
+            match Box::pin(self.logic_prepare_bound(decl, Some(*owner), Some(&after))).await {
+                Ok(d) => prepared.push((d, kind.clone(), w.clone())),
+                Err(e) => {
+                    for (d, ..) in &mut prepared {
+                        d.abort().await;
+                    }
+                    let e = SprigError::new(
+                        SprigCode::DdlUnsupported,
+                        format!(
+                            "ALTER TABLE {} would change columns compiled logic reads, and {kind} \
+                             {} couldn't be compiled again for them ({}); nothing changed",
+                            change.table, decl.name, e.message
+                        ),
+                    );
+                    return self.answer(Err(e), status, out).await.map(Some);
+                }
+            }
+        }
+        // 2. The statement, with every CHECK swap in it.
+        let prefix = format!("ALTER TABLE {}.{} ", bq(&db), bq(&change.table));
+        let mut statement = sql.trim().trim_end_matches(';').trim_end().to_owned();
+        for (d, ..) in &prepared {
+            if let Some(a) = &d.pending.alter {
+                match a.strip_prefix(&prefix) {
+                    Some(clauses) => {
+                        statement.push_str(", ");
+                        statement.push_str(clauses);
+                    }
+                    None => {
+                        return Err(SprigError::internal(format!(
+                            "a validation's ALTER TABLE names another table: {a}"
+                        )));
+                    }
+                }
+            }
+        }
+        // 3. After-commit triggers switch first; the worker reads a
+        // binding's active version at most this stale.
+        let mut switched = Vec::new();
+        let mut rest = Vec::new();
+        for (i, (d, kind, w)) in prepared.into_iter().enumerate() {
+            if d.kind == Kind::Trigger {
+                let name = d.name.clone();
+                switched.push((Self::logic_finish_bound(d).await, kind, w, name, i));
+            } else {
+                rest.push((d, kind, w));
+            }
+        }
+        if !switched.is_empty() {
+            tokio::time::sleep(TRIGGER_VERSION_STALE).await;
+        }
+        for (d, ..) in &mut rest {
+            d.shards.release();
+        }
+        self.column_change_running = true;
+        let err = self.run_alter(cx, &statement).await;
+        self.column_change_running = false;
+        if let Some(e) = err {
+            // Nothing changed: the new validations go; a trigger already
+            // switched is deployed again for the columns as they are.
+            for (d, ..) in &mut rest {
+                d.abort().await;
+            }
+            for (r, kind, _, name, i) in &switched {
+                if r.is_err() {
+                    continue;
+                }
+                let (decl, owner, ..) = &decls[*i];
+                tracing::info!(%kind, %name, table = %change.table, "a column change failed after its trigger switched: deploying it again for the columns as they are");
+                if let Err(x) =
+                    Box::pin(self.logic_deploy_bound_as(cx, decl.clone(), Some(*owner))).await
+                {
+                    tracing::warn!(%kind, %name, error = %x, "a trigger couldn't be deployed again after a failed column change");
+                }
+            }
+            let e = sprig_logic::triggers::map_check_error(e);
+            return self.answer(Err(e), status, out).await.map(Some);
+        }
+        // 4. The validations' new versions become active; their old
+        // triggers go.
+        let mut notes = Vec::new();
+        let finished = {
+            let mut v = Vec::new();
+            for (d, kind, w) in rest {
+                let name = d.name.clone();
+                v.push((Self::logic_finish_bound(d).await, kind, w, name));
+            }
+            v
+        };
+        for (r, kind, w, name) in switched
+            .into_iter()
+            .map(|(r, k, w, n, _)| (r, k, w, n))
+            .chain(finished)
+        {
+            match r {
                 Ok(_) => {
-                    tracing::info!(kind = %m.kind, name = %m.name, table = %change.table, "recompiled for its table's new column types");
+                    tracing::info!(kind = %kind, name = %name, table = %change.table, "recompiled for its table's new column types");
                     notes.push(format!(
-                        "{} {} was recompiled for the new column types and deployed as a new \
-                         version ({w})",
-                        m.kind, m.name
+                        "{kind} {name} was recompiled for the new column types and deployed as a \
+                         new version ({w})"
                     ));
                 }
                 Err(e) => {
-                    tracing::warn!(kind = %m.kind, name = %m.name, table = %change.table, error = %e, "recompiling after a column change failed");
+                    tracing::warn!(kind = %kind, name = %name, table = %change.table, error = %e, "activating a recompiled version failed");
                     notes.push(format!(
-                        "the table changed, but recompiling {} {} failed ({}); its previous \
-                         version still runs with the old column types: deploy it again",
-                        m.kind, m.name, e.message
+                        "the table changed, but activating the recompiled {kind} {name} failed \
+                         ({}); its previous version still runs: deploy it again",
+                        e.message
                     ));
                 }
             }

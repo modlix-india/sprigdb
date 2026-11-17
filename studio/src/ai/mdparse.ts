@@ -1,14 +1,42 @@
-// The small part of Markdown the assistants write: paragraphs, headings,
-// lists, fenced code (also while a fence is still streaming), and inline
-// code, bold, italics and links. Parsed to data and drawn as React
-// elements, so model text never becomes HTML.
+// The small part of Markdown the assistants and the docs write:
+// paragraphs, headings, lists, quotes, tables, fenced code (also while a
+// fence is still streaming), and inline code, bold, italics and links.
+// Parsed to data and drawn as React elements, so neither model text nor
+// a docs page ever becomes HTML.
 
 export type MdBlock =
   | { type: 'p'; text: string }
   | { type: 'h'; level: number; text: string }
   | { type: 'ul' | 'ol'; items: string[] }
   | { type: 'code'; lang: string; text: string }
-  | { type: 'quote'; text: string };
+  | { type: 'quote'; text: string }
+  | { type: 'table'; head: string[]; rows: string[][] };
+
+/** A table row's cells: split on `|` outside code spans (`\|` stays a
+ * pipe), and `<br>` as a line break. */
+export function tableCells(line: string): string[] {
+  const t = line.trim().replace(/^\|/, '').replace(/\|$/, '');
+  const cells: string[] = [];
+  let cur = '';
+  let code = false;
+  for (let i = 0; i < t.length; i++) {
+    const c = t[i]!;
+    if (c === '\\' && t[i + 1] === '|') {
+      cur += '|';
+      i++;
+    } else if (c === '`') {
+      code = !code;
+      cur += c;
+    } else if (c === '|' && !code) {
+      cells.push(cur);
+      cur = '';
+    } else cur += c;
+  }
+  cells.push(cur);
+  return cells.map((x) => x.trim().replace(/<br\s*\/?>/gi, '\n'));
+}
+
+const isDelimiterRow = (line: string) => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(line);
 
 export function parseMarkdown(src: string): MdBlock[] {
   const out: MdBlock[] = [];
@@ -20,7 +48,8 @@ export function parseMarkdown(src: string): MdBlock[] {
   };
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
-    const fence = /^\s*(```|~~~)\s*([\w+-]*)\s*$/.exec(line);
+    // A fence and its info string (`sql test`): the language is its first word.
+    const fence = /^\s*(`{3,}|~{3,})\s*([\w+-]*)[^`]*$/.exec(line);
     if (fence) {
       flush();
       const close = fence[1]!;
@@ -31,6 +60,19 @@ export function parseMarkdown(src: string): MdBlock[] {
         i++;
       }
       out.push({ type: 'code', lang: fence[2]!.toLowerCase(), text: body.join('\n') });
+      continue;
+    }
+    if (/^\s*\|/.test(line) && i + 1 < lines.length && isDelimiterRow(lines[i + 1]!)) {
+      flush();
+      const head = tableCells(line);
+      const rows: string[][] = [];
+      i += 2;
+      while (i < lines.length && /^\s*\|/.test(lines[i]!)) {
+        rows.push(tableCells(lines[i]!));
+        i++;
+      }
+      i--;
+      out.push({ type: 'table', head, rows });
       continue;
     }
     const h = /^(#{1,6})\s+(.*)$/.exec(line);
@@ -79,21 +121,37 @@ export type Inline =
   | { type: 'code'; text: string }
   | { type: 'strong'; text: string }
   | { type: 'em'; text: string }
-  | { type: 'link'; text: string; href: string };
+  | { type: 'link'; text: string; href: string }
+  | { type: 'image'; alt: string };
 
-/** Inline marks of one paragraph or item. Links only to http(s). */
-export function parseInline(src: string): Inline[] {
+/** Inline marks of one paragraph or item. Links to http(s) only, unless
+ * `relative` also allows links without a scheme (a docs page's
+ * `../x.md#y` and `#y`); any other link stays text. Images become their
+ * description. */
+export function parseInline(src: string, relative = false): Inline[] {
   const out: Inline[] = [];
-  const re = /`([^`]+)`|\*\*([^*]+)\*\*|__([^_]+)__|\*([^*\s][^*]*)\*|\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;
+  const text = (t: string) => {
+    const last = out[out.length - 1];
+    if (last?.type === 'text') last.text += t;
+    else out.push({ type: 'text', text: t });
+  };
+  const re = /`([^`]+)`|\*\*([^*]+)\*\*|__([^_]+)__|\*([^*\s][^*]*)\*|!\[([^\]]*)\]\(([^)\s]+)\)|\[([^\]]+)\]\(([^)\s]+)\)/g;
   let at = 0;
   for (let m = re.exec(src); m; m = re.exec(src)) {
-    if (m.index > at) out.push({ type: 'text', text: src.slice(at, m.index) });
+    if (m.index > at) text(src.slice(at, m.index));
     if (m[1] !== undefined) out.push({ type: 'code', text: m[1] });
     else if (m[2] !== undefined || m[3] !== undefined) out.push({ type: 'strong', text: (m[2] ?? m[3])! });
     else if (m[4] !== undefined) out.push({ type: 'em', text: m[4] });
-    else out.push({ type: 'link', text: m[5]!, href: m[6]! });
+    else if (m[5] !== undefined) out.push({ type: 'image', alt: m[5] });
+    else {
+      const href = m[8]!;
+      const web = /^https?:\/\//i.test(href);
+      const local = relative && !/^[a-z][a-z0-9+.-]*:/i.test(href) && !href.startsWith('//');
+      if (web || local) out.push({ type: 'link', text: m[7]!, href });
+      else text(m[0]);
+    }
     at = m.index + m[0].length;
   }
-  if (at < src.length) out.push({ type: 'text', text: src.slice(at) });
+  if (at < src.length) text(src.slice(at));
   return out;
 }

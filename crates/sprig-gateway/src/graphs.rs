@@ -52,13 +52,13 @@ use sprig_shard::{KeyClass, KeySpec, ShardMap, ShardMapCache, ShardMapStore, sha
 
 use crate::tenant::TenantServices;
 
+pub(crate) mod migrate;
 pub(crate) mod mirror;
 pub(crate) mod txn;
+pub(crate) mod typed;
 
 /// Ids handed out per block of the counter table.
 const ID_BLOCK: u64 = 256;
-/// Connections of Bolt transactions per cluster and gateway.
-pub const SESSION_POOL_MAX: usize = 64;
 
 /// One resolved graph.
 #[derive(Debug, Clone)]
@@ -141,10 +141,14 @@ pub struct GatewayGraphs {
     /// Labels and types this process made or looked up since the
     /// snapshot, by (tenant, graph): (labels, types).
     names: Mutex<HashMap<(u64, u64), Names>>,
+    /// Typed graphs' schemas as this process last saw them change, by
+    /// (tenant, graph) ([`typed`]).
+    typed: Mutex<HashMap<(u64, u64), Arc<sprig_graph::typed::TypedSchema>>>,
     /// Pools for Bolt transactions, by cluster: apart from the cluster's
     /// `sprig_ctl` pool, which the catalog and the id counters use while a
-    /// transaction holds its connection.
-    sessions: Mutex<HashMap<ClusterId, mysql_async::Pool>>,
+    /// transaction holds its connection; with the size each was made
+    /// with (`graph.session_pool`).
+    sessions: Mutex<HashMap<ClusterId, (usize, mysql_async::Pool)>>,
     /// Replica pools for Bolt reads in `mode: "r"`, by node address.
     replicas: Mutex<HashMap<String, mysql_async::Pool>>,
     /// Spreads reads over replicas.
@@ -157,6 +161,17 @@ pub struct GatewayGraphs {
     pub(crate) coord: txn::CoordServices,
     /// Asynchronous mirrors' mode changes and subscriptions.
     pub(crate) mirrors: mirror::MirrorState,
+    /// Graphs moving to typed tables ([`migrate`]).
+    pub(crate) moves: migrate::MoveState,
+    /// Typed tables' columns to add after their writes' commit, by
+    /// (tenant, graph, table) ([`typed`]).
+    #[allow(clippy::type_complexity)]
+    promoting: Mutex<
+        HashMap<
+            (u64, u64, sprig_graph::typed::Owner),
+            std::collections::BTreeSet<(String, sprig_graph::typed::Code)>,
+        >,
+    >,
 }
 
 type Names = (BTreeMap<u32, String>, BTreeMap<u32, String>);
@@ -190,6 +205,7 @@ impl GatewayGraphs {
             migrated: Mutex::new(HashSet::new()),
             counters: Mutex::new(HashMap::new()),
             names: Mutex::new(HashMap::new()),
+            typed: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             replicas: Mutex::new(HashMap::new()),
             next_replica: std::sync::atomic::AtomicUsize::new(0),
@@ -197,6 +213,8 @@ impl GatewayGraphs {
             dtx_ready: Mutex::new(HashSet::new()),
             coord: txn::CoordServices::new(),
             mirrors: mirror::MirrorState::default(),
+            moves: migrate::MoveState::default(),
+            promoting: Mutex::new(HashMap::new()),
         }
     }
 
@@ -425,8 +443,11 @@ impl GatewayGraphs {
                 mysql_async::OptsBuilder::from_opts(o).pool_opts(
                     mysql_async::PoolOpts::new()
                         .with_constraints(
-                            mysql_async::PoolConstraints::new(0, SESSION_POOL_MAX)
-                                .unwrap_or_default(),
+                            mysql_async::PoolConstraints::new(
+                                0,
+                                crate::offload::GraphLimits::now().session_pool,
+                            )
+                            .unwrap_or_default(),
                         )
                         .with_inactive_connection_ttl(std::time::Duration::from_secs(60)),
                 ),
@@ -648,16 +669,20 @@ impl GatewayGraphs {
     }
 
     /// The pool Bolt transactions take connections from on `cluster`:
-    /// the `sprig_ctl` account, up to [`SESSION_POOL_MAX`] connections.
+    /// the `sprig_ctl` account, up to `graph.session_pool` connections (a
+    /// new size makes a new pool; connections of the old one close as
+    /// their statements give them back).
     ///
     /// # Errors
     /// The locator's; a backend error.
     pub async fn session_pool(&self, cluster: &ClusterId) -> Result<mysql_async::Pool> {
-        if let Some(p) = self
+        let size = crate::offload::GraphLimits::now().session_pool;
+        if let Some((n, p)) = self
             .sessions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(cluster)
+            && *n == size
         {
             return Ok(p.clone());
         }
@@ -670,18 +695,19 @@ impl GatewayGraphs {
             mysql_async::OptsBuilder::from_opts(opts).pool_opts(
                 mysql_async::PoolOpts::new()
                     .with_constraints(
-                        mysql_async::PoolConstraints::new(0, SESSION_POOL_MAX).unwrap_or_default(),
+                        mysql_async::PoolConstraints::new(0, size).unwrap_or_default(),
                     )
                     .with_inactive_connection_ttl(std::time::Duration::from_secs(60)),
             ),
         );
-        Ok(self
-            .sessions
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        let mut m = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        let e = m
             .entry(cluster.clone())
-            .or_insert(pool)
-            .clone())
+            .or_insert_with(|| (size, pool.clone()));
+        if e.0 != size {
+            *e = (size, pool);
+        }
+        Ok(e.1.clone())
     }
 
     /// The id counters of `g`.
@@ -751,6 +777,16 @@ impl GatewayGraphs {
                 Some(&cat.settings),
             )
             .clamp(1, 256);
+        let storage = if self.svc.settings.get(
+            &sprig_graph::settings::STORAGE,
+            &cat.setting_ctx(&self.svc.dc).with_db(row.db_id),
+            Some(&cat.settings),
+        ) == "typed"
+        {
+            sprig_graph::typed::STORAGE_TYPED
+        } else {
+            1
+        };
         let ep = self.svc.locator.writer(tenant).await?;
         let (object_id, members, group) = {
             let mut c = ep.pool.get_conn().await.map_err(backend_error)?;
@@ -808,7 +844,16 @@ impl GatewayGraphs {
                 c.query_drop(sprig_catalog::ddl::dtx_table_sql(s))
                     .await
                     .map_err(backend_error)?;
-                for d in Tables::of(s, object_id.0).shard_ddl() {
+                // A typed graph's label-set and type tables come with their
+                // first rows; the directory, values and claims tables now.
+                let ddl = if storage == sprig_graph::typed::STORAGE_TYPED {
+                    let mut v = sprig_graph::typed::base_ddl(s, object_id.0);
+                    v.push(Tables::of(s, object_id.0).claims_ddl());
+                    v
+                } else {
+                    Tables::of(s, object_id.0).shard_ddl()
+                };
+                for d in ddl {
                     c.query_drop(d).await.map_err(backend_error)?;
                 }
             }
@@ -850,7 +895,7 @@ impl GatewayGraphs {
             let cat_schema = store.schema().to_owned();
             match store.insert_object(tx, &obj).await {
                 Ok(()) => match GraphCatalog::new(&cat_schema)
-                    .insert_native_in(tx, object_id.0, row.db_id.0, Some(group))
+                    .insert_native_as(tx, object_id.0, row.db_id.0, Some(group), storage)
                     .await
                 {
                     Ok(()) => {
@@ -892,6 +937,7 @@ impl GatewayGraphs {
             id = object_id.0,
             group,
             shards,
+            storage,
             "graph created"
         );
         Ok((g, v))
@@ -1368,16 +1414,18 @@ impl GatewayGraphs {
             let (labels, types) = self.names_of(&g);
             let dict = self.dictionary(&g);
             let ids = self.counters(&g).await?;
-            let mut store = sprig_graph::maria::MariaStore::new(
-                &mut rc,
-                Arc::clone(&g.shards),
+            let parts = typed::StoreParts {
                 labels,
                 types,
                 dict,
                 ids,
-            )
-            .with_schema(g.def.indexes.clone(), None);
-            sprig_graph::exec::run(&mut store, &q, &sprig_graph::eval::Params::new(), &budgets)
+                indexes: g.def.indexes.clone(),
+                ops: None,
+                gate: None,
+                holds: None,
+            };
+            let mut store = self.open_store(&g, &mut rc, parts);
+            sprig_graph::exec::run(&mut *store, &q, &sprig_graph::eval::Params::new(), &budgets)
                 .await
         };
         rc.end().await;
@@ -1507,6 +1555,12 @@ impl GatewayGraphs {
     /// data breaks a new constraint; catalog and backend errors.
     #[allow(clippy::too_many_lines)] // drop, or plan, record, alter, mark online
     pub async fn schema(self: &Arc<Self>, g: &GraphRef, cmd: &Schema) -> Result<SchemaCounts> {
+        if g.def.storage_phase.is_some() {
+            return Err(migrate::moving_error());
+        }
+        if typed::is_typed(g) {
+            return self.typed_index_cmd(g, cmd).await;
+        }
         self.prepare(g.tenant).await?;
         let existing = self.current_indexes(g).await?;
         if let Schema::Drop { .. } = cmd {

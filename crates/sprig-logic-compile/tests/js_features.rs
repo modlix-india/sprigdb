@@ -588,6 +588,56 @@ fn corpus() -> Vec<(&'static str, &'static str, ScriptSig, Vec<Vec<J>>)> {
             x(),
             vec![vec![json!(7)], vec![json!(2)], vec![json!(30)]],
         ),
+        (
+            // Operands are read left to right: a helper that changes a
+            // variable runs after the operands before it were read.
+            "order_operands",
+            "let n = x;
+             let s = 'ab';
+             function bump(k) { n = n + k; return n; }
+             function grow() { s = s + 'c'; return 'c'; }
+             const get = () => n;
+             const plus = (a) => a + bump(1);
+             function pair(a, b) { return a * 100 + b; }
+             const a = n + bump(1);
+             const b = get() * 10 + bump(2);
+             const c = `${n}-${bump(3)}-${n}`;
+             const d = pair(n, bump(1));
+             const e = plus(n);
+             const f = Math.max(n, bump(5) - 10);
+             const g = s.indexOf(grow());
+             const h = (x > 2 ? n : -n) + bump(1);
+             const i = (n > 0 && n < 1000) === (bump(-1000) > 0);
+             n += bump(1);
+             const m = n;
+             const k = bump(1) + n;
+             return { a, b, c, d, e, f, g, h, i, m, k, n, s };",
+            x(),
+            vec![vec![json!(1)], vec![json!(5)]],
+        ),
+        (
+            "order_literals",
+            "let n = x;
+             function bump() { n = n * 2; return n; }
+             const arr = [n, bump(), n, bump()];
+             const obj = { p: n, q: bump(), r: n };
+             const t = { first: n + 0, again: bump() };
+             return { arr, obj, t, n };",
+            x(),
+            vec![vec![json!(3)], vec![json!(-4)]],
+        ),
+        (
+            "order_db",
+            "let n = x;
+             function bump(k) { n = n + k; return n; }
+             db.exec('INSERT INTO orders (id, product_id, qty, note) VALUES (?, ?, ?, ?)',
+                     [n + 1000, 7, bump(1), 'n ' + n]);
+             const r = db.sqlOne('SELECT qty FROM orders WHERE id = ?', [n + 999]);
+             db.exec('INSERT INTO audit (what) VALUES (?)', [`${n}:${bump(10)}:${n}`]);
+             return sprig.event('done', { q: r === null ? -1 : r.qty, before: n, after: bump(1) });",
+            x(),
+            vec![vec![json!(2)], vec![json!(40)]],
+        ),
     ]
 }
 

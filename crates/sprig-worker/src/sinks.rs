@@ -45,6 +45,11 @@ pub struct SinksEnv {
     rls: Option<Arc<RlsCatalogs>>,
 }
 
+/// The most tenant ids worker-run code's context inlines for its
+/// definer's subtree sets (the hard bound of `rls.inline_subtree_max`):
+/// about 1.3 MB of JSON, well under `max_allowed_packet`.
+pub(crate) const WORKER_SUBTREE_MAX: usize = 100_000;
+
 /// Tenant catalogs with the identity and authorization modules (users,
 /// grants, row-level security), cached two seconds per tenant: what a change
 /// sink's owner may see, checked before each batch.
@@ -79,8 +84,8 @@ impl RlsCatalogs {
             })
     }
 
-    /// Reads definers' tenant subtrees from `global`'s directory, up to
-    /// `rls.inline_subtree_max` tenants (`settings`), for [`Self::context`].
+    /// Reads definers' tenant subtrees from `global`'s directory, for
+    /// [`Self::context`] (`settings`: the tenant's settings, read there).
     pub(crate) fn with_tree(
         mut self,
         global: Arc<dyn MetaStore>,
@@ -197,11 +202,14 @@ impl RlsCatalogs {
     /// tenant, so its subtree sets are the tenant's, as for a definer
     /// routine in the gateway: `"sub"` the tenant's subtree, `"man"` the
     /// same when the definer administers the tenant. They are read only
-    /// when a policy of the tenant names the subtree functions, and stay
-    /// empty (those policies then show nothing) without a directory, when
-    /// reading it fails, or above `rls.inline_subtree_max`: the subtree
-    /// table's view reads the session account's tenant, and worker-run
-    /// code runs as `sprig_ctl`.
+    /// when a policy of the tenant names the subtree functions, and are
+    /// inlined at any size up to [`WORKER_SUBTREE_MAX`], also above
+    /// `rls.inline_subtree_max`: the subtree table's view reads the session
+    /// account's tenant, and worker-run code runs as `sprig_ctl`, so it
+    /// can't read that table; the context is set once per run, and MariaDB
+    /// reads the list once per statement. They stay empty (those policies
+    /// then show nothing) without a directory, when reading it fails, or
+    /// past [`WORKER_SUBTREE_MAX`].
     pub(crate) async fn context(&self, tenant: TenantId, user: u32) -> Result<Option<String>> {
         use sprig_auth::authz::{Action, AuthzState, CompiledPrivileges, Target};
         let cat = self.catalog(tenant).await?;
@@ -236,14 +244,17 @@ impl RlsCatalogs {
             Some((global, settings)) if names_tree => {
                 match sprig_auth::authz::rls::directory_subtree(global.as_ref(), tenant.0).await {
                     Ok(t) => {
-                        let max = settings.tenant_get(
-                            tenant,
-                            &sprig_auth::authz::settings::RLS_INLINE_SUBTREE_MAX,
-                        );
-                        if t.len() as u64 <= max {
+                        if t.len() <= WORKER_SUBTREE_MAX {
+                            let max = settings.tenant_get(
+                                tenant,
+                                &sprig_auth::authz::settings::RLS_INLINE_SUBTREE_MAX,
+                            );
+                            if t.len() as u64 > max {
+                                tracing::debug!(%tenant, tenants = t.len(), max, "worker-run code: tenant subtree above rls.inline_subtree_max, inlined in its context");
+                            }
                             t
                         } else {
-                            tracing::warn!(%tenant, tenants = t.len(), max, "worker-run code: tenant subtree above rls.inline_subtree_max, its subtree policies show nothing");
+                            tracing::warn!(%tenant, tenants = t.len(), max = WORKER_SUBTREE_MAX, "worker-run code: tenant subtree too large to inline, its subtree policies show nothing");
                             Vec::new()
                         }
                     }

@@ -1204,8 +1204,8 @@ meaning = "Logic code failed to parse or type-check at deploy; the message gives
 what_to_do = "Fix the code at the line and column named, and deploy again; `sprigctl logic compile` checks it without deploying."
 
 [ER_SPRIG_LOGIC_UNSUPPORTED]
-meaning = "The code can't run in any tier: for example procedural SQL that would span shards, or a dry run of a stream or queue trigger or a schedule, which only a deploy places."
-what_to_do = "Rewrite the code so it touches one shard per call, or move it into a language the engine runs (JavaScript, Lua or KIRun)."
+meaning = "The code can't run in any tier: a validation, after-commit trigger or computed column whose code doesn't compile into MariaDB (these kinds have no engine tier; the message lists the reasons), procedural SQL that would span shards, a dry run of a stream or queue trigger or a schedule, which only a deploy places, or a statement refused inside a test run."
+what_to_do = "Remove the reasons the message lists, so the code compiles (for Lua, test a column or argument for `sprig.null` before comparing it or doing arithmetic on it), or rewrite procedural SQL so it touches one shard per call."
 
 [ER_SPRIG_LOGIC_VALIDATION_FAILED]
 meaning = "A validation rejected the write; MongoDB clients see 121, `DocumentValidationFailure`."
@@ -1236,8 +1236,8 @@ meaning = "Another session is deploying the same module at the same time and too
 what_to_do = "Retry the deploy once the other finishes."
 
 [ER_SPRIG_LOGIC_ROLLOUT_BLOCKED]
-meaning = "A staged rollout can't stage this version: it changes the parameters, the language or the rights, or the candidate was rolled back after failing its checks."
-what_to_do = "Deploy without `SPRIG_ROLLOUT` to switch at once, or keep the signature and rights unchanged for a staged rollout."
+meaning = "A staged rollout can't stage this version: a function's or procedure's candidate changes the parameters, the language or the rights, or keys the rollout on a parameter that doesn't exist or isn't a whole number or text (`SPRIG_ROLLOUT_BY = 'key:<parameter>'`); a trigger's candidate reads another stream or queue, or, for an after-commit trigger, changes the table, the events or the `UPDATE OF` columns; or the candidate was rolled back after failing its checks."
+what_to_do = "Deploy without `SPRIG_ROLLOUT` to switch at once, or keep what the message names unchanged for a staged rollout; for a rollout by key, name a whole-number or text parameter."
 
 [ER_SPRIG_LOGIC_ENGINE_BUSY]
 meaning = "The logic engine's queue on this gateway is full."

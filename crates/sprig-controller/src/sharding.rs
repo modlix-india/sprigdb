@@ -509,6 +509,33 @@ impl ShardingLoop {
         })
     }
 
+    /// The `sprig_ctl` pool for writes of `tenant`'s rows on `cluster`:
+    /// for a tenant on Sprig 2PC's relay path, through the cluster's
+    /// relay writer, so the relay fence ends these connections with the
+    /// tenant's own (`sprig_cluster::failover::relay_pools`).
+    ///
+    /// # Errors
+    /// Retryable 39030 while such a cluster has no ready relay writer.
+    async fn tenant_pool(&self, tenant: TenantId, cluster: &ClusterId) -> Result<Pool> {
+        let direct = self.pools.pool(cluster).await?;
+        sprig_cluster::failover::relay_pools::tenant_pool(
+            self.maps.store(),
+            tenant,
+            cluster,
+            direct,
+            sprig_txn::fence::wire::preamble,
+        )
+        .await
+    }
+
+    /// A connection from [`Self::tenant_pool`].
+    async fn tenant_conn(&self, tenant: TenantId, cluster: &ClusterId) -> Result<Conn> {
+        let pool = self.tenant_pool(tenant, cluster).await?;
+        pool.get_conn_bounded().await.map_err(|e| {
+            SprigError::new(sprig_common::SprigCode::BackendUnavailable, e.to_string())
+        })
+    }
+
     /// One evaluation of `tenant`.
     ///
     /// # Errors

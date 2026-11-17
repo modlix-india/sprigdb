@@ -9,15 +9,23 @@
 //!   anywhere: it is answered first and replaced by its value as a literal
 //!   (a vector as `X'...'`). A whole item of the outermost `SELECT` list
 //!   keeps its column name (`AS` the call's text).
-//! - **A call over row values** (`AI_CLASSIFY(body, 'bug', 'idea')`) must
-//!   be a whole item of the outermost `SELECT` list of a `SELECT` or
-//!   `WITH ... SELECT` (an alias may follow). Its input expression takes its
-//!   place, so the statement returns the inputs in that column; the gateway
-//!   answers them and puts the answers in their place. Not with `DISTINCT`,
-//!   `UNION`, `INTO`, or an `ORDER BY`, `GROUP BY` or `HAVING` that names
-//!   the column (by alias or position), since those would act on the
-//!   inputs: those are refused (1235), as is a call over row values
-//!   anywhere else.
+//! - **A call over row values** (`AI_CLASSIFY(body, 'bug', 'idea')`) that
+//!   is a whole item of the outermost `SELECT` list of a `SELECT` or
+//!   `WITH ... SELECT` (an alias may follow), in a statement that doesn't
+//!   act on its column (`DISTINCT`, `ORDER BY` and the like), has its
+//!   input expression put in its place, so the statement returns the
+//!   inputs in that column; the gateway answers them and puts the answers
+//!   in their place.
+//! - **Any other call over row values is bound** ([`bind`]): in the
+//!   outermost `SELECT`'s list (inside any expression), `WHERE` and
+//!   `ORDER BY`, and in a single-table `UPDATE ... SET`. The gateway reads
+//!   the distinct inputs first, answers them, and runs the statement with
+//!   each call replaced by a lookup of its answers. Refused (1235): in a
+//!   subquery, `FROM` or a join condition, `GROUP BY`, `HAVING`, `WINDOW`,
+//!   or an item they name; with `UNION`, `EXCEPT`, `INTERSECT` or `INTO`;
+//!   in an `UPDATE`'s `WHERE`, `ORDER BY` or `LIMIT`, a multiple-table
+//!   `UPDATE`, or reading a column an earlier assignment sets; in
+//!   `INSERT`, `REPLACE`, `DELETE` and every other statement.
 //! - **Every argument after the input is a literal**: labels, the JSON
 //!   schema, the word limit, the model (1210 otherwise). Calls don't nest.
 //!
@@ -29,6 +37,10 @@ use std::ops::Range;
 
 use crate::lex::{self, LexOptions, Token, TokenKind, ident_value, string_value};
 use crate::names::NameError;
+
+pub mod bind;
+
+pub use bind::{Bind, Level, case_of};
 
 /// The functions' names, upper case.
 pub const NAMES: [&str; 5] = [
@@ -103,6 +115,10 @@ pub struct Call {
     pub rest: Vec<Option<String>>,
     /// The item of the outermost `SELECT` list the call is, if it is one.
     pub item: Option<Item>,
+    /// When the statement binds the call (see [`bind`]): when its inputs
+    /// are read. `None` for a literal input and a whole item answered in
+    /// its column.
+    pub level: Option<Level>,
 }
 
 impl Call {
@@ -129,6 +145,8 @@ pub struct Plan {
     /// Every name that qualifies another (`x` in `x.y`): the databases
     /// among them are the ones the statement reads.
     pub qualifiers: Vec<String>,
+    /// How the statement runs when it binds calls over row values.
+    pub bind: Option<Bind>,
 }
 
 fn refused(errno: u16, sqlstate: [u8; 5], message: String) -> NameError {
@@ -145,7 +163,8 @@ fn not_here(name: &str, why: &str) -> NameError {
         *b"42000",
         format!(
             "This version of SprigDB doesn't yet support '{name} over row values {why}': \
-             use it as a whole item of the outermost SELECT list, or give it a literal input"
+             such a call may stand in the SELECT list, WHERE or ORDER BY of the outermost \
+             SELECT, or in a single-table UPDATE ... SET; or give it a literal input"
         ),
     )
 }
@@ -163,6 +182,8 @@ struct Toks<'a> {
     sql: &'a [u8],
     t: Vec<Token>,
     depth: Vec<u32>,
+    /// The innermost `(` around each token.
+    parent: Vec<Option<usize>>,
 }
 
 impl Toks<'_> {
@@ -268,13 +289,19 @@ fn literal(tk: &Toks<'_>, r: Range<usize>, nbe: bool) -> Option<Option<String>> 
 /// The outermost `SELECT` list: its items' token ranges, and what the
 /// statement around it does.
 struct Outer {
+    /// The `SELECT` keyword's token.
+    sel: usize,
     items: Vec<Range<usize>>,
+    /// The token that ends the list.
+    list_end: usize,
     distinct: bool,
     /// `UNION`, `EXCEPT`, `INTERSECT` or `INTO` at the top level.
     compound: bool,
     /// The token ranges of `GROUP BY`, `HAVING`, `ORDER BY` and `WINDOW`
     /// clauses at the top level.
     clauses: Vec<Range<usize>>,
+    /// Every top-level clause after the list.
+    parts: Vec<(bind::Clause, Range<usize>)>,
 }
 
 const MODIFIERS: &[&str] = &[
@@ -366,10 +393,13 @@ fn outer_select(tk: &Toks<'_>) -> Option<Outer> {
         clauses.push(o..tk.t.len());
     }
     Some(Outer {
+        sel,
         items,
+        list_end: j,
         distinct,
         compound,
         clauses,
+        parts: bind::clauses(tk, j),
     })
 }
 
@@ -437,16 +467,21 @@ pub fn analyze(text: &[u8], opts: &LexOptions) -> Option<Result<Plan, NameError>
         sql: text,
         t: all.into_iter().filter(|t| !t.kind.is_trivia()).collect(),
         depth: Vec::new(),
+        parent: Vec::new(),
     };
     let mut d = 0u32;
-    for t in &tk.t {
+    let mut open: Vec<usize> = Vec::new();
+    for (i, t) in tk.t.iter().enumerate() {
         let b = t.bytes(text);
         if t.kind == TokenKind::Punct && b == b")" {
             d = d.saturating_sub(1);
+            open.pop();
         }
         tk.depth.push(d);
+        tk.parent.push(open.last().copied());
         if t.kind == TokenKind::Punct && b == b"(" {
             d += 1;
+            open.push(i);
         }
     }
     let first = tk.word(0).unwrap_or_default();
@@ -483,6 +518,8 @@ pub fn analyze(text: &[u8], opts: &LexOptions) -> Option<Result<Plan, NameError>
     let outer = outer_select(&tk);
     let nbe = opts.no_backslash_escapes;
     let mut calls = Vec::new();
+    // Whether every call over rows can be answered in its column.
+    let mut in_column = true;
     for &(name, open_at, close) in &found {
         if found
             .iter()
@@ -544,45 +581,34 @@ pub fn analyze(text: &[u8], opts: &LexOptions) -> Option<Result<Plan, NameError>
             })
         });
         if lit.is_none() {
-            let Some(it) = &item else {
-                return Some(Err(not_here(name, "outside the outermost SELECT list")));
-            };
-            let o = outer
-                .as_ref()
-                .unwrap_or_else(|| unreachable!("an item has an outer list"));
-            if o.distinct {
-                return Some(Err(not_here(name, "with SELECT DISTINCT")));
-            }
-            if o.compound {
-                return Some(Err(not_here(name, "in a UNION or SELECT ... INTO")));
-            }
-            // The column named by alias or position in GROUP BY, HAVING,
-            // ORDER BY or WINDOW.
-            let pos = match it.column {
-                ColumnAt::FromStart(i) => Some((i + 1).to_string()),
-                ColumnAt::FromEnd(_) => None,
-            };
-            let named = o.clauses.iter().any(|c| {
-                c.clone().any(|k| {
-                    let t = &tk.t[k];
-                    (t.kind == TokenKind::Number
-                        && pos
-                            .as_deref()
-                            .is_some_and(|p| t.bytes(text) == p.as_bytes())
-                        && (tk.is_word(k - 1, "BY") || tk.punct(k - 1, b',')))
-                        || it.alias.as_ref().is_some_and(|a| {
-                            tk.ident(k).is_some_and(|x| x.eq_ignore_ascii_case(a))
-                                && !tk.punct(k + 1, b'.')
-                                && !tk.punct(k.wrapping_sub(1), b'.')
-                        })
-                })
+            in_column &= item.as_ref().is_some_and(|it| {
+                let o = outer
+                    .as_ref()
+                    .unwrap_or_else(|| unreachable!("an item has an outer list"));
+                // Not where the statement acts on the column: DISTINCT,
+                // UNION, INTO, or the column named by alias or position in
+                // GROUP BY, HAVING, ORDER BY or WINDOW.
+                let pos = match it.column {
+                    ColumnAt::FromStart(i) => Some((i + 1).to_string()),
+                    ColumnAt::FromEnd(_) => None,
+                };
+                let named = o.clauses.iter().any(|c| {
+                    c.clone().any(|k| {
+                        let t = &tk.t[k];
+                        (t.kind == TokenKind::Number
+                            && pos
+                                .as_deref()
+                                .is_some_and(|p| t.bytes(text) == p.as_bytes())
+                            && (tk.is_word(k - 1, "BY") || tk.punct(k - 1, b',')))
+                            || it.alias.as_ref().is_some_and(|a| {
+                                tk.ident(k).is_some_and(|x| x.eq_ignore_ascii_case(a))
+                                    && !tk.punct(k + 1, b'.')
+                                    && !tk.punct(k.wrapping_sub(1), b'.')
+                            })
+                    })
+                });
+                !o.distinct && !o.compound && !named
             });
-            if named {
-                return Some(Err(not_here(
-                    name,
-                    "named in GROUP BY, HAVING, ORDER BY or WINDOW",
-                )));
-            }
         }
         calls.push(Call {
             name,
@@ -591,13 +617,50 @@ pub fn analyze(text: &[u8], opts: &LexOptions) -> Option<Result<Plan, NameError>
             literal: lit,
             rest,
             item,
+            level: None,
         });
     }
-    Some(Ok(Plan {
+    let mut plan = Plan {
         calls,
         hint_db,
         qualifiers,
-    }))
+        bind: None,
+    };
+    if in_column {
+        return Some(Ok(plan));
+    }
+    // Calls over rows bound by their answers.
+    let spans: Vec<(usize, usize)> = found.iter().map(|&(_, o, c)| (o, c)).collect();
+    let bound = match (first.as_str(), &outer) {
+        ("SELECT" | "WITH", Some(o)) => bind::select(&tk, o, &plan.calls, &spans),
+        ("UPDATE", _) => {
+            if let Some(u) = bind::update_parts(&tk) {
+                bind::update(&tk, &u, &plan.calls, &spans)
+            } else {
+                let c = plan.calls.iter().find(|c| !c.constant());
+                Err(not_here(c.map_or("AI_COMPLETE", |c| c.name), "here"))
+            }
+        }
+        (w, _) => {
+            let why = match w {
+                "INSERT" | "REPLACE" => "in INSERT or REPLACE",
+                "DELETE" => "in DELETE",
+                _ => "outside SELECT and UPDATE",
+            };
+            let c = plan.calls.iter().find(|c| !c.constant());
+            return Some(Err(not_here(c.map_or("AI_COMPLETE", |c| c.name), why)));
+        }
+    };
+    match bound {
+        Ok((b, levels)) => {
+            for (c, l) in plan.calls.iter_mut().zip(levels) {
+                c.level = l;
+            }
+            plan.bind = Some(b);
+            Some(Ok(plan))
+        }
+        Err(e) => Some(Err(e)),
+    }
 }
 
 impl Plan {
@@ -607,16 +670,19 @@ impl Plan {
         self.calls.iter().any(|c| !c.constant())
     }
 
-    /// The statement to run: each constant call replaced by `values[i]`
-    /// (SQL text, one per call in order; ignored for calls over rows),
-    /// each call over rows by its input expression.
+    /// The statement to run: each constant or bound call replaced by
+    /// `values[i]` (SQL text, one per call in order; ignored for the other
+    /// calls over rows), each other call over rows by its input
+    /// expression.
     #[must_use]
     pub fn render(&self, text: &[u8], values: &[String]) -> String {
         let mut out = Vec::with_capacity(text.len());
         let mut at = 0;
         for (c, v) in self.calls.iter().zip(values) {
             out.extend_from_slice(&text[at..c.range.start]);
-            if c.constant() {
+            if c.level.is_some() {
+                out.extend_from_slice(v.as_bytes());
+            } else if c.constant() {
                 out.extend_from_slice(v.as_bytes());
                 if let Some(it) = &c.item
                     && it.alias.is_none()
@@ -765,24 +831,31 @@ mod tests {
     }
 
     #[test]
-    fn row_inputs_elsewhere_are_refused() {
-        assert_eq!(
-            err("SELECT id FROM t WHERE AI_CLASSIFY(body, 'a', 'b') = 'a'"),
-            1235
-        );
-        assert_eq!(err("SELECT UPPER(AI_SUMMARIZE(body)) FROM t"), 1235);
-        assert_eq!(err("UPDATE t SET s = AI_SUMMARIZE(body)"), 1235);
+    fn row_inputs_elsewhere_are_bound_or_refused() {
+        let bound = |s: &str| {
+            let p = plan(s);
+            assert!(p.bind.is_some(), "{s}");
+            assert!(
+                p.calls.iter().all(|c| c.constant() || c.level.is_some()),
+                "{s}"
+            );
+        };
+        bound("SELECT id FROM t WHERE AI_CLASSIFY(body, 'a', 'b') = 'a'");
+        bound("SELECT UPPER(AI_SUMMARIZE(body)) FROM t");
+        bound("UPDATE t SET s = AI_SUMMARIZE(body)");
+        bound("SELECT DISTINCT AI_CLASSIFY(body, 'a', 'b') FROM t");
+        bound("SELECT AI_CLASSIFY(b, 'a', 'b') k FROM t ORDER BY k");
+        // A whole item beside a bound call is bound too.
+        let p = plan("SELECT AI_SUMMARIZE(b), id FROM t WHERE AI_CLASSIFY(b, 'a', 'b') = 'a'");
+        assert_eq!(p.calls[0].level, Some(Level::Output));
+        assert!(p.calls[0].item.is_some());
         assert_eq!(err("INSERT INTO s SELECT AI_SUMMARIZE(body) FROM t"), 1235);
         assert_eq!(
-            err("SELECT DISTINCT AI_CLASSIFY(body, 'a', 'b') FROM t"),
+            err("DELETE FROM t WHERE AI_CLASSIFY(b, 'a', 'b') = 'a'"),
             1235
         );
         assert_eq!(
             err("SELECT AI_SUMMARIZE(body) FROM t UNION SELECT 'x'"),
-            1235
-        );
-        assert_eq!(
-            err("SELECT AI_CLASSIFY(b, 'a', 'b') k FROM t ORDER BY k"),
             1235
         );
         assert_eq!(

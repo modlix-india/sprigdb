@@ -260,6 +260,7 @@ fn guarded_loops_stop_at_the_budget() {
     assert_eq!(c.analysis.guarded_loops, 1);
     let lim = Limits {
         max_loop_iterations: 10,
+        ..Limits::default()
     };
     let f = c.ir.as_ref().unwrap();
     let o = run(f, &[Value::Int(10), Value::Int(4)], &mut NoDb, &lim).unwrap();

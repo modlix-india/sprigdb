@@ -24,6 +24,9 @@
             "additionalProperties": true,
             "type": "object"
           },
+          "message_id": {
+            "type": "string"
+          },
           "model": {
             "type": "string"
           },
@@ -1557,6 +1560,70 @@
       },
       "DeleteVectorsResponse": {
         "description": "The DeleteVectorsResponse message as JSON (proto3 mapping)",
+        "type": "object"
+      },
+      "DocsPage": {
+        "properties": {
+          "audience": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "chunks": {
+            "items": {
+              "$ref": "#/components/schemas/DocsPageChunk"
+            },
+            "type": "array"
+          },
+          "markdown": {
+            "type": "string"
+          },
+          "ordered": {
+            "type": "boolean"
+          },
+          "page": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "page",
+          "title",
+          "audience",
+          "ordered",
+          "markdown",
+          "chunks"
+        ],
+        "type": "object"
+      },
+      "DocsPageChunk": {
+        "properties": {
+          "chunk_id": {
+            "type": "string"
+          },
+          "heading_path": {
+            "type": "string"
+          },
+          "seq": {
+            "type": "integer"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "chunk_id",
+          "heading_path",
+          "text",
+          "seq"
+        ],
         "type": "object"
       },
       "DocsSearchHit": {
@@ -6541,6 +6608,55 @@
         },
         "tags": [
           "sprig.v1.Vectors"
+        ]
+      }
+    },
+    "/v1/docs/pages/{page}": {
+      "get": {
+        "operationId": "Docs.Page",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "page",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "version",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DocsPage"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error"
+          }
+        },
+        "summary": "One page of the product documentation of this release (any signed-in user), rebuilt from the docs pack: its chunks in page order and its Markdown. {page} is the page's path under docs/, slashes included (tools/studio.md)",
+        "tags": [
+          "sprig.v1.Docs"
         ]
       }
     },

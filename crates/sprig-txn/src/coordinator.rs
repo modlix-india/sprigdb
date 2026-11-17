@@ -2048,7 +2048,7 @@ async fn prepare_one<C: BranchConn>(
             // Locking reads only: nothing to replay.
             return Ok(());
         }
-        return admin
+        admin
             .insert_redo_held(
                 &b.cluster,
                 &b.anchor.schema,
@@ -2057,7 +2057,23 @@ async fn prepare_one<C: BranchConn>(
                 &stmts,
                 b.thread_id,
             )
-            .await;
+            .await?;
+        // Galera aborts a local transaction that stands in a DDL's way
+        // (the mover's rename fence) and keeps its connection open, so the
+        // branch can have lost its writes while its holder looks alive; the
+        // next statement on it answers 1213. One round trip on the branch
+        // itself, after the rows are in (a DDL that aborts it later finds
+        // them): an aborted branch must not prepare, or the commit would
+        // apply only the other branches.
+        if let Err(e) = b
+            .conn
+            .control(&[Ctl::Savepoint(STMT_SAVEPOINT.to_owned())])
+            .await
+        {
+            let _ = admin.delete_redo(&b.cluster, &b.anchor.schema, dtid).await;
+            return Err(e);
+        }
+        return Ok(());
     }
     let x = b.xid.clone().expect("prepared branches are XA or held");
     b.conn

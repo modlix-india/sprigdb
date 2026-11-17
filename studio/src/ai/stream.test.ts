@@ -124,6 +124,35 @@ describe('the dock store', () => {
     expect(b && b.type === 'proposal' && b.state).toBe('accepted');
   });
 
+  it('rates the answer the end line names, even for a question asked twice', async () => {
+    let n = 0;
+    stubFetch((url) => {
+      if (url === '/v1/ai/chat') {
+        n += 1;
+        const turn = [
+          { type: 'start', conversation: '41', role: 'data', model: 'stub-model', share_data: false },
+          { type: 'text', text: `Answer ${n}` },
+          { type: 'end', stop: 'end_turn', message_id: String(200 + n) },
+        ];
+        return new Response(chunked(lines(turn), 7), { status: 200, headers: { 'content-type': 'application/x-ndjson' } });
+      }
+      if (url === '/v1/ai/feedback') return Response.json({ recorded: true });
+      return new Response('{}', { status: 404 });
+    });
+    await send('Same question?', [], null);
+    await send('Same question?', [], null);
+    const turns = useAssistant.getState().items.filter((i): i is Turn => i.kind === 'turn');
+    expect(turns.map((t) => t.messageId)).toEqual(['201', '202']);
+    await rate(turns[0]!.key, 'down');
+    await rate(turns[1]!.key, 'up');
+    // No conversation read back: the ids came with the answers.
+    expect(calls.some((c) => c.url.startsWith('/v1/ai/conversations'))).toBe(false);
+    expect(calls.filter((c) => c.url === '/v1/ai/feedback').map((c) => c.body)).toEqual([
+      { message_id: '201', vote: 'down' },
+      { message_id: '202', vote: 'up' },
+    ]);
+  });
+
   it('remembers that the assistants are not set up (39990) and keeps the question', async () => {
     stubFetch(() => Response.json({ code: 39990, name: 'ER_SPRIG_AI_NOT_CONFIGURED', message: 'no model for data' }, { status: 503 }));
     await send('hello', [], null);

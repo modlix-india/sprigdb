@@ -45,9 +45,12 @@
 //!   increment` as the feed's HLC stamps): the tail starts where
 //!   `Changes.Watch`'s `start_at_hlc` does, at the feed time index's last
 //!   position 30 s or more before `T` on the tenant's cluster, and the
-//!   stream leaves out events stamped before `T`. Older than the index or
-//!   than the tenant's last move: 286; a cluster without an index (Galera):
-//!   39802; a tenant homed in another DC: 39662.
+//!   stream leaves out events stamped before `T`. A Galera cluster's index
+//!   keeps its shared GTID domain. A tenant homed in another DC starts
+//!   from the time index there (the relay), and this gateway leaves out
+//!   the relayed events stamped before `T`. Older than the index or than
+//!   the tenant's last move: 286; a cluster without an index (a Galera
+//!   cluster without `wsrep_gtid_mode`, or not written yet): 39802.
 //!
 //! Not built: `shardCollection` events, and the k-way merge across clusters
 //! (a tenant lives on one cluster at a time).
@@ -878,6 +881,29 @@ impl ChangeFeed {
             Some(Bson::Timestamp(t)) => (u64::from(t.time) << 32) | u64::from(t.increment),
             _ => 0,
         };
+        // A tenant homed in another DC: its home's reader tails it (from
+        // the time index there, for `startAtOperationTime`), and the items
+        // are rendered here, those stamped before the time left out.
+        if let Some(svc) = &self.relay
+            && let Some(home) = super::feed_relay::remote_home(svc, tenant)
+                .await
+                .map_err(|e| feed_error(&e))?
+        {
+            let after = match resume {
+                Some(Bson::Timestamp(_)) | None => None,
+                Some(v) => Some(parse_token(v, tenant)?),
+            };
+            let (token, rx) = super::feed_relay::open(svc, &home, tenant, after.as_ref(), from)
+                .await
+                .map_err(|e| feed_error(&e))?;
+            let first = after.as_ref().map(ResumeToken::to_hex);
+            return Ok(Self::stream(
+                Tail::Relayed(rx),
+                spec,
+                first.unwrap_or(token),
+                from,
+            ));
+        }
         let start = match resume {
             Some(Bson::Timestamp(_)) => self.start_at(tenant, from).await?,
             Some(v) => StartAt::After(parse_token(v, tenant)?),
@@ -887,34 +913,6 @@ impl ChangeFeed {
             StartAt::After(t) => Some(t.to_hex()),
             _ => None,
         };
-        // A tenant homed in another DC: its home's reader tails it, and
-        // the items are rendered here.
-        if let Some(svc) = &self.relay
-            && let Some(home) = super::feed_relay::remote_home(svc, tenant)
-                .await
-                .map_err(|e| feed_error(&e))?
-        {
-            if from != 0 {
-                return Err(MongoError::new(
-                    code::SPRIG_DOC_FEATURE_UNSUPPORTED,
-                    "startAtOperationTime for a tenant homed in another data center is not \
-                     supported yet; resume with a token",
-                ));
-            }
-            let after = match &start {
-                StartAt::After(t) => Some(t.clone()),
-                _ => None,
-            };
-            let (token, rx) = super::feed_relay::open(svc, &home, tenant, after.as_ref())
-                .await
-                .map_err(|e| feed_error(&e))?;
-            return Ok(Self::stream(
-                Tail::Relayed(rx),
-                spec,
-                first.unwrap_or(token),
-                0,
-            ));
-        }
         let tail = TenantTail::start(
             tenant,
             start,
@@ -972,7 +970,7 @@ impl ChangeFeed {
                 "startAtOperationTime needs the tenant services; resume with a token",
             ));
         };
-        crate::http::changes::start_at(svc, &self.placement, tenant, hlc)
+        crate::http::changes::start_at(svc, &self.clusters, &self.placement, tenant, hlc)
             .await
             .map_err(|e| feed_error(&e))
     }
