@@ -81,27 +81,27 @@ struct Key {
 impl Key {
     fn new() -> Self {
         let rng = SystemRandom::new();
-        let a = &signature::ECDSA_P256_SHA256_FIXED_SIGNING;
-        let der = EcdsaKeyPair::generate_pkcs8(a, &rng).unwrap();
+        let alg = &signature::ECDSA_P256_SHA256_FIXED_SIGNING;
+        let der = EcdsaKeyPair::generate_pkcs8(alg, &rng).unwrap();
         Self {
-            kp: EcdsaKeyPair::from_pkcs8(a, der.as_ref(), &rng).unwrap(),
+            kp: EcdsaKeyPair::from_pkcs8(alg, der.as_ref(), &rng).unwrap(),
         }
     }
 
     fn jwks(&self) -> String {
-        let p = self.kp.public_key().as_ref();
+        let point = self.kp.public_key().as_ref();
         json!({"keys": [{"kty": "EC", "crv": "P-256", "kid": "cf1", "use": "sig",
-               "x": URL_SAFE_NO_PAD.encode(&p[1..33]), "y": URL_SAFE_NO_PAD.encode(&p[33..65])}]})
+               "x": URL_SAFE_NO_PAD.encode(&point[1..33]), "y": URL_SAFE_NO_PAD.encode(&point[33..65])}]})
         .to_string()
     }
 
     fn sign(&self, iss: &str, user: &str) -> String {
-        let n = now();
+        let at = now();
         let claims = json!({"iss": iss, "aud": AUD, "sub": format!("s-{user}"),
-                            "preferred_username": user, "iat": n, "exp": n + 600});
-        let h =
+                            "preferred_username": user, "iat": at, "exp": at + 600});
+        let header =
             URL_SAFE_NO_PAD.encode(json!({"alg": "ES256", "kid": "cf1", "typ": "JWT"}).to_string());
-        let msg = format!("{h}.{}", URL_SAFE_NO_PAD.encode(claims.to_string()));
+        let msg = format!("{header}.{}", URL_SAFE_NO_PAD.encode(claims.to_string()));
         let sig = self.kp.sign(&SystemRandom::new(), msg.as_bytes()).unwrap();
         format!("{msg}.{}", URL_SAFE_NO_PAD.encode(sig.as_ref()))
     }
@@ -109,28 +109,28 @@ impl Key {
 
 /// Serves `body` as the key set on 127.0.0.1; its URL.
 async fn serve_jwks(body: String) -> String {
-    let l = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
-    let url = format!("http://{}/jwks", l.local_addr().unwrap());
+    let url = format!("http://{}/jwks", listener.local_addr().unwrap());
     tokio::spawn(async move {
-        while let Ok((mut s, _)) = l.accept().await {
+        while let Ok((mut stream, _)) = listener.accept().await {
             let body = body.clone();
             tokio::spawn(async move {
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 1024];
-                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    match s.read(&mut chunk).await {
+                while !buf.windows(4).any(|end| end == b"\r\n\r\n") {
+                    match stream.read(&mut chunk).await {
                         Ok(0) | Err(_) => return,
-                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        Ok(got) => buf.extend_from_slice(&chunk[..got]),
                     }
                 }
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 );
-                let _ = s.write_all(resp.as_bytes()).await;
-                let _ = s.shutdown().await;
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.shutdown().await;
             });
         }
     });
@@ -145,22 +145,22 @@ async fn http(
     headers: &[(&str, &str)],
     body: &str,
 ) -> (u16, String) {
-    let mut h = String::new();
-    for (k, v) in headers {
-        let _ = write!(h, "{k}: {v}\r\n");
+    let mut lines = String::new();
+    for (name, value) in headers {
+        let _ = write!(lines, "{name}: {value}\r\n");
     }
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{h}Content-Type: application/json\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{lines}Content-Type: application/json\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let mut out = Vec::new();
-    let r = async {
-        let mut s = TcpStream::connect(addr).await?;
-        s.write_all(req.as_bytes()).await?;
-        s.read_to_end(&mut out).await
+    let exchange = async {
+        let mut stream = TcpStream::connect(addr).await?;
+        stream.write_all(req.as_bytes()).await?;
+        stream.read_to_end(&mut out).await
     };
-    if tokio::time::timeout(Duration::from_secs(20), r)
+    if tokio::time::timeout(Duration::from_secs(20), exchange)
         .await
         .is_err()
     {
@@ -170,11 +170,11 @@ async fn http(
     let status = text
         .split_whitespace()
         .nth(1)
-        .and_then(|s| s.parse().ok())
+        .and_then(|code| code.parse().ok())
         .unwrap_or(0);
     let body = text
         .split_once("\r\n\r\n")
-        .map_or(String::new(), |(_, b)| b.to_owned());
+        .map_or(String::new(), |(_, rest)| rest.to_owned());
     (status, body)
 }
 
@@ -182,7 +182,7 @@ async fn http(
 async fn call(addr: &str, path: &str, token: &str, body: &Value) -> (u16, Value, String) {
     let tenant = var("SPRIG_TEST_CF_TENANT", "cf");
     let auth = format!("Bearer {token}");
-    let (st, b) = http(
+    let (st, raw) = http(
         addr,
         "POST",
         path,
@@ -190,20 +190,20 @@ async fn call(addr: &str, path: &str, token: &str, body: &Value) -> (u16, Value,
         &body.to_string(),
     )
     .await;
-    let v = serde_json::from_str(&b).unwrap_or(Value::Null);
-    (st, v, b)
+    let reply = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    (st, reply, raw)
 }
 
 /// The first column of a page's rows, as numbers.
-fn ids(v: &Value) -> Vec<i64> {
-    v["rows"]
+fn ids(page: &Value) -> Vec<i64> {
+    page["rows"]
         .as_array()
         .map(|rows| {
             rows.iter()
-                .filter_map(|r| {
-                    let c = r.as_array().map_or(r, |a| &a[0]);
-                    c.as_i64()
-                        .or_else(|| c.as_str().and_then(|s| s.parse().ok()))
+                .filter_map(|row| {
+                    let cell = row.as_array().map_or(row, |cells| &cells[0]);
+                    cell.as_i64()
+                        .or_else(|| cell.as_str().and_then(|text| text.parse().ok()))
                 })
                 .collect()
         })
@@ -211,11 +211,11 @@ fn ids(v: &Value) -> Vec<i64> {
 }
 
 async fn forwarded_total(telemetry: Option<&str>) -> Option<f64> {
-    let (_, b) = http(telemetry?, "GET", "/metrics", &[], "").await;
+    let (_, text) = http(telemetry?, "GET", "/metrics", &[], "").await;
     Some(
-        b.lines()
-            .filter(|l| l.starts_with("sprig_studio_cursors_forwarded_total"))
-            .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+        text.lines()
+            .filter(|line| line.starts_with("sprig_studio_cursors_forwarded_total"))
+            .filter_map(|line| line.rsplit(' ').next()?.parse::<f64>().ok())
             .sum(),
     )
 }
