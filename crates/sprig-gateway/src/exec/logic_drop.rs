@@ -14,18 +14,27 @@
 //! the catalog: dropped, versions retired, rollout ended, index entries
 //! ```
 //!
-//! `ALTER TRIGGER [db.]name DISABLE | ENABLE | ROLLOUT ...` of a trigger on a stream or
-//! a queue (the rights `DROP TRIGGER` needs):
+//! `ALTER TRIGGER [db.]name DISABLE | ENABLE | ROLLOUT ...` of a trigger on a stream,
+//! a queue or a table (after-commit), with the rights `DROP TRIGGER` needs:
 //!
 //! ```text
-//! DISABLE: the module disabled, its index entry removed; the running job
-//!   ends at its next check of the module (5 s), and the stream's consumer
-//!   group, or the queue's messages, keep the position
-//! ENABLE: the module active, the index entry back: a job starts there
+//! on a stream or a queue:
+//!   DISABLE: the module disabled, its index entry removed; the running job
+//!     ends at its next check of the module (5 s), and the stream's consumer
+//!     group, or the queue's messages, keep the position
+//!   ENABLE: the module active, the index entry back: a job starts there
+//! after-commit:
+//!   DISABLE: the module disabled, its feed subscription paused; the running
+//!     job ends at its next check of the module (5 s), and the controller
+//!     starts none while the subscription is paused; the checkpoint stays
+//!   ENABLE: the module active, the subscription active: a job resumes at
+//!     the checkpoint, so changes committed meanwhile run then, each once
+//!     (the markers stop a change the old job ran after its last
+//!     acknowledgement)
 //! ```
 //!
-//! An after-commit trigger is 39862, as is an inherited trigger's instance
-//! (`ALTER INHERITED TRIGGER` owns those).
+//! An inherited trigger's instance is 39862 (`ALTER INHERITED TRIGGER`
+//! owns those).
 //!
 //! `SHOW DEPENDENTS OF FUNCTION | PROCEDURE [db.]name` answers what
 //! the drop would find, as rows (`Kind`, `Name`, `Cascade`, `Detail`), so
@@ -355,6 +364,7 @@ impl PassSession {
 
     /// Disables or enables a trigger on a stream or a queue (see the
     /// module docs). The same rights as `DROP TRIGGER`.
+    #[allow(clippy::too_many_lines)] // the checks, then one arm per kind of trigger
     async fn logic_toggle(&mut self, a: &AlterTrigger) -> Result<Vec<String>> {
         let current = self.current_logical();
         let Some(ts) = self.tenant.as_deref_mut() else {
@@ -416,6 +426,40 @@ impl PassSession {
             let at = (tenant.0, m.module_id);
             return alter_rollout(&mut conn, &schema, at, a, op, catalog.version, &who).await;
         }
+        let binding = store.binding(&mut conn, m.module_id).await?;
+        if let Some(b) = binding.as_ref().filter(|b| b.timing == "after_commit") {
+            let dc = svc.locator.dc_store();
+            let changed = after_commit_toggle(&mut conn, &store, &dc, tenant, b, &m, a).await?;
+            let state = if a.enable { "enabled" } else { "disabled" };
+            let note = if changed {
+                if let Err(e) = store
+                    .log(
+                        &mut conn,
+                        m.module_id,
+                        m.active_version,
+                        "info",
+                        "deploy",
+                        &format!("{state} by {who}"),
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "logic_log line not written");
+                }
+                format!(
+                    "after-commit trigger {} {state}{}",
+                    a.name,
+                    if a.enable {
+                        "; it resumes from where it stopped, and changes committed meanwhile run now"
+                    } else {
+                        "; its job ends within 5 s and its position is kept"
+                    }
+                )
+            } else {
+                format!("trigger {} was already {state}", a.name)
+            };
+            tracing::info!(%tenant, binding = b.binding_id, trigger = %a.name, state, "after-commit trigger altered");
+            return Ok(vec![note]);
+        }
         let (b, src) = message_source(&mut conn, &store, &schema, &catalog, a, m.module_id).await?;
         let changed = store
             .set_module_state(&mut conn, m.module_id, a.enable)
@@ -434,7 +478,7 @@ impl PassSession {
                     m.module_id,
                     m.active_version,
                     "info",
-                    "alter",
+                    "deploy",
                     &format!("{state} by {who}"),
                 )
                 .await
@@ -667,6 +711,34 @@ async fn set_indexed(
     Ok(())
 }
 
+/// `ALTER TRIGGER ... DISABLE | ENABLE` of an after-commit trigger: the
+/// module's state and its feed subscription's (`logic:b<binding>`), in the
+/// order that never leaves a job running for a disabled module: `DISABLE`
+/// pauses the subscription first (the controller starts no new job), then
+/// disables the module (the running job ends at its next check);
+/// `ENABLE` makes the module active first, then the subscription (a job
+/// starts at the checkpoint). Whether the module's state changed.
+async fn after_commit_toggle(
+    conn: &mut mysql_async::Conn,
+    store: &sprig_logic::LogicStore,
+    dc: &Arc<dyn sprig_meta::MetaStore>,
+    tenant: sprig_common::ids::TenantId,
+    b: &sprig_logic::catalog::BindingRow,
+    m: &ModuleRow,
+    a: &AlterTrigger,
+) -> Result<bool> {
+    let subs = sprig_feed::subs::Subscriptions::new(Arc::clone(dc));
+    let name = sprig_logic::triggers::subscription_name(b.binding_id);
+    if a.enable {
+        let changed = store.set_module_state(conn, m.module_id, true).await?;
+        subs.set_state(tenant, &name, "active").await?;
+        Ok(changed)
+    } else {
+        subs.set_state(tenant, &name, "paused").await?;
+        store.set_module_state(conn, m.module_id, false).await
+    }
+}
+
 /// `ALTER TRIGGER`'s rights: those `DROP TRIGGER` needs (`ALTER ROUTINE`,
 /// `CREATE ROUTINE` or `TRIGGER` on the database), else 1044.
 fn may_alter_trigger(
@@ -696,8 +768,9 @@ fn may_alter_trigger(
 }
 
 /// The binding and source row of trigger module `module_id`, which must be
-/// on a stream or a queue (39862 otherwise) and not an inherited trigger's
-/// instance (its definition's overrides would undo the change: 39862).
+/// on a stream or a queue (39862 otherwise; after-commit triggers are
+/// handled before) and not an inherited trigger's instance (its
+/// definition's overrides would undo the change: 39862).
 async fn message_source(
     conn: &mut mysql_async::Conn,
     store: &sprig_logic::LogicStore,
@@ -711,8 +784,8 @@ async fn message_source(
         return Err(SprigError::new(
             SprigCode::LogicUnsupported,
             format!(
-                "trigger {} isn't on a stream or a queue: ALTER TRIGGER ... DISABLE | ENABLE \
-                 applies to triggers on streams and queues",
+                "trigger {} isn't on a stream, a queue or a table: ALTER TRIGGER ... DISABLE | \
+                 ENABLE applies to triggers",
                 a.name
             ),
         ));

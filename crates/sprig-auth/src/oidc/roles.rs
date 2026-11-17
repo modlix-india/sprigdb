@@ -158,7 +158,7 @@ pub fn audit_login(
 ) -> Option<AuditEvent> {
     // A catalog without the authorization module has no roles to take.
     let Some(state) = AuthzState::of(cat).filter(|s| s.is_migrated()) else {
-        success.detail = Some(format!("issuer {}", token.issuer));
+        success.detail = Some(token.login_detail());
         return None;
     };
     let unknown = of_names(state, &token.roles).1;
@@ -169,11 +169,11 @@ pub fn audit_login(
         .map(String::as_str)
         .collect();
     success.detail = Some(if defined.is_empty() {
-        format!("issuer {}", token.issuer)
+        token.login_detail()
     } else {
         format!(
-            "issuer {}; token roles {}",
-            token.issuer,
+            "{}; token roles {}",
+            token.login_detail(),
             defined.join(", ")
         )
     });

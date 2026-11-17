@@ -127,7 +127,10 @@ async fn forward(
         .forward(
             &h.gateway_id,
             ForwardRequest {
-                authorization: caller.authorization.clone().unwrap_or_default(),
+                authorization: super::auth::forwarded_authorization(
+                    caller.authorization.as_deref(),
+                    &caller.principal,
+                ),
                 method: rpc.to_owned(),
                 request_json: request.to_string(),
                 client_addr: caller.peer.to_string(),

@@ -21,9 +21,11 @@
 //! The protocols ([`TokenProtocol`]): MySQL and MariaDB take the token as
 //! the clear-text password of an account with the `token` method (the
 //! login name names the account, and the token must map to it); Redis the
-//! same in `AUTH`; HTTP and gRPC as `Authorization: Bearer`, where the
-//! mapping names the account (created when the issuer has `jit_users`);
-//! MongoDB as `MONGODB-OIDC`, like HTTP.
+//! same in `AUTH` and in an HTTP `Basic` password; HTTP and gRPC as
+//! `Authorization: Bearer`, where the mapping names the account (created
+//! when the issuer has `jit_users`); MongoDB as `MONGODB-OIDC`, like HTTP.
+//! An `end_user_layer` issuer never creates accounts: its tokens are end
+//! users' and log in as the service account its mapping names.
 //!
 //! The verified claims become the session's `SPRIG_CLAIM()` values,
 //! unchanged.
@@ -221,6 +223,27 @@ pub struct VerifiedToken {
     pub expires: SystemTime,
 }
 
+impl VerifiedToken {
+    /// The detail of a token login's `auth.login_succeeded`: the issuer,
+    /// and for an end-user layer's token the end user (`sub`), since many
+    /// end users share one service account.
+    #[must_use]
+    pub fn login_detail(&self) -> String {
+        let sub = self
+            .claims
+            .get("sub")
+            .and_then(Value::as_str)
+            .filter(|_| self.kind == IssuerKind::EndUserLayer);
+        match sub {
+            Some(s) => {
+                let s: String = s.chars().take(255).collect();
+                format!("issuer {}; end user {s}", self.issuer)
+            }
+            None => format!("issuer {}", self.issuer),
+        }
+    }
+}
+
 /// What a verification runs against.
 #[derive(Debug, Clone, Copy)]
 pub struct Check<'a> {
@@ -414,7 +437,9 @@ impl ExternalTokens {
             issuer_id: issuer.spec.issuer_id.unwrap_or(0),
             issuer: issuer.spec.issuer.clone(),
             kind: issuer.spec.kind,
-            jit_users: issuer.spec.jit_users,
+            // An end-user layer's tokens are its end users': they never
+            // become accounts, whatever a stored row says.
+            jit_users: issuer.spec.jit_users && issuer.spec.kind == IssuerKind::Oidc,
             claims: Arc::new(jws.claims),
             user: m.user,
             roles: m.roles,

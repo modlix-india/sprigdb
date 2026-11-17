@@ -8,6 +8,7 @@
 //! | `Authorization` | Check |
 //! |---|---|
 //! | `Basic` base64(`user:password`) | Like Redis `AUTH`: the fast cache (`SHA256(SHA256(password))`), else the `caching_sha2_password` verifiers on a hashing slot; then the MySQL login's policy order (temporary lock, credentials, suspension, `ACCOUNT LOCK`, TLS requirement, expiry: HTTP has no sandbox mode, so an expired password is refused with 1862) |
+//! | `Basic` base64(`user:<JWT>`) | For an account with the `token` method, a password shaped like a JWT is an issuer's token, checked as a MySQL login's is (never through the fast cache): the issuer must take `http`, and its user mapping must name this account. [`HttpAuth::authenticate_login`] returns the token, so its claims reach the request's session as a bearer token's do |
 //! | `Bearer sprig_<tenant>_<key_id>_<secret>` | API key ([`crate::apikey`]): checked in a DC the tenant's residency allows (handed off from any other, 39302 with `deny_remote_access`); `SHA256(secret)` in constant time; revocation, expiry, `allowed_cidrs`; the user live, with the `api_key` method; temporary lock, `ACCOUNT LOCK`, TLS requirement, suspension |
 //! | `Bearer` an issuer's JWT | [`crate::oidc`]: the tenant from the `Host` header (or TLS SNI) under `listener.tenant_sni_suffixes`, else `x-sprig-tenant`, else 39786; the token verified against the tenant's issuers for `http`; its user mapping names the account (created when the issuer has `jit_users`); the account's `token` method, temporary lock, suspension, `ACCOUNT LOCK` and TLS requirement |
 //! | `Bearer` anything else | 401 (SprigDB session tokens are checked by the HTTP front end) |
@@ -79,6 +80,18 @@ impl std::fmt::Debug for HttpRequest<'_> {
             .field("tls", &self.tls)
             .finish_non_exhaustive()
     }
+}
+
+/// An accepted request: who sent it, and the issuer's token its `Basic`
+/// password was, when it was verified as one (an account with the `token`
+/// method; never a password that only looks like a token).
+#[derive(Debug, Clone)]
+pub struct HttpLogin {
+    /// Who sent the request.
+    pub principal: Principal,
+    /// The verified token a `Basic` password carried: its claims are the
+    /// request's `SPRIG_CLAIM()` values, as a bearer token's are.
+    pub basic_token: Option<String>,
 }
 
 /// A refused request: what to answer.
@@ -202,6 +215,24 @@ impl HttpAuth {
     /// [`HttpAuthError`]: 401 (1045, 3118, 3955, 1862), 403 (39303), 429
     /// (39300), 500 (39998), 503 (39301).
     pub async fn authenticate(&self, req: &HttpRequest<'_>) -> Result<Principal, HttpAuthError> {
+        self.authenticate_login(req).await.map(|l| l.principal)
+    }
+
+    /// [`Self::authenticate`], with the issuer's token a `Basic` password
+    /// was verified as.
+    ///
+    /// # Errors
+    /// As [`Self::authenticate`].
+    pub async fn authenticate_login(
+        &self,
+        req: &HttpRequest<'_>,
+    ) -> Result<HttpLogin, HttpAuthError> {
+        let plain = |r: Result<Principal, HttpAuthError>| {
+            r.map(|principal| HttpLogin {
+                principal,
+                basic_token: None,
+            })
+        };
         if let Err(e) = self.svc.admit(req.client_ip) {
             let mut err = HttpAuthError::from_error(&e);
             err.retry_after = self
@@ -216,9 +247,9 @@ impl HttpAuth {
         };
         match parse_authorization(h) {
             Some(Credential::Basic { user, password }) => self.basic(req, &user, &password).await,
-            Some(Credential::ApiKey(k)) => self.api_key(req, &k).await,
+            Some(Credential::ApiKey(k)) => plain(self.api_key(req, &k).await),
             Some(Credential::OtherBearer(t)) if crate::oidc::Jws::looks_like(t.as_bytes()) => {
-                self.bearer_token(req, &t).await
+                plain(self.bearer_token(req, &t).await)
             }
             Some(Credential::OtherBearer(_)) | None => {
                 self.refuse_unparsed(req);
@@ -246,13 +277,17 @@ impl HttpAuth {
         req: &HttpRequest<'_>,
         user: &str,
         password: &[u8],
-    ) -> Result<Principal, HttpAuthError> {
+    ) -> Result<HttpLogin, HttpAuthError> {
         let host = req
             .sni
             .or(req.host)
             .map(|h| h.rsplit_once(':').map_or(h, |(name, _)| name).to_owned());
+        // `x-sprig-tenant` names the tenant unless the host does: a `Host`
+        // header that names no tenant (an address, say) doesn't stop it,
+        // and every HTTP/1.1 request has one.
+        let host_names_tenant = self.svc.tenant_named(None, host.as_deref()).is_some();
         let login_name = match req.tenant_header {
-            Some(t) if host.is_none() && !t.is_empty() => format!("{t}.{user}"),
+            Some(t) if !host_names_tenant && !t.is_empty() => format!("{t}.{user}"),
             _ => user.to_owned(),
         };
         // Residency: a tenant pinned elsewhere is decided in
@@ -270,7 +305,14 @@ impl HttpAuth {
                 can_handle_expired_password: false,
             })
             .await;
-        let (outcome, path) = if login.check_clear_fast(password) {
+        // A password shaped like a JWT is an issuer's token for an account
+        // with the `token` method (as over MySQL and Redis); it never takes
+        // the fast path, so only a verified token gives claims.
+        let token_shaped = crate::oidc::Jws::looks_like(password);
+        if token_shaped {
+            login.allow_tokens(crate::oidc::TokenProtocol::Http);
+        }
+        let (outcome, path) = if !token_shaped && login.check_clear_fast(password) {
             (Outcome::Verified, AuthPath::Fast)
         } else if login
             .check_password(Zeroizing::new(password.to_vec()))
@@ -281,10 +323,19 @@ impl HttpAuth {
             (Outcome::WrongCredentials, AuthPath::Full)
         };
         match login.decide(outcome, path).await {
-            AuthVerdict::Accept => login
-                .principal()
-                .cloned()
-                .ok_or_else(|| HttpAuthError::from_error(&SprigError::internal("no principal"))),
+            AuthVerdict::Accept => {
+                let principal = login.principal().cloned().ok_or_else(|| {
+                    HttpAuthError::from_error(&SprigError::internal("no principal"))
+                })?;
+                let basic_token = login
+                    .token()
+                    .and_then(|_| std::str::from_utf8(password).ok())
+                    .map(str::to_owned);
+                Ok(HttpLogin {
+                    principal,
+                    basic_token,
+                })
+            }
             AuthVerdict::Refuse(p) => Err(HttpAuthError::from_packet(p)),
         }
     }

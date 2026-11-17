@@ -650,22 +650,24 @@ impl PassSession {
         Ok(affected)
     }
 
-    /// `COM_STMT_PREPARE` of a publish into one of the tenant's streams:
-    /// kept as text and run at each execute with the bound values written
-    /// in as literals, so the stream layer measures every record as it
-    /// does for a text statement. `None` for any other statement.
-    pub(super) fn streams_prepare(
-        &mut self,
-        sql: &Bytes,
-        charset: u16,
-    ) -> Option<crate::pipeline::ExecSummary> {
-        let ts = self.tenant.as_deref()?;
+    /// Whether `sql` publishes into one of the tenant's streams (an
+    /// `INSERT` into a stream, which MariaDB itself can't prepare: the
+    /// stream is no table of its own). Never for the gateway's own
+    /// statements or a session that must change its password.
+    pub(super) fn stream_publish(&self, sql: &[u8]) -> bool {
+        let Some(ts) = self.tenant.as_deref() else {
+            return false;
+        };
         if ts.types.internal || ts.principal.must_change_password {
-            return None;
+            return false;
         }
-        let cat = Arc::clone(ts.catalog()?);
+        let Some(cat) = ts.catalog().map(Arc::clone) else {
+            return false;
+        };
         let (state, _) = state_of(&cat);
-        let text = std::str::from_utf8(sql).ok()?;
+        let Ok(text) = std::str::from_utf8(sql) else {
+            return false;
+        };
         let lctn = ts.lower_case_table_names();
         let current = self.current_logical();
         let (lex, _) = self.lex_opts();
@@ -677,9 +679,22 @@ impl PassSession {
             mysql: false,
         };
         let db_id = |n: &str| cat.database(&database_key(n, lctn)).map(|d| d.db_id);
-        if !sprig_streams::sql::publishes(text, &ctx, &db_id) {
+        sprig_streams::sql::publishes(text, &ctx, &db_id)
+    }
+
+    /// `COM_STMT_PREPARE` of a publish into one of the tenant's streams:
+    /// kept as text and run at each execute with the bound values written
+    /// in as literals, so the stream layer measures every record as it
+    /// does for a text statement. `None` for any other statement.
+    pub(super) fn streams_prepare(
+        &mut self,
+        sql: &Bytes,
+        charset: u16,
+    ) -> Option<crate::pipeline::ExecSummary> {
+        if !self.stream_publish(sql) {
             return None;
         }
+        let (lex, _) = self.lex_opts();
         let params = sprig_sql::lex::lex(sql, &lex)
             .map(|t| {
                 t.iter()

@@ -379,6 +379,12 @@ impl SessionGrants for CompiledPrivileges {
         let Target::Object { object, .. } = table else {
             return None;
         };
+        // `DROP TABLE` and `TRUNCATE` (the DROP privilege) read no row and
+        // say nothing of hidden ones: they take the table whole, as in
+        // PostgreSQL, where neither is subject to row-level security.
+        if action == Action::Drop {
+            return None;
+        }
         let t = self.rls.tables.get(&object)?;
         let bit = match action {
             Action::Insert => super::rls::cmd::INSERT,

@@ -61,7 +61,8 @@ pub enum TokenProtocol {
     Mongodb,
     /// Redis: the token as `AUTH`'s password.
     Redis,
-    /// HTTP and gRPC: `Authorization: Bearer`.
+    /// HTTP and gRPC: `Authorization: Bearer`, or the `Basic` password of
+    /// an account with the `token` method.
     Http,
 }
 
@@ -98,7 +99,9 @@ pub enum IssuerKind {
     #[default]
     Oidc,
     /// The pluggable end-user layer: its tokens map to a service account
-    /// per application, and their claims reach row-level security.
+    /// per application, and their claims reach row-level security. It
+    /// never creates accounts (`jit_users` is refused), and a login's audit
+    /// names the end user (`sub`).
     EndUserLayer,
 }
 
@@ -223,7 +226,8 @@ impl IssuerSpec {
     /// 39998 naming the first problem: an empty or long issuer, a URL that
     /// isn't `https://` (or `http://` to a loopback address), no audience,
     /// an algorithm SprigDB doesn't verify (`none`, HMAC), no protocol, a
-    /// lifetime of 0, a bad mapping (an empty claim or target, a value
+    /// lifetime of 0, `jit_users` on an `end_user_layer` issuer, a bad
+    /// mapping (an empty claim or target, a value
     /// missing or present against its match kind, a regular expression that
     /// doesn't compile).
     pub fn validate(&self) -> Result<()> {
@@ -256,6 +260,12 @@ impl IssuerSpec {
         }
         if self.protocols.is_empty() {
             return Err(invalid("protocols: at least one"));
+        }
+        if self.kind == IssuerKind::EndUserLayer && self.jit_users {
+            return Err(invalid(
+                "an end_user_layer issuer's tokens are end users': they log in as the service \
+                 account a user mapping names, so jit_users must be false",
+            ));
         }
         if self.max_lifetime_s == 0 {
             return Err(invalid("max_lifetime_s must be above 0"));

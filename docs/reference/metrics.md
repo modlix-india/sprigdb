@@ -9,7 +9,7 @@ source: the metric macros in the source tree, and docs/metrics-help.toml
 
 Every metric SprigDB records, as exported on each process's telemetry port (`/metrics`, Prometheus text) and through OTLP. Counters end in `_total`; durations are histograms in seconds.
 
-521 metrics in 55 groups.
+522 metrics in 55 groups.
 
 ## `sprig_advisor_*`
 
@@ -163,7 +163,7 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 
 | Metric | Type | Labels | Recorded by | Description |
 |---|---|---|---|---|
-| `sprig_backup_last_success_timestamp_seconds` | gauge | `cluster`, `kind` | sprig-controller | When the newest successful backup of each cluster finished, as the backup tool or the Kubernetes operator recorded it; the controllers read the records once a minute and the `BackupMissed` alert watches this gauge. `cluster` is the cluster, `kind` the backup kind, such as `full`. Unit: Unix time in seconds. |
+| `sprig_backup_last_success_timestamp_seconds` | gauge | `cluster`, `kind` | sprig-controller, sprig-operator | When the newest successful backup of each cluster finished, as the backup tool or the Kubernetes operator recorded it; the controllers read the records once a minute and the `BackupMissed` alert watches this gauge. `cluster` is the cluster, `kind` the backup kind, such as `full`. Unit: Unix time in seconds. |
 
 ## `sprig_balancer_*`
 
@@ -216,10 +216,10 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | Metric | Type | Labels | Recorded by | Description |
 |---|---|---|---|---|
 | `sprig_cluster_capability_changes_total` | counter | `cluster`, `dc`, `direction`, `field` | sprig-controller | Changes in a cluster's capability profile seen by the probes; `dc` and `cluster` identify it, `field` is the capability, `direction` `upgrade`, `downgrade` or `changed`. Unit: count. |
-| `sprig_cluster_health_state` | gauge | - | sprig-controller | Health of each cluster as the controller's monitor judges it: 0 healthy, 1 degraded, 2 no writer, 3 unknown. Labelled by `dc` and `cluster`. Unit: state code. |
-| `sprig_cluster_probe_duration_seconds` | histogram | `probe` | sprig-cluster, sprig-controller | Duration of cluster probes; `probe` is the probe (`binlog_dump` for the binlog check), others are labelled by `dc` and `cluster`. Unit: seconds. |
+| `sprig_cluster_health_state` | gauge | `cluster`, `dc` | sprig-controller | Health of each cluster as the controller's monitor judges it: 0 healthy, 1 degraded, 2 no writer, 3 unknown. Labelled by `dc` and `cluster`. Unit: state code. |
+| `sprig_cluster_probe_duration_seconds` | histogram | `cluster`, `dc`, `probe` | sprig-cluster, sprig-controller | Duration of cluster probes; `probe` is the probe (`binlog_dump` for the binlog check), others are labelled by `dc` and `cluster`. Unit: seconds. |
 | `sprig_cluster_probe_failures_total` | counter | `cluster`, `dc`, `node`, `probe` | sprig-cluster, sprig-controller | Failed cluster probes; `dc`, `cluster` and `node` identify the node, `probe` the check that failed. Unit: count. |
-| `sprig_cluster_semi_sync_status` | gauge | - | sprig-controller | Whether semi-synchronous replication is active on the cluster's writer; labelled by `dc` and `cluster`. Unit: 0 or 1. |
+| `sprig_cluster_semi_sync_status` | gauge | `cluster`, `dc` | sprig-controller | Whether semi-synchronous replication is active on the cluster's writer; labelled by `dc` and `cluster`. Unit: 0 or 1. |
 
 ## `sprig_controller_*`
 
@@ -360,6 +360,7 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_gateway_recovery_fenced_writes_total` | counter | - | sprig-gateway | Writes refused with `ER_SPRIG_RECOVERY_FENCED` because the tenant's copy here is fenced after a failover. Unit: count. |
 | `sprig_gateway_remote_home_statements_total` | counter | `home_dc` | sprig-gateway | Statements this gateway served for tenants homed in another data centre; `home_dc` is that data centre. Unit: count. |
 | `sprig_gateway_runtime_stalls_total` | counter | - | sprig-gateway | Times the watchdog found the gateway's async runtime stuck for twice `failover.watchdog_ms`. Unit: count. |
+| `sprig_gateway_session_panics_total` | counter | `protocol` | sprig-gateway | Client session tasks that panicked; the gateway logs the panic and closes that connection. `protocol` is `mysql`, `mariadb`, `mongo`, `redis`, `http`, `bolt`, `kafka` or `amqp`. Should stay at 0. Unit: count. |
 | `sprig_gateway_shed_requests_total` | counter | - | sprig-gateway | Requests moved to a blocking thread after using 100 ms of an async worker. Unit: count. |
 | `sprig_gateway_stall_kills_total` | counter | - | sprig-gateway | Statements stopped because they held an async worker while the runtime was stuck. Unit: count. |
 | `sprig_gateway_statements_total` | counter | `protocol`, `result`, `tenant` | sprig-gateway | Statements the gateway finished; `protocol` is the front end, `result` is `ok`, `client` (the application's error), `sprig` (SprigDB's error) or `backend` (MariaDB unreachable or failed), `tenant` the tenant id for busy tenants. Unit: count. |

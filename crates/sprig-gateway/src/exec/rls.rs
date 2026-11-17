@@ -100,6 +100,112 @@ type RefusedNames = (
     Vec<crate::tenant::rls::TaintedCode>,
 );
 
+/// Whether `SHOW INDEX` or `SHOW TABLE STATUS` in words `w` reaches one
+/// of the `protected` tables (database, table): `SHOW INDEX FROM t [FROM
+/// db]` (or `db.t`) names one; `SHOW TABLE STATUS [FROM db] [LIKE 'p']`
+/// lists a database holding one (that the pattern matches; with `WHERE`,
+/// any). Names compare without case, so a doubt refuses. `false` for any
+/// other statement, and when no database is known (MariaDB answers 1046).
+fn show_counts_hidden(
+    w: &[(TokenKind, String)],
+    current: Option<&str>,
+    protected: &[(String, String)],
+) -> bool {
+    let up = |i: usize| {
+        w.get(i)
+            .filter(|(k, _)| *k == TokenKind::Word)
+            .map(|(_, v)| v.to_ascii_uppercase())
+            .unwrap_or_default()
+    };
+    let ident = |i: usize| {
+        w.get(i)
+            .filter(|(k, _)| matches!(k, TokenKind::Word | TokenKind::QuotedIdent))
+            .map(|(_, v)| v.clone())
+    };
+    let is_from = |i: usize| matches!(up(i).as_str(), "FROM" | "IN");
+    let same = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    if up(0) != "SHOW" {
+        return false;
+    }
+    if up(1) == "TABLE" && up(2) == "STATUS" {
+        let (db, mut i) = if is_from(3) {
+            (ident(4), 5)
+        } else {
+            (current.map(str::to_owned), 3)
+        };
+        let Some(db) = db else {
+            return false;
+        };
+        let pattern = if up(i) == "LIKE" {
+            i += 1;
+            w.get(i)
+                .filter(|(k, _)| *k == TokenKind::String)
+                .map(|(_, v)| unquote(v))
+        } else {
+            None
+        };
+        return protected
+            .iter()
+            .any(|(d, t)| same(d, &db) && pattern.as_deref().is_none_or(|p| like_matches(p, t)));
+    }
+    let at = if matches!(up(1).as_str(), "INDEX" | "INDEXES" | "KEYS") {
+        1
+    } else if matches!(up(2).as_str(), "INDEX" | "INDEXES" | "KEYS") {
+        2
+    } else {
+        return false;
+    };
+    if !is_from(at + 1) {
+        return false;
+    }
+    let Some(first) = ident(at + 2) else {
+        return false;
+    };
+    let dotted = w.get(at + 3).is_some_and(|(_, v)| v == ".");
+    let (mut db, table, next) = if dotted {
+        (Some(first), ident(at + 4), at + 5)
+    } else {
+        (None, Some(first), at + 3)
+    };
+    if is_from(next) {
+        db = ident(next + 1).or(db);
+    }
+    let (Some(db), Some(table)) = (db.or_else(|| current.map(str::to_owned)), table) else {
+        return false;
+    };
+    protected
+        .iter()
+        .any(|(d, t)| same(d, &db) && same(t, &table))
+}
+
+/// A string literal's text without its quotes (no escapes beyond doubled
+/// quotes and backslashes, enough for a `LIKE` pattern).
+fn unquote(v: &str) -> String {
+    let inner = v
+        .strip_prefix(['\'', '"'])
+        .and_then(|x| x.strip_suffix(['\'', '"']))
+        .unwrap_or(v);
+    inner.replace("''", "'").replace("\\\\", "\\")
+}
+
+/// SQL `LIKE` without case: `%` any run, `_` one character, `\` escapes.
+fn like_matches(pattern: &str, s: &str) -> bool {
+    fn go(p: &[char], s: &[char]) -> bool {
+        match p.first() {
+            None => s.is_empty(),
+            Some('%') => (0..=s.len()).any(|i| go(&p[1..], &s[i..])),
+            Some('_') => !s.is_empty() && go(&p[1..], &s[1..]),
+            Some('\\') if p.len() > 1 => {
+                !s.is_empty() && s[0].eq_ignore_ascii_case(&p[1]) && go(&p[2..], &s[1..])
+            }
+            Some(c) => !s.is_empty() && s[0].eq_ignore_ascii_case(c) && go(&p[1..], &s[1..]),
+        }
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let s: Vec<char> = s.chars().collect();
+    go(&p, &s)
+}
+
 /// Whether words `w` name one of `names` (lower case): as an identifier,
 /// or inside a string (the text of `PREPARE ... FROM '...'`).
 fn names_any(w: &[(TokenKind, String)], names: &[String]) -> bool {
@@ -1224,11 +1330,11 @@ impl PassSession {
                 .map(|(_, v)| v.to_ascii_uppercase())
                 .unwrap_or_default()
         };
-        if up(0) == "SHOW"
-            && (up(1) == "TABLE" && up(2) == "STATUS"
-                || matches!(up(1).as_str(), "INDEX" | "INDEXES" | "KEYS")
-                || matches!(up(2).as_str(), "INDEX" | "INDEXES" | "KEYS"))
-        {
+        // Only those that reach a protected table are refused: an index
+        // of another table, or the status of a database without one,
+        // counts no hidden row.
+        let _ = up;
+        if show_counts_hidden(&w, current.as_deref(), &protected_names) {
             return Err(unsupported(
                 "SHOW TABLE STATUS or SHOW INDEX for a session bound by row-level security \
                  (they count hidden rows; information_schema.TABLES and STATISTICS show the \
@@ -2133,6 +2239,32 @@ mod tests {
             Some("create or replace view v as select 1")
         );
         assert_eq!(or_replace("SELECT 1"), None);
+    }
+
+    #[test]
+    fn show_metadata_is_refused_only_for_protected_tables() {
+        let p = vec![("db_x".to_owned(), "notes".to_owned())];
+        let r = |sql: &str, cur: Option<&str>| {
+            show_counts_hidden(&words(sql.as_bytes(), &LexOptions::mariadb()), cur, &p)
+        };
+        // Another database's table, or another table: allowed.
+        assert!(!r("SHOW INDEX FROM fx", Some("db_y")));
+        assert!(!r("SHOW INDEX FROM fx", Some("db_x")));
+        assert!(!r("SHOW TABLE STATUS", Some("db_y")));
+        assert!(!r("SHOW TABLE STATUS FROM db_y", Some("db_x")));
+        assert!(!r("SHOW TABLE STATUS LIKE 'fx%'", Some("db_x")));
+        assert!(!r("SHOW INDEX FROM notes", None));
+        // The protected table, however it is named: refused.
+        assert!(r("SHOW INDEX FROM notes", Some("db_x")));
+        assert!(r("show keys in `Notes` from db_x", Some("db_y")));
+        assert!(r("SHOW INDEXES FROM db_x.notes", None));
+        assert!(r("SHOW EXTENDED INDEX FROM notes IN db_x", None));
+        assert!(r("SHOW TABLE STATUS", Some("db_x")));
+        assert!(r("SHOW TABLE STATUS IN db_x LIKE 'no%'", None));
+        assert!(r("SHOW TABLE STATUS FROM db_x WHERE Name = 'fx'", None));
+        assert!(!r("SELECT 1", Some("db_x")));
+        assert!(like_matches("n_t\\_s", "not_s"));
+        assert!(!like_matches("n_t\\_s", "notes"));
     }
 
     #[test]

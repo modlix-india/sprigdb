@@ -199,7 +199,8 @@ impl Scanner {
                 i += 1;
                 continue;
             };
-            line += b[line_at..i].iter().filter(|&&c| c == b'\n').count();
+            // Both offsets are at a macro's first letter, so on char bounds.
+            line += text[line_at..i].matches('\n').count();
             line_at = i;
             let open = i + mac.len() - 1;
             let close = matching_paren(b, open);
@@ -238,16 +239,14 @@ impl Scanner {
                 metric: metric.map(str::to_owned),
                 expr,
             };
-            let name = match &c.name {
-                Ok(id) => match self.resolve(c, id) {
-                    Some(n) => n,
-                    None => {
-                        unresolved.push(miss(None, id.text()));
-                        continue;
-                    }
-                },
+            let resolved = match &c.name {
+                Ok(id) => self.resolve(c, id).ok_or_else(|| id.text()),
+                Err(expr) => Err(expr.clone()),
+            };
+            let name = match resolved {
+                Ok(n) => n,
                 Err(expr) => {
-                    unresolved.push(miss(None, expr.clone()));
+                    unresolved.push(miss(None, expr));
                     continue;
                 }
             };

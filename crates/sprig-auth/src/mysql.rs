@@ -1805,7 +1805,7 @@ impl MysqlLogin {
                     crate::oidc::roles::audit_login(&mut e, t, &c.catalog)
                 }
                 (Some(t), _) => {
-                    e.detail = Some(format!("issuer {}", t.issuer));
+                    e.detail = Some(t.login_detail());
                     None
                 }
                 (None, _) => None,

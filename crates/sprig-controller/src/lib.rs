@@ -532,6 +532,9 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         dc.clone(),
         read_secret(cfg.controller.approvals_webhook_secret_file.as_deref())?,
     )));
+    // Tenants with no approvals item: the loop skips them until one
+    // changes (this hook) or a recheck is due.
+    let idle_approvals = Arc::new(approvals::IdleTenants::default());
     let approvals = {
         let stores_ = sprig_approvals::LocatorStores::new(Arc::new(locator.clone()))
             .with_dc(dc.clone(), Arc::clone(&stores.dc))
@@ -543,7 +546,8 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
                 )),
                 dc.clone(),
             )))
-            .with_hook(Arc::clone(&notifier) as Arc<dyn sprig_approvals::Hook>);
+            .with_hook(Arc::clone(&notifier) as Arc<dyn sprig_approvals::Hook>)
+            .with_hook(Arc::clone(&idle_approvals) as Arc<dyn sprig_approvals::Hook>);
         let a = Arc::new(
             approvals::ControllerApprovals::new(
                 Arc::new(hub),
@@ -778,7 +782,9 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         )))
         // Approvals: escalation, auto-apply, appliers, expiry, gauges.
         .with_loop(Loop::new(
-            approvals::ApprovalsLoop::new(Arc::clone(&approvals)).with_notifier(Arc::clone(&notifier)),
+            approvals::ApprovalsLoop::new(Arc::clone(&approvals))
+                .with_notifier(Arc::clone(&notifier))
+                .with_idle(Arc::clone(&idle_approvals)),
         ))
         // The same for DC failover items in the global tier.
         .with_loop(Loop::new(approvals::GlobalApprovalsLoop::new(Arc::clone(&approvals))))

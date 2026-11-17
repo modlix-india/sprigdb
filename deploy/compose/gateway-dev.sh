@@ -252,10 +252,13 @@ start() {
     if [[ -f $state/$name.log ]]; then mv -f "$state/$name.log" "$state/$name.log.1"; fi
     local telemetry=$ctl_telemetry_port extra=()
     # Without [tls] the peer service stays off on a non-loopback bind, and then workers can't
-    # run triggers or sinks; the dev stack binds it on loopback (as advertise_addr is).
+    # run triggers or sinks; the dev stack binds it on loopback (as advertise_addr is). A
+    # private instance sets its own SPRIGDB_GATEWAY_LISTEN_OVERRIDE (its peer port and the
+    # other listeners), which is kept.
     if [[ $role == gateway ]]; then
         telemetry=$gw_telemetry_port
-        extra=("SPRIGDB_GATEWAY_LISTEN_OVERRIDE={peer = \"127.0.0.1:7403\"}")
+        local loopback_peer='{peer = "127.0.0.1:7403"}'
+        extra=("SPRIGDB_GATEWAY_LISTEN_OVERRIDE=${SPRIGDB_GATEWAY_LISTEN_OVERRIDE:-$loopback_peer}")
     fi
     # The worker reads the controller's config under its own node id.
     if [[ $role == worker ]]; then telemetry=$wk_telemetry_port; extra=(SPRIGDB_NODE_ID=wkr-1); fi

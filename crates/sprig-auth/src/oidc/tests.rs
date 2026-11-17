@@ -329,6 +329,39 @@ async fn every_algorithm_verifies_with_a_local_jwks() {
 }
 
 #[tokio::test]
+async fn end_user_layer_tokens_never_create_accounts_and_name_the_end_user() {
+    let rsa = Key::rsa("r1");
+    let idp = Idp::start(&[&rsa]).await;
+    let t = tokens();
+    let now = SystemTime::now();
+    // A stored row from before the check: jit_users is ignored.
+    let mut s = spec(&idp, &["RS256"]);
+    s.kind = IssuerKind::EndUserLayer;
+    s.jit_users = true;
+    let issuers = vec![Arc::new(Issuer::new(s))];
+    let v = t
+        .verify(&rsa.sign(&claims(now, "svc-app")), &check(&issuers, now))
+        .await
+        .unwrap();
+    assert!(!v.jit_users);
+    assert_eq!(v.kind, IssuerKind::EndUserLayer);
+    assert_eq!(
+        v.login_detail(),
+        format!("issuer {ISS}; end user u-svc-app")
+    );
+    // An OIDC provider's: as before.
+    let mut s = spec(&idp, &["RS256"]);
+    s.jit_users = true;
+    let issuers = vec![Arc::new(Issuer::new(s))];
+    let v = t
+        .verify(&rsa.sign(&claims(now, "alice")), &check(&issuers, now))
+        .await
+        .unwrap();
+    assert!(v.jit_users);
+    assert_eq!(v.login_detail(), format!("issuer {ISS}"));
+}
+
+#[tokio::test]
 async fn bad_tokens_are_refused_with_their_reason() {
     let rsa = Key::rsa("r1");
     let other = Key::ec("e1");
@@ -656,6 +689,10 @@ fn specs_refuse_what_never_verifies() {
         }),
         ("no protocol", &|s| s.protocols.clear()),
         ("zero lifetime", &|s| s.max_lifetime_s = 0),
+        ("end-user layer with jit_users", &|s| {
+            s.kind = IssuerKind::EndUserLayer;
+            s.jit_users = true;
+        }),
         ("bad regex", &|s| {
             s.mappings.push(ClaimMapping {
                 priority: 1,
@@ -988,6 +1025,89 @@ async fn http_bearer_tokens_name_tenant_and_account() {
     .unwrap_err();
     assert_eq!(e.error.code, 3118);
     assert!(w.idp.hits("/jwks") >= 1);
+}
+
+#[tokio::test]
+async fn http_basic_takes_a_token_as_the_password_of_its_account() {
+    let w = world().await;
+    let now = w.clock.wall();
+    let http = crate::http::HttpAuth::new(Arc::clone(&w.svc));
+    let call = |user: &str, password: &str| {
+        let auth = format!(
+            "Basic {}",
+            STANDARD.encode(format!("{user}:{password}").as_bytes())
+        );
+        let http = http.clone();
+        async move {
+            http.authenticate_login(&crate::http::HttpRequest {
+                authorization: Some(&auth),
+                host: Some("127.0.0.1:8080"),
+                sni: None,
+                tenant_header: None,
+                client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                tls: true,
+                client_cert: false,
+                client_dn: None,
+            })
+            .await
+        }
+    };
+    let tok = w.key.sign(&claims(now, "tok"));
+    let l = call("acme.tok", &tok).await.unwrap();
+    assert_eq!(
+        (l.principal.tenant, l.principal.user_id),
+        (Some(ACME), Some(UserId(1)))
+    );
+    assert_eq!(l.basic_token.as_deref(), Some(tok.as_str()));
+    let last = w.audit.events().last().cloned().unwrap();
+    assert_eq!(
+        (last.event, last.protocol, last.mechanism),
+        ("auth.login_succeeded", "http", Some("jwt"))
+    );
+    // Twice: never through the fast cache, the token is checked again.
+    let l = call("acme.tok", &tok).await.unwrap();
+    assert!(l.basic_token.is_some());
+    // The tenant from x-sprig-tenant, with a Host header that names none.
+    let auth = format!("Basic {}", STANDARD.encode(format!("tok:{tok}").as_bytes()));
+    let l = http
+        .authenticate_login(&crate::http::HttpRequest {
+            authorization: Some(&auth),
+            host: Some("127.0.0.1:8080"),
+            sni: None,
+            tenant_header: Some("acme"),
+            client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            tls: true,
+            client_cert: false,
+            client_dn: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(l.principal.user_id, Some(UserId(1)));
+    // Another account's token, an expired one: 401 with 1045.
+    let e = call("acme.tok", &w.key.sign(&claims(now, "pw")))
+        .await
+        .unwrap_err();
+    assert_eq!((e.status, e.error.code), (401, 1045));
+    let mut c = claims(now, "tok");
+    c["exp"] = json!(unix(now) - 3600);
+    c["iat"] = json!(unix(now) - 4000);
+    let e = call("acme.tok", &w.key.sign(&c)).await.unwrap_err();
+    assert_eq!((e.status, e.error.code), (401, 1045));
+    assert_eq!(
+        w.audit.events().last().unwrap().detail.as_deref(),
+        Some("token: expired")
+    );
+    // An account without the token method: a token is a wrong password,
+    // and a JWT-shaped password gives no claims.
+    let e = call("acme.pw", &w.key.sign(&claims(now, "pw")))
+        .await
+        .unwrap_err();
+    assert_eq!(e.error.code, 1045);
+    // ACCOUNT LOCK applies.
+    let e = call("acme.lockd", &w.key.sign(&claims(now, "lockd")))
+        .await
+        .unwrap_err();
+    assert_eq!(e.error.code, 3118);
 }
 
 #[tokio::test]

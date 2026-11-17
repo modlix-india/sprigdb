@@ -17,7 +17,13 @@
 //!   created; `SET ROLE NONE`, `DEFAULT` and the role by name; MySQL,
 //!   MariaDB, HTTP and `COM_CHANGE_USER`;
 //! - key rotation: a token signed with a new key is accepted after the
-//!   gateway refetches the key set (at most once a minute).
+//!   gateway refetches the key set (at most once a minute);
+//! - an HTTP `Basic` password that is a token, for an account with the
+//!   `token` method: the same rows as the bearer token; a password login
+//!   over Basic has no claims;
+//! - an `end_user_layer` issuer: `jit_users` refused (39998); an end
+//!   user's token logs in as the service account its mapping names, with
+//!   the end user in the audit line, and never creates an account.
 //!
 //! ```sh
 //! source target/agent-authjwt/env.sh   # AJ_MYSQL, AJ_MARIADB, AJ_HTTP, AJ_REDIS, AJ_MONGO, AJ_ADMIN, AJ_LOG
@@ -246,6 +252,26 @@ async fn http(
 
 async fn http_sql(token: &str, tenant: Option<&str>, sql: &str) -> (u16, String) {
     let auth = format!("Bearer {token}");
+    let mut hs = vec![("Authorization", auth.as_str())];
+    if let Some(t) = tenant {
+        hs.push(("x-sprig-tenant", t));
+    }
+    http(
+        port("AJ_HTTP"),
+        "POST",
+        &format!("/v1/databases/{DB}/sql:query"),
+        &hs,
+        &json!({"sql": sql}).to_string(),
+    )
+    .await
+}
+
+/// A SQL call with `Authorization: Basic` (`user:password`).
+async fn http_basic(user: &str, password: &str, tenant: Option<&str>, sql: &str) -> (u16, String) {
+    let auth = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+    );
     let mut hs = vec![("Authorization", auth.as_str())];
     if let Some(t) = tenant {
         hs.push(("x-sprig-tenant", t));
@@ -536,6 +562,57 @@ async fn jwt_logins_live() {
             || format!("{st} {b}"),
         );
     }
+    // A token as the Basic password of an account with the token method.
+    let (st, b) = http_basic(
+        "acme.tok",
+        &t1,
+        None,
+        &format!("SELECT COUNT(*) AS n FROM {DB}.docs"),
+    )
+    .await;
+    c.ok(
+        "http basic: token as the password, the policy shows 2 rows",
+        st == 200 && b.contains('2'),
+        || format!("{st} {b}"),
+    );
+    let (st, b) = http_basic(
+        "tok",
+        &t2,
+        Some("acme"),
+        &format!("SELECT id FROM {DB}.docs"),
+    )
+    .await;
+    c.ok(
+        "http basic: org o-2's token (tenant from the header) sees row 3 only",
+        st == 200 && b.contains('3') && !b.contains("\"1\""),
+        || format!("{st} {b}"),
+    );
+    let (st, b) = http_basic(
+        "acme.tok",
+        "Tok-pass-1",
+        None,
+        &format!("SELECT COUNT(*) AS n FROM {DB}.docs"),
+    )
+    .await;
+    c.ok(
+        "http basic: the password has no claims, 0 rows",
+        st == 200 && b.contains("[[\"0\"]]"),
+        || format!("{st} {b}"),
+    );
+    for (what, tok, _) in &bad {
+        let (st, b) = http_basic("acme.tok", tok, None, "SELECT 1").await;
+        c.ok(
+            &format!("http basic: {what} refused with 401"),
+            st == 401 && b.contains("1045"),
+            || format!("{st} {b}"),
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    c.ok(
+        "audit: a Basic token login is mechanism jwt over http",
+        log_has(&["auth.login_succeeded", "\"jwt\"", "\"http\"", ISS]),
+        String::new,
+    );
     let (st, b) = http_sql(&t1, None, "SELECT 1").await;
     c.ok(
         "http: no tenant named: 401 with 39786",
@@ -773,6 +850,96 @@ async fn jwt_logins_live() {
         || format!("{r:?}"),
     );
     let _ = app.query_drop("DROP ROLE IF EXISTS ajghost").await;
+
+    // An end-user layer: its tokens are end users', logging in as the
+    // service account its mapping names; never just in time.
+    let eul = "https://eul.authjwt.test";
+    let mut layer = json!({
+        "kind": "end_user_layer", "issuer": eul, "jwks_url": idp.url, "audiences": [AUD],
+        "algorithms": ["ES256"], "jit_users": true, "max_lifetime_s": 3600,
+        "mappings": [{"priority": 1, "kind": "user", "claim": "azp",
+                      "match_kind": "any", "target": "{azp}"}]
+    });
+    let (st, b) = http(
+        admin,
+        "POST",
+        "/admin/v1/tenants/acme/issuers",
+        &[],
+        &layer.to_string(),
+    )
+    .await;
+    c.ok(
+        "admin: an end_user_layer issuer with jit_users is refused (39998)",
+        st >= 400 && b.contains("39998") && b.contains("jit_users"),
+        || format!("{st} {b}"),
+    );
+    layer["jit_users"] = json!(false);
+    let (st, b) = http(
+        admin,
+        "POST",
+        "/admin/v1/tenants/acme/issuers",
+        &[],
+        &layer.to_string(),
+    )
+    .await;
+    c.ok(
+        "admin: the end_user_layer issuer created",
+        st == 200,
+        || format!("{st} {b}"),
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let end_user = |azp: &str, sub: &str, org: &str| {
+        let n = now();
+        k1.sign(
+            &json!({"iss": eul, "aud": AUD, "sub": sub, "azp": azp, "org": org,
+                        "iat": n, "exp": n + 600}),
+        )
+    };
+    match my(mysql, "acme.tok", &end_user("tok", "eu-4711", "o-2")).await {
+        Ok(mut s) => {
+            let ids: Vec<i32> = s.query(format!("SELECT id FROM {DB}.docs")).await.unwrap();
+            c.ok(
+                "end-user layer: an end user's token logs in as the service account, its org's row 3",
+                ids == vec![3],
+                || format!("{ids:?}"),
+            );
+        }
+        Err(e) => c.ok("end-user layer: mysql login", false, || e.to_string()),
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    c.ok(
+        "audit: the end-user layer's login names the end user",
+        log_has(&["auth.login_succeeded", eul, "end user eu-4711"]),
+        String::new,
+    );
+    let (st, b) = http_sql(&end_user("ajeul", "eu-1", "o-1"), Some("acme"), "SELECT 1").await;
+    c.ok(
+        "end-user layer: a token naming no account is refused, nothing created",
+        st == 401 && b.contains("1045"),
+        || format!("{st} {b}"),
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    c.ok(
+        "end-user layer: no just-in-time account ajeul",
+        var("AJ_LOG").is_none()
+            || (!log_has(&["auth.user_created_jit", "ajeul"])
+                && log_has(&["auth.login_failed", "ajeul"])),
+        String::new,
+    );
+    layer["active"] = json!(false);
+    let (st, _) = http(
+        admin,
+        "POST",
+        "/admin/v1/tenants/acme/issuers",
+        &[],
+        &layer.to_string(),
+    )
+    .await;
+    c.ok(
+        "admin: the end_user_layer issuer disabled",
+        st == 200,
+        String::new,
+    );
 
     // Key rotation: the issuer adds k2. A k2 token is accepted once the
     // gateway refetches (an unknown kid refetches at most once a minute).
