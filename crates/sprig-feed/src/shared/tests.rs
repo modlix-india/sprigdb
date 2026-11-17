@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::many_single_char_names)]
 
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 use sprig_binlog::RowImage;
 
@@ -52,6 +52,11 @@ struct Fake {
     grew: Arc<Notify>,
     opens: Arc<Mutex<Vec<DumpScope>>>,
     live: Arc<AtomicUsize>,
+    /// Groups up to this one are purged: a dump from before it is refused
+    /// (39800), as a node refuses a position its binary logs lack.
+    purged: Arc<AtomicU64>,
+    /// Dumps refused for it, by scope.
+    refused: Arc<Mutex<Vec<DumpScope>>>,
 }
 
 impl Fake {
@@ -149,6 +154,14 @@ impl Clusters for Fake {
         scope: Arc<DumpScope>,
         from: &GtidPos,
     ) -> Result<Box<dyn TxnSource>> {
+        let purged = self.purged.load(Ordering::SeqCst);
+        if from.get(0).map_or(0, |g| g.seq) < purged {
+            self.refused.lock().unwrap().push((*scope).clone());
+            return Err(SprigError::new(
+                SprigCode::FeedHistoryLost,
+                format!("group {purged} and those before it are purged; dump from {from}"),
+            ));
+        }
         self.opens.lock().unwrap().push((*scope).clone());
         self.live.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(FakeSrc {
@@ -805,4 +818,152 @@ async fn a_view_gets_idle_positions_as_often_as_it_asks() {
     assert!(fi.windows(2).all(|p| p[1].reached(&p[0])));
     let last = fi.last().unwrap().get(0).unwrap().seq;
     assert!(last >= 54, "the fast view's last position is {last}");
+}
+
+async fn seqs(src: &mut Box<dyn TxnSource>, n: usize) -> Vec<u64> {
+    take(src, n).await.iter().map(|x| x.0).collect()
+}
+
+/// The first `Err` a source returns within 5 s, reading past anything
+/// else.
+async fn fails(src: &mut Box<dyn TxnSource>) -> SprigError {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Err(e) = src.next().await {
+                return e;
+            }
+        }
+    })
+    .await
+    .expect("no error within 5 s")
+}
+
+/// A worker's restart where one sequencer's checkpoint lies in purged
+/// binlogs: the gathering hub moves back for it, finds that history lost,
+/// and reads on instead of failing everyone. The lost subscription alone
+/// gets 39800; the others catch up and join the hub, each group once, and
+/// once caught up they share the one dump again. A retry of the lost one
+/// never moves the hub back again.
+#[tokio::test]
+async fn a_lost_subscription_fails_alone_while_the_others_read_on() {
+    let tenants = ["t1_d1_g1_s1", "t2_d1_g1_s1", "t3_d1_g1_s1"];
+    let fake = Fake::with((1..=20).map(|s| txn(s, &tenants)).collect());
+    fake.purged.store(5, Ordering::SeqCst);
+    let feed = SharedFeed::new(Arc::new(fake.clone()), SharedOpts::default());
+    let shared = feed.view(Kept::Tables(vec!["__sprig_qo".to_owned()].into()));
+    let c = cluster();
+    let mut a = shared.open(&c, TenantId(1), &at(15)).await.unwrap();
+    let mut b = shared.open(&c, TenantId(2), &at(10)).await.unwrap();
+    let mut lost = shared.open(&c, TenantId(3), &at(2)).await.unwrap();
+    assert_eq!(seqs(&mut a, 5).await, (16..=20).collect::<Vec<_>>());
+    assert_eq!(seqs(&mut b, 10).await, (11..=20).collect::<Vec<_>>());
+    let e = fails(&mut lost).await;
+    assert_eq!(e.code(), Some(SprigCode::FeedHistoryLost), "{e}");
+    // Its retry takes a catch-up dump again (refused), not the hub back.
+    let mut again = shared.open(&c, TenantId(3), &at(2)).await.unwrap();
+    let e = fails(&mut again).await;
+    assert_eq!(e.code(), Some(SprigCode::FeedHistoryLost), "{e}");
+    let refused = fake.refused.lock().unwrap().clone();
+    assert!(
+        refused.iter().filter(|s| s.only.is_none()).count() <= 1,
+        "the hub tried the lost position once: {refused:?}"
+    );
+    assert!(refused.iter().any(|s| s.only == Some(TenantId(3))));
+    // New groups reach the others once, through the one shared dump.
+    for s in 21..=25 {
+        fake.push(txn(s, &tenants));
+    }
+    assert_eq!(seqs(&mut a, 5).await, (21..=25).collect::<Vec<_>>());
+    assert_eq!(seqs(&mut b, 5).await, (21..=25).collect::<Vec<_>>());
+    assert!(quiet(&mut a, 300).await, "tenant 1 got a group twice");
+    assert!(quiet(&mut b, 300).await, "tenant 2 got a group twice");
+    assert_eq!(
+        fake.live.load(Ordering::SeqCst),
+        1,
+        "only the hub's dump is open"
+    );
+    assert_eq!(feed.stats(&c).unwrap().catchups, 0);
+    assert_eq!(feed.stats(&c).unwrap().subscriptions, 2);
+}
+
+/// A new whole tenant just behind a running hub whose start is purged: the
+/// replay it would get is refused, the hub goes back to where it was
+/// reading, and the subscriptions there never notice; the new one alone
+/// fails.
+#[tokio::test]
+async fn a_replay_into_lost_history_fails_only_its_subscription() {
+    let groups: Vec<RawTxn> = (1..=10)
+        .map(|s| {
+            let mut t = txn(s, &["t1_d1_g1_s1"]);
+            t.rows.push(row_in("t2_d1_g1_s1", "orders"));
+            t
+        })
+        .collect();
+    let fake = Fake::with(groups);
+    let opts = SharedOpts {
+        gather: Duration::ZERO,
+        ..SharedOpts::default()
+    };
+    let feed = SharedFeed::new(Arc::new(fake.clone()), opts);
+    let outbox = feed.view(Kept::Tables(vec!["__sprig_qo".to_owned()].into()));
+    let all = feed.view(Kept::All);
+    let c = cluster();
+    let mut q = outbox.open(&c, TenantId(1), &at(0)).await.unwrap();
+    assert_eq!(seqs(&mut q, 10).await, (1..=10).collect::<Vec<_>>());
+    fake.purged.store(6, Ordering::SeqCst);
+    let mut w = all.open(&c, TenantId(2), &at(3)).await.unwrap();
+    let e = fails(&mut w).await;
+    assert_eq!(e.code(), Some(SprigCode::FeedHistoryLost), "{e}");
+    for s in 11..=13 {
+        fake.push(txn(s, &["t1_d1_g1_s1"]));
+    }
+    assert_eq!(seqs(&mut q, 3).await, vec![11, 12, 13]);
+    assert!(quiet(&mut q, 300).await, "tenant 1 got a group twice");
+    assert_eq!(fake.live.load(Ordering::SeqCst), 1);
+}
+
+/// A subscription behind the hub that can be served: its catch-up dump
+/// reads up to the hub and hands over with nothing skipped and nothing
+/// twice, while groups keep arriving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_catch_up_joins_the_hub_without_gaps_or_duplicates_under_load() {
+    let fake = Fake::with(
+        (1..=200)
+            .map(|s| txn(s, &["t1_d1_g1_s1", "t2_d1_g1_s1"]))
+            .collect(),
+    );
+    let opts = SharedOpts {
+        ring_groups: 10,
+        gather: Duration::ZERO,
+        ..SharedOpts::default()
+    };
+    let feed = SharedFeed::new(Arc::new(fake.clone()), opts);
+    let shared = feed.view(Kept::Tables(vec!["__sprig_qo".to_owned()].into()));
+    let c = cluster();
+    let mut a = shared.open(&c, TenantId(1), &at(0)).await.unwrap();
+    assert_eq!(seqs(&mut a, 200).await.len(), 200);
+    let f2 = fake.clone();
+    let writer = tokio::spawn(async move {
+        for s in 201..=600 {
+            f2.push(txn(s, &["t1_d1_g1_s1", "t2_d1_g1_s1"]));
+            if s % 20 == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    });
+    let mut b = shared.open(&c, TenantId(2), &at(50)).await.unwrap();
+    let got = seqs(&mut b, 550).await;
+    writer.await.unwrap();
+    assert_eq!(got, (51..=600).collect::<Vec<_>>());
+    assert!(quiet(&mut b, 400).await, "tenant 2 got a group twice");
+    // Tenant 1, not read meanwhile, was detached and catches up too.
+    assert_eq!(seqs(&mut a, 400).await, (201..=600).collect::<Vec<_>>());
+    assert!(quiet(&mut a, 400).await, "tenant 1 got a group twice");
+    assert!(fake.catchup_opens() >= 1);
+    assert_eq!(feed.stats(&c).unwrap().catchups, 0);
+    assert_eq!(
+        fake.live.load(Ordering::SeqCst),
+        1,
+        "only the hub's dump is open"
+    );
 }

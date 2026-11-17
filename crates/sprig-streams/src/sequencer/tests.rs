@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
 
 use std::sync::atomic::AtomicUsize;
+use std::sync::{Mutex, PoisonError};
 
 use sprig_binlog::{Gtid, Value};
 use sprig_common::ids::{DbId, GroupId, ShardId, TenantId};
@@ -93,6 +94,9 @@ struct ScriptFeed {
     /// A wait after taking a transaction and before emitting it, as the
     /// tail's catalog lookups: `next` isn't cancel-safe then.
     lookup: Option<Duration>,
+    /// The binlog's head when the log's own writes follow the script
+    /// ([`OwnLog`]): progress reaches it.
+    head: Option<Arc<AtomicU64>>,
 }
 
 #[async_trait::async_trait]
@@ -115,8 +119,9 @@ impl FeedSource for ScriptFeed {
                 continue;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
+            let head = self.head.as_ref().map_or(0, |h| h.load(Ordering::SeqCst));
             return Ok(FeedItem::Progress {
-                token: token(self.txns.len() as u64),
+                token: token((self.txns.len() as u64).max(head)),
             });
         }
     }
@@ -134,6 +139,7 @@ impl FeedOpener for Script {
             next,
             out: std::collections::VecDeque::new(),
             lookup: None,
+            head: None,
         }))
     }
 }
@@ -155,6 +161,7 @@ impl FeedOpener for SlowScript {
             next,
             out: std::collections::VecDeque::new(),
             lookup: Some(Duration::from_millis(20)),
+            head: None,
         }))
     }
 }
@@ -344,4 +351,292 @@ fn starts_round_trip() {
     let b = Start::After(token(9));
     assert_eq!(Start::decode(&b.encode()).unwrap(), b);
     assert!(Start::decode(b"").is_err());
+}
+
+/// A binlog where the script comes first and the log's own writes follow
+/// (`head`), with everything up to `purged` purged: a dump from before it
+/// is refused, as a node refuses a position its binary logs lack.
+#[derive(Clone)]
+struct Binlog {
+    script: Script,
+    head: Arc<AtomicU64>,
+    purged: Arc<AtomicU64>,
+}
+
+impl Binlog {
+    fn new(script: Script) -> Self {
+        let n = script.0.len() as u64;
+        Self {
+            script,
+            head: Arc::new(AtomicU64::new(n)),
+            purged: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn write(&self) -> Gtid {
+        Gtid {
+            domain: 1,
+            server: 1,
+            seq: self.head.fetch_add(1, Ordering::SeqCst) + 1,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl FeedOpener for Binlog {
+    async fn open(&self, start: &Start) -> Result<Box<dyn FeedSource>> {
+        let from = match start {
+            Start::After(t) => t.pos.get(1).map_or(0, |g| g.seq),
+            Start::At { .. } => 0,
+        };
+        let purged = self.purged.load(Ordering::SeqCst);
+        if from < purged {
+            return Err(SprigError::new(
+                SprigCode::FeedHistoryLost,
+                format!("binlog events up to {purged} are purged; the feed starts after {from}"),
+            ));
+        }
+        let n = self.script.0.len();
+        Ok(Box::new(ScriptFeed {
+            txns: Arc::clone(&self.script.0),
+            next: usize::try_from(from).unwrap().min(n),
+            out: std::collections::VecDeque::new(),
+            lookup: None,
+            head: Some(Arc::clone(&self.head)),
+        }))
+    }
+}
+
+/// A [`MemLog`] whose every commit (an acquisition, an append, a
+/// clean-up) is a write of its own in [`Binlog`], with its GTID.
+struct OwnLog {
+    log: MemLog,
+    binlog: Binlog,
+    own: Mutex<Vec<Gtid>>,
+}
+
+impl OwnLog {
+    fn wrote(&self) {
+        let g = self.binlog.write();
+        self.own
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(g);
+    }
+}
+
+#[async_trait::async_trait]
+impl LogStore for OwnLog {
+    async fn acquire(&self) -> Result<Acquired> {
+        let a = self.log.acquire().await?;
+        self.wrote();
+        Ok(a)
+    }
+
+    async fn append(&self, epoch: LeaderEpoch, batch: &Batch) -> Result<AppendOutcome> {
+        let o = self.log.append(epoch, batch).await?;
+        if matches!(o, AppendOutcome::Appended(_)) {
+            self.wrote();
+        }
+        Ok(o)
+    }
+
+    async fn cleanup(&self, outbox_ids: &[[u8; 16]]) -> Result<()> {
+        self.log.cleanup(outbox_ids).await?;
+        self.wrote();
+        Ok(())
+    }
+
+    fn take_own(&self) -> Vec<Gtid> {
+        std::mem::take(&mut *self.own.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    async fn position(&self) -> Result<Option<GtidPos>> {
+        Ok(Some(token(self.binlog.head.load(Ordering::SeqCst)).pos))
+    }
+}
+
+/// Positions saved outside the log, in memory.
+#[derive(Default)]
+struct SavedPositions {
+    saved: Mutex<Option<Vec<u8>>>,
+    saves: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Watermarks for SavedPositions {
+    async fn publish(&self, _epoch: LeaderEpoch, _marks: &BTreeMap<PartitionNo, Offset>) {}
+
+    async fn save_position(&self, _epoch: LeaderEpoch, start: &[u8]) -> bool {
+        *self.saved.lock().unwrap_or_else(PoisonError::into_inner) = Some(start.to_vec());
+        self.saves.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    async fn saved_position(&self) -> Option<Vec<u8>> {
+        self.saved
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+fn own_sequencer(log: &MemLog, binlog: &Binlog, marks: &Arc<SavedPositions>) -> Sequencer {
+    let mut s = sequencer(log, &binlog.script);
+    s.store = Arc::new(OwnLog {
+        log: log.clone(),
+        binlog: binlog.clone(),
+        own: Mutex::new(Vec::new()),
+    });
+    s.feed = Arc::new(binlog.clone());
+    s.marks = Arc::clone(marks) as Arc<dyn Watermarks>;
+    s
+}
+
+fn saved_seq(marks: &SavedPositions) -> Option<u64> {
+    let b = marks.saved.lock().unwrap().clone()?;
+    match Start::decode(&b).unwrap() {
+        Start::After(t) => t.pos.get(1).map(|g| g.seq),
+        Start::At { .. } => None,
+    }
+}
+
+/// The shard row's position lies one of the sequencer's own writes behind
+/// (its last append, and the outbox clean-up after it). A stop saves the
+/// position past them outside the log; a purge of every binlog right after
+/// the stop then loses nothing on the restart, which starts there and
+/// handles nothing twice.
+#[tokio::test(start_paused = true)]
+async fn a_purge_right_after_a_stop_loses_nothing() {
+    let binlog = Binlog::new(script(30));
+    let log = MemLog::new(&start());
+    let marks = Arc::new(SavedPositions::default());
+    let s = own_sequencer(&log, &binlog, &marks);
+    // Stopped soon after its last append.
+    assert_eq!(
+        run_for(&s, Duration::from_millis(400)).await,
+        RunEnd::Stopped
+    );
+    check(&log, &binlog.script);
+    let head = binlog.head.load(Ordering::SeqCst);
+    let row = match Start::decode(&log.lock().resume).unwrap() {
+        Start::After(t) => t.pos.get(1).unwrap().seq,
+        Start::At { .. } => 0,
+    };
+    assert!(
+        row < head,
+        "the row's position {row} lies behind the sequencer's own writes up to {head}"
+    );
+    assert_eq!(
+        saved_seq(&marks),
+        Some(head),
+        "the saved position covers its own last writes"
+    );
+    // Every binlog purged; the restart starts past them.
+    binlog.purged.store(head, Ordering::SeqCst);
+    let s2 = own_sequencer(&log, &binlog, &marks);
+    assert_eq!(run_for(&s2, Duration::from_secs(3)).await, RunEnd::Stopped);
+    assert_eq!(s2.stats.appended.load(Ordering::Relaxed), 0);
+    assert_eq!(s2.stats.duplicates.load(Ordering::Relaxed), 0);
+    check(&log, &binlog.script);
+    // Without the saved position, the row's alone is refused.
+    let bare = MemLog::new(&Start::decode(&log.lock().resume).unwrap());
+    let s3 = own_sequencer(&bare, &binlog, &Arc::new(SavedPositions::default()));
+    let e = run_for_err(&s3, Duration::from_secs(1)).await;
+    assert_eq!(e.code(), Some(SprigCode::FeedHistoryLost), "{e}");
+}
+
+/// Once the feed has moved over nothing but its own writes, an idle
+/// sequencer saves its position outside the log and writes nothing more:
+/// a checkpoint in the log would itself be a new write to move over.
+#[tokio::test(start_paused = true)]
+async fn an_idle_sequencer_stops_writing_its_own_checkpoints() {
+    let binlog = Binlog::new(script(20));
+    let log = MemLog::new(&start());
+    let marks = Arc::new(SavedPositions::default());
+    let mut s = own_sequencer(&log, &binlog, &marks);
+    s.opts.idle_checkpoint = Duration::from_millis(500);
+    let stop = CancellationToken::new();
+    let s = Arc::new(s);
+    let (s2, stop2) = (Arc::clone(&s), stop.clone());
+    let run = tokio::spawn(async move { s2.run(&stop2).await });
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let (commits, head, saves) = (
+        log.lock().commits,
+        binlog.head.load(Ordering::SeqCst),
+        marks.saves.load(Ordering::SeqCst),
+    );
+    assert!(saves >= 1);
+    assert_eq!(saved_seq(&marks), Some(head));
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(
+        log.lock().commits,
+        commits,
+        "no checkpoint written while idle"
+    );
+    assert_eq!(
+        binlog.head.load(Ordering::SeqCst),
+        head,
+        "no write of its own while idle"
+    );
+    assert_eq!(
+        marks.saves.load(Ordering::SeqCst),
+        saves,
+        "nothing new to save"
+    );
+    stop.cancel();
+    assert_eq!(run.await.unwrap().unwrap(), RunEnd::Stopped);
+    check(&log, &binlog.script);
+}
+
+#[test]
+fn the_saved_position_is_used_only_when_it_is_later_on_the_same_feed() {
+    let row = Start::After(token(10));
+    let later = Start::After(token(12)).encode();
+    let earlier = Start::After(token(8)).encode();
+    assert_eq!(
+        later_start(row.clone(), Some(&later)),
+        Start::After(token(12))
+    );
+    assert_eq!(later_start(row.clone(), Some(&earlier)), row);
+    assert_eq!(later_start(row.clone(), None), row);
+    let mut other = token(12);
+    other.segment = 3;
+    assert_eq!(
+        later_start(row.clone(), Some(&Start::After(other).encode())),
+        row
+    );
+    let mut moved = token(12);
+    moved.cluster = ClusterId::new("dc-a-c2").unwrap();
+    assert_eq!(
+        later_start(row.clone(), Some(&Start::After(moved).encode())),
+        row
+    );
+    assert_eq!(later_start(start(), Some(&later)), Start::After(token(12)));
+    let base = token(10).pos;
+    let own = [
+        Gtid {
+            domain: 1,
+            server: 1,
+            seq: 12,
+        },
+        Gtid {
+            domain: 1,
+            server: 1,
+            seq: 11,
+        },
+    ];
+    assert_eq!(past_own(&base, &own), token(12).pos);
+    // A gap (someone else's write at 11) stops it there.
+    assert_eq!(past_own(&base, &own[..1]), base);
+}
+
+async fn run_for_err(seq: &Sequencer, d: Duration) -> SprigError {
+    let stop = CancellationToken::new();
+    let s2 = stop.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(d).await;
+        s2.cancel();
+    });
+    seq.run(&stop).await.unwrap_err()
 }

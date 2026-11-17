@@ -121,12 +121,40 @@ impl Versioned for WatermarkRecord {
     const V: u32 = 1;
 }
 
+/// `stream_pos/<tenant>/<stream>/<shard>` in the DC tier: a log shard's
+/// sequencer's exact feed position, past its own last writes. The shard
+/// row's position always lies one of the sequencer's own writes behind
+/// (the append that writes it is a later transaction), and a transaction
+/// can't hold its own GTID, so this position is kept outside the log's
+/// cluster (see the sequencer's module docs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PositionRecord {
+    /// The sequencer's leader epoch.
+    pub epoch: u32,
+    /// The position: a `Start::encode`, base64.
+    pub start: String,
+    /// When written (ms since the Unix epoch).
+    pub at_ms: u64,
+}
+
+impl Versioned for PositionRecord {
+    const V: u32 = 1;
+}
+
+/// The key of a log shard's [`PositionRecord`].
+#[must_use]
+pub fn position_key(tenant: TenantId, s: StreamId, shard: u32) -> String {
+    format!("stream_pos/{tenant}/{}/{shard}", s.0)
+}
+
 /// High watermarks to etcd, at most every `every`. A mark held back by
 /// that limit is written when it ends (a trailing write), so the last
-/// marks of a burst always reach the gateways' long polls.
+/// marks of a burst always reach the gateways' long polls. The sequencer's
+/// exact position goes to etcd too ([`PositionRecord`]).
 pub struct MetaWatermarks {
     dc: Arc<dyn MetaStore>,
     key: String,
+    pos_key: String,
     every: Duration,
     state: Arc<Mutex<(Option<Instant>, WatermarkRecord)>>,
     trailing: Arc<std::sync::atomic::AtomicBool>,
@@ -147,6 +175,7 @@ impl MetaWatermarks {
         Self {
             dc,
             key: format!("streams/{tenant}/{}/{shard}", s.0),
+            pos_key: position_key(tenant, s, shard),
             every: Duration::from_millis(50),
             state: Arc::new(Mutex::new((
                 None,
@@ -226,6 +255,75 @@ impl Watermarks for MetaWatermarks {
         let rec = st.1.clone();
         drop(st);
         write_marks(&self.dc, &self.key, rec).await;
+    }
+
+    async fn save_position(&self, epoch: LeaderEpoch, start: &[u8]) -> bool {
+        use base64::Engine as _;
+        let rec = PositionRecord {
+            epoch: epoch.0,
+            start: base64::engine::general_purpose::STANDARD.encode(start),
+            at_ms: now_ms(),
+        };
+        let (Ok(key), Ok(value)) = (self.dc.tier().key(&self.pos_key), Record::new(rec).encode())
+        else {
+            return false;
+        };
+        let r = self
+            .dc
+            .txn(Txn {
+                when: Vec::new(),
+                then: vec![Op::Put {
+                    key,
+                    value,
+                    lease: None,
+                }],
+                otherwise: Vec::new(),
+            })
+            .await;
+        match r {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::debug!(error = %e, "stream sequencer's position not saved");
+                false
+            }
+        }
+    }
+
+    async fn saved_position(&self) -> Option<Vec<u8>> {
+        use base64::Engine as _;
+        let key = self.dc.tier().key(&self.pos_key).ok()?;
+        let kv = match self
+            .dc
+            .get(&key, sprig_meta::Consistency::Linearizable)
+            .await
+        {
+            Ok(kv) => kv?,
+            Err(e) => {
+                tracing::warn!(error = %e, "stream sequencer's saved position can't be read; starting from its checkpoint");
+                return None;
+            }
+        };
+        let rec = Record::<PositionRecord>::decode(&kv.value).ok()?;
+        base64::engine::general_purpose::STANDARD
+            .decode(rec.body.start)
+            .ok()
+    }
+}
+
+/// Removes a dropped stream's saved positions.
+async fn forget_positions(dc: &Arc<dyn MetaStore>, tenant: TenantId, s: StreamId, shard: u32) {
+    let Ok(key) = dc.tier().key(&position_key(tenant, s, shard)) else {
+        return;
+    };
+    let r = dc
+        .txn(Txn {
+            when: Vec::new(),
+            then: vec![Op::Delete(key)],
+            otherwise: Vec::new(),
+        })
+        .await;
+    if let Err(e) = r {
+        tracing::debug!(error = %e, "a dropped stream's saved position not removed");
     }
 }
 
@@ -512,6 +610,9 @@ pub async fn run_job(
         }
     };
     tracing::info!(%tenant, stream = id.0, ?end, "stream sequencer stopped");
+    if gone {
+        forget_positions(&env.dc(), tenant, id, log.slot.shard.0).await;
+    }
     Ok(match end {
         RunEnd::Stopped if gone => JobEnd::Gone,
         RunEnd::Stopped => JobEnd::Stopped,

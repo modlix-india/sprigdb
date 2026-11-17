@@ -33,6 +33,21 @@
 //! 3. with everything running, then a rotation, a wait and a purge; rows
 //!    21 to 30 go in, the worker restarts, and rows 31 to 40 go in.
 //!
+//! Then (4) the worker stops, every node's binary logs are rotated and
+//! purged at once, rows 41 to 50 go in, the worker starts, and rows 51 to
+//! 60 go in. A stream sequencer's checkpoint in its log lies one of its
+//! own writes behind (the append that writes it comes after it), so a
+//! purge right after a stop used to remove an event its restart needed:
+//! the change topic refused to read on, and the stream trigger got
+//! nothing more. The sequencer now saves its exact position at the stop:
+//! the stream trigger and the sink must hold rows 1 to 60 exactly once.
+//! The after-commit trigger acknowledges its position at most every
+//! second and not at a stop, so a write in the worker's last second (any
+//! consumer's) can lie after it; then its history is really purged, and it
+//! alone fails with 39800 while the others read on. Its rows and the
+//! worker's `sprig_feed_history_lost_total` in this round are reported,
+//! not checked.
+//!
 //! After each round, the trigger tables and the sink must hold every row so
 //! far exactly once (the sink by idempotency key: it is at least once, and
 //! its deliveries are reported). With `SPRIG_TEST_FLD_METRICS` (the
@@ -41,10 +56,7 @@
 //! `SPRIG_TEST_FLD_EXPECT_REPAIR=1` it also checks that one was counted.
 //!
 //! It writes node-local transactions and purges binary logs: run it only
-//! against a private Galera cluster made for it, never a shared one. A
-//! purge right after the worker stops would remove events its stream
-//! sequencers still need (each checkpoint write is itself a later event),
-//! so round 3 purges while the worker runs, after a wait.
+//! against a private Galera cluster made for it, never a shared one.
 //!
 //! ```sh
 //! export SPRIG_TEST_FLD_SQL=127.0.0.1:46306        # the gateway's MySQL port
@@ -586,7 +598,66 @@ async fn feed_readers_survive_purged_local_domains() {
     insert(&addr, 31..=40).await;
     check_rows(&addr, &hook, &mut ck, 40, "after a purge and a restart").await;
 
-    add_metrics(&mut totals).await;
+    // 4. A purge right after the worker stops.
+    if let (Ok(stop), Ok(start)) = (
+        std::env::var("SPRIG_TEST_FLD_STOP"),
+        std::env::var("SPRIG_TEST_FLD_START"),
+    ) {
+        add_metrics(&mut totals).await;
+        // The metric checks below count the rounds before this one.
+        let before = totals;
+        sh("stop", &stop);
+        for (i, url) in nodes.iter().enumerate() {
+            let mut n = node(url).await;
+            let local: u32 = n
+                .query_first("SELECT @@gtid_domain_id")
+                .await
+                .unwrap()
+                .unwrap();
+            must(&mut n, "FLUSH BINARY LOGS").await;
+            purge_older(&mut n, &mut ck, i, local).await;
+        }
+        insert(&addr, 41..=50).await;
+        sh("start", &start);
+        insert(&addr, 51..=60).await;
+        let when = "after a purge right after a stop";
+        let s = settle(&addr, &hook, 60, 180).await;
+        ck.ok(
+            &format!("stream trigger {when}: rows 1-60 once each"),
+            s.trig == exactly(60),
+            || format!("{:?}", s.trig),
+        );
+        ck.ok(
+            &format!("sink {when}: rows 1-60 once each"),
+            s.sink == exactly(60),
+            || format!("{:?}", s.sink),
+        );
+        let ac_once = s.ac == exactly(60);
+        ck.ok(
+            &format!(
+                "after-commit trigger {when}: rows 1-60 once each, or (its history purged) 1-40"
+            ),
+            ac_once || s.ac == exactly(40),
+            || format!("{:?}", s.ac),
+        );
+        eprintln!(
+            "     after-commit trigger {when}: {}",
+            if ac_once {
+                "every row once"
+            } else {
+                "its position was purged; it alone stopped"
+            }
+        );
+        let mut after = totals;
+        add_metrics(&mut after).await;
+        eprintln!(
+            "     worker in this round: sprig_feed_history_lost_total {}",
+            after.1 - before.1
+        );
+        totals = before;
+    } else {
+        add_metrics(&mut totals).await;
+    }
     if std::env::var("SPRIG_TEST_FLD_METRICS").is_ok() {
         let (added, lost) = totals;
         eprintln!(

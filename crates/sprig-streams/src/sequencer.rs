@@ -18,12 +18,33 @@
 //!       append(epoch, records, resume) — fenced: a different epoch in the
 //!       shard row means another sequencer took over; stop at once
 //!       publish the high watermarks; delete the appended outbox rows
+//!     a position that moved over nothing but this sequencer's own writes
+//!       (its appends, clean-ups, its epoch's raise) is saved outside the
+//!       log instead (Watermarks::save_position): writing it to the log
+//!       would add another write after it
+//!  5. stop: flush what is pending, read on until the feed has passed the
+//!     log cluster's position (at most STOP_DRAIN), save that exact
+//!     position outside the log; acquire starts from the later of the
+//!     shard row's position and the saved one
 //! ```
 //!
 //! **Exactly once.** The records and the position commit together, so a
 //! restart resumes just after the last appended batch. A batch replayed
 //! anyway (a commit whose answer was lost, then retried) is caught by
 //! `uk_source`: its records are skipped and their offsets not reused.
+//!
+//! **The exact position.** The position in the shard row is the feed's
+//! position before the append that writes it, and that append is itself a
+//! later transaction of the same binlog. So the row always lies one write
+//! (the sequencer's own) behind, and a binlog purge right after a stop
+//! would remove an event a restart from it needs: the restart was refused
+//! (history lost) though nothing it needed was gone. A transaction can't
+//! hold its own GTID, so the position past the sequencer's own writes is
+//! saved outside the log's cluster, where saving it writes nothing to that
+//! binlog: at a stop, and when the feed moved over nothing else. It is used
+//! only when it is a point of the same feed at or after the row's, and
+//! only records the row already holds lie before it, so it never skips a
+//! record and never makes one handled twice.
 //!
 //! **Leases.** The worker's job runtime gives each
 //! (stream, log shard) one sequencer job under its lease. The lease alone
@@ -37,7 +58,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use sprig_binlog::{GtidPos, Value};
+use sprig_binlog::{Gtid, GtidPos, Value};
 use sprig_common::ids::{ClusterId, DbId, ObjectId};
 use sprig_common::{CancellationToken, ErrorKind, Result, SprigCode, SprigError};
 use sprig_feed::{ChangeEvent, FeedItem, Op, ResumeToken};
@@ -156,6 +177,24 @@ pub trait LogStore: Send + Sync {
     /// The backend's (retryable when the shard is unreachable).
     async fn append(&self, epoch: LeaderEpoch, batch: &Batch) -> Result<AppendOutcome>;
 
+    /// GTIDs of this store's own writes on the log's cluster since the
+    /// last call (its appends, acquisitions and clean-ups): the sequencer
+    /// tells its own writes in the feed from others' by them. Default:
+    /// none known, so every move of the position counts as others'.
+    fn take_own(&self) -> Vec<Gtid> {
+        Vec::new()
+    }
+
+    /// The log's cluster's binlog position now (`None`: not known). A
+    /// stopping sequencer reads on until its feed has passed it, so the
+    /// position it saves covers its own last writes.
+    ///
+    /// # Errors
+    /// The backend's.
+    async fn position(&self) -> Result<Option<GtidPos>> {
+        Ok(None)
+    }
+
     /// Deletes appended outbox rows (idempotent; a sweep catches misses).
     ///
     /// # Errors
@@ -190,11 +229,25 @@ pub trait FeedOpener: Send + Sync {
     async fn open(&self, start: &Start) -> Result<Box<dyn FeedSource>>;
 }
 
-/// Where high watermarks go (etcd and waiting fetches).
+/// Where high watermarks go (etcd and waiting fetches), and the
+/// sequencer's exact position: outside the log's cluster, so saving it
+/// adds nothing to the binlog the sequencer reads.
 #[async_trait::async_trait]
 pub trait Watermarks: Send + Sync {
     /// The partitions' new high watermarks.
     async fn publish(&self, epoch: LeaderEpoch, marks: &BTreeMap<PartitionNo, Offset>);
+
+    /// Saves the sequencer's exact position (a [`Start::encode`]): every
+    /// record before it is in the log. Returns whether it was saved.
+    /// Default: nowhere to save it.
+    async fn save_position(&self, _epoch: LeaderEpoch, _start: &[u8]) -> bool {
+        false
+    }
+
+    /// The position [`Self::save_position`] saved last.
+    async fn saved_position(&self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// A sequencer's feed as the shared pump reads it (`sprig_feed::pump`:
@@ -207,6 +260,66 @@ impl sprig_feed::pump::Source for Box<dyn FeedSource> {
     async fn next(&mut self) -> Result<FeedItem> {
         FeedSource::next(self.as_mut()).await
     }
+}
+
+/// How long a stopping sequencer reads on, at most, for its exact
+/// position: until its feed has passed the log's cluster position at the
+/// stop, its own last writes included (the shared reader sends a position
+/// at least every second).
+pub const STOP_DRAIN: Duration = Duration::from_secs(3);
+
+/// The later of the shard row's position `row` and the position saved
+/// outside the log (`saved`): the saved one when it is a point of the
+/// same feed (tenant, cluster, segment) at or after the row's.
+#[must_use]
+pub fn later_start(row: Start, saved: Option<&[u8]>) -> Start {
+    let Some(Ok(Start::After(e))) = saved.map(Start::decode) else {
+        return row;
+    };
+    let later = match &row {
+        Start::After(p) => {
+            e.tenant == p.tenant
+                && e.cluster == p.cluster
+                && e.segment == p.segment
+                && e.pos.reached(&p.pos)
+                && e != *p
+        }
+        Start::At { cluster, pos } => e.cluster == *cluster && e.pos.reached(pos),
+    };
+    if later { Start::After(e) } else { row }
+}
+
+fn start_pos(s: &Start) -> GtidPos {
+    match s {
+        Start::After(t) => t.pos.clone(),
+        Start::At { pos, .. } => pos.clone(),
+    }
+}
+
+/// `base` moved on over `own`, this sequencer's own writes: each one that
+/// is the next transaction of its domain (nothing else lies between).
+fn past_own(base: &GtidPos, own: &[Gtid]) -> GtidPos {
+    let mut out = base.clone();
+    let mut own = own.to_vec();
+    own.sort_by_key(|g| (g.domain, g.seq));
+    for g in own {
+        if out
+            .get(g.domain)
+            .is_some_and(|x| x.seq.checked_add(1) == Some(g.seq))
+        {
+            out.update(g);
+        }
+    }
+    out
+}
+
+/// Whether `pos` has passed `target` in every domain both name (a domain
+/// only `target` names, the local one of the node it was read on, isn't
+/// in this feed).
+fn passed(pos: &GtidPos, target: &GtidPos) -> bool {
+    target
+        .iter()
+        .all(|g| pos.get(g.domain).is_none_or(|x| x.seq >= g.seq))
 }
 
 /// Watermarks that go nowhere.
@@ -511,13 +624,18 @@ impl Sequencer {
             }
         };
         let epoch = acq.epoch;
-        tracing::info!(epoch = epoch.0, start = ?acq.start, "stream sequencer acquired its log shard");
+        let saved = self.marks.saved_position().await;
+        let start = later_start(acq.start.clone(), saved.as_deref());
+        if start != acq.start {
+            tracing::info!(epoch = epoch.0, checkpoint = ?acq.start, start = ?start, "stream sequencer resumes from its exact position, past its own last writes");
+        }
+        tracing::info!(epoch = epoch.0, start = ?start, "stream sequencer acquired its log shard");
         // Read in a task of its own: a feed's `next` isn't cancel-safe (a
         // tail takes a group from its source, then awaits catalog lookups),
         // and the deadlines below would drop it half-way, losing the group
         // (new instances used to lose their first record).
         let mut feed = sprig_feed::pump::Pump::start(
-            self.feed.open(&acq.start).await?,
+            self.feed.open(&start).await?,
             sprig_feed::pump::Pump::<FeedItem>::AHEAD,
             "stream sequencer",
         );
@@ -532,18 +650,33 @@ impl Sequencer {
         let mut dirty = false;
         let mut last_write = Instant::now();
         let far = Duration::from_secs(3600);
+        // The position last made durable (the shard row's, or the one
+        // saved outside the log), and this sequencer's own writes since.
+        let mut base = start_pos(&start);
+        let mut own: Vec<Gtid> = self.store.take_own();
+        // Stopping: until when it reads on, and the log cluster's position
+        // its feed must pass first.
+        let mut stopping: Option<Instant> = None;
+        let mut target: Option<GtidPos> = None;
         loop {
             let now = Instant::now();
-            let deadline = if let Some(f) = first_pending {
+            let mut deadline = if let Some(f) = first_pending {
                 f + self.opts.window()
             } else if dirty {
                 last_write + self.opts.idle_checkpoint
             } else {
                 now + far
             };
+            if let Some(s) = stopping {
+                deadline = deadline.min(s);
+            }
             let item = tokio::select! {
                 biased;
-                () = stop.cancelled() => return Ok(RunEnd::Stopped),
+                () = stop.cancelled(), if stopping.is_none() => {
+                    stopping = Some(Instant::now() + STOP_DRAIN);
+                    target = self.store.position().await.unwrap_or_default();
+                    None
+                }
                 r = feed.next() => Some(r?),
                 () = tokio::time::sleep_until(deadline) => None,
             };
@@ -583,69 +716,125 @@ impl Sequencer {
                 }
             }
             let now = Instant::now();
-            let due = pending.len() >= self.opts.max_batch
-                || first_pending.is_some_and(|f| now >= f + self.opts.window())
-                || (pending.is_empty() && dirty && now >= last_write + self.opts.idle_checkpoint);
-            if !due {
-                continue;
-            }
-            let Some(token) = resume.clone() else {
-                continue;
-            };
-            let ids: Vec<[u8; 16]> = pending.iter().filter_map(|(_, id)| *id).collect();
-            let batch = Batch {
-                records: pending.iter().map(|(r, _)| r.clone()).collect(),
-                resume: Start::After(token).encode(),
-            };
-            let Some(outcome) = self.append(epoch, &batch, stop).await? else {
-                return Ok(RunEnd::Stopped);
-            };
-            match outcome {
-                AppendOutcome::Fenced { now } => {
-                    tracing::warn!(
-                        epoch = epoch.0,
-                        now = now.0,
-                        "stream sequencer fenced: another one took the log shard"
-                    );
-                    return Ok(RunEnd::Fenced);
-                }
-                AppendOutcome::Appended(a) => {
-                    self.stats.appended.fetch_add(a.records, Ordering::Relaxed);
-                    self.stats
-                        .duplicates
-                        .fetch_add(a.duplicates, Ordering::Relaxed);
-                    self.stats.batches.fetch_add(1, Ordering::Relaxed);
-                    metrics::counter!("sprig_stream_records_appended_total", "kind" => kind)
-                        .increment(a.records);
-                    #[allow(clippy::cast_precision_loss)]
-                    if let Some(oldest) = batch
-                        .records
-                        .iter()
-                        .map(|r| r.ts_ms)
-                        .filter(|t| *t > 0)
-                        .min()
+            let flush = !pending.is_empty()
+                && (pending.len() >= self.opts.max_batch
+                    || first_pending.is_some_and(|f| now >= f + self.opts.window())
+                    || stopping.is_some());
+            let idle = pending.is_empty()
+                && dirty
+                && stopping.is_none()
+                && now >= last_write + self.opts.idle_checkpoint;
+            if let Some(token) = resume.clone().filter(|_| flush || idle) {
+                if idle && past_own(&base, &own).reached(&token.pos) {
+                    // The feed moved over nothing but this sequencer's own
+                    // writes: saved outside the log, which adds no write
+                    // after it (the shard row's position would lie behind
+                    // its own write again).
+                    if !base.reached(&token.pos)
+                        && self
+                            .marks
+                            .save_position(epoch, &Start::After(token.clone()).encode())
+                            .await
                     {
-                        let wall = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0));
-                        metrics::histogram!("sprig_stream_sequencing_lag_seconds")
-                            .record((wall - oldest).max(0) as f64 / 1000.0);
+                        base = token.pos.clone();
+                        own.retain(|g| base.get(g.domain).is_none_or(|x| g.seq > x.seq));
                     }
-                    if !a.high_watermarks.is_empty() {
-                        self.marks.publish(epoch, &a.high_watermarks).await;
+                    dirty = false;
+                    last_write = Instant::now();
+                } else {
+                    let ids: Vec<[u8; 16]> = pending.iter().filter_map(|(_, id)| *id).collect();
+                    let batch = Batch {
+                        records: pending.iter().map(|(r, _)| r.clone()).collect(),
+                        resume: Start::After(token.clone()).encode(),
+                    };
+                    let Some(outcome) = self.append(epoch, &batch, stop).await? else {
+                        return Ok(RunEnd::Stopped);
+                    };
+                    match outcome {
+                        AppendOutcome::Fenced { now } => {
+                            tracing::warn!(
+                                epoch = epoch.0,
+                                now = now.0,
+                                "stream sequencer fenced: another one took the log shard"
+                            );
+                            return Ok(RunEnd::Fenced);
+                        }
+                        AppendOutcome::Appended(a) => {
+                            self.appended(kind, epoch, &batch, &a, &ids).await;
+                        }
                     }
-                    if self.opts.cleanup
-                        && !ids.is_empty()
-                        && let Err(e) = self.store.cleanup(&ids).await
-                    {
-                        tracing::debug!(error = %e, "outbox cleanup failed; the sweep will retry");
+                    pending.clear();
+                    first_pending = None;
+                    dirty = false;
+                    last_write = Instant::now();
+                    base = token.pos.clone();
+                    own.extend(self.store.take_own());
+                    own.retain(|g| base.get(g.domain).is_none_or(|x| g.seq > x.seq));
+                    if stopping.is_some() {
+                        // This append is a later write: read on past it.
+                        target = self.store.position().await.unwrap_or_default();
                     }
                 }
             }
-            pending.clear();
-            first_pending = None;
-            dirty = false;
-            last_write = Instant::now();
+            if let Some(end) = stopping {
+                let at = resume.as_ref().map_or(&base, |t| &t.pos);
+                let quiet = txn.is_empty() && pending.is_empty();
+                let drained = quiet && target.as_ref().is_none_or(|c| passed(at, c));
+                if drained || Instant::now() >= end {
+                    if quiet
+                        && let Some(t) = &resume
+                        && !base.reached(&t.pos)
+                        && self
+                            .marks
+                            .save_position(epoch, &Start::After(t.clone()).encode())
+                            .await
+                    {
+                        tracing::debug!(epoch = epoch.0, pos = %t.pos, passed = drained, "stream sequencer saved its exact position at its stop");
+                    }
+                    return Ok(RunEnd::Stopped);
+                }
+            }
+        }
+    }
+
+    /// An append's counters, metrics, watermarks and outbox clean-up.
+    async fn appended(
+        &self,
+        kind: &'static str,
+        epoch: LeaderEpoch,
+        batch: &Batch,
+        a: &Appended,
+        ids: &[[u8; 16]],
+    ) {
+        self.stats.appended.fetch_add(a.records, Ordering::Relaxed);
+        self.stats
+            .duplicates
+            .fetch_add(a.duplicates, Ordering::Relaxed);
+        self.stats.batches.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("sprig_stream_records_appended_total", "kind" => kind)
+            .increment(a.records);
+        #[allow(clippy::cast_precision_loss)]
+        if let Some(oldest) = batch
+            .records
+            .iter()
+            .map(|r| r.ts_ms)
+            .filter(|t| *t > 0)
+            .min()
+        {
+            let wall = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0));
+            metrics::histogram!("sprig_stream_sequencing_lag_seconds")
+                .record((wall - oldest).max(0) as f64 / 1000.0);
+        }
+        if !a.high_watermarks.is_empty() {
+            self.marks.publish(epoch, &a.high_watermarks).await;
+        }
+        if self.opts.cleanup
+            && !ids.is_empty()
+            && let Err(e) = self.store.cleanup(ids).await
+        {
+            tracing::debug!(error = %e, "outbox cleanup failed; the sweep will retry");
         }
     }
 }
