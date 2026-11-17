@@ -29,6 +29,9 @@ for _ in $(seq 1 60); do (echo >/dev/tcp/127.0.0.1/9876) 2>/dev/null && break; s
     TEST_NEO4J_PASS=$B_PASS TEST_NEO4J_SCHEME=bolt TEST_NEO4J_VERSION=$NEOVER TEST_NEO4J_EDITION=$EDITION \
     TEST_NEO4J_CLUSTER=False TEST_NEO4J_DEFAULT_DB=neo4j \
     "$PY" "$BENCH_DIR/../compose/clients-bolt/testkit_run.py" "$TK" "$LOGDIR/tests.tsv") 2>"$LOGDIR/unittest.log" || true
+kill $backend 2>/dev/null || true
+# The backend logs every protocol message (tens of MB): keep the last 200 kB.
+tail -c 200000 "$LOGDIR/backend.log" >"$LOGDIR/backend.tail.log" && rm -f "$LOGDIR/backend.log"
 read -r pass fail skip < <(awk -F'\t' '{c[$2]++} END {print c["pass"]+0, c["fail"]+0, c["skip"]+0}' "$LOGDIR/tests.tsv")
 echo "testkit python: $pass pass, $fail fail, $skip skip"
 emit graph compat testkit-python passed "$pass" tests higher --total $((pass + fail)) \

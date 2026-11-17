@@ -33,6 +33,7 @@ function receive() {
     if (got.length === N) {
       out.received = got.length;
       out.order = got.join(',');
+      out.each_once = new Set(got).size === N;
       out.release_redelivered = got.filter((x) => x === 'm3').length === 1;
       out.properties_kept = props.every((p, k) => p === +got[k].slice(1));
       out.done = true;

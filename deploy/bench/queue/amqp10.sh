@@ -19,7 +19,7 @@ while [[ $# -gt 0 ]]; do case $1 in
     --ref-user) RUSER=$2; shift 2 ;; --ref-password) RPASS=$2; shift 2 ;;
     --ref-vhost) RVHOST=$2; shift 2 ;; --ref-version) RVER=$2; shift 2 ;;
     *) echo "unknown $1" >&2; exit 2 ;; esac; done
-q=bench.a10.$(date +%s)
+q=bench.a10.$(date +%s).$$.$RANDOM
 declare_q() {
     PYTHONPATH=${BENCH_PIKA:-} python3 - "$@" <<'EOF'
 import sys, pika
@@ -37,7 +37,7 @@ run_side "$HOST" "$PORT" "$B_USER" "$B_PASS" "${B_DB:-/}" "$q" >"$LOGDIR/target.
 read -r total same < <(python3 -I - "$LOGDIR/ref.json" "$LOGDIR/target.json" "$LOGDIR/diff.txt" <<'EOF'
 import json, sys
 a, b = (json.load(open(p)) for p in sys.argv[1:3])
-keys = sorted((set(a) | set(b)) - {"done", "order"})  # the order after a release is not specified by AMQP 1.0; logged only
+keys = sorted(k for k in set(a) | set(b) if k not in ("done", "order"))
 diff = [k for k in keys if a.get(k) != b.get(k)]
 open(sys.argv[3], "w").write("".join(f"{k}: reference {a.get(k)!r} target {b.get(k)!r}\n" for k in diff))
 print(len(keys), len(keys) - len(diff))

@@ -51,6 +51,13 @@ use mysql_async::prelude::Queryable;
 
 const DB: &str = "rx_live";
 
+/// One hit: (`id`, `chunk_no`, `bm25_rank`, `vector_rank`).
+type Hit = (i64, u32, Option<u32>, Option<u32>);
+
+/// A statement's hits (`id`, `bm25_rank`), its warning count and its
+/// warnings (code, message).
+type Warned = (Vec<(i64, Option<u32>)>, u16, Vec<(u16, String)>);
+
 struct Checks {
     n: usize,
     failed: Vec<String>,
@@ -505,10 +512,7 @@ async fn shell_watching(
 
 /// How many questions have the same hits (id, chunk) in their top five,
 /// and how many the same hits with every rank.
-fn same_hits(
-    a: &[Vec<(i64, u32, Option<u32>, Option<u32>)>],
-    b: &[Vec<(i64, u32, Option<u32>, Option<u32>)>],
-) -> (usize, usize) {
+fn same_hits(a: &[Vec<Hit>], b: &[Vec<Hit>]) -> (usize, usize) {
     let sets = a
         .iter()
         .zip(b)
@@ -524,10 +528,7 @@ fn same_hits(
 
 /// How many questions keep every hit's vector rank (hits in both), and
 /// how many keep their best hit.
-fn vector_and_top(
-    a: &[Vec<(i64, u32, Option<u32>, Option<u32>)>],
-    b: &[Vec<(i64, u32, Option<u32>, Option<u32>)>],
-) -> (usize, usize) {
+fn vector_and_top(a: &[Vec<Hit>], b: &[Vec<Hit>]) -> (usize, usize) {
     let vec_same = a
         .iter()
         .zip(b)
@@ -548,10 +549,7 @@ fn vector_and_top(
 
 /// `RETRIEVE()`'s (`id`, `bm25_rank`) and the statement's warning count
 /// and warnings (`SHOW WARNINGS`: code, message).
-async fn retrieve_warned(
-    c: &mut mysql_async::Conn,
-    sql: &str,
-) -> (Vec<(i64, Option<u32>)>, u16, Vec<(u16, String)>) {
+async fn retrieve_warned(c: &mut mysql_async::Conn, sql: &str) -> Warned {
     let hits: Vec<(i64, Option<u32>)> = c.query(sql).await.unwrap();
     let count = c.get_warnings();
     let shown: Vec<(String, u16, String)> = c.query("SHOW WARNINGS").await.unwrap();
@@ -1272,7 +1270,7 @@ async fn retrieval_indexes_end_to_end() {
     must(&mut c, "CREATE RETRIEVAL INDEX kbc ON crowd (body)").await;
     let filled = wait_ready(&mut c, "kbc", Duration::from_secs(400)).await;
     ck.ok("the crowded table's index fills", filled.is_some(), || {
-        format!("{:?}", filled)
+        format!("{filled:?}")
     });
     if let Some(d) = filled {
         eprintln!("     fill of 1050 rows: {:.1} s", d.as_secs_f64());
