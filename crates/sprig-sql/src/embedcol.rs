@@ -33,7 +33,7 @@ use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::ops::Range;
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::lex::{self, LexOptions, Token, TokenKind};
 
@@ -220,22 +220,33 @@ pub struct Meta {
 }
 
 impl Meta {
-    /// The comment text: [`COMMENT_TAG`] and a JSON object.
+    /// The comment text: [`COMMENT_TAG`] and a JSON object with its keys
+    /// in alphabetical order. The object is written by hand, not through a
+    /// `serde_json` map, because a map's key order depends on whether
+    /// `serde_json`'s `preserve_order` feature is on in the final build;
+    /// the same column must get the same comment in every binary.
+    /// [`Meta::from_comment`] reads the keys in any order.
     #[must_use]
     pub fn comment(&self) -> String {
-        let mut v = json!({
-            "column": self.column,
-            "model": self.model,
-            "generation": self.generation,
-            "mode": self.mode.as_str(),
-        });
+        let s = |x: &str| Value::String(x.to_owned()).to_string();
+        let mut out = format!(
+            "{{\"column\":{},\"generation\":{}",
+            s(&self.column),
+            self.generation
+        );
         if let Some(n) = self.max_input_tokens {
-            v["max_input_tokens"] = json!(n);
+            out.push_str(&format!(",\"max_input_tokens\":{n}"));
         }
+        out.push_str(&format!(
+            ",\"mode\":{},\"model\":{}",
+            s(self.mode.as_str()),
+            s(&self.model)
+        ));
         if self.shadow {
-            v["shadow"] = json!(true);
+            out.push_str(",\"shadow\":true");
         }
-        format!("{COMMENT_TAG}{v}")
+        out.push('}');
+        format!("{COMMENT_TAG}{out}")
     }
 
     /// From [`Meta::comment`]'s text.

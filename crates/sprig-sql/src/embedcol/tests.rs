@@ -299,3 +299,24 @@ fn names() {
         "YbcXef"
     );
 }
+
+#[test]
+fn comment_keys_have_one_order_and_any_order_parses() {
+    let meta = Meta {
+        column: "e\"x".into(),
+        model: "local:bge-small".into(),
+        generation: 3,
+        mode: Mode::Async,
+        max_input_tokens: Some(512),
+        shadow: true,
+    };
+    let c = meta.comment();
+    assert_eq!(
+        c,
+        "sprig:embedding {\"column\":\"e\\\"x\",\"generation\":3,\"max_input_tokens\":512,\"mode\":\"async\",\"model\":\"local:bge-small\",\"shadow\":true}"
+    );
+    assert_eq!(Meta::from_comment(&c), Some(meta.clone()));
+    // Comments written in insertion order by earlier builds still parse.
+    let old = "sprig:embedding {\"column\":\"e\\\"x\",\"model\":\"local:bge-small\",\"generation\":3,\"mode\":\"async\",\"max_input_tokens\":512,\"shadow\":true}";
+    assert_eq!(Meta::from_comment(old), Some(meta));
+}
