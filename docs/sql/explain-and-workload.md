@@ -132,7 +132,7 @@ On the MySQL persona, `performance_schema.events_statements_summary_by_digest` h
 | `QUERY_SAMPLE_TEXT` | Always `NULL`: SprigDB keeps no plain statement text |
 | Lock time, temporary tables, sorts, index use, memory, warnings | `0`: MariaDB can't give them per statement |
 
-The totals run from when this gateway first counted the fingerprint, or from your last `TRUNCATE` of the table. The `sys` views `statement_analysis` and `statements_with_errors_or_warnings` (and their `x$` forms) read the same rows.
+As in MySQL, the table holds at most 10,000 rows (the most recently seen fingerprints), and `DIGEST_TEXT` is cut at 1,024 bytes. The totals run from when this gateway first counted the fingerprint, or from your last `TRUNCATE` of the table. The `sys` views `statement_analysis` and `statements_with_errors_or_warnings` (and their `x$` forms) read the same rows.
 
 ```sql test
 SELECT DIGEST, COUNT_STAR, DIGEST_TEXT

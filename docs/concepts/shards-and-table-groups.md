@@ -206,6 +206,22 @@ A transaction keeps one branch per cluster it touches. How it commits depends on
 
 Galera clusters don't support XA, so a transaction that writes to a Galera cluster and another cluster needs `best_effort` or `sprig_2pc`.
 
+### The relay path
+
+Under `sprig_2pc`, the gateway session holds a held branch on its own connection by default (`txn.sprig_2pc_path = gateway`). If that gateway dies at the wrong moment, another writer could change the held rows before the branch is recovered. `txn.sprig_2pc_path = relay` (tenant, DC or global scope) closes that gap. Every connection of the tenant to a Galera cluster then goes through one relay, run by the node agent on one node of the cluster, and a lost holder's rows stay fenced until the branch is recovered. To use it:
+
+1. Give the agent on every Galera node a `relay_addr` and an `internal_addr` (see [Configuration](../operate/configuration.md#agent)). The agents elect one relay writer per cluster.
+2. Set `txn.non_xa_policy = sprig_2pc` and `txn.sprig_2pc_path = relay` for the tenant.
+
+What changes for the tenant:
+
+- While a cluster has no ready relay writer (during a takeover, or with every agent down), the tenant's statements on that cluster wait up to `backend.acquire_timeout_ms`, then fail with 39448 `ER_SPRIG_HELD_BRANCH_FENCED`, which you can retry. They never go around the relay.
+- A cluster without a ready relay when a branch opens doesn't hold branches: a second writer without XA fails with 39440, as under `reject`.
+- An autocommit `INSERT`, `UPDATE`, `DELETE` or `REPLACE` on a relayed cluster runs inside a transaction, which costs about three times the latency of a direct write.
+- Logins straight to MariaDB with the tenant's backend accounts are refused (4151), and direct sessions are closed. Switching the tenant back to `gateway` lets them in again.
+
+Once a cluster has had a relay, relayed tenants reach it only through one. To retire a cluster's relays, an operator deletes the cluster's `relays/<cluster>` key in etcd.
+
 Other limits and failures:
 
 | Code | Name | Meaning |
@@ -214,6 +230,7 @@ Other limits and failures:
 | 39443 | `ER_SPRIG_DTX_ROLLED_BACK` | The distributed transaction was rolled back; retry it |
 | 39441 | `ER_SPRIG_COMMIT_OUTCOME_UNKNOWN` | The commit's outcome is unknown; the connection closes. The resolver finishes it from the decision row |
 | 39449 | `ER_SPRIG_PHASE2_PENDING` | The previous distributed commit is still finishing on this cluster; retry |
+| 39448 | `ER_SPRIG_HELD_BRANCH_FENCED` | On the relay path, no relay writer is ready, or the tenant's held rows are fenced for recovery; retry |
 
 If a gateway dies between prepare and commit, the controller's resolver finds the prepared branches and commits or rolls them back from the decision row. Operators can see and resolve in-doubt transactions with `sprigctl txn list | show | resolve`.
 

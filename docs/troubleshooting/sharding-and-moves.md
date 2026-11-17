@@ -202,11 +202,12 @@ Keep `reject` unless you accept the trade-off of the others. The real fix is pla
 | `ER_SPRIG_PARTIAL_COMMIT` (39442) | Under `best_effort`, only some clusters committed | Repair the missing part from the message |
 | `ER_SPRIG_HELD_BRANCH_STATEMENT` (39446) | Under `sprig_2pc`, a statement can't be replayed exactly: `UUID()`, unseeded `RAND()`, `SYSDATE()`, `LIMIT` without `ORDER BY` in a write. The transaction is rolled back | Compute such values in the application and pass them as literals |
 | `ER_SPRIG_PHASE2_PENDING` (39449) | The session's previous distributed commit is still being finished on the cluster this statement needs | Retry the statement |
+| `ER_SPRIG_HELD_BRANCH_FENCED` (39448) | With `txn.sprig_2pc_path = relay`, no relay writer of the cluster was ready within `backend.acquire_timeout_ms`, or the tenant's held rows are fenced while a lost branch is recovered | Retry with backoff. If it lasts, check the node agents' `relay_addr` and that one agent of the cluster holds the relay |
 | 1205 | A lock wait over `txn.distributed_lock_wait_timeout_seconds` (10) in a transaction with two branches | Retry; keep distributed transactions short |
 
 ### In-doubt transactions
 
-A transaction is *in doubt* when its branches were prepared but the gateway died before finishing them. The resolver on the controller finishes them on its own, after they are `txn.resolver_min_age_seconds` (30) old. To see and, if needed, resolve them:
+A transaction is *in doubt* when its branches were prepared but the gateway died before finishing them. The resolver on the controller finishes them on its own, after they are `txn.resolver_min_age_seconds` (30) old. A gateway waits `txn.commit_resolve_timeout_ms` for an unclear commit's outcome before it answers 39441, so that setting must stay below `txn.resolver_min_age_seconds`: setting either one so that it doesn't fails with 39080, and a process whose configuration breaks the rule doesn't start. To see and, if needed, resolve them:
 
 ```sh
 sprigctl txn list --tenant acme

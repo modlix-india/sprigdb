@@ -131,7 +131,7 @@ score(dc) = 0.4 × storage_spare + 0.4 × cpu_spare + 0.2 × connections_spare
 
 with the weights from `placement.least_busy_weights`. Only DCs that have been `active` for `recovery.stability_minutes` (60) count, unless none has, as in a new deployment. If no allowed DC has a placeable cluster, creation fails with 39525 `ER_SPRIG_NO_DC_CAPACITY`. With `--cluster`, the tenant is homed in the DC of the controller you called, on that cluster.
 
-A child tenant's residency lies within its parent's, so its home must be one of the parent's allowed DCs. See [Residency](../security/residency.md).
+A child tenant's residency lies within its parent's, so its home must be one of the parent's allowed DCs. Within that, a child can live in another DC than its parent: `sprigctl tenant create c --under p --cluster <a cluster of that DC>` creates it there directly. See [Residency](../security/residency.md).
 
 ## Move a tenant to another DC
 
@@ -158,6 +158,8 @@ What happens:
 3. It catches up from the binlog, verifies, and waits until lag stays under `mover.ready_max_lag_ms` for `mover.ready_sustain_seconds`.
 4. It holds writes, fences the source, applies to the fence position, and commits the new home in one transaction. Every gateway in every DC follows the new home.
 5. An attempt that would hold writes longer than the budget is aborted; after three, the move rolls back and the tenant stays where it was.
+
+If the tenant has an automatic standby in the target DC, the move drops the standby first and waits up to 60 seconds for its job to end; a dry run shows `drops_standby`. If the standby's job still runs then, the move fails with 39131, and you can retry it shortly. The move makes its own copy.
 
 What clients see: writes pause for at most the budget. Sessions that held temporary tables, locks or an XA transaction are ended with 39502 `ER_SPRIG_SESSION_MOVED`; reconnect. Other sessions continue.
 

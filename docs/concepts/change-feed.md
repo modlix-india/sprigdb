@@ -33,7 +33,7 @@ Tokens keep working when SprigDB moves the tenant's data. When the mover cuts a 
 
 ### How far back it reaches
 
-The feed can only read what the binlogs still hold. Each cluster keeps binlogs for `binlog_expire_logs_seconds` (a MariaDB setting); SprigDB warns when a cluster keeps less than `cluster.min_binlog_retention_hours` (24). A resume token older than the oldest binlog fails with 39800 `ER_SPRIG_FEED_HISTORY_LOST`, and the consumer must start again from now.
+The feed can only read what the binlogs still hold. Each cluster keeps binlogs for `binlog_expire_logs_seconds` (a MariaDB setting); SprigDB warns when a cluster keeps less than `cluster.min_binlog_retention_hours` (24). A resume token older than the oldest binlog fails with 39800 `ER_SPRIG_FEED_HISTORY_LOST`, and the consumer must start again from now. The message names the missing GTID domain and the node, and `sprig_feed_history_lost_total{node}` counts each refusal: alert on any increase. On Galera, purged node-local GTID domains that hold no tenant writes don't stop a reader.
 
 A stream can also start at a point in time, within the same history; see [Starting at a point in time](#starting-at-a-point-in-time).
 

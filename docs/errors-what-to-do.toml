@@ -584,8 +584,8 @@ meaning = "Under `txn.non_xa_policy = sprig_2pc`, a branch on a cluster without 
 what_to_do = "Compute such values in the application and pass them as literals, add `ORDER BY` to limited writes, then retry the transaction."
 
 [ER_SPRIG_HELD_BRANCH_FENCED]
-meaning = "A node's agent refuses the tenant's connections to that node while it recovers a held branch whose holder was lost. Declared for this case; no current path raises it."
-what_to_do = "Retry after a short delay; recovery finishes on its own."
+meaning = "On a tenant whose distributed commits go through the relay (`txn.sprig_2pc_path = relay`), no relay writer of the cluster was ready within `backend.acquire_timeout_ms` (during a takeover, or with every node agent down), or the tenant's held rows on that node are fenced while a branch whose holder was lost is recovered. The statement didn't run; statements never go around the relay."
+what_to_do = "Retry with backoff; a takeover or recovery finishes on its own. If it lasts, check that the cluster's node agents are up, that their `relay_addr` is reachable, and that one of them holds the relay."
 
 [ER_SPRIG_PHASE2_PENDING]
 meaning = "A branch of the session's last distributed commit is still being finished on the cluster this statement needs (phase 2 outlasted `txn.phase2_wait_ms`, and settling it took longer than `txn.commit_resolve_timeout_ms`). The statement didn't run."
@@ -1040,8 +1040,8 @@ meaning = "The resume token is malformed or belongs to another tenant (MongoDB c
 what_to_do = "Use a token your own stream returned, unchanged; start without a token if you don't have one."
 
 [ER_SPRIG_FEED_SOURCE_UNSUPPORTED]
-meaning = "The change stream can't run as asked: the caller isn't a tenant user, an unsupported start option such as `start_at_hlc` was given, or the cluster's binlog settings don't meet the feed's requirements."
-what_to_do = "Use `start_after` with a token, call as a tenant user, and on the cluster use `binlog_format = ROW` with full row images."
+meaning = "The change stream can't run as asked: the caller isn't a tenant user, the cluster's binlog settings don't meet the feed's requirements, or a stream asked to start at a time (`start_at_hlc`, MongoDB's `startAtOperationTime`) on a cluster that has no time index yet (just added or upgraded, or a Galera cluster without `wsrep_gtid_mode`)."
+what_to_do = "Call as a tenant user, and on the cluster use `binlog_format = ROW` with full row images. For a start time on a new cluster, wait until its time index has caught up, or start with a resume token (`start_after`) instead."
 
 [ER_SPRIG_FEED_SUBSCRIPTION_EXISTS]
 meaning = "A change-feed subscription with that name already exists."
@@ -1132,8 +1132,8 @@ meaning = "A document's `_id`, once encoded, is longer than 1,024 bytes. MongoDB
 what_to_do = "Use a shorter `_id`, such as an `ObjectId` or a hash of the long value, and keep the long value in another field."
 
 [ER_SPRIG_DOC_FEATURE_UNSUPPORTED]
-meaning = "A MongoDB command, operator or option that this release doesn't support, such as `$where`, `mapReduce`, capped or time-series collections, `startAtOperationTime` on a change stream, or some `explain` targets. The message names it. MongoDB clients see `codeName` `SprigDocFeatureUnsupported`."
-what_to_do = "Rewrite the operation without the feature the message names, for example with an aggregation pipeline instead of `$where` or `mapReduce`. A retry won't help."
+meaning = "A MongoDB feature that this release doesn't support, such as views, time-series or clustered collections, Queryable Encryption, `2d` or `geoHaystack` indexes, a compound `2dsphere` index, or some `explain` targets. The message names it. MongoDB clients see `codeName` `SprigDocFeatureUnsupported`."
+what_to_do = "Rewrite the operation without the feature the message names: run a view's pipeline as an aggregation, use an ordinary collection with an index on the time field instead of a time-series one, and `2dsphere` with GeoJSON points instead of `2d`. A retry won't help."
 
 [ER_SPRIG_SHARD_KEY_ARRAY]
 meaning = "Reserved: this release doesn't return it. It is kept for an array value in a collection's shard key field."
@@ -1581,108 +1581,6 @@ what_to_do = "Note the time, gateway and statement, find the error in that proce
 
 # Codes not raised by this build. Kept for when they are; the generator
 # shows only codes in SprigCode.
-
-[ER_SPRIG_ROLE_ACTIVATION_TIMEOUT]
-meaning = "Combined role not ready."
-
-[ER_SPRIG_TOO_MANY_ROLE_SETS]
-meaning = "Too many active-role sets."
-
-[ER_SPRIG_GRANT_TARGET_MISMATCH]
-meaning = "Role cycle; wrong resource kind."
-
-[ER_SPRIG_REDIS_ACL_UNSUPPORTED]
-meaning = "Redis rule SprigDB can't represent."
-
-[ER_SPRIG_GRANT_OUTSIDE_SUBTREE]
-meaning = "Grant up or sideways the tree."
-
-[ER_SPRIG_TENANT_NOT_IN_SUBTREE]
-meaning = "USE TENANT or management outside the subtree."
-
-[ER_SPRIG_STALE_EPOCH]
-meaning = "An internal request names an older epoch."
-
-[ER_SPRIG_KEY_CHANGE_TOO_LARGE]
-meaning = "A key update would move too many rows."
-
-[ER_SPRIG_SHARD_UNAVAILABLE]
-meaning = "HY000."
-
-[ER_SPRIG_EXPLAIN_NOTE]
-meaning = "HY000."
-
-[ER_SPRIG_XA_NOT_SUPPORTED]
-meaning = "HY000."
-
-[ER_SPRIG_CLAUSE_IGNORED]
-meaning = "ENCRYPTION, AUTOEXTEND_SIZE, SECONDARY_ENGINE."
-
-[ER_SPRIG_TYPE_NOT_FOUND]
-meaning = "Unknown type."
-
-[ER_SPRIG_TYPE_MISMATCH]
-meaning = "Upsert meets an unrelated type."
-
-[ER_SPRIG_TYPE_VALIDATION_FAILED]
-meaning = "Schema failure (MongoDB: 121)."
-
-[ER_SPRIG_KV_TARGET_EXISTS]
-meaning = "ALREADY_EXISTS."
-
-[ER_SPRIG_KV_SUBTREE_TOO_LARGE]
-meaning = "FAILED_PRECONDITION."
-
-[ER_SPRIG_KV_TXN_TOO_LARGE]
-meaning = "INVALID_ARGUMENT."
-
-[ER_SPRIG_KV_FILTER_UNSUPPORTED]
-meaning = "INVALID_ARGUMENT."
-
-[ER_SPRIG_KV_SQL_READ_ONLY]
-meaning = "FAILED_PRECONDITION."
-
-[ER_SPRIG_PAGE_TOKEN_INVALID]
-meaning = "INVALID_ARGUMENT."
-
-[ER_SPRIG_FEED_STALLED]
-meaning = "Scope stalled feed.stall_seconds (6, resumable)."
-
-[ER_SPRIG_FEED_CONSUMER_TOO_SLOW]
-meaning = "Edge buffer overflowed."
-
-[ER_SPRIG_FEED_RESIDENCY]
-meaning = "Tenant's data may not be served here."
-
-[ER_SPRIG_FEED_TOO_MANY_READERS]
-meaning = "No catch-up slot (retryable)."
-
-[ER_SPRIG_FEED_INVALIDATED]
-meaning = "Watched object dropped or renamed."
-
-[ER_SPRIG_FEED_DIVERGED]
-meaning = "Failover lost delivered transactions (280)."
-
-[ER_SPRIG_REDIS_TLS_REQUIRED]
-meaning = "SPRIG, then close."
-
-[ER_SPRIG_REDIS_CROSS_SHARD_TOO_LARGE]
-meaning = "SPRIG past redis.max_cross_shard_elements."
-
-[ER_SPRIG_REDIS_OUTPUT_BUFFER_LIMIT]
-meaning = "Logged; the client is closed, as Redis does."
-
-[ER_SPRIG_GRAPH_PLUGIN_FAILED]
-meaning = "Internal; the call falls back."
-
-[ER_SPRIG_GRAPH_ALGO_FAILED]
-meaning = "SprigAlgoFailed."
-
-[ER_SPRIG_BOLT_TLS_REQUIRED]
-meaning = "Closed before the handshake."
-
-[ER_SPRIG_STUDIO_VERSION_MISMATCH]
-meaning = "Studio needs a newer API (409)."
 
 [ER_SPRIG_EMBEDDING_FAILED]
 meaning = "An embedded column's declaration or change was refused: its source isn't a function of the row (`RAND()`, `NOW()`, a variable, a subquery), its `USING MODEL` alias isn't in `ai.embedding_models`, `VECTOR(n)` isn't the model's dimensions, it asks for `ON CHANGE SYNC` or a provider's model (neither is available yet), its table has no primary key, its name is too long, a re-embedding of it is still running, or a `CHANGE`, `RENAME COLUMN`, `ALTER COLUMN` or plain `MODIFY` would change it. `AI_EMBED` (and `$aiEmbed`) raise it for a model alias that isn't an embedding model, or when the bundled model can't be loaded on the gateway. `CREATE RETRIEVAL INDEX` raises it for a provider's model (not available yet), an unknown alias, a text, title or filter column of a type it can't use, or a table without a primary key; a retrieval index whose worker fails (a column it reads was dropped, the model isn't available) shows it as its error."

@@ -36,7 +36,7 @@ A KIRun definition takes its parameters from the JSON, so a `CREATE FUNCTION` fo
 
 ### JavaScript
 
-JavaScript runs on QuickJS, embedded in the gateway. A body is either a module whose default export is the function (`import { db, sprig } from 'sprig:db'` is the only import), or plain statements with the parameters in scope by name:
+JavaScript runs on QuickJS, embedded in the gateway. A body is either a module whose default export is the function (`import { db, sprig } from 'sprig:db'` is the only import, and `db` and `sprig` work without it too), or plain statements with the parameters in scope by name:
 
 ```js
 // Statements: the declared parameters are in scope.
@@ -671,7 +671,7 @@ ALTER FUNCTION price_for ROLLOUT TO 60 PERCENT;
 CREATE OR REPLACE FUNCTION price_for(customer BIGINT, amount DOUBLE) RETURNS DOUBLE LANGUAGE javascript
   WITH (SPRIG_ROLLOUT = 30, SPRIG_ROLLOUT_BY = 'key:amount') AS $$ return amount * 0.9 $$;
 ```
-- **Automatic rollback.** Gateways count each version's calls, errors and latency, and add them to the catalog every 5 seconds. With at least 20 candidate calls, a candidate whose error rate is above 1% and above twice the active version's, or (both with 20 calls) whose p95 latency is above twice the active version's, is rolled back by SprigDB, and the module's log says why.
+- **Automatic rollback.** Gateways count each version's calls, errors and latency, and add them to the catalog every 5 seconds. With at least 20 candidate calls, a candidate whose error rate is above 1% and above twice the active version's, or (both with 20 calls) whose p95 latency is above twice the active version's, is rolled back by SprigDB, and the module's log says why. Only calls the gateway sees are counted: SQL `CALL`, REST, gRPC, MongoDB, Redis, and `db.call` from code that runs in the engine tier. A `db.call` from compiled code runs inside MariaDB and isn't counted.
 
 Studio's **Rollout** tab, on a function, procedure or trigger, shows the stage (the active and candidate versions, the share and what picks it) and each version's calls (a trigger's runs), errors, error rate, mean, p95 and latency histogram, from `GET /v1/databases/{database}/logic/{kind}/{name}/rollout`. **Move…**, **Promote…** and **Abort…** run the `ALTER ... ROLLOUT` statements above, shown before they run. A trigger's tab has no **Pick by**, since a trigger always picks by key. Functions, procedures and triggers can be staged; `SPRIG_ROLLOUT` on a validation, computed column or schedule fails with 39861.
 

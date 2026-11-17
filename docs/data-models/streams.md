@@ -136,6 +136,8 @@ The update and the record commit together. If the transaction rolls back, nothin
 - Without a column list, two values mean `(key, value)` and three mean `(key, value, headers)`.
 - `ts` and `partition_no` are optional. Without `ts`, the record gets the time of the insert.
 - Publishing needs `INSERT` on the stream or its database.
+- A driver's prepared statement such as `INSERT INTO order_events (key, value) VALUES (?, ?)` works too; the size limit is checked on the values bound at each execute.
+- Values that aren't literals, such as function calls or an `INSERT ... SELECT`, are computed by a `SELECT` first, so such a publish costs one more round trip.
 
 A stream is append-only:
 

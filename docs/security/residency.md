@@ -157,13 +157,13 @@ Gateways outside a pinned tenant's allowed data centres never load its credentia
 - by default, the gateway **hands the login off** to a gateway in the nearest allowed data centre over the internal peer port (7403, mutual TLS). The allowed data centre checks the password with its own login service, lockout counters and audit, and returns only the result. The client must log in over TLS, because the password has to be checked in full there (the fast path isn't available). Each handoff costs one round trip between data centres and is audited as `auth.handoff`;
 - with `--deny-remote-access true`, the gateway refuses the login with `ER_SPRIG_REMOTE_ACCESS_DENIED` (39302) instead.
 
-Every protocol's login follows residency. Most hand off; two can't, because the client's proof can only be checked by the gateway the client is talking to:
+Every protocol's login follows residency. Most hand off; some can't, because the client's proof can only be checked by the gateway the client is talking to:
 
 | Login | Outside an allowed data centre |
 |---|---|
 | MySQL and MariaDB (password or token), HTTP and gRPC (Basic, API key, session or identity-provider token) | Handed off; 39302 with `--deny-remote-access true` |
 | Redis `AUTH`, AMQP `PLAIN` and `AMQPLAIN`, Bolt, Kafka SASL `PLAIN` | Handed off; 39302 with `--deny-remote-access true` |
-| MongoDB SCRAM, AMQP `EXTERNAL` (client certificate) | Can't be handed off: refused with 39301, whose message names the allowed data centres (or 39302 with `--deny-remote-access true`). Connect to a gateway in an allowed data centre |
+| MongoDB SCRAM, Kafka SASL `SCRAM-SHA-256` and `SCRAM-SHA-512`, AMQP `EXTERNAL` (client certificate) | Can't be handed off: refused with 39301, whose message names the allowed data centres (or 39302 with `--deny-remote-access true`). Connect to a gateway in an allowed data centre |
 
 An API key or token is checked in the allowed data centre over the handoff, as a password is. Handoffs that can't be relayed are counted in `sprig_auth_handoffs_total` with outcome `not_relayable`. 
 A handoff carries whether the client presented a verified certificate, with its subject and issuer, so accounts with `REQUIRE X509`, `REQUIRE SUBJECT` or `REQUIRE ISSUER` are checked in the allowed data centre as on a direct login (see [Client certificates](tls.md#client-certificates)). A gateway of an earlier release hands off no subject or issuer, so `REQUIRE SUBJECT` and `REQUIRE ISSUER` accounts are refused through it until it is upgraded. After a login, statements go to the tenant's clusters in its home data centre as for any tenant.

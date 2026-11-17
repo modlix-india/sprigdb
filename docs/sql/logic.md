@@ -504,7 +504,7 @@ Stream and queue triggers run as the definer. JavaScript and Lua triggers compil
 JavaScript and Lua code gets one argument, `ctx` (also a global):
 
 - `ctx.record`: `stream`, `partition`, `offset`, `key`, `value`, `headers`, `timestamp`;
-- `ctx.message`: `queue`, `exchange`, `routingKey`, `body`, `properties`, `redelivered`, `deliveryCount`.
+- `ctx.message`: `queue`, `exchange`, `routingKey`, `body`, `properties`, `redelivered`, `deliveryCount`, `vhost`.
 
 KIRun parameters bind by name to those fields, or to `record`, `message` or `ctx` for the whole object.
 

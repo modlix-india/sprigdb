@@ -68,7 +68,7 @@ CREATE DATABASE mq;
 
 Exchanges, queues and bindings belong to their virtual host, so two tenants (or two databases) can each have a queue named `billing`.
 
-A gateway keeps an open virtual host in memory only while it is in use. After `queue.vhost_idle_close_seconds` (300) with nothing to do, it closes it; the next connection, or a delayed or expiring message falling due, opens it again, so delays and TTLs still fire on time. Nothing in the queues is lost. The metrics `sprig_queue_vhosts_open`, `sprig_queue_vhost_closes_total` and `sprig_queue_vhost_wakeups_total` show it.
+A gateway keeps an open virtual host in memory only while it is in use. After `queue.vhost_idle_close_seconds` (300) with nothing to do, it closes it; the next connection, or a delayed or expiring message falling due, opens it again, so delays and TTLs still fire. A delayed message written through another gateway into an idle virtual host can be up to 2 seconds late. Nothing in the queues is lost. The metrics `sprig_queue_vhosts_open`, `sprig_queue_vhost_closes_total` and `sprig_queue_vhost_wakeups_total` show it.
 
 ## Log in
 

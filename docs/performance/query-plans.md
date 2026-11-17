@@ -194,6 +194,7 @@ Some `SELECT` statements can't be answered by running them on each shard and mer
 
 - **Gathered read** (`Gather` in the plan): the rows each table needs are copied into temporary tables on the session's cluster, filtered by the statement's own conditions where they can be pushed down, and the statement runs once over the copies. A gathered read may copy at most `router.gather.max_rows` (100,000) rows; at most `router.gather.max_concurrent` (4) run at once per gateway.
 - **Analytic read**: the same statement runs inside the gateway over streams of the shards' rows, with joins, grouping, aggregates in exact integer and decimal arithmetic, and window functions, and results rendered as MariaDB would. It may read at most `router.analytics.max_rows` (50,000,000) rows and spill at most `router.analytics.spill_mb` (4096 MB) to disk.
+  An aggregating statement with `HAVING`, or with expressions over its aggregates (`SUM(a) * 2`, `ROUND(AVG(q), 1)`, `CASE`), can be an analytic read too: the gateway computes the groups and aggregates, and MariaDB computes the select list, `HAVING`, `ORDER BY` and `LIMIT` over them, so every value you see is MariaDB's. Aggregates of expressions (`SUM(a * b)`), `DISTINCT`, window functions over aggregates, subqueries, and a name that is both a column and an alias are still gathered.
 
 `router.analytics.mode` chooses between them:
 

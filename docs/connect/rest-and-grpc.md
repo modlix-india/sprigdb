@@ -163,7 +163,7 @@ Without that header, the same objects come as one JSON array.
 | `language` | string | `sql` | `sql`, `cypher`, `gql` or `mongo` |
 | `output` | string | `relaxed_ejson` | For `mongo`: `relaxed_ejson` or `canonical_ejson` |
 
-**Spaces.** A `Sprig-Space: <space>` header (gRPC metadata `sprig-space`) makes the call's session act in that [space](../sql/inheritance.md#use-space), as `USE SPACE` would. It applies to SQL calls, the other REST APIs and change streams. An unknown space fails with 39880 `ER_SPRIG_SPACE_NOT_FOUND`.
+**Spaces.** A `Sprig-Space: <space>` header (gRPC metadata `sprig-space`) makes the call's session act in that [space](../sql/inheritance.md#use-space), as `USE SPACE` would. It applies to SQL calls, the other REST APIs and change streams. An unknown space fails with 39880 `ER_SPRIG_SPACE_NOT_FOUND`. A space outside your home space's subtree fails with 39884. A transaction keeps the space its `Begin` call named.
 
 There are no bound parameters: the statement is SQL text. Quote values yourself, or call a [logic function](../data-models/logic.md) with `POST /v1/databases/{database}/functions/{name}:call`.
 
