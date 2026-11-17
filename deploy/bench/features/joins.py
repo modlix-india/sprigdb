@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Feature probe: a join. Two tables (collections) of customers and orders,
 one query that returns each order with its customer's name, matched by value."""
-import lib
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lib  # noqa: E402
 from lib import check
 
 WANT = [["a", "10"], ["a", "11"], ["b", "20"]]

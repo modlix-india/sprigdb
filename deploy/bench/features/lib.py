@@ -67,7 +67,7 @@ class Target:
     # SQL over the MySQL protocol (MySQL, SprigDB).
     def mysql(self, sql, user=None, password=None, db=None):
         h, p = self.hp("mysql")
-        cmd = ["mysql", "-h", h, "-P", str(p), "-u", user or self.c["user"], "--ssl-mode=DISABLED", "-N", "-B"]
+        cmd = ["mysql", "-h", h, "-P", str(p), "-u", user or self.c["user"], "--ssl-mode=" + self.c.get("ssl_mode", "PREFERRED"), "-N", "-B"]
         db = db or self.c.get("db")
         if db:
             cmd += ["-D", db]
@@ -109,7 +109,10 @@ class Target:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 txt = r.read().decode()
-                return r.status, (json.loads(txt) if txt.strip()[:1] in "[{" else txt)
+                try:
+                    return r.status, (json.loads(txt) if txt.strip()[:1] in "[{" else txt)
+                except ValueError:
+                    return r.status, txt
         except urllib.error.HTTPError as e:
             txt = e.read().decode(errors="replace")
             try:
@@ -117,7 +120,7 @@ class Target:
             except ValueError:
                 return e.code, txt
 
-    def surreal(self, sql, token=None):
+    def surreal(self, sql, token=None, allow_err=False):
         h, p = self.hp("http")
         hdr = {"Accept": "application/json", "surreal-ns": self.c["ns"], "surreal-db": self.c["db"]}
         auth = None
@@ -127,9 +130,10 @@ class Target:
             auth = (self.c["user"], self.c["password"])
         st, res = self.http("POST", f"http://{h}:{p}/sql", sql, hdr, auth)
         if st != 200 or not isinstance(res, list):
-            raise Fail(f"HTTP {st}: {str(res)[:200]}")
+            info = res.get("information", res) if isinstance(res, dict) else res
+            raise Fail(f"HTTP {st}: {str(info)[:300]}")
         for r in res:
-            if r.get("status") != "OK":
+            if r.get("status") != "OK" and not allow_err:
                 raise Fail(str(r.get("result"))[:200])
         return [r.get("result") for r in res]
 
@@ -191,7 +195,8 @@ def wire_bolt(h, p):
         s.settimeout(5)
         s.sendall(b"\x60\x60\xb0\x17" + b"\x00\x08\x08\x05" + b"\x00\x00\x04\x04" + b"\x00\x00\x00\x03" + b"\x00" * 4)
         r = s.recv(4)
-        return len(r) == 4 and r != b"\x00\x00\x00\x00"
+        # The server answers with one of the offered versions: 00 00 minor major.
+        return len(r) == 4 and r[0] == 0 and r[1] == 0 and r[3] in (3, 4, 5) and r[2] <= 8
 
 
 def run(feature, model, probes, title):

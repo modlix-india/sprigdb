@@ -2,7 +2,11 @@
 """Feature probe: a multi-document (multi-row) transaction. Two documents
 written in one transaction and rolled back leave nothing; written and
 committed, both are there."""
-import lib
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lib  # noqa: E402
 from lib import check
 
 
@@ -31,7 +35,9 @@ db.{n}.drop(); print(a+','+b);""")
 
 
 def surreal(t):
-    r = t.surreal("BEGIN TRANSACTION; CREATE txd:1; CREATE txd:2; CANCEL TRANSACTION; SELECT count() FROM txd GROUP ALL;")
+    t.surreal("DEFINE TABLE txd;")
+    t.surreal("BEGIN TRANSACTION; CREATE txd:1; CREATE txd:2; CANCEL TRANSACTION;", allow_err=True)
+    r = t.surreal("SELECT count() FROM txd GROUP ALL;")
     check(r[-1] in ([], [{"count": 0}]), f"after cancel {r[-1]}")
     r = t.surreal("BEGIN TRANSACTION; CREATE txd:1; CREATE txd:2; COMMIT TRANSACTION; SELECT count() FROM txd GROUP ALL; REMOVE TABLE txd;")
     check(r[-2] == [{"count": 2}], f"after commit {r[-2]}")

@@ -37,7 +37,7 @@ run_side "$HOST" "$PORT" "$B_USER" "$B_PASS" "${B_DB:-/}" "$q" >"$LOGDIR/target.
 read -r total same < <(python3 -I - "$LOGDIR/ref.json" "$LOGDIR/target.json" "$LOGDIR/diff.txt" <<'EOF'
 import json, sys
 a, b = (json.load(open(p)) for p in sys.argv[1:3])
-keys = sorted(set(a) | set(b) - {"done"})
+keys = sorted((set(a) | set(b)) - {"done", "order"})  # the order after a release is not specified by AMQP 1.0; logged only
 diff = [k for k in keys if a.get(k) != b.get(k)]
 open(sys.argv[3], "w").write("".join(f"{k}: reference {a.get(k)!r} target {b.get(k)!r}\n" for k in diff))
 print(len(keys), len(keys) - len(diff))
