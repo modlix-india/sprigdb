@@ -779,7 +779,7 @@ audited
 ```
 
 - **The position is kept.** `DISABLE` stops the trigger's job within 5 seconds, so a change committed in those seconds may still run. After that, nothing runs. An after-commit trigger keeps its place in the change feed. A stream trigger keeps its consumer group's offsets. A queue trigger stops taking messages, which stay in the queue for its other consumers.
-- **`ENABLE` resumes where the trigger stopped.** A job starts within a few seconds. What was committed or published while the trigger was off then runs, each change, record or message once and in order, followed by new ones.
+- **`ENABLE` resumes where the trigger stopped.** A job starts within a few seconds, and the first held change, record or message runs within about 20 seconds. What was committed or published while the trigger was off then runs, each change, record or message once and in order, followed by new ones.
 - **Notes.** Both answer with a note, such as `after-commit trigger audit_orders disabled; its job ends within 5 s and its position is kept`. Disabling a disabled trigger, or enabling an enabled one, changes nothing and says so in a note.
 - **The log.** Each change of state adds a line to the trigger's log, such as `disabled by app@%` and `enabled by app@%` (see [Logs and dead letters](#logs-and-dead-letters)).
 - **Deploys.** A `CREATE OR REPLACE` of a disabled trigger deploys the new version and keeps the trigger disabled.

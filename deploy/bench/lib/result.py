@@ -72,6 +72,8 @@ def write(rec, root=None):
     rec.setdefault("date", datetime.date.today().isoformat())
     rec.setdefault("host", host_stamp())
     rec.setdefault("build", os.environ.get("BENCH_BUILD", "not recorded"))
+    if not rec.get("durability") and os.environ.get("BENCH_DURABILITY"):
+        rec["durability"] = os.environ["BENCH_DURABILITY"]  # what an acknowledged write means in this run
     for k in ("model", "op", "product"):
         if not rec.get(k):
             raise SystemExit(f"result.py: {k} is required")
