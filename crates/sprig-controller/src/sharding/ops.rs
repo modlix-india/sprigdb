@@ -134,7 +134,7 @@ impl ShardingLoop {
         let groups: Vec<(u32, String, String)> = c
             .query(format!(
                 "SELECT group_id, name, state FROM `{cat}`.table_groups \
-                 WHERE kind = 'sharded' ORDER BY group_id"
+                 WHERE kind = 'sharded' AND state <> 'retired' ORDER BY group_id"
             ))
             .await
             .map_err(|e| db_err("table groups", &e))?;
@@ -398,7 +398,8 @@ impl ShardingLoop {
         sprig_shard::groups::migrate(c, &cat).await?;
         let n: Option<u64> = c
             .query_first(format!(
-                "SELECT COUNT(*) FROM `{cat}`.table_groups WHERE kind = 'sharded'"
+                "SELECT COUNT(*) FROM `{cat}`.table_groups WHERE kind = 'sharded' \
+                 AND state <> 'retired'"
             ))
             .await
             .map_err(|e| db_err("table groups", &e))?;

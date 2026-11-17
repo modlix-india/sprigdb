@@ -148,6 +148,7 @@ def main():
     for k in ("version", "competitor", "user", "password", "db", "run", "build", "out"):
         ap.add_argument("--" + k, default="")
     ap.add_argument("--no-load", action="store_true")
+    ap.add_argument("--variant", default="", help="what separates comparable runs, e.g. index=search or index=fulltext")
     a = ap.parse_args()
     corpus, queries, qrels = read_beir(a.dataset)
     eng = {"opensearch": OpenSearch, "mongo": MongoSearch, "mysql": MySQL}[a.engine](a)
@@ -157,6 +158,8 @@ def main():
               "command": " ".join(sys.argv), "source": f"fts/beir.py ({name})"}
     if a.build:
         common["build"] = a.build
+    if a.variant:
+        common["variant"] = a.variant
     out = []
     if not a.no_load:
         t = time.time()
@@ -182,7 +185,7 @@ def main():
     out.append(("feed", "freshness_ms", round((time.perf_counter() - t) * 1000, 1), "ms", "lower"))
     for op, m, v, unit, better in out:
         result.write({**common, "op": op, "metric": m, "value": v, "unit": unit, "better": better,
-                      "run": f"beir-{name}-{m}-{a.run or 'run'}"}, a.out or None)
+                      "run": f"beir-{name}-{a.variant}-{m}-{a.run or 'run'}"}, a.out or None)
         print(f"{m}: {v} {unit}")
 
 

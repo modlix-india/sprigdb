@@ -1802,7 +1802,7 @@ impl PassSession {
         out: &mut dyn ResultSink,
     ) -> Result<Route> {
         // The engine step's warnings (exec/engine.rs), answered with the OK.
-        let engine_notes = self
+        let mut engine_notes = self
             .tenant
             .as_deref_mut()
             .and_then(|ts| ts.warnings.take())
@@ -1955,13 +1955,20 @@ impl PassSession {
         }
         // The database's sinks, connections and logic modules
         // go with it once the drop has published.
-        let db_drop = match &stmt {
+        let mut db_drop = match &stmt {
             DdlStatement::DropDatabase { name, .. } => self
                 .tenant
                 .as_deref()
                 .and_then(|ts| super::dropdb::DbDrop::before(ts, name, lctn)),
             _ => None,
         };
+        // Its table groups' shards, which may be on other clusters: read
+        // now, refused while a mover job holds one.
+        if let Some(d) = db_drop.as_mut()
+            && let Err(e) = Box::pin(d.prepare(&svc)).await
+        {
+            return Ok(Route::Done(self.fail(out, &e).await?));
+        }
         let ctl_pool = ctl.clone();
         let undo_pool = ctl.clone();
         let ctl = MariaExecutor::new(ctl);
@@ -2140,7 +2147,15 @@ impl PassSession {
         match result {
             Ok(outcome) => {
                 let sinks_version = match (db_drop, outcome.version) {
-                    (Some(d), Some(v)) => Box::pin(d.after(&svc, v)).await,
+                    (Some(d), Some(v)) => {
+                        let a = Box::pin(d.after(&svc, v)).await;
+                        engine_notes.extend(a.warnings.into_iter().map(|message| LocalWarning {
+                            level: "Warning",
+                            code: 1105,
+                            message,
+                        }));
+                        a.version
+                    }
                     _ => None,
                 };
                 if let Some(ts) = self.tenant.as_deref_mut() {

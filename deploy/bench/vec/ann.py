@@ -49,11 +49,15 @@ class PgVector:
         return time.time() - t
 
     def searcher(self, ef):
+        import threading
         import psycopg
-        conn = psycopg.connect(self.dsn, autocommit=True)
-        conn.execute(f"SET hnsw.ef_search = {ef}")
+        local = threading.local()  # one connection per client thread, so queries run concurrently
 
         def q(v):
+            conn = getattr(local, "conn", None)
+            if conn is None:
+                conn = local.conn = psycopg.connect(self.dsn, autocommit=True)
+                conn.execute(f"SET hnsw.ef_search = {ef}")
             vec = "[" + ",".join(map(str, v)) + "]"
             return [r[0] for r in conn.execute(f"SELECT id FROM ann ORDER BY v {self.op} %s::vector LIMIT 10", (vec,))]
         return q

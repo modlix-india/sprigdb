@@ -274,9 +274,12 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             Some(settings.live.clone()),
             Arc::clone(&clock),
         )
-        .with_group_maps(Arc::new(sprig_shard::ShardMapStore::new(Arc::clone(
-            &stores.dc,
-        ))))
+        // Shard maps, and the tables of table groups, which the default
+        // shard doesn't hold.
+        .with_group_maps(Arc::new(catalog_reconciler::CatalogGroupMaps::new(
+            sprig_shard::ShardMapStore::new(Arc::clone(&stores.dc)),
+            Arc::new(locator.clone()),
+        )))
         // A crashed gateway's DDL job goes within about a minute.
         .with_owners(Arc::new(sprig_catalog::ddl::ProcessOwners::new(
             Arc::clone(&stores.dc),

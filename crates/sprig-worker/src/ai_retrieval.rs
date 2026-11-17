@@ -936,7 +936,7 @@ impl Job<'_> {
         for group in groups {
             // Rows that gained chunks and rows that lost them, counted once
             // the group's transaction commits.
-            let (mut gained, mut lost) = (0u64, 0u64);
+            let (mut gained, mut emptied) = (0u64, 0u64);
             if cancel.is_cancelled() {
                 return Err(SprigError::internal("cancelled"));
             }
@@ -976,7 +976,7 @@ impl Job<'_> {
                     .map_err(backend)?;
                 if gone || chunks.is_empty() {
                     cleared += 1;
-                    lost += u64::from(had);
+                    emptied += u64::from(had);
                     vi += chunks.len();
                     continue;
                 }
@@ -1004,7 +1004,7 @@ impl Job<'_> {
                 gained += u64::from(!had);
             }
             tx.commit().await.map_err(backend)?;
-            self.adjust(&schema, gained, lost);
+            self.adjust(&schema, gained, emptied);
         }
         // Current chunks given their row's routing hash, under the guard.
         if !rk_only.is_empty() {

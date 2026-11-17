@@ -565,7 +565,8 @@ impl ShardingLoop {
                 format!(
                     "SELECT group_id, state, min_shards, \
                      TIMESTAMPDIFF(MICROSECOND, '1970-01-01', created_at) DIV 1000 \
-                     FROM `{cat}`.table_groups WHERE kind = 'sharded' ORDER BY group_id"
+                     FROM `{cat}`.table_groups WHERE kind = 'sharded' AND state <> 'retired' \
+                     ORDER BY group_id"
                 ),
             )
             .await

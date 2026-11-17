@@ -528,6 +528,44 @@ impl GroupMaps for FixedGroups {
     }
 }
 
+/// Group maps that also name the grouped tables.
+struct GroupedTables(BTreeSet<sprig_common::ids::ObjectId>);
+
+#[async_trait::async_trait]
+impl GroupMaps for GroupedTables {
+    async fn groups(&self, _tenant: TenantId) -> Result<BTreeSet<GroupId>> {
+        Ok([GroupId(9)].into())
+    }
+    async fn grouped(
+        &self,
+        _tenant: TenantId,
+    ) -> Result<Option<BTreeSet<sprig_common::ids::ObjectId>>> {
+        Ok(Some(self.0.clone()))
+    }
+}
+
+/// A table moved into a table group lives in the group's shard schemas
+/// (perhaps on another cluster), not the database's default shard: no
+/// `object_missing` for it; any other table still gets one.
+#[tokio::test]
+async fn grouped_tables_are_not_missing_from_the_default_shard() {
+    let env = billing().await;
+    let s = env.schema(1);
+    env.exec.drop_object(&s, ObjectKind::Table, "orders");
+    let orders = env.live("orders").unwrap().object_id;
+    let rec = env
+        .reconciler(now_cfg())
+        .with_group_maps(Arc::new(GroupedTables([orders].into())));
+    let r = rec.pass(env.tenant).await.unwrap();
+    assert!(r.objects_missing.is_empty(), "{:?}", r.objects_missing);
+    // Without the membership, it is reported as before.
+    let rec = env
+        .reconciler(now_cfg())
+        .with_group_maps(Arc::new(GroupedTables(BTreeSet::new())));
+    let r = rec.pass(env.tenant).await.unwrap();
+    assert_eq!(r.objects_missing, ["billing.orders"]);
+}
+
 /// A split's new shard schemas start empty, and a retired
 /// source waits for the mover to drop it. Shard schemas of a group with a
 /// shard map are never orphans, and when the maps can't be read (or no
