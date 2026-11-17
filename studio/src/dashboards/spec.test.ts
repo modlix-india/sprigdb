@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import RULES from './chart-rules.json';
-import { PRESETS, applyPreset, best, counts, fits, normalize, presetFits, presetOf, roleOf, suggest, toStored } from './spec';
+import { COUNTRY_NAMES, LAT_NAMES, LON_NAMES, PRESETS, applyPreset, best, counts, fits, normalize, presetFits, presetOf, roleOf, suggest, toStored } from './spec';
 import { placeholders } from './api';
 import { settle, moves, clampPos } from './layout';
 
@@ -17,7 +17,7 @@ describe('Show Me', () => {
   const c = (s: Parameters<typeof counts>[0]) => counts(s);
   it('follows the rules of thumb, as the tile check does', () => {
     const date = c({ mark: 'bar', columns: [{ field: 'week', datePart: 'week' }], rows: [{ field: 'revenue', agg: 'sum' }] });
-    expect(date).toEqual({ dims: 1, measures: 1, dates: 1, geo: false, latLon: false, unknown: 0 });
+    expect(date).toEqual({ dims: 1, measures: 1, dates: 1, geo: false, latLon: false, country: false, unknown: 0 });
     expect(best(date).mark).toBe('line');
     const one = c({ mark: 'bar', columns: [{ field: 'status' }], rows: [{ field: 'n', agg: 'count' }] });
     expect(best(one).mark).toBe('bar');
@@ -28,8 +28,9 @@ describe('Show Me', () => {
     expect(best(c({ mark: 'bar', columns: [{ field: 'a', agg: 'sum' }], rows: [{ field: 'b', agg: 'sum' }] })).mark).toBe('point');
     expect(best(c({ mark: 'bar', rows: [{ field: 'a', agg: 'sum' }] })).mark).toBe('kpi');
     expect(best(c({ mark: 'bar', columns: ['day'], rows: ['hour'], color: { field: 'n', agg: 'count' } })).mark).toBe('heatmap');
-    // A place name alone would be a filled map, which needs region shapes: the next rule.
-    expect(best(c({ mark: 'bar', columns: [{ field: 'country' }], rows: [{ field: 'n', agg: 'sum' }] })).mark).toBe('bar');
+    // A country and a measure: a filled map; another place name alone: the next rule.
+    expect(best(c({ mark: 'bar', columns: [{ field: 'country' }], rows: [{ field: 'n', agg: 'sum' }] }))).toEqual({ mark: 'map-filled', why: 'a country and a measure: a filled map' });
+    expect(best(c({ mark: 'bar', columns: [{ field: 'city' }], rows: [{ field: 'n', agg: 'sum' }] })).mark).toBe('bar');
     // A latitude and a longitude: a point map.
     const ll = c({ mark: 'bar', columns: [{ field: 'longitude' }], rows: [{ field: 'Lat' }], size: { field: 'n', agg: 'sum' } });
     expect(ll.latLon).toBe(true);
@@ -37,6 +38,30 @@ describe('Show Me', () => {
     expect(presetFits(PRESETS.find((p) => p.id === 'map-point')!, ll)).toBe(true);
     expect(presetFits(PRESETS.find((p) => p.id === 'map-point')!, c({ mark: 'bar', columns: [{ field: 'country' }] }))).toBe(false);
     expect(best(c({ mark: 'bar' })).mark).toBe('text-table');
+  });
+
+  it('draws a filled map from a country field, as the tile check allows it', () => {
+    const filled = PRESETS.find((p) => p.id === 'map-filled')!;
+    for (const name of RULES.countryNames) {
+      const k = c({ mark: 'map-filled', columns: [{ field: name.toUpperCase() }], color: { field: 'n', agg: 'avg' } });
+      expect(k.country && k.geo).toBe(true);
+      expect(fits('map-filled', k) && presetFits(filled, k)).toBe(true);
+    }
+    // A bare country is never taken as a measure; a bare number may be.
+    const bare = c({ mark: 'map-filled', columns: ['iso3'], rows: ['revenue'] });
+    expect([bare.dims, bare.unknown]).toEqual([2, 1]);
+    expect(fits('map-filled', bare)).toBe(true);
+    for (const other of ['state', 'city', 'nation']) {
+      const k = c({ mark: 'map-filled', columns: [other], rows: [{ field: 'n', agg: 'sum' }] });
+      expect(fits('map-filled', k)).toBe(false);
+    }
+    // No measure, or two: no filled map.
+    expect(fits('map-filled', { ...c({ mark: 'map-filled', columns: [{ field: 'country' }] }), unknown: 0 })).toBe(false);
+    expect(fits('map-filled', c({ mark: 'map-filled', columns: [{ field: 'country' }], rows: [{ field: 'a', agg: 'sum' }, { field: 'b', agg: 'sum' }] }))).toBe(false);
+    // A numeric country code column is a dimension.
+    expect(roleOf({ name: 'country_code', type: 'SMALLINT' })).toBe('dimension');
+    // The place-name lists are chart-rules.json's, which the tile check reads.
+    expect([LAT_NAMES, LON_NAMES, COUNTRY_NAMES]).toEqual([RULES.latNames, RULES.lonNames, RULES.countryNames]);
   });
 
   it('greys out presets that need other fields', () => {

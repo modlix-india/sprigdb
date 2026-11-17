@@ -277,7 +277,7 @@ A chart spec is JSON text:
 | `datePart` | `year`, `quarter`, `month`, `week`, `day`, `hour` or `exact` |
 | `sort`, `top`, `stack`, `format` | `{by, dir: asc\|desc}`, a positive number, `none`, `stack` or `percent`, and display formats |
 
-Every field must be a column the query returns (unless it selects `*`), and unknown keys, marks, aggregations and date parts are refused, so the assistant fixes the spec before you see it. It picks the mark with Show Me's rules of thumb: a date and measures, a line; one dimension and one measure, bars; two measures, points; one measure alone, a KPI; two dimensions and a measure, a heatmap; parts of a whole with five or fewer categories, a pie; a latitude and a longitude field, a [point map](dashboards.md#maps). As in Studio, a place name alone, such as `country`, doesn't make a map: the next rule applies, and a `map-filled` tile is refused because filled maps aren't drawn yet.
+Every field must be a column the query returns (unless it selects `*`), and unknown keys, marks, aggregations and date parts are refused, so the assistant fixes the spec before you see it. It picks the mark with Show Me's rules of thumb: a date and measures, a line; one dimension and one measure, bars; two measures, points; one measure alone, a KPI; two dimensions and a measure, a heatmap; parts of a whole with five or fewer categories, a pie; a latitude and a longitude field, a [point map](dashboards.md#maps); a country field (`country`, `country_code`, `country_name`, `country_iso`, `iso2` or `iso3`) and one measure, a [filled map](dashboards.md#maps). As in Studio, other place names, such as `city`, don't make a map: the next rule applies, and a `map-filled` tile without a country field is refused.
 
 ## ASK in SQL
 

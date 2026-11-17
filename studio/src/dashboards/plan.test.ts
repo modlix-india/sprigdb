@@ -222,9 +222,9 @@ describe('spec to Recharts', () => {
     expect(bu.kind === 'bullet' && bu.data[0]).toEqual({ name: 'SUM(revenue)', value: 380, target: 10 });
   });
 
-  it('keeps filled maps as specs it can’t draw yet, filters rows, and says when nothing came back', () => {
+  it('says what a map lacks, filters rows, and says when nothing came back', () => {
     const filled = p({ mark: 'map-filled', columns: ['region'], rows: [{ field: 'revenue', agg: 'sum' }] });
-    expect(filled.kind === 'unavailable' && filled.why).toMatch(/needs region shapes/);
+    expect(filled.kind === 'empty' && filled.why).toMatch(/needs a country field \(named country, country_code/);
     const noPlace = p({ mark: 'map-point', columns: ['country'] });
     expect(noPlace.kind === 'empty' && noPlace.why).toMatch(/latitude and a longitude/);
     const f = cart(p({ mark: 'bar', columns: ['region'], rows: [{ field: 'revenue', agg: 'sum' }], filters: [{ field: 'status', in: ['paid'] }] }));

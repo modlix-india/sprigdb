@@ -211,7 +211,7 @@ function Module({ db, kind, name }: Readonly<{ db: string; kind: string; name: s
           [
             ['code', 'Code'],
             ['versions', 'Versions'],
-            ...(m.kind === 'function' || m.kind === 'procedure' ? ([['rollout', 'Rollout']] as const) : []),
+            ...(m.kind === 'function' || m.kind === 'procedure' || m.kind === 'trigger' ? ([['rollout', 'Rollout']] as const) : []),
             ['test', 'Test run'],
             ['logs', 'Logs'],
             ['dead', 'Dead letters'],
@@ -229,7 +229,9 @@ function Module({ db, kind, name }: Readonly<{ db: string; kind: string; name: s
           <p className="muted">Viewing code needs ALTER ROUTINE, CREATE ROUTINE or ALL on {db}.</p>
         ))}
       {tab === 'versions' && <Versions db={db} detail={d} />}
-      {tab === 'rollout' && <RolloutView db={db} kind={m.kind === 'procedure' ? 'procedure' : 'function'} name={m.name} routines={d.routines} />}
+      {tab === 'rollout' && (
+        <RolloutView db={db} kind={m.kind === 'procedure' || m.kind === 'trigger' ? m.kind : 'function'} name={m.name} routines={d.routines} />
+      )}
       {tab === 'test' && <TestRun db={db} detail={d} />}
       {tab === 'logs' && <Logs db={db} kind={kind} name={name} />}
       {tab === 'dead' && <DeadLetters db={db} kind={kind} name={name} />}

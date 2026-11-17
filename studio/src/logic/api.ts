@@ -127,7 +127,9 @@ export interface RolloutRow {
   active_version: number;
   candidate_version: number;
   pct: number;
-  by: 'user' | 'tenant';
+  /** `user`, `tenant`, or a key: a function's argument (its position) or,
+   * for a trigger, the record's key (`null`). */
+  by: 'user' | 'tenant' | { key: number | null };
   started_at: string;
 }
 

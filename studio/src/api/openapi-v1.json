@@ -2227,12 +2227,20 @@
           },
           "index": {
             "type": "string"
+          },
+          "warnings": {
+            "description": "What SHOW WARNINGS answers after the search: 39827 when the keyword list was skipped (a caller restricted by row-level security, past 1,000 keyword matches on a shard); empty without",
+            "items": {
+              "$ref": "#/components/schemas/RetrievalSearchWarning"
+            },
+            "type": "array"
           }
         },
         "required": [
           "database",
           "index",
-          "hits"
+          "hits",
+          "warnings"
         ],
         "type": "object"
       },
@@ -2250,6 +2258,25 @@
         },
         "required": [
           "query"
+        ],
+        "type": "object"
+      },
+      "RetrievalSearchWarning": {
+        "properties": {
+          "code": {
+            "type": "integer"
+          },
+          "level": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "level",
+          "code",
+          "message"
         ],
         "type": "object"
       },

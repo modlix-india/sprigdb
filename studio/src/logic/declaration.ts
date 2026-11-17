@@ -145,12 +145,18 @@ export function template(runtime: Runtime, kind: LogicKind, name: string): Pick<
 
 export type RolloutAction = { to: number; by?: RolloutBy } | 'promote' | 'abort';
 
-/** `ALTER FUNCTION | PROCEDURE db.f ROLLOUT TO n [BY USER | TENANT] | PROMOTE | ABORT`. */
-export function rolloutStatement(db: string, kind: LogicKind, name: string, a: RolloutAction): string {
+/** The kinds a staged rollout moves for: functions and procedures by
+ * caller, tenant or argument; triggers by record key. */
+export type RolloutKind = LogicKind | 'trigger';
+
+/** `ALTER FUNCTION | PROCEDURE | TRIGGER db.name ROLLOUT TO n [BY USER | TENANT] | PROMOTE | ABORT`.
+ * A trigger rolls out by key alone, so it takes no `BY`. */
+export function rolloutStatement(db: string, kind: RolloutKind, name: string, a: RolloutAction): string {
   const head = `ALTER ${kind.toUpperCase()} ${ident(db)}.${ident(name)} ROLLOUT`;
   if (a === 'promote') return `${head} PROMOTE`;
   if (a === 'abort') return `${head} ABORT`;
   if (!Number.isInteger(a.to) || a.to < 1 || a.to > 99) throw new Error('a rollout stage is 1 to 99 percent (100 promotes, 0 aborts)');
+  if (kind === 'trigger' && a.by) throw new Error('a trigger rolls out by record key: leave "Pick by" as it is');
   return `${head} TO ${a.to}${a.by ? ` BY ${a.by.toUpperCase()}` : ''}`;
 }
 

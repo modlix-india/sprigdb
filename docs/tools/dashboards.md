@@ -76,6 +76,7 @@ Show Me lights up the chart types that fit the fields on the shelves and greys o
 | On the shelves | Show Me suggests |
 |---|---|
 | A latitude and a longitude field | a point map |
+| A country field and one measure | a filled map |
 | One measure and nothing else | a KPI |
 | Two or more measures, no dimension | a scatter plot |
 | A date and one or more measures | a line |
@@ -108,6 +109,7 @@ A chart type that doesn't fit its shelves can't be saved; the editor says which 
 | Gantt | a task, a start date, and an end date or a duration in days on Size |
 | Text table and pivot table | any fields; the pivot puts Rows' dimensions down the side and Columns' across, with subtotals for each value of the first row dimension and a grand total (see below) |
 | Point map | a latitude and a longitude field, sized by Size and coloured by Colour (see below) |
+| Filled map | a country field and one measure: each country coloured by the measure (see below) |
 
 Any of these can be split into small multiples with **Facet**. Colours come from one colour-blind-safe palette, chosen separately for light and dark themes; a series keeps its colour by its first appearance.
 
@@ -122,9 +124,37 @@ A **point map** (`map-point`) draws one point per place:
 - **Base map.** Without `studio.map_tile_url` (the default), the points are drawn on a plain background with lines every 30 degrees, and Studio fetches nothing from outside the gateway. To draw a base map, set `studio.map_tile_url` to an XYZ raster tile template from a tile server you're allowed to use, such as `https://tiles.example.com/{z}/{x}/{y}.png`. Studio adds that server to its Content-Security-Policy and shows its host as the map's attribution. In a dark theme the tiles are dimmed.
 - **Browsers.** Maps need WebGL. MapLibre loads only when a dashboard first shows a map.
 
-Show Me suggests a point map when a latitude and a longitude are on the shelves. A place name alone, such as `country`, doesn't make a point map: Show Me goes on to its next rule. The assistant's tiles follow the same rule: a proposed point map needs both fields, and a proposed filled map is sent back to the assistant until Studio draws them.
+A **filled map** (`map-filled`) colours each country by a measure:
 
-A **filled map** (`map-filled`) colours regions such as countries or states. It needs region shapes, and Studio doesn't have any yet. A tile may hold the mark, but Studio shows "needs region shapes" in its place. Use a point map, or another chart, instead.
+- **Which countries.** A field named `country`, `country_code`, `country_name`, `country_iso`, `iso2` or `iso3`, on any shelf; case doesn't matter. Its values may be country names (`Germany`, `United States`, `Côte d'Ivoire`) or ISO 3166-1 codes: alpha-2 (`DE`), alpha-3 (`DEU`) or numeric (`276`). Names are compared without case, accents or punctuation, and common other names are known too, such as `USA`, `UK`, `Russian Federation` and `Viet Nam`. For a column with another name, use an alias: `SELECT nation AS country, ...`.
+- **The measure** is the one on Colour, or else the one on Columns or Rows. Each country's rows are aggregated with the measure's own aggregation, after matching, so `US` and `United States` count as one country. Tooltip measures are aggregated the same way and shown on hover.
+- **Colours.** Six steps of one hue, from the smallest value to the largest in equal steps, with a legend; countries without data are grey. The scale is chosen separately for light and dark themes.
+- **Rows that match no country** are left out, and the map says how many, with a few of their values. That includes empty values, places that aren't countries, and small countries without a shape at this scale (such as Singapore or Malta).
+- **Shapes.** The country outlines are Natural Earth's 1:110 million countries, bundled with Studio: they load from the gateway, only when a dashboard first shows a filled map, and nothing is fetched from anywhere else. States and provinces aren't drawn.
+
+For example, sales recorded with both codes and names:
+
+```sql test
+CREATE TABLE sales (id INT PRIMARY KEY, country VARCHAR(40), revenue DECIMAL(10,2));
+INSERT INTO sales VALUES
+  (1, 'DE', 120.00), (2, 'Germany', 80.00), (3, 'USA', 300.00),
+  (4, 'United States', 50.00), (5, 'IN', 75.50), (6, 'Atlantis', 9.99);
+SELECT country, SUM(revenue) AS revenue FROM sales GROUP BY country ORDER BY country;
+```
+
+```text output
+country	revenue
+Atlantis	9.99
+DE	120.00
+Germany	80.00
+IN	75.50
+United States	50.00
+USA	300.00
+```
+
+With `country` on Columns and `revenue` on Rows, the tile colours Germany 200 (`DE` and `Germany`), the United States 350 and India 75.50, and says that one row (`Atlantis`) matched no country.
+
+Show Me suggests a point map when a latitude and a longitude are on the shelves, and a filled map for a country field and one measure. Other place names, such as `city` or `state`, make neither: Show Me goes on to its next rule. The assistant's tiles follow the same rules.
 
 ## Using a dashboard
 

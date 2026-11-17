@@ -1,4 +1,4 @@
-// Point maps on dashboards and the Docs panel's own pages, against a
+// Point and filled maps on dashboards and the Docs panel's own pages, against a
 // stubbed API: every /v1 call is answered here, so no gateway is needed.
 // Run it against Vite's dev server:
 //
@@ -7,7 +7,8 @@
 //   STUDIO_URL=http://127.0.0.1:26473 pnpm exec playwright test e2e/maps-docs.spec.ts --project chromium
 //
 // The map checks that, without studio.map_tile_url, nothing is fetched from
-// anywhere but Studio's own origin; with it, tiles come from that server.
+// anywhere but Studio's own origin (the country shapes included, and only
+// for a filled map); with it, tiles come from that server.
 import { expect, test, type Page, type Route } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
 
@@ -97,6 +98,26 @@ const RUN = {
   ms: 3,
 };
 
+// Countries as names and codes; two rows match nothing.
+const RUN2 = {
+  columns: [
+    { name: 'country', type: 'VARCHAR' },
+    { name: 'revenue', type: 'DECIMAL' },
+  ],
+  rows: [
+    ['IN', '150'],
+    ['India', '300'],
+    ['USA', '220'],
+    ['DE', '90'],
+    ['076', '40'],
+    ['Atlantis', '5'],
+    [null, '1'],
+  ],
+  row_count: 7,
+  truncated: false,
+  ms: 3,
+};
+
 const PAGE = {
   version: '0.9.0',
   page: 'tools/studio.md',
@@ -117,7 +138,7 @@ const DASHBOARDS_PAGE = {
 };
 
 /** Answers every /v1 call; returns the URLs the page asked for. */
-async function stub(page: Page, tiles = ''): Promise<{ urls: string[]; tileRequests: string[] }> {
+async function stub(page: Page, tiles = '', dash = DASH): Promise<{ urls: string[]; tileRequests: string[] }> {
   const urls: string[] = [];
   const tileRequests: string[] = [];
   page.on('request', (r) => urls.push(r.url()));
@@ -133,9 +154,10 @@ async function stub(page: Page, tiles = ''): Promise<{ urls: string[]; tileReque
     if (path === '/v1/auth/refresh') return ok({ access_token: 'tok', token_type: 'Bearer', expires_in: 3600, session_id: 's1' });
     if (path === '/v1/auth/me') return ok(ME(tiles));
     if (path === '/v1/catalog') return ok({ databases: ['shop'] });
-    if (path === '/v1/dashboards') return ok({ mine: [{ ...DASH, tiles: 2 }], shared: [] });
-    if (path === '/v1/dashboards/d1') return ok(DASH);
-    if (path === '/v1/dashboards/d1/tiles/t1:run' || path === '/v1/dashboards/d1/tiles/t2:run') return ok(RUN);
+    if (path === '/v1/dashboards') return ok({ mine: [{ ...dash, tiles: dash.tiles.length }], shared: [] });
+    if (path === '/v1/dashboards/d1') return ok(dash);
+    if (path === '/v1/dashboards/d1/tiles/t1:run') return ok(RUN);
+    if (path === '/v1/dashboards/d1/tiles/t2:run') return ok(RUN2);
     if (path === '/v1/docs:search') {
       return ok({
         version: '0.9.0',
@@ -166,7 +188,9 @@ async function axe(page: Page, what: string, include: string): Promise<void> {
   expect(r.violations.map((v) => `${what}: ${v.id} ${v.nodes.map((n) => n.target.join(' ')).join(', ')}`)).toEqual([]);
 }
 
-test('a point map draws without any outside request; a filled map says it needs region shapes', async ({ page, baseURL }) => {
+const SHAPES = /shapes|countries-110m/;
+
+test('point and filled maps draw without any outside request', async ({ page, baseURL }) => {
   const { urls } = await stub(page);
   for (const scheme of ['light', 'dark'] as const) {
     await page.emulateMedia({ colorScheme: scheme });
@@ -177,15 +201,33 @@ test('a point map draws without any outside request; a filled map says it needs 
     await expect(map).toHaveAttribute('data-tiles', 'off');
     await expect(map.locator('canvas.maplibregl-canvas')).toBeVisible();
     await expect(page.getByRole('figure', { name: /point map of 3 places, sized by SUM\(revenue\), coloured by region/ })).toBeVisible();
-    await expect(page.getByTestId('map-legend')).toContainText('West');
-    await expect(page.getByTestId('map-legend')).toContainText('Size: SUM(revenue)');
-    await expect(page.getByText(/A filled map needs region shapes/)).toBeVisible();
+    await expect(map.getByTestId('map-legend')).toContainText('West');
+    await expect(map.getByTestId('map-legend')).toContainText('Size: SUM(revenue)');
+    // The filled map: countries by name and code, aggregated, two rows unmatched.
+    const filled = page.getByTestId('filled-map');
+    await expect(filled).toBeVisible();
+    await expect(filled).toHaveAttribute('data-shapes', 'on');
+    await expect(filled).toHaveAttribute('data-regions', '4');
+    await expect(filled.locator('canvas.maplibregl-canvas')).toBeVisible();
+    await expect(page.getByRole('figure', { name: /Sales by country: map of 4 countries coloured by SUM\(revenue\), 2 rows not matched to a country/ })).toBeVisible();
+    await expect(filled.getByTestId('map-legend')).toContainText('SUM(revenue)');
+    await expect(filled.getByTestId('map-legend')).toContainText('No data');
+    await expect(filled.getByTestId('map-note')).toHaveText(/2 rows not matched to a country \(Atlantis, NULL\)/);
     await axe(page, `dashboard, ${scheme}`, 'main');
   }
+  expect(urls.some((u) => SHAPES.test(u))).toBe(true);
   // Nothing but Studio's own origin (and blobs and data) was asked for.
   const origin = new URL(baseURL!).origin;
   const outside = urls.filter((u) => !u.startsWith(origin) && !u.startsWith('blob:') && !u.startsWith('data:'));
   expect(outside).toEqual([]);
+});
+
+test('the country shapes load only for a filled map', async ({ page }) => {
+  const { urls } = await stub(page, '', { ...DASH, tiles: [DASH.tiles[0]!] });
+  await page.goto('/studio/t/acme/d/d1');
+  await expect(page.getByTestId('point-map')).toHaveAttribute('data-points', '3');
+  await expect(page.getByTestId('point-map').locator('canvas.maplibregl-canvas')).toBeVisible();
+  expect(urls.filter((u) => SHAPES.test(u))).toEqual([]);
 });
 
 test('with studio.map_tile_url the map draws that server’s tiles', async ({ page }) => {

@@ -2293,11 +2293,18 @@ export interface components {
             database: string;
             hits: components["schemas"]["RetrievalSearchHit"][];
             index: string;
+            /** @description What SHOW WARNINGS answers after the search: 39827 when the keyword list was skipped (a caller restricted by row-level security, past 1,000 keyword matches on a shard); empty without */
+            warnings: components["schemas"]["RetrievalSearchWarning"][];
         };
         RetrievalSearchRequest: {
             filter?: string;
             limit?: number;
             query: string;
+        };
+        RetrievalSearchWarning: {
+            code: number;
+            level: string;
+            message: string;
         };
         /** @description The SearchQueryRequest message as JSON (proto3 mapping) */
         SearchQueryRequest: Record<string, never>;

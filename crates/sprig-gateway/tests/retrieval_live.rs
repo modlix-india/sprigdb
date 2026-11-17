@@ -27,7 +27,7 @@
 //! export SPRIG_TEST_RX_SHARD_CMD='.../rx.sh shard'
 //! # optional, with the above: a second cluster's backend (root). Then
 //! # `move` moves the group's one shard to that cluster and `rekey`
-//! # re-keys the group by `product`, each waiting for its job to end
+//! # re-keys the group by `title`, each waiting for its job to end
 //! export SPRIG_TEST_RX_BACKEND2=mysql://root:...@127.0.0.1:42321
 //! # optional: kills the worker (kill -9) and starts it again
 //! export SPRIG_TEST_RX_KILL='.../rx.sh kill-worker'
@@ -524,6 +524,30 @@ fn same_hits(
         .count();
     let exact = a.iter().zip(b).filter(|(x, y)| x == y).count();
     (sets, exact)
+}
+
+/// How many questions keep every hit's vector rank (hits in both), and
+/// how many keep their best hit.
+fn vector_and_top(
+    a: &[Vec<(i64, u32, Option<u32>, Option<u32>)>],
+    b: &[Vec<(i64, u32, Option<u32>, Option<u32>)>],
+) -> (usize, usize) {
+    let vec_same = a
+        .iter()
+        .zip(b)
+        .filter(|(x, y)| {
+            let va: HashMap<(i64, u32), Option<u32>> =
+                x.iter().map(|h| ((h.0, h.1), h.3)).collect();
+            y.iter()
+                .all(|h| va.get(&(h.0, h.1)).is_none_or(|v| *v == h.3))
+        })
+        .count();
+    let top = a
+        .iter()
+        .zip(b)
+        .filter(|(x, y)| x.first().map(|h| h.0) == y.first().map(|h| h.0))
+        .count();
+    (vec_same, top)
 }
 
 /// `RETRIEVE()`'s (`id`, `bm25_rank`) and the statement's warning count
@@ -1625,14 +1649,21 @@ async fn retrieval_indexes_end_to_end() {
                 rows_after == rows_before,
                 || format!("{rows_before} → {rows_after}"),
             );
+            // The vector ranks must not move at all. MariaDB's own
+            // full-text relevance (an unrestricted user's keyword list)
+            // counts a table's deleted documents until it is optimized, so
+            // the fresh copy can order a few keyword matches differently.
             let (sets, exact) = same_hits(&before, &right_after);
+            let (vec_same, top_same) = vector_and_top(&before, &right_after);
             eprintln!(
-                "     move: the same top five for {sets}/{n}, with every rank for {exact}/{n}",
+                "     move: the same vector ranks for {vec_same}/{n}, the same best hit for {top_same}/{n}, the same top five for {sets}/{n}, with every rank for {exact}/{n}",
                 n = QUESTIONS.len()
             );
             ck.ok(
                 "searches give the same hits before and after the move",
-                sets == QUESTIONS.len() && exact * 10 >= QUESTIONS.len() * 9,
+                vec_same == QUESTIONS.len()
+                    && top_same == QUESTIONS.len()
+                    && sets * 10 >= QUESTIONS.len() * 9,
                 || format!("before {before:?}\nafter {right_after:?}"),
             );
             // The mover's cleanup drops the source shard, chunk table too.
@@ -1702,18 +1733,18 @@ async fn retrieval_indexes_end_to_end() {
             let after = all_hits(&mut c, "kb2").await;
             let (sets, exact) = same_hits(&before, &after);
             let five = after.iter().filter(|h| h.len() == 5).count();
-            let same_top = before
-                .iter()
-                .zip(&after)
-                .filter(|(x, y)| x.first().map(|h| h.0) == y.first().map(|h| h.0))
-                .count();
+            let (vec_same, same_top) = vector_and_top(&before, &after);
             eprintln!(
-                "     re-key: five hits for {five}/{n}, the same best hit for {same_top}/{n}, the same top five for {sets}/{n}, with every rank for {exact}/{n}",
+                "     re-key: five hits for {five}/{n}, the same vector ranks for {vec_same}/{n}, the same best hit for {same_top}/{n}, the same top five for {sets}/{n}, with every rank for {exact}/{n}",
                 n = QUESTIONS.len()
             );
+            // Over two shards the keyword list merges per-shard relevance
+            // (as in the split above); the vector ranks don't move.
             ck.ok(
                 "searches match before and after the re-key",
-                five == QUESTIONS.len() && same_top * 10 >= QUESTIONS.len() * 9,
+                five == QUESTIONS.len()
+                    && vec_same == QUESTIONS.len()
+                    && same_top * 10 >= QUESTIONS.len() * 9,
                 || format!("before {before:?}\nafter {after:?}"),
             );
             // The old shards' chunk tables are dropped; the new ones hold
