@@ -3,10 +3,14 @@
 //! following inserts, updates and deletes, `RETRIEVE()` and the REST
 //! route, `SHOW CREATE` round trips, filters, row-level security hiding
 //! hits from a restricted user, a restricted user's ranks unchanged by
-//! rows hidden from it, recall@5 on a small corpus, an indexed table split
-//! into two shards and merged back (the chunks moved with their rows, nothing embedded
-//! again) and its fused hits against the same table unsharded, a kill -9
-//! of the worker in the middle of a fill, and `DROP`.
+//! rows hidden from it, the warning (39827, SQL and REST) when a
+//! restricted user's search skips its keyword list, recall@5 on a small
+//! corpus, an indexed table moved into its table group, split into two
+//! shards and merged back (the chunks moved with their rows, nothing
+//! embedded again) and its fused hits against the same table unsharded,
+//! its shard moved to another cluster (the chunks with it) and re-keyed
+//! (filled again), a kill -9 of the worker in the middle of a fill, and
+//! `DROP`.
 //!
 //! ```sh
 //! export SPRIG_TEST_RX_SQL=127.0.0.1:42306          # a gateway's MySQL port
@@ -21,6 +25,10 @@
 //! # it merges the two back; each waits
 //! # for its jobs to end
 //! export SPRIG_TEST_RX_SHARD_CMD='.../rx.sh shard'
+//! # optional, with the above: a second cluster's backend (root). Then
+//! # `move` moves the group's one shard to that cluster and `rekey`
+//! # re-keys the group by `product`, each waiting for its job to end
+//! export SPRIG_TEST_RX_BACKEND2=mysql://root:...@127.0.0.1:42321
 //! # optional: kills the worker (kill -9) and starts it again
 //! export SPRIG_TEST_RX_KILL='.../rx.sh kill-worker'
 //! cargo test -p sprig-gateway --test retrieval_live -- --nocapture
@@ -435,9 +443,103 @@ fn long_text(i: usize, n: usize) -> String {
 }
 
 async fn backend() -> Option<mysql_async::Conn> {
-    let url = std::env::var("SPRIG_TEST_RX_BACKEND").ok()?;
+    backend_of("SPRIG_TEST_RX_BACKEND").await
+}
+
+async fn backend_of(var: &str) -> Option<mysql_async::Conn> {
+    let url = std::env::var(var).ok()?;
     let opts = mysql_async::Opts::from_url(&url).ok()?;
     mysql_async::Conn::new(opts).await.ok()
+}
+
+/// The chunk tables of index `id` on both backends: (cluster 1 or 2,
+/// schema, rows).
+async fn chunk_tables_both(
+    b1: &mut mysql_async::Conn,
+    b2: &mut mysql_async::Conn,
+    id: u64,
+) -> Vec<(u8, String, u64)> {
+    let mut out: Vec<(u8, String, u64)> = chunk_tables(b1, id)
+        .await
+        .into_iter()
+        .map(|(s, n)| (1, s, n))
+        .collect();
+    out.extend(
+        chunk_tables(b2, id)
+            .await
+            .into_iter()
+            .map(|(s, n)| (2, s, n)),
+    );
+    out
+}
+
+/// The index's states seen over `secs` seconds, and its rows indexed then.
+async fn states_for(
+    c: &mut mysql_async::Conn,
+    index: &str,
+    secs: u64,
+) -> (BTreeSet<String>, u64) {
+    let mut states = BTreeSet::new();
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(secs) {
+        states.insert(state(c, index).await.0);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    (states, state(c, index).await.1)
+}
+
+/// Runs `cmd` while watching the index's state every 100 ms: whether it
+/// passed, and the states seen.
+async fn shell_watching(
+    c: &mut mysql_async::Conn,
+    cmd: &str,
+    index: &str,
+) -> (bool, BTreeSet<String>) {
+    let cmd = cmd.to_owned();
+    let mut job = tokio::task::spawn_blocking(move || shell(&cmd));
+    let mut states = BTreeSet::new();
+    loop {
+        states.insert(state(c, index).await.0);
+        tokio::select! {
+            r = &mut job => return (r.unwrap_or(false), states),
+            () = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+    }
+}
+
+/// How many questions have the same hits (id, chunk) in their top five,
+/// and how many the same hits with every rank.
+fn same_hits(
+    a: &[Vec<(i64, u32, Option<u32>, Option<u32>)>],
+    b: &[Vec<(i64, u32, Option<u32>, Option<u32>)>],
+) -> (usize, usize) {
+    let sets = a
+        .iter()
+        .zip(b)
+        .filter(|(x, y)| {
+            let x: BTreeSet<(i64, u32)> = x.iter().map(|h| (h.0, h.1)).collect();
+            let y: BTreeSet<(i64, u32)> = y.iter().map(|h| (h.0, h.1)).collect();
+            x == y
+        })
+        .count();
+    let exact = a.iter().zip(b).filter(|(x, y)| x == y).count();
+    (sets, exact)
+}
+
+/// `RETRIEVE()`'s (`id`, `bm25_rank`) and the statement's warning count
+/// and warnings (`SHOW WARNINGS`: code, message).
+async fn retrieve_warned(
+    c: &mut mysql_async::Conn,
+    sql: &str,
+) -> (Vec<(i64, Option<u32>)>, u16, Vec<(u16, String)>) {
+    let hits: Vec<(i64, Option<u32>)> = c.query(sql).await.unwrap();
+    let count = c.get_warnings();
+    let shown: Vec<(String, u16, String)> = c.query("SHOW WARNINGS").await.unwrap();
+    (
+        hits,
+        count,
+        shown.into_iter().map(|(_, code, m)| (code, m)).collect(),
+    )
 }
 
 /// The chunk tables of index `id` on the backend: (schema, rows).
@@ -1115,6 +1217,127 @@ async fn retrieval_indexes_end_to_end() {
     must(&mut c, "DROP USER 'rxalice'@'%'").await;
     must(&mut c, "DROP USER 'rxbob'@'%'").await;
 
+    // ---- a restricted user past 1,000 keyword matches: a warning ------------------
+    // 1,050 rows share the words "brass lantern"; four also say "harbour".
+    must(
+        &mut c,
+        "CREATE TABLE crowd (id INT PRIMARY KEY, body TEXT, owner VARCHAR(20) NOT NULL)",
+    )
+    .await;
+    let sides = ["north", "south", "east", "west"];
+    for part in (0..1050usize).collect::<Vec<_>>().chunks(350) {
+        let v: Vec<String> = part
+            .iter()
+            .map(|i| {
+                let extra = if *i < 4 {
+                    " The harbour master keeps the spare key."
+                } else {
+                    ""
+                };
+                format!(
+                    "({i}, {}, 'alice')",
+                    q(&format!(
+                        "Note {i}: the brass lantern by the {} door needs new oil.{extra}",
+                        sides[i % 4]
+                    ))
+                )
+            })
+            .collect();
+        must(&mut c, &format!("INSERT INTO crowd VALUES {}", v.join(", "))).await;
+    }
+    must(&mut c, "CREATE RETRIEVAL INDEX kbc ON crowd (body)").await;
+    let filled = wait_ready(&mut c, "kbc", Duration::from_secs(400)).await;
+    ck.ok("the crowded table's index fills", filled.is_some(), || {
+        format!("{:?}", filled)
+    });
+    if let Some(d) = filled {
+        eprintln!("     fill of 1050 rows: {:.1} s", d.as_secs_f64());
+    }
+    let _ = run(&mut c, "DROP USER IF EXISTS 'rxcrowd'@'%'").await;
+    must(
+        &mut c,
+        "CREATE USER 'rxcrowd'@'%' IDENTIFIED BY 'Rx-crowd-Passw0rd'",
+    )
+    .await;
+    must(&mut c, &format!("GRANT SELECT ON {DB}.crowd TO 'rxcrowd'@'%'")).await;
+    must(
+        &mut c,
+        "CREATE POLICY crowd_alice ON crowd FOR SELECT TO rxcrowd USING (owner = 'alice')",
+    )
+    .await;
+    must(&mut c, "ALTER TABLE crowd ENABLE ROW LEVEL SECURITY").await;
+    let mut rc = login(&addr, "rxcrowd", "Rx-crowd-Passw0rd").await;
+    must(&mut rc, &format!("USE {DB}")).await;
+    let lantern = "SELECT id, bm25_rank FROM RETRIEVE(kbc, 'brass lantern', 5) ORDER BY `rank`";
+    let (hits, count, shown) = retrieve_warned(&mut rc, lantern).await;
+    eprintln!("     restricted, 1050 matches: {count} warning(s) {shown:?}, hits {hits:?}");
+    ck.ok(
+        "a restricted user past 1,000 matches gets warning 39827, counted in the result",
+        count == 1
+            && shown.len() == 1
+            && shown[0].0 == 39827
+            && shown[0]
+                .1
+                .starts_with("RETRIEVE(rx_live.kbc): no keyword list: its shard has more than 1000"),
+        || format!("{count} {shown:?}"),
+    );
+    ck.ok(
+        "its hits come from the vector list alone",
+        hits.len() == 5 && hits.iter().all(|h| h.1.is_none()),
+        || format!("{hits:?}"),
+    );
+    let (_, count, shown) = retrieve_warned(
+        &mut rc,
+        "SELECT a.id, a.bm25_rank FROM RETRIEVE(kbc, 'brass lantern', 3) AS a \
+         JOIN RETRIEVE(kbc, 'brass lantern', 3) AS b ON a.id = b.id",
+    )
+    .await;
+    ck.ok(
+        "two calls over the same index: one warning",
+        count == 1 && shown.len() == 1,
+        || format!("{count} {shown:?}"),
+    );
+    let (hits, count, shown) = retrieve_warned(
+        &mut rc,
+        "SELECT id, bm25_rank FROM RETRIEVE(kbc, 'harbour', 5) ORDER BY `rank`",
+    )
+    .await;
+    ck.ok(
+        "a restricted user with few matches: no warning, a keyword list",
+        count == 0 && shown.is_empty() && hits.iter().any(|h| h.1.is_some()),
+        || format!("{count} {shown:?} {hits:?}"),
+    );
+    let (hits, count, shown) = retrieve_warned(&mut c, lantern).await;
+    ck.ok(
+        "an unrestricted user: no warning, a keyword list",
+        count == 0 && shown.is_empty() && hits.iter().any(|h| h.1.is_some()),
+        || format!("{count} {shown:?} {hits:?}"),
+    );
+    if let Ok(http) = std::env::var("SPRIG_TEST_RX_HTTP") {
+        let path = format!("/v1/databases/{DB}/retrieval/kbc:search");
+        let body = serde_json::json!({"query": "brass lantern", "limit": 5});
+        let (code, v) = rest(&http, "rxcrowd", "Rx-crowd-Passw0rd", &path, &body);
+        ck.ok(
+            "REST: the restricted user's answer carries warning 39827",
+            code == 200
+                && v["warnings"].as_array().is_some_and(|w| w.len() == 1)
+                && v["warnings"][0]["code"] == 39827
+                && v["warnings"][0]["level"] == "Warning"
+                && v["hits"].as_array().is_some_and(|h| h.len() == 5),
+            || format!("{code} {v}"),
+        );
+        let (code, v) = rest(&http, &user, &password, &path, &body);
+        ck.ok(
+            "REST: an unrestricted user's warnings are empty",
+            code == 200 && v["warnings"].as_array().is_some_and(Vec::is_empty),
+            || format!("{code} {v}"),
+        );
+    }
+    let _ = rc.disconnect().await;
+    must(&mut c, "DROP RETRIEVAL INDEX kbc").await;
+    must(&mut c, "DROP TABLE crowd").await;
+    must(&mut c, "DROP USER 'rxcrowd'@'%'").await;
+
     // ---- sharded fusion against the unsharded table -------------------------------
     if let Ok(cmd) = std::env::var("SPRIG_TEST_RX_SHARD_CMD") {
         // The index first, then the table is grouped and split under it.
@@ -1133,6 +1356,7 @@ async fn retrieval_indexes_end_to_end() {
             String::new,
         );
         must(&mut c, "SPRIG PIN many SHARD KEY (id)").await;
+        let rows_before_group = state(&mut c, "kb2").await.1;
         let group = format!("{cmd} group");
         ck.ok("the table moved into its group", shell(&group), || {
             group.clone()
@@ -1141,9 +1365,9 @@ async fn retrieval_indexes_end_to_end() {
             Some(b) => index_id(b, "kb2").await,
             None => None,
         };
-        // Moved into the group's schema without its chunks: filled again
-        // there; the chunks written before the rows had a routing hash get
-        // it, and the chunk table left behind is dropped.
+        // Moved into the group's schema with its chunks (renamed with the
+        // table): nothing embedded again; the chunks written before the
+        // rows had a routing hash get it, and no chunk table stays behind.
         if let (Some(bk), Some(id)) = (b.as_mut(), kb2) {
             let mut left = (99, 99, 99);
             let mut grouped = 0;
@@ -1191,6 +1415,12 @@ async fn retrieval_indexes_end_to_end() {
             );
         }
         let rows_before = state(&mut c, "kb2").await.1;
+        eprintln!("     group: rows indexed {rows_before_group} → {rows_before}");
+        ck.ok(
+            "the move into the group embeds nothing again (rows indexed unchanged)",
+            rows_before == rows_before_group,
+            || format!("{rows_before_group} → {rows_before}"),
+        );
         let before = all_hits(&mut c, "kb2").await;
         let split = format!("{cmd} split");
         ck.ok("the shard split ran", shell(&split), || split.clone());
@@ -1341,6 +1571,191 @@ async fn retrieval_indexes_end_to_end() {
             (b.is_none() || shards.iter().map(|x| x.1).sum::<u64>() >= 20) && m.0 == 0 && m.1 == 0,
             || format!("{shards:?} {m:?}"),
         );
+        let mut b2 = backend_of("SPRIG_TEST_RX_BACKEND2").await;
+        if let (Some(b1), Some(b2), Some(id)) = (b.as_mut(), b2.as_mut(), kb2) {
+            // ---- the shard moved to the other cluster: the chunks go with it ----
+            let source = chunk_tables_both(b1, b2, id).await;
+            let chunks_before: u64 = source.iter().map(|x| x.2).sum();
+            let rows_before = state(&mut c, "kb2").await.1;
+            let before = all_hits(&mut c, "kb2").await;
+            let mv = format!("{cmd} move");
+            let t = Instant::now();
+            let (moved_ok, mut states) = shell_watching(&mut c, &mv, "kb2").await;
+            ck.ok("the shard moved to the other cluster", moved_ok, || {
+                mv.clone()
+            });
+            eprintln!("     move: {} ms", t.elapsed().as_millis());
+            let right_after = all_hits(&mut c, "kb2").await;
+            let (later, rows_after) = states_for(&mut c, "kb2", 20).await;
+            states.extend(later);
+            let tables = chunk_tables_both(b1, b2, id).await;
+            let moved: Vec<&(u8, String, u64)> = tables
+                .iter()
+                .filter(|x| !source.iter().any(|s| s.0 == x.0 && s.1 == x.1))
+                .collect();
+            let m = misplaced(
+                if moved.first().is_some_and(|x| x.0 == 1) {
+                    &mut *b1
+                } else {
+                    &mut *b2
+                },
+                id,
+                "many",
+            )
+            .await;
+            eprintln!(
+                "     after the move: chunk tables {source:?} → {tables:?}, states {states:?}, rows indexed {rows_before} → {rows_after}"
+            );
+            ck.ok(
+                "the chunk table arrives on the other cluster with its rows",
+                moved.len() == 1
+                    && moved[0].0 != source.first().map_or(0, |s| s.0)
+                    && moved[0].2 == chunks_before
+                    && m.0 == 0
+                    && m.1 == 0,
+                || format!("{source:?} → {tables:?}, away and wrong rk {m:?}"),
+            );
+            ck.ok(
+                "the move leaves the index ready",
+                states.len() == 1 && states.contains("ready"),
+                || format!("{states:?}"),
+            );
+            ck.ok(
+                "the move embeds nothing again (rows indexed unchanged)",
+                rows_after == rows_before,
+                || format!("{rows_before} → {rows_after}"),
+            );
+            let (sets, exact) = same_hits(&before, &right_after);
+            eprintln!(
+                "     move: the same top five for {sets}/{n}, with every rank for {exact}/{n}",
+                n = QUESTIONS.len()
+            );
+            ck.ok(
+                "searches give the same hits before and after the move",
+                sets == QUESTIONS.len() && exact * 10 >= QUESTIONS.len() * 9,
+                || format!("before {before:?}\nafter {right_after:?}"),
+            );
+            // The mover's cleanup drops the source shard, chunk table too.
+            let mut left = source.len();
+            let t = Instant::now();
+            while t.elapsed() < Duration::from_secs(300) {
+                let now = chunk_tables_both(b1, b2, id).await;
+                left = now
+                    .iter()
+                    .filter(|x| source.iter().any(|s| s.0 == x.0 && s.1 == x.1))
+                    .count();
+                if left == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            eprintln!(
+                "     source chunk tables left: {left} after {} s",
+                t.elapsed().as_secs()
+            );
+            ck.ok(
+                "no chunk table is left in the source after the cleanup",
+                left == 0,
+                || format!("{left} left"),
+            );
+
+            // ---- re-key: the chunks stay behind, the new shards are filled again ----
+            let old = chunk_tables_both(b1, b2, id).await;
+            let rows_before = state(&mut c, "kb2").await.1;
+            let before = all_hits(&mut c, "kb2").await;
+            let rk = format!("{cmd} rekey");
+            let t = Instant::now();
+            let (rekeyed, mut states) = shell_watching(&mut c, &rk, "kb2").await;
+            eprintln!("     re-key: {} ms", t.elapsed().as_millis());
+            ck.ok("the group was re-keyed", rekeyed, || rk.clone());
+            // The new shards get no chunks from the mover, so the worker
+            // fills them again: every row embedded once more.
+            let at_cutover = chunk_tables_both(b1, b2, id).await;
+            let t = Instant::now();
+            let mut ready_in = None;
+            while t.elapsed() < Duration::from_secs(300) {
+                let s = state(&mut c, "kb2").await.0;
+                states.insert(s.clone());
+                if s == "ready" && states.contains("rebuilding") {
+                    ready_in = Some(t.elapsed());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            let rows_after = state(&mut c, "kb2").await.1;
+            eprintln!(
+                "     re-key: chunk tables {old:?} → at the cutover {at_cutover:?}, states {states:?}, ready again in {:?}, rows indexed {rows_before} → {rows_after}",
+                ready_in.map(|d| d.as_millis())
+            );
+            // Chunks the mover had copied would be checked, not embedded
+            // (as in the move above): rows indexed would stay the same.
+            ck.ok(
+                "the re-key leaves the chunk tables out of its copy (every row embedded once again)",
+                rows_after == rows_before + 20,
+                || format!("{rows_before} → {rows_after}"),
+            );
+            ck.ok(
+                "the index goes rebuilding, then ready",
+                ready_in.is_some(),
+                || format!("{states:?}"),
+            );
+            let after = all_hits(&mut c, "kb2").await;
+            let (sets, exact) = same_hits(&before, &after);
+            let five = after.iter().filter(|h| h.len() == 5).count();
+            let same_top = before
+                .iter()
+                .zip(&after)
+                .filter(|(x, y)| x.first().map(|h| h.0) == y.first().map(|h| h.0))
+                .count();
+            eprintln!(
+                "     re-key: five hits for {five}/{n}, the same best hit for {same_top}/{n}, the same top five for {sets}/{n}, with every rank for {exact}/{n}",
+                n = QUESTIONS.len()
+            );
+            ck.ok(
+                "searches match before and after the re-key",
+                five == QUESTIONS.len() && same_top * 10 >= QUESTIONS.len() * 9,
+                || format!("before {before:?}\nafter {after:?}"),
+            );
+            // The old shards' chunk tables are dropped; the new ones hold
+            // every row's chunks next to the row.
+            let mut left = old.len();
+            let mut now = Vec::new();
+            let t = Instant::now();
+            while t.elapsed() < Duration::from_secs(300) {
+                now = chunk_tables_both(b1, b2, id).await;
+                left = now
+                    .iter()
+                    .filter(|x| old.iter().any(|s| s.0 == x.0 && s.1 == x.1))
+                    .count();
+                if left == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            let (m1, m2) = (
+                misplaced(b1, id, "many").await,
+                misplaced(b2, id, "many").await,
+            );
+            eprintln!(
+                "     re-key: old chunk tables left {left} after {} s; now {now:?}; away/wrong rk/orphans {m1:?} {m2:?}",
+                t.elapsed().as_secs()
+            );
+            ck.ok("the old shards' chunk tables are dropped", left == 0, || {
+                format!("{left} left: {now:?}")
+            });
+            ck.ok(
+                "the new shards hold every row's chunks, next to the row",
+                now.len() >= 2
+                    && now.iter().map(|x| x.2).sum::<u64>() == chunks_before
+                    && m1 == (0, 0, 0)
+                    && m2 == (0, 0, 0),
+                || format!("{now:?} {m1:?} {m2:?}"),
+            );
+        } else {
+            eprintln!(
+                "     (no SPRIG_TEST_RX_BACKEND2: the move to another cluster and the re-key not checked)"
+            );
+        }
     } else {
         eprintln!("     (no SPRIG_TEST_RX_SHARD_CMD: sharded fusion not checked)");
     }

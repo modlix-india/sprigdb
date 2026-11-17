@@ -147,7 +147,7 @@ export function fieldsOf(s: Spec): { dims: Field[]; measures: Field[] } {
 }
 
 /** The rows as records, with the spec's filters applied, and a field getter. */
-function filtered(s: Spec, columns: ColumnInfo[], rows: unknown[][]): { recs: Rec[]; get: (rec: Rec, field: string) => Cell } {
+export function filtered(s: Spec, columns: ColumnInfo[], rows: unknown[][]): { recs: Rec[]; get: (rec: Rec, field: string) => Cell } {
   const get = getter(columns);
   let recs = records(columns, rows);
   for (const f of s.filters) {

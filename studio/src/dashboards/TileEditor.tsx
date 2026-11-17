@@ -27,8 +27,9 @@ import {
   presetOf,
   roleOf,
   toStored,
-  DRAWN,
-  NOT_DRAWN_WHY,
+  COUNTRY_NAMES,
+  LAT_NAMES,
+  LON_NAMES,
   type Agg,
   type ChartSpec,
   type DatePart,
@@ -38,6 +39,12 @@ import {
 } from './spec';
 import { labelOf } from './data';
 import './dashboards.css';
+
+/** What a map in Show Me needs, said when it is greyed out. */
+const NEEDS: Partial<Record<Mark, string>> = {
+  'map-point': `needs a latitude field (${LAT_NAMES.join(', ')}) and a longitude field (${LON_NAMES.join(', ')})`,
+  'map-filled': `needs a country field (${COUNTRY_NAMES.join(', ')}) and one measure`,
+};
 
 type ShelfName = 'columns' | 'rows' | 'color' | 'size' | 'label' | 'detail' | 'tooltip' | 'facet';
 const LIST_SHELVES: ShelfName[] = ['columns', 'rows', 'detail', 'tooltip'];
@@ -394,10 +401,9 @@ function Editor({ dash, existing, draft }: { dash: Dashboard; existing: Tile | u
             <h3>Marks</h3>
             <select aria-label="Mark" value={spec.mark} onChange={(e) => setSpec({ ...spec, mark: e.target.value as Mark })} data-testid="mark-select">
               {MARKS.map((m) => (
-                <option key={m} value={m} disabled={!DRAWN.has(m)}>
+                <option key={m} value={m}>
                   {MARK_NAMES[m]}
                   {fits(m, exact) ? '' : ' (doesn’t fit the shelves)'}
-                  {DRAWN.has(m) ? '' : ` (${NOT_DRAWN_WHY[m] ?? 'not drawn yet'})`}
                 </option>
               ))}
             </select>
@@ -487,7 +493,7 @@ function Editor({ dash, existing, draft }: { dash: Dashboard; existing: Tile | u
         <h3>Show Me</h3>
         <div className="gallery">
           {PRESETS.map((p) => {
-            const ok = presetFits(p, exact) && DRAWN.has(p.mark);
+            const ok = presetFits(p, exact);
             const on = presetOf(spec) === p.id;
             return (
               <button
@@ -496,7 +502,7 @@ function Editor({ dash, existing, draft }: { dash: Dashboard; existing: Tile | u
                 disabled={!ok}
                 className={p.mark === pick.mark && !p.stack && !p.horizontal && !p.combo && p.id === pick.mark ? 'best' : undefined}
                 onClick={() => setSpec(applyPreset(spec, p))}
-                title={ok ? p.label : DRAWN.has(p.mark) ? `${p.label}: needs other fields` : `${p.label}: ${NOT_DRAWN_WHY[p.mark] ?? 'not drawn in Studio yet'}`}
+                title={ok ? p.label : `${p.label}: ${NEEDS[p.mark] ?? 'needs other fields'}`}
                 data-testid={`showme-${p.id}`}
               >
                 <i aria-hidden="true">{ICONS[p.id] ?? '▮'}</i>

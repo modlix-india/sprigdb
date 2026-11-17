@@ -47,6 +47,10 @@
 .map-legend { position: absolute; inset-inline-start: 6px; inset-block-end: 6px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; max-inline-size: 60%; }
 .map-legend ul { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 2px 10px; }
 .map-legend i { display: inline-block; inline-size: 10px; block-size: 10px; border-radius: 50%; margin-inline-end: 4px; vertical-align: -1px; }
+.map-legend .map-steps { gap: 2px 3px; align-items: center; }
+.map-legend .map-steps i { border-radius: 2px; inline-size: 14px; margin: 0; }
+.map-legend .map-steps li:last-child { margin-inline-start: 8px; }
+.map-legend .map-steps li:last-child i { margin-inline-end: 4px; }
 .map-ramp { display: inline-block; inline-size: 60px; block-size: 8px; border-radius: 2px; vertical-align: 0; }
 .map-note { position: absolute; inset-inline: 6px; inset-block-start: 4px; pointer-events: none; }
 .map-tip { position: absolute; pointer-events: none; z-index: 3; }

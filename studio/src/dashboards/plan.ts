@@ -1,8 +1,8 @@
 // How a spec is drawn: which Recharts chart and series (or which of
-// Studio's own drawings: tables, heatmaps, KPIs, point maps), worked out
+// Studio's own drawings: tables, heatmaps, KPIs, point and filled maps), worked out
 // without React so the mapping can be tested.
 
-import type { ColumnInfo, Spec } from './spec';
+import { COUNTRY_NAMES, LAT_NAMES, LON_NAMES, type ColumnInfo, type Spec } from './spec';
 import {
   boxes,
   fmt,
@@ -25,7 +25,7 @@ import {
   type Rec,
   type SeriesData,
 } from './data';
-import { pointMap, type PointMap } from './map';
+import { filledMap, pointMap, type FilledMap, type PointMap } from './map';
 
 /** One drawn series: a Recharts component with its props. */
 export interface DrawnSeries {
@@ -66,6 +66,7 @@ export type Plan =
   | { kind: 'matrix'; numbers: boolean; m: Matrix }
   | { kind: 'pivot'; p: Pivot }
   | PointMap
+  | FilledMap
   | { kind: 'table'; heads: string[]; rows: Rec[] }
   | { kind: 'unavailable'; why: string }
   | { kind: 'empty'; why: string };
@@ -220,14 +221,15 @@ export function plan(s: Spec, columns: ColumnInfo[], rows: unknown[][]): Plan {
       return (
         pointMap(s, columns, rows) ?? {
           kind: 'empty',
-          why: 'A point map needs a latitude and a longitude field (named lat or latitude, and lon, lng, long or longitude). Place names alone need region shapes, which Studio doesn’t have yet.',
+          why: `A point map needs a latitude and a longitude field (named ${LAT_NAMES.join(', ')}, and ${LON_NAMES.join(', ')}). For countries, use a filled map.`,
         }
       );
-    case 'map-filled':
-      return {
-        kind: 'unavailable',
-        why: 'A filled map needs region shapes (the outlines of countries or states), which Studio doesn’t have yet. Use a point map with latitude and longitude, or another chart; the tile keeps its spec.',
-      };
+    case 'map-filled': {
+      const f = filledMap(s, columns, rows);
+      if (!f) return { kind: 'empty', why: `A filled map needs a country field (named ${COUNTRY_NAMES.join(', ')}) holding country names or ISO codes. States and provinces aren’t drawn.` };
+      if (!f.measure) return { kind: 'empty', why: 'A filled map needs a measure, on Colour or Rows.' };
+      return f;
+    }
     case 'text-table':
     default: {
       if (!dims.length && !measures.length) {
@@ -256,6 +258,8 @@ export function describePlan(p: Plan, title: string): string {
       return `${title}: ${p.label} is ${fmt(p.value)}`;
     case 'pie':
       return `${title}: ${p.donut ? 'donut' : 'pie'} of ${p.data.length} slices`;
+    case 'filled':
+      return `${title}: map of ${p.regions.length} countries coloured by ${p.measure.label}${p.unmatched ? `, ${p.unmatched} rows not matched to a country` : ''}`;
     case 'map':
       return `${title}: point map of ${p.points.length} places${p.size ? `, sized by ${p.size.label}` : ''}${p.colour ? `, coloured by ${p.colour.label}` : ''}`;
     case 'empty':

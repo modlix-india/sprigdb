@@ -1,13 +1,16 @@
-// A point map drawn with MapLibre GL. Loaded on first use (ChartView
-// imports it lazily), so the main bundle doesn't carry MapLibre.
+// Point and filled maps drawn with MapLibre GL. Loaded on first use
+// (ChartView imports it lazily), so the main bundle doesn't carry MapLibre.
 //
+// - A filled map's country shapes (shapes.ts, about 100 KB) load only when
+//   one is drawn, from Studio's own origin.
 // - Base map: `studio.map_tile_url` when it is an XYZ raster template
 //   (the gateway adds its origin to the CSP). Without one the points sit on
 //   a plain background with a 30° graticule and nothing is fetched from
 //   anywhere: no tiles, glyphs or sprites.
 // - The worker is MapLibre's own module, served by Studio (worker-src 'self').
 // - Colours follow the theme: the chart palette for categories, the
-//   sequential ramp for a colour measure; a dark theme dims raster tiles.
+//   sequential ramp for a colour measure and a filled map's steps; a dark
+//   theme dims raster tiles.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Map as MlMap, NavigationControl, setWorkerUrl, type StyleSpecification } from 'maplibre-gl';
@@ -16,7 +19,8 @@ import workerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?url';
 import { useSession } from '../auth/session';
 import { isDark } from '../app/theme';
 import type { Palette } from './ChartView';
-import { bounds, radius, tileTemplate, type PointMap } from './map';
+import { bounds, radius, step, tileTemplate, STEPS, type FilledMap, type PointMap } from './map';
+import type { Shape } from './shapes';
 
 setWorkerUrl(workerUrl);
 
@@ -25,7 +29,10 @@ interface Feature {
   type: 'Feature';
   id?: number;
   properties: Record<string, unknown>;
-  geometry: { type: 'Point'; coordinates: number[] } | { type: 'LineString'; coordinates: number[][] };
+  geometry:
+    | { type: 'Point'; coordinates: number[] }
+    | { type: 'LineString'; coordinates: number[][] }
+    | { type: 'MultiPolygon'; coordinates: number[][][][] };
 }
 interface Collection {
   type: 'FeatureCollection';
@@ -69,8 +76,27 @@ function graticule(): Collection {
   return { type: 'FeatureCollection', features };
 }
 
-function styleOf(m: PointMap, pal: Palette, tiles: string | null): StyleSpecification {
-  const dark = isDark();
+/** The background, and the tiles when there are any (dimmed in a dark
+ * theme). */
+function base(pal: Palette, tiles: string | null): StyleSpecification {
+  const style: StyleSpecification = {
+    version: 8,
+    sources: {},
+    layers: [{ id: 'background', type: 'background', paint: { 'background-color': pal.surface } }],
+  };
+  if (tiles) {
+    style.sources.base = { type: 'raster', tiles: [tiles], tileSize: 256, maxzoom: 19 };
+    style.layers.push({
+      id: 'base',
+      type: 'raster',
+      source: 'base',
+      paint: isDark() ? { 'raster-brightness-max': 0.7, 'raster-saturation': -0.4 } : {},
+    });
+  }
+  return style;
+}
+
+function pointStyle(m: PointMap, pal: Palette, tiles: string | null): StyleSpecification {
   const points: Collection = {
     type: 'FeatureCollection',
     features: m.points.map((p, i) => ({
@@ -80,22 +106,9 @@ function styleOf(m: PointMap, pal: Palette, tiles: string | null): StyleSpecific
       geometry: { type: 'Point', coordinates: [p.lon, p.lat] },
     })),
   };
-  const style: StyleSpecification = {
-    version: 8,
-    sources: {
-      points: { type: 'geojson', data: points },
-    },
-    layers: [{ id: 'background', type: 'background', paint: { 'background-color': pal.surface } }],
-  };
-  if (tiles) {
-    style.sources.base = { type: 'raster', tiles: [tiles], tileSize: 256, maxzoom: 19 };
-    style.layers.push({
-      id: 'base',
-      type: 'raster',
-      source: 'base',
-      paint: dark ? { 'raster-brightness-max': 0.7, 'raster-saturation': -0.4 } : {},
-    });
-  } else {
+  const style = base(pal, tiles);
+  style.sources.points = { type: 'geojson', data: points };
+  if (!tiles) {
     style.sources.graticule = { type: 'geojson', data: graticule() };
     style.layers.push({
       id: 'graticule',
@@ -117,6 +130,93 @@ function styleOf(m: PointMap, pal: Palette, tiles: string | null): StyleSpecific
     },
   });
   return style;
+}
+
+/** A step's colour: the sequential ramp past its lightest (light theme) or
+ * darkest (dark theme) shade, which is too close to the background. */
+const stepColour = (pal: Palette, k: number) => pal.seq[Math.min(pal.seq.length - 1, k + 1)]!;
+
+/** Countries without data, and Antarctica unless it has some. */
+function filledStyle(m: FilledMap, shapes: Shape[] | null, pal: Palette, tiles: string | null): StyleSpecification {
+  const style = base(pal, tiles);
+  if (!shapes) return style;
+  const at = new Map(m.regions.map((r, i) => [r.key, i]));
+  const features: Feature[] = [];
+  shapes.forEach((sh, n) => {
+    const i = sh.key === null ? undefined : at.get(sh.key);
+    if (i === undefined && sh.key === '010') return;
+    const k = i === undefined ? null : step(m, m.regions[i]!.value);
+    features.push({
+      type: 'Feature',
+      id: n,
+      properties: { i: i ?? -1, s: n, d: k !== null, c: k === null ? pal.grid : stepColour(pal, k) },
+      geometry: { type: 'MultiPolygon', coordinates: sh.polygons },
+    });
+  });
+  style.sources.regions = { type: 'geojson', data: { type: 'FeatureCollection', features } as Collection };
+  style.layers.push({
+    id: 'regions',
+    type: 'fill',
+    source: 'regions',
+    // Over tiles, countries without data stay clear.
+    paint: { 'fill-color': ['get', 'c'], 'fill-opacity': tiles ? ['case', ['get', 'd'], 0.75, 0] : 1 },
+  });
+  style.layers.push({
+    id: 'borders',
+    type: 'line',
+    source: 'regions',
+    paint: { 'line-color': tiles ? pal.muted : pal.surface, 'line-width': 0.6 },
+  });
+  return style;
+}
+
+/** The bounds of the countries with data, or the world when they span
+ * most of it (or there are none). */
+function filledBounds(m: FilledMap, shapes: Shape[] | null): [[number, number], [number, number]] | null {
+  if (!shapes) return null;
+  const keys = new Set(m.regions.map((r) => r.key));
+  let w = 180;
+  let s = 90;
+  let e = -180;
+  let n = -90;
+  for (const sh of shapes) {
+    if (sh.key === null || !keys.has(sh.key)) continue;
+    w = Math.min(w, sh.bounds[0][0]);
+    s = Math.min(s, sh.bounds[0][1]);
+    e = Math.max(e, sh.bounds[1][0]);
+    n = Math.max(n, sh.bounds[1][1]);
+  }
+  if (w > e || e - w > 250) return [
+    [-180, -56],
+    [180, 80],
+  ];
+  return [
+    [w, s],
+    [e, n],
+  ];
+}
+
+function FilledLegend({ m, pal, format }: { m: FilledMap; pal: Palette; format: (v: unknown) => string }) {
+  const { min, max, label } = m.measure;
+  const width = (max - min) / STEPS;
+  return (
+    <div className="map-legend small" data-testid="map-legend">
+      <div>{label}</div>
+      <ul aria-label={`Colour: ${label}, ${format(min)} to ${format(max)}`} className="map-steps">
+        <li>{format(min)}</li>
+        {Array.from({ length: STEPS }, (_, k) => (
+          <li key={k} title={max > min ? `${format(min + k * width)} to ${format(min + (k + 1) * width)}` : format(max)}>
+            <i aria-hidden="true" style={{ background: stepColour(pal, k) }} />
+          </li>
+        ))}
+        <li>{format(max)}</li>
+        <li>
+          <i aria-hidden="true" style={{ background: pal.grid }} />
+          No data
+        </li>
+      </ul>
+    </div>
+  );
 }
 
 function Legend({ m, pal, format }: { m: PointMap; pal: Palette; format: (v: unknown) => string }) {
@@ -154,15 +254,32 @@ function Legend({ m, pal, format }: { m: PointMap; pal: Palette; format: (v: unk
   );
 }
 
-export default function MapView({ m, pal, format }: { m: PointMap; pal: Palette; format: (v: unknown) => string }) {
+export default function MapView({ m, pal, format }: { m: PointMap | FilledMap; pal: Palette; format: (v: unknown) => string }) {
   const box = useRef<HTMLDivElement>(null);
   const map = useRef<MlMap | null>(null);
   const setting = useSession((s) => s.me?.studio.map_tile_url ?? '');
   const tiles = tileTemplate(setting);
   const [failed, setFailed] = useState<string | null>(null);
-  const [hover, setHover] = useState<{ x: number; y: number; i: number } | null>(null);
-  const style = useMemo(() => styleOf(m, pal, tiles), [m, pal, tiles]);
-  const area = useMemo(() => bounds(m), [m]);
+  const [hover, setHover] = useState<{ x: number; y: number; i: number; shape?: number } | null>(null);
+  const [shapes, setShapes] = useState<Shape[] | null>(null);
+  const filled = m.kind === 'filled';
+  // A filled map's shapes: loaded on first use.
+  useEffect(() => {
+    if (!filled || shapes) return;
+    let live = true;
+    import('./shapes')
+      .then((x) => {
+        if (live) setShapes(x.countries());
+      })
+      .catch((e: unknown) => {
+        if (live) setFailed(`the country shapes didn’t load: ${e instanceof Error ? e.message : String(e)}`);
+      });
+    return () => {
+      live = false;
+    };
+  }, [filled, shapes]);
+  const style = useMemo(() => (m.kind === 'filled' ? filledStyle(m, shapes, pal, tiles) : pointStyle(m, pal, tiles)), [m, pal, tiles, shapes]);
+  const area = useMemo(() => (m.kind === 'filled' ? filledBounds(m, shapes) : bounds(m)), [m, shapes]);
 
   // The map: made once, its style swapped (diffed) when the data or theme changes.
   useEffect(() => {
@@ -185,13 +302,16 @@ export default function MapView({ m, pal, format }: { m: PointMap; pal: Palette;
       return () => window.clearTimeout(t);
     }
     made.addControl(new NavigationControl({ showCompass: false }), 'top-right');
-    made.on('mousemove', 'points', (e) => {
-      const f = e.features?.[0];
-      const i = typeof f?.properties?.i === 'number' ? f.properties.i : null;
-      made.getCanvas().style.cursor = i === null ? '' : 'pointer';
-      setHover(i === null ? null : { x: e.point.x, y: e.point.y, i });
+    // Hover: the point or country under the pointer, from whichever of
+    // the two layers the current style has (a tile may switch between them).
+    made.on('mousemove', (e) => {
+      const layers = ['points', 'regions'].filter((l) => made.getLayer(l));
+      const p = layers.length ? made.queryRenderedFeatures(e.point, { layers })[0]?.properties : undefined;
+      const i = typeof p?.i === 'number' ? p.i : null;
+      made.getCanvas().style.cursor = i === null || i < 0 ? '' : 'pointer';
+      setHover(i === null ? null : { x: e.point.x, y: e.point.y, i, shape: typeof p?.s === 'number' ? p.s : undefined });
     });
-    made.on('mouseleave', 'points', () => {
+    made.on('mouseout', () => {
       made.getCanvas().style.cursor = '';
       setHover(null);
     });
@@ -217,21 +337,63 @@ export default function MapView({ m, pal, format }: { m: PointMap; pal: Palette;
     if (!mm || !area) return;
     const [[w, s], [e, n]] = area;
     if (w === e && s === n) mm.jumpTo({ center: [w, s], zoom: 6 });
-    else mm.fitBounds(area, { padding: 32, maxZoom: 12, animate: false });
-  }, [area]);
+    else mm.fitBounds(area, { padding: 32, maxZoom: filled ? 5 : 12, animate: false });
+  }, [area, filled]);
 
   if (!hasWebgl()) return <p className="muted chart-note">This browser can’t draw maps: it has no WebGL.</p>;
   if (failed) return <p className="muted chart-note">This browser can’t draw maps here ({failed}).</p>;
+  const badTiles = !!setting.trim() && !tiles;
+  const tileNote = badTiles && 'studio.map_tile_url isn’t a {z}/{x}/{y} tile template, so there is no base map.';
+  const dark = isDark() ? 'map-wrap map-dark' : 'map-wrap';
+  if (m.kind === 'filled') {
+    const region = hover && hover.i >= 0 ? m.regions[hover.i] : null;
+    const shape = hover?.shape !== undefined ? shapes?.[hover.shape] : undefined;
+    return (
+      <div className={dark} data-testid="filled-map" data-regions={m.regions.length} data-shapes={shapes ? 'on' : 'off'} data-tiles={tiles ? 'on' : 'off'}>
+        <div ref={box} className="map-box" />
+        <FilledLegend m={m} pal={pal} format={format} />
+        {(m.unmatched > 0 || badTiles || !shapes) && (
+          <p className="muted chart-cut map-note" data-testid="map-note">
+            {!shapes && 'Loading the country shapes… '}
+            {m.unmatched > 0 &&
+              `${m.unmatched} ${m.unmatched === 1 ? 'row' : 'rows'} not matched to a country (${m.examples.join(', ')}${m.unmatched > m.examples.length ? ', …' : ''}). `}
+            {tileNote}
+          </p>
+        )}
+        {hover && shape && (
+          <div className="chart-tip map-tip" style={{ left: hover.x + 12, top: hover.y + 12 }} role="status">
+            <div>
+              <b>{shape.name}</b>
+            </div>
+            {region ? (
+              <>
+                <div>
+                  {m.measure.label}: <b>{format(region.value)}</b>
+                </div>
+                {region.tip.map((t) => (
+                  <div key={t.label}>
+                    {t.label}: <b>{format(t.value)}</b>
+                  </div>
+                ))}
+              </>
+            ) : (
+              <div className="muted">No data</div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
   const tip = hover ? m.points[hover.i] : null;
   return (
-    <div className={isDark() ? 'map-wrap map-dark' : 'map-wrap'} data-testid="point-map" data-points={m.points.length} data-tiles={tiles ? 'on' : 'off'}>
+    <div className={dark} data-testid="point-map" data-points={m.points.length} data-tiles={tiles ? 'on' : 'off'}>
       <div ref={box} className="map-box" />
       <Legend m={m} pal={pal} format={format} />
-      {(m.cut > 0 || m.skipped > 0 || (setting.trim() && !tiles)) && (
+      {(m.cut > 0 || m.skipped > 0 || badTiles) && (
         <p className="muted chart-cut map-note">
           {m.cut > 0 && `${m.cut} more places not shown. `}
           {m.skipped > 0 && `${m.skipped} rows without a valid latitude and longitude. `}
-          {setting.trim() && !tiles && 'studio.map_tile_url isn’t a {z}/{x}/{y} tile template, so there is no base map.'}
+          {tileNote}
         </p>
       )}
       {tip && hover && (

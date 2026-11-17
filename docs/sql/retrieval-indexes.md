@@ -146,7 +146,9 @@ How a search works:
 - The candidates whose rows you can read are ranked by BM25, with word counts and lengths taken from those chunks only. Equal scores go to the lower key.
 - Both lists are cut at the same depth (40 per shard), counted in chunks you can see, so how many hidden rows there are changes nothing.
 
-Your hits and ranks are then the same whether or not the hidden rows exist. A query whose words match more than 1,000 chunks in one shard is ranked by the vector list alone for you. Users no policy restricts keep the full-text relevance of the whole index. The nearest-chunk search uses MariaDB's approximate vector index, whose answers can still vary slightly with the rows in the index.
+Your hits and ranks are then the same whether or not the hidden rows exist. Users no policy restricts keep the full-text relevance of the whole index. The nearest-chunk search uses MariaDB's approximate vector index, whose answers can still vary slightly with the rows in the index.
+
+A query whose words match more than 1,000 chunks in one shard gets no full-text list for you: its hits come from the vector list alone, and their `bm25_rank` is `NULL`. The statement then carries warning 39827 (`ER_SPRIG_SEARCH_WINDOW_EXCEEDED`), once for each index it searched this way, naming the index and how many of its shards had too many matches. Rarer or more specific words, or a filter, bring the full-text list back.
 
 Arguments:
 
@@ -176,11 +178,19 @@ Content-Type: application/json
     {"key": {"id": 42}, "chunk_no": 0, "title": "Account help",
      "text": "To reset your password, open Settings ...", "score": 0.0325,
      "bm25_rank": 1, "vector_rank": 2}
-  ]
+  ],
+  "warnings": []
 }
 ```
 
-`key` holds the row's primary key columns; binary key columns are given in hexadecimal.
+`key` holds the row's primary key columns; binary key columns are given in hexadecimal. `warnings` lists what `SHOW WARNINGS` would show after the same `RETRIEVE()`, as `{"level", "code", "message"}` objects, and is empty when there are none. Today that is warning 39827 when the full-text list was left out for a user that row-level security restricts:
+
+```json
+"warnings": [
+  {"level": "Warning", "code": 39827,
+   "message": "RETRIEVE(support.kb): no keyword list: its shard has more than 1000 chunks with a query word, more than a search under row-level security ranks; the hits come from the vector list alone"}
+]
+```
 
 ## DROP, SHOW CREATE and SHOW
 
@@ -232,6 +242,7 @@ The model is found in `docs.model_dir`, as for [embedded columns](../data-models
 | 1142 | | No `INDEX` on the table (create, drop), or no `SELECT` on it or its text column (search) |
 | 1210, 1582 | | `RETRIEVE()` with arguments of the wrong kind or number |
 | 39051 | `ER_SPRIG_NAME_REWRITE_UNSUPPORTED` | `RETRIEVE()` in a prepared statement |
+| 39827 | `ER_SPRIG_SEARCH_WINDOW_EXCEEDED` | A warning, not an error: for a user that row-level security restricts, the query's words matched more than 1,000 chunks in a shard, so the hits come from the vector list alone |
 
 ## Related
 

@@ -1,9 +1,14 @@
-// Point maps: a tile's rows as points at their latitude and longitude,
-// sized by the Size shelf and coloured by the Colour shelf. Worked out
-// without React or MapLibre so it can be tested; MapView draws it.
+// Maps, worked out without React or MapLibre so they can be tested;
+// MapView draws them.
+// - Point maps: a tile's rows as points at their latitude and longitude,
+//   sized by the Size shelf and coloured by the Colour shelf.
+// - Filled maps: countries coloured by a measure, the rows matched to
+//   countries by name or ISO code (countries.ts) and aggregated per
+//   country with the measure's own aggregation.
 
-import { fieldsOf, grouped, labelOf, num, type Cell } from './data';
-import { isLat, isLon, isMeasure, type ColumnInfo, type Field, type Spec } from './spec';
+import { countryKey } from './countries';
+import { aggregate, fieldsOf, filtered, grouped, labelOf, num, type Cell } from './data';
+import { isCountry, isLat, isLon, isMeasure, type ColumnInfo, type Field, type Spec } from './spec';
 
 const isGeo = (f: Field) => isLat(f.field) || isLon(f.field);
 
@@ -147,4 +152,95 @@ export function tileTemplate(url: string): string | null {
   if (!/^https?:\/\//i.test(u)) return null;
   if (!u.includes('{z}') || !u.includes('{x}') || !u.includes('{y}')) return null;
   return u;
+}
+
+// ---- filled maps ----
+
+/** One country of a filled map. */
+export interface Region {
+  /** The shape key (countries.ts): the numeric code, or `XK`. */
+  key: string;
+  /** The measure, aggregated over the country's rows. */
+  value: number | null;
+  /** The tooltip's measures, aggregated likewise. */
+  tip: { label: string; value: number | null }[];
+  /** Rows matched to it. */
+  rows: number;
+}
+
+export interface FilledMap {
+  kind: 'filled';
+  /** The country field. */
+  country: string;
+  /** The measure's label and range over the regions. */
+  measure: { label: string; min: number; max: number };
+  regions: Region[];
+  /** Rows whose country matched no country shape (or was empty). */
+  unmatched: number;
+  /** A few of those rows' values, as written. */
+  examples: string[];
+}
+
+/** The steps of a filled map's colour scale. */
+export const STEPS = 6;
+
+/** The filled map of a spec over a result: the first country field on a
+ * shelf, and the measure on Colour (else the first on Columns or Rows,
+ * else Size). Null without a country field; `measure` null without a
+ * measure. */
+export function filledMap(s: Spec, columns: ColumnInfo[], rows: unknown[][]): FilledMap | { kind: 'filled'; measure: null } | null {
+  const all = [...s.columns, ...s.rows, ...(s.color ? [s.color] : []), ...s.detail, ...s.tooltip, ...(s.label ? [s.label] : [])];
+  const country = all.find((f) => isCountry(f.field));
+  if (!country) return null;
+  const measure: Field | undefined =
+    (s.color && isMeasure(s.color) ? s.color : undefined) ??
+    [...s.columns, ...s.rows].find((f) => isMeasure(f) && !isCountry(f.field)) ??
+    (s.size ? { ...s.size, agg: s.size.agg ?? 'sum' } : undefined);
+  if (!measure) return { kind: 'filled', measure: null };
+  const tips = s.tooltip.filter((f) => isMeasure(f) && labelOf(f) !== labelOf(measure));
+  const { recs, get } = filtered(s, columns, rows);
+  const byKey = new Map<string, { vals: unknown[][]; rows: number }>();
+  let unmatched = 0;
+  const examples: string[] = [];
+  for (const r of recs) {
+    const raw = get(r, country.field);
+    const key = countryKey(raw);
+    if (!key) {
+      unmatched++;
+      const shown = raw === null ? 'NULL' : String(raw);
+      if (examples.length < 3 && !examples.includes(shown)) examples.push(shown);
+      continue;
+    }
+    let g = byKey.get(key);
+    if (!g) {
+      g = { vals: [measure, ...tips].map(() => []), rows: 0 };
+      byKey.set(key, g);
+    }
+    g.rows++;
+    [measure, ...tips].forEach((f, i) => g.vals[i]!.push(get(r, f.field)));
+  }
+  const regions: Region[] = [...byKey.entries()].map(([key, g]) => ({
+    key,
+    value: aggregate(g.vals[0]!, measure.agg),
+    tip: tips.map((f, i) => ({ label: labelOf(f), value: aggregate(g.vals[i + 1]!, f.agg) })),
+    rows: g.rows,
+  }));
+  const ns = regions.map((x) => x.value).filter((v): v is number => v !== null);
+  return {
+    kind: 'filled',
+    country: country.field,
+    measure: { label: labelOf(measure), min: ns.length ? Math.min(...ns) : 0, max: ns.length ? Math.max(...ns) : 0 },
+    regions,
+    unmatched,
+    examples,
+  };
+}
+
+/** A value's step on the colour scale, 0 to STEPS - 1 (equal intervals
+ * from the smallest value to the largest), or null without a value. */
+export function step(m: FilledMap, v: number | null): number | null {
+  if (v === null) return null;
+  const { min, max } = m.measure;
+  if (max <= min) return STEPS - 1;
+  return Math.min(STEPS - 1, Math.max(0, Math.floor(((v - min) / (max - min)) * STEPS)));
 }

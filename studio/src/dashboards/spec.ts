@@ -90,22 +90,26 @@ export interface ColumnInfo {
 
 export type Role = 'measure' | 'dimension' | 'date';
 
-/** Field names read as a latitude or a longitude (any case). */
-export const LAT_NAMES = ['lat', 'latitude'];
-export const LON_NAMES = ['lon', 'lng', 'long', 'longitude'];
+/** Field names read as a latitude, a longitude or a country (any case):
+ * chart-rules.json's lists, which the gateway's tile check reads too. */
+export const LAT_NAMES: readonly string[] = RULES.latNames;
+export const LON_NAMES: readonly string[] = RULES.lonNames;
+export const COUNTRY_NAMES: readonly string[] = RULES.countryNames;
 export const isLat = (name: string) => LAT_NAMES.includes(name.toLowerCase());
 export const isLon = (name: string) => LON_NAMES.includes(name.toLowerCase());
+export const isCountry = (name: string) => COUNTRY_NAMES.includes(name.toLowerCase());
 
 const NUMERIC = ['DECIMAL', 'TINYINT', 'SMALLINT', 'INT', 'FLOAT', 'DOUBLE', 'BIGINT', 'MEDIUMINT', 'INTEGER', 'NUMBER'];
 const DATES = ['DATE', 'DATETIME', 'TIMESTAMP'];
 
 /** What a column is on the shelves, from its type: numbers are measures,
- * dates are dates, the rest dimensions. Ids, flags, latitudes and
- * longitudes stay dimensions (a location is never summed). */
+ * dates are dates, the rest dimensions. Ids, flags, latitudes, longitudes
+ * and countries (a numeric code) stay dimensions (a location is never
+ * summed). */
 export function roleOf(c: ColumnInfo): Role {
   const t = c.type.toUpperCase().replace(/\(.*$/, '').trim();
   if (DATES.includes(t)) return 'date';
-  if (isLat(c.name) || isLon(c.name)) return 'dimension';
+  if (isLat(c.name) || isLon(c.name) || isCountry(c.name)) return 'dimension';
   const n = c.name.toLowerCase();
   if (NUMERIC.includes(t)) {
     const idLike = n === 'id' || n.endsWith('_id') || /[a-z]Id$/.test(c.name);
@@ -178,9 +182,11 @@ export interface Counts {
   measures: number;
   dates: number;
   geo: boolean;
-  /** A latitude and a longitude field are on the shelves (Studio's own
-   * count, for point maps; the gateway's rules don't use it). */
+  /** A latitude and a longitude field are on the shelves (a point map
+   * needs them, as the gateway's tile check does). */
   latLon: boolean;
+  /** A country field is on the shelves (a filled map needs one). */
+  country: boolean;
   /** Bare entries that might be measures (only for specs without column types). */
   unknown: number;
 }
@@ -199,11 +205,12 @@ const GEO = new Set(RULES.geoNames);
 
 /** Counts a spec's fields the way the gateway's tile check does. */
 export function counts(s: ChartSpec): Counts {
-  const c: Counts = { dims: 0, measures: 0, dates: 0, geo: false, latLon: false, unknown: 0 };
+  const c: Counts = { dims: 0, measures: 0, dates: 0, geo: false, latLon: false, country: false, unknown: 0 };
   let lat = false;
   let lon = false;
   const place = (f: Field) => {
     if (GEO.has(f.field.toLowerCase())) c.geo = true;
+    if (isCountry(f.field)) c.country = true;
     lat ||= isLat(f.field);
     lon ||= isLon(f.field);
   };
@@ -218,7 +225,8 @@ export function counts(s: ChartSpec): Counts {
       else {
         c.dims++;
         if (f.datePart) c.dates++;
-        else if (name === 'columns' || name === 'rows') c.unknown++;
+        // A bare location is never a measure.
+        else if ((name === 'columns' || name === 'rows') && !isLat(f.field) && !isLon(f.field) && !isCountry(f.field)) c.unknown++;
       }
     }
   };
@@ -250,27 +258,28 @@ function fitsExactly(r: MarkRule, c: Counts): boolean {
   );
 }
 
-/** Whether `mark` fits, taking any bare entries as measures if that helps
- * (as the gateway does). */
+/** Whether `mark` fits, taking any bare entries as measures if that helps,
+ * and a map has its place fields (as the gateway does). */
 export function fits(mark: Mark, c: Counts): boolean {
   const r = MARK_RULES[mark];
-  if (!r) return false;
+  if (!r || !placed(mark, c)) return false;
   for (let k = 0; k <= c.unknown; k++) {
     if (fitsExactly(r, { ...c, dims: c.dims - k, measures: c.measures + k, unknown: 0 })) return true;
   }
   return false;
 }
 
-/** Marks Studio can draw; a filled map needs region shapes Studio doesn't
- * have, so Show Me offers it as "needs region shapes". */
-export const DRAWN: ReadonlySet<Mark> = new Set<Mark>(MARKS.filter((m) => m !== 'map-filled'));
-
-/** Why Studio doesn't draw a mark (for marks not in DRAWN). */
-export const NOT_DRAWN_WHY: Partial<Record<Mark, string>> = { 'map-filled': 'needs region shapes' };
+/** Whether a map mark has the place fields it draws by: a point map a
+ * latitude and a longitude, a filled map a country. Other marks have. */
+export function placed(mark: Mark, c: Counts): boolean {
+  if (mark === 'map-point') return c.latLon;
+  if (mark === 'map-filled') return c.country;
+  return true;
+}
 
 /** The best mark for the shelves, and why (the first rule that holds),
- * skipping marks Studio can't draw, and a point map without a latitude
- * and a longitude. */
+ * skipping a point map without a latitude and a longitude and a filled
+ * map without a country. */
 export function best(c: Counts): { mark: Mark; why: string } {
   for (const b of RULES.best) {
     const w = b.when as Record<string, unknown>;
@@ -282,7 +291,7 @@ export function best(c: Counts): { mark: Mark; why: string } {
       if (k === 'dates') return within(c.dates, r);
       return true;
     });
-    if (ok && DRAWN.has(b.mark as Mark) && (b.mark !== 'map-point' || c.latLon)) return { mark: b.mark as Mark, why: b.why };
+    if (ok && placed(b.mark as Mark, c)) return { mark: b.mark as Mark, why: b.why };
   }
   return { mark: 'text-table', why: '' };
 }
@@ -330,7 +339,7 @@ export const PRESETS: Preset[] = [
   { id: 'bullet', label: 'Bullet', mark: 'bullet' },
   { id: 'gantt', label: 'Gantt', mark: 'gantt' },
   { id: 'map-point', label: 'Point map', mark: 'map-point', needs: (c) => c.latLon },
-  { id: 'map-filled', label: 'Filled map', mark: 'map-filled' },
+  { id: 'map-filled', label: 'Filled map', mark: 'map-filled', needs: (c) => c.country },
 ];
 
 /** Whether a preset fits (its mark's rule, then its own needs). */

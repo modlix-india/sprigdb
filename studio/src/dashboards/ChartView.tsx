@@ -1,8 +1,9 @@
 // Draws a tile's chart from its plan with Recharts (bar, line, area,
 // combo, scatter, pie, radar, treemap, funnel, sankey, gauge; box plots,
 // waterfalls, bullets and Gantt bars from Bar shapes), Studio's own HTML
-// for tables, pivots, heatmaps and KPIs, and MapLibre for point maps
-// (loaded on first use).
+// for tables, pivots, heatmaps and KPIs, and MapLibre for point and
+// filled maps (loaded on first use, the country shapes only for a filled
+// map).
 
 import { lazy, Suspense, useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
@@ -525,6 +526,7 @@ function One({ p, pal, format, title }: { p: Plan; pal: Palette; format: (v: unk
     case 'table':
       return <Table heads={p.heads} rows={p.rows} format={format} />;
     case 'map':
+    case 'filled':
       return (
         <Suspense fallback={<p className="muted chart-note">Loading the map…</p>}>
           <MapView m={p} pal={pal} format={format} />
@@ -560,7 +562,7 @@ export function ChartView({
     const cut = 'cut' in single && single.cut ? single.cut : 0;
     return (
       <div className="chart-wrap" style={{ height }}>
-        <Frame label={describePlan(single, title)} height={cut ? 'calc(100% - 18px)' : '100%'} interactive={single.kind === 'map'}>
+        <Frame label={describePlan(single, title)} height={cut ? 'calc(100% - 18px)' : '100%'} interactive={single.kind === 'map' || single.kind === 'filled'}>
           <One p={single} pal={pal} format={format} title={title} />
         </Frame>
         {cut > 0 && <p className="muted chart-cut">{cut} more categories not shown</p>}
@@ -575,7 +577,7 @@ export function ChartView({
         return (
           <div className="facet" key={f.value}>
             <div className="facet-title">{f.value}</div>
-            <Frame label={describePlan(p, `${title}, ${f.value}`)} height="calc(100% - 20px)" interactive={p.kind === 'map'}>
+            <Frame label={describePlan(p, `${title}, ${f.value}`)} height="calc(100% - 20px)" interactive={p.kind === 'map' || p.kind === 'filled'}>
               <One p={p} pal={pal} format={format} title={title} />
             </Frame>
           </div>
