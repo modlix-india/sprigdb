@@ -129,6 +129,7 @@ The token is printed once. Save it in a file and pass it with `--token-file`.
 | `space` | Spaces and shares |
 | `inherit` | Inherited tables, shares, tree-wide ids and delete blockers |
 | `txn` | In-doubt distributed transactions |
+| `catalog` | Catalog contract migrations |
 | `sink` | Sinks, their dead letters and connections |
 | `graph` | Graphs and their partitioning |
 | `search` | Search indexes on workers |
@@ -310,6 +311,8 @@ sprigctl gateway show gw-1
 sprigctl gateway drain gw-1        # readiness off, listeners closed, work finished, exit
 ```
 
+A gateway whose peer listener for calls from other processes is down shows `ready (degraded)`, with the reason on the next lines; in `-o json` it has `degraded`. It still serves clients, but workers can't reach it to run triggers.
+
 See [Upgrades](../operate/upgrades.md).
 
 ### check
@@ -362,6 +365,15 @@ sprigctl txn resolve <dtid>            # finish it now, by its recorded decision
 ```
 
 A transaction is in doubt while one of its XA branches is prepared. The controller's resolver finishes such branches on its own; `resolve` does the same at once. The recorded decision commits it; with none recorded it is aborted. You never pick the outcome.
+
+### catalog
+
+```sh
+sprigctl catalog contracts show
+sprigctl catalog contracts run --reason "<why>" --operator <who> [--tenant acme]
+```
+
+`show` lists which catalog formats the running processes read and what holds each module's contract migrations back. `run` runs contracts before `catalog.contract_delay_days` is over, with the reason recorded. See [Upgrades](../operate/upgrades.md#catalog-format-migrations).
 
 ### sink
 

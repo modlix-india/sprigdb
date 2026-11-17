@@ -98,7 +98,8 @@ const RUN = {
   ms: 3,
 };
 
-// Countries as names and codes; two rows match nothing.
+// Countries as names and codes (Singapore and Malta are small ones); two
+// rows match nothing.
 const RUN2 = {
   columns: [
     { name: 'country', type: 'VARCHAR' },
@@ -110,10 +111,12 @@ const RUN2 = {
     ['USA', '220'],
     ['DE', '90'],
     ['076', '40'],
+    ['SG', '12'],
+    ['Malta', '12'],
     ['Atlantis', '5'],
     [null, '1'],
   ],
-  row_count: 7,
+  row_count: 9,
   truncated: false,
   ms: 3,
 };
@@ -188,7 +191,7 @@ async function axe(page: Page, what: string, include: string): Promise<void> {
   expect(r.violations.map((v) => `${what}: ${v.id} ${v.nodes.map((n) => n.target.join(' ')).join(', ')}`)).toEqual([]);
 }
 
-const SHAPES = /shapes|countries-110m/;
+const SHAPES = /shapes|countries-50m/;
 
 test('point and filled maps draw without any outside request', async ({ page, baseURL }) => {
   const { urls } = await stub(page);
@@ -207,11 +210,15 @@ test('point and filled maps draw without any outside request', async ({ page, ba
     const filled = page.getByTestId('filled-map');
     await expect(filled).toBeVisible();
     await expect(filled).toHaveAttribute('data-shapes', 'on');
-    await expect(filled).toHaveAttribute('data-regions', '4');
+    await expect(filled).toHaveAttribute('data-regions', '6');
     await expect(filled.locator('canvas.maplibregl-canvas')).toBeVisible();
-    await expect(page.getByRole('figure', { name: /Sales by country: map of 4 countries coloured by SUM\(revenue\), 2 rows not matched to a country/ })).toBeVisible();
-    await expect(filled.getByTestId('map-legend')).toContainText('SUM(revenue)');
-    await expect(filled.getByTestId('map-legend')).toContainText('No data');
+    await expect(page.getByRole('figure', { name: /Sales by country: map of 6 countries coloured by SUM\(revenue\), 2 rows not matched to a country/ })).toBeVisible();
+    // Five distinct values (Singapore and Malta tie): a step each, with its value.
+    const legend = filled.getByTestId('map-legend');
+    await expect(legend).toContainText('SUM(revenue)');
+    await expect(legend.getByRole('list', { name: 'Colour: SUM(revenue), in 5 steps' })).toBeVisible();
+    await expect(legend.getByRole('listitem')).toHaveText(['12', '40', '90', '220', '450', 'No data']);
+    await expect(legend.getByRole('listitem').first()).toHaveAttribute('title', '2 countries');
     await expect(filled.getByTestId('map-note')).toHaveText(/2 rows not matched to a country \(Atlantis, NULL\)/);
     await axe(page, `dashboard, ${scheme}`, 'main');
   }

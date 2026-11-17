@@ -548,7 +548,7 @@ Code runs under budgets. Each is a setting; a run that exceeds one fails with 39
 | `logic.max_rows_read` | `100000` | object, database, tenant, global | Rows read in one run |
 | `logic.memory_limit_mb` | `64` | tenant, global | Heap of one run |
 
-A call in a gateway reads the value for the code's own database, so set these on the database, the tenant or globally. Workers read the tenant's and global values of the trigger settings (`logic.trigger_*`, `logic.job_budget_ms`). All of them apply live. See the [settings reference](../reference/settings.md#logic).
+A call in a gateway reads the value for the code's own database, so set these on the database, the tenant or globally. Workers read the trigger settings (`logic.trigger_*`) for the trigger's table and database, and `logic.job_budget_ms` for the schedule's database. All of them apply live. See the [settings reference](../reference/settings.md#logic).
 
 Some limits are fixed:
 

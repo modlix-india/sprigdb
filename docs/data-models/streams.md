@@ -355,7 +355,7 @@ Each record is one row change, in commit order. Its key is the JSON of the row's
 ```
 
 - `op` is `c` (insert), `u` (update) or `d` (delete). A schema change is `ddl`, with the statement in `ddl`, and a `TRUNCATE` is `t`; both go to partition 0 without a key.
-- Internal columns never appear. `DECIMAL` values are JSON numbers, so trailing zeros are lost (`49.90` is `49.9`). Binary and spatial values are base64, and dates and times are MariaDB's text.
+- Internal columns never appear. `DECIMAL` values are JSON numbers, so trailing zeros are lost (`49.90` is `49.9`); a value a double can't hold exactly, such as `12345678901234567890.1234567891`, is a JSON string instead. `ENUM` values are the member's index and `SET` values a bitmap. Binary and spatial values are base64, and dates and times are MariaDB's text.
 - Change topics are written only by SprigDB: publishing into one is 39941.
 - Reading a change topic needs `SELECT` on its table. A reader bound by the table's [row-level security](../security/row-level-security.md) policies sees only the changes those policies show it; an update that hides or reveals a row reaches that reader as a delete or an insert. Offsets aren't renumbered, so filtered records leave gaps.
 

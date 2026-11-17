@@ -110,7 +110,18 @@ A new binary applies the expand migrations it knows to tenant catalogs: every mo
 
 Each catalog records the oldest format a reader must know. A binary older than that gets 39073 `ER_SPRIG_CATALOG_FORMAT_TOO_NEW`: upgrade it rather than run old binaries against upgraded tenants.
 
-Contract migrations don't run automatically yet, so an upgraded catalog stays readable by the previous binary.
+Contract migrations run only when every running gateway, worker and controller reads the new format, and at least `catalog.contract_delay_days` (7) after the module's last expand migration. Each process records the catalog formats it reads when it starts, and a process from a build too old to record them holds every contract back. The controller checks every 10 minutes. No release has a contract migration yet, so today an upgraded catalog stays readable by the previous binary.
+
+To see what holds contracts back, and to run one before the delay is over:
+
+```sh
+sprigctl catalog contracts show
+sprigctl catalog contracts run --reason "rollback window closed" --operator alice [--tenant acme]
+```
+
+`show` lists the processes and the formats they read, any process without a record, and each module's contracts. `run` shortens only the delay: it never runs a contract that a running process can't read. It needs a platform operator, a reason and an operator name (39084 if either is blank), and it is recorded in the audit log, the event log (`catalog.contract_override`) and the migration's history. The Admin API routes are `GET /admin/v1/catalog/contracts` and `POST /admin/v1/catalog/contracts:run`.
+
+In a deployment with separate etcd clusters per data centre, contracts don't run yet.
 
 ## Rolling back
 
@@ -143,7 +154,8 @@ Upgrade one data centre at a time, as for any release.
 
 ## Not supported yet
 
-- Automatic upgrade orchestration: SprigDB doesn't track which builds are running before it migrates catalogs, and doesn't run contract migrations or a delay before them.
+- Automatic upgrade orchestration: SprigDB doesn't upgrade processes for you. It does hold contract migrations back until every running process reads the new format.
+- Contract migrations in deployments with separate etcd clusters per data centre.
 - Point-in-time restore for a rollback after a stored-format change.
 
 ## Related

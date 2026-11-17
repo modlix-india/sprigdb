@@ -49,7 +49,7 @@ A statement that waits longer than `limits.queue_timeout_ms` (5 seconds) for adm
 
 ### Connections to MariaDB
 
-Each gateway keeps its own pools of connections to each MariaDB node: at most `backend.max_conns_per_account_node` (32) per backend account and node, and at most `backend.max_conns_per_node` (256) per node across all its pools. In the default `transaction` pool mode, a client connection holds a backend connection only for the duration of a transaction, so thousands of client connections share a few hundred backend ones.
+Each gateway keeps its own pools of connections to each MariaDB node: at most `backend.max_conns_per_account_node` (32) per backend account and node, and at most as many again for the extra branches of distributed transactions, and at most `backend.max_conns_per_node` (256) per node across all its pools. In the default `transaction` pool mode, a client connection holds a backend connection only for the duration of a transaction, so thousands of client connections share a few hundred backend ones.
 
 Size each MariaDB node's `max_connections` for the worst case:
 

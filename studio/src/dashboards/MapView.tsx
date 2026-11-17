@@ -1,8 +1,11 @@
 // Point and filled maps drawn with MapLibre GL. Loaded on first use
 // (ChartView imports it lazily), so the main bundle doesn't carry MapLibre.
 //
-// - A filled map's country shapes (shapes.ts, about 100 KB) load only when
-//   one is drawn, from Studio's own origin.
+// - A filled map's country shapes (shapes.ts, about 750 KB, 230 KB
+//   compressed) load only when one is drawn, from Studio's own origin. Their
+//   GeoJSON is made once; new data or a theme change only recolours it (a
+//   paint expression by country), so the shapes aren't sent to the worker
+//   again.
 // - Base map: `studio.map_tile_url` when it is an XYZ raster template
 //   (the gateway adds its origin to the CSP). Without one the points sit on
 //   a plain background with a 30° graticule and nothing is fetched from
@@ -19,7 +22,7 @@ import workerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?url';
 import { useSession } from '../auth/session';
 import { isDark } from '../app/theme';
 import type { Palette } from './ChartView';
-import { bounds, radius, step, tileTemplate, STEPS, type FilledMap, type PointMap } from './map';
+import { bounds, radius, shade, step, tileTemplate, type FilledMap, type PointMap } from './map';
 import type { Shape } from './shapes';
 
 setWorkerUrl(workerUrl);
@@ -132,41 +135,60 @@ function pointStyle(m: PointMap, pal: Palette, tiles: string | null): StyleSpeci
   return style;
 }
 
-/** A step's colour: the sequential ramp past its lightest (light theme) or
- * darkest (dark theme) shade, which is too close to the background. */
-const stepColour = (pal: Palette, k: number) => pal.seq[Math.min(pal.seq.length - 1, k + 1)]!;
+/** Step `k` of `n`'s colour: spread over the sequential ramp past its
+ * lightest (light theme) or darkest (dark theme) shade, which is too close
+ * to the background. */
+const stepColour = (pal: Palette, k: number, n: number) => pal.seq[shade(k, n, pal.seq.length)]!;
 
-/** Countries without data, and Antarctica unless it has some. */
-function filledStyle(m: FilledMap, shapes: Shape[] | null, pal: Palette, tiles: string | null): StyleSpecification {
-  const style = base(pal, tiles);
-  if (!shapes) return style;
-  const at = new Map(m.regions.map((r, i) => [r.key, i]));
-  const features: Feature[] = [];
-  shapes.forEach((sh, n) => {
-    const i = sh.key === null ? undefined : at.get(sh.key);
-    if (i === undefined && sh.key === '010') return;
-    const k = i === undefined ? null : step(m, m.regions[i]!.value);
-    features.push({
+/** The shapes as GeoJSON, made once per load: each feature's properties
+ * are its index in `shapes` (s) and its key (k, '' without one). */
+function shapeFeatures(shapes: Shape[]): Collection {
+  return {
+    type: 'FeatureCollection',
+    features: shapes.map((sh, n) => ({
       type: 'Feature',
       id: n,
-      properties: { i: i ?? -1, s: n, d: k !== null, c: k === null ? pal.grid : stepColour(pal, k) },
+      properties: { s: n, k: sh.key ?? '' },
       geometry: { type: 'MultiPolygon', coordinates: sh.polygons },
-    });
-  });
-  style.sources.regions = { type: 'geojson', data: { type: 'FeatureCollection', features } as Collection };
+    })),
+  };
+}
+
+/** Countries coloured by step, those without data grey (clear over
+ * tiles), and Antarctica hidden unless it has data. */
+function filledStyle(m: FilledMap, features: Collection | null, pal: Palette, tiles: string | null): StyleSpecification {
+  const style = base(pal, tiles);
+  if (!features) return style;
+  // Keys by step, for one `match` over the shapes' keys.
+  const byStep: string[][] = m.steps.map(() => []);
+  const withData: string[] = [];
+  for (const r of m.regions) {
+    const k = step(m, r.value);
+    if (k === null) continue;
+    byStep[k]!.push(r.key);
+    withData.push(r.key);
+  }
+  const arms = byStep.flatMap((keys, k) => (keys.length ? [keys, stepColour(pal, k, m.steps.length)] : []));
+  const colour = arms.length ? ['match', ['get', 'k'], ...arms, pal.grid] : pal.grid;
+  const opacity = !tiles ? 1 : withData.length ? ['match', ['get', 'k'], withData, 0.75, 0] : 0;
+  style.sources.regions = { type: 'geojson', data: features };
+  const antarctica = m.regions.some((r) => r.key === '010');
+  const filter = antarctica ? undefined : ['!=', ['get', 'k'], '010'];
   style.layers.push({
     id: 'regions',
     type: 'fill',
     source: 'regions',
+    ...(filter ? { filter } : {}),
     // Over tiles, countries without data stay clear.
-    paint: { 'fill-color': ['get', 'c'], 'fill-opacity': tiles ? ['case', ['get', 'd'], 0.75, 0] : 1 },
-  });
+    paint: { 'fill-color': colour, 'fill-opacity': opacity },
+  } as StyleSpecification['layers'][number]);
   style.layers.push({
     id: 'borders',
     type: 'line',
     source: 'regions',
+    ...(filter ? { filter } : {}),
     paint: { 'line-color': tiles ? pal.muted : pal.surface, 'line-width': 0.6 },
-  });
+  } as StyleSpecification['layers'][number]);
   return style;
 }
 
@@ -197,19 +219,18 @@ function filledBounds(m: FilledMap, shapes: Shape[] | null): [[number, number], 
 }
 
 function FilledLegend({ m, pal, format }: { m: FilledMap; pal: Palette; format: (v: unknown) => string }) {
-  const { min, max, label } = m.measure;
-  const width = (max - min) / STEPS;
+  const { label } = m.measure;
+  const range = (from: number, to: number) => (from === to ? format(from) : `${format(from)} – ${format(to)}`);
   return (
     <div className="map-legend small" data-testid="map-legend">
       <div>{label}</div>
-      <ul aria-label={`Colour: ${label}, ${format(min)} to ${format(max)}`} className="map-steps">
-        <li>{format(min)}</li>
-        {Array.from({ length: STEPS }, (_, k) => (
-          <li key={k} title={max > min ? `${format(min + k * width)} to ${format(min + (k + 1) * width)}` : format(max)}>
-            <i aria-hidden="true" style={{ background: stepColour(pal, k) }} />
+      <ul aria-label={`Colour: ${label}, in ${m.steps.length} ${m.steps.length === 1 ? 'step' : 'steps'}`} className="map-steps" data-steps={m.steps.length}>
+        {m.steps.map((x, k) => (
+          <li key={k} title={`${x.count} ${x.count === 1 ? 'country' : 'countries'}`}>
+            <i aria-hidden="true" style={{ background: stepColour(pal, k, m.steps.length) }} />
+            {range(x.from, x.to)}
           </li>
         ))}
-        <li>{format(max)}</li>
         <li>
           <i aria-hidden="true" style={{ background: pal.grid }} />
           No data
@@ -260,9 +281,14 @@ export default function MapView({ m, pal, format }: { m: PointMap | FilledMap; p
   const setting = useSession((s) => s.me?.studio.map_tile_url ?? '');
   const tiles = tileTemplate(setting);
   const [failed, setFailed] = useState<string | null>(null);
-  const [hover, setHover] = useState<{ x: number; y: number; i: number; shape?: number } | null>(null);
+  const [hover, setHover] = useState<{ x: number; y: number; i?: number; shape?: number } | null>(null);
   const [shapes, setShapes] = useState<Shape[] | null>(null);
   const filled = m.kind === 'filled';
+  // The keys of the countries with data, for the hover handler (made once).
+  const keys = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    keys.current = new Set(m.kind === 'filled' ? m.regions.map((r) => r.key) : []);
+  }, [m]);
   // A filled map's shapes: loaded on first use.
   useEffect(() => {
     if (!filled || shapes) return;
@@ -278,7 +304,8 @@ export default function MapView({ m, pal, format }: { m: PointMap | FilledMap; p
       live = false;
     };
   }, [filled, shapes]);
-  const style = useMemo(() => (m.kind === 'filled' ? filledStyle(m, shapes, pal, tiles) : pointStyle(m, pal, tiles)), [m, pal, tiles, shapes]);
+  const features = useMemo(() => (shapes ? shapeFeatures(shapes) : null), [shapes]);
+  const style = useMemo(() => (m.kind === 'filled' ? filledStyle(m, features, pal, tiles) : pointStyle(m, pal, tiles)), [m, pal, tiles, features]);
   const area = useMemo(() => (m.kind === 'filled' ? filledBounds(m, shapes) : bounds(m)), [m, shapes]);
 
   // The map: made once, its style swapped (diffed) when the data or theme changes.
@@ -307,9 +334,11 @@ export default function MapView({ m, pal, format }: { m: PointMap | FilledMap; p
     made.on('mousemove', (e) => {
       const layers = ['points', 'regions'].filter((l) => made.getLayer(l));
       const p = layers.length ? made.queryRenderedFeatures(e.point, { layers })[0]?.properties : undefined;
-      const i = typeof p?.i === 'number' ? p.i : null;
-      made.getCanvas().style.cursor = i === null || i < 0 ? '' : 'pointer';
-      setHover(i === null ? null : { x: e.point.x, y: e.point.y, i, shape: typeof p?.s === 'number' ? p.s : undefined });
+      const i = typeof p?.i === 'number' ? p.i : undefined;
+      const shape = typeof p?.s === 'number' ? p.s : undefined;
+      const data = i !== undefined || (typeof p?.k === 'string' && keys.current.has(p.k));
+      made.getCanvas().style.cursor = data ? 'pointer' : '';
+      setHover(i === undefined && shape === undefined ? null : { x: e.point.x, y: e.point.y, i, shape });
     });
     made.on('mouseout', () => {
       made.getCanvas().style.cursor = '';
@@ -346,8 +375,8 @@ export default function MapView({ m, pal, format }: { m: PointMap | FilledMap; p
   const tileNote = badTiles && 'studio.map_tile_url isn’t a {z}/{x}/{y} tile template, so there is no base map.';
   const dark = isDark() ? 'map-wrap map-dark' : 'map-wrap';
   if (m.kind === 'filled') {
-    const region = hover && hover.i >= 0 ? m.regions[hover.i] : null;
     const shape = hover?.shape !== undefined ? shapes?.[hover.shape] : undefined;
+    const region = shape?.key ? m.regions.find((r) => r.key === shape.key) : undefined;
     return (
       <div className={dark} data-testid="filled-map" data-regions={m.regions.length} data-shapes={shapes ? 'on' : 'off'} data-tiles={tiles ? 'on' : 'off'}>
         <div ref={box} className="map-box" />
@@ -384,7 +413,7 @@ export default function MapView({ m, pal, format }: { m: PointMap | FilledMap; p
       </div>
     );
   }
-  const tip = hover ? m.points[hover.i] : null;
+  const tip = hover?.i !== undefined ? m.points[hover.i] : null;
   return (
     <div className={dark} data-testid="point-map" data-points={m.points.length} data-tiles={tiles ? 'on' : 'off'}>
       <div ref={box} className="map-box" />

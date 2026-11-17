@@ -239,7 +239,9 @@ SprigDB's own AI operators, `$aiEmbed`, `$aiClassify`, `$aiExtract`, `$aiSummari
 | Vector search indexes | yes, with `createSearchIndexes` |
 | Multikey (indexing array elements) | no; queries on array fields are checked in the gateway |
 | Wildcard (`$**`), `2d`, `geoHaystack` | no |
-| `sparse`, `partialFilterExpression`, `collation`, `hidden` | kept and listed, but the index holds every document |
+| `sparse`, `partialFilterExpression` | yes on unique indexes: uniqueness covers only the documents the index includes; on other indexes kept and listed, and the index holds every document |
+| `hidden` | yes through `collMod`; kept and listed from `createIndexes` |
+| `collation` | yes; an index without one takes the collection's default |
 | TTL (`expireAfterSeconds`) | yes: expired documents are deleted in the background; see [Documents](../data-models/documents.md#ttl-indexes) |
 
 SprigDB also creates indexes on its own from your queries; `listIndexes` hides those unless you pass `showAutoIndexes: true`. See [Automatic indexing](../performance/automatic-indexing.md).
@@ -259,8 +261,7 @@ Multi-document transactions work through the drivers' session API, across collec
 | SCRAM-SHA-1, MONGODB-X509, LDAP, Kerberos and AWS logins | Authentication fails |
 | Views, time-series collections, clustered collections, Queryable Encryption | 39662 `SprigDocFeatureUnsupported` |
 | `mapReduce`, `eval`, the `geoNear` command | 115 `CommandNotSupported` |
-| Multikey, wildcard and `2d` indexes; sparse and partial semantics | See [Indexes](#indexes) |
-| A collection's default collation | Collation per command works |
+| Multikey, wildcard and `2d` indexes; sparse and partial semantics on non-unique indexes | See [Indexes](#indexes) |
 | Replica-set commands and topology | SprigDB presents a `mongos` |
 
 ## Tested clients

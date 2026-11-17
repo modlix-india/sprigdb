@@ -182,7 +182,7 @@ id	sku	qty
 
 4. **Keep small, read-mostly tables out of sharded groups.** Pin tables such as `countries` and `currencies` `UNSHARDED` (or `REFERENCE`) so the advisor leaves them in the database's default group; see [Pins](sharding-advisor.md#pin-a-tables-place). Copies of reference tables on every cluster aren't built yet, so a `REFERENCE` pin currently behaves like `UNSHARDED`.
 
-5. **Reads by a unique column other than the key go to every shard.** A read by an order number or an email address, when the table is sharded by customer, can't be narrowed today: there is no statement to create a global lookup index, and automatic indexing doesn't propose one yet. Where you can, include the distribution key in the condition. (The router already uses a lookup index when one exists, and `EXPLAIN FORMAT=SPRIG` then shows a top `Lookup` row.)
+5. **Give unique columns other than the key a lookup index.** A read by an order number or an email address, when the table is sharded by customer, goes to every shard unless the column has a global lookup index. Declare the column `UNIQUE` (`ALTER TABLE … ADD UNIQUE`), and SprigDB builds one; the sharding advisor also proposes one when such reads keep scattering. See [Unique keys and lookup indexes](../sql/sharding.md#unique-keys-and-lookup-indexes). Reads through a lookup show a top `Lookup` row in `EXPLAIN FORMAT=SPRIG`. Columns that aren't unique get no lookup: include the distribution key in the condition where you can.
 
 6. **Keep key values literal and of the key's type.** Compare an integer key with an integer, not a string.
 

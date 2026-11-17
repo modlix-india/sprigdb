@@ -198,7 +198,7 @@ These must be the first stage of the pipeline (40602 otherwise):
 | `$search`, `$searchMeta`, `$rankFusion`, `$scoreFusion`, `$listSearchIndexes` | Full-text and hybrid search; see [Search](search.md) |
 | `$vectorSearch` | Nearest vectors; see [Vectors](vectors.md) |
 | `$collStats`, `$indexStats`, `$planCacheStats`, `$listClusterCatalog` | Collection and index statistics |
-| `$currentOp`, `$listSessions`, `$listLocalSessions` | Running operations and sessions |
+| `$currentOp`, `$listSessions`, `$listLocalSessions` | Running operations and sessions, on the gateway you are connected to. `$currentOp` with `allUsers: true` needs `PROCESS` on the tenant (13 `Unauthorized` otherwise) |
 | `$querySettings`, `$queryStats` | Query settings and query statistics |
 
 ```js
@@ -278,11 +278,11 @@ db.products.aggregate([
 
 ### Server-side JavaScript
 
-`$where`, `$function` and `$accumulator` run in SprigDB's embedded JavaScript engine while `mongo.server_js` is on (the default; scope tenant, data centre or global). All the code of one command shares `logic.function_budget_ms` of JavaScript time and a heap of `logic.memory_limit_mb`. Past the time, `$where` fails with 50 `MaxTimeMSExpired` and the others with 11601 `Interrupted`. With `mongo.server_js` off, they fail with MongoDB's errors for disabled JavaScript.
+`$where`, `$function` and `$accumulator` run in SprigDB's embedded JavaScript engine while `mongo.server_js` is on (the default; scope tenant, data centre or global). All the code of one command shares `logic.function_budget_ms` of JavaScript time and a heap of `logic.memory_limit_mb`. Past the time, `$where` fails with 50 `MaxTimeMSExpired` and the others with 11601 `Interrupted`. A command's own `maxTimeMS`, when it ends first, stops the code too, and every kind then fails with 50. With `mongo.server_js` off, they fail with MongoDB's errors for disabled JavaScript.
 
 ### Collation
 
-A command's `collation` option applies to its filters, sorts, `distinct`, `$in` and ranges, and to `getMore` on its cursor. Strength 1 to 5, `caseLevel`, `caseFirst` and `numericOrdering` work; every locale compares as the root locale. While a collation is active, string conditions aren't pushed into SQL, so the query reads more rows.
+A command's `collation` option applies to its filters, sorts, `distinct`, `$in` and ranges, and to `getMore` on its cursor. Strength 1 to 5, `caseLevel`, `caseFirst` and `numericOrdering` work; every locale compares as the root locale. A collection created with `collation` uses it as the default for `find`, `aggregate`, `count`, `distinct`, updates, deletes, `findAndModify` and `bulkWrite`, unless the command names its own; `{locale: "simple"}` turns it off. An invalid default collation fails at `create` with 2. While a collation is active, string conditions aren't pushed into SQL, so the query reads more rows.
 
 ## Indexes
 
@@ -308,7 +308,9 @@ For each indexed path SprigDB adds three hidden generated columns over `doc`: th
 Rules and limits:
 
 - `unique: true` makes a unique MariaDB index. If existing documents break it, the build fails with 11000 `DuplicateKey`. Strings are compared by their first 160 characters, so two strings that share those characters count as duplicates.
-- `sparse`, `partialFilterExpression`, `hidden` and `collation` are kept and shown by `listIndexes`, but don't change what the index holds or which documents it serves.
+- A unique index with `partialFilterExpression` is unique only over the documents the filter matches, and a `sparse` unique index only over the documents that have one of its fields. The filter may use equality, `$in`, `$gt`, `$gte`, `$lt`, `$lte`, `$exists: true`, `$type`, `$and` and `$or`. What MongoDB refuses in a partial filter (`$ne`, `$nin`, `$not`, `$exists: false`, `$regex`, `$nor`, or `sparse` together with a filter) fails with 67; on a unique index, a filter value of `null`, an ObjectId or a date fails with 39662. Where the filter's path crosses an array, fewer documents count as inside the index than on MongoDB, so a duplicate can get in. On a non-unique index, `sparse` and the filter are recorded only: the index holds every document.
+- `collMod` with `index: {name, hidden: true | false}` hides an index from plans (not `_id`), and answers `hidden_old` and `hidden_new`; writes keep it current. `hidden: true` in `createIndexes` is recorded but doesn't hide the index.
+- An index created without a collation takes the collection's default collation.
 - `expireAfterSeconds` makes a TTL index: see [TTL indexes](#ttl-indexes).
 - Index paths can't start with `$` or contain a numeric part such as `items.0` (67 `CannotCreateIndex`). Other index types, such as `"2d"`, fail with 39662 `SprigDocFeatureUnsupported`.
 - A second index with the same name and a different key gives 86 `IndexKeySpecsConflict`; the same key under another name gives 85 `IndexOptionsConflict`.
@@ -331,14 +333,14 @@ Which documents expire:
 
 - A document expires once the indexed field holds a date earlier than now minus `expireAfterSeconds`. If the field is an array, the earliest date in it counts.
 - Other values never expire: strings, numbers, timestamps, `null`, a missing field and nested arrays.
-- `partialFilterExpression` doesn't narrow which documents expire, because partial semantics aren't built: every document whose field is old enough is deleted.
+- With a `partialFilterExpression`, only the documents the filter matches expire.
 - Capped collections take TTL indexes too, and expire their documents the same way.
 
 The rules for the index:
 
 - One field, not `_id`. A compound key fails with 67 `CannotCreateIndex` ("TTL indexes are single-field indexes"), and `_id` with 197 `InvalidIndexSpecificationOption`.
 - `expireAfterSeconds` is a number from 0 to 2,147,483,647, truncated to whole seconds. In `createIndexes`, a negative, `NaN`, out-of-range or non-numeric value fails with 67; in `collMod`, with 72 `InvalidOptions` or 14 `TypeMismatch`.
-- `collMod` with `index: {name | keyPattern, expireAfterSeconds}` changes the seconds of an existing index, or turns a single-field index into a TTL index. The reply carries `expireAfterSeconds_old` (when there was one) and `expireAfterSeconds_new`. An unknown index fails with 27 `IndexNotFound`; `hidden`, `unique` and `prepareUnique` in `collMod`'s `index` fail with 39662.
+- `collMod` with `index: {name | keyPattern, expireAfterSeconds}` changes the seconds of an existing index, or turns a single-field index into a TTL index. The reply carries `expireAfterSeconds_old` (when there was one) and `expireAfterSeconds_new`. An unknown index fails with 27 `IndexNotFound`; `unique` and `prepareUnique` in `collMod`'s `index` fail with 39662.
 
 How expiry runs:
 
@@ -526,12 +528,11 @@ The nesting limit is lower than MongoDB's 100 because MariaDB's JSON functions h
 | `mapReduce`, `eval`, the `geoNear` command | 115 `CommandNotSupported` |
 | `renameCollection` across databases | 39662 |
 | Multikey and wildcard (`$**`) indexes | No multikey indexes; `{"$**": 1}` gives 67 |
-| `sparse` and partial index semantics | Recorded only |
-| A collection's default collation, locale tailoring | Per-command root collation only |
+| `sparse` and partial semantics on non-unique indexes | Recorded only |
+| Locale tailoring in collations | Root collation only |
 | `$lookup` with `let`, `$lookup` into SQL tables | Use `pipeline`, or SQL for tables |
 | The `$slice` aggregation expression | `$slice` works in projections and `$push` only |
 | `$merge` on fields other than `_id`, or with a pipeline in `whenMatched` | 39662 |
-| `startAtOperationTime` in change streams | 39662 |
 | Typed collections and type inheritance | Inheritance works on SQL tables; see [Inheritance](inheritance.md) |
 
 ## Related

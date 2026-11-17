@@ -18,7 +18,8 @@ For each tenant session, the gateway records every statement that reaches MariaD
 - latency, measured from sending the statement to the end of its result, kept as a histogram, so p50, p95 and maximum are available;
 - for **watched** fingerprints, rows examined, read from MariaDB's `Handler_read_*` counters before and after a sample of runs;
 - for watched fingerprints, a few encrypted **parameter samples**, so automatic indexing can replay real statements on a replica;
-- **transaction footprints**: which table groups each write transaction touched together, for the sharding advisor.
+- **transaction footprints**: which table groups each write transaction touched together, for the sharding advisor;
+- for statements on sharded tables, how many shards each run's plan visits. A run that visits every shard of its group counts as a scatter; a read narrowed by a lookup index counts as one shard. Rows examined and clusters aren't recorded for these statements yet.
 
 What is not captured:
 
@@ -219,13 +220,13 @@ Each gateway aggregates in memory per bucket of `workload.bucket_minutes` (60) a
 | Setting | Type | Default | Scopes | Meaning |
 |---|---|---|---|---|
 | `workload.bucket_minutes` | int | 60 | dc, global | Statistics bucket size |
-| `workload.retention_days` | int | 30 | tenant, global | How long statistics are kept |
-| `workload.max_fingerprints_per_tenant` | int | 10000 | tenant, global | Fingerprints per tenant per gateway; new ones beyond it count under "other" |
+| `workload.retention_days` | int | 30 | dc, global | How long statistics are kept |
+| `workload.max_fingerprints_per_tenant` | int | 10000 | dc, global | Fingerprints per tenant per gateway; new ones beyond it count under "other" |
 | `workload.max_text_bytes` | int | 4096 | dc, global | Longest normalized text |
 | `workload.watch_p95_ms` | int | 50 | dc, global | p95 that makes a fingerprint watched |
 | `workload.examined_sample_rate` | float | 0.02 | dc, global | Share of a watched fingerprint's runs probed for rows examined |
 | `workload.full_probe_ms` | int | 100 | dc, global | Mean latency from which every run is probed |
-| `workload.capture_samples` | bool | true | object to global | Capture parameter samples |
+| `workload.capture_samples` | bool | true | database, tenant, global | Capture parameter samples |
 | `workload.sample_rate` | float | 0.01 | dc, global | Share of a watched fingerprint's runs that offer a sample |
 | `workload.samples_per_bucket` | int | 3 | dc, global | Samples kept per fingerprint per gateway per bucket |
 | `workload.max_samples_per_fingerprint` | int | 50 | dc, global | Stored samples kept per fingerprint |
@@ -235,9 +236,7 @@ Each gateway aggregates in memory per bucket of `workload.bucket_minutes` (60) a
 | `workload.flush_seconds` | int | 900 | dc, global | How often gateways write partial buckets |
 | `workload.rollup_delay_minutes` | int | 10 | dc, global | Wait after a bucket closes before the rollup |
 
-"Object to global" means the object, database, tenant and global scopes.
-
-Each gateway reads the recorder's settings at the data-centre and global scopes, and applies a change live, without a restart; the flush and rollup settings apply live too. `workload.retention_days` and `workload.max_fingerprints_per_tenant` accept a tenant value, but only their global value is read, so they apply to every tenant alike. `workload.capture_samples` is resolved for the session's tenant and current database before each sample.
+Each gateway reads the recorder's settings at the data-centre and global scopes, and applies a change live, without a restart; the flush and rollup settings apply live too. `workload.retention_days` and `workload.max_fingerprints_per_tenant` apply to every tenant alike, so a tenant value is refused with 39082. `workload.capture_samples` is resolved for the session's tenant and current database before each sample.
 
 ## Memory caps
 

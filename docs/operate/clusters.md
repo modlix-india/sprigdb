@@ -326,7 +326,7 @@ sprigctl cluster rebuild fra1-c1 n1          # rebuild it from a replica's backu
 
 ## Not supported yet
 
-- Automatic tuning of MariaDB server variables (caches and memory budgets). The `tuning.*` settings are registered, but nothing reads them yet; size the server variables yourself, as in [Sizing](sizing.md#mariadb).
+- Automatic tuning of MariaDB server variables (caches and memory budgets). There are no settings for it yet; size the server variables yourself, as in [Sizing](sizing.md#mariadb).
 
 ## Related
 

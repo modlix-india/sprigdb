@@ -69,7 +69,7 @@ LPUSH jobs:email job-1 job-2
 BRPOP jobs:email 5
 ```
 
-Every command runs as SQL statements through your own session, so your grants and row-level security apply to it. A command the account isn't allowed to run on that table answers `NOPERM this user has no permissions to run this command on this data: ...`.
+Every command runs as SQL statements through your own session, so your grants and row-level security apply to it. A policy on the key-value table also covers the elements of its hashes, sets, lists and sorted sets, even when it reads the value or the type; a bound user can't read the element tables directly (1142). A command the account isn't allowed to run on that table answers `NOPERM this user has no permissions to run this command on this data: ...`.
 
 ### Commands by type
 

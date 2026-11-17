@@ -206,8 +206,11 @@ Policies are table policies, so they apply wherever the table's rows go:
 | MongoDB drivers | Collections are tables: reads and writes go through the same rewrite and checks. MongoDB commands create policies in filter form (below) |
 | Change streams, Kafka change topics, stream triggers, sinks | Each change record is filtered by the reader's `SELECT` policies, over its before and after images: an update whose row becomes visible arrives as an insert, one that becomes hidden as a delete |
 | Redis keyspace notifications | Filtered the same way, per key |
+| Redis hashes, sets, lists and sorted sets | Their elements follow the policies of the key-value table, so a user sees only the elements of keys they may read |
 | Search | Hits are re-read through your session; counts and facets count only the hits you can see |
 | `LOAD DATA` into a protected table | MariaDB's write checks |
+
+Change records carry some columns in another form than the table, and the filter reads them back as the table types them: binary strings (such as a key-value table's key) as their bytes, `TIMESTAMP` values in the reader's time zone, and `ENUM` and `SET` values as their members' text when the policy compares them with string literals. A policy that uses an `ENUM` or `SET` column any other way, or reads a bit, spatial or vector column, hides every change record of the table from the users it binds; the table itself is filtered as usual.
 
 ### Policies from MongoDB drivers
 
@@ -270,7 +273,7 @@ The rules:
 | Setting | Type | Default | Scopes | Meaning |
 |---|---|---|---|---|
 | `rls.backend_enforcement` | text | `views` | database, tenant, global | `views`, `triggers` or `off` |
-| `rls.inline_subtree_max` | int | 1000 | tenant, dc, global | Tenant ids inlined for `SPRIG_TENANT_IN_SUBTREE` and `SPRIG_TENANT_MANAGED`. After-commit triggers and schedules get their definer's subtree and managed tenants too; above this size those sets are empty for them, so such a policy hides every row from that code (it fails closed) |
+| `rls.inline_subtree_max` | int | 1000 | tenant, dc, global | Tenant ids inlined for `SPRIG_TENANT_IN_SUBTREE` and `SPRIG_TENANT_MANAGED`. Above it, sessions read the ids from a table. After-commit triggers and schedules get their definer's subtree and managed tenants inline at any size, up to 100,000 tenants; beyond that the sets are empty for them, so such a policy hides every row from that code (it fails closed) |
 | `studio.view_as` | text | `on` | tenant, dc, global | Allow the row-level security tester |
 
 ## Not supported yet

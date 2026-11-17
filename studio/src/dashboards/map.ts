@@ -174,6 +174,8 @@ export interface FilledMap {
   country: string;
   /** The measure's label and range over the regions. */
   measure: { label: string; min: number; max: number };
+  /** The colour scale's steps, lowest first (see `quantiles`). */
+  steps: Step[];
   regions: Region[];
   /** Rows whose country matched no country shape (or was empty). */
   unmatched: number;
@@ -181,8 +183,51 @@ export interface FilledMap {
   examples: string[];
 }
 
-/** The steps of a filled map's colour scale. */
-export const STEPS = 6;
+/** The most steps a filled map's colour scale has. */
+export const MAX_STEPS = 6;
+
+/** One step of a filled map's colour scale: the smallest and largest
+ * value in it, and how many countries have a value in it. */
+export interface Step {
+  from: number;
+  to: number;
+  count: number;
+}
+
+/**
+ * Quantile steps: each holds about the same number of values. With at
+ * most `max` distinct values, each value is a step of its own (one value,
+ * one step; none, no steps). With more, there are `max` steps, and equal
+ * values always share one: a break that would split them moves to the
+ * nearest change of value, and a step that a long run of equal values
+ * leaves empty is dropped.
+ */
+export function quantiles(values: number[], max = MAX_STEPS): Step[] {
+  const xs = values.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
+  const n = xs.length;
+  if (!n) return [];
+  // Where the value changes: the possible breaks.
+  const changes: number[] = [];
+  for (let i = 1; i < n; i++) if (xs[i] !== xs[i - 1]) changes.push(i);
+  // Few distinct values: a step each. Otherwise a break near each
+  // quantile, at a change of value past the previous break.
+  const breaks: number[] = changes.length < max ? changes : [];
+  if (changes.length >= max) {
+    for (let j = 1; j < max; j++) {
+      const ideal = (j * n) / max;
+      const last = breaks.length ? breaks[breaks.length - 1]! : 0;
+      let best: number | null = null;
+      for (const c of changes) {
+        if (c <= last) continue;
+        if (best === null || Math.abs(c - ideal) < Math.abs(best - ideal)) best = c;
+        else break;
+      }
+      if (best !== null) breaks.push(best);
+    }
+  }
+  const edges = [0, ...breaks, n];
+  return edges.slice(1).map((end, j) => ({ from: xs[edges[j]!]!, to: xs[end - 1]!, count: end - edges[j]! }));
+}
 
 /** The filled map of a spec over a result: the first country field on a
  * shelf, and the measure on Colour (else the first on Columns or Rows,
@@ -230,17 +275,26 @@ export function filledMap(s: Spec, columns: ColumnInfo[], rows: unknown[][]): Fi
     kind: 'filled',
     country: country.field,
     measure: { label: labelOf(measure), min: ns.length ? Math.min(...ns) : 0, max: ns.length ? Math.max(...ns) : 0 },
+    steps: quantiles(ns),
     regions,
     unmatched,
     examples,
   };
 }
 
-/** A value's step on the colour scale, 0 to STEPS - 1 (equal intervals
- * from the smallest value to the largest), or null without a value. */
+/** A value's step on the colour scale, 0 to `m.steps.length - 1`, or
+ * null without a value. */
 export function step(m: FilledMap, v: number | null): number | null {
-  if (v === null) return null;
-  const { min, max } = m.measure;
-  if (max <= min) return STEPS - 1;
-  return Math.min(STEPS - 1, Math.max(0, Math.floor(((v - min) / (max - min)) * STEPS)));
+  if (v === null || !m.steps.length) return null;
+  const i = m.steps.findIndex((x) => v <= x.to);
+  return i < 0 ? m.steps.length - 1 : i;
+}
+
+/** The shade of the sequential ramp (`len` shades, lightest first in a
+ * light theme) for step `k` of `n`: spread over the ramp past its first
+ * shade, which is too close to the background; a single step takes the
+ * last. */
+export function shade(k: number, n: number, len: number): number {
+  if (n <= 1) return len - 1;
+  return 1 + Math.round((k * (len - 2)) / (n - 1));
 }

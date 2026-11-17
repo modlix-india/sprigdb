@@ -439,7 +439,7 @@ Retirement is cautious. The index is first made `IGNORED`, which is instant and 
 
 On collections, automatic indexing indexes document paths (shown as paths, such as `status, qty`, rather than columns), up to three paths per index. Each path is indexed as a value-type column plus a number and a string column, whatever mix of types its values have. Paths that cross arrays get no index yet.
 
-Automatic indexing doesn't yet propose global lookup indexes for statements that scatter over shards, or wildcard indexes for collections filtered on many different paths.
+Global lookup indexes for reads that scatter over shards are proposed by the sharding advisor, for declared unique keys only; see [Sharding advisor](sharding-advisor.md#lookup-indexes). Automatic indexing doesn't yet propose lookups for columns without a unique key, or wildcard indexes for collections filtered on many different paths.
 
 ## Your own indexes and the 64-index limit
 

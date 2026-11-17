@@ -310,7 +310,7 @@ To publish every committed change of a table to an exchange, set `queue.change_e
 ALTER TABLE orders SPRIG SET (queue.change_exchange = 'orders.changes');
 ```
 
-Each change is published to that exchange, in the table's database, with routing key `<db>.<table>.<op>` (for example `shop.orders.u`) and the [change topic](streams.md) envelope as a JSON body. Changes are published as the user who ran the `ALTER TABLE`, so that user's privileges and row-level security decide what is sent: an update that hides or reveals a row goes out as a delete or an insert. Delivery is at least once, in commit order. Reset the setting to stop. Consumers that need replay should read a change topic instead. See [Change feed](../concepts/change-feed.md).
+Each change is published to that exchange, in the table's database, with routing key `<db>.<table>.<op>` (for example `shop.orders.u`) and the [change topic](streams.md) envelope as a JSON body. Changes are published as the user who ran the `ALTER TABLE`, so that user's privileges and row-level security decide what is sent: an update that hides or reveals a row goes out as a delete or an insert. Each change goes into each queue exactly once, in commit order: it has a fixed message id, and a queue takes an id only once, even when the change is published again after a crash (within a day). Reset the setting to stop. Consumers that need replay should read a change topic instead. See [Change feed](../concepts/change-feed.md).
 
 ## Queues for every tenant
 

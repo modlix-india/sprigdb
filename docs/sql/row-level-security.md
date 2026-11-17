@@ -106,10 +106,10 @@ It may not use `?` parameters, user or system variables (`@v`, `@@v`), non-deter
 | `SPRIG_TENANT_IN_SUBTREE(expr)` | True when `expr` is the id of the home tenant or one of its descendants |
 | `SPRIG_TENANT_MANAGED(expr)` | True when `expr` is the id of a tenant the user administers |
 | `SPRIG_USER_ATTR('key')` | The user's attribute `key`, set with `CREATE USER` or `ALTER USER ... ATTRIBUTE '{json}'` (see [Tenants and accounts](tenants-and-accounts.md#create-user)), or `NULL` |
-| `SPRIG_CLAIM('key')` | Top-level claim `key` of the token the session logged in with. For a token from a registered identity provider (on MySQL, MariaDB, Redis, MongoDB, REST and gRPC), any of its claims: strings and numbers as they are, booleans as `TRUE` or `FALSE`, arrays and objects as JSON text; see [Logins with identity provider tokens](../security/external-tokens.md#claims-in-row-level-security). For SprigDB's session token (from `POST /v1/auth/login` or Studio, over REST, gRPC or Studio): `sub` (`<tenant id>:<user id>`), `ten` (the tenant's name), `sid` (the session id), `amr` (the login methods, an array), `cli` (`studio`, `api` or `cli`), `iat` and `exp` (Unix seconds), `act` while an administrator impersonates the user, and `iss` and `aud` (always `sprigdb`). A claim the token doesn't have is `NULL`, and so is every claim in sessions without a token, such as password logins, HTTP Basic and API keys |
+| `SPRIG_CLAIM('key')` | Top-level claim `key` of the token the session logged in with. For a token from a registered identity provider (on MySQL, MariaDB, Redis, MongoDB, REST and gRPC), any of its claims, as text: strings as they are, numbers as their JSON text (`'7'`), booleans as `'1'` or `'0'`, arrays and objects as JSON; see [Logins with identity provider tokens](../security/external-tokens.md#claims-in-row-level-security). For SprigDB's session token (from `POST /v1/auth/login` or Studio, over REST, gRPC or Studio): `sub` (`<tenant id>:<user id>`), `ten` (the tenant's name), `sid` (the session id), `amr` (the login methods, an array), `cli` (`studio`, `api` or `cli`), `iat` and `exp` (Unix seconds), `act` while an administrator impersonates the user, and `iss` and `aud` (always `sprigdb`). A claim the token doesn't have is `NULL`, and so is every claim in sessions without a token, such as password logins, HTTP Basic and API keys |
 | `SPRIG_SESSION_SPACE()` | The session's space id (see [Inheritance](inheritance.md)), or `NULL` |
 
-`SPRIG_USER_ATTR` and `SPRIG_CLAIM` take a string literal. Up to `rls.inline_subtree_max` tenant ids (default 1000) are written into the statement for `SPRIG_TENANT_IN_SUBTREE` and `SPRIG_TENANT_MANAGED`; beyond that, SprigDB reads them from a table.
+`SPRIG_USER_ATTR` and `SPRIG_CLAIM` take a string literal, and return text, as claims do: compare a number attribute with a number column as `customer_id = SPRIG_USER_ATTR('customer_id')`, and read an array with JSON functions, such as `JSON_CONTAINS(SPRIG_CLAIM('groups'), '"g1"')`. Up to `rls.inline_subtree_max` tenant ids (default 1000) are written into the statement for `SPRIG_TENANT_IN_SUBTREE` and `SPRIG_TENANT_MANAGED`; beyond that, SprigDB reads them from a table.
 
 ### Example
 
@@ -173,6 +173,21 @@ CREATE POLICY recent ON orders FOR SELECT USING (id > 0 AND NOW() > '2026-01-01'
 -- a FOR SELECT policy can't have WITH CHECK: 1064
 CREATE POLICY bad ON orders FOR SELECT WITH CHECK (total > 0);
 ```
+
+### Session functions outside policies
+
+The session functions also work in ordinary statements, with the same values as in policies. A password login has no token, so its claims are `NULL`:
+
+```sql test
+SELECT SPRIG_CLAIM('sub') AS sub, SPRIG_TENANT_ID() IS NOT NULL AS has_tenant;
+```
+
+```text output
+sub	has_tenant
+NULL	1
+```
+
+Inside a `SQL SECURITY DEFINER` routine, claims are `NULL`: a claim belongs to the caller's token, not to the definer. The subtree functions there give the definer's tenant's subtree.
 
 ## ALTER POLICY
 
@@ -314,6 +329,40 @@ Some statements can't carry the rewrite. On a table that binds the session, thes
 
 **Views and stored code over protected tables.** A view, procedure, function or trigger that reads a protected table can be created as usual, by any user with the privileges for it, bound by the policies or not. Right after the `CREATE` succeeds, the gateway points it at the table's policy views, so it applies the policies of whoever it runs as: the caller for `SQL SECURITY INVOKER`, its definer for `SQL SECURITY DEFINER` (as on any call). Code written before a table got its policies is pointed when a policy statement runs. For a few milliseconds after a `CREATE`, another gateway may not know about the new code's pointing yet, and a call that lands there runs with the caller's policies.
 
+A routine without a `SQL SECURITY` clause runs as `DEFINER`, MariaDB's default. When it reads a protected table, its `CREATE` succeeds with note 39369 `ER_SPRIG_RLS_DEFINER_DEFAULT`, naming the tables. Add `SQL SECURITY INVOKER` to apply the caller's policies instead.
+
+The examples below force the policies, so they bind the table's managers too:
+
+```sql test
+CREATE TABLE notes (id INT PRIMARY KEY, owner VARCHAR(100) NOT NULL, body VARCHAR(100));
+INSERT INTO notes VALUES (1, 'app@%', 'mine'), (2, 'clerk@%', 'theirs');
+CREATE POLICY own_notes ON notes FOR SELECT USING (owner = CURRENT_USER());
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE notes FORCE ROW LEVEL SECURITY;
+CREATE FUNCTION note_count() RETURNS INT READS SQL DATA
+  RETURN (SELECT COUNT(*) FROM notes);
+SHOW WARNINGS;
+```
+
+```text output
+Level	Code	Message
+Note	39369	ER_SPRIG_RLS_DEFINER_DEFAULT: this routine has no SQL SECURITY clause, so it runs as SQL SECURITY DEFINER and applies its definer's row-level security policies, not its caller's, to docs_row_level_security.notes; add SQL SECURITY INVOKER to keep the caller's
+```
+
+Prepared statement text is checked too, whether it is a literal or a variable:
+
+```sql test-error
+-- 39366: the text names a protected table
+SET @q = 'SELECT COUNT(*) FROM notes';
+PREPARE s FROM @q;
+```
+
+```sql test
+ALTER TABLE notes NO FORCE ROW LEVEL SECURITY;
+```
+
+A statement prepared before its table got policies fails with 39366 when it is executed afterwards. Statements that clients prepare through the protocol (`COM_STMT_PREPARE`, as most drivers do) aren't affected: the gateway prepares them again with the policies.
+
 `LOAD DATA` without `REPLACE` is checked by MariaDB's triggers. DDL, `SHOW`, `DESCRIBE` and transaction statements are unaffected. A statement that names `@sprig_rls` (SprigDB's internal session context) fails with 39050 `ER_SPRIG_RESERVED_NAME`.
 
 ## Errors
@@ -331,6 +380,7 @@ Some statements can't carry the rewrite. On a table that binds the session, thes
 | 39364 | `ER_SPRIG_RLS_POLICY_INVALID` | The expression uses something a policy can't |
 | 39365 | `ER_SPRIG_RLS_POLICY_CYCLE` | Policies refer to each other's tables in a cycle |
 | 39366 | `ER_SPRIG_RLS_UNSUPPORTED` | A statement form that can't be filtered, on a protected table |
+| 39369 | `ER_SPRIG_RLS_DEFINER_DEFAULT` | A note: a routine without `SQL SECURITY` reads a protected table, so it applies its definer's policies |
 
 ## Not supported yet
 

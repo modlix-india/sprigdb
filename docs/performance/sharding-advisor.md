@@ -21,7 +21,7 @@ A new tenant has no table groups: every table of a database lives in that databa
 | `min_shards` | `sharding.min_shards` asks for more than one shard per group from the start |
 | `manual` | An operator runs `sprigctl advisor run` |
 
-Once a tenant has table groups, the advisor doesn't redesign them by itself. Changing a group's key after it has split is an online re-key, which operators start with `sprigctl shard rekey` (see [Change a key after the split](#change-a-key-after-the-split)).
+Once a tenant has table groups, the advisor runs every `advisor.interval_hours` (24) to check each group's key, and can propose a re-key (see [Periodic re-keys](#periodic-re-keys)). It doesn't regroup tables after the first design. Operators can also re-key by hand with `sprigctl shard rekey` (see [Change a key after the split](#change-a-key-after-the-split)).
 
 ## How the advisor chooses
 
@@ -216,7 +216,27 @@ If a group's key turns out to be wrong after it has split, an operator can re-ke
 sprigctl shard rekey acme 3 --key customer_id --member events=cust --shards 4
 ```
 
-The group's rows are copied to new shards routed by the new key while clients keep reading and writing, caught up from the binary log, verified row by row, and cut over in one change of the shard map. The old shards stay fenced for `sharding.retire_hours` (24) and are then dropped. A re-key needs the group's shards on one cluster, every member able to supply the new key from one column of a routable type, and no member owning a lookup index. `sprig_advisor_rekeys_total{outcome}` counts re-keys started, finished and rolled back.
+The group's rows are copied to new shards routed by the new key while clients keep reading and writing, caught up from the binary log, verified row by row, and cut over in one change of the shard map. The old shards stay fenced for `sharding.retire_hours` (24) and are then dropped. A re-key needs the group's shards on one cluster, and every member able to supply the new key from one column of a routable type. Members' [lookup indexes](../sql/sharding.md#unique-keys-and-lookup-indexes) are kept, and rebuilt right after the cutover; until then, reads don't use them. A re-key waits with 39470 only while a lookup is being built or dropped. `sprig_advisor_rekeys_total{outcome}` counts re-keys started, finished and rolled back.
+
+### Periodic re-keys
+
+For a tenant with table groups, the advisor runs every `advisor.interval_hours` (24). For each group, it scores every column that all members can supply against the current key, over the whole workload. It applies a re-key when all of these hold:
+
+- the new key gains at least `advisor.rekey_min_gain_pct` (15) points, at confidence 0.95;
+- the last `advisor.rekey_sustain_runs` (3) runs agree;
+- the group hasn't been re-keyed in the last `advisor.rekey_cooldown_days` (14);
+- the group is below `migration.auto_size_limit_gb`.
+
+Under `advisor.mode = on`, it starts the same re-key as `sprigctl shard rekey`. Under `approve` or `recommend`, it raises an `advisor.rekey` item in the [approvals inbox](../concepts/approvals.md) instead, and the re-key starts when the item is approved. A gain of 5 points or more that misses the bar is a `recommend` verdict in the run, with no item; `sprigctl advisor apply <tenant> <run>` starts it. A group whose shards are on several clusters gets recommendations only. Groups with a pinned member or a key of several columns aren't re-keyed.
+
+## Lookup indexes
+
+Every `advisor.lookup_eval_minutes` (5), the advisor reads the last `advisor.lookup_window_minutes` (60) of workload for each sharded table. It proposes a global [lookup index](../sql/sharding.md#unique-keys-and-lookup-indexes) for a declared unique key without the distribution key when:
+
+- reads by `=` or `IN` on the key's columns ran at least `advisor.lookup_min_runs` (100) times;
+- at least `auto_index.lookup_scatter_pct` (80) percent of those runs went to every shard.
+
+Keys of several columns count reads that bind all their columns, even with other columns bound too. The proposal is an `advisor.lookup` item whose action is `SPRIG REBUILD LOOKUP INDEX`. Under `advisor.mode = on` the lookup is built at once; otherwise it is built at the next evaluation after you approve the item, up to 5 minutes later. A build that finds duplicate values fails, and its item lists them; a duplicates item always waits for approval, whatever the mode.
 
 ## Settings
 
@@ -233,6 +253,13 @@ The group's rows are copied to new shards routed by the new key while clients ke
 | `advisor.lookup_penalty` | float | 0.1 | Credit lost per lookup a statement needs |
 | `advisor.txn_weight` | float | 2 | Weight of a write transaction against a statement |
 | `advisor.max_moves` | int | 200 | Search steps per run |
+| `advisor.interval_hours` | float | 24 | How often a tenant with table groups is checked for re-keys |
+| `advisor.rekey_min_gain_pct` | float | 15 | Points a re-key must gain |
+| `advisor.rekey_sustain_runs` | int | 3 | Runs in a row that must agree on a re-key |
+| `advisor.rekey_cooldown_days` | float | 14 | Days after a re-key before the group is re-keyed again |
+| `advisor.lookup_eval_minutes` | int | 5 | How often scattering reads are checked for lookups |
+| `advisor.lookup_window_minutes` | int | 60 | Workload window for lookup proposals |
+| `advisor.lookup_min_runs` | int | 100 | Reads needed before a lookup is proposed |
 | `sharding.split_size_gb` | float | 32 | Size above which the first split (and every later split) is due |
 | `sharding.min_shards` | int | 1 | Shards per group from the start |
 
@@ -241,7 +268,7 @@ The group's rows are copied to new shards routed by the new key while clients ke
 ## Not supported yet
 
 - Reference tables copied to every cluster: a `REFERENCE` pin keeps the table unsharded.
-- Periodic redesigns of existing groups: after the first design, key changes are operator re-keys.
+- Regrouping after the first design: periodic runs only change a group's key; moving tables between groups needs an operator.
 
 ## Related
 

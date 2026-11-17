@@ -126,11 +126,11 @@ A **point map** (`map-point`) draws one point per place:
 
 A **filled map** (`map-filled`) colours each country by a measure:
 
-- **Which countries.** A field named `country`, `country_code`, `country_name`, `country_iso`, `iso2` or `iso3`, on any shelf; case doesn't matter. Its values may be country names (`Germany`, `United States`, `Côte d'Ivoire`) or ISO 3166-1 codes: alpha-2 (`DE`), alpha-3 (`DEU`) or numeric (`276`). Names are compared without case, accents or punctuation, and common other names are known too, such as `USA`, `UK`, `Russian Federation` and `Viet Nam`. For a column with another name, use an alias: `SELECT nation AS country, ...`.
+- **Which countries.** A field named `country`, `country_code`, `country_name`, `country_iso`, `iso2` or `iso3`, on any shelf; case doesn't matter. Its values may be country names (`Germany`, `United States`, `Côte d'Ivoire`) or ISO 3166-1 codes: alpha-2 (`DE`), alpha-3 (`DEU`) or numeric (`276`). Names are compared without case, accents or punctuation (`Saint` and `St.` are the same), and common other names are known too, such as `USA`, `UK`, `Russian Federation`, `Viet Nam`, `Hong Kong SAR China` and `Cape Verde`. Small countries, islands and city states have their own shape, such as Singapore, Hong Kong (`HK`, `HKG`, `344`), Macao, Malta, Bahrain, Mauritius and the Maldives. For a column with another name, use an alias: `SELECT nation AS country, ...`.
 - **The measure** is the one on Colour, or else the one on Columns or Rows. Each country's rows are aggregated with the measure's own aggregation, after matching, so `US` and `United States` count as one country. Tooltip measures are aggregated the same way and shown on hover.
-- **Colours.** Six steps of one hue, from the smallest value to the largest in equal steps, with a legend; countries without data are grey. The scale is chosen separately for light and dark themes.
-- **Rows that match no country** are left out, and the map says how many, with a few of their values. That includes empty values, places that aren't countries, and small countries without a shape at this scale (such as Singapore or Malta).
-- **Shapes.** The country outlines are Natural Earth's 1:110 million countries, bundled with Studio: they load from the gateway, only when a dashboard first shows a filled map, and nothing is fetched from anywhere else. States and provinces aren't drawn.
+- **Colours.** Up to six steps of one hue, by quantiles: each step holds about the same number of countries, so one very large value doesn't leave every other country in the lightest step. Countries with the same value are always in the same step. With six or fewer different values, each value is a step of its own, and a single value is one colour. The legend shows each step's range, in the tile's number format, and hovering over a step says how many countries it holds; countries without data are grey. The scale is chosen separately for light and dark themes.
+- **Rows that match no country** are left out, and the map says how many, with a few of their values. That includes empty values, places that aren't countries, and territories without a shape of their own (such as Gibraltar, Tokelau or Christmas Island). A few shapes have no ISO code and are always grey: Northern Cyprus, Somaliland, the Siachen Glacier, and Christmas Island with the Cocos Islands (one shape). Ashmore and Cartier Islands take Australia's colour.
+- **Shapes.** The country outlines are Natural Earth's 1:50 million countries (241 shapes), bundled with Studio: they load from the gateway (about 200 KB compressed), only when a dashboard first shows a filled map, and nothing is fetched from anywhere else. Antarctica is drawn only when it has data. States and provinces aren't drawn.
 
 For example, sales recorded with both codes and names:
 
@@ -138,7 +138,8 @@ For example, sales recorded with both codes and names:
 CREATE TABLE sales (id INT PRIMARY KEY, country VARCHAR(40), revenue DECIMAL(10,2));
 INSERT INTO sales VALUES
   (1, 'DE', 120.00), (2, 'Germany', 80.00), (3, 'USA', 300.00),
-  (4, 'United States', 50.00), (5, 'IN', 75.50), (6, 'Atlantis', 9.99);
+  (4, 'United States', 50.00), (5, 'IN', 75.50), (6, 'Atlantis', 9.99),
+  (7, 'SG', 42.00);
 SELECT country, SUM(revenue) AS revenue FROM sales GROUP BY country ORDER BY country;
 ```
 
@@ -148,11 +149,12 @@ Atlantis	9.99
 DE	120.00
 Germany	80.00
 IN	75.50
+SG	42.00
 United States	50.00
 USA	300.00
 ```
 
-With `country` on Columns and `revenue` on Rows, the tile colours Germany 200 (`DE` and `Germany`), the United States 350 and India 75.50, and says that one row (`Atlantis`) matched no country.
+With `country` on Columns and `revenue` on Rows, the tile colours Germany 200 (`DE` and `Germany`), the United States 350, India 75.5 and Singapore 42, and says that one row (`Atlantis`) matched no country. The four countries have four different values, so the legend has four steps, one per value: 42, 75.5, 200 and 350.
 
 Show Me suggests a point map when a latitude and a longitude are on the shelves, and a filled map for a country field and one measure. Other place names, such as `city` or `state`, make neither: Show Me goes on to its next rule. The assistant's tiles follow the same rules.
 
