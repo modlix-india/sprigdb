@@ -60,8 +60,16 @@ E0_PORT_MARIADB=${E0_PORT_MARIADB:-3306}
 E0_PORT_REDIS=${E0_PORT_REDIS:-6379}
 E0_PORT_NODE_SQL=${E0_PORT_NODE_SQL:-3306}
 E0_PORT_NODE_REDIS=${E0_PORT_NODE_REDIS:-6379}
+E0_PORT_NODE_MARIADB=${E0_PORT_NODE_MARIADB:-3307}
+# The node's own etcd and catalog MariaDB: container names on the laptop,
+# loopback ports on a benchmark VM (E0_NET=host).
+if [[ $E0_NET == host ]]; then
+    E0_ETCD_ADDR=${E0_ETCD_ADDR:-127.0.0.1:33379} E0_CATALOG_ADDR=${E0_CATALOG_ADDR:-127.0.0.1:33301}
+else
+    E0_ETCD_ADDR=${E0_ETCD_ADDR:-e0bench-etcd:2379} E0_CATALOG_ADDR=${E0_CATALOG_ADDR:-e0bench-sprigmaria:3306}
+fi
 e0_host() { echo "${E0_SUT_HOST:-$1}"; }  # container name -> the address clients use
-export E0_SUT_HOST E0_SUT_DOCKER E0_PORT_MYSQL E0_PORT_MARIADB E0_PORT_REDIS E0_PORT_NODE_SQL E0_PORT_NODE_REDIS
+export E0_SUT_HOST E0_SUT_DOCKER E0_PORT_MYSQL E0_PORT_MARIADB E0_PORT_REDIS E0_PORT_NODE_SQL E0_PORT_NODE_REDIS E0_PORT_NODE_MARIADB E0_ETCD_ADDR E0_CATALOG_ADDR
 e0_product() { # arm -> product name in the result files (the market harness's names)
     case $1 in
     mysql) echo MySQL ;; mariadb) echo MariaDB ;; redis) echo Redis ;;

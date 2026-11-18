@@ -36,7 +36,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(E0_DIR), "lib"))
 import result  # noqa: E402
 
 ENV = os.environ
-DOCKER = shlex.split(ENV.get("E0_DOCKER", "docker"))
+DOCKER = shlex.split(ENV.get("E0_DOCKER", "docker"))  # clients
+SUT_DOCKER = shlex.split(ENV.get("E0_SUT_DOCKER") or ENV.get("E0_DOCKER", "docker"))  # the SUT's containers
 NET = ENV.get("E0_NET", "e0bench")
 IMG_RUN = ENV.get("IMG_RUN", "e0bench-run:13.7")
 IMG_REDIS = ENV.get("IMG_REDIS", "redis:7.4.11")
@@ -62,22 +63,26 @@ def stamp(name):
 
 def arms():
     e0_user = ENV.get("E0_NODE_USER", "bench.app")
+    H = lambda c: ENV.get("E0_SUT_HOST") or c  # noqa: E731
+    P = lambda k, d: int(ENV.get(k, d))  # noqa: E731
     return {
-        "mysql": dict(sql=("e0bench-mysql", 3306, APP_USER, APP_PW, "sbtest"), sut=["e0bench-mysql"],
+        "mysql": dict(sql=(H("e0bench-mysql"), P("E0_PORT_MYSQL", 3306), APP_USER, APP_PW, "sbtest"), sut=["e0bench-mysql"],
                       data=[("e0bench-mysql", "/var/lib/mysql")], product="MySQL", version="8.4.11",
                       comp="MySQL 8.4", dur=INNODB, build="release image mysql:8.4 (8.4.11)"),
-        "mariadb": dict(sql=("e0bench-mariadb", 3306, APP_USER, APP_PW, "sbtest"), sut=["e0bench-mariadb"],
+        "mariadb": dict(sql=(H("e0bench-mariadb"), P("E0_PORT_MARIADB", 3306), APP_USER, APP_PW, "sbtest"), sut=["e0bench-mariadb"],
                         data=[("e0bench-mariadb", "/var/lib/mysql")], product="MariaDB", version="11.8.9",
                         comp="MariaDB 11.8 (direct)", dur=INNODB + ", binlog on", build="release image mariadb:11.8 (11.8.9)"),
-        "redis": dict(kv=("e0bench-redis", 6379, "", ""), sut=["e0bench-redis"], data=[("e0bench-redis", "/data")],
+        "redis": dict(kv=(H("e0bench-redis"), P("E0_PORT_REDIS", 6379), "", ""), sut=["e0bench-redis"], data=[("e0bench-redis", "/data")],
                       product="Redis", version="7.4.11", comp="Redis 7.4 / 8.1", dur="appendfsync always (fsync per write)",
                       build="release image redis:7.4.11"),
         "sprig": dict(sql=("e0bench-sprig", 3306, "bench.app", APP_PW, "sbtest"), kv=("e0bench-sprig", 6379, "bench.app", APP_PW),
                       sut=["e0bench-sprig", "e0bench-sprigmaria", "e0bench-etcd"], data=[("e0bench-sprigmaria", "/var/lib/mysql")],
                       product="SprigDB", version=stamp("before"), comp="SprigDB",
                       dur="commit per write: MariaDB " + INNODB, build="release " + stamp("before") + ", Linux build in e0bench-build"),
-        "e0": dict(sql=("e0bench-node", 3306, e0_user, APP_PW, "sbtest"), kv=("e0bench-node", 6379, e0_user, APP_PW),
-                   sut=["e0bench-node"], data=[("e0bench-node", "/data")], product="SprigDB E0", version=stamp("e0"),
+        "e0": dict(sql=(H("e0bench-sprig"), P("E0_PORT_NODE_SQL", 3306), e0_user, APP_PW, "sbtest"), kv=(H("e0bench-sprig"), P("E0_PORT_NODE_REDIS", 6379), e0_user, APP_PW),
+                   sut=["e0bench-sprig", "e0bench-sprigmaria", "e0bench-etcd"],
+                   data=[("e0bench-sprig", ENV.get("E0_ENGINE_DIR", "/var/lib/sprig/engine")), ("e0bench-sprigmaria", "/var/lib/mysql")],
+                   product="SprigDB E0", version=stamp("e0"),
                    comp="SprigDB E0", dur=ENV.get("E0_DURABILITY", "commit per write: one fdatasync per commit batch (group commit)"),
                    build="release " + stamp("e0") + ", Linux build in e0bench-build"),
     }
@@ -103,22 +108,22 @@ class Cpu:
         self.names = containers
         self.ids = {}
         for c in containers:
-            r = sh(DOCKER + ["inspect", "-f", "{{.Id}}", c], check=False)
+            r = sh(SUT_DOCKER + ["inspect", "-f", "{{.Id}}", c], check=False)
             if r.returncode == 0:
                 self.ids[c] = r.stdout.strip()
         self.ensure_sidecar()
 
     @staticmethod
     def ensure_sidecar():
-        r = sh(DOCKER + ["inspect", "-f", "{{.State.Running}}", "e0bench-cgmon"], check=False)
+        r = sh(SUT_DOCKER + ["inspect", "-f", "{{.State.Running}}", "e0bench-cgmon"], check=False)
         if r.returncode == 0 and r.stdout.strip() == "true":
             return
-        sh(DOCKER + ["rm", "-f", "e0bench-cgmon"], check=False)
-        sh(DOCKER + ["run", "-d", "--name", "e0bench-cgmon", "--cgroupns", "host", "--cpuset-cpus", CLIENT_CPUS,
+        sh(SUT_DOCKER + ["rm", "-f", "e0bench-cgmon"], check=False)
+        sh(SUT_DOCKER + ["run", "-d", "--name", "e0bench-cgmon", "--cgroupns", "host", "--cpuset-cpus", CLIENT_CPUS,
                      "-m", "64m", "-v", "/sys/fs/cgroup:/hostcg:ro", "-v", f"{E0_DIR}:/opt/e0:ro", IMG_RUN, "sleep", "infinity"])
 
     def snap(self):
-        r = sh(DOCKER + ["exec", "e0bench-cgmon", "python3", "-I", "/opt/e0/lib/cgsnap.py"] + list(self.ids.values()))
+        r = sh(SUT_DOCKER + ["exec", "e0bench-cgmon", "python3", "-I", "/opt/e0/lib/cgsnap.py"] + list(self.ids.values()))
         s = json.loads(r.stdout)
         s["cg"] = {n: s["cg"].get(i) for n, i in self.ids.items()}
         return s
@@ -249,13 +254,13 @@ def parse_sysbench(t):
 def datadir_kb(a):
     tot = 0
     for c, d in a["data"]:
-        r = sh(DOCKER + ["exec", c, "du", "-sk", d], check=False)
+        r = sh(SUT_DOCKER + ["exec", c, "du", "-sk", d], check=False)
         tot += int(r.stdout.split()[0]) if r.returncode == 0 and r.stdout else 0
     return tot
 
 
 def resident_mib(a):
-    r = sh(DOCKER + ["stats", "--no-stream", "--format", "{{.Name}} {{.MemUsage}}"] + a["sut"], check=False)
+    r = sh(SUT_DOCKER + ["stats", "--no-stream", "--format", "{{.Name}} {{.MemUsage}}"] + a["sut"], check=False)
     tot = 0.0
     for line in r.stdout.splitlines():
         v = line.split()[1]

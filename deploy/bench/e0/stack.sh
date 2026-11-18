@@ -19,7 +19,9 @@
 #   redis    Redis 7.4.11: appendonly yes, appendfsync always, no RDB snapshots, io-threads 4
 #   sprig    today's SprigDB: controller, worker and gateway (one container, $E0_WORK/bin/before)
 #            over its own etcd and MariaDB 11.8 (durable as above); MySQL and Redis listeners
-#   e0       the E0 node ($E0_WORK/bin/e0/sprigdb): MySQL and Redis listeners, data in /data
+#   e0       the same stack with the E0 build ($E0_WORK/bin/e0) and the benchmark's databases on
+#            the engine (conf/e0-placement.sh); `kill` SIGKILLs the node (controller, worker
+#            and gateway with the engine), `start` restarts it on the same data
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 D=$E0_DOCKER
@@ -65,10 +67,10 @@ up_mysql() {
     rmc e0bench-mysql
     # shellcheck disable=SC2046
     $D run -d --name e0bench-mysql --hostname e0bench-mysql "${SUT[@]}" -e MYSQL_ROOT_PASSWORD="$E0_ROOT_PW" \
-        "$IMG_MYSQL" $(innodb_args) --innodb-redo-log-capacity=1G --mysql-native-password=ON --tls-version= >/dev/null
-    wait_sql e0bench-mysql e0bench-mysql 3306
-    for _ in $(seq 1 60); do $D exec e0bench-mysql mysql -uroot -p"$E0_ROOT_PW" -e 'SELECT 1' >/dev/null 2>&1 && break; sleep 1; done
-    $D exec e0bench-mysql mysql -uroot -p"$E0_ROOT_PW" -e "
+        "$IMG_MYSQL" --port="$E0_PORT_MYSQL" $(innodb_args) --innodb-redo-log-capacity=1G --mysql-native-password=ON --tls-version= >/dev/null
+    wait_sql e0bench-mysql "$(e0_host e0bench-mysql)" "$E0_PORT_MYSQL"
+    for _ in $(seq 1 60); do $D exec e0bench-mysql mysql -h127.0.0.1 -P"$E0_PORT_MYSQL" -uroot -p"$E0_ROOT_PW" -e 'SELECT 1' >/dev/null 2>&1 && break; sleep 1; done
+    $D exec e0bench-mysql mysql -h127.0.0.1 -P"$E0_PORT_MYSQL" -uroot -p"$E0_ROOT_PW" -e "
         CREATE USER IF NOT EXISTS '$E0_APP_USER'@'%' IDENTIFIED WITH mysql_native_password BY '$E0_APP_PW';
         GRANT ALL ON *.* TO '$E0_APP_USER'@'%'; CREATE DATABASE IF NOT EXISTS sbtest; CREATE DATABASE IF NOT EXISTS e0diff; CREATE DATABASE IF NOT EXISTS e0crash;" 2>/dev/null
 }
@@ -77,19 +79,19 @@ up_mariadb() {
     rmc e0bench-mariadb
     # shellcheck disable=SC2046
     $D run -d --name e0bench-mariadb --hostname e0bench-mariadb "${SUT[@]}" -e MARIADB_ROOT_PASSWORD="$E0_ROOT_PW" \
-        "$IMG_MARIADB" $(innodb_args) --innodb-log-file-size=1G --log-bin=bin --binlog-format=ROW --server-id=1 --skip-ssl >/dev/null
-    wait_sql e0bench-mariadb e0bench-mariadb 3306
-    for _ in $(seq 1 60); do $D exec e0bench-mariadb mariadb --skip-ssl -uroot -p"$E0_ROOT_PW" -e 'SELECT 1' >/dev/null 2>&1 && break; sleep 1; done
-    $D exec e0bench-mariadb mariadb --skip-ssl -uroot -p"$E0_ROOT_PW" -e "
+        "$IMG_MARIADB" --port="$E0_PORT_MARIADB" $(innodb_args) --innodb-log-file-size=1G --log-bin=bin --binlog-format=ROW --server-id=1 --skip-ssl >/dev/null
+    wait_sql e0bench-mariadb "$(e0_host e0bench-mariadb)" "$E0_PORT_MARIADB"
+    for _ in $(seq 1 60); do $D exec e0bench-mariadb mariadb --skip-ssl -h127.0.0.1 -P"$E0_PORT_MARIADB" -uroot -p"$E0_ROOT_PW" -e 'SELECT 1' >/dev/null 2>&1 && break; sleep 1; done
+    $D exec e0bench-mariadb mariadb --skip-ssl -h127.0.0.1 -P"$E0_PORT_MARIADB" -uroot -p"$E0_ROOT_PW" -e "
         CREATE USER IF NOT EXISTS '$E0_APP_USER'@'%' IDENTIFIED BY '$E0_APP_PW';
         GRANT ALL ON *.* TO '$E0_APP_USER'@'%'; CREATE DATABASE IF NOT EXISTS sbtest; CREATE DATABASE IF NOT EXISTS e0diff; CREATE DATABASE IF NOT EXISTS e0crash;"
 }
 
 up_redis() {
     rmc e0bench-redis
-    $D run -d --name e0bench-redis --hostname e0bench-redis "${SUT[@]}" "$IMG_REDIS" redis-server --port 6379 \
+    $D run -d --name e0bench-redis --hostname e0bench-redis "${SUT[@]}" "$IMG_REDIS" redis-server --port "$E0_PORT_REDIS" \
         --protected-mode no --maxmemory "$E0_REDIS_MAXMEM" --io-threads 4 --appendonly yes --appendfsync always --save '' >/dev/null
-    wait_redis e0bench-redis e0bench-redis 6379
+    wait_redis e0bench-redis "$(e0_host e0bench-redis)" "$E0_PORT_REDIS"
 }
 
 # Today's SprigDB: etcd and MariaDB in their own containers, and the controller,
@@ -100,48 +102,44 @@ up_sprig() {
     [[ -x $bin/sprigdb && -x $bin/sprigctl ]] || { e0_say "no Linux sprigdb/sprigctl in $bin (run e0/build-linux.sh before)"; exit 2; }
     rmc e0bench-sprig e0bench-sprigmaria e0bench-etcd
     $D run -d --name e0bench-etcd --hostname e0bench-etcd "${SUT[@]}" -m 256m --memory-swap 256m "$IMG_ETCD" etcd --name=e0 \
-        --data-dir=/etcd-data --listen-client-urls=http://0.0.0.0:2379 --advertise-client-urls=http://e0bench-etcd:2379 \
+        --data-dir=/etcd-data --listen-client-urls="http://0.0.0.0:${E0_ETCD_ADDR##*:}" --advertise-client-urls="http://$E0_ETCD_ADDR" \
         --listen-peer-urls=http://127.0.0.1:2380 --initial-advertise-peer-urls=http://127.0.0.1:2380 \
         --initial-cluster=e0=http://127.0.0.1:2380 --auto-compaction-mode=periodic --auto-compaction-retention=1h >/dev/null
     # shellcheck disable=SC2046
     $D run -d --name e0bench-sprigmaria --hostname e0bench-sprigmaria "${SUT[@]}" -e MARIADB_ROOT_PASSWORD="$E0_ROOT_PW" \
         -v "$E0_ROOT/deploy/compose/mariadb/binlog.cnf:/etc/mysql/conf.d/10-binlog.cnf:ro" \
-        "$IMG_MARIADB" $(innodb_args) --innodb-log-file-size=1G --server-id=1 --gtid-domain-id=1 >/dev/null
-    wait_sql e0bench-sprigmaria e0bench-sprigmaria 3306
-    for _ in $(seq 1 60); do $D exec e0bench-sprigmaria mariadb --skip-ssl -uroot -p"$E0_ROOT_PW" -e 'SELECT 1' >/dev/null 2>&1 && break; sleep 1; done
+        "$IMG_MARIADB" --port="${E0_CATALOG_ADDR##*:}" $(innodb_args) --innodb-log-file-size=1G --server-id=1 --gtid-domain-id=1 >/dev/null
+    wait_sql e0bench-sprigmaria "$(e0_host "${E0_CATALOG_ADDR%:*}")" "${E0_CATALOG_ADDR##*:}"
+    for _ in $(seq 1 60); do $D exec e0bench-sprigmaria mariadb --skip-ssl -h127.0.0.1 -P"${E0_CATALOG_ADDR##*:}" -uroot -p"$E0_ROOT_PW" -e 'SELECT 1' >/dev/null 2>&1 && break; sleep 1; done
     $D run -d --name e0bench-sprig --hostname e0bench-sprig "${SUT[@]}" --init \
         -e E0_ROOT_PW="$E0_ROOT_PW" -e E0_APP_PW="$E0_APP_PW" -e E0_TENANT_BASE="${E0_TENANT_BASE:-57306000000}" \
+        -e E0_ENGINE="${E0_ENGINE:-0}" -e E0_CACHE_MB="$E0_CACHE_MB" -e E0_ETCD_ADDR="$E0_ETCD_ADDR" -e E0_CATALOG_ADDR="$E0_CATALOG_ADDR" \
+        -e E0_PORT_NODE_SQL="$E0_PORT_NODE_SQL" -e E0_PORT_NODE_MARIADB="$E0_PORT_NODE_MARIADB" -e E0_PORT_NODE_REDIS="$E0_PORT_NODE_REDIS" \
         -v "$bin:/opt/sprig:ro" -v "$E0_DIR:/opt/e0:ro" \
         -v "$E0_ROOT/deploy/compose/workload-keys.dev:/opt/e0conf-x/workload-keys.dev:ro" \
         -v "$E0_ROOT/deploy/compose/gateway-certs:/opt/e0conf-x/certs:ro" \
         "$IMG_RUN" bash /opt/e0/conf/sprig-up.sh >/dev/null
+    wait_node
+    e0_say "sprig up ($bin): mysql e0bench-sprig:3306 (sbtest), redis e0bench-sprig:6379, user bench.app"
+}
+wait_node() { # sprig-up.sh writes READY once the tenant answers
     for _ in $(seq 1 240); do
-        $D exec e0bench-sprig test -f /var/lib/sprig/READY 2>/dev/null && break
-        exists e0bench-sprig && [[ $($D inspect -f '{{.State.Running}}' e0bench-sprig) == true ]] || { $D logs --tail 40 e0bench-sprig >&2; exit 1; }
+        $D exec e0bench-sprig test -f /var/lib/sprig/READY 2>/dev/null && return 0
+        [[ $($D inspect -f '{{.State.Running}}' e0bench-sprig 2>/dev/null) == true ]] || { $D logs --tail 40 e0bench-sprig >&2; exit 1; }
         sleep 1
     done
-    $D exec e0bench-sprig test -f /var/lib/sprig/READY || { $D logs --tail 40 e0bench-sprig >&2; e0_say "sprig not ready"; exit 1; }
-    e0_say "sprig up: mysql e0bench-sprig:3306 (sbtest), redis e0bench-sprig:6379, user bench.app"
+    $D logs --tail 40 e0bench-sprig >&2; e0_say "sprig not ready"; exit 1
 }
 
-# The E0 node: one process with the MySQL and Redis listeners and the engine.
-# How it starts is in conf/e0-node.sh (kept beside the harness so the command
-# line can follow the binary without editing this script).
-up_e0() {
-    local bin=${E0_BIN:-$E0_WORK/bin/e0}
-    [[ -x $bin/sprigdb ]] || { e0_say "no E0 binary in $bin"; exit 2; }
-    rmc e0bench-node
-    $D run -d --name e0bench-node --hostname e0bench-node "${SUT[@]}" --init \
-        -e E0_APP_PW="$E0_APP_PW" -e E0_CACHE_MB="$E0_CACHE_MB" \
-        -v "$bin:/opt/sprig:ro" -v "$E0_DIR:/opt/e0:ro" "$IMG_RUN" bash /opt/e0/conf/e0-node.sh >/dev/null
-    wait_sql e0bench-node e0bench-node 3306
-    wait_redis e0bench-node e0bench-node 6379
-}
+# The E0 arm: the same stack with the E0 build ($E0_WORK/bin/e0) and the
+# benchmark's databases placed on the engine (conf/e0-placement.sh, run by
+# sprig-up.sh before the databases are created). MariaDB keeps only the catalog.
+up_e0() { SPRIG_BIN=${E0_BIN:-$E0_WORK/bin/e0} E0_ENGINE=1 up_sprig; }
 
 containers_of() {
     case $1 in
     mysql) echo e0bench-mysql ;; mariadb) echo e0bench-mariadb ;; redis) echo e0bench-redis ;;
-    sprig) echo e0bench-sprig e0bench-sprigmaria e0bench-etcd ;; e0) echo e0bench-node ;;
+    sprig | e0) echo e0bench-sprig e0bench-sprigmaria e0bench-etcd ;;
     *) echo "unknown arm $1" >&2; exit 2 ;;
     esac
 }
@@ -152,18 +150,18 @@ containers_of() {
 killarm() {
     local c
     for c in $(containers_of "$1"); do
-        [[ $1 == sprig && $c == e0bench-etcd ]] && continue
+        [[ $c == e0bench-etcd || $c == e0bench-sprigmaria ]] && continue  # the node is the gateway; its catalog stays up
         $D kill -s KILL "$c" >/dev/null 2>&1 && e0_say "killed $c" || true
     done
 }
 startarm() {
     local c
-    for c in $(containers_of "$1"); do $D start "$c" >/dev/null; done
+    for c in $(containers_of "$1"); do [[ $($D inspect -f '{{.State.Running}}' "$c") == true ]] || $D start "$c" >/dev/null; done
     case $1 in
-    mysql | mariadb) wait_sql "e0bench-$1" "e0bench-$1" 3306 ;;
-    redis) wait_redis e0bench-redis e0bench-redis 6379 ;;
-    e0) wait_sql e0bench-node e0bench-node 3306; wait_redis e0bench-node e0bench-node 6379 ;;
-    sprig) e0_say "sprig restart after a kill is not supported by sprig-up.sh; use up" ;;
+    mysql) wait_sql e0bench-mysql "$(e0_host e0bench-mysql)" "$E0_PORT_MYSQL" ;;
+    mariadb) wait_sql e0bench-mariadb "$(e0_host e0bench-mariadb)" "$E0_PORT_MARIADB" ;;
+    redis) wait_redis e0bench-redis "$(e0_host e0bench-redis)" "$E0_PORT_REDIS" ;;
+    sprig | e0) wait_node ;;
     esac
 }
 

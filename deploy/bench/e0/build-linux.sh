@@ -38,9 +38,9 @@ STAMP="$(git rev-parse --short HEAD)$([[ -n $(git status --porcelain | head -1) 
 e0_say "building $NAME ($STAMP): ${PKGS[*]} (log $LOG)"
 $E0_DOCKER image inspect "$IMG_BUILD" >/dev/null 2>&1 || "$E0_DIR/stack.sh" images
 t0=$(date +%s)
-$E0_DOCKER run --rm --name "e0bench-build-$$" -m "${E0_BUILD_MEM:-10g}" \
+$E0_DOCKER run --rm --name "e0bench-build-$$" -m "${E0_BUILD_MEM:-14g}" \
     -e CARGO_TARGET_DIR=/target -e CARGO_HOME=/cargo -e RUSTUP_TOOLCHAIN=1.94.0 \
-    -e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-6}" -e CARGO_INCREMENTAL=0 \
+    -e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-6}" -e CARGO_INCREMENTAL=0 -e CARGO_PROFILE_RELEASE_DEBUG="${E0_RELEASE_DEBUG:-false}" \
     -v "$SRC:/src" -v "$TGT:/target" -v "$CH:/cargo" -w /src "$IMG_BUILD" \
     bash -c 'mkdir -p /cargo/bin && cargo build --release --locked "$@"' _ "${PKGS[@]}" >"$LOG" 2>&1 ||
     { tail -40 "$LOG"; e0_say "BUILD FAILED ($LOG)"; exit 1; }

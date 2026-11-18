@@ -39,7 +39,7 @@ ARMS = {  # arm -> redis endpoint, sql endpoint, user, product, competitor, dura
     "redis": ("e0bench-redis:6379", None, "", "Redis", "Redis 7.4 / 8.1", "appendfsync always (fsync per write)"),
     "mysql": (None, "e0bench-mysql:3306", ENV.get("E0_APP_USER", "sbtest"), "MySQL", "MySQL 8.4", "innodb_flush_log_at_trx_commit=1, sync_binlog=1"),
     "mariadb": (None, "e0bench-mariadb:3306", ENV.get("E0_APP_USER", "sbtest"), "MariaDB", "MariaDB 11.8 (direct)", "innodb_flush_log_at_trx_commit=1, sync_binlog=1"),
-    "e0": ("e0bench-node:6379", "e0bench-node:3306", ENV.get("E0_NODE_USER", "bench.app"), "SprigDB E0", "SprigDB E0",
+    "e0": ("e0bench-sprig:6379", "e0bench-sprig:3306", ENV.get("E0_NODE_USER", "bench.app"), "SprigDB E0", "SprigDB E0",
            ENV.get("E0_DURABILITY", "commit per write: one fdatasync per commit batch (group commit)")),
 }
 
