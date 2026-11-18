@@ -600,6 +600,27 @@ impl GatewayGraphs {
         (!v.labels.is_empty() || !v.types.is_empty()).then_some(v)
     }
 
+    /// `tenant`'s catalog for a statement's own reads (the mirrors' gate):
+    /// on the cluster its map named when last read, without reading the map
+    /// again; else as [`CatalogLocator::writer`].
+    ///
+    /// # Errors
+    /// The locator's.
+    pub(crate) async fn statement_catalog(
+        &self,
+        tenant: TenantId,
+    ) -> Result<sprig_catalog::CatalogEndpoint> {
+        match self.svc.locator.cached_cluster(tenant) {
+            Some(c) => Ok(sprig_catalog::CatalogEndpoint {
+                pool: self.svc.locator.catalog_pool(&c).await?,
+                store: sprig_catalog::Store::new(
+                    sprig_common::names::SchemaName::catalog(tenant).to_string(),
+                ),
+            }),
+            None => self.svc.locator.writer(tenant).await,
+        }
+    }
+
     /// Resolves `db.name` in `cat`: `None` if there is no such graph.
     ///
     /// # Errors
@@ -636,7 +657,13 @@ impl GatewayGraphs {
             .first()
             .map(ToString::to_string)
             .ok_or_else(|| not_found(db, name))?;
-        let cluster = self.svc.locator.cluster(cat.tenant).await?;
+        // The cluster the tenant's map named when last read (the catalog
+        // load before this read it): a shard map read per statement was
+        // half of a point read's time in the gateway.
+        let cluster = match self.svc.locator.cached_cluster(cat.tenant) {
+            Some(c) => c,
+            None => self.svc.locator.cluster(cat.tenant).await?,
+        };
         let (shards, held_until) = self.layout(cat.tenant, &def, &schema, &cluster).await?;
         Ok(Some(GraphRef {
             tenant: cat.tenant,

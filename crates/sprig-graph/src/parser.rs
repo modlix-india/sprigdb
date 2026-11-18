@@ -264,6 +264,33 @@ pub fn parse(src: &str) -> Result<Query> {
     Ok(q)
 }
 
+/// Statements parsed before, by text, at most this many (all dropped when
+/// full).
+const PARSED_MAX: usize = 512;
+
+/// [`parse`] through a process-wide cache of statement texts: a driver
+/// sends the same few parameterized texts again and again, and IC1's
+/// statement took 90 µs to parse.
+///
+/// # Errors
+/// As [`parse`] (failures aren't kept).
+pub fn parse_cached(src: &str) -> Result<Query> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock, PoisonError};
+    static PARSED: OnceLock<Mutex<HashMap<String, Query>>> = OnceLock::new();
+    let m = PARSED.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(q) = m.lock().unwrap_or_else(PoisonError::into_inner).get(src) {
+        return Ok(q.clone());
+    }
+    let q = parse(src)?;
+    let mut g = m.lock().unwrap_or_else(PoisonError::into_inner);
+    if g.len() >= PARSED_MAX {
+        g.clear();
+    }
+    g.insert(src.to_owned(), q.clone());
+    Ok(q)
+}
+
 /// Parses a standalone expression (tests, `GRAPH_TABLE` columns).
 ///
 /// # Errors

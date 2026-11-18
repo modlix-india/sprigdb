@@ -756,7 +756,7 @@ impl GwSession {
                 "impersonation (imp_user) is not supported",
             ));
         }
-        let q = sprig_graph::parser::parse(query)?;
+        let q = sprig_graph::parser::parse_cached(query)?;
         let mut p = Params::new();
         for (k, v) in params.as_map().unwrap_or_default() {
             p.insert(k.clone(), from_pack(v)?);

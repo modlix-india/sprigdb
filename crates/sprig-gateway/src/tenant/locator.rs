@@ -58,6 +58,11 @@ const CATALOG_CONN_TTL: std::time::Duration = std::time::Duration::from_secs(15 
 /// Spreads the catalog connections' renewals.
 const CATALOG_CONN_JITTER: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long a cluster's record, as read, serves the pools' lookups (the
+/// backends' cluster views keep theirs as long); the writer is checked on
+/// every lookup.
+const RECORD_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The gateway's three `sprig_ctl` pools per cluster, each its own budget
 /// of [`POOL_MAX`] connections.
 ///
@@ -161,6 +166,10 @@ pub struct GatewayLocator {
     /// The `sprig_ctl` pools per cluster, by [`Budget`]; the catalog ones
     /// keep their connections' prepared statements.
     pools: Mutex<HashMap<(Budget, ClusterId), (String, Pool)>>,
+    /// Cluster records as last read for the pools, and when
+    /// ([`RECORD_TTL`]).
+    records:
+        Mutex<HashMap<ClusterId, (std::time::Instant, sprig_cluster::registry::StoredCluster)>>,
     clusters: Mutex<HashMap<TenantId, ClusterId>>,
     ctl_users: Mutex<HashMap<ClusterId, String>>,
     /// Every tenant map in this DC tier (`shardmaps/`), fed by a watch,
@@ -206,6 +215,7 @@ impl GatewayLocator {
             registry,
             backends,
             pools: Mutex::new(HashMap::new()),
+            records: Mutex::new(HashMap::new()),
             clusters: Mutex::new(HashMap::new()),
             ctl_users: Mutex::new(HashMap::new()),
             maps: OnceLock::new(),
@@ -862,15 +872,39 @@ impl GatewayLocator {
         self.pool_of(cluster, Budget::Catalog).await
     }
 
-    async fn pool_of(&self, cluster: &ClusterId, budget: Budget) -> Result<Pool> {
-        let catalog = budget == Budget::Catalog;
-        let key = (budget, cluster.clone());
+    /// `cluster`'s record for [`Self::pool_of`]: as read within
+    /// [`RECORD_TTL`], else read again (every pool lookup read it from the
+    /// store, two of them per Bolt statement).
+    async fn pool_record(
+        &self,
+        cluster: &ClusterId,
+    ) -> Result<sprig_cluster::registry::StoredCluster> {
+        if let Some((at, r)) = self
+            .records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(cluster)
+            && at.elapsed() < RECORD_TTL
+        {
+            return Ok(r.clone());
+        }
         let stored = self.registry.get(cluster).await?.ok_or_else(|| {
             SprigError::new(
                 SprigCode::ClusterNotFound,
                 format!("no cluster {cluster} in dc {}", self.registry.dc()),
             )
         })?;
+        self.records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(cluster.clone(), (std::time::Instant::now(), stored.clone()));
+        Ok(stored)
+    }
+
+    async fn pool_of(&self, cluster: &ClusterId, budget: Budget) -> Result<Pool> {
+        let catalog = budget == Budget::Catalog;
+        let key = (budget, cluster.clone());
+        let stored = self.pool_record(cluster).await?;
         let rec = stored.body();
         let writer = match self.backends.writer(cluster, ShardId(0)).await {
             Ok(n) => rec.nodes.iter().find(|s| s.node == n.node).cloned(),
@@ -1007,5 +1041,110 @@ impl CatalogLocator for GatewayLocator {
             pool: self.catalog_pool(&cluster).await?,
             store: Store::new(SchemaName::catalog(tenant).to_string()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use sprig_cluster::TopologyKind;
+    use sprig_cluster::record::{Capacity, NodeSpec, ProvisionerKind, SecretRefs};
+    use sprig_cluster::registry::Registration;
+    use sprig_common::ids::NodeId;
+    use sprig_meta::MemStore;
+
+    use super::*;
+    use crate::backend::cluster::{Published, PublishedWriter};
+    use crate::backend::{
+        BackendSettings, ClusterSource, ClusterView, FixedSettings, NodeRef, StaticClusters,
+    };
+
+    fn view(id: &ClusterId, writer: &str) -> ClusterView {
+        let nodes = ["n1", "n2"]
+            .iter()
+            .map(|n| NodeRef {
+                node: NodeId::new(*n).unwrap(),
+                addr: format!("{n}.db:3306"),
+            })
+            .collect();
+        let mut v = ClusterView::new(id.clone(), TopologyKind::PrimaryReplica, nodes);
+        v.published = Published {
+            writer: PublishedWriter::Node {
+                node: NodeId::new(writer).unwrap(),
+                epoch: 1,
+            },
+            read_at: Instant::now(),
+        };
+        v
+    }
+
+    /// The pools' lookups read the cluster record once within its time,
+    /// and still hand out a new pool at once when the writer changes.
+    #[tokio::test]
+    async fn pools_follow_the_writer_without_reading_the_record_each_time() {
+        let creds = std::env::temp_dir().join(format!("gs-locator-{}.toml", std::process::id()));
+        std::fs::write(
+            &creds,
+            "[sprig_ctl]\nuser = \"sprig_ctl\"\npassword = \"pw\"\n",
+        )
+        .unwrap();
+        let dc_id = DcId::new("dc-a").unwrap();
+        let global: Arc<dyn MetaStore> = Arc::new(MemStore::new(Tier::Global));
+        let dc: Arc<dyn MetaStore> = Arc::new(MemStore::new(Tier::Dc(dc_id.clone())));
+        let registry = ClusterRegistry::new(Arc::clone(&global), Arc::clone(&dc)).unwrap();
+        let stored = registry
+            .register(Registration {
+                name: "c1".into(),
+                topology: TopologyKind::PrimaryReplica,
+                provisioner: ProvisionerKind::External,
+                nodes: ["n1", "n2"]
+                    .iter()
+                    .map(|n| NodeSpec {
+                        node: NodeId::new(*n).unwrap(),
+                        addr: format!("{n}.db:3306"),
+                        zone: None,
+                    })
+                    .collect(),
+                secrets: SecretRefs {
+                    ctl: format!("file:{}#sprig_ctl", creds.display()),
+                    repl: format!("file:{}#sprig_ctl", creds.display()),
+                },
+                capacity: Capacity::default(),
+                declared: None,
+            })
+            .await
+            .unwrap();
+        let id = stored.body().cluster_id.clone();
+        let clusters = StaticClusters::new();
+        clusters.insert(view(&id, "n1"));
+        let backends = Backends::new(
+            dc_id,
+            Arc::clone(&clusters) as Arc<dyn ClusterSource>,
+            FixedSettings::new(BackendSettings::default()),
+        );
+        let l = GatewayLocator::new(Arc::clone(&dc), registry, backends);
+        l.ctl_pool(&id).await.unwrap();
+        let first = l.ctl_pool_fingerprint(&id).unwrap();
+        assert!(first.starts_with("n1|"), "{first}");
+        // The record gone from the store: lookups within its time still
+        // answer from the record as read.
+        dc.txn(sprig_meta::Txn {
+            when: Vec::new(),
+            then: vec![sprig_meta::Op::Delete(
+                dc.tier().key(&format!("clusters/{id}")).unwrap(),
+            )],
+            otherwise: Vec::new(),
+        })
+        .await
+        .unwrap();
+        l.ctl_pool(&id).await.unwrap();
+        assert_eq!(l.ctl_pool_fingerprint(&id).as_deref(), Some(first.as_str()));
+        // A new writer: a new pool at once, the old one replaced.
+        clusters.insert(view(&id, "n2"));
+        l.ctl_pool(&id).await.unwrap();
+        let second = l.ctl_pool_fingerprint(&id).unwrap();
+        assert!(second.starts_with("n2|"), "{second}");
+        let _ = std::fs::remove_file(&creds);
     }
 }

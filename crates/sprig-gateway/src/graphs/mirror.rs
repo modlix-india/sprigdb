@@ -258,7 +258,7 @@ impl CatalogGate {
         // the target below.
         let catalog_key = format!("catalog:{}", self.tenant);
         let first = async {
-            let ep = self.graphs.svc.locator.writer(self.tenant).await?;
+            let ep = self.graphs.statement_catalog(self.tenant).await?;
             let Some(pool) = gate_pool(&catalog_key, &ep.pool).await? else {
                 return Ok(None);
             };

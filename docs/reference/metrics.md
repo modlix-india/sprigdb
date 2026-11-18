@@ -9,7 +9,7 @@ source: the metric macros in the source tree, and docs/metrics-help.toml
 
 Every metric SprigDB records, as exported on each process's telemetry port (`/metrics`, Prometheus text) and through OTLP. Counters end in `_total`; durations are histograms in seconds.
 
-524 metrics in 55 groups.
+528 metrics in 55 groups.
 
 ## `sprig_advisor_*`
 
@@ -302,18 +302,21 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | Metric | Type | Labels | Recorded by | Description |
 |---|---|---|---|---|
 | `sprig_feed_binlog_dumps` | gauge | `kind`, `node` | sprig-feed | Binlog dump connections open from this process to MariaDB; `node` is the MariaDB node (`host:port`), `kind` is `tenant` (one tenant's own dump), `shared` (a cluster's shared feed reader) or `catchup` (a private dump that brings one tenant up to the shared reader). Unit: count. |
+| `sprig_feed_buffered_bytes` | gauge | - | sprig-feed | Estimated bytes of decoded transactions waiting in this process's shared feed readers: read ahead of the reader, or sent to a subscription and not read yet. Each buffer holds at most twice the largest transaction the feed keeps (64 MiB); a subscription past it is detached. Unit: bytes. |
 | `sprig_feed_catchup_readers` | gauge | `cluster` | sprig-feed | Private catch-up dumps open, each reading the binlog for one tenant's subscription until the shared feed reader's ring covers its position; `cluster` is the cluster. Only a few run at once per cluster; the rest wait for a slot. Unit: count. |
 | `sprig_feed_events_total` | counter | `cluster` | sprig-feed | Change events the change feed produced from a cluster's binlog; `cluster` is the cluster. Unit: count. |
 | `sprig_feed_filtered_total` | counter | `reason` | sprig-feed | Binlog changes the change feed left out; `reason` is why: `internal` (SprigDB's own tables), `apply` (writes by a move's apply), `owner` or `noop`. Unit: count. |
 | `sprig_feed_handoffs_total` | counter | - | sprig-feed | Times a change-feed reader followed a tenant's move to another cluster. Unit: count. |
 | `sprig_feed_history_lost_total` | counter | `node` | sprig-feed | Binlog dumps a node refused because events a change-feed reader still needs are purged from its binary logs: those changes are lost to that reader, which fails with 39800 at every retry. The error log names the GTID domain, the reader's position and where the node's oldest binary log starts. Alert on any increase. `node` is the MariaDB node (`host:port`). Unit: count. |
 | `sprig_feed_local_domains_added_total` | counter | `domain`, `node` | sprig-feed | Times a change-feed reader's dump was refused because a Galera node purged the start of one of its node-local GTID domains (its own local writes, such as statements run with `wsrep_on = OFF` or an index built by hand with RSU, never a tenant's changes), and the reader added that domain to its position and read on. `node` is the MariaDB node (`host:port`), `domain` the GTID domain. Unit: count. |
+| `sprig_feed_overflow_lost_total` | counter | - | sprig-feed | Times a feed reader stopped at a transaction too large to keep that changed a table it reads (error 39800); a search copy then seeds again. Unit: count. |
 | `sprig_feed_resumes_total` | counter | `consumer`, `tier` | sprig-feed | Feed subscriptions that resumed from an earlier position; `tier` is `ring` (served from the shared feed reader's in-memory ring of recent groups), `replay` (a subscription a little behind the reader, up to 20,000 groups: the reader reopens its dump at that position and reads those groups again, which the other subscriptions skip) or `binlog` (served by a catch-up dump). Unit: count. |
 | `sprig_feed_ring_groups` | gauge | `cluster` | sprig-feed | Committed transaction groups kept in the shared feed reader's in-memory ring of recent history, for subscriptions that resume; `cluster` is the cluster. Updated about once a second. Unit: count. |
 | `sprig_feed_shared_detached_total` | counter | `cluster`, `consumer` | sprig-feed | Subscriptions the shared feed reader detached because their buffer was full when a group arrived, so a slow consumer never holds up the others; a detached subscription comes back through the ring or a catch-up dump. `cluster` is the cluster. Unit: count. |
 | `sprig_feed_shared_dumps_total` | counter | `cluster` | sprig-feed | Binlog dump connections the shared feed reader opened (one per cluster and worker process, plus reconnects); `cluster` is the cluster. Unit: count. |
 | `sprig_feed_shared_groups_total` | counter | `cluster` | sprig-feed | Committed transaction groups the shared feed reader read; `cluster` is the cluster. Unit: count. |
 | `sprig_feed_shared_subscriptions` | gauge | `cluster` | sprig-feed | Subscriptions attached to the shared feed reader of each cluster in this process, such as queue forwarders, stream sequencers and change topics; `cluster` is the cluster. Updated about once a second. Unit: count. |
+| `sprig_feed_txn_overflow_total` | counter | - | sprig-feed | Transactions whose row changes were larger than the feed keeps (64 MiB, estimated): their rows were let go and only the tables they touched kept, so one bulk load can't fill a reader's memory. Readers of those tables read them again from MariaDB (search copies seed again); other readers pass them by. Unit: count. |
 
 ## `sprig_fk_*`
 
@@ -797,6 +800,7 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_workload_fingerprints_active` | gauge | - | sprig-workload | Statement fingerprints the gateway's workload recorder holds in memory (limit `workload.max_fingerprints_per_tenant` per tenant). Unit: count. |
 | `sprig_workload_flush_deferred_total` | counter | - | sprig-workload | Workload rows the recorder dropped because it couldn't flush them in time. Unit: count. |
 | `sprig_workload_flush_duration_seconds` | histogram | - | sprig-workload | Duration of one workload flush from a gateway to the tenant catalogs. Unit: seconds. |
+| `sprig_workload_flush_gone_dropped_total` | counter | - | sprig-workload | Workload rows (first sightings, statistics, samples) dropped because their tenant was deleted, instead of kept for the next flush. Unit: count. |
 | `sprig_workload_flush_late_dropped_total` | counter | - | sprig-workload | Closed workload buckets dropped because the rollup may already have merged them. Unit: count. |
 | `sprig_workload_flush_rows_total` | counter | - | sprig-workload | Workload rows (statistics, fingerprints, samples) flushed to tenant catalogs. Unit: count. |
 | `sprig_workload_memory_bytes` | gauge | - | sprig-workload | Memory the gateway's workload recorder uses (limit `workload.max_memory_mb`). Unit: bytes. |
