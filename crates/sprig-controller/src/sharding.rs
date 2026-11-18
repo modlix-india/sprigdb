@@ -195,8 +195,9 @@ struct TenantState {
     last_run: Option<Instant>,
     /// Waits already logged, by subject and blocker.
     logged_waits: BTreeSet<(String, &'static str)>,
-    /// When the next periodic run is due (`advisor.interval_hours`).
-    next_periodic: Option<Instant>,
+    /// When the next periodic run is due, and the `advisor.interval_hours`
+    /// it was computed from (a changed interval is checked again at once).
+    next_periodic: Option<(Instant, Duration)>,
     /// A periodic run's re-key held for approval.
     pending_rekey: Option<periodic::PendingRekey>,
 }

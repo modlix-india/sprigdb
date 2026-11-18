@@ -123,6 +123,9 @@ use crate::reads::Watermarks;
 /// TLS configurations by (skip verification, CA file).
 type TlsKey = (bool, Option<PathBuf>);
 
+/// Moves' read fences by tenant and cluster.
+type ReadFences = HashMap<sprig_common::ids::TenantId, HashMap<ClusterId, crate::reads::GtidSet>>;
+
 /// The backend side of one gateway: pools, node states, writers, read
 /// watermarks and the monitors behind them.
 pub struct Backends {
@@ -133,6 +136,9 @@ pub struct Backends {
     nodes: Arc<NodeTable>,
     writers: TopologyWriters,
     watermarks: Watermarks,
+    /// Per (cluster, tenant): the mover's last write of a move into the
+    /// cluster ([`Backends::raise_read_fence`]).
+    read_fences: Mutex<ReadFences>,
     tls: Mutex<HashMap<TlsKey, Arc<rustls::ClientConfig>>>,
     monitors: Mutex<HashMap<ClusterId, JoinHandle<()>>>,
     monitor_targets: Mutex<HashMap<ClusterId, BackendTarget>>,
@@ -175,6 +181,7 @@ impl Backends {
             writers: TopologyWriters::new(Arc::clone(&nodes)),
             nodes,
             watermarks: Watermarks::new(),
+            read_fences: Mutex::new(HashMap::new()),
             tls: Mutex::new(HashMap::new()),
             monitors: Mutex::new(HashMap::new()),
             monitor_targets: Mutex::new(HashMap::new()),
@@ -293,6 +300,67 @@ impl Backends {
     #[must_use]
     pub fn watermark(&self, cluster: &ClusterId, account: &str) -> crate::reads::GtidSet {
         self.watermarks.get(cluster, account)
+    }
+
+    /// Records a move's read fence: `tenant`'s rows on `cluster` were
+    /// written by the mover up to `fence` (the writer's position after its
+    /// last write, from the shard map). The mover's writes are in no
+    /// session's causal position, so every plain read of the tenant on
+    /// that cluster adds the fence to its target from now on: a replica
+    /// that hasn't applied the copy gets no read. Fences only grow; a
+    /// replica past one serves reads again at once.
+    pub fn raise_read_fence(
+        &self,
+        cluster: &ClusterId,
+        tenant: sprig_common::ids::TenantId,
+        fence: &crate::reads::GtidSet,
+    ) {
+        if fence.is_empty() {
+            return;
+        }
+        let mut m = self
+            .read_fences
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let per = m.entry(tenant).or_default();
+        if per.get(cluster).is_some_and(|cur| cur.covers(fence)) {
+            return;
+        }
+        per.entry(cluster.clone()).or_default().union(fence);
+        tracing::debug!(%cluster, %tenant, %fence, "a move's read fence");
+    }
+
+    /// [`Backends::raise_read_fence`] from a map's text form; a fence that
+    /// doesn't parse is logged and skipped.
+    pub fn raise_read_fence_text(
+        &self,
+        cluster: &ClusterId,
+        tenant: sprig_common::ids::TenantId,
+        fence: &str,
+    ) {
+        match crate::reads::GtidSet::parse(fence) {
+            Ok(g) => self.raise_read_fence(cluster, tenant, &g),
+            Err(e) => {
+                tracing::warn!(%cluster, %tenant, error = %e, "a shard map's read fence doesn't parse");
+            }
+        }
+    }
+
+    /// The read fence of `tenant` on `cluster` (empty without a move into
+    /// it seen by this gateway).
+    #[must_use]
+    pub fn read_fence(
+        &self,
+        cluster: &ClusterId,
+        tenant: sprig_common::ids::TenantId,
+    ) -> crate::reads::GtidSet {
+        self.read_fences
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&tenant)
+            .and_then(|per| per.get(cluster))
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn limits(&self, cluster: &ClusterId) -> pool::Limits {
@@ -724,5 +792,38 @@ mod packet_tests {
         assert_eq!(b.packet_limit(&c), Some(16 << 20));
         b.record_packet_limit(&c, Some(64 << 20));
         assert_eq!(b.packet_limit(&c), Some(64 << 20));
+    }
+
+    /// A move's read fence is kept per tenant and cluster, only grows,
+    /// and a replica that has applied it qualifies for the tenant's reads
+    /// again while one that hasn't doesn't.
+    #[test]
+    fn read_fences_grow_per_tenant_and_cluster() {
+        use crate::reads::GtidSet;
+        let b = Backends::new(
+            DcId::new("dc-a").unwrap(),
+            StaticClusters::new(),
+            FixedSettings::new(BackendSettings::default()),
+        );
+        let (c1, c2) = (
+            ClusterId::new("dc-a-c1").unwrap(),
+            ClusterId::new("dc-a-c2").unwrap(),
+        );
+        let t = sprig_common::ids::TenantId(7);
+        assert!(b.read_fence(&c2, t).is_empty());
+        b.raise_read_fence_text(&c2, t, "451-4511-90");
+        b.raise_read_fence_text(&c2, t, "451-4511-80"); // older: no change
+        b.raise_read_fence_text(&c2, t, "not a position"); // skipped
+        assert_eq!(b.read_fence(&c2, t).to_string(), "451-4511-90");
+        assert!(b.read_fence(&c1, t).is_empty(), "another cluster");
+        assert!(
+            b.read_fence(&c2, sprig_common::ids::TenantId(8)).is_empty(),
+            "another tenant"
+        );
+        b.raise_read_fence_text(&c2, t, "451-4511-120");
+        let f = b.read_fence(&c2, t);
+        assert_eq!(f.to_string(), "451-4511-120");
+        assert!(!GtidSet::parse("451-4511-119").unwrap().covers(&f));
+        assert!(GtidSet::parse("451-4512-120").unwrap().covers(&f));
     }
 }

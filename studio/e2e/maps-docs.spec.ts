@@ -237,8 +237,33 @@ test('the country shapes load only for a filled map', async ({ page }) => {
   expect(urls.filter((u) => SHAPES.test(u))).toEqual([]);
 });
 
+// The stub sets studio.map_tile_url only in the API's answer; a gateway adds
+// the tile server to Studio's Content-Security-Policy only when its own
+// setting names it. Served by a gateway (as in CI), the page is fetched for
+// real and its policy given the tile origin, as the gateway would send it;
+// served by Vite there is no policy to change.
+async function allowTiles(page: Page): Promise<void> {
+  const origin = new URL(TILES.replace(/\{[xyz]\}/g, '0')).origin;
+  await page.route(
+    (url) => url.pathname.startsWith('/studio/t/'),
+    async (route) => {
+      if (route.request().resourceType() !== 'document') return route.fallback();
+      const res = await route.fetch();
+      const headers = { ...res.headers() };
+      const csp = headers['content-security-policy'];
+      if (csp) {
+        headers['content-security-policy'] = csp
+          .replace(/img-src ([^;]*)/, `img-src $1 ${origin}`)
+          .replace(/connect-src ([^;]*)/, `connect-src $1 ${origin}`);
+      }
+      await route.fulfill({ response: res, headers });
+    },
+  );
+}
+
 test('with studio.map_tile_url the map draws that server’s tiles', async ({ page }) => {
   const { tileRequests } = await stub(page, TILES);
+  await allowTiles(page);
   await page.goto('/studio/t/acme/d/d1');
   const map = page.getByTestId('point-map');
   await expect(map).toHaveAttribute('data-tiles', 'on');

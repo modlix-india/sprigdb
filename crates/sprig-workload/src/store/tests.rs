@@ -390,6 +390,74 @@ async fn samples_are_stored_sealed_capped_and_opened() {
     .await;
 }
 
+/// The cap on samples per fingerprint runs on a connection with no
+/// default database, as the controller's catalog connections are: MariaDB
+/// resolves a multi-table `DELETE`'s alias against the default database
+/// and refused the old statement with 1046 there.
+#[tokio::test]
+async fn the_sample_cap_runs_without_a_default_database() {
+    with_schema("samples_nodb", |conn, schema| async move {
+        drop(conn);
+        let url = std::env::var(MARIADB_ENV).unwrap();
+        let mut bare = Conn::new(Opts::from_url(&url).unwrap()).await.unwrap();
+        let db: Option<Option<String>> = bare.query_first("SELECT DATABASE()").await.unwrap();
+        assert_eq!(db, Some(None), "{MARIADB_ENV} must name no database");
+        let t = WorkloadTables::new(&schema);
+        let keys = MasterKeyring::new([(1, [3u8; 32])]).unwrap();
+        let rng = SystemRandom::new();
+        let now = SystemTime::now();
+        let mut rows = Vec::new();
+        for (f, sql) in ["SELECT * FROM a WHERE x = 1", "SELECT * FROM b WHERE y = 2"]
+            .into_iter()
+            .enumerate()
+        {
+            let (fp, _) = new_fp(sql);
+            let payload = SamplePayload {
+                literals: SampledLiterals::from_execution(sql.as_bytes(), &fp, &[]),
+                context: SampleContext::default(),
+            };
+            for i in 0..5u64 {
+                let mut s = seal(
+                    &keys,
+                    &rng,
+                    TenantId(1),
+                    fp.id,
+                    &payload,
+                    CaptureMeta {
+                        captured_at: now - Duration::from_secs(i),
+                        latency_us: 1000,
+                        rows_examined: Some(1),
+                        rows_returned: 1,
+                        expires_at: now + Duration::from_secs(86_400),
+                    },
+                )
+                .unwrap();
+                s.sample_id = f as u64 * 100 + i + 1;
+                rows.push(s);
+            }
+        }
+        t.replace_samples(&mut bare, &rows).await.unwrap();
+        let secs = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let r = Retention {
+            max_samples_per_fingerprint: 2,
+            ..Retention::default()
+        };
+        let rep = t.retain(&mut bare, secs, &r).await.unwrap();
+        assert_eq!(rep.expired_samples, 6, "three over the cap of each");
+        // The newest two of each fingerprint stay.
+        let left: Vec<u64> = bare
+            .query(format!(
+                "SELECT sample_id FROM {}.workload_samples ORDER BY sample_id",
+                quote(&schema)
+            ))
+            .await
+            .unwrap();
+        assert_eq!(left, vec![1, 2, 101, 102]);
+        bare.disconnect().await.unwrap();
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn maintain_migrates_rolls_up_and_retains_through_a_locator() {
     with_schema("maintain", |mut conn, schema| async move {

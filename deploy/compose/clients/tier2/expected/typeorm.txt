@@ -1,0 +1,18 @@
+# TypeORM 0.3.27, its own suite with only the mysql connection (through mysql2): tests that pass on
+# MySQL 8.4.11 and not through 3306 (tab, reason). Names are mocha's full titles, as run.sh writes them.
+# 18 Nov 2026, laptop (compiled on the host, tests in node:22-bookworm-slim, 80 files per run, the
+# test files that load SQLite left out): MySQL 8.4.11 2,319 pass, 5 fail, 55 skip; a debug gateway
+# 2,307 pass, 15 fail, 55 skip. A 13th difference, a before-each hook that met a stalled private
+# etcd, passed on a rerun and isn't listed.
+database schema > generated columns > mysql should add generated column and revert add	DROP COLUMN of a generated NOT NULL column fails (1054 "Unknown column … in check constraint expression"): the persona's _sprignn_ check that holds its NOT NULL isn't dropped with it
+database schema > generated columns > mysql should change generated column and revert change	ALTER TABLE CHANGE of a generated column with NOT NULL is refused by MariaDB (1064 near NOT NULL)
+database schema > generated columns > mysql should drop generated column and revert drop	DROP COLUMN of a generated NOT NULL column fails (1054 "Unknown column … in check constraint expression"): the persona's _sprignn_ check that holds its NOT NULL isn't dropped with it
+entity-schema > indices > mysql should correctly create SPATIAL and FULLTEXT indices	a FULLTEXT index becomes a search index and is not listed back as a MariaDB index the way TypeORM reads it
+github issues > #1377 Add support for `GENERATED ALWAYS AS` in MySQL should correctly create table with generated columns	DROP COLUMN of a generated NOT NULL column fails (1054 "Unknown column … in check constraint expression"): the persona's _sprignn_ check that holds its NOT NULL isn't dropped with it
+github issues > #320 Bug in getManyAndCount should correctly parse type from PrimaryGeneratedColumn options	ONLY_FULL_GROUP_BY: the gateway refuses a SELECT list expression MySQL accepts (Expression #2 … not in GROUP BY); not investigated
+github issues > #6633 Fulltext indices continually dropped & re-created should not create migrations for fulltext indices	a FULLTEXT index is not read back as created, so the migration generator drops and re-creates it
+github issues > #750 Need option for Mysql's full text search should correctly create SPATIAL and FULLTEXT indices	a FULLTEXT index becomes a search index and is not listed back as a MariaDB index the way TypeORM reads it
+indices > fulltext index should correctly create fulltext indices	FULLTEXT WITH PARSER is refused ("FULLTEXT parsers are not supported"); the before-all hook fails
+indices > fulltext index with default parser	FULLTEXT WITH PARSER is refused ("FULLTEXT parsers are not supported"); the before-all hook fails
+indices > fulltext index with ngram parser	FULLTEXT WITH PARSER is refused ("FULLTEXT parsers are not supported"); the before-all hook fails
+query runner > add column should correctly add column and revert add	DROP COLUMN of a generated NOT NULL column fails (1054 "Unknown column … in check constraint expression"): the persona's _sprignn_ check that holds its NOT NULL isn't dropped with it

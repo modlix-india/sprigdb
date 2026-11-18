@@ -474,6 +474,116 @@ pub struct SearchOpts {
     pub slop: Option<u32>,
     /// `INORDER` (accepted; phrase order is kept anyway).
     pub inorder: bool,
+    /// `HIGHLIGHT`.
+    pub highlight: Option<Highlight>,
+    /// `SUMMARIZE`.
+    pub summarize: Option<Summarize>,
+}
+
+/// `HIGHLIGHT [FIELDS n f...] [TAGS open close]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Highlight {
+    /// The fields (`None`: every text field returned).
+    pub fields: Option<Vec<String>>,
+    /// The tags around each matching word (`<b>`, `</b>` by default).
+    pub tags: (String, String),
+}
+
+/// `SUMMARIZE [FIELDS n f...] [FRAGS n] [LEN n] [SEPARATOR s]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Summarize {
+    /// The fields (`None`: every text field returned).
+    pub fields: Option<Vec<String>>,
+    /// Fragments per field (3 by default).
+    pub frags: usize,
+    /// Words per fragment (20 by default).
+    pub len: usize,
+    /// Written after each fragment (`"... "` by default).
+    pub separator: String,
+}
+
+/// The `FIELDS n f...` of `HIGHLIGHT` or `SUMMARIZE` at `a[i]`, if there:
+/// the fields and how many arguments they took.
+fn sub_fields(a: &[&[u8]], i: usize, what: &str) -> Result<Option<(Vec<String>, usize)>> {
+    if a.get(i).is_none_or(|x| upper(x) != "FIELDS") {
+        return Ok(None);
+    }
+    let n = a
+        .get(i + 1)
+        .and_then(|x| text(x).parse::<usize>().ok())
+        .ok_or_else(|| arg_error(format!("Bad arguments for {what}")))?;
+    if i + 2 + n > a.len() {
+        return Err(arg_error(format!("Bad arguments for {what}")));
+    }
+    let f = a[i + 2..i + 2 + n]
+        .iter()
+        .map(|x| text(x).trim_start_matches('@').to_owned())
+        .collect();
+    Ok(Some((f, 2 + n)))
+}
+
+/// `HIGHLIGHT`'s arguments after the keyword at `a[i]`: the option and
+/// the index of its last argument.
+fn parse_highlight(a: &[&[u8]], mut i: usize) -> Result<(Highlight, usize)> {
+    let mut h = Highlight {
+        fields: None,
+        tags: ("<b>".into(), "</b>".into()),
+    };
+    loop {
+        if let Some((f, used)) = sub_fields(a, i + 1, "HIGHLIGHT")? {
+            h.fields = Some(f);
+            i += used;
+        } else if a.get(i + 1).is_some_and(|x| upper(x) == "TAGS") {
+            let (Some(o), Some(c)) = (a.get(i + 2), a.get(i + 3)) else {
+                return Err(arg_error("Bad arguments for HIGHLIGHT"));
+            };
+            h.tags = (text(o), text(c));
+            i += 3;
+        } else {
+            return Ok((h, i));
+        }
+    }
+}
+
+/// `SUMMARIZE`'s arguments after the keyword at `a[i]`.
+fn parse_summarize(a: &[&[u8]], mut i: usize) -> Result<(Summarize, usize)> {
+    let mut s = Summarize {
+        fields: None,
+        frags: 3,
+        len: 20,
+        separator: "... ".into(),
+    };
+    let num = |j: usize| -> Result<usize> {
+        a.get(j)
+            .and_then(|x| text(x).parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .ok_or_else(|| arg_error("Bad arguments for SUMMARIZE"))
+    };
+    loop {
+        if let Some((f, used)) = sub_fields(a, i + 1, "SUMMARIZE")? {
+            s.fields = Some(f);
+            i += used;
+            continue;
+        }
+        match a.get(i + 1).map(|x| upper(x)).as_deref() {
+            Some("FRAGS") => {
+                s.frags = num(i + 2)?;
+                i += 2;
+            }
+            Some("LEN") => {
+                s.len = num(i + 2)?;
+                i += 2;
+            }
+            Some("SEPARATOR") => {
+                s.separator = a
+                    .get(i + 2)
+                    .map(|x| text(x))
+                    .ok_or_else(|| arg_error("Bad arguments for SUMMARIZE"))?;
+                i += 2;
+            }
+            _ => return Ok((s, i)),
+        }
+    }
 }
 
 /// Parses `FT.SEARCH`'s options (after the index and the query).
@@ -599,7 +709,17 @@ pub fn parse_search_opts(a: &[&[u8]]) -> Result<SearchOpts> {
                 i += 1;
             }
             "TIMEOUT" | "LANGUAGE" | "EXPANDER" | "SCORER" | "PAYLOAD" => i += 1,
-            "SUMMARIZE" | "HIGHLIGHT" | "GEOFILTER" => {
+            "HIGHLIGHT" => {
+                let (h, end) = parse_highlight(a, i)?;
+                o.highlight = Some(h);
+                i = end;
+            }
+            "SUMMARIZE" => {
+                let (s, end) = parse_summarize(a, i)?;
+                o.summarize = Some(s);
+                i = end;
+            }
+            "GEOFILTER" => {
                 return Err(unsupported(format!("FT.SEARCH {opt} is not supported")));
             }
             other => {
@@ -719,5 +839,39 @@ mod tests {
         assert_eq!(o.params, vec![("x".into(), "hello".into())]);
         assert!(parse_search_opts(&refs(&args("LIMIT 0"))).is_err());
         assert!(parse_search_opts(&refs(&args("BOGUS"))).is_err());
+    }
+
+    #[test]
+    fn highlight_and_summarize_options() {
+        let o = parse_search_opts(&refs(&args("HIGHLIGHT LIMIT 0 5"))).unwrap();
+        let h = o.highlight.unwrap();
+        assert_eq!((h.fields, h.tags), (None, ("<b>".into(), "</b>".into())));
+        assert_eq!(o.num, 5);
+        let o = parse_search_opts(&refs(&args(
+            "HIGHLIGHT TAGS [ ] FIELDS 2 title @body SUMMARIZE FIELDS 1 body FRAGS 2 LEN 5 SEPARATOR | WITHSCORES",
+        )))
+        .unwrap();
+        let h = o.highlight.unwrap();
+        assert_eq!(h.fields, Some(vec!["title".into(), "body".into()]));
+        assert_eq!(h.tags, ("[".into(), "]".into()));
+        let s = o.summarize.unwrap();
+        assert_eq!(
+            (s.fields, s.frags, s.len, s.separator.as_str()),
+            (Some(vec!["body".into()]), 2, 5, "|")
+        );
+        assert!(o.withscores);
+        let bad = |s: &str| parse_search_opts(&refs(&args(s))).unwrap_err().message;
+        assert_eq!(
+            bad("HIGHLIGHT FIELDS 2 title"),
+            "Bad arguments for HIGHLIGHT"
+        );
+        assert_eq!(bad("HIGHLIGHT TAGS a"), "Bad arguments for HIGHLIGHT");
+        assert_eq!(bad("SUMMARIZE LEN 0"), "Bad arguments for SUMMARIZE");
+        assert_eq!(
+            parse_search_opts(&refs(&args("GEOFILTER g 1 2 3 km")))
+                .unwrap_err()
+                .code(),
+            Some(SprigCode::SearchUnsupported)
+        );
     }
 }

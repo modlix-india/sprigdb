@@ -73,6 +73,7 @@ impl PinReason {
 pub struct Pins {
     in_trans: bool,
     next_trx: bool,
+    savepoint: bool,
     temp: BTreeSet<String>,
     table_locks: bool,
     user_locks: u32,
@@ -97,7 +98,7 @@ impl Pins {
     #[must_use]
     pub fn reasons(&self) -> Vec<PinReason> {
         let mut r = Vec::new();
-        if self.in_trans || self.next_trx {
+        if self.in_trans || self.next_trx || self.savepoint {
             r.push(PinReason::Transaction);
         }
         if !self.temp.is_empty() {
@@ -161,6 +162,7 @@ impl Pins {
             || self.untracked
             || self.routine
             || self.next_trx
+            || self.savepoint
             || self.txn_lock_wait
             || self.txn_clock
     }
@@ -174,10 +176,18 @@ impl Pins {
             match e {
                 Effect::Begin => {
                     self.next_trx = false;
-                    // START TRANSACTION releases table locks.
+                    // START TRANSACTION commits, which ends savepoints, and
+                    // releases table locks.
+                    self.savepoint = false;
                     self.table_locks = false;
                 }
-                Effect::Commit | Effect::Rollback | Effect::ImplicitCommit => self.next_trx = false,
+                Effect::Commit | Effect::Rollback | Effect::ImplicitCommit => {
+                    self.next_trx = false;
+                    self.savepoint = false;
+                }
+                // Held until the transaction it belongs to ends, or until
+                // the server says autocommit dropped it (`after_statement`).
+                Effect::Savepoint => self.savepoint = true,
                 Effect::NextTransaction => self.next_trx = true,
                 Effect::CreateTemp(t) => {
                     self.temp.insert(t.to_ascii_lowercase());
@@ -214,10 +224,14 @@ impl Pins {
     /// Takes the server's word on the transaction from a statement's final
     /// status flags (`SERVER_STATUS_IN_TRANS`): `COMMIT`, `ROLLBACK` and
     /// implicit commits end it; `autocommit = 0` starts one with the first
-    /// statement.
+    /// statement that touches a table. A savepoint outside a transaction
+    /// lasts only while autocommit is off.
     pub fn after_statement(&mut self, status: StatusFlags) -> bool {
         let was = self.in_trans;
         self.in_trans = status.contains(StatusFlags::IN_TRANS);
+        if !self.in_trans && status.contains(StatusFlags::AUTOCOMMIT) {
+            self.savepoint = false;
+        }
         if self.in_trans {
             self.next_trx = false;
         }
@@ -329,6 +343,31 @@ mod tests {
         p.apply_effects(&[Effect::Untracked("x".into())]);
         p.lose_connection();
         assert_eq!(p.reasons(), vec![PinReason::SessionMode]);
+    }
+
+    #[test]
+    fn a_savepoint_before_the_first_table_pins_while_autocommit_is_off() {
+        // `SET autocommit = 0; SAVEPOINT a;` (Django's TestCase): the server
+        // reports no transaction, but `ROLLBACK TO SAVEPOINT a` needs the
+        // same connection.
+        let mut p = Pins::default();
+        p.apply_effects(&[Effect::Savepoint]);
+        p.after_statement(StatusFlags::empty());
+        assert_eq!(p.reasons(), vec![PinReason::Transaction]);
+        assert!(p.holds_state());
+        p.after_statement(StatusFlags::IN_TRANS);
+        p.apply_effects(&[Effect::Rollback]);
+        p.after_statement(StatusFlags::empty());
+        assert!(p.is_empty(), "ROLLBACK ends it");
+        // With autocommit on, the server drops it at once.
+        p.apply_effects(&[Effect::Savepoint]);
+        p.after_statement(StatusFlags::AUTOCOMMIT);
+        assert!(p.is_empty());
+        // SET autocommit = 1 commits.
+        p.apply_effects(&[Effect::Savepoint]);
+        p.after_statement(StatusFlags::empty());
+        p.after_statement(StatusFlags::AUTOCOMMIT);
+        assert!(p.is_empty());
     }
 
     #[test]

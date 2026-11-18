@@ -188,7 +188,9 @@ jobs:
           deploy/compose/gateway-dev.sh up
           deploy/compose/studio/e2e.sh setup
       - name: Playwright (installed Google Chrome)
-        run: deploy/compose/studio/e2e.sh run
+        # Only the chromium project: it uses the runner's installed Chrome. The firefox
+        # and webkit projects need Playwright's own browser builds, which CI doesn't download.
+        run: deploy/compose/studio/e2e.sh run --project chromium
       - uses: actions/upload-artifact@v4
         if: always()
         with:

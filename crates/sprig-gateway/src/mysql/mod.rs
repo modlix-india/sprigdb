@@ -26,6 +26,7 @@ pub mod dispatch;
 pub mod listener_hooks;
 pub(crate) mod local;
 pub mod login;
+pub mod rsa;
 pub mod settings;
 pub(crate) mod sink;
 pub(crate) mod watch;
@@ -167,6 +168,14 @@ impl MySqlStack {
     pub fn start(cfg: StackConfig, stop: sprig_common::CancellationToken) -> Result<Self> {
         let mut tasks = Vec::new();
         let login = cfg.login;
+        // The RSA key for logins without TLS: generated now, unless
+        // tls.caching_sha2_rsa_key names a file.
+        if FrontendSettings::read(&cfg.live, &cfg.dc)
+            .rsa_key_path
+            .is_empty()
+        {
+            rsa::start_generating();
+        }
         let hooks = ListenerHooks::new();
         tasks.push(hooks.spawn_follower(cfg.live.clone(), cfg.dc.clone(), stop));
         let settings = SettingsSource::Live {
@@ -454,12 +463,20 @@ async fn login_phase(
         ))
         .await;
     let (verdict, nonce, seq) = {
+        // The RSA key only matters without TLS (the full path's
+        // encrypted password).
+        let rsa = if tls {
+            None
+        } else {
+            rsa::key_for(&settings.rsa_key_path).await
+        };
         let mut raw = RawIo::new(&mut conn.stream, seq);
         let mut io = AuthIo {
             io: &mut raw,
             persona,
             tls,
             nonce,
+            rsa,
         };
         let v = authenticate(
             &mut io,

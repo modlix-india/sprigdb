@@ -1328,8 +1328,9 @@ async fn open_change_stream(
         bs,
         c.shared.settings().max_cursors,
     )?;
-    // MongoDB 9.0's option counters.
+    // MongoDB 9.0's option counters; the (empty) first batch.
     super::status::stream_options(stage, body);
+    super::status::stream_returned(&[]);
     Ok(
         doc! {"cursor": {"firstBatch": [], "postBatchResumeToken": token_doc(&token), "id": id, "ns": ns}, "ok": 1.0},
     )
@@ -1810,6 +1811,7 @@ async fn exec_cmd(
                 } else {
                     id
                 };
+                super::status::stream_returned(&batch);
                 return Ok(
                     doc! {"cursor": {"nextBatch": batch.into_iter().map(Bson::Document).collect::<Vec<_>>(), "postBatchResumeToken": super::changes::token_doc(&token), "id": rid, "ns": ns}, "ok": 1.0},
                 );
@@ -2180,7 +2182,7 @@ async fn explain(
         Some(d) => Ok(d),
         None => Err(MongoError::new(
             code::SPRIG_DOC_FEATURE_UNSUPPORTED,
-            "explain is supported for find, aggregate, count, distinct, update and delete in this release",
+            "explain is supported for find, aggregate, count, distinct, update, delete and findAndModify in this release",
         )),
     }
 }

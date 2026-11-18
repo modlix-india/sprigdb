@@ -796,6 +796,7 @@ impl CommandLoop {
                 persona,
                 tls: self.proto.is_tls(),
                 nonce: self.proto.nonce,
+                rsa: super::rsa::key(self.proto.is_tls(), &self.shared.cfg.settings).await,
             };
             let v = authenticate(
                 &mut io,

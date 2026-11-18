@@ -62,6 +62,7 @@ use sprig_auth::authz::account_sql::{
 };
 use sprig_auth::authz::authorizer::{
     self as engines, Dropped, Renamed, SettingsDenied, SettingsOp, Subject, row_filter_unsupported,
+    row_policy_ddl_refused,
 };
 use sprig_auth::authz::backend::{self, BackendKey};
 use sprig_auth::authz::definers;
@@ -1039,7 +1040,16 @@ impl CheckCtx<'_> {
             if self.p.row_filter(target, a).is_some()
                 && !matches!(target, Target::Object { object, .. } if self.covered.contains(&object))
             {
-                return Err(row_filter_unsupported(name));
+                return Err(
+                    if matches!(
+                        a,
+                        Action::Alter | Action::Index | Action::Drop | Action::Create
+                    ) {
+                        row_policy_ddl_refused(name)
+                    } else {
+                        row_filter_unsupported(name)
+                    },
+                );
             }
             return Ok(());
         }

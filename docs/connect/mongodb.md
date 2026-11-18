@@ -199,7 +199,7 @@ db.getSiblingDB("admin").createUser({
 | Collections and databases | `create`, `drop`, `dropDatabase`, `listDatabases`, `listCollections`, `renameCollection`, `collMod`, `convertToCapped`, `cloneCollectionAsCapped`, `dbStats`, `collStats` | yes; `renameCollection` within one database only |
 | Indexes | `createIndexes`, `listIndexes`, `dropIndexes` | partly; see [Indexes](#indexes). `collMod` changes a TTL index's `expireAfterSeconds` |
 | Search and vector indexes | `createSearchIndexes`, `updateSearchIndex`, `dropSearchIndex` | yes; see [Search](../data-models/search.md) and [Vectors](../data-models/vectors.md) |
-| `explain` | for `find`, `aggregate`, `count`, `distinct`, `update`, `delete` | yes; other commands answer 39662 |
+| `explain` | for `find`, `aggregate`, `count`, `distinct`, `update`, `delete`, `findAndModify` | yes; other commands answer 39662 |
 | Users and roles | see [above](#users-and-roles) | partly |
 | Query settings | `setQuerySettings`, `removeQuerySettings`, `$querySettings`, `$queryStats` | yes |
 | SprigDB extensions | `sprigCall` (logic functions), `sprigCreatePolicy`, `sprigDropPolicy`, `sprigRowSecurity` | yes |
@@ -252,7 +252,7 @@ Multi-document transactions work through the drivers' session API, across collec
 
 ### Change streams
 
-`watch()` on a collection, a database or the whole deployment works, with `fullDocument`, `fullDocumentBeforeChange`, `resumeAfter`, `startAfter`, `startAtOperationTime` and `showExpandedEvents`. `startAtOperationTime` leaves out events stamped before the time; a time older than the feed's time index reaches back, or than the tenant's last move to another cluster, fails with 286 `ChangeStreamHistoryLost`, labelled `NonResumableChangeStreamError` (see [Change feed](../concepts/change-feed.md#starting-at-a-point-in-time)). A stream at a gateway outside the tenant's home data centre is relayed from there, with the same events and resume tokens (see [Change feed](../concepts/change-feed.md#from-another-data-centre)). A stream needs `find` and `changeStream` on what it watches: in SprigDB's terms `SELECT` and `WATCH`. The built-in `read` and `readWrite` roles include both; see [Grants and roles](../security/grants-and-roles.md#change-streams-need-watch). See [Documents](../data-models/documents.md#change-streams).
+`watch()` on a collection, a database or the whole deployment works, with `fullDocument`, `fullDocumentBeforeChange`, `resumeAfter`, `startAfter`, `startAtOperationTime` and `showExpandedEvents`. `startAtOperationTime` leaves out events stamped before the time; a time older than the feed's time index reaches back, or than the tenant's last move to another cluster, fails with 286 `ChangeStreamHistoryLost`, labelled `NonResumableChangeStreamError` (see [Change feed](../concepts/change-feed.md#starting-at-a-point-in-time)). A stream at a gateway outside the tenant's home data centre is relayed from there, with the same events and resume tokens (see [Change feed](../concepts/change-feed.md#from-another-data-centre)). A stream needs `find` and `changeStream` on what it watches: in SprigDB's terms `SELECT` and `WATCH`. The built-in `read` and `readWrite` roles include both; see [Grants and roles](../security/grants-and-roles.md#change-streams-need-watch). An event larger than 16,793,600 bytes ends its stream with 10334 `BSONObjectTooLarge`, as in MongoDB. `serverStatus` counts change-stream batches, events and bytes under `metrics.changeStreams`. See [Documents](../data-models/documents.md#change-streams).
 
 ## Not supported
 
@@ -290,7 +290,7 @@ MongoDB clients receive MongoDB's codes and `codeName`s, and SprigDB's own error
 | 263 | `OperationNotSupportedInTransaction` | A command that can't run in a transaction |
 | 292 | `QueryExceededMemoryLimitNoDiskUseAllowed` | A blocking stage ran out of memory with `allowDiskUse: false` |
 | 509 | `TooManyOpenTransactions` | More than `mongo.max_open_transactions` on the gateway |
-| 10334 | `BSONObjectTooLarge` | A document over 16 MiB |
+| 10334 | `BSONObjectTooLarge` | A document over 16 MiB, or a change-stream event over 16,793,600 bytes |
 | 11000 | `DuplicateKey` | A unique index refused the write |
 | 39630 | `SprigCursorLimit` | More than `mongo.max_cursors_per_tenant` cursors open |
 | 39660 | `SprigDocIdTooLong` | An encoded `_id` over 1,024 bytes |

@@ -170,8 +170,15 @@ impl GroupMapIo {
 
     /// Replaces the held sources with the targets (the flip). The
     /// sources must be contiguous and held by `me`; the targets must cover
-    /// exactly their union.
-    fn flip(&self, m: &mut ShardMap, idx: &[usize], me: &str) -> Result<()> {
+    /// exactly their union. `read_fence` is the target position after the
+    /// job's last write, which reads of the new ranges wait for on replicas.
+    fn flip(
+        &self,
+        m: &mut ShardMap,
+        idx: &[usize],
+        me: &str,
+        read_fence: Option<&str>,
+    ) -> Result<()> {
         let mut idx = idx.to_vec();
         idx.sort_unstable();
         if idx.windows(2).any(|w| w[1] != w[0] + 1) {
@@ -217,6 +224,7 @@ impl GroupMapIo {
                 state: RangeState::Serving,
                 job_id: Some(me.to_owned()),
                 hold_until_ms: None,
+                read_fence: read_fence.map(str::to_owned),
             })
             .collect();
         m.ranges.splice(first..=last, new);
@@ -247,7 +255,10 @@ impl GroupMapIo {
                     Found::Sources(i) => i,
                 };
                 let from = m.ranges[idx[0]].cluster.clone();
-                self.flip(&mut m, &idx, &me)?;
+                let fence = handoff
+                    .map(|h| h.start.to_string())
+                    .filter(|f| !f.is_empty());
+                self.flip(&mut m, &idx, &me, fence.as_deref())?;
                 m.version += 1;
                 m.validate()?;
                 let mut then = vec![Op::Put {
@@ -533,6 +544,12 @@ mod tests {
         assert_eq!(m.next_shard_id, 4);
         let shards: Vec<(u64, u32)> = m.ranges.iter().map(|r| (r.lo, r.shard.0)).collect();
         assert_eq!(shards, vec![(0, 2), (HALF, 3)]);
+        // Reads of the new shards wait for the job's last write on replicas.
+        assert!(
+            m.ranges
+                .iter()
+                .all(|r| r.read_fence.as_deref() == Some("1-1-9"))
+        );
         assert_eq!(
             ownership::history(&s, TenantId(3), 2).await.unwrap().len(),
             1

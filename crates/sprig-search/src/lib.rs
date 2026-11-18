@@ -39,6 +39,7 @@ pub mod ft;
 pub mod ft_agg;
 pub mod ft_query;
 pub mod highlight;
+pub mod mongo_score;
 pub mod partition;
 pub mod placement;
 pub mod query;

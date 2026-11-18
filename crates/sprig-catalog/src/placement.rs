@@ -64,6 +64,14 @@ pub struct MapRange {
     /// milliseconds since the Unix epoch, even if the hold isn't cleared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_until_ms: Option<u64>,
+    /// After a move into this range's cluster: the cluster writer's GTID
+    /// position once the mover's last write had committed there. The
+    /// mover writes the copied rows itself, outside any client session, so
+    /// no session's read-your-writes position names them: a read of the
+    /// range must not go to a replica that hasn't applied this position.
+    /// `None` when the range wasn't moved, or was moved without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_fence: Option<String>,
 }
 
 /// A shard map record.
@@ -119,6 +127,7 @@ impl ShardMap {
                 state: RangeState::Serving,
                 job_id: None,
                 hold_until_ms: None,
+                read_fence: None,
             }],
         }
     }

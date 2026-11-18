@@ -370,6 +370,7 @@ fn map_of(e: &Env, g: &Grp, version: u64, shards: &[Sh], next: u32) -> ShardMap 
                 state: RangeState::Serving,
                 job_id: None,
                 hold_until_ms: None,
+                read_fence: None,
             })
             .collect(),
     }
@@ -4028,6 +4029,7 @@ async fn split(
                 state: RangeState::Serving,
                 job_id: Some("r1finish-split".into()),
                 hold_until_ms: None,
+                read_fence: None,
             },
         );
     }

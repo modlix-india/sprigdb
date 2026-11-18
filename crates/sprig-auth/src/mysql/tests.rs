@@ -360,6 +360,7 @@ pub(crate) async fn run_first(
             persona,
             tls,
             nonce: NONCE,
+            rsa: None,
         };
         let v = authenticate(
             &mut io,

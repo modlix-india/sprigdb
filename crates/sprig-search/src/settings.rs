@@ -107,3 +107,8 @@ key!(
     OVERFETCH_FACTOR: u64 = "search.overfetch_factor", 3, HardBounds::range(1, 100),
     "Page multiplier for residual filters and facets"
 );
+key!(
+    /// `search.like_acceleration`.
+    LIKE_ACCELERATION: bool = "search.like_acceleration", false, HardBounds::NONE,
+    "Serve infix LIKE from SUBSTRING fields of search indexes"
+);

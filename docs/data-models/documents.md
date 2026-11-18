@@ -440,6 +440,37 @@ A stream needs `SELECT` and `WATCH` (MongoDB's `find` and `changeStream`) on wha
 
 Documents deleted by a [TTL index](#ttl-indexes) appear as `delete` events.
 
+### Large events
+
+An event can be larger than the document it describes: an update event with `fullDocument` holds the update and the whole document. An event over 16,793,600 bytes (MongoDB's limit, 16 MiB plus 16 KiB) ends its stream with 10334 `BSONObjectTooLarge`, as in MongoDB:
+
+```text
+MongoServerError[BSONObjectTooLarge]: Executor error during getMore :: caused by :: BSONObj size: 24000441 (0x16E37B9) is invalid. Size must be between 0 and 16793600(16MB)
+```
+
+To avoid it, leave out the large fields with a `$project` stage, or stop asking for `fullDocument`. `$changeStreamSplitLargeEvent`, which splits such events into fragments, isn't supported yet.
+
+### Change-stream counters
+
+`serverStatus` counts change-stream activity on the gateway you're connected to, since it started, under `metrics.changeStreams`:
+
+| Field | Counts |
+|---|---|
+| `cursor.open.total`, `cursor.totalOpened`, `cursor.lifespan` | Open streams, streams opened, and how long closed ones lived |
+| `cursor.batchesReturned` | Batches sent to clients: each first batch and each `getMore` |
+| `cursor.docsReturned`, `cursor.bytesReturned` | Events sent to clients, and their BSON bytes |
+| `cursor.docsExamined`, `cursor.bytesRead` | Events streams read, and their bytes, before the streams' own pipeline stages |
+| `largeEventsFailed` | Streams ended by an event over the limit |
+| `largeEventsSplit` | Always `0`: events aren't split |
+| `error.nonRetriable.bsonObjectTooLarge` and the other `error.*` fields | Errors that ended streams, by kind |
+| `option.*` | Streams opened with each option, such as `fullDocument.updateLookup` |
+
+```js
+db.adminCommand({ serverStatus: 1 }).metrics.changeStreams.cursor
+```
+
+Events that row-level security hides from a user never reach that user's stream, so they aren't counted.
+
 ## Capped collections
 
 ```js
@@ -496,17 +527,34 @@ See [REST and gRPC](../connect/rest-and-grpc.md) and the [REST API reference](..
 
 | Command | What it does |
 |---|---|
-| `explain` | For `find`, `aggregate`, `count`, `distinct`, `update` and `delete`: MongoDB's `queryPlanner` and `executionStats`, built from MariaDB's plan, plus the SQL statements and their MariaDB plans under `sprig`. Other commands give 39662 |
+| `explain` | For `find`, `aggregate`, `count`, `distinct`, `update`, `delete` and `findAndModify`: MongoDB's `queryPlanner` and `executionStats`, built from MariaDB's plan, plus the SQL statements and their MariaDB plans under `sprig`. That is every command MongoDB explains, except `mapReduce`, which SprigDB doesn't offer. Other commands give 39662. See [Explain `findAndModify`](#explain-findandmodify) |
 | `sprigCreatePolicy`, `sprigDropPolicy`, `sprigRowSecurity` | Row-level security policies on a collection, with MongoDB filters; see [Row-level security](../security/row-level-security.md) |
 | `sprigCall` | Calls a logic function exposed to MongoDB: `db.runCommand({sprigCall: "quote", args: [7, 3]})`. Inside a transaction the call joins it; a failed validation answers 121. See [Logic](logic.md) |
 | `setQuerySettings`, `removeQuerySettings` | MongoDB's query settings, such as `reject` and `indexHints` |
 | `shardCollection`, `enableSharding` | Accepted and recorded as a hint only; SprigDB shards collections itself |
+
+### Explain `findAndModify`
+
+`explain` of `findAndModify` covers updates, removes and upserts. It never writes:
+
+```js
+db.runCommand({
+  explain: { findAndModify: "events", query: { _id: 2 }, update: { $set: { seen: true } } },
+  verbosity: "executionStats"
+})
+```
+
+- **The plan.** `winningPlan` is an `UPDATE` or `DELETE` stage over a `LIMIT` (`limitAmount: 1`) over the stages that find the document by `query` and `sort`. On a collection that doesn't exist, it is `EOF`.
+- **The counts.** With `executionStats`, the read runs: `nReturned` is the document found, and `nMatched` and `nWouldUpsert` (for an update) or `nWouldDelete` (for a remove) say what the command would do. The write it would send is listed in `queryPlanner.sprig.statements` with MariaDB's plan, marked `write (not sent)`, but isn't run.
+- **Not reported:** `nWouldModify`, whether the update would change the document. This is the same as for `explain` of `update`.
+- **Row policies apply.** The read runs in your session, so a user bound by a row policy matches only documents that user may see.
 
 ## Limits
 
 | Limit | Value | Error |
 |---|---|---|
 | Document size | 16 MiB of BSON | 10334 `BSONObjectTooLarge` |
+| Change-stream event | 16,793,600 bytes of BSON | 10334 `BSONObjectTooLarge`; the stream ends |
 | Nesting depth | 32 levels | 39665 `SprigDocTooDeep` |
 | Encoded `_id` | 1,024 bytes | 39660 `SprigDocIdTooLong` |
 | Duplicate field names, invalid UTF-8 | refused | 2 `BadValue` |
@@ -534,6 +582,7 @@ The nesting limit is lower than MongoDB's 100 because MariaDB's JSON functions h
 | The `$slice` aggregation expression | `$slice` works in projections and `$push` only |
 | `$merge` on fields other than `_id`, or with a pipeline in `whenMatched` | 39662 |
 | Typed collections and type inheritance | Inheritance works on SQL tables; see [Inheritance](inheritance.md) |
+| `$changeStreamSplitLargeEvent` | 9 `FailedToParse`; see [Large events](#large-events) |
 
 ## Related
 

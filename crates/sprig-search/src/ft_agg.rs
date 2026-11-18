@@ -14,7 +14,8 @@
 //! `RANDOM_SAMPLE` (the first values here). Expressions have Redis Search's
 //! operators and the functions listed in [`call`]. Numbers print as C's
 //! `%.12g`, as Redis Search prints them. A `SORTBY` without `MAX` keeps the
-//! first 10 rows unless a `LIMIT` follows, as Redis does. `WITHCURSOR` answers 39823.
+//! first 10 rows unless a `LIMIT` follows, as Redis does. `WITHCURSOR` pages the rows
+//! through `FT.CURSOR` (the gateway keeps them).
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
@@ -649,6 +650,38 @@ pub struct Plan {
     pub dialect: u32,
     /// `VERBATIM`.
     pub verbatim: bool,
+    /// `WITHCURSOR [COUNT n] [MAXIDLE ms]`.
+    pub cursor: Option<CursorOpts>,
+}
+
+/// `WITHCURSOR`'s options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorOpts {
+    /// Rows per read (`COUNT`, 1000 by default).
+    pub count: usize,
+    /// How long an unread cursor lives, in milliseconds (`MAXIDLE`,
+    /// at most and by default 300,000).
+    pub max_idle_ms: u64,
+}
+
+/// The longest `MAXIDLE` (Redis's default `CURSOR_MAX_IDLE`).
+pub const CURSOR_MAX_IDLE_MS: u64 = 300_000;
+
+/// A positive number for `COUNT` or `MAXIDLE`, worded as Redis words it.
+///
+/// # Errors
+/// 39822 when `a` isn't a number of at least 1.
+pub fn cursor_number(a: Option<&[u8]>, what: &str) -> Result<u64> {
+    let t = a.map(text).unwrap_or_default();
+    match t.parse::<i64>() {
+        Ok(n) if n >= 1 => Ok(n.unsigned_abs()),
+        Ok(_) => Err(syntax(format!(
+            "SEARCH_PARSE_ARGS Bad arguments for {what}: Value is outside acceptable bounds"
+        ))),
+        Err(_) => Err(syntax(format!(
+            "SEARCH_PARSE_ARGS Bad arguments for {what}: Value is not an integer"
+        ))),
+    }
 }
 
 const REDUCERS: &[&str] = &[
@@ -675,7 +708,7 @@ fn field_name(a: &[u8]) -> String {
 /// Expressions are parsed after `PARAMS` is known.
 ///
 /// # Errors
-/// 39822 for malformed steps, 39823 for `WITHCURSOR`.
+/// 39822 for malformed steps.
 pub fn parse_plan(a: &[&[u8]]) -> Result<Plan> {
     let mut plan = Plan {
         load: None,
@@ -683,6 +716,7 @@ pub fn parse_plan(a: &[&[u8]]) -> Result<Plan> {
         params: Vec::new(),
         dialect: 1,
         verbatim: false,
+        cursor: None,
     };
     // Expressions wait for PARAMS, which may come last.
     let mut pending: Vec<(usize, String, Option<String>)> = Vec::new();
@@ -845,10 +879,27 @@ pub fn parse_plan(a: &[&[u8]]) -> Result<Plan> {
                 i += 1;
             }
             "WITHCURSOR" => {
-                return Err(SprigError::new(
-                    SprigCode::SearchUnsupported,
-                    "FT.AGGREGATE WITHCURSOR is not supported",
-                ));
+                let mut c = CursorOpts {
+                    count: 1000,
+                    max_idle_ms: CURSOR_MAX_IDLE_MS,
+                };
+                loop {
+                    match a.get(i + 1).map(|x| upper(x)).as_deref() {
+                        Some("COUNT") => {
+                            c.count =
+                                usize::try_from(cursor_number(a.get(i + 2).copied(), "COUNT")?)
+                                    .unwrap_or(usize::MAX);
+                            i += 2;
+                        }
+                        Some("MAXIDLE") => {
+                            c.max_idle_ms = cursor_number(a.get(i + 2).copied(), "MAXIDLE")?
+                                .min(CURSOR_MAX_IDLE_MS);
+                            i += 2;
+                        }
+                        _ => break,
+                    }
+                }
+                plan.cursor = Some(c);
             }
             other => return Err(syntax(format!("Unknown argument `{other}`"))),
         }
@@ -1218,8 +1269,21 @@ mod tests {
         );
         assert!(parse_expr("nosuch(1)", &[]).is_err());
         assert!(parse_expr("1 +", &[]).is_err());
-        let bad = args("WITHCURSOR");
-        let refs: Vec<&[u8]> = bad.iter().map(Vec::as_slice).collect();
-        assert!(parse_plan(&refs).is_err());
+        let plan_of = |s: &str| {
+            let a = args(s);
+            let refs: Vec<&[u8]> = a.iter().map(Vec::as_slice).collect();
+            parse_plan(&refs)
+        };
+        let c = plan_of("LOAD 1 @a WITHCURSOR").unwrap().cursor.unwrap();
+        assert_eq!((c.count, c.max_idle_ms), (1000, CURSOR_MAX_IDLE_MS));
+        let p = plan_of("WITHCURSOR COUNT 5 MAXIDLE 900000 LIMIT 0 3").unwrap();
+        let c = p.cursor.unwrap();
+        assert_eq!((c.count, c.max_idle_ms), (5, CURSOR_MAX_IDLE_MS));
+        assert_eq!(p.steps, vec![Step::Limit(0, 3)]);
+        assert_eq!(
+            plan_of("WITHCURSOR COUNT 0").unwrap_err().message,
+            "SEARCH_PARSE_ARGS Bad arguments for COUNT: Value is outside acceptable bounds"
+        );
+        assert!(plan_of("WITHCURSOR MAXIDLE x").is_err());
     }
 }

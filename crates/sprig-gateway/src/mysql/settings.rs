@@ -110,6 +110,21 @@ pub static RELAY_BUFFER_KB: Setting<u64> = Setting {
 };
 sprig_settings::register!(RELAY_BUFFER_KB);
 
+/// `tls.caching_sha2_rsa_key`.
+pub static CACHING_SHA2_RSA_KEY: Setting<Text> = Setting {
+    key: "tls.caching_sha2_rsa_key",
+    default: Cow::Borrowed(""),
+    scopes: Scopes::PROCESS,
+    hard: HardBounds::NONE,
+    apply: Apply::NewSessions,
+    operator_only: false,
+    owner: 5,
+    doc: "PEM RSA private key file (PKCS#1 or PKCS#8) for caching_sha2_password logins without TLS; \
+          the same file on every gateway of a DC; empty: each gateway generates its own at start; \
+          watched for changes",
+};
+sprig_settings::register!(CACHING_SHA2_RSA_KEY);
+
 /// What one connection reads from the settings when its greeting is built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrontendSettings {
@@ -129,6 +144,8 @@ pub struct FrontendSettings {
     pub relay_buffer: usize,
     /// `gateway.large_statement_bytes` ([`crate::offload`]).
     pub large_statement: usize,
+    /// `tls.caching_sha2_rsa_key` ([`super::rsa`]).
+    pub rsa_key_path: String,
 }
 
 impl Default for FrontendSettings {
@@ -142,6 +159,7 @@ impl Default for FrontendSettings {
             compression: CompressionOffer::parse(&COMPRESSION.default),
             relay_buffer: to_usize(RELAY_BUFFER_KB.default) * 1024,
             large_statement: to_usize(crate::offload::LARGE_STATEMENT_BYTES.default),
+            rsa_key_path: String::new(),
         }
     }
 }
@@ -174,6 +192,7 @@ impl FrontendSettings {
             compression: CompressionOffer::parse(&snap.get(&COMPRESSION, &ctx)),
             relay_buffer: to_usize(snap.get(&RELAY_BUFFER_KB, &ctx)).saturating_mul(1024),
             large_statement: to_usize(snap.get(&crate::offload::LARGE_STATEMENT_BYTES, &ctx)),
+            rsa_key_path: snap.get(&CACHING_SHA2_RSA_KEY, &ctx).into_owned(),
         }
     }
 }

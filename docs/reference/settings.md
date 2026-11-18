@@ -9,7 +9,7 @@ source: the settings registry (sprig-settings)
 
 Every setting SprigDB declares, with its default, the scopes that may set it, hard bounds and when a change applies. Settings resolve from the most specific scope: object, database, tenant and its ancestors, cluster, data center, global, then the built-in default. Read them with `SHOW SPRIG SETTINGS`, change them with `ALTER TENANT|DATABASE|TABLE … SPRIG SET (key = value)` or `sprigctl settings`.
 
-754 settings in 61 groups.
+755 settings in 61 groups.
 
 ## `advisor`
 
@@ -857,6 +857,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `search.default_consistency` | text | `stale_ok` | dc, global | - | live | stale_ok, own_writes or latest |
 | `search.fulltext_ddl` | text | `convert` | dc, global | - | live | MySQL FULLTEXT DDL: convert, mariadb or reject |
 | `search.highlight_chars` | int | `150` | dc, global | 20 to 10000 | live | Fragment length |
+| `search.like_acceleration` | bool | `false` | dc, global | - | live | Serve infix LIKE from SUBSTRING fields of search indexes |
 | `search.max_expansions` | int | `50` | dc, global | 1 to 10000 | live | Terms per fuzzy or prefix term |
 | `search.max_indexes_per_object` | int | `4` | dc, global | 1 to 64 | live | Search indexes per object |
 | `search.max_window` | int | `10000` | dc, global | 1 to 10000000 | live | Hits read per query |
@@ -1012,6 +1013,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `tls.bundles.default.cert_path` | text | `` | dc, global | - | live | PEM certificate chain of the default bundle, leaf first; watched for changes |
 | `tls.bundles.default.client_ca_path` | text | `` | dc, global | - | rebind | PEM CA certificates that sign client certificates (listener.<name>.client_cert); watched for changes |
 | `tls.bundles.default.key_path` | text | `` | dc, global | - | live | PEM private key of the default bundle; watched for changes |
+| `tls.caching_sha2_rsa_key` | text | `` | dc, global | - | new sessions | PEM RSA private key file (PKCS#1 or PKCS#8) for caching_sha2_password logins without TLS; the same file on every gateway of a DC; empty: each gateway generates its own at start; watched for changes |
 | `tls.min_version` | text | `1.2` | dc, global | 1.2, 1.3 | rebind | Lowest TLS version client listeners accept |
 
 ## `txn`

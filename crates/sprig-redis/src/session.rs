@@ -323,6 +323,162 @@ impl Session {
         frames
     }
 
+    /// The commands at the head of `cmds` that run as one group
+    /// ([`crate::batch::Group`]): two or more guarded writes and `GET`s in
+    /// a row, within the group's caps. `None`: the first runs alone.
+    #[must_use]
+    pub fn group(&self, cmds: &[Command]) -> Option<crate::batch::Group> {
+        use crate::batch::{GROUP_MAX_BYTES, GROUP_MAX_COMMANDS, Item};
+        let login = self.login.as_ref()?;
+        if cmds.len() < 2
+            || self.multi.is_some()
+            || (self.subscribed() && self.proto == Proto::Resp2)
+        {
+            return None;
+        }
+        let cfg = self.env.config();
+        if !cfg.guarded_batches {
+            return None;
+        }
+        let ns = self
+            .ns_override
+            .clone()
+            .unwrap_or_else(|| sprig_kv::Namespace::redis(&cfg.logical_database, self.db));
+        // Writes need every reply's rows back from one statement, and a
+        // database whose router refused a group (sharded) keeps its
+        // writes one by one.
+        let writes = login.sql.multi_results() && !self.env.group_refused(&login.scope, &ns);
+        let mut items = Vec::new();
+        let mut bytes = 0;
+        for c in cmds.iter().take(GROUP_MAX_COMMANDS) {
+            let Some(first) = c.args.first() else {
+                break;
+            };
+            let name = String::from_utf8_lossy(first).to_ascii_lowercase();
+            let Some(spec) = spec::lookup(&name) else {
+                break;
+            };
+            if !spec.arity_ok(c.args.len()) {
+                break;
+            }
+            bytes += c.args.iter().map(Bytes::len).sum::<usize>();
+            if bytes > GROUP_MAX_BYTES {
+                break;
+            }
+            let item = if name == "get" {
+                Item::Get(c.args[1].clone())
+            } else if writes
+                && spec.has('w')
+                && crate::keyspace::covered(&name)
+                && let Some(p) = crate::batch::plan(&ns, &name, &c.args)
+            {
+                Item::Write(p)
+            } else {
+                break;
+            };
+            items.push(item);
+        }
+        (items.len() >= 2).then_some(crate::batch::Group { items })
+    }
+
+    /// Runs `g`, the group [`Session::group`] made of the first commands
+    /// of `cmds`: their replies, in order, once the group has committed.
+    /// When the group fails with an error that rolled it back (a deadlock,
+    /// a lost race for a new key, a router that can't place it), its
+    /// commands run again one by one, each as it would alone.
+    pub async fn handle_group(
+        &mut self,
+        g: &crate::batch::Group,
+        cmds: &[Command],
+    ) -> Vec<Vec<Frame>> {
+        let n = g.items.len();
+        let env = Arc::clone(&self.env);
+        let cfg = env.config();
+        let db = self.db;
+        let ns = self
+            .ns_override
+            .clone()
+            .unwrap_or_else(|| sprig_kv::Namespace::redis(&cfg.logical_database, db));
+        let writes = g.writes();
+        let ensured = self.ensure_db(db).await;
+        let outcome = match (ensured, self.login.as_mut()) {
+            (Ok(()), Some(login)) => {
+                let sql = g.sql(&ns);
+                if writes {
+                    login.sql.notified(true);
+                }
+                let r = if sql.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    login.sql.query(&sql).await
+                };
+                if writes {
+                    login.sql.notified(false);
+                }
+                if r.is_err() && writes {
+                    let _ = login.sql.exec("ROLLBACK").await;
+                }
+                Some((r, login.scope.clone()))
+            }
+            _ => None,
+        };
+        let (rows, scope) = match outcome {
+            Some((Ok(rows), scope)) => (rows, scope),
+            Some((Err(e), scope)) => {
+                // The router can't place a group on this database
+                // (sharded): its writes run one by one from now on.
+                if e.errno == Some(39420) {
+                    env.set_group_refused(&scope, &ns);
+                }
+                // MariaDB's own errors come from inside the statement,
+                // whose handler rolled the group back; so does the
+                // router's refusal, before sending. Anything else (a lost
+                // connection) leaves the outcome unknown: no rerun.
+                let rolled_back = matches!(e.errno, Some(1000..=1999 | 3000..=4999 | 39420));
+                if !rolled_back {
+                    return (0..n).map(|_| vec![reply::backend(&e)]).collect();
+                }
+                let mut out = Vec::with_capacity(n);
+                for c in &cmds[..n] {
+                    out.push(Box::pin(self.handle(c.clone())).await);
+                }
+                return out;
+            }
+            None => {
+                let mut out = Vec::with_capacity(n);
+                for c in &cmds[..n] {
+                    out.push(Box::pin(self.handle(c.clone())).await);
+                }
+                return out;
+            }
+        };
+        let replies = g.replies(&rows);
+        if writes {
+            let flags =
+                crate::keyspace::parse_flags(env.keyspace_flags(&scope).as_bytes()).unwrap_or(0);
+            for ((item, (f, pushed)), c) in g.items.iter().zip(&replies).zip(cmds) {
+                let crate::batch::Item::Write(p) = item else {
+                    continue;
+                };
+                if *pushed {
+                    env.wake(&scope, db, p.key());
+                }
+                if flags != 0 {
+                    Self::notify(
+                        Arc::clone(&env),
+                        scope.clone(),
+                        db,
+                        &c.args,
+                        None,
+                        std::slice::from_ref(f),
+                    )
+                    .await;
+                }
+            }
+        }
+        replies.into_iter().map(|(f, _)| vec![f]).collect()
+    }
+
     /// Publishes the keyspace events of a command that answered `frames`
     /// (EXEC's: `queued` with its replies), under tenant `scope`'s flags.
     async fn notify(
@@ -2003,12 +2159,14 @@ impl Session {
         };
         let database = env.config().logical_database;
         let scope = login.scope.clone();
+        let user = login.user.clone();
         hook.ft(
             login.sql.as_mut(),
             crate::search::FtCall {
                 command: name,
                 args: &a[1..],
                 scope: &scope,
+                user: &user,
                 database: &database,
                 db,
                 resp3,

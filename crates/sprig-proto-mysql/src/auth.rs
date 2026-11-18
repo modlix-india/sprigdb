@@ -7,9 +7,13 @@
 //!   (an empty response or a single NUL, answered with the verdict at once),
 //!   the fast path (`AuthMoreData 0x03` then the verdict), and the full path
 //!   (`AuthMoreData 0x04`, then the clear-text password over TLS). Without TLS
-//!   the full path would need the server's RSA key; SprigDB has no RSA and
-//!   refuses it with [`Outcome::NeedsTls`], whether the client asks for the key
-//!   (`0x02`) or already has one.
+//!   the full path is the RSA exchange: the client asks for the server's
+//!   public key (`0x02`) and gets it in an `AuthMoreData`, or already has it
+//!   (`--server-public-key-path`), and sends its password encrypted with
+//!   RSA-OAEP. A clear-text password is never read without TLS: anything
+//!   that isn't a ciphertext of the server's key is refused with
+//!   [`Outcome::NeedsTls`], as is the whole path when the listener has no
+//!   key ([`AuthIo::rsa`]).
 //! - [`NativePassword`]: `mysql_native_password`, when the flow allows it.
 //! - [`ClearPassword`]: `mysql_clear_password`, refused with 3159 without
 //!   TLS.
@@ -23,6 +27,8 @@
 //!
 //! The verdict ([`AuthVerdict`]) comes back to the caller, which sends the
 //! OK packet (or the ERR) itself, since the OK carries session state.
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -104,8 +110,7 @@ pub enum AuthPath {
     Fast,
     /// `caching_sha2_password` full path over TLS.
     Full,
-    /// `caching_sha2_password` full path without TLS: the RSA exchange
-    /// (refused: SprigDB has no RSA).
+    /// `caching_sha2_password` full path without TLS: the RSA exchange.
     Rsa,
     /// `mysql_native_password`.
     Native,
@@ -135,8 +140,10 @@ pub enum Outcome {
     Verified,
     /// The credential didn't match (or the account doesn't exist).
     WrongCredentials,
-    /// The full path was needed without TLS, which needs the RSA exchange
-    /// (not supported; the client should use TLS).
+    /// The full path was needed without TLS, and the RSA exchange couldn't
+    /// run: the listener has no key, or the client sent something other than
+    /// a ciphertext of it (a clear-text password, never checked). The client
+    /// should use TLS.
     NeedsTls,
 }
 
@@ -182,6 +189,25 @@ pub trait LoginFlow: Send {
     async fn decide(&mut self, outcome: Outcome, path: AuthPath) -> AuthVerdict;
 }
 
+/// The server's RSA key pair for `caching_sha2_password`'s full path
+/// without TLS. The client encrypts `password || 0x00`, combined by XOR with the
+/// nonce repeated, with RSA-OAEP (SHA-1, MGF1-SHA-1, empty label), as
+/// MySQL 8.0.5 and later and MariaDB's Connector/C do.
+#[async_trait]
+pub trait ServerRsaKey: Send + Sync {
+    /// The public key as PEM (`-----BEGIN PUBLIC KEY-----`, X.509
+    /// `SubjectPublicKeyInfo`), sent to a client that asks for it.
+    fn public_pem(&self) -> Bytes;
+
+    /// The modulus length in bytes: every ciphertext is exactly this long.
+    fn size(&self) -> usize;
+
+    /// The RSA-OAEP plaintext of `ciphertext`, or `None` when it isn't a
+    /// valid ciphertext of this key. CPU-bound: implementations run it off
+    /// the async runtime.
+    async fn decrypt(&self, ciphertext: Bytes) -> Option<Zeroizing<Vec<u8>>>;
+}
+
 /// The connection an exchange runs on.
 pub struct AuthIo<'a> {
     /// The packet transport.
@@ -193,6 +219,9 @@ pub struct AuthIo<'a> {
     /// The nonce the client's scramble answers; replaced by a fresh one on
     /// an `AuthSwitchRequest`.
     pub nonce: [u8; NONCE_LEN],
+    /// The server's RSA key for the full path without TLS; `None` refuses
+    /// that path with [`Outcome::NeedsTls`]. Unused over TLS.
+    pub rsa: Option<Arc<dyn ServerRsaKey>>,
 }
 
 impl std::fmt::Debug for AuthIo<'_> {
@@ -200,6 +229,7 @@ impl std::fmt::Debug for AuthIo<'_> {
         f.debug_struct("AuthIo")
             .field("persona", &self.persona)
             .field("tls", &self.tls)
+            .field("rsa", &self.rsa.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -276,13 +306,74 @@ impl ServerAuthPlugin for CachingSha2Password {
         io.more_data(PERFORM_FULL_AUTHENTICATION).await?;
         let reply = io.io.read_packet().await?;
         if !io.tls {
-            // The client asks for the public key (0x02) or sends an RSA
-            // ciphertext: without RSA support, both are refused.
-            return Ok(flow.decide(Outcome::NeedsTls, AuthPath::Rsa).await);
+            return rsa_exchange(io, reply, flow).await;
         }
         let ok = flow.check_password(password_of(&reply)).await;
         Ok(flow.decide(verified(ok), AuthPath::Full).await)
     }
+}
+
+/// The full path without TLS, from the client's reply to `0x04`: the
+/// public-key request (`0x02`) answered with the PEM key, then the
+/// ciphertext; or the ciphertext at once (the client has the key).
+///
+/// A reply of any other length (a clear-text password, a key of another
+/// size) is refused with [`Outcome::NeedsTls`] and never checked. A
+/// ciphertext that doesn't decrypt to `password || 0x00` (combined by XOR with the
+/// nonce) costs the same hash work as a wrong password and gets the same
+/// error, so the answer doesn't tell a padding failure from a wrong
+/// password.
+async fn rsa_exchange(
+    io: &mut AuthIo<'_>,
+    reply: Bytes,
+    flow: &mut dyn LoginFlow,
+) -> ProtoResult<AuthVerdict> {
+    let Some(key) = io.rsa.clone() else {
+        return Ok(flow.decide(Outcome::NeedsTls, AuthPath::Rsa).await);
+    };
+    let ciphertext = if reply.as_ref() == [REQUEST_PUBLIC_KEY] {
+        let p = AuthMoreData {
+            data: key.public_pem(),
+        };
+        io.io.write_packet(p.encode()).await?;
+        io.io.read_packet().await?
+    } else {
+        reply
+    };
+    if ciphertext.len() != key.size() {
+        return Ok(flow.decide(Outcome::NeedsTls, AuthPath::Rsa).await);
+    }
+    let password = match key.decrypt(ciphertext).await {
+        Some(plain) => unscramble(&plain, &io.nonce),
+        None => None,
+    };
+    let Some(password) = password else {
+        // A random password: the decoy's hash work, never a match.
+        let _ = flow
+            .check_password(Zeroizing::new(new_nonce()?.to_vec()))
+            .await;
+        return Ok(flow.decide(Outcome::WrongCredentials, AuthPath::Rsa).await);
+    };
+    let ok = flow.check_password(password).await;
+    Ok(flow.decide(verified(ok), AuthPath::Rsa).await)
+}
+
+/// The password in an RSA plaintext: combined by XOR with the nonce repeated, then
+/// its terminating NUL removed. `None` without the NUL (MySQL refuses that
+/// too).
+fn unscramble(plain: &[u8], nonce: &[u8; NONCE_LEN]) -> Option<Zeroizing<Vec<u8>>> {
+    let mut p: Zeroizing<Vec<u8>> = Zeroizing::new(
+        plain
+            .iter()
+            .zip(nonce.iter().cycle())
+            .map(|(b, n)| b ^ n)
+            .collect(),
+    );
+    if p.last() != Some(&0) {
+        return None;
+    }
+    p.pop();
+    Some(p)
 }
 
 /// `mysql_native_password`.

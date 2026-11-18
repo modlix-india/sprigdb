@@ -83,6 +83,14 @@ pub(super) fn stored_rekey(design: &Value, evidence: &Value) -> Option<Proposal>
     all.into_iter().find(|p| u64::from(p.group) == g)
 }
 
+/// Whether a periodic run is due: never checked yet, its time has come, or
+/// `advisor.interval_hours` changed since the due time was computed (a
+/// shorter interval then takes effect at once, a longer one from the last
+/// run's time).
+fn periodic_due(next: Option<(Instant, Duration)>, every: Duration, now: Instant) -> bool {
+    next.is_none_or(|(t, was)| was != every || now >= t)
+}
+
 impl ShardingLoop {
     /// The periodic run when it is due (module docs). Returns whether it
     /// started a re-key (the tick then leaves the groups alone).
@@ -103,10 +111,8 @@ impl ShardingLoop {
         if let Some(started) = self.pending_rekey(tenant, ts, home).await? {
             return Ok(started);
         }
-        let due = lock(&self.state)
-            .get(&tenant)
-            .and_then(|s| s.next_periodic)
-            .is_none_or(|t| Instant::now() >= t);
+        let next = lock(&self.state).get(&tenant).and_then(|s| s.next_periodic);
+        let due = periodic_due(next, ts.rekey.every, Instant::now());
         if !due {
             return Ok(false);
         }
@@ -125,7 +131,7 @@ impl ShardingLoop {
         {
             let wait = ts.rekey.every.saturating_sub(Duration::from_secs(s));
             lock(&self.state).entry(tenant).or_default().next_periodic =
-                Some(Instant::now() + wait);
+                Some((Instant::now() + wait, ts.rekey.every));
             return Ok(false);
         }
         // No run while the tenant's layout moves.
@@ -139,7 +145,7 @@ impl ShardingLoop {
             return Ok(false);
         }
         lock(&self.state).entry(tenant).or_default().next_periodic =
-            Some(Instant::now() + ts.rekey.every);
+            Some((Instant::now() + ts.rekey.every, ts.rekey.every));
         let groups = Self::live_group_rows(&mut c, &cat).await?;
         drop(c);
         if groups.is_empty() {
@@ -576,5 +582,28 @@ impl ShardingLoop {
         )
         .await?;
         Ok(r.is_ok())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_changed_interval_is_checked_again_at_once() {
+        let now = Instant::now();
+        let day = Duration::from_secs(86_400);
+        let short = Duration::from_secs(10);
+        assert!(periodic_due(None, day, now), "never checked");
+        assert!(!periodic_due(Some((now + day, day)), day, now), "not yet");
+        assert!(
+            periodic_due(Some((now, day)), day, now + short),
+            "its time came"
+        );
+        // Lowered from a day to 10 s after a run: due now, and the check
+        // against the newest run's time decides.
+        assert!(periodic_due(Some((now + day, day)), short, now));
+        // Raised: checked again too (the newest run's time then defers it).
+        assert!(periodic_due(Some((now + short, short)), day, now));
     }
 }

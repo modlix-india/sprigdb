@@ -71,6 +71,19 @@ pub struct KeyRow {
     pub stored: bool,
 }
 
+/// A key row as [`Ctx::lock_set`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Locked {
+    /// The key.
+    pub k: Vec<u8>,
+    /// Its type.
+    pub t: KeyType,
+    /// Its generation.
+    pub g: u64,
+    /// Not expired.
+    pub live: bool,
+}
+
 /// A fresh version (`_v`): random, 63 bits, never 0. Versions only need to
 /// differ from the key's earlier ones (`WATCH`, compare-and-set).
 #[must_use]
@@ -280,6 +293,18 @@ impl<'a> Ctx<'a> {
         )
     }
 
+    /// [`Ctx::select_sql`]'s unlocked read with the key and its
+    /// distribution key as parameters (`?`, `?`).
+    fn select_bound_sql(ns: &Namespace) -> String {
+        format!(
+            "SELECT {NOW_MS_SQL}, {KEY_COLS}, {}, (t.expires_at IS NOT NULL AND t.expires_at <= UTC_TIMESTAMP(3)) \
+             FROM {} AS t WHERE t.k = ? AND t._sprig_dk = ? AND {}",
+            ms_sql("t.expires_at"),
+            ns.keys(),
+            live("t")
+        )
+    }
+
     /// MariaDB's clock (ms since the epoch): the last key read's, or, after
     /// a read of an absent key, read on `k`'s shard (one aggregate over the
     /// key table, so it routes like the key's statements).
@@ -374,6 +399,62 @@ impl<'a> Ctx<'a> {
             .collect())
     }
 
+    /// Locks the rows of `keys` (each at most 1024 bytes) with one
+    /// statement, in the index's (byte) order: what a multi-key write
+    /// needs of each, `None` for an absent key. Expired rows come back
+    /// (not live), not deleted.
+    ///
+    /// # Errors
+    /// The backend's.
+    pub async fn lock_set(&mut self, keys: &[&[u8]]) -> R<Vec<Option<Locked>>> {
+        let sql = format!(
+            "SELECT k, type, g, (expires_at IS NOT NULL AND expires_at <= UTC_TIMESTAMP(3)) \
+             FROM {} WHERE {} FOR UPDATE",
+            self.ns.keys(),
+            self.keys_in(keys)
+        );
+        let rows = self.q(&sql).await?;
+        let mut got: Vec<Locked> = rows
+            .iter()
+            .filter_map(|r| {
+                Some(Locked {
+                    k: r.first()?.clone()?,
+                    t: r.get(1)?.as_deref().and_then(KeyType::parse)?,
+                    g: cell_u64(r.get(2)?.as_ref()),
+                    live: cell_i64(r.get(3)?.as_ref()) == 0,
+                })
+            })
+            .collect();
+        Ok(keys
+            .iter()
+            .map(|k| {
+                got.iter()
+                    .position(|l| l.k.as_slice() == *k)
+                    .map(|i| got.swap_remove(i))
+            })
+            .collect())
+    }
+
+    /// Deletes the elements of the locked key row `l` (none for a
+    /// string); the row itself stays, for the caller to overwrite.
+    ///
+    /// # Errors
+    /// The backend's.
+    pub async fn drop_elements(&mut self, l: &Locked) -> Result<(), SqlError> {
+        let table = match l.t {
+            KeyType::String => return Ok(()),
+            KeyType::ZSet => self.ns.zset(),
+            _ => self.ns.elems(),
+        };
+        let sql = format!(
+            "DELETE FROM {table} WHERE {} AND g = {}",
+            sprig_kv::api::key_pred(&self.ns, &l.k, ""),
+            l.g
+        );
+        self.x(&sql).await?;
+        Ok(())
+    }
+
     /// Reads `k`'s live row in `ns` without locking.
     ///
     /// # Errors
@@ -382,8 +463,16 @@ impl<'a> Ctx<'a> {
         if k.len() > MAX_KEY_BYTES {
             return Ok(None);
         }
-        let sql = Self::select_sql(ns, k, false);
-        let rows = self.q(&sql).await?;
+        let rows = if self.sql.prepares() {
+            // One statement per namespace, prepared once per session: the
+            // gateway doesn't parse and rewrite its text again per read.
+            let sql = Self::select_bound_sql(ns);
+            self.statements += 1;
+            self.sql.query_bound(&sql, &[k, ns.dist_key(k)]).await?
+        } else {
+            let sql = Self::select_sql(ns, k, false);
+            self.q(&sql).await?
+        };
         let Some((now, row, _)) = rows.first().and_then(|r| parse_row(k, r)) else {
             self.now = 0;
             return Ok(None);

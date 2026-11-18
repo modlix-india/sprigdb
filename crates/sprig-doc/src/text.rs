@@ -98,6 +98,25 @@ pub struct TextHits {
     pub meta: Option<Document>,
     /// Highlights by encoded `_id` (`highlight` option).
     pub highlights: HashMap<Vec<u8>, Bson>,
+    /// Scores each document read instead of the hit's own score (`$text`:
+    /// MongoDB's `textScore`, from the document alone).
+    pub scorer: Option<DocScorer>,
+}
+
+/// A document's score, computed from the document.
+#[derive(Clone)]
+pub struct DocScorer(pub std::sync::Arc<dyn Fn(&Document) -> f64 + Send + Sync>);
+
+impl Debug for DocScorer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DocScorer")
+    }
+}
+
+impl PartialEq for DocScorer {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 /// The gateway's search indexes on collections.
@@ -270,7 +289,8 @@ impl Engine {
         let mut out = Vec::with_capacity(found.len());
         for (k, s) in &h.hits {
             if let Some(mut d) = found.remove(k) {
-                d.insert(SCORE_FIELD, Bson::Double(*s));
+                let s = h.scorer.as_ref().map_or(*s, |f| (f.0)(&d));
+                d.insert(SCORE_FIELD, Bson::Double(s));
                 if let Some(hl) = h.highlights.get(k) {
                     d.insert(HIGHLIGHT_FIELD, hl.clone());
                 }

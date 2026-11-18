@@ -11,6 +11,18 @@
 //!   `BIN_TO_UUID(b, 1)` swaps the parts back.
 //! - `IS_UUID(s)` tests MySQL's three accepted forms (32 hex digits, the
 //!   dashed form, and the dashed form in braces).
+//! - `REGEXP_LIKE(e, p[, flags])` becomes `e REGEXP p`, with a literal
+//!   `flags` as PCRE's inline options in front of the pattern: `c` is
+//!   `(?-i)`, `i` `(?i)` (the last of the two wins, as on MySQL), `m`
+//!   `(?m)` and `n` `(?s)`. Without flags, case follows the collation on
+//!   both servers. Django's `regex` and `iregex` lookups send it.
+//!
+//! MySQL 8.4's locking clauses, which MariaDB 11.8 refuses (1064), are
+//! rewritten here too ([`lock_clauses`]): `FOR UPDATE OF t, u` loses its
+//! `OF` list, and `FOR SHARE [OF ...]` becomes `LOCK IN SHARE MODE`, each
+//! keeping `NOWAIT` or `SKIP LOCKED`. Without `OF`, the rows of every table
+//! the query reads are locked, more than MySQL locks; several clauses
+//! become one, `FOR UPDATE` when any of them is.
 //!
 //! Every form uses its argument once (the swaps are one `REGEXP_REPLACE`),
 //! so a `?` parameter or a volatile argument (`UUID()`) stays one value,
@@ -30,7 +42,17 @@ use crate::lex::{LexOptions, Token, TokenKind, lex};
 pub fn rewrite(sql: &[u8], opts: &LexOptions) -> Option<Vec<u8>> {
     let lower = sql.to_ascii_lowercase();
     let has = |w: &[u8]| lower.windows(w.len()).any(|x| x == w);
-    if !(has(b"any_value") || has(b"uuid_to_bin") || has(b"bin_to_uuid") || has(b"is_uuid")) {
+    if (has(b"share") || (has(b"update") && has(b"of")))
+        && let Some(t) = lock_clauses(sql, opts)
+    {
+        return Some(rewrite(&t, opts).unwrap_or(t));
+    }
+    if !(has(b"any_value")
+        || has(b"uuid_to_bin")
+        || has(b"bin_to_uuid")
+        || has(b"is_uuid")
+        || has(b"regexp_like"))
+    {
         return None;
     }
     let mut cur: Option<Vec<u8>> = None;
@@ -44,7 +66,13 @@ pub fn rewrite(sql: &[u8], opts: &LexOptions) -> Option<Vec<u8>> {
     cur
 }
 
-const TARGETS: &[&[u8]] = &[b"ANY_VALUE", b"UUID_TO_BIN", b"BIN_TO_UUID", b"IS_UUID"];
+const TARGETS: &[&[u8]] = &[
+    b"ANY_VALUE",
+    b"UUID_TO_BIN",
+    b"BIN_TO_UUID",
+    b"IS_UUID",
+    b"REGEXP_LIKE",
+];
 
 /// Clauses that end a select list.
 const ENDS_LIST: &[&[u8]] = &[
@@ -239,8 +267,130 @@ fn replacement(name: &str, args: &[String], nbe: bool) -> Option<String> {
                 h(32)
             ))
         }
+        ("REGEXP_LIKE", [e, p]) => Some(format!("(({e}) REGEXP ({p}))")),
+        ("REGEXP_LIKE", [e, p, flags]) => {
+            let opts = regexp_flags(flags)?;
+            if opts.is_empty() {
+                Some(format!("(({e}) REGEXP ({p}))"))
+            } else {
+                Some(format!("(({e}) REGEXP CONCAT('{opts}', {p}))"))
+            }
+        }
         _ => None,
     }
+}
+
+/// MySQL's locking clauses in MariaDB's forms; `None` when there is none
+/// to change (a plain `FOR UPDATE [NOWAIT | SKIP LOCKED]` is the same on
+/// both).
+#[must_use]
+pub fn lock_clauses(sql: &[u8], opts: &LexOptions) -> Option<Vec<u8>> {
+    let tokens = lex(sql, opts).ok()?;
+    let sig: Vec<Token> = tokens.into_iter().filter(|t| !t.kind.is_trivia()).collect();
+    let is_word = |j: usize, w: &[u8]| {
+        sig.get(j)
+            .is_some_and(|t| t.kind == TokenKind::Word && t.bytes(sql).eq_ignore_ascii_case(w))
+    };
+    let is_punct = |j: usize, c: u8| {
+        sig.get(j)
+            .is_some_and(|t| t.kind == TokenKind::Punct && t.bytes(sql) == [c])
+    };
+    let is_name = |j: usize| {
+        sig.get(j)
+            .is_some_and(|t| matches!(t.kind, TokenKind::Word | TokenKind::QuotedIdent))
+    };
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut j = 0;
+    while j < sig.len() {
+        if !(is_word(j, b"FOR") && (is_word(j + 1, b"UPDATE") || is_word(j + 1, b"SHARE"))) {
+            j += 1;
+            continue;
+        }
+        // One or more clauses in a row: `FOR UPDATE|SHARE [OF names] [NOWAIT | SKIP LOCKED]`.
+        let start = j;
+        let (mut update, mut changed, mut wait) = (false, false, None);
+        while is_word(j, b"FOR") && (is_word(j + 1, b"UPDATE") || is_word(j + 1, b"SHARE")) {
+            if j > start {
+                changed = true;
+            }
+            if is_word(j + 1, b"UPDATE") {
+                update = true;
+            } else {
+                changed = true;
+            }
+            j += 2;
+            if is_word(j, b"OF") {
+                changed = true;
+                j += 1;
+                while is_name(j) {
+                    j += 1;
+                    if is_punct(j, b'.') && is_name(j + 1) {
+                        j += 2;
+                    }
+                    if is_punct(j, b',') && is_name(j + 1) {
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if is_word(j, b"NOWAIT") {
+                wait = Some("NOWAIT");
+                j += 1;
+            } else if is_word(j, b"SKIP") && is_word(j + 1, b"LOCKED") {
+                wait = Some("SKIP LOCKED");
+                j += 2;
+            }
+        }
+        if changed {
+            let mut out = String::from(if update {
+                "FOR UPDATE"
+            } else {
+                "LOCK IN SHARE MODE"
+            });
+            if let Some(w) = wait {
+                out.push(' ');
+                out.push_str(w);
+            }
+            edits.push((sig[start].start as usize, sig[j - 1].end as usize, out));
+        }
+    }
+    if edits.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(sql.len());
+    let mut at = 0;
+    for (a, b, ins) in edits {
+        out.extend_from_slice(&sql[at..a]);
+        out.extend_from_slice(ins.as_bytes());
+        at = b;
+    }
+    out.extend_from_slice(&sql[at..]);
+    Some(out)
+}
+
+/// `REGEXP_LIKE`'s match type, a string literal, as PCRE inline options;
+/// `None` (the call is left alone) when it isn't a literal or holds a
+/// letter MySQL refuses.
+fn regexp_flags(arg: &str) -> Option<String> {
+    let a = arg.trim();
+    let inner = a
+        .strip_prefix('\'')
+        .and_then(|x| x.strip_suffix('\''))
+        .or_else(|| a.strip_prefix('"').and_then(|x| x.strip_suffix('"')))?;
+    let mut case = None;
+    let mut out = String::new();
+    for c in inner.chars() {
+        match c {
+            'c' => case = Some("(?-i)"),
+            'i' => case = Some("(?i)"),
+            'm' => out.push_str("(?m)"),
+            'n' => out.push_str("(?s)"),
+            'u' => {}
+            _ => return None,
+        }
+    }
+    Some(format!("{}{out}", case.unwrap_or("")))
 }
 
 #[cfg(test)]
@@ -267,6 +417,61 @@ mod tests {
         );
         assert_eq!(r("SELECT 'ANY_VALUE(b)' FROM t"), None);
         assert_eq!(r("SELECT a FROM t"), None);
+    }
+
+    #[test]
+    fn regexp_like_becomes_regexp() {
+        // Django's `regex` and `iregex` lookups.
+        assert_eq!(
+            r("SELECT id FROM t WHERE REGEXP_LIKE(`t`.`name`, %s, 'c')").as_deref(),
+            Some("SELECT id FROM t WHERE ((`t`.`name`) REGEXP CONCAT('(?-i)', %s))")
+        );
+        assert_eq!(
+            r("SELECT id FROM t WHERE regexp_like(name, '^a', 'ci')").as_deref(),
+            Some("SELECT id FROM t WHERE ((name) REGEXP CONCAT('(?i)', '^a'))")
+        );
+        assert_eq!(
+            r("SELECT REGEXP_LIKE(a, 'x') FROM t").as_deref(),
+            Some("SELECT ((a) REGEXP ('x')) AS `REGEXP_LIKE(a, 'x')` FROM t")
+        );
+        assert_eq!(
+            r("SELECT id FROM t WHERE REGEXP_LIKE(a, 'x', 'mn')").as_deref(),
+            Some("SELECT id FROM t WHERE ((a) REGEXP CONCAT('(?m)(?s)', 'x'))")
+        );
+        // A match type that isn't a literal, or a letter MySQL refuses: left alone.
+        assert_eq!(r("SELECT id FROM t WHERE REGEXP_LIKE(a, 'x', @m)"), None);
+        assert_eq!(r("SELECT id FROM t WHERE REGEXP_LIKE(a, 'x', 'z')"), None);
+    }
+
+    #[test]
+    fn mysql_locking_clauses() {
+        // Django's `select_for_update(of=...)` and TypeORM's `pessimistic_read`.
+        assert_eq!(
+            r("SELECT `p`.`id` FROM `p` INNER JOIN `c` ON (`p`.`c_id` = `c`.`id`) FOR UPDATE OF `p`, `c`")
+                .as_deref(),
+            Some("SELECT `p`.`id` FROM `p` INNER JOIN `c` ON (`p`.`c_id` = `c`.`id`) FOR UPDATE")
+        );
+        assert_eq!(
+            r("SELECT id FROM t FOR SHARE").as_deref(),
+            Some("SELECT id FROM t LOCK IN SHARE MODE")
+        );
+        assert_eq!(
+            r("SELECT id FROM t AS x FOR SHARE OF x SKIP LOCKED").as_deref(),
+            Some("SELECT id FROM t AS x LOCK IN SHARE MODE SKIP LOCKED")
+        );
+        assert_eq!(
+            r("SELECT id FROM db.t FOR UPDATE OF db.t NOWAIT").as_deref(),
+            Some("SELECT id FROM db.t FOR UPDATE NOWAIT")
+        );
+        assert_eq!(
+            r("SELECT a.id FROM a, b FOR SHARE OF a FOR UPDATE OF b").as_deref(),
+            Some("SELECT a.id FROM a, b FOR UPDATE")
+        );
+        // MariaDB's own forms, and the words elsewhere: left alone.
+        assert_eq!(r("SELECT id FROM t FOR UPDATE SKIP LOCKED"), None);
+        assert_eq!(r("SELECT id FROM t LOCK IN SHARE MODE"), None);
+        assert_eq!(r("SELECT 'FOR SHARE' FROM t"), None);
+        assert_eq!(r("SELECT share FROM t WHERE x = 1"), None);
     }
 
     #[test]

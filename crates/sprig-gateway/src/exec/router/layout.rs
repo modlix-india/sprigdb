@@ -378,6 +378,12 @@ pub(crate) struct TenantLayout {
     /// The metadata placement of the grouped tables, per cluster
     /// a session runs metadata statements on (made at first use).
     pub grouped: Mutex<HashMap<String, Arc<GroupedTables>>>,
+    /// Ranges moved here by a mover job: the cluster and the job's last
+    /// write there, which reads of the tenant on that cluster wait for on
+    /// replicas ([`crate::backend::Backends::raise_read_fence`]).
+    pub fences: Vec<(ClusterId, String)>,
+    /// The fences were handed to the backends.
+    pub fences_noted: std::sync::atomic::AtomicBool,
 }
 
 impl TenantLayout {
@@ -580,6 +586,7 @@ fn build(cat: &TenantCatalog, state: &ShardingState, cache: &ShardMapCache) -> T
     let mut held_groups: HashMap<u32, u64> = HashMap::new();
     let mut rekeyed: HashSet<u32> = HashSet::new();
     let mut clusters = BTreeSet::new();
+    let mut fences = Vec::new();
     for g in &state.groups {
         if g.kind != "sharded" {
             continue;
@@ -604,6 +611,9 @@ fn build(cat: &TenantCatalog, state: &ShardingState, cache: &ShardMapCache) -> T
                 versions.insert(g.id, map.version);
                 for r in &map.ranges {
                     clusters.insert(r.cluster.to_string());
+                    if let Some(f) = &r.read_fence {
+                        fences.push((r.cluster.clone(), f.clone()));
+                    }
                     if r.state == sprig_shard::shardmap::RangeState::Held {
                         let u = r.hold_until_ms.unwrap_or(0);
                         let e = held_groups.entry(g.id).or_insert(u);
@@ -757,6 +767,8 @@ fn build(cat: &TenantCatalog, state: &ShardingState, cache: &ShardMapCache) -> T
         epochs,
         objects,
         grouped: Mutex::new(HashMap::new()),
+        fences,
+        fences_noted: std::sync::atomic::AtomicBool::new(false),
     }
 }
 
@@ -787,6 +799,8 @@ mod tests {
             epochs: HashMap::new(),
             objects: HashMap::new(),
             grouped: Mutex::new(HashMap::new()),
+            fences: Vec::new(),
+            fences_noted: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

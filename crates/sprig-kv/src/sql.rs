@@ -62,6 +62,29 @@ pub trait SqlRunner: Send {
     fn row_policy_binds(&self, _object: u64) -> Option<bool> {
         None
     }
+    /// Whether [`SqlRunner::query`] returns the rows of every result set
+    /// a statement sends (a compound statement's several `SELECT`s), not
+    /// only the first one's. The Redis front end groups a pipeline's
+    /// commands into one statement only on such a runner; by default
+    /// `false`.
+    fn multi_results(&self) -> bool {
+        false
+    }
+    /// Whether [`SqlRunner::query_bound`] runs prepared statements;
+    /// callers otherwise send the statement with its values as literals.
+    /// By default `false`.
+    fn prepares(&self) -> bool {
+        false
+    }
+    /// `sql`, with `?` placeholders, prepared once per session and run
+    /// with `params` bound as binary strings: its rows. Called only when
+    /// [`SqlRunner::prepares`] says so; by default an error.
+    async fn query_bound(&mut self, _sql: &str, _params: &[&[u8]]) -> Result<Vec<Row>, SqlError> {
+        Err(SqlError {
+            errno: None,
+            message: "this runner doesn't prepare statements".into(),
+        })
+    }
 }
 
 /// `X'...'`, or `''` for empty bytes.

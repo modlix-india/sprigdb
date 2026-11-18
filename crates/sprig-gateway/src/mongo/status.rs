@@ -204,6 +204,59 @@ fn option_and_error_metrics() -> (Document, Document) {
     (option, error)
 }
 
+/// Change-stream batches returned (`cursor.batchesReturned`), events and
+/// their BSON bytes returned (`docsReturned`, `bytesReturned`), and events
+/// and bytes the streams read before their pipeline's stages
+/// (`docsExamined`, `bytesRead`). Events a row policy hides never reach a
+/// stream, so they aren't counted.
+static BATCHES: AtomicU64 = AtomicU64::new(0);
+static DOCS_RETURNED: AtomicU64 = AtomicU64::new(0);
+static BYTES_RETURNED: AtomicU64 = AtomicU64::new(0);
+static DOCS_EXAMINED: AtomicU64 = AtomicU64::new(0);
+static BYTES_READ: AtomicU64 = AtomicU64::new(0);
+/// Events over the BSON limit that failed their stream
+/// (`largeEventsFailed`); `$changeStreamSplitLargeEvent` isn't offered,
+/// so `largeEventsSplit` stays 0.
+static LARGE_FAILED: AtomicU64 = AtomicU64::new(0);
+
+/// The largest event a change stream returns: MongoDB's BSON document
+/// limit plus its 16 KiB of command headroom.
+pub(crate) const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024 + 16 * 1024;
+
+fn bson_len(d: &Document) -> u64 {
+    bson::to_vec(d).map_or(0, |v| v.len() as u64)
+}
+
+/// A change stream read `events` from its feed, before its pipeline.
+pub(crate) fn stream_examined(events: &[Document]) {
+    DOCS_EXAMINED.fetch_add(events.len() as u64, Ordering::Relaxed);
+    BYTES_READ.fetch_add(events.iter().map(bson_len).sum(), Ordering::Relaxed);
+}
+
+/// A change-stream batch returned to the client.
+pub(crate) fn stream_returned(batch: &[Document]) {
+    BATCHES.fetch_add(1, Ordering::Relaxed);
+    DOCS_RETURNED.fetch_add(batch.len() as u64, Ordering::Relaxed);
+    BYTES_RETURNED.fetch_add(batch.iter().map(bson_len).sum(), Ordering::Relaxed);
+}
+
+/// The error for an event over [`MAX_EVENT_BYTES`] (MongoDB's 10334,
+/// `BSONObjectTooLarge`), counted in `largeEventsFailed`; `None` for an
+/// event within the limit.
+pub(crate) fn too_large(event: &Document) -> Option<sprig_proto_mongo::errors::MongoError> {
+    let size = bson_len(event);
+    if size <= MAX_EVENT_BYTES as u64 {
+        return None;
+    }
+    LARGE_FAILED.fetch_add(1, Ordering::Relaxed);
+    Some(sprig_proto_mongo::errors::MongoError::new(
+        10334,
+        format!(
+            "Executor error during getMore :: caused by :: BSONObj size: {size} (0x{size:X}) is invalid. Size must be between 0 and 16793600(16MB)"
+        ),
+    ))
+}
+
 /// The open change-stream cursors and when each opened.
 fn open_at() -> std::sync::MutexGuard<'static, HashMap<i64, Instant>> {
     static M: std::sync::OnceLock<Mutex<HashMap<i64, Instant>>> = std::sync::OnceLock::new();
@@ -286,12 +339,20 @@ fn change_stream_metrics(c: &Conn) -> Document {
         .unwrap_or_else(PoisonError::into_inner)
         .unwrap_or(0.0);
     let (option, error) = option_and_error_metrics();
+    let load = |a: &AtomicU64| n(a.load(Ordering::Relaxed));
     doc! {
         "cursor": {
             "open": {"total": n(open as u64), "pinned": n(pinned.min(open) as u64)},
             "totalOpened": n(OPENED.load(Ordering::Relaxed)),
             "lifespan": {"average": average, "totalCount": n(closed)},
+            "batchesReturned": load(&BATCHES),
+            "bytesRead": load(&BYTES_READ),
+            "bytesReturned": load(&BYTES_RETURNED),
+            "docsExamined": load(&DOCS_EXAMINED),
+            "docsReturned": load(&DOCS_RETURNED),
         },
+        "largeEventsFailed": load(&LARGE_FAILED),
+        "largeEventsSplit": n(0),
         "option": option,
         "error": error,
         "scope": {
@@ -489,5 +550,34 @@ mod tests {
         // The lifespan average is exponential: the newest weighs 0.2.
         close(Instant::now());
         assert!(LIFESPAN_AVERAGE.lock().unwrap().is_some());
+    }
+
+    /// Batches, events and bytes returned and examined; an event past the
+    /// BSON limit fails with 10334 and counts in `largeEventsFailed`.
+    #[test]
+    fn change_stream_cursor_counters() {
+        let before = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let (b0, r0, e0, x0, l0) = (
+            before(&BATCHES),
+            before(&DOCS_RETURNED),
+            before(&DOCS_EXAMINED),
+            before(&BYTES_RETURNED),
+            before(&LARGE_FAILED),
+        );
+        let ev = doc! {"operationType": "insert", "fullDocument": {"_id": 1, "a": "x"}};
+        stream_examined(&[ev.clone(), ev.clone(), ev.clone()]);
+        stream_returned(&[ev.clone()]);
+        stream_returned(&[]);
+        assert!(before(&BATCHES) >= b0 + 2);
+        assert!(before(&DOCS_RETURNED) > r0);
+        assert!(before(&DOCS_EXAMINED) >= e0 + 3);
+        assert!(before(&BYTES_RETURNED) >= x0 + bson_len(&ev));
+        assert!(too_large(&ev).is_none());
+        let big =
+            doc! {"operationType": "update", "fullDocument": {"s": "x".repeat(MAX_EVENT_BYTES)}};
+        let e = too_large(&big).unwrap();
+        assert_eq!(e.code, 10334);
+        assert!(e.message.contains("BSONObj size"), "{}", e.message);
+        assert!(before(&LARGE_FAILED) > l0);
     }
 }

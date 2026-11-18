@@ -780,12 +780,21 @@ async fn message_source(
     module_id: u64,
 ) -> Result<(sprig_logic::catalog::BindingRow, messages::SourceRow)> {
     let binding = store.binding(conn, module_id).await?;
+    let timing = binding.as_ref().map(|b| b.timing.clone());
     let Some(b) = binding.filter(|b| b.timing == "on_message") else {
+        // A trigger that runs inside its statement (BEFORE a write, on a
+        // read), or one without a binding.
+        let what = match timing.as_deref() {
+            Some("before_write" | "on_write") => "runs inside the statements that write its table",
+            Some("on_read") => "runs inside the statements that read its table",
+            _ => "isn't bound to a table, a stream or a queue",
+        };
         return Err(SprigError::new(
             SprigCode::LogicUnsupported,
             format!(
-                "trigger {} isn't on a stream, a queue or a table: ALTER TRIGGER ... DISABLE | \
-                 ENABLE applies to triggers",
+                "trigger {} {what}: ALTER TRIGGER ... DISABLE | ENABLE applies only to \
+                 after-commit triggers and triggers on a stream or a queue; use DROP TRIGGER \
+                 and create it again instead",
                 a.name
             ),
         ));

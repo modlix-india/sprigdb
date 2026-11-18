@@ -1904,8 +1904,9 @@ fn needs_tls_hint(e: &ErrPacket) -> ErrPacket {
         e.code,
         e.sqlstate,
         format!(
-            "{}; caching_sha2_password needs TLS for a full authentication \
-             (RSA key exchange is not supported): connect with TLS",
+            "{}; caching_sha2_password needs TLS, or the server's RSA public key, \
+             for a full authentication: connect with TLS, or let the client \
+             request the key (--get-server-public-key)",
             e.message
         ),
     )

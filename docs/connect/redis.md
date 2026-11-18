@@ -86,7 +86,7 @@ CLIENT SETNAME orders~fra1
 | RESP3 (`HELLO 3`) | yes, with maps, sets, doubles, pushes and verbatim strings |
 | `HELLO` answer | `server: redis`, `version: 7.2.0` (`redis.server_version`), `mode: standalone`, `role: master`, no modules |
 | Inline commands (a plain line, as `telnet` sends) | yes |
-| Pipelining | yes |
+| Pipelining | yes; runs of the commonest writes and `GET`s in a pipeline commit together (see [Key-value](../data-models/key-value.md#pipelines)) |
 | Largest bulk string | `redis.max_bulk_bytes`, 16 MiB |
 | Largest command | `redis.max_command_bytes`, 64 MiB |
 | Cluster mode | no. Connect as a standalone client; `INFO` reports `cluster_enabled:0` |
@@ -139,7 +139,7 @@ SELECT v FROM redis.db0 WHERE k = 'session:42';
 | HyperLogLog (`PFADD`, `PFCOUNT`, `PFMERGE`) | no | 39840 |
 | `SWAPDB`, `MONITOR` | no | 39840 |
 | `REPLICAOF`, `SLAVEOF`, `SYNC`, `PSYNC`, `FAILOVER`, `DEBUG`, `SHUTDOWN`, `MODULE` | no | 39842 |
-| Search: `FT.CREATE`, `FT.SEARCH`, `FT.AGGREGATE` and seven more | yes | On SprigDB's search indexes, over hashes; see [Search (`FT.*`)](#search-ft) |
+| Search: `FT.CREATE`, `FT.SEARCH`, `FT.AGGREGATE`, `FT.CURSOR` and seven more | yes | On SprigDB's search indexes, over hashes; see [Search (`FT.*`)](#search-ft) |
 | RedisJSON (`JSON.*`) | no | Unknown command |
 
 The full command list, with every option, is in [Key-value](../data-models/key-value.md#commands-by-type).
@@ -185,6 +185,7 @@ OK
 | `FT.DROPINDEX idx [DD]` | Runs `DROP SEARCH INDEX`. With `DD` it first deletes the hashes under the index's prefixes (every hash of the namespace when it has none) |
 | `FT.SEARCH idx query [options]` | Searches, then reads the matching hashes back through your session |
 | `FT.AGGREGATE idx query [steps]` | Searches, reads the matching hashes back, and runs the pipeline in the gateway |
+| `FT.CURSOR READ idx id [COUNT n]`, `FT.CURSOR DEL idx id`, `FT.CURSOR GC idx` | Reads the next rows of an `FT.AGGREGATE ... WITHCURSOR`, drops the cursor, or drops idle cursors; see [Cursors](#cursors) |
 | `FT.INFO idx` | `index_name`, `index_definition` (`key_type` `HASH`, `prefixes`), `attributes`, `num_docs`, `indexing`, `percent_indexed` and `generation`. Not Redis's memory statistics |
 | `FT._LIST` | The search indexes on the Redis databases' namespaces |
 | `FT.EXPLAIN idx query`, `FT.EXPLAINCLI idx query` | The parsed query as a tree, in RediSearch's shape but with SprigDB's own text |
@@ -246,11 +247,69 @@ An index covers the one Redis database selected when it was created, but its nam
 | `FILTER field min max`, `INKEYS`, `INFIELDS`, `PARAMS`, `SLOP`, `DIALECT` | yes |
 | `SORTBY field [ASC\|DESC]` | yes; hashes without the field sort last |
 | `VERBATIM`, `INORDER`, `NOSTOPWORDS`, `EXPLAINSCORE`, `WITHPAYLOADS`, `TIMEOUT`, `LANGUAGE`, `EXPANDER`, `SCORER`, `PAYLOAD` | Accepted and ignored: words are still stemmed and stop words still dropped |
-| `HIGHLIGHT`, `SUMMARIZE`, `GEOFILTER` | 39823 |
+| `HIGHLIGHT [FIELDS n field ...] [TAGS open close]` | yes; see [Highlights and summaries](#highlights-and-summaries) |
+| `SUMMARIZE [FIELDS n field ...] [FRAGS n] [LEN n] [SEPARATOR s]` | yes; see [Highlights and summaries](#highlights-and-summaries) |
+| `GEOFILTER` | 39823 |
 
-`FT.AGGREGATE` takes `LOAD n @field ...` or `LOAD *`, `GROUPBY` with `REDUCE` (`COUNT`, `COUNT_DISTINCT`, `COUNT_DISTINCTISH`, `SUM`, `MIN`, `MAX`, `AVG`, `STDDEV`, `QUANTILE`, `TOLIST`, `FIRST_VALUE`, `RANDOM_SAMPLE`), `SORTBY ... [MAX m]`, `APPLY expr AS name`, `FILTER expr`, `LIMIT`, `PARAMS` and `DIALECT`, run in the order given. Expressions have RediSearch's operators and the functions `upper`, `lower`, `strlen`, `substr`, `contains`, `startswith`, `exists`, `abs`, `ceil`, `floor`, `log`, `log2`, `sqrt`, `exp`, `to_number`, `to_str` and `format`. `COUNT_DISTINCTISH` is exact, and `RANDOM_SAMPLE` returns the first values. As in Redis, a `SORTBY` without `MAX` keeps 10 rows unless a `LIMIT` follows. `WITHCURSOR` answers 39823.
+`FT.AGGREGATE` takes `LOAD n @field ...` or `LOAD *`, `GROUPBY` with `REDUCE` (`COUNT`, `COUNT_DISTINCT`, `COUNT_DISTINCTISH`, `SUM`, `MIN`, `MAX`, `AVG`, `STDDEV`, `QUANTILE`, `TOLIST`, `FIRST_VALUE`, `RANDOM_SAMPLE`), `SORTBY ... [MAX m]`, `APPLY expr AS name`, `FILTER expr`, `LIMIT`, `PARAMS`, `DIALECT` and `WITHCURSOR [COUNT n] [MAXIDLE ms]`, run in the order given. Expressions have RediSearch's operators and the functions `upper`, `lower`, `strlen`, `substr`, `contains`, `startswith`, `exists`, `abs`, `ceil`, `floor`, `log`, `log2`, `sqrt`, `exp`, `to_number`, `to_str` and `format`. `COUNT_DISTINCTISH` is exact, and `RANDOM_SAMPLE` returns the first values. As in Redis, a `SORTBY` without `MAX` keeps 10 rows unless a `LIMIT` follows.
 
 Replies have Redis's RESP2 shapes, and its maps after `HELLO 3`.
+
+### Highlights and summaries
+
+`HIGHLIGHT` wraps each word the query matches in tags, `<b>` and `</b>` by default. It works on the returned `TEXT` fields: all of them, or the ones named after `FIELDS`.
+
+```text
+> FT.SEARCH products "running @price:[0 100]" RETURN 1 name HIGHLIGHT
+1) (integer) 1
+2) "product:1"
+3) 1) "name"
+   2) "Trail <b>running</b> shoe"
+```
+
+- A word is marked when it has the same stem as a query term (`shoes` for `shoe`), when it starts with a prefix term (`run*`), or when it is within a fuzzy term's distance (`%runing%`).
+- Negated terms mark nothing. A term limited to one field, such as `@name:shoe`, is marked in every returned field, as in Redis.
+- `TAGS open close` sets other tags, for example `TAGS "[" "]"`.
+
+`SUMMARIZE` shortens long `TEXT` fields to fragments around the matched words:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `FIELDS n field ...` | every returned `TEXT` field | The fields to summarize |
+| `FRAGS n` | `3` | Fragments per field at most |
+| `LEN n` | `20` | Words per fragment |
+| `SEPARATOR s` | `"... "` | Text after each fragment |
+
+Fragments with the most different matched words come first, then the rest in text order. A field with no matched word keeps its first `LEN` words. With `HIGHLIGHT` as well, the fragments are highlighted.
+
+The text comes from the hashes, read through your session, so you see highlights only in keys and fields you may read. `HIGHLIGHT FIELDS` naming a field the index doesn't have answers `SEARCH_PROP_NOT_FOUND No such property`. Malformed options answer `Bad arguments for HIGHLIGHT` or `Bad arguments for SUMMARIZE`.
+
+### Cursors
+
+`WITHCURSOR` returns a large aggregate in pages. The first reply holds the first `COUNT` rows (1000 by default) and a cursor id. `FT.CURSOR READ` returns the next rows, until the id is `0`:
+
+```text
+> FT.AGGREGATE products "*" LOAD 1 @name SORTBY 2 @name ASC WITHCURSOR COUNT 2
+1) 1) (integer) 3
+   2) 1) "name"
+      2) "Rain jacket"
+   3) 1) "name"
+      2) "Road running shoe"
+2) (integer) 1720983113
+> FT.CURSOR READ products 1720983113
+1) 1) (integer) 0
+   2) 1) "name"
+      2) "Trail running shoe"
+2) (integer) 0
+```
+
+- The first reply's count is the aggregate's row count; later reads answer `0`, as in Redis. `FT.CURSOR READ ... COUNT n` reads another number of rows.
+- The aggregate runs once, when you send `FT.AGGREGATE`. Its rows wait in the gateway, so reads show the data as it was then.
+- `FT.CURSOR DEL idx id` drops a cursor. A cursor unread for `MAXIDLE` milliseconds is dropped too. `MAXIDLE` is 300,000 (5 minutes) by default and at most; a larger value is lowered to it. `FT.CURSOR GC idx` drops idle cursors now.
+- Only the login that made a cursor can read it: the same tenant, user, Redis database and index. Anyone else gets `SEARCH_CURSOR_NOT_FOUND Cursor not found`, even with the right id. In Redis, any client with the id can read it.
+- A tenant holds at most 128 open cursors on one gateway. One more answers `SEARCH_LIMIT Too many cursors allocated for index`. Read cursors to the end, or drop them.
+- A cursor lives in one gateway's memory. A client that reconnects to another gateway doesn't find it.
+- The aggregate still reads every match up to `search.max_window`, as without a cursor; the cursor pages its result, not the search.
 
 ### How results differ from Redis
 
@@ -262,8 +321,26 @@ Replies have Redis's RESP2 shapes, and its maps after `HELLO 3`.
 - **`FLUSHALL` and `FLUSHDB` keep indexes.** They delete the keys, so the indexes become empty; Redis drops its indexes. Use `FT.DROPINDEX` to drop one.
 - **`FT.*` isn't allowed inside `MULTI` or scripts.** There it answers `ERR FT.SEARCH isn't allowed inside MULTI or scripts` (inside `MULTI`) or `ERR This Redis command is not allowed from script`.
 - **No search module is listed.** `HELLO` shows no modules and `MODULE LIST` answers 39842. Turn off a client library's module check if it has one.
+- **Prefix and fuzzy terms highlight every word they match.** Redis marks only the one expansion its search stopped at: for `run*` it can mark `run` but not `Running` in the same field.
+- **Summaries are SprigDB's own.** They cover `TEXT` fields only, by the rule above, so the fragments can differ from Redis's.
+- **Cursors end with id `0` on the last rows.** Redis sometimes returns a non-zero id and then an empty last read.
 
-The other `FT.*` commands — `FT.PROFILE`, `FT.CURSOR`, `FT.CONFIG`, aliases (`FT.ALIASADD`, `FT.ALIASUPDATE`, `FT.ALIASDEL`), `FT.SPELLCHECK`, dictionaries (`FT.DICTADD`, `FT.DICTDEL`, `FT.DICTDUMP`), synonyms (`FT.SYNUPDATE`, `FT.SYNDUMP`) and suggestions (`FT.SUGADD`, `FT.SUGGET`, `FT.SUGDEL`, `FT.SUGLEN`) — answer `SPRIG REDIS_RESTRICTED 39842`.
+### Not supported
+
+These aren't built yet. They answer `SPRIG REDIS_RESTRICTED 39842`:
+
+- aliases: `FT.ALIASADD`, `FT.ALIASUPDATE`, `FT.ALIASDEL`;
+- `FT.PROFILE` and `FT.CONFIG`;
+- spelling: `FT.SPELLCHECK`;
+- dictionaries: `FT.DICTADD`, `FT.DICTDEL`, `FT.DICTDUMP`;
+- synonyms: `FT.SYNUPDATE`, `FT.SYNDUMP`;
+- suggestions: `FT.SUGADD`, `FT.SUGGET`, `FT.SUGDEL`, `FT.SUGLEN`.
+
+These answer `SPRIG SEARCH_UNSUPPORTED 39823`:
+
+- `GEO`, `VECTOR` and `GEOSHAPE` fields, and `GEOFILTER`;
+- `ON JSON` indexes;
+- the other options marked 39823 in the tables above.
 
 ### Privileges
 
@@ -274,6 +351,7 @@ The other `FT.*` commands — `FT.PROFILE`, `FT.CURSOR`, `FT.CONFIG`, aliases (`
 | `FT.CREATE`, `FT.ALTER`, `FT.DROPINDEX` | `INDEX` (and, the first time a database is used, the privileges to create its tables) |
 | `FT.DROPINDEX ... DD` | `INDEX` and `DELETE` |
 | `FT.SEARCH`, `FT.AGGREGATE`, `FT.INFO`, `FT.TAGVALS` | `SELECT` |
+| `FT.CURSOR` | Nothing more: it reads only your own cursors |
 
 A refusal answers `NOPERM this user has no permissions to run this command on this data: ...`.
 
@@ -376,7 +454,9 @@ SPRIG REDIS_UNSUPPORTED 39840 XADD is ...
 | `SEARCH_INDEX_NOT_FOUND Index not found: <name>` | `FT.*` names an index that doesn't exist | Check the name with `FT._LIST` |
 | `SEARCH_INDEX_EXISTS Index already exists` | `FT.CREATE` of a name already used in any Redis database | Pick another name, or `FT.DROPINDEX` the old index |
 | `ERR ...` from `FT.*` | A malformed query, option or schema, with RediSearch's message | Correct it |
-| `SPRIG SEARCH_UNSUPPORTED 39823` | An `FT.*` option or field type SprigDB doesn't offer | See [Search (`FT.*`)](#search-ft) |
+| `SEARCH_CURSOR_NOT_FOUND Cursor not found, id: <id>` | `FT.CURSOR READ` of a cursor that was read to the end, dropped, idle past `MAXIDLE`, made by another login, or kept by another gateway | Run the aggregate again |
+| `SEARCH_LIMIT Too many cursors allocated for index` | The tenant has 128 open cursors on this gateway | Read cursors to the end or `FT.CURSOR DEL` them |
+| `SPRIG SEARCH_UNSUPPORTED 39823` | An `FT.*` option or field type SprigDB doesn't offer | See [Not supported](#not-supported) |
 | `SPRIG SEARCH_INDEX_NOT_READY 39824` | The index is still being built | Retry |
 | `SPRIG SEARCH_UNAVAILABLE 39825` | No copy of the index can answer | Retry |
 | `SPRIG SEARCH_WAIT_TIMEOUT 39826` | The index didn't catch up with earlier writes within `search.wait_timeout_ms` | Retry |

@@ -9,7 +9,7 @@ source: the metric macros in the source tree, and docs/metrics-help.toml
 
 Every metric SprigDB records, as exported on each process's telemetry port (`/metrics`, Prometheus text) and through OTLP. Counters end in `_total`; durations are histograms in seconds.
 
-522 metrics in 55 groups.
+524 metrics in 55 groups.
 
 ## `sprig_advisor_*`
 
@@ -660,12 +660,14 @@ Every metric SprigDB records, as exported on each process's telemetry port (`/me
 | `sprig_search_docs_indexed_total` | counter | `op` | sprig-search | Documents applied to search index copies; `op` is `feed` (from the change feed), `stale_skipped` (an older change skipped) or `reread` (keys of an index with hash fields that a change touched, read back from MariaDB and indexed again before a commit). Unit: count. |
 | `sprig_search_gateway_copies_total` | counter | - | sprig-gateway | Searches a gateway answered from its own copy because no search worker was available. Unit: count. |
 | `sprig_search_index_lag_seconds` | gauge | `cluster` | sprig-search | How far the searchable state of the search index copies on this process trails each cluster: the wall clock minus the commit time a copy last made searchable, the largest over the copies; `cluster` is the source cluster. Unit: seconds. |
+| `sprig_search_like_total` | counter | `result` | sprig-gateway | `LIKE` conditions on a column with a search index's `SUBSTRING` field, with `search.like_acceleration` on; `result` is `narrowed` (the condition read only the rows the index found) or `scan` (it ran unchanged: no run of three characters, a row policy binds the user, or the search failed). Unit: count. |
 | `sprig_search_queries_total` | counter | `flavor`, `result` | sprig-gateway | Search queries; `flavor` is the index flavour, `result` `ok` or `error`. Unit: count. |
 | `sprig_search_query_duration_seconds` | histogram | `phase` | sprig-gateway, sprig-worker | Duration of search queries; `phase` is `search` (the whole query at the gateway) or `copy` (one copy's part on a worker). Unit: seconds. |
 | `sprig_search_remote_queries_total` | counter | `result` | sprig-gateway | Search requests sent to worker copies; `result` is `ok` or `retried`. Unit: count. |
 | `sprig_search_seed_page_seconds` | histogram | - | sprig-gateway | Time to read one page of rows from MariaDB while seeding a search index. Unit: seconds. |
 | `sprig_search_seeds_total` | counter | `source` | sprig-search, sprig-worker | Search index copies seeded; `source` is `mariadb` (built from the rows) or `peer` (copied from another worker's snapshot). Unit: count. |
 | `sprig_search_snapshot_bytes_total` | counter | - | sprig-worker | Bytes of search index snapshots written by workers. Unit: bytes. |
+| `sprig_search_top_k_total` | counter | `result` | sprig-gateway | SQL statements reading the best rows of one search (`ORDER BY` its score `DESC LIMIT n`); `result` is `paged` (answered from the search's best hits, a page at a time) or `every_hit` (they read every hit, as other statements do). Unit: count. |
 | `sprig_search_window_exceeded_total` | counter | - | sprig-gateway | Searches refused with `ER_SPRIG_SEARCH_WINDOW_EXCEEDED` for reading more hits than `search.max_window`. Unit: count. |
 
 ## `sprig_settings_*`
