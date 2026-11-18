@@ -721,7 +721,10 @@ impl PassSession {
         let mut sql = sql;
         let mut slot = None;
         if self.tenant.is_some() {
-            match self.routed_execute(cx, &sql, &values, cursor, out).await? {
+            match self
+                .routed_execute(cx, &sql, logical.as_deref(), &values, cursor, out)
+                .await?
+            {
                 router::ExecRoute::Answered => {
                     return Ok(ExecSummary {
                         status: None,

@@ -2175,12 +2175,15 @@ impl PassSession {
     /// `COM_STMT_EXECUTE` of a tenant session whose tenant has sharded or
     /// reference tables: `None` to run it as before (on `slot`'s
     /// connection, with `sql` instead of the statement's own text when
-    /// given), or the answer the router sent.
+    /// given), or the answer the router sent. `logical` is the text the
+    /// client prepared, for workload capture of the statements the router
+    /// answers itself.
     #[allow(clippy::too_many_lines)]
     pub(super) async fn routed_execute(
         &mut self,
         cx: &mut ExecCtx<'_>,
         sql: &[u8],
+        logical: Option<&[u8]>,
         values: &[BoundParam],
         cursor: bool,
         out: &mut dyn ResultSink,
@@ -2287,6 +2290,12 @@ impl PassSession {
                     Some(ts) => ts.map(),
                     None => return Err(SprigError::internal("no tenant")),
                 };
+                // Workload capture, as for text statements: the statement
+                // with the shards it visited, so the advisor sees prepared
+                // statements that scatter (only the pass-through plans
+                // above reach the executor's own capture).
+                let fan = fanout_of(&plan, &layout);
+                let mut wl_pending = logical.and_then(|l| self.wl_start(l));
                 let mut mapper = ResultMapper::scrub();
                 let ran = self
                     .execute_plan(
@@ -2304,12 +2313,45 @@ impl PassSession {
                     self.router.collisions = 0;
                 }
                 match ran {
-                    Ran::Done(step) => Ok(ExecRoute::Done(step.status)),
+                    Ran::Done(step) => {
+                        if let (Some(p), Some(l)) = (wl_pending.as_mut(), logical) {
+                            if let Some((n, all)) = fan {
+                                p.set_fanout(n, all);
+                            }
+                            let rendered = if p.wants_sample() {
+                                let nbe = self.lex_opts().0.no_backslash_escapes;
+                                values
+                                    .iter()
+                                    .filter(|v| v.name.is_empty())
+                                    .map(|v| match &v.value {
+                                        sprig_proto_mysql::command::ParamValue::Value(x) => {
+                                            crate::workload::sample_value(x, nbe)
+                                        }
+                                        sprig_proto_mysql::command::ParamValue::LongData => {
+                                            crate::workload::sample_value(
+                                                &sprig_proto_mysql::Value::Null,
+                                                nbe,
+                                            )
+                                        }
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                            let r = super::capture::Ran {
+                                outcome: None,
+                                errored: step.errored,
+                                params: &rendered,
+                            };
+                            self.wl_finish(cx, wl_pending, l, &r);
+                        }
+                        Ok(ExecRoute::Done(step.status))
+                    }
                     // A collision: new values, the statement again.
                     Ran::Collision(_) if self.router.collisions < COLLISION_RETRIES => {
                         self.router.collisions += 1;
                         metrics::counter!("sprig_ids_collision_retries_total").increment(1);
-                        Box::pin(self.routed_execute(cx, sql, values, cursor, out)).await
+                        Box::pin(self.routed_execute(cx, sql, logical, values, cursor, out)).await
                     }
                     Ran::Collision(e) => {
                         self.router.collisions = 0;
