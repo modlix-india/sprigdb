@@ -2,6 +2,11 @@
 //! the client sent, answer them in order, flush once per batch, and
 //! deliver pub/sub messages between batches.
 //!
+//! Commands already buffered are taken up to
+//! [`GROUP_MAX_COMMANDS`] at a time; a run of guarded writes and `GET`s
+//! among them runs as one group ([`crate::batch::Group`]: one statement,
+//! one commit), its replies written after the commit.
+//!
 //! While a command runs (a blocking pop may wait for minutes), the loop
 //! keeps reading into its buffer, so a client that goes away ends the
 //! command at once.
@@ -9,9 +14,10 @@
 use std::future::Future;
 
 use bytes::BytesMut;
-use sprig_proto_redis::{Decoder, Frame, Limits, encode};
+use sprig_proto_redis::{Command, Decoder, Frame, Limits, encode};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::batch::GROUP_MAX_COMMANDS;
 use crate::session::Session;
 
 /// Serves `sess` on `stream` until the client quits, the stream ends, or
@@ -35,46 +41,70 @@ where
     let mut msgs = sess.take_messages();
     tokio::pin!(stop);
     let r = async {
+        let mut cmds: Vec<Command> = Vec::new();
         loop {
-            // Answer every whole command already buffered.
+            // Answer every whole command already buffered, a few at a
+            // time: a run of them may share one statement and one commit
+            // (Session::group), its replies sent once it has committed.
             loop {
-                let cmd = match decoder.decode(&mut inbuf) {
-                    Ok(Some(c)) => c,
-                    Ok(None) => break,
-                    Err(e) => {
-                        encode(&Frame::err(&e.to_string()), sess.proto, &mut out);
-                        stream.write_all(&out).await?;
-                        return Ok(());
+                let mut bad = None;
+                cmds.clear();
+                while cmds.len() < GROUP_MAX_COMMANDS {
+                    match decoder.decode(&mut inbuf) {
+                        Ok(Some(c)) => cmds.push(c),
+                        Ok(None) => break,
+                        Err(e) => {
+                            bad = Some(e);
+                            break;
+                        }
                     }
-                };
-                let frames = {
-                    let fut = sess.handle(cmd);
-                    tokio::pin!(fut);
-                    loop {
-                        tokio::select! {
-                            f = &mut fut => break Some(f),
-                            n = stream.read_buf(&mut inbuf) => {
-                                if n? == 0 {
-                                    // The client went away mid-command.
-                                    break None;
+                }
+                if cmds.is_empty() && bad.is_none() {
+                    break;
+                }
+                let mut at = 0;
+                while at < cmds.len() {
+                    let group = sess.group(&cmds[at..]);
+                    let replies = {
+                        let fut = async {
+                            match &group {
+                                Some(g) => sess.handle_group(g, &cmds[at..]).await,
+                                None => vec![sess.handle(cmds[at].clone()).await],
+                            }
+                        };
+                        tokio::pin!(fut);
+                        loop {
+                            tokio::select! {
+                                f = &mut fut => break Some(f),
+                                n = stream.read_buf(&mut inbuf) => {
+                                    if n? == 0 {
+                                        // The client went away mid-command.
+                                        break None;
+                                    }
                                 }
                             }
                         }
+                    };
+                    let Some(replies) = replies else {
+                        return Ok(());
+                    };
+                    at += replies.len().max(1);
+                    for f in replies.iter().flatten() {
+                        encode(f, sess.proto, &mut out);
                     }
-                };
-                let Some(frames) = frames else {
-                    return Ok(());
-                };
-                for f in &frames {
-                    encode(f, sess.proto, &mut out);
+                    if sess.closing {
+                        stream.write_all(&out).await?;
+                        return Ok(());
+                    }
+                    if out.len() > 64 * 1024 {
+                        stream.write_all(&out).await?;
+                        out.clear();
+                    }
                 }
-                if sess.closing {
+                if let Some(e) = bad {
+                    encode(&Frame::err(&e.to_string()), sess.proto, &mut out);
                     stream.write_all(&out).await?;
                     return Ok(());
-                }
-                if out.len() > 64 * 1024 {
-                    stream.write_all(&out).await?;
-                    out.clear();
                 }
             }
             if !out.is_empty() {

@@ -732,6 +732,7 @@ pub fn fuzz_server_auth(data: &[u8]) {
         persona,
         tls,
         nonce: [7; NONCE_LEN],
+        rsa: None,
     };
     let verdict = futures::executor::block_on(auth::authenticate(
         &mut aio,

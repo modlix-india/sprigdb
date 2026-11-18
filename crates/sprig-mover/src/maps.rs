@@ -158,6 +158,9 @@ impl MapIo for TenantMapIo {
                 }
                 let from = Placement::of(&m)?.cluster;
                 map::flip(&mut m, &me, to)?;
+                // The mover wrote the copy itself: reads on the new cluster
+                // wait for its last write before they may use a replica.
+                map::set_read_fence(&mut m, &h.start.to_string());
                 map::validate(&m)?;
                 let rec = Handoff {
                     tenant: self.tenant,
@@ -294,6 +297,9 @@ mod tests {
         assert_eq!(io.release(job, 2).await.unwrap(), Released::Committed);
         let st = io.read().await.unwrap();
         assert_eq!((st.cluster, st.epoch), (to, 2));
+        // A commit without a handoff position records no fence.
+        let (m, _) = io.maps.load(TenantId(3)).await.unwrap();
+        assert_eq!(Placement::of(&m).unwrap().read_fence, None);
         // Another job's hold is not ours.
         let other = JobId::new_v7();
         io.hold(other, 1, u64::MAX).await.unwrap();
@@ -335,6 +341,11 @@ mod tests {
         assert_eq!(r.hlc_floor, 6 << 32);
         let (m, _) = io.maps.load(TenantId(3)).await.unwrap();
         assert_eq!(r.map_version, m.map_version);
+        // Reads on the new cluster wait for the mover's last write there.
+        assert_eq!(
+            Placement::of(&m).unwrap().read_fence.as_deref(),
+            Some("2-201-77")
+        );
         // Without the hold, nothing is recorded.
         let other = JobId::new_v7();
         assert_eq!(

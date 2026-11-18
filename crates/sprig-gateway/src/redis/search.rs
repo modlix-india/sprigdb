@@ -40,6 +40,7 @@ use sprig_proto_redis::Frame;
 use sprig_redis::search::{FtCall, SearchCalls};
 use sprig_search::def::{FieldKind, IndexDef, Model, Source};
 use sprig_search::ft_agg::{AggVal, Row};
+use sprig_search::highlight::{self, Marks};
 use sprig_search::query::SearchQuery;
 use sprig_search::rpc::{Answer, Op};
 use sprig_search::schema::Key;
@@ -66,6 +67,12 @@ impl SearchCalls for GatewaySearch {
 fn error_frame(e: &SprigError) -> Frame {
     match e.code() {
         Some(SprigCode::SearchIndexNotFound) => Frame::error(e.message.clone()),
+        // Redis's own error prefixes (`SEARCH_PROP_NOT_FOUND ...`) as they are.
+        Some(SprigCode::SearchQuerySyntax | SprigCode::SearchFieldType)
+            if e.message.starts_with("SEARCH_") =>
+        {
+            Frame::error(e.message.clone())
+        }
         Some(SprigCode::SearchQuerySyntax | SprigCode::SearchFieldType) => Frame::err(&e.message),
         Some(c) => sprig_redis::reply::sprig(c, &e.message),
         None => match errno(e) {
@@ -168,6 +175,7 @@ async fn run(sql: &mut dyn SqlRunner, call: &FtCall<'_>) -> Result<Frame> {
         "ft.aggregate" => cx.aggregate(&a).await,
         "ft.explain" | "ft.explaincli" => cx.explain(&a).await,
         "ft.tagvals" => cx.tagvals(&a).await,
+        "ft.cursor" => cx.cursor(&a).await,
         other => Err(SprigError::new(
             SprigCode::SearchUnsupported,
             format!("{} is not supported", other.to_ascii_uppercase()),
@@ -725,6 +733,7 @@ impl Cx<'_, '_> {
                 min_should: 0,
             };
         }
+        let dress = Dress::new(&def, &customs, &ast, &opts)?;
         let end = opts.offset.saturating_add(opts.num);
         let (mut hits, total) = self
             .matches(&def, &customs, ast, opts.sortby.is_some(), end)
@@ -802,12 +811,12 @@ impl Cx<'_, '_> {
                         fields
                             .iter()
                             .find(|(e, _)| e.as_slice() == src.as_bytes())
-                            .map(|(_, v)| (bulk(alias.clone()), Frame::bulk_from(v)))
+                            .map(|(e, v)| (bulk(alias.clone()), dress.value(e, v)))
                     })
                     .collect(),
                 None => fields
                     .iter()
-                    .map(|(e, v)| (Frame::bulk_from(e), Frame::bulk_from(v)))
+                    .map(|(e, v)| (Frame::bulk_from(e), dress.value(e, v)))
                     .collect(),
             };
             let score = f64::from(h.score);
@@ -912,43 +921,416 @@ impl Cx<'_, '_> {
             rows.push(row);
         }
         let (count, rows) = plan.run(rows)?;
-        let resp3 = self.call.resp3;
         let count = i64::try_from(count).unwrap_or(i64::MAX);
-        let row_frame = |r: &Row| -> Vec<(Frame, Frame)> {
-            // A group of hashes without the field shows it as nil.
-            r.iter()
-                .map(|(k, v)| (bulk(k.clone()), agg_frame(v)))
-                .collect()
+        let Some(c) = plan.cursor else {
+            return Ok(rows_reply(self.call.resp3, count, &rows));
         };
-        Ok(if resp3 {
-            Frame::Map(vec![
-                (bulk("attributes"), Frame::Array(Vec::new())),
-                (bulk("warning"), Frame::Array(Vec::new())),
-                (bulk("total_results"), Frame::Integer(count)),
-                (bulk("format"), bulk("STRING")),
-                (
-                    bulk("results"),
-                    Frame::Array(
-                        rows.iter()
-                            .map(|r| {
-                                Frame::Map(vec![
-                                    (bulk("extra_attributes"), Frame::Map(row_frame(r))),
-                                    (bulk("values"), Frame::Array(Vec::new())),
-                                ])
-                            })
-                            .collect(),
-                    ),
-                ),
-            ])
+        // WITHCURSOR: the first COUNT rows now, the rest kept for
+        // FT.CURSOR READ by this login.
+        let mut rest: std::collections::VecDeque<Row> = rows.into();
+        let first: Vec<Row> = rest.drain(..c.count.min(rest.len())).collect();
+        let id = if rest.is_empty() {
+            0
         } else {
-            let mut out = vec![Frame::Integer(count)];
-            for r in &rows {
-                out.push(Frame::Array(
-                    row_frame(r).into_iter().flat_map(|(k, v)| [k, v]).collect(),
-                ));
+            cursors::open(cursors::Owner::of(self.call, &def.name), rest, c)?
+        };
+        Ok(Frame::Array(vec![
+            rows_reply(self.call.resp3, count, &first),
+            Frame::Integer(id),
+        ]))
+    }
+
+    /// `FT.CURSOR READ idx id [COUNT n]`, `FT.CURSOR DEL idx id`,
+    /// `FT.CURSOR GC idx`.
+    async fn cursor(&mut self, a: &[&[u8]]) -> Result<Frame> {
+        let sub = a
+            .first()
+            .map(|x| text(x).to_ascii_uppercase())
+            .unwrap_or_default();
+        let wrong = |s: &str| {
+            Err(ft::arg_error(format!(
+                "SEARCH_WRONG_ARGS wrong number of arguments for 'FT.CURSOR|{s}' command"
+            )))
+        };
+        match sub.as_str() {
+            "READ" | "DEL" | "GC" => {}
+            _ => {
+                return Err(ft::arg_error(format!(
+                    "SEARCH_UNKNOWN_SUBCOMMAND unknown subcommand '{}'. Try FT.CURSOR HELP.",
+                    a.first().map(|x| text(x)).unwrap_or_default()
+                )));
             }
-            Frame::Array(out)
-        })
+        }
+        let name = a.get(1).map(|x| text(x)).unwrap_or_default();
+        let (def, _) = self.index(&name).await?;
+        if sub == "GC" {
+            cursors::sweep();
+            return Ok(Frame::Integer(0));
+        }
+        let Some(raw) = a.get(2) else {
+            return wrong(&sub);
+        };
+        let id = text(raw)
+            .parse::<i64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or_else(|| ft::arg_error("SEARCH_BAD_CURSOR Bad cursor ID"))?;
+        let owner = cursors::Owner::of(self.call, &def.name);
+        if sub == "DEL" {
+            if a.len() > 3 {
+                return wrong(&sub);
+            }
+            return if cursors::remove(&owner, id) {
+                Ok(Frame::ok())
+            } else {
+                Err(ft::arg_error(
+                    "SEARCH_CURSOR_NOT_FOUND Cursor does not exist",
+                ))
+            };
+        }
+        let count = match (a.get(3), a.get(4)) {
+            (None, _) => None,
+            (Some(k), Some(n)) if text(k).eq_ignore_ascii_case("COUNT") && a.len() == 5 => Some(
+                usize::try_from(ft_agg::cursor_number(Some(n), "COUNT")?).unwrap_or(usize::MAX),
+            ),
+            _ => return wrong(&sub),
+        };
+        let (rows, next) = cursors::read(&owner, id, count).ok_or_else(|| {
+            ft::arg_error(format!(
+                "SEARCH_CURSOR_NOT_FOUND Cursor not found, id: {id}"
+            ))
+        })?;
+        Ok(Frame::Array(vec![
+            rows_reply(self.call.resp3, 0, &rows),
+            Frame::Integer(next),
+        ]))
+    }
+}
+
+/// `FT.AGGREGATE`'s rows as a reply: `count` first (RESP2), or
+/// `total_results` (RESP3).
+fn rows_reply(resp3: bool, count: i64, rows: &[Row]) -> Frame {
+    let row_frame = |r: &Row| -> Vec<(Frame, Frame)> {
+        // A group of hashes without the field shows it as nil.
+        r.iter()
+            .map(|(k, v)| (bulk(k.clone()), agg_frame(v)))
+            .collect()
+    };
+    if resp3 {
+        Frame::Map(vec![
+            (bulk("attributes"), Frame::Array(Vec::new())),
+            (bulk("warning"), Frame::Array(Vec::new())),
+            (bulk("total_results"), Frame::Integer(count)),
+            (bulk("format"), bulk("STRING")),
+            (
+                bulk("results"),
+                Frame::Array(
+                    rows.iter()
+                        .map(|r| {
+                            Frame::Map(vec![
+                                (bulk("extra_attributes"), Frame::Map(row_frame(r))),
+                                (bulk("values"), Frame::Array(Vec::new())),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+        ])
+    } else {
+        let mut out = vec![Frame::Integer(count)];
+        for r in rows {
+            out.push(Frame::Array(
+                row_frame(r).into_iter().flat_map(|(k, v)| [k, v]).collect(),
+            ));
+        }
+        Frame::Array(out)
+    }
+}
+
+/// `FT.SEARCH`'s `HIGHLIGHT` and `SUMMARIZE` of the returned text fields,
+/// from the values the session re-read.
+struct Dress {
+    marks: Marks,
+    highlight: Option<ft::Highlight>,
+    summarize: Option<ft::Summarize>,
+    /// Text fields by hash field: the analyzer, and whether each option
+    /// applies to it.
+    fields: HashMap<Vec<u8>, (sprig_search::analyze::Analyzer, bool, bool)>,
+}
+
+impl Dress {
+    /// 39822 (`SEARCH_PROP_NOT_FOUND`) for a field the index doesn't have.
+    fn new(
+        def: &IndexDef,
+        customs: &[sprig_search::analyze::CustomAnalyzer],
+        ast: &SearchQuery,
+        opts: &ft::SearchOpts,
+    ) -> Result<Self> {
+        let mut d = Self {
+            marks: Marks::default(),
+            highlight: opts.highlight.clone(),
+            summarize: opts.summarize.clone(),
+            fields: HashMap::new(),
+        };
+        if d.highlight.is_none() && d.summarize.is_none() {
+            return Ok(d);
+        }
+        let analyzers = sprig_search::analyze::Analyzers::resolve(
+            def.analyzer_names().iter().map(String::as_str),
+            customs,
+        )?;
+        d.marks = Marks::of(ast, &analyzers);
+        for list in [
+            d.highlight.as_ref().and_then(|h| h.fields.as_ref()),
+            d.summarize.as_ref().and_then(|s| s.fields.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(f) = list.iter().find(|f| def.fields_named(f).is_empty()) {
+                return Err(ft::arg_error(format!(
+                    "SEARCH_PROP_NOT_FOUND No such property `{f}`"
+                )));
+            }
+        }
+        let picks = |list: Option<&Vec<String>>, name: &str| {
+            list.is_none_or(|l| l.iter().any(|x| x == name))
+        };
+        for f in def.fields.iter().filter(|f| f.kind == FieldKind::Text) {
+            let an = analyzers
+                .get(f.index_analyzer(&def.default_analyzer))?
+                .clone();
+            let h = d
+                .highlight
+                .as_ref()
+                .is_some_and(|h| picks(h.fields.as_ref(), &f.name));
+            let s = d
+                .summarize
+                .as_ref()
+                .is_some_and(|s| picks(s.fields.as_ref(), &f.name));
+            if h || s {
+                d.fields
+                    .insert(f.source_ref.clone().into_bytes(), (an, h, s));
+            }
+        }
+        Ok(d)
+    }
+
+    /// The reply value of hash field `field`.
+    fn value(&self, field: &[u8], raw: &[u8]) -> Frame {
+        let Some((analyzer, marked, summed)) = self.fields.get(field) else {
+            return Frame::bulk_from(raw);
+        };
+        let text = String::from_utf8_lossy(raw);
+        let tags = self
+            .highlight
+            .as_ref()
+            .filter(|_| *marked)
+            .map(|x| (x.tags.0.as_str(), x.tags.1.as_str()));
+        let out = match (self.summarize.as_ref().filter(|_| *summed), tags) {
+            (Some(sm), tags) => highlight::summarize(
+                analyzer,
+                &text,
+                &self.marks,
+                sm.frags,
+                sm.len,
+                &sm.separator,
+                tags,
+            ),
+            (None, Some((open, close))) => {
+                highlight::mark(analyzer, &text, &self.marks, open, close)
+            }
+            (None, None) => return Frame::bulk_from(raw),
+        };
+        bulk(out)
+    }
+}
+
+/// `FT.AGGREGATE ... WITHCURSOR`'s kept rows, in this gateway process.
+///
+/// A cursor belongs to the login that made it (tenant, user, logical
+/// database and index), so another login, even one knowing its id, gets
+/// "Cursor not found". Rows were read through the maker's session when
+/// the aggregate ran: a later read shows them as they were then, as in
+/// Redis. A cursor unread for its `MAXIDLE` is dropped; a client that
+/// reconnects to another gateway doesn't find it.
+mod cursors {
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{LazyLock, Mutex};
+    use std::time::{Duration, Instant};
+
+    use sprig_common::Result;
+    use sprig_redis::search::FtCall;
+    use sprig_search::ft;
+    use sprig_search::ft_agg::{CursorOpts, Row};
+
+    /// Open cursors per tenant at most (Redis keeps 128 per index by
+    /// default; idle ones are swept first).
+    const PER_TENANT: usize = 128;
+
+    /// Who may read a cursor.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct Owner {
+        tenant: String,
+        user: String,
+        database: String,
+        db: u32,
+        index: String,
+    }
+
+    impl Owner {
+        pub(super) fn of(call: &FtCall<'_>, index: &str) -> Self {
+            Self {
+                tenant: call.scope.to_owned(),
+                user: call.user.to_owned(),
+                database: call.database.to_owned(),
+                db: call.db,
+                index: index.to_owned(),
+            }
+        }
+    }
+
+    struct Cursor {
+        owner: Owner,
+        rows: VecDeque<Row>,
+        count: usize,
+        max_idle: Duration,
+        last: Instant,
+    }
+
+    static CURSORS: LazyLock<Mutex<HashMap<i64, Cursor>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    fn table() -> std::sync::MutexGuard<'static, HashMap<i64, Cursor>> {
+        CURSORS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn sweep_in(t: &mut HashMap<i64, Cursor>) {
+        let now = Instant::now();
+        t.retain(|_, c| now.duration_since(c.last) < c.max_idle);
+    }
+
+    /// Drops idle cursors.
+    pub(super) fn sweep() {
+        sweep_in(&mut table());
+    }
+
+    /// Keeps `rows`; the new cursor's id.
+    ///
+    /// # Errors
+    /// 39822 when the tenant already holds [`PER_TENANT`] live cursors.
+    pub(super) fn open(owner: Owner, rows: VecDeque<Row>, o: CursorOpts) -> Result<i64> {
+        let mut t = table();
+        sweep_in(&mut t);
+        if t.values()
+            .filter(|c| c.owner.tenant == owner.tenant)
+            .count()
+            >= PER_TENANT
+        {
+            return Err(ft::arg_error(
+                "SEARCH_LIMIT Too many cursors allocated for index",
+            ));
+        }
+        let id = loop {
+            // A random positive id that isn't in use, as Redis's are.
+            let mut b = [0u8; 4];
+            getrandom::fill(&mut b)
+                .map_err(|e| sprig_common::SprigError::internal(e.to_string()))?;
+            let n = i64::from(u32::from_le_bytes(b) >> 1).max(1);
+            if !t.contains_key(&n) {
+                break n;
+            }
+        };
+        t.insert(
+            id,
+            Cursor {
+                owner,
+                rows,
+                count: o.count,
+                max_idle: Duration::from_millis(o.max_idle_ms),
+                last: Instant::now(),
+            },
+        );
+        Ok(id)
+    }
+
+    /// The next `count` rows (the cursor's own `COUNT` by default) of
+    /// `owner`'s cursor `id`, and the id to read next (0 at the end, when
+    /// the cursor is gone); `None` when it isn't `owner`'s live cursor.
+    pub(super) fn read(owner: &Owner, id: i64, count: Option<usize>) -> Option<(Vec<Row>, i64)> {
+        let mut t = table();
+        sweep_in(&mut t);
+        let c = t.get_mut(&id).filter(|c| &c.owner == owner)?;
+        let n = count.unwrap_or(c.count).min(c.rows.len());
+        let rows: Vec<Row> = c.rows.drain(..n).collect();
+        c.last = Instant::now();
+        if c.rows.is_empty() {
+            t.remove(&id);
+            return Some((rows, 0));
+        }
+        Some((rows, id))
+    }
+
+    /// Drops `owner`'s cursor `id`; whether there was one.
+    pub(super) fn remove(owner: &Owner, id: i64) -> bool {
+        let mut t = table();
+        sweep_in(&mut t);
+        if t.get(&id).is_some_and(|c| &c.owner == owner) {
+            t.remove(&id);
+            return true;
+        }
+        false
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use sprig_search::ft_agg::AggVal;
+
+        fn owner(user: &str) -> Owner {
+            Owner {
+                tenant: "7".into(),
+                user: user.into(),
+                database: "redis".into(),
+                db: 0,
+                index: "idx".into(),
+            }
+        }
+
+        #[test]
+        fn a_cursor_pages_its_rows_for_its_owner_only() {
+            let rows: VecDeque<Row> = (0..5)
+                .map(|i| vec![("n".to_owned(), AggVal::Num(f64::from(i)))])
+                .collect();
+            let o = CursorOpts {
+                count: 2,
+                max_idle_ms: 60_000,
+            };
+            let id = open(owner("alice"), rows, o).unwrap();
+            assert!(read(&owner("bob"), id, None).is_none());
+            assert!(!remove(&owner("bob"), id));
+            let (r, next) = read(&owner("alice"), id, None).unwrap();
+            assert_eq!((r.len(), next), (2, id));
+            let (r, next) = read(&owner("alice"), id, Some(10)).unwrap();
+            assert_eq!((r.len(), next), (3, 0));
+            assert!(read(&owner("alice"), id, None).is_none());
+            let id = open(owner("alice"), vec![Vec::new()].into(), o).unwrap();
+            assert!(remove(&owner("alice"), id));
+            assert!(!remove(&owner("alice"), id));
+        }
+
+        #[test]
+        fn an_idle_cursor_is_dropped() {
+            let o = CursorOpts {
+                count: 1,
+                max_idle_ms: 1,
+            };
+            let id = open(owner("carol"), vec![Vec::new(), Vec::new()].into(), o).unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+            assert!(read(&owner("carol"), id, None).is_none());
+        }
     }
 }
 

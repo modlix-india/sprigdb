@@ -80,7 +80,7 @@ Index names are unique per database; a duplicate fails with 1061. An object has 
 | `DATE` | A date | `DATE`, `DATETIME`, `TIMESTAMP`, `TIME` |
 | `BOOL` | A boolean | Numeric types |
 | `AUTOCOMPLETE` | Edge n-grams of 2 to 15 characters, for type-ahead | Text types |
-| `SUBSTRING` | Trigrams (n-grams of 3) | Text types |
+| `SUBSTRING` | Trigrams (n-grams of 3), which can speed up `LIKE '%...%'` (see [`LIKE` with `SUBSTRING` fields](#like-with-substring-fields)) | Text types |
 | `FACET` | Values counted by facets | Text types |
 
 A column of the wrong type fails with 39829. The same name may appear once per kind, so a column can be both `TEXT` and `KEYWORD`.
@@ -276,9 +276,65 @@ SELECT id FROM articles WHERE MATCH (title, body) AGAINST ('tutorial' WITH QUERY
 
 - A table without any search index keeps MariaDB's own `FULLTEXT` behaviour.
 - A table with search indexes, none of which covers the `MATCH` columns, fails with 39821.
-- `MATCH ... AGAINST (?)` works in server-side prepared statements. In a text statement, `AGAINST` needs a string literal (39823 otherwise).
-- As a condition, `MATCH` needs every match, up to `search.max_window` (10,000); more fails with 39827.
+- `MATCH ... AGAINST (?)` works in statements your driver prepares (server-side prepared statements). In a text statement, `AGAINST` needs a string literal (39823 otherwise). A search statement prepared in SQL, with `PREPARE` or `EXECUTE IMMEDIATE`, isn't supported yet: it fails with MariaDB's error 1191, even with a string literal.
+- As a condition, `MATCH` needs every match, up to `search.max_window` (10,000); more fails with 39827. Statements that ask only for the best rows are the exception; see [Top results](#top-results).
 - Scores are BM25 scores, so their values differ from MariaDB's relevance values. The order is usually similar.
+
+### Top results
+
+A statement that asks for the best few rows of a search, like the one above, reads the search a page at a time instead of reading every hit. SprigDB asks the index for the best `(offset + limit) × search.overfetch_factor` hits, runs the statement over them, and checks that it fills its `LIMIT`. If the statement's other conditions leave it short, SprigDB asks for four times as many hits, and so on up to `search.max_window`.
+
+What this means for you:
+
+- **It's faster on common words.** A word that matches 100,000 rows no longer reads them all to return 20. The cost is one extra counting statement per page, and one page is usually enough.
+- **It doesn't fail with 39827** because a word matches more than `search.max_window` rows.
+- **The answer is the same** as reading every hit. Rows with equal scores can come in any order, as in MariaDB.
+- **Very selective conditions can still fail.** If the best `search.max_window` hits still don't fill the `LIMIT`, the statement reads every hit, as other statements do, and fails with 39827 when there are more than `search.max_window`.
+
+A statement is read this way when:
+
+- it is a `SELECT` on one table;
+- every `MATCH` in it is the same search, with a literal `AGAINST`;
+- it is ordered by that `MATCH`, or its alias, `DESC`, and by nothing else;
+- it has a literal `LIMIT n`, `LIMIT m, n` or `LIMIT n OFFSET m`;
+- it has no `GROUP BY`, `HAVING`, `DISTINCT`, `UNION`, aggregates, window functions, subqueries, placeholders, `FOR UPDATE` or `INTO`.
+
+Joins and other statements read every hit. So does a user bound by a row policy on the table, because that user's scores count only the rows the user may see. The counter `sprig_search_top_k_total` counts statements by `result`: `paged` or `every_hit`.
+
+### `LIKE` with `SUBSTRING` fields
+
+With `search.like_acceleration` on, a `LIKE` with a leading wildcard can use a search index's `SUBSTRING` field instead of scanning the table:
+
+```sql test
+CREATE SEARCH INDEX product_names ON products (name SUBSTRING);
+
+SELECT id, name FROM products WHERE name LIKE '%unning sho%' ORDER BY id;
+```
+
+```text output
+id	name
+1	Trail running shoe
+2	Road running shoe
+3	Kids running shoe
+```
+
+The pattern's literal runs of 3 or more characters (between `%` and `_`, honouring `ESCAPE`) are looked up as trigrams in the index. The search waits for every committed write (`latest`), so no row is missed. MariaDB then checks the pattern on just the rows the index found, so the answer is the same as a scan. The statement runs as a plain scan when the pattern has no run of 3 characters, the column has no `SUBSTRING` field, the index finds more than `search.max_window` rows, or the search fails.
+
+It applies to `column LIKE 'literal' [ESCAPE 'c']`, alone or combined with `AND` and `OR`, in `WHERE` or `ON`, also inside parentheses and subqueries. It doesn't apply:
+
+- in a statement that uses `NOT`, `XOR`, `IS`, `<=>`, `!`, `CASE`, `IF`, `IFNULL`, `COALESCE`, `NULLIF` or `ISNULL` anywhere, because the change turns a `NULL` result into `FALSE` and these can tell the two apart;
+- to `LIKE ?` in server-side prepared statements, or to `LIKE` in the select list;
+- to a user bound by a row policy on the table, or one without `SELECT` on it.
+
+The setting is off by default. An operator turns it on for a data centre or globally:
+
+```sh
+sprigctl settings set search.like_acceleration true --scope global --reason "LIKE from SUBSTRING fields"
+```
+
+> **Check your collations first.** The index lowercases text and folds accented letters to plain ones, and it folds some letters into two, such as `ß` into `ss`. Where the column's collation treats such a letter as equal to one letter, as `utf8mb4_general_ci` treats `ß` and `s`, MariaDB's `LIKE` matches rows the index doesn't find. With the setting on, those rows are missing from the answer. Case- and accent-insensitive matching alone is safe. This is why the setting is off by default.
+
+The counter `sprig_search_like_total` counts these `LIKE` conditions by `result`: `narrowed` (only the rows the index found were read) or `scan`.
 
 ### `sprig_search()`
 
@@ -352,7 +408,9 @@ db.events.find(
 - `$caseSensitive` and `$diacriticSensitive` work: the search runs as usual, then only documents whose text contains each term and phrase with the same case or accents are kept.
 - `$text` always waits until the index holds every committed write (`latest`), because MongoDB updates text indexes with the write.
 - Without a text index, `$text` fails with 27 `IndexNotFound`.
-- `textScore` is BM25, so its values differ from MongoDB's.
+- `{ $meta: "textScore" }` is MongoDB's own score, so values and order match MongoDB's. For the query `shoe`, a document whose field is `"shoe"` scores 1.1, `"shoe shoe"` 1.5 and `"red shoe"` 0.75.
+
+`textScore` is worked out from each document alone, as MongoDB does. For each string the index covers, each query term found there adds the field's weight × a factor that grows with how often the term appears × `(0.5 × count / words + 0.5)`, and 10% more when the whole string is the term. Words are lowercased, stemmed and folded, and stop words don't count. For English these are MongoDB's own 174 stop words; other languages use the analyzer's lists, which can differ from MongoDB's. A document's own `language` field doesn't change how it is stemmed. Because the score depends only on the document, a user bound by a row policy gets the same scores as anyone else.
 
 ### Search indexes, `$search` and `$searchMeta`
 
@@ -493,6 +551,8 @@ gRPC clients call `sprig.v1.Search/Query` on the same port with the same fields.
 
 Scores are BM25 (k1 = 1.2, b = 0.75), multiplied by field and query boosts. Each copy holds all of an index's partitions, so by default (`search.scoring = global`) term statistics are summed over every partition and a document scores as it would in one unsharded index. `search.scoring = local` scores each partition with its own statistics, which is cheaper but lets the same document score differently in different partitions.
 
+MongoDB's `$text` is the exception: its `textScore` uses MongoDB's own formula, from each document alone (see [Text indexes and `$text`](#text-indexes-and-text)).
+
 ## Freshness and lag
 
 A copy follows the tenant's change feed: inserts and updates replace the document by key, deletes remove it, `TRUNCATE` empties the index, and dropping the object stops the copy. It commits at transaction boundaries every `search.commit_interval_ms` (500), sooner while a query is waiting, or after 10,000 pending changes. A search therefore sees committed writes typically within about a second.
@@ -538,7 +598,8 @@ All `search.*` settings are set at dc or global scope and apply live.
 | `search.scoring` | text | `global` | `global` or `local` statistics |
 | `search.max_window` | int | `10000` | Hits read per query |
 | `search.max_expansions` | int | `50` | Terms per fuzzy or prefix term |
-| `search.overfetch_factor` | int | `3` | Page multiplier when hidden rows leave a page short |
+| `search.overfetch_factor` | int | `3` | Page multiplier when hidden rows leave a page short, and for [top results](#top-results) |
+| `search.like_acceleration` | bool | `false` | Serve `LIKE '%...%'` from `SUBSTRING` fields; see [`LIKE` with `SUBSTRING` fields](#like-with-substring-fields) |
 | `search.highlight_chars` | int | `150` | Highlight fragment length |
 | `search.query_timeout_ms` | int | `5000` | Per copy |
 | `search.writer_memory_mb` | int | `32` | Indexing memory per partition |
@@ -570,6 +631,8 @@ Processes that hold copies read these environment variables:
 | `sprig_search_gateway_copies_total` | counter | none | Searches answered from a gateway's own copy |
 | `sprig_search_seed_page_seconds` | histogram | none | Time per page read while filling a copy |
 | `sprig_search_snapshot_bytes_total` | counter | none | Snapshot bytes written |
+| `sprig_search_top_k_total` | counter | `result` | SQL statements asking for the best rows of one search: `paged` (read a page at a time) or `every_hit` |
+| `sprig_search_like_total` | counter | `result` | `LIKE` conditions on a column with a `SUBSTRING` field, with `search.like_acceleration` on: `narrowed` or `scan` |
 
 See [Metrics](../reference/metrics.md).
 
@@ -598,7 +661,7 @@ MongoDB clients get the same numbers. See [Errors](../reference/errors.md).
 - Sorting search results by anything other than score, in REST and `$search`.
 - Facets from SQL; use `$searchMeta` or the REST `facets` field.
 - Per-query languages in `$text`, and `language_override`.
-- Accelerating `LIKE '%...%'` with `SUBSTRING` fields.
+- Reading a search a page at a time in joins and other statements that aren't [top results](#top-results).
 - Indexing lists, sets and sorted sets of key-value namespaces.
 - Some Redis `FT.*` commands and options; see [Search (`FT.*`)](../connect/redis.md#search-ft).
 

@@ -113,7 +113,11 @@ Remove the override with `ALTER TABLE accounts SPRIG RESET (reads.routing);`.
 
 ## Reads during moves and failover
 
-While a shard is being cut over to another cluster, or a tenant moves to another data centre, statements wait for the cutover (up to its hold) rather than run against a copy that isn't caught up; a statement still waiting when the hold's deadline passes fails with error 1205 and can be retried. During a data-centre failover, every statement of the tenant, reads included, waits until the new home has caught up. A replica that falls behind or stops is skipped by the next read, and a read that fails on a replica before sending anything is retried elsewhere. See [Failover](../operate/failover.md) and [Backups and moves](../operate/backups-and-moves.md).
+While a shard is being cut over to another cluster, or a tenant moves to another data centre, statements wait for the cutover (up to its hold) rather than run against a copy that isn't caught up; a statement still waiting when the hold's deadline passes fails with error 1205 and can be retried. During a data-centre failover, every statement of the tenant, reads included, waits until the new home has caught up.
+
+After a tenant or a shard moves to a cluster with replicas, its reads go only to replicas that have applied the moved rows. The move records the new writer's position when it finishes, and every plain read of the tenant on that cluster waits for that position, as a read after your own write does, whatever `reads.causal_scope` says. Until a replica catches up, the tenant's reads there go to the writer or wait briefly for a replica that is nearly there; after that, replicas serve them again. This covers SQL and MongoDB reads, on sessions opened before or after the move. Moves between data centres are covered by the hold described above instead.
+
+A replica that falls behind or stops is skipped by the next read, and a read that fails on a replica before sending anything is retried elsewhere. See [Failover](../operate/failover.md) and [Backups and moves](../operate/backups-and-moves.md).
 
 ## Watch read routing
 

@@ -22,7 +22,9 @@ use sprig_common::ids::TenantId;
 use sprig_common::{SprigCode, SprigError};
 use sprig_doc::engine::{Ns, SqlRunner};
 use sprig_doc::meta::CollMeta;
-use sprig_doc::text::{TextCall, TextCreate, TextHits, TextIndexInfo, TextKind, TextSearch};
+use sprig_doc::text::{
+    DocScorer, TextCall, TextCreate, TextHits, TextIndexInfo, TextKind, TextSearch,
+};
 use sprig_proto_mongo::errors::{MongoError, code};
 use sprig_search::def::{Flavor, IndexDef, Model};
 use sprig_search::query::{SearchQuery, parse_atlas, parse_mongo_text};
@@ -83,6 +85,69 @@ fn language_of(def: &IndexDef) -> String {
         .strip_prefix("mongo_")
         .unwrap_or(&def.default_analyzer)
         .to_owned()
+}
+
+/// MongoDB's `textScore` of `$search` text `query` on the text index
+/// `def`, computed from each document (`sprig_search::mongo_score`): the
+/// index's fields with their weights, every other string too for a `$**`
+/// index (weight 1, or the `$**` weight).
+fn mongo_text_scorer(def: &IndexDef, query: &str) -> sprig_common::Result<DocScorer> {
+    let scorer = sprig_search::mongo_score::MongoTextScore::new(&language_of(def), query)?;
+    let fields: Vec<(String, f64)> = def
+        .fields
+        .iter()
+        .map(|f| (f.name.clone(), f.boost))
+        .collect();
+    let wildcard = def.dynamic.then_some(1.0);
+    let scorer = Mutex::new(scorer);
+    Ok(DocScorer(Arc::new(move |d: &Document| {
+        let mut s = scorer.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut acc = HashMap::new();
+        let mut strings: Vec<(String, &str)> = Vec::new();
+        collect_strings(d, "", &mut strings);
+        for (path, text) in strings {
+            let w = fields
+                .iter()
+                .find(|(p, _)| *p == path)
+                .map(|(_, w)| *w)
+                .or(wildcard);
+            if let Some(w) = w {
+                s.add(text, w, &mut acc);
+            }
+        }
+        s.total(&acc)
+    })))
+}
+
+/// Every string in `d` with its dotted path (array positions left out),
+/// except SprigDB's hidden fields and the language override (`language`),
+/// which MongoDB doesn't score.
+fn collect_strings<'a>(d: &'a Document, prefix: &str, out: &mut Vec<(String, &'a str)>) {
+    fn walk<'a>(v: &'a Bson, path: &str, out: &mut Vec<(String, &'a str)>) {
+        match v {
+            Bson::String(s) => out.push((path.to_owned(), s.as_str())),
+            Bson::Array(a) => {
+                for x in a {
+                    walk(x, path, out);
+                }
+            }
+            Bson::Document(d) => collect_strings(d, path, out),
+            _ => {}
+        }
+    }
+    for (k, v) in d {
+        if (prefix.is_empty() && k.starts_with("__sprig"))
+            || (k == "language" && matches!(v, Bson::String(_)))
+        {
+            continue;
+        }
+        let path = if prefix.is_empty() {
+            k.clone()
+        } else {
+            format!("{prefix}.{k}")
+        };
+        walk(v, &path, out);
+    }
 }
 
 /// A `text` index as `listIndexes` shows it.
@@ -738,6 +803,7 @@ impl TextSearch for DocSearch {
                         .into_iter()
                         .map(|h| (h.key.0, f64::from(h.score)))
                         .collect(),
+                    scorer: Some(mongo_text_scorer(def, text).map_err(|e| mongo(&e))?),
                     ..TextHits::default()
                 })
             }
@@ -806,6 +872,7 @@ impl TextSearch for DocSearch {
                         .collect(),
                     meta: None,
                     highlights,
+                    scorer: None,
                 })
             }
             TextCall::Meta(spec) => {

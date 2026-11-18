@@ -16,15 +16,15 @@
 //! START TRANSACTION;
 //! SELECT now_ms, t.type, t.v, IFNULL(t.n,0), IFNULL(t.lh,0), IFNULL(t.lt,0), t.g,
 //!        t.expires_at, (t.expires_at IS NOT NULL AND t.expires_at <= UTC_TIMESTAMP(3))
-//!   INTO @now, @t, @sv, @n, @lh, @lt, @g, @e, @x
+//!   INTO sp_now, sp_t, sp_sv, sp_n, sp_lh, sp_lt, sp_g, sp_e, sp_x
 //!   FROM (SELECT 1 AS one) AS d LEFT JOIN <keys> AS t
 //!     ON t.k = :k AND t._sprig_dk = :dk FOR UPDATE;
-//! IF @x THEN <delete the key row and its elements>; <reset to absent>; END IF;
+//! IF sp_x THEN <delete the key row and its elements>; <reset to absent>; END IF;
 //! ```
 //!
 //! The left join always returns one row, so every variable is assigned
 //! (`NULL` for an absent key) and MariaDB raises no "no data" warning.
-//! Later statements are guarded by `@rc` (0 = go, 1 = nothing to do,
+//! Later statements are guarded by `sp_rc` (0 = go, 1 = nothing to do,
 //! 2 = `WRONGTYPE`, 3 = not an integer, 4 = overflow), so a refused
 //! command changes nothing. A new key is a plain `INSERT`: two clients
 //! creating one key meet on its primary key (1062) and the loser reruns
@@ -32,12 +32,19 @@
 //! handler rolls back and re-raises the error (the caller still sends
 //! `ROLLBACK`, a no-op). On a sharded database the gateway routes the
 //! statement by its `_sprig_dk` literal (`sprig_router::compound`).
+//!
+//! The block's state is local variables (`DECLARE sp_t ...`), so the
+//! statement leaves no session state behind for the gateway to read back.
+//!
+//! **Groups.** Several of these commands (and `GET`s) a client pipelined
+//! run as one [`Group`]: the same steps one after the other in one block
+//! and one transaction, each command's rows tagged with its position.
 
 // The batches are SQL text built piece by piece.
 #![allow(clippy::format_push_string)]
 
 use bytes::Bytes;
-use sprig_kv::layout::{KeyType, MAX_ELEMENT_BYTES, MAX_KEY_BYTES, Namespace};
+use sprig_kv::layout::{KeyType, MAX_ELEMENT_BYTES, MAX_KEY_BYTES, Namespace, live};
 use sprig_kv::sql::{cell_i64, lit};
 use sprig_kv::time::{MAX_MS, NOW_MS_SQL, datetime_lit};
 use sprig_kv::{Row, SqlError, SqlRunner};
@@ -51,6 +58,22 @@ use crate::reply;
 const MAX_ITEMS: usize = 200;
 /// Most argument bytes one batch carries (the packet stays small).
 const MAX_BYTES: usize = 1 << 20;
+
+/// Opens every compound statement: an error rolls the transaction back
+/// inside the statement, so no connection is left with it open (the
+/// shard's connection may not be the session's own); RESIGNAL keeps the
+/// error.
+///
+/// The block's state is local variables (`sp_*`), not user variables: a
+/// user variable an executed statement assigns is session state the
+/// gateway reads back after the statement (one more round trip) and
+/// restores on the next connection.
+const BLOCK_START: &str = "BEGIN NOT ATOMIC \
+     DECLARE sp_now BIGINT; DECLARE sp_t VARCHAR(8); DECLARE sp_sv LONGBLOB; \
+     DECLARE sp_n, sp_lh, sp_lt, sp_add, sp_have, sp_chg, sp_c, sp_lo, sp_hi BIGINT; \
+     DECLARE sp_g BIGINT UNSIGNED; DECLARE sp_e DATETIME(3); DECLARE sp_x, sp_rc INT; \
+     DECLARE sp_r DECIMAL(25,0); \
+     DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK; RESIGNAL; END; START TRANSACTION; ";
 
 /// Which end of a list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,8 +360,8 @@ pub fn plan(ns: &Namespace, name: &str, a: &[Bytes]) -> Option<Plan> {
     }
 }
 
-/// The prologue: lock the key row, clear an expired key. `sv`: read the
-/// string value into `@sv`.
+/// The prologue (inside the transaction): lock the key row, clear an
+/// expired key. `sv`: read the string value into `sp_sv`.
 fn prologue(ns: &Namespace, key: &[u8], sv: bool) -> String {
     let keys = ns.keys();
     let k = lit(key);
@@ -346,16 +369,15 @@ fn prologue(ns: &Namespace, key: &[u8], sv: bool) -> String {
     // routes the whole compound statement by it.
     let dk = lit(ns.dist_key(key));
     format!(
-        "START TRANSACTION; \
-         SELECT {NOW_MS_SQL}, t.type, {v}, IFNULL(t.n, 0), IFNULL(t.lh, 0), IFNULL(t.lt, 0), t.g, t.expires_at, \
+        "SELECT {NOW_MS_SQL}, t.type, {v}, IFNULL(t.n, 0), IFNULL(t.lh, 0), IFNULL(t.lt, 0), t.g, t.expires_at, \
          (t.expires_at IS NOT NULL AND t.expires_at <= UTC_TIMESTAMP(3)) \
-         INTO @now, @t, @sv, @n, @lh, @lt, @g, @e, @x \
+         INTO sp_now, sp_t, sp_sv, sp_n, sp_lh, sp_lt, sp_g, sp_e, sp_x \
          FROM (SELECT 1 AS one) AS d LEFT JOIN {keys} AS t ON t.k = {k} AND t._sprig_dk = {dk} FOR UPDATE; \
-         IF @x THEN DELETE FROM {keys} WHERE k = {k}; \
-         IF @t = 'zset' THEN DELETE FROM {zs} WHERE k = {k} AND g = @g; \
-         ELSEIF @t <> 'string' THEN DELETE FROM {el} WHERE k = {k} AND g = @g; END IF; \
-         SET @t = NULL, @sv = NULL, @n = 0, @lh = 0, @lt = 0, @e = NULL; END IF; \
-         SET @rc = 0; ",
+         IF sp_x THEN DELETE FROM {keys} WHERE k = {k}; \
+         IF sp_t = 'zset' THEN DELETE FROM {zs} WHERE k = {k} AND g = sp_g; \
+         ELSEIF sp_t <> 'string' THEN DELETE FROM {el} WHERE k = {k} AND g = sp_g; END IF; \
+         SET sp_t = NULL, sp_sv = NULL, sp_n = 0, sp_lh = 0, sp_lt = 0, sp_e = NULL; END IF; \
+         SET sp_rc = 0; ",
         v = if sv { "t.v" } else { "NULL" },
         zs = ns.zset(),
         el = ns.elems(),
@@ -366,15 +388,15 @@ fn prologue(ns: &Namespace, key: &[u8], sv: bool) -> String {
 fn drop_key(ns: &Namespace, k: &str) -> String {
     format!(
         "DELETE FROM {keys} WHERE k = {k}; \
-         IF @t = 'zset' THEN DELETE FROM {zs} WHERE k = {k} AND g = @g; \
-         ELSEIF @t <> 'string' THEN DELETE FROM {el} WHERE k = {k} AND g = @g; END IF; ",
+         IF sp_t = 'zset' THEN DELETE FROM {zs} WHERE k = {k} AND g = sp_g; \
+         ELSEIF sp_t <> 'string' THEN DELETE FROM {el} WHERE k = {k} AND g = sp_g; END IF; ",
         keys = ns.keys(),
         zs = ns.zset(),
         el = ns.elems(),
     )
 }
 
-/// A new key row of type `t`; `g` from `@g`, `_v` = `ver`.
+/// A new key row of type `t`; `g` from `sp_g`, `_v` = `ver`.
 fn insert_key(
     ns: &Namespace,
     key: &[u8],
@@ -386,7 +408,7 @@ fn insert_key(
 ) -> String {
     format!(
         "INSERT INTO {} (k, type, v, n, lh, lt, g, _v, expires_at, _sprig_dk, _sprig_rk) \
-         VALUES ({}, '{}', {v}, {n}, @lh, @lt, @g, {ver}, {exp}, {}, {}); ",
+         VALUES ({}, '{}', {v}, {n}, sp_lh, sp_lt, sp_g, {ver}, {exp}, {}, {}); ",
         ns.keys(),
         lit(key),
         t.as_str(),
@@ -413,17 +435,44 @@ impl Plan {
     /// each attempt).
     #[must_use]
     pub fn sql(&self, ns: &Namespace) -> String {
-        let ver = new_version();
+        let (body, result) = self.steps(ns, new_version(), None);
+        let mut s = String::with_capacity(body.len() + result.len() + 128);
+        s.push_str(BLOCK_START);
+        s.push_str(&body);
+        s.push_str("COMMIT; ");
+        s.push_str(&result);
+        s.push_str("END");
+        s
+    }
+
+    /// The command's statements inside a transaction the caller opens
+    /// (the prologue, the guarded writes, and for a pop the select of the
+    /// popped items), and the select of its reply's source, each ending
+    /// in "; ". With `tag`, every row the command returns starts with
+    /// that number (a group of commands in one statement, [`Group`]).
+    fn steps(&self, ns: &Namespace, ver: u64, tag: Option<usize>) -> (String, String) {
         let key = self.key();
         let k = lit(key);
         let keys = ns.keys();
+        let tag = tag.map_or_else(String::new, |t| format!("{t}, "));
         let mut s = String::with_capacity(1024);
-        // An error rolls the transaction back inside the statement, so no
-        // connection is left with it open (the shard's connection may not
-        // be the session's own); RESIGNAL keeps the error.
-        s.push_str(
-            "BEGIN NOT ATOMIC DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK; RESIGNAL; END; ",
-        );
+        let result = match self {
+            Self::Set { get, .. } => {
+                format!(
+                    "SELECT {tag}sp_rc, {}; ",
+                    if *get {
+                        "IF(sp_t = 'string', sp_sv, NULL)"
+                    } else {
+                        "NULL"
+                    }
+                )
+            }
+            Self::Incr { .. } => format!("SELECT {tag}sp_rc, CAST(sp_r AS SIGNED); "),
+            Self::Hset { .. } => format!("SELECT {tag}sp_rc, sp_add; "),
+            Self::Push { .. } => format!("SELECT {tag}sp_rc, sp_n; "),
+            Self::Pop { .. } => String::new(),
+            Self::Zadd { .. } => format!("SELECT {tag}sp_rc, sp_add, sp_chg; "),
+        };
         match self {
             Self::Set {
                 v,
@@ -435,29 +484,29 @@ impl Plan {
             } => {
                 s.push_str(&prologue(ns, key, *get));
                 let go = if *nx {
-                    "@t IS NULL"
+                    "sp_t IS NULL"
                 } else if *xx {
-                    "@t IS NOT NULL"
+                    "sp_t IS NOT NULL"
                 } else {
                     "TRUE"
                 };
                 let exp = match ttl.0 {
                     Ttl::Unset => "NULL".to_owned(),
-                    Ttl::Keep => "@e".to_owned(),
+                    Ttl::Keep => "sp_e".to_owned(),
                     Ttl::At(ms) => datetime_lit(ms),
                     Ttl::In(ms) => format!(
-                        "TIMESTAMPADD(MICROSECOND, LEAST(@now + {ms}, {MAX_MS}) * 1000, '1970-01-01 00:00:00')"
+                        "TIMESTAMPADD(MICROSECOND, LEAST(sp_now + {ms}, {MAX_MS}) * 1000, '1970-01-01 00:00:00')"
                     ),
                 };
                 let vl = lit(v);
                 s.push_str(&format!(
-                    "IF {get} AND @t IS NOT NULL AND @t <> 'string' THEN SET @rc = 2; \
-                     ELSEIF NOT ({go}) THEN SET @rc = 1; END IF; \
-                     IF @rc = 0 THEN \
-                     IF @t = 'string' THEN UPDATE {keys} SET v = {vl}, n = 0, lh = 0, lt = 0, _v = {ver}, expires_at = {exp} WHERE k = {k}; \
-                     ELSE IF @t IS NOT NULL THEN {drop} END IF; \
-                     SET @g = {ver}, @lh = 0, @lt = 0; {ins}END IF; END IF; \
-                     COMMIT; SELECT @rc, IF(@t = 'string', @sv, NULL); END",
+                    "IF {get} AND sp_t IS NOT NULL AND sp_t <> 'string' THEN SET sp_rc = 2; \
+                     ELSEIF NOT ({go}) THEN SET sp_rc = 1; END IF; \
+                     IF sp_rc = 0 THEN \
+                     IF sp_t = 'string' THEN UPDATE {keys} SET v = {vl}, n = 0, lh = 0, lt = 0, _v = {ver}, expires_at = {exp} WHERE k = {k}; \
+                     ELSE IF sp_t IS NOT NULL THEN {drop} END IF; \
+                     SET sp_g = {ver}, sp_lh = 0, sp_lt = 0; {ins}END IF; END IF; \
+                     ",
                     get = if *get { "TRUE" } else { "FALSE" },
                     drop = drop_key(ns, &k),
                     ins = insert_key(ns, key, KeyType::String, &vl, "0", &exp, ver),
@@ -466,22 +515,22 @@ impl Plan {
             Self::Incr { by, .. } => {
                 s.push_str(&prologue(ns, key, true));
                 s.push_str(&format!(
-                    "SET @r = NULL; \
-                     IF @t IS NOT NULL AND @t <> 'string' THEN SET @rc = 2; \
-                     ELSEIF @sv IS NOT NULL AND NOT (@sv = '0' OR (LENGTH(@sv) <= 20 AND LOCATE(X'0A', @sv) = 0 \
-                     AND @sv REGEXP '^-?[1-9][0-9]*$' \
-                     AND CAST(@sv AS DECIMAL(25,0)) BETWEEN -9223372036854775808 AND 9223372036854775807)) THEN SET @rc = 3; \
-                     ELSE SET @r = CAST(IFNULL(@sv, '0') AS DECIMAL(25,0)) + {by}; \
-                     IF @r < -9223372036854775808 OR @r > 9223372036854775807 THEN SET @rc = 4; END IF; END IF; \
-                     IF @rc = 0 THEN \
-                     IF @t = 'string' THEN UPDATE {keys} SET v = CAST(CAST(@r AS SIGNED) AS CHAR), n = 0, lh = 0, lt = 0, _v = {ver} WHERE k = {k}; \
-                     ELSE SET @g = {ver}, @lh = 0, @lt = 0; {ins}END IF; END IF; \
-                     COMMIT; SELECT @rc, CAST(@r AS SIGNED); END",
+                    "SET sp_r = NULL; \
+                     IF sp_t IS NOT NULL AND sp_t <> 'string' THEN SET sp_rc = 2; \
+                     ELSEIF sp_sv IS NOT NULL AND NOT (sp_sv = '0' OR (LENGTH(sp_sv) <= 20 AND LOCATE(X'0A', sp_sv) = 0 \
+                     AND sp_sv REGEXP '^-?[1-9][0-9]*$' \
+                     AND CAST(sp_sv AS DECIMAL(25,0)) BETWEEN -9223372036854775808 AND 9223372036854775807)) THEN SET sp_rc = 3; \
+                     ELSE SET sp_r = CAST(IFNULL(sp_sv, '0') AS DECIMAL(25,0)) + {by}; \
+                     IF sp_r < -9223372036854775808 OR sp_r > 9223372036854775807 THEN SET sp_rc = 4; END IF; END IF; \
+                     IF sp_rc = 0 THEN \
+                     IF sp_t = 'string' THEN UPDATE {keys} SET v = CAST(CAST(sp_r AS SIGNED) AS CHAR), n = 0, lh = 0, lt = 0, _v = {ver} WHERE k = {k}; \
+                     ELSE SET sp_g = {ver}, sp_lh = 0, sp_lt = 0; {ins}END IF; END IF; \
+                     ",
                     ins = insert_key(
                         ns,
                         key,
                         KeyType::String,
-                        "CAST(CAST(@r AS SIGNED) AS CHAR)",
+                        "CAST(CAST(sp_r AS SIGNED) AS CHAR)",
                         "0",
                         "NULL",
                         ver
@@ -498,24 +547,26 @@ impl Plan {
                 let route = format!("{}, {}", lit(ns.dist_key(key)), ns.routing_hash(key));
                 let vals = pairs
                     .iter()
-                    .map(|(f, v)| format!("({k}, @g, {}, {}, {}, {route})", crc(f), lit(f), lit(v)))
+                    .map(|(f, v)| {
+                        format!("({k}, sp_g, {}, {}, {}, {route})", crc(f), lit(f), lit(v))
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 s.push_str(&format!(
-                    "SET @add = 0; \
-                     IF @t IS NOT NULL AND @t <> 'hash' THEN SET @rc = 2; \
+                    "SET sp_add = 0; \
+                     IF sp_t IS NOT NULL AND sp_t <> 'hash' THEN SET sp_rc = 2; \
                      ELSE \
-                     IF @t IS NULL THEN SET @g = {ver}, @lh = 0, @lt = 0, @have = 0; \
-                     ELSE SELECT COUNT(*) INTO @have FROM {el} WHERE k = {k} AND g = @g AND ({pred}); END IF; \
+                     IF sp_t IS NULL THEN SET sp_g = {ver}, sp_lh = 0, sp_lt = 0, sp_have = 0; \
+                     ELSE SELECT COUNT(*) INTO sp_have FROM {el} WHERE k = {k} AND g = sp_g AND ({pred}); END IF; \
                      INSERT INTO {el} (k, g, o, e, v, _sprig_dk, _sprig_rk) VALUES {vals} ON DUPLICATE KEY UPDATE v = VALUES(v); \
-                     SET @add = {nf} - @have; \
-                     IF @t IS NULL THEN {ins}\
-                     ELSE UPDATE {keys} SET n = n + @add, _v = {ver} WHERE k = {k}; END IF; \
+                     SET sp_add = {nf} - sp_have; \
+                     IF sp_t IS NULL THEN {ins}\
+                     ELSE UPDATE {keys} SET n = n + sp_add, _v = {ver} WHERE k = {k}; END IF; \
                      END IF; \
-                     COMMIT; SELECT @rc, @add; END",
+                     ",
                     el = ns.elems(),
                     nf = pairs.len(),
-                    ins = insert_key(ns, key, KeyType::Hash, "NULL", "@add", "NULL", ver),
+                    ins = insert_key(ns, key, KeyType::Hash, "NULL", "sp_add", "NULL", ver),
                 ));
             }
             Self::Push {
@@ -532,55 +583,62 @@ impl Plan {
                     .enumerate()
                     .map(|(i, v)| {
                         let o = match end {
-                            End::Left => format!("@lh - {}", i + 1),
-                            End::Right => format!("@lt + {i}"),
+                            End::Left => format!("sp_lh - {}", i + 1),
+                            End::Right => format!("sp_lt + {i}"),
                         };
-                        format!("({k}, @g, {o}, '', {}, {route})", lit(v))
+                        format!("({k}, sp_g, {o}, '', {}, {route})", lit(v))
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
                 let bounds = match end {
-                    End::Left => format!("@lh = @lh - {m}"),
-                    End::Right => format!("@lt = @lt + {m}"),
+                    End::Left => format!("sp_lh = sp_lh - {m}"),
+                    End::Right => format!("sp_lt = sp_lt + {m}"),
                 };
                 s.push_str(&format!(
-                    "IF @t IS NOT NULL AND @t <> 'list' THEN SET @rc = 2; \
-                     ELSEIF @t IS NULL AND {ox} THEN SET @rc = 1; \
+                    "IF sp_t IS NOT NULL AND sp_t <> 'list' THEN SET sp_rc = 2; \
+                     ELSEIF sp_t IS NULL AND {ox} THEN SET sp_rc = 1; \
                      ELSE \
-                     IF @t IS NULL THEN SET @g = {ver}, @lh = 0, @lt = 0, @n = 0; END IF; \
+                     IF sp_t IS NULL THEN SET sp_g = {ver}, sp_lh = 0, sp_lt = 0, sp_n = 0; END IF; \
                      INSERT INTO {el} (k, g, o, e, v, _sprig_dk, _sprig_rk) VALUES {vals}; \
-                     SET {bounds}, @n = @n + {m}; \
-                     IF @t IS NULL THEN {ins}\
-                     ELSE UPDATE {keys} SET n = @n, lh = @lh, lt = @lt, _v = {ver} WHERE k = {k}; END IF; \
+                     SET {bounds}, sp_n = sp_n + {m}; \
+                     IF sp_t IS NULL THEN {ins}\
+                     ELSE UPDATE {keys} SET n = sp_n, lh = sp_lh, lt = sp_lt, _v = {ver} WHERE k = {k}; END IF; \
                      END IF; \
-                     COMMIT; SELECT @rc, @n; END",
+                     ",
                     ox = if *only_existing { "TRUE" } else { "FALSE" },
                     el = ns.elems(),
-                    ins = insert_key(ns, key, KeyType::List, "NULL", "@n", "NULL", ver),
+                    ins = insert_key(ns, key, KeyType::List, "NULL", "sp_n", "NULL", ver),
                 ));
             }
             Self::Pop { count, end, .. } => {
                 s.push_str(&prologue(ns, key, false));
                 let c = count.unwrap_or(1);
                 let (range, order, bounds) = match end {
-                    End::Left => ("@lo = @lh, @hi = @lh + @c", "ASC", "@lh = @lh + @c"),
-                    End::Right => ("@lo = @lt - @c, @hi = @lt", "DESC", "@lt = @lt - @c"),
+                    End::Left => (
+                        "sp_lo = sp_lh, sp_hi = sp_lh + sp_c",
+                        "ASC",
+                        "sp_lh = sp_lh + sp_c",
+                    ),
+                    End::Right => (
+                        "sp_lo = sp_lt - sp_c, sp_hi = sp_lt",
+                        "DESC",
+                        "sp_lt = sp_lt - sp_c",
+                    ),
                 };
                 let el = ns.elems();
                 s.push_str(&format!(
-                    "SET @c = 0, @lo = 0, @hi = 0; \
-                     IF @t IS NOT NULL AND @t <> 'list' THEN SET @rc = 2; \
-                     ELSEIF @t IS NULL THEN SET @rc = 1; \
-                     ELSE SET @c = GREATEST(LEAST({c}, @n), 0); SET {range}; END IF; \
-                     SELECT @rc, x.v FROM (SELECT 1 AS one) AS d LEFT JOIN {el} AS x \
-                     ON x.k = {k} AND x.g = @g AND x.o >= @lo AND x.o < @hi ORDER BY x.o {order}; \
-                     IF @c > 0 THEN \
-                     DELETE FROM {el} WHERE k = {k} AND g = @g AND o >= @lo AND o < @hi; \
-                     SET @n = @n - @c, {bounds}; \
-                     IF @n <= 0 THEN DELETE FROM {keys} WHERE k = {k}; DELETE FROM {el} WHERE k = {k} AND g = @g; \
-                     ELSE UPDATE {keys} SET n = @n, lh = @lh, lt = @lt, _v = {ver} WHERE k = {k}; END IF; \
-                     END IF; \
-                     COMMIT; END",
+                    "SET sp_c = 0, sp_lo = 0, sp_hi = 0; \
+                     IF sp_t IS NOT NULL AND sp_t <> 'list' THEN SET sp_rc = 2; \
+                     ELSEIF sp_t IS NULL THEN SET sp_rc = 1; \
+                     ELSE SET sp_c = GREATEST(LEAST({c}, sp_n), 0); SET {range}; END IF; \
+                     SELECT {tag}sp_rc, x.v FROM (SELECT 1 AS one) AS d LEFT JOIN {el} AS x \
+                     ON x.k = {k} AND x.g = sp_g AND x.o >= sp_lo AND x.o < sp_hi ORDER BY x.o {order}; \
+                     IF sp_c > 0 THEN \
+                     DELETE FROM {el} WHERE k = {k} AND g = sp_g AND o >= sp_lo AND o < sp_hi; \
+                     SET sp_n = sp_n - sp_c, {bounds}; \
+                     IF sp_n <= 0 THEN DELETE FROM {keys} WHERE k = {k}; DELETE FROM {el} WHERE k = {k} AND g = sp_g; \
+                     ELSE UPDATE {keys} SET n = sp_n, lh = sp_lh, lt = sp_lt, _v = {ver} WHERE k = {k}; END IF; \
+                     END IF; ",
                 ));
             }
             Self::Zadd {
@@ -622,33 +680,33 @@ impl Plan {
                 };
                 let zs = ns.zset();
                 let join = format!(
-                    "FROM ({derived}) AS x LEFT JOIN {zs} AS z ON z.k = {k} AND z.g = @g AND z.o = x.o AND z.m = x.m"
+                    "FROM ({derived}) AS x LEFT JOIN {zs} AS z ON z.k = {k} AND z.g = sp_g AND z.o = x.o AND z.m = x.m"
                 );
                 s.push_str(&format!(
-                    "SET @add = 0, @chg = 0; \
-                     IF @t IS NOT NULL AND @t <> 'zset' THEN SET @rc = 2; \
-                     ELSEIF @t IS NULL AND {xxs} THEN SET @rc = 0; \
+                    "SET sp_add = 0, sp_chg = 0; \
+                     IF sp_t IS NOT NULL AND sp_t <> 'zset' THEN SET sp_rc = 2; \
+                     ELSEIF sp_t IS NULL AND {xxs} THEN SET sp_rc = 0; \
                      ELSE \
-                     IF @t IS NULL THEN SET @g = {ver}, @lh = 0, @lt = 0; END IF; \
-                     SELECT COUNT(z.m), IFNULL(SUM(z.m IS NOT NULL AND {chg}), 0) INTO @have, @chg {join}; \
-                     SET @add = IF({xxs}, 0, {np} - @have); \
-                     IF @add + @chg > 0 THEN \
+                     IF sp_t IS NULL THEN SET sp_g = {ver}, sp_lh = 0, sp_lt = 0; END IF; \
+                     SELECT COUNT(z.m), IFNULL(SUM(z.m IS NOT NULL AND {chg}), 0) INTO sp_have, sp_chg {join}; \
+                     SET sp_add = IF({xxs}, 0, {np} - sp_have); \
+                     IF sp_add + sp_chg > 0 THEN \
                      INSERT INTO {zs} (k, g, o, m, c, score, _sprig_dk, _sprig_rk) \
-                     SELECT {k}, @g, x.o, x.m, x.c, x.s, {route} {join} \
+                     SELECT {k}, sp_g, x.o, x.m, x.c, x.s, {route} {join} \
                      WHERE (z.m IS NULL AND NOT {xxs}) OR (z.m IS NOT NULL AND {chg}) \
                      ON DUPLICATE KEY UPDATE c = VALUES(c), score = VALUES(score); \
-                     IF @t IS NULL THEN {ins}\
-                     ELSE UPDATE {keys} SET n = n + @add, _v = {ver} WHERE k = {k}; END IF; \
+                     IF sp_t IS NULL THEN {ins}\
+                     ELSE UPDATE {keys} SET n = n + sp_add, _v = {ver} WHERE k = {k}; END IF; \
                      END IF; \
                      END IF; \
-                     COMMIT; SELECT @rc, @add, @chg; END",
+                     ",
                     xxs = if *xx { "TRUE" } else { "FALSE" },
                     np = pairs.len(),
-                    ins = insert_key(ns, key, KeyType::ZSet, "NULL", "@add", "NULL", ver),
+                    ins = insert_key(ns, key, KeyType::ZSet, "NULL", "sp_add", "NULL", ver),
                 ));
             }
         }
-        s
+        (s, result)
     }
 
     /// The reply from the batch's rows, and whether the command pushed to
@@ -750,6 +808,164 @@ pub async fn run_once(
     }
 }
 
+/// Most commands one group carries ([`Group`]).
+pub const GROUP_MAX_COMMANDS: usize = 64;
+/// Most argument bytes one group carries.
+pub const GROUP_MAX_BYTES: usize = 1 << 20;
+
+/// One command of a [`Group`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum Item {
+    /// A guarded write.
+    Write(Plan),
+    /// `GET k`.
+    Get(Bytes),
+}
+
+/// Commands a client sent in a row, before reading any reply (a
+/// pipeline), run together: guarded writes and `GET`s, in order, as one
+/// compound statement in one transaction, so they share one round trip
+/// and one commit. A refused command (`WRONGTYPE`, not an integer...)
+/// changes nothing and the others go on, as in a Redis pipeline: the
+/// guards make a refusal a result, not an error. Any error rolls the
+/// whole group back (the caller then runs the commands one by one), and
+/// the replies go out only after the commit. A group of `GET`s alone is
+/// one plain read of all its keys.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Group {
+    /// The commands, in order.
+    pub items: Vec<Item>,
+}
+
+impl Group {
+    /// Whether the group writes.
+    #[must_use]
+    pub fn writes(&self) -> bool {
+        self.items.iter().any(|i| matches!(i, Item::Write(_)))
+    }
+
+    /// The keys of the group's `GET`s that can exist (a key past
+    /// [`MAX_KEY_BYTES`] reads as absent).
+    fn read_keys(&self) -> Vec<&[u8]> {
+        self.items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Get(k) if key_ok(k) => Some(&k[..]),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The statement, with fresh versions (build it again for each
+    /// attempt): for `GET`s alone, one read of every key (`k IN (...)`,
+    /// so a sharded database's router reads each shard once); else one
+    /// compound statement whose rows each start with their command's
+    /// position.
+    #[must_use]
+    pub fn sql(&self, ns: &Namespace) -> String {
+        if !self.writes() {
+            let keys = self.read_keys();
+            if keys.is_empty() {
+                return String::new();
+            }
+            let mut ks: Vec<&[u8]> = keys.clone();
+            ks.sort_unstable();
+            ks.dedup();
+            let mut dks: Vec<&[u8]> = ks.iter().map(|k| ns.dist_key(k)).collect();
+            dks.sort_unstable();
+            dks.dedup();
+            let list = |v: &[&[u8]]| v.iter().map(|x| lit(x)).collect::<Vec<_>>().join(", ");
+            return format!(
+                "SELECT t.k, t.type, t.v FROM {} AS t WHERE t.k IN ({}) AND t._sprig_dk IN ({}) AND {}",
+                ns.keys(),
+                list(&ks),
+                list(&dks),
+                live("t")
+            );
+        }
+        let mut s = String::with_capacity(1024 * self.items.len());
+        s.push_str(BLOCK_START);
+        let keys = ns.keys();
+        for (i, item) in self.items.iter().enumerate() {
+            match item {
+                Item::Write(p) => {
+                    let (body, result) = p.steps(ns, new_version(), Some(i));
+                    s.push_str(&body);
+                    s.push_str(&result);
+                }
+                Item::Get(k) if key_ok(k) => {
+                    s.push_str(&format!(
+                        "SELECT {i}, t.type, t.v FROM {keys} AS t WHERE {} AND {}; ",
+                        sprig_kv::api::key_pred(ns, k, "t."),
+                        live("t")
+                    ));
+                }
+                Item::Get(_) => {}
+            }
+        }
+        s.push_str("COMMIT; END");
+        s
+    }
+
+    /// The replies from the statement's rows, in order, each with
+    /// whether the command pushed to its key (wakes blocked clients).
+    /// A command whose rows aren't what it returns gets an error reply
+    /// (a backend surprise; the group has committed, so it isn't rerun).
+    #[must_use]
+    pub fn replies(&self, rows: &[Row]) -> Vec<(Frame, bool)> {
+        let get = |row: Option<&[Option<Vec<u8>>]>| -> Frame {
+            match row {
+                None => Frame::null(),
+                Some(r) => {
+                    if r.first().and_then(Option::as_deref) == Some(&b"string"[..]) {
+                        Frame::Bulk(r.get(1).cloned().flatten().unwrap_or_default().into())
+                    } else {
+                        reply::wrongtype()
+                    }
+                }
+            }
+        };
+        if !self.writes() {
+            return self
+                .items
+                .iter()
+                .map(|i| match i {
+                    Item::Get(k) if key_ok(k) => {
+                        let r = rows
+                            .iter()
+                            .find(|r| r.first().and_then(Option::as_deref) == Some(&k[..]));
+                        (get(r.map(|r| &r[1..])), false)
+                    }
+                    _ => (Frame::null(), false),
+                })
+                .collect();
+        }
+        let mut by: Vec<Vec<Row>> = vec![Vec::new(); self.items.len()];
+        for r in rows {
+            let t = usize::try_from(cell_i64(r.first().and_then(Option::as_ref))).ok();
+            if let Some(b) = t.and_then(|t| by.get_mut(t)) {
+                b.push(r[1..].to_vec());
+            }
+        }
+        self.items
+            .iter()
+            .zip(by)
+            .map(|(i, rs)| match i {
+                Item::Write(p) => p.reply(&rs).unwrap_or_else(|| {
+                    (
+                        reply::backend(&SqlError {
+                            errno: None,
+                            message: "the guarded batch returned an unexpected result".into(),
+                        }),
+                        false,
+                    )
+                }),
+                Item::Get(_) => (get(rs.first().map(Vec::as_slice)), false),
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,15 +1026,95 @@ mod tests {
             let p = plan(&ns, &name, &a).unwrap();
             let s = p.sql(&ns);
             assert!(
-                s.starts_with(
-                    "BEGIN NOT ATOMIC DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK; RESIGNAL; END; START TRANSACTION;"
-                ),
+                s.starts_with(BLOCK_START)
+                    && BLOCK_START.contains(
+                        "DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK; RESIGNAL; END; START TRANSACTION;"
+                    )
+                    && !s.contains('@'),
                 "{s}"
             );
             assert!(s.ends_with(" END"), "{s}");
             assert!(s.contains("COMMIT;"), "{s}");
             assert!(s.is_ascii());
         }
+    }
+
+    #[test]
+    fn groups() {
+        let ns = Namespace::redis("redis", 0);
+        let row = |v: &[Option<&str>]| -> Row {
+            v.iter().map(|c| c.map(|s| s.as_bytes().to_vec())).collect()
+        };
+        let long = Bytes::from(vec![b'x'; MAX_KEY_BYTES + 1]);
+        // GETs alone: one read of every key.
+        let g = Group {
+            items: vec![
+                Item::Get(Bytes::from_static(b"a")),
+                Item::Get(Bytes::from_static(b"h")),
+                Item::Get(Bytes::from_static(b"none")),
+                Item::Get(long.clone()),
+                Item::Get(Bytes::from_static(b"a")),
+            ],
+        };
+        let s = g.sql(&ns);
+        assert!(
+            s.starts_with("SELECT t.k, t.type, t.v FROM")
+                && s.contains("t.k IN (X'61', X'68', X'6E6F6E65')"),
+            "{s}"
+        );
+        let r = g.replies(&[
+            row(&[Some("a"), Some("string"), Some("1")]),
+            row(&[Some("h"), Some("hash"), None]),
+        ]);
+        let f: Vec<Frame> = r.into_iter().map(|x| x.0).collect();
+        assert_eq!(
+            f,
+            vec![
+                Frame::bulk("1"),
+                reply::wrongtype(),
+                Frame::null(),
+                Frame::null(),
+                Frame::bulk("1")
+            ]
+        );
+        // Writes and reads: one block, rows tagged by position.
+        let set = plan(&ns, "set", &args(&["set", "a", "2"])).unwrap();
+        let push = plan(&ns, "rpush", &args(&["rpush", "a", "x"])).unwrap();
+        let g = Group {
+            items: vec![
+                Item::Write(set),
+                Item::Get(Bytes::from_static(b"a")),
+                Item::Write(push),
+                Item::Get(long),
+            ],
+        };
+        let s = g.sql(&ns);
+        assert!(
+            s.starts_with(BLOCK_START) && s.ends_with("COMMIT; END") && !s.contains('@'),
+            "{s}"
+        );
+        assert!(
+            s.contains("SELECT 0, sp_rc")
+                && s.contains("SELECT 1, t.type, t.v")
+                && s.contains("SELECT 2, sp_rc"),
+            "{s}"
+        );
+        assert_eq!(s.matches("START TRANSACTION").count(), 1);
+        let r = g.replies(&[
+            row(&[Some("0"), Some("0"), None]),
+            row(&[Some("1"), Some("string"), Some("2")]),
+            row(&[Some("2"), Some("2"), None]),
+        ]);
+        let f: Vec<Frame> = r.into_iter().map(|x| x.0).collect();
+        assert_eq!(
+            f,
+            vec![
+                Frame::ok(),
+                Frame::bulk("2"),
+                reply::wrongtype(),
+                Frame::null()
+            ]
+        );
     }
 
     #[test]

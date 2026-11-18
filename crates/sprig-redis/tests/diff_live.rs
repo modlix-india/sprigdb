@@ -51,7 +51,15 @@ fn sql_err(e: &mysql_async::Error) -> SqlError {
 #[async_trait]
 impl SqlRunner for My {
     async fn query(&mut self, sql: &str) -> Result<Vec<Row>, SqlError> {
-        let rows: Vec<mysql_async::Row> = self.0.query(sql).await.map_err(|e| sql_err(&e))?;
+        // Every result set's rows (a group of pipelined commands sends
+        // one per command).
+        let mut res = self.0.query_iter(sql).await.map_err(|e| sql_err(&e))?;
+        let mut rows: Vec<mysql_async::Row> = Vec::new();
+        while !res.is_empty() {
+            let mut more: Vec<mysql_async::Row> = res.collect().await.map_err(|e| sql_err(&e))?;
+            rows.append(&mut more);
+        }
+        drop(res);
         Ok(rows
             .into_iter()
             .map(|r| {
@@ -70,6 +78,10 @@ impl SqlRunner for My {
     async fn exec(&mut self, sql: &str) -> Result<u64, SqlError> {
         self.0.query_drop(sql).await.map_err(|e| sql_err(&e))?;
         Ok(self.0.affected_rows())
+    }
+
+    fn multi_results(&self) -> bool {
+        true
     }
 }
 
@@ -1601,4 +1613,235 @@ async fn batched_writes_match_redis() {
     run(&mut s, &["FLUSHALL"]).await.unwrap();
     drop_test_db().await;
     assert_eq!(total_bad, 0, "{total_bad} differ");
+}
+
+/// Pipelines against Redis, byte for byte: every command sent in one
+/// write before any reply is read, so the gateway runs them as groups
+/// (one statement, one commit). A refused command in the middle
+/// (`WRONGTYPE`, not an integer, overflow, a failed `NX`) answers its
+/// error in place and changes nothing, while the writes before and after
+/// it apply; then the final state, read one command at a time. Then 8
+/// clients pipelining 16 `INCR`s and `RPUSH`es on shared keys at once
+/// (groups that deadlock or race on a new key rerun one by one) lose
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn pipelines_match_redis() {
+    use tokio::io::AsyncWriteExt;
+    let (Some(refaddr), Some(url)) = (var("SPRIG_TEST_REDIS_REF"), sprig_url().await) else {
+        eprintln!("SPRIG_TEST_REDIS_REF or SprigDB not set: skipped");
+        return;
+    };
+    let saddr = host_of(&url);
+    let (cu, cp) = creds_of(&url);
+    let big = i64::MAX.to_string();
+    let pipelines: Vec<Vec<Vec<&str>>> = vec![
+        // A failing command in the middle of writes, and reads of them.
+        vec![
+            vec!["SET", "p:a", "1"],
+            vec!["SET", "p:s", "x"],
+            vec!["LPUSH", "p:s", "y"],
+            vec!["INCR", "p:s"],
+            vec!["INCR", "p:a"],
+            vec!["GET", "p:s"],
+            vec!["HSET", "p:h", "f", "v", "g", "w"],
+            vec!["GET", "p:h"],
+            vec!["RPUSH", "p:l", "1", "2", "3"],
+            vec!["LPOP", "p:l"],
+            vec!["RPOP", "p:l", "5"],
+            vec!["ZADD", "p:z", "1", "m", "2", "n"],
+            vec!["ZADD", "p:a", "1", "m"],
+            vec!["SET", "p:c", "v", "NX"],
+            vec!["SET", "p:c", "w", "NX", "GET"],
+            vec!["SET", "p:h", "z", "GET"],
+            vec!["INCRBY", "p:a", &big],
+            vec!["INCRBY", "p:a", &big],
+            vec!["GET", "p:a"],
+            vec!["GET", "p:missing"],
+            vec!["HMSET", "p:h", "a", "1"],
+            vec!["RPUSHX", "p:nolist", "1"],
+            vec!["DECRBY", "p:a", "3"],
+            vec!["GET", "p:c"],
+        ],
+        // Reads alone (one read of every key), with a wrong type and a
+        // repeated key.
+        vec![
+            vec!["GET", "p:a"],
+            vec!["GET", "p:h"],
+            vec!["GET", "p:a"],
+            vec!["GET", "p:none"],
+            vec!["GET", "p:c"],
+        ],
+        // Writes on one key in a row, then other commands that end a group
+        // (MULTI/EXEC, a script, SELECT) between groups.
+        vec![
+            vec!["INCR", "p:n"],
+            vec!["INCR", "p:n"],
+            vec!["APPEND", "p:n", "0"],
+            vec!["INCR", "p:n"],
+            vec!["MULTI"],
+            vec!["INCR", "p:n"],
+            vec!["LPUSH", "p:n", "x"],
+            vec!["EXEC"],
+            vec!["EVAL", "return redis.call('INCR', KEYS[1])", "1", "p:n"],
+            vec!["SET", "p:t", "1", "PX", "100000"],
+            vec!["PTTL", "p:t"],
+            vec!["SELECT", "1"],
+            vec!["SET", "p:n", "other"],
+            vec!["GET", "p:n"],
+            vec!["SELECT", "0"],
+            vec!["GET", "p:n"],
+            vec!["MSET", "p:m1", "a", "p:m2", "b", "p:m1", "c", "p:h", "s"],
+            vec!["MSETNX", "p:m2", "x", "p:m3", "y"],
+            vec!["MSETNX", "p:m3", "x", "p:m4", "y"],
+            vec!["MGET", "p:m1", "p:m2", "p:m3", "p:m4", "p:h"],
+            vec!["HGETALL", "p:h"],
+        ],
+    ];
+    let state: Vec<Vec<&str>> = vec![
+        vec!["GET", "p:a"],
+        vec!["GET", "p:s"],
+        vec!["HGETALL", "p:h"],
+        vec!["LRANGE", "p:l", "0", "-1"],
+        vec!["ZRANGE", "p:z", "0", "-1", "WITHSCORES"],
+        vec!["GET", "p:c"],
+        vec!["GET", "p:n"],
+        vec!["TYPE", "p:n"],
+        vec!["EXISTS", "p:nolist"],
+        vec!["MGET", "p:m1", "p:m2", "p:m3", "p:m4"],
+        vec!["DBSIZE"],
+    ];
+    let mut logs = Vec::new();
+    for (sprig, addr) in [(false, refaddr.as_str()), (true, saddr.as_str())] {
+        let login = sprig.then_some((cu.as_str(), cp.as_str()));
+        let (mut s, mut buf) = raw(addr, login).await;
+        let mut log: Vec<String> = Vec::new();
+        for c in [
+            vec!["SELECT", "1"],
+            vec!["FLUSHDB"],
+            vec!["SELECT", "0"],
+            vec!["FLUSHDB"],
+        ] {
+            s.write_all(&wire(&c)).await.unwrap();
+            read_reply(&mut s, &mut buf).await;
+        }
+        for (pi, p) in pipelines.iter().enumerate() {
+            let mut out = Vec::new();
+            for c in p {
+                out.extend_from_slice(&wire(c));
+            }
+            s.write_all(&out).await.unwrap();
+            for c in p {
+                let r = read_reply(&mut s, &mut buf).await;
+                let mut r = String::from_utf8_lossy(&r).into_owned();
+                if c[0] == "PTTL"
+                    && r.trim_start_matches(':')
+                        .trim_end()
+                        .parse::<i64>()
+                        .is_ok_and(|n| n > 0)
+                {
+                    r = ":positive".into();
+                }
+                log.push(format!("p{pi} {} -> {r:?}", c.join(" ")));
+            }
+        }
+        for c in &state {
+            s.write_all(&wire(c)).await.unwrap();
+            let r = read_reply(&mut s, &mut buf).await;
+            let r = if c[0] == "HGETALL" {
+                let v = conn_pairs(&r);
+                format!("{v:?}")
+            } else {
+                String::from_utf8_lossy(&r).into_owned()
+            };
+            log.push(format!("state {} -> {r:?}", c.join(" ")));
+        }
+        for c in [
+            vec!["SELECT", "1"],
+            vec!["FLUSHDB"],
+            vec!["SELECT", "0"],
+            vec!["FLUSHDB"],
+        ] {
+            s.write_all(&wire(&c)).await.unwrap();
+            read_reply(&mut s, &mut buf).await;
+        }
+        logs.push(log);
+    }
+    let mut bad = 0;
+    for (a, b) in logs[0].iter().zip(&logs[1]) {
+        if a != b {
+            bad += 1;
+            eprintln!("MISMATCH\n   redis: {a}\n   sprig: {b}");
+        }
+    }
+    eprintln!(
+        "pipelines: {} replies compared, {bad} differ",
+        logs[0].len()
+    );
+    assert_eq!(logs[0].len(), logs[1].len());
+
+    // Concurrency: 8 clients, each 25 pipelines of 8 INCR + 8 RPUSH on
+    // two shared keys and its own, every reply checked.
+    let mut tasks = Vec::new();
+    for c in 0..8 {
+        let saddr = saddr.clone();
+        let (cu, cp) = (cu.clone(), cp.clone());
+        tasks.push(tokio::spawn(async move {
+            let (mut s, mut buf) = raw(&saddr, Some((&cu, &cp))).await;
+            let mut errors = 0;
+            for i in 0..25 {
+                let mut out = Vec::new();
+                for j in 0..8 {
+                    out.extend_from_slice(&wire(&["INCR", "p:ctr"]));
+                    out.extend_from_slice(&wire(&["RPUSH", "p:q", &format!("{c}-{i}-{j}")]));
+                }
+                out.extend_from_slice(&wire(&["INCR", &format!("p:own:{c}")]));
+                s.write_all(&out).await.unwrap();
+                for _ in 0..17 {
+                    let r = read_reply(&mut s, &mut buf).await;
+                    if r.first() != Some(&b':') {
+                        errors += 1;
+                        eprintln!("client {c}: {}", String::from_utf8_lossy(&r));
+                    }
+                }
+            }
+            errors
+        }));
+    }
+    let mut errors = 0;
+    for t in tasks {
+        errors += t.await.unwrap();
+    }
+    let (mut s, mut buf) = raw(&saddr, Some((&cu, &cp))).await;
+    let mut got = Vec::new();
+    for c in [
+        vec!["GET", "p:ctr"],
+        vec!["LLEN", "p:q"],
+        vec!["MGET", "p:own:0", "p:own:7"],
+        vec!["FLUSHDB"],
+    ] {
+        s.write_all(&wire(&c)).await.unwrap();
+        got.push(String::from_utf8_lossy(&read_reply(&mut s, &mut buf).await).into_owned());
+    }
+    eprintln!("concurrent pipelines: {got:?}, {errors} error replies");
+    drop_test_db().await;
+    assert_eq!(bad, 0, "{bad} replies differ");
+    assert_eq!(errors, 0);
+    assert_eq!(got[0], "$4\r\n1600\r\n");
+    assert_eq!(got[1], ":1600\r\n");
+    assert_eq!(got[2], "*2\r\n$2\r\n25\r\n$2\r\n25\r\n");
+}
+
+/// A flat RESP array of bulk strings as sorted (field, value) pairs.
+fn conn_pairs(r: &[u8]) -> Vec<(String, String)> {
+    let text = String::from_utf8_lossy(r);
+    let items: Vec<&str> = text
+        .split("\r\n")
+        .filter(|l| !l.is_empty() && !l.starts_with('*') && !l.starts_with('$'))
+        .collect();
+    let mut v: Vec<(String, String)> = items
+        .chunks(2)
+        .map(|c| (c[0].to_owned(), c.get(1).copied().unwrap_or("").to_owned()))
+        .collect();
+    v.sort();
+    v
 }

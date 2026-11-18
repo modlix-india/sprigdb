@@ -1109,15 +1109,21 @@ impl ChangeStream {
                 break;
             }
         }
-        if self.pipeline.is_empty() || out.is_empty() {
-            return Ok(out);
+        super::status::stream_examined(&out);
+        if !(self.pipeline.is_empty() || out.is_empty()) {
+            let lim = AggLimits {
+                stage_bytes: 104_857_600,
+                now: DateTime::now(),
+            };
+            for s in &self.pipeline {
+                out = agg::run_stage(out, s, &lim)?;
+            }
         }
-        let lim = AggLimits {
-            stage_bytes: 104_857_600,
-            now: DateTime::now(),
-        };
-        for s in &self.pipeline {
-            out = agg::run_stage(out, s, &lim)?;
+        // An event past the BSON limit ends the stream, as on MongoDB
+        // (`$changeStreamSplitLargeEvent` isn't offered).
+        if let Some(e) = out.iter().find_map(super::status::too_large) {
+            self.done = true;
+            return Err(e);
         }
         Ok(out)
     }

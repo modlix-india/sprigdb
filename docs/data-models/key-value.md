@@ -89,7 +89,7 @@ These commands are built. Each takes Redis 7.2's options.
 | Blocking | `BLPOP`, `BRPOP`, `BLMOVE`, `BRPOPLPUSH`, `BLMPOP`, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP` |
 | Transactions | `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH` |
 | Scripting | `EVAL`, `EVALSHA`, `EVAL_RO`, `EVALSHA_RO`, `SCRIPT` (`LOAD`, `EXISTS`, `FLUSH`, `KILL`), `FUNCTION` (`LOAD`, `DELETE`, `FLUSH`, `LIST`, `STATS`, `KILL`), `FCALL`, `FCALL_RO` |
-| Search | `FT.CREATE`, `FT.ALTER`, `FT.DROPINDEX`, `FT.SEARCH`, `FT.AGGREGATE`, `FT.INFO`, `FT._LIST`, `FT.EXPLAIN`, `FT.EXPLAINCLI`, `FT.TAGVALS`, on hashes; see [Search (`FT.*`)](../connect/redis.md#search-ft) |
+| Search | `FT.CREATE`, `FT.ALTER`, `FT.DROPINDEX`, `FT.SEARCH`, `FT.AGGREGATE`, `FT.CURSOR`, `FT.INFO`, `FT._LIST`, `FT.EXPLAIN`, `FT.EXPLAINCLI`, `FT.TAGVALS`, on hashes; see [Search (`FT.*`)](../connect/redis.md#search-ft) |
 | Pub/sub | `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `SSUBSCRIBE`, `SUNSUBSCRIBE`, `PUBLISH`, `SPUBLISH`, `PUBSUB` (`CHANNELS`, `NUMSUB`, `NUMPAT`, `SHARDCHANNELS`, `SHARDNUMSUB`) |
 | Connection | `PING`, `ECHO`, `QUIT`, `RESET`, `SELECT`, `HELLO`, `AUTH`, `CLIENT` (`ID`, `SETNAME`, `GETNAME`, `INFO`, `LIST`, `SETINFO`, `NO-EVICT`, `NO-TOUCH`, `REPLY ON`, `UNBLOCK`, `GETREDIR`, `TRACKINGINFO`) |
 | Server | `INFO`, `TIME`, `COMMAND`, `CONFIG`, `ACL`, `ROLE`, `CLUSTER`, `SLOWLOG`, `LATENCY`, `MEMORY`, `LASTSAVE`, `LOLWUT`, `READONLY`, `READWRITE`, `ASKING`, `WAIT`, `WAITAOF`; `SAVE`, `BGSAVE` and `BGREWRITEAOF` succeed and do nothing |
@@ -107,6 +107,19 @@ A few behave differently from a single Redis server:
 A write command is one MariaDB transaction: it locks the key row, reads what it needs, writes the rows, and commits. Single commands run at `READ COMMITTED`.
 
 The busiest writes run as one compound statement, in one round trip to MariaDB: `SET`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `HSET`, `HMSET`, `LPUSH`, `RPUSH`, `LPUSHX`, `RPUSHX`, `LPOP`, `RPOP` and `ZADD`. `redis.guarded_batches` (default `true`) turns this off. Commands that need an error reply, `ZADD INCR`, repeated `ZADD` members, and more than 200 items take the ordinary path.
+
+`MSET` and `MSETNX` lock all their keys with one statement, then write them with a few multi-row statements, so a large `MSET` costs about four round trips instead of two per key.
+
+### Pipelines
+
+When a client sends several commands before it reads a reply (a pipeline), the gateway runs them in groups. A run of two or more of the commands above, or of `GET`s, among the commands already received becomes one compound statement and one transaction. The commands run in order, commit once together, and get their replies after that commit, so every acknowledged write is durable. A batch of 16 commands costs far less than 16 commands sent one at a time.
+
+- **A pipeline is still not atomic, as in Redis.** A command that fails its own check, such as `WRONGTYPE`, a value that isn't an integer, or an `NX` that doesn't apply, gets its error in place and changes nothing. The commands before and after it still apply.
+- **If the group's statement fails** (a deadlock, for example), the whole group rolls back and its commands run again one by one, each as it would alone. If the outcome is unknown (a lost connection to MariaDB), every command of the group gets the error and nothing is run again, as for a single command.
+- **What ends a group.** `MULTI`/`EXEC`, scripts, blocking commands and every other command run alone. So do commands inside `MULTI`, commands of a RESP2 subscriber, and everything while `redis.guarded_batches` is off.
+- **Caps.** A group holds at most 64 commands and 1 MiB of arguments.
+- **Sharded Redis databases.** Runs of `GET`s still group. Runs of writes on a sharded database run one by one.
+- Keyspace notifications and wake-ups of blocked clients go out per command, after the commit.
 
 When two writers conflict (a deadlock or a lock wait timeout), SprigDB reruns the command up to `redis.write_retries` times (default 10) after a short random wait. If it still conflicts, the client gets:
 

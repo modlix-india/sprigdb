@@ -14,14 +14,13 @@
 //! - `aggregate` with `explain: true` on `$search`: `queryPlanner` only
 //!   (no hit count, nothing run);
 //! - `$searchMeta` under `executionStats`;
-//! - `explain` of `findAndModify`: refused (code 39662, unsupported in
-//!   this release), and a bad verbosity (9).
+//! - a bad verbosity (9).
 //!
 //! `explain_of_reads_and_writes` checks the other commands on
 //! database `r5eight_explain`: a point read is `EXPRESS_IXSCAN`, a filter
 //! on an indexed field `IXSCAN` under `FETCH`, an unindexed one `COLLSCAN`;
-//! `count`, `distinct`, `aggregate` (in the `stages` form), `update` and
-//! `delete` (which write nothing); MariaDB's plan of each statement under
+//! `count`, `distinct`, `aggregate` (in the `stages` form), `update`,
+//! `delete` and `findAndModify` (which write nothing); MariaDB's plan of each statement under
 //! `queryPlanner.sprig`, without physical schema names; `executionStats`'
 //! counts; `EOF` for a missing collection.
 //!
@@ -161,12 +160,9 @@ async fn explain_of_searches() {
         1
     );
 
-    // A command explain doesn't cover (explain covers find, aggregate,
-    // count, distinct, update and delete); a bad verbosity.
+    // A command explain doesn't cover; a bad verbosity.
     let e = db
-        .run_command(
-            doc! {"explain": {"findAndModify": "p", "query": {"name": "x"}, "remove": true}},
-        )
+        .run_command(doc! {"explain": {"insert": "p", "documents": [{"x": 1}]}})
         .await
         .unwrap_err();
     assert_eq!(code_of(&e), 39662, "{e}");
@@ -393,9 +389,112 @@ async fn explain_of_reads_and_writes() {
         "explain wrote"
     );
 
+    // findAndModify: the first document by the sort, then its write,
+    // planned and not sent (MongoDB 8.0's stages: UPDATE or DELETE above
+    // LIMIT 1).
+    let r = ex(
+        doc! {"findAndModify": "o", "query": {"tag": "odd"}, "sort": {"qty": -1}, "update": {"$inc": {"qty": 1}}, "new": true},
+        "executionStats",
+    )
+    .await;
+    assert_eq!(wp(&r).get_str("stage").unwrap(), "UPDATE", "{r}");
+    assert_eq!(
+        wp(&r)
+            .get_document("inputStage")
+            .unwrap()
+            .get_str("stage")
+            .unwrap(),
+        "LIMIT",
+        "{r}"
+    );
+    let es = r.get_document("executionStats").unwrap();
+    assert_eq!(es.get_i64("nReturned").unwrap(), 1, "{r}");
+    assert_eq!(es.get_i64("nMatched").unwrap(), 1, "{r}");
+    assert_eq!(es.get_i64("nWouldUpsert").unwrap(), 0, "{r}");
+    assert!(
+        stmts(&r).iter().any(|s| {
+            let s = s.as_document().unwrap();
+            s.get_str("sql").unwrap().starts_with("UPDATE")
+                && s.get_str("kind").unwrap() == "write (not sent)"
+        }),
+        "{r}"
+    );
+    let r = ex(
+        doc! {"findAndModify": "o", "query": {"qty": 9999}, "update": {"$set": {"z": 1}}, "upsert": true},
+        "executionStats",
+    )
+    .await;
+    let es = r.get_document("executionStats").unwrap();
+    assert_eq!(
+        (
+            es.get_i64("nMatched").unwrap(),
+            es.get_i64("nWouldUpsert").unwrap()
+        ),
+        (0, 1),
+        "{r}"
+    );
+    assert!(
+        stmts(&r).iter().any(|s| s
+            .as_document()
+            .unwrap()
+            .get_str("sql")
+            .unwrap()
+            .starts_with("INSERT")),
+        "{r}"
+    );
+    let r = ex(
+        doc! {"findAndModify": "o", "query": {"tag": "odd"}, "remove": true},
+        "queryPlanner",
+    )
+    .await;
+    assert_eq!(wp(&r).get_str("stage").unwrap(), "DELETE", "{r}");
+    assert!(r.get_document("executionStats").is_err(), "{r}");
+    let r = ex(
+        doc! {"findAndModify": "o", "query": {"tag": "odd"}, "remove": true},
+        "executionStats",
+    )
+    .await;
+    assert_eq!(
+        r.get_document("executionStats")
+            .unwrap()
+            .get_i64("nWouldDelete")
+            .unwrap(),
+        1,
+        "{r}"
+    );
+    let r = ex(
+        doc! {"findAndModify": "nope", "query": {}, "remove": true},
+        "executionStats",
+    )
+    .await;
+    assert_eq!(wp(&r).get_str("stage").unwrap(), "EOF", "{r}");
+    assert_eq!(
+        o.count_documents(doc! {}).await.unwrap(),
+        40,
+        "explain of findAndModify wrote"
+    );
+    assert_eq!(
+        o.count_documents(doc! {"z": 1}).await.unwrap(),
+        0,
+        "explain of findAndModify upserted"
+    );
+    assert_eq!(
+        o.find_one(doc! {"tag": "odd"})
+            .sort(doc! {"qty": -1})
+            .await
+            .unwrap()
+            .unwrap()
+            .get_i32("qty")
+            .unwrap(),
+        39,
+        "explain of findAndModify updated"
+    );
+
     // A missing collection.
     let r = ex(doc! {"find": "nope", "filter": {}}, "queryPlanner").await;
     assert_eq!(wp(&r).get_str("stage").unwrap(), "EOF");
-    println!("explain: point, indexed, scan, count, distinct, aggregate, update, delete, EOF");
+    println!(
+        "explain: point, indexed, scan, count, distinct, aggregate, update, delete, findAndModify, EOF"
+    );
     db.drop().await.unwrap();
 }

@@ -2323,6 +2323,93 @@ async fn amqp10_sasl() {
     c.close().await.unwrap();
 }
 
+/// A client that sends its whole opening (SASL, header, `open`, `begin`)
+/// in one write, without waiting for the server's replies, as rhea does:
+/// the `begin` that arrives together with the `open` is answered.
+#[tokio::test]
+async fn amqp10_frames_pipelined_behind_open() {
+    use bytes::BytesMut;
+    use sprig_proto_amqp::sniff::{AMQP_10, AMQP_10_SASL};
+    use sprig_proto_amqp::v10::performative::{FRAME_AMQP, FRAME_SASL, Frame, put_frame};
+    let e = env().await;
+    let mut b = BytesMut::new();
+    b.extend_from_slice(&AMQP_10_SASL);
+    let frame =
+        |b: &mut BytesMut, kind: u8, p: &Performative| put_frame(b, kind, 0, &p.to_value(), &[]);
+    frame(
+        &mut b,
+        FRAME_SASL,
+        &Performative::SaslInit {
+            mechanism: "PLAIN".into(),
+            initial_response: Some(plain(&e.user, &e.pass)),
+            hostname: None,
+        },
+    );
+    b.extend_from_slice(&AMQP_10);
+    frame(
+        &mut b,
+        FRAME_AMQP,
+        &Performative::Open {
+            container_id: "pipelined".into(),
+            hostname: Some("vhost:/".into()),
+            max_frame_size: 65_536,
+            channel_max: 64,
+            idle_timeout: None,
+            offered_capabilities: vec![],
+            desired_capabilities: vec![],
+            properties: None,
+        },
+    );
+    frame(
+        &mut b,
+        FRAME_AMQP,
+        &Performative::Begin {
+            remote_channel: None,
+            next_outgoing_id: 0,
+            incoming_window: 65_535,
+            outgoing_window: 65_535,
+            handle_max: 255,
+            offered_capabilities: vec![],
+            desired_capabilities: vec![],
+            properties: None,
+        },
+    );
+    let mut io = e.tcp().await;
+    io.write_all(&b).await.unwrap();
+    let mut inb = BytesMut::new();
+    let mut seen = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !seen.contains(&"begin") {
+        // Protocol headers (8 bytes, "AMQP...") between the frames.
+        if inb.starts_with(b"AMQP") && inb.len() >= 8 {
+            let _ = inb.split_to(8);
+            seen.push("header");
+            continue;
+        }
+        if let Some(f) = Frame::parse(&mut inb, 0).unwrap() {
+            let p = Performative::from_value(f.body.as_ref().unwrap()).unwrap();
+            seen.push(p.name());
+            continue;
+        }
+        let n = tokio::time::timeout_at(deadline, io.read_buf(&mut inb))
+            .await
+            .unwrap_or_else(|_| panic!("no begin within 5 s; seen {seen:?}"))
+            .unwrap();
+        assert!(n > 0, "closed; seen {seen:?}");
+    }
+    assert_eq!(
+        seen,
+        [
+            "header",
+            "sasl-mechanisms",
+            "sasl-outcome",
+            "header",
+            "open",
+            "begin"
+        ]
+    );
+}
+
 #[tokio::test]
 async fn amqp10_publish_outcomes() {
     let e = env().await;

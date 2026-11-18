@@ -228,7 +228,7 @@ The statement then runs as usual. A table without any search index keeps MariaDB
 | Natural language (default) | Words, any of which may match, ranked by BM25 |
 | Boolean | MySQL's operators: `+word` (required), `-word` (excluded), `"phrase"`, `word*` (prefix), `( )`, and `>word`, `<word`, `~word`, which become boosts of 1.5, 0.67 and 0.5 |
 
-`WITH QUERY EXPANSION` fails with 39823, and so does a placeholder (`?`) instead of a string literal in `AGAINST`. A table with search indexes none of which covers the columns fails with 39821 `ER_SPRIG_SEARCH_NO_INDEX_FOR_MATCH`.
+`WITH QUERY EXPANSION` fails with 39823. A placeholder (`?`) in `AGAINST` works only in a statement your driver prepares (server-side prepared statements); a search statement prepared in SQL, with `PREPARE` or `EXECUTE IMMEDIATE`, isn't supported yet and fails with MariaDB's error 1191. A table with search indexes none of which covers the columns fails with 39821 `ER_SPRIG_SEARCH_NO_INDEX_FOR_MATCH`.
 
 ```sql
 SELECT id, name, MATCH (name, description) AGAINST ('running shoe') AS score
@@ -242,6 +242,12 @@ WHERE MATCH (name, description) AGAINST ('+shoe -trail' IN BOOLEAN MODE)
 ```
 
 The scores are BM25 scores, not InnoDB's or MariaDB's relevance values, so compare them only with each other.
+
+As a condition, `MATCH` reads every hit, up to `search.max_window` (default 10,000); more fails with 39827 `ER_SPRIG_SEARCH_WINDOW_EXCEEDED`. A `SELECT` on one table that asks for the best rows of one search (`ORDER BY` the `MATCH` or its alias `DESC`, with a literal `LIMIT`) reads the search a page at a time instead: it is faster on common words and doesn't fail because a word matches too many rows. See [Top results](../data-models/search.md#top-results) for the exact rules.
+
+### LIKE and SUBSTRING fields
+
+With `search.like_acceleration` on (an operator setting, off by default), `column LIKE '%text%'` reads only the rows that a search index's `SUBSTRING` field on the column finds, instead of scanning the table. MariaDB still checks the pattern on those rows. Check the column's collation before turning it on; see [`LIKE` with `SUBSTRING` fields](../data-models/search.md#like-with-substring-fields).
 
 ### sprig_search()
 

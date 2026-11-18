@@ -1046,13 +1046,18 @@ impl WorkloadTables {
             (now,),
         )
         .await?;
+        // A single-table DELETE: MariaDB resolves a multi-table DELETE's
+        // alias (`DELETE s FROM <schema>.t s ...`) against the default
+        // database, and the controller's connections have none (1046).
+        // The derived table `x` is materialized first, so the subquery may
+        // read the table the statement deletes from.
         rep.expired_samples += exec_count(
             q,
             format!(
-                "DELETE s FROM {t} s JOIN (SELECT fingerprint_id, sample_id FROM (SELECT \
-                 fingerprint_id, sample_id, ROW_NUMBER() OVER (PARTITION BY fingerprint_id \
-                 ORDER BY captured_at DESC, sample_id) AS rn FROM {t}) x WHERE rn > ?) d \
-                 USING (fingerprint_id, sample_id)",
+                "DELETE FROM {t} WHERE (fingerprint_id, sample_id) IN (SELECT fingerprint_id, \
+                 sample_id FROM (SELECT fingerprint_id, sample_id, ROW_NUMBER() OVER \
+                 (PARTITION BY fingerprint_id ORDER BY captured_at DESC, sample_id) AS rn \
+                 FROM {t}) x WHERE rn > ?)",
                 t = self.samples
             ),
             (u64::from(r.max_samples_per_fingerprint),),

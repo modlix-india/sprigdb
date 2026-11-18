@@ -273,14 +273,97 @@ pub async fn mget(cx: &mut Ctx<'_>, a: &[Bytes]) -> R<Frame> {
     ))
 }
 
-/// `MSET k v ...` and `MSETNX`.
+/// `MSET k v ...` and `MSETNX`: one locking read of every key, and the
+/// new values as multi-row upserts (a few statements whatever the count),
+/// or key by key when the router can't place those (39420).
 pub async fn mset(cx: &mut Ctx<'_>, a: &[Bytes], nx: bool) -> R<Frame> {
+    use std::fmt::Write as _;
     if a.len().is_multiple_of(2) {
         return fail(reply::arity(if nx { "msetnx" } else { "mset" }));
     }
     for v in a[2..].iter().step_by(2) {
         cx.check_value(v)?;
     }
+    // The last value of a repeated key wins; keys in byte order (the
+    // order every multi-key lock takes).
+    let mut pairs: Vec<(&[u8], &Bytes)> = Vec::with_capacity(a.len() / 2);
+    for i in (1..a.len()).step_by(2).rev() {
+        let k = &a[i][..];
+        if !pairs.iter().any(|(pk, _)| *pk == k) {
+            pairs.push((k, &a[i + 1]));
+        }
+    }
+    pairs.sort_unstable_by(|x, y| x.0.cmp(y.0));
+    for (k, _) in &pairs {
+        Ctx::check_key(k)?;
+    }
+    let keys: Vec<&[u8]> = pairs.iter().map(|(k, _)| *k).collect();
+    let rows = match cx.lock_set(&keys).await {
+        Ok(r) => r,
+        Err(crate::ctx::Fail::Sql(e)) if e.errno == Some(39420) => {
+            return mset_one_by_one(cx, a, nx).await;
+        }
+        Err(e) => return Err(e),
+    };
+    if nx && rows.iter().any(|r| r.as_ref().is_some_and(|r| r.live)) {
+        return Ok(Frame::Integer(0));
+    }
+    // A key of another type (or expired) loses its elements; a live
+    // string keeps its generation, as a key-by-key `SET` would.
+    let mut gens = Vec::with_capacity(pairs.len());
+    for r in &rows {
+        let g = match r {
+            Some(r) if r.live && r.t == KeyType::String => r.g,
+            Some(r) => {
+                cx.drop_elements(r).await?;
+                crate::ctx::new_version()
+            }
+            None => crate::ctx::new_version(),
+        };
+        gens.push(g);
+    }
+    let ns = cx.ns.clone();
+    let head = format!(
+        "INSERT INTO {} (k, type, v, n, lh, lt, g, _v, expires_at, _sprig_dk, _sprig_rk) VALUES ",
+        ns.keys()
+    );
+    let tail = " ON DUPLICATE KEY UPDATE type = VALUES(type), v = VALUES(v), n = 0, lh = 0, lt = 0, \
+                g = VALUES(g), _v = VALUES(_v), expires_at = NULL";
+    let mut sql = String::new();
+    for (i, ((k, v), g)) in pairs.iter().zip(&gens).enumerate() {
+        if sql.is_empty() {
+            sql.push_str(&head);
+        } else {
+            sql.push_str(", ");
+        }
+        let ver = crate::ctx::new_version();
+        let _ = write!(
+            sql,
+            "({}, 'string', {}, 0, 0, 0, {g}, {ver}, NULL, {}, {})",
+            sprig_kv::sql::lit(k),
+            sprig_kv::sql::lit(v),
+            sprig_kv::sql::lit(ns.dist_key(k)),
+            ns.routing_hash(k)
+        );
+        // Statements of about a megabyte at most.
+        if sql.len() >= MSET_STATEMENT_BYTES || i + 1 == pairs.len() {
+            sql.push_str(tail);
+            match cx.x(&sql).await {
+                Ok(_) => {}
+                Err(e) if e.errno == Some(39420) => return mset_one_by_one(cx, a, nx).await,
+                Err(e) => return Err(e.into()),
+            }
+            sql.clear();
+        }
+    }
+    Ok(if nx { Frame::Integer(1) } else { Frame::ok() })
+}
+
+/// Most bytes of one `MSET` upsert statement before the next starts.
+const MSET_STATEMENT_BYTES: usize = 1 << 20;
+
+/// `MSET` key by key (a router that can't place the multi-key forms).
+async fn mset_one_by_one(cx: &mut Ctx<'_>, a: &[Bytes], nx: bool) -> R<Frame> {
     let keys: Vec<&[u8]> = a[1..].iter().step_by(2).map(|k| &k[..]).collect();
     let rows = cx.lock_many(&keys).await?;
     if nx && rows.iter().any(Option::is_some) {

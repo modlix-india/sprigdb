@@ -258,16 +258,27 @@ async fn required_listener_refuses_plaintext_with_3159() {
 }
 
 #[tokio::test]
-async fn off_listener_offers_no_tls_and_needs_tls_for_a_full_login() {
+async fn off_listener_offers_no_tls_and_takes_a_full_login_over_rsa() {
     let gw = Gateway::start(TlsMode::Off).await;
     // A client that requires TLS fails on its side.
     let e = connect(opts(gw.mysql, "app", PW, true)).await.unwrap_err();
     assert_eq!(server_code(&e), None, "{e}");
-    // A cold caching_sha2 login over plaintext would need the RSA key
-    // exchange, which the gateway doesn't offer: refused.
-    let e = connect(opts(gw.mysql, "app", PW, false)).await.unwrap_err();
-    assert_eq!(server_code(&e), Some(1045), "{e}");
-    assert!(e.to_string().contains("connect with TLS"), "{e}");
+    // A cold caching_sha2 login over plaintext: the client asks for the
+    // server's RSA public key and sends its password encrypted with it.
+    // A wrong password gets the plain 1045, without the TLS hint.
+    for persona in [Persona::MySql84, Persona::MariaDb] {
+        let e = connect(opts(gw.addr(persona), "app", OTHER_PW, false))
+            .await
+            .unwrap_err();
+        assert_eq!(server_code(&e), Some(1045), "{e}");
+        assert!(!e.to_string().contains("connect with TLS"), "{e}");
+        let mut c = connect(opts(gw.addr(persona), "app", PW, false))
+            .await
+            .unwrap_or_else(|e| panic!("{persona:?}: {e}"));
+        let one: Option<i64> = c.query_first("SELECT 1").await.unwrap();
+        assert_eq!(one, Some(1));
+        c.disconnect().await.unwrap();
+    }
     // mysql_native_password works in plaintext (switch from the greeting's
     // plugin).
     for persona in [Persona::MySql84, Persona::MariaDb] {
@@ -284,8 +295,11 @@ async fn off_listener_offers_no_tls_and_needs_tls_for_a_full_login() {
 #[tokio::test]
 async fn optional_listener_fast_path_after_a_tls_login() {
     let gw = Gateway::start(TlsMode::Optional).await;
-    // Plaintext first: the fast cache is cold.
-    let e = connect(opts(gw.mysql, "app", PW, false)).await.unwrap_err();
+    // Plaintext first, with a wrong password: the fast cache is cold, the
+    // RSA exchange refuses it.
+    let e = connect(opts(gw.mysql, "app", OTHER_PW, false))
+        .await
+        .unwrap_err();
     assert_eq!(server_code(&e), Some(1045));
     // A TLS login takes the full path and fills the fast cache ...
     connect(opts(gw.mysql, "app", PW, true))

@@ -331,7 +331,7 @@ pub const ALL: &[Spec] = specs! {
     "ft.explaincli" -3 "rs" 0 0 0;
     "ft.tagvals" 3 "rs" 0 0 0;
     "ft.profile" -5 "rsx" 0 0 0;
-    "ft.cursor" -3 "rsx" 0 0 0;
+    "ft.cursor" -3 "rs" 0 0 0;
     "ft.aliasadd" 3 "wsx" 0 0 0;
     "ft.aliasupdate" 3 "wsx" 0 0 0;
     "ft.aliasdel" 2 "wsx" 0 0 0;

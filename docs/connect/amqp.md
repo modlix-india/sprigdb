@@ -196,10 +196,11 @@ Queue arguments, such as `x-message-ttl`, `x-expires`, `x-max-length`, `x-overfl
 - **Unacknowledged deliveries return to their queue** when the channel or connection closes, marked `redelivered`.
 - **A stuck consumer is cancelled.** A delivery unacknowledged longer than `amqp.consumer_timeout_ms` (30 minutes) is requeued and the consumer gets `basic.cancel` (39262).
 - **Publish quotas** send `connection.blocked` to the virtual host's connections for the rest of the second.
+- **Prefetch refills as acknowledgements arrive.** Under a `basic.qos` prefetch limit, each `basic.ack` lets as many new deliveries through as it acknowledged, sent as soon as that ack arrives. RabbitMQ sometimes sends several refills in one write; SprigDB sends one per ack. A client that polls once after several acks may see only the first refill, so keep reading for the time you mean to wait.
 
 ### AMQP 1.0
 
-AMQP 1.0 clients use the same exchanges and queues. Targets are `/exchanges/<exchange>/<key>`, `/exchanges/<exchange>`, `/queues/<queue>`, or the anonymous terminus with `to` set on each message; sources are `/queues/<queue>`. The virtual host comes from `open.hostname` as `vhost:<name>`. Messages convert between 0-9-1 and 1.0 as RabbitMQ 4 converts them. AMQP 1.0 transactions and link recovery aren't supported. See [Queues](../data-models/queues.md#over-amqp-10).
+AMQP 1.0 clients use the same exchanges and queues. Targets are `/exchanges/<exchange>/<key>`, `/exchanges/<exchange>`, `/queues/<queue>`, or the anonymous terminus with `to` set on each message; sources are `/queues/<queue>`. The virtual host comes from `open.hostname` as `vhost:<name>`. Messages convert between 0-9-1 and 1.0 as RabbitMQ 4 converts them. Clients may send `begin` and `attach` right after `open`, before the server's `open` arrives, as rhea does. AMQP 1.0 transactions and link recovery aren't supported. See [Queues](../data-models/queues.md#over-amqp-10).
 
 ## Not supported
 

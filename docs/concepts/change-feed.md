@@ -95,7 +95,7 @@ Supported:
 - pipeline stages that work on one event at a time: `$match`, `$project`, `$addFields`, `$set`, `$unset`, `$replaceRoot`, `$replaceWith`;
 - `showExpandedEvents` for `create`, `createIndexes`, `dropIndexes` and `modify`.
 
-`startAtOperationTime` starts a stream at a time, as `start_at_hlc` does below. `watch()` on a collection without `WATCH` fails with 13 `Unauthorized`; a database stream leaves such collections out. Documents a TTL index deletes appear as `delete` events. See [MongoDB](../connect/mongodb.md).
+`startAtOperationTime` starts a stream at a time, as `start_at_hlc` does below. `watch()` on a collection without `WATCH` fails with 13 `Unauthorized`; a database stream leaves such collections out. Documents a TTL index deletes appear as `delete` events. An event over 16,793,600 bytes ends the stream with 10334 `BSONObjectTooLarge`, as in MongoDB, and `serverStatus` counts streams' batches, events and bytes; see [Documents](../data-models/documents.md#large-events). See [MongoDB](../connect/mongodb.md).
 
 ### Server-Sent Events, WebSocket and NDJSON
 
@@ -179,6 +179,7 @@ The three settings can be set for a tenant or globally. A `Sprig-Space` header (
 ## Not supported yet
 
 - A SQL statement for subscribing to changes. Use one of the transports above, a change topic or a sink.
+- MongoDB's `$changeStreamSplitLargeEvent`. An event over 16,793,600 bytes ends a MongoDB change stream with 10334.
 
 ## Related
 

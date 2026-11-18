@@ -413,6 +413,10 @@ impl Conn<'_> {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_recv = Instant::now();
         let mut last_send = Instant::now();
+        // Frames the client sent right behind its `open` (rhea sends
+        // `begin` and `attach` without waiting) came in with it: handle
+        // them before waiting for more, or the connection waits forever.
+        self.handle_frames(&mut inb).await;
         loop {
             if !self.out.is_empty() {
                 write(wr, &mut self.out).await?;
@@ -436,23 +440,7 @@ impl Conn<'_> {
                         Err(e) => return Err(io_err(&e)),
                     }
                     last_recv = Instant::now();
-                    loop {
-                        let f = match Frame::parse(&mut inb, self.cfg.frame_max.max(MIN_MAX_FRAME_SIZE)) {
-                            Ok(Some(f)) => f,
-                            Ok(None) => break,
-                            Err(e) => {
-                                self.close_connection(AmqpError::new(condition::FRAMING_ERROR, e.0));
-                                inb.clear();
-                                break;
-                            }
-                        };
-                        if let Err(e) = self.on_frame(f).await {
-                            self.close_connection(e);
-                        }
-                        if self.finished {
-                            break;
-                        }
-                    }
+                    self.handle_frames(&mut inb).await;
                 }
                 Some(ev) = events.recv() => self.on_event(ev).await,
                 Some(c) = self.confirms.next(), if !self.confirms.is_empty() => self.on_confirm(c),
@@ -469,6 +457,27 @@ impl Conn<'_> {
                             put_heartbeat(&mut self.out);
                         }
                 }
+            }
+        }
+    }
+
+    /// Handles every whole frame in `inb`.
+    async fn handle_frames(&mut self, inb: &mut BytesMut) {
+        loop {
+            let f = match Frame::parse(inb, self.cfg.frame_max.max(MIN_MAX_FRAME_SIZE)) {
+                Ok(Some(f)) => f,
+                Ok(None) => break,
+                Err(e) => {
+                    self.close_connection(AmqpError::new(condition::FRAMING_ERROR, e.0));
+                    inb.clear();
+                    break;
+                }
+            };
+            if let Err(e) = self.on_frame(f).await {
+                self.close_connection(e);
+            }
+            if self.finished {
+                break;
             }
         }
     }

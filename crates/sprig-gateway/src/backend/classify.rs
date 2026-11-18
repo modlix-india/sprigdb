@@ -26,6 +26,10 @@ pub enum Effect {
     Commit,
     /// `ROLLBACK` (not `ROLLBACK TO SAVEPOINT`).
     Rollback,
+    /// `SAVEPOINT name`: with `autocommit = 0` and no transaction open yet
+    /// (MariaDB opens one only when a table is read or written), the server
+    /// keeps the savepoint on the connection without `SERVER_STATUS_IN_TRANS`.
+    Savepoint,
     /// DDL and other statements that commit implicitly.
     ImplicitCommit,
     /// `SET TRANSACTION ...` for the next transaction only.
@@ -318,6 +322,7 @@ impl StmtInfo {
             "START" if kw(1) == Some("TRANSACTION") => info.effects.push(Effect::Begin),
             "COMMIT" => info.effects.push(Effect::Commit),
             "ROLLBACK" if !has("TO") => info.effects.push(Effect::Rollback),
+            "SAVEPOINT" => info.effects.push(Effect::Savepoint),
             "XA" => match kw(1) {
                 Some("START" | "BEGIN") => info.effects.push(Effect::XaStart),
                 Some("COMMIT" | "ROLLBACK") => info.effects.push(Effect::XaEnd),
@@ -855,6 +860,8 @@ mod tests {
         assert!(c("COMMIT").commits());
         assert_eq!(c("ROLLBACK").effects, vec![Effect::Rollback]);
         assert!(c("ROLLBACK TO SAVEPOINT a").effects.is_empty());
+        assert_eq!(c("SAVEPOINT `s1_x1`").effects, vec![Effect::Savepoint]);
+        assert!(c("RELEASE SAVEPOINT a").effects.is_empty());
         assert_eq!(
             c("CREATE TEMPORARY TABLE IF NOT EXISTS `Tmp` (a int)").effects,
             vec![Effect::CreateTemp("tmp".into())]

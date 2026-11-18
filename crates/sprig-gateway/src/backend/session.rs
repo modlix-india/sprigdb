@@ -62,6 +62,10 @@ pub struct SessionOpts {
     /// the same pool, sessions that each hold a branch could wait on each
     /// other until every wait times out.
     pub txn_branch: bool,
+    /// The tenant whose statements the session runs, if any: plain reads
+    /// add the tenant's read fence on the cluster to their causal target
+    /// ([`Backends::raise_read_fence`](super::Backends::raise_read_fence)).
+    pub tenant: Option<sprig_common::ids::TenantId>,
 }
 
 impl Default for SessionOpts {
@@ -75,6 +79,7 @@ impl Default for SessionOpts {
             shard: ShardId(0),
             relay: None,
             txn_branch: false,
+            tenant: None,
         }
     }
 }
@@ -1811,7 +1816,10 @@ impl BackendSession {
         })
     }
 
-    /// The causal target of a read.
+    /// The causal target of a read: the session's commits, the tenant's
+    /// commits through this gateway (`reads.causal_scope =
+    /// tenant_gateway`), and, whatever the scope, the tenant's read fence on
+    /// the cluster: rows a move copied there are in no session's commits.
     fn causal_target(&self, settings: &BackendSettings) -> GtidSet {
         let mut t = self.causal.clone();
         if settings.causal_scope == CausalScope::TenantGateway {
@@ -1821,6 +1829,9 @@ impl BackendSession {
                     .watermarks
                     .get(&self.target.cluster, &self.target.user),
             );
+        }
+        if let Some(tenant) = self.opts.tenant {
+            t.union(&self.backends.read_fence(&self.target.cluster, tenant));
         }
         t
     }

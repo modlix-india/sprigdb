@@ -41,6 +41,10 @@ pub struct RangeEntry {
     pub job_id: Option<String>,
     /// While held: gateways release queued work by then (ms since epoch).
     pub hold_until_ms: Option<u64>,
+    /// After a move: the GTID position on `cluster` a read of the range
+    /// must find applied before it may go to a replica (see
+    /// [`MapRange::read_fence`]).
+    pub read_fence: Option<String>,
 }
 
 /// A group's shard map, parsed.
@@ -163,6 +167,7 @@ impl ShardMap {
                     state: RangeState::Serving,
                     job_id: None,
                     hold_until_ms: None,
+                    read_fence: None,
                 }
             })
             .collect();
@@ -200,6 +205,7 @@ impl ShardMap {
                     state: x.state,
                     job_id: x.job_id.clone(),
                     hold_until_ms: x.hold_until_ms,
+                    read_fence: x.read_fence.clone(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -241,6 +247,7 @@ impl ShardMap {
                     state: r.state,
                     job_id: r.job_id.clone(),
                     hold_until_ms: r.hold_until_ms,
+                    read_fence: r.read_fence.clone(),
                 })
                 .collect(),
         }

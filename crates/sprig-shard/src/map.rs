@@ -44,6 +44,10 @@ pub struct Placement {
     pub hold: Option<Hold>,
     /// The job that last moved the range, once its cutover committed.
     pub moved_by: Option<String>,
+    /// The GTID position on `cluster` that reads must find applied
+    /// before they may go to one of its replicas: the mover's last write
+    /// of the move into it (the map range's `read_fence`).
+    pub read_fence: Option<String>,
 }
 
 impl Placement {
@@ -73,6 +77,7 @@ impl Placement {
             } else {
                 None
             },
+            read_fence: r.read_fence.clone(),
             hold,
         })
     }
@@ -181,6 +186,11 @@ pub fn flip(map: &mut ShardMap, job: &str, to: &ClusterId) -> Result<u64> {
         ));
     }
     for r in &mut map.ranges {
+        // A fence names a position on the range's own cluster: a move
+        // elsewhere drops it (the commit sets the new one).
+        if &r.cluster_id != to {
+            r.read_fence = None;
+        }
         r.cluster_id = to.clone();
         r.epoch += 1;
         r.state = RangeState::Serving;
@@ -189,6 +199,16 @@ pub fn flip(map: &mut ShardMap, job: &str, to: &ClusterId) -> Result<u64> {
     }
     map.map_version += 1;
     Ok(map.ranges.first().map_or(0, |r| r.epoch))
+}
+
+/// Records `fence` as every range's read fence (after [`flip`], in the
+/// same compare-and-put): reads of the tenant on its new cluster don't go
+/// to a replica that hasn't applied it. An empty position records none.
+pub fn set_read_fence(map: &mut ShardMap, fence: &str) {
+    let fence = (!fence.trim().is_empty()).then(|| fence.to_owned());
+    for r in &mut map.ranges {
+        r.read_fence.clone_from(&fence);
+    }
 }
 
 /// Reads and writes tenants' whole-tenant maps in one DC tier.

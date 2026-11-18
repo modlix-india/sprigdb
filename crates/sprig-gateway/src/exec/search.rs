@@ -906,14 +906,26 @@ impl PassSession {
         format: RowFormat,
         out: &mut dyn ResultSink,
     ) -> Result<Option<Step>> {
-        if !sqlscan::mentions(text) || crate::search::service().is_none() {
+        let Some(svc) = crate::search::service() else {
+            return Ok(None);
+        };
+        // An infix LIKE narrowed by a SUBSTRING field (`search.like_acceleration`).
+        let like = sqlscan::mentions_like(text) && svc.like_acceleration();
+        if !sqlscan::mentions(text) && !like {
             return Ok(None);
         }
         let Ok(sql) = std::str::from_utf8(text) else {
             return Ok(None);
         };
+        let likes = if like {
+            sqlscan::likes(sql)
+        } else {
+            Vec::new()
+        };
         let scan = match sqlscan::scan(sql) {
-            Ok(s) if s.matches.is_empty() && s.searches.is_empty() => return Ok(None),
+            Ok(s) if s.matches.is_empty() && s.searches.is_empty() && likes.is_empty() => {
+                return Ok(None);
+            }
             Ok(s) => s,
             Err(e) => return Ok(Some(self.fail(out, &e).await?)),
         };
@@ -921,7 +933,10 @@ impl PassSession {
         // `EXPLAIN` of a statement with searches describes
         // them after MariaDB's plan.
         let mut scans = crate::search::explain::is_explain(sql).then(Vec::new);
-        let rewritten = match self.rewrite_search(cx, wire, sql, &scan, &mut scans).await {
+        let rewritten = match self
+            .rewrite_search(cx, wire, sql, &scan, &likes, &mut scans)
+            .await
+        {
             Ok(None) => return Ok(None),
             Ok(Some(s)) => s,
             Err(e) => return Ok(Some(self.fail(out, &e).await?)),
@@ -1025,6 +1040,7 @@ impl PassSession {
         wire: Wire,
         sql: &str,
         scan: &sqlscan::Scan,
+        likes: &[sqlscan::LikeCall],
         scans: &mut Option<Vec<crate::search::explain::Scan>>,
     ) -> Result<Option<String>> {
         let svc = self.search_service()?;
@@ -1040,6 +1056,13 @@ impl PassSession {
         let st = scat::state(&cat);
         // (span, replacement)
         let mut edits: Vec<((usize, usize), String)> = Vec::new();
+        // The best rows of one search: read its hits a page at a time.
+        let top_k = if scans.is_none() {
+            sqlscan::top_k(sql, scan)
+        } else {
+            None
+        };
+        let mut paged: Option<Vec<Hit>> = None;
         for m in &scan.matches {
             // Candidate tables: by qualifier, else every table named.
             let qual = m.columns.iter().find_map(|(q, _)| q.clone());
@@ -1124,6 +1147,45 @@ impl PassSession {
             };
             let started = std::time::Instant::now();
             let bound = self.bound_by_policy(&def);
+            if let Some(tk) = top_k.filter(|_| !bound) {
+                // Every MATCH of a top-k statement is the same search:
+                // searched once, a page at a time.
+                if paged.is_none() {
+                    paged = self
+                        .top_k_hits(
+                            cx,
+                            wire,
+                            svc,
+                            tenant,
+                            &cat,
+                            &def,
+                            &query,
+                            consistency,
+                            sql,
+                            scan,
+                            tk,
+                        )
+                        .await?;
+                }
+                if let Some(hits) = &paged {
+                    let qual = match (&tref.alias, m.columns.iter().any(|(q, _)| q.is_some())) {
+                        (Some(a), true) => format!("{}.", quote(a)),
+                        (None, true) => format!("{}.", quote(&tref.table)),
+                        _ => String::new(),
+                    };
+                    let tgt = Target2 {
+                        def: Arc::clone(&def),
+                        qual,
+                    };
+                    let rep = if m.condition {
+                        tgt.in_list(hits)?
+                    } else {
+                        tgt.score_case(hits)?
+                    };
+                    edits.push((m.span, rep));
+                    continue;
+                }
+            }
             let mut hits = if bound {
                 // Every candidate (prefix and fuzzy terms not cut down by
                 // hidden rows' words), to re-read.
@@ -1199,6 +1261,17 @@ impl PassSession {
                 .await?;
             edits.push((s.span, rep));
         }
+        for l in likes {
+            if let Some(rep) = self
+                .narrow_like(svc, tenant, &cat, lctn, st, scan, sql, l)
+                .await
+            {
+                edits.push((l.span, rep));
+            }
+        }
+        if edits.is_empty() {
+            return Ok(None);
+        }
         edits.sort_by_key(|e| e.0.0);
         let mut out = String::with_capacity(sql.len() + 256);
         let mut last = 0;
@@ -1209,6 +1282,212 @@ impl PassSession {
         }
         out.push_str(&sql[last..]);
         Ok(Some(out))
+    }
+
+    /// The hits a top-k statement needs: the best `k` of the search, `k`
+    /// growing until the statement, rewritten over them, fills its `LIMIT`
+    /// (its answer is then the same as over every hit: no row outside the
+    /// best `k` can outrank one inside), or the search has no more hits.
+    /// `None` when `k` would pass `search.max_window`, or a page's count
+    /// fails: the caller then reads every hit, as before.
+    #[allow(clippy::too_many_arguments)]
+    async fn top_k_hits(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        wire: Wire,
+        svc: &Arc<SearchService>,
+        tenant: sprig_common::ids::TenantId,
+        cat: &TenantCatalog,
+        def: &Arc<IndexDef>,
+        query: &SearchQuery,
+        consistency: Consistency,
+        sql: &str,
+        scan: &sqlscan::Scan,
+        tk: sqlscan::TopK,
+    ) -> Result<Option<Vec<Hit>>> {
+        let knobs = svc.knobs();
+        let want = usize::try_from(tk.offset.saturating_add(tk.limit)).unwrap_or(usize::MAX);
+        if want > knobs.max_window {
+            metrics::counter!("sprig_search_top_k_total", "result" => "every_hit").increment(1);
+            return Ok(None);
+        }
+        let mut k = want
+            .max(1)
+            .saturating_mul(knobs.overfetch.max(1))
+            .min(knobs.max_window);
+        let mut pages = 0u32;
+        loop {
+            pages += 1;
+            let hits =
+                run_search(svc, tenant, cat, def, query.clone(), Some(k), consistency).await?;
+            if hits.len() < k || tk.limit == 0 {
+                metrics::counter!("sprig_search_top_k_total", "result" => "paged").increment(1);
+                return Ok(Some(hits));
+            }
+            // The statement over these hits: does it fill its LIMIT?
+            let mut text = String::with_capacity(sql.len() + hits.len() * 24);
+            let mut last = 0;
+            let tref = &scan.tables[0];
+            for m in &scan.matches {
+                let qual = match (&tref.alias, m.columns.iter().any(|(q, _)| q.is_some())) {
+                    (Some(a), true) => format!("{}.", quote(a)),
+                    (None, true) => format!("{}.", quote(&tref.table)),
+                    _ => String::new(),
+                };
+                let tgt = Target2 {
+                    def: Arc::clone(def),
+                    qual,
+                };
+                text.push_str(&sql[last..m.span.0]);
+                text.push_str(&if m.condition {
+                    tgt.in_list(&hits)?
+                } else {
+                    tgt.score_case(&hits)?
+                });
+                last = m.span.1;
+            }
+            text.push_str(sql[last..].trim_end().trim_end_matches(';'));
+            let probe = format!("SELECT COUNT(*) FROM ({text}) AS `_sprig_top_k`");
+            let filled = match self.sub_rows(cx, wire, &probe).await {
+                Ok(rows) => rows
+                    .first()
+                    .and_then(|r| r.first().cloned().flatten())
+                    .and_then(|b| String::from_utf8(b).ok()?.parse::<u64>().ok())
+                    .is_some_and(|n| n >= tk.limit),
+                Err(e) => {
+                    tracing::debug!(error = %e, "a top-k search's page count failed; reading every hit");
+                    break;
+                }
+            };
+            if filled {
+                metrics::counter!("sprig_search_top_k_total", "result" => "paged").increment(1);
+                tracing::debug!(k, pages, "top-k search answered from a page of hits");
+                return Ok(Some(hits));
+            }
+            if k == knobs.max_window {
+                break;
+            }
+            k = k.saturating_mul(4).min(knobs.max_window);
+        }
+        metrics::counter!("sprig_search_top_k_total", "result" => "every_hit").increment(1);
+        Ok(None)
+    }
+
+    /// `(column LIKE ('pattern') AND key IN (candidates))` for a `LIKE`
+    /// whose column has a `SUBSTRING` field: the candidates are the rows
+    /// holding every trigram of the pattern's literal runs (3 characters or
+    /// more), searched at `latest` so no committed row is missed; MariaDB
+    /// still checks the pattern on them. `None` (the plain scan) when no
+    /// run is long enough, no index has such a field, the session may not
+    /// read the table, a row policy on it binds the session (its
+    /// statements carry only keys it reads), or the search fails or passes
+    /// `search.max_window`.
+    #[allow(clippy::too_many_arguments)]
+    async fn narrow_like(
+        &self,
+        svc: &Arc<SearchService>,
+        tenant: sprig_common::ids::TenantId,
+        cat: &TenantCatalog,
+        lctn: bool,
+        st: &scat::SearchState,
+        scan: &sqlscan::Scan,
+        sql: &str,
+        l: &sqlscan::LikeCall,
+    ) -> Option<String> {
+        let runs: Vec<String> = sqlscan::like_runs(&l.pattern, l.escape)
+            .into_iter()
+            .filter(|r| r.chars().count() >= 3)
+            .collect();
+        if runs.is_empty() {
+            return None;
+        }
+        let current = self.current_logical();
+        let (qual, col) = &l.column;
+        let cands = scan.tables.iter().filter(|t| match qual {
+            Some(q) => {
+                t.alias
+                    .as_deref()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(q))
+                    || (t.alias.is_none() && t.table.eq_ignore_ascii_case(q))
+            }
+            None => true,
+        });
+        let mut found = None;
+        for t in cands {
+            let Some(db) = t.db.clone().or_else(|| current.clone()) else {
+                continue;
+            };
+            let Some(db_id) = svc.catalog().db_id(cat, &db) else {
+                continue;
+            };
+            let field = st
+                .on_object(db_id.0, &t.table, lctn)
+                .into_iter()
+                .find_map(|d| {
+                    let f = d.fields.iter().find(|f| {
+                        f.kind == FieldKind::Substring
+                            && f.source == Source::Column
+                            && f.source_ref.eq_ignore_ascii_case(col)
+                    })?;
+                    let name = f.name.clone();
+                    Some((d, name))
+                });
+            if let Some((d, name)) = field {
+                found = Some((d, name, db, db_id, t));
+                break;
+            }
+        }
+        let (def, field, db, db_id, tref) = found?;
+        if !self.allowed(cat, lctn, &db, db_id, Some(def.object_id), Action::Select)
+            || self.bound_by_policy(&def)
+        {
+            metrics::counter!("sprig_search_like_total", "result" => "scan").increment(1);
+            return None;
+        }
+        let must = runs
+            .into_iter()
+            .map(|text| SearchQuery::Match {
+                fields: vec![field.clone()],
+                text,
+                all: true,
+                fuzzy: None,
+            })
+            .collect();
+        let query = SearchQuery::Bool {
+            must,
+            should: Vec::new(),
+            must_not: Vec::new(),
+            filter: Vec::new(),
+            min_should: 0,
+        };
+        let hits = match run_search(svc, tenant, cat, &def, query, None, Consistency::Latest).await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::debug!(error = %e, "LIKE not narrowed by its search index");
+                metrics::counter!("sprig_search_like_total", "result" => "scan").increment(1);
+                return None;
+            }
+        };
+        let qual = match (&tref.alias, qual.is_some() || scan.tables.len() > 1) {
+            (Some(a), true) => format!("{}.", quote(a)),
+            (None, true) => format!("{}.", quote(&tref.table)),
+            _ => String::new(),
+        };
+        let tgt = Target2 { def, qual };
+        let keys = tgt.in_list(&hits).ok()?;
+        metrics::counter!("sprig_search_like_total", "result" => "narrowed").increment(1);
+        let esc = l
+            .escape_span
+            .map(|(a, b)| format!(" {}", &sql[a..b]))
+            .unwrap_or_default();
+        // The pattern in parentheses: this statement isn't narrowed again
+        // when it runs.
+        Some(format!(
+            "({} LIKE ({}){esc} AND {keys})",
+            &sql[l.column_span.0..l.column_span.1],
+            &sql[l.pattern_span.0..l.pattern_span.1]
+        ))
     }
 
     /// One search through the index's copy here, after the consistency

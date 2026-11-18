@@ -10,6 +10,8 @@
 //! `ftx:` and the index `ftd_idx` on both servers, and deletes them at the
 //! end. Results are compared as sets of keys (scores are BM25 on both
 //! sides, with different statistics), in order where the query sorts.
+//! `HIGHLIGHT` replies compare field by field; `FT.AGGREGATE ...
+//! WITHCURSOR` compares the rows of every `FT.CURSOR READ` together.
 
 #![allow(
     clippy::unwrap_used,
@@ -283,6 +285,14 @@ FT.SEARCH ftd_idx world SORTBY price ASC LIMIT 0 5
 FT.SEARCH ftd_idx world SORTBY price ASC LIMIT 0 5 RETURN 2 title price
 FT.SEARCH ftd_idx world SORTBY price ASC LIMIT 0 5 RETURN 3 title AS t price
 FT.SEARCH ftd_idx * SORTBY price DESC LIMIT 0 0
+FT.SEARCH ftd_idx hello HIGHLIGHT LIMIT 0 1000
+FT.SEARCH ftd_idx 'hello world' HIGHLIGHT FIELDS 1 title TAGS '[' ']' LIMIT 0 1000
+FT.SEARCH ftd_idx running HIGHLIGHT LIMIT 0 1000
+FT.SEARCH ftd_idx '\"quick brown\"' HIGHLIGHT FIELDS 1 body LIMIT 0 1000
+FT.SEARCH ftd_idx 'world -hello' HIGHLIGHT LIMIT 0 1000
+FT.SEARCH ftd_idx '@title:engines' HIGHLIGHT LIMIT 0 1000
+FT.SEARCH ftd_idx %helo% HIGHLIGHT TAGS '<em>' '</em>' LIMIT 0 1000
+FT.SEARCH ftd_idx world SORTBY price ASC LIMIT 0 5 RETURN 2 title body HIGHLIGHT
 ";
 
 const AGGREGATES: &str = "
@@ -378,6 +388,90 @@ async fn ft_matches_redis() {
             check(&mut bad, &format!("[{round}] {line}"), sv, rv);
         }
     }
+    // FT.AGGREGATE ... WITHCURSOR, read to the end with FT.CURSOR READ:
+    // the same rows (Redis's first count and the moment its cursor id
+    // turns 0 differ, so neither is compared).
+    for line in [
+        "FT.AGGREGATE ftd_idx * LOAD 2 @title @price SORTBY 4 @price ASC @title ASC MAX 100 WITHCURSOR COUNT 7",
+        "FT.AGGREGATE ftd_idx * GROUPBY 1 @tags REDUCE COUNT 0 AS n WITHCURSOR COUNT 2",
+        "FT.AGGREGATE ftd_idx hello LOAD 1 @title WITHCURSOR",
+    ] {
+        let c = both(line);
+        let mut rows: [Vec<BTreeMap<String, String>>; 2] = [Vec::new(), Vec::new()];
+        for (i, conn) in [&mut s, &mut r].into_iter().enumerate() {
+            let mut reply = run(conn, &c).await;
+            let mut reads = 0;
+            loop {
+                let Ok(Value::Array(parts)) = &reply else {
+                    bad.push(format!("{line}: {reply:?}"));
+                    break;
+                };
+                if let Some(Value::Array(batch)) = parts.first() {
+                    rows[i].extend(batch.iter().skip(1).map(pairs));
+                }
+                let id = parts.get(1).map(text).unwrap_or_default();
+                if id == "0" || reads > 100 {
+                    break;
+                }
+                reads += 1;
+                reply = run(conn, &both(&format!("FT.CURSOR READ ftd_idx {id}"))).await;
+            }
+        }
+        let sorted = line.contains("SORTBY");
+        let [mut a, mut b] = rows;
+        if !sorted {
+            a.sort();
+            b.sort();
+        }
+        if a != b {
+            bad.push(format!("{line}\n  sprig: {a:?}\n  ref:   {b:?}"));
+        }
+        n += 1;
+    }
+    // Cursor errors: an unknown cursor (READ and DEL), a cursor deleted.
+    for line in [
+        "FT.CURSOR READ ftd_idx 12345",
+        "FT.CURSOR DEL ftd_idx 12345",
+        "FT.CURSOR READ nosuch_idx 12345",
+        "FT.AGGREGATE ftd_idx * WITHCURSOR COUNT 0",
+    ] {
+        let c = both(line);
+        let sv = run(&mut s, &c).await;
+        let rv = run(&mut r, &c).await;
+        if sv.is_ok() || rv.is_ok() {
+            bad.push(format!(
+                "{line}: expected errors\n  sprig: {sv:?}\n  ref:   {rv:?}"
+            ));
+        }
+        n += 1;
+    }
+    for conn in [&mut s, &mut r] {
+        let reply = run(
+            conn,
+            &both("FT.AGGREGATE ftd_idx * LOAD 1 @price WITHCURSOR COUNT 1"),
+        )
+        .await
+        .unwrap();
+        let Value::Array(parts) = reply else {
+            panic!("WITHCURSOR reply");
+        };
+        let id = text(&parts[1]);
+        assert_ne!(id, "0");
+        assert_eq!(
+            text(
+                &run(conn, &both(&format!("FT.CURSOR DEL ftd_idx {id}")))
+                    .await
+                    .unwrap()
+            ),
+            "OK"
+        );
+        assert!(
+            run(conn, &both(&format!("FT.CURSOR READ ftd_idx {id}")))
+                .await
+                .is_err()
+        );
+    }
+    n += 1;
     // Errors on both sides.
     for line in [
         "FT.SEARCH nosuch_idx hello",
@@ -386,6 +480,8 @@ async fn ft_matches_redis() {
         "FT.CREATE ftd_idx SCHEMA a TEXT",
         "FT.AGGREGATE ftd_idx * GROUPBY 1 @tags REDUCE NOSUCH 0",
         "FT.DROPINDEX nosuch_idx",
+        "FT.SEARCH ftd_idx hello HIGHLIGHT FIELDS 1 nosuch",
+        "FT.SEARCH ftd_idx hello HIGHLIGHT TAGS x",
     ] {
         let c = both(line);
         let sv = run(&mut s, &c).await;

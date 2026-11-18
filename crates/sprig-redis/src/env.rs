@@ -115,7 +115,14 @@ pub struct Env {
     key_filter: OnceLock<Arc<dyn crate::keyspace::KeyFilter>>,
     /// The notifications from the change feed; unset, none.
     keyspace_feed: OnceLock<Arc<dyn crate::keyspace::KeyspaceFeed>>,
+    /// `<tenant>/<database>/<table>` whose router refused a group of
+    /// writes ([`crate::batch::Group`]), and when.
+    group_refused: Mutex<std::collections::HashMap<String, Instant>>,
 }
+
+/// How long a database whose router refused a group of writes keeps its
+/// writes one by one before a group is tried again.
+const GROUP_REFUSED_FOR: Duration = Duration::from_secs(600);
 
 impl Default for Env {
     fn default() -> Self {
@@ -142,7 +149,34 @@ impl Env {
             keyspace: Mutex::new(std::collections::HashMap::new()),
             key_filter: OnceLock::new(),
             keyspace_feed: OnceLock::new(),
+            group_refused: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Whether `ns`'s router refused a group of writes in the last
+    /// [`GROUP_REFUSED_FOR`].
+    #[must_use]
+    pub fn group_refused(&self, scope: &str, ns: &sprig_kv::Namespace) -> bool {
+        let g = self
+            .group_refused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if g.is_empty() {
+            return false;
+        }
+        g.get(&format!("{scope}/{}/{}", ns.database, ns.table))
+            .is_some_and(|t| t.elapsed() < GROUP_REFUSED_FOR)
+    }
+
+    /// Records that `ns`'s router refused a group of writes.
+    pub fn set_group_refused(&self, scope: &str, ns: &sprig_kv::Namespace) {
+        self.group_refused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                format!("{scope}/{}/{}", ns.database, ns.table),
+                Instant::now(),
+            );
     }
 
     /// The keyspace notification flags of tenant `scope` (canonical).

@@ -27,7 +27,13 @@ function receive() {
   const rcv = c.open_receiver({ source: { address: addr }, autoaccept: false, credit_window: 5 });
   rcv.on('message', (ctx) => {
     const b = typeof ctx.message.body === 'string' ? ctx.message.body : Buffer.from(ctx.message.body.content || ctx.message.body).toString();
-    if (b === 'm3' && !released) { released = true; ctx.delivery.release({ delivery_failed: false }); return; }
+    // The release goes out on its own, in a later turn of the event loop.
+    // rhea 3.0.4 merges the settlements of one turn into ranges and takes
+    // the second delivery of a range into the first's outcome without
+    // comparing them (session.js, write_dispositions): an accept next to
+    // the release would release an accepted message, or accept the
+    // released one, whatever the broker does.
+    if (b === 'm3' && !released) { released = true; const d = ctx.delivery; setImmediate(() => d.release({ delivery_failed: false })); return; }
     got.push(b); props.push((ctx.message.application_properties || {}).i);
     ctx.delivery.accept();
     if (got.length === N) {

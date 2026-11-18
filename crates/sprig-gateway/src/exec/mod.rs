@@ -371,6 +371,7 @@ impl PassSession {
             Some(ts) => ts.schema_of(ts.current.as_deref().or(cx.db)),
             None => cx.db.map(str::to_owned),
         };
+        let tenant = self.tenant.as_deref().map(|ts| ts.tenant);
         let bs = self.bs.get_or_insert_with(|| {
             backends.session(
                 target.clone(),
@@ -381,6 +382,7 @@ impl PassSession {
                     collation: cx.proto.collation,
                     schema,
                     relay,
+                    tenant,
                     ..SessionOpts::default()
                 },
             )

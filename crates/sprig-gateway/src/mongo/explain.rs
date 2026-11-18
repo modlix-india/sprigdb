@@ -1,5 +1,5 @@
 //! MongoDB's `explain` for `find`, `aggregate`, `count`, `distinct`,
-//! `update` and `delete` (searches have their own).
+//! `update`, `delete` and `findAndModify` (searches have their own).
 //!
 //! The command runs through the engine as usual, on a [`Recorder`] around
 //! the caller's session: every statement the engine sends to the
@@ -9,7 +9,9 @@
 //! first statement of each step without reading. Writes to the table (an
 //! `UPDATE`, a `DELETE`) are noted and not sent; an update is planned as the
 //! read that finds its documents plus the write the engine would send for
-//! each. Each noted statement then goes to MariaDB as `EXPLAIN FORMAT=JSON`
+//! each; a `findAndModify` as the read of its one document (by its `sort`)
+//! plus that document's `UPDATE`, `DELETE` or, for an upsert that finds
+//! none, `INSERT`. Each noted statement then goes to MariaDB as `EXPLAIN FORMAT=JSON`
 //! through the same session, so the caller's privileges and row policies
 //! apply: a caller a row policy binds gets MariaDB's plan refused, as SQL
 //! `EXPLAIN` is, and sees the refusal in its place.
@@ -170,7 +172,7 @@ struct Ran {
 }
 
 /// The explain of `cmd` (the document under `explain`) in `db`; `None` for
-/// commands other than the six this module explains, and for `aggregate`
+/// commands other than the seven this module explains, and for `aggregate`
 /// on a database.
 ///
 /// # Errors
@@ -189,7 +191,14 @@ pub(super) async fn explain(
     let name = name.as_str();
     if !matches!(
         name,
-        "find" | "aggregate" | "count" | "distinct" | "update" | "delete"
+        "find"
+            | "aggregate"
+            | "count"
+            | "distinct"
+            | "update"
+            | "delete"
+            | "findAndModify"
+            | "findandmodify"
     ) {
         return Ok(None);
     }
@@ -228,6 +237,16 @@ pub(super) async fn explain(
                 let n = engine.count(sql, &ns, &q, 0, u64::from(one)).await?;
                 ran.n = n;
                 ran.stats.insert("nWouldDelete", to_i64(n));
+            }
+            "findAndModify" | "findandmodify" => {
+                if cmd.get_bool("remove").unwrap_or(false) {
+                    ran.stats.insert("nWouldDelete", to_i64(ran.n));
+                } else {
+                    let upsert = cmd.get_bool("upsert").unwrap_or(false);
+                    ran.stats.insert("nMatched", to_i64(ran.n));
+                    ran.stats
+                        .insert("nWouldUpsert", i64::from(upsert && ran.n == 0));
+                }
             }
             _ => {}
         }
@@ -520,6 +539,71 @@ async fn run(
             }
             ran.gateway.push("apply the update to each document in the gateway, then write it if its _v is unchanged".into());
             ran.above.push(doc! {"stage": "UPDATE"});
+            ran.parsed = q;
+        }
+        "findAndModify" | "findandmodify" => {
+            let q = cmd.get_document("query").cloned().unwrap_or_default();
+            let sort = cmd
+                .get_document("sort")
+                .ok()
+                .cloned()
+                .filter(|s| !s.is_empty());
+            let remove = cmd.get_bool("remove").unwrap_or(false);
+            let upsert = !remove && cmd.get_bool("upsert").unwrap_or(false);
+            // The one document it would change: the first by its sort.
+            let (n, key) = read_keys(
+                engine,
+                rec,
+                ns,
+                FindSpec {
+                    filter: q.clone(),
+                    sort: sort.clone(),
+                    limit: 1,
+                    ..FindSpec::default()
+                },
+                execute,
+            )
+            .await?;
+            ran.n = n;
+            let table = format!("{}.{}", ident(&ns.db), ident(&m.table));
+            let key = key.unwrap_or_else(|| vec![0]);
+            if remove {
+                ran.planned.push(inline(
+                    &format!("DELETE FROM {table} WHERE _id = ?"),
+                    &[Param::Bin(key)],
+                ));
+            } else {
+                ran.planned.push(inline(
+                    &format!(
+                        "UPDATE {table} SET _v = ?, doc = ?, _types = ? WHERE _id = ? AND _v = ?"
+                    ),
+                    &[
+                        Param::Int(0),
+                        Param::Text("{}".into()),
+                        Param::Null,
+                        Param::Bin(key),
+                        Param::Int(0),
+                    ],
+                ));
+                if upsert {
+                    ran.planned.push(format!(
+                        "INSERT INTO {table} (_id, doc, _types, _v) VALUES (X'00', '{{}}', NULL, 0)"
+                    ));
+                }
+            }
+            if let Some(s) = &sort
+                && !id_sort(s)
+            {
+                ran.gateway.push("sort in the gateway".into());
+            }
+            ran.gateway.push(if remove {
+                "delete the first document found and return it".into()
+            } else {
+                "apply the update to the first document found in the gateway, then write it if its _v is unchanged, and return the document".into()
+            });
+            ran.above.push(doc! {"stage": "LIMIT", "limitAmount": 1i64});
+            ran.above
+                .push(doc! {"stage": if remove { "DELETE" } else { "UPDATE" }});
             ran.parsed = q;
         }
         "delete" => {

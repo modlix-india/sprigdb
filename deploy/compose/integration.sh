@@ -47,11 +47,12 @@ die() {
 listening() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 
 # Runs SQL through the gateway's MySQL listener as $1 (password
-# sprig-dev-app): with the mysql client when there is one, else with
+# sprig-dev-app), over TLS when the gateway offers it: a cold caching_sha2 login over
+# plain TCP fails with 2061 until the gateway serves its RSA public key: with the mysql client when there is one, else with
 # compose.yaml's MariaDB image (host network, Linux).
 sql_as() {
     if command -v mysql >/dev/null; then
-        MYSQL_PWD=$password mysql -h 127.0.0.1 -P "$mysql_port" -u "$1" --ssl-mode=DISABLED -e "$2"
+        MYSQL_PWD=$password mysql -h 127.0.0.1 -P "$mysql_port" -u "$1" --ssl-mode=PREFERRED -e "$2"
     else
         docker run --rm --network host "${MARIADB_IMAGE:-mariadb:11.8}" \
             mariadb -h 127.0.0.1 -P "$mysql_port" -u "$1" -p"$password" --skip-ssl -e "$2"

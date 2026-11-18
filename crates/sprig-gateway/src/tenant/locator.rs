@@ -425,11 +425,25 @@ impl GatewayLocator {
                 // The new home's mirror may still be loading: keep following
                 // the forwarding map meanwhile.
                 if let Some(m) = self.mirrored_map(&now, tenant) {
-                    return Placement::of(&m).ok();
+                    return Placement::of(&m)
+                        .ok()
+                        .inspect(|p| self.note_fence(tenant, p));
                 }
             }
         }
-        Placement::of(&*map?).ok()
+        Placement::of(&*map?)
+            .ok()
+            .inspect(|p| self.note_fence(tenant, p))
+    }
+
+    /// Hands a placement's read fence (a move's last write on the
+    /// tenant's new cluster) to the backends, before any statement routes
+    /// by the placement: reads of the tenant there then skip replicas
+    /// that haven't applied the copy.
+    fn note_fence(&self, tenant: TenantId, p: &Placement) {
+        if let Some(f) = &p.read_fence {
+            self.backends.raise_read_fence_text(&p.cluster, tenant, f);
+        }
     }
 
     /// The DC `tenant` is followed in and its map mirror's generation:
@@ -467,7 +481,9 @@ impl GatewayLocator {
         let key = ShardMap::catalog_key(self.dc.tier(), tenant).ok()?;
         let kv = self.maps().get(&key)?;
         let map = Record::<ShardMap>::decode(&kv.value).ok()?.body;
-        Placement::of(&map).ok()
+        Placement::of(&map)
+            .ok()
+            .inspect(|p| self.note_fence(tenant, p))
     }
 
     /// Changes whenever any tenant map changes.
@@ -507,6 +523,9 @@ impl GatewayLocator {
             .catalog_cluster()
             .cloned()
             .ok_or_else(|| not_here(tenant))?;
+        if let Ok(p) = Placement::of(&map) {
+            self.note_fence(tenant, &p);
+        }
         self.clusters
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

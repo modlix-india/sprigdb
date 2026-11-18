@@ -30,6 +30,14 @@ def drain(ch, name, n=100, wait=0.0):
         got.append(b.decode())
     return got
 
+def pump(c, secs):
+    # Handles what arrives for the whole time. One process_data_events call
+    # returns after the first read that brings anything, so a broker that
+    # sends two deliveries in two writes would look like it sent one.
+    end = time.time() + secs
+    while time.time() < end:
+        c.process_data_events(time_limit=max(0.0, min(0.1, end - time.time())))
+
 def err(e):
     a = getattr(e, 'args', ())
     return a[0] if a and isinstance(a[0], int) else type(e).__name__
@@ -191,12 +199,35 @@ def _(c, ch):
     ch.basic_qos(prefetch_count=2)
     got = []
     ch.basic_consume(q("pf"), lambda ch_, m, p, b: got.append((m.delivery_tag, b.decode())))
-    c.process_data_events(time_limit=1.0)
+    pump(c, 1.0)
     first = len(got)
     for t, _ in list(got):
         ch.basic_ack(t)
-    c.process_data_events(time_limit=1.0)
+    pump(c, 1.0)
     return [first, len(got)]
+
+@scenario("prefetch_refill")
+def _(c, ch):
+    # Prefetch 2, 7 queued: each round acknowledges what it got with
+    # separate basic.ack calls, and the window refills by as many. The
+    # window is never exceeded.
+    ch.confirm_delivery()
+    ch.queue_declare(q("pf2"))
+    for i in range(7):
+        ch.basic_publish('', q("pf2"), f"{i}".encode())
+    ch.basic_qos(prefetch_count=2)
+    got, unacked, most = [], set(), [0]
+    def on(ch_, m, p, b):
+        got.append(b.decode()); unacked.add(m.delivery_tag)
+        most[0] = max(most[0], len(unacked))
+    ch.basic_consume(q("pf2"), on)
+    rounds = []
+    for _ in range(5):
+        pump(c, 0.5)
+        rounds.append(len(got))
+        for t in sorted(unacked):
+            ch.basic_ack(t); unacked.discard(t)
+    return [rounds, got, most[0]]
 
 @scenario("exclusive_elsewhere")
 def _(c, ch):
@@ -254,7 +285,7 @@ def _(c, ch):
 
 @scenario("cleanup")
 def _(c, ch):
-    for n in ("a","b","c","dead","d","dead2","e","t1","t2","f1","f2","hall","hany","p","g","h","tx","pf","altq","props","rpc"):
+    for n in ("a","b","c","dead","d","dead2","e","t1","t2","f1","f2","hall","hany","p","g","h","tx","pf","pf2","altq","props","rpc"):
         try: ch.queue_delete(q(n))
         except Exception: ch = c.channel()
     for n in ("dlx","dlx2","topic","fan","hdr","nowhere","alt","main"):

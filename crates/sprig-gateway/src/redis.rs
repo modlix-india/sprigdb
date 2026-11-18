@@ -484,9 +484,18 @@ impl Auth for GatewayAuth {
     }
 }
 
+/// The persona of the executor sessions the Redis front end and the
+/// key-value API run their statements in. Their statements are
+/// MariaDB's own (compound statements included) and their replies are
+/// read as text, so the MySQL 8.4 persona's compatibility work (integer
+/// result metadata, which parses every statement that returns a
+/// computed integer, and the MySQL text rewrites) only costs time, as in
+/// the MongoDB front end's sessions.
+const PERSONA: Persona = Persona::MariaDb;
+
 /// The capabilities the executor sees.
 fn caps() -> Caps {
-    let mut c = Caps::server_default(Persona::MySql84);
+    let mut c = Caps::server_default(PERSONA);
     c.remove(Caps::SSL | Caps::COMPRESS | Caps::ZSTD_COMPRESSION_ALGORITHM | Caps::LOCAL_FILES);
     c
 }
@@ -495,6 +504,9 @@ fn caps() -> Caps {
 #[derive(Default)]
 struct Collect {
     columns: usize,
+    /// The columns, for binary rows (prepared statements).
+    defs: Vec<ColumnDef>,
+    binary: bool,
     rows: Vec<Row>,
     affected: u64,
     error: Option<SprigError>,
@@ -505,33 +517,41 @@ struct Collect {
 impl ResultSink for Collect {
     fn wire(&self) -> Wire {
         Wire {
-            persona: Persona::MySql84,
+            persona: PERSONA,
             caps: caps(),
         }
     }
 
-    async fn begin_rows(&mut self, columns: &[ColumnDef], _format: RowFormat) -> Result<()> {
+    async fn begin_rows(&mut self, columns: &[ColumnDef], format: RowFormat) -> Result<()> {
         self.columns = columns.len();
-        Ok(())
-    }
-
-    async fn row(&mut self, values: RowValues<'_>) -> Result<()> {
-        match values {
-            RowValues::Text(v) => self
-                .rows
-                .push(v.iter().map(|c| c.map(<[u8]>::to_vec)).collect()),
-            RowValues::Binary(_) => {
-                return Err(SprigError::internal("a binary row for the Redis front end"));
-            }
+        self.binary = format == RowFormat::Binary;
+        if self.binary {
+            self.defs = columns.to_vec();
         }
         Ok(())
     }
 
+    async fn row(&mut self, values: RowValues<'_>) -> Result<()> {
+        let r = match values {
+            RowValues::Text(v) => v.iter().map(|c| c.map(<[u8]>::to_vec)).collect(),
+            RowValues::Binary(v) => v.iter().map(value_text).collect(),
+        };
+        self.rows.push(r);
+        Ok(())
+    }
+
     async fn raw_row(&mut self, payload: Bytes) -> Result<()> {
-        let r = sprig_proto_mysql::resultset::decode_text_row(&payload, self.columns)?
-            .into_iter()
-            .map(|c| c.map(<[u8]>::to_vec))
-            .collect();
+        let r = if self.binary {
+            sprig_proto_mysql::resultset::decode_binary_row(&payload, &self.defs)?
+                .iter()
+                .map(value_text)
+                .collect()
+        } else {
+            sprig_proto_mysql::resultset::decode_text_row(&payload, self.columns)?
+                .into_iter()
+                .map(|c| c.map(<[u8]>::to_vec))
+                .collect()
+        };
         self.rows.push(r);
         Ok(())
     }
@@ -585,8 +605,53 @@ impl ResultSink for Collect {
     }
 }
 
+/// A binary protocol value as the text protocol carries it (the Redis
+/// front end's prepared reads return integers and byte strings).
+fn value_text(v: &sprig_proto_mysql::Value) -> Option<Vec<u8>> {
+    use std::fmt::Write as _;
+
+    use sprig_proto_mysql::Value;
+    Some(match v {
+        Value::Null => return None,
+        Value::Int(i) => i.to_string().into_bytes(),
+        Value::UInt(u) => u.to_string().into_bytes(),
+        Value::Float(f) => f.to_string().into_bytes(),
+        Value::Double(f) => f.to_string().into_bytes(),
+        Value::Bytes(b) => b.to_vec(),
+        Value::DateTime(d) => {
+            let mut t = format!("{:04}-{:02}-{:02}", d.year, d.month, d.day);
+            if d.hour > 0 || d.minute > 0 || d.second > 0 || d.micro > 0 {
+                let _ = write!(t, " {:02}:{:02}:{:02}", d.hour, d.minute, d.second);
+            }
+            if d.micro > 0 {
+                let _ = write!(t, ".{:06}", d.micro);
+            }
+            t.into_bytes()
+        }
+        Value::Time(t) => format!(
+            "{}{:02}:{:02}:{:02}",
+            if t.negative { "-" } else { "" },
+            u64::from(t.days) * 24 + u64::from(t.hour),
+            t.minute,
+            t.second
+        )
+        .into_bytes(),
+    })
+}
+
+/// Whether reads run as prepared statements: on unless the process has
+/// `SPRIGDB_REDIS_PREPARED_READS=off` (for comparisons), read once.
+fn prepared_reads_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SPRIGDB_REDIS_PREPARED_READS").map_or(true, |v| v != "off"))
+}
+
+/// Statements a session keeps prepared; past this many the oldest are
+/// closed.
+const MAX_PREPARED: usize = 32;
+
 fn sql_error(e: &SprigError) -> SqlError {
-    let p = ErrPacket::from_error(Persona::MySql84, e);
+    let p = ErrPacket::from_error(PERSONA, e);
     SqlError {
         errno: Some(p.code),
         message: p.message,
@@ -600,6 +665,9 @@ pub(crate) struct SqlSession {
     proto: ProtoState,
     /// Writes carry `/*sprig ... o=k*/` (`SqlRunner::notified`).
     notified: bool,
+    /// Statements prepared in this session, by text, in order of
+    /// preparing.
+    prepared: Vec<(String, crate::pipeline::StmtRef)>,
 }
 
 impl SqlSession {
@@ -618,9 +686,9 @@ impl SqlSession {
         session.set_principal(principal.clone());
         session.set_state(SessionState::Ready);
         let proto = ProtoState {
-            persona: Persona::MySql84,
+            persona: PERSONA,
             caps: caps(),
-            collation: u16::from(Persona::MySql84.greeting_collation()),
+            collation: u16::from(PERSONA.greeting_collation()),
             multi_statements: false,
             framing: Framing::Plain,
             max_packet: 64 * 1024 * 1024,
@@ -634,14 +702,123 @@ impl SqlSession {
         let exec = executor.open(&LoginInfo {
             principal: principal.clone(),
             backend: principal.backend.clone(),
-            persona: Persona::MySql84,
+            persona: PERSONA,
         });
         Ok(Self {
             session,
             exec,
             proto,
             notified: false,
+            prepared: Vec::new(),
         })
+    }
+
+    /// Runs one request in internal mode: its collected result.
+    async fn request(
+        &mut self,
+        req: Request,
+        what: &'static str,
+    ) -> std::result::Result<(Collect, crate::pipeline::ExecSummary), SqlError> {
+        let mut sink = Collect::default();
+        self.session.begin_command(what, None);
+        self.exec.set_internal(true);
+        let r = {
+            let mut cx = ExecCtx {
+                session: &mut self.session,
+                proto: &self.proto,
+                db: None,
+            };
+            self.exec.execute(&mut cx, req, &mut sink).await
+        };
+        self.exec.set_internal(false);
+        self.session.end_command();
+        let summary = r.map_err(|e| sql_error(&e))?;
+        if let Some(e) = sink.error.take() {
+            return Err(sql_error(&e));
+        }
+        Ok((sink, summary))
+    }
+
+    /// The statement `sql` prepared in this session (prepared now when it
+    /// isn't yet).
+    async fn statement(
+        &mut self,
+        sql: &str,
+    ) -> std::result::Result<crate::pipeline::StmtRef, SqlError> {
+        if let Some((_, s)) = self.prepared.iter().find(|(t, _)| t == sql) {
+            return Ok(*s);
+        }
+        if self.prepared.len() >= MAX_PREPARED {
+            let (_, old) = self.prepared.remove(0);
+            let _ = self
+                .request(Request::CloseStmt { stmt: old }, "Close stmt")
+                .await;
+        }
+        let (_, summary) = self
+            .request(
+                Request::Prepare {
+                    sql: Bytes::copy_from_slice(sql.as_bytes()),
+                },
+                "Prepare",
+            )
+            .await?;
+        let stmt = summary
+            .prepared
+            .map(|m| m.stmt)
+            .ok_or_else(|| sql_error(&SprigError::internal("a prepare without a statement")))?;
+        self.prepared.push((sql.to_owned(), stmt));
+        Ok(stmt)
+    }
+
+    /// Runs `sql` prepared, with `params` bound as binary strings (`BLOB`,
+    /// compared byte for byte); an execute the statement no longer fits
+    /// (1243 unknown handler, 1615 re-prepare, a table changed under it)
+    /// is prepared once more and run again.
+    async fn run_bound(
+        &mut self,
+        sql: &str,
+        params: &[&[u8]],
+    ) -> std::result::Result<Collect, SqlError> {
+        use sprig_proto_mysql::command::{BoundParam, ParamValue};
+        use sprig_proto_mysql::resultset::column_type as ct;
+        let mut again = false;
+        loop {
+            let stmt = self.statement(sql).await?;
+            let req = Request::Execute {
+                stmt,
+                raw: sprig_proto_mysql::command::StmtExecute {
+                    stmt_id: 0,
+                    flags: 0,
+                    iterations: 1,
+                    raw_params: Bytes::new(),
+                    params: None,
+                },
+                params: sprig_proto_mysql::command::ExecuteParams {
+                    new_params_bound: true,
+                    params: params
+                        .iter()
+                        .map(|p| BoundParam {
+                            param_type: u16::from(ct::BLOB),
+                            name: Bytes::new(),
+                            value: ParamValue::Value(sprig_proto_mysql::Value::Bytes(
+                                Bytes::copy_from_slice(p),
+                            )),
+                        })
+                        .collect(),
+                },
+            };
+            match self.request(req, "Execute").await {
+                Ok((sink, _)) => return Ok(sink),
+                Err(e) if !again && matches!(e.errno, Some(1243 | 1615 | 1146 | 1054)) => {
+                    again = true;
+                    self.prepared.retain(|(t, _)| t != sql);
+                    let _ = self
+                        .request(Request::CloseStmt { stmt }, "Close stmt")
+                        .await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     async fn run(&mut self, sql: &str) -> std::result::Result<Collect, SqlError> {
@@ -655,8 +832,10 @@ impl SqlSession {
             sql
         };
         let mut sink = Collect::default();
+        // The processlist's text: the first 1,024 characters.
+        let end = sql.char_indices().nth(1024).map_or(sql.len(), |(i, _)| i);
         self.session
-            .begin_command("Query", Some(sql.chars().take(1024).collect()));
+            .begin_command("Query", Some(sql[..end].to_owned()));
         self.exec.set_internal(true);
         let r = {
             let mut cx = ExecCtx {
@@ -710,6 +889,23 @@ impl SqlRunner for SqlSession {
 
     fn row_policy_binds(&self, object: u64) -> Option<bool> {
         self.exec.row_policy_binds(object)
+    }
+
+    fn multi_results(&self) -> bool {
+        // `Collect` keeps the rows of every result set.
+        true
+    }
+
+    fn prepares(&self) -> bool {
+        prepared_reads_on()
+    }
+
+    async fn query_bound(
+        &mut self,
+        sql: &str,
+        params: &[&[u8]],
+    ) -> std::result::Result<Vec<Row>, SqlError> {
+        Ok(self.run_bound(sql, params).await?.rows)
     }
 }
 

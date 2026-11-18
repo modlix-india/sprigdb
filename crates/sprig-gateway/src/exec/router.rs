@@ -609,6 +609,17 @@ impl PassSession {
         } else {
             layout?
         };
+        // Ranges a mover job moved: their reads skip replicas that haven't
+        // applied the job's last write (once per layout).
+        if !layout.fences.is_empty()
+            && !layout
+                .fences_noted
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            for (c, f) in &layout.fences {
+                self.backends.raise_read_fence_text(c, ts.tenant, f);
+            }
+        }
         Some((layout, cache))
     }
 
@@ -641,6 +652,7 @@ impl PassSession {
                     mariadb_caps: super::mariadb_caps(self.persona, cx.proto.caps),
                     collation: cx.proto.collation,
                     schema: bs.vars().schema.clone(),
+                    tenant: Some(ts.tenant),
                     ..crate::backend::SessionOpts::default()
                 },
                 main,

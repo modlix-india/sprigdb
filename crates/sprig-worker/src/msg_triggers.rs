@@ -468,6 +468,23 @@ impl std::fmt::Debug for MsgEnv {
     }
 }
 
+/// The `end` a job that stopped for `why` reports.
+fn end_label(why: Unloaded) -> &'static str {
+    match why {
+        Unloaded::Gone => "gone",
+        Unloaded::Disabled => "disabled",
+    }
+}
+
+/// Why a job's binding didn't load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unloaded {
+    /// The binding, its module, source or database is gone.
+    Gone,
+    /// The trigger is disabled (`ALTER TRIGGER ... DISABLE`).
+    Disabled,
+}
+
 /// A job's binding as the catalog has it now.
 struct Loaded {
     source: SourceRow,
@@ -483,30 +500,66 @@ fn spec_u64(spec: &Value, k: &str) -> std::result::Result<u64, String> {
 }
 
 impl MsgEnv {
-    /// The binding, or `None` when it (or its source row) is gone or
-    /// paused.
-    async fn load(&self, tenant: TenantId, binding: u64) -> Result<Option<Loaded>> {
+    /// Ends a job whose binding didn't load. A gone binding's index entry
+    /// is removed. A disabled trigger's is left alone: `DISABLE` removed it
+    /// already, and an `ENABLE` since may have put it back, which the
+    /// controller then follows with a new job at once.
+    async fn end_unloaded(&self, tenant: TenantId, binding: u64, why: Unloaded) {
+        if why == Unloaded::Gone {
+            let _ = messages::delete_index(self.dc.as_ref(), tenant, binding).await;
+        }
+    }
+
+    /// A job's binding at its start, or (after [`Self::end_unloaded`])
+    /// the job's end to report.
+    async fn load_or_end(
+        &self,
+        tenant: TenantId,
+        binding: u64,
+    ) -> std::result::Result<std::result::Result<Loaded, Value>, String> {
+        match self
+            .load_or_why(tenant, binding)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            Ok(l) => Ok(Ok(l)),
+            Err(why) => {
+                self.end_unloaded(tenant, binding, why).await;
+                Ok(Err(json!({"end": end_label(why), "binding": binding})))
+            }
+        }
+    }
+
+    /// The binding, or why it can't run now.
+    async fn load_or_why(
+        &self,
+        tenant: TenantId,
+        binding: u64,
+    ) -> Result<std::result::Result<Loaded, Unloaded>> {
         let ep = self.locator.writer(tenant).await?;
         let schema = ep.store.schema().to_owned();
         let mut c = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
         let Some(source) = messages::source(&mut c, &schema, binding).await? else {
-            return Ok(None);
+            return Ok(Err(Unloaded::Gone));
         };
         let store = LogicStore::new(&schema);
         let b = store.binding_by_id(&mut c, binding).await?;
         if b.as_ref().is_none_or(|b| b.state != "active") {
-            return Ok(None);
+            return Ok(Err(Unloaded::Gone));
         }
         let Some(m) = store.module_by_id(&mut c, source.module_id).await? else {
-            return Ok(None);
+            return Ok(Err(Unloaded::Gone));
         };
+        if m.state == "disabled" {
+            return Ok(Err(Unloaded::Disabled));
+        }
         if m.state != "active" {
-            return Ok(None);
+            return Ok(Err(Unloaded::Gone));
         }
         let Some(version) = m.active_version else {
-            return Ok(None);
+            return Ok(Err(Unloaded::Gone));
         };
         // The source's database (a dropped database's streams and queues
         // are gone, even when a new one has its name).
@@ -523,7 +576,7 @@ impl MsgEnv {
                 SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
             })?;
         if db_state.as_deref() != Some("active") {
-            return Ok(None);
+            return Ok(Err(Unloaded::Gone));
         }
         // The source itself (a fan-in trigger's: its definition).
         let alive = match source.kind {
@@ -554,9 +607,9 @@ impl MsgEnv {
             }
         };
         if !alive {
-            return Ok(None);
+            return Ok(Err(Unloaded::Gone));
         }
-        Ok(Some(Loaded {
+        Ok(Ok(Loaded {
             source,
             version,
             catalog: ep.pool.clone(),
@@ -671,8 +724,8 @@ impl MsgEnv {
             }
             if last_reload.elapsed() >= RELOAD_EVERY {
                 last_reload = Instant::now();
-                match self.load(tenant, binding).await {
-                    Ok(Some(l)) => {
+                match self.load_or_why(tenant, binding).await {
+                    Ok(Ok(l)) => {
                         let old = t.version.swap(l.version, Ordering::Relaxed);
                         if old != l.version {
                             tracing::info!(%tenant, binding, version = l.version, "trigger: new version");
@@ -682,11 +735,17 @@ impl MsgEnv {
                             tracing::warn!(%tenant, binding, error = %e, "trigger: dead-letter replay stopped; retried");
                         }
                     }
-                    Ok(None) => {
-                        tracing::info!(%tenant, binding, "trigger's binding or source is gone; its job ends");
-                        let _ = messages::delete_index(self.dc.as_ref(), tenant, binding).await;
+                    Ok(Err(why)) => {
+                        let what = match why {
+                            Unloaded::Gone => "trigger's binding or source is gone; its job ends",
+                            Unloaded::Disabled => "trigger disabled; its job ends",
+                        };
+                        tracing::info!(%tenant, binding, "{what}");
+                        self.end_unloaded(tenant, binding, why).await;
                         stop.cancel();
-                        return true;
+                        // Only a gone binding is "gone" (a fan-in trigger's
+                        // record is removed then); a disabled one just stops.
+                        return why == Unloaded::Gone;
                     }
                     Err(e) => tracing::debug!(error = %e, "trigger: catalog unreadable"),
                 }
@@ -1023,9 +1082,9 @@ impl JobHandler for StreamTrigger {
         let env = &self.0;
         let tenant = TenantId(spec_u64(&cx.spec, "tenant")?);
         let binding = spec_u64(&cx.spec, "binding")?;
-        let Some(l) = env.load(tenant, binding).await.map_err(|e| e.to_string())? else {
-            let _ = messages::delete_index(env.dc.as_ref(), tenant, binding).await;
-            return Ok(json!({"end": "gone", "binding": binding}));
+        let l = match env.load_or_end(tenant, binding).await? {
+            Ok(l) => l,
+            Err(end) => return Ok(end),
         };
         if let Some(def) = l.source.fanin_definition() {
             return run_fan_in(env, cx, tenant, binding, &l, def).await;
@@ -1288,9 +1347,9 @@ impl JobHandler for QueueTrigger {
         let env = &self.0;
         let tenant = TenantId(spec_u64(&cx.spec, "tenant")?);
         let binding = spec_u64(&cx.spec, "binding")?;
-        let Some(l) = env.load(tenant, binding).await.map_err(|e| e.to_string())? else {
-            let _ = messages::delete_index(env.dc.as_ref(), tenant, binding).await;
-            return Ok(json!({"end": "gone", "binding": binding}));
+        let l = match env.load_or_end(tenant, binding).await? {
+            Ok(l) => l,
+            Err(end) => return Ok(end),
         };
         env.settings.refresh_tenant(tenant).await;
         let t = env.template(tenant, &l);

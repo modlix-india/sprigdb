@@ -793,15 +793,31 @@ pub fn drop_plan(state: &AuthzState, cat: &TenantCatalog, dropped: &[Dropped]) -
     out
 }
 
-/// 39366 `ER_SPRIG_RLS_UNSUPPORTED`: the engine filters rows of `table`
-/// and this gateway can't apply the filter yet.
+/// 39366 `ER_SPRIG_RLS_UNSUPPORTED`: rows of `table` are filtered for this
+/// session (its row policies, or the authorization engine), and the
+/// statement can't be policed exactly.
 #[must_use]
 pub fn row_filter_unsupported(table: &str) -> SprigError {
     SprigError::new(
         sprig_common::SprigCode::RlsUnsupported,
         format!(
-            "ER_SPRIG_RLS_UNSUPPORTED: the authorization engine filters rows of '{table}', \
-             which this gateway can't apply yet"
+            "ER_SPRIG_RLS_UNSUPPORTED: rows of '{table}' are filtered for this session, and \
+             this statement can't be limited to the rows it may see; use plain SELECT, \
+             INSERT, UPDATE or DELETE"
+        ),
+    )
+}
+
+/// 39366 `ER_SPRIG_RLS_UNSUPPORTED` for DDL (`ALTER TABLE`, `CREATE` or
+/// `DROP INDEX`, `RENAME TABLE`) on `table`, whose row policies bind this
+/// session.
+#[must_use]
+pub fn row_policy_ddl_refused(table: &str) -> SprigError {
+    SprigError::new(
+        sprig_common::SprigCode::RlsUnsupported,
+        format!(
+            "ER_SPRIG_RLS_UNSUPPORTED: DDL on '{table}', a table whose row policies bind this \
+             session, isn't allowed; run it as a user the policies don't restrict"
         ),
     )
 }

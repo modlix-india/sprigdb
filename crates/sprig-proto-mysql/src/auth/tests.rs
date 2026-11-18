@@ -3,6 +3,7 @@
 //! are tested with the gateway's flow over `sprig-auth`.
 
 use std::future::Future;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use tokio::io::DuplexStream;
@@ -69,6 +70,23 @@ where
     C: FnOnce(DuplexStream) -> F,
     F: Future<Output = ()>,
 {
+    exchange_rsa(flow, tls, None, plugin, first, force_switch, client).await
+}
+
+/// [`exchange`] with the listener's RSA key `rsa`.
+async fn exchange_rsa<C, F>(
+    flow: &mut Mock,
+    tls: bool,
+    rsa: Option<Arc<dyn ServerRsaKey>>,
+    plugin: Option<&str>,
+    first: &'static [u8],
+    force_switch: bool,
+    client: C,
+) -> (AuthVerdict, [u8; NONCE_LEN])
+where
+    C: FnOnce(DuplexStream) -> F,
+    F: Future<Output = ()>,
+{
     let (c, mut s) = tokio::io::duplex(1 << 16);
     let mut sio = RawIo::new(&mut s, 2);
     let mut io = AuthIo {
@@ -76,6 +94,7 @@ where
         persona: Persona::MySql84,
         tls,
         nonce: NONCE,
+        rsa,
     };
     let server = async {
         let v = authenticate(
@@ -189,6 +208,161 @@ async fn rsa_path_is_refused_without_hashing() {
     assert!(matches!(v, AuthVerdict::Refuse(_)));
     assert!(flow.passwords.is_empty());
     assert_eq!(flow.decided, [(Outcome::NeedsTls, AuthPath::Rsa)]);
+}
+
+/// A stand-in for the RSA key: "decrypting" returns the ciphertext as it
+/// is, except one starting with 0xFF (a padding failure). Ciphertexts are
+/// `SIZE` bytes.
+struct FakeKey;
+
+impl FakeKey {
+    const SIZE: usize = 7;
+}
+
+#[async_trait]
+impl ServerRsaKey for FakeKey {
+    fn public_pem(&self) -> Bytes {
+        Bytes::from_static(b"-----BEGIN PUBLIC KEY-----\nfake\n-----END PUBLIC KEY-----\n")
+    }
+    fn size(&self) -> usize {
+        Self::SIZE
+    }
+    async fn decrypt(&self, ciphertext: Bytes) -> Option<Zeroizing<Vec<u8>>> {
+        (ciphertext.first() != Some(&0xFF)).then(|| Zeroizing::new(ciphertext.to_vec()))
+    }
+}
+
+/// `password || 0x00` combined by XOR with the nonce: what the client encrypts.
+fn scrambled(password: &[u8]) -> Bytes {
+    let mut p = password.to_vec();
+    p.push(0);
+    p.iter()
+        .zip(NONCE.iter().cycle())
+        .map(|(b, n)| b ^ n)
+        .collect::<Vec<u8>>()
+        .into()
+}
+
+fn fake_key() -> Arc<dyn ServerRsaKey> {
+    Arc::new(FakeKey)
+}
+
+#[tokio::test]
+async fn rsa_path_serves_the_public_key_then_reads_the_ciphertext() {
+    let mut flow = Mock {
+        password: b"secret".to_vec(),
+        ..Mock::default()
+    };
+    let (v, _) = exchange_rsa(
+        &mut flow,
+        false,
+        Some(fake_key()),
+        Some(CACHING_SHA2_PASSWORD),
+        &[1; 32],
+        false,
+        |mut d| async move {
+            let mut c = RawIo::new(&mut d, 2);
+            assert_eq!(c.read_packet().await.expect("read"), &[0x01, 0x04][..]);
+            c.write_packet(Bytes::from_static(&[REQUEST_PUBLIC_KEY]))
+                .await
+                .expect("write");
+            let key = c.read_packet().await.expect("read key");
+            assert_eq!(key[0], 0x01);
+            assert_eq!(&key[1..], &FakeKey.public_pem()[..]);
+            c.write_packet(scrambled(b"secret")).await.expect("write");
+        },
+    )
+    .await;
+    assert_eq!(v, AuthVerdict::Accept);
+    assert_eq!(flow.passwords, [b"secret".to_vec()]);
+    assert_eq!(flow.decided, [(Outcome::Verified, AuthPath::Rsa)]);
+}
+
+#[tokio::test]
+async fn rsa_path_takes_a_ciphertext_from_a_client_that_has_the_key() {
+    let mut flow = Mock {
+        password: b"secret".to_vec(),
+        ..Mock::default()
+    };
+    let (v, _) = exchange_rsa(
+        &mut flow,
+        false,
+        Some(fake_key()),
+        Some(CACHING_SHA2_PASSWORD),
+        &[1; 32],
+        false,
+        |mut d| async move {
+            let mut c = RawIo::new(&mut d, 2);
+            assert_eq!(c.read_packet().await.expect("read"), &[0x01, 0x04][..]);
+            c.write_packet(scrambled(b"secret")).await.expect("write");
+        },
+    )
+    .await;
+    assert_eq!(v, AuthVerdict::Accept);
+    assert_eq!(flow.decided, [(Outcome::Verified, AuthPath::Rsa)]);
+}
+
+#[tokio::test]
+async fn a_clear_password_without_tls_is_never_checked() {
+    // "secret\0" is 7 bytes, a ciphertext of the fake key is too: send a
+    // longer clear-text password.
+    let mut flow = Mock {
+        password: b"secret-password".to_vec(),
+        ..Mock::default()
+    };
+    let (v, _) = exchange_rsa(
+        &mut flow,
+        false,
+        Some(fake_key()),
+        Some(CACHING_SHA2_PASSWORD),
+        &[1; 32],
+        false,
+        |mut d| async move {
+            let mut c = RawIo::new(&mut d, 2);
+            assert_eq!(c.read_packet().await.expect("read"), &[0x01, 0x04][..]);
+            c.write_packet(Bytes::from_static(b"secret-password\0"))
+                .await
+                .expect("write");
+        },
+    )
+    .await;
+    assert!(matches!(v, AuthVerdict::Refuse(_)));
+    assert!(flow.passwords.is_empty());
+    assert_eq!(flow.decided, [(Outcome::NeedsTls, AuthPath::Rsa)]);
+}
+
+#[tokio::test]
+async fn a_bad_ciphertext_costs_a_wrong_password() {
+    for bad in [
+        // The padding check fails.
+        Bytes::from_static(&[0xFF; FakeKey::SIZE]),
+        // It decrypts, but without the terminating NUL.
+        Bytes::from_static(&[b'x'; FakeKey::SIZE]),
+    ] {
+        let mut flow = Mock {
+            password: b"secret".to_vec(),
+            ..Mock::default()
+        };
+        let (v, _) = exchange_rsa(
+            &mut flow,
+            false,
+            Some(fake_key()),
+            Some(CACHING_SHA2_PASSWORD),
+            &[1; 32],
+            false,
+            |mut d| async move {
+                let mut c = RawIo::new(&mut d, 2);
+                assert_eq!(c.read_packet().await.expect("read"), &[0x01, 0x04][..]);
+                c.write_packet(bad).await.expect("write");
+            },
+        )
+        .await;
+        assert!(matches!(v, AuthVerdict::Refuse(e) if e.code == 1045));
+        // One hash, of a random password.
+        assert_eq!(flow.passwords.len(), 1);
+        assert_ne!(flow.passwords[0], b"secret");
+        assert_eq!(flow.decided, [(Outcome::WrongCredentials, AuthPath::Rsa)]);
+    }
 }
 
 #[tokio::test]

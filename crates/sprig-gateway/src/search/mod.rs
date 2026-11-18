@@ -249,6 +249,15 @@ impl SearchService {
         }
     }
 
+    /// `search.like_acceleration`, read alone (statements with `LIKE` ask
+    /// it before anything else).
+    #[must_use]
+    pub fn like_acceleration(&self) -> bool {
+        self.deps
+            .live
+            .get(&LIKE_ACCELERATION, &SettingCtx::process(&self.deps.dc))
+    }
+
     /// The catalog module.
     #[must_use]
     pub fn catalog(&self) -> &catalog::SearchCatalog {

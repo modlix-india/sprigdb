@@ -22,6 +22,8 @@ pub struct FtCall<'a> {
     pub args: &'a [Bytes],
     /// The login's tenant (its id as text).
     pub scope: &'a str,
+    /// The login's user name (`FT.CURSOR` reads only its own cursors).
+    pub user: &'a str,
     /// `redis.logical_database`: where the namespaces are.
     pub database: &'a str,
     /// The selected database (`SELECT`): the namespace `db<n>`.
