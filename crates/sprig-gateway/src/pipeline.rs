@@ -407,6 +407,12 @@ pub trait SessionExec: Send {
 
     /// Returns a backend connection kept between statements to its pool.
     fn release_idle(&mut self) {}
+
+    /// Keeps the session's backend connection from one statement to the
+    /// next (`on`) instead of returning it to the pool after each. The front
+    /// end that turns it on calls [`Self::release_idle`] when its client
+    /// goes quiet.
+    fn keep_idle(&mut self, _on: bool) {}
 }
 
 /// What [`SessionExec::point_read`] found.
@@ -508,6 +514,18 @@ pub trait ResultSink: Send {
     /// One row packet's payload exactly as the backend sent it (relay
     /// mode). Never re-encoded.
     async fn raw_row(&mut self, payload: Bytes) -> Result<()>;
+
+    /// [`Self::raw_row`] when the sink can take the row without waiting
+    /// (the client isn't behind): no future per row. `Err(payload)` hands
+    /// the row back unsent, for [`Self::raw_row`]; a sink that changes rows
+    /// hands back the row as it came.
+    ///
+    /// # Errors
+    /// `Ok(Err(..))`: the row was taken and sending it failed, as
+    /// [`Self::raw_row`] fails.
+    fn try_raw_row(&mut self, payload: Bytes) -> std::result::Result<Result<()>, Bytes> {
+        Err(payload)
+    }
 
     /// Ends the rows with an EOF or an OK terminator, whichever the client
     /// expects.
@@ -646,6 +664,10 @@ impl SessionExec for HookedSession {
 
     fn release_idle(&mut self) {
         self.inner.release_idle();
+    }
+
+    fn keep_idle(&mut self, on: bool) {
+        self.inner.keep_idle(on);
     }
 
     async fn execute(

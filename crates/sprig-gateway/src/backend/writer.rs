@@ -42,7 +42,8 @@ pub trait WriterSelector: Send + Sync {
 #[derive(Debug)]
 pub struct TopologyWriters {
     nodes: Arc<NodeTable>,
-    current: Mutex<HashMap<(ClusterId, ShardId), NodeId>>,
+    /// The last writer chosen per cluster and shard.
+    current: Mutex<HashMap<ClusterId, HashMap<ShardId, NodeId>>>,
 }
 
 impl TopologyWriters {
@@ -57,7 +58,18 @@ impl TopologyWriters {
 
     fn remember(&self, view: &ClusterView, shard: ShardId, node: &NodeRef) {
         let mut cur = self.current.lock().unwrap_or_else(PoisonError::into_inner);
-        let prev = cur.insert((view.id.clone(), shard), node.node.clone());
+        // Every statement passes here: the same writer again copies nothing.
+        if cur
+            .get(&view.id)
+            .and_then(|m| m.get(&shard))
+            .is_some_and(|n| *n == node.node)
+        {
+            return;
+        }
+        let prev = cur
+            .entry(view.id.clone())
+            .or_default()
+            .insert(shard, node.node.clone());
         if prev.as_ref().is_some_and(|p| p != &node.node) {
             tracing::info!(
                 event = "backend.writer_changed",

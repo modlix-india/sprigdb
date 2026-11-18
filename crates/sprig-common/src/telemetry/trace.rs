@@ -603,6 +603,19 @@ where
     }
 }
 
+/// Whether a trace that `span` belongs to may be kept when it ends: it is
+/// head-sampled, or it ran for at least the slow threshold (`ran`). A
+/// field recorded on a span only matters then (or with an error, which
+/// keeps it too); skipping it otherwise saves the log formatter's copy.
+#[must_use]
+pub fn may_keep(span: &tracing::Span, ran: Duration) -> bool {
+    // A margin: the trace layer times the span a little later, at its close.
+    ran + Duration::from_millis(5) >= tracer().slow()
+        || span
+            .with_subscriber(|(id, dispatch)| context_of(id, dispatch).is_some_and(|c| c.sampled))
+            .unwrap_or(false)
+}
+
 /// The trace context of the innermost traced span around the caller, if
 /// any (for propagation to MariaDB and to peers).
 #[must_use]

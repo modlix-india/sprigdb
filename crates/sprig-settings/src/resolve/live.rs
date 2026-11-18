@@ -180,9 +180,8 @@ impl Settings {
         ctx: &SettingCtx<'_>,
         tenant: Option<&TenantSettings>,
     ) -> Result<Resolved> {
-        let etcd = self.inner.live.snapshot();
-        match tenant {
-            Some(ts) => ts.resolve(&etcd, key, ctx),
+        self.inner.live.with_snapshot(|etcd| match tenant {
+            Some(ts) => ts.resolve(etcd, key, ctx),
             None if ctx.tenant.is_none() => {
                 let def = def(self.registry(), key)?;
                 let stamp = etcd.stamp();
@@ -193,8 +192,8 @@ impl Settings {
                 self.inner.memo.put(def.key(), ctx, stamp, &r);
                 Ok(r)
             }
-            None => resolve_layered(&etcd, None, key, ctx),
-        }
+            None => resolve_layered(etcd, None, key, ctx),
+        })
     }
 
     /// The typed value of `setting` in `ctx`, or its default if resolution

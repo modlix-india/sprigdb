@@ -518,9 +518,11 @@ pub(crate) async fn relay(
                         RowFormat::Text => cs.rewrite(&p.payload),
                         RowFormat::Binary => cs.rewrite_binary(&p.payload, &defs, r.backend_caps),
                     });
-                match rewritten {
-                    Some(row) => out.raw_row(row).await?,
-                    None => out.raw_row(p.payload).await?,
+                let row = rewritten.unwrap_or(p.payload);
+                // Without a future per row while the client keeps up.
+                match out.try_raw_row(row) {
+                    Ok(r) => r?,
+                    Err(row) => out.raw_row(row).await?,
                 }
             }
             PacketKind::End(t) => {

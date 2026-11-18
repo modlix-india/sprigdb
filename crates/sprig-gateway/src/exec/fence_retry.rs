@@ -258,6 +258,11 @@ impl ResultSink for FenceSink<'_> {
         self.inner.raw_row(payload).await
     }
 
+    fn try_raw_row(&mut self, payload: Bytes) -> std::result::Result<Result<()>, Bytes> {
+        self.sent = true;
+        self.inner.try_raw_row(payload)
+    }
+
     async fn end_rows(&mut self, end: EndOfRows) -> Result<()> {
         self.sent = true;
         self.inner.end_rows(end).await

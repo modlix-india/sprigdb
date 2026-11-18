@@ -577,6 +577,53 @@ impl SessionVars {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unreplayable(pub String);
 
+/// Whether [`sync_prefix`] would list no statement: the connection
+/// already matches the session for `stmt` (and its next state is
+/// `applied` unchanged). Allocates nothing; most statements take this way.
+#[must_use]
+pub fn in_sync(
+    applied: &AppliedState,
+    base: &Baseline,
+    session: &SessionVars,
+    stmt: &StmtInfo,
+    wsrep_sync_wait: u8,
+) -> bool {
+    // A session without a schema keeps the connection's (see
+    // `sync_prefix`).
+    if session.schema.is_some() && session.schema != applied.schema {
+        return false;
+    }
+    if client_names(applied, session).is_some()
+        || applied.wsrep_sync_wait != wsrep_sync_wait
+        || session.role != applied.role
+    {
+        return false;
+    }
+    if session
+        .vars
+        .keys()
+        .chain(applied.vars.keys())
+        .any(|name| want(&session.vars, base, name) != want(&applied.vars, base, name))
+    {
+        return false;
+    }
+    let differs = |v: &String| {
+        let want = session.user_vars.get(v).unwrap_or(&VarValue::Null);
+        let have = applied.user_vars.get(v);
+        !(have == Some(want) || (have.is_none() && *want == VarValue::Null))
+    };
+    let all = || session.user_vars.keys().chain(applied.user_vars.keys());
+    let reads_differ = if stmt.reads_all_user_vars {
+        all().any(differs)
+    } else {
+        stmt.reads_user_vars.iter().any(differs)
+    };
+    if reads_differ || all().filter(|v| v.as_str() == RLS_CONTEXT_VAR).any(differs) {
+        return false;
+    }
+    !(stmt.uses_last_insert_id && applied.last_insert_id != session.last_insert_id)
+}
+
 /// The statements that make a connection holding `applied` match the
 /// session, and the state it holds once they succeed.
 ///
@@ -999,6 +1046,78 @@ mod tests {
         assert_ne!(a.digest(&b), s.digest(1, &b), "wsrep_sync_wait counts");
         s.schema = Some("db".into());
         assert_ne!(a.digest(&b), s.digest(0, &b));
+    }
+
+    #[test]
+    fn in_sync_agrees_with_sync_prefix() {
+        let b = base();
+        let mut sessions = Vec::new();
+        let plain = SessionVars {
+            schema: Some("db".into()),
+            ..SessionVars::default()
+        };
+        sessions.push(plain.clone());
+        let mut s = plain.clone();
+        s.schema = None;
+        sessions.push(s);
+        let mut s = plain.clone();
+        s.vars.insert("time_zone".into(), "+01:00".into());
+        sessions.push(s);
+        let mut s = plain.clone();
+        s.vars.insert("autocommit".into(), "ON".into());
+        sessions.push(s);
+        let mut s = plain.clone();
+        s.client_collation = Some("latin1_swedish_ci".into());
+        sessions.push(s);
+        let mut s = plain.clone();
+        s.user_vars
+            .insert("a".into(), VarValue::Integer("5".into()));
+        sessions.push(s);
+        let mut s = plain.clone();
+        s.user_vars
+            .insert(RLS_CONTEXT_VAR.into(), VarValue::Integer("7".into()));
+        sessions.push(s);
+        let mut s = plain.clone();
+        s.last_insert_id = 9;
+        sessions.push(s);
+        let mut stmts = vec![StmtInfo::read(), StmtInfo::write()];
+        let mut st = StmtInfo::read();
+        st.reads_user_vars = vec!["a".into()];
+        st.uses_last_insert_id = true;
+        stmts.push(st);
+        let mut st = StmtInfo::read();
+        st.reads_all_user_vars = true;
+        stmts.push(st);
+        // Every session's state applied on a connection, against every
+        // session and statement: in sync exactly when sync lists nothing,
+        // and then the next state is the connection's.
+        let mut conns = vec![AppliedState::default()];
+        for s in &sessions {
+            for st in &stmts {
+                if let Ok((_, next)) = sync_prefix(&AppliedState::default(), &b, s, st, 0) {
+                    conns.push(next);
+                }
+            }
+        }
+        for conn in &conns {
+            for s in &sessions {
+                for st in &stmts {
+                    for w in [0, 1] {
+                        let synced = in_sync(conn, &b, s, st, w);
+                        match sync_prefix(conn, &b, s, st, w) {
+                            Ok((p, next)) => {
+                                assert_eq!(synced, p.is_empty(), "{conn:?} {s:?} {st:?} {p:?}");
+                                if p.is_empty() {
+                                    assert_eq!(&next, conn);
+                                }
+                            }
+                            // Unreplayable: never in sync.
+                            Err(e) => assert!(!synced, "{conn:?} {s:?} {e:?}"),
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

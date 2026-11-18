@@ -779,7 +779,10 @@ impl BackendSession {
     fn take_kept(&mut self, view: &ClusterView, node: &NodeRef) -> Option<BackendLease> {
         let mut l = *self.kept.take()?;
         let key = l.key();
-        let same = key.cluster == view.id
+        // Another session waits for a connection: this one goes back to
+        // the pool and the statement leases like any other.
+        let same = !self.backends.pools.has_waiters()
+            && key.cluster == view.id
             && key.node == node.node
             && key.account == self.target.user
             && key.found_rows == self.opts.found_rows
@@ -1157,9 +1160,24 @@ impl BackendSession {
         if cur.done || cur.failed {
             return Ok(None);
         }
-        let waited = Instant::now();
-        let packet = cur.lease.conn().client.next_packet().await;
-        crate::observe::backend_time(waited.elapsed());
+        // The time waiting on MariaDB: from the read's first wait, read from
+        // the clock only when it waits (most packets of a response are
+        // already buffered).
+        let mut waited: Option<Instant> = None;
+        let packet = {
+            let mut read = std::pin::pin!(cur.lease.conn().client.next_packet());
+            std::future::poll_fn(|cx| {
+                let p = read.as_mut().poll(cx);
+                if p.is_pending() && waited.is_none() {
+                    waited = Some(Instant::now());
+                }
+                p
+            })
+            .await
+        };
+        if let Some(w) = waited {
+            crate::observe::backend_time(w.elapsed());
+        }
         match packet {
             Ok(Some(mut p)) => {
                 if cur.ended_silently(&p) {
@@ -1506,7 +1524,7 @@ impl BackendSession {
                 }
             }
         }
-        if ok && self.keep && cur.error.is_none() {
+        if ok && self.keep && cur.error.is_none() && !self.backends.pools.has_waiters() {
             // Kept for the session's next statement (`set_keep`).
             self.release_kept();
             self.kept = Some(Box::new(cur.lease));
@@ -2351,9 +2369,13 @@ impl BackendSession {
                 && !self.pins.in_transaction()
                 && !self.implicit_transactions()
                 && stmt_sql.is_some_and(plain_write);
-            let (mut prefix, next_applied) =
+            // `None`: the connection already matches (most statements).
+            let synced = state::in_sync(&conn.applied, &base, &self.vars, info, 0);
+            let (mut prefix, next_applied) = if synced {
+                (Vec::new(), None)
+            } else {
                 match state::sync_prefix(&conn.applied, &base, &self.vars, info, 0) {
-                    Ok(x) => x,
+                    Ok((p, n)) => (p, Some(n)),
                     Err(state::Unreplayable(why)) => {
                         tracing::warn!(%why, "session state can't be replayed");
                         drop(lease);
@@ -2363,7 +2385,8 @@ impl BackendSession {
                             "this session's state can't be replayed on a backend connection",
                         ));
                     }
-                };
+                }
+            };
             if wrapped {
                 prefix.push("START TRANSACTION".to_owned());
             }
@@ -2493,7 +2516,9 @@ impl BackendSession {
                 Ok(Sent::Ready) => {}
                 Ok(Sent::TrxGone(reported)) => {
                     // The sync statements before the guard ran.
-                    conn.applied = next_applied;
+                    if let Some(n) = next_applied {
+                        conn.applied = n;
+                    }
                     conn.client.take_changes();
                     if reported.is_none() {
                         note_silent_abort(&cluster, &node_key, "a write's transaction check");
@@ -2521,7 +2546,9 @@ impl BackendSession {
                         drop(lease);
                     } else {
                         // The sync statements before the wait ran.
-                        conn.applied = next_applied;
+                        if let Some(n) = next_applied {
+                            conn.applied = n;
+                        }
                         conn.client.take_changes();
                         let limits = self.backends.limits(&cluster);
                         self.backends.pools.release(lease, Release::Reuse, limits);
@@ -2565,7 +2592,9 @@ impl BackendSession {
                 metrics::histogram!("sprig_backend_gtid_wait_seconds", "cluster" => cluster.to_string())
                     .record(wait_started.elapsed().as_secs_f64());
             }
-            conn.applied = next_applied;
+            if let Some(n) = next_applied {
+                conn.applied = n;
+            }
             conn.client.take_changes();
 
             // Prepared statements and other commands go out now.

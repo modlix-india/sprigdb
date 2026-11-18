@@ -81,6 +81,27 @@ pub struct TenantSession {
     pub rls: super::rls::RlsSession,
     long_data_max: Arc<AtomicU64>,
     watch: Option<JoinHandle<()>>,
+    /// What the backend accounts were last found reconciled for, and when
+    /// (`refresh`).
+    ensured: Option<(EnsureKey, std::time::Instant)>,
+    /// `lower_case_table_names` with the catalog and settings snapshots it
+    /// was resolved against.
+    lctn_memo: std::sync::Mutex<Option<(Arc<TenantCatalog>, sprig_settings::Snapshot, bool)>>,
+    /// `aliases` once the provisioning account's name is known.
+    aliases_memo:
+        std::sync::OnceLock<(sprig_common::ids::ClusterId, super::aliases::AccountAliases)>,
+}
+
+/// How long a session trusts its last check that the tenant's backend
+/// accounts are reconciled, while nothing it can see changed.
+const ENSURE_AGAIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What a check of the backend accounts depends on that a session can see:
+/// the catalog snapshot, the etcd settings and the tenant's shard maps.
+struct EnsureKey {
+    catalog: Arc<TenantCatalog>,
+    etcd: sprig_settings::Snapshot,
+    maps: (sprig_common::ids::DcId, u64),
 }
 
 impl std::fmt::Debug for TenantSession {
@@ -131,6 +152,9 @@ impl TenantSession {
             rls: super::rls::RlsSession::default(),
             long_data_max: Arc::new(AtomicU64::new(LONG_DATA_MAX_BYTES.default)),
             watch: None,
+            ensured: None,
+            lctn_memo: std::sync::Mutex::new(None),
+            aliases_memo: std::sync::OnceLock::new(),
         })
     }
 
@@ -169,13 +193,32 @@ impl TenantSession {
         let cat = self.svc.cache.get(self.tenant, fresh).await?;
         self.install(&cat);
         // The tenant's per-user backend accounts follow the
-        // snapshot before this session uses them.
-        if let Err(e) = self
+        // snapshot before this session uses them. Checked again when the
+        // snapshot, the settings or the tenant's maps changed, and at least
+        // every `ENSURE_AGAIN` (where the accounts log in from moves with
+        // the relays, which none of those show).
+        let maps = self.svc.locator.maps_generation(self.tenant);
+        let live = self.svc.settings.live();
+        if self.ensured.as_ref().is_some_and(|(k, at)| {
+            Arc::ptr_eq(&k.catalog, &cat)
+                && k.maps == maps
+                && live.with_snapshot(|e| Arc::ptr_eq(&k.etcd, e))
+                && at.elapsed() < ENSURE_AGAIN
+        }) {
+            return Ok(cat);
+        }
+        let key = EnsureKey {
+            catalog: Arc::clone(&cat),
+            etcd: live.snapshot(),
+            maps,
+        };
+        let r = self
             .svc
             .authz
             .ensure(&self.svc, &cat, &self.principal.backend.cluster)
-            .await
-        {
+            .await;
+        self.ensured = r.is_ok().then(|| (key, std::time::Instant::now()));
+        if let Err(e) = r {
             // A tenant being deleted: every statement says so.
             if e.code() == Some(sprig_common::SprigCode::TenantNotReady) {
                 tracing::debug!(tenant = %self.tenant, error = %e, "backend grants not reconciled");
@@ -308,6 +351,26 @@ impl TenantSession {
             .map(|s| s.to_string())
     }
 
+    /// [`Self::aliases`] without a copy once the provisioning account's
+    /// name is known (it doesn't change): every execute asks.
+    #[must_use]
+    pub fn aliases_cached(&self) -> std::borrow::Cow<'_, super::aliases::AccountAliases> {
+        let cluster = &self.principal.backend.cluster;
+        if let Some((c, a)) = self.aliases_memo.get() {
+            if c == cluster {
+                return std::borrow::Cow::Borrowed(a);
+            }
+            // The session follows its tenant to another cluster.
+            return std::borrow::Cow::Owned(self.aliases());
+        }
+        let a = self.aliases();
+        if self.svc.locator.ctl_user(cluster).is_some() {
+            let (_, a) = self.aliases_memo.get_or_init(|| (cluster.clone(), a));
+            return std::borrow::Cow::Borrowed(a);
+        }
+        std::borrow::Cow::Owned(a)
+    }
+
     /// Backend accounts this session's output must not show (see
     /// [`super::aliases`]).
     #[must_use]
@@ -334,11 +397,27 @@ impl TenantSession {
     #[must_use]
     pub fn lower_case_table_names(&self) -> bool {
         let Some(cat) = &self.cat else { return false };
-        self.svc.settings.get(
-            &LOWER_CASE_TABLE_NAMES,
-            &cat.setting_ctx(&self.svc.dc),
-            Some(&cat.settings),
-        ) == 1
+        // Asked several times per statement: resolved again only for
+        // another catalog snapshot or settings snapshot.
+        self.svc.settings.live().with_snapshot(|etcd| {
+            let mut memo = self
+                .lctn_memo
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((c, e, v)) = memo.as_ref()
+                && Arc::ptr_eq(c, cat)
+                && Arc::ptr_eq(e, etcd)
+            {
+                return *v;
+            }
+            let v = self.svc.settings.get(
+                &LOWER_CASE_TABLE_NAMES,
+                &cat.setting_ctx(&self.svc.dc),
+                Some(&cat.settings),
+            ) == 1;
+            *memo = Some((Arc::clone(cat), Arc::clone(etcd), v));
+            v
+        })
     }
 
     /// `catalog.ddl_wait_ms` for the tenant: how long its DDL waits for a

@@ -79,6 +79,10 @@ impl ResultSink for DupKeySink<'_> {
         self.inner.raw_row(payload).await
     }
 
+    fn try_raw_row(&mut self, payload: Bytes) -> std::result::Result<Result<()>, Bytes> {
+        self.inner.try_raw_row(payload)
+    }
+
     async fn end_rows(&mut self, end: EndOfRows) -> Result<()> {
         self.inner.end_rows(end).await
     }
@@ -740,6 +744,14 @@ impl ResultSink for IntMetaSink<'_> {
         match self.cur.as_ref().and_then(|c| c.rewrite(&payload)) {
             Some(row) => self.inner.raw_row(row).await,
             None => self.inner.raw_row(payload).await,
+        }
+    }
+
+    fn try_raw_row(&mut self, payload: Bytes) -> std::result::Result<Result<()>, Bytes> {
+        match self.cur.as_ref().and_then(|c| c.rewrite(&payload)) {
+            // Handed back as it came: `raw_row` rewrites it again.
+            Some(row) => self.inner.try_raw_row(row).map_err(|_| payload),
+            None => self.inner.try_raw_row(payload),
         }
     }
 

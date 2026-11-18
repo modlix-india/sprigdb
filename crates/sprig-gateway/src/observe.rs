@@ -50,6 +50,15 @@ tokio::task_local! {
     static BACKEND_NANOS: Arc<AtomicU64>;
 }
 
+/// Whether requests get their `gateway.request` span: on unless the
+/// gateway's environment has `SPRIGDB_REQUEST_SPANS=off` (for comparisons
+/// of the span's cost; without it no request is traced or logged with
+/// its span's fields).
+fn request_spans() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SPRIGDB_REQUEST_SPANS").map_or(true, |v| v != "off"))
+}
+
 /// Adds `d` to the current request's time waiting on MariaDB (the backend
 /// layer calls it around each round trip). Outside a request, nothing.
 pub fn backend_time(d: Duration) {
@@ -289,6 +298,10 @@ impl SessionExec for ObservedSession {
         self.inner.release_idle();
     }
 
+    fn keep_idle(&mut self, on: bool) {
+        self.inner.keep_idle(on);
+    }
+
     async fn execute(
         &mut self,
         cx: &mut ExecCtx<'_>,
@@ -302,7 +315,7 @@ impl SessionExec for ObservedSession {
         let request = req.name();
         // One span per request: an engine statement inside a
         // traced command (MongoDB's) is part of that command's span.
-        let span = if self.internal && in_traced_request() {
+        let span = if (self.internal && in_traced_request()) || !request_spans() {
             None
         } else {
             Some(tracing::info_span!(
@@ -344,9 +357,13 @@ impl SessionExec for ObservedSession {
             _ => {}
         }
         if let Some(span) = &span {
-            span.record("result", result);
+            // `ok` matters only to a trace that may be kept: recording a
+            // field makes the log formatter write the span's fields again.
             if result != "ok" {
+                span.record("result", result);
                 span.record("error", true);
+            } else if sprig_common::telemetry::trace::may_keep(span, total) {
+                span.record("result", result);
             }
         }
         let backend = Duration::from_nanos(waited.load(Ordering::Relaxed));
@@ -446,6 +463,9 @@ impl ResultSink for Watch<'_> {
     }
     async fn raw_row(&mut self, payload: Bytes) -> Result<()> {
         self.inner.raw_row(payload).await
+    }
+    fn try_raw_row(&mut self, payload: Bytes) -> std::result::Result<Result<()>, Bytes> {
+        self.inner.try_raw_row(payload)
     }
     async fn end_rows(&mut self, end: EndOfRows) -> Result<()> {
         self.inner.end_rows(end).await

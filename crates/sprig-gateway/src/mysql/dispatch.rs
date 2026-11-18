@@ -70,6 +70,11 @@ type ClientFramed = Framed<crate::offload::Paced<MaybeTls<TcpStream>>, PacketCod
 /// The initial write buffer of a client connection.
 const WRITE_CAPACITY: usize = 16 * 1024;
 
+/// How long a quiet client's session keeps its backend connection after a
+/// statement before it goes back to the pool (MongoDB sessions keep theirs
+/// as long).
+const KEEP_IDLE: Duration = Duration::from_millis(100);
+
 /// What the loop does after a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Flow {
@@ -158,6 +163,9 @@ pub struct CommandLoop {
     stmts: Stmts,
     watch: ClientWatch,
     settings: FrontendSettings,
+    /// `sprig_mysql_commands_total` handles by command, registered once per
+    /// connection instead of at every command.
+    commands: Vec<(&'static str, metrics::Counter)>,
 }
 
 impl std::fmt::Debug for CommandLoop {
@@ -197,18 +205,23 @@ impl CommandLoop {
         framed.set_backpressure_boundary(settings.relay_buffer.max(WRITE_CAPACITY));
         // 3306's performance_schema.session_connect_attrs.
         session.connect_attrs = l.attrs;
+        let mut exec = l.exec;
+        // The backend connection stays with the session from one statement
+        // to the next while the client keeps sending (see `serve`).
+        exec.keep_idle(true);
         Self {
             shared,
             ctx,
             session,
             framed,
             proto: l.proto,
-            exec: l.exec,
+            exec,
             db: l.db,
             status: StatusFlags::AUTOCOMMIT,
             stmts: Stmts::default(),
             watch,
             settings,
+            commands: Vec::new(),
         }
     }
 
@@ -223,6 +236,7 @@ impl CommandLoop {
         r
     }
 
+    #[allow(clippy::too_many_lines)] // the command loop, with its idle, drain and keep timers
     async fn serve(&mut self) -> Result<()> {
         loop {
             self.framed.codec_mut().reset_seq();
@@ -240,13 +254,24 @@ impl CommandLoop {
             // first send 4031 (ER_CLIENT_INTERACTION_TIMEOUT); MariaDB
             // closes silently.
             let idle = self.exec.idle_timeout();
-            let idle_sleep = tokio::time::sleep(idle.unwrap_or(Duration::from_secs(86_400)));
+            let now = tokio::time::Instant::now();
+            let idle_sleep =
+                tokio::time::sleep_until(now + idle.unwrap_or(Duration::from_secs(86_400)));
             tokio::pin!(idle_sleep);
             let mut timed_out = false;
+            // A backend connection kept from the last statement goes back to
+            // its pool once the client has been quiet for `KEEP_IDLE`.
+            let mut kept = self.exec.holds_idle();
+            let keep_sleep = tokio::time::sleep_until(now + KEEP_IDLE);
+            tokio::pin!(keep_sleep);
             let next = loop {
                 tokio::select! {
                     biased;
                     n = self.framed.next() => break Some(n),
+                    () = &mut keep_sleep, if kept => {
+                        kept = false;
+                        self.exec.release_idle();
+                    }
                     () = handle.flags().close_wanted(), if watch_close => {
                         if handle.flags().close_reason() == Some(crate::session::CloseReason::Drain)
                             || handle.flags().conn_killed()
@@ -319,13 +344,25 @@ impl CommandLoop {
                     continue;
                 }
             };
-            metrics::counter!("sprig_mysql_commands_total", "persona" => self.proto.persona.as_str(), "command" => command_name(&cmd)).increment(1);
+            self.count_command(command_name(&cmd));
             let flow = self.command(cmd).await?;
             super::sink::flush(&mut self.framed).await?;
             if flow == Flow::Close {
                 return Ok(());
             }
         }
+    }
+
+    /// Counts a command in `sprig_mysql_commands_total`, with the handle
+    /// kept per connection.
+    fn count_command(&mut self, name: &'static str) {
+        if let Some((_, c)) = self.commands.iter().find(|(n, _)| *n == name) {
+            c.increment(1);
+            return;
+        }
+        let c = metrics::counter!("sprig_mysql_commands_total", "persona" => self.proto.persona.as_str(), "command" => name);
+        c.increment(1);
+        self.commands.push((name, c));
     }
 
     #[allow(clippy::too_many_lines)] // one arm per command

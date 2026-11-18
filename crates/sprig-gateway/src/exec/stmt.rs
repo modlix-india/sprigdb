@@ -98,6 +98,14 @@ pub(crate) struct Stmt {
         super::capture::FpKey,
         sprig_workload::fingerprint::Fingerprint,
     )>,
+    /// 3306: the table MySQL names in a duplicate-key error of `logical`
+    /// (`errmap::dup_key_table`), with the lexer's options it was found
+    /// under: worked out at the first execute, not at each.
+    pub dup_table: Option<(sprig_sql::lex::LexOptions, Option<String>)>,
+    /// The `Com_*` counter an execute of `sql` bumps besides
+    /// `Com_stmt_execute` (`SHOW STATUS`), found at the first execute.
+    #[allow(clippy::option_option)] // not looked up yet / no counter / the counter
+    pub com: Option<Option<&'static str>>,
 }
 
 impl Stmt {
@@ -124,6 +132,8 @@ impl Stmt {
             graph_params: false,
             stream_params: false,
             fp: None,
+            dup_table: None,
+            com: None,
         }
     }
 
@@ -151,6 +161,8 @@ impl Stmt {
             graph_params: false,
             stream_params: false,
             fp: None,
+            dup_table: None,
+            com: None,
             sql,
         }
     }

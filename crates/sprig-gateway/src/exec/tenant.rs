@@ -352,34 +352,64 @@ enum Route {
     Done(Step),
 }
 
+/// [`PassSession::lex_opts`]'s last answer and what it came from.
+#[derive(Debug)]
+pub(super) struct LexMemo {
+    sql_mode: Option<String>,
+    version: Option<u32>,
+    out: (LexOptions, bool),
+}
+
+/// The lexer's options for `persona` at version `version` (executable
+/// comments run by the version the greeting reports) under `sql_mode`
+/// `mode`, and whether the mode has `IGNORE_SPACE`.
+fn lex_opts_of(persona: Persona, version: Option<u32>, mode: Option<&str>) -> (LexOptions, bool) {
+    let mut lex = LexOptions::for_persona(persona);
+    if let Some(v) = version {
+        lex = lex.version(v);
+    }
+    let mut ignore_space = false;
+    if let Some(mode) = mode {
+        // MariaDB reports `sql_mode` in capitals: copy only otherwise.
+        let m: std::borrow::Cow<'_, str> = if mode.bytes().any(|b| b.is_ascii_lowercase()) {
+            std::borrow::Cow::Owned(mode.to_ascii_uppercase())
+        } else {
+            std::borrow::Cow::Borrowed(mode)
+        };
+        lex = lex
+            .ansi_quotes(m.contains("ANSI_QUOTES") || m.contains("ANSI,") || m == "ANSI")
+            .no_backslash_escapes(m.contains("NO_BACKSLASH_ESCAPES"));
+        ignore_space = m.contains("IGNORE_SPACE");
+    }
+    (lex, ignore_space)
+}
+
 impl PassSession {
     /// The lexer options of the session: the persona, and `sql_mode`'s
     /// `ANSI_QUOTES` and `NO_BACKSLASH_ESCAPES` as the session last set
     /// them.
     pub(super) fn lex_opts(&self) -> (LexOptions, bool) {
-        let mut lex = LexOptions::for_persona(self.persona);
-        // Executable comments run by the version the greeting reports
-        // (`gateway.mysql_server_version`).
-        if let Some(v) =
-            sprig_sql::compat::vars::version_number(&self.settings.persona_version(self.persona))
+        // Asked several times per statement: worked out again only when the
+        // session's `sql_mode` or the persona's version changed.
+        let version = self.settings.persona_version_number(self.persona);
+        let mode = self.bs.as_ref().and_then(|b| b.vars().vars.get("sql_mode"));
+        let mut memo = self
+            .lex_memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(m) = memo.as_ref()
+            && m.version == version
+            && m.sql_mode.as_deref() == mode.map(String::as_str)
         {
-            lex = lex.version(v);
+            return m.out;
         }
-        let mut ignore_space = false;
-        if let Some(mode) = self.bs.as_ref().and_then(|b| b.vars().vars.get("sql_mode")) {
-            // MariaDB reports `sql_mode` in capitals: copy only otherwise
-            // (this runs several times per statement).
-            let m: std::borrow::Cow<'_, str> = if mode.bytes().any(|b| b.is_ascii_lowercase()) {
-                std::borrow::Cow::Owned(mode.to_ascii_uppercase())
-            } else {
-                std::borrow::Cow::Borrowed(mode.as_str())
-            };
-            lex = lex
-                .ansi_quotes(m.contains("ANSI_QUOTES") || m.contains("ANSI,") || m == "ANSI")
-                .no_backslash_escapes(m.contains("NO_BACKSLASH_ESCAPES"));
-            ignore_space = m.contains("IGNORE_SPACE");
-        }
-        (lex, ignore_space)
+        let out = lex_opts_of(self.persona, version, mode.map(String::as_str));
+        *memo = Some(LexMemo {
+            sql_mode: mode.cloned(),
+            version,
+            out,
+        });
+        out
     }
 
     /// The session's `sql_mode` has MariaDB's `ORACLE` (where `SQLERRM` is

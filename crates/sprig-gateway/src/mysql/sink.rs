@@ -171,6 +171,18 @@ where
         self.feed(payload).await
     }
 
+    fn try_raw_row(&mut self, payload: Bytes) -> std::result::Result<Result<()>, Bytes> {
+        use futures::Sink as _;
+        // `feed` without its wait: below the backpressure boundary the
+        // framed writer is ready, and the row only goes into its buffer.
+        if self.framed.write_buffer().len() >= self.framed.backpressure_boundary() {
+            return Err(payload);
+        }
+        Ok(std::pin::Pin::new(&mut *self.framed)
+            .start_send(payload)
+            .map_err(SprigError::from))
+    }
+
     async fn end_rows(&mut self, end: EndOfRows) -> Result<()> {
         let t = Terminator::Ok(OkPacket {
             header: 0xFE,

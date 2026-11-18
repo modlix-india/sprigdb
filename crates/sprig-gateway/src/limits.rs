@@ -380,7 +380,7 @@ impl Drop for Attached {
 pub struct ActivePermit {
     limiter: Arc<Limiter>,
     tenant: Key,
-    user: String,
+    user: Arc<str>,
 }
 
 impl Drop for ActivePermit {
@@ -575,6 +575,22 @@ impl Limiter {
         user: &str,
         high: bool,
     ) -> Result<ActivePermit> {
+        self.admit_shared(tenant, &Arc::from(user), high).await
+    }
+
+    /// [`Self::admit`] for a session that keeps its user's name shared
+    /// (no copy per statement).
+    ///
+    /// # Errors
+    /// 39002 past `limits.queue_timeout_ms`.
+    pub async fn admit_shared(
+        self: &Arc<Self>,
+        tenant: Key,
+        user: &Arc<str>,
+        high: bool,
+    ) -> Result<ActivePermit> {
+        let user_arc = user;
+        let user: &str = user;
         let l = self.limits_for(tenant);
         let (rx, id) = {
             let mut st = self.lock();
@@ -583,8 +599,15 @@ impl Limiter {
             let ua = t.users.get(user).copied().unwrap_or(0);
             if t.queue.is_empty() && t.active < l.tenant_active && ua < l.user_active {
                 t.active += 1;
-                *t.users.entry(user.to_owned()).or_default() += 1;
-                return Ok(self.permit(tenant, user));
+                // A user's count stays (at 0) while the tenant has state
+                // here: no allocation per statement.
+                match t.users.get_mut(user) {
+                    Some(n) => *n += 1,
+                    None => {
+                        t.users.insert(user.to_owned(), 1);
+                    }
+                }
+                return Ok(self.permit(tenant, user_arc));
             }
             let (tx, rx) = oneshot::channel();
             let w = Waiter {
@@ -611,7 +634,7 @@ impl Limiter {
         metrics::histogram!("sprig_gateway_admission_wait_seconds")
             .record(started.elapsed().as_secs_f64());
         if let Ok(Ok(())) = r {
-            return Ok(self.permit(tenant, user));
+            return Ok(self.permit(tenant, user_arc));
         }
         // Timed out: leave the queue, unless a grant raced the timeout, in
         // which case give the slot back.
@@ -632,26 +655,34 @@ impl Limiter {
         Err(admission_timeout(started.elapsed()))
     }
 
-    fn permit(self: &Arc<Self>, tenant: Key, user: &str) -> ActivePermit {
+    fn permit(self: &Arc<Self>, tenant: Key, user: &Arc<str>) -> ActivePermit {
         ActivePermit {
             limiter: Arc::clone(self),
             tenant,
-            user: user.to_owned(),
+            user: Arc::clone(user),
         }
     }
 
     /// A statement ended: free its slot and grant waiters.
     fn release(&self, tenant: Key, user: &str) {
-        let l = self.limits_for(tenant);
         let mut st = self.lock();
+        let mut queued = false;
         if let Some(t) = st.tenants.get_mut(&tenant) {
             t.active = t.active.saturating_sub(1);
             if let Some(u) = t.users.get_mut(user) {
                 *u = u.saturating_sub(1);
-                if *u == 0 {
-                    t.users.remove(user);
-                }
             }
+            queued = !t.queue.is_empty();
+        }
+        if !queued {
+            Self::forget_if_idle(&mut st, tenant);
+            return;
+        }
+        // Waiters: the limits now (resolved outside the lock), then grant.
+        drop(st);
+        let l = self.limits_for(tenant);
+        let mut st = self.lock();
+        if let Some(t) = st.tenants.get_mut(&tenant) {
             // Grant in order, skipping users at their own limit.
             while t.active < l.tenant_active {
                 let Some(i) = t
@@ -666,7 +697,12 @@ impl Limiter {
                     continue;
                 }
                 t.active += 1;
-                *t.users.entry(w.user.clone()).or_default() += 1;
+                match t.users.get_mut(&w.user) {
+                    Some(n) => *n += 1,
+                    None => {
+                        t.users.insert(w.user.clone(), 1);
+                    }
+                }
                 if w.tx.send(()).is_err() {
                     // The waiter left between the check and the send.
                     t.active -= 1;
@@ -770,7 +806,7 @@ impl Executor for Limited {
             inner: self.inner.open(login),
             limiter: Arc::clone(&self.limiter),
             tenant: login.principal.tenant,
-            user: login.principal.user.clone(),
+            user: Arc::from(login.principal.user.as_str()),
         })
     }
 }
@@ -779,7 +815,7 @@ struct LimitedSession {
     inner: Box<dyn SessionExec>,
     limiter: Arc<Limiter>,
     tenant: Key,
-    user: String,
+    user: Arc<str>,
 }
 
 #[async_trait]
@@ -791,7 +827,10 @@ impl SessionExec for LimitedSession {
         params: &sprig_proto_mysql::command::ExecuteParams,
     ) -> Result<crate::pipeline::PointRead> {
         let high = cx.session.state() == SessionState::InTransaction;
-        let _permit = self.limiter.admit(self.tenant, &self.user, high).await?;
+        let _permit = self
+            .limiter
+            .admit_shared(self.tenant, &self.user, high)
+            .await?;
         self.inner.point_read(cx, stmt, params).await
     }
 
@@ -801,6 +840,10 @@ impl SessionExec for LimitedSession {
 
     fn release_idle(&mut self) {
         self.inner.release_idle();
+    }
+
+    fn keep_idle(&mut self, on: bool) {
+        self.inner.keep_idle(on);
     }
 
     async fn execute(
@@ -813,7 +856,11 @@ impl SessionExec for LimitedSession {
             None
         } else {
             let high = cx.session.state() == SessionState::InTransaction;
-            Some(self.limiter.admit(self.tenant, &self.user, high).await?)
+            Some(
+                self.limiter
+                    .admit_shared(self.tenant, &self.user, high)
+                    .await?,
+            )
         };
         self.inner.execute(cx, req, out).await
     }

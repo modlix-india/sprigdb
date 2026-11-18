@@ -5,7 +5,8 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use sprig_common::ids::{ClusterId, NodeId};
@@ -159,19 +160,37 @@ struct Inner {
     pools: HashMap<PoolKey, Pool>,
     nodes: HashMap<NodeKey, NodeCount>,
     seq: u64,
-    /// Accounts whose grants changed: connections opened
-    /// before the instant are closed instead of reused.
-    retired: HashMap<String, Instant>,
 }
 
 pub(crate) struct Shared {
     inner: Mutex<Inner>,
     freed: Notify,
+    /// Accounts whose grants changed: connections opened
+    /// before the instant are closed instead of reused. Apart from
+    /// `inner`, and empty until the first retirement: every statement's
+    /// release (and a kept connection's reuse) reads it.
+    retired: RwLock<HashMap<String, Instant>>,
+    any_retired: AtomicBool,
+    /// Acquires waiting for a connection to come free: sessions don't keep
+    /// connections between statements while any wait.
+    waiting: AtomicU32,
 }
 
 impl Shared {
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// When `account`'s connections were last retired, if ever.
+    fn retired_at(&self, account: &str) -> Option<Instant> {
+        if !self.any_retired.load(Ordering::Acquire) {
+            return None;
+        }
+        self.retired
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(account)
+            .copied()
     }
 
     /// Forgets one open connection of `key`.
@@ -297,6 +316,9 @@ impl BackendPools {
             shared: Arc::new(Shared {
                 inner: Mutex::new(Inner::default()),
                 freed: Notify::new(),
+                retired: RwLock::new(HashMap::new()),
+                any_retired: AtomicBool::new(false),
+                waiting: AtomicU32::new(0),
             }),
         }
     }
@@ -426,7 +448,10 @@ impl BackendPools {
                     }
                 },
                 Step::Wait => {
-                    if tokio::time::timeout_at(deadline, freed).await.is_err() {
+                    self.shared.waiting.fetch_add(1, Ordering::AcqRel);
+                    let waited = tokio::time::timeout_at(deadline, freed).await;
+                    self.shared.waiting.fetch_sub(1, Ordering::AcqRel);
+                    if waited.is_err() {
                         return Err(AcquireError::Timeout);
                     }
                 }
@@ -447,13 +472,17 @@ impl BackendPools {
             && conn.client.is_idle()
             && !conn.client.in_transaction()
             && conn.age() < limits.max_lifetime;
+        // The bucket's digest, outside the lock.
+        let digest = reusable.then(|| conn.applied.digest(&conn.baseline));
         let mut close = None;
         {
             let mut g = self.shared.lock();
-            if let Some(at) = g.retired.get(&key.account)
+            // Read under the pools' lock, which a retirement also holds: a
+            // connection retired meanwhile never goes back idle.
+            if let Some(at) = self.shared.retired_at(&key.account)
                 && Instant::now()
                     .checked_sub(conn.age())
-                    .is_none_or(|opened| opened < *at)
+                    .is_none_or(|opened| opened < at)
             {
                 reusable = false;
             }
@@ -465,8 +494,10 @@ impl BackendPools {
             let node_over = node.open > limits.per_node;
             let pool = inner.pools.entry(key).or_default();
             pool.leased = pool.leased.saturating_sub(1);
-            if reusable && pool.open <= limits.per_pool && !node_over {
-                let d = conn.applied.digest(&conn.baseline);
+            if let Some(d) = digest.filter(|_| reusable)
+                && pool.open <= limits.per_pool
+                && !node_over
+            {
                 pool.idle.entry(d).or_default().push(IdleConn {
                     conn,
                     seq,
@@ -533,7 +564,13 @@ impl BackendPools {
     /// sends `USE` again.
     #[must_use]
     pub fn retired_at(&self, account: &str) -> Option<Instant> {
-        self.shared.lock().retired.get(account).copied()
+        self.shared.retired_at(account)
+    }
+
+    /// Whether an acquire is waiting for a connection to come free.
+    #[must_use]
+    pub fn has_waiters(&self) -> bool {
+        self.shared.waiting.load(Ordering::Acquire) > 0
     }
 
     /// [`Self::retire_account`] for every account `which` names, and the
@@ -552,8 +589,16 @@ impl BackendPools {
                 .filter(|k| which(&k.account))
                 .map(|k| k.account.clone())
                 .collect();
-            for a in accounts {
-                inner.retired.insert(a, now);
+            if !accounts.is_empty() {
+                let mut r = self
+                    .shared
+                    .retired
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner);
+                for a in accounts {
+                    r.insert(a, now);
+                }
+                self.shared.any_retired.store(true, Ordering::Release);
             }
             for (key, pool) in &mut inner.pools {
                 if !which(&key.account) {

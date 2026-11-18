@@ -97,37 +97,58 @@ impl ExecSettingsSource {
     /// what `@@version` and `VERSION()` answer.
     #[must_use]
     pub fn persona_version(&self, persona: Persona) -> String {
+        self.with_versions(persona, |v, _| v.to_owned())
+    }
+
+    /// [`Self::persona_version`] as the lexer's number (`Mmmrr`), if it
+    /// parses: executable comments run by it.
+    #[must_use]
+    pub fn persona_version_number(&self, persona: Persona) -> Option<u32> {
+        self.with_versions(persona, |_, n| n)
+    }
+
+    /// Calls `f` with `persona`'s version string and number. Asked several
+    /// times per statement (the lexer's options): resolved once per
+    /// settings snapshot and runtime thread, so sessions on different
+    /// threads share no lock.
+    fn with_versions<R>(&self, persona: Persona, f: impl FnOnce(&str, Option<u32>) -> R) -> R {
         use crate::mysql::settings::{MARIADB_SERVER_VERSION, MYSQL_SERVER_VERSION};
-        let setting = match persona {
-            Persona::MySql84 => &MYSQL_SERVER_VERSION,
-            Persona::MariaDb => &MARIADB_SERVER_VERSION,
-        };
+        let i = usize::from(persona == Persona::MariaDb);
         match self {
-            ExecSettingsSource::Fixed(_) => setting.default.clone().into_owned(),
+            ExecSettingsSource::Fixed(_) => {
+                let setting = [&MYSQL_SERVER_VERSION, &MARIADB_SERVER_VERSION][i];
+                let v = setting.default.clone();
+                f(&v, sprig_sql::compat::vars::version_number(&v))
+            }
             ExecSettingsSource::Live { live, dc } => {
-                // Asked several times per statement (the
-                // lexer's options); resolved once per settings snapshot.
-                type Memo = Option<(sprig_settings::Snapshot, DcId, [String; 2])>;
-                static MEMO: std::sync::Mutex<Memo> = std::sync::Mutex::new(None);
-                let snap = live.snapshot();
-                let i = usize::from(persona == Persona::MariaDb);
-                let mut memo = MEMO
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some((s, d, v)) = memo.as_ref()
-                    && std::sync::Arc::ptr_eq(s, &snap)
-                    && d == dc
-                {
-                    return v[i].clone();
+                type Memo = Option<(sprig_settings::Snapshot, DcId, [(String, Option<u32>); 2])>;
+                thread_local! {
+                    static MEMO: std::cell::RefCell<Memo> = const { std::cell::RefCell::new(None) };
                 }
-                let ctx = SettingCtx::process(dc);
-                let v = [
-                    snap.get(&MYSQL_SERVER_VERSION, &ctx).into_owned(),
-                    snap.get(&MARIADB_SERVER_VERSION, &ctx).into_owned(),
-                ];
-                let out = v[i].clone();
-                *memo = Some((snap, dc.clone(), v));
-                out
+                live.with_snapshot(|snap| {
+                    MEMO.with(|m| {
+                        let mut memo = m.borrow_mut();
+                        match memo.as_ref() {
+                            Some((s, d, both)) if std::sync::Arc::ptr_eq(s, snap) && d == dc => {
+                                f(&both[i].0, both[i].1)
+                            }
+                            _ => {
+                                let ctx = SettingCtx::process(dc);
+                                let v = |s: &sprig_settings::Setting<
+                                    std::borrow::Cow<'static, str>,
+                                >| {
+                                    let v: String = snap.get(s, &ctx).into_owned();
+                                    let n = sprig_sql::compat::vars::version_number(&v);
+                                    (v, n)
+                                };
+                                let both = [v(&MYSQL_SERVER_VERSION), v(&MARIADB_SERVER_VERSION)];
+                                let r = f(&both[i].0, both[i].1);
+                                *memo = Some((std::sync::Arc::clone(snap), dc.clone(), both));
+                                r
+                            }
+                        }
+                    })
+                })
             }
         }
     }

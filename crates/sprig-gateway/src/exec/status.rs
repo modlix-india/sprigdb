@@ -93,6 +93,17 @@ impl SessionStatus {
         }
     }
 
+    /// [`Self::command`] with the statement's own counter already found.
+    pub(crate) fn command_named(&mut self, name: &'static str, com: Option<&'static str>) {
+        if name == "Com_stmt_execute" {
+            self.questions += 1;
+        }
+        self.bump(name);
+        if let Some(c) = com {
+            self.bump(c);
+        }
+    }
+
     fn bump(&mut self, name: &'static str) {
         *self.counts.entry(name).or_default() += 1;
     }
@@ -160,8 +171,12 @@ impl super::PassSession {
             }
             Request::Prepare { .. } => self.status.command("Com_stmt_prepare", None),
             Request::Execute { stmt, .. } => {
-                let text = self.stmts.get_mut(*stmt).ok().map(|s| s.sql.clone());
-                self.status.command("Com_stmt_execute", text.as_deref());
+                let com = self
+                    .stmts
+                    .get_mut(*stmt)
+                    .ok()
+                    .and_then(|s| *s.com.get_or_insert_with(|| command_of(&s.sql)));
+                self.status.command_named("Com_stmt_execute", com);
             }
             Request::ResetStmt { .. } => self.status.command("Com_stmt_reset", None),
             Request::CloseStmt { .. } => self.status.command("Com_stmt_close", None),

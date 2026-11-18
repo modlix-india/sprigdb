@@ -328,9 +328,14 @@ impl Stoppable for crate::session::SessionHandle {
 
 /// Microseconds since the process's first guarded poll (0 is "not polling").
 fn now_us() -> u64 {
+    us_at(Instant::now())
+}
+
+/// [`now_us`] of an instant already read (one clock read per poll).
+fn us_at(t: Instant) -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
     let start = *START.get_or_init(Instant::now);
-    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX) + 1
+    u64::try_from(t.saturating_duration_since(start).as_micros()).unwrap_or(u64::MAX) + 1
 }
 
 /// One thread's poll in progress.
@@ -394,7 +399,7 @@ impl<F: Future> Future for Guarded<F> {
                 &mut *s.who.lock().unwrap_or_else(PoisonError::into_inner),
                 me.who.clone(),
             );
-            (s.since_us.swap(now_us(), Ordering::SeqCst), prev_who)
+            (s.since_us.swap(us_at(started), Ordering::SeqCst), prev_who)
         });
         let r = me.fut.as_mut().poll(cx);
         SLOT.with(|s| {

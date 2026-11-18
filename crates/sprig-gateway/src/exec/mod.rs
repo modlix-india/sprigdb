@@ -215,11 +215,14 @@ impl Executor for PassThrough {
             status: status::SessionStatus::default(),
             globals_applied: false,
             column_change_running: false,
+            keep_idle: false,
+            lex_memo: std::sync::Mutex::new(None),
         })
     }
 }
 
 /// One session's side of the pass-through executor.
+#[allow(clippy::struct_excessive_bools)] // independent flags of one session
 pub struct PassSession {
     backends: Arc<Backends>,
     target: BackendTarget,
@@ -261,6 +264,13 @@ pub struct PassSession {
     /// recompiled afterwards runs now: its own column check is done
     /// (`logic_bound`).
     column_change_running: bool,
+    /// The front end returns a connection kept between statements when its
+    /// client goes quiet (`SessionExec::keep_idle`): the session's backend
+    /// connection then stays with it from one statement to the next.
+    keep_idle: bool,
+    /// The lexer's options last worked out, with the `sql_mode` and version
+    /// they came from (`lex_opts`, asked several times per statement).
+    lex_memo: std::sync::Mutex<Option<tenant::LexMemo>>,
 }
 
 impl std::fmt::Debug for PassSession {
@@ -367,13 +377,17 @@ impl PassSession {
         let backends = &self.backends;
         let target = &self.target;
         let persona = self.persona;
-        let schema = match self.tenant.as_deref() {
-            Some(ts) => ts.schema_of(ts.current.as_deref().or(cx.db)),
-            None => cx.db.map(str::to_owned),
-        };
-        let tenant = self.tenant.as_deref().map(|ts| ts.tenant);
+        let ts = self.tenant.as_deref();
+        let keep = self.keep_idle;
         let bs = self.bs.get_or_insert_with(|| {
-            backends.session(
+            // Asked several times per statement: the schema only for a
+            // new session.
+            let schema = match ts {
+                Some(ts) => ts.schema_of(ts.current.as_deref().or(cx.db)),
+                None => cx.db.map(str::to_owned),
+            };
+            let tenant = ts.map(|ts| ts.tenant);
+            let mut bs = backends.session(
                 target.clone(),
                 SessionOpts {
                     persona,
@@ -385,7 +399,11 @@ impl PassSession {
                     tenant,
                     ..SessionOpts::default()
                 },
-            )
+            );
+            // The front end returns a kept connection when its client goes
+            // quiet (`SessionExec::keep_idle`).
+            bs.set_keep(keep);
+            bs
         });
 
         if bs.relay() != relay {
@@ -585,6 +603,8 @@ impl PassSession {
         s.mapper = new.mapper;
         s.recheck = new.recheck;
         s.logical = new.logical;
+        s.dup_table = None;
+        s.com = None;
         s.renames = new.renames;
         s.nowait = new.nowait;
         s.session_status = new.session_status;
@@ -895,12 +915,12 @@ impl PassSession {
         };
         let map = self.tenant.as_deref().map(TenantSession::map);
         let accounts = Accounts(self.tenant.as_deref().and_then(TenantSession::auth));
-        let aliases = self.tenant.as_deref().map(TenantSession::aliases);
+        let aliases = self.tenant.as_deref().map(TenantSession::aliases_cached);
         let mut names = match (&mut mapper, &map) {
             (Some(m), Some(map)) => Some(NamesOut {
                 mapper: m,
                 ctx: sprig_sql::names::OutputCtx::new(&**map).accounts(&accounts),
-                aliases: aliases.as_ref(),
+                aliases: aliases.as_deref(),
             }),
             _ => None,
         };
@@ -1229,6 +1249,13 @@ impl SessionExec for PassSession {
 
     fn holds_idle(&self) -> bool {
         self.bs.as_ref().is_some_and(BackendSession::holds_kept)
+    }
+
+    fn keep_idle(&mut self, on: bool) {
+        self.keep_idle = on;
+        if let Some(bs) = self.bs.as_mut() {
+            bs.set_keep(on);
+        }
     }
 
     fn release_idle(&mut self) {
@@ -1645,8 +1672,16 @@ impl PassSession {
                     self.stmts
                         .get_mut(stmt)
                         .ok()
-                        .and_then(|s| s.logical.clone())
-                        .and_then(|l| sprig_sql::compat::errmap::dup_key_table(&l, &lex))
+                        .and_then(|s| match &s.dup_table {
+                            Some((l, t)) if *l == lex => t.clone(),
+                            _ => {
+                                let t = s.logical.as_deref().and_then(|l| {
+                                    sprig_sql::compat::errmap::dup_key_table(l, &lex)
+                                });
+                                s.dup_table = Some((lex, t.clone()));
+                                t
+                            }
+                        })
                 } else {
                     None
                 };

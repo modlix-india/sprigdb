@@ -84,10 +84,25 @@ struct Sub {
     tx: watch::Sender<u64>,
 }
 
+/// Ids of `LiveSettings` instances (`Shared::id`).
+static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// This thread's copy of the last snapshot it read: the instance's id,
+    /// its stamp then, and the snapshot.
+    static THREAD_SNAPSHOT: std::cell::RefCell<Option<(u64, u64, Snapshot)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 struct Shared {
     registry: &'static Registry,
     stores: SettingsStores,
     snapshot: RwLock<Snapshot>,
+    /// Bumped after every rebuild (whether or not a row changed), for the
+    /// runtime threads' copies of `snapshot` (see `with_snapshot`).
+    stamp: AtomicU64,
+    /// This instance, among every `LiveSettings` of the process.
+    id: u64,
     /// Bumped after each rebuild that changed a row; 0 until the first
     /// snapshot is built.
     generation: watch::Sender<u64>,
@@ -144,6 +159,8 @@ impl LiveSettings {
             registry,
             stores,
             snapshot: RwLock::new(Arc::new(MemSettings::new(registry))),
+            stamp: AtomicU64::new(0),
+            id: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
             generation: watch::channel(0).0,
             subs: Mutex::new(Vec::new()),
             callbacks: Mutex::new(Vec::new()),
@@ -186,13 +203,39 @@ impl LiveSettings {
     /// snapshot to see them consistently.
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
-        Arc::clone(
-            &self
-                .shared
-                .snapshot
-                .read()
-                .unwrap_or_else(PoisonError::into_inner),
-        )
+        self.with_snapshot(Arc::clone)
+    }
+
+    /// Calls `f` with the current snapshot without taking the lock or a
+    /// reference count: each runtime thread keeps a copy, renewed when a
+    /// rebuild replaced it. Settings are resolved several times per
+    /// statement, and a lock and a count shared by every thread cost more
+    /// than the lookups (cores contending on the same cache line).
+    pub fn with_snapshot<R>(&self, f: impl FnOnce(&Snapshot) -> R) -> R {
+        let stamp = self.shared.stamp.load(Ordering::Acquire);
+        let id = self.shared.id;
+        THREAD_SNAPSHOT.with(|c| {
+            if let Ok(b) = c.try_borrow()
+                && let Some((i, s, snap)) = b.as_ref()
+                && *i == id
+                && *s == stamp
+            {
+                return f(snap);
+            }
+            let snap = Arc::clone(
+                &self
+                    .shared
+                    .snapshot
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+            // A call from inside `f` that finds the copy old (a rebuild in
+            // between) uses its own and leaves the copy alone.
+            if let Ok(mut b) = c.try_borrow_mut() {
+                *b = Some((id, stamp, Arc::clone(&snap)));
+            }
+            f(&snap)
+        })
     }
 
     /// Resolves `key` in `ctx` against the current snapshot.
@@ -378,6 +421,7 @@ fn rebuild(shared: &Shared, m: &Mirrors) {
             .unwrap_or_else(PoisonError::into_inner);
         std::mem::replace(&mut *cur, Arc::clone(&new))
     };
+    shared.stamp.fetch_add(1, Ordering::Release);
     let first = *shared.generation.borrow() == 0;
     let changed = diff(&old, &new);
     if changed.is_empty() && !first {
