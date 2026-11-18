@@ -1,0 +1,9 @@
+# Build image for the E0 harness's Linux binaries: the workspace's pinned
+# toolchain on Debian 12 (glibc 2.36, so the binary also runs on Debian 13 and
+# Ubuntu 24.04), plus what RocksDB's C++ and its bindgen step need (g++,
+# clang, libclang), and protoc for etcd-client's build script.
+FROM rust:1.94.0-slim-bookworm
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends g++ clang libclang-dev protobuf-compiler libprotobuf-dev make pkg-config \
+ && rm -rf /var/lib/apt/lists/*
+ENV CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_DEBUG=line-tables-only

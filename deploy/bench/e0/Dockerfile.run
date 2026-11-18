@@ -1,0 +1,7 @@
+# Runtime and load-generator image for the E0 harness: SprigDB binaries
+# (mounted, never baked in), sysbench 1.0.20 on libmariadb, and Python 3 for
+# the differential and crash runners (standard library only).
+FROM debian:13.7-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends sysbench=1.0.20+ds-7+b1 python3 curl jq ca-certificates procps \
+ && rm -rf /var/lib/apt/lists/*
