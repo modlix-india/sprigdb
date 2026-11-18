@@ -888,11 +888,14 @@ impl Copy {
 
     async fn run(self: Arc<Self>, host: Arc<dyn CopyHost>) {
         let mut backoff = Duration::from_millis(200);
+        // The feed couldn't deliver changes of the object (a transaction
+        // too large for it): read the object again instead of resuming.
+        let mut reseed = false;
         loop {
             if self.stop.is_cancelled() {
                 return;
             }
-            match self.serve(host.as_ref()).await {
+            match self.serve(host.as_ref(), std::mem::take(&mut reseed)).await {
                 Ok(()) => return,
                 Err(e) if e.code() == Some(SprigCode::SearchIndexNotFound) => {
                     tracing::info!(
@@ -901,6 +904,10 @@ impl Copy {
                     );
                     self.phase.send_replace(Phase::Stopped);
                     return;
+                }
+                Err(e) if e.code() == Some(SprigCode::FeedHistoryLost) => {
+                    tracing::info!(tenant = %self.tenant, index = self.def.name, error = %e, "search copy can't follow the feed past a change; seeding it again");
+                    reseed = true;
                 }
                 Err(e) => {
                     tracing::warn!(tenant = %self.tenant, index = self.def.name, error = %e, "search copy interrupted; retrying");
@@ -941,6 +948,23 @@ impl Copy {
                 progress_every: Duration::from_millis(200),
                 follow_moves: false,
                 progress_on_filtered: true,
+                // A transaction too large for the feed matters only when
+                // it changed this index's object (then the copy seeds
+                // again); others pass by.
+                reads: Some((
+                    if self.def.object_id == 0 {
+                        Vec::new()
+                    } else {
+                        vec![self.def.object_id]
+                    },
+                    std::iter::once(self.def.table.clone())
+                        .chain(
+                            self.def
+                                .has_hash_fields()
+                                .then(|| format!("__sprig_ke_{}", self.def.table)),
+                        )
+                        .collect(),
+                )),
                 // Hash fields live in the namespace's element table: a
                 // field change alone (the key row's `_v` is not a change
                 // the feed reports) shows only there.
@@ -958,7 +982,7 @@ impl Copy {
     /// Opens one feed reader per cluster (resuming when every partition
     /// committed the same positions), seeds when it can't resume, then
     /// follows.
-    async fn serve(&self, host: &dyn CopyHost) -> Result<()> {
+    async fn serve(&self, host: &dyn CopyHost, reseed: bool) -> Result<()> {
         let payloads = {
             let ix = Arc::clone(&self.index);
             tokio::task::spawn_blocking(move || ix.payloads())
@@ -966,7 +990,9 @@ impl Copy {
                 .map_err(join_err)??
         };
         let mut resume = match payloads.first() {
-            Some(Some(p)) if payloads.iter().all(|x| x.as_deref() == Some(p.as_str())) => {
+            Some(Some(p))
+                if !reseed && payloads.iter().all(|x| x.as_deref() == Some(p.as_str())) =>
+            {
                 Payload::parse(p)
             }
             _ => None,

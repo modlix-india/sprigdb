@@ -28,10 +28,12 @@
 //! A name the gateway doesn't hold gets 1243 from the gateway: sent to the
 //! backend, the command would pin the session's connection for good.
 //! Tenants without sharded or reference tables keep MariaDB's own
-//! statements, except a publish into a stream (`INSERT INTO stream ...`),
-//! which MariaDB can't prepare (the stream is no table of its own): the
-//! gateway holds it as above, as it does for `COM_STMT_PREPARE`, and
-//! `EXECUTE IMMEDIATE` of one runs it the same way.
+//! statements, except two kinds MariaDB can't prepare: a publish into a
+//! stream (`INSERT INTO stream ...`; the stream is no table of its own)
+//! and a statement with `MATCH ... AGAINST` on a search index (no
+//! `FULLTEXT` index there: 1191). The gateway holds them as above, as it
+//! does for `COM_STMT_PREPARE`, and `EXECUTE IMMEDIATE` of one runs it
+//! the same way, the search rewritten at each run.
 //!
 //! Differences from MariaDB: an expression with a parameter in the
 //! select list is named after its value (`5+1`, not `?+1`; a bare `?` is
@@ -296,6 +298,33 @@ const LIST_END: &[&str] = &[
 /// `text` with its `?` placeholders replaced by `params` in order; a
 /// select-list item that is only a `?` keeps MariaDB's name for it (an
 /// alias of a backquoted question mark). `None` when the counts differ.
+/// A text value as a quoted string literal (`'it''s'`); anything else,
+/// and bytes that aren't UTF-8, as it is.
+fn quoted_text(p: ParamLit) -> ParamLit {
+    match p {
+        ParamLit::Str { bytes, charset } => match String::from_utf8(bytes) {
+            Ok(s) => {
+                let mut o = String::with_capacity(s.len() + 2);
+                o.push('\'');
+                for c in s.chars() {
+                    match c {
+                        '\'' => o.push_str("''"),
+                        '\\' => o.push_str("\\\\"),
+                        c => o.push(c),
+                    }
+                }
+                o.push('\'');
+                ParamLit::Raw(o)
+            }
+            Err(e) => ParamLit::Str {
+                bytes: e.into_bytes(),
+                charset,
+            },
+        },
+        other => other,
+    }
+}
+
 pub(crate) fn render(text: &[u8], params: &[ParamLit], opts: LexOptions) -> Option<Vec<u8>> {
     let toks = lex(text, &opts).ok()?;
     let sig: Vec<usize> = (0..toks.len())
@@ -555,6 +584,14 @@ impl PassSession {
                 return self.fail(out, &e).await;
             }
         };
+        // `MATCH ... AGAINST` on a search index takes its query as a quoted
+        // string literal, which the search rewrite reads: text values go in
+        // quoted there, not as `_charset X'...'`.
+        let params = if sprig_search::sqlscan::mentions(&held.text) {
+            params.into_iter().map(quoted_text).collect()
+        } else {
+            params
+        };
         let (lex, _) = self.lex_opts();
         let Some(text) = render(&held.text, &params, lex) else {
             return self.fail(out, &wrong_arguments()).await;
@@ -612,6 +649,14 @@ impl PassSession {
         })
     }
 
+    /// Whether an unsharded tenant's prepared `text` is one MariaDB can't
+    /// prepare, so the gateway holds it: a publish into a stream, or a
+    /// statement with a `MATCH ... AGAINST` on a search index (the gateway
+    /// rewrites the call at each execute).
+    async fn gateway_runs(&mut self, text: &[u8]) -> bool {
+        self.stream_publish(text) || matches!(self.search_prepare_text(text).await, Ok(Some(_)))
+    }
+
     /// A SQL-level prepared-statement command of a tenant session (see the
     /// module docs): `None` when it isn't one, or goes on as before.
     #[allow(clippy::too_many_lines)] // one arm per command
@@ -644,10 +689,12 @@ impl PassSession {
                     let Ok(text) = self.source_text(cx, &src).await else {
                         return Ok(None);
                     };
-                    // A publish into a stream: the gateway holds it, as for
-                    // COM_STMT_PREPARE (MariaDB has no table to prepare it
-                    // on: 1146).
-                    if self.stream_publish(&text) {
+                    // A publish into a stream, or a `MATCH ... AGAINST` on a
+                    // search index: the gateway holds it, as for
+                    // COM_STMT_PREPARE (MariaDB has no table to prepare a
+                    // publish on, 1146, and no FULLTEXT index for the
+                    // search, 1191).
+                    if self.gateway_runs(&text).await {
                         let step = match self.hold(cx, text).await {
                             Ok(h) => {
                                 self.forget_backend_ps(cx, &name).await;
@@ -710,9 +757,10 @@ impl PassSession {
                     let Ok(text) = self.source_text(cx, &src).await else {
                         return Ok(None);
                     };
-                    // A publish into a stream runs as the gateway's own
-                    // statement, as an EXECUTE of a held one does.
-                    if self.stream_publish(&text) {
+                    // A publish into a stream or a search runs as the
+                    // gateway's own statement, as an EXECUTE of a held one
+                    // does.
+                    if self.gateway_runs(&text).await {
                         let step = match self.hold(cx, text).await {
                             Ok(h) => self.run_held(cx, &h, &using, more, format, out).await?,
                             Err(e) => {
@@ -868,6 +916,26 @@ mod tests {
 
     fn r(s: &str, params: &[ParamLit]) -> Option<String> {
         render(s.as_bytes(), params, lx()).map(|v| String::from_utf8(v).unwrap())
+    }
+
+    #[test]
+    fn a_search_query_value_goes_in_quoted() {
+        let p = |s: &[u8]| {
+            quoted_text(ParamLit::Str {
+                bytes: s.to_vec(),
+                charset: "utf8mb4".into(),
+            })
+        };
+        assert_eq!(
+            r(
+                "SELECT id FROM t WHERE MATCH (b) AGAINST (?) AND n = ?",
+                &[p(b"it's a \\ shoe"), quoted_text(ParamLit::Int(3))],
+            )
+            .as_deref(),
+            Some("SELECT id FROM t WHERE MATCH (b) AGAINST ('it''s a \\\\ shoe') AND n = 3")
+        );
+        // Bytes that aren't text keep their hex form.
+        assert!(matches!(p(&[0xff, 0xfe]), ParamLit::Str { .. }));
     }
 
     #[test]

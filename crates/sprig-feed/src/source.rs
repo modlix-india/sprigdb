@@ -76,6 +76,84 @@ pub enum XaMark {
     Rollback(String),
 }
 
+/// The longest a group's row changes may be (estimated bytes, see
+/// [`row_bytes`]) before its rows are let go: the feed's
+/// `feed.max_txn_mb` (64). A larger group keeps only which tables it
+/// touched ([`Overflow`]); its rows are never held, so one huge
+/// transaction (a bulk load) can't fill a reader's memory.
+pub const MAX_TXN_BYTES: usize = 64 << 20;
+
+static MAX_TXN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(MAX_TXN_BYTES);
+
+/// The bound on a group's row changes now ([`MAX_TXN_BYTES`] unless set).
+#[must_use]
+pub fn max_txn_bytes() -> usize {
+    MAX_TXN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sets the bound for this process (tests use a small one); 0 restores
+/// the default.
+pub fn set_max_txn_bytes(bytes: usize) {
+    let b = if bytes == 0 { MAX_TXN_BYTES } else { bytes };
+    MAX_TXN.store(b, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn value_bytes(v: &sprig_binlog::Value) -> usize {
+    use sprig_binlog::Value;
+    match v {
+        Value::Decimal(s) => s.len(),
+        Value::String(b) | Value::Bytes(b) | Value::Geometry(b) => b.len(),
+        _ => 8,
+    }
+}
+
+/// A row change's size in memory, roughly, from its images.
+#[must_use]
+pub fn images_bytes(before: Option<&RowImage>, after: Option<&RowImage>) -> usize {
+    [before, after]
+        .into_iter()
+        .flatten()
+        .flat_map(|i| i.0.iter().flatten())
+        .map(|v| 16 + value_bytes(v))
+        .sum::<usize>()
+        + 64
+}
+
+/// A row change's size in memory, roughly.
+#[must_use]
+pub fn row_bytes(r: &RawRow) -> usize {
+    images_bytes(r.before.as_ref(), r.after.as_ref())
+}
+
+/// A group whose row changes were over [`max_txn_bytes`]: its rows were
+/// let go, and these are the tables they were in. A consumer that reads
+/// one of them can't have the group's changes and must read the tables
+/// again from MariaDB (a search copy seeds again); others pass it by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Overflow {
+    /// The tables the rows were in, each once, in binlog order.
+    pub tables: Vec<Arc<TableShape>>,
+    /// The rows let go.
+    pub rows: u64,
+    /// Their estimated size.
+    pub bytes: usize,
+}
+
+impl Overflow {
+    /// Notes `n` more rows of `table`.
+    pub fn add(&mut self, table: &Arc<TableShape>, n: u64, bytes: usize) {
+        if !self
+            .tables
+            .iter()
+            .any(|t| t.schema == table.schema && t.table == table.table)
+        {
+            self.tables.push(Arc::clone(table));
+        }
+        self.rows += n;
+        self.bytes += bytes;
+    }
+}
+
 /// One committed binlog group, cut down to what the feed reads.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawTxn {
@@ -98,6 +176,8 @@ pub struct RawTxn {
     pub apply: bool,
     /// The XA role of the group, if any.
     pub xa: Option<XaMark>,
+    /// The group's rows were too many to hold: `rows` is empty.
+    pub overflow: Option<Box<Overflow>>,
 }
 
 impl RawTxn {
@@ -114,7 +194,18 @@ impl RawTxn {
             statement_dml: None,
             apply: false,
             xa: None,
+            overflow: None,
         }
+    }
+
+    /// Whether it carries nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+            && self.ddl.is_none()
+            && self.statement_dml.is_none()
+            && self.xa.is_none()
+            && self.overflow.is_none()
     }
 
     /// The position after the group.

@@ -33,8 +33,7 @@ pub(crate) mod watch;
 
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::AtomicU64;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -274,30 +273,15 @@ async fn connection(
         Arc::clone(&conn.transport),
     );
     let settings = shared.cfg.settings.current();
-    // gateway.handshake_timeout_ms, moved back by the failure delays the
-    // login waits out: a delayed refusal still ends with its ERR packet,
-    // not a dropped connection.
-    let conn_timeout = conn.listener.handshake_timeout;
-    let delayed = Arc::new(AtomicU64::new(0));
-    let phase = {
-        let phase = sprig_auth::LOGIN_DELAY_MS.scope(
-            Arc::clone(&delayed),
-            login_phase(&shared, &ctx, &settings, &mut session, conn),
-        );
-        tokio::pin!(phase);
-        let mut deadline = tokio::time::Instant::now() + conn_timeout;
-        loop {
-            tokio::select! {
-                r = &mut phase => break Some(r),
-                () = tokio::time::sleep_until(deadline) => {
-                    match delayed.swap(0, Ordering::Relaxed) {
-                        0 => break None,
-                        ms => deadline += Duration::from_millis(ms),
-                    }
-                }
-            }
-        }
-    };
+    // gateway.handshake_timeout_ms of the client's time: the gateway's own
+    // waits (a failure delay, the RSA key the first plain-TCP login waits
+    // for) don't count, and a refusal whose delay began still ends with its
+    // ERR packet, not a dropped connection.
+    let phase = sprig_auth::login_waits::with_deadline(
+        conn.listener.handshake_timeout,
+        login_phase(&shared, &ctx, &settings, &mut session, conn),
+    )
+    .await;
     let mut logged_in = match phase {
         None => {
             tracing::debug!(session = %session.id, "connection phase timed out");
@@ -468,6 +452,9 @@ async fn login_phase(
         let rsa = if tls {
             None
         } else {
+            // The first login after a start waits for the generated key:
+            // the gateway's wait, not the client's.
+            let _wait = sprig_auth::login_waits::begin_wait();
             rsa::key_for(&settings.rsa_key_path).await
         };
         let mut raw = RawIo::new(&mut conn.stream, seq);

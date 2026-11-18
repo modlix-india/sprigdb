@@ -9,15 +9,15 @@
 #
 #   sql/tpcc.sh --target 10.0.0.3:3306 --product SprigDB --user bench --password pw --db tpcc \
 #       -- --tpcc-dir /opt/sysbench-tpcc [--warehouses 10] [--threads 16] [--time 600] [--runs 3] [--model dsql]
-#          [--driver mysql|pgsql]
+#          [--driver mysql|pgsql] [--no-prepare]
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 bench_args "$@"
-DIR="" WH=10 TH=16 TIME=600 WARM=120 RUNS=3 MODEL=sql DRIVER=mysql
+DIR="" WH=10 TH=16 TIME=600 WARM=120 RUNS=3 MODEL=sql DRIVER=mysql PREP=1
 set -- "${EXTRA[@]+"${EXTRA[@]}"}"
 while [[ $# -gt 0 ]]; do case $1 in
     --tpcc-dir) DIR=$2; shift 2 ;; --warehouses) WH=$2; shift 2 ;; --threads) TH=$2; shift 2 ;;
-    --time) TIME=$2; shift 2 ;; --warmup) WARM=$2; shift 2 ;; --runs) RUNS=$2; shift 2 ;; --model) MODEL=$2; shift 2 ;; --driver) DRIVER=$2; shift 2 ;;
+    --time) TIME=$2; shift 2 ;; --warmup) WARM=$2; shift 2 ;; --runs) RUNS=$2; shift 2 ;; --model) MODEL=$2; shift 2 ;; --driver) DRIVER=$2; shift 2 ;; --no-prepare) PREP=0; shift ;;
     *) echo "unknown $1" >&2; exit 2 ;; esac; done
 [[ -f $DIR/tpcc.lua ]] || { echo "--tpcc-dir must hold tpcc.lua (Percona-Lab/sysbench-tpcc)" >&2; exit 2; }
 SB=${BENCH_SYSBENCH:-sysbench}
@@ -33,7 +33,7 @@ else
 fi
 VARIANT="warehouses=$WH,threads=$TH"
 [[ $DRY == 1 ]] && { echo "would load $WH warehouses and run $RUNS x $TIME s"; exit 0; }
-(cd "$LOGDIR" && "$SB" "$DIR/tpcc.lua" "${conn[@]}" --threads=8 prepare) >"$LOGDIR/prepare.log" 2>&1
+[[ $PREP == 1 ]] && { (cd "$LOGDIR" && "$SB" "$DIR/tpcc.lua" "${conn[@]}" --threads=8 prepare) >"$LOGDIR/prepare.log" 2>&1; }
 (cd "$LOGDIR" && "$SB" "$DIR/tpcc.lua" "${conn[@]}" --threads="$TH" --time="$WARM" run) >"$LOGDIR/warmup.log" 2>&1
 for r in $(seq 1 "$RUNS"); do
     f=$LOGDIR/run$r.log

@@ -733,9 +733,12 @@ impl Walker<'_, '_> {
         }
         let raw = ident_value(self.bytes(tok));
         let name = String::from_utf8_lossy(&raw);
-        // The hidden column of a MySQL functional key part, which the 3306
-        // translator writes into the statement.
-        if !is_internal_column(&name) || crate::compat::fxindex::is_fx_column(&name) {
+        // The hidden column of a MySQL functional key part, and its hidden
+        // check, which the 3306 translator writes into the statement.
+        if !is_internal_column(&name)
+            || crate::compat::fxindex::is_fx_column(&name)
+            || crate::compat::fxindex::fx_column_of_check(&name).is_some()
+        {
             return Ok(());
         }
         if self.creating_cols {
@@ -2520,7 +2523,9 @@ impl Walker<'_, '_> {
                 self.eat_if_not_exists();
                 self.database()?;
             } else if let Some(kind) = self.show_object_kind() {
-                let table = self.at(b"TABLE");
+                // A view of a grouped table's group (a key-value
+                // namespace's) lives in the group's schemas too.
+                let table = self.at(b"TABLE") || self.at(b"VIEW");
                 self.i += 1;
                 let c = self.object(kind, false)?;
                 if table {

@@ -10,17 +10,18 @@
 #       --user bench --password pw --db sbtest -- [--tests "..."] [--threads "1 16 64"] \
 #       [--tables 10] [--table-size 1000000] [--time 120] [--warmup 60] [--runs 3] [--no-prepare]
 #       [--driver mysql|pgsql]   (pgsql: PostgreSQL through sysbench's own pgsql driver)
+#       [--model dsql]           (record under the distributed-SQL model)
 #
 # Needs sysbench 1.0.20 on PATH ($BENCH_SYSBENCH to override).
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 bench_args "$@"
-TESTS="oltp_point_select oltp_read_only oltp_read_write" THREADS="1 16 64" TABLES=10 SIZE=1000000 TIME=120 WARM=60 RUNS=3 PREP=1 DRIVER=mysql
+TESTS="oltp_point_select oltp_read_only oltp_read_write" THREADS="1 16 64" TABLES=10 SIZE=1000000 TIME=120 WARM=60 RUNS=3 PREP=1 DRIVER=mysql MODEL=sql
 set -- "${EXTRA[@]+"${EXTRA[@]}"}"
 while [[ $# -gt 0 ]]; do case $1 in
     --tests) TESTS=$2; shift 2 ;; --threads) THREADS=$2; shift 2 ;; --tables) TABLES=$2; shift 2 ;;
     --table-size) SIZE=$2; shift 2 ;; --time) TIME=$2; shift 2 ;; --warmup) WARM=$2; shift 2 ;;
-    --runs) RUNS=$2; shift 2 ;; --no-prepare) PREP=0; shift ;; --driver) DRIVER=$2; shift 2 ;;
+    --runs) RUNS=$2; shift 2 ;; --no-prepare) PREP=0; shift ;; --driver) DRIVER=$2; shift 2 ;; --model) MODEL=$2; shift 2 ;;
     *) echo "unknown $1" >&2; exit 2 ;; esac; done
 SB=${BENCH_SYSBENCH:-sysbench}
 need "$SB" python3
@@ -31,6 +32,9 @@ else
     conn=(--db-driver=mysql --mysql-host="$HOST" --mysql-port="$PORT" --mysql-user="$B_USER" --mysql-password="$B_PASS"
           --mysql-db="${B_DB:-sbtest}" --mysql-ssl=off --tables="$TABLES" --table-size="$SIZE")
 fi
+# BENCH_SB_EXTRA: more sysbench options for every call, e.g. --auto_inc=off (explicit ids 1..N)
+read -r -a SBX <<<"${BENCH_SB_EXTRA:-}"
+conn+=("${SBX[@]+"${SBX[@]}"}")
 [[ $PREP == 1 && $DRY == 0 ]] && "$SB" oltp_read_write "${conn[@]}" --threads=16 prepare >"$LOGDIR/prepare.log" 2>&1
 for t in $TESTS; do
     op=complex; [[ $t == oltp_point_select ]] && op=point
@@ -58,9 +62,9 @@ print(tps, pct(0.50), pct(0.99))
 PY
 )
             RUN_ID_SAVE=$RUN_ID; RUN_ID=$RUN_ID_SAVE-run$r
-            emit sql "$op" sysbench tps "$tps" "transactions/s" higher --config "tables=$TABLES" --config "table_size=$SIZE" --config "seconds=$TIME" --config "run=$r"
-            emit sql "$op" sysbench p50_ms "$p50" ms lower --config "run=$r"
-            emit sql "$op" sysbench p99_ms "$p99" ms lower --config "run=$r"
+            emit "$MODEL" "$op" sysbench tps "$tps" "transactions/s" higher --config "tables=$TABLES" --config "table_size=$SIZE" --config "seconds=$TIME" --config "run=$r"
+            emit "$MODEL" "$op" sysbench p50_ms "$p50" ms lower --config "run=$r"
+            emit "$MODEL" "$op" sysbench p99_ms "$p99" ms lower --config "run=$r"
             RUN_ID=$RUN_ID_SAVE
         done
     done

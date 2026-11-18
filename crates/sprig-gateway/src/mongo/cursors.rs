@@ -46,10 +46,14 @@ pub struct Cursor {
     last_used: Instant,
 }
 
+/// An open cursor's tenant (readable while a command holds the cursor),
+/// and the cursor.
+type Slot = (u64, Arc<tokio::sync::Mutex<Option<Cursor>>>);
+
 /// The cursors of this gateway.
 #[derive(Debug, Default)]
 pub struct CursorTable {
-    map: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<Option<Cursor>>>>>,
+    map: Mutex<HashMap<i64, Slot>>,
     gateway_bits: i64,
 }
 
@@ -64,9 +68,7 @@ impl CursorTable {
         }
     }
 
-    fn lock(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<i64, Arc<tokio::sync::Mutex<Option<Cursor>>>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<i64, Slot>> {
         self.map.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -86,7 +88,8 @@ impl CursorTable {
         max_per_tenant: usize,
     ) -> Result<i64, MongoError> {
         let mut m = self.lock();
-        let tenant_open = m.len();
+        let tenant = owner.tenant;
+        let tenant_open = m.values().filter(|(t, _)| *t == tenant).count();
         if tenant_open >= max_per_tenant {
             return Err(MongoError::new(
                 code::SPRIG_CURSOR_LIMIT,
@@ -104,17 +107,20 @@ impl CursorTable {
             }
             m.insert(
                 id,
-                Arc::new(tokio::sync::Mutex::new(Some(Cursor {
-                    plan,
-                    ns,
-                    owner,
-                    lsid,
-                    batch_size,
-                    no_timeout,
-                    stream: None,
-                    await_data: false,
-                    last_used: Instant::now(),
-                }))),
+                (
+                    tenant,
+                    Arc::new(tokio::sync::Mutex::new(Some(Cursor {
+                        plan,
+                        ns,
+                        owner,
+                        lsid,
+                        batch_size,
+                        no_timeout,
+                        stream: None,
+                        await_data: false,
+                        last_used: Instant::now(),
+                    }))),
+                ),
             );
             metrics::gauge!("sprig_mongo_cursors_open", "kind" => "find")
                 .set(f64::from(u32::try_from(m.len()).unwrap_or(u32::MAX)));
@@ -145,9 +151,10 @@ impl CursorTable {
         plan.exhausted = false;
         // Change-stream metrics.
         let scope = super::status::stream_scope(&ns);
+        let tenant = owner.tenant;
         let id = self.open(plan, ns, owner, lsid, batch_size, false, max_per_tenant)?;
-        super::status::stream_opened(id, scope);
-        if let Some(c) = self.lock().get(&id).cloned()
+        super::status::stream_opened(tenant, id, scope);
+        if let Some(c) = self.cursor(id)
             && let Ok(mut g) = c.try_lock()
             && let Some(cur) = g.as_mut()
         {
@@ -158,7 +165,7 @@ impl CursorTable {
 
     /// Marks cursor `id` as a tailable `awaitData` cursor.
     pub fn set_await_data(&self, id: i64) {
-        if let Some(c) = self.lock().get(&id).cloned()
+        if let Some(c) = self.cursor(id)
             && let Ok(mut g) = c.try_lock()
             && let Some(cur) = g.as_mut()
         {
@@ -175,7 +182,7 @@ impl CursorTable {
         id: i64,
         owner: &Owner,
     ) -> Result<Arc<tokio::sync::Mutex<Option<Cursor>>>, MongoError> {
-        let c = self.lock().get(&id).cloned();
+        let c = self.cursor(id);
         let Some(c) = c else {
             let other = (id >> 47) != (self.gateway_bits >> 47);
             return Err(MongoError::new(
@@ -222,7 +229,7 @@ impl CursorTable {
         let mut m = self.lock();
         let dead: Vec<i64> = m
             .iter()
-            .filter_map(|(id, c)| {
+            .filter_map(|(id, (_, c))| {
                 let g = c.try_lock().ok()?;
                 let cur = g.as_ref()?;
                 (!cur.no_timeout && now.duration_since(cur.last_used) > timeout).then_some(*id)
@@ -241,7 +248,7 @@ impl CursorTable {
     /// Kills the cursors of session `lsid`.
     pub fn kill_session(&self, lsid: &[u8]) {
         let mut m = self.lock();
-        m.retain(|_, c| match c.try_lock() {
+        m.retain(|_, (_, c)| match c.try_lock() {
             Ok(g) => g
                 .as_ref()
                 .is_none_or(|cur| cur.lsid.as_deref() != Some(lsid)),
@@ -260,7 +267,7 @@ impl CursorTable {
     pub fn entries(&self) -> Vec<(i64, Arc<tokio::sync::Mutex<Option<Cursor>>>)> {
         self.lock()
             .iter()
-            .map(|(k, v)| (*k, Arc::clone(v)))
+            .map(|(k, (_, v))| (*k, Arc::clone(v)))
             .collect()
     }
 
@@ -268,6 +275,19 @@ impl CursorTable {
     #[must_use]
     pub fn len(&self) -> usize {
         self.lock().len()
+    }
+
+    /// Open cursors of `tenant` (`None`: every tenant's).
+    #[must_use]
+    pub fn len_of(&self, tenant: Option<u64>) -> usize {
+        match tenant {
+            None => self.len(),
+            Some(t) => self.lock().values().filter(|(o, _)| *o == t).count(),
+        }
+    }
+
+    fn cursor(&self, id: i64) -> Option<Arc<tokio::sync::Mutex<Option<Cursor>>>> {
+        self.lock().get(&id).map(|(_, c)| Arc::clone(c))
     }
 
     /// No open cursors.
@@ -332,6 +352,18 @@ mod tests {
                 .code,
             code::SPRIG_CURSOR_LIMIT
         );
+        // The limit is per tenant: another tenant still opens cursors.
+        let carol = Owner {
+            tenant: 2,
+            user: "carol".into(),
+        };
+        let other = t
+            .open(plan(), "d.c".into(), carol, None, None, false, 2)
+            .unwrap();
+        assert_eq!(t.len_of(Some(1)), 2);
+        assert_eq!(t.len_of(Some(2)), 1);
+        assert_eq!(t.len_of(None), 3);
+        assert!(t.remove(other));
         t.kill_session(&[1]);
         assert_eq!(t.len(), 1);
         assert_eq!(t.reap(Duration::ZERO), 1);

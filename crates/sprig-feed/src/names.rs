@@ -30,6 +30,13 @@ pub trait Resolver: Send + Sync {
     /// # Errors
     /// The catalog's errors.
     async fn object(&self, tenant: TenantId, db: DbId, table: &str) -> Result<Option<u64>>;
+
+    /// Forgets what is cached for `tenant`: a feed reader calls it after
+    /// each DDL of the tenant, since a table dropped and created again
+    /// under its name is a new object.
+    fn forget(&self, tenant: TenantId) {
+        let _ = tenant;
+    }
 }
 
 /// Names from a fixed table (tests and the simulation).
@@ -85,13 +92,15 @@ pub trait CatalogPools: Send + Sync {
 
 type ObjectKey = (TenantId, DbId, String);
 
-/// Names from the tenant catalog, cached. Names found are kept for the
-/// process's life: a renamed database shows its old name until restart
-/// (a shared catalog cache is to replace this).
+/// Names from the tenant catalog, cached until the tenant's next DDL
+/// ([`Resolver::forget`]).
 pub struct CatalogResolver {
     pools: Arc<dyn CatalogPools>,
     dbs: Mutex<HashMap<(TenantId, DbId), String>>,
     objects: Mutex<HashMap<ObjectKey, u64>>,
+    /// Bumped by each [`Resolver::forget`] of the tenant: a lookup that
+    /// started before one doesn't cache what it read.
+    epochs: Mutex<HashMap<TenantId, u64>>,
 }
 
 impl std::fmt::Debug for CatalogResolver {
@@ -108,7 +117,17 @@ impl CatalogResolver {
             pools,
             dbs: Mutex::default(),
             objects: Mutex::default(),
+            epochs: Mutex::default(),
         }
+    }
+
+    fn epoch(&self, tenant: TenantId) -> u64 {
+        self.epochs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&tenant)
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -130,6 +149,7 @@ impl Resolver for CatalogResolver {
         {
             return Ok(Some(n.clone()));
         }
+        let epoch = self.epoch(tenant);
         let mut c = self
             .pools
             .pool(tenant)
@@ -145,7 +165,9 @@ impl Resolver for CatalogResolver {
             .exec_first(q, (db.0,))
             .await
             .map_err(|e| catalog_err(&e))?;
-        if let Some(n) = &name {
+        if let Some(n) = &name
+            && self.epoch(tenant) == epoch
+        {
             self.dbs
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -164,6 +186,7 @@ impl Resolver for CatalogResolver {
         {
             return Ok(Some(*id));
         }
+        let epoch = self.epoch(tenant);
         let mut c = self
             .pools
             .pool(tenant)
@@ -173,20 +196,39 @@ impl Resolver for CatalogResolver {
             .map_err(|e| catalog_err(&e))?;
         let q = format!(
             "SELECT object_id FROM `{}`.objects WHERE db_id = ? AND namespace = 'relation' \
-             AND name_key = ? AND state <> 'dropped'",
+             AND name_key = ? AND state <> 'dropped' ORDER BY state = 'dropping', object_id DESC LIMIT 1",
             SchemaName::catalog(tenant)
         );
         let id: Option<u64> = c
             .exec_first(q, (db.0, table.to_lowercase()))
             .await
             .map_err(|e| catalog_err(&e))?;
-        if let Some(id) = id {
+        if let Some(id) = id
+            && self.epoch(tenant) == epoch
+        {
             self.objects
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(key, id);
         }
         Ok(id)
+    }
+
+    fn forget(&self, tenant: TenantId) {
+        *self
+            .epochs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(tenant)
+            .or_default() += 1;
+        self.objects
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|k, _| k.0 != tenant);
+        self.dbs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|k, _| k.0 != tenant);
     }
 }
 

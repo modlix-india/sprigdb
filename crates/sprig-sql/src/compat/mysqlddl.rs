@@ -841,6 +841,15 @@ pub fn functional_index_error(
     original: &[u8],
     opts: &LexOptions,
 ) -> Option<WireError> {
+    // A hidden check refusing a row the table already holds, when a
+    // `CREATE INDEX` or `ALTER TABLE ... ADD INDEX` adds it: MySQL's 3751
+    // from computing the new hidden column.
+    if code == 4025 {
+        let v = fx_value_error(code, message)?;
+        let index = super::fxindex::index_of_fx_column(original, opts, &v.column)
+            .unwrap_or_else(|| "functional_index".to_owned());
+        return Some(functional_index_value(&index, &v));
+    }
     if code != 1901 {
         return None;
     }
@@ -1168,9 +1177,22 @@ pub struct FxValueError {
 
 /// The [`FxValueError`] in MariaDB's 1264, 1265, 1292, 1366 or 1406 when
 /// the column it names is a hidden column (`'_sprig_fx_..'` or
-/// `` `db`.`t`.`_sprig_fx_..` ``). `None` for other errors.
+/// `` `db`.`t`.`_sprig_fx_..` ``), or in its 4025 when the check it names
+/// is a hidden column's check (`` CONSTRAINT `_sprig_fxck_..` failed for
+/// `db`.`t` ``, which has no row number: row 1). `None` for other errors.
 #[must_use]
 pub fn fx_value_error(code: u16, message: &str) -> Option<FxValueError> {
+    if code == 4025 {
+        let name = message
+            .strip_prefix("CONSTRAINT `")?
+            .split_once('`')
+            .map(|(n, _)| n)?;
+        return Some(FxValueError {
+            column: super::fxindex::fx_column_of_check(name)?,
+            row: 1,
+            out_of_range: false,
+        });
+    }
     let out_of_range = match code {
         1264 => true,
         1265 | 1292 | 1366 | 1406 => false,

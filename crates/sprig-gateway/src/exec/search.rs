@@ -1056,11 +1056,27 @@ impl PassSession {
         let st = scat::state(&cat);
         // (span, replacement)
         let mut edits: Vec<((usize, usize), String)> = Vec::new();
-        // The best rows of one search: read its hits a page at a time.
-        let top_k = if scans.is_none() {
-            sqlscan::top_k(sql, scan)
-        } else {
+        // The best rows of one search: read its hits a page at a time. An
+        // `EXPLAIN` of such a statement reads them the same way (else it
+        // would fail past `search.max_window` where the statement runs):
+        // the statement after `EXPLAIN` is the one paged.
+        let explained = scans
+            .is_some()
+            .then(|| explained_select(sql))
+            .flatten()
+            .and_then(|at| {
+                let inner = &sql[at..];
+                sqlscan::scan(inner).ok().map(|s| (inner, s))
+            });
+        let (tk_sql, tk_scan) = match &explained {
+            Some((inner, s)) => (*inner, s),
+            None if scans.is_none() => (sql, scan),
+            None => ("", scan),
+        };
+        let top_k = if tk_sql.is_empty() {
             None
+        } else {
+            sqlscan::top_k(tk_sql, tk_scan)
         };
         let mut paged: Option<Vec<Hit>> = None;
         for m in &scan.matches {
@@ -1161,11 +1177,27 @@ impl PassSession {
                             &def,
                             &query,
                             consistency,
-                            sql,
-                            scan,
+                            tk_sql,
+                            tk_scan,
                             tk,
                         )
                         .await?;
+                    if let (Some(list), Some(hits)) = (scans.as_mut(), &paged) {
+                        let name = tref.alias.clone().unwrap_or_else(|| tref.table.clone());
+                        list.push(
+                            self.explain_scan(
+                                svc,
+                                tenant,
+                                &def,
+                                &query,
+                                consistency,
+                                name,
+                                hits.len(),
+                                started,
+                            )
+                            .await,
+                        );
+                    }
                 }
                 if let Some(hits) = &paged {
                     let qual = match (&tref.alias, m.columns.iter().any(|(q, _)| q.is_some())) {
@@ -1828,6 +1860,37 @@ impl PassSession {
 
 /// The analyzed terms of a query (for highlights): every token of its
 /// text, as each text field's query analyzer gives it.
+/// Where the statement an `EXPLAIN` (or `DESCRIBE`) describes starts: its
+/// `SELECT`, when only words and `=` (`EXTENDED`, `FORMAT=JSON`) stand
+/// between them.
+fn explained_select(sql: &str) -> Option<usize> {
+    let b = sql.as_bytes();
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut i = 0;
+    let mut words = 0;
+    while i < b.len() {
+        if b[i].is_ascii_whitespace() || b[i] == b'=' {
+            i += 1;
+            continue;
+        }
+        if !word(b[i]) {
+            return None;
+        }
+        let start = i;
+        while i < b.len() && word(b[i]) {
+            i += 1;
+        }
+        words += 1;
+        if words > 1 && sql[start..i].eq_ignore_ascii_case("SELECT") {
+            return Some(start);
+        }
+        if words > 4 {
+            return None;
+        }
+    }
+    None
+}
+
 pub(crate) fn query_terms(q: &SearchQuery, schema: &sprig_search::IndexSchema) -> HashSet<String> {
     let mut out = HashSet::new();
     fn walk(q: &SearchQuery, schema: &sprig_search::IndexSchema, out: &mut HashSet<String>) {
@@ -2144,5 +2207,28 @@ impl ResultSink for ToBinary<'_> {
     }
     fn finished(&self) -> bool {
         self.inner.finished()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::explained_select;
+
+    fn at(s: &str) -> Option<&str> {
+        explained_select(s).map(|i| &s[i..])
+    }
+
+    #[test]
+    fn the_statement_an_explain_describes() {
+        assert_eq!(at("EXPLAIN SELECT 1"), Some("SELECT 1"));
+        assert_eq!(
+            at("explain format=json select a from t"),
+            Some("select a from t")
+        );
+        assert_eq!(at("EXPLAIN EXTENDED\n  SELECT 1"), Some("SELECT 1"));
+        assert_eq!(at("DESCRIBE SELECT 1"), Some("SELECT 1"));
+        assert_eq!(at("EXPLAIN UPDATE t SET a = 1"), None);
+        assert_eq!(at("EXPLAIN /* c */ SELECT 1"), None);
+        assert_eq!(at("SELECT 1"), None);
     }
 }

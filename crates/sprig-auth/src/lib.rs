@@ -63,6 +63,7 @@ mod crypt;
 pub mod fast_cache;
 pub mod handoff;
 pub mod http;
+pub mod login_waits;
 pub mod mfa;
 pub mod mysql;
 pub mod oidc;
@@ -87,8 +88,8 @@ pub use accounts::{Account, AccountStore, BackendTarget, FileAccounts, StaticAcc
 pub use cache::{AuthExtension, AuthUser, TenantAuth};
 pub use fast_cache::{FastCache, FastKey};
 pub use mysql::{
-    AuthCatalogs, BackendResolver, BackendSpec, CatalogLogins, LOGIN_DELAY_MS, LoginMode,
-    LoginRequest, LoginService, LoginSource, MysqlLogin, PolicySettings, Principal, SettingsPolicy,
+    AuthCatalogs, BackendResolver, BackendSpec, CatalogLogins, LoginMode, LoginRequest,
+    LoginService, LoginSource, MysqlLogin, PolicySettings, Principal, SettingsPolicy,
     StaticBackends,
 };
 pub use scram::{ScramKind, ScramVerifier};

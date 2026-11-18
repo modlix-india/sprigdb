@@ -154,3 +154,88 @@ async fn run_flushes_once_more_at_shutdown() {
     Arc::clone(&flusher).run(stop).await;
     assert_eq!(r.target.batches.lock().unwrap().len(), 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_lowered_period_applies_to_the_wait_under_way() {
+    let r = rig();
+    let a = fp(&r.f, 1, "SELECT 1");
+    r.rec.record(TenantId(1), &a, &ex(100));
+    let period = Arc::new(std::sync::atomic::AtomicU32::new(900));
+    let p = Arc::clone(&period);
+    let flusher = Arc::new(Flusher::new(
+        Arc::clone(&r.rec),
+        Arc::new(SampleOutbox::new(3, 1)),
+        r.target.clone(),
+        7,
+        r.clock.clone(),
+        Arc::new(move || FlushSettings {
+            flush_seconds: p.load(std::sync::atomic::Ordering::Relaxed),
+            ..FlushSettings::default()
+        }),
+    ));
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(Arc::clone(&flusher).run(stop.clone()));
+    // 10 s into a 900 s wait: nothing yet.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(r.target.batches.lock().unwrap().is_empty());
+    // Lowered to 5 s: the wait under way is past it, so the flush comes
+    // at the next check, not 890 s later.
+    period.store(5, std::sync::atomic::Ordering::Relaxed);
+    tokio::time::sleep(PERIOD_CHECK + Duration::from_millis(100)).await;
+    assert_eq!(r.target.batches.lock().unwrap().len(), 1);
+    // And the next wait is 5 s.
+    r.rec.record(TenantId(1), &a, &ex(100));
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(r.target.batches.lock().unwrap().len(), 2);
+    stop.cancel();
+    task.await.unwrap();
+}
+
+struct Deleted(TenantId);
+
+#[async_trait]
+impl TenantGone for Deleted {
+    async fn gone(&self, tenant: TenantId) -> bool {
+        tenant == self.0
+    }
+}
+
+#[tokio::test]
+async fn a_deleted_tenants_rows_are_dropped_not_retried() {
+    let r = rig();
+    let flusher = Flusher::new(
+        Arc::clone(&r.rec),
+        Arc::new(SampleOutbox::new(3, 1)),
+        r.target.clone(),
+        7,
+        r.clock.clone(),
+        Arc::new(FlushSettings::default),
+    )
+    .with_gone(Arc::new(Deleted(TenantId(1))));
+    let a = fp(&r.f, 1, "SELECT * FROM t WHERE id = 1");
+    let b = fp(&r.f, 2, "SELECT * FROM u WHERE id = 1");
+    let c = fp(&r.f, 3, "SELECT * FROM v WHERE id = 1");
+    r.rec.record(TenantId(1), &a, &ex(100));
+    r.rec.record(TenantId(2), &b, &ex(100));
+    r.rec.record(TenantId(3), &c, &ex(100));
+    // Tenant 1 is deleted; tenant 3's catalog is only down.
+    r.target
+        .failing
+        .lock()
+        .unwrap()
+        .extend([TenantId(1), TenantId(3)]);
+    let rep = flusher.flush().await;
+    assert_eq!((rep.tenants, rep.failed), (1, 1), "{rep:?}");
+    assert!(rep.gone_dropped >= 2, "{rep:?}");
+    // The bucket ends: tenant 1 has nothing left to close or retry, and
+    // tenant 3's closed row is still kept.
+    r.clock.advance(Duration::from_secs(3600));
+    let rep = flusher.flush().await;
+    assert_eq!((rep.failed, rep.gone_dropped), (1, 0), "{rep:?}");
+    r.target.failing.lock().unwrap().clear();
+    let rep = flusher.flush().await;
+    assert_eq!(rep.failed, 0);
+    let batches = r.target.batches.lock().unwrap();
+    assert!(batches.iter().all(|(t, ..)| *t != TenantId(1)));
+    assert!(batches.iter().any(|(t, ..)| *t == TenantId(3)));
+}

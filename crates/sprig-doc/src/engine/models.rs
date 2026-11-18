@@ -23,15 +23,15 @@
 //!
 //! **Approximate vectors.** Each vector index
 //! has a side table `__sprig_doc_vx_<hash>` (`_id`, the vector, the
-//! document's `_v`) with MariaDB's HNSW `VECTOR INDEX`. It is kept in step
-//! on read, not on write: before an approximate search, rows whose `_v`
-//! is newer than the side table's newest minus a margin are copied in
-//! (an upsert, read through an index on `_v`), at most every
-//! `vector_sync_ms` (1 s) per gateway, and every minute rows of deleted
-//! documents are removed; approximate results are thus up to about a
-//! second behind writes, as Atlas Vector Search is eventually consistent.
-//! A missing side table (a new index, or one a move didn't carry) is
-//! created and filled the same way (MariaDB limits a vector index's
+//! document's `_v`) with MariaDB's HNSW `VECTOR INDEX`. It is built when
+//! the index is created, and kept in step after reads, not on write
+//! ([`super::vectors`]): in the background when the gateway runs it, never
+//! in the reader's session, so a search takes no locks. Until it is built
+//! the index lists as `BUILDING`, not queryable, and searches are exact;
+//! approximate results are up to about a second behind writes, as Atlas
+//! Vector Search is eventually consistent. Dropping the collection drops
+//! its search indexes. A missing side table (one a move didn't carry) is
+//! built again the same way (MariaDB limits a vector index's
 //! primary key to 256 bytes with its length: documents whose encoded
 //! `_id` is over 254 bytes stay out of approximate searches). An approximate search reads
 //! `numCandidates` nearest `_id`s from the side table, then the documents
@@ -60,7 +60,7 @@ const SEARCH_TABLE: &str = "__sprig_doc_search_ix";
 
 /// How far back (in `_v` units: ms << 16) each side-table sync re-reads:
 /// writers' clocks and transactions that commit late.
-const SIDE_MARGIN: u64 = 30_000 << 16;
+pub(super) const SIDE_MARGIN: u64 = 30_000 << 16;
 
 /// Side tables synced, and when (this process): at most once a second.
 static SYNCED: std::sync::LazyLock<
@@ -291,13 +291,13 @@ impl VectorIndex {
         )
     }
 
-    fn path_lit(&self) -> String {
+    pub(super) fn path_lit(&self) -> String {
         let parts: Vec<&str> = self.path.split('.').collect();
         str_lit(&json_path(&parts, &[]))
     }
 
     /// The side table's distance function (the one its index uses).
-    fn side_distance(&self) -> (&'static str, &'static str) {
+    pub(super) fn side_distance(&self) -> (&'static str, &'static str) {
         if self.similarity == "euclidean" {
             ("VEC_DISTANCE_EUCLIDEAN", "euclidean")
         } else {
@@ -306,7 +306,7 @@ impl VectorIndex {
     }
 
     /// Rows whose path holds a numeric array of the right length.
-    fn valid_sql(&self) -> String {
+    pub(super) fn valid_sql(&self) -> String {
         let p = self.path_lit();
         format!(
             "JSON_TYPE(JSON_EXTRACT(doc, {p})) = 'ARRAY' AND JSON_LENGTH(JSON_EXTRACT(doc, {p})) = {} \
@@ -635,7 +635,7 @@ impl Engine {
 
     /// The search indexes of `ns` (`name`: only that one): `(id, name,
     /// type, definition)`.
-    async fn search_rows(
+    pub(super) async fn search_rows(
         &self,
         sql: &mut dyn SqlRunner,
         ns: &Ns,
@@ -687,15 +687,20 @@ impl Engine {
         ns: &Ns,
         name: Option<&str>,
     ) -> Result<Vec<Document>, MongoError> {
-        let mut out: Vec<Document> = self
-            .search_rows(sql, ns, name)
-            .await?
-            .into_iter()
-            .map(|(id, name, t, def)| {
-                doc! {"id": id, "name": name, "type": t, "status": "READY", "queryable": true,
-                "latestDefinition": def}
-            })
-            .collect();
+        let table = self.meta(sql, ns).await?.map(|m| m.table);
+        let mut out: Vec<Document> = Vec::new();
+        for (id, name, t, def) in self.search_rows(sql, ns, name).await? {
+            // Queryable once its side table is built.
+            let ready = match &table {
+                Some(table) if t == "vectorSearch" => {
+                    self.side_ready(sql, ns, table, &name).await?
+                }
+                _ => true,
+            };
+            out.push(doc! {"id": id, "name": name, "type": t,
+            "status": if ready { "READY" } else { "BUILDING" }, "queryable": ready,
+            "latestDefinition": def});
+        }
         // Full-text search indexes.
         if let Some(t) = &self.text {
             for i in t.list(sql, ns).await? {
@@ -795,9 +800,66 @@ impl Engine {
             ))
             .await
             .map_err(|e| mongo_error(&e))?;
+            // A side table under this name is a leftover: built again.
+            let side = vector_side_table(&m.table, &name);
+            self.drop_side_tables(sql, &ns.db, &side).await;
+            self.side_upkeep(sql, ns, &m.table, &name, false).await;
             out.push(doc! {"id": id, "name": name});
         }
         Ok(out)
+    }
+
+    /// Moves `from`'s vector index definitions to `to` (a rename from
+    /// table `old_table` to `new_table`), and drops their side tables:
+    /// they are built again under the new name on first use. Definitions a
+    /// dropped `to` left go first. Failures are ignored.
+    pub(crate) async fn rename_search_indexes(
+        &self,
+        sql: &mut dyn SqlRunner,
+        from: &Ns,
+        to: &Ns,
+        (old_table, new_table): (&str, &str),
+    ) {
+        self.forget_search_indexes(sql, to, new_table).await;
+        if let Ok(rows) = self.search_rows(sql, from, None).await {
+            for (_, n, t, _) in rows {
+                if t == "vectorSearch" {
+                    for table in [old_table, new_table] {
+                        let side = vector_side_table(table, &n);
+                        self.drop_side_tables(sql, &from.db, &side).await;
+                    }
+                }
+            }
+        }
+        let _ = sql
+            .exec(&format!(
+                "UPDATE {}.{} SET coll = {} WHERE coll = {}",
+                ident(&from.db),
+                ident(SEARCH_TABLE),
+                str_lit(&to.coll),
+                str_lit(&from.coll)
+            ))
+            .await;
+    }
+
+    /// Forgets every search index of `ns` (a vector index's side
+    /// tables, and the definitions): the collection was dropped, or is
+    /// created again under a name a dropped one had. Failures are ignored.
+    pub(crate) async fn forget_search_indexes(
+        &self,
+        sql: &mut dyn SqlRunner,
+        ns: &Ns,
+        table: &str,
+    ) {
+        self.drop_vector_sides(sql, ns, table, None).await;
+        let _ = sql
+            .exec(&format!(
+                "DELETE FROM {}.{} WHERE coll = {}",
+                ident(&ns.db),
+                ident(SEARCH_TABLE),
+                str_lit(&ns.coll)
+            ))
+            .await;
     }
 
     /// `updateSearchIndex`.
@@ -836,6 +898,9 @@ impl Engine {
             .await;
         match r {
             Ok(d) if d.affected > 0 || !self.search_rows(sql, ns, Some(name)).await?.is_empty() => {
+                if let Some(m) = self.meta(sql, ns).await? {
+                    self.side_upkeep(sql, ns, &m.table, name, false).await;
+                }
                 Ok(())
             }
             Ok(_) => Err(MongoError::new(
@@ -1066,114 +1131,8 @@ impl Engine {
                 continue;
             }
             let side = vector_side_table(table, &n);
-            let _ = sql
-                .exec(&format!(
-                    "DROP TABLE IF EXISTS {}.{}",
-                    ident(&ns.db),
-                    ident(&side)
-                ))
-                .await;
+            self.drop_side_tables(sql, &ns.db, &side).await;
         }
-    }
-
-    /// Brings the side table of vector index `name` up to date (creating
-    /// and filling it when missing); its vector count.
-    async fn vector_sync(
-        &self,
-        sql: &mut dyn SqlRunner,
-        ns: &Ns,
-        m: &crate::meta::CollMeta,
-        name: &str,
-        vx: &VectorIndex,
-    ) -> Result<u64, MongoError> {
-        let side = vector_side_table(&m.table, name);
-        let st = format!("{}.{}", ident(&ns.db), ident(&side));
-        let coll = format!("{}.{}", ident(&ns.db), ident(&m.table));
-        let sync_key = format!("{}.{side}", ns.db);
-        if let Some((at, n)) = SYNCED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&sync_key)
-            && at.elapsed() < std::time::Duration::from_millis(self.cfg.vector_sync_ms)
-        {
-            return Ok(*n);
-        }
-        let probe = format!("SELECT COUNT(*), COALESCE(MAX(_v), 0) FROM {st}");
-        let (count, newest) = match sql.query(&probe).await {
-            Ok(r) => {
-                let row = r.into_iter().next().unwrap_or_default();
-                (
-                    text(row.first().and_then(Option::as_ref))
-                        .parse::<u64>()
-                        .unwrap_or(0),
-                    text(row.get(1).and_then(Option::as_ref))
-                        .parse::<u64>()
-                        .unwrap_or(0),
-                )
-            }
-            Err(e) if e.is(1146) => {
-                let (_, metric) = vx.side_distance();
-                // The documents' `_v`, for the syncs' range reads.
-                sql.exec(&format!(
-                    "ALTER TABLE {coll} ADD INDEX IF NOT EXISTS _sprig_dix_v (_v)"
-                ))
-                .await
-                .map_err(|e| mongo_error(&e))?;
-                sql.exec(&format!(
-                    "CREATE TABLE IF NOT EXISTS {st} (_id VARBINARY(254) NOT NULL, \
-                     v VECTOR({}) NOT NULL, _v BIGINT UNSIGNED NOT NULL, PRIMARY KEY (_id), KEY by_v (_v), \
-                     VECTOR INDEX (v) M=16 DISTANCE={metric}) ENGINE=InnoDB",
-                    vx.dims
-                ))
-                .await
-                .map_err(|e| mongo_error(&e))?;
-                (0, 0)
-            }
-            Err(e) => return Err(mongo_error(&e)),
-        };
-        let lower = if count == 0 {
-            0
-        } else {
-            newest.saturating_sub(SIDE_MARGIN)
-        };
-        let done = sql
-            .exec(&format!(
-                "INSERT INTO {st} (_id, v, _v) SELECT _id, VEC_FromText(JSON_EXTRACT(doc, {p})), _v FROM {coll} \
-                 WHERE _v > {lower} AND LENGTH(_id) <= 254 AND {valid} \
-                 ON DUPLICATE KEY UPDATE v = VALUES(v), _v = VALUES(_v)",
-                p = vx.path_lit(),
-                valid = vx.valid_sql()
-            ))
-            .await
-            .map_err(|e| mongo_error(&e))?;
-        let due = {
-            let mut g = PURGED
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let key = format!("{}.{side}", ns.db);
-            let due = g
-                .get(&key)
-                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(60));
-            if due {
-                g.insert(key, std::time::Instant::now());
-            }
-            due
-        };
-        if due {
-            // Documents deleted, or whose vector went away.
-            sql.exec(&format!(
-                "DELETE FROM {st} WHERE _id NOT IN (SELECT _id FROM {coll} WHERE {})",
-                vx.valid_sql()
-            ))
-            .await
-            .map_err(|e| mongo_error(&e))?;
-        }
-        let n = count + done.affected;
-        SYNCED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(sync_key, (std::time::Instant::now(), n));
-        Ok(n)
     }
 
     /// Approximate `$vectorSearch`: `None` when the index is too
@@ -1193,7 +1152,16 @@ impl Engine {
         limit: usize,
         num_candidates: usize,
     ) -> Result<Option<Vec<Document>>, MongoError> {
-        let n = self.vector_sync(sql, ns, m, name, vx).await?;
+        // The side table is brought up to date in the background (inline
+        // only without the gateway's), never by the read's own session.
+        self.side_upkeep(sql, ns, &m.table, name, true).await;
+        let Some(n) = self
+            .side_count(sql, &ns.db, &vector_side_table(&m.table, name))
+            .await?
+        else {
+            // Still being built: exact.
+            return Ok(None);
+        };
         if n < self.cfg.vector_ann_min_rows {
             return Ok(None);
         }

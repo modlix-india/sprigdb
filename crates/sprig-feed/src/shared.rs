@@ -65,18 +65,20 @@
 //! instances opened 76 dumps.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use sprig_binlog::{Gtid, GtidPos, Value};
+use sprig_binlog::{Gtid, GtidPos};
 use sprig_common::ids::{ClusterId, TenantId};
 use sprig_common::names::SchemaName;
 use sprig_common::{ErrorKind, Result, SprigCode, SprigError};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::Instant;
 
-use crate::source::{Clusters, DumpScope, RawTxn, SourceItem, TxnSource, XaMark};
+use crate::source::{
+    Clusters, DumpScope, Overflow, RawTxn, SourceItem, TxnSource, XaMark, max_txn_bytes, row_bytes,
+};
 
 /// Items a subscription buffers before it is detached.
 pub const SUB_CHANNEL: usize = 256;
@@ -91,6 +93,87 @@ pub const IDLE_TICK: Duration = crate::binlog::IDLE_EVERY;
 pub const HUB_LINGER: Duration = Duration::from_secs(30);
 
 type Item = Result<SourceItem>;
+
+/// Bytes of decoded groups waiting in the shared readers' buffers (read
+/// ahead of the hub, or sent to a subscription and not yet read), this
+/// process: `sprig_feed_buffered_bytes`.
+static BUFFERED: AtomicUsize = AtomicUsize::new(0);
+
+/// [`BUFFERED`] now (tests).
+#[must_use]
+pub fn buffered_bytes() -> usize {
+    BUFFERED.load(Ordering::Relaxed)
+}
+
+fn buffered(add: bool, bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    if add {
+        BUFFERED.fetch_add(bytes, Ordering::Relaxed);
+    } else {
+        BUFFERED.fetch_sub(bytes, Ordering::Relaxed);
+    }
+    #[allow(clippy::cast_precision_loss)]
+    {
+        metrics::gauge!("sprig_feed_buffered_bytes").set(BUFFERED.load(Ordering::Relaxed) as f64);
+    }
+}
+
+/// The estimated bytes of an item ([`approx_bytes`] of a group).
+fn item_bytes(i: &Item) -> usize {
+    match i {
+        Ok(SourceItem::Txn(t)) => approx_bytes(t),
+        _ => 0,
+    }
+}
+
+/// A subscription's link with the hub: whether it was detached, and the
+/// bytes of the groups sent to it and not read yet.
+#[derive(Debug, Default)]
+struct SubLink {
+    detached: AtomicBool,
+    held: AtomicUsize,
+}
+
+impl SubLink {
+    fn store(&self, v: bool, o: Ordering) {
+        self.detached.store(v, o);
+    }
+
+    fn load(&self, o: Ordering) -> bool {
+        self.detached.load(o)
+    }
+
+    /// Takes `bytes` for a group about to be sent; `false` when the
+    /// subscription already holds enough (it is detached, as when its
+    /// channel is full).
+    fn take(&self, bytes: usize, cap: usize) -> bool {
+        let held = self.held.load(Ordering::Acquire);
+        if held > 0 && held.saturating_add(bytes) > cap {
+            return false;
+        }
+        self.held.fetch_add(bytes, Ordering::AcqRel);
+        buffered(true, bytes);
+        true
+    }
+
+    /// Gives back what [`Self::take`] took for a group read (or not sent).
+    fn give(&self, bytes: usize) {
+        let _ = self
+            .held
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |h| {
+                Some(h.saturating_sub(bytes))
+            });
+        buffered(false, bytes);
+    }
+}
+
+impl Drop for SubLink {
+    fn drop(&mut self) {
+        buffered(false, *self.held.get_mut());
+    }
+}
 
 /// A shared reader's sizes and limits.
 #[derive(Debug, Clone)]
@@ -114,6 +197,24 @@ pub struct SharedOpts {
     /// from the ring and listens only once it is this close, instead of
     /// taking a catch-up dump.
     pub max_backlog: usize,
+    /// Bytes (estimated) one buffer holds at most: a dump's read-ahead, or
+    /// a subscription's groups not read yet (past it the subscription is
+    /// detached, as when its channel is full). A buffer always takes one
+    /// group. 0: twice the largest group the feed holds
+    /// ([`crate::source::max_txn_bytes`]).
+    pub buffer_bytes: usize,
+}
+
+impl SharedOpts {
+    /// [`Self::buffer_bytes`] in effect.
+    #[must_use]
+    pub fn buffer_cap(&self) -> usize {
+        if self.buffer_bytes == 0 {
+            max_txn_bytes().saturating_mul(2)
+        } else {
+            self.buffer_bytes
+        }
+    }
 }
 
 impl Default for SharedOpts {
@@ -125,6 +226,7 @@ impl Default for SharedOpts {
             max_catchup: 4,
             gather: Duration::from_secs(10),
             max_backlog: 4_096,
+            buffer_bytes: 0,
         }
     }
 }
@@ -212,6 +314,25 @@ pub fn split(t: &RawTxn, xa: &mut HashMap<String, HashSet<TenantId>>) -> Vec<(Te
             parts[i].1.rows.push(r.clone());
         }
     }
+    if let Some(o) = &t.overflow {
+        for table in &o.tables {
+            if let Some(tenant) = DumpScope::tenant_of(&table.schema) {
+                let i = part(&mut parts, tenant);
+                parts[i]
+                    .1
+                    .overflow
+                    .get_or_insert_with(|| {
+                        Box::new(Overflow {
+                            tables: Vec::new(),
+                            rows: o.rows,
+                            bytes: o.bytes,
+                        })
+                    })
+                    .tables
+                    .push(Arc::clone(table));
+            }
+        }
+    }
     if let Some(d) = &t.ddl {
         for tenant in DumpScope::tenants_named(&d.db, &d.sql) {
             let i = part(&mut parts, tenant);
@@ -244,13 +365,7 @@ pub fn split(t: &RawTxn, xa: &mut HashMap<String, HashSet<TenantId>>) -> Vec<(Te
 #[must_use]
 pub fn view(part: &RawTxn, kept: &Kept) -> Option<RawTxn> {
     match kept {
-        Kept::All => {
-            let empty = part.rows.is_empty()
-                && part.ddl.is_none()
-                && part.statement_dml.is_none()
-                && part.xa.is_none();
-            (!empty).then(|| part.clone())
-        }
+        Kept::All => (!part.is_empty()).then(|| part.clone()),
         Kept::Tables(tables) => {
             let rows: Vec<_> = part
                 .rows
@@ -266,7 +381,26 @@ pub fn view(part: &RawTxn, kept: &Kept) -> Option<RawTxn> {
                 })
                 .cloned()
                 .collect();
-            if rows.is_empty() && part.xa.is_none() {
+            let overflow = part.overflow.as_ref().and_then(|o| {
+                let tables: Vec<_> = o
+                    .tables
+                    .iter()
+                    .filter(|t| {
+                        tables.iter().any(|p| DumpScope::table_matches(p, &t.table))
+                            && !matches!(
+                                t.schema.parse::<SchemaName>(),
+                                Ok(SchemaName::Catalog { .. })
+                            )
+                    })
+                    .cloned()
+                    .collect();
+                (!tables.is_empty()).then_some(Box::new(Overflow {
+                    tables,
+                    rows: o.rows,
+                    bytes: o.bytes,
+                }))
+            });
+            if rows.is_empty() && part.xa.is_none() && overflow.is_none() {
                 return None;
             }
             let mut v = RawTxn::new(part.gtid, part.before.clone(), part.ts);
@@ -274,34 +408,15 @@ pub fn view(part: &RawTxn, kept: &Kept) -> Option<RawTxn> {
             v.apply = part.apply;
             v.xa.clone_from(&part.xa);
             v.rows = rows;
+            v.overflow = overflow;
             Some(v)
         }
     }
 }
 
-fn value_bytes(v: &Value) -> usize {
-    match v {
-        Value::Decimal(s) => s.len(),
-        Value::String(b) | Value::Bytes(b) | Value::Geometry(b) => b.len(),
-        _ => 8,
-    }
-}
-
 /// A group's size in memory, roughly.
 fn approx_bytes(t: &RawTxn) -> usize {
-    let images: usize = t
-        .rows
-        .iter()
-        .map(|r| {
-            [&r.before, &r.after]
-                .into_iter()
-                .flatten()
-                .flat_map(|i| i.0.iter().flatten())
-                .map(|v| 16 + value_bytes(v))
-                .sum::<usize>()
-                + 64
-        })
-        .sum();
+    let images: usize = t.rows.iter().map(row_bytes).sum();
     images + t.ddl.as_ref().map_or(0, |d| d.sql.len()) + 128
 }
 
@@ -310,7 +425,7 @@ struct Sub {
     kept: Kept,
     from: GtidPos,
     tx: mpsc::Sender<Item>,
-    detached: Arc<AtomicBool>,
+    detached: Arc<SubLink>,
     /// Its view's idle cadence, and when it last got an idle position
     /// (`None`: never, so one is due).
     idle_every: Duration,
@@ -503,7 +618,7 @@ impl HubState {
         who: &Who,
         from: GtidPos,
         tx: mpsc::Sender<Item>,
-        detached: Arc<AtomicBool>,
+        detached: Arc<SubLink>,
     ) {
         let id = self.next_id;
         self.next_id += 1;
@@ -560,7 +675,7 @@ enum Attach {
     Live {
         rx: mpsc::Receiver<Item>,
         backlog: VecDeque<SourceItem>,
-        detached: Arc<AtomicBool>,
+        detached: Arc<SubLink>,
     },
     /// The next `max_backlog` of its groups from the ring, not listening
     /// yet: it attaches again after them.
@@ -619,7 +734,7 @@ impl Hub {
         let opts = &self.feed.opts;
         let kept = &who.kept;
         let (tx, rx) = mpsc::channel(opts.sub_channel);
-        let detached = Arc::new(AtomicBool::new(false));
+        let detached = Arc::new(SubLink::default());
         let whole = matches!(kept, Kept::All);
         let mut st = self.lock();
         if !st.running {
@@ -987,7 +1102,7 @@ impl Hub {
                 let sc = Arc::new(scope.clone().unwrap_or_default());
                 match self.feed.inner.open_scope(&self.cluster, sc, &pos).await {
                     Ok(s) => {
-                        src = Some(Reader::start(s));
+                        src = Some(Reader::start(s, self.feed.opts.buffer_cap()));
                         delay = Duration::from_millis(100);
                         good = Some(good.map_or_else(|| pos.clone(), |g| newer(&g, &pos)));
                         metrics::counter!("sprig_feed_shared_dumps_total", "cluster" => label.clone()).increment(1);
@@ -1044,6 +1159,7 @@ impl Hub {
                         continue;
                     }
                     let parts = split(&t, &mut xa);
+                    let cap = self.feed.opts.buffer_cap();
                     let mut detach: Vec<u64> = Vec::new();
                     let mut gone: Vec<u64> = Vec::new();
                     let mut sent = false;
@@ -1064,14 +1180,27 @@ impl Hub {
                                     s.from.update(t.gtid);
                                     continue;
                                 };
+                                // A subscription holding its bytes' worth
+                                // is detached, as one whose channel is full.
+                                let b = approx_bytes(&v);
+                                if !s.detached.take(b, cap) {
+                                    detach.push(*id);
+                                    continue;
+                                }
                                 match s.tx.try_send(Ok(SourceItem::Txn(v))) {
                                     Ok(()) => {
                                         // Delivered: a rewind won't send it again.
                                         s.from.update(t.gtid);
                                         sent = true;
                                     }
-                                    Err(mpsc::error::TrySendError::Full(_)) => detach.push(*id),
-                                    Err(mpsc::error::TrySendError::Closed(_)) => gone.push(*id),
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        s.detached.give(b);
+                                        detach.push(*id);
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        s.detached.give(b);
+                                        gone.push(*id);
+                                    }
                                 }
                             }
                         }
@@ -1169,34 +1298,71 @@ enum Fallback {
 struct Reader {
     rx: mpsc::Receiver<Item>,
     task: tokio::task::JoinHandle<()>,
+    held: Arc<ReadAhead>,
+}
+
+/// Bytes a [`Reader`] read ahead and that weren't taken yet, and a wake-up
+/// for its task; what is left is given back when both are gone.
+#[derive(Default)]
+struct ReadAhead {
+    bytes: AtomicUsize,
+    taken: Notify,
+}
+
+impl Drop for ReadAhead {
+    fn drop(&mut self) {
+        buffered(false, *self.bytes.get_mut());
+    }
 }
 
 impl Reader {
     /// Items read ahead at most.
     const AHEAD: usize = 1_024;
 
-    fn start(mut src: Box<dyn TxnSource>) -> Self {
+    fn start(mut src: Box<dyn TxnSource>, cap: usize) -> Self {
         let (tx, rx) = mpsc::channel(Self::AHEAD);
+        let held: Arc<ReadAhead> = Arc::default();
+        let h = Arc::clone(&held);
         let task = tokio::spawn(async move {
             loop {
                 let item = src.next().await;
                 let end = item.is_err();
+                // Reads ahead by bytes too: at most `buffer_cap` waiting
+                // (one group always goes).
+                let b = item_bytes(&item);
+                loop {
+                    let wake = h.taken.notified();
+                    let now = h.bytes.load(Ordering::Acquire);
+                    if now == 0 || now.saturating_add(b) <= cap {
+                        break;
+                    }
+                    wake.await;
+                }
+                h.bytes.fetch_add(b, Ordering::AcqRel);
+                buffered(true, b);
                 if tx.send(item).await.is_err() || end {
                     return;
                 }
             }
         });
-        Self { rx, task }
+        Self { rx, task, held }
     }
 
     /// The next item (cancel-safe).
     async fn next(&mut self) -> Item {
-        self.rx.recv().await.unwrap_or_else(|| {
+        let item = self.rx.recv().await.unwrap_or_else(|| {
             Err(SprigError::new(
                 SprigCode::BinlogDisconnected,
                 "the shared feed reader's dump task ended",
             ))
-        })
+        });
+        let b = item_bytes(&item);
+        if b > 0 {
+            self.held.bytes.fetch_sub(b, Ordering::AcqRel);
+            buffered(false, b);
+            self.held.taken.notify_one();
+        }
+        item
     }
 }
 
@@ -1234,7 +1400,7 @@ enum Mode {
     Live {
         rx: mpsc::Receiver<Item>,
         backlog: VecDeque<SourceItem>,
-        detached: Arc<AtomicBool>,
+        detached: Arc<SubLink>,
     },
     CatchUp(CatchUp),
     /// A part of a long return through the ring: attach again
@@ -1335,7 +1501,7 @@ impl SubSource {
         metrics::counter!("sprig_feed_resumes_total", "tier" => "binlog", "consumer" => self.who.consumer).increment(1);
         tracing::info!(cluster = %self.hub.cluster, tenant = %self.tenant, consumer = self.who.consumer, pos = %self.pos, why = %why, "shared feed reader: catch-up dump");
         self.mode = Mode::CatchUp(CatchUp {
-            src: Reader::start(src),
+            src: Reader::start(src, self.hub.feed.opts.buffer_cap()),
             _permit: permit,
             cluster,
             checked: Instant::now(),
@@ -1363,6 +1529,9 @@ impl TxnSource for SubSource {
                     }
                     match rx.recv().await {
                         Some(Ok(i)) => {
+                            if let SourceItem::Txn(t) = &i {
+                                detached.give(approx_bytes(t));
+                            }
                             self.advance(&i);
                             return Ok(i);
                         }

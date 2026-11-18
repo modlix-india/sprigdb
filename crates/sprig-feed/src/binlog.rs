@@ -24,7 +24,8 @@ use tokio::time::Instant;
 
 use crate::local_domains::{self, Plan};
 use crate::source::{
-    Clusters, DumpScope, RawDdl, RawRow, RawTxn, RowKind, SourceItem, TableShape, TxnSource, XaMark,
+    Clusters, DumpScope, Overflow, RawDdl, RawRow, RawTxn, RowKind, SourceItem, TableShape,
+    TxnSource, XaMark, images_bytes, max_txn_bytes, row_bytes,
 };
 
 /// The internal schema.
@@ -235,6 +236,52 @@ struct Group {
     xa: Option<String>,
     /// The current statement's operation hint.
     hint: Option<sprig_binlog::OpHint>,
+    /// The estimated size of `txn.rows` ([`crate::source::row_bytes`]).
+    bytes: usize,
+}
+
+impl Group {
+    /// Keeps `rows` of `shape`, unless the group is over `limit` bytes
+    /// ([`max_txn_bytes`]): then only which tables it touched is kept.
+    fn push_rows(
+        &mut self,
+        shape: &Arc<TableShape>,
+        kind: RowKind,
+        rows: Vec<sprig_binlog::RowChange>,
+        limit: usize,
+    ) {
+        if let Some(o) = self.txn.overflow.as_mut() {
+            let b: usize = rows
+                .iter()
+                .map(|r| images_bytes(r.before.as_ref(), r.after.as_ref()))
+                .sum();
+            o.add(shape, rows.len() as u64, b);
+            return;
+        }
+        for r in rows {
+            let row = RawRow {
+                table: Arc::clone(shape),
+                kind,
+                before: r.before,
+                after: r.after,
+                hint: self.hint,
+            };
+            self.bytes += row_bytes(&row);
+            self.txn.rows.push(row);
+        }
+        if self.bytes > limit {
+            let mut o = Overflow {
+                tables: Vec::new(),
+                rows: 0,
+                bytes: 0,
+            };
+            for r in std::mem::take(&mut self.txn.rows) {
+                o.add(&r.table, 1, row_bytes(&r));
+            }
+            self.bytes = 0;
+            self.txn.overflow = Some(Box::new(o));
+        }
+    }
 }
 
 /// One open binlog dump in `sprig_feed_binlog_dumps` (node, kind): +1
@@ -367,11 +414,17 @@ impl BinlogTxns {
         let mut txn = g.txn;
         self.pos.update(txn.gtid);
         txn.xa = xa;
-        let empty = txn.rows.is_empty()
-            && txn.ddl.is_none()
-            && txn.statement_dml.is_none()
-            && txn.xa.is_none();
-        if empty {
+        if let Some(o) = &txn.overflow {
+            metrics::counter!("sprig_feed_txn_overflow_total").increment(1);
+            tracing::warn!(
+                gtid = %txn.gtid,
+                rows = o.rows,
+                mib = o.bytes >> 20,
+                tables = o.tables.len(),
+                "feed: a transaction too large to hold; its rows are let go, and readers of its tables read them again from MariaDB"
+            );
+        }
+        if txn.is_empty() {
             self.quiet_since.get_or_insert_with(Instant::now);
             return None;
         }
@@ -415,6 +468,7 @@ impl TxnSource for BinlogTxns {
                         flags,
                         xa: xa.map(|x| x.to_string()),
                         hint: None,
+                        bytes: 0,
                     });
                 }
                 Event::Annotate(text) => {
@@ -458,15 +512,7 @@ impl TxnSource for BinlogTxns {
                         RowsKind::Update => RowKind::Update,
                         RowsKind::Delete => RowKind::Delete,
                     };
-                    for r in rows {
-                        g.txn.rows.push(RawRow {
-                            table: shape.clone(),
-                            kind,
-                            before: r.before,
-                            after: r.after,
-                            hint: g.hint,
-                        });
-                    }
+                    g.push_rows(&shape, kind, rows, max_txn_bytes());
                 }
                 Event::Query { db, sql, .. } => {
                     let standalone = self
@@ -484,6 +530,7 @@ impl TxnSource for BinlogTxns {
                             // Nothing changed, but the group took a GTID.
                             if let Some(g) = self.group.as_mut() {
                                 g.txn.rows.clear();
+                                g.txn.overflow = None;
                             }
                             let _ = self.close(None);
                         }
@@ -691,6 +738,59 @@ impl Clusters for StaticClusters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_group_over_the_limit_keeps_only_its_tables() {
+        let shape = |t: &str| {
+            Arc::new(TableShape {
+                schema: "t7_d1_g1_s1".into(),
+                table: t.into(),
+                columns: vec!["k".into(), "v".into()],
+                key: vec![0],
+            })
+        };
+        let rows = |n: usize| -> Vec<sprig_binlog::RowChange> {
+            (0..n)
+                .map(|i| sprig_binlog::RowChange {
+                    before: None,
+                    after: Some(sprig_binlog::RowImage(vec![
+                        Some(sprig_binlog::Value::Int(i64::try_from(i).unwrap())),
+                        Some(sprig_binlog::Value::String(vec![b'x'; 100])),
+                    ])),
+                })
+                .collect()
+        };
+        let mut g = Group {
+            txn: RawTxn::new(
+                sprig_binlog::Gtid {
+                    domain: 0,
+                    server: 1,
+                    seq: 1,
+                },
+                GtidPos::new(),
+                0,
+            ),
+            flags: GtidFlags::default(),
+            xa: None,
+            hint: None,
+            bytes: 0,
+        };
+        let (a, b) = (shape("a"), shape("b"));
+        // 10 rows of about 200 bytes each: under 10 KB, held.
+        g.push_rows(&a, RowKind::Insert, rows(10), 10_000);
+        assert_eq!(g.txn.rows.len(), 10);
+        assert!(g.txn.overflow.is_none());
+        // 100 more: over it. The rows go; the tables and counts stay.
+        g.push_rows(&b, RowKind::Insert, rows(100), 10_000);
+        g.push_rows(&a, RowKind::Insert, rows(1_000), 10_000);
+        assert!(g.txn.rows.is_empty());
+        let o = g.txn.overflow.as_ref().unwrap();
+        let names: Vec<&str> = o.tables.iter().map(|t| t.table.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+        assert_eq!(o.rows, 1_110);
+        assert!(o.bytes > 200_000, "{}", o.bytes);
+        assert!(!g.txn.is_empty());
+    }
 
     #[test]
     fn statements_classify_by_their_first_words() {

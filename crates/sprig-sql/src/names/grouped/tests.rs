@@ -153,6 +153,11 @@ fn one_table_reads_its_groups_schema() {
         ),
         ("DESCRIBE orders", "DESCRIBE `t42_d1_g3_s2`.orders"),
         ("DESC billing.orders id", "DESC `t42_d1_g3_s2`.orders id"),
+        // A grouped view (a key-value namespace's) too.
+        (
+            "SHOW CREATE VIEW orders",
+            "SHOW CREATE VIEW `t42_d1_g3_s2`.orders",
+        ),
     ] {
         assert_eq!(sql(text), want, "{text}");
     }

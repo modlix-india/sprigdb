@@ -166,6 +166,7 @@ The model `local:bge-small` is bundled with SprigDB: BAAI's bge-small-en-v1.5, 3
 - **Only when the source changes.** SprigDB keeps a hash of the text it embedded with each row. An update that leaves the source as it was costs nothing. A source that becomes `NULL` or blank makes the vector `NULL`.
 - **Existing rows.** Declaring the column on a table with rows starts a backfill that embeds them in key order, at most `ai.embedding.backfill_rows_per_s` rows a second (500 by default), while new changes are embedded as they come. A worker that stops carries on where the backfill was.
 - **Exactly once.** The worker records how far it has read the feed only after its writes commit, and writes a vector only if the row's source is still the one it embedded. A worker killed in the middle of a batch is replaced, reads the last changes again and passes over the rows it had already written; a row changed again meanwhile gets the vector of its newest source.
+- **A background check.** Once the column is filled, the worker also rereads its rows slowly (at a tenth of `ai.embedding.backfill_rows_per_s`, resting a minute after each pass) and embeds any row whose vector isn't its current source's, so a change the worker missed is embedded late rather than never.
 - **Graceful stops.** A worker stopped gracefully (`SIGTERM`) first finishes the changes written up to its stop, for at most 3 seconds, and records how far it got, so binary logs purged right after the stop take nothing it needs. After a `kill -9`, keep the binary logs until the worker has caught up.
 - **Long inputs.** A source is cut to `ai.embedding.max_input_bytes` (64 KiB) and to the model's 512 tokens, or fewer with `WITH (max_input_tokens = n)`.
 
@@ -292,9 +293,9 @@ The other index commands work as in Atlas:
 
 | Command | Behaviour |
 |---|---|
-| `listSearchIndexes`, `$listSearchIndexes` | Lists vector and full-text indexes. A vector index reports `status: "READY"` and `queryable: true` at once. |
+| `listSearchIndexes`, `$listSearchIndexes` | Lists vector and full-text indexes. A new vector index reports `status: "BUILDING"` and `queryable: false` while it is built in the background; meanwhile `$vectorSearch` on it still answers, by an exact search. It then reports `"READY"` and `queryable: true`. |
 | `updateSearchIndex` | Replaces the definition. Fails with 27 `IndexNotFound` when the index doesn't exist. |
-| `dropSearchIndex` | Drops the index. Dropping an index that doesn't exist succeeds. |
+| `dropSearchIndex` | Drops the index. Dropping an index that doesn't exist succeeds. Dropping the collection drops its search indexes too, so an index of the same name can be created again after `drop()`. |
 
 Creating an index whose name exists with the same definition succeeds and does nothing. With a different definition it fails with 68 `IndexKeySpecsConflict`. A malformed definition fails with 2 `BadValue`.
 

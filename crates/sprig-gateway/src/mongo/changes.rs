@@ -492,6 +492,8 @@ pub struct ChangeStream {
     /// The digest of the row-level security views the stream opened with
     /// ([`crate::tenant::rls::DocViews::fingerprint`]).
     pub policies: u64,
+    /// The tenant (its `serverStatus` counters).
+    tenant: u64,
 }
 
 impl Drop for ChangeStream {
@@ -982,6 +984,7 @@ impl ChangeFeed {
         let stop = CancellationToken::new();
         let pipeline = spec.pipeline.clone();
         let policies = crate::tenant::rls::DocViews::fingerprint(spec.visibility.as_deref());
+        let tenant = spec.tenant.0;
         tokio::spawn(run(tail, spec, tx, stop.clone(), from));
         metrics::gauge!("sprig_mongo_cursors_open", "kind" => "change_stream").increment(1.0);
         ChangeStream {
@@ -991,6 +994,7 @@ impl ChangeFeed {
             pipeline,
             done: false,
             policies,
+            tenant,
         }
     }
 }
@@ -1109,7 +1113,7 @@ impl ChangeStream {
                 break;
             }
         }
-        super::status::stream_examined(&out);
+        super::status::stream_examined(self.tenant, &out);
         if !(self.pipeline.is_empty() || out.is_empty()) {
             let lim = AggLimits {
                 stage_bytes: 104_857_600,
@@ -1121,7 +1125,10 @@ impl ChangeStream {
         }
         // An event past the BSON limit ends the stream, as on MongoDB
         // (`$changeStreamSplitLargeEvent` isn't offered).
-        if let Some(e) = out.iter().find_map(super::status::too_large) {
+        if let Some(e) = out
+            .iter()
+            .find_map(|d| super::status::too_large(self.tenant, d))
+        {
             self.done = true;
             return Err(e);
         }

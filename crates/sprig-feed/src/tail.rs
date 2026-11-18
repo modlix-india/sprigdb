@@ -81,6 +81,12 @@ pub struct TailOptions {
     /// a cluster busy with other tenants' writes, where the source is
     /// never idle (search's waits for `latest`).
     pub progress_on_filtered: bool,
+    /// The objects (by id) and tables (by name) the consumer reads;
+    /// `None`: every table. A group too large for the feed to hold
+    /// ([`crate::source::Overflow`]) fails the tail with 39800 only when
+    /// it touched one of them, or any table when this is `None`; the
+    /// others pass it by.
+    pub reads: Option<(Vec<u64>, Vec<String>)>,
 }
 
 impl Default for TailOptions {
@@ -93,6 +99,7 @@ impl Default for TailOptions {
             keep_internal: Vec::new(),
             follow_moves: true,
             progress_on_filtered: false,
+            reads: None,
         }
     }
 }
@@ -509,7 +516,7 @@ impl TenantTail {
 
     /// Handles one group: XA bookkeeping, skipping, filters, decoding.
     #[allow(clippy::too_many_lines)] // one group's steps, in order
-    async fn on_txn(&mut self, t: RawTxn) -> Result<()> {
+    async fn on_txn(&mut self, mut t: RawTxn) -> Result<()> {
         self.reads += 1;
         let read = self.reads;
         // Skipping what a resume token already delivered.
@@ -528,6 +535,22 @@ impl TenantTail {
                 self.xa_bookkeeping(&t, read);
                 return Ok(());
             }
+        }
+        if !matches!(t.xa, Some(XaMark::Rollback(_)))
+            && let Some(table) = self.overflow_read(&t).await?
+        {
+            metrics::counter!("sprig_feed_overflow_lost_total").increment(1);
+            return Err(SprigError::new(
+                SprigCode::FeedHistoryLost,
+                format!(
+                    "transaction {} on {} changed about {} MiB ({} rows) of table {table}: more than \
+                     the feed holds, so its changes can't be delivered; read the table again",
+                    t.gtid,
+                    self.cluster,
+                    t.overflow.as_ref().map_or(0, |o| o.bytes >> 20),
+                    t.overflow.as_ref().map_or(0, |o| o.rows),
+                ),
+            ));
         }
         // Rows, with XA branches held until their commit.
         let mut pos_for_events = t.before.clone();
@@ -558,7 +581,7 @@ impl TenantTail {
                     }
                     (Vec::new(), Vec::new())
                 };
-                rows.extend(t.rows.iter().cloned());
+                rows.append(&mut t.rows);
                 stamps.extend(t.stamps.iter().copied());
                 (rows, stamps)
             }
@@ -566,7 +589,7 @@ impl TenantTail {
                 if let Some(h) = self.held.first() {
                     pos_for_events = h.before.clone();
                 }
-                (t.rows.clone(), t.stamps.clone())
+                (std::mem::take(&mut t.rows), t.stamps.clone())
             }
         };
         if let Some(db) = &t.statement_dml {
@@ -686,6 +709,13 @@ impl TenantTail {
                 ));
             }
         }
+        // A table dropped and created again under its name is a new
+        // object: names are looked up afresh after any DDL of the tenant
+        // (the event above still carries the id the DDL acted on).
+        if t.ddl.is_some() {
+            self.objects.clear();
+            self.names.forget(self.tenant);
+        }
         if events.is_empty() {
             return Ok(());
         }
@@ -736,6 +766,42 @@ impl TenantTail {
     }
 
     /// While skipping: keep XA state as if the group had been read.
+    /// The first table of `t`'s overflow ([`crate::source::Overflow`])
+    /// that the consumer reads (`TailOptions::reads`), logically named.
+    async fn overflow_read(&mut self, t: &RawTxn) -> Result<Option<String>> {
+        let Some(o) = &t.overflow else {
+            return Ok(None);
+        };
+        for shape in &o.tables {
+            if is_internal_object(&shape.table)
+                && !self
+                    .opts
+                    .keep_internal
+                    .iter()
+                    .any(|p| shape.table.starts_with(p.as_str()))
+            {
+                continue;
+            }
+            let Some(info) = self.schema(&shape.schema).await? else {
+                continue;
+            };
+            let name = format!("{}.{}", info.db_name, shape.table);
+            let Some((objects, tables)) = self.opts.reads.clone() else {
+                return Ok(Some(name));
+            };
+            if tables.iter().any(|x| x.eq_ignore_ascii_case(&shape.table)) {
+                return Ok(Some(name));
+            }
+            if !objects.is_empty() {
+                let id = self.object(info.db, &shape.table).await?;
+                if id != 0 && objects.contains(&id) {
+                    return Ok(Some(name));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn xa_bookkeeping(&mut self, t: &RawTxn, read: u64) {
         match &t.xa {
             Some(XaMark::Prepare(x)) => self.held.push(Held {
@@ -873,8 +939,9 @@ mod tests {
     use sprig_binlog::{RowImage, Value};
 
     use super::*;
+    use crate::event::{DdlKind, Op};
     use crate::names::StaticResolver;
-    use crate::source::{RowKind, TableShape};
+    use crate::source::{RawDdl, RowKind, TableShape};
 
     const T: TenantId = TenantId(7);
 
@@ -1071,6 +1138,172 @@ mod tests {
         let last = items.last().unwrap().token().clone();
         let mut r = tail(binlog, StartAt::After(last)).await;
         assert!(keys(&drain(&mut r).await).is_empty());
+    }
+
+    /// A catalog whose table `a` is object 1 until the source hands out
+    /// group 3 (its re-creation), then object 2.
+    struct Recreated(Arc<std::sync::atomic::AtomicU64>);
+
+    #[async_trait::async_trait]
+    impl Resolver for Recreated {
+        async fn database(&self, _: TenantId, _: DbId) -> Result<Option<String>> {
+            Ok(Some("shop".into()))
+        }
+        async fn object(&self, _: TenantId, _: DbId, _: &str) -> Result<Option<u64>> {
+            let seen = self.0.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(if seen >= 3 { 2 } else { 1 }))
+        }
+    }
+
+    struct Watched(Vec<RawTxn>, Arc<std::sync::atomic::AtomicU64>);
+    struct WatchedSrc(
+        std::vec::IntoIter<RawTxn>,
+        Arc<std::sync::atomic::AtomicU64>,
+    );
+
+    #[async_trait::async_trait]
+    impl TxnSource for WatchedSrc {
+        async fn next(&mut self) -> Result<SourceItem> {
+            if let Some(t) = self.0.next() {
+                self.1
+                    .store(t.gtid.seq, std::sync::atomic::Ordering::SeqCst);
+                return Ok(SourceItem::Txn(t));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok(SourceItem::Idle {
+                pos: GtidPos::from_gtids([g(4)]),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Clusters for Watched {
+        async fn open(
+            &self,
+            _: &ClusterId,
+            _: TenantId,
+            _: &GtidPos,
+        ) -> Result<Box<dyn TxnSource>> {
+            Ok(Box::new(WatchedSrc(
+                self.0.clone().into_iter(),
+                Arc::clone(&self.1),
+            )))
+        }
+        async fn position(&self, _: &ClusterId) -> Result<GtidPos> {
+            Ok(GtidPos::from_gtids([g(4)]))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_table_created_again_under_its_name_is_a_new_object() {
+        let ddl = |seq: u64, sql: &str| {
+            let mut t = txn(seq, vec![], None);
+            t.ddl = Some(RawDdl {
+                db: "t7_d1_g1_s1".into(),
+                sql: sql.into(),
+            });
+            t
+        };
+        let binlog = vec![
+            txn(1, vec![row(1)], None),
+            ddl(2, "DROP TABLE a"),
+            ddl(3, "CREATE TABLE a (k INT PRIMARY KEY)"),
+            txn(4, vec![row(4)], None),
+        ];
+        let seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut t = TenantTail::start(
+            T,
+            StartAt::At {
+                cluster: c1(),
+                pos: GtidPos::new(),
+            },
+            Arc::new(Watched(binlog, Arc::clone(&seen))),
+            Arc::new(Here),
+            Arc::new(Recreated(seen)),
+            TailOptions {
+                progress_every: Duration::from_millis(1),
+                ..TailOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let objects: Vec<(Op, u64)> = drain(&mut t)
+            .await
+            .into_iter()
+            .filter_map(|i| match i {
+                FeedItem::Event(e) => Some((e.op, e.object)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            objects,
+            vec![
+                (Op::Insert, 1),
+                (Op::Ddl(DdlKind::Drop), 1),
+                (Op::Ddl(DdlKind::Create), 2),
+                (Op::Insert, 2)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_group_too_large_fails_only_tails_that_read_its_tables() {
+        let mut big = txn(2, vec![], None);
+        big.overflow = Some(Box::new(crate::source::Overflow {
+            tables: vec![row(0).table],
+            rows: 6_000_000,
+            bytes: 900 << 20,
+        }));
+        let binlog = vec![txn(1, vec![row(1)], None), big, txn(3, vec![row(3)], None)];
+        let start = || StartAt::At {
+            cluster: c1(),
+            pos: GtidPos::new(),
+        };
+        let open = |reads: Option<(Vec<u64>, Vec<String>)>| {
+            let binlog = binlog.clone();
+            async move {
+                TenantTail::start(
+                    T,
+                    start(),
+                    Arc::new(Fixed(binlog)),
+                    Arc::new(Here),
+                    Arc::new(StaticResolver::new().database(T, DbId(1), "shop").object(
+                        T,
+                        DbId(1),
+                        "a",
+                        41,
+                    )),
+                    TailOptions {
+                        progress_every: Duration::from_millis(1),
+                        reads,
+                        ..TailOptions::default()
+                    },
+                )
+                .await
+                .unwrap()
+            }
+        };
+        // A tail of every table, and one of table `a` (by object id), fail
+        // at group 2 with 39800, after group 1's row.
+        for reads in [None, Some((vec![41], vec!["renamed".to_owned()]))] {
+            let mut t = open(reads).await;
+            let mut got = Vec::new();
+            let e = loop {
+                match t.next().await {
+                    Ok(i) => got.push(i),
+                    Err(e) => break e,
+                }
+            };
+            assert_eq!(keys(&got), vec![1]);
+            assert!(
+                matches!(e.kind, ErrorKind::Sprig(SprigCode::FeedHistoryLost)),
+                "{e}"
+            );
+            assert!(e.message.contains("shop.a"), "{e}");
+        }
+        // A tail of another table passes it by.
+        let mut t = open(Some((vec![99], vec!["b".to_owned()]))).await;
+        assert_eq!(keys(&drain(&mut t).await), vec![1, 3]);
     }
 
     #[tokio::test]

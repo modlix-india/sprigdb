@@ -879,13 +879,21 @@ async fn gather(
         .collect()
 }
 
+/// A column type for [`same_columns`]: MariaDB's four blob types (`TINY_BLOB`
+/// to `LONG_BLOB`, 249 to 252) as one. A shard whose join finds no row can
+/// type an expression over a blob (`WEIGHT_STRING`, the router's own sort
+/// columns) as a longer blob than a shard with rows; the values compare the
+/// same.
+const fn type_class(t: u8) -> u8 {
+    if matches!(t, 249..=252) { 252 } else { t }
+}
+
 /// Checks that a shard's columns match the first shard's.
 fn same_columns(first: &[ColumnDef], other: &[ColumnDef]) -> Result<()> {
     if first.len() != other.len()
-        || first
-            .iter()
-            .zip(other)
-            .any(|(a, b)| a.col_type != b.col_type || a.charset != b.charset)
+        || first.iter().zip(other).any(|(a, b)| {
+            type_class(a.col_type) != type_class(b.col_type) || a.charset != b.charset
+        })
     {
         return Err(rejected(
             Reason::SchemaSkew,

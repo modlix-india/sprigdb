@@ -11,6 +11,8 @@
 //! An `ALTER TABLE ... ADD INDEX ((e))` without a name also reads the
 //! table's index names, so the index gets the name MySQL would give it
 //! (`functional_index`, or the first free `functional_index_<n>`).
+//! `DROP INDEX` of a functional index also drops the hidden checks of its
+//! parts (`fxindex::FX_CHECK_PREFIX`) that no other index shares.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -35,11 +37,31 @@ impl PassSession {
             return Ok(None);
         }
         let (lex, _) = self.lex_opts();
-        // A descending index over a foreign key's columns.
+        // A descending index over a foreign key's columns, and the hidden
+        // checks of a functional index's parts.
         if let Some((table, index)) = fxindex::drop_index_target(text, &lex) {
-            return Ok(Box::pin(self.fk_desc_drop(cx, &table, &index))
+            let checks = Box::pin(self.fx_checks_of(cx, &table, &index))
                 .await
-                .unwrap_or(None));
+                .unwrap_or_default();
+            let kept = Box::pin(self.fk_desc_drop(cx, &table, &index))
+                .await
+                .unwrap_or(None);
+            if checks.is_empty() {
+                return Ok(kept);
+            }
+            let mut sql = kept.map_or_else(
+                || {
+                    format!(
+                        "ALTER TABLE {table} DROP INDEX `{}`",
+                        index.replace('`', "``")
+                    )
+                },
+                |b| String::from_utf8_lossy(&b).into_owned(),
+            );
+            for c in &checks {
+                let _ = write!(sql, ", DROP CONSTRAINT `{}`", c.replace('`', "``"));
+            }
+            return Ok(Some(Bytes::from(sql)));
         }
         // An unnamed functional index added to a table gets the first
         // name MySQL would give it that the table doesn't use.
@@ -111,6 +133,69 @@ impl PassSession {
             [d, t] => Some((lit(d), lit(t))),
             _ => None,
         }
+    }
+
+    /// The hidden checks (`fxindex::FX_CHECK_PREFIX`) of the functional
+    /// parts of index `index` of `table` (as written) that no other index of
+    /// the table has, read from MariaDB's `information_schema` on the
+    /// session's backend connection: they go with the index, as MySQL's
+    /// hidden column does. `None` when the table can't be read.
+    async fn fx_checks_of(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        table: &str,
+        index: &str,
+    ) -> Option<Vec<String>> {
+        let (lex, _) = self.lex_opts();
+        let (schema, name) = self.physical_written(table)?;
+        let lit = |v: &str| sprig_sql::names::rewrite::sql_string(v, lex.no_backslash_escapes);
+        let (schema, name) = (lit(&schema), lit(&name));
+        let parts: Vec<(String, String)> = self
+            .backend_rows(
+                cx,
+                &format!(
+                    "SELECT INDEX_NAME, COLUMN_NAME FROM information_schema.STATISTICS \
+                     WHERE TABLE_SCHEMA = {schema} AND TABLE_NAME = {name}"
+                ),
+            )
+            .await
+            .ok()?
+            .into_iter()
+            .filter_map(|r| Some((r.first()?.clone()?, r.get(1)?.clone()?)))
+            .collect();
+        let own: Vec<&String> = parts
+            .iter()
+            .filter(|(i, c)| i.eq_ignore_ascii_case(index) && fxindex::is_fx_column(c))
+            .map(|(_, c)| c)
+            .filter(|c| {
+                !parts
+                    .iter()
+                    .any(|(i, o)| !i.eq_ignore_ascii_case(index) && o.eq_ignore_ascii_case(c))
+            })
+            .collect();
+        if own.is_empty() {
+            return Some(Vec::new());
+        }
+        let checks = self
+            .backend_rows(
+                cx,
+                &format!(
+                    "SELECT CONSTRAINT_NAME FROM information_schema.CHECK_CONSTRAINTS \
+                     WHERE CONSTRAINT_SCHEMA = {schema} AND TABLE_NAME = {name}"
+                ),
+            )
+            .await
+            .ok()?;
+        Some(
+            checks
+                .into_iter()
+                .filter_map(|r| r.first()?.clone())
+                .filter(|n| {
+                    fxindex::fx_column_of_check(n)
+                        .is_some_and(|c| own.iter().any(|o| o.eq_ignore_ascii_case(&c)))
+                })
+                .collect(),
+        )
     }
 
     /// `DROP INDEX i` where `i` leads with a foreign key's columns, one of

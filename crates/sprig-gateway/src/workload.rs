@@ -797,9 +797,10 @@ pub fn start(
         flush_seconds: flive.get(&ws::FLUSH_SECONDS, &SettingCtx::process(&fdc)),
         rollup_delay_minutes: flive.get(&ws::ROLLUP_DELAY_MINUTES, &SettingCtx::process(&fdc)),
     });
-    let flusher = Arc::new(sprig_workload::flush::Flusher::new(
-        recorder, outbox, target, gw, clock, settings,
-    ));
+    let flusher = Arc::new(
+        sprig_workload::flush::Flusher::new(recorder, outbox, target, gw, clock, settings)
+            .with_gone(Arc::new(DirectoryGone(Arc::downgrade(tenants)))),
+    );
     tracing::info!(gateway_id = gw, "workload capture on");
     // The recorder's keys apply live: a change to any `workload.*` key
     // rebuilds the recorder's and the capture's settings.
@@ -822,6 +823,25 @@ pub fn start(
     });
     let task = tokio::spawn(flusher.run(shutdown));
     Ok((Arc::new(wl), Some(task)))
+}
+
+/// A tenant is gone when the directory (`tenants/<id>`) no longer has it,
+/// or has it as `deleting` or `deleted`: the flusher then drops its rows.
+struct DirectoryGone(std::sync::Weak<crate::tenant::TenantServices>);
+
+#[async_trait::async_trait]
+impl sprig_workload::flush::TenantGone for DirectoryGone {
+    async fn gone(&self, tenant: TenantId) -> bool {
+        let Some(svc) = self.0.upgrade() else {
+            return false;
+        };
+        match crate::inherited::dir_entry(&svc, tenant).await {
+            Ok(None) => true,
+            Ok(Some(e)) => matches!(e.state.as_str(), "deleting" | "deleted"),
+            // The directory can't be read: keep the rows for later.
+            Err(_) => false,
+        }
+    }
 }
 
 /// The recorder's and the capture's settings at this DC's process scopes

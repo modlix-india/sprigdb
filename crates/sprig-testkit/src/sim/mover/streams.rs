@@ -160,6 +160,7 @@ pub(super) fn shared_view(clusters: &Arc<SimClusters>) -> Arc<dyn Clusters> {
             max_catchup: 1,
             gather: Duration::from_millis(200),
             max_backlog: 4,
+            buffer_bytes: 0,
         },
     );
     feed.view(Kept::All)

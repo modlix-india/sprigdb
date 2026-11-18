@@ -12,6 +12,16 @@
 //!   `DROP INDEX functional_index` works, and the next unnamed index takes
 //!   the freed name.
 //!
+//! - values MySQL's strict hidden column refuses and MariaDB only warns
+//!   about: `CAST(s AS CHAR(2))` of a longer value and `CAST(s AS SIGNED)`
+//!   of text that isn't an integer, in `INSERT` with and without a column
+//!   list, `INSERT ... SET`, `REPLACE` and `UPDATE`, as text and prepared,
+//!   answer 3751 naming the index and write nothing; values MySQL takes
+//!   (spaces around an integer, one above 2^63 - 1) are written; the hidden
+//!   check shows nowhere; `CREATE INDEX` over a row it refuses answers
+//!   3751; dropping or renaming the cast column answers 3837; after `DROP
+//!   INDEX` the longer value is written.
+//!
 //! The expected answers were captured from MySQL 8.4.11; the test passes
 //! against it too (`SPRIG_TEST_FX_URL=mysql://root:<pw>@127.0.0.1:<port>`).
 //!
@@ -175,5 +185,173 @@ async fn functional_indexes_as_mysql_answers_them() {
         vec!["dx", "functional_index", "functional_index_2", "PRIMARY"]
     );
     c.query_drop(format!("DROP DATABASE {DB}")).await.unwrap();
+    c.disconnect().await.unwrap();
+}
+
+/// MySQL's 3751 for functional index `index`, at row 1.
+fn truncated(index: &str) -> (u16, String, String) {
+    (
+        3751,
+        "01000".to_owned(),
+        format!("Data truncated for functional index '{index}' at row 1"),
+    )
+}
+
+#[tokio::test]
+async fn casts_mysql_refuses_are_refused() {
+    let Ok(url) = std::env::var("SPRIG_TEST_FX_URL") else {
+        eprintln!("skipped: SPRIG_TEST_FX_URL is not set");
+        return;
+    };
+    let db = "fx_live_cast";
+    let mut c = Conn::new(Opts::from_url(&url).expect("url"))
+        .await
+        .expect("login");
+    c.query_drop(format!("DROP DATABASE IF EXISTS {db}"))
+        .await
+        .unwrap();
+    c.query_drop(format!("CREATE DATABASE {db}")).await.unwrap();
+    c.query_drop(format!("USE {db}")).await.unwrap();
+    c.query_drop(
+        "CREATE TABLE tc (id INT PRIMARY KEY, s VARCHAR(20), INDEX i ((CAST(s AS CHAR(2)))))",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "CREATE TABLE ts (id INT PRIMARY KEY, s VARCHAR(30), INDEX ((CAST(s AS SIGNED))))",
+    )
+    .await
+    .unwrap();
+
+    // CHAR(2): every statement form, text and prepared.
+    for q in [
+        "INSERT INTO tc VALUES (1, 'abc')",
+        "INSERT INTO tc (id, s) VALUES (1, 'abc')",
+        "INSERT INTO tc SET id = 1, s = 'abc'",
+        "REPLACE INTO tc VALUES (1, 'abc')",
+        "INSERT INTO tc VALUES (1, 'ab ')",
+    ] {
+        assert_eq!(server_error(c.query_drop(q).await), truncated("i"), "{q}");
+    }
+    assert_eq!(
+        server_error(
+            c.exec_drop("INSERT INTO tc VALUES (?, ?)", (1, "abc"))
+                .await
+        ),
+        truncated("i")
+    );
+    c.query_drop("INSERT INTO tc VALUES (2, 'ab'), (3, NULL)")
+        .await
+        .unwrap();
+    assert_eq!(
+        server_error(c.query_drop("UPDATE tc SET s = 'abcd' WHERE id = 2").await),
+        truncated("i")
+    );
+    assert_eq!(
+        server_error(
+            c.exec_drop("UPDATE tc SET s = ? WHERE id = ?", ("xyz", 2))
+                .await
+        ),
+        truncated("i")
+    );
+    let rows: Vec<(i32, Option<String>)> =
+        c.query("SELECT id, s FROM tc ORDER BY id").await.unwrap();
+    assert_eq!(rows, vec![(2, Some("ab".to_owned())), (3, None)]);
+
+    // SIGNED of text: integers between spaces, from -2^63 to 2^64 - 1.
+    for (id, v) in [
+        (1, "abc"),
+        (2, "1.5"),
+        (3, ""),
+        (4, "-9223372036854775809"),
+        (5, "1e3"),
+    ] {
+        assert_eq!(
+            server_error(c.exec_drop("INSERT INTO ts VALUES (?, ?)", (id, v)).await),
+            truncated("functional_index"),
+            "{v:?}"
+        );
+    }
+    assert_eq!(
+        server_error(c.query_drop("INSERT INTO ts VALUES (6, '12abc')").await),
+        truncated("functional_index")
+    );
+    for (id, v) in [
+        (7, " 12 "),
+        (8, "-7"),
+        (9, "9223372036854775808"),
+        (10, "00012"),
+    ] {
+        c.exec_drop("INSERT INTO ts VALUES (?, ?)", (id, v))
+            .await
+            .unwrap_or_else(|e| panic!("{v:?}: {e}"));
+    }
+    let n: Option<i64> = c.query_first("SELECT COUNT(*) FROM ts").await.unwrap();
+    assert_eq!(n, Some(4));
+
+    // The check shows nowhere.
+    for t in ["tc", "ts"] {
+        let (_, create): (String, String) = c
+            .query_first(format!("SHOW CREATE TABLE {t}"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!create.contains("_sprig_"), "{create}");
+        assert!(!create.contains("CONSTRAINT"), "{create}");
+    }
+    let checks: Vec<String> = c
+        .query(format!(
+            "SELECT CONSTRAINT_NAME FROM information_schema.CHECK_CONSTRAINTS \
+             WHERE CONSTRAINT_SCHEMA = '{db}'"
+        ))
+        .await
+        .unwrap();
+    assert!(checks.is_empty(), "{checks:?}");
+    let constraints: Vec<(String, String)> = c
+        .query(format!(
+            "SELECT CONSTRAINT_NAME, CONSTRAINT_TYPE FROM information_schema.TABLE_CONSTRAINTS \
+             WHERE TABLE_SCHEMA = '{db}' ORDER BY TABLE_NAME"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        constraints,
+        vec![
+            ("PRIMARY".to_owned(), "PRIMARY KEY".to_owned()),
+            ("PRIMARY".to_owned(), "PRIMARY KEY".to_owned())
+        ]
+    );
+
+    // The cast column can't be dropped or renamed.
+    for q in [
+        "ALTER TABLE ts DROP COLUMN s",
+        "ALTER TABLE ts RENAME COLUMN s TO s2",
+    ] {
+        assert_eq!(
+            server_error(c.query_drop(q).await),
+            (
+                3837,
+                "HY000".to_owned(),
+                "Column 's' has a functional index dependency and cannot be dropped or renamed."
+                    .to_owned()
+            ),
+            "{q}"
+        );
+    }
+
+    // Dropping the index lets the longer value in; an index over a row
+    // it refuses isn't made.
+    c.query_drop("DROP INDEX i ON tc").await.unwrap();
+    c.query_drop("INSERT INTO tc VALUES (4, 'abcdef')")
+        .await
+        .unwrap();
+    assert_eq!(
+        server_error(
+            c.query_drop("CREATE INDEX i2 ON tc ((CAST(s AS CHAR(3))))")
+                .await
+        ),
+        truncated("i2")
+    );
+    c.query_drop(format!("DROP DATABASE {db}")).await.unwrap();
     c.disconnect().await.unwrap();
 }

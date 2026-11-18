@@ -1307,7 +1307,7 @@ async fn open_change_stream(
     let stream = feed
         .open(spec, resume.as_ref())
         .await
-        .inspect_err(super::status::stream_error)?;
+        .inspect_err(|e| super::status::stream_error(owner(c).tenant, e))?;
     let token = stream.token.clone();
     let ns = if coll.is_empty() {
         format!("{db}.$cmd.aggregate")
@@ -1329,8 +1329,9 @@ async fn open_change_stream(
         c.shared.settings().max_cursors,
     )?;
     // MongoDB 9.0's option counters; the (empty) first batch.
-    super::status::stream_options(stage, body);
-    super::status::stream_returned(&[]);
+    let tenant = owner(c).tenant;
+    super::status::stream_options(tenant, stage, body);
+    super::status::stream_returned(tenant, &[]);
     Ok(
         doc! {"cursor": {"firstBatch": [], "postBatchResumeToken": token_doc(&token), "id": id, "ns": ns}, "ok": 1.0},
     )
@@ -1759,7 +1760,7 @@ async fn exec_cmd(
             }
             CursorTable::touch(cursor);
             if let Some(st) = cursor.stream.as_mut() {
-                super::status::stream_get_more(body);
+                super::status::stream_get_more(owner(c).tenant, body);
                 // A change stream: wait up to maxTimeMS for events.
                 let wait = Duration::from_millis(
                     i64_of(body, "maxTimeMS")
@@ -1794,14 +1795,14 @@ async fn exec_cmd(
                          the new policies",
                     )
                     .label("ResumableChangeStreamError");
-                    super::status::stream_error(&e);
+                    super::status::stream_error(owner(c).tenant, &e);
                     return Err(e);
                 }
                 let batch = match r {
                     Ok(b) => b,
                     Err(e) => {
                         c.shared.cursors.remove(id);
-                        super::status::stream_error(&e);
+                        super::status::stream_error(owner(c).tenant, &e);
                         return Err(e);
                     }
                 };
@@ -1811,7 +1812,7 @@ async fn exec_cmd(
                 } else {
                     id
                 };
-                super::status::stream_returned(&batch);
+                super::status::stream_returned(owner(c).tenant, &batch);
                 return Ok(
                     doc! {"cursor": {"nextBatch": batch.into_iter().map(Bson::Document).collect::<Vec<_>>(), "postBatchResumeToken": super::changes::token_doc(&token), "id": rid, "ns": ns}, "ok": 1.0},
                 );

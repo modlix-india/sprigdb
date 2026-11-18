@@ -1845,3 +1845,298 @@ fn conn_pairs(r: &[u8]) -> Vec<(String, String)> {
     v.sort();
     v
 }
+
+/// `sprigctl -o json <args>` against the deployment's Admin API.
+fn sprigctl(ctl: &str, admin: u16, args: &[&str]) -> Result<serde_json::Value, String> {
+    let out = std::process::Command::new(ctl)
+        .args([
+            "--endpoint",
+            &format!("http://127.0.0.1:{admin}"),
+            "-o",
+            "json",
+        ])
+        .args(args)
+        .env("SPRIGCTL_ACTOR", "diff_live")
+        .output()
+        .map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    if !out.status.success() {
+        return Err(format!(
+            "sprigctl {args:?}: {text}{}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
+}
+
+/// The shards of the Redis database's group (`(shard, cluster)`), if any.
+fn kv_shards(ctl: &str, admin: u16, tenant: &str) -> Option<(u64, Vec<(u64, String)>)> {
+    let l = sprigctl(ctl, admin, &["shard", "list", tenant]).ok()?;
+    let g = l
+        .as_array()?
+        .iter()
+        .find(|g| g["name"].as_str().is_some_and(|n| n.contains("db0")))?;
+    Some((
+        g["group"].as_u64()?,
+        g["shards"]
+            .as_array()?
+            .iter()
+            .filter_map(|s| {
+                Some((
+                    s["shard"].as_u64()?,
+                    s["cluster"].as_str().unwrap_or_default().to_owned(),
+                ))
+            })
+            .collect(),
+    ))
+}
+
+async fn wait_kv_shards(
+    ctl: &str,
+    admin: u16,
+    tenant: &str,
+    what: &str,
+    done: impl Fn(&[(u64, String)]) -> bool,
+) -> (u64, Vec<(u64, String)>) {
+    let t0 = std::time::Instant::now();
+    loop {
+        if let Some((g, s)) = kv_shards(ctl, admin, tenant)
+            && done(&s)
+        {
+            eprintln!("{what}: group {g} shards {s:?} after {:?}", t0.elapsed());
+            return (g, s);
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(900),
+            "{what} never happened: {:?}",
+            sprigctl(ctl, admin, &["shard", "list", tenant])
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Rows of each of the Redis database's SQL views, and one key's hash.
+async fn view_counts(c: &mut mysql_async::Conn) -> Vec<String> {
+    let mut out = Vec::new();
+    for v in ["db0__hash", "db0__list", "db0__set", "db0__zset"] {
+        let n: Option<u64> = c
+            .query_first(format!("SELECT COUNT(*) FROM redis.{v}"))
+            .await
+            .unwrap_or_else(|e| panic!("{v}: {e}"));
+        out.push(format!("{v} {}", n.unwrap_or(0)));
+    }
+    let rows: Vec<(String, String)> = c
+        .query(
+            "SELECT field, CAST(value AS CHAR) FROM redis.db0__hash \
+             WHERE k = 'shard:h:7' ORDER BY field",
+        )
+        .await
+        .unwrap();
+    out.push(format!("shard:h:7 {rows:?}"));
+    out
+}
+
+/// A Redis database with data, sharded by a pin: the advisor groups its
+/// tables on `_sprig_dk` although the gateway made SQL views over them
+/// (stored code holds the tables it names, but not a namespace's own
+/// views), the group is split (and one shard moved, with
+/// `..._MOVE_TO`), the data and the views read the same as before, and
+/// the command corpus still matches Redis on it.
+///
+/// - `SPRIG_TEST_REDIS_SPRIG` and `SPRIG_TEST_REDIS_REF` as above, the
+///   login's tenant new and holding nothing (its Redis database is
+///   flushed);
+/// - `SPRIG_TEST_REDIS_SHARD=<MySQL port>,<Admin API port>` of the same
+///   deployment, `SPRIG_TEST_REDIS_SHARD_SPRIGCTL=<path to sprigctl>`;
+/// - optional `SPRIG_TEST_REDIS_SHARD_MOVE_TO=<cluster>`, where one shard
+///   moves.
+///
+/// The tenant's settings `advisor.min_ndv_per_shard` and
+/// `sharding.min_shards` change; delete the tenant afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::many_single_char_names)]
+async fn sharded_by_a_pin_still_matches_redis() {
+    let (Some(refaddr), Some(url), Some(shard), Some(ctl)) = (
+        var("SPRIG_TEST_REDIS_REF"),
+        var("SPRIG_TEST_REDIS_SPRIG"),
+        var("SPRIG_TEST_REDIS_SHARD"),
+        var("SPRIG_TEST_REDIS_SHARD_SPRIGCTL"),
+    ) else {
+        eprintln!(
+            "SPRIG_TEST_REDIS_REF, SPRIG_TEST_REDIS_SPRIG, SPRIG_TEST_REDIS_SHARD or \
+             SPRIG_TEST_REDIS_SHARD_SPRIGCTL not set: skipped"
+        );
+        return;
+    };
+    let (mysql, admin) = shard.split_once(',').expect("<mysql port>,<admin port>");
+    let mysql: u16 = mysql.trim().parse().unwrap();
+    let admin: u16 = admin.trim().parse().unwrap();
+    let (user, pass) = creds_of(&url);
+    let tenant = user
+        .split_once('.')
+        .map_or(user.as_str(), |x| x.0)
+        .to_owned();
+    let host = host_of(&url);
+    let host = host
+        .rsplit_once(':')
+        .map_or(host.as_str(), |x| x.0)
+        .to_owned();
+    let mut r = conn(&format!("redis://{refaddr}")).await;
+    let mut s = conn(&url).await;
+    run(&mut r, &["FLUSHALL"]).await.unwrap();
+    run(&mut s, &["FLUSHALL"]).await.unwrap();
+
+    // Data of every type, on both servers.
+    let n = 400;
+    let mut cmds: Vec<Vec<String>> = Vec::new();
+    for i in 0..n {
+        let v = |x: &str| x.to_owned();
+        cmds.push(vec![v("SET"), format!("shard:s:{i}"), format!("v{i}")]);
+        cmds.push(vec![
+            v("SET"),
+            format!("{{tag{}}}:s:{i}", i % 7),
+            format!("t{i}"),
+        ]);
+        let mut h = vec![v("HSET"), format!("shard:h:{i}")];
+        let mut l = vec![v("RPUSH"), format!("shard:l:{i}")];
+        let mut st = vec![v("SADD"), format!("shard:set:{i}")];
+        let mut z = vec![v("ZADD"), format!("shard:z:{i}")];
+        for j in 0..5 {
+            h.extend([format!("f{j}"), format!("{i}-{j}")]);
+            l.push(format!("i{j}"));
+            st.push(format!("m{j}"));
+            z.extend([format!("{}", i * 10 + j), format!("z{j}")]);
+        }
+        cmds.extend([h, l, st, z]);
+    }
+    cmds.push(vec![
+        "ZADD".into(),
+        "shard:zinf".into(),
+        "+inf".into(),
+        "top".into(),
+    ]);
+    for chunk in cmds.chunks(64) {
+        for c in [&mut s, &mut r] {
+            let mut p = redis::pipe();
+            for x in chunk {
+                let mut q = redis::cmd(&x[0]);
+                for a in &x[1..] {
+                    q.arg(a);
+                }
+                p.add_command(q);
+            }
+            let _: Vec<Value> = p.query_async(c).await.unwrap();
+        }
+    }
+    let before = dump(&mut s).await;
+    assert_eq!(
+        before,
+        dump(&mut r).await,
+        "the data differs before sharding"
+    );
+
+    let mut my = mysql_async::Conn::new(
+        mysql_async::OptsBuilder::default()
+            .ip_or_hostname(host.clone())
+            .tcp_port(mysql)
+            .user(Some(user.clone()))
+            .pass(Some(pass.clone())),
+    )
+    .await
+    .unwrap();
+    let views_before = view_counts(&mut my).await;
+    eprintln!("views before: {views_before:?}");
+    assert_eq!(views_before[0], format!("db0__hash {}", n * 5));
+
+    // The pin, then the advisor.
+    my.query_drop("SPRIG PIN redis.db0 SHARD KEY (_sprig_dk)")
+        .await
+        .unwrap();
+    for (k, v) in [
+        ("advisor.min_ndv_per_shard", "0"),
+        ("sharding.min_shards", "2"),
+    ] {
+        sprigctl(
+            &ctl,
+            admin,
+            &[
+                "settings",
+                "set",
+                k,
+                v,
+                "--scope",
+                &format!("tenant:{tenant}"),
+                "--reason",
+                "diff_live",
+                "--yes",
+            ],
+        )
+        .unwrap();
+    }
+    if kv_shards(&ctl, admin, &tenant).is_none() {
+        let ran = sprigctl(&ctl, admin, &["advisor", "run", &tenant]).unwrap();
+        eprintln!("advisor run: {ran}");
+        if ran["applied_hold_ms"].is_null()
+            && let Some(id) = ran["run"].as_u64()
+        {
+            let applied = sprigctl(&ctl, admin, &["advisor", "apply", &tenant, &id.to_string()]);
+            eprintln!("advisor apply: {applied:?}");
+        }
+    }
+    let (gid, sh) = wait_kv_shards(&ctl, admin, &tenant, "regroup", |s| !s.is_empty()).await;
+    let g = gid.to_string();
+    if sh.len() < 2 {
+        let first = sh[0].0.to_string();
+        sprigctl(&ctl, admin, &["shard", "split", &tenant, &g, &first]).unwrap();
+        wait_kv_shards(&ctl, admin, &tenant, "split", |s| s.len() >= 2).await;
+    }
+    if let Some(to) = var("SPRIG_TEST_REDIS_SHARD_MOVE_TO") {
+        let (_, sh) = kv_shards(&ctl, admin, &tenant).unwrap();
+        let last = sh.last().unwrap().0;
+        sprigctl(
+            &ctl,
+            admin,
+            &["shard", "move", &tenant, &g, &last.to_string(), "--to", &to],
+        )
+        .unwrap();
+        // The moved range gets a new shard id on its new cluster.
+        wait_kv_shards(&ctl, admin, &tenant, "move", |s| {
+            s.iter().any(|x| x.1 == to) && !s.iter().any(|x| x.0 == last)
+        })
+        .await;
+    }
+
+    // Nothing held it: the evidence names no stored code for db0.
+    let shown = sprigctl(&ctl, admin, &["advisor", "show", &tenant]).unwrap();
+    let notes = shown["evidence"]["notes"].to_string();
+    eprintln!("advisor evidence: {notes}");
+    assert!(
+        !notes.contains("db0: stays unsharded because stored code"),
+        "{notes}"
+    );
+    // The same data and views, now read from the shards.
+    let after = dump(&mut s).await;
+    assert_eq!(after.len(), before.len());
+    assert_eq!(after, before, "the data changed while it was sharded");
+    let views_after = view_counts(&mut my).await;
+    eprintln!("views after: {views_after:?}");
+    assert_eq!(views_after, views_before);
+    drop(my);
+
+    // The command corpus on the sharded database.
+    run(&mut r, &["FLUSHALL"]).await.unwrap();
+    run(&mut s, &["FLUSHALL"]).await.unwrap();
+    let cmds = split(CORPUS);
+    let bad = compare(&mut s, &mut r, &cmds).await;
+    for b in &bad {
+        eprintln!("MISMATCH {b}");
+    }
+    eprintln!(
+        "corpus on the sharded database: {} commands, {} mismatches",
+        cmds.len(),
+        bad.len()
+    );
+    run(&mut s, &["FLUSHALL"]).await.unwrap();
+    run(&mut r, &["FLUSHALL"]).await.unwrap();
+    assert!(bad.is_empty(), "{} of {} differ", bad.len(), cmds.len());
+}

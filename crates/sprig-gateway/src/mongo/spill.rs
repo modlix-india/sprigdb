@@ -183,7 +183,7 @@ pub fn ctx_for(
         None | Some(Bson::Null) => default,
         Some(Bson::Boolean(b)) => {
             if !*b {
-                sprig_doc::spill::note_disallowed();
+                sprig_doc::spill::note_disallowed(tenant);
             }
             *b
         }

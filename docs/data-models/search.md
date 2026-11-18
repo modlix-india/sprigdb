@@ -276,7 +276,7 @@ SELECT id FROM articles WHERE MATCH (title, body) AGAINST ('tutorial' WITH QUERY
 
 - A table without any search index keeps MariaDB's own `FULLTEXT` behaviour.
 - A table with search indexes, none of which covers the `MATCH` columns, fails with 39821.
-- `MATCH ... AGAINST (?)` works in statements your driver prepares (server-side prepared statements). In a text statement, `AGAINST` needs a string literal (39823 otherwise). A search statement prepared in SQL, with `PREPARE` or `EXECUTE IMMEDIATE`, isn't supported yet: it fails with MariaDB's error 1191, even with a string literal.
+- `MATCH ... AGAINST (?)` works in statements your driver prepares, and in statements prepared in SQL (`PREPARE ... FROM`, then `EXECUTE ... USING`) or run with `EXECUTE IMMEDIATE ... USING`. In a plain text statement, `AGAINST` needs a string literal (39823 otherwise).
 - As a condition, `MATCH` needs every match, up to `search.max_window` (10,000); more fails with 39827. Statements that ask only for the best rows are the exception; see [Top results](#top-results).
 - Scores are BM25 scores, so their values differ from MariaDB's relevance values. The order is usually similar.
 

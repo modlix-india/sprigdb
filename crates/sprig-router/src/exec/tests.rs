@@ -557,3 +557,17 @@ async fn scatters_stream_from_parallel_shards_with_offset_and_limit() {
             .is_err()
     );
 }
+
+#[test]
+fn blob_sizes_are_one_column_type() {
+    let blob = |t: u8| ColumnDef {
+        name: Bytes::from_static(b"w"),
+        charset: 63,
+        col_type: t,
+        ..ColumnDef::default()
+    };
+    assert!(same_columns(&[blob(252)], &[blob(251)]).is_ok());
+    assert!(same_columns(&[blob(249)], &[blob(250)]).is_ok());
+    assert!(same_columns(&[blob(252)], &[bin_col("w")]).is_err());
+    assert!(same_columns(&[int_col("a")], &[str_col("a")]).is_err());
+}

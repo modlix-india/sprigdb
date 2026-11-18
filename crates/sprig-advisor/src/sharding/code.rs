@@ -24,8 +24,13 @@
 //!
 //! Row-level security's own objects (`__sprig_rls*`: policy views, their
 //! context function and write-check triggers) move with their table at the
-//! regroup and are not counted. [`conflicts`] checks a
-//! stored design against the code that exists when it is applied.
+//! regroup and are not counted. Neither are a key-value namespace's own
+//! views (`<ns>__hash`, `__list`, `__set`, `__zset` over its key and
+//! element tables, [`kv_view`]): they join a key's rows, which all sit on
+//! the key's shard, so the regroup moves them with their tables, the mover
+//! copies them into every shard, and the router reads them shard by shard.
+//! [`conflicts`] checks a stored design against the code that exists when
+//! it is applied.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -198,6 +203,56 @@ pub struct CodeRules {
     pub couples: Vec<(Obj, Obj, String)>,
 }
 
+/// The suffixes of a key-value namespace's views (`sprig_kv::api::view_ddl`).
+pub const KV_VIEW_SUFFIXES: [&str; 4] = ["__hash", "__list", "__set", "__zset"];
+
+/// The key table of a key-value namespace's view name `<ns>__hash`,
+/// `__list`, `__set` or `__zset` (the name only).
+#[must_use]
+pub fn kv_view_key(name: &str) -> Option<&str> {
+    KV_VIEW_SUFFIXES.iter().find_map(|s| {
+        let cut = name.len().checked_sub(s.len()).filter(|n| *n > 0)?;
+        (name.is_char_boundary(cut) && name[cut..].eq_ignore_ascii_case(s)).then(|| &name[..cut])
+    })
+}
+
+/// Whether `c` is one of a key-value namespace's own views: named
+/// `<ns>__hash`, `__list`, `__set` or `__zset`, joining the key table
+/// `<ns>` with its element tables (`__sprig_ke_<ns>`, `__sprig_kz_<ns>`)
+/// and naming nothing else, all in the view's own schema, without dynamic
+/// SQL.
+/// The gateway makes them over every namespace and their names are
+/// reserved while it exists.
+#[must_use]
+pub fn kv_view(c: &StoredCode) -> bool {
+    if c.kind != CodeKind::View {
+        return false;
+    }
+    let Some(key) = kv_view_key(&c.name) else {
+        return false;
+    };
+    let refs = references(&c.text, &lex_for(&c.sql_mode));
+    if refs.opaque || refs.tables.is_empty() {
+        return false;
+    }
+    let own = |t: &str| {
+        t.eq_ignore_ascii_case(key)
+            || crate::sharding::input::kv_key_table(t).is_some_and(|k| k.eq_ignore_ascii_case(key))
+    };
+    let (mut names_key, mut names_elements) = (false, false);
+    for (s, t) in &refs.tables {
+        if s.as_deref()
+            .is_some_and(|s| !s.eq_ignore_ascii_case(&c.schema))
+            || !own(t)
+        {
+            return false;
+        }
+        names_key |= t.eq_ignore_ascii_case(key);
+        names_elements |= !t.eq_ignore_ascii_case(key);
+    }
+    names_key && names_elements
+}
+
 fn lex_for(sql_mode: &str) -> LexOptions {
     let up = sql_mode.to_ascii_uppercase();
     LexOptions::mariadb()
@@ -242,7 +297,7 @@ pub fn rules(code: &[StoredCode], located: &[Located]) -> CodeRules {
     };
     let mut couples: Vec<(Obj, Obj, String)> = Vec::new();
     for c in code {
-        if c.name.to_ascii_lowercase().starts_with("__sprig_rls") {
+        if c.name.to_ascii_lowercase().starts_with("__sprig_rls") || kv_view(c) {
             continue;
         }
         let refs = references(&c.text, &lex_for(&c.sql_mode));
@@ -532,6 +587,63 @@ mod tests {
         assert!(r.held[&2].iter().any(|w| w == "event ev names it"));
         assert_eq!(r.couples.len(), 1);
         assert_eq!((r.couples[0].0, r.couples[0].1), (4, 3));
+    }
+
+    #[test]
+    fn key_value_views_hold_nothing() {
+        let mut l = located();
+        l.extend([
+            at(6, "db0"),
+            at(7, "__sprig_ke_db0"),
+            at(8, "__sprig_kz_db0"),
+        ]);
+        // As `information_schema.VIEWS` gives `sprig_kv::api::view_ddl`'s views.
+        let hash = "select `t`.`k` AS `k`,`e`.`e` AS `field`,`e`.`v` AS `value` from \
+                    (`t9_d1_g1_s1`.`db0` `t` join `t9_d1_g1_s1`.`__sprig_ke_db0` `e` \
+                    on(`e`.`k` = `t`.`k` and `e`.`g` = `t`.`g`)) where `t`.`type` = 'hash' \
+                    and (`t`.`expires_at` is null or `t`.`expires_at` > utc_timestamp(3))";
+        let zset = "select `t`.`k` AS `k`,`z`.`m` AS `member`,if(`z`.`c` = 0,`z`.`score`,NULL) \
+                    AS `score`,`z`.`c` AS `score_class` from (`t9_d1_g1_s1`.`db0` `t` join \
+                    `t9_d1_g1_s1`.`__sprig_kz_db0` `z` on(`z`.`k` = `t`.`k` and `z`.`g` = `t`.`g`)) \
+                    where `t`.`type` = 'zset'";
+        let mut c = vec![
+            code(CodeKind::View, "db0__hash", None, hash),
+            code(CodeKind::View, "DB0__ZSET", None, zset),
+        ];
+        assert!(c.iter().all(kv_view));
+        assert!(rules(&c, &l).held.is_empty());
+        // A view of that name reading another table, another namespace's
+        // tables or another schema's is the client's: it holds.
+        c.push(code(
+            CodeKind::View,
+            "db0__set",
+            None,
+            "select `k` from `t9_d1_g1_s1`.`db0` join `t9_d1_g1_s1`.`cust`",
+        ));
+        c.push(code(
+            CodeKind::View,
+            "db0__list",
+            None,
+            "select `k` from `t9_d1_g1_s1`.`__sprig_ke_db1`",
+        ));
+        c.push(code(
+            CodeKind::View,
+            "db0__list2",
+            None,
+            "select `k` from `t9_d1_g1_s1`.`db0`",
+        ));
+        c.push(code(
+            CodeKind::Procedure,
+            "db0__hash",
+            None,
+            "SELECT k FROM db0",
+        ));
+        assert_eq!(c.iter().filter(|x| kv_view(x)).count(), 2);
+        let r = rules(&c, &l);
+        assert_eq!(r.held.keys().copied().collect::<Vec<_>>(), vec![3, 6]);
+        assert_eq!(kv_view_key("cache__hash"), Some("cache"));
+        assert_eq!(kv_view_key("__hash"), None);
+        assert_eq!(kv_view_key("x__zsets"), None);
     }
 
     #[test]

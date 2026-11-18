@@ -811,9 +811,16 @@ async fn raw_empty_password_is_one_nul() {
 }
 
 /// A failure delay that runs past `gateway.handshake_timeout_ms`
-/// still ends with the ERR packet: the deadline moves back by the delay.
-/// Before, the gateway dropped the connection and clients reported "2013
-/// Lost connection" once a name's delays grew past the timeout.
+/// still ends with the ERR packet: the deadline counts only the client's
+/// time. Before, the gateway dropped the connection and clients reported
+/// "2013 Lost connection" once a name's delays grew past the timeout.
+///
+/// The first attempt is the process's first plain-TCP login, which waits
+/// for the generated RSA key (seconds in a debug build on a slow machine).
+/// That wait counted toward the deadline too, and on a CI runner it cut the
+/// login off with no packet at all; it is the gateway's wait now, as the
+/// delays are (`sprig_auth::login_waits` has the timing cases on a paused
+/// clock).
 #[tokio::test]
 async fn delayed_refusals_outlast_the_handshake_timeout() {
     let gw = Gateway::start(TlsMode::Off).await;
@@ -833,8 +840,10 @@ async fn delayed_refusals_outlast_the_handshake_timeout() {
         let t = Instant::now();
         let (p, _) = raw_empty_login(addr, "ghost").await;
         took = t.elapsed();
+        eprintln!("attempt {attempt}: {took:?}");
         assert_eq!(err_code(&p.payload), Some(1045), "attempt {attempt}");
     }
+    // The last refusal outlived the 1.5 s deadline by its 2 s delay.
     assert!(took >= Duration::from_millis(1900), "{took:?}");
     gw.stop().await;
 }

@@ -6,9 +6,10 @@
 //!   login.
 //! - `SPRIG_TEST_MONGO_REF_URI`: a private MongoDB 8.0.
 //!
-//! A `$**` index's copy doesn't index `_id`, so a document that only
-//! its string `_id` matches isn't found (MongoDB finds it); when another
-//! field matches, the `_id` counts in the score as on MongoDB.
+//! The `$**` collection also checks what such an index covers: a string
+//! `_id` and a document `_id`'s strings (a document only they match is
+//! found), not an object id `_id`, and not the language override
+//! (`language`, at any level).
 //!
 //! Skipped unless both are set. Uses the database `text_score_live` on
 //! both and drops it at the end.
@@ -22,7 +23,7 @@
 )]
 
 use futures_util::TryStreamExt;
-use mongodb::bson::{Bson, Document, doc};
+use mongodb::bson::{Bson, Document, doc, oid::ObjectId};
 use mongodb::{Client, Database};
 
 fn uri(var: &str) -> Option<String> {
@@ -68,6 +69,11 @@ fn corpus() -> Vec<(&'static str, Document, Document, Vec<Document>)> {
         doc! {"_id": 1, "a": "shoe", "n": {"b": "red shoe"}, "language": "english"},
         doc! {"_id": 2, "n": [{"b": "shoe"}, {"b": "fox shoe"}]},
         doc! {"_id": "shoe", "a": "red shoe"},
+        doc! {"_id": "zebra crossing", "a": "x"},
+        doc! {"_id": {"k": "walrus tusk"}, "a": "y"},
+        doc! {"_id": ObjectId::parse_str("65a1b2c3d4e5f60718293a4b").unwrap(), "a": "plum"},
+        doc! {"_id": 9, "a": "kiwi", "language": "english"},
+        doc! {"_id": 10, "n": {"language": "english", "b": "kiwi fruit"}},
     ];
     vec![
         ("plain", doc! {"t": "text"}, doc! {}, plain),
@@ -86,7 +92,7 @@ fn corpus() -> Vec<(&'static str, Document, Document, Vec<Document>)> {
     ]
 }
 
-const SEARCHES: [&str; 12] = [
+const SEARCHES: [&str; 16] = [
     "shoe",
     "shoe red",
     "\"red shoe\"",
@@ -99,6 +105,10 @@ const SEARCHES: [&str; 12] = [
     "numbers 42 under_score",
     "the",
     "zebra",
+    "walrus",
+    "65a1b2c3d4e5f60718293a4b",
+    "english",
+    "kiwi",
 ];
 
 async fn scores(db: &Database, coll: &str, q: &str) -> Vec<(String, f64)> {

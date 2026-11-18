@@ -527,6 +527,9 @@ pub struct Engine {
     /// Text and search indexes; `None`: `$text` and `$search`
     /// are refused.
     pub text: Option<Arc<dyn crate::text::TextSearch>>,
+    /// Background upkeep of vector side tables; `None`: done in the
+    /// caller's session.
+    pub vectors: Option<Arc<dyn vectors::VectorSides>>,
 }
 
 impl Default for Engine {
@@ -569,6 +572,7 @@ impl Engine {
             cfg,
             catalog,
             text: None,
+            vectors: None,
         }
     }
 
@@ -576,6 +580,13 @@ impl Engine {
     #[must_use]
     pub fn with_text(mut self, t: Arc<dyn crate::text::TextSearch>) -> Self {
         self.text = Some(t);
+        self
+    }
+
+    /// With the gateway's background upkeep of vector side tables.
+    #[must_use]
+    pub fn with_vector_sides(mut self, v: Arc<dyn vectors::VectorSides>) -> Self {
+        self.vectors = Some(v);
         self
     }
 
@@ -692,6 +703,9 @@ impl Engine {
             meta::create_table_sql(&ns.db, &table)
         };
         sql.exec(&ddl).await.map_err(|e| mongo_error(&e))?;
+        // Search indexes a dropped collection of this name left (dropped
+        // before they went with it) aren't this one's.
+        self.forget_search_indexes(sql, ns, &table).await;
         let mut uuid = [0u8; 16];
         uuid[..12].copy_from_slice(&ObjectId::new().bytes());
         uuid[12..].copy_from_slice(
@@ -749,8 +763,9 @@ impl Engine {
         ))
         .await
         .map_err(|e| mongo_error(&e))?;
-        // The vector indexes' side tables.
-        self.drop_vector_sides(sql, ns, &m.table, None).await;
+        // Its search indexes: the vector indexes' side tables and every
+        // definition (Atlas drops them with the collection).
+        self.forget_search_indexes(sql, ns, &m.table).await;
         // A capped collection's totals row.
         if capped::Cap::of(&m.options).is_some() {
             capped::forget(sql, &ns.db, &m.uuid).await;
@@ -2545,6 +2560,10 @@ impl Engine {
         ))
         .await
         .map_err(|e| mongo_error(&e))?;
+        // Its vector indexes go with it (their side tables are built again
+        // for the new name).
+        self.rename_search_indexes(sql, from, to, (&m.table, &table))
+            .await;
         m.table = table;
         self.catalog.rename(sql, from, to, &m).await?;
         Ok(())
@@ -3450,3 +3469,6 @@ pub mod fusion;
 /// `$near`, `$geoNear`, `2dsphere` columns, search indexes and
 /// `$vectorSearch`.
 pub mod models;
+
+/// Upkeep of vector side tables.
+pub mod vectors;

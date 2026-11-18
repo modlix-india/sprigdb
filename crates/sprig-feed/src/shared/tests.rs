@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 
-use sprig_binlog::RowImage;
+use sprig_binlog::{RowImage, Value};
 
 use super::*;
 use crate::source::{RawDdl, RawRow, RowKind, TableShape};
@@ -966,4 +966,82 @@ async fn a_catch_up_joins_the_hub_without_gaps_or_duplicates_under_load() {
         1,
         "only the hub's dump is open"
     );
+}
+
+/// A group too large to hold reaches each tenant with only the tables of
+/// its own it touched, and each view with the tables it keeps.
+#[test]
+fn an_overflow_is_split_by_tenant_and_cut_by_view() {
+    let shape = |s: &str, t: &str| row_in(s, t).table;
+    let mut t = RawTxn::new(g(1), at(0), 0);
+    t.overflow = Some(Box::new(Overflow {
+        tables: vec![
+            shape("t1_d1_g1_s1", "orders"),
+            shape("t1_d1_g1_s1", "__sprig_qo"),
+            shape("t2_d1_g1_s1", "orders"),
+        ],
+        rows: 3_000_000,
+        bytes: 900 << 20,
+    }));
+    let parts = split(&t, &mut HashMap::new());
+    let tables = |p: &RawTxn| -> Vec<String> {
+        p.overflow
+            .as_ref()
+            .map(|o| o.tables.iter().map(|t| t.table.clone()).collect())
+            .unwrap_or_default()
+    };
+    let p1 = &parts.iter().find(|(x, _)| *x == TenantId(1)).unwrap().1;
+    let p2 = &parts.iter().find(|(x, _)| *x == TenantId(2)).unwrap().1;
+    assert_eq!(tables(p1), vec!["orders", "__sprig_qo"]);
+    assert_eq!(tables(p2), vec!["orders"]);
+    assert!(p1.rows.is_empty());
+    let outbox = Kept::Tables(vec!["__sprig_qo".to_owned()].into());
+    assert_eq!(tables(&view(p1, &outbox).unwrap()), vec!["__sprig_qo"]);
+    assert!(
+        view(p2, &outbox).is_none(),
+        "tenant 2's outbox wasn't touched"
+    );
+    assert_eq!(tables(&view(p2, &Kept::All).unwrap()), vec!["orders"]);
+}
+
+fn big_txn(seq: u64, schema: &str, bytes: usize) -> RawTxn {
+    let mut t = RawTxn::new(g(seq), at(seq - 1), 0);
+    let mut r = row(schema);
+    r.after = Some(RowImage(vec![Some(Value::String(vec![b'x'; bytes]))]));
+    t.rows.push(r);
+    t
+}
+
+/// A subscription that doesn't read holds at most its byte budget of
+/// groups, however many its channel could take: past it, it is detached
+/// (the hub goes on), and it comes back through the ring with every group
+/// once and in order.
+#[tokio::test]
+async fn a_slow_subscription_holds_at_most_its_bytes() {
+    let fake = Fake::with(vec![txn(1, &["t1_d1_g1_s1"])]);
+    let opts = SharedOpts {
+        sub_channel: 1_000,
+        buffer_bytes: 20_000,
+        ..SharedOpts::default()
+    };
+    let feed = SharedFeed::new(Arc::new(fake.clone()), opts);
+    let shared = feed.view(Kept::Tables(vec!["__sprig_qo".to_owned()].into()));
+    let c = cluster();
+    let mut fast = shared.open(&c, TenantId(1), &at(0)).await.unwrap();
+    let mut slow = shared.open(&c, TenantId(2), &at(0)).await.unwrap();
+    assert_eq!(take(&mut fast, 1).await, vec![(1, 1)]);
+    // 100 groups of about 1 KB for the slow one (100 KB in all, five
+    // times its budget), each followed by one for the fast one.
+    for i in 0..100 {
+        fake.push(big_txn(2 + 2 * i, "t2_d1_g1_s1", 1_000));
+        fake.push(txn(3 + 2 * i, &["t1_d1_g1_s1"]));
+    }
+    let got = take(&mut fast, 100).await;
+    assert_eq!(got.last(), Some(&(201, 1)), "the hub never waited");
+    let st = feed.stats(&c).unwrap();
+    assert_eq!(st.subscriptions, 1, "the slow one was detached by bytes");
+    let got = take(&mut slow, 100).await;
+    let seqs: Vec<u64> = got.iter().map(|x| x.0).collect();
+    assert_eq!(seqs, (0..100).map(|i| 2 + 2 * i).collect::<Vec<_>>());
+    assert!(quiet(&mut slow, 300).await);
 }

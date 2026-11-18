@@ -735,6 +735,26 @@ fn build(cat: &TenantCatalog, state: &ShardingState, cache: &ShardMapCache) -> T
             member,
         });
     }
+    // A key-value namespace's own views go where their key table's rows
+    // are: read on every shard, as a member without a key column.
+    for v in kv_view_members(cat, &tables) {
+        if !seen.insert(v.object) {
+            continue;
+        }
+        if let Membership::Sharded { group, .. } = &v.member
+            && let Some(u) = held_groups.get(group)
+        {
+            held.insert(v.name.to_ascii_lowercase(), *u);
+        }
+        objects.insert(
+            (
+                v.default_schema.to_ascii_lowercase(),
+                v.name.to_ascii_lowercase(),
+            ),
+            v.object,
+        );
+        tables.push(v);
+    }
     let mut topo =
         sprig_router::topology::catalog::build_with_fks(tenant.0, &groups, &tables, &state.fks);
     // Groups without a table the router plans (a graph's
@@ -770,6 +790,65 @@ fn build(cat: &TenantCatalog, state: &ShardingState, cache: &ShardMapCache) -> T
         fences,
         fences_noted: std::sync::atomic::AtomicBool::new(false),
     }
+}
+
+/// The views a key-value namespace's key table has (`sprig_kv::api::view_ddl`:
+/// `<ns>__hash`, `__list`, `__set`, `__zset`), as members of the key table's
+/// group without a key column, for every sharded key table among `tables`
+/// whose element tables (`__sprig_ke_<ns>`, `__sprig_kz_<ns>`) are in the
+/// same group. Each such view joins one key's rows, which all sit on the
+/// key's shard, and the regroup and the mover keep a copy of it in every
+/// shard schema, so reading it on every shard and merging is exact.
+fn kv_view_members(cat: &TenantCatalog, tables: &[CatalogTable]) -> Vec<CatalogTable> {
+    const SUFFIXES: [&str; 4] = ["__hash", "__list", "__set", "__zset"];
+    let element_of = |e: &str, key: &str| {
+        ["__sprig_ke_", "__sprig_kz_"].iter().any(|p| {
+            e.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p))
+                && e.get(p.len()..)
+                    .is_some_and(|k| k.eq_ignore_ascii_case(key))
+        })
+    };
+    let mut out = Vec::new();
+    for t in tables {
+        let Membership::Sharded { group, .. } = &t.member else {
+            continue;
+        };
+        let with_elements = tables.iter().any(|e| {
+            e.db == t.db
+                && matches!(&e.member, Membership::Sharded { group: g, .. } if g == group)
+                && element_of(&e.name, &t.name)
+        });
+        if !with_elements {
+            continue;
+        }
+        for suffix in SUFFIXES {
+            let want = format!("{}{suffix}", t.name);
+            let Some(view) = cat
+                .objects
+                .names(DbId(t.db), sprig_catalog::store::Namespace::Relation)
+                .find(|(n, _)| n.eq_ignore_ascii_case(&want))
+                .and_then(|(_, id)| cat.objects.get(id))
+                .filter(|o| o.kind == sprig_catalog::store::ObjectKind::View)
+            else {
+                continue;
+            };
+            out.push(CatalogTable {
+                object: view.object_id.0,
+                db: t.db,
+                default_schema: t.default_schema.clone(),
+                name: view.name.clone(),
+                member: Membership::Sharded {
+                    group: *group,
+                    key_columns: None,
+                    create_sql: None,
+                    lookups: Vec::new(),
+                    fill_rk: false,
+                    parent_fk: None,
+                },
+            });
+        }
+    }
+    out
 }
 
 /// The cluster ids of `layout`, typed.

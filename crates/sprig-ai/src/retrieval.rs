@@ -275,6 +275,42 @@ pub fn rk_catch_up_sql(source: &str, chunks: &str, keys: &[KeyColumn], limit: u6
     )
 }
 
+/// One window of the stale-hash check: the next `limit` rows of `source`
+/// (alias `s`) after the key `after` (its columns' SQL literals; `None`
+/// from the start), in key order, each row's key columns and whether its
+/// chunks are stale (1) or current (0). Stale: chunk 0's `src_hash` isn't
+/// `hash` (the row's [`hash_expr`] over alias `s`), or the row has text
+/// and no chunks. `source` and `chunks` are qualified table names, `keys`
+/// the source's key columns, `text` its text column.
+#[must_use]
+pub fn stale_scan_sql(
+    source: &str,
+    chunks: &str,
+    keys: &[KeyColumn],
+    text: &str,
+    hash: &str,
+    after: Option<&[String]>,
+    limit: u64,
+) -> String {
+    let kcols: Vec<String> = keys.iter().map(|k| col(Some("s"), &k.name)).collect();
+    let kcols = kcols.join(", ");
+    let on: Vec<String> = keys
+        .iter()
+        .map(|k| format!("c.{} = s.{}", quote(&key_column(&k.name)), quote(&k.name)))
+        .collect();
+    let pred = after.map_or_else(
+        || "TRUE".to_owned(),
+        |a| format!("({kcols}) > ({})", a.join(", ")),
+    );
+    format!(
+        "SELECT {kcols}, IF(c.`src_hash` IS NULL, COALESCE(TRIM({}), '') <> '', \
+         c.`src_hash` <> {hash}) FROM {source} AS s LEFT JOIN {chunks} AS c ON {} \
+         AND c.`chunk_no` = 0 WHERE {pred} ORDER BY {kcols} LIMIT {limit}",
+        col(Some("s"), text),
+        on.join(" AND ")
+    )
+}
+
 fn col(qualifier: Option<&str>, name: &str) -> String {
     match qualifier {
         Some(q) => format!("{}.{}", quote(q), quote(name)),
@@ -518,6 +554,44 @@ mod tests {
             "{up}"
         );
         assert!(up.ends_with("AND s.`_sprig_rk` > 0) LIMIT 500"), "{up}");
+    }
+
+    #[test]
+    fn the_stale_hash_check_reads_a_keyset_window() {
+        let h = hash_expr("body", Some("title"), &[], Some("s"));
+        assert_eq!(
+            h, "UNHEX(MD5(JSON_ARRAY(`s`.`body`, `s`.`title`)))",
+            "the row's hash over alias s"
+        );
+        let first = stale_scan_sql(
+            "`s1`.`t`",
+            "`s1`.`__sprig_rx_7`",
+            &keys()[1..],
+            "body",
+            &h,
+            None,
+            50,
+        );
+        assert_eq!(
+            first,
+            "SELECT `s`.`id`, `s`.`n`, IF(c.`src_hash` IS NULL, COALESCE(TRIM(`s`.`body`), '') <> '', \
+             c.`src_hash` <> UNHEX(MD5(JSON_ARRAY(`s`.`body`, `s`.`title`)))) FROM `s1`.`t` AS s \
+             LEFT JOIN `s1`.`__sprig_rx_7` AS c ON c.`k_id` = s.`id` AND c.`k_n` = s.`n` \
+             AND c.`chunk_no` = 0 WHERE TRUE ORDER BY `s`.`id`, `s`.`n` LIMIT 50"
+        );
+        let next = stale_scan_sql(
+            "`s1`.`t`",
+            "`s1`.`__sprig_rx_7`",
+            &keys()[1..],
+            "body",
+            &h,
+            Some(&["X'0a0b'".to_owned(), "7".to_owned()]),
+            50,
+        );
+        assert!(
+            next.contains("WHERE (`s`.`id`, `s`.`n`) > (X'0a0b', 7) ORDER BY"),
+            "{next}"
+        );
     }
 
     #[test]

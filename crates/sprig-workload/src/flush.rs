@@ -9,8 +9,13 @@
 //!   closed  := recorder.drain_closed()     REPLACE workload_stats (final)
 //!   samples := outbox.drain()              REPLACE workload_samples
 //!   per tenant, in that order; a tenant that fails gets its closed rows,
-//!   first sightings and samples back for the next flush
+//!   first sightings and samples back for the next flush, unless it is
+//!   gone (deleted): then its rows are dropped and the recorder forgets it
 //! ```
+//!
+//! The wait between flushes reads `workload.flush_seconds` every second,
+//! so a lowered period applies at once rather than after the current
+//! wait.
 //!
 //! A flush is idempotent: every stats row is this gateway's cumulative
 //! value under its own `(gateway_id, part)` key. **Late closed rows**
@@ -37,6 +42,16 @@ use sprig_common::{CancellationToken, Result, SprigError};
 use crate::recorder::{FlushRow, NewFingerprint, Recorder};
 use crate::samples::{SampleOutbox, SealedSample};
 use crate::store::{WORKLOAD_MODULE, WorkloadTables, map_err};
+
+/// Whether a tenant is gone (deleted): its rows can never be written.
+#[async_trait]
+pub trait TenantGone: Send + Sync + 'static {
+    /// Whether `tenant` is deleted or being deleted.
+    async fn gone(&self, tenant: TenantId) -> bool;
+}
+
+/// How often the wait between flushes reads `workload.flush_seconds`.
+pub const PERIOD_CHECK: Duration = Duration::from_secs(1);
 
 /// What one tenant gets in one flush.
 #[derive(Debug, Default)]
@@ -80,6 +95,8 @@ pub struct FlushReport {
     pub samples: u64,
     /// Closed rows dropped as late (module docs).
     pub late_dropped: u64,
+    /// Rows dropped because their tenant is gone.
+    pub gone_dropped: u64,
 }
 
 /// Settings the flusher reads on every run.
@@ -111,6 +128,10 @@ pub struct Flusher {
     pending_new: Mutex<Vec<NewFingerprint>>,
     /// One flush at a time.
     running: tokio::sync::Mutex<()>,
+    /// Tells deleted tenants; `None`: every tenant is kept for a retry.
+    gone: Option<Arc<dyn TenantGone>>,
+    /// Tenants found gone: their rows are dropped without a write.
+    gone_seen: Mutex<HashSet<TenantId>>,
 }
 
 impl std::fmt::Debug for Flusher {
@@ -146,7 +167,39 @@ impl Flusher {
             settings,
             pending_new: Mutex::new(Vec::new()),
             running: tokio::sync::Mutex::new(()),
+            gone: None,
+            gone_seen: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Asks `gone` about a tenant whose write failed: a deleted tenant's
+    /// rows are dropped instead of kept for the next flush.
+    #[must_use]
+    pub fn with_gone(mut self, gone: Arc<dyn TenantGone>) -> Self {
+        self.gone = Some(gone);
+        self
+    }
+
+    /// Drops what is held for `tenant` (it is gone): first sightings,
+    /// open and closed rows, samples. The number of rows dropped.
+    fn forget(&self, tenant: TenantId) -> u64 {
+        let mut n = 0u64;
+        lock(&self.pending_new).retain(|f| {
+            let keep = f.tenant != tenant;
+            n += u64::from(!keep);
+            keep
+        });
+        // Open entries go to the closed outbox: take them out again.
+        self.recorder.forget_tenant(tenant);
+        let mut closed = self.recorder.drain_closed();
+        closed.retain(|r| {
+            let keep = r.tenant != tenant;
+            n += u64::from(!keep);
+            keep
+        });
+        self.recorder.requeue_closed(closed);
+        self.samples.forget_tenant(tenant);
+        n
     }
 
     fn now_secs(&self) -> u64 {
@@ -200,6 +253,10 @@ impl Flusher {
             if batch.is_empty() {
                 continue;
             }
+            if lock(&self.gone_seen).contains(&tenant) {
+                rep.gone_dropped += batch_rows(&batch) + self.forget(tenant);
+                continue;
+            }
             match self.target.write(tenant, self.gateway_id, &batch).await {
                 Ok(()) => {
                     rep.tenants += 1;
@@ -208,6 +265,19 @@ impl Flusher {
                     rep.samples += batch.samples.len() as u64;
                 }
                 Err(e) => {
+                    let gone = match &self.gone {
+                        Some(g) => g.gone(tenant).await,
+                        None => false,
+                    };
+                    if gone {
+                        // Deleted: nothing of it can be written again.
+                        lock(&self.gone_seen).insert(tenant);
+                        let n = batch_rows(&batch) + self.forget(tenant);
+                        rep.gone_dropped += n;
+                        tracing::info!(tenant = %tenant, rows = n,
+                            "workload flush: the tenant is deleted; its rows are dropped");
+                        continue;
+                    }
                     rep.failed += 1;
                     tracing::warn!(tenant = %tenant, error = %e,
                         "workload flush failed; keeping the rows for the next flush");
@@ -232,6 +302,7 @@ impl Flusher {
         metrics::counter!("sprig_workload_flush_rows_total")
             .increment(rep.stats + rep.fingerprints + rep.samples);
         metrics::counter!("sprig_workload_flush_late_dropped_total").increment(rep.late_dropped);
+        metrics::counter!("sprig_workload_flush_gone_dropped_total").increment(rep.gone_dropped);
         #[allow(clippy::cast_precision_loss)]
         {
             metrics::gauge!("sprig_workload_fingerprints_active").set(m.fingerprints_active as f64);
@@ -248,22 +319,41 @@ impl Flusher {
     /// end plus `jitter`, whichever comes first.
     #[must_use]
     pub fn next_delay(&self, jitter: Duration) -> Duration {
-        let period = Duration::from_secs(u64::from((self.settings)().flush_seconds.max(1)));
+        self.period().min(self.to_bucket_end(jitter))
+    }
+
+    /// `workload.flush_seconds` now.
+    fn period(&self) -> Duration {
+        Duration::from_secs(u64::from((self.settings)().flush_seconds.max(1)))
+    }
+
+    /// The current bucket's end plus `jitter`, from now.
+    fn to_bucket_end(&self, jitter: Duration) -> Duration {
         let now = self.now_secs();
         let bucket = self.bucket_secs();
-        let to_end = Duration::from_secs(bucket - now % bucket) + jitter;
-        period.min(to_end)
+        Duration::from_secs(bucket - now % bucket) + jitter
     }
 
     /// Flushes until `shutdown`, then once more (as the gateway drains).
+    /// The wait reads the period every [`PERIOD_CHECK`]: a lowered
+    /// `workload.flush_seconds` counts from the last flush at once.
     pub async fn run(self: Arc<Self>, shutdown: CancellationToken) {
         let mut seed = self.now_secs() ^ u64::from(self.gateway_id).rotate_left(32);
-        loop {
+        'run: loop {
             seed = crate::recorder::mix(seed.wrapping_add(1));
             let jitter = Duration::from_secs(seed % 61);
-            tokio::select! {
-                () = shutdown.cancelled() => break,
-                () = tokio::time::sleep(self.next_delay(jitter)) => {}
+            let began = tokio::time::Instant::now();
+            let to_end = self.to_bucket_end(jitter);
+            loop {
+                let due = began + self.period().min(to_end);
+                let now = tokio::time::Instant::now();
+                if now >= due {
+                    break;
+                }
+                tokio::select! {
+                    () = shutdown.cancelled() => break 'run,
+                    () = tokio::time::sleep((due - now).min(PERIOD_CHECK)) => {}
+                }
             }
             let r = self.flush().await;
             tracing::debug!(?r, "workload flush");
@@ -271,6 +361,11 @@ impl Flusher {
         let r = self.flush().await;
         tracing::info!(?r, "final workload flush");
     }
+}
+
+/// The rows of a batch.
+fn batch_rows(b: &TenantBatch) -> u64 {
+    (b.fingerprints.len() + b.stats.len() + b.samples.len()) as u64
 }
 
 /// Writes flushes to each tenant's catalog writer.

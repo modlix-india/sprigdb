@@ -39,6 +39,8 @@ runs, qto = int(runs), int(qto)
 LOADING = [True]
 TABLES = ["region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem"]
 schema = open(os.path.join(data, "schema.sql")).read()
+# DuckDB's EXPORT ends statements with ";;"; keep one ";" per statement (DuckDB refuses the empty statement)
+schema = "".join(st.strip() + ";\n" for st in schema.split(";") if st.strip())
 def mysql(sql, database=db):
     env = dict(os.environ, MYSQL_PWD=pw)
     if not LOADING[0]:

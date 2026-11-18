@@ -71,6 +71,12 @@ pub async fn call(
             if rpc == "Analytics.UpdateModel" && !model.is_empty() && s(&def, "model") != model {
                 return Err(bad("the definition's model differs from the path's"));
             }
+            refuse_inheritable(
+                engine,
+                caller,
+                &sprig_dim::model::Model::parse(&database, &def)?,
+            )
+            .await?;
             let st = store::put(&mut sql, &database, &def, rpc == "Analytics.UpdateModel").await?;
             Ok(info_json(&database, &st))
         }
@@ -117,6 +123,57 @@ pub async fn call(
     }
 }
 
+/// 39752 when a table of `model` is inheritable. Analytics reads tables
+/// through its own session's internal statements, which the inheritance
+/// layer doesn't rewrite, so an inheritable table's rows would be every
+/// space's layer rows (overrides, hide markers, other spaces' records)
+/// instead of the caller's merged records, and a child tenant would see
+/// only its own layer rows. Checked when a model is made or changed and at
+/// every query, since a table can become inheritable later (as for mapped
+/// graphs).
+async fn refuse_inheritable(
+    engine: &SqlEngine,
+    caller: &Caller,
+    model: &sprig_dim::model::Model,
+) -> Result<()> {
+    use sprig_catalog::ddl::{LOWER_CASE_TABLE_NAMES, database_key, object_key};
+    use sprig_catalog::store::{Namespace, ObjectKind};
+    let (Some(svc), Some(t)) = (engine.tenants.as_deref(), caller.principal.tenant) else {
+        return Ok(());
+    };
+    let cat = svc.cache.get(t, sprig_catalog::Freshness::Latest).await?;
+    let Some(st) = cat
+        .ext
+        .get::<sprig_inherit::InheritState>(sprig_inherit::MODULE)
+    else {
+        return Ok(());
+    };
+    let lctn = svc.settings.get(
+        &LOWER_CASE_TABLE_NAMES,
+        &cat.setting_ctx(&svc.dc),
+        Some(&cat.settings),
+    ) == 1;
+    let Some(db) = cat.database(&database_key(&model.database, lctn)) else {
+        return Ok(());
+    };
+    let dims = model.dimensions.iter().filter_map(|d| match &d.kind {
+        sprig_dim::model::DimKind::Table { table, .. } => Some(table),
+        sprig_dim::model::DimKind::Time => None,
+    });
+    for table in model.facts.iter().map(|f| &f.table).chain(dims) {
+        let key = object_key(ObjectKind::Table, table, lctn);
+        if let Some(o) = cat.object(db.db_id, Namespace::Relation, &key)
+            && st.object(o.object_id).is_some()
+        {
+            return Err(sprig_dim::model::invalid(format!(
+                "table '{table}' is inheritable: analytics models can't read inheritable tables \
+                 yet (they would read every space's layer rows, not your merged records)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn row_json(r: &OutRow) -> Value {
     json!({"keys": r.keys, "values": r.values, "grouping": r.grouping})
 }
@@ -131,6 +188,13 @@ async fn answer(
     body: &Value,
 ) -> Result<(&'static str, Vec<OutRow>)> {
     let q = Query::parse(body)?;
+    // A table may have become inheritable since the model was made.
+    refuse_inheritable(
+        engine,
+        caller,
+        &store::get(sql, database, &q.model).await?.model,
+    )
+    .await?;
     // Live `analytics.*` settings, at the tenant's and the
     // database's scopes.
     let limits = super::model_settings::analytics_for(engine, caller, database);

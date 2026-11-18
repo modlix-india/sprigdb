@@ -48,6 +48,8 @@ pub mod sql;
 pub mod status;
 pub mod txn;
 pub mod users;
+/// Background upkeep of vector side tables.
+pub mod vectors;
 pub mod workload;
 pub mod writes;
 
@@ -429,7 +431,8 @@ impl MongoFrontend {
                     spill::engine_config(d.live.as_ref()),
                     Arc::clone(c) as Arc<dyn sprig_doc::catalog::DocCatalog>,
                 )
-                .with_text(Arc::new(crate::search::docs::DocSearch::default())),
+                .with_text(Arc::new(crate::search::docs::DocSearch::default()))
+                .with_vector_sides(Arc::new(vectors::GatewaySides)),
                 None => sprig_doc::engine::Engine::default(),
             },
             feed,

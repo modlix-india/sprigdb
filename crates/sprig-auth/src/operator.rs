@@ -304,7 +304,15 @@ mod tests {
         assert!(!svc);
         assert_eq!(id, t.key_id);
         assert!(secret_matches(&t.secret_sha256, secret));
-        assert!(!secret_matches(&t.secret_sha256, &secret.replace('a', "b")));
+        // Change the first character for certain (a replace() of a letter the random
+        // secret may not contain changed nothing and failed now and then in CI).
+        let first = secret.chars().next().unwrap();
+        let wrong = format!(
+            "{}{}",
+            if first == 'x' { 'y' } else { 'x' },
+            &secret[first.len_utf8()..]
+        );
+        assert!(!secret_matches(&t.secret_sha256, &wrong));
         let s = new_token(true).unwrap();
         assert!(parse_token(&s.text).unwrap().0);
         assert!(parse_token("sprig_acme_abc_def").is_none());

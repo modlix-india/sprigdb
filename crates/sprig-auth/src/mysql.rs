@@ -52,7 +52,6 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
 
@@ -592,16 +591,6 @@ impl CatalogLogins {
     }
 }
 
-tokio::task_local! {
-    /// Milliseconds of failure delay the logins
-    /// run in this scope have waited or are waiting. A front end whose
-    /// connection phase has a deadline (the gateway's
-    /// `gateway.handshake_timeout_ms`) runs the login in this scope and
-    /// moves its deadline back by this much, so a delayed refusal still
-    /// reaches the client as its ERR packet instead of a dropped connection.
-    pub static LOGIN_DELAY_MS: Arc<AtomicU64>;
-}
-
 /// Where accounts come from: the switch between the tenant catalog and the
 /// TOML accounts file.
 #[derive(Clone)]
@@ -818,15 +807,17 @@ impl LoginService {
     }
 
     /// Counts a failure of `key` and waits out its delay (a timer). Inside
-    /// [`LOGIN_DELAY_MS`]'s scope the delay is added to it first, so the
-    /// front end can push its own deadline back by as much.
+    /// [`LOGIN_WAITS`](crate::login_waits::LOGIN_WAITS)'s scope the login is
+    /// marked as refused and the delay as the server's wait, so the front
+    /// end's deadline neither counts it nor cuts off the ERR packet after
+    /// it.
     pub(crate) async fn failure_delay(&self, key: DelayKey, catalog: Option<&TenantCatalog>) {
         let rule = self.delay_rule(catalog);
         let d = self.delays.on_failure(key, rule);
         if !d.is_zero() {
             metrics::counter!("sprig_auth_rate_limited_total", "scope" => "account").increment(1);
-            let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
-            let _ = LOGIN_DELAY_MS.try_with(|t| t.fetch_add(ms, Ordering::Relaxed));
+            let _ = crate::login_waits::LOGIN_WAITS.try_with(|w| w.refusing());
+            let _wait = crate::login_waits::begin_wait();
             tokio::time::sleep(d).await;
         }
     }

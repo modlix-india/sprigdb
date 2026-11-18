@@ -41,6 +41,12 @@
 //!       or check ends; in between each committed write adds a row that
 //!       gained chunks and takes away one that lost them. Embeddings are
 //!       counted apart: sprig_retrieval_rows_total{result="indexed"}
+//!     the stale-hash check, between rounds once every shard is filled: one
+//!       keyset window of one shard (a tenth of
+//!       ai.embedding.backfill_rows_per_s, at most 200 rows; a minute's rest
+//!       after each pass over every shard): the rows whose chunk 0's hash
+//!       isn't theirs, or with text and no chunks, reconciled; a shard
+//!       walked to its end is swept of chunks whose row is gone
 //!   a graceful stop drains (sprig_feed::drain): the round in flight is
 //!     finished, the feed read and handled on (no fill steps) until the
 //!     position has passed the cluster's (read again once passed, until
@@ -50,8 +56,10 @@
 //!
 //! reconcile(shard, rows):
 //!   SELECT pk, text, title, filters, UNHEX(MD5(JSON_ARRAY(text, title,
-//!     filters))) [, _sprig_rk] from the source; the stored hash (and
-//!     routing hash) of each row's chunk 0
+//!     filters))) [, _sprig_rk] from the source, for a feed round's keys
+//!     read causally (`ai_embed::causal`: after a wsrep_sync_wait barrier
+//!     on Galera, else LOCK IN SHARE MODE); the stored hash (and routing
+//!     hash) of each row's chunk 0
 //!   same hash: nothing to do, or only the chunks' _sprig_rk set (guarded
 //!     as below); no text: its chunks deleted
 //!   else: cut into chunks (CHUNK BY), embedded in batches of
@@ -61,7 +69,8 @@
 //!         gone → chunks deleted
 //!       DELETE its chunks; INSERT the new ones, with the row's _sprig_rk
 //!   keys the source no longer has: DELETE their chunks WHERE NOT EXISTS
-//!     (the row) — the guard of a delete
+//!     (the row) — the guard of a delete; on Galera after the barrier too
+//!     (a round's TRUNCATE sweep likewise)
 //! ```
 //!
 //! The work that locks the source's rows (the guard, and the clean-ups'
@@ -93,7 +102,8 @@ use sprig_feed::subs::Subscriptions;
 use sprig_feed::{FeedItem, MetaPlacement, Op, ResumeToken, StartAt, TailOptions, TenantTail};
 use sprig_sql::retrieval::Chunking;
 
-use crate::ai_embed::{EmbedEnv, Throttle, backend, cut, now_ms, pause};
+use crate::ai_embed::causal::{self, Reads};
+use crate::ai_embed::{EmbedEnv, Scan, Throttle, backend, cut, flag, now_ms, pause};
 use crate::runtime::{JobCtx, JobHandler};
 
 /// The job kind (the controller loop's).
@@ -380,6 +390,10 @@ struct Job<'a> {
     orphans: HashMap<String, Instant>,
     /// Rows embedded by this run of the job.
     indexed: u64,
+    /// How each cluster is read causally.
+    kinds: causal::Kinds,
+    /// The stale-hash check.
+    scan: Scan,
 }
 
 impl Job<'_> {
@@ -454,6 +468,12 @@ impl Job<'_> {
         pool.get_conn_bounded()
             .await
             .map_err(|e| SprigError::new(SprigCode::BackendUnavailable, format!("retrieval: {e}")))
+    }
+
+    /// How shard `s`'s cluster is read causally.
+    async fn reads(&mut self, s: &ShardLoc) -> Result<Reads> {
+        let cluster = self.cluster_of(s).await?;
+        self.kinds.of(&self.env.logic.registry, &cluster).await
     }
 
     /// The table's live shards, each with its chunk table: a shard without
@@ -781,21 +801,30 @@ impl Job<'_> {
     }
 
     /// Brings the source rows `sql` selects up to date in the chunk table
-    /// of `schema` (see the module docs); the last row's key as SQL
-    /// literals and the number of rows read.
+    /// of `schema` (see the module docs), reading them causally when
+    /// `causal` (a feed round's keys); the last row's key as SQL literals,
+    /// the number of rows read and the number whose chunks were written or
+    /// deleted.
     #[allow(clippy::too_many_lines, clippy::many_single_char_names)] // the reconcile of the module docs
     async fn reconcile(
         &mut self,
         s: &ShardLoc,
         sql: &str,
+        causal: bool,
         cancel: &sprig_common::CancellationToken,
-    ) -> Result<(Option<Vec<String>>, u64)> {
+    ) -> Result<(Option<Vec<String>>, u64, u64)> {
         let schema = self.ix.schema(self.tenant, s);
         let has_rk = self.rk.contains(&schema);
         let keys: Vec<KeyColumn> = self.ix.row.key_columns.clone();
         let nk = keys.len();
         let nf = self.ix.row.filters.len();
         let mut c = self.locking_conn_of(s).await?;
+        let sql = if causal {
+            let reads = self.reads(s).await?;
+            causal::read_sql(reads, &mut c, sql).await?
+        } else {
+            sql.to_owned()
+        };
         let rows: Vec<mysql_async::Row> = c.query(sql).await.map_err(|e| self.source_error(e))?;
         let read = rows.len() as u64;
         let src: Vec<SrcRow> = rows
@@ -830,7 +859,7 @@ impl Job<'_> {
                 .collect::<Vec<_>>()
         });
         if src.is_empty() {
-            return Ok((last, read));
+            return Ok((last, read, 0));
         }
         // The stored hashes and routing hashes (chunk 0 of each row).
         let mut stored: HashMap<Vec<Option<String>>, (Vec<u8>, u64)> = HashMap::new();
@@ -1085,7 +1114,7 @@ impl Job<'_> {
         metrics::rows("superseded", superseded);
         metrics::chunks(written);
         self.indexed += indexed;
-        Ok((last, read))
+        Ok((last, read, indexed + cleared))
     }
 
     /// 1054 (a column the index reads is gone) and 1146 of the source as
@@ -1141,9 +1170,15 @@ impl Job<'_> {
                 .collect();
             let rk = self.rk.contains(&schema);
             let sql = self.ix.select_sql(&schema, &pred.join(" OR "), None, rk);
-            self.reconcile(s, &sql, cancel).await?;
-            // The rows that are gone: their chunks, unless the row exists.
+            self.reconcile(s, &sql, true, cancel).await?;
+            // The rows that are gone: their chunks, unless the row exists
+            // (read causally: on Galera after the barrier; elsewhere the
+            // subquery is a locking read).
+            let reads = self.reads(s).await?;
             let mut c = self.locking_conn_of(s).await?;
+            if reads == Reads::Barrier {
+                causal::barrier(&mut c).await?;
+            }
             let mut gone = 0u64;
             for l in &lits {
                 let stmt = format!(
@@ -1165,8 +1200,9 @@ impl Job<'_> {
     }
 
     /// Deletes the chunks of shard `s` whose row is gone, then counts the
-    /// shard's rows again.
-    async fn sweep(&mut self, s: &ShardLoc) -> Result<u64> {
+    /// shard's rows again; after a feed round's `TRUNCATE` (`causal`), on
+    /// Galera after the barrier (elsewhere the subquery is a locking read).
+    async fn sweep(&mut self, s: &ShardLoc, causal: bool) -> Result<u64> {
         let schema = self.ix.schema(self.tenant, s);
         // Single-table form: a multi-table DELETE with no current schema
         // is refused (1046).
@@ -1184,7 +1220,15 @@ impl Job<'_> {
                 )
             })
             .collect();
+        let reads = if causal {
+            Some(self.reads(s).await?)
+        } else {
+            None
+        };
         let mut c = self.locking_conn_of(s).await?;
+        if reads == Some(Reads::Barrier) {
+            causal::barrier(&mut c).await?;
+        }
         c.query_drop(format!(
             "DELETE FROM {chunks} WHERE NOT EXISTS (SELECT 1 FROM {} AS s WHERE {})",
             self.ix.source(&schema),
@@ -1197,6 +1241,89 @@ impl Job<'_> {
         let n = self.count(s, &schema).await?;
         self.rows.insert(schema, n);
         Ok(swept)
+    }
+
+    /// One window of the stale-hash check (see the module docs): the next
+    /// rows of the shard it walks, read plainly with their chunk 0's hash;
+    /// those whose chunks are stale, or missing while they have text, are
+    /// reconciled. A shard walked to its end is swept of chunks whose row
+    /// is gone. A pass over every shard ends with a log line when it
+    /// repaired anything.
+    async fn scan_step(&mut self, cancel: &sprig_common::CancellationToken) -> Result<()> {
+        let now = Instant::now();
+        let n = self.scan.take(CHUNK, now);
+        if n == 0 {
+            return Ok(());
+        }
+        let shards = self.shards().await?;
+        let Some((s, _)) = shards.get(self.scan.shard).cloned() else {
+            let repaired = self.scan.pass_done(now);
+            if repaired > 0 {
+                tracing::warn!(tenant = %self.tenant, index = self.ix.row.id, db = %self.ix.db, table = %self.ix.table, repaired, "retrieval index: the stale-hash check brought rows' chunks up to date that their changes had missed");
+            }
+            return Ok(());
+        };
+        let schema = self.ix.schema(self.tenant, &s);
+        let kc = self.ix.row.key_columns.clone();
+        let nk = kc.len();
+        let sql = {
+            let r = &self.ix.row;
+            let hash = retrieval::hash_expr(
+                &r.text_column,
+                r.title_column.as_deref(),
+                &r.filters,
+                Some("s"),
+            );
+            retrieval::stale_scan_sql(
+                &self.ix.source(&schema),
+                &self.ix.chunks(&schema),
+                &kc,
+                &r.text_column,
+                &hash,
+                self.scan.after.as_deref(),
+                n,
+            )
+        };
+        let rows: Vec<mysql_async::Row> = {
+            let mut c = self.conn_of(&s).await?;
+            c.query(sql).await.map_err(|e| self.source_error(e))?
+        };
+        let read = rows.len() as u64;
+        let key = |r: &mysql_async::Row| -> Vec<String> {
+            (0..nk)
+                .map(|i| kc[i].literal(bytes(r, i).as_deref()))
+                .collect()
+        };
+        let last = rows.last().map(key);
+        let stale: Vec<String> = rows
+            .iter()
+            .filter(|r| flag(r.as_ref(nk)))
+            .map(|r| {
+                let eq: Vec<String> = kc
+                    .iter()
+                    .zip(key(r))
+                    .map(|(c, v)| format!("{} = {v}", quote(&c.name)))
+                    .collect();
+                format!("({})", eq.join(" AND "))
+            })
+            .collect();
+        if !stale.is_empty() {
+            let rk = self.rk.contains(&schema);
+            let sql = self.ix.select_sql(&schema, &stale.join(" OR "), None, rk);
+            let (_, _, written) = self.reconcile(&s, &sql, false, cancel).await?;
+            self.scan.repaired += written;
+            self.live.spend(stale.len() as u64, now);
+        }
+        if read < n {
+            // The shard's end: chunks whose row is gone.
+            let swept = self.sweep(&s, false).await?;
+            if swept > 0 {
+                metrics::rows("cleared", swept);
+                tracing::warn!(tenant = %self.tenant, index = self.ix.row.id, %schema, swept, "retrieval index: the stale-hash check swept chunks of deleted rows");
+            }
+        }
+        self.scan.advance(last, read, n);
+        Ok(())
     }
 
     /// One fill chunk of the first shard not done; whether every shard is
@@ -1231,12 +1358,12 @@ impl Job<'_> {
         };
         let rk = self.rk.contains(&schema);
         let sql = self.ix.select_sql(&schema, &pred, Some(n), rk);
-        let (last, read) = self.reconcile(&s, &sql, cancel).await?;
+        let (last, read, _) = self.reconcile(&s, &sql, false, cancel).await?;
         self.live.spend(read, Instant::now());
         let pos = match last {
             Some(l) if read >= n => json!(l),
             _ => {
-                let swept = self.sweep(&s).await?;
+                let swept = self.sweep(&s, false).await?;
                 metrics::rows("cleared", swept);
                 json!("done")
             }
@@ -1433,6 +1560,11 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
         map_changes: env.maps.changes(),
         orphans: HashMap::new(),
         indexed: 0,
+        kinds: causal::Kinds::default(),
+        scan: Scan::new(
+            settings.tenant_get(tenant, &embedding::BACKFILL_ROWS_PER_S),
+            Instant::now(),
+        ),
         ix,
     };
     // A failed index that loads again carries on.
@@ -1536,6 +1668,8 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
                 .set_rate(settings.tenant_get(tenant, &embedding::ROWS_PER_S));
             job.backfill
                 .set_rate(settings.tenant_get(tenant, &embedding::BACKFILL_ROWS_PER_S));
+            job.scan
+                .set_rate(settings.tenant_get(tenant, &embedding::BACKFILL_ROWS_PER_S));
             job.max_chunks =
                 usize::try_from(settings.get(&retrieval::MAX_CHUNKS_PER_ROW)).unwrap_or(64);
             let _ = cx
@@ -1626,7 +1760,7 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
                 let mut failed = job.relocate(&mut keys, &mut truncated).await.err();
                 if failed.is_none() {
                     for s in &truncated {
-                        if let Err(e) = job.sweep(s).await {
+                        if let Err(e) = job.sweep(s, true).await {
                             failed = Some(e);
                             break;
                         }
@@ -1715,6 +1849,11 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
             }
         } else if job.ix.row.state != State::Ready {
             job.set_state(State::Ready, None).await?;
+        } else if let Err(e) = job.scan_step(&cx.cancel).await {
+            // The next window tries again; a failed index shows in the
+            // rounds.
+            job.shards = None;
+            tracing::debug!(%tenant, index = id, error = %e, "stale-hash check step failed; retrying");
         }
     }
     backlog_set(&job_key, 0);

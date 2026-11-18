@@ -27,8 +27,15 @@
 //!       shadow into place) and the row's generation moves on
 //!     every 5 s: the row again (a model change, a drop)
 //!
+//!     the stale-hash check, between rounds once ready: one keyset window
+//!       of one shard (a tenth of ai.embedding.backfill_rows_per_s, at most
+//!       500 rows; a minute's rest after each pass over every shard): the
+//!       rows whose stored hash isn't their source's, reconciled
+//!
 //! reconcile(shard, keys or a keyset chunk):
-//!   SELECT pk, src, UNHEX(MD5(src)), hash per generation filled
+//!   SELECT pk, src, UNHEX(MD5(src)), hash per generation filled; for a
+//!     feed round's keys a causal read (`causal`): after a wsrep_sync_wait
+//!     barrier on Galera, else LOCK IN SHARE MODE
 //!   a row whose hash is its source's: nothing to do
 //!   no source (NULL or blank): vector NULL, hash := the source's
 //!   else: embedded in batches of ai.embedding.batch_rows with the model,
@@ -46,6 +53,11 @@
 //! hash and are passed over; the guard keeps a slow write from replacing a
 //! newer source's vector. No change is lost (the feed is read from the
 //! last checkpoint) and no row is embedded twice for the same source.
+//! A round's rows are read causally ([`causal`]): a read that returned a
+//! version older than the round's events would take the row as done and
+//! acknowledge past its change. The stale-hash check is the safety net
+//! behind that: a row left stale by any miss is found within a pass and
+//! embedded.
 //!
 //! **A graceful stop drains** (`sprig_feed::drain`, as the other feed
 //! consumers): the round in flight is finished, and the feed is read and
@@ -85,6 +97,8 @@ use sprig_sql::embedcol;
 use crate::logic::LogicEnv;
 use crate::runtime::{JobCtx, JobHandler};
 
+pub(crate) mod causal;
+
 /// The job kind (the controller's `ai_embed_loop::JOB_KIND`).
 pub const JOB_KIND: &str = "ai_embed";
 
@@ -93,6 +107,14 @@ const ROUND: usize = 2048;
 
 /// Rows of one backfill chunk at most.
 const CHUNK: u64 = 500;
+
+/// The stale-hash check reads this share of
+/// `ai.embedding.backfill_rows_per_s` (one in ten).
+const SCAN_SHARE: u64 = 10;
+
+/// The stale-hash check's rest after each pass over every shard (and
+/// before the first, after the job starts).
+pub(crate) const SCAN_REST: Duration = Duration::from_secs(60);
 
 /// The job's environment: the logic jobs' (catalogs, shard pools, the
 /// shared reader), the shard maps, and where the local model is.
@@ -302,6 +324,87 @@ impl Throttle {
     }
 }
 
+/// Where the stale-hash check is: a keyset walk over the shards, one
+/// window at a time, throttled to [`SCAN_SHARE`] of the backfill's rate,
+/// resting [`SCAN_REST`] between passes.
+#[derive(Debug)]
+pub(crate) struct Scan {
+    /// The shard (its index in the job's sorted shard list) being walked.
+    pub(crate) shard: usize,
+    /// The last key read in it, as SQL literals.
+    pub(crate) after: Option<Vec<String>>,
+    /// Not before then.
+    next: Instant,
+    throttle: Throttle,
+    /// Rows brought up to date in this pass.
+    pub(crate) repaired: u64,
+}
+
+impl Scan {
+    /// A check that starts [`SCAN_REST`] after `now`, at a share of
+    /// `backfill_rate`.
+    pub(crate) fn new(backfill_rate: u64, now: Instant) -> Self {
+        Self {
+            shard: 0,
+            after: None,
+            next: now + SCAN_REST,
+            throttle: Throttle::new(scan_rate(backfill_rate)),
+            repaired: 0,
+        }
+    }
+
+    /// The backfill's rate changed.
+    pub(crate) fn set_rate(&mut self, backfill_rate: u64) {
+        self.throttle.set_rate(scan_rate(backfill_rate));
+    }
+
+    /// Rows the next window may read now, at most `max`: 0 while resting
+    /// or throttled.
+    pub(crate) fn take(&mut self, max: u64, now: Instant) -> u64 {
+        if now < self.next {
+            return 0;
+        }
+        self.throttle.take(max, now)
+    }
+
+    /// A window read `read` rows of the `asked`, the last key `last`: the
+    /// walk goes on after it, or to the next shard at the end of this one.
+    pub(crate) fn advance(&mut self, last: Option<Vec<String>>, read: u64, asked: u64) {
+        if read >= asked && last.is_some() {
+            self.after = last;
+        } else {
+            self.shard += 1;
+            self.after = None;
+        }
+    }
+
+    /// Every shard walked: back to the first after the rest; the rows
+    /// this pass repaired.
+    pub(crate) fn pass_done(&mut self, now: Instant) -> u64 {
+        self.shard = 0;
+        self.after = None;
+        self.next = now + SCAN_REST;
+        std::mem::take(&mut self.repaired)
+    }
+}
+
+/// The stale-hash check's rows per second for a backfill rate.
+#[must_use]
+pub(crate) fn scan_rate(backfill_rate: u64) -> u64 {
+    (backfill_rate / SCAN_SHARE).max(1)
+}
+
+/// Whether `v` (a column of a row read) is a true flag (`1`, as either
+/// protocol returns it).
+pub(crate) fn flag(v: Option<&mysql_async::Value>) -> bool {
+    match v {
+        Some(mysql_async::Value::Int(n)) => *n != 0,
+        Some(mysql_async::Value::UInt(n)) => *n != 0,
+        Some(mysql_async::Value::Bytes(b)) => b.as_slice() != b"0" && !b.is_empty(),
+        _ => false,
+    }
+}
+
 // ---- one column -----------------------------------------------------------------
 
 /// One row's work for one generation: the target's index, the row's key,
@@ -395,6 +498,10 @@ struct Job<'a> {
     progress_dirty: u64,
     shards: Option<(Instant, Vec<(ShardLoc, ClusterId)>)>,
     embedded: u64,
+    /// How each cluster is read causally.
+    kinds: causal::Kinds,
+    /// The stale-hash check.
+    scan: Scan,
 }
 
 impl Job<'_> {
@@ -559,20 +666,30 @@ impl Job<'_> {
         sql
     }
 
-    /// Brings the rows `sql` selects up to date (see the module docs); the
-    /// last row's key as SQL literals and the number of rows read.
+    /// Brings the rows `sql` selects up to date (see the module docs),
+    /// reading them causally when `causal` (a feed round's keys); the last
+    /// row's key as SQL literals, the number of rows read and the number
+    /// written (embedded or cleared).
     #[allow(clippy::too_many_lines)] // the reconcile of the module docs
     async fn reconcile(
         &mut self,
         s: &ShardLoc,
         sql: &str,
+        causal: bool,
         cancel: &sprig_common::CancellationToken,
-    ) -> Result<(Option<Vec<String>>, u64)> {
+    ) -> Result<(Option<Vec<String>>, u64, u64)> {
         let pk = self.pk(s).await?;
         let pool = self.write_pool_of(s).await?;
         let mut c = pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::BackendUnavailable, format!("embedding: {e}"))
         })?;
+        let sql = if causal {
+            let cluster = self.cluster_of(s).await?;
+            let reads = self.kinds.of(&self.env.logic.registry, &cluster).await?;
+            causal::read_sql(reads, &mut c, sql).await?
+        } else {
+            sql.to_owned()
+        };
         let rows: Vec<mysql_async::Row> = c.query(sql).await.map_err(backend)?;
         let read = rows.len() as u64;
         let last = rows.last().map(|r| {
@@ -607,7 +724,7 @@ impl Job<'_> {
         }
         metrics::rows(self.model_label(), "skipped", skipped);
         if work.is_empty() {
-            return Ok((last, read));
+            return Ok((last, read, 0));
         }
         // Embed in batches, each written in one transaction.
         let where_pk: Vec<String> = pk.iter().map(|c| format!("{} = ?", quote(c))).collect();
@@ -693,7 +810,7 @@ impl Job<'_> {
         metrics::rows(&model, "superseded", superseded);
         self.embedded += embedded;
         self.progress_dirty += embedded;
-        Ok((last, read))
+        Ok((last, read, embedded + cleared))
     }
 
     /// The rows of `keys` (feed keys of one shard) brought up to date.
@@ -725,8 +842,68 @@ impl Job<'_> {
             let cols: Vec<String> = pk.iter().map(|c| quote(c)).collect();
             let pred = format!("({}) IN ({})", cols.join(", "), tuples.join(", "));
             let sql = self.select_sql(s, &pk, &pred, None);
-            self.reconcile(s, &sql, cancel).await?;
+            self.reconcile(s, &sql, true, cancel).await?;
         }
+        Ok(())
+    }
+
+    /// One window of the stale-hash check (see the module docs): the next
+    /// rows of the shard it is walking, read plainly; those whose stored
+    /// hash isn't their source's are reconciled. A pass over every shard
+    /// ends with a log line when it repaired rows.
+    async fn scan_step(&mut self, cancel: &sprig_common::CancellationToken) -> Result<()> {
+        let now = Instant::now();
+        let n = self.scan.take(CHUNK, now);
+        if n == 0 {
+            return Ok(());
+        }
+        let shards = self.shards().await?;
+        let Some((s, _)) = shards.get(self.scan.shard).cloned() else {
+            let repaired = self.scan.pass_done(now);
+            if repaired > 0 {
+                tracing::warn!(tenant = %self.tenant, embedding = self.col.row.id, db = %self.col.db, table = %self.col.table, column = %self.col.row.column, repaired, "embedded column: the stale-hash check brought rows up to date that their changes had missed");
+            }
+            return Ok(());
+        };
+        let pk = self.pk(&s).await?;
+        let sql = scan_sql(
+            &self.col.table_ref(self.tenant, &s),
+            &pk,
+            &self.col.targets,
+            self.scan.after.as_deref(),
+            n,
+        );
+        let rows: Vec<mysql_async::Row> = {
+            let pool = self.pool_of(&s).await?;
+            let mut c = pool.get_conn_bounded().await.map_err(|e| {
+                SprigError::new(SprigCode::BackendUnavailable, format!("embedding: {e}"))
+            })?;
+            c.query(sql).await.map_err(backend)?
+        };
+        let read = rows.len() as u64;
+        let key = |r: &mysql_async::Row| -> Vec<String> {
+            (0..pk.len())
+                .map(|i| {
+                    r.as_ref(i)
+                        .map_or_else(|| "NULL".to_owned(), |v| v.as_sql(false))
+                })
+                .collect()
+        };
+        let last = rows.last().map(key);
+        let stale: Vec<String> = rows
+            .iter()
+            .filter(|r| flag(r.as_ref(pk.len())))
+            .map(|r| format!("({})", key(r).join(", ")))
+            .collect();
+        if !stale.is_empty() {
+            let cols: Vec<String> = pk.iter().map(|c| quote(c)).collect();
+            let pred = format!("({}) IN ({})", cols.join(", "), stale.join(", "));
+            let sql = self.select_sql(&s, &pk, &pred, None);
+            let (_, _, written) = self.reconcile(&s, &sql, false, cancel).await?;
+            self.scan.repaired += written;
+            self.live.spend(stale.len() as u64, now);
+        }
+        self.scan.advance(last, read, n);
         Ok(())
     }
 
@@ -761,7 +938,7 @@ impl Job<'_> {
             _ => "TRUE".to_owned(),
         };
         let sql = self.select_sql(&s, &pk, &pred, Some(n));
-        let (last, read) = self.reconcile(&s, &sql, cancel).await?;
+        let (last, read, _) = self.reconcile(&s, &sql, false, cancel).await?;
         self.live.spend(read, Instant::now());
         let pos = match last {
             Some(l) if read >= n => json!(l),
@@ -892,6 +1069,34 @@ impl Job<'_> {
             .map_err(backend)?;
         Ok(n.unwrap_or(0) > 0)
     }
+}
+
+/// One window of the stale-hash check over `table`: the next `n` rows
+/// after key `after` (SQL literals; `None` from the start), in key order,
+/// each row's key and whether a generation's stored hash isn't its
+/// source's (1) or every one is (0). MariaDB hashes the sources; only keys
+/// and flags come back.
+fn scan_sql(
+    table: &str,
+    pk: &[String],
+    targets: &[Target],
+    after: Option<&[String]>,
+    n: u64,
+) -> String {
+    let keys: Vec<String> = pk.iter().map(|c| quote(c)).collect();
+    let keys = keys.join(", ");
+    let stale: Vec<String> = targets
+        .iter()
+        .map(|t| format!("NOT ({} <=> UNHEX(MD5({})))", quote(&t.hash), quote(&t.src)))
+        .collect();
+    let pred = after.map_or_else(
+        || "TRUE".to_owned(),
+        |a| format!("({keys}) > ({})", a.join(", ")),
+    );
+    format!(
+        "SELECT {keys}, ({}) FROM {table} WHERE {pred} ORDER BY {keys} LIMIT {n}",
+        stale.join(" OR ")
+    )
 }
 
 /// `[x,y,...]`, as `VEC_FromText` reads it.
@@ -1062,6 +1267,11 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
         progress_dirty: 0,
         shards: None,
         embedded: 0,
+        kinds: causal::Kinds::default(),
+        scan: Scan::new(
+            settings.tenant_get(tenant, &embedding::BACKFILL_ROWS_PER_S),
+            Instant::now(),
+        ),
         col,
     };
     // A failed column that loads again carries on.
@@ -1174,6 +1384,8 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
             job.live
                 .set_rate(settings.tenant_get(tenant, &embedding::ROWS_PER_S));
             job.backfill
+                .set_rate(settings.tenant_get(tenant, &embedding::BACKFILL_ROWS_PER_S));
+            job.scan
                 .set_rate(settings.tenant_get(tenant, &embedding::BACKFILL_ROWS_PER_S));
             let _ = cx
                 .progress(json!({"embedded": job.embedded, "state": job.col.row.state.as_str()}))
@@ -1344,6 +1556,14 @@ async fn serve(env: &EmbedEnv, cx: &JobCtx, tenant: TenantId, name: &str) -> Res
                     let _ = pause(&cx.cancel, Duration::from_secs(1)).await;
                 }
             }
+        } else if drain.is_none()
+            && job.col.row.state == State::Ready
+            && let Err(e) = job.scan_step(&cx.cancel).await
+        {
+            // The next window tries again; a failed column shows in the
+            // rounds.
+            job.shards = None;
+            tracing::debug!(%tenant, embedding = id, error = %e, "stale-hash check step failed; retrying");
         }
     }
     backlog_set(&job_key, 0);

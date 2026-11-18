@@ -256,7 +256,16 @@ impl PassSession {
             } else {
                 Vec::new()
             };
-            return mysqlddl::drop_dependency(column, check, &name, &checks);
+            if let Some(m) = mysqlddl::drop_dependency(column, check, &name, &checks) {
+                return Some(m);
+            }
+            // Only a functional key part's hidden check names it: MySQL's
+            // answer for the part (or for a generated column using it too).
+            if !check {
+                return None;
+            }
+            let generated = Box::pin(self.generated_columns(cx, &table)).await?;
+            return mysqlddl::generated_dependency_of(&[column.to_owned()], &generated);
         }
         let column = mysqlddl::generated_dependency_column(code, message)?;
         let (table, _, _) = mysqlddl::dropped_columns(original, &lex)?;
@@ -289,7 +298,7 @@ impl PassSession {
 
     /// The physical schema and name of `table` as written (perhaps
     /// qualified, quoted).
-    fn physical_written(&self, table: &str) -> Option<(String, String)> {
+    pub(super) fn physical_written(&self, table: &str) -> Option<(String, String)> {
         let (lex, _) = self.lex_opts();
         let names: Vec<String> = sprig_sql::lex::lex(table.as_bytes(), &lex)
             .ok()?
@@ -351,7 +360,9 @@ impl PassSession {
         Some((name, columns, checks))
     }
 
-    /// The table-level check constraints of physical `schema`.`name`.
+    /// The table-level check constraints of physical `schema`.`name`,
+    /// without functional key parts' hidden checks (their column's
+    /// dependencies are the part's).
     async fn table_checks(
         &mut self,
         cx: &mut ExecCtx<'_>,
@@ -380,6 +391,7 @@ impl PassSession {
                         clause: r.get(1)?.clone()?,
                     })
                 })
+                .filter(|k| sprig_sql::compat::fxindex::fx_column_of_check(&k.name).is_none())
                 .collect(),
         )
     }

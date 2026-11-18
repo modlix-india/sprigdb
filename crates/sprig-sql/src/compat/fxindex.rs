@@ -25,6 +25,19 @@
 //! as `Expression`; the name layer already hides `_sprig_` columns everywhere
 //! else.
 //!
+//! Values MySQL refuses and MariaDB only warns about. MySQL computes its
+//! hidden column strictly and refuses a value its cast would cut with 3751:
+//! `CAST(x AS CHAR(n))` of a longer value, `CAST(s AS SIGNED)` of text that
+//! isn't an integer. MariaDB computes the hidden column with a warning, and
+//! errors only in some statements (an `INSERT` naming its columns), so the
+//! row was written. Such a part also gets a hidden check
+//! [`FX_CHECK_PREFIX`]`<8 hex>` (the column's hex), `CHECK ((<condition>)
+//! OR <column> IS NULL)`, which MariaDB applies to every write of every
+//! statement form; it names the hidden column, so the name layer hides it
+//! wherever it hides the column, and the gateway answers its 4025 with
+//! MySQL's 3751 naming the index. `DROP INDEX` drops it with the index's
+//! last part over that column.
+//!
 //! The column's type: `CAST(x AS t)` gives `t` (`CHAR(n)` as `VARCHAR(n)`,
 //! `SIGNED` as `BIGINT`, ...); a string function of one column (`lower`,
 //! `upper`, `trim`, `left`, `substring`, ...) the column's type when the
@@ -72,6 +85,30 @@ pub fn is_fx_column(name: &str) -> bool {
         && name[FX_PREFIX.len()..]
             .bytes()
             .all(|b| b.is_ascii_hexdigit())
+}
+
+/// The name prefix of the hidden checks that refuse what MySQL's own
+/// hidden column refuses and MariaDB only warns about (see the module docs).
+pub const FX_CHECK_PREFIX: &str = "_sprig_fxck_";
+
+/// The hidden check of hidden column `column` (`_sprig_fxck_<8 hex>`).
+#[must_use]
+pub fn fx_check_name(column: &str) -> String {
+    format!(
+        "{FX_CHECK_PREFIX}{}",
+        column.get(FX_PREFIX.len()..).unwrap_or(column)
+    )
+}
+
+/// The hidden column whose check `name` is, if it is one.
+#[must_use]
+pub fn fx_column_of_check(name: &str) -> Option<String> {
+    let hex = name
+        .get(..FX_CHECK_PREFIX.len())
+        .filter(|p| p.eq_ignore_ascii_case(FX_CHECK_PREFIX))
+        .and_then(|_| name.get(FX_CHECK_PREFIX.len()..))?;
+    let column = format!("{FX_PREFIX}{hex}");
+    is_fx_column(&column).then_some(column)
 }
 
 struct Sig<'a> {
@@ -560,13 +597,84 @@ fn case_type(s: &Sig<'_>, a: usize, b: usize, cols: &BTreeMap<String, String>) -
     Some(format!("VARCHAR({n})"))
 }
 
+/// Whether a column type holds text (`CHAR`, `VARCHAR` and the `TEXT`
+/// types).
+fn is_text_type(t: &str) -> bool {
+    let up = t.trim_start().to_ascii_uppercase();
+    is_string_type(&up)
+        || ["TINYTEXT", "TEXT", "MEDIUMTEXT", "LONGTEXT"]
+            .iter()
+            .any(|w| up.starts_with(w))
+}
+
+/// For a part whose value MariaDB only warns about where MySQL refuses
+/// it with 3751 (`[a, b]`, the part's expression), the condition a valid
+/// value meets:
+///
+/// - `CAST(x AS CHAR(n))`, `CONVERT(x, CHAR(n))`: `CHAR_LENGTH(x) <= n`
+///   (MySQL refuses a value its cast would cut, trailing spaces included);
+/// - `CAST(c AS SIGNED)`, `CONVERT(c, SIGNED)` of a text column `c`: an
+///   integer between spaces, from -2^63 to 2^64 - 1 (MySQL refuses any
+///   other text, and wraps those above 2^63 - 1).
+///
+/// `None` for every other part.
+#[allow(clippy::many_single_char_names)] // the token positions, as in `infer`
+fn guard(s: &Sig<'_>, a: usize, b: usize, cols: &BTreeMap<String, String>) -> Option<String> {
+    let cast = s.word(a, b"CAST");
+    if !(cast || s.word(a, b"CONVERT")) || !s.punct(a + 1, b'(') || s.matching(a + 1) != Some(b) {
+        return None;
+    }
+    let mut d = 0;
+    let mut sep = None;
+    for k in a + 2..b {
+        if s.punct(k, b'(') {
+            d += 1;
+        } else if s.punct(k, b')') {
+            d -= 1;
+        } else if d == 0 && ((cast && s.word(k, b"AS")) || (!cast && s.punct(k, b','))) {
+            sep = Some(k);
+            break;
+        }
+    }
+    let sep = sep?;
+    if sep <= a + 2 || sep + 1 >= b {
+        return None;
+    }
+    let inner = s.text(a + 2, sep - 1);
+    if s.word(sep + 1, b"CHAR") && s.punct(sep + 2, b'(') && s.punct(sep + 4, b')') {
+        let n = s.t.get(sep + 3).filter(|t| t.kind == TokenKind::Number)?;
+        let n: u32 = std::str::from_utf8(n.bytes(s.sql)).ok()?.parse().ok()?;
+        return Some(format!("CHAR_LENGTH({inner}) <= {n}"));
+    }
+    let signed = s.word(sep + 1, b"SIGNED")
+        && (sep + 2 == b || (sep + 3 == b && s.word(sep + 2, b"INTEGER")));
+    let column = match sep - (a + 2) {
+        1 => s.ident(a + 2),
+        3 if s.punct(a + 3, b'.') => s.ident(a + 4),
+        _ => None,
+    };
+    if signed
+        && column.is_some_and(|c| cols.get(&c.to_lowercase()).is_some_and(|t| is_text_type(t)))
+    {
+        return Some(format!(
+            "{inner} REGEXP '^[[:space:]]*[-+]?[0-9]+[[:space:]]*$' AND \
+             CAST(REGEXP_REPLACE({inner}, '[[:space:]]', '') AS DECIMAL(65,0)) \
+             BETWEEN -9223372036854775808 AND 18446744073709551615"
+        ));
+    }
+    None
+}
+
 /// One functional part found: the part's `(` and `)`, its expression's
-/// token range, and the hidden column definition and name.
+/// token range, the hidden column definition and name, and the hidden check
+/// that refuses what MySQL refuses and MariaDB only warns about ([`guard`]),
+/// if the part needs one.
 struct Part {
     open: usize,
     close: usize,
     column: String,
     definition: String,
+    check: Option<String>,
 }
 
 /// The functional parts of the part list at `open` (`(` of the list).
@@ -588,11 +696,18 @@ fn parts(s: &Sig<'_>, open: usize, cols: &BTreeMap<String, String>) -> Option<Ve
         let ty = infer(s, a + 1, pc - 1, cols)?;
         let expr = s.text(a + 1, pc - 1);
         let column = fx_column(&expr);
+        let check = guard(s, a + 1, pc - 1, cols).map(|g| {
+            format!(
+                "CONSTRAINT `{}` CHECK (({g}) OR `{column}` IS NULL)",
+                fx_check_name(&column)
+            )
+        });
         out.push(Part {
             open: a,
             close: pc,
             definition: format!("`{column}` {ty} GENERATED ALWAYS AS ({expr}) VIRTUAL INVISIBLE"),
             column,
+            check,
         });
     }
     Some(out)
@@ -645,7 +760,10 @@ pub fn needs_types(sql: &[u8], opts: &LexOptions) -> Option<String> {
     if !maybe_functional(sql) {
         return None;
     }
-    if rewrite(sql, opts).is_some() {
+    // A `SIGNED` cast is typed without the table, but its hidden check
+    // needs to know whether it casts a text column.
+    if rewrite(sql, opts).is_some() && !sql.to_ascii_uppercase().windows(6).any(|w| w == b"SIGNED")
+    {
         return None;
     }
     let tokens = lex::lex(sql, opts).ok()?;
@@ -736,6 +854,13 @@ fn has_functional_part(s: &Sig<'_>, open: usize) -> bool {
         .any(|(a, b)| s.punct(a, b'(') && s.matching(a).is_some_and(|pc| pc < b && pc > a + 1))
 }
 
+/// A hidden check's `CONSTRAINT x CHECK (..)` as `CONSTRAINT IF NOT EXISTS x
+/// CHECK (..)`: an index over an expression another index has already
+/// made keeps its column and check.
+fn if_not_exists(check: &str) -> String {
+    check.replacen("CONSTRAINT ", "CONSTRAINT IF NOT EXISTS ", 1)
+}
+
 /// [`rewrite_with`], naming each index the client didn't name that has a
 /// functional part as MySQL would (`existing`: the table's index names,
 /// for `ALTER TABLE`; the statement's own names count too).
@@ -766,6 +891,7 @@ pub fn rewrite_named(
         let elems = s.split(open + 1, close);
         let cols = column_types(&s, &elems);
         let mut defs: BTreeMap<String, String> = BTreeMap::new();
+        let mut checks: BTreeMap<String, String> = BTreeMap::new();
         let mut taken: Vec<String> = elems
             .iter()
             .filter_map(|&(a, _)| key_name_slot(&s, a)?.0)
@@ -781,6 +907,9 @@ pub fn rewrite_named(
             }
             for p in ps {
                 edits.push((st(p.open), en(p.close), format!("`{}`", p.column)));
+                if let Some(c) = p.check {
+                    checks.insert(p.column.clone(), c);
+                }
                 defs.insert(p.column, p.definition);
             }
         }
@@ -788,10 +917,13 @@ pub fn rewrite_named(
             return None;
         }
         let at = st(close);
-        let text = defs.values().fold(String::new(), |mut s, d| {
-            let _ = write!(s, ", {d}");
-            s
-        });
+        let text = defs
+            .values()
+            .chain(checks.values())
+            .fold(String::new(), |mut s, d| {
+                let _ = write!(s, ", {d}");
+                s
+            });
         edits.push((at, at, text));
         return Some(apply(sql, edits));
     }
@@ -826,6 +958,9 @@ pub fn rewrite_named(
         for p in &ps {
             if !seen.contains(&p.column) {
                 let _ = write!(cols, "ADD COLUMN IF NOT EXISTS {}, ", p.definition);
+                if let Some(c) = &p.check {
+                    let _ = write!(cols, "ADD {}, ", if_not_exists(c));
+                }
                 seen.push(p.column.clone());
             }
         }
@@ -841,7 +976,7 @@ pub fn rewrite_named(
     }
     // ALTER TABLE t ADD [UNIQUE] {INDEX | KEY} [i] (parts), ...
     if s.word(0, b"ALTER") && s.word(1, b"TABLE") {
-        let mut defs: Vec<(String, String)> = Vec::new();
+        let mut defs: Vec<(String, String, Option<String>)> = Vec::new();
         let specs = s.split(2, s.t.len());
         let first_add = (2..s.t.len()).find(|&k| s.word(k, b"ADD"))?;
         let start_of = |a: usize| if a == 2 { first_add } else { a };
@@ -870,8 +1005,8 @@ pub fn rewrite_named(
             }
             for p in ps {
                 edits.push((st(p.open), en(p.close), format!("`{}`", p.column)));
-                if !defs.iter().any(|(c, _)| *c == p.column) {
-                    defs.push((p.column, p.definition));
+                if !defs.iter().any(|(c, _, _)| *c == p.column) {
+                    defs.push((p.column, p.definition, p.check));
                 }
             }
         }
@@ -880,8 +1015,11 @@ pub fn rewrite_named(
         }
         // The columns come first: `ADD INDEX` names them.
         let at = st(first_add);
-        let text = defs.iter().fold(String::new(), |mut s, (_, d)| {
+        let text = defs.iter().fold(String::new(), |mut s, (_, d, c)| {
             let _ = write!(s, "ADD COLUMN IF NOT EXISTS {d}, ");
+            if let Some(c) = c {
+                let _ = write!(s, "ADD {}, ", if_not_exists(c));
+            }
             s
         });
         edits.push((at, at, text));
@@ -1155,6 +1293,74 @@ mod tests {
 
     fn rw(s: &str) -> Option<String> {
         rewrite(s.as_bytes(), &LexOptions::mysql84()).map(|v| String::from_utf8(v).unwrap())
+    }
+
+    #[test]
+    fn casts_mysql_refuses_get_a_hidden_check() {
+        let out = rw("CREATE TABLE t (id INT PRIMARY KEY, s VARCHAR(20), n INT, \
+                      INDEX i ((CAST(s AS CHAR(2)))), INDEX j ((CAST(s AS SIGNED))), \
+                      INDEX k ((CAST(n AS SIGNED))), INDEX l ((LOWER(s))))")
+        .unwrap();
+        let c = fx_column("CAST(s AS CHAR(2))");
+        let j = fx_column("CAST(s AS SIGNED)");
+        assert!(
+            out.contains(&format!(
+                ", CONSTRAINT `{}` CHECK ((CHAR_LENGTH(s) <= 2) OR `{c}` IS NULL)",
+                fx_check_name(&c)
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                ", CONSTRAINT `{}` CHECK ((s REGEXP '^[[:space:]]*[-+]?[0-9]+[[:space:]]*$' AND \
+                 CAST(REGEXP_REPLACE(s, '[[:space:]]', '') AS DECIMAL(65,0)) \
+                 BETWEEN -9223372036854775808 AND 18446744073709551615) OR `{j}` IS NULL)",
+                fx_check_name(&j)
+            )),
+            "{out}"
+        );
+        // An integer column's cast and a function need none.
+        assert_eq!(out.matches("CONSTRAINT").count(), 2, "{out}");
+        assert_eq!(fx_column_of_check(&fx_check_name(&c)), Some(c.clone()));
+        assert_eq!(fx_column_of_check("_sprig_fxck_zz"), None);
+        assert_eq!(fx_column_of_check("chk_1"), None);
+        // CREATE INDEX and ALTER TABLE add the check after the column.
+        let known: BTreeMap<String, String> = [("s".to_owned(), "varchar(20)".to_owned())]
+            .into_iter()
+            .collect();
+        let o = LexOptions::mysql84();
+        assert_eq!(
+            needs_types(b"CREATE INDEX j ON t ((CAST(s AS SIGNED)))", &o),
+            Some("t".to_owned())
+        );
+        let out = String::from_utf8(
+            rewrite_with(b"CREATE INDEX i ON t ((CAST(s AS CHAR(2))))", &o, &known).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            out.starts_with(&format!(
+                "ALTER TABLE t ADD COLUMN IF NOT EXISTS `{c}` VARCHAR(2) GENERATED ALWAYS AS \
+                 (CAST(s AS CHAR(2))) VIRTUAL INVISIBLE, ADD CONSTRAINT IF NOT EXISTS `{}` CHECK \
+                 ((CHAR_LENGTH(s) <= 2) OR `{c}` IS NULL), ADD INDEX `i`",
+                fx_check_name(&c)
+            )),
+            "{out}"
+        );
+        let out = String::from_utf8(
+            rewrite_named(
+                b"ALTER TABLE t ADD INDEX ((CONVERT(s, SIGNED)))",
+                &o,
+                &known,
+                &[],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            out.contains("ADD CONSTRAINT IF NOT EXISTS `_sprig_fxck_"),
+            "{out}"
+        );
+        assert!(out.contains("REGEXP_REPLACE(s, "), "{out}");
     }
 
     #[test]

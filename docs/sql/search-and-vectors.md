@@ -228,7 +228,7 @@ The statement then runs as usual. A table without any search index keeps MariaDB
 | Natural language (default) | Words, any of which may match, ranked by BM25 |
 | Boolean | MySQL's operators: `+word` (required), `-word` (excluded), `"phrase"`, `word*` (prefix), `( )`, and `>word`, `<word`, `~word`, which become boosts of 1.5, 0.67 and 0.5 |
 
-`WITH QUERY EXPANSION` fails with 39823. A placeholder (`?`) in `AGAINST` works only in a statement your driver prepares (server-side prepared statements); a search statement prepared in SQL, with `PREPARE` or `EXECUTE IMMEDIATE`, isn't supported yet and fails with MariaDB's error 1191. A table with search indexes none of which covers the columns fails with 39821 `ER_SPRIG_SEARCH_NO_INDEX_FOR_MATCH`.
+`WITH QUERY EXPANSION` fails with 39823. A placeholder (`?`) in `AGAINST` works in a statement your driver prepares, and in one prepared in SQL with `PREPARE ... FROM` or run with `EXECUTE IMMEDIATE ... USING`. A table with search indexes none of which covers the columns fails with 39821 `ER_SPRIG_SEARCH_NO_INDEX_FOR_MATCH`.
 
 ```sql
 SELECT id, name, MATCH (name, description) AGAINST ('running shoe') AS score

@@ -263,6 +263,35 @@ fn functional_index_errors_name_the_index() {
         None
     );
     assert_eq!(functional_index_error(1064, &msg, b"", &my()), None);
+    // A hidden check refusing a row already there when the index is added.
+    let c = super::super::fxindex::fx_column("CAST(s AS CHAR(2))");
+    let msg = format!(
+        "CONSTRAINT `{}` failed for `t9_d1_g1_s1`.`tc2`",
+        super::super::fxindex::fx_check_name(&c)
+    );
+    let m = functional_index_error(
+        4025,
+        &msg,
+        b"CREATE INDEX i2 ON tc2 ((CAST(s AS CHAR(2))))",
+        &my(),
+    )
+    .unwrap();
+    assert_eq!(
+        (m.code, m.sqlstate, m.message.as_str()),
+        (
+            3751,
+            *b"01000",
+            "Data truncated for functional index 'i2' at row 1"
+        )
+    );
+    let m = functional_index_error(
+        4025,
+        &msg,
+        b"ALTER TABLE tc2 ADD INDEX ((CAST(s AS CHAR(2))))",
+        &my(),
+    )
+    .unwrap();
+    assert!(m.message.contains("'functional_index'"), "{}", m.message);
 }
 
 #[test]
@@ -412,6 +441,20 @@ fn values_that_dont_fit_a_functional_index() {
         );
     }
     // A user's column, another code, or a hidden column named elsewhere.
+    // A hidden column's check (no row number in MariaDB's words).
+    let e = fx_value_error(
+        4025,
+        "CONSTRAINT `_sprig_fxck_0a1b2c3d` failed for `t9_d1_g1_s1`.`t`",
+    )
+    .unwrap();
+    assert_eq!(
+        (e.column.as_str(), e.row, e.out_of_range),
+        ("_sprig_fx_0a1b2c3d", 1, false)
+    );
+    assert_eq!(
+        fx_value_error(4025, "CONSTRAINT `chk_1` failed for `db`.`t`"),
+        None
+    );
     assert_eq!(
         fx_value_error(1264, "Out of range value for column 'c0' at row 1"),
         None

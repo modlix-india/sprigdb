@@ -77,3 +77,90 @@ fn vectors_are_written_as_text() {
     assert_eq!(vec_text(&[0.5, -1.0, 0.0]), "[0.5,-1,0]");
     assert_eq!(vec_text(&[]), "[]");
 }
+
+#[test]
+fn the_stale_hash_check_reads_keys_and_flags() {
+    let t = |vec: &str, src: &str, hash: &str| Target {
+        vec: vec.into(),
+        src: src.into(),
+        hash: hash.into(),
+        max_tokens: 512,
+    };
+    let targets = [t("emb", "_sprig_emb_emb_src", "_sprig_emb_emb_hash")];
+    let pk = ["org".to_owned(), "id".to_owned()];
+    assert_eq!(
+        scan_sql("`s1`.`t`", &pk, &targets, None, 50),
+        "SELECT `org`, `id`, (NOT (`_sprig_emb_emb_hash` <=> UNHEX(MD5(`_sprig_emb_emb_src`)))) \
+         FROM `s1`.`t` WHERE TRUE ORDER BY `org`, `id` LIMIT 50"
+    );
+    // After a key; every generation filled is checked (a re-embedding's
+    // shadow too).
+    let two = [
+        targets[0].clone(),
+        t(
+            "_sprig_emb_emb_g2",
+            "_sprig_emb_emb_src",
+            "_sprig_emb_emb_g2_hash",
+        ),
+    ];
+    let next = scan_sql(
+        "`s1`.`t`",
+        &pk,
+        &two,
+        Some(&["'a'".to_owned(), "7".to_owned()]),
+        5,
+    );
+    assert!(
+        next.contains("WHERE (`org`, `id`) > ('a', 7) ORDER BY `org`, `id` LIMIT 5"),
+        "{next}"
+    );
+    assert!(
+        next.contains(
+            "(NOT (`_sprig_emb_emb_hash` <=> UNHEX(MD5(`_sprig_emb_emb_src`))) OR \
+             NOT (`_sprig_emb_emb_g2_hash` <=> UNHEX(MD5(`_sprig_emb_emb_src`))))"
+        ),
+        "{next}"
+    );
+}
+
+#[test]
+fn the_stale_hash_check_walks_rests_and_is_throttled() {
+    let t0 = Instant::now();
+    // A tenth of the backfill's rate, at least one a second.
+    assert_eq!(scan_rate(500), 50);
+    assert_eq!(scan_rate(5), 1);
+    let mut s = Scan::new(500, t0);
+    // Resting after the job starts.
+    assert_eq!(s.take(500, t0), 0);
+    assert_eq!(s.take(500, t0 + Duration::from_secs(59)), 0);
+    let at = t0 + SCAN_REST;
+    // Then a second's worth, then throttled.
+    assert_eq!(s.take(500, at), 50);
+    assert_eq!(s.take(500, at), 0);
+    // A full window goes on after its last key; a short one ends the
+    // shard.
+    s.advance(Some(vec!["7".into()]), 50, 50);
+    assert_eq!((s.shard, s.after.clone()), (0, Some(vec!["7".to_owned()])));
+    s.advance(Some(vec!["9".into()]), 3, 50);
+    assert_eq!((s.shard, s.after.clone()), (1, None));
+    s.advance(None, 0, 50);
+    assert_eq!((s.shard, s.after.clone()), (2, None));
+    // The pass ends: back to the start after a rest, with what it repaired.
+    s.repaired = 3;
+    let end = at + Duration::from_secs(10);
+    assert_eq!(s.pass_done(end), 3);
+    assert_eq!((s.shard, s.after.clone(), s.repaired), (0, None, 0));
+    assert_eq!(s.take(500, end + Duration::from_secs(5)), 0);
+    assert!(s.take(500, end + SCAN_REST) > 0);
+}
+
+#[test]
+fn flags_read_from_either_protocol() {
+    use mysql_async::Value;
+    assert!(flag(Some(&Value::Bytes(b"1".to_vec()))));
+    assert!(!flag(Some(&Value::Bytes(b"0".to_vec()))));
+    assert!(flag(Some(&Value::Int(1))));
+    assert!(!flag(Some(&Value::Int(0))));
+    assert!(!flag(Some(&Value::NULL)));
+    assert!(!flag(None));
+}

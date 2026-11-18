@@ -9,8 +9,9 @@
 //! 2. **Regroup.** Under a hold of the tenant's map (at most
 //!    `mover.cutover_max_hold_ms`), move every member into its group's
 //!    schema with one atomic `RENAME TABLE` on the same server (triggers
-//!    are dropped before and re-created after, inside the hold), then
-//!    release.
+//!    are dropped before and re-created after, inside the hold; policy
+//!    views and a key table's own views are re-created in the new schema
+//!    and dropped from the old), then release.
 //! 3. Add `_sprig_rk` (an online `ALTER`), mark members `filling` (from now
 //!    on writers fill it), and back-fill it: column members by primary-key
 //!    chunks hashed in Rust, parent members by copying the co-located
@@ -375,6 +376,78 @@ async fn policy_views(
     Ok(out)
 }
 
+/// A moved key table's key-value views in `schema` (`<table>__hash`,
+/// `__list`, `__set`, `__zset`, [`super::code::kv_view`]): (name, `CREATE
+/// VIEW` text).
+async fn kv_views(c: &mut Conn, schema: &str, table: &str) -> Result<Vec<(String, String)>> {
+    let names: Vec<String> = super::code::KV_VIEW_SUFFIXES
+        .iter()
+        .map(|s| format!("{table}{s}"))
+        .collect();
+    let found: Vec<String> = c
+        .exec(
+            "SELECT TABLE_NAME FROM information_schema.VIEWS WHERE TABLE_SCHEMA = ? \
+             AND TABLE_NAME IN (?, ?, ?, ?)",
+            (schema, &names[0], &names[1], &names[2], &names[3]),
+        )
+        .await
+        .map_err(|e| db_err("key-value views", &e))?;
+    let mut out = Vec::new();
+    for n in found {
+        let r: Option<Row> = c
+            .query_first(format!("SHOW CREATE VIEW {}.{}", quote(schema), quote(&n)))
+            .await
+            .map_err(|e| db_err("SHOW CREATE VIEW", &e))?;
+        if let Some(body) = r.and_then(|r| r.get::<String, _>(1)) {
+            out.push((n, body));
+        }
+    }
+    Ok(out)
+}
+
+/// A key-value view's `CREATE VIEW` text (`SHOW CREATE VIEW` of
+/// a view in `from`) re-made in `to`: every name it qualifies with `from`
+/// (the view's own, its key and element tables) moves to `to`.
+fn kv_view_in(body: &str, from: &str, to: &str) -> String {
+    body.replacen("CREATE ", "CREATE OR REPLACE ", 1)
+        .replace(&format!("{}.", quote(from)), &format!("{}.", quote(to)))
+}
+
+/// Re-creates moved key tables' views (`views`: from, to, name, text) in
+/// their new schemas. Best effort: a view that can't be made is logged and
+/// left where it was (the gateways make missing ones again at a
+/// namespace's first use); the regroup never fails for one. Returns the
+/// views made (the caller carries their grants and drops the old ones).
+async fn move_kv_views(
+    c: &mut Conn,
+    views: &[(String, String, String, String)],
+) -> Vec<(String, String, String)> {
+    let mut made = Vec::new();
+    for (from, to, name, body) in views {
+        match c.query_drop(kv_view_in(body, from, to)).await {
+            Ok(()) => made.push((from.clone(), to.clone(), name.clone())),
+            Err(e) => {
+                tracing::warn!(schema = %to, view = %name, error = %e, "a key-value view didn't follow the regroup");
+            }
+        }
+    }
+    made
+}
+
+#[cfg(test)]
+#[test]
+fn key_value_views_move_with_their_tables() {
+    let body = "CREATE ALGORITHM=UNDEFINED DEFINER=`t9_u1`@`%` SQL SECURITY INVOKER VIEW \
+                `t9_d1_g1_s1`.`db0__hash` AS select `t`.`k` AS `k` from (`t9_d1_g1_s1`.`db0` `t` \
+                join `t9_d1_g1_s1`.`__sprig_ke_db0` `e` on(`e`.`k` = `t`.`k`))";
+    assert_eq!(
+        kv_view_in(body, "t9_d1_g1_s1", "t9_d1_g3_s1"),
+        "CREATE OR REPLACE ALGORITHM=UNDEFINED DEFINER=`t9_u1`@`%` SQL SECURITY INVOKER VIEW \
+         `t9_d1_g3_s1`.`db0__hash` AS select `t`.`k` AS `k` from (`t9_d1_g3_s1`.`db0` `t` \
+         join `t9_d1_g3_s1`.`__sprig_ke_db0` `e` on(`e`.`k` = `t`.`k`))"
+    );
+}
+
 #[cfg(test)]
 #[test]
 fn policy_views_are_recognised() {
@@ -613,12 +686,19 @@ async fn regroup(
     let mut trig: Vec<(String, String, String)> = Vec::new(); // (to schema, name, body)
     // Policy views: (from, to, view, definer account, text).
     let mut pviews: Vec<(String, String, String, String, String)> = Vec::new();
+    // Key-value views: (from, to, view, text).
+    let mut kvviews: Vec<(String, String, String, String)> = Vec::new();
     for (from, to, t) in &moves {
         for (n, body) in triggers(c, from, t).await? {
             trig.push((to.clone(), n, body));
         }
         for (n, account, body) in policy_views(c, from, t).await? {
             pviews.push((from.clone(), to.clone(), n, account, body));
+        }
+        // A key table's own views follow it into its group's schema,
+        // where splits and moves copy them into every shard.
+        for (n, body) in kv_views(c, from, t).await? {
+            kvviews.push((from.clone(), to.clone(), n, body));
         }
     }
     let holder = format!("advisor-run-{run}");
@@ -681,6 +761,19 @@ async fn regroup(
         }
         for (from, to, n) in &made {
             carry_grants(c, ctx.tenant, from, to, n).await;
+        }
+        let made_kv = move_kv_views(c, &kvviews).await;
+        for (from, to, n) in &made_kv {
+            carry_grants(c, ctx.tenant, from, to, n).await;
+        }
+        // The old ones read tables that aren't there any more.
+        for (from, _, n) in &made_kv {
+            if let Err(e) = c
+                .query_drop(format!("DROP VIEW IF EXISTS {}.{}", quote(from), quote(n)))
+                .await
+            {
+                tracing::warn!(schema = %from, view = %n, error = %e, "a moved key table's old view wasn't dropped");
+            }
         }
         // Every old policy view of a moved table reads nothing valid now.
         for (from, _, n, _, _) in &pviews {

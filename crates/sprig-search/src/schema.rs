@@ -25,7 +25,7 @@ use tantivy::schema::{
 use tantivy::{DateTime, TantivyDocument};
 
 use crate::analyze::{Analyzers, CustomAnalyzer};
-use crate::def::{FieldDef, FieldKind, IndexDef, Model, Source};
+use crate::def::{FieldDef, FieldKind, Flavor, IndexDef, Model, Source};
 
 /// One part of a table's key, as read from a row.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -349,8 +349,10 @@ impl IndexSchema {
         if let Some(allf) = self.all {
             let mut vals = Vec::new();
             match r {
-                Record::Doc { doc, .. } => {
-                    if let Json::Object(m) = doc {
+                Record::Doc { key, doc } => {
+                    if self.def.flavor == Flavor::MongoText {
+                        mongo_text_strings(key, doc, &mut vals);
+                    } else if let Json::Object(m) = doc {
                         for (k, v) in m {
                             if k != "_id" {
                                 all_strings(v, &mut vals);
@@ -413,6 +415,41 @@ fn all_strings(j: &Json, out: &mut Vec<String>) {
         Json::Array(a) => a.iter().for_each(|x| all_strings(x, out)),
         Json::Object(m) => m.values().for_each(|x| all_strings(x, out)),
         _ => {}
+    }
+}
+
+/// The strings a MongoDB `$**` text index covers in a stored document, as
+/// MongoDB indexes them: every string, the `_id`'s included when it is a
+/// string or a document (its key's class byte tells a string from an
+/// object id, which is stored as hex text), and the language override
+/// (`language`, a string at any level) left out.
+fn mongo_text_strings(key: &Key, doc: &Json, out: &mut Vec<String>) {
+    fn walk(j: &Json, out: &mut Vec<String>) {
+        match j {
+            Json::String(s) => out.push(s.clone()),
+            Json::Array(a) => a.iter().for_each(|x| walk(x, out)),
+            Json::Object(m) => {
+                for (k, v) in m {
+                    if !(k == "language" && v.is_string()) {
+                        walk(v, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let Json::Object(m) = doc else {
+        return;
+    };
+    for (k, v) in m {
+        if k == "_id" {
+            // The key's class bytes: 40 strings, 50 documents.
+            if matches!(key.0.first(), Some(40 | 50)) {
+                walk(v, out);
+            }
+        } else if !(k == "language" && v.is_string()) {
+            walk(v, out);
+        }
     }
 }
 
@@ -636,5 +673,53 @@ mod tests {
             doc: json!({"_id": 2, "other": 1}),
         };
         assert!(s.extract(&none).is_none());
+    }
+
+    #[test]
+    fn mongo_text_wildcard_covers_string_ids_and_skips_the_language_override() {
+        let def = IndexDef::from_mongo_text(
+            "t",
+            "db",
+            "c",
+            &[("$**".into(), json!("text"))],
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        let s = IndexSchema::build(&def, &[]).unwrap();
+        let all = s.all.unwrap();
+        let strings = |class: u8, doc: Json| {
+            let r = Record::Doc {
+                key: Key(vec![class, b'k', 0, 0]),
+                doc,
+            };
+            s.extract(&r).map_or(0, |d| d.get_all(all).count())
+        };
+        // A string `_id` (class 40) and a document `_id`'s strings (50).
+        assert_eq!(strings(40, json!({"_id": "zebra crossing", "n": 1})), 1);
+        assert_eq!(strings(50, json!({"_id": {"k": "walrus"}, "a": "x"})), 2);
+        // An ObjectId is stored as hex text; its class (80) says it isn't one.
+        assert_eq!(
+            strings(80, json!({"_id": "65a1b2c3d4e5f60718293a4b", "a": "x"})),
+            1
+        );
+        // The language override, at any level, isn't indexed.
+        assert_eq!(
+            strings(
+                30,
+                json!({"_id": 1, "language": "english", "n": {"language": "english", "b": "kiwi"}})
+            ),
+            1
+        );
+        // Atlas-style dynamic indexes keep leaving `_id` out.
+        let mut atlas = IndexDef::new("i", "d", "c", Model::Collection, Flavor::MongoSearch);
+        atlas.dynamic = true;
+        let a = IndexSchema::build(&atlas, &[]).unwrap();
+        let r = Record::Doc {
+            key: Key(vec![40, b'k', 0, 0]),
+            doc: json!({"_id": "zebra", "language": "english"}),
+        };
+        assert_eq!(a.extract(&r).unwrap().get_all(a.all.unwrap()).count(), 1);
     }
 }

@@ -70,14 +70,37 @@ struct Global {
     /// Totals since start (`serverStatus`).
     total_spills: AtomicU64,
     total_bytes: AtomicU64,
-    /// By kind (`serverStatus`'s `metrics.query`): spills, bytes,
-    /// records.
+    /// The whole gateway's `serverStatus` counters.
+    all: Counters,
+    /// Each tenant's.
+    tenants: Mutex<HashMap<u64, Arc<Counters>>>,
+}
+
+/// `serverStatus`'s `metrics.query` counters of one tenant, or of the
+/// whole gateway.
+#[derive(Default)]
+struct Counters {
+    /// Every spill and its bytes (`sprigSpills`).
+    spills: AtomicU64,
+    bytes: AtomicU64,
+    /// By kind: spills, bytes, records.
     by_kind: [[AtomicU64; 3]; KINDS],
     /// Documents and bytes sorted (`metrics.query.sort`).
     sorted_keys: AtomicU64,
     sorted_bytes: AtomicU64,
     /// Commands run with `allowDiskUse: false`.
     disallowed: AtomicU64,
+}
+
+/// Runs `f` on the whole gateway's counters and on `tenant`'s (0: none,
+/// outside a command's context).
+fn count(tenant: u64, f: impl Fn(&Counters)) {
+    let g = global();
+    f(&g.all);
+    if tenant != 0 {
+        let c = Arc::clone(lock(&g.tenants).entry(tenant).or_default());
+        f(&c);
+    }
 }
 
 /// What spilled, for `serverStatus`: MongoDB 8.0's `metrics.query`
@@ -136,10 +159,8 @@ fn global() -> &'static Global {
             seq: AtomicU64::new(0),
             total_spills: AtomicU64::new(0),
             total_bytes: AtomicU64::new(0),
-            by_kind: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
-            sorted_keys: AtomicU64::new(0),
-            sorted_bytes: AtomicU64::new(0),
-            disallowed: AtomicU64::new(0),
+            all: Counters::default(),
+            tenants: Mutex::new(HashMap::new()),
         }
     })
 }
@@ -277,19 +298,31 @@ pub fn totals() -> (u64, u64) {
     )
 }
 
-/// Counts a command run with `allowDiskUse: false`
+/// Counts a command of `tenant` run with `allowDiskUse: false`
 /// (`metrics.query.allowDiskUseFalse`).
-pub fn note_disallowed() {
-    global().disallowed.fetch_add(1, AO::Relaxed);
+pub fn note_disallowed(tenant: u64) {
+    count(tenant, |c| {
+        c.disallowed.fetch_add(1, AO::Relaxed);
+    });
 }
 
 /// `serverStatus`'s spill counters, in MongoDB 8.0's
 /// `metrics.query` shape: `allowDiskUseFalse`, `group`,
 /// `setWindowFields` and `sort`, plus SprigDB's `graphLookup` and
-/// `sprigSpills` (every spill, including the collection's read).
+/// `sprigSpills` (every spill, including the collection's read): `tenant`'s
+/// own (its commands' spills on this gateway), or the whole gateway's for
+/// `None`.
 #[must_use]
-pub fn metrics_doc() -> Document {
-    let g = global();
+pub fn metrics_doc(tenant: Option<u64>) -> Document {
+    let gl = global();
+    let mine;
+    let g: &Counters = match tenant {
+        None => &gl.all,
+        Some(t) => {
+            mine = lock(&gl.tenants).get(&t).cloned().unwrap_or_default();
+            &mine
+        }
+    };
     let n = |a: &AtomicU64| i64::try_from(a.load(AO::Relaxed)).unwrap_or(i64::MAX);
     let k = |kind: Kind| &g.by_kind[kind.index()];
     let four = |kind: Kind| {
@@ -319,8 +352,8 @@ pub fn metrics_doc() -> Document {
         },
         "graphLookup": four(Kind::Graph),
         "sprigSpills": {
-            "spills": n(&g.total_spills),
-            "spilledBytes": n(&g.total_bytes),
+            "spills": n(&g.spills),
+            "spilledBytes": n(&g.bytes),
         },
     }
 }
@@ -343,8 +376,12 @@ fn charge(tenant: u64, n: u64) -> Result<(), MongoError> {
         ));
     }
     *t += n;
+    drop(pt);
     g.used.fetch_add(n, AO::Relaxed);
     g.total_bytes.fetch_add(n, AO::Relaxed);
+    count(tenant, |c| {
+        c.bytes.fetch_add(n, AO::Relaxed);
+    });
     Ok(())
 }
 
@@ -454,10 +491,13 @@ fn record(bytes: u64, records: u64, storage: u64) {
         .try_with(|c| c.kind.load(AO::Relaxed))
         .unwrap_or(Kind::Other.index())
         .min(KINDS - 1);
-    let c = &g.by_kind[ki];
-    c[0].fetch_add(1, AO::Relaxed);
-    c[1].fetch_add(bytes, AO::Relaxed);
-    c[2].fetch_add(records, AO::Relaxed);
+    count(tenant(), |t| {
+        t.spills.fetch_add(1, AO::Relaxed);
+        let c = &t.by_kind[ki];
+        c[0].fetch_add(1, AO::Relaxed);
+        c[1].fetch_add(bytes, AO::Relaxed);
+        c[2].fetch_add(records, AO::Relaxed);
+    });
     let _ = CTX.try_with(|c| {
         let i = c.stage.load(AO::Relaxed);
         let mut s = lock(&c.stats);
@@ -848,9 +888,10 @@ pub fn sort_seq(
         let d = d?;
         let b = doc_bytes(&d);
         bytes += b;
-        let g = global();
-        g.sorted_keys.fetch_add(1, AO::Relaxed);
-        g.sorted_bytes.fetch_add(b as u64, AO::Relaxed);
+        count(tenant(), |c| {
+            c.sorted_keys.fetch_add(1, AO::Relaxed);
+            c.sorted_bytes.fetch_add(b as u64, AO::Relaxed);
+        });
         buf.push(d);
         if trim_at.is_some_and(|t| buf.len() >= t) || (limit.is_some() && bytes > budget) {
             sort_buf(&mut buf, &cmp, limit);

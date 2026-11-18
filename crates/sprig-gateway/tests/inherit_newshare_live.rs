@@ -853,3 +853,449 @@ async fn a_childs_reseed_reaches_the_grandchilds_copy() {
         ok(x, "SPRIG RESET inherit.merge").await;
     }
 }
+
+/// A parent's `FORCE ROW LEVEL SECURITY` binds the parent's own managers,
+/// but not the account its share views run as (the tenant's share
+/// definer, which no user owns and no policy names): its children still
+/// read every record the share gives them, read through and materialized,
+/// also records the parent writes while forced. Before the share definer,
+/// the views ran as the share's creator, whom `FORCE` bound, and every
+/// child's read failed with 1142.
+#[tokio::test]
+async fn a_parents_forced_policies_dont_bind_its_share_views() {
+    let Some(e) = env() else {
+        eprintln!("SPRIG_TEST_NEWSHARE_* not set; skipped");
+        return;
+    };
+    for merge in ["read_through", "materialized"] {
+        let db = format!("sf20fp{}{}", &merge[..1], suffix());
+        let mut p = conn(&e.addr, &e.parent).await;
+        ok(&mut p, &format!("SPRIG SET inherit.merge = '{merge}'")).await;
+        share(&mut p, &db).await;
+        ok(&mut p, "SPRIG RESET inherit.merge").await;
+        let both = [("1", "parent one"), ("2", "parent two")];
+        let mut c = conn(&e.addr, &e.child).await;
+        ok(&mut c, &format!("USE {db}")).await;
+        assert_eq!(
+            rows_become(&mut c, &db, &both).await,
+            pairs(&both),
+            "{merge}"
+        );
+
+        // A policy no row passes for reads, one that lets the parent
+        // write, and FORCE, so the parent's own `app` (a manager) is bound.
+        ok(
+            &mut p,
+            "CREATE POLICY sf20_none ON t1 FOR SELECT USING (id < 0)",
+        )
+        .await;
+        ok(
+            &mut p,
+            "CREATE POLICY sf20_add ON t1 FOR INSERT WITH CHECK (TRUE)",
+        )
+        .await;
+        ok(&mut p, "ALTER TABLE t1 ENABLE ROW LEVEL SECURITY").await;
+        ok(&mut p, "ALTER TABLE t1 FORCE ROW LEVEL SECURITY").await;
+        let seen = ok(&mut p, "SELECT COUNT(*) FROM t1").await;
+        assert_eq!(
+            seen[0][0].as_deref(),
+            Some("0"),
+            "{merge}: the parent is bound"
+        );
+        ok(&mut p, "INSERT INTO t1 VALUES (3, 'parent three')").await;
+        let seen = ok(&mut p, "SELECT COUNT(*) FROM t1").await;
+        assert_eq!(seen[0][0].as_deref(), Some("0"), "{merge}: still bound");
+
+        // The child, on its open connection and on a new one, reads all
+        // three records.
+        let three = [
+            ("1", "parent one"),
+            ("2", "parent two"),
+            ("3", "parent three"),
+        ];
+        let got = rows_become(&mut c, &db, &three).await;
+        println!("{merge}: the child under the parent's FORCE: {got:?}");
+        assert_eq!(got, pairs(&three), "{merge}");
+        let mut c2 = conn(&e.addr, &e.child).await;
+        assert_eq!(rows_of(&mut c2, &db).await, pairs(&three), "{merge}");
+        drop_conns(vec![c2]).await;
+
+        ok(&mut p, "ALTER TABLE t1 NO FORCE ROW LEVEL SECURITY").await;
+        ok(&mut p, "ALTER TABLE t1 DISABLE ROW LEVEL SECURITY").await;
+        ok(&mut p, "DROP POLICY sf20_none ON t1").await;
+        ok(&mut p, "DROP POLICY sf20_add ON t1").await;
+        ok(&mut p, &format!("DROP SHARE {db}_s")).await;
+        ok(&mut p, &format!("DROP DATABASE {db}")).await;
+        ok(&mut c, &format!("DROP DATABASE IF EXISTS {db}")).await;
+        drop_conns(vec![p, c]).await;
+    }
+}
+
+/// One REST call (`sql:execute`, or `path` for another data call) as the
+/// tenant's `app`, with the `Sprig-Space` header when `space` names one:
+/// `(HTTP status, body)`.
+async fn rest_call(
+    http: &str,
+    tenant: &str,
+    user: &str,
+    pw: &str,
+    path: &str,
+    space: Option<&str>,
+    body: &serde_json::Value,
+) -> (u16, serde_json::Value) {
+    use base64::Engine as _;
+    use http_body_util::BodyExt as _;
+    let tcp = tokio::net::TcpStream::connect(http).await.unwrap();
+    let (mut tx, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tcp))
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    let auth = base64::engine::general_purpose::STANDARD.encode(format!("{tenant}.{user}:{pw}"));
+    let mut b = hyper::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("host", http)
+        .header("authorization", format!("Basic {auth}"))
+        .header("content-type", "application/json");
+    if let Some(s) = space {
+        b = b.header("sprig-space", s);
+    }
+    let resp = tx
+        .send_request(
+            b.body(http_body_util::Full::new(bytes::Bytes::from(
+                body.to_string(),
+            )))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap_or_default())
+}
+
+/// The `(id, v)` rows of a REST `sql:execute` reply.
+fn rest_rows(v: &serde_json::Value) -> Vec<(String, String)> {
+    let r = sprig_api::results::execute_from_json(v).unwrap_or_else(|e| panic!("{e}: {v}"));
+    let text = |c: &prost_types::Value| {
+        sprig_api::results::cell_bytes(c, false)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default()
+    };
+    r.results
+        .iter()
+        .flat_map(|res| res.rows.iter())
+        .map(|row| (text(&row.values[0]), text(&row.values[1])))
+        .collect()
+}
+
+/// The `Sprig-Space` header (gRPC metadata `sprig-space`) runs a call's
+/// session in the space it names, as `USE SPACE` does: reads see that
+/// space's view and writes land there; a transaction keeps the space its
+/// `Begin` named; an unknown space is 39880 and one above the user's home
+/// space 39884. Needs `SPRIG_TEST_NEWSHARE_HTTP` (the gateway's HTTP
+/// listener, plain HTTP).
+#[tokio::test]
+async fn the_space_header_picks_the_calls_space() {
+    let Some(e) = env() else {
+        eprintln!("SPRIG_TEST_NEWSHARE_* not set; skipped");
+        return;
+    };
+    let Some(http) = std::env::var("SPRIG_TEST_NEWSHARE_HTTP")
+        .ok()
+        .filter(|s| !s.is_empty())
+    else {
+        eprintln!("SPRIG_TEST_NEWSHARE_HTTP not set; skipped");
+        return;
+    };
+    let pw = "sprig-dev-app";
+    let n = suffix();
+    let db = format!("sf20sh{n}");
+    let space = format!("sf20s{n}");
+    let user = format!("sf20u{n}");
+    let mut p = conn(&e.addr, &e.parent).await;
+    ok(&mut p, &format!("USE SPACE `{}`", e.parent)).await;
+    ok(&mut p, &format!("CREATE SPACE `{space}`")).await;
+    ok(&mut p, &format!("CREATE DATABASE {db}")).await;
+    ok(
+        &mut p,
+        &format!("CREATE TABLE {db}.t1 (id INT PRIMARY KEY, v VARCHAR(40))"),
+    )
+    .await;
+    ok(&mut p, &format!("USE {db}")).await;
+    ok(&mut p, "ALTER TABLE t1 SPRIG INHERITABLE KEY (id)").await;
+    ok(
+        &mut p,
+        "INSERT INTO t1 VALUES (1, 'root one'), (2, 'root two')",
+    )
+    .await;
+    ok(
+        &mut p,
+        &format!("CREATE SHARE {db}_sp ON t1 TO SPACE `{space}`"),
+    )
+    .await;
+    ok(&mut p, &format!("USE SPACE `{space}`")).await;
+    ok(&mut p, "UPDATE t1 SET v = 'space one' WHERE id = 1").await;
+    ok(&mut p, &format!("USE SPACE `{}`", e.parent)).await;
+    ok(
+        &mut p,
+        &format!("CREATE USER '{user}'@'%' IDENTIFIED BY '{pw}'"),
+    )
+    .await;
+    ok(&mut p, &format!("GRANT SELECT ON {db}.* TO '{user}'@'%'")).await;
+    ok(
+        &mut p,
+        &format!("ALTER SPACE `{space}` SET HOME FOR '{user}'@'%'"),
+    )
+    .await;
+
+    let exec = format!("/v1/databases/{db}/sql:execute");
+    let read = serde_json::json!({ "sql": "SELECT id, v FROM t1 ORDER BY id" });
+    let root = pairs(&[("1", "root one"), ("2", "root two")]);
+    let in_space = pairs(&[("1", "space one"), ("2", "root two")]);
+
+    // REST: no header reads the home (root) space, the header the space.
+    let (s, v) = rest_call(&http, &e.parent, "app", pw, &exec, None, &read).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(rest_rows(&v), root);
+    let (s, v) = rest_call(&http, &e.parent, "app", pw, &exec, Some(&space), &read).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(rest_rows(&v), in_space, "the header's space");
+
+    // A write with the header lands in the space, not in the root.
+    let upd = serde_json::json!({ "sql": "UPDATE t1 SET v = 'rest two' WHERE id = 2" });
+    let (s, v) = rest_call(&http, &e.parent, "app", pw, &exec, Some(&space), &upd).await;
+    assert_eq!(s, 200, "{v}");
+    let (_, v) = rest_call(&http, &e.parent, "app", pw, &exec, Some(&space), &read).await;
+    assert_eq!(
+        rest_rows(&v),
+        pairs(&[("1", "space one"), ("2", "rest two")])
+    );
+    assert_eq!(rows_of(&mut p, &db).await, root, "the root is unchanged");
+
+    // A transaction keeps the space its Begin named.
+    let (s, t) = rest_call(
+        &http,
+        &e.parent,
+        "app",
+        pw,
+        &format!("/v1/databases/{db}/transactions"),
+        Some(&space),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(s, 200, "{t}");
+    let handle = t["name"].as_str().unwrap().to_owned();
+    let in_txn = serde_json::json!({
+        "sql": "SELECT id, v FROM t1 ORDER BY id",
+        "transaction": handle,
+    });
+    let (s, v) = rest_call(&http, &e.parent, "app", pw, &exec, None, &in_txn).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        rest_rows(&v),
+        pairs(&[("1", "space one"), ("2", "rest two")]),
+        "a call in the transaction reads Begin's space"
+    );
+    let (s, _) = rest_call(
+        &http,
+        &e.parent,
+        "app",
+        pw,
+        &format!("/v1/{handle}:rollback"),
+        None,
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(s, 200);
+
+    // Refusals: an unknown space, and one above the user's home space.
+    let (s, v) = rest_call(
+        &http,
+        &e.parent,
+        "app",
+        pw,
+        &exec,
+        Some("sf20_nosuch"),
+        &read,
+    )
+    .await;
+    assert_eq!((s >= 400, v["code"].as_u64()), (true, Some(39880)), "{v}");
+    let (s, v) = rest_call(&http, &e.parent, &user, pw, &exec, None, &read).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        rest_rows(&v),
+        pairs(&[("1", "space one"), ("2", "rest two")]),
+        "home space"
+    );
+    let (s, v) = rest_call(&http, &e.parent, &user, pw, &exec, Some(&e.parent), &read).await;
+    assert_eq!((s >= 400, v["code"].as_u64()), (true, Some(39884)), "{v}");
+
+    // gRPC: the metadata `sprig-space`.
+    {
+        use base64::Engine as _;
+        use sprig_api::proto::v1::QueryRequest;
+        use sprig_api::proto::v1::sql_client::SqlClient;
+        let ch = tonic::transport::Endpoint::from_shared(format!("http://{http}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = SqlClient::new(ch);
+        let auth = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{}.app:{pw}", e.parent))
+        );
+        for (sp, want) in [
+            (None, root.clone()),
+            (
+                Some(space.as_str()),
+                pairs(&[("1", "space one"), ("2", "rest two")]),
+            ),
+        ] {
+            let mut req = tonic::Request::new(QueryRequest {
+                database: db.clone(),
+                sql: "SELECT id, v FROM t1 ORDER BY id".into(),
+                ..QueryRequest::default()
+            });
+            req.metadata_mut()
+                .insert("authorization", auth.parse().unwrap());
+            if let Some(sp) = sp {
+                req.metadata_mut()
+                    .insert("sprig-space", sp.parse().unwrap());
+            }
+            let r = client.execute(req).await.unwrap().into_inner();
+            let text = |c: &prost_types::Value| {
+                sprig_api::results::cell_bytes(c, false)
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default()
+            };
+            let got: Vec<(String, String)> = r
+                .results
+                .iter()
+                .flat_map(|res| res.rows.iter())
+                .map(|row| (text(&row.values[0]), text(&row.values[1])))
+                .collect();
+            assert_eq!(got, want, "gRPC with space {sp:?}");
+        }
+        let mut req = tonic::Request::new(QueryRequest {
+            database: db.clone(),
+            sql: "SELECT id FROM t1".into(),
+            ..QueryRequest::default()
+        });
+        req.metadata_mut()
+            .insert("authorization", auth.parse().unwrap());
+        req.metadata_mut()
+            .insert("sprig-space", "sf20_nosuch".parse().unwrap());
+        let err = client.execute(req).await.unwrap_err();
+        println!("gRPC with an unknown space: {err:?}");
+        assert!(err.message().contains("doesn't exist"), "{err:?}");
+    }
+
+    ok(&mut p, &format!("DROP USER '{user}'@'%'")).await;
+    ok(&mut p, &format!("USE {db}")).await;
+    ok(&mut p, &format!("DROP SHARE {db}_sp")).await;
+    ok(&mut p, &format!("DROP DATABASE {db}")).await;
+    ok(&mut p, &format!("DROP SPACE `{space}` CASCADE")).await;
+    drop_conns(vec![p]).await;
+}
+
+/// Analytics models can't read inheritable tables: the Analytics API reads
+/// through internal statements the inheritance layer doesn't rewrite, so it
+/// summed every space's layer rows (an override and the record it
+/// overrides, hide markers, other spaces' records). A model over one is
+/// refused (39752) when it is made, and at its next query when a table
+/// becomes inheritable later. Needs `SPRIG_TEST_NEWSHARE_HTTP`.
+#[tokio::test]
+async fn analytics_models_refuse_inheritable_tables() {
+    let Some(e) = env() else {
+        eprintln!("SPRIG_TEST_NEWSHARE_* not set; skipped");
+        return;
+    };
+    let Some(http) = std::env::var("SPRIG_TEST_NEWSHARE_HTTP")
+        .ok()
+        .filter(|s| !s.is_empty())
+    else {
+        eprintln!("SPRIG_TEST_NEWSHARE_HTTP not set; skipped");
+        return;
+    };
+    let pw = "sprig-dev-app";
+    let db = format!("sf20an{}", suffix());
+    let mut p = conn(&e.addr, &e.parent).await;
+    ok(&mut p, &format!("CREATE DATABASE {db}")).await;
+    ok(&mut p, &format!("USE {db}")).await;
+    ok(
+        &mut p,
+        "CREATE TABLE store (store_id INT PRIMARY KEY, country VARCHAR(10), region VARCHAR(10))",
+    )
+    .await;
+    ok(&mut p, "INSERT INTO store VALUES (1, 'IN', 'S')").await;
+    for t in ["sale", "sale2"] {
+        ok(
+            &mut p,
+            &format!(
+                "CREATE TABLE {t} (id INT PRIMARY KEY, store_id INT, sold_at DATETIME, amount INT)"
+            ),
+        )
+        .await;
+        ok(
+            &mut p,
+            &format!(
+                "INSERT INTO {t} VALUES (1, 1, '2026-01-01', 10), (2, 1, '2026-01-02', 20), \
+                 (3, 1, '2026-01-03', 30)"
+            ),
+        )
+        .await;
+    }
+    ok(&mut p, "ALTER TABLE sale SPRIG INHERITABLE KEY (id)").await;
+    let def = |name: &str, table: &str| {
+        serde_json::json!({"definition": {"model": name, "time_zone": "UTC",
+            "dimensions": [{"name": "store", "table": "store", "key": "store_id",
+                            "levels": ["country", "region"]},
+                           {"name": "date", "builtin": "time"}],
+            "facts": [{"name": name, "table": table, "key": ["id"],
+                "links": [{"dimension": "store", "column": "store_id"},
+                          {"dimension": "date", "column": "sold_at"}],
+                "measures": [{"name": "revenue", "expr": "amount", "agg": "sum"}]}]}})
+    };
+    let models = format!("/v1/databases/{db}/models");
+    let (s, v) = rest_call(
+        &http,
+        &e.parent,
+        "app",
+        pw,
+        &models,
+        None,
+        &def("m1", "sale"),
+    )
+    .await;
+    println!("a model over an inheritable table: {s} {v}");
+    assert_eq!((s >= 400, v["code"].as_u64()), (true, Some(39752)), "{v}");
+
+    // A model over a plain table answers; once the table is inheritable,
+    // its next query is refused.
+    let (s, v) = rest_call(
+        &http,
+        &e.parent,
+        "app",
+        pw,
+        &models,
+        None,
+        &def("m2", "sale2"),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let q = serde_json::json!({"measures": ["revenue"],
+        "dimensions": [{"dimension": "store", "level": "country"}]});
+    let query = format!("{models}/m2:query");
+    let (s, v) = rest_call(&http, &e.parent, "app", pw, &query, None, &q).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["rows"][0]["values"][0], "60", "{v}");
+    ok(&mut p, "ALTER TABLE sale2 SPRIG INHERITABLE KEY (id)").await;
+    let (s, v) = rest_call(&http, &e.parent, "app", pw, &query, None, &q).await;
+    println!("the model's table made inheritable: {s} {v}");
+    assert_eq!((s >= 400, v["code"].as_u64()), (true, Some(39752)), "{v}");
+
+    ok(&mut p, &format!("DROP DATABASE {db}")).await;
+    drop_conns(vec![p]).await;
+}

@@ -305,6 +305,7 @@ Over gRPC each error maps to the status in the [error reference](../reference/er
 - Pre-computed aggregates, materialised rollups and result caching; every query reads the tables.
 - A built-in geography dimension, more than one hierarchy per dimension, parent-child dimensions, and dimensions in another database.
 - Collections as facts or dimensions, and inherited dimensions.
+- Inheritable tables (shared from a parent tenant) as facts or dimensions: creating, updating or querying such a model fails with 39752.
 - Measures from two facts in one query (drill-across) fail with 39754.
 - `as_of` attribution and bitemporal versioning.
 - Functions in measure expressions and filters.
