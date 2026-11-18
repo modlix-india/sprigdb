@@ -27,6 +27,7 @@ set -euo pipefail
 D=$E0_DOCKER
 SUT=(--network "$E0_NET" --cpuset-cpus "$E0_SUT_CPUS" -m "$E0_MEM" --memory-swap "$E0_MEM" --ulimit nofile=65536:65536)
 
+hn() { [[ $E0_NET == host ]] || echo "--hostname $1"; }  # Docker refuses --hostname with host networking
 exists() { $D container inspect "$1" >/dev/null 2>&1; }
 rmc() { local c; for c in "$@"; do exists "$c" && $D rm -f "$c" >/dev/null && e0_say "removed $c"; done; return 0; }
 run_tool() { $D run --rm --network "$E0_NET" --cpuset-cpus "$E0_CLIENT_CPUS" -v "$E0_DIR:/opt/e0:ro" "$IMG_RUN" "$@"; }
@@ -66,11 +67,11 @@ innodb_args() { # the durable InnoDB settings both MySQL and MariaDB get
 up_mysql() {
     rmc e0bench-mysql
     # shellcheck disable=SC2046
-    $D run -d --name e0bench-mysql --hostname e0bench-mysql "${SUT[@]}" -e MYSQL_ROOT_PASSWORD="$E0_ROOT_PW" \
+    $D run -d --name e0bench-mysql $(hn e0bench-mysql) "${SUT[@]}" -e MYSQL_ROOT_PASSWORD="$E0_ROOT_PW" \
         "$IMG_MYSQL" --port="$E0_PORT_MYSQL" $(innodb_args) --innodb-redo-log-capacity=1G --mysql-native-password=ON --tls-version= >/dev/null
     wait_sql e0bench-mysql "$(e0_host e0bench-mysql)" "$E0_PORT_MYSQL"
-    for _ in $(seq 1 60); do $D exec e0bench-mysql mysql -h127.0.0.1 -P"$E0_PORT_MYSQL" -uroot -p"$E0_ROOT_PW" -e 'SELECT 1' >/dev/null 2>&1 && break; sleep 1; done
-    $D exec e0bench-mysql mysql -h127.0.0.1 -P"$E0_PORT_MYSQL" -uroot -p"$E0_ROOT_PW" -e "
+    for _ in $(seq 1 60); do $D exec e0bench-mysql mysql --get-server-public-key -h127.0.0.1 -P"$E0_PORT_MYSQL" -uroot -p"$E0_ROOT_PW" -e 'SELECT 1' >/dev/null 2>&1 && break; sleep 1; done
+    $D exec e0bench-mysql mysql --get-server-public-key -h127.0.0.1 -P"$E0_PORT_MYSQL" -uroot -p"$E0_ROOT_PW" -e "
         CREATE USER IF NOT EXISTS '$E0_APP_USER'@'%' IDENTIFIED WITH mysql_native_password BY '$E0_APP_PW';
         GRANT ALL ON *.* TO '$E0_APP_USER'@'%'; CREATE DATABASE IF NOT EXISTS sbtest; CREATE DATABASE IF NOT EXISTS e0diff; CREATE DATABASE IF NOT EXISTS e0crash;" 2>/dev/null
 }
@@ -78,7 +79,7 @@ up_mysql() {
 up_mariadb() {
     rmc e0bench-mariadb
     # shellcheck disable=SC2046
-    $D run -d --name e0bench-mariadb --hostname e0bench-mariadb "${SUT[@]}" -e MARIADB_ROOT_PASSWORD="$E0_ROOT_PW" \
+    $D run -d --name e0bench-mariadb $(hn e0bench-mariadb) "${SUT[@]}" -e MARIADB_ROOT_PASSWORD="$E0_ROOT_PW" \
         "$IMG_MARIADB" --port="$E0_PORT_MARIADB" $(innodb_args) --innodb-log-file-size=1G --log-bin=bin --binlog-format=ROW --server-id=1 --skip-ssl >/dev/null
     wait_sql e0bench-mariadb "$(e0_host e0bench-mariadb)" "$E0_PORT_MARIADB"
     for _ in $(seq 1 60); do $D exec e0bench-mariadb mariadb --skip-ssl -h127.0.0.1 -P"$E0_PORT_MARIADB" -uroot -p"$E0_ROOT_PW" -e 'SELECT 1' >/dev/null 2>&1 && break; sleep 1; done
@@ -89,7 +90,7 @@ up_mariadb() {
 
 up_redis() {
     rmc e0bench-redis
-    $D run -d --name e0bench-redis --hostname e0bench-redis "${SUT[@]}" "$IMG_REDIS" redis-server --port "$E0_PORT_REDIS" \
+    $D run -d --name e0bench-redis $(hn e0bench-redis) "${SUT[@]}" "$IMG_REDIS" redis-server --port "$E0_PORT_REDIS" \
         --protected-mode no --maxmemory "$E0_REDIS_MAXMEM" --io-threads 4 --appendonly yes --appendfsync always --save '' >/dev/null
     wait_redis e0bench-redis "$(e0_host e0bench-redis)" "$E0_PORT_REDIS"
 }
@@ -101,17 +102,17 @@ up_sprig() {
     local bin=${SPRIG_BIN:-$E0_WORK/bin/before}
     [[ -x $bin/sprigdb && -x $bin/sprigctl ]] || { e0_say "no Linux sprigdb/sprigctl in $bin (run e0/build-linux.sh before)"; exit 2; }
     rmc e0bench-sprig e0bench-sprigmaria e0bench-etcd
-    $D run -d --name e0bench-etcd --hostname e0bench-etcd "${SUT[@]}" -m 256m --memory-swap 256m "$IMG_ETCD" etcd --name=e0 \
+    $D run -d --name e0bench-etcd $(hn e0bench-etcd) "${SUT[@]}" -m 256m --memory-swap 256m "$IMG_ETCD" etcd --name=e0 \
         --data-dir=/etcd-data --listen-client-urls="http://0.0.0.0:${E0_ETCD_ADDR##*:}" --advertise-client-urls="http://$E0_ETCD_ADDR" \
         --listen-peer-urls=http://127.0.0.1:2380 --initial-advertise-peer-urls=http://127.0.0.1:2380 \
         --initial-cluster=e0=http://127.0.0.1:2380 --auto-compaction-mode=periodic --auto-compaction-retention=1h >/dev/null
     # shellcheck disable=SC2046
-    $D run -d --name e0bench-sprigmaria --hostname e0bench-sprigmaria "${SUT[@]}" -e MARIADB_ROOT_PASSWORD="$E0_ROOT_PW" \
+    $D run -d --name e0bench-sprigmaria $(hn e0bench-sprigmaria) "${SUT[@]}" -e MARIADB_ROOT_PASSWORD="$E0_ROOT_PW" \
         -v "$E0_ROOT/deploy/compose/mariadb/binlog.cnf:/etc/mysql/conf.d/10-binlog.cnf:ro" \
         "$IMG_MARIADB" --port="${E0_CATALOG_ADDR##*:}" $(innodb_args) --innodb-log-file-size=1G --server-id=1 --gtid-domain-id=1 >/dev/null
     wait_sql e0bench-sprigmaria "$(e0_host "${E0_CATALOG_ADDR%:*}")" "${E0_CATALOG_ADDR##*:}"
     for _ in $(seq 1 60); do $D exec e0bench-sprigmaria mariadb --skip-ssl -h127.0.0.1 -P"${E0_CATALOG_ADDR##*:}" -uroot -p"$E0_ROOT_PW" -e 'SELECT 1' >/dev/null 2>&1 && break; sleep 1; done
-    $D run -d --name e0bench-sprig --hostname e0bench-sprig "${SUT[@]}" --init \
+    $D run -d --name e0bench-sprig $(hn e0bench-sprig) "${SUT[@]}" --init \
         -e E0_ROOT_PW="$E0_ROOT_PW" -e E0_APP_PW="$E0_APP_PW" -e E0_TENANT_BASE="${E0_TENANT_BASE:-57306000000}" \
         -e E0_ENGINE="${E0_ENGINE:-0}" -e E0_CACHE_MB="$E0_CACHE_MB" -e E0_ETCD_ADDR="$E0_ETCD_ADDR" -e E0_CATALOG_ADDR="$E0_CATALOG_ADDR" \
         -e E0_PORT_NODE_SQL="$E0_PORT_NODE_SQL" -e E0_PORT_NODE_MARIADB="$E0_PORT_NODE_MARIADB" -e E0_PORT_NODE_REDIS="$E0_PORT_NODE_REDIS" \

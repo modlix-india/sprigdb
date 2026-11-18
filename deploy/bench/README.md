@@ -117,3 +117,23 @@ Families: `mysql`, `pg`, `mongo`, `surreal`, `arango`, `couchbase` (`query`,
 - Speed numbers come only from the benchmark VMs: warm-up, then three runs,
   the median and spread reported; durability matched across products
   (fsync per acknowledged write) or reported both ways.
+
+## e0/: the storage-engine prototype's harness
+
+`e0/` measures the engine prototype against MySQL 8.4 and Redis 7.4
+(`appendfsync always`), with today's SprigDB as the "before" arm, all inside
+Linux: on a laptop every arm and load generator is a container on the private
+network `e0bench` (no port forward, no docker-proxy), with the same memory
+limit, CPU set and primary cache; on benchmark VMs the same scripts run with
+`E0_NET=host`. Settings are in `e0/env.sh`.
+
+| Script | What it does |
+|---|---|
+| `e0/build-linux.sh <name>` | Linux release build in a container (glibc 2.36) into `$E0_WORK/bin/<name>/` |
+| `e0/stack.sh up\|down\|kill\|start <arm>` | Arms: `mysql`, `mariadb`, `redis`, `sprig` (today's stack), `e0` (the same stack with the engine build and the benchmark databases on the engine) |
+| `e0/bench.sh sql\|kv\|calib --arm <arm>` | sysbench point_select 1/16/64, memtier pipelines 1/16, hot-key redis-benchmark, 1M-key and sysbench footprints; CPU per operation from every SUT container's cgroup (or the VM's `/proc/stat`) |
+| `e0/diff.sh sql\|redis` | The differential: E0's SQL statements against MySQL 8.4 or MariaDB 11.8 (answers, and prepared point-select packets byte for byte), E0's Redis commands against Redis |
+| `e0/crash.sh --arm <arm> --proto redis\|sql` | kill -9 loops; every acknowledged write and the atomicity of multi-record writes checked after restart |
+| `e0/laptop.sh sql\|kv\|diff\|crash <arm>` | One laptop set, through the heavy-slot queue |
+
+Results use the format above, so the same report generator reads them.

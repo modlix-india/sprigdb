@@ -16,7 +16,7 @@ LOCK=$E0_ROOT/target/heavy-lock.sh
 what=${1:?sql|kv|diff|crash}; arm=${2:?arm}
 T=${E0_TIME:-30} W=${E0_WARMUP:-15} R=${E0_RUNS:-3}
 export E0_RB_REQUESTS_SPRIG=${E0_RB_REQUESTS_SPRIG:-5000}
-heavy() { "$LOCK" run e0-bench -- "$@"; }
+heavy() { if [[ ${E0_NOLOCK:-0} == 1 ]]; then "$@"; else "$LOCK" run e0-bench -- "$@"; fi; }  # E0_NOLOCK=1: the caller already holds a slot
 case $what in
 sql)
     heavy bash -c "'$E0_DIR/stack.sh' up $arm && '$E0_DIR/bench.sh' sql --arm $arm --threads '1 16 64' --time $T --warmup $W --runs $R; rc=\$?; [[ \${E0_KEEP:-0} == 1 ]] || '$E0_DIR/stack.sh' down $arm; exit \$rc" ;;
