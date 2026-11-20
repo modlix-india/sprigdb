@@ -9,14 +9,14 @@
 //! | `POST /v1/auth/login` | Password login: an access token, and the refresh token as an `HttpOnly` cookie |
 //! | `POST /v1/auth/refresh`, `/v1/auth/logout` | Rotate or end the session (cookie, `X-Sprig-CSRF`, same origin) |
 //! | `POST /v1/auth/mfa`, `/v1/auth/factors...`, `POST /v1/auth/impersonate` | Second factors and impersonation ([`mfa`]) |
-//! | `GET /v1/auth/me` | `Auth.WhoAmI`: the principal, the session, the tenant tree, grants, `studio.*` |
+//! | `GET /v1/auth/me` | `Auth.WhoAmI`: the principal, the session, the tenant tree, grants, a capability summary for Studio's workspaces, the user's last and default workspace, `studio.*` |
 //! | `POST /v1/exports:ticket`, `POST /v1/exports` | `Exports.CreateTicket`; the form post that streams the file |
 //! | `POST /v1/users:setPassword` | `Users.SetPassword`, so a password never enters statement text |
 //! | `GET /v1/users`, `GET`/`POST /v1/api-keys`, `POST /v1/api-keys/{id}:revoke` | Accounts and API keys ([`accounts`]) |
 //! | `/v1/indexing/...` | The caller's tenant's automatic indexes, recommendations, actions and explanations |
 //! | `POST /v1/databases/{db}/cursors`, `POST /v1/cursors/{h}:fetch`, `:close` | `Cursors` ([`cursors`]) |
 //! | `/v1/ops/...` | Operator mode: the Admin API for logins in `studio.operator_logins` ([`ops`]) |
-//! | `/v1/library`, `/v1/library/saved[:delete]`, `/v1/library/history[:clear]` | The caller's saved queries and history ([`library`]) |
+//! | `/v1/library`, `/v1/library/saved[:delete]`, `/v1/library/history[:clear]`, `/v1/library/prefs` | The caller's saved queries, history and preferences ([`library`]) |
 //! | `/v1/dashboards...` | Dashboards and their tiles, run as the viewer ([`dashboards`]) |
 //! | `GET /v1/shards`, `/v1/shards/advisor[/{run}]` | The shards view: table groups, keys, maps, advisor runs ([`shards`]) |
 //! | `/v1/ai/...` | The AI assistants: chat (NDJSON), conversations, feedback, glossary ([`ai`]) |
@@ -1250,6 +1250,17 @@ async fn whoami(
     let limits = core.studio.limits_for(p.tenant);
     let platform_roles = ops::roles(core, &caller);
     let ai = ai::whoami_json(&core.studio, p.tenant, !platform_roles.is_empty());
+    // What Studio's workspaces look at; a display summary, checked nowhere.
+    let capabilities =
+        grants::Capabilities::of(&grants, &privs, platform_roles.contains(&"operator"));
+    let default_workspace = sprig_studio::settings::default_workspace(
+        &core
+            .studio
+            .tenant_get(&sprig_studio::settings::DEFAULT_WORKSPACE, p.tenant, None),
+        &p.user,
+        &grants::roles_of(&grants),
+    );
+    let chosen_workspace = library::workspace_pref(core, &caller).await;
     let out = json!({
         "principal": {
             "tenant": p.tenant_name,
@@ -1274,6 +1285,11 @@ async fn whoami(
         "tenants": tenants,
         "grants": grants,
         "privileges": privs.to_json(),
+        "capabilities": capabilities.to_json(),
+        "workspace": {
+            "chosen": chosen_workspace,
+            "default": default_workspace,
+        },
         "platform_roles": platform_roles,
         "studio": core.studio.client_for(cfg, p.tenant),
         "ai": ai,

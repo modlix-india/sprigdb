@@ -5,12 +5,12 @@ import { addTab } from '../editor/tabs';
 import { X } from '../icons';
 import { clearHistory, deleteSaved, useLibrary, type HistoryItem, type SavedQuery } from './library';
 
-function firstLine(sql: string): string {
+export function firstLine(sql: string): string {
   const line = sql.trim().split('\n')[0] ?? '';
   return line.length > 80 ? `${line.slice(0, 80)}…` : line;
 }
 
-function ago(at: number): string {
+export function ago(at: number): string {
   const s = Math.max(0, Math.round((Date.now() - at) / 1000));
   if (s < 60) return `${s}s ago`;
   if (s < 3600) return `${Math.round(s / 60)} min ago`;
@@ -18,7 +18,8 @@ function ago(at: number): string {
   return new Date(at).toLocaleDateString();
 }
 
-function useOpen() {
+/** Opens a query (saved or from history) in a new query tab. */
+export function useOpen() {
   const navigate = useNavigate();
   const { tenant = '' } = useParams();
   return (q: { sql: string; db: string | null; language: SavedQuery['language']; name?: string }) => {

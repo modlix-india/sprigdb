@@ -7,8 +7,10 @@ import { addTab } from '../editor/tabs';
 import { currentTheme, setTheme, type Theme } from '../app/theme';
 import { useDatabases, type DbSnapshot } from '../catalog/snapshot';
 import { operatorSession } from '../ops/ops';
-import { Database, Eye, LogOut, Moon, Search, Share2, SquareFunction, SquareTerminal, Table2 } from '../icons';
-import { SECTIONS, resolve } from './sections';
+import { Database, Eye, LayoutDashboard, LogOut, Moon, Search, Share2, SquareFunction, SquareTerminal, Table2 } from '../icons';
+import { entryOf, resolve } from './sections';
+import { paletteSections } from './workspaces';
+import { pickWorkspace, useWorkspaces } from './current';
 import { useWorkspace } from './store';
 import { DOC_ICON } from './WorkspaceTabs';
 import type { MessageId } from '../i18n/en';
@@ -21,6 +23,8 @@ interface Item {
   hint: string;
   icon: ComponentType<{ size?: number }>;
   run: () => void;
+  /** Ranks a little higher on equal matches: the workspace's own sections. */
+  boost?: number;
 }
 
 /** Subsequence match with a score: earlier and contiguous matches rank higher. */
@@ -64,6 +68,7 @@ function PaletteBody({ onClose }: { onClose: () => void }) {
   const aiRoles = useRoles();
   const aiRoleKey = aiRoles.join(',');
   const aiRole = useAssistant((s) => s.role);
+  const { open: workspaces, current: workspace } = useWorkspaces();
   const [q, setQ] = useState('');
   const [sel, setSel] = useState(0);
   const input = useRef<HTMLInputElement>(null);
@@ -77,13 +82,33 @@ function PaletteBody({ onClose }: { onClose: () => void }) {
     const go = (to: string) => () => void navigate(to);
     const out: Item[] = [];
     const isOperator = !!(me?.platform_roles.includes('operator') || operatorSession());
-    for (const s of SECTIONS) {
-      if ((s.operatorOnly && !isOperator) || s.panel) continue;
-      out.push({ id: `s:${s.id}`, label: t(s.label), hint: t('palette.kind.page'), icon: s.icon, run: go(resolve(base, s.to)) });
+    // The workspace's sections first (its activity bar, then the ones it
+    // offers only here); sections it doesn't offer stay out.
+    const bar = new Set(Object.entries(workspace.sections).filter(([, p]) => p === 'bar').map(([id]) => id));
+    for (const s of paletteSections(workspace, isOperator)) {
+      const boost = bar.has(s.id) || s.operatorOnly ? 5 : 0;
+      out.push({ id: `s:${s.id}`, label: t(s.label), hint: t('palette.kind.page'), icon: s.icon, run: go(resolve(base, entryOf(s))), boost });
       for (const l of s.links) {
         if (l.to === s.to && l.label === s.label) continue;
-        out.push({ id: `l:${l.to}`, label: t(l.label), hint: t(s.label), icon: s.icon, run: go(resolve(base, l.to)) });
+        out.push({ id: `l:${l.to}`, label: t(l.label), hint: t(s.label), icon: s.icon, run: go(resolve(base, l.to)), boost });
       }
+    }
+    for (const w of workspaces) {
+      if (w.id === workspace.id) continue;
+      out.push({
+        id: `w:${w.id}`,
+        label: intl.formatMessage({ id: 'palette.cmd.workspace' }, { name: t(w.label) }),
+        hint: t('palette.kind.command'),
+        icon: LayoutDashboard,
+        run: () => {
+          if (w.entry) {
+            void navigate(w.entry);
+            return;
+          }
+          void pickWorkspace(w.id);
+          void navigate(base);
+        },
+      });
     }
     for (const d of docs) {
       out.push({ id: `d:${d.rel}`, label: d.title, hint: t('palette.kind.tab'), icon: DOC_ICON[d.kind], run: go(d.rel ? `${base}/${d.rel}` : base) });
@@ -120,12 +145,13 @@ function PaletteBody({ onClose }: { onClose: () => void }) {
     out.push({ id: 'c:out', label: t('palette.cmd.signOut'), hint: t('palette.kind.command'), icon: LogOut, run: () => void logout() });
     return out;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [base, dbs.data, docs, me]);
+  }, [base, dbs.data, docs, me, workspace, workspaces]);
 
   const shown = useMemo(() => {
     const scored = items
       .map((it) => ({ it, s: Math.max(score(q, it.label) ?? -1, (score(q, it.hint) ?? -1) - 400) }))
-      .filter((x) => x.s >= 0);
+      .filter((x) => x.s >= 0)
+      .map((x) => ({ ...x, s: x.s + (x.it.boost ?? 0) }));
     scored.sort((a, b) => b.s - a.s);
     const out = scored.slice(0, 50).map((x) => x.it);
     // A question for the assistant, or words to look up in the docs.

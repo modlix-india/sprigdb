@@ -9,11 +9,12 @@
 //! | `POST /v1/library/saved:delete` | Deletes `{name}` |
 //! | `POST /v1/library/history` | Records a run `{language, database, text, ok, ms, error, client}` |
 //! | `POST /v1/library/history:clear` | Clears the caller's history |
+//! | `POST /v1/library/prefs` | Keeps the caller's preferences: `{workspace}`, Studio's last workspace (`null` clears it); `WhoAmI` returns it |
 //!
 //! - **Whose.** Each row belongs to one user of the tenant (`user_id`);
 //!   every route reads and writes only the caller's own rows. A tenant
 //!   login is needed (not the accounts file).
-//! - **Where.** Two tables in `t<tenant>_sprig`, module `library`, created
+//! - **Where.** Three tables in `t<tenant>_sprig`, module `library`, created
 //!   the first time a gateway needs them for a tenant. They aren't
 //!   versioned catalog state: nothing is cached, every call reads them.
 //! - **Secrets.** Text is redacted here as well as in the clients: a
@@ -72,13 +73,36 @@ const DDL_HISTORY: &str = "CREATE TABLE IF NOT EXISTS library_history (
   KEY by_user (user_id, run_id)
 ) ENGINE=InnoDB";
 
+const DDL_PREFS: &str = "CREATE TABLE IF NOT EXISTS library_prefs (
+  user_id    INT UNSIGNED NOT NULL,
+  name       VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
+  value      VARCHAR(256) NOT NULL,
+  updated_at DATETIME(3) NOT NULL,
+  PRIMARY KEY (user_id, name)
+) ENGINE=InnoDB";
+
 /// The module's migrations.
-pub static LIBRARY_MIGRATIONS: &[Migration] = &[Migration {
-    format: 1,
-    phase: Phase::Expand,
-    name: "library_saved, library_history",
-    statements: &[DDL_SAVED, DDL_HISTORY],
-}];
+pub static LIBRARY_MIGRATIONS: &[Migration] = &[
+    Migration {
+        format: 1,
+        phase: Phase::Expand,
+        name: "library_saved, library_history",
+        statements: &[DDL_SAVED, DDL_HISTORY],
+    },
+    Migration {
+        format: 2,
+        phase: Phase::Expand,
+        name: "library_prefs",
+        statements: &[DDL_PREFS],
+    },
+];
+
+/// The table the newest migration creates: when it exists, the module is
+/// current.
+const NEWEST_TABLE: &str = "library_prefs";
+
+/// The preference keeping the user's last Studio workspace.
+const PREF_WORKSPACE: &str = "workspace";
 
 /// Longest text kept, in bytes.
 pub const MAX_TEXT: usize = 64 * 1024;
@@ -377,6 +401,37 @@ pub fn run_req(v: &Value) -> Result<RunReq, SprigError> {
     })
 }
 
+/// Checks a preferences request: `{workspace}`, a workspace Studio offers
+/// or `null` (or `""`) to forget the choice. Returns the value to keep,
+/// `None` to delete it. Which workspaces the user may open isn't checked:
+/// a workspace only changes what Studio shows.
+///
+/// # Errors
+/// No known key, or an unknown workspace.
+pub fn prefs_req(v: &Value) -> Result<Option<String>, SprigError> {
+    let Some(obj) = v.as_object().filter(|o| o.contains_key(PREF_WORKSPACE)) else {
+        return Err(invalid("the preferences to keep are {workspace}"));
+    };
+    if let Some(k) = obj.keys().find(|k| k.as_str() != PREF_WORKSPACE) {
+        return Err(invalid(format!("unknown preference {k}")));
+    }
+    match &obj[PREF_WORKSPACE] {
+        Value::Null => Ok(None),
+        Value::String(s) if s.trim().is_empty() => Ok(None),
+        Value::String(s) => sprig_studio::settings::WORKSPACES
+            .iter()
+            .find(|w| w.eq_ignore_ascii_case(s.trim()))
+            .map(|w| Some((*w).to_owned()))
+            .ok_or_else(|| {
+                invalid(format!(
+                    "workspace must be one of {}",
+                    sprig_studio::settings::WORKSPACES.join(", ")
+                ))
+            }),
+        _ => Err(invalid("workspace is a string or null")),
+    }
+}
+
 /// `m` milliseconds as a whole number, clamped to `u32`.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // clamped first
 fn whole_ms(m: f64) -> u32 {
@@ -431,8 +486,8 @@ async fn context(core: &Arc<Core>, caller: &Caller) -> Result<Ctx, SprigError> {
     let have: Option<u64> = conn
         .exec_first(
             "SELECT COUNT(*) FROM information_schema.TABLES \
-             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'library_history'",
-            (schema.as_str(),),
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+            (schema.as_str(), NEWEST_TABLE),
         )
         .await
         .map_err(unavailable)?;
@@ -593,6 +648,62 @@ async fn clear(c: &mut Ctx) -> Result<(), SprigError> {
         .map_err(unavailable)
 }
 
+async fn set_pref(c: &mut Ctx, name: &str, value: Option<&str>) -> Result<(), SprigError> {
+    let t = c.t("library_prefs");
+    match value {
+        Some(v) => c
+            .conn
+            .exec_drop(
+                format!(
+                    "INSERT INTO {t} (user_id, name, value, updated_at) \
+                     VALUES (?, ?, ?, UTC_TIMESTAMP(3)) \
+                     ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)"
+                ),
+                (c.user, name, v),
+            )
+            .await
+            .map_err(unavailable),
+        None => c
+            .conn
+            .exec_drop(
+                format!("DELETE FROM {t} WHERE user_id = ? AND name = ?"),
+                (c.user, name),
+            )
+            .await
+            .map_err(unavailable),
+    }
+}
+
+/// The caller's last Studio workspace, for `WhoAmI`. `None` when there is
+/// none, for logins without a tenant user, and when the tenant's catalog
+/// can't answer (or doesn't have the table yet): Studio then picks the
+/// default. It reads only; the table is created by the first write.
+pub(super) async fn workspace_pref(core: &Arc<Core>, caller: &Caller) -> Option<String> {
+    let (Some(svc), Some(tid), Some(user)) = (
+        &core.studio.tenants,
+        caller.principal.tenant,
+        caller.principal.user_id,
+    ) else {
+        return None;
+    };
+    let ep = sprig_catalog::CatalogLocator::writer(&*svc.locator, tid)
+        .await
+        .ok()?;
+    let mut conn = ep.pool.get_conn_bounded().await.ok()?;
+    let sql = format!(
+        "SELECT value FROM {}.{} WHERE user_id = ? AND name = ?",
+        quote(ep.store.schema()),
+        quote(NEWEST_TABLE)
+    );
+    let v: Option<String> = conn
+        .exec_first(sql, (user.0, PREF_WORKSPACE))
+        .await
+        .map_err(|e| tracing::debug!(error = %e, "WhoAmI: the workspace preference wasn't read"))
+        .ok()
+        .flatten();
+    v.filter(|w| sprig_studio::settings::WORKSPACES.contains(&w.as_str()))
+}
+
 // ---- routes ----
 
 /// Whether `path` is one of the library's.
@@ -658,6 +769,12 @@ pub(super) async fn route(
             let mut c = context(core, &caller).await?;
             clear(&mut c).await?;
             Ok(json_response(200, &json!({})))
+        }
+        ("POST", "/v1/library/prefs") => {
+            let workspace = prefs_req(&body)?;
+            let mut c = context(core, &caller).await?;
+            set_pref(&mut c, PREF_WORKSPACE, workspace.as_deref()).await?;
+            Ok(json_response(200, &json!({ "workspace": workspace })))
         }
         _ => Err(invalid(format!("no route {method} {path}"))),
     }
@@ -740,6 +857,24 @@ mod tests {
         assert!(!r.ok);
         assert_eq!(r.client, "other");
         assert_eq!(r.error.as_deref(), Some("syntax"));
+    }
+
+    #[test]
+    fn preferences_are_checked() {
+        assert_eq!(
+            prefs_req(&json!({"workspace": " Developer "})).expect("ok"),
+            Some("developer".to_owned())
+        );
+        assert_eq!(prefs_req(&json!({"workspace": null})).expect("ok"), None);
+        assert_eq!(prefs_req(&json!({"workspace": ""})).expect("ok"), None);
+        // The operator workspace is entered through operator mode, not kept.
+        assert!(prefs_req(&json!({"workspace": "operator"})).is_err());
+        assert!(prefs_req(&json!({"workspace": "wizard"})).is_err());
+        assert!(prefs_req(&json!({"workspace": 3})).is_err());
+        assert!(prefs_req(&json!({})).is_err());
+        assert!(prefs_req(&json!({"workspace": "analyst", "theme": "dark"})).is_err());
+        assert_eq!(LIBRARY_MIGRATIONS.last().map(|m| m.format), Some(2));
+        assert!(DDL_PREFS.contains(NEWEST_TABLE));
     }
 
     #[test]

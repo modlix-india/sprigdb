@@ -9,7 +9,7 @@ source: the gateway's OpenAPI document (/v1/openapi.json)
 
 The gateway's REST API, as `/v1/openapi.json` describes it on every gateway. Requests authenticate with `Authorization: Bearer <token or API key>` (or HTTP Basic where allowed) and act with the caller's own rights. Statements stream as NDJSON from `POST /v1/databases/{database}/sql:query`. The same services are available over gRPC.
 
-111 operations in 29 services.
+112 operations in 29 services.
 
 ## sprig.admin.v1.Recommendations
 
@@ -68,7 +68,7 @@ The gateway's REST API, as `/v1/openapi.json` describes it on every gateway. Req
 | POST | `/v1/auth/impersonate` | `Auth.Impersonate` | A session as a user of one's tenant or a descendant, with a reason; no refresh token |
 | POST | `/v1/auth/login` | `Auth.Login` | Password login; the refresh token comes as an HttpOnly cookie (refresh_transport cookie, needs X-Sprig-CSRF) or in the body |
 | POST | `/v1/auth/logout` | `Auth.Logout` | Ends the session |
-| GET | `/v1/auth/me` | `Auth.WhoAmI` | The principal, session, tenant tree, grants, studio.* settings, and whether the AI assistants are on and which roles have a model |
+| GET | `/v1/auth/me` | `Auth.WhoAmI` | The principal, session, tenant tree, grants, a capability summary and the last and default workspace for Studio, studio.* settings, and whether the AI assistants are on and which roles have a model |
 | POST | `/v1/auth/mfa` | `Auth.CompleteMfa` | Completes a login's challenge with a TOTP code or a recovery code (cookie rules as login) |
 | POST | `/v1/auth/refresh` | `Auth.Refresh` | Rotates the refresh token (cookie with X-Sprig-CSRF, or refresh_token in the body) |
 
@@ -169,6 +169,7 @@ The gateway's REST API, as `/v1/openapi.json` describes it on every gateway. Req
 | GET | `/v1/library` | `Library.Get` | The caller's saved queries and last runs (history: how many, 100; at most studio.history_max) |
 | POST | `/v1/library/history` | `Library.Record` | Records a run {language, database, text, ok, ms, error, client} (redacted) |
 | POST | `/v1/library/history:clear` | `Library.ClearHistory` | Clears the caller's history |
+| POST | `/v1/library/prefs` | `Library.SetPrefs` | Keeps the caller's preferences {workspace}: Studio's last workspace, or null to forget it |
 | POST | `/v1/library/saved` | `Library.Save` | Saves {name, language, database, text} (redacted), replacing a query of that name |
 | POST | `/v1/library/saved:delete` | `Library.Delete` | Deletes the caller's saved query {name} |
 

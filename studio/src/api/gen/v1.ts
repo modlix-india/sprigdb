@@ -315,7 +315,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** The principal, session, tenant tree, grants, studio.* settings, and whether the AI assistants are on and which roles have a model */
+        /** The principal, session, tenant tree, grants, a capability summary and the last and default workspace for Studio, studio.* settings, and whether the AI assistants are on and which roles have a model */
         get: operations["Auth.WhoAmI"];
         put?: never;
         post?: never;
@@ -1410,6 +1410,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/library/prefs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Keeps the caller's preferences {workspace}: Studio's last workspace, or null to forget it */
+        post: operations["Library.SetPrefs"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/library/saved": {
         parameters: {
             query?: never;
@@ -2395,6 +2412,15 @@ export interface components {
                 share_data: boolean;
             };
             amr: string[];
+            capabilities?: {
+                administer_tenant: boolean;
+                approve_changes: boolean;
+                change_schemas: boolean;
+                manage_logic: boolean;
+                manage_users: boolean;
+                operator: boolean;
+                read_data: boolean;
+            };
             gateway?: {
                 dc?: string;
                 id?: string;
@@ -2429,6 +2455,10 @@ export interface components {
                 [key: string]: unknown;
             };
             tenants: components["schemas"]["TenantNode"][];
+            workspace?: {
+                chosen: string | null;
+                default: string | null;
+            };
         };
     };
     responses: never;
@@ -5497,6 +5527,35 @@ export interface operations {
         };
     };
     "Library.ClearHistory": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JsonReply"];
+                };
+            };
+            /** @description An error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    "Library.SetPrefs": {
         parameters: {
             query?: never;
             header?: never;

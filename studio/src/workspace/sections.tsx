@@ -1,10 +1,13 @@
 // The activity bar's sections: today's pages regrouped into a
 // few sections, each with the pages it holds. Routes are unchanged.
+// Which sections a user sees, and where, is up to their workspace
+// (workspaces.ts).
 
 import type { ComponentType, SVGProps } from 'react';
 import type { MessageId } from '../i18n/en';
 import {
   BookOpen,
+  DataCentreIcon,
   LayoutDashboard,
   Database,
   GitFork,
@@ -13,6 +16,7 @@ import {
   History,
   Settings,
   Shield,
+  ShieldCheck,
   Star,
   SquareFunction,
   SquareTerminal,
@@ -20,6 +24,23 @@ import {
 } from '../icons';
 
 type Icon = ComponentType<SVGProps<SVGSVGElement> & { size?: number }>;
+
+export type SectionId =
+  | 'explorer'
+  | 'query'
+  | 'saved'
+  | 'history'
+  | 'dashboards'
+  | 'messaging'
+  | 'logic'
+  | 'performance'
+  | 'inheritance'
+  | 'access'
+  | 'operations'
+  | 'security'
+  | 'docs'
+  | 'operator'
+  | 'settings';
 
 export interface SectionLink {
   label: MessageId;
@@ -31,11 +52,12 @@ export interface SectionLink {
 }
 
 export interface Section {
-  id: string;
+  id: SectionId;
   label: MessageId;
   icon: Icon;
-  /** Where the activity icon goes (relative to the tenant base, or absolute). */
-  to: string;
+  /** Where the activity icon goes (relative to the tenant base, or absolute);
+   * null when the section has no page of its own and opens its first link. */
+  to: string | null;
   /** Pages this section holds, listed in its side panel. */
   links: SectionLink[];
   /** Whether a path relative to the tenant base belongs to this section. */
@@ -146,6 +168,26 @@ export const SECTIONS: Section[] = [
     ],
     owns: (rel) => starts(rel, 'access', 'policies', 'security'),
   },
+  // Operations (backups, placement, diagnostics, external servers) and
+  // Security (sign-on sources, encrypted fields and keys, the audit log,
+  // residency) get their pages with their engine features. A section with
+  // no pages isn't shown (hasPages); add each page's link here when it lands.
+  {
+    id: 'operations',
+    label: 'nav.operations',
+    icon: DataCentreIcon,
+    to: null,
+    links: [],
+    owns: () => false,
+  },
+  {
+    id: 'security',
+    label: 'nav.securitySection',
+    icon: ShieldCheck,
+    to: null,
+    links: [],
+    owns: () => false,
+  },
   {
     id: 'docs',
     label: 'nav.docs',
@@ -188,4 +230,18 @@ export function sectionOf(rel: string): Section {
 /** Resolves a section or link target against the tenant base. */
 export function resolve(base: string, to: string): string {
   return to.startsWith('/') ? to : to ? `${base}/${to}` : base;
+}
+
+/** Whether a section has anything to open: a page of its own, links, or a panel. */
+export function hasPages(s: Section): boolean {
+  return s.to !== null || s.links.length > 0 || !!s.panel || !!s.side;
+}
+
+/** Where a section's activity icon goes: its own page, else its first link. */
+export function entryOf(s: Section): string {
+  return s.to ?? s.links[0]?.to ?? '';
+}
+
+export function sectionById(id: SectionId): Section | undefined {
+  return SECTIONS.find((s) => s.id === id);
 }

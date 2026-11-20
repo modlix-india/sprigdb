@@ -91,6 +91,16 @@ export interface Privileges {
   index_dbs: string[];
 }
 
+export interface Capabilities {
+  read_data: boolean;
+  change_schemas: boolean;
+  manage_logic: boolean;
+  manage_users: boolean;
+  approve_changes: boolean;
+  administer_tenant: boolean;
+  operator: boolean;
+}
+
 export interface WhoAmI {
   principal: { tenant: string | null; tenant_id: string | null; user: string; host: string; login: string };
   amr: string[];
@@ -105,6 +115,12 @@ export interface WhoAmI {
   tenants: TenantNode[];
   grants: string[];
   privileges: Privileges;
+  /** What the user can do, summed up for choosing workspaces (absent from
+   * older gateways). Display only: the gateway checks every statement. */
+  capabilities?: Capabilities;
+  /** The user's last workspace and the default `studio.default_workspace`
+   * names for them (absent from older gateways). */
+  workspace?: { chosen: string | null; default: string | null };
   platform_roles: string[];
   studio: StudioSettings;
   gateway?: { id: string; dc: string; studio_build: string };
@@ -126,3 +142,8 @@ export type CreatedApiKey = Schemas['CreatedApiKey'];
 // The hand-written WhoAmI must stay assignable to the generated one.
 type Assignable<A, B> = A extends B ? true : false;
 export const WHOAMI_MATCHES: Assignable<WhoAmI['principal'], Schemas['WhoAmI']['principal']> = true;
+export const CAPABILITIES_MATCH: Assignable<Capabilities, NonNullable<Schemas['WhoAmI']['capabilities']>> = true;
+export const WORKSPACE_MATCHES: Assignable<
+  NonNullable<WhoAmI['workspace']>,
+  NonNullable<Schemas['WhoAmI']['workspace']>
+> = true;

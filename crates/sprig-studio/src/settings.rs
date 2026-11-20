@@ -87,6 +87,62 @@ def!(CURSOR_IDLE_SECONDS: u64 = "studio.cursor_idle_seconds", 60, Scopes::TREE, 
     "Idle time before a cursor closes and its backend statement is killed");
 def!(CURSOR_MAX_OPEN: u64 = "studio.cursor_max_open", 4, TENANT_GLOBAL, HardBounds::range(1, 64),
     "Open cursors per user on one gateway; opening another closes the least recently used");
+def!(DEFAULT_WORKSPACE: Cow<'static, str> = "studio.default_workspace", Cow::Borrowed(""), TENANT_GLOBAL,
+    HardBounds::NONE,
+    "Studio's first workspace for users who haven't picked one, comma-separated: a workspace for everyone, user:<name>=<workspace>, role:<name>=<workspace>");
+
+/// The workspaces `studio.default_workspace` and a user's own choice may
+/// name. Studio's operator workspace is entered through operator mode, so
+/// it is never a default.
+pub const WORKSPACES: &[&str] = &[
+    "analyst",
+    "developer",
+    "db_admin",
+    "security_admin",
+    "tenant_admin",
+];
+
+/// The workspace the value of `studio.default_workspace` (`setting`) names
+/// for `user`, who holds `roles`: a `user:` entry first, then the first
+/// `role:` entry for a role the user holds, then a bare entry. Entries
+/// naming an unknown workspace, and malformed ones, are skipped. Names
+/// compare without case. It only picks what Studio shows first; it allows
+/// nothing.
+#[must_use]
+pub fn default_workspace(setting: &str, user: &str, roles: &[String]) -> Option<&'static str> {
+    let known = |w: &str| {
+        WORKSPACES
+            .iter()
+            .copied()
+            .find(|k| k.eq_ignore_ascii_case(w.trim()))
+    };
+    let (mut by_user, mut by_role, mut everyone) = (None, None, None);
+    for entry in split_list(setting) {
+        if let Some((who, w)) = entry.split_once('=') {
+            let Some(w) = known(w) else { continue };
+            let who = who.trim();
+            if let Some(u) = strip_prefix_ci(who, "user:") {
+                if by_user.is_none() && u.trim().eq_ignore_ascii_case(user) {
+                    by_user = Some(w);
+                }
+            } else if let Some(r) = strip_prefix_ci(who, "role:")
+                && by_role.is_none()
+                && roles.iter().any(|x| x.eq_ignore_ascii_case(r.trim()))
+            {
+                by_role = Some(w);
+            }
+        } else if everyone.is_none() {
+            everyone = known(&entry);
+        }
+    }
+    by_user.or(by_role).or(everyone)
+}
+
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    s.get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &s[prefix.len()..])
+}
 
 /// What serving and the session endpoints read, resolved at this
 /// gateway's scopes.
@@ -317,6 +373,35 @@ mod tests {
     }
 
     #[test]
+    fn default_workspace_picks_user_then_role_then_everyone() {
+        let roles = ["dev".to_owned(), "Auditors".to_owned()];
+        let setting =
+            "analyst, role:dev=developer, user:ann=tenant_admin, role:auditors=security_admin";
+        assert_eq!(
+            default_workspace(setting, "ann", &roles),
+            Some("tenant_admin")
+        );
+        assert_eq!(default_workspace(setting, "bob", &roles), Some("developer"));
+        assert_eq!(
+            default_workspace(setting, "bob", &["auditors".to_owned()]),
+            Some("security_admin")
+        );
+        assert_eq!(default_workspace(setting, "bob", &[]), Some("analyst"));
+        assert_eq!(default_workspace("", "bob", &roles), None);
+        // Unknown workspaces and malformed entries are skipped.
+        assert_eq!(
+            default_workspace("operator, user:bob=wizard, =db_admin, DB_Admin", "bob", &[]),
+            Some("db_admin")
+        );
+        assert_eq!(
+            default_workspace("USER:Bob = Developer", "bob", &[]),
+            Some("developer")
+        );
+        assert_eq!(default_workspace("team:x=developer", "x", &[]), None);
+        assert_eq!(default_workspace("rôle:x=developer", "x", &[]), None);
+    }
+
+    #[test]
     fn keys_are_registered() {
         let reg = sprig_settings::Registry::global().expect("registry");
         for k in [
@@ -327,6 +412,7 @@ mod tests {
             "studio.cursor_idle_seconds",
             "studio.cursor_max_open",
             "studio.operator_logins",
+            "studio.default_workspace",
         ] {
             assert!(reg.get(k).is_some(), "{k}");
         }

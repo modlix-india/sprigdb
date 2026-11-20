@@ -198,6 +198,23 @@ export const en = {
   'filter.clear': 'Clear',
   'filter.apply': 'Filter',
   'welcome.lead': 'Pick up where you left off, or start something new.',
+  'nav.operations': 'Operations',
+  'nav.securitySection': 'Security',
+  'ws.label': 'Workspace',
+  'ws.home': 'Home',
+  'ws.analyst': 'Analyst',
+  'ws.analyst.blurb': 'Find tables, filter them, run, save and export queries.',
+  'ws.developer': 'Developer',
+  'ws.developer.blurb': 'Design schemas, write queries and logic, watch messages and changes.',
+  'ws.db_admin': 'Database administrator',
+  'ws.db_admin.blurb': 'Watch load and slow statements, approve index and shard changes.',
+  'ws.security_admin': 'Security administrator',
+  'ws.security_admin.blurb': 'Manage users, roles and policies, and review access.',
+  'ws.tenant_admin': 'Tenant administrator',
+  'ws.tenant_admin.blurb': 'Everything in this tenant, plus its sub-tenants, settings and limits.',
+  'ws.operator': 'Operator',
+  'ws.operator.blurb': 'Operator mode: data centres, clusters, moves and health.',
+  'palette.cmd.workspace': 'Switch to the {name} workspace',
 } as const;
 
 export type MessageId = keyof typeof en;

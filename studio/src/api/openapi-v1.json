@@ -2564,6 +2564,41 @@
             },
             "type": "array"
           },
+          "capabilities": {
+            "properties": {
+              "administer_tenant": {
+                "type": "boolean"
+              },
+              "approve_changes": {
+                "type": "boolean"
+              },
+              "change_schemas": {
+                "type": "boolean"
+              },
+              "manage_logic": {
+                "type": "boolean"
+              },
+              "manage_users": {
+                "type": "boolean"
+              },
+              "operator": {
+                "type": "boolean"
+              },
+              "read_data": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "read_data",
+              "change_schemas",
+              "manage_logic",
+              "manage_users",
+              "approve_changes",
+              "administer_tenant",
+              "operator"
+            ],
+            "type": "object"
+          },
           "gateway": {
             "properties": {
               "dc": {
@@ -2690,6 +2725,23 @@
               "$ref": "#/components/schemas/TenantNode"
             },
             "type": "array"
+          },
+          "workspace": {
+            "properties": {
+              "chosen": {
+                "nullable": true,
+                "type": "string"
+              },
+              "default": {
+                "nullable": true,
+                "type": "string"
+              }
+            },
+            "required": [
+              "chosen",
+              "default"
+            ],
+            "type": "object"
           }
         },
         "required": [
@@ -3539,7 +3591,7 @@
             "description": "An error"
           }
         },
-        "summary": "The principal, session, tenant tree, grants, studio.* settings, and whether the AI assistants are on and which roles have a model",
+        "summary": "The principal, session, tenant tree, grants, a capability summary and the last and default workspace for Studio, studio.* settings, and whether the AI assistants are on and which roles have a model",
         "tags": [
           "sprig.v1.Auth"
         ]
@@ -7153,6 +7205,37 @@
           }
         },
         "summary": "Clears the caller's history",
+        "tags": [
+          "sprig.v1.Library"
+        ]
+      }
+    },
+    "/v1/library/prefs": {
+      "post": {
+        "operationId": "Library.SetPrefs",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonReply"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error"
+          }
+        },
+        "summary": "Keeps the caller's preferences {workspace}: Studio's last workspace, or null to forget it",
         "tags": [
           "sprig.v1.Library"
         ]

@@ -1,28 +1,41 @@
-import { Link, useParams } from 'react-router';
+import type { ComponentType } from 'react';
+import { useParams } from 'react-router';
 import { useIntl } from 'react-intl';
 import { Mascot } from './Mascot';
 import { useSession } from '../auth/session';
-import { useDatabases } from '../catalog/snapshot';
+import { useWorkspaces } from '../workspace/current';
+import type { WorkspaceId } from '../workspace/workspaces';
+import { AnalystHome, DbAdminHome, DeveloperHome, SecurityAdminHome, TenantAdminHome } from '../home/Homes';
 
-/** The tenant's home: databases, who you are, the session. */
+const HOMES: Record<Exclude<WorkspaceId, 'operator'>, ComponentType> = {
+  analyst: AnalystHome,
+  developer: DeveloperHome,
+  db_admin: DbAdminHome,
+  security_admin: SecurityAdminHome,
+  tenant_admin: TenantAdminHome,
+};
+
+/** The tenant's home: the home page of the workspace in use. */
 export function TenantHome() {
   const { tenant = '' } = useParams();
   const me = useSession((s) => s.me);
-  const dbs = useDatabases();
+  const { current } = useWorkspaces();
   const intl = useIntl();
   if (!me) return null;
   const home = me.principal.tenant === tenant;
+  const Home = HOMES[current.id as keyof typeof HOMES] ?? AnalystHome;
   return (
-    <div className="stack">
+    <div className="stack" data-testid={`home-${current.id}`}>
       <div className="welcome-hero">
-        <Mascot pose="waving" size={150} />
+        <Mascot pose="waving" size={96} />
         <div>
           <h1>{intl.formatMessage({ id: 'welcome.title' }, { user: me.principal.login })}</h1>
           <p className="muted" style={{ margin: 0 }}>
-            {intl.formatMessage({ id: 'welcome.lead' })}
+            {intl.formatMessage({ id: current.label })}: {intl.formatMessage({ id: current.blurb })}
           </p>
-          <p className="muted" style={{ margin: '4px 0 0' }}>
+          <p className="muted small" style={{ margin: '4px 0 0' }}>
             {tenant}
+            {me.gateway ? ` · ${me.gateway.id} in ${me.gateway.dc}` : ''}
           </p>
         </div>
       </div>
@@ -32,49 +45,7 @@ export function TenantHome() {
           tenant.
         </p>
       )}
-      <div className="row" style={{ alignItems: 'stretch' }}>
-        <section className="card" style={{ flex: 1, minInlineSize: 260 }} aria-labelledby="dbs-h">
-          <h2 id="dbs-h">Databases</h2>
-          <ul className="linklist">
-            {(dbs.data ?? []).map((d) => (
-              <li key={d}>
-                <Link to={`/t/${encodeURIComponent(me.principal.tenant ?? '')}/db/${encodeURIComponent(d)}`}>{d}</Link>
-              </li>
-            ))}
-          </ul>
-        </section>
-        <section className="card" style={{ flex: 1, minInlineSize: 260 }} aria-labelledby="me-h">
-          <h2 id="me-h">You</h2>
-          <dl>
-            <dt>Signed in as</dt>
-            <dd>
-              {me.principal.login}@{me.principal.host}
-            </dd>
-            <dt>Session</dt>
-            <dd>
-              idle limit {me.session.idle_minutes} min, at most {me.session.max_hours} h
-            </dd>
-            <dt>Privileges</dt>
-            <dd>
-              {[
-                me.privileges.tenant_admin && 'tenant admin',
-                me.privileges.settings_admin && 'settings admin',
-                me.privileges.create_user && 'create user',
-              ]
-                .filter(Boolean)
-                .join(', ') || 'ordinary user'}
-            </dd>
-            {me.gateway && (
-              <>
-                <dt>Gateway</dt>
-                <dd>
-                  {me.gateway.id} in {me.gateway.dc}
-                </dd>
-              </>
-            )}
-          </dl>
-        </section>
-      </div>
+      <Home />
     </div>
   );
 }

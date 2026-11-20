@@ -251,6 +251,8 @@ fn round4_paths() -> Value {
             "Records a run {language, database, text, ok, ms, error, client} (redacted)", None, "JsonReply")},
         "/v1/library/history:clear": {"post": op("Library.ClearHistory", "sprig.v1.Library",
             "Clears the caller's history", None, "JsonReply")},
+        "/v1/library/prefs": {"post": op("Library.SetPrefs", "sprig.v1.Library",
+            "Keeps the caller's preferences {workspace}: Studio's last workspace, or null to forget it", None, "JsonReply")},
     })
 }
 
@@ -354,7 +356,7 @@ fn core_paths() -> Value {
         "/v1/auth/impersonate": {"post": op("Auth.Impersonate", "sprig.v1.Auth",
             "A session as a user of one's tenant or a descendant, with a reason; no refresh token", Some("ImpersonateRequest"), "TokenReply")},
         "/v1/auth/me": {"get": op("Auth.WhoAmI", "sprig.v1.Auth",
-            "The principal, session, tenant tree, grants, studio.* settings, and whether the AI assistants are on and which roles have a model", None, "WhoAmI")},
+            "The principal, session, tenant tree, grants, a capability summary and the last and default workspace for Studio, studio.* settings, and whether the AI assistants are on and which roles have a model", None, "WhoAmI")},
         "/v1/exports:ticket": {"post": op("Exports.CreateTicket", "sprig.v1.Exports",
             "A short-lived ticket for a form POST /v1/exports (form field ticket)", Some("ExportTicketRequest"), "ExportTicket")},
         "/v1/users:setPassword": {"post": op("Users.SetPassword", "sprig.v1.Users",
@@ -431,6 +433,54 @@ fn docs_page_schemas() -> Value {
     })
 }
 
+/// `Auth.WhoAmI`'s reply.
+fn whoami_schema() -> Value {
+    let s = |props: Value, req: &[&str]| json!({"type": "object", "properties": props, "required": req});
+    let string = json!({"type": "string"});
+    let int = json!({"type": "integer"});
+    let boolean = json!({"type": "boolean"});
+    let obj = json!({"type": "object", "additionalProperties": true});
+    let nullable = json!({"type": "string", "nullable": true});
+    s(
+        json!({
+            "principal": s(json!({"tenant": nullable, "tenant_id": nullable, "user": string,
+                "host": string, "login": string}), &["user", "host", "login"]),
+            "amr": {"type": "array", "items": string},
+            "session": s(json!({"id": string, "client": string, "created_at_ms": string,
+                "idle_minutes": int, "max_hours": int, "access_ttl_seconds": int}),
+                &["id", "idle_minutes", "max_hours", "access_ttl_seconds"]),
+            "tenants": {"type": "array", "items": {"$ref": "#/components/schemas/TenantNode"}},
+            "grants": {"type": "array", "items": string},
+            "privileges": s(json!({"tenant_admin": boolean, "settings_admin": boolean,
+                "create_user": boolean, "grant_option": boolean, "index_all": boolean,
+                "index_dbs": {"type": "array", "items": string}}),
+                &["tenant_admin", "settings_admin", "create_user", "grant_option", "index_all", "index_dbs"]),
+            "capabilities": s(json!({"read_data": boolean, "change_schemas": boolean,
+                "manage_logic": boolean, "manage_users": boolean, "approve_changes": boolean,
+                "administer_tenant": boolean, "operator": boolean}),
+                &["read_data", "change_schemas", "manage_logic", "manage_users", "approve_changes",
+                  "administer_tenant", "operator"]),
+            "workspace": s(json!({"chosen": nullable, "default": nullable}), &["chosen", "default"]),
+            "platform_roles": {"type": "array", "items": string},
+            "studio": obj,
+            "gateway": s(json!({"id": string, "dc": string, "studio_build": string}), &[]),
+            "ai": s(json!({"enabled": boolean, "share_data": boolean,
+                "roles": {"type": "array", "items": {"type": "string", "enum": ["data", "dba", "admin"]}}}),
+                &["enabled", "share_data", "roles"]),
+        }),
+        &[
+            "principal",
+            "amr",
+            "session",
+            "tenants",
+            "grants",
+            "privileges",
+            "platform_roles",
+            "studio",
+        ],
+    )
+}
+
 fn core_schemas() -> Value {
     let s = |props: Value, req: &[&str]| json!({"type": "object", "properties": props, "required": req});
     let string = json!({"type": "string"});
@@ -448,26 +498,7 @@ fn core_schemas() -> Value {
         "LogoutReply": s(json!({"ended": boolean}), &["ended"]),
         "TenantNode": s(json!({"name": nullable, "id": nullable, "path": nullable,
             "relation": {"type": "string", "enum": ["home", "admin", "foreign"]}}), &["name", "relation"]),
-        "WhoAmI": s(json!({
-            "principal": s(json!({"tenant": nullable, "tenant_id": nullable, "user": string,
-                "host": string, "login": string}), &["user", "host", "login"]),
-            "amr": {"type": "array", "items": string},
-            "session": s(json!({"id": string, "client": string, "created_at_ms": string,
-                "idle_minutes": int, "max_hours": int, "access_ttl_seconds": int}),
-                &["id", "idle_minutes", "max_hours", "access_ttl_seconds"]),
-            "tenants": {"type": "array", "items": {"$ref": "#/components/schemas/TenantNode"}},
-            "grants": {"type": "array", "items": string},
-            "privileges": s(json!({"tenant_admin": boolean, "settings_admin": boolean,
-                "create_user": boolean, "grant_option": boolean, "index_all": boolean,
-                "index_dbs": {"type": "array", "items": string}}),
-                &["tenant_admin", "settings_admin", "create_user", "grant_option", "index_all", "index_dbs"]),
-            "platform_roles": {"type": "array", "items": string},
-            "studio": obj,
-            "gateway": s(json!({"id": string, "dc": string, "studio_build": string}), &[]),
-            "ai": s(json!({"enabled": boolean, "share_data": boolean,
-                "roles": {"type": "array", "items": {"type": "string", "enum": ["data", "dba", "admin"]}}}),
-                &["enabled", "share_data", "roles"]),
-        }), &["principal", "amr", "session", "tenants", "grants", "privileges", "platform_roles", "studio"]),
+        "WhoAmI": whoami_schema(),
         "ExportTicketRequest": s(json!({"database": string, "sql": string,
             "format": {"type": "string", "enum": ["csv", "ndjson"]}, "name": string}), &["sql", "format"]),
         "ExportTicket": s(json!({"ticket": string, "expires_in": int}), &["ticket", "expires_in"]),

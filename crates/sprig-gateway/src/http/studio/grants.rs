@@ -135,6 +135,141 @@ impl Privileges {
     }
 }
 
+/// `WhoAmI`'s `capabilities`: what the user can do, summed up for Studio
+/// to choose which workspaces to offer. It is a summary for display only;
+/// nothing on the server checks it, and the gateway decides every
+/// statement as before.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // one flag per capability, as WhoAmI shows them
+pub struct Capabilities {
+    /// `SELECT` (or `ALL`) on anything.
+    pub read_data: bool,
+    /// `CREATE`, `CREATE VIEW`, `ALTER`, `DROP` or `INDEX` (or `ALL`) on anything.
+    pub change_schemas: bool,
+    /// `CREATE ROUTINE` or `ALTER ROUTINE` (or `ALL`) on anything.
+    pub manage_logic: bool,
+    /// `CREATE USER` on `*.*`, or tenant admin.
+    pub manage_users: bool,
+    /// Can approve index and shard changes for every database:
+    /// `INDEX`, `ALTER` or `ALL` on `*.*`, or tenant admin.
+    pub approve_changes: bool,
+    /// `SPRIG_TENANT_ADMIN` (or `ALL` on `*.*`).
+    pub administer_tenant: bool,
+    /// Holds platform operator rights in Studio.
+    pub operator: bool,
+}
+
+/// The privilege names of a grant's list, without column lists:
+/// `SELECT (a, b), INSERT` → `SELECT`, `INSERT`.
+fn privilege_names(list: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut cur = String::new();
+    for c in list.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => out.push(std::mem::take(&mut cur)),
+            _ if depth == 0 => cur.push(c),
+            _ => {}
+        }
+    }
+    out.push(cur);
+    out.into_iter()
+        .map(|p| p.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+impl Capabilities {
+    /// Sums up `SHOW GRANTS` lines (`privs` read from the same lines) and
+    /// whether the user holds operator rights.
+    #[must_use]
+    pub fn of(lines: &[String], privs: &Privileges, operator: bool) -> Self {
+        let mut c = Self {
+            manage_users: privs.create_user,
+            approve_changes: privs.index_all,
+            administer_tenant: privs.tenant_admin,
+            operator,
+            ..Self::default()
+        };
+        for line in lines {
+            let u = line.trim().to_ascii_uppercase();
+            let Some(rest) = u.strip_prefix("GRANT ") else {
+                continue;
+            };
+            let Some(on_at) = rest.find(" ON ") else {
+                continue;
+            };
+            let names = privilege_names(&rest[..on_at]);
+            let has = |want: &[&str]| {
+                names
+                    .iter()
+                    .any(|n| n == "ALL" || n == "ALL PRIVILEGES" || want.contains(&n.as_str()))
+            };
+            c.read_data |= has(&["SELECT"]);
+            c.change_schemas |= has(&["CREATE", "CREATE VIEW", "ALTER", "DROP", "INDEX"]);
+            c.manage_logic |= has(&["CREATE ROUTINE", "ALTER ROUTINE"]);
+        }
+        if c.administer_tenant {
+            c.read_data = true;
+            c.change_schemas = true;
+            c.manage_logic = true;
+        }
+        c
+    }
+
+    /// The JSON `WhoAmI` returns.
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        json!({
+            "read_data": self.read_data,
+            "change_schemas": self.change_schemas,
+            "manage_logic": self.manage_logic,
+            "manage_users": self.manage_users,
+            "approve_changes": self.approve_changes,
+            "administer_tenant": self.administer_tenant,
+            "operator": self.operator,
+        })
+    }
+}
+
+/// The roles granted to the user, from `SHOW GRANTS` lines of the form
+/// ``GRANT `role` TO `user`@`host` `` (a role grant has no `ON`).
+#[must_use]
+pub fn roles_of(lines: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in lines {
+        let t = line.trim();
+        let Some(rest) = t
+            .get(..6)
+            .filter(|h| h.eq_ignore_ascii_case("GRANT "))
+            .map(|_| &t[6..])
+        else {
+            continue;
+        };
+        let upper = rest.to_ascii_uppercase();
+        if upper.contains(" ON ") {
+            continue;
+        }
+        let Some(to_at) = upper.find(" TO ") else {
+            continue;
+        };
+        for role in rest[..to_at].split(',') {
+            // `role` or `role`@`host` (an account used as a role).
+            let name = match role.trim().find("`@") {
+                Some(at) => &role.trim()[..=at],
+                None => role.trim(),
+            };
+            let name = unquote(name);
+            if !name.is_empty() && !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +302,77 @@ mod tests {
         let p = of(&["GRANT SPRIG_SETTINGS_ADMIN, CREATE USER ON *.* TO `a`@`%`"]);
         assert!(!p.tenant_admin && p.settings_admin && p.create_user);
         assert!(!p.may_index("x"));
+    }
+
+    fn caps(lines: &[&str], operator: bool) -> Capabilities {
+        let lines: Vec<String> = lines.iter().map(|s| (*s).to_owned()).collect();
+        Capabilities::of(&lines, &Privileges::of(&lines), operator)
+    }
+
+    #[test]
+    fn capabilities_sum_up_the_grants() {
+        // Read only, through a column grant.
+        let c = caps(
+            &[
+                "GRANT USAGE ON *.* TO `ann`@`%`",
+                "GRANT SELECT (`id`, `name`), INSERT ON `shop`.`orders` TO `ann`@`%`",
+            ],
+            false,
+        );
+        assert!(c.read_data);
+        assert!(!c.change_schemas && !c.manage_logic && !c.manage_users);
+        assert!(!c.approve_changes && !c.administer_tenant && !c.operator);
+
+        // A developer on one database: schemas and logic, but approving
+        // changes for every database needs the grant on *.*.
+        let c = caps(
+            &["GRANT SELECT, ALTER, CREATE ROUTINE ON `shop`.* TO `dev`@`%`"],
+            false,
+        );
+        assert!(c.read_data && c.change_schemas && c.manage_logic);
+        assert!(!c.approve_changes);
+        let c = caps(&["GRANT INDEX ON *.* TO `dba`@`%`"], false);
+        assert!(c.change_schemas && c.approve_changes && !c.read_data);
+
+        // Logic alone.
+        let c = caps(&["GRANT ALTER ROUTINE ON `shop`.* TO `l`@`%`"], false);
+        assert!(c.manage_logic && !c.change_schemas);
+
+        // User management and the tenant administrator.
+        let c = caps(&["GRANT CREATE USER ON *.* TO `sec`@`%`"], true);
+        assert!(c.manage_users && c.operator && !c.administer_tenant);
+        let c = caps(&["GRANT SPRIG_TENANT_ADMIN ON *.* TO `boss`@`%`"], false);
+        assert!(c.administer_tenant && c.manage_users && c.approve_changes);
+        assert!(c.read_data && c.change_schemas && c.manage_logic);
+        let c = caps(&["GRANT ALL PRIVILEGES ON `shop`.* TO `o`@`%`"], false);
+        assert!(c.read_data && c.change_schemas && c.manage_logic && !c.administer_tenant);
+
+        // Nothing.
+        assert_eq!(
+            caps(&["GRANT USAGE ON *.* TO `x`@`%`"], false),
+            Capabilities::default()
+        );
+        let j = caps(&[], true).to_json();
+        assert_eq!(j["operator"], true);
+        assert_eq!(j.as_object().map(serde_json::Map::len), Some(7));
+    }
+
+    #[test]
+    fn roles_come_from_role_grants() {
+        let lines: Vec<String> = [
+            "GRANT `dev` TO `a`@`%`",
+            "GRANT `ops`@`%`, `Auditors` TO `a`@`%` WITH ADMIN OPTION",
+            "GRANT SELECT ON `shop`.* TO `a`@`%`",
+            "grant `dev` to `a`@`%`",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        assert_eq!(roles_of(&lines), ["dev", "ops", "Auditors"]);
+        assert_eq!(
+            privilege_names("SELECT (a, b), INSERT,  CREATE   ROUTINE"),
+            ["SELECT", "INSERT", "CREATE ROUTINE"]
+        );
     }
 
     #[test]

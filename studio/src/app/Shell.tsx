@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { NavLink, Outlet } from 'react-router';
+import { Link, NavLink, Outlet } from 'react-router';
 import { FormattedMessage, useIntl } from 'react-intl';
 import { logout, stopImpersonating, touch, useSession } from '../auth/session';
 import { IdleDialog } from '../auth/IdleDialog';
@@ -11,7 +11,10 @@ import { useOpenCount } from '../approvals/InboxPage';
 import { operatorSession } from '../ops/ops';
 import { Mascot } from './Mascot';
 import { Command, LogOut, Search } from '../icons';
-import { SECTIONS, resolve, sectionOf, type Section } from '../workspace/sections';
+import { SECTIONS, entryOf, resolve, sectionOf, type Section } from '../workspace/sections';
+import { barSections } from '../workspace/workspaces';
+import { useWorkspaces } from '../workspace/current';
+import { WorkspaceSwitcher } from '../workspace/WorkspaceSwitcher';
 import { useRel, WorkspaceTabs } from '../workspace/WorkspaceTabs';
 import { StatusBar } from '../workspace/StatusBar';
 import { CommandPalette } from '../workspace/CommandPalette';
@@ -33,6 +36,7 @@ export function Shell() {
   const openCount = useOpenCount();
   const [palette, setPalette] = useState(false);
   const dockOpen = useAssistant((s) => s.open);
+  const { current: workspace } = useWorkspaces();
   // A panel-only section (saved queries, history) chosen in the activity bar,
   // for the page it was chosen on; navigating elsewhere goes back to the page's section.
   const [panelOn, setPanelOn] = useState<{ id: string; rel: string } | null>(null);
@@ -63,7 +67,7 @@ export function Shell() {
   const isOperator = !!(me?.platform_roles.includes('operator') || operatorSession());
   const panelSection = panelOn && panelOn.rel === rel ? SECTIONS.find((s) => s.id === panelOn.id) : undefined;
   const active = panelSection ?? sectionOf(rel);
-  const target = (s: Section) => (s.id === 'query' ? `${base}/q/${firstTab}` : resolve(base, s.to));
+  const target = (s: Section) => (s.id === 'query' ? `${base}/q/${firstTab}` : resolve(base, entryOf(s)));
   const activityItem = (s: Section) => {
     const label = intl.formatMessage({ id: s.label });
     if (s.panel) {
@@ -85,12 +89,12 @@ export function Shell() {
       <NavLink
         key={s.id}
         to={target(s)}
-        className={s.id === active.id && !s.to.startsWith('/') ? 'on' : undefined}
+        className={s.id === active.id && !entryOf(s).startsWith('/') ? 'on' : undefined}
         onClick={() => setPanelOn(null)}
         aria-label={label}
         title={label}
         data-testid={s.testId}
-        aria-current={s.id === active.id && !s.to.startsWith('/') ? 'page' : undefined}
+        aria-current={s.id === active.id && !entryOf(s).startsWith('/') ? 'page' : undefined}
       >
         <s.icon size={20} />
         {s.id === 'performance' && openCount > 0 && (
@@ -101,7 +105,9 @@ export function Shell() {
       </NavLink>
     );
   };
-  const visible = SECTIONS.filter((s) => !s.operatorOnly || isOperator);
+  // The activity bar is the workspace's; other sections stay reachable from
+  // the command palette and by their routes.
+  const visible = barSections(workspace, isOperator);
   return (
     <div className="shell">
       <a className="skip" href="#content">
@@ -119,11 +125,12 @@ export function Shell() {
         </div>
       )}
       <header className="titlebar">
-        <span className="brand">
+        <Link className="brand" to={base} title={intl.formatMessage({ id: 'ws.home' })}>
           <Mascot pose="avatar" size={26} />
           <FormattedMessage id="app.name" />
-        </span>
+        </Link>
         <TenantSwitcher />
+        <WorkspaceSwitcher />
         <button className="search-button" onClick={() => setPalette(true)} aria-keyshortcuts="Control+K">
           <Search size={14} />
           <span className="search-text">{intl.formatMessage({ id: 'palette.open' })}</span>

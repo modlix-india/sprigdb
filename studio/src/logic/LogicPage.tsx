@@ -1,10 +1,9 @@
 // The logic editors: KIRun functions
 // in @fincity/kirun-ui, JavaScript and Lua in Monaco. "Check" is
 // Logic.Compile, a dry run showing the tier and each reason where it
-// applies (Monaco markers for script lines, the step's name for KIRun),
-// and the generated PL/SQL for users with ALTER ROUTINE. Deploy, rollback,
-// rollout stages and drops are the statements a SQL client would run, shown
-// before they run. Test runs are Logic.TestRun, of the deployed
+// applies (Monaco markers for script lines, the step's name for KIRun).
+// Deploy, rollback, rollout stages and drops are the statements a SQL client
+// would run, shown before they run. Test runs are Logic.TestRun, of the deployed
 // versions or of the editor's draft, with inputs, snapshot rows and fetch
 // mocks, always rolled back; a CALL that keeps its changes stays as a
 // second choice. Logs poll Logic.TailLogs; dead letters are replayed or
@@ -523,13 +522,6 @@ function Editor({ db, detail, isNew, newKind }: Readonly<{ db: string; detail?: 
               ))}
             </ul>
           )}
-          {checked.plsql && (
-            <details>
-              <summary>Generated PL/SQL</summary>
-              <pre data-testid="logic-plsql">{checked.plsql}</pre>
-            </details>
-          )}
-          {checked.plsql_hidden && <p className="muted">The generated PL/SQL shows to users with ALTER ROUTINE.</p>}
         </section>
       )}
       <details>
@@ -545,7 +537,7 @@ function Versions({ db, detail }: Readonly<{ db: string; detail: ModuleDetail }>
   const qc = useQueryClient();
   const confirm = useConfirm();
   const [err, setErr] = useState<string | null>(null);
-  const [shown, setShown] = useState<{ v: number; source: string; plsql: string | null } | null>(null);
+  const [shown, setShown] = useState<{ v: number; source: string } | null>(null);
   const m = detail.module;
   const kind: LogicKind = m.kind === 'procedure' ? 'procedure' : 'function';
   const roll = async (v: number) => {
@@ -582,7 +574,7 @@ function Versions({ db, detail }: Readonly<{ db: string; detail: ModuleDetail }>
                   <button
                     onClick={() =>
                       void getVersion(db, m.kind, m.name, v.version).then(
-                        (x) => setShown({ v: v.version, source: x.source, plsql: x.plsql }),
+                        (x) => setShown({ v: v.version, source: x.source }),
                         (e: unknown) => setErr(errorText(e)),
                       )
                     }
@@ -610,12 +602,6 @@ function Versions({ db, detail }: Readonly<{ db: string; detail: ModuleDetail }>
         <div className="stack">
           <h3>Version {shown.v}</h3>
           <pre data-testid="logic-version-source">{shown.source}</pre>
-          {shown.plsql && (
-            <details>
-              <summary>PL/SQL</summary>
-              <pre>{shown.plsql}</pre>
-            </details>
-          )}
         </div>
       )}
       {confirm.node}

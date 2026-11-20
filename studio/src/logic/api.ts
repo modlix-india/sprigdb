@@ -56,7 +56,6 @@ export interface ModuleDetail {
   schedule: { cron: string; time_zone: string; next_fire_ms: number; last_outcome: string | null; paused: boolean } | null;
   routines: boolean;
   source?: string | null;
-  plsql?: string | null;
   source_version?: number;
 }
 
@@ -75,8 +74,6 @@ export interface CompileResult {
   tier?: string;
   placement?: Placement;
   signature?: Signature | null;
-  plsql?: string | null;
-  plsql_hidden?: boolean;
   diagnostics: Diagnostic[];
 }
 
@@ -109,7 +106,7 @@ const one = (db: string, kind: string, name: string) => `${base(db)}/${encodeURI
 export const listModules = (db: string) => json<{ modules: ModuleRow[]; routines: boolean }>(base(db));
 export const getModule = (db: string, kind: string, name: string) => json<ModuleDetail>(one(db, kind, name));
 export const getVersion = (db: string, kind: string, name: string, v: number) =>
-  json<{ version: number; source: string; plsql: string | null }>(`${one(db, kind, name)}/versions/${v}`);
+  json<{ version: number; source: string }>(`${one(db, kind, name)}/versions/${v}`);
 export const compileDry = (db: string, sql: string) => json<CompileResult>(`${base(db)}:compile`, { body: { sql } });
 export const logs = (db: string, kind: string, name: string, after = 0) =>
   json<{ logs: LogRow[] }>(`${one(db, kind, name)}/logs?after=${after}&limit=200`);

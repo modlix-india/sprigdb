@@ -63,16 +63,24 @@ function target(r: Recommendation): string {
   return s.tenant_name ?? s.cluster ?? r.target;
 }
 
-/** The inbox's unread count, for the navigation badge. */
-export function useOpenCount(): number {
-  const q = useQuery({
+/** The open recommendations (the first 200) and their count, for the
+ * navigation badge and the administrators' home pages. */
+export function useOpenApprovals() {
+  return useQuery({
     queryKey: ['approvals', 'badge'],
     queryFn: () => json<ListResponse>('/v1/recommendations?state=open&limit=200'),
     refetchInterval: 60_000,
     retry: false,
   });
-  return q.data?.open ?? 0;
 }
+
+/** The inbox's unread count, for the navigation badge. */
+export function useOpenCount(): number {
+  return useOpenApprovals().data?.open ?? 0;
+}
+
+/** Where a recommendation applies, in words. */
+export const recommendationTarget = (r: Recommendation): string => target(r);
 
 /** Recommendations held for approval: filters, the item with
  * its evidence and history, and approve, approve in a window, ignore,

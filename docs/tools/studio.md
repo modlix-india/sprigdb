@@ -126,15 +126,37 @@ Studio's window has five parts:
 └─────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **The title bar** has the tenant (a switcher, if you administer descendant tenants), the search box that opens the [command palette](#the-command-palette), the theme, who you are, and **Sign out**.
-- **The activity bar** on the left picks a section. From the top: **Explorer**, **Query**, **Saved queries**, **History**, **Dashboards**, **Messaging**, **Logic**, **Performance** (with a badge counting approvals that wait), **Inheritance**, **Access control** and **Docs**; at the bottom, **Operator mode** (operators only) and **Settings**.
+- **The title bar** has the tenant (a switcher, if you administer descendant tenants), the [workspace](#workspaces), the search box that opens the [command palette](#the-command-palette), the theme, who you are, and **Sign out**. The SprigDB Studio name goes back to the home page.
+- **The activity bar** on the left picks a section. Which sections it shows depends on the workspace. All of them, from the top: **Explorer**, **Query**, **Saved queries**, **History**, **Dashboards**, **Messaging**, **Logic**, **Performance** (with a badge counting approvals that wait), **Inheritance**, **Access control** and **Docs**; at the bottom, **Operator mode** (operators only) and **Settings**.
 - **The side panel** lists the section's pages and, below them, the database tree. For Saved queries and History, it shows those lists instead.
 - **The tabs** hold everything you have open: query tabs, tables, and pages. `Left` and `Right` move between tabs, and `Delete` (or a middle click) closes one.
 - **The status bar** shows whether you are connected (and whether Studio is working), the tenant and database, the gateway and its data centre, your login, and the **Assistant** button, which opens [the assistant](#the-assistant).
 
-The tenant's home page welcomes you and lists your databases, with who you are signed in as, your session limits, your privileges and the gateway you reached. If you are a tenant administrator, the tenant switcher lists your home tenant and its descendants; choosing a descendant opens its settings. Settings and access can target a descendant; data views always use your home tenant.
+The tenant's home page is your workspace's (see below). If you are a tenant administrator, the tenant switcher lists your home tenant and its descendants; choosing a descendant opens its settings. Settings and access can target a descendant; data views always use your home tenant.
 
 ![The workspace on the Welcome tab: title bar with the tenant, search box, theme menu and Sign out; activity bar and database tree on the left; status bar along the bottom](../img/studio/home.png)
+
+### Workspaces
+
+A workspace is Studio arranged for one kind of user: its own home page, its own sections in the activity bar, and its own commands first in the command palette. It changes only what Studio shows. What you may do is still decided by your privileges, whatever the workspace.
+
+| Workspace | Opens for users who can | Activity bar | Home page |
+|---|---|---|---|
+| **Analyst** | read data | Explorer, Query, Saved queries, History, Dashboards, Docs | Search over tables and saved queries; recent and saved queries; the tables you have open |
+| **Developer** | change schemas or manage logic | Explorer, Query, Saved queries, History, Dashboards, Messaging, Logic, Inheritance, Docs | Databases with their tables, views, graphs and routines; recent queries; triggers and schedules with dead letters |
+| **Database administrator** | approve changes for every database (`INDEX`, `ALTER` or `ALL` on `*.*`) | Explorer, Query, Saved queries, History, Performance, Docs, Settings | Load and slow statements of the last 24 hours; pending approvals; index advice |
+| **Security administrator** | manage users (`CREATE USER`) | Access control, Docs, Settings | Users, locked accounts and expired passwords |
+| **Tenant administrator** | administer the tenant (`SPRIG_TENANT_ADMIN`) | Every section | The tenant tree; a summary of the two administrators' pages; settings set on this tenant |
+| **Operator** | hold operator rights | Operator mode, as before | |
+
+- **Other sections** stay one search away: the command palette offers a workspace's other sections after its own (a database administrator finds **Logic** there, for example). Pages keep their addresses, so links work in every workspace.
+- **Switching.** Pick a workspace in the title bar, beside the tenant, or type its name in the command palette. Switching opens the workspace's home page and keeps your tabs open. Choosing **Operator** opens operator mode.
+- **Which one Studio opens on.** Your own last choice, which is kept in the tenant's catalog beside your saved queries, so it follows you to other browsers. Without one, the default a tenant administrator set for you or one of your roles in `studio.default_workspace`. Without that, the widest workspace you qualify for, in the order of the table. A choice you no longer qualify for is skipped.
+- **Setting a default.** `studio.default_workspace` is a comma-separated list. An entry is a workspace for everyone (`analyst`), for one user (`user:ann=developer`), or for a role (`role:auditors=security_admin`). A user's entry wins over a role's, and a role's over the one for everyone. The workspace names are `analyst`, `developer`, `db_admin`, `security_admin` and `tenant_admin`:
+
+  ```sql
+  ALTER TENANT SPRIG SET (studio.default_workspace = 'developer, role:dba=db_admin, user:ann=tenant_admin');
+  ```
 
 ### The explorer
 
@@ -357,7 +379,7 @@ The **Logic** section lists the database's functions, procedures, triggers and v
 
 - **JavaScript** and **Lua** in Monaco; **KIRun** in the visual KIRun editor, with its step graph and text form, which knows SprigDB's own functions (`Sprig.Db.*`, `Sprig.Http.Fetch`, `Sprig.Mq.*`).
 - A new function or procedure takes a name, parameters, a return type (functions), security (`INVOKER` or `DEFINER`) and a tier preference (`auto`, `mariadb` or `engine`).
-- **Check** compiles without deploying, shows which tier the code runs in and why ("Why not MariaDB"), and, for users with `ALTER ROUTINE`, the generated SQL. Errors are marked on their line, or on the step's name for KIRun.
+- **Check** compiles without deploying, shows which tier the code runs in and why ("Why not MariaDB"). Errors are marked on their line, or on the step's name for KIRun.
 - **Deploy** shows and runs the statement. A function or procedure can be deployed to a share of callers first, picked by caller or by tenant.
 
 ![The logic editor on a JavaScript function, order_total: its runtime, active version, tier and security, the Code, Versions, Rollout, Test run, Logs and Dead letters tabs, the parameters and return type, the code in the editor, and Check, Test run and Deploy](../img/studio/logic.png)
