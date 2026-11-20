@@ -143,10 +143,10 @@ A workspace is Studio arranged for one kind of user: its own home page, its own 
 | Workspace | Opens for users who can | Activity bar | Home page |
 |---|---|---|---|
 | **Analyst** | read data | Explorer, Query, Saved queries, History, Dashboards, Docs | Search over tables and saved queries; recent and saved queries; the tables you have open |
-| **Developer** | change schemas or manage logic | Explorer, Query, Saved queries, History, Dashboards, Messaging, Logic, Inheritance, Docs | Databases with their tables, views, graphs and routines; recent queries; triggers and schedules with dead letters |
-| **Database administrator** | approve changes for every database (`INDEX`, `ALTER` or `ALL` on `*.*`) | Explorer, Query, Saved queries, History, Performance, Docs, Settings | Load and slow statements of the last 24 hours; pending approvals; index advice |
-| **Security administrator** | manage users (`CREATE USER`) | Access control, Docs, Settings | Users, locked accounts and expired passwords |
-| **Tenant administrator** | administer the tenant (`SPRIG_TENANT_ADMIN`) | Every section | The tenant tree; a summary of the two administrators' pages; settings set on this tenant |
+| **Developer** | change schemas (`CREATE`, `ALTER`, `DROP`) or manage logic | Explorer, Query, Saved queries, History, Dashboards, Messaging, Logic, Inheritance, Docs | Databases with their tables, views, graphs and routines; recent queries; triggers and schedules with dead letters; recent schema changes; connection strings for each protocol |
+| **Database administrator** | approve changes for every database (`INDEX`, `ALTER` or `ALL` on `*.*`) | Explorer, Query, Saved queries, History, Performance, Docs, Settings | Load and slow statements of the last 24 hours; pending approvals; index advice; storage per database; statements running 5 seconds or more on this gateway |
+| **Security administrator** | manage users (`CREATE USER`) | Access control, Docs, Settings | Users with their last sign-in, locked accounts and expired passwords; failed logins; recent grants |
+| **Tenant administrator** | administer the tenant (`SPRIG_TENANT_ADMIN`) | Every section | The tenant tree; a summary of the two administrators' pages, with the storage the tenant uses; settings set on this tenant |
 | **Operator** | hold operator rights | Operator mode, as before | |
 
 - **Other sections** stay one search away: the command palette offers a workspace's other sections after its own (a database administrator finds **Logic** there, for example). Pages keep their addresses, so links work in every workspace.
@@ -157,6 +157,18 @@ A workspace is Studio arranged for one kind of user: its own home page, its own 
   ```sql
   ALTER TENANT SPRIG SET (studio.default_workspace = 'developer, role:dba=db_admin, user:ann=tenant_admin');
   ```
+
+- **Getting started.** Each workspace's home page starts with a short checklist of first steps. Steps Studio can see done (running or saving a query, opening a table or a database) tick themselves; tick the others yourself, or **Hide** the list. The ticks are kept in your browser.
+- **The assistant**, where it is on, starts with questions that fit the workspace: about tables and charts for an analyst, joins and triggers for a developer, access and policies for a security administrator.
+
+The analyst's workspace is the simplest:
+
+- **The tree** lists tables, views and collections only. A table's page has **Data**, **Columns** and **Relations**, without indexes, triggers, policies, shards or the definition.
+- **Query tabs start read-only.** Studio runs reads and stops anything else before sending it, with a message saying so. Clear **Read-only** in the tab to run the statement; your privileges still decide whether it succeeds. A table's data view likewise starts without editing, until you tick **Allow edits**. Every other workspace's tabs start with **Read-only** clear, and you can tick it in any tab.
+- **No DDL forms.** Pages of sections the workspace doesn't offer (logic, messaging, performance, inheritance, access control, settings) show a note instead, with a button to open the page in another workspace of yours when you have one. Your own sign-in settings (**Security**) stay open.
+- **No engine terms.** There is no **Explain** button, since plans speak of shards and units, and the home page doesn't name the gateway or data centre.
+
+The [`sprig` TUI](sprig.md#workspaces) takes the same workspace.
 
 ### The explorer
 

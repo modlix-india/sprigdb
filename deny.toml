@@ -19,6 +19,16 @@ ignore = [
     { id = "RUSTSEC-2026-0543", reason = "chrono: unmaintained, not vulnerable; replacement pending Kiran's decision" },
     { id = "RUSTSEC-2026-0555", reason = "chrono-tz: unmaintained, not vulnerable; replacement pending Kiran's decision" },
     { id = "RUSTSEC-2026-0542", reason = "humantime: unmaintained, not vulnerable; replacement pending Kiran's decision" },
+    # protobuf 2.x (MIT) comes in through raft-engine 0.4.2 (approved by Kiran,
+    # 18 Nov 2026), whose newest release still uses it for log entries and
+    # metrics. The advisory is a stack overflow when parsing deeply nested
+    # untrusted messages; the engine's log only ever parses entries it wrote
+    # itself, which hold no nested messages.
+    { id = "RUSTSEC-2024-0437", reason = "protobuf 2: raft-engine's log parses only the engine's own flat entries" },
+    # pin-utils (MIT OR Apache-2.0) was archived in October 2026: unmaintained, not
+    # vulnerable. It comes in through nix 0.26, which raft-engine 0.4.2 (approved by
+    # Kiran, 18 Nov 2026) uses for file locking; no raft-engine release drops it yet.
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils: unmaintained, not vulnerable; via nix 0.26 under raft-engine" },
 ]
 
 [licenses]

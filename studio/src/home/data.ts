@@ -134,6 +134,136 @@ export interface HomeUser {
   kind: string;
   account_locked: boolean;
   password_expired: boolean;
+  /** Newer gateways: the last successful and failed logins (ms, as text),
+   * failures in a row, and a temporary lock's end. */
+  last_login_ms?: string | null;
+  last_failed_login_ms?: string | null;
+  failed_logins?: number;
+  locked_until_ms?: string | null;
+}
+
+/** Accounts with failed logins in a row, most first, then by latest failure. */
+export function failedLogins(users: readonly HomeUser[]): HomeUser[] {
+  return users
+    .filter((u) => (u.failed_logins ?? 0) > 0)
+    .sort((a, b) => (b.failed_logins ?? 0) - (a.failed_logins ?? 0) || Number(b.last_failed_login_ms ?? 0) - Number(a.last_failed_login_ms ?? 0));
+}
+
+/** Storage per database as `information_schema.TABLES` reports it to the
+ * caller (data and index bytes), largest first. */
+export function useStorage() {
+  return useQuery({
+    queryKey: ['home', 'storage'],
+    queryFn: async () => {
+      const r = await objects(
+        null,
+        'SELECT TABLE_SCHEMA AS db, COUNT(*) AS tables, SUM(DATA_LENGTH + INDEX_LENGTH) AS bytes FROM information_schema.TABLES GROUP BY TABLE_SCHEMA',
+      );
+      return storageRows(r);
+    },
+    retry: false,
+  });
+}
+
+export interface StorageRow {
+  db: string;
+  tables: number;
+  bytes: number;
+}
+
+export function storageRows(rows: readonly Record<string, string | null>[]): StorageRow[] {
+  return rows
+    .map((x) => ({ db: x.db ?? '', tables: Number(x.tables ?? 0), bytes: Number(x.bytes ?? 0) }))
+    .filter((x) => x.db && !['information_schema', 'performance_schema', 'mysql', 'sys'].includes(x.db.toLowerCase()))
+    .sort((a, b) => b.bytes - a.bytes);
+}
+
+/** Bytes in words: 1.5 MB. */
+export function bytesText(n: number): string {
+  const units = ['bytes', 'KB', 'MB', 'GB', 'TB'];
+  let v = n;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return i === 0 ? `${v} bytes` : `${v.toFixed(v < 10 ? 1 : 0)} ${units[i]}`;
+}
+
+export interface RunningStatement {
+  id: string;
+  user: string;
+  db: string | null;
+  seconds: number;
+  text: string;
+}
+
+/** Statements running at least `min` seconds on this gateway, from SHOW FULL
+ * PROCESSLIST as the caller sees it, longest first. */
+export function longRunning(rows: readonly Record<string, string | null>[], min = 5): RunningStatement[] {
+  return rows
+    .filter((x) => x.Command !== 'Sleep' && Number(x.Time ?? 0) >= min && x.Info && !/^\s*SHOW\s+FULL\s+PROCESSLIST/i.test(x.Info))
+    .map((x) => ({ id: x.Id ?? '', user: x.User ?? '', db: x.db ?? null, seconds: Number(x.Time ?? 0), text: x.Info ?? '' }))
+    .sort((a, b) => b.seconds - a.seconds);
+}
+
+export function useLongRunning() {
+  return useQuery({
+    queryKey: ['home', 'processlist'],
+    queryFn: async () => longRunning(await objects(null, 'SHOW FULL PROCESSLIST')),
+    refetchInterval: 15_000,
+    retry: false,
+  });
+}
+
+export interface SchemaChange {
+  database: string;
+  object: string;
+  kind: string;
+  version: number;
+  statement: string;
+  at_ms: number;
+  by: string | null;
+}
+
+/** Recent schema changes of the objects the caller can see (newer gateways). */
+export function useSchemaChanges(limit = 10) {
+  return useQuery({
+    queryKey: ['home', 'schema-changes', limit],
+    queryFn: () => json<{ changes: SchemaChange[] }>(`/v1/activity/schema?limit=${limit}`),
+    retry: false,
+  });
+}
+
+export interface RecentGrant {
+  grantee_kind: string;
+  grantee: string | null;
+  level: string;
+  database: string | null;
+  object: string | null;
+  column: string | null;
+  privileges: string[];
+  restriction: boolean;
+  at_ms: number;
+  by: string | null;
+}
+
+/** Recent grants, for user administrators (newer gateways). */
+export function useRecentGrants(limit = 10) {
+  return useQuery({
+    queryKey: ['home', 'grants', limit],
+    queryFn: () => json<{ grants: RecentGrant[] }>(`/v1/activity/grants?limit=${limit}`),
+    retry: false,
+  });
+}
+
+/** Where a grant applies, as GRANT writes it: `*.*`, `shop.*`, `shop.orders`. */
+export function grantTarget(g: Pick<RecentGrant, 'level' | 'database' | 'object' | 'column'>): string {
+  if (g.level === 'tenant') return '*.*';
+  const db = g.database ?? '?';
+  if (g.level === 'database') return `${db}.*`;
+  const obj = `${db}.${g.object ?? '?'}`;
+  return g.column ? `${obj} (${g.column})` : obj;
 }
 
 /** The tenant's accounts (the users page, same cache). */

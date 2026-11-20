@@ -7,7 +7,7 @@
 
 import type { Capabilities, WhoAmI } from '../api/types';
 import type { MessageId } from '../i18n/en';
-import { SECTIONS, hasPages, type Section, type SectionId } from './sections';
+import { SECTIONS, hasPages, sectionOf, type Section, type SectionId } from './sections';
 
 export type Capability = keyof Capabilities;
 
@@ -28,6 +28,26 @@ export interface WorkspaceDef {
   /** Entered at this path instead of the tenant's home (operator mode): never
    * a default, never kept as the user's choice. */
   entry?: string;
+  /** How Studio simplifies itself in this workspace (the analyst's). */
+  simple?: Simple;
+}
+
+/** The analyst's simplifications. Each changes only what Studio shows or
+ * asks first; the gateway still enforces the user's real privileges. */
+export interface Simple {
+  /** The tree and database pages list tables, views and collections only;
+   * object pages show data, columns and relations, not indexes, triggers,
+   * policies, shards or definitions. */
+  tree: boolean;
+  /** Query tabs start read-only: Studio runs reads and stops anything else
+   * before sending it, until the tab's switch is turned off. */
+  readOnlyTabs: boolean;
+  /** Pages of sections the workspace doesn't offer (where the DDL forms
+   * are) show a note instead, and settings links are left out. */
+  hideDdl: boolean;
+  /** No engine terms: no Explain (plans speak of shards and units), no
+   * Shards tab, no gateway or data-centre names on the home page. */
+  plainWords: boolean;
 }
 
 /** Widest first: the default for a user who hasn't chosen is the first one
@@ -118,6 +138,7 @@ export const WORKSPACES: readonly WorkspaceDef[] = [
     label: 'ws.analyst',
     blurb: 'ws.analyst.blurb',
     needs: ['read_data'],
+    simple: { tree: true, readOnlyTabs: true, hideDdl: true, plainWords: true },
     sections: {
       explorer: 'bar',
       query: 'bar',
@@ -204,4 +225,51 @@ export function paletteSections(ws: WorkspaceDef, isOperator: boolean): Section[
     ...offered.filter((s) => placed(ws, s, isOperator) === 'bar'),
     ...offered.filter((s) => placed(ws, s, isOperator) === 'palette'),
   ];
+}
+
+// ---- the analyst's simplifications ----
+
+type ObjectKind = 'table' | 'view' | 'procedure' | 'function' | 'graph';
+
+/** The objects a workspace's tree and database pages list. */
+export function treeObjects<T extends { kind: ObjectKind }>(ws: WorkspaceDef, objects: readonly T[]): T[] {
+  return ws.simple?.tree ? objects.filter((o) => o.kind === 'table' || o.kind === 'view') : [...objects];
+}
+
+/** The tabs of an object's page in a workspace, from the full list. */
+export function objectTabs<T extends string>(ws: WorkspaceDef, kind: string, all: readonly T[]): T[] {
+  if (!ws.simple?.tree) return [...all];
+  const keep: string[] = kind === 'table' ? ['data', 'columns', 'relations'] : kind === 'view' ? ['data', 'columns'] : [];
+  return all.filter((t) => keep.includes(t));
+}
+
+/** Whether a query tab starts read-only in a workspace. */
+export function readOnlyByDefault(ws: WorkspaceDef): boolean {
+  return !!ws.simple?.readOnlyTabs;
+}
+
+/** Whether a read-only tab stops a statement of class `cls` (lib/sql's
+ * classify, or the MongoDB and Cypher equivalents) before sending it. */
+export function stopsInReadOnly(cls: string): boolean {
+  return cls !== 'read' && cls !== 'session';
+}
+
+/** Pages every workspace keeps whatever its sections: your own sign-in
+ * security, and the home page. */
+const ALWAYS: readonly string[] = ['', 'security'];
+
+/** Whether a workspace shows the page at tenant-relative `rel`. Only a
+ * workspace with `hideDdl` shows a note instead: on pages of sections it
+ * doesn't offer at all. */
+export function showsPage(ws: WorkspaceDef, rel: string): boolean {
+  if (!ws.simple?.hideDdl || ALWAYS.includes(rel)) return true;
+  const s = sectionOf(rel);
+  return s.id in ws.sections;
+}
+
+/** The widest workspace in `open` that offers the section of `rel`, to
+ * suggest when the current one doesn't. */
+export function workspaceFor(open: readonly WorkspaceDef[], rel: string): WorkspaceDef | undefined {
+  const s = sectionOf(rel);
+  return open.find((w) => !w.entry && s.id in w.sections && showsPage(w, rel));
 }

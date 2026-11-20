@@ -14,8 +14,8 @@
 │       │orders                                      table · shop                          │       │
 │       │order_items                                 table · shop                          │       │
 │       │Dashboard                                   screen                                │       │
-│       └──────────────────────────────────────────────────────────────────────────────────┘ands   │
-│                            ││       .'  .*.  '.~~.    F5      run the statement at the cursor    │
+│       │Make this tab read-only                     command · read-only                   │ands   │
+│       └──────────────────────────────────────────────────────────────────────────────────┘sor    │
 │                            ││       '-(_)-(_)-'~~'    F1      all the keys                       │
 │                            ││                                                                    │
 │                            ││                                                                    │

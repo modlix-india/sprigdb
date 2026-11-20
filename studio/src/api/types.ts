@@ -123,7 +123,8 @@ export interface WhoAmI {
   workspace?: { chosen: string | null; default: string | null };
   platform_roles: string[];
   studio: StudioSettings;
-  gateway?: { id: string; dc: string; studio_build: string };
+  /** `listeners`: this gateway's client listeners and ports (newer gateways). */
+  gateway?: { id: string; dc: string; studio_build: string; listeners?: Record<string, number> };
   /** The administrator acting, in an impersonation session. */
   impersonator?: string | null;
   /** The AI assistants: on for the tenant, results shared, roles with a model

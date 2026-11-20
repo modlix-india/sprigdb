@@ -144,7 +144,8 @@ impl Privileges {
 pub struct Capabilities {
     /// `SELECT` (or `ALL`) on anything.
     pub read_data: bool,
-    /// `CREATE`, `CREATE VIEW`, `ALTER`, `DROP` or `INDEX` (or `ALL`) on anything.
+    /// `CREATE`, `CREATE VIEW`, `ALTER` or `DROP` (or `ALL`) on anything.
+    /// `INDEX` alone doesn't count: approving indexes isn't designing schemas.
     pub change_schemas: bool,
     /// `CREATE ROUTINE` or `ALTER ROUTINE` (or `ALL`) on anything.
     pub manage_logic: bool,
@@ -208,7 +209,7 @@ impl Capabilities {
                     .any(|n| n == "ALL" || n == "ALL PRIVILEGES" || want.contains(&n.as_str()))
             };
             c.read_data |= has(&["SELECT"]);
-            c.change_schemas |= has(&["CREATE", "CREATE VIEW", "ALTER", "DROP", "INDEX"]);
+            c.change_schemas |= has(&["CREATE", "CREATE VIEW", "ALTER", "DROP"]);
             c.manage_logic |= has(&["CREATE ROUTINE", "ALTER ROUTINE"]);
         }
         if c.administer_tenant {
@@ -332,7 +333,9 @@ mod tests {
         assert!(c.read_data && c.change_schemas && c.manage_logic);
         assert!(!c.approve_changes);
         let c = caps(&["GRANT INDEX ON *.* TO `dba`@`%`"], false);
-        assert!(c.change_schemas && c.approve_changes && !c.read_data);
+        assert!(!c.change_schemas && c.approve_changes && !c.read_data);
+        let c = caps(&["GRANT ALTER ON *.* TO `dba`@`%`"], false);
+        assert!(c.change_schemas && c.approve_changes);
 
         // Logic alone.
         let c = caps(&["GRANT ALTER ROUTINE ON `shop`.* TO `l`@`%`"], false);

@@ -18,6 +18,7 @@
 //! | `/v1/ops/...` | Operator mode: the Admin API for logins in `studio.operator_logins` ([`ops`]) |
 //! | `/v1/library`, `/v1/library/saved[:delete]`, `/v1/library/history[:clear]`, `/v1/library/prefs` | The caller's saved queries, history and preferences ([`library`]) |
 //! | `/v1/dashboards...` | Dashboards and their tiles, run as the viewer ([`dashboards`]) |
+//! | `GET /v1/activity/schema`, `GET /v1/activity/grants` | Recent schema changes the caller can see; recent grants for user administrators ([`activity`]) |
 //! | `GET /v1/shards`, `/v1/shards/advisor[/{run}]` | The shards view: table groups, keys, maps, advisor runs ([`shards`]) |
 //! | `/v1/ai/...` | The AI assistants: chat (NDJSON), conversations, feedback, glossary ([`ai`]) |
 //! | `GET /v1/openapi.json` | The data API's document with these routes added |
@@ -34,6 +35,8 @@
 //! are signed tokens ([`session`]): any gateway accepts them.
 
 pub mod accounts;
+// Recent schema changes and grants for the home pages.
+pub mod activity;
 // The AI assistants' chat, conversations, feedback and glossary.
 pub mod ai;
 pub mod catalog;
@@ -895,6 +898,7 @@ pub async fn handle(
         (_, p) if logic::is_logic_path(p) => logic::route(core, info, req).await,
         (_, p) if messaging::is_messaging_path(p) => messaging::route(core, info, req).await,
         (_, p) if library::is_library_path(p) => library::route(core, info, req).await,
+        (_, p) if activity::is_activity_path(p) => activity::route(core, info, req).await,
         (_, p) if dashboards::is_dashboards_path(p) => dashboards::route(core, info, req).await,
         (_, p) if ai::is_ai_path(p) => ai::route(core, info, req).await,
         (_, ai::mcp::PATH) => Ok(ai::mcp::route(core, info, req).await),
@@ -1261,6 +1265,7 @@ async fn whoami(
         &grants::roles_of(&grants),
     );
     let chosen_workspace = library::workspace_pref(core, &caller).await;
+    let listeners = own_listeners(core).await;
     let out = json!({
         "principal": {
             "tenant": p.tenant_name,
@@ -1297,9 +1302,42 @@ async fn whoami(
             "id": core.engine.gateway_id,
             "dc": core.engine.dc,
             "studio_build": core.studio.store().build_version(),
+            "listeners": listeners,
         },
     });
     Ok(json_response(200, &out))
+}
+
+/// This gateway's client listeners and their ports (`mysql`, `mongo`,
+/// `redis`, ...), from its registration record, for Studio's connection
+/// strings; the peer service is internal and left out. Empty when the
+/// record can't be read.
+async fn own_listeners(core: &Arc<Core>) -> serde_json::Map<String, Value> {
+    let Some(peers) = core.studio.tenants.as_ref().and_then(|t| t.peers.get()) else {
+        return serde_json::Map::new();
+    };
+    match peers.gateways().await {
+        Ok(all) => all
+            .into_iter()
+            .find(|g| g.gateway_id == core.engine.gateway_id)
+            .map(|g| client_listeners(&g.listeners))
+            .unwrap_or_default(),
+        Err(e) => {
+            tracing::debug!(error = %e, "WhoAmI: the gateway's listeners weren't read");
+            serde_json::Map::new()
+        }
+    }
+}
+
+/// The client listeners of a registration record's ports.
+fn client_listeners(
+    ports: &std::collections::BTreeMap<String, u16>,
+) -> serde_json::Map<String, Value> {
+    ports
+        .iter()
+        .filter(|(name, _)| name.as_str() != "peer")
+        .map(|(name, port)| (name.clone(), json!(port)))
+        .collect()
 }
 
 /// The directory fields the tenant tree reads.

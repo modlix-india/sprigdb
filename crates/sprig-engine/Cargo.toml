@@ -1,0 +1,26 @@
+[package]
+name = "sprig-engine"
+description = "SprigDB: the storage engine (sorted store, keys, commit log, recovery, budgets)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+flate2.workspace = true
+protobuf.workspace = true
+raft-engine.workspace = true
+rust-rocksdb.workspace = true
+sprig-common.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

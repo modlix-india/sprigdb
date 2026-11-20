@@ -16,6 +16,7 @@ pub mod palette;
 pub mod results;
 pub mod table;
 pub mod theme;
+pub mod workspace;
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -393,6 +394,22 @@ impl Rt {
             Effect::Export(tab, format) => {
                 let msg = export(app, tab, format);
                 app.status = msg;
+            }
+            Effect::LoadWorkspace => {
+                let c = self.client.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(Msg::WhoAmI(c.whoami().await));
+                });
+            }
+            Effect::SetWorkspace(id) => {
+                let c = self.client.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = c.set_prefs(&serde_json::json!({ "workspace": id })).await {
+                        let _ = tx.send(Msg::Status(format!(
+                            "the workspace is used here; the catalog didn't keep it: {e}"
+                        )));
+                    }
+                });
             }
             Effect::LoadLibrary => {
                 let c = self.client.clone();
@@ -778,6 +795,7 @@ async fn open(
         Effect::LoadCatalog,
         Effect::InboxRefresh,
         Effect::LoadLibrary,
+        Effect::LoadWorkspace,
     ];
     if let Some(f) = start {
         fx.extend(app.show(f));

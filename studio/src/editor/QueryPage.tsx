@@ -19,6 +19,8 @@ import { MONGO_WORDS } from '../docs/words';
 import { AskButton } from '../ai/AskButton';
 import { InlineAsk } from '../ai/InlineAsk';
 import { useRoles } from '../ai/store';
+import { useWorkspaces } from '../workspace/current';
+import { readOnlyByDefault, stopsInReadOnly } from '../workspace/workspaces';
 
 const EDITOR_LANG: Record<QueryLanguage, EditorLanguage> = { sql: 'mysql', cypher: 'cypher', gql: 'cypher', mongo: 'javascript' };
 
@@ -59,6 +61,8 @@ export function QueryPage() {
   const me = useSession((s) => s.me);
   const tabs = useTabs((s) => s.tabs);
   const tab = tabs.find((t) => t.id === tabId);
+  const { current: workspace } = useWorkspaces();
+  const readOnly = tab?.readOnly ?? readOnlyByDefault(workspace);
   const dbs = useDatabases();
   const snap = useSnapshot(tab?.db);
   const qc = useQueryClient();
@@ -260,6 +264,13 @@ export function QueryPage() {
             throw e;
           }
         }
+        // Studio's switch, not an access check: it stops a write before it
+        // is sent; with the switch off the gateway decides as always.
+        if (readOnly && stopsInReadOnly(cls)) {
+          setError({ text: intl.formatMessage({ id: 'query.readOnlyStopped' }, { kind: cls }) });
+          setPhase('failed');
+          return;
+        }
         if (needsConfirmation(cls, me.studio.confirm_writes)) {
           setPhase('checking');
           const ok = await askConfirm(tl === 'mongo' ? `${s.text}\n\n${JSON.stringify(JSON.parse(send), null, 2)}` : s.text, cls);
@@ -306,7 +317,7 @@ export function QueryPage() {
       setPhase('done');
       log(true);
     },
-    [tab, me, phase, qc],
+    [tab, me, phase, qc, readOnly, intl],
   );
 
   const [saving, setSaving] = useState<string | null>(null);
@@ -441,12 +452,23 @@ export function QueryPage() {
         <button onClick={() => void run(true)} disabled={busy}>
           <FormattedMessage id="query.runAll" />
         </button>
-        <button onClick={() => void doExplain()} disabled={busy}>
-          <FormattedMessage id="query.explain" />
-        </button>
+        {!workspace.simple?.plainWords && (
+          <button onClick={() => void doExplain()} disabled={busy}>
+            <FormattedMessage id="query.explain" />
+          </button>
+        )}
         <button onClick={cancel} disabled={!busy}>
           <FormattedMessage id="query.cancel" />
         </button>
+        <label className="row small" title={intl.formatMessage({ id: 'query.readOnlyHint' })}>
+          <input
+            type="checkbox"
+            checked={readOnly}
+            onChange={(e) => updateTab(tab.id, { readOnly: e.target.checked })}
+            data-testid="read-only"
+          />
+          <FormattedMessage id="query.readOnly" />
+        </label>
         <span className="grow" />
         {saving === null ? (
           <button onClick={() => setSaving(tab.title)} title="Ctrl/⌘ + S" data-testid="save-query">

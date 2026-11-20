@@ -2607,6 +2607,12 @@
               "id": {
                 "type": "string"
               },
+              "listeners": {
+                "additionalProperties": {
+                  "type": "integer"
+                },
+                "type": "object"
+              },
               "studio_build": {
                 "type": "string"
               }
@@ -2764,6 +2770,88 @@
   },
   "openapi": "3.0.3",
   "paths": {
+    "/v1/activity/grants": {
+      "get": {
+        "operationId": "Activity.RecentGrants",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonReply"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error"
+          }
+        },
+        "summary": "The latest privilege grants in the tenant, for CREATE USER or SPRIG_TENANT_ADMIN (limit: 20, at most 200)",
+        "tags": [
+          "sprig.v1.Activity"
+        ]
+      }
+    },
+    "/v1/activity/schema": {
+      "get": {
+        "operationId": "Activity.SchemaChanges",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonReply"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An error"
+          }
+        },
+        "summary": "The latest schema changes of the objects the caller can see (database, object, kind, version, the statement's verb, when, by whom; limit: 20, at most 200)",
+        "tags": [
+          "sprig.v1.Activity"
+        ]
+      }
+    },
     "/v1/ai/chat": {
       "post": {
         "operationId": "Ai.Chat",
@@ -7711,7 +7799,7 @@
             "description": "An error"
           }
         },
-        "summary": "The tenant's accounts (all for CREATE USER or SPRIG_TENANT_ADMIN, else the caller)",
+        "summary": "The tenant's accounts (all for CREATE USER or SPRIG_TENANT_ADMIN, else the caller), with each one's last login, last failed login, failures in a row and temporary lock",
         "tags": [
           "sprig.v1.Users"
         ]

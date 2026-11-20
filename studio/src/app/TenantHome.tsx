@@ -5,6 +5,7 @@ import { Mascot } from './Mascot';
 import { useSession } from '../auth/session';
 import { useWorkspaces } from '../workspace/current';
 import type { WorkspaceId } from '../workspace/workspaces';
+import { Checklist } from '../home/Checklist';
 import { AnalystHome, DbAdminHome, DeveloperHome, SecurityAdminHome, TenantAdminHome } from '../home/Homes';
 
 const HOMES: Record<Exclude<WorkspaceId, 'operator'>, ComponentType> = {
@@ -35,7 +36,7 @@ export function TenantHome() {
           </p>
           <p className="muted small" style={{ margin: '4px 0 0' }}>
             {tenant}
-            {me.gateway ? ` · ${me.gateway.id} in ${me.gateway.dc}` : ''}
+            {me.gateway && !current.simple?.plainWords ? ` · ${me.gateway.id} in ${me.gateway.dc}` : ''}
           </p>
         </div>
       </div>
@@ -45,6 +46,7 @@ export function TenantHome() {
           tenant.
         </p>
       )}
+      <Checklist ws={current} />
       <Home />
     </div>
   );

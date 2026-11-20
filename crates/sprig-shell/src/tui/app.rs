@@ -8,6 +8,7 @@ use crate::tui::assistant::{self, Act as AiAct, Assistant, Item as AiItem, State
 use crate::tui::icons::{self, Icon};
 use crate::tui::palette::{self, Action as PalAction, Item as PalItem};
 use crate::tui::theme;
+use crate::tui::workspace::{self, Workspace};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -63,6 +64,9 @@ pub struct DataTab {
     pub last_run: Option<(String, Lang)>,
     /// A table tab's view (instead of the editor and results).
     pub table: Option<Box<TableView>>,
+    /// The tab's read-only switch; unset: the workspace's default (on in
+    /// the analyst's). The gateway checks every statement either way.
+    pub read_only: Option<bool>,
 }
 
 impl DataTab {
@@ -81,6 +85,7 @@ impl DataTab {
             started: None,
             last_run: None,
             table: None,
+            read_only: None,
         }
     }
 }
@@ -229,6 +234,10 @@ pub enum Effect {
     InboxAct(InboxAction),
     /// Read the saved queries and history the tenant's catalog keeps.
     LoadLibrary,
+    /// Read `WhoAmI` for the workspace.
+    LoadWorkspace,
+    /// Keep the user's workspace choice in the tenant's catalog (as Studio).
+    SetWorkspace(String),
     /// Send a saved query to the catalog.
     LibrarySave(crate::saved::SavedQuery),
     /// Record a run in the catalog's history.
@@ -293,6 +302,8 @@ pub enum Msg {
     Inbox(Result<Value, ShellError>),
     /// The catalog's library (`GET /v1/library`).
     Library(Result<Value, ShellError>),
+    /// `WhoAmI` (`GET /v1/auth/me`), for the workspace.
+    WhoAmI(Result<Value, ShellError>),
     /// A table tab's database snapshot.
     TableInfo(TabId, Result<Value, ShellError>),
     /// A table tab's query results.
@@ -413,6 +424,13 @@ pub struct App {
     pub operator: bool,
     /// The assistant pane (Ctrl-A).
     pub assistant: Assistant,
+    /// The workspace in use (Studio's), once `WhoAmI` says; `None` on a
+    /// gateway without workspaces or a native connection: every screen shows.
+    pub workspace: Option<Workspace>,
+    /// The workspaces open to the user.
+    pub workspaces: Vec<Workspace>,
+    /// `WhoAmI` says the user holds operator rights.
+    pub caps_operator: bool,
     /// Next tab id.
     pub next_id: TabId,
     /// Quit after this frame.
@@ -462,7 +480,89 @@ impl App {
             inbox: Inbox::default(),
             operator,
             assistant: Assistant::default(),
+            workspace: None,
+            workspaces: Vec::new(),
+            caps_operator: false,
             quit: false,
+        }
+    }
+
+    /// The fixed screens shown after the data tabs: all three without a
+    /// workspace; with one, the Inbox where the workspace has Studio's
+    /// Performance section, and the Dashboard and Admin screens (operator
+    /// mode) for operators and admin profiles.
+    #[must_use]
+    pub fn fixed_list(&self) -> Vec<Fixed> {
+        let Some(ws) = self.workspace else {
+            return FIXED.to_vec();
+        };
+        let ops = self.operator || self.caps_operator;
+        FIXED
+            .into_iter()
+            .filter(|f| match f {
+                Fixed::Dash | Fixed::Admin => ops,
+                Fixed::Inbox => ws.shows_inbox(),
+            })
+            .collect()
+    }
+
+    /// Whether the tab `t` is read-only now.
+    #[must_use]
+    pub fn read_only(&self, t: &DataTab) -> bool {
+        t.read_only
+            .unwrap_or_else(|| self.workspace.is_some_and(Workspace::simple))
+    }
+
+    /// The palette's workspace commands: switch to another open workspace,
+    /// and the current tab's read-only switch.
+    fn workspace_items(&self, out: &mut Vec<PalItem>) {
+        for w in &self.workspaces {
+            if Some(*w) != self.workspace {
+                out.push(PalItem {
+                    label: format!("Switch to the {} workspace", w.label()),
+                    hint: "command · workspace".to_owned(),
+                    action: PalAction::Workspace(w.id().to_owned()),
+                });
+            }
+        }
+        if let Some(t) = self.tabs.get(self.screen) {
+            out.push(PalItem {
+                label: if self.read_only(t) {
+                    "Allow writes in this tab".to_owned()
+                } else {
+                    "Make this tab read-only".to_owned()
+                },
+                hint: "command · read-only".to_owned(),
+                action: PalAction::ReadOnly,
+            });
+        }
+    }
+
+    /// Takes `WhoAmI`'s workspace and capabilities.
+    pub fn apply_whoami(&mut self, v: &Value) {
+        let Some((ws, open, caps)) = workspace::from_whoami(v) else {
+            return;
+        };
+        self.workspaces = open;
+        self.caps_operator = caps.operator;
+        self.set_workspace(ws);
+    }
+
+    /// Uses workspace `ws`: its screens, its explorer, its tab default.
+    pub fn set_workspace(&mut self, ws: Workspace) {
+        let shown = self.fixed();
+        self.workspace = Some(ws);
+        self.explorer.simple = ws.simple();
+        let list = self.fixed_list();
+        // Stay on the same fixed screen when it still shows.
+        if let Some(f) = shown {
+            self.screen = match list.iter().position(|x| *x == f) {
+                Some(i) => self.tabs.len() + i,
+                None => 0,
+            };
+        }
+        if !ws.shows_explorer() && self.focus == Focus::Explorer {
+            self.focus = Focus::Editor;
         }
     }
 
@@ -471,12 +571,12 @@ impl App {
     pub fn fixed(&self) -> Option<Fixed> {
         self.screen
             .checked_sub(self.tabs.len())
-            .and_then(|i| FIXED.get(i).copied())
+            .and_then(|i| self.fixed_list().get(i).copied())
     }
 
     /// Shows a fixed screen.
     pub fn show(&mut self, f: Fixed) -> Vec<Effect> {
-        let i = FIXED.iter().position(|x| *x == f).unwrap_or(0);
+        let i = self.fixed_list().iter().position(|x| *x == f).unwrap_or(0);
         self.screen = self.tabs.len() + i;
         self.entered()
     }
@@ -539,7 +639,7 @@ impl App {
             KeyCode::F(7) => return self.switch(1),
             KeyCode::Char(c @ '1'..='9') if alt(&k) => {
                 let i = (c as usize) - ('1' as usize);
-                if i < self.tabs.len() + FIXED.len() {
+                if i < self.tabs.len() + self.fixed_list().len() {
                     self.screen = i;
                     self.completion = None;
                     return self.entered();
@@ -569,7 +669,7 @@ impl App {
     }
 
     fn switch(&mut self, d: isize) -> Vec<Effect> {
-        let n = self.tabs.len() + FIXED.len();
+        let n = self.tabs.len() + self.fixed_list().len();
         self.screen = (self.screen + n).saturating_add_signed(d) % n;
         self.completion = None;
         self.entered()
@@ -762,20 +862,19 @@ impl App {
                 action: PalAction::Screen(i),
             });
         }
-        for (j, (name, hint)) in [
-            ("Dashboard", "screen"),
-            ("Admin", "screen · sprigctl"),
-            ("Inbox", "screen · approvals"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (j, f) in self.fixed_list().into_iter().enumerate() {
+            let (name, hint) = match f {
+                Fixed::Dash => ("Dashboard", "screen"),
+                Fixed::Admin => ("Admin", "screen · sprigctl"),
+                Fixed::Inbox => ("Inbox", "screen · approvals"),
+            };
             out.push(PalItem {
                 label: name.to_owned(),
                 hint: hint.to_owned(),
                 action: PalAction::Screen(self.tabs.len() + j),
             });
         }
+        self.workspace_items(&mut out);
         for db in &self.explorer.roots {
             for group in &db.children {
                 for n in &group.children {
@@ -880,10 +979,10 @@ impl App {
         Vec::new()
     }
 
-    fn palette_act(&mut self, a: PalAction) -> Vec<Effect> {
+    pub(crate) fn palette_act(&mut self, a: PalAction) -> Vec<Effect> {
         match a {
             PalAction::Screen(i) => {
-                self.screen = i.min(self.tabs.len() + FIXED.len() - 1);
+                self.screen = i.min(self.tabs.len() + self.fixed_list().len().max(1) - 1);
                 self.completion = None;
                 self.entered()
             }
@@ -903,6 +1002,26 @@ impl App {
                 Vec::new()
             }
             PalAction::Reload => vec![Effect::LoadCatalog],
+            PalAction::Workspace(id) => match Workspace::from_id(&id) {
+                Some(w) => {
+                    self.set_workspace(w);
+                    self.status = format!("{} workspace", w.label());
+                    vec![Effect::SetWorkspace(id)]
+                }
+                None => Vec::new(),
+            },
+            PalAction::ReadOnly => {
+                if self.screen < self.tabs.len() {
+                    let ro = !self.read_only(&self.tabs[self.screen]);
+                    self.tabs[self.screen].read_only = Some(ro);
+                    self.status = if ro {
+                        "this tab is read-only: sprig sends only reads".to_owned()
+                    } else {
+                        "this tab sends writes; your privileges still decide".to_owned()
+                    };
+                }
+                Vec::new()
+            }
             PalAction::OpenTable(db, table, is_view) => self.open_table(&db, &table, is_view),
             PalAction::Insert(text) => {
                 if self.tabs.get(self.screen).is_none_or(|t| t.table.is_some()) {
@@ -937,6 +1056,14 @@ impl App {
             return Vec::new();
         }
         if stmts.is_empty() {
+            return Vec::new();
+        }
+        // The tab's switch, not an access check: with it off the gateway
+        // decides as always.
+        if self.read_only(tab) && !stmts.iter().all(|s| workspace::reads_only(s, lang)) {
+            self.status = String::from(
+                "this tab is read-only, so sprig didn't send it; Ctrl-K \"Allow writes in this tab\" to run it",
+            );
             return Vec::new();
         }
         let why: Vec<String> = stmts
@@ -1057,6 +1184,17 @@ impl App {
                 Vec::new()
             }
             TableCmd::Apply(stmts) => {
+                if self
+                    .tabs
+                    .iter()
+                    .find(|t| t.id == id)
+                    .is_some_and(|t| self.read_only(t))
+                {
+                    self.status = String::from(
+                        "this tab is read-only, so sprig didn't apply the changes; Ctrl-K \"Allow writes in this tab\" first",
+                    );
+                    return Vec::new();
+                }
                 let shown: Vec<String> = stmts.iter().map(|s| format!("{};", s.sql)).collect();
                 self.dialog = Some(Dialog::Confirm(
                     format!(
@@ -1985,7 +2123,10 @@ impl App {
                     .map(Effect::LibrarySave)
                     .collect();
             }
-            Msg::Library(Err(_)) => {}
+            Msg::WhoAmI(Ok(v)) => self.apply_whoami(&v),
+            // An older gateway or a native login (no workspace): every
+            // screen shows.
+            Msg::Library(Err(_)) | Msg::WhoAmI(Err(_)) => {}
             m @ (Msg::TableInfo(..)
             | Msg::TableRows(..)
             | Msg::TableShards(..)
@@ -2092,7 +2233,8 @@ impl App {
 
     #[allow(clippy::many_single_char_names)]
     fn draw_data(&mut self, f: &mut Frame<'_>, area: Rect) {
-        let show_explorer = area.width >= 90;
+        let show_explorer =
+            area.width >= 90 && self.workspace.is_none_or(Workspace::shows_explorer);
         let [left, right] = if show_explorer {
             Layout::horizontal([Constraint::Length(30), Constraint::Min(30)]).areas(area)
         } else {
@@ -2320,12 +2462,18 @@ impl App {
             if t.in_txn {
                 spans.push(Span::styled(" TXN ", theme::warn_badge()));
             }
+            if self.read_only(t) {
+                spans.push(Span::styled(" READ-ONLY ", theme::badge()));
+            }
             if let Some(s) = t.started {
                 spans.push(Span::raw(format!(
                     " running {} ms ",
                     s.elapsed().as_millis()
                 )));
             }
+        }
+        if let Some(w) = self.workspace {
+            spans.push(Span::styled(format!(" {} ", w.label()), theme::muted()));
         }
         if let Some(n) = self.inbox.count().filter(|n| *n > 0) {
             spans.push(Span::styled(format!(" ⚑ {n} to approve "), theme::badge()));

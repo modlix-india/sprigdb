@@ -215,6 +215,16 @@ export const en = {
   'ws.operator': 'Operator',
   'ws.operator.blurb': 'Operator mode: data centres, clusters, moves and health.',
   'palette.cmd.workspace': 'Switch to the {name} workspace',
+  'ws.guard.title': "This page isn't part of the {name} workspace",
+  'ws.guard.body': 'Switch workspace to use it. Your privileges are the same in every workspace.',
+  'ws.guard.switch': 'Open it in the {name} workspace',
+  'query.readOnly': 'Read-only',
+  'query.readOnlyHint': 'Studio runs only reads in this tab. Your privileges still decide what you may change.',
+  'query.readOnlyStopped':
+    "This tab is read-only, so Studio didn't send this {kind} statement. Clear Read-only to run it; your privileges still apply.",
+  'checklist.title': 'Getting started',
+  'checklist.dismiss': 'Hide',
+  'checklist.done': 'done',
 } as const;
 
 export type MessageId = keyof typeof en;

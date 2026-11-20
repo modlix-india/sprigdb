@@ -680,6 +680,15 @@ impl Peers {
             .into_inner())
     }
 
+    /// This DC's registered gateways, in any state (Studio reads its own
+    /// gateway's listener ports from them).
+    ///
+    /// # Errors
+    /// The store's errors.
+    pub async fn gateways(&self) -> Result<Vec<GatewayRecord>> {
+        registry::list(self.store.as_ref()).await
+    }
+
     /// The ready gateways of DC `dc` that serve the peer service, from that
     /// DC's tier (single-etcd mode).
     ///

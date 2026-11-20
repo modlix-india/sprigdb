@@ -3,7 +3,7 @@
 //!
 //! | Route | Who | Does |
 //! |---|---|---|
-//! | `GET /v1/users` | any user (themselves); `CREATE USER` or `SPRIG_TENANT_ADMIN` (all) | The tenant's accounts, without secrets |
+//! | `GET /v1/users` | any user (themselves); `CREATE USER` or `SPRIG_TENANT_ADMIN` (all) | The tenant's accounts, without secrets, with each one's last login, last failed login, failures in a row and temporary lock |
 //! | `GET /v1/api-keys` | as above | Keys: id, name, user, expiry, revocation; never a secret |
 //! | `POST /v1/api-keys` | the user for themselves; `CREATE USER` or admin for another user | Creates a key; the reply is the only time the key is shown |
 //! | `POST /v1/api-keys/{key_id}:revoke` | the key's user; `CREATE USER` or admin | Revokes it |
@@ -101,11 +101,13 @@ pub(super) async fn list_users(
     let (caller, privs, cat) = context(core, info, &req).await?;
     let auth = auth_of(&cat)?;
     let all = privs.create_user || privs.tenant_admin;
+    let logins = super::activity::login_states(core, &caller).await;
     let mut users: Vec<Value> = auth
         .users()
         .filter(|u| all || Some(u.row.user_id) == caller.principal.user_id)
         .map(|u| {
             let r = &u.row;
+            let l = logins.get(&r.user_id.0).cloned().unwrap_or_default();
             json!({
                 "user_id": r.user_id.0.to_string(),
                 "user": r.name,
@@ -119,6 +121,10 @@ pub(super) async fn list_users(
                 "password_changed_at_ms": r.password_changed_at.map(ms),
                 "created_at_ms": ms(r.created_at),
                 "created_by_tenant": r.created_by_tenant.to_string(),
+                "last_login_ms": l.last_login_ms.map(|m| m.to_string()),
+                "last_failed_login_ms": l.last_failure_ms.map(|m| m.to_string()),
+                "failed_logins": l.failures,
+                "locked_until_ms": l.locked_until_ms.map(|m| m.to_string()),
             })
         })
         .collect();

@@ -407,6 +407,21 @@ Until you run a statement, the results pane shows the keys to start with:
  dev  127.0.0.1:8080 db shop  F1 help · F5 run · Ctrl-C cancel · Ctrl-Q quit
 ```
 
+### Workspaces
+
+On a REST profile, the TUI opens in the same [workspace as Studio](studio.md#workspaces): your own last choice, else the default `studio.default_workspace` sets for you, else the widest one you qualify for. It shows the workspace's sections that a terminal can show:
+
+| Studio's section | In the TUI |
+|---|---|
+| Explorer | the explorer pane (not in the security administrator's workspace) |
+| Query, Saved queries, History | the query tabs and the command palette |
+| Performance | the Inbox screen (tenant administrator, database administrator, developer) |
+| Operator mode | the Dashboard and Admin screens, for operators and profiles with an `admin_url` |
+
+Dashboards, Messaging, Logic, Inheritance, Access control, Settings and Docs are browser pages. The status line names the workspace. **Switch to the … workspace** in the command palette changes it, and keeps the choice in the tenant's catalog for Studio too.
+
+In the analyst's workspace the explorer lists tables and views only, and query and table tabs start read-only: the TUI sends only reads, and says so on the status line instead of sending anything else. **Allow writes in this tab** in the palette turns that off for the tab (**Make this tab read-only** turns it on in any workspace); the gateway still checks your privileges. On a native profile, or a gateway without workspaces, every screen shows as before.
+
 ### Query tabs
 
 Each query tab has the explorer on the left, an editor and the results.

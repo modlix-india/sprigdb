@@ -14,6 +14,9 @@ export interface Tab {
   language?: 'sql' | 'cypher' | 'gql' | 'mongo';
   /** For Cypher and GQL: the graph, sent as Bolt's `db.graph`. */
   graph?: string;
+  /** Studio runs only reads in this tab. Unset: the workspace's default
+   * (read-only in the analyst's). The gateway still checks every statement. */
+  readOnly?: boolean;
 }
 
 interface TabsState {

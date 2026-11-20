@@ -35,6 +35,8 @@ sprig-mover = { path = "crates/sprig-mover" }
 sprig-feed = { path = "crates/sprig-feed" }
 # The AI assistants' core: providers, tools, the egress gate, budgets, audit.
 sprig-ai = { path = "crates/sprig-ai" }
+# SprigDB's own storage engine (the merged node's storage core).
+sprig-engine = { path = "crates/sprig-engine" }
 
 # Third-party crates. Every licence must be on deny.toml's allow-list (chapter 03).
 async-trait = "0.1"
@@ -191,6 +193,19 @@ candle-core = "=0.11.1"
 candle-nn = "=0.11.1"
 candle-transformers = "=0.11.1"
 tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex"] }
+
+# The storage engine's parts (approved by Kiran, 18 Nov 2026), pinned.
+# rust-rocksdb (Apache-2.0) builds RocksDB (Apache-2.0; dual-licensed with
+# GPLv2, we take Apache) from source with the C++ toolchain and libclang
+# (bindgen at build time). Only LZ4 and ZSTD compression: no snappy, zlib or
+# bzip2, and no jemalloc (the node keeps mimalloc). raft-engine (Apache-2.0)
+# is TiKV's shared log for many Raft groups, used as the engine's commit log;
+# without its default `scripting` feature (rhai). Its entries are protobuf-2
+# messages (protobuf, MIT), so the engine implements that trait for its own
+# entry type. lz4-sys (MIT, builds liblz4, BSD-2-Clause) is shared by both.
+rust-rocksdb = { version = "=0.54.0", default-features = false, features = ["lz4", "zstd", "bindgen-runtime"] }
+raft-engine = { version = "=0.4.2", default-features = false }
+protobuf = "=2.28.0"
 
 [workspace.lints.rust]
 # `deny`, not `forbid`, so vetted spots can opt out with a `SAFETY:` comment

@@ -15,6 +15,7 @@ import { SECTIONS, entryOf, resolve, sectionOf, type Section } from '../workspac
 import { barSections } from '../workspace/workspaces';
 import { useWorkspaces } from '../workspace/current';
 import { WorkspaceSwitcher } from '../workspace/WorkspaceSwitcher';
+import { WorkspaceGuard } from '../workspace/WorkspaceGuard';
 import { useRel, WorkspaceTabs } from '../workspace/WorkspaceTabs';
 import { StatusBar } from '../workspace/StatusBar';
 import { CommandPalette } from '../workspace/CommandPalette';
@@ -191,7 +192,9 @@ export function Shell() {
         <section className="workspace">
           <WorkspaceTabs />
           <main className="main" id="content" tabIndex={-1}>
-            <Outlet />
+            <WorkspaceGuard>
+              <Outlet />
+            </WorkspaceGuard>
           </main>
         </section>
         {dockOpen && <AssistantDock />}

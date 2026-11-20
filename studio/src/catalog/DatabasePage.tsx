@@ -1,12 +1,15 @@
 import { Link, useNavigate, useParams } from 'react-router';
 import { useSnapshot } from './snapshot';
 import { addTab } from '../editor/tabs';
+import { useWorkspaces } from '../workspace/current';
+import { treeObjects } from '../workspace/workspaces';
 
 /** A logical database: its objects with estimates. */
 export function DatabasePage() {
   const { tenant = '', db = '' } = useParams();
   const snap = useSnapshot(db);
   const navigate = useNavigate();
+  const { current } = useWorkspaces();
   const base = `/t/${encodeURIComponent(tenant)}/db/${encodeURIComponent(db)}`;
   return (
     <div className="stack">
@@ -20,7 +23,9 @@ export function DatabasePage() {
         >
           New query
         </button>
-        <Link to={`/t/${encodeURIComponent(tenant)}/settings?scope=database&db=${encodeURIComponent(db)}`}>Settings</Link>
+        {!current.simple?.hideDdl && (
+          <Link to={`/t/${encodeURIComponent(tenant)}/settings?scope=database&db=${encodeURIComponent(db)}`}>Settings</Link>
+        )}
       </div>
       {snap.error && <p className="error">{snap.error.message}</p>}
       <table>
@@ -33,7 +38,7 @@ export function DatabasePage() {
           </tr>
         </thead>
         <tbody>
-          {(snap.data?.objects ?? []).map((o) => (
+          {treeObjects(current, snap.data?.objects ?? []).map((o) => (
             <tr key={`${o.kind}:${o.name}`}>
               <td>
                 <Link to={`${base}/obj/${o.kind}/${encodeURIComponent(o.name)}`}>{o.name}</Link>

@@ -872,3 +872,115 @@ fn assistant_proposals_edit_dismiss_copy_and_what_was_sent() {
     ))));
     assert!(screen(&mut a, 100, 30).contains("ER_SPRIG_AI_NOT_CONFIGURED"));
 }
+
+fn whoami(caps: &serde_json::Value, chosen: Option<&str>) -> serde_json::Value {
+    json!({"capabilities": caps, "workspace": {"chosen": chosen, "default": null}})
+}
+
+#[test]
+fn workspaces_pick_the_screens() {
+    // No workspace (an older gateway, a native login): every screen.
+    let mut a = app();
+    assert_eq!(a.fixed_list(), [Fixed::Dash, Fixed::Admin, Fixed::Inbox]);
+    a.on_msg(Msg::WhoAmI(Err(crate::error::ShellError::shell(
+        crate::error::ShellCode::Parse,
+        "404",
+    ))));
+    assert_eq!(a.workspace, None);
+
+    // An analyst: no Inbox, no operator screens, a simple tree.
+    a.on_msg(Msg::WhoAmI(Ok(whoami(&json!({"read_data": true}), None))));
+    assert_eq!(
+        a.workspace.map(super::workspace::Workspace::id),
+        Some("analyst")
+    );
+    assert!(a.fixed_list().is_empty());
+    assert!(a.explorer.simple);
+
+    // A developer sees the Inbox; an operator also the Dashboard and Admin.
+    a.on_msg(Msg::WhoAmI(Ok(whoami(
+        &json!({"read_data": true, "change_schemas": true, "operator": true}),
+        Some("developer"),
+    ))));
+    assert_eq!(
+        a.workspace.map(super::workspace::Workspace::id),
+        Some("developer")
+    );
+    assert_eq!(a.fixed_list(), [Fixed::Dash, Fixed::Admin, Fixed::Inbox]);
+    assert!(!a.explorer.simple);
+    let labels: Vec<String> = a.palette_items().into_iter().map(|i| i.label).collect();
+    assert!(labels.contains(&"Switch to the Analyst workspace".to_owned()));
+    assert!(!labels.contains(&"Switch to the Developer workspace".to_owned()));
+    // Switching from the palette keeps the choice in the catalog.
+    assert_eq!(
+        a.palette_act(super::palette::Action::Workspace("analyst".into())),
+        vec![Effect::SetWorkspace("analyst".into())]
+    );
+    assert_eq!(
+        a.workspace.map(super::workspace::Workspace::id),
+        Some("analyst")
+    );
+}
+
+#[test]
+fn analyst_tabs_start_read_only() {
+    let mut a = app();
+    a.on_msg(Msg::WhoAmI(Ok(whoami(
+        &json!({"read_data": true, "change_schemas": true}),
+        Some("analyst"),
+    ))));
+    a.tabs[0].editor = super::editor::Editor::with_text("INSERT INTO orders VALUES (1);");
+    assert!(a.on_key(key(KeyCode::Enter)).is_empty());
+    assert!(a.status.contains("read-only"));
+    assert!(!a.tabs[0].running);
+    assert!(screen(&mut a, 120, 24).contains("READ-ONLY"));
+    // Reads still run.
+    a.tabs[0].editor = super::editor::Editor::with_text("SELECT 1;");
+    assert_eq!(
+        a.on_key(key(KeyCode::Enter)),
+        vec![Effect::Run(1, vec!["SELECT 1".into()], Lang::Sql)]
+    );
+    a.on_msg(Msg::Done {
+        tab: 1,
+        error: None,
+        elapsed_ms: 1,
+        describe: String::new(),
+        database: None,
+        in_txn: false,
+    });
+    // Allow writes in this tab: the statement goes to the gateway, which
+    // decides.
+    assert!(a.palette_act(super::palette::Action::ReadOnly).is_empty());
+    a.tabs[0].editor = super::editor::Editor::with_text("INSERT INTO orders VALUES (1);");
+    assert_eq!(
+        a.on_key(key(KeyCode::Enter)),
+        vec![Effect::Run(
+            1,
+            vec!["INSERT INTO orders VALUES (1)".into()],
+            Lang::Sql
+        )]
+    );
+}
+
+#[test]
+fn the_analysts_tree_lists_tables_and_views() {
+    let mut a = app();
+    a.on_msg(Msg::WhoAmI(Ok(whoami(&json!({"read_data": true}), None))));
+    a.on_msg(Msg::Db(
+        "shop".into(),
+        Ok(json!({"db": "shop", "objects": [
+            {"name": "orders", "kind": "table"},
+            {"name": "v_paid", "kind": "view"},
+            {"name": "total", "kind": "function"},
+            {"name": "ties", "kind": "graph"}],
+          "columns": {}})),
+        vec!["order_events".into()],
+        vec!["to_s3".into()],
+    ));
+    let groups: Vec<String> = a.explorer.roots[0]
+        .children
+        .iter()
+        .map(|g| g.label.clone())
+        .collect();
+    assert_eq!(groups, ["tables", "views"]);
+}

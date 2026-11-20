@@ -29,12 +29,17 @@ import {
 import { sentCalls, type AiRole, type Item } from './thread';
 import { TurnView } from './TurnView';
 import './assistant.css';
+import { useWorkspaces } from '../workspace/current';
+import type { WorkspaceId } from '../workspace/workspaces';
 
 const ROLE_LABEL: Record<AiRole, string> = { data: 'Data', dba: 'DBA', admin: 'Admin' };
 
-/** Three questions from the schema, for the first open. */
-export function suggestions(role: AiRole, db: string | null, tables: string[]): string[] {
+/** Three questions from the schema, for the first open: the workspace's
+ * own when it has them for this role, else the role's. */
+export function suggestions(role: AiRole, db: string | null, tables: string[], workspace?: WorkspaceId): string[] {
   const [a, b] = tables;
+  const own = workspace && role !== 'admin' ? workspaceSuggestions(workspace, role, db, a, b) : null;
+  if (own) return own;
   if (role === 'admin') {
     return ['Are any clusters unhealthy right now?', 'Why did the last failover happen?', 'What should I check before upgrading?'];
   }
@@ -50,6 +55,52 @@ export function suggestions(role: AiRole, db: string | null, tables: string[]): 
     a ? `Show the 10 most recent rows of ${a}` : 'Show me something interesting in my data',
     a && b ? `How many ${a} does each ${b.replace(/s$/, '')} have?` : 'Which tables are the largest?',
   ];
+}
+
+/** Starting questions per workspace, in its users' words (the analyst's
+ * avoid engine terms); null where the role's general ones fit. */
+function workspaceSuggestions(
+  ws: WorkspaceId,
+  role: AiRole,
+  db: string | null,
+  a: string | undefined,
+  b: string | undefined,
+): string[] | null {
+  const where = db ?? 'my data';
+  switch (ws) {
+    case 'analyst':
+      return role === 'data'
+        ? [
+            a ? `What does ${a} hold, in plain words?` : 'Which tables hold my business data?',
+            a ? `Show the 10 most recent rows of ${a}` : 'Show me something interesting in my data',
+            a && b ? `Make a chart of ${a} by ${b.replace(/s$/, '')}` : 'Make a chart of my busiest month',
+          ]
+        : null;
+    case 'developer':
+      return role === 'data'
+        ? [
+            a && b ? `Write a query joining ${a} and ${b}` : 'Write a query that joins my two largest tables',
+            a ? `Draft a trigger that keeps an audit row when ${a} changes` : 'Draft a trigger that keeps an audit trail',
+            `How should I index ${where} for my most common queries?`,
+          ]
+        : null;
+    case 'security_admin':
+      return [
+        a ? `Who can read ${a}, and through which roles?` : 'Which users can change data in every database?',
+        a ? `Write a row-level security policy so users see only their own ${a}` : 'Write a row-level security policy for a table',
+        db ? `Which columns in ${db} hold personal data?` : 'Which columns hold personal data?',
+      ];
+    case 'tenant_admin':
+      return role === 'dba'
+        ? [
+            'What needs my attention in this tenant today?',
+            db ? `What's slow in ${db} right now?` : 'Which statements take the most time?',
+            'Which settings differ from the defaults, and why might they?',
+          ]
+        : null;
+    default:
+      return null;
+  }
 }
 
 function SetupCard({ me }: { me: NonNullable<ReturnType<typeof useSession.getState>['me']> }) {
@@ -87,7 +138,8 @@ function Empty({ role, db, onPick }: { role: AiRole; db: string | null; onPick: 
   const me = useSession((s) => s.me);
   const shared = useAssistant((s) => s.shareData) ?? me?.ai?.share_data ?? false;
   const tables = (snap.data?.objects ?? []).filter((o) => o.kind === 'table').map((o) => o.name);
-  const qs = suggestions(role, db, tables);
+  const { current } = useWorkspaces();
+  const qs = suggestions(role, db, tables, current.id);
   return (
     <div className="ai-empty">
       <Mascot pose="waving" size={96} />

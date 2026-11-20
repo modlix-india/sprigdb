@@ -75,6 +75,9 @@ pub struct Explorer {
     pub top: usize,
     /// A message instead of the tree ("loading", an error).
     pub note: Option<String>,
+    /// The analyst's tree: tables (collections and key namespaces are
+    /// tables) and views only.
+    pub simple: bool,
 }
 
 /// What the app should do after an explorer key.
@@ -150,7 +153,11 @@ impl Explorer {
             .flatten()
         {
             let name = o.get("name").and_then(Value::as_str).unwrap_or_default();
-            let kind = match o.get("kind").and_then(Value::as_str) {
+            let raw = o.get("kind").and_then(Value::as_str);
+            if self.simple && !matches!(raw, Some("table" | "view") | None) {
+                continue;
+            }
+            let kind = match raw {
                 Some("view") => Kind::View,
                 Some("function" | "procedure") => Kind::Routine,
                 _ => Kind::Table,
@@ -177,6 +184,11 @@ impl Explorer {
                 g.2.push(n);
             }
         }
+        let (streams, sinks) = if self.simple {
+            (&[][..], &[][..])
+        } else {
+            (streams, sinks)
+        };
         for (list, kind) in [(streams, Kind::Stream), (sinks, Kind::Sink)] {
             if let Some(g) = groups.iter_mut().find(|g| g.0 == kind) {
                 g.2.extend(list.iter().map(|s| Node::new(kind, db, s)));

@@ -9,7 +9,7 @@ source: the settings registry (sprig-settings)
 
 Every setting SprigDB declares, with its default, the scopes that may set it, hard bounds and when a change applies. Settings resolve from the most specific scope: object, database, tenant and its ancestors, cluster, data center, global, then the built-in default. Read them with `SHOW SPRIG SETTINGS`, change them with `ALTER TENANT|DATABASE|TABLE … SPRIG SET (key = value)` or `sprigctl settings`.
 
-756 settings in 61 groups.
+757 settings in 61 groups.
 
 ## `advisor`
 
@@ -965,6 +965,7 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | `studio.confirm_writes` | text | `ddl` | object, database, tenant, global | off, ddl, all | live | off, ddl or all |
 | `studio.cursor_idle_seconds` | int | `60` | tenant, dc, global | 1 to 3600 | live | Idle time before a cursor closes and its backend statement is killed |
 | `studio.cursor_max_open` | int | `4` | tenant, global | 1 to 64 | live | Open cursors per user on one gateway; opening another closes the least recently used |
+| `studio.default_workspace` | text | `` | tenant, global | - | live | Studio's first workspace for users who haven't picked one, comma-separated: a workspace for everyone, user:<name>=<workspace>, role:<name>=<workspace> |
 | `studio.enabled` | bool | `true` | dc, global | - | live | Serve Studio |
 | `studio.export_ticket_seconds` | int | `60` | dc, global | 5 to 3600 | live | Life of an export ticket |
 | `studio.feed_view_max_events` | int | `5000` | tenant, global | 10 to 1000000 | live | Events kept in the feed view |

@@ -10,6 +10,8 @@ import { StructureView, type StructureTab } from './Structure';
 import { addTab } from '../editor/tabs';
 import { useNavigate } from 'react-router';
 import { AskButton } from '../ai/AskButton';
+import { useWorkspaces } from '../workspace/current';
+import { objectTabs } from '../workspace/workspaces';
 
 type Tab = 'columns' | 'indexes' | 'ddl' | 'data' | StructureTab;
 
@@ -19,6 +21,11 @@ export function ObjectPage() {
   const { tenant = '', db = '', kind = 'table', name = '' } = useParams();
   const snap = useSnapshot(db);
   const navigate = useNavigate();
+  const { current } = useWorkspaces();
+  // The analyst's object pages start read-only too; the switch only changes
+  // what Studio offers, the gateway still checks every write.
+  const [allowEdits, setAllowEdits] = useState(false);
+  const readOnly = !!current.simple?.readOnlyTabs && !allowEdits;
   const [tab, setTab] = useState<Tab>(kind === 'table' || kind === 'view' ? 'data' : 'ddl');
   const cols = snap.data?.columns[name] ?? [];
   const isTable = kind === 'table' || kind === 'view';
@@ -39,13 +46,14 @@ export function ObjectPage() {
     enabled: tab === 'ddl' && !isGraph,
   });
   const graph = isGraph ? snap.data?.objects.find((o) => o.kind === 'graph' && o.name === name) : undefined;
-  const tabs: Tab[] = isTable
+  const allTabs: Tab[] = isTable
     ? kind === 'table'
       ? ['data', 'columns', 'indexes', 'relations', 'triggers', 'policies', 'inheritance', 'shards', 'ddl']
       : ['data', 'columns', 'policies', 'ddl']
     : isGraph
       ? []
       : ['ddl'];
+  const tabs = isTable ? objectTabs(current, kind, allTabs) : allTabs;
   return (
     <div className="stack">
       <nav aria-label="Breadcrumb" className="muted">
@@ -77,7 +85,13 @@ export function ObjectPage() {
             })}
           />
         )}
-        {kind === 'table' && (
+        {kind === 'table' && current.simple?.readOnlyTabs && (
+          <label className="row small" title="Studio's switch; your privileges still decide what you may change">
+            <input type="checkbox" checked={!readOnly} onChange={(e) => setAllowEdits(e.target.checked)} data-testid="allow-edits" />
+            Allow edits
+          </label>
+        )}
+        {kind === 'table' && !current.simple?.hideDdl && (
           <Link to={`/t/${encodeURIComponent(tenant)}/settings?scope=table&db=${encodeURIComponent(db)}&table=${encodeURIComponent(name)}`}>
             Settings
           </Link>
@@ -178,7 +192,7 @@ export function ObjectPage() {
         </section>
       )}
       {tab === 'ddl' && !isGraph && (ddl.error ? <p className="error">{ddl.error.message}</p> : <pre data-testid="ddl">{ddl.data ?? '…'}</pre>)}
-      {tab === 'data' && isTable && cols.length > 0 && <Browse key={`${db}.${name}`} db={db} table={name} cols={cols} editable={kind === 'table'} />}
+      {tab === 'data' && isTable && cols.length > 0 && <Browse key={`${db}.${name}`} db={db} table={name} cols={cols} editable={kind === 'table' && !readOnly} />}
     </div>
   );
 }

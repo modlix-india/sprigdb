@@ -12,18 +12,31 @@ import { useLibrary } from '../workspace/library';
 import { ago, firstLine, useOpen } from '../workspace/LibraryPanels';
 import { useWorkspace } from '../workspace/store';
 import {
+  bytesText,
+  failedLogins,
+  grantTarget,
   loadSummary,
   modelCounts,
   searchHome,
   useFailingLogic,
   useFingerprints,
   useIndexAdvice,
+  useLongRunning,
+  useRecentGrants,
+  useSchemaChanges,
   useSnapshots,
+  useStorage,
   useTenantSettings,
   useUsers,
 } from './data';
+import { connectionLines } from './connect';
 
 const fmt = (n: number) => n.toLocaleString(undefined, { maximumFractionDigits: 1 });
+/** A time in ms (number or text) as a short local date and time; '—' when absent. */
+const when = (ms: number | string | null | undefined) => {
+  const n = Number(ms ?? 0);
+  return n > 0 ? new Date(n).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '—';
+};
 
 function useBase(): string {
   const { tenant = '' } = useParams();
@@ -54,6 +67,10 @@ function QueryNote({ q }: { q: { isLoading: boolean; error: unknown } }) {
   if (!q.error) return null;
   if (isApiError(q.error) && (q.error.status === 403 || q.error.status === 401)) {
     return <p className="muted">Not available to you.</p>;
+  }
+  // An older gateway without the route.
+  if (isApiError(q.error) && (q.error.status === 404 || /no route/i.test(q.error.message))) {
+    return <p className="muted">This gateway doesn't provide this yet.</p>;
   }
   return <p className="error">{errorText(q.error)}</p>;
 }
@@ -224,12 +241,65 @@ function FailingLogic() {
   );
 }
 
+function SchemaChanges() {
+  const base = useBase();
+  const q = useSchemaChanges(10);
+  const rows = q.data?.changes ?? [];
+  return (
+    <Card id="schema" title="Recent schema changes">
+      <QueryNote q={q} />
+      {q.data && rows.length === 0 && <p className="muted">No schema changes recorded for what you can see.</p>}
+      <ul className="linklist">
+        {rows.map((c) => (
+          <li key={`${c.database}.${c.object}.${c.version}`}>
+            <Link to={`${base}/db/${encodeURIComponent(c.database)}`}>{c.database}</Link>.{c.object}{' '}
+            <span className="muted small">
+              {c.statement || c.kind} · version {c.version} · {when(c.at_ms)}
+              {c.by ? ` · ${c.by}` : ''}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </Card>
+  );
+}
+
+function ConnectCard() {
+  const me = useSession((s) => s.me);
+  const listeners = me?.gateway?.listeners ?? {};
+  const host = typeof window === 'undefined' ? 'localhost' : window.location.hostname;
+  const lines = me ? connectionLines(host, listeners, me.principal.login, null) : [];
+  return (
+    <Card id="connect" title="Connect an application">
+      {lines.length === 0 ? (
+        <p className="muted">This gateway didn't report its listeners; see the docs on connecting.</p>
+      ) : (
+        <>
+          <dl className="kv">
+            {lines.map((l) => (
+              <div key={l.protocol} style={{ display: 'contents' }}>
+                <dt>{l.label}</dt>
+                <dd className="mono" style={{ overflowWrap: 'anywhere' }}>
+                  {l.text}
+                </dd>
+              </div>
+            ))}
+          </dl>
+          <p className="muted small">Add your client's TLS options where the listener requires TLS. Passwords are never shown here.</p>
+        </>
+      )}
+    </Card>
+  );
+}
+
 export function DeveloperHome() {
   return (
     <div className="home-grid">
       <DatabasesByModel />
       <RecentQueries />
       <FailingLogic />
+      <SchemaChanges />
+      <ConnectCard />
     </div>
   );
 }
@@ -313,12 +383,73 @@ function IndexAdviceCard({ n = 5 }: { n?: number }) {
   );
 }
 
+function Storage() {
+  const base = useBase();
+  const q = useStorage();
+  const rows = q.data ?? [];
+  return (
+    <Card id="storage" title="Storage per database">
+      <QueryNote q={q} />
+      {q.data && rows.length === 0 && <p className="muted">No databases yet.</p>}
+      {rows.length > 0 && (
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Database</th>
+              <th>Tables</th>
+              <th>Data and indexes</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.db}>
+                <td>
+                  <Link to={`${base}/db/${encodeURIComponent(r.db)}`}>{r.db}</Link>
+                </td>
+                <td>{r.tables}</td>
+                <td>{bytesText(r.bytes)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      <p className="muted small">As information_schema reports it to you.</p>
+    </Card>
+  );
+}
+
+function LongRunning() {
+  const q = useLongRunning();
+  const rows = q.data ?? [];
+  return (
+    <Card id="running" title="Long-running statements on this gateway">
+      <QueryNote q={q} />
+      {q.data && rows.length === 0 && <p className="muted">Nothing has been running for 5 seconds or more.</p>}
+      <ul className="linklist">
+        {rows.slice(0, 8).map((r) => (
+          <li key={r.id}>
+            <span className="mono" title={r.text}>
+              {firstLine(r.text)}
+            </span>{' '}
+            <span className="muted small">
+              {r.seconds} s · {r.user}
+              {r.db ? ` · ${r.db}` : ''} · id {r.id}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </Card>
+  );
+}
+
 export function DbAdminHome() {
   return (
     <div className="home-grid">
       <Load />
       <Approvals />
       <IndexAdviceCard />
+      <Storage />
+      <LongRunning />
     </div>
   );
 }
@@ -349,6 +480,7 @@ function Users() {
             </span>{' '}
             <span className="muted small">
               {u.kind}
+              {u.last_login_ms !== undefined ? ` · last sign-in ${when(u.last_login_ms)}` : ''}
               {u.account_locked ? ' · locked' : ''}
               {u.password_expired ? ' · password expired' : ''}
             </span>
@@ -378,11 +510,68 @@ function Lockouts() {
   );
 }
 
+function FailedLogins() {
+  const base = useBase();
+  const q = useUsers();
+  const users = q.data?.users ?? [];
+  const known = users.some((u) => u.failed_logins !== undefined);
+  const failing = failedLogins(users);
+  return (
+    <Card id="failed" title="Failed logins" more={{ to: `${base}/access/users`, label: 'Users and access' }}>
+      <QueryNote q={q} />
+      {q.data && !known && <p className="muted">This gateway doesn't report failed logins.</p>}
+      {q.data && known && failing.length === 0 && <p className="muted">No account has failed logins since its last sign-in.</p>}
+      <ul className="linklist">
+        {failing.slice(0, 10).map((u) => (
+          <li key={`${u.user}@${u.host}`}>
+            <span className="mono">
+              {u.user}@{u.host}
+            </span>{' '}
+            <span className="muted small">
+              {u.failed_logins} in a row · last {when(u.last_failed_login_ms)}
+              {Number(u.locked_until_ms ?? 0) > q.dataUpdatedAt ? ` · locked until ${when(u.locked_until_ms)}` : ''}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </Card>
+  );
+}
+
+function RecentGrants() {
+  const base = useBase();
+  const q = useRecentGrants(10);
+  const rows = q.data?.grants ?? [];
+  return (
+    <Card id="grants" title="Recent grants" more={{ to: `${base}/access/grants`, label: 'Grants' }}>
+      <QueryNote q={q} />
+      {q.data && rows.length === 0 && <p className="muted">No grants recorded.</p>}
+      <ul className="linklist">
+        {rows.map((g, i) => (
+          <li key={i}>
+            <span className="mono">
+              {g.restriction ? 'REVOKE ' : ''}
+              {g.privileges.join(', ') || 'USAGE'} ON {grantTarget(g)}
+            </span>{' '}
+            <span className="muted small">
+              to {g.grantee_kind === 'role' ? 'role ' : ''}
+              {g.grantee ?? '?'} · {when(g.at_ms)}
+              {g.by ? ` · by ${g.by}` : ''}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </Card>
+  );
+}
+
 export function SecurityAdminHome() {
   return (
     <div className="home-grid">
       <Users />
       <Lockouts />
+      <FailedLogins />
+      <RecentGrants />
     </div>
   );
 }
@@ -411,10 +600,13 @@ function AdminSummaries() {
   const approvals = useOpenApprovals();
   const advice = useIndexAdvice();
   const users = useUsers();
+  const storage = useStorage();
   const list = users.data?.users ?? [];
   return (
     <Card id="summaries" title="At a glance">
       <dl className="kv">
+        <dt>Storage used</dt>
+        <dd>{storage.data ? bytesText(storage.data.reduce((n, r) => n + r.bytes, 0)) : storage.isLoading ? '…' : '—'}</dd>
         <dt>
           <Link to={`${base}/inbox`}>Pending approvals</Link>
         </dt>

@@ -521,6 +521,16 @@ impl DataClient {
         .await
     }
 
+    /// `Library.SetPrefs`: keeps the user's preferences, such as the
+    /// workspace Studio and the TUI open on.
+    ///
+    /// # Errors
+    /// The API's error.
+    pub async fn set_prefs(&self, prefs: &Value) -> Result<Value> {
+        self.call(Method::POST, "/v1/library/prefs", Some(prefs))
+            .await
+    }
+
     /// `Library.Record`: one run, as `sprig` ran it.
     ///
     /// # Errors

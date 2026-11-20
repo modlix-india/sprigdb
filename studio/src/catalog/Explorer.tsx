@@ -4,6 +4,8 @@ import { useIntl, FormattedMessage } from 'react-intl';
 import { useQueryClient } from '@tanstack/react-query';
 import { invalidateCatalog, useDatabases, useSnapshot, type ObjectInfo } from './snapshot';
 import { ChevronDown, ChevronRight, Database, Eye, RefreshCw, Share2, SquareFunction, Table2 } from '../icons';
+import { useWorkspaces } from '../workspace/current';
+import { treeObjects } from '../workspace/workspaces';
 
 const KIND_ICON: Record<ObjectInfo['kind'], typeof Table2> = {
   table: Table2,
@@ -16,9 +18,11 @@ const KIND_ICON: Record<ObjectInfo['kind'], typeof Table2> = {
 function DbNode({ tenant, db, filter, open: initial }: { tenant: string; db: string; filter: string; open: boolean }) {
   const [open, setOpen] = useState(initial);
   const snap = useSnapshot(open ? db : null);
+  const { current } = useWorkspaces();
   const base = `/t/${encodeURIComponent(tenant)}/db/${encodeURIComponent(db)}`;
   const f = filter.toLowerCase();
-  const items = (snap.data?.objects ?? []).filter((o) => !f || o.name.toLowerCase().includes(f));
+  // The analyst's tree: tables, views and collections (collections are tables).
+  const items = treeObjects(current, snap.data?.objects ?? []).filter((o) => !f || o.name.toLowerCase().includes(f));
   return (
     <li>
       <button

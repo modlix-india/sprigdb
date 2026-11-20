@@ -19,6 +19,10 @@ pub enum Action {
     Insert(String),
     /// Open a table's view: database, name, whether it is a view.
     OpenTable(String, String, bool),
+    /// Switch to the workspace with this id (Studio's workspaces).
+    Workspace(String),
+    /// Turn the current tab's read-only switch on or off.
+    ReadOnly,
     /// Quit.
     Quit,
 }

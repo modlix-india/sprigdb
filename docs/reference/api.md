@@ -9,7 +9,7 @@ source: the gateway's OpenAPI document (/v1/openapi.json)
 
 The gateway's REST API, as `/v1/openapi.json` describes it on every gateway. Requests authenticate with `Authorization: Bearer <token or API key>` (or HTTP Basic where allowed) and act with the caller's own rights. Statements stream as NDJSON from `POST /v1/databases/{database}/sql:query`. The same services are available over gRPC.
 
-112 operations in 29 services.
+114 operations in 30 services.
 
 ## sprig.admin.v1.Recommendations
 
@@ -22,6 +22,13 @@ The gateway's REST API, as `/v1/openapi.json` describes it on every gateway. Req
 | GET | `/v1/recommendations:policy` | `Recommendations.GetApprovalPolicy` | Every kind's mode, level and timers at the tenant, a database (db) or a table (object) |
 | GET | `/v1/recommendations:subscriptions` | `Recommendations.ListSubscriptions` | The tenant's approval email subscriptions |
 | POST | `/v1/recommendations:subscriptions` | `Recommendations.SetSubscription` | The caller's own address and delivery (immediate, digest or off) |
+
+## sprig.v1.Activity
+
+| Method | Path | Operation | Description |
+|---|---|---|---|
+| GET | `/v1/activity/grants` | `Activity.RecentGrants` | The latest privilege grants in the tenant, for CREATE USER or SPRIG_TENANT_ADMIN (limit: 20, at most 200) |
+| GET | `/v1/activity/schema` | `Activity.SchemaChanges` | The latest schema changes of the objects the caller can see (database, object, kind, version, the statement's verb, when, by whom; limit: 20, at most 200) |
 
 ## sprig.v1.Ai
 
@@ -247,7 +254,7 @@ The gateway's REST API, as `/v1/openapi.json` describes it on every gateway. Req
 
 | Method | Path | Operation | Description |
 |---|---|---|---|
-| GET | `/v1/users` | `Users.ListUsers` | The tenant's accounts (all for CREATE USER or SPRIG_TENANT_ADMIN, else the caller) |
+| GET | `/v1/users` | `Users.ListUsers` | The tenant's accounts (all for CREATE USER or SPRIG_TENANT_ADMIN, else the caller), with each one's last login, last failed login, failures in a row and temporary lock |
 | POST | `/v1/users:setPassword` | `Users.SetPassword` | ALTER USER ... IDENTIFIED BY, run as the caller, without the password in statement text |
 
 ## sprig.v1.Vectors
