@@ -37,6 +37,10 @@ sprig-feed = { path = "crates/sprig-feed" }
 sprig-ai = { path = "crates/sprig-ai" }
 # SprigDB's own storage engine (the merged node's storage core).
 sprig-engine = { path = "crates/sprig-engine" }
+# The SQL expression engine and row executor on the engine's values.
+sprig-exec = { path = "crates/sprig-exec" }
+# The SQL planner: names, access paths and join order onto sprig-exec's operators.
+sprig-plan = { path = "crates/sprig-plan" }
 
 # Third-party crates. Every licence must be on deny.toml's allow-list (chapter 03).
 async-trait = "0.1"

@@ -781,6 +781,9 @@ where
                 for o in rows.iter().filter(|o| {
                     o.state == ObjectState::Active
                         && sql_object(o.kind)
+                        // Tables live in the storage engine of the gateway
+                        // nodes, not in the schema: nothing to compare.
+                        && o.kind != ObjectKind::Table
                         && !grouped.contains(&o.object_id)
                         && !o.parent_id.is_some_and(|p| grouped.contains(&p))
                 }) {

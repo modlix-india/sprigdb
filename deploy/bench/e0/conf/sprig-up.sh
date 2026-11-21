@@ -60,7 +60,8 @@ if [[ ${E0_ENGINE:-0} == 1 ]]; then
     # the engine's files, and (until the catalog placement of the tenant's `redis` database is wired) every
     # tenant's Redis databases on the engine
     mkdir -p "$H/engine"
-    ENGINE_ENV=(SPRIGDB_ENGINE_DIR="$H/engine" SPRIGDB_ENGINE_REDIS_TENANTS="${E0_REDIS_TENANTS:-all}")  # the cache-budget knob is added once the store names it
+    # The engine's memory is the same budget every arm's primary cache gets ($E0_CACHE_MB).
+    ENGINE_ENV=(SPRIGDB_ENGINE_DIR="$H/engine" SPRIGDB_ENGINE_MB="${E0_CACHE_MB:-384}" SPRIGDB_ENGINE_REDIS_TENANTS="${E0_REDIS_TENANTS:-all}")
 fi
 start gateway "$H/gateway.toml" gateway SPRIGDB_GATEWAY_ADVERTISE_ADDR=127.0.0.1 "${ENGINE_ENV[@]+"${ENGINE_ENV[@]}"}"
 wait_ready gateway http://127.0.0.1:9190/readyz

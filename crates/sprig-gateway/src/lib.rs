@@ -68,6 +68,8 @@ pub mod backend;
 // The Bolt listener on 7687.
 pub mod bolt;
 pub mod dc;
+// The in-process SQL backend (the storage engine's first prototype).
+pub(crate) mod engine;
 // Docs search and the sprig_docs database.
 pub mod docs;
 pub mod exec;
@@ -83,6 +85,8 @@ pub mod limits;
 pub mod listener;
 pub mod mongo;
 pub mod mysql;
+// The node's one storage engine, shared by the front ends whose data it holds.
+pub mod node_engine;
 pub mod observe;
 pub mod offload;
 // The feed-driven outbox forwarder's gateway side.

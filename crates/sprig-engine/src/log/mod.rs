@@ -84,8 +84,13 @@ pub struct LogConfig {
     pub replicated_sync: Duration,
     /// How syncs reach the disk.
     pub sync: SyncMode,
-    /// raft-engine's file size.
+    /// raft-engine's file size. A checkpoint deletes whole files only, and
+    /// never the one being written, so up to this much trimmed log stays on
+    /// disk.
     pub target_file_size: u64,
+    /// LZ4-compress a commit group's log batch once it is at least this
+    /// many bytes. Zero turns log compression off.
+    pub compress_min_bytes: u64,
     /// Crash simulation for the log's files, in tests.
     pub sim: Option<Arc<SimDisk>>,
 }
@@ -98,7 +103,8 @@ impl Default for LogConfig {
             relaxed_sync: Duration::from_millis(1000),
             replicated_sync: Duration::from_millis(100),
             sync: SyncMode::Full,
-            target_file_size: 128 << 20,
+            target_file_size: 16 << 20,
+            compress_min_bytes: 4 << 10,
             sim: None,
         }
     }
@@ -377,9 +383,13 @@ impl LocalLog {
         let rcfg = raft_engine::Config {
             dir: dir.to_string_lossy().into_owned(),
             recovery_mode: RecoveryMode::TolerateTailCorruption,
-            batch_compression_threshold: ReadableSize(0),
+            batch_compression_threshold: ReadableSize(cfg.compress_min_bytes),
             target_file_size: ReadableSize(cfg.target_file_size),
-            purge_threshold: ReadableSize(cfg.target_file_size.max(1 << 20) * 8),
+            // raft-engine deletes trimmed files only while its files add up
+            // to more than this, and it refuses a value below the file
+            // size. At the file size, every checkpoint that leaves more
+            // than the file being written deletes the trimmed ones.
+            purge_threshold: ReadableSize(cfg.target_file_size.max(1 << 20)),
             enable_log_recycle: false,
             ..raft_engine::Config::default()
         };
@@ -395,9 +405,17 @@ impl LocalLog {
             units: RwLock::new(HashMap::new()),
             counters: Counters::default(),
         });
-        for u in sh.engine.raft_groups() {
-            replay(&sh, UnitId(u))?;
-        }
+        // raft-engine caches the last log block it read in a per-thread
+        // slot keyed only by file number, offset and length, not by engine:
+        // replaying on the caller's thread could hand this log a block that
+        // another (or an earlier) engine read there. A fresh thread starts
+        // with an empty slot.
+        on_fresh_thread(|| {
+            for u in sh.engine.raft_groups() {
+                replay(&sh, UnitId(u))?;
+            }
+            Ok(())
+        })?;
         let w = Arc::clone(&sh);
         let writer = std::thread::Builder::new()
             .name("sprig-log-writer".into())
@@ -455,11 +473,42 @@ impl LocalLog {
         for (u, applied) in floors {
             trimmed += self.sh.engine.compact_to(u.0, applied + 1);
         }
-        self.sh
-            .engine
-            .purge_expired_files()
-            .map_err(|e| log_err("purge", e))?;
+        // A purge can read entries back to rewrite them, through the same
+        // per-thread cache as replay: on a fresh thread, for the reason
+        // given in `open`.
+        on_fresh_thread(|| {
+            self.sh
+                .engine
+                .purge_expired_files()
+                .map(drop)
+                .map_err(|e| log_err("purge", e))
+        })?;
         Ok(trimmed)
+    }
+
+    /// The entry at `index` of `unit`, if the log still holds it. For
+    /// diagnostics and tests (what a crash left in the log).
+    ///
+    /// # Errors
+    /// raft-engine failed to read.
+    pub fn entry(&self, unit: UnitId, index: u64) -> Result<Option<LogEntry>> {
+        // On a fresh thread, for the reason given in `open`.
+        on_fresh_thread(|| {
+            let mut buf = Vec::new();
+            match self.sh.engine.fetch_entries_to::<EntryExt>(
+                unit.0,
+                index,
+                index + 1,
+                None,
+                &mut buf,
+            ) {
+                Ok(_) => Ok(buf.pop()),
+                Err(raft_engine::Error::EntryNotFound | raft_engine::Error::EntryCompacted) => {
+                    Ok(None)
+                }
+                Err(e) => Err(log_err("read", e)),
+            }
+        })
     }
 
     /// Bytes of log files on disk.
@@ -469,7 +518,9 @@ impl LocalLog {
     }
 
     /// Stops the writer at once, dropping queued proposals and skipping the
-    /// closing sync: what a crash leaves. For crash simulations.
+    /// closing sync: what a crash leaves. For crash simulations. Under a
+    /// [`SimDisk`], the power is cut once the writer has stopped, so the sync
+    /// raft-engine makes when the log is dropped keeps nothing.
     pub fn halt(&self) {
         {
             let mut q = self.sh.queue.lock().unwrap_or_else(PoisonError::into_inner);
@@ -479,6 +530,9 @@ impl LocalLog {
             q.bytes = 0;
         }
         self.close();
+        if let Some(sim) = &self.sh.cfg.sim {
+            sim.power_cut();
+        }
     }
 
     /// Stops the writer after it drains and syncs the queue. Later
@@ -504,6 +558,19 @@ impl Drop for LocalLog {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// Runs `f` on a new thread and waits for it, so raft-engine's per-thread
+/// block cache starts empty.
+fn on_fresh_thread<T: Send>(f: impl FnOnce() -> Result<T> + Send) -> Result<T> {
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .name("sprig-log-read".into())
+            .spawn_scoped(s, f)
+            .map_err(|e| SprigError::internal("commit log: spawn reader").with_source(e))?
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+    })
 }
 
 fn unit_state(sh: &Shared, id: UnitId) -> Arc<UnitState> {

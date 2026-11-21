@@ -118,6 +118,8 @@ pub struct Env {
     /// `<tenant>/<database>/<table>` whose router refused a group of
     /// writes ([`crate::batch::Group`]), and when.
     group_refused: Mutex<std::collections::HashMap<String, Instant>>,
+    /// Which Redis databases live on the storage engine; unset, none.
+    engine: OnceLock<Arc<dyn crate::engine::EngineBackend>>,
 }
 
 /// How long a database whose router refused a group of writes keeps its
@@ -150,6 +152,7 @@ impl Env {
             key_filter: OnceLock::new(),
             keyspace_feed: OnceLock::new(),
             group_refused: Mutex::new(std::collections::HashMap::new()),
+            engine: OnceLock::new(),
         }
     }
 
@@ -227,6 +230,17 @@ impl Env {
     /// Installs the logic layer's `FCALL` hook (the gateway does, once).
     pub fn set_logic(&self, l: Arc<dyn crate::logic::LogicCalls>) {
         let _ = self.logic.set(l);
+    }
+
+    /// Installs the storage engine's databases (the gateway does, once).
+    pub fn set_engine(&self, e: Arc<dyn crate::engine::EngineBackend>) {
+        let _ = self.engine.set(e);
+    }
+
+    /// The storage engine's databases, when installed.
+    #[must_use]
+    pub fn engine(&self) -> Option<&Arc<dyn crate::engine::EngineBackend>> {
+        self.engine.get()
     }
 
     /// Installs the `FT.*` hook.

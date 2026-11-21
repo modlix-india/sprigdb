@@ -1098,6 +1098,9 @@ sprig_codes! {
     /// alias, a dimension that isn't the model's, a source that isn't a
     /// deterministic expression of the row, or a change the column refuses.
     EmbeddingFailed = 39997, "ER_SPRIG_EMBEDDING_FAILED", "SprigEmbeddingFailed", SQLSTATE_GENERAL, false;
+    /// A statement on a table of an engine-backed database that the storage
+    /// engine can't run yet (it never reaches the database's MariaDB copy).
+    NotOnEngine = 39960, "ER_SPRIG_NOT_ON_ENGINE", "SprigNotOnEngine", SQLSTATE_GENERAL, false;
     /// `sprigdb.toml` or its environment overrides are invalid. Raised only at
     /// process start; never reaches a client.
     ConfigInvalid = 39998, "ER_SPRIG_CONFIG_INVALID", "SprigConfigInvalid", SQLSTATE_GENERAL, false;
@@ -1681,7 +1684,8 @@ fn sprig_protocol(code: SprigCode) -> ProtocolError {
         | SprigCode::RedisLuaUnsupported
         | SprigCode::RedisRestricted
         | SprigCode::KafkaTransactionsUnsupported
-        | SprigCode::KafkaUnsupportedApi => (Code::Unimplemented, 501),
+        | SprigCode::KafkaUnsupportedApi
+        | SprigCode::NotOnEngine => (Code::Unimplemented, 501),
         SprigCode::MqConfirmTimeout | SprigCode::MqConsumerTimeout => (Code::DeadlineExceeded, 504),
         SprigCode::ShellCancelled => (Code::Cancelled, 499),
         SprigCode::MqDeadLetterCycle | SprigCode::ConfigInvalid | SprigCode::Internal => {

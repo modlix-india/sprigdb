@@ -9,7 +9,7 @@ source: the settings registry (sprig-settings)
 
 Every setting SprigDB declares, with its default, the scopes that may set it, hard bounds and when a change applies. Settings resolve from the most specific scope: object, database, tenant and its ancestors, cluster, data center, global, then the built-in default. Read them with `SHOW SPRIG SETTINGS`, change them with `ALTER TENANT|DATABASE|TABLE … SPRIG SET (key = value)` or `sprigctl settings`.
 
-757 settings in 61 groups.
+758 settings in 62 groups.
 
 ## `advisor`
 
@@ -939,6 +939,12 @@ Every setting SprigDB declares, with its default, the scopes that may set it, ha
 | Key | Type | Default | Scopes | Bounds | Applies | Description |
 |---|---|---|---|---|---|---|
 | `sql.local_infile` | bool | `true` | object, database, tenant, global | - | live | Allow LOAD DATA LOCAL INFILE; per statement |
+
+## `storage`
+
+| Key | Type | Default | Scopes | Bounds | Applies | Description |
+|---|---|---|---|---|---|---|
+| `storage.placement` | text | `mariadb` | database | mariadb, engine | live | Where a database's rows live: mariadb (the tenant's MariaDB cluster) or engine (SprigDB's own storage engine, first prototype). Set it before the database has tables |
 
 ## `stream`
 

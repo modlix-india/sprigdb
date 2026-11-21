@@ -5,7 +5,8 @@
 //! stored key  := logical key | !commit_ts u64 BE        (newest version first)
 //! ```
 //!
-//! The user key is already memcomparable ([`memcmp`], [`collation`]), and
+//! The user key is already memcomparable ([`memcmp`], [`collation`], and
+//! [`typed`] for SQL column values), and
 //! every user-key encoding is prefix-free (fixed widths, or escaped and
 //! terminated strings), so no logical key is a proper prefix of another in
 //! the same index. RocksDB's prefix extractor strips the 8-byte version, so
@@ -16,6 +17,7 @@
 
 pub mod collation;
 pub mod memcmp;
+pub mod typed;
 
 use std::fmt;
 

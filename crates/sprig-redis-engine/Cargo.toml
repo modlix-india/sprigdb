@@ -1,0 +1,31 @@
+[package]
+name = "sprig-redis-engine"
+description = "SprigDB: Redis commands executed directly on the storage engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+crc32fast.workspace = true
+sprig-common.workspace = true
+sprig-engine = { path = "../sprig-engine" }
+sprig-proto-redis = { path = "../sprig-proto-redis" }
+sprig-redis = { path = "../sprig-redis" }
+# The routing hash of a key (its scan-index entry), as the key-value tables keep it.
+sprig-kv = { path = "../sprig-kv" }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros", "net"] }
+# The differential suite's client (BSD-3-Clause), against a reference Redis.
+redis = { version = "=0.27.6", default-features = false, features = ["aio", "tokio-comp"] }
+
+[lints]
+workspace = true

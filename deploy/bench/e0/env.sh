@@ -13,7 +13,7 @@ export BENCH_RESULTS=${BENCH_RESULTS:-$E0_WORK/results}
 export BENCH_LOGS=${BENCH_LOGS:-$E0_WORK/logs}
 
 # The host label every result carries; the E0 page groups results by it.
-export BENCH_HOST_LABEL=${BENCH_HOST_LABEL:-laptop Docker VM (SUT pinned to 4 CPUs, 768m)}
+export BENCH_HOST_LABEL=${BENCH_HOST_LABEL:-laptop Docker VM (SUT pinned to 4 CPUs, 1g)}
 
 # Docker: one private network; no published ports, so no docker-proxy and no
 # Docker Desktop port forward sits in any measured path. On a benchmark VM set
@@ -33,7 +33,7 @@ IMG_ETCD=${IMG_ETCD:-quay.io/coreos/etcd:v3.6.5}
 # Same footing for every database arm: one memory limit, one CPU set for the
 # system under test (all of its processes share it, as they share one VM on
 # OCI), another for the load generator, and the same primary cache.
-E0_MEM=${E0_MEM:-768m}
+E0_MEM=${E0_MEM:-1g}                                # 768m killed mysqld and MariaDB under the write loads (E0-104)
 E0_SUT_CPUS=${E0_SUT_CPUS:-8-11}
 E0_CLIENT_CPUS=${E0_CLIENT_CPUS:-12-15}
 E0_CACHE_MB=${E0_CACHE_MB:-384}                     # InnoDB buffer pool = the engine's cache budget

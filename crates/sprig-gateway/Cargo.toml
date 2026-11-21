@@ -85,6 +85,12 @@ sprig-search.workspace = true
 sprig-redis = { path = "../sprig-redis" }
 sprig-proto-redis = { path = "../sprig-proto-redis" }
 sprig-kv = { path = "../sprig-kv" }
+# SprigDB's storage engine (one per node), and the Redis databases on it.
+sprig-engine = { path = "../sprig-engine" }
+# The SQL planner and executor that general SELECTs on engine tables run on.
+sprig-plan.workspace = true
+sprig-exec.workspace = true
+sprig-redis-engine = { path = "../sprig-redis-engine" }
 # The Vectors API, and regions for its geo filters.
 sprig-vector = { path = "../sprig-vector" }
 sprig-geo = { path = "../sprig-geo" }

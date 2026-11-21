@@ -1,6 +1,7 @@
 //! Model tests against `MemStore`: a snapshot-isolation and lock-order
-//! checker over random concurrent histories, and a linearizability checker
-//! for autocommit reads and writes.
+//! checker over random concurrent histories (phantom-free range reads at
+//! REPEATABLE READ and SERIALIZABLE, the anomalies READ COMMITTED allows),
+//! and a linearizability checker for autocommit reads and writes.
 
 #![allow(
     clippy::unwrap_used,
@@ -22,8 +23,12 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use sprig_engine::StoreKind;
+use sprig_engine::keys::KeyRange;
 use sprig_engine::log::SyncMode;
-use sprig_engine::txn::{Isolation, LockRequest, Locked, Ts, TxnOptions, UnitConfig, Wait};
+use sprig_engine::txn::{
+    Dir as ScanDir, InsertLock, InsertProbe, Isolation, LockRequest, Locked, Ts, TxnOptions,
+    UnitConfig, Wait,
+};
 use txn_common::{Bed, Dir, engine_bed, k, mem_bed_with};
 
 /// A tiny deterministic generator (no extra dependencies).
@@ -50,20 +55,32 @@ enum Op {
         got: Option<Bytes>,
         own: bool,
     },
-    /// A locking read returned the latest value.
+    /// A locking read returned the latest value. `held`: what it returned
+    /// stays true until commit (a row that was found is locked; a missing
+    /// row is protected by a gap lock, except at READ COMMITTED).
     Current {
         key: usize,
         got: Option<Bytes>,
         own: bool,
         view: Option<Ts>,
+        held: bool,
     },
     /// A write after an X lock.
     Write { key: usize, val: Option<Bytes> },
+    /// A locking range read over keys `lo..hi` returned these rows.
+    Range {
+        lo: usize,
+        hi: usize,
+        rows: Vec<(usize, Bytes)>,
+        view: Option<Ts>,
+    },
 }
 
 #[derive(Debug, Clone)]
 struct TxnRecord {
     si: bool,
+    /// REPEATABLE READ or SERIALIZABLE: range reads take gap locks.
+    gaps: bool,
     ops: Vec<Op>,
     cts: Option<Ts>,
 }
@@ -80,16 +97,17 @@ fn run_txn(unit: &Bed, rng: &mut Rng, tid: usize, seq: &mut u64) -> TxnRecord {
     } else {
         TxnOptions::mysql()
     };
-    let iso = if rng.below(3) == 0 {
-        Isolation::ReadCommitted
-    } else {
-        Isolation::RepeatableRead
+    let iso = match rng.below(4) {
+        0 => Isolation::ReadCommitted,
+        1 => Isolation::Serializable,
+        _ => Isolation::RepeatableRead,
     };
     let opts = base.with_isolation(iso).with_lock_wait_seconds(10);
-    let si = opts.snapshot_isolation && iso == Isolation::RepeatableRead;
+    let si = opts.snapshot_isolation && iso != Isolation::ReadCommitted;
     let mut t = unit.begin(opts);
     let mut rec = TxnRecord {
         si,
+        gaps: iso != Isolation::ReadCommitted,
         ops: Vec::new(),
         cts: None,
     };
@@ -98,7 +116,7 @@ fn run_txn(unit: &Bed, rng: &mut Rng, tid: usize, seq: &mut u64) -> TxnRecord {
     for _ in 0..n {
         t.begin_statement();
         let ki = usize::try_from(rng.below(KEYS as u64)).unwrap();
-        match rng.below(4) {
+        match rng.below(6) {
             0 => {
                 let got = t.get_snapshot(&key(ki)).unwrap();
                 rec.ops.push(Op::Snapshot {
@@ -113,6 +131,7 @@ fn run_txn(unit: &Bed, rng: &mut Rng, tid: usize, seq: &mut u64) -> TxnRecord {
                 match t.lock_get_blocking(&key(ki), LockRequest::for_share()) {
                     Ok(Locked::Row(got)) => rec.ops.push(Op::Current {
                         key: ki,
+                        held: got.is_some() || rec.gaps,
                         got,
                         own: own.contains(&ki),
                         view,
@@ -121,27 +140,103 @@ fn run_txn(unit: &Bed, rng: &mut Rng, tid: usize, seq: &mut u64) -> TxnRecord {
                     Err(_) => return rec,
                 }
             }
-            _ => {
+            2 => {
+                // A locking range read over keys `ki..hi`.
+                let hi = ki + 1 + usize::try_from(rng.below((KEYS - ki) as u64)).unwrap();
+                let range = KeyRange::new(key(ki).to_vec(), key(hi).to_vec());
+                let req = if rng.below(2) == 0 {
+                    LockRequest::for_share()
+                } else {
+                    LockRequest::for_update()
+                };
+                let dir = if rng.below(2) == 0 {
+                    ScanDir::Forward
+                } else {
+                    ScanDir::Reverse
+                };
+                // Half the reads stop early, as `LIMIT` does.
+                let limit = if rng.below(2) == 0 {
+                    usize::MAX
+                } else {
+                    1 + usize::try_from(rng.below(3)).unwrap()
+                };
                 let view = t.read_view();
-                match t.lock_get_blocking(&key(ki), LockRequest::for_update()) {
-                    Ok(Locked::Row(got)) => rec.ops.push(Op::Current {
-                        key: ki,
-                        got,
-                        own: own.contains(&ki),
-                        view,
-                    }),
-                    Ok(Locked::Skipped) => unreachable!(),
+                match t.scan_lock_blocking(&range, dir, limit, req) {
+                    Ok(rows) => {
+                        assert!(rows.len() <= limit);
+                        let mut rows: Vec<(usize, Bytes)> = rows
+                            .into_iter()
+                            .map(|(rk, rv)| ((0..KEYS).find(|&i| key(i) == rk).unwrap(), rv))
+                            .collect();
+                        if dir == ScanDir::Reverse {
+                            rows.reverse();
+                        }
+                        assert!(rows.windows(2).all(|w| w[0].0 < w[1].0), "out of order");
+                        assert!(rows.iter().all(|(i, _)| (ki..hi).contains(i)));
+                        // A read the limit stopped looked no further than
+                        // its last row: only that stretch is promised.
+                        let (mut lo, mut hi) = (ki, hi);
+                        if rows.len() == limit {
+                            match dir {
+                                ScanDir::Forward => hi = rows[rows.len() - 1].0 + 1,
+                                ScanDir::Reverse => lo = rows[0].0,
+                            }
+                        }
+                        rec.ops.push(Op::Range { lo, hi, rows, view });
+                    }
                     Err(_) => return rec,
                 }
+            }
+            _ => {
+                let view = t.read_view();
+                let got = match t.lock_get_blocking(&key(ki), LockRequest::for_update()) {
+                    Ok(Locked::Row(got)) => got,
+                    Ok(Locked::Skipped) => unreachable!(),
+                    Err(_) => return rec,
+                };
+                let present = got.is_some();
+                rec.ops.push(Op::Current {
+                    key: ki,
+                    held: present || rec.gaps,
+                    got,
+                    own: own.contains(&ki),
+                    view,
+                });
                 *seq += 1;
-                let val = if rng.below(8) == 0 {
+                let val = if present && rng.below(4) == 0 {
                     None
                 } else {
                     Some(Bytes::from(format!("t{tid}.{seq}")))
                 };
-                match &val {
-                    Some(v) => t.put(key(ki), v.clone()).unwrap(),
-                    None => t.delete(key(ki)).unwrap(),
+                if !present {
+                    // A new row goes through the insert's locks: the
+                    // duplicate check, then the wait for gap locks.
+                    let view = t.read_view();
+                    match t.lock_insert_blocking(&key(ki), InsertLock::insert()) {
+                        Ok(InsertProbe::Free) => {}
+                        Ok(InsertProbe::Exists(v)) => {
+                            // Inserted and committed by another transaction
+                            // since the miss (READ COMMITTED holds nothing
+                            // on a miss): a duplicate, with the row locked.
+                            assert!(!rec.gaps, "a gap-locked miss turned into a row");
+                            rec.ops.push(Op::Current {
+                                key: ki,
+                                held: true,
+                                got: Some(v),
+                                own: false,
+                                view,
+                            });
+                            continue;
+                        }
+                        Err(_) => return rec,
+                    }
+                }
+                let wrote = match &val {
+                    Some(v) => t.put(key(ki), v.clone()),
+                    None => t.delete(key(ki)),
+                };
+                if wrote.is_err() {
+                    return rec;
                 }
                 own.insert(ki);
                 rec.ops.push(Op::Write { key: ki, val });
@@ -173,7 +268,21 @@ fn version_at(
     })
 }
 
-fn check_history(history: &[TxnRecord]) -> (usize, usize, usize) {
+/// What the checker counted.
+#[derive(Debug, Default, Clone, Copy)]
+struct Checked {
+    snapshot_reads: usize,
+    current_reads: usize,
+    si_checks: usize,
+    /// Keys in gap-locked range reads checked for phantoms.
+    range_keys: usize,
+    /// Rows READ COMMITTED range reads returned (each stays locked).
+    rc_rows: usize,
+    /// Phantoms READ COMMITTED range reads let in (allowed there).
+    rc_phantoms: usize,
+}
+
+fn check_history(history: &[TxnRecord]) -> Checked {
     // Committed versions per key, in commit-timestamp order.
     let mut versions: BTreeMap<usize, Vec<(Ts, Option<Bytes>)>> = BTreeMap::new();
     let mut seen_cts = HashSet::new();
@@ -193,7 +302,7 @@ fn check_history(history: &[TxnRecord]) -> (usize, usize, usize) {
     for vs in versions.values_mut() {
         vs.sort_by_key(|(ts, _)| *ts);
     }
-    let (mut snapshot_reads, mut current_reads, mut si_checks) = (0, 0, 0);
+    let mut c = Checked::default();
     for r in history {
         let mut own: HashMap<usize, Option<Bytes>> = HashMap::new();
         for op in &r.ops {
@@ -213,36 +322,76 @@ fn check_history(history: &[TxnRecord]) -> (usize, usize, usize) {
                         version_at(&versions, *key, *rts, true)
                     };
                     assert_eq!(got, &want, "snapshot read of key{key} at {rts:?}");
-                    snapshot_reads += 1;
+                    c.snapshot_reads += 1;
+                }
+                Op::Range { lo, hi, rows, view } => {
+                    let got: HashMap<usize, Bytes> = rows.iter().cloned().collect();
+                    for key in *lo..*hi {
+                        if let Some(mine) = own.get(&key) {
+                            assert_eq!(got.get(&key), mine.as_ref(), "own write of key{key}");
+                            continue;
+                        }
+                        let Some(cts) = r.cts else { continue };
+                        // The state just before this transaction's commit.
+                        let before = version_at(&versions, key, cts, false);
+                        if r.gaps {
+                            // Rows stay locked and gaps stay closed: the
+                            // range looked the same until commit. A row
+                            // that appeared would be a phantom.
+                            assert_eq!(
+                                got.get(&key),
+                                before.as_ref(),
+                                "key{key} of range {lo}..{hi} changed before {cts:?}"
+                            );
+                            c.range_keys += 1;
+                            if let (true, Some(rts)) = (r.si, view) {
+                                let foreign = versions.get(&key).is_some_and(|vs| {
+                                    vs.iter().any(|(ts, _)| *ts > *rts && *ts < cts)
+                                });
+                                assert!(!foreign, "1020 should have fired for key{key} in a range");
+                                c.si_checks += 1;
+                            }
+                        } else if let Some(v) = got.get(&key) {
+                            // READ COMMITTED: a returned row stays locked.
+                            assert_eq!(Some(v), before.as_ref(), "locked row key{key}");
+                            c.rc_rows += 1;
+                        } else if before.is_some() {
+                            c.rc_phantoms += 1;
+                        }
+                    }
                 }
                 Op::Current {
                     key,
                     got,
                     own: is_own,
                     view,
+                    held,
                 } => {
                     if *is_own {
                         assert_eq!(got, &own.get(key).cloned().flatten());
+                    } else if !*held {
+                        // A miss at READ COMMITTED promises nothing.
                     } else if let Some(cts) = r.cts {
                         // Held until commit: nobody committed the key between
                         // this read and our commit.
                         let want = version_at(&versions, *key, cts, false);
                         assert_eq!(got, &want, "current read of key{key} before {cts:?}");
-                        current_reads += 1;
+                        c.current_reads += 1;
                         // First committer wins: no foreign version in
                         // (view, cts) under MariaDB's snapshot isolation.
                         if let (true, Some(rts)) = (r.si, view) {
-                            let foreign =
-                                versions[key].iter().any(|(ts, _)| *ts > *rts && *ts < cts);
+                            let foreign = versions
+                                .get(key)
+                                .is_some_and(|vs| vs.iter().any(|(ts, _)| *ts > *rts && *ts < cts));
                             assert!(!foreign, "1020 should have fired for key{key}");
-                            si_checks += 1;
+                            c.si_checks += 1;
                         }
                     }
                 }
             }
         }
     }
-    (snapshot_reads, current_reads, si_checks)
+    c
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -307,12 +456,14 @@ fn run_history(seed: u64, variant: Variant, elr: bool) -> Vec<TxnRecord> {
         );
     }
     assert_eq!(b.locks().key_count(), 0, "lock leak");
+    assert_eq!(b.locks().gap_count(), 0, "gap lock leak");
     h
 }
 
 #[test]
 fn random_histories_are_snapshot_consistent_and_lock_ordered() {
-    let mut totals = (0, 0, 0, 0, 0);
+    let mut totals = Checked::default();
+    let (mut committed, mut all) = (0, 0);
     for seed in 1..=6 {
         for (variant, elr) in [
             (Variant::Mem(Duration::ZERO), true),
@@ -323,19 +474,20 @@ fn random_histories_are_snapshot_consistent_and_lock_ordered() {
             (Variant::Engine(StoreKind::Rocks), false),
         ] {
             let h = run_history(seed, variant, elr);
-            let (s, c, si) = check_history(&h);
-            totals.0 += s;
-            totals.1 += c;
-            totals.2 += si;
-            totals.3 += h.iter().filter(|r| r.cts.is_some()).count();
-            totals.4 += h.len();
+            let c = check_history(&h);
+            totals.snapshot_reads += c.snapshot_reads;
+            totals.current_reads += c.current_reads;
+            totals.si_checks += c.si_checks;
+            totals.range_keys += c.range_keys;
+            totals.rc_rows += c.rc_rows;
+            totals.rc_phantoms += c.rc_phantoms;
+            committed += h.iter().filter(|r| r.cts.is_some()).count();
+            all += h.len();
         }
     }
-    eprintln!(
-        "checked {} snapshot reads, {} current reads, {} first-committer checks; {} of {} transactions committed",
-        totals.0, totals.1, totals.2, totals.3, totals.4
-    );
-    assert!(totals.0 > 1000 && totals.1 > 1000 && totals.2 > 100);
+    eprintln!("checked {totals:?}; {committed} of {all} transactions committed");
+    assert!(totals.snapshot_reads > 1000 && totals.current_reads > 1000 && totals.si_checks > 100);
+    assert!(totals.range_keys > 1000 && totals.rc_rows > 100);
 }
 
 // ----- linearizability ----------------------------------------------------

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use sprig_engine::locks::LockMode;
 use sprig_engine::txn::{
-    AbortReason, Isolation, LockRequest, Locked, TxnOptions, UnitConfig, Wait,
+    AbortReason, Interrupt, Isolation, LockRequest, Locked, TxnOptions, UnitConfig, Wait,
 };
 use txn_common::{Bed, bed, errno, k, mem_bed_with, sqlstate, v};
 
@@ -173,6 +173,8 @@ fn rollback_on_timeout_ends_the_whole_transaction() {
 #[test]
 fn deadlock_requester_is_the_victim_on_equal_weight() {
     let b = bed();
+    seed(&b, "1", "one");
+    seed(&b, "2", "two");
     let unit = b.clone();
     let mut a = unit.begin(TxnOptions::mariadb());
     let mut bt = unit.begin(TxnOptions::mariadb());
@@ -191,11 +193,33 @@ fn deadlock_requester_is_the_victim_on_equal_weight() {
     assert_eq!(bt.state().aborted_by, Some(AbortReason::Deadlock));
     // The victim's locks went, so the other transaction proceeds.
     let (r, a) = h.join().unwrap();
-    assert_eq!(r.unwrap(), Locked::Row(None));
+    assert_eq!(r.unwrap(), Locked::Row(Some(v("two"))));
     assert_eq!(
         unit.locks().mode_held(a_id, &k("2")),
         Some(LockMode::Exclusive)
     );
+    // The report names both waits and the transaction rolled back.
+    let report = unit.locks().latest_deadlock().expect("recorded");
+    assert_eq!(report.victim, bt.id());
+    assert_eq!(report.members.len(), 2);
+    let victim = report.members.iter().find(|m| m.txn == bt.id()).unwrap();
+    assert_eq!(victim.waits_for_key, k("1"));
+    assert_eq!(victim.blocked_by, vec![a_id]);
+    assert_eq!(victim.mode, LockMode::Exclusive);
+    let other = report.members.iter().find(|m| m.txn == a_id).unwrap();
+    assert_eq!(other.waits_for_key, k("2"));
+    assert_eq!(other.locks_held, 1);
+    let text = report.to_string();
+    assert!(text.contains("*** (1) TRANSACTION:"), "{text}");
+    assert!(
+        text.contains("*** (2) WAITING FOR THIS LOCK TO BE GRANTED:"),
+        "{text}"
+    );
+    assert!(
+        text.contains("lock_mode X locks rec but not gap waiting"),
+        "{text}"
+    );
+    assert!(text.contains("*** WE ROLL BACK TRANSACTION ("), "{text}");
     assert!(
         unit.locks()
             .stats
@@ -384,12 +408,40 @@ fn no_1020_without_a_view_for_mysql_or_at_read_committed() {
 }
 
 #[test]
-fn serializable_with_snapshot_isolation_opens_the_view_at_begin() {
+fn serializable_with_snapshot_isolation_opens_the_view_at_the_first_statement() {
     let b = bed();
     seed(&b, "a", "1");
+    // BEGIN alone opens no view: a commit before the first statement is
+    // not a conflict (MariaDB 11.8 answers the UPDATE, not 1020).
     let mut t = b.begin(TxnOptions::mariadb().with_isolation(Isolation::Serializable));
+    assert!(t.read_view().is_none());
     seed(&b, "a", "2");
+    t.begin_statement();
+    assert!(t.read_view().is_some());
+    assert_eq!(
+        t.lock_get_blocking(&k("a"), x()).unwrap(),
+        Locked::Row(Some(v("2")))
+    );
+    t.rollback();
+    // The first statement opens it, whatever it is: a commit after that is
+    // a conflict for a later statement.
+    let mut t = b.begin(TxnOptions::mariadb().with_isolation(Isolation::Serializable));
+    t.begin_statement();
+    t.lock_get_blocking(&k("b"), x()).unwrap();
+    seed(&b, "a", "3");
+    t.begin_statement();
     assert_eq!(errno(&t.lock_get_blocking(&k("a"), x()).unwrap_err()), 1020);
+    assert_eq!(t.state().aborted_by, Some(AbortReason::CheckRead));
+    // MySQL has no such check, and REPEATABLE READ opens no view here.
+    for opts in [
+        TxnOptions::mysql().with_isolation(Isolation::Serializable),
+        TxnOptions::mariadb(),
+    ] {
+        let mut t = b.begin(opts);
+        t.begin_statement();
+        assert!(t.read_view().is_none());
+        t.rollback();
+    }
 }
 
 #[test]
@@ -482,4 +534,190 @@ fn repeatable_read_keeps_its_snapshot_read_committed_does_not() {
     let mut late = b.begin(TxnOptions::mariadb());
     seed(&b, "a", "3");
     assert_eq!(late.get_snapshot(&k("a")).unwrap(), Some(v("3")));
+}
+
+// ----- waits ended from outside -----------------------------------------------
+
+#[test]
+fn kill_query_ends_a_lock_wait_with_1317_and_only_the_statement_is_rolled_back() {
+    let b = bed();
+    seed(&b, "a", "1");
+    let unit = b.clone();
+    let mut holder = unit.begin(TxnOptions::mariadb());
+    holder.lock_blocking(&k("a"), x()).unwrap();
+    let mut t = unit.begin(TxnOptions::mariadb());
+    t.begin_statement();
+    t.put(k("first"), v("kept")).unwrap();
+    t.begin_statement();
+    t.put(k("second"), v("undone")).unwrap();
+    let kill = t.interrupt_handle();
+    let h = thread::spawn(move || {
+        let started = Instant::now();
+        let r = t.lock_get_blocking(&k("a"), x());
+        (r, t, started.elapsed())
+    });
+    until_waiting(&unit, 1);
+    kill.interrupt(Interrupt::Kill);
+    let (r, mut t, waited) = h.join().unwrap();
+    let e = r.unwrap_err();
+    assert_eq!(errno(&e), 1317);
+    assert_eq!(&sqlstate(&e), b"70100");
+    assert!(waited < Duration::from_secs(5));
+    assert!(unit.locks().waits_for().is_empty());
+    // Statement scope: open, earlier statement kept, locks kept.
+    assert!(t.state().is_open);
+    assert_eq!(t.state().aborted_by, None);
+    assert_eq!(t.get_snapshot(&k("first")).unwrap(), Some(v("kept")));
+    assert_eq!(t.get_snapshot(&k("second")).unwrap(), None);
+    assert_eq!(
+        unit.locks().mode_held(t.id(), &k("second")),
+        Some(LockMode::Exclusive)
+    );
+    // Still interrupted until the next statement starts.
+    let e = t.lock_blocking(&k("other"), x()).unwrap_err();
+    assert_eq!(errno(&e), 1317);
+    t.begin_statement();
+    t.lock_blocking(&k("other"), x()).unwrap();
+    holder.rollback();
+    assert_eq!(
+        t.lock_get_blocking(&k("a"), x()).unwrap(),
+        Locked::Row(Some(v("1")))
+    );
+    t.commit().unwrap().wait().unwrap();
+    assert_eq!(unit.locks().key_count(), 0);
+}
+
+#[test]
+fn a_statement_time_limit_is_1969_on_mariadb_and_3024_on_mysql() {
+    for (opts, want, state) in [
+        (TxnOptions::mariadb(), 1969, b"70100"),
+        (TxnOptions::mysql(), 3024, b"HY000"),
+    ] {
+        let b = bed();
+        seed(&b, "a", "1");
+        let unit = b.clone();
+        let mut holder = unit.begin(TxnOptions::mariadb());
+        holder.lock_blocking(&k("a"), x()).unwrap();
+        let mut t = unit.begin(opts);
+        let limit = t.interrupt_handle();
+        let h = thread::spawn(move || {
+            let r = t.lock_get_blocking(&k("a"), x());
+            (r, t)
+        });
+        until_waiting(&unit, 1);
+        limit.interrupt(Interrupt::StatementTimeout);
+        let (r, t) = h.join().unwrap();
+        let e = r.unwrap_err();
+        assert_eq!(errno(&e), want);
+        assert_eq!(&sqlstate(&e), state);
+        assert!(t.state().is_open);
+    }
+}
+
+#[test]
+fn an_interrupt_that_arrives_before_the_wait_fails_the_request_at_once() {
+    let b = bed();
+    seed(&b, "a", "1");
+    let mut holder = b.begin(TxnOptions::mariadb());
+    holder.lock_blocking(&k("a"), x()).unwrap();
+    let mut t = b.begin(TxnOptions::mariadb());
+    t.begin_statement();
+    t.interrupt_handle().interrupt(Interrupt::Kill);
+    let started = Instant::now();
+    let e = t.lock_get_blocking(&k("a"), x()).unwrap_err();
+    assert_eq!(errno(&e), 1317);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    // Range reads and inserts check it too.
+    let e = t
+        .scan(
+            &sprig_engine::keys::KeyRange::all(),
+            sprig_engine::txn::Dir::Forward,
+            10,
+            sprig_engine::txn::ReadMode::ForUpdate,
+        )
+        .unwrap_err();
+    assert_eq!(errno(&e), 1317);
+    let e = t
+        .lock_insert_blocking(&k("new"), sprig_engine::txn::InsertLock::insert())
+        .unwrap_err();
+    assert_eq!(errno(&e), 1317);
+    assert!(t.state().is_open);
+}
+
+#[test]
+fn wait_n_waits_that_long_and_wait_0_not_at_all() {
+    let b = bed();
+    seed(&b, "a", "1");
+    let mut holder = b.begin(TxnOptions::mariadb());
+    holder.lock_blocking(&k("a"), x()).unwrap();
+    // WAIT n overrides the session's timeout for this request, on both
+    // personas, and its error is the timeout's (1205), not NOWAIT's.
+    for opts in [
+        TxnOptions::mariadb().with_lock_wait_seconds(0),
+        TxnOptions::mysql().with_lock_wait_seconds(100_000_000),
+    ] {
+        let mut t = b.begin(opts);
+        let started = Instant::now();
+        let e = t
+            .lock_get_blocking(&k("a"), x().with_wait(Wait::Seconds(1)))
+            .unwrap_err();
+        let waited = started.elapsed();
+        assert_eq!(errno(&e), 1205);
+        assert!(waited >= Duration::from_millis(950) && waited < Duration::from_secs(5));
+        let started = Instant::now();
+        let e = t
+            .lock_get_blocking(&k("a"), x().with_wait(Wait::Seconds(0)))
+            .unwrap_err();
+        assert_eq!(errno(&e), 1205);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(t.state().is_open);
+    }
+    assert!(b.locks().waits_for().is_empty());
+}
+
+#[test]
+fn a_request_that_cannot_wait_is_never_part_of_a_deadlock() {
+    // A zero timeout, WAIT 0 and NOWAIT would each close a cycle if they
+    // queued. They fail at once with their own error, and nobody is rolled
+    // back.
+    for (opts, wait, want) in [
+        (
+            TxnOptions::mariadb().with_lock_wait_seconds(0),
+            Wait::Block,
+            1205,
+        ),
+        (TxnOptions::mysql(), Wait::Seconds(0), 1205),
+        (TxnOptions::mysql(), Wait::NoWait, 3572),
+    ] {
+        let b = bed();
+        seed(&b, "1", "one");
+        seed(&b, "2", "two");
+        let unit = b.clone();
+        let mut a = unit.begin(TxnOptions::mariadb());
+        a.lock_blocking(&k("1"), x()).unwrap();
+        let mut t = unit.begin(opts);
+        t.lock_blocking(&k("2"), LockRequest::write().with_wait(Wait::Seconds(5)))
+            .unwrap();
+        let h = thread::spawn(move || {
+            let r = a.lock_get_blocking(&k("2"), x());
+            (r, a)
+        });
+        until_waiting(&unit, 1);
+        let e = t
+            .lock_get_blocking(&k("1"), x().with_wait(wait))
+            .unwrap_err();
+        assert_eq!(errno(&e), want);
+        assert!(t.state().is_open);
+        t.rollback();
+        let (r, a) = h.join().unwrap();
+        assert_eq!(r.unwrap(), Locked::Row(Some(v("two"))));
+        assert_eq!(a.state().aborted_by, None);
+        assert_eq!(
+            unit.locks()
+                .stats
+                .deadlocks
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
 }

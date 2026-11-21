@@ -1,0 +1,127 @@
+# == Formerly open value differences, each now matched (the rule is in named-r3.txt). New open cases go here, each listed in the decisions file.
+# MariaDB's EXTRACT of a time number whose microseconds are 999999 answers NULL
+Q EXTRACT(DAY_HOUR FROM 8385959.999999)
+M V NULL
+M T LONG 10 0 - 63
+M W W 1292 Incorrect interval value: '8385959.999999'
+Y V 838
+Y T LONGLONG 9 0 - 63
+K M l
+K Y l
+Q EXTRACT(DAY_HOUR FROM 235959.9999999)
+M V NULL
+M T LONG 10 0 - 63
+M W W 1292 Incorrect interval value: '235959.9999999'
+Y V 24
+Y T LONGLONG 9 0 - 63
+K M l
+K Y l
+Q EXTRACT(HOUR_MICROSECOND FROM 235959.9999994)
+M V NULL
+M T LONGLONG 13 0 - 63
+M W W 1292 Incorrect interval value: '235959.9999994'
+Y V 235959999999
+Y T LONGLONG 14 0 - 63
+K M t
+K Y l
+# MySQL rounds a seventh fraction digit in EXTRACT of a number
+Q EXTRACT(HOUR_MICROSECOND FROM 123456.1234567)
+M V 123456123456
+M T LONGLONG 13 0 - 63
+Y V 123456123457
+Y T LONGLONG 14 0 - 63
+K M t
+K Y l
+Q EXTRACT(HOUR_MICROSECOND FROM 235959.9999995)
+M V NULL
+M T LONGLONG 13 0 - 63
+M W W 1292 Incorrect interval value: '235959.9999995'
+Y V 240000000000
+Y T LONGLONG 14 0 - 63
+K M t
+K Y l
+# MariaDB reads a string of digits as a date for the units with a day part, and answers NULL when it is none
+Q EXTRACT(DAY_MINUTE FROM '103000')
+M V NULL
+M T LONGLONG 12 0 - 63
+M W W 1292 Incorrect interval value: '103000'
+Y V 1030
+Y T LONGLONG 11 0 - 63
+K M t
+K Y l
+Q EXTRACT(DAY_MINUTE FROM '1031103000')
+M V NULL
+M T LONGLONG 12 0 - 63
+M W W 1292 Incorrect interval value: '1031103000'
+Y V 83859
+Y T LONGLONG 11 0 - 63
+Y W W 1292 Truncated incorrect time value: '1031103000'
+K M t
+K Y l
+# A compact date, a T and a compact time
+Q EXTRACT(DAY_HOUR FROM '20240115T103000')
+M V 1510
+M T LONG 10 0 - 63
+Y V 1510
+Y T LONGLONG 9 0 - 63
+K M l
+K Y l
+# Open cases found by the three-seed runs
+Q EXTRACT(DAY_MICROSECOND FROM '20240115')
+M V 84080115000000
+M T LONGLONG 20 0 - 63
+Y V 8385959000000
+Y T LONGLONG 20 0 - 63
+Y W W 1292 Truncated incorrect time value: '20240115'
+K M t
+Q LPAD(COALESCE(`vg`, `bn`), 10, '2')
+M V 2222222222	222222222a	222222222A	2222222abc	222222ABC 	22222221.5	22222222-3	22222ÉTÉ	22222222ß	22222222ss	2222222abd	2024-01-15	NULL	22222222ß	2222222abc	2222222abd	22222221.5	2222222222	22222ÉTÉ	222222222A	22222222ss	222222ABC 	2024-01-15	22222222-3
+M T VAR_STRING 10 39 - 63
+Y V 2222222222	222222222a	222222222A	2222222abc	222222ABC 	22222221.5	22222222-3	2222222ÉTÉ	222222222ß	22222222ss	2222222abd	2024-01-15	NULL	222222222ß	2222222abc	2222222abd	22222221.5	2222222222	2222222ÉTÉ	222222222A	22222222ss	222222ABC 	2024-01-15	22222222-3
+Y T VAR_STRING 10 31 - 63
+# MariaDB raises the right operand's overflow although the left operand is NULL
+Q ((LEAST(NULL, 2147483647) - (CASE 0.10 WHEN '2' THEN .5 END)) + ((1e308 * 256) DIV (256 - 0.5)))
+M X 1690
+M T DOUBLE 18 1 - 63
+Y V NULL
+Y T NEWDECIMAL 25 1 - 63
+K Y l
+# A DIV of doubles under a decimal modulo: two rows differ
+Q ((GREATEST(`u4`, `f8`) DIV (CASE WHEN `d0` THEN `f8` ELSE `vb` END)) % GREATEST((9223372036854775807 - 0.4), (4294967295 DIV `d2`)))
+M V NULL	1.0	-1.0	1.0	0.0	2.0	1000.0	1.0	1.0	2000000.0	1.0	-123450000.0	NULL	1.0	NULL	NULL	NULL	NULL	1.0	NULL	14.0	NULL	NULL	NULL
+M T NEWDECIMAL 23 1 - 63
+M W W 1292 Truncated incorrect DECIMAL value: ''
+M W W 1365 Division by 0
+M W W 1916 Got overflow when converting '' to DECIMAL. Value truncated
+M W W 1916 Got overflow when converting '' to DECIMAL. Value truncated
+M W W 1292 Truncated incorrect DECIMAL value: '1e300'
+M W W 1292 Truncated incorrect DECIMAL value: 'ABC '
+M W W 1365 Division by 0
+M W W 1916 Got overflow when converting '' to DECIMAL. Value truncated
+M W W 1916 Got overflow when converting '' to DECIMAL. Value truncated
+M W W 1292 Truncated incorrect DECIMAL value: '1e300'
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect DECIMAL value: 'abc'
+M W W 1365 Division by 0
+Y V NULL	1.0	-1.0	1.0	0.0	2.0	1000.0	1.0	1.0	2000000.0	1.0	-123450000.0	NULL	1.0	NULL	NULL	NULL	NULL	1.0	NULL	14.0	NULL	NULL	NULL
+Y T NEWDECIMAL 23 1 - 63
+Y W W 1366 Incorrect DECIMAL value: '0' for column '' at row -1
+Y W W 1292 Truncated incorrect DECIMAL value: ''
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DECIMAL value: '1'
+Y W W 1292 Truncated incorrect DECIMAL value: '1'
+Y W W 1366 Incorrect DECIMAL value: '0' for column '' at row -1
+Y W W 1292 Truncated incorrect DECIMAL value: 'ABC '
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DECIMAL value: '1'
+Y W W 1292 Truncated incorrect DECIMAL value: '1'
+Y W W 1365 Division by 0
+Y W W 1366 Incorrect DECIMAL value: '0' for column '' at row -1
+Y W W 1292 Truncated incorrect DECIMAL value: 'abc'
+Y W W 1365 Division by 0
+K M w
+K Y w
+# Which collation error comes first: 1267 on MariaDB, we raise 1253
+Q (CASE WHEN (GREATEST('5e-1', '12abc', '18446744073709551616') < `bn`) THEN LEAST('_', 'abc') WHEN CAST('a_c' AS BINARY) THEN (`bn` COLLATE utf8mb4_general_ci) WHEN (`vg` NOT LIKE `vc`) THEN (CAST('abc' AS BINARY) COLLATE utf8mb4_general_ci) ELSE `vc` END)
+M X 1267
+Y X 1253

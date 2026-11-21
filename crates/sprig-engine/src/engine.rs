@@ -293,7 +293,9 @@ impl Engine {
             }),
         };
         engine.set_version_gc(txn_gc);
-        if !engine.inner.cfg.checkpoint_interval.is_zero() {
+        if !engine.inner.cfg.checkpoint_interval.is_zero()
+            && engine.inner.cfg.store != StoreKind::Mem
+        {
             let h = spawn_checkpointer(&engine)?;
             *engine
                 .inner
@@ -384,11 +386,16 @@ impl Engine {
     }
 
     /// Flushes the store and trims the log below what it holds. Returns the
-    /// number of log entries trimmed.
+    /// number of log entries trimmed. On the in-memory store it does nothing:
+    /// that store keeps nothing across a restart, so the log is its only copy
+    /// and must not be trimmed.
     ///
     /// # Errors
     /// The log sync, the flush or the purge failed.
     pub fn checkpoint(&self) -> Result<u64> {
+        if self.inner.cfg.store == StoreKind::Mem {
+            return Ok(0);
+        }
         let store = Arc::clone(&self.inner.store);
         let n = self.inner.log.checkpoint(&move || store.flush_all())?;
         self.inner.checkpoints.fetch_add(1, Ordering::Relaxed);
@@ -423,11 +430,13 @@ fn spawn_checkpointer(engine: &Engine) -> Result<JoinHandle<()>> {
     let stop = Arc::clone(&engine.inner.stop);
     let interval = engine.inner.cfg.checkpoint_interval;
     let every = engine.inner.cfg.checkpoint_entries;
+    let every_bytes = engine.inner.cfg.checkpoint_log_bytes;
     std::thread::Builder::new()
         .name("sprig-checkpoint".into())
         .spawn(move || {
             let tick = interval.min(Duration::from_secs(1));
             let mut last_applied = 0u64;
+            let mut last_bytes = 0u64;
             let mut last_time = Instant::now();
             loop {
                 {
@@ -441,14 +450,18 @@ fn spawn_checkpointer(engine: &Engine) -> Result<JoinHandle<()>> {
                     }
                 }
                 let Some(inner) = weak.upgrade() else { return };
+                inner.store.release_idle_reads();
                 let engine = Engine { inner };
                 let applied = engine.consensus().applied_index(engine.unit());
+                let bytes = engine.inner.log.stats().bytes;
                 let due = applied.saturating_sub(last_applied) >= every
+                    || (every_bytes > 0 && bytes.saturating_sub(last_bytes) >= every_bytes)
                     || (applied > last_applied && last_time.elapsed() >= interval);
                 if due {
                     match engine.checkpoint() {
                         Ok(_) => {
                             last_applied = applied;
+                            last_bytes = bytes;
                             last_time = Instant::now();
                         }
                         Err(e) => tracing::warn!(error = %e, "engine checkpoint failed"),

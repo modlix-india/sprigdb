@@ -121,6 +121,8 @@ pub(crate) mod status;
 pub(crate) mod search;
 // Protocol engines' point reads (MongoDB `_id` finds).
 mod point;
+// The in-process SQL backend's hooks (engine databases).
+pub(crate) mod engine_seam;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -217,6 +219,7 @@ impl Executor for PassThrough {
             column_change_running: false,
             keep_idle: false,
             lex_memo: std::sync::Mutex::new(None),
+            eng: engine_seam::EngineState::default(),
         })
     }
 }
@@ -271,6 +274,9 @@ pub struct PassSession {
     /// The lexer's options last worked out, with the `sql_mode` and version
     /// they came from (`lex_opts`, asked several times per statement).
     lex_memo: std::sync::Mutex<Option<tenant::LexMemo>>,
+    /// The session's state on the storage engine: its transaction there,
+    /// and its variables as the engine path last read them.
+    eng: engine_seam::EngineState,
 }
 
 impl std::fmt::Debug for PassSession {
@@ -440,6 +446,8 @@ impl PassSession {
         if self.router.in_txn() {
             s |= StatusFlags::IN_TRANS;
         }
+        // A transaction on the storage engine, which the session holds.
+        s |= self.engine_txn_flags();
         // As the servers do in every OK and EOF: clients pick their string
         // escaping by this bit (go-sql-driver's interpolateParams, the
         // `mysql` and `mariadb` clients' parsers), so an answer the gateway
@@ -698,6 +706,26 @@ impl PassSession {
                 db: Some(self.current_logical()),
             });
         }
+        // An engine database's statement: the prepared fast path.
+        if s.engine.is_some() {
+            if let Some(summary) = Box::pin(self.engine_execute(cx, stmt, raw, params, out)).await?
+            {
+                return Ok(summary);
+            }
+            return Err(SprigError::internal("an engine statement without its plan"));
+        }
+        // A statement MariaDB runs may change what the engine path keeps
+        // of the session's variables.
+        self.eng.stale();
+        // Inside a transaction on the engine, MariaDB's tables can't join.
+        if self.eng.txn.is_open() {
+            let sql = self.stmts.get_mut(stmt)?.sql.clone();
+            self.engine_other_side(&sql)?;
+            // A prepared `SET autocommit = ?` that turns autocommit on
+            // commits the engine transaction, as the text form does.
+            self.engine_autocommit_param(cx, &sql, params).await?;
+        }
+        let s = self.stmts.get_mut(stmt)?;
         let mapper = s.mapper.clone();
         let logical = s.logical.clone();
         let recheck = s.recheck.clone();
@@ -1090,6 +1118,13 @@ impl PassSession {
     ) -> Result<ExecSummary> {
         let backend_caps = self.backend_caps(cx);
         let s = self.stmts.get_mut(stmt)?;
+        // An engine database's statement has no backend statement, and its
+        // rows must never reach the database's MariaDB copy.
+        if s.engine.is_some() {
+            return Err(crate::engine::not_on_engine(
+                "a bulk execute (COM_STMT_BULK_EXECUTE)",
+            ));
+        }
         let (sql, info, params, types) = (s.sql.clone(), s.info.clone(), s.params, s.types.clone());
         let bs = self.bs(cx);
         let mut build = |b: &BackendStmt| bulk_payload(b, raw, params, types.as_deref());
@@ -1228,10 +1263,13 @@ impl SessionExec for PassSession {
         self.mq_after_request(u64::from(cx.session.id.0), txn_word, r.is_ok());
         // Cross-tenant publishes of the transaction go
         // out once it has ended.
-        crate::inherited::outbox::after_request(
-            u64::from(cx.session.id.0),
-            self.offsets_in_transaction(),
-        );
+        // The request's own final status says whether a transaction is
+        // open; worked out again only when it sent none.
+        let in_transaction = match r.as_ref().ok().and_then(|s| s.status) {
+            Some(s) => s.contains(StatusFlags::IN_TRANS) || !s.contains(StatusFlags::AUTOCOMMIT),
+            None => self.offsets_in_transaction(),
+        };
+        crate::inherited::outbox::after_request(u64::from(cx.session.id.0), in_transaction);
         // Tenant sessions: no error the gateway returns carries a physical
         // name (the relay maps the ones it sends itself).
         r.map_err(|e| self.map_error(e))
@@ -1265,6 +1303,8 @@ impl SessionExec for PassSession {
     }
 
     async fn init_db(&mut self, cx: &mut ExecCtx<'_>, schema: &str) -> Result<()> {
+        // The current database changes: the engine path reads it again.
+        self.eng.stale();
         if self.tenant.is_some() {
             let r = self.tenant_init_db(cx, schema).await;
             return r.map_err(|e| self.map_error(e));
@@ -1282,6 +1322,8 @@ impl SessionExec for PassSession {
         }
         // A reset session starts from the tenant's defaults again.
         self.globals_applied = false;
+        // Its transaction on the storage engine is rolled back.
+        self.engine_end();
         if let Some(wl) = self.wl.as_mut() {
             wl.reset();
         }
@@ -1299,6 +1341,12 @@ impl SessionExec for PassSession {
     async fn abandoned(&mut self, _cx: &mut ExecCtx<'_>, why: Abandon) {
         // The router's statements on other connections too.
         self.router.abandon_in_flight(DRAIN_TIMEOUT).await;
+        // On the storage engine: a killed statement is undone and its
+        // transaction stays open; a lost client's transaction is rolled back.
+        match why {
+            Abandon::Killed => self.engine_abandon_statement(),
+            Abandon::ClientGone => self.engine_end(),
+        }
         let Some(bs) = self.bs.as_mut() else {
             return;
         };
@@ -1336,6 +1384,10 @@ impl SessionExec for PassSession {
             p.row_policies()
                 .is_some_and(|r| r.tables.contains_key(&sprig_common::ids::ObjectId(object))),
         )
+    }
+
+    fn engine_database(&self, name: &str) -> bool {
+        self.engine_database_named(name)
     }
 
     fn row_policy_docs(&self) -> Option<std::sync::Arc<crate::tenant::rls::DocViews>> {
@@ -1399,6 +1451,7 @@ impl SessionExec for PassSession {
         metrics::gauge!("sprig_mysql_prepared_statements", "persona" => self.persona.as_str())
             .decrement(n);
         self.router.close().await;
+        self.engine_end();
         if let Some(bs) = self.bs.as_mut() {
             bs.close().await;
         }
@@ -1668,7 +1721,7 @@ impl PassSession {
                 // 3306: MySQL's `'table.key'` in 1062 for prepared
                 // statements too (MySQL Connector/J's suite checks it).
                 let dup_table = if self.persona == Persona::MySql84 {
-                    let lex = self.lex_opts().0;
+                    let lex = self.engine_lex().unwrap_or_else(|| self.lex_opts().0);
                     self.stmts
                         .get_mut(stmt)
                         .ok()
@@ -1717,7 +1770,7 @@ impl PassSession {
                         r.map_err(|e| compat_sink::map(e, Some(table)))
                     }
                     (None, Some(l)) => {
-                        let lex = self.lex_opts().0;
+                        let lex = self.engine_lex().unwrap_or_else(|| self.lex_opts().0);
                         let mut wrapped = compat_sink::IntMetaSink::new(out, &l, lex);
                         self.execute(cx, stmt, &raw, &params, &mut wrapped).await
                     }

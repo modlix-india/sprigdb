@@ -1,0 +1,18 @@
+[package]
+name = "sprig-plan"
+description = "SprigDB: the SQL planner (name resolution, access paths, join order) onto sprig-exec's operators"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+sprig-engine.workspace = true
+sprig-exec.workspace = true
+sqlparser.workspace = true
+
+[lints]
+workspace = true

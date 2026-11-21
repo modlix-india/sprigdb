@@ -43,6 +43,10 @@ pub struct EngineConfig {
     /// Trim the log once this many entries were applied since the last
     /// checkpoint, whatever the interval.
     pub checkpoint_entries: u64,
+    /// Trim the log once this many payload bytes were written since the
+    /// last checkpoint, whatever the interval: what bounds the log's size
+    /// on disk under a steady write load. Zero turns this trigger off.
+    pub checkpoint_log_bytes: u64,
 }
 
 impl EngineConfig {
@@ -58,6 +62,7 @@ impl EngineConfig {
             rocks: RocksTuning::default(),
             checkpoint_interval: Duration::from_secs(30),
             checkpoint_entries: 500_000,
+            checkpoint_log_bytes: 64 << 20,
         }
     }
 }
@@ -76,6 +81,10 @@ pub struct RocksTuning {
     pub target_file_size: u64,
     /// One memtable's size in bytes; the write buffer manager caps the sum.
     pub write_buffer_size: usize,
+    /// LZ4 on the two top levels (L0 and L1) too. They hold what the
+    /// memtables last flushed, which is most of a small database; left
+    /// uncompressed they take several times the space of the levels below.
+    pub compress_top_levels: bool,
     /// Collect RocksDB statistics (costs a few percent of CPU).
     pub statistics: bool,
     /// Skip the flush on close. Only crash simulations set this: with the
@@ -91,6 +100,7 @@ impl Default for RocksTuning {
             bloom_bits_per_key: 10.0,
             target_file_size: 64 << 20,
             write_buffer_size: 64 << 20,
+            compress_top_levels: true,
             statistics: false,
             avoid_flush_on_close: false,
         }

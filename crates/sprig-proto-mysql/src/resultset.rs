@@ -11,11 +11,11 @@ mod value;
 
 pub use value::{
     DateTime, Time, Value, decode_binary_row, decode_binary_row_types, decode_binary_value,
-    encode_binary_row, encode_binary_row_types, encode_binary_value, null_bitmap_get,
-    null_bitmap_len, null_bitmap_set,
+    encode_binary_row, encode_binary_row_into, encode_binary_row_types, encode_binary_value,
+    null_bitmap_get, null_bitmap_len, null_bitmap_set,
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 use crate::buf::{Reader, Writer};
 use crate::error::ErrPacket;
@@ -213,13 +213,20 @@ impl ColumnDef {
     /// `MARIADB_CLIENT_EXTENDED_METADATA`.
     #[must_use]
     pub fn encode(&self, caps: Caps) -> Bytes {
-        let mut w = Writer::with_capacity(
+        let mut b = BytesMut::with_capacity(
             32 + self.schema.len()
                 + self.table.len()
                 + self.org_table.len()
                 + self.name.len()
                 + self.org_name.len(),
         );
+        self.encode_into(caps, &mut b);
+        b.freeze()
+    }
+
+    /// [`ColumnDef::encode`], appended to `out`.
+    pub fn encode_into(&self, caps: Caps, out: &mut BytesMut) {
+        let mut w = Writer::from_buf(std::mem::take(out));
         w.lenenc_bytes(b"def")
             .lenenc_bytes(&self.schema)
             .lenenc_bytes(&self.table)
@@ -236,7 +243,7 @@ impl ColumnDef {
             .u16(self.flags)
             .u8(self.decimals)
             .u16(0);
-        w.into_bytes()
+        *out = w.into_buf();
     }
 
     /// Whether the column is `UNSIGNED`.
@@ -321,11 +328,21 @@ pub fn decode_text_row(payload: &[u8], columns: usize) -> ProtoResult<Vec<Option
 
 /// Encodes a text row.
 pub fn encode_text_row<'a>(values: impl IntoIterator<Item = Option<&'a [u8]>>) -> Bytes {
-    let mut w = Writer::new();
+    let mut b = BytesMut::new();
+    encode_text_row_into(values, &mut b);
+    b.freeze()
+}
+
+/// [`encode_text_row`], appended to `out`.
+pub fn encode_text_row_into<'a>(
+    values: impl IntoIterator<Item = Option<&'a [u8]>>,
+    out: &mut BytesMut,
+) {
+    let mut w = Writer::from_buf(std::mem::take(out));
     for v in values {
         w.lenenc_bytes_or_null(v);
     }
-    w.into_bytes()
+    *out = w.into_buf();
 }
 
 /// `COM_STMT_PREPARE` success (`COM_STMT_PREPARE_OK`).

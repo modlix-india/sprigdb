@@ -7,12 +7,13 @@
 //! has, so at most that much waits for a slow client.
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt as _};
 use sprig_common::{Result, SprigError};
+use sprig_proto_mysql::buf::put_lenenc_int;
 use sprig_proto_mysql::packets::{EofPacket, OkPacket};
 use sprig_proto_mysql::resultset::{
-    Terminator, encode_binary_row, encode_column_count, encode_text_row,
+    Terminator, encode_binary_row_into, encode_column_count, encode_text_row_into,
 };
 use sprig_proto_mysql::{Caps, ColumnDef, ErrPacket, PacketCodec, Persona, StatusFlags};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -30,6 +31,44 @@ where
         .map_err(SprigError::from)
 }
 
+/// Puts one packet whose payload `f` writes straight into the connection's
+/// write buffer: no payload allocation or copy while the buffer is below its
+/// backpressure boundary and framing is plain (the common case). Otherwise,
+/// and for payloads that need splitting, the payload goes through the codec
+/// as before.
+async fn put<S>(
+    framed: &mut Framed<S, PacketCodec>,
+    f: impl FnOnce(&mut BytesMut) -> Result<()> + Send,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let plain = !framed.codec().framing().is_compressed();
+    if plain && framed.write_buffer().len() < framed.backpressure_boundary() {
+        let seq = framed.codec().next_seq();
+        let buf = framed.write_buffer_mut();
+        let start = buf.len();
+        buf.extend_from_slice(&[0, 0, 0, seq]);
+        if let Err(e) = f(buf) {
+            buf.truncate(start);
+            return Err(e);
+        }
+        let len = buf.len() - start - 4;
+        if len < 0xFF_FFFF {
+            let l = u32::try_from(len).unwrap_or(0).to_le_bytes();
+            buf[start..start + 3].copy_from_slice(&l[..3]);
+            framed.codec_mut().set_next_seq(seq.wrapping_add(1));
+            return Ok(());
+        }
+        let payload = buf.split_off(start + 4).freeze();
+        buf.truncate(start);
+        return framed.feed(payload).await.map_err(SprigError::from);
+    }
+    let mut b = BytesMut::new();
+    f(&mut b)?;
+    framed.feed(b.freeze()).await.map_err(SprigError::from)
+}
+
 /// Where a response is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -43,6 +82,17 @@ enum State {
     Finished,
 }
 
+/// The column definitions a client last received for one prepared
+/// statement (`MARIADB_CLIENT_CACHE_METADATA`): those of its `PREPARE_OK`,
+/// then of each execute that sent them.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SentMeta {
+    /// Definitions the gateway encoded.
+    Typed(Vec<ColumnDef>),
+    /// Definitions relayed as the backend sent them.
+    Raw(Vec<Bytes>),
+}
+
 /// The sink of one request.
 pub(crate) struct WireSink<'a, S> {
     framed: &'a mut Framed<S, PacketCodec>,
@@ -52,6 +102,23 @@ pub(crate) struct WireSink<'a, S> {
     state: State,
     /// The status of the last OK, EOF or terminator sent.
     pub(crate) last_status: Option<StatusFlags>,
+    /// A `COM_STMT_EXECUTE` under `MARIADB_CLIENT_CACHE_METADATA`: what the
+    /// client already has for the statement. Binary resultsets then send
+    /// the definitions only when they changed, after a one-byte flag.
+    pub(crate) meta_cache: Option<&'a mut Option<SentMeta>>,
+    /// A resultset of this request already began: only an execute's first
+    /// resultset may leave its definitions out.
+    began: bool,
+}
+
+/// A column count packet with the metadata flag
+/// (`MARIADB_CLIENT_CACHE_METADATA`).
+fn count_with_flag(n: usize, follows: bool) -> Bytes {
+    let c = encode_column_count(n as u64);
+    let mut b = Vec::with_capacity(c.len() + 1);
+    b.extend_from_slice(&c);
+    b.push(u8::from(follows));
+    Bytes::from(b)
 }
 
 impl<'a, S> WireSink<'a, S>
@@ -70,7 +137,48 @@ where
             columns: Vec::new(),
             state: State::Idle,
             last_status: None,
+            meta_cache: None,
+            began: false,
         }
+    }
+
+    /// Under `MARIADB_CLIENT_CACHE_METADATA`, whether the definitions must
+    /// follow the count (and records them as sent); `None` without the
+    /// capability. `now` builds the definitions about to be sent; it is
+    /// called only when there is a statement's slot to compare them with.
+    /// Only the first resultset of an execute may leave them out: a later
+    /// one (a procedure's second resultset) always carries its own.
+    fn cached(&mut self, format: RowFormat, now: impl FnOnce() -> SentMeta) -> Option<bool> {
+        let first = !std::mem::replace(&mut self.began, true);
+        if !self.caps.contains(Caps::MARIADB_CLIENT_CACHE_METADATA) {
+            return None;
+        }
+        if format == RowFormat::Text {
+            return Some(true);
+        }
+        let Some(slot) = self.meta_cache.as_deref_mut() else {
+            return Some(true);
+        };
+        let now = now();
+        if first && slot.as_ref() == Some(&now) {
+            return Some(false);
+        }
+        *slot = Some(now);
+        Some(true)
+    }
+
+    /// The EOF that ends a resultset's column definitions for a client
+    /// without `DEPRECATE_EOF`. MariaDB sends it even when the definitions
+    /// themselves were left out (`MARIADB_CLIENT_CACHE_METADATA`).
+    async fn end_of_definitions(&mut self) -> Result<()> {
+        if self.caps.contains(Caps::DEPRECATE_EOF) {
+            return Ok(());
+        }
+        let eof = EofPacket {
+            warnings: 0,
+            status: StatusFlags::AUTOCOMMIT,
+        };
+        self.feed(eof.encode(self.caps)).await
     }
 
     async fn feed(&mut self, payload: Bytes) -> Result<()> {
@@ -100,34 +208,45 @@ where
     }
 
     async fn begin_rows(&mut self, columns: &[ColumnDef], format: RowFormat) -> Result<()> {
-        self.feed(encode_column_count(columns.len() as u64)).await?;
-        for c in columns {
-            self.feed(c.encode(self.caps)).await?;
+        let follows = self.cached(format, || SentMeta::Typed(columns.to_vec()));
+        let n = columns.len() as u64;
+        put(self.framed, |b| {
+            put_lenenc_int(b, n);
+            if let Some(f) = follows {
+                b.extend_from_slice(&[u8::from(f)]);
+            }
+            Ok(())
+        })
+        .await?;
+        if follows != Some(false) {
+            let caps = self.caps;
+            for c in columns {
+                put(self.framed, |b| {
+                    c.encode_into(caps, b);
+                    Ok(())
+                })
+                .await?;
+            }
         }
-        if !self.caps.contains(Caps::DEPRECATE_EOF) {
-            let eof = EofPacket {
-                warnings: 0,
-                status: StatusFlags::AUTOCOMMIT,
-            };
-            self.feed(eof.encode(self.caps)).await?;
-        }
-        self.columns = columns.to_vec();
+        self.end_of_definitions().await?;
+        self.columns.clear();
+        self.columns.extend_from_slice(columns);
         self.state = State::Rows(format);
         Ok(())
     }
 
     async fn begin_rows_raw(&mut self, defs: &[Bytes], format: RowFormat) -> Result<()> {
-        self.feed(encode_column_count(defs.len() as u64)).await?;
-        for d in defs {
-            self.feed(d.clone()).await?;
+        let follows = self.cached(format, || SentMeta::Raw(defs.to_vec()));
+        match follows {
+            None => self.feed(encode_column_count(defs.len() as u64)).await?,
+            Some(f) => self.feed(count_with_flag(defs.len(), f)).await?,
         }
-        if !self.caps.contains(Caps::DEPRECATE_EOF) {
-            let eof = EofPacket {
-                warnings: 0,
-                status: StatusFlags::AUTOCOMMIT,
-            };
-            self.feed(eof.encode(self.caps)).await?;
+        if follows != Some(false) {
+            for d in defs {
+                self.feed(d.clone()).await?;
+            }
         }
+        self.end_of_definitions().await?;
         // Rows are relayed raw: nothing to encode them with.
         self.columns.clear();
         self.state = State::Rows(format);
@@ -135,9 +254,21 @@ where
     }
 
     async fn cursor_opened(&mut self, columns: &[ColumnDef], end: EndOfRows) -> Result<()> {
-        self.feed(encode_column_count(columns.len() as u64)).await?;
-        for c in columns {
-            self.feed(c.encode(self.caps)).await?;
+        match self.cached(RowFormat::Binary, || SentMeta::Typed(columns.to_vec())) {
+            None => self.feed(encode_column_count(columns.len() as u64)).await?,
+            Some(f) => {
+                self.feed(count_with_flag(columns.len(), f)).await?;
+                if f {
+                    for c in columns {
+                        self.feed(c.encode(self.caps)).await?;
+                    }
+                }
+            }
+        }
+        if !self.caps.contains(Caps::MARIADB_CLIENT_CACHE_METADATA) {
+            for c in columns {
+                self.feed(c.encode(self.caps)).await?;
+            }
         }
         // The one packet after the definitions carries CURSOR_EXISTS: an
         // EOF, or under DEPRECATE_EOF the OK-form terminator.
@@ -160,11 +291,15 @@ where
     }
 
     async fn row(&mut self, values: RowValues<'_>) -> Result<()> {
-        let payload = match values {
-            RowValues::Text(v) => encode_text_row(v.iter().copied()),
-            RowValues::Binary(v) => encode_binary_row(v, &self.columns)?,
-        };
-        self.feed(payload).await
+        let columns = &self.columns;
+        put(self.framed, |b| match values {
+            RowValues::Text(v) => {
+                encode_text_row_into(v.iter().copied(), b);
+                Ok(())
+            }
+            RowValues::Binary(v) => encode_binary_row_into(v, columns, b).map_err(SprigError::from),
+        })
+        .await
     }
 
     async fn raw_row(&mut self, payload: Bytes) -> Result<()> {
@@ -184,6 +319,22 @@ where
     }
 
     async fn end_rows(&mut self, end: EndOfRows) -> Result<()> {
+        if self.caps.contains(Caps::DEPRECATE_EOF) {
+            let ok = OkPacket {
+                header: 0xFE,
+                status: end.status,
+                warnings: end.warnings,
+                ..OkPacket::default()
+            };
+            let caps = self.caps;
+            put(self.framed, |b| {
+                ok.encode_into(caps, b);
+                Ok(())
+            })
+            .await?;
+            self.finish_with(end.status);
+            return Ok(());
+        }
         let t = Terminator::Ok(OkPacket {
             header: 0xFE,
             status: end.status,
@@ -198,7 +349,12 @@ where
     async fn ok(&mut self, ok: OkPacket) -> Result<()> {
         let status = ok.status;
         let ok = OkPacket { header: 0, ..ok };
-        self.feed(ok.encode(self.caps)).await?;
+        let caps = self.caps;
+        put(self.framed, |b| {
+            ok.encode_into(caps, b);
+            Ok(())
+        })
+        .await?;
         self.finish_with(status);
         Ok(())
     }

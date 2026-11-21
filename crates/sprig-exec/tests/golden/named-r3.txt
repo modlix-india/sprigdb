@@ -1,0 +1,1928 @@
+# == The text answer of DATE_ADD on a string is, among numbers, the datetime it was computed as
+Q (DATE_SUB('2024-12-31 23:59:59.999999', INTERVAL '2' MICROSECOND) * 109)
+M V 2206294204719640.000000
+M T DOUBLE 23 6 - 63
+Y V 2.20629420471964e15
+Y T DOUBLE 23 31 - 63
+Q (DATE_ADD('2024-12-31', INTERVAL 1 DAY) + 0)
+M V 20250101
+M T DOUBLE 17 0 - 63
+Y V 20250101
+Y T DOUBLE 23 31 - 63
+Q CAST(DATE_SUB('20240115', INTERVAL '1.5' SECOND_MICROSECOND) AS DOUBLE)
+M V 20240114235958.5
+M T DOUBLE 22 31 - 63
+Y V 20240114235958.5
+Y T DOUBLE 23 31 - 63
+Q CAST(DATE_SUB(240115, INTERVAL '1:1.5' MINUTE_MICROSECOND) AS DECIMAL(20,6))
+M V 20240114235858.500000
+M T NEWDECIMAL 22 6 - 63
+Y V 20240114235858.500000
+Y T NEWDECIMAL 22 6 - 63
+Q (DATE_SUB('2024-01-15', INTERVAL '1 02:03:04' DAY_SECOND) DIV 3)
+M V 6746704405218
+M T LONGLONG 19 0 - 63
+Y V 6746704405218
+Y T LONGLONG 22 0 - 63
+Q (DATE_SUB('2024-12-31 23:59:59.999999', INTERVAL '1-2' YEAR_MONTH) + '+3')
+M V 20231031235963
+M T DOUBLE 23 31 - 63
+Y V 20231031235963
+Y T DOUBLE 23 31 - 63
+# == STR_TO_DATE: one or two digits for %Y are a two-digit year
+Q STR_TO_DATE('70-01-01', '%Y-%m-%d')
+M V 1970-01-01
+M T DATE 10 0 - 63
+Y V 1970-01-01
+Y T DATE 10 0 - 63
+Q STR_TO_DATE('69-01-01', '%Y-%m-%d')
+M V 2069-01-01
+M T DATE 10 0 - 63
+Y V 2069-01-01
+Y T DATE 10 0 - 63
+Q STR_TO_DATE('7-01-01', '%Y-%m-%d')
+M V 2007-01-01
+M T DATE 10 0 - 63
+Y V 2007-01-01
+Y T DATE 10 0 - 63
+Q STR_TO_DATE('170-01-01', '%Y-%m-%d')
+M V 0170-01-01
+M T DATE 10 0 - 63
+Y V 0170-01-01
+Y T DATE 10 0 - 63
+# == TIME() of a double has six fraction digits
+Q TIME(('2024-00-10' * 0.5))
+M V 00:10:12.000000
+M T TIME 17 6 - 63
+M W W 1292 Truncated incorrect DOUBLE value: '2024-00-10'
+Y V 00:10:12.000000
+Y T TIME 17 6 - 63
+Y W W 1292 Truncated incorrect DOUBLE value: '2024-00-10'
+Q TIME(1012e0)
+M V 00:10:12.000000
+M T TIME 17 6 - 63
+Y V 00:10:12.000000
+Y T TIME 17 6 - 63
+# == A string's digits beyond the signed range wrap around where a function reads an integer
+Q ROUND(1e22, '18446744073709551616')
+M V 10000000000000000000000
+M T DOUBLE 17 0 N 63
+M W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+M W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+Y V 1e22
+Y T DOUBLE 23 31 N 63
+Y W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+Q ROUND(1.5e0, '9223372036854775808')
+M V 0
+M T DOUBLE 17 0 N 63
+Y V 0
+Y T DOUBLE 23 31 N 63
+Q ROUND((0.001 / 2), '9223372036854775808')
+M V 0
+M T NEWDECIMAL 3 0 - 63
+Y V 0
+Y T NEWDECIMAL 3 0 - 63
+Q SUBSTRING('abcé', '18446744073709551616')
+M V é
+M T VAR_STRING 4 39 - 224
+M W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+M W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+Y V é
+Y T VAR_STRING 4 31 - 255
+Y W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+Y W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+K M l
+K Y l
+Q SUBSTRING('abcé', 2, '18446744073709551616')
+M V 
+M T VAR_STRING 0 39 - 224
+M W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+M W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+Y V 
+Y T VAR_STRING 0 31 - 255
+Y W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+Y W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+K M l
+K Y l
+Q LEFT('abcé', '18446744073709551616')
+M V 
+M T VAR_STRING 0 39 - 224
+M W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+M W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+Y V 
+Y T VAR_STRING 0 31 - 255
+Y W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+Y W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+Q LPAD('ab', '18446744073709551616', 'x')
+M V NULL
+M T VAR_STRING 0 39 - 224
+M W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+M W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+Y V NULL
+Y T LONG_BLOB 67108864 31 - 255
+Y W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+Y W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+K Y t
+# == MySQL's NULLIF with a BIGINT column: the constant becomes the integer it is stored as
+Q NULLIF('', `u8`)
+M V NULL				NULL											NULL								NULL
+M T VAR_STRING 0 39 - 224
+M W W 1292 Truncated incorrect DECIMAL value: ''
+Y V NULL	0	0	0	NULL	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	0	0	NULL
+Y T LONGLONG 22 0 U 63
+K M w
+Q NULLIF('+3', `i8`)
+M V +3	+3	+3	+3	+3	+3	+3	+3	+3	+3	+3	+3	+3	+3	+3	+3	+3	+3	+3	+3	+3	+3	+3	+3
+M T VAR_STRING 8 39 - 224
+Y V 3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3
+Y T LONGLONG 22 0 - 63
+Q NULLIF('abc', `i8`)
+M V NULL	abc	abc	abc	abc	abc	abc	abc	abc	abc	abc	abc	abc	abc	abc	abc	abc	NULL	abc	abc	abc	abc	abc	abc
+M T VAR_STRING 12 39 - 224
+M W W 1292 Truncated incorrect DECIMAL value: 'abc'
+Y V NULL	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	0
+Y T LONGLONG 22 0 - 63
+Y W W 1292 Truncated incorrect DOUBLE value: 'abc'
+K M w
+Q NULLIF(' 3 ', `i8`)
+M V  3 	 3 	 3 	 3 	 3 	 3 	 3 	 3 	 3 	 3 	 3 	 3 	 3 	 3 	 3 	 3 	 3 	 3 	 3 	 3 	 3 	 3 	 3 	 3 
+M T VAR_STRING 12 39 - 224
+M W N 1292 Truncated incorrect DECIMAL value: ' 3 '
+Y V 3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3
+Y T LONGLONG 22 0 - 63
+K M w
+Q NULLIF(3.0, `i8`)
+M V 3.0	3.0	3.0	3.0	3.0	3.0	3.0	3.0	3.0	3.0	3.0	3.0	3.0	3.0	3.0	3.0	3.0	3.0	3.0	3.0	3.0	3.0	3.0	3.0
+M T NEWDECIMAL 4 1 - 63
+Y V 3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3	3
+Y T LONGLONG 22 0 - 63
+Q NULLIF('1.5', `i8`)
+M V 1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5
+M T VAR_STRING 12 39 - 224
+Y V 1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5	1.5
+Y T VAR_STRING 12 31 - 255
+Q NULLIF('3', `i4`)
+M V 3	3	3	3	3	NULL	3	3	3	3	3	3	3	3	3	3	3	3	3	3	NULL	3	3	3
+M T VAR_STRING 4 39 - 224
+Y V 3	3	3	3	3	NULL	3	3	3	3	3	3	3	3	3	3	3	3	3	3	NULL	3	3	3
+Y T VAR_STRING 4 31 - 255
+Q (NULLIF('+3', `i8`) > `vb`)
+M V 1	0	0	0	0	0	1	0	0	0	0	0	NULL	1	0	0	0	NULL	0	1	0	0	0	0
+M T LONG 1 0 - 63
+Y V 1	1	1	1	1	0	0	1	1	1	1	1	NULL	0	1	1	1	NULL	1	1	0	1	1	1
+Y T LONGLONG 1 0 - 63
+Y W W 1292 Truncated incorrect DOUBLE value: 'a'
+Y W W 1292 Truncated incorrect DOUBLE value: 'A'
+Y W W 1292 Truncated incorrect DOUBLE value: 'abc'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ABC '
+Y W W 1292 Truncated incorrect DOUBLE value: 'ete'
+Y W W 1292 Truncated incorrect DOUBLE value: 'B'
+Y W W 1292 Truncated incorrect DOUBLE value: 'a_c'
+Y W W 1292 Truncated incorrect DOUBLE value: 'Z'
+Y W W 1292 Truncated incorrect DOUBLE value: 'Z'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ABC '
+Y W W 1292 Truncated incorrect DOUBLE value: 'a_c'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ete'
+Y W W 1292 Truncated incorrect DOUBLE value: 'abc'
+Y W W 1292 Truncated incorrect DOUBLE value: 'B'
+Q ((NULLIF(('abc ' COLLATE utf8mb4_bin), `i8`) COLLATE utf8mb4_bin) COLLATE utf8mb4_bin)
+M V NULL	abc 	abc 	abc 	abc 	abc 	abc 	abc 	abc 	abc 	abc 	abc 	abc 	abc 	abc 	abc 	abc 	NULL	abc 	abc 	abc 	abc 	abc 	abc 
+M T VAR_STRING 16 39 - 224
+M W W 1292 Truncated incorrect DECIMAL value: 'abc '
+Y V NULL	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	0
+Y T VAR_STRING 88 31 - 255
+Y W W 1292 Truncated incorrect DOUBLE value: 'abc '
+K M w
+Q (`i8` = 'abc')
+M V 1	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	1	0	0	0	0	0	0
+M T LONG 1 0 - 63
+M W W 1292 Truncated incorrect DECIMAL value: 'abc'
+Y V 1	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	1	0	0	0	0	0	0
+Y T LONGLONG 1 0 - 63
+Y W W 1292 Truncated incorrect DOUBLE value: 'abc'
+K M w
+# == NULLIF compares through the first argument's own number (MariaDB's LEAST of strings)
+Q NULLIF(LEAST(' 12 ', 'ss'), `f8`)
+M V NULL	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	NULL	 12 	 12 	 12 	 12 	 12 	 12 
+M T VAR_STRING 16 39 - 224
+M W N 1292 Truncated incorrect DOUBLE value: ' 12 '
+M W W 1292 Truncated incorrect DOUBLE value: 'ss'
+Y V  12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 
+Y T VAR_STRING 16 31 - 255
+K M w
+Q NULLIF(LEAST(' 12 ', 'ss'), 12e0)
+M V  12 
+M T VAR_STRING 16 39 - 224
+M W N 1292 Truncated incorrect DOUBLE value: ' 12 '
+M W W 1292 Truncated incorrect DOUBLE value: 'ss'
+Y V NULL
+Y T VAR_STRING 16 31 - 255
+Q ('2' IN (NULLIF(GREATEST('x', 'É', '+3'), NULLIF(`i1`, `u4`))))
+M V 0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	0	0	0	0	0	NULL	0
+M T LONG 1 0 - 63
+M W W 1292 Truncated incorrect DECIMAL value: 'x'
+M W W 1292 Truncated incorrect DECIMAL value: 'É'
+Y V 0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	NULL
+Y T LONGLONG 1 0 - 63
+K M w
+# == LIKE with an empty ESCAPE: the default escape on MariaDB, none on MySQL
+Q ('ab%' LIKE 'ab\\%' ESCAPE '')
+M V 1
+M T LONG 1 0 N 63
+Y V 0
+Y T LONGLONG 1 0 N 63
+Q ('ab\\x' LIKE 'ab\\%' ESCAPE '')
+M V 0
+M T LONG 1 0 N 63
+Y V 1
+Y T LONGLONG 1 0 N 63
+Q (`vc` LIKE 'ab\\%' ESCAPE '')
+M V 0	0	0	0	0	0	0	0	0	1	0	0	NULL	0	0	0	0	0	0	0	1	0	0	0
+M T LONG 1 0 - 63
+Y V 0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	0	0	0	0	0	0
+Y T LONGLONG 1 0 - 63
+# == MySQL's COALESCE and IFNULL hand a nested CASE's own text on
+Q COALESCE((CASE WHEN 0 THEN 1.25 WHEN 1 THEN -18446744073709551615 ELSE 1e15 END), CAST(NULL AS CHAR(3)))
+M V -1.8446744073709552e19
+M T VAR_STRING 84 39 N 224
+Y V -18446744073709551615
+Y T VAR_STRING 88 31 N 255
+K Y l
+Q CONCAT(COALESCE((CASE WHEN 0 THEN 1e15 WHEN 1.5 THEN -0.10 ELSE 0 END), 'x'))
+M V -0.1
+M T VAR_STRING 20 39 - 224
+Y V -0.10
+Y T VAR_STRING 88 31 - 255
+K Y l
+Q CONCAT(IFNULL((CASE WHEN 0 THEN 1e15 WHEN 1.5 THEN -0.10 ELSE 0 END), 'x'))
+M V -0.1
+M T VAR_STRING 20 39 - 224
+Y V -0.10
+Y T VAR_STRING 88 31 - 255
+K Y l
+Q CONCAT(COALESCE(-0.10, 1e15))
+M V -0.1
+M T VAR_STRING 20 39 - 224
+Y V -0.1
+Y T VAR_STRING 88 31 - 255
+# == MySQL's nested CASE keeps its branch's own decimals
+Q (CASE `d2` WHEN 1 THEN .5 ELSE (CASE WHEN 1 THEN `d2` ELSE 1000000.000001 END) END)
+M V 0.000000	0.500000	-1.500000	99999999.990000	-99999999.990000	2.500000	0.010000	-0.010000	123.450000	0.500000	1.250000	3.330000	NULL	0.010000	3.330000	-99999999.990000	0.500000	-1.500000	-0.010000	0.000000	2.500000	1.250000	99999999.990000	123.450000
+M T NEWDECIMAL 16 6 - 63
+Y V 0.00	0.5	-1.50	99999999.99	-99999999.99	2.50	0.01	-0.01	123.45	0.50	1.25	3.33	NULL	0.01	3.33	-99999999.99	0.50	-1.50	-0.01	0.00	2.50	1.25	99999999.99	123.45
+Y T NEWDECIMAL 16 6 - 63
+Q (CASE `d2` WHEN 1 THEN .5 ELSE IF(1, `d2`, 1000000.000001) END)
+M V 0.000000	0.500000	-1.500000	99999999.990000	-99999999.990000	2.500000	0.010000	-0.010000	123.450000	0.500000	1.250000	3.330000	NULL	0.010000	3.330000	-99999999.990000	0.500000	-1.500000	-0.010000	0.000000	2.500000	1.250000	99999999.990000	123.450000
+M T NEWDECIMAL 16 6 - 63
+Y V 0.00	0.5	-1.50	99999999.99	-99999999.99	2.50	0.01	-0.01	123.45	0.50	1.25	3.33	NULL	0.01	3.33	-99999999.99	0.50	-1.50	-0.01	0.00	2.50	1.25	99999999.99	123.45
+Y T NEWDECIMAL 16 6 - 63
+Q (CASE (`u4` % `i4`) WHEN NULLIF(`vc`, '0') THEN (-1.25 / 65536) ELSE (CASE `f8` WHEN `u4` THEN `i4` WHEN `i8` THEN `d0` WHEN `vb` THEN 9223372036854775808 ELSE `d2` END) END)
+M V 0.000000	-0.000019	-0.000019	99999999.990000	-0.000019	-0.000019	0.010000	-0.000019	-0.000019	-0.000019	1.250000	-0.000019	NULL	-0.000019	3.330000	-99999999.990000	0.500000	0.000000	-0.000019	0.000000	2.500000	1.250000	99999999.990000	123.450000
+M T NEWDECIMAL 28 6 - 63
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect DECIMAL value: 'a'
+M W W 1292 Truncated incorrect DECIMAL value: 'A'
+M W W 1292 Truncated incorrect DECIMAL value: 'abc'
+M W W 1292 Truncated incorrect DOUBLE value: 'abc'
+M W W 1292 Truncated incorrect DECIMAL value: 'ABC '
+M W W 1292 Truncated incorrect DECIMAL value: '12abc'
+M W N 1292 Truncated incorrect DOUBLE value: ' 7 '
+M W W 1292 Truncated incorrect DECIMAL value: 'été'
+M W W 1292 Truncated incorrect DECIMAL value: 'b'
+M W W 1292 Truncated incorrect DECIMAL value: 'ab%'
+M W W 1292 Truncated incorrect DECIMAL value: 'z'
+M W W 1292 Truncated incorrect DECIMAL value: 'A'
+M W W 1292 Truncated incorrect DOUBLE value: 'Z'
+M W W 1292 Truncated incorrect DECIMAL value: 'ABC '
+M W W 1292 Truncated incorrect DOUBLE value: 'ABC '
+M W W 1292 Truncated incorrect DECIMAL value: '12abc'
+M W W 1292 Truncated incorrect DECIMAL value: 'été'
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect DOUBLE value: ''
+M W W 1292 Truncated incorrect DECIMAL value: 'ab%'
+M W W 1292 Truncated incorrect DECIMAL value: 'z'
+M W W 1292 Truncated incorrect DOUBLE value: 'abc'
+M W W 1292 Truncated incorrect DECIMAL value: ''
+Y V 0	-0.000019	-0.000019	99999999.99	-0.000019	-0.000019	0.01	-0.000019	-0.000019	-0.000019	1.25	-0.000019	NULL	-0.000019	3.33	-99999999.99	0.50	0	-0.000019	0.00	2.50	1.25	99999999.99	123.45
+Y T NEWDECIMAL 28 6 - 63
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'a'
+Y W W 1292 Truncated incorrect DOUBLE value: 'A'
+Y W W 1292 Truncated incorrect DOUBLE value: 'abc'
+Y W W 1292 Truncated incorrect DOUBLE value: 'abc'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ABC '
+Y W W 1292 Truncated incorrect DOUBLE value: '12abc'
+Y W W 1292 Truncated incorrect DOUBLE value: 'été'
+Y W W 1292 Truncated incorrect DOUBLE value: 'b'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ab%'
+Y W W 1292 Truncated incorrect DOUBLE value: 'z'
+Y W W 1292 Truncated incorrect DOUBLE value: 'A'
+Y W W 1292 Truncated incorrect DOUBLE value: 'Z'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ABC '
+Y W W 1292 Truncated incorrect DOUBLE value: 'ABC '
+Y W W 1292 Truncated incorrect DOUBLE value: '12abc'
+Y W W 1292 Truncated incorrect DOUBLE value: 'été'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'ab%'
+Y W W 1292 Truncated incorrect DOUBLE value: 'z'
+Y W W 1292 Truncated incorrect DOUBLE value: 'abc'
+# == MySQL keeps a product's digits beyond the 30-digit scale for the next operation
+Q (`u8` * (-242 * (CAST(3 AS DECIMAL(65,30)) / `u8`)))
+M V NULL	-726.0000000000000000000000000000000000	-726.0000000000000000000000000000000000	-725.9999999999999995092417338118361520	NULL	-725.9999999999999999999999999999999993	-725.9999999999999995485982726730599629	-725.9999999999999999994887018078097756	-726.0000000000000000000000000000000000	-726.0000000000000000000000000000000000	-725.9999999999999999999999999999999993	-725.9999999999999999999999977592606772	NULL	-726.0000000000000000000000000000000000	-725.9999999999999995092417338118361520	NULL	-725.9999999999999999999999999999999993	-725.9999999999999995485982726730599629	-725.9999999999999999994887018078097756	-726.0000000000000000000000000000000000	-726.0000000000000000000000000000000000	-725.9999999999999999999999999999999993	-725.9999999999999999999999977592606772	NULL
+M T NEWDECIMAL 67 34 - 63
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+Y V NULL	-726.000000000000000000000000000000	-726.000000000000000000000000000000	-725.999999999999999509241733811836	NULL	-726.000000000000000000000000000000	-725.999999999999999548598272673060	-725.999999999999999999488701807810	-726.000000000000000000000000000000	-726.000000000000000000000000000000	-726.000000000000000000000000000000	-725.999999999999999999999997759261	NULL	-726.000000000000000000000000000000	-725.999999999999999509241733811836	NULL	-726.000000000000000000000000000000	-725.999999999999999548598272673060	-725.999999999999999999488701807810	-726.000000000000000000000000000000	-726.000000000000000000000000000000	-726.000000000000000000000000000000	-725.999999999999999999999997759261	NULL
+Y T NEWDECIMAL 67 30 - 63
+Y W W 1365 Division by 0
+Y W W 1365 Division by 0
+Y W W 1365 Division by 0
+Y W W 1365 Division by 0
+# == NOT (x IS NULL) is x IS NOT NULL on both servers, and the other way round
+Q (NOT ((785 - -9223372036854775807) IS NOT NULL))
+M V 0
+M T LONG 1 0 N 63
+Y V 0
+Y T LONGLONG 1 0 N 63
+Q (NOT (((1e308 * 10) * (2147483647 - 100)) IS NULL))
+M X 1690
+M T LONG 1 0 N 63
+Y X 1690
+Y T LONGLONG 1 0 N 63
+# == MariaDB's LEAST and GREATEST with a NULL among numbers compare doubles; only NULLs are the NULL type
+Q ((GREATEST(-18446744073709551616, 0, NULL) + (9223372036854775808 * 697)) IS NULL)
+M X 1690
+M T LONG 1 0 N 63
+Y V 1
+Y T LONGLONG 1 0 N 63
+Q (LEAST(NULL, 32767, -0.001) * (`u8` + 5))
+M X 1690
+M T DOUBLE 20 3 - 63
+Y V NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+Y T NEWDECIMAL 31 3 - 63
+Q (LEAST(0.5, NULL, 312) - (-128 - 9223372036854775808))
+M X 1690
+M T DOUBLE 18 1 - 63
+Y V NULL
+Y T NEWDECIMAL 24 1 - 63
+Q (LEAST(NULL, 2147483647) - 0.5)
+M V NULL
+M T DOUBLE 18 1 - 63
+Y V NULL
+Y T NEWDECIMAL 14 1 - 63
+Q LEAST(NULL, NULL)
+M V NULL
+M T NULL 0 0 - 63
+Y V NULL
+Y T NULL 0 0 - 63
+# == An unsigned DIV with a negative quotient fails; MariaDB also refuses one that truncates to zero
+Q (9223372036854775808 DIV (1.5e0 - 9223372036854775807))
+M X 1690
+M T LONGLONG 19 0 U 63
+M W W 1916 Got overflow when converting '-0' to UNSIGNED INT. Value truncated
+Y V 0
+Y T LONGLONG 21 0 U 63
+Q (`u8` DIV -18446744073709551616)
+M X 1690
+M T LONGLONG 20 0 U 63
+M W W 1916 Got overflow when converting '-0' to UNSIGNED INT. Value truncated
+Y V 0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	0	0	0	0	0	0
+Y T LONGLONG 20 0 U 63
+Q ((`i4` + `i1`) DIV (`u4` % `f8`))
+M X 1690
+M T LONGLONG 11 0 U 63
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+M W W 1916 Got overflow when converting '-4' to UNSIGNED INT. Value truncated
+Y X 1690
+Y T LONGLONG 21 0 U 63
+Y W W 1365 Division by 0
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DECIMAL value: '-4'
+Q ((CAST(9223372036854775807 AS UNSIGNED) % (`i4` / `f8`)) DIV ((`d2` / 245) + (287 - 1.5)))
+M X 1690
+M T LONGLONG 21 0 U 63
+M W W 1365 Division by 0
+M W W 1916 Got overflow when converting '-22613078775832' to UNSIGNED INT. Value truncated
+Y X 1690
+Y T LONGLONG 21 0 U 63
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DECIMAL value: '-22613078775832'
+Q (18446744073709551615 DIV '.5')
+M X 1690
+M T LONGLONG 20 0 U 63
+M W W 1916 Got overflow when converting '36893488147419103230' to UNSIGNED INT. Value truncated
+Y X 1690
+Y T LONGLONG 21 0 U 63
+Y W W 1292 Truncated incorrect DECIMAL value: '36893488147419103230'
+# == MariaDB computes with a date as a decimal: a difference is signed
+Q (`dt` - `u4`)
+M V 20240115	20240228	20231229	-4275267194	99991231	10000094	20000129	20241221	20144792	19190704	20380116	19998564	NULL	20000229	NULL	99991228	19190704	20165695	NULL	20240015	10000094	NULL	-4275267194	20210326
+M T LONGLONG 12 0 - 63
+Y X 1690
+Y T LONGLONG 11 0 U 63
+Q (`dt` + `u4`)
+M V 20240115	20240230	20231233	4314667396	99991231	10000108	20000329	20241241	20275864	21190704	20380122	20023254	NULL	20000229	NULL	99991234	21190704	20296767	NULL	20240215	10000108	NULL	4314667396	20210330
+M T LONGLONG 12 0 - 63
+Y V 20240115	20240230	20231233	4314667396	99991231	10000108	20000329	20241241	20275864	21190704	20380122	20023254	NULL	20000229	NULL	99991234	21190704	20296767	NULL	20240215	10000108	NULL	4314667396	20210330
+Y T LONGLONG 11 0 U 63
+# == Dates compare by their fields: a zero month sorts before the first month
+Q (`dt0` < '2024-00-10')
+M V 0	0	1	1	0	1	1	0	1	1	0	1	NULL	1	1	0	1	0	0	1	1	0	1	1
+M T LONG 1 0 - 63
+Y X 1525
+Y W W 1292 Incorrect datetime value: '2024-00-10' for column 'dt0' at row 1
+K Y w
+Q ('2024-00-10' <= `dtm`)
+M V 1	1	0	0	1	0	0	1	0	0	1	0	NULL	0	0	1	0	0	1	NULL	0	1	0	0
+M T LONG 1 0 - 63
+Y X 1525
+Y W W 1292 Incorrect datetime value: '2024-00-10' for column 'dtm' at row 1
+K Y w
+Q (CAST('2023-12-31' AS DATE) < '2024-00-10')
+M V 1
+M T LONG 1 0 - 63
+Y X 1525
+Y W W 1292 Truncated incorrect date value: '2024-00-10'
+K Y w
+# == MySQL's EXTRACT: a date that a space and more text follow is that date; a DATE_ADD text is read as text
+Q EXTRACT(DAY_HOUR FROM '2024-01-15 abc')
+M V 1500
+M T LONG 10 0 - 63
+M W W 1292 Truncated incorrect date value: '2024-01-15 abc'
+Y V 1500
+Y T LONGLONG 9 0 - 63
+Y W W 1292 Truncated incorrect time value: '2024-01-15 abc'
+K M x l
+K Y x l
+Q EXTRACT(DAY_MINUTE FROM '2024-01-15 abc')
+M V 150000
+M T LONGLONG 12 0 - 63
+M W W 1292 Truncated incorrect date value: '2024-01-15 abc'
+Y V 150000
+Y T LONGLONG 11 0 - 63
+Y W W 1292 Truncated incorrect time value: '2024-01-15 abc'
+K M x t
+K Y x l
+Q EXTRACT(DAY_HOUR FROM '2024-01-15')
+M V 1500
+M T LONG 10 0 - 63
+Y V 0
+Y T LONGLONG 9 0 - 63
+Y W W 1292 Truncated incorrect time value: '2024-01-15'
+K M l
+K Y l
+Q EXTRACT(DAY_HOUR FROM '2024-01-15 1:2 abc')
+M V 1501
+M T LONG 10 0 - 63
+M W W 1292 Truncated incorrect datetime value: '2024-01-15 1:2 abc'
+Y V 0
+Y T LONGLONG 9 0 - 63
+Y W W 1292 Truncated incorrect time value: '2024-01-15 1:2 abc'
+K M l
+K Y l
+Q EXTRACT(DAY_HOUR FROM '2024-02-30 abc')
+M V NULL
+M T LONG 10 0 - 63
+M W W 1292 Incorrect interval value: '2024-02-30 abc'
+Y V NULL
+Y T LONGLONG 9 0 - 63
+Y W W 1292 Truncated incorrect time value: '2024-02-30 abc'
+K M x l
+K Y x l
+Q EXTRACT(DAY_MINUTE FROM DATE_ADD('2024-1-5 3:4:5', INTERVAL 1.5 DAY))
+M V 70304
+M T LONGLONG 12 0 - 63
+Y V 70304
+Y T LONGLONG 11 0 - 63
+K M t
+K Y l
+Q EXTRACT(DAY_MICROSECOND FROM DATE_SUB(DATE_ADD('20240115103000', INTERVAL -23 QUARTER), INTERVAL '2' DAY))
+M V 13103000000000
+M T LONGLONG 20 0 - 63
+Y V 13103000000000
+Y T LONGLONG 20 0 - 63
+K M t
+# == MariaDB's EXTRACT of a cast that is no date is NULL
+Q EXTRACT(HOUR_SECOND FROM CAST('2023-02-29' AS DATE))
+M V NULL
+M T LONG 7 0 - 63
+M W W 1292 Incorrect datetime value: '2023-02-29'
+Y V NULL
+Y T LONGLONG 8 0 - 63
+Y W W 1292 Incorrect datetime value: '2023-02-29'
+K Y l
+Q EXTRACT(DAY_SECOND FROM CAST('2023-02-29' AS DATETIME(6)))
+M V NULL
+M T LONG 9 0 - 63
+M W W 1292 Incorrect datetime value: '2023-02-29'
+Y V NULL
+Y T LONGLONG 13 0 - 63
+Y W W 1292 Incorrect datetime value: '2023-02-29'
+K Y l
+# == The all-zero date keeps year 0 when written with two digits
+Q MONTH('00:00:00')
+M V 0
+M T LONG 2 0 - 63
+Y V NULL
+Y T LONGLONG 3 0 - 63
+Y W W 1292 Incorrect datetime value: '00:00:00'
+K Y l
+Q MONTH(DATE_FORMAT('240115', '%H:%i:%s'))
+M V 0
+M T LONG 2 0 - 63
+Y V NULL
+Y T LONGLONG 3 0 - 63
+Y W W 1292 Incorrect datetime value: '00:00:00'
+K Y l
+# == Numbers as dates: thirteen digits are YYYYMMDDhhmmss; MySQL's date parts read seven digits as YYYYMMDD
+Q DATE(EXTRACT(DAY_MICROSECOND FROM `dtm`))
+M V NULL	NULL	3100-00-00	NULL	NULL	0100-00-00	2912-00-00	NULL	NULL	0406-07-08	NULL	NULL	NULL	2912-00-00	NULL	NULL	0406-07-08	3100-00-00	NULL	NULL	0100-00-00	NULL	NULL	NULL
+M T DATE 10 0 - 63
+M W W 1292 Incorrect datetime value: '15103000000000'
+M W W 1292 Incorrect datetime value: '29235959999999'
+M W W 1292 Incorrect datetime value: '1000001500000'
+M W W 1292 Incorrect datetime value: '31235959999999'
+M W W 1292 Incorrect datetime value: '31235959500000'
+M W W 1292 Incorrect datetime value: '28023000000000'
+M W W 1292 Incorrect datetime value: '19031407000000'
+M W W 1292 Incorrect datetime value: '9014640123456'
+M W W 1292 Incorrect datetime value: '9014640123456'
+M W W 1292 Incorrect datetime value: '31235959999999'
+M W W 1292 Incorrect datetime value: '31235959500000'
+M W W 1292 Incorrect datetime value: '19031407000000'
+M W W 1292 Incorrect datetime value: '1000001500000'
+M W W 1292 Incorrect datetime value: '28023000000000'
+Y V NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	0406-07-08	NULL	NULL	NULL	NULL	NULL	NULL	0406-07-08	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+Y T DATE 10 0 - 63
+Y W W 1292 Incorrect datetime value: '15103000000000'
+Y W W 1292 Incorrect datetime value: '29235959999999'
+Y W W 1292 Incorrect datetime value: '31000000000000'
+Y W W 1292 Incorrect datetime value: '1000001500000'
+Y W W 1292 Incorrect datetime value: '31235959999999'
+Y W W 1292 Incorrect datetime value: '1000000000000'
+Y W W 1292 Incorrect datetime value: '29120000000000'
+Y W W 1292 Incorrect datetime value: '31235959500000'
+Y W W 1292 Incorrect datetime value: '28023000000000'
+Y W W 1292 Incorrect datetime value: '19031407000000'
+Y W W 1292 Incorrect datetime value: '9014640123456'
+Y W W 1292 Incorrect datetime value: '29120000000000'
+Y W W 1292 Incorrect datetime value: '9014640123456'
+Y W W 1292 Incorrect datetime value: '31235959999999'
+Y W W 1292 Incorrect datetime value: '31000000000000'
+Y W W 1292 Incorrect datetime value: '31235959500000'
+Y W W 1292 Incorrect datetime value: '1000000000000'
+Y W W 1292 Incorrect datetime value: '19031407000000'
+Y W W 1292 Incorrect datetime value: '1000001500000'
+Y W W 1292 Incorrect datetime value: '28023000000000'
+Q QUARTER(1000000)
+M V NULL
+M T LONG 1 0 - 63
+M W W 1292 Incorrect datetime value: '1000000'
+Y V 0
+Y T LONGLONG 2 0 - 63
+K Y l
+Q DATE_FORMAT((`dtm` / `dt`), '%Y-%m-%d')
+M V NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+M T VAR_STRING 40 0 - 224
+M W W 1292 Incorrect datetime value: '1000000.005088903'
+M W W 1292 Incorrect datetime value: '1000000.011657970865794057'
+M W W 1292 Incorrect datetime value: '1000000.000000000'
+M W W 1292 Incorrect datetime value: '1000000.000000076141741608'
+M W W 1292 Incorrect datetime value: '1000000.002359806931459819'
+M W W 1292 Incorrect datetime value: '1000000.000000000'
+M W W 1292 Incorrect datetime value: '1000000.005999931'
+M W W 1292 Incorrect datetime value: '1000000.011657369060211802'
+M W W 1292 Incorrect datetime value: '1000000.001138032'
+M W W 1292 Incorrect datetime value: '1000000.003006734683446401'
+M W W 1292 Incorrect datetime value: '1000000.001541060'
+M W W 1292 Incorrect datetime value: '1000000.000731607117697651'
+M W W 1292 Incorrect datetime value: '1000000.005999931'
+M W W 1292 Incorrect datetime value: '1000000.000731607117697651'
+M W W 1292 Incorrect datetime value: '1000000.002359806931459819'
+M W W 1292 Incorrect datetime value: '1000000.003006734683446401'
+M W W 1292 Incorrect datetime value: '1000000.000000000'
+M W W 1292 Incorrect datetime value: '1000000.000000000'
+M W W 1292 Incorrect datetime value: '1000000.001541060'
+M W W 1292 Incorrect datetime value: '1000000.000000076141741608'
+M W W 1292 Incorrect datetime value: '1000000.001138032'
+Y V 0100-00-00	0100-00-00	0100-00-00	0100-00-00	0100-00-00	0100-00-00	0100-00-00	0100-00-00	0100-00-00	0100-00-00	0100-00-00	0100-00-00	NULL	0100-00-00	0100-00-00	0100-00-00	0100-00-00	0100-00-00	NULL	NULL	0100-00-00	0100-00-00	0100-00-00	0100-00-00
+Y T VAR_STRING 40 31 - 255
+Y W W 1292 Truncated incorrect date value: '1000000.005088903'
+Y W W 1292 Truncated incorrect date value: '1000000.011657970865794057'
+Y W W 1292 Truncated incorrect date value: '1000000.000000076141741608'
+Y W W 1292 Truncated incorrect date value: '1000000.002359806931459819'
+Y W W 1292 Truncated incorrect date value: '1000000.005999931'
+Y W W 1292 Truncated incorrect date value: '1000000.011657369060211802'
+Y W W 1292 Truncated incorrect date value: '1000000.001138032'
+Y W W 1292 Truncated incorrect date value: '1000000.003006734683446401'
+Y W W 1292 Truncated incorrect date value: '1000000.001541060'
+Y W W 1292 Truncated incorrect date value: '1000000.000731607117697651'
+Y W W 1292 Truncated incorrect date value: '1000000.005999931'
+Y W W 1292 Truncated incorrect date value: '1000000.000731607117697651'
+Y W W 1292 Truncated incorrect date value: '1000000.002359806931459819'
+Y W W 1292 Truncated incorrect date value: '1000000.003006734683446401'
+Y W W 1292 Truncated incorrect date value: '1000000.001541060'
+Y W W 1292 Truncated incorrect date value: '1000000.000000076141741608'
+Y W W 1292 Truncated incorrect date value: '1000000.001138032'
+K M l
+K Y w l
+Q DATE_FORMAT(TIMESTAMPDIFF(MICROSECOND, `dt0`, '2024-02-29'), '%')
+M V %	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	%	NULL	NULL	NULL	NULL	NULL	NULL
+M T VAR_STRING 4 0 - 224
+M W W 1292 Incorrect datetime value: '-86399000000'
+M W W 1292 Incorrect datetime value: '5184000000000'
+M W W 1292 Incorrect datetime value: '1709164799000000'
+M W W 1292 Incorrect datetime value: '-251693135999000000'
+M W W 1292 Incorrect datetime value: '32319388800000000'
+M W W 1292 Incorrect datetime value: '757339200000000'
+M W W 1292 Incorrect datetime value: '-26524799000000'
+M W W 1292 Incorrect datetime value: '92266200000000'
+M W W 1292 Incorrect datetime value: '146944372000000'
+M W W 1292 Incorrect datetime value: '-438318847000000'
+M W W 1292 Incorrect datetime value: '709164800000000'
+M W W 1292 Incorrect datetime value: '92266200000000'
+M W W 1292 Incorrect datetime value: '1709164799000000'
+M W W 1292 Incorrect datetime value: '-438318847000000'
+M W W 1292 Incorrect datetime value: '32319388800000000'
+M W W 1292 Incorrect datetime value: '-26524799000000'
+M W W 1292 Incorrect datetime value: '5184000000000'
+M W W 1292 Incorrect datetime value: '146944372000000'
+M W W 1292 Incorrect datetime value: '-251693135999000000'
+M W W 1292 Incorrect datetime value: '709164800000000'
+M W W 1292 Incorrect datetime value: '757339200000000'
+Y V %	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	%	NULL	NULL	NULL	NULL	NULL	NULL
+Y T VAR_STRING 4 31 - 255
+Y W W 1292 Incorrect datetime value: '-86399000000'
+Y W W 1292 Incorrect datetime value: '5184000000000'
+Y W W 1292 Incorrect datetime value: '1709164799000000'
+Y W W 1292 Incorrect datetime value: '-251693135999000000'
+Y W W 1292 Incorrect datetime value: '32319388800000000'
+Y W W 1292 Incorrect datetime value: '757339200000000'
+Y W W 1292 Incorrect datetime value: '-26524799000000'
+Y W W 1292 Incorrect datetime value: '92266200000000'
+Y W W 1292 Incorrect datetime value: '146944372000000'
+Y W W 1292 Incorrect datetime value: '-438318847000000'
+Y W W 1292 Incorrect datetime value: '709164800000000'
+Y W W 1292 Incorrect datetime value: '92266200000000'
+Y W W 1292 Incorrect datetime value: '1709164799000000'
+Y W W 1292 Incorrect datetime value: '-438318847000000'
+Y W W 1292 Incorrect datetime value: '32319388800000000'
+Y W W 1292 Incorrect datetime value: '-26524799000000'
+Y W W 1292 Incorrect datetime value: '5184000000000'
+Y W W 1292 Incorrect datetime value: '146944372000000'
+Y W W 1292 Incorrect datetime value: '-251693135999000000'
+Y W W 1292 Incorrect datetime value: '709164800000000'
+Y W W 1292 Incorrect datetime value: '757339200000000'
+K M l
+K Y l
+Q SECOND(EXTRACT(DAY_MICROSECOND FROM `dt`))
+M V 0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	NULL	0	0	0	0	0
+M T LONG 2 0 - 63
+Y V NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+Y T LONGLONG 3 0 - 63
+Y W W 1292 Truncated incorrect time value: '15000000000000'
+Y W W 1292 Truncated incorrect time value: '29000000000000'
+Y W W 1292 Truncated incorrect time value: '31000000000000'
+Y W W 1292 Truncated incorrect time value: '1000000000000'
+Y W W 1292 Truncated incorrect time value: '31000000000000'
+Y W W 1292 Truncated incorrect time value: '1000000000000'
+Y W W 1292 Truncated incorrect time value: '29000000000000'
+Y W W 1292 Truncated incorrect time value: '31000000000000'
+Y W W 1292 Truncated incorrect time value: '28000000000000'
+Y W W 1292 Truncated incorrect time value: '4000000000000'
+Y W W 1292 Truncated incorrect time value: '19000000000000'
+Y W W 1292 Truncated incorrect time value: '9000000000000'
+Y W W 1292 Truncated incorrect time value: '29000000000000'
+Y W W 1292 Truncated incorrect time value: '9000000000000'
+Y W W 1292 Truncated incorrect time value: '31000000000000'
+Y W W 1292 Truncated incorrect time value: '4000000000000'
+Y W W 1292 Truncated incorrect time value: '31000000000000'
+Y W W 1292 Truncated incorrect time value: '15000000000000'
+Y W W 1292 Truncated incorrect time value: '1000000000000'
+Y W W 1292 Truncated incorrect time value: '19000000000000'
+Y W W 1292 Truncated incorrect time value: '1000000000000'
+Y W W 1292 Truncated incorrect time value: '28000000000000'
+K Y l
+# == A date written with colons before a time
+Q HOUR('00:00:00 12:00:00')
+M V 12
+M T LONG 2 0 - 63
+Y V 12
+Y T LONGLONG 4 0 - 63
+Y W W 4095 Delimiter ':' in position 2 in datetime value '00:00:00 12:00:00' at row 1 is deprecated. Prefer the standard '-'.
+K Y w l
+Q HOUR('10:30:00 11:00:00')
+M V NULL
+M T LONG 2 0 - 63
+M W W 1292 Incorrect time value: '10:30:00 11:00:00'
+Y V NULL
+Y T LONGLONG 4 0 - 63
+Y W W 1292 Truncated incorrect time value: '10:30:00 11:00:00'
+K Y x l
+Q EXTRACT(HOUR_MICROSECOND FROM DATE_FORMAT('2024-01-15 abc', '%T %r %f'))
+M V 120000000000
+M T LONGLONG 13 0 - 63
+M W W 1292 Truncated incorrect date value: '2024-01-15 abc'
+M W W 1292 Truncated incorrect datetime value: '00:00:00 12:00:00 AM 000000'
+Y V 120000000000
+Y T LONGLONG 14 0 - 63
+Y W W 1292 Truncated incorrect date value: '2024-01-15 abc'
+Y W W 1292 Truncated incorrect time value: '00:00:00 12:00:00 AM 000000'
+Y W W 4095 Delimiter ':' in position 2 in datetime value '00:00:00 12:00:00 AM 000000' at row 1 is deprecated. Prefer the standard '-'.
+K M w t
+K Y w l
+# == MySQL compares a TIME column with a constant date as times, and a number beyond a time's range as the largest time
+Q (`tm` = CAST('2024-01-15' AS DATE))
+M V 0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	0	0	0	0	0	0
+M T LONG 1 0 - 63
+Y V 0	0	1	0	0	0	0	0	0	0	0	0	NULL	1	0	0	0	0	0	0	0	0	0	0
+Y T LONGLONG 1 0 - 63
+Q (`tm` < CAST('2024-01-15' AS DATE))
+M V 1	1	1	1	1	1	1	1	1	1	1	1	NULL	1	1	1	1	1	1	1	1	1	1	1
+M T LONG 1 0 - 63
+Y V 0	0	0	1	0	1	0	0	0	1	0	0	NULL	0	1	0	1	0	0	0	1	0	0	0
+Y T LONGLONG 1 0 - 63
+Q (CAST('9999-12-31 23:59:59' AS TIME(0)) >= 20240115)
+M V 1
+M T LONG 1 0 - 63
+Y V 0
+Y T LONGLONG 1 0 - 63
+Q (20240115103000 <= CAST('9999-12-31 23:59:59' AS TIME(6)))
+M V 1
+M T LONG 1 0 - 63
+Y V 0
+Y T LONGLONG 1 0 - 63
+Q (CAST('2024-01-15' AS TIME(3)) >= (UNIX_TIMESTAMP('2001-09-09 01:46:40') + 99.99))
+M V 1
+M T LONG 1 0 - 63
+M W W 1292 Truncated incorrect time value: '2024-01-15'
+M W W 1292 Truncated incorrect time value: '999980299.99'
+Y V 0
+Y T LONGLONG 1 0 - 63
+Y W W 1292 Truncated incorrect time value: '2024-01-15'
+K M x
+# == MariaDB's DATE_ADD refuses a day its month lacks
+Q DATE_ADD(STR_TO_DATE('2024-02-30', '%Y-%m-%d'), INTERVAL 0 SECOND_MICROSECOND)
+M V NULL
+M T DATETIME 26 6 - 63
+M W W 1292 Incorrect datetime value: '2024-02-30 00:00:00'
+Y V NULL
+Y T DATETIME 26 6 - 63
+Y W W 1411 Incorrect datetime value: '2024-02-30' for function str_to_date
+# == MariaDB's LPAD and RPAD of a number with a non-ASCII pad
+Q RPAD(`i4`, 10, 'É')
+M V 0Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰	1Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰	-1Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰	2147483647	-214748364	3Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰	100Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰	-10Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰	65536Ã‰Ã‰Ã‰Ã‰Ã‰	1000000Ã‰Ã‰Ã‰	-3Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰	12345Ã‰Ã‰Ã‰Ã‰Ã‰	NULL	100Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰	12345Ã‰Ã‰Ã‰Ã‰Ã‰	-214748364	1000000Ã‰Ã‰Ã‰	-1Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰	-10Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰	0Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰	3Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰	-3Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰Ã‰	2147483647	65536Ã‰Ã‰Ã‰Ã‰Ã‰
+M T VAR_STRING 40 39 - 224
+Y V 0ÉÉÉÉÉÉÉÉÉ	1ÉÉÉÉÉÉÉÉÉ	-1ÉÉÉÉÉÉÉÉ	2147483647	-214748364	3ÉÉÉÉÉÉÉÉÉ	100ÉÉÉÉÉÉÉ	-10ÉÉÉÉÉÉÉ	65536ÉÉÉÉÉ	1000000ÉÉÉ	-3ÉÉÉÉÉÉÉÉ	12345ÉÉÉÉÉ	NULL	100ÉÉÉÉÉÉÉ	12345ÉÉÉÉÉ	-214748364	1000000ÉÉÉ	-1ÉÉÉÉÉÉÉÉ	-10ÉÉÉÉÉÉÉ	0ÉÉÉÉÉÉÉÉÉ	3ÉÉÉÉÉÉÉÉÉ	-3ÉÉÉÉÉÉÉÉ	2147483647	65536ÉÉÉÉÉ
+Y T VAR_STRING 40 31 - 255
+Q LPAD(5, 4, 'é')
+M V ééé5
+M T VAR_STRING 16 39 - 224
+Y V ééé5
+Y T VAR_STRING 16 31 - 255
+# == MariaDB's HEX of a double rounds by adding a half in double arithmetic
+Q HEX((CAST(255 AS CHAR(5)) - (9.007199254740993e15 + -962)))
+M V FFE00000000004C0
+M T VAR_STRING 64 0 - 224
+Y V FFE00000000004C1
+Y T VAR_STRING 64 31 - 255
+# == MariaDB compares two doubles with fixed decimals as equal within half a unit of one more decimal
+Q (((CAST(1.5 AS BINARY(4)) / -18446744073709551615) * LEAST(228, 2.5, 9223372036854775807)) < (-9007199254740993 DIV 18446744073709551615))
+M V 0
+M T LONG 1 0 - 63
+M W W 1292 Truncated incorrect DOUBLE value: '1.5\\x00'
+Y V 1
+Y T LONGLONG 1 0 - 63
+Y W W 1292 Truncated incorrect DOUBLE value: '1.5\\x00'
+K M x
+K Y x
+Q ((1.0000000001 / CAST(1e16 AS SIGNED)) = CAST(-9223372036854775807 AS BINARY(0)))
+M V 1
+M T LONG 1 0 - 63
+M W W 1292 Truncated incorrect BINARY(0) value: '-9223372036854775807'
+M W W 1292 Truncated incorrect DOUBLE value: ''
+Y V 0
+Y T LONGLONG 1 0 - 63
+Y W W 1292 Truncated incorrect BINARY(0) value: '-9223372036854775807'
+Q (((10 DIV TRUE) / -4294967296) = CAST('0.0' AS BINARY))
+M V 1
+M T LONG 1 0 - 63
+Y V 0
+Y T LONGLONG 1 0 - 63
+Q ((1/3) = CAST('0.33333' AS CHAR))
+M V 1
+M T LONG 1 0 - 63
+Y V 0
+Y T LONGLONG 1 0 - 63
+Q ((1/3) = CAST('0.333' AS CHAR))
+M V 0
+M T LONG 1 0 - 63
+Y V 0
+Y T LONGLONG 1 0 - 63
+Q (0.33 = CAST('0.333' AS CHAR))
+M V 1
+M T LONG 1 0 - 63
+Y V 0
+Y T LONGLONG 1 0 - 63
+Q (`d2` = CAST(CONCAT(`d2`, '1') AS CHAR))
+M V 1	1	1	1	1	1	1	1	1	1	1	1	NULL	1	1	1	1	1	1	1	1	1	1	1
+M T LONG 1 0 - 63
+Y V 0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	0	0	0	0	0	0
+Y T LONGLONG 1 0 - 63
+Q (`d2` = CAST('2.5' AS CHAR))
+M V 0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	0	0	0	0	0	0
+M T LONG 1 0 - 63
+Y V 0	0	0	0	0	1	0	0	0	0	0	0	NULL	0	0	0	0	0	0	0	1	0	0	0
+Y T LONGLONG 1 0 - 63
+Q NULLIF((-123456789.123456789 / (`d10` * `d2`)), CAST((`u4` / `d0`) AS CHAR))
+M V NULL	-123456789.1234567890000	-54869684.0548696840000	NULL	NULL	-493827156493827156.0000000000000	-3929751649.4376102395149	-24691357824.6913578000000	-0.0081004455245	-493827156.4938271560000	-39506172.5195061724800	-111222332.5547769981203	NULL	NULL	-111222332.5547769981203	0.4938271565432	-493827156.4938271560000	0.6666666666667	-24691357824.6913578000000	NULL	-493827156493827156.0000000000000	0.0000000000010	0.0000000000000	666703.3299498139004
+M T NEWDECIMAL 36 13 - 63
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+Y V NULL	-123456789.1234567890000	-54869684.0548696840000	0.0000000000000	0.0000000000000	-493827156493827156.0000000000000	-3929751649.4376102395149	-24691357824.6913578000000	-0.0081004455245	-493827156.4938271560000	-39506172.5195061724800	-111222332.5547769981203	NULL	NULL	-111222332.5547769981203	0.4938271565432	-493827156.4938271560000	0.6666666666667	-24691357824.6913578000000	NULL	-493827156493827156.0000000000000	0.0000000000010	0.0000000000000	666703.3299498139004
+Y T NEWDECIMAL 36 13 - 63
+Y W W 1365 Division by 0
+Y W W 1365 Division by 0
+Y W W 1365 Division by 0
+Y W W 1365 Division by 0
+Y W W 1365 Division by 0
+Y W W 1365 Division by 0
+Y W W 1365 Division by 0
+# == MariaDB's NULLIF reads its result's number from the value (GREATEST's string, not the greatest number)
+Q (0 - NULLIF(GREATEST('12abc', '1', 'ab%', '10'), 'abcé'))
+M V 0
+M T DOUBLE 23 31 - 63
+M W W 1292 Truncated incorrect DOUBLE value: 'ab%'
+Y V 0
+Y T DOUBLE 23 31 - 63
+Q (1 / NULLIF(LEAST('abc', '1.50'), `vc`))
+M V 0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666
+M T DOUBLE 23 31 - 63
+Y V 0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666	0.6666666666666666
+Y T DOUBLE 23 31 - 63
+# == MySQL's CASE with a DOUBLE result reads the chosen branch's own double
+Q (CASE WHEN `vb` THEN ((1.5e0 + 9007199254740993) / -9007199254740993) ELSE (CASE WHEN ('ß' / 'x') THEN IFNULL(1000000.000001, `d2`) ELSE (`i4` / `d10`) END) END)
+M V NULL	1	0.6666666666666666	0.000000000021474836	0.000000000021474836	-1.0000000000000002	-1.0000000000000002	20	0.000530841604299816	2000000	-1.0000000000000002	37035.0000037035	NULL	-1.0000000000000002	37035.0000037035	-858993459.2	2000000	-0.000000008100000065	20	0	-1.0000000000000002	-1.0000000000000002	0.000000000021474836	-43690.666666666664
+M T DOUBLE 28 31 - 63
+M W W 1292 Truncated incorrect BOOLEAN value: ''
+M W W 1292 Truncated incorrect DOUBLE value: 'ß'
+M W W 1292 Truncated incorrect DOUBLE value: 'x'
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect BOOLEAN value: 'a'
+M W W 1292 Truncated incorrect DOUBLE value: 'ß'
+M W W 1292 Truncated incorrect DOUBLE value: 'x'
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect BOOLEAN value: 'A'
+M W W 1292 Truncated incorrect DOUBLE value: 'ß'
+M W W 1292 Truncated incorrect DOUBLE value: 'x'
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect BOOLEAN value: 'abc'
+M W W 1292 Truncated incorrect DOUBLE value: 'ß'
+M W W 1292 Truncated incorrect DOUBLE value: 'x'
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect BOOLEAN value: 'ABC '
+M W W 1292 Truncated incorrect DOUBLE value: 'ß'
+M W W 1292 Truncated incorrect DOUBLE value: 'x'
+M W W 1365 Division by 0
+M W N 1292 Truncated incorrect BOOLEAN value: ' 7 '
+M W W 1292 Truncated incorrect BOOLEAN value: 'ete'
+M W W 1292 Truncated incorrect DOUBLE value: 'ß'
+M W W 1292 Truncated incorrect DOUBLE value: 'x'
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect BOOLEAN value: 'B'
+M W W 1292 Truncated incorrect DOUBLE value: 'ß'
+M W W 1292 Truncated incorrect DOUBLE value: 'x'
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect BOOLEAN value: 'a_c'
+M W W 1292 Truncated incorrect DOUBLE value: 'ß'
+M W W 1292 Truncated incorrect DOUBLE value: 'x'
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect BOOLEAN value: 'Z'
+M W W 1292 Truncated incorrect DOUBLE value: 'ß'
+M W W 1292 Truncated incorrect DOUBLE value: 'x'
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect DOUBLE value: 'ß'
+M W W 1292 Truncated incorrect DOUBLE value: 'x'
+M W W 1365 Division by 0
+M W N 1292 Truncated incorrect BOOLEAN value: ' 7 '
+M W W 1292 Truncated incorrect BOOLEAN value: 'Z'
+M W W 1292 Truncated incorrect DOUBLE value: 'ß'
+M W W 1292 Truncated incorrect DOUBLE value: 'x'
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect BOOLEAN value: 'ABC '
+M W W 1292 Truncated incorrect DOUBLE value: 'ß'
+M W W 1292 Truncated incorrect DOUBLE value: 'x'
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect BOOLEAN value: 'a_c'
+M W W 1292 Truncated incorrect DOUBLE value: 'ß'
+M W W 1292 Truncated incorrect DOUBLE value: 'x'
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect DOUBLE value: 'ß'
+M W W 1292 Truncated incorrect DOUBLE value: 'x'
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect BOOLEAN value: 'ete'
+M W W 1292 Truncated incorrect DOUBLE value: 'ß'
+M W W 1292 Truncated incorrect DOUBLE value: 'x'
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect BOOLEAN value: ''
+M W W 1292 Truncated incorrect DOUBLE value: 'ß'
+M W W 1292 Truncated incorrect DOUBLE value: 'x'
+Y V NULL	1	0.6666666666666666	0.000000000021474836	0.000000000021474836	-1.0000000000000002	-1.0000000000000002	20	0.000530841604299816	2000000	-1.0000000000000002	37035.0000037035	NULL	-1.0000000000000002	37035.0000037035	-858993459.2	2000000	-0.000000008100000065	20	0	-1.0000000000000002	-1.0000000000000002	0.000000000021474836	-43690.666666666664
+Y T DOUBLE 23 31 - 63
+Y W W 1292 Truncated incorrect DOUBLE value: 'ß'
+Y W W 1292 Truncated incorrect DOUBLE value: 'x'
+Y W W 1365 Division by 0
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'a'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ß'
+Y W W 1292 Truncated incorrect DOUBLE value: 'x'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'A'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ß'
+Y W W 1292 Truncated incorrect DOUBLE value: 'x'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'abc'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ß'
+Y W W 1292 Truncated incorrect DOUBLE value: 'x'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'ABC '
+Y W W 1292 Truncated incorrect DOUBLE value: 'ß'
+Y W W 1292 Truncated incorrect DOUBLE value: 'x'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'ete'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ß'
+Y W W 1292 Truncated incorrect DOUBLE value: 'x'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'B'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ß'
+Y W W 1292 Truncated incorrect DOUBLE value: 'x'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'a_c'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ß'
+Y W W 1292 Truncated incorrect DOUBLE value: 'x'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'Z'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ß'
+Y W W 1292 Truncated incorrect DOUBLE value: 'x'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'ß'
+Y W W 1292 Truncated incorrect DOUBLE value: 'x'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'Z'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ß'
+Y W W 1292 Truncated incorrect DOUBLE value: 'x'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'ABC '
+Y W W 1292 Truncated incorrect DOUBLE value: 'ß'
+Y W W 1292 Truncated incorrect DOUBLE value: 'x'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'a_c'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ß'
+Y W W 1292 Truncated incorrect DOUBLE value: 'x'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'ß'
+Y W W 1292 Truncated incorrect DOUBLE value: 'x'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'ete'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ß'
+Y W W 1292 Truncated incorrect DOUBLE value: 'x'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'ß'
+Y W W 1292 Truncated incorrect DOUBLE value: 'x'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'abc'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ß'
+Y W W 1292 Truncated incorrect DOUBLE value: 'x'
+Q IF(0, 1e0, (7 / 123456789.123456789))
+M V 0.000000056700000459
+M T DOUBLE 16 31 - 63
+Y V 0.000000056700000459
+Y T DOUBLE 23 31 - 63
+# == MySQL evaluates x in x <=> NULL even when x cannot be NULL
+Q ((CASE (1e16 % 2) WHEN (1e0 - -4294967295) THEN 1 WHEN (18446744073709551615 DIV '.5') THEN 2 ELSE 3 END) <=> NULL)
+M X 1690
+M T LONG 1 0 N 63
+M W W 1916 Got overflow when converting '36893488147419103230' to UNSIGNED INT. Value truncated
+Y X 1690
+Y T LONGLONG 1 0 N 63
+Y W W 1292 Truncated incorrect DECIMAL value: '36893488147419103230'
+# == A string's number beyond a decimal's 65 digits is the largest decimal
+Q ('1e300' DIV 1e300)
+M V 1
+M T LONG 5 0 - 63
+M W W 1916 Got overflow when converting '' to DECIMAL. Value truncated
+M W W 1292 Truncated incorrect DECIMAL value: '1e300'
+M W W 1916 Got overflow when converting '' to DECIMAL. Value truncated
+Y V 1
+Y T LONGLONG 22 0 - 63
+Y W W 1292 Truncated incorrect DECIMAL value: '1'
+Y W W 1292 Truncated incorrect DECIMAL value: '1e300'
+Y W W 1292 Truncated incorrect DECIMAL value: '1'
+K M w
+Q (GREATEST(`u4`, `f8`) DIV (CASE WHEN `d0` THEN `f8` ELSE `vb` END))
+M V NULL	1	-1	1	0	2	1000	1	1	2000000	1	-123450000	NULL	1	NULL	NULL	NULL	NULL	1	-66	14	NULL	NULL	NULL
+M T LONGLONG 21 0 - 63
+M W W 1292 Truncated incorrect DECIMAL value: ''
+M W W 1365 Division by 0
+M W W 1916 Got overflow when converting '' to DECIMAL. Value truncated
+M W W 1916 Got overflow when converting '' to DECIMAL. Value truncated
+M W W 1292 Truncated incorrect DECIMAL value: '1e300'
+M W W 1292 Truncated incorrect DECIMAL value: 'ABC '
+M W W 1365 Division by 0
+M W W 1916 Got overflow when converting '' to DECIMAL. Value truncated
+M W W 1916 Got overflow when converting '' to DECIMAL. Value truncated
+M W W 1292 Truncated incorrect DECIMAL value: '1e300'
+M W W 1292 Truncated incorrect DECIMAL value: 'abc'
+M W W 1365 Division by 0
+Y V NULL	1	-1	1	0	2	1000	1	1	2000000	1	-123450000	NULL	1	NULL	NULL	NULL	NULL	1	-66	14	NULL	NULL	NULL
+Y T LONGLONG 22 0 - 63
+Y W W 1366 Incorrect DECIMAL value: '0' for column '' at row -1
+Y W W 1292 Truncated incorrect DECIMAL value: ''
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DECIMAL value: '1'
+Y W W 1292 Truncated incorrect DECIMAL value: '1'
+Y W W 1366 Incorrect DECIMAL value: '0' for column '' at row -1
+Y W W 1292 Truncated incorrect DECIMAL value: 'ABC '
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DECIMAL value: '1'
+Y W W 1292 Truncated incorrect DECIMAL value: '1'
+Y W W 1366 Incorrect DECIMAL value: '0' for column '' at row -1
+Y W W 1292 Truncated incorrect DECIMAL value: 'abc'
+Y W W 1365 Division by 0
+K M w
+K Y w
+# == MariaDB: a time number whose microseconds are 999999 is no time; MySQL rounds a seventh digit
+Q EXTRACT(SECOND FROM 100.999999)
+M V NULL
+M T LONG 3 0 - 63
+M W W 1292 Incorrect interval value: '100.999999'
+Y V 0
+Y T LONGLONG 3 0 - 63
+Q TIME(100.999999)
+M V NULL
+M T TIME 17 6 - 63
+M W W 1292 Incorrect time value: '100.999999'
+Y V 00:01:00.999999
+Y T TIME 17 6 - 63
+Q HOUR(100.9999999)
+M V NULL
+M T LONG 2 0 - 63
+M W W 1292 Incorrect time value: '100.9999999'
+Y V 0
+Y T LONGLONG 4 0 - 63
+K Y l
+Q TIME(100.9999999)
+M V NULL
+M T TIME 17 6 - 63
+M W W 1292 Incorrect time value: '100.9999999'
+Y V 00:01:01.000000
+Y T TIME 17 6 - 63
+Q EXTRACT(MICROSECOND FROM 100.9999996)
+M V NULL
+M T LONG 7 0 - 63
+M W W 1292 Incorrect interval value: '100.9999996'
+Y V 0
+Y T LONGLONG 7 0 - 63
+Q (CAST('00:01:00' AS TIME) < 100.999999)
+M V 0
+M T LONG 1 0 - 63
+M W W 1292 Truncated incorrect time value: '100.999999'
+Y V 1
+Y T LONGLONG 1 0 - 63
+K M x
+# == MariaDB's EXTRACT of digits: a date for DAY_HOUR, DAY_MINUTE and DAY_SECOND, a duration for DAY_MICROSECOND
+Q EXTRACT(DAY_MINUTE FROM '240115')
+M V 150000
+M T LONGLONG 12 0 - 63
+Y V 2401
+Y T LONGLONG 11 0 - 63
+K M t
+K Y l
+Q EXTRACT(DAY_MINUTE FROM '120000')
+M V 0
+M T LONGLONG 12 0 - 63
+Y V 1200
+Y T LONGLONG 11 0 - 63
+K M t
+K Y l
+Q EXTRACT(HOUR_MINUTE FROM '700101')
+M V 2201
+M T LONG 5 0 - 63
+Y V 7001
+Y T LONGLONG 6 0 - 63
+K Y l
+Q EXTRACT(DAY_HOUR FROM '20240115.5')
+M V 8408
+M T LONG 10 0 - 63
+Y V 838
+Y T LONGLONG 9 0 - 63
+Y W W 1292 Truncated incorrect time value: '20240115.5'
+K M l
+K Y l
+Q EXTRACT(DAY_MICROSECOND FROM '240115')
+M V 1000115000000
+M T LONGLONG 20 0 - 63
+Y V 240115000000
+Y T LONGLONG 20 0 - 63
+K M t
+# == Which error a CASE reports first: MariaDB resolves every WHEN before the THENs, MySQL the operand after the pairs
+Q (CASE (COALESCE('5e-1', `vg`) LIKE CAST(`d0` AS CHAR(3))) WHEN ((`d2` / `d10`) % (`d10` / 127)) THEN ((`bn` COLLATE utf8mb4_general_ci) COLLATE utf8mb4_general_ci) ELSE CAST(('abc' COLLATE utf8mb4_general_ci) AS CHAR(8)) END)
+M X 1253
+Y X 1253
+Q (CASE CAST((`vc` < `vg`) AS CHAR(2)) WHEN 'x' THEN 'b' WHEN ('-' COLLATE utf8mb4_unicode_ci) THEN (`bn` COLLATE utf8mb4_unicode_ci) ELSE CAST(`vb` AS CHAR(8)) END)
+M X 1267
+Y X 1253
+# == MariaDB's '-0' of an unsigned DIV needs two whole numbers; a fraction anywhere gives 0
+Q (0.5 + ((0.001 - `u8`) DIV `u8`))
+M V NULL	0.5	0.5	0.5	NULL	0.5	0.5	0.5	0.5	0.5	0.5	0.5	NULL	0.5	0.5	NULL	0.5	0.5	0.5	0.5	0.5	0.5	0.5	NULL
+M T NEWDECIMAL 25 1 - 63
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+Y V NULL	0.5	0.5	0.5	NULL	0.5	0.5	0.5	0.5	0.5	0.5	0.5	NULL	0.5	0.5	NULL	0.5	0.5	0.5	0.5	0.5	0.5	0.5	NULL
+Y T NEWDECIMAL 25 1 - 63
+Y W W 1365 Division by 0
+Y W W 1365 Division by 0
+Y W W 1365 Division by 0
+Y W W 1365 Division by 0
+K M l
+K Y l
+Q ((100 DIV 0.0) >> ((CAST(1.25 AS UNSIGNED) DIV -1.25) DIV (0 - 230)))
+M V NULL
+M T LONGLONG 21 0 U 63
+M W W 1365 Division by 0
+Y V NULL
+Y T LONGLONG 21 0 U 63
+Y W W 1365 Division by 0
+Q (CAST(1 AS UNSIGNED) DIV -18446744073709551616)
+M V 0
+M T LONG 1 0 U 63
+Y V 0
+Y T LONGLONG 21 0 U 63
+# == MariaDB's TIMESTAMPDIFF takes a day its month lacks
+Q TIMESTAMPDIFF(WEEK, STR_TO_DATE('2024-02-30', '%Y-%m-%d'), '2024-12-31 23:59:59.999999')
+M V 43
+M T LONGLONG 21 0 - 63
+Y V NULL
+Y T LONGLONG 21 0 - 63
+Y W W 1411 Incorrect datetime value: '2024-02-30' for function str_to_date
+# == MariaDB's EXTRACT(DAY_MICROSECOND) of twelve digits or more reads a date and time
+Q EXTRACT(DAY_MICROSECOND FROM '20240115103000')
+M V 15103000000000
+M T LONGLONG 20 0 - 63
+Y V 15103000000000
+Y T LONGLONG 20 0 - 63
+K M t
+# == A NULL left side of IN takes part in the collation check
+Q (NOT (NULL NOT IN (NULL, CAST((120 % `d10`) AS CHAR(1)), (CASE WHEN (`bn` LIKE '') THEN '18446744073709551616' WHEN `vg` THEN '1.5' ELSE `vc` END), `vg`)))
+M X 1271
+Y X 1271
+# == MySQL: NULL <=> x is x IS NULL (x not evaluated when it cannot be NULL); x <=> NULL evaluates x
+Q (NULL <=> (542 * 1e308))
+M X 1690
+M T LONG 1 0 N 63
+Y V 0
+Y T LONGLONG 1 0 N 63
+Q ((542 * 1e308) <=> NULL)
+M X 1690
+M T LONG 1 0 N 63
+Y X 1690
+Y T LONGLONG 1 0 N 63
+# == MySQL: a TIME column against a number compares times; a TIME that is no column compares with a number as numbers, with a string as strings
+Q (20240115103000 = `tm`)
+M V 1	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	0	0	0	0	0	1
+M T LONG 1 0 - 63
+Y V 1	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	0	0	0	0	0	1
+Y T LONGLONG 1 0 - 63
+Y W N 1292 Incorrect time value: '20240115103000' for column 'tm' at row 1
+K Y w
+Q ('10:30:00' >= CAST('20240115103000' AS TIME(4)))
+M V 1
+M T LONG 1 0 - 63
+Y V 0
+Y T LONGLONG 1 0 - 63
+Q (CAST('10:30:00' AS TIME) = '10:30')
+M V 1
+M T LONG 1 0 - 63
+Y V 0
+Y T LONGLONG 1 0 - 63
+Q (CAST('10:30:00' AS TIME) = '10:30:00')
+M V 1
+M T LONG 1 0 - 63
+Y V 1
+Y T LONGLONG 1 0 - 63
+# == MySQL's EXTRACT of DATE_ADD's date text is midnight; of its datetime text, with the day
+Q EXTRACT(HOUR_MICROSECOND FROM DATE_ADD(240115, INTERVAL '2' YEAR_MONTH))
+M V 0
+M T LONGLONG 13 0 - 63
+Y V 0
+Y T LONGLONG 14 0 - 63
+K M t
+K Y l
+# == An empty ESCAPE makes the NUL byte the escape; MariaDB keeps the backslash too
+Q ('a\0b' LIKE 'a\0b' ESCAPE '')
+M V 1
+M T LONG 1 0 N 63
+Y V 0
+Y T LONGLONG 1 0 N 63
+Q ('a_b' LIKE 'a\0_b' ESCAPE '')
+M V 0
+M T LONG 1 0 N 63
+Y V 1
+Y T LONGLONG 1 0 N 63
+Q ('ab' LIKE 'a\0b' ESCAPE '')
+M V 0
+M T LONG 1 0 N 63
+Y V 1
+Y T LONGLONG 1 0 N 63
+Q (20240115 > `tm`)
+M V 0	0	0	1	0	1	0	0	0	1	0	0	NULL	0	1	0	1	0	0	0	1	0	0	0
+M T LONG 1 0 - 63
+Y V 1	1	1	1	1	1	1	1	1	1	1	1	NULL	1	1	1	1	1	1	1	1	1	1	1
+Y T LONGLONG 1 0 - 63
+Y W W 1292 Incorrect time value: '20240115' for column 'tm' at row 1
+K Y w
+Q (`bn` LIKE CAST(IF(1.0000000001, `bn`, ('00012' COLLATE utf8mb4_unicode_ci)) AS CHAR(3)) ESCAPE '')
+M V 1	1	1	1	0	1	0	1	0	1	1	1	NULL	1	1	1	1	0	1	0	1	0	1	1
+M T LONG 1 0 - 63
+M W W 1292 Truncated incorrect CHAR(3) value: 'ABC '
+M W W 1292 Truncated incorrect CHAR(3) value: '12abc'
+M W W 1292 Truncated incorrect CHAR(3) value: '12abc'
+M W W 1292 Truncated incorrect CHAR(3) value: 'ABC '
+Y V 1	1	1	1	0	1	0	1	0	1	1	1	NULL	1	1	1	1	0	1	0	1	0	1	1
+Y T LONGLONG 1 0 - 63
+Y W W 1292 Truncated incorrect CHAR(3) value: 'ABC '
+Y W W 1292 Truncated incorrect CHAR(3) value: '12abc'
+Y W W 1292 Truncated incorrect CHAR(3) value: '12abc'
+Y W W 1292 Truncated incorrect CHAR(3) value: 'ABC '
+# == SUBSTRING with an unsigned length column of zero
+Q SUBSTRING(`vc`, 1, `u4`)
+M V 	a	A	abc		1	12abc	été	b	ab%	1e2	z	NULL		NULL	ABC	1	12abc	été	b	ab%	NULL	z	
+M T VAR_STRING 320 39 - 224
+Y V 	a	A	abc		1	12abc	été	b	ab%	1e2	z	NULL		NULL	ABC	1	12abc	été	b	ab%	NULL	z	
+Y T VAR_STRING 80 31 - 255
+K M l
+Q SUBSTRING((CASE WHEN CAST(`i4` AS CHAR) THEN (`vb` COLLATE utf8mb4_bin) ELSE `vc` END), 1, `u4`)
+M V 	a	A	abc		12	 7 	ete	B	a_c	0.5	Z	NULL		NULL	ABC	a_c	NULL	ete	b	12	NULL	abc	B
+M T VAR_STRING 320 39 - 224
+Y V 	a	A	abc		12	 7 	ete	B	a_c	0.5	Z	NULL		NULL	ABC	a_c	NULL	ete	b	12	NULL	abc	B
+Y T VAR_STRING 80 31 - 255
+K M l
+# == MariaDB's DATE_ADD text of a constant CAST(x AS CHAR) has the fraction digits written there
+Q DATE_SUB(CAST('2024-12-31 23:59:59.999999' AS CHAR), INTERVAL 1.5 MINUTE)
+M V 2024-12-31 23:57:59.999999
+M T STRING 104 6 - 224
+Y V 2024-12-31 23:57:59.999999
+Y T STRING 116 31 - 255
+Q DATE_SUB(CAST('2024-1-5 3:4:5' AS CHAR), INTERVAL 26 SECOND)
+M V 2024-01-05 03:03:39
+M T STRING 76 0 - 224
+Y V 2024-01-05 03:03:39
+Y T STRING 116 31 - 255
+# == A double read as a date or time by its exact binary value
+Q UNIX_TIMESTAMP(20240115103003.14159e0)
+M V 1705294803.140625
+M T NEWDECIMAL 24 6 - 63
+Y V 1705294803.140625
+Y T NEWDECIMAL 19 6 N 63
+K M l
+K Y l n
+Q CAST(20240115103003.14159e0 AS DATETIME(6))
+M V 2024-01-15 10:30:03.140625
+M T DATETIME 26 6 - 63
+Y V 2024-01-15 10:30:03.140625
+Y T DATETIME 26 6 - 63
+Q TIME(103003.14159e0)
+M V 10:30:03.141589
+M T TIME 17 6 - 63
+Y V 10:30:03.141590
+Y T TIME 17 6 - 63
+Q UNIX_TIMESTAMP((CAST('2024-01-15T10:30:00' AS DATETIME(0)) + 3.141592653589793e0))
+M V 1705294803.140625
+M T NEWDECIMAL 24 6 - 63
+Y V 1705294803.140625
+Y T NEWDECIMAL 19 6 - 63
+K M l
+K Y l
+# == MySQL: a constant left operand of <=> that is NULL leaves the right one unevaluated when it cannot be NULL
+Q (((0.05 / CAST('a_c' AS UNSIGNED)) / -9007199254740993) <=> (CAST('10' AS UNSIGNED) * (1e10 - 1e308)))
+M X 1690
+M T LONG 1 0 N 63
+M W W 1292 Truncated incorrect INTEGER value: 'a_c'
+M W W 1365 Division by 0
+Y V 0
+Y T LONGLONG 1 0 N 63
+Y W W 1292 Truncated incorrect INTEGER value: 'a_c'
+Y W W 1365 Division by 0
+K Y w
+# == MySQL: a number that is no time leaves a comparison with a TIME column NULL
+Q (20240115 <=> `tm`)
+M V 0	0	1	0	0	0	0	0	0	0	0	0	0	1	0	0	0	0	0	0	0	0	0	0
+M T LONG 1 0 N 63
+Y V 0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0
+Y T LONGLONG 1 0 N 63
+Y W W 1292 Incorrect time value: '20240115' for column 'tm' at row 1
+K Y w
+Q (20240115 = `tm`)
+M V 0	0	1	0	0	0	0	0	0	0	0	0	NULL	1	0	0	0	0	0	0	0	0	0	0
+M T LONG 1 0 - 63
+Y V 0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	0	0	0	0	0	0
+Y T LONGLONG 1 0 - 63
+Y W W 1292 Incorrect time value: '20240115' for column 'tm' at row 1
+K Y w
+# == MySQL's LOCATE takes a string of no collation derivation; MariaDB refuses it
+Q LOCATE('aBc', (CASE WHEN `i1` THEN `vg` WHEN `i4` THEN CAST(4294967295 AS CHAR(6)) END), 5)
+M V NULL	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	0	0	0	0	0	0
+M T LONG 11 0 - 63
+M W W 1292 Truncated incorrect CHAR(6) value: '4294967295'
+Y V NULL	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	0	0	0	0	0	0
+Y T LONGLONG 11 0 - 63
+Y W W 1292 Truncated incorrect CHAR(6) value: '4294967295'
+# == SPACE and REPEAT read a string count with wrap-around
+Q SPACE('9223372036854775808')
+M V 
+M T VAR_STRING 0 39 - 224
+Y V 
+Y T VAR_STRING 0 31 - 255
+Q REPEAT('a', '18446744073709551616')
+M V 
+M T VAR_STRING 0 39 - 224
+M W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+M W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+Y V 
+Y T LONG_BLOB 67108864 31 - 255
+Y W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+Y W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
+K Y t
+# == IS NOT NULL of a row expression that cannot be NULL is true, unevaluated
+Q (((2e-3 - `d2`) <=> (`u4` DIV -1)) IS NOT NULL)
+M V 1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1
+M T LONG 1 0 N 63
+Y V 1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1
+Y T LONGLONG 1 0 N 63
+# == MySQL's EXTRACT counts the day of DATE_ADD's date result
+Q EXTRACT(DAY_HOUR FROM DATE_SUB(`dt`, INTERVAL '2' YEAR_MONTH))
+M V 1500	2900	3100	100	3100	100	2900	3100	2800	400	1900	900	NULL	2900	900	3100	400	3100	NULL	1500	100	1900	100	2800
+M T LONG 5 0 - 63
+Y V 1500	2900	3100	100	3100	100	2900	3100	2800	400	1900	900	NULL	2900	900	3100	400	3100	NULL	1500	100	1900	100	2800
+Y T LONGLONG 9 0 - 63
+K Y l
+Q EXTRACT(DAY_HOUR FROM DATE_SUB(`dt`, INTERVAL 1 DAY))
+M V 1400	2800	3000	3100	3000	3100	2800	3000	2700	300	1800	800	NULL	2800	800	3000	300	3000	NULL	1400	3100	1800	3100	2700
+M T LONG 5 0 - 63
+Y V 1400	2800	3000	3100	3000	3100	2800	3000	2700	300	1800	800	NULL	2800	800	3000	300	3000	NULL	1400	3100	1800	3100	2700
+Y T LONGLONG 9 0 - 63
+K Y l
+Q EXTRACT(DAY_HOUR FROM CAST('2024-01-15' AS DATE))
+M V 1500
+M T LONG 5 0 - 63
+Y V 0
+Y T LONGLONG 9 0 - 63
+K Y l
+# == MySQL's IFNULL and COALESCE with a DOUBLE result read the argument's own double
+Q IFNULL(((2147483648 % `i4`) / `f8`), (CASE ('A' * `i4`) WHEN (128 / `i4`) THEN CAST('1e2' AS DECIMAL(65,30)) WHEN `vb` THEN `i4` WHEN (`d2` * `d0`) THEN (724 / `u4`) END))
+M V 0	0	0	0.000000000000001	0	0.8	480	8e-300	0	967296	0.5714285714285714	-91730000	NULL	0.00038880000353808	0.000000000009173	0	1000000	0.011047363	8e-300	0	4	-1999999999999999.8	-10000	65536
+M T DOUBLE 67 31 - 63
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect DOUBLE value: 'A'
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect DOUBLE value: ''
+M W W 1292 Truncated incorrect DOUBLE value: 'A'
+M W W 1292 Truncated incorrect DOUBLE value: 'A'
+M W W 1292 Truncated incorrect DOUBLE value: 'a_c'
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect DOUBLE value: 'A'
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect DOUBLE value: 'A'
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect DOUBLE value: ''
+M W W 1292 Truncated incorrect DOUBLE value: 'A'
+M W W 1292 Truncated incorrect DOUBLE value: 'B'
+Y V 0	0	-0	0.000000000000001	-0	0.8	480	8e-300	0	967296	0.5714285714285714	-91730000	NULL	0.00038880000353808	0.000000000009173	0	1000000	0.011047363	8e-300	0	4	-1999999999999999.8	-10000	65536
+Y T DOUBLE 23 31 - 63
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'A'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'A'
+Y W W 1292 Truncated incorrect DOUBLE value: 'A'
+Y W W 1292 Truncated incorrect DOUBLE value: 'a_c'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'A'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'A'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DOUBLE value: 'A'
+Y W W 1292 Truncated incorrect DOUBLE value: 'B'
+Q COALESCE((1/3), 1e0)
+M V 0.333333333
+M T DOUBLE 7 31 N 63
+Y V 0.333333333
+Y T DOUBLE 23 31 N 63
+# == MySQL evaluates a constant list for NULL IN (...)
+Q (NULL IN (((CASE NULL WHEN 1000 THEN 0.0 ELSE 3.141592653589793e0 END) + -128), 559, ((1e308 DIV -127) - ('1.' / 60))))
+M V NULL
+M T LONG 1 0 - 63
+Y X 1690
+Y W W 1292 Truncated incorrect DECIMAL value: '1'
+Y W W 1292 Truncated incorrect DECIMAL value: '-787401574803149606299212598425196850393700787401574803149606299'
+K Y w
+# == A text that reaches a binary result keeps its character set: MariaDB's COALESCE and CASE, MySQL's COALESCE (CHAR_LENGTH counts characters; MariaDB's LPAD counts bytes)
+Q CHAR_LENGTH(COALESCE(`vc`, `bn`))
+M V 0	1	1	3	4	1	5	3	1	3	3	1	NULL	1	3	4	1	5	3	1	3	3	1	0
+M T LONG 10 0 - 63
+Y V 0	1	1	3	4	1	5	3	1	3	3	1	NULL	1	3	4	1	5	3	1	3	3	1	0
+Y T LONGLONG 10 0 - 63
+Q CHAR_LENGTH((CASE `i1` WHEN 99 THEN `bn` ELSE `vc` END))
+M V 0	1	1	3	4	1	5	3	1	3	3	1	NULL	1	3	4	1	5	3	1	3	3	1	0
+M T LONG 10 0 - 63
+Y V 0	1	1	3	4	1	5	5	1	3	3	1	NULL	1	3	4	1	5	5	1	3	3	1	0
+Y T LONGLONG 10 0 - 63
+Q CHAR_LENGTH((CASE WHEN 0 THEN CAST('-1e30' AS BINARY) ELSE 'abcé' END))
+M V 4
+M T LONG 10 0 - 63
+Y V 5
+Y T LONGLONG 10 0 - 63
+Q CHAR_LENGTH(IF(0, `bn`, `vc`))
+M V 0	1	1	3	4	1	5	5	1	3	3	1	NULL	1	3	4	1	5	5	1	3	3	1	0
+M T LONG 10 0 - 63
+Y V 0	1	1	3	4	1	5	5	1	3	3	1	NULL	1	3	4	1	5	5	1	3	3	1	0
+Y T LONGLONG 10 0 - 63
+Q CHAR_LENGTH(IFNULL(`vc`, `bn`))
+M V 0	1	1	3	4	1	5	5	1	3	3	1	NULL	1	3	4	1	5	5	1	3	3	1	0
+M T LONG 10 0 - 63
+Y V 0	1	1	3	4	1	5	5	1	3	3	1	NULL	1	3	4	1	5	5	1	3	3	1	0
+Y T LONGLONG 10 0 - 63
+# == MariaDB's IF of an unsigned integer and NULL stays unsigned
+Q (65535 + (IF(`f8`, 18446744073709551615, NULL) + (-`i4`)))
+M X 1690
+M T LONGLONG 22 0 U 63
+Y X 1690
+Y T LONGLONG 22 0 U 63
+Q IF(1, 18446744073709551615, NULL)
+M V 18446744073709551615
+M T LONGLONG 20 0 U 63
+Y V 18446744073709551615
+Y T LONGLONG 20 0 U 63
+Q COALESCE(NULL, 18446744073709551615)
+M V 18446744073709551615
+M T NEWDECIMAL 21 0 N 63
+Y V 18446744073709551615
+Y T LONGLONG 20 0 UN 63
+# == MariaDB rounds a quotient beyond 38 digits after the point
+Q ((CAST(-5 AS DECIMAL(65,30)) / (`d2` - `u8`)) / `i4`)
+M V NULL	NULL	-1.42857142857142857142857142857142857143	0.00000000000000000000000000012621774489	-0.00000000000000002328306436771526932740	0.19607843137254901960784313725490196078	0.00000000000000000000542101086242752217	-0.00000000000000005551115123125782079658	0.00000000000001776356890457975242062715	0.00000000000000000500000000000250000000	-0.28985507246376811594202898550724637681	0.00000000000000410085054686707757442469	NULL	0.02512562814070351758793969849246231156	0.00000000000000000000002195630158941888	-0.00000000000000002328306436771526932740	0.00000047619047619047619047619047619048	-0.00000000000000000054210108624275221692	-0.00000000000000005551115123125782079658	NULL	0.00000000000166666666667083333333334375	-0.28985507246376811594202898550724637681	0.00000000000000000002359799565123135443	-0.00000061801494785338193600648035641960
+M T NEWDECIMAL 67 38 - 63
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+Y V NULL	NULL	-1.428571428571428571428571428571	0.000000000000000000000000000126	-0.000000000000000023283064367715	0.196078431372549019607843137255	0.000000000000000000005421010862	-0.000000000000000055511151231258	0.000000000000017763568904579752	0.000000000000000005000000000003	-0.289855072463768115942028985507	0.000000000000004100850546867078	NULL	0.025125628140703517587939698492	0.000000000000000000000021956302	-0.000000000000000023283064367715	0.000000476190476190476190476190	-0.000000000000000000542101086243	-0.000000000000000055511151231258	NULL	0.000000000001666666666670833333	-0.289855072463768115942028985507	0.000000000000000000023597995651	-0.000000618014947853381936006480
+Y T NEWDECIMAL 67 30 - 63
+Y W W 1365 Division by 0
+Y W W 1365 Division by 0
+Y W W 1365 Division by 0
+# == MySQL casts an unsigned decimal beyond the signed range to SIGNED by wrapping; a signed one sticks
+Q CAST((18446744073709551615 / `u4`) AS SIGNED)
+M V NULL	9223372036854775807	9223372036854775807	4294967297	NULL	2635249153387078802	184467440737095516	1844674407370955162	281474976710656	18446744073710	6148914691236517205	1494268454735484	NULL	NULL	NULL	6148914691236517205	18446744073710	281474976710656	1844674407370955162	184467440737095516	2635249153387078802	NULL	4294967297	9223372036854775807
+M T LONGLONG 21 0 - 63
+M W W 1365 Division by 0
+M W W 1916 Got overflow when converting '18446744073709551615.000000000' to INT. Value truncated
+M W W 1916 Got overflow when converting '9223372036854775807.500000000' to INT. Value truncated
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+M W W 1916 Got overflow when converting '9223372036854775807.500000000' to INT. Value truncated
+Y V NULL	-1	-9223372036854775808	4294967297	NULL	2635249153387078802	184467440737095516	1844674407370955162	281474976710656	18446744073710	6148914691236517205	1494268454735484	NULL	NULL	NULL	6148914691236517205	18446744073710	281474976710656	1844674407370955162	184467440737095516	2635249153387078802	NULL	4294967297	-9223372036854775808
+Y T LONGLONG 21 0 - 63
+Y W W 1365 Division by 0
+Y W W 1365 Division by 0
+Y W W 1365 Division by 0
+Q CAST(`d0` AS SIGNED)
+M V 0	1	-1	9223372036854775807	-9223372036854775808	3	10	-10	9223372036854775807	2	100	7	NULL	9223372036854775807	9223372036854775807	NULL	3	0	-10	-1	2	-9223372036854775808	NULL	10
+M T LONGLONG 21 0 - 63
+M W W 1916 Got overflow when converting '99999999999999999999' to INT. Value truncated
+M W W 1916 Got overflow when converting '-99999999999999999999' to INT. Value truncated
+M W W 1916 Got overflow when converting '18446744073709551616' to INT. Value truncated
+M W W 1916 Got overflow when converting '18446744073709551616' to INT. Value truncated
+M W W 1916 Got overflow when converting '99999999999999999999' to INT. Value truncated
+M W W 1916 Got overflow when converting '-99999999999999999999' to INT. Value truncated
+Y V 0	1	-1	9223372036854775807	-9223372036854775808	3	10	-10	9223372036854775807	2	100	7	NULL	9223372036854775807	9223372036854775807	NULL	3	0	-10	-1	2	-9223372036854775808	NULL	10
+Y T LONGLONG 21 0 - 63
+Y W W 1292 Truncated incorrect DECIMAL value: '99999999999999999999'
+Y W W 1292 Truncated incorrect DECIMAL value: '-99999999999999999999'
+Y W W 1292 Truncated incorrect DECIMAL value: '18446744073709551616'
+Y W W 1292 Truncated incorrect DECIMAL value: '18446744073709551616'
+Y W W 1292 Truncated incorrect DECIMAL value: '99999999999999999999'
+Y W W 1292 Truncated incorrect DECIMAL value: '-99999999999999999999'
+# == MySQL's NULLIF hands its argument's own text to a string reader
+Q (CASE IFNULL((529 DIV `i4`), (`i1` * `f8`)) WHEN ((CAST('%' AS DECIMAL(20,5)) % 1e-15) * (`d10` + `i4`)) THEN NULLIF((CASE CAST(1e10 AS CHAR) WHEN '-1e30' THEN `f8` ELSE `d0` END), 'abc ') WHEN '%' THEN ('abd' COLLATE utf8mb4_bin) ELSE '_' END)
+M V NULL	_	_	1e20	-1e20	_	_	_	1.8446744073709552e19	2	_	7	_	_	1e20	NULL	3	_	_	_	_	_	NULL	10
+M T VAR_STRING 88 39 - 224
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+M W W 1292 Truncated incorrect DOUBLE value: 'abc '
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+M W W 1292 Truncated incorrect DOUBLE value: '%'
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+M W W 1292 Truncated incorrect DOUBLE value: '%'
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+M W W 1292 Truncated incorrect DOUBLE value: '%'
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+M W W 1292 Truncated incorrect DOUBLE value: '%'
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+M W W 1292 Truncated incorrect DOUBLE value: '%'
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+M W W 1292 Truncated incorrect DOUBLE value: '%'
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+M W W 1292 Truncated incorrect DOUBLE value: '%'
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+M W W 1292 Truncated incorrect DOUBLE value: '%'
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+M W W 1292 Truncated incorrect DOUBLE value: '%'
+M W W 1365 Division by 0
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+M W W 1292 Truncated incorrect DOUBLE value: '%'
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+M W W 1292 Truncated incorrect DOUBLE value: '%'
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+M W W 1292 Truncated incorrect DOUBLE value: '%'
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+M W W 1292 Truncated incorrect DECIMAL value: '%'
+Y V NULL	_	_	99999999999999999999	-99999999999999999999	_	_	_	18446744073709551616	2	_	7	_	_	99999999999999999999	NULL	3	_	_	_	_	_	NULL	10
+Y T VAR_STRING 88 31 - 255
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+Y W W 1292 Truncated incorrect DOUBLE value: 'abc '
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+Y W W 1292 Truncated incorrect DOUBLE value: '%'
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+Y W W 1292 Truncated incorrect DOUBLE value: '%'
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+Y W W 1292 Truncated incorrect DOUBLE value: '%'
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+Y W W 1292 Truncated incorrect DOUBLE value: '%'
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+Y W W 1292 Truncated incorrect DOUBLE value: '%'
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+Y W W 1292 Truncated incorrect DOUBLE value: '%'
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+Y W W 1292 Truncated incorrect DOUBLE value: '%'
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+Y W W 1292 Truncated incorrect DOUBLE value: '%'
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+Y W W 1292 Truncated incorrect DOUBLE value: '%'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+Y W W 1292 Truncated incorrect DOUBLE value: '%'
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+Y W W 1292 Truncated incorrect DOUBLE value: '%'
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+Y W W 1292 Truncated incorrect DOUBLE value: '%'
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+Y W W 1292 Truncated incorrect DECIMAL value: '%'
+K M w
+K Y w l
+# == MySQL keeps a difference of two unsigned decimals unsigned, and refuses a negative one
+Q ((`u8` / `u4`) - `u4`)
+M V NULL	0.0000	-1.0000	2.0000	NULL	-5.4286	92233720368547658.0800	900719925474089.3000	0.0000	0.0000	-0.6667	7988095.0243	NULL	NULL	NULL	-3.0000	-1000000.0000	140737488289792.0000	900719925474089.3000	42949572.9600	142857142850.1429	NULL	-4294967272.0044	-2.0000
+M T NEWDECIMAL 26 4 U 63
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+Y X 1690
+Y T NEWDECIMAL 26 4 U 63
+Y W W 1365 Division by 0
+K M t
+Q (-99.99 IN (0.10, ((`u8` / `u4`) - `u4`)))
+M V NULL	0	0	0	NULL	0	0	0	0	0	0	0	NULL	NULL	NULL	0	0	0	0	0	0	NULL	0	0
+M T LONG 1 0 - 63
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+Y X 1690
+Y T LONGLONG 1 0 - 63
+Y W W 1365 Division by 0
+# == MySQL compares a DATE column with a constant number as dates
+Q (20240115103000 <=> `dt`)
+M V 0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0
+M T LONG 1 0 N 63
+Y V 1	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0	0	0
+Y T LONGLONG 1 0 N 63
+Y W N 1292 Incorrect date value: '20240115103000' for column 'dt' at row 1
+K Y w
+Q (20240115103000 = `dt`)
+M V 0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	NULL	0	0	0	0	0
+M T LONG 1 0 - 63
+Y V 1	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	NULL	1	0	0	0	0
+Y T LONGLONG 1 0 - 63
+Y W N 1292 Incorrect date value: '20240115103000' for column 'dt' at row 1
+K Y w
+Q ('2024-01-15 10:30:00' = `dt`)
+M V 0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	NULL	0	0	0	0	0
+M T LONG 1 0 - 63
+Y V 0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	NULL	0	0	0	0	0
+Y T LONGLONG 1 0 - 63
+# == MariaDB's empty ESCAPE under a binary comparison is the NUL byte alone
+Q (`bn` LIKE 'ab\\%' ESCAPE '')
+M V 0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	0	0	0	0	0	0
+M T LONG 1 0 - 63
+Y V 0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	0	0	0	0	0	0
+Y T LONGLONG 1 0 - 63
+Q (`bn` LIKE 'ab\\%')
+M V 0	0	0	0	0	0	0	0	0	1	0	0	NULL	0	0	0	1	0	0	0	0	0	0	0
+M T LONG 1 0 - 63
+Y V 0	0	0	0	0	0	0	0	0	1	0	0	NULL	0	0	0	1	0	0	0	0	0	0	0
+Y T LONGLONG 1 0 - 63
+# == MariaDB sends an unsigned DIV result of decimals beyond the signed range as signed
+Q (CAST(950 AS UNSIGNED) DIV (1e-16 + FALSE))
+M V -8946744073709551616
+M T LONG 3 0 U 63
+Y V 9500000000000000000
+Y T LONGLONG 21 0 U 63
+Q (950 DIV 1e-16)
+M X 1690
+M T LONG 3 0 - 63
+M W W 1916 Got overflow when converting '9500000000000000000' to INT. Value truncated
+Y X 1690
+Y T LONGLONG 22 0 - 63
+Y W W 1292 Truncated incorrect DECIMAL value: '9500000000000000000'
+# == MariaDB's TRUNCATE of a decimal by a column keeps no more decimals than its type
+Q TRUNCATE(((CAST(172 AS UNSIGNED) + `d0`) - (12345678901234567890.5 / `d10`)), `d0`)
+M V NULL	-12345678901234567717.50000	8230452600823045430.00000	100000000000000000170.87654	0.00000	-123456789012345678904999999825.00000	-3929751645900833576.71693	24691357800000000000.00000	18446743973709551877.99999	-24691357802469135607.00000	-4938271560493826884.20000	-37037036707407407163.24074	NULL	NULL	62962963292592592828.75925	NULL	-24691357802469135606.00000	-99999999738.00000	24691357800000000000.00000	-3929751645900833580.00000	-123456789012345678904999999826.00000	0.00000	NULL	8230452600823045442.33333
+M T NEWDECIMAL 38 5 - 63
+M W W 1365 Division by 0
+M W W 1916 Got overflow when converting '99999999999999999999' to INT. Value truncated
+M W W 1916 Got overflow when converting '-99999999999999999999' to INT. Value truncated
+M W W 1916 Got overflow when converting '18446744073709551616' to INT. Value truncated
+M W W 1365 Division by 0
+M W W 1916 Got overflow when converting '18446744073709551616' to INT. Value truncated
+M W W 1916 Got overflow when converting '99999999999999999999' to INT. Value truncated
+M W W 1916 Got overflow when converting '-99999999999999999999' to INT. Value truncated
+Y V NULL	-12345678901234567717.50000	8230452600823045430.00000	100000000000000000170.87654	0.00000	-123456789012345678904999999825.00000	-3929751645900833576.71693	24691357800000000000.00000	18446743973709551877.99999	-24691357802469135607.00000	-4938271560493826884.20000	-37037036707407407163.24074	NULL	NULL	62962963292592592828.75925	NULL	-24691357802469135606.00000	-99999999738.00000	24691357800000000000.00000	-3929751645900833580.00000	-123456789012345678904999999826.00000	0.00000	NULL	8230452600823045442.33333
+Y T NEWDECIMAL 38 5 - 63
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DECIMAL value: '99999999999999999999'
+Y W W 1292 Truncated incorrect DECIMAL value: '-99999999999999999999'
+Y W W 1292 Truncated incorrect DECIMAL value: '18446744073709551616'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DECIMAL value: '18446744073709551616'
+Y W W 1292 Truncated incorrect DECIMAL value: '99999999999999999999'
+Y W W 1292 Truncated incorrect DECIMAL value: '-99999999999999999999'
+Q ROUND(((CAST(172 AS UNSIGNED) + `d0`) - (12345678901234567890.5 / `d10`)), `d0`)
+M V NULL	-12345678901234567717.50000	8230452600823045430.00000	100000000000000000170.87654	0.00000	-123456789012345678904999999825.00000	-3929751645900833576.71694	24691357800000000000.00000	18446743973709551878.00000	-24691357802469135607.00000	-4938271560493826884.20000	-37037036707407407163.24074	NULL	NULL	62962963292592592828.75926	NULL	-24691357802469135606.00000	-99999999738.00000	24691357800000000000.00000	-3929751645900833590.00000	-123456789012345678904999999826.00000	0.00000	NULL	8230452600823045442.33333
+M T NEWDECIMAL 38 5 - 63
+M W W 1365 Division by 0
+M W W 1916 Got overflow when converting '99999999999999999999' to INT. Value truncated
+M W W 1916 Got overflow when converting '-99999999999999999999' to INT. Value truncated
+M W W 1916 Got overflow when converting '18446744073709551616' to INT. Value truncated
+M W W 1365 Division by 0
+M W W 1916 Got overflow when converting '18446744073709551616' to INT. Value truncated
+M W W 1916 Got overflow when converting '99999999999999999999' to INT. Value truncated
+M W W 1916 Got overflow when converting '-99999999999999999999' to INT. Value truncated
+Y V NULL	-12345678901234567717.50000	8230452600823045430.00000	100000000000000000170.87654	0.00000	-123456789012345678904999999825.00000	-3929751645900833576.71694	24691357800000000000.00000	18446743973709551878.00000	-24691357802469135607.00000	-4938271560493826884.20000	-37037036707407407163.24074	NULL	NULL	62962963292592592828.75926	NULL	-24691357802469135606.00000	-99999999738.00000	24691357800000000000.00000	-3929751645900833590.00000	-123456789012345678904999999826.00000	0.00000	NULL	8230452600823045442.33333
+Y T NEWDECIMAL 38 5 - 63
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DECIMAL value: '99999999999999999999'
+Y W W 1292 Truncated incorrect DECIMAL value: '-99999999999999999999'
+Y W W 1292 Truncated incorrect DECIMAL value: '18446744073709551616'
+Y W W 1365 Division by 0
+Y W W 1292 Truncated incorrect DECIMAL value: '18446744073709551616'
+Y W W 1292 Truncated incorrect DECIMAL value: '99999999999999999999'
+Y W W 1292 Truncated incorrect DECIMAL value: '-99999999999999999999'
+# == MySQL's DAYNAME read as a number is the weekday's
+Q CAST(DAYNAME(`dt`) AS DECIMAL(20,6))
+M V 0.000000	0.000000	0.000000	0.000000	0.000000	0.000000	0.000000	0.000000	0.000000	0.000000	0.000000	0.000000	NULL	0.000000	0.000000	0.000000	0.000000	0.000000	NULL	0.000000	0.000000	0.000000	0.000000	0.000000
+M T NEWDECIMAL 22 6 - 63
+M W W 1292 Truncated incorrect DECIMAL value: 'Monday'
+M W W 1292 Truncated incorrect DECIMAL value: 'Thursday'
+M W W 1292 Truncated incorrect DECIMAL value: 'Sunday'
+M W W 1292 Truncated incorrect DECIMAL value: 'Thursday'
+M W W 1292 Truncated incorrect DECIMAL value: 'Friday'
+M W W 1292 Truncated incorrect DECIMAL value: 'Wednesday'
+M W W 1292 Truncated incorrect DECIMAL value: 'Tuesday'
+M W W 1292 Truncated incorrect DECIMAL value: 'Tuesday'
+M W W 1292 Truncated incorrect DECIMAL value: 'Sunday'
+M W W 1292 Truncated incorrect DECIMAL value: 'Thursday'
+M W W 1292 Truncated incorrect DECIMAL value: 'Tuesday'
+M W W 1292 Truncated incorrect DECIMAL value: 'Sunday'
+M W W 1292 Truncated incorrect DECIMAL value: 'Tuesday'
+M W W 1292 Truncated incorrect DECIMAL value: 'Sunday'
+M W W 1292 Truncated incorrect DECIMAL value: 'Friday'
+M W W 1292 Truncated incorrect DECIMAL value: 'Thursday'
+M W W 1292 Truncated incorrect DECIMAL value: 'Sunday'
+M W W 1292 Truncated incorrect DECIMAL value: 'Monday'
+M W W 1292 Truncated incorrect DECIMAL value: 'Wednesday'
+M W W 1292 Truncated incorrect DECIMAL value: 'Tuesday'
+M W W 1292 Truncated incorrect DECIMAL value: 'Thursday'
+M W W 1292 Truncated incorrect DECIMAL value: 'Sunday'
+Y V 0.000000	3.000000	6.000000	3.000000	4.000000	2.000000	1.000000	1.000000	6.000000	3.000000	1.000000	6.000000	NULL	1.000000	6.000000	4.000000	3.000000	6.000000	NULL	0.000000	2.000000	1.000000	3.000000	6.000000
+Y T NEWDECIMAL 22 6 - 63
+Q CAST(DAYNAME(FROM_UNIXTIME(1700000000.123456)) AS DOUBLE)
+M V 0
+M T DOUBLE 22 31 - 63
+M W W 1292 Truncated incorrect DOUBLE value: 'Wednesday'
+Y V 2
+Y T DOUBLE 23 31 - 63
+Q (DAYNAME('2024-01-17') + 0)
+M V 0
+M T DOUBLE 17 0 - 63
+M W W 1292 Truncated incorrect DOUBLE value: 'Wednesday'
+Y V 2
+Y T DOUBLE 23 31 - 63
+# == MySQL compares a string computed per row that is no date as the zero date
+Q (DAYNAME(`dt`) > `dt0`)
+M V 0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	NULL	0	0	0	0	0
+M T LONG 1 0 - 63
+M W W 1292 Truncated incorrect datetime value: 'Monday'
+M W W 1292 Truncated incorrect datetime value: 'Thursday'
+M W W 1292 Truncated incorrect datetime value: 'Sunday'
+M W W 1292 Truncated incorrect datetime value: 'Thursday'
+M W W 1292 Truncated incorrect datetime value: 'Friday'
+M W W 1292 Truncated incorrect datetime value: 'Wednesday'
+M W W 1292 Truncated incorrect datetime value: 'Tuesday'
+M W W 1292 Truncated incorrect datetime value: 'Tuesday'
+M W W 1292 Truncated incorrect datetime value: 'Sunday'
+M W W 1292 Truncated incorrect datetime value: 'Thursday'
+M W W 1292 Truncated incorrect datetime value: 'Tuesday'
+M W W 1292 Truncated incorrect datetime value: 'Sunday'
+M W W 1292 Truncated incorrect datetime value: 'Tuesday'
+M W W 1292 Truncated incorrect datetime value: 'Sunday'
+M W W 1292 Truncated incorrect datetime value: 'Friday'
+M W W 1292 Truncated incorrect datetime value: 'Thursday'
+M W W 1292 Truncated incorrect datetime value: 'Sunday'
+M W W 1292 Truncated incorrect datetime value: 'Monday'
+M W W 1292 Truncated incorrect datetime value: 'Wednesday'
+M W W 1292 Truncated incorrect datetime value: 'Tuesday'
+M W W 1292 Truncated incorrect datetime value: 'Thursday'
+M W W 1292 Truncated incorrect datetime value: 'Sunday'
+Y V 0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	NULL	0	0	0	0	0
+Y T LONGLONG 1 0 - 63
+Y W W 1292 Incorrect datetime value: 'Monday'
+Y W W 1292 Incorrect datetime value: 'Thursday'
+Y W W 1292 Incorrect datetime value: 'Sunday'
+Y W W 1292 Incorrect datetime value: 'Thursday'
+Y W W 1292 Incorrect datetime value: 'Friday'
+Y W W 1292 Incorrect datetime value: 'Wednesday'
+Y W W 1292 Incorrect datetime value: 'Tuesday'
+Y W W 1292 Incorrect datetime value: 'Tuesday'
+Y W W 1292 Incorrect datetime value: 'Sunday'
+Y W W 1292 Incorrect datetime value: 'Thursday'
+Y W W 1292 Incorrect datetime value: 'Tuesday'
+Y W W 1292 Incorrect datetime value: 'Sunday'
+Y W W 1292 Incorrect datetime value: 'Tuesday'
+Y W W 1292 Incorrect datetime value: 'Sunday'
+Y W W 1292 Incorrect datetime value: 'Friday'
+Y W W 1292 Incorrect datetime value: 'Thursday'
+Y W W 1292 Incorrect datetime value: 'Sunday'
+Y W W 1292 Incorrect datetime value: 'Monday'
+Y W W 1292 Incorrect datetime value: 'Wednesday'
+Y W W 1292 Incorrect datetime value: 'Tuesday'
+Y W W 1292 Incorrect datetime value: 'Thursday'
+Y W W 1292 Incorrect datetime value: 'Sunday'
+K M x
+# == MySQL compares a number within a time's hours with a TIME column by its minutes and seconds as they are
+Q (TO_DAYS('2024-01-15') <= `tm`)
+M V 1	1	1	0	1	0	1	1	1	0	1	1	NULL	1	0	1	0	1	1	1	0	1	1	1
+M T LONG 1 0 - 63
+M W W 1292 Truncated incorrect time value: '739265'
+Y V 0	0	0	0	1	0	0	0	1	0	0	0	NULL	0	0	1	0	0	0	1	0	0	0	0
+Y T LONGLONG 1 0 - 63
+Y W W 1292 Incorrect time value: '739265' for column 'tm' at row 1
+K M w
+K Y w
+# == MySQL rounds a seventh fraction digit of a double read as a datetime
+Q DATE_ADD(CAST(`dtm` AS DOUBLE), INTERVAL 10 QUARTER)
+M V 2026-07-15 10:30:00.000000	NULL	2026-06-30 00:00:00.000000	1972-07-01 00:00:01.500000	NULL	1002-07-01 00:00:00.000000	2002-08-29 12:00:00.000000	2027-06-30 23:59:59.500000	2023-09-28 02:30:00.000000	2022-01-04 06:07:08.089843	2040-07-19 03:14:07.000000	2004-03-09 01:46:40.125000	NULL	2002-08-29 12:00:00.000000	2004-03-09 01:46:40.125000	NULL	2022-01-04 06:07:08.089843	2026-06-30 00:00:00.000000	2027-06-30 23:59:59.500000	NULL	1002-07-01 00:00:00.000000	2040-07-19 03:14:07.000000	1972-07-01 00:00:01.500000	2023-09-28 02:30:00.000000
+M T STRING 104 6 - 224
+M W W 1292 Incorrect datetime value: '20240229235960'
+M W W 1292 Incorrect datetime value: '99991231235960'
+M W W 1292 Incorrect datetime value: '99991231235960'
+Y V 2026-07-15 10:30:00	NULL	2026-06-30 00:00:00	1972-07-01 00:00:01.500000	NULL	1002-07-01 00:00:00	2002-08-29 12:00:00	2027-06-30 23:59:59.500000	2023-09-28 02:30:00	2022-01-04 06:07:08.089844	2040-07-19 03:14:07	2004-03-09 01:46:40.125000	NULL	2002-08-29 12:00:00	2004-03-09 01:46:40.125000	NULL	2022-01-04 06:07:08.089844	2026-06-30 00:00:00	2027-06-30 23:59:59.500000	NULL	1002-07-01 00:00:00	2040-07-19 03:14:07	1972-07-01 00:00:01.500000	2023-09-28 02:30:00
+Y T STRING 116 31 - 255
+Y W W 1292 Incorrect datetime value: '20240229235960'
+Y W W 1292 Incorrect datetime value: '99991231235960'
+Y W W 1292 Incorrect datetime value: '0'
+Y W W 1292 Incorrect datetime value: '99991231235960'
+Y W W 1292 Incorrect datetime value: '0'
+K Y w
+# == MariaDB has no compound interval for an unsigned integer beyond the signed range
+Q DATE_ADD('2024-01-15', INTERVAL 18446744073709551615 DAY_MICROSECOND)
+M V NULL
+M T STRING 104 6 - 224
+Y V NULL
+Y T STRING 116 31 - 255
+Y W W 1441 Datetime function: date_add_interval field overflow
+K Y x
+Q DATE_ADD('2024-01-15', INTERVAL 9223372036854775807 DAY_MICROSECOND)
+M V 2024-01-15 00:00:00.922337
+M T STRING 104 6 - 224
+Y V NULL
+Y T STRING 116 31 - 255
+Y W W 1441 Datetime function: date_add_interval field overflow
+K Y x
+Q DATE_ADD('2024-01-15', INTERVAL 1234567 DAY_MICROSECOND)
+M V 2024-01-15 00:00:00.123456
+M T STRING 104 6 - 224
+Y V 2024-01-15 00:00:01.234567
+Y T STRING 116 31 - 255
+# == A negative zero met while the statement is prepared (a constant IN list) counts too
+Q (0 IN (130.501, (128 / (-18446744073709551616 * 942))))
+M V 0
+M T LONG 1 0 - 63
+Y V 1
+Y T LONGLONG 1 0 - 63
+K M v=negative-zero
+# == MySQL's LPAD counts a binary string that reaches a text result by its bytes
+Q LPAD(COALESCE((CASE WHEN (('-1' <> ' 12 ') XOR CAST('1.5' AS BINARY)) THEN CAST('abc' AS BINARY) WHEN 1.5e-5 THEN 'é' WHEN (-10 <=> 9223372036854775807) THEN '1' END), ('1e30' COLLATE utf8mb4_unicode_ci), ('a%' COLLATE utf8mb4_unicode_ci)), 9, 'a')
+M V aaaaaaaaé
+M T VAR_STRING 36 39 - 224
+Y V aaaaaaaé
+Y T VAR_STRING 36 31 - 255
+# == MariaDB's nested CASE hands a text branch's characters on through a binary result
+Q CHAR_LENGTH((CASE WHEN `i1` = 99 THEN CAST('x' AS BINARY) ELSE (CASE WHEN `i1` = 98 THEN `bn` ELSE `vg` END) END))
+M V 0	1	1	3	4	3	2	3	1	2	3	10	NULL	1	3	3	3	0	3	1	2	4	10	2
+M T LONG 10 0 - 63
+Y V 0	1	1	3	4	3	2	5	2	2	3	10	NULL	2	3	3	3	0	5	1	2	4	10	2
+Y T LONGLONG 10 0 - 63
+# == MariaDB's SUBSTRING counts a passed-through text's characters
+Q SUBSTRING((CASE `f8` WHEN `d0` THEN `bn` WHEN `i8` THEN `bn` ELSE `vc` END), -2)
+M V 			bc	C 		bc	té		b%	e2		NULL		bc	C 		\0	té		b%	e2		
+M T VAR_STRING 2 39 - 63
+Y V 			bc	C 		bc	é		b%	e2		NULL		bc	C 		\0	é		b%	e2		
+Y T VAR_STRING 2 31 - 63
+K M l
+K Y l
+# == MariaDB reads an unsigned decimal shift count over the unsigned range, 32 bits of it
+Q (`u8` << (18446744073709551615 / `u4`))
+M V NULL	0	2	18446744073709551614	NULL	0	0	0	4294967296	0	0	0	NULL	NULL	NULL	0	0	9223372036854775808	0	0	0	NULL	197530864200	0
+M T LONGLONG 21 0 U 63
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+M W W 1365 Division by 0
+Y V NULL	0	0	0	NULL	0	0	0	0	0	0	0	NULL	NULL	NULL	0	0	0	0	0	0	NULL	0	0
+Y T LONGLONG 21 0 U 63
+Y W W 1365 Division by 0
+Y W W 1365 Division by 0
+Y W W 1365 Division by 0
+# == MariaDB shows no more fraction digits than its nine-digit groups leave
+Q TRUNCATE((`d0` * `u8`), 4294967295)
+M V 0.00000000000000000000000000000000000000	1.00000000000000000000000000000000000000	-2.00000000000000000000000000000000000000	1844674407370955161481553255926290448385.000000000000000000000000000000000000	0.00000000000000000000000000000000000000	33.00000000000000000000000000000000000000	92233720368547758080.00000000000000000000000000000000000000	-90071992547409930.00000000000000000000000000000000000000	79228162514264337593543950336.00000000000000000000000000000000000000	2000000000000.00000000000000000000000000000000000000	700.00000000000000000000000000000000000000	691358024700.00000000000000000000000000000000000000	NULL	36893488147419103232.00000000000000000000000000000000000000	1844674407370955161481553255926290448385.000000000000000000000000000000000000	NULL	33.00000000000000000000000000000000000000	0.00000000000000000000000000000000000000	-90071992547409930.00000000000000000000000000000000000000	-4294967296.00000000000000000000000000000000000000	2000000000000.00000000000000000000000000000000000000	-699999999999999999993.00000000000000000000000000000000000000	NULL	0.00000000000000000000000000000000000000
+M T NEWDECIMAL 80 38 - 63
+Y V 0	1	-2	1844674407370955161481553255926290448385	0	33	92233720368547758080	-90071992547409930	79228162514264337593543950336	2000000000000	700	691358024700	NULL	36893488147419103232	1844674407370955161481553255926290448385	NULL	33	0	-90071992547409930	-4294967296	2000000000000	-699999999999999999993	NULL	0
+Y T NEWDECIMAL 41 0 - 63
+K M l
+# == MariaDB's unsigned DIV: a dividend beyond the signed range keeps its unsigned quotient
+Q (CAST(-509 AS UNSIGNED) DIV 1e0)
+M V 18446744073709551107
+M T LONGLONG 20 0 U 63
+M W N 1105 Cast to unsigned converted negative integer to it's positive complement
+Y V 18446744073709551107
+Y T LONGLONG 21 0 U 63
+# == MariaDB walks an IN list with a string item among numbers, stopping at the first match
+Q (0 IN ('ß', '0x10', (9223372036854775807 * -4294967295)))
+M V 1
+M T LONG 1 0 N 63
+M W W 1292 Truncated incorrect DECIMAL value: 'ß'
+Y V 1
+Y T LONGLONG 1 0 N 63
+Y W W 1292 Truncated incorrect DOUBLE value: 'ß'
+Q ((('9223372036854775808' COLLATE utf8mb4_general_ci) = 'x') IN (('ß' COLLATE utf8mb4_general_ci), '0x10', (9223372036854775807 * -4294967295)))
+M V 1
+M T LONG 1 0 - 63
+M W W 1292 Truncated incorrect DECIMAL value: 'ß'
+Y V 1
+Y T LONGLONG 1 0 - 63
+Y W W 1292 Truncated incorrect DOUBLE value: 'ß'
+Q (0 IN (0, (9223372036854775807 * 2)))
+M X 1690
+Y X 1690
+# == MariaDB answers a CASE whose every result is NULL without looking at its conditions
+Q (CASE WHEN (((`d2` % -5) - (-`i4`)) <=> (`u8` + -5)) THEN NULL END)
+M V NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+M T NULL 0 0 - 63
+Y X 1690
+Y T NULL 0 0 - 63

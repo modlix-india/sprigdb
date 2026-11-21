@@ -174,6 +174,7 @@ impl Caps {
                 common
                     | Caps::MARIADB_CLIENT_STMT_BULK_OPERATIONS
                     | Caps::MARIADB_CLIENT_EXTENDED_METADATA
+                    | Caps::MARIADB_CLIENT_CACHE_METADATA
             }
         }
     }

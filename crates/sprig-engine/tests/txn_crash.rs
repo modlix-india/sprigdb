@@ -104,15 +104,25 @@ fn client(engine: &Engine, acks: &Mutex<Acks>, stop: &AtomicBool, seed: u64, tid
             ks.sort_unstable();
             let val = Bytes::from(format!("w{tid}.{n}"));
             let mut seen = Vec::new();
+            let mut failed = false;
             for &ki in &ks {
                 match t.lock_get_blocking(&key(ki), LockRequest::for_update()) {
                     Ok(Locked::Row(Some(v))) => seen.push((ki, v)),
                     Ok(_) => {}
-                    Err(_) => return,
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
                 }
                 if t.put(key(ki), val.clone()).is_err() {
-                    return;
+                    failed = true;
+                    break;
                 }
+            }
+            if failed {
+                // A deadlock victim (two clients inserting the same missing
+                // row), or the log has halted: try again until told to stop.
+                continue;
             }
             let Ok(ticket) = t.commit() else { return };
             if ticket.wait().is_err() {

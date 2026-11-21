@@ -10,6 +10,8 @@
 //! - [`ctx`]: a command's view of one Redis database: its key-value
 //!   namespace, the key row, elements, versions and expiry,
 //!   all as SQL through the caller's [`sprig_kv::SqlRunner`].
+//! - [`engine`]: databases stored on SprigDB's storage engine, whose
+//!   commands the session hands to the engine.
 //! - [`batch`]: the hottest writes (`SET`, `INCR`, `HSET`, pushes,
 //!   pops, `ZADD`) as one guarded compound statement.
 //! - [`cmd`]: the commands, by type.
@@ -53,6 +55,7 @@ pub mod batch;
 pub mod cmd;
 pub mod conn;
 pub mod ctx;
+pub mod engine;
 pub mod env;
 pub mod fabric;
 pub mod glob;

@@ -1,7 +1,7 @@
 //! One unit's transaction state: the clock, the lock table, the pending
 //! overlay, read views, and the commit path with early lock release.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
@@ -36,6 +36,23 @@ pub struct TxnStats {
 
 type HeldQueue = (Mutex<VecDeque<(DurableTicket, TxnId)>>, Condvar);
 
+/// A transaction after `XA PREPARE`: it belongs to the unit, not to a
+/// session, until it is committed or rolled back by its XID.
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedTxn {
+    /// The id its locks are held under.
+    pub(crate) id: TxnId,
+    /// Its buffered writes, in key order.
+    pub(crate) writes: Vec<(Bytes, Option<Bytes>)>,
+    /// The log entry of its prepare record.
+    pub(crate) ticket: DurableTicket,
+    /// The durability class its session asked for.
+    pub(crate) durability: Option<Durability>,
+    /// A session is committing or rolling it back right now. It stays
+    /// listed meanwhile, so its XID stays taken.
+    pub(crate) finishing: bool,
+}
+
 /// Per-unit transaction state, shared by every transaction of the unit.
 pub struct TxnShared {
     pub(crate) hlc: Hlc,
@@ -57,6 +74,8 @@ pub struct TxnShared {
     held: Arc<HeldQueue>,
     releaser: OnceLock<()>,
     recovered: OnceLock<()>,
+    /// Prepared (XA) transactions, by XID.
+    prepared: Mutex<HashMap<Vec<u8>, PreparedTxn>>,
     /// Status counters.
     pub stats: TxnStats,
 }
@@ -116,6 +135,7 @@ impl TxnShared {
             held: Arc::default(),
             releaser: OnceLock::new(),
             recovered: OnceLock::new(),
+            prepared: Mutex::new(HashMap::new()),
             stats: TxnStats::default(),
         }
     }
@@ -177,7 +197,82 @@ impl TxnShared {
             if let Some(ts) = path.recovered_max_ts() {
                 self.observe(ts);
             }
+            self.load_prepared(path);
         });
+    }
+
+    /// An id for a transaction that no session opened (a prepared one read
+    /// back after a restart).
+    pub(crate) fn fresh_txn_id(&self) -> TxnId {
+        self.next_txn.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(crate) fn note_rollback(&self) {
+        self.stats.rollbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ----- prepared transactions ---------------------------------------------
+
+    /// Whether a prepared transaction has `xid`.
+    pub(crate) fn xa_known(&self, xid: &[u8]) -> bool {
+        lock_or_recover(&self.prepared).contains_key(xid)
+    }
+
+    /// Queues `prepared`'s record with `propose` and lists it under `xid`,
+    /// in one step, so two sessions can't both prepare one XID.
+    pub(crate) fn xa_register(
+        &self,
+        xid: &[u8],
+        mut prepared: PreparedTxn,
+        propose: impl FnOnce() -> Result<DurableTicket>,
+    ) -> Result<DurableTicket> {
+        let mut list = lock_or_recover(&self.prepared);
+        if list.contains_key(xid) {
+            return Err(super::xa::xaer_dupid());
+        }
+        let ticket = propose()?;
+        prepared.ticket = ticket.clone();
+        list.insert(xid.to_vec(), prepared);
+        Ok(ticket)
+    }
+
+    /// Claims `xid`'s prepared transaction for one session to finish.
+    /// `None`: no such transaction, or another session is finishing it. It
+    /// stays listed until [`TxnShared::xa_finished`].
+    pub(crate) fn xa_claim(&self, xid: &[u8]) -> Option<PreparedTxn> {
+        let mut list = lock_or_recover(&self.prepared);
+        let p = list.get_mut(xid).filter(|p| !p.finishing)?;
+        p.finishing = true;
+        Some(p.clone())
+    }
+
+    /// Ends a claim: the transaction is finished (`done`) and leaves the
+    /// list, or the log refused and it stays prepared.
+    pub(crate) fn xa_finished(&self, xid: &[u8], done: bool) {
+        let mut list = lock_or_recover(&self.prepared);
+        if done {
+            list.remove(xid);
+        } else if let Some(p) = list.get_mut(xid) {
+            p.finishing = false;
+        }
+    }
+
+    /// Lists a prepared transaction read back after a restart.
+    pub(crate) fn xa_restore(&self, xid: &[u8], prepared: PreparedTxn) {
+        lock_or_recover(&self.prepared).insert(xid.to_vec(), prepared);
+    }
+
+    /// The XIDs of the prepared transactions, sorted.
+    pub(crate) fn xa_list(&self) -> Vec<Vec<u8>> {
+        let mut xids: Vec<Vec<u8>> = lock_or_recover(&self.prepared).keys().cloned().collect();
+        xids.sort_unstable();
+        xids
+    }
+
+    /// Prepared transactions waiting to be finished.
+    #[must_use]
+    pub fn prepared_transactions(&self) -> usize {
+        lock_or_recover(&self.prepared).len()
     }
 
     pub(crate) fn next_txn_id(&self) -> TxnId {
@@ -230,13 +325,15 @@ impl TxnShared {
     /// Queues one transaction's writes: takes `cts`, proposes the versions to
     /// the log, publishes them in the overlay, then releases the locks
     /// (early lock release) or hands them to the releaser (released at
-    /// durability).
+    /// durability). `also_delete` is a reserved key the same entry removes
+    /// (a prepared transaction's record).
     pub(crate) fn commit_writes(
         &self,
         path: &dyn CommitPath,
         txn: TxnId,
         writes: Vec<(Bytes, Option<Bytes>)>,
         durability: Option<Durability>,
+        also_delete: Option<&[u8]>,
     ) -> Result<(Ts, DurableTicket)> {
         let size: usize = writes
             .iter()
@@ -251,6 +348,9 @@ impl TxnShared {
                 val.clear();
                 encode_value_into(&mut val, v.as_deref());
                 p.put(Cf::Data, &keys::versioned(k, cts), &val);
+            }
+            if let Some(key) = also_delete {
+                p.delete(Cf::Data, key);
             }
             let ticket = path.propose(p.into_bytes(), durability)?;
             self.overlay

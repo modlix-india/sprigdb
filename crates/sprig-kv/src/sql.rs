@@ -76,6 +76,13 @@ pub trait SqlRunner: Send {
     fn prepares(&self) -> bool {
         false
     }
+    /// Whether the tenant's logical database `database` is placed on the
+    /// storage engine (its `storage.placement` setting is `engine`); the
+    /// Redis front end then runs its Redis databases there. By default
+    /// `false`.
+    fn engine_placed(&self, _database: &str) -> bool {
+        false
+    }
     /// `sql`, with `?` placeholders, prepared once per session and run
     /// with `params` bound as binary strings: its rows. Called only when
     /// [`SqlRunner::prepares`] says so; by default an error.

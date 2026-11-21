@@ -412,6 +412,11 @@ pub trait SortedStore: Send + Sync {
         Ok(Read::Ready(Some(ts)))
     }
 
+    /// Lets go of whatever the store keeps between reads to make them
+    /// cheaper (cursors that pin memtables and files). The engine's
+    /// checkpointer calls it on every tick.
+    fn release_idle_reads(&self) {}
+
     /// A cursor over `cf`, consistent as of its creation.
     // A cursor that seeks both ways, as RocksDB's raw iterator does, not a
     // Rust `Iterator`; the name matches the store it mirrors.

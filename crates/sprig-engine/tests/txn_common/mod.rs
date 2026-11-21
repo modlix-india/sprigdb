@@ -98,9 +98,22 @@ pub fn engine_bed(dir: &Dir, store: StoreKind, sync: SyncMode) -> (Engine, Bed) 
     (e, bed)
 }
 
-/// A prefix-free logical key.
+/// A prefix-free logical key, with the head every engine key has (tenant,
+/// shard, object, kind, index). The engine reads a version's timestamp only
+/// from keys with that head, to start its clock above every recovered
+/// commit; a shorter key would be invisible after a restart that lands in
+/// the same millisecond as its commit.
 pub fn k(s: &str) -> Bytes {
-    let mut v = s.as_bytes().to_vec();
+    let mut v = Vec::with_capacity(sprig_engine::keys::PREFIX_LEN + s.len() + 1);
+    sprig_engine::keys::KeyPrefix {
+        tenant: 7,
+        shard: 0,
+        object: 1,
+        kind: sprig_engine::keys::kind::PRIMARY,
+        index: 0,
+    }
+    .encode_into(&mut v);
+    v.extend_from_slice(s.as_bytes());
     v.push(0);
     Bytes::from(v)
 }

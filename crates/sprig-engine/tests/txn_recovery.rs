@@ -107,3 +107,33 @@ fn engine_reopen_reads_its_last_commits() {
         }
     }
 }
+
+/// Two engines recovered one after the other on the same thread each get
+/// their own log back. raft-engine keeps the last log block it read in a
+/// per-thread cache keyed only by file number, offset and length, so a
+/// second engine whose first block has the same position and size would be
+/// handed the first engine's block. The commit log replays where that
+/// cache can't carry over: on a fresh thread.
+#[test]
+fn engines_recovered_on_one_thread_read_their_own_logs() {
+    fn commit_and_reopen(dir: &Dir, value: &str) -> Option<bytes::Bytes> {
+        {
+            let (_e, b) = engine_bed(dir, StoreKind::Mem, SyncMode::Off);
+            let mut t = b.begin(TxnOptions::mariadb());
+            t.put(k("row"), v(value)).unwrap();
+            t.commit().unwrap().wait().unwrap();
+        }
+        // The in-memory store is rebuilt from the log on this thread.
+        let (_e, b) = engine_bed(dir, StoreKind::Mem, SyncMode::Off);
+        let mut r = b.begin(TxnOptions::mariadb());
+        r.get_snapshot(&k("row")).unwrap()
+    }
+    let (a, b) = (Dir::new("cache-a"), Dir::new("cache-b"));
+    assert_eq!(commit_and_reopen(&a, "first"), Some(v("first")));
+    // Same key, same value length: the same first block position and size.
+    assert_eq!(
+        commit_and_reopen(&b, "other"),
+        Some(v("other")),
+        "the second engine replayed the first engine's log block"
+    );
+}

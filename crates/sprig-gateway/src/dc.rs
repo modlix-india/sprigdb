@@ -296,7 +296,10 @@ pub struct TrafficBatch {
     pub rows: Vec<TrafficRow>,
 }
 
-type Counts = HashMap<(TenantId, String), (u64, u64)>;
+/// Reads and writes per tenant, then per client DC (`""`: unknown). Nested
+/// so that counting a statement looks both up by reference: no allocation
+/// on the statement path.
+type Counts = HashMap<TenantId, HashMap<String, (u64, u64)>>;
 
 /// The gateway's traffic counts and where its tenants live.
 pub struct DcRouting {
@@ -338,9 +341,13 @@ impl DcRouting {
     /// Counts one statement of `tenant` from `client` (the session's known
     /// DC, or `None`).
     pub fn record(&self, tenant: TenantId, client: Option<&DcId>, write: bool) {
-        let key = (tenant, client.map_or_else(String::new, ToString::to_string));
+        let client = client.map_or("", DcId::as_str);
         let mut c = lock(&self.counts);
-        let e = c.entry(key).or_insert((0, 0));
+        let by_dc = c.entry(tenant).or_default();
+        let e = match by_dc.get_mut(client) {
+            Some(e) => e,
+            None => by_dc.entry(client.to_owned()).or_insert((0, 0)),
+        };
         if write {
             e.1 += 1;
         } else {
@@ -366,19 +373,22 @@ impl DcRouting {
     fn take(&self, minute: i64) -> HashMap<DcId, TrafficBatch> {
         let counts = std::mem::take(&mut *lock(&self.counts));
         let mut out: HashMap<DcId, TrafficBatch> = HashMap::new();
-        for ((tenant, client_dc), (reads, writes)) in counts {
-            out.entry(self.home(tenant))
+        for (tenant, by_dc) in counts {
+            let rows = &mut out
+                .entry(self.home(tenant))
                 .or_insert_with(|| TrafficBatch {
                     minute,
                     rows: Vec::new(),
                 })
-                .rows
-                .push(TrafficRow {
+                .rows;
+            for (client_dc, (reads, writes)) in by_dc {
+                rows.push(TrafficRow {
                     tenant_id: tenant.0,
                     client_dc,
                     reads,
                     writes,
                 });
+            }
         }
         out
     }
@@ -388,7 +398,9 @@ impl DcRouting {
         let mut c = lock(&self.counts);
         for r in batch.rows {
             let e = c
-                .entry((TenantId(r.tenant_id), r.client_dc))
+                .entry(TenantId(r.tenant_id))
+                .or_default()
+                .entry(r.client_dc)
                 .or_insert((0, 0));
             e.0 += r.reads;
             e.1 += r.writes;

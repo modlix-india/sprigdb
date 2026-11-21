@@ -106,6 +106,9 @@ pub(crate) struct Stmt {
     /// `Com_stmt_execute` (`SHOW STATUS`), found at the first execute.
     #[allow(clippy::option_option)] // not looked up yet / no counter / the counter
     pub com: Option<Option<&'static str>>,
+    /// Tenant sessions: the plan of a statement on an engine database
+    /// (`engine_seam`); never prepared on a backend.
+    pub engine: Option<Box<super::engine_seam::EnginePrepared>>,
 }
 
 impl Stmt {
@@ -134,6 +137,7 @@ impl Stmt {
             fp: None,
             dup_table: None,
             com: None,
+            engine: None,
         }
     }
 
@@ -163,8 +167,19 @@ impl Stmt {
             fp: None,
             dup_table: None,
             com: None,
+            engine: None,
             sql,
         }
+    }
+
+    /// A statement on an engine database: `params` parameters, `columns`
+    /// as `PREPARE_OK` reports them; its plan goes in [`Stmt::engine`].
+    pub(crate) fn engine(sql: Bytes, info: StmtInfo, params: u16, columns: Vec<ColumnDef>) -> Self {
+        let mut s = Self::deferred(sql, columns);
+        s.deferred = None;
+        s.info = info;
+        s.params = params;
+        s
     }
 
     /// Buffers a piece of long data (`COM_STMT_SEND_LONG_DATA`).

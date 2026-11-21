@@ -107,6 +107,15 @@ impl WriteSet {
         self.bytes
     }
 
+    /// A copy of the writes, in key order.
+    #[must_use]
+    pub fn writes(&self) -> Vec<(Bytes, Option<Bytes>)> {
+        self.map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
     /// The writes, in key order, consuming the set.
     #[must_use]
     pub fn into_writes(self) -> Vec<(Bytes, Option<Bytes>)> {

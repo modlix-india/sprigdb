@@ -102,6 +102,9 @@ struct ClientStmt {
     param_types: Option<Vec<u16>>,
     /// Parameters that got long data since the last execute.
     long_data: Vec<bool>,
+    /// The result's column definitions the client has
+    /// (`MARIADB_CLIENT_CACHE_METADATA`).
+    sent: Option<super::sink::SentMeta>,
 }
 
 /// The session's statements, by client id (assigned here, from 1).
@@ -128,6 +131,8 @@ impl Stmts {
                 params,
                 param_types: None,
                 long_data: Vec::new(),
+                sent: (!meta.columns.is_empty())
+                    .then(|| super::sink::SentMeta::Typed(meta.columns.clone())),
             },
         );
         self.last = Some(self.next);
@@ -166,6 +171,9 @@ pub struct CommandLoop {
     /// `sprig_mysql_commands_total` handles by command, registered once per
     /// connection instead of at every command.
     commands: Vec<(&'static str, metrics::Counter)>,
+    /// The client id of the statement the next request executes, for
+    /// `MARIADB_CLIENT_CACHE_METADATA`.
+    meta_for: Option<u32>,
 }
 
 impl std::fmt::Debug for CommandLoop {
@@ -222,6 +230,7 @@ impl CommandLoop {
             watch,
             settings,
             commands: Vec::new(),
+            meta_for: None,
         }
     }
 
@@ -549,6 +558,7 @@ impl CommandLoop {
 
     /// Hands `req` to the executor, watching for `KILL QUERY` and the
     /// client hanging up (see the module docs).
+    #[allow(clippy::too_many_lines)] // the request kinds, then the watch loop
     async fn exec_request(&mut self, req: Request) -> Result<Ran> {
         enum End {
             Done(Result<ExecSummary>),
@@ -560,6 +570,14 @@ impl CommandLoop {
         let size = req.size();
         let handle = Arc::clone(self.session.handle());
         let mut sink = WireSink::new(&mut self.framed, self.proto.persona, self.proto.caps);
+        if let Some(id) = self.meta_for.take()
+            && self
+                .proto
+                .caps
+                .contains(Caps::MARIADB_CLIENT_CACHE_METADATA)
+        {
+            sink.meta_cache = self.stmts.map.get_mut(&id).map(|s| &mut s.sent);
+        }
         let mut cx = ExecCtx {
             session: &mut self.session,
             proto: &self.proto,
@@ -741,6 +759,7 @@ impl CommandLoop {
         }
         st.long_data.clear();
         let stmt = st.exec;
+        self.meta_for = Some(id);
         self.session.begin_command("Execute", None);
         let r = self
             .run_answered(Request::Execute { stmt, raw, params })

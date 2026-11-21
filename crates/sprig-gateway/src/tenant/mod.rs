@@ -198,6 +198,8 @@ impl TenantServices {
             Arc::new(sprig_inherit::msg::MsgExtension),
             // Table groups, for the router.
             Arc::new(crate::exec::router::ShardingExtension),
+            // Engine-backed databases and their tables' definitions.
+            Arc::new(crate::engine::catalog::EngineExtension),
             // Collections, their indexes and field columns.
             Arc::new(crate::mongo::catalog::DocExtension),
             // Search indexes and analyzers.

@@ -34,6 +34,15 @@ fn run(
     engine.txn_shared().set_early_lock_release(elr);
     let path: Arc<dyn CommitPath> = Arc::new(engine.clone());
     let key = Bytes::from_static(b"hot\0");
+    {
+        // The row exists before the clients start, as a hot row does. (Two
+        // clients that both find it missing and both insert it deadlock,
+        // which is what `InnoDB` does and not what this measures.)
+        let mut t = Txn::begin_on(path.clone(), TxnOptions::mariadb());
+        t.put(key.clone(), Bytes::copy_from_slice(&0u64.to_be_bytes()))
+            .expect("seed");
+        t.commit().expect("commit").wait().expect("durable");
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicU64::new(0));
     let lat_us = Arc::new(AtomicU64::new(0));

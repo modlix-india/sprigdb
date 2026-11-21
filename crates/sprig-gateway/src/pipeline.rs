@@ -358,6 +358,13 @@ pub trait SessionExec: Send {
         None
     }
 
+    /// Whether the tenant's logical database `name` is placed on the
+    /// storage engine (`storage.placement = 'engine'`). The Redis front end
+    /// asks it for the database holding its Redis databases.
+    fn engine_database(&self, _name: &str) -> bool {
+        false
+    }
+
     /// The tables whose policies bind this session, with those policies as
     /// MongoDB filters with its values bound:
     /// what a change stream shows. `None` when the executor can't tell:
@@ -724,6 +731,10 @@ impl SessionExec for HookedSession {
 
     fn row_policy_binds(&self, object: u64) -> Option<bool> {
         self.inner.row_policy_binds(object)
+    }
+
+    fn engine_database(&self, name: &str) -> bool {
+        self.inner.engine_database(name)
     }
 
     fn row_policy_docs(&self) -> Option<std::sync::Arc<crate::tenant::rls::DocViews>> {

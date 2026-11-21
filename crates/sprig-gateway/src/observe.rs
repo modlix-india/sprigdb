@@ -422,6 +422,10 @@ impl SessionExec for ObservedSession {
         self.inner.row_policy_binds(object)
     }
 
+    fn engine_database(&self, name: &str) -> bool {
+        self.inner.engine_database(name)
+    }
+
     fn row_policy_docs(&self) -> Option<std::sync::Arc<crate::tenant::rls::DocViews>> {
         self.inner.row_policy_docs()
     }

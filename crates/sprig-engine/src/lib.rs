@@ -15,6 +15,7 @@
 //! - [`store`]: `SortedStore`, `RocksStore`, `MemStore`;
 //! - [`log`]: the commit log, durability classes, group commit, the apply
 //!   step and the payload format;
+//! - [`row`]: typed SQL values, column types and the row record;
 //! - [`budget`]: the engine's memory budgets;
 //! - [`txn`] and [`locks`]: transactions, MVCC reads and record locks;
 //! - [`Engine`]: the handle that ties them together.
@@ -25,6 +26,7 @@ mod engine;
 pub mod keys;
 pub mod locks;
 pub mod log;
+pub mod row;
 pub mod store;
 pub mod txn;
 

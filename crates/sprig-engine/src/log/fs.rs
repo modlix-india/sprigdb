@@ -10,7 +10,9 @@
 //! - can simulate a crash ([`SimDisk`]): it remembers how much of each file
 //!   was synced, and [`SimDisk::crash`] cuts every file back to its synced
 //!   length plus a seed-chosen part of the unsynced tail, the way a power
-//!   loss can keep some unsynced pages and lose others.
+//!   loss can keep some unsynced pages and lose others. The power goes at
+//!   [`SimDisk::power_cut`]: syncs after it (raft-engine's own closing sync
+//!   when the log is dropped, for one) don't count.
 //!
 //! Directory entries (creates, renames, deletes) are not simulated: the engine runs
 //! raft-engine without log recycling, so it only creates and deletes files.
@@ -20,6 +22,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Result as IoResult, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use raft_engine::env::{FileSystem, Handle, Permission, WriteExt};
@@ -38,6 +41,8 @@ pub enum SyncMode {
 #[derive(Debug, Default)]
 pub struct SimDisk {
     synced: Mutex<HashMap<PathBuf, u64>>,
+    /// The power is off: syncs no longer make anything durable.
+    cut: AtomicBool,
 }
 
 impl SimDisk {
@@ -48,10 +53,30 @@ impl SimDisk {
     }
 
     fn note_sync(&self, path: &Path, len: u64) {
-        self.synced
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(path.to_path_buf(), len);
+        let mut synced = self.synced.lock().unwrap_or_else(PoisonError::into_inner);
+        // Checked under the lock, so a sync either counts before the cut
+        // or not at all.
+        if self.cut.load(Ordering::Acquire) {
+            return;
+        }
+        // Two syncs of one file can race (the writer's and a checkpoint's):
+        // the synced length only grows.
+        let e = synced.entry(path.to_path_buf()).or_insert(0);
+        *e = (*e).max(len);
+    }
+
+    /// The power goes off now: later syncs don't count. Call it once nothing
+    /// more can be acknowledged (the log's writer has stopped), then drop the
+    /// log and call [`SimDisk::crash`].
+    pub fn power_cut(&self) {
+        let _g = self.synced.lock().unwrap_or_else(PoisonError::into_inner);
+        self.cut.store(true, Ordering::Release);
+    }
+
+    /// Whether [`SimDisk::power_cut`] was called since the last crash.
+    #[must_use]
+    pub fn is_cut(&self) -> bool {
+        self.cut.load(Ordering::Acquire)
     }
 
     /// Simulates a power loss after the log was dropped: each file keeps its
@@ -95,6 +120,7 @@ impl SimDisk {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        self.cut.store(false, Ordering::Release);
         Ok(lost)
     }
 }

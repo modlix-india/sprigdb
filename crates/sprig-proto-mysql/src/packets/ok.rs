@@ -1,7 +1,7 @@
 //! OK and EOF packets, and the session-state tracker entries an OK packet
 //! carries under `CLIENT_SESSION_TRACK`.
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 use super::{Caps, EOF_HEADER, OK_HEADER, StatusFlags};
 use crate::buf::{Reader, Writer};
@@ -108,7 +108,14 @@ impl OkPacket {
     /// cleared.
     #[must_use]
     pub fn encode(&self, caps: Caps) -> Bytes {
-        let mut w = Writer::with_capacity(16 + self.info.len() + self.session_state.len());
+        let mut b = BytesMut::with_capacity(16 + self.info.len() + self.session_state.len());
+        self.encode_into(caps, &mut b);
+        b.freeze()
+    }
+
+    /// [`OkPacket::encode`], appended to `out`.
+    pub fn encode_into(&self, caps: Caps, out: &mut BytesMut) {
+        let mut w = Writer::from_buf(std::mem::take(out));
         w.u8(self.header)
             .lenenc_int(self.affected_rows)
             .lenenc_int(self.last_insert_id);
@@ -137,7 +144,7 @@ impl OkPacket {
                 w.lenenc_bytes(&self.info);
             }
         }
-        w.into_bytes()
+        *out = w.into_buf();
     }
 
     /// Decodes the session-state block.

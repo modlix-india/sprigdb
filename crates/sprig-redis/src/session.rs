@@ -92,6 +92,11 @@ pub struct Session {
     /// A fixed namespace in place of the Redis databases (the API's
     /// `Exec`).
     ns_override: Option<sprig_kv::Namespace>,
+    /// The selected database, when it lives on the storage engine.
+    engine: Option<Arc<dyn crate::engine::EngineDatabase>>,
+    /// Keys watched on the storage engine, with what `EXEC` checks (only
+    /// those still in `watched` count).
+    engine_watched: Vec<crate::engine::Watched>,
 }
 
 impl std::fmt::Debug for Session {
@@ -149,6 +154,8 @@ impl Session {
             created: Instant::now(),
             dc_hint: None,
             ns_override: None,
+            engine: None,
+            engine_watched: Vec::new(),
         }
     }
 
@@ -208,7 +215,9 @@ impl Session {
     /// Ends the connection: subscriptions go, a transaction rolls back.
     pub async fn close(&mut self) {
         self.unsubscribe_all();
-        if let Some(l) = &mut self.login {
+        if self.engine.is_none()
+            && let Some(l) = &mut self.login
+        {
             let _ = l.sql.exec("ROLLBACK").await;
         }
     }
@@ -238,7 +247,11 @@ impl Session {
             return Vec::new();
         };
         let name = String::from_utf8_lossy(first).to_ascii_lowercase();
-        let Some(spec) = spec::lookup(&name) else {
+        let Some(spec) = spec::lookup(&name).or_else(|| {
+            self.engine
+                .as_ref()
+                .and_then(|_| crate::engine::engine_spec(&name))
+        }) else {
             if self.multi.is_some() {
                 self.multi_err = true;
             }
@@ -260,6 +273,25 @@ impl Session {
             return vec![Frame::err(&format!(
                 "Can't execute '{name}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"
             ))];
+        }
+        // A database on the storage engine: the engine runs its data
+        // commands, the session only connection, server and pub/sub ones.
+        if let Some(e) = self.engine.clone() {
+            if self.multi.is_some() && !spec.has('m') {
+                // Queued for EXEC below, which runs the engine's commands
+                // as one transaction.
+                if !e.runs(&name) && !crate::engine::session_command(&name) {
+                    self.multi_err = true;
+                    return vec![crate::engine::not_on_engine(&name)];
+                }
+            } else {
+                if e.runs(&name) {
+                    return e.run(&[&c.args[..]], self.resp3()).await;
+                }
+                if !crate::engine::session_command(&name) {
+                    return vec![crate::engine::not_on_engine(&name)];
+                }
+            }
         }
         if let Some(q) = &mut self.multi
             && !spec.has('m')
@@ -321,6 +353,57 @@ impl Session {
             .await;
         }
         frames
+    }
+
+    /// How many commands at the head of `cmds` the storage engine runs as
+    /// one batch ([`Session::handle_engine`]); 0 when the first doesn't go
+    /// to the engine.
+    #[must_use]
+    pub fn engine_len(&self, cmds: &[Command]) -> usize {
+        let Some(e) = &self.engine else {
+            return 0;
+        };
+        if (self.subscribed() && self.proto == Proto::Resp2) || self.multi.is_some() {
+            return 0;
+        }
+        cmds.iter()
+            .take_while(|c| {
+                c.args.first().is_some_and(|first| {
+                    let name = String::from_utf8_lossy(first).to_ascii_lowercase();
+                    e.runs(&name)
+                        && crate::engine::lookup(&name).is_some_and(|s| s.arity_ok(c.args.len()))
+                })
+            })
+            .count()
+    }
+
+    /// Runs `cmds`, which [`Session::engine_len`] counted, on the storage
+    /// engine as one batch: their replies, in order, once durable.
+    pub async fn handle_engine(&mut self, cmds: &[Command]) -> Vec<Vec<Frame>> {
+        let Some(e) = self.engine.clone() else {
+            return cmds
+                .iter()
+                .map(|_| vec![Frame::err("no engine database")])
+                .collect();
+        };
+        let args: Vec<&[Bytes]> = cmds.iter().map(|c| &c.args[..]).collect();
+        e.run(&args, self.resp3())
+            .await
+            .into_iter()
+            .map(|f| vec![f])
+            .collect()
+    }
+
+    /// Looks up whether the selected database lives on the storage engine
+    /// (after a login and on `SELECT`).
+    fn refresh_engine(&mut self) {
+        self.engine = match (&self.login, &self.ns_override, self.env.engine()) {
+            (Some(l), None, Some(b)) => {
+                let placed = l.sql.engine_placed(&self.env.config().logical_database);
+                b.database(&l.scope, self.db, placed)
+            }
+            _ => None,
+        };
     }
 
     /// The commands at the head of `cmds` that run as one group
@@ -574,6 +657,7 @@ impl Session {
                 self.watched.clear();
                 self.unsubscribe_all();
                 self.db = 0;
+                self.refresh_engine();
                 self.proto = Proto::Resp2;
                 self.name = None;
                 if let Some(l) = &mut self.login {
@@ -589,6 +673,7 @@ impl Session {
                     return one(Frame::err("DB index is out of range"));
                 }
                 self.db = u32::try_from(n).unwrap_or(0);
+                self.refresh_engine();
                 one(Frame::ok())
             }
             "hello" => Ok(vec![self.hello(a).await]),
@@ -980,16 +1065,24 @@ impl Session {
         // key takes no gap lock, so writers of neighbouring keys don't
         // deadlock; two inserts of one key meet on its primary key (1062)
         // and the loser reruns. EXEC and scripts ask for REPEATABLE READ.
-        if let Err(e) = l
-            .sql
-            .exec("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
-            .await
+        // A database on the storage engine sends no statements.
+        let on_engine = self.ns_override.is_none()
+            && self.env.engine().is_some_and(|b| {
+                let placed = l.sql.engine_placed(&self.env.config().logical_database);
+                b.database(&l.scope, self.db, placed).is_some()
+            });
+        if !on_engine
+            && let Err(e) = l
+                .sql
+                .exec("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                .await
         {
             tracing::debug!(error = %e, "redis session isolation not set");
         }
         // A name set before AUTH names the DC too.
         l.sql.client_dc(self.dc_hint.as_deref());
         self.login = Some(l);
+        self.refresh_engine();
     }
 
     async fn auth_cmd(&mut self, a: &[Bytes]) -> Frame {
@@ -1106,6 +1199,21 @@ impl Session {
     }
 
     async fn watch(&mut self, keys: &[Bytes]) -> Frame {
+        if let Some(e) = self.engine.clone() {
+            let db = self.db;
+            let fresh: Vec<Bytes> = keys
+                .iter()
+                .filter(|k| !self.watched.iter().any(|(d, wk, _)| *d == db && wk == *k))
+                .cloned()
+                .collect();
+            for w in e.watch(&fresh).await {
+                self.engine_watched
+                    .retain(|x| !(x.db == w.db && x.key == w.key));
+                self.watched.push((w.db, w.key.clone(), Some(w.token)));
+                self.engine_watched.push(w);
+            }
+            return Frame::ok();
+        }
         let env = Arc::clone(&self.env);
         if let Err(e) = self.ensure_db(self.db).await {
             return reply::backend(&e);
@@ -1175,6 +1283,68 @@ impl Session {
         }
     }
 
+    /// `EXEC` on a storage-engine database: the engine's commands as one
+    /// transaction, `PING` and `ECHO` answered here.
+    async fn exec_engine(
+        &mut self,
+        e: &Arc<dyn crate::engine::EngineDatabase>,
+        queue: &[Command],
+    ) -> Frame {
+        let watched: Vec<crate::engine::Watched> = std::mem::take(&mut self.engine_watched)
+            .into_iter()
+            .filter(|w| {
+                self.watched
+                    .iter()
+                    .any(|(d, k, _)| *d == w.db && *k == w.key)
+            })
+            .collect();
+        self.watched.clear();
+        let names: Vec<String> = queue.iter().map(Command::name_lower).collect();
+        // The engine also takes SELECT: the commands after it run in that
+        // database, in the same transaction.
+        let to_engine = |n: &str| e.runs(n) || n == "select";
+        let cmds: Vec<&[Bytes]> = queue
+            .iter()
+            .zip(&names)
+            .filter(|(_, n)| to_engine(n))
+            .map(|(c, _)| &c.args[..])
+            .collect();
+        let Some(replies) = e.exec(&cmds, &watched, self.resp3()).await else {
+            return Frame::null_array();
+        };
+        let mut it = replies.into_iter();
+        let mut db = None;
+        let out = queue
+            .iter()
+            .zip(&names)
+            .map(|(c, n)| match n.as_str() {
+                "select" => {
+                    let r = it.next().unwrap_or_else(Frame::null);
+                    if !r.is_error() {
+                        db = parse_i64(&c.args[1]).and_then(|d| u32::try_from(d).ok());
+                    }
+                    r
+                }
+                _ if e.runs(n) => it.next().unwrap_or_else(Frame::null),
+                "ping" => c
+                    .args
+                    .get(1)
+                    .map_or_else(|| Frame::simple("PONG"), |m| Frame::Bulk(m.clone())),
+                "echo" => Frame::Bulk(c.args[1].clone()),
+                _ => Frame::err(&format!(
+                    "'{}' inside MULTI is not available on this database yet",
+                    n.to_ascii_uppercase()
+                )),
+            })
+            .collect();
+        // The connection stays in the last database the transaction chose.
+        if let Some(d) = db {
+            self.db = d;
+            self.refresh_engine();
+        }
+        Frame::Array(out)
+    }
+
     async fn exec(&mut self) -> Frame {
         let Some(queue) = self.multi.take() else {
             return Frame::err("EXEC without MULTI");
@@ -1182,6 +1352,9 @@ impl Session {
         if std::mem::take(&mut self.multi_err) {
             self.watched.clear();
             return Frame::error("EXECABORT Transaction discarded because of previous errors.");
+        }
+        if let Some(e) = self.engine.clone() {
+            return self.exec_engine(&e, &queue).await;
         }
         // DDL commits, so every database the queue reaches gets its tables
         // before the transaction starts.

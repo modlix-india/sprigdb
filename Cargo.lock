@@ -6823,6 +6823,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sprig-exec"
+version = "0.0.1"
+dependencies = [
+ "bytes",
+ "sprig-engine",
+]
+
+[[package]]
 name = "sprig-feed"
 version = "0.0.1"
 dependencies = [
@@ -6887,6 +6895,8 @@ dependencies = [
  "sprig-doc",
  "sprig-docs",
  "sprig-embed",
+ "sprig-engine",
+ "sprig-exec",
  "sprig-feed",
  "sprig-geo",
  "sprig-graph",
@@ -6895,6 +6905,7 @@ dependencies = [
  "sprig-logic",
  "sprig-logic-js",
  "sprig-meta",
+ "sprig-plan",
  "sprig-proto-amqp",
  "sprig-proto-bolt",
  "sprig-proto-kafka",
@@ -6904,6 +6915,7 @@ dependencies = [
  "sprig-provision",
  "sprig-queues",
  "sprig-redis",
+ "sprig-redis-engine",
  "sprig-router",
  "sprig-search",
  "sprig-settings",
@@ -7147,6 +7159,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sprig-plan"
+version = "0.0.1"
+dependencies = [
+ "bytes",
+ "sprig-engine",
+ "sprig-exec",
+ "sqlparser 0.63.0",
+]
+
+[[package]]
 name = "sprig-proto-amqp"
 version = "0.0.1"
 dependencies = [
@@ -7332,6 +7354,24 @@ dependencies = [
  "sprig-kv",
  "sprig-logic-js",
  "sprig-proto-redis",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "sprig-redis-engine"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "crc32fast",
+ "proptest",
+ "redis",
+ "sprig-common",
+ "sprig-engine",
+ "sprig-kv",
+ "sprig-proto-redis",
+ "sprig-redis",
  "tokio",
  "tracing",
 ]

@@ -13,6 +13,7 @@
 //!   in internal mode so the `__sprig_` element tables pass the
 //!   reserved-name check.
 
+pub mod engine;
 pub mod hub;
 mod keyspace_feed;
 pub mod logic;
@@ -312,6 +313,10 @@ impl RedisFrontend {
         // Keyspace notifications reach only subscribers who may read the
         // key.
         env.set_key_filter(Arc::new(KeyImages));
+        // Tenants whose Redis databases live on the storage engine.
+        env.set_engine(Arc::new(engine::NodeEngine::from_env(
+            env.config().databases,
+        )));
         Self {
             d: Arc::new(d),
             env,
@@ -889,6 +894,10 @@ impl SqlRunner for SqlSession {
 
     fn row_policy_binds(&self, object: u64) -> Option<bool> {
         self.exec.row_policy_binds(object)
+    }
+
+    fn engine_placed(&self, database: &str) -> bool {
+        self.exec.engine_database(database)
     }
 
     fn multi_results(&self) -> bool {

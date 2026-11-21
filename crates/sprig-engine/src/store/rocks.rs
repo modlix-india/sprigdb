@@ -13,13 +13,15 @@
 //!   filters (whole-key filtering off: every versioned read is a prefix
 //!   seek), partitioned index and filters with the top level pinned, and a
 //!   memtable prefix Bloom filter.
-//! - Leveled compaction with dynamic level sizes; no compression on L0–L1,
-//!   LZ4 on L2–L4, ZSTD below.
+//! - Leveled compaction with dynamic level sizes; LZ4 on L0–L4 (L0–L1 can
+//!   be left uncompressed with `RocksTuning::compress_top_levels`), ZSTD
+//!   below.
 
 use std::cell::RefCell;
 use std::ffi::CStr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
 use rust_rocksdb::compaction_filter::CompactionFilter;
@@ -36,7 +38,7 @@ use super::{
     BatchOp, Cf, GcDecider, GcRule, IterOpts, Read, ReadTier, SortedStore, StoreBatch, StoreIter,
     StoreStats, WalMode,
 };
-use crate::keys::{KeyRange, VERSION_LEN, strip_version};
+use crate::keys::{self, KeyRange, Ts, VERSION_LEN, strip_version};
 
 /// What [`RocksStore::open`] needs.
 #[derive(Clone)]
@@ -106,6 +108,10 @@ impl CompactionFilterFactory for GcFactory {
 
 /// RocksDB behind [`SortedStore`].
 pub struct RocksStore {
+    /// Cursors kept for versioned point reads. Declared before `db`:
+    /// fields drop in declaration order, so every kept cursor is destroyed
+    /// while the database is still open.
+    point_iters: PointIters,
     db: DB,
     cache: Cache,
     wbm: WriteBufferManager,
@@ -116,6 +122,82 @@ impl std::fmt::Debug for RocksStore {
         f.debug_struct("RocksStore")
             .field("path", &self.db.path())
             .finish_non_exhaustive()
+    }
+}
+
+/// A cursor that outlives the call that built it. It never leaves its
+/// [`RocksStore`], which destroys it before the database closes.
+type KeptIter = DBRawIteratorWithThreadMode<'static, DB>;
+
+/// How many pools each (column family, read tier) pair has: a thread uses
+/// one, so threads rarely share a lock.
+const POINT_POOLS: usize = 16;
+/// Cursors one pool keeps. More than one only when several threads share a
+/// pool.
+const POINT_KEEP: usize = 4;
+
+thread_local! {
+    /// This thread's pool number.
+    static POINT_POOL: usize = {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        NEXT.fetch_add(1, Ordering::Relaxed) % POINT_POOLS
+    };
+}
+
+/// Cursors kept between versioned point reads.
+///
+/// A point read of a versioned key is a seek (the newest version at or
+/// below a timestamp), and building a cursor for one seek costs about as
+/// much as the seek: RocksDB assembles the merge tree over the memtables
+/// and every sorted run each time. A kept cursor is refreshed instead,
+/// which only moves its read sequence while no flush or compaction has
+/// happened since.
+///
+/// A kept cursor pins the memtables and files it was built over, so the
+/// pools are emptied on every flush, every manual compaction and every
+/// checkpointer tick ([`SortedStore::release_idle_reads`]): an idle
+/// thread's cursor holds obsolete files for about a second at most.
+struct PointIters {
+    pools: Vec<Mutex<Vec<KeptIter>>>,
+}
+
+impl PointIters {
+    fn new() -> Self {
+        Self {
+            pools: (0..Cf::ALL.len() * 2 * POINT_POOLS)
+                .map(|_| Mutex::new(Vec::new()))
+                .collect(),
+        }
+    }
+
+    fn pool(&self, cf: Cf, tier: ReadTier) -> &Mutex<Vec<KeptIter>> {
+        let kind = usize::from(cf == Cf::Local) * 2 + usize::from(tier == ReadTier::CacheOnly);
+        &self.pools[kind * POINT_POOLS + POINT_POOL.with(|p| *p)]
+    }
+
+    fn take(&self, cf: Cf, tier: ReadTier) -> Option<KeptIter> {
+        self.pool(cf, tier)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop()
+    }
+
+    fn keep(&self, cf: Cf, tier: ReadTier, it: KeptIter) {
+        let mut pool = self
+            .pool(cf, tier)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if pool.len() < POINT_KEEP {
+            pool.push(it);
+        }
+    }
+
+    /// Destroys every kept cursor.
+    fn clear(&self) {
+        for pool in &self.pools {
+            let kept = std::mem::take(&mut *pool.lock().unwrap_or_else(PoisonError::into_inner));
+            drop(kept);
+        }
     }
 }
 
@@ -171,9 +253,14 @@ fn cf_options(
     o.set_level_zero_file_num_compaction_trigger(4);
     o.set_level_zero_slowdown_writes_trigger(20);
     o.set_level_zero_stop_writes_trigger(36);
+    let top = if tuning.compress_top_levels {
+        DBCompressionType::Lz4
+    } else {
+        DBCompressionType::None
+    };
     o.set_compression_per_level(&[
-        DBCompressionType::None,
-        DBCompressionType::None,
+        top,
+        top,
         DBCompressionType::Lz4,
         DBCompressionType::Lz4,
         DBCompressionType::Lz4,
@@ -254,7 +341,12 @@ impl RocksStore {
             })
             .collect::<Vec<_>>();
         let db = DB::open_cf_descriptors(&db_opts, path, cfs).map_err(|e| rocks_err(&e, "open"))?;
-        Ok(Self { db, cache, wbm })
+        Ok(Self {
+            point_iters: PointIters::new(),
+            db,
+            cache,
+            wbm,
+        })
     }
 
     fn cf(&self, cf: Cf) -> &ColumnFamily {
@@ -263,6 +355,32 @@ impl RocksStore {
         self.db
             .cf_handle(cf.name())
             .expect("column family opened at start")
+    }
+
+    /// A cursor for one versioned point read: a kept one moved to the
+    /// database's latest state, or a new one.
+    fn point_iter(&self, cf: Cf, tier: ReadTier) -> KeptIter {
+        if let Some(mut it) = self.point_iters.take(cf, tier)
+            && it.refresh().is_ok()
+        {
+            return it;
+        }
+        let mut ro = ReadOptions::default();
+        ro.set_prefix_same_as_start(true);
+        if tier == ReadTier::CacheOnly {
+            ro.set_read_tier(RocksTier::BlockCache);
+        }
+        let it = self.db.raw_iterator_cf_opt(self.cf(cf), ro);
+        // SAFETY: only the lifetime changes. The cursor records the
+        // database as a `PhantomData` borrow and reads nothing through it;
+        // what must hold is that the cursor is destroyed before the
+        // database closes. It never leaves this store: it is used inside
+        // `get_version` and kept in `point_iters`, which is declared
+        // before `db` and so dropped first.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::mem::transmute::<DBRawIteratorWithThreadMode<'_, DB>, KeptIter>(it)
+        }
     }
 
     fn prop(&self, cf: Cf, name: &str) -> u64 {
@@ -319,6 +437,47 @@ impl SortedStore for RocksStore {
             });
             read_result(r, "get")
         })
+    }
+
+    fn get_version(
+        &self,
+        cf: Cf,
+        logical: &[u8],
+        at: Ts,
+        tier: ReadTier,
+        out: &mut Vec<u8>,
+    ) -> Result<Read<Option<Ts>>> {
+        let seek = keys::versioned(logical, at);
+        let mut it = self.point_iter(cf, tier);
+        it.seek(&seek);
+        let found = match it.key() {
+            Some(k) if k.len() == logical.len() + VERSION_LEN && k.starts_with(logical) => {
+                keys::split_version(k).map(|(_, ts)| ts)
+            }
+            Some(_) => None,
+            None => {
+                // The end of the prefix, a block outside the cache
+                // (`WouldBlock`), or an error. A cursor that failed isn't
+                // kept.
+                return match read_result(it.status(), "get")? {
+                    Read::Ready(()) => {
+                        self.point_iters.keep(cf, tier, it);
+                        Ok(Read::Ready(None))
+                    }
+                    Read::WouldBlock => Ok(Read::WouldBlock),
+                };
+            }
+        };
+        if found.is_some() {
+            out.clear();
+            out.extend_from_slice(it.value().unwrap_or(&[]));
+        }
+        self.point_iters.keep(cf, tier, it);
+        Ok(Read::Ready(found))
+    }
+
+    fn release_idle_reads(&self) {
+        self.point_iters.clear();
     }
 
     fn multi_get(
@@ -392,9 +551,13 @@ impl SortedStore for RocksStore {
         let mut fo = FlushOptions::default();
         fo.set_wait(true);
         let handles: Vec<&ColumnFamily> = Cf::ALL.iter().map(|c| self.cf(*c)).collect();
-        self.db
+        let r = self
+            .db
             .flush_cfs_opt(&handles, &fo)
-            .map_err(|e| rocks_err(&e, "flush"))
+            .map_err(|e| rocks_err(&e, "flush"));
+        // Kept cursors pin the memtables just flushed.
+        self.point_iters.clear();
+        r
     }
 
     fn compact_all(&self) -> Result<()> {
@@ -405,6 +568,8 @@ impl SortedStore for RocksStore {
             self.db
                 .compact_range_cf_opt(self.cf(cf), None::<&[u8]>, None::<&[u8]>, &co);
         }
+        // Kept cursors pin the files just compacted away.
+        self.point_iters.clear();
         Ok(())
     }
 

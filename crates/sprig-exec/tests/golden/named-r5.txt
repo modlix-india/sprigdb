@@ -1,0 +1,296 @@
+# == CONVERT(x USING cs): a character the set lacks becomes '?' (MariaDB warns 1977); bad UTF-8 is '?' on MariaDB, NULL on MySQL
+Q CONVERT('é' USING latin1)
+M V é
+M T VAR_STRING 4 39 - 224
+Y V é
+Y T VAR_STRING 4 31 - 255
+K M n
+K Y n
+Q HEX(CONVERT('é' USING latin1))
+M V E9
+M T VAR_STRING 8 0 - 224
+Y V E9
+Y T VAR_STRING 8 31 - 255
+Q CONVERT('中' USING latin1)
+M V ?
+M T VAR_STRING 4 39 - 224
+M W W 1977 Cannot convert 'utf8mb4' character 0xE4B8AD to 'latin1'
+Y V ?
+Y T VAR_STRING 4 31 - 255
+K M n
+K Y n
+Q HEX(CONVERT('€' USING latin1))
+M V 80
+M T VAR_STRING 8 0 - 224
+Y V 80
+Y T VAR_STRING 8 31 - 255
+Q CONVERT('é' USING ascii)
+M V ?
+M T VAR_STRING 4 39 - 224
+M W W 1977 Cannot convert 'utf8mb4' character 0xC3A9 to 'ascii'
+Y V ?
+Y T VAR_STRING 4 31 - 255
+K M n
+K Y n
+Q CONVERT(_latin1 0xE9 USING utf8mb4)
+M V é
+M T VAR_STRING 4 39 - 224
+Y V é
+Y T VAR_STRING 4 31 - 255
+K M n
+K Y n
+Q CONVERT(0xE9 USING utf8mb4)
+M V ?
+M T VAR_STRING 4 39 - 224
+M W W 1300 Invalid utf8mb4 character string: '\\xE9'
+Y V NULL
+Y T VAR_STRING 4 31 - 255
+Y W W 1300 Invalid utf8mb4 character string: 'E9'
+K M x n
+K Y n
+Q CONVERT(0xFF41 USING utf8mb4)
+M V ?A
+M T VAR_STRING 8 39 - 224
+M W W 1300 Invalid utf8mb4 character string: '\\xFFA'
+Y V NULL
+Y T VAR_STRING 8 31 - 255
+Y W W 1300 Invalid utf8mb4 character string: 'FF41'
+K M x n
+K Y n
+Q CONVERT(123 USING latin1)
+M V 123
+M T VAR_STRING 12 39 - 224
+Y V 123
+Y T VAR_STRING 16 31 - 255
+K M n
+K Y n
+Q CONVERT(NULL USING latin1)
+M V NULL
+M T VAR_STRING 0 39 - 224
+Y V NULL
+Y T VAR_STRING 0 31 - 255
+Q COLLATION(CONVERT('a' USING latin1))
+M V latin1_swedish_ci
+M T VAR_STRING 256 39 - 224
+Y V latin1_swedish_ci
+Y T VAR_STRING 256 31 - 255
+Q COERCIBILITY(CONVERT('a' USING latin1))
+M V 4
+M T LONG 10 0 N 63
+Y V 2
+Y T LONGLONG 10 0 N 63
+Q CONVERT('aé' USING binary)
+M V aé
+M T VAR_STRING 2 39 - 63
+Y V aé
+Y T VAR_STRING 8 31 - 63
+K M n
+K Y l n
+# == An introducer reads the literal's bytes as text of its set: _latin1'é' is two characters
+Q _latin1'é'
+M V Ã©
+M T VAR_STRING 8 39 N 224
+Y V Ã©
+Y T VAR_STRING 8 31 N 255
+Q HEX(_latin1'é')
+M V C3A9
+M T VAR_STRING 16 0 - 224
+Y V C3A9
+Y T VAR_STRING 16 31 - 255
+Q CHAR_LENGTH(_latin1'é')
+M V 2
+M T LONG 10 0 N 63
+Y V 2
+Y T LONGLONG 10 0 N 63
+Q COLLATION(_latin1'é')
+M V latin1_swedish_ci
+M T VAR_STRING 256 39 - 224
+Y V latin1_swedish_ci
+Y T VAR_STRING 256 31 - 255
+Q _latin1 0x80
+M V €
+M T VAR_STRING 4 39 N 224
+Y V €
+Y T VAR_STRING 4 31 N 255
+Q HEX(CONVERT(_latin1 0x81 USING utf8mb4))
+M V C281
+M T VAR_STRING 32 0 - 224
+Y V C281
+Y T VAR_STRING 32 31 - 255
+Q _ascii'abc'
+M V abc
+M T VAR_STRING 12 39 N 224
+Y V abc
+Y T VAR_STRING 12 31 N 255
+Q _ascii'ß'
+M V ??
+M T VAR_STRING 8 39 N 224
+Y V ??
+Y T VAR_STRING 8 31 N 255
+Y W W 1300 Invalid ascii character string: 'C39F'
+K Y w
+Q COLLATION(_binary'abc')
+M V binary
+M T VAR_STRING 256 39 - 224
+Y V binary
+Y T VAR_STRING 256 31 - 255
+# == latin1 strings: case mapping of À..Þ, sending as utf8mb4, lengths in characters
+Q UPPER(_latin1 0xE9)
+M V É
+M T VAR_STRING 4 39 - 224
+Y V É
+Y T VAR_STRING 4 31 - 255
+Q LOWER(_latin1 0xC9)
+M V é
+M T VAR_STRING 4 39 - 224
+Y V é
+Y T VAR_STRING 4 31 - 255
+Q REVERSE(_latin1 0xE9E8)
+M V èé
+M T VAR_STRING 8 39 - 224
+Y V èé
+Y T VAR_STRING 8 31 - 255
+Q LOWER(`l1`)
+M V 	a	a	é	é	e	ß	ss	€	abc 	1	x	NULL	a	é	é	e	ß	ss	€	abc 	1	x	
+M T VAR_STRING 80 39 - 224
+Y V 	a	a	é	é	e	ß	ss	€	abc 	1	x	NULL	a	é	é	e	ß	ss	€	abc 	1	x	
+Y T VAR_STRING 80 31 - 255
+Q UPPER(`lb`)
+M V B	B	É	E	ABC	ABC	€	ÿ	1.5	 	Z	Ä	NULL	NULL	Ä	ABC	 	É	ÿ	B	NULL	Z	E	1.5
+M T VAR_STRING 80 39 - 224
+Y V B	B	É	E	ABC	ABC	€	ÿ	1.5	 	Z	Ä	NULL	NULL	Ä	ABC	 	É	ÿ	B	NULL	Z	E	1.5
+Y T VAR_STRING 80 31 - 255
+Q LENGTH(`l1`)
+M V 0	1	1	1	1	1	1	2	1	4	1	1	NULL	1	1	1	1	1	2	1	4	1	1	0
+M T LONG 10 0 - 63
+Y V 0	1	1	1	1	1	1	2	1	4	1	1	NULL	1	1	1	1	1	2	1	4	1	1	0
+Y T LONGLONG 10 0 - 63
+Q CHAR_LENGTH(`lb`)
+M V 1	1	1	1	3	3	1	1	3	1	1	1	NULL	NULL	1	3	1	1	1	1	NULL	1	1	3
+M T LONG 10 0 - 63
+Y V 1	1	1	1	3	3	1	1	3	1	1	1	NULL	NULL	1	3	1	1	1	1	NULL	1	1	3
+Y T LONGLONG 10 0 - 63
+Q HEX(`l1`)
+M V 	61	41	E9	C9	65	DF	7373	80	61626320	31	78	NULL	41	E9	C9	65	DF	7373	80	61626320	31	78	
+M T VAR_STRING 160 0 - 224
+Y V 	61	41	E9	C9	65	DF	7373	80	61626320	31	78	NULL	41	E9	C9	65	DF	7373	80	61626320	31	78	
+Y T VAR_STRING 160 31 - 255
+# == Merging character sets: an ASCII side gives way, utf8mb4 takes in latin1 held as strongly, else the weaker side converts if it can
+Q CONCAT(_latin1 0xE9, 'é')
+M V éé
+M T VAR_STRING 8 39 - 224
+Y V éé
+Y T VAR_STRING 8 31 - 255
+Q COLLATION(CONCAT(_latin1 0xE9, 'é'))
+M V utf8mb4_uca1400_ai_ci
+M T VAR_STRING 256 39 - 224
+Y V utf8mb4_0900_ai_ci
+Y T VAR_STRING 256 31 - 255
+Q (_latin1 0xE9 = 'é')
+M V 1
+M T LONG 1 0 N 63
+Y V 1
+Y T LONGLONG 1 0 N 63
+Q (_latin1 0x81 > 'x')
+M V 1
+M T LONG 1 0 N 63
+Y V 0
+Y T LONGLONG 1 0 N 63
+K Y v=open
+Q GREATEST(_latin1 0x41, _latin1 0xDF, 'x')
+M V ß
+M T VAR_STRING 4 39 N 224
+Y V x
+Y T VAR_STRING 4 31 N 255
+K Y v=open
+Q CONCAT(`l1`, `a1`)
+M V a	aA	A1	éabc	É	e x	ßz	ss12abc	€1e2	abc ABC 	1b	x%	NULL	Aa	é%	Éb	eABC 	ß1e2	ss12abc	€z	abc  x	1	xabc	1
+M T VAR_STRING 160 39 - 224
+Y V a	aA	A1	éabc	É	e x	ßz	ss12abc	€1e2	abc ABC 	1b	x%	NULL	Aa	é%	Éb	eABC 	ß1e2	ss12abc	€z	abc  x	1	xabc	1
+Y T VAR_STRING 160 31 - 255
+Q (`a1` < `lb`)
+M V 1	1	1	1	1	1	1	1	0	0	1	1	NULL	NULL	1	0	0	1	1	0	NULL	1	1	1
+M T LONG 1 0 - 63
+Y V 1	1	1	1	1	1	1	1	0	0	1	1	NULL	NULL	1	0	0	1	1	0	NULL	1	1	1
+Y T LONGLONG 1 0 - 63
+Q LOCATE(`lb`, `a1`)
+M V 0	0	0	0	0	0	0	0	0	4	0	0	NULL	NULL	0	0	4	0	0	0	NULL	0	0	0
+M T LONG 11 0 - 63
+Y X 3854
+Y T LONGLONG 11 0 - 63
+K Y v=open
+Q COALESCE(`lb`, `a1`)
+M V b	B	é	e	abc	ABC	€	ÿ	1.5	 	z	ä	NULL	a	ä	abc	 	é	ÿ	b	 x	z	e	1.5
+M T VAR_STRING 80 39 - 224
+Y V b	B	é	e	abc	ABC	€	ÿ	1.5	 	z	ä	NULL	a	ä	abc	 	é	ÿ	b	 x	z	e	1.5
+Y T VAR_STRING 80 31 - 255
+Q (`a1` = 'é')
+M X 1267
+Y X 1267
+Q ('é' <> _ascii'ä')
+M X 1267
+Y X 1267
+Y W W 1300 Invalid ascii character string: 'C3A4'
+K Y w
+Q (_ascii'' <> _latin1 0xC9)
+M V 1
+M T LONG 1 0 N 63
+Y V 1
+Y T LONGLONG 1 0 N 63
+Q LEAST(_ascii'ss', _latin1 0xC9, '€')
+M V €
+M T VAR_STRING 8 39 N 224
+Y V €
+Y T VAR_STRING 8 31 N 255
+Q CONCAT('é', CONVERT('é' USING ascii))
+M X 1267
+Y X 1267
+Q CONCAT(`a1`, CONVERT('1' USING utf8mb4), `lb`)
+M X 1270
+Y V a1b	A1B	11é	abc1e	1abc	 x1ABC	z1€	12abc1ÿ	1e211.5	ABC 1 	b1z	%1ä	NULL	NULL	%1ä	b1abc	ABC 1 	1e21é	12abc1ÿ	z1b	NULL	1z	abc1e	111.5
+Y T VAR_STRING 164 31 - 255
+K M v=open
+Q REPLACE(`l1`, `l1`, `a1`)
+M V 	A	1	abc		 x	z	12abc	1e2	ABC 	b	%	NULL	a	%	b	ABC 	1e2	12abc	z	 x		abc	
+M T VAR_STRING 1600 39 - 224
+Y V 	A	1	abc		 x	z	12abc	1e2	ABC 	b	%	NULL	a	%	b	ABC 	1e2	12abc	z	 x		abc	
+Y T VAR_STRING 1520 31 - 255
+K Y l
+Q (CONVERT('ss' USING ascii) IN ('e', CONVERT('é' USING latin1), 'é'))
+M V 0
+M T LONG 1 0 - 63
+Y V 0
+Y T LONGLONG 1 0 - 63
+K M n
+K Y n
+Q STRCMP(LEAST('é', '-', 'abc', '0.0'), `a1`)
+M V -1	-1	-1	-1	1	1	-1	-1	-1	-1	-1	1	NULL	-1	1	-1	-1	-1	-1	-1	1	1	-1	-1
+M T LONG 2 0 - 63
+Y V -1	-1	-1	-1	1	1	-1	-1	-1	-1	-1	1	NULL	-1	1	-1	-1	-1	-1	-1	1	1	-1	-1
+Y T LONGLONG 2 0 - 63
+Q (`l1` = `vc`)
+M V 1	1	1	0	0	0	0	0	0	0	0	0	NULL	1	0	0	0	0	0	0	0	0	0	1
+M T LONG 1 0 - 63
+Y V 1	1	1	0	0	0	0	0	0	0	0	0	NULL	1	0	0	0	0	0	0	0	0	0	1
+Y T LONGLONG 1 0 - 63
+Q CONCAT(`l1`, `vc`)
+M V 	aa	AA	éabc	ÉABC 	e1	ß12abc	ssété	€b	abc ab%	11e2	xz	NULL	AA	éabc	ÉABC 	e1	ß12abc	ssété	€b	abc ab%	11e2	xz	
+M T VAR_STRING 160 39 - 224
+Y V 	aa	AA	éabc	ÉABC 	e1	ß12abc	ssété	€b	abc ab%	11e2	xz	NULL	AA	éabc	ÉABC 	e1	ß12abc	ssété	€b	abc ab%	11e2	xz	
+Y T VAR_STRING 160 31 - 255
+Q (`l1` LIKE '%é%')
+M V 0	0	0	1	1	1	0	0	0	0	0	0	NULL	0	1	1	1	0	0	0	0	0	0	0
+M T LONG 1 0 - 63
+Y V 0	0	0	1	1	1	0	0	0	0	0	0	NULL	0	1	1	1	0	0	0	0	0	0	0
+Y T LONGLONG 1 0 - 63
+Q (`l1` IN ('é', 'e', '€'))
+M V 0	0	0	1	1	1	0	0	1	0	0	0	NULL	0	1	1	1	0	0	1	0	0	0	0
+M T LONG 1 0 - 63
+Y V 0	0	0	1	1	1	0	0	1	0	0	0	NULL	0	1	1	1	0	0	1	0	0	0	0
+Y T LONGLONG 1 0 - 63
+# == REPLACE on MariaDB answers the string for an empty search string, even with a NULL replacement
+Q REPLACE('abc', '', NULL)
+M V abc
+M T VAR_STRING 12 39 - 224
+Y V NULL
+Y T VAR_STRING 12 31 - 255

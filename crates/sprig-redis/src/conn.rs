@@ -5,7 +5,9 @@
 //! Commands already buffered are taken up to
 //! [`GROUP_MAX_COMMANDS`] at a time; a run of guarded writes and `GET`s
 //! among them runs as one group ([`crate::batch::Group`]: one statement,
-//! one commit), its replies written after the commit.
+//! one commit), its replies written after the commit. On a database stored
+//! on the storage engine, a run of the engine's commands is one engine
+//! batch instead ([`Session::handle_engine`]).
 //!
 //! While a command runs (a blocking pop may wait for minutes), the loop
 //! keeps reading into its buffer, so a client that goes away ends the
@@ -64,9 +66,19 @@ where
                 }
                 let mut at = 0;
                 while at < cmds.len() {
-                    let group = sess.group(&cmds[at..]);
+                    // A run of commands on a storage-engine database is one
+                    // batch: one commit, replies once it is durable.
+                    let engine = sess.engine_len(&cmds[at..]);
+                    let group = if engine == 0 {
+                        sess.group(&cmds[at..])
+                    } else {
+                        None
+                    };
                     let replies = {
                         let fut = async {
+                            if engine > 0 {
+                                return sess.handle_engine(&cmds[at..at + engine]).await;
+                            }
                             match &group {
                                 Some(g) => sess.handle_group(g, &cmds[at..]).await,
                                 None => vec![sess.handle(cmds[at].clone()).await],

@@ -1036,8 +1036,38 @@ impl<'a> Resolve<'a> {
         self.rls.tables.get(&o).cloned()
     }
 
-    fn render_one(&self, t: &TableRls, bit: u8, qual: &str, table_name: &str) -> Result<String> {
-        let c = t.combination(bit, Clause::Using);
+    /// The session's condition on the new row versions command `bit`
+    /// (`cmd::INSERT`, `cmd::UPDATE`) writes into protected table `key`:
+    /// each applying policy's `WITH CHECK`, or its `USING` where it has
+    /// none, combined as [`Resolver::predicate`] combines `USING`, with
+    /// the session's values bound and columns qualified with `qual`. It is
+    /// what MariaDB's write triggers check; the storage engine evaluates
+    /// it itself. A `NULL` result fails, as there.
+    ///
+    /// # Errors
+    /// The policy's (39364).
+    pub fn new_row_check(&self, key: usize, bit: u8, qual: &str) -> Result<String> {
+        let t = self
+            .table(key)
+            .ok_or_else(|| SprigError::internal("an unknown protected table"))?;
+        let name = self
+            .cat
+            .objects
+            .get(t.object)
+            .map(|o| o.name.clone())
+            .unwrap_or_default();
+        self.render_one(&t, bit, Clause::Check, qual, &name)
+    }
+
+    fn render_one(
+        &self,
+        t: &TableRls,
+        bit: u8,
+        clause: Clause,
+        qual: &str,
+        table_name: &str,
+    ) -> Result<String> {
+        let c = t.combination(bit, clause);
         let nbe = self.lex.no_backslash_escapes;
         let claim = |k: &str| {
             self.values
@@ -1202,7 +1232,7 @@ impl Resolver for Resolve<'_> {
                 // A policy reading only the key filters the element row
                 // itself; any other reads the element's key row (its
                 // primary key) and applies the key table's policies there.
-                let r = self.render_one(&t, bit, "`__sprig_kq`", &name)?;
+                let r = self.render_one(&t, bit, Clause::Using, "`__sprig_kq`", &name)?;
                 parts.push(key_only(&r, qual).unwrap_or_else(|| {
                     format!(
                         "EXISTS (SELECT 1 FROM {}.{} AS `__sprig_kq` WHERE `__sprig_kq`.`k` = \
@@ -1213,7 +1243,7 @@ impl Resolver for Resolve<'_> {
                 }));
                 continue;
             }
-            parts.push(self.render_one(&t, bit, qual, &name)?);
+            parts.push(self.render_one(&t, bit, Clause::Using, qual, &name)?);
         }
         let s = if parts.len() == 1 {
             parts.remove(0)

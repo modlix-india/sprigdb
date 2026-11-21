@@ -143,6 +143,16 @@ fn a_crash_fails_every_reply_that_depends_on_lost_entries() {
 async fn async_waits_and_tickets() {
     let b = mem_bed_with(UnitConfig::default(), Duration::from_millis(2));
     let unit = b.clone();
+    {
+        // The counter exists before the tasks start. On a missing row the
+        // locking read would keep only a gap lock, and the tasks' inserts
+        // would then wait for each other inside `put`, on the runtime's
+        // threads (and deadlock, as they do in `InnoDB`).
+        let mut t = unit.begin(TxnOptions::mariadb());
+        t.put(k("ctr"), bytes::Bytes::copy_from_slice(&0u64.to_be_bytes()))
+            .unwrap();
+        t.commit().unwrap().wait_async().await.unwrap();
+    }
     let mut tasks = Vec::new();
     for _ in 0..16 {
         let unit = unit.clone();

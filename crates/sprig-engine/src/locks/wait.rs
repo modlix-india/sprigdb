@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-use super::{LockTable, TxnId};
+use super::{Interrupt, LockTable, TxnId};
 
 /// Where a queued request stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +17,7 @@ pub(crate) enum SlotState {
     Waiting,
     Granted,
     Deadlock,
+    Interrupted(Interrupt),
 }
 
 /// How a wait ended.
@@ -28,6 +29,9 @@ pub enum WaitOutcome {
     TimedOut,
     /// Chosen as a deadlock victim while waiting (1213).
     Deadlock,
+    /// Ended from outside: `KILL QUERY` or a statement time limit. The
+    /// request was withdrawn.
+    Interrupted(Interrupt),
 }
 
 #[derive(Debug)]
@@ -94,17 +98,28 @@ pub struct LockWait {
     table: Arc<LockTable>,
     txn: TxnId,
     key: Bytes,
+    insert: bool,
+    upgrade: bool,
     slot: Arc<Slot>,
     started: Instant,
     done: bool,
 }
 
 impl LockWait {
-    pub(crate) fn new(table: Arc<LockTable>, txn: TxnId, key: Bytes, slot: Arc<Slot>) -> Self {
+    pub(crate) fn new(
+        table: Arc<LockTable>,
+        txn: TxnId,
+        key: Bytes,
+        insert: bool,
+        upgrade: bool,
+        slot: Arc<Slot>,
+    ) -> Self {
         Self {
             table,
             txn,
             key,
+            insert,
+            upgrade,
             slot,
             started: Instant::now(),
             done: false,
@@ -115,8 +130,29 @@ impl LockWait {
         match s {
             SlotState::Granted => WaitOutcome::Granted,
             SlotState::Deadlock => WaitOutcome::Deadlock,
+            SlotState::Interrupted(why) => WaitOutcome::Interrupted(why),
             SlotState::Waiting => WaitOutcome::TimedOut,
         }
+    }
+
+    /// The key the request is for.
+    #[must_use]
+    pub fn key(&self) -> &Bytes {
+        &self.key
+    }
+
+    /// Whether this is an insert waiting for gap locks (true) or a record
+    /// lock request (false).
+    #[must_use]
+    pub fn is_insert_intention(&self) -> bool {
+        self.insert
+    }
+
+    /// Whether the request upgrades a shared lock the transaction already
+    /// holds.
+    #[must_use]
+    pub fn is_upgrade(&self) -> bool {
+        self.upgrade
     }
 
     fn finish(mut self, out: WaitOutcome) -> WaitOutcome {
@@ -131,7 +167,7 @@ impl LockWait {
             None => SlotFuture(&self.slot).await,
             Some(d) => {
                 let Ok(s) = tokio::time::timeout(d, SlotFuture(&self.slot)).await else {
-                    let out = self.table.cancel_wait(self.txn, &self.key, &self.slot);
+                    let out = self.table.cancel_wait(self.txn, &self.slot);
                     return self.finish(out);
                 };
                 s
@@ -175,7 +211,7 @@ impl LockWait {
         };
         let out = match state {
             Some(s) => Self::outcome(s),
-            None => self.table.cancel_wait(self.txn, &self.key, &self.slot),
+            None => self.table.cancel_wait(self.txn, &self.slot),
         };
         self.finish(out)
     }
@@ -187,7 +223,7 @@ impl Drop for LockWait {
             // Abandoned (for example a killed query): withdraw the request.
             // A grant that raced in is kept until the transaction ends, like
             // any lock a failed statement took.
-            let _ = self.table.cancel_wait(self.txn, &self.key, &self.slot);
+            let _ = self.table.cancel_wait(self.txn, &self.slot);
         }
     }
 }

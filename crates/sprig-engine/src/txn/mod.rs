@@ -14,6 +14,22 @@
 //! locking read of a row whose latest version is newer than the open view
 //! fails with 1020 and rolls the transaction back.
 //!
+//! **What a locking read keeps locked** (as clients of `InnoDB` observe it):
+//! - One key ([`Txn::lock_get`]): a row that is found is record-locked. A
+//!   row that is missing leaves a gap lock on the place it would be, at
+//!   REPEATABLE READ and SERIALIZABLE; nothing at READ COMMITTED.
+//! - A range ([`Txn::scan_lock`]): every row read is record-locked. At
+//!   REPEATABLE READ and SERIALIZABLE the scanned stretch is gap-locked too,
+//!   so no other transaction can insert into it and a repeated read sees no
+//!   phantom. Gaps are bounded by the range's own bounds and the rows read,
+//!   not by the neighbouring rows outside the range. At READ COMMITTED only
+//!   rows are locked, rows that fail the `WHERE` are unlocked again, and
+//!   `UPDATE`/`DELETE` scans may read semi-consistently
+//!   ([`Txn::scan_lock_where`]).
+//! - An insert ([`Txn::lock_insert`]): the duplicate check keeps its lock
+//!   on a row it collides with; a new row waits while another transaction's
+//!   gap lock covers its key.
+//!
 //! **Commit.** The write set becomes one log entry with one commit
 //! timestamp. Under the unit's commit latch the entry is proposed (which
 //! gives it its log index) and its versions enter the pending overlay; then
@@ -40,6 +56,7 @@ mod shared;
 pub mod testing;
 mod transaction;
 pub mod write_set;
+pub mod xa;
 
 use std::time::Duration;
 
@@ -48,10 +65,13 @@ use sprig_common::Result;
 pub use durable::DurableTicket;
 pub use hlc::Ts;
 pub use shared::{TxnShared, TxnStats};
-pub use transaction::{AbortReason, CommitTicket, LockRequest, Locked, Savepoint, Txn, TxnState};
+pub use transaction::{
+    AbortReason, CommitTicket, InsertLock, InsertProbe, InterruptHandle, LockRequest, Locked,
+    Savepoint, Txn, TxnState,
+};
 
 use crate::Engine;
-pub use crate::locks::{LockMode, Wait};
+pub use crate::locks::{Interrupt, LockMode, Wait};
 use crate::log::Durability;
 use crate::store::SortedStore;
 
@@ -217,6 +237,10 @@ pub trait CommitPath: Send + Sync {
     fn propose(&self, payload: Vec<u8>, durability: Option<Durability>) -> Result<DurableTicket>;
     /// The highest index applied to the store.
     fn applied_index(&self) -> u64;
+    /// The unit's id: it names the unit's reserved bookkeeping keys.
+    fn unit_id(&self) -> u64 {
+        0
+    }
     /// Tells the store side the oldest timestamp readers may still need.
     fn set_gc_watermark(&self, _ts: Ts) {}
     /// The highest commit timestamp recovered from the log, if this path
@@ -244,6 +268,10 @@ impl CommitPath for Engine {
 
     fn applied_index(&self) -> u64 {
         self.consensus().applied_index(self.unit())
+    }
+
+    fn unit_id(&self) -> u64 {
+        self.unit().0
     }
 
     fn set_gc_watermark(&self, ts: Ts) {

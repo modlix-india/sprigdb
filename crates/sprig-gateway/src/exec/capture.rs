@@ -91,6 +91,59 @@ impl PassSession {
         Some(p)
     }
 
+    /// [`PassSession::wl_start_stmt`] for a caller that already knows the
+    /// session's current database and lexer options (the engine's prepared
+    /// path keeps them from one execute to the next): nothing is worked
+    /// out again, and nothing is allocated, while the statement's kept
+    /// fingerprint still fits.
+    pub(super) fn wl_start_stmt_known(
+        &mut self,
+        stmt: crate::pipeline::StmtRef,
+        logical: &[u8],
+        db: Option<&str>,
+        lex: sprig_sql::lex::LexOptions,
+    ) -> Option<Pending> {
+        if crate::workload::task_caller().is_some() {
+            return self.wl_start(logical);
+        }
+        let (version, max_text) = {
+            let wl = self.wl.as_ref()?;
+            let ts = self.tenant.as_deref()?;
+            (
+                ts.catalog().map_or(0, |c| c.version),
+                wl.workload().max_text_bytes(),
+            )
+        };
+        let cached = self
+            .stmts
+            .get_mut(stmt)
+            .ok()
+            .and_then(|s| s.fp.as_ref())
+            .filter(|(k, _)| {
+                k.version == version
+                    && k.db.as_deref() == db
+                    && k.lex == lex
+                    && k.max_text == max_text
+            })
+            .map(|(_, fp)| fp.clone());
+        if let Some(fp) = cached {
+            let wl = self.wl.as_ref()?;
+            let tenant = self.tenant.as_deref()?.tenant;
+            return Some(wl.start(tenant, fp, self.wl_multi));
+        }
+        let p = self.wl_start(logical)?;
+        if let Ok(s) = self.stmts.get_mut(stmt) {
+            let key = FpKey {
+                version,
+                db: db.map(str::to_owned),
+                lex,
+                max_text,
+            };
+            s.fp = Some((key, p.fingerprint().clone()));
+        }
+        Some(p)
+    }
+
     /// Fingerprints `logical` (a tenant statement's text, logical names)
     /// and asks the recorder for a plan. `None` without capture or tenant.
     pub(super) fn wl_start(&self, logical: &[u8]) -> Option<Pending> {

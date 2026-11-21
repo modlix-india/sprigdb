@@ -243,6 +243,19 @@ impl Writer {
         self.buf.freeze()
     }
 
+    /// A writer appending to `buf` (an existing buffer, so encoding into
+    /// a connection's write buffer allocates nothing).
+    #[must_use]
+    pub fn from_buf(buf: BytesMut) -> Self {
+        Self { buf }
+    }
+
+    /// The buffer, with what was written appended.
+    #[must_use]
+    pub fn into_buf(self) -> BytesMut {
+        self.buf
+    }
+
     /// The underlying buffer.
     pub fn buf_mut(&mut self) -> &mut BytesMut {
         &mut self.buf

@@ -584,6 +584,9 @@ impl PassSession {
         if client {
             self.release_hier_locks().await;
         }
+        // Any text statement may change a session variable or the current
+        // database: the engine path reads them again.
+        self.eng.stale();
         let r = Box::pin(self.tenant_text_one(cx, text, attrs, more, format, out)).await;
         if client {
             self.release_hier_locks().await;
@@ -1787,6 +1790,19 @@ impl PassSession {
             }
         }
         if let Some(target) = &sp.info.ddl {
+            // DDL an engine database's rows can't follow.
+            if let Err(e) = self.engine_ddl_check(target, original) {
+                return Ok(Route::Done(self.fail(out, &e).await?));
+            }
+            // DDL commits the session's transaction on the engine first,
+            // as it commits MariaDB's.
+            let mut s = s;
+            if self.engine_ddl_commits(target) {
+                if let Err(e) = self.engine_implicit_commit().await {
+                    return Ok(Route::Done(self.fail(out, &e).await?));
+                }
+                s.remove(StatusFlags::IN_TRANS | StatusFlags::IN_TRANS_READONLY);
+            }
             return Box::pin(self.ddl(cx, &sp, target, original, s, out)).await;
         }
         if is_ddl_kind(sp.info.kind) && !sp.info.nested_ddl {
@@ -2056,6 +2072,18 @@ impl PassSession {
                 std::time::Duration::from_secs(mins.saturating_mul(60)),
             ))
         });
+        // A change of an engine database's tables: the engine takes part in
+        // the statement (its rows follow the new definition, or the
+        // statement fails and nothing changes).
+        let engine_hook = self
+            .engine_ddl_hook(cx, target)
+            .map(|h| h.with_services(Arc::clone(&svc)));
+        if engine_hook.is_some() && layout.is_some() {
+            let e = crate::engine::not_on_engine(
+                "a definition change on an engine database of a tenant with sharded table groups",
+            );
+            return Ok(Route::Done(self.fail(out, &e).await?));
+        }
         self.tenant_bs(cx);
         // Gaps row 53: `VERSION()` in a body gives this persona's version.
         let version = self.settings.persona_version(self.persona);
@@ -2084,7 +2112,10 @@ impl PassSession {
                     }
                     svc.ddl.execute(&req, &sharded).await
                 }
-                None => svc.ddl.execute(&req, &exec).await,
+                None => match &engine_hook {
+                    Some(h) => svc.ddl.execute(&req, &h.over(&exec)).await,
+                    None => svc.ddl.execute(&req, &exec).await,
+                },
             }
         };
         // The lookups of the keys the statement added; a failed build
@@ -2130,6 +2161,23 @@ impl PassSession {
             },
             (r, _) => r,
         };
+        // The engine applies a published change of its tables, and gives
+        // up one that wasn't published.
+        let engine_report = self
+            .engine_ddl_done(
+                engine_hook,
+                result.is_err(),
+                result.as_ref().ok().and_then(|o| o.version),
+            )
+            .await;
+        engine_notes.extend(engine_report.conds.iter().map(|c| LocalWarning {
+            level: match c.level {
+                crate::engine::assign::Level::Note => "Note",
+                crate::engine::assign::Level::Warning => "Warning",
+            },
+            code: c.code,
+            message: c.message.clone(),
+        }));
         if result.as_ref().is_ok_and(|o| o.version.is_some()) && !lookup_owners.is_empty() {
             match crate::tenant::lookups_sql::drop_owned(&svc, tenant, &lookup_owners).await {
                 Ok(names) => {
@@ -2260,6 +2308,15 @@ impl PassSession {
                         engine_notes.len(),
                     ));
                 }
+                // The rows of an engine table that the servers report as
+                // copied (its MariaDB copy has none).
+                if let Some(rows) = engine_report.rows {
+                    ok.affected_rows = rows;
+                    ok.info = Bytes::from(format!(
+                        "Records: {rows}  Duplicates: 0  Warnings: {}",
+                        engine_notes.len()
+                    ));
+                }
                 if matches!(stmt, DdlStatement::DropDatabase { .. })
                     && self.current_logical().is_none()
                     && current.is_some()
@@ -2324,6 +2381,10 @@ impl PassSession {
         show_sql: &[u8],
         head: &str,
     ) -> Result<String> {
+        // The engine's table: its own definition.
+        if let Some(text) = Box::pin(self.engine_show_create_text(show_sql)).await {
+            return create_like_sql(head, &text?).ok_or_else(ddl_unsupported);
+        }
         self.tenant_bs(cx);
         let Some(bs) = self.bs.as_mut() else {
             return Err(SprigError::internal("no backend session"));
@@ -2418,6 +2479,22 @@ impl PassSession {
         map: &dyn NameMap,
         out: &mut dyn ResultSink,
     ) -> Result<Step> {
+        // An engine database's statement runs in the gateway, never on
+        // its empty MariaDB copy.
+        if let Some(step) = Box::pin(self.engine_text(cx, &sql, logical, more, format, out)).await?
+        {
+            return Ok(step);
+        }
+        // A transaction on the engine stays open across a statement
+        // MariaDB answers: the answer's status flags say so.
+        let txn_flags = self.engine_txn_flags();
+        let mut txn_sink;
+        let out: &mut dyn ResultSink = if txn_flags.is_empty() {
+            out
+        } else {
+            txn_sink = super::engine_seam::TxnSink::new(out, txn_flags);
+            &mut txn_sink
+        };
         let (piece, mut renames) = self.session_rewrites(sql, cx.session.id.0);
         renames.append(&mut self.subst);
         let infile_name = split::local_infile_name(&piece);
@@ -2428,6 +2505,13 @@ impl PassSession {
             if !allowed {
                 return Err(local_infile_disabled(self.persona));
             }
+        }
+        // A `SHOW` about tables: the engine answers (no table exists on
+        // MariaDB), through the same name mapping.
+        if let Some(answer) = Box::pin(self.engine_show(&piece)).await {
+            return self
+                .engine_show_answer(cx, answer, more, format, mapper, map, out)
+                .await;
         }
         let info = StmtInfo::classify(&piece);
         let conn_status = self.conn_status_for(&piece, cx.proto);
@@ -2488,7 +2572,10 @@ impl PassSession {
         }
         Ok(Step {
             errored: relayed.errored,
-            status: outcome.map(|o| o.status).or(relayed.status),
+            status: outcome
+                .map(|o| o.status)
+                .or(relayed.status)
+                .map(|s| s | txn_flags),
         })
     }
 
@@ -3002,6 +3089,13 @@ impl PassSession {
                 return Ok(self.prepared_deferred(sql, cols));
             }
         };
+        // An engine database's statement: planned once, here.
+        if let Some(summary) =
+            Box::pin(self.engine_prepare(cx, &rewritten, &sql, &client_text, recheck.clone()))
+                .await?
+        {
+            return Ok(summary);
+        }
         self.tenant_bs(cx);
         let mut summary = self.prepare(cx, rewritten).await?;
         let accounts = Accounts(self.tenant.as_deref().and_then(|t| t.auth()));
@@ -3029,7 +3123,7 @@ impl PassSession {
     }
 
     /// A prepared statement kept as text, answered at execute time.
-    fn prepared_deferred(&mut self, sql: Bytes, columns: Vec<ColumnDef>) -> ExecSummary {
+    pub(super) fn prepared_deferred(&mut self, sql: Bytes, columns: Vec<ColumnDef>) -> ExecSummary {
         let st = Stmt::deferred(sql, columns.clone());
         let stmt = self.stmts.insert(st);
         metrics::gauge!("sprig_mysql_prepared_statements", "persona" => self.persona.as_str())

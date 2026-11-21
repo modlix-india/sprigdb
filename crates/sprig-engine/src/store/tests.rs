@@ -337,6 +337,71 @@ fn rocks_cache_only_reads_would_block() {
     );
 }
 
+/// Versioned point reads keep their cursors between calls. A kept cursor
+/// must see every later write, on every thread, across flushes and
+/// compactions, and the store must close (and open again) with cursors
+/// still kept.
+#[test]
+fn rocks_kept_point_cursors_see_later_writes() {
+    let dir = TempDir::new("kept");
+    let opts = RocksOptions::default();
+    let read = |s: &RocksStore, logical: &[u8], at: Ts| {
+        let mut buf = Vec::new();
+        s.get_version(Cf::Data, logical, at, ReadTier::All, &mut buf)
+            .unwrap()
+            .expect_ready()
+            .unwrap()
+            .map(|t| (t, buf))
+    };
+    {
+        let s = RocksStore::open(dir.path(), &opts).unwrap();
+        assert_eq!(read(&s, b"a", Ts::MAX), None);
+        for round in 1..=40u64 {
+            let mut b = StoreBatch::new();
+            b.put(
+                Cf::Data,
+                keys::versioned(b"a", Ts(round)),
+                round.to_be_bytes().to_vec(),
+            );
+            s.write(&b, WalMode::Off).unwrap();
+            // The cursor kept by the read before this write sees it.
+            assert_eq!(
+                read(&s, b"a", Ts::MAX),
+                Some((Ts(round), round.to_be_bytes().to_vec()))
+            );
+            // An older timestamp still reads the older version.
+            if round > 1 {
+                assert_eq!(
+                    read(&s, b"a", Ts(round - 1)).map(|(t, _)| t),
+                    Some(Ts(round - 1))
+                );
+            }
+            // A key that isn't there, between two that are.
+            assert_eq!(read(&s, b"b", Ts::MAX), None);
+            match round % 10 {
+                3 => s.flush_all().unwrap(),
+                7 => s.compact_all().unwrap(),
+                9 => s.release_idle_reads(),
+                _ => {}
+            }
+        }
+        // Other threads have their own cursors; all read the same state.
+        std::thread::scope(|sc| {
+            for _ in 0..8 {
+                sc.spawn(|| {
+                    for _ in 0..50 {
+                        assert_eq!(read(&s, b"a", Ts::MAX).map(|(t, _)| t), Some(Ts(40)));
+                        assert_eq!(read(&s, b"a", Ts(5)).map(|(t, _)| t), Some(Ts(5)));
+                    }
+                });
+            }
+        });
+        // Dropped here with cursors kept on nine threads' pools.
+    }
+    let s = RocksStore::open(dir.path(), &opts).unwrap();
+    assert_eq!(read(&s, b"a", Ts::MAX).map(|(t, _)| t), Some(Ts(40)));
+}
+
 /// With the WAL off and no flush, a close that skips the flush loses the
 /// memtable, exactly like a crash. A `Local` (WAL on) write survives.
 #[test]

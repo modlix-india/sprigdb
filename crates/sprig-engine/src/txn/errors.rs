@@ -65,6 +65,57 @@ pub fn lock_table_full() -> SprigError {
     )
 }
 
+/// `ER_QUERY_INTERRUPTED`: `KILL QUERY`.
+pub const ER_QUERY_INTERRUPTED: u16 = 1317;
+/// `ER_STATEMENT_TIMEOUT`: MariaDB's `max_statement_time`.
+pub const ER_STATEMENT_TIMEOUT: u16 = 1969;
+/// `ER_QUERY_TIMEOUT`: MySQL's `max_execution_time`.
+pub const ER_QUERY_TIMEOUT: u16 = 3024;
+/// `ER_XA_RBDEADLOCK`: a deadlock victim inside an XA transaction.
+pub const ER_XA_RBDEADLOCK: u16 = 1614;
+/// `ER_XA_RBTIMEOUT`: a lock wait timeout that rolled back an XA transaction.
+pub const ER_XA_RBTIMEOUT: u16 = 1613;
+
+/// 1317: the statement was killed while it waited.
+#[must_use]
+pub fn query_interrupted() -> SprigError {
+    SprigError::standard(
+        ER_QUERY_INTERRUPTED,
+        *b"70100",
+        "Query execution was interrupted",
+    )
+}
+
+/// 1969 (MariaDB): the statement's time limit passed while it waited.
+#[must_use]
+pub fn statement_timeout_mariadb() -> SprigError {
+    SprigError::standard(
+        ER_STATEMENT_TIMEOUT,
+        *b"70100",
+        "Query execution was interrupted (max_statement_time exceeded)",
+    )
+}
+
+/// 3024 (MySQL): the statement's time limit passed while it waited.
+#[must_use]
+pub fn statement_timeout_mysql() -> SprigError {
+    SprigError::standard(
+        ER_QUERY_TIMEOUT,
+        *b"HY000",
+        "Query execution was interrupted, maximum statement execution time exceeded",
+    )
+}
+
+/// 1614: a deadlock victim inside an XA transaction.
+#[must_use]
+pub fn xa_deadlock() -> SprigError {
+    SprigError::standard(
+        ER_XA_RBDEADLOCK,
+        *b"40001",
+        "XA_RBDEADLOCK: Transaction branch was rolled back: deadlock was detected",
+    )
+}
+
 /// The MySQL error number of `e`, if it is a standard or passed-through one.
 #[must_use]
 pub fn errno(e: &SprigError) -> Option<u16> {

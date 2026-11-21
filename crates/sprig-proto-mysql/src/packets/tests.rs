@@ -21,7 +21,10 @@ fn server_defaults_follow_the_capability_table() {
     assert!(!maria.contains(Caps::CLIENT_MYSQL));
     assert!(!maria.contains(Caps::ZSTD_COMPRESSION_ALGORITHM));
     assert!(maria.contains(Caps::MARIADB_CLIENT_EXTENDED_METADATA));
-    assert_eq!(maria.extended(), 0b1100);
+    // The metadata cache is MariaDB's own: MySQL's listener never offers it.
+    assert!(maria.contains(Caps::MARIADB_CLIENT_CACHE_METADATA));
+    assert!(!my.contains(Caps::MARIADB_CLIENT_CACHE_METADATA));
+    assert_eq!(maria.extended(), 0b1_1100);
 }
 
 #[test]

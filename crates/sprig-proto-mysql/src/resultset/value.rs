@@ -1,7 +1,7 @@
 //! The binary protocol's value encoding, used by binary resultset rows and
 //! by `COM_STMT_EXECUTE` and `COM_STMT_BULK_EXECUTE` parameters.
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 use super::column_type as ct;
 use super::{ColumnDef, PARAM_UNSIGNED};
@@ -369,6 +369,41 @@ pub fn encode_binary_row_types(values: &[Value], types: &[u8]) -> ProtoResult<By
         encode_binary_value(&mut w, v, t)?;
     }
     Ok(w.into_bytes())
+}
+
+/// [`encode_binary_row`], appended to `out` (no allocation for rows of up
+/// to 254 columns).
+///
+/// # Errors
+/// As [`encode_binary_row_types`].
+pub fn encode_binary_row_into(
+    values: &[Value],
+    columns: &[ColumnDef],
+    out: &mut BytesMut,
+) -> ProtoResult<()> {
+    if values.len() != columns.len() || values.len() > 254 {
+        let b = encode_binary_row(values, columns)?;
+        out.extend_from_slice(&b);
+        return Ok(());
+    }
+    let mut bitmap = [0u8; 32];
+    let n = null_bitmap_len(values.len(), 2);
+    for (i, v) in values.iter().enumerate() {
+        if v.is_null() {
+            null_bitmap_set(&mut bitmap, i, 2);
+        }
+    }
+    let mut w = Writer::from_buf(std::mem::take(out));
+    w.u8(0).bytes(&bitmap[..n]);
+    let mut r = Ok(());
+    for (v, c) in values.iter().zip(columns) {
+        r = encode_binary_value(&mut w, v, c.col_type);
+        if r.is_err() {
+            break;
+        }
+    }
+    *out = w.into_buf();
+    r
 }
 
 /// Encodes a binary row for these columns.
