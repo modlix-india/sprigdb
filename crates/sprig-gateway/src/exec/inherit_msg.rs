@@ -3,61 +3,47 @@
 //! logic layer's declarations:
 //!
 //! ```text
-//! CREATE STREAM s FOR EACH TENANT [scope] ...      a definition: inherited_defs
-//!                                                 in this tenant, no tables
-//! CREATE [OR REPLACE] TRIGGER g ON STREAM s FOR EACH TENANT [scope]
+//! CREATE EXCHANGE | QUEUE ... FOR EACH TENANT [scope] ...   a definition
+//! BIND ... FOR EACH TENANT | UNBIND ...                     bindings
+//! CREATE [OR REPLACE] TRIGGER g ON QUEUE q FOR EACH TENANT [scope]
 //!   [GRANTS (...)] LANGUAGE ... AS ...            a trigger definition; existing
 //!                                                 instances get it in the background
-//! ALTER STREAM s PARTITIONS n | SET (...)          changes the definition
-//! DROP STREAM s [IMMEDIATE] | DROP TRIGGER g        drops it
-//! INSERT INTO s ...                  in a member: into its own instance (created
-//!                                    on first publish); headers stamped
-//! INSERT INTO s FOR TENANT t ...     in an ancestor: into t's instance
-//! INSERT INTO s (tenant, key, value) ...           one target per row
+//! DROP QUEUE | EXCHANGE | TRIGGER ... [IMMEDIATE]  drops it
 //! ALTER INHERITED kind name ...      overrides (nearest level wins)
 //! SHOW INHERITED DEFINITIONS | INSTANCES | OVERRIDES [FOR kind name]
 //! ```
 //!
-//! A publish evaluates its rows in this session (`VALUES` rows become
-//! `SELECT ... UNION ALL ...`; an `INSERT ... SELECT` runs its `SELECT`),
-//! under the user's rights, then writes the instance's outbox: through
-//! this session for its own tenant (so it joins the transaction), or as
-//! the provisioning account on the member's cluster for another tenant.
-//! Every record carries `x-sprig-tenant` (the instance's tenant) and
-//! `x-sprig-origin-tenant` (the publisher's), set here over anything the
-//! client sent.
+//! `CREATE STREAM ... FOR EACH TENANT`, and publishes `FOR TENANT`, `IN
+//! TENANT` or `FOR ALL TENANTS`, answer 1235: streams are stored on the
+//! engine, whose inherited instances aren't built yet.
 
 // Lexing options are passed by reference, as the lexer takes them.
 #![allow(clippy::trivially_copy_pass_by_ref)]
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use mysql_async::prelude::Queryable;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use sprig_auth::authz::{Action, Target};
 use sprig_catalog::TenantCatalog;
 use sprig_catalog::ddl::{database_key, object_key};
-use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::ObjectKind;
 use sprig_common::ids::TenantId;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_inherit::msg::grammar::{self, AlterOp, For, ShowInherited, Stmt};
 use sprig_inherit::msg::{
     AppliesTo, Cause, Chain, DefKey, DefKind, DefState, Definition, MsgState, Override, Scope,
-    StreamSpec, TriggerSpec, What,
+    TriggerSpec, What,
 };
 use sprig_proto_mysql::StatusFlags;
 use sprig_proto_mysql::command::QueryAttrs;
 use sprig_proto_mysql::packets::OkPacket;
 use sprig_sql::lex::{LexOptions, TokenKind, lex};
-use sprig_streams::grammar::InsertInto;
 use sprig_streams::publish::Publish;
 
 use super::PassSession;
 use super::tenant::Step;
-use crate::inherited::{self, MsgWrite, streams, target_err, triggers};
+use crate::inherited::{self, MsgWrite, target_err, triggers};
 use crate::pipeline::{ExecCtx, ResultSink, RowFormat};
 use crate::tenant::TenantServices;
 use crate::tenant::session::{LocalWarning, TenantSession};
@@ -68,8 +54,15 @@ enum Reply {
     Ok(u64, Vec<String>),
     /// A result set.
     Rows(Vec<&'static str>, Vec<Vec<Option<String>>>),
-    /// Run this statement instead, on the ordinary path.
-    Forward(String),
+}
+
+/// Inherited streams: their instances, publishes and fan-in were built for
+/// streams kept in MariaDB.
+fn streams_not_built() -> SprigError {
+    not_built(
+        "FOR EACH TENANT on a stream: streams are stored on the SprigDB engine, whose inherited \
+         instances aren't built yet",
+    )
 }
 
 fn not_built(what: &str) -> SprigError {
@@ -127,143 +120,6 @@ fn first_word(sql: &str, lex_opts: &LexOptions) -> Option<String> {
     (t.kind == TokenKind::Word).then(|| sql[t.range()].to_ascii_lowercase())
 }
 
-/// `VALUES (a, b), (c, d)` → `SELECT a, b UNION ALL SELECT c, d`; a
-/// `SELECT` (or `WITH`, or a parenthesized query) as it is.
-///
-/// # Errors
-/// 1064 for anything else.
-pub(crate) fn rows_query(tail: &str, lex_opts: &LexOptions) -> Result<String> {
-    let syntax = || {
-        SprigError::standard(
-            1064,
-            *b"42000",
-            format!(
-                "You have an error in your SQL syntax near '{}'",
-                tail.chars().take(40).collect::<String>()
-            ),
-        )
-    };
-    let toks: Vec<_> = lex(tail.as_bytes(), lex_opts)
-        .map_err(|_| syntax())?
-        .into_iter()
-        .filter(|t| !t.kind.is_trivia())
-        .collect();
-    let Some(first) = toks.first() else {
-        return Err(syntax());
-    };
-    let w = tail[first.range()].to_ascii_lowercase();
-    if w == "select" || w == "with" || &tail[first.range()] == "(" {
-        return Ok(tail.trim().trim_end_matches(';').to_owned());
-    }
-    if w != "values" && w != "value" {
-        return Err(syntax());
-    }
-    let mut out = Vec::new();
-    let mut depth = 0usize;
-    let mut start = 0usize;
-    for t in &toks[1..] {
-        let s = &tail[t.range()];
-        if t.kind == TokenKind::Punct && s == "(" {
-            if depth == 0 {
-                start = t.end as usize;
-            }
-            depth += 1;
-        } else if t.kind == TokenKind::Punct && s == ")" {
-            depth = depth.checked_sub(1).ok_or_else(syntax)?;
-            if depth == 0 {
-                out.push(format!("SELECT {}", &tail[start..t.start as usize]));
-            }
-        } else if depth == 0 && !(t.kind == TokenKind::Punct && (s == "," || s == ";")) {
-            return Err(syntax());
-        }
-    }
-    if out.is_empty() || depth != 0 {
-        return Err(syntax());
-    }
-    Ok(out.join(" UNION ALL "))
-}
-
-/// Where each column of a publish goes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Col {
-    Key,
-    Value,
-    Headers,
-    Partition,
-    Tenant,
-}
-
-/// The column list and the rows' text of an insert.
-fn insert_shape(sql: &str, i: &InsertInto) -> Result<(Vec<Col>, String)> {
-    let cols = match &i.columns {
-        Some(cs) => cs
-            .iter()
-            .map(|(n, _)| match n.to_ascii_lowercase().as_str() {
-                "key" | "k" => Ok(Col::Key),
-                "value" | "v" => Ok(Col::Value),
-                "headers" => Ok(Col::Headers),
-                "partition_no" => Ok(Col::Partition),
-                "tenant" => Ok(Col::Tenant),
-                "ts" => Err(not_built(
-                    "the ts column on a publish into an inherited stream",
-                )),
-                _ => Err(SprigError::standard(
-                    1054,
-                    *b"42S22",
-                    format!("Unknown column '{n}' in 'field list'"),
-                )),
-            })
-            .collect::<Result<Vec<_>>>()?,
-        None => match i.first_row_arity {
-            Some(2) => vec![Col::Key, Col::Value],
-            _ => vec![Col::Key, Col::Value, Col::Headers],
-        },
-    };
-    let after = match &i.columns {
-        Some(cs) => {
-            let last = cs.last().map_or(i.after_target, |(_, r)| r.end);
-            sql[last..].find(')').map_or(last, |p| last + p + 1)
-        }
-        None => i.after_target,
-    };
-    Ok((cols, sql[after..].to_owned()))
-}
-
-/// One evaluated row: its target tenant name (the `tenant` column) and its
-/// record.
-struct Row {
-    tenant: Option<String>,
-    rec: Publish,
-}
-
-fn stamp(headers: Option<&[u8]>, tenant: &str, origin: &str) -> Result<String> {
-    let mut m: Map<String, Value> = match headers {
-        None => Map::new(),
-        Some(b) => match serde_json::from_slice::<Value>(b) {
-            Ok(Value::Object(m)) => m,
-            Ok(Value::Null) => Map::new(),
-            _ => {
-                return Err(SprigError::standard(
-                    3140,
-                    *b"22032",
-                    "Invalid JSON text: a record's headers are a JSON object",
-                ));
-            }
-        },
-    };
-    m.insert("x-sprig-tenant".into(), json!(tenant));
-    m.insert("x-sprig-origin-tenant".into(), json!(origin));
-    Ok(Value::Object(m).to_string())
-}
-
-/// Where a publish's records go.
-enum Dest {
-    /// This session's own instance: through the session.
-    Own,
-    /// Another tenant's: as the provisioning account.
-    Other,
-}
-
 impl PassSession {
     /// The inherited-messaging step of [`PassSession::tenant_text`]: `None`
     /// when the statement isn't about inherited messaging objects.
@@ -272,7 +128,7 @@ impl PassSession {
         &mut self,
         cx: &mut ExecCtx<'_>,
         text: &Bytes,
-        attrs: &QueryAttrs,
+        _attrs: &QueryAttrs,
         more: bool,
         format: RowFormat,
         out: &mut dyn ResultSink,
@@ -319,8 +175,7 @@ impl PassSession {
         if !kw && !inherited::has_defs(&chain) && own.instances.is_empty() {
             return Ok(None);
         }
-        let r =
-            Box::pin(self.inherit_msg(cx, sql, &head, &lex_opts, &svc, &cat, &chain, &own)).await;
+        let r = Box::pin(self.inherit_msg(sql, &head, &lex_opts, &svc, &cat, &chain, &own)).await;
         let mut status = self.status();
         if more {
             status |= StatusFlags::MORE_RESULTS_EXISTS;
@@ -331,12 +186,6 @@ impl PassSession {
         };
         match r {
             Ok(None) => Ok(None),
-            Ok(Some(Reply::Forward(sql))) => {
-                let text = Bytes::from(sql.into_bytes());
-                Box::pin(self.tenant_text(cx, &text, attrs, more, format, out))
-                    .await
-                    .map(Some)
-            }
             Err(e) => Ok(Some(self.fail(out, &e).await?)),
             Ok(Some(Reply::Ok(n, notes))) => {
                 if !notes.is_empty()
@@ -384,7 +233,6 @@ impl PassSession {
     #[allow(clippy::too_many_arguments)]
     async fn inherit_msg(
         &mut self,
-        cx: &mut ExecCtx<'_>,
         sql: &str,
         head: &str,
         lex_opts: &LexOptions,
@@ -407,10 +255,7 @@ impl PassSession {
                     return self.inherit_shadow_check(sql, lex_opts, cat, chain);
                 };
                 match grammar::ddl_kind(sql, lex_opts) {
-                    Some((DefKind::Stream, false)) => self
-                        .define_stream(svc, cat, own, sql, lex_opts, &f)
-                        .await
-                        .map(Some),
+                    Some((DefKind::Stream, false)) => Err(streams_not_built()),
                     Some((DefKind::Trigger, false)) => self
                         .define_trigger(svc, cat, chain, own, sql, lex_opts, &f)
                         .await
@@ -440,22 +285,12 @@ impl PassSession {
                 None => Ok(None),
             },
             "unbind" => self.unbind_def(svc, cat, own, sql, lex_opts).await,
-            "insert" => {
-                Box::pin(self.inherit_insert(cx, svc, cat, chain, own, sql, lex_opts)).await
-            }
-            "select" if inherited::fanin::find(sql, lex_opts).is_some() => self
-                .fan_in_select(svc, cat, chain, own, sql, lex_opts)
-                .await
-                .map(Some),
-            "select" => Ok(empty_reads(
-                sql,
-                lex_opts,
-                cat,
-                chain,
-                own,
-                self.current_logical().as_deref(),
-            )
-            .map(Reply::Forward)),
+            "insert" => match grammar::insert_target(sql, lex_opts)? {
+                // `INSERT ... FOR TENANT | IN TENANT | FOR ALL TENANTS`
+                // publish into inherited streams.
+                Some(_) => Err(streams_not_built()),
+                None => Ok(None),
+            },
             _ => Ok(None),
         }
     }
@@ -498,143 +333,6 @@ impl PassSession {
         Ok(None)
     }
 
-    /// `CREATE STREAM s FOR EACH TENANT ...`.
-    #[allow(clippy::too_many_lines)]
-    async fn define_stream(
-        &mut self,
-        svc: &Arc<TenantServices>,
-        cat: &Arc<TenantCatalog>,
-        own: &MsgState,
-        sql: &str,
-        lex_opts: &LexOptions,
-        f: &grammar::ForEach,
-    ) -> Result<Reply> {
-        let rest = f.strip(sql);
-        let sprig_streams::grammar::Stmt::Create(c) =
-            sprig_streams::grammar::classify(rest.as_bytes(), lex_opts)?
-        else {
-            return Err(SprigError::standard(
-                1064,
-                *b"42000",
-                "expected CREATE STREAM",
-            ));
-        };
-        if c.attached.is_some() {
-            return Err(not_built(
-                "ATTACHED TO GROUP OF on a FOR EACH TENANT stream",
-            ));
-        }
-        if !f.grants.is_empty() {
-            return Err(SprigError::standard(
-                1064,
-                *b"42000",
-                "GRANTS belongs to triggers and sinks, not streams",
-            ));
-        }
-        let name = c
-            .name
-            .clone()
-            .ok_or_else(|| SprigError::internal("no name"))?;
-        let db = name
-            .db
-            .clone()
-            .or_else(|| self.current_logical())
-            .ok_or_else(|| SprigError::standard(1046, *b"3D000", "No database selected"))?;
-        let ts = self
-            .tenant
-            .as_deref()
-            .ok_or_else(|| SprigError::internal("no tenant"))?;
-        let lctn = ts.lower_case_table_names();
-        if cat.database(&database_key(&db, lctn)).is_none() {
-            return Err(SprigError::standard(
-                1049,
-                *b"42000",
-                format!("Unknown database '{db}'"),
-            ));
-        }
-        if !sprig_streams::model::valid_name(&name.name) {
-            return Err(SprigError::standard(
-                1103,
-                *b"42000",
-                format!("Incorrect stream name '{}'", name.name),
-            ));
-        }
-        if !allows(ts, cat, Action::Create, &db, &name.name) {
-            return Err(denied(ts, "CREATE", &name.name));
-        }
-        let user = ts.principal.user_id.map_or(0, |u| u.0);
-        if own.def(&db, DefKind::Stream, &name.name).is_some() {
-            if c.if_not_exists {
-                return Ok(Reply::Ok(0, Vec::new()));
-            }
-            return Err(SprigError::new(
-                SprigCode::StreamExists,
-                format!("ER_SPRIG_STREAM_EXISTS: '{db}.{}' exists", name.name),
-            ));
-        }
-        let streams = cat
-            .ext
-            .get::<sprig_streams::StreamsState>(sprig_streams::MODULE)
-            .cloned()
-            .unwrap_or_default();
-        if let Some(d) = cat.database(&database_key(&db, lctn))
-            && streams.get(d.db_id, &name.name, lctn).is_some()
-        {
-            return Err(SprigError::new(
-                SprigCode::StreamExists,
-                format!("ER_SPRIG_STREAM_EXISTS: '{db}.{}' exists", name.name),
-            ));
-        }
-        let scope = scope_of(svc, cat.tenant, f).await?;
-        check_quota(svc, cat, own)?;
-        let partitions = c.partitions.unwrap_or_else(|| {
-            let ctx = cat.setting_ctx(&svc.dc);
-            u32::try_from(svc.settings.get(
-                &sprig_streams::settings::PARTITIONS_DEFAULT,
-                &ctx,
-                Some(&cat.settings),
-            ))
-            .unwrap_or(12)
-        });
-        let spec = StreamSpec {
-            key: c.key.clone(),
-            partitions: partitions.max(1),
-            retention_hours: c.retention_hours,
-            cleanup: c
-                .cleanup
-                .map_or_else(|| "delete".to_owned(), |c| c.as_str().to_owned()),
-            settings: BTreeMap::new(),
-        };
-        let object_id = next_object_id(svc, cat.tenant).await?;
-        let def = Definition {
-            declarer: cat.tenant,
-            object_id,
-            kind: DefKind::Stream,
-            db_name: db.clone(),
-            name: name.name.clone(),
-            scope,
-            definition: serde_json::to_value(&spec).unwrap_or_default(),
-            grants: None,
-            def_version: 1,
-            state: DefState::Active,
-            drop_after_ms: None,
-            created_by: user,
-            created_at_ms: sprig_inherit::msg::store::now_ms(),
-            changed_version: 0,
-        };
-        let v = inherited::commit(svc, cat.tenant, &[MsgWrite::Def(&def)]).await?;
-        self.after_own_change(v).await?;
-        tracing::info!(tenant = %cat.tenant, def = %def.key(), name = %def.name, "inherited stream defined");
-        Ok(Reply::Ok(
-            0,
-            vec![format!(
-                "stream {db}.{} is defined for every tenant in scope; each member's instance is \
-                 created on its first publish",
-                name.name
-            )],
-        ))
-    }
-
     /// A catalog change of this session's own tenant: read it at once.
     pub(super) async fn after_own_change(&mut self, v: u64) -> Result<()> {
         if let Some(ts) = self.tenant.as_deref_mut() {
@@ -644,7 +342,7 @@ impl PassSession {
         Ok(())
     }
 
-    /// `CREATE [OR REPLACE] TRIGGER g ON STREAM s FOR EACH TENANT ...`.
+    /// `CREATE [OR REPLACE] TRIGGER g ON QUEUE q FOR EACH TENANT ...`.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn define_trigger(
         &mut self,
@@ -663,11 +361,13 @@ impl PassSession {
                 "FOR EACH TENANT on an after-commit trigger (inherited triggers read streams)",
             ));
         };
-        let src_kind = if src.kind == sprig_logic::declare::SourceKind::Queue {
-            DefKind::Queue
-        } else {
-            DefKind::Stream
-        };
+        if src.kind != sprig_logic::declare::SourceKind::Queue {
+            return Err(not_built(
+                "FOR EACH TENANT on a trigger on a stream: streams are stored on the SprigDB \
+                 engine, whose triggers aren't built yet",
+            ));
+        }
+        let src_kind = DefKind::Queue;
         let current = self.current_logical();
         let ts = self
             .tenant
@@ -902,69 +602,11 @@ impl PassSession {
                 .await
                 .map(Some);
         }
-        if kind != DefKind::Stream {
-            return Ok(None);
+        // `ALTER STREAM` of a stream definition: none can be made any more.
+        if kind == DefKind::Stream {
+            return Err(streams_not_built());
         }
-        if !allows(ts, cat, Action::Alter, &db, &name) {
-            return Err(denied(ts, "ALTER", &name));
-        }
-        let sprig_streams::grammar::Stmt::Alter(a) =
-            sprig_streams::grammar::classify(sql.as_bytes(), lex_opts)?
-        else {
-            return Ok(None);
-        };
-        let mut spec: StreamSpec =
-            serde_json::from_value(def.definition.clone()).unwrap_or_default();
-        if let Some(n) = a.partitions {
-            if n < spec.partitions {
-                return Err(SprigError::new(
-                    SprigCode::StreamPartitionsDecrease,
-                    format!(
-                        "ER_SPRIG_STREAM_PARTITIONS_DECREASE: stream '{name}' has {} partitions; partitions can only grow",
-                        spec.partitions
-                    ),
-                ));
-            }
-            if n > spec.partitions {
-                return Err(not_built(
-                    "more partitions on a FOR EACH TENANT stream yet (declare a new definition)",
-                ));
-            }
-        }
-        if a.cleanup.is_some_and(|c| c.as_str() != spec.cleanup) {
-            return Err(SprigError::new(
-                SprigCode::InheritedObjectInUse,
-                "ER_SPRIG_INHERITED_OBJECT_IN_USE: a FOR EACH TENANT stream's cleanup policy \
-                 can't change; declare a new definition",
-            ));
-        }
-        if let Some(h) = a.retention_hours {
-            spec.retention_hours = Some(h);
-        }
-        for (k, v) in &a.settings {
-            let c = sprig_streams::settings::stream_setting(k, v.as_deref()).map_err(|m| {
-                SprigError::standard(1231, *b"42000", format!("ALTER STREAM '{name}': {m}"))
-            })?;
-            match c.value {
-                Some(v) => spec.settings.insert(c.key.to_owned(), json!(v)),
-                None => spec.settings.remove(c.key),
-            };
-        }
-        let new = Definition {
-            definition: serde_json::to_value(&spec).unwrap_or_default(),
-            def_version: def.def_version + 1,
-            ..(*def).clone()
-        };
-        let v = inherited::commit(svc, cat.tenant, &[MsgWrite::Def(&new)]).await?;
-        self.after_own_change(v).await?;
-        let n = rollout(svc, def.key()).await?;
-        Ok(Some(Reply::Ok(
-            0,
-            vec![format!(
-                "stream definition {db}.{name} is at version {}; rolling out to {n} instance(s)",
-                new.def_version
-            )],
-        )))
+        Ok(None)
     }
 
     /// `DROP STREAM | TRIGGER` of a definition. A stream: refused while trigger definitions read it
@@ -1225,383 +867,6 @@ async fn drop_trigger_instances(svc: &Arc<TenantServices>, g: DefKey) -> Result<
 }
 
 impl PassSession {
-    /// `INSERT` into an inherited stream: a member's own publish, `FOR
-    /// TENANT t`, or the `tenant` column. `None` when the target isn't
-    /// one.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    async fn inherit_insert(
-        &mut self,
-        cx: &mut ExecCtx<'_>,
-        svc: &Arc<TenantServices>,
-        cat: &Arc<TenantCatalog>,
-        chain: &Chain,
-        own: &MsgState,
-        sql: &str,
-        lex_opts: &LexOptions,
-    ) -> Result<Option<Reply>> {
-        let target = grammar::insert_target(sql, lex_opts)?;
-        let text = target
-            .as_ref()
-            .map_or_else(|| sql.to_owned(), |t| t.strip(sql));
-        let sprig_streams::grammar::Stmt::Insert(i) =
-            sprig_streams::grammar::classify(text.as_bytes(), lex_opts)?
-        else {
-            return Ok(None);
-        };
-        let Some(db) = i.target.db.clone().or_else(|| self.current_logical()) else {
-            return Ok(None);
-        };
-        let name = i.target.name.clone();
-        if let Some(grammar::Target::In(up)) = target.as_ref().map(|t| &t.target) {
-            return self
-                .publish_up(cx, svc, cat, &text, &i, &db, &name, up, lex_opts)
-                .await
-                .map(Some);
-        }
-        // Ours: a definition of this tenant, one reaching it, or its
-        // instance of one; an ordinary stream or table of the name isn't.
-        let def = own
-            .def(&db, DefKind::Stream, &name)
-            .cloned()
-            .or_else(|| chain.resolve(&db, DefKind::Stream, &name));
-        let Some(def) = def else {
-            if target.is_some() {
-                return Err(SprigError::new(
-                    SprigCode::StreamNotFound,
-                    format!(
-                        "ER_SPRIG_STREAM_NOT_FOUND: '{db}.{name}' isn't a FOR EACH TENANT stream \
-                         this tenant declares or inherits"
-                    ),
-                ));
-            }
-            return Ok(None);
-        };
-        if own
-            .instances
-            .get(&def.key())
-            .is_some_and(|i| i.state == sprig_inherit::msg::InstanceState::Detached)
-        {
-            // Detached: the member's own stream now.
-            return Ok(None);
-        }
-        if def.declarer != cat.tenant {
-            let ts = self
-                .tenant
-                .as_deref()
-                .ok_or_else(|| SprigError::internal("no tenant"))?;
-            let lctn = ts.lower_case_table_names();
-            // The member's own stream of that name (made before the
-            // definition) shadows it.
-            let instance = own.instances.get(&def.key()).map(|i| i.instance_id);
-            if let Some(d) = cat.database(&database_key(&db, lctn))
-                && let Some(s) = cat
-                    .ext
-                    .get::<sprig_streams::StreamsState>(sprig_streams::MODULE)
-                    .and_then(|st| st.get(d.db_id, &name, lctn).cloned())
-                && Some(s.id.0) != instance
-            {
-                return Ok(None);
-            }
-            if let Some(d) = cat.database(&database_key(&db, lctn))
-                && cat
-                    .object(
-                        d.db_id,
-                        sprig_catalog::store::Namespace::Relation,
-                        &object_key(ObjectKind::Table, &name, lctn),
-                    )
-                    .is_some()
-            {
-                // The member's own table of that name shadows it.
-                return Ok(None);
-            }
-        }
-        match target.map(|t| t.target) {
-            Some(grammar::Target::All {
-                with_instance,
-                under,
-            }) => self
-                .inherit_broadcast(
-                    cx,
-                    svc,
-                    cat,
-                    &text,
-                    &i,
-                    &def,
-                    with_instance,
-                    under.as_deref(),
-                    lex_opts,
-                )
-                .await
-                .map(Some),
-            Some(grammar::Target::Tenant(t)) if t == "*" => self
-                .inherit_broadcast(cx, svc, cat, &text, &i, &def, false, None, lex_opts)
-                .await
-                .map(Some),
-            Some(grammar::Target::In(_)) => Ok(None),
-            Some(grammar::Target::Tenant(t)) => Box::pin(self.inherit_publish(
-                cx,
-                svc,
-                cat,
-                chain,
-                &text,
-                &i,
-                &db,
-                &def,
-                Some(t),
-                lex_opts,
-            ))
-            .await
-            .map(Some),
-            None => Box::pin(
-                self.inherit_publish(cx, svc, cat, chain, &text, &i, &db, &def, None, lex_opts),
-            )
-            .await
-            .map(Some),
-        }
-    }
-
-    /// Evaluates the insert's rows in this session and writes each into
-    /// its target's instance (see the module docs).
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    async fn inherit_publish(
-        &mut self,
-        cx: &mut ExecCtx<'_>,
-        svc: &Arc<TenantServices>,
-        cat: &Arc<TenantCatalog>,
-        chain: &Chain,
-        text: &str,
-        i: &InsertInto,
-        db: &str,
-        def: &Arc<Definition>,
-        fixed: Option<String>,
-        lex_opts: &LexOptions,
-    ) -> Result<Reply> {
-        if i.on_duplicate {
-            return Err(SprigError::new(
-                SprigCode::StreamAppendOnly,
-                "ER_SPRIG_STREAM_APPEND_ONLY: INSERT ... ON DUPLICATE KEY UPDATE on a stream",
-            ));
-        }
-        if i.set_form {
-            return Err(not_built(
-                "'INSERT ... SET' on a stream: use VALUES or SELECT",
-            ));
-        }
-        let (cols, tail) = insert_shape(text, i)?;
-        let me = cat.tenant;
-        let my_name = {
-            let ts = self
-                .tenant
-                .as_deref()
-                .ok_or_else(|| SprigError::internal("no tenant"))?;
-            if !allows(ts, cat, Action::Insert, db, &def.name) {
-                return Err(denied(ts, "INSERT", &def.name));
-            }
-            ts.principal.tenant_name.clone().unwrap_or_default()
-        };
-        if fixed.is_some() && cols.contains(&Col::Tenant) {
-            return Err(SprigError::standard(
-                1064,
-                *b"42000",
-                "FOR TENANT and a tenant column can't be used together",
-            ));
-        }
-        let q = rows_query(&tail, lex_opts)?;
-        let got = self.run_checked(cx, &q, false).await?;
-        let mut rows: Vec<Row> = Vec::with_capacity(got.rows.len());
-        for r in got.rows {
-            if r.len() != cols.len() {
-                return Err(SprigError::standard(
-                    1136,
-                    *b"21S01",
-                    "Column count doesn't match value count at row 1",
-                ));
-            }
-            let mut row = Row {
-                tenant: fixed.clone(),
-                rec: Publish::default(),
-            };
-            let mut headers = None;
-            for (c, v) in cols.iter().zip(r) {
-                match c {
-                    Col::Key => row.rec.key = v,
-                    Col::Value => row.rec.value = v,
-                    Col::Headers => headers = v,
-                    Col::Partition => {
-                        row.rec.partition = v
-                            .and_then(|b| String::from_utf8(b).ok())
-                            .and_then(|s| s.trim().parse().ok());
-                    }
-                    Col::Tenant => {
-                        row.tenant = Some(
-                            v.and_then(|b| String::from_utf8(b).ok())
-                                .ok_or_else(|| target_err("a row names no tenant"))?,
-                        );
-                    }
-                }
-            }
-            row.rec.headers = headers.map(|h| String::from_utf8_lossy(&h).into_owned());
-            rows.push(row);
-        }
-        // Group by target, in order of first appearance.
-        let mut groups: Vec<(String, Vec<Publish>)> = Vec::new();
-        for r in rows {
-            let t = r.tenant.unwrap_or_else(|| my_name.clone());
-            match groups.iter_mut().find(|(n, _)| *n == t) {
-                Some((_, v)) => v.push(r.rec),
-                None => groups.push((t, vec![r.rec])),
-            }
-        }
-        let in_txn = self.offsets_in_transaction();
-        let mut total = 0u64;
-        let mut notes = Vec::new();
-        for (tname, mut recs) in groups {
-            let (si, dest) = if tname == my_name {
-                // Into this tenant's own instance.
-                if !chain.reaches_level(def, 0) {
-                    return Err(target_err(format!(
-                        "this tenant declares {}.{} without INCLUDING SELF: name a member with \
-                         FOR TENANT t or a tenant column",
-                        def.db_name, def.name
-                    )));
-                }
-                if def.declarer != me {
-                    let decl_cat = inherited::catalog(svc, def.declarer).await?;
-                    let mut dctx =
-                        decl_cat.object_ctx(&svc.dc, sprig_common::ids::ObjectId(def.object_id));
-                    if let Some(d) = decl_cat
-                        .databases
-                        .iter()
-                        .find(|d| d.name.eq_ignore_ascii_case(&def.db_name))
-                    {
-                        dctx = dctx.with_db(d.db_id);
-                    }
-                    let on = svc.settings.get(
-                        &sprig_inherit::msg::settings::MEMBER_PUBLISH,
-                        &dctx,
-                        Some(&decl_cat.settings),
-                    );
-                    if on == "off" {
-                        return Err(target_err(format!(
-                            "{}.{} takes publishes from its ancestors only \
-                             (inherit.member_publish = off)",
-                            def.db_name, def.name
-                        )));
-                    }
-                }
-                let si = Box::pin(streams::ensure(svc, chain, def, Cause::Publish)).await?;
-                if si.created || si.cat.version > cat.version {
-                    self.after_own_change(si.cat.version).await?;
-                }
-                (si, Dest::Own)
-            } else {
-                // Down the tree only.
-                let tid = inherited::tenant_by_name(svc, &tname)
-                    .await?
-                    .ok_or_else(|| no_member(&tname, def))?;
-                let tcat = inherited::catalog(svc, tid).await?;
-                let tchain = inherited::chain(svc, &tcat).await?;
-                let tdef = tchain
-                    .resolve(&def.db_name, DefKind::Stream, &def.name)
-                    .filter(|d| d.key() == def.key())
-                    .ok_or_else(|| no_member(&tname, def))?;
-                if !tchain.is_proper_ancestor(me) {
-                    return Err(no_member(&tname, def));
-                }
-                if in_txn {
-                    // Through this tenant's cross-tenant outbox: the record
-                    // exists only if the transaction commits.
-                    let strict = svc.settings.get(
-                        &sprig_inherit::msg::settings::CROSS_TENANT_MESSAGING_STRICT,
-                        &cat.setting_ctx(&svc.dc),
-                        Some(&cat.settings),
-                    ) == "on";
-                    if strict {
-                        inherited::check_residency(svc, tid, me, SprigCode::InheritResidency)
-                            .await?;
-                    }
-                    for r in &mut recs {
-                        r.headers = Some(stamp(
-                            r.headers.as_deref().map(str::as_bytes),
-                            &tname,
-                            &my_name,
-                        )?);
-                    }
-                    let n = recs.len() as u64;
-                    let dest = inherited::outbox::Dest::Instance {
-                        tenant: tid.0,
-                        def_tenant: def.declarer.0,
-                        def_object: def.object_id,
-                    };
-                    self.xo_publish(cx, svc, cat, &def.db_name, &dest, recs)
-                        .await?;
-                    total += n;
-                    continue;
-                }
-                (
-                    Box::pin(streams::ensure(svc, &tchain, &tdef, Cause::Publish)).await?,
-                    Dest::Other,
-                )
-            };
-            let max = svc.settings.get(
-                &sprig_streams::settings::MAX_MESSAGE_BYTES,
-                &si.cat
-                    .object_ctx(&svc.dc, sprig_common::ids::ObjectId(si.stream.id.0))
-                    .with_db(si.stream.db),
-                Some(&si.cat.settings),
-            );
-            for r in &mut recs {
-                let stamped = stamp(r.headers.as_deref().map(str::as_bytes), &tname, &my_name)?;
-                sprig_streams::publish::check_record(
-                    &si.stream,
-                    r.key.as_deref(),
-                    r.value.as_ref().map_or(0, Vec::len),
-                    stamped.len(),
-                    max,
-                )?;
-                r.headers = Some(stamped);
-            }
-            let n = recs.len() as u64;
-            match dest {
-                Dest::Own => {
-                    let ins =
-                        sprig_streams::publish::outbox_insert(&si.stream, Some(&si.db_name), &recs)
-                            .ok_or_else(|| SprigError::internal("an empty publish"))?;
-                    self.run_checked(cx, &ins, true).await?;
-                }
-                Dest::Other => {
-                    let schema = si.outbox_schema()?;
-                    let ins =
-                        sprig_streams::publish::outbox_insert(&si.stream, Some(&schema), &recs)
-                            .ok_or_else(|| SprigError::internal("an empty publish"))?;
-                    let cluster = svc.locator.cluster(si.tenant).await?;
-                    let pool = svc.locator.ctl_pool(&cluster).await?;
-                    let mut c = pool
-                        .get_conn_bounded()
-                        .await
-                        .map_err(sprig_streams::maria::map_err)?;
-                    c.query_drop(ins)
-                        .await
-                        .map_err(sprig_streams::maria::map_err)?;
-                    metrics::counter!("sprig_inherit_publishes_total", "kind" => "stream", "path" => "direct")
-                        .increment(n);
-                }
-            }
-            if matches!(dest, Dest::Own) {
-                metrics::counter!("sprig_inherit_publishes_total", "kind" => "stream", "path" => "own")
-                    .increment(n);
-            }
-            if si.created {
-                notes.push(format!(
-                    "tenant {tname}'s instance of {}.{} was created",
-                    def.db_name, def.name
-                ));
-            }
-            total += n;
-        }
-        Ok(Reply::Ok(total, notes))
-    }
-
     /// `ALTER INHERITED ...`: overrides, the nearest level wins.
     #[allow(clippy::too_many_lines)]
     async fn inherit_alter(
@@ -1730,31 +995,12 @@ impl PassSession {
                 puts.push(mk(What::Settings, Value::Object(m)));
                 what_done = "queue arguments".into();
             }
-            AlterOp::Set(kvs) => {
-                if a.kind != DefKind::Stream {
-                    return Err(not_built(&format!(
-                        "SET on an inherited {} yet (streams and queues take SET; DISABLE, \
-                         ENABLE, REPLACE and RESET are built)",
-                        a.kind.as_str()
-                    )));
-                }
-                let mut m = existing(What::Settings)
-                    .and_then(|o| o.value.as_object().cloned())
-                    .unwrap_or_default();
-                for (k, v) in kvs {
-                    if !streams::OVERRIDABLE.contains(&k.as_str()) {
-                        return Err(inherited::not_overridable(format!(
-                            "{k} belongs to the definition; a member may set {}",
-                            streams::OVERRIDABLE.join(", ")
-                        )));
-                    }
-                    let c = sprig_streams::settings::stream_setting(k, Some(v)).map_err(|m| {
-                        SprigError::standard(1231, *b"42000", format!("{}: {m}", a.name))
-                    })?;
-                    m.insert(k.clone(), json!(c.value));
-                }
-                puts.push(mk(What::Settings, Value::Object(m)));
-                what_done = "settings".into();
+            AlterOp::Set(_) => {
+                return Err(not_built(&format!(
+                    "SET on an inherited {} yet (queues take SET; DISABLE, ENABLE, REPLACE and \
+                     RESET are built)",
+                    a.kind.as_str()
+                )));
             }
             AlterOp::Reset(keys) if keys.is_empty() => {
                 deletes.push(None);
@@ -2127,201 +1373,6 @@ impl PassSession {
                 ))
             }
         }
-    }
-}
-
-impl PassSession {
-    /// `INSERT INTO db.s IN TENANT a ...`: a descendant's session publishes
-    /// into an ancestor's ordinary stream (one platform stream for every
-    /// client): only when the stream's owner set
-    /// `stream.descendant_publish = on`; with `stream.descendant_key =
-    /// origin` every record's key is the publishing tenant's name (39957
-    /// for another); `x-sprig-origin-tenant` is stamped; under
-    /// `residency.cross_tenant_messaging_strict` a pinned publisher can't
-    /// store into a data center its policy forbids (39949).
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    async fn publish_up(
-        &mut self,
-        cx: &mut ExecCtx<'_>,
-        svc: &Arc<TenantServices>,
-        cat: &Arc<TenantCatalog>,
-        text: &str,
-        i: &InsertInto,
-        db: &str,
-        name: &str,
-        up: &str,
-        lex_opts: &LexOptions,
-    ) -> Result<Reply> {
-        let me = cat.tenant;
-        let (my_name, user, host) = {
-            let ts = self
-                .tenant
-                .as_deref()
-                .ok_or_else(|| SprigError::internal("no tenant"))?;
-            if !allows(ts, cat, Action::Insert, db, name) {
-                return Err(denied(ts, "INSERT", name));
-            }
-            (
-                ts.principal.tenant_name.clone().unwrap_or_default(),
-                ts.principal.user.clone(),
-                ts.principal.client_ip.to_string(),
-            )
-        };
-        let refused = || {
-            SprigError::standard(
-                1142,
-                *b"42000",
-                format!(
-                    "INSERT command denied to user '{user}'@'{host}' for table '{name}' in tenant \
-                     {up}: its owner doesn't take publishes from descendants"
-                ),
-            )
-        };
-        let owner = inherited::tenant_by_name(svc, up)
-            .await?
-            .filter(|o| cat.ancestry.iter().any(|a| a.id == *o))
-            .ok_or_else(refused)?;
-        let ocat = inherited::catalog(svc, owner).await?;
-        let olctn = svc.settings.get(
-            &sprig_catalog::ddl::LOWER_CASE_TABLE_NAMES,
-            &ocat.setting_ctx(&svc.dc),
-            Some(&ocat.settings),
-        ) == 1;
-        let odb = ocat
-            .database(&database_key(db, olctn))
-            .cloned()
-            .ok_or_else(refused)?;
-        let stream = ocat
-            .ext
-            .get::<sprig_streams::StreamsState>(sprig_streams::MODULE)
-            .and_then(|st| st.get(odb.db_id, name, olctn).cloned())
-            .filter(|s| s.state == sprig_streams::StreamState::Active)
-            .ok_or_else(refused)?;
-        sprig_streams::publish::check_target(&stream)?;
-        // Streams have no `objects` row: their database is named here.
-        let octx = ocat
-            .object_ctx(&svc.dc, sprig_common::ids::ObjectId(stream.id.0))
-            .with_db(stream.db);
-        let consent = svc.settings.get(
-            &sprig_inherit::msg::settings::STREAM_DESCENDANT_PUBLISH,
-            &octx,
-            Some(&ocat.settings),
-        );
-        if consent != "on" {
-            return Err(refused());
-        }
-        let origin_key = svc.settings.get(
-            &sprig_inherit::msg::settings::STREAM_DESCENDANT_KEY,
-            &octx,
-            Some(&ocat.settings),
-        ) == "origin";
-        // Residency, only under the strict platform setting.
-        let strict = svc.settings.get(
-            &sprig_inherit::msg::settings::CROSS_TENANT_MESSAGING_STRICT,
-            &cat.setting_ctx(&svc.dc),
-            Some(&cat.settings),
-        ) == "on";
-        if strict {
-            inherited::check_residency(svc, me, owner, SprigCode::StreamResidency).await?;
-        }
-        let in_txn = self.offsets_in_transaction();
-        let (cols, tail) = insert_shape(text, i)?;
-        if cols.contains(&Col::Tenant) {
-            return Err(SprigError::standard(
-                1064,
-                *b"42000",
-                "IN TENANT and a tenant column can't be used together",
-            ));
-        }
-        let q = rows_query(&tail, lex_opts)?;
-        let got = self.run_checked(cx, &q, false).await?;
-        let max = svc.settings.get(
-            &sprig_streams::settings::MAX_MESSAGE_BYTES,
-            &octx,
-            Some(&ocat.settings),
-        );
-        let mut recs = Vec::with_capacity(got.rows.len());
-        for r in got.rows {
-            if r.len() != cols.len() {
-                return Err(SprigError::standard(
-                    1136,
-                    *b"21S01",
-                    "Column count doesn't match value count at row 1",
-                ));
-            }
-            let mut rec = Publish::default();
-            let mut headers = None;
-            for (c, v) in cols.iter().zip(r) {
-                match c {
-                    Col::Key => rec.key = v,
-                    Col::Value => rec.value = v,
-                    Col::Headers => headers = v,
-                    Col::Partition => {
-                        rec.partition = v
-                            .and_then(|b| String::from_utf8(b).ok())
-                            .and_then(|s| s.trim().parse().ok());
-                    }
-                    Col::Tenant => {}
-                }
-            }
-            if origin_key {
-                match &rec.key {
-                    None => rec.key = Some(my_name.as_bytes().to_vec()),
-                    Some(k) if k.as_slice() == my_name.as_bytes() => {}
-                    Some(k) => {
-                        return Err(SprigError::new(
-                            SprigCode::StreamOriginKey,
-                            format!(
-                                "ER_SPRIG_STREAM_ORIGIN_KEY: a record from tenant {my_name} is keyed \
-                                 by its own name (stream.descendant_key = origin), not '{}'",
-                                String::from_utf8_lossy(k)
-                            ),
-                        ));
-                    }
-                }
-            }
-            let stamped = stamp(headers.as_deref(), up, &my_name)?;
-            sprig_streams::publish::check_record(
-                &stream,
-                rec.key.as_deref(),
-                rec.value.as_ref().map_or(0, Vec::len),
-                stamped.len(),
-                max,
-            )?;
-            rec.headers = Some(stamped);
-            recs.push(rec);
-        }
-        let n = recs.len() as u64;
-        if n == 0 {
-            return Ok(Reply::Ok(0, Vec::new()));
-        }
-        if in_txn {
-            let dest = inherited::outbox::Dest::Stream {
-                tenant: owner.0,
-                stream: stream.id.0,
-            };
-            self.xo_publish(cx, svc, cat, db, &dest, recs).await?;
-            return Ok(Reply::Ok(n, Vec::new()));
-        }
-        let slot = stream
-            .outbox
-            .first()
-            .ok_or_else(|| SprigError::internal("a stream without an outbox"))?;
-        let schema = slot.schema(owner, stream.db).to_string();
-        let ins = sprig_streams::publish::outbox_insert(&stream, Some(&schema), &recs)
-            .ok_or_else(|| SprigError::internal("an empty publish"))?;
-        let cluster = svc.locator.cluster(owner).await?;
-        let pool = svc.locator.ctl_pool(&cluster).await?;
-        let mut c = pool
-            .get_conn_bounded()
-            .await
-            .map_err(sprig_streams::maria::map_err)?;
-        c.query_drop(ins)
-            .await
-            .map_err(sprig_streams::maria::map_err)?;
-        metrics::counter!("sprig_inherit_publishes_total", "kind" => "stream", "path" => "direct")
-            .increment(n);
-        Ok(Reply::Ok(n, Vec::new()))
     }
 }
 
@@ -2820,184 +1871,6 @@ impl PassSession {
     }
 }
 
-impl PassSession {
-    /// `INSERT INTO s FOR ALL TENANTS [WITH INSTANCE] [UNDER t] ...` (or
-    /// `FOR TENANT '*'`): each row is one broadcast: its log row now, or, inside a transaction, a row of
-    /// this tenant's cross-tenant outbox that becomes it at commit.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    async fn inherit_broadcast(
-        &mut self,
-        cx: &mut ExecCtx<'_>,
-        svc: &Arc<TenantServices>,
-        cat: &Arc<TenantCatalog>,
-        text: &str,
-        i: &InsertInto,
-        def: &Arc<Definition>,
-        with_instance: bool,
-        under: Option<&str>,
-        lex_opts: &LexOptions,
-    ) -> Result<Reply> {
-        let me = cat.tenant;
-        {
-            let ts = self
-                .tenant
-                .as_deref()
-                .ok_or_else(|| SprigError::internal("no tenant"))?;
-            if !allows(ts, cat, Action::Insert, &def.db_name, &def.name) {
-                return Err(denied(ts, "INSERT", &def.name));
-            }
-        }
-        if def.state != DefState::Active {
-            return Err(inherited::dropping(format!(
-                "stream {}.{} is being dropped",
-                def.db_name, def.name
-            )));
-        }
-        let under = match under {
-            None => None,
-            Some(n) => {
-                let id = inherited::tenant_by_name(svc, n)
-                    .await?
-                    .ok_or_else(|| target_err(format!("UNDER {n}: no descendant of that name")))?;
-                let below = inherited::dir_entry(svc, id)
-                    .await?
-                    .is_some_and(|e| e.path_ids().contains(&me.0));
-                if !below {
-                    return Err(target_err(format!("UNDER {n}: no descendant of that name")));
-                }
-                Some(id.0)
-            }
-        };
-        let form = inherited::broadcast::Form {
-            with_instance,
-            under,
-        };
-        let (cols, tail) = insert_shape(text, i)?;
-        if cols.contains(&Col::Tenant) {
-            return Err(SprigError::standard(
-                1064,
-                *b"42000",
-                "FOR ALL TENANTS and a tenant column can't be used together",
-            ));
-        }
-        let q = rows_query(&tail, lex_opts)?;
-        let got = self.run_checked(cx, &q, false).await?;
-        let mut recs = Vec::with_capacity(got.rows.len());
-        for r in got.rows {
-            let mut rec = Publish::default();
-            for (c, v) in cols.iter().zip(r) {
-                match c {
-                    Col::Key => rec.key = v,
-                    Col::Value => rec.value = v,
-                    Col::Headers => {
-                        rec.headers = v.map(|h| String::from_utf8_lossy(&h).into_owned());
-                    }
-                    Col::Partition | Col::Tenant => {}
-                }
-            }
-            recs.push(rec);
-        }
-        let in_txn = self.offsets_in_transaction();
-        let n = recs.len() as u64;
-        let mut ids = Vec::new();
-        for rec in recs {
-            if in_txn {
-                let bytes = rec.key.as_ref().map_or(0, Vec::len)
-                    + rec.value.as_ref().map_or(0, Vec::len)
-                    + rec.headers.as_ref().map_or(0, String::len);
-                inherited::broadcast::check_limits(svc, def, me, bytes, form).await?;
-                let dest = inherited::outbox::Dest::Broadcast {
-                    def_tenant: def.declarer.0,
-                    def_object: def.object_id,
-                    publisher: me.0,
-                    form,
-                };
-                let db = def.db_name.clone();
-                self.xo_publish(cx, svc, cat, &db, &dest, vec![rec]).await?;
-            } else {
-                let bid = inherited::broadcast::publish_now(svc, def, me, form, &rec).await?;
-                ids.push(inherited::broadcast::id_text(&bid));
-            }
-        }
-        Ok(Reply::Ok(
-            n,
-            if in_txn {
-                vec![
-                    "broadcast(s) logged when the transaction commits, then delivered to every \
-                     member in the background"
-                        .into(),
-                ]
-            } else {
-                ids.iter()
-                    .map(|b| {
-                        format!(
-                            "broadcast {b} logged; members get it in the background (SHOW \
-                             INHERITED BROADCASTS FOR STREAM {}.{})",
-                            def.db_name, def.name
-                        )
-                    })
-                    .collect()
-            },
-        ))
-    }
-}
-
-impl PassSession {
-    /// `SELECT ... FROM s FAN IN ...`: the members'
-    /// instances as one derived table (see [`inherited::fanin`]).
-    async fn fan_in_select(
-        &mut self,
-        svc: &Arc<TenantServices>,
-        cat: &Arc<TenantCatalog>,
-        chain: &Chain,
-        own: &MsgState,
-        sql: &str,
-        lex_opts: &LexOptions,
-    ) -> Result<Reply> {
-        let (r, only) = inherited::fanin::find(sql, lex_opts)
-            .ok_or_else(|| SprigError::internal("no FAN IN"))?;
-        let db =
-            r.db.clone()
-                .or_else(|| self.current_logical())
-                .ok_or_else(|| SprigError::standard(1046, *b"3D000", "No database selected"))?;
-        let ts = self
-            .tenant
-            .as_deref()
-            .ok_or_else(|| SprigError::internal("no tenant"))?;
-        if !allows(ts, cat, Action::Select, &db, &r.name) {
-            return Err(denied(ts, "SELECT", &r.name));
-        }
-        let grants = crate::tenant::authz::privileges(ts, cat);
-        if !grants.unrestricted() && !grants.allows(Action::FanIn, Target::Tenant) {
-            return Err(SprigError::standard(
-                1227,
-                *b"42000",
-                "Access denied; you need (at least one of) the SPRIG_FAN_IN privilege(s) for this \
-                 operation (granted by name; GRANT ALL doesn't include it)",
-            ));
-        }
-        let def = inherited::fanin::definition(chain, own, &db, &r.name).ok_or_else(|| {
-            target_err(format!(
-                "{db}.{} isn't a FOR EACH TENANT stream this tenant declares or is a member of",
-                r.name
-            ))
-        })?;
-        let max = svc.settings.get(
-            &sprig_inherit::msg::settings::FAN_IN_SQL_MAX_TENANTS,
-            &cat.setting_ctx(&svc.dc),
-            Some(&cat.settings),
-        );
-        let (table, n) =
-            inherited::fanin::derived(svc, cat.tenant, &def, &only, max, &r.name).await?;
-        tracing::debug!(tenant = %cat.tenant, def = %def.key(), members = n, "fan-in read");
-        Ok(Reply::Forward(format!(
-            "{}{table}{}",
-            &sql[..r.range.start],
-            &sql[r.range.end..]
-        )))
-    }
-}
-
 /// Re-applies database `db`'s inherited exchanges, queues and bindings in
 /// every member of `declarer`'s definitions that has instances there, in
 /// the background (a new definition, an override); with `unbind`, also
@@ -3020,131 +1893,4 @@ async fn mq_rollout(
         inherited::remote::mq_rollout_in_other_dcs(&svc, declarer, &p).await;
     });
     Ok(n)
-}
-
-/// The id that marks an inherited stream without an instance in a read.
-const NO_INSTANCE: u64 = u64::MAX - 42;
-
-/// A read naming an inherited stream the member has no instance of yet:
-/// the statement with that stream as an empty table (reads never create
-/// an instance; an instance not created yet has no records).
-/// `None` when the read names none.
-fn empty_reads(
-    sql: &str,
-    lex_opts: &LexOptions,
-    cat: &TenantCatalog,
-    chain: &Chain,
-    own: &MsgState,
-    current: Option<&str>,
-) -> Option<String> {
-    let reaching = chain.reaching(DefKind::Stream);
-    if !reaching.iter().any(|d| sql.contains(d.name.as_str())) {
-        return None;
-    }
-    let streams = cat
-        .ext
-        .get::<sprig_streams::StreamsState>(sprig_streams::MODULE)
-        .cloned()
-        .unwrap_or_default();
-    let lookup = |db: Option<&str>, name: &str| -> Option<sprig_streams::StreamId> {
-        let db = db.or(current)?.to_owned();
-        let d = reaching
-            .iter()
-            .find(|d| d.db_name.eq_ignore_ascii_case(&db) && d.name == name)?;
-        // An instance that is usable: its stream is in the snapshot.
-        if let Some(i) = own.instances.get(&d.key())
-            && streams.all().any(|s| s.id.0 == i.instance_id)
-        {
-            return None;
-        }
-        // The member's own stream of the name shadows it.
-        if let Some(row) = cat.database(&database_key(&db, false))
-            && streams.get(row.db_id, name, true).is_some()
-        {
-            return None;
-        }
-        Some(sprig_streams::StreamId(NO_INSTANCE))
-    };
-    let r = sprig_streams::read::rewrite_select(sql, lex_opts, &lookup).ok()??;
-    let log = sprig_common::names::quote(&sprig_streams::model::log_table(
-        sprig_streams::StreamId(NO_INSTANCE),
-    ));
-    let empty = "(SELECT CAST(NULL AS UNSIGNED) AS partition_no, CAST(NULL AS UNSIGNED) AS \
-                 offset_no, CAST(NULL AS DATETIME(3)) AS ts, CAST(NULL AS BINARY) AS k, \
-                 CAST(NULL AS BINARY) AS v, CAST(NULL AS CHAR) AS headers FROM DUAL WHERE 0) \
-                 AS __sprig_no_instance";
-    let mut out = r.sql;
-    for (db, _, _) in &r.streams {
-        if let Some(d) = db {
-            out = out.replace(&format!("{}.{log}", sprig_common::names::quote(d)), empty);
-        }
-    }
-    Some(out.replace(&log, empty))
-}
-
-/// 39896 for a target that isn't a member (the same text whether or not
-/// a tenant of that name exists).
-fn no_member(name: &str, def: &Definition) -> SprigError {
-    target_err(format!(
-        "'{name}' isn't a member of {}.{} below this tenant",
-        def.db_name, def.name
-    ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn values_become_a_union() {
-        let o = LexOptions::mariadb();
-        assert_eq!(
-            rows_query(" VALUES (1, JSON_OBJECT('a', (2))), (3, 'x,y')", &o).unwrap(),
-            "SELECT 1, JSON_OBJECT('a', (2)) UNION ALL SELECT 3, 'x,y'"
-        );
-        assert_eq!(
-            rows_query("SELECT a, b FROM t;", &o).unwrap(),
-            "SELECT a, b FROM t"
-        );
-        assert!(rows_query("VALUES (1", &o).is_err());
-        assert!(rows_query("SET a = 1", &o).is_err());
-        assert!(rows_query("VALUES (1) junk", &o).is_err());
-    }
-
-    #[test]
-    fn headers_are_stamped_over_the_clients() {
-        let h = stamp(
-            Some(br#"{"x-sprig-origin-tenant": "forged", "trace": "t1"}"#),
-            "client_x",
-            "system",
-        )
-        .unwrap();
-        let v: Value = serde_json::from_str(&h).unwrap();
-        assert_eq!(v["x-sprig-tenant"], "client_x");
-        assert_eq!(v["x-sprig-origin-tenant"], "system");
-        assert_eq!(v["trace"], "t1");
-        assert!(stamp(Some(b"[1]"), "a", "b").is_err());
-        assert!(stamp(None, "a", "b").is_ok());
-    }
-
-    #[test]
-    fn insert_shapes() {
-        let o = LexOptions::mariadb();
-        let sql = "INSERT INTO s (tenant, key, value) SELECT t, k, v FROM x";
-        let sprig_streams::grammar::Stmt::Insert(i) =
-            sprig_streams::grammar::classify(sql.as_bytes(), &o).unwrap()
-        else {
-            panic!("not an insert");
-        };
-        let (cols, tail) = insert_shape(sql, &i).unwrap();
-        assert_eq!(cols, vec![Col::Tenant, Col::Key, Col::Value]);
-        assert_eq!(tail.trim(), "SELECT t, k, v FROM x");
-        let sql = "INSERT INTO s (key, ts) VALUES (1, NOW())";
-        let sprig_streams::grammar::Stmt::Insert(i) =
-            sprig_streams::grammar::classify(sql.as_bytes(), &o).unwrap()
-        else {
-            panic!("not an insert");
-        };
-        assert!(insert_shape(sql, &i).is_err());
-    }
 }

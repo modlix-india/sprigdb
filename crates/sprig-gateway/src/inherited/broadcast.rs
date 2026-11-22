@@ -50,13 +50,13 @@ use std::time::{Duration, Instant};
 
 use mysql_async::prelude::Queryable;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::Value;
 use sprig_catalog::ddl::{database_key, shard_schemas};
 use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::{ClusterId, TenantId};
 use sprig_common::names::quote;
 use sprig_common::{Result, SprigCode, SprigError};
-use sprig_inherit::msg::{Cause, DefKey, DefKind, Definition, InstanceState};
+use sprig_inherit::msg::{DefKey, DefKind, Definition, InstanceState};
 use sprig_meta::{ListOpts, Record, Versioned};
 use sprig_streams::publish::Publish;
 
@@ -182,7 +182,7 @@ fn limit_err(m: impl std::fmt::Display) -> SprigError {
 async fn place(svc: &Arc<TenantServices>, def: &Definition) -> Result<(ClusterId, String)> {
     let a = def.declarer;
     let cat = catalog(svc, a).await?;
-    let lc = super::streams::lctn(svc, &cat);
+    let lc = super::lctn(svc, &cat);
     let row = cat
         .database(&database_key(&def.db_name, lc))
         .ok_or_else(|| super::unavailable(format!("tenant {a}'s database {}", def.db_name)))?;
@@ -645,45 +645,6 @@ async fn deliver_local(
         .unwrap_or_else(|_| b.publisher.to_string());
     let bid_text = id_text(&b.bid);
     match def.kind {
-        DefKind::Stream => {
-            let d = tchain
-                .def(def.key())
-                .ok_or_else(|| super::target_err(format!("tenant {t} left the scope")))?;
-            let si = Box::pin(super::streams::ensure(svc, &tchain, &d, Cause::Publish)).await?;
-            let mut h: Map<String, Value> = b
-                .rec
-                .headers
-                .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or_default();
-            h.insert(super::mq::TENANT_HEADER.into(), json!(tname));
-            h.insert(super::mq::ORIGIN_HEADER.into(), json!(origin));
-            h.insert(BROADCAST_HEADER.into(), json!(bid_text));
-            let headers = Value::Object(h).to_string();
-            let schema = si.outbox_schema()?;
-            let lit = |v: Option<&[u8]>| {
-                v.map_or_else(|| "NULL".to_owned(), sprig_queues::sql::hex_literal)
-            };
-            let sql = format!(
-                "INSERT IGNORE INTO {}.{} (event_id, k, v, headers) VALUES ({}, {}, {}, CONVERT({} \
-                 USING utf8mb4))",
-                quote(&schema),
-                quote(&si.stream.outbox_table()),
-                sprig_queues::sql::hex_literal(&b.bid),
-                lit(b.rec.key.as_deref()),
-                lit(b.rec.value.as_deref()),
-                sprig_queues::sql::hex_literal(headers.as_bytes()),
-            );
-            let cluster = svc.locator.cluster(t).await?;
-            let pool = svc.locator.ctl_pool(&cluster).await?;
-            let mut c = pool
-                .get_conn_bounded()
-                .await
-                .map_err(sprig_streams::maria::map_err)?;
-            c.query_drop(sql)
-                .await
-                .map_err(sprig_streams::maria::map_err)?;
-        }
         DefKind::Exchange | DefKind::Queue => {
             let h: Value = b
                 .rec

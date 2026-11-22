@@ -77,10 +77,6 @@ pub trait Host: Send {
     fn db_name(&self, id: u32) -> Option<String>;
     /// The sinks module in the session's snapshot.
     fn state(&self) -> Arc<SinksState>;
-    /// A stream (or change topic) of `db`: its id and partitions.
-    fn stream(&self, db: u32, name: &str) -> Option<(u64, u32)>;
-    /// A table of `db`: its object id.
-    fn table(&self, db: u32, name: &str) -> Option<u64>;
     /// The session holds `SPRIG_SINK_ADMIN`.
     fn sink_admin(&self) -> bool;
     /// The session holds `SPRIG_TENANT_ADMIN`.
@@ -148,26 +144,6 @@ pub trait Host: Send {
             .await?
             .map(|(r, s)| (r, 0, s, Value::Null)))
     }
-    /// The change topic (`t.changes`) of table object `table` in `db`: its
-    /// stream id and partitions, when the table's change topic is on.
-    fn change_stream(&self, _db: u32, _table: u64) -> Option<(u64, u32)> {
-        None
-    }
-    /// The inherited stream definition `db.name` a fan-in sink of this
-    /// tenant may read (declared here or above, the tenant in reach of its
-    /// members), with `UNDER t` resolved to a member below this tenant.
-    /// `None`: no such definition.
-    ///
-    /// # Errors
-    /// `UNDER` names no tenant below this one; the catalog's.
-    async fn fan_in_stream(
-        &mut self,
-        _db: &str,
-        _name: &str,
-        _under: Option<&str>,
-    ) -> Result<Option<FanInDef>> {
-        Ok(None)
-    }
 
     /// The durable queue `name` of database `db` (its vhost): its id.
     /// `None` when there is none, or this host can't tell.
@@ -221,7 +197,7 @@ pub trait Host: Send {
     }
 }
 
-/// An inherited stream definition a fan-in sink reads.
+/// An inherited queue definition a fan-in sink reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FanInDef {
     /// The declaring tenant.
@@ -1030,25 +1006,12 @@ async fn dry_run_rows(
     let env = h.sink_env().ok_or_else(no_env)?;
     let n = sample as usize;
     let records = match &def.source {
-        SourceSpec::Stream {
-            id,
-            name: s,
-            partitions,
-        } => {
-            if !h.can_select(db_name, s) {
-                return Err(err(
-                    SprigCode::SinkPrivilege,
-                    format!("TEST SINK reads stream {s} for you: you need SELECT on it"),
-                ));
-            }
-            crate::probe::sample_stream(env.as_ref(), h.tenant(), *id, *partitions, n).await?
-        }
         SourceSpec::Queue { name: q, .. } => h.sample_queue(db_name, q, n).await?,
         other => {
             return Err(err(
                 SprigCode::SinkOptionInvalid,
                 format!(
-                    "TEST SINK samples stream and queue sources; this sink reads {}",
+                    "TEST SINK samples queue sources; this sink reads {}",
                     other.kind()
                 ),
             ));
@@ -1228,61 +1191,14 @@ async fn sink_def(h: &mut dyn Host, c: grammar::CreateSink) -> Result<SinkDef> {
     let (db, dbname) = db_of(h, c.name.db.as_deref())?;
     // The source, readable by the owner.
     let source = match &c.source {
-        grammar::SourceAst::Stream(q) => {
-            let (sdb, sdbname) = db_of(h, q.db.as_deref().or(Some(&dbname)))?;
-            let (id, partitions) = h.stream(sdb, &q.name).ok_or_else(|| {
-                sprig_common::SprigError::new(
-                    SprigCode::StreamNotFound,
-                    format!("unknown stream {}", q.name),
-                )
-            })?;
-            if !h.can_select(&sdbname, &q.name) {
-                return Err(err(
-                    SprigCode::SinkPrivilege,
-                    format!("you need SELECT on stream {}", q.name),
-                ));
-            }
-            SourceSpec::Stream {
-                id,
-                name: q.name.clone(),
-                partitions,
-            }
-        }
-        grammar::SourceAst::FanIn { stream: q, under } => {
-            let sdbname = q.db.clone().unwrap_or_else(|| dbname.clone());
-            if !h.fan_in() {
-                return Err(err(
-                    SprigCode::SinkPrivilege,
-                    "Access denied; you need (at least one of) the SPRIG_FAN_IN privilege(s) for a fan-in sink",
-                ));
-            }
-            if !h.can_select(&sdbname, &q.name) {
-                return Err(err(
-                    SprigCode::SinkPrivilege,
-                    format!("you need SELECT on stream {}", q.name),
-                ));
-            }
-            let d = h
-                .fan_in_stream(&sdbname, &q.name, under.as_deref())
-                .await?
-                .ok_or_else(|| {
-                    sprig_common::SprigError::new(
-                        SprigCode::StreamNotFound,
-                        format!(
-                            "no FOR EACH TENANT stream {sdbname}.{} in reach for FAN IN",
-                            q.name
-                        ),
-                    )
-                })?;
-            fan_in_guarantee(c.guarantee, &c.target)?;
-            SourceSpec::FanIn {
-                def_tenant: d.def_tenant,
-                def_object: d.def_object,
-                db: sdbname,
-                name: q.name.clone(),
-                partitions: d.partitions,
-                under: d.under,
-            }
+        grammar::SourceAst::Stream(_)
+        | grammar::SourceAst::FanIn { .. }
+        | grammar::SourceAst::Changes(_) => {
+            return Err(err(
+                SprigCode::SinkOptionInvalid,
+                "sinks read queues only: streams are stored on the SprigDB engine, which has \
+                 no sink source yet, and tables' changes wait for the engine's change log",
+            ));
         }
         grammar::SourceAst::Queue(q) => {
             // A durable queue of the database's vhost, which the sink
@@ -1351,39 +1267,6 @@ async fn sink_def(h: &mut dyn Host, c: grammar::CreateSink) -> Result<SinkDef> {
                 under: d.under,
             }
         }
-        grammar::SourceAst::Changes(ts) => {
-            // Read through each table's change topic, which must be on.
-            let mut objects = Vec::new();
-            for t in ts {
-                let (tdb, tdbname) = db_of(h, t.db.as_deref().or(Some(&dbname)))?;
-                let id = h.table(tdb, &t.name).ok_or_else(|| {
-                    sprig_common::SprigError::standard(
-                        1146,
-                        *b"42S02",
-                        format!("Table '{tdbname}.{}' doesn't exist", t.name),
-                    )
-                })?;
-                if !h.can_select(&tdbname, &t.name) {
-                    return Err(err(
-                        SprigCode::SinkPrivilege,
-                        format!("you need SELECT on table {}", t.name),
-                    ));
-                }
-                if h.change_stream(tdb, id).is_none() {
-                    return Err(bad_option(format!(
-                        "CHANGES OF {} reads the table's change topic, which is off: ALTER TABLE {} SPRIG SET (stream.change_topic = on)",
-                        t.name, t.name
-                    )));
-                }
-                objects.push((id, t.name.clone()));
-            }
-            if c.guarantee == Guarantee::ExactlyOnce && objects.len() > 1 {
-                return Err(bad_option(
-                    "EXACTLY ONCE with CHANGES OF more than one table isn't built yet",
-                ));
-            }
-            SourceSpec::Changes { objects }
-        }
     };
     // TRANSFORM f: a live JavaScript, KIRun or Lua function of the sink's
     // database whose text uses no data or outside calls.
@@ -1421,35 +1304,14 @@ async fn sink_def(h: &mut dyn Host, c: grammar::CreateSink) -> Result<SinkDef> {
             }
         }
     }
-    // DEAD LETTER TO STREAM d: a stream of this tenant (its events go
-    // there as well as to sink_dead_letters, which sprigctl replays from).
+    // Dead letters go to the sink's dead-letter records, which sprigctl
+    // replays from; `DEAD LETTER TO STREAM | QUEUE | EXCHANGE` aren't built.
     let dead_letter = match &c.dead_letter {
         None => None,
-        Some(grammar::DeadAst::Stream(n)) => {
-            let (dl_db, dl_dbname, dl_name) = match n.split_once('.') {
-                Some((d, s)) => {
-                    let (dl_id, dl_nm) = db_of(h, Some(d))?;
-                    (dl_id, dl_nm, s.to_owned())
-                }
-                None => {
-                    let (dl_id, dl_nm) = db_of(h, Some(&dbname))?;
-                    (dl_id, dl_nm, n.clone())
-                }
-            };
-            let (stream_id, _) = h.stream(dl_db, &dl_name).ok_or_else(|| {
-                sprig_common::SprigError::new(
-                    SprigCode::StreamNotFound,
-                    format!("unknown dead-letter stream {dl_dbname}.{dl_name}"),
-                )
-            })?;
-            Some(crate::model::DeadLetter::Stream {
-                id: stream_id,
-                name: dl_name,
-            })
-        }
         Some(_) => {
             return Err(bad_option(
-                "DEAD LETTER TO QUEUE and EXCHANGE aren't built yet; DEAD LETTER TO STREAM is",
+                "DEAD LETTER TO STREAM, QUEUE and EXCHANGE aren't built yet; dead letters are \
+                 kept in the sink's dead-letter records",
             ));
         }
     };
@@ -1741,10 +1603,7 @@ pub fn render_sink(d: &SinkDef) -> String {
 }
 
 /// Applies a change inside the caller's catalog change `tx`: the sink rows
-/// go to its records; a dropped or reset sink's consumer-group rows of the
-/// MariaDB stream path go to the catalog schema ([`MariaTx::sql`]).
-///
-/// [`MariaTx::sql`]: sprig_catalog::version::MariaTx::sql
+/// go to its records.
 ///
 /// # Errors
 /// The catalog's; 39211 for a taken name; 39216 when sealing fails.
@@ -1768,57 +1627,14 @@ pub async fn apply(
         Change::DropConnection(def) => SinksStore::delete_connection(rec, def).await?,
         Change::InsertSink(def) => SinksStore::insert_sink(rec, def).await?,
         Change::UpdateSink(def) => SinksStore::update_sink(rec, def).await?,
-        Change::ResetSink(def) => {
-            SinksStore::update_sink(rec, def).await?;
-            delete_sql_group(tx, def).await?;
-        }
+        Change::ResetSink(def) => SinksStore::update_sink(rec, def).await?,
         // The state record is written after the commit (`after_commit`);
         // the change itself moves the catalog version.
         Change::State(..) => {}
         Change::DropSink(def) => {
             SinksStore::delete_sink(rec, def.id).await?;
-            delete_sql_group(tx, def).await?;
         }
         Change::Usage(u, grant) => SinksStore::set_usage(rec, u, *grant, user).await?,
-    }
-    Ok(())
-}
-
-/// Whether a sink can have a consumer group in the MariaDB stream path's
-/// tables: a sink reading a stream of that path, its fan-in instances, or
-/// tables' changes (read through the tables' change topics, which are
-/// streams of that path). Streams on the engine keep their groups as engine
-/// records, and queues have none.
-fn has_sql_group(def: &crate::model::SinkDef) -> bool {
-    match &def.source {
-        crate::model::SourceSpec::Stream { id, .. } => {
-            !sprig_streams::seg::kafka::is_engine_stream(*id)
-        }
-        crate::model::SourceSpec::FanIn { .. } | crate::model::SourceSpec::Changes { .. } => true,
-        crate::model::SourceSpec::Queue { .. } | crate::model::SourceSpec::FanInQueue { .. } => {
-            false
-        }
-    }
-}
-
-/// Deletes a sink's consumer group from the MariaDB stream path's tables in
-/// the catalog schema, for a sink that can have one ([`has_sql_group`]); any
-/// other sink's change touches no MariaDB. A tenant whose catalog never held
-/// such a stream (a fan-in sink's declarer whose task never ran) has no
-/// group tables.
-async fn delete_sql_group(
-    tx: &mut sprig_catalog::version::MariaTx,
-    def: &crate::model::SinkDef,
-) -> Result<()> {
-    if !has_sql_group(def) {
-        return Ok(());
-    }
-    let group = def.group();
-    let group = group.as_str();
-    let (store, q) = tx.sql().await?;
-    let streams = sprig_streams::StreamsStore::new(store.schema());
-    if streams.migrated(q).await.unwrap_or(true) {
-        streams.delete_group(q, group).await?;
     }
     Ok(())
 }
@@ -1897,37 +1713,5 @@ mod fan_in_guarantee_tests {
             let e = fan_in_guarantee(Guarantee::ExactlyOnce, t).unwrap_err();
             assert_eq!(e.code(), Some(SprigCode::SinkExactlyOnceUnsupported));
         }
-    }
-}
-
-#[cfg(test)]
-mod sql_group_tests {
-    use super::has_sql_group;
-    use crate::model::{SourceSpec, TargetSpec};
-
-    #[test]
-    fn only_mariadb_path_stream_sinks_have_a_sql_group() {
-        let mut d = crate::probe::stand_in(1, "s", TargetSpec::Webhook { path: None });
-        d.source = SourceSpec::Stream {
-            id: 7,
-            name: "old".into(),
-            partitions: 1,
-        };
-        assert!(has_sql_group(&d));
-        d.source = SourceSpec::Stream {
-            id: sprig_streams::seg::kafka::FIRST_STREAM_ID + 3,
-            name: "s".into(),
-            partitions: 1,
-        };
-        assert!(!has_sql_group(&d));
-        d.source = SourceSpec::Queue {
-            id: 9,
-            name: "q".into(),
-        };
-        assert!(!has_sql_group(&d));
-        d.source = SourceSpec::Changes {
-            objects: vec![(5, "t".into())],
-        };
-        assert!(has_sql_group(&d));
     }
 }

@@ -565,7 +565,7 @@ async fn sync_one(
         if w.child.is_none() {
             // A database alone changes nothing anyone reads: it is
             // published on its own.
-            let cat = crate::inherited::streams::ensure_database(svc, t, &w.db).await?;
+            let cat = crate::inherited::ensure_database(svc, t, &w.db).await?;
             seen = seen.max(cat.version);
             let text = show_create(svc, parent.tenant, &pschema, &w.table).await?;
             let cschema = sprig_inherit::plan::physical_schema(&cat, &w.db, lctn)?;

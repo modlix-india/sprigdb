@@ -235,9 +235,6 @@ impl<H: crate::tenants::BootstrapHooks> crate::tenants::BootstrapHooks for WithM
         {
             modules.push(sprig_queues::catalog::MQ_MODULE);
         }
-        if kinds.contains("stream") {
-            modules.push(sprig_streams::store::STREAMS_MODULE);
-        }
         let opts = sprig_catalog::migrate::MigrateOpts {
             applied_by: "controller:inherit".to_owned(),
             ..sprig_catalog::migrate::MigrateOpts::existing()

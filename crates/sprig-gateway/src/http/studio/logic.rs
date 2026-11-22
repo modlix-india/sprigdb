@@ -500,25 +500,12 @@ async fn table_source(
         Err(e) if missing_tables(&e) => None,
         Err(e) => return Err(e),
     };
-    let Some(src) = src else {
+    if src.is_none() {
         return Ok(b.object_id);
-    };
-    if src.kind != sprig_logic::declare::SourceKind::Stream || src.fanin_declarer != 0 {
-        return Ok(None);
     }
-    let Some(cat) = svc.cache.cached(tid) else {
-        // Can't tell: treat it as table rows.
-        return Ok(Some(0));
-    };
-    Ok(cat
-        .ext
-        .get::<sprig_streams::StreamsState>(sprig_streams::MODULE)
-        .and_then(|st| {
-            st.all()
-                .find(|s| s.id.0 == src.object_id)
-                .filter(|s| s.kind == sprig_streams::model::StreamKind::Changes)
-                .map(|s| s.source_object.map_or(0, |o| o.0))
-        }))
+    // A stream or queue trigger's events carry no table's rows (triggers
+    // on change topics were served only for streams kept in MariaDB).
+    Ok(None)
 }
 
 /// Whether policies on table `object` don't bind the caller (a session of

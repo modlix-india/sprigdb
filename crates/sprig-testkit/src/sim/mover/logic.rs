@@ -217,7 +217,7 @@ pub(super) async fn trigger_worker(
                 StartAt::After,
             );
         let source: Arc<dyn Clusters> = if shared {
-            super::streams::shared_view(&clusters)
+            shared_view(&clusters)
         } else {
             clusters.clone()
         };
@@ -366,4 +366,23 @@ pub(super) fn summary(log: &Arc<Mutex<TriggerLog>>) -> String {
         l.dead.len(),
         l.restarts
     )
+}
+
+/// A worker process's shared reader over the clusters' binlog models, with
+/// buffers and a ring small enough that the trigger's subscription is
+/// detached, returns through the ring, and needs catch-up dumps.
+fn shared_view(clusters: &Arc<SimClusters>) -> Arc<dyn Clusters> {
+    let feed = sprig_feed::shared::SharedFeed::new(
+        Arc::clone(clusters) as Arc<dyn Clusters>,
+        sprig_feed::shared::SharedOpts {
+            sub_channel: 2,
+            ring_groups: 6,
+            ring_bytes: 1 << 20,
+            max_catchup: 1,
+            gather: Duration::from_millis(200),
+            max_backlog: 4,
+            buffer_bytes: 0,
+        },
+    );
+    feed.view(sprig_feed::shared::Kept::All)
 }

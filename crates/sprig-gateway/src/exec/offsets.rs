@@ -1,41 +1,20 @@
 //! `CALL sprig.commit_offset(group, stream, partition, offset [, metadata])`
-//! in a tenant session (for exactly-once consume and write), and the same
-//! commit for `db.commitOffset` and the logic triggers on streams.
-//!
-//! ```text
-//! the arguments: SELECT <args> through this session (any expression)
-//! the stream: [db.]name, the database's stream; SELECT on it
-//! outside a transaction: written at once as sprig_ctl (sprig_streams::store)
-//! inside one: CALL t<tenant>_sprig.__sprig_commit_offset(...) on the
-//!   session's own connection to the catalog's cluster, in its transaction
-//!   (the coordinator's branch there), after SET ROLE t<tenant>_sprig_offsets
-//! ```
-//!
-//! The procedure and the role are made by `sprig_ctl` the first time an
-//! account commits an offset ([`sprig_streams::offsets::grant_sql`]), then
-//! remembered per cluster and account. The catalog must be on the cluster
-//! of the session's own connection, as the router keeps it; a transaction
-//! whose connection is elsewhere gets 39958 rather than an XA branch on the
-//! catalog (the coordinator anchors its decisions in shard schemas).
-
-use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock, PoisonError};
+//! in a tenant session (for exactly-once consume and write) on a stream of
+//! an engine database: the offset is an engine record, written in the
+//! session's engine transaction when one is open (so it commits or rolls
+//! back with the transaction's writes), else at once. The same records
+//! hold a trigger's dead-letter replay marks ([`PassSession::replay_mark`]).
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use mysql_async::prelude::Queryable;
 use sprig_auth::authz::{Action, Target};
 use sprig_catalog::ddl::{database_key, object_key};
-use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::ObjectKind;
-use sprig_common::ids::ClusterId;
-use sprig_common::names::SchemaName;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_proto_mysql::command::QueryAttrs;
 use sprig_proto_mysql::packets::OkPacket;
 use sprig_proto_mysql::{ColumnDef, StatusFlags};
-use sprig_streams::offsets::{self, Commit};
-use sprig_streams::{StreamDef, StreamsState};
+use sprig_streams::offsets;
 
 use super::PassSession;
 use super::tenant::Step;
@@ -147,41 +126,12 @@ impl ResultSink for Collect {
     }
 }
 
-/// Accounts (by cluster) known to hold the offsets role.
-fn granted() -> &'static Mutex<HashSet<(ClusterId, String)>> {
-    static G: OnceLock<Mutex<HashSet<(ClusterId, String)>>> = OnceLock::new();
-    G.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
 fn arg_error() -> SprigError {
     SprigError::standard(
         1318,
         *b"42000",
         "Incorrect arguments to sprig.commit_offset",
     )
-}
-
-/// `[db.]name` of a stream, against the catalog's streams: a dotted name
-/// is first a database and a stream (Kafka's `<db>.<stream>`), then a
-/// stream of the current database.
-pub(super) fn find_stream(
-    streams: &StreamsState,
-    db_of: &dyn Fn(&str) -> Option<sprig_common::ids::DbId>,
-    current: Option<&str>,
-    name: &str,
-    lctn: bool,
-) -> Option<(String, std::sync::Arc<StreamDef>)> {
-    if let Some((db, s)) = name.split_once('.')
-        && let Some(id) = db_of(db)
-        && let Some(def) = streams.get(id, s, lctn)
-    {
-        return Some((db.to_owned(), std::sync::Arc::clone(def)));
-    }
-    let db = current?;
-    let id = db_of(db)?;
-    streams
-        .get(id, name, lctn)
-        .map(|d| (db.to_owned(), std::sync::Arc::clone(d)))
 }
 
 impl PassSession {
@@ -329,70 +279,10 @@ impl PassSession {
                 .commit_offset_engine(&group, &db, &name_text, partition, offset, metadata)
                 .await;
         }
-        let ts = self
-            .tenant
-            .as_deref_mut()
-            .ok_or_else(|| SprigError::internal("no tenant"))?;
-        let cat = match ts.catalog() {
-            Some(c) => std::sync::Arc::clone(c),
-            None => ts.refresh().await?,
-        };
-        let lctn = ts.lower_case_table_names();
-        let streams = cat
-            .ext
-            .get::<StreamsState>(sprig_streams::MODULE)
-            .cloned()
-            .unwrap_or_default();
-        let db_of = |n: &str| cat.database(&database_key(n, lctn)).map(|d| d.db_id);
-        let (db_name, def) = find_stream(&streams, &db_of, current.as_deref(), &stream, lctn)
-            .ok_or_else(|| {
-                SprigError::new(SprigCode::StreamNotFound, format!("no stream {stream}"))
-            })?;
-        if def.partitions <= partition {
-            return Err(SprigError::new(
-                SprigCode::StreamNotFound,
-                format!("stream {stream} has no partition {partition}"),
-            ));
-        }
-        // Committing a position is reading the stream.
-        {
-            let grants = crate::tenant::authz::privileges(ts, &cat);
-            let db_key = database_key(&db_name, lctn);
-            let name_key = object_key(ObjectKind::Table, &def.name, lctn);
-            if !grants.unrestricted()
-                && !grants.allows(
-                    Action::Select,
-                    Target::Named {
-                        db_key: &db_key,
-                        name_key: &name_key,
-                    },
-                )
-                && !grants.allows(Action::Select, Target::Database { db_key: &db_key })
-            {
-                return Err(SprigError::standard(
-                    1142,
-                    *b"42000",
-                    format!(
-                        "SELECT command denied to user '{}'@'{}' for table `{db_name}`.`{}`",
-                        ts.principal.user, ts.principal.host, def.name
-                    ),
-                ));
-            }
-        }
-        self.commit_offset_internal(
-            cx,
-            &Commit {
-                group,
-                instance: 0,
-                stream: def.id.0,
-                partition,
-                offset,
-                epoch: None,
-                metadata,
-                expect: None,
-            },
-        )
-        .await
+        Err(SprigError::new(
+            SprigCode::StreamNotFound,
+            format!("no stream {stream}: streams are kept in engine databases"),
+        ))
     }
 
     /// `CALL sprig.commit_offset` on stream `name` of engine database `db`:
@@ -500,156 +390,39 @@ impl PassSession {
             .await
     }
 
-    /// Commits `c` (see the module docs): inside the session's transaction
-    /// when there is one, else at once.
+    /// Marks the replay of dead letter `dl_id` of the trigger whose replay
+    /// group is `group`, in the session's engine transaction: `false` when
+    /// it is already marked (a repeated run, which must not run again).
     ///
     /// # Errors
-    /// 39877 when `c.expect` doesn't hold; 39958 (see the module docs);
-    /// the catalog's or the statement's error.
-    pub(super) async fn commit_offset_internal(
-        &mut self,
-        cx: &mut ExecCtx<'_>,
-        c: &Commit,
-    ) -> Result<()> {
-        let in_txn = self.offsets_in_transaction();
-        let (svc, tenant, user) = {
-            let ts = self
-                .tenant
-                .as_deref()
-                .ok_or_else(|| SprigError::internal("no tenant"))?;
-            (
-                std::sync::Arc::clone(ts.services()),
-                ts.tenant,
-                ts.principal.backend.user.clone(),
-            )
-        };
-        let schema = SchemaName::catalog(tenant).to_string();
-        let catalog_cluster = svc.locator.cluster(tenant).await?;
-        let call = offsets::call_sql(&schema, c);
-        if !in_txn {
-            // A transaction's commit of the same group can be a held
-            // branch's row: through the relay writer for a tenant on the
-            // relay path.
-            let pool = svc.locator.tenant_catalog_pool(tenant).await?;
-            let mut conn = pool
-                .get_conn_bounded()
-                .await
-                .map_err(sprig_streams::maria::map_err)?;
-            if let Err(e) = conn.query_drop(&call).await {
-                let missing = matches!(&e, mysql_async::Error::Server(s) if s.code == 1305);
-                if !missing {
-                    return Err(moved_or(sprig_streams::maria::map_err(e)));
-                }
-                conn.query_drop(offsets::procedure_for(&schema, c))
-                    .await
-                    .map_err(sprig_streams::maria::map_err)?;
-                conn.query_drop(&call)
-                    .await
-                    .map_err(|e| moved_or(sprig_streams::maria::map_err(e)))?;
-            }
-            return Ok(());
-        }
-        if catalog_cluster != self.own_cluster() {
-            return Err(SprigError::new(
-                SprigCode::StreamOffsetTxnUnsupported,
-                format!(
-                    "sprig.commit_offset inside a transaction needs the tenant's catalog on the \
-                     transaction's cluster ({}), but it is on {catalog_cluster}",
-                    self.own_cluster()
-                ),
-            ));
-        }
-        let key = (catalog_cluster.clone(), user.clone());
-        let known = granted()
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains(&key);
-        if !known {
-            self.grant_offsets(&catalog_cluster, &schema, tenant, &user)
-                .await?;
-        }
-        let role = format!("SET ROLE `{}`", offsets::role(tenant));
-        let wire = Wire {
-            persona: cx.proto.persona,
-            caps: cx.proto.caps,
-        };
-        for attempt in 0..2 {
-            let mut sink = Collect::new(wire);
-            Box::pin(self.forward_raw_own(cx, &role, &mut sink)).await?;
-            if let Some(e) = sink.error {
-                // 1959: the role isn't granted (anymore): grant it again.
-                if attempt == 0 && sql_errno(&e) == 1959 {
-                    self.grant_offsets(&catalog_cluster, &schema, tenant, &user)
-                        .await?;
-                    continue;
-                }
-                return Err(e);
-            }
-            let mut sink = Collect::new(wire);
-            Box::pin(self.forward_raw_own(cx, &call, &mut sink)).await?;
-            match sink.error {
-                None => return Ok(()),
-                // 1370: no EXECUTE; 1305: no procedure.
-                Some(e) if attempt == 0 && matches!(sql_errno(&e), 1370 | 1305) => {
-                    self.grant_offsets(&catalog_cluster, &schema, tenant, &user)
-                        .await?;
-                }
-                Some(e) => return Err(moved_or(e)),
-            }
-        }
-        Err(SprigError::internal(
-            "sprig.commit_offset: the grant didn't take",
-        ))
-    }
-
-    async fn grant_offsets(
-        &self,
-        cluster: &ClusterId,
-        schema: &str,
-        tenant: sprig_common::ids::TenantId,
-        user: &str,
-    ) -> Result<()> {
-        let ts = self
+    /// 1235 when the session has no engine transaction; the engine's.
+    pub(super) async fn replay_mark(&mut self, group: &str, dl_id: u64) -> Result<bool> {
+        let tenant = self
             .tenant
             .as_deref()
-            .ok_or_else(|| SprigError::internal("no tenant"))?;
-        let pool = ts.services().locator.ctl_pool(cluster).await?;
-        let mut conn = pool
-            .get_conn_bounded()
-            .await
-            .map_err(sprig_streams::maria::map_err)?;
-        for s in offsets::grant_sql(schema, tenant, user) {
-            if let Err(e) = conn.query_drop(&s).await {
-                // 1396 (role exists, raced) and 1304 are "already done".
-                if !matches!(&e, mysql_async::Error::Server(x) if matches!(x.code, 1396 | 1304)) {
-                    return Err(sprig_streams::maria::map_err(e));
-                }
+            .ok_or_else(|| SprigError::internal("no tenant"))?
+            .tenant;
+        let now = sprig_streams::seg::now_ms();
+        match self.eng.txn.open_tx() {
+            Some(tx) => {
+                sprig_streams::seg::records::move_offset(
+                    tx.engine_txn(),
+                    tenant.0,
+                    group,
+                    dl_id,
+                    0,
+                    0,
+                    1,
+                    now,
+                )
+                .await
             }
+            None => Err(SprigError::standard(
+                1235,
+                *b"42000",
+                "This version of SprigDB doesn't yet support 'a trigger's dead-letter replay \
+                 outside a transaction on the engine'",
+            )),
         }
-        granted()
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert((cluster.clone(), user.to_owned()));
-        Ok(())
-    }
-}
-
-fn sql_errno(e: &SprigError) -> u16 {
-    match e.kind {
-        sprig_common::ErrorKind::Backend { errno, .. }
-        | sprig_common::ErrorKind::Standard { errno, .. } => errno,
-        sprig_common::ErrorKind::Sprig(c) => c.number(),
-    }
-}
-
-/// The procedure's compare-and-set failure as 39877.
-fn moved_or(e: SprigError) -> SprigError {
-    if offsets::is_moved(&e) {
-        SprigError::new(
-            SprigCode::LogicTriggerPositionMoved,
-            "the consumer group is no longer at this offset (another run committed it)",
-        )
-    } else {
-        e
     }
 }

@@ -1,15 +1,7 @@
 //! Source readers.
 //!
-//! - [`StreamSource`]: a stream or change topic, read from its log with
-//!   `sprig-streams`' `LogReader`, positions in the consumer group
-//!   `__sprig_sink_<id>` (`stream_offsets`), so Kafka tools and Studio show
-//!   a sink's lag like any group's. A partition without a committed offset
-//!   starts at `START AT` and commits that position at once, so a restart
-//!   neither skips nor repeats records published meanwhile.
-//! - Dead letters marked for replay are fed back first, with their
-//!   original idempotency keys; they settle on their own (they are below
-//!   the group's offsets).
-//!
+//! - [`FanInSource`]: every member's instance of an inherited queue
+//!   definition, read as one source.
 //! - [`QueueSource`]: a durable queue, consumed through a
 //!   gateway's queue engine as the sink's owner ([`crate::peer`]):
 //!   `sprig.mq_get` holds each message for `sink.queue_lease_ms`, a
@@ -17,372 +9,15 @@
 //!   for good is rejected without requeue (`mq_nack`) when the sink has no
 //!   `DEAD LETTER TO`, so the queue's own dead-lettering applies. Its
 //!   idempotency key is `q/<queue id>/<message id>`.
-//!
-//! `CHANGES OF` reads the tables' change topics (`t.changes`) as streams.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use mysql_async::Pool;
 use sprig_common::{Result, SprigCode};
-use sprig_streams::read::{LogReader, ReadLimits};
-use sprig_streams::store::{CommittedOffset, StreamsStore};
-use sprig_streams::{Offset, PartitionNo, StreamId};
 
-use crate::model::{Position, SinkId, SinkRecord, StartAt, err, stream_key};
+use crate::model::{Position, SinkRecord};
 use crate::runtime::SourceReader;
-use crate::store::SinksStore;
-
-fn backend(e: mysql_async::Error) -> sprig_common::SprigError {
-    let mut x =
-        sprig_common::SprigError::new(SprigCode::CatalogUnavailable, "sink source unavailable")
-            .with_source(e);
-    x.retryable = true;
-    x
-}
-
-/// Catalog schemas whose streams module this process migrated.
-fn migrated() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    M.get_or_init(Default::default)
-}
-
-/// A stream log record as a sink record (also `TEST SINK`'s samples).
-pub(crate) fn stream_record(stream: u64, p: u32, rec: sprig_streams::model::Record) -> SinkRecord {
-    SinkRecord {
-        idem_key: stream_key(stream, p, rec.offset.0, rec.leader_epoch.0),
-        pos: Position::Stream {
-            stream,
-            partition: p,
-            offset: rec.offset.0,
-            epoch: rec.leader_epoch.0,
-        },
-        key: rec.key,
-        value: rec.value,
-        headers: rec
-            .headers
-            .into_iter()
-            .map(|(k, v)| (k, v.unwrap_or_default()))
-            .collect(),
-        op: None,
-        before: None,
-        after: None,
-        ts_ms: rec.ts_ms,
-    }
-}
-
-/// A stream source for one task.
-pub struct StreamSource {
-    shard: Pool,
-    catalog: Pool,
-    catalog_schema: String,
-    log: LogReader,
-    /// The member whose instance `stream` is (a fan-in sink); 0 for
-    /// the sink's own tenant's stream.
-    instance: u64,
-    stream: StreamId,
-    partitions: Vec<u32>,
-    group: String,
-    at: HashMap<u32, u64>,
-    turn: usize,
-    sink: SinkId,
-    last_replay_check: Option<tokio::time::Instant>,
-    /// The sink's records (its dead letters to replay).
-    sinks: Option<SinksStore>,
-}
-
-impl std::fmt::Debug for StreamSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StreamSource")
-            .field("stream", &self.stream.0)
-            .field("partitions", &self.partitions)
-            .field("at", &self.at)
-            .finish_non_exhaustive()
-    }
-}
-
-impl StreamSource {
-    /// The same source, replaying the sink's dead letters from `store`.
-    #[must_use]
-    pub fn with_sinks(mut self, store: SinksStore) -> Self {
-        self.sinks = Some(store);
-        self
-    }
-
-    /// Opens the source at its committed offsets, or at `start` for
-    /// partitions without one (committing that position).
-    ///
-    /// # Errors
-    /// The catalog's or the shard's.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn open(
-        shard: Pool,
-        catalog: Pool,
-        catalog_schema: String,
-        log_schema: String,
-        stream: StreamId,
-        partitions: Vec<u32>,
-        group: String,
-        start: StartAt,
-        sink: SinkId,
-    ) -> Result<Self> {
-        Self::open_instance(
-            shard,
-            catalog,
-            catalog_schema,
-            log_schema,
-            0,
-            stream,
-            partitions,
-            group,
-            start,
-            sink,
-        )
-        .await
-    }
-
-    /// [`Self::open`] over member `instance`'s instance `stream` (a fan-in
-    /// sink): `shard` is the member's cluster, the positions
-    /// are the sink's, in its own catalog, with `instance_tenant_id`.
-    ///
-    /// # Errors
-    /// The catalog's or the shard's.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn open_instance(
-        shard: Pool,
-        catalog: Pool,
-        catalog_schema: String,
-        log_schema: String,
-        instance: u64,
-        stream: StreamId,
-        partitions: Vec<u32>,
-        group: String,
-        start: StartAt,
-        sink: SinkId,
-    ) -> Result<Self> {
-        let log = LogReader { schema: log_schema };
-        let store = StreamsStore::new(catalog_schema.clone());
-        let mut c = catalog.get_conn().await.map_err(backend)?;
-        // `stream_offsets.instance_tenant_id` before the first read.
-        if !migrated()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&catalog_schema)
-        {
-            sprig_streams::store::migrate(&mut c, &catalog_schema).await?;
-            migrated()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(catalog_schema.clone());
-        }
-        let committed = store.group_offsets(&mut c, &group).await?;
-        let mut sc = shard.get_conn().await.map_err(backend)?;
-        let mut at = HashMap::new();
-        let mut fresh = Vec::new();
-        for p in &partitions {
-            if let Some(o) = committed.iter().find(|o| {
-                o.instance_tenant == instance && o.stream == stream && o.partition.0 == *p
-            }) {
-                at.insert(*p, o.offset);
-                continue;
-            }
-            let b = log.bounds(&mut sc, stream, PartitionNo(*p)).await?;
-            let o = match start {
-                StartAt::Earliest | StartAt::Snapshot => b.log_start.0,
-                StartAt::Latest => b.high_watermark.0,
-                StartAt::Timestamp { ms } => log
-                    .offset_for_time(&mut sc, stream, PartitionNo(*p), Some(ms))
-                    .await?
-                    .map_or(b.high_watermark.0, |(o, _)| o.0),
-            };
-            at.insert(*p, o);
-            fresh.push((*p, o));
-        }
-        for (p, o) in fresh {
-            store
-                .commit_offset(
-                    &mut c,
-                    &CommittedOffset {
-                        group: group.clone(),
-                        instance_tenant: instance,
-                        stream,
-                        partition: PartitionNo(p),
-                        offset: o,
-                        leader_epoch: None,
-                        metadata: Some("sprig sink: start".into()),
-                    },
-                )
-                .await?;
-        }
-        Ok(Self {
-            shard,
-            catalog,
-            catalog_schema,
-            log,
-            instance,
-            stream,
-            partitions,
-            group,
-            at,
-            turn: 0,
-            sink,
-            last_replay_check: None,
-            sinks: None,
-        })
-    }
-
-    async fn replays(&mut self) -> Result<Vec<SinkRecord>> {
-        let now = tokio::time::Instant::now();
-        if self
-            .last_replay_check
-            .is_some_and(|t| now.duration_since(t) < Duration::from_secs(3))
-        {
-            return Ok(Vec::new());
-        }
-        self.last_replay_check = Some(now);
-        let Some(store) = &self.sinks else {
-            return Ok(Vec::new());
-        };
-        let mut v = store.take_replays(self.sink, 500).await?;
-        for r in &mut v {
-            // Replays settle on their own: they are below the offsets.
-            r.pos = Position::Queue {
-                queue: 0,
-                msg_id: format!("replay:{}", r.idem_key),
-                delivery: String::new(),
-            };
-        }
-        Ok(v)
-    }
-}
-
-#[async_trait]
-impl SourceReader for StreamSource {
-    async fn next_batch(
-        &mut self,
-        max_records: usize,
-        max_bytes: u64,
-        wait: Duration,
-    ) -> Result<Vec<SinkRecord>> {
-        let mut out = self.replays().await?;
-        if self.partitions.is_empty() {
-            tokio::time::sleep(wait).await;
-            return Ok(out);
-        }
-        let mut c = self.shard.get_conn().await.map_err(backend)?;
-        let n = self.partitions.len();
-        for i in 0..n {
-            if out.len() >= max_records {
-                break;
-            }
-            let p = self.partitions[(self.turn + i) % n];
-            let from = self.at.get(&p).copied().unwrap_or(0);
-            let r = self
-                .log
-                .read(
-                    &mut c,
-                    self.stream,
-                    PartitionNo(p),
-                    Offset(from),
-                    ReadLimits {
-                        max_records: u32::try_from(max_records - out.len()).unwrap_or(u32::MAX),
-                        max_bytes,
-                    },
-                )
-                .await;
-            let batch = match r {
-                Ok(b) => b,
-                Err(e)
-                    if e.kind
-                        == sprig_common::ErrorKind::Sprig(SprigCode::StreamOffsetOutOfRange) =>
-                {
-                    let b = self.log.bounds(&mut c, self.stream, PartitionNo(p)).await?;
-                    if from < b.log_start.0 {
-                        return Err(err(
-                            SprigCode::SinkSourceLost,
-                            format!(
-                                "partition {p}: position {from} is below the stream's log start {}",
-                                b.log_start.0
-                            ),
-                        ));
-                    }
-                    // Above the high watermark (a reset log): start over at it.
-                    self.at.insert(p, b.high_watermark.0);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            for rec in batch.records {
-                self.at.insert(p, rec.offset.0 + 1);
-                out.push(stream_record(self.stream.0, p, rec));
-            }
-        }
-        self.turn = self.turn.wrapping_add(1);
-        drop(c);
-        if out.is_empty() {
-            tokio::time::sleep(wait.min(Duration::from_millis(100))).await;
-        }
-        Ok(out)
-    }
-
-    async fn settle(&mut self, done: &[Position]) -> Result<()> {
-        let mut by_part: HashMap<u32, (u64, u32)> = HashMap::new();
-        for p in done {
-            if let Position::Stream {
-                stream,
-                partition,
-                offset,
-                epoch,
-            } = p
-                && *stream == self.stream.0
-            {
-                let e = by_part.entry(*partition).or_insert((0, *epoch));
-                if *offset + 1 > e.0 {
-                    *e = (*offset + 1, *epoch);
-                }
-            }
-        }
-        if by_part.is_empty() {
-            return Ok(());
-        }
-        let store = StreamsStore::new(self.catalog_schema.clone());
-        let mut c = self.catalog.get_conn().await.map_err(backend)?;
-        for (p, (o, e)) in by_part {
-            store
-                .commit_offset(
-                    &mut c,
-                    &CommittedOffset {
-                        group: self.group.clone(),
-                        instance_tenant: self.instance,
-                        stream: self.stream,
-                        partition: PartitionNo(p),
-                        offset: o,
-                        leader_epoch: Some(e),
-                        metadata: None,
-                    },
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn seek_after(&mut self, pos: &Position) -> Result<()> {
-        if let Position::Stream {
-            stream,
-            partition,
-            offset,
-            ..
-        } = pos
-            && *stream == self.stream.0
-            && self.partitions.contains(partition)
-        {
-            self.at.insert(*partition, offset + 1);
-        }
-        Ok(())
-    }
-}
 
 // ----------------------------------------------------------------------
 // Fan-in sources.
@@ -452,10 +87,6 @@ struct Child {
 /// ([`FANIN_SLOT_FLAG`]).
 pub struct FanInSource {
     opener: Box<dyn FanInOpener>,
-    /// `CHANGES OF`: the tables' change topics of the sink's own tenant;
-    /// values are change envelopes, read into `op`, `before` and `after`,
-    /// and nothing is tagged with a tenant.
-    changes: bool,
     children: Vec<Child>,
     refresh: Duration,
     next_refresh: tokio::time::Instant,
@@ -481,29 +112,8 @@ impl FanInSource {
     pub async fn open(opener: Box<dyn FanInOpener>, refresh: Duration) -> Result<Self> {
         let mut s = Self {
             opener,
-            changes: false,
             children: Vec::new(),
             refresh,
-            next_refresh: tokio::time::Instant::now(),
-            turn: 0,
-            next_slot: 0,
-        };
-        s.refresh_members().await?;
-        Ok(s)
-    }
-
-    /// A source over the sink's own tables' change topics (`CHANGES OF`):
-    /// the same reading, with each record's change envelope read into
-    /// `op`, `before` and `after`.
-    ///
-    /// # Errors
-    /// The first listing's.
-    pub async fn open_changes(opener: Box<dyn FanInOpener>) -> Result<Self> {
-        let mut s = Self {
-            opener,
-            changes: true,
-            children: Vec::new(),
-            refresh: Duration::from_secs(3600),
             next_refresh: tokio::time::Instant::now(),
             turn: 0,
             next_slot: 0,
@@ -566,26 +176,6 @@ fn unslot(mut p: Position, real: u64) -> Position {
     p
 }
 
-/// A change topic's record as a change record (`CHANGES OF`).
-fn change(mut r: SinkRecord, packed: u64) -> SinkRecord {
-    if let Position::Stream { stream, .. } = &mut r.pos {
-        *stream = packed;
-    }
-    if let Some(v) = r
-        .value
-        .as_deref()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
-    {
-        r.op = v
-            .get("op")
-            .and_then(serde_json::Value::as_str)
-            .and_then(crate::model::ChangeOp::parse);
-        r.before = v.get("before").filter(|x| !x.is_null()).cloned();
-        r.after = v.get("after").filter(|x| !x.is_null()).cloned();
-    }
-    r
-}
-
 fn tag(mut r: SinkRecord, c: &Child) -> SinkRecord {
     match &mut r.pos {
         Position::Stream { stream, .. } => {
@@ -643,11 +233,7 @@ impl SourceReader for FanInSource {
                 c.idle_until = None;
             }
             let c = &self.children[k];
-            if self.changes {
-                out.extend(got.into_iter().map(|r| change(r, c.packed)));
-            } else {
-                out.extend(got.into_iter().map(|r| tag(r, c)));
-            }
+            out.extend(got.into_iter().map(|r| tag(r, c)));
         }
         self.turn = self.turn.wrapping_add(1);
         if out.is_empty() {
@@ -1341,7 +927,7 @@ mod fan_in_tests {
             before: None,
             after: None,
             ts_ms: 0,
-            idem_key: stream_key(stream, 0, offset, 1),
+            idem_key: crate::model::stream_key(stream, 0, offset, 1),
             pos: Position::Stream {
                 stream,
                 partition: 0,
@@ -1467,20 +1053,6 @@ mod fan_in_tests {
         assert_eq!(record_member(&r), None);
         r.idem_key = ":x".into();
         assert_eq!(record_member(&r), None);
-    }
-
-    #[tokio::test]
-    async fn change_topics_are_not_members() {
-        let settled = Arc::new(Mutex::new(Vec::new()));
-        let mut s = FanInSource::open_changes(Box::new(Opener {
-            members: vec![(26_306_000_001, "")],
-            settled: Arc::clone(&settled),
-        }))
-        .await
-        .unwrap();
-        let got = s.next_batch(100, 1 << 20, Duration::ZERO).await.unwrap();
-        assert_eq!(got.len(), 2);
-        assert!(got.iter().all(|r| record_member(r).is_none()));
     }
 }
 

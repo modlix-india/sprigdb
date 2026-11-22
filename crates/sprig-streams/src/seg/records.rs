@@ -145,6 +145,46 @@ pub async fn put_offsets(
     Ok(())
 }
 
+/// Moves one committed offset of `group` from `expect` (absent counts as 0)
+/// to `offset` in `txn`, the row locked first: `false` when it holds
+/// another value (someone else moved it), and nothing is written. A
+/// trigger's dead-letter replay marks its run this way, so a repeated run
+/// finds the mark and stops.
+///
+/// # Errors
+/// A lock, read or write error of the transaction.
+#[allow(clippy::too_many_arguments)] // the key's parts and the move
+pub async fn move_offset(
+    txn: &mut Txn,
+    tenant: u64,
+    group: &str,
+    stream: u64,
+    partition: i32,
+    expect: i64,
+    offset: i64,
+    now_ms: i64,
+) -> Result<bool> {
+    let k = Bytes::from(offset_key(tenant, group, 0, stream, partition));
+    txn.lock(&k, LockRequest::write()).await?;
+    let have = match txn.read_current(&k)? {
+        Some(b) => parse::<OffsetRow>(&b)?.offset,
+        None => 0,
+    };
+    if have != expect {
+        return Ok(false);
+    }
+    txn.put(
+        k.to_vec(),
+        json(&OffsetRow {
+            offset,
+            leader_epoch: None,
+            metadata: None,
+            committed_ms: now_ms,
+        })?,
+    )?;
+    Ok(true)
+}
+
 /// The engine records of streams.
 #[derive(Clone)]
 pub struct StreamRecords {

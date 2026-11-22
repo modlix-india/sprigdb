@@ -685,12 +685,10 @@ impl PassSession {
                 s.exec(q).await?;
             }
         }
-        // Back before the change topic's view and the catalog change below
-        // (catalog before `sprig_ctl`, never the other way round).
+        // Back before the catalog change below (catalog before
+        // `sprig_ctl`, never the other way round).
         let list = std::mem::take(&mut shards.list);
         drop(shards);
-        // The table's change topic filter view follows its policies.
-        Box::pin(self.redeploy_change_view(object)).await;
         let mut shards = super::logic_bound::CtlShards {
             list,
             conns: HashMap::new(),

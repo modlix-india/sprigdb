@@ -13,7 +13,7 @@
 //!                                         member, sealed under its key
 //! ALTER INHERITED SINK s ... SET (...) | RESET | DISABLE | ENABLE
 //!
-//! ensure_for_stream(T, stream definition D, T's instance of D):
+//! ensure_for_queue(T, queue definition D, T's instance of D):
 //!   for each sink definition S reaching T whose source is D:
 //!     config := for each connection definition C that S names: C's options
 //!               with the nearest overrides, templates expanded for T; the
@@ -25,8 +25,7 @@
 //!       C's instance: an ordinary connection of T (create, or SET and SET
 //!         CREDENTIALS when the config changed); allowlist and residency are T's
 //!       S's instance: an ordinary sink of T over D's instance (create, or SET
-//!         its options); a new one starts at the beginning of D's instance when
-//!         that came after S, else at the definition's START AT
+//!         its options)
 //!       DISABLE pauses it (its position stays); ENABLE resumes it
 //! ```
 //!
@@ -42,9 +41,8 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::ddl::database_key;
 use sprig_catalog::pool_wait::Bounded as _;
-use sprig_catalog::store::{Namespace, ObjectKind, ObjectState};
 use sprig_catalog::version::VersionKind;
 use sprig_catalog::{CatalogLocator, Freshness, TenantCatalog};
 use sprig_common::ids::{DbId, TenantId, UserId};
@@ -55,7 +53,7 @@ use sprig_inherit::msg::{
 };
 use sprig_sinks::grammar::{self as sg, OptVal};
 use sprig_sinks::meta::{PlatformConnection, SinkIndex};
-use sprig_sinks::model::{SinkId, SinkState, StartAt, TaskRow};
+use sprig_sinks::model::{SinkId, SinkState, TaskRow};
 use sprig_sinks::policy::Residency;
 use sprig_sinks::secrets::SinkKeyring;
 use sprig_sinks::sql::{Change, Host};
@@ -63,7 +61,6 @@ use sprig_sinks::store::SinksState;
 use zeroize::Zeroizing;
 
 use super::catalog;
-use super::streams::StreamInstance;
 use crate::tenant::TenantServices;
 
 /// An option of a connection definition, as written.
@@ -147,12 +144,6 @@ fn on_source(chain: &Chain, source: &Definition) -> Vec<Arc<Definition>> {
                     .is_some_and(|s| s.key() == source.key())
         })
         .collect()
-}
-
-/// The sink definitions reaching the member whose source is `stream`.
-#[must_use]
-pub fn on_stream(chain: &Chain, stream: &Definition) -> Vec<Arc<Definition>> {
-    on_source(chain, stream)
 }
 
 /// The sink definitions reaching the member whose source is `queue`.
@@ -332,24 +323,12 @@ fn signature(chain: &Chain, s: &Definition, conns: &[ConnConfig]) -> String {
     out
 }
 
-/// See the module docs. Errors of one member's sink (its webhook not on
-/// its allowlist, a name it uses itself) are kept in the instance row and
-/// logged; they never fail the publish that triggered the check.
-pub async fn ensure_for_stream(
-    svc: &Arc<TenantServices>,
-    chain: &Chain,
-    stream_def: &Definition,
-    si: &StreamInstance,
-) {
-    for s in on_stream(chain, stream_def) {
-        ensure_logged(svc, chain, &s, si.tenant, Some(si), stream_def.key()).await;
-    }
-}
-
-/// [`ensure_for_stream`] for a member's queue instance: the sink
-/// definitions over `FOR EACH TENANT` queue `queue_def` reaching member `t`
-/// get its own queue sink, deployed when its queue instance is made (as for
-/// streams), reading that queue as its `sprig_inherited`.
+/// See the module docs: the sink definitions over `FOR EACH TENANT` queue
+/// `queue_def` reaching member `t` get its own queue sink, deployed when its
+/// queue instance is made, reading that queue as its `sprig_inherited`.
+/// Errors of one member's sink (its webhook not on its allowlist, a name it
+/// uses itself) are kept in the instance row and logged; they never fail
+/// the publish that triggered the check.
 pub async fn ensure_for_queue(
     svc: &Arc<TenantServices>,
     chain: &Chain,
@@ -357,7 +336,7 @@ pub async fn ensure_for_queue(
     t: TenantId,
 ) {
     for s in on_queue(chain, queue_def) {
-        ensure_logged(svc, chain, &s, t, None, queue_def.key()).await;
+        ensure_logged(svc, chain, &s, t, queue_def.key()).await;
     }
 }
 
@@ -368,10 +347,9 @@ async fn ensure_logged(
     chain: &Chain,
     s: &Arc<Definition>,
     t: TenantId,
-    si: Option<&StreamInstance>,
     source: DefKey,
 ) {
-    match ensure_one(svc, chain, s, t, si).await {
+    match ensure_one(svc, chain, s, t).await {
         Ok(true) => {
             // It had failed before: no retry is due any more.
             let _ = retry::clear(svc, t, s.key()).await;
@@ -619,29 +597,16 @@ pub mod retry {
         else {
             return Ok(None);
         };
-        // The source: a stream definition (its instance must exist), or a
-        // queue definition (a member without its queue instance yet fails
-        // the deploy and is tried again).
-        let stream_def = chain
-            .reaching(DefKind::Stream)
-            .into_iter()
-            .find(|d| d.key() == e.stream);
-        let si = if let Some(stream_def) = stream_def {
-            let Some(si) = super::super::streams::existing(&cat, &stream_def) else {
-                return Ok(None);
-            };
-            Some(si)
-        } else {
-            if !chain
-                .reaching(DefKind::Queue)
-                .iter()
-                .any(|d| d.key() == e.stream)
-            {
-                return Ok(None);
-            }
-            None
-        };
-        match super::ensure_one(svc, &chain, &s, e.tenant, si.as_ref()).await {
+        // The source: a queue definition (a member without its queue
+        // instance yet fails the deploy and is tried again).
+        if !chain
+            .reaching(DefKind::Queue)
+            .iter()
+            .any(|d| d.key() == e.stream)
+        {
+            return Ok(None);
+        }
+        match super::ensure_one(svc, &chain, &s, e.tenant).await {
             Ok(_) => Ok(Some(())),
             Err(err) => {
                 let _ = super::record(
@@ -729,14 +694,13 @@ async fn record(
 }
 
 #[allow(clippy::too_many_lines)]
-/// Deploys member `si.tenant`'s instance of sink definition `s`: true
+/// Deploys member `t`'s instance of sink definition `s`: true
 /// when its last deploy had failed (see [`retry`]).
 async fn ensure_one(
     svc: &Arc<TenantServices>,
     chain: &Chain,
     s: &Arc<Definition>,
     t: TenantId,
-    si: Option<&StreamInstance>,
 ) -> Result<bool> {
     let spec: SinkSpec = serde_json::from_value(s.definition.clone()).unwrap_or_default();
     let name = super::tenant_name(svc, t).await?;
@@ -998,27 +962,7 @@ async fn ensure_one(
             cur.id.0
         }
         None => {
-            // Like inherited triggers: an instance made after the
-            // definition starts at its beginning (every record came after
-            // the definition), else where the definition says. A queue
-            // sink (no stream instance) takes what its queue holds.
-            match si {
-                Some(si) if si.created || si.stream.created_at_ms >= s.created_at_ms => {
-                    cs.start_at = StartAt::Earliest;
-                }
-                // "Latest" is the definition's creation, not the deploy or
-                // the task's first run: the publish whose use of the
-                // instance deploys the sink was stamped before the deploy,
-                // and a task that can't start yet (a destination down, a
-                // credential still missing, a deploy retried on the timer)
-                // misses nothing published after the definition.
-                Some(_) if cs.start_at == StartAt::Latest => {
-                    cs.start_at = StartAt::Timestamp {
-                        ms: i64::try_from(s.created_at_ms).unwrap_or(i64::MAX),
-                    };
-                }
-                _ => {}
-            }
+            // A queue sink takes what its queue holds.
             cs.options = opts
                 .iter()
                 .map(|(k, v)| (k.clone(), OptVal::Text(v.clone())))
@@ -1506,9 +1450,6 @@ pub async fn reapply_source(
     };
     if d.kind == DefKind::Queue {
         ensure_for_queue(svc, &chain, &d, t).await;
-    } else {
-        super::streams::forget_applied(t, source);
-        Box::pin(super::streams::ensure(svc, &chain, &d, Cause::Declare)).await?;
     }
     Ok(true)
 }
@@ -1587,15 +1528,6 @@ impl Host for DeployHost {
         )
     }
 
-    fn stream(&self, db: u32, name: &str) -> Option<(u64, u32)> {
-        let st = self
-            .cat
-            .ext
-            .get::<sprig_streams::StreamsState>(sprig_streams::MODULE)?;
-        st.get(DbId(db), name, self.lctn())
-            .map(|s| (s.id.0, s.partitions))
-    }
-
     fn queue(&self, db: u32, name: &str) -> Option<u64> {
         let st = self
             .cat
@@ -1607,17 +1539,6 @@ impl Host for DeployHost {
             .get(name)
             .filter(|q| q.durable && q.temp_on.is_none())
             .map(|q| q.id)
-    }
-
-    fn table(&self, db: u32, name: &str) -> Option<u64> {
-        self.cat
-            .object(
-                DbId(db),
-                Namespace::Relation,
-                &object_key(ObjectKind::Table, name, self.lctn()),
-            )
-            .filter(|o| o.state == ObjectState::Active)
-            .map(|o| o.object_id.0)
     }
 
     fn sink_admin(&self) -> bool {

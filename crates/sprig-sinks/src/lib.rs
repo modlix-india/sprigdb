@@ -36,7 +36,6 @@ pub mod peer;
 pub mod policy;
 pub mod probe;
 pub mod residency;
-pub mod rls_filter;
 pub mod runtime;
 pub mod secrets;
 pub mod settings;

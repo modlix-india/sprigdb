@@ -218,7 +218,9 @@ impl PassSession {
         // Every shard of the database:
         // a sharded database gets the routines on each, all or nothing.
         let shard_list = shard_list(ts, &self.target.cluster, &db, &row)?;
-        let streams = logic_streams(ts, &catalog, row.db_id);
+        // Compiled code publishes to no stream: streams are stored on the
+        // engine, which compiled routines can't reach.
+        let streams = service::StreamList::new();
         let schema = shard_list[0].0.clone();
         let single_shard = shard_list.len() == 1;
         let user = match auto {
@@ -426,55 +428,6 @@ impl PassSession {
         }
         Ok(notes)
     }
-}
-
-/// The streams of database `db` as a compiled `db.publish` sees them:
-/// each event stream's outbox, `stream.max_message_bytes` and whether it
-/// is compacted; a change topic or a stream that isn't active can't be
-/// published to from compiled code (the engine tier answers those).
-pub(super) fn logic_streams(
-    ts: &crate::tenant::session::TenantSession,
-    cat: &sprig_catalog::TenantCatalog,
-    db: sprig_common::ids::DbId,
-) -> service::StreamList {
-    let Some(state) = cat
-        .ext
-        .get::<sprig_streams::StreamsState>(sprig_streams::MODULE)
-    else {
-        return Vec::new();
-    };
-    let svc = ts.services();
-    state
-        .of_db(db)
-        .map(|s| {
-            // The stream's own value, else its database's and up, as an
-            // `INSERT INTO <stream>` reads it.
-            let ctx = cat
-                .object_ctx(&svc.dc, sprig_common::ids::ObjectId(s.id.0))
-                .with_db(db);
-            let max = svc.settings.get(
-                &sprig_streams::settings::MAX_MESSAGE_BYTES,
-                &ctx,
-                Some(&cat.settings),
-            );
-            let t = if s.kind == sprig_streams::StreamKind::Changes {
-                Err(format!(
-                    "{} is a change topic, which only SprigDB writes",
-                    s.name
-                ))
-            } else if s.state != sprig_streams::StreamState::Active {
-                Err(format!("stream {} isn't active", s.name))
-            } else {
-                Ok(sprig_logic::compiler::link::StreamTarget {
-                    name: s.name.clone(),
-                    outbox: s.outbox_table(),
-                    max_bytes: max,
-                    compact: s.cleanup == sprig_streams::Cleanup::Compact,
-                })
-            };
-            (s.name.clone(), t)
-        })
-        .collect()
 }
 
 /// Every shard schema of database `db`: the session's own schema (the default group's shard, where

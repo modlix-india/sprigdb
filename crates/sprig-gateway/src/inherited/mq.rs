@@ -243,9 +243,9 @@ pub async fn ensure_vhost(
         )
         .await?;
     }
-    let cat = super::streams::ensure_database(svc, t, &db_name).await?;
+    let cat = super::ensure_database(svc, t, &db_name).await?;
     let prepared_ms = started.elapsed().as_millis();
-    let lc = super::streams::lctn(svc, &cat);
+    let lc = super::lctn(svc, &cat);
     let row = cat
         .database(&database_key(&db_name, lc))
         .cloned()
@@ -584,7 +584,7 @@ async fn warm_store(
 /// The catalog's.
 pub async fn remove(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) -> Result<()> {
     let cat = catalog(svc, t).await?;
-    let lc = super::streams::lctn(svc, &cat);
+    let lc = super::lctn(svc, &cat);
     if let Some(row) = cat.database(&database_key(&def.db_name, lc)) {
         let mq = cat
             .ext
@@ -642,7 +642,7 @@ pub async fn remove_binding(
     b: &BindingSpec,
 ) -> Result<()> {
     let cat = catalog(svc, t).await?;
-    let lc = super::streams::lctn(svc, &cat);
+    let lc = super::lctn(svc, &cat);
     let Some(row) = cat.database(&database_key(db, lc)) else {
         return Ok(());
     };
@@ -929,7 +929,7 @@ pub async fn deliver_outbox(
         .map_err(|e| sql_mq(&e))?;
     v.ensure_store().await.map_err(|e| sql_mq(&e))?;
     let cat = catalog(svc, t).await?;
-    let lc = super::streams::lctn(svc, &cat);
+    let lc = super::lctn(svc, &cat);
     let row = cat
         .database(&database_key(db, lc))
         .ok_or_else(|| super::unavailable(format!("tenant {t}'s database {db}")))?;

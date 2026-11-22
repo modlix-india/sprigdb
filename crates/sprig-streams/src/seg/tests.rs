@@ -668,3 +668,38 @@ async fn offsets_on_instances_are_kept_apart() {
     r.delete_group(5, "g").await.unwrap();
     assert!(r.offsets_on(5, "g").unwrap().is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replay_mark_moves_once() {
+    use sprig_engine::txn::TxnOptions;
+    let d = TempDir::new("records-mark");
+    let e = engine(d.path());
+    let r = records::StreamRecords::new(e.clone());
+    // The first run marks it, in its transaction; a rolled-back run
+    // leaves it unmarked.
+    let mut t = e.begin(TxnOptions::mysql()).unwrap();
+    assert!(
+        records::move_offset(&mut t, 5, "replay", 41, 0, 0, 1, 1)
+            .await
+            .unwrap()
+    );
+    t.rollback();
+    let mut t = e.begin(TxnOptions::mysql()).unwrap();
+    assert!(
+        records::move_offset(&mut t, 5, "replay", 41, 0, 0, 1, 1)
+            .await
+            .unwrap()
+    );
+    t.commit().unwrap().wait_async().await.unwrap();
+    // A repeat finds it moved, and writes nothing.
+    let mut t = e.begin(TxnOptions::mysql()).unwrap();
+    assert!(
+        !records::move_offset(&mut t, 5, "replay", 41, 0, 0, 1, 2)
+            .await
+            .unwrap()
+    );
+    t.rollback();
+    let got = r.offsets(5, "replay", None).unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!((got[0].stream_id, got[0].offset), (41, 1));
+}

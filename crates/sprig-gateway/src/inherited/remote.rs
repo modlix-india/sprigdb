@@ -497,8 +497,7 @@ pub async fn drop_trigger_here(svc: &Arc<TenantServices>, g: DefKey) -> Result<u
 /// The members this DC indexes that an override of `def`, made by
 /// `chain`'s tenant for `target` (alone, or with its subtree), applies to
 /// re-apply it now: exchanges, queues, bindings and triggers on queues
-/// through the members' vhosts; streams and triggers on streams through
-/// their stream instances. The instances reached.
+/// through the members' vhosts. The instances reached.
 ///
 /// # Errors
 /// The members' catalogs' and the store's.
@@ -509,26 +508,6 @@ pub async fn apply_override_here(
     target: TenantId,
     applies: AppliesTo,
 ) -> Result<usize> {
-    let own = chain
-        .levels
-        .first()
-        .and_then(|l| l.state.clone())
-        .unwrap_or_default();
-    let stream_key = match def.kind {
-        DefKind::Stream => Some(def.key()),
-        DefKind::Trigger => {
-            let spec: TriggerSpec =
-                serde_json::from_value(def.definition.clone()).unwrap_or_default();
-            chain
-                .resolve(&spec.source_db, DefKind::Stream, &spec.source_name)
-                .or_else(|| {
-                    own.def(&spec.source_db, DefKind::Stream, &spec.source_name)
-                        .cloned()
-                })
-                .map(|d| d.key())
-        }
-        _ => None,
-    };
     let mut reached = 0;
     let hits = |t: TenantId| async move {
         if t == target {
@@ -566,20 +545,6 @@ pub async fn apply_override_here(
             let tcat = super::catalog(svc, t).await?;
             let tchain = super::chain(svc, &tcat).await?;
             if Box::pin(super::mq::ensure_vhost(svc, &tchain, &mdb, Cause::Declare)).await? {
-                reached += 1;
-            }
-        }
-    }
-    if let Some(sk) = stream_key {
-        for e in super::instances_of(svc, sk).await? {
-            if !hits(e.tenant).await? {
-                continue;
-            }
-            super::streams::forget_applied(e.tenant, sk);
-            let tcat = super::catalog(svc, e.tenant).await?;
-            let tchain = super::chain(svc, &tcat).await?;
-            if let Some(d) = tchain.def(sk) {
-                Box::pin(super::streams::ensure(svc, &tchain, &d, Cause::Declare)).await?;
                 reached += 1;
             }
         }

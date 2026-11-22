@@ -5,30 +5,26 @@
 //! chain(T):  T's snapshot, then each ancestor's (root last), each with its
 //!            inherit_msg rows: definitions, overrides, instances
 //! resolve:   the nearest definition of kind db.name whose scope reaches T
-//! instance:  streams::ensure (lazy, on first publish, with its race rule),
-//!            then the member's inherited triggers (triggers::ensure_for_stream)
+//! instance:  a queue definition's instance in the member's vhost
+//!            (mq::ensure_vhost), then the member's inherited triggers
 //! index:     inherit-instances/<tenant>/<def tenant>.<def object> in the DC
 //!            tier: every instance of a definition, for SHOW, IMMEDIATE
 //!            drops and (later) broadcasts and fan-in
 //! ```
 //!
-//! **As built.** Definitions have no `objects` row (as streams have none). A
-//! stream instance is an ordinary `streams` row of the member, created in a
-//! versioned catalog change of the member (its `inherited_instances` row is
-//! written before, unversioned), so every stream reader finds it as before.
+//! Inherited streams (`CREATE STREAM ... FOR EACH TENANT`) answer 1235:
+//! streams are stored on the engine, and their instances, fan-in and
+//! cross-tenant publishes were built for streams kept in MariaDB.
 
 pub mod broadcast;
-pub mod fanin;
 pub mod fanin_mq;
 pub mod fanin_sink;
-pub mod fanin_triggers;
 pub mod lifecycle;
 pub mod mq;
 pub mod orphan_sinks;
 pub mod outbox;
 pub mod remote;
 pub mod sinks;
-pub mod streams;
 pub mod triggers;
 
 use std::sync::Arc;
@@ -448,4 +444,72 @@ pub async fn check_residency(
 #[must_use]
 pub fn js(s: &str) -> Value {
     Value::String(s.to_owned())
+}
+
+/// Whether `cat`'s tenant uses `lower_case_table_names = 1`.
+pub(crate) fn lctn(svc: &TenantServices, cat: &TenantCatalog) -> bool {
+    svc.settings.get(
+        &sprig_catalog::ddl::LOWER_CASE_TABLE_NAMES,
+        &cat.setting_ctx(&svc.dc),
+        Some(&cat.settings),
+    ) == 1
+}
+
+/// `t`'s snapshot holding database `db`, created (empty, as the
+/// provisioning account) when `t` has none: a member without the
+/// definition's database gets it.
+///
+/// # Errors
+/// The catalog's and the DDL's.
+pub async fn ensure_database(
+    svc: &Arc<TenantServices>,
+    t: TenantId,
+    db: &str,
+) -> Result<Arc<TenantCatalog>> {
+    let cat = catalog(svc, t).await?;
+    let lc = lctn(svc, &cat);
+    if cat
+        .database(&sprig_catalog::ddl::database_key(db, lc))
+        .is_some()
+    {
+        return Ok(cat);
+    }
+    let cluster = svc.locator.cluster(t).await?;
+    let pool = svc.locator.ctl_pool(&cluster).await?;
+    let logical = format!(
+        "CREATE DATABASE IF NOT EXISTS {}",
+        sprig_common::names::quote(db)
+    );
+    let req = sprig_catalog::ddl::DdlRequest {
+        tenant: t,
+        statement: sprig_catalog::ddl::DdlStatement::CreateDatabase {
+            name: db.to_owned(),
+            if_not_exists: true,
+            charset: None,
+            collation: None,
+        },
+        sql: &logical,
+        logical_sql: &logical,
+        current_db: None,
+        user: None,
+        lower_case_table_names: lc,
+        wait: None,
+    };
+    let out = svc
+        .ddl
+        .execute(&req, &sprig_catalog::ddl::MariaExecutor::new(pool))
+        .await?;
+    let cat = match out.version {
+        Some(v) => {
+            svc.cache
+                .get(
+                    t,
+                    sprig_catalog::cache::Freshness::Cached { min_version: v },
+                )
+                .await?
+        }
+        None => catalog(svc, t).await?,
+    };
+    tracing::info!(tenant = %t, %db, "database created for an inherited instance");
+    Ok(cat)
 }

@@ -446,23 +446,17 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
             live.clone(),
             dc.clone(),
         ));
-        let data = Arc::new(kafka::data::GatewayData::start(Arc::clone(t), stop.clone()));
-        // Filtered change-topic reads run as the reader.
-        data.set_engine(Arc::clone(&engine));
+        let data = Arc::new(kafka::data::GatewayData::new(Arc::clone(t)));
         Arc::new(kafka::KafkaFrontend::start(
             kafka::KafkaDeps {
                 live: live.clone(),
                 dc: dc.clone(),
                 identity: Arc::new(kafka::identity::KafkaIdentity::new(Arc::clone(&login))),
                 cluster,
-                topics: Arc::new(kafka::catalog::StreamTopics::new(
-                    Arc::clone(t),
-                    Arc::clone(&engine),
-                    Arc::clone(&data),
-                )),
-                groups: Arc::new(kafka::catalog::CatalogGroups::new(Arc::clone(t))),
-                engine_gate: Some(Arc::clone(&data)),
-                data: Some(data),
+                topics: Arc::new(kafka::catalog::StreamTopics::new(Arc::clone(t))),
+                groups: Arc::new(kafka::catalog::CatalogGroups),
+                engine_gate: Some(data),
+                data: None,
             },
             stop.clone(),
         ))

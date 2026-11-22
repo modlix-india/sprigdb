@@ -220,10 +220,6 @@ const KNOWN_TENANT_GAPS: &[(&str, &str)] = &[
         "not a gap: approvals resolve per tenant",
     ),
     (
-        "approvals.stream_database",
-        "not a gap: approvals resolve per tenant",
-    ),
-    (
         "approvals.webhook_connection",
         "not a gap: approvals resolve per tenant",
     ),

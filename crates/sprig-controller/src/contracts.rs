@@ -65,7 +65,6 @@ pub fn known_modules() -> Vec<Module> {
         sprig_ai::retrieval::store::RETRIEVAL_MODULE,
         sprig_ai::functions::cache::FN_MODULE,
         sprig_workload::store::WORKLOAD_MODULE,
-        sprig_streams::store::STREAMS_MODULE,
         sprig_advisor::sharding::runs::ADVISOR_RUNS_MODULE,
         sprig_advisor::autoindex::store::AUTOINDEX_MODULE,
         sprig_logic::catalog::LOGIC_MODULE,

@@ -42,7 +42,6 @@ fn cat_err(e: mysql_async::Error) -> SprigError {
 /// entry), whatever its state but `detached`.
 async fn remove_one(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) -> Result<()> {
     match def.kind {
-        DefKind::Stream => super::streams::remove(svc, t, def.key()).await,
         DefKind::Exchange | DefKind::Queue => super::mq::remove(svc, t, def).await,
         _ => Ok(()),
     }
@@ -266,7 +265,6 @@ pub async fn database_dropped(
     let st = MsgStore::new(Arc::clone(&svc.records), t);
     for i in &gone {
         let triggers = match chain.def(i.def) {
-            Some(d) if d.kind == DefKind::Stream => super::triggers::on_stream(&chain, &d),
             Some(d) if d.kind == DefKind::Queue => super::triggers::on_queue(&chain, &d),
             _ => Vec::new(),
         };
@@ -286,7 +284,6 @@ pub async fn database_dropped(
         }
         st.delete_instance(i.def).await?;
         super::delete_index(svc, t, i.def).await?;
-        super::streams::forget_applied(t, i.def);
     }
     super::mq::forget_applied(t, Some(db));
     // The change takes its own catalog connection.
@@ -339,7 +336,6 @@ pub async fn detach(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) ->
     let cat = catalog(svc, t).await?;
     let chain = super::chain(svc, &cat).await?;
     let triggers = match def.kind {
-        DefKind::Stream => super::triggers::on_stream(&chain, def),
         DefKind::Queue => super::triggers::on_queue(&chain, def),
         _ => Vec::new(),
     };
@@ -363,7 +359,6 @@ pub async fn detach(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) ->
     // Every gateway reads the row at the member's next version.
     let c = svc.catalog.change(t, VersionKind::Catalog).await?;
     c.commit().await?;
-    super::streams::forget_applied(t, def.key());
     super::mq::forget_applied(t, Some(&def.db_name));
     metrics::counter!("sprig_inherit_drops_total", "how" => "detached").increment(1);
     Ok(stopped)

@@ -829,55 +829,6 @@ impl PassSession {
         self.bs.as_ref().is_some_and(|b| b.pins().in_transaction())
     }
 
-    /// The cluster of the session's own connection.
-    pub(super) fn own_cluster(&self) -> ClusterId {
-        self.main_cluster()
-    }
-
-    /// Runs physical `sql` that the gateway made itself (names the client
-    /// can't write) on the session's own cluster, inside the session's
-    /// transaction: the coordinator's branch there in a coordinator
-    /// transaction, else the main connection: the stream layer's
-    /// `sprig.commit_offset`. Its rows or OK go to `out`.
-    ///
-    /// # Errors
-    /// The statement's error.
-    pub(super) async fn forward_raw_own(
-        &mut self,
-        cx: &mut ExecCtx<'_>,
-        sql: &str,
-        out: &mut dyn ResultSink,
-    ) -> Result<Step> {
-        let map = self
-            .tenant
-            .as_deref()
-            .map(crate::tenant::session::TenantSession::map)
-            .ok_or_else(|| SprigError::internal("no tenant"))?;
-        let slot = if self.router.in_txn() {
-            Slot::Branch(self.main_cluster(), self.home_ref(), Intent::Write)
-        } else {
-            Slot::Main
-        };
-        let text = Bytes::copy_from_slice(sql.as_bytes());
-        let ran = Box::pin(self.forward_on(
-            cx,
-            slot,
-            false,
-            text,
-            sql.as_bytes(),
-            false,
-            RowFormat::Text,
-            ResultMapper::relay(),
-            &*map,
-            out,
-        ))
-        .await?;
-        match ran {
-            Ran::Done(step) => Ok(step),
-            Ran::Stale(e) | Ran::ColumnGone(e) | Ran::Collision(e) | Ran::Regather(e, _) => Err(e),
-        }
-    }
-
     /// Puts `slot`'s connection where the forward path looks
     /// (`self.bs`).
     async fn slot_in(&mut self, slot: &Slot) -> Result<()> {

@@ -1,16 +1,9 @@
-//! Triggers on streams and queues, on the job runtime:
-//!
-//! - `logic_stream_trigger`: one per binding, long-running, in the
-//!   `consumer` job class. It reads the stream's log and its consumer
-//!   group's offsets (`__sprig_logic_<binding>`) as `sprig_ctl`, and runs
-//!   [`sprig_logic::msgrun::run_stream`], each run in a gateway.
-//! - `logic_queue_trigger`: one per binding; `logic.trigger_lanes` loops of
-//!   [`sprig_logic::msgrun::run_queue`], each asking a gateway to run the
-//!   queue's next message.
-//!
-//! Both report progress every second (their lease: a lost job stops),
-//! pick up a new version within 5 s, and end, removing their index entry,
-//! when the trigger's stream or queue (or the binding) is gone.
+//! Triggers on queues, on the job runtime: `logic_queue_trigger`, one per
+//! binding; `logic.trigger_lanes` loops of [`sprig_logic::msgrun::run_queue`],
+//! each asking a gateway to run the queue's next message. A job reports
+//! progress every second (its lease: a lost job stops), picks up a new
+//! version within 5 s, and ends, removing its index entry, when the
+//! trigger's queue (or the binding) is gone.
 //!
 //! **Gateways.** Runs go over the peer service (`sprig.internal.logic.v1`
 //! on each gateway's `peer` port, mutual TLS with `[tls]`, plaintext on
@@ -25,7 +18,6 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use mysql_async::Pool;
-use mysql_async::prelude::Queryable;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sprig_api::proto::logic_peer::RunTriggerRequest;
@@ -33,19 +25,15 @@ use sprig_api::proto::logic_peer::logic_peer_client::LogicPeerClient;
 use sprig_catalog::CatalogLocator;
 use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::TenantId;
-use sprig_common::names::quote;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_controller::catalogs::{ClusterPools, ShardMapLocator};
 use sprig_controller::dispatch::JobClass;
 use sprig_logic::LogicStore;
 use sprig_logic::declare::SourceKind;
-use sprig_logic::messages::{self, RecordIn, RunReply, RunRequest, SourceRow};
-use sprig_logic::msgrun::{self, Gateway, MsgStats, StreamSide, Template};
+use sprig_logic::messages::{self, RunReply, RunRequest, SourceRow};
+use sprig_logic::msgrun::{self, Gateway, MsgStats, Template};
 use sprig_logic::triggers::RunOpts;
 use sprig_meta::{ListOpts, MetaStore, Record, Versioned};
-use sprig_streams::offsets;
-use sprig_streams::read::{LogReader, ReadLimits};
-use sprig_streams::{PartitionNo, StreamId, StreamState, StreamsStore};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 /// sprig-queues' durable queues (`m/mq/queues/<id>` catalog records).
@@ -576,18 +564,8 @@ impl MsgEnv {
         }
         // The source itself (a fan-in trigger's: its definition).
         let alive = match source.kind {
-            SourceKind::Stream if source.fanin_definition().is_some() => {
-                // The declarer's catalog may be on the same cluster: its
-                // connection comes from the same pool, so this one goes
-                // back first.
-                drop(c);
-                let (dt, dobj) = source.fanin_definition().unwrap_or((0, 0));
-                self.definition_active(TenantId(dt), dobj).await?
-            }
-            SourceKind::Stream => StreamsStore::new(schema.clone())
-                .get(&mut c, StreamId(source.object_id))
-                .await?
-                .is_some_and(|d| d.state == StreamState::Active),
+            // Triggers on streams ran only on streams kept in MariaDB.
+            SourceKind::Stream => false,
             SourceKind::Queue => {
                 // Durable queues are catalog records on the engine node.
                 drop(c);
@@ -610,26 +588,6 @@ impl MsgEnv {
             catalog: ep.pool.clone(),
             schema,
         }))
-    }
-
-    /// Whether definition `(declarer, object)` is active (a fan-in
-    /// trigger's source).
-    async fn definition_active(&self, declarer: TenantId, object: u64) -> Result<bool> {
-        let ep = self.locator.writer(declarer).await?;
-        let mut c = ep.pool.get_conn_bounded().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-        })?;
-        let r: std::result::Result<Option<String>, _> = c
-            .exec_first(
-                format!(
-                    "SELECT CAST(state AS CHAR) FROM {}.inherited_defs WHERE object_id = ? AND \
-                     kind = 'stream'",
-                    quote(ep.store.schema())
-                ),
-                (object,),
-            )
-            .await;
-        Ok(matches!(r, Ok(Some(s)) if s == "active"))
     }
 
     /// The stream's or queue's database's and the tenant's own
@@ -668,21 +626,6 @@ impl MsgEnv {
             version: Arc::new(AtomicU64::new(l.version)),
             budget: Some(self.settings.live_trigger_budget(scope)),
         }
-    }
-
-    async fn shard_pool(&self, tenant: TenantId) -> Result<ShardPool> {
-        let cluster = self.locator.cluster_of(tenant).await?.ok_or_else(|| {
-            let mut e = SprigError::new(
-                SprigCode::TenantNotReady,
-                format!("tenant {tenant} has no shard map here"),
-            );
-            e.retryable = true;
-            e
-        })?;
-        Ok(ShardPool {
-            pools: Arc::clone(&self.pools),
-            cluster,
-        })
     }
 
     /// Supervises a running trigger: progress every second, a new version
@@ -767,13 +710,8 @@ async fn replay_due(l: &Loaded, t: &Template, gw: &dyn Gateway) -> Result<u64> {
     if rows.is_empty() {
         return Ok(0);
     }
-    let group = messages::replay_group(l.source.binding_id);
     let mut n = 0;
     for r in rows {
-        {
-            let mut c = l.catalog.get_conn_bounded().await.map_err(db_err)?;
-            offsets::init_positions(&mut c, &l.schema, &group, r.dl_id, &[(0, 0)]).await?;
-        }
         let mut req = t.req.clone();
         req.version = t.version.load(Ordering::Relaxed);
         req.record = None;
@@ -845,487 +783,11 @@ async fn replay_due(l: &Loaded, t: &Template, gw: &dyn Gateway) -> Result<u64> {
     Ok(n)
 }
 
-/// A tenant's shard pool, from the pool cache at each use.
-#[derive(Clone)]
-struct ShardPool {
-    pools: Arc<dyn ClusterPools>,
-    cluster: sprig_common::ids::ClusterId,
-}
-
-impl ShardPool {
-    async fn get(&self) -> Result<Pool> {
-        self.pools.writer(&self.cluster).await
-    }
-}
-
-/// A tenant's catalog pool, from the locator at each use (see
-/// [`ShardPool`]). The trigger's committed offsets are rows the tenant's
-/// own transactions also write (a gateway run commits its position in its
-/// transaction), so for a tenant on Sprig 2PC's relay path its connections
-/// go through the relay writer.
-#[derive(Clone)]
-struct CatalogPool {
-    locator: Arc<ShardMapLocator>,
-    tenant: TenantId,
-    /// This DC's tier (relay leases).
-    dc: Arc<dyn MetaStore>,
-}
-
-impl CatalogPool {
-    async fn get_conn(&self) -> Result<mysql_async::Conn> {
-        let ep = self.locator.writer(self.tenant).await?;
-        let pool = match self.locator.catalog_cluster(self.tenant).await? {
-            Some(cluster) => {
-                crate::relay_pools::shard_pool(&self.dc, self.tenant, &cluster, ep.pool).await?
-            }
-            None => ep.pool,
-        };
-        pool.get_conn_bounded().await.map_err(db_err)
-    }
-}
-
-/// A stream trigger's stream and offsets, as `sprig_ctl`.
-struct MariaSide {
-    catalog: CatalogPool,
-    schema: String,
-    /// The shard's cluster: its pool is asked for at each use (the pool
-    /// cache replaces, and disconnects, a cluster's pool when its writer
-    /// changes, which a pool held for a job's life wouldn't follow).
-    shard: ShardPool,
-    log_schema: String,
-    group: String,
-    /// A fan-in trigger's member; 0 for the tenant's own stream.
-    instance: u64,
-    stream: StreamId,
-    source: SourceRow,
-    version: Arc<AtomicU64>,
-}
-
 fn db_err(e: mysql_async::Error) -> SprigError {
-    sprig_streams::maria::map_err(e)
+    SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
 }
 
-#[async_trait]
-impl StreamSide for MariaSide {
-    async fn positions(&self) -> Result<HashMap<u32, u64>> {
-        let mut c = self.catalog.get_conn().await?;
-        Ok(offsets::positions_of(
-            &mut c,
-            &self.schema,
-            &self.group,
-            self.instance,
-            self.stream.0,
-        )
-        .await?
-        .into_iter()
-        .collect())
-    }
-
-    async fn bounds(&self) -> Result<HashMap<u32, (u64, u64)>> {
-        let mut c = self
-            .shard
-            .get()
-            .await?
-            .get_conn_bounded()
-            .await
-            .map_err(db_err)?;
-        let rows: Vec<(u32, u64, u64)> = c
-            .exec(
-                format!(
-                    "SELECT partition_no, log_start, next_offset FROM {}.{} \
-                     WHERE stream_id = ? AND partition_no <> ?",
-                    quote(&self.log_schema),
-                    quote(sprig_streams::model::CKPT_TABLE)
-                ),
-                (self.stream.0, sprig_streams::model::SHARD_ROW),
-            )
-            .await
-            .map_err(db_err)?;
-        Ok(rows.into_iter().map(|(p, s, n)| (p, (s, n))).collect())
-    }
-
-    async fn read(&self, p: u32, from: u64, max: u32) -> Result<Vec<RecordIn>> {
-        let mut c = self
-            .shard
-            .get()
-            .await?
-            .get_conn_bounded()
-            .await
-            .map_err(db_err)?;
-        let r = LogReader {
-            schema: self.log_schema.clone(),
-        }
-        .read(
-            &mut c,
-            self.stream,
-            PartitionNo(p),
-            sprig_streams::Offset(from),
-            ReadLimits {
-                max_records: max,
-                max_bytes: 4 << 20,
-            },
-        )
-        .await;
-        let batch = match r {
-            Ok(b) => b,
-            // Below the log start: the runner moves past it.
-            Err(e) if e.code() == Some(SprigCode::StreamOffsetOutOfRange) => return Ok(Vec::new()),
-            Err(e) => return Err(e),
-        };
-        Ok(batch
-            .records
-            .into_iter()
-            .map(|r| RecordIn {
-                partition: r.partition.0,
-                offset: r.offset.0,
-                ts_ms: r.ts_ms,
-                key: r.key,
-                value: r.value,
-                headers: r.headers,
-            })
-            .collect())
-    }
-
-    async fn init(&self, p: u32, at: u64) -> Result<()> {
-        let mut c = self.catalog.get_conn().await?;
-        offsets::init_positions_of(
-            &mut c,
-            &self.schema,
-            &self.group,
-            self.instance,
-            self.stream.0,
-            &[(p, at)],
-        )
-        .await
-    }
-
-    async fn advance(&self, p: u32, expect: u64, to: u64) -> Result<bool> {
-        let mut c = self.catalog.get_conn().await?;
-        offsets::advance_of(
-            &mut c,
-            &self.schema,
-            &self.group,
-            self.instance,
-            self.stream.0,
-            p,
-            expect,
-            to,
-        )
-        .await
-    }
-
-    async fn dead_letter(&self, r: &RecordIn, attempts: u32, last: &RunReply) -> Result<()> {
-        let mut c = self.catalog.get_conn().await?;
-        let store = LogicStore::new(&self.schema);
-        let version = self.version.load(Ordering::Relaxed);
-        let event =
-            messages::record_value(&format!("{}.{}", self.source.db_name, self.source.name), r);
-        store
-            .put_dead_letter(
-                &mut c,
-                self.source.binding_id,
-                version,
-                &if self.instance == 0 {
-                    format!("p{}:{}", r.partition, r.offset)
-                } else {
-                    format!("t{}:p{}:{}", self.instance, r.partition, r.offset)
-                },
-                b"",
-                &event,
-                attempts,
-                last.code,
-                &last.message,
-            )
-            .await?;
-        let _ = store
-            .log(
-                &mut c,
-                self.source.module_id,
-                Some(version),
-                "error",
-                "trigger",
-                &format!(
-                    "stream {}.{} partition {} offset {}: dead letter after {attempts} attempts: {} {}",
-                    self.source.db_name,
-                    self.source.name,
-                    r.partition,
-                    r.offset,
-                    last.code,
-                    last.message
-                ),
-            )
-            .await;
-        Ok(())
-    }
-}
-
-/// `logic_stream_trigger` (see the module docs).
-#[derive(Debug, Clone)]
-pub struct StreamTrigger(pub MsgEnv);
-
-#[async_trait]
-impl JobHandler for StreamTrigger {
-    fn kind(&self) -> &'static str {
-        messages::STREAM_JOB_KIND
-    }
-
-    fn class(&self) -> JobClass {
-        JobClass::Consumer
-    }
-
-    async fn run(&self, cx: &JobCtx) -> std::result::Result<Value, String> {
-        let env = &self.0;
-        let tenant = TenantId(spec_u64(&cx.spec, "tenant")?);
-        let binding = spec_u64(&cx.spec, "binding")?;
-        let l = match env.load_or_end(tenant, binding).await? {
-            Ok(l) => l,
-            Err(end) => return Ok(end),
-        };
-        if let Some(def) = l.source.fanin_definition() {
-            return run_fan_in(env, cx, tenant, binding, &l, def).await;
-        }
-        let def = {
-            let mut c = l
-                .catalog
-                .get_conn_bounded()
-                .await
-                .map_err(|e| e.to_string())?;
-            StreamsStore::new(l.schema.clone())
-                .get(&mut c, StreamId(l.source.object_id))
-                .await
-                .map_err(|e| e.to_string())?
-                .ok_or("the stream is gone")?
-        };
-        let log = def.log.first().ok_or("the stream has no log shard")?;
-        let shard = env.shard_pool(tenant).await.map_err(|e| e.to_string())?;
-        env.settings.refresh_tenant(tenant).await;
-        let t = env.template(tenant, &l);
-        let side: Arc<dyn StreamSide> = Arc::new(MariaSide {
-            catalog: CatalogPool {
-                locator: Arc::clone(&env.locator),
-                tenant,
-                dc: Arc::clone(&env.dc),
-            },
-            schema: l.schema.clone(),
-            shard,
-            log_schema: log.slot.schema(tenant, def.db).to_string(),
-            group: offsets::logic_group(binding),
-            instance: 0,
-            stream: def.id,
-            source: l.source.clone(),
-            version: Arc::clone(&t.version),
-        });
-        let log = RunLog {
-            catalog: l.catalog.clone(),
-            schema: l.schema.clone(),
-            module_id: l.source.module_id,
-            version: Arc::clone(&t.version),
-        };
-        log.write(
-            "info",
-            &format!(
-                "trigger on stream {}.{} started (job {}, {} partitions)",
-                l.source.db_name, l.source.name, cx.job_id, def.partitions
-            ),
-        )
-        .await;
-        let gw: Arc<dyn Gateway> = Arc::new(GwClient {
-            gws: Arc::clone(&env.gateways),
-            seed: binding,
-            log,
-            unreachable_noted: Mutex::new(None),
-        });
-        let stats = Arc::new(MsgStats::default());
-        let stop = cx.cancel.child_token();
-        tracing::info!(%tenant, binding, stream = def.id.0, partitions = def.partitions, "trigger on a stream started");
-        let runner = msgrun::run_stream(
-            side,
-            Arc::clone(&gw),
-            t.clone(),
-            env.opts_for(tenant, &l),
-            Arc::clone(&stats),
-            def.partitions,
-            Duration::from_millis(100),
-            stop.clone(),
-        );
-        tokio::pin!(runner);
-        let sup = env.supervise(cx, tenant, binding, &t, &stats, &stop, &gw);
-        tokio::pin!(sup);
-        let (r, gone) = tokio::select! {
-            r = &mut runner => {
-                stop.cancel();
-                (r, false)
-            }
-            gone = &mut sup => {
-                stop.cancel();
-                (runner.await, gone)
-            }
-        };
-        let mut out = stats.json();
-        out["binding"] = json!(binding);
-        if gone {
-            out["end"] = json!("gone");
-            return Ok(out);
-        }
-        r.map(|()| out).map_err(|e| e.to_string())
-    }
-}
-
-/// A fan-in trigger's job (see `sprig_logic::messages`' fan-in notes):
-/// one runner per listed member instance, all sharing the binding's
-/// version, stats and supervision; the list is read again every 5 s, and
-/// a runner that fails starts again at the next read.
-async fn run_fan_in(
-    env: &MsgEnv,
-    cx: &JobCtx,
-    tenant: TenantId,
-    binding: u64,
-    l: &Loaded,
-    def: (u64, u64),
-) -> std::result::Result<Value, String> {
-    env.settings.refresh_tenant(tenant).await;
-    let t = env.template(tenant, l);
-    let log = RunLog {
-        catalog: l.catalog.clone(),
-        schema: l.schema.clone(),
-        module_id: l.source.module_id,
-        version: Arc::clone(&t.version),
-    };
-    log.write(
-        "info",
-        &format!(
-            "fan-in trigger on stream {}.{} started (job {})",
-            l.source.db_name, l.source.name, cx.job_id
-        ),
-    )
-    .await;
-    let gw: Arc<dyn Gateway> = Arc::new(GwClient {
-        gws: Arc::clone(&env.gateways),
-        seed: binding,
-        log,
-        unreachable_noted: Mutex::new(None),
-    });
-    let stats = Arc::new(MsgStats::default());
-    let stop = cx.cancel.child_token();
-    let mut running: HashMap<u64, tokio::task::JoinHandle<Result<()>>> = HashMap::new();
-    let sup = env.supervise(cx, tenant, binding, &t, &stats, &stop, &gw);
-    tokio::pin!(sup);
-    let mut refresh = tokio::time::interval(RELOAD_EVERY);
-    tracing::info!(%tenant, binding, "fan-in trigger started");
-    let gone = loop {
-        tokio::select! {
-            gone = &mut sup => break gone,
-            _ = refresh.tick() => {}
-        }
-        let ended: Vec<u64> = running
-            .iter()
-            .filter(|(_, h)| h.is_finished())
-            .map(|(m, _)| *m)
-            .collect();
-        for member in ended {
-            if let Some(h) = running.remove(&member) {
-                let why = match h.await {
-                    Ok(Ok(())) => "ended".to_owned(),
-                    Ok(Err(e)) => e.to_string(),
-                    Err(e) => e.to_string(),
-                };
-                tracing::warn!(%tenant, binding, member, error = %why, "fan-in trigger: a member's runner ended; started again");
-            }
-        }
-        let members = match messages::fanin_members(env.dc.as_ref(), tenant, binding).await {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::debug!(error = %e, "fan-in trigger: the member list is unreadable");
-                continue;
-            }
-        };
-        for m in members {
-            if running.contains_key(&m.member.0) {
-                continue;
-            }
-            match fan_in_side(env, tenant, l, &t, binding, &m).await {
-                Ok((side, parts)) => {
-                    let mut mt = t.clone();
-                    mt.req.instance_tenant = m.member.0;
-                    mt.req.instance_stream = m.stream;
-                    let h = tokio::spawn(msgrun::run_stream(
-                        side,
-                        Arc::clone(&gw),
-                        mt,
-                        env.opts_for(tenant, l),
-                        Arc::clone(&stats),
-                        parts,
-                        Duration::from_millis(100),
-                        stop.child_token(),
-                    ));
-                    running.insert(m.member.0, h);
-                    tracing::info!(%tenant, binding, member = %m.member, stream = m.stream, "fan-in trigger reads a member's instance");
-                }
-                Err(e) => {
-                    tracing::debug!(member = %m.member, error = %e, "fan-in trigger: a member's instance isn't readable yet");
-                }
-            }
-        }
-    };
-    stop.cancel();
-    for (_, h) in running {
-        let _ = h.await;
-    }
-    let mut out = stats.json();
-    out["binding"] = json!(binding);
-    if gone {
-        let _ = messages::delete_fanin(env.dc.as_ref(), tenant, binding, def).await;
-        out["end"] = json!("gone");
-    }
-    Ok(out)
-}
-
-/// The side of one member instance of a fan-in trigger, and its
-/// partitions.
-async fn fan_in_side(
-    env: &MsgEnv,
-    tenant: TenantId,
-    l: &Loaded,
-    t: &Template,
-    binding: u64,
-    m: &messages::FanInMember,
-) -> Result<(Arc<dyn StreamSide>, u32)> {
-    let ep = env.locator.writer(m.member).await?;
-    let def = {
-        let mut c = ep.pool.get_conn_bounded().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-        })?;
-        StreamsStore::new(ep.store.schema().to_owned())
-            .get(&mut c, StreamId(m.stream))
-            .await?
-            .filter(|d| d.state == StreamState::Active)
-            .ok_or_else(|| SprigError::internal("the member's instance stream is gone"))?
-    };
-    let log = def
-        .log
-        .first()
-        .ok_or_else(|| SprigError::internal("the instance has no log shard"))?;
-    let shard = env.shard_pool(m.member).await?;
-    let side: Arc<dyn StreamSide> = Arc::new(MariaSide {
-        catalog: CatalogPool {
-            locator: Arc::clone(&env.locator),
-            tenant,
-            dc: Arc::clone(&env.dc),
-        },
-        schema: l.schema.clone(),
-        shard,
-        log_schema: log.slot.schema(m.member, def.db).to_string(),
-        group: offsets::logic_group(binding),
-        instance: m.member.0,
-        stream: def.id,
-        source: l.source.clone(),
-        version: Arc::clone(&t.version),
-    });
-    Ok((side, def.partitions))
-}
-
-/// `logic_queue_trigger` (see the module docs).
-#[derive(Debug, Clone)]
+/// The `logic_queue_trigger` job.
 pub struct QueueTrigger(pub MsgEnv);
 
 #[async_trait]

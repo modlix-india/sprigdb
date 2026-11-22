@@ -108,7 +108,6 @@ pub mod sharding;
 pub mod sharding_runtime;
 // Job standbys kept current by the mover.
 pub mod standby;
-pub mod streams_loop;
 // The graph mirror applier jobs.
 pub mod graph_mirror_loop;
 // `queue.change_exchange` forwarders.
@@ -546,7 +545,6 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         .transpose()
     };
     let notifier = Arc::new(approvals::notify::Notifier::new(
-        Arc::new(locator.clone()),
         Arc::clone(&auth_records),
         approvals::notify::Secrets {
             smtp_password: read_secret(cfg.controller.smtp_password_file.as_deref())?,
@@ -761,7 +759,6 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         // After-commit trigger jobs and schedules.
         .with_loop(Loop::new(logic_loop::LogicLoop::new(logic_locator)))
         .with_loop(Loop::new(inherit_loop::InheritLoop))
-        .with_loop(Loop::new(streams_loop::StreamsLoop))
         .with_loop(Loop::new(graph_mirror_loop::GraphMirrorLoop))
         .with_loop(Loop::new(change_exchange_loop::ChangeExchangeLoop))
         .with_loop(Loop::new(ai_embed_loop::AiEmbedLoop))

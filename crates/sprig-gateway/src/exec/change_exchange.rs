@@ -45,12 +45,8 @@ impl PassSession {
             return Ok(());
         }
         let (lex, _) = self.lex_opts();
-        // The table the statement names, read as the change-topic hook
-        // reads it (its parser looks for that key's name).
-        let Some(target) = sprig_streams::sql::change_topic_target(
-            &format!("{sql} /* stream.change_topic */"),
-            &lex,
-        ) else {
+        // The table the statement names.
+        let Some(target) = sprig_streams::grammar::settings_target(sql, &lex) else {
             return Ok(());
         };
         let current = self.current_logical();

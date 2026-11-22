@@ -378,103 +378,11 @@ pub fn run_settings(o: &Opts, def: &SinkDef) -> Result<RunSettings> {
 struct CatalogDead {
     store: SinksStore,
     sink: SinkId,
-    /// `DEAD LETTER TO STREAM d`: the stream, its outbox schema and a
-    /// pool on its cluster.
-    stream: Option<(Arc<sprig_streams::StreamDef>, String, Pool)>,
-}
-
-impl CatalogDead {
-    /// The dead-letter stream of `def` (`DEAD LETTER TO STREAM d`), if any.
-    async fn target(
-        env: &dyn SinkEnv,
-        tenant: TenantId,
-        pool: &Pool,
-        schema: &str,
-        def: &SinkDef,
-    ) -> Result<Option<(Arc<sprig_streams::StreamDef>, String, Pool)>> {
-        let Some(crate::model::DeadLetter::Stream { id, .. }) = &def.dead_letter else {
-            return Ok(None);
-        };
-        let mut c = pool.get_conn().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e)
-        })?;
-        let d = sprig_streams::StreamsStore::new(schema)
-            .get(&mut c, sprig_streams::StreamId(*id))
-            .await?
-            .ok_or_else(|| {
-                err(
-                    SprigCode::SinkSourceLost,
-                    format!("dead-letter stream {id} is gone"),
-                )
-            })?;
-        let slot = d.outbox.first().ok_or_else(|| {
-            err(
-                SprigCode::SinkOptionInvalid,
-                "the dead-letter stream has no outbox",
-            )
-        })?;
-        let out_schema = slot.schema(tenant, d.db).to_string();
-        Ok(Some((
-            Arc::new(d),
-            out_schema,
-            env.shard_pool(tenant).await?,
-        )))
-    }
 }
 
 #[async_trait]
 impl DeadLetters for CatalogDead {
     async fn write(&self, rec: &crate::model::SinkRecord, info: &DeadInfo) -> Result<()> {
-        // The stream first: a crash between the two writes a duplicate
-        // dead letter, never loses one.
-        if let Some((d, schema, pool)) = &self.stream {
-            let mut h: Vec<(String, Option<Vec<u8>>)> = rec
-                .headers
-                .iter()
-                .map(|(k, v)| (k.clone(), Some(v.clone())))
-                .collect();
-            for (k, v) in [
-                ("sprig.dl.reason", info.reason.clone()),
-                ("sprig.dl.class", info.class.to_owned()),
-                ("sprig.dl.attempts", info.attempts.to_string()),
-                ("sprig.dl.sink", self.sink.0.to_string()),
-                ("sprig.dl.idempotency_key", rec.idem_key.clone()),
-                ("sprig.dl.position", rec.pos.text()),
-            ] {
-                h.push((k.to_owned(), Some(v.into_bytes())));
-            }
-            let p = sprig_streams::publish::Publish {
-                key: rec.key.clone(),
-                value: rec
-                    .value
-                    .clone()
-                    .or_else(|| rec.after.as_ref().map(|a| a.to_string().into_bytes())),
-                headers: sprig_streams::publish::headers_json(&h),
-                partition: None,
-                ts_ms: None,
-            };
-            if let Some(q) = sprig_streams::publish::outbox_insert(d, Some(schema), &[p]) {
-                let mut c = pool.get_conn().await.map_err(|e| {
-                    let mut x = SprigError::new(
-                        SprigCode::CatalogUnavailable,
-                        "dead-letter stream unavailable",
-                    )
-                    .with_source(e);
-                    x.retryable = true;
-                    x
-                })?;
-                c.query_drop(q).await.map_err(|e| {
-                    let mut x = SprigError::new(
-                        SprigCode::CatalogUnavailable,
-                        "dead-letter stream write failed",
-                    )
-                    .with_source(e);
-                    x.retryable = true;
-                    x
-                })?;
-                metrics::counter!("sprig_sink_dead_letters_total", "to" => "stream").increment(1);
-            }
-        }
         self.store.insert_dead(self.sink, rec, info).await
     }
 }
@@ -1058,313 +966,19 @@ pub async fn run_sink_task_of(
             .unwrap_or("webhook,kafka,s3,database,script"),
         def.target.kind(),
     )?;
-    let per_task = u32::try_from(opts.u64("partitions_per_task", 4)?).unwrap_or(4);
-    if let SourceSpec::FanIn { .. } | SourceSpec::FanInQueue { .. } | SourceSpec::Changes { .. } =
-        &def.source
-    {
-        return run_fan_in_task(env, tenant, sink, task_no, of, cancel, c, store, def, opts).await;
-    }
-    if let SourceSpec::Queue { .. } = &def.source {
-        return run_queue_task(env, tenant, sink, task_no, cancel, c, store, def, opts).await;
-    }
-    let (stream, partitions_n) = match &def.source {
-        SourceSpec::Stream { id, partitions, .. } => (*id, *partitions),
-        other => {
-            return Err(err(
-                SprigCode::SinkOptionInvalid,
-                format!("{} sources don't run in workers yet", other.kind()),
-            ));
+    match &def.source {
+        SourceSpec::FanInQueue { .. } => {
+            run_fan_in_task(env, tenant, sink, task_no, of, cancel, c, store, def, opts).await
         }
-    };
-    let k = if def.guarantee == Guarantee::ExactlyOnce {
-        1
-    } else {
-        per_task
-    };
-    let parts = task_partitions(partitions_n, k, task_no.0);
-    // `START AT LATEST` (the default) means from the sink's creation, not
-    // from its task's first start: the task starts seconds later under load,
-    // and records published in between were skipped (the dead
-    // letter step of `fan_in_sink_end_to_end` lost all three).
-    let start = instance_start(
-        def.start_at,
-        0,
-        fan_in_created_ms(store.created_ms(sink).await?, false),
-    );
-    let epoch = store
-        .claim_task(
-            sink,
-            task_no,
-            &json!({"partitions": parts}),
-            &env.worker_id(),
-        )
-        .await?;
-    let mut conns = Vec::new();
-    for r in &def.connections {
-        conns.push(open_conn(env.as_ref(), tenant, &store, r, &opts).await?);
-    }
-    drop(c);
-    let info = TaskInfo {
-        tenant: tenant.0,
-        sink: sink.0,
-        task_no: task_no.0,
-        epoch,
-    };
-    let (conn, extra) = if def.target.kind() == TargetKind::Script {
-        (None, conns)
-    } else {
-        let mut it = conns.into_iter();
-        (it.next(), it.collect())
-    };
-    if let Some(cn) = &conn
-        && !def.target.kind().accepts(cn.kind)
-    {
-        return Err(err(
+        SourceSpec::Queue { .. } => {
+            run_queue_task(env, tenant, sink, task_no, cancel, c, store, def, opts).await
+        }
+        other => Err(err(
             SprigCode::SinkOptionInvalid,
-            format!(
-                "a {} target can't use a {} connection",
-                def.target.kind(),
-                cn.kind
-            ),
-        ));
-    }
-    let ctx = TargetCtx {
-        task: info.clone(),
-        sink: Arc::clone(&def),
-        conn,
-        extra,
-        opts: opts.clone(),
-        db_name: opts.get("__db_name").unwrap_or("").to_owned(),
-    };
-    let mut settings = run_settings(&opts, &def)?;
-    if def.target.kind() == TargetKind::S3 {
-        crate::target::s3::run_settings_override(&opts, &mut settings)?;
-    }
-    let db = script_db(env.as_ref(), tenant, &def, &opts).await?;
-    let target = build_target_with(&ctx, db).await?;
-    // The stream's log shard.
-    let shard = env.shard_pool(tenant).await?;
-    let (log_schema, change_source) =
-        stream_log_schema(&cat_pool, &cat_schema, tenant, stream).await?;
-    let source = crate::source::StreamSource::open(
-        shard,
-        cat_pool.clone(),
-        cat_schema.clone(),
-        log_schema,
-        sprig_streams::StreamId(stream),
-        parts,
-        def.group(),
-        start,
-        sink,
-    )
-    .await?
-    .with_sinks(store.clone());
-    // A change topic's records reach a sink whose owner the table's
-    // policies bind only as the owner may see them, filtered batch by batch
-    // through the topic's SQL read as the owner.
-    let source: Box<dyn crate::runtime::SourceReader> = match change_source {
-        Some(object) => Box::new(crate::rls_filter::FilteredChanges {
-            inner: Box::new(source),
-            env: Arc::clone(&env),
-            tenant,
-            owner: def.owner_user_id,
-            object,
-            topic: crate::rls_filter::topic_sql(&cat_pool, &cat_schema, stream).await?,
-            run_as: run_as(env.as_ref(), tenant, &def, &opts).await.ok(),
-            peer: env.peer(),
-            seed: sink.0,
-        }),
-        None => Box::new(source),
-    };
-    let prepare = SinkPrepare {
-        condition: def
-            .filter_sql
-            .as_deref()
-            .map(crate::filter::parse)
-            .transpose()?,
-        projection: def.projection.clone(),
-        transform: load_transform(&cat_pool, &cat_schema, &def, &opts).await?,
-    };
-    let control = Arc::new(CatalogControl {
-        pool: cat_pool.clone(),
-        store: store.clone(),
-        sink,
-        task: task_no,
-        epoch,
-        definition_ver: def.definition_ver,
-        delivered: AtomicU64::new(0),
-        // `FROM STREAM t.changes` is filtered for its owner (above)
-        // instead of paused when t's policies bind the owner.
-        rls: None,
-        regroup: None,
-        owner: OwnerCheck::new(&env, tenant, &def),
-    });
-    let dead = Arc::new(CatalogDead {
-        store: store.clone(),
-        sink,
-        stream: CatalogDead::target(env.as_ref(), tenant, &cat_pool, &cat_schema, &def).await?,
-    });
-    tracing::info!(tenant = %tenant, sink = sink.0, task = task_no.0, epoch = epoch.0, "sink task started");
-    metrics::gauge!("sprig_sink_tasks", "state" => "running").increment(1.0);
-    let end = run_task(
-        TaskParts {
-            info,
-            source,
-            target,
-            dead,
-            control,
-            prepare: Arc::new(prepare),
-            settings,
-            seed: None,
-            reject_via_source: false,
-        },
-        cancel,
-    )
-    .await;
-    metrics::gauge!("sprig_sink_tasks", "state" => "running").decrement(1.0);
-    tracing::info!(tenant = %tenant, sink = sink.0, task = task_no.0, end = ?end, "sink task ended");
-    end
-}
-
-/// Lists and opens a fan-in sink's member instances: the DC's
-/// `inherit-instances/` index, members below the sink's tenant (and `UNDER t`),
-/// members whose residency sets `deny_remote_access` left out.
-struct EnvFanIn {
-    env: Arc<dyn SinkEnv>,
-    tenant: u64,
-    def: (u64, u64),
-    under: Option<u64>,
-    cat_pool: Pool,
-    cat_schema: String,
-    group: String,
-    start: crate::model::StartAt,
-    sink: SinkId,
-    /// When the sink was created (ms): instances made later start at
-    /// their beginning, so the records that made them aren't missed.
-    sink_created_ms: u64,
-    /// This task's group: (task, of).
-    task_group: (u32, u32),
-}
-
-#[async_trait]
-impl crate::source::FanInOpener for EnvFanIn {
-    async fn members(&self) -> Result<Vec<(crate::source::FanInMember, Vec<u32>)>> {
-        let dc = self.env.dc();
-        let prefix = dc.tier().key("inherit-instances/")?;
-        let page = dc
-            .list(
-                &prefix,
-                sprig_meta::ListOpts {
-                    limit: 1_000_000,
-                    ..sprig_meta::ListOpts::default()
-                },
-            )
-            .await?;
-        let mut out = Vec::new();
-        for kv in &page.kvs {
-            let Ok(v) = serde_json::from_slice::<Value>(&kv.value) else {
-                continue;
-            };
-            let def = (
-                v.pointer("/def/tenant").and_then(Value::as_u64),
-                v.pointer("/def/object").and_then(Value::as_u64),
-            );
-            if def != (Some(self.def.0), Some(self.def.1))
-                || v.get("kind").and_then(Value::as_str) != Some("stream")
-            {
-                continue;
-            }
-            let (Some(member), Some(stream)) = (
-                v.get("tenant").and_then(Value::as_u64),
-                v.get("instance_id").and_then(Value::as_u64),
-            ) else {
-                continue;
-            };
-            if crate::meta::fanin_task_of(member, self.task_group.1) != self.task_group.0 {
-                continue;
-            }
-            let Some(global) = self.env.global() else {
-                continue;
-            };
-            let Some(e) = global
-                .get(
-                    &global.tier().key(&format!("tenants/{member}"))?,
-                    sprig_meta::Consistency::Serializable,
-                )
-                .await?
-                .and_then(|kv| serde_json::from_slice::<Value>(&kv.value).ok())
-            else {
-                continue;
-            };
-            let path: Vec<u64> = e
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .split('/')
-                .filter_map(|x| x.parse().ok())
-                .collect();
-            if member != self.tenant && !path.contains(&self.tenant) {
-                continue;
-            }
-            if self.under.is_some_and(|u| !path.contains(&u)) {
-                continue;
-            }
-            if e.pointer("/residency/deny_remote_access")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                metrics::counter!("sprig_inherit_fanin_skipped_total", "reason" => "residency")
-                    .increment(1);
-                continue;
-            }
-            let name = e
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            out.push((
-                crate::source::FanInMember {
-                    tenant: member,
-                    name,
-                    stream,
-                },
-                Vec::new(),
-            ));
-        }
-        Ok(out)
-    }
-
-    async fn open(
-        &self,
-        m: &crate::source::FanInMember,
-        _partitions: Vec<u32>,
-    ) -> Result<Box<dyn crate::runtime::SourceReader>> {
-        let t = TenantId(m.tenant);
-        let (mpool, mschema) = self.env.catalog(t).await?;
-        let (log_schema, partitions, created_ms) =
-            instance_stream(&mpool, &mschema, t, m.stream).await?;
-        let shard = self.env.shard_pool(t).await?;
-        let start = instance_start(self.start, created_ms, self.sink_created_ms);
-        crate::source::StreamSource::open_instance(
-            shard,
-            self.cat_pool.clone(),
-            self.cat_schema.clone(),
-            log_schema,
-            m.tenant,
-            sprig_streams::StreamId(m.stream),
-            (0..partitions).collect(),
-            self.group.clone(),
-            start,
-            self.sink,
-        )
-        .await
-        .map(|s| {
-            Box::new(s.with_sinks(SinksStore::new(self.env.records(), TenantId(self.tenant))))
-                as Box<dyn crate::runtime::SourceReader>
-        })
+            format!("{} sources don't run in workers yet", other.kind()),
+        )),
     }
 }
-
 /// A queue sink's `ordering` option: `queue` (strict queue order) or
 /// `key` (the default: one routing key's messages in order, lanes
 /// in parallel).
@@ -1378,146 +992,6 @@ pub fn queue_ordering(opts: &Opts) -> Result<bool> {
         Some(o) => Err(crate::model::bad_option(format!(
             "ordering = '{o}' isn't known for a queue sink: use 'queue' or 'key'"
         ))),
-    }
-}
-
-/// When sink `sink` was made (ms since the Unix epoch), from its catalog
-/// row.
-/// A fan-in sink's creation time as its sources compare it: milliseconds
-/// for stream instances, whole seconds for change topics (`changes`).
-#[must_use]
-pub fn fan_in_created_ms(created_ms: Option<i64>, changes: bool) -> u64 {
-    let ms = u64::try_from(created_ms.unwrap_or(0)).unwrap_or(0);
-    if changes { ms / 1000 * 1000 } else { ms }
-}
-
-/// Where a fan-in sink starts reading a member's stream instance made at
-/// `instance_created_ms`, for a sink made at `sink_created_ms` (both in
-/// milliseconds). An instance made after the sink is read from its start;
-/// `LATEST` means from the sink's creation (not from the task's first
-/// start, which comes a moment later).
-#[must_use]
-pub fn instance_start(
-    start: crate::model::StartAt,
-    instance_created_ms: u64,
-    sink_created_ms: u64,
-) -> crate::model::StartAt {
-    if instance_created_ms > sink_created_ms {
-        crate::model::StartAt::Earliest
-    } else if start == crate::model::StartAt::Latest && sink_created_ms > 0 {
-        crate::model::StartAt::Timestamp {
-            ms: i64::try_from(sink_created_ms).unwrap_or(i64::MAX),
-        }
-    } else {
-        start
-    }
-}
-
-/// `CHANGES OF t, ...`: the tables' change topics (`t.changes`) of the sink's
-/// own tenant, read as one source.
-struct EnvChanges {
-    env: Arc<dyn SinkEnv>,
-    tenant: u64,
-    objects: Vec<u64>,
-    cat_pool: Pool,
-    cat_schema: String,
-    group: String,
-    start: crate::model::StartAt,
-    sink: SinkId,
-    sink_created_ms: u64,
-    /// The sink's owner, whose view of each change topic the records are
-    /// filtered to while the table's policies bind it.
-    owner: u32,
-    /// The owner on a gateway (the filter's reads).
-    run_as: Option<crate::peer::RunAs>,
-}
-
-#[async_trait]
-impl crate::source::FanInOpener for EnvChanges {
-    async fn members(&self) -> Result<Vec<(crate::source::FanInMember, Vec<u32>)>> {
-        let mut c = self.cat_pool.get_conn().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e)
-        })?;
-        let st = sprig_streams::StreamsStore::new(&self.cat_schema)
-            .load(&mut c)
-            .await?;
-        let mut out = Vec::new();
-        for o in &self.objects {
-            let Some(s) = st.all().find(|s| {
-                s.kind == sprig_streams::model::StreamKind::Changes
-                    && s.source_object.is_some_and(|x| x.0 == *o)
-            }) else {
-                return Err(err(
-                    SprigCode::SinkSourceLost,
-                    format!(
-                        "table object {o} has no change topic (ALTER TABLE ... SPRIG SET \
-                         (stream.change_topic = on))"
-                    ),
-                ));
-            };
-            out.push((
-                crate::source::FanInMember {
-                    tenant: self.tenant,
-                    name: String::new(),
-                    stream: s.id.0,
-                },
-                Vec::new(),
-            ));
-        }
-        Ok(out)
-    }
-
-    async fn open(
-        &self,
-        m: &crate::source::FanInMember,
-        _partitions: Vec<u32>,
-    ) -> Result<Box<dyn crate::runtime::SourceReader>> {
-        let t = TenantId(self.tenant);
-        let (log_schema, partitions, _) =
-            instance_stream(&self.cat_pool, &self.cat_schema, t, m.stream).await?;
-        let shard = self.env.shard_pool(t).await?;
-        let start = if self.start == crate::model::StartAt::Latest && self.sink_created_ms > 0 {
-            crate::model::StartAt::Timestamp {
-                ms: i64::try_from(self.sink_created_ms).unwrap_or(i64::MAX),
-            }
-        } else {
-            self.start
-        };
-        let src = crate::source::StreamSource::open(
-            shard,
-            self.cat_pool.clone(),
-            self.cat_schema.clone(),
-            log_schema,
-            sprig_streams::StreamId(m.stream),
-            (0..partitions).collect(),
-            self.group.clone(),
-            start,
-            self.sink,
-        )
-        .await?
-        .with_sinks(SinksStore::new(self.env.records(), TenantId(self.tenant)));
-        // Each table's change topic is filtered batch by batch for the
-        // owner while the table's policies bind it, as `FROM STREAM
-        // t.changes` is, instead of the sink being paused.
-        let (topic, object) =
-            crate::rls_filter::topic_of(&self.cat_pool, &self.cat_schema, m.stream).await?;
-        let object = object.ok_or_else(|| {
-            err(
-                SprigCode::SinkSourceLost,
-                format!("stream {} isn't a change topic", m.stream),
-            )
-        })?;
-        Ok(Box::new(crate::rls_filter::FilteredChanges {
-            inner: Box::new(src),
-            env: Arc::clone(&self.env),
-            tenant: t,
-            owner: self.owner,
-            object,
-            topic,
-            run_as: self.run_as.clone(),
-            peer: self.env.peer(),
-            seed: self.sink.0,
-        }))
     }
 }
 
@@ -1537,7 +1011,6 @@ async fn run_fan_in_task(
     opts: Opts,
 ) -> Result<TaskEnd> {
     let (cat_pool, cat_schema) = env.catalog(tenant).await?;
-    let created = store.created_ms(sink).await?;
     // A fan-in queue task takes its members' messages under a lease
     // tag, as a queue task does, and gives back a dead
     // predecessor's in each member it opens.
@@ -1601,39 +1074,7 @@ async fn run_fan_in_task(
     let db = script_db(env.as_ref(), tenant, &def, &opts).await?;
     let target = build_target_with(&ctx, db).await?;
     let refresh = Duration::from_secs(opts.u64("fanin_refresh_seconds", 30)?.max(1));
-    // Stream instances compare in milliseconds (their records and their
-    // creation carry ms): whole seconds made an instance created earlier in
-    // the sink's creation second look newer than the sink, and it was read
-    // from its start. Change topics' records carry their commit
-    // time in whole seconds, so a record committed in the sink's creation
-    // second counts there.
-    let sink_created_ms = fan_in_created_ms(created, false);
-    let sink_created_s_ms = fan_in_created_ms(created, true);
     let source = match &def.source {
-        SourceSpec::FanIn {
-            def_tenant,
-            def_object,
-            under,
-            ..
-        } => {
-            crate::source::FanInSource::open(
-                Box::new(EnvFanIn {
-                    env: Arc::clone(&env),
-                    tenant: tenant.0,
-                    def: (*def_tenant, *def_object),
-                    under: *under,
-                    cat_pool: cat_pool.clone(),
-                    cat_schema: cat_schema.clone(),
-                    group: def.group(),
-                    start: def.start_at,
-                    sink,
-                    sink_created_ms,
-                    task_group: (task_no.0, of.max(1)),
-                }),
-                refresh,
-            )
-            .await?
-        }
         SourceSpec::FanInQueue {
             def_tenant,
             def_object,
@@ -1667,22 +1108,6 @@ async fn run_fan_in_task(
             )
             .await?
         }
-        SourceSpec::Changes { objects } => {
-            crate::source::FanInSource::open_changes(Box::new(EnvChanges {
-                env: Arc::clone(&env),
-                tenant: tenant.0,
-                objects: objects.iter().map(|o| o.0).collect(),
-                cat_pool: cat_pool.clone(),
-                cat_schema: cat_schema.clone(),
-                group: def.group(),
-                start: def.start_at,
-                sink,
-                sink_created_ms: sink_created_s_ms,
-                owner: def.owner_user_id,
-                run_as: run_as(env.as_ref(), tenant, &def, &opts).await.ok(),
-            }))
-            .await?
-        }
         _ => return Ok(TaskEnd::Stopped),
     };
     let prepare = SinkPrepare {
@@ -1706,7 +1131,7 @@ async fn run_fan_in_task(
         // instead of paused when its tables' policies bind the owner.
         rls: None,
         regroup: match &def.source {
-            SourceSpec::FanIn { .. } | SourceSpec::FanInQueue { .. } => Some(Regroup {
+            SourceSpec::FanInQueue { .. } => Some(Regroup {
                 dc: env.dc(),
                 tenant: tenant.0,
                 sink: sink.0,
@@ -1720,7 +1145,6 @@ async fn run_fan_in_task(
     let dead = Arc::new(CatalogDead {
         store: store.clone(),
         sink,
-        stream: CatalogDead::target(env.as_ref(), tenant, &cat_pool, &cat_schema, &def).await?,
     });
     let reject_via_source =
         matches!(def.source, SourceSpec::FanInQueue { .. }) && def.dead_letter.is_none();
@@ -2052,7 +1476,6 @@ async fn run_queue_task(
     let dead = Arc::new(CatalogDead {
         store: store.clone(),
         sink,
-        stream: CatalogDead::target(env.as_ref(), tenant, &cat_pool, &cat_schema, &def).await?,
     });
     tracing::info!(tenant = %tenant, sink = sink.0, task = task_no.0, queue = %name, "queue sink task started");
     metrics::gauge!("sprig_sink_tasks", "state" => "running").increment(1.0);
@@ -2076,68 +1499,6 @@ async fn run_queue_task(
     metrics::gauge!("sprig_sink_tasks", "state" => "running").decrement(1.0);
     tracing::info!(tenant = %tenant, sink = sink.0, task = task_no.0, end = ?end, "queue sink task ended");
     end
-}
-
-/// A member's instance stream: its log shard schema, partitions and
-/// creation time (ms).
-async fn instance_stream(
-    pool: &Pool,
-    catalog: &str,
-    tenant: TenantId,
-    stream: u64,
-) -> Result<(String, u32, u64)> {
-    let mut c = pool.get_conn().await.map_err(|e| {
-        SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e)
-    })?;
-    let def = sprig_streams::StreamsStore::new(catalog)
-        .get(&mut c, sprig_streams::StreamId(stream))
-        .await?
-        .ok_or_else(|| {
-            err(
-                SprigCode::SinkSourceLost,
-                format!("instance stream {stream} of tenant {tenant} is gone"),
-            )
-        })?;
-    let log = def
-        .log
-        .first()
-        .ok_or_else(|| err(SprigCode::SinkSourceLost, "the instance has no log shard"))?;
-    Ok((
-        log.slot.schema(tenant, def.db).to_string(),
-        def.partitions,
-        def.created_at_ms,
-    ))
-}
-
-/// The log shard schema of stream `stream` (its first log shard).
-/// A stream's log schema, and its table's object id when it is a change
-/// topic.
-pub(crate) async fn stream_log_schema(
-    pool: &Pool,
-    catalog: &str,
-    tenant: TenantId,
-    stream: u64,
-) -> Result<(String, Option<u64>)> {
-    let mut c = pool.get_conn().await.map_err(|e| {
-        SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e)
-    })?;
-    let def = sprig_streams::StreamsStore::new(catalog)
-        .get(&mut c, sprig_streams::StreamId(stream))
-        .await?
-        .ok_or_else(|| {
-            err(
-                SprigCode::SinkSourceLost,
-                format!("stream {stream} is gone"),
-            )
-        })?;
-    let log = def
-        .log
-        .first()
-        .ok_or_else(|| err(SprigCode::SinkSourceLost, "the stream has no log shard"))?;
-    let source = (def.kind == sprig_streams::model::StreamKind::Changes)
-        .then(|| def.source_object.map(|o| o.0))
-        .flatten();
-    Ok((log.slot.schema(tenant, def.db).to_string(), source))
 }
 
 /// Kinds of connection each target needs (for messages).
@@ -2250,29 +1611,8 @@ mod tests {
         assert_eq!(unquote("12"), "12");
     }
 
-    /// Regression: a member's instance made earlier in the second the fan-in
-    /// sink was made in is read from the sink's creation under `LATEST`,
-    /// not from its start (whole seconds made it look newer than the sink,
-    /// and `fan_in_sink_end_to_end` got 5 records from before the sink).
     #[test]
-    fn instance_made_in_the_sinks_second_starts_at_the_sink() {
-        use crate::model::StartAt;
-        let sink = fan_in_created_ms(Some(1_794_000_000_900), false);
-        assert_eq!(
-            instance_start(StartAt::Latest, 1_794_000_000_300, sink),
-            StartAt::Timestamp {
-                ms: 1_794_000_000_900
-            }
-        );
-        // An instance made after the sink: from its start.
-        assert_eq!(
-            instance_start(StartAt::Latest, 1_794_000_000_950, sink),
-            StartAt::Earliest
-        );
-        assert_eq!(
-            instance_start(StartAt::Earliest, 1_794_000_000_300, sink),
-            StartAt::Earliest
-        );
+    fn queue_orderings() {
         // `ordering` of queue sinks.
         let o = |v: &str| {
             Opts(
@@ -2325,11 +1665,6 @@ mod tests {
         assert_eq!(
             dead_lease_tag(s, t, Some(&prev(Value::Null)), Some(None)),
             None
-        );
-        // Change topics keep whole seconds.
-        assert_eq!(
-            fan_in_created_ms(Some(1_794_000_000_900), true),
-            1_794_000_000_000
         );
     }
 }

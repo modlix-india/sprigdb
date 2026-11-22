@@ -1,18 +1,16 @@
 //! Inherited triggers, run as the member's `sprig_inherited` principal:
 //!
 //! ```text
-//! ensure_for_stream(T, stream definition S, T's instance of S):
-//!   for each trigger definition G reaching T whose source is S:
+//! ensure_for_queue(T, queue definition Q, T's instance of Q):
+//!   for each trigger definition G reaching T whose source is Q:
 //!     disabled for T (ALTER INHERITED TRIGGER ... DISABLE, nearest level):
 //!       its job's index entry is removed (the position stays); next
 //!     no instance yet:
 //!       T's sprig_inherited (created locked, no password anyone knows) gets
 //!       G's GRANTS, once: what T's administrators revoke later stays revoked
-//!       deploy G's body in T as a trigger of S's instance, definer
-//!       sprig_inherited, module database = S's database in T
-//!       its consumer group starts at 0 when the stream instance was made
-//!       after G (every record then came after G), else at each partition's
-//!       high watermark; the index entry starts its job
+//!       deploy G's body in T as a trigger of Q's instance, definer
+//!       sprig_inherited, module database = Q's database in T; the index
+//!       entry starts its job
 //!     an instance whose body is behind (G changed, or the nearest body
 //!     override changed): deploy the new body as a new version (OR REPLACE
 //!       keeps the binding and the position); the job picks it up within 5 s
@@ -20,7 +18,7 @@
 //! ```
 //!
 //! Every run is then an ordinary trigger run of T: in a gateway, as T's
-//! `sprig_inherited`, exactly once per record, in the engine tier.
+//! `sprig_inherited`, once per message, in the engine tier.
 
 use std::sync::Arc;
 
@@ -42,33 +40,12 @@ use sprig_inherit::msg::{
 };
 use sprig_logic::declare::SourceKind;
 use sprig_logic::messages::{self, MsgIndex};
-use sprig_streams::offsets;
 
-use super::streams::StreamInstance;
 use super::{RUN_AS_USER, catalog};
 use crate::tenant::TenantServices;
 
 fn cat_err(e: mysql_async::Error) -> SprigError {
     SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-}
-
-/// The trigger definitions reaching the member whose source is `stream`.
-#[must_use]
-pub fn on_stream(chain: &Chain, stream: &Definition) -> Vec<Arc<Definition>> {
-    chain
-        .reaching(DefKind::Trigger)
-        .into_iter()
-        .filter(|g| g.state == DefState::Active)
-        .filter(|g| {
-            let Ok(spec) = serde_json::from_value::<TriggerSpec>(g.definition.clone()) else {
-                return false;
-            };
-            spec.source_kind == "stream"
-                && chain
-                    .resolve(&spec.source_db, DefKind::Stream, &spec.source_name)
-                    .is_some_and(|s| s.key() == stream.key())
-        })
-        .collect()
 }
 
 /// The trigger definitions reaching the member whose source is the queue
@@ -91,8 +68,8 @@ pub fn on_queue(chain: &Chain, queue: &Definition) -> Vec<Arc<Definition>> {
         .collect()
 }
 
-/// What an inherited trigger reads in the member: a stream instance, or a
-/// queue instance (an ordinary queue of the member).
+/// What an inherited trigger reads in the member: a queue instance (an
+/// ordinary queue of the member).
 #[derive(Clone, Copy)]
 pub struct Source<'a> {
     /// The member.
@@ -105,10 +82,8 @@ pub struct Source<'a> {
     pub object_id: u64,
     /// Its name.
     pub name: &'a str,
-    /// Stream or queue.
+    /// The source's kind (a queue).
     pub kind: SourceKind,
-    /// The stream instance (positions start from it).
-    pub stream: Option<&'a StreamInstance>,
 }
 
 /// The body text the member's instance of `g` runs, and a mark of where
@@ -129,45 +104,12 @@ fn body_of(chain: &Chain, g: &Definition) -> (String, String) {
     }
 }
 
-/// See the module docs. Whether every trigger is settled: `false` when
-/// another deploy (the rollout, another gateway, another session's
-/// publish) is still making one, so the caller doesn't record the
-/// instance as up to date and its next use looks again.
-///
-/// # Errors
-/// The catalog's and the deploy's (an inherited body that no longer
-/// compiles fails the publish that would adopt it).
-pub async fn ensure_for_stream(
-    svc: &Arc<TenantServices>,
-    chain: &Chain,
-    stream_def: &Definition,
-    si: &StreamInstance,
-) -> Result<bool> {
-    let triggers = on_stream(chain, stream_def);
-    if triggers.is_empty() {
-        return Ok(true);
-    }
-    let db_id = si.stream.db.0;
-    ensure_for(
-        svc,
-        chain,
-        triggers,
-        Source {
-            tenant: si.tenant,
-            db_id,
-            db_name: &si.db_name,
-            object_id: si.stream.id.0,
-            name: &si.stream.name,
-            kind: SourceKind::Stream,
-            stream: Some(si),
-        },
-    )
-    .await
-}
-
 /// The inherited triggers of the member's queue instance (`queue_def`'s
 /// instance, queue `queue_id` of database `db`); see the module docs.
-/// Whether every trigger is settled, as [`ensure_for_stream`].
+/// Whether every trigger is settled: `false` when another deploy (the
+/// rollout, another gateway, another session's publish) is still making
+/// one, so the caller doesn't record the instance as up to date and its
+/// next use looks again.
 ///
 /// # Errors
 /// The catalog's and the deploy's.
@@ -193,7 +135,6 @@ pub async fn ensure_for_queue(
             object_id: queue_id,
             name: &queue_def.name,
             kind: SourceKind::Queue,
-            stream: None,
         },
     )
     .await
@@ -334,10 +275,6 @@ async fn ensure_for(
             Err(e) => return Err(e),
         };
         let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
-        // A new stream trigger's position.
-        if let Some(si) = src.stream {
-            stream_positions(svc, &mut conn, &schema, &g, si, deployed.binding_id).await?;
-        }
         let physical = json!({
             "binding": deployed.binding_id,
             "module": deployed.module_id,
@@ -375,49 +312,6 @@ async fn ensure_for(
 /// A `creating` instance row nobody finished for this long was left by a
 /// gateway that stopped while deploying it; the next use takes it over.
 const CLAIM_ABANDONED_MS: u64 = 30_000;
-
-/// A new stream trigger's consumer group: from the start when the stream
-/// instance came after the trigger, else at each partition's end.
-async fn stream_positions(
-    svc: &Arc<TenantServices>,
-    conn: &mut mysql_async::Conn,
-    schema: &str,
-    g: &Definition,
-    si: &StreamInstance,
-    binding: u64,
-) -> Result<()> {
-    let t = si.tenant;
-    {
-        let conn = &mut *conn;
-        let group = offsets::logic_group(binding);
-        let have = offsets::positions(conn, schema, &group, si.stream.id.0).await?;
-        if have.len() < si.stream.partitions as usize {
-            let from_start = si.created || si.stream.created_at_ms >= g.created_at_ms;
-            let mut start = Vec::new();
-            if !from_start && let Some(log) = si.stream.log.first() {
-                let lschema = log.slot.schema(t, si.stream.db).to_string();
-                let cluster = svc.locator.cluster(t).await?;
-                let pool = svc.locator.ctl_pool(&cluster).await?;
-                let mut c = pool
-                    .get_conn_bounded()
-                    .await
-                    .map_err(sprig_streams::maria::map_err)?;
-                let reader = sprig_streams::read::LogReader { schema: lschema };
-                for p in 0..si.stream.partitions {
-                    let hw = reader
-                        .bounds(&mut c, si.stream.id, sprig_streams::PartitionNo(p))
-                        .await
-                        .map_or(0, |b| b.high_watermark.0);
-                    start.push((p, hw));
-                }
-            } else {
-                start = (0..si.stream.partitions).map(|p| (p, 0)).collect();
-            }
-            offsets::init_positions(conn, schema, &group, si.stream.id.0, &start).await?;
-        }
-    }
-    Ok(())
-}
 
 /// Sets a module's state (`active` or `disabled`); the trigger job of a
 /// module that isn't active ends at its next check.

@@ -6,15 +6,13 @@
 //! - [`cluster`]: brokers from the DC's gateway records (broker id = the
 //!   gateway's slot) and coordinator leases in etcd
 //!   (`stream-groups/<tenant_id>/<group>`);
-//! - [`catalog`]: topics as streams (read from the tenant's catalog
-//!   snapshot, filtered by privilege, changed with stream DDL run as the
-//!   user), and consumer groups in `stream_groups` and `stream_offsets`
-//!   through `sprig-streams`' store;
-//! - [`data`]: Produce, Fetch, ListOffsets and OffsetForLeaderEpoch over
-//!   `sprig-streams`' publish and log reader, as `sprig-proto-kafka`'s data
-//!   plane;
-//! - [`engine`]: topics of engine databases, stored on the node's engine
-//!   (segment files and engine records), in front of the three above.
+//! - [`engine`]: topics, stored on the node's engine (segment files and
+//!   engine records): the topic store, consumer groups' offsets and the data
+//!   plane (Produce, Fetch, ListOffsets, OffsetForLeaderEpoch);
+//! - [`data`]: the tenant catalog and privileges the engine router asks
+//!   about, and the produce and fetch limits;
+//! - [`catalog`]: what the engine router falls back to (consumer groups'
+//!   rows; topics of databases that don't exist).
 
 // Kafka API and config names fill the docs.
 #![allow(clippy::doc_markdown)]
@@ -123,8 +121,8 @@ pub struct KafkaDeps {
     pub groups: Arc<dyn sprig_proto_kafka::group::GroupStore>,
     /// Produce, Fetch, ListOffsets, OffsetForLeaderEpoch.
     pub data: Option<Arc<dyn sprig_proto_kafka::broker::data::StreamData>>,
-    /// Topics of engine databases are served from the node's engine, with
-    /// this data plane's catalog and grants (`None`: not at all).
+    /// Topics are served from the node's engine, with this catalog and
+    /// these grants (`None`: not at all).
     pub engine_gate: Option<Arc<data::GatewayData>>,
 }
 

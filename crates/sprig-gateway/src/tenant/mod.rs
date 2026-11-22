@@ -192,8 +192,6 @@ impl TenantServices {
             Arc::new(sprig_auth::authz::rls::RlsExtension),
             // Types and record hierarchies.
             Arc::new(sprig_types::TypesExtension),
-            // Event streams.
-            Arc::new(sprig_streams::StreamsExtension),
             // Exchanges, queues and bindings.
             Arc::new(sprig_queues::catalog::MqExtension),
             // Sinks and connections.

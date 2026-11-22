@@ -778,6 +778,53 @@ pub fn identifiers(sql: &[u8], lex_opts: &LexOptions) -> Vec<String> {
         .collect()
 }
 
+/// `ALTER TABLE [db.]t SPRIG SET | RESET (...)`: the table the statement
+/// names, so a hook can act after the settings statement succeeded.
+#[must_use]
+pub fn settings_target(sql: &str, lex: &LexOptions) -> Option<QName> {
+    let toks = sprig_sql::lex::lex(sql.as_bytes(), lex).ok()?;
+    let words: Vec<_> = toks.iter().filter(|t| !t.kind.is_trivia()).collect();
+    let w = |i: usize, s: &str| {
+        words
+            .get(i)
+            .is_some_and(|t| sql[t.range()].eq_ignore_ascii_case(s))
+    };
+    if !(w(0, "ALTER") && w(1, "TABLE")) {
+        return None;
+    }
+    let ident = |i: usize| -> Option<(String, std::ops::Range<usize>)> {
+        let t = words.get(i)?;
+        if !t.kind.is_ident_like() {
+            return None;
+        }
+        Some((
+            String::from_utf8_lossy(&sprig_sql::lex::ident_value(t.bytes(sql.as_bytes())))
+                .into_owned(),
+            t.range(),
+        ))
+    };
+    let (first, r) = ident(2)?;
+    if words.get(3).is_some_and(|t| &sql[t.range()] == ".") {
+        let (second, r2) = ident(4)?;
+        if !w(5, "SPRIG") {
+            return None;
+        }
+        return Some(QName {
+            db: Some(first),
+            name: second,
+            range: r.start..r2.end,
+        });
+    }
+    if !w(3, "SPRIG") {
+        return None;
+    }
+    Some(QName {
+        db: None,
+        name: first,
+        range: r,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

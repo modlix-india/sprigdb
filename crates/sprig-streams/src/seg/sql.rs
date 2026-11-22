@@ -198,10 +198,8 @@ pub fn plan(
                 return Err(unsupported("ALTER STREAM ... SET"));
             }
             let name = format!("{db}.{}", a.name.name);
-            // Not an engine stream: the statement goes on (a stream kept in
-            // MariaDB answers there, a missing one is refused there).
             let Some(mut r) = eng.topic(tenant, &name)? else {
-                return Ok(None);
+                return Err(not_found(&name));
             };
             if !host.allowed(&db, &a.name.name, Need::Alter) {
                 return Err(denied(host, "ALTER", &a.name.name));
@@ -231,9 +229,6 @@ pub fn plan(
         Stmt::Drop { if_exists, name } => {
             let db = db_of(&name, host)?;
             if !host.on_engine(&db) {
-                return Ok(None);
-            }
-            if eng.topic(tenant, &format!("{db}.{}", name.name))?.is_none() {
                 return Ok(None);
             }
             if !host.allowed(&db, &name.name, Need::Drop) {
@@ -859,14 +854,21 @@ mod tests {
             other => panic!("{other:?}"),
         }
         go(&s, &h, "DROP STREAM orders").await.unwrap();
-        // Gone from the engine: the statement goes on to the other streams
-        // (which refuse a missing one).
-        assert_eq!(go(&s, &h, "DROP STREAM orders").await.unwrap(), None);
+        // Gone: a missing stream is refused (39940), `IF EXISTS` is quiet.
+        assert_eq!(
+            go(&s, &h, "DROP STREAM orders").await.unwrap_err().code(),
+            Some(SprigCode::StreamNotFound)
+        );
+        assert_eq!(
+            go(&s, &h, "DROP STREAM IF EXISTS orders").await.unwrap(),
+            Some(Answer::Ok(0))
+        );
         assert_eq!(
             go(&s, &h, "ALTER STREAM orders PARTITIONS 9")
                 .await
-                .unwrap(),
-            None
+                .unwrap_err()
+                .code(),
+            Some(SprigCode::StreamNotFound)
         );
         go(&s, &h, "CREATE STREAM a").await.unwrap();
         go(&s, &h, "CREATE STREAM b").await.unwrap();

@@ -23,7 +23,7 @@ pub mod kv_sweep;
 // The TTL monitor.
 pub mod doc_ttl;
 pub mod logic;
-// Triggers on streams and queues.
+// Triggers on queues.
 pub mod msg_triggers;
 pub mod permit;
 // The feed-driven queue outbox forwarder.
@@ -36,8 +36,6 @@ pub mod runtime;
 pub mod search;
 // Live settings for every job.
 pub mod settings;
-// Stream sequencers.
-pub mod streams;
 // Sink tasks.
 pub mod sinks;
 pub mod xa_drain;
@@ -295,9 +293,6 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         clusters: graph_mirror::shared_view(&shared_feed),
         maps: sprig_shard::ShardMapCache::spawn(dc_logic.clone())?,
     };
-    // Stream sequencers, on the logic jobs' pools and the
-    // shared reader.
-    let streams_env = streams::StreamsEnv::from_logic(&env, &shared_feed);
     // Sink tasks, on the same pools, with the global tier
     // (platform connections) and the master key file (credentials).
     let sinks_env = sinks::SinksEnv::new(
@@ -309,7 +304,7 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
             .or(cfg.controller.workload_key_file.as_deref()),
         &worker,
     );
-    // Triggers on streams and queues, run in gateways.
+    // Triggers on queues, run in gateways.
     let peer_pems = cfg
         .tls
         .as_ref()
@@ -419,10 +414,8 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         })))
         .with_handler(Arc::new(inherit::InheritCopy(inherit_env)))
         .with_handler(Arc::new(graph_mirror::GraphMirror(graph_mirror_env)))
-        .with_handler(Arc::new(streams::StreamSequencer(streams_env)))
         .with_handler(Arc::new(sinks::SinkTask(sinks_env)))
         .with_handler(Arc::new(queue_forwarder::QueueForwarder(forwarder_env)))
-        .with_handler(Arc::new(msg_triggers::StreamTrigger(msg_env.clone())))
         .with_handler(Arc::new(msg_triggers::QueueTrigger(msg_env)))
         .with_handler(Arc::new(kv_sweep::KvSweep {
             pools: Arc::new(

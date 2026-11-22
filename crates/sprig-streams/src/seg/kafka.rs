@@ -74,6 +74,12 @@ pub trait Gate: Send + Sync + 'static {
     fn tenant_on_engine(&self, tenant: u64) -> bool;
     /// Whether `p` may do `need` on `db`.`stream`.
     async fn allowed(&self, p: &Principal, db: &str, stream: &str, need: Need) -> bool;
+    /// The produce and fetch limits for `p` when no other data plane gives
+    /// them.
+    async fn limits(&self, p: &Principal) -> Limits {
+        let _ = p;
+        Limits::default()
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1198,7 +1204,7 @@ impl StreamData for RoutedData {
     async fn limits(&self, p: &Principal) -> Limits {
         match &self.inner {
             Some(i) => i.limits(p).await,
-            None => Limits::default(),
+            None => self.gate.limits(p).await,
         }
     }
 

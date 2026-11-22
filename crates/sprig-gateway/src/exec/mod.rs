@@ -94,9 +94,6 @@ mod offsets;
 // privileges and row-level security (gRPC, SSE and WebSocket change
 // streams, Redis keyspace notifications).
 pub(crate) mod rls_images;
-// Change topics' filter views, for views and
-// stored code over them.
-mod change_views;
 // `queue.change_exchange`.
 pub(crate) mod change_exchange;
 // ONLY_FULL_GROUP_BY on 3306.

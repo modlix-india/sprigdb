@@ -117,14 +117,6 @@ keys! {
     WEBHOOK_CONNECTION: Text = "approvals.webhook_connection", Cow::Borrowed(""), TENANT_ONLY,
         HardBounds::NONE, false, 52,
         "<database>.<connection> or platform:<name>: a webhook connection that gets the tenant's events";
-    /// `approvals.stream_database`.
-    STREAM_DATABASE: Text = "approvals.stream_database", Cow::Borrowed(""), TENANT_ONLY,
-        HardBounds::NONE, false, 52,
-        "Database whose stream sprig_recommendations gets the tenant's events";
-    /// `approvals.platform_tenant`.
-    PLATFORM_TENANT: Text = "approvals.platform_tenant", Cow::Borrowed(""), Scopes::PROCESS,
-        HardBounds::NONE, true, 52,
-        "Tenant whose stream sprig_recommendations gets every event";
     /// `vector.auto_ann`.
     VECTOR_AUTO_ANN: Text = "vector.auto_ann", Cow::Borrowed("on"), Scopes::ALL,
         HardBounds::one_of(MODES), false, 34,

@@ -1,5 +1,5 @@
-//! The cross-tenant outbox: a publish into another tenant's stream inside
-//! a transaction.
+//! The cross-tenant outbox: a publish into another tenant's exchange (or a
+//! broadcast to every member) inside a transaction.
 //!
 //! ```text
 //! publish(P's transaction, record r, destination d):
@@ -15,11 +15,9 @@
 //!   listed schema: rows a crashed gateway or a lost hook left
 //! forward(rows):
 //!   SELECT ... FOR UPDATE SKIP LOCKED   -- one forwarder per row at a time
-//!   d an instance of a definition: create it if needed; d a
-//!     stream: that stream
-//!   INSERT IGNORE INTO the destination's outbox (event_id := out_id, ...)
-//!   -- a second forward is a no-op: the outbox's primary key, or, once
-//!   -- sequenced, the log's duplicate check on the event id
+//!   d an exchange: the member's queue outbox (event_id := out_id, ...);
+//!   d a broadcast: the definition's broadcast log
+//!   -- a second forward is a no-op: the destination's key on the event id
 //!   DELETE the rows; COMMIT
 //! ```
 //!
@@ -36,9 +34,7 @@ use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::{ClusterId, TenantId};
 use sprig_common::names::quote;
 use sprig_common::{Result, SprigCode, SprigError};
-use sprig_inherit::msg::{Cause, DefKey};
 use sprig_meta::{ListOpts, Record, Versioned};
-use sprig_streams::StreamsState;
 use sprig_streams::publish::Publish;
 
 use super::catalog;
@@ -71,23 +67,6 @@ pub fn ddl(schema: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "to", rename_all = "snake_case")]
 pub enum Dest {
-    /// A member's instance of a definition (`FOR TENANT`, the `tenant`
-    /// column).
-    Instance {
-        /// The member.
-        tenant: u64,
-        /// The definition's tenant.
-        def_tenant: u64,
-        /// Its object id.
-        def_object: u64,
-    },
-    /// An ancestor's ordinary stream (`IN TENANT`).
-    Stream {
-        /// The owner.
-        tenant: u64,
-        /// The stream.
-        stream: u64,
-    },
     /// A broadcast (`FOR ALL TENANTS`, `x-sprig-tenant: *`): forwarded
     /// into the definition's broadcast log, whose fan-out delivers it.
     Broadcast {
@@ -539,7 +518,7 @@ fn failed(key: &str, yes: bool) -> Duration {
 /// Writes `rows` into `dest`'s outbox (event id = out id).
 #[allow(clippy::too_many_lines)]
 async fn deliver(svc: &Arc<TenantServices>, dest: &Dest, rows: &[Row]) -> Result<()> {
-    let (tenant, schema, stream) = match dest {
+    match dest {
         Dest::Broadcast {
             def_tenant,
             def_object,
@@ -568,7 +547,7 @@ async fn deliver(svc: &Arc<TenantServices>, dest: &Dest, rows: &[Row]) -> Result
                 )
                 .await?;
             }
-            return Ok(());
+            Ok(())
         }
         Dest::Exchange {
             tenant,
@@ -592,80 +571,9 @@ async fn deliver(svc: &Arc<TenantServices>, dest: &Dest, rows: &[Row]) -> Result
             Box::pin(super::mq::deliver_outbox(svc, &chain, db, exchange, &rows)).await?;
             metrics::counter!("sprig_inherit_publishes_total", "kind" => "exchange", "path" => "outbox")
                 .increment(rows.len() as u64);
-            return Ok(());
+            Ok(())
         }
-        Dest::Instance {
-            tenant,
-            def_tenant,
-            def_object,
-        } => {
-            let t = TenantId(*tenant);
-            let cat = catalog(svc, t).await?;
-            let chain = super::chain(svc, &cat).await?;
-            let key = DefKey {
-                tenant: TenantId(*def_tenant),
-                object: *def_object,
-            };
-            let d = chain
-                .def(key)
-                .ok_or_else(|| super::dropping(format!("the definition {key} is gone")))?;
-            let si = Box::pin(super::streams::ensure(svc, &chain, &d, Cause::Publish)).await?;
-            (t, si.outbox_schema()?, si.stream)
-        }
-        Dest::Stream { tenant, stream } => {
-            let t = TenantId(*tenant);
-            let cat = catalog(svc, t).await?;
-            let s = cat
-                .ext
-                .get::<StreamsState>(sprig_streams::MODULE)
-                .and_then(|st| st.all().find(|s| s.id.0 == *stream).cloned())
-                .ok_or_else(|| {
-                    SprigError::new(
-                        SprigCode::StreamNotFound,
-                        format!("ER_SPRIG_STREAM_NOT_FOUND: tenant {t}'s stream {stream} is gone"),
-                    )
-                })?;
-            let slot = s
-                .outbox
-                .first()
-                .ok_or_else(|| SprigError::internal("a stream without an outbox"))?;
-            (t, slot.schema(t, s.db).to_string(), s)
-        }
-    };
-    let values: Vec<String> = rows
-        .iter()
-        .map(|r| {
-            format!(
-                "({}, {}, {}, {}, {})",
-                hex(&r.id),
-                lit(r.rec.key.as_deref()),
-                lit(r.rec.value.as_deref()),
-                r.rec.headers.as_deref().map_or_else(
-                    || "NULL".to_owned(),
-                    |h| format!("CONVERT({} USING utf8mb4)", hex(h.as_bytes()))
-                ),
-                r.rec.partition.map_or_else(
-                    || "NULL".to_owned(),
-                    |p| (p % stream.partitions.max(1)).to_string()
-                ),
-            )
-        })
-        .collect();
-    let cluster = svc.locator.cluster(tenant).await?;
-    let pool = svc.locator.ctl_pool(&cluster).await?;
-    let mut c = pool
-        .get_conn_bounded()
-        .await
-        .map_err(sprig_streams::maria::map_err)?;
-    c.query_drop(format!(
-        "INSERT IGNORE INTO {}.{} (event_id, k, v, headers, partition_no) VALUES {}",
-        quote(&schema),
-        quote(&stream.outbox_table()),
-        values.join(", ")
-    ))
-    .await
-    .map_err(sprig_streams::maria::map_err)?;
-    Ok(())
+    }
 }
 
 /// Rows waiting in `tenant`'s outbox in `schema` (0 without the table).
@@ -876,14 +784,14 @@ mod tests {
 
     #[test]
     fn destinations_and_inserts() {
-        let d = Dest::Instance {
+        let d = Dest::Exchange {
             tenant: 9,
-            def_tenant: 2,
-            def_object: 41,
+            db: "security".into(),
+            exchange: "alerts".into(),
         };
         assert_eq!(
             dest_json(&d),
-            serde_json::json!({"to": "instance", "tenant": 9, "def_tenant": 2, "def_object": 41})
+            serde_json::json!({"to": "exchange", "tenant": 9, "db": "security", "exchange": "alerts"})
         );
         let back: Dest = serde_json::from_value(dest_json(&d)).unwrap();
         assert_eq!(back, d);

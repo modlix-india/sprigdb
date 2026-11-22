@@ -155,6 +155,10 @@ impl Gate for GatewayGate {
         };
         self.data.allowed_named(p, &cat, db, stream, action)
     }
+
+    async fn limits(&self, p: &Principal) -> sprig_proto_kafka::broker::data::Limits {
+        self.data.limits(p).await
+    }
 }
 
 /// Puts engine-stored topics in front of `d`'s stores when the node has an

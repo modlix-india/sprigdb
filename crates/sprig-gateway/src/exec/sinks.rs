@@ -19,7 +19,7 @@ use bytes::Bytes;
 use sprig_auth::authz::{Action, Target};
 use sprig_catalog::ddl::{database_key, object_key};
 use sprig_catalog::pool_wait::Bounded as _;
-use sprig_catalog::store::{Namespace, ObjectKind, ObjectState};
+use sprig_catalog::store::ObjectKind;
 use sprig_catalog::version::VersionKind;
 use sprig_catalog::{CatalogLocator, TenantCatalog};
 use sprig_common::ids::{DbId, TenantId, UserId};
@@ -235,26 +235,6 @@ impl Host for GwHost<'_> {
         )
     }
 
-    fn stream(&self, db: u32, name: &str) -> Option<(u64, u32)> {
-        let st = self
-            .cat
-            .ext
-            .get::<sprig_streams::StreamsState>(sprig_streams::MODULE)?;
-        st.get(DbId(db), name, self.lctn())
-            .map(|s| (s.id.0, s.partitions))
-    }
-
-    fn table(&self, db: u32, name: &str) -> Option<u64> {
-        self.cat
-            .object(
-                DbId(db),
-                Namespace::Relation,
-                &object_key(ObjectKind::Table, name, self.lctn()),
-            )
-            .filter(|o| o.state == ObjectState::Active)
-            .map(|o| o.object_id.0)
-    }
-
     fn sink_admin(&self) -> bool {
         self.allows(Action::SinkAdmin)
     }
@@ -274,31 +254,6 @@ impl Host for GwHost<'_> {
         let lctn = self.lctn();
         let db_key = database_key(db_name, lctn);
         let name_key = object_key(ObjectKind::Table, name, lctn);
-        // `FROM STREAM t.changes` exports table t's
-        // rows: SELECT on t decides; when t's policies bind the owner, the
-        // worker delivers only the records they show (rls_filter).
-        if let Some(row) = self.cat.database(&db_key)
-            && let Some(st) = self
-                .cat
-                .ext
-                .get::<sprig_streams::StreamsState>(sprig_streams::MODULE)
-            && let Some(def) = st.get(row.db_id, name, lctn)
-            && def.kind == sprig_streams::model::StreamKind::Changes
-        {
-            return crate::tenant::rls_streams::change_topic_access(
-                g.as_ref(),
-                &self.cat,
-                def,
-                lctn,
-                &ts.principal.user,
-            )
-            .is_ok();
-        }
-        // A table's rows reach a sink only
-        // through its change topic (`CHANGES OF t`), which the worker
-        // filters batch by batch for the owner while t's policies bind it
-        // (sprig_sinks::rls_filter); SELECT on t decides, as for any
-        // reader. Before, a bound owner was refused.
         g.allows(
             Action::Select,
             Target::Named {
@@ -575,83 +530,10 @@ impl Host for GwHost<'_> {
             .collect())
     }
 
-    fn change_stream(&self, db: u32, table: u64) -> Option<(u64, u32)> {
-        let st = self
-            .cat
-            .ext
-            .get::<sprig_streams::StreamsState>(sprig_streams::MODULE)?;
-        st.all()
-            .find(|s| {
-                s.db.0 == db
-                    && s.kind == sprig_streams::model::StreamKind::Changes
-                    && s.source_object.is_some_and(|o| o.0 == table)
-            })
-            .map(|s| (s.id.0, s.partitions))
-    }
-
     fn fan_in(&self) -> bool {
-        // Checked against the latest grants in `fan_in_stream`: the
+        // Checked against the latest grants in `fan_in_queue`: the
         // session's snapshot may predate a GRANT or REVOKE it just ran.
         true
-    }
-
-    async fn fan_in_stream(
-        &mut self,
-        db: &str,
-        name: &str,
-        under: Option<&str>,
-    ) -> Result<Option<sprig_sinks::sql::FanInDef>> {
-        let svc = Arc::clone(
-            self.ts()
-                .ok_or_else(|| SprigError::internal("no tenant"))?
-                .services(),
-        );
-        let me = self.cat.tenant;
-        let fresh = crate::inherited::catalog(&svc, me).await?;
-        let user = self.ts().and_then(|t| t.principal.user_id);
-        let g = crate::tenant::authz::grants_of(&svc, &fresh, user);
-        if !g.unrestricted() && !g.allows(Action::FanIn, Target::Tenant) {
-            return Err(SprigError::new(
-                SprigCode::SinkPrivilege,
-                "Access denied; you need (at least one of) the SPRIG_FAN_IN privilege(s) for a \
-                 fan-in sink",
-            ));
-        }
-        let chain = crate::inherited::chain(&svc, &self.cat).await?;
-        let own = crate::inherited::state_of(&self.cat);
-        let Some(d) = crate::inherited::fanin::definition(&chain, &own, db, name) else {
-            return Ok(None);
-        };
-        let partitions = d
-            .definition
-            .get("partitions")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|p| u32::try_from(p).ok())
-            .unwrap_or(1);
-        let under = match under {
-            None => None,
-            Some(u) => {
-                let id = crate::inherited::tenant_by_name(&svc, u)
-                    .await?
-                    .ok_or_else(|| crate::inherited::target_err(format!("no tenant '{u}'")))?;
-                let e = crate::inherited::dir_entry(&svc, id)
-                    .await?
-                    .unwrap_or_default();
-                if id != me && !e.path_ids().contains(&me.0) {
-                    return Err(crate::inherited::target_err(format!(
-                        "tenant '{u}' isn't below this one"
-                    )));
-                }
-                Some(id.0)
-            }
-        };
-        let k = d.key();
-        Ok(Some(sprig_sinks::sql::FanInDef {
-            def_tenant: k.tenant.0,
-            def_object: k.object,
-            partitions,
-            under,
-        }))
     }
 
     // `FROM QUEUE q FAN IN`.

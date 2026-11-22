@@ -6,14 +6,12 @@
 //! slow a decision: channels run on spawned tasks and count their results
 //! in `sprig_approvals_notifications_total`.
 
-use sprig_catalog::pool_wait::Bounded as _;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use hyper::body::Bytes;
-use mysql_async::prelude::Queryable;
 use sprig_approvals::catalog::{CatalogRecStore, Subscription};
 use sprig_approvals::events::{Outbound, rfc3339};
 use sprig_approvals::gate::{Event, Hook};
@@ -23,9 +21,8 @@ use sprig_approvals::policy::kind_listed;
 use sprig_approvals::settings as keys;
 use sprig_approvals::smtp::{Mail, SmtpConfig, TlsFiles};
 use sprig_approvals::store::Filter;
-use sprig_catalog::CatalogLocator;
+use sprig_common::Result;
 use sprig_common::ids::TenantId;
-use sprig_common::{Result, SprigError};
 use sprig_settings::Value;
 
 use super::ControllerApprovals;
@@ -47,7 +44,6 @@ pub struct Secrets {
 /// The notification hook.
 pub struct Notifier {
     ctl: OnceLock<Arc<ControllerApprovals>>,
-    locator: Arc<dyn CatalogLocator>,
     records: Arc<dyn sprig_catalog::RecordStore>,
     secrets: Secrets,
     webhooks: OnceLock<Arc<super::webhook::Webhooks>>,
@@ -69,17 +65,12 @@ fn text(v: Option<sprig_settings::Resolved>) -> String {
 }
 
 impl Notifier {
-    /// A notifier reading catalogs through `locator` and subscriptions
-    /// from the tenants' catalog records in `records`.
+    /// A notifier reading subscriptions from the tenants' catalog records
+    /// in `records`.
     #[must_use]
-    pub fn new(
-        locator: Arc<dyn CatalogLocator>,
-        records: Arc<dyn sprig_catalog::RecordStore>,
-        secrets: Secrets,
-    ) -> Self {
+    pub fn new(records: Arc<dyn sprig_catalog::RecordStore>, secrets: Secrets) -> Self {
         Self {
             ctl: OnceLock::new(),
-            locator,
             records,
             secrets,
             webhooks: OnceLock::new(),
@@ -121,80 +112,6 @@ impl Notifier {
             auth,
             self.secrets.smtp_tls.clone(),
         )
-    }
-
-    /// Appends `body` to stream `sprig_recommendations` in `tenant`'s
-    /// database named by `approvals.stream_database`, if both exist.
-    async fn to_stream(&self, tenant: TenantId, body: &[u8]) -> Result<bool> {
-        let db_name = self.setting(keys::STREAM_DATABASE.key, Some(tenant)).await;
-        if db_name.is_empty() {
-            return Ok(false);
-        }
-        let ep = self.locator.writer(tenant).await?;
-        let schema = ep.store.schema().to_owned();
-        let mut c = ep
-            .pool
-            .get_conn_bounded()
-            .await
-            .map_err(|e| SprigError::internal("stream: catalog unavailable").with_source(e))?;
-        let db: Option<u32> =
-            sprig_catalog::store::rec::CoreReader::new(crate::catalog_records(), tenant)
-                .database_by_name(&db_name.to_lowercase())
-                .await?
-                .filter(|d| d.state == sprig_catalog::store::DbState::Active)
-                .map(|d| d.db_id.0);
-        let Some(db) = db else {
-            return Ok(false);
-        };
-        let st = sprig_streams::store::StreamsStore::new(schema.clone())
-            .load(&mut c)
-            .await?;
-        let Some(def) = st.get(sprig_common::ids::DbId(db), "sprig_recommendations", true) else {
-            return Ok(false);
-        };
-        let Some(slot) = def.outbox.first() else {
-            return Ok(false);
-        };
-        let shard = slot.schema(tenant, def.db).to_string();
-        let rec = sprig_streams::publish::Publish {
-            key: None,
-            value: Some(body.to_vec()),
-            headers: Some(r#"{"source":"sprig_approvals"}"#.into()),
-            partition: None,
-            ts_ms: None,
-        };
-        let Some(sql) = sprig_streams::publish::outbox_insert(def, Some(&shard), &[rec]) else {
-            return Ok(false);
-        };
-        c.query_drop(sql)
-            .await
-            .map_err(|e| SprigError::internal("stream: outbox insert").with_source(e))?;
-        Ok(true)
-    }
-
-    async fn streams(&self, ev: &Event, body: &[u8]) {
-        let mut tenants = Vec::new();
-        if let Some(t) = ev.rec.subject.tenant {
-            tenants.push(t);
-        }
-        let platform = self.setting(keys::PLATFORM_TENANT.key, None).await;
-        if !platform.is_empty()
-            && let Some(c) = self.ctl.get()
-            && let Ok(Some(e)) = c.directory().by_name(&platform).await
-            && !tenants.contains(&e.body().tenant_id)
-        {
-            tenants.push(e.body().tenant_id);
-        }
-        for t in tenants {
-            match self.to_stream(t, body).await {
-                Ok(true) => notified("stream", "sent"),
-                Ok(false) => {}
-                Err(e) => {
-                    notified("stream", "failed");
-                    tracing::warn!(tenant = %t, error = %e, "approvals: stream event not written");
-                }
-            }
-        }
     }
 
     /// The webhook destinations of `ev`: the platform URL, the subject
@@ -528,7 +445,6 @@ impl Hook for Notifier {
         let Ok(body) = serde_json::to_vec(&Outbound::of(ev, &studio)) else {
             return;
         };
-        self.streams(ev, &body).await;
         self.webhook(ev, Bytes::from(body)).await;
         if ev.kind.notify_now() && !ev.rec.advisory {
             self.email(ev).await;

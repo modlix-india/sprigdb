@@ -1,22 +1,7 @@
-//! Streams as the catalog and the sequencer see them: interfaces, data
-//! structures and storage.
-//!
-//! **Physical names (as built).** A stream's tables are named by its id,
-//! not its name: the outbox `__sprig_eo_<stream_id>`, the log
-//! `__sprig_sl_<stream_id>`. Stream names follow Kafka's topic rules (up
-//! to 249 characters, dots and dashes allowed), which MariaDB's 64-character
-//! identifiers can't hold, and change topics are named `<object>.changes`.
-//! Ids never change, so a rename later needs no table rename.
+//! Stream records and their small value types, shared by the engine's
+//! stream log, change-record envelopes and the Kafka front end.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
-
-use sprig_catalog::cache::ExtState;
-use sprig_common::ids::{DbId, GroupId, ObjectId, ShardId, TenantId};
-use sprig_common::names::SchemaName;
-
-/// `streams.stream_id`: an id from the tenant's object counter, so it can become `objects.object_id` once streams are catalog
-/// objects.
+/// A stream's id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StreamId(pub u64);
 
@@ -157,135 +142,6 @@ impl StreamState {
     }
 }
 
-/// One shard schema of a group, by id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ShardSlot {
-    /// The table group.
-    pub group: GroupId,
-    /// The shard.
-    pub shard: ShardId,
-}
-
-impl ShardSlot {
-    /// The physical schema of this slot in `db` of `tenant`.
-    #[must_use]
-    pub fn schema(&self, tenant: TenantId, db: DbId) -> SchemaName {
-        SchemaName::shard(tenant, db, self.group, self.shard)
-    }
-}
-
-/// A log shard: a shard schema of the stream's log group and the
-/// partitions it holds (the log group is sharded by partition,
-/// so each partition lives whole on one shard).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LogShard {
-    /// Where.
-    pub slot: ShardSlot,
-    /// The partitions it holds; empty means every partition.
-    pub partitions: Vec<PartitionNo>,
-}
-
-impl LogShard {
-    /// Whether partition `p` lives here.
-    #[must_use]
-    pub fn holds(&self, p: PartitionNo) -> bool {
-        self.partitions.is_empty() || self.partitions.contains(&p)
-    }
-}
-
-/// One row of `streams`, with what the gateway and the sequencer need.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamDef {
-    /// The id.
-    pub id: StreamId,
-    /// The logical database.
-    pub db: DbId,
-    /// The name (a Kafka topic name).
-    pub name: String,
-    /// Events or changes.
-    pub kind: StreamKind,
-    /// For a change topic: the watched object.
-    pub source_object: Option<ObjectId>,
-    /// For a change topic: the watched table's name (logical).
-    pub source_name: Option<String>,
-    /// Partitions; they only grow.
-    pub partitions: u32,
-    /// The event key's columns (documentation, and the attached group's
-    /// key check).
-    pub key_spec: Vec<String>,
-    /// The outbox's table group, when `ATTACHED TO GROUP OF` was given.
-    pub attached_group: Option<GroupId>,
-    /// The stream log's table group.
-    pub log_group: GroupId,
-    /// Kafka's `cleanup.policy`.
-    pub cleanup: Cleanup,
-    /// The record envelope.
-    pub envelope: Envelope,
-    /// The life cycle.
-    pub state: StreamState,
-    /// Where the outbox lives (event streams; empty for change topics).
-    pub outbox: Vec<ShardSlot>,
-    /// Where the log lives.
-    pub log: Vec<LogShard>,
-    /// When created (ms since the Unix epoch).
-    pub created_at_ms: u64,
-}
-
-impl StreamDef {
-    /// The outbox table's name (`__sprig_eo_<stream>`; by id,
-    /// see the module docs).
-    #[must_use]
-    pub fn outbox_table(&self) -> String {
-        outbox_table(self.id)
-    }
-
-    /// The log table's name.
-    #[must_use]
-    pub fn log_table(&self) -> String {
-        log_table(self.id)
-    }
-
-    /// The log shard holding partition `p`.
-    #[must_use]
-    pub fn log_shard_of(&self, p: PartitionNo) -> Option<&LogShard> {
-        self.log.iter().find(|l| l.holds(p))
-    }
-
-    /// The partitions of log shard `slot`.
-    #[must_use]
-    pub fn partitions_of(&self, slot: &ShardSlot) -> Vec<PartitionNo> {
-        let Some(l) = self.log.iter().find(|l| &l.slot == slot) else {
-            return Vec::new();
-        };
-        (0..self.partitions)
-            .map(PartitionNo)
-            .filter(|p| l.holds(*p))
-            .collect()
-    }
-}
-
-/// The prefix of every stream outbox's name.
-pub const OUTBOX_PREFIX: &str = "__sprig_eo_";
-
-/// `__sprig_eo_<id>`.
-#[must_use]
-pub fn outbox_table(id: StreamId) -> String {
-    format!("{OUTBOX_PREFIX}{}", id.0)
-}
-
-/// `__sprig_sl_<id>`.
-#[must_use]
-pub fn log_table(id: StreamId) -> String {
-    format!("__sprig_sl_{}", id.0)
-}
-
-/// The checkpoint table, one per log shard schema.
-pub const CKPT_TABLE: &str = "__sprig_sl_ckpt";
-
-/// The checkpoint row holding a log shard's sequencer state (leader epoch
-/// and feed position) rather than one partition's offsets.
-pub const SHARD_ROW: u32 = u32::MAX;
-
 /// The change topic of object `object`: `<object>.changes`.
 #[must_use]
 pub fn change_topic_name(object: &str) -> String {
@@ -388,89 +244,6 @@ pub struct NewRecord {
     pub source: Source,
 }
 
-/// The `streams` module in a catalog snapshot: the tenant's live streams,
-/// by database and name.
-#[derive(Debug, Clone, Default)]
-pub struct StreamsState {
-    /// The module's tables exist.
-    pub migrated: bool,
-    by_db: HashMap<DbId, BTreeMap<String, Arc<StreamDef>>>,
-}
-
-impl StreamsState {
-    /// A state with `streams` (the module migrated).
-    #[must_use]
-    pub fn new(streams: Vec<StreamDef>) -> Self {
-        let mut by_db: HashMap<DbId, BTreeMap<String, Arc<StreamDef>>> = HashMap::new();
-        for s in streams {
-            by_db
-                .entry(s.db)
-                .or_default()
-                .insert(s.name.clone(), Arc::new(s));
-        }
-        Self {
-            migrated: true,
-            by_db,
-        }
-    }
-
-    /// Whether there is no stream at all.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.by_db.values().all(BTreeMap::is_empty)
-    }
-
-    /// Stream `name` of `db` (exact name; with `lctn`, case-insensitive),
-    /// in any state.
-    #[must_use]
-    pub fn get(&self, db: DbId, name: &str, lctn: bool) -> Option<&Arc<StreamDef>> {
-        let m = self.by_db.get(&db)?;
-        if let Some(s) = m.get(name) {
-            return Some(s);
-        }
-        if lctn {
-            return m.values().find(|s| s.name.eq_ignore_ascii_case(name));
-        }
-        None
-    }
-
-    /// The streams of `db`, by name.
-    pub fn of_db(&self, db: DbId) -> impl Iterator<Item = &Arc<StreamDef>> {
-        self.by_db.get(&db).into_iter().flat_map(BTreeMap::values)
-    }
-
-    /// Every stream.
-    pub fn all(&self) -> impl Iterator<Item = &Arc<StreamDef>> {
-        self.by_db.values().flat_map(BTreeMap::values)
-    }
-
-    /// The change topic of object `object`, if any.
-    #[must_use]
-    pub fn change_topic_of(&self, db: DbId, object: ObjectId) -> Option<&Arc<StreamDef>> {
-        self.of_db(db)
-            .find(|s| s.kind == StreamKind::Changes && s.source_object == Some(object))
-    }
-
-    /// Whether `word` (an identifier as written) names a stream of any
-    /// database: the gateway's quick test before it looks closer.
-    #[must_use]
-    pub fn mentions(&self, word: &str, lctn: bool) -> bool {
-        self.all().any(|s| {
-            if lctn {
-                s.name.eq_ignore_ascii_case(word)
-            } else {
-                s.name == word
-            }
-        })
-    }
-}
-
-impl ExtState for StreamsState {
-    fn bytes(&self) -> usize {
-        self.all().map(|s| 256 + s.name.len()).sum()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,7 +256,6 @@ mod tests {
         assert!(!valid_name(".."));
         assert!(!valid_name("a b"));
         assert!(!valid_name(&"x".repeat(250)));
-        assert_eq!(outbox_table(StreamId(41)), "__sprig_eo_41");
         assert_eq!(change_topic_name("orders"), "orders.changes");
         let e = Source::Outbox([7; 16]).to_bytes();
         assert_eq!(e.len(), 17);

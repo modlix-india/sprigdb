@@ -474,7 +474,7 @@ impl PassSession {
         };
         let svc = Arc::clone(ts.services());
         let tenant = ts.tenant;
-        let streams = super::logic::logic_streams(ts, &catalog, row.db_id);
+        let streams = sprig_logic::service::StreamList::new();
         // The DDL layout's shards: the table's group, or every shard of the
         // database; one shard (the template) for unsharded databases.
         let template = ts.schema_of(Some(&db));
