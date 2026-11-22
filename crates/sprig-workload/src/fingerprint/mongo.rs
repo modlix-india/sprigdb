@@ -15,9 +15,8 @@
 //!   `json_path` predicate per condition on the `doc` column with `func`
 //!   `mongo` (a path no document has held an array on) or `mongo_multikey`
 //!   (a path crossing an array) and `cmp` the condition (`eq`, `in`,
-//!   `range`, `is_null`, `ne`), and the sort paths as `order_by`. Automatic
-//!   indexing's document candidates read these (`sprig_advisor::autoindex::doc`);
-//!   the SQL candidate generator ignores them (they aren't SQL columns);
+//!   `range`, `is_null`, `ne`), and the sort paths as `order_by` (they
+//!   aren't SQL columns);
 //! - **literals** fill one slot per condition, in order: one value, an
 //!   `$in` list, or nothing (`null`). A sample keeps the values as
 //!   [`SampleValue`]s whose kind is the BSON class (number, string, bool,

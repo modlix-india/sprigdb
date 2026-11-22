@@ -254,14 +254,12 @@ impl CommitTicket {
         self.cts
     }
 
-    /// The commit log's ticket: the transaction's own entry, or the entry
+    /// The commit log's ticket: the transaction's own entry (across units:
+    /// the entry carrying its notes, else its first unit's), or the entry
     /// of the newest pending version it read.
     #[must_use]
     pub fn log_ticket(&self) -> Option<&Ticket> {
-        match &self.ticket {
-            DurableTicket::Log(t) => Some(t),
-            _ => None,
-        }
+        self.ticket.first_log()
     }
 
     /// What the reply waits for.
@@ -646,9 +644,7 @@ impl Txn {
             .stats
             .pending_reads
             .fetch_add(1, Ordering::Relaxed);
-        if ticket.index() > self.dep.index() {
-            self.dep = ticket.clone();
-        }
+        self.dep = std::mem::take(&mut self.dep).max(ticket.clone());
     }
 
     // ----- reads ----------------------------------------------------------
@@ -1429,7 +1425,7 @@ impl Txn {
             let Some(sub) = between(&pos, &goal) else {
                 break;
             };
-            let mut seq = self.shared().visible_ts();
+            let mut seq = self.shared().commit_seq();
             let (mut rows, mut exhausted) = self.scan_rows(&sub, dir, n, Ts::MAX, si)?;
             // How far this round looks: to the last row read, or to the
             // range's end when the rows ran out.
@@ -1457,7 +1453,7 @@ impl Txn {
                     };
                     stopped = Some(k);
                 }
-                let now = self.shared().visible_ts();
+                let now = self.shared().commit_seq();
                 if now == seq {
                     if let Some(p) = &stopped {
                         rows.retain(|r| if fwd { r.key < *p } else { r.key > *p });
@@ -1508,7 +1504,7 @@ impl Txn {
                         None => continue,
                     },
                 };
-                if grant.waited || self.shared().visible_ts() != seq {
+                if grant.waited || self.shared().commit_seq() != seq {
                     // The row may have changed since it was read.
                     let (ts, now) = self.current_version(&key)?;
                     self.check_version(si, ts)?;

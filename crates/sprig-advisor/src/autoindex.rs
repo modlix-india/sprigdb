@@ -1,47 +1,10 @@
-//! Automatic indexing: the decision logic that turns the
-//! workload into secondary indexes, run by the controller.
+//! What is left of automatic indexing: two settings other code still reads.
 //!
-//! What exists:
-//!
-//! - [`model`]: definitions, origins, candidates and the canonical form
-//!   that names an index `sprig_auto_<8 hex>`;
-//! - [`store`]: the catalog tables as the `autoindex` migration module,
-//!   typed rows and access, the state machine and the decision hook;
-//! - [`settings`]: every `auto_index.*` key in the registry;
-//! - [`stats`]: MariaDB's engine-independent statistics, the `JSON_HB`
-//!   histogram parser, selectivity estimates and the throttled analyze job;
-//! - [`candidates`]: candidate generation, covering, merging and the
-//!   coverage check against existing indexes with its `EXPLAIN` probe;
-//! - [`cost`]: the cost model, the gates, selection under budgets and
-//!   replacement;
-//! - [`policy`]: per-object setting resolution, budgets at each scope,
-//!   bound tightening and the churn dampers;
-//! - [`replay`] and [`validate`]: the replay harness and the validators;
-//! - [`rollout`]: online builds, windows, slots, lock-safe retries,
-//!   aborts, the Galera method until the mover exists, and the rollout
-//!   state machine;
-//! - [`observe`]: the watch, usage tracking, retire and drop, and the drift
-//!   reconciler.
-//!
-//! - [`qualify`]: trigger evaluation, the fast scan trigger included;
-//! - [`evaluate`]: one evaluation of one tenant, from the workload window
-//!   to candidates routed to validation or recommendations, paced by
-//!   `auto_index.eval_interval_minutes`.
+//! Automatic indexing built, validated and dropped MariaDB indexes on
+//! tables' MariaDB shard tables. Engine tables have none, so the pipeline,
+//! its store (`auto_indexes`, `auto_index_candidates`,
+//! `auto_index_validations`, `index_origins`, `index_usage`) and its
+//! `auto_index.*` keys are gone; [`settings`] keeps the job scheduler's
+//! build-slot key and the sharding advisor's lookup threshold.
 
-pub mod candidates;
-pub mod cost;
-pub mod doc;
-pub mod evaluate;
-#[cfg(test)]
-mod fixtures;
-pub mod kv;
-pub mod model;
-pub mod observe;
-pub mod policy;
-pub mod qualify;
-pub mod replay;
-pub mod rollout;
 pub mod settings;
-pub mod stats;
-pub mod store;
-pub mod validate;

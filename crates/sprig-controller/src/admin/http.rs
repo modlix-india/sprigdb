@@ -26,7 +26,6 @@ use super::types::{
     SetBoundsRequest, SetClusterNodesRequest, SetSettingRequest, SettingOp, SettingWrite,
 };
 use super::{AdminService, invalid};
-use crate::autoindex_admin::view::{Action as IndexAction, IndexActionRequest};
 
 /// The routes' shared state.
 struct App {
@@ -111,28 +110,11 @@ fn routes(app: Arc<App>) -> Router {
             "/admin/v1/tenants/{name}/accounts",
             get(export_accounts).post(import_accounts),
         )
-        .route("/admin/v1/tenants/{name}/indexes", get(list_indexes))
-        .route(
-            "/admin/v1/tenants/{name}/indexes/{index}",
-            get(get_index).post(index_method),
-        )
-        .route(
-            "/admin/v1/tenants/{name}/recommendations",
-            get(list_recommendations),
-        )
-        .route(
-            "/admin/v1/tenants/{name}/queries/{fingerprint}",
-            get(explain_query),
-        )
         .route("/admin/v1/mover/jobs", get(list_moves).post(submit_move))
         .route("/admin/v1/mover/jobs/{id}", get(get_move).post(move_method))
         .route("/admin/v1/jobs", get(list_jobs))
         .route("/admin/v1/jobs/{id}", get(get_job).post(job_method))
         .route("/admin/v1/tenants/{name}/placement", get(explain_placement))
-        .route(
-            "/admin/v1/tenants/{name}/shards",
-            get(list_shards).post(submit_shard_job),
-        )
         .route("/admin/v1/tenants/{name}/search", get(list_search))
         .route(
             "/admin/v1/tenants/{name}/search/{index}",
@@ -140,13 +122,6 @@ fn routes(app: Arc<App>) -> Router {
         )
         .route("/admin/v1/tenants/{name}/graphs", get(list_graphs))
         .route("/admin/v1/tenants/{name}/graphs/{graph}", get(show_graph))
-        .route(
-            "/admin/v1/tenants/{name}/graphs/{graph}/partition",
-            get(graph_partition),
-        )
-        .route("/admin/v1/tenants/{name}/advisor", get(advisor_show))
-        .route("/admin/v1/tenants/{name}/advisor:run", post(advisor_run))
-        .route("/admin/v1/tenants/{name}/advisor:apply", post(advisor_apply))
         .route(
             "/admin/v1/tenants/{name}/pin",
             post(pin_tenant_cluster).delete(unpin_tenant_cluster),
@@ -1097,87 +1072,6 @@ async fn setting_method(
     respond(r.await)
 }
 
-async fn list_indexes(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    UrlPath(name): UrlPath<String>,
-    uri: Uri,
-) -> Response {
-    let r = async {
-        authorize_gateway(&app, &headers)?;
-        app.svc.list_indexes(&name, query(&uri)?, false).await
-    };
-    respond(r.await)
-}
-
-async fn list_recommendations(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    UrlPath(name): UrlPath<String>,
-    uri: Uri,
-) -> Response {
-    let r = async {
-        authorize_gateway(&app, &headers)?;
-        app.svc.list_indexes(&name, query(&uri)?, true).await
-    };
-    respond(r.await)
-}
-
-async fn get_index(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    UrlPath((name, index)): UrlPath<(String, String)>,
-) -> Response {
-    let r = async {
-        authorize_gateway(&app, &headers)?;
-        app.svc.get_index(&name, &index).await
-    };
-    respond(r.await)
-}
-
-/// `{index}:approve`, `:reject`, `:drop`, `:pin`, `:unpin` (and the
-/// alternative names `:apply`, `:dismiss`, `:freeze`, `:unfreeze`).
-async fn index_method(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    UrlPath((name, index)): UrlPath<(String, String)>,
-    body: Bytes,
-) -> Response {
-    let r = async {
-        authorize_gateway(&app, &headers)?;
-        let Some((index, action)) = index
-            .rsplit_once(':')
-            .and_then(|(i, m)| Some((i, IndexAction::parse(m)?)))
-        else {
-            return Err(invalid(format!(
-                "POST /admin/v1/tenants/{name}/indexes/{index}: expected {{index}}:approve, \
-                 :reject, :drop, :pin or :unpin"
-            )));
-        };
-        let req: IndexActionRequest = parse(&body, true)?;
-        app.svc.index_action(&name, index, action, &req).await
-    };
-    respond(r.await)
-}
-
-/// `{fingerprint}:explain`.
-async fn explain_query(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    UrlPath((name, fp)): UrlPath<(String, String)>,
-) -> Response {
-    let r = async {
-        authorize_gateway(&app, &headers)?;
-        let Some((fp, "explain")) = fp.rsplit_once(':') else {
-            return Err(invalid(format!(
-                "GET /admin/v1/tenants/{name}/queries/{fp}: expected {{fingerprint}}:explain"
-            )));
-        };
-        app.svc.explain_query(&name, fp).await
-    };
-    respond(r.await)
-}
-
 async fn pin_tenant_cluster(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -1322,98 +1216,6 @@ async fn show_graph(
     let r = async {
         authorize(&app, &headers)?;
         app.svc.show_graph(&name, &graph).await
-    };
-    respond(r.await)
-}
-
-async fn graph_partition(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    UrlPath((name, graph)): UrlPath<(String, String)>,
-) -> Response {
-    let r = async {
-        authorize(&app, &headers)?;
-        app.svc.graph_partition(&name, &graph).await
-    };
-    respond(r.await)
-}
-
-async fn list_shards(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    UrlPath(name): UrlPath<String>,
-) -> Response {
-    let r = async {
-        // Studio's shards view reads maps over the gateway credential.
-        authorize_gateway(&app, &headers)?;
-        app.svc.list_shards(&name).await
-    };
-    respond(r.await)
-}
-
-async fn submit_shard_job(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    UrlPath(name): UrlPath<String>,
-    body: Bytes,
-) -> Response {
-    let r = async {
-        authorize(&app, &headers)?;
-        let req: super::sharding_admin::ShardJobRequest = parse_required(&body)?;
-        app.svc.submit_shard_job(&name, req).await
-    };
-    respond(r.await)
-}
-
-/// `GET /admin/v1/tenants/{name}/advisor?run=`.
-#[derive(Debug, Default, serde::Deserialize)]
-struct AdvisorQuery {
-    run: Option<String>,
-}
-
-async fn advisor_show(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    UrlPath(name): UrlPath<String>,
-    uri: Uri,
-) -> Response {
-    let r = async {
-        authorize_gateway(&app, &headers)?;
-        let q: AdvisorQuery = query(&uri)?;
-        let run = q
-            .run
-            .map(|r| {
-                r.parse::<u64>()
-                    .map_err(|_| invalid(format!("run {r:?} is not a number")))
-            })
-            .transpose()?;
-        app.svc.advisor_show(&name, run).await
-    };
-    respond(r.await)
-}
-
-async fn advisor_run(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    UrlPath(name): UrlPath<String>,
-) -> Response {
-    let r = async {
-        authorize(&app, &headers)?;
-        app.svc.advisor_run(&name).await
-    };
-    respond(r.await)
-}
-
-async fn advisor_apply(
-    State(app): State<Arc<App>>,
-    headers: HeaderMap,
-    UrlPath(name): UrlPath<String>,
-    body: Bytes,
-) -> Response {
-    let r = async {
-        authorize(&app, &headers)?;
-        let req: super::sharding_admin::AdvisorApplyRequest = parse_required(&body)?;
-        app.svc.advisor_apply(&name, req).await
     };
     respond(r.await)
 }

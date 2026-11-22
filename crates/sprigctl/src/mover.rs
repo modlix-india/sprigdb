@@ -42,19 +42,14 @@ struct MoveJobs {
 
 /// `sprigctl shard`.
 pub(crate) fn shard_group() -> Command {
-    crate::sharding::shard_subcommands(Command::new("shard"))
+    Command::new("shard")
         .about("Shards")
         .subcommand_required(true)
         .arg_required_else_help(true)
         .subcommand(
             Command::new("move")
-                .about(
-                    "Move one shard of a table group (<tenant> <group> <shard>), or a tenant \
-                     without table groups whole (<tenant>), to another cluster, online",
-                )
+                .about("Move a tenant whole (<tenant>) to another cluster, online")
                 .arg(Arg::new("tenant").required(true).help("The tenant"))
-                .arg(Arg::new("group").help("The table group id (a shard move)"))
-                .arg(Arg::new("shard").help("The shard id (a shard move)"))
                 .arg(
                     Arg::new("to")
                         .long("to")

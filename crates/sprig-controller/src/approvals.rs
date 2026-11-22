@@ -42,7 +42,6 @@ pub trait Applier: Send + Sync {
 }
 
 pub mod http;
-pub mod index;
 pub mod notify;
 pub mod service;
 pub mod webhook;

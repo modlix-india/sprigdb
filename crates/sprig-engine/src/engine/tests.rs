@@ -16,8 +16,12 @@ fn cfg(dir: &Path, store: StoreKind) -> EngineConfig {
 }
 
 fn row_key(id: i32) -> Vec<u8> {
+    row_key_in(42, id)
+}
+
+fn row_key_in(tenant: u64, id: i32) -> Vec<u8> {
     let mut k = KeyPrefix {
-        tenant: 42,
+        tenant,
         shard: 0,
         object: 1,
         kind: kind::PRIMARY,
@@ -40,8 +44,12 @@ fn put(e: &Engine, id: i32, v: &str, d: Durability) -> crate::txn::CommitTicket 
 }
 
 fn get(e: &Engine, id: i32) -> Option<Vec<u8>> {
+    get_in(e, 42, id)
+}
+
+fn get_in(e: &Engine, tenant: u64, id: i32) -> Option<Vec<u8>> {
     let mut t = e.begin(TxnOptions::default()).unwrap();
-    t.get(&row_key(id), ReadMode::Snapshot)
+    t.get(&row_key_in(tenant, id), ReadMode::Snapshot)
         .unwrap()
         .expect_ready()
         .unwrap()
@@ -91,7 +99,7 @@ fn round_trip_mem() {
 /// loses its memtables (WAL off, no flush on close). Every acknowledged
 /// commit is back after recovery, and no commit is partial.
 fn crash_round(store: StoreKind, seed: u64, checkpoint_at: Option<i32>) -> u64 {
-    crash_round_with(store, seed, checkpoint_at.as_slice(), 0, None)
+    crash_round_with(store, seed, checkpoint_at.as_slice(), 0, None, 42)
 }
 
 /// One crash round. Each value is padded with `pad` bytes; `log_file` sets
@@ -102,6 +110,7 @@ fn crash_round_with(
     checkpoints: &[i32],
     pad: usize,
     log_file: Option<u64>,
+    b_tenant: u64,
 ) -> u64 {
     let dir = TempDir::new("crash");
     let sim = SimDisk::new();
@@ -139,10 +148,11 @@ fn crash_round_with(
                 })
                 .unwrap();
             t.put(row_key(i), value('a', i)).unwrap();
-            t.put(row_key(10_000 + i), value('b', i)).unwrap();
+            t.put(row_key_in(b_tenant, 10_000 + i), value('b', i))
+                .unwrap();
             let tk = t.commit().unwrap();
             if d.needs_sync() {
-                tk.log_ticket().unwrap().wait().unwrap();
+                tk.wait().unwrap();
                 acked.push(i);
             }
         }
@@ -161,7 +171,7 @@ fn crash_round_with(
     for i in 0..120 {
         assert_eq!(
             get(&e, i).is_some(),
-            get(&e, 10_000 + i).is_some(),
+            get_in(&e, b_tenant, 10_000 + i).is_some(),
             "seed {seed}: partial commit {i}"
         );
     }
@@ -194,9 +204,238 @@ fn crash_simulation_after_log_files_were_deleted() {
             &[12, 13, 25, 33, 38],
             48 << 10,
             Some(1 << 20),
+            42,
         );
     }
     assert!(lost > 0, "the crash simulation lost nothing");
+}
+
+/// Each commit writes one row of tenant 42 and one of tenant 43: two
+/// units, one atomic log write. After a crash both rows are there or
+/// neither is, and every acknowledged pair is there.
+#[test]
+fn crash_simulation_across_units() {
+    let mut lost = 0;
+    for seed in 1..=25 {
+        lost += crash_round_with(
+            if seed % 2 == 0 {
+                StoreKind::Rocks
+            } else {
+                StoreKind::Mem
+            },
+            seed,
+            if seed % 3 == 0 { &[20] } else { &[] },
+            0,
+            None,
+            43,
+        );
+    }
+    assert!(lost > 0, "the crash simulation lost nothing");
+}
+
+/// Small files and checkpoints that delete them, across units.
+#[test]
+fn crash_simulation_across_units_after_log_files_were_deleted() {
+    for seed in 1..=6 {
+        crash_round_with(
+            StoreKind::Rocks,
+            seed,
+            &[12, 13, 25, 33, 38],
+            48 << 10,
+            Some(1 << 20),
+            43,
+        );
+    }
+}
+
+/// Every tenant is its own unit with its own log and applied index; a
+/// transaction over two tenants commits on both at one timestamp.
+#[test]
+fn each_tenant_is_its_own_unit() {
+    let dir = TempDir::new("units");
+    let e = Engine::open(cfg(dir.path(), StoreKind::Rocks)).unwrap();
+    assert_eq!(Engine::unit_of_tenant(42), UnitId(42));
+    assert_eq!(Engine::unit_of_tenant(keys::META_TENANT), NODE_UNIT);
+    assert_eq!(e.unit_of_key(&row_key_in(7, 1)), UnitId(7));
+    assert_eq!(e.unit_of_key(&keys::unit_meta_key(9, b"x")), UnitId(9));
+    assert_eq!(e.unit_of_key(b"short"), NODE_UNIT);
+    for i in 0..5 {
+        put(&e, i, "a", Durability::Local).wait().unwrap();
+    }
+    let mut t = e.begin(TxnOptions::default()).unwrap();
+    t.put(row_key_in(43, 1), b"b".to_vec()).unwrap();
+    t.commit().unwrap().wait().unwrap();
+    let c = e.consensus();
+    assert_eq!(c.durable_index(UnitId(42)), 5);
+    assert_eq!(c.durable_index(UnitId(43)), 1);
+    // One transaction, two units.
+    let mut t = e.begin(TxnOptions::default()).unwrap();
+    t.put(row_key_in(42, 100), b"x".to_vec()).unwrap();
+    t.put(row_key_in(43, 100), b"y".to_vec()).unwrap();
+    let tk = t.commit().unwrap();
+    assert!(matches!(
+        tk.durable_ticket(),
+        crate::txn::DurableTicket::Many(p) if p.len() == 2
+    ));
+    tk.wait().unwrap();
+    assert_eq!(c.durable_index(UnitId(42)), 6);
+    assert_eq!(c.durable_index(UnitId(43)), 2);
+    assert_eq!(get_in(&e, 42, 100).as_deref(), Some(&b"x"[..]));
+    assert_eq!(get_in(&e, 43, 100).as_deref(), Some(&b"y"[..]));
+    // Both versions carry the one commit timestamp.
+    let ts = |tenant| {
+        let lo = row_key_in(tenant, 100);
+        let mut it = e.store().iter(
+            Cf::Data,
+            crate::store::IterOpts::range(&keys::KeyRange::prefix(&lo)),
+        );
+        it.seek(&lo);
+        keys::split_version(it.key()).unwrap().1
+    };
+    assert_eq!(ts(42), ts(43));
+    drop(e);
+    let e = Engine::open(cfg(dir.path(), StoreKind::Rocks)).unwrap();
+    assert_eq!(get_in(&e, 43, 100).as_deref(), Some(&b"y"[..]));
+    let units: Vec<UnitId> = e.units().into_iter().map(|(u, _)| u).collect();
+    assert!(units.contains(&UnitId(42)) && units.contains(&UnitId(43)));
+    // New commits continue each unit's own sequence.
+    let t = put(&e, 200, "z", Durability::Local);
+    assert_eq!(t.log_ticket().unwrap().index(), 7);
+}
+
+/// A read view sees every commit below it on every unit, even when
+/// commits on different units publish out of timestamp order.
+#[test]
+fn read_views_are_consistent_across_units() {
+    let dir = TempDir::new("views");
+    let e = Engine::open(cfg(dir.path(), StoreKind::Mem)).unwrap();
+    std::thread::scope(|s| {
+        for w in 0..4u64 {
+            let e = e.clone();
+            s.spawn(move || {
+                for i in 0..200 {
+                    // Writer w moves a counter from tenant 50+w to tenant 60+w.
+                    let mut t = e.begin(TxnOptions::default()).unwrap();
+                    t.put(row_key_in(50 + w, 0), i.to_string().into_bytes())
+                        .unwrap();
+                    t.put(row_key_in(60 + w, 0), i.to_string().into_bytes())
+                        .unwrap();
+                    t.commit().unwrap();
+                }
+            });
+        }
+        for _ in 0..2 {
+            let e = e.clone();
+            s.spawn(move || {
+                for _ in 0..400 {
+                    let mut t = e.begin(TxnOptions::default()).unwrap();
+                    for w in 0..4u64 {
+                        let a = t.get_snapshot(&row_key_in(50 + w, 0)).unwrap();
+                        let b = t.get_snapshot(&row_key_in(60 + w, 0)).unwrap();
+                        assert_eq!(a, b, "a read view saw half of a commit across units");
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// A data directory from before units (one unit, numbered 1, holding
+/// every tenant) opens: the node unit continues unit 1's index sequence
+/// and takes its observer floors.
+#[test]
+fn a_one_unit_data_directory_moves_to_units() {
+    let dir = TempDir::new("legacy");
+    let c = cfg(dir.path(), StoreKind::Rocks);
+    {
+        let e = Engine::open(c.clone()).unwrap();
+        // What the old engine wrote: every commit on unit 1.
+        for i in 0..9 {
+            let mut p = log::Payload::with_capacity(32);
+            p.put(
+                Cf::Data,
+                &keys::versioned(&row_key_in(5, i), keys::Ts(1 << 20)),
+                b"\x01v",
+            );
+            e.consensus()
+                .propose(LEGACY_UNIT, p.into_bytes(), Durability::Local)
+                .unwrap()
+                .wait_applied()
+                .unwrap();
+        }
+        let mut b = StoreBatch::new();
+        // A queue message where the old engine kept it.
+        let mut old = KeyPrefix {
+            tenant: keys::META_TENANT,
+            shard: 0,
+            object: keys::QUEUES_OBJECT,
+            kind: kind::ELEMENTS,
+            index: 0,
+        }
+        .to_vec();
+        old.extend_from_slice(&5u64.to_be_bytes());
+        old.extend_from_slice(&3u32.to_be_bytes());
+        old.extend_from_slice(b"msg");
+        b.put(Cf::Data, old, b"body".to_vec());
+        b.put(
+            Cf::Local,
+            floor_key(LEGACY_UNIT, "streams"),
+            7u64.to_be_bytes(),
+        );
+        b.delete(Cf::Data, keys::unit_meta_key(NODE_UNIT.0, LAYOUT));
+        e.store().write(&b, WalMode::Sync).unwrap();
+    }
+    let e = Engine::open(c.clone()).unwrap();
+    assert_eq!(e.log_floor("streams"), Some(7));
+    assert_eq!(e.last_applied(), 9);
+    let mut moved = KeyPrefix {
+        tenant: 5,
+        shard: 0,
+        object: keys::QUEUES_OBJECT,
+        kind: kind::ELEMENTS,
+        index: 0,
+    }
+    .to_vec();
+    moved.extend_from_slice(&3u32.to_be_bytes());
+    moved.extend_from_slice(b"msg");
+    let got = e
+        .store()
+        .get(Cf::Data, &moved, ReadTier::All)
+        .unwrap()
+        .expect_ready()
+        .unwrap();
+    assert_eq!(got.as_deref(), Some(&b"body"[..]));
+    assert_eq!(e.unit_of_key(&moved), UnitId(5));
+    assert!(keys::is_unversioned(&moved));
+    let all = e.store().iter(
+        Cf::Data,
+        crate::store::IterOpts::range(&keys::KeyRange::prefix(&keys::META_TENANT.to_be_bytes())),
+    );
+    let mut all = all;
+    all.seek_to_first();
+    while all.valid() {
+        assert!(
+            u32::from_be_bytes(all.key()[12..16].try_into().unwrap()) != keys::QUEUES_OBJECT,
+            "a queue message stayed under the reserved tenant"
+        );
+        all.next();
+    }
+    drop(all);
+    let t = e
+        .consensus()
+        .propose(
+            NODE_UNIT,
+            log::Payload::with_capacity(0).into_bytes(),
+            Durability::Local,
+        )
+        .unwrap();
+    assert_eq!(t.index(), 10);
+    t.wait_applied().unwrap();
+    drop(e);
+    // Once moved, never again.
+    let e = Engine::open(c).unwrap();
+    assert_eq!(e.last_applied(), 10);
+    assert_eq!(e.log_floor("streams"), Some(7));
 }
 
 #[test]
@@ -341,7 +580,12 @@ fn version_gc_runs_at_the_watermark(store: StoreKind) {
     e.set_version_gc(rule.clone());
     let w = e.txn_shared().now();
     e.set_gc_watermark(w);
-    put(&e, 1, "d", Durability::Local).wait().unwrap();
+    // Applied, not only durable: the compaction must see "d" in the store.
+    put(&e, 1, "d", Durability::Local)
+        .log_ticket()
+        .unwrap()
+        .wait_applied()
+        .unwrap();
     e.checkpoint().unwrap();
     e.store().compact_all().unwrap();
     // "d" is above the watermark, "c" is the floor; "a" and "b" go.
@@ -383,7 +627,7 @@ fn mem_store_checkpoint_keeps_the_log() {
 struct Notes(std::sync::Mutex<Vec<(u64, Vec<u8>)>>);
 
 impl crate::observe::ApplyObserver for Notes {
-    fn applied(&self, entries: &[LogEntry]) {
+    fn applied(&self, _: UnitId, entries: &[LogEntry]) {
         let mut g = self.0.lock().unwrap();
         for e in entries {
             for n in log::payload::notes(&e.data).unwrap() {

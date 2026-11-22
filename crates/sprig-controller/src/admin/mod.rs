@@ -29,7 +29,6 @@
 //! | `Tenants.MoveTenant`, `PinTenant`, `UnpinTenant`, traffic | `/admin/v1/tenants/{name}:move\|:pin\|:unpin`, `.../move`, `.../traffic`, `/admin/v1/traffic/reports` ([`dcmove`]) |
 //! | `Jobs.ListJobs`, `GetJob`, `CancelJob` | `/admin/v1/jobs[/{job_id}[:cancel]]` ([`jobs`]) |
 //! | `Settings.*` | `/admin/v1/settings[/{key}]`, `/admin/v1/tenants/{name}/settings` ([`crate::settings_admin`]) |
-//! | `Indexes.*`, `Explain.ExplainQuery` | `/admin/v1/tenants/{name}/indexes[/{index}[:action]]`, `.../recommendations`, `.../queries/{fingerprint}:explain` ([`crate::autoindex_admin`]) |
 //!
 //! Settings writes at `global`, `dc` and `cluster` scope are answered only
 //! by the DC leader (or, for `global`, a controller leading the global
@@ -54,8 +53,8 @@ pub mod jobs;
 pub mod mover;
 pub mod placement_admin;
 // An operator's errant_extract and node_rebuild.
+pub mod graph_admin;
 pub mod recovery;
-pub mod sharding_admin;
 // sprigctl search.
 mod search_admin;
 pub mod txn_admin;
@@ -73,11 +72,6 @@ use sprig_meta::{Cmp, Consistency, MetaStore, Tier, elect};
 use sprig_provision::{ExternalProvisioner, RegisterCluster, unsupported};
 use tokio::sync::watch;
 
-use crate::autoindex_admin::view::{
-    Action as IndexAction, IndexActionRequest, IndexActionResponse, IndexDetail,
-    ListIndexesResponse, QueryExplanation,
-};
-use crate::autoindex_admin::{AutoIndexAdmin, ListIndexesQuery};
 use crate::dc::{self, DcKind, DcRegistration, Registered};
 use crate::monitor::ClusterMonitor;
 use crate::runtime::{Status, Stores};
@@ -113,11 +107,10 @@ pub struct AdminService {
     tenants: Option<Arc<dyn TenantAdmin>>,
     users: Option<Arc<dyn UserAdmin>>,
     settings: Option<Arc<dyn SettingsAdmin>>,
-    indexes: Option<Arc<dyn AutoIndexAdmin>>,
     placement: Option<Arc<crate::balancer_loop::BalancerLoop>>,
     moves: Option<Arc<crate::migrate::DcMoves>>,
     failover: Option<Arc<crate::failover::role::FailoverRole>>,
-    sharding: Option<Arc<crate::sharding::ShardingLoop>>,
+    graphs: Option<Arc<crate::graph_views::GraphViews>>,
     residency: Option<Arc<crate::residency::Residency>>,
     /// The in-doubt transaction calls, built on first use.
     txn: std::sync::OnceLock<Arc<txn_admin::TxnAdmin>>,
@@ -153,12 +146,11 @@ impl AdminService {
             tenants: None,
             users: None,
             settings: None,
-            indexes: None,
             placement: None,
             moves: None,
             failover: None,
             residency: None,
-            sharding: None,
+            graphs: None,
             txn: std::sync::OnceLock::new(),
             search_catalog: None,
             contracts: None,
@@ -214,67 +206,6 @@ impl AdminService {
     ) -> Self {
         self.search_catalog = Some(v);
         self
-    }
-
-    /// The same service with the automatic-indexing calls.
-    #[must_use]
-    pub fn with_indexes(mut self, indexes: Arc<dyn AutoIndexAdmin>) -> Self {
-        self.indexes = Some(indexes);
-        self
-    }
-
-    fn indexes(&self) -> Result<&Arc<dyn AutoIndexAdmin>> {
-        self.indexes
-            .as_ref()
-            .ok_or_else(|| invalid("this controller doesn't serve automatic indexes"))
-    }
-
-    /// `Indexes.ListIndexes`, or `ListRecommendations` with
-    /// `recommendations`.
-    ///
-    /// # Errors
-    /// As [`AutoIndexAdmin::list`].
-    pub async fn list_indexes(
-        &self,
-        tenant: &str,
-        mut q: ListIndexesQuery,
-        recommendations: bool,
-    ) -> Result<ListIndexesResponse> {
-        if recommendations {
-            q.state = Some("recommended".to_owned());
-        }
-        self.indexes()?.list(tenant, &q).await
-    }
-
-    /// `Indexes.GetIndex`.
-    ///
-    /// # Errors
-    /// As [`AutoIndexAdmin::show`].
-    pub async fn get_index(&self, tenant: &str, index: &str) -> Result<IndexDetail> {
-        self.indexes()?.show(tenant, index).await
-    }
-
-    /// `Indexes.Approve`, `Reject`, `Drop`, `Pin`, `Unpin`. Catalog
-    /// changes: any controller answers them.
-    ///
-    /// # Errors
-    /// As [`AutoIndexAdmin::act`].
-    pub async fn index_action(
-        &self,
-        tenant: &str,
-        index: &str,
-        action: IndexAction,
-        req: &IndexActionRequest,
-    ) -> Result<IndexActionResponse> {
-        self.indexes()?.act(tenant, index, action, req).await
-    }
-
-    /// `Explain.ExplainQuery`.
-    ///
-    /// # Errors
-    /// As [`AutoIndexAdmin::explain_query`].
-    pub async fn explain_query(&self, tenant: &str, fingerprint: &str) -> Result<QueryExplanation> {
-        self.indexes()?.explain_query(tenant, fingerprint).await
     }
 
     /// The same service with the balancer's explain calls.

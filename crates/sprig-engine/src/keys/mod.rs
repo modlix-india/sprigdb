@@ -13,7 +13,9 @@
 //! Bloom filters work on the logical key for versioned point reads.
 //!
 //! Engine bookkeeping that is not versioned (a unit's applied index) lives
-//! under the reserved tenant [`META_TENANT`].
+//! under the reserved tenant [`META_TENANT`]. Unversioned data a tenant
+//! owns (queue messages) lives in the tenant's range, in objects from
+//! [`UNVERSIONED_OBJECT_MIN`] up ([`is_unversioned`]).
 
 pub mod collation;
 pub mod memcmp;
@@ -95,6 +97,26 @@ pub const PREFIX_LEN: usize = 8 + 4 + 4 + 1 + 2;
 pub const VERSION_LEN: usize = 8;
 /// The reserved tenant id under which unversioned engine bookkeeping lives.
 pub const META_TENANT: u64 = u64::MAX;
+
+/// Objects from this id up hold unversioned keys inside a tenant's range
+/// (queue messages): no commit timestamp suffix, outside MVCC, ignored by
+/// the version GC and the clock. Ordinary objects never get ids this high.
+pub const UNVERSIONED_OBJECT_MIN: u32 = 0x5100_0000;
+
+/// The object of a tenant's queue messages (`'Q'`), an unversioned object.
+pub const QUEUES_OBJECT: u32 = UNVERSIONED_OBJECT_MIN;
+
+/// Whether a stored key is unversioned: engine bookkeeping under the
+/// reserved tenant, or a key of an unversioned object in a tenant's range.
+#[must_use]
+pub fn is_unversioned(key: &[u8]) -> bool {
+    if key.starts_with(&META_TENANT.to_be_bytes()) {
+        return true;
+    }
+    key.get(12..16)
+        .and_then(|o| o.try_into().ok())
+        .is_some_and(|o: [u8; 4]| u32::from_be_bytes(o) >= UNVERSIONED_OBJECT_MIN)
+}
 
 /// The fixed head of every logical key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

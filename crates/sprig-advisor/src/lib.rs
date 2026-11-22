@@ -1,13 +1,11 @@
-//! `sprig-advisor`: the sharding advisor and automatic indexing.
+//! `sprig-advisor`: the sharding advisor's design logic.
 //!
 //! Layer: 2 operations.
 //!
-//! What exists: the core of automatic indexing, [`autoindex`], and the
-//! sharding advisor's first design, [`sharding`].
+//! What exists: the sharding advisor's design logic over a workload and
+//! schema input, [`sharding`] (kept for sharding big tenants across nodes),
+//! and the two `auto_index.*` settings other code still reads,
+//! [`autoindex`].
 
 pub mod autoindex;
 pub mod sharding;
-mod sql;
-
-#[cfg(test)]
-mod live_tests;

@@ -72,7 +72,7 @@ pub use transaction::{
 
 use crate::Engine;
 pub use crate::locks::{Interrupt, LockMode, Wait};
-use crate::log::Durability;
+use crate::log::{Durability, UnitId};
 use crate::store::SortedStore;
 
 /// Isolation levels (READ UNCOMMITTED runs as READ COMMITTED).
@@ -237,9 +237,44 @@ pub trait CommitPath: Send + Sync {
     fn propose(&self, payload: Vec<u8>, durability: Option<Durability>) -> Result<DurableTicket>;
     /// The highest index applied to the store.
     fn applied_index(&self) -> u64;
-    /// The unit's id: it names the unit's reserved bookkeeping keys.
+    /// The path's own unit: it carries writes no other unit claims.
     fn unit_id(&self) -> u64 {
         0
+    }
+    /// The unit `key` belongs to. A path with one unit returns it for
+    /// every key.
+    fn unit_of(&self, key: &[u8]) -> u64 {
+        let _ = key;
+        self.unit_id()
+    }
+    /// The unit whose log entries carry a commit's notes.
+    fn notes_unit(&self) -> u64 {
+        self.unit_id()
+    }
+    /// Queues one payload per unit as one atomic write; tickets in the
+    /// order of `parts`. A path with one unit accepts only one part.
+    ///
+    /// # Errors
+    /// The log is closed, or it can't write several units atomically.
+    fn propose_many(
+        &self,
+        parts: Vec<(u64, Vec<u8>)>,
+        durability: Option<Durability>,
+    ) -> Result<Vec<DurableTicket>> {
+        if parts.len() != 1 {
+            return Err(sprig_common::SprigError::internal(
+                "this commit path has one unit",
+            ));
+        }
+        parts
+            .into_iter()
+            .map(|(_, p)| self.propose(p, durability))
+            .collect()
+    }
+    /// The highest index of `unit` applied to the store.
+    fn applied_index_of(&self, unit: u64) -> u64 {
+        let _ = unit;
+        self.applied_index()
     }
     /// Tells the store side the oldest timestamp readers may still need.
     fn set_gc_watermark(&self, _ts: Ts) {}
@@ -272,6 +307,35 @@ impl CommitPath for Engine {
 
     fn unit_id(&self) -> u64 {
         self.unit().0
+    }
+
+    fn unit_of(&self, key: &[u8]) -> u64 {
+        self.unit_of_key(key).0
+    }
+
+    fn notes_unit(&self) -> u64 {
+        Engine::notes_unit(self).0
+    }
+
+    fn propose_many(
+        &self,
+        parts: Vec<(u64, Vec<u8>)>,
+        durability: Option<Durability>,
+    ) -> Result<Vec<DurableTicket>> {
+        let d = durability.unwrap_or(self.config().default_durability);
+        let tickets = if let [(u, _)] = parts.as_slice() {
+            let u = UnitId(*u);
+            let p = parts.into_iter().next().map(|x| x.1).unwrap_or_default();
+            vec![self.consensus().propose(u, p, d)?]
+        } else {
+            self.consensus()
+                .propose_many(parts.into_iter().map(|(u, p)| (UnitId(u), p)).collect(), d)?
+        };
+        Ok(tickets.into_iter().map(DurableTicket::Log).collect())
+    }
+
+    fn applied_index_of(&self, unit: u64) -> u64 {
+        self.consensus().applied_index(UnitId(unit))
     }
 
     fn set_gc_watermark(&self, ts: Ts) {

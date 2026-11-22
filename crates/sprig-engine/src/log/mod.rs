@@ -132,6 +132,20 @@ pub trait StateMachine: Send + Sync {
     /// # Errors
     /// The state could not be written. The log treats this as fatal.
     fn apply(&self, unit: UnitId, entries: &[LogEntry]) -> Result<()>;
+
+    /// Applies one write group's entries of several units together: a
+    /// state machine that can should make them visible and durable as one
+    /// (the parts of an atomic write across units are in one group). The
+    /// default applies unit by unit.
+    ///
+    /// # Errors
+    /// As for [`StateMachine::apply`].
+    fn apply_group(&self, parts: &[(UnitId, &[LogEntry])]) -> Result<()> {
+        for (u, es) in parts {
+            self.apply(*u, es)?;
+        }
+        Ok(())
+    }
 }
 
 /// Commits through a log. A single node has [`LocalLog`]; replication will add a Raft
@@ -144,6 +158,33 @@ pub trait Consensus: Send + Sync {
     /// # Errors
     /// The log is closed.
     fn propose(&self, unit: UnitId, payload: Vec<u8>, durability: Durability) -> Result<Ticket>;
+
+    /// Queues one payload for each of several units as one atomic write:
+    /// after a crash either every part is in the log or none is. Tickets
+    /// come back in the order of `parts`. One part is a plain
+    /// [`Consensus::propose`].
+    ///
+    /// The default refuses more than one part: only a log that writes all
+    /// its units together (the single-node [`LocalLog`]) can promise this
+    /// without a commit protocol across units.
+    ///
+    /// # Errors
+    /// The log is closed, or it can't write several units atomically.
+    fn propose_many(
+        &self,
+        parts: Vec<(UnitId, Vec<u8>)>,
+        durability: Durability,
+    ) -> Result<Vec<Ticket>> {
+        if parts.len() > 1 {
+            return Err(SprigError::internal(
+                "commit log: a write across units needs a commit protocol this log doesn't have",
+            ));
+        }
+        parts
+            .into_iter()
+            .map(|(u, p)| self.propose(u, p, durability))
+            .collect()
+    }
 
     /// The highest index of `unit` that is synced.
     fn durable_index(&self, unit: UnitId) -> u64;
@@ -402,6 +443,9 @@ struct Proposal {
     index: u64,
     payload: Vec<u8>,
     durability: Durability,
+    /// Written in the same group as the proposal before it (a part of a
+    /// [`Consensus::propose_many`] after the first).
+    joined: bool,
 }
 
 #[derive(Default)]
@@ -826,18 +870,14 @@ fn replay(sh: &Shared, unit: UnitId) -> Result<()> {
     Ok(())
 }
 
-impl Consensus for LocalLog {
-    fn propose(&self, unit: UnitId, payload: Vec<u8>, durability: Durability) -> Result<Ticket> {
+impl LocalLog {
+    /// Gives `unit` its next index, under the queue latch.
+    fn next_index(&self, q: &mut Queue, unit: UnitId, state: &UnitState) -> Result<u64> {
         if unit.0 == SYNC_GROUP {
             return Err(SprigError::internal(format!(
                 "commit log: unit {} is reserved for the log's own sync markers",
                 unit.0
             )));
-        }
-        let state = self.unit(unit);
-        let mut q = self.sh.queue.lock().unwrap_or_else(PoisonError::into_inner);
-        if q.closed {
-            return Err(closed());
         }
         let next = match q.next.entry(unit) {
             Entry::Occupied(e) => e.into_mut(),
@@ -854,12 +894,25 @@ impl Consensus for LocalLog {
         };
         let index = *next;
         *next += 1;
+        Ok(index)
+    }
+}
+
+impl Consensus for LocalLog {
+    fn propose(&self, unit: UnitId, payload: Vec<u8>, durability: Durability) -> Result<Ticket> {
+        let state = self.unit(unit);
+        let mut q = self.sh.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        if q.closed {
+            return Err(closed());
+        }
+        let index = self.next_index(&mut q, unit, &state)?;
         q.bytes += payload.len();
         q.items.push_back(Proposal {
             unit,
             index,
             payload,
             durability,
+            joined: false,
         });
         drop(q);
         self.sh.work.notify_one();
@@ -869,6 +922,64 @@ impl Consensus for LocalLog {
             index,
             sync: durability.needs_sync(),
         })
+    }
+
+    /// Every part goes into the same group, so into one raft-engine write
+    /// batch: raft-engine recovers a batch whole or not at all.
+    fn propose_many(
+        &self,
+        parts: Vec<(UnitId, Vec<u8>)>,
+        durability: Durability,
+    ) -> Result<Vec<Ticket>> {
+        let mut seen = std::collections::HashSet::new();
+        if parts.iter().any(|(u, _)| !seen.insert(*u)) {
+            return Err(SprigError::internal(
+                "commit log: an atomic write names one unit twice",
+            ));
+        }
+        let states: Vec<Arc<UnitState>> = parts.iter().map(|(u, _)| self.unit(*u)).collect();
+        let mut q = self.sh.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        if q.closed {
+            return Err(closed());
+        }
+        // Every unit's first index is settled before any is taken, so a
+        // failure leaves no unit with an index that was never written.
+        for ((u, _), s) in parts.iter().zip(&states) {
+            if u.0 == SYNC_GROUP || !q.next.contains_key(u) {
+                let i = self.next_index(&mut q, *u, s)?;
+                if let Some(n) = q.next.get_mut(u) {
+                    *n = i;
+                }
+            }
+        }
+        let mut indexes = Vec::with_capacity(parts.len());
+        for ((u, _), s) in parts.iter().zip(&states) {
+            indexes.push(self.next_index(&mut q, *u, s)?);
+        }
+        let units: Vec<UnitId> = parts.iter().map(|(u, _)| *u).collect();
+        for (n, ((unit, payload), index)) in parts.into_iter().zip(&indexes).enumerate() {
+            q.bytes += payload.len();
+            q.items.push_back(Proposal {
+                unit,
+                index: *index,
+                payload,
+                durability,
+                joined: n > 0,
+            });
+        }
+        drop(q);
+        self.sh.work.notify_one();
+        Ok(states
+            .into_iter()
+            .zip(units)
+            .zip(indexes)
+            .map(|((state, unit_id), index)| Ticket {
+                unit_id,
+                unit: state,
+                index,
+                sync: durability.needs_sync(),
+            })
+            .collect())
     }
 
     fn durable_index(&self, unit: UnitId) -> u64 {
@@ -942,7 +1053,8 @@ fn run(sh: &Shared) {
         }
         let mut bytes = 0;
         while let Some(p) = q.items.front() {
-            if !group.is_empty() && bytes + p.payload.len() > sh.cfg.group_max_bytes {
+            // The parts of one atomic write stay in one group.
+            if !group.is_empty() && !p.joined && bytes + p.payload.len() > sh.cfg.group_max_bytes {
                 break;
             }
             bytes += p.payload.len();
@@ -993,6 +1105,8 @@ fn add_us(c: &AtomicU64, since: Instant) {
 }
 
 fn write_group(sh: &Shared, group: &mut Vec<Proposal>, relaxed_due: &mut Option<Instant>) {
+    // One raft-engine batch for the whole group: the parts of an atomic
+    // write across units are recovered together or not at all.
     let mut by_unit: BTreeMap<UnitId, Vec<LogEntry>> = BTreeMap::new();
     let mut need_sync = false;
     let mut relax: Option<Duration> = None;
@@ -1060,10 +1174,10 @@ fn write_group(sh: &Shared, group: &mut Vec<Proposal>, relaxed_due: &mut Option<
         u.wake();
     }
     let t = Instant::now();
-    for (id, entries) in &by_unit {
-        if let Err(e) = sh.sm.apply(*id, entries) {
-            fatal("apply", &e);
-        }
+    let parts: Vec<(UnitId, &[LogEntry])> =
+        by_unit.iter().map(|(u, es)| (*u, es.as_slice())).collect();
+    if let Err(e) = sh.sm.apply_group(&parts) {
+        fatal("apply", &e);
     }
     add_us(&c.apply_us, t);
     for (u, last) in &units {

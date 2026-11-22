@@ -86,7 +86,7 @@ impl MemPath {
             payload::decode_into(p, &mut b)?;
             for op in b.ops() {
                 if let BatchOp::Put { key, .. } = op
-                    && !key.starts_with(&keys::META_TENANT.to_be_bytes())
+                    && !keys::is_unversioned(key)
                     && let Some((_, ts)) = keys::split_version(key)
                 {
                     max_ts = max_ts.max(Some(ts));

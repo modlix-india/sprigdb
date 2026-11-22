@@ -1,5 +1,13 @@
 //! The engine handle: the store, the commit log, recovery, budgets and the
-//! checkpointer, for one node with one unit.
+//! checkpointer, for one node with many units.
+//!
+//! **Units.** Each tenant is its own unit: its own log (a raft-engine
+//! group, one Raft group once replication is built), applied index and
+//! commit latch. Tenant `t` is unit `t`. The node's own unit
+//! ([`Engine::unit`]) carries what no tenant owns. Every key belongs to
+//! exactly one unit ([`Engine::unit_of_key`]), and only that unit's log
+//! writes it, so units replay independently. One clock, one lock table
+//! and one set of read views serve every unit of the node.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,8 +27,19 @@ use crate::store::{
 };
 use crate::txn::{self, Txn, TxnOptions};
 
-/// The node's single unit.
-const UNIT: UnitId = UnitId(1);
+/// The node's own unit: engine bookkeeping that no tenant owns, and what
+/// is still kept per node rather than per tenant.
+pub const NODE_UNIT: UnitId = UnitId(keys::META_TENANT - 1);
+
+/// Before units, a node had one unit, numbered 1, holding every tenant.
+const LEGACY_UNIT: UnitId = UnitId(1);
+
+/// The node bookkeeping field that records the data layout.
+const LAYOUT: &[u8] = b"layout";
+/// Units per tenant (layout 2).
+const LAYOUT_UNITS: u64 = 2;
+/// Queue messages in their tenants' ranges (layout 3, the current one).
+const LAYOUT_QUEUES: u64 = 3;
 
 /// The field of a unit's bookkeeping that holds its applied index.
 const APPLIED: &[u8] = b"applied";
@@ -32,8 +51,8 @@ struct StoreMachine {
     /// Apply observers ([`crate::observe`]). Held shared across a whole
     /// apply, so registering one sees either all of an apply or none.
     observers: RwLock<Vec<Arc<dyn crate::observe::ApplyObserver>>>,
-    /// The last index applied to the store (set inside the apply).
-    last_applied: AtomicU64,
+    /// Each unit's last index applied to the store (set inside the apply).
+    last_applied: RwLock<std::collections::HashMap<UnitId, u64>>,
     /// The highest version timestamp ever applied, kept in the unit's
     /// bookkeeping (`max_ts`) so a restarted clock starts above it even when
     /// the wall clock stepped back.
@@ -54,14 +73,27 @@ fn read_u64(store: &dyn SortedStore, key: &[u8]) -> Result<u64> {
 }
 
 /// The version timestamp of a stored data key, if it is a versioned key
-/// (engine bookkeeping under the reserved tenant is not).
+/// (engine bookkeeping and queue messages are not).
 fn version_of(key: &[u8]) -> Option<keys::Ts> {
-    if key.len() < keys::PREFIX_LEN + keys::VERSION_LEN
-        || key[..8] == keys::META_TENANT.to_be_bytes()
-    {
+    if key.len() < keys::PREFIX_LEN + keys::VERSION_LEN || keys::is_unversioned(key) {
         return None;
     }
     keys::split_version(key).map(|(_, ts)| ts)
+}
+
+impl StoreMachine {
+    /// `unit`'s last applied index.
+    fn last_applied(&self, unit: UnitId) -> u64 {
+        if let Some(i) = self
+            .last_applied
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&unit)
+        {
+            return *i;
+        }
+        read_u64(self.store.as_ref(), &keys::unit_meta_key(unit.0, APPLIED)).unwrap_or(0)
+    }
 }
 
 impl StateMachine for StoreMachine {
@@ -70,44 +102,72 @@ impl StateMachine for StoreMachine {
     }
 
     fn apply(&self, unit: UnitId, entries: &[LogEntry]) -> Result<()> {
-        let Some(last) = entries.last() else {
-            return Ok(());
-        };
+        self.apply_group(&[(unit, entries)])
+    }
+
+    /// Every unit's part of a group in one store batch: a checkpoint's
+    /// flush sees all of a write across units or none of it, so the store
+    /// can't keep one unit's half of a relaxed commit whose log tail a
+    /// crash then loses.
+    fn apply_group(&self, parts: &[(UnitId, &[LogEntry])]) -> Result<()> {
         let observers = self
             .observers
             .read()
             .unwrap_or_else(PoisonError::into_inner);
         let mut batch = StoreBatch::new();
-        for e in entries {
-            log::payload::decode_into(&e.data, &mut batch)?;
-        }
-        let batch_max = batch
-            .ops()
-            .iter()
-            .filter_map(|o| match o {
-                BatchOp::Put {
-                    cf: Cf::Data, key, ..
-                } => version_of(key),
-                _ => None,
-            })
-            .max();
-        batch.put(
-            Cf::Data,
-            keys::unit_meta_key(unit.0, APPLIED),
-            last.index.to_be_bytes(),
-        );
-        if let Some(m) = batch_max {
-            let top = self.max_ts.fetch_max(m.0, Ordering::AcqRel).max(m.0);
+        let mut lasts = Vec::with_capacity(parts.len());
+        for (unit, entries) in parts {
+            let Some(last) = entries.last() else {
+                continue;
+            };
+            let from = batch.ops().len();
+            for e in *entries {
+                log::payload::decode_into(&e.data, &mut batch)?;
+            }
+            let part_max = batch.ops()[from..]
+                .iter()
+                .filter_map(|o| match o {
+                    BatchOp::Put {
+                        cf: Cf::Data, key, ..
+                    } => version_of(key),
+                    _ => None,
+                })
+                .max();
             batch.put(
                 Cf::Data,
-                keys::unit_meta_key(unit.0, MAX_TS),
-                top.to_be_bytes(),
+                keys::unit_meta_key(unit.0, APPLIED),
+                last.index.to_be_bytes(),
             );
+            if let Some(m) = part_max {
+                let top = self.max_ts.fetch_max(m.0, Ordering::AcqRel).max(m.0);
+                batch.put(
+                    Cf::Data,
+                    keys::unit_meta_key(unit.0, MAX_TS),
+                    top.to_be_bytes(),
+                );
+            }
+            lasts.push((*unit, last.index));
+        }
+        if lasts.is_empty() {
+            return Ok(());
         }
         self.store.write(&batch, WalMode::Off)?;
-        self.last_applied.store(last.index, Ordering::Release);
-        for o in observers.iter() {
-            o.applied(entries);
+        {
+            let mut la = self
+                .last_applied
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            for (u, i) in &lasts {
+                la.insert(*u, *i);
+            }
+        }
+        for (unit, entries) in parts {
+            if entries.is_empty() {
+                continue;
+            }
+            for o in observers.iter() {
+                o.applied(*unit, entries);
+            }
         }
         Ok(())
     }
@@ -221,7 +281,39 @@ impl Drop for Inner {
 /// The storage engine of one node. Cheap to clone.
 #[derive(Clone)]
 pub struct Engine {
+    /// Held by every handle callers have (not by the checkpointer's own):
+    /// when the last one goes, the checkpointer is stopped and joined
+    /// first, so the engine closes on the caller's thread and its files are
+    /// free when the drop returns. Declared before `inner` so it drops
+    /// first.
+    user: Option<Arc<Users>>,
     inner: Arc<Inner>,
+}
+
+/// See [`Engine::user`].
+struct Users {
+    stop: Arc<Stop>,
+    inner: std::sync::Weak<Inner>,
+}
+
+impl Drop for Users {
+    fn drop(&mut self) {
+        *self
+            .stop
+            .stopped
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = true;
+        self.stop.cv.notify_all();
+        let h = self.inner.upgrade().and_then(|i| {
+            i.checkpointer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+        });
+        if let Some(h) = h {
+            let _ = h.join();
+        }
+    }
 }
 
 impl std::fmt::Debug for Engine {
@@ -242,10 +334,13 @@ pub struct EngineStats {
     pub log: LogStats,
     /// Bytes of log files.
     pub log_disk_bytes: u64,
-    /// The unit's applied index.
+    /// Entries applied, summed over every unit (each unit's applied
+    /// index).
     pub applied_index: u64,
-    /// The unit's synced index.
+    /// Entries synced, summed over every unit.
     pub durable_index: u64,
+    /// Units the commit log knows.
+    pub units: u64,
     /// Checkpoints taken.
     pub checkpoints: u64,
     /// Bytes held by the transaction pool.
@@ -281,20 +376,23 @@ impl Engine {
             }
             StoreKind::Mem => (Arc::new(MemStore::with_gc(Some(rule))), None),
         };
-        let max_ts = read_u64(store.as_ref(), &keys::unit_meta_key(UNIT.0, MAX_TS))?;
-        let applied0 = read_u64(store.as_ref(), &keys::unit_meta_key(UNIT.0, APPLIED))?;
+        let max_ts = max_ts_of_units(store.as_ref())?;
         let sm = Arc::new(StoreMachine {
             store: Arc::clone(&store),
             observers: RwLock::new(Vec::new()),
-            last_applied: AtomicU64::new(applied0),
+            last_applied: RwLock::new(std::collections::HashMap::new()),
             max_ts: AtomicU64::new(max_ts),
         });
-        let floors = load_floors(store.as_ref(), UNIT)?;
         let log = Arc::new(LocalLog::open(
             cfg.data_dir.join("raft"),
             cfg.log.clone(),
             Arc::clone(&sm) as Arc<dyn StateMachine>,
         )?);
+        // Replay is done and nothing else writes yet.
+        if cfg.store != StoreKind::Mem {
+            migrate_legacy(store.as_ref())?;
+        }
+        let floors = load_floors(store.as_ref(), NODE_UNIT)?;
         let stop = Arc::new(Stop {
             stopped: Mutex::new(false),
             cv: Condvar::new(),
@@ -305,7 +403,8 @@ impl Engine {
         // Compactions drop versions by the transaction layer's rule, at the
         // watermark it computes when each compaction starts.
         let txn_gc = Arc::new(TxnGc(Arc::downgrade(&txn_shared)));
-        let engine = Engine {
+        let mut engine = Engine {
+            user: None,
             inner: Arc::new(Inner {
                 sm: Arc::clone(&sm),
                 floors: Mutex::new(floors),
@@ -314,7 +413,7 @@ impl Engine {
                 rocks,
                 log,
                 budgets,
-                unit: UNIT,
+                unit: NODE_UNIT,
                 gc,
                 checkpoints: AtomicU64::new(0),
                 stop,
@@ -322,6 +421,10 @@ impl Engine {
                 cfg,
             }),
         };
+        engine.user = Some(Arc::new(Users {
+            stop: Arc::clone(&engine.inner.stop),
+            inner: Arc::downgrade(&engine.inner),
+        }));
         engine.set_version_gc(txn_gc);
         if !engine.inner.cfg.checkpoint_interval.is_zero()
             && engine.inner.cfg.store != StoreKind::Mem
@@ -369,10 +472,48 @@ impl Engine {
         &self.inner.log
     }
 
-    /// The single unit the node runs.
+    /// The node's own unit ([`NODE_UNIT`]): engine bookkeeping no tenant
+    /// owns, stream appends, and the queue messages until they move into
+    /// their tenants' ranges.
     #[must_use]
     pub fn unit(&self) -> UnitId {
         self.inner.unit
+    }
+
+    /// The unit of `tenant`: tenant `t` is unit `t`, and the reserved
+    /// tenant's keys are the node unit's.
+    #[must_use]
+    pub fn unit_of_tenant(tenant: u64) -> UnitId {
+        if tenant == keys::META_TENANT {
+            NODE_UNIT
+        } else {
+            UnitId(tenant)
+        }
+    }
+
+    /// The unit `key` (a logical or stored key) belongs to: its tenant's.
+    /// A unit's own bookkeeping key belongs to that unit; other keys of
+    /// the reserved tenant, and keys too short to name a tenant, to the
+    /// node unit.
+    #[must_use]
+    pub fn unit_of_key(&self, key: &[u8]) -> UnitId {
+        unit_of_key(key)
+    }
+
+    /// The unit whose log entries carry transactions' notes (stream
+    /// appends): the node unit, for now.
+    #[must_use]
+    pub fn notes_unit(&self) -> UnitId {
+        NODE_UNIT
+    }
+
+    /// Every unit the commit log knows on this node, with its applied
+    /// index.
+    #[must_use]
+    pub fn units(&self) -> Vec<(UnitId, u64)> {
+        let mut u = self.inner.log.applied();
+        u.sort_unstable();
+        u
     }
 
     /// The memory budgets.
@@ -505,47 +646,42 @@ impl Engine {
         self.inner.log.first_index(self.inner.unit)
     }
 
-    /// The highest index the store has applied (what [`Engine::observe`]
-    /// hands an observer up to).
+    /// The highest index of the notes unit the store has applied (what
+    /// [`Engine::observe`] hands an observer up to).
     #[must_use]
     pub fn last_applied(&self) -> u64 {
-        self.inner.sm.last_applied.load(Ordering::Acquire)
+        self.inner.sm.last_applied(self.notes_unit())
     }
 
-    /// Registers an apply observer. Entries above `from` that the store
-    /// has already applied are handed to it first (from the log), then it
-    /// sees every new one; no entry is missed or seen twice. Returns the
-    /// last index it was given.
+    /// Registers an apply observer. Entries of the notes unit above `from`
+    /// that the store has already applied are handed to it first (from the
+    /// log), then it sees every new entry of every unit; no entry is missed
+    /// or seen twice. Returns the last index of the notes unit it was given.
     ///
     /// # Errors
     /// The log no longer holds an entry it needs (the observer's floor was
     /// not kept), or reading the log failed.
     pub fn observe(&self, o: Arc<dyn crate::observe::ApplyObserver>, from: u64) -> Result<u64> {
         let sm = &self.inner.sm;
+        let unit = self.notes_unit();
         let mut obs = sm.observers.write().unwrap_or_else(PoisonError::into_inner);
-        let top = sm.last_applied.load(Ordering::Acquire);
+        let top = sm.last_applied(unit);
         let mut next = from + 1;
-        if next <= top
-            && self
-                .inner
-                .log
-                .first_index(self.inner.unit)
-                .is_none_or(|f| f > next)
-        {
+        if next <= top && self.inner.log.first_index(unit).is_none_or(|f| f > next) {
             return Err(SprigError::internal(format!(
                 "engine: the log no longer holds entry {next}, which an observer needs"
             )));
         }
         while next <= top {
             let end = (next + 512).min(top + 1);
-            let got = self.inner.log.entries(self.inner.unit, next, end)?;
+            let got = self.inner.log.entries(unit, next, end)?;
             if got.first().map(|e| e.index) != Some(next) {
                 return Err(SprigError::internal(format!(
                     "engine: the log no longer holds entry {next}, which an observer needs"
                 )));
             }
             next += got.len() as u64;
-            o.applied(&got);
+            o.applied(unit, &got);
         }
         obs.push(o);
         Ok(top)
@@ -555,12 +691,14 @@ impl Engine {
     #[must_use]
     pub fn stats(&self) -> EngineStats {
         let i = &self.inner;
+        let units = i.log.applied();
         EngineStats {
             store: i.store.stats(),
             log: i.log.stats(),
             log_disk_bytes: i.log.disk_bytes(),
-            applied_index: i.log.applied_index(i.unit),
-            durable_index: i.log.durable_index(i.unit),
+            applied_index: units.iter().map(|(_, a)| a).sum(),
+            durable_index: units.iter().map(|(u, _)| i.log.durable_index(*u)).sum(),
+            units: units.len() as u64,
             checkpoints: i.checkpoints.load(Ordering::Relaxed),
             txn_bytes: i.budgets.txn.used(),
             query_bytes: i.budgets.query.used(),
@@ -599,6 +737,183 @@ fn load_floors(
     Ok(out)
 }
 
+/// The unit of a key: see [`Engine::unit_of_key`].
+#[must_use]
+pub fn unit_of_key(key: &[u8]) -> UnitId {
+    let Some(head) = key.get(..8) else {
+        return NODE_UNIT;
+    };
+    let tenant = u64::from_be_bytes(head.try_into().unwrap_or([0; 8]));
+    if tenant != keys::META_TENANT {
+        return UnitId(tenant);
+    }
+    let meta = keys::unit_meta_key(0, b"");
+    let head = &meta[..meta.len() - 8];
+    match (key.strip_prefix(head), key.len() >= meta.len()) {
+        (Some(rest), true) => UnitId(u64::from_be_bytes(rest[..8].try_into().unwrap_or([0; 8]))),
+        _ => NODE_UNIT,
+    }
+}
+
+/// One unit bookkeeping entry: `(unit, field, value)`.
+type Bookkeeping = (u64, Vec<u8>, Vec<u8>);
+
+/// Every unit's bookkeeping.
+fn unit_bookkeeping(store: &dyn SortedStore) -> Result<Vec<Bookkeeping>> {
+    let meta = keys::unit_meta_key(0, b"");
+    let head = &meta[..meta.len() - 8];
+    let mut out = Vec::new();
+    let mut it = store.iter(
+        Cf::Data,
+        crate::store::IterOpts::range(&keys::KeyRange::prefix(head)),
+    );
+    it.seek(head);
+    while it.valid() {
+        let rest = &it.key()[head.len()..];
+        if rest.len() >= 8 {
+            let unit = u64::from_be_bytes(rest[..8].try_into().unwrap_or([0; 8]));
+            out.push((unit, rest[8..].to_vec(), it.value().to_vec()));
+        }
+        it.next();
+    }
+    it.status()?.expect_ready()?;
+    Ok(out)
+}
+
+/// The highest version timestamp any unit has applied.
+fn max_ts_of_units(store: &dyn SortedStore) -> Result<u64> {
+    let mut top = 0;
+    for (_, field, v) in unit_bookkeeping(store)? {
+        if field == MAX_TS {
+            let b: [u8; 8] = v
+                .as_slice()
+                .try_into()
+                .map_err(|_| SprigError::internal("storage: unit bookkeeping is corrupt"))?;
+            top = top.max(u64::from_be_bytes(b));
+        }
+    }
+    Ok(top)
+}
+
+/// Moves a data directory written when the node had one unit (unit 1,
+/// holding every tenant) to one unit per tenant, once, right after replay:
+/// - the store is flushed, so the old unit's entries are never replayed
+///   again (they hold every tenant's keys, and units replay
+///   independently);
+/// - the node unit continues the old unit's index sequence and takes its
+///   observer floors, because what the old unit's entries carried for
+///   observers (stream appends) now comes on the node unit's log, and
+///   stream files record their position as an index of that log;
+/// - tenant 1's unit keeps its own applied index and continues after it.
+///
+/// An apply observer's files must already hold everything the old unit's
+/// log carried for it (a clean shutdown flushes them).
+///
+/// Then (layout 3) queue messages kept under the reserved tenant move into
+/// their tenants' ranges ([`move_queue_keys`]).
+fn migrate_legacy(store: &dyn SortedStore) -> Result<()> {
+    let layout_key = keys::unit_meta_key(NODE_UNIT.0, LAYOUT);
+    let layout = read_u64(store, &layout_key)?;
+    if layout >= LAYOUT_QUEUES {
+        return Ok(());
+    }
+    if layout < LAYOUT_UNITS {
+        migrate_units(store)?;
+    }
+    let moved = move_queue_keys(store)?;
+    if moved > 0 {
+        tracing::info!(
+            keys = moved,
+            "engine: moved queue messages into their tenants' ranges"
+        );
+    }
+    let mut b = StoreBatch::new();
+    b.put(Cf::Data, layout_key, LAYOUT_QUEUES.to_be_bytes());
+    store.write(&b, WalMode::Sync)?;
+    store.flush_all()?;
+    Ok(())
+}
+
+/// Before layout 3, queue messages sat under the reserved tenant:
+/// `META | 0 | queues | kind | index | tenant | db | rest`. They move to
+/// `tenant | 0 | queues | kind | index | db | rest`, flushed before the
+/// old keys go, so a crash in between leaves both and the move runs again.
+/// Returns the number of keys moved.
+fn move_queue_keys(store: &dyn SortedStore) -> Result<u64> {
+    let old_head = keys::KeyPrefix {
+        tenant: keys::META_TENANT,
+        shard: 0,
+        object: keys::QUEUES_OBJECT,
+        kind: 0,
+        index: 0,
+    }
+    .to_vec();
+    let head = &old_head[..16];
+    let mut moved = 0u64;
+    loop {
+        let mut puts = StoreBatch::new();
+        let mut dels = StoreBatch::new();
+        let mut n = 0;
+        {
+            let mut it = store.iter(
+                Cf::Data,
+                crate::store::IterOpts::range(&keys::KeyRange::prefix(head)),
+            );
+            it.seek(head);
+            while it.valid() && n < 10_000 {
+                let k = it.key();
+                if k.len() >= keys::PREFIX_LEN + 8 {
+                    let mut nk = Vec::with_capacity(k.len() - 8);
+                    nk.extend_from_slice(&k[keys::PREFIX_LEN..keys::PREFIX_LEN + 8]);
+                    nk.extend_from_slice(&k[8..keys::PREFIX_LEN]);
+                    nk.extend_from_slice(&k[keys::PREFIX_LEN + 8..]);
+                    puts.put(Cf::Data, nk, it.value().to_vec());
+                }
+                dels.delete(Cf::Data, k.to_vec());
+                n += 1;
+                it.next();
+            }
+            it.status()?.expect_ready()?;
+        }
+        if n == 0 {
+            return Ok(moved);
+        }
+        store.write(&puts, WalMode::Sync)?;
+        store.flush_all()?;
+        store.write(&dels, WalMode::Sync)?;
+        moved += n;
+    }
+}
+
+/// Layout 1 to 2: see [`migrate_legacy`].
+fn migrate_units(store: &dyn SortedStore) -> Result<()> {
+    let layout_key = keys::unit_meta_key(NODE_UNIT.0, LAYOUT);
+    let legacy_applied = read_u64(store, &keys::unit_meta_key(LEGACY_UNIT.0, APPLIED))?;
+    let mut b = StoreBatch::new();
+    if legacy_applied > 0 && read_u64(store, &keys::unit_meta_key(NODE_UNIT.0, APPLIED))? == 0 {
+        store.flush_all()?;
+        b.put(
+            Cf::Data,
+            keys::unit_meta_key(NODE_UNIT.0, APPLIED),
+            legacy_applied.to_be_bytes(),
+        );
+        for (name, index) in load_floors(store, LEGACY_UNIT)? {
+            let mut lb = StoreBatch::new();
+            lb.put(Cf::Local, floor_key(NODE_UNIT, &name), index.to_be_bytes());
+            lb.delete(Cf::Local, floor_key(LEGACY_UNIT, &name));
+            store.write(&lb, WalMode::Sync)?;
+        }
+        tracing::info!(
+            index = legacy_applied,
+            "engine: moved a one-unit data directory to one unit per tenant"
+        );
+    }
+    b.put(Cf::Data, layout_key, LAYOUT_UNITS.to_be_bytes());
+    store.write(&b, WalMode::Sync)?;
+    store.flush_all()?;
+    Ok(())
+}
+
 fn spawn_checkpointer(engine: &Engine) -> Result<JoinHandle<()>> {
     let weak = Arc::downgrade(&engine.inner);
     let stop = Arc::clone(&engine.inner.stop);
@@ -625,9 +940,11 @@ fn spawn_checkpointer(engine: &Engine) -> Result<JoinHandle<()>> {
                 }
                 let Some(inner) = weak.upgrade() else { return };
                 inner.store.release_idle_reads();
-                let engine = Engine { inner };
-                let applied = engine.consensus().applied_index(engine.unit());
-                let bytes = engine.inner.log.stats().bytes;
+                let engine = Engine { user: None, inner };
+                // Entries written on every unit, not one unit's index.
+                let stats = engine.inner.log.stats();
+                let applied = stats.entries;
+                let bytes = stats.bytes;
                 let due = applied.saturating_sub(last_applied) >= every
                     || (every_bytes > 0 && bytes.saturating_sub(last_bytes) >= every_bytes)
                     || (applied > last_applied && last_time.elapsed() >= interval);

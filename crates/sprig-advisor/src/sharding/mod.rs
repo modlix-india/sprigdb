@@ -1,15 +1,14 @@
-//! The sharding advisor: table groups, distribution keys and
-//! the first design before a tenant's first split.
+//! The sharding advisor's design logic: table groups, distribution keys
+//! and verdicts from a workload and schema [`Input`], with no storage of
+//! its own (the input assembly, run records and apply steps that worked on
+//! MariaDB shard schemas are gone; this logic is kept for sharding big
+//! tenants across nodes).
 //!
 //! | Part | Module |
 //! |---|---|
-//! | Input assembly from the catalog and the workload store | [`input`] |
 //! | Graph, structural design, key filters, scoring, search, confidence, verdicts | [`design`] |
 //! | Key-value units: shard a Redis database or namespace only when a rule says so | [`kv`] |
 //! | The periodic run's `Rekey` verdict for tenants with table groups | [`periodic`] |
-//! | `advisor_runs` and decision-log evidence | [`runs`] |
-//! | Stored code keeps the tables it names in place | [`code`] |
-//! | The first-design plan: regroup by `RENAME` under a hold, `_sprig_rk`, back-fill | [`apply`] |
 //!
 //! [`settings`] declares the `advisor.*` keys.
 
@@ -22,13 +21,9 @@
     clippy::too_many_arguments
 )]
 
-pub mod apply;
-pub mod code;
 pub mod design;
-pub mod input;
 pub mod kv;
 pub mod periodic;
-pub mod runs;
 pub mod settings;
 
 pub use design::{Cause, Design, Input, Score, Verdict, decide, search, structural};

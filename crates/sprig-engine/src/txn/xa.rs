@@ -197,7 +197,11 @@ impl Txn {
         let mut locks = shared.locks.exclusive_keys(self.id);
         locks.retain(|k| writes.binary_search_by(|(w, _)| w.cmp(k)).is_err());
         let record = encode(&writes, &locks);
-        let key = record_key(path.unit_id(), xid);
+        // The record lives in the unit of the transaction's first write.
+        let home = writes
+            .first()
+            .map_or_else(|| path.notes_unit(), |(k, _)| path.unit_of(k));
+        let key = record_key(home, xid);
         let mut p = Payload::with_capacity(key.len() + record.len() + 16);
         p.put(Cf::Data, &key, &record);
         let durability = self.opts.durability;
@@ -206,9 +210,12 @@ impl Txn {
             writes,
             ticket: DurableTicket::Ready,
             durability,
+            home,
             finishing: false,
         };
-        let queued = shared.xa_register(xid, prepared, || path.propose(p.into_bytes(), durability));
+        let queued = shared.xa_register(xid, prepared, || {
+            propose_one(&*path, home, p.into_bytes(), durability)
+        });
         let ticket = match queued {
             Ok(t) => t,
             // Another session prepared the same XID in between.
@@ -247,7 +254,7 @@ impl Txn {
         let shared = path.shared();
         shared.recover_once(&**path);
         let p = shared.xa_claim(xid).ok_or_else(xaer_nota)?;
-        let key = record_key(path.unit_id(), xid);
+        let key = record_key(p.home, xid);
         let done = shared.commit_writes(&**path, p.id, p.writes, p.durability, Some(&key));
         shared.xa_finished(xid, done.is_ok());
         let (cts, ticket) = done?;
@@ -264,10 +271,10 @@ impl Txn {
         let shared = path.shared();
         shared.recover_once(&**path);
         let p = shared.xa_claim(xid).ok_or_else(xaer_nota)?;
-        let key = record_key(path.unit_id(), xid);
+        let key = record_key(p.home, xid);
         let mut payload = Payload::with_capacity(key.len() + 8);
         payload.delete(Cf::Data, &key);
-        let queued = path.propose(payload.into_bytes(), p.durability);
+        let queued = propose_one(&**path, p.home, payload.into_bytes(), p.durability);
         shared.xa_finished(xid, queued.is_ok());
         let ticket = queued?;
         shared.locks.release_all(p.id);
@@ -284,25 +291,43 @@ impl Txn {
     }
 }
 
+/// Proposes `payload` to `unit` alone.
+fn propose_one(
+    path: &dyn CommitPath,
+    unit: u64,
+    payload: Vec<u8>,
+    durability: Option<crate::log::Durability>,
+) -> Result<DurableTicket> {
+    path.propose_many(vec![(unit, payload)], durability)?
+        .pop()
+        .ok_or_else(|| SprigError::internal("the log returned no ticket"))
+}
+
 impl TxnShared {
     /// Reads the prepare records back from the store after a restart: each
     /// becomes a prepared transaction again, holding its exclusive locks.
     pub(crate) fn load_prepared(&self, path: &dyn CommitPath) {
-        let prefix = keys::unit_meta_key(path.unit_id(), FIELD);
+        // Every unit's bookkeeping: `<prefix> | unit u64 | field`.
+        let all = keys::unit_meta_key(0, b"");
+        let prefix = &all[..all.len() - 8];
         let mut found = Vec::new();
         {
             let mut it = path
                 .store()
-                .iter(Cf::Data, IterOpts::range(&KeyRange::prefix(&prefix)));
+                .iter(Cf::Data, IterOpts::range(&KeyRange::prefix(prefix)));
             it.seek_to_first();
             while it.valid() {
-                if let Some(xid) = it.key().strip_prefix(&prefix[..]) {
-                    found.push((xid.to_vec(), decode(it.value())));
+                let rest = &it.key()[prefix.len()..];
+                if rest.len() >= 8
+                    && let Some(xid) = rest[8..].strip_prefix(FIELD)
+                {
+                    let home = u64::from_be_bytes(rest[..8].try_into().unwrap_or([0; 8]));
+                    found.push((home, xid.to_vec(), decode(it.value())));
                 }
                 it.next();
             }
         }
-        for (xid, record) in found {
+        for (home, xid, record) in found {
             let (writes, locks) = match record {
                 Ok(r) => r,
                 Err(e) => {
@@ -322,6 +347,7 @@ impl TxnShared {
                     writes,
                     ticket: DurableTicket::Ready,
                     durability: None,
+                    home,
                     finishing: false,
                 },
             );

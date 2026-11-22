@@ -57,7 +57,6 @@ mod export;
 mod failover;
 mod gateway;
 mod graph;
-mod index;
 mod inherit;
 // Token issuers (external tokens).
 mod issuer;
@@ -72,7 +71,6 @@ mod recommendations;
 mod render;
 mod residency;
 mod settings;
-mod sharding;
 mod sink;
 mod space;
 // Tenant suspension.
@@ -500,12 +498,10 @@ fn cli() -> Command {
         .subcommand(cluster_group())
         .subcommand(tenant_group())
         .subcommand(settings::group())
-        .subcommand(index::group())
         .subcommand(recommendations::group())
-        .subcommand(index::explain_group())
+        .subcommand(placement::explain_group())
         .subcommand(mover::shard_group())
         .subcommand(mover::job_group())
-        .subcommand(sharding::advisor_group())
         .subcommand(gateway::group())
         .subcommand(check::group())
         .subcommand(logic::group())
@@ -607,13 +603,10 @@ fn main() -> ExitCode {
             "settings" => settings::run(&client, &matches, sub, output(&matches))
                 .await
                 .map(|()| ExitCode::SUCCESS),
-            "index" => index::run(&client, &matches, sub, output(&matches))
-                .await
-                .map(|()| ExitCode::SUCCESS),
             "recommendations" => recommendations::run(&client, &matches, sub, output(&matches))
                 .await
                 .map(|()| ExitCode::SUCCESS),
-            "explain" => index::explain(&client, sub, output(&matches))
+            "explain" => placement::explain(&client, sub, output(&matches))
                 .await
                 .map(|()| ExitCode::SUCCESS),
             "check" => check::no_restart(&client, sub, output(&matches))
@@ -653,12 +646,6 @@ fn main() -> ExitCode {
                 .await
                 .map(|()| ExitCode::SUCCESS),
             "ai" => ai::run(&client, sub, matches.get_flag("dry-run"), output(&matches))
-                .await
-                .map(|()| ExitCode::SUCCESS),
-            "shard" if sharding::run_shard(&client, sub, output(&matches)).await? => {
-                Ok(ExitCode::SUCCESS)
-            }
-            "advisor" => sharding::run_advisor(&client, sub, output(&matches))
                 .await
                 .map(|()| ExitCode::SUCCESS),
             "shard" | "job" => mover::run(&client, group, sub, output(&matches))

@@ -120,14 +120,23 @@ impl Overlay {
             .collect()
     }
 
-    /// Drops the versions of one applied commit.
-    pub fn remove_applied<'a>(&self, index: u64, keys: impl IntoIterator<Item = &'a Bytes>) {
+    /// Drops the versions of one applied commit: entry `index` of `unit`
+    /// (the unit as [`DurableTicket`] names it; `u64::MAX` for a ticket of
+    /// no unit).
+    pub fn remove_applied<'a>(
+        &self,
+        unit: u64,
+        index: u64,
+        keys: impl IntoIterator<Item = &'a Bytes>,
+    ) {
         let mut m = self.write();
         let mut n = 0;
         for k in keys {
             if let Some(vs) = m.get_mut(k) {
                 let before = vs.len();
-                vs.retain(|v| v.index() != index);
+                vs.retain(|v| {
+                    v.index() != index || v.ticket.unit_key().unwrap_or(u64::MAX) != unit
+                });
                 n += before - vs.len();
                 if vs.is_empty() {
                     m.remove(k);

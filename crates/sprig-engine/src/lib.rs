@@ -32,7 +32,7 @@ pub mod store;
 pub mod txn;
 
 pub use config::{EngineConfig, StoreKind};
-pub use engine::{Engine, EngineStats, VersionGc};
+pub use engine::{Engine, EngineStats, NODE_UNIT, VersionGc, unit_of_key};
 pub use keys::Ts;
 pub use log::{Durability, UnitId};
 pub use observe::ApplyObserver;

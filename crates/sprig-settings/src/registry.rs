@@ -235,16 +235,6 @@ pub enum Mark {
 /// an unread key that isn't marked.
 pub const MARKED: &[(&str, Mark, &str)] = &[
     (
-        "auto_index.field_column_class_pct",
-        Mark::Unbuilt,
-        "document indexes use the class-and-value columns for every path; typed single-class columns aren't built",
-    ),
-    (
-        "auto_index.wildcard_recommend_paths",
-        Mark::Unbuilt,
-        "nothing produces advice recommendations (advice_wildcard) yet",
-    ),
-    (
         "failover.quarantine_days",
         Mark::Unbuilt,
         "diverged-transaction extracts are kept until an operator removes them",

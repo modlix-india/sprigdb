@@ -130,26 +130,86 @@ pub enum DurableTicket {
     Log(Ticket),
     /// An index of the test path's log.
     Watch(Arc<DurableWatch>, u64),
+    /// Entries of several units (a commit across units, or reads of
+    /// pending versions on several units): every one must be durable.
+    /// Never empty, and never holds another `Many`.
+    Many(Arc<[DurableTicket]>),
 }
 
 impl DurableTicket {
-    /// The log index waited for (0 for [`DurableTicket::Ready`]).
+    /// The log index waited for (0 for [`DurableTicket::Ready`]; the
+    /// first unit's for [`DurableTicket::Many`]).
     #[must_use]
     pub fn index(&self) -> u64 {
         match self {
             DurableTicket::Ready => 0,
             DurableTicket::Log(t) => t.index(),
             DurableTicket::Watch(_, i) => *i,
+            DurableTicket::Many(ts) => ts.first().map_or(0, DurableTicket::index),
         }
     }
 
-    /// The later of two tickets of one unit (its log is in index order).
+    /// The unit whose log the ticket waits on (`None`: nothing to wait for,
+    /// or several units). The test path's log counts as one unit.
+    pub(crate) fn unit_key(&self) -> Option<u64> {
+        match self {
+            DurableTicket::Log(t) => Some(t.unit().0),
+            DurableTicket::Watch(..) => Some(u64::MAX),
+            DurableTicket::Ready | DurableTicket::Many(_) => None,
+        }
+    }
+
+    /// Both tickets at once: the later of the two on one unit (its log is
+    /// in index order), every unit's latest across units.
     #[must_use]
     pub fn max(self, other: DurableTicket) -> DurableTicket {
-        if other.index() > self.index() {
-            other
+        match (&self, &other) {
+            (DurableTicket::Ready, _) => return other,
+            (_, DurableTicket::Ready) => return self,
+            _ => {}
+        }
+        if let (Some(a), Some(b)) = (self.unit_key(), other.unit_key())
+            && a == b
+        {
+            return if other.index() > self.index() {
+                other
+            } else {
+                self
+            };
+        }
+        let mut parts: Vec<DurableTicket> = Vec::new();
+        for t in [self, other] {
+            match t {
+                DurableTicket::Many(ts) => {
+                    for x in ts.iter() {
+                        merge_part(&mut parts, x.clone());
+                    }
+                }
+                t => merge_part(&mut parts, t),
+            }
+        }
+        if parts.len() == 1 {
+            parts.pop().unwrap_or_default()
         } else {
-            self
+            DurableTicket::Many(parts.into())
+        }
+    }
+
+    /// The tickets of a commit across units, in order.
+    #[must_use]
+    pub fn all(tickets: Vec<DurableTicket>) -> DurableTicket {
+        tickets
+            .into_iter()
+            .fold(DurableTicket::Ready, DurableTicket::max)
+    }
+
+    /// The first log ticket (for [`DurableTicket::Many`], its first part's).
+    #[must_use]
+    pub fn first_log(&self) -> Option<&Ticket> {
+        match self {
+            DurableTicket::Log(t) => Some(t),
+            DurableTicket::Many(ts) => ts.iter().find_map(DurableTicket::first_log),
+            _ => None,
         }
     }
 
@@ -160,6 +220,7 @@ impl DurableTicket {
             DurableTicket::Ready => true,
             DurableTicket::Log(t) => t.is_durable(),
             DurableTicket::Watch(w, i) => w.durable() >= *i,
+            DurableTicket::Many(ts) => ts.iter().all(DurableTicket::is_durable),
         }
     }
 
@@ -173,6 +234,7 @@ impl DurableTicket {
             DurableTicket::Ready => Ok(()),
             DurableTicket::Log(t) => t.wait().map_err(|_| super::errors::outcome_lost()),
             DurableTicket::Watch(w, i) => w.wait_blocking(*i),
+            DurableTicket::Many(ts) => ts.iter().try_for_each(DurableTicket::wait),
         }
     }
 
@@ -198,6 +260,28 @@ impl DurableTicket {
                 }
                 .await
             }
+            DurableTicket::Many(ts) => {
+                for t in ts.iter() {
+                    Box::pin(t.wait_async()).await?;
+                }
+                Ok(())
+            }
         }
     }
+}
+
+/// Adds `t` to `parts`, keeping one ticket per unit (the later one).
+fn merge_part(parts: &mut Vec<DurableTicket>, t: DurableTicket) {
+    if matches!(t, DurableTicket::Ready) {
+        return;
+    }
+    if let Some(k) = t.unit_key()
+        && let Some(slot) = parts.iter_mut().find(|p| p.unit_key() == Some(k))
+    {
+        if t.index() > slot.index() {
+            *slot = t;
+        }
+        return;
+    }
+    parts.push(t);
 }

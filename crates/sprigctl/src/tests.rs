@@ -894,5 +894,4 @@ async fn tenant_calls_over_the_admin_api() {
 
 // --- Settings --------------------------------------------------------------
 
-mod index_cli;
 mod settings_cli;

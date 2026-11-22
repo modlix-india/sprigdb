@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -48,21 +48,52 @@ pub(crate) struct PreparedTxn {
     pub(crate) ticket: DurableTicket,
     /// The durability class its session asked for.
     pub(crate) durability: Option<Durability>,
+    /// The unit holding its prepare record.
+    pub(crate) home: u64,
     /// A session is committing or rolling it back right now. It stays
     /// listed meanwhile, so its XID stays taken.
     pub(crate) finishing: bool,
 }
 
-/// Per-unit transaction state, shared by every transaction of the unit.
+/// Commit timestamps taken and not yet published, and the newest one
+/// published.
+#[derive(Debug, Default)]
+struct Inflight {
+    open: BTreeMap<Ts, u32>,
+    done_max: Ts,
+}
+
+/// One part of a commit: the writes, plain writes and notes for one unit.
+#[derive(Default)]
+struct UnitPart<'a> {
+    writes: Vec<(Bytes, Option<Bytes>)>,
+    extras: Vec<&'a super::transaction::Extra>,
+    delete: Option<&'a [u8]>,
+}
+
+/// The node's transaction state, shared by every transaction: one clock,
+/// one lock table and one set of read views over all units, and each
+/// unit's commit latch.
 pub struct TxnShared {
     pub(crate) hlc: Hlc,
     pub(crate) locks: Arc<LockTable>,
     pub(crate) overlay: Overlay,
-    commit_latch: Mutex<()>,
-    /// Commits whose versions are still in the overlay: `(index, keys)`.
-    unapplied: Mutex<VecDeque<(u64, Vec<Bytes>)>>,
-    /// The commit timestamp of the last queued commit. New read views take
-    /// it, so every version at or below a view is already readable.
+    /// One commit latch per unit: a unit's commits take their timestamps
+    /// and log indexes in the same order. A commit across units holds every
+    /// unit's latch, taken in unit order.
+    latches: RwLock<HashMap<u64, Arc<Mutex<()>>>>,
+    /// Commits that took a timestamp and are not yet in the overlay.
+    inflight: Mutex<Inflight>,
+    /// Signalled when `visible_ts` moves.
+    published: Condvar,
+    /// Counts commits published to the overlay (a locking scan rereads
+    /// when it moved).
+    commit_seq: AtomicU64,
+    /// Commits whose versions are still in the overlay: `(unit, index,
+    /// keys)`.
+    unapplied: Mutex<VecDeque<(u64, u64, Vec<Bytes>)>>,
+    /// Every commit at or below this timestamp is in the overlay or the
+    /// store. New read views take it, on every unit of the node.
     visible_ts: AtomicU64,
     views: [Mutex<BTreeMap<Ts, usize>>; VIEW_SHARDS],
     next_txn: AtomicU64,
@@ -123,7 +154,10 @@ impl TxnShared {
                 max_lock_bytes_per_txn: config.max_lock_bytes_per_txn,
             })),
             overlay: Overlay::default(),
-            commit_latch: Mutex::new(()),
+            latches: RwLock::new(HashMap::new()),
+            inflight: Mutex::new(Inflight::default()),
+            published: Condvar::new(),
+            commit_seq: AtomicU64::new(0),
             unapplied: Mutex::new(VecDeque::new()),
             visible_ts: AtomicU64::new(start.0),
             views: std::array::from_fn(|_| Mutex::new(BTreeMap::new())),
@@ -339,6 +373,11 @@ impl TxnShared {
     }
 
     /// [`TxnShared::commit_writes`], with log notes in the same entry.
+    ///
+    /// Each write goes to the unit its key belongs to, notes to the unit
+    /// that carries them. Writes to one unit are one log entry; writes to
+    /// several are one entry per unit, proposed as one atomic write, all at
+    /// one commit timestamp.
     pub(crate) fn commit_writes_noted(
         &self,
         path: &dyn CommitPath,
@@ -348,38 +387,98 @@ impl TxnShared {
         also_delete: Option<&[u8]>,
         notes: &[super::transaction::Extra],
     ) -> Result<(Ts, DurableTicket)> {
-        let size: usize = writes
-            .iter()
-            .map(|(k, v)| k.len() + 24 + v.as_ref().map_or(0, Bytes::len))
-            .sum();
-        let mut val = Vec::new();
-        let (cts, ticket) = {
-            let _latch = lock_or_recover(&self.commit_latch);
-            let cts = self.hlc.now();
-            let mut p = Payload::with_capacity(size);
-            for (k, v) in &writes {
-                val.clear();
-                encode_value_into(&mut val, v.as_deref());
-                p.put(Cf::Data, &keys::versioned(k, cts), &val);
-            }
-            if let Some(key) = also_delete {
-                p.delete(Cf::Data, key);
-            }
-            for n in notes {
-                match n {
-                    super::transaction::Extra::Note(b) => p.note(b),
-                    super::transaction::Extra::Put(cf, k, v) => p.put(*cf, k, v),
-                    super::transaction::Extra::Delete(cf, k) => p.delete(*cf, k),
+        use super::transaction::Extra;
+        let notes_unit = path.notes_unit();
+        let mut parts: BTreeMap<u64, UnitPart<'_>> = BTreeMap::new();
+        for (k, v) in writes {
+            parts
+                .entry(path.unit_of(&k))
+                .or_default()
+                .writes
+                .push((k, v));
+        }
+        if let Some(key) = also_delete {
+            parts.entry(path.unit_of(key)).or_default().delete = Some(key);
+        }
+        for n in notes {
+            let u = match n {
+                Extra::Note(_) => notes_unit,
+                Extra::Put(_, k, _) | Extra::Delete(_, k) => path.unit_of(k),
+            };
+            parts.entry(u).or_default().extras.push(n);
+        }
+        if parts.is_empty() {
+            parts.entry(notes_unit).or_default();
+        }
+        let latches: Vec<Arc<Mutex<()>>> = parts.keys().map(|u| self.latch(*u)).collect();
+        let (cts, tickets) = {
+            let _held: Vec<MutexGuard<'_, ()>> =
+                latches.iter().map(|l| lock_or_recover(l)).collect();
+            let cts = self.take_commit_ts();
+            let mut val = Vec::new();
+            let mut payloads = Vec::with_capacity(parts.len());
+            for (u, part) in &parts {
+                let size: usize = part
+                    .writes
+                    .iter()
+                    .map(|(k, v)| k.len() + 24 + v.as_ref().map_or(0, Bytes::len))
+                    .sum();
+                let mut p = Payload::with_capacity(size);
+                for (k, v) in &part.writes {
+                    val.clear();
+                    encode_value_into(&mut val, v.as_deref());
+                    p.put(Cf::Data, &keys::versioned(k, cts), &val);
                 }
+                if let Some(key) = part.delete {
+                    p.delete(Cf::Data, key);
+                }
+                for n in &part.extras {
+                    match n {
+                        Extra::Note(b) => p.note(b),
+                        Extra::Put(cf, k, v) => p.put(*cf, k, v),
+                        Extra::Delete(cf, k) => p.delete(*cf, k),
+                    }
+                }
+                payloads.push((*u, p.into_bytes()));
             }
-            let ticket = path.propose(p.into_bytes(), durability)?;
-            self.overlay
-                .insert(cts, &ticket, writes.iter().map(|(k, v)| (k, v)));
-            lock_or_recover(&self.unapplied)
-                .push_back((ticket.index(), writes.into_iter().map(|(k, _)| k).collect()));
-            self.visible_ts.store(cts.0, Ordering::Release);
-            (cts, ticket)
+            let tickets = match path.propose_many(payloads, durability) {
+                Ok(t) => t,
+                Err(e) => {
+                    self.publish_commit_ts(cts);
+                    return Err(e);
+                }
+            };
+            for (part, ticket) in parts.values().zip(&tickets) {
+                if part.writes.is_empty() {
+                    continue;
+                }
+                self.overlay
+                    .insert(cts, ticket, part.writes.iter().map(|(k, v)| (k, v)));
+                lock_or_recover(&self.unapplied).push_back((
+                    ticket.unit_key().unwrap_or(u64::MAX),
+                    ticket.index(),
+                    part.writes.iter().map(|(k, _)| k.clone()).collect(),
+                ));
+            }
+            self.commit_seq.fetch_add(1, Ordering::AcqRel);
+            self.publish_commit_ts(cts);
+            (cts, tickets)
         };
+        // The unit carrying the notes comes first: its entry is the one
+        // observers report outcomes under.
+        let mut ordered: Vec<DurableTicket> = Vec::with_capacity(tickets.len());
+        let mut rest = Vec::with_capacity(tickets.len());
+        for (u, t) in parts.keys().zip(tickets) {
+            if *u == notes_unit && !notes.is_empty() {
+                ordered.push(t);
+            } else {
+                rest.push(t);
+            }
+        }
+        ordered.extend(rest);
+        let ticket = DurableTicket::all(ordered);
+        // The session's next read view must see this commit.
+        self.wait_visible(cts);
         if self.early_lock_release() {
             self.locks.release_all(txn);
         } else {
@@ -393,18 +492,88 @@ impl TxnShared {
         Ok((cts, ticket))
     }
 
+    /// `unit`'s commit latch.
+    fn latch(&self, unit: u64) -> Arc<Mutex<()>> {
+        if let Some(l) = self
+            .latches
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&unit)
+        {
+            return Arc::clone(l);
+        }
+        let mut w = self
+            .latches
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(w.entry(unit).or_default())
+    }
+
+    /// Takes a commit timestamp and records it as in flight, so read views
+    /// stay below it until it is published.
+    fn take_commit_ts(&self) -> Ts {
+        let mut g = lock_or_recover(&self.inflight);
+        let cts = self.hlc.now();
+        *g.open.entry(cts).or_insert(0) += 1;
+        cts
+    }
+
+    /// `cts`'s commit is in the overlay (or failed): read views may move up
+    /// to just below the oldest commit still in flight.
+    fn publish_commit_ts(&self, cts: Ts) {
+        let mut g = lock_or_recover(&self.inflight);
+        if let Some(n) = g.open.get_mut(&cts) {
+            *n -= 1;
+            if *n == 0 {
+                g.open.remove(&cts);
+            }
+        }
+        g.done_max = g.done_max.max(cts);
+        let visible = match g.open.keys().next() {
+            Some(oldest) => Ts(oldest.0.saturating_sub(1)).min(g.done_max),
+            None => g.done_max,
+        };
+        self.visible_ts.fetch_max(visible.0, Ordering::AcqRel);
+        drop(g);
+        self.published.notify_all();
+    }
+
+    /// Waits until read views see `cts`: until every commit that took an
+    /// older timestamp (on another unit) is published too. A commit in
+    /// flight holds every latch it needs, so this never waits on the
+    /// caller.
+    fn wait_visible(&self, cts: Ts) {
+        if self.visible_ts.load(Ordering::Acquire) >= cts.0 {
+            return;
+        }
+        let mut g = lock_or_recover(&self.inflight);
+        while self.visible_ts.load(Ordering::Acquire) < cts.0 {
+            g = self
+                .published
+                .wait(g)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// Changes whenever a commit enters the overlay.
+    pub(crate) fn commit_seq(&self) -> u64 {
+        self.commit_seq.load(Ordering::Acquire)
+    }
+
     /// Drops overlay versions the store has applied.
     pub(crate) fn prune(&self, path: &dyn CommitPath) {
         if self.overlay.is_empty() {
             return;
         }
-        let applied = path.applied_index();
         let Ok(mut q) = self.unapplied.try_lock() else {
             return;
         };
-        while q.front().is_some_and(|(i, _)| *i <= applied) {
-            if let Some((i, keys)) = q.pop_front() {
-                self.overlay.remove_applied(i, keys.iter());
+        while let Some(&(unit, i, _)) = q.front() {
+            if i > path.applied_index_of(unit) {
+                break;
+            }
+            if let Some((unit, i, keys)) = q.pop_front() {
+                self.overlay.remove_applied(unit, i, keys.iter());
             }
         }
     }

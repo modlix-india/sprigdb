@@ -30,12 +30,6 @@
 //! - [`tenants`]: tenant bootstrap and deletion, and the
 //!   `tenant_bootstrap` loop that finishes or fails them; [`catalogs`]:
 //!   how the controller reaches tenant catalogs;
-//! - [`autoindex_admin`]: the Admin API's automatic-indexing calls behind
-//!   `sprigctl index` and `sprigctl explain query`;
-//! - [`autoindex_loop`]: the `auto_index` loop, evaluate → validate → roll
-//!   out → observe per tenant, with
-//!   [`autoindex_env`], its view of catalogs, objects, settings and
-//!   clusters;
 //! - [`catalog_reconciler`]: the `catalog_reconciler` loop: stuck DDL jobs finished or rolled back, missing and orphan
 //!   schemas, outside objects adopted, tombstones purged by age, clamped
 //!   setting values counted.
@@ -67,13 +61,6 @@ pub fn catalog_records() -> Arc<dyn sprig_catalog::RecordStore> {
 pub mod admin;
 // Approvals and recommendations for every automatic decision.
 pub mod approvals;
-pub mod autoindex_admin;
-pub mod autoindex_doc;
-pub mod autoindex_env;
-pub mod autoindex_loop;
-pub mod autoindex_stats;
-pub mod autoindex_validate;
-pub mod autoindex_workload;
 // The BackupMissed alert's gauge, from the backup tools' records.
 pub mod backups;
 pub mod balancer_loop;
@@ -104,8 +91,8 @@ pub mod residency;
 pub mod runtime;
 pub mod settings;
 pub mod settings_admin;
-pub mod sharding;
-pub mod sharding_runtime;
+// `sprigctl graph list|show`.
+pub mod graph_views;
 // Job standbys kept current by the mover.
 pub mod standby;
 // The graph mirror applier jobs.
@@ -132,7 +119,6 @@ pub mod tree_settings;
 pub mod txn_resolver;
 pub mod users;
 pub mod workload_rollup;
-pub mod write_load;
 // AI providers in the Admin API and the payload purge.
 pub mod ai_admin;
 pub mod ai_digest;
@@ -248,7 +234,6 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
     };
     let registry = ClusterRegistry::new(Arc::clone(&stores.global), Arc::clone(&stores.dc))?;
     let registry_for_balancer = registry.clone();
-    let registry_for_sharding = registry.clone();
     let registry_for_scopes = registry.clone();
     let monitor = Arc::new(ClusterMonitor::new(
         registry.clone(),
@@ -326,38 +311,6 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         Directory::new(Arc::clone(&stores.global)),
         Arc::clone(&clock),
     ));
-    // Automatic indexing holds a catalog connection for a whole pass (and
-    // its Admin API for a request) while it reads snapshots, samples and
-    // decisions: those long-held connections come from their own budget,
-    // so they can never starve the short calls of every other loop
-    // (see the `catalogs` module docs).
-    let ai_sessions = ShardMapLocator::new(
-        Arc::clone(&homes),
-        Arc::new(
-            RegistryPools::new(catalog_registry.clone(), Some(Arc::clone(&monitor)))
-                .budget("autoindex", autoindex_loop::SESSIONS),
-        ),
-        default_naming(),
-    )
-    .with_directory(Arc::clone(&stores.global));
-    let indexes = Arc::new(
-        autoindex_admin::AutoIndexService::new(
-            Directory::new(Arc::clone(&stores.global)),
-            Arc::new(ai_sessions.clone()),
-            versioner.clone(),
-            settings.live.clone(),
-            Arc::clone(&clock),
-        )
-        // `sprigctl index restore` runs its statements on the shards.
-        .with_env(Arc::new(autoindex_env::ControllerEnv::new(
-            dc.clone(),
-            locator.clone(),
-            registry.clone(),
-            Some(Arc::clone(&monitor)),
-            Some(settings.live.clone()),
-            autoindex_loop::JobShardLocks::new(Arc::clone(&stores.dc)),
-        ))),
-    );
     let auth_catalog = Versioner::new(
         sprig_catalog::RecBackend::new(Arc::clone(&auth_records)).with_clock(Arc::clone(&clock)),
         Arc::new(DirectoryAllocator::new(Arc::clone(&stores.global))),
@@ -367,97 +320,8 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         auth_catalog,
         Arc::clone(&clock),
     ));
-    // Automatic indexing: evaluation, validation, builds and observation
-    // on the DC leader (no worker job runtime yet), reading the workload
-    // store in the tenants' catalogs.
-    let jobs = autoindex_loop::JobShardLocks::new(Arc::clone(&stores.dc));
     let catalog_locator: Arc<dyn sprig_catalog::CatalogLocator> = Arc::new(locator.clone());
     let logic_locator = Arc::clone(&catalog_locator);
-    let workload_store: Arc<dyn sprig_workload::store::WorkloadStore> = Arc::new(
-        sprig_workload::store::CatalogWorkloadStore::new(Arc::clone(&auth_records)),
-    );
-    let keyring: Option<Arc<dyn sprig_workload::keyring::TenantKeyring>> =
-        if let Some(p) = &cfg.controller.workload_key_file {
-            let k = sprig_workload::keyring::MasterKeyring::from_file(p)?;
-            tracing::info!(versions = ?k.versions(), "workload sample keys loaded");
-            Some(Arc::new(k))
-        } else {
-            tracing::info!(
-                "no [controller] workload_key_file: automatic-index validation uses \
-                 estimates and a canary only"
-            );
-            None
-        };
-    let ai_clock: Arc<dyn Clock> = match &cfg.controller.autoindex_test_clock_file {
-        Some(f) => {
-            tracing::warn!(file = %f.display(), "auto_index runs on a test clock");
-            Arc::new(autoindex_env::SkewClock::new(Arc::clone(&clock), f.clone()))
-        }
-        None => Arc::clone(&clock),
-    };
-    let ai_env = Arc::new(
-        autoindex_env::ControllerEnv::new(
-            dc.clone(),
-            locator.clone(),
-            registry.clone(),
-            Some(Arc::clone(&monitor)),
-            Some(settings.live.clone()),
-            jobs.clone(),
-        )
-        .with_sessions(ai_sessions),
-    );
-    let ai_eval = autoindex_env::EvalShim::new(
-        Arc::clone(&ai_env),
-        Arc::clone(&ai_clock),
-        Arc::new(autoindex_workload::StoreSource::new(Arc::clone(
-            &workload_store,
-        ))),
-        Arc::new(sprig_advisor::autoindex::store::LogDecisions),
-    );
-    let marker: Arc<dyn sprig_advisor::autoindex::validate::NodeMarker> =
-        Arc::new(autoindex_validate::LogMarker);
-    // Validations' statistics snapshots, kept in the DC tier until they
-    // are back on their node.
-    let ai_stats: Arc<dyn sprig_advisor::autoindex::validate::journal::StatsJournal> = Arc::new(
-        autoindex_stats::EtcdStatsJournal::new(Arc::clone(&stores.dc)),
-    );
-    let auto_index = autoindex_loop::AutoIndexLoop::new(
-        ai_env,
-        autoindex_loop::AutoIndexHooks {
-            candidates: Arc::new(ai_eval),
-            validation: Arc::new(
-                autoindex_validate::SampleValidation::new(
-                    Arc::clone(&catalog_locator),
-                    registry,
-                    keyring.clone(),
-                    Arc::clone(&marker),
-                )
-                .with_stats_journal(Arc::clone(&ai_stats)),
-            ),
-            workload: Arc::new(autoindex_workload::ObserveSource::new(
-                workload_store,
-                catalog_locator,
-                keyring,
-                Arc::clone(&ai_clock),
-            )),
-            locks: Arc::new(jobs),
-            mover: None,
-            marker,
-            decisions: Arc::new(sprig_advisor::autoindex::store::LogDecisions),
-            docs: Some(Arc::new(autoindex_doc::DocRegistry::new(versioner.clone()))),
-            stats: Some(ai_stats),
-        },
-        Directory::new(Arc::clone(&stores.global)),
-        dc.clone(),
-        Arc::clone(&ai_clock),
-        // Passes every minute at most; evaluation is paced by
-        // auto_index.eval_interval_minutes (resolved per tenant).
-        autoindex_loop::Cadence {
-            eval_every: Duration::from_secs(60),
-            max_requeue: Duration::from_secs(60),
-            ..autoindex_loop::Cadence::default()
-        },
-    );
     // The AI assistants' exact payloads past `ai.audit_payload_days`.
     let ai_purge = ai_admin::AiPurgeLoop::new(
         Directory::new(Arc::clone(&stores.global)),
@@ -482,8 +346,7 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         ))),
     );
     // Tenant, database and object scopes from the tenants' catalogs, for
-    // the loops below that decide per tenant (the balancer and the
-    // sharding loop too).
+    // the loops below that decide per tenant (the balancer too).
     let tenant_scopes = tenant_scopes::TenantScopes::new(
         Arc::clone(&stores.global),
         Arc::clone(&stores.dc),
@@ -508,27 +371,6 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             Some(move_exec),
             cfg.node.id().clone(),
         )
-        .with_tenant_scopes(Arc::clone(&tenant_scopes)),
-    );
-    // The advisor's first design and automatic
-    // split, merge and move, per tenant homed here.
-    let sharding = Arc::new(
-        sharding_runtime::ShardingRuntime::new(
-            dc.clone(),
-            Arc::clone(&stores.dc),
-            Arc::clone(&stores.global),
-            Arc::clone(&clock),
-            Arc::new(
-                RegistryPools::new(registry_for_sharding, Some(Arc::clone(&monitor)))
-                    .budget("sharding", sharding_runtime::POOL_MAX),
-            ),
-            Arc::new(sprig_balancer::decisions::CatalogDecisionLog::new(
-                Arc::clone(&auth_records),
-            )),
-            Some(settings.live.clone()),
-            &format!("controller:{}", cfg.node.id()),
-        )
-        .with_publish(versioner.clone())
         .with_tenant_scopes(Arc::clone(&tenant_scopes)),
     );
     // Approvals and recommendations. Items about a tenant live
@@ -598,9 +440,6 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             .with_locator(Arc::new(locator.clone()))
             .with_records(Arc::clone(&auth_records)),
         );
-        let ix = Arc::new(approvals::index::IndexApprovals::new(Arc::clone(&indexes)));
-        a.register_producer(ix.clone());
-        a.register(sprig_approvals::Kind::IndexCreate, ix);
         a.register(
             sprig_approvals::Kind::DcMove,
             Arc::new(approvals::DcMoveProgress::new(Directory::new(Arc::clone(
@@ -623,15 +462,9 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         );
         a
     };
-    let _ = sharding.sharding().approvals.set(Arc::clone(&approvals));
-    let _ = sharding.sharding().records.set(Arc::clone(&auth_records));
     let _ = balancer.approvals.set(Arc::clone(&approvals));
     approvals::install(Arc::clone(&approvals));
     notifier.bind(Arc::clone(&approvals));
-    // Load splits need placement's hot clusters.
-    sharding
-        .write_load()
-        .set_placement(Arc::clone(&balancer) as Arc<dyn write_load::HotClusters>);
     let tenants = Arc::new(TenantService::new(
         Arc::clone(&stores.dc),
         locator.clone(),
@@ -641,7 +474,7 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         // A member below FOR EACH TENANT messaging
         // definitions gets their catalog modules at creation.
         Arc::new(inherit_loop::WithMessagingModules::new(
-            balancer_loop::WithDecisions(autoindex_loop::WithAutoIndex(users::AuthHooks)),
+            balancer_loop::WithDecisions(users::AuthHooks),
             locator.clone(),
         )),
         Arc::clone(&clock),
@@ -706,7 +539,7 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             registry: ClusterRegistry::new(Arc::clone(&stores.global), Arc::clone(&stores.dc))?,
             monitor: Arc::clone(&monitor),
             balancer: Arc::clone(&balancer),
-            sizes: sharding.sharding().ai_sizes.clone(),
+            sizes: ai_health::ShardSizes::default(),
             live: Some((settings.live.clone(), dc.clone())),
             locator: Arc::new(locator.clone()),
             pools: RegistryPools::new(
@@ -738,7 +571,6 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         .with_loop(Loop::new(tree_loop))
         .with_loop(Loop::new(TenantLifecycle::new(Arc::clone(&tenants))))
         .with_loop(Loop::new(reconciler))
-        .with_loop(Loop::new(auto_index))
         .with_loop(Loop::new(workload_rollup))
         .with_loop(Loop::new(ai_purge))
         .with_loop(Loop::new(Arc::clone(&balancer)))
@@ -748,7 +580,6 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             dc_migrate::MigrationDecider::new(Arc::clone(&moves), Some(Arc::clone(&balancer)))
                 .with_approvals(Arc::clone(&approvals)),
         ))
-        .with_loop(Loop::from_arc(Arc::clone(&sharding)))
         // In-doubt distributed transactions and decision rows.
         .with_loop(Loop::new(txn_resolver::ResolverLoop::for_controller(
             &dc,
@@ -961,10 +792,11 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             .with_tenants(tenants)
             .with_users(users)
             .with_settings(Arc::clone(&settings_admin) as Arc<dyn settings_admin::SettingsAdmin>)
-            .with_indexes(indexes)
             .with_placement(balancer)
             .with_moves(moves)
-            .with_sharding(sharding.sharding())
+            .with_graphs(Arc::new(graph_views::GraphViews::new(Arc::clone(
+                &auth_records,
+            ))))
             .with_failover(Arc::clone(&failover))
             .with_residency(residency)
             .with_search_catalog(versioner.clone())

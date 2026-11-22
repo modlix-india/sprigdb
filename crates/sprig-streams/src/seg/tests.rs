@@ -535,24 +535,22 @@ async fn opens_after_a_binary_without_floors_trimmed_the_log() {
         l.flush().unwrap();
     }
     // An older binary: it doesn't know the stream log's floor, writes
-    // engine records and trims the commit log past the floor.
+    // more entries on the log the stream log rides on, and trims that log
+    // past the floor.
     {
         let e = engine(d.path());
         let floor = e.log_floor(FLOOR).unwrap();
         e.clear_log_floor(FLOOR).unwrap();
-        let r = records::StreamRecords::new(e.clone());
-        for i in 0..20 {
-            let t = records::TopicRecord {
-                name: format!("db.s{i}"),
-                stream_id: 0,
-                partitions: 1,
-                retention_ms: None,
-                retention_bytes: None,
-                compact: None,
-                max_message_bytes: None,
-                created_ms: 1,
-            };
-            r.create(5, t).await.unwrap();
+        for _ in 0..20 {
+            e.consensus()
+                .propose(
+                    e.notes_unit(),
+                    sprig_engine::log::Payload::new().into_bytes(),
+                    sprig_engine::Durability::Local,
+                )
+                .unwrap()
+                .wait_applied()
+                .unwrap();
         }
         e.checkpoint().unwrap();
         assert!(e.last_applied() > floor + 1);
@@ -581,7 +579,7 @@ async fn opens_after_a_binary_without_floors_trimmed_the_log() {
 struct NoObserver;
 
 impl sprig_engine::observe::ApplyObserver for NoObserver {
-    fn applied(&self, _: &[sprig_engine::log::LogEntry]) {}
+    fn applied(&self, _: sprig_engine::UnitId, _: &[sprig_engine::log::LogEntry]) {}
 }
 
 #[test]
@@ -622,7 +620,7 @@ async fn the_floor_never_passes_what_the_commit_log_holds_durably() {
     // Applied, not yet durable: the flush doesn't write a manifest or
     // raise the floor past the durable index.
     assert!(l.flush().is_err());
-    let durable = e.consensus().durable_index(e.unit());
+    let durable = e.consensus().durable_index(e.notes_unit());
     assert!(e.log_floor(FLOOR).unwrap_or(0) <= durable);
     assert!(
         read_manifest(&d.path().join("streams"))

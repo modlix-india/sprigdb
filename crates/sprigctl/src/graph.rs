@@ -1,10 +1,9 @@
-//! `sprigctl graph list|show|partition`, over
-//! the Admin API's `/admin/v1/tenants/{name}/graphs`.
+//! `sprigctl graph list|show`, over the Admin API's
+//! `/admin/v1/tenants/{name}/graphs`.
 //!
 //! ```text
 //! sprigctl graph list acme
 //! sprigctl graph show acme social.friends
-//! sprigctl graph partition acme social.friends
 //! ```
 
 use clap::{Arg, ArgMatches, Command};
@@ -34,13 +33,7 @@ pub(crate) fn group() -> Command {
         )
         .subcommand(
             Command::new("show")
-                .about("One graph: labels, types, indexes, shards and row counts")
-                .arg(tenant())
-                .arg(graph()),
-        )
-        .subcommand(
-            Command::new("partition")
-                .about("How a graph is partitioned, and the share of relationships crossing shards")
+                .about("One graph: labels, types and indexes")
                 .arg(tenant())
                 .arg(graph()),
         )
@@ -55,7 +48,7 @@ fn s(v: &Value, k: &str) -> String {
 }
 
 fn list_text(v: &Value) -> String {
-    let rows: Vec<[String; 7]> = v
+    let rows: Vec<[String; 6]> = v
         .as_array()
         .map(|a| {
             a.iter()
@@ -67,18 +60,12 @@ fn list_text(v: &Value) -> String {
                         s(g, "kind"),
                         s(g, "state"),
                         s(g, "group"),
-                        s(g, "shards"),
                     ]
                 })
                 .collect()
         })
         .unwrap_or_default();
-    table(
-        [
-            "DATABASE", "GRAPH", "ID", "KIND", "STATE", "GROUP", "SHARDS",
-        ],
-        &rows,
-    )
+    table(["DATABASE", "GRAPH", "ID", "KIND", "STATE", "GROUP"], &rows)
 }
 
 fn show_text(v: &Value) -> String {
@@ -151,52 +138,7 @@ fn show_text(v: &Value) -> String {
             &idx,
         ));
     }
-    let shards: Vec<[String; 6]> = v["shards"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .map(|x| {
-                    [
-                        s(x, "shard"),
-                        s(x, "cluster"),
-                        s(x, "nodes"),
-                        s(x, "relationships"),
-                        s(x, "mirrors"),
-                        s(x, "claims"),
-                    ]
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    if !shards.is_empty() {
-        out.push_str(&table(
-            [
-                "SHARD",
-                "CLUSTER",
-                "NODES",
-                "RELATIONSHIPS",
-                "MIRRORS",
-                "CLAIMS",
-            ],
-            &shards,
-        ));
-    }
     out
-}
-
-fn partition_text(v: &Value) -> String {
-    let g = &v["graph"];
-    format!(
-        "Graph {}.{}: {} shard(s), partitioned by {}\n{} of {} relationships cross shards ({}%)\n{}\n",
-        s(g, "database"),
-        s(g, "name"),
-        s(g, "shards"),
-        s(v, "partition_by"),
-        s(v, "cross_shard"),
-        s(v, "relationships"),
-        s(v, "cross_shard_pct"),
-        s(v, "advice"),
-    )
 }
 
 /// Runs `sprigctl graph <cmd>`.
@@ -215,10 +157,6 @@ pub(crate) async fn run(c: &AdminClient, sub: &ArgMatches, out: Output) -> Resul
         "show" => {
             let v: Value = c.get(&format!("{base}/{}", graph())).await?;
             print(out, &v, show_text);
-        }
-        "partition" => {
-            let v: Value = c.get(&format!("{base}/{}/partition", graph())).await?;
-            print(out, &v, partition_text);
         }
         other => return Err(Failed(format!("graph {other}: unknown subcommand"))),
     }

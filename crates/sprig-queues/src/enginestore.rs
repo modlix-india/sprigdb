@@ -2,7 +2,7 @@
 //! keyspace per vhost, written straight through the engine's commit log.
 //!
 //! ```text
-//! P(kind, index) = META_TENANT | 0 | OBJECT | kind | index | tenant u64 | db u32
+//! P(kind, index) = tenant u64 | 0 | OBJECT | kind | index | db u32
 //! P(E,0) | queue u64 | lane u16 | pclass u8 | seq u64  -> message
 //! P(S,0) | queue u64 | msg_id                          -> lane u16 | pclass u8 | seq u64
 //! P(M,0) | queue u64 | lane u16                        -> epoch u64 | lane state
@@ -16,9 +16,10 @@
 //! message be a plain delete, so a message published and acknowledged
 //! between two memtable flushes never reaches an SST (RocksDB drops the
 //! shadowed put at flush), and a run of acknowledgements in sequence order
-//! is one range delete. They sit under the engine's reserved tenant (with
-//! the real tenant and database right after), where the version GC and
-//! the clock ignore them.
+//! is one range delete. They sit in the tenant's own key range, in an
+//! unversioned object ([`sprig_engine::keys::is_unversioned`]) that the
+//! version GC and the clock ignore, so they are part of the tenant's unit:
+//! written through its log, in its snapshots, gone with the tenant.
 //!
 //! **One owner batch is one log entry**: its puts and deletes are applied
 //! together or not at all. The owner epoch fence is checked in memory
@@ -32,7 +33,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use sprig_engine::keys::{KeyPrefix, KeyRange, META_TENANT, kind, memcmp, prefix_end};
+use sprig_engine::keys::{KeyPrefix, KeyRange, kind, memcmp, prefix_end};
 use sprig_engine::log::Payload;
 use sprig_engine::store::{Cf, IterOpts, ReadTier};
 use sprig_engine::{Durability, Engine};
@@ -42,8 +43,8 @@ use crate::store::{
     StoredMsg, WriteBatch,
 };
 
-/// The queues object under the engine's reserved tenant (`'Q'`).
-pub const OBJECT: u32 = 0x5100_0000;
+/// The queues object in each tenant's range (`'Q'`).
+pub const OBJECT: u32 = sprig_engine::keys::QUEUES_OBJECT;
 
 const MSGS: (u8, u16) = (kind::ELEMENTS, 0);
 const IDS: (u8, u16) = (kind::SECONDARY, 0);
@@ -135,7 +136,7 @@ impl EngineMsgStore {
     /// that was durable when called.
     async fn caught_up(&self) {
         let c = self.engine.consensus();
-        let u = self.engine.unit();
+        let u = self.unit();
         let target = c.durable_index(u);
         for _ in 0..2000 {
             if c.applied_index(u) >= target {
@@ -409,16 +410,20 @@ fn dec_lane(b: &[u8]) -> Result<(u64, LaneState), StoreError> {
 impl EngineMsgStore {
     fn p(&self, (k, index): (u8, u16)) -> Vec<u8> {
         let mut v = KeyPrefix {
-            tenant: META_TENANT,
+            tenant: self.scope.0,
             shard: 0,
             object: OBJECT,
             kind: k,
             index,
         }
         .to_vec();
-        v.extend_from_slice(&self.scope.0.to_be_bytes());
         v.extend_from_slice(&self.scope.1.to_be_bytes());
         v
+    }
+
+    /// The tenant's unit, whose log carries this vhost's writes.
+    fn unit(&self) -> sprig_engine::UnitId {
+        Engine::unit_of_tenant(self.scope.0)
     }
 
     fn queue_p(&self, f: (u8, u16), queue: u64) -> Vec<u8> {
@@ -509,7 +514,7 @@ impl EngineMsgStore {
     fn propose(&self, p: Payload) -> Result<sprig_engine::log::Ticket, StoreError> {
         self.engine
             .consensus()
-            .propose(self.engine.unit(), p.into_bytes(), self.durability)
+            .propose(self.unit(), p.into_bytes(), self.durability)
             .map_err(failed)
     }
 

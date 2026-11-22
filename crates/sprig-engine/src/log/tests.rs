@@ -547,3 +547,115 @@ fn entry_reads_one_index() {
     assert_eq!((e.index, e.data.as_slice()), (2, &1u64.to_be_bytes()[..]));
     assert!(log.entry(UnitId(1), 9).unwrap().is_none());
 }
+
+/// The parts of an atomic write across units go into one group (one
+/// raft-engine batch) even when they pass the group's byte limit, each unit
+/// numbering its part in its own sequence.
+#[test]
+fn an_atomic_write_across_units_is_one_group() {
+    let dir = TempDir::new("log-many");
+    let sm = Arc::new(Recorder::default());
+    let log = LocalLog::open(
+        dir.path(),
+        LogConfig {
+            group_max_bytes: 16,
+            ..cfg()
+        },
+        sm.clone(),
+    )
+    .unwrap();
+    log.propose(UnitId(2), vec![0; 8], Durability::Local)
+        .unwrap()
+        .wait_applied()
+        .unwrap();
+    let before = log.stats().groups;
+    let tickets = log
+        .propose_many(
+            vec![
+                (UnitId(1), vec![1; 40]),
+                (UnitId(2), vec![2; 40]),
+                (UnitId(3), vec![3; 40]),
+            ],
+            Durability::Local,
+        )
+        .unwrap();
+    let got: Vec<(UnitId, u64)> = tickets.iter().map(|t| (t.unit(), t.index())).collect();
+    assert_eq!(got, vec![(UnitId(1), 1), (UnitId(2), 2), (UnitId(3), 1)]);
+    for t in &tickets {
+        t.wait_applied().unwrap();
+    }
+    assert_eq!(log.stats().groups, before + 1);
+    assert!(
+        log.propose_many(
+            vec![(UnitId(4), vec![]), (UnitId(4), vec![])],
+            Durability::Local
+        )
+        .is_err()
+    );
+    assert!(
+        log.propose_many(
+            vec![(UnitId(5), vec![]), (UnitId(u64::MAX), vec![])],
+            Durability::Local
+        )
+        .is_err()
+    );
+    // The refused write took no index.
+    let t = log.propose(UnitId(5), vec![], Durability::Local).unwrap();
+    assert_eq!(t.index(), 1);
+}
+
+/// After a power cut, an atomic write across units is in the log whole or
+/// not at all.
+#[test]
+fn an_atomic_write_across_units_survives_a_crash_whole_or_not_at_all() {
+    for seed in 1..=40u64 {
+        let dir = TempDir::new("log-many-crash");
+        let sim = SimDisk::new();
+        {
+            let sm = Arc::new(Recorder::default());
+            let log = LocalLog::open(
+                dir.path(),
+                LogConfig {
+                    sim: Some(sim.clone()),
+                    ..cfg()
+                },
+                sm,
+            )
+            .unwrap();
+            for i in 0..30u64 {
+                let d = if i % 3 == 0 {
+                    Durability::Local
+                } else {
+                    Durability::LocalRelaxed
+                };
+                let ts = log
+                    .propose_many(
+                        vec![
+                            (UnitId(1), i.to_be_bytes().to_vec()),
+                            (UnitId(2), i.to_be_bytes().to_vec()),
+                        ],
+                        d,
+                    )
+                    .unwrap();
+                if d.needs_sync() {
+                    for t in &ts {
+                        t.wait().unwrap();
+                    }
+                }
+            }
+            log.halt();
+        }
+        sim.crash(dir.path(), seed).unwrap();
+        let fresh = Arc::new(Recorder::default());
+        let _log = LocalLog::open(dir.path(), cfg(), fresh.clone()).unwrap();
+        let a = fresh.applied.lock().unwrap();
+        let one = a.get(&UnitId(1)).cloned().unwrap_or_default();
+        let two = a.get(&UnitId(2)).cloned().unwrap_or_default();
+        assert_eq!(one, two, "seed {seed}: a write across units was cut");
+        assert!(
+            one.len() >= 28,
+            "seed {seed}: synced writes lost ({})",
+            one.len()
+        );
+    }
+}

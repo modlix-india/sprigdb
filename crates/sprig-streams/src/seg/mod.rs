@@ -257,9 +257,13 @@ const RESULTS_KEPT: usize = 100_000;
 struct Applier(Weak<Inner>);
 
 impl ApplyObserver for Applier {
-    fn applied(&self, entries: &[LogEntry]) {
+    fn applied(&self, unit: sprig_engine::UnitId, entries: &[LogEntry]) {
         if let Some(i) = self.0.upgrade() {
-            i.apply(entries);
+            // Stream appends ride on the engine's notes unit; its index
+            // sequence is the one this log tracks.
+            if unit == i.engine.notes_unit() {
+                i.apply(entries);
+            }
         }
     }
 }
@@ -431,7 +435,7 @@ impl SegLog {
             m.floor.max(engine.log_floor(FLOOR).unwrap_or(0))
         } else {
             clear_parts(&dir);
-            engine.consensus().applied_index(engine.unit())
+            engine.consensus().applied_index(engine.notes_unit())
         };
         if let Some(held) = catch_up_start(from, engine.log_first_index(), engine.last_applied()) {
             // The commit log was trimmed past the floor: a binary that
@@ -493,7 +497,7 @@ impl SegLog {
         let mut p = Payload::with_capacity(batch.len() + 48);
         p.note(&note::encode_append(key, now_ms(), lat, batch));
         let t = self.inner.engine.consensus().propose(
-            self.inner.engine.unit(),
+            self.inner.engine.notes_unit(),
             p.into_bytes(),
             self.inner.cfg.durability,
         )?;
@@ -520,7 +524,7 @@ impl SegLog {
             p.note(&note::encode_append(*key, now, lat, batch));
         }
         let t = self.inner.engine.consensus().propose(
-            self.inner.engine.unit(),
+            self.inner.engine.notes_unit(),
             p.into_bytes(),
             self.inner.cfg.durability,
         )?;
@@ -867,7 +871,7 @@ impl SegLog {
         let e = &self.inner.engine;
         let c = e.consensus();
         for _ in 0..200 {
-            if c.durable_index(e.unit()) >= index {
+            if c.durable_index(e.notes_unit()) >= index {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -902,7 +906,7 @@ impl SegLog {
                 drop(a);
                 // Never above what the log holds durably (see below).
                 let e = &self.inner.engine;
-                let floor = floor.min(e.consensus().durable_index(e.unit()));
+                let floor = floor.min(e.consensus().durable_index(e.notes_unit()));
                 if self.inner.engine.log_floor(FLOOR).is_none_or(|f| f < floor) {
                     self.inner.engine.set_log_floor(FLOOR, floor)?;
                 }

@@ -165,3 +165,25 @@ pub(crate) async fn run_pin(
     }
     Ok(())
 }
+
+/// `sprigctl explain`: `decision` and `placement`.
+pub(crate) fn explain_group() -> Command {
+    Command::new("explain")
+        .about("Explain a decision or a tenant's placement")
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .subcommand(decision_cmd())
+        .subcommand(placement_cmd())
+}
+
+/// Runs `sprigctl explain <cmd>`.
+pub(crate) async fn explain(
+    c: &AdminClient,
+    group: &ArgMatches,
+    out: Output,
+) -> Result<(), Failed> {
+    match group.subcommand() {
+        Some((cmd @ ("decision" | "placement"), sub)) => run(c, cmd, sub, out).await,
+        _ => Err(Failed("not available in this version".into())),
+    }
+}

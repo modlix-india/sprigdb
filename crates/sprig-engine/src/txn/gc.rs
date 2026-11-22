@@ -13,7 +13,7 @@ use sprig_common::Result;
 
 use super::hlc::Ts;
 use super::mvcc::is_tombstone;
-use crate::keys::{KeyRange, META_TENANT, split_version};
+use crate::keys::{KeyRange, split_version};
 use crate::store::{Cf, IterOpts, SortedStore, StoreBatch, WalMode};
 
 /// Keep or drop one stored entry.
@@ -46,10 +46,10 @@ impl GcFilter {
         }
     }
 
-    /// The decision for one entry. Unversioned bookkeeping keys (under the
-    /// reserved tenant) are kept.
+    /// The decision for one entry. Unversioned keys (bookkeeping under the
+    /// reserved tenant, queue messages) are kept.
     pub fn decide(&mut self, stored_key: &[u8], value: &[u8]) -> GcDecision {
-        if stored_key.starts_with(&META_TENANT.to_be_bytes()) {
+        if crate::keys::is_unversioned(stored_key) {
             return GcDecision::Keep;
         }
         let Some((logical, ts)) = split_version(stored_key) else {
@@ -114,6 +114,25 @@ mod tests {
         let mut out = Vec::new();
         encode_value_into(&mut out, v);
         out
+    }
+
+    #[test]
+    fn unversioned_keys_are_never_collected() {
+        let mut queue = crate::keys::KeyPrefix {
+            tenant: 7,
+            shard: 0,
+            object: crate::keys::QUEUES_OBJECT,
+            kind: b'E',
+            index: 0,
+        }
+        .to_vec();
+        queue.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let meta = crate::keys::unit_meta_key(7, b"applied");
+        let mut f = GcFilter::new(Ts::MAX, true);
+        for k in [&queue, &meta] {
+            assert_eq!(f.decide(k, b"x"), GcDecision::Keep);
+            assert_eq!(f.decide(k, b"x"), GcDecision::Keep);
+        }
     }
 
     #[test]

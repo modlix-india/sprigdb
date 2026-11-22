@@ -632,16 +632,3 @@ fn string_joins_co_locate_under_the_key_collation_or_a_finer_one() {
     // MariaDB won't mix these two collations: no co-location.
     assert_eq!(case("utf8mb4_uca1400_ai_ci"), 0.0);
 }
-
-#[test]
-fn every_model_with_join_edges_has_rules() {
-    use crate::sharding::input::join_rules;
-    use sprig_workload::fingerprint::FpKind;
-    assert_eq!(join_rules(FpKind::Sql), Some(Rules::Sql));
-    assert_eq!(join_rules(FpKind::Analytics), Some(Rules::Sql));
-    assert_eq!(join_rules(FpKind::Api), Some(Rules::Sql));
-    assert_eq!(join_rules(FpKind::Mongo), Some(Rules::Mongo));
-    for k in [FpKind::Redis, FpKind::Kv, FpKind::Vector, FpKind::Search] {
-        assert_eq!(join_rules(k), None);
-    }
-}
