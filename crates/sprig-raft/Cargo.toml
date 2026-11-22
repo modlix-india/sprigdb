@@ -1,0 +1,29 @@
+[package]
+name = "sprig-raft"
+description = "SprigDB: the multi-Raft driver (raft-rs groups over one shared log per node)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+protobuf.workspace = true
+raft.workspace = true
+raft-engine.workspace = true
+raft-proto.workspace = true
+rustls.workspace = true
+slog.workspace = true
+sprig-common.workspace = true
+sprig-engine.workspace = true
+tokio = { workspace = true, features = ["rt", "io-util"] }
+tokio-rustls.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tokio = { workspace = true, features = ["rt", "io-util", "test-util"] }
+
+[lints]
+workspace = true

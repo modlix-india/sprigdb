@@ -24,7 +24,7 @@ use mysql_async::prelude::Queryable;
 use serde::{Deserialize, Serialize};
 use sprig_common::ids::ClusterId;
 use sprig_common::names::quote;
-use sprig_common::{Result, SprigCode, SprigError};
+use sprig_common::{Result, SprigError};
 
 use crate::migrate::{MigrateOpts, MigrateReport, Migrator};
 use crate::pool_wait::Bounded as _;
@@ -295,47 +295,19 @@ pub async fn write_progress(
         .await
 }
 
-/// Live (not dropped) databases in the catalog; 0 if the catalog doesn't
-/// exist.
+/// Drops the catalog schema of a tenant being deleted.
+///
+/// The caller first makes sure the catalog lists no live database: the
+/// catalog's rows are engine records now (`store::rec::CoreReader`), and
+/// tenant cleanup drops every database through the DDL path and waits for
+/// that before it gets here. The schema's own `databases` table is not
+/// consulted: a tenant made before the catalog moved onto records still
+/// has rows there that no DDL can drop any more, and their data schemas
+/// are removed by id with the rest of the tenant's names.
 ///
 /// # Errors
 /// 39070 or a backend error.
-pub async fn live_databases(pool: &Pool, store: &Store) -> Result<u64> {
-    let mut conn = pool.get_conn_bounded().await.map_err(map_err)?;
-    let tables: Option<String> = conn
-        .exec_first(
-            "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? \
-             AND TABLE_NAME = 'databases'",
-            (store.schema(),),
-        )
-        .await
-        .map_err(map_err)?;
-    if tables.is_none() {
-        return Ok(0);
-    }
-    let n: Option<u64> = conn
-        .query_first(format!(
-            "SELECT COUNT(*) FROM {}.`databases` WHERE state <> 'dropped'",
-            quote(store.schema())
-        ))
-        .await
-        .map_err(map_err)?;
-    Ok(n.unwrap_or(0))
-}
-
-/// Drops the catalog schema of a tenant being deleted. Refuses while the
-/// catalog still lists live databases: their data schemas must go first.
-///
-/// # Errors
-/// 39072 while databases remain; 39070 or a backend error.
 pub async fn drop_catalog(pool: &Pool, store: &Store) -> Result<()> {
-    let n = live_databases(pool, store).await?;
-    if n > 0 {
-        return Err(SprigError::new(
-            SprigCode::TenantNotReady,
-            format!("the tenant still has {n} databases; drop them first"),
-        ));
-    }
     let mut conn = pool.get_conn_bounded().await.map_err(map_err)?;
     conn.query_drop(format!("DROP DATABASE IF EXISTS {}", quote(store.schema())))
         .await
