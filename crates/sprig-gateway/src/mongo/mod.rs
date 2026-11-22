@@ -29,6 +29,8 @@ pub mod conn;
 pub mod cursors;
 /// `$currentOp` and `$listSessions`.
 pub mod diag;
+/// Collections stored on the storage engine.
+pub mod engine;
 pub mod explain;
 pub mod failpoint;
 pub mod feed_relay;

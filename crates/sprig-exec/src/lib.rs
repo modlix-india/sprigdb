@@ -64,6 +64,7 @@ pub mod ops;
 pub mod session;
 mod temporal;
 pub mod types;
+mod tz;
 
 pub use error::{Level, Result, SqlError, Warning};
 pub use expr::{BinOp, CastTarget, ColumnRef, Compiled, Expr, Truth, compile, value_text};

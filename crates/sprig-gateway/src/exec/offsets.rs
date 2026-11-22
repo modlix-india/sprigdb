@@ -319,6 +319,16 @@ impl PassSession {
             ));
         }
         let current = self.current_logical();
+        // A stream of an engine database: its offset is an engine record.
+        let (db_text, name_text) = match stream.split_once('.') {
+            Some((d, n)) => (Some(d.to_owned()), n.to_owned()),
+            None => (current.clone(), stream.clone()),
+        };
+        if let Some(db) = db_text.filter(|d| self.engine_database_named(d)) {
+            return self
+                .commit_offset_engine(&group, &db, &name_text, partition, offset, metadata)
+                .await;
+        }
         let ts = self
             .tenant
             .as_deref_mut()
@@ -383,6 +393,111 @@ impl PassSession {
             },
         )
         .await
+    }
+
+    /// `CALL sprig.commit_offset` on stream `name` of engine database `db`:
+    /// the group's offset is an engine record of the node's streams,
+    /// written in the session's engine transaction when one is open (so it
+    /// commits or rolls back with the transaction's writes), else at once.
+    ///
+    /// # Errors
+    /// 39940-range stream errors when the stream or partition doesn't
+    /// exist; 1142 without `SELECT` on it; the engine's.
+    async fn commit_offset_engine(
+        &mut self,
+        group: &str,
+        db: &str,
+        name: &str,
+        partition: u32,
+        offset: u64,
+        metadata: Option<String>,
+    ) -> Result<()> {
+        let ts = self
+            .tenant
+            .as_deref_mut()
+            .ok_or_else(|| SprigError::internal("no tenant"))?;
+        let tenant = ts.tenant;
+        let Some(eng) = crate::kafka::engine::streams() else {
+            return Err(SprigError::new(
+                SprigCode::StreamNotFound,
+                format!(
+                    "no stream {db}.{name}: streams of engine databases aren't served on this node"
+                ),
+            ));
+        };
+        let topic = eng
+            .topic(tenant.0, &format!("{db}.{name}"))?
+            .ok_or_else(|| {
+                SprigError::new(SprigCode::StreamNotFound, format!("no stream {db}.{name}"))
+            })?;
+        if u32::try_from(topic.partitions).unwrap_or(0) <= partition {
+            return Err(SprigError::new(
+                SprigCode::StreamNotFound,
+                format!("stream {db}.{name} has no partition {partition}"),
+            ));
+        }
+        // Committing a position is reading the stream.
+        {
+            let cat = match ts.catalog() {
+                Some(c) => std::sync::Arc::clone(c),
+                None => ts.refresh().await?,
+            };
+            let lctn = ts.lower_case_table_names();
+            let grants = crate::tenant::authz::privileges(ts, &cat);
+            let db_key = database_key(db, lctn);
+            let name_key = object_key(ObjectKind::Table, name, lctn);
+            if !grants.unrestricted()
+                && !grants.allows(
+                    Action::Select,
+                    Target::Named {
+                        db_key: &db_key,
+                        name_key: &name_key,
+                    },
+                )
+                && !grants.allows(Action::Select, Target::Database { db_key: &db_key })
+            {
+                return Err(SprigError::standard(
+                    1142,
+                    *b"42000",
+                    format!(
+                        "SELECT command denied to user '{}'@'{}' for table `{db}`.`{name}`",
+                        ts.principal.user, ts.principal.host
+                    ),
+                ));
+            }
+        }
+        let o = sprig_proto_kafka::group::CommittedOffset {
+            stream_id: topic.stream_id,
+            partition: i32::try_from(partition).unwrap_or(i32::MAX),
+            offset: i64::try_from(offset).unwrap_or(i64::MAX),
+            leader_epoch: None,
+            metadata,
+        };
+        let now = sprig_streams::seg::now_ms();
+        if self.offsets_in_transaction() {
+            return match self.eng.txn.open_tx() {
+                Some(tx) => {
+                    sprig_streams::seg::records::put_offsets(
+                        tx.engine_txn(),
+                        tenant.0,
+                        group,
+                        0,
+                        std::slice::from_ref(&o),
+                        now,
+                    )
+                    .await
+                }
+                None => Err(SprigError::standard(
+                    1235,
+                    *b"42000",
+                    "This version of SprigDB doesn't yet support 'sprig.commit_offset on a stream \
+                     of an engine database inside a transaction that isn't on the engine'",
+                )),
+            };
+        }
+        eng.records()
+            .commit_offsets(tenant.0, group, std::slice::from_ref(&o), now)
+            .await
     }
 
     /// Commits `c` (see the module docs): inside the session's transaction

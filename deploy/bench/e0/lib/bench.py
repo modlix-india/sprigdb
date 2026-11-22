@@ -38,6 +38,13 @@ import result  # noqa: E402
 ENV = os.environ
 DOCKER = shlex.split(ENV.get("E0_DOCKER", "docker"))  # clients
 SUT_DOCKER = shlex.split(ENV.get("E0_SUT_DOCKER") or ENV.get("E0_DOCKER", "docker"))  # the SUT's containers
+FAILED = []  # cells with a run that gave no result; main() exits 3 when any
+
+
+def sut(args):
+    """The command that runs `docker <args>` against the SUT. Through ssh (E0_SUT_DOCKER='ssh vm2 docker') the
+    remote shell splits the joined words again, so each argument is quoted (a --format with a space broke)."""
+    return SUT_DOCKER + ([shlex.quote(x) for x in args] if os.path.basename(SUT_DOCKER[0]) == "ssh" else list(args))
 NET = ENV.get("E0_NET", "e0bench")
 IMG_RUN = ENV.get("IMG_RUN", "e0bench-run:13.7")
 IMG_REDIS = ENV.get("IMG_REDIS", "redis:7.4.11")
@@ -108,22 +115,22 @@ class Cpu:
         self.names = containers
         self.ids = {}
         for c in containers:
-            r = sh(SUT_DOCKER + ["inspect", "-f", "{{.Id}}", c], check=False)
+            r = sh(sut(["inspect", "-f", "{{.Id}}", c]), check=False)
             if r.returncode == 0:
                 self.ids[c] = r.stdout.strip()
         self.ensure_sidecar()
 
     @staticmethod
     def ensure_sidecar():
-        r = sh(SUT_DOCKER + ["inspect", "-f", "{{.State.Running}}", "e0bench-cgmon"], check=False)
+        r = sh(sut(["inspect", "-f", "{{.State.Running}}", "e0bench-cgmon"]), check=False)
         if r.returncode == 0 and r.stdout.strip() == "true":
             return
-        sh(SUT_DOCKER + ["rm", "-f", "e0bench-cgmon"], check=False)
-        sh(SUT_DOCKER + ["run", "-d", "--name", "e0bench-cgmon", "--cgroupns", "host", "--cpuset-cpus", CLIENT_CPUS,
-                     "-m", "64m", "-v", "/sys/fs/cgroup:/hostcg:ro", "-v", f"{E0_DIR}:/opt/e0:ro", IMG_RUN, "sleep", "infinity"])
+        sh(sut(["rm", "-f", "e0bench-cgmon"]), check=False)
+        sh(sut(["run", "-d", "--name", "e0bench-cgmon", "--cgroupns", "host", "--cpuset-cpus", CLIENT_CPUS,
+                     "-m", "64m", "-v", "/sys/fs/cgroup:/hostcg:ro", "-v", f"{E0_DIR}:/opt/e0:ro", IMG_RUN, "sleep", "infinity"]))
 
     def snap(self):
-        r = sh(SUT_DOCKER + ["exec", "e0bench-cgmon", "python3", "-I", "/opt/e0/lib/cgsnap.py"] + list(self.ids.values()))
+        r = sh(sut(["exec", "e0bench-cgmon", "python3", "-I", "/opt/e0/lib/cgsnap.py"] + list(self.ids.values())))
         s = json.loads(r.stdout)
         s["cg"] = {n: s["cg"].get(i) for n, i in self.ids.items()}
         return s
@@ -254,13 +261,13 @@ def parse_sysbench(t):
 def datadir_kb(a):
     tot = 0
     for c, d in a["data"]:
-        r = sh(SUT_DOCKER + ["exec", c, "du", "-sk", d], check=False)
+        r = sh(sut(["exec", c, "du", "-sk", d]), check=False)
         tot += int(r.stdout.split()[0]) if r.returncode == 0 and r.stdout else 0
     return tot
 
 
 def resident_mib(a):
-    r = sh(SUT_DOCKER + ["stats", "--no-stream", "--format", "{{.Name}} {{.MemUsage}}"] + a["sut"], check=False)
+    r = sh(sut(["stats", "--no-stream", "--format", "{{.Name}} {{.MemUsage}}"] + a["sut"]), check=False)
     tot = 0.0
     for line in r.stdout.splitlines():
         v = line.split()[1]
@@ -278,11 +285,13 @@ def cmd_sql(arm, a, o, args):
         say(f"{arm}: sysbench prepare {TABLES} x {TABLE_SIZE}")
         k0 = datadir_kb(a)
         t0 = time.time()
-        out, _, rc = client(IMG_RUN, sb_args(a, "oltp_read_write", 16, []) + ["prepare"], f"e0bench-sb-{os.getpid()}", entry="sysbench")
+        # E0_SB_PREPARE_EXTRA: extra sysbench prepare options, e.g. "--create_secondary=off" (point select reads by id only).
+        extra = os.environ.get("E0_SB_PREPARE_EXTRA", "").split()
+        out, _, rc = client(IMG_RUN, sb_args(a, "oltp_read_write", 16, extra) + ["prepare"], f"e0bench-sb-{os.getpid()}", entry="sysbench")
         load_s = round(time.time() - t0, 1)
         write_log(os.path.join(o.logdir, "prepare.log"), out)
-        if rc != 0:
-            raise SystemExit(f"{arm}: prepare failed; see {o.logdir}/prepare.log")
+        if rc != 0 or "FATAL:" in out:  # sysbench's prepare can exit 0 after its threads failed to connect
+            raise SystemExit(f"{arm}: prepare failed (rc {rc}); see {o.logdir}/prepare.log")
         time.sleep(5)
         disk = round((datadir_kb(a) - k0) / 1024, 1)
         rss = resident_mib(a)
@@ -310,6 +319,7 @@ def cmd_sql(arm, a, o, args):
                 p = parse_sysbench(out)
                 if not p:
                     say(f"{arm}: {variant} run {r}: no result (rc {rc}); see the log")
+                    FAILED.append(f"{variant} run {r}")
                     continue
                 d = Cpu.delta(s0, s1)
                 write_log(os.path.join(o.logdir, f"{test}-{th}-run{r}.cpu.json"), json.dumps(d, indent=1))
@@ -363,6 +373,8 @@ def cmd_kv(arm, a, o, args):
                             name, entry="memtier_benchmark", mount=o.logdir)
         load_s = round(time.time() - t0, 1)
         write_log(os.path.join(o.logdir, "preload.log"), out)
+        if rc != 0 or "Connection error" in out:
+            raise SystemExit(f"{arm}: preload failed (rc {rc}); see {o.logdir}/preload.log")
         time.sleep(3)
         disk = round((datadir_kb(a) - k0) / 1024, 1)
         rss = resident_mib(a)
@@ -388,8 +400,11 @@ def cmd_kv(arm, a, o, args):
             write_log(os.path.join(o.logdir, f"memtier-p{pl}-run{r}.log"), out)
             try:
                 m = parse_memtier(os.path.join(o.logdir, js))
+                if not m["ops"]:
+                    raise ValueError("no operations counted")
             except (OSError, ValueError, KeyError) as e:
                 say(f"{arm}: memtier {variant} run {r}: no result ({e}, rc {rc})")
+                FAILED.append(f"memtier {variant} run {r}")
                 continue
             d = Cpu.delta(s0, s1)
             cpu_us, det = per_op(d, m["ops"], idle)
@@ -415,6 +430,7 @@ def cmd_kv(arm, a, o, args):
             m = re.search(r'^"([A-Z]+)[^"]*","([\d.]+)"', out, re.M)
             if not m:
                 say(f"{arm}: redis-benchmark {c} run {r}: no result (rc {rc})")
+                FAILED.append(f"redis-benchmark {c} run {r}")
                 continue
             rps = float(m.group(2))
             d = Cpu.delta(s0, s1)
@@ -462,6 +478,8 @@ def main():
         return
     {"sql": cmd_sql, "kv": cmd_kv, "calib": cmd_calib}[args.cmd](args.arm, a, o, args)
     say(f"{args.arm}: {args.cmd} done; logs {o.logdir}")
+    if FAILED:
+        raise SystemExit(f"{args.arm}: {len(FAILED)} run(s) gave no result: {', '.join(FAILED)}")
 
 
 if __name__ == "__main__":

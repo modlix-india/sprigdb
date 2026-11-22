@@ -141,6 +141,13 @@ impl Tx {
         self.t.options()
     }
 
+    /// The engine transaction itself, for the stream and queue calls made
+    /// inside the session's transaction: their log notes and plain writes
+    /// join its commit.
+    pub(crate) fn engine_txn(&mut self) -> &mut Txn {
+        &mut self.t
+    }
+
     /// Whether the transaction is still open (a deadlock, a snapshot
     /// conflict or a full lock table ends it).
     pub(crate) fn is_open(&self) -> bool {
@@ -319,6 +326,92 @@ impl Tx {
             Locked::Row(v) => Ok(Some(v)),
             Locked::Skipped => Ok(None),
         }
+    }
+
+    /// A locking read of key `key` in `mode`, waiting, without the
+    /// snapshot check (a foreign key's lookup of a parent or child entry):
+    /// its latest committed value (or this transaction's own), `None`
+    /// inside when it doesn't exist (its place is then locked against
+    /// inserts at REPEATABLE READ and SERIALIZABLE).
+    ///
+    /// # Errors
+    /// A lock error (1205, 1213), or the store's.
+    #[allow(clippy::option_option)] // skipped, missing, or the row: as `lock_read`
+    pub(crate) async fn lock_key(
+        &mut self,
+        key: &Bytes,
+        mode: LockMode,
+    ) -> Result<Option<Option<Bytes>>> {
+        let req = LockRequest {
+            mode,
+            wait: Wait::Block,
+            check_snapshot: false,
+        };
+        match self.t.lock_get(key, req).await? {
+            Locked::Row(v) => Ok(Some(v)),
+            Locked::Skipped => Ok(None),
+        }
+    }
+
+    /// [`Tx::lock_read`] for a thread that may block (the planner's
+    /// synchronous section, off the runtime's worker).
+    ///
+    /// # Errors
+    /// As for [`Tx::lock_read`].
+    #[allow(clippy::option_option)] // skipped, missing, or the row: as `lock_read`
+    pub(crate) fn lock_read_blocking(
+        &mut self,
+        key: &Bytes,
+        mode: LockMode,
+        wait: Wait,
+    ) -> Result<Option<Option<Bytes>>> {
+        let req = self.row_request(mode, wait);
+        match self.t.lock_get_blocking(key, req)? {
+            Locked::Row(v) => Ok(Some(v)),
+            Locked::Skipped => Ok(None),
+        }
+    }
+
+    /// A locking read of the keys in `[lo, hi)` (rows or index entries),
+    /// up to `limit`, each locked in `mode`, with the stretch read
+    /// gap-locked at REPEATABLE READ and SERIALIZABLE; for a thread that may
+    /// block. `rows`: the keys are a table's rows (the snapshot check
+    /// applies to them).
+    ///
+    /// # Errors
+    /// As for [`Tx::lock_read`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn scan_lock_blocking(
+        &mut self,
+        lo: &[u8],
+        hi: &[u8],
+        reverse: bool,
+        limit: usize,
+        mode: LockMode,
+        wait: Wait,
+        rows: bool,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        if lo >= hi {
+            return Ok(Vec::new());
+        }
+        let dir = if reverse { Dir::Reverse } else { Dir::Forward };
+        let r = KeyRange::new(lo.to_vec(), hi.to_vec());
+        let req = if rows {
+            self.row_request(mode, wait)
+        } else {
+            LockRequest {
+                mode,
+                wait,
+                check_snapshot: false,
+            }
+        };
+        self.t.scan_lock_blocking(&r, dir, limit, req)
+    }
+
+    /// What ends this transaction's lock wait from another task
+    /// (`KILL QUERY`, a statement time limit).
+    pub(crate) fn interrupt_handle(&self) -> sprig_engine::txn::InterruptHandle {
+        self.t.interrupt_handle()
     }
 
     /// Whether the session follows MySQL (where the two servers lock

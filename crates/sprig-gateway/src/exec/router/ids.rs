@@ -22,12 +22,12 @@ use std::time::Instant;
 use mysql_async::prelude::Queryable;
 use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::{ClusterId, TenantId};
-use sprig_common::names::SchemaName;
 use sprig_common::{ErrorKind, Result, SprigCode, SprigError};
 use sprig_router::plan::IdFill;
+use sprig_shard::ids::records::RecordSequences;
 use sprig_shard::ids::{
-    AutoIncSession, BLOCK_LEASE, BlockAllocator, BlockConfig, CatalogSequences, Explicit,
-    IdAllocator, IdRun, Ordering, SeqId, SequenceSource,
+    AutoIncSession, BLOCK_LEASE, BlockAllocator, BlockConfig, Explicit, IdAllocator, IdRun,
+    Ordering, SeqId, SequenceSource,
 };
 
 use crate::tenant::locator::GatewayLocator;
@@ -39,10 +39,10 @@ fn unavailable(e: &SprigError) -> SprigError {
     )
 }
 
-/// The tenant catalog's `sequences`, through the catalog cluster's pool of
-/// the moment (a failover replaces the pool).
+/// The tenant's sequences in its catalog records (the engine node's).
 pub(super) struct GwSequences {
     locator: Arc<GatewayLocator>,
+    records: Arc<dyn sprig_catalog::RecordStore>,
     tenant: TenantId,
     /// This gateway process (its coordinator id): the holder of the
     /// blocks it fetches.
@@ -50,24 +50,10 @@ pub(super) struct GwSequences {
 }
 
 impl GwSequences {
-    async fn catalog(&self) -> Result<CatalogSequences> {
-        let cluster = match self.locator.cached_cluster(self.tenant) {
-            Some(c) => c,
-            None => self
-                .locator
-                .cluster(self.tenant)
-                .await
-                .map_err(|e| unavailable(&e))?,
-        };
-        let pool = self
-            .locator
-            .ctl_pool(&cluster)
-            .await
-            .map_err(|e| unavailable(&e))?;
-        Ok(
-            CatalogSequences::new(pool, SchemaName::catalog(self.tenant).to_string())
-                .held_by(self.holder.clone(), BLOCK_LEASE),
-        )
+    #[allow(clippy::unused_async)] // as when it looked the catalog's pool up
+    async fn catalog(&self) -> Result<RecordSequences> {
+        Ok(RecordSequences::new(Arc::clone(&self.records), self.tenant)
+            .held_by(self.holder.clone(), BLOCK_LEASE))
     }
 }
 
@@ -111,25 +97,28 @@ pub(super) struct TenantIds {
     alloc: BlockAllocator<GwSequences>,
     /// Sequences whose row is known to exist.
     ready: Mutex<HashSet<u64>>,
-    /// `sequence_blocks` is known to exist.
-    tables: std::sync::atomic::AtomicBool,
     /// One creation at a time in this gateway.
     creating: tokio::sync::Mutex<()>,
 }
 
 impl TenantIds {
-    pub(super) fn new(locator: Arc<GatewayLocator>, tenant: TenantId, holder: String) -> Self {
+    pub(super) fn new(
+        locator: Arc<GatewayLocator>,
+        records: Arc<dyn sprig_catalog::RecordStore>,
+        tenant: TenantId,
+        holder: String,
+    ) -> Self {
         Self {
             alloc: BlockAllocator::new(
                 GwSequences {
                     locator,
+                    records,
                     tenant,
                     holder,
                 },
                 BlockConfig::default(),
             ),
             ready: Mutex::new(HashSet::new()),
-            tables: std::sync::atomic::AtomicBool::new(false),
             creating: tokio::sync::Mutex::new(()),
         }
     }
@@ -172,12 +161,6 @@ impl TenantIds {
         }
         let src = &self.alloc.source();
         let cat = src.catalog().await?;
-        if !self.tables.load(std::sync::atomic::Ordering::Relaxed) {
-            // A catalog migrated before the leased blocks' table.
-            cat.ensure_tables().await.map_err(|e| unavailable(&e))?;
-            self.tables
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
         if !cat.exists(SeqId(f.seq)).await? {
             let next = first_value(src, f).await?;
             match cat

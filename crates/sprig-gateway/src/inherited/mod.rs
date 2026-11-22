@@ -292,30 +292,26 @@ pub async fn commit(
     migrate(svc, tenant).await?;
     let mut c = svc.catalog.change(tenant, VersionKind::Catalog).await?;
     let version = c.version();
-    let applied = {
-        let (store, tx) = c.tx().parts();
-        let st = MsgStore::new(store.schema());
-        async {
-            for w in writes {
-                match w {
-                    MsgWrite::Def(d) => st.put_def(tx, d, version).await?,
-                    MsgWrite::DeleteDef(o) => st.delete_def(tx, *o).await?,
-                    MsgWrite::Override(o) => st.put_override(tx, o, version).await?,
-                    MsgWrite::DeleteOverrides {
-                        def,
-                        target,
-                        applies_to,
-                        what,
-                    } => {
-                        st.delete_override(tx, *def, *target, *applies_to, *what)
-                            .await?;
-                    }
+    let applied = async {
+        let rec = c.tx().records().await?;
+        for w in writes {
+            match w {
+                MsgWrite::Def(d) => MsgStore::put_def(rec, d, version).await?,
+                MsgWrite::DeleteDef(o) => MsgStore::delete_def(rec, *o).await?,
+                MsgWrite::Override(o) => MsgStore::put_override(rec, o, version).await?,
+                MsgWrite::DeleteOverrides {
+                    def,
+                    target,
+                    applies_to,
+                    what,
+                } => {
+                    MsgStore::delete_override(rec, *def, *target, *applies_to, *what).await?;
                 }
             }
-            Ok::<_, SprigError>(())
         }
-        .await
-    };
+        Ok::<_, SprigError>(())
+    }
+    .await;
     if let Err(e) = applied {
         let _ = c.rollback().await;
         return Err(e);

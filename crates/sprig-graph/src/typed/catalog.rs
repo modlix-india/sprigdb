@@ -187,6 +187,12 @@ pub trait DdlConns: Send + Sync {
     async fn changed(&self) -> Result<()> {
         Ok(())
     }
+    /// Graph `graph`'s indexes and constraints as the catalog has them now
+    /// (token names left empty). The default: none (a store with no
+    /// catalog records, as in tests).
+    async fn indexes(&self, _graph: u64) -> Result<Vec<crate::store::IndexDef>> {
+        Ok(Vec::new())
+    }
 }
 
 /// [`TypedDdl`] over plain SQL connections.
@@ -319,7 +325,7 @@ impl SqlDdl {
         if add.is_empty() || have.len() + add.len() > super::MAX_COLUMNS {
             return Ok(s);
         }
-        let indexes = self.indexes_now(&mut c, &Want::default()).await?;
+        let indexes = self.indexes_now(&Want::default()).await?;
         let mut with = s.clone();
         with.columns
             .entry(owner)
@@ -358,17 +364,8 @@ impl SqlDdl {
 
     /// The graph's indexes as the catalog has them now (a writer's may be
     /// a moment old).
-    async fn indexes_now(
-        &self,
-        c: &mut mysql_async::Conn,
-        want: &Want,
-    ) -> Result<Vec<crate::store::IndexDef>> {
-        let mut v: Vec<crate::store::IndexDef> = crate::catalog::GraphCatalog::new(&self.cat)
-            .indexes(c, Some(self.graph))
-            .await?
-            .into_iter()
-            .map(|(_, d)| d)
-            .collect();
+    async fn indexes_now(&self, want: &Want) -> Result<Vec<crate::store::IndexDef>> {
+        let mut v: Vec<crate::store::IndexDef> = self.conns.indexes(self.graph).await?;
         for d in &want.indexes {
             if !v.iter().any(|x| x.id == d.id) {
                 v.push(d.clone());
@@ -456,7 +453,7 @@ impl TypedDdl for SqlDdl {
                 .filter_map(|(k, code)| s.keys.get(k).map(|id| (*id, *code)))
                 .collect()
         };
-        let indexes = self.indexes_now(&mut c, want).await?;
+        let indexes = self.indexes_now(want).await?;
         // Columns of tables that exist (made meanwhile by another writer).
         let mut more: BTreeMap<Owner, BTreeSet<(String, Code)>> = BTreeMap::new();
         for (labels, cols) in &want.classes {

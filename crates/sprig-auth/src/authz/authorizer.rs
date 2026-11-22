@@ -38,7 +38,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, LazyLock};
 
 use sprig_catalog::store::{DbState, Namespace, ObjectState};
-use sprig_catalog::{ChangeOpts, MariaCatalog, TenantCatalog, VersionKind};
+use sprig_catalog::{AuthCatalog, ChangeOpts, TenantCatalog, VersionKind};
 use sprig_common::ids::{DbId, ObjectId, RoleId, UserId};
 use sprig_common::{Result, SprigError};
 
@@ -285,7 +285,7 @@ pub trait Authorizer: Send + Sync + std::fmt::Debug {
     /// The catalog's.
     async fn objects_dropped(
         &self,
-        catalog: &MariaCatalog,
+        catalog: &AuthCatalog,
         cat: &TenantCatalog,
         dropped: &[Dropped],
     ) -> Result<Option<u64>>;
@@ -300,7 +300,7 @@ pub trait Authorizer: Send + Sync + std::fmt::Debug {
     /// The catalog's.
     async fn objects_renamed(
         &self,
-        catalog: &MariaCatalog,
+        catalog: &AuthCatalog,
         cat: &TenantCatalog,
         renamed: &[Renamed],
     ) -> Result<Option<u64>>;
@@ -309,7 +309,7 @@ pub trait Authorizer: Send + Sync + std::fmt::Debug {
 /// Deletes the row-level security rows of dropped tables in one auth
 /// change; the version, if anything was deleted.
 async fn forget_policies(
-    catalog: &MariaCatalog,
+    catalog: &AuthCatalog,
     cat: &TenantCatalog,
     dropped: &[Dropped],
 ) -> Result<Option<u64>> {
@@ -337,10 +337,8 @@ async fn forget_policies(
         .change_with(cat.tenant, VersionKind::Auth, ChangeOpts::default())
         .await?;
     let r = {
-        let (core, q) = change.tx().parts();
-        super::rls::RlsStore::new(core.schema())
-            .forget_objects(q, &gone)
-            .await
+        let q = change.tx().records();
+        super::rls::RlsStore::new().forget_objects(q, &gone).await
     };
     match r {
         Ok(()) => Ok(Some(change.commit().await?)),
@@ -536,7 +534,7 @@ impl Authorizer for MysqlGrants {
 
     async fn objects_dropped(
         &self,
-        catalog: &MariaCatalog,
+        catalog: &AuthCatalog,
         cat: &TenantCatalog,
         dropped: &[Dropped],
     ) -> Result<Option<u64>> {
@@ -549,7 +547,7 @@ impl Authorizer for MysqlGrants {
 
     async fn objects_renamed(
         &self,
-        catalog: &MariaCatalog,
+        catalog: &AuthCatalog,
         cat: &TenantCatalog,
         renamed: &[Renamed],
     ) -> Result<Option<u64>> {
@@ -560,7 +558,7 @@ impl Authorizer for MysqlGrants {
 /// Writes `ops` as one auth change of `cat`'s tenant; `None` when there is
 /// nothing to write.
 async fn apply_ops(
-    catalog: &MariaCatalog,
+    catalog: &AuthCatalog,
     cat: &TenantCatalog,
     ops: &[DropOp],
 ) -> Result<Option<u64>> {
@@ -571,8 +569,8 @@ async fn apply_ops(
         .change_with(cat.tenant, VersionKind::Auth, ChangeOpts::default())
         .await?;
     let r: Result<()> = async {
-        let (core, q) = c.tx().parts();
-        let store = AuthzStore::new(core.schema());
+        let q = c.tx().records();
+        let store = AuthzStore::new();
         for op in ops {
             match op {
                 DropOp::KeepByName {

@@ -655,9 +655,12 @@ impl LiveEnv {
             Arc::new(sprig_inherit::InheritExtension),
             Arc::new(sprig_inherit::TypesExtension),
         ];
-        let source = MariaSource::new(Arc::clone(&locator) as Arc<dyn CatalogLocator>, ext)?;
+        let records = crate::sinks::catalog_records();
+        let source = MariaSource::new(Arc::clone(&locator) as Arc<dyn CatalogLocator>, ext)?
+            .with_records(Arc::clone(&records));
         let catalog = sprig_catalog::Versioner::new(
-            sprig_catalog::MariaBackend::new(Arc::clone(&locator) as Arc<dyn CatalogLocator>),
+            sprig_catalog::MariaBackend::new(Arc::clone(&locator) as Arc<dyn CatalogLocator>)
+                .with_records(records),
             Arc::new(sprig_catalog::DirectoryAllocator::new(Arc::clone(&global))),
         );
         Ok(Self {
@@ -742,11 +745,9 @@ impl CopyEnv for LiveEnv {
             .change(tenant, sprig_catalog::VersionKind::Catalog)
             .await?;
         let version = c.version();
-        let applied = {
-            let (store, tx) = c.tx().parts();
-            sprig_inherit::InheritStore::new(store.schema())
-                .apply(tx, &change, version)
-                .await
+        let applied = match c.tx().records().await {
+            Ok(rec) => sprig_inherit::InheritStore::apply(rec, &change, version).await,
+            Err(e) => Err(e),
         };
         if let Err(e) = applied {
             let _ = c.rollback().await;

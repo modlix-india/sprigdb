@@ -860,5 +860,6 @@ impl SequenceSource for CatalogSequences {
     }
 }
 
+pub mod records;
 #[cfg(test)]
 mod tests;

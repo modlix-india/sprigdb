@@ -10,7 +10,17 @@ publish.workspace = true
 
 [dependencies]
 bytes.workspace = true
+# Named time zones: the IANA database bundled into the binary (the same
+# answers on every host).
+jiff = { version = "=0.2.24", default-features = false, features = ["std", "tzdb-bundle-always"] }
+# REGEXP and the REGEXP_ functions: a backtracking engine (back
+# references and look-around, which both servers' regex libraries have).
+fancy-regex = "=0.19.2"
 sprig-engine.workspace = true
+
+[dev-dependencies]
+# The compressor of the generated golden files (test data only).
+lz4_flex.workspace = true
 
 [lints]
 workspace = true

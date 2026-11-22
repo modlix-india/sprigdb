@@ -293,7 +293,6 @@ pub struct ControllerHealth {
     balancer: Arc<crate::balancer_loop::BalancerLoop>,
     sizes: ShardSizes,
     live: Option<(LiveSettings, DcId)>,
-    locator: Arc<dyn CatalogLocator>,
     pools: RegistryPools,
     clock: Arc<dyn sprig_common::time::Clock>,
 }
@@ -324,7 +323,8 @@ pub struct HealthSources {
     pub sizes: ShardSizes,
     /// The live settings.
     pub live: Option<(LiveSettings, DcId)>,
-    /// Tenant catalogs (workload fingerprints).
+    /// Tenant catalogs (unused since the workload store moved to catalog
+    /// records; kept so callers build the sources as before).
     pub locator: Arc<dyn CatalogLocator>,
     /// Cluster connections (the docs index on the system cluster).
     pub pools: RegistryPools,
@@ -345,7 +345,6 @@ impl ControllerHealth {
             balancer: s.balancer,
             sizes: s.sizes,
             live: s.live,
-            locator: s.locator,
             pools: s.pools,
             clock: s.clock,
         }
@@ -777,20 +776,9 @@ impl HealthEnv for ControllerHealth {
                 continue;
             }
             let read = async {
-                let ep = self.locator.reader(*t).await?;
-                let schema = ep.store.schema().to_owned();
-                let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-                    SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable")
-                        .with_source(e)
-                })?;
-                let rows: Vec<(String, String, String, u64)> = conn
-                    .query(format!(
-                        "SELECT front_end, kind, stmt_type, COUNT(*) FROM `{}`.workload_fingerprints \
-                         GROUP BY front_end, kind, stmt_type",
-                        schema.replace('`', "``")
-                    ))
-                    .await
-                    .map_err(|e| SprigError::internal(format!("workload fingerprints: {e}")))?;
+                let mut rec = crate::catalog_records().begin(*t).await?;
+                let rows =
+                    sprig_workload::store::WorkloadTables::statement_counts(&mut *rec).await?;
                 Ok::<_, SprigError>(rows)
             };
             match tokio::time::timeout(Duration::from_secs(5), read).await {

@@ -275,8 +275,10 @@ impl ShardingLoop {
         // their own rule, and their samples read the home cluster only.
         tables.retain(|t| input::kv_key_table(&t.name).is_none());
         let mut c = self.conn(home).await?;
+        let mut wl = crate::catalog_records().begin(tenant).await?;
         let asm = input::assemble_from(
             &mut c,
+            &mut *wl,
             tenant,
             now,
             s.window,
@@ -433,10 +435,13 @@ impl ShardingLoop {
         tenant: TenantId,
         g: u32,
     ) -> Option<Duration> {
-        let rows = DecisionStore::for_tenant(tenant)
-            .by_subject(c, "group", &format!("t{tenant}/g{g}"), 50)
-            .await
-            .ok()?;
+        let _ = c;
+        let rows = {
+            let mut rec = self.records.get()?.begin(tenant).await.ok()?;
+            DecisionStore::by_subject(&mut *rec, "group", &format!("t{tenant}/g{g}"), 50)
+                .await
+                .ok()?
+        };
         let at = rows
             .iter()
             .filter(|r| r.d.kind == "group.rekey" && r.d.outcome != Outcome::Rejected)

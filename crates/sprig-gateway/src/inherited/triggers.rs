@@ -211,7 +211,7 @@ async fn ensure_for(
     let st = super::state_of(&cat);
     let ep = svc.locator.writer(t).await?;
     let schema = ep.store.schema().to_owned();
-    let mstore = MsgStore::new(&schema);
+    let mstore = MsgStore::new(Arc::clone(&svc.records), t);
     let dc = svc.locator.dc_store();
     let mut settled = true;
     for g in triggers {
@@ -220,7 +220,7 @@ async fn ensure_for(
         let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
         let row = match st.instances.get(&key) {
             Some(i) => Some((**i).clone()),
-            None => mstore.instance(&mut conn, key).await?,
+            None => mstore.instance(key).await?,
         };
         let binding = row
             .as_ref()
@@ -270,9 +270,9 @@ async fn ensure_for(
             continue;
         }
         // A new instance, or a new body.
-        let instance_id = if let Some(i) = &row {
+        let _instance_id = if let Some(i) = &row {
             if i.state == InstanceState::Creating
-                && !mstore.take_over(&mut conn, key, CLAIM_ABANDONED_MS).await?
+                && !mstore.take_over(key, CLAIM_ABANDONED_MS).await?
             {
                 // Another deploy claimed it and is making it now (the
                 // rollout, or a publish on another connection or gateway).
@@ -285,20 +285,17 @@ async fn ensure_for(
         } else {
             let id = ep.store.next_object_id(&mut conn).await?.0;
             let claimed = mstore
-                .claim(
-                    &mut conn,
-                    &Instance {
-                        def: key,
-                        instance_id: id,
-                        kind: DefKind::Trigger,
-                        def_version: g.def_version,
-                        definition: g.definition.clone(),
-                        state: InstanceState::Creating,
-                        cause: Cause::Declare,
-                        physical: None,
-                        created_at_ms: 0,
-                    },
-                )
+                .claim(&Instance {
+                    def: key,
+                    instance_id: id,
+                    kind: DefKind::Trigger,
+                    def_version: g.def_version,
+                    definition: g.definition.clone(),
+                    state: InstanceState::Creating,
+                    cause: Cause::Declare,
+                    physical: None,
+                    created_at_ms: 0,
+                })
                 .await?;
             if !claimed {
                 // Another gateway is deploying it.
@@ -350,16 +347,15 @@ async fn ensure_for(
             "stream": src.object_id,
         });
         set_module_state(&mut conn, &schema, deployed.module_id, "active").await?;
-        set_physical(
-            &mut conn,
-            &schema,
-            key,
-            instance_id,
-            g.def_version,
-            &g,
-            &physical,
-        )
-        .await?;
+        mstore
+            .set_instance(
+                key,
+                InstanceState::Active,
+                g.def_version,
+                &g.definition,
+                Some(&physical),
+            )
+            .await?;
         messages::put_index(
             dc.as_ref(),
             &MsgIndex {
@@ -439,35 +435,6 @@ async fn set_module_state(
             sprig_common::names::quote(schema)
         ),
         (state, module),
-    )
-    .await
-    .map_err(cat_err)
-}
-
-async fn set_physical(
-    conn: &mut mysql_async::Conn,
-    schema: &str,
-    key: sprig_inherit::msg::DefKey,
-    _instance_id: u64,
-    def_version: u64,
-    g: &Definition,
-    physical: &Value,
-) -> Result<()> {
-    use mysql_async::prelude::Queryable;
-    conn.exec_drop(
-        format!(
-            "UPDATE {}.inherited_instances SET state = 'active', def_version = ?, definition = ?, \
-             physical = ?, last_used_at = UTC_TIMESTAMP(3) WHERE def_tenant_id = ? AND \
-             def_object_id = ?",
-            sprig_common::names::quote(schema)
-        ),
-        (
-            def_version,
-            g.definition.to_string(),
-            physical.to_string(),
-            key.tenant.0,
-            key.object,
-        ),
     )
     .await
     .map_err(cat_err)
@@ -588,7 +555,7 @@ pub async fn ensure_run_as(
         let mut new = NewUser::new(RUN_AS_USER, hex(&pw).as_bytes());
         new.account_locked = true;
         new.created_by_tenant = g.declarer.0;
-        match sprig_auth::admin::create_user(&svc.catalog, t, &new, &*svc.clock).await {
+        match sprig_auth::admin::create_user(&svc.auth, t, &new, &*svc.clock).await {
             Ok(c) => {
                 cat = wait_auth(svc, t, c.auth_version).await?;
                 c.user_id
@@ -609,12 +576,12 @@ pub async fn ensure_run_as(
             Some(&cat.settings),
         ) == 1;
         let mut change = svc
-            .catalog
+            .auth
             .change_with(t, VersionKind::Auth, ChangeOpts::default())
             .await?;
         let r = {
-            let (core, q) = change.tx().parts();
-            let store = AuthzStore::new(core.schema());
+            let q = change.tx().records();
+            let store = AuthzStore::new();
             async {
                 for it in &items {
                     let actions = actions_of(it)?;
@@ -696,12 +663,12 @@ pub async fn revoke_database_grant(
         name: "*".to_owned(),
     })?;
     let mut change = svc
-        .catalog
+        .auth
         .change_with(t, VersionKind::Auth, ChangeOpts::default())
         .await?;
     let before = {
-        let (core, q) = change.tx().parts();
-        AuthzStore::new(core.schema())
+        let q = change.tx().records();
+        AuthzStore::new()
             .revoke(
                 q,
                 Grantee::User(user),
@@ -822,25 +789,9 @@ pub async fn on_run(
 /// Sets (or clears) `blocked` in the instance row of the trigger whose
 /// binding is `binding`.
 async fn mark_blocked(svc: &TenantServices, t: TenantId, binding: u64, why: Option<&str>) {
-    use mysql_async::prelude::Queryable;
-    let r = async {
-        let ep = svc.locator.writer(t).await?;
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
-        // `?` is the reason; NULL removes it.
-        let set = "IF(? IS NULL, JSON_REMOVE(physical, '$.blocked'), \
-                   JSON_SET(physical, '$.blocked', ?))";
-        conn.exec_drop(
-            format!(
-                "UPDATE {}.inherited_instances SET physical = {set} WHERE kind = 'trigger' AND \
-                 JSON_VALUE(physical, '$.binding') = ?",
-                sprig_common::names::quote(ep.store.schema())
-            ),
-            (why, why, binding),
-        )
-        .await
-        .map_err(cat_err)
-    }
-    .await;
+    let r = MsgStore::new(Arc::clone(&svc.records), t)
+        .mark_blocked(binding, why)
+        .await;
     if let Err(e) = r {
         tracing::debug!(tenant = %t, binding, error = %e, "blocked state not recorded");
     }

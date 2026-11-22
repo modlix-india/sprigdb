@@ -284,7 +284,7 @@ pub struct ExternalTokens {
     cache: Mutex<HashMap<CacheKey, Cached>>,
     /// The catalog writer, for just-in-time accounts; `None`: an issuer's
     /// `jit_users` creates nothing (the login is refused).
-    catalog: Option<sprig_catalog::MariaCatalog>,
+    catalog: Option<sprig_catalog::AuthCatalog>,
 }
 
 impl std::fmt::Debug for ExternalTokens {
@@ -317,14 +317,14 @@ impl ExternalTokens {
 
     /// The same verifier creating just-in-time accounts through `cat`.
     #[must_use]
-    pub fn with_catalog(mut self, cat: sprig_catalog::MariaCatalog) -> Self {
+    pub fn with_catalog(mut self, cat: sprig_catalog::AuthCatalog) -> Self {
         self.catalog = Some(cat);
         self
     }
 
     /// The catalog writer for just-in-time accounts, if any.
     #[must_use]
-    pub fn catalog(&self) -> Option<&sprig_catalog::MariaCatalog> {
+    pub fn catalog(&self) -> Option<&sprig_catalog::AuthCatalog> {
         self.catalog.as_ref()
     }
 

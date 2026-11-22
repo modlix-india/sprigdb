@@ -732,6 +732,35 @@ async fn reads_never_wait_behind_a_load_unless_they_need_its_version() {
     assert!(c1.database("b").is_none());
 }
 
+/// A session following its tenant sees every new snapshot as a change at
+/// its next statement, and an eviction too; with nothing loaded it sees
+/// none and may keep its snapshot.
+#[tokio::test]
+async fn followers_see_each_load_and_eviction() {
+    let env = Env::new().await;
+    let cache = env.cache(fast(), None);
+    assert!(cache.follow(T).is_none(), "nothing cached yet");
+    let c1 = cache.get(T, Freshness::Latest).await.unwrap();
+    let mut f = cache.follow(T).unwrap();
+    assert!(!f.changed());
+    // Reads that load nothing are not changes.
+    cache.get(T, Freshness::ANY).await.unwrap();
+    assert!(!f.changed());
+    let v2 = env
+        .commit(T, |tx, v| tx.put_database(db(2, "b", v, DbState::Active)))
+        .await;
+    let c2 = cache
+        .get(T, Freshness::Cached { min_version: v2 })
+        .await
+        .unwrap();
+    assert!(c2.version > c1.version);
+    assert!(f.changed(), "a finished load is a change");
+    f.mark_seen();
+    assert!(!f.changed());
+    assert!(cache.evict(T));
+    assert!(f.changed(), "an eviction is a change");
+}
+
 #[tokio::test]
 async fn pinned_tenants_reload_on_directory_events_others_on_next_use() {
     let env = Env::new().await;

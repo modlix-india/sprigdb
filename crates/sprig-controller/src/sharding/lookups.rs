@@ -575,25 +575,24 @@ impl ShardingLoop {
         let has: Option<u64> = c
             .exec_first(
                 "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? \
-                 AND TABLE_NAME IN ('workload_stats', 'lookup_indexes')",
+                 AND TABLE_NAME = 'lookup_indexes'",
                 (cat.as_str(),),
             )
             .await
             .map_err(|e| SprigError::internal(format!("catalog: {e}")))?;
-        if has.unwrap_or(0) < 2 {
+        if has.unwrap_or(0) < 1 {
             return Ok(Vec::new());
         }
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let wl = WorkloadTables::for_tenant(tenant);
-        let stats = wl
-            .merged_stats(
-                &mut c,
-                now.saturating_sub(ts.lookup_advice.window.as_secs()),
-                now + 60,
-            )
-            .await?;
+        let mut rec = crate::catalog_records().begin(tenant).await?;
+        let stats = WorkloadTables::merged_stats(
+            &mut *rec,
+            now.saturating_sub(ts.lookup_advice.window.as_secs()),
+            now + 60,
+        )
+        .await?;
         let busy: Vec<(u64, u64, u64, u64)> = stats
             .iter()
             .filter(|(_, s)| s.exec_count >= 1 && s.scatter_count > 0)
@@ -606,7 +605,8 @@ impl ShardingLoop {
             .iter()
             .map(|(id, ..)| sprig_common::ids::Fingerprint(*id))
             .collect();
-        let fps = wl.fingerprints(&mut c, &ids).await?;
+        let fps = WorkloadTables::fingerprints(&mut *rec, &ids).await?;
+        drop(rec);
         let mut by_col: BTreeMap<(ObjectId, Vec<String>), Scatter> = BTreeMap::new();
         for f in &fps {
             let Some(&(id, runs, scattered, us)) = busy.iter().find(|b| b.0 == f.id.0) else {

@@ -28,7 +28,6 @@ use sprig_common::{Result, SprigError};
 use sprig_engine::keys::collation::{Charset, Collation};
 use sprig_engine::txn::{LockMode, TxnOptions, Wait};
 
-use super::Engine;
 use super::assign::{self, Condition, Env, Level, Store};
 use super::expr::{self, Args, CExpr};
 use super::keys::{self, Space};
@@ -38,6 +37,7 @@ use super::row::{self, Datum};
 use super::store::Tx;
 use super::table::{ColDefault, ColType, Column, TableDef};
 use super::temporal;
+use super::{Engine, Pace};
 
 /// What a statement did.
 #[derive(Debug, Default)]
@@ -436,12 +436,34 @@ fn int_key(d: &Datum, ty: ColType) -> KeyConst {
 
 /// 1062 as MariaDB words it, for the values of columns `cols` of `row`.
 pub(crate) fn duplicate(def: &TableDef, cols: &[usize], row: &[Datum], key: &str) -> SprigError {
+    // The key's parts: a part on a column prefix shows the prefix only.
+    let bare = key
+        .strip_prefix(def.name.as_str())
+        .and_then(|k| k.strip_prefix('.'))
+        .unwrap_or(key);
+    let parts = if bare == def.pk_name {
+        Some(&def.pk_parts[..])
+    } else {
+        def.indexes
+            .iter()
+            .find(|x| x.name == bare)
+            .map(|x| &x.parts[..])
+    };
+    // A hidden row number is no column: it is never part of the text.
     let v: Vec<String> = cols
         .iter()
-        .map(|&i| {
+        .enumerate()
+        .filter(|&(_, &i)| i < def.columns.len())
+        .map(|(n, &i)| {
             meta::text(&def.columns[i], &row[i]).map_or_else(
                 || "NULL".into(),
-                |t| String::from_utf8_lossy(&t).into_owned(),
+                |t| {
+                    let t = String::from_utf8_lossy(&t).into_owned();
+                    match parts.and_then(|p| p.get(n)).and_then(|kc| kc.prefix) {
+                        Some(len) => t.chars().take(len as usize).collect(),
+                        None => t,
+                    }
+                },
             )
         })
         .collect();
@@ -599,6 +621,7 @@ impl Engine {
             params,
             env,
             now: std::sync::OnceLock::new(),
+            conds: crate::engine::expr::Conds::default(),
         };
         let o = self.statement(&sp, &mut tx, plan, &a, found_rows).await?;
         tx.finish().await?;
@@ -633,6 +656,7 @@ impl Engine {
             params,
             env: tx.env(),
             now: std::sync::OnceLock::new(),
+            conds: crate::engine::expr::Conds::default(),
         };
         tx.begin_statement();
         let r = match self.statement(&sp, tx, plan, &a, found_rows).await {
@@ -648,9 +672,71 @@ impl Engine {
         }
     }
 
+    /// Runs `plan` as a part of the statement `tx` is running (a write of
+    /// one row of a multi-table write): no statement of its own, so an
+    /// error leaves the undoing to the caller.
+    ///
+    /// # Errors
+    /// As for [`Engine::run_in`].
+    pub(crate) async fn run_part(
+        &self,
+        tenant: u64,
+        plan: &Plan,
+        params: &[Datum],
+        found_rows: bool,
+        tx: &mut Tx,
+    ) -> Result<Outcome> {
+        let sp = if let Some(sp) = tx.held(&plan.table) {
+            sp
+        } else {
+            let sp = self.space(tenant, &plan.table).await?;
+            tx.hold(&plan.table, &sp);
+            sp
+        };
+        let a = Args {
+            params,
+            env: tx.env(),
+            now: std::sync::OnceLock::new(),
+            conds: crate::engine::expr::Conds::default(),
+        };
+        self.statement(&sp, tx, plan, &a, found_rows)
+            .await
+            .map_err(|e| name_table(e, plan))
+    }
+
+    /// One statement in `tx`, with the conditions its expressions raised
+    /// (reading the rows) ahead of those its writes raised.
+    async fn statement(
+        &self,
+        sp: &Space,
+        tx: &mut Tx,
+        plan: &Plan,
+        a: &Args<'_>,
+        found_rows: bool,
+    ) -> Result<Outcome> {
+        let mut o = Box::pin(self.statement_rows(sp, tx, plan, a, found_rows)).await?;
+        let raised = a.take_conds();
+        if !raised.is_empty() {
+            let mut all = raised;
+            all.append(&mut o.conds);
+            o.conds = all;
+            // An UPDATE's info counts every condition.
+            if let Some(info) = &o.info
+                && let Some(at) = info.find("Warnings: ")
+            {
+                o.info = Some(format!(
+                    "{}Warnings: {}",
+                    &info[..at],
+                    warning_count(&o.conds)
+                ));
+            }
+        }
+        Ok(o)
+    }
+
     /// One statement in `tx`.
     #[allow(clippy::too_many_lines)] // one arm per statement kind
-    async fn statement(
+    async fn statement_rows(
         &self,
         sp: &Space,
         tx: &mut Tx,
@@ -693,7 +779,8 @@ impl Engine {
                         produced += 1;
                         rows.push(out.iter().map(|oc| r[oc.col].clone()).collect());
                         Ok(produced < limit)
-                    })?;
+                    })
+                    .await?;
                 }
                 o.rows = rows;
                 o
@@ -714,7 +801,9 @@ impl Engine {
                 .await?;
                 let (mut changed, n) = (0u64, matched.len());
                 let mut conds = Vec::new();
+                let mut pace = Pace::default();
                 for (ri, (key, old)) in matched.into_iter().enumerate() {
+                    pace.add(1).await;
                     // Left to right, as MariaDB assigns: a later assignment
                     // sees the values earlier ones stored.
                     let mut new = old.clone();
@@ -751,6 +840,24 @@ impl Engine {
                     }
                     check_constraints(plan, &new, a)?;
                     changed += 1;
+                    if let Some(g) = plan.fks.as_deref().filter(|_| !a.env.no_fk_checks) {
+                        let mut chain = super::fk::Chain::of(def.object, &key, true);
+                        self.fk_children(
+                            sp.tenant,
+                            tx,
+                            g,
+                            def.object,
+                            &old,
+                            Some(&new),
+                            0,
+                            &mut chain,
+                        )
+                        .await?;
+                        replace_row(sp, def, tx, key, &old, &new).await?;
+                        self.fk_parents(sp.tenant, tx, g, def.object, &new, Some(&old))
+                            .await?;
+                        continue;
+                    }
                     replace_row(sp, def, tx, key, &old, &new).await?;
                 }
                 o.affected = if found_rows { n as u64 } else { changed };
@@ -774,15 +881,30 @@ impl Engine {
                     false,
                 )
                 .await?;
-                for (key, old) in &matched {
-                    tx.delete(key.clone()).await?;
-                    for ix in 0..def.indexes.len() {
-                        if let Some((k, _)) = keys::index_entry(sp, def, ix, old) {
-                            tx.delete(Bytes::from(k)).await?;
+                let fks = plan.fks.as_deref().filter(|_| !a.env.no_fk_checks);
+                let mut deleted = 0u64;
+                let mut pace = Pace::default();
+                for (key, old) in matched {
+                    pace.add(1).await;
+                    if let Some(g) = fks {
+                        // A cascade of an earlier row may have taken this
+                        // one already (a table that references itself).
+                        if g.refers_to_itself(def.object)
+                            && !matches!(
+                                tx.lock_key(&key, LockMode::Exclusive).await?,
+                                Some(Some(_))
+                            )
+                        {
+                            continue;
                         }
+                        let mut chain = super::fk::Chain::of(def.object, &key, false);
+                        self.fk_children(sp.tenant, tx, g, def.object, &old, None, 0, &mut chain)
+                            .await?;
                     }
+                    delete_row(sp, def, tx, key, &old).await?;
+                    deleted += 1;
                 }
-                o.affected = matched.len() as u64;
+                o.affected = deleted;
                 o
             }
         })
@@ -801,7 +923,9 @@ impl Engine {
         let def = &*plan.table;
         let mut o = Outcome::default();
         let mut conds = Vec::new();
+        let mut pace = Pace::default();
         for (ri, exprs) in rows.iter().enumerate() {
+            pace.add(1).await;
             let mut cx = store_cx(plan, a.env, &mut conds);
             cx.row = ri + 1;
             // What the statement gives each column: a value, or nothing
@@ -895,7 +1019,14 @@ impl Engine {
             }
             check_new_row(plan, &row, a)?;
             check_constraints(plan, &row, a)?;
+            if def.hidden {
+                row.push(Datum::UInt(self.next_rowid(sp)?));
+            }
             insert_row(sp, def, tx, &row).await?;
+            if let Some(g) = plan.fks.as_deref().filter(|_| !a.env.no_fk_checks) {
+                self.fk_parents(sp.tenant, tx, g, def.object, &row, None)
+                    .await?;
+            }
             o.affected += 1;
         }
         if rows.len() > 1 {
@@ -947,7 +1078,7 @@ async fn insert_row(sp: &Space, def: &TableDef, tx: &mut Tx, row: &[Datum]) -> R
         .insert(Bytes::from(key), row::encode(def, sp, row)?, true)
         .await?
     {
-        return Err(duplicate(def, &def.pk, row, "PRIMARY"));
+        return Err(duplicate(def, &def.pk, row, &def.pk_name));
     }
     for ix in 0..def.indexes.len() {
         put_index_entry(sp, def, tx, ix, row).await?;
@@ -978,9 +1109,26 @@ async fn put_index_entry(
     tx.put_new(Bytes::from(k), v).await
 }
 
+/// Deletes row `old` (at `key`) and its index entries.
+pub(crate) async fn delete_row(
+    sp: &Space,
+    def: &TableDef,
+    tx: &mut Tx,
+    key: Bytes,
+    old: &[Datum],
+) -> Result<()> {
+    tx.delete(key).await?;
+    for ix in 0..def.indexes.len() {
+        if let Some((k, _)) = keys::index_entry(sp, def, ix, old) {
+            tx.delete(Bytes::from(k)).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Replaces row `old` (at `key`) by `new`, touching only the index
 /// entries that change.
-async fn replace_row(
+pub(crate) async fn replace_row(
     sp: &Space,
     def: &TableDef,
     tx: &mut Tx,
@@ -1012,7 +1160,7 @@ async fn replace_row(
             .insert(Bytes::from(nk), row::encode(def, sp, new)?, true)
             .await?
         {
-            return Err(duplicate(def, &def.pk, new, "PRIMARY"));
+            return Err(duplicate(def, &def.pk, new, &def.pk_name));
         }
     }
     for ix in changed {
@@ -1115,7 +1263,16 @@ fn locate<'p>(sp: &Space, plan: &'p Plan, a: &Args<'_>) -> Result<(Found, Option
             let mut k = p;
             for ((e, &ci), kc) in vals.iter().zip(&def.pk).zip(def.pk_key(sp.first_format)) {
                 let v = expr::eval(e, &[], a)?;
-                match key_const(&v, &def.columns[ci], &a.env) {
+                // The hidden row number (a write through a join finds a
+                // table's rows by it): the value read, as it is.
+                let kv = match def.columns.get(ci) {
+                    Some(col) => key_const(&v, col, &a.env),
+                    None => match v {
+                        Datum::UInt(_) => KeyConst::Exact(v.clone()),
+                        _ => KeyConst::NoRow,
+                    },
+                };
+                match kv {
                     KeyConst::Exact(d) => {
                         if !keys::put_part(&mut k, &d, kc) {
                             return Err(part_failed());
@@ -1295,7 +1452,7 @@ async fn lock_candidate(
         tx.unlock_unmatched(key);
         return Ok(false);
     };
-    row::decode_into(def, sp, &raw, row)?;
+    row::decode_into(def, sp, key, &raw, row)?;
     let mut keep = entry
         .is_none_or(|(ix, ik)| keys::index_entry(sp, def, ix, row).is_some_and(|(k, _)| k == ik));
     if keep && let Some(fl) = filter {
@@ -1354,6 +1511,7 @@ async fn locked_rows(
         return Ok(out);
     }
     let mut row = Vec::with_capacity(def.columns.len());
+    let mut pace = Pace::default();
     let (found, filter) = locate(sp, plan, a)?;
     match found {
         Found::Nothing => {}
@@ -1374,6 +1532,7 @@ async fn locked_rows(
                         return Ok(out);
                     }
                 }
+                pace.add(1).await;
             }
         }
         Found::Index { ix, lo, hi } => {
@@ -1409,6 +1568,7 @@ async fn locked_rows(
                         }
                     }
                 }
+                pace.add(batch.len()).await;
                 match batch.last() {
                     Some((k, _)) if more => from = keys::prefix_end(k),
                     _ => break,
@@ -1435,13 +1595,13 @@ async fn locked_rows(
                 let mut failed: Option<SprigError> = None;
                 let mut seen = 0u64;
                 let batch = {
-                    let keep = |_: &[u8], raw: &[u8]| -> bool {
+                    let keep = |key: &[u8], raw: &[u8]| -> bool {
                         seen += 1;
                         if failed.is_some() {
                             return false;
                         }
                         let raw = Bytes::copy_from_slice(raw);
-                        let kept = row::decode_into(def, sp, &raw, &mut row).and_then(|()| {
+                        let kept = row::decode_into(def, sp, key, &raw, &mut row).and_then(|()| {
                             Ok(match filter {
                                 Some(fl) => row::truth(&expr::eval(fl, &row, a)?) == Some(true),
                                 None => true,
@@ -1464,11 +1624,12 @@ async fn locked_rows(
                 }
                 let more = batch.len() == want;
                 for (k, raw) in &batch {
-                    out.push((k.clone(), row::decode(def, sp, raw)?));
+                    out.push((k.clone(), row::decode(def, sp, k, raw)?));
                 }
                 if out.len() as u64 >= max {
                     return Ok(out);
                 }
+                pace.add(usize::try_from(seen).unwrap_or(usize::MAX)).await;
                 match batch.last() {
                     Some((k, _)) if more => {
                         if rev {
@@ -1489,18 +1650,19 @@ async fn locked_rows(
 /// select (plain reads at the read view), in key order, until `f`
 /// answers `false`.
 #[allow(clippy::too_many_lines)] // one arm per access path
-fn visit(
+async fn visit(
     sp: &Space,
     tx: &mut Tx,
     plan: &Plan,
     a: &Args<'_>,
     o: &mut Outcome,
-    f: &mut dyn FnMut(Bytes, &[Datum]) -> Result<bool>,
+    f: &mut (dyn FnMut(Bytes, &[Datum]) -> Result<bool> + Send),
 ) -> Result<()> {
+    let mut pace = Pace::default();
     let def = &*plan.table;
     let (found, filter) = locate(sp, plan, a)?;
     let mut pass = |key: Bytes, raw: &Bytes| -> Result<bool> {
-        let row = row::decode(def, sp, raw)?;
+        let row = row::decode(def, sp, &key, raw)?;
         if let Some(fl) = filter
             && row::truth(&expr::eval(fl, &row, a)?) != Some(true)
         {
@@ -1524,6 +1686,7 @@ fn visit(
                 {
                     return Ok(());
                 }
+                pace.add(1).await;
             }
         }
         Found::Index { ix: _, lo, hi } => {
@@ -1551,6 +1714,7 @@ fn visit(
                         return Ok(());
                     }
                 }
+                pace.add(batch.len()).await;
                 match batch.last() {
                     Some((k, _)) if full && rev => hi = k.to_vec(),
                     Some((k, _)) if full => from = keys::prefix_end(k),
@@ -1578,6 +1742,7 @@ fn visit(
                         return Ok(());
                     }
                 }
+                pace.add(batch.len()).await;
                 match batch.last() {
                     Some((k, _)) if full => {
                         if rev {

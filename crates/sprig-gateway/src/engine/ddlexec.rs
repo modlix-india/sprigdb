@@ -131,13 +131,416 @@ impl Hook {
             .cloned()
     }
 
+    /// The foreign keys of other tables that reference `def`, by the
+    /// child's object id (oldest table first), unless `foreign_key_checks
+    /// = 0`.
+    fn children_of(&self, def: &TableDef) -> Vec<(Arc<TableDef>, usize)> {
+        if self.sess.env.no_fk_checks {
+            return Vec::new();
+        }
+        let Some(eng) = catalog::of(&self.cat) else {
+            return Vec::new();
+        };
+        let names = super::plan::CatalogNames {
+            cat: &self.cat,
+            eng,
+            lower_case: self.lctn,
+        };
+        let mut v: Vec<(Arc<TableDef>, usize)> =
+            super::plan::Names::referencing(&names, def.db, &def.name)
+                .into_iter()
+                .filter(|(c, _)| c.object != def.object)
+                .collect();
+        v.sort_by_key(|(c, i)| (c.object, *i));
+        v
+    }
+
+    /// The catalog's names as the binder reads them.
+    fn names(&self) -> Option<super::plan::CatalogNames<'_>> {
+        Some(super::plan::CatalogNames {
+            cat: &self.cat,
+            eng: catalog::of(&self.cat)?,
+            lower_case: self.lctn,
+        })
+    }
+
+    /// The database of the parent of foreign key `f` of a table of `db`.
+    fn parent_db(&self, db: DbId, f: &define::Fk) -> Option<DbId> {
+        match &f.ref_db {
+            None => Some(db),
+            // The statement's text names it physically (the gateway's
+            // name translation); a stored definition, by its logical name.
+            Some(n) => super::plan::physical_db(self.tenant, n)
+                .or_else(|| super::plan::Names::db_by_name(&self.names()?, n)),
+        }
+    }
+
+    /// Whether foreign key `f` of table `child` of `db` references `child`
+    /// itself.
+    fn self_reference(&self, db: DbId, child: &str, f: &define::Fk) -> bool {
+        self.parent_db(db, f) == Some(db)
+            && if self.lctn {
+                f.ref_table.eq_ignore_ascii_case(child)
+            } else {
+                f.ref_table == child
+            }
+    }
+
+    /// The stored definition of table `name` of database `db`, as the
+    /// session's catalog has it.
+    fn stored_def(&self, db: DbId, name: &str) -> Option<define::Def> {
+        let eng = catalog::of(&self.cat)?;
+        let o = if self.lctn {
+            eng.by_lower.get(&(db, name.to_lowercase()))?
+        } else {
+            eng.by_name.get(&(db, name.to_owned()))?
+        };
+        define::parse_stored(eng.texts.get(o)?).ok()
+    }
+
+    /// Foreign keys `fks` of table `child` of `db` (being created, or
+    /// altered to `child`) checked against their parents.
+    ///
+    /// # Errors
+    /// MariaDB's 1005 errno 150; MySQL's 1824, 1830, 3734, 3780, 6125.
+    fn check_fks(&self, db: DbId, child: &define::Def, fks: &[&define::Fk]) -> Result<()> {
+        if fks.is_empty() {
+            return Ok(());
+        }
+        let db_name = self.db_name(db);
+        let cx = define::fkcheck::For {
+            mysql: self.sess.env.mysql,
+            checks: !self.sess.env.no_fk_checks,
+            db: &db_name,
+        };
+        define::fkcheck::set_null(cx, child, fks)?;
+        for f in fks {
+            let stored;
+            let parent = if self.self_reference(db, &child.name, f) {
+                Some(child)
+            } else {
+                stored = self
+                    .parent_db(db, f)
+                    .and_then(|pdb| self.stored_def(pdb, &f.ref_table));
+                stored.as_ref()
+            };
+            define::fkcheck::check(cx, child, f, parent)?;
+        }
+        Ok(())
+    }
+
+    /// Column changes of `ALTER TABLE` (`a`, from `old` to `new`, of table
+    /// `d0`) that a foreign key depends on. MariaDB refuses any change of
+    /// a key column's type (1832 on the child, 1833 on the parent), and a
+    /// rename together with a type change (1846); MySQL refuses a type
+    /// the other side doesn't match (3780) and any change it can't make
+    /// in place (1832, 1833).
+    #[allow(clippy::too_many_lines)] // the child's side, then the parents'
+    fn fk_column_changes(
+        &self,
+        a: &alter::Alter,
+        old: &define::Def,
+        new: &define::Def,
+        d0: &TableDef,
+    ) -> Result<()> {
+        let mysql = self.sess.env.mysql;
+        let db = self.db_name(d0.db);
+        let err = |code: u16, msg: String| SprigError::standard(code, *b"HY000", msg);
+        let renamed_too = || {
+            SprigError::standard(
+                1846,
+                *b"0A000",
+                "ALGORITHM=COPY is not supported. Reason: Columns participating in a foreign key are renamed. Try ALGORITHM=INPLACE",
+            )
+        };
+        let incompatible = |c: &str, r: &str, fk: &str| {
+            err(
+                3780,
+                format!(
+                    "Referencing column '{c}' and referenced column '{r}' in foreign key constraint '{fk}' are incompatible."
+                ),
+            )
+        };
+        for spec in &a.specs {
+            let (oname, nname) = match spec {
+                alter::Spec::Modify(n) => (n.as_str(), n.as_str()),
+                alter::Spec::Rename { old, new } => (old.as_str(), new.as_str()),
+                _ => continue,
+            };
+            let (Some(oi), Some(ni)) = (old.col(oname), new.col(nname)) else {
+                continue;
+            };
+            let (ot, nt) = (&old.cols[oi].ty, &new.cols[ni].ty);
+            if ot == nt {
+                continue;
+            }
+            let oname = old.cols[oi].name.as_str();
+            let renamed = !oname.eq_ignore_ascii_case(nname);
+            let in_place = define::fkcheck::in_place(ot, nt, mysql);
+            // The table's own foreign keys on the column.
+            for f in &old.fks {
+                let Some(pos) = f.cols.iter().position(|c| c.eq_ignore_ascii_case(oname)) else {
+                    continue;
+                };
+                if !mysql {
+                    if renamed {
+                        return Err(renamed_too());
+                    }
+                    let fk = if in_place {
+                        format!("{db}/{}", f.name)
+                    } else {
+                        f.name.clone()
+                    };
+                    return Err(err(
+                        1832,
+                        format!(
+                            "Cannot change column '{oname}': used in a foreign key constraint '{fk}'"
+                        ),
+                    ));
+                }
+                let r = &f.ref_cols[pos];
+                let pty = if self.self_reference(d0.db, &old.name, f) {
+                    new.col(r).map(|i| new.cols[i].ty.clone())
+                } else {
+                    self.parent_db(d0.db, f)
+                        .and_then(|pdb| self.stored_def(pdb, &f.ref_table))
+                        .and_then(|p| p.col(r).map(|i| p.cols[i].ty.clone()))
+                };
+                if let Some(pty) = pty
+                    && !define::fkcheck::compatible(nt, &pty)
+                {
+                    return Err(incompatible(new.cols[ni].name.as_str(), r, &f.name));
+                }
+                if !in_place {
+                    return Err(err(
+                        1832,
+                        format!(
+                            "Cannot change column '{oname}': used in a foreign key constraint '{}'",
+                            f.name
+                        ),
+                    ));
+                }
+            }
+            // Other tables' foreign keys on the column.
+            for (child, i) in self.children_of(d0) {
+                let cf = &child.fks[i];
+                let Some(pos) = cf
+                    .ref_cols
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(oname))
+                else {
+                    continue;
+                };
+                let cdb = self.db_name(child.db);
+                if !mysql {
+                    if renamed {
+                        return Err(renamed_too());
+                    }
+                    let (fk, table) = if in_place {
+                        (format!("{db}/{}", cf.name), format!("{cdb}/{}", child.name))
+                    } else {
+                        (cf.name.clone(), format!("{cdb}.{}", child.name))
+                    };
+                    return Err(err(
+                        1833,
+                        format!(
+                            "Cannot change column '{oname}': used in a foreign key constraint '{fk}' of table '{table}'"
+                        ),
+                    ));
+                }
+                let ccol = child
+                    .columns
+                    .get(cf.cols[pos])
+                    .map_or("", |c| c.name.as_str());
+                let cty = self
+                    .stored_def(child.db, &child.name)
+                    .and_then(|c| c.col(ccol).map(|i| c.cols[i].ty.clone()));
+                if let Some(cty) = cty
+                    && !define::fkcheck::compatible(&cty, nt)
+                {
+                    return Err(incompatible(ccol, nname, &cf.name));
+                }
+                if !in_place {
+                    return Err(err(
+                        1833,
+                        format!(
+                            "Cannot change column '{oname}': used in a foreign key constraint '{}' of table '{cdb}.{}'",
+                            cf.name, child.name
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `ALTER TABLE ... ADD FOREIGN KEY` with `foreign_key_checks` on: the
+    /// rows of `d0` must all have their parent under key `f` (the new
+    /// definition `d1` names it in the error; `generated`: the statement
+    /// didn't name it). Returns how many rows the table has (the servers
+    /// copy the table to check them, and report the rows).
+    ///
+    /// # Errors
+    /// 1452 naming the servers' temporary copy of the table.
+    async fn rows_have_parents(
+        &self,
+        d0: &TableDef,
+        d1: &TableDef,
+        f: &define::Fk,
+        generated: bool,
+    ) -> Result<Option<u64>> {
+        let parent = if self.self_reference(d0.db, &d0.name, f) {
+            None
+        } else {
+            let Some(names) = self.names() else {
+                return Ok(None);
+            };
+            let Some(pdb) = self.parent_db(d0.db, f) else {
+                return Ok(None);
+            };
+            match super::plan::Names::table(&names, pdb, &f.ref_table)
+                .and_then(|p| p.as_ref().as_ref().ok().cloned())
+            {
+                Some(p) => Some(p),
+                None => return Ok(None),
+            }
+        };
+        let pdef: &TableDef = parent.as_deref().unwrap_or(d0);
+        let cols: Option<Vec<usize>> = f.cols.iter().map(|c| d0.column(c)).collect();
+        let pcols: Option<Vec<usize>> = f.ref_cols.iter().map(|c| pdef.column(c)).collect();
+        let (Some(cols), Some(pcols)) = (cols, pcols) else {
+            return Ok(None);
+        };
+        if let Some(n) = self
+            .eng
+            .fk_rows_hold(self.tenant.0, d0, &cols, pdef, &pcols)
+            .await?
+        {
+            return Ok(Some(n));
+        }
+        let mysql = self.sess.env.mysql;
+        let mut text = d1
+            .fks
+            .iter()
+            .find(|x| x.name.eq_ignore_ascii_case(&f.name))
+            .map_or_else(String::new, |x| x.text(d1, mysql));
+        // The servers check the rows while copying into a temporary table,
+        // which the message names: `#sql-alter-<pid>-<connection>` on
+        // MariaDB, `#sql-<pid>_<connection>` on MySQL (hexadecimal).
+        let tmp = if mysql {
+            format!("#sql-1_{:x}", self.sess.conn)
+        } else {
+            format!("#sql-alter-1-{:x}", self.sess.conn)
+        };
+        // MariaDB names a key the statement left unnamed after that copy.
+        if generated
+            && !mysql
+            && let Some(n) = f.name.strip_prefix(&format!("{}_ibfk_", d0.name))
+        {
+            text = text.replacen(&format!("`{}`", f.name), &format!("`{tmp}_ibfk_{n}`"), 1);
+        }
+        Err(SprigError::standard(
+            1452,
+            *b"23000",
+            format!(
+                "Cannot add or update a child row: a foreign key constraint fails (`{}`.`{tmp}`, {text})",
+                self.db_name(d0.db)
+            ),
+        ))
+    }
+
+    /// The logical name of database `db`.
+    fn db_name(&self, db: DbId) -> String {
+        self.cat
+            .databases
+            .get(db)
+            .map_or_else(String::new, |d| d.name.clone())
+    }
+
+    /// 1701 for a `TRUNCATE` of a table another table's foreign key
+    /// references. MariaDB names the newest such key, with the parent's
+    /// database written out; MySQL the oldest, by name only.
+    fn truncate_refused(&self, def: &TableDef) -> Option<SprigError> {
+        let kids = self.children_of(def);
+        let mysql = self.sess.env.mysql;
+        let (child, i) = if mysql { kids.first()? } else { kids.last()? };
+        let f = &child.fks[*i];
+        let detail = if mysql {
+            format!(
+                "`{}`.`{}`, CONSTRAINT `{}`",
+                self.db_name(child.db),
+                child.name,
+                f.name
+            )
+        } else {
+            let mut q = f.clone();
+            q.ref_db = Some(self.db_name(def.db));
+            q.on_delete = None;
+            q.on_update = None;
+            format!(
+                "`{}`.`{}`, {}",
+                self.db_name(child.db),
+                child.name,
+                q.text(child, false)
+            )
+        };
+        Some(SprigError::standard(
+            1701,
+            *b"42000",
+            format!("Cannot truncate a table referenced in a foreign key constraint ({detail})"),
+        ))
+    }
+
+    /// The refusal of a `DROP TABLE` of a table another table's foreign key
+    /// references, unless that table goes in the same statement: MariaDB's
+    /// 1451 without details, MySQL's 3730.
+    fn drop_refused(&self, defs: &[Arc<TableDef>]) -> Option<SprigError> {
+        for d in defs {
+            let kids = self.children_of(d);
+            let Some((child, i)) = kids
+                .iter()
+                .find(|(c, _)| !defs.iter().any(|x| x.object == c.object))
+            else {
+                continue;
+            };
+            return Some(if self.sess.env.mysql {
+                SprigError::standard(
+                    3730,
+                    *b"HY000",
+                    format!(
+                        "Cannot drop table '{}' referenced by a foreign key constraint '{}' on table '{}'.",
+                        d.name, child.fks[*i].name, child.name
+                    ),
+                )
+            } else {
+                SprigError::standard(
+                    1451,
+                    *b"23000",
+                    "Cannot delete or update a parent row: a foreign key constraint fails",
+                )
+            });
+        }
+        None
+    }
+
     /// The text of table `name` of `schema`: what this statement produced
     /// for it, else the session catalog's. `Some(None)`: this statement
     /// removed it.
+    #[allow(clippy::option_option)] // a table produced, removed, or not touched
     fn text(&self, schema: &SchemaName, name: &str) -> Option<Option<String>> {
-        let same = |a: &str, b: &str| if self.lctn { a.eq_ignore_ascii_case(b) } else { a == b };
+        let same = |a: &str, b: &str| {
+            if self.lctn {
+                a.eq_ignore_ascii_case(b)
+            } else {
+                a == b
+            }
+        };
         let produced = self.produced.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((_, _, t)) = produced.iter().rev().find(|(s, n, _)| s == schema && same(n, name)) {
+        if let Some((_, _, t)) = produced
+            .iter()
+            .rev()
+            .find(|(s, n, _)| s == schema && same(n, name))
+        {
             return Some(t.clone());
         }
         drop(produced);
@@ -148,7 +551,7 @@ impl Hook {
         } else {
             eng.by_name.get(&(db, name.to_owned()))?
         };
-        Some(eng.texts.get(o).map(|t| t.to_string()))
+        Some(eng.texts.get(o).map(ToString::to_string))
     }
 
     fn produce(&self, schema: SchemaName, name: &str, text: Option<String>) {
@@ -172,7 +575,6 @@ impl Hook {
             db_cs,
         }
     }
-
 
     /// The catalog answered.
     pub(crate) async fn done(self, outcome: Outcome<'_>) -> Report {
@@ -212,12 +614,26 @@ impl Hook {
                 }
             }
         }
-        if matches!(outcome, Outcome::Published(_)) {
-            for object in dropped {
-                if let Err(e) = self.eng.drop_table(self.tenant.0, object).await {
-                    tracing::warn!(tenant = %self.tenant, object, error = %e, "a dropped table's rows weren't all deleted");
-                }
+        // A dropped table's rows are deleted after the statement has
+        // answered: the catalog no longer names the table, its keys carry
+        // an object number no new table gets, and deleting millions of
+        // rows a batch at a time would hold the client for minutes (the
+        // servers answer at once).
+        if matches!(outcome, Outcome::Published(_)) && !dropped.is_empty() {
+            let (eng, tenant) = (self.eng, self.tenant);
+            // Marked first, durably: a process that stops before the
+            // deletion ends deletes the rest when it next serves the
+            // tenant (`Engine::sweep_once`).
+            if let Err(e) = eng.mark_dropped(tenant.0, &dropped).await {
+                tracing::warn!(tenant = %tenant, error = %e, "dropped tables not marked; the catalog's record of the drop is the sweep's fallback");
             }
+            tokio::spawn(async move {
+                for object in dropped {
+                    if let Err(e) = eng.drop_table(tenant.0, object).await {
+                        tracing::warn!(tenant = %tenant, object, error = %e, "a dropped table's rows weren't all deleted");
+                    }
+                }
+            });
         }
         report
     }
@@ -260,35 +676,43 @@ impl EngineDdl<'_> {
     }
 
     /// `CREATE TABLE` (or `CREATE TABLE ... LIKE`) of `name` in `schema`.
-    async fn create(&self, stmt: &PhysicalDdl, name: &str) -> Result<()> {
+    fn create(&self, stmt: &PhysicalDdl, name: &str) -> Result<()> {
         let Some(db) = stmt.schema.db() else {
-            return Err(SprigError::internal("engine: CREATE TABLE outside a database"));
+            return Err(SprigError::internal(
+                "engine: CREATE TABLE outside a database",
+            ));
         };
         let cx = self.hook.ctx(db);
         let def = match define::create(&stmt.sql, &cx)? {
             Created::Def(d) => {
                 let mut d = *d;
-                d.name = name.to_owned();
+                name.clone_into(&mut d.name);
                 d
             }
             Created::Like(src_db, src) => {
                 let src_schema = match &src_db {
                     None => stmt.schema,
-                    Some(s) => s.parse::<SchemaName>().map_err(|_| unknown_table(s, &src))?,
+                    Some(s) => s
+                        .parse::<SchemaName>()
+                        .map_err(|_| unknown_table(s, &src))?,
                 };
-                let shown = src_db.as_deref().map_or_else(|| stmt.schema.to_string(), str::to_owned);
+                let shown = src_db
+                    .as_deref()
+                    .map_or_else(|| stmt.schema.to_string(), str::to_owned);
                 let Some(Some(text)) = self.hook.text(&src_schema, &src) else {
                     return Err(unknown_table(&shown, &src));
                 };
                 define::like(&define::parse_stored(&text)?, name)
             }
         };
+        let fks: Vec<&define::Fk> = def.fks.iter().collect();
+        self.hook.check_fks(db, &def, &fks)?;
         let text = define::render(&def);
         // The engine must be able to serve what results.
         if let Err(why) = table::parse(ObjectId(0), 1, db, &text) {
-            return Err(not_on_engine(why.trim_start_matches(
-                "table definition not served by the engine: ",
-            )));
+            return Err(not_on_engine(
+                why.trim_start_matches("table definition not served by the engine: "),
+            ));
         }
         // `CREATE OR REPLACE`: the table it replaces goes.
         if !self.hook.creates
@@ -341,18 +765,41 @@ impl EngineDdl<'_> {
         };
         let old = define::parse_stored(&text)?;
         let new = define::alter(&old, &stmt.sql, &self.hook.ctx(d0.db))?;
+        self.hook.fk_column_changes(&a, &old, &new, d0)?;
         let new_text = define::render(&new);
-        let d1 = table::parse(d0.object, d0.version.saturating_add(1), d0.db, &new_text)
-            .map_err(|why| {
-                not_on_engine(why.trim_start_matches(
-                    "table definition not served by the engine: ",
-                ))
-            })?;
-        let s = self
+        let d1 = table::parse(d0.object, d0.version.saturating_add(1), d0.db, &new_text).map_err(
+            |why| {
+                not_on_engine(why.trim_start_matches("table definition not served by the engine: "))
+            },
+        )?;
+        // Foreign keys the statement adds: checked against their parents,
+        // and (with `foreign_key_checks` on) against the rows.
+        let added: Vec<&define::Fk> = new
+            .fks
+            .iter()
+            .filter(|f| !old.fks.iter().any(|o| o.name.eq_ignore_ascii_case(&f.name)))
+            .collect();
+        self.hook.check_fks(d0.db, &new, &added)?;
+        let mut copied = None;
+        if !self.hook.sess.env.no_fk_checks {
+            let lower = stmt.sql.to_lowercase();
+            for f in &added {
+                let generated = !lower.contains(&f.name.to_lowercase());
+                copied = self
+                    .hook
+                    .rows_have_parents(d0, &d1, f, generated)
+                    .await?
+                    .or(copied);
+            }
+        }
+        let mut s = self
             .hook
             .eng
             .alter_stage(self.hook.tenant.0, d0, &d1, &a, &self.hook.sess)
             .await?;
+        if copied.is_some() && s.rows.is_none() {
+            s.rows = copied;
+        }
         self.staged(s);
         self.hook.produce(stmt.schema, name, Some(new_text));
         Ok(())
@@ -382,11 +829,14 @@ impl DdlExecutor for EngineDdl<'_> {
             Effect::Create {
                 kind: ObjectKind::Table,
                 name,
-            } => self.create(stmt, name).await,
+            } => self.create(stmt, name),
             Effect::Truncate { name } => {
                 let Some(def) = self.hook.table(&stmt.schema, name) else {
                     return Err(unknown_table(&stmt.schema.to_string(), name));
                 };
+                if let Some(e) = self.hook.truncate_refused(&def) {
+                    return Err(e);
+                }
                 self.hook
                     .eng
                     .truncate(self.hook.tenant.0, &def, &self.hook.sess)
@@ -396,11 +846,14 @@ impl DdlExecutor for EngineDdl<'_> {
                 kind: ObjectKind::Table,
                 names,
             } => {
-                let objects: Vec<u32> = names
+                let defs: Vec<Arc<TableDef>> = names
                     .iter()
                     .filter_map(|n| self.hook.table(&stmt.schema, n))
-                    .filter_map(|d| object_of(&d).ok())
                     .collect();
+                if let Some(e) = self.hook.drop_refused(&defs) {
+                    return Err(e);
+                }
+                let objects: Vec<u32> = defs.iter().filter_map(|d| object_of(d).ok()).collect();
                 for n in names {
                     self.hook.produce(stmt.schema, n, None);
                 }
@@ -432,13 +885,14 @@ impl DdlExecutor for EngineDdl<'_> {
                 self.note_dropped(objects);
                 Ok(())
             }
-            Effect::CreateSchema | Effect::AlterSchema => self.inner.execute(stmt).await,
+            Effect::CreateSchema | Effect::AlterSchema | Effect::Drop { .. } => {
+                self.inner.execute(stmt).await
+            }
             // Views, stored code, triggers, events and sequences aren't the
             // engine's yet.
             Effect::Create { .. } | Effect::Alter { .. } | Effect::Restore { .. } => Err(
                 not_on_engine("views, stored routines, triggers, events and sequences"),
             ),
-            Effect::Drop { .. } => self.inner.execute(stmt).await,
         }
     }
 

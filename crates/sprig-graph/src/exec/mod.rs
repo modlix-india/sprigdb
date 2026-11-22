@@ -2859,5 +2859,14 @@ mod agg {
     }
 }
 
+/// The store `tests` runs on.
+#[cfg(test)]
+use crate::mem::MemStore;
+
 #[cfg(test)]
 mod tests;
+
+/// The same tests over the storage engine's store.
+#[cfg(test)]
+#[path = "../engine_exec_tests.rs"]
+mod on_engine;

@@ -503,18 +503,10 @@ pub fn catalog_modules() -> Vec<sprig_catalog::Module> {
     use sprig_catalog::Module;
     vec![
         sprig_types::store::TYPES_MODULE,
-        Module {
-            name: sprig_graph::catalog::MODULE,
-            migrations: sprig_graph::catalog::GRAPH_MIGRATIONS,
-        },
-        Module {
-            name: crate::search::catalog::MODULE,
-            migrations: crate::search::catalog::SEARCH_MIGRATIONS,
-        },
-        Module {
-            name: crate::mongo::catalog::MODULE,
-            migrations: crate::mongo::catalog::DOC_MIGRATIONS,
-        },
+        sprig_graph::catalog::GRAPH_MODULE,
+        sprig_graph::catalog::GRAPH_SQL_MODULE,
+        crate::search::catalog::SEARCH_MODULE,
+        crate::mongo::catalog::DOC_MODULE,
         Module {
             name: crate::http::studio::library::MODULE,
             migrations: crate::http::studio::library::LIBRARY_MIGRATIONS,

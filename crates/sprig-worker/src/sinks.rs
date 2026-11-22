@@ -66,6 +66,31 @@ pub(crate) struct RlsCatalogs {
     >,
 }
 
+/// The engine node's catalog records (the auth modules' rows), set once
+/// when the worker starts ([`set_catalog_records`]).
+static CATALOG_RECORDS: std::sync::OnceLock<Arc<dyn sprig_catalog::RecordStore>> =
+    std::sync::OnceLock::new();
+
+/// Sets where this worker reads catalog records: the engine node's peer
+/// service, found in `dc`'s gateway registrations (or named by
+/// `SPRIGDB_CATALOG_NODE`), over `tls`.
+pub(crate) fn set_catalog_records(
+    dc: Arc<dyn MetaStore>,
+    tls: Option<sprig_catalog::records::remote::PeerPems>,
+) {
+    let _ = CATALOG_RECORDS.set(Arc::new(
+        sprig_catalog::records::remote::RemoteRecords::new(Some(dc), tls),
+    ));
+}
+
+pub(crate) fn catalog_records() -> Arc<dyn sprig_catalog::RecordStore> {
+    Arc::clone(CATALOG_RECORDS.get_or_init(|| {
+        Arc::new(sprig_catalog::records::remote::RemoteRecords::new(
+            None, None,
+        ))
+    }))
+}
+
 impl RlsCatalogs {
     pub(crate) fn new(locator: Arc<ShardMapLocator>) -> Option<Self> {
         // Policies from MongoDB filters get this build's SQL when loaded.
@@ -77,6 +102,7 @@ impl RlsCatalogs {
         ];
         sprig_catalog::cache::MariaSource::new(locator as Arc<dyn CatalogLocator>, ext)
             .ok()
+            .map(|source| source.with_records(catalog_records()))
             .map(|source| Self {
                 source,
                 tree: None,
@@ -344,6 +370,10 @@ impl SinkEnv for SinksEnv {
     async fn catalog(&self, tenant: TenantId) -> Result<(Pool, String)> {
         let ep = self.locator.writer(tenant).await?;
         Ok((ep.pool, ep.store.schema().to_owned()))
+    }
+
+    fn records(&self) -> Arc<dyn sprig_catalog::RecordStore> {
+        catalog_records()
     }
 
     fn peer(&self) -> Option<Arc<dyn sprig_sinks::peer::SinkPeer>> {

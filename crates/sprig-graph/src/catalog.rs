@@ -1,6 +1,27 @@
-//! The `graph` catalog module: `graphs`, `graph_node_sources` and `graph_edge_sources` in
-//! `t<tenant>_sprig`, the snapshot state ([`GraphExtension`]), graph DDL
-//! text, and the physical tables of a native graph.
+//! The `graph` catalog module: graphs, their native labels and types,
+//! property indexes and the bookmark key, kept as the engine's catalog
+//! records (`m/graph/<table>/<key>`), the snapshot state
+//! ([`GraphExtension`]), graph DDL text, and the physical tables of a
+//! native graph.
+//!
+//! ```text
+//! m/graph/graphs/<graph u64>                     GraphRow
+//! m/graph/nodes/<graph u64><source u32>          SourceRow (a native label)
+//! m/graph/labels/<graph u64><name>               source id
+//! m/graph/edges/<graph u64><source u32>          SourceRow (a relationship type)
+//! m/graph/types/<graph u64><name>                source id
+//! m/graph/indexes/<graph u64><index u32>         IndexRow
+//! m/graph/inames/<graph u64><name>               index id
+//! m/graph/keys/<kid u32>                         KeyRow   (not versioned)
+//! m/graph/leases/<graph u64>                     LeaseRow (not versioned)
+//! ```
+//!
+//! Every write of the versioned tables goes through the caller's catalog
+//! change (its records), so every gateway's snapshot follows it. The name
+//! rows stand for the unique keys the MariaDB tables had (a native label
+//! or type per graph, an index name per graph). The bookmark key and the
+//! lease on a storage move are written in short engine transactions of
+//! their own, as they were written outside catalog changes before.
 //!
 //! **As built:**
 //! - `CREATE PROPERTY GRAPH` makes a mapped graph (see
@@ -8,153 +29,83 @@
 //! - A native graph is a sharded table group (`group_id`, mirrors
 //!   `ready`); graphs made before grouped graphs keep their tables in the
 //!   database's first shard schema.
-//! - `node_seq` and `edge_seq` are NULL: ids come from a counter table
-//!   `__sprig_gq_<graph>` in the same schema, handed out in blocks.
+//! - Ids come from a counter table `__sprig_gq_<graph>` in the same
+//!   schema (MariaDB graphs) or from the engine's graph keys.
 //! - A graph is an `objects` row of kind `graph` in namespace `graph`.
+//! - Native graphs stored in MariaDB tables keep three catalog tables of
+//!   that path in MariaDB (`graph_label_sets`, `graph_prop_keys`,
+//!   `graph_columns`: typed storage) and the mirror applier's positions
+//!   (`graph_mirror_pos`), created by the `graph_sql` module.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
 use mysql_async::prelude::Queryable;
+use serde::{Deserialize, Serialize};
 use sprig_catalog::CatalogExtension;
 use sprig_catalog::cache::{ExtState, SnapshotTx};
-use sprig_catalog::migrate::{Migration, Phase};
+use sprig_catalog::migrate::{Migration, Module, Phase};
+use sprig_catalog::records::{Pk, RecordStore, RecordTx, RowTable};
 use sprig_catalog::version::VersionKind;
+use sprig_common::ids::TenantId;
 use sprig_common::names::quote;
 use sprig_common::{Result, SprigCode, SprigError};
 
 /// The module name.
 pub const MODULE: &str = "graph";
 
-const DDL_GRAPHS: &str = "CREATE TABLE IF NOT EXISTS graphs (
-  graph_id      BIGINT UNSIGNED NOT NULL,
-  db_id         INT UNSIGNED NOT NULL,
-  kind          ENUM('mapped','native') NOT NULL,
-  group_id      INT UNSIGNED NULL,
-  node_seq      BIGINT UNSIGNED NULL,
-  edge_seq      BIGINT UNSIGNED NULL,
-  partition_by  JSON NULL,
-  mirror_state  ENUM('none','building','ready') NOT NULL DEFAULT 'none',
-  state         ENUM('creating','active','repartitioning','dropping') NOT NULL,
-  definition    MEDIUMTEXT NULL,
-  def_version   BIGINT UNSIGNED NOT NULL,
-  created_at    DATETIME(6) NOT NULL,
-  updated_at    DATETIME(6) NOT NULL,
-  PRIMARY KEY (graph_id), KEY k_db (db_id)
-) ENGINE=InnoDB";
+/// Graphs by id.
+pub const GRAPHS: RowTable = RowTable::new(MODULE, "graphs");
+/// Native labels by graph and id.
+pub const NODES: RowTable = RowTable::new(MODULE, "nodes");
+/// Native label ids by graph and name.
+pub const LABELS: RowTable = RowTable::new(MODULE, "labels");
+/// Relationship types by graph and id.
+pub const EDGES: RowTable = RowTable::new(MODULE, "edges");
+/// Relationship type ids by graph and name.
+pub const TYPES: RowTable = RowTable::new(MODULE, "types");
+/// Property indexes and constraints by graph and id.
+pub const INDEXES: RowTable = RowTable::new(MODULE, "indexes");
+/// Index ids by graph and name.
+pub const INAMES: RowTable = RowTable::new(MODULE, "inames");
+/// The bookmark key.
+pub const KEYS: RowTable = RowTable::new(MODULE, "keys");
+/// Leases on moving a graph's storage.
+pub const LEASES: RowTable = RowTable::new(MODULE, "leases");
 
-const DDL_NODE_SOURCES: &str = "CREATE TABLE IF NOT EXISTS graph_node_sources (
-  graph_id      BIGINT UNSIGNED NOT NULL,
-  source_id     INT UNSIGNED NOT NULL,
-  kind          ENUM('table','collection','label') NOT NULL,
-  object_id     BIGINT UNSIGNED NULL,
-  label         VARCHAR(255) COLLATE utf8mb4_bin NOT NULL,
-  extra_labels  JSON NULL,
-  key_columns   JSON NULL,
-  properties    JSON NULL,
-  id_mode       ENUM('native','int_key','hashed') NOT NULL,
-  writable      BOOLEAN NOT NULL,
-  state         ENUM('active','dropping') NOT NULL,
-  native_label  VARCHAR(255) COLLATE utf8mb4_bin
-                AS (IF(kind = 'label', label, NULL)) PERSISTENT,
-  PRIMARY KEY (graph_id, source_id),
-  UNIQUE KEY uk_native_label (graph_id, native_label)
-) ENGINE=InnoDB";
+/// The module's MariaDB migrations: none, its rows are engine records.
+pub static GRAPH_MIGRATIONS: &[Migration] = &[];
 
-const DDL_EDGE_SOURCES: &str = "CREATE TABLE IF NOT EXISTS graph_edge_sources (
-  graph_id      BIGINT UNSIGNED NOT NULL,
-  source_id     INT UNSIGNED NOT NULL,
-  kind          ENUM('table','collection','type') NOT NULL,
-  object_id     BIGINT UNSIGNED NULL,
-  type          VARCHAR(255) COLLATE utf8mb4_bin NOT NULL,
-  key_columns   JSON NULL,
-  src_source_id INT UNSIGNED NULL,
-  src_columns   JSON NULL,
-  dst_source_id INT UNSIGNED NULL,
-  dst_columns   JSON NULL,
-  properties    JSON NULL,
-  writable      BOOLEAN NOT NULL,
-  state         ENUM('active','dropping') NOT NULL,
-  native_type   VARCHAR(255) COLLATE utf8mb4_bin
-                AS (IF(kind = 'type', type, NULL)) PERSISTENT,
-  PRIMARY KEY (graph_id, source_id),
-  UNIQUE KEY uk_native_type (graph_id, native_type)
-) ENGINE=InnoDB";
+/// The MariaDB graph path's own catalog tables (typed storage and the
+/// mirror applier's positions): what native graphs stored in MariaDB
+/// tables still keep in the tenant's MariaDB catalog.
+pub const SQL_MODULE: &str = "graph_sql";
 
-/// The tenant's bookmark key (`kid` 1), shared by every gateway.
-const DDL_KEYS: &str = "CREATE TABLE IF NOT EXISTS graph_keys (
-  kid     INT UNSIGNED NOT NULL,
-  secret  VARBINARY(64) NOT NULL,
-  PRIMARY KEY (kid)
-) ENGINE=InnoDB";
+/// [`SQL_MODULE`]'s migrations.
+pub static GRAPH_SQL_MIGRATIONS: &[Migration] = &[Migration {
+    format: 1,
+    phase: Phase::Expand,
+    name: "graph_mirror_pos, graph_label_sets, graph_prop_keys, graph_columns",
+    statements: &[
+        crate::mirror::DDL_POS,
+        crate::typed::catalog::DDL[0],
+        crate::typed::catalog::DDL[1],
+        crate::typed::catalog::DDL[2],
+    ],
+}];
 
-/// Property indexes and uniqueness constraints of native graphs: each
-/// is generated columns `_sprig_i<index_id>_<k>` over `props` on the node
-/// or edge table, with an index (`UNIQUE` for a constraint).
-const DDL_INDEXES: &str = "CREATE TABLE IF NOT EXISTS graph_indexes (
-  graph_id    BIGINT UNSIGNED NOT NULL,
-  index_id    INT UNSIGNED NOT NULL,
-  name        VARCHAR(255) COLLATE utf8mb4_bin NOT NULL,
-  kind        ENUM('range','text') NOT NULL,
-  is_unique   BOOLEAN NOT NULL,
-  entity      ENUM('node','relationship') NOT NULL,
-  source_id   INT UNSIGNED NOT NULL,
-  properties  JSON NOT NULL,
-  state       ENUM('building','online','dropping') NOT NULL,
-  created_at  DATETIME(6) NOT NULL,
-  PRIMARY KEY (graph_id, index_id),
-  UNIQUE KEY uk_name (graph_id, name)
-) ENGINE=InnoDB";
+/// The `graph` module, for `Migrator::new`.
+pub const GRAPH_MODULE: Module = Module {
+    name: MODULE,
+    migrations: GRAPH_MIGRATIONS,
+};
 
-/// The module's migrations.
-pub static GRAPH_MIGRATIONS: &[Migration] = &[
-    Migration {
-        format: 1,
-        phase: Phase::Expand,
-        name: "graphs, graph_node_sources, graph_edge_sources",
-        statements: &[DDL_GRAPHS, DDL_NODE_SOURCES, DDL_EDGE_SOURCES],
-    },
-    Migration {
-        format: 2,
-        phase: Phase::Expand,
-        name: "graph_keys, graph_indexes",
-        statements: &[DDL_KEYS, DDL_INDEXES],
-    },
-    Migration {
-        format: 3,
-        phase: Phase::Expand,
-        name: "graph_mirror_pos, graphs.mirror_mode",
-        statements: &[crate::mirror::DDL_POS, DDL_MIRROR_MODE],
-    },
-    Migration {
-        format: 4,
-        phase: Phase::Expand,
-        name: "typed storage: graphs.storage, graph_label_sets, graph_prop_keys, graph_columns",
-        statements: &[
-            DDL_STORAGE,
-            crate::typed::catalog::DDL[0],
-            crate::typed::catalog::DDL[1],
-            crate::typed::catalog::DDL[2],
-        ],
-    },
-];
-
-/// The layout of a native graph's tables: 1, the JSON document per row
-/// (graphs made before typed storage); 2, typed tables
-/// ([`crate::typed`]). `storage_phase`, `storage_owner` and
-/// `storage_until`: a move from 1 to 2 under way, and its lease.
-const DDL_STORAGE: &str = "ALTER TABLE graphs \
-  ADD COLUMN IF NOT EXISTS storage TINYINT UNSIGNED NOT NULL DEFAULT 1 AFTER mirror_mode, \
-  ADD COLUMN IF NOT EXISTS storage_phase VARCHAR(16) CHARACTER SET ascii NULL AFTER storage, \
-  ADD COLUMN IF NOT EXISTS storage_owner VARCHAR(128) NULL AFTER storage_phase, \
-  ADD COLUMN IF NOT EXISTS storage_until DATETIME(6) NULL AFTER storage_owner";
-
-/// Who keeps a grouped graph's mirrors: `sync`, the writers;
-/// `starting`, still the writers while the worker's applier starts on the
-/// graph; `async`, the applier (`graph.mirror = async`).
-const DDL_MIRROR_MODE: &str = "ALTER TABLE graphs ADD COLUMN IF NOT EXISTS \
-  mirror_mode ENUM('sync','starting','async') NOT NULL DEFAULT 'sync' AFTER mirror_state";
+/// The `graph_sql` module, for `Migrator::new`.
+pub const GRAPH_SQL_MODULE: Module = Module {
+    name: SQL_MODULE,
+    migrations: GRAPH_SQL_MIGRATIONS,
+};
 
 fn map_err(e: mysql_async::Error) -> SprigError {
     match &e {
@@ -180,6 +131,21 @@ pub fn backend_error(e: mysql_async::Error) -> SprigError {
     map_err(e)
 }
 
+/// A taken unique name, as MariaDB's unique key answered it (1062).
+fn duplicate(what: &str, name: &str) -> SprigError {
+    SprigError::backend(
+        1062,
+        *b"23000",
+        format!("Duplicate entry '{name}' for key '{what}'"),
+    )
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// One graph as the catalog has it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphDef {
@@ -187,7 +153,7 @@ pub struct GraphDef {
     pub graph_id: u64,
     /// The database.
     pub db_id: u32,
-    /// `native` (mapped graphs aren't built).
+    /// `native` or `mapped`.
     pub kind: String,
     /// `creating`, `active`, ...
     pub state: String,
@@ -216,6 +182,9 @@ pub struct GraphDef {
     /// A move to typed tables under way: `dual` (writers write both,
     /// rows are copied), `drop` (the JSON tables go).
     pub storage_phase: Option<String>,
+    /// When the row last changed (its mirror mode or storage), ms since
+    /// the epoch.
+    pub updated_ms: u64,
 }
 
 /// The module's state in a snapshot.
@@ -234,184 +203,212 @@ impl ExtState for GraphState {
     }
 }
 
-/// A `graph_indexes` row.
-type IndexRow = (u64, u32, String, String, bool, String, u32, String, String);
-
-/// Reads and writes the module's tables in catalog schema `schema`.
-#[derive(Debug, Clone)]
-pub struct GraphCatalog {
-    schema: String,
+/// A graph: what `graphs` held.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphRow {
+    /// Its id (`objects.object_id`).
+    pub graph_id: u64,
+    /// Its database.
+    pub db_id: u32,
+    /// `mapped` or `native`.
+    pub kind: String,
+    /// A native graph's table group.
+    pub group_id: Option<u32>,
+    /// `none`, `building` or `ready`.
+    pub mirror_state: String,
+    /// `sync`, `starting` or `async`.
+    pub mirror_mode: String,
+    /// `creating`, `active`, `repartitioning` or `dropping`.
+    pub state: String,
+    /// A mapped graph's definition (JSON).
+    pub definition: Option<String>,
+    /// Starts at 1.
+    pub def_version: u64,
+    /// 1 JSON tables, 2 typed tables.
+    pub storage: u8,
+    /// A move between storages under way.
+    pub storage_phase: Option<String>,
+    /// Ms since the epoch.
+    pub created_ms: u64,
+    /// Ms since the epoch.
+    pub updated_ms: u64,
 }
 
+/// A native label or relationship type: what `graph_node_sources` and
+/// `graph_edge_sources` held for kinds `label` and `type` (the only kinds
+/// written).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceRow {
+    /// The label or type.
+    pub name: String,
+    /// Writable.
+    pub writable: bool,
+    /// `active` or `dropping`.
+    pub state: String,
+}
+
+/// A property index or constraint: what `graph_indexes` held.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexRow {
+    /// Its name.
+    pub name: String,
+    /// `range` or `text`.
+    pub kind: String,
+    /// A uniqueness constraint.
+    pub unique: bool,
+    /// `node` or `relationship`.
+    pub entity: String,
+    /// The label or type id.
+    pub source_id: u32,
+    /// The properties, in order.
+    pub properties: Vec<String>,
+    /// `building`, `online` or `dropping`.
+    pub state: String,
+    /// Ms since the epoch.
+    pub created_ms: u64,
+}
+
+/// The bookmark key: what `graph_keys` held.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyRow {
+    /// The secret.
+    pub secret: Vec<u8>,
+}
+
+/// Who moves a graph's storage, until when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseRow {
+    /// The owner.
+    pub owner: String,
+    /// Ms since the epoch.
+    pub until_ms: u64,
+}
+
+fn gpk(graph: u64) -> Pk {
+    Pk::new().u64(graph)
+}
+
+fn name_pk(graph: u64, name: &str) -> Pk {
+    Pk::new().u64(graph).bytes(name.as_bytes())
+}
+
+fn index_def(id: u32, r: IndexRow) -> crate::store::IndexDef {
+    crate::store::IndexDef {
+        id,
+        name: r.name,
+        unique: r.unique,
+        kind: if r.kind == "text" {
+            crate::ast::IndexKind::Text
+        } else {
+            crate::ast::IndexKind::Range
+        },
+        entity: if r.entity == "node" {
+            crate::ast::Entity::Node
+        } else {
+            crate::ast::Entity::Relationship
+        },
+        token: String::new(),
+        token_id: r.source_id,
+        props: r.properties,
+        state: r.state,
+    }
+}
+
+fn last_u32(pk: &Pk) -> Option<u32> {
+    let b = pk.0.get(pk.0.len().checked_sub(4)?..)?;
+    <[u8; 4]>::try_from(b).ok().map(u32::from_be_bytes)
+}
+
+fn def_of(r: GraphRow) -> GraphDef {
+    GraphDef {
+        graph_id: r.graph_id,
+        db_id: r.db_id,
+        kind: r.kind,
+        state: r.state,
+        group_id: r.group_id,
+        mirrors: r.mirror_state == "ready",
+        mirror_async: r.mirror_mode == "async",
+        mirror_mode: r.mirror_mode,
+        definition: r.definition,
+        labels: BTreeMap::new(),
+        types: BTreeMap::new(),
+        indexes: Vec::new(),
+        storage: r.storage,
+        typed: None,
+        storage_phase: r.storage_phase,
+        updated_ms: r.updated_ms,
+    }
+}
+
+/// Reads and writes the module's records.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GraphCatalog;
+
 impl GraphCatalog {
-    /// Over `t<tenant>_sprig`.
-    #[must_use]
-    pub fn new(schema: &str) -> Self {
-        Self {
-            schema: schema.to_owned(),
-        }
-    }
-
-    fn t(&self, name: &str) -> String {
-        format!("{}.{}", quote(&self.schema), name)
-    }
-
-    /// Whether the module's tables exist.
+    /// Makes sure catalog `schema` can take the module's records and the
+    /// MariaDB graph path's tables (idempotent).
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn migrated<Q: Queryable + Send>(&self, q: &mut Q) -> Result<bool> {
-        let n: Option<u64> = q
-            .exec_first(
-                "SELECT COUNT(*) FROM information_schema.TABLES \
-                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'graph_edge_sources'",
-                (self.schema.as_str(),),
-            )
-            .await
-            .map_err(map_err)?;
-        Ok(n.unwrap_or(0) > 0)
-    }
-
-    /// Creates the module's tables (idempotent).
-    ///
-    /// # Errors
-    /// A backend error.
-    pub async fn migrate(&self, q: &mut mysql_async::Conn) -> Result<()> {
-        sprig_catalog::Migrator::new(&[sprig_catalog::migrate::Module {
-            name: MODULE,
-            migrations: GRAPH_MIGRATIONS,
-        }])?
-        .run(
-            q,
-            &self.schema,
-            &sprig_catalog::migrate::MigrateOpts::default(),
-        )
-        .await?;
+    /// The migrator's.
+    pub async fn migrate(q: &mut mysql_async::Conn, schema: &str) -> Result<()> {
+        sprig_catalog::Migrator::new(&[GRAPH_SQL_MODULE])?
+            .run(q, schema, &sprig_catalog::migrate::MigrateOpts::default())
+            .await?;
         Ok(())
     }
 
-    /// Every graph.
+    /// Every graph's row, by id.
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn load<Q: Queryable + Send>(&self, q: &mut Q) -> Result<GraphState> {
-        type GraphRow = (
-            u64,
-            u32,
-            String,
-            String,
-            Option<u32>,
-            String,
-            Option<String>,
-        );
-        // `mirror_mode` arrived with migration 3; a catalog without it
-        // keeps every mirror synchronous.
-        let rows: Vec<GraphRow> = match q
-            .query(format!(
-                "SELECT graph_id, db_id, kind, state, group_id, \
-                 CONCAT(mirror_state, ':', mirror_mode), definition FROM {}",
-                self.t("graphs")
-            ))
-            .await
-        {
-            Ok(r) => r,
-            Err(mysql_async::Error::Server(e)) if e.code == 1054 => q
-                .query(format!(
-                    "SELECT graph_id, db_id, kind, state, group_id, mirror_state, definition FROM {}",
-                    self.t("graphs")
-                ))
-                .await
-                .map_err(map_err)?,
-            Err(e) => return Err(map_err(e)),
-        };
-        let mut graphs: HashMap<u64, GraphDef> = rows
+    /// The record store's; `Internal` for a malformed row.
+    pub async fn rows(rec: &mut dyn RecordTx) -> Result<Vec<GraphRow>> {
+        GRAPHS.rows(rec, &Pk::new()).await
+    }
+
+    /// Graph `graph`'s row.
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn row(rec: &mut dyn RecordTx, graph: u64) -> Result<Option<GraphRow>> {
+        GRAPHS.get(rec, &gpk(graph)).await
+    }
+
+    /// Every graph, without typed schemas (see [`Self::load_typed`]).
+    ///
+    /// # Errors
+    /// The record store's; `Internal` for a malformed row.
+    pub async fn load(rec: &mut dyn RecordTx) -> Result<GraphState> {
+        let mut graphs: HashMap<u64, GraphDef> = Self::rows(rec)
+            .await?
             .into_iter()
-            .map(|(g, d, k, s, group, m, definition)| {
-                (
-                    g,
-                    GraphDef {
-                        graph_id: g,
-                        db_id: d,
-                        kind: k,
-                        state: s,
-                        group_id: group,
-                        mirrors: m == "ready" || m.starts_with("ready:"),
-                        mirror_async: m.ends_with(":async"),
-                        mirror_mode: m.split_once(':').map_or("sync", |x| x.1).to_owned(),
-                        definition,
-                        labels: BTreeMap::new(),
-                        types: BTreeMap::new(),
-                        indexes: Vec::new(),
-                        storage: 1,
-                        typed: None,
-                        storage_phase: None,
-                    },
-                )
-            })
+            .map(|r| (r.graph_id, def_of(r)))
             .collect();
-        // `storage` arrived with migration 4; a catalog without it has
-        // only JSON graphs.
-        match q
-            .query::<(u64, u8, Option<String>), _>(format!(
-                "SELECT graph_id, storage, storage_phase FROM {} \
-                 WHERE storage <> 1 OR storage_phase IS NOT NULL",
-                self.t("graphs")
-            ))
-            .await
-        {
-            Ok(rows) => {
-                for (g, st, phase) in rows {
-                    if let Some(d) = graphs.get_mut(&g) {
-                        d.storage = st;
-                        d.storage_phase = phase;
-                    }
-                }
-            }
-            Err(mysql_async::Error::Server(e)) if e.code == 1054 => {}
-            Err(e) => return Err(map_err(e)),
-        }
-        for d in graphs.values_mut() {
-            if d.storage == crate::typed::STORAGE_TYPED || d.storage_phase.is_some() {
-                d.typed = Some(Arc::new(
-                    crate::typed::catalog::load(q, &self.schema, d.graph_id).await?,
-                ));
-            }
-        }
-        let labels: Vec<(u64, u32, String)> = q
-            .query(format!(
-                "SELECT graph_id, source_id, label FROM {} WHERE kind = 'label'",
-                self.t("graph_node_sources")
-            ))
-            .await
-            .map_err(map_err)?;
-        for (g, s, l) in labels {
+        for (pk, s) in NODES.scan::<SourceRow>(rec, &Pk::new()).await? {
+            let (Some(g), Some(id)) = (be_u64(&pk.0), last_u32(&pk)) else {
+                continue;
+            };
             if let Some(d) = graphs.get_mut(&g) {
-                d.labels.insert(s, l);
+                d.labels.insert(id, s.name);
             }
         }
-        let types: Vec<(u64, u32, String)> = q
-            .query(format!(
-                "SELECT graph_id, source_id, type FROM {} WHERE kind = 'type'",
-                self.t("graph_edge_sources")
-            ))
-            .await
-            .map_err(map_err)?;
-        for (g, s, t) in types {
+        for (pk, s) in EDGES.scan::<SourceRow>(rec, &Pk::new()).await? {
+            let (Some(g), Some(id)) = (be_u64(&pk.0), last_u32(&pk)) else {
+                continue;
+            };
             if let Some(d) = graphs.get_mut(&g) {
-                d.types.insert(s, t);
+                d.types.insert(id, s.name);
             }
         }
-        for d in self.indexes(q, None).await? {
-            if let Some(g) = graphs.get_mut(&d.0) {
-                let mut def = d.1;
+        for (g, mut def) in Self::indexes(rec, None).await? {
+            if let Some(d) = graphs.get_mut(&g) {
                 let lookup = match def.entity {
-                    crate::ast::Entity::Node => &g.labels,
-                    crate::ast::Entity::Relationship => &g.types,
+                    crate::ast::Entity::Node => &d.labels,
+                    crate::ast::Entity::Relationship => &d.types,
                 };
                 if let Some(t) = lookup.get(&def.token_id) {
                     def.token.clone_from(t);
                 }
-                g.indexes.push(def);
+                d.indexes.push(def);
             }
         }
         Ok(GraphState {
@@ -419,221 +416,185 @@ impl GraphCatalog {
         })
     }
 
-    /// Indexes and constraints (of one graph, or all), with their token
-    /// names left empty: `(graph, definition)`.
+    /// Adds the typed schemas of typed graphs (and graphs moving to typed
+    /// storage) from the MariaDB graph path's tables in catalog `schema`.
     ///
     /// # Errors
     /// A backend error.
-    pub async fn indexes<Q: Queryable + Send>(
-        &self,
+    pub async fn load_typed<Q: Queryable + Send>(
+        st: &mut GraphState,
         q: &mut Q,
-        graph: Option<u64>,
-    ) -> Result<Vec<(u64, crate::store::IndexDef)>> {
-        let exists: Option<u64> = q
-            .exec_first(
-                "SELECT COUNT(*) FROM information_schema.TABLES \
-                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'graph_indexes'",
-                (self.schema.as_str(),),
-            )
-            .await
-            .map_err(map_err)?;
-        if exists.unwrap_or(0) == 0 {
-            return Ok(Vec::new());
+        schema: &str,
+    ) -> Result<()> {
+        for d in st.graphs.values_mut() {
+            if d.storage == crate::typed::STORAGE_TYPED || d.storage_phase.is_some() {
+                let typed = crate::typed::catalog::load(q, schema, d.graph_id).await?;
+                Arc::make_mut(d).typed = Some(Arc::new(typed));
+            }
         }
-        let filter = graph.map_or(String::new(), |g| format!(" WHERE graph_id = {g}"));
-        let rows: Vec<IndexRow> = q
-            .query(format!(
-                "SELECT graph_id, index_id, name, kind, is_unique, entity, source_id, properties, state \
-                 FROM {}{filter} ORDER BY graph_id, index_id",
-                self.t("graph_indexes")
-            ))
-            .await
-            .map_err(map_err)?;
-        Ok(rows
-            .into_iter()
-            .map(|(g, id, name, kind, unique, entity, src, props, state)| {
-                (
-                    g,
-                    crate::store::IndexDef {
-                        id,
-                        name,
-                        unique,
-                        kind: if kind == "text" {
-                            crate::ast::IndexKind::Text
-                        } else {
-                            crate::ast::IndexKind::Range
-                        },
-                        entity: if entity == "node" {
-                            crate::ast::Entity::Node
-                        } else {
-                            crate::ast::Entity::Relationship
-                        },
-                        token: String::new(),
-                        token_id: src,
-                        props: serde_json::from_str::<Vec<String>>(&props).unwrap_or_default(),
-                        state,
-                    },
-                )
-            })
-            .collect())
+        Ok(())
     }
 
-    /// The tenant's bookmark secret, made on first use.
+    /// Indexes and constraints (of one graph, or all), with their token
+    /// names left empty: `(graph, definition)`, by graph and index id.
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn bookmark_secret<Q: Queryable + Send>(&self, q: &mut Q) -> Result<Vec<u8>> {
+    /// The record store's.
+    pub async fn indexes(
+        rec: &mut dyn RecordTx,
+        graph: Option<u64>,
+    ) -> Result<Vec<(u64, crate::store::IndexDef)>> {
+        let under = graph.map_or_else(Pk::new, gpk);
+        let mut out = Vec::new();
+        for (pk, r) in INDEXES.scan::<IndexRow>(rec, &under).await? {
+            let (Some(g), Some(id)) = (be_u64(&pk.0), last_u32(&pk)) else {
+                continue;
+            };
+            out.push((g, index_def(id, r)));
+        }
+        Ok(out)
+    }
+
+    /// The tenant's bookmark secret, made on first use (in a short engine
+    /// transaction of its own).
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn bookmark_secret(store: &dyn RecordStore, tenant: TenantId) -> Result<Vec<u8>> {
+        let pk = Pk::new().u32(1);
+        {
+            let mut tx = store.begin(tenant).await?;
+            if let Some(k) = KEYS.get::<KeyRow>(&mut *tx, &pk).await? {
+                return Ok(k.secret);
+            }
+        }
+        let mut tx = store.begin(tenant).await?;
+        if let Some(k) = KEYS.get_for_update::<KeyRow>(&mut *tx, &pk).await? {
+            return Ok(k.secret);
+        }
         let mut secret = [0u8; 32];
         ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut secret)
             .map_err(|_| SprigError::internal("no randomness for the bookmark key"))?;
-        q.exec_drop(
-            format!(
-                "INSERT IGNORE INTO {} (kid, secret) VALUES (1, ?)",
-                self.t("graph_keys")
-            ),
-            (secret.to_vec(),),
-        )
-        .await
-        .map_err(map_err)?;
-        let s: Option<Vec<u8>> = q
-            .exec_first(
-                format!("SELECT secret FROM {} WHERE kid = 1", self.t("graph_keys")),
-                (),
-            )
-            .await
-            .map_err(map_err)?;
-        s.ok_or_else(|| SprigError::internal("no bookmark key"))
+        let row = KeyRow {
+            secret: secret.to_vec(),
+        };
+        KEYS.put(&mut *tx, &pk, &row).await?;
+        tx.commit().await?;
+        Ok(row.secret)
     }
 
     /// Adds index `d` of `graph` as `building`, with the next index id:
     /// that id.
     ///
     /// # Errors
-    /// A backend error (1062 for a name in use).
-    pub async fn insert_index<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
+    /// The record store's (a backend 1062 for a name in use).
+    pub async fn insert_index(
+        rec: &mut dyn RecordTx,
         graph: u64,
         d: &crate::store::IndexDef,
     ) -> Result<u32> {
-        let id: Option<u32> = q
-            .exec_first(
-                format!(
-                    "SELECT COALESCE(MAX(index_id), 0) + 1 FROM {} WHERE graph_id = ?",
-                    self.t("graph_indexes")
-                ),
-                (graph,),
-            )
-            .await
-            .map_err(map_err)?;
-        let id = id.unwrap_or(1);
-        q.exec_drop(
-            format!(
-                "INSERT INTO {} (graph_id, index_id, name, kind, is_unique, entity, source_id, \
-                 properties, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'building', UTC_TIMESTAMP(6))",
-                self.t("graph_indexes")
-            ),
-            (
-                graph,
-                id,
-                d.name.as_str(),
-                if d.kind == crate::ast::IndexKind::Text {
-                    "text"
-                } else {
-                    "range"
-                },
-                d.unique,
-                if d.entity == crate::ast::Entity::Node {
-                    "node"
-                } else {
-                    "relationship"
-                },
-                d.token_id,
-                serde_json::to_string(&d.props).unwrap_or_default(),
-            ),
-        )
-        .await
-        .map_err(map_err)?;
+        if INAMES
+            .get::<u32>(rec, &name_pk(graph, &d.name))
+            .await?
+            .is_some()
+        {
+            return Err(duplicate("uk_name", &d.name));
+        }
+        let id = Self::indexes(rec, Some(graph))
+            .await?
+            .iter()
+            .map(|(_, d)| d.id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let row = IndexRow {
+            name: d.name.clone(),
+            kind: if d.kind == crate::ast::IndexKind::Text {
+                "text"
+            } else {
+                "range"
+            }
+            .to_owned(),
+            unique: d.unique,
+            entity: if d.entity == crate::ast::Entity::Node {
+                "node"
+            } else {
+                "relationship"
+            }
+            .to_owned(),
+            source_id: d.token_id,
+            properties: d.props.clone(),
+            state: "building".to_owned(),
+            created_ms: now_ms(),
+        };
+        INDEXES
+            .put(rec, &Pk::new().u64(graph).u32(id), &row)
+            .await?;
+        INAMES.put(rec, &name_pk(graph, &d.name), &id).await?;
         Ok(id)
     }
 
     /// Marks index `id` of `graph` `online`.
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn index_online<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        graph: u64,
-        id: u32,
-    ) -> Result<()> {
-        q.exec_drop(
-            format!(
-                "UPDATE {} SET state = 'online' WHERE graph_id = ? AND index_id = ?",
-                self.t("graph_indexes")
-            ),
-            (graph, id),
-        )
-        .await
-        .map_err(map_err)
+    /// The record store's.
+    pub async fn index_online(rec: &mut dyn RecordTx, graph: u64, id: u32) -> Result<()> {
+        let pk = Pk::new().u64(graph).u32(id);
+        if let Some(mut r) = INDEXES.get::<IndexRow>(rec, &pk).await? {
+            "online".clone_into(&mut r.state);
+            INDEXES.put(rec, &pk, &r).await?;
+        }
+        Ok(())
     }
 
     /// Deletes index `id` of `graph`.
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn delete_index<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        graph: u64,
-        id: u32,
-    ) -> Result<()> {
-        q.exec_drop(
-            format!(
-                "DELETE FROM {} WHERE graph_id = ? AND index_id = ?",
-                self.t("graph_indexes")
-            ),
-            (graph, id),
-        )
-        .await
-        .map_err(map_err)
+    /// The record store's.
+    pub async fn delete_index(rec: &mut dyn RecordTx, graph: u64, id: u32) -> Result<()> {
+        let pk = Pk::new().u64(graph).u32(id);
+        if let Some(r) = INDEXES.get::<IndexRow>(rec, &pk).await? {
+            INAMES.delete(rec, &name_pk(graph, &r.name)).await?;
+            INDEXES.delete(rec, &pk).await?;
+        }
+        Ok(())
     }
 
     /// Inserts a native graph's row, `active`.
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn insert_native<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        graph: u64,
-        db: u32,
-    ) -> Result<()> {
-        self.insert_native_in(q, graph, db, None).await
+    /// The record store's.
+    pub async fn insert_native(rec: &mut dyn RecordTx, graph: u64, db: u32) -> Result<()> {
+        Self::insert_native_as(rec, graph, db, None, 1).await
     }
 
     /// Inserts a mapped graph's row with its definition (JSON).
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn insert_mapped<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
+    /// The record store's.
+    pub async fn insert_mapped(
+        rec: &mut dyn RecordTx,
         graph: u64,
         db: u32,
         definition: &str,
     ) -> Result<()> {
-        q.exec_drop(
-            format!(
-                "INSERT INTO {} (graph_id, db_id, kind, definition, state, def_version, \
-                 created_at, updated_at) \
-                 VALUES (?, ?, 'mapped', ?, 'active', 1, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))",
-                self.t("graphs")
-            ),
-            (graph, db, definition),
-        )
-        .await
-        .map_err(map_err)
+        let now = now_ms();
+        let row = GraphRow {
+            graph_id: graph,
+            db_id: db,
+            kind: "mapped".to_owned(),
+            group_id: None,
+            mirror_state: "none".to_owned(),
+            mirror_mode: "sync".to_owned(),
+            state: "active".to_owned(),
+            definition: Some(definition.to_owned()),
+            def_version: 1,
+            storage: 1,
+            storage_phase: None,
+            created_ms: now,
+            updated_ms: now,
+        };
+        GRAPHS.put(rec, &gpk(graph), &row).await
     }
 
     /// Inserts a native graph's row with its table group (`None`: one
@@ -641,82 +602,104 @@ impl GraphCatalog {
     /// start (`mirror_state = ready`).
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn insert_native_in<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
+    /// The record store's.
+    pub async fn insert_native_in(
+        rec: &mut dyn RecordTx,
         graph: u64,
         db: u32,
         group: Option<u32>,
     ) -> Result<()> {
-        self.insert_native_as(q, graph, db, group, 1).await
+        Self::insert_native_as(rec, graph, db, group, 1).await
     }
 
     /// [`Self::insert_native_in`] with its storage (`graphs.storage`: 1
     /// JSON, 2 typed tables).
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn insert_native_as<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
+    /// The record store's.
+    pub async fn insert_native_as(
+        rec: &mut dyn RecordTx,
         graph: u64,
         db: u32,
         group: Option<u32>,
         storage: u8,
     ) -> Result<()> {
-        if storage != 1 {
-            return q
-                .exec_drop(
-                    format!(
-                        "INSERT INTO {} (graph_id, db_id, kind, group_id, mirror_state, state, \
-                         def_version, storage, created_at, updated_at) \
-                         VALUES (?, ?, 'native', ?, ?, 'active', 1, ?, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))",
-                        self.t("graphs")
-                    ),
-                    (graph, db, group, if group.is_some() { "ready" } else { "none" }, storage),
-                )
-                .await
-                .map_err(map_err);
-        }
-        q.exec_drop(
-            format!(
-                "INSERT INTO {} (graph_id, db_id, kind, group_id, mirror_state, state, def_version, \
-                 created_at, updated_at) \
-                 VALUES (?, ?, 'native', ?, ?, 'active', 1, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))",
-                self.t("graphs")
-            ),
-            (graph, db, group, if group.is_some() { "ready" } else { "none" }),
-        )
-        .await
-        .map_err(map_err)
+        let now = now_ms();
+        let row = GraphRow {
+            graph_id: graph,
+            db_id: db,
+            kind: "native".to_owned(),
+            group_id: group,
+            mirror_state: if group.is_some() { "ready" } else { "none" }.to_owned(),
+            mirror_mode: "sync".to_owned(),
+            state: "active".to_owned(),
+            definition: None,
+            def_version: 1,
+            storage,
+            storage_phase: None,
+            created_ms: now,
+            updated_ms: now,
+        };
+        GRAPHS.put(rec, &gpk(graph), &row).await
     }
 
-    /// Deletes a graph's rows.
+    /// Deletes a graph's records (its row, labels, types and indexes). The MariaDB graph path's rows go with
+    /// [`Self::delete_sql`].
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn delete(rec: &mut dyn RecordTx, graph: u64) -> Result<()> {
+        let under = gpk(graph);
+        for t in [NODES, LABELS, EDGES, TYPES, INDEXES, INAMES] {
+            for (pk, _) in t.scan::<serde_json::Value>(rec, &under).await? {
+                t.delete(rec, &pk).await?;
+            }
+        }
+        // The storage-move lease is written only directly (never through
+        // a change); a dropped graph's lease is ignored (ids aren't reused).
+        GRAPHS.delete(rec, &under).await
+    }
+
+    /// Deletes graph `graph`'s rows of the MariaDB graph path's tables in
+    /// catalog `schema` (typed storage, mirror positions); tables that
+    /// don't exist are skipped.
     ///
     /// # Errors
     /// A backend error.
-    pub async fn delete<Q: Queryable + Send>(&self, q: &mut Q, graph: u64) -> Result<()> {
-        for t in [
-            "graph_indexes",
-            "graph_node_sources",
-            "graph_edge_sources",
-            "graph_label_sets",
-            "graph_prop_keys",
-            "graph_columns",
-            "graphs",
-        ] {
-            q.exec_drop(
-                format!("DELETE FROM {} WHERE graph_id = ?", self.t(t)),
-                (graph,),
-            )
-            .await
-            .map_err(map_err)?;
+    pub async fn delete_sql<Q: Queryable + Send>(
+        q: &mut Q,
+        schema: &str,
+        graph: u64,
+    ) -> Result<()> {
+        for t in ["graph_label_sets", "graph_prop_keys", "graph_columns"] {
+            match q
+                .exec_drop(
+                    format!("DELETE FROM {}.{t} WHERE graph_id = ?", quote(schema)),
+                    (graph,),
+                )
+                .await
+            {
+                Err(mysql_async::Error::Server(e)) if e.code == 1146 => {}
+                r => r.map_err(map_err)?,
+            }
         }
-        // The applier's positions (migration 3; absent before it).
-        match crate::mirror::clear_pos(q, &self.schema, graph).await {
+        match crate::mirror::clear_pos(q, schema, graph).await {
             Err(e) if matches!(e.kind, sprig_common::ErrorKind::Backend { errno: 1146, .. }) => {}
             r => r?,
+        }
+        Ok(())
+    }
+
+    async fn update_row(
+        rec: &mut dyn RecordTx,
+        graph: u64,
+        f: impl FnOnce(&mut GraphRow) + Send,
+    ) -> Result<()> {
+        let pk = gpk(graph);
+        if let Some(mut r) = GRAPHS.get::<GraphRow>(rec, &pk).await? {
+            f(&mut r);
+            r.updated_ms = now_ms().max(r.updated_ms + 1);
+            GRAPHS.put(rec, &pk, &r).await?;
         }
         Ok(())
     }
@@ -725,86 +708,78 @@ impl GraphCatalog {
     /// versioned change).
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn set_storage<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
+    /// The record store's.
+    pub async fn set_storage(
+        rec: &mut dyn RecordTx,
         graph: u64,
         storage: u8,
         phase: Option<&str>,
     ) -> Result<()> {
-        q.exec_drop(
-            format!(
-                "UPDATE {} SET storage = ?, storage_phase = ?, updated_at = UTC_TIMESTAMP(6) \
-                 WHERE graph_id = ?",
-                self.t("graphs")
-            ),
-            (storage, phase, graph),
-        )
+        let phase = phase.map(str::to_owned);
+        Self::update_row(rec, graph, move |r| {
+            r.storage = storage;
+            r.storage_phase = phase;
+        })
         .await
-        .map_err(map_err)
     }
 
     /// Takes or renews the lease on moving a graph's storage for `owner`,
     /// for `secs` seconds: whether `owner` holds it (no one else holds a
-    /// lease that hasn't run out). Written outside versioned changes: the
-    /// snapshot doesn't carry it.
+    /// lease that hasn't run out). Written in a short engine transaction
+    /// of its own, outside versioned changes: the snapshot doesn't carry
+    /// it.
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn lease_storage<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
+    /// The record store's.
+    pub async fn lease_storage(
+        store: &dyn RecordStore,
+        tenant: TenantId,
         graph: u64,
         owner: &str,
         secs: u32,
     ) -> Result<bool> {
-        q.exec_drop(
-            format!(
-                "UPDATE {} SET storage_owner = ?, \
-                 storage_until = UTC_TIMESTAMP(6) + INTERVAL ? SECOND \
-                 WHERE graph_id = ? AND (storage_owner IS NULL OR storage_owner = ? \
-                 OR storage_until IS NULL OR storage_until < UTC_TIMESTAMP(6))",
-                self.t("graphs")
-            ),
-            (owner, secs, graph, owner),
-        )
-        .await
-        .map_err(map_err)?;
-        let held: Option<Option<String>> = q
-            .exec_first(
-                format!(
-                    "SELECT storage_owner FROM {} WHERE graph_id = ?",
-                    self.t("graphs")
-                ),
-                (graph,),
-            )
-            .await
-            .map_err(map_err)?;
-        Ok(held.flatten().as_deref() == Some(owner))
+        let pk = gpk(graph);
+        let mut tx = store.begin(tenant).await?;
+        if GRAPHS.get::<GraphRow>(&mut *tx, &pk).await?.is_none() {
+            return Ok(false);
+        }
+        let now = now_ms();
+        let held = LEASES.get_for_update::<LeaseRow>(&mut *tx, &pk).await?;
+        if let Some(l) = &held
+            && l.owner != owner
+            && l.until_ms >= now
+        {
+            return Ok(false);
+        }
+        let row = LeaseRow {
+            owner: owner.to_owned(),
+            until_ms: now + u64::from(secs) * 1000,
+        };
+        LEASES.put(&mut *tx, &pk, &row).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Gives the lease on moving a graph's storage back, if `owner` holds
     /// it.
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn release_storage<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
+    /// The record store's.
+    pub async fn release_storage(
+        store: &dyn RecordStore,
+        tenant: TenantId,
         graph: u64,
         owner: &str,
     ) -> Result<()> {
-        q.exec_drop(
-            format!(
-                "UPDATE {} SET storage_owner = NULL, storage_until = NULL \
-                 WHERE graph_id = ? AND storage_owner = ?",
-                self.t("graphs")
-            ),
-            (graph, owner),
-        )
-        .await
-        .map_err(map_err)
+        let pk = gpk(graph);
+        let mut tx = store.begin(tenant).await?;
+        if let Some(l) = LEASES.get_for_update::<LeaseRow>(&mut *tx, &pk).await?
+            && l.owner == owner
+        {
+            LEASES.delete(&mut *tx, &pk).await?;
+            tx.commit().await?;
+        }
+        Ok(())
     }
 
     /// Sets who keeps a graph's mirrors and their state:
@@ -812,61 +787,42 @@ impl GraphCatalog {
     /// `ready`.
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn set_mirror<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
+    /// The record store's.
+    pub async fn set_mirror(
+        rec: &mut dyn RecordTx,
         graph: u64,
         mode: &str,
         state: &str,
     ) -> Result<()> {
-        q.exec_drop(
-            format!(
-                "UPDATE {} SET mirror_mode = ?, mirror_state = ?, updated_at = UTC_TIMESTAMP(6) \
-                 WHERE graph_id = ?",
-                self.t("graphs")
-            ),
-            (mode, state, graph),
-        )
+        let (mode, state) = (mode.to_owned(), state.to_owned());
+        Self::update_row(rec, graph, move |r| {
+            r.mirror_mode = mode;
+            r.mirror_state = state;
+        })
         .await
-        .map_err(map_err)
     }
 
     /// The id of a native label (`label = true`) or relationship type.
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn find_source<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
+    /// The record store's.
+    pub async fn find_source(
+        rec: &mut dyn RecordTx,
         graph: u64,
         label: bool,
         name: &str,
     ) -> Result<Option<u32>> {
-        let (table, native) = if label {
-            ("graph_node_sources", "native_label")
-        } else {
-            ("graph_edge_sources", "native_type")
-        };
-        q.exec_first(
-            format!(
-                "SELECT source_id FROM {} WHERE graph_id = ? AND {native} = ?",
-                self.t(table)
-            ),
-            (graph, name),
-        )
-        .await
-        .map_err(map_err)
+        let names = if label { LABELS } else { TYPES };
+        names.get::<u32>(rec, &name_pk(graph, name)).await
     }
 
     /// Adds a native label (`label = true`) or relationship type, or
     /// returns the one there: its id.
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn add_source<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
+    /// 39908 for a name of 0 or more than 255 bytes; the record store's.
+    pub async fn add_source(
+        rec: &mut dyn RecordTx,
         graph: u64,
         label: bool,
         name: &str,
@@ -877,36 +833,37 @@ impl GraphCatalog {
                 "a label or relationship type is 1 to 255 characters",
             ));
         }
-        let (table, kind, col, native) = if label {
-            ("graph_node_sources", "label", "label", "native_label")
+        let (rows, names) = if label {
+            (NODES, LABELS)
         } else {
-            ("graph_edge_sources", "type", "type", "native_type")
+            (EDGES, TYPES)
         };
-        let extra = if label { ", id_mode" } else { "" };
-        let extra_v = if label { ", 'native'" } else { "" };
-        q.exec_drop(
-            format!(
-                "INSERT IGNORE INTO {t} (graph_id, source_id, kind, {col}, writable, state{extra}) \
-                 SELECT ?, COALESCE(MAX(source_id), 0) + 1, '{kind}', ?, TRUE, 'active'{extra_v} \
-                 FROM {t} WHERE graph_id = ?",
-                t = self.t(table)
-            ),
-            (graph, name, graph),
-        )
-        .await
-        .map_err(map_err)?;
-        let id: Option<u32> = q
-            .exec_first(
-                format!(
-                    "SELECT source_id FROM {} WHERE graph_id = ? AND {native} = ?",
-                    self.t(table)
-                ),
-                (graph, name),
-            )
-            .await
-            .map_err(map_err)?;
-        id.ok_or_else(|| SprigError::internal("label row missing after insert"))
+        if let Some(id) = names.get::<u32>(rec, &name_pk(graph, name)).await? {
+            return Ok(id);
+        }
+        let id = rows
+            .scan::<serde_json::Value>(rec, &gpk(graph))
+            .await?
+            .iter()
+            .filter_map(|(pk, _)| last_u32(pk))
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let row = SourceRow {
+            name: name.to_owned(),
+            writable: true,
+            state: "active".to_owned(),
+        };
+        rows.put(rec, &Pk::new().u64(graph).u32(id), &row).await?;
+        names.put(rec, &name_pk(graph, name), &id).await?;
+        Ok(id)
     }
+}
+
+fn be_u64(b: &[u8]) -> Option<u64> {
+    b.get(..8)
+        .and_then(|s| <[u8; 8]>::try_from(s).ok())
+        .map(u64::from_be_bytes)
 }
 
 /// The module in the catalog cache: [`GraphState`] in every snapshot.
@@ -933,12 +890,19 @@ impl CatalogExtension for GraphExtension {
         _since: Option<u64>,
         _prev: Option<&Arc<dyn ExtState>>,
     ) -> Result<Arc<dyn ExtState>> {
-        let c = GraphCatalog::new(tx.schema());
-        let conn = tx.conn();
-        if !c.migrated(conn).await? {
+        if !tx.catalog_records() {
             return Ok(Arc::new(GraphState::default()));
         }
-        Ok(Arc::new(c.load(conn).await?))
+        let mut st = GraphCatalog::load(tx.records()?).await?;
+        if st
+            .graphs
+            .values()
+            .any(|d| d.storage == crate::typed::STORAGE_TYPED || d.storage_phase.is_some())
+        {
+            let schema = tx.schema().to_owned();
+            GraphCatalog::load_typed(&mut st, tx.conn(), &schema).await?;
+        }
+        Ok(Arc::new(st))
     }
 }
 
@@ -1391,11 +1355,272 @@ mod tests {
 
     #[test]
     fn module_is_well_formed() {
-        sprig_catalog::Migrator::new(&[sprig_catalog::migrate::Module {
-            name: MODULE,
-            migrations: GRAPH_MIGRATIONS,
-        }])
-        .unwrap_or_else(|_| unreachable!());
+        sprig_catalog::Migrator::new(&[GRAPH_MODULE, GRAPH_SQL_MODULE])
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(GRAPH_MODULE.newest(), 0);
+        assert_eq!(GRAPH_SQL_MODULE.newest(), 1);
+    }
+
+    use sprig_catalog::records::mem::MemRecords;
+
+    const T: TenantId = TenantId(57_406_000_001);
+
+    fn idx(name: &str, token_id: u32, entity: crate::ast::Entity) -> crate::store::IndexDef {
+        crate::store::IndexDef {
+            id: 0,
+            name: name.into(),
+            unique: name.starts_with('u'),
+            kind: crate::ast::IndexKind::Range,
+            entity,
+            token: String::new(),
+            token_id,
+            props: vec!["a".into(), "b".into()],
+            state: String::new(),
+        }
+    }
+
+    async fn load(store: &MemRecords) -> GraphState {
+        let mut tx = store.begin(T).await.unwrap();
+        GraphCatalog::load(&mut *tx).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn graphs_sources_and_indexes_follow_the_sql_rules() {
+        use crate::ast::Entity;
+        let store = MemRecords::new();
+        let mut tx = store.begin(T).await.unwrap();
+        GraphCatalog::insert_native_as(&mut *tx, 900, 3, Some(7), 2)
+            .await
+            .unwrap();
+        GraphCatalog::insert_native(&mut *tx, 901, 3).await.unwrap();
+        GraphCatalog::insert_mapped(&mut *tx, 902, 4, "{}")
+            .await
+            .unwrap();
+        // Labels and types: ids per graph from 1, a name added twice keeps
+        // its id; the label and type namespaces are apart.
+        assert_eq!(
+            GraphCatalog::add_source(&mut *tx, 900, true, "Person")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            GraphCatalog::add_source(&mut *tx, 900, true, "City")
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            GraphCatalog::add_source(&mut *tx, 900, true, "Person")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            GraphCatalog::add_source(&mut *tx, 900, false, "Person")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            GraphCatalog::add_source(&mut *tx, 901, true, "a\0b")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            GraphCatalog::add_source(&mut *tx, 900, true, "")
+                .await
+                .unwrap_err()
+                .code(),
+            Some(SprigCode::GraphDefinitionInvalid)
+        );
+        assert_eq!(
+            GraphCatalog::find_source(&mut *tx, 900, true, "City")
+                .await
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            GraphCatalog::find_source(&mut *tx, 900, false, "City")
+                .await
+                .unwrap(),
+            None
+        );
+        // Indexes: ids per graph from 1, a taken name is 1062.
+        let a = GraphCatalog::insert_index(&mut *tx, 900, &idx("by_name", 1, Entity::Node))
+            .await
+            .unwrap();
+        let b = GraphCatalog::insert_index(&mut *tx, 900, &idx("u_rel", 1, Entity::Relationship))
+            .await
+            .unwrap();
+        assert_eq!((a, b), (1, 2));
+        let e = GraphCatalog::insert_index(&mut *tx, 900, &idx("by_name", 2, Entity::Node))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            e.kind,
+            sprig_common::ErrorKind::Backend { errno: 1062, .. }
+        ));
+        GraphCatalog::index_online(&mut *tx, 900, 1).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let st = load(&store).await;
+        assert_eq!(st.graphs.len(), 3);
+        let g = &st.graphs[&900];
+        assert_eq!((g.kind.as_str(), g.state.as_str()), ("native", "active"));
+        assert_eq!(
+            (g.group_id, g.storage, g.mirrors, g.mirror_async),
+            (Some(7), 2, true, false)
+        );
+        assert_eq!(g.labels.get(&1).map(String::as_str), Some("Person"));
+        assert_eq!(g.types.get(&1).map(String::as_str), Some("Person"));
+        assert_eq!(g.indexes.len(), 2);
+        assert_eq!(
+            (g.indexes[0].token.as_str(), g.indexes[0].state.as_str()),
+            ("Person", "online")
+        );
+        assert_eq!(g.indexes[0].props, vec!["a".to_owned(), "b".to_owned()]);
+        assert!(g.indexes[1].unique);
+        assert_eq!(g.indexes[1].state, "building");
+        assert_eq!(
+            st.graphs[&901].labels.get(&1).map(String::as_str),
+            Some("a\0b")
+        );
+        assert!(!st.graphs[&901].mirrors);
+        assert_eq!(st.graphs[&902].definition.as_deref(), Some("{}"));
+
+        // Mirror mode and storage move the change time; a dropped index
+        // frees its name; a dropped graph leaves nothing.
+        let mut tx = store.begin(T).await.unwrap();
+        let before = GraphCatalog::row(&mut *tx, 900)
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_ms;
+        GraphCatalog::set_mirror(&mut *tx, 900, "async", "ready")
+            .await
+            .unwrap();
+        GraphCatalog::set_storage(&mut *tx, 901, 1, Some("dual"))
+            .await
+            .unwrap();
+        GraphCatalog::delete_index(&mut *tx, 900, 1).await.unwrap();
+        assert_eq!(
+            GraphCatalog::insert_index(&mut *tx, 900, &idx("by_name", 2, Entity::Node))
+                .await
+                .unwrap(),
+            3
+        );
+        GraphCatalog::delete(&mut *tx, 902).await.unwrap();
+        tx.commit().await.unwrap();
+        let st = load(&store).await;
+        let g = &st.graphs[&900];
+        assert!(g.mirror_async && g.mirrors && g.updated_ms > before);
+        assert_eq!(st.graphs[&901].storage_phase.as_deref(), Some("dual"));
+        assert!(!st.graphs.contains_key(&902));
+        assert_eq!(
+            g.indexes.iter().map(|d| d.id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        let mut tx = store.begin(T).await.unwrap();
+        GraphCatalog::delete(&mut *tx, 900).await.unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = store.begin(T).await.unwrap();
+        assert!(
+            GraphCatalog::indexes(&mut *tx, Some(900))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            GraphCatalog::find_source(&mut *tx, 900, true, "Person")
+                .await
+                .unwrap(),
+            None
+        );
+        // A graph made again under the same id starts its ids from 1.
+        GraphCatalog::insert_native(&mut *tx, 900, 3).await.unwrap();
+        assert_eq!(
+            GraphCatalog::add_source(&mut *tx, 900, true, "City")
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn an_uncommitted_change_leaves_nothing() {
+        let store = MemRecords::new();
+        let mut tx = store.begin(T).await.unwrap();
+        GraphCatalog::insert_native(&mut *tx, 5, 1).await.unwrap();
+        GraphCatalog::add_source(&mut *tx, 5, true, "X")
+            .await
+            .unwrap();
+        drop(tx);
+        assert!(load(&store).await.graphs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_bookmark_key_is_made_once_and_leases_exclude() {
+        let store = MemRecords::new();
+        let a = GraphCatalog::bookmark_secret(&store, T).await.unwrap();
+        let b = GraphCatalog::bookmark_secret(&store, T).await.unwrap();
+        assert_eq!(a.len(), 32);
+        assert_eq!(a, b);
+        assert_ne!(
+            GraphCatalog::bookmark_secret(&store, TenantId(2))
+                .await
+                .unwrap(),
+            a
+        );
+        // No lease on a graph the catalog doesn't have.
+        assert!(
+            !GraphCatalog::lease_storage(&store, T, 9, "gw1", 30)
+                .await
+                .unwrap()
+        );
+        let mut tx = store.begin(T).await.unwrap();
+        GraphCatalog::insert_native(&mut *tx, 9, 1).await.unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            GraphCatalog::lease_storage(&store, T, 9, "gw1", 30)
+                .await
+                .unwrap()
+        );
+        assert!(
+            GraphCatalog::lease_storage(&store, T, 9, "gw1", 30)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !GraphCatalog::lease_storage(&store, T, 9, "gw2", 30)
+                .await
+                .unwrap()
+        );
+        // Giving back someone else's lease does nothing.
+        GraphCatalog::release_storage(&store, T, 9, "gw2")
+            .await
+            .unwrap();
+        assert!(
+            !GraphCatalog::lease_storage(&store, T, 9, "gw2", 30)
+                .await
+                .unwrap()
+        );
+        GraphCatalog::release_storage(&store, T, 9, "gw1")
+            .await
+            .unwrap();
+        assert!(
+            GraphCatalog::lease_storage(&store, T, 9, "gw2", 0)
+                .await
+                .unwrap()
+        );
+        // A lease that ran out can be taken.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert!(
+            GraphCatalog::lease_storage(&store, T, 9, "gw1", 30)
+                .await
+                .unwrap()
+        );
     }
 
     #[test]

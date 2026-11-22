@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use hyper::body::Bytes;
 use mysql_async::prelude::Queryable;
-use sprig_approvals::catalog::{SqlRecs, Subscription};
+use sprig_approvals::catalog::{CatalogRecStore, Subscription};
 use sprig_approvals::events::{Outbound, rfc3339};
 use sprig_approvals::gate::{Event, Hook};
 use sprig_approvals::metrics::notified;
@@ -49,6 +49,7 @@ pub struct Secrets {
 pub struct Notifier {
     ctl: OnceLock<Arc<ControllerApprovals>>,
     locator: Arc<dyn CatalogLocator>,
+    records: Arc<dyn sprig_catalog::RecordStore>,
     secrets: Secrets,
     webhooks: OnceLock<Arc<super::webhook::Webhooks>>,
     /// Day (since the epoch) of each tenant's last digest run.
@@ -69,12 +70,18 @@ fn text(v: Option<sprig_settings::Resolved>) -> String {
 }
 
 impl Notifier {
-    /// A notifier reading catalogs through `locator`.
+    /// A notifier reading catalogs through `locator` and subscriptions
+    /// from the tenants' catalog records in `records`.
     #[must_use]
-    pub fn new(locator: Arc<dyn CatalogLocator>, secrets: Secrets) -> Self {
+    pub fn new(
+        locator: Arc<dyn CatalogLocator>,
+        records: Arc<dyn sprig_catalog::RecordStore>,
+        secrets: Secrets,
+    ) -> Self {
         Self {
             ctl: OnceLock::new(),
             locator,
+            records,
             secrets,
             webhooks: OnceLock::new(),
             digested: Mutex::new(BTreeMap::new()),
@@ -290,14 +297,8 @@ impl Notifier {
     }
 
     async fn subscriptions(&self, t: TenantId) -> Vec<Subscription> {
-        let Ok(ep) = self.locator.writer(t).await else {
-            return Vec::new();
-        };
-        let Ok(mut c) = ep.pool.get_conn_bounded().await else {
-            return Vec::new();
-        };
-        SqlRecs::new(t, ep.store.schema())
-            .subscriptions(&mut c)
+        CatalogRecStore::new(Arc::clone(&self.records), t)
+            .subscriptions()
             .await
             .unwrap_or_default()
     }

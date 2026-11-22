@@ -203,6 +203,138 @@ fn concat(src: &[u8], args: &[Token], nbe: bool) -> Size {
     }
 }
 
+/// The value one expression writes, read from the text: `Some(None)` for
+/// `NULL` and `DEFAULT`, `Some(Some(bytes))` for a literal (the forms
+/// [`value`] measures), `None` for anything else (a column, a function
+/// other than `CONCAT`, a placeholder, a bit string, a number with an
+/// exponent).
+#[must_use]
+pub fn literal_value(src: &[u8], toks: &[Token], nbe: bool) -> Option<Option<Vec<u8>>> {
+    let text = |t: &Token| &src[t.range()];
+    let is_word = |t: &Token, w: &str| {
+        t.kind == TokenKind::Word && text(t).eq_ignore_ascii_case(w.as_bytes())
+    };
+    let punct = |t: &Token, p: u8| t.kind == TokenKind::Punct && text(t) == [p];
+    match toks {
+        [] => None,
+        [t] if is_word(t, "NULL") || is_word(t, "DEFAULT") => Some(None),
+        [t] if is_word(t, "TRUE") => Some(Some(b"1".to_vec())),
+        [t] if is_word(t, "FALSE") => Some(Some(b"0".to_vec())),
+        [t] if t.kind == TokenKind::Number => number_text(text(t), false).map(Some),
+        [sign, t]
+            if sign.kind == TokenKind::Op
+                && matches!(text(sign), b"-" | b"+")
+                && t.kind == TokenKind::Number =>
+        {
+            number_text(text(t), text(sign) == b"-").map(Some)
+        }
+        [open, inner @ .., close] if punct(open, b'(') && punct(close, b')') => {
+            if balanced(src, inner) {
+                literal_value(src, inner, nbe)
+            } else {
+                None
+            }
+        }
+        [f, open, args @ .., close]
+            if is_word(f, "CONCAT") && punct(open, b'(') && punct(close, b')') =>
+        {
+            if !balanced(src, args) || args.is_empty() {
+                return None;
+            }
+            let mut out = Vec::new();
+            let mut null = false;
+            for a in split_commas(src, args) {
+                match literal_value(src, a, nbe)? {
+                    None => null = true,
+                    Some(b) => out.extend(b),
+                }
+            }
+            Some((!null).then_some(out))
+        }
+        [first, rest @ ..] if first.kind == TokenKind::Word && text(first).starts_with(b"_") => {
+            let cs = String::from_utf8_lossy(&text(first)[1..]).to_ascii_lowercase();
+            if rest.is_empty() || !AS_IS.contains(&cs.as_str()) {
+                return None;
+            }
+            literal_bytes(src, rest, nbe).map(Some)
+        }
+        _ => literal_bytes(src, toks, nbe).map(Some),
+    }
+}
+
+fn hex_bytes(digits: &[u8]) -> Option<Vec<u8>> {
+    let padded: Vec<u8> = if digits.len() % 2 == 1 {
+        std::iter::once(b'0')
+            .chain(digits.iter().copied())
+            .collect()
+    } else {
+        digits.to_vec()
+    };
+    padded
+        .chunks(2)
+        .map(|c| {
+            std::str::from_utf8(c)
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        })
+        .collect()
+}
+
+/// One literal's bytes (adjacent strings joined).
+fn literal_bytes(src: &[u8], toks: &[Token], nbe: bool) -> Option<Vec<u8>> {
+    let text = |t: &Token| &src[t.range()];
+    if let [t] = toks {
+        match t.kind {
+            TokenKind::HexString => {
+                // X'..'
+                let tx = text(t);
+                return hex_bytes(tx.get(2..tx.len().saturating_sub(1))?);
+            }
+            TokenKind::HexNumber => return hex_bytes(text(t).get(2..)?),
+            TokenKind::String | TokenKind::NationalString => {}
+            _ => return None,
+        }
+    }
+    let mut out = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        let tok = text(t);
+        let v = match t.kind {
+            TokenKind::String => string_value(tok, nbe),
+            TokenKind::NationalString if i == 0 => string_value(&tok[1..], nbe),
+            _ => None,
+        }?;
+        out.extend(v);
+    }
+    Some(out)
+}
+
+/// A decimal number as MariaDB writes it into a text column (see
+/// [`number`]); `None` with an exponent.
+fn number_text(t: &[u8], negative: bool) -> Option<Vec<u8>> {
+    if t.iter().any(|b| !(b.is_ascii_digit() || *b == b'.')) {
+        return None;
+    }
+    let (int, frac) = match t.iter().position(|b| *b == b'.') {
+        Some(p) => (&t[..p], Some(&t[p + 1..])),
+        None => (t, None),
+    };
+    let int: Vec<u8> = int.iter().copied().skip_while(|b| *b == b'0').collect();
+    let mut out = Vec::new();
+    if negative {
+        out.push(b'-');
+    }
+    if int.is_empty() {
+        out.push(b'0');
+    } else {
+        out.extend(int);
+    }
+    if let Some(f) = frac {
+        out.push(b'.');
+        out.extend_from_slice(f);
+    }
+    Some(out)
+}
+
 /// Splits `toks` at its top-level commas.
 pub(crate) fn split_commas<'t>(src: &[u8], toks: &'t [Token]) -> Vec<&'t [Token]> {
     let mut out = Vec::new();

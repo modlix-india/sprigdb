@@ -6,11 +6,11 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
-use sprig_catalog::CatalogLocator;
+use sprig_catalog::RecordStore;
 use sprig_common::Result;
 use sprig_common::ids::TenantId;
 
-use super::{MaintenanceReport, Retention, WorkloadTables, map_err};
+use super::{MaintenanceReport, Retention, WorkloadTables};
 use crate::fingerprint::FingerprintId;
 use crate::keyring::TenantKeyring;
 use crate::samples::{OpenedSample, SealedSample, open};
@@ -78,13 +78,10 @@ pub trait WorkloadStore: Send + Sync {
     }
 }
 
-/// [`WorkloadStore`] over each tenant's catalog, found by a
-/// `sprig-catalog` locator: reads go to the catalog's reader (a healthy
-/// local replica, else the writer). A catalog without the workload tables
-/// (never migrated: no traffic yet) reads as empty.
+/// The workload store over the tenants' catalog records.
 #[derive(Clone)]
 pub struct CatalogWorkloadStore {
-    locator: Arc<dyn CatalogLocator>,
+    records: Arc<dyn RecordStore>,
 }
 
 impl std::fmt::Debug for CatalogWorkloadStore {
@@ -95,16 +92,11 @@ impl std::fmt::Debug for CatalogWorkloadStore {
 }
 
 impl CatalogWorkloadStore {
-    /// A store over `locator`.
+    /// Over the tenants' catalog records in `records`.
     #[must_use]
-    pub fn new(locator: Arc<dyn CatalogLocator>) -> Self {
-        Self { locator }
+    pub fn new(records: Arc<dyn RecordStore>) -> Self {
+        Self { records }
     }
-}
-
-/// 1146 (no such table) reads as empty.
-fn missing_table(e: &sprig_common::SprigError) -> bool {
-    matches!(e.kind, sprig_common::ErrorKind::Backend { errno: 1146, .. })
 }
 
 #[async_trait]
@@ -115,13 +107,8 @@ impl WorkloadStore for CatalogWorkloadStore {
         from: SystemTime,
         to: SystemTime,
     ) -> Result<Vec<FpWindowStats>> {
-        let ep = self.locator.reader(tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(map_err)?;
-        let t = WorkloadTables::new(ep.store.schema());
-        match t.window(&mut conn, tenant, from, to).await {
-            Err(e) if missing_table(&e) => Ok(Vec::new()),
-            r => r,
-        }
+        let mut tx = self.records.begin(tenant).await?;
+        WorkloadTables::window(&mut *tx, tenant, from, to).await
     }
 
     async fn samples(
@@ -130,39 +117,26 @@ impl WorkloadStore for CatalogWorkloadStore {
         fp: FingerprintId,
         max: usize,
     ) -> Result<Vec<SealedSample>> {
-        let ep = self.locator.reader(tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(map_err)?;
-        let t = WorkloadTables::new(ep.store.schema());
-        match t.samples(&mut conn, fp, max).await {
-            Err(e) if missing_table(&e) => Ok(Vec::new()),
-            r => r,
-        }
+        let mut tx = self.records.begin(tenant).await?;
+        WorkloadTables::samples(&mut *tx, fp, max).await
     }
 }
 
-/// The rollup and retention job for one tenant: migrates the module if needed,
-/// merges closed buckets, then applies retention. `now` is the wall
-/// clock. Idempotent: run it from a controller loop every few minutes.
+/// The rollup and retention run for one tenant (module docs).
 ///
 /// # Errors
-/// The catalog's errors.
+/// The record store's.
 pub async fn maintain(
-    locator: &dyn CatalogLocator,
+    records: &dyn RecordStore,
     tenant: TenantId,
     now: SystemTime,
     r: &Retention,
-    applied_by: &str,
 ) -> Result<MaintenanceReport> {
-    let ep = locator.writer(tenant).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(map_err)?;
-    let schema = ep.store.schema().to_owned();
-    crate::flush::migrate(&mut conn, &schema, applied_by).await?;
-    let t = WorkloadTables::new(schema);
     let secs = now
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let mut rep = t.rollup(&mut conn, secs, r).await?;
-    let ret = t.retain(&mut conn, secs, r).await?;
+    let mut rep = WorkloadTables::rollup(records, tenant, secs, r).await?;
+    let ret = WorkloadTables::retain(records, tenant, secs, r).await?;
     rep.expired_stats = ret.expired_stats;
     rep.expired_samples = ret.expired_samples;
     rep.expired_fingerprints = ret.expired_fingerprints;

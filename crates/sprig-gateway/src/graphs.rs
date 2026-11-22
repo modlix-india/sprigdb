@@ -52,6 +52,7 @@ use sprig_shard::{KeyClass, KeySpec, ShardMap, ShardMapCache, ShardMapStore, sha
 
 use crate::tenant::TenantServices;
 
+pub(crate) mod engine;
 pub(crate) mod migrate;
 pub(crate) mod mirror;
 pub(crate) mod txn;
@@ -408,11 +409,7 @@ impl GatewayGraphs {
             return Ok(Arc::clone(k));
         }
         self.prepare(tenant).await?;
-        let ep = self.svc.locator.writer(tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(backend_error)?;
-        let secret = GraphCatalog::new(ep.store.schema())
-            .bookmark_secret(&mut conn)
-            .await?;
+        let secret = GraphCatalog::bookmark_secret(&*self.svc.records, tenant).await?;
         let k = Arc::new(sprig_graph::bookmark::key(&secret));
         self.keys
             .lock()
@@ -473,9 +470,7 @@ impl GatewayGraphs {
         }
         let ep = self.svc.locator.writer(tenant).await?;
         let mut conn = ep.pool.get_conn().await.map_err(backend_error)?;
-        GraphCatalog::new(ep.store.schema())
-            .migrate(&mut conn)
-            .await?;
+        GraphCatalog::migrate(&mut conn, ep.store.schema()).await?;
         self.migrated
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -960,45 +955,52 @@ impl GatewayGraphs {
             .change(tenant, VersionKind::Catalog)
             .await?;
         let version = ch.version();
-        let r = {
-            let (store, tx) = ch.tx().parts();
-            let obj = ObjectRow {
-                object_id,
-                db_id: row.db_id,
-                namespace: Namespace::Graph,
-                name: name.to_owned(),
-                name_key: object_key(ObjectKind::Graph, name, lctn),
-                kind: ObjectKind::Graph,
-                parent_id: None,
-                state: ObjectState::Active,
-                schema_version: 1,
-                flags: ObjectFlags::default(),
-                pending_job_id: None,
-                created_at: SystemTime::now(),
-                changed_version: version,
-            };
-            let cat_schema = store.schema().to_owned();
-            match store.insert_object(tx, &obj).await {
-                Ok(()) => match GraphCatalog::new(&cat_schema)
-                    .insert_native_as(tx, object_id.0, row.db_id.0, Some(group), storage)
+        let r = match ch.tx().split().await {
+            Err(e) => Err(e),
+            Ok((store, tx, rec)) => {
+                let obj = ObjectRow {
+                    object_id,
+                    db_id: row.db_id,
+                    namespace: Namespace::Graph,
+                    name: name.to_owned(),
+                    name_key: object_key(ObjectKind::Graph, name, lctn),
+                    kind: ObjectKind::Graph,
+                    parent_id: None,
+                    state: ObjectState::Active,
+                    schema_version: 1,
+                    flags: ObjectFlags::default(),
+                    pending_job_id: None,
+                    created_at: SystemTime::now(),
+                    changed_version: version,
+                };
+                let cat_schema = store.schema().to_owned();
+                match store.insert_object(tx, &obj).await {
+                    Ok(()) => match GraphCatalog::insert_native_as(
+                        rec,
+                        object_id.0,
+                        row.db_id.0,
+                        Some(group),
+                        storage,
+                    )
                     .await
-                {
-                    Ok(()) => {
-                        insert_group(
-                            tx,
-                            &cat_schema,
-                            group,
-                            shards,
-                            &spec,
-                            row.db_id,
-                            object_id.0,
-                            members,
-                        )
-                        .await
-                    }
+                    {
+                        Ok(()) => {
+                            insert_group(
+                                tx,
+                                &cat_schema,
+                                group,
+                                shards,
+                                &spec,
+                                row.db_id,
+                                object_id.0,
+                                members,
+                            )
+                            .await
+                        }
+                        Err(e) => Err(e),
+                    },
                     Err(e) => Err(e),
-                },
-                Err(e) => Err(e),
+                }
             }
         };
         if let Err(e) = r {
@@ -1107,21 +1109,27 @@ impl GatewayGraphs {
             .change(tenant, VersionKind::Catalog)
             .await?;
         let version = ch.version();
-        let r = {
-            let (store, tx) = ch.tx().parts();
-            let cat_schema = store.schema().to_owned();
-            match store
-                .set_object_state(tx, ObjectId(g.graph_id), ObjectState::Dropped, version)
-                .await
-            {
-                Ok(_) => match GraphCatalog::new(&cat_schema).delete(tx, g.graph_id).await {
-                    Ok(()) => match group {
-                        Some(gid) => delete_group(tx, &cat_schema, gid).await,
-                        None => Ok(()),
+        let r = match ch.tx().split().await {
+            Err(e) => Err(e),
+            Ok((store, tx, rec)) => {
+                let cat_schema = store.schema().to_owned();
+                match store
+                    .set_object_state(tx, ObjectId(g.graph_id), ObjectState::Dropped, version)
+                    .await
+                {
+                    Ok(_) => match GraphCatalog::delete(rec, g.graph_id).await {
+                        Ok(()) => match GraphCatalog::delete_sql(tx, &cat_schema, g.graph_id).await
+                        {
+                            Ok(()) => match group {
+                                Some(gid) => delete_group(tx, &cat_schema, gid).await,
+                                None => Ok(()),
+                            },
+                            Err(e) => Err(e),
+                        },
+                        Err(e) => Err(e),
                     },
                     Err(e) => Err(e),
-                },
-                Err(e) => Err(e),
+                }
             }
         };
         if let Err(e) = r {
@@ -1129,6 +1137,9 @@ impl GatewayGraphs {
             return Err(e);
         }
         let v = ch.commit().await?;
+        if engine::on_engine(&g, &cat) {
+            engine::drop_storage(&g).await;
+        }
         if group.is_some() {
             let at: Vec<(ClusterId, String)> = g
                 .shards
@@ -1272,17 +1283,26 @@ impl GatewayGraphs {
         let cluster = self.svc.locator.cluster(tenant).await?;
         let pool = self.pool(&cluster).await?;
         let mut conn = pool.get_conn().await.map_err(backend_error)?;
+        // An engine database's tables: their columns from the engine's
+        // definitions, and the probe below run in process.
+        let on_engine = crate::engine::graphsql::EngineSql::serves(&cat, row.db_id);
+        let mut engine_sql =
+            on_engine.then(|| crate::engine::graphsql::EngineSql::new(tenant, &cat, lctn, false));
         let mut def = c.def.clone();
         let invalid = |m: String| SprigError::new(SprigCode::GraphDefinitionInvalid, m);
         let mut columns_of = HashMap::new();
         for (t, _) in &sources {
-            let cols: Vec<String> = conn
-                .exec(
+            let cols: Vec<String> = if on_engine {
+                crate::engine::graphsql::EngineSql::columns(&cat, row.db_id, t, lctn)
+                    .unwrap_or_default()
+            } else {
+                conn.exec(
                     sprig_graph::mapped::MappedStore::columns_sql(),
                     (schema.as_str(), t.as_str()),
                 )
                 .await
-                .map_err(backend_error)?;
+                .map_err(backend_error)?
+            };
             let cols: Vec<String> = cols
                 .into_iter()
                 .filter(|x| !x.starts_with("_sprig"))
@@ -1342,8 +1362,14 @@ impl GatewayGraphs {
                 sprig_common::names::quote(&schema),
                 sprig_common::names::quote(t)
             );
-            conn.query_drop(&sql)
-                .await
+            let outcome = match engine_sql.as_mut() {
+                Some(run) => sprig_graph::mapped::SqlRunner::rows(run, &sql, Vec::new())
+                    .await
+                    .map(drop)
+                    .map_err(|e| e.message),
+                None => conn.query_drop(&sql).await.map_err(|e| e.to_string()),
+            };
+            outcome
                 .map_err(|e| invalid(format!("a property of table '{t}' doesn't evaluate: {e}")))?;
         }
         drop(conn);
@@ -1359,31 +1385,30 @@ impl GatewayGraphs {
             .change(tenant, VersionKind::Catalog)
             .await?;
         let version = ch.version();
-        let r = {
-            let (store, tx) = ch.tx().parts();
-            let obj = ObjectRow {
-                object_id,
-                db_id: row.db_id,
-                namespace: Namespace::Graph,
-                name: c.name.clone(),
-                name_key: object_key(ObjectKind::Graph, &c.name, lctn),
-                kind: ObjectKind::Graph,
-                parent_id: None,
-                state: ObjectState::Active,
-                schema_version: 1,
-                flags: ObjectFlags::default(),
-                pending_job_id: None,
-                created_at: SystemTime::now(),
-                changed_version: version,
-            };
-            let cat_schema = store.schema().to_owned();
-            match store.insert_object(tx, &obj).await {
-                Ok(()) => {
-                    GraphCatalog::new(&cat_schema)
-                        .insert_mapped(tx, object_id.0, row.db_id.0, &text)
-                        .await
+        let r = match ch.tx().split().await {
+            Err(e) => Err(e),
+            Ok((store, tx, rec)) => {
+                let obj = ObjectRow {
+                    object_id,
+                    db_id: row.db_id,
+                    namespace: Namespace::Graph,
+                    name: c.name.clone(),
+                    name_key: object_key(ObjectKind::Graph, &c.name, lctn),
+                    kind: ObjectKind::Graph,
+                    parent_id: None,
+                    state: ObjectState::Active,
+                    schema_version: 1,
+                    flags: ObjectFlags::default(),
+                    pending_job_id: None,
+                    created_at: SystemTime::now(),
+                    changed_version: version,
+                };
+                match store.insert_object(tx, &obj).await {
+                    Ok(()) => {
+                        GraphCatalog::insert_mapped(rec, object_id.0, row.db_id.0, &text).await
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
             }
         };
         if let Err(e) = r {
@@ -1443,6 +1468,37 @@ impl GatewayGraphs {
             &ctx,
             Some(&cat.settings),
         ));
+        if engine::on_engine(&g, cat) {
+            // Read-only, on its own engine transaction that is never
+            // committed. Index commands commit on their own and batches
+            // only in an implicit transaction: both are refused here.
+            if q.parts.iter().any(|x| {
+                x.clauses
+                    .iter()
+                    .any(|c| matches!(c, sprig_graph::ast::Clause::Schema(_)))
+            }) {
+                return Err(SprigError::new(
+                    SprigCode::GraphUnsupported,
+                    "GRAPH_TABLE reads only",
+                ));
+            }
+            let eg = engine::graph(&g)?;
+            let mut tx = eg.begin(false);
+            let r = {
+                let mut store = eg.store(&mut tx);
+                sprig_graph::exec::run(&mut store, &q, &sprig_graph::eval::Params::new(), &budgets)
+                    .await
+            };
+            tx.rollback();
+            let out = r?;
+            if out.qtype != "r" {
+                return Err(SprigError::new(
+                    SprigCode::GraphUnsupported,
+                    "GRAPH_TABLE reads only",
+                ));
+            }
+            return Ok(out);
+        }
         let mut rc = txn::ReadConns::default();
         let opened: Result<()> = async {
             for c in rc.missing(&g.shards) {
@@ -1481,8 +1537,24 @@ impl GatewayGraphs {
                 }
                 ok &= true;
             }
-            match rc.conns.get_mut(g.cluster.as_str()) {
-                Some(conn) if ok => {
+            // Over an engine database's tables: read in process.
+            let on_engine = crate::engine::graphsql::EngineSql::serves(cat, g.db_id);
+            let mut run = on_engine.then(|| {
+                crate::engine::graphsql::EngineSql::new(g.tenant, cat, self.lctn(cat), false)
+            });
+            match (run.as_mut(), rc.conns.get_mut(g.cluster.as_str())) {
+                (Some(run), _) if ok => {
+                    let mut store =
+                        sprig_graph::mapped::MappedStore::new(run, g.graph_id, &g.schema, def);
+                    sprig_graph::exec::run(
+                        &mut store,
+                        &q,
+                        &sprig_graph::eval::Params::new(),
+                        &budgets,
+                    )
+                    .await
+                }
+                (None, Some(conn)) if ok => {
                     let mut store =
                         sprig_graph::mapped::MappedStore::new(conn, g.graph_id, &g.schema, def);
                     sprig_graph::exec::run(
@@ -1610,11 +1682,10 @@ impl GatewayGraphs {
 
     /// `g`'s indexes from the catalog now, with token names.
     async fn current_indexes(&self, g: &GraphRef) -> Result<Vec<IndexDef>> {
-        let ep = self.svc.locator.writer(g.tenant).await?;
-        let mut c = ep.pool.get_conn().await.map_err(backend_error)?;
-        let rows = GraphCatalog::new(ep.store.schema())
-            .indexes(&mut c, Some(g.graph_id))
-            .await?;
+        let rows = {
+            let mut rec = self.svc.records.begin(g.tenant).await?;
+            GraphCatalog::indexes(&mut *rec, Some(g.graph_id)).await?
+        };
         let (labels, types) = self.names_of(g);
         let mut out = Vec::with_capacity(rows.len());
         for (_, mut d) in rows {
@@ -1659,11 +1730,9 @@ impl GatewayGraphs {
                 .catalog
                 .change(g.tenant, VersionKind::Catalog)
                 .await?;
-            let r = {
-                let (store, tx) = ch.tx().parts();
-                GraphCatalog::new(store.schema())
-                    .delete_index(tx, g.graph_id, d.id)
-                    .await
+            let r = match ch.tx().records().await {
+                Err(e) => Err(e),
+                Ok(rec) => GraphCatalog::delete_index(rec, g.graph_id, d.id).await,
             };
             if let Err(e) = r {
                 let _ = ch.rollback().await;
@@ -1699,11 +1768,9 @@ impl GatewayGraphs {
             .catalog
             .change(g.tenant, VersionKind::Catalog)
             .await?;
-        let r = {
-            let (store, tx) = ch.tx().parts();
-            GraphCatalog::new(store.schema())
-                .insert_index(tx, g.graph_id, &d)
-                .await
+        let r = match ch.tx().records().await {
+            Err(e) => Err(e),
+            Ok(rec) => GraphCatalog::insert_index(rec, g.graph_id, &d).await,
         };
         d.id = match r {
             Ok(id) => id,
@@ -1728,13 +1795,14 @@ impl GatewayGraphs {
             .catalog
             .change(g.tenant, VersionKind::Catalog)
             .await?;
-        let r = {
-            let (store, tx) = ch.tx().parts();
-            let gc = GraphCatalog::new(store.schema());
-            if altered.is_ok() {
-                gc.index_online(tx, g.graph_id, d.id).await
-            } else {
-                gc.delete_index(tx, g.graph_id, d.id).await
+        let r = match ch.tx().records().await {
+            Err(e) => Err(e),
+            Ok(rec) => {
+                if altered.is_ok() {
+                    GraphCatalog::index_online(rec, g.graph_id, d.id).await
+                } else {
+                    GraphCatalog::delete_index(rec, g.graph_id, d.id).await
+                }
             }
         };
         if let Err(e) = r {
@@ -1984,13 +2052,9 @@ impl GwDict {
     async fn create_once(&self, label: bool, name: &str) -> Result<u32> {
         // Usually it exists already (another session or gateway made it):
         // no versioned change then.
-        let ep = self.graphs.svc.locator.writer(self.tenant).await?;
         {
-            let mut c = ep.pool.get_conn().await.map_err(backend_error)?;
-            if let Some(id) = GraphCatalog::new(ep.store.schema())
-                .find_source(&mut c, self.graph, label, name)
-                .await?
-            {
+            let mut rec = self.graphs.svc.records.begin(self.tenant).await?;
+            if let Some(id) = GraphCatalog::find_source(&mut *rec, self.graph, label, name).await? {
                 self.graphs.learn(self.tenant, self.graph, label, id, name);
                 return Ok(id);
             }
@@ -2001,11 +2065,9 @@ impl GwDict {
             .catalog
             .change(self.tenant, VersionKind::Catalog)
             .await?;
-        let r = {
-            let (store, tx) = ch.tx().parts();
-            GraphCatalog::new(store.schema())
-                .add_source(tx, self.graph, label, name)
-                .await
+        let r = match ch.tx().records().await {
+            Err(e) => Err(e),
+            Ok(rec) => GraphCatalog::add_source(rec, self.graph, label, name).await,
         };
         match r {
             Ok(id) => {

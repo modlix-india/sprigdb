@@ -297,6 +297,30 @@ impl std::fmt::Debug for TenantCache {
     }
 }
 
+/// Tells a session whether its tenant's cached catalog may have changed
+/// since it last looked, with one atomic read: every finished load of the
+/// tenant counts as a change, and so does the tenant leaving the cache.
+/// A session that sees no change may keep its snapshot without asking the
+/// cache ([`TenantCache::follow`]).
+#[derive(Debug)]
+pub struct CatalogFollow {
+    rx: watch::Receiver<u64>,
+}
+
+impl CatalogFollow {
+    /// Whether a load finished (or the tenant was evicted) since the last
+    /// [`Self::mark_seen`] or since this was made.
+    #[must_use]
+    pub fn changed(&self) -> bool {
+        self.rx.has_changed().unwrap_or(true)
+    }
+
+    /// Everything published so far counts as seen.
+    pub fn mark_seen(&mut self) {
+        let _ = self.rx.borrow_and_update();
+    }
+}
+
 /// Keeps a tenant marked as having sessions here: it reloads as soon as
 /// its directory entry moves, and is evicted last. Dropping it unpins.
 #[must_use = "dropping a TenantPin unpins the tenant"]
@@ -466,6 +490,19 @@ impl TenantCache {
         slot.lock().current.clone()
     }
 
+    /// A [`CatalogFollow`] of `tenant`, while it is cached here.
+    #[must_use]
+    pub fn follow(&self, tenant: TenantId) -> Option<CatalogFollow> {
+        let slots = self
+            .inner
+            .slots
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        slots.get(&tenant).map(|s| CatalogFollow {
+            rx: s.published.subscribe(),
+        })
+    }
+
     /// Marks `tenant` as having a session here (see [`TenantPin`]).
     pub fn pin(&self, tenant: TenantId) -> TenantPin {
         *lock(&self.inner.pins).entry(tenant).or_insert(0) += 1;
@@ -617,7 +654,9 @@ impl Inner {
         latest: bool,
     ) -> Result<Arc<TenantCatalog>> {
         let limit = self.wait_limit();
-        let deadline = tokio::time::Instant::now() + limit;
+        // Read the clock only when a wait starts: a cached snapshot (every
+        // statement's case) needs no deadline.
+        let mut deadline = None;
         loop {
             let (mut rx, seen) = {
                 let mut st = slot.lock();
@@ -631,6 +670,7 @@ impl Inner {
                 self.start_load(slot, &mut st);
                 (slot.published.subscribe(), st.loads)
             };
+            let deadline = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + limit);
             loop {
                 match tokio::time::timeout_at(deadline, rx.changed()).await {
                     Err(_) => {
@@ -681,7 +721,14 @@ impl Inner {
             }
         }
         let ttl = self.config().ttl;
-        if st.refreshing || st.confirmed_at.is_some_and(|t| t.elapsed() < ttl) {
+        // The poll's clock reading (at most one poll old) rather than the
+        // clock: every statement passes here.
+        let now = sprig_common::time::poll::now();
+        if st.refreshing
+            || st
+                .confirmed_at
+                .is_some_and(|t| now.saturating_duration_since(t) < ttl)
+        {
             return;
         }
         st.refreshing = true;
@@ -833,6 +880,8 @@ impl Inner {
         };
         let b = slot.bytes.swap(0, Ordering::Relaxed);
         self.bytes.fetch_sub(b, Ordering::Relaxed);
+        // Sessions following the tenant ask the cache again.
+        slot.published.send_modify(|g| *g += 1);
         self.feed.forget(tenant);
         if let Some(n) = &self.notify {
             n.tenant_evicted(tenant);

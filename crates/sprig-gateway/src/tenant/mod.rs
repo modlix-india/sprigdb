@@ -25,6 +25,7 @@ pub mod aliases;
 pub mod authz;
 pub mod autoindex;
 pub mod backends;
+pub mod catalog_records;
 pub mod ddl;
 pub mod ddl_owners;
 pub mod locator;
@@ -49,10 +50,11 @@ use std::sync::Arc;
 use sprig_auth::AuthExtension;
 use sprig_auth::revoke::AuthChanges;
 use sprig_catalog::ddl::DdlEngine;
+use sprig_catalog::records::{RecBackend, RecordStore};
 use sprig_catalog::{
-    AllowAll, CacheConfig, CatalogExtension, CatalogLocator, DirectoryAllocator, DirectoryWatch,
-    LogDecisions, MariaBackend, MariaCatalog, MariaSource, TenantCache, TenantSettingsWriter,
-    Versioner,
+    AllowAll, AuthCatalog, CacheConfig, CatalogExtension, CatalogLocator, DirectoryAllocator,
+    DirectoryWatch, LogDecisions, MariaBackend, MariaCatalog, MariaSource, TenantCache,
+    TenantSettingsWriter, Versioner,
 };
 use sprig_cluster::registry::ClusterRegistry;
 use sprig_common::Result;
@@ -83,8 +85,13 @@ pub struct TenantServices {
     pub settings: Settings,
     /// This gateway's DC.
     pub dc: DcId,
-    /// Versioned catalog changes (passwords, settings, DDL).
+    /// Versioned catalog changes (settings, DDL, the other modules).
     pub catalog: MariaCatalog,
+    /// Versioned auth changes (users, passwords, privileges, row
+    /// security): engine catalog records of this node.
+    pub auth: AuthCatalog,
+    /// This node's catalog records (unversioned auth writes).
+    pub records: Arc<dyn RecordStore>,
     /// The DDL write path.
     pub ddl: DdlEngine<MariaBackend>,
     /// Setting writes at tenant, database and object scope.
@@ -147,6 +154,7 @@ impl TenantServices {
     /// # Errors
     /// `Internal` if the catalog modules' migrations are malformed (a
     /// bug); the stores' key errors.
+    #[allow(clippy::too_many_lines)] // one wiring step after another
     pub fn start(
         live: &LiveSettings,
         backends: Arc<Backends>,
@@ -205,7 +213,10 @@ impl TenantServices {
             // Search indexes and analyzers.
             Arc::new(crate::search::catalog::SearchExtension),
         ];
-        let source = MariaSource::new(Arc::clone(&dyn_locator), extensions)?;
+        // The auth modules read this node's engine records.
+        let records: Arc<dyn RecordStore> = Arc::new(catalog_records::EngineRecords::default());
+        let source = MariaSource::new(Arc::clone(&dyn_locator), extensions)?
+            .with_records(Arc::clone(&records));
         let feed = DirectoryWatch::start(Arc::clone(&global))?;
         let settings = Settings::new(live.clone());
         let cache = TenantCache::start(
@@ -225,7 +236,13 @@ impl TenantServices {
             Arc::clone(&global),
         );
         let catalog = Versioner::new(
-            MariaBackend::new(Arc::clone(&dyn_locator)).with_clock(Arc::clone(&clock)),
+            MariaBackend::new(Arc::clone(&dyn_locator))
+                .with_clock(Arc::clone(&clock))
+                .with_records(Arc::clone(&records)),
+            Arc::new(DirectoryAllocator::new(Arc::clone(&global))),
+        );
+        let auth = Versioner::new(
+            RecBackend::new(Arc::clone(&records)).with_clock(Arc::clone(&clock)),
             Arc::new(DirectoryAllocator::new(Arc::clone(&global))),
         );
         // No destructive change of a shared object, checked
@@ -249,6 +266,8 @@ impl TenantServices {
             settings,
             dc,
             catalog,
+            auth,
+            records,
             ddl,
             writer,
             locator,

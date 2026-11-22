@@ -13,11 +13,18 @@
 //! ```text
 //! admit(session, cmd):
 //!   if cmd ends a transaction or is a ping or close: free permit
-//!   if tenant and user semaphores both try_acquire: return permit
-//!   enqueue on the tenant's queue; high priority if session.state == InTransaction
-//!   grant in queue order, high priority first, skipping users at their limit
+//!   if nobody waits and the tenant's then the user's counter (atomics the
+//!     session holds) both count it in under their limits: return permit
+//!   else, under the lock: enqueue on the tenant's queue; high priority if
+//!     session.state == InTransaction
+//!   leaving: count out; if anyone waits, grant under the lock in queue
+//!     order, high priority first, skipping users at their limit
 //!   past limits.queue_timeout_ms: 39002
 //! ```
+//!
+//! A session resolves its tenant's statement limits again at most every
+//! [`LIMITS_RECHECK`] (1 s): a changed limit reaches running sessions
+//! within that.
 //!
 //! - **Memory:** what the gateway buffers is charged to three nested
 //!   budgets ([`Limiter::charge`]): the gateway (`gateway.memory_limit_mb`,
@@ -39,7 +46,7 @@
 //! `gateway.relay_buffer_kb` per session and not charged yet.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -299,16 +306,71 @@ const TENANT_MEMO_MAX: usize = 4096;
 
 struct Waiter {
     id: u64,
-    user: String,
+    user: Arc<AtomicUsize>,
     high: bool,
     tx: oneshot::Sender<()>,
+}
+
+/// How long a session uses its tenant's statement limits before resolving
+/// them again: a changed `limits.tenant_active_statements`,
+/// `limits.user_active_statements` or `limits.queue_timeout_ms` reaches
+/// running sessions within this (new sessions at once).
+pub const LIMITS_RECHECK: Duration = Duration::from_secs(1);
+
+/// A tenant's running statements here, counted without the limiter's lock.
+///
+/// A statement counts itself in with two atomic steps (tenant, then user)
+/// while nobody waits. Only when a limit is reached does it take the lock
+/// and queue. A statement that leaves checks for waiters after it counted
+/// itself out, and a waiter checks for room after it counted itself in
+/// (both sequentially consistent), so a slot freed while a waiter queues is
+/// never missed: either the waiter sees it, or the leaver sees the waiter
+/// and grants under the lock.
+#[derive(Debug, Default)]
+struct Gate {
+    active: AtomicUsize,
+    queued: AtomicUsize,
+    tenant_limit: AtomicUsize,
+    user_limit: AtomicUsize,
+    queue_timeout_ms: AtomicU64,
+    /// When the limits were last resolved, in microseconds since the
+    /// limiter started (0: never).
+    resolved_us: AtomicU64,
+}
+
+impl Gate {
+    /// Counts a statement of `user` in if both limits have room.
+    fn try_take(&self, user: &AtomicUsize) -> bool {
+        if self.active.fetch_add(1, Ordering::SeqCst) >= self.tenant_limit.load(Ordering::Relaxed) {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            return false;
+        }
+        if user.fetch_add(1, Ordering::SeqCst) >= self.user_limit.load(Ordering::Relaxed) {
+            user.fetch_sub(1, Ordering::SeqCst);
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
+    /// Counts a statement of `user` out.
+    fn put_back(&self, user: &AtomicUsize) {
+        user.fetch_sub(1, Ordering::SeqCst);
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn full(&self) -> bool {
+        self.active.load(Ordering::SeqCst) >= self.tenant_limit.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Default)]
 struct TenantState {
     conns: usize,
-    active: usize,
-    users: HashMap<String, usize>,
+    gate: Arc<Gate>,
+    /// Each user's running statements; a user's counter stays (at 0) while
+    /// the tenant has state here.
+    users: HashMap<String, Arc<AtomicUsize>>,
     mem: usize,
     user_mem: HashMap<String, usize>,
     queue: VecDeque<Waiter>,
@@ -316,7 +378,21 @@ struct TenantState {
 
 impl TenantState {
     fn idle(&self) -> bool {
-        self.conns == 0 && self.active == 0 && self.mem == 0 && self.queue.is_empty()
+        self.conns == 0
+            && self.mem == 0
+            && self.queue.is_empty()
+            && self.gate.active.load(Ordering::SeqCst) == 0
+            // No session holds the counters.
+            && Arc::strong_count(&self.gate) == 1
+    }
+
+    fn user(&mut self, user: &str) -> Arc<AtomicUsize> {
+        if let Some(u) = self.users.get(user) {
+            return Arc::clone(u);
+        }
+        let u = Arc::new(AtomicUsize::new(0));
+        self.users.insert(user.to_owned(), Arc::clone(&u));
+        u
     }
 }
 
@@ -338,6 +414,8 @@ pub struct Limiter {
     connections: AtomicUsize,
     memory: AtomicUsize,
     state: Mutex<State>,
+    /// The origin of [`Gate::resolved_us`].
+    epoch: Instant,
 }
 
 impl std::fmt::Debug for Limiter {
@@ -376,16 +454,132 @@ impl Drop for Attached {
 }
 
 /// One running statement's admission permit.
-#[derive(Debug)]
 pub struct ActivePermit {
     limiter: Arc<Limiter>,
     tenant: Key,
-    user: Arc<str>,
+    gate: Arc<Gate>,
+    user: Arc<AtomicUsize>,
+}
+
+impl std::fmt::Debug for ActivePermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActivePermit")
+            .field("tenant", &self.tenant)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Drop for ActivePermit {
     fn drop(&mut self) {
-        self.limiter.release(self.tenant, &self.user);
+        self.limiter.release(self.tenant, &self.gate, &self.user);
+    }
+}
+
+/// One session's admission: its tenant's and user's counters, kept for the
+/// session's life so a statement counts itself in and out without the
+/// limiter's lock or a name lookup.
+pub struct SessionGate {
+    limiter: Arc<Limiter>,
+    tenant: Key,
+    user_name: Arc<str>,
+    /// Looked up at the session's first statement.
+    held: Option<(Arc<Gate>, Arc<AtomicUsize>)>,
+}
+
+impl std::fmt::Debug for SessionGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionGate")
+            .field("tenant", &self.tenant)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A statement admitted through a [`SessionGate`]; counts it out when
+/// dropped.
+pub struct Admitted<'a> {
+    limiter: &'a Limiter,
+    tenant: Key,
+    gate: &'a Gate,
+    user: &'a AtomicUsize,
+}
+
+impl Drop for Admitted<'_> {
+    fn drop(&mut self) {
+        self.limiter.release(self.tenant, self.gate, self.user);
+    }
+}
+
+/// A queued statement's wait (see [`Limiter::admit_on`]).
+struct WaitGuard<'a> {
+    limiter: &'a Limiter,
+    tenant: Key,
+    gate: &'a Gate,
+    user: &'a AtomicUsize,
+    id: u64,
+    /// Granted and received: nothing to undo.
+    done: bool,
+}
+
+impl Drop for WaitGuard<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let mut st = self.limiter.lock();
+        let queued = st.tenants.get_mut(&self.tenant).is_some_and(|t| {
+            match t.queue.iter().position(|w| w.id == self.id) {
+                Some(i) => {
+                    t.queue.remove(i);
+                    self.gate.queued.fetch_sub(1, Ordering::SeqCst);
+                    true
+                }
+                None => false,
+            }
+        });
+        drop(st);
+        if !queued {
+            // Granted after all: the slot goes back.
+            self.limiter.release(self.tenant, self.gate, self.user);
+        }
+    }
+}
+
+impl SessionGate {
+    /// Admits one statement; `high` for a session inside a transaction.
+    ///
+    /// # Errors
+    /// 39002 past `limits.queue_timeout_ms`.
+    pub async fn admit(&mut self, high: bool) -> Result<Admitted<'_>> {
+        if self.held.is_none() {
+            let mut st = self.limiter.lock();
+            let t = st.tenants.entry(self.tenant).or_default();
+            self.held = Some((Arc::clone(&t.gate), t.user(&self.user_name)));
+        }
+        let Some((gate, user)) = self.held.as_ref() else {
+            return Err(SprigError::internal("admission: no counters"));
+        };
+        self.limiter.refresh_limits(
+            self.tenant,
+            gate,
+            sprig_common::time::poll::now(),
+            LIMITS_RECHECK,
+        );
+        self.limiter.admit_on(self.tenant, gate, user, high).await?;
+        Ok(Admitted {
+            limiter: &self.limiter,
+            tenant: self.tenant,
+            gate,
+            user,
+        })
+    }
+}
+
+impl Drop for SessionGate {
+    fn drop(&mut self) {
+        if self.held.take().is_some() {
+            let mut st = self.limiter.lock();
+            Limiter::forget_if_idle(&mut st, self.tenant);
+        }
     }
 }
 
@@ -454,6 +648,7 @@ impl Limiter {
             connections: AtomicUsize::new(0),
             memory: AtomicUsize::new(0),
             state: Mutex::new(State::default()),
+            epoch: Instant::now(),
         })
     }
 
@@ -578,8 +773,8 @@ impl Limiter {
         self.admit_shared(tenant, &Arc::from(user), high).await
     }
 
-    /// [`Self::admit`] for a session that keeps its user's name shared
-    /// (no copy per statement).
+    /// [`Self::admit`] with the user's name shared. Resolves the limits
+    /// again on every call; a session uses [`Self::session_gate`] instead.
     ///
     /// # Errors
     /// 39002 past `limits.queue_timeout_ms`.
@@ -589,30 +784,88 @@ impl Limiter {
         user: &Arc<str>,
         high: bool,
     ) -> Result<ActivePermit> {
-        let user_arc = user;
-        let user: &str = user;
+        let (gate, user) = {
+            let mut st = self.lock();
+            let t = st.tenants.entry(tenant).or_default();
+            (Arc::clone(&t.gate), t.user(user))
+        };
+        self.refresh_limits(tenant, &gate, Instant::now(), Duration::ZERO);
+        self.admit_on(tenant, &gate, &user, high).await?;
+        Ok(ActivePermit {
+            limiter: Arc::clone(self),
+            tenant,
+            gate,
+            user,
+        })
+    }
+
+    /// The admission of one session of `user` of `tenant`.
+    #[must_use]
+    pub fn session_gate(self: &Arc<Self>, tenant: Key, user: Arc<str>) -> SessionGate {
+        SessionGate {
+            limiter: Arc::clone(self),
+            tenant,
+            user_name: user,
+            held: None,
+        }
+    }
+
+    /// Resolves `tenant`'s statement limits into `gate` when they are
+    /// older than `max_age` at `now`.
+    fn refresh_limits(&self, tenant: Key, gate: &Gate, now: Instant, max_age: Duration) {
+        let now_us = u64::try_from(now.saturating_duration_since(self.epoch).as_micros())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let at = gate.resolved_us.load(Ordering::Relaxed);
+        let max_us = u64::try_from(max_age.as_micros()).unwrap_or(u64::MAX);
+        if at != 0 && max_us > 0 && now_us.saturating_sub(at) < max_us {
+            return;
+        }
         let l = self.limits_for(tenant);
+        gate.tenant_limit.store(l.tenant_active, Ordering::Relaxed);
+        gate.user_limit.store(l.user_active, Ordering::Relaxed);
+        gate.queue_timeout_ms.store(
+            u64::try_from(l.queue_timeout.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        gate.resolved_us.store(now_us, Ordering::Relaxed);
+    }
+
+    /// Counts one statement in on `gate` and `user`, queueing when a limit
+    /// is reached.
+    async fn admit_on(
+        &self,
+        tenant: Key,
+        gate: &Gate,
+        user: &Arc<AtomicUsize>,
+        high: bool,
+    ) -> Result<()> {
+        // Nobody waits: two atomic steps.
+        if gate.queued.load(Ordering::SeqCst) == 0 {
+            if gate.try_take(user) {
+                return Ok(());
+            }
+            // A slot the attempt held for a moment may have turned a
+            // waiter away.
+            if gate.queued.load(Ordering::SeqCst) > 0 {
+                self.grant(tenant);
+            }
+        }
         let (rx, id) = {
             let mut st = self.lock();
             let next = st.next_waiter;
             let t = st.tenants.entry(tenant).or_default();
-            let ua = t.users.get(user).copied().unwrap_or(0);
-            if t.queue.is_empty() && t.active < l.tenant_active && ua < l.user_active {
-                t.active += 1;
-                // A user's count stays (at 0) while the tenant has state
-                // here: no allocation per statement.
-                match t.users.get_mut(user) {
-                    Some(n) => *n += 1,
-                    None => {
-                        t.users.insert(user.to_owned(), 1);
-                    }
-                }
-                return Ok(self.permit(tenant, user_arc));
+            gate.queued.fetch_add(1, Ordering::SeqCst);
+            // Room freed before this waiter counted itself: take it, unless
+            // others wait first.
+            if t.queue.is_empty() && gate.try_take(user) {
+                gate.queued.fetch_sub(1, Ordering::SeqCst);
+                return Ok(());
             }
             let (tx, rx) = oneshot::channel();
             let w = Waiter {
                 id: next,
-                user: user.to_owned(),
+                user: Arc::clone(user),
                 high,
                 tx,
             };
@@ -629,90 +882,63 @@ impl Limiter {
             st.next_waiter += 1;
             (rx, next)
         };
+        // Leaves the queue, or gives back a slot granted too late, however
+        // the wait ends (timed out, or the statement cancelled).
+        let mut guard = WaitGuard {
+            limiter: self,
+            tenant,
+            gate,
+            user,
+            id,
+            done: false,
+        };
+        // A slot freed between the attempt and the queueing.
+        self.grant(tenant);
+        let timeout = Duration::from_millis(gate.queue_timeout_ms.load(Ordering::Relaxed));
         let started = Instant::now();
-        let r = tokio::time::timeout(l.queue_timeout, rx).await;
+        let r = tokio::time::timeout(timeout, rx).await;
         metrics::histogram!("sprig_gateway_admission_wait_seconds")
             .record(started.elapsed().as_secs_f64());
         if let Ok(Ok(())) = r {
-            return Ok(self.permit(tenant, user_arc));
+            guard.done = true;
+            return Ok(());
         }
-        // Timed out: leave the queue, unless a grant raced the timeout, in
-        // which case give the slot back.
-        let mut st = self.lock();
-        let granted = st.tenants.get_mut(&tenant).is_none_or(|t| {
-            match t.queue.iter().position(|w| w.id == id) {
-                Some(i) => {
-                    t.queue.remove(i);
-                    false
-                }
-                None => true,
-            }
-        });
-        drop(st);
-        if granted {
-            self.release(tenant, user);
-        }
+        drop(guard);
         Err(admission_timeout(started.elapsed()))
     }
 
-    fn permit(self: &Arc<Self>, tenant: Key, user: &Arc<str>) -> ActivePermit {
-        ActivePermit {
-            limiter: Arc::clone(self),
-            tenant,
-            user: Arc::clone(user),
+    /// A statement ended: count it out, and grant waiters if any.
+    fn release(&self, tenant: Key, gate: &Gate, user: &AtomicUsize) {
+        gate.put_back(user);
+        if gate.queued.load(Ordering::SeqCst) > 0 {
+            self.grant(tenant);
         }
     }
 
-    /// A statement ended: free its slot and grant waiters.
-    fn release(&self, tenant: Key, user: &str) {
+    /// Grants waiting statements of `tenant` while there is room, in queue
+    /// order (high priority first), skipping users at their own limit.
+    fn grant(&self, tenant: Key) {
         let mut st = self.lock();
-        let mut queued = false;
-        if let Some(t) = st.tenants.get_mut(&tenant) {
-            t.active = t.active.saturating_sub(1);
-            if let Some(u) = t.users.get_mut(user) {
-                *u = u.saturating_sub(1);
-            }
-            queued = !t.queue.is_empty();
-        }
-        if !queued {
-            Self::forget_if_idle(&mut st, tenant);
+        let Some(t) = st.tenants.get_mut(&tenant) else {
             return;
-        }
-        // Waiters: the limits now (resolved outside the lock), then grant.
-        drop(st);
-        let l = self.limits_for(tenant);
-        let mut st = self.lock();
-        if let Some(t) = st.tenants.get_mut(&tenant) {
-            // Grant in order, skipping users at their own limit.
-            while t.active < l.tenant_active {
-                let Some(i) = t
-                    .queue
-                    .iter()
-                    .position(|w| t.users.get(&w.user).copied().unwrap_or(0) < l.user_active)
-                else {
-                    break;
-                };
-                let Some(w) = t.queue.remove(i) else { break };
-                if w.tx.is_closed() {
-                    continue;
-                }
-                t.active += 1;
-                match t.users.get_mut(&w.user) {
-                    Some(n) => *n += 1,
-                    None => {
-                        t.users.insert(w.user.clone(), 1);
-                    }
-                }
-                if w.tx.send(()).is_err() {
-                    // The waiter left between the check and the send.
-                    t.active -= 1;
-                    if let Some(u) = t.users.get_mut(&w.user) {
-                        *u -= 1;
-                    }
-                }
+        };
+        let gate = Arc::clone(&t.gate);
+        let mut i = 0;
+        while i < t.queue.len() && !gate.full() {
+            // A waiter whose statement left removes itself
+            // ([`WaitGuard`]); a user at its own limit waits.
+            if t.queue[i].tx.is_closed() || !gate.try_take(&t.queue[i].user) {
+                i += 1;
+                continue;
             }
+            let Some(w) = t.queue.remove(i) else { break };
+            gate.queued.fetch_sub(1, Ordering::SeqCst);
+            // A waiter that left between the check and the send finds
+            // itself granted and gives the slot back.
+            let _ = w.tx.send(());
         }
-        Self::forget_if_idle(&mut st, tenant);
+        drop(gate);
+        Limiter::forget_if_idle(&mut st, tenant);
     }
 
     /// An empty charge for `user` of `tenant`, grown as bytes are buffered.
@@ -804,18 +1030,17 @@ impl Executor for Limited {
     fn open(&self, login: &LoginInfo) -> Box<dyn SessionExec> {
         Box::new(LimitedSession {
             inner: self.inner.open(login),
-            limiter: Arc::clone(&self.limiter),
-            tenant: login.principal.tenant,
-            user: Arc::from(login.principal.user.as_str()),
+            gate: self.limiter.session_gate(
+                login.principal.tenant,
+                Arc::from(login.principal.user.as_str()),
+            ),
         })
     }
 }
 
 struct LimitedSession {
     inner: Box<dyn SessionExec>,
-    limiter: Arc<Limiter>,
-    tenant: Key,
-    user: Arc<str>,
+    gate: SessionGate,
 }
 
 #[async_trait]
@@ -827,10 +1052,7 @@ impl SessionExec for LimitedSession {
         params: &sprig_proto_mysql::command::ExecuteParams,
     ) -> Result<crate::pipeline::PointRead> {
         let high = cx.session.state() == SessionState::InTransaction;
-        let _permit = self
-            .limiter
-            .admit_shared(self.tenant, &self.user, high)
-            .await?;
+        let _permit = self.gate.admit(high).await?;
         self.inner.point_read(cx, stmt, params).await
     }
 
@@ -856,11 +1078,7 @@ impl SessionExec for LimitedSession {
             None
         } else {
             let high = cx.session.state() == SessionState::InTransaction;
-            Some(
-                self.limiter
-                    .admit_shared(self.tenant, &self.user, high)
-                    .await?,
-            )
+            Some(self.gate.admit(high).await?)
         };
         self.inner.execute(cx, req, out).await
     }

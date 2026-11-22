@@ -377,6 +377,42 @@ impl PassSession {
                         vec![vec![Some(routed.to_string().into_bytes())]],
                     ));
                 }
+                if self.mq_on_engine(v.db()) {
+                    // Messages on the engine: the outbox row (or delayed
+                    // message) is a plain write of the session's engine
+                    // transaction, so it exists only if that commits.
+                    if self.eng.txn.open_tx().is_none() {
+                        return Err(engine_txn_refused("sprig.mq_publish"));
+                    }
+                    let r = v.vhost();
+                    let (tenant, db_id) = (r.tenant, r.db_id);
+                    let store = engine_msg_store(tenant, db_id)?;
+                    let (op, routed) = match v
+                        .publish_in_txn(m, mandatory)
+                        .await
+                        .map_err(|e| sql_error(&e))?
+                    {
+                        TxnWrite::Outbox(row, n) => (store.txn_publish(&row), n),
+                        TxnWrite::Delayed(row) => (store.txn_delay(&row), 1),
+                        TxnWrite::Nothing => {
+                            return Ok(Reply::Rows(
+                                vec!["routed"],
+                                vec![vec![Some(b"0".to_vec())]],
+                            ));
+                        }
+                    };
+                    let tx = self
+                        .eng
+                        .txn
+                        .open_tx()
+                        .ok_or_else(|| engine_txn_refused("sprig.mq_publish"))?;
+                    plain_write(tx.engine_txn(), op)?;
+                    engine.note_txn_publish(session, tenant, db_id);
+                    return Ok(Reply::Rows(
+                        vec!["routed"],
+                        vec![vec![Some(routed.to_string().into_bytes())]],
+                    ));
+                }
                 v.ensure_store().await.map_err(|e| sql_error(&e))?;
                 let db = v.db().to_owned();
                 let routed = match v
@@ -644,6 +680,24 @@ impl PassSession {
                 }
                 v.hold(&t).await.map_err(|e| sql_error(&e))?;
                 let in_txn = self.mq_in_transaction();
+                // Messages stored on the engine: the owner deletes the
+                // message itself, as for an AMQP acknowledgement.
+                if self.mq_on_engine(&db) {
+                    if in_txn {
+                        return self.mq_engine_txn_ack(&engine, session, &v, t);
+                    }
+                    v.release(&t, false);
+                    // The right an acknowledgement needs: consuming the
+                    // queue (what the MariaDB path's DELETE stands for).
+                    if !v.may_consume(&t) {
+                        return Err(sql_error(&MqError::new(
+                            MqCode::AccessRefused,
+                            "the user may not consume this queue",
+                        )));
+                    }
+                    v.ack(&t);
+                    return Ok(Reply::Ok(1));
+                }
                 let deleted = match self.mq_run(cx, &mq::ack_sql(&db, &t), true).await {
                     Ok(c) => c.affected.unwrap_or(0),
                     // A user granted only the queue (not
@@ -687,6 +741,114 @@ impl PassSession {
                 Ok(Reply::Ok(1))
             }
         }
+    }
+}
+
+/// A queue call inside a transaction on a vhost whose messages are on the
+/// engine, when the transaction is not the engine's (it is MariaDB's: one
+/// transaction can't be atomic across the two).
+fn engine_txn_refused(call: &str) -> SprigError {
+    SprigError::standard(
+        1235,
+        *b"42000",
+        format!(
+            "This version of SprigDB doesn't yet support '{call}' inside a transaction that isn't \
+             on the engine for a vhost whose messages are stored on the engine; call it outside \
+             the transaction, or in a transaction started in an engine database"
+        ),
+    )
+}
+
+/// The engine store of vhost (`tenant`, `db_id`).
+fn engine_msg_store(
+    tenant: u64,
+    db_id: u32,
+) -> Result<Arc<sprig_queues::enginestore::EngineMsgStore>> {
+    crate::amqp::queues::engine_queues()
+        .map(|q| q.store(tenant, db_id))
+        .ok_or_else(|| {
+            SprigError::internal(
+                "queue messages of this vhost are stored on the SprigDB engine, which failed to \
+                 start on this node; see the node's log",
+            )
+        })
+}
+
+/// Adds a queue store write to the session's engine transaction.
+fn plain_write(t: &mut sprig_engine::txn::Txn, op: sprig_queues::enginestore::TxnOp) -> Result<()> {
+    use sprig_queues::enginestore::TxnOp;
+    match op {
+        TxnOp::Put(k, v) => t.add_plain_put(sprig_engine::Cf::Data, k, v),
+        TxnOp::Delete(k) => t.add_plain_delete(sprig_engine::Cf::Data, k),
+    }
+}
+
+impl PassSession {
+    /// `mq_ack` inside the session's engine transaction, for a message on
+    /// the engine: the delivery is held (the caller did it), and the
+    /// message's deletes join the transaction's commit. The commit hook
+    /// tells the owner how the transaction ended. A message no longer
+    /// stored is 39258, and the transaction is rolled back.
+    fn mq_engine_txn_ack(
+        &mut self,
+        engine: &Arc<sprig_queues::QueueEngine>,
+        session: u64,
+        v: &mq::SqlVhost,
+        t: sprig_queues::token::TokenData,
+    ) -> Result<Reply> {
+        let refuse = |v: &mq::SqlVhost, e: SprigError| {
+            v.release(&t, false);
+            Err(e)
+        };
+        if self.eng.txn.open_tx().is_none() {
+            return refuse(v, engine_txn_refused("sprig.mq_ack"));
+        }
+        // The right an acknowledgement needs: consuming the queue.
+        if !v.may_consume(&t) {
+            return refuse(
+                v,
+                sql_error(&MqError::new(
+                    MqCode::AccessRefused,
+                    "the user may not consume this queue",
+                )),
+            );
+        }
+        let store = match engine_msg_store(t.tenant, t.db) {
+            Ok(s) => s,
+            Err(e) => return refuse(v, e),
+        };
+        let ops = match store.txn_ack(t.id.queue, &t.msg_id) {
+            Ok(Some(ops)) => ops,
+            Ok(None) => {
+                v.release(&t, false);
+                let _ = self.eng.txn.rollback();
+                return Err(sql_error(&MqError::new(
+                    MqCode::AlreadySettled,
+                    "the message was already settled (acknowledged, or returned after its lease); the transaction is rolled back",
+                )));
+            }
+            Err(e) => return refuse(v, SprigError::internal(e.to_string())),
+        };
+        let Some(tx) = self.eng.txn.open_tx() else {
+            return refuse(v, engine_txn_refused("sprig.mq_ack"));
+        };
+        for op in ops {
+            if let Err(e) = plain_write(tx.engine_txn(), op) {
+                return refuse(v, e);
+            }
+        }
+        // The session's commit hook tells the owner how the transaction
+        // ended ([`PassSession::mq_after_request`]).
+        engine.note_txn_hold(session, t);
+        Ok(Reply::Ok(1))
+    }
+}
+
+impl PassSession {
+    /// Whether vhost database `db`'s messages are stored on the engine.
+    fn mq_on_engine(&self, db: &str) -> bool {
+        let tenant = self.tenant.as_deref().map_or(0, |t| t.tenant.0);
+        crate::amqp::queues::messages_on_engine(tenant) || self.engine_database_named(db)
     }
 }
 

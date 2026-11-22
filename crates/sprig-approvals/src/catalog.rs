@@ -1,23 +1,29 @@
-//! The tenant catalog's tables: the
-//! `approvals` migration module and [`CatalogRecStore`].
+//! The tenant catalog's recommendations and email subscriptions as the
+//! engine's catalog records ([`CatalogRecStore`]).
 //!
-//! Like the decision log, these tables are not versioned catalog state:
-//! they are read on demand and written in plain transactions, so a
-//! recommendation never invalidates a gateway's catalog cache. Catalogs
-//! bootstrapped before the module existed are migrated on first use.
+//! ```text
+//! m/approvals/recs/<rec id u64>              RecRow (the whole item, its due time)
+//! m/approvals/live/<fingerprint>             rec id (one live item per fingerprint)
+//! m/approvals/due/<due µs><rec id>           (empty: the due index)
+//! m/approvals/raise/<kind><target>           (empty: the raise's lock)
+//! m/approvals/subs/<user name>               Subscription
+//! ctr/rec                                    the last rec id handed out
+//! ```
 //!
-//! A row keeps the whole item in `body` (JSON); the other columns are
-//! projections for filtering, the due index and the one-live-item-per-
-//! fingerprint unique key. Times are microseconds since the epoch.
+//! Like the decision log, these are not versioned catalog state: they are
+//! read on demand and written in short engine transactions of their own,
+//! so a recommendation never invalidates a gateway's catalog cache. The
+//! live-fingerprint record stands for the unique key on live items' fingerprints
+//! (1062 when a second live item would take one); the raise locks its
+//! kind and target first, as `SELECT ... FOR UPDATE` on that index range
+//! did. Times are microseconds since the epoch.
 
 use std::sync::Arc;
 
-use mysql_async::prelude::Queryable;
-use mysql_async::{Conn, Row, TxOpts};
-use sprig_catalog::migrate::MigrateOpts;
-use sprig_catalog::{CatalogLocator, Migration, Migrator, Module, Phase};
+use serde::{Deserialize, Serialize};
+use sprig_catalog::records::{Pk, RecordStore, RecordTx, RowTable, next_ids};
+use sprig_catalog::{Migration, Module};
 use sprig_common::ids::TenantId;
-use sprig_common::names::quote;
 use sprig_common::{ErrorKind, Result, SprigCode, SprigError};
 
 use crate::machine::{self, Verdict, VerdictPlan};
@@ -28,74 +34,28 @@ use crate::store::{DUE_APPLYING_TIMEOUT, Filter, Raised, RecStore};
 /// The module name in the catalog's format records.
 pub const MODULE: &str = "approvals";
 
-/// `recommendations`.
-pub const DDL_RECOMMENDATIONS: &str = "CREATE TABLE IF NOT EXISTS recommendations (
-  rec_id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  kind           VARCHAR(32)     NOT NULL,
-  level          ENUM('table','database','tenant','dc','platform') NOT NULL,
-  state          ENUM('open','approved','applying','applied','failed','ignored',
-                      'snoozed','superseded','expired') NOT NULL,
-  advisory       BOOLEAN         NOT NULL,
-  db_id          INT UNSIGNED    NULL,
-  object_id      BIGINT UNSIGNED NULL,
-  target         VARCHAR(255)    NOT NULL,
-  fingerprint    VARCHAR(32)     NOT NULL,
-  notify_level   VARCHAR(40)     NOT NULL,
-  due_at_us      BIGINT          NULL,
-  created_at_us  BIGINT          NOT NULL,
-  updated_at_us  BIGINT          NOT NULL,
-  version        BIGINT UNSIGNED NOT NULL,
-  body           JSON            NOT NULL,
-  live_fp VARCHAR(32) AS (IF(state = 'open' OR state = 'approved' OR state = 'applying'
-                          OR state = 'snoozed', fingerprint, NULL)) PERSISTENT,
-  PRIMARY KEY (rec_id),
-  UNIQUE KEY uk_live_fp (live_fp),
-  KEY by_fp (fingerprint, updated_at_us),
-  KEY by_target (kind, target),
-  KEY by_state (state, updated_at_us),
-  KEY by_due (due_at_us),
-  KEY by_object (db_id, object_id, state)
-) ENGINE=InnoDB";
+/// Items by number.
+pub const RECS: RowTable = RowTable::new(MODULE, "recs");
+/// Live items by fingerprint.
+pub const LIVE: RowTable = RowTable::new(MODULE, "live");
+/// Items by due time.
+pub const DUE: RowTable = RowTable::new(MODULE, "due");
+/// The raise's lock per kind and target.
+pub const RAISE: RowTable = RowTable::new(MODULE, "raise");
+/// Email subscriptions by user.
+pub const SUBS: RowTable = RowTable::new(MODULE, "subs");
+/// The item counter.
+pub const COUNTER: &str = "rec";
 
-/// `approval_subscriptions`: email preferences.
-pub const DDL_SUBSCRIPTIONS: &str = "CREATE TABLE IF NOT EXISTS approval_subscriptions (
-  user_name    VARCHAR(128)    NOT NULL,
-  email        VARCHAR(254)    NOT NULL,
-  delivery     ENUM('immediate','digest','off') NOT NULL,
-  kinds        VARCHAR(255)    NOT NULL DEFAULT '*',
-  updated_at_us BIGINT         NOT NULL,
-  last_digest_us BIGINT        NULL,
-  PRIMARY KEY (user_name)
-) ENGINE=InnoDB";
+/// The module's MariaDB migrations: none, its rows are engine records.
+pub static APPROVALS_MIGRATIONS: &[Migration] = &[];
 
-/// The module's migrations.
-pub static APPROVALS_MIGRATIONS: &[Migration] = &[Migration {
-    format: 1,
-    phase: Phase::Expand,
-    name: "recommendations and approval_subscriptions",
-    statements: &[DDL_RECOMMENDATIONS, DDL_SUBSCRIPTIONS],
-}];
-
-/// The module, for [`Migrator::new`] and the catalog bootstrap hooks.
+/// The module, for [`sprig_catalog::Migrator::new`] and the catalog
+/// bootstrap hooks.
 pub const APPROVALS_MODULE: Module = Module {
     name: MODULE,
     migrations: APPROVALS_MIGRATIONS,
 };
-
-pub(crate) fn map_err(e: mysql_async::Error) -> SprigError {
-    match &e {
-        mysql_async::Error::Server(s) => {
-            let code = s.code;
-            SprigError::backend(
-                code,
-                *b"HY000",
-                format!("recommendations: statement failed ({code}): {}", s.message),
-            )
-            .with_source(e)
-        }
-        _ => SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e),
-    }
-}
 
 fn errno(e: &SprigError) -> Option<u16> {
     match e.kind {
@@ -104,128 +64,161 @@ fn errno(e: &SprigError) -> Option<u16> {
     }
 }
 
-const COLS: &str = "rec_id, body";
-
-/// SQL access to one catalog's tables.
-#[derive(Debug, Clone)]
-pub struct SqlRecs {
-    tenant: TenantId,
-    table: String,
-    subs: String,
+/// A stored item: the item and its next due time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecRow {
+    /// The item (its id's number is the record's key).
+    pub rec: Recommendation,
+    /// When its timers may fire next.
+    pub due_at_us: Option<Micros>,
 }
 
-impl SqlRecs {
-    /// The tables in catalog `schema` of `tenant`.
+/// An order-preserving key part for a signed time.
+fn at_key(us: i64) -> [u8; 8] {
+    #[allow(clippy::cast_sign_loss)]
+    let u = (us as u64) ^ (1u64 << 63);
+    u.to_be_bytes()
+}
+
+fn live(state: State) -> bool {
+    matches!(
+        state,
+        State::Open | State::Approved | State::Applying | State::Snoozed
+    )
+}
+
+fn closed(state: State) -> bool {
+    matches!(
+        state,
+        State::Applied | State::Failed | State::Ignored | State::Superseded | State::Expired
+    )
+}
+
+fn id_of(pk: &Pk) -> Option<u64> {
+    let b = pk.0.get(pk.0.len().checked_sub(8)?..)?;
+    <[u8; 8]>::try_from(b).ok().map(u64::from_be_bytes)
+}
+
+/// One tenant's items and subscriptions, in the caller's transaction.
+#[derive(Debug, Clone, Copy)]
+pub struct RecRecords {
+    tenant: TenantId,
+}
+
+impl RecRecords {
+    /// `tenant`'s.
     #[must_use]
-    pub fn new(tenant: TenantId, schema: &str) -> Self {
-        Self {
-            tenant,
-            table: format!("{}.recommendations", quote(schema)),
-            subs: format!("{}.approval_subscriptions", quote(schema)),
+    pub fn new(tenant: TenantId) -> Self {
+        Self { tenant }
+    }
+
+    fn decode(self, n: u64, r: RecRow) -> Recommendation {
+        let mut rec = r.rec;
+        rec.id = RecId::Tenant(self.tenant, n);
+        rec
+    }
+
+    /// Removes item `n`'s index entries for its stored form `old`.
+    async fn unindex(rec: &mut dyn RecordTx, n: u64, old: &RecRow) -> Result<()> {
+        let fp = Pk::new().bytes(old.rec.fingerprint.as_bytes());
+        if live(old.rec.state) && LIVE.get_for_update::<u64>(rec, &fp).await? == Some(n) {
+            LIVE.delete(rec, &fp).await?;
         }
+        if let Some(d) = old.due_at_us {
+            DUE.delete(rec, &Pk::new().raw(&at_key(d)).u64(n)).await?;
+        }
+        Ok(())
     }
 
-    fn decode(&self, mut row: Row) -> Result<Recommendation> {
-        let id: u64 = row
-            .take(0)
-            .ok_or_else(|| SprigError::internal("recommendations: no rec_id"))?;
-        let body: String = row
-            .take(1)
-            .ok_or_else(|| SprigError::internal("recommendations: no body"))?;
-        let mut r: Recommendation = serde_json::from_str(&body)
-            .map_err(|e| SprigError::internal(format!("recommendations: bad body of {id}: {e}")))?;
-        r.id = RecId::Tenant(self.tenant, id);
-        Ok(r)
-    }
-
-    fn params(r: &Recommendation) -> Result<Vec<mysql_async::Value>> {
-        let body = serde_json::to_string(r)
-            .map_err(|e| SprigError::internal(format!("recommendations: encode: {e}")))?;
-        Ok(vec![
-            r.kind.as_str().into(),
-            r.level.as_str().into(),
-            r.state.as_str().into(),
-            r.advisory.into(),
-            r.subject.db.map(|d| d.0).into(),
-            r.subject.object.map(|o| o.0).into(),
-            r.target.clone().into(),
-            r.fingerprint.clone().into(),
-            r.notify_level.to_string().into(),
-            machine::next_due(r, DUE_APPLYING_TIMEOUT).into(),
-            r.created_at_us.into(),
-            r.updated_at_us.into(),
-            r.version.into(),
-            body.into(),
-        ])
+    /// Writes item `n` as `r` with its index entries.
+    async fn store(rec: &mut dyn RecordTx, n: u64, r: &Recommendation) -> Result<()> {
+        if live(r.state) {
+            let fp = Pk::new().bytes(r.fingerprint.as_bytes());
+            // Locked: two writers making live items of one fingerprint are
+            // serial here, as the unique key made them.
+            match LIVE.get_for_update::<u64>(rec, &fp).await? {
+                Some(other) if other != n => {
+                    return Err(SprigError::backend(
+                        1062,
+                        *b"23000",
+                        format!("Duplicate entry '{}' for key 'uk_live_fp'", r.fingerprint),
+                    ));
+                }
+                Some(_) => {}
+                None => LIVE.put(rec, &fp, &n).await?,
+            }
+        }
+        let due = machine::next_due(r, DUE_APPLYING_TIMEOUT);
+        if let Some(d) = due {
+            DUE.put(rec, &Pk::new().raw(&at_key(d)).u64(n), &()).await?;
+        }
+        let row = RecRow {
+            rec: r.clone(),
+            due_at_us: due,
+        };
+        RECS.put(rec, &Pk::new().u64(n), &row).await
     }
 
     /// Inserts a new item; returns its number.
     ///
     /// # Errors
-    /// MariaDB's (1062 when a live item with the fingerprint exists).
-    pub async fn insert<Q: Queryable + Send>(&self, q: &mut Q, r: &Recommendation) -> Result<u64> {
-        let sql = format!(
-            "INSERT INTO {} (kind, level, state, advisory, db_id, object_id, target, fingerprint, \
-             notify_level, due_at_us, created_at_us, updated_at_us, version, body) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            self.table
-        );
-        let res = q.exec_iter(sql, Self::params(r)?).await.map_err(map_err)?;
-        let id = res.last_insert_id().unwrap_or(0);
-        res.drop_result().await.map_err(map_err)?;
-        Ok(id)
+    /// The record store's (a backend 1062 when a live item with the
+    /// fingerprint exists).
+    pub async fn insert(&self, rec: &mut dyn RecordTx, r: &Recommendation) -> Result<u64> {
+        let n = next_ids(rec, COUNTER, 1).await?;
+        Self::store(rec, n, r).await?;
+        Ok(n)
     }
 
     /// Writes `r` if its stored version is `expected`.
     ///
     /// # Errors
-    /// MariaDB's.
-    pub async fn update<Q: Queryable + Send>(
+    /// The record store's.
+    pub async fn update(
         &self,
-        q: &mut Q,
+        rec: &mut dyn RecordTx,
         r: &Recommendation,
         expected: u64,
     ) -> Result<bool> {
-        let sql = format!(
-            "UPDATE {} SET kind=?, level=?, state=?, advisory=?, db_id=?, object_id=?, target=?, \
-             fingerprint=?, notify_level=?, due_at_us=?, created_at_us=?, updated_at_us=?, \
-             version=?, body=? WHERE rec_id=? AND version=?",
-            self.table
-        );
-        let mut p = Self::params(r)?;
-        p.push(r.id.number().into());
-        p.push(expected.into());
-        let res = q.exec_iter(sql, p).await.map_err(map_err)?;
-        let n = res.affected_rows();
-        res.drop_result().await.map_err(map_err)?;
-        Ok(n == 1)
+        let n = r.id.number();
+        let pk = Pk::new().u64(n);
+        let Some(old) = RECS.get_for_update::<RecRow>(rec, &pk).await? else {
+            return Ok(false);
+        };
+        if old.rec.version != expected {
+            return Ok(false);
+        }
+        Self::unindex(rec, n, &old).await?;
+        Self::store(rec, n, r).await?;
+        Ok(true)
     }
 
     /// One item.
     ///
     /// # Errors
-    /// MariaDB's.
-    pub async fn get<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        n: u64,
-    ) -> Result<Option<Recommendation>> {
-        let sql = format!("SELECT {COLS} FROM {} WHERE rec_id = ?", self.table);
-        let row: Option<Row> = q.exec_first(sql, (n,)).await.map_err(map_err)?;
-        row.map(|r| self.decode(r)).transpose()
+    /// The record store's.
+    pub async fn get(&self, rec: &mut dyn RecordTx, n: u64) -> Result<Option<Recommendation>> {
+        Ok(RECS
+            .get::<RecRow>(rec, &Pk::new().u64(n))
+            .await?
+            .map(|r| self.decode(n, r)))
+    }
+
+    async fn all(&self, rec: &mut dyn RecordTx) -> Result<Vec<Recommendation>> {
+        let mut out = Vec::new();
+        for (pk, r) in RECS.scan::<RecRow>(rec, &Pk::new()).await? {
+            if let Some(n) = id_of(&pk) {
+                out.push(self.decode(n, r));
+            }
+        }
+        Ok(out)
     }
 
     /// Items passing `f`, newest first.
     ///
     /// # Errors
-    /// MariaDB's.
-    pub async fn list<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        f: &Filter,
-    ) -> Result<Vec<Recommendation>> {
-        let mut wh = Vec::new();
-        let mut args: Vec<mysql_async::Value> = Vec::new();
+    /// The record store's.
+    pub async fn list(&self, rec: &mut dyn RecordTx, f: &Filter) -> Result<Vec<Recommendation>> {
         let states: Vec<State> = if !f.states.is_empty() {
             f.states.clone()
         } else if f.all {
@@ -233,120 +226,116 @@ impl SqlRecs {
         } else {
             State::ALL.iter().copied().filter(|s| s.is_live()).collect()
         };
-        if !states.is_empty() {
-            wh.push(format!("state IN ({})", vec!["?"; states.len()].join(",")));
-            args.extend(states.iter().map(|s| s.as_str().into()));
-        }
-        if let Some(l) = f.level {
-            wh.push("level = ?".into());
-            args.push(l.as_str().into());
-        }
-        if let Some(d) = f.db {
-            wh.push("db_id = ?".into());
-            args.push(d.0.into());
-        }
-        if let Some(o) = f.object {
-            wh.push("object_id = ?".into());
-            args.push(o.0.into());
-        }
-        if !f.kinds.is_empty() {
-            let mut ors = Vec::new();
-            for k in &f.kinds {
-                ors.push("kind = ? OR kind LIKE ?".to_string());
-                args.push(k.clone().into());
-                args.push(format!("{k}.%").into());
-            }
-            wh.push(format!("({})", ors.join(" OR ")));
-        }
-        let wh = if wh.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", wh.join(" AND "))
-        };
-        let sql = format!(
-            "SELECT {COLS} FROM {} {wh} ORDER BY rec_id DESC LIMIT {}",
-            self.table,
-            f.limit()
-        );
-        let rows: Vec<Row> = q.exec(sql, args).await.map_err(map_err)?;
-        rows.into_iter().map(|r| self.decode(r)).collect()
+        let mut out: Vec<Recommendation> = self
+            .all(rec)
+            .await?
+            .into_iter()
+            .rev()
+            .filter(|r| states.is_empty() || states.contains(&r.state))
+            .filter(|r| f.level.is_none_or(|l| r.level == l))
+            .filter(|r| f.db.is_none_or(|d| r.subject.db == Some(d)))
+            .filter(|r| f.object.is_none_or(|o| r.subject.object == Some(o)))
+            .filter(|r| {
+                f.kinds.is_empty()
+                    || f.kinds.iter().any(|k| {
+                        let kind = r.kind.as_str();
+                        kind == k
+                            || kind
+                                .strip_prefix(k.as_str())
+                                .is_some_and(|x| x.starts_with('.'))
+                    })
+            })
+            .collect();
+        out.truncate(f.limit());
+        Ok(out)
     }
 
-    /// Items due at `now`.
+    /// Items due at `now`, soonest first.
     ///
     /// # Errors
-    /// MariaDB's.
-    pub async fn due<Q: Queryable + Send>(
+    /// The record store's.
+    pub async fn due(
         &self,
-        q: &mut Q,
+        rec: &mut dyn RecordTx,
         now: Micros,
         limit: usize,
     ) -> Result<Vec<Recommendation>> {
-        let sql = format!(
-            "SELECT {COLS} FROM {} WHERE due_at_us <= ? ORDER BY due_at_us LIMIT {limit}",
-            self.table
-        );
-        let rows: Vec<Row> = q.exec(sql, (now,)).await.map_err(map_err)?;
-        rows.into_iter().map(|r| self.decode(r)).collect()
+        let lo = DUE.prefix();
+        let hi = DUE.key(&Pk::new().raw(&at_key(now.saturating_add(1))));
+        let base = lo.len();
+        let entries = rec.scan(&lo, &hi, limit).await?;
+        let mut out = Vec::with_capacity(entries.len());
+        for (k, _) in entries {
+            if let Some(n) = id_of(&Pk(k[base..].to_vec()))
+                && let Some(r) = self.get(rec, n).await?
+            {
+                out.push(r);
+            }
+        }
+        Ok(out)
     }
 
-    /// Deletes closed items changed before `before`.
+    /// Deletes up to 1000 closed items changed before `before` (an ignored
+    /// item with no end to its ignoring stays).
     ///
     /// # Errors
-    /// MariaDB's.
-    pub async fn purge<Q: Queryable + Send>(&self, q: &mut Q, before: Micros) -> Result<u64> {
-        let sql = format!(
-            "DELETE FROM {} WHERE state IN ('applied','failed','ignored','superseded','expired') \
-             AND updated_at_us < ? AND NOT (state = 'ignored' AND JSON_VALUE(body, '$.ignore.until_us') IS NULL) \
-             LIMIT 1000",
-            self.table
-        );
-        let res = q.exec_iter(sql, (before,)).await.map_err(map_err)?;
-        let n = res.affected_rows();
-        res.drop_result().await.map_err(map_err)?;
+    /// The record store's.
+    pub async fn purge(&self, rec: &mut dyn RecordTx, before: Micros) -> Result<u64> {
+        let mut n = 0u64;
+        for (pk, r) in RECS.scan::<RecRow>(rec, &Pk::new()).await? {
+            if n >= 1000 {
+                break;
+            }
+            let item = &r.rec;
+            let forever = item.state == State::Ignored
+                && serde_json::to_value(item)
+                    .ok()
+                    .and_then(|v| v.get("ignore").and_then(|i| i.get("until_us")).cloned())
+                    .is_none_or(|u| u.is_null());
+            if closed(item.state) && item.updated_at_us < before && !forever {
+                let Some(id) = id_of(&pk) else { continue };
+                Self::unindex(rec, id, &r).await?;
+                RECS.delete(rec, &pk).await?;
+                n += 1;
+            }
+        }
         Ok(n)
     }
 
-    /// The raise, in one transaction on `conn`.
+    /// The raise, in `rec`'s transaction.
     ///
     /// # Errors
-    /// MariaDB's; 1062 or 1213 when another raise of the same advice won
-    /// (the caller retries).
+    /// The record store's; 1062 or 39071 when another raise of the same
+    /// advice won (the caller retries).
     pub async fn raise(
         &self,
-        conn: &mut Conn,
+        rec: &mut dyn RecordTx,
         p: &Proposal,
         policy: &Policy,
         ancestry: &[TenantId],
         now: Micros,
     ) -> Result<Raised> {
-        let mut tx = conn
-            .start_transaction(TxOpts::default())
-            .await
-            .map_err(map_err)?;
         let fp = p.fingerprint();
-        let sql = format!(
-            "SELECT {COLS} FROM {} WHERE kind = ? AND target = ? AND live_fp IS NOT NULL FOR UPDATE",
-            self.table
-        );
-        let rows: Vec<Row> = tx
-            .exec(sql, (p.kind.as_str(), &p.target))
-            .await
-            .map_err(map_err)?;
-        let same = rows
-            .into_iter()
-            .map(|r| self.decode(r))
-            .collect::<Result<Vec<_>>>()?;
+        // The raises of one kind and target are serial.
+        let lock = Pk::new()
+            .bytes(p.kind.as_str().as_bytes())
+            .bytes(p.target.as_bytes());
+        RAISE.get_for_update::<()>(rec, &lock).await?;
+        RAISE.put(rec, &lock, &()).await?;
+        let everything = self.all(rec).await?;
+        let same: Vec<Recommendation> = everything
+            .iter()
+            .filter(|r| r.kind == p.kind && r.target == p.target && live(r.state))
+            .cloned()
+            .collect();
         let ignored = if same.iter().any(|r| r.fingerprint == fp) {
             None
         } else {
-            let sql = format!(
-                "SELECT {COLS} FROM {} WHERE fingerprint = ? AND state = 'ignored' \
-                 ORDER BY updated_at_us DESC LIMIT 1",
-                self.table
-            );
-            let row: Option<Row> = tx.exec_first(sql, (&fp,)).await.map_err(map_err)?;
-            row.map(|r| self.decode(r)).transpose()?
+            everything
+                .iter()
+                .filter(|r| r.fingerprint == fp && r.state == State::Ignored)
+                .max_by_key(|r| r.updated_at_us)
+                .cloned()
         };
         let plan = machine::raise(
             p,
@@ -361,11 +350,11 @@ impl SqlRecs {
         for w in &plan.writes {
             let mut w = w.clone();
             if w.id.number() == 0 {
-                let n = self.insert(&mut tx, &w).await?;
+                let n = self.insert(rec, &w).await?;
                 w.id = RecId::Tenant(self.tenant, n);
             } else {
                 let expected = same.iter().find(|x| x.id == w.id).map_or(0, |x| x.version);
-                if !self.update(&mut tx, &w, expected).await? {
+                if !self.update(rec, &w, expected).await? {
                     return Err(SprigError::new(
                         SprigCode::CatalogConflict,
                         "recommendation changed during the raise",
@@ -374,7 +363,6 @@ impl SqlRecs {
             }
             stored.push(w);
         }
-        tx.commit().await.map_err(map_err)?;
         let mut out = Raised::from_plan(&plan, &stored);
         if plan.verdict == VerdictPlan::Suppressed
             && let Some(i) = ignored
@@ -384,65 +372,49 @@ impl SqlRecs {
         Ok(out)
     }
 
-    /// Email subscriptions.
+    /// Email subscriptions, by user.
     ///
     /// # Errors
-    /// MariaDB's.
-    pub async fn subscriptions<Q: Queryable + Send>(&self, q: &mut Q) -> Result<Vec<Subscription>> {
-        let sql = format!(
-            "SELECT user_name, email, delivery, kinds, last_digest_us FROM {} ORDER BY user_name",
-            self.subs
-        );
-        let rows: Vec<(String, String, String, String, Option<i64>)> =
-            q.query(sql).await.map_err(map_err)?;
-        Ok(rows
-            .into_iter()
-            .map(|(user, email, delivery, kinds, last)| Subscription {
-                user,
-                email,
-                delivery,
-                kinds,
-                last_digest_us: last,
-            })
-            .collect())
+    /// The record store's.
+    pub async fn subscriptions(&self, rec: &mut dyn RecordTx) -> Result<Vec<Subscription>> {
+        SUBS.rows(rec, &Pk::new()).await
     }
 
-    /// Sets one user's subscription (`delivery = off` keeps the row).
+    /// Sets one user's subscription (`delivery = off` keeps the row; the
+    /// last digest time stays).
     ///
     /// # Errors
-    /// MariaDB's.
-    pub async fn set_subscription<Q: Queryable + Send>(
+    /// The record store's.
+    pub async fn set_subscription(
         &self,
-        q: &mut Q,
+        rec: &mut dyn RecordTx,
         s: &Subscription,
         now: Micros,
     ) -> Result<()> {
-        let sql = format!(
-            "INSERT INTO {} (user_name, email, delivery, kinds, updated_at_us) VALUES (?,?,?,?,?) \
-             ON DUPLICATE KEY UPDATE email = VALUES(email), delivery = VALUES(delivery), \
-             kinds = VALUES(kinds), updated_at_us = VALUES(updated_at_us)",
-            self.subs
-        );
-        q.exec_drop(sql, (&s.user, &s.email, &s.delivery, &s.kinds, now))
-            .await
-            .map_err(map_err)
+        let pk = Pk::new().bytes(s.user.as_bytes());
+        let last = SUBS
+            .get_for_update::<Subscription>(rec, &pk)
+            .await?
+            .and_then(|o| o.last_digest_us);
+        let row = Subscription {
+            last_digest_us: last,
+            updated_at_us: Some(now),
+            ..s.clone()
+        };
+        SUBS.put(rec, &pk, &row).await
     }
 
     /// Records a sent digest.
     ///
     /// # Errors
-    /// MariaDB's.
-    pub async fn digest_sent<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        user: &str,
-        now: Micros,
-    ) -> Result<()> {
-        let sql = format!(
-            "UPDATE {} SET last_digest_us = ? WHERE user_name = ?",
-            self.subs
-        );
-        q.exec_drop(sql, (now, user)).await.map_err(map_err)
+    /// The record store's.
+    pub async fn digest_sent(&self, rec: &mut dyn RecordTx, user: &str, now: Micros) -> Result<()> {
+        let pk = Pk::new().bytes(user.as_bytes());
+        if let Some(mut s) = SUBS.get_for_update::<Subscription>(rec, &pk).await? {
+            s.last_digest_us = Some(now);
+            SUBS.put(rec, &pk, &s).await?;
+        }
+        Ok(())
     }
 }
 
@@ -461,16 +433,18 @@ pub struct Subscription {
     /// The last digest sent.
     #[serde(default)]
     pub last_digest_us: Option<i64>,
+    /// When it was last set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at_us: Option<i64>,
 }
 
 fn star() -> String {
     "*".into()
 }
 
-/// A tenant's recommendations in its catalog, reached through a
-/// [`CatalogLocator`].
+/// A tenant's recommendations in its catalog records.
 pub struct CatalogRecStore {
-    locator: Arc<dyn CatalogLocator>,
+    records: Arc<dyn RecordStore>,
     tenant: TenantId,
 }
 
@@ -485,50 +459,46 @@ impl std::fmt::Debug for CatalogRecStore {
 impl CatalogRecStore {
     /// `tenant`'s store.
     #[must_use]
-    pub fn new(locator: Arc<dyn CatalogLocator>, tenant: TenantId) -> Self {
-        Self { locator, tenant }
+    pub fn new(records: Arc<dyn RecordStore>, tenant: TenantId) -> Self {
+        Self { records, tenant }
     }
 
-    /// A writer connection and the tables, migrating the module on first
-    /// use.
+    fn recs(&self) -> RecRecords {
+        RecRecords::new(self.tenant)
+    }
+
+    async fn begin(&self) -> Result<Box<dyn RecordTx>> {
+        self.records.begin(self.tenant).await
+    }
+
+    /// Email subscriptions, by user.
     ///
     /// # Errors
-    /// The locator's and MariaDB's.
-    pub async fn open(&self) -> Result<(Conn, SqlRecs)> {
-        let ep = self.locator.writer(self.tenant).await?;
-        let conn = ep.pool.get_conn().await.map_err(map_err)?;
-        Ok((conn, SqlRecs::new(self.tenant, ep.store.schema())))
+    /// The record store's.
+    pub async fn subscriptions(&self) -> Result<Vec<Subscription>> {
+        let mut tx = self.begin().await?;
+        self.recs().subscriptions(&mut *tx).await
     }
 
-    async fn migrate(&self, conn: &mut Conn) -> Result<()> {
-        let ep = self.locator.writer(self.tenant).await?;
-        // The catalog must exist: a dropped one (a deleted tenant) isn't
-        // made again without its owner mark.
-        Migrator::new(&[APPROVALS_MODULE])?
-            .run(conn, ep.store.schema(), &MigrateOpts::existing())
-            .await?;
-        Ok(())
+    /// Sets one user's subscription.
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn set_subscription(&self, s: &Subscription, now: Micros) -> Result<()> {
+        let mut tx = self.begin().await?;
+        self.recs().set_subscription(&mut *tx, s, now).await?;
+        tx.commit().await
     }
-}
 
-/// Runs `$body` with `$c` (a connection) and `$s` (the tables), migrating
-/// the module and retrying once when the table is missing.
-macro_rules! with_conn {
-    ($self:ident, |$c:ident, $s:ident| $body:expr) => {{
-        let (mut conn, $s) = $self.open().await?;
-        let first = {
-            let $c = &mut conn;
-            $body
-        };
-        match first {
-            Err(e) if errno(&e) == Some(1146) => {
-                $self.migrate(&mut conn).await?;
-                let $c = &mut conn;
-                $body
-            }
-            r => r,
-        }
-    }};
+    /// Records a sent digest.
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn digest_sent(&self, user: &str, now: Micros) -> Result<()> {
+        let mut tx = self.begin().await?;
+        self.recs().digest_sent(&mut *tx, user, now).await?;
+        tx.commit().await
+    }
 }
 
 #[async_trait::async_trait]
@@ -542,10 +512,19 @@ impl RecStore for CatalogRecStore {
     ) -> Result<Raised> {
         let mut last = None;
         for _ in 0..3 {
-            let r = with_conn!(self, |c, s| s.raise(c, p, policy, ancestry, now).await);
+            let r = async {
+                let mut tx = self.begin().await?;
+                let out = self
+                    .recs()
+                    .raise(&mut *tx, p, policy, ancestry, now)
+                    .await?;
+                tx.commit().await?;
+                Ok(out)
+            }
+            .await;
             match r {
                 Err(e)
-                    if matches!(errno(&e), Some(1062 | 1213 | 1205))
+                    if matches!(errno(&e), Some(1062))
                         || e.code() == Some(SprigCode::CatalogConflict) =>
                 {
                     last = Some(e);
@@ -557,23 +536,34 @@ impl RecStore for CatalogRecStore {
     }
 
     async fn get(&self, n: u64) -> Result<Option<Recommendation>> {
-        with_conn!(self, |c, s| s.get(c, n).await)
+        let mut tx = self.begin().await?;
+        self.recs().get(&mut *tx, n).await
     }
 
     async fn list(&self, f: &Filter) -> Result<Vec<Recommendation>> {
-        with_conn!(self, |c, s| s.list(c, f).await)
+        let mut tx = self.begin().await?;
+        self.recs().list(&mut *tx, f).await
     }
 
-    async fn put(&self, r: &Recommendation, expected: u64) -> Result<bool> {
-        with_conn!(self, |c, s| s.update(c, r, expected).await)
+    async fn put(&self, rec: &Recommendation, expected: u64) -> Result<bool> {
+        let mut tx = self.begin().await?;
+        let ok = self.recs().update(&mut *tx, rec, expected).await?;
+        if ok {
+            tx.commit().await?;
+        }
+        Ok(ok)
     }
 
     async fn due(&self, now: Micros, limit: usize) -> Result<Vec<Recommendation>> {
-        with_conn!(self, |c, s| s.due(c, now, limit).await)
+        let mut tx = self.begin().await?;
+        self.recs().due(&mut *tx, now, limit).await
     }
 
     async fn purge(&self, before: Micros) -> Result<u64> {
-        with_conn!(self, |c, s| s.purge(c, before).await)
+        let mut tx = self.begin().await?;
+        let n = self.recs().purge(&mut *tx, before).await?;
+        tx.commit().await?;
+        Ok(n)
     }
 }
 

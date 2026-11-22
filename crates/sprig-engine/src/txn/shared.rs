@@ -335,6 +335,19 @@ impl TxnShared {
         durability: Option<Durability>,
         also_delete: Option<&[u8]>,
     ) -> Result<(Ts, DurableTicket)> {
+        self.commit_writes_noted(path, txn, writes, durability, also_delete, &[])
+    }
+
+    /// [`TxnShared::commit_writes`], with log notes in the same entry.
+    pub(crate) fn commit_writes_noted(
+        &self,
+        path: &dyn CommitPath,
+        txn: TxnId,
+        writes: Vec<(Bytes, Option<Bytes>)>,
+        durability: Option<Durability>,
+        also_delete: Option<&[u8]>,
+        notes: &[super::transaction::Extra],
+    ) -> Result<(Ts, DurableTicket)> {
         let size: usize = writes
             .iter()
             .map(|(k, v)| k.len() + 24 + v.as_ref().map_or(0, Bytes::len))
@@ -351,6 +364,13 @@ impl TxnShared {
             }
             if let Some(key) = also_delete {
                 p.delete(Cf::Data, key);
+            }
+            for n in notes {
+                match n {
+                    super::transaction::Extra::Note(b) => p.note(b),
+                    super::transaction::Extra::Put(cf, k, v) => p.put(*cf, k, v),
+                    super::transaction::Extra::Delete(cf, k) => p.delete(*cf, k),
+                }
             }
             let ticket = path.propose(p.into_bytes(), durability)?;
             self.overlay

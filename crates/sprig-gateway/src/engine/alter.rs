@@ -741,7 +741,6 @@ pub(crate) fn mysql_clauses(a: &Alter, p: &Plan) -> Result<(), SprigError> {
     Ok(())
 }
 
-
 /// MariaDB 11.8's rules for `ALGORITHM` and `LOCK` (observed): `NOCOPY` is
 /// an algorithm too; a column type the table must be copied for refuses
 /// every algorithm but `COPY` (1846), making a column `NOT NULL` isn't
@@ -751,7 +750,10 @@ pub(crate) fn mysql_clauses(a: &Alter, p: &Plan) -> Result<(), SprigError> {
 pub(crate) fn mariadb_clauses(a: &Alter, p: &Plan, tightens: bool) -> Result<(), SprigError> {
     let algorithm = a.algorithm.as_deref().unwrap_or("DEFAULT");
     let lock = a.lock.as_deref().unwrap_or("DEFAULT");
-    if !matches!(algorithm, "DEFAULT" | "INSTANT" | "INPLACE" | "NOCOPY" | "COPY") {
+    if !matches!(
+        algorithm,
+        "DEFAULT" | "INSTANT" | "INPLACE" | "NOCOPY" | "COPY"
+    ) {
         return Err(SprigError::standard(
             1800,
             *b"HY000",
@@ -771,20 +773,25 @@ pub(crate) fn mariadb_clauses(a: &Alter, p: &Plan, tightens: bool) -> Result<(),
     if p.copies_type {
         return Err(unsupported(
             1846,
-            format!("ALGORITHM={algorithm} is not supported. Reason: Cannot change column type. Try ALGORITHM=COPY"),
+            format!(
+                "ALGORITHM={algorithm} is not supported. Reason: Cannot change column type. Try ALGORITHM=COPY"
+            ),
         ));
     }
     if a.specs.contains(&Spec::AddCheck) {
         return Err(unsupported(
             1845,
-            format!("ALGORITHM={algorithm} is not supported for this operation. Try ALGORITHM=COPY"),
+            format!(
+                "ALGORITHM={algorithm} is not supported for this operation. Try ALGORITHM=COPY"
+            ),
         ));
     }
     if algorithm == "INSTANT" {
         if tightens {
             return Err(unsupported(
                 1845,
-                "ALGORITHM=INSTANT is not supported for this operation. Try ALGORITHM=INPLACE".into(),
+                "ALGORITHM=INSTANT is not supported for this operation. Try ALGORITHM=INPLACE"
+                    .into(),
             ));
         }
         let reason = a.specs.iter().find_map(|s| match s {

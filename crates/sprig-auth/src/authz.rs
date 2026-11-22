@@ -7,7 +7,7 @@
 //! - [`privilege`]: actions as stable bits, levels, the MySQL and MariaDB
 //!   privilege names;
 //! - [`store`]: the `authz` catalog module (`roles`, `role_edges`,
-//!   `privileges`) with typed rows and writes;
+//!   `privileges`, as catalog records) with typed rows and writes;
 //! - [`state`]: [`AuthzExtension`], loading [`AuthzState`] into every
 //!   catalog snapshot at each auth version;
 //! - [`compile`]: [`CompiledPrivileges`] and the checks;
@@ -17,7 +17,8 @@
 //!   own shard schemas, and their reconciler;
 //! - [`definers`]: stored code runs as a tenant account, never as
 //!   `sprig_ctl`, and code created before that is moved;
-//! - [`migrate`]: bringing an existing tenant's catalog to the module.
+//! - [`migrate`]: a no-op kept for its callers (the modules' rows are
+//!   engine records, at the newest format from the start).
 //!
 //! The gateway glues these to statements (`sprig-gateway`'s
 //! `tenant::authz`), and `sprig-sql` parses the statements
@@ -46,40 +47,19 @@ pub use privilege::{Action, ActionSet, Level, ObjectType};
 pub use state::{AuthzExtension, AuthzState};
 pub use store::{AUTHZ_MODULE, Grantee, PrivTarget};
 
-use sprig_catalog::migrate::MigrateOpts;
-use sprig_catalog::{CatalogLocator, ChangeOpts, MariaCatalog, Migrator, VersionKind};
+use sprig_catalog::AuthCatalog;
+use sprig_common::Result;
 use sprig_common::ids::TenantId;
-use sprig_common::{Result, SprigCode, SprigError};
 
-use crate::store::AUTH_MODULE;
-
-/// Migrates `tenant`'s catalog to the `auth` and `authz` modules (both
-/// idempotent), then commits an empty auth change so every gateway reloads
-/// the tenant with the module (an unmigrated catalog allows everything,
-/// see [`AuthzState::unmigrated`]). Returns the auth version.
+/// Brings `tenant`'s catalog to the `auth` and `authz` modules: nothing to
+/// do, since their rows are engine records that start at the newest
+/// format. Kept for its callers; returns 0 (no auth change), as the
+/// migration did for a catalog already current.
 ///
 /// # Errors
-/// 39070 if the catalog is unreachable; the migrator's and the change's.
-pub async fn migrate(
-    locator: &dyn CatalogLocator,
-    catalog: &MariaCatalog,
-    tenant: TenantId,
-) -> Result<u64> {
-    let ep = locator.writer(tenant).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(|e| {
-        SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-    })?;
-    let report = Migrator::new(&[AUTH_MODULE, AUTHZ_MODULE])?
-        .run(&mut conn, ep.store.schema(), &MigrateOpts::existing())
-        .await?;
-    drop(conn);
-    if report.applied.is_empty() {
-        // Already current (the migrator's fast path): no auth change, so
-        // checking every tenant once per process reloads nothing.
-        return Ok(0);
-    }
-    let c = catalog
-        .change_with(tenant, VersionKind::Auth, ChangeOpts::default())
-        .await?;
-    c.commit().await
+/// None.
+#[allow(clippy::unused_async, clippy::unnecessary_wraps)] // the callers await it, as they did the migration
+pub async fn migrate(catalog: &AuthCatalog, tenant: TenantId) -> Result<u64> {
+    let _ = (catalog, tenant);
+    Ok(0)
 }

@@ -234,9 +234,9 @@ impl StudioState {
             && matches!(login.source(), LoginSource::Catalog(_))
         {
             let store: Arc<dyn SessionStore> =
-                Arc::new(CatalogSessions::new(Arc::clone(login), t.catalog.clone()));
+                Arc::new(CatalogSessions::new(Arc::clone(login), t.auth.clone()));
             self.tokens = Arc::new(Tokens::new(Arc::clone(self.tokens.keys()), store));
-            self.factors = Some(sprig_auth::mfa::FactorStore::new(t.catalog.clone()));
+            self.factors = Some(sprig_auth::mfa::FactorStore::new(t.auth.clone()));
         }
         self.tenants = tenants;
         self

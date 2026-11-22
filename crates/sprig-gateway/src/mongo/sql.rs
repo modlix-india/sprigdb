@@ -274,6 +274,13 @@ impl SqlSession {
         self.exec.row_policy_docs()
     }
 
+    /// Whether the tenant's logical database `name` is placed on the
+    /// storage engine (its collections are then the engine store's).
+    #[must_use]
+    pub fn engine_database(&self, name: &str) -> bool {
+        self.exec.engine_database(name)
+    }
+
     /// Whether the session holds `action` on the whole tenant
     /// (`$currentOp`'s `allUsers` needs `PROCESS`); `None` when it can't
     /// tell.

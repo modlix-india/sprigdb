@@ -16,13 +16,18 @@ use super::{
 };
 
 /// One clause, as read.
+#[allow(clippy::large_enum_variant)] // a few per statement
 enum Clause {
     DropColumn(String, bool),
     DropKey(String, bool),
     DropPrimary,
     DropFk(String, bool),
     DropConstraint(String, bool),
-    Change { old: String, col: RawCol, if_exists: bool },
+    Change {
+        old: String,
+        col: RawCol,
+        if_exists: bool,
+    },
     RenameColumn(String, String),
     SetDefault(String, Default),
     DropDefault(String),
@@ -86,7 +91,11 @@ fn create_index(p: &mut P<'_>, cs: &str) -> Result<Vec<Clause>, Fail> {
         p.want("EXISTS")?;
     }
     let name = p.ident()?;
-    let using = if p.eat("USING") || p.eat("TYPE") { Some(p.ident()?.to_ascii_uppercase()) } else { None };
+    let using = if p.eat("USING") || p.eat("TYPE") {
+        Some(p.ident()?.to_ascii_uppercase())
+    } else {
+        None
+    };
     p.want("ON")?;
     p.qualified()?;
     let mut k = key_body(p, kind, false)?;
@@ -97,7 +106,10 @@ fn create_index(p: &mut P<'_>, cs: &str) -> Result<Vec<Clause>, Fail> {
     while skip_algorithm_lock(p)? {}
     super::end(p)?;
     let _ = cs;
-    Ok(vec![Clause::Add(Raw { keys: vec![k], ..Raw::default() })])
+    Ok(vec![Clause::Add(Raw {
+        keys: vec![k],
+        ..Raw::default()
+    })])
 }
 
 fn drop_index(p: &mut P<'_>) -> Result<Vec<Clause>, Fail> {
@@ -114,7 +126,11 @@ fn drop_index(p: &mut P<'_>) -> Result<Vec<Clause>, Fail> {
     p.qualified()?;
     while skip_algorithm_lock(p)? {}
     super::end(p)?;
-    Ok(vec![if name.eq_ignore_ascii_case("PRIMARY") { Clause::DropPrimary } else { Clause::DropKey(name, ie) }])
+    Ok(vec![if name.eq_ignore_ascii_case("PRIMARY") {
+        Clause::DropPrimary
+    } else {
+        Clause::DropKey(name, ie)
+    }])
 }
 
 fn if_exists(p: &mut P<'_>) -> Result<bool, Fail> {
@@ -137,6 +153,7 @@ fn if_not_exists(p: &mut P<'_>) -> Result<bool, Fail> {
 }
 
 /// `FIRST` / `AFTER x` after a column definition.
+#[allow(clippy::option_option)] // no place, `FIRST`, or `AFTER x`
 fn place(p: &mut P<'_>) -> Result<Option<Option<String>>, Fail> {
     if p.eat("FIRST") {
         Ok(Some(None))
@@ -177,7 +194,16 @@ fn read_alter(p: &mut P<'_>, cs: &str) -> Result<Vec<Clause>, Fail> {
                     c.place = place(p)?;
                     out.push(Clause::AddColumns(vec![c], ine));
                 }
-            } else if p.is("INDEX") || p.is("KEY") || p.is("UNIQUE") || p.is("PRIMARY") || p.is("FOREIGN") || p.is("CHECK") || p.is("CONSTRAINT") || p.is("FULLTEXT") || p.is("SPATIAL") {
+            } else if p.is("INDEX")
+                || p.is("KEY")
+                || p.is("UNIQUE")
+                || p.is("PRIMARY")
+                || p.is("FOREIGN")
+                || p.is("CHECK")
+                || p.is("CONSTRAINT")
+                || p.is("FULLTEXT")
+                || p.is("SPATIAL")
+            {
                 // `ADD INDEX IF NOT EXISTS name`.
                 let save = p.i;
                 if (p.is("INDEX") || p.is("KEY")) && p.is_at(1, "IF") {
@@ -197,7 +223,14 @@ fn read_alter(p: &mut P<'_>, cs: &str) -> Result<Vec<Clause>, Fail> {
                 let mut cols = Vec::new();
                 let mut raw = Raw::default();
                 loop {
-                    if p.is("INDEX") || p.is("KEY") || p.is("UNIQUE") || p.is("PRIMARY") || p.is("FOREIGN") || p.is("CHECK") || p.is("CONSTRAINT") {
+                    if p.is("INDEX")
+                        || p.is("KEY")
+                        || p.is("UNIQUE")
+                        || p.is("PRIMARY")
+                        || p.is("FOREIGN")
+                        || p.is("CHECK")
+                        || p.is("CONSTRAINT")
+                    {
                         element(p, &mut raw, cs)?;
                     } else {
                         cols.push(column(p, cs)?);
@@ -223,7 +256,11 @@ fn read_alter(p: &mut P<'_>, cs: &str) -> Result<Vec<Clause>, Fail> {
             } else if p.eat("INDEX") || p.eat("KEY") {
                 let ie = if_exists(p)?;
                 let n = p.ident()?;
-                out.push(if n.eq_ignore_ascii_case("PRIMARY") { Clause::DropPrimary } else { Clause::DropKey(n, ie) });
+                out.push(if n.eq_ignore_ascii_case("PRIMARY") {
+                    Clause::DropPrimary
+                } else {
+                    Clause::DropKey(n, ie)
+                });
             } else if p.eat("FOREIGN") {
                 p.want("KEY")?;
                 let ie = if_exists(p)?;
@@ -242,14 +279,22 @@ fn read_alter(p: &mut P<'_>, cs: &str) -> Result<Vec<Clause>, Fail> {
             let ie = if_exists(p)?;
             let mut c = column(p, cs)?;
             c.place = place(p)?;
-            out.push(Clause::Change { old: c.col.name.clone(), col: c, if_exists: ie });
+            out.push(Clause::Change {
+                old: c.col.name.clone(),
+                col: c,
+                if_exists: ie,
+            });
         } else if p.eat("CHANGE") {
             p.eat("COLUMN");
             let ie = if_exists(p)?;
             let old = p.ident()?;
             let mut c = column(p, cs)?;
             c.place = place(p)?;
-            out.push(Clause::Change { old, col: c, if_exists: ie });
+            out.push(Clause::Change {
+                old,
+                col: c,
+                if_exists: ie,
+            });
         } else if p.eat("RENAME") {
             if p.eat("COLUMN") {
                 let a = p.ident()?;
@@ -260,7 +305,9 @@ fn read_alter(p: &mut P<'_>, cs: &str) -> Result<Vec<Clause>, Fail> {
                 p.want("TO")?;
                 out.push(Clause::RenameKey(a, p.ident()?));
             } else {
-                return Err(refuse("ALTER TABLE that renames the table among other changes (rename it in a statement of its own)"));
+                return Err(refuse(
+                    "ALTER TABLE that renames the table among other changes (rename it in a statement of its own)",
+                ));
             }
         } else if p.eat("ALTER") {
             if p.eat("INDEX") || p.eat("KEY") {
@@ -304,7 +351,11 @@ fn read_alter(p: &mut P<'_>, cs: &str) -> Result<Vec<Clause>, Fail> {
                 p.want("SET")?;
             }
             let cs = p.ident()?;
-            let co = if p.eat("COLLATE") { Some(p.ident()?) } else { None };
+            let co = if p.eat("COLLATE") {
+                Some(p.ident()?)
+            } else {
+                None
+            };
             out.push(Clause::Convert(cs, co));
         } else if p.eat("FORCE") {
             out.push(Clause::Nothing);
@@ -312,7 +363,23 @@ fn read_alter(p: &mut P<'_>, cs: &str) -> Result<Vec<Clause>, Fail> {
             p.i += 1;
             p.want("KEYS")?;
             out.push(Clause::Nothing);
-        } else if p.is("ORDER") || p.is("DISCARD") || p.is("IMPORT") || p.is("PARTITION") || p.is("REMOVE") || p.is("COALESCE") || p.is("REORGANIZE") || p.is("EXCHANGE") || p.is("ANALYZE") || p.is("CHECK") && !p.is_at(1, "(") || p.is("OPTIMIZE") || p.is("REBUILD") || p.is("REPAIR") || p.is("TRUNCATE") || p.is("WITH") || p.is("WITHOUT") {
+        } else if p.is("ORDER")
+            || p.is("DISCARD")
+            || p.is("IMPORT")
+            || p.is("PARTITION")
+            || p.is("REMOVE")
+            || p.is("COALESCE")
+            || p.is("REORGANIZE")
+            || p.is("EXCHANGE")
+            || p.is("ANALYZE")
+            || p.is("CHECK") && !p.is_at(1, "(")
+            || p.is("OPTIMIZE")
+            || p.is("REBUILD")
+            || p.is("REPAIR")
+            || p.is("TRUNCATE")
+            || p.is("WITH")
+            || p.is("WITHOUT")
+        {
             return Err(refuse("this ALTER TABLE clause"));
         } else {
             let before = p.i;
@@ -355,71 +422,139 @@ fn run(d: &mut Def, clauses: Vec<Clause>, cx: &Ctx) -> Result<(), Fail> {
                     d.cols.remove(i);
                 }
                 None if *ie => {}
-                None => return Err(err(1091, "42000", format!("Can't DROP COLUMN `{n}`; check that it exists"))),
+                None => {
+                    return Err(err(
+                        1091,
+                        "42000",
+                        format!("Can't DROP COLUMN `{n}`; check that it exists"),
+                    ));
+                }
             },
             Clause::DropKey(n, ie) => match d.key(n) {
                 Some(i) => {
                     d.keys.remove(i);
                 }
                 None if *ie => {}
-                None => return Err(err(1091, "42000", format!("Can't DROP INDEX `{n}`; check that it exists"))),
+                None => {
+                    return Err(err(
+                        1091,
+                        "42000",
+                        format!("Can't DROP INDEX `{n}`; check that it exists"),
+                    ));
+                }
             },
             Clause::DropPrimary => match d.keys.iter().position(|k| k.kind == KeyKind::Primary) {
                 Some(i) => {
                     d.keys.remove(i);
                 }
-                None => return Err(err(1091, "42000", "Can't DROP INDEX `PRIMARY`; check that it exists")),
-            },
-            Clause::DropFk(n, ie) => match d.fks.iter().position(|f| f.name.eq_ignore_ascii_case(n)) {
-                Some(i) => {
-                    d.fks.remove(i);
+                None => {
+                    return Err(err(
+                        1091,
+                        "42000",
+                        "Can't DROP INDEX `PRIMARY`; check that it exists",
+                    ));
                 }
-                None if *ie => {}
-                None => return Err(err(1091, "42000", format!("Can't DROP FOREIGN KEY `{n}`; check that it exists"))),
             },
+            Clause::DropFk(n, ie) => {
+                match d.fks.iter().position(|f| f.name.eq_ignore_ascii_case(n)) {
+                    Some(i) => {
+                        d.fks.remove(i);
+                    }
+                    None if *ie => {}
+                    None => {
+                        return Err(err(
+                            1091,
+                            "42000",
+                            format!("Can't DROP FOREIGN KEY `{n}`; check that it exists"),
+                        ));
+                    }
+                }
+            }
             Clause::DropConstraint(n, ie) => {
                 if let Some(i) = d.checks.iter().position(|c| c.name.eq_ignore_ascii_case(n)) {
                     d.checks.remove(i);
                 } else if let Some(i) = d.fks.iter().position(|f| f.name.eq_ignore_ascii_case(n)) {
                     d.fks.remove(i);
-                } else if let Some(i) = d.keys.iter().position(|k| k.kind == KeyKind::Unique && k.name.eq_ignore_ascii_case(n)) {
+                } else if let Some(i) = d
+                    .keys
+                    .iter()
+                    .position(|k| k.kind == KeyKind::Unique && k.name.eq_ignore_ascii_case(n))
+                {
                     d.keys.remove(i);
                 } else if !*ie {
-                    return Err(err(1091, "42000", format!("Can't DROP CONSTRAINT `{n}`; check that it exists")));
+                    return Err(err(
+                        1091,
+                        "42000",
+                        format!("Can't DROP CONSTRAINT `{n}`; check that it exists"),
+                    ));
                 }
             }
             _ => {}
         }
     }
     if d.cols.is_empty() {
-        return Err(err(1090, "42000", "You can't delete all columns with ALTER TABLE; use DROP TABLE instead"));
+        return Err(err(
+            1090,
+            "42000",
+            "You can't delete all columns with ALTER TABLE; use DROP TABLE instead",
+        ));
     }
     for gone in &dropped_cols {
         for c in &d.cols {
             if c.generated.as_ref().is_some_and(|(g, _)| reads(g, gone)) {
-                return Err(err(1054, "42S22", format!("Unknown column '{gone}' in 'GENERATED ALWAYS AS'")));
+                return Err(err(
+                    1054,
+                    "42S22",
+                    format!("Unknown column '{gone}' in 'GENERATED ALWAYS AS'"),
+                ));
             }
             if c.check.as_ref().is_some_and(|ch| reads(ch, gone)) {
-                return Err(err(1054, "42S22", format!("Unknown column '{gone}' in 'CHECK'")));
+                return Err(err(
+                    1054,
+                    "42S22",
+                    format!("Unknown column '{gone}' in 'CHECK'"),
+                ));
             }
             if matches!(&c.default, Some(Default::Expr(e)) if reads(e, gone)) {
-                return Err(err(1054, "42S22", format!("Unknown column '{gone}' in 'DEFAULT'")));
+                return Err(err(
+                    1054,
+                    "42S22",
+                    format!("Unknown column '{gone}' in 'DEFAULT'"),
+                ));
             }
         }
-        if let Some(f) = d.fks.iter().find(|f| f.cols.iter().any(|c| c.eq_ignore_ascii_case(gone))) {
-            return Err(err(1828, "HY000", format!("Cannot drop column '{gone}': needed in a foreign key constraint '{}'", f.name)));
+        if let Some(f) = d
+            .fks
+            .iter()
+            .find(|f| f.cols.iter().any(|c| c.eq_ignore_ascii_case(gone)))
+        {
+            return Err(err(
+                1828,
+                "HY000",
+                format!(
+                    "Cannot drop column '{gone}': needed in a foreign key constraint '{}'",
+                    f.name
+                ),
+            ));
         }
         // A table check on only dropped columns goes with them.
         let mut keep = Vec::new();
         for ch in std::mem::take(&mut d.checks) {
             let mut used = Vec::new();
             expr::columns(&ch.expr, &mut used);
-            let all_gone = !used.is_empty() && used.iter().all(|u| dropped_cols.iter().any(|g| g.eq_ignore_ascii_case(u)));
+            let all_gone = !used.is_empty()
+                && used
+                    .iter()
+                    .all(|u| dropped_cols.iter().any(|g| g.eq_ignore_ascii_case(u)));
             if all_gone {
                 continue;
             }
             if used.iter().any(|u| u.eq_ignore_ascii_case(gone)) {
-                return Err(err(1054, "42S22", format!("Unknown column '{gone}' in 'CHECK'")));
+                return Err(err(
+                    1054,
+                    "42S22",
+                    format!("Unknown column '{gone}' in 'CHECK'"),
+                ));
             }
             keep.push(ch);
         }
@@ -434,22 +569,40 @@ fn run(d: &mut Def, clauses: Vec<Clause>, cx: &Ctx) -> Result<(), Fail> {
     let mut new_keys: Vec<Key> = Vec::new();
     for (ci, c) in clauses.iter().enumerate() {
         match c {
-            Clause::Change { old, col, if_exists } => {
+            Clause::Change {
+                old,
+                col,
+                if_exists,
+            } => {
                 let Some(i) = d.col(old) else {
                     if *if_exists {
                         continue;
                     }
-                    return Err(err(1054, "42S22", format!("Unknown column '{old}' in '{}'", d.name)));
+                    return Err(err(
+                        1054,
+                        "42S22",
+                        format!("Unknown column '{old}' in '{}'", d.name),
+                    ));
                 };
                 let mut rc = col.clone();
                 let newname = rc.col.name.clone();
                 if !newname.eq_ignore_ascii_case(&d.cols[i].name) && d.col(&newname).is_some() {
-                    return Err(err(1060, "42S21", format!("Duplicate column name '{newname}'")));
+                    return Err(err(
+                        1060,
+                        "42S21",
+                        format!("Duplicate column name '{newname}'"),
+                    ));
                 }
                 let oldname = d.cols[i].name.clone();
                 // Put the new definition in place: resolve it as a column of
                 // its own, then swap it in.
-                let mut scratch = Def { cols: Vec::new(), keys: Vec::new(), fks: Vec::new(), checks: Vec::new(), ..d.clone() };
+                let mut scratch = Def {
+                    cols: Vec::new(),
+                    keys: Vec::new(),
+                    fks: Vec::new(),
+                    checks: Vec::new(),
+                    ..d.clone()
+                };
                 rc.place = None;
                 let mut keys = Vec::new();
                 let pos = rc.place.clone();
@@ -467,7 +620,11 @@ fn run(d: &mut Def, clauses: Vec<Clause>, cx: &Ctx) -> Result<(), Fail> {
             }
             Clause::RenameColumn(a, b) => {
                 let Some(i) = d.col(a) else {
-                    return Err(err(1054, "42S22", format!("Unknown column '{a}' in '{}'", d.name)));
+                    return Err(err(
+                        1054,
+                        "42S22",
+                        format!("Unknown column '{a}' in '{}'", d.name),
+                    ));
                 };
                 if !a.eq_ignore_ascii_case(b) && d.col(b).is_some() {
                     return Err(err(1060, "42S21", format!("Duplicate column name '{b}'")));
@@ -478,7 +635,11 @@ fn run(d: &mut Def, clauses: Vec<Clause>, cx: &Ctx) -> Result<(), Fail> {
             }
             Clause::SetDefault(n, dv) => {
                 let Some(i) = d.col(n) else {
-                    return Err(err(1054, "42S22", format!("Unknown column '{n}' in '{}'", d.name)));
+                    return Err(err(
+                        1054,
+                        "42S22",
+                        format!("Unknown column '{n}' in '{}'", d.name),
+                    ));
                 };
                 if d.cols[i].generated.is_some() {
                     return Err(err(1064, "42000", "generated column default"));
@@ -487,13 +648,21 @@ fn run(d: &mut Def, clauses: Vec<Clause>, cx: &Ctx) -> Result<(), Fail> {
             }
             Clause::DropDefault(n) => {
                 let Some(i) = d.col(n) else {
-                    return Err(err(1054, "42S22", format!("Unknown column '{n}' in '{}'", d.name)));
+                    return Err(err(
+                        1054,
+                        "42S22",
+                        format!("Unknown column '{n}' in '{}'", d.name),
+                    ));
                 };
                 d.cols[i].default = None;
             }
             Clause::SetVisible(n, v) => {
                 let Some(i) = d.col(n) else {
-                    return Err(err(1054, "42S22", format!("Unknown column '{n}' in '{}'", d.name)));
+                    return Err(err(
+                        1054,
+                        "42S22",
+                        format!("Unknown column '{n}' in '{}'", d.name),
+                    ));
                 };
                 d.cols[i].invisible = !v;
             }
@@ -525,7 +694,13 @@ fn run(d: &mut Def, clauses: Vec<Clause>, cx: &Ctx) -> Result<(), Fail> {
             None => 0,
             Some(a) => match d.col(a) {
                 Some(k) => k + 1,
-                None => return Err(err(1054, "42S22", format!("Unknown column '{a}' in '{}'", d.name))),
+                None => {
+                    return Err(err(
+                        1054,
+                        "42S22",
+                        format!("Unknown column '{a}' in '{}'", d.name),
+                    ));
+                }
             },
         };
         d.cols.insert(at, col);
@@ -538,7 +713,11 @@ fn run(d: &mut Def, clauses: Vec<Clause>, cx: &Ctx) -> Result<(), Fail> {
         match c {
             Clause::RenameKey(a, b) => {
                 let Some(i) = d.key(&a) else {
-                    return Err(err(1176, "42000", format!("Key '{a}' doesn't exist in table '{}'", d.name)));
+                    return Err(err(
+                        1176,
+                        "42000",
+                        format!("Key '{a}' doesn't exist in table '{}'", d.name),
+                    ));
                 };
                 if !a.eq_ignore_ascii_case(&b) && d.key(&b).is_some() {
                     return Err(err(1061, "42000", format!("Duplicate key name '{b}'")));
@@ -547,7 +726,11 @@ fn run(d: &mut Def, clauses: Vec<Clause>, cx: &Ctx) -> Result<(), Fail> {
             }
             Clause::KeyIgnored(n, ig) => {
                 let Some(i) = d.key(&n) else {
-                    return Err(err(1176, "42000", format!("Key '{n}' doesn't exist in table '{}'", d.name)));
+                    return Err(err(
+                        1176,
+                        "42000",
+                        format!("Key '{n}' doesn't exist in table '{}'", d.name),
+                    ));
                 };
                 d.keys[i].ignored = ig;
             }
@@ -569,7 +752,11 @@ fn run(d: &mut Def, clauses: Vec<Clause>, cx: &Ctx) -> Result<(), Fail> {
                     return Err(err(1286, "42000", format!("Unknown storage engine '{e}'")));
                 }
                 if o.charset.is_some() || o.collate.is_some() {
-                    let spec = super::types::CsSpec { charset: o.charset.clone(), collate: o.collate.clone(), ..super::types::CsSpec::default() };
+                    let spec = super::types::CsSpec {
+                        charset: o.charset.clone(),
+                        collate: o.collate.clone(),
+                        ..super::types::CsSpec::default()
+                    };
                     d.cs = super::types::resolve_cs(&spec, (&d.cs.0, &d.cs.1))?;
                 }
                 if let Some(a) = o.auto_increment {
@@ -589,7 +776,11 @@ fn run(d: &mut Def, clauses: Vec<Clause>, cx: &Ctx) -> Result<(), Fail> {
                 }
             }
             Clause::Convert(cs, co) => {
-                let spec = super::types::CsSpec { charset: Some(cs), collate: co, ..super::types::CsSpec::default() };
+                let spec = super::types::CsSpec {
+                    charset: Some(cs),
+                    collate: co,
+                    ..super::types::CsSpec::default()
+                };
                 let to = super::types::resolve_cs(&spec, (&d.cs.0, &d.cs.1))?;
                 for c in &mut d.cols {
                     if c.ty.cs.is_some() && !c.ty.json {
@@ -613,14 +804,14 @@ fn rename_everywhere(d: &mut Def, old: &str, new: &str) {
     for k in &mut d.keys {
         for p in &mut k.parts {
             if p.col.eq_ignore_ascii_case(old) {
-                p.col = new.to_owned();
+                new.clone_into(&mut p.col);
             }
         }
     }
     for f in &mut d.fks {
         for c in &mut f.cols {
             if c.eq_ignore_ascii_case(old) {
-                *c = new.to_owned();
+                new.clone_into(c);
             }
         }
     }

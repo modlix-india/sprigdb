@@ -179,6 +179,14 @@ impl Txn {
         if xid.len() > MAX_XID_LEN {
             return Err(SprigError::internal("XID too long"));
         }
+        if self.has_plain_writes() {
+            return Err(SprigError::standard(
+                1235,
+                *b"42000",
+                "This version of SprigDB doesn't yet support XA PREPARE of a transaction that \
+                 published or acknowledged queue messages",
+            ));
+        }
         let path = self.path.clone();
         let shared = path.shared();
         shared.recover_once(&*path);

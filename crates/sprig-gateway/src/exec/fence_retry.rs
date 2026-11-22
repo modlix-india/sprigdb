@@ -316,13 +316,20 @@ impl PassSession {
         req: Request,
         out: &mut dyn ResultSink,
     ) -> Result<Result<ExecSummary>> {
-        let t0 = Instant::now();
+        // The poll's clock reading: a retry's time budget is coarse.
+        let t0 = sprig_common::time::poll::now();
         let mut attempts = 0u32;
         let mut counted = false;
         loop {
+            // Whether the tenant's home and map moved since the last
+            // statement: when not, what was found then still holds.
+            let quiet = match self.tenant.as_deref() {
+                Some(ts) => self.placement_memo.begin(&ts.services().locator, ts.tenant),
+                None => false,
+            };
             // Tenant sessions wait out a mover's hold, a promotion,
             // and follow a move.
-            self.follow_tenant().await?;
+            self.follow_tenant(quiet).await?;
             // Writes of tenants homed here need the DC's
             // permit, and so do their acknowledgements.
             let gate = self.dc_write_gate(&req).await?;
@@ -334,32 +341,42 @@ impl PassSession {
                 counted = true;
             }
             let memo = &mut self.placement_memo;
-            let watch = self.tenant.as_deref().map(|ts| {
-                let locator = std::sync::Arc::clone(&ts.services().locator);
-                // Kept per map generation.
-                let token = memo.maps_token(&locator, ts.tenant);
-                (locator, ts.tenant, ts.map(), token)
-            });
+            let watch = match self.tenant.as_deref() {
+                Some(ts) => {
+                    // Kept per map generation; read back only if a fence
+                    // stops the statement.
+                    memo.keep_token(&ts.services().locator, ts.tenant, quiet);
+                    true
+                }
+                None => false,
+            };
             let in_trx =
                 self.router.in_txn() || self.bs.as_ref().is_some_and(|b| b.pins().in_transaction());
-            let mut fs = FenceSink::new(out, watch.is_some());
+            let mut fs = FenceSink::new(out, watch);
             let r = match gate {
                 Some(f) => {
                     let mut gated = crate::failover::GatedSink::new(&mut fs, f);
-                    Box::pin(self.run_request(cx, req.clone(), &mut gated)).await
+                    Box::pin(self.run_request(cx, &req, &mut gated)).await
                 }
-                None => Box::pin(self.run_request(cx, req.clone(), &mut fs)).await,
+                None => Box::pin(self.run_request(cx, &req, &mut fs)).await,
             };
             let (sent, held) = (fs.sent(), fs.take_held());
             drop(fs);
             let (err, via_sink) = match (held, &r) {
                 (Some(e), _) => (e, true),
-                (None, Err(e)) if watch.is_some() && !sent && fence_code(e) => (copy(e), false),
+                (None, Err(e)) if watch && !sent && fence_code(e) => (copy(e), false),
                 _ => return Ok(r),
             };
-            let Some((locator, tenant, map, token)) = watch else {
+            let (Some(ts), Some(token)) =
+                (self.tenant.as_deref(), self.placement_memo.last_token())
+            else {
                 return Ok(r);
             };
+            let (locator, tenant, map) = (
+                std::sync::Arc::clone(&ts.services().locator),
+                ts.tenant,
+                ts.map(),
+            );
             let reply = if met_fence(&locator, tenant, &map, &token, &err).await {
                 if in_trx {
                     metrics::counter!("sprig_gateway_fence_errors_total", "outcome" => "txn_lost")

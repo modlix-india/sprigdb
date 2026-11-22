@@ -545,7 +545,11 @@ async fn sink_dead(
             "Access denied; you need (at least one of) the SPRIG_SINK_ADMIN privilege(s) for this operation, or to own the sink",
         ));
     }
-    let store = sprig_sinks::store::SinksStore::new(schema.clone());
+    // Sink rows are engine catalog records.
+    let (Some(svc), Some(tid)) = (&core.studio.tenants, caller.principal.tenant) else {
+        return Err(invalid("these views need a tenant login"));
+    };
+    let store = sprig_sinks::store::SinksStore::new(Arc::clone(&svc.records), tid);
     let id = sprig_sinks::model::SinkId(sink_id);
     if let Some((verb, body)) = act {
         let ids: Vec<u64> = body
@@ -571,10 +575,10 @@ async fn sink_dead(
         } else {
             "discarded"
         };
-        let n = store.mark_dead(&mut conn, id, &ids, state).await?;
+        let n = store.mark_dead(id, &ids, state).await?;
         return Ok(json_response(200, &json!({"marked": n, "state": state})));
     }
-    let rows = store.dead_letters(&mut conn, id, MAX_DEAD).await?;
+    let rows = store.dead_letters(id, MAX_DEAD).await?;
     let list: Vec<Value> = rows
         .into_iter()
         .map(|r| {

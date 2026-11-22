@@ -6,7 +6,8 @@
 //! - [`topology`]: the model and routing (every exchange type,
 //!   exchange-to-exchange bindings, alternate exchanges, policies);
 //! - [`store`]: what owners write ([`store::MsgStore`]), served by
-//!   [`maria`] (the `__sprig_q*` shard tables) and [`memstore`];
+//!   [`maria`] (the `__sprig_q*` shard tables), [`enginestore`] (the
+//!   node's storage engine) and [`memstore`];
 //! - [`catalog`]: the `mq_*` catalog tables, their migration and the
 //!   snapshot loader;
 //! - [`owner`]: the queue owner: head cache, credit dispatch, unacked
@@ -37,6 +38,7 @@
 
 pub mod catalog;
 pub mod engine;
+pub mod enginestore;
 mod idle;
 pub mod maria;
 pub mod mem;

@@ -4,19 +4,19 @@
 //! transaction.
 //!
 //! The tables are small (a tenant has users and roles, not rows), so every
-//! load reads them whole; the cache reloads a tenant when its auth version
-//! moves, which every gateway learns from the directory watch (the same
-//! path settings changes take). A catalog whose module isn't
-//! migrated yet loads as [`AuthzState::unmigrated`]: every user then holds
-//! everything, as before authorization existed, until the gateway migrates it (see
-//! [`super::migrate`]).
+//! load reads them whole from the snapshot's catalog records; the cache
+//! reloads a tenant when its auth version moves, which every gateway learns
+//! from the directory watch (the same path settings changes take). The
+//! rows are engine records, so every load is of a migrated module at its
+//! newest format; [`AuthzState::unmigrated`] (every user holds everything)
+//! remains for snapshots without the module.
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use sprig_catalog::{
-    CatalogExtension, ExtState, Migration, SnapshotTx, TenantCatalog, VersionKind,
+    CatalogExtension, ExtState, Migration, RecordTx, SnapshotTx, TenantCatalog, VersionKind,
 };
 use sprig_common::Result;
 use sprig_common::ids::{RoleId, UserId};
@@ -100,8 +100,8 @@ impl AuthzState {
         self.migrated
     }
 
-    /// Whether the catalog is at the module's latest format (format 2's
-    /// data step gives `WATCH` where `SELECT` was granted).
+    /// Whether the catalog is at the module's latest format (always, for
+    /// a loaded state: the rows start at it).
     #[must_use]
     pub fn is_current(&self) -> bool {
         self.migrated && self.format >= super::store::AUTHZ_FORMAT
@@ -220,15 +220,19 @@ impl CatalogExtension for AuthzExtension {
         _since: Option<u64>,
         _prev: Option<&Arc<dyn ExtState>>,
     ) -> Result<Arc<dyn ExtState>> {
-        let store = AuthzStore::new(tx.schema());
-        let conn = tx.conn();
-        if !store.migrated(conn).await? {
-            return Ok(Arc::new(AuthzState::unmigrated()));
-        }
-        let rows = store.load(conn).await?;
-        let format = store.format(conn).await?;
-        Ok(Arc::new(AuthzState::new(rows).with_format(format)))
+        Ok(Arc::new(load_state(tx.records()?).await?))
     }
+}
+
+/// The tenant's [`AuthzState`] from its catalog records: every role, role
+/// edge and privilege, at the module's format.
+///
+/// # Errors
+/// The store's, or `Internal` for a malformed row.
+pub async fn load_state(tx: &mut dyn RecordTx) -> Result<AuthzState> {
+    let store = AuthzStore::new();
+    let rows = store.load(tx).await?;
+    Ok(AuthzState::new(rows).with_format(store.format()))
 }
 
 /// `prev` as an [`AuthzState`], for tests.
@@ -236,4 +240,59 @@ impl CatalogExtension for AuthzExtension {
 pub fn downcast(prev: &Arc<dyn ExtState>) -> Option<&AuthzState> {
     let any: &dyn Any = &**prev;
     any.downcast_ref::<AuthzState>()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use sprig_catalog::RecordStore;
+    use sprig_catalog::records::mem::MemRecords;
+    use sprig_common::ids::TenantId;
+
+    use super::super::privilege::{Action, ActionSet};
+    use super::super::store::PrivTarget;
+    use super::*;
+
+    #[tokio::test]
+    async fn every_load_is_migrated_and_current() {
+        let recs = MemRecords::new();
+        let mut tx = recs.begin(TenantId(42)).await.unwrap();
+        let empty = load_state(&mut *tx).await.unwrap();
+        assert!(empty.is_migrated() && empty.is_current());
+        assert!(empty.rows().privileges.is_empty());
+        let store = AuthzStore::new();
+        let alice = Grantee::User(UserId(7));
+        let sel = ActionSet::of(&[Action::Select]);
+        store
+            .grant(&mut *tx, alice, &PrivTarget::Tenant, sel, None)
+            .await
+            .unwrap();
+        let r = store
+            .create_role(&mut *tx, "reader", "%", None)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .grant_role(&mut *tx, alice, r, false, None)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = recs.begin(TenantId(42)).await.unwrap();
+        let st = load_state(&mut *tx).await.unwrap();
+        assert!(st.is_current());
+        assert_eq!(st.privileges_of(alice).count(), 1);
+        assert_eq!(st.granted_roles(UserId(7)), vec![r]);
+        assert_eq!(st.role_named("reader", "%"), Some(r));
+        // Another tenant's records are its own.
+        let mut other = recs.begin(TenantId(43)).await.unwrap();
+        assert!(
+            load_state(&mut *other)
+                .await
+                .unwrap()
+                .rows()
+                .roles
+                .is_empty()
+        );
+    }
 }

@@ -120,17 +120,12 @@ async fn live_run_builds_the_view_and_explains() {
         .with_url(c2.clone(), &url)
         .unwrap();
     let pools: Arc<dyn ClusterPools> = Arc::new(pools);
-    let locator = crate::catalogs::ShardMapLocator::new(
-        Arc::clone(&dcs),
-        Arc::clone(&pools),
-        crate::catalogs::default_naming(),
-    );
     let b = BalancerLoop::new(
         dc,
         ClusterRegistry::new(Arc::clone(&global), Arc::clone(&dcs)).unwrap(),
         Arc::clone(&dcs),
         pools,
-        Arc::new(locator),
+        Arc::new(sprig_catalog::records::mem::MemRecords::new()),
         Directory::new(global),
         None,
         Arc::new(sprig_common::time::SystemClock),

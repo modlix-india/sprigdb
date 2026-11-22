@@ -389,25 +389,14 @@ pub async fn statement(
         .user_id
         .ok_or_else(|| invalid("an internal session can't manage policies"))?;
     let svc = Arc::clone(ts.services());
-    // The module's tables, created on first use (DDL: outside the change).
-    {
-        let ep = svc.locator.writer(ts.tenant).await?;
-        let store = RlsStore::new(ep.store.schema());
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-        })?;
-        if !store.migrated(&mut conn).await? {
-            store.migrate(&mut conn).await?;
-        }
-    }
     let mut change = svc
-        .catalog
+        .auth
         .change_with(ts.tenant, VersionKind::Auth, ChangeOpts::default())
         .await?;
     let version = change.version();
     let r: Result<bool> = async {
-        let (core, q) = change.tx().parts();
-        let store = RlsStore::new(core.schema());
+        let q = change.tx().records();
+        let store = RlsStore::new();
         match stmt {
             PolicyStmt::Create {
                 name,
@@ -582,12 +571,12 @@ pub async fn statement(
         }
         Ok(false) => {
             let _ = change.rollback().await;
-            let _ = svc.catalog.settle(ts.tenant, VersionKind::Auth).await;
+            let _ = svc.auth.settle(ts.tenant, VersionKind::Auth).await;
             Ok(PolicyAnswer::Unchanged)
         }
         Err(e) => {
             let _ = change.rollback().await;
-            let _ = svc.catalog.settle(ts.tenant, VersionKind::Auth).await;
+            let _ = svc.auth.settle(ts.tenant, VersionKind::Auth).await;
             Err(e)
         }
     }
@@ -616,13 +605,13 @@ pub async fn recompile_policies(
     }
     let svc = Arc::clone(ts.services());
     let mut change = svc
-        .catalog
+        .auth
         .change_with(ts.tenant, VersionKind::Auth, ChangeOpts::default())
         .await?;
     let version = change.version();
     let r: Result<Vec<ObjectId>> = async {
-        let (core, q) = change.tx().parts();
-        let store = RlsStore::new(core.schema());
+        let q = change.tx().records();
+        let store = RlsStore::new();
         let mut touched = Vec::new();
         for p in &stale {
             if store.recompiled(q, p, version).await? {
@@ -654,12 +643,12 @@ pub async fn recompile_policies(
         }
         Ok(_) => {
             let _ = change.rollback().await;
-            let _ = svc.catalog.settle(ts.tenant, VersionKind::Auth).await;
+            let _ = svc.auth.settle(ts.tenant, VersionKind::Auth).await;
             Ok(Vec::new())
         }
         Err(e) => {
             let _ = change.rollback().await;
-            let _ = svc.catalog.settle(ts.tenant, VersionKind::Auth).await;
+            let _ = svc.auth.settle(ts.tenant, VersionKind::Auth).await;
             Err(e)
         }
     }
@@ -1989,6 +1978,11 @@ pub fn enforcement_digest(svc: &super::TenantServices, cat: &TenantCatalog) -> u
 /// Whether table `object`'s reads go through its policy view.
 #[must_use]
 pub fn views_on(svc: &super::TenantServices, cat: &TenantCatalog, object: ObjectId) -> bool {
+    // A storage-engine table has no policy view: its reads are filtered by
+    // the rewrite.
+    if crate::engine::catalog::of(cat).is_some_and(|e| e.tables.contains_key(&object)) {
+        return false;
+    }
     cat.objects
         .get(object)
         .is_some_and(|o| enforcement(svc, cat, o.db_id) == "views")

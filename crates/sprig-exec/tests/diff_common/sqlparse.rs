@@ -381,7 +381,12 @@ impl Parser<'_> {
             // Only NOT IN, NOT BETWEEN and NOT LIKE continue a predicate.
             let save = (self.lex.i, self.tok.clone());
             self.advance()?;
-            if self.word_is("IN") || self.word_is("BETWEEN") || self.word_is("LIKE") {
+            if self.word_is("IN")
+                || self.word_is("BETWEEN")
+                || self.word_is("LIKE")
+                || self.word_is("REGEXP")
+                || self.word_is("RLIKE")
+            {
                 true
             } else {
                 self.lex.i = save.0;
@@ -401,6 +406,11 @@ impl Parser<'_> {
             self.expect_word("AND")?;
             let hi = self.predicate()?;
             return Ok(Expr::Between(b(left), b(lo), b(hi), not));
+        }
+        if self.eat_word("REGEXP")? || self.eat_word("RLIKE")? {
+            let pattern = self.bit_or()?;
+            let m = Expr::func("REGEXP", vec![left, pattern]);
+            return Ok(if not { Expr::Not(b(m)) } else { m });
         }
         if self.eat_word("LIKE")? {
             let pattern = self.unary()?;

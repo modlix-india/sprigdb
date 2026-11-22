@@ -183,9 +183,9 @@ fn pos_rows(rows: Vec<(u32, String, u64, String, i64)>) -> Vec<PosRow> {
         .collect()
 }
 
-/// The positions of `graph` written after its `graphs` row last changed
-/// (its mirror mode): what an applier that serves the graph under that
-/// mode wrote.
+/// The positions of `graph` written after its catalog row last changed
+/// (its mirror mode, at `changed_ms` since the epoch): what an applier
+/// that serves the graph under that mode wrote.
 ///
 /// # Errors
 /// A backend error.
@@ -193,15 +193,19 @@ pub async fn read_pos_since_change<Q: Queryable + Send>(
     q: &mut Q,
     catalog: &str,
     graph: u64,
+    changed_ms: u64,
 ) -> Result<Vec<PosRow>> {
     let c = quote(catalog);
     let rows: Vec<(u32, String, u64, String, i64)> = q
-        .query(format!(
-            "SELECT p.shard_id, p.cluster, p.epoch, p.gtid_pos, \
-             TIMESTAMPDIFF(MICROSECOND, p.applied_at, UTC_TIMESTAMP(6)) DIV 1000 \
-             FROM {c}.{POS_TABLE} p JOIN {c}.graphs g ON g.graph_id = p.graph_id \
-             WHERE p.graph_id = {graph} AND p.applied_at > g.updated_at"
-        ))
+        .exec(
+            format!(
+                "SELECT p.shard_id, p.cluster, p.epoch, p.gtid_pos, \
+                 TIMESTAMPDIFF(MICROSECOND, p.applied_at, UTC_TIMESTAMP(6)) DIV 1000 \
+                 FROM {c}.{POS_TABLE} p \
+                 WHERE p.graph_id = {graph} AND p.applied_at > FROM_UNIXTIME(? / 1000)"
+            ),
+            (changed_ms,),
+        )
         .await
         .map_err(backend_error)?;
     Ok(pos_rows(rows))
@@ -281,18 +285,22 @@ pub async fn clear_pos<Q: Queryable + Send>(q: &mut Q, catalog: &str, graph: u64
     .map_err(backend_error)
 }
 
-/// Deletes the position rows of graphs the catalog no longer has: a graph
-/// dropped while an applier still served it, whose next position write
-/// put the rows back after `DROP GRAPH` deleted them. The number deleted.
+/// Deletes the position rows of graphs the catalog no longer has (all
+/// but `live`, the graphs the catalog has now): a graph dropped while an
+/// applier still served it, whose next position write put the rows back
+/// after `DROP GRAPH` deleted them. The number deleted.
 ///
 /// # Errors
-/// A backend error (1146 before the catalog's migration 3).
-pub async fn clear_orphan_pos(q: &mut Conn, catalog: &str) -> Result<u64> {
+/// A backend error (1146 before the catalog's graph tables exist).
+pub async fn clear_orphan_pos(q: &mut Conn, catalog: &str, live: &[u64]) -> Result<u64> {
     let c = quote(catalog);
-    let sql = format!(
-        "{NO_BINLOG}DELETE FROM {c}.{POS_TABLE} \
-         WHERE graph_id NOT IN (SELECT graph_id FROM {c}.graphs)"
-    );
+    let keep = if live.is_empty() {
+        String::new()
+    } else {
+        let ids: Vec<String> = live.iter().map(u64::to_string).collect();
+        format!(" WHERE graph_id NOT IN ({})", ids.join(", "))
+    };
+    let sql = format!("{NO_BINLOG}DELETE FROM {c}.{POS_TABLE}{keep}");
     if q.query_drop(sql.as_str()).await.is_err() {
         // Without `BINLOG ADMIN` (or `SUPER`): logged, as the writes.
         q.query_drop(sql.replacen(NO_BINLOG, "", 1))

@@ -1,184 +1,36 @@
-//! The auth tables of the tenant catalog, as the `auth` migration module, with typed rows and
-//! access.
-//!
-//! The module registers with `sprig-catalog`'s migrator ([`AUTH_MODULE`],
-//! or through [`AuthExtension`](crate::cache::AuthExtension)), so every
-//! tenant catalog gets these tables with its own: `sprig-auth` depends on
-//! `sprig-catalog`, never the reverse.
-//!
-//! Format 1 creates `users`, `verifiers` and `login_state` exactly as
-//! the catalog's schema defines them, plus the user id counter
-//! `sprig.next_user_id`; format 2 adds `api_keys`, format 3 adds
-//! `scram_sha_512` to `verifiers.mechanism`, and format 4 adds
-//! `token_sessions` ([`crate::token`]), format 5 `user_factors`
-//! ([`crate::mfa`]), format 6 `users.require_subject` and `require_issuer`,
-//! and format 7 `oidc_issuers` and `claim_mappings` ([`crate::oidc`]).
+//! The auth tables of the tenant catalog, with typed rows and access: the
+//! users, their verifiers and their login state, as catalog records in
+//! the storage engine ([`crate::rec`]).
 //!
 //! **Versioning.** `users` and `verifiers` are versioned by the tenant's
 //! auth version ([`VersionKind::Auth`](sprig_catalog::VersionKind)).
-//! `verifiers` has no `changed_version` column, so every change of a
-//! user's verifiers also rewrites the user's row with the change's
-//! version ([`AuthStore::touch_user`]); the cache reloads a changed user's
-//! verifiers with it. `login_state` is not versioned (it is read on
-//! demand); only lock transitions bump the auth version, and the cache
-//! re-reads every locked row on each load.
+//! `verifiers` has no `changed_version`, so every change of a user's
+//! verifiers also rewrites the user's row with the change's version; the
+//! cache reloads a changed user's verifiers with it. `login_state` is not
+//! versioned (it is read on demand); only lock transitions bump the auth
+//! version, and the cache re-reads every locked row on each load.
 //!
-//! **Times.** `DATETIME(6)` columns hold UTC. They travel as microseconds
-//! since the epoch (`TIMESTAMPDIFF` and `TIMESTAMPADD` against
-//! `'1970-01-01'`), so no calendar arithmetic happens here and the session
-//! time zone doesn't matter.
+//! **Formats.** The rows start at the newest shape (what MariaDB's format 7
+//! had); the `auth` module has no migrations ([`AUTH_MODULE`]).
 
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use mysql_async::prelude::Queryable;
-use mysql_async::{Params, Row, Value};
-use sprig_catalog::{Counter, Migration, Module, Phase, Store};
-use sprig_common::ids::{TenantId, UserId};
-use sprig_common::names::{SchemaName, quote};
+use serde::{Deserialize, Serialize};
+use sprig_catalog::records::{self, Pk, RecordTx};
+use sprig_catalog::{Migration, Module};
+use sprig_common::ids::UserId;
 use sprig_common::{Result, SprigCode, SprigError};
+
+use crate::rec::{LOGIN_STATE, USERS, VERIFIERS, duplicate, host_eq};
 
 /// The module name in the catalog's format records.
 pub const MODULE: &str = "auth";
 
-/// `users`, with exactly the catalog schema's columns.
-pub const DDL_USERS: &str = "CREATE TABLE IF NOT EXISTS users (
-  user_id            INT UNSIGNED  NOT NULL,
-  name               VARCHAR(255)  NOT NULL COLLATE utf8mb4_bin,
-  host               VARCHAR(255)  NOT NULL COLLATE ascii_general_ci DEFAULT '%',
-  kind               ENUM('user','service') NOT NULL DEFAULT 'user',
-  auth_methods       SET('password','token','api_key') NOT NULL DEFAULT 'password',
-  plugin             VARCHAR(64)   NOT NULL DEFAULT 'caching_sha2_password',
-  mongo_db           VARCHAR(64)   NULL,
-  home_space_id      BIGINT UNSIGNED NOT NULL DEFAULT 1,
-  require_tls        ENUM('none','ssl','x509') NOT NULL DEFAULT 'none',
-  account_locked     TINYINT(1)    NOT NULL DEFAULT 0,
-  password_expired   TINYINT(1)    NOT NULL DEFAULT 0,
-  password_changed_at DATETIME(6)  NULL,
-  password_lifetime  SMALLINT      NULL,
-  password_history   SMALLINT      NULL,
-  password_reuse_days SMALLINT     NULL,
-  require_current    ENUM('default','yes','optional') NOT NULL DEFAULT 'default',
-  failed_login_attempts SMALLINT UNSIGNED NULL,
-  password_lock_minutes INT        NULL,
-  max_queries_per_hour     INT UNSIGNED NOT NULL DEFAULT 0,
-  max_updates_per_hour     INT UNSIGNED NOT NULL DEFAULT 0,
-  max_connections_per_hour INT UNSIGNED NOT NULL DEFAULT 0,
-  max_user_connections     INT UNSIGNED NOT NULL DEFAULT 0,
-  attributes         JSON          NULL,
-  source     ENUM('sql','mongo','redis','api','oidc_jit','bootstrap') NOT NULL,
-  created_by_tenant  BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  state              ENUM('active','dropped') NOT NULL DEFAULT 'active',
-  created_at         DATETIME(6)   NOT NULL,
-  changed_version    BIGINT UNSIGNED NOT NULL,
-  live_name VARCHAR(255) AS (IF(state = 'dropped', NULL, name)) PERSISTENT,
-  PRIMARY KEY (user_id),
-  UNIQUE KEY uk_account (live_name, host)
-) ENGINE=InnoDB";
-
-/// `verifiers`.
-pub const DDL_VERIFIERS: &str = "CREATE TABLE IF NOT EXISTS verifiers (
-  verifier_id     BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  user_id         INT UNSIGNED    NOT NULL,
-  mechanism       ENUM('caching_sha2_password','mysql_native_password',
-                       'scram_sha_256','scram_sha_1') NOT NULL,
-  slot            ENUM('primary','secondary','history') NOT NULL,
-  login_form      ENUM('any','qualified','plain') NOT NULL DEFAULT 'any',
-  auth_string     VARBINARY(255)  NULL,
-  salt            VARBINARY(64)   NULL,
-  iterations      INT UNSIGNED    NULL,
-  stored_key      VARBINARY(64)   NULL,
-  server_key      VARBINARY(64)   NULL,
-  generation      BIGINT UNSIGNED NOT NULL,
-  created_at      DATETIME(6)     NOT NULL,
-  PRIMARY KEY (verifier_id),
-  KEY k_user (user_id, slot, mechanism)
-) ENGINE=InnoDB";
-
-/// `login_state`.
-pub const DDL_LOGIN_STATE: &str = "CREATE TABLE IF NOT EXISTS login_state (
-  user_id              INT UNSIGNED      NOT NULL,
-  consecutive_failures INT UNSIGNED      NOT NULL DEFAULT 0,
-  locked_until         DATETIME(6)       NULL,
-  last_failure_at      DATETIME(6)       NULL,
-  last_success_at      DATETIME(6)       NULL,
-  last_success_ip      VARBINARY(16)     NULL,
-  updated_at           DATETIME(6)       NOT NULL,
-  PRIMARY KEY (user_id)
-) ENGINE=InnoDB";
-
-/// The user id counter, `sprig.next_user_id`, starting at 1. Idempotent.
-pub const INSERT_USER_COUNTER: &str = "INSERT INTO settings
-  (scope_kind, scope_id, setting_key, value, bounds, set_by, set_at, version) VALUES
-  ('tenant', 0, 'sprig.next_user_id', '1', NULL, 'system', UTC_TIMESTAMP(6), 0)
-  ON DUPLICATE KEY UPDATE setting_key = setting_key";
-
-/// The auth module's migrations.
-pub static AUTH_MIGRATIONS: &[Migration] = &[
-    Migration {
-        format: 1,
-        phase: Phase::Expand,
-        name: "users, verifiers, login_state and the user id counter",
-        statements: &[
-            DDL_USERS,
-            DDL_VERIFIERS,
-            DDL_LOGIN_STATE,
-            INSERT_USER_COUNTER,
-        ],
-    },
-    Migration {
-        format: 2,
-        phase: Phase::Expand,
-        name: "api_keys",
-        statements: &[crate::apikey::DDL_API_KEYS],
-    },
-    Migration {
-        format: 3,
-        phase: Phase::Expand,
-        name: "verifiers.mechanism gains scram_sha_512",
-        statements: &[ALTER_VERIFIERS_SCRAM_SHA_512],
-    },
-    Migration {
-        format: 4,
-        phase: Phase::Expand,
-        name: "token_sessions",
-        statements: &[crate::token::sessions::DDL_TOKEN_SESSIONS],
-    },
-    Migration {
-        format: 5,
-        phase: Phase::Expand,
-        name: "user_factors",
-        statements: &[crate::mfa::DDL_USER_FACTORS],
-    },
-    Migration {
-        format: 6,
-        phase: Phase::Expand,
-        name: "users.require_subject and users.require_issuer",
-        statements: &[ALTER_USERS_REQUIRE_DN],
-    },
-    Migration {
-        format: 7,
-        phase: Phase::Expand,
-        name: "oidc_issuers and claim_mappings",
-        statements: &[
-            crate::oidc::store::DDL_OIDC_ISSUERS,
-            crate::oidc::store::DDL_CLAIM_MAPPINGS,
-        ],
-    },
-];
-
-/// `REQUIRE SUBJECT` and `REQUIRE ISSUER`: the client
-/// certificate's subject and issuer, in MySQL's `/C=../O=../CN=..` form.
-pub const ALTER_USERS_REQUIRE_DN: &str = "ALTER TABLE users \
-  ADD COLUMN IF NOT EXISTS require_subject VARCHAR(1024) NULL, \
-  ADD COLUMN IF NOT EXISTS require_issuer VARCHAR(1024) NULL";
-
-/// Format 3: `scram_sha_512` joins `verifiers.mechanism`. A new last `ENUM`
-/// member: MariaDB changes only the table's metadata, and rerunning it changes
-/// nothing.
-pub const ALTER_VERIFIERS_SCRAM_SHA_512: &str = "ALTER TABLE verifiers MODIFY mechanism
-  ENUM('caching_sha2_password','mysql_native_password',
-       'scram_sha_256','scram_sha_1','scram_sha_512') NOT NULL";
+/// The auth module's migrations: none. Its rows are engine records, which
+/// start at the newest shape; the module stays registered so older
+/// catalogs' format records of it are recognised.
+pub static AUTH_MIGRATIONS: &[Migration] = &[];
 
 /// The auth module, for [`Migrator::new`](sprig_catalog::Migrator::new).
 pub const AUTH_MODULE: Module = Module {
@@ -186,8 +38,8 @@ pub const AUTH_MODULE: Module = Module {
     migrations: AUTH_MIGRATIONS,
 };
 
-/// The id counter of users (`sprig.next_user_id`).
-pub const USER_COUNTER: Counter = Counter::Other("user");
+/// The id counter of users.
+pub const USER_COUNTER: &str = "user";
 
 /// `locked_until` of an `UNBOUNDED` lock: 9999-12-31.
 pub const UNBOUNDED_LOCK_MICROS: i64 = 253_402_214_400_000_000;
@@ -225,6 +77,19 @@ macro_rules! sql_enum {
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str(self.as_str())
+            }
+        }
+
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+                s.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+                let s = <std::borrow::Cow<'de, str>>::deserialize(d)?;
+                $name::parse(&s).map_err(|e| serde::de::Error::custom(e.message))
             }
         }
     };
@@ -337,7 +202,8 @@ sql_enum! {
 }
 
 /// `users.auth_methods`: the login methods an account accepts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct AuthMethods(u8);
 
 impl AuthMethods {
@@ -409,7 +275,7 @@ impl Default for AuthMethods {
 
 /// An account's resource limits (`MAX_QUERIES_PER_HOUR` and the others);
 /// 0 means unlimited.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AccountLimits {
     /// `MAX_QUERIES_PER_HOUR`.
     pub max_queries_per_hour: u32,
@@ -422,7 +288,7 @@ pub struct AccountLimits {
 }
 
 /// A `users` row.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserRow {
     /// The id; never reused. The backend account is `t<tenant>_u<user_id>`.
     pub user_id: UserId,
@@ -448,6 +314,7 @@ pub struct UserRow {
     /// `PASSWORD EXPIRE` (the flag; the lifetime is checked separately).
     pub password_expired: bool,
     /// When the password last changed.
+    #[serde(with = "crate::rec::micros_opt")]
     pub password_changed_at: Option<SystemTime>,
     /// `PASSWORD EXPIRE INTERVAL n DAY`: `None` from `auth.*` settings,
     /// `Some(0)` never.
@@ -473,6 +340,7 @@ pub struct UserRow {
     /// Active or dropped.
     pub state: UserState,
     /// When created.
+    #[serde(with = "crate::rec::micros")]
     pub created_at: SystemTime,
     /// The auth version of the last change to the row or its verifiers.
     pub changed_version: u64,
@@ -539,7 +407,7 @@ impl UserRow {
 }
 
 /// A `verifiers` row. `Debug` hides the secret-derived columns.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifierRow {
     /// The id (`AUTO_INCREMENT`; 0 when inserting), never reused: the fast
     /// cache keys on it.
@@ -566,6 +434,7 @@ pub struct VerifierRow {
     /// Increases with every password change of the user.
     pub generation: u64,
     /// When created.
+    #[serde(with = "crate::rec::micros")]
     pub created_at: SystemTime,
 }
 
@@ -612,21 +481,25 @@ impl VerifierRow {
 }
 
 /// A `login_state` row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoginStateRow {
     /// The user.
     pub user_id: UserId,
     /// Wrong credentials in a row (saturates).
     pub consecutive_failures: u32,
     /// The temporary lock's end; 9999-12-31 for `UNBOUNDED`.
+    #[serde(with = "crate::rec::micros_opt")]
     pub locked_until: Option<SystemTime>,
     /// Last failure.
+    #[serde(with = "crate::rec::micros_opt")]
     pub last_failure_at: Option<SystemTime>,
     /// Last success.
+    #[serde(with = "crate::rec::micros_opt")]
     pub last_success_at: Option<SystemTime>,
     /// The last successful login's address (4 or 16 bytes).
     pub last_success_ip: Option<Vec<u8>>,
     /// Last write.
+    #[serde(with = "crate::rec::micros")]
     pub updated_at: SystemTime,
 }
 
@@ -641,225 +514,135 @@ pub struct TempLock {
     pub consecutive_failures: u32,
 }
 
-/// Typed access to one catalog's auth tables. Every method takes the
-/// connection or transaction to run on: a [`Change`](sprig_catalog::Change)'s
-/// transaction for writes, a snapshot transaction for cache loads.
-#[derive(Debug, Clone)]
-pub struct AuthStore {
-    schema: String,
-    users: String,
-    verifiers: String,
-    login_state: String,
+/// Typed access to the auth tables of one tenant's catalog records. Every
+/// method takes the record transaction to run in: an auth change's
+/// ([`AuthTx`](sprig_catalog::AuthTx)`.tx().records()`) for versioned
+/// writes, a snapshot's for cache loads, or a plain record transaction for
+/// the unversioned login-state writes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AuthStore;
+
+/// The primary key of user `id`.
+fn user_pk(id: UserId) -> Pk {
+    Pk::new().u32(id.0)
 }
 
-const USER_COLS: &str = "user_id, name, host, kind, auth_methods, plugin, mongo_db, \
-    home_space_id, require_tls, account_locked, password_expired, \
-    TIMESTAMPDIFF(MICROSECOND, '1970-01-01', password_changed_at), password_lifetime, \
-    password_history, password_reuse_days, require_current, failed_login_attempts, \
-    password_lock_minutes, max_queries_per_hour, max_updates_per_hour, \
-    max_connections_per_hour, max_user_connections, attributes, source, created_by_tenant, \
-    state, TIMESTAMPDIFF(MICROSECOND, '1970-01-01', created_at), changed_version";
-
-/// [`USER_COLS`] and format 6's `REQUIRE SUBJECT` and `ISSUER` columns.
-const USER_COLS_DN: &str = "require_subject, require_issuer";
-/// The same for a catalog still before format 6.
-const USER_COLS_NO_DN: &str = "NULL, NULL";
-
-/// MariaDB's 1054 (unknown column): a catalog before format 6.
-fn unknown_column(e: &mysql_async::Error) -> bool {
-    matches!(e, mysql_async::Error::Server(s) if s.code == 1054)
+/// The primary key of a verifier.
+fn verifier_pk(user: UserId, id: u64) -> Pk {
+    Pk::new().u32(user.0).u64(id)
 }
 
-const VERIFIER_COLS: &str = "verifier_id, user_id, mechanism, slot, login_form, auth_string, \
-    salt, iterations, stored_key, server_key, generation, \
-    TIMESTAMPDIFF(MICROSECOND, '1970-01-01', created_at)";
-
-/// `TIMESTAMPADD` of a microsecond parameter: a time parameter.
-pub(crate) const AT: &str = "TIMESTAMPADD(MICROSECOND, ?, '1970-01-01')";
-
-/// Rows per `IN (...)` list.
-const IN_CHUNK: usize = 500;
+/// A row with every time truncated to microseconds, as MariaDB stored it.
+fn stored_user(r: &UserRow) -> UserRow {
+    let mut r = r.clone();
+    r.created_at = crate::rec::to_micros(r.created_at);
+    r.password_changed_at = r.password_changed_at.map(crate::rec::to_micros);
+    r
+}
 
 impl AuthStore {
-    /// The auth tables of catalog schema `schema`.
+    /// The auth tables.
     #[must_use]
-    pub fn new(schema: impl Into<String>) -> Self {
-        let schema = schema.into();
-        let q = quote(&schema);
-        Self {
-            users: format!("{q}.users"),
-            verifiers: format!("{q}.verifiers"),
-            login_state: format!("{q}.login_state"),
-            schema,
-        }
-    }
-
-    /// The auth tables of `tenant`'s catalog, `t<tenant>_sprig`.
-    #[must_use]
-    pub fn for_tenant(tenant: TenantId) -> Self {
-        Self::new(SchemaName::catalog(tenant).to_string())
-    }
-
-    /// The auth tables next to `store`'s core tables.
-    #[must_use]
-    pub fn of(store: &Store) -> Self {
-        Self::new(store.schema())
-    }
-
-    /// The catalog schema.
-    #[must_use]
-    pub fn schema(&self) -> &str {
-        &self.schema
+    pub const fn new() -> Self {
+        Self
     }
 
     // ---- users ----
 
-    /// Reserves the next user id (`sprig.next_user_id`). Not versioned.
-    /// Inside a change's transaction the reservation commits or rolls back
-    /// with the change, so a failed create leaves no gap; ids of users that
-    /// existed (dropped ones included) are never handed out again.
+    /// Reserves the next user id (counter `user`). Inside a change's
+    /// transaction the reservation commits or rolls back with the change,
+    /// so a failed create leaves no gap; ids of users that existed
+    /// (dropped ones included) are never handed out again.
     ///
     /// # Errors
-    /// 39072 if the counter row is missing (the auth module isn't
-    /// migrated); 39070 or a backend error.
-    pub async fn next_user_id<Q: Queryable + Send>(
-        &self,
-        core: &Store,
-        q: &mut Q,
-    ) -> Result<UserId> {
-        let id = core.next_ids(q, USER_COUNTER, 1).await?;
+    /// The store's; `Internal` when ids are exhausted.
+    pub async fn next_user_id(&self, tx: &mut dyn RecordTx) -> Result<UserId> {
+        let id = records::next_ids(tx, USER_COUNTER, 1).await?;
         u32::try_from(id)
             .map(UserId)
             .map_err(|_| SprigError::internal("user ids exhausted"))
     }
 
-    /// Inserts a user. A live `(name, host)` already in use is MariaDB's
-    /// 1062.
-    ///
-    /// # Errors
-    /// 39070 or a backend error.
-    pub async fn insert_user<Q: Queryable + Send>(&self, q: &mut Q, r: &UserRow) -> Result<()> {
-        let sql = format!(
-            "INSERT INTO {} (user_id, name, host, kind, auth_methods, plugin, mongo_db, \
-             home_space_id, require_tls, account_locked, password_expired, password_changed_at, \
-             password_lifetime, password_history, password_reuse_days, require_current, \
-             failed_login_attempts, password_lock_minutes, max_queries_per_hour, \
-             max_updates_per_hour, max_connections_per_hour, max_user_connections, attributes, \
-             source, created_by_tenant, state, created_at, changed_version) VALUES \
-             (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {}, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {AT}, ?)",
-            self.users,
-            opt_at(r.password_changed_at.is_some()),
-        );
-        let mut p = vec![Value::from(r.user_id.0)];
-        p.extend(user_values(r));
-        exec(q, sql, p).await?;
-        self.set_dn(q, r).await
+    /// Whether a live user other than `except` holds account
+    /// `name`@`host`.
+    async fn live_holder(
+        &self,
+        tx: &mut dyn RecordTx,
+        name: &str,
+        host: &str,
+        except: UserId,
+    ) -> Result<bool> {
+        Ok(self.users_since(tx, None).await?.iter().any(|u| {
+            u.user_id != except && u.is_live() && u.name == name && host_eq(&u.host, host)
+        }))
     }
 
-    /// Writes `r`'s `REQUIRE SUBJECT` and `ISSUER` (format 6's columns).
-    /// A catalog before format 6 takes a user without them; one with
-    /// them must be migrated first ([`migrate_dn`]).
-    async fn set_dn<Q: Queryable + Send>(&self, q: &mut Q, r: &UserRow) -> Result<()> {
-        let sql = format!(
-            "UPDATE {} SET require_subject = ?, require_issuer = ? WHERE user_id = ?",
-            self.users
-        );
-        let p = (
-            r.require_subject.clone(),
-            r.require_issuer.clone(),
-            r.user_id.0,
-        );
-        match q.exec_drop(sql, p).await {
-            Ok(()) => Ok(()),
-            Err(e)
-                if unknown_column(&e)
-                    && r.require_subject.is_none()
-                    && r.require_issuer.is_none() =>
-            {
-                Ok(())
-            }
-            Err(e) => Err(map_err(e)),
+    /// Inserts a user. A live `(name, host)` already in use is a duplicate
+    /// key (1062, as MariaDB's unique key reported it).
+    ///
+    /// # Errors
+    /// 1062; the store's.
+    pub async fn insert_user(&self, tx: &mut dyn RecordTx, r: &UserRow) -> Result<()> {
+        if USERS
+            .get::<UserRow>(tx, &user_pk(r.user_id))
+            .await?
+            .is_some()
+        {
+            return Err(duplicate("user id"));
         }
+        if r.is_live() && self.live_holder(tx, &r.name, &r.host, r.user_id).await? {
+            return Err(duplicate("account"));
+        }
+        USERS.put(tx, &user_pk(r.user_id), &stored_user(r)).await
     }
 
     /// Rewrites every column of the user `r.user_id`. Returns whether the
-    /// row exists.
+    /// row exists (nothing is written when it doesn't).
     ///
     /// # Errors
-    /// 39070 or a backend error (1062 for a live name in use).
-    pub async fn update_user<Q: Queryable + Send>(&self, q: &mut Q, r: &UserRow) -> Result<bool> {
-        let sql = format!(
-            "UPDATE {} SET name = ?, host = ?, kind = ?, auth_methods = ?, plugin = ?, \
-             mongo_db = ?, home_space_id = ?, require_tls = ?, account_locked = ?, \
-             password_expired = ?, password_changed_at = {}, password_lifetime = ?, \
-             password_history = ?, password_reuse_days = ?, require_current = ?, \
-             failed_login_attempts = ?, password_lock_minutes = ?, max_queries_per_hour = ?, \
-             max_updates_per_hour = ?, max_connections_per_hour = ?, max_user_connections = ?, \
-             attributes = ?, source = ?, created_by_tenant = ?, state = ?, created_at = {AT}, \
-             changed_version = ? WHERE user_id = ?",
-            self.users,
-            opt_at(r.password_changed_at.is_some()),
-        );
-        let mut p = user_values(r);
-        p.push(Value::from(r.user_id.0));
-        exec(q, sql, p).await?;
-        self.set_dn(q, r).await?;
-        self.exists(q, r.user_id).await
+    /// 1062 for a live name in use by another user; the store's.
+    pub async fn update_user(&self, tx: &mut dyn RecordTx, r: &UserRow) -> Result<bool> {
+        if USERS
+            .get::<UserRow>(tx, &user_pk(r.user_id))
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        if r.is_live() && self.live_holder(tx, &r.name, &r.host, r.user_id).await? {
+            return Err(duplicate("account"));
+        }
+        USERS.put(tx, &user_pk(r.user_id), &stored_user(r)).await?;
+        Ok(true)
     }
 
     /// Sets the user's `changed_version` to `version`, so the cache
-    /// reloads it and its verifiers (every verifier change must call it in
-    /// the same change). Returns whether the user exists.
+    /// reloads it and its verifiers. Returns whether the user exists.
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn touch_user<Q: Queryable + Send>(
+    /// The store's.
+    pub async fn touch_user(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         user: UserId,
         version: u64,
     ) -> Result<bool> {
-        exec(
-            q,
-            format!(
-                "UPDATE {} SET changed_version = ? WHERE user_id = ?",
-                self.users
-            ),
-            vec![Value::from(version), Value::from(user.0)],
-        )
-        .await?;
-        self.exists(q, user).await
-    }
-
-    async fn exists<Q: Queryable + Send>(&self, q: &mut Q, user: UserId) -> Result<bool> {
-        let found: Option<u32> = q
-            .exec_first(
-                format!("SELECT user_id FROM {} WHERE user_id = ?", self.users),
-                (user.0,),
-            )
-            .await
-            .map_err(map_err)?;
-        Ok(found.is_some())
+        match self.user(tx, user).await? {
+            Some(mut u) => {
+                u.changed_version = version;
+                USERS.put(tx, &user_pk(user), &u).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     /// The user `id`, live or dropped.
     ///
     /// # Errors
-    /// 39070 or a backend error; `Internal` for a malformed row.
-    pub async fn user<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        id: UserId,
-    ) -> Result<Option<UserRow>> {
-        let users = &self.users;
-        let rows = select_users(q, |dn| {
-            (
-                format!("SELECT {USER_COLS}, {dn} FROM {users} WHERE user_id = ?"),
-                Params::from((id.0,)),
-            )
-        })
-        .await?;
-        rows.into_iter().next().map(user_row).transpose()
+    /// The store's; `Internal` for a malformed row.
+    pub async fn user(&self, tx: &mut dyn RecordTx, id: UserId) -> Result<Option<UserRow>> {
+        USERS.get(tx, &user_pk(id)).await
     }
 
     /// The live account `'name'@'host'` (host compared as MySQL does,
@@ -867,21 +650,17 @@ impl AuthStore {
     ///
     /// # Errors
     /// As [`user`](Self::user).
-    pub async fn user_by_account<Q: Queryable + Send>(
+    pub async fn user_by_account(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         name: &str,
         host: &str,
     ) -> Result<Option<UserRow>> {
-        let users = &self.users;
-        let rows = select_users(q, |dn| {
-            (
-                format!("SELECT {USER_COLS}, {dn} FROM {users} WHERE live_name = ? AND host = ?"),
-                Params::from((name, host)),
-            )
-        })
-        .await?;
-        rows.into_iter().next().map(user_row).transpose()
+        Ok(self
+            .users_since(tx, None)
+            .await?
+            .into_iter()
+            .find(|u| u.is_live() && u.name == name && host_eq(&u.host, host)))
     }
 
     /// Users changed after `since` (every user, dropped ones included, for
@@ -889,94 +668,62 @@ impl AuthStore {
     ///
     /// # Errors
     /// As [`user`](Self::user).
-    pub async fn users_since<Q: Queryable + Send>(
+    pub async fn users_since(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         since: Option<u64>,
     ) -> Result<Vec<UserRow>> {
-        let users = &self.users;
-        let rows = select_users(q, |dn| match since {
-            Some(v) => (
-                format!(
-                    "SELECT {USER_COLS}, {dn} FROM {users} WHERE changed_version > ? ORDER BY user_id"
-                ),
-                Params::from((v,)),
-            ),
-            None => (
-                format!("SELECT {USER_COLS}, {dn} FROM {users} ORDER BY user_id"),
-                Params::Empty,
-            ),
+        let all: Vec<UserRow> = USERS.rows(tx, &Pk::new()).await?;
+        Ok(match since {
+            Some(v) => all.into_iter().filter(|u| u.changed_version > v).collect(),
+            None => all,
         })
-        .await?;
-        rows.into_iter().map(user_row).collect()
     }
 
     // ---- verifiers ----
 
-    /// Inserts a verifier and returns its id.
+    /// Inserts a verifier (its id from counter `verifier`) and returns its
+    /// id.
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn insert_verifier<Q: Queryable + Send>(
+    /// The store's.
+    pub async fn insert_verifier(&self, tx: &mut dyn RecordTx, r: &VerifierRow) -> Result<u64> {
+        let id = records::next_ids(tx, "verifier", 1).await?;
+        let mut row = r.clone();
+        row.verifier_id = id;
+        row.created_at = crate::rec::to_micros(row.created_at);
+        VERIFIERS
+            .put(tx, &verifier_pk(r.user_id, id), &row)
+            .await?;
+        Ok(id)
+    }
+
+    /// The verifiers of one user, by id.
+    async fn verifiers_of_one(
         &self,
-        q: &mut Q,
-        r: &VerifierRow,
-    ) -> Result<u64> {
-        let sql = format!(
-            "INSERT INTO {} (user_id, mechanism, slot, login_form, auth_string, salt, iterations, \
-             stored_key, server_key, generation, created_at) VALUES \
-             (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {AT})",
-            self.verifiers
-        );
-        let p = vec![
-            Value::from(r.user_id.0),
-            Value::from(r.kind.as_str()),
-            Value::from(r.slot.as_str()),
-            Value::from(r.login_form.as_str()),
-            Value::from(r.auth_string.clone()),
-            Value::from(r.salt.clone()),
-            Value::from(r.iterations),
-            Value::from(r.stored_key.clone()),
-            Value::from(r.server_key.clone()),
-            Value::from(r.generation),
-            Value::from(micros(r.created_at)),
-        ];
-        exec(q, sql, p).await?;
-        let id: Option<u64> = q
-            .exec_first("SELECT LAST_INSERT_ID()", ())
-            .await
-            .map_err(map_err)?;
-        id.filter(|&id| id > 0)
-            .ok_or_else(|| SprigError::internal("verifier insert returned no id"))
+        tx: &mut dyn RecordTx,
+        user: UserId,
+    ) -> Result<Vec<VerifierRow>> {
+        VERIFIERS.rows(tx, &Pk::new().u32(user.0)).await
     }
 
     /// The verifiers of `users`, by user, slot and id.
     ///
     /// # Errors
     /// As [`user`](Self::user).
-    pub async fn verifiers_of<Q: Queryable + Send>(
+    pub async fn verifiers_of(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         users: &[UserId],
     ) -> Result<Vec<VerifierRow>> {
+        let mut ids = users.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
         let mut out = Vec::new();
-        for chunk in users.chunks(IN_CHUNK) {
-            let marks = vec!["?"; chunk.len()].join(", ");
-            let rows: Vec<Row> = q
-                .exec(
-                    format!(
-                        "SELECT {VERIFIER_COLS} FROM {} WHERE user_id IN ({marks}) \
-                         ORDER BY user_id, slot, verifier_id",
-                        self.verifiers
-                    ),
-                    Params::Positional(chunk.iter().map(|u| Value::from(u.0)).collect()),
-                )
-                .await
-                .map_err(map_err)?;
-            for row in rows {
-                out.push(verifier_row(row)?);
-            }
+        for u in ids {
+            out.extend(self.verifiers_of_one(tx, u).await?);
         }
+        sort_verifiers(&mut out);
         Ok(out)
     }
 
@@ -984,121 +731,106 @@ impl AuthStore {
     ///
     /// # Errors
     /// As [`user`](Self::user).
-    pub async fn all_verifiers<Q: Queryable + Send>(&self, q: &mut Q) -> Result<Vec<VerifierRow>> {
-        let rows: Vec<Row> = q
-            .query(format!(
-                "SELECT {VERIFIER_COLS} FROM {} ORDER BY user_id, slot, verifier_id",
-                self.verifiers
-            ))
-            .await
-            .map_err(map_err)?;
-        rows.into_iter().map(verifier_row).collect()
+    pub async fn all_verifiers(&self, tx: &mut dyn RecordTx) -> Result<Vec<VerifierRow>> {
+        let mut out: Vec<VerifierRow> = VERIFIERS.rows(tx, &Pk::new()).await?;
+        sort_verifiers(&mut out);
+        Ok(out)
     }
 
     /// Deletes the user's verifiers in `slot`. Returns how many.
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn delete_verifiers<Q: Queryable + Send>(
+    /// The store's.
+    pub async fn delete_verifiers(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         user: UserId,
         slot: Slot,
     ) -> Result<u64> {
-        exec_count(
-            q,
-            format!(
-                "DELETE FROM {} WHERE user_id = ? AND slot = ?",
-                self.verifiers
-            ),
-            vec![Value::from(user.0), Value::from(slot.as_str())],
-        )
-        .await
+        let mut n = 0;
+        for v in self.verifiers_of_one(tx, user).await? {
+            if v.slot == slot {
+                VERIFIERS
+                    .delete(tx, &verifier_pk(user, v.verifier_id))
+                    .await?;
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 
     /// Moves the user's verifiers from slot `from` to `to`. Returns how
     /// many.
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn move_verifiers<Q: Queryable + Send>(
+    /// The store's.
+    pub async fn move_verifiers(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         user: UserId,
         from: Slot,
         to: Slot,
     ) -> Result<u64> {
-        exec_count(
-            q,
-            format!(
-                "UPDATE {} SET slot = ? WHERE user_id = ? AND slot = ?",
-                self.verifiers
-            ),
-            vec![
-                Value::from(to.as_str()),
-                Value::from(user.0),
-                Value::from(from.as_str()),
-            ],
-        )
-        .await
+        let mut n = 0;
+        for mut v in self.verifiers_of_one(tx, user).await? {
+            if v.slot == from {
+                v.slot = to;
+                VERIFIERS
+                    .put(tx, &verifier_pk(user, v.verifier_id), &v)
+                    .await?;
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 
     /// Deletes the user's history verifiers beyond the newest `keep`
     /// generations. Returns how many.
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn trim_history<Q: Queryable + Send>(
+    /// The store's.
+    pub async fn trim_history(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         user: UserId,
         keep: u64,
     ) -> Result<u64> {
-        let gens: Vec<u64> = q
-            .exec(
-                format!(
-                    "SELECT DISTINCT generation FROM {} WHERE user_id = ? AND slot = 'history' \
-                     ORDER BY generation DESC",
-                    self.verifiers
-                ),
-                (user.0,),
-            )
-            .await
-            .map_err(map_err)?;
+        let history: Vec<VerifierRow> = self
+            .verifiers_of_one(tx, user)
+            .await?
+            .into_iter()
+            .filter(|v| v.slot == Slot::History)
+            .collect();
+        let mut gens: Vec<u64> = history.iter().map(|v| v.generation).collect();
+        gens.sort_unstable_by(|a, b| b.cmp(a));
+        gens.dedup();
         let Some(&cut) = usize::try_from(keep).ok().and_then(|k| gens.get(k)) else {
             return Ok(0);
         };
-        exec_count(
-            q,
-            format!(
-                "DELETE FROM {} WHERE user_id = ? AND slot = 'history' AND generation <= ?",
-                self.verifiers
-            ),
-            vec![Value::from(user.0), Value::from(cut)],
-        )
-        .await
+        let mut n = 0;
+        for v in history {
+            if v.generation <= cut {
+                VERIFIERS
+                    .delete(tx, &verifier_pk(user, v.verifier_id))
+                    .await?;
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 
     /// The user's newest verifier generation, 0 if none.
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn max_generation<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        user: UserId,
-    ) -> Result<u64> {
-        let g: Option<Option<u64>> = q
-            .exec_first(
-                format!(
-                    "SELECT MAX(generation) FROM {} WHERE user_id = ?",
-                    self.verifiers
-                ),
-                (user.0,),
-            )
-            .await
-            .map_err(map_err)?;
-        Ok(g.flatten().unwrap_or(0))
+    /// The store's.
+    pub async fn max_generation(&self, tx: &mut dyn RecordTx, user: UserId) -> Result<u64> {
+        Ok(self
+            .verifiers_of_one(tx, user)
+            .await?
+            .iter()
+            .map(|v| v.generation)
+            .max()
+            .unwrap_or(0))
     }
 
     // ---- login_state ----
@@ -1106,140 +838,93 @@ impl AuthStore {
     /// The user's login state, if any was written.
     ///
     /// # Errors
-    /// 39070 or a backend error; `Internal` for a malformed row.
-    pub async fn login_state<Q: Queryable + Send>(
+    /// The store's; `Internal` for a malformed row.
+    pub async fn login_state(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         user: UserId,
     ) -> Result<Option<LoginStateRow>> {
-        self.read_login_state(q, user, "").await
+        LOGIN_STATE.get(tx, &user_pk(user)).await
     }
 
-    /// The user's login state, locked for update (`SELECT ... FOR UPDATE`)
-    /// in the caller's transaction: the failure counter's read.
+    /// The user's login state, locked for update in the caller's
+    /// transaction (the failure counter's read): its latest value.
     ///
     /// # Errors
-    /// As [`login_state`](Self::login_state).
-    pub async fn login_state_for_update<Q: Queryable + Send>(
+    /// As [`login_state`](Self::login_state); 39071 when the lock wait
+    /// times out.
+    pub async fn login_state_for_update(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         user: UserId,
     ) -> Result<Option<LoginStateRow>> {
-        self.read_login_state(q, user, " FOR UPDATE").await
+        LOGIN_STATE.get_for_update(tx, &user_pk(user)).await
     }
 
     /// Clears the user's temporary lock and failure count (`ACCOUNT
     /// UNLOCK`, or an expired lock). Returns whether a row changed.
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn clear_login_lock<Q: Queryable + Send>(
+    /// As [`login_state_for_update`](Self::login_state_for_update).
+    pub async fn clear_login_lock(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         user: UserId,
         now: SystemTime,
     ) -> Result<bool> {
-        let n = exec_count(
-            q,
-            format!(
-                "UPDATE {} SET locked_until = NULL, consecutive_failures = 0, updated_at = {AT} \
-                 WHERE user_id = ? AND (locked_until IS NOT NULL OR consecutive_failures > 0)",
-                self.login_state
-            ),
-            vec![Value::from(micros(now)), Value::from(user.0)],
-        )
-        .await?;
-        Ok(n > 0)
+        let Some(mut r) = self.login_state_for_update(tx, user).await? else {
+            return Ok(false);
+        };
+        if r.locked_until.is_none() && r.consecutive_failures == 0 {
+            return Ok(false);
+        }
+        r.locked_until = None;
+        r.consecutive_failures = 0;
+        r.updated_at = now;
+        self.put_login_state(tx, &r).await?;
+        Ok(true)
     }
 
     /// Resets a non-zero failure count of an unlocked user (a successful
     /// login). Returns whether a row changed.
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn reset_failures<Q: Queryable + Send>(
+    /// As [`login_state_for_update`](Self::login_state_for_update).
+    pub async fn reset_failures(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         user: UserId,
         now: SystemTime,
     ) -> Result<bool> {
-        let n = exec_count(
-            q,
-            format!(
-                "UPDATE {} SET consecutive_failures = 0, updated_at = {AT} \
-                 WHERE user_id = ? AND consecutive_failures > 0 AND locked_until IS NULL",
-                self.login_state
-            ),
-            vec![Value::from(micros(now)), Value::from(user.0)],
-        )
-        .await?;
-        Ok(n > 0)
-    }
-
-    async fn read_login_state<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        user: UserId,
-        suffix: &str,
-    ) -> Result<Option<LoginStateRow>> {
-        let rows: Vec<Row> = q
-            .exec(
-                format!(
-                    "SELECT user_id, consecutive_failures, \
-                     TIMESTAMPDIFF(MICROSECOND, '1970-01-01', locked_until), \
-                     TIMESTAMPDIFF(MICROSECOND, '1970-01-01', last_failure_at), \
-                     TIMESTAMPDIFF(MICROSECOND, '1970-01-01', last_success_at), \
-                     last_success_ip, TIMESTAMPDIFF(MICROSECOND, '1970-01-01', updated_at) \
-                     FROM {} WHERE user_id = ?{suffix}",
-                    self.login_state
-                ),
-                (user.0,),
-            )
-            .await
-            .map_err(map_err)?;
-        rows.into_iter()
-            .next()
-            .map(|mut r| {
-                Ok(LoginStateRow {
-                    user_id: UserId(col(&mut r, 0, "user_id")?),
-                    consecutive_failures: col(&mut r, 1, "consecutive_failures")?,
-                    locked_until: opt_time(&mut r, 2, "locked_until")?,
-                    last_failure_at: opt_time(&mut r, 3, "last_failure_at")?,
-                    last_success_at: opt_time(&mut r, 4, "last_success_at")?,
-                    last_success_ip: col(&mut r, 5, "last_success_ip")?,
-                    updated_at: time(&mut r, 6, "updated_at")?,
-                })
-            })
-            .transpose()
+        // Most logins find nothing to reset: a plain read first, so they
+        // take no lock.
+        match self.login_state(tx, user).await? {
+            Some(r) if r.consecutive_failures > 0 && r.locked_until.is_none() => {}
+            _ => return Ok(false),
+        }
+        let Some(mut r) = self.login_state_for_update(tx, user).await? else {
+            return Ok(false);
+        };
+        if r.consecutive_failures == 0 || r.locked_until.is_some() {
+            return Ok(false);
+        }
+        r.consecutive_failures = 0;
+        r.updated_at = now;
+        self.put_login_state(tx, &r).await?;
+        Ok(true)
     }
 
     /// Writes a login state row (the lockout counters use it; tests too).
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn put_login_state<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        r: &LoginStateRow,
-    ) -> Result<()> {
-        let sql = format!(
-            "REPLACE INTO {} (user_id, consecutive_failures, locked_until, last_failure_at, \
-             last_success_at, last_success_ip, updated_at) VALUES (?, ?, {}, {}, {}, ?, {AT})",
-            self.login_state,
-            opt_at(r.locked_until.is_some()),
-            opt_at(r.last_failure_at.is_some()),
-            opt_at(r.last_success_at.is_some()),
-        );
-        let p = vec![
-            Value::from(r.user_id.0),
-            Value::from(r.consecutive_failures),
-            opt_micros(r.locked_until),
-            opt_micros(r.last_failure_at),
-            opt_micros(r.last_success_at),
-            Value::from(r.last_success_ip.clone()),
-            Value::from(micros(r.updated_at)),
-        ];
-        exec(q, sql, p).await
+    /// The store's.
+    pub async fn put_login_state(&self, tx: &mut dyn RecordTx, r: &LoginStateRow) -> Result<()> {
+        let mut row = r.clone();
+        row.locked_until = row.locked_until.map(crate::rec::to_micros);
+        row.last_failure_at = row.last_failure_at.map(crate::rec::to_micros);
+        row.last_success_at = row.last_success_at.map(crate::rec::to_micros);
+        row.updated_at = crate::rec::to_micros(row.updated_at);
+        LOGIN_STATE.put(tx, &user_pk(r.user_id), &row).await
     }
 
     /// Every user with a temporary lock set (expired ones included: the
@@ -1247,171 +932,26 @@ impl AuthStore {
     ///
     /// # Errors
     /// As [`login_state`](Self::login_state).
-    pub async fn temp_locks<Q: Queryable + Send>(&self, q: &mut Q) -> Result<Vec<TempLock>> {
-        let rows: Vec<Row> = q
-            .query(format!(
-                "SELECT user_id, TIMESTAMPDIFF(MICROSECOND, '1970-01-01', locked_until), \
-                 consecutive_failures FROM {} WHERE locked_until IS NOT NULL",
-                self.login_state
-            ))
-            .await
-            .map_err(map_err)?;
-        rows.into_iter()
-            .map(|mut r| {
-                Ok(TempLock {
-                    user_id: UserId(col(&mut r, 0, "user_id")?),
-                    locked_until: time(&mut r, 1, "locked_until")?,
-                    consecutive_failures: col(&mut r, 2, "consecutive_failures")?,
+    pub async fn temp_locks(&self, tx: &mut dyn RecordTx) -> Result<Vec<TempLock>> {
+        let rows: Vec<LoginStateRow> = LOGIN_STATE.rows(tx, &Pk::new()).await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                r.locked_until.map(|locked_until| TempLock {
+                    user_id: r.user_id,
+                    locked_until,
+                    consecutive_failures: r.consecutive_failures,
                 })
             })
-            .collect()
+            .collect())
     }
 }
 
-/// `TIMESTAMPADD(...)` for a time parameter, or `?` for a NULL one.
-pub(crate) fn opt_at(some: bool) -> &'static str {
-    if some { AT } else { "?" }
-}
-
-/// Runs the user select `stmt` builds, with format 6's columns, or with
-/// `NULL`s in their place on a catalog before format 6 (1054).
-async fn select_users<Q: Queryable + Send>(
-    q: &mut Q,
-    stmt: impl Fn(&str) -> (String, Params),
-) -> Result<Vec<Row>> {
-    let (sql, p) = stmt(USER_COLS_DN);
-    match q.exec(sql, p).await {
-        Ok(rows) => Ok(rows),
-        Err(e) if unknown_column(&e) => {
-            let (sql, p) = stmt(USER_COLS_NO_DN);
-            q.exec(sql, p).await.map_err(map_err)
-        }
-        Err(e) => Err(map_err(e)),
-    }
-}
-
-/// Brings `schema`'s auth module to format 6 before a user gets `REQUIRE
-/// SUBJECT` or `ISSUER` (outside any change: the migration is DDL).
-///
-/// # Errors
-/// The migrator's.
-pub async fn migrate_dn(conn: &mut mysql_async::Conn, schema: &str) -> Result<()> {
-    sprig_catalog::Migrator::new(&[AUTH_MODULE])?
-        .run(
-            conn,
-            schema,
-            &sprig_catalog::migrate::MigrateOpts::default(),
-        )
-        .await?;
-    Ok(())
-}
-
-/// The parameters of every user column but `user_id`, in `insert_user`'s
-/// order.
-fn user_values(r: &UserRow) -> Vec<Value> {
-    vec![
-        Value::from(r.name.as_str()),
-        Value::from(r.host.as_str()),
-        Value::from(r.kind.as_str()),
-        Value::from(r.auth_methods.to_sql()),
-        Value::from(r.plugin.as_str()),
-        Value::from(r.mongo_db.clone()),
-        Value::from(r.home_space_id),
-        Value::from(r.require_tls.as_str()),
-        Value::from(r.account_locked),
-        Value::from(r.password_expired),
-        opt_micros(r.password_changed_at),
-        Value::from(r.password_lifetime),
-        Value::from(r.password_history),
-        Value::from(r.password_reuse_days),
-        Value::from(r.require_current.as_str()),
-        Value::from(r.failed_login_attempts),
-        Value::from(r.password_lock_minutes),
-        Value::from(r.limits.max_queries_per_hour),
-        Value::from(r.limits.max_updates_per_hour),
-        Value::from(r.limits.max_connections_per_hour),
-        Value::from(r.limits.max_user_connections),
-        Value::from(r.attributes.as_ref().map(ToString::to_string)),
-        Value::from(r.source.as_str()),
-        Value::from(r.created_by_tenant),
-        Value::from(r.state.as_str()),
-        Value::from(micros(r.created_at)),
-        Value::from(r.changed_version),
-    ]
-}
-
-fn user_row(mut r: Row) -> Result<UserRow> {
-    let text = |r: &mut Row, i: usize, n: &str| -> Result<String> {
-        let b: Vec<u8> = col(r, i, n)?;
-        String::from_utf8(b)
-            .map_err(|_| SprigError::internal(format!("auth catalog: {n} is not UTF-8")))
-    };
-    let attributes: Option<Vec<u8>> = col(&mut r, 22, "attributes")?;
-    Ok(UserRow {
-        user_id: UserId(col(&mut r, 0, "user_id")?),
-        name: text(&mut r, 1, "name")?,
-        host: text(&mut r, 2, "host")?,
-        kind: UserKind::parse(&text(&mut r, 3, "kind")?)?,
-        auth_methods: AuthMethods::parse(&text(&mut r, 4, "auth_methods")?)?,
-        plugin: text(&mut r, 5, "plugin")?,
-        mongo_db: col::<Option<Vec<u8>>>(&mut r, 6, "mongo_db")?
-            .map(|b| String::from_utf8_lossy(&b).into_owned()),
-        home_space_id: col(&mut r, 7, "home_space_id")?,
-        require_tls: RequireTls::parse(&text(&mut r, 8, "require_tls")?)?,
-        account_locked: col::<i64>(&mut r, 9, "account_locked")? != 0,
-        password_expired: col::<i64>(&mut r, 10, "password_expired")? != 0,
-        password_changed_at: opt_time(&mut r, 11, "password_changed_at")?,
-        password_lifetime: col(&mut r, 12, "password_lifetime")?,
-        password_history: col(&mut r, 13, "password_history")?,
-        password_reuse_days: col(&mut r, 14, "password_reuse_days")?,
-        require_current: RequireCurrent::parse(&text(&mut r, 15, "require_current")?)?,
-        failed_login_attempts: col(&mut r, 16, "failed_login_attempts")?,
-        password_lock_minutes: col(&mut r, 17, "password_lock_minutes")?,
-        limits: AccountLimits {
-            max_queries_per_hour: col(&mut r, 18, "max_queries_per_hour")?,
-            max_updates_per_hour: col(&mut r, 19, "max_updates_per_hour")?,
-            max_connections_per_hour: col(&mut r, 20, "max_connections_per_hour")?,
-            max_user_connections: col(&mut r, 21, "max_user_connections")?,
-        },
-        attributes: attributes
-            .map(|b| {
-                serde_json::from_slice(&b).map_err(|e| {
-                    SprigError::internal(format!("auth catalog: bad attributes JSON: {e}"))
-                })
-            })
-            .transpose()?,
-        source: UserSource::parse(&text(&mut r, 23, "source")?)?,
-        created_by_tenant: col(&mut r, 24, "created_by_tenant")?,
-        state: UserState::parse(&text(&mut r, 25, "state")?)?,
-        created_at: time(&mut r, 26, "created_at")?,
-        changed_version: col(&mut r, 27, "changed_version")?,
-        require_subject: col::<Option<Vec<u8>>>(&mut r, 28, "require_subject")?
-            .map(|b| String::from_utf8_lossy(&b).into_owned()),
-        require_issuer: col::<Option<Vec<u8>>>(&mut r, 29, "require_issuer")?
-            .map(|b| String::from_utf8_lossy(&b).into_owned()),
-    })
-}
-
-fn verifier_row(mut r: Row) -> Result<VerifierRow> {
-    let text = |r: &mut Row, i: usize, n: &str| -> Result<String> {
-        let b: Vec<u8> = col(r, i, n)?;
-        String::from_utf8(b)
-            .map_err(|_| SprigError::internal(format!("auth catalog: {n} is not UTF-8")))
-    };
-    Ok(VerifierRow {
-        verifier_id: col(&mut r, 0, "verifier_id")?,
-        user_id: UserId(col(&mut r, 1, "user_id")?),
-        kind: VerifierKind::parse(&text(&mut r, 2, "mechanism")?)?,
-        slot: Slot::parse(&text(&mut r, 3, "slot")?)?,
-        login_form: LoginForm::parse(&text(&mut r, 4, "login_form")?)?,
-        auth_string: col(&mut r, 5, "auth_string")?,
-        salt: col(&mut r, 6, "salt")?,
-        iterations: col(&mut r, 7, "iterations")?,
-        stored_key: col(&mut r, 8, "stored_key")?,
-        server_key: col(&mut r, 9, "server_key")?,
-        generation: col(&mut r, 10, "generation")?,
-        created_at: time(&mut r, 11, "created_at")?,
-    })
+/// MariaDB's order of verifier reads: by user, slot (in the column's
+/// order: primary, secondary, history) and id.
+fn sort_verifiers(v: &mut [VerifierRow]) {
+    let slot = |s: Slot| Slot::ALL.iter().position(|x| *x == s).unwrap_or(usize::MAX);
+    v.sort_by_key(|r| (r.user_id, slot(r.slot), r.verifier_id));
 }
 
 /// Microseconds since the epoch; times before it clamp to 0.
@@ -1420,37 +960,9 @@ pub(crate) fn micros(t: SystemTime) -> i64 {
         .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
 }
 
-pub(crate) fn opt_micros(t: Option<SystemTime>) -> Value {
-    Value::from(t.map(micros))
-}
-
 /// The time `m` microseconds after the epoch.
 pub(crate) fn from_micros(m: i64) -> SystemTime {
     UNIX_EPOCH + Duration::from_micros(u64::try_from(m).unwrap_or(0))
-}
-
-pub(crate) fn col<T: mysql_async::prelude::FromValue>(
-    r: &mut Row,
-    i: usize,
-    name: &str,
-) -> Result<T> {
-    match r.take_opt::<T, usize>(i) {
-        Some(Ok(v)) => Ok(v),
-        Some(Err(e)) => Err(SprigError::internal(format!(
-            "auth catalog column {name}: unexpected value: {e}"
-        ))),
-        None => Err(SprigError::internal(format!(
-            "auth catalog column {name} missing from the result"
-        ))),
-    }
-}
-
-pub(crate) fn time(r: &mut Row, i: usize, name: &str) -> Result<SystemTime> {
-    Ok(from_micros(col::<i64>(r, i, name)?))
-}
-
-pub(crate) fn opt_time(r: &mut Row, i: usize, name: &str) -> Result<Option<SystemTime>> {
-    Ok(col::<Option<i64>>(r, i, name)?.map(from_micros))
 }
 
 /// Maps a driver error the way `sprig-catalog` does: lock waits and
@@ -1472,22 +984,6 @@ pub(crate) fn map_err(e: mysql_async::Error) -> SprigError {
         .with_source(e),
         _ => SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e),
     }
-}
-
-pub(crate) async fn exec<Q: Queryable + Send>(q: &mut Q, sql: String, p: Vec<Value>) -> Result<()> {
-    q.exec_drop(sql, Params::Positional(p))
-        .await
-        .map_err(map_err)
-}
-
-pub(crate) async fn exec_count<Q: Queryable + Send>(
-    q: &mut Q,
-    sql: String,
-    p: Vec<Value>,
-) -> Result<u64> {
-    exec(q, sql, p).await?;
-    let n: Option<i64> = q.query_first("SELECT ROW_COUNT()").await.map_err(map_err)?;
-    Ok(n.and_then(|n| u64::try_from(n).ok()).unwrap_or(0))
 }
 
 #[cfg(test)]

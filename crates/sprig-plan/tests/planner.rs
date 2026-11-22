@@ -338,6 +338,79 @@ fn subqueries_derived_tables_and_unions() {
     assert_eq!(rows, ["10", "10", "10", "20", "40"]);
 }
 
+/// `INTERSECT` and `EXCEPT`, with and without `ALL`; table value
+/// constructors on their own and as a set operation's input; `ORDER BY`
+/// and `LIMIT` over the whole result.
+#[test]
+fn intersect_except_and_values() {
+    // emp.dept: 10, 10, 20, NULL, 20, 30; dept.id: 10, 20, 40.
+    let q = |sql: &str| run(sql).0;
+    assert_eq!(
+        q("SELECT dept FROM emp INTERSECT SELECT id FROM dept ORDER BY 1"),
+        ["10", "20"]
+    );
+    assert_eq!(
+        q("SELECT dept FROM emp INTERSECT ALL SELECT id FROM dept UNION ALL SELECT 10 ORDER BY 1"),
+        ["10", "10", "20"]
+    );
+    assert_eq!(
+        q(
+            "SELECT dept FROM emp INTERSECT ALL (SELECT id FROM dept UNION ALL SELECT 20) ORDER BY 1"
+        ),
+        ["10", "20", "20"]
+    );
+    assert_eq!(
+        q("SELECT dept FROM emp EXCEPT SELECT id FROM dept ORDER BY 1"),
+        ["NULL", "30"]
+    );
+    assert_eq!(
+        q("SELECT dept FROM emp EXCEPT ALL SELECT id FROM dept ORDER BY 1"),
+        ["NULL", "10", "20", "30"]
+    );
+    assert_eq!(q("SELECT id FROM dept EXCEPT SELECT dept FROM emp"), ["40"]);
+    // NULL matches NULL.
+    assert_eq!(q("SELECT dept FROM emp INTERSECT SELECT NULL"), ["NULL"]);
+    // INTERSECT binds tighter than UNION and EXCEPT.
+    assert_eq!(
+        q("SELECT 40 UNION SELECT dept FROM emp INTERSECT SELECT id FROM dept ORDER BY 1"),
+        ["10", "20", "40"]
+    );
+    assert_eq!(
+        q("SELECT id FROM dept EXCEPT SELECT 10 INTERSECT SELECT 10 ORDER BY 1"),
+        ["20", "40"]
+    );
+    // Case-insensitive names are equal under emp.name's collation.
+    assert_eq!(
+        q("SELECT name FROM emp WHERE id = 1 INTERSECT SELECT name FROM emp WHERE id = 5"),
+        ["Ann"]
+    );
+    assert_eq!(
+        q("SELECT id FROM dept EXCEPT SELECT dept FROM emp ORDER BY 1 LIMIT 1"),
+        ["40"]
+    );
+    // Table value constructors: MariaDB's form and MySQL's ROW form.
+    assert_eq!(q("VALUES (1, 'a'), (2, 'b')"), ["1|a", "2|b"]);
+    assert_eq!(q("VALUES ROW(3), ROW(1) ORDER BY 1"), ["1", "3"]);
+    assert_eq!(
+        q("SELECT id, title FROM dept WHERE id = 10 UNION ALL VALUES (7, 'x'), (8, NULL)"),
+        ["10|eng", "7|x", "8|NULL"]
+    );
+    assert_eq!(
+        q(
+            "SELECT e.name, g.t FROM emp e JOIN (SELECT 10 AS d, 'ten' AS t UNION ALL VALUES (20, 'twenty')) g ON g.d = e.dept ORDER BY e.id"
+        ),
+        ["Ann|ten", "bob|ten", "Cy|twenty", "ann|twenty"]
+    );
+    assert_eq!(
+        error(
+            Persona::MySql,
+            "SELECT id FROM emp INTERSECT SELECT id, title FROM dept"
+        )
+        .0,
+        1222
+    );
+}
+
 #[test]
 fn a_simple_derived_table_keeps_its_tables_keys() {
     let (rows, sig, examined) =
@@ -504,4 +577,49 @@ fn every_condition_kept_gives_the_same_rows() {
         );
         assert!(common::same(&a.outcome, &b.outcome, false), "{sql}");
     }
+}
+
+#[test]
+fn parenthesized_inner_joins_are_written_out_flat() {
+    let flat = run("SELECT e.name FROM emp e JOIN dept d ON d.id = e.dept JOIN emp f ON f.id = e.id ORDER BY e.id").0;
+    for sql in [
+        "SELECT e.name FROM (emp e JOIN dept d ON d.id = e.dept) JOIN emp f ON f.id = e.id ORDER BY e.id",
+        "SELECT e.name FROM emp e JOIN (dept d CROSS JOIN emp f) ON d.id = e.dept AND f.id = e.id ORDER BY e.id",
+        "SELECT e.name FROM (emp e JOIN dept d ON d.id = e.dept JOIN emp f ON f.id = e.id) ORDER BY e.id",
+    ] {
+        assert_eq!(run(sql).0, flat, "{sql}");
+    }
+    let left = "SELECT e.name, f.name FROM emp e JOIN dept d ON d.id = e.dept LEFT JOIN emp f ON f.id = e.id + 10 ORDER BY e.id";
+    let nested = "SELECT e.name, f.name FROM (emp e JOIN dept d ON d.id = e.dept) LEFT JOIN emp f ON f.id = e.id + 10 ORDER BY e.id";
+    assert_eq!(run(nested).0, run(left).0);
+}
+
+/// An inner join's `ON` may hold a scalar subquery that reads a row of
+/// the join (hierarchy functions expand to one): it filters as the same
+/// condition in `WHERE` does.
+#[test]
+fn a_correlated_scalar_subquery_in_an_inner_join_on() {
+    let on = "SELECT e.name, f.name FROM emp e JOIN emp f ON e.sal >= (SELECT g.sal FROM emp g WHERE g.id = f.id) WHERE f.id = 2 ORDER BY e.id";
+    let wh = "SELECT e.name, f.name FROM emp e JOIN emp f ON TRUE WHERE e.sal >= (SELECT g.sal FROM emp g WHERE g.id = f.id) AND f.id = 2 ORDER BY e.id";
+    let (rows, _, _) = run(on);
+    assert!(!rows.is_empty());
+    assert_eq!(rows, run(wh).0);
+    let count = "SELECT COUNT(*) FROM emp a JOIN emp b ON a.id >= (SELECT h.id FROM emp AS h WHERE h.id = b.id) AND a.id < (SELECT h.id + 3 FROM emp AS h WHERE h.id = b.id) WHERE b.id = 1";
+    assert_eq!(
+        run(count).0,
+        run("SELECT COUNT(*) FROM emp WHERE id >= 1 AND id < 4").0
+    );
+}
+
+/// A parenthesized join of any kind as the first item of `FROM` is
+/// written out flat: joins associate to the left.
+#[test]
+fn a_leading_parenthesized_outer_join_is_written_out_flat() {
+    let flat = "SELECT e.name, d.title FROM emp e LEFT JOIN dept d ON d.id = e.dept ORDER BY e.id";
+    let nested =
+        "SELECT e.name, d.title FROM (emp e LEFT JOIN dept d ON d.id = e.dept) ORDER BY e.id";
+    assert_eq!(run(nested).0, run(flat).0);
+    let more = "SELECT e.name, f.name FROM (emp e LEFT JOIN dept d ON d.id = e.dept) JOIN emp f ON f.id = e.id ORDER BY e.id";
+    let more_flat = "SELECT e.name, f.name FROM emp e LEFT JOIN dept d ON d.id = e.dept JOIN emp f ON f.id = e.id ORDER BY e.id";
+    assert_eq!(run(more).0, run(more_flat).0);
 }

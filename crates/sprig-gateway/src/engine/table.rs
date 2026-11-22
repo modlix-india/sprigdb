@@ -23,6 +23,7 @@
 //! the reason, and its statements fail with `ER_SPRIG_NOT_ON_ENGINE`.
 //! [`check_create`] refuses the common cases before the table is created.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -211,6 +212,9 @@ pub(crate) struct Column {
     pub flags: u16,
     /// The column's value is worked out from the row's other columns.
     pub generated: Option<Generated>,
+    /// `INVISIBLE`: left out of `SELECT *` and of an `INSERT` without a
+    /// column list (both servers).
+    pub invisible: bool,
 }
 
 impl Column {
@@ -273,6 +277,125 @@ pub(crate) struct Index {
     pub unique: bool,
 }
 
+/// What a foreign key does when its parent row is deleted or its key
+/// changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FkAction {
+    /// `RESTRICT`.
+    Restrict,
+    /// `NO ACTION` (the same as `RESTRICT`: checked at once).
+    NoAction,
+    /// `CASCADE`.
+    Cascade,
+    /// `SET NULL`.
+    SetNull,
+    /// `SET DEFAULT`: both servers accept it and act as `RESTRICT`.
+    SetDefault,
+}
+
+impl FkAction {
+    fn read(p: &mut P) -> Option<Self> {
+        Some(if p.word("CASCADE") {
+            Self::Cascade
+        } else if p.word("RESTRICT") {
+            Self::Restrict
+        } else if p.word("SET") {
+            if p.word("NULL") {
+                Self::SetNull
+            } else if p.word("DEFAULT") {
+                Self::SetDefault
+            } else {
+                return None;
+            }
+        } else if p.word("NO") && p.word("ACTION") {
+            Self::NoAction
+        } else {
+            return None;
+        })
+    }
+
+    fn sql(self) -> &'static str {
+        match self {
+            Self::Restrict => "RESTRICT",
+            Self::NoAction => "NO ACTION",
+            Self::Cascade => "CASCADE",
+            Self::SetNull => "SET NULL",
+            Self::SetDefault => "SET DEFAULT",
+        }
+    }
+
+    /// Whether the action changes the child rows (otherwise it refuses
+    /// the parent's change while they exist).
+    pub(crate) fn acts(self) -> bool {
+        matches!(self, Self::Cascade | Self::SetNull)
+    }
+}
+
+/// A foreign key of the table (the child).
+#[derive(Debug, Clone)]
+pub(crate) struct ForeignKey {
+    /// The constraint's name.
+    pub name: String,
+    /// The child's columns, in the key's order.
+    pub cols: Vec<usize>,
+    /// The parent's database as the definition names it (`None`: the
+    /// child's own).
+    pub ref_db: Option<String>,
+    /// The parent table's name.
+    pub ref_table: String,
+    /// The parent's columns, by name, in the key's order.
+    pub ref_cols: Vec<String>,
+    /// `ON DELETE`, as written (`None`: not written, `RESTRICT`).
+    pub on_delete: Option<FkAction>,
+    /// `ON UPDATE`, as written.
+    pub on_update: Option<FkAction>,
+}
+
+impl ForeignKey {
+    /// What deleting the parent row does.
+    pub(crate) fn delete_action(&self) -> FkAction {
+        self.on_delete.unwrap_or(FkAction::Restrict)
+    }
+
+    /// What changing the parent's key does.
+    pub(crate) fn update_action(&self) -> FkAction {
+        self.on_update.unwrap_or(FkAction::Restrict)
+    }
+
+    /// The constraint as 1451 and 1452 quote it: its definition as the
+    /// session's server prints it, without `SET DEFAULT` (which neither
+    /// server keeps), `RESTRICT` printed by MySQL only and `NO ACTION` by
+    /// MariaDB only.
+    pub(crate) fn text(&self, def: &TableDef, mysql: bool) -> String {
+        let q = |n: &str| format!("`{}`", n.replace('`', "``"));
+        let cols: Vec<String> = self.cols.iter().map(|&c| q(&def.columns[c].name)).collect();
+        let refs: Vec<String> = self.ref_cols.iter().map(|c| q(c)).collect();
+        let mut s = format!(
+            "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}{} ({})",
+            q(&self.name),
+            cols.join(", "),
+            self.ref_db
+                .as_deref()
+                .map(|d| format!("{}.", q(d)))
+                .unwrap_or_default(),
+            q(&self.ref_table),
+            refs.join(", ")
+        );
+        let shown = |a: FkAction| match a {
+            FkAction::SetDefault => false,
+            FkAction::Restrict => mysql,
+            FkAction::NoAction => !mysql,
+            FkAction::Cascade | FkAction::SetNull => true,
+        };
+        for (what, a) in [("DELETE", self.on_delete), ("UPDATE", self.on_update)] {
+            if let Some(a) = a.filter(|a| shown(*a)) {
+                let _ = write!(s, " ON {what} {}", a.sql());
+            }
+        }
+        s
+    }
+}
+
 /// A table as the engine serves it.
 #[derive(Debug, Clone)]
 pub(crate) struct TableDef {
@@ -290,6 +413,15 @@ pub(crate) struct TableDef {
     pub pk: Vec<usize>,
     /// How each primary key column is encoded (no NULL marker).
     pub pk_parts: Vec<KeyColumn>,
+    /// The primary key's name in errors: `PRIMARY`, or the unique key the
+    /// servers take as the primary key of a table without one.
+    pub pk_name: String,
+    /// The table has neither a primary key nor a unique key that can
+    /// stand for one: its rows are keyed by a hidden row number, which
+    /// `pk` names as the column after the last ([`TableDef::columns`]'s
+    /// length) and which a row read from the table carries as one more
+    /// value at that place.
+    pub hidden: bool,
     /// Secondary indexes.
     pub indexes: Vec<Index>,
     /// The `AUTO_INCREMENT` column.
@@ -308,6 +440,8 @@ pub(crate) struct TableDef {
     pub checks_mysql: Vec<usize>,
     /// The generated columns, in definition order.
     pub generated_cols: Vec<usize>,
+    /// The foreign keys, in definition order.
+    pub fks: Vec<ForeignKey>,
 }
 
 impl TableDef {
@@ -379,6 +513,12 @@ impl TableDef {
         &self.indexes[ix].parts
     }
 }
+
+/// The hidden row number's type in keys: an unsigned 8-byte integer.
+pub(crate) const HIDDEN_TYPE: ColType = ColType::Int {
+    bytes: 8,
+    unsigned: true,
+};
 
 /// A token of `SHOW CREATE TABLE` text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -594,6 +734,70 @@ impl P {
     }
 }
 
+/// A foreign key as the definition's text has it.
+struct RawFk {
+    name: String,
+    cols: Vec<String>,
+    ref_db: Option<String>,
+    ref_table: String,
+    ref_cols: Vec<String>,
+    on_delete: Option<FkAction>,
+    on_update: Option<FkAction>,
+}
+
+/// `KEY (cols) REFERENCES [db.]table (cols) [ON DELETE a] [ON UPDATE a]`,
+/// after `CONSTRAINT name FOREIGN`.
+fn raw_fk(p: &mut P, name: String) -> Option<RawFk> {
+    let names = |p: &mut P| -> Option<Vec<String>> {
+        if !p.punct('(') {
+            return None;
+        }
+        let mut v = Vec::new();
+        loop {
+            v.push(p.ident()?);
+            if p.punct(')') {
+                return Some(v);
+            }
+            if !p.punct(',') {
+                return None;
+            }
+        }
+    };
+    if !p.word("KEY") {
+        return None;
+    }
+    let cols = names(p)?;
+    if !p.word("REFERENCES") {
+        return None;
+    }
+    let first = p.ident()?;
+    let (ref_db, ref_table) = if p.punct('.') {
+        (Some(first), p.ident()?)
+    } else {
+        (None, first)
+    };
+    let ref_cols = names(p)?;
+    let (mut on_delete, mut on_update) = (None, None);
+    while p.word("ON") {
+        if p.word("DELETE") {
+            on_delete = Some(FkAction::read(p)?);
+        } else if p.word("UPDATE") {
+            on_update = Some(FkAction::read(p)?);
+        } else {
+            return None;
+        }
+    }
+    (cols.len() == ref_cols.len() && !cols.is_empty()).then_some(RawFk {
+        name,
+        cols,
+        ref_db,
+        ref_table,
+        ref_cols,
+        on_delete,
+        on_update,
+    })
+}
+
 /// Tokens as SQL text again: an expression of the definition, for the
 /// expression compiler.
 fn sql_of(toks: &[Tok]) -> String {
@@ -652,7 +856,42 @@ fn compile_expr(def: &TableDef, text: &str) -> std::result::Result<CExpr, String
         backslash: true,
         hints: Vec::new(),
     };
-    c.compile(&e).map_err(|_| format!("the expression {text}"))
+    match c.compile(&e) {
+        Ok(x) => Ok(x),
+        // What the single-table compiler doesn't have, the expression
+        // engine may.
+        Err(_) => exec_expr(def, &e).map_err(|why| format!("the expression {text} ({why})")),
+    }
+}
+
+/// `e`, an expression of `def`'s own columns, compiled by the expression
+/// engine for both ports. Columns whose stored values it would misread
+/// (`ENUM`, `SET`, `BIT`, `JSON`) are refused.
+fn exec_expr(def: &TableDef, e: &sqlparser::ast::Expr) -> std::result::Result<CExpr, String> {
+    let table = super::general::names::plan_table(def, "");
+    let mut out = Vec::with_capacity(2);
+    for persona in [sprig_exec::Persona::MariaDb, sprig_exec::Persona::MySql] {
+        let session = sprig_exec::Session::new(persona);
+        let db = sprig_plan::mem::MemDb::new("");
+        let storage: Arc<dyn sprig_plan::access::Storage> = Arc::new(db.clone());
+        let planner = sprig_plan::Planner::new(&db, storage, &session);
+        let (x, read) = planner.scalar(&table, e).map_err(|e| e.message)?;
+        if let Some(t) = read
+            .iter()
+            .filter_map(|&c| def.columns.get(c))
+            .find_map(|c| super::general::names::opaque(c.ty))
+        {
+            return Err(format!("it reads a {t} column"));
+        }
+        let c = sprig_exec::compile(&x, &session).map_err(|e| e.message)?;
+        out.push((session, c));
+    }
+    let mysql = out.pop().ok_or("no MySQL form")?;
+    let maria = out.pop().ok_or("no MariaDB form")?;
+    Ok(CExpr::Exec(Arc::new(super::expr::ExecExpr {
+        maria,
+        mysql,
+    })))
 }
 
 /// What [`parse`] found: the definition, or why the engine can't serve
@@ -715,6 +954,7 @@ struct RawCol {
     json: bool,
     /// `GENERATED ALWAYS AS (text)`, and whether it is `STORED`.
     generated: Option<(String, bool)>,
+    invisible: bool,
 }
 
 fn small(t: Option<&Tok>) -> Option<u8> {
@@ -904,6 +1144,7 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
     // `CHECK` constraints: the column they were declared on, their name,
     // their expression.
     let mut raw_checks: Vec<(Option<usize>, Option<String>, String)> = Vec::new();
+    let mut raw_fks: Vec<RawFk> = Vec::new();
     loop {
         match p.peek().cloned() {
             Some(Tok::Ident(c)) => {
@@ -950,6 +1191,7 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
                     collation: None,
                     json: false,
                     generated: None,
+                    invisible: false,
                 };
                 loop {
                     if p.word("NOT") {
@@ -1058,7 +1300,8 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
                     } else if p.word("AS") {
                         return bad("a generated column");
                     } else if p.word("INVISIBLE") {
-                        return bad("an invisible column");
+                        rc.invisible = true;
+                    } else if p.word("VISIBLE") {
                     } else if p.word("COMPRESSED") {
                         return bad("a compressed column");
                     } else {
@@ -1108,8 +1351,21 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
                 let Some(n) = p.ident() else {
                     return bad("a constraint");
                 };
+                if p.word("FOREIGN") {
+                    match raw_fk(&mut p, n) {
+                        Some(f) => raw_fks.push(f),
+                        None => return bad("a foreign key"),
+                    }
+                    if p.punct(',') {
+                        continue;
+                    }
+                    if p.punct(')') {
+                        break;
+                    }
+                    return bad("table elements");
+                }
                 if !p.word("CHECK") {
-                    return bad("a foreign key");
+                    return bad("a constraint");
                 }
                 let Some(g) = p.group() else {
                     return bad("a CHECK constraint");
@@ -1316,6 +1572,7 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
             mb3,
             flags: 0,
             generated: None,
+            invisible: rc.invisible,
         });
     }
     // Defaults, in each column's stored form (expressions are compiled
@@ -1369,6 +1626,25 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
             }
             Some((i, k))
         };
+    // Without a primary key, both servers take the first unique key whose
+    // columns are all `NOT NULL` and whole (no prefix) as the table's
+    // primary key (the definition lists such keys first): its columns
+    // report `PRI`, the rows are kept in its order, and its errors name
+    // it. Without one either, the rows are keyed by a hidden row number.
+    let mut pk_name = String::from("PRIMARY");
+    if pk.is_empty()
+        && let Some(at) = keys.iter().position(|(_, parts, unique)| {
+            *unique
+                && parts.iter().all(|rp| {
+                    rp.prefix.is_none() && find(&rp.name).is_some_and(|i| !columns[i].nullable)
+                })
+        })
+    {
+        let (n, parts, _) = keys.remove(at);
+        pk = parts;
+        pk_name = n;
+    }
+    let hidden = pk.is_empty();
     let mut pk_idx = Vec::new();
     let mut pk_parts = Vec::new();
     for rp in &pk {
@@ -1378,8 +1654,9 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
         pk_idx.push(i);
         pk_parts.push(k);
     }
-    if pk_idx.is_empty() {
-        return bad("no primary key");
+    if hidden {
+        pk_idx.push(columns.len());
+        pk_parts.push(KeyColumn::new(HIDDEN_TYPE));
     }
     let mut indexes = Vec::new();
     for (n, l, unique) in &keys {
@@ -1505,6 +1782,8 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
         columns,
         pk: pk_idx,
         pk_parts,
+        pk_name,
+        hidden,
         indexes,
         auto_inc,
         auto_inc_start,
@@ -1513,8 +1792,27 @@ pub(crate) fn parse(object: ObjectId, version: u64, db: DbId, create_sql: &str) 
         checks: Vec::new(),
         checks_mysql: Vec::new(),
         generated_cols: Vec::new(),
+        fks: Vec::new(),
     };
     def.index_sigs = super::indexes::sigs(&def);
+    for f in raw_fks {
+        let mut cols = Vec::with_capacity(f.cols.len());
+        for c in &f.cols {
+            let Some(i) = def.column(c) else {
+                return bad("a foreign key column");
+            };
+            cols.push(i);
+        }
+        def.fks.push(ForeignKey {
+            name: f.name,
+            cols,
+            ref_db: f.ref_db,
+            ref_table: f.ref_table,
+            ref_cols: f.ref_cols,
+            on_delete: f.on_delete,
+            on_update: f.on_update,
+        });
+    }
     // Expressions, compiled against the whole table.
     let mut defaults = Vec::with_capacity(default_exprs.len());
     for (i, text) in default_exprs {
@@ -1691,14 +1989,8 @@ pub(crate) fn check_create(text: &str) -> std::result::Result<(), String> {
                     word(0).unwrap_or_default().to_ascii_lowercase()
                 ));
             }
-            Some("FOREIGN") => return Err("a foreign key".into()),
-            Some("CONSTRAINT") => {
-                if e.iter().any(|x| *x == Tok::Word("FOREIGN".into())) {
-                    return Err("a foreign key".into());
-                }
-                continue;
-            }
-            Some("CHECK") => continue,
+            // Foreign keys are enforced by the engine.
+            Some("FOREIGN" | "CONSTRAINT" | "CHECK") => continue,
             Some("PERIOD") => return Err("an application-time period".into()),
             Some("PRIMARY" | "UNIQUE" | "KEY" | "INDEX") if e.len() > 1 => continue,
             _ => {}
@@ -1746,7 +2038,6 @@ pub(crate) fn check_create(text: &str) -> std::result::Result<(), String> {
             match w.as_str() {
                 "ZEROFILL" => return Err("ZEROFILL".into()),
                 "REFERENCES" => return Err("a foreign key".into()),
-                "INVISIBLE" => return Err("an invisible column".into()),
                 "COMPRESSED" => return Err("a compressed column".into()),
                 "COLLATE" | "CHARSET" => {
                     if let Some(n) = name(i + 1) {
@@ -1867,7 +2158,25 @@ mod tests {
         let m = "CREATE TABLE `t` (\n  `a` int(11) NOT NULL,\n  PRIMARY KEY (`a`)\n) ENGINE=MyISAM";
         assert!(parse(ObjectId(1), 1, DbId(1), m).is_err());
         let f = "CREATE TABLE `t` (\n  `a` int(11) NOT NULL,\n  `b` int(11) DEFAULT NULL,\n  PRIMARY KEY (`a`),\n  KEY `b` (`b`),\n  CONSTRAINT `fk` FOREIGN KEY (`b`) REFERENCES `p` (`id`)\n) ENGINE=InnoDB";
-        assert!(parse(ObjectId(1), 1, DbId(1), f).is_err());
+        // A foreign key is read into the definition.
+        let fk = parse(ObjectId(1), 1, DbId(1), f).unwrap();
+        assert_eq!(fk.fks.len(), 1);
+        assert_eq!(fk.fks[0].cols, vec![1]);
+        assert_eq!(fk.fks[0].ref_table, "p");
+        assert_eq!(
+            fk.fks[0].text(&fk, false),
+            "CONSTRAINT `fk` FOREIGN KEY (`b`) REFERENCES `p` (`id`)"
+        );
+        let g = "CREATE TABLE `t` (\n  `a` int(11) NOT NULL,\n  `b` int(11) DEFAULT NULL,\n  PRIMARY KEY (`a`),\n  KEY `b` (`b`),\n  CONSTRAINT `fk` FOREIGN KEY (`b`) REFERENCES `d`.`p` (`id`) ON DELETE RESTRICT ON UPDATE NO ACTION\n) ENGINE=InnoDB";
+        let g = parse(ObjectId(1), 1, DbId(1), g).unwrap();
+        assert_eq!(
+            g.fks[0].text(&g, false),
+            "CONSTRAINT `fk` FOREIGN KEY (`b`) REFERENCES `d`.`p` (`id`) ON UPDATE NO ACTION"
+        );
+        assert_eq!(
+            g.fks[0].text(&g, true),
+            "CONSTRAINT `fk` FOREIGN KEY (`b`) REFERENCES `d`.`p` (`id`) ON DELETE RESTRICT"
+        );
         // A generated column is served when its expression is one the
         // engine works out.
         let g = "CREATE TABLE `t` (\n  `a` int(11) NOT NULL,\n  `b` int(11) GENERATED ALWAYS AS (`a` + 1) VIRTUAL,\n  `c` int(11) GENERATED ALWAYS AS (`a` * `b`) STORED,\n  PRIMARY KEY (`a`)\n) ENGINE=InnoDB";
@@ -1879,7 +2188,16 @@ mod tests {
             .map(|&i| t.columns[i].generated.as_ref().unwrap().stored)
             .collect();
         assert_eq!(stored, vec![false, true]);
+        // A function the single-table compiler doesn't have: worked out by
+        // the expression engine.
         let g = "CREATE TABLE `t` (\n  `a` int(11) NOT NULL,\n  `b` varchar(9) GENERATED ALWAYS AS (concat(`a`,'x')) VIRTUAL,\n  PRIMARY KEY (`a`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci";
+        let t = parse(ObjectId(1), 1, DbId(1), g).unwrap();
+        assert!(matches!(
+            t.columns[1].generated.as_ref().map(|g| &*g.expr),
+            Some(CExpr::Exec(_))
+        ));
+        // Except over a column whose stored form it would misread.
+        let g = "CREATE TABLE `t` (\n  `a` enum('x','y') NOT NULL,\n  `b` varchar(9) GENERATED ALWAYS AS (concat(`a`,'x')) VIRTUAL,\n  PRIMARY KEY (`a`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci";
         let e = parse(ObjectId(1), 1, DbId(1), g).unwrap_err();
         assert!(
             e.contains("generated column the engine can't work out"),
@@ -1948,16 +2266,20 @@ mod tests {
             (constant(2), constant(3), constant(4), constant(1)),
             (Some(true), Some(false), Some(false), None)
         );
-        // What the evaluator can't work out is refused, naming it.
+        // What the single-table compiler doesn't have goes to the
+        // expression engine.
         let like = "CREATE TABLE `t` (\n  `id` int(11) NOT NULL,\n  `d` varchar(9) DEFAULT NULL,\n  PRIMARY KEY (`id`),\n  CONSTRAINT `CONSTRAINT_1` CHECK (`d`  not like 'z%')\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci";
-        let e = parse(ObjectId(1), 1, DbId(1), like).unwrap_err();
+        let t = parse(ObjectId(1), 1, DbId(1), like).unwrap();
+        assert!(matches!(t.checks[0].expr, CExpr::Exec(_)));
+        let call = "CREATE TABLE `t` (\n  `id` int(11) NOT NULL,\n  `d` varchar(9) DEFAULT concat('x','y'),\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci";
+        parse(ObjectId(1), 1, DbId(1), call).unwrap();
+        // What neither can work out is refused, naming it.
+        let sub = "CREATE TABLE `t` (\n  `id` int(11) NOT NULL,\n  `d` varchar(9) DEFAULT NULL,\n  PRIMARY KEY (`id`),\n  CONSTRAINT `CONSTRAINT_1` CHECK (`d` in (select 1))\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci";
+        let e = parse(ObjectId(1), 1, DbId(1), sub).unwrap_err();
         assert!(
             e.contains("CHECK constraint the engine can't evaluate"),
             "{e}"
         );
-        let call = "CREATE TABLE `t` (\n  `id` int(11) NOT NULL,\n  `d` varchar(9) DEFAULT concat('x','y'),\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci";
-        let e = parse(ObjectId(1), 1, DbId(1), call).unwrap_err();
-        assert!(e.contains("DEFAULT the engine can't evaluate"), "{e}");
     }
 
     #[test]
@@ -1974,7 +2296,7 @@ mod tests {
             check_create(
                 "CREATE TABLE t (id INT PRIMARY KEY, p INT, FOREIGN KEY (p) REFERENCES o (id))"
             )
-            .is_err()
+            .is_ok()
         );
         assert!(
             check_create("CREATE TABLE t (id INT PRIMARY KEY, b TEXT, FULLTEXT KEY (b))").is_err()

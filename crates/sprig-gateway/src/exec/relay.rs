@@ -716,6 +716,57 @@ async fn local_infile(
     Ok(true)
 }
 
+/// A text result the gateway made itself in the backend's shape (the
+/// storage engine answering a `SHOW` for its tables with physical names),
+/// sent as [`relay`] sends a backend's: definitions and rows through the
+/// statement's name mapping, then the end of rows with `status`.
+///
+/// # Errors
+/// The client connection's, or a row the mapping can't read.
+pub(crate) async fn relay_local(
+    out: &mut dyn ResultSink,
+    r: &Relay<'_>,
+    defs: &[Bytes],
+    rows: Vec<Bytes>,
+    status: StatusFlags,
+    mut names: Option<&mut NamesOut<'_>>,
+) -> Result<Relayed> {
+    let client_caps = out.wire().caps;
+    let mut cols: Vec<ColumnDef> = Vec::new();
+    begin(out, defs, r, client_caps, names.as_deref_mut(), &mut cols).await?;
+    for p in rows {
+        if let Some(n) = names.as_deref_mut().filter(|n| n.mapper.needs_rows()) {
+            let mut mapped = Vec::new();
+            n.mapper
+                .row_packet(&p, cols.len(), &n.ctx, &mut mapped)
+                .map_err(|e| protocol_error(&format!("text row: {e}")))?;
+            for row in mapped {
+                out.raw_row(n.alias_text(row, cols.len())).await?;
+            }
+        } else {
+            out.raw_row(p).await?;
+        }
+    }
+    if let Some(n) = names.filter(|n| n.mapper.needs_rows()) {
+        let mut mapped = Vec::new();
+        n.mapper.finish_packets(&n.ctx, &mut mapped);
+        for row in mapped {
+            out.raw_row(n.alias_text(row, cols.len())).await?;
+        }
+    }
+    let status = r.status(status);
+    out.end_rows(EndOfRows {
+        status,
+        warnings: 0,
+    })
+    .await?;
+    Ok(Relayed {
+        errored: false,
+        cursor_opened: false,
+        status: Some(status),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -823,55 +874,4 @@ mod tests {
         assert!(out.session_state.is_empty());
         assert!(!out.status.contains(StatusFlags::SESSION_STATE_CHANGED));
     }
-}
-
-/// A text result the gateway made itself in the backend's shape (the
-/// storage engine answering a `SHOW` for its tables with physical names),
-/// sent as [`relay`] sends a backend's: definitions and rows through the
-/// statement's name mapping, then the end of rows with `status`.
-///
-/// # Errors
-/// The client connection's, or a row the mapping can't read.
-pub(crate) async fn relay_local(
-    out: &mut dyn ResultSink,
-    r: &Relay<'_>,
-    defs: &[Bytes],
-    rows: Vec<Bytes>,
-    status: StatusFlags,
-    mut names: Option<&mut NamesOut<'_>>,
-) -> Result<Relayed> {
-    let client_caps = out.wire().caps;
-    let mut cols: Vec<ColumnDef> = Vec::new();
-    begin(out, defs, r, client_caps, names.as_deref_mut(), &mut cols).await?;
-    for p in rows {
-        if let Some(n) = names.as_deref_mut().filter(|n| n.mapper.needs_rows()) {
-            let mut mapped = Vec::new();
-            n.mapper
-                .row_packet(&p, cols.len(), &n.ctx, &mut mapped)
-                .map_err(|e| protocol_error(&format!("text row: {e}")))?;
-            for row in mapped {
-                out.raw_row(n.alias_text(row, cols.len())).await?;
-            }
-        } else {
-            out.raw_row(p).await?;
-        }
-    }
-    if let Some(n) = names.as_deref_mut().filter(|n| n.mapper.needs_rows()) {
-        let mut mapped = Vec::new();
-        n.mapper.finish_packets(&n.ctx, &mut mapped);
-        for row in mapped {
-            out.raw_row(n.alias_text(row, cols.len())).await?;
-        }
-    }
-    let status = r.status(status);
-    out.end_rows(EndOfRows {
-        status,
-        warnings: 0,
-    })
-    .await?;
-    Ok(Relayed {
-        errored: false,
-        cursor_opened: false,
-        status: Some(status),
-    })
 }

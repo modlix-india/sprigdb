@@ -237,6 +237,8 @@ impl Walk<'_, '_> {
     fn table_of(&mut self, name: &ObjectName, alias: Option<&Ident>) -> Option<usize> {
         let parts: Option<Vec<&Ident>> = name.0.iter().map(ident_of).collect();
         let (db, table) = match parts.as_deref() {
+            // `FROM DUAL` reads no table.
+            Some([t]) if crate::engine::plan::is_dual(t) => return None,
             Some([t]) => {
                 let db = self.cx.current.filter(|d| self.cx.names.engine_db(*d));
                 // A common table expression's name, unless a table of the
@@ -541,7 +543,7 @@ impl Visitor for Walk<'_, '_> {
 }
 
 /// Column types whose stored values the expression engine would misread.
-fn opaque(ty: ColType) -> Option<&'static str> {
+pub(crate) fn opaque(ty: ColType) -> Option<&'static str> {
     match ty {
         ColType::Enum { .. } => Some("ENUM"),
         ColType::Set { .. } => Some("SET"),
@@ -551,34 +553,54 @@ fn opaque(ty: ColType) -> Option<&'static str> {
     }
 }
 
+/// The reserved name of a hidden row number in the planner's tables.
+pub(crate) const HIDDEN_ROW: &str = "_sprig_hidden_row";
+
 /// `def` as the planner sees it, in database `db_name`.
-fn plan_table(def: &TableDef, db_name: &str) -> PlanTable {
+pub(crate) fn plan_table(def: &TableDef, db_name: &str) -> PlanTable {
     let part = |column: usize, kc: &sprig_engine::keys::typed::KeyColumn| IndexPart {
         column,
         prefix: kc.prefix,
         desc: kc.desc,
     };
+    let mut columns: Vec<PlanColumn> = def
+        .columns
+        .iter()
+        .map(|c| PlanColumn {
+            name: c.name.clone(),
+            ty: c.ty,
+            nullable: c.nullable,
+            invisible: c.invisible,
+        })
+        .collect();
+    // A table keyed by a hidden row number shows it as one more invisible
+    // column under a reserved name: a write through a join finds its rows
+    // by it (`multiwrite`).
+    if def.hidden {
+        columns.push(PlanColumn {
+            name: HIDDEN_ROW.to_owned(),
+            ty: crate::engine::table::HIDDEN_TYPE,
+            nullable: false,
+            invisible: true,
+        });
+    }
     PlanTable {
         schema: db_name.to_owned(),
         name: def.name.clone(),
-        columns: def
-            .columns
-            .iter()
-            .map(|c| PlanColumn {
-                name: c.name.clone(),
-                ty: c.ty,
-                nullable: c.nullable,
-            })
-            .collect(),
-        primary: Some(IndexDef::new(
-            "PRIMARY",
-            true,
-            def.pk
-                .iter()
-                .zip(&def.pk_parts)
-                .map(|(&c, kc)| part(c, kc))
-                .collect(),
-        )),
+        columns,
+        // A table keyed by a hidden row number has no primary key the
+        // planner could use.
+        primary: (!def.hidden).then(|| {
+            IndexDef::new(
+                &def.pk_name,
+                true,
+                def.pk
+                    .iter()
+                    .zip(&def.pk_parts)
+                    .map(|(&c, kc)| part(c, kc))
+                    .collect(),
+            )
+        }),
         indexes: def
             .indexes
             .iter()
@@ -617,10 +639,17 @@ fn query_of(stmt: &Statement) -> Option<&Query> {
 /// elsewhere or a view, has a locking clause, or computes with a column
 /// type the expression engine doesn't have; 1146.
 #[allow(clippy::too_many_lines)] // one pass, in the order the checks must run
+/// The columns `*` names of table `def`: all but the invisible ones.
+fn star_columns(def: &crate::engine::table::TableDef) -> impl Iterator<Item = usize> + '_ {
+    (0..def.columns.len()).filter(|&c| !def.columns[c].invisible)
+}
+
+#[allow(clippy::too_many_lines)] // one walk, then the marks and the origins
 pub(super) fn analyze(
     cx: &BindCtx<'_>,
     stmt: &Statement,
     text: Option<&str>,
+    tableless: bool,
 ) -> Result<Option<Analysis>> {
     // The names of computed columns, from the statement as it was parsed
     // (the copy below loses nothing of it, but is read first for its
@@ -653,7 +682,7 @@ pub(super) fn analyze(
         SetExpr::Select(s) => Some((w.read_from(s), &**s)),
         _ => None,
     };
-    if w.tables.is_empty() {
+    if w.tables.is_empty() && (!tableless || w.elsewhere) {
         // Not the engine's: whatever it names is MariaDB's to answer.
         return Ok(None);
     }
@@ -797,7 +826,7 @@ fn origins(
                     }
                 }
                 for f in factors {
-                    out.extend((0..tables[f.table].def.columns.len()).map(|c| Some(of(f, c))));
+                    out.extend(star_columns(&tables[f.table].def).map(|c| Some(of(f, c))));
                 }
             }
             SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(n), _) => {
@@ -806,7 +835,7 @@ fn origins(
                 let (Some(f), None) = (hits.next(), hits.next()) else {
                     return none();
                 };
-                out.extend((0..tables[f.table].def.columns.len()).map(|c| Some(of(f, c))));
+                out.extend(star_columns(&tables[f.table].def).map(|c| Some(of(f, c))));
             }
             SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
                 let (qual, name) = match e {

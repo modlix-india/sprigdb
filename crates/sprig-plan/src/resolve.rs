@@ -806,6 +806,17 @@ impl Cx<'_> {
                 };
                 Expr::Like(a, p, esc, *negated)
             }
+            A::RLike {
+                negated,
+                expr,
+                pattern,
+                ..
+            } => {
+                let a = self.expr_in(expr, x, false)?;
+                let p = self.expr_in(pattern, x, false)?;
+                let m = Expr::Func("REGEXP".into(), vec![a, p]);
+                if *negated { Expr::Not(Box::new(m)) } else { m }
+            }
             A::Case {
                 operand,
                 conditions,

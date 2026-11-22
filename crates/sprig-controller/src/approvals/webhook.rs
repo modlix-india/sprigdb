@@ -121,6 +121,8 @@ pub struct Webhooks {
     secret_dir: Option<PathBuf>,
     webhook_secret: Option<String>,
     targets: Mutex<BTreeMap<Dest, (Instant, Arc<WebhookTarget>)>>,
+    /// The engine's catalog records (tenants' connections).
+    records: Option<Arc<dyn sprig_catalog::RecordStore>>,
 }
 
 impl std::fmt::Debug for Webhooks {
@@ -165,7 +167,15 @@ impl Webhooks {
             secret_dir: std::env::var_os("SPRIG_SINK_SECRET_DIR").map(PathBuf::from),
             webhook_secret,
             targets: Mutex::new(BTreeMap::new()),
+            records: None,
         }
+    }
+
+    /// The same hub reading tenants' connections from `records`.
+    #[must_use]
+    pub fn with_records(mut self, records: Arc<dyn sprig_catalog::RecordStore>) -> Self {
+        self.records = Some(records);
+        self
     }
 
     fn cached(&self, d: &Dest) -> Option<Arc<WebhookTarget>> {
@@ -233,7 +243,7 @@ impl Webhooks {
         let mut c = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e)
         })?;
-        let store = SinksStore::new(schema.clone());
+        let store = SinksStore::new(self.records(), tenant);
         let (db_id, r) = match name {
             ConnName::Own { db, name } => {
                 let id: Option<u32> = c
@@ -247,7 +257,12 @@ impl Webhooks {
                     .await
                     .map_err(|e| SprigError::internal("approvals webhook: databases").with_source(e))?;
                 let db_id = id.ok_or_else(|| not_found(&format!("database {db}")))?;
-                let st = store.load(&mut c).await?;
+                let st = {
+                    let mut rtx = self.records().begin(tenant).await?;
+                    let st = SinksStore::load(&mut *rtx).await;
+                    let _ = rtx.rollback().await;
+                    st?
+                };
                 let def = st
                     .connection(db_id, name)
                     .or_else(|| st.connection(db_id, &name.to_lowercase()))
@@ -299,7 +314,7 @@ impl Webhooks {
                 .unwrap_or("webhook,kafka,s3,database,script"),
             TargetKind::Webhook,
         )?;
-        let conn = sprig_sinks::job::open_conn(self, tenant, &mut c, &store, &r, &opts).await?;
+        let conn = sprig_sinks::job::open_conn(self, tenant, &store, &r, &opts).await?;
         drop(c);
         if conn.kind != ConnKind::Webhook {
             return Err(not_found(&format!("webhook connection {}", r.name())));
@@ -368,6 +383,15 @@ impl SinkEnv for Webhooks {
     async fn catalog(&self, tenant: TenantId) -> Result<(Pool, String)> {
         let ep = self.locator.writer(tenant).await?;
         Ok((ep.pool, ep.store.schema().to_owned()))
+    }
+
+    fn records(&self) -> Arc<dyn sprig_catalog::RecordStore> {
+        self.records.clone().unwrap_or_else(|| {
+            Arc::new(sprig_catalog::records::remote::RemoteRecords::new(
+                Some(Arc::clone(&self.dc_store)),
+                None,
+            ))
+        })
     }
 
     async fn shard_pool(&self, _tenant: TenantId) -> Result<Pool> {

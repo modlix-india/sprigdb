@@ -67,6 +67,7 @@ pub struct ControllerApprovals {
     appliers: RwLock<BTreeMap<Kind, Arc<dyn Applier>>>,
     producers: RwLock<Vec<Arc<dyn Producer>>>,
     locator: Option<Arc<dyn sprig_catalog::CatalogLocator>>,
+    records: Option<Arc<dyn sprig_catalog::RecordStore>>,
 }
 
 impl fmt::Debug for ControllerApprovals {
@@ -95,6 +96,7 @@ impl ControllerApprovals {
             appliers: RwLock::new(BTreeMap::new()),
             producers: RwLock::new(Vec::new()),
             locator: None,
+            records: None,
         }
     }
 
@@ -110,6 +112,22 @@ impl ControllerApprovals {
     pub fn with_locator(mut self, l: Arc<dyn sprig_catalog::CatalogLocator>) -> Self {
         self.locator = Some(l);
         self
+    }
+
+    /// Tenants' catalog records (their items and email subscriptions).
+    #[must_use]
+    pub fn with_records(mut self, r: Arc<dyn sprig_catalog::RecordStore>) -> Self {
+        self.records = Some(r);
+        self
+    }
+
+    /// Tenants' catalog records; tests without them get an empty
+    /// in-memory store.
+    #[must_use]
+    pub fn records(&self) -> Arc<dyn sprig_catalog::RecordStore> {
+        self.records
+            .clone()
+            .unwrap_or_else(|| Arc::new(sprig_catalog::records::mem::MemRecords::new()))
     }
 
     /// The catalog locator.

@@ -89,6 +89,10 @@ pub struct Session {
     pub div_precision_increment: u8,
     /// The session time zone as seconds east of UTC.
     pub time_zone_offset: i32,
+    /// The session time zone by name (`Europe/Berlin`): when set, and
+    /// known to the bundled time zone database, it gives the offset at
+    /// each instant instead of `time_zone_offset`.
+    pub time_zone_name: Option<String>,
     /// The statement's start time: seconds since the Unix epoch, UTC.
     pub now_seconds: i64,
     /// The microseconds of the statement's start time.
@@ -129,12 +133,45 @@ impl Session {
             },
             div_precision_increment: 4,
             time_zone_offset: 0,
+            time_zone_name: None,
             now_seconds: 0,
             now_micros: 0,
             max_allowed_packet: if maria { 16 << 20 } else { 64 << 20 },
             group_concat_max_len: if maria { 1 << 20 } else { 1024 },
             default_week_format: 0,
             fold_constants: false,
+        }
+    }
+}
+
+impl Session {
+    /// The session time zone's offset from UTC, in seconds, at an instant
+    /// (seconds since the epoch).
+    #[must_use]
+    pub fn zone_offset_at(&self, unix: i64) -> i64 {
+        match self.time_zone_name.as_deref().and_then(crate::tz::lookup) {
+            Some(tz) => crate::tz::offset_at(&tz, unix),
+            None => i64::from(self.time_zone_offset),
+        }
+    }
+
+    /// Whether the session's zone is a named one the time zone database
+    /// knows.
+    #[must_use]
+    pub fn zone_is_named(&self) -> bool {
+        self.time_zone_name
+            .as_deref()
+            .and_then(crate::tz::lookup)
+            .is_some()
+    }
+
+    /// The instant (seconds since the epoch) of a wall-clock time of the
+    /// session's zone, given as seconds since 1970-01-01 00:00 local.
+    #[must_use]
+    pub fn zone_to_unix(&self, local: i64) -> i64 {
+        match self.time_zone_name.as_deref().and_then(crate::tz::lookup) {
+            Some(tz) => crate::tz::local_to_unix(&tz, local),
+            None => local - i64::from(self.time_zone_offset),
         }
     }
 }

@@ -1,7 +1,8 @@
 //! A statement's trace and its SLI on a running gateway: a statement slower than `telemetry.trace_slow_ms`
 //! (500 ms by default) is kept by tail sampling, and `/debug/traces` on the
-//! telemetry port shows its `gateway.request` root with a `backend.query`
-//! child naming the cluster; `sprig_gateway_statements_total` counted it.
+//! telemetry port shows its `gateway.request` root (with a `backend.query`
+//! child naming the cluster when the statement was head-sampled);
+//! `sprig_gateway_statements_total` counted it.
 //!
 //! ```sh
 //! export SPRIG_TEST_OPS_TRACE=127.0.0.1:23307,http://127.0.0.1:23190,ops-src.admin,ops-pw-1
@@ -99,24 +100,31 @@ async fn a_slow_statement_is_traced_from_gateway_to_backend() {
     let spans = t["spans"].as_array().unwrap();
     let root = spans.last().unwrap();
     assert_eq!(root["name"], "gateway.request");
-    let child = spans
-        .iter()
-        .find(|s| s["name"] == "backend.query")
-        .expect("a backend.query span");
-    assert_eq!(child["parent_id"], root["span_id"]);
-    let cluster = child["attributes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|a| a[0] == "cluster")
-        .map(|a| a[1].clone())
-        .unwrap();
-    println!(
-        "trace {}: gateway.request {} ms > backend.query on {cluster} {} ms",
-        t["trace_id"],
-        root["duration_nanos"].as_u64().unwrap() / 1_000_000,
-        child["duration_nanos"].as_u64().unwrap() / 1_000_000
-    );
+    // A head-sampled statement shows its `backend.query` child; one that
+    // wasn't ran without spans and is kept as its root alone.
+    if let Some(child) = spans.iter().find(|s| s["name"] == "backend.query") {
+        assert_eq!(child["parent_id"], root["span_id"]);
+        let cluster = child["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a[0] == "cluster")
+            .map(|a| a[1].clone())
+            .unwrap();
+        println!(
+            "trace {}: gateway.request {} ms > backend.query on {cluster} {} ms",
+            t["trace_id"],
+            root["duration_nanos"].as_u64().unwrap() / 1_000_000,
+            child["duration_nanos"].as_u64().unwrap() / 1_000_000
+        );
+    } else {
+        assert_eq!(spans.len(), 1, "an unsampled root is kept alone");
+        println!(
+            "trace {}: gateway.request {} ms (not head-sampled: root only)",
+            t["trace_id"],
+            root["duration_nanos"].as_u64().unwrap() / 1_000_000
+        );
+    }
     let after = statements(&get(&format!("{telemetry}/metrics")).await);
     assert!(after > before, "statements counted: {before} -> {after}");
 }

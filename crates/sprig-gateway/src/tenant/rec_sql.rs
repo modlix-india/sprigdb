@@ -8,14 +8,14 @@
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
-use sprig_approvals::catalog::SqlRecs;
+use sprig_approvals::catalog::CatalogRecStore;
 use sprig_approvals::events::rfc3339;
 use sprig_approvals::model::{Level, Recommendation};
 use sprig_approvals::store::Filter;
+use sprig_approvals::store::RecStore as _;
 use sprig_approvals::{Caller, may_act, may_see};
 use sprig_auth::authz::{Action, SessionGrants, Target};
 use sprig_catalog::ddl::database_key;
-use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::{CatalogLocator, TenantCatalog};
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_proto_mysql::ColumnDef;
@@ -68,10 +68,6 @@ pub fn columns(charset: u16) -> Vec<ColumnDef> {
     .iter()
     .map(|n| text_column(n, charset))
     .collect()
-}
-
-fn backend(e: mysql_async::Error) -> SprigError {
-    SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e)
 }
 
 /// The session as a caller of `rec`: its tenant, administrator right and
@@ -133,9 +129,7 @@ pub async fn execute(
     charset: u16,
 ) -> Result<RecAnswer> {
     let p = super::authz::privileges(ts, cat);
-    let ep = ts.services().locator.writer(ts.tenant).await?;
-    let recs = SqlRecs::new(ts.tenant, ep.store.schema());
-    let mut conn = ep.pool.get_conn_bounded().await.map_err(backend)?;
+    let recs = CatalogRecStore::new(Arc::clone(&ts.services().records), ts.tenant);
     let id_of = |n: u64| sprig_approvals::RecId::Tenant(ts.tenant, n);
     match stmt {
         RecStmt::Show { all, scope } => {
@@ -143,16 +137,7 @@ pub async fn execute(
                 all: *all,
                 ..Filter::default()
             };
-            let items = match recs.list(&mut conn, &f).await {
-                Ok(v) => v,
-                // No item was ever raised: the module isn't migrated yet.
-                Err(e)
-                    if matches!(e.kind, sprig_common::ErrorKind::Backend { errno: 1146, .. }) =>
-                {
-                    Vec::new()
-                }
-                Err(e) => return Err(e),
-            };
+            let items = recs.list(&f).await?;
             let (db_name, table) = match scope {
                 RecScope::Tenant => (None, None),
                 RecScope::Database(d) => (Some(d.clone()), None),
@@ -205,11 +190,9 @@ pub async fn execute(
             }))
         }
         RecStmt::Approve { id, .. } | RecStmt::Ignore { id, .. } | RecStmt::Snooze { id, .. } => {
-            let Ok(Some(rec)) = recs.get(&mut conn, *id).await else {
+            let Ok(Some(rec)) = recs.get(*id).await else {
                 return Err(sprig_approvals::store::not_found(&id_of(*id)));
             };
-            // Not held across the controller's round trip.
-            drop(conn);
             let caller = caller_for(ts, cat, &*p, &rec);
             if !may_act(&rec, &caller, &[]) && rec.level <= Level::Tenant {
                 return Err(SprigError::new(

@@ -119,8 +119,11 @@ impl Oracle {
             Persona::MariaDb => "utf8mb4_uca1400_ai_ci",
             Persona::MySql => "utf8mb4_0900_ai_ci",
         };
+        // `SPRIG_EXEC_ORACLE_TZNAME` puts both sides in a named zone.
+        let zone =
+            std::env::var("SPRIG_EXEC_ORACLE_TZNAME").unwrap_or_else(|_| "+05:30".to_owned());
         format!(
-            "SET NAMES utf8mb4 COLLATE {coll}; SET time_zone='+05:30'; SET timestamp={NOW_SECONDS}.{NOW_MICROS:06}; SET max_error_count=64;\n"
+            "SET NAMES utf8mb4 COLLATE {coll}; SET time_zone='{zone}'; SET timestamp={NOW_SECONDS}.{NOW_MICROS:06}; SET max_error_count=64;\n"
         )
     }
 }
@@ -132,6 +135,9 @@ pub fn session_for(persona: Persona) -> Session {
     s.now_seconds = NOW_SECONDS;
     s.now_micros = NOW_MICROS;
     s.time_zone_offset = TZ_OFFSET;
+    if let Ok(zone) = std::env::var("SPRIG_EXEC_ORACLE_TZNAME") {
+        s.time_zone_name = Some(zone);
+    }
     s
 }
 
@@ -821,6 +827,10 @@ pub fn evaluate(e: &Expr, session: &Session, rows: &[Vec<Value>]) -> Mine {
 }
 
 /// The functions whose last digit comes from the platform's math library.
+/// Old link names of the time zone database that the MariaDB oracle's
+/// time zone tables lack.
+const LINK_ZONES: &[&str] = &["Asia/Calcutta", "US/Pacific", "Europe/Kiev", "Zulu"];
+
 const MATH_LIBRARY: &[&str] = &[
     "POW", "POWER", "EXP", "LN", "LOG", "LOG2", "LOG10", "SIN", "COS", "TAN", "ASIN", "ACOS",
     "ATAN", "ATAN2", "COT",
@@ -839,8 +849,10 @@ const MATH_LIBRARY: &[&str] = &[
 /// - `math-library`: the expression calls a transcendental function and
 ///   every differing value is a number within a few units in the last
 ///   place of the server's.
-/// - `named-time-zone`: `CONVERT_TZ` with a zone given by name; the
-///   executor has no time zone database and answers `NULL`.
+/// - `zone-name-unknown-to-server`: MariaDB answers `NULL` for an old
+///   link name of the time zone database (`Asia/Calcutta`, `US/Pacific`,
+///   `posix/...`) that its time zone tables lack; the executor's bundled
+///   database has them.
 /// - `number-padded-as-latin1`: MariaDB's `LPAD`/`RPAD` of a number with
 ///   a pad beyond ASCII comes out encoded twice; the executor's does not.
 pub fn kept_reason(
@@ -856,24 +868,25 @@ pub fn kept_reason(
         return Some("wide-decimal");
     }
     let mut math = false;
-    let mut named_zone = false;
+    let mut link_zone = false;
     walk(e, &mut |x| {
         if let Expr::Func(name, args) = x {
             math |= MATH_LIBRARY.contains(&name.as_str());
             if name == "CONVERT_TZ" {
-                for zone in args.iter().skip(1) {
-                    if let Expr::Str(z) = zone {
-                        let offset = z.starts_with('+') || z.starts_with('-');
-                        let known =
-                            z.eq_ignore_ascii_case("SYSTEM") || z.eq_ignore_ascii_case("UTC");
-                        named_zone |= !offset && !known && z.chars().any(char::is_alphabetic);
+                for z in args.iter().skip(1) {
+                    if let Expr::Str(z) = z {
+                        link_zone |= LINK_ZONES.iter().any(|l| z.eq_ignore_ascii_case(l))
+                            || z.to_ascii_lowercase().starts_with("posix/");
                     }
                 }
             }
         }
     });
-    if named_zone && matches!(&mine.outcome, Outcome::Rows(r) if r.iter().all(|v| v == b"NULL")) {
-        return Some("named-time-zone");
+    if persona == Persona::MariaDb
+        && link_zone
+        && matches!(theirs, Outcome::Rows(r) if r.iter().all(|v| v == b"NULL"))
+    {
+        return Some("zone-name-unknown-to-server");
     }
     // MariaDB pads a number as a latin1 string and sends the pad's UTF-8
     // bytes on as if they were latin1 characters: its answer is the

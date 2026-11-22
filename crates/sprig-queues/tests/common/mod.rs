@@ -42,6 +42,32 @@ pub fn var(k: &str) -> Option<String> {
     std::env::var(k).ok().filter(|v| !v.is_empty())
 }
 
+/// With `SPRIG_QUEUE_STORE=engine`, durable messages go to a fresh storage
+/// engine in a temporary directory instead of memory.
+pub fn maybe_engine_store(c: &MemCatalog) {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if var("SPRIG_QUEUE_STORE").as_deref() != Some("engine") {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "sprig-queues-engine-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut cfg = sprig_engine::EngineConfig::new(&dir);
+    cfg.log.sync = sprig_engine::log::SyncMode::Off;
+    cfg.budget.engine_mb = 64;
+    let e = sprig_engine::Engine::open(cfg).unwrap();
+    let q = Arc::new(sprig_queues::enginestore::EngineQueues::new(
+        e,
+        sprig_engine::Durability::Local,
+    ));
+    c.set_store_factory(Arc::new(move |t, d| {
+        q.store(t, d) as Arc<dyn sprig_queues::store::MsgStore>
+    }));
+}
+
 /// A running in-process server.
 pub struct Server {
     pub addr: String,
@@ -69,6 +95,7 @@ pub async fn server_with(settings: QueueSettings) -> Server {
         Arc::new(|p, perm, _| p.user != "ro" || perm == Perm::Read),
     ));
     catalog.set_settings(settings);
+    maybe_engine_store(&catalog);
     let engine = Arc::new(QueueEngine::new(EngineDeps {
         catalog: Arc::clone(&catalog) as Arc<dyn sprig_queues::engine::MqCatalog>,
         leases: Arc::new(MemLeases::new().for_gateway("gw-test")),
@@ -162,10 +189,12 @@ pub async fn server_on(
 /// The in-memory catalog [`server_with`] uses (vhost `/` is database `mq`;
 /// `acme.ro` may only read).
 pub fn mem_catalog() -> Arc<MemCatalog> {
-    Arc::new(MemCatalog::new(
+    let c = Arc::new(MemCatalog::new(
         Arc::new(|_, v| Ok(if v == "/" { "mq".into() } else { v.to_owned() })),
         Arc::new(|p, perm, _| p.user != "ro" || perm == Perm::Read),
-    ))
+    ));
+    maybe_engine_store(&c);
+    c
 }
 
 /// [`server_with`] the default settings.

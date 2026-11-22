@@ -1,0 +1,58 @@
+// sprig.internal.v1.CatalogPeer: tenants' catalog records in the engine
+// node's storage engine, for the processes that don't open the engine
+// themselves (the controller, workers), on the peer service (7403, mutual
+// TLS). Never exposed to clients. The gateway confines every key to the
+// named tenant's catalog records.
+syntax = "proto3";
+
+package sprig.internal.v1;
+
+service CatalogPeer {
+  // One transaction on one tenant's catalog records, bound to the stream:
+  // the first message is `begin`; each later one is answered by one reply,
+  // in order. The stream ending before `commit` rolls the transaction back.
+  rpc Txn(stream CatalogOp) returns (stream CatalogReply);
+}
+
+message CatalogOp {
+  oneof op {
+    // Opens the transaction on this tenant's records (answered too).
+    uint64 begin_tenant = 1;
+    // The record at the read view.
+    bytes get = 2;
+    // The record, locked exclusively, as it is now.
+    bytes get_for_update = 3;
+    // Records of [lo, hi) at the read view.
+    CatalogScan scan = 4;
+    // Writes a record.
+    CatalogEntry put = 5;
+    // Deletes a record.
+    bytes delete = 6;
+    // Commits (durably) and ends the stream.
+    bool commit = 7;
+    // Rolls back and ends the stream.
+    bool rollback = 8;
+  }
+}
+
+message CatalogScan {
+  bytes lo = 1;
+  bytes hi = 2;
+  uint32 limit = 3;
+}
+
+message CatalogEntry {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message CatalogReply {
+  // 0 on success, else the SprigDB error code (39071: a record is busy).
+  uint32 error_code = 1;
+  string error_message = 2;
+  // get / get_for_update: whether the record exists, and its value.
+  bool found = 3;
+  bytes value = 4;
+  // scan: the records.
+  repeated CatalogEntry entries = 5;
+}

@@ -1,7 +1,9 @@
 //! Row-level security's catalog and per-session view.
 //!
-//! - **Tables** (module `rls`, in `t<tenant>_sprig`): `row_policies`
-//!   and `row_security`, one row per object whose
+//! - **Tables** (module `rls`, as the tenant's catalog records:
+//!   `row_policies/<policy_id>` and `row_security/<object_id>`; a policy's
+//!   name is unique per object, checked inside the auth change):
+//!   `row_policies` and `row_security`, one row per object whose
 //!   security was ever switched: `enabled`, `forced`, and the auth version
 //!   whose MariaDB write checks (triggers) are deployed (`checks_version`,
 //!   against `changed_version`, which every policy change of the object
@@ -27,59 +29,24 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use mysql_async::prelude::Queryable;
-use mysql_async::{Row, Value};
+use serde::{Deserialize, Serialize};
+use sprig_catalog::records::{self, Pk, RecordTx};
 use sprig_catalog::{
-    CatalogExtension, ExtState, Migration, Module, Phase, SnapshotTx, TenantCatalog, VersionKind,
+    CatalogExtension, ExtState, Migration, Module, SnapshotTx, TenantCatalog, VersionKind,
 };
 use sprig_common::ids::{DbId, ObjectId, RoleId, UserId};
-use sprig_common::names::quote;
 use sprig_common::{Result, SprigError};
 
 use super::compile::{CompiledPrivileges, Target};
 use super::privilege::Action;
 use super::store::Grantee;
+use crate::rec::{ROW_POLICIES, ROW_SECURITY};
 
 /// The module name in the catalog's format records.
 pub const MODULE: &str = "rls";
 
-/// `row_policies`.
-pub const DDL_ROW_POLICIES: &str = "CREATE TABLE IF NOT EXISTS row_policies (
-  policy_id    INT UNSIGNED NOT NULL AUTO_INCREMENT,
-  object_id    BIGINT UNSIGNED NOT NULL,
-  name         VARCHAR(64) NOT NULL COLLATE utf8mb4_bin,
-  mode         ENUM('permissive','restrictive') NOT NULL,
-  commands     SET('select','insert','update','delete') NOT NULL,
-  grantees     JSON NOT NULL,
-  element      INT UNSIGNED NOT NULL DEFAULT 0,
-  using_expr   TEXT NULL,
-  check_expr   TEXT NULL,
-  using_mongo  JSON NULL,
-  check_mongo  JSON NULL,
-  created_by   INT UNSIGNED NOT NULL,
-  changed_version BIGINT UNSIGNED NOT NULL,
-  PRIMARY KEY (policy_id),
-  UNIQUE KEY uk_policy (object_id, name)
-) ENGINE=InnoDB";
-
-/// `row_security`: the switches and the deployed write checks per object.
-pub const DDL_ROW_SECURITY: &str = "CREATE TABLE IF NOT EXISTS row_security (
-  object_id       BIGINT UNSIGNED NOT NULL,
-  db_id           INT UNSIGNED NOT NULL,
-  enabled         TINYINT(1) NOT NULL DEFAULT 0,
-  forced          TINYINT(1) NOT NULL DEFAULT 0,
-  checks_version  BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  changed_version BIGINT UNSIGNED NOT NULL,
-  PRIMARY KEY (object_id)
-) ENGINE=InnoDB";
-
-/// The module's migrations.
-pub static RLS_MIGRATIONS: &[Migration] = &[Migration {
-    format: 1,
-    phase: Phase::Expand,
-    name: "row_policies and row_security",
-    statements: &[DDL_ROW_POLICIES, DDL_ROW_SECURITY],
-}];
+/// The module's migrations: none (its rows are engine records).
+pub static RLS_MIGRATIONS: &[Migration] = &[];
 
 /// The `rls` module.
 pub const RLS_MODULE: Module = Module {
@@ -411,22 +378,105 @@ pub fn compile(cat: &TenantCatalog, c: &CompiledPrivileges, user: UserId) -> Ses
     out
 }
 
-/// The `rls` module's tables in catalog schema `schema`.
-#[derive(Debug, Clone)]
-pub struct RlsStore {
-    schema: String,
-    policies: String,
-    security: String,
+/// The `rls` module's tables in the tenant's catalog records. Every method
+/// takes the record transaction to run in: an auth change's for writes, a
+/// snapshot's for loads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RlsStore;
+
+/// The id counter of policies.
+pub const POLICY_COUNTER: &str = "row_policies";
+
+/// A `row_policies` row as stored. The texts are kept as the old columns
+/// held them: `commands` as the `SET` text, `grantees` and the MongoDB
+/// forms as JSON text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PolicyRec {
+    policy_id: u32,
+    object_id: u64,
+    /// Compared exactly (unique per object).
+    name: String,
+    /// `permissive` or `restrictive`.
+    mode: String,
+    /// [`commands_text`].
+    commands: String,
+    /// [`grantees_json`].
+    grantees: String,
+    element: u32,
+    using_expr: Option<String>,
+    check_expr: Option<String>,
+    using_mongo: Option<String>,
+    check_mongo: Option<String>,
+    created_by: u32,
+    changed_version: u64,
 }
 
-fn map_err(e: mysql_async::Error) -> SprigError {
-    crate::store::map_err(e)
+/// A `row_security` row as stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct SecurityRec {
+    object_id: u64,
+    db_id: u32,
+    enabled: bool,
+    forced: bool,
+    checks_version: u64,
+    changed_version: u64,
 }
 
-fn get<T: mysql_async::prelude::FromValue>(row: &Row, i: usize) -> Result<T> {
-    row.get_opt::<T, usize>(i)
-        .and_then(std::result::Result::ok)
-        .ok_or_else(|| SprigError::internal(format!("rls catalog: bad column {i}")))
+impl From<SecurityRec> for SecurityRow {
+    fn from(r: SecurityRec) -> Self {
+        SecurityRow {
+            object_id: ObjectId(r.object_id),
+            db_id: DbId(r.db_id),
+            enabled: r.enabled,
+            forced: r.forced,
+            checks_version: r.checks_version,
+            changed_version: r.changed_version,
+        }
+    }
+}
+
+fn policy_pk(id: u32) -> Pk {
+    Pk::new().u32(id)
+}
+
+fn security_pk(object: ObjectId) -> Pk {
+    Pk::new().u64(object.0)
+}
+
+/// The `TEXT` columns' limit (bytes).
+const TEXT_MAX: usize = 65_535;
+
+/// 1406 for a policy name or expression longer than the old columns kept.
+fn check_policy_texts(
+    name: Option<&str>,
+    using_expr: Option<&str>,
+    check_expr: Option<&str>,
+) -> Result<()> {
+    if let Some(n) = name {
+        super::store::check_chars("name", n, 64)?;
+    }
+    if using_expr.is_some_and(|e| e.len() > TEXT_MAX) {
+        return Err(super::store::too_long("using_expr"));
+    }
+    if check_expr.is_some_and(|e| e.len() > TEXT_MAX) {
+        return Err(super::store::too_long("check_expr"));
+    }
+    Ok(())
+}
+
+/// The check MariaDB put on a `JSON` column (`JSON_VALID`): 4025 for text
+/// that isn't JSON.
+fn check_json(column: &str, v: Option<&str>) -> Result<()> {
+    match v {
+        Some(t) if serde_json::from_str::<serde::de::IgnoredAny>(t).is_err() => {
+            Err(SprigError::backend(
+                4025,
+                *b"23000",
+                format!("catalog statement failed (4025): CONSTRAINT `{column}` failed"),
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 fn commands_of(set: &str) -> u8 {
@@ -490,18 +540,6 @@ fn grantees_of(json: &str) -> Result<Vec<Grantee>> {
     Ok(out)
 }
 
-/// Runs a statement; the rows it changed.
-async fn affected<Q: Queryable + Send>(
-    q: &mut Q,
-    sql: String,
-    params: mysql_async::Params,
-) -> Result<u64> {
-    let r = q.exec_iter(sql, params).await.map_err(map_err)?;
-    let n = r.affected_rows();
-    r.drop_result().await.map_err(map_err)?;
-    Ok(n)
-}
-
 /// A policy to write.
 #[derive(Debug, Clone)]
 pub struct NewPolicy<'a> {
@@ -530,234 +568,204 @@ pub struct NewPolicy<'a> {
 }
 
 impl RlsStore {
-    /// The tables of catalog schema `schema`.
+    /// The tables.
     #[must_use]
-    pub fn new(schema: impl Into<String>) -> Self {
-        let schema = schema.into();
-        let q = quote(&schema);
-        Self {
-            policies: format!("{q}.row_policies"),
-            security: format!("{q}.row_security"),
-            schema,
-        }
+    pub const fn new() -> Self {
+        Self
     }
 
-    /// Whether the module's tables exist.
-    ///
-    /// # Errors
-    /// 39070 or a backend error.
-    pub async fn migrated<Q: Queryable + Send>(&self, q: &mut Q) -> Result<bool> {
-        let n: Option<u64> = q
-            .exec_first(
-                "SELECT COUNT(*) FROM information_schema.TABLES \
-                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'row_security'",
-                (self.schema.as_str(),),
-            )
-            .await
-            .map_err(map_err)?;
-        Ok(n.unwrap_or(0) > 0)
+    /// Whether the module's tables exist: always (engine records need no
+    /// migration).
+    #[must_use]
+    pub const fn migrated(&self) -> bool {
+        true
     }
 
-    /// Creates the module's tables (idempotent; DDL, so outside any
-    /// change).
-    ///
-    /// # Errors
-    /// A backend error.
-    pub async fn migrate(&self, conn: &mut mysql_async::Conn) -> Result<()> {
-        sprig_catalog::Migrator::new(&[RLS_MODULE])?
-            .run(
-                conn,
-                &self.schema,
-                &sprig_catalog::migrate::MigrateOpts::default(),
-            )
-            .await?;
-        Ok(())
+    /// Creates the module's tables: nothing to do (engine records need no
+    /// migration). Kept for its callers.
+    pub fn migrate(&self) {}
+
+    async fn policies(&self, tx: &mut dyn RecordTx) -> Result<Vec<PolicyRec>> {
+        ROW_POLICIES.rows(tx, &Pk::new()).await
     }
 
-    /// Every row.
+    /// The policy `name` of `object`.
+    async fn policy(
+        &self,
+        tx: &mut dyn RecordTx,
+        object: ObjectId,
+        name: &str,
+    ) -> Result<Option<PolicyRec>> {
+        Ok(self
+            .policies(tx)
+            .await?
+            .into_iter()
+            .find(|p| p.object_id == object.0 && p.name == name))
+    }
+
+    /// Every row: policies by object and name, switches by object.
     ///
     /// # Errors
-    /// 39070, a backend error, or `Internal` for a malformed row.
-    pub async fn load<Q: Queryable + Send>(&self, q: &mut Q) -> Result<RlsRows> {
-        let rows: Vec<Row> = q
-            .query(format!(
-                "SELECT policy_id, object_id, name, mode, commands, CAST(grantees AS CHAR), \
-                 using_expr, check_expr, created_by, changed_version, \
-                 CAST(using_mongo AS CHAR), CAST(check_mongo AS CHAR) FROM {} \
-                 ORDER BY object_id, name",
-                self.policies
-            ))
-            .await
-            .map_err(map_err)?;
+    /// The store's, or `Internal` for a malformed row.
+    pub async fn load(&self, tx: &mut dyn RecordTx) -> Result<RlsRows> {
+        let mut rows = self.policies(tx).await?;
+        rows.sort_by(|a, b| (a.object_id, &a.name).cmp(&(b.object_id, &b.name)));
         let mut policies = Vec::with_capacity(rows.len());
-        for r in &rows {
-            let mode: String = get(r, 3)?;
-            let cmds: String = get(r, 4)?;
-            let grantees: String = get(r, 5)?;
+        for r in rows {
             policies.push(PolicyRow {
-                policy_id: get(r, 0)?,
-                object_id: ObjectId(get(r, 1)?),
-                name: get(r, 2)?,
-                restrictive: mode == "restrictive",
-                commands: commands_of(&cmds),
-                grantees: grantees_of(&grantees)?,
-                using_expr: r
-                    .get_opt::<Option<String>, usize>(6)
-                    .and_then(Result::ok)
-                    .flatten(),
-                check_expr: r
-                    .get_opt::<Option<String>, usize>(7)
-                    .and_then(Result::ok)
-                    .flatten(),
-                created_by: UserId(get(r, 8)?),
-                changed_version: get(r, 9)?,
-                using_mongo: r
-                    .get_opt::<Option<String>, usize>(10)
-                    .and_then(Result::ok)
-                    .flatten(),
-                check_mongo: r
-                    .get_opt::<Option<String>, usize>(11)
-                    .and_then(Result::ok)
-                    .flatten(),
+                policy_id: r.policy_id,
+                object_id: ObjectId(r.object_id),
+                name: r.name,
+                restrictive: r.mode == "restrictive",
+                commands: commands_of(&r.commands),
+                grantees: grantees_of(&r.grantees)?,
+                using_expr: r.using_expr,
+                check_expr: r.check_expr,
+                created_by: UserId(r.created_by),
+                changed_version: r.changed_version,
+                using_mongo: r.using_mongo,
+                check_mongo: r.check_mongo,
                 stored_exprs: None,
             });
         }
         for p in &mut policies {
             compile_mongo(p);
         }
-        let rows: Vec<Row> = q
-            .query(format!(
-                "SELECT object_id, db_id, enabled, forced, checks_version, changed_version \
-                 FROM {}",
-                self.security
-            ))
-            .await
-            .map_err(map_err)?;
-        let mut security = Vec::with_capacity(rows.len());
-        for r in &rows {
-            security.push(SecurityRow {
-                object_id: ObjectId(get(r, 0)?),
-                db_id: DbId(get(r, 1)?),
-                enabled: get::<u8>(r, 2)? != 0,
-                forced: get::<u8>(r, 3)? != 0,
-                checks_version: get(r, 4)?,
-                changed_version: get(r, 5)?,
-            });
-        }
+        let security = ROW_SECURITY
+            .rows::<SecurityRec>(tx, &Pk::new())
+            .await?
+            .into_iter()
+            .map(SecurityRow::from)
+            .collect();
         Ok(RlsRows { policies, security })
     }
 
     /// Records a change of `object`'s policies or switches at `version`
     /// (the change's auth version): its write checks are stale until
-    /// [`Self::checks_deployed`].
+    /// [`Self::checks_deployed`]. A switch given as `None` keeps its value
+    /// (`false` for a new row); an existing row keeps its database.
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn touch<Q: Queryable + Send>(
+    /// The store's.
+    pub async fn touch(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         object: ObjectId,
         db: DbId,
         version: u64,
         switch: Option<(Option<bool>, Option<bool>)>,
     ) -> Result<()> {
         let (enabled, forced) = switch.unwrap_or((None, None));
-        q.exec_drop(
-            format!(
-                "INSERT INTO {} (object_id, db_id, enabled, forced, checks_version, \
-                 changed_version) VALUES (?, ?, ?, ?, 0, ?) \
-                 ON DUPLICATE KEY UPDATE changed_version = VALUES(changed_version), \
-                 enabled = COALESCE(?, enabled), forced = COALESCE(?, forced)",
-                self.security
-            ),
-            (
-                object.0,
-                db.0,
-                enabled.unwrap_or(false),
-                forced.unwrap_or(false),
-                version,
-                enabled.map(Value::from),
-                forced.map(Value::from),
-            ),
-        )
-        .await
-        .map_err(map_err)
+        let pk = security_pk(object);
+        let row = match ROW_SECURITY.get::<SecurityRec>(tx, &pk).await? {
+            Some(mut r) => {
+                r.changed_version = version;
+                r.enabled = enabled.unwrap_or(r.enabled);
+                r.forced = forced.unwrap_or(r.forced);
+                r
+            }
+            None => SecurityRec {
+                object_id: object.0,
+                db_id: db.0,
+                enabled: enabled.unwrap_or(false),
+                forced: forced.unwrap_or(false),
+                checks_version: 0,
+                changed_version: version,
+            },
+        };
+        ROW_SECURITY.put(tx, &pk, &row).await
     }
 
-    /// Records that `object`'s write checks match `version`.
+    /// Records that `object`'s write checks match `version` (never moving
+    /// back; nothing without a row).
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn checks_deployed<Q: Queryable + Send>(
+    /// The store's.
+    pub async fn checks_deployed(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         object: ObjectId,
         version: u64,
     ) -> Result<()> {
-        q.exec_drop(
-            format!(
-                "UPDATE {} SET checks_version = GREATEST(checks_version, ?) WHERE object_id = ?",
-                self.security
-            ),
-            (version, object.0),
-        )
-        .await
-        .map_err(map_err)
+        let pk = security_pk(object);
+        if let Some(mut r) = ROW_SECURITY.get::<SecurityRec>(tx, &pk).await?
+            && version > r.checks_version
+        {
+            r.checks_version = version;
+            ROW_SECURITY.put(tx, &pk, &r).await?;
+        }
+        Ok(())
     }
 
-    /// Adds a policy; `false` if the table has one of that name.
+    /// Adds a policy (its id from the `row_policies` counter); `false` if
+    /// the table has one of that name.
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn insert<Q: Queryable + Send>(
+    /// The store's; 1406 for a name over 64 characters or an expression
+    /// over 65535 bytes; 4025 for a MongoDB form that isn't JSON.
+    pub async fn insert(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         p: &NewPolicy<'_>,
         version: u64,
     ) -> Result<bool> {
-        let r = q
-            .exec_drop(
-                format!(
-                    "INSERT INTO {} (object_id, name, mode, commands, grantees, using_expr, \
-                     check_expr, created_by, changed_version, using_mongo, check_mongo) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    self.policies
-                ),
-                (
-                    p.object.0,
-                    p.name,
-                    if p.restrictive {
-                        "restrictive"
-                    } else {
-                        "permissive"
-                    },
-                    commands_text(p.commands),
-                    grantees_json(p.grantees),
-                    p.using_expr,
-                    p.check_expr,
-                    p.by.0,
-                    version,
-                    p.using_mongo,
-                    p.check_mongo,
-                ),
-            )
-            .await;
-        match r {
-            Ok(()) => Ok(true),
-            Err(mysql_async::Error::Server(e)) if e.code == 1062 => Ok(false),
-            Err(e) => Err(map_err(e)),
+        check_policy_texts(Some(p.name), p.using_expr, p.check_expr)?;
+        check_json("row_policies.using_mongo", p.using_mongo)?;
+        check_json("row_policies.check_mongo", p.check_mongo)?;
+        if self.policy(tx, p.object, p.name).await?.is_some() {
+            return Ok(false);
         }
+        let id = records::next_ids(tx, POLICY_COUNTER, 1).await?;
+        let id = u32::try_from(id).map_err(|_| SprigError::internal("policy ids exhausted"))?;
+        let row = PolicyRec {
+            policy_id: id,
+            object_id: p.object.0,
+            name: p.name.to_owned(),
+            mode: if p.restrictive {
+                "restrictive"
+            } else {
+                "permissive"
+            }
+            .to_owned(),
+            commands: commands_text(p.commands),
+            grantees: grantees_json(p.grantees),
+            element: 0,
+            using_expr: p.using_expr.map(str::to_owned),
+            check_expr: p.check_expr.map(str::to_owned),
+            using_mongo: p.using_mongo.map(str::to_owned),
+            check_mongo: p.check_mongo.map(str::to_owned),
+            created_by: p.by.0,
+            changed_version: version,
+        };
+        ROW_POLICIES.put(tx, &policy_pk(id), &row).await?;
+        Ok(true)
     }
 
-    /// Changes a policy's grantees and expressions (`None` keeps one);
-    /// `false` if there is no such policy.
+    /// Writes `new` over `old` when it differs; whether it did (MariaDB
+    /// counted only rows an `UPDATE` changed).
+    async fn rewrite(
+        &self,
+        tx: &mut dyn RecordTx,
+        old: &PolicyRec,
+        new: &PolicyRec,
+    ) -> Result<bool> {
+        if new == old {
+            return Ok(false);
+        }
+        ROW_POLICIES.put(tx, &policy_pk(new.policy_id), new).await?;
+        Ok(true)
+    }
+
+    /// Changes a policy's grantees and expressions (`None` keeps one; a new
+    /// expression drops the MongoDB form it came from); `false` if there is
+    /// no such policy (or the change changes nothing).
     ///
     /// # Errors
-    /// A backend error.
+    /// The store's; 1406 for an expression over 65535 bytes.
     #[allow(clippy::too_many_arguments)]
-    pub async fn alter<Q: Queryable + Send>(
+    pub async fn alter(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         object: ObjectId,
         name: &str,
         grantees: Option<&[Grantee]>,
@@ -765,30 +773,24 @@ impl RlsStore {
         check_expr: Option<&str>,
         version: u64,
     ) -> Result<bool> {
-        affected(
-            q,
-            format!(
-                "UPDATE {} SET grantees = COALESCE(?, grantees), \
-                 using_mongo = IF(? IS NULL, using_mongo, NULL), \
-                 check_mongo = IF(? IS NULL, check_mongo, NULL), \
-                 using_expr = COALESCE(?, using_expr), check_expr = COALESCE(?, check_expr), \
-                 changed_version = ? WHERE object_id = ? AND name = ?",
-                self.policies
-            ),
-            (
-                grantees.map(grantees_json),
-                using_expr,
-                check_expr,
-                using_expr,
-                check_expr,
-                version,
-                object.0,
-                name,
-            )
-                .into(),
-        )
-        .await
-        .map(|n| n > 0)
+        let Some(old) = self.policy(tx, object, name).await? else {
+            return Ok(false);
+        };
+        check_policy_texts(None, using_expr, check_expr)?;
+        let mut new = old.clone();
+        if let Some(g) = grantees {
+            new.grantees = grantees_json(g);
+        }
+        if let Some(u) = using_expr {
+            new.using_mongo = None;
+            new.using_expr = Some(u.to_owned());
+        }
+        if let Some(c) = check_expr {
+            new.check_mongo = None;
+            new.check_expr = Some(c.to_owned());
+        }
+        new.changed_version = version;
+        self.rewrite(tx, &old, &new).await
     }
 
     /// Rewrites policy `p`'s row with the SQL its MongoDB forms compile to
@@ -798,115 +800,102 @@ impl RlsStore {
     /// no-op, so running it twice is harmless.
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn recompiled<Q: Queryable + Send>(
+    /// The store's; 1406 for an expression over 65535 bytes.
+    pub async fn recompiled(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         p: &PolicyRow,
         version: u64,
     ) -> Result<bool> {
         let Some((old_using, old_check)) = &p.stored_exprs else {
             return Ok(false);
         };
-        affected(
-            q,
-            format!(
-                "UPDATE {} SET using_expr = ?, check_expr = ?, changed_version = ? \
-                 WHERE policy_id = ? AND using_expr <=> ? AND check_expr <=> ? \
-                 AND CAST(using_mongo AS CHAR) <=> ? AND CAST(check_mongo AS CHAR) <=> ?",
-                self.policies
-            ),
-            (
-                p.using_expr.as_deref(),
-                p.check_expr.as_deref(),
-                version,
-                p.policy_id,
-                old_using.as_deref(),
-                old_check.as_deref(),
-                p.using_mongo.as_deref(),
-                p.check_mongo.as_deref(),
-            )
-                .into(),
-        )
-        .await
-        .map(|n| n > 0)
+        let Some(old) = ROW_POLICIES
+            .get::<PolicyRec>(tx, &policy_pk(p.policy_id))
+            .await?
+        else {
+            return Ok(false);
+        };
+        let holds = old.using_expr == *old_using
+            && old.check_expr == *old_check
+            && old.using_mongo == p.using_mongo
+            && old.check_mongo == p.check_mongo;
+        if !holds {
+            return Ok(false);
+        }
+        check_policy_texts(None, p.using_expr.as_deref(), p.check_expr.as_deref())?;
+        let mut new = old.clone();
+        new.using_expr.clone_from(&p.using_expr);
+        new.check_expr.clone_from(&p.check_expr);
+        new.changed_version = version;
+        self.rewrite(tx, &old, &new).await
     }
 
-    /// Renames a policy; `Ok(None)` if it doesn't exist, `Ok(Some(false))`
-    /// if the new name is taken.
+    /// Renames a policy; `Ok(None)` if it doesn't exist (or the rename
+    /// changes nothing), `Ok(Some(false))` if the new name is taken.
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn rename<Q: Queryable + Send>(
+    /// The store's; 1406 for a name over 64 characters.
+    pub async fn rename(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         object: ObjectId,
         name: &str,
         to: &str,
         version: u64,
     ) -> Result<Option<bool>> {
-        let r = affected(
-            q,
-            format!(
-                "UPDATE {} SET name = ?, changed_version = ? WHERE object_id = ? AND name = ?",
-                self.policies
-            ),
-            (to, version, object.0, name).into(),
-        )
-        .await;
-        match r {
-            Ok(n) if n > 0 => Ok(Some(true)),
-            Ok(_) => Ok(None),
-            Err(e) if e.protocol().mysql_errno == 1062 => Ok(Some(false)),
-            Err(e) => Err(e),
+        let Some(old) = self.policy(tx, object, name).await? else {
+            return Ok(None);
+        };
+        check_policy_texts(Some(to), None, None)?;
+        let mut new = old.clone();
+        new.name = to.to_owned();
+        new.changed_version = version;
+        if new == old {
+            return Ok(None);
         }
+        let taken = self
+            .policies(tx)
+            .await?
+            .iter()
+            .any(|p| p.policy_id != old.policy_id && p.object_id == object.0 && p.name == to);
+        if taken {
+            return Ok(Some(false));
+        }
+        self.rewrite(tx, &old, &new).await?;
+        Ok(Some(true))
     }
 
     /// Drops a policy; `false` if it doesn't exist.
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn delete<Q: Queryable + Send>(
+    /// The store's.
+    pub async fn delete(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         object: ObjectId,
         name: &str,
     ) -> Result<bool> {
-        affected(
-            q,
-            format!(
-                "DELETE FROM {} WHERE object_id = ? AND name = ?",
-                self.policies
-            ),
-            (object.0, name).into(),
-        )
-        .await
-        .map(|n| n > 0)
+        let Some(p) = self.policy(tx, object, name).await? else {
+            return Ok(false);
+        };
+        ROW_POLICIES.delete(tx, &policy_pk(p.policy_id)).await?;
+        Ok(true)
     }
 
     /// Forgets everything of dropped objects (PostgreSQL drops a table's
     /// policies with it).
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn forget_objects<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        objects: &[ObjectId],
-    ) -> Result<()> {
+    /// The store's.
+    pub async fn forget_objects(&self, tx: &mut dyn RecordTx, objects: &[ObjectId]) -> Result<()> {
         for o in objects {
-            q.exec_drop(
-                format!("DELETE FROM {} WHERE object_id = ?", self.policies),
-                (o.0,),
-            )
-            .await
-            .map_err(map_err)?;
-            q.exec_drop(
-                format!("DELETE FROM {} WHERE object_id = ?", self.security),
-                (o.0,),
-            )
-            .await
-            .map_err(map_err)?;
+            for p in self.policies(tx).await? {
+                if p.object_id == o.0 {
+                    ROW_POLICIES.delete(tx, &policy_pk(p.policy_id)).await?;
+                }
+            }
+            ROW_SECURITY.delete(tx, &security_pk(*o)).await?;
         }
         Ok(())
     }
@@ -1359,14 +1348,17 @@ impl CatalogExtension for RlsExtension {
         _since: Option<u64>,
         _prev: Option<&Arc<dyn ExtState>>,
     ) -> Result<Arc<dyn ExtState>> {
-        let store = RlsStore::new(tx.schema());
-        let conn = tx.conn();
-        if !store.migrated(conn).await? {
-            return Ok(Arc::new(RlsState::default()));
-        }
-        let rows = store.load(conn).await?;
-        Ok(Arc::new(RlsState::new(rows)))
+        Ok(Arc::new(load_state(tx.records()?).await?))
     }
+}
+
+/// The tenant's [`RlsState`] from its catalog records (every policy and
+/// switch).
+///
+/// # Errors
+/// The store's, or `Internal` for a malformed row.
+pub async fn load_state(tx: &mut dyn RecordTx) -> Result<RlsState> {
+    Ok(RlsState::new(RlsStore::new().load(tx).await?))
 }
 
 /// `prev` as an [`RlsState`], for tests.
@@ -1375,6 +1367,9 @@ pub fn downcast(prev: &Arc<dyn ExtState>) -> Option<&RlsState> {
     let any: &dyn Any = &**prev;
     any.downcast_ref::<RlsState>()
 }
+
+#[cfg(test)]
+mod store_tests;
 
 #[cfg(test)]
 mod tests {

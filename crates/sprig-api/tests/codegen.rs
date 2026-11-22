@@ -24,6 +24,7 @@ const PROTOS: &[&str] = &[
     "sprig/internal/v1/queues.proto",
     "sprig/internal/v1/redis.proto",
     "sprig/internal/v1/search.proto",
+    "sprig/internal/v1/catalog.proto",
     "grpc/health/v1/health.proto",
     "google/rpc/status.proto",
     "google/rpc/error_details.proto",

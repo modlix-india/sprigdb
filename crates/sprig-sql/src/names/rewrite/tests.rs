@@ -149,3 +149,27 @@ fn only_the_rls_subtree_view_of_sprig_sys_passes() {
         assert!(rewrite(bad.as_bytes(), &ctx).is_err(), "{bad}");
     }
 }
+
+/// A foreign key's parent in a database that doesn't exist stays as
+/// written (the storage engine answers it as each server does); one in a
+/// database that exists is mapped, and an unknown database anywhere else
+/// is still 1049.
+#[test]
+fn a_parent_in_a_missing_database_stays_as_written() {
+    let m = MemoryNameMap::new(TenantId(1)).with_db(1, "d", 1, 1);
+    let ctx = RewriteCtx::new(&m, Persona::MySql84).current_db(Some("d"));
+    for sql in [
+        "CREATE TABLE c (id INT PRIMARY KEY, p INT, FOREIGN KEY (p) REFERENCES nodb.t (id))",
+        "ALTER TABLE c ADD CONSTRAINT k FOREIGN KEY (p) REFERENCES `nodb`.`t` (id)",
+    ] {
+        let out = rewrite(sql.as_bytes(), &ctx).unwrap();
+        let text = String::from_utf8(apply_edits(sql.as_bytes(), &out.edits)).unwrap();
+        assert!(text.contains("nodb"), "{text}");
+    }
+    let sql = "CREATE TABLE c (id INT PRIMARY KEY, p INT, FOREIGN KEY (p) REFERENCES d.t (id))";
+    let out = rewrite(sql.as_bytes(), &ctx).unwrap();
+    let text = String::from_utf8(apply_edits(sql.as_bytes(), &out.edits)).unwrap();
+    assert!(!text.contains("REFERENCES d.t"), "{text}");
+    assert!(rewrite(b"CREATE TABLE nodb.c (id INT PRIMARY KEY)", &ctx).is_err());
+    assert!(rewrite(b"SELECT * FROM nodb.t", &ctx).is_err());
+}

@@ -65,6 +65,10 @@ impl Re {
         if !self.options.chars().all(|c| c == 's' || c == 'u') {
             return None;
         }
+        // An alternation (`^ab|cd`) matches without the prefix too.
+        if self.pattern.contains('|') {
+            return None;
+        }
         let rest = self.pattern.strip_prefix('^')?;
         let mut out = String::new();
         let mut chars = rest.chars().peekable();
@@ -802,11 +806,25 @@ impl Pred {
                 path,
                 op: FieldOp::Eq(v),
             } => out.push((path.clone(), v.clone())),
+            // `$all` with one value is an equality too.
+            Self::Field {
+                path,
+                op: FieldOp::All(inner),
+            } if inner.len() == 1 => {
+                if let FieldOp::Eq(v) = &inner[0] {
+                    out.push((path.clone(), v.clone()));
+                }
+            }
+            // An `$in` whose values are all equal is an equality.
             Self::Field {
                 path,
                 op: FieldOp::In(items),
-            } if items.len() == 1 => {
-                if let InItem::Value(v) = &items[0] {
+            } if !items.is_empty() => {
+                if let InItem::Value(v) = &items[0]
+                    && items[1..]
+                        .iter()
+                        .all(|i| matches!(i, InItem::Value(w) if crate::keyenc::equal(v, w)))
+                {
                     out.push((path.clone(), v.clone()));
                 }
             }

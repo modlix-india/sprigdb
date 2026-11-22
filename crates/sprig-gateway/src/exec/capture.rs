@@ -80,9 +80,9 @@ impl PassSession {
             .filter(|(k, _)| *k == key)
             .map(|(_, fp)| fp.clone());
         if let Some(fp) = cached {
-            let wl = self.wl.as_ref()?;
             let tenant = self.tenant.as_deref()?.tenant;
-            return Some(wl.start(tenant, fp, self.wl_multi));
+            let multi = self.wl_multi;
+            return Some(self.wl.as_mut()?.start(tenant, fp, multi));
         }
         let p = self.wl_start(logical)?;
         if let Ok(s) = self.stmts.get_mut(stmt) {
@@ -127,9 +127,9 @@ impl PassSession {
             })
             .map(|(_, fp)| fp.clone());
         if let Some(fp) = cached {
-            let wl = self.wl.as_ref()?;
             let tenant = self.tenant.as_deref()?.tenant;
-            return Some(wl.start(tenant, fp, self.wl_multi));
+            let multi = self.wl_multi;
+            return Some(self.wl.as_mut()?.start(tenant, fp, multi));
         }
         let p = self.wl_start(logical)?;
         if let Ok(s) = self.stmts.get_mut(stmt) {
@@ -146,7 +146,7 @@ impl PassSession {
 
     /// Fingerprints `logical` (a tenant statement's text, logical names)
     /// and asks the recorder for a plan. `None` without capture or tenant.
-    pub(super) fn wl_start(&self, logical: &[u8]) -> Option<Pending> {
+    pub(super) fn wl_start(&mut self, logical: &[u8]) -> Option<Pending> {
         let wl = self.wl.as_ref()?;
         // The client's text when a rewrite put data into the statement.
         let logical = self.wl_text.as_deref().unwrap_or(logical);
@@ -168,7 +168,8 @@ impl PassSession {
         };
         let resolver = CatalogResolver::new(cat, &*map, lower);
         let fp = wl.fingerprint(ts.tenant, logical, &ctx, &resolver);
-        Some(wl.start(ts.tenant, fp, self.wl_multi))
+        let (tenant, multi) = (ts.tenant, self.wl_multi);
+        Some(self.wl.as_mut()?.start(tenant, fp, multi))
     }
 
     /// Asks the backend session to probe the next statement when `p` says

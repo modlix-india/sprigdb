@@ -6,6 +6,7 @@ use super::{Fail, err};
 
 /// A column's type, normalized.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent attributes of a type
 pub(crate) struct Ty {
     /// The base name as printed: `int`, `varchar`, `decimal`, `enum`, ...
     pub base: String,
@@ -60,13 +61,23 @@ impl Ty {
     pub(crate) fn is_lob(&self) -> bool {
         matches!(
             self.base.as_str(),
-            "tinytext" | "text" | "mediumtext" | "longtext" | "tinyblob" | "blob" | "mediumblob" | "longblob"
+            "tinytext"
+                | "text"
+                | "mediumtext"
+                | "longtext"
+                | "tinyblob"
+                | "blob"
+                | "mediumblob"
+                | "longblob"
         )
     }
 
     /// An integer type.
     pub(crate) fn is_int(&self) -> bool {
-        matches!(self.base.as_str(), "tinyint" | "smallint" | "mediumint" | "int" | "bigint")
+        matches!(
+            self.base.as_str(),
+            "tinyint" | "smallint" | "mediumint" | "int" | "bigint"
+        )
     }
 
     /// A numeric type (an `AUTO_INCREMENT` column must be one).
@@ -128,7 +139,10 @@ pub(crate) fn charset_name(cs: &str) -> Option<&'static str> {
 
 /// A character set's default collation.
 pub(crate) fn default_collation(cs: &str) -> &'static str {
-    CHARSETS.iter().find(|(n, _)| *n == cs).map_or("binary", |(_, c)| *c)
+    CHARSETS
+        .iter()
+        .find(|(n, _)| *n == cs)
+        .map_or("binary", |(_, c)| *c)
 }
 
 /// A collation's name as printed and its character set, or `None` for a
@@ -174,14 +188,17 @@ pub(crate) struct CsSpec {
 pub(crate) fn resolve_cs(spec: &CsSpec, table: (&str, &str)) -> Result<(String, String), Fail> {
     let named_cs = match (&spec.charset, spec.short, spec.national) {
         (Some(c), _, _) => Some(
-            charset_name(c).ok_or_else(|| err(1115, "42000", format!("Unknown character set: '{c}'")))?,
+            charset_name(c)
+                .ok_or_else(|| err(1115, "42000", format!("Unknown character set: '{c}'")))?,
         ),
         (None, Some(s), _) => Some(s),
         (None, None, true) => Some("utf8mb3"),
         _ => None,
     };
     let coll = match &spec.collate {
-        Some(c) => Some(collation(c).ok_or_else(|| err(1273, "HY000", format!("Unknown collation: '{c}'")))?),
+        Some(c) => Some(
+            collation(c).ok_or_else(|| err(1273, "HY000", format!("Unknown collation: '{c}'")))?,
+        ),
         None => None,
     };
     match (named_cs, coll) {
@@ -204,7 +221,11 @@ pub(crate) fn resolve_cs(spec: &CsSpec, table: (&str, &str)) -> Result<(String, 
 
 fn bin_or_default(cs: &str, binary: bool) -> String {
     if binary {
-        if cs == "binary" { "binary".into() } else { format!("{cs}_bin") }
+        if cs == "binary" {
+            "binary".into()
+        } else {
+            format!("{cs}_bin")
+        }
     } else {
         default_collation(cs).to_owned()
     }
@@ -217,15 +238,21 @@ fn bin_or_default(cs: &str, binary: bool) -> String {
 /// error (`Fail::Syntax`).
 #[allow(clippy::too_many_lines)] // one arm per type spelling
 pub(crate) fn read(t: &[Tok], i: &mut usize, col: &str, spec: &mut CsSpec) -> Result<Ty, Fail> {
-    let Some(first) = t.get(*i) else { return Err(Fail::Syntax(*i)) };
-    let T::Word(w) = &first.t else { return Err(Fail::Syntax(*i)) };
+    let Some(first) = t.get(*i) else {
+        return Err(Fail::Syntax(*i));
+    };
+    let T::Word(w) = &first.t else {
+        return Err(Fail::Syntax(*i));
+    };
     let mut w = w.to_ascii_uppercase();
     *i += 1;
     // Multi-word spellings.
     let next_is = |i: usize, s: &str| t.get(i).is_some_and(|x| x.is(s));
     if w == "NATIONAL" {
         spec.national = true;
-        let Some(T::Word(n)) = t.get(*i).map(|x| &x.t) else { return Err(Fail::Syntax(*i)) };
+        let Some(T::Word(n)) = t.get(*i).map(|x| &x.t) else {
+            return Err(Fail::Syntax(*i));
+        };
         w = n.to_ascii_uppercase();
         *i += 1;
     }
@@ -283,24 +310,54 @@ pub(crate) fn read(t: &[Tok], i: &mut usize, col: &str, spec: &mut CsSpec) -> Re
             ty.serial = true;
         }
         "BIT" => {
-            let n = if args.is_empty() { 1 } else { num(0).ok_or(Fail::Syntax(*i))? };
+            let n = if args.is_empty() {
+                1
+            } else {
+                num(0).ok_or(Fail::Syntax(*i))?
+            };
             if n > 64 {
-                return Err(err(1439, "42000", format!("Display width out of range for '{col}' (max = 64)")));
+                return Err(err(
+                    1439,
+                    "42000",
+                    format!("Display width out of range for '{col}' (max = 64)"),
+                ));
             }
             ty.base = "bit".into();
             ty.args = format!("({})", n.max(1));
         }
         "DECIMAL" | "DEC" | "NUMERIC" | "FIXED" => {
-            let m = if args.is_empty() { 10 } else { num(0).ok_or(Fail::Syntax(*i))? };
-            let d = if args.len() > 1 { num(1).ok_or(Fail::Syntax(*i))? } else { 0 };
+            let m = if args.is_empty() {
+                10
+            } else {
+                num(0).ok_or(Fail::Syntax(*i))?
+            };
+            let d = if args.len() > 1 {
+                num(1).ok_or(Fail::Syntax(*i))?
+            } else {
+                0
+            };
             if m > 65 {
-                return Err(err(1426, "42000", format!("Too big precision specified for '{col}'. Maximum is 65")));
+                return Err(err(
+                    1426,
+                    "42000",
+                    format!("Too big precision specified for '{col}'. Maximum is 65"),
+                ));
             }
             if d > 38 {
-                return Err(err(1425, "42000", format!("Too big scale specified for '{col}'. Maximum is 38")));
+                return Err(err(
+                    1425,
+                    "42000",
+                    format!("Too big scale specified for '{col}'. Maximum is 38"),
+                ));
             }
             if m < d {
-                return Err(err(1427, "42000", format!("For float(M,D), double(M,D) or decimal(M,D), M must be >= D (column '{col}')")));
+                return Err(err(
+                    1427,
+                    "42000",
+                    format!(
+                        "For float(M,D), double(M,D) or decimal(M,D), M must be >= D (column '{col}')"
+                    ),
+                ));
             }
             ty.base = "decimal".into();
             ty.args = format!("({},{})", m.max(1), d);
@@ -310,7 +367,11 @@ pub(crate) fn read(t: &[Tok], i: &mut usize, col: &str, spec: &mut CsSpec) -> Re
             if args.len() == 1 {
                 let p = num(0).ok_or(Fail::Syntax(*i))?;
                 if p > 53 {
-                    return Err(err(1063, "42000", format!("Incorrect column specifier for column '{col}'")));
+                    return Err(err(
+                        1063,
+                        "42000",
+                        format!("Incorrect column specifier for column '{col}'"),
+                    ));
                 }
                 ty.base = if p > 24 { "double" } else { "float" }.into();
             } else {
@@ -332,9 +393,19 @@ pub(crate) fn read(t: &[Tok], i: &mut usize, col: &str, spec: &mut CsSpec) -> Re
             if w == "NCHAR" {
                 spec.national = true;
             }
-            let n = if args.is_empty() { 1 } else { num(0).ok_or(Fail::Syntax(*i))? };
+            let n = if args.is_empty() {
+                1
+            } else {
+                num(0).ok_or(Fail::Syntax(*i))?
+            };
             if n > 255 {
-                return Err(err(1074, "42000", format!("Column length too big for column '{col}' (max = 255); use BLOB or TEXT instead")));
+                return Err(err(
+                    1074,
+                    "42000",
+                    format!(
+                        "Column length too big for column '{col}' (max = 255); use BLOB or TEXT instead"
+                    ),
+                ));
             }
             ty.base = "char".into();
             ty.args = format!("({n})");
@@ -350,9 +421,19 @@ pub(crate) fn read(t: &[Tok], i: &mut usize, col: &str, spec: &mut CsSpec) -> Re
             ty.len = u32::try_from(n).unwrap_or(u32::MAX);
         }
         "BINARY" => {
-            let n = if args.is_empty() { 1 } else { num(0).ok_or(Fail::Syntax(*i))? };
+            let n = if args.is_empty() {
+                1
+            } else {
+                num(0).ok_or(Fail::Syntax(*i))?
+            };
             if n > 255 {
-                return Err(err(1074, "42000", format!("Column length too big for column '{col}' (max = 255); use BLOB or TEXT instead")));
+                return Err(err(
+                    1074,
+                    "42000",
+                    format!(
+                        "Column length too big for column '{col}' (max = 255); use BLOB or TEXT instead"
+                    ),
+                ));
             }
             ty.base = "binary".into();
             ty.args = format!("({n})");
@@ -361,7 +442,13 @@ pub(crate) fn read(t: &[Tok], i: &mut usize, col: &str, spec: &mut CsSpec) -> Re
         "VARBINARY" => {
             let n = num(0).ok_or(Fail::Syntax(*i))?;
             if n > 65532 {
-                return Err(err(1074, "42000", format!("Column length too big for column '{col}' (max = 65532); use BLOB or TEXT instead")));
+                return Err(err(
+                    1074,
+                    "42000",
+                    format!(
+                        "Column length too big for column '{col}' (max = 65532); use BLOB or TEXT instead"
+                    ),
+                ));
             }
             ty.base = "varbinary".into();
             ty.args = format!("({n})");
@@ -378,7 +465,11 @@ pub(crate) fn read(t: &[Tok], i: &mut usize, col: &str, spec: &mut CsSpec) -> Re
             ty.len = u32::MAX;
             if let Some(n) = num(0) {
                 let text = w == "TEXT";
-                let bytes = if text { n * u64::from(spec_mb(spec)) } else { n };
+                let bytes = if text {
+                    n * u64::from(spec_mb(spec))
+                } else {
+                    n
+                };
                 let kind = if bytes < 256 {
                     "tiny"
                 } else if bytes < 65536 {
@@ -401,7 +492,11 @@ pub(crate) fn read(t: &[Tok], i: &mut usize, col: &str, spec: &mut CsSpec) -> Re
             let members = read_members(t, i)?;
             ty.args = format!(
                 "({})",
-                members.iter().map(|m| super::expr::quote_str(m).replace("\\'", "''")).collect::<Vec<_>>().join(",")
+                members
+                    .iter()
+                    .map(|m| super::expr::quote_str(m).replace("\\'", "''"))
+                    .collect::<Vec<_>>()
+                    .join(",")
             );
             ty.members = members;
         }
@@ -410,7 +505,11 @@ pub(crate) fn read(t: &[Tok], i: &mut usize, col: &str, spec: &mut CsSpec) -> Re
             ty.base = w.to_ascii_lowercase();
             if let Some(f) = num(0) {
                 if f > 6 {
-                    return Err(err(1426, "42000", format!("Too big precision specified for '{col}'. Maximum is 6")));
+                    return Err(err(
+                        1426,
+                        "42000",
+                        format!("Too big precision specified for '{col}'. Maximum is 6"),
+                    ));
                 }
                 if f > 0 {
                     ty.args = format!("({f})");
@@ -424,20 +523,31 @@ pub(crate) fn read(t: &[Tok], i: &mut usize, col: &str, spec: &mut CsSpec) -> Re
             let n = num(0).unwrap_or(4);
             ty.args = if n == 2 { "(2)".into() } else { "(4)".into() };
         }
-        "GEOMETRY" | "POINT" | "LINESTRING" | "POLYGON" | "MULTIPOINT" | "MULTILINESTRING" | "MULTIPOLYGON" | "GEOMETRYCOLLECTION" | "UUID" | "INET4" | "INET6" | "VECTOR" => {
+        "GEOMETRY" | "POINT" | "LINESTRING" | "POLYGON" | "MULTIPOINT" | "MULTILINESTRING"
+        | "MULTIPOLYGON" | "GEOMETRYCOLLECTION" | "UUID" | "INET4" | "INET6" | "VECTOR" => {
             ty.base = w.to_ascii_lowercase();
         }
-        _ => return Err(err(4161, "HY000", format!("Unknown data type: '{}'", first_text(first)))),
+        _ => {
+            return Err(err(
+                4161,
+                "HY000",
+                format!("Unknown data type: '{}'", first_text(first)),
+            ));
+        }
     }
     // Integer display widths.
-    if ty.is_int() {
-        if let Some(wd) = num(0) {
-            if wd > 255 {
-                return Err(err(1439, "42000", format!("Display width out of range for '{col}' (max = 255)")));
-            }
-            if ty.args.is_empty() {
-                ty.args = format!("({wd})");
-            }
+    if ty.is_int()
+        && let Some(wd) = num(0)
+    {
+        if wd > 255 {
+            return Err(err(
+                1439,
+                "42000",
+                format!("Display width out of range for '{col}' (max = 255)"),
+            ));
+        }
+        if ty.args.is_empty() {
+            ty.args = format!("({wd})");
         }
     }
     // Attributes after the type: SIGNED / UNSIGNED / ZEROFILL, the string
@@ -494,13 +604,25 @@ fn md_args(ty: &mut Ty, args: &[String], col: &str, at: usize) -> Result<(), Fai
     let m: u64 = args[0].parse().map_err(|_| Fail::Syntax(at))?;
     let d: u64 = args[1].parse().map_err(|_| Fail::Syntax(at))?;
     if m > 255 {
-        return Err(err(1439, "42000", format!("Display width out of range for '{col}' (max = 255)")));
+        return Err(err(
+            1439,
+            "42000",
+            format!("Display width out of range for '{col}' (max = 255)"),
+        ));
     }
     if d > 30 {
-        return Err(err(1425, "42000", format!("Too big scale specified for '{col}'. Maximum is 30")));
+        return Err(err(
+            1425,
+            "42000",
+            format!("Too big scale specified for '{col}'. Maximum is 30"),
+        ));
     }
     if m < d {
-        return Err(err(1427, "42000", format!("For float(M,D), double(M,D) or decimal(M,D), M must be >= D (column '{col}')")));
+        return Err(err(
+            1427,
+            "42000",
+            format!("For float(M,D), double(M,D) or decimal(M,D), M must be >= D (column '{col}')"),
+        ));
     }
     ty.args = format!("({m},{d})");
     Ok(())

@@ -228,8 +228,7 @@ pub(crate) async fn run(sub: &ArgMatches, out: Output) -> Result<(), Failed> {
         }
         Some((cmd @ ("list" | "show"), m)) => {
             let (mut c, schema) = catalog(m).await?;
-            let st = InheritStore::new(&schema)
-                .load(&mut c)
+            let st = InheritStore::load_remote(&mut c, &schema)
                 .await
                 .map_err(|e| Failed(e.to_string()))?;
             let name = |id: SpaceId| {

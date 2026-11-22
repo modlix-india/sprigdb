@@ -258,7 +258,7 @@ pub async fn ensure_vhost(
         .any(|d| d.kind == DefKind::Queue)
         .then(|| tokio::spawn(warm_store(Arc::clone(svc), t, Arc::clone(&row))));
     let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
-    let mstore = MsgStore::new(ep.store.schema());
+    let mstore = MsgStore::new(Arc::clone(&svc.records), t);
     let st = super::state_of(&cat);
     let mq = cat
         .ext
@@ -283,7 +283,7 @@ pub async fn ensure_vhost(
         let key = d.key();
         let row_now = match st.instances.get(&key) {
             Some(i) => Some((**i).clone()),
-            None => mstore.instance(&mut conn, key).await?,
+            None => mstore.instance(key).await?,
         };
         let present = match d.kind {
             DefKind::Exchange => topo.exchanges.get(&d.name).map(|x| x.id),
@@ -315,20 +315,17 @@ pub async fn ensure_vhost(
             }
             let id = ep.store.next_object_id(&mut conn).await?.0;
             let claimed = mstore
-                .claim(
-                    &mut conn,
-                    &Instance {
-                        def: key,
-                        instance_id: id,
-                        kind: d.kind,
-                        def_version: d.def_version,
-                        definition: d.definition.clone(),
-                        state: InstanceState::Active,
-                        cause,
-                        physical: Some(json!({"db": d.db_name, "name": d.name})),
-                        created_at_ms: 0,
-                    },
-                )
+                .claim(&Instance {
+                    def: key,
+                    instance_id: id,
+                    kind: d.kind,
+                    def_version: d.def_version,
+                    definition: d.definition.clone(),
+                    state: InstanceState::Active,
+                    cause,
+                    physical: Some(json!({"db": d.db_name, "name": d.name})),
+                    created_at_ms: 0,
+                })
                 .await?;
             have += 1;
             if claimed {
@@ -338,10 +335,7 @@ pub async fn ensure_vhost(
                 id
             } else {
                 // Another gateway claimed it first: its id.
-                mstore
-                    .instance(&mut conn, key)
-                    .await?
-                    .map_or(id, |i| i.instance_id)
+                mstore.instance(key).await?.map_or(id, |i| i.instance_id)
             }
         };
         instances.push((Arc::clone(d), id));
@@ -449,29 +443,17 @@ pub async fn ensure_vhost(
     drop(conn);
     if !all.is_empty() || !arg_updates.is_empty() {
         let mut c = svc.catalog.change(t, VersionKind::Catalog).await?;
-        let r = {
-            let (store, tx) = c.tx().parts();
-            let ms = MqStore::new(store.schema());
-            let schema = store.schema().to_owned();
-            async {
-                for (ch, id) in &all {
-                    ms.apply(tx, row.db_id.0, ch, *id).await?;
-                }
-                for (id, args) in &arg_updates {
-                    tx.exec_drop(
-                        format!(
-                            "UPDATE {}.mq_queues SET arguments = ? WHERE object_id = ?",
-                            quote(&schema)
-                        ),
-                        (args.to_string(), id),
-                    )
-                    .await
-                    .map_err(cat_err)?;
-                }
-                Ok::<_, SprigError>(())
+        let r = async {
+            let rec = c.tx().records().await?;
+            for (ch, id) in &all {
+                MqStore::apply(rec, row.db_id.0, ch, *id).await?;
             }
-            .await
-        };
+            for (id, args) in &arg_updates {
+                MqStore::set_queue_arguments(rec, *id, args).await?;
+            }
+            Ok::<_, SprigError>(())
+        }
+        .await;
         if let Err(e) = r {
             let _ = c.rollback().await;
             return Err(e);
@@ -631,11 +613,9 @@ pub async fn remove(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) ->
         };
         if let Some(ch) = ch {
             let mut c = svc.catalog.change(t, VersionKind::Catalog).await?;
-            let r = {
-                let (store, tx) = c.tx().parts();
-                MqStore::new(store.schema())
-                    .apply(tx, row.db_id.0, &ch, 0)
-                    .await
+            let r = match c.tx().records().await {
+                Ok(rec) => MqStore::apply(rec, row.db_id.0, &ch, 0).await,
+                Err(e) => Err(e),
             };
             if let Err(e) = r {
                 let _ = c.rollback().await;
@@ -644,10 +624,8 @@ pub async fn remove(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) ->
             c.commit().await?;
         }
     }
-    let ep = svc.locator.writer(t).await?;
-    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
-    MsgStore::new(ep.store.schema())
-        .delete_instance(&mut conn, def.key())
+    MsgStore::new(Arc::clone(&svc.records), t)
+        .delete_instance(def.key())
         .await?;
     super::delete_index(svc, t, def.key()).await?;
     if def.kind == DefKind::Queue {
@@ -685,11 +663,9 @@ pub async fn remove_binding(
         arguments: json_table(&json_args(&b.arguments)),
     };
     let mut c = svc.catalog.change(t, VersionKind::Catalog).await?;
-    let r = {
-        let (store, tx) = c.tx().parts();
-        MqStore::new(store.schema())
-            .apply(tx, row.db_id.0, &TopoChange::Unbind(def), 0)
-            .await
+    let r = match c.tx().records().await {
+        Ok(rec) => MqStore::apply(rec, row.db_id.0, &TopoChange::Unbind(def), 0).await,
+        Err(e) => Err(e),
     };
     if let Err(e) = r {
         let _ = c.rollback().await;

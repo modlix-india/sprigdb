@@ -334,3 +334,98 @@ fn digests_outlive_buckets_and_reset_per_tenant() {
     assert_eq!(r.digests(TenantId(1))[0].digest.exec_count, 1);
     assert_eq!(r.stats(TenantId(1), a.id).unwrap().exec_count, 3);
 }
+
+/// A session's batch counts exactly what one record per execution would:
+/// in the bucket's counters, the digest and the first sighting, whether
+/// the fingerprint was known before or not.
+#[test]
+fn a_batch_counts_like_its_records() {
+    let (one, _c1, f) = setup(RecorderConfig::default());
+    let (batched, _c2, _) = setup(RecorderConfig::default());
+    let a = fp(&f, 1, "SELECT * FROM t WHERE id = 1");
+    let mut failed = ex(700);
+    failed.error = true;
+    failed.rows_returned = 0;
+    let runs: Vec<ExecSummary> = (1..=50u64).map(|us| ex(us * 10)).chain([failed]).collect();
+    for e in &runs {
+        one.record(TenantId(1), &a, e);
+    }
+    // New to the batched recorder: the batch makes its entry.
+    let mut b = Batch::default();
+    for e in &runs[..20] {
+        b.add(&a, e);
+    }
+    assert_eq!(b.len(), 20);
+    batched.record_batch(TenantId(1), &a, &b);
+    let mut b = Batch::default();
+    for e in &runs[20..] {
+        b.add(&a, e);
+    }
+    batched.record_batch(TenantId(1), &a, &b);
+    batched.record_batch(TenantId(1), &a, &Batch::default());
+    let (s1, s2) = (
+        one.stats(TenantId(1), a.id).unwrap(),
+        batched.stats(TenantId(1), a.id).unwrap(),
+    );
+    assert_eq!(
+        (
+            s1.exec_count,
+            s1.error_count,
+            s1.total_us,
+            s1.max_us,
+            s1.rows_returned
+        ),
+        (
+            s2.exec_count,
+            s2.error_count,
+            s2.total_us,
+            s2.max_us,
+            s2.rows_returned
+        )
+    );
+    assert_eq!(s1.latency_hist.p50_p95_p99(), s2.latency_hist.p50_p95_p99());
+    assert_eq!(
+        (s1.shards_sum, s1.shards_max),
+        (s2.shards_sum, s2.shards_max)
+    );
+    let (d1, d2) = (
+        &one.digests(TenantId(1))[0].digest,
+        &batched.digests(TenantId(1))[0].digest,
+    );
+    assert_eq!(
+        (
+            d1.exec_count,
+            d1.error_count,
+            d1.total_us,
+            d1.min_us,
+            d1.max_us,
+            d1.rows_returned
+        ),
+        (
+            d2.exec_count,
+            d2.error_count,
+            d2.total_us,
+            d2.min_us,
+            d2.max_us,
+            d2.rows_returned
+        )
+    );
+    assert_eq!(
+        batched.drain_new().len(),
+        1,
+        "the first sighting is reported"
+    );
+}
+
+/// An unwatched fingerprint's plan says so (a session may keep that), a
+/// watched one's is computed.
+#[test]
+fn plan_watched_tells_unwatched_apart() {
+    let (r, _c, f) = setup(RecorderConfig::default());
+    let a = fp(&f, 1, "SELECT 1 FROM t WHERE a = 1");
+    assert_eq!(r.plan_watched(TenantId(1), &a), None);
+    r.record(TenantId(1), &a, &ex(100));
+    assert_eq!(r.plan_watched(TenantId(1), &a), None);
+    r.watch(TenantId(1), a.id, true);
+    assert!(r.plan_watched(TenantId(1), &a).is_some_and(|p| p.examined));
+}

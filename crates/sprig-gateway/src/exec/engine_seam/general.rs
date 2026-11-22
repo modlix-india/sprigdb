@@ -30,7 +30,7 @@ use sprig_common::{Result, SprigError};
 use sprig_proto_mysql::command::{ExecuteParams, ParamValue, StmtExecute};
 use sprig_proto_mysql::{Caps, StatusFlags};
 
-use super::{EnginePrepared, SessVars, engine_in_other_txn};
+use super::{EnginePrepared, SessVars, diag, engine_in_other_txn};
 use crate::backend::{StmtInfo, StmtOutcome};
 use crate::engine::general::results::{self, Layout};
 use crate::engine::general::{General, Rows, RunArgs};
@@ -81,7 +81,7 @@ impl PassSession {
     /// # Errors
     /// 1142, 1143; `ER_SPRIG_NOT_ON_ENGINE` for a protected table the
     /// rewrite didn't cover.
-    fn general_checks(
+    pub(super) fn general_checks(
         &self,
         cat: &TenantCatalog,
         g: &General,
@@ -182,6 +182,7 @@ impl PassSession {
         g: &General,
         params: &[Datum],
         sv: &SessVars,
+        stop: std::sync::Arc<crate::session::SessionHandle>,
     ) -> Result<Rows> {
         // MariaDB holds the session's transaction: an engine statement
         // can't join it.
@@ -207,6 +208,7 @@ impl PassSession {
             params,
             seed: &sv.general,
             deadline: sv.time_limit.map(|d| (Instant::now() + d, timed_out)),
+            stop: Some(stop),
         };
         if !self.eng.txn.is_open() {
             if !sv.autocommit_off {
@@ -217,8 +219,11 @@ impl PassSession {
                 .txn
                 .begin(e, sv.opts, sv.read_only, Start::default())?;
         }
-        if let Some(tx) = self.eng.txn.statement() {
-            // The session's `sql_mode` and time zone as they are now.
+        // The session's `sql_mode` and time zone as they are now. The
+        // statement itself starts in `general_run_in`: starting it here
+        // too marked the previous statement as still running, and the
+        // second start undid that statement's writes.
+        if let Some(tx) = self.eng.txn.open_tx() {
             tx.set_env(sv.env);
         }
         let r = e.general_run_in(g, &a, &mut self.eng.txn).await;
@@ -236,9 +241,21 @@ impl PassSession {
         sv: &SessVars,
         out: &mut dyn ResultSink,
     ) -> Result<()> {
+        // The statement's conditions become the diagnostics area; one
+        // that read no table and raised nothing leaves it as the
+        // statement's kind says (`diag`).
+        if rows.warnings > 0 || !g.tables.is_empty() {
+            let (area, extra) = diag::kept(
+                rows.conds
+                    .iter()
+                    .map(|w| diag::warning(w.level.name(), w.code, w.message.clone())),
+            );
+            let beyond = usize::from(rows.warnings).saturating_sub(area.len());
+            self.diag_set(area, extra.max(beyond));
+        }
         let Layout { shapes, defs } = results::layout(g, &rows.columns, sv.results);
         let mut s = status;
-        if rows.no_index {
+        if rows.no_index || results::set_operation_scans(&g.stmt) {
             s |= StatusFlags::NO_INDEX_USED;
         }
         match format {
@@ -320,7 +337,15 @@ impl PassSession {
         }
         let sv = self.engine_vars(cx);
         let pending = logical.and_then(|l| self.wl_start(l));
-        let r = self.general_run(cat.tenant.0, &g, &[], &sv).await;
+        let r = self
+            .general_run(
+                cat.tenant.0,
+                &g,
+                &[],
+                &sv,
+                std::sync::Arc::clone(cx.session.handle()),
+            )
+            .await;
         let mut status = self.engine_status(&sv);
         if more {
             status |= StatusFlags::MORE_RESULTS_EXISTS;
@@ -412,6 +437,20 @@ impl PassSession {
             return Err(SprigError::internal("engine: a statement without a table"));
         };
         let persona = self.persona;
+        // MySQL types each `?` from its context.
+        let param_types = if persona == sprig_proto_mysql::Persona::MySql84 {
+            let named: Vec<engine::paramtype::Named<'_>> = g
+                .tables
+                .iter()
+                .map(|t| engine::paramtype::Named {
+                    aliases: &t.aliases,
+                    def: &t.def,
+                })
+                .collect();
+            engine::paramtype::infer(&g.stmt, &named)
+        } else {
+            Vec::new()
+        };
         let mut st = Stmt::engine(
             rewritten.clone(),
             StmtInfo::classify(rewritten),
@@ -435,8 +474,10 @@ impl PassSession {
             status: None,
             prepared: Some(PreparedMeta {
                 stmt,
-                params: (0..params)
-                    .map(|_| meta::param_def(persona, None, sv.results))
+                params: (0..usize::from(params))
+                    .map(|i| {
+                        meta::param_def(persona, param_types.get(i).copied().flatten(), sv.results)
+                    })
                     .collect(),
                 columns: defs,
                 warnings: 0,
@@ -534,7 +575,15 @@ impl PassSession {
             Some(l) => self.wl_start_stmt_known(stmt, l, sv.current.as_deref(), sv.lex),
             None => None,
         };
-        let r = self.general_run(cat.tenant.0, &g, &vals, &sv).await;
+        let r = self
+            .general_run(
+                cat.tenant.0,
+                &g,
+                &vals,
+                &sv,
+                std::sync::Arc::clone(cx.session.handle()),
+            )
+            .await;
         // Once per statement, after it: the engine may have ended the
         // transaction.
         let status = self.engine_status(&sv);

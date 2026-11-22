@@ -689,7 +689,11 @@ async fn new_tables_store_row_records_and_prototype_tables_are_refused() {
     .unwrap();
     tx.finish().await.unwrap();
     let err = e.space(TENANT.0, &named).await.unwrap_err();
-    assert!(err.message.contains("prototype row format"), "{}", err.message);
+    assert!(
+        err.message.contains("prototype row format"),
+        "{}",
+        err.message
+    );
 
     // A new table stores the engine's row record, version 1, and no marker.
     let owned = f.tables["owned"].as_ref().as_ref().unwrap().clone();

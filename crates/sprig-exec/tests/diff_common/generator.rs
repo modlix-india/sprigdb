@@ -1250,8 +1250,8 @@ impl<'a> Generator<'a> {
     fn cs_leaf(&mut self, depth: usize) -> Expr {
         let lit = |g: &mut Self| -> Expr {
             Expr::str(*g.rng.pick(&[
-                "a", "\u{e9}", "\u{c9}", "e", "\u{df}", "ss", "\u{20ac}", "\u{4e2d}", "abc ", "", "1", "x", "\u{e4}",
-                "ABC",
+                "a", "\u{e9}", "\u{c9}", "e", "\u{df}", "ss", "\u{20ac}", "\u{4e2d}", "abc ", "",
+                "1", "x", "\u{e4}", "ABC",
             ]))
         };
         // (Under GREATEST and LEAST: no column and no COLLATE, see `plain`.)
@@ -1261,19 +1261,26 @@ impl<'a> Generator<'a> {
             self.rng.below(12)
         };
         match pick {
-            0..=3 if self.with_cols && self.plain == 0 => self
-                .column(is_charset_col)
-                .unwrap_or_else(|| lit(self)),
+            0..=3 if self.with_cols && self.plain == 0 => {
+                self.column(is_charset_col).unwrap_or_else(|| lit(self))
+            }
             0 | 1 => Expr::Func(
                 "_CHARSET".to_owned(),
                 vec![
                     Expr::Keyword("latin1".to_owned()),
-                    Expr::Hex(vec![*self.rng.pick(&[0xE9u8, 0x80, 0xDF, 0x41, 0xC9, 0xFF, 0x81])]),
+                    Expr::Hex(vec![
+                        *self.rng.pick(&[0xE9u8, 0x80, 0xDF, 0x41, 0xC9, 0xFF, 0x81]),
+                    ]),
                 ],
             ),
             2 => Expr::Func(
                 "_CHARSET".to_owned(),
-                vec![Expr::Keyword((*self.rng.pick(&["latin1", "ascii", "utf8mb4", "binary"])).to_owned()), lit(self)],
+                vec![
+                    Expr::Keyword(
+                        (*self.rng.pick(&["latin1", "ascii", "utf8mb4", "binary"])).to_owned(),
+                    ),
+                    lit(self),
+                ],
             ),
             3 | 4 => {
                 let cs = *self.rng.pick(&["latin1", "ascii", "utf8mb4", "binary"]);
@@ -1282,14 +1289,21 @@ impl<'a> Generator<'a> {
                 } else {
                     lit(self)
                 };
-                Expr::Func("CONVERT_USING".to_owned(), vec![inner, Expr::Keyword(cs.to_owned())])
+                Expr::Func(
+                    "CONVERT_USING".to_owned(),
+                    vec![inner, Expr::Keyword(cs.to_owned())],
+                )
             }
             5 => Expr::Collate(
                 b(Expr::Func(
                     "CONVERT_USING".to_owned(),
                     vec![lit(self), Expr::Keyword("latin1".to_owned())],
                 )),
-                *self.rng.pick(&[Collation::Latin1Bin, Collation::Latin1GeneralCi, Collation::Latin1SwedishCi]),
+                *self.rng.pick(&[
+                    Collation::Latin1Bin,
+                    Collation::Latin1GeneralCi,
+                    Collation::Latin1SwedishCi,
+                ]),
             ),
             6 | 7 => lit(self),
             _ => self.str_arg(depth),
@@ -1310,22 +1324,39 @@ impl<'a> Generator<'a> {
                 f("CONCAT", (0..n).map(|_| self.cs_leaf(depth)).collect())
             }
             4 => {
-                let name = *self.rng.pick(&["LENGTH", "CHAR_LENGTH", "UPPER", "LOWER", "REVERSE", "HEX", "ASCII", "ORD"]);
+                let name = *self.rng.pick(&[
+                    "LENGTH",
+                    "CHAR_LENGTH",
+                    "UPPER",
+                    "LOWER",
+                    "REVERSE",
+                    "HEX",
+                    "ASCII",
+                    "ORD",
+                ]);
                 f(name, vec![self.cs_leaf(depth)])
             }
             5 => {
                 let name = *self.rng.pick(&["CHARSET", "COLLATION", "COERCIBILITY"]);
                 f(name, vec![self.cs_leaf(depth)])
             }
-            6 => f("REPLACE", vec![self.cs_leaf(depth), self.cs_leaf(0), self.cs_leaf(0)]),
+            6 => f(
+                "REPLACE",
+                vec![self.cs_leaf(depth), self.cs_leaf(0), self.cs_leaf(0)],
+            ),
             7 => f("LOCATE", vec![self.cs_leaf(0), self.cs_leaf(depth)]),
             8 => {
                 let name = *self.rng.pick(&["LPAD", "RPAD"]);
-                f(name, vec![self.cs_leaf(depth), self.small_int(), self.cs_leaf(0)])
+                f(
+                    name,
+                    vec![self.cs_leaf(depth), self.small_int(), self.cs_leaf(0)],
+                )
             }
             9 => Expr::Like(
                 b(self.cs_leaf(depth)),
-                b(Expr::str(*self.rng.pick(&["%\u{e9}%", "a%", "_", "%", "\u{c9}", "e%"]))),
+                b(Expr::str(
+                    *self.rng.pick(&["%\u{e9}%", "a%", "_", "%", "\u{c9}", "e%"]),
+                )),
                 None,
                 self.rng.chance(1, 4),
             ),
@@ -1348,6 +1379,98 @@ impl<'a> Generator<'a> {
             }
             12 => f("SUBSTRING", vec![self.cs_leaf(depth), self.small_int()]),
             _ => f("STRCMP", vec![self.cs_leaf(depth), self.cs_leaf(depth)]),
+        }
+    }
+
+    /// Named time zones: `CONVERT_TZ` between names and offsets, at
+    /// ordinary times, at the clocks' changes and at the range's ends; and
+    /// the functions that read the session's zone.
+    fn tz_expr(&mut self, depth: usize) -> Expr {
+        let f = |name: &str, args: Vec<Expr>| Expr::func(name, args);
+        let zone = |g: &mut Self| {
+            Expr::str(*g.rng.pick(&[
+                "Europe/Berlin",
+                "America/New_York",
+                "Asia/Kolkata",
+                "Australia/Lord_Howe",
+                "Pacific/Chatham",
+                "America/St_Johns",
+                "Europe/London",
+                "UTC",
+                "Etc/GMT+5",
+                "Etc/GMT-14",
+                "EST",
+                "MET",
+                "Asia/Kathmandu",
+                "Africa/Casablanca",
+                "America/Sao_Paulo",
+                "Pacific/Apia",
+                "europe/berlin",
+                "Asia/Calcutta",
+                "US/Pacific",
+                "posix/Europe/Berlin",
+                "Europe/Nowhere",
+                "+05:30",
+                "-08:00",
+                "SYSTEM",
+                "",
+            ]))
+        };
+        let when = |g: &mut Self| -> Expr {
+            if g.rng.chance(1, 3) {
+                g.temporal_arg(depth)
+            } else {
+                Expr::str(*g.rng.pick(&[
+                    "2024-03-10 02:30:00",
+                    "2024-03-10 01:59:59",
+                    "2024-03-31 02:30:00",
+                    "2024-11-03 01:30:00",
+                    "2024-10-27 02:30:00",
+                    "2024-01-15 10:30:00.123456",
+                    "2024-07-04 12:00:00",
+                    "1970-01-01 00:00:01",
+                    "1970-01-01 05:30:00",
+                    "2038-01-19 03:14:07",
+                    "2106-02-07 06:28:15",
+                    "3001-01-19 03:14:07",
+                    "1969-12-31 23:59:59",
+                    "2024-04-07 02:15:00",
+                    "2011-12-30 00:00:00",
+                ]))
+            }
+        };
+        match self.rng.below(10) {
+            0..=5 => f("CONVERT_TZ", vec![when(self), zone(self), zone(self)]),
+            6 => f("UNIX_TIMESTAMP", vec![when(self)]),
+            7 => {
+                let n = Expr::Int(
+                    (*self.rng.pick(&[
+                        "1710052200",
+                        "1730611800",
+                        "1700000000",
+                        "0",
+                        "1",
+                        "2147483647",
+                        "1711846800",
+                    ]))
+                    .to_owned(),
+                );
+                f("FROM_UNIXTIME", vec![n])
+            }
+            8 => f(
+                *self
+                    .rng
+                    .pick(&["NOW", "CURDATE", "CURTIME", "UTC_TIMESTAMP"]),
+                vec![],
+            ),
+            _ => Expr::binary(
+                BinOp::Sub,
+                f(
+                    "UNIX_TIMESTAMP",
+                    vec![f("CONVERT_TZ", vec![when(self), zone(self), zone(self)])],
+                ),
+                f("UNIX_TIMESTAMP", vec![when(self)]),
+            ),
         }
     }
 
@@ -1388,6 +1511,7 @@ impl<'a> Generator<'a> {
             "numfn2" => self.numeric_fn2(depth),
             "rowcmp" => self.row_cmp(depth),
             "charset" => self.charset_expr(depth),
+            "tzname" => self.tz_expr(depth.min(1)),
             "coll" => {
                 let name = *self.rng.pick(&["COLLATION", "COERCIBILITY", "CHARSET"]);
                 let arg = if self.rng.chance(1, 4) {
@@ -1419,5 +1543,5 @@ fn is_temporal_col(c: &Col) -> bool {
 
 pub const AREAS: &[&str] = &[
     "arith", "cmp", "logic", "pred", "control", "cast", "bit", "mixed", "strfn", "numfn", "coll",
-    "temporal", "strfn2", "numfn2", "rowcmp", "charset",
+    "temporal", "strfn2", "numfn2", "rowcmp", "charset", "tzname",
 ];

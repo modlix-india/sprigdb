@@ -53,6 +53,11 @@ pub(crate) trait Names {
     fn db_by_name(&self, name: &str) -> Option<DbId>;
     /// The catalog version.
     fn version(&self) -> u64;
+    /// The foreign keys whose parent is table `name` of `db`: each child
+    /// table's definition and the key's position among its foreign keys.
+    fn referencing(&self, _db: DbId, _name: &str) -> Vec<(Arc<TableDef>, usize)> {
+        Vec::new()
+    }
 }
 
 /// [`Names`] over a catalog snapshot.
@@ -96,6 +101,34 @@ impl Names for CatalogNames<'_> {
     }
     fn version(&self) -> u64 {
         self.cat.version
+    }
+    fn referencing(&self, db: DbId, name: &str) -> Vec<(Arc<TableDef>, usize)> {
+        if self.eng.refs.is_empty() {
+            return Vec::new();
+        }
+        let Some(cands) = self.eng.refs.get(&name.to_lowercase()) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for &(object, i) in cands {
+            let Some(Ok(child)) = self.eng.tables.get(&object).map(|p| p.as_ref().clone()) else {
+                continue;
+            };
+            let f = &child.fks[i];
+            let same_name = if self.lower_case {
+                f.ref_table.eq_ignore_ascii_case(name)
+            } else {
+                f.ref_table == name
+            };
+            let ref_db = match &f.ref_db {
+                None => Some(child.db),
+                Some(n) => self.db_by_name(n),
+            };
+            if same_name && ref_db == Some(db) {
+                out.push((child, i));
+            }
+        }
+        out
     }
 }
 
@@ -215,6 +248,9 @@ pub(crate) struct Plan {
     /// or `UPDATE` writes (the policies' `WITH CHECK`, bound to the
     /// session): a row that doesn't meet it fails the statement.
     pub check: Option<CExpr>,
+    /// The foreign keys an `INSERT`, `UPDATE` or `DELETE` must keep (none
+    /// when the table has none either way).
+    pub fks: Option<Arc<super::fk::Graph>>,
 }
 
 impl Plan {
@@ -249,16 +285,24 @@ pub(crate) fn physical_db(tenant: TenantId, schema: &str) -> Option<DbId> {
 }
 
 /// A resolved table reference.
-enum Resolved {
+pub(crate) enum Resolved {
     /// Not an engine database's.
     Elsewhere,
     /// An engine table.
     Engine(Arc<TableDef>, DbId),
 }
 
-fn resolve(cx: &BindCtx<'_>, name: &ObjectName) -> Result<Resolved> {
+/// `DUAL`, unquoted: the servers' dummy table, never a table of the
+/// database (a table named so must be quoted).
+pub(crate) fn is_dual(t: &sqlparser::ast::Ident) -> bool {
+    t.quote_style.is_none() && t.value.eq_ignore_ascii_case("dual")
+}
+
+pub(crate) fn resolve(cx: &BindCtx<'_>, name: &ObjectName) -> Result<Resolved> {
     let parts = ident_parts(name).ok_or_else(|| not_on_engine("a table name"))?;
     let (db, table) = match parts.as_slice() {
+        // `FROM DUAL` reads no table.
+        [t] if is_dual(t) => return Ok(Resolved::Elsewhere),
         [t] => (cx.current, &t.value),
         [s, t] => {
             let db = physical_db(cx.tenant, &s.value).or_else(|| cx.names.db_by_name(&s.value));
@@ -581,6 +625,11 @@ pub(crate) fn bind(cx: &BindCtx<'_>, stmt: &Statement) -> Result<Option<Plan>> {
             let from = match &d.from {
                 FromTable::WithFromKeyword(f) | FromTable::WithoutKeyword(f) => f,
             };
+            // `DELETE t FROM ...` and `DELETE FROM t USING ...` name their
+            // targets by alias: not one table's shape (`multiwrite`).
+            if !d.tables.is_empty() || d.using.is_some() {
+                return Err(not_on_engine("this DELETE form"));
+            }
             let Some((def, db, name, alias)) = single_table(cx, from)? else {
                 return Ok(None);
             };
@@ -712,6 +761,11 @@ fn finish(
         .unwrap_or_default();
     let alias = alias.map_or_else(|| table_written.clone(), |a| a.value.clone());
     let db_name = cx.names.db_name(db);
+    let fks = if matches!(op, Op::Select { .. }) {
+        None
+    } else {
+        super::fk::Graph::build(cx, &def, db)
+    };
     Ok(Some(Plan {
         op,
         db_name: Bytes::from(db_name),
@@ -731,6 +785,7 @@ fn finish(
         ordered: false,
         lock: None,
         check: None,
+        fks,
         table: def,
     }))
 }
@@ -765,6 +820,10 @@ fn bind_query(cx: &BindCtx<'_>, q: &Query) -> Result<Option<Plan>> {
         match item {
             SelectItem::Wildcard(_) => {
                 for (i, col) in def.columns.iter().enumerate() {
+                    // An invisible column isn't part of `*`.
+                    if col.invisible {
+                        continue;
+                    }
                     c.read[i] = true;
                     out.push(OutCol {
                         col: i,
@@ -913,6 +972,7 @@ fn mentions_engine(cx: &BindCtx<'_>, e: &SetExpr) -> Result<bool> {
     })
 }
 
+#[allow(clippy::too_many_lines)] // the forms, the columns, the rows
 fn bind_insert(cx: &BindCtx<'_>, ins: &sqlparser::ast::Insert) -> Result<Option<Plan>> {
     let TableObject::TableName(name) = &ins.table else {
         return Ok(None);
@@ -933,23 +993,48 @@ fn bind_insert(cx: &BindCtx<'_>, ins: &sqlparser::ast::Insert) -> Result<Option<
         || ins.replace_into
         || ins.on.is_some()
         || ins.returning.is_some()
-        || !ins.assignments.is_empty()
         || ins.partitioned.is_some()
         || ins.insert_alias.is_some()
     {
         return Err(not_on_engine("this INSERT form"));
     }
-    let Some(src) = &ins.source else {
-        return Err(not_on_engine("INSERT without VALUES"));
-    };
-    let SetExpr::Values(values) = &*src.body else {
-        return Err(not_on_engine("INSERT ... SELECT"));
-    };
-    let cols: Vec<usize> = if ins.columns.is_empty() {
-        (0..def.columns.len()).collect()
+    // `INSERT ... SET c = v, ...`: one row of those columns.
+    let set_form: Option<(Vec<ObjectName>, Vec<Expr>)> = if ins.assignments.is_empty() {
+        None
     } else {
-        let mut v = Vec::with_capacity(ins.columns.len());
-        for n in &ins.columns {
+        let mut names = Vec::new();
+        let mut row = Vec::new();
+        for a in &ins.assignments {
+            let sqlparser::ast::AssignmentTarget::ColumnName(n) = &a.target else {
+                return Err(not_on_engine("a tuple assignment"));
+            };
+            names.push(n.clone());
+            row.push(a.value.clone());
+        }
+        Some((names, row))
+    };
+    let rows_in: Vec<&[Expr]> = match (&set_form, &ins.source) {
+        (Some((_, row)), None) => vec![row.as_slice()],
+        (None, Some(src)) => {
+            let SetExpr::Values(values) = &*src.body else {
+                return Err(not_on_engine("INSERT ... SELECT"));
+            };
+            values.rows.iter().map(|r| r.content.as_slice()).collect()
+        }
+        _ => return Err(not_on_engine("INSERT without VALUES")),
+    };
+    let listed: &[ObjectName] = match &set_form {
+        Some((names, _)) => names,
+        None => &ins.columns,
+    };
+    let cols: Vec<usize> = if listed.is_empty() {
+        // Without a column list, the visible columns in order.
+        (0..def.columns.len())
+            .filter(|&i| !def.columns[i].invisible)
+            .collect()
+    } else {
+        let mut v = Vec::with_capacity(listed.len());
+        for n in listed {
             let parts = ident_parts(n).ok_or_else(|| not_on_engine("a column"))?;
             let Some(last) = parts.last() else {
                 return Err(not_on_engine("a column"));
@@ -962,9 +1047,9 @@ fn bind_insert(cx: &BindCtx<'_>, ins: &sqlparser::ast::Insert) -> Result<Option<
         v
     };
     let mut c = compiler(cx, &def, name, None);
-    let mut rows = Vec::with_capacity(values.rows.len());
-    for (ri, r) in values.rows.iter().enumerate() {
-        if r.content.len() != cols.len() {
+    let mut rows = Vec::with_capacity(rows_in.len());
+    for (ri, r) in rows_in.iter().enumerate() {
+        if r.len() != cols.len() {
             return Err(SprigError::standard(
                 1136,
                 *b"21S01",
@@ -972,7 +1057,7 @@ fn bind_insert(cx: &BindCtx<'_>, ins: &sqlparser::ast::Insert) -> Result<Option<
             ));
         }
         let mut row = Vec::with_capacity(cols.len());
-        for e in &r.content {
+        for e in *r {
             if let Expr::Identifier(i) = e
                 && i.quote_style.is_none()
                 && i.value.eq_ignore_ascii_case("DEFAULT")

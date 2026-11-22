@@ -5,9 +5,10 @@
 //! ```text
 //! every doc.ttl_interval_seconds (read at each pass):
 //!   for each cluster of the DC:
-//!     catalogs t<tenant>_sprig with doc_indexes, whose catalog shard map
-//!       here is the tenant's home (role home) on this cluster
-//!     each one's collections with a ready TTL index (expire_seconds)
+//!     catalogs t<tenant>_sprig, whose catalog shard map here is the
+//!       tenant's home (role home) on this cluster
+//!     each one's collections with a ready TTL index (expire_seconds), from
+//!       the tenant's catalog records on the engine node
 //!   for each such collection, its shard schemas t<tenant>_d<db>_g<g>_s<s>
 //!     holding its table on any cluster, kept only where the group's shard
 //!     map (role home) has shard s on that cluster, serving; a group without
@@ -34,12 +35,11 @@
 //! (like `kv_sweep`), not through a gateway: TTL needs no user's
 //! privileges, and the shard maps are the gateways' own routing.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use bson::Document;
 use mysql_async::prelude::Queryable;
 use serde_json::{Value, json};
 use sprig_catalog::placement::{MapRole, RangeState, ShardMap};
@@ -52,7 +52,7 @@ use sprig_controller::doc_ttl_loop::{
     MULTI_WRITE_BATCH, TTL_INTERVAL_SECONDS, TTL_TENANT_DELETES_PER_SECOND,
 };
 use sprig_doc::engine::{Done, Engine, EngineConfig, Ns, Rows, SqlError, SqlRunner};
-use sprig_doc::meta::{CollMeta, IndexDef};
+use sprig_doc::meta::CollMeta;
 use sprig_meta::{Consistency, MetaStore, Record};
 
 use crate::runtime::{JobCtx, JobHandler};
@@ -175,132 +175,19 @@ async fn home_map(
     Ok((m.role == MapRole::Home).then_some(m))
 }
 
-/// Every ready index of the collections in catalog `q` (quoted) that have
-/// a TTL index, by collection.
-async fn ttl_indexes(
-    conn: &mut mysql_async::Conn,
-    q: &str,
-) -> Result<BTreeMap<u64, Vec<IndexDef>>, mysql_async::Error> {
-    let idx: Vec<mysql_async::Row> = conn
-        .query(format!(
-            "SELECT i.collection_id, i.index_id, i.name, i.key_pattern, i.expire_seconds, \
-             i.mariadb_name, i.is_unique, i.is_sparse, i.origin, i.options FROM {q}.doc_indexes i \
-             WHERE i.state = 'ready' AND i.collection_id IN \
-             (SELECT collection_id FROM {q}.doc_indexes WHERE expire_seconds IS NOT NULL) \
-             ORDER BY i.collection_id, i.index_id"
-        ))
-        .await?;
-    let mut by_coll: BTreeMap<u64, Vec<IndexDef>> = BTreeMap::new();
-    for r in idx {
-        let Ok((cid, id, name, key, expire, mariadb, uniq, sparse, origin, opts)) =
-            mysql_async::from_row_opt::<(
-                u64,
-                u32,
-                String,
-                Vec<u8>,
-                Option<i64>,
-                Option<String>,
-                i8,
-                i8,
-                String,
-                Option<Vec<u8>>,
-            )>(r)
-        else {
-            continue;
-        };
-        // The index's other options: a partial TTL index expires only
-        // the documents its filter matches.
-        let extra = opts
-            .and_then(|b| bson::from_slice::<Document>(&b).ok())
-            .unwrap_or_default();
-        let Ok(k) = bson::from_slice::<Document>(&key) else {
-            continue;
-        };
-        let key = k
-            .iter()
-            .map(|(p, v)| {
-                let d = sprig_doc::filter::as_i64(v).unwrap_or(1);
-                (p.clone(), if d < 0 { -1 } else { 1 })
-            })
-            .collect();
-        let mariadb = mariadb.filter(|m| *m != format!("sprig_dix_{id}"));
-        by_coll.entry(cid).or_default().push(IndexDef {
-            id,
-            name,
-            key,
-            unique: uniq != 0,
-            sparse: sparse != 0,
-            expire_after: expire,
-            origin,
-            extra,
-            mariadb,
-            auto_index_id: None,
-        });
-    }
-    Ok(by_coll)
-}
-
-/// The TTL collections in catalog `schema` (see the module docs).
-async fn ttl_collections(
-    conn: &mut mysql_async::Conn,
-    schema: &str,
-    tenant: TenantId,
-) -> Result<Vec<TtlColl>, mysql_async::Error> {
-    let q = sprig_common::names::quote(schema);
-    let mut by_coll = ttl_indexes(conn, &q).await?;
-    if by_coll.is_empty() {
-        return Ok(Vec::new());
-    }
-    let ids: Vec<String> = by_coll.keys().map(ToString::to_string).collect();
-    let rows: Vec<mysql_async::Row> = conn
-        .query(format!(
-            "SELECT collection_id, db_id, name, table_name, coll_uuid, \
-             CAST(array_paths AS CHAR), array_paths_full, options, next_index \
-             FROM {q}.collections WHERE state = 'ready' AND collection_id IN ({})",
-            ids.join(", ")
-        ))
-        .await?;
+/// The TTL collections of `tenant` (see the module docs), from its
+/// catalog records on the engine node: ready collections with a ready
+/// TTL index, each with every ready index.
+async fn ttl_collections(tenant: TenantId) -> sprig_common::Result<Vec<TtlColl>> {
+    let mut rec = crate::sinks::catalog_records().begin(tenant).await?;
+    let colls = sprig_doc::catalog_records::DocTables::load(&mut *rec).await?;
+    drop(rec);
     let mut out = Vec::new();
-    for r in rows {
-        let Ok((cid, db, name, table, uuid, paths, full, options, next)) =
-            mysql_async::from_row_opt::<(
-                u64,
-                u32,
-                String,
-                String,
-                Vec<u8>,
-                Option<String>,
-                i8,
-                Option<Vec<u8>>,
-                u32,
-            )>(r)
-        else {
-            continue;
-        };
-        let indexes = by_coll.remove(&cid).unwrap_or_default();
-        let array_paths: BTreeSet<String> = paths
-            .and_then(|p| serde_json::from_str::<Vec<String>>(&p).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        let options = options
-            .and_then(|o| bson::from_slice::<Document>(&o).ok())
-            .unwrap_or_default();
+    for (_, (db, meta)) in colls {
         // Time series collections aren't built; a view has no table.
-        if options.contains_key("timeseries") || options.contains_key("viewOn") {
+        if meta.options.contains_key("timeseries") || meta.options.contains_key("viewOn") {
             continue;
         }
-        let meta = CollMeta {
-            name,
-            table,
-            uuid: uuid.try_into().unwrap_or([0; 16]),
-            array_paths,
-            arrays_full: full != 0,
-            pending_paths: BTreeSet::new(),
-            indexes,
-            options,
-            next_index: next,
-        };
         for i in &meta.indexes {
             if let Some((path, expire)) = sprig_doc::engine::ttl::ttl_of(i) {
                 out.push(TtlColl {
@@ -350,7 +237,7 @@ impl DocTtl {
             let schemas: Vec<String> = match conn
                 .query(
                     "SELECT table_schema FROM information_schema.tables \
-                     WHERE table_name = 'doc_indexes' AND table_schema REGEXP '^t[0-9]+_sprig$'",
+                     WHERE table_name = 'objects' AND table_schema REGEXP '^t[0-9]+_sprig$'",
                 )
                 .await
             {
@@ -373,7 +260,7 @@ impl DocTtl {
                 if !seen.insert(tenant.0) {
                     continue;
                 }
-                match ttl_collections(&mut conn, &schema, tenant).await {
+                match ttl_collections(tenant).await {
                     Ok(c) => out.extend(c),
                     Err(e) => {
                         tracing::debug!(%tenant, error = %e, "TTL: collections not read");

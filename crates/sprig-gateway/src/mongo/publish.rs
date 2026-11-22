@@ -118,7 +118,8 @@ fn lapse() {
 /// catalog from the writer before using it, then calls [`reloaded`].
 #[must_use]
 pub fn stale(tenant: TenantId) -> Option<u64> {
-    let now = Instant::now();
+    // Every statement asks: the poll's clock reading, at most one poll old.
+    let now = sprig_common::time::poll::now();
     let expired = fence(|f| f.valid_until.is_some_and(|u| now > u));
     if expired {
         lapse();

@@ -671,8 +671,18 @@ pub(crate) fn compare(op: BinOp, a: Node, b: Node, env: Env<'_>) -> Result<Node>
     }
     let twice = |n: &Node| mysql && null_safe && n.ty.nullable && n.lit.is_none();
     let (twice_a, twice_b) = (twice(&a), twice(&b));
+    // MariaDB converts a constant operand once per statement that reads
+    // tables (its conditions come once).
+    let keep = |n: &Node| {
+        if env.maria() && env.s.fold_constants {
+            super::row::const_id(n)
+        } else {
+            None
+        }
+    };
+    let (ia, ib) = (keep(&a), keep(&b));
     Ok(Node::new(ty, text, move |ctx, row| {
-        let kx = cmp.node_key(ctx, &a, row)?;
+        let kx = super::row::element_key(&cmp, &a, ia, ctx, row)?;
         if kx.is_none() {
             if !null_safe {
                 return Ok(Value::Null);
@@ -681,7 +691,7 @@ pub(crate) fn compare(op: BinOp, a: Node, b: Node, env: Env<'_>) -> Result<Node>
                 a.eval(ctx, row)?;
             }
         }
-        let ky = cmp.node_key(ctx, &b, row)?;
+        let ky = super::row::element_key(&cmp, &b, ib, ctx, row)?;
         if ky.is_none() && twice_b {
             b.eval(ctx, row)?;
         }

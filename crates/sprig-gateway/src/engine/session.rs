@@ -481,6 +481,13 @@ impl SessionTxn {
         Some(tx)
     }
 
+    /// The open transaction, for a setting made before a statement starts
+    /// (its `sql_mode` and time zone): unlike [`SessionTxn::statement`] it
+    /// starts nothing, so it never undoes the previous statement's writes.
+    pub(crate) fn open_tx(&mut self) -> Option<&mut Tx> {
+        self.tx.as_mut()
+    }
+
     /// Hands the open transaction to a statement that must own it while
     /// it runs (a plan whose storage holds the transaction). The caller
     /// gives it back with [`SessionTxn::restore`] before anything is

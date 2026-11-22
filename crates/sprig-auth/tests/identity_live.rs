@@ -10,6 +10,9 @@
 //!   `SPRIG_IDENTITY_TENANT_ID`, its catalog on `SPRIG_TEST_MARIADB_SINGLE`
 //!   (`mysql://root:sprig-dev-root@127.0.0.1:13301`), its directory in
 //!   `SPRIG_TEST_ETCD` (`http://127.0.0.1:2379`);
+//! - auth changes go to gateway A's engine through its peer service
+//!   (`SPRIG_IDENTITY_CATALOG_NODE`); the two gateways must share one
+//!   engine node for B to see them;
 //! - two gateways of this build in catalog mode: A on
 //!   `SPRIG_IDENTITY_GW_A` (MySQL persona, default 15306) and
 //!   `SPRIG_IDENTITY_GW_A_MARIA` (MariaDB persona, 15307), B on
@@ -36,9 +39,10 @@ use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, OptsBuilder, Pool, SslOpts};
 use sprig_auth::admin::{self, NewUser, SetPassword};
 use sprig_auth::policy::AccountClauses;
+use sprig_catalog::records::remote::RemoteRecords;
 use sprig_catalog::settings::{FixedEtcd, SetRequest, Target};
 use sprig_catalog::{
-    AllowAll, CatalogEndpoint, DirectoryAllocator, LogDecisions, MariaBackend, MariaCatalog,
+    AllowAll, AuthCatalog, CatalogEndpoint, DirectoryAllocator, RecBackend, LogDecisions, MariaBackend, MariaCatalog,
     StaticLocator, Store, TenantSettingsWriter, Versioner,
 };
 use sprig_common::ids::{DcId, TenantId, UserId};
@@ -58,6 +62,10 @@ struct World {
     tenant: String,
     tid: TenantId,
     cat: MariaCatalog,
+    /// Auth changes: the engine node's catalog records, through gateway
+    /// A's peer service (`SPRIG_IDENTITY_CATALOG_NODE`, default
+    /// 127.0.0.1:7403).
+    auth: AuthCatalog,
     global: Arc<dyn MetaStore>,
     a: u16,
     a_maria: u16,
@@ -98,14 +106,14 @@ async fn query(c: &mut Conn, sql: &str) -> Result<(), (u16, String)> {
 impl World {
     async fn user(&self, name: &str, pw: &str) -> UserId {
         let clock = SystemClock;
-        if let Some(id) = admin::find_user(&self.cat, self.tid, name, "%")
+        if let Some(id) = admin::find_user(&self.auth, self.tid, name, "%")
             .await
             .unwrap()
         {
-            admin::drop_user(&self.cat, self.tid, id).await.unwrap();
+            admin::drop_user(&self.auth, self.tid, id).await.unwrap();
         }
         admin::create_user(
-            &self.cat,
+            &self.auth,
             self.tid,
             &NewUser::new(name, pw.as_bytes()),
             &clock,
@@ -116,7 +124,7 @@ impl World {
     }
 
     async fn clauses(&self, user: UserId, c: AccountClauses) {
-        admin::set_clauses(&self.cat, self.tid, user, c)
+        admin::set_clauses(&self.auth, self.tid, user, c)
             .await
             .unwrap();
     }
@@ -231,10 +239,18 @@ async fn world() -> Option<World> {
         MariaBackend::new(locator),
         Arc::new(DirectoryAllocator::new(Arc::clone(&global))),
     );
+    let auth = Versioner::new(
+        RecBackend::new(Arc::new(RemoteRecords::at(
+            env("SPRIG_IDENTITY_CATALOG_NODE", "127.0.0.1:7403"),
+            None,
+        ))),
+        Arc::new(DirectoryAllocator::new(Arc::clone(&global))),
+    );
     Some(World {
         tenant,
         tid,
         cat,
+        auth,
         global,
         a: env("SPRIG_IDENTITY_GW_A", "15306").parse().unwrap(),
         a_maria: env("SPRIG_IDENTITY_GW_A_MARIA", "15307").parse().unwrap(),
@@ -291,7 +307,7 @@ async fn identity_live() {
     );
     assert_eq!(code(&r), 3955, "the lock is shared by every gateway");
     // ACCOUNT UNLOCK ends it at once.
-    admin::set_account_locked(&w.cat, w.tid, lock, false)
+    admin::set_account_locked(&w.auth, w.tid, lock, false)
         .await
         .unwrap();
     let wr = &w;
@@ -346,7 +362,7 @@ async fn identity_live() {
 
     // ---- 3. ACCOUNT LOCK, expiry and sandbox mode, both personas ----
     let manual = w.user("manual", pw).await;
-    admin::set_account_locked(&w.cat, w.tid, manual, true)
+    admin::set_account_locked(&w.auth, w.tid, manual, true)
         .await
         .unwrap();
     let my = w.login(w.a, "manual", pw).await;
@@ -358,7 +374,7 @@ async fn identity_live() {
     );
     assert_eq!((code(&my), code(&maria)), (3118, 4151));
     let exp = w.user("exp", pw).await;
-    admin::set_password_expired(&w.cat, w.tid, exp, true)
+    admin::set_password_expired(&w.auth, w.tid, exp, true)
         .await
         .unwrap();
     match w.login(w.a, "exp", pw).await {
@@ -423,7 +439,7 @@ async fn identity_live() {
         query(&mut on_a, "SELECT 1").await.unwrap();
         // Drop: new logins refused, and open sessions closed (39306).
         let t0 = Instant::now();
-        admin::drop_user(&w.cat, w.tid, id).await.unwrap();
+        admin::drop_user(&w.auth, w.tid, id).await.unwrap();
         let committed = t0.elapsed();
         let n = name.as_str();
         // All three polled at once, timed from the commit's return.
@@ -445,7 +461,7 @@ async fn identity_live() {
     assert!(w.login(w.b, "pwchange", pw).await.is_ok());
     let t0 = Instant::now();
     admin::set_password(
-        &w.cat,
+        &w.auth,
         w.tid,
         pwu,
         b"Identity-new-9",
@@ -469,7 +485,7 @@ async fn identity_live() {
     let lk = w.user("lockme", pw).await;
     let mut s = w.login(w.b, "lockme", pw).await.unwrap();
     let t0 = Instant::now();
-    admin::set_account_locked(&w.cat, w.tid, lk, true)
+    admin::set_account_locked(&w.auth, w.tid, lk, true)
         .await
         .unwrap();
     let changed = t0.elapsed();
@@ -506,8 +522,8 @@ async fn identity_live() {
     for name in [
         "lock", &dname, "manual", "exp", "hist", "pwchange", "lockme",
     ] {
-        if let Some(id) = admin::find_user(&w.cat, w.tid, name, "%").await.unwrap() {
-            admin::drop_user(&w.cat, w.tid, id).await.unwrap();
+        if let Some(id) = admin::find_user(&w.auth, w.tid, name, "%").await.unwrap() {
+            admin::drop_user(&w.auth, w.tid, id).await.unwrap();
         }
     }
 }
@@ -522,7 +538,7 @@ async fn identity_live_account_ops() {
     let Some(w) = world().await else { return };
     let audit = MemoryAudit::new();
     let ops = AccountOps {
-        cat: &w.cat,
+        cat: &w.auth,
         tenant: w.tid,
         tenant_name: Some(w.tenant.clone()),
         actor: Actor::operator(TenantId(0), "op:identity-live"),
@@ -530,11 +546,11 @@ async fn identity_live_account_ops() {
         clock: &SystemClock,
         protocol: "admin",
     };
-    if let Some(id) = admin::find_user(&w.cat, w.tid, "audited", "%")
+    if let Some(id) = admin::find_user(&w.auth, w.tid, "audited", "%")
         .await
         .unwrap()
     {
-        admin::drop_user(&w.cat, w.tid, id).await.unwrap();
+        admin::drop_user(&w.auth, w.tid, id).await.unwrap();
     }
     let id = ops
         .create_user(&NewUser::new("audited", b"Audited-pw-1"))

@@ -524,8 +524,10 @@ impl ShardingLoop {
             )));
         }
         let d = shown["decision_id"].as_u64().unwrap_or(0);
+        let mut wl = crate::catalog_records().begin(tenant).await?;
         let asm = input::assemble(
             &mut c,
+            &mut *wl,
             tenant,
             std::time::SystemTime::now(),
             ts.advisor.window,

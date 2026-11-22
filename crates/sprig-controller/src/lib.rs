@@ -49,6 +49,21 @@
 //! global loops (`directory`, `tree_moves`, `dc_registry`), subtree moves,
 //! the decision log, and the Admin API's other services.
 
+/// The tenants' catalog records on the engine node (the peer service),
+/// set once at startup.
+static CATALOG_RECORDS: std::sync::OnceLock<Arc<dyn sprig_catalog::RecordStore>> =
+    std::sync::OnceLock::new();
+
+/// The tenants' catalog records: the engine node's once the controller
+/// started; before that (tests that drive loops directly), one in-memory
+/// store for the whole process, which such tests seed.
+#[must_use]
+pub fn catalog_records() -> Arc<dyn sprig_catalog::RecordStore> {
+    let r =
+        CATALOG_RECORDS.get_or_init(|| Arc::new(sprig_catalog::records::mem::MemRecords::new()));
+    Arc::clone(r)
+}
+
 pub mod admin;
 // Approvals and recommendations for every automatic decision.
 pub mod approvals;
@@ -260,8 +275,24 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
     ));
     let locator = ShardMapLocator::new(Arc::clone(&homes), pools, default_naming())
         .with_directory(Arc::clone(&stores.global));
+    // Users, privileges, the other auth rows and modules' rows on the
+    // catalog version are catalog records on the engine node, reached
+    // through its peer service.
+    let auth_records: Arc<dyn sprig_catalog::RecordStore> =
+        Arc::new(sprig_catalog::records::remote::RemoteRecords::new(
+            Some(Arc::clone(&stores.dc)),
+            cfg.tls
+                .as_ref()
+                .map(sprig_catalog::records::remote::PeerPems::from_config)
+                .transpose()?,
+        ));
+    if CATALOG_RECORDS.set(Arc::clone(&auth_records)).is_err() {
+        tracing::warn!("catalog records were set before the controller started");
+    }
     let versioner = Versioner::new(
-        MariaBackend::new(Arc::new(locator.clone())).with_clock(Arc::clone(&clock)),
+        MariaBackend::new(Arc::new(locator.clone()))
+            .with_clock(Arc::clone(&clock))
+            .with_records(Arc::clone(&auth_records)),
         Arc::new(DirectoryAllocator::new(Arc::clone(&stores.global))),
     );
     let reconciler = Arc::new(
@@ -328,10 +359,13 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
             autoindex_loop::JobShardLocks::new(Arc::clone(&stores.dc)),
         ))),
     );
+    let auth_catalog = Versioner::new(
+        sprig_catalog::RecBackend::new(Arc::clone(&auth_records)).with_clock(Arc::clone(&clock)),
+        Arc::new(DirectoryAllocator::new(Arc::clone(&stores.global))),
+    );
     let users = Arc::new(users::TenantUsers::new(
         Directory::new(Arc::clone(&stores.global)),
-        Arc::new(locator.clone()),
-        versioner.clone(),
+        auth_catalog,
         Arc::clone(&clock),
     ));
     // Automatic indexing: evaluation, validation, builds and observation
@@ -341,7 +375,7 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
     let catalog_locator: Arc<dyn sprig_catalog::CatalogLocator> = Arc::new(locator.clone());
     let logic_locator = Arc::clone(&catalog_locator);
     let workload_store: Arc<dyn sprig_workload::store::WorkloadStore> = Arc::new(
-        sprig_workload::store::CatalogWorkloadStore::new(Arc::clone(&catalog_locator)),
+        sprig_workload::store::CatalogWorkloadStore::new(Arc::clone(&auth_records)),
     );
     let keyring: Option<Arc<dyn sprig_workload::keyring::TenantKeyring>> =
         if let Some(p) = &cfg.controller.workload_key_file {
@@ -435,7 +469,7 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
     // Rollup and retention of the workload tables.
     let workload_rollup = workload_rollup::WorkloadRollup::new(
         Directory::new(Arc::clone(&stores.global)),
-        Arc::new(locator.clone()),
+        Arc::clone(&auth_records),
         dc.clone(),
         Some(settings.live.clone()),
         Arc::clone(&clock),
@@ -468,7 +502,7 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
                 RegistryPools::new(registry_for_balancer, Some(Arc::clone(&monitor)))
                     .budget("balancer", catalogs::POOL_MAX),
             ),
-            Arc::new(locator.clone()),
+            Arc::clone(&auth_records),
             Directory::new(Arc::clone(&stores.global)),
             Some(settings.live.clone()),
             Arc::clone(&clock),
@@ -490,7 +524,7 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
                     .budget("sharding", sharding_runtime::POOL_MAX),
             ),
             Arc::new(sprig_balancer::decisions::CatalogDecisionLog::new(
-                Arc::new(locator.clone()),
+                Arc::clone(&auth_records),
             )),
             Some(settings.live.clone()),
             &format!("controller:{}", cfg.node.id()),
@@ -513,6 +547,7 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
     };
     let notifier = Arc::new(approvals::notify::Notifier::new(
         Arc::new(locator.clone()),
+        Arc::clone(&auth_records),
         approvals::notify::Secrets {
             smtp_password: read_secret(cfg.controller.smtp_password_file.as_deref())?,
             webhook_secret: read_secret(cfg.controller.approvals_webhook_secret_file.as_deref())?,
@@ -526,26 +561,29 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
     // Webhooks through the sinks' webhook target: the platform URL and
     // tenants' own connections (their credentials open with the master
     // key file, as in sink workers).
-    notifier.set_webhooks(Arc::new(approvals::webhook::Webhooks::new(
-        Arc::new(locator.clone()),
-        Arc::clone(&stores.dc),
-        Arc::clone(&stores.global),
-        cfg.controller.workload_key_file.as_deref(),
-        Some(settings.live.clone()),
-        dc.clone(),
-        read_secret(cfg.controller.approvals_webhook_secret_file.as_deref())?,
-    )));
+    notifier.set_webhooks(Arc::new(
+        approvals::webhook::Webhooks::new(
+            Arc::new(locator.clone()),
+            Arc::clone(&stores.dc),
+            Arc::clone(&stores.global),
+            cfg.controller.workload_key_file.as_deref(),
+            Some(settings.live.clone()),
+            dc.clone(),
+            read_secret(cfg.controller.approvals_webhook_secret_file.as_deref())?,
+        )
+        .with_records(Arc::clone(&auth_records)),
+    ));
     // Tenants with no approvals item: the loop skips them until one
     // changes (this hook) or a recheck is due.
     let idle_approvals = Arc::new(approvals::IdleTenants::default());
     let approvals = {
-        let stores_ = sprig_approvals::LocatorStores::new(Arc::new(locator.clone()))
+        let stores_ = sprig_approvals::LocatorStores::new(Arc::clone(&auth_records))
             .with_dc(dc.clone(), Arc::clone(&stores.dc))
             .with_global(Arc::clone(&stores.global));
         let hub = sprig_approvals::Approvals::new(Arc::new(stores_), Arc::clone(&clock))
             .with_hook(Arc::new(approvals::DecisionHook::new(
                 Arc::new(sprig_balancer::decisions::CatalogDecisionLog::new(
-                    Arc::new(locator.clone()),
+                    Arc::clone(&auth_records),
                 )),
                 dc.clone(),
             )))
@@ -559,7 +597,8 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
                 Some(settings.live.clone()),
             )
             .with_tenant_scopes(Arc::clone(&tenant_scopes))
-            .with_locator(Arc::new(locator.clone())),
+            .with_locator(Arc::new(locator.clone()))
+            .with_records(Arc::clone(&auth_records)),
         );
         let ix = Arc::new(approvals::index::IndexApprovals::new(Arc::clone(&indexes)));
         a.register_producer(ix.clone());
@@ -587,6 +626,7 @@ pub async fn serve(ctx: RoleContext, stores: Stores, clock: Arc<dyn Clock>) -> R
         a
     };
     let _ = sharding.sharding().approvals.set(Arc::clone(&approvals));
+    let _ = sharding.sharding().records.set(Arc::clone(&auth_records));
     let _ = balancer.approvals.set(Arc::clone(&approvals));
     approvals::install(Arc::clone(&approvals));
     notifier.bind(Arc::clone(&approvals));

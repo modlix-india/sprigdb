@@ -3,16 +3,16 @@
 //! An automatic index on a collection table (`sprig_advisor::autoindex::doc`)
 //! is built like any other: field columns, then the MariaDB index, on
 //! every shard. The document engine plans with an index only once it is a
-//! `doc_indexes` row, so [`DocRegistry::reconcile`] keeps those rows in
+//! registered index (a catalog record, `m/doc/indexes`), so [`DocRegistry::reconcile`] keeps those rows in
 //! step with `auto_indexes`, at the start of each `auto_index` pass:
 //!
 //! ```text
 //! wanted     := document indexes in observing or active (built everywhere)
-//! registered := doc_indexes rows with origin 'auto'
-//! wanted − registered → a doc_indexes row (origin auto, auto_index_id,
+//! registered := index records with origin 'auto'
+//! wanted − registered → an index record (origin auto, auto_index_id,
 //!                        mariadb_name sprig_auto_<hex>, the next index id),
-//!                        promoted_fields pair rows for its paths
-//! registered − wanted → its doc_indexes row deleted (retiring, dropping,
+//!                        field records for its paths
+//! registered − wanted → its index record deleted (retiring, dropping,
 //!                        failed or gone): the engine stops planning with it
 //!                        before the index is dropped
 //! all of it in one versioned catalog change, so every gateway reloads it
@@ -24,22 +24,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use bson::Document;
-use mysql_async::prelude::Queryable;
 use sprig_advisor::autoindex::doc;
 use sprig_advisor::autoindex::model::IndexKind;
 use sprig_advisor::autoindex::store::{AutoIndexRow, IndexState};
 use sprig_catalog::{MariaBackend, VersionKind, Versioner};
+use sprig_common::Result;
 use sprig_common::ids::TenantId;
-use sprig_common::{Result, SprigCode, SprigError};
-
-fn err(e: impl std::fmt::Display) -> SprigError {
-    SprigError::new(SprigCode::CatalogUnavailable, e.to_string())
-}
-
-fn t(schema: &str, table: &str) -> String {
-    format!("`{}`.`{table}`", schema.replace('`', "``"))
-}
+use sprig_doc::catalog_records::DocTables;
 
 /// The paths of a document index row, `None` for any other row.
 #[must_use]
@@ -84,30 +75,15 @@ impl DocRegistry {
             .collect();
         let mut ch = self.versioner.lock(tenant, VersionKind::Catalog).await?;
         let r: Result<u32> = async {
-            let (store, tx) = ch.tx().parts();
-            let s = store.schema().to_owned();
-            let registered: Vec<(u64, u32, Option<u64>)> = tx
-                .query(format!(
-                    "SELECT collection_id, index_id, auto_index_id FROM {} WHERE origin = 'auto'",
-                    t(&s, "doc_indexes")
-                ))
-                .await
-                .map_err(err)?;
+            let rec = ch.tx().records().await?;
+            let registered = DocTables::auto_indexes(rec).await?;
             let have: BTreeSet<u64> = registered.iter().filter_map(|(_, _, a)| *a).collect();
             let mut changed = 0u32;
             for (cid, iid, auto) in &registered {
                 if auto.is_some_and(|a| wanted.contains_key(&a)) {
                     continue;
                 }
-                tx.exec_drop(
-                    format!(
-                        "DELETE FROM {} WHERE collection_id = ? AND index_id = ?",
-                        t(&s, "doc_indexes")
-                    ),
-                    (cid, iid),
-                )
-                .await
-                .map_err(err)?;
+                DocTables::delete_index(rec, *cid, *iid).await?;
                 tracing::info!(%tenant, collection = cid, index = iid,
                     "auto_index: document index unregistered");
                 changed += 1;
@@ -117,81 +93,12 @@ impl DocRegistry {
                     continue;
                 }
                 let cid = row.object.0;
-                let next: Option<u32> = tx
-                    .exec_first(
-                        format!(
-                            "SELECT next_index FROM {} WHERE collection_id = ? FOR UPDATE",
-                            t(&s, "collections")
-                        ),
-                        (cid,),
-                    )
-                    .await
-                    .map_err(err)?;
-                let Some(next) = next else {
-                    // Not a collection (any more): nothing to register.
-                    continue;
-                };
-                let mut key = Document::new();
-                for (p, d) in ps {
-                    key.insert(p.clone(), *d);
+                // Not a collection (any more): nothing to register.
+                if let Some(next) = DocTables::register_auto(rec, cid, &row.name, *id, ps).await? {
+                    tracing::info!(%tenant, collection = cid, index = next, name = %row.name,
+                        "auto_index: document index registered");
+                    changed += 1;
                 }
-                let key_bytes = bson::to_vec(&key).map_err(err)?;
-                let opts = bson::to_vec(&Document::new()).map_err(err)?;
-                let slugs: Vec<String> = ps.iter().map(|(p, _)| sprig_doc::meta::slug(p)).collect();
-                tx.exec_drop(
-                    format!(
-                        "INSERT INTO {} (collection_id, index_id, name, key_pattern, impl, \
-                         mariadb_name, field_columns, is_unique, is_sparse, expire_seconds, \
-                         multikey_paths, origin, options, auto_index_id, state, created_at) \
-                         VALUES (?, ?, ?, ?, 'column', ?, ?, 0, 0, NULL, '[]', 'auto', ?, ?, \
-                         'ready', UTC_TIMESTAMP(3))",
-                        t(&s, "doc_indexes")
-                    ),
-                    mysql_async::Params::Positional(vec![
-                        cid.into(),
-                        next.into(),
-                        row.name.clone().into(),
-                        key_bytes.into(),
-                        row.name.clone().into(),
-                        serde_json::Value::from(slugs).to_string().into(),
-                        opts.into(),
-                        id.into(),
-                    ]),
-                )
-                .await
-                .map_err(err)?;
-                for (p, _) in ps {
-                    tx.exec_drop(
-                        format!(
-                            "INSERT IGNORE INTO {} (collection_id, path_hash, class, path, slug, \
-                             sql_type, origin, auto_index_id, state, created_at) \
-                             VALUES (?, ?, 'pair', ?, ?, ?, 'auto', ?, 'ready', UTC_TIMESTAMP(3))",
-                            t(&s, "promoted_fields")
-                        ),
-                        (
-                            cid,
-                            sprig_doc::meta::fnv64(p.as_bytes()),
-                            p.as_str(),
-                            sprig_doc::meta::slug(p),
-                            format!("TINYINT,DOUBLE,VARCHAR({})", sprig_doc::meta::S_CHARS),
-                            id,
-                        ),
-                    )
-                    .await
-                    .map_err(err)?;
-                }
-                tx.exec_drop(
-                    format!(
-                        "UPDATE {} SET next_index = ? WHERE collection_id = ?",
-                        t(&s, "collections")
-                    ),
-                    (next + 1, cid),
-                )
-                .await
-                .map_err(err)?;
-                tracing::info!(%tenant, collection = cid, index = next, name = %row.name,
-                    "auto_index: document index registered");
-                changed += 1;
             }
             Ok(changed)
         }

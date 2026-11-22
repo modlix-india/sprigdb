@@ -1,7 +1,7 @@
 //! Bolt bookmarks: `SB1:` and base64url of {tenant, commit time, per-cluster
 //! GTID positions}, then `.` and base64url of an HMAC-SHA256 tag.
 //!
-//! The key is the tenant's bookmark secret in its catalog (`graph_keys`),
+//! The key is the tenant's bookmark secret in its catalog records (`m/graph/keys`),
 //! so every gateway signs and checks the same way, as AMQP reply-to
 //! tokens do. A bookmark that doesn't parse, has a bad tag, or names
 //! another tenant fails with 39917 (`InvalidBookmark`).

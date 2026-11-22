@@ -121,6 +121,10 @@ impl sprig_sinks::job::SinkEnv for GwSinkEnv {
         Ok((ep.pool, ep.store.schema().to_owned()))
     }
 
+    fn records(&self) -> Arc<dyn sprig_catalog::records::RecordStore> {
+        Arc::clone(&self.svc.records)
+    }
+
     async fn shard_pool(&self, tenant: TenantId) -> Result<mysql_async::Pool> {
         let cluster = self.svc.locator.cluster(tenant).await?;
         self.svc.locator.ctl_pool(&cluster).await
@@ -185,6 +189,15 @@ impl GwHost<'_> {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
         Ok((conn, ep.store.schema().to_owned()))
+    }
+
+    /// The tenant's sink records (tasks, live states).
+    fn sinks_store(&self) -> Result<sprig_sinks::store::SinksStore> {
+        let ts = self.ts().ok_or_else(|| SprigError::internal("no tenant"))?;
+        Ok(sprig_sinks::store::SinksStore::new(
+            Arc::clone(&ts.services().records),
+            self.cat.tenant,
+        ))
     }
 }
 
@@ -461,16 +474,24 @@ impl Host for GwHost<'_> {
         }
         let mut c = svc.catalog.change(tenant, VersionKind::Catalog).await?;
         let keys = keyring();
-        let applied = {
-            let (store, tx) = c.tx().parts();
-            sprig_sinks::sql::apply(tx, store.schema(), &change, keys.as_deref(), tenant, user)
-                .await
+        let applied = match c.tx().split().await {
+            Err(e) => Err(e),
+            Ok((store, tx, rec)) => {
+                let schema = store.schema().to_owned();
+                sprig_sinks::sql::apply(tx, &schema, rec, &change, keys.as_deref(), tenant, user)
+                    .await
+            }
         };
         if let Err(e) = applied {
             let _ = c.rollback().await;
             return Err(e);
         }
         let v = c.commit().await?;
+        sprig_sinks::sql::after_commit(
+            &sprig_sinks::store::SinksStore::new(Arc::clone(&svc.records), tenant),
+            &change,
+        )
+        .await?;
         tracing::info!(tenant = %tenant, user, change = change_name(&change), "sink catalog change");
         if let Some(ts) = self.sess.tenant.as_deref_mut() {
             ts.changed(Some(v));
@@ -480,24 +501,14 @@ impl Host for GwHost<'_> {
     }
 
     async fn tasks(&mut self, sink: SinkId) -> Result<Vec<TaskRow>> {
-        let (mut c, schema) = self.catalog_conn().await?;
-        let store = sprig_sinks::store::SinksStore::new(schema);
-        if !store.migrated(&mut c).await? {
-            return Ok(Vec::new());
-        }
-        store.tasks(&mut c, sink).await
+        self.sinks_store()?.tasks(sink).await
     }
 
     async fn live_states(
         &mut self,
     ) -> Result<std::collections::HashMap<u64, (sprig_sinks::model::SinkState, Option<String>)>>
     {
-        let (mut c, schema) = self.catalog_conn().await?;
-        let store = sprig_sinks::store::SinksStore::new(schema);
-        if !store.migrated(&mut c).await? {
-            return Ok(std::collections::HashMap::new());
-        }
-        store.states(&mut c).await
+        self.sinks_store()?.states().await
     }
 
     async fn index(&mut self, sink: SinkId, ix: Option<SinkIndex>) -> Result<()> {

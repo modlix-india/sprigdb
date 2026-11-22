@@ -100,6 +100,53 @@ pub(crate) struct Args<'a> {
     /// microseconds, the same for every row and column of the statement.
     /// Read when a column first asks for it (most statements never do).
     pub now: std::sync::OnceLock<(i64, u32)>,
+    /// Conditions the expressions raised (a string of a row read as a
+    /// number), in the order raised; the statement reports them.
+    pub conds: Conds,
+}
+
+/// [`Raised`] behind a lock that is set up only when something is raised:
+/// most statements raise nothing, and creating the lock for each one
+/// showed in a point select's profile.
+#[derive(Debug, Default)]
+pub(crate) struct Conds {
+    raised: std::sync::atomic::AtomicBool,
+    inner: std::sync::Mutex<Raised>,
+}
+
+impl Conds {
+    /// The conditions, for adding to them.
+    pub(crate) fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Raised>> {
+        self.raised
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.inner.lock()
+    }
+
+    /// Whether anything was ever locked for (so may have been raised).
+    fn touched(&self) -> bool {
+        self.raised.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// What a statement's expressions raised.
+#[derive(Debug, Default)]
+pub(crate) struct Raised {
+    pub conds: Vec<assign::Condition>,
+    /// The constants already reported (each is converted once).
+    pub once: Vec<usize>,
+}
+
+impl Args<'_> {
+    /// The conditions raised so far, taken.
+    pub(crate) fn take_conds(&self) -> Vec<assign::Condition> {
+        if !self.conds.touched() {
+            return Vec::new();
+        }
+        self.conds
+            .lock()
+            .map(|mut c| std::mem::take(&mut c.conds))
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -110,6 +157,7 @@ impl<'a> Args<'a> {
             params,
             env: Env::STRICT,
             now: std::sync::OnceLock::new(),
+            conds: Conds::default(),
         }
     }
 }
@@ -143,6 +191,10 @@ pub(crate) enum CExpr {
     Arith(Arith, Box<CExpr>, Box<CExpr>),
     /// Unary minus.
     Neg(Box<CExpr>),
+    /// What the expression engine works out: an expression of a table's
+    /// own columns this compiler doesn't have (`CASE`, `COLLATE`,
+    /// functions), in a generated column, a `DEFAULT` or a `CHECK`.
+    Exec(Arc<ExecExpr>),
     /// The statement's date or time, cut to `fsp` fractional digits.
     Now {
         /// What of it.
@@ -154,11 +206,26 @@ pub(crate) enum CExpr {
     },
 }
 
+/// An expression compiled by the expression engine for each port, with
+/// the session each runs under (the table's own expressions read no
+/// session setting the engine keeps per connection).
+#[derive(Clone)]
+pub(crate) struct ExecExpr {
+    pub maria: (sprig_exec::Session, sprig_exec::Compiled),
+    pub mysql: (sprig_exec::Session, sprig_exec::Compiled),
+}
+
+impl std::fmt::Debug for ExecExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExecExpr")
+    }
+}
+
 /// Whether `e` reads the row, a parameter or the clock: without any of
 /// them it has one value.
 pub(crate) fn reads_row_or_clock(e: &CExpr) -> bool {
     match e {
-        CExpr::Col(_) | CExpr::Param(_) | CExpr::Now { .. } => true,
+        CExpr::Col(_) | CExpr::Param(_) | CExpr::Now { .. } | CExpr::Exec(_) => true,
         CExpr::Lit(_) => false,
         CExpr::Cmp(_, a, b, _)
         | CExpr::And(a, b)
@@ -1266,9 +1333,102 @@ fn out_of_range(ty: &str, e: &str) -> SprigError {
 /// # Errors
 /// 1690; `ER_SPRIG_NOT_ON_ENGINE`.
 #[allow(clippy::too_many_lines)] // one arm per expression kind
+/// How a comparison's side may raise 1292: a column's value for every
+/// row; a constant (a literal or a parameter, by its key) once per
+/// statement, as both servers convert a constant once.
+#[derive(Clone, Copy)]
+enum Side {
+    Row,
+    Once(usize),
+    No,
+}
+
+fn side_of(e: &CExpr) -> Side {
+    match e {
+        CExpr::Col(_) => Side::Row,
+        CExpr::Lit(d) => Side::Once(std::ptr::from_ref(d) as usize),
+        CExpr::Param(i) => Side::Once(usize::MAX - *i),
+        _ => Side::No,
+    }
+}
+
+/// A string compared with a number is read as one: when it isn't
+/// entirely a number both servers raise 1292. MariaDB names the
+/// comparison `DECIMAL` beside an integer (`DOUBLE` beside any other
+/// number), raises it for an empty or blank string too, and
+/// only a note when the number is followed by spaces; MySQL always says
+/// `DOUBLE` and is silent for blank strings and surrounding spaces.
+fn text_number_warning(x: &Datum, y: &Datum, sx: Side, sy: Side, cx: &CmpCx, a: &Args<'_>) {
+    use Datum as D;
+    if cx.members.is_some() {
+        return;
+    }
+    let number = |d: &Datum| {
+        matches!(
+            d,
+            D::Int(_) | D::UInt(_) | D::Decimal(_) | D::Double(_) | D::Float(_)
+        )
+    };
+    let (s, other, side) = match (x, y) {
+        (D::Str(s), o) if number(o) => (s, o, sx),
+        (o, D::Str(s)) if number(o) => (s, o, sy),
+        _ => return,
+    };
+    let core = s.trim_ascii();
+    let (level, quiet) = if a.env.mysql {
+        (assign::Level::Warning, core.is_empty() || str_to_f64(s).1)
+    } else if core.is_empty() {
+        (assign::Level::Warning, false)
+    } else if str_to_f64(s).1 {
+        // A number with spaces after it: a note.
+        (
+            assign::Level::Note,
+            s.trim_ascii_start().len() == core.len(),
+        )
+    } else {
+        (assign::Level::Warning, false)
+    };
+    if quiet {
+        return;
+    }
+    let Ok(mut r) = a.conds.lock() else {
+        return;
+    };
+    match side {
+        Side::No => return,
+        Side::Once(k) => {
+            if r.once.contains(&k) {
+                return;
+            }
+            r.once.push(k);
+        }
+        Side::Row => {}
+    }
+    let kind = if !a.env.mysql && matches!(other, D::Int(_) | D::UInt(_)) {
+        "DECIMAL"
+    } else {
+        "DOUBLE"
+    };
+    r.conds.push(assign::Condition {
+        level,
+        code: 1292,
+        message: format!(
+            "Truncated incorrect {kind} value: '{}'",
+            String::from_utf8_lossy(s)
+        ),
+    });
+}
+
+/// The value of `e` for `row`.
+#[allow(clippy::too_many_lines)] // one arm per expression kind
 pub(crate) fn eval(e: &CExpr, row: &[Datum], a: &Args<'_>) -> Result<Datum> {
     Ok(match e {
         CExpr::Col(i) => row.get(*i).cloned().unwrap_or(Datum::Null),
+        CExpr::Exec(x) => {
+            let (session, c) = if a.env.mysql { &x.mysql } else { &x.maria };
+            let mut ctx = sprig_exec::Ctx::new(session);
+            c.eval(&mut ctx, row).map_err(super::general::sql_error)?
+        }
         CExpr::Param(i) => a.params.get(*i).cloned().unwrap_or(Datum::Null),
         CExpr::Lit(d) => d.clone(),
         CExpr::Cmp(op, l, r, cx) => {
@@ -1293,6 +1453,7 @@ pub(crate) fn eval(e: &CExpr, row: &[Datum], a: &Args<'_>) -> Result<Datum> {
                 Cmp::Gt => ">",
                 Cmp::Ge => ">=",
             };
+            text_number_warning(&x, &y, side_of(l), side_of(r), cx, a);
             let Some(o) = compare(&x, &y, cx, &a.env, sym)? else {
                 return Ok(Datum::Null);
             };
@@ -1344,11 +1505,16 @@ pub(crate) fn eval(e: &CExpr, row: &[Datum], a: &Args<'_>) -> Result<Datum> {
             }
             let mut saw_null = false;
             let mut found = false;
-            for y in list {
-                let y = eval(y, row, a)?;
+            // The tested value is read as a number once per row.
+            let mut first = true;
+            for ye in list {
+                let y = eval(ye, row, a)?;
                 if y.is_null() {
                     saw_null = true;
                     continue;
+                }
+                if std::mem::take(&mut first) {
+                    text_number_warning(&x, &y, side_of(l), side_of(ye), cx, a);
                 }
                 match compare(&x, &y, cx, &a.env, " IN ")? {
                     Some(Ordering::Equal) => {

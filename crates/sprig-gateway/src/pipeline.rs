@@ -613,7 +613,7 @@ pub struct NoWorkload;
 impl WorkloadHook for NoWorkload {
     fn begin(&self, _session: &Session, req: &Request) -> WorkloadToken {
         WorkloadToken {
-            started: std::time::Instant::now(),
+            started: sprig_common::time::poll::now(),
             request: req.name(),
         }
     }

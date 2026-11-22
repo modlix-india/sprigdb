@@ -318,8 +318,7 @@ pub async fn raise_duplicates(
         summary,
         emergency: false,
     };
-    let locator: Arc<dyn sprig_catalog::CatalogLocator> = svc.locator.clone();
-    let recs = sprig_approvals::catalog::CatalogRecStore::new(locator, tenant);
+    let recs = sprig_approvals::catalog::CatalogRecStore::new(Arc::clone(&svc.records), tenant);
     let now = sprig_approvals::model::wall_micros(svc.clock.wall());
     recs.raise(&p, &Policy::fixed(Mode::Approve, Level::Database), &[], now)
         .await?;

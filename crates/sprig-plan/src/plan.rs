@@ -20,7 +20,7 @@ use std::sync::Arc;
 use sprig_engine::row::Value;
 use sprig_exec::ops::{
     AggKind, Aggregate, Aggregation, Distinct, Filter, HashJoin, InnerSource, JoinKind, Limit,
-    Memory, NestedLoopJoin, Project, RowSource, Sort, SortKey, Union,
+    Memory, NestedLoopJoin, Project, RowSource, SetKind, SetOp, Sort, SortKey, Union,
 };
 use sprig_exec::{
     BinOp, Compiled, Ctx, Expr, ExprType, Persona, Result, Session, SqlError, compile,
@@ -34,13 +34,35 @@ use crate::exprs::{self, slot_ref};
 use crate::keyval::{key_usable, lookup_exact};
 use crate::range::{KeyCtx, RangeSet};
 use crate::resolve::{
-    AGG_BASE, AggSpec, Apply, Block, Clause, Derived, Rel, RelKind, SUBQ_BASE, Scope, SemiJoin,
-    derived_cols, unknown_column, unsupported,
+    AGG_BASE, AggSpec, Apply, Block, Clause, Derived, ExprCx, Rel, RelCol, RelKind, SUBQ_BASE,
+    Scope, SemiJoin, StarCol, derived_cols, unknown_column, unsupported,
 };
 use crate::sources::{
     ApplyAgg, ApplyOp, CachedInner, DerivedSource, Fixed, LookupInner, LookupPart, ScanSource,
-    table_types,
+    TableFilter, table_types,
 };
+
+/// `SELECT 1`, parsed once: the shell a table value constructor's rows
+/// are planned in (each row becomes its select list).
+fn one_row_select() -> Result<ast::Select> {
+    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::parser::Parser;
+    thread_local! {
+        static SHELL: Option<ast::Select> = Parser::parse_sql(&MySqlDialect {}, "SELECT 1")
+            .ok()
+            .and_then(|mut v| v.pop())
+            .and_then(|s| match s {
+                ast::Statement::Query(q) => match *q.body {
+                    ast::SetExpr::Select(sel) => Some(*sel),
+                    _ => None,
+                },
+                _ => None,
+            });
+    }
+    SHELL
+        .with(Clone::clone)
+        .ok_or_else(|| unsupported("a table value constructor"))
+}
 
 /// Reading the next row of a primary-key scan.
 const ROW: f64 = 1.0;
@@ -249,6 +271,90 @@ impl<'a> Planner<'a> {
             explain: rows,
             accesses: cx.accesses,
         })
+    }
+}
+
+impl Planner<'_> {
+    /// Resolves `expr`, written over the columns of `table` alone (a
+    /// generated column's or a `DEFAULT`'s expression), for the expression
+    /// engine: column `i` of the table is slot `i` of the row it reads.
+    /// Also gives the columns it reads.
+    ///
+    /// # Errors
+    /// The resolver's: unknown columns (1054), what the planner doesn't
+    /// cover (1235), and subqueries, aggregates and parameters, which such
+    /// an expression can't hold.
+    pub fn scalar(
+        &self,
+        table: &TableDef,
+        expr: &ast::Expr,
+    ) -> Result<(sprig_exec::Expr, BTreeSet<usize>)> {
+        let mut forbidden = false;
+        let _ = ast::visit_expressions(expr, |e: &ast::Expr| {
+            if matches!(
+                e,
+                ast::Expr::Subquery(_) | ast::Expr::Exists { .. } | ast::Expr::InSubquery { .. }
+            ) || matches!(e, ast::Expr::Value(v) if matches!(v.value, ast::Value::Placeholder(_)))
+            {
+                forbidden = true;
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        if forbidden {
+            return Err(unsupported(
+                "a subquery or parameter in a column expression",
+            ));
+        }
+        let mut cx = Cx {
+            catalog: self.catalog,
+            storage: self.storage.clone(),
+            session: self.session.clone(),
+            params: &[],
+            options: self.options.clone(),
+            memory: Memory::unlimited(),
+            explain: Vec::new(),
+            accesses: Vec::new(),
+            ids: 0,
+            outer_refs: 0,
+            ctes: Vec::new(),
+        };
+        let cols = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| RelCol {
+                name: c.name.clone(),
+                expr: crate::resolve::table_col(0, i, &c.name, c.ty, c.nullable),
+            })
+            .collect();
+        let rel = Rel {
+            alias: table.name.clone(),
+            shown: table.name.clone(),
+            qualified: Some((table.schema.clone(), table.name.clone())),
+            kind: RelKind::Table(Arc::new(table.clone())),
+            cols,
+            base: 0,
+            width: table.columns.len(),
+            outer_on: None,
+            outer_dep: None,
+            pending: Vec::new(),
+            hidden: false,
+            derived_id: None,
+        };
+        let rels = [rel];
+        let star: Vec<StarCol> = (0..table.columns.len())
+            .map(|col| StarCol { rel: 0, col })
+            .collect();
+        let scope = Scope {
+            rels: &rels,
+            star: &star,
+            visible: 0..1,
+            outer: None,
+        };
+        let mut x = ExprCx::new(&scope, Clause::Select);
+        let e = cx.expr(expr, &mut x)?;
+        let read = exprs::slots(&e);
+        Ok((e, read))
     }
 }
 
@@ -608,35 +714,128 @@ impl<'a> Cx<'a> {
             ast::SetExpr::Query(q) => self.query(q, outer, select_type),
             ast::SetExpr::SetOperation {
                 left,
-                op: ast::SetOperator::Union,
+                op,
                 set_quantifier,
                 right,
             } => {
                 let all = match set_quantifier {
                     ast::SetQuantifier::All => true,
                     ast::SetQuantifier::Distinct | ast::SetQuantifier::None => false,
-                    _ => return Err(unsupported("this UNION form")),
+                    _ => return Err(unsupported("this set operation form")),
+                };
+                let (label, kind) = match op {
+                    ast::SetOperator::Union => ("UNION", None),
+                    ast::SetOperator::Intersect => ("INTERSECT", Some(SetKind::Intersect)),
+                    ast::SetOperator::Except => ("EXCEPT", Some(SetKind::Except)),
+                    ast::SetOperator::Minus => return Err(unsupported("MINUS")),
                 };
                 let l = self.set_expr(left, outer, select_type)?;
-                let r = self.set_expr(right, outer, "UNION")?;
-                let est_rows = l.est_rows + r.est_rows;
-                let source = Union::new(
-                    vec![l.source, r.source],
-                    all,
-                    &self.session,
-                    self.memory.clone(),
-                )?;
+                let r = self.set_expr(right, outer, label)?;
+                let (source, est_rows): (Box<dyn RowSource>, f64) = match kind {
+                    None => (
+                        Box::new(Union::new(
+                            vec![l.source, r.source],
+                            all,
+                            &self.session,
+                            self.memory.clone(),
+                        )?),
+                        l.est_rows + r.est_rows,
+                    ),
+                    Some(k) => {
+                        let est = match k {
+                            SetKind::Intersect => l.est_rows.min(r.est_rows),
+                            SetKind::Except => l.est_rows,
+                        };
+                        (
+                            Box::new(SetOp::new(
+                                l.source,
+                                r.source,
+                                k,
+                                all,
+                                &self.session,
+                                self.memory.clone(),
+                            )?),
+                            est,
+                        )
+                    }
+                };
                 let types = source.types();
                 Ok(Planned {
-                    source: Box::new(source),
+                    source,
                     names: l.names,
                     types,
                     est_rows,
                     id: l.id,
                 })
             }
+            ast::SetExpr::Values(v) => self.values(v, outer, select_type),
             _ => Err(unsupported("this set operation")),
         }
+    }
+
+    /// A table value constructor, `VALUES (...), (...)` (MariaDB) or
+    /// `VALUES ROW(...), ROW(...)` (MySQL), as the `UNION ALL` of one
+    /// `SELECT` per row: the columns' types are merged as for a union.
+    /// The columns are named as the servers name them: after the first
+    /// row's expressions on MariaDB, `column_0`, `column_1`, ... on MySQL.
+    fn values(
+        &mut self,
+        v: &ast::Values,
+        outer: Option<&Scope<'_>>,
+        select_type: &str,
+    ) -> Result<Planned> {
+        let maria = self.session.persona.is_maria();
+        let width = v.rows.first().map_or(0, |r| r.content.len());
+        if width == 0 || v.rows.iter().any(|r| r.content.len() != width) {
+            return Err(SqlError::new(
+                1222,
+                "21000",
+                "The used SELECT statements have a different number of columns",
+            ));
+        }
+        let template = one_row_select()?;
+        let mut parts: Vec<Planned> = Vec::with_capacity(v.rows.len());
+        for (i, row) in v.rows.iter().enumerate() {
+            let mut sel = template.clone();
+            sel.projection = row
+                .content
+                .iter()
+                .enumerate()
+                .map(|(k, e)| {
+                    if maria {
+                        ast::SelectItem::UnnamedExpr(e.clone())
+                    } else {
+                        ast::SelectItem::ExprWithAlias {
+                            expr: e.clone(),
+                            alias: ast::Ident::new(format!("column_{k}")),
+                        }
+                    }
+                })
+                .collect();
+            let id = self.next_id();
+            let block = self.select_block(&sel, None, None, outer, false, id)?;
+            parts.push(self.plan_block(block, if i == 0 { select_type } else { "UNION" })?);
+        }
+        if parts.len() == 1 {
+            return Ok(parts.remove(0));
+        }
+        let names = parts[0].names.clone();
+        let id = parts[0].id;
+        let est_rows = parts.len() as f64;
+        let source = Union::new(
+            parts.into_iter().map(|p| p.source).collect(),
+            true,
+            &self.session,
+            self.memory.clone(),
+        )?;
+        let types = source.types();
+        Ok(Planned {
+            source: Box::new(source),
+            names,
+            types,
+            est_rows,
+            id,
+        })
     }
 
     /// `ORDER BY` and `LIMIT` over a finished result: the keys name its
@@ -1407,6 +1606,8 @@ impl<'a> Cx<'a> {
                             reverse: bool,
                             using_where: &mut bool|
              -> Result<Box<dyn RowSource>> {
+                let kept: Vec<Expr> = path.kept.iter().map(|i| info.local[*i].clone()).collect();
+                let mut kept = Some(kept);
                 let mut src: Box<dyn RowSource> = match &rel.kind {
                     RelKind::Table(table) => {
                         let fetch = if path.covering {
@@ -1429,7 +1630,7 @@ impl<'a> Cx<'a> {
                             path.rows,
                             by_order,
                         );
-                        Box::new(ScanSource {
+                        let scan = ScanSource {
                             storage: cx.storage.clone(),
                             table: table.clone(),
                             key: path.key,
@@ -1438,7 +1639,20 @@ impl<'a> Cx<'a> {
                             fetch,
                             counters: counters.clone(),
                             cursor: None,
-                        })
+                        };
+                        // The table's own conditions, right above its scan:
+                        // a row they refuse is the scan's to know of (a
+                        // locking read at READ COMMITTED gives up its lock).
+                        match exprs::and_all(kept.take().unwrap_or_default()) {
+                            Some(cond) => {
+                                *using_where = true;
+                                Box::new(TableFilter {
+                                    scan,
+                                    cond: cx.compile_at(&cond, &local_map)?,
+                                })
+                            }
+                            None => Box::new(scan),
+                        }
                     }
                     RelKind::Derived(d) => {
                         row.access = Some("ALL".into());
@@ -1446,8 +1660,7 @@ impl<'a> Cx<'a> {
                         Box::new(DerivedSource::new(d.clone()))
                     }
                 };
-                let kept: Vec<Expr> = path.kept.iter().map(|i| info.local[*i].clone()).collect();
-                if let Some(cond) = exprs::and_all(kept) {
+                if let Some(cond) = kept.and_then(exprs::and_all) {
                     *using_where = true;
                     src = Box::new(Filter::new(src, cx.compile_at(&cond, &local_map)?));
                 }

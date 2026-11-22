@@ -9,7 +9,7 @@
 //! | DDL job older than `catalog.stuck_state_minutes` (`stuck_job`) | Finish if the physical state matches, else roll back; drops roll forward ([`DdlEngine::resolve`]) |
 //! | DDL job of a gateway process that has ended, at least a minute old (`stuck_job`) | The same, at once ([`CatalogReconciler::with_owners`]) |
 //! | Shard schema missing (`schema_missing`) | Alert (no mover-created shards to recreate) |
-//! | Object missing (`object_missing`) | Alert |
+//! | Object missing (`object_missing`), tables excepted (they live in the storage engine) | Alert |
 //! | Physical schema with no catalog entry (`orphan_schema`) | Quarantine; drop after `catalog.orphan_retention_days` if empty |
 //! | Schema of a dropped database still there (`dropped_schema_exists`) | Drop it: the catalog committed the drop |
 //! | Object created outside SprigDB (`outside_object`) | Adopt it ([`DdlEngine::adopt`]) |

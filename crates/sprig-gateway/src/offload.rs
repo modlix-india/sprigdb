@@ -401,12 +401,20 @@ impl<F: Future> Future for Guarded<F> {
             );
             (s.since_us.swap(us_at(started), Ordering::SeqCst), prev_who)
         });
+        // The layers inside read this poll's clock readings instead of
+        // the clock (`sprig_common::time::poll`).
+        let clock = sprig_common::time::poll::enter(started);
         let r = me.fut.as_mut().poll(cx);
+        let ended = sprig_common::time::poll::leave(clock);
         SLOT.with(|s| {
             *s.who.lock().unwrap_or_else(PoisonError::into_inner) = prev.1;
             s.since_us.store(prev.0, Ordering::SeqCst);
         });
-        let took = started.elapsed();
+        // A statement's end reading, when one was taken, is close enough
+        // for the shedding budget and the long-poll warning.
+        let took = ended
+            .unwrap_or_else(Instant::now)
+            .saturating_duration_since(started);
         me.busy += took;
         if took >= LONG_POLL {
             metrics::counter!("sprig_gateway_long_polls_total").increment(1);

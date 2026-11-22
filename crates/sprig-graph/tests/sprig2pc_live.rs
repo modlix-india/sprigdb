@@ -48,6 +48,25 @@ use sprig_txn::{
     ShardRef, StaticLocator, TxnBackend, TxnConfig, TxnCoordinator, TxnHooks, TxnMode,
 };
 
+/// The graph catalog's records for these tests (in memory: the graph
+/// module's rows live in the engine's catalog records).
+fn catalog_records() -> &'static sprig_catalog::records::mem::MemRecords {
+    static M: std::sync::OnceLock<sprig_catalog::records::mem::MemRecords> =
+        std::sync::OnceLock::new();
+    M.get_or_init(sprig_catalog::records::mem::MemRecords::new)
+}
+
+/// Adds a native label or type to graph `g` in a transaction of its own.
+async fn add_source(g: u64, label: bool, name: &str) -> sprig_common::Result<u32> {
+    use sprig_catalog::records::RecordStore as _;
+    let mut tx = catalog_records()
+        .begin(sprig_common::ids::TenantId(1))
+        .await?;
+    let id = sprig_graph::catalog::GraphCatalog::add_source(&mut *tx, g, label, name).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
 const TENANT: TenantId = TenantId(921_306_099_999);
 const GRAPH: u64 = 77;
 
@@ -63,7 +82,6 @@ struct Env {
 }
 
 struct Dict {
-    pool: Pool,
     labels: Mutex<BTreeMap<u32, String>>,
     types: Mutex<BTreeMap<u32, String>>,
 }
@@ -71,14 +89,7 @@ struct Dict {
 #[async_trait]
 impl Dictionary for Dict {
     async fn create(&self, label: bool, name: &str) -> Result<u32> {
-        let mut c = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(sprig_graph::catalog::backend_error)?;
-        let id = GraphCatalog::new("r8five_2pc_cat")
-            .add_source(&mut c, GRAPH, label, name)
-            .await?;
+        let id = add_source(GRAPH, label, name).await?;
         let m = if label { &self.labels } else { &self.types };
         m.lock().unwrap().insert(id, name.to_owned());
         Ok(id)
@@ -183,12 +194,7 @@ async fn setup() -> Option<Env> {
     let pool0 = pool(&urls[0]);
     {
         let mut c = pool0.get_conn().await.unwrap();
-        GraphCatalog::new("r8five_2pc_cat")
-            .migrate(&mut c)
-            .await
-            .unwrap();
-        GraphCatalog::new("r8five_2pc_cat")
-            .insert_native(&mut c, GRAPH, 1)
+        GraphCatalog::migrate(&mut c, "r8five_2pc_cat")
             .await
             .unwrap();
         for s in shards[0].tables.seq_ddl() {
@@ -239,7 +245,6 @@ async fn setup() -> Option<Env> {
             64,
         )),
         dict: Arc::new(Dict {
-            pool: pool0.clone(),
             labels: Mutex::new(BTreeMap::new()),
             types: Mutex::new(BTreeMap::new()),
         }),

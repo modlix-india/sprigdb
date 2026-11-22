@@ -532,16 +532,17 @@ impl GatewayGraphs {
             .catalog
             .change(g.tenant, VersionKind::Catalog)
             .await?;
-        let r = {
-            let (store, tx) = ch.tx().parts();
-            GraphCatalog::new(store.schema())
-                .set_mirror(
-                    tx,
+        let r = match ch.tx().records().await {
+            Err(e) => Err(e),
+            Ok(rec) => {
+                GraphCatalog::set_mirror(
+                    rec,
                     g.graph_id,
                     mode,
                     if ready { "ready" } else { "building" },
                 )
                 .await
+            }
         };
         if let Err(e) = r {
             let _ = ch.rollback().await;
@@ -557,7 +558,14 @@ impl GatewayGraphs {
         let ep = self.svc.locator.writer(g.tenant).await?;
         let mut c = ep.pool.get_conn().await.map_err(backend_error)?;
         let schema = ep.store.schema().to_owned();
-        let rows = mirror::read_pos_since_change(&mut c, &schema, g.graph_id).await?;
+        let changed_ms = {
+            let mut rec = self.svc.records.begin(g.tenant).await?;
+            match GraphCatalog::row(&mut *rec, g.graph_id).await? {
+                Some(r) => r.updated_ms,
+                None => return Ok(false),
+            }
+        };
+        let rows = mirror::read_pos_since_change(&mut c, &schema, g.graph_id, changed_ms).await?;
         Ok(mirror::fresh(&rows, &g.shards, &BTreeMap::new()))
     }
 

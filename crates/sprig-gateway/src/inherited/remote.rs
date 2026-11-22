@@ -463,8 +463,8 @@ pub async fn drop_trigger_here(svc: &Arc<TenantServices>, g: DefKey) -> Result<u
         let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
-        let store = sprig_inherit::msg::MsgStore::new(ep.store.schema());
-        if let Some(i) = store.instance(&mut conn, g).await? {
+        let store = sprig_inherit::msg::MsgStore::new(Arc::clone(&svc.records), t);
+        if let Some(i) = store.instance(g).await? {
             if let Some(b) = i
                 .physical
                 .as_ref()
@@ -487,7 +487,7 @@ pub async fn drop_trigger_here(svc: &Arc<TenantServices>, g: DefKey) -> Result<u
                     )
                     .await;
             }
-            store.delete_instance(&mut conn, g).await?;
+            store.delete_instance(g).await?;
             n += 1;
         }
     }

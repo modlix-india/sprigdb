@@ -235,7 +235,7 @@ pub(super) async fn create_key(
         })
         .unwrap_or_default();
     let created = create_api_key(
-        &svc.catalog,
+        &svc.auth,
         tid,
         &tname,
         user_id,
@@ -279,7 +279,7 @@ pub(super) async fn revoke_key(
     let (Some(svc), Some(tid)) = (&core.studio.tenants, caller.principal.tenant) else {
         return Err(denied("no tenant"));
     };
-    let changed = revoke_api_key(&svc.catalog, tid, key_id, SystemTime::now()).await?;
+    let changed = revoke_api_key(&svc.auth, tid, key_id, SystemTime::now()).await?;
     tracing::info!(target: "sprig_audit", event = "auth.api_key_revoked", key = %key_id,
         by = %caller.principal.user, client = "studio", "API key revoked");
     Ok(json_response(

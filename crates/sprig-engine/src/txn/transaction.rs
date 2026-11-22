@@ -24,7 +24,7 @@ use crate::locks::{
     Acquire, GapAcquire, Interrupt, LockMode, LockTable, Pos, TxnId, Wait, WaitOutcome,
 };
 use crate::log::Ticket;
-use crate::store::{Read, SortedStore};
+use crate::store::{Cf, Read, SortedStore};
 
 /// A locking read or write request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,7 +226,7 @@ pub(super) enum Phase {
 
 /// A savepoint (`SAVEPOINT s`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Savepoint(Mark);
+pub struct Savepoint(Mark, usize);
 
 /// A queued commit: answer the client only once it is durable.
 #[derive(Debug, Clone)]
@@ -403,6 +403,22 @@ pub struct Txn {
     /// Set by an [`InterruptHandle`]: 0 none, 1 killed, 2 time limit.
     interrupt: Arc<AtomicU8>,
     phase: Phase,
+    /// Log notes and plain store writes the commit carries
+    /// ([`Txn::add_note`], [`Txn::add_plain_put`]).
+    notes: Vec<Extra>,
+    /// `notes.len()` when the current statement started.
+    stmt_notes: usize,
+}
+
+/// What a commit's log entry carries beside the versioned writes.
+#[derive(Debug, Clone)]
+pub(crate) enum Extra {
+    /// An opaque note (the apply step skips it; observers read it).
+    Note(Vec<u8>),
+    /// A plain put.
+    Put(Cf, Vec<u8>, Vec<u8>),
+    /// A plain delete.
+    Delete(Cf, Vec<u8>),
 }
 
 impl std::fmt::Debug for Txn {
@@ -444,6 +460,8 @@ impl Txn {
             inserted: Vec::new(),
             interrupt: Arc::new(AtomicU8::new(0)),
             phase: Phase::Active,
+            notes: Vec::new(),
+            stmt_notes: 0,
         };
         // A consistent snapshot opens the view at once. (SERIALIZABLE with
         // snapshot isolation opens it when the first statement starts: see
@@ -523,6 +541,7 @@ impl Txn {
     /// none), so the snapshot check can fire from that statement on.
     pub fn begin_statement(&mut self) {
         self.stmt_mark = self.writes.mark();
+        self.stmt_notes = self.notes.len();
         self.stmt_seq = self.stmt_seq.wrapping_add(1).max(1);
         self.stmt_fresh.clear();
         self.interrupt.store(0, Ordering::Release);
@@ -544,6 +563,7 @@ impl Txn {
     /// (see [`Txn::undo_insert_locks`]).
     pub fn rollback_statement(&mut self) {
         self.writes.rollback_to(self.stmt_mark);
+        self.notes.truncate(self.stmt_notes);
         self.undo_insert_locks(self.stmt_mark);
         self.sync_weight();
     }
@@ -595,13 +615,15 @@ impl Txn {
     /// `SAVEPOINT`.
     #[must_use]
     pub fn savepoint(&self) -> Savepoint {
-        Savepoint(self.writes.mark())
+        Savepoint(self.writes.mark(), self.notes.len())
     }
 
     /// `ROLLBACK TO SAVEPOINT`: later writes go, later locks stay (but see
     /// [`Txn::undo_insert_locks`] for rows inserted since).
     pub fn rollback_to(&mut self, sp: Savepoint) {
         self.writes.rollback_to(sp.0);
+        self.notes.truncate(sp.1);
+        self.stmt_notes = self.stmt_notes.min(sp.1);
         self.undo_insert_locks(sp.0);
         if self.stmt_mark > sp.0 {
             self.stmt_mark = sp.0;
@@ -1787,6 +1809,63 @@ impl Txn {
 
     // ----- end ------------------------------------------------------------
 
+    /// Adds an opaque note to the commit's log entry (the apply step's
+    /// observers read it, the store doesn't; a stream append in a SQL
+    /// transaction). It goes with the transaction's writes or not at all,
+    /// and a statement or savepoint rollback removes it. Notes don't
+    /// survive `XA PREPARE`.
+    ///
+    /// # Errors
+    /// The transaction is not active.
+    pub fn add_note(&mut self, note: Vec<u8>) -> Result<()> {
+        self.ensure_active()?;
+        self.notes.push(Extra::Note(note));
+        Ok(())
+    }
+
+    /// Adds a plain (unversioned) put of `key` in `cf` to the commit's log
+    /// entry: applied with the transaction's writes or not at all, never
+    /// visible before the commit applies, not locked and not versioned
+    /// (keys outside MVCC that one owner writes, such as queue messages: a
+    /// queue publish or acknowledgement inside a SQL transaction). A
+    /// statement or savepoint rollback removes it, as it removes notes.
+    ///
+    /// # Errors
+    /// The transaction is not active.
+    pub fn add_plain_put(&mut self, cf: Cf, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        self.ensure_active()?;
+        self.notes.push(Extra::Put(cf, key, value));
+        Ok(())
+    }
+
+    /// Adds a plain (unversioned) delete of `key` in `cf` to the commit's
+    /// log entry, as [`Txn::add_plain_put`] adds a put.
+    ///
+    /// # Errors
+    /// The transaction is not active.
+    pub fn add_plain_delete(&mut self, cf: Cf, key: Vec<u8>) -> Result<()> {
+        self.ensure_active()?;
+        self.notes.push(Extra::Delete(cf, key));
+        Ok(())
+    }
+
+    /// Whether the commit carries plain store writes (they can't be kept
+    /// across `XA PREPARE`).
+    #[must_use]
+    pub fn has_plain_writes(&self) -> bool {
+        self.notes.iter().any(|e| !matches!(e, Extra::Note(_)))
+    }
+
+    /// The notes added so far (plain writes not counted: a note's slot
+    /// among the entry's notes is what observers see).
+    #[must_use]
+    pub fn notes(&self) -> usize {
+        self.notes
+            .iter()
+            .filter(|e| matches!(e, Extra::Note(_)))
+            .count()
+    }
+
     /// A ticket for replying to the current statement: ready once every
     /// pending version it read is durable.
     #[must_use]
@@ -1804,7 +1883,7 @@ impl Txn {
         self.ensure_active()?;
         let token = self.view.unwrap_or_else(|| self.shared().visible_ts());
         self.close_view();
-        if self.writes.is_empty() {
+        if self.writes.is_empty() && self.notes.is_empty() {
             self.shared().locks.release_all(self.id);
             self.finish(Phase::Done);
             return Ok(CommitTicket {
@@ -1814,11 +1893,16 @@ impl Txn {
             });
         }
         let writes = std::mem::take(&mut self.writes).into_writes();
+        let notes = std::mem::take(&mut self.notes);
         let path = self.path.clone();
-        match path
-            .shared()
-            .commit_writes(&*path, self.id, writes, self.opts.durability, None)
-        {
+        match path.shared().commit_writes_noted(
+            &*path,
+            self.id,
+            writes,
+            self.opts.durability,
+            None,
+            &notes,
+        ) {
             Ok((cts, ticket)) => {
                 self.finish(Phase::Done);
                 Ok(CommitTicket {
@@ -1841,6 +1925,7 @@ impl Txn {
 
     fn rollback_inner(&mut self) {
         self.writes = WriteSet::default();
+        self.notes.clear();
         self.xlocked.clear();
         self.stmt_fresh.clear();
         self.inserted.clear();

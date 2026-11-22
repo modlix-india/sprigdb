@@ -11,7 +11,7 @@
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
-use sprig_catalog::{ChangeOpts, MariaCatalog, VersionKind};
+use sprig_catalog::{AuthCatalog, ChangeOpts, VersionKind};
 use sprig_common::ids::TenantId;
 use sprig_common::time::Clock;
 use sprig_common::{Result, SprigCode, SprigError};
@@ -142,24 +142,18 @@ fn bad(what: &str, e: &SprigError) -> SprigError {
 ///
 /// # Errors
 /// The catalog's errors (39070, 39072).
-pub async fn export(cat: &MariaCatalog, tenant: TenantId) -> Result<PortableAccounts> {
-    let ep = cat.backend().locator().writer(tenant).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(crate::store::map_err)?;
-    let store = AuthStore::of(&ep.store);
-    let users = store.users_since(&mut conn, None).await?;
-    let verifiers = store.all_verifiers(&mut conn).await?;
-    let authz = AuthzStore::new(ep.store.schema());
-    let roles = if authz.migrated(&mut conn).await? {
-        authz
-            .load(&mut conn)
-            .await?
-            .roles
-            .into_iter()
-            .map(|r| (r.name, r.host))
-            .collect()
-    } else {
-        Vec::new()
-    };
+pub async fn export(cat: &AuthCatalog, tenant: TenantId) -> Result<PortableAccounts> {
+    let mut tx = cat.backend().store().begin(tenant).await?;
+    let store = AuthStore;
+    let users = store.users_since(&mut *tx, None).await?;
+    let verifiers = store.all_verifiers(&mut *tx).await?;
+    let roles = AuthzStore::new()
+        .load(&mut *tx)
+        .await?
+        .roles
+        .into_iter()
+        .map(|r| (r.name, r.host))
+        .collect();
     let mut out = PortableAccounts {
         users: Vec::new(),
         roles,
@@ -212,7 +206,7 @@ pub async fn export(cat: &MariaCatalog, tenant: TenantId) -> Result<PortableAcco
 /// # Errors
 /// 39792 for a malformed account; the change's errors.
 pub async fn import(
-    cat: &MariaCatalog,
+    cat: &AuthCatalog,
     tenant: TenantId,
     a: &PortableAccount,
     clock: &dyn Clock,
@@ -253,9 +247,9 @@ pub async fn import(
         .await?;
     let version = c.version();
     let result = async {
-        let (core, q) = c.tx().parts();
-        let store = AuthStore::of(core);
-        let id = store.next_user_id(core, q).await?;
+        let q = c.tx().records();
+        let store = AuthStore;
+        let id = store.next_user_id(q).await?;
         let mut row = UserRow::new(id, &a.name, &a.host, UserSource::Api, now, version);
         row.kind = kind;
         row.plugin.clone_from(&a.plugin);

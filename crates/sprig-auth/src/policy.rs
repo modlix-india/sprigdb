@@ -48,7 +48,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
-use sprig_catalog::{ChangeOpts, MariaCatalog, TenantCatalog, VersionKind};
+use sprig_catalog::records::RecordTx;
+use sprig_catalog::{AuthCatalog, ChangeOpts, TenantCatalog, VersionKind};
 use sprig_common::ids::{TenantId, UserId};
 use sprig_common::time::Clock;
 use sprig_common::{Result, SprigCode, SprigError};
@@ -65,7 +66,7 @@ use crate::settings::{
 };
 use crate::store::{
     AuthStore, LoginStateRow, RequireCurrent, Slot, UNBOUNDED_LOCK_MICROS, UserRow, VerifierKind,
-    VerifierRow, from_micros, map_err,
+    VerifierRow, from_micros,
 };
 use crate::verifier::CachingSha2Verifier;
 
@@ -241,7 +242,7 @@ pub trait LoginStateStore: Send + Sync + 'static {
 /// `login_state` in the tenant's catalog, through its writer; lock
 /// transitions are auth changes.
 pub struct CatalogLoginState {
-    cat: MariaCatalog,
+    cat: AuthCatalog,
     /// Failures counted while the writer couldn't be reached.
     pending: Mutex<HashMap<(TenantId, UserId), u32>>,
 }
@@ -255,7 +256,7 @@ impl std::fmt::Debug for CatalogLoginState {
 impl CatalogLoginState {
     /// Counters in the catalogs `cat` changes.
     #[must_use]
-    pub fn new(cat: MariaCatalog) -> Self {
+    pub fn new(cat: AuthCatalog) -> Self {
         Self {
             cat,
             pending: Mutex::new(HashMap::new()),
@@ -284,18 +285,13 @@ impl CatalogLoginState {
         now: SystemTime,
         extra: u32,
     ) -> Result<FailureOutcome> {
-        let ep = self.cat.backend().locator().writer(tenant).await?;
-        let store = AuthStore::of(&ep.store);
-        let mut conn = ep.pool.get_conn().await.map_err(map_err)?;
-        let mut tx = conn
-            .start_transaction(mysql_async::TxOpts::default())
-            .await
-            .map_err(map_err)?;
-        let row = store.login_state_for_update(&mut tx, user).await?;
+        let store = AuthStore;
+        let mut tx = self.cat.backend().store().begin(tenant).await?;
+        let row = store.login_state_for_update(&mut *tx, user).await?;
         let mut row = row.unwrap_or_else(|| empty_state(user, now));
         if row.locked_until.is_some_and(|u| u > now) {
             // Locked meanwhile (another gateway): failures don't count.
-            tx.rollback().await.map_err(map_err)?;
+            tx.rollback().await?;
             return Ok(FailureOutcome {
                 failures: row.consecutive_failures,
                 locked_until: None,
@@ -310,15 +306,14 @@ impl CatalogLoginState {
             row.consecutive_failures = failures;
             row.last_failure_at = Some(now);
             row.updated_at = now;
-            store.put_login_state(&mut tx, &row).await?;
-            tx.commit().await.map_err(map_err)?;
+            store.put_login_state(&mut *tx, &row).await?;
+            tx.commit().await?;
             return Ok(FailureOutcome {
                 failures,
                 locked_until: None,
             });
         }
-        tx.rollback().await.map_err(map_err)?;
-        drop(conn);
+        tx.rollback().await?;
         // The lock: an auth change, so every gateway reloads.
         let until = policy.lock.until(now);
         let r = auth_change(&self.cat, tenant, move |store, q| {
@@ -370,12 +365,12 @@ type ChangeBody<'a, T> =
 /// Runs `body` in one auth change of `tenant`; returns its value and the
 /// committed version. On failure the change rolls back and the allocated
 /// version is settled.
-async fn auth_change<T, F>(cat: &MariaCatalog, tenant: TenantId, body: F) -> Result<(T, u64)>
+async fn auth_change<T, F>(cat: &AuthCatalog, tenant: TenantId, body: F) -> Result<(T, u64)>
 where
     T: Send,
     F: for<'a> FnOnce(
             &'a AuthStore,
-            &'a mut mysql_async::Transaction<'static>,
+            &'a mut dyn RecordTx,
         ) -> ChangeBody<'a, T>
         + Send,
 {
@@ -383,9 +378,8 @@ where
         .change_with(tenant, VersionKind::Auth, ChangeOpts::default())
         .await?;
     let r = {
-        let (core, q) = c.tx().parts();
-        let store = AuthStore::of(core);
-        body(&store, q).await
+        let q = c.tx().records();
+        body(&AuthStore, q).await
     };
     match r {
         Ok(v) => Ok((v, c.commit().await?)),
@@ -420,11 +414,10 @@ impl LoginStateStore for CatalogLoginState {
 
     async fn record_success(&self, tenant: TenantId, user: UserId, now: SystemTime) -> Result<()> {
         self.take_pending((tenant, user));
-        let ep = self.cat.backend().locator().writer(tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(map_err)?;
-        AuthStore::of(&ep.store)
-            .reset_failures(&mut conn, user, now)
-            .await?;
+        let mut tx = self.cat.backend().store().begin(tenant).await?;
+        if AuthStore.reset_failures(&mut *tx, user, now).await? {
+            tx.commit().await?;
+        }
         Ok(())
     }
 
@@ -437,11 +430,8 @@ impl LoginStateStore for CatalogLoginState {
     ) -> Result<bool> {
         // Read first, so gateways racing to unlock allocate one version.
         {
-            let ep = self.cat.backend().locator().writer(tenant).await?;
-            let mut conn = ep.pool.get_conn().await.map_err(map_err)?;
-            let row = AuthStore::of(&ep.store)
-                .login_state(&mut conn, user)
-                .await?;
+            let mut tx = self.cat.backend().store().begin(tenant).await?;
+            let row = AuthStore.login_state(&mut *tx, user).await?;
             if row.and_then(|r| r.locked_until) != Some(until) {
                 return Ok(false);
             }
@@ -830,7 +820,7 @@ pub struct PasswordCtx<'a> {
     /// The tenant's name, for audit events.
     pub tenant_name: Option<&'a str>,
     /// The catalog writer path.
-    pub cat: &'a MariaCatalog,
+    pub cat: &'a AuthCatalog,
     /// The tenant's snapshot, for its settings and the account.
     pub catalog: &'a TenantCatalog,
     /// Resolution of the `auth.*` keys.
@@ -863,11 +853,10 @@ pub async fn change_password(
 ) -> Result<Changed> {
     let tenant = ctx.catalog.tenant;
     // The account as the writer has it (the snapshot may be older).
-    let ep = ctx.cat.backend().locator().writer(tenant).await?;
-    let store = AuthStore::of(&ep.store);
+    let store = AuthStore;
     let (row, verifiers) = {
-        let mut conn = ep.pool.get_conn().await.map_err(map_err)?;
-        let row = match store.user(&mut conn, user).await? {
+        let mut tx = ctx.cat.backend().store().begin(tenant).await?;
+        let row = match store.user(&mut *tx, user).await? {
             Some(r) if r.is_live() => r,
             _ => {
                 return Err(SprigError::backend(
@@ -877,7 +866,7 @@ pub async fn change_password(
                 ));
             }
         };
-        let verifiers = store.verifiers_of(&mut conn, &[user]).await?;
+        let verifiers = store.verifiers_of(&mut *tx, &[user]).await?;
         (row, verifiers)
     };
     let rules = PasswordRules::of(&row, ctx.policy, ctx.catalog);

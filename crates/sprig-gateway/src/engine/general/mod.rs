@@ -34,8 +34,10 @@
 //!   moves off the runtime's worker (`block_in_place`) after its first
 //!   stretch.
 //! - **Reads are consistent reads** at the transaction's read view. A
-//!   locking clause, and a `SELECT` inside a SERIALIZABLE transaction
-//!   (which locks what it reads), are refused with 39960 here.
+//!   locking clause, and any `SELECT` inside a SERIALIZABLE transaction,
+//!   read the rows as they are now and lock what they read, as the
+//!   single-table path does; such a statement runs off the runtime's
+//!   worker, since a lock wait blocks its thread.
 
 pub(crate) mod names;
 pub(crate) mod results;
@@ -46,7 +48,7 @@ use std::time::Instant;
 
 use sprig_common::{Result, SprigError};
 use sprig_engine::keys::collation::{Collation, Flavor};
-use sprig_engine::txn::TxnOptions;
+use sprig_engine::txn::{LockMode, TxnOptions, Wait};
 use sprig_exec::{Ctx, Persona, Session, SqlError, SqlMode};
 use sprig_plan::{PlanOptions, Planner};
 use sqlparser::ast::Statement;
@@ -90,6 +92,15 @@ pub(crate) struct General {
     pub catalog_version: u64,
     /// The current database's logical name.
     pub current: Option<String>,
+    /// The locking clause (`FOR UPDATE`, `LOCK IN SHARE MODE`, `FOR
+    /// SHARE`): every row read is locked.
+    pub lock: Option<crate::engine::plan::RowLock>,
+    /// Per table: it is read in the outermost query block's `FROM`.
+    pub top: Vec<bool>,
+    /// A write's `SELECT` (`multiwrite`): per table, whether its rows are
+    /// locked exclusively (a target of the write) or in shared mode;
+    /// every table read is locked, subqueries' too.
+    pub lock_each: Option<Vec<bool>>,
 }
 
 impl General {
@@ -118,6 +129,7 @@ impl General {
             ordered: false,
             lock: None,
             check: None,
+            fks: None,
         })
     }
 }
@@ -142,7 +154,56 @@ pub(crate) fn bind(
     cx: &BindCtx<'_>,
     stmt: &Statement,
     text: Option<&str>,
-    locking: bool,
+    lock: Option<crate::engine::plan::RowLock>,
+) -> Result<Option<General>> {
+    bind_in(cx, stmt, text, lock, false)
+}
+
+/// [`bind`] for a set operation or table value constructor that reads no
+/// table (`VALUES ROW(1), ROW(2)`, `SELECT 1 UNION SELECT 2`): the MySQL
+/// port plans it here, so it is typed and described as MySQL does, not by
+/// the MariaDB backend.
+///
+/// # Errors
+/// As for [`bind`].
+pub(crate) fn bind_tableless(
+    cx: &BindCtx<'_>,
+    stmt: &Statement,
+    text: Option<&str>,
+) -> Result<Option<General>> {
+    use sqlparser::ast::SetExpr;
+    let Statement::Query(q) = stmt else {
+        return Ok(None);
+    };
+    // A set operation or VALUES, alone or as a derived table.
+    let derived_values = match &*q.body {
+        SetExpr::Select(s) => s.from.iter().any(|t| {
+            matches!(&t.relation, sqlparser::ast::TableFactor::Derived { subquery, .. }
+                if matches!(&*subquery.body, SetExpr::Values(_) | SetExpr::SetOperation { .. }))
+        }),
+        _ => false,
+    };
+    if !derived_values && !matches!(&*q.body, SetExpr::Values(_) | SetExpr::SetOperation { .. }) {
+        return Ok(None);
+    }
+    // Any table at all (`information_schema`'s too) leaves it where it was.
+    let mut names_table = false;
+    let _ = sqlparser::ast::visit_relations(stmt, |_| {
+        names_table = true;
+        std::ops::ControlFlow::<()>::Break(())
+    });
+    if names_table {
+        return Ok(None);
+    }
+    bind_in(cx, stmt, text, None, true)
+}
+
+fn bind_in(
+    cx: &BindCtx<'_>,
+    stmt: &Statement,
+    text: Option<&str>,
+    lock: Option<crate::engine::plan::RowLock>,
+    tableless: bool,
 ) -> Result<Option<General>> {
     let explain = match stmt {
         Statement::Query(_) => false,
@@ -158,7 +219,7 @@ pub(crate) fn bind(
             if *analyze || format.is_some() || *query_plan || *estimate || options.is_some() {
                 // Only the plain tabular form is the planner's; the other
                 // forms would be answered from MariaDB's empty copy.
-                return match names::analyze(cx, stmt, None)? {
+                return match names::analyze(cx, stmt, None, false)? {
                     Some(_) => Err(not_on_engine(
                         "EXPLAIN in another form than plain EXPLAIN SELECT, on engine tables",
                     )),
@@ -169,15 +230,13 @@ pub(crate) fn bind(
         }
         _ => return Ok(None),
     };
-    let Some(a) = names::analyze(cx, stmt, text.filter(|_| !explain))? else {
+    let Some(a) = names::analyze(cx, stmt, text.filter(|_| !explain), tableless)? else {
         return Ok(None);
     };
-    if locking {
-        return Err(not_on_engine(
-            "a locking read (FOR UPDATE, LOCK IN SHARE MODE) with a join, grouping, an \
-             expression or a subquery",
-        ));
+    if lock.is_some() && explain {
+        return Err(not_on_engine("EXPLAIN of a locking read"));
     }
+    let top = top_tables(&a.stmt, &a.tables);
     Ok(Some(General {
         stmt: a.stmt,
         explain,
@@ -187,7 +246,69 @@ pub(crate) fn bind(
         params: a.params,
         catalog_version: cx.names.version(),
         current: cx.current.map(|d| cx.names.db_name(d)),
+        top,
+        lock,
+        lock_each: None,
     }))
+}
+
+/// Per table of `tables`: whether the outermost query block of `stmt`
+/// reads it in its `FROM` (by one of the names it is read under).
+fn top_tables(stmt: &Statement, tables: &[TableUse]) -> Vec<bool> {
+    use sqlparser::ast::{SetExpr, TableFactor};
+    let mut names: Vec<String> = Vec::new();
+    let query = match stmt {
+        Statement::Query(q) => Some(q),
+        _ => None,
+    };
+    if let Some(q) = query
+        && let SetExpr::Select(s) = &*q.body
+    {
+        let mut add = |f: &TableFactor| {
+            if let TableFactor::Table { name, alias, .. } = f {
+                if let Some(a) = alias {
+                    names.push(a.name.value.to_lowercase());
+                }
+                if let Some(sqlparser::ast::ObjectNamePart::Identifier(i)) = name.0.last() {
+                    names.push(i.value.to_lowercase());
+                }
+            }
+        };
+        for t in &s.from {
+            add(&t.relation);
+            for j in &t.joins {
+                add(&j.relation);
+            }
+        }
+    }
+    tables
+        .iter()
+        .map(|t| t.aliases.iter().any(|a| names.contains(a)))
+        .collect()
+}
+
+/// How a statement's reads lock.
+#[derive(Debug, Clone, Copy)]
+struct Lock {
+    mode: LockMode,
+    wait: Wait,
+    /// Every table read is locked (SERIALIZABLE); otherwise only the
+    /// tables of the outermost query block, as both servers lock for a
+    /// locking clause (a subquery's tables are read without locks).
+    all: bool,
+}
+
+/// A locking clause's lock.
+fn lock_of(l: crate::engine::plan::RowLock, all: bool) -> Lock {
+    Lock {
+        mode: if l.exclusive {
+            LockMode::Exclusive
+        } else {
+            LockMode::Shared
+        },
+        wait: l.wait,
+        all,
+    }
 }
 
 /// What the session's variables say to the expression engine, and to the
@@ -316,14 +437,19 @@ pub(crate) struct Rows {
     pub rows: Vec<Vec<Datum>>,
     /// How many notes and warnings the statement raised.
     pub warnings: u16,
+    /// The first of them (as many as the servers list).
+    pub conds: Vec<sprig_exec::Warning>,
     /// Rows read from the store.
     pub examined: u64,
     /// Some table was read whole, without a key (`NO_INDEX_USED`).
     pub no_index: bool,
+    /// Some table was read whole, by a key or not: what a write reports
+    /// as "no index used".
+    pub full_scan: bool,
 }
 
 /// An executor error as the gateway's.
-fn sql_error(e: SqlError) -> SprigError {
+pub(crate) fn sql_error(e: SqlError) -> SprigError {
     match e.code {
         // What the planner or the expression engine doesn't cover yet: the
         // statement is refused, as every statement outside the engine's
@@ -357,6 +483,38 @@ pub(crate) struct RunArgs<'a> {
     pub seed: &'a Seed,
     /// When the session's statement time limit passes, and its error.
     pub deadline: Option<(Instant, fn() -> SprigError)>,
+    /// The session, whose `KILL QUERY` ends a lock wait of the statement.
+    pub stop: Option<Arc<crate::session::SessionHandle>>,
+}
+
+/// Ends the lock wait of the transaction `h` belongs to, from a task of
+/// its own, when the session's `KILL QUERY` comes or the statement's time
+/// limit passes: a locking read through the planner waits on its thread,
+/// where neither can reach it otherwise. Aborted when the statement ends.
+fn interrupt_on_stop(
+    h: sprig_engine::txn::InterruptHandle,
+    stop: Option<Arc<crate::session::SessionHandle>>,
+    deadline: Option<Instant>,
+) -> tokio::task::JoinHandle<()> {
+    use sprig_engine::txn::Interrupt;
+    tokio::spawn(async move {
+        let killed = async {
+            match &stop {
+                Some(s) => s.flags().query_killed().await,
+                None => std::future::pending().await,
+            }
+        };
+        let timed = async {
+            match deadline {
+                Some(d) => tokio::time::sleep_until(d.into()).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            () = killed => h.interrupt(Interrupt::Kill),
+            () = timed => h.interrupt(Interrupt::StatementTimeout),
+        }
+    })
 }
 
 impl Engine {
@@ -400,11 +558,13 @@ impl Engine {
 
     /// Plans and runs `g` on `tx`, in one synchronous section: the
     /// transaction comes back with the result.
+    #[allow(clippy::too_many_lines)] // storage, the run, its stretches
     fn general_exec(
         g: &General,
         spaces: Vec<Space>,
         tx: Option<Tx>,
         a: &RunArgs<'_>,
+        lock: Option<Lock>,
     ) -> (Option<Tx>, Result<Rows>) {
         // Without a transaction storage holds no rows: the plan is only
         // described.
@@ -413,12 +573,37 @@ impl Engine {
             .tables
             .iter()
             .zip(spaces)
-            .map(|(t, sp)| Bound::new(t, sp))
+            .enumerate()
+            .map(|(i, (t, sp))| {
+                let l = match (&g.lock_each, lock) {
+                    (Some(each), Some(l)) if !dry => {
+                        let mode = if each.get(i).copied().unwrap_or(false) {
+                            LockMode::Exclusive
+                        } else {
+                            LockMode::Shared
+                        };
+                        (l.all || g.top.get(i).copied().unwrap_or(true)).then_some((mode, l.wait))
+                    }
+                    _ => lock
+                        .filter(|l| !dry && (l.all || g.top.get(i).copied().unwrap_or(true)))
+                        .map(|l| (l.mode, l.wait)),
+                };
+                Bound::new(t, sp, l)
+            })
             .collect();
+        let interrupt = lock
+            .filter(|_| !dry)
+            .and_then(|_| tx.as_ref().map(Tx::interrupt_handle));
         let storage = TxStorage::new(tx, bounds, a.deadline);
+        // A locking read may wait for a lock, blocking its thread: it runs
+        // off the runtime's worker from the start.
+        let off_worker = lock.is_some()
+            && !dry
+            && tokio::runtime::Handle::try_current()
+                .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
         let catalog = names::PlanCatalog::new(g);
         let session = a.seed.now();
-        let r = (|| -> std::result::Result<Rows, SqlError> {
+        let run = || -> std::result::Result<Rows, SqlError> {
             let mut planner = Planner::new(&catalog, storage.shared(), &session);
             planner.options = PlanOptions {
                 only_full_group_by: a.seed.only_full_group_by,
@@ -445,8 +630,10 @@ impl Engine {
                     }
                     Ok(())
                 };
-                if tokio::runtime::Handle::try_current()
-                    .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+                if !off_worker
+                    && tokio::runtime::Handle::try_current().is_ok_and(|h| {
+                        h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+                    })
                 {
                     tokio::task::block_in_place(rest)?;
                 } else {
@@ -461,10 +648,26 @@ impl Engine {
                 columns: std::mem::take(&mut plan.columns),
                 rows,
                 warnings: u16::try_from(ctx.warning_count()).unwrap_or(u16::MAX),
+                conds: ctx.warnings().to_vec(),
                 examined: plan.rows_examined(),
                 no_index: no_index && !g.explain,
+                full_scan: plan
+                    .explain
+                    .iter()
+                    .any(|r| matches!(r.access.as_deref(), Some("ALL" | "index"))),
             })
-        })();
+        };
+        let r = if off_worker {
+            let watch =
+                interrupt.map(|h| interrupt_on_stop(h, a.stop.clone(), a.deadline.map(|d| d.0)));
+            let r = tokio::task::block_in_place(run);
+            if let Some(w) = watch {
+                w.abort();
+            }
+            r
+        } else {
+            run()
+        };
         // The plan and the planner are gone: the storage is this
         // function's alone again.
         let (tx, failed) = storage.finish();
@@ -492,7 +695,10 @@ impl Engine {
         let spaces = self.general_spaces(a.tenant, g, None).await?;
         let mut tx = self.begin(opts)?;
         tx.set_env(env);
-        let (tx, r) = Self::general_exec(g, spaces, Some(tx), a);
+        // An autocommit statement's reads lock only for its locking clause
+        // (a SERIALIZABLE autocommit read is a consistent read).
+        let lock = g.lock.map(|l| lock_of(l, false));
+        let (tx, r) = Self::general_exec(g, spaces, Some(tx), a, lock);
         let Some(tx) = tx else {
             return Err(SprigError::internal(
                 "engine: a statement lost its transaction",
@@ -526,12 +732,22 @@ impl Engine {
         let Some(tx) = txn.statement() else {
             return Err(SprigError::internal("engine: no open transaction"));
         };
-        if tx.shared_reads() {
-            return Err(not_on_engine(
-                "a join, grouping, an expression or a subquery in a SELECT inside a \
-                 SERIALIZABLE transaction (its reads lock the rows they read)",
-            ));
-        }
+        // Every read of a SERIALIZABLE transaction locks what it reads, in
+        // shared mode, unless its locking clause asks for more.
+        // A write's `SELECT` locks its subqueries' rows too, except at
+        // READ COMMITTED (both servers).
+        let all = if g.lock_each.is_some() {
+            tx.options().isolation != sprig_engine::txn::Isolation::ReadCommitted
+        } else {
+            tx.shared_reads()
+        };
+        let lock = g.lock.map(|l| lock_of(l, all)).or_else(|| {
+            tx.shared_reads().then_some(Lock {
+                mode: LockMode::Shared,
+                wait: Wait::Block,
+                all: true,
+            })
+        });
         let spaces = self.general_spaces(a.tenant, g, Some(tx)).await?;
         tx.begin_statement();
         // The plan's storage owns the transaction while it runs: nothing
@@ -539,7 +755,7 @@ impl Engine {
         let Some(owned) = txn.lend() else {
             return Err(SprigError::internal("engine: no open transaction"));
         };
-        let (owned, r) = Self::general_exec(g, spaces, Some(owned), a);
+        let (owned, r) = Self::general_exec(g, spaces, Some(owned), a, lock);
         let Some(owned) = owned else {
             return Err(SprigError::internal(
                 "engine: a statement lost its transaction",
@@ -573,8 +789,9 @@ impl Engine {
             params: &params,
             seed,
             deadline: None,
+            stop: None,
         };
-        Self::general_exec(g, spaces, None, &a)
+        Self::general_exec(g, spaces, None, &a, None)
             .1
             .map(|ran| ran.columns)
     }

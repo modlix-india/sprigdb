@@ -82,7 +82,7 @@ fn wire_type(f: FieldType) -> u8 {
 }
 
 /// The definition of a computed column named `name`.
-fn value_def(name: &str, ty: &ExprType, results: Results) -> ColumnDef {
+pub(crate) fn value_def(name: &str, ty: &ExprType, results: Results) -> ColumnDef {
     let m = ty.meta(exec_persona(results));
     let text = ty.kind == Kind::Str && ty.coll != Collation::Binary;
     let (charset, length) = if text {
@@ -126,6 +126,156 @@ fn value_def(name: &str, ty: &ExprType, results: Results) -> ColumnDef {
     }
 }
 
+/// Whether `stmt`'s outermost query is a set operation or a table value
+/// constructor, and if so whether it removes duplicates somewhere (a
+/// `UNION` without `ALL`, any `INTERSECT` or `EXCEPT`).
+fn set_operation(stmt: &sqlparser::ast::Statement) -> Option<bool> {
+    use sqlparser::ast::{SetExpr, SetOperator, SetQuantifier, Statement};
+    fn dedups(e: &SetExpr) -> bool {
+        match e {
+            SetExpr::SetOperation {
+                left,
+                op,
+                set_quantifier,
+                right,
+            } => {
+                let here = match op {
+                    SetOperator::Union => !matches!(
+                        set_quantifier,
+                        SetQuantifier::All | SetQuantifier::AllByName
+                    ),
+                    _ => true,
+                };
+                here || dedups(left) || dedups(right)
+            }
+            SetExpr::Query(q) => dedups(&q.body),
+            _ => false,
+        }
+    }
+    let Statement::Query(q) = stmt else {
+        return None;
+    };
+    match &*q.body {
+        b @ SetExpr::SetOperation { .. } => Some(dedups(b)),
+        SetExpr::Values(_) => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether `stmt` is a set operation the servers gather in a temporary
+/// table and then read whole: one that removes duplicates, uses
+/// `INTERSECT` or `EXCEPT`, or orders its whole result. Its answer says
+/// "no index used" (both servers).
+pub(crate) fn set_operation_scans(stmt: &sqlparser::ast::Statement) -> bool {
+    use sqlparser::ast::{SetExpr, SetOperator, Statement};
+    fn intersects(e: &SetExpr) -> bool {
+        match e {
+            SetExpr::SetOperation {
+                left, op, right, ..
+            } => !matches!(op, SetOperator::Union) || intersects(left) || intersects(right),
+            SetExpr::Query(q) => intersects(&q.body),
+            _ => false,
+        }
+    }
+    let Statement::Query(q) = stmt else {
+        return false;
+    };
+    if !matches!(&*q.body, SetExpr::SetOperation { .. }) {
+        return false;
+    }
+    set_operation(stmt).unwrap_or(false) || intersects(&q.body) || q.order_by.is_some()
+}
+
+/// Per result column of `stmt` (`n` of them): when it is a column of a
+/// derived table that is a set operation or a table value constructor
+/// (`SELECT v.t FROM a JOIN (SELECT ... UNION ...) v`), that table's alias
+/// and whether the operation removes duplicates. Such columns are
+/// described as the set operation's own, with the derived table's name.
+fn derived_set_columns(stmt: &sqlparser::ast::Statement, n: usize) -> Vec<Option<(String, bool)>> {
+    use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement, TableFactor};
+    let none = vec![None; n];
+    let Statement::Query(q) = stmt else {
+        return none;
+    };
+    let SetExpr::Select(s) = &*q.body else {
+        return none;
+    };
+    let mut factors = 0usize;
+    let mut derived: Vec<(String, bool)> = Vec::new();
+    for twj in &s.from {
+        for f in std::iter::once(&twj.relation).chain(twj.joins.iter().map(|j| &j.relation)) {
+            factors += 1;
+            if let TableFactor::Derived {
+                subquery,
+                alias: Some(alias),
+                ..
+            } = f
+                && let Some(dedup) = set_operation(&Statement::Query(subquery.clone()))
+            {
+                derived.push((alias.name.value.clone(), dedup));
+            }
+        }
+    }
+    if derived.is_empty() {
+        return none;
+    }
+    let only = (factors == 1).then(|| derived[0].clone());
+    let all_stars = s.projection.iter().all(|i| {
+        matches!(
+            i,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+        )
+    });
+    if all_stars {
+        return vec![only; n];
+    }
+    if s.projection.len() != n
+        || s.projection.iter().any(|i| {
+            matches!(
+                i,
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+            )
+        })
+    {
+        return none;
+    }
+    s.projection
+        .iter()
+        .map(|i| {
+            let (SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. }) = i else {
+                return None;
+            };
+            match e {
+                Expr::Identifier(_) => only.clone(),
+                Expr::CompoundIdentifier(p) if p.len() == 2 => derived
+                    .iter()
+                    .find(|(a, _)| a.eq_ignore_ascii_case(&p[0].value))
+                    .cloned(),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// A set operation's result column as the servers describe it: the
+/// column of the temporary table they gather the rows in (its name the
+/// column's original name too). A number isn't
+/// marked binary; a string has no decimals; MariaDB marks every column a
+/// key part when the operation removes duplicates (its table's key).
+fn set_result_def(d: &mut ColumnDef, ty: &ExprType, dedup: bool, results: Results) {
+    // The temporary table's column is named as the result's.
+    d.org_name = d.name.clone();
+    if ty.kind == Kind::Str {
+        d.decimals = 0;
+    } else {
+        d.flags &= !ColumnFlags::BINARY.bits();
+    }
+    if dedup && !results.mysql {
+        // PART_KEY_FLAG.
+        d.flags |= 1 << 14;
+    }
+}
+
 /// The columns of `g`'s result as the planner typed them (`cols`), for
 /// the session's results character set.
 pub(crate) fn layout(g: &General, cols: &[sprig_plan::Column], results: Results) -> Layout {
@@ -142,6 +292,19 @@ pub(crate) fn layout(g: &General, cols: &[sprig_plan::Column], results: Results)
                         .eq_ignore_ascii_case(&c.name)
             })
         });
+    // MySQL describes a lone `VALUES` as plain values (no temporary table).
+    let lone_values = results.mysql
+        && matches!(&g.stmt, sqlparser::ast::Statement::Query(q)
+            if matches!(&*q.body, sqlparser::ast::SetExpr::Values(_)));
+    // MariaDB streams a UNION ALL it doesn't order: its columns are the
+    // first branch's, merged, with no temporary table to describe.
+    let streamed = !results.mysql && !set_operation_scans(&g.stmt);
+    let setop = set_operation(&g.stmt).filter(|_| !lone_values && !streamed);
+    let derived = if setop.is_none() {
+        derived_set_columns(&g.stmt, cols.len())
+    } else {
+        vec![None; cols.len()]
+    };
     let mut shapes = Vec::with_capacity(cols.len());
     let mut defs = Vec::with_capacity(cols.len());
     for (i, c) in cols.iter().enumerate() {
@@ -174,7 +337,14 @@ pub(crate) fn layout(g: &General, cols: &[sprig_plan::Column], results: Results)
             } else {
                 None
             };
-            defs.push(value_def(name.unwrap_or(&c.name), &c.ty, results));
+            let mut d = value_def(name.unwrap_or(&c.name), &c.ty, results);
+            if let Some(dedup) = setop {
+                set_result_def(&mut d, &c.ty, dedup, results);
+            } else if let Some((alias, dedup)) = &derived[i] {
+                set_result_def(&mut d, &c.ty, *dedup, results);
+                d.table = Bytes::from(alias.clone());
+            }
+            defs.push(d);
             shapes.push(Shape::Value(c.ty));
         }
     }

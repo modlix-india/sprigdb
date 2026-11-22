@@ -16,10 +16,12 @@ mysql_async.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+sprig-api.workspace = true
 sprig-common.workspace = true
 sprig-meta.workspace = true
 sprig-settings.workspace = true
 tokio.workspace = true
+tonic = { workspace = true, features = ["codegen", "channel", "tls-ring"] }
 tracing.workspace = true
 uuid.workspace = true
 

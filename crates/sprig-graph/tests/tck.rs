@@ -16,6 +16,8 @@
 //! the executor and is skipped). Scenarios needing procedures, the binary
 //! or features the runner doesn't model are counted as skipped, with the
 //! reason. `SPRIG_TCK_REPORT` writes every failure to a file.
+//! `SPRIG_TCK_ENGINE` runs it on the storage engine's store instead of
+//! the in-memory one.
 
 #![allow(
     clippy::too_many_lines,
@@ -35,6 +37,25 @@ use sprig_graph::mem::MemStore;
 use sprig_graph::store::GraphStore;
 use sprig_graph::value::Value;
 use sprig_graph::{Budgets, Output, execute};
+
+/// The graph catalog's records for these tests (in memory: the graph
+/// module's rows live in the engine's catalog records).
+fn catalog_records() -> &'static sprig_catalog::records::mem::MemRecords {
+    static M: std::sync::OnceLock<sprig_catalog::records::mem::MemRecords> =
+        std::sync::OnceLock::new();
+    M.get_or_init(sprig_catalog::records::mem::MemRecords::new)
+}
+
+/// Adds a native label or type to graph `g` in a transaction of its own.
+async fn add_source(g: u64, label: bool, name: &str) -> sprig_common::Result<u32> {
+    use sprig_catalog::records::RecordStore as _;
+    let mut tx = catalog_records()
+        .begin(sprig_common::ids::TenantId(1))
+        .await?;
+    let id = sprig_graph::catalog::GraphCatalog::add_source(&mut *tx, g, label, name).await?;
+    tx.commit().await?;
+    Ok(id)
+}
 
 /// The TCK over typed tables in MariaDB (`SPRIG_TCK_TYPED` set, with
 /// `SPRIG_TEST_MARIADB_SINGLE`): each scenario a graph of its own over
@@ -61,7 +82,6 @@ mod typed_env {
 
     struct Dict {
         g: u64,
-        pool: mysql_async::Pool,
         labels: Mutex<BTreeMap<u32, String>>,
         types: Mutex<BTreeMap<u32, String>>,
     }
@@ -69,10 +89,7 @@ mod typed_env {
     #[async_trait]
     impl Dictionary for Dict {
         async fn create(&self, label: bool, name: &str) -> Result<u32> {
-            let mut c = self.pool.get_conn().await.map_err(backend_error)?;
-            let id = GraphCatalog::new(CAT)
-                .add_source(&mut c, self.g, label, name)
-                .await?;
+            let id = super::add_source(self.g, label, name).await?;
             let m = if label { &self.labels } else { &self.types };
             m.lock().expect("lock").insert(id, name.to_owned());
             Ok(id)
@@ -122,7 +139,7 @@ mod typed_env {
                 .ok()?;
             c.query_drop(format!("CREATE DATABASE {s}")).await.ok()?;
         }
-        GraphCatalog::new(CAT).migrate(&mut c).await.ok()?;
+        GraphCatalog::migrate(&mut c, CAT).await.ok()?;
         drop(c);
         Some(pool)
     }
@@ -131,7 +148,6 @@ mod typed_env {
         pub(crate) async fn new(pool: &mysql_async::Pool) -> Result<Self> {
             let g = NEXT.fetch_add(1, Ordering::Relaxed);
             let mut c = pool.get_conn().await.map_err(backend_error)?;
-            GraphCatalog::new(CAT).insert_native(&mut c, g, 1).await?;
             let mut layout = GraphShards::single(g, 1, &data(1), "c1");
             layout.group = 7;
             layout.mirrors = true;
@@ -168,7 +184,6 @@ mod typed_env {
                 g,
                 dict: Arc::new(Dict {
                     g,
-                    pool: pool.clone(),
                     labels: Mutex::new(BTreeMap::new()),
                     types: Mutex::new(BTreeMap::new()),
                 }),
@@ -263,6 +278,19 @@ mod typed_env {
 enum Store {
     Mem(MemStore),
     Typed(typed_env::Env),
+    /// The storage engine's store (`SPRIG_TCK_ENGINE` set), on an
+    /// in-memory engine path, one transaction per scenario.
+    Engine(Box<sprig_graph::engine::EngineStore<'static>>),
+}
+
+/// A fresh graph on an in-memory engine path.
+fn engine_store(shards: usize) -> Store {
+    let path = sprig_engine::txn::testing::MemPath::start(
+        sprig_engine::txn::UnitConfig::default(),
+        std::time::Duration::ZERO,
+    );
+    let g = sprig_graph::engine::EngineGraph::open(path, 1, 1, shards).expect("engine graph");
+    Store::Engine(Box::new(sprig_graph::engine::EngineStore::standalone(&g)))
 }
 
 impl Store {
@@ -270,6 +298,7 @@ impl Store {
         match self {
             Self::Mem(m) => execute(m, q, p, &Budgets::default()).await,
             Self::Typed(t) => t.execute(q, p).await,
+            Self::Engine(e) => execute(&mut **e, q, p, &Budgets::default()).await,
         }
     }
 
@@ -277,6 +306,7 @@ impl Store {
         match self {
             Self::Mem(m) => m.all_labels(),
             Self::Typed(t) => t.labels(),
+            Self::Engine(e) => e.all_labels(),
         }
     }
 }
@@ -920,6 +950,7 @@ async fn run(s: &Scenario, shards: usize, typed: Option<&mysql_async::Pool>) -> 
             Ok(e) => Store::Typed(e),
             Err(e) => return Outcome::Fail(format!("typed setup: {e}")),
         },
+        None if engine_mode() => engine_store(shards),
         None if shards > 1 => Store::Mem(MemStore::new(shards).with_late_reads()),
         None => Store::Mem(MemStore::new(shards)),
     };
@@ -1057,6 +1088,10 @@ async fn run_on(s: &Scenario, store: &mut Store) -> Outcome {
     Outcome::Pass
 }
 
+fn engine_mode() -> bool {
+    std::env::var("SPRIG_TCK_ENGINE").is_ok_and(|v| !v.is_empty())
+}
+
 fn features(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
@@ -1142,6 +1177,8 @@ async fn opencypher_tck() {
             "openCypher TCK on {shards} shard(s){}: {pass} of {run} run scenarios pass ({:.1}%), {skip} skipped, {} total",
             if typed.is_some() {
                 ", typed tables in MariaDB"
+            } else if engine_mode() {
+                ", the storage engine's store"
             } else {
                 ""
             },

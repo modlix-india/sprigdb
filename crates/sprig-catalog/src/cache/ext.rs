@@ -26,6 +26,7 @@ use mysql_async::Transaction;
 use sprig_common::Result;
 
 use crate::migrate::{Migration, Module};
+use crate::records::RecordTx;
 use crate::store::{Store, Versions};
 use crate::version::VersionKind;
 
@@ -38,11 +39,16 @@ pub trait ExtState: Any + Send + Sync + fmt::Debug {
 }
 
 /// The transaction a snapshot reads in: consistent, read-only, at the
-/// versions the core rows were read at.
+/// versions the core rows were read at. Modules whose rows are engine
+/// records (auth) read them through [`SnapshotTx::records`], a read-only
+/// engine transaction opened in the same load, at the auth version in
+/// [`SnapshotTx::versions`].
 pub struct SnapshotTx<'a> {
     tx: &'a mut Transaction<'static>,
     store: &'a Store,
     versions: Versions,
+    records: Option<&'a mut (dyn RecordTx + 'static)>,
+    rec_log: bool,
 }
 
 impl fmt::Debug for SnapshotTx<'_> {
@@ -59,11 +65,45 @@ impl<'a> SnapshotTx<'a> {
         tx: &'a mut Transaction<'static>,
         store: &'a Store,
         versions: Versions,
+        records: Option<&'a mut (dyn RecordTx + 'static)>,
     ) -> Self {
         Self {
             tx,
             store,
             versions,
+            records,
+            rec_log: false,
+        }
+    }
+
+    /// The same transaction, noting whether the catalog has its record
+    /// log (core format 2): modules on the catalog version keep their rows
+    /// as records only then.
+    #[must_use]
+    pub(crate) fn with_rec_log(mut self, rec_log: bool) -> Self {
+        self.rec_log = rec_log;
+        self
+    }
+
+    /// Whether modules on the catalog version read their rows from
+    /// [`records`](Self::records): the catalog has its record log and this
+    /// process has a record store. Until a catalog is migrated, those
+    /// modules load as empty and migrate before their first change.
+    #[must_use]
+    pub fn catalog_records(&self) -> bool {
+        self.rec_log && self.records.is_some()
+    }
+
+    /// The engine's catalog records, inside the snapshot (read-only).
+    ///
+    /// # Errors
+    /// 39070 when this process's catalog has no record store.
+    pub fn records(&mut self) -> Result<&mut dyn RecordTx> {
+        match self.records.as_deref_mut() {
+            Some(r) => Ok(r),
+            None => Err(crate::records::unavailable(
+                "this process has no engine catalog records",
+            )),
         }
     }
 

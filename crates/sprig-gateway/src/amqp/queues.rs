@@ -82,7 +82,69 @@ impl std::fmt::Debug for GatewayMq {
     }
 }
 
+/// The variable naming whole tenants whose queue messages are on the
+/// engine (`all`, or tenant ids separated by commas).
+pub const ENGINE_TENANTS_VAR: &str = "SPRIGDB_ENGINE_QUEUES_TENANTS";
+
+fn engine_tenants() -> &'static crate::kafka::engine::Tenants {
+    static T: std::sync::OnceLock<crate::kafka::engine::Tenants> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        std::env::var(ENGINE_TENANTS_VAR)
+            .ok()
+            .and_then(|v| crate::kafka::engine::Tenants::parse(&v))
+            .unwrap_or_else(|| {
+                crate::kafka::engine::Tenants::Only(std::collections::BTreeSet::new())
+            })
+    })
+}
+
+/// Whether the node puts every queue message of `tenant` on the engine.
+pub(crate) fn messages_on_engine(tenant: u64) -> bool {
+    tenant != 0 && engine_tenants().has(tenant)
+}
+
+/// The node's engine-stored queue messages, opened on first use; `None`
+/// when the engine failed to open.
+pub(crate) fn engine_queues() -> Option<Arc<sprig_queues::enginestore::EngineQueues>> {
+    static Q: std::sync::OnceLock<Option<Arc<sprig_queues::enginestore::EngineQueues>>> =
+        std::sync::OnceLock::new();
+    Q.get_or_init(|| match crate::node_engine::engine() {
+        Ok(e) => {
+            tracing::info!("queue messages on the storage engine");
+            Some(Arc::new(sprig_queues::enginestore::EngineQueues::new(
+                e,
+                sprig_engine::Durability::Local,
+            )))
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "queue messages on the storage engine not started");
+            None
+        }
+    })
+    .clone()
+}
+
 impl GatewayMq {
+    /// Whether vhost `v`'s messages are stored on the engine: its database
+    /// is an engine database, or its tenant is named in
+    /// `SPRIGDB_ENGINE_QUEUES_TENANTS`.
+    async fn on_engine(&self, v: &VhostRef) -> bool {
+        if v.tenant == 0 {
+            return false;
+        }
+        if engine_tenants().has(v.tenant) {
+            return true;
+        }
+        let cat = match self.svc.cache.cached(TenantId(v.tenant)) {
+            Some(c) => c,
+            None => match self.catalog(v.tenant, Freshness::Latest).await {
+                Ok(c) => c,
+                Err(_) => return false,
+            },
+        };
+        crate::engine::catalog::of(&cat).is_some_and(|eng| eng.dbs.contains(&DbId(v.db_id)))
+    }
+
     /// The catalog side over `svc`.
     #[must_use]
     pub fn new(svc: Arc<TenantServices>, live: LiveSettings) -> Self {
@@ -130,8 +192,8 @@ impl GatewayMq {
         sprig_queues::catalog::migrate(&mut conn, &schema)
             .await
             .map_err(unavailable)?;
-        let secret = MqStore::new(&schema)
-            .token_secret(&mut conn)
+        drop(conn);
+        let secret = MqStore::token_secret(&*self.svc.records, TenantId(tenant))
             .await
             .map_err(unavailable)?;
         lock(&self.keys).insert(tenant, Arc::new(TokenKey::new(&secret)));
@@ -325,11 +387,9 @@ impl MqCatalog for GatewayMq {
             .change(tenant, VersionKind::Catalog)
             .await
             .map_err(unavailable)?;
-        let applied = {
-            let (store, tx) = ch.tx().parts();
-            MqStore::new(store.schema())
-                .apply(tx, v.db_id, &c, new_id)
-                .await
+        let applied = match ch.tx().records().await {
+            Ok(rec) => MqStore::apply(rec, v.db_id, &c, new_id).await,
+            Err(e) => Err(e),
         };
         if let Err(e) = applied {
             let _ = ch.rollback().await;
@@ -347,7 +407,18 @@ impl MqCatalog for GatewayMq {
         Ok(Self::state(&cat).topology(v.db_id, cat.version))
     }
 
+    #[allow(clippy::too_many_lines)] // the MariaDB store's setup, step by step
     async fn store(&self, v: &VhostRef) -> Result<Arc<dyn MsgStore>, MqError> {
+        if self.on_engine(v).await {
+            let q = engine_queues().ok_or_else(|| {
+                MqError::new(
+                    MqCode::OwnerMoved,
+                    "this vhost's messages are stored on the SprigDB engine, which failed to \
+                     start on this node; see the node's log",
+                )
+            })?;
+            return Ok(q.store(v.tenant, v.db_id) as Arc<dyn MsgStore>);
+        }
         {
             let mut stores = self.stores.lock().await;
             match stores.get(&(v.tenant, v.db_id)) {
@@ -516,9 +587,14 @@ impl MqCatalog for GatewayMq {
     }
 
     /// The tenant's cluster's `queue-forwarder-beats/` beat, in its home DC's
-    /// tier, read at most once a second per cluster.
+    /// tier, read at most once a second per cluster. Never for a vhost on
+    /// the engine (no feed forwards its outbox).
     async fn feed_forwarder_runs(&self, v: &VhostRef) -> bool {
         const REREAD: Duration = Duration::from_secs(1);
+        if self.on_engine(v).await {
+            return false;
+        }
+
         let tenant = TenantId(v.tenant);
         let Ok(cluster) = self.svc.locator.cluster(tenant).await else {
             return false;

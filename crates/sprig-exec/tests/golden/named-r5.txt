@@ -4,8 +4,6 @@ M V é
 M T VAR_STRING 4 39 - 224
 Y V é
 Y T VAR_STRING 4 31 - 255
-K M n
-K Y n
 Q HEX(CONVERT('é' USING latin1))
 M V E9
 M T VAR_STRING 8 0 - 224
@@ -17,8 +15,6 @@ M T VAR_STRING 4 39 - 224
 M W W 1977 Cannot convert 'utf8mb4' character 0xE4B8AD to 'latin1'
 Y V ?
 Y T VAR_STRING 4 31 - 255
-K M n
-K Y n
 Q HEX(CONVERT('€' USING latin1))
 M V 80
 M T VAR_STRING 8 0 - 224
@@ -30,15 +26,11 @@ M T VAR_STRING 4 39 - 224
 M W W 1977 Cannot convert 'utf8mb4' character 0xC3A9 to 'ascii'
 Y V ?
 Y T VAR_STRING 4 31 - 255
-K M n
-K Y n
 Q CONVERT(_latin1 0xE9 USING utf8mb4)
 M V é
 M T VAR_STRING 4 39 - 224
 Y V é
 Y T VAR_STRING 4 31 - 255
-K M n
-K Y n
 Q CONVERT(0xE9 USING utf8mb4)
 M V ?
 M T VAR_STRING 4 39 - 224
@@ -46,8 +38,7 @@ M W W 1300 Invalid utf8mb4 character string: '\\xE9'
 Y V NULL
 Y T VAR_STRING 4 31 - 255
 Y W W 1300 Invalid utf8mb4 character string: 'E9'
-K M x n
-K Y n
+K M x
 Q CONVERT(0xFF41 USING utf8mb4)
 M V ?A
 M T VAR_STRING 8 39 - 224
@@ -55,15 +46,12 @@ M W W 1300 Invalid utf8mb4 character string: '\\xFFA'
 Y V NULL
 Y T VAR_STRING 8 31 - 255
 Y W W 1300 Invalid utf8mb4 character string: 'FF41'
-K M x n
-K Y n
+K M x
 Q CONVERT(123 USING latin1)
 M V 123
 M T VAR_STRING 12 39 - 224
 Y V 123
 Y T VAR_STRING 16 31 - 255
-K M n
-K Y n
 Q CONVERT(NULL USING latin1)
 M V NULL
 M T VAR_STRING 0 39 - 224
@@ -84,8 +72,7 @@ M V aé
 M T VAR_STRING 2 39 - 63
 Y V aé
 Y T VAR_STRING 8 31 - 63
-K M n
-K Y l n
+K Y l
 # == An introducer reads the literal's bytes as text of its set: _latin1'é' is two characters
 Q _latin1'é'
 M V Ã©
@@ -261,8 +248,6 @@ M V 0
 M T LONG 1 0 - 63
 Y V 0
 Y T LONGLONG 1 0 - 63
-K M n
-K Y n
 Q STRCMP(LEAST('é', '-', 'abc', '0.0'), `a1`)
 M V -1	-1	-1	-1	1	1	-1	-1	-1	-1	-1	1	NULL	-1	1	-1	-1	-1	-1	-1	1	1	-1	-1
 M T LONG 2 0 - 63

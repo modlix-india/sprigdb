@@ -21,6 +21,18 @@
 //! where the executor knows the statement (its logical text, the tenant's
 //! catalog, its backend connection and rows).
 //!
+//! **Repeated prepared executions.** A session asks the recorder for a
+//! fingerprint's plan at most once per [`PLAN_RECHECK`] while the answer
+//! is "not watched" (a fingerprint that becomes watched is probed from at
+//! most that much later), and it gathers the counts of the engine's
+//! prepared executions ([`Pending::batch`]) per fingerprint, handing them
+//! to the recorder once [`BATCH_MAX_AGE`] has passed, before any statement
+//! that isn't gathered (so the session's own reads of its digests see its
+//! counts), at a reset and when the session ends. A ticker hands over what
+//! an idle session gathered, so the recorder is at most about a second
+//! behind for every session. Gathered executions count in the bucket of
+//! the hand-over.
+//!
 //! Only tenant sessions are captured: accounts-file logins have no
 //! tenant catalog to write to. Statements the gateway answers itself (DDL
 //! through the catalog, settings, local answers) are not fingerprinted
@@ -39,11 +51,11 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use ring::rand::SystemRandom;
 use sprig_catalog::{Namespace, TenantCatalog};
 use sprig_common::ids::{ConnId, DbId, GroupId, ObjectId, TenantId};
-use sprig_common::time::Clock;
+use sprig_common::time::{Clock, poll};
 use sprig_sql::names::{NameMap, Purpose};
 use sprig_workload::fingerprint::{Fingerprint, SqlCtx, SqlFingerprinter};
 use sprig_workload::keyring::TenantKeyring;
-use sprig_workload::recorder::{ExecSummary, ProbePlan, Recorder};
+use sprig_workload::recorder::{Batch, ExecSummary, ProbePlan, Recorder};
 use sprig_workload::samples::{
     CaptureMeta, SampleContext, SampleOutbox, SamplePayload, cap_lists, seal,
 };
@@ -296,7 +308,7 @@ impl GatewayWorkload {
 impl WorkloadHook for GatewayWorkload {
     fn begin(&self, _session: &Session, req: &Request) -> WorkloadToken {
         WorkloadToken {
-            started: Instant::now(),
+            started: poll::now(),
             request: req.name(),
         }
     }
@@ -304,10 +316,7 @@ impl WorkloadHook for GatewayWorkload {
     fn end(&self, _token: WorkloadToken, _outcome: &WorkloadOutcome<'_>) {}
 
     fn capture(&self) -> Option<SessionCapture> {
-        Some(SessionCapture {
-            wl: self.clone(),
-            txn: TxnTracker::new(),
-        })
+        Some(SessionCapture::new(self.clone()))
     }
 }
 
@@ -321,9 +330,20 @@ pub struct Pending {
     /// The router's fan-out: shards visited and whether that was every
     /// shard of the table's group (`None`: one backend, as before).
     fanout: Option<(u32, bool)>,
+    /// Its counts may be gathered with the session's others (see the
+    /// module notes).
+    batch: bool,
 }
 
 impl Pending {
+    /// Lets this statement's counts be gathered with the session's other
+    /// executions (the engine's prepared executions) rather than handed to
+    /// the recorder at once. A probed statement is recorded at once
+    /// whatever this says.
+    pub fn batch(&mut self) {
+        self.batch = true;
+    }
+
     /// Records the router's fan-out for this statement: `shards` visited,
     /// `scatter` when that was every shard of the table's group
     /// (`workload_stats.shards_sum` and `scatter_count`).
@@ -384,12 +404,99 @@ pub struct Done<'a> {
     pub sample: Option<SampleInput<'a>>,
 }
 
+/// How long a session keeps a fingerprint's "not watched" plan.
+pub const PLAN_RECHECK: Duration = Duration::from_secs(1);
+
+/// How long a session gathers executions before handing them over.
+pub const BATCH_MAX_AGE: Duration = Duration::from_secs(1);
+
+/// Fingerprints a session gathers at once; one more hands them over.
+const BATCH_MAX_FPS: usize = 32;
+
+/// Fingerprints whose "not watched" plan a session keeps at once.
+const IDLE_PLANS_MAX: usize = 64;
+
+/// A session's gathered executions, per fingerprint (see the module
+/// notes). Shared with the ticker that hands over an idle session's.
+#[derive(Debug)]
+struct Gathered {
+    recorder: Arc<Recorder>,
+    since: Option<Instant>,
+    fps: Vec<(TenantId, Fingerprint, Batch)>,
+}
+
+impl Gathered {
+    fn hand_over(&mut self) {
+        self.since = None;
+        for (tenant, fp, b) in self.fps.drain(..) {
+            self.recorder.record_batch(tenant, &fp, &b);
+        }
+    }
+}
+
+type SharedGathered = Arc<std::sync::Mutex<Gathered>>;
+
+fn lock_gathered(g: &SharedGathered) -> std::sync::MutexGuard<'_, Gathered> {
+    g.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Every session's gathered executions, for the ticker that hands over
+/// an idle session's; the ticker starts with the first session that
+/// gathers.
+fn register_gathered(g: &SharedGathered) {
+    static ALL: std::sync::Mutex<Vec<std::sync::Weak<std::sync::Mutex<Gathered>>>> =
+        std::sync::Mutex::new(Vec::new());
+    static TICKER: std::sync::Once = std::sync::Once::new();
+    ALL.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(Arc::downgrade(g));
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    TICKER.call_once(|| {
+        tokio::spawn(async {
+            let mut every = tokio::time::interval(BATCH_MAX_AGE);
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                every.tick().await;
+                let alive: Vec<SharedGathered> = {
+                    let mut all = ALL
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    all.retain(|w| w.strong_count() > 0);
+                    all.iter().filter_map(std::sync::Weak::upgrade).collect()
+                };
+                for g in alive {
+                    let mut g = lock_gathered(&g);
+                    if g.since.is_some_and(|t| t.elapsed() >= BATCH_MAX_AGE) {
+                        g.hand_over();
+                    }
+                }
+            }
+        });
+    });
+}
+
 /// One session's capture: the gateway's capture plus the session's open
-/// transaction.
+/// transaction, its kept plans and its gathered executions.
 #[derive(Debug)]
 pub struct SessionCapture {
     wl: GatewayWorkload,
     txn: TxnTracker,
+    /// Fingerprint ids whose plan was "not watched", and until when it is
+    /// kept.
+    idle_plans: Vec<(u64, Instant)>,
+    /// Executions gathered for the recorder; registered with the ticker at
+    /// the first one.
+    gathered: Option<SharedGathered>,
+    /// `session_hash` of the session's connection, once worked out.
+    session: Option<(ConnId, u64)>,
+}
+
+impl Drop for SessionCapture {
+    fn drop(&mut self) {
+        self.hand_over();
+    }
 }
 
 fn is_rollback(fp: &Fingerprint) -> bool {
@@ -398,6 +505,103 @@ fn is_rollback(fp: &Fingerprint) -> bool {
 }
 
 impl SessionCapture {
+    fn new(wl: GatewayWorkload) -> Self {
+        Self {
+            wl,
+            txn: TxnTracker::new(),
+            idle_plans: Vec::new(),
+            gathered: None,
+            session: None,
+        }
+    }
+
+    /// Hands what the session gathered to the recorder.
+    pub fn hand_over(&mut self) {
+        if let Some(g) = &self.gathered {
+            lock_gathered(g).hand_over();
+        }
+    }
+
+    /// The recorder's plan for `fp`, or the "not watched" answer kept from
+    /// less than [`PLAN_RECHECK`] ago.
+    fn plan_for(&mut self, tenant: TenantId, fp: &Fingerprint, now: Instant) -> ProbePlan {
+        let id = fp.id.0;
+        if self
+            .idle_plans
+            .iter()
+            .any(|(i, until)| *i == id && now < *until)
+        {
+            return ProbePlan::default();
+        }
+        if let Some(p) = self.wl.0.recorder.plan_watched(tenant, fp) {
+            self.idle_plans.retain(|(i, _)| *i != id);
+            return p;
+        }
+        let until = now + PLAN_RECHECK;
+        if let Some(e) = self.idle_plans.iter_mut().find(|(i, _)| *i == id) {
+            e.1 = until;
+        } else {
+            if self.idle_plans.len() >= IDLE_PLANS_MAX {
+                self.idle_plans.clear();
+            }
+            self.idle_plans.push((id, until));
+        }
+        ProbePlan::default()
+    }
+
+    /// Counts one execution: gathered when it may be (see the module
+    /// notes), else at once, after what the session gathered.
+    fn count(&mut self, tenant: TenantId, p: &Pending, ex: &ExecSummary, now: Instant) {
+        let recorder = &self.wl.0.recorder;
+        if !p.batch || ex.examined.is_some() {
+            if let Some(g) = &self.gathered {
+                let mut g = lock_gathered(g);
+                if !g.fps.is_empty() {
+                    g.hand_over();
+                }
+            }
+            recorder.record(tenant, &p.fp, ex);
+            return;
+        }
+        let g = self.gathered.get_or_insert_with(|| {
+            let g = Arc::new(std::sync::Mutex::new(Gathered {
+                recorder: Arc::clone(recorder),
+                since: None,
+                fps: Vec::new(),
+            }));
+            register_gathered(&g);
+            g
+        });
+        let mut g = lock_gathered(g);
+        let since = *g.since.get_or_insert(now);
+        if let Some((_, _, b)) = g
+            .fps
+            .iter_mut()
+            .find(|(t, fp, _)| *t == tenant && fp.id == p.fp.id)
+        {
+            b.add(&p.fp, ex);
+        } else {
+            let mut b = Batch::default();
+            b.add(&p.fp, ex);
+            g.fps.push((tenant, p.fp.clone(), b));
+        }
+        if g.fps.len() > BATCH_MAX_FPS || now.saturating_duration_since(since) >= BATCH_MAX_AGE {
+            g.hand_over();
+        }
+    }
+
+    /// `session_hash` of `conn`, worked out once per session.
+    fn session_of(&mut self, conn: ConnId) -> u64 {
+        match self.session {
+            Some((c, h)) if c == conn => h,
+            _ => {
+                let h = self.wl.session_hash(conn);
+                self.session = Some((conn, h));
+                h
+            }
+        }
+    }
+
     /// The gateway's capture.
     #[must_use]
     pub fn workload(&self) -> &GatewayWorkload {
@@ -419,8 +623,9 @@ impl SessionCapture {
     /// A statement is about to run: asks the recorder for a probe plan.
     /// `multi`: it came in a client multi-statement packet (never probed).
     #[must_use]
-    pub fn start(&self, tenant: TenantId, fp: Fingerprint, multi: bool) -> Pending {
-        let mut plan = self.wl.0.recorder.plan(tenant, &fp);
+    pub fn start(&mut self, tenant: TenantId, fp: Fingerprint, multi: bool) -> Pending {
+        let started = poll::start();
+        let mut plan = self.plan_for(tenant, &fp, started);
         if FRONT_RUN.try_with(|r| r.probe).unwrap_or(false) {
             plan.examined = true;
         }
@@ -430,18 +635,20 @@ impl SessionCapture {
         Pending {
             fp,
             plan,
-            started: Instant::now(),
+            started,
             fanout: None,
+            batch: false,
         }
     }
 
     /// The statement ended: records it, follows the transaction, and seals
     /// its sample.
     pub fn finish(&mut self, tenant: TenantId, conn: ConnId, p: &Pending, done: Done<'_>) {
-        let w = &self.wl.0;
-        let latency = p.started.elapsed();
+        // One end reading per statement, shared with the outer layers.
+        let now = poll::end();
+        let latency = now.saturating_duration_since(p.started);
         let latency_us = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
-        let session = self.wl.session_hash(conn);
+        let session = self.session_of(conn);
         let ex = ExecSummary {
             latency_us,
             error: done.error,
@@ -454,7 +661,8 @@ impl SessionCapture {
             examined: done.examined,
             session,
         };
-        w.recorder.record(tenant, &p.fp, &ex);
+        self.count(tenant, p, &ex, now);
+        let w = &self.wl.0;
         if let Some(x) = done.examined {
             let _ = FRONT_RUN.try_with(|r| {
                 r.examined
@@ -465,7 +673,6 @@ impl SessionCapture {
 
         // Transaction footprints, from the
         // backend's transaction state after each statement.
-        let now = Instant::now();
         let was_open = self.txn.is_open();
         if !was_open && done.in_transaction {
             self.txn.begin();
@@ -573,6 +780,7 @@ impl SessionCapture {
 
     /// The session ended or reset: an open transaction records nothing.
     pub fn reset(&mut self) {
+        self.hand_over();
         self.txn.rollback();
     }
 }
@@ -786,11 +994,9 @@ pub fn start(
         Arc::clone(&clock),
         capture,
     );
-    let locator: Arc<dyn sprig_catalog::CatalogLocator> = tenants.locator.clone();
-    let target = Arc::new(sprig_workload::flush::CatalogTarget::new(
-        locator,
-        format!("gateway:{}", config.node.id()),
-    ));
+    let target = Arc::new(sprig_workload::flush::CatalogTarget::new(Arc::clone(
+        &tenants.records,
+    )));
     let flive = live.clone();
     let fdc = dc.clone();
     let settings = Arc::new(move || sprig_workload::flush::FlushSettings {

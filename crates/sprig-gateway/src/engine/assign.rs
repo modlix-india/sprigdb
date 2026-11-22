@@ -59,6 +59,8 @@ pub(crate) struct Env {
     /// The session's time zone as seconds east of UTC; `None`: a named
     /// zone, which the engine can't apply yet.
     pub tz: Option<i32>,
+    /// `foreign_key_checks = 0`: foreign keys are not checked.
+    pub no_fk_checks: bool,
 }
 
 impl Env {
@@ -73,6 +75,7 @@ impl Env {
         round_fraction: false,
         no_auto_value_on_zero: false,
         tz: Some(0),
+        no_fk_checks: false,
     };
 
     /// The session's rules from its `sql_mode` (as the backend spells it;
@@ -89,6 +92,7 @@ impl Env {
             round_fraction: mysql,
             no_auto_value_on_zero: false,
             tz: time_zone.map_or(Some(0), zone_offset),
+            no_fk_checks: false,
         };
         if let Some(m) = sql_mode {
             let has = |f: &str| m.split(',').any(|x| x.trim().eq_ignore_ascii_case(f));

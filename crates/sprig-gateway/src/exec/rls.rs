@@ -437,6 +437,51 @@ impl PassSession {
             .ok_or_else(|| SprigError::internal("no user"))?;
         let tenant = ts.tenant;
         let svc = Arc::clone(ts.services());
+        // A table of the storage engine has no MariaDB table to put views
+        // and triggers on: the engine checks `WITH CHECK` itself on every
+        // write (the session's policies come with the statement), and reads
+        // are filtered by the rewrite. Only its invisible columns and the
+        // version the checks are current for are recorded.
+        if let Some(text) = crate::engine::catalog::of(&cat)
+            .filter(|e| e.tables.contains_key(&object))
+            .map(|e| e.texts.get(&object).map(ToString::to_string))
+        {
+            let hidden: Vec<String> = text
+                .and_then(|t| crate::engine::define::parse_stored(&t).ok())
+                .map(|d| {
+                    d.cols
+                        .iter()
+                        .filter(|c| c.invisible)
+                        .map(|c| c.name.to_lowercase())
+                        .collect()
+                })
+                .unwrap_or_default();
+            crate::tenant::rls::hidden_set(tenant.0, object.0, hidden);
+            let mut change = svc
+                .auth
+                .change_with(tenant, VersionKind::Auth, ChangeOpts::default())
+                .await?;
+            let r = {
+                let q = change.tx().records();
+                RlsStore::new()
+                    .checks_deployed(q, object, sec.changed_version)
+                    .await
+            };
+            return match r {
+                Ok(()) => {
+                    let v = change.commit().await?;
+                    if let Some(ts) = self.tenant.as_deref_mut() {
+                        crate::tenant::rls::await_auth(ts, v).await;
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = change.rollback().await;
+                    let _ = svc.auth.settle(tenant, VersionKind::Auth).await;
+                    Err(e)
+                }
+            };
+        }
         // An inheritable table's rows are layer rows: overrides and hide
         // markers are checked as updates and deletes.
         let layered = cat
@@ -678,12 +723,12 @@ impl PassSession {
         );
         // Record the deployed version (another auth change).
         let mut change = svc
-            .catalog
+            .auth
             .change_with(tenant, VersionKind::Auth, ChangeOpts::default())
             .await?;
         let r = {
-            let (core, q) = change.tx().parts();
-            RlsStore::new(core.schema())
+            let q = change.tx().records();
+            RlsStore::new()
                 .checks_deployed(q, object, sec.changed_version)
                 .await
         };
@@ -697,7 +742,7 @@ impl PassSession {
             }
             Err(e) => {
                 let _ = change.rollback().await;
-                let _ = svc.catalog.settle(tenant, VersionKind::Auth).await;
+                let _ = svc.auth.settle(tenant, VersionKind::Auth).await;
                 Err(e)
             }
         }
@@ -720,6 +765,11 @@ impl PassSession {
         let Some(sec) = RlsState::of(&cat).and_then(|s| s.security(object).copied()) else {
             return Ok(());
         };
+        // An engine table: nothing in MariaDB to verify (see
+        // `deploy_checks`).
+        if crate::engine::catalog::of(&cat).is_some_and(|e| e.tables.contains_key(&object)) {
+            return Ok(());
+        }
         let (Some(obj), Some(db)) = (
             cat.objects.get(object).cloned(),
             cat.objects

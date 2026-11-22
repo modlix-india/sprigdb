@@ -21,6 +21,25 @@ struct From {
     star: Vec<StarCol>,
     filters: Vec<Expr>,
     next_slot: usize,
+    /// Inner joins' `ON` conditions that hold a subquery: resolved with
+    /// the block's `WHERE` (an inner join's `ON` filters the same rows),
+    /// where a scalar subquery may read the row it is computed for.
+    deferred_on: Vec<ast::Expr>,
+}
+
+/// Whether `e` holds a subquery.
+fn has_subquery(e: &ast::Expr) -> bool {
+    let mut found = false;
+    let _ = ast::visit_expressions(e, |x: &ast::Expr| {
+        if matches!(
+            x,
+            ast::Expr::Subquery(_) | ast::Expr::Exists { .. } | ast::Expr::InSubquery { .. }
+        ) {
+            found = true;
+        }
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    found
 }
 
 fn nullable_cols(rel: &mut Rel) {
@@ -308,6 +327,14 @@ impl Cx<'_> {
         tables: &[ast::TableWithJoins],
         outer: Option<&Scope<'_>>,
     ) -> Result<From> {
+        let flat;
+        let tables = match flatten_nested(tables) {
+            Some(f) => {
+                flat = f;
+                flat.as_slice()
+            }
+            None => tables,
+        };
         let maria = self.session.persona.is_maria();
         let mut from = From::default();
         for twj in tables {
@@ -352,6 +379,10 @@ impl Cx<'_> {
                 let mut conds = Vec::new();
                 match constraint {
                     ast::JoinConstraint::None => chain.extend(right_cols),
+                    ast::JoinConstraint::On(e) if !left && !right && has_subquery(e) => {
+                        chain.extend(right_cols);
+                        from.deferred_on.push(e.clone());
+                    }
                     ast::JoinConstraint::On(e) => {
                         chain.extend(right_cols);
                         let scope = Scope {
@@ -625,6 +656,7 @@ impl Cx<'_> {
             rels,
             star,
             mut filters,
+            deferred_on,
             ..
         } = self.from_clause(&select.from, outer)?;
         let mut semis = Vec::new();
@@ -680,6 +712,23 @@ impl Cx<'_> {
                 }
             }
         }
+        // Inner joins' ON conditions with a subquery (see `From`).
+        for on in &deferred_on {
+            let scope = Scope {
+                rels: &rels,
+                star: &star,
+                visible: 0..rels.len(),
+                outer,
+            };
+            let before = self.outer_refs;
+            let mut x = ExprCx::new(&scope, Clause::On);
+            x.applies = Some(&mut applies);
+            let e = self.expr(on, &mut x)?;
+            if self.outer_refs != before {
+                return Err(unsupported("a subquery that reads its outer query here"));
+            }
+            exprs::conjuncts(e, &mut filters);
+        }
         let refs_before = self.outer_refs;
         let scope = Scope {
             rels: &rels,
@@ -698,7 +747,7 @@ impl Cx<'_> {
                         return Err(SqlError::new(1096, "HY000", "No tables used"));
                     }
                     for sc in &star {
-                        if rels[sc.rel].hidden {
+                        if rels[sc.rel].hidden || invisible(&rels[sc.rel], sc.col) {
                             continue;
                         }
                         let c = &rels[sc.rel].cols[sc.col];
@@ -727,7 +776,10 @@ impl Cx<'_> {
                             };
                             SqlError::new(1051, "42S02", format!("Unknown table '{shown}'"))
                         })?;
-                    for c in &rel.cols {
+                    for (ci, c) in rel.cols.iter().enumerate() {
+                        if invisible(rel, ci) {
+                            continue;
+                        }
                         items.push(Item {
                             name: c.name.clone(),
                             expr: c.expr.clone(),
@@ -920,4 +972,121 @@ impl Cx<'_> {
             correlated,
         })
     }
+}
+
+/// Whether column `col` of `rel` is a table's invisible column, which `*`
+/// leaves out (it is still found by name).
+fn invisible(rel: &Rel, col: usize) -> bool {
+    if let RelKind::Table(t) = &rel.kind {
+        t.columns.get(col).is_some_and(|c| c.invisible)
+    } else {
+        false
+    }
+}
+
+/// Whether `op` is an inner join (`JOIN`, `INNER JOIN`, `CROSS JOIN`).
+fn inner_join(op: &ast::JoinOperator) -> bool {
+    use ast::JoinOperator as J;
+    matches!(op, J::Join(_) | J::Inner(_) | J::CrossJoin(_))
+}
+
+/// `FROM` items with parenthesized inner joins written out flat: `(a JOIN
+/// b ON x) LEFT JOIN c ON y` is `a JOIN b ON x LEFT JOIN c ON y` (the
+/// parenthesized joins come first anyway); when every join involved is an
+/// inner join, `a JOIN (b JOIN c ON x) ON y` is
+/// `a CROSS JOIN b JOIN c ON (x) AND (y)` (the same rows: every condition
+/// of inner joins is a condition on their product). `None` when there is
+/// no such nesting.
+fn flatten_nested(tables: &[ast::TableWithJoins]) -> Option<Vec<ast::TableWithJoins>> {
+    use ast::{JoinConstraint, JoinOperator as J, TableFactor};
+    let nested = |f: &TableFactor| match f {
+        TableFactor::NestedJoin {
+            table_with_joins,
+            alias: None,
+        } if table_with_joins
+            .joins
+            .iter()
+            .all(|j| inner_join(&j.join_operator)) =>
+        {
+            Some((**table_with_joins).clone())
+        }
+        _ => None,
+    };
+    // The first item of a join chain may hold any joins: joins associate
+    // to the left, so `(a LEFT JOIN b ON x) JOIN c ON y` is
+    // `a LEFT JOIN b ON x JOIN c ON y` as written.
+    let first_nested = |f: &TableFactor| match f {
+        TableFactor::NestedJoin {
+            table_with_joins,
+            alias: None,
+        } => Some((**table_with_joins).clone()),
+        _ => None,
+    };
+    let mut changed = false;
+    let mut out = Vec::with_capacity(tables.len());
+    for twj in tables {
+        let all_inner = twj.joins.iter().all(|j| inner_join(&j.join_operator));
+        let mut cur = twj.clone();
+        // The first item: whatever joins follow, its joins come first
+        // (left to right), so they can be written out flat.
+        while let Some(inner) = first_nested(&cur.relation) {
+            let mut joins = inner.joins;
+            joins.extend(cur.joins);
+            cur = ast::TableWithJoins {
+                relation: inner.relation,
+                joins,
+            };
+            changed = true;
+        }
+        if all_inner {
+            let mut joins = Vec::with_capacity(cur.joins.len());
+            for j in cur.joins {
+                match nested(&j.relation) {
+                    Some(inner) => {
+                        let on = match &j.join_operator {
+                            J::Join(JoinConstraint::On(e)) | J::Inner(JoinConstraint::On(e)) => {
+                                Some(e.clone())
+                            }
+                            J::Join(JoinConstraint::None)
+                            | J::Inner(JoinConstraint::None)
+                            | J::CrossJoin(JoinConstraint::None) => None,
+                            _ => {
+                                joins.push(j);
+                                continue;
+                            }
+                        };
+                        changed = true;
+                        let mut inner_joins = vec![ast::Join {
+                            relation: inner.relation,
+                            global: false,
+                            join_operator: J::CrossJoin(JoinConstraint::None),
+                        }];
+                        inner_joins.extend(inner.joins);
+                        let n = inner_joins.len();
+                        for (k, mut ij) in inner_joins.into_iter().enumerate() {
+                            if k + 1 == n
+                                && let Some(e) = &on
+                            {
+                                let cond = match &ij.join_operator {
+                                    J::Join(JoinConstraint::On(x))
+                                    | J::Inner(JoinConstraint::On(x)) => ast::Expr::BinaryOp {
+                                        left: Box::new(ast::Expr::Nested(Box::new(x.clone()))),
+                                        op: ast::BinaryOperator::And,
+                                        right: Box::new(ast::Expr::Nested(Box::new(e.clone()))),
+                                    },
+                                    _ => e.clone(),
+                                };
+                                ij.join_operator = J::Join(JoinConstraint::On(cond));
+                            }
+                            joins.push(ij);
+                        }
+                    }
+                    None => joins.push(j),
+                }
+            }
+            cur.joins = joins;
+        }
+        out.push(cur);
+    }
+    changed.then_some(out)
 }

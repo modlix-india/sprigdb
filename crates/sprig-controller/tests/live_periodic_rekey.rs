@@ -42,6 +42,7 @@ use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, Value};
 use sprig_balancer::decisions::{DecisionLog, DecisionStore, NewDecision, Outcome};
 use sprig_catalog::placement::ShardMap as TenantMap;
+use sprig_catalog::records::RecordStore as _;
 use sprig_cluster::TopologyKind;
 use sprig_common::ids::{ClusterId, DbId, DcId, GroupId, NodeId, ObjectId, ShardId, TenantId};
 use sprig_common::names::SchemaName;
@@ -113,13 +114,15 @@ struct CatalogLog(Pool);
 #[async_trait::async_trait]
 impl DecisionLog for CatalogLog {
     async fn record(&self, tenant: TenantId, d: &NewDecision) -> SResult<u64> {
-        let mut c = self
-            .0
-            .get_conn()
-            .await
-            .map_err(|e| sprig_common::SprigError::internal(e.to_string()))?;
-        DecisionStore::for_tenant(tenant).insert(&mut c, d).await
+        // Decisions are the engine's catalog records now; this test keeps
+        // them in memory.
+        let _ = &self.0;
+        let mut tx = decision_records().begin(tenant).await?;
+        let id = DecisionStore::insert(&mut *tx, d).await?;
+        tx.commit().await?;
+        Ok(id)
     }
+
     async fn update_outcome(
         &self,
         tenant: TenantId,
@@ -127,15 +130,17 @@ impl DecisionLog for CatalogLog {
         o: Outcome,
         at_us: i64,
     ) -> SResult<()> {
-        let mut c = self
-            .0
-            .get_conn()
-            .await
-            .map_err(|e| sprig_common::SprigError::internal(e.to_string()))?;
-        DecisionStore::for_tenant(tenant)
-            .set_outcome(&mut c, id, o, None, at_us)
-            .await
+        let mut tx = decision_records().begin(tenant).await?;
+        DecisionStore::set_outcome(&mut *tx, id, o, None, at_us).await?;
+        tx.commit().await
     }
+}
+
+/// The decision records of this test process.
+fn decision_records() -> &'static sprig_catalog::records::mem::MemRecords {
+    static M: std::sync::OnceLock<sprig_catalog::records::mem::MemRecords> =
+        std::sync::OnceLock::new();
+    M.get_or_init(sprig_catalog::records::mem::MemRecords::new)
 }
 
 struct Factory {
@@ -260,12 +265,17 @@ async fn record(p: &Pool, stmts: &[(&str, u32)]) {
             );
         }
     }
-    let mut c = p.get_conn().await.unwrap();
-    let t = WorkloadTables::for_tenant(TENANT);
-    t.insert_fingerprints(&mut c, &rec.drain_new())
+    // The workload store is the catalog records the controller reads.
+    let _ = p;
+    let records = sprig_controller::catalog_records();
+    let mut tx = records.begin(TENANT).await.unwrap();
+    WorkloadTables::insert_fingerprints(&mut *tx, &rec.drain_new())
         .await
         .unwrap();
-    t.replace_stats(&mut c, 1, &rec.snapshot()).await.unwrap();
+    WorkloadTables::replace_stats(&mut *tx, 1, &rec.snapshot())
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
 }
 
 /// Drops this tenant's schemas (by the exact tenant id) and the private

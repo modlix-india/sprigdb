@@ -14,7 +14,6 @@
 
 #![allow(clippy::cast_precision_loss)] // milliseconds for display
 
-use sprig_catalog::pool_wait::Bounded as _;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -112,13 +111,14 @@ fn round(x: f64) -> f64 {
     (x * 1000.0).round() / 1000.0
 }
 
-/// The tenant's catalog connection and tables.
+/// The tenant's workload records (a transaction on its catalog records)
+/// and catalog.
 async fn tables(
     core: &Arc<Core>,
     caller: &Caller,
 ) -> Result<
     (
-        mysql_async::Conn,
+        Box<dyn sprig_catalog::RecordTx>,
         WorkloadTables,
         Arc<sprig_catalog::TenantCatalog>,
     ),
@@ -127,19 +127,12 @@ async fn tables(
     let (Some(svc), Some(tid)) = (&core.studio.tenants, caller.principal.tenant) else {
         return Err(super::invalid("workload views need a tenant login"));
     };
-    let ep = sprig_catalog::CatalogLocator::writer(&*svc.locator, tid).await?;
-    let conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-        SprigError::new(
-            sprig_common::SprigCode::CatalogUnavailable,
-            "the tenant's catalog is unreachable",
-        )
-        .with_source(e)
-    })?;
+    let conn = svc.records.begin(tid).await?;
     let cat = svc
         .cache
         .cached(tid)
         .ok_or_else(|| super::invalid("the tenant's catalog isn't loaded yet; retry"))?;
-    Ok((conn, WorkloadTables::new(ep.store.schema()), cat))
+    Ok((conn, WorkloadTables, cat))
 }
 
 /// `Workload.ListFingerprints`.
@@ -154,16 +147,15 @@ pub(super) async fn list(
         .clamp(1, MAX_LIMIT);
     let source = query_str(query, "source").unwrap_or("all");
     let seen = visible(core, caller).await?;
-    let (mut conn, t, cat) = tables(core, caller).await?;
+    let (mut conn, _, cat) = tables(core, caller).await?;
     let to = SystemTime::now() + Duration::from_secs(3600);
     // From the start of the hour: older buckets are rolled up to hours,
     // so a window cut mid-hour would miss them.
     let from_s = secs(SystemTime::now()).saturating_sub(hours * 3600) / 3600 * 3600;
     let from = UNIX_EPOCH + Duration::from_secs(from_s);
-    let window = t.window(&mut conn, cat.tenant, from, to).await?;
+    let window = WorkloadTables::window(&mut *conn, cat.tenant, from, to).await?;
     let ids: Vec<_> = window.iter().map(|w| w.id).collect();
-    let rows: std::collections::HashMap<u64, _> = t
-        .fingerprints(&mut conn, &ids)
+    let rows: std::collections::HashMap<u64, _> = WorkloadTables::fingerprints(&mut *conn, &ids)
         .await?
         .into_iter()
         .map(|r| (r.id.0, r))
@@ -228,10 +220,9 @@ pub(super) async fn series(
         .map_err(|_| super::invalid("a fingerprint id is 16 hex digits"))?;
     let days = query_u64(query, "days", 7).clamp(1, 90);
     let seen = visible(core, caller).await?;
-    let (mut conn, t, cat) = tables(core, caller).await?;
+    let (mut conn, _, cat) = tables(core, caller).await?;
     let fid = sprig_common::ids::Fingerprint(fp);
-    let row = t
-        .fingerprints(&mut conn, &[fid])
+    let row = WorkloadTables::fingerprints(&mut *conn, &[fid])
         .await?
         .into_iter()
         .next()
@@ -254,8 +245,7 @@ pub(super) async fn series(
     }
     let to = secs(SystemTime::now()) + 3600;
     let from = to.saturating_sub(days * 86_400 + 3600) / 3600 * 3600;
-    let buckets: Vec<Value> = t
-        .series(&mut conn, fid, from, to)
+    let buckets: Vec<Value> = WorkloadTables::series(&mut *conn, fid, from, to)
         .await?
         .into_iter()
         .map(|(start, s)| {

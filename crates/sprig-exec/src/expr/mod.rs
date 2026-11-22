@@ -455,6 +455,10 @@ pub(crate) struct Node {
     /// result's bytes above ASCII arrive encoded once more (`RPAD` of a
     /// number). Only the statement's own result shows it.
     pub(crate) latin1_send: bool,
+    /// The expression holds a cast to `CHAR(n)` or `BINARY(n)`, which
+    /// both servers compute again for every row (warnings and all), so it
+    /// is not computed once per statement even when constant.
+    pub(crate) sized: bool,
 }
 
 pub(crate) type F64Fn = Arc<dyn Fn(&mut Ctx<'_>, &[Value]) -> Result<Option<f64>> + Send + Sync>;
@@ -507,6 +511,7 @@ impl Node {
             konst: false,
             alt: None,
             latin1_send: false,
+            sized: false,
         }
     }
 
@@ -523,6 +528,7 @@ impl Node {
             konst: false,
             alt: None,
             latin1_send: false,
+            sized: false,
         }
     }
 
@@ -870,6 +876,39 @@ pub(crate) fn is_const(e: &Expr) -> bool {
     }
 }
 
+/// Whether an expression holds a cast to `CHAR(n)` or `BINARY(n)`.
+fn has_sized_cast(e: &Expr) -> bool {
+    match e {
+        Expr::Cast(_, CastTarget::Char(Some(_)) | CastTarget::Binary(Some(_))) => true,
+        Expr::Neg(a)
+        | Expr::Not(a)
+        | Expr::BitNot(a)
+        | Expr::IsNull(a, _)
+        | Expr::IsTruth(a, _, _)
+        | Expr::Cast(a, _)
+        | Expr::Collate(a, _) => has_sized_cast(a),
+        Expr::Binary(_, a, b) => has_sized_cast(a) || has_sized_cast(b),
+        Expr::In(a, list, _) => has_sized_cast(a) || list.iter().any(has_sized_cast),
+        Expr::Between(a, b, c, _) => has_sized_cast(a) || has_sized_cast(b) || has_sized_cast(c),
+        Expr::Like(a, b, c, _) => {
+            has_sized_cast(a) || has_sized_cast(b) || c.as_ref().is_some_and(|c| has_sized_cast(c))
+        }
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+        } => {
+            operand.as_ref().is_some_and(|o| has_sized_cast(o))
+                || whens
+                    .iter()
+                    .any(|(w, t)| has_sized_cast(w) || has_sized_cast(t))
+                || otherwise.as_ref().is_some_and(|o| has_sized_cast(o))
+        }
+        Expr::Func(_, args) => args.iter().any(has_sized_cast),
+        _ => false,
+    }
+}
+
 /// Compiles one sub-expression. With constant folding on, a constant
 /// sub-expression that isn't a literal is computed once per statement.
 pub(crate) fn build(expr: &Expr, env: Env<'_>) -> Result<Node> {
@@ -896,8 +935,9 @@ pub(crate) fn build(expr: &Expr, env: Env<'_>) -> Result<Node> {
                 _,
                 _
             )
-    );
+    ) || matches!(expr, Expr::Func(f, _) if f == "REGEXP" || f == "REGEXP_LIKE");
     n.konst = is_const(expr);
+    n.sized = has_sized_cast(expr);
     // MySQL settles a constant predicate once per statement that reads
     // tables.
     if n.konst && n.pred {
@@ -962,7 +1002,12 @@ pub(crate) fn convertible(n: &Node, to: Collation, env: Env<'_>) -> bool {
 
 /// [`recode_node`] for the operands of `op` merged under `dtc`, refusing
 /// (error 1267 and its siblings) an operand that cannot be converted.
-pub(crate) fn recode_checked(nodes: Vec<Node>, to: Collation, op: &str, env: Env<'_>) -> Result<Vec<Node>> {
+pub(crate) fn recode_checked(
+    nodes: Vec<Node>,
+    to: Collation,
+    op: &str,
+    env: Env<'_>,
+) -> Result<Vec<Node>> {
     if nodes.iter().any(|n| !convertible(n, to, env)) {
         let dtcs: Vec<crate::types::Dtc> = nodes
             .iter()
@@ -978,7 +1023,13 @@ pub(crate) fn recode_checked(nodes: Vec<Node>, to: Collation, op: &str, env: Env
 /// constant predicates and for the constant operands of comparisons;
 /// MariaDB computes them for every row.
 pub(crate) fn cached(mut n: Node, env: Env<'_>) -> Node {
-    if !env.s.fold_constants || env.maria() || !n.konst || n.lit.is_some() || n.alt.is_some() {
+    if !env.s.fold_constants
+        || env.maria()
+        || !n.konst
+        || n.sized
+        || n.lit.is_some()
+        || n.alt.is_some()
+    {
         return n;
     }
     let id = NEXT_CONST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1255,17 +1306,18 @@ pub(crate) fn charset_name(c: Charset) -> &'static str {
 fn column(c: &ColumnRef, env: Env<'_>) -> Node {
     let ty = ExprType::of_column(&c.ty, c.nullable);
     let slot = c.slot;
-    let offset = i64::from(env.s.time_zone_offset);
     let text = format!("`{}`", c.name);
+    let _ = env;
     match c.ty {
-        ColumnType::Timestamp { .. } => Node::new(ty, text, move |_, row| {
+        ColumnType::Timestamp { .. } => Node::new(ty, text, move |ctx, row| {
             Ok(match row.get(slot) {
                 Some(Value::Timestamp(t)) => {
                     if t.is_zero() {
                         Value::DateTime(DateTime::default())
                     } else {
+                        let secs = i64::from(t.seconds);
                         Value::DateTime(crate::temporal::datetime_from_unix(
-                            i64::from(t.seconds) + offset,
+                            secs + ctx.session.zone_offset_at(secs),
                             t.micros,
                         ))
                     }

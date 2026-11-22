@@ -39,7 +39,7 @@ pub struct MemStore {
 }
 
 /// `j` (an object) with only `keys`.
-fn only(j: &serde_json::Value, keys: &[String]) -> serde_json::Value {
+pub(crate) fn only(j: &serde_json::Value, keys: &[String]) -> serde_json::Value {
     match j {
         serde_json::Value::Object(m) => serde_json::Value::Object(
             m.iter()
@@ -53,7 +53,7 @@ fn only(j: &serde_json::Value, keys: &[String]) -> serde_json::Value {
 
 /// The unique key of `props` (with its `_types`) under `d`: `None` if a
 /// property is missing or of a type the index doesn't hold.
-fn unique_key(
+pub(crate) fn unique_key(
     d: &IndexDef,
     props: &serde_json::Value,
     types: Option<&serde_json::Value>,
@@ -64,7 +64,8 @@ fn unique_key(
         .collect()
 }
 
-fn duplicate(d: &IndexDef, what: &str, id: u64) -> sprig_common::SprigError {
+/// The uniqueness violation `what` (`Node` or `Relationship`) `id` makes.
+pub(crate) fn duplicate(d: &IndexDef, what: &str, id: u64) -> sprig_common::SprigError {
     sprig_common::SprigError::backend(
         1062,
         *b"23000",
@@ -111,7 +112,11 @@ impl MemStore {
         *self.per_shard.entry(shard).or_default() += 1;
     }
 
-    fn json_matches(props: &serde_json::Value, key: &str, vals: &[serde_json::Value]) -> bool {
+    pub(crate) fn json_matches(
+        props: &serde_json::Value,
+        key: &str,
+        vals: &[serde_json::Value],
+    ) -> bool {
         props.get(key).is_some_and(|v| {
             vals.iter().any(|w| match (v.as_f64(), w.as_f64()) {
                 (Some(a), Some(b)) => (a - b).abs() < f64::EPSILON,

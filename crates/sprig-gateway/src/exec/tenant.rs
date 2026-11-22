@@ -100,32 +100,6 @@ fn ddl_unsupported() -> SprigError {
     )
 }
 
-/// The `SHOW WARNINGS` columns.
-fn warning_columns(charset: u16) -> Vec<ColumnDef> {
-    vec![
-        crate::pipeline::text_column("Level", charset),
-        crate::pipeline::int_column("Code", true),
-        crate::pipeline::text_column("Message", charset),
-    ]
-}
-
-fn warnings_answer(w: &[LocalWarning], charset: u16, errors_only: bool) -> LocalAnswer {
-    LocalAnswer {
-        columns: warning_columns(charset),
-        rows: w
-            .iter()
-            .filter(|w| !errors_only || w.level == "Error")
-            .map(|w| {
-                vec![
-                    Some(Bytes::from_static(w.level.as_bytes())),
-                    Some(Bytes::from(w.code.to_string())),
-                    Some(Bytes::from(w.message.clone())),
-                ]
-            })
-            .collect(),
-    }
-}
-
 /// A text row as binary values for `columns` (a local answer to a
 /// prepared statement).
 fn binary_row(columns: &[ColumnDef], row: &[Option<Bytes>]) -> Vec<Value> {
@@ -480,7 +454,14 @@ impl PassSession {
         attrs: &QueryAttrs,
         out: &mut dyn ResultSink,
     ) -> Result<ExecSummary> {
-        let mut pieces = split::split(&sql);
+        // A plain statement on one table (`sprig_sql::compat::fastpath`):
+        // one statement, its target known, read once.
+        let fast = self.fast_classify(&sql);
+        let mut pieces = if fast.is_some() {
+            vec![sql.clone()]
+        } else {
+            split::split(&sql)
+        };
         if pieces.len() > 1 && !cx.proto.multi_statements {
             let second = pieces[1].as_ptr() as usize - sql.as_ptr() as usize;
             return Err(multi_statements_off(
@@ -496,11 +477,15 @@ impl PassSession {
         self.wl_multi = n > 1;
         for (i, piece) in pieces.into_iter().enumerate() {
             // 3306: MySQL's `'table.key'` in 1062.
-            let dup_table = if self.persona == Persona::MySql84 {
-                sprig_sql::compat::errmap::dup_key_table(&piece, &self.lex_opts().0)
-            } else {
+            let dup_table = if self.persona != Persona::MySql84 {
                 None
+            } else if let Some(f) = &fast {
+                f.dup_key_table().map(str::to_owned)
+            } else {
+                sprig_sql::compat::errmap::dup_key_table(&piece, &self.lex_opts().0)
             };
+            self.fast_hint(fast.clone());
+            self.eng.dup_table.clone_from(&dup_table);
             let step = match dup_table.as_deref() {
                 Some(table) => {
                     let mut wrapped = super::compat_sink::DupKeySink::new(&mut *out, table);
@@ -587,7 +572,9 @@ impl PassSession {
         // Any text statement may change a session variable or the current
         // database: the engine path reads them again.
         self.eng.stale();
+        let saved = self.fast_enter();
         let r = Box::pin(self.tenant_text_one(cx, text, attrs, more, format, out)).await;
+        self.fast_leave(saved);
         if client {
             self.release_hier_locks().await;
         }
@@ -620,6 +607,16 @@ impl PassSession {
         // Row-level security: no earlier statement's rewrite covers this one.
         if let Some(ts) = self.tenant.as_deref_mut() {
             ts.rls.covered.clear();
+        }
+        // A plain statement on an engine table of a shape seen to pass
+        // every step below unchanged: straight to the engine
+        // (exec/engine_seam/fast.rs).
+        let entry = text.clone();
+        self.eng.entry = Some(entry.clone());
+        if let Some(f) = self.fast_take()
+            && let Some(step) = Box::pin(self.engine_fast(cx, text, &f, more, format, out)).await?
+        {
+            return Ok(step);
         }
         // `ALTER TABLE ... ADD c TYPE AS (f(...))` with a logic function `f`
         // becomes a generated column.
@@ -702,7 +699,8 @@ impl PassSession {
             return Box::pin(self.tenant_logic_dependents(cx, d, more, format, out)).await;
         }
         let charset = cx.proto.collation;
-        let previous_warnings = self.tenant.as_deref_mut().and_then(|ts| ts.warnings.take());
+        // The diagnostics area the previous statement left (`diag`).
+        let previous_warnings = self.diag_begin();
         let Some(ts) = self.tenant.as_deref_mut() else {
             return Err(SprigError::internal("a tenant statement without a tenant"));
         };
@@ -752,7 +750,7 @@ impl PassSession {
             let audit = sprig_auth::audit::LogAudit::default();
             let ctx = sprig_auth::policy::PasswordCtx {
                 tenant_name: tenant_name.as_deref(),
-                cat: &svc.catalog,
+                cat: &svc.auth,
                 catalog: &catalog,
                 policy: &policy,
                 audit: &audit,
@@ -1704,24 +1702,18 @@ impl PassSession {
         if sandbox && sp.info.kind != StmtKind::Set {
             return self.fail(out, &must_reset()).await;
         }
-        // SHOW WARNINGS right after a statement the gateway answered.
-        if let (Some(w), Some(show)) = (&previous_warnings, &sp.show)
-            && matches!(show.kind, ShowKind::Warnings | ShowKind::Errors)
-        {
-            let ans = warnings_answer(w, charset, show.kind == ShowKind::Errors);
-            if let Some(ts) = self.tenant.as_deref_mut() {
-                ts.warnings.clone_from(&previous_warnings);
-            }
-            let s = status(self.status());
-            send_local(out, &ans, format, s).await?;
-            return Ok(Step {
-                errored: false,
-                status: Some(s),
-            });
-        }
         let original = text
             .get(sp.info.range.clone())
             .map_or_else(|| text.to_vec(), <[u8]>::to_vec);
+        // The diagnostics area: SHOW WARNINGS / ERRORS and the counts are
+        // answered from the gateway's when it holds it (the statement
+        // that left it ran here), and leave it as it was.
+        if let Some(step) =
+            Box::pin(self.diag_statement(cx, &sp, &original, previous_warnings, more, format, out))
+                .await?
+        {
+            return Ok(step);
+        }
         let is_call = sp.info.kind == StmtKind::Call;
         // `SELECT f(constants)` of an engine-tier
         // function, answered by the gateway (`exec::logic`).
@@ -1743,6 +1735,10 @@ impl PassSession {
             }
             // Through the router when the tenant has shards.
             Route::Forward(sql, mapper) => {
+                // Every step left a plain statement's text alone: its
+                // shape may skip them next time (exec/engine_seam/fast.rs).
+                let unchanged = text.as_ptr() == entry.as_ptr() && text.len() == entry.len();
+                self.fast_forwarding(&sql, &entry, unchanged);
                 Box::pin(self.routed(cx, sql, &original, more, format, mapper, &*map, out)).await
             }
         }
@@ -2446,10 +2442,9 @@ impl PassSession {
         out: &mut dyn ResultSink,
         err: &SprigError,
     ) -> Result<Step> {
-        // The gateway's warnings of a statement that failed (the engine
-        // step's, say) are no answer to the next SHOW WARNINGS.
-        if let Some(ts) = self.tenant.as_deref_mut() {
-            ts.warnings = None;
+        // A failed statement's diagnostics area holds its error.
+        if self.tenant.is_some() {
+            self.diag_set(self.diag_error(err), 0);
         }
         let shown = SprigError {
             kind: err.kind,
@@ -2475,7 +2470,7 @@ impl PassSession {
         logical: Option<&[u8]>,
         more: bool,
         format: RowFormat,
-        mut mapper: ResultMapper,
+        mapper: ResultMapper,
         map: &dyn NameMap,
         out: &mut dyn ResultSink,
     ) -> Result<Step> {
@@ -2495,6 +2490,42 @@ impl PassSession {
             txn_sink = super::engine_seam::TxnSink::new(out, txn_flags);
             &mut txn_sink
         };
+        // What the backend raised decides where the diagnostics area is.
+        let mut diag_sink = super::engine_seam::diag::DiagSink::new(out);
+        let step = Box::pin(self.forward_backend(
+            cx,
+            sql,
+            logical,
+            more,
+            format,
+            mapper,
+            map,
+            &mut diag_sink,
+        ))
+        .await;
+        let (warnings, error) = (diag_sink.warnings, diag_sink.error.take());
+        if let Some(e) = error {
+            self.diag_set(self.diag_error(&e), 0);
+        } else if warnings > 0 {
+            self.eng.diag.on_backend();
+        }
+        step
+    }
+
+    /// [`Self::forward`] past the engine: the backend runs `sql`.
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_backend(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        sql: Bytes,
+        logical: Option<&[u8]>,
+        more: bool,
+        format: RowFormat,
+        mut mapper: ResultMapper,
+        map: &dyn NameMap,
+        out: &mut dyn ResultSink,
+    ) -> Result<Step> {
+        let txn_flags = self.engine_txn_flags();
         let (piece, mut renames) = self.session_rewrites(sql, cx.session.id.0);
         renames.append(&mut self.subst);
         let infile_name = split::local_infile_name(&piece);

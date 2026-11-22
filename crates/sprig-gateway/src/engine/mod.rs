@@ -47,14 +47,19 @@ pub(crate) mod ddlexec;
 pub(crate) mod define;
 pub(crate) mod exec;
 pub(crate) mod expr;
+pub(crate) mod fk;
 pub(crate) mod general;
+pub(crate) mod graphsql;
 pub(crate) mod indexes;
 pub(crate) mod infoschema;
 pub(crate) mod keys;
 pub(crate) mod layout;
 pub(crate) mod locking;
 pub(crate) mod meta;
+pub(crate) mod multiwrite;
+pub(crate) mod paramtype;
 pub(crate) mod plan;
+pub(crate) mod plancache;
 pub(crate) mod row;
 pub(crate) mod session;
 pub(crate) mod show;
@@ -176,11 +181,38 @@ type TableLocks = HashMap<(u64, u32), Arc<tokio::sync::Mutex<()>>>;
 /// Rows read per store call when a whole table is walked.
 const WALK_BATCH: usize = 1024;
 
+/// Rows a long loop handles between two returns to the runtime.
+const PACE_ROWS: usize = 1024;
+
+/// Paces a loop over many rows: every [`PACE_ROWS`] rows the task goes
+/// back to the runtime once. A loop whose awaits are all ready at once
+/// (no lock waits, no durability wait) otherwise runs to its end in one
+/// poll, holding a runtime worker; the stall watchdog stops a statement
+/// whose one poll runs past its limit (1317), and the gateway's per-poll
+/// timing can only move a heavy statement off the workers between polls.
+#[derive(Default)]
+pub(crate) struct Pace(usize);
+
+impl Pace {
+    /// Counts `rows` more rows handled, yielding once each time the
+    /// count passes another [`PACE_ROWS`].
+    pub(crate) async fn add(&mut self, rows: usize) {
+        self.0 += rows;
+        if self.0 >= PACE_ROWS {
+            self.0 = 0;
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
 /// The SQL backend over the node's engine.
 pub(crate) struct Engine {
     eng: sprig_engine::Engine,
     /// Next `AUTO_INCREMENT` value per (tenant, object).
     autoinc: Mutex<HashMap<(u64, u32), u64>>,
+    /// Next hidden row number per (tenant, object, row generation), for
+    /// tables without a primary key.
+    rowids: Mutex<HashMap<(u64, u32, u16), u64>>,
     /// Each table's key index numbers, per (tenant, object), for the index
     /// identities they were given for.
     spaces: RwLock<Spaces>,
@@ -190,6 +222,9 @@ pub(crate) struct Engine {
     /// reads the rows until its catalog change is published and applied,
     /// so statements that find no cached keyspace of the table wait for it.
     tables: Mutex<TableLocks>,
+    /// Tenants whose dropped tables' keys were swept in this process
+    /// (`Engine::sweep_once`).
+    swept: Mutex<std::collections::HashSet<u64>>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -240,8 +275,10 @@ impl Engine {
         Self {
             eng,
             autoinc: Mutex::new(HashMap::new()),
+            rowids: Mutex::new(HashMap::new()),
             spaces: RwLock::new(HashMap::new()),
             tables: Mutex::new(HashMap::new()),
+            swept: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -264,6 +301,33 @@ impl Engine {
             // The table's `AUTO_INCREMENT=n` option is where an empty
             // table starts.
             None => (self.max_autoinc(sp, def)? + 1).max(start_of(sp, def)),
+        };
+        m.insert(key, next + 1);
+        Ok(next)
+    }
+
+    /// The next hidden row number of a table without a primary key,
+    /// reserved. The first one a process gives follows the largest row
+    /// number stored (the last row key); after that the counter lives in
+    /// memory. Numbers are never given twice in a generation of the rows,
+    /// so a rolled-back insert leaves a gap, as InnoDB's row ids do.
+    fn next_rowid(&self, sp: &Space) -> Result<u64> {
+        let key = (sp.tenant, sp.object, sp.layout.row_gen);
+        let mut m = self.rowids.lock().unwrap_or_else(PoisonError::into_inner);
+        let next = if let Some(n) = m.get(&key) {
+            *n
+        } else {
+            let mut tx = self.begin(TxnOptions::default())?;
+            let p = sp.rows();
+            let end = keys::prefix_end(&p);
+            let last = tx.scan(&p, &end, true, 1)?;
+            match last.first() {
+                Some((k, _)) => match row::hidden_of(k)? {
+                    Datum::UInt(n) => n + 1,
+                    _ => 1,
+                },
+                None => 1,
+            }
         };
         m.insert(key, next + 1);
         Ok(next)
@@ -317,8 +381,8 @@ impl Engine {
         let mut lo = p;
         loop {
             let batch = tx.scan(&lo, &end, false, WALK_BATCH)?;
-            for (_, v) in &batch {
-                let r = row::decode(def, sp, v)?;
+            for (k, v) in &batch {
+                let r = row::decode(def, sp, k, v)?;
                 max = max.max(as_u64(&r[ac]));
             }
             match batch.last() {
@@ -357,9 +421,11 @@ impl Engine {
         let end = keys::prefix_end(&p);
         let mut lo = p;
         let mut n: u64 = 0;
+        let mut pace = Pace::default();
         loop {
             let batch = tx.scan(&lo, &end, false, WALK_BATCH)?;
             n += batch.len() as u64;
+            pace.add(batch.len()).await;
             match batch.last() {
                 Some((k, _)) if batch.len() == WALK_BATCH && n < cap => lo = keys::prefix_end(k),
                 _ => break,
@@ -414,7 +480,7 @@ impl Engine {
         let key = (tenant, object);
         let wanted = &def.index_sigs;
         let layout = Arc::new(self.layout_of(tenant, object, def).await?);
-        let first_format = self.row_format(tenant, object, def, layout.row_gen).await?;
+        let first_format = self.row_format(tenant, object, def, layout.row_gen)?;
         let rk = Bytes::from(keys::index_record_key(tenant, object));
         let mut tx = self.begin(TxnOptions::default())?;
         let record = match tx.get(&rk)? {
@@ -477,13 +543,7 @@ impl Engine {
     /// Refuses a table whose rows are in the first (prototype) row format:
     /// its marker says so. That format is no longer read (development
     /// stacks only); such a table is dropped and created again.
-    async fn row_format(
-        &self,
-        tenant: u64,
-        object: u32,
-        def: &TableDef,
-        _row_gen: u16,
-    ) -> Result<bool> {
+    fn row_format(&self, tenant: u64, object: u32, def: &TableDef, _row_gen: u16) -> Result<bool> {
         let fk = Bytes::from(keys::format_key(tenant, object));
         let mut tx = self.begin(TxnOptions::default())?;
         if let Some(raw) = tx.get(&fk)?
@@ -507,8 +567,8 @@ impl Engine {
         let last = loop {
             let mut tx = self.begin(TxnOptions::default())?;
             let batch = tx.scan(&lo, &end, false, WALK_BATCH)?;
-            for (_, v) in &batch {
-                let r = row::decode(def, sp, v)?;
+            for (k, v) in &batch {
+                let r = row::decode(def, sp, k, v)?;
                 for &ix in which {
                     let Some((k, v)) = keys::index_entry(sp, def, ix, &r) else {
                         return Err(SprigError::internal(
@@ -527,6 +587,10 @@ impl Engine {
                 }
             }
             let queued = tx.commit_queued()?;
+            // Between batches the worker goes back to the runtime: a long
+            // build must not hold it (the stall watchdog stops a statement
+            // whose one poll runs past its limit, with 1317).
+            tokio::task::yield_now().await;
             match batch.last() {
                 Some((k, _)) if batch.len() == WALK_BATCH => lo = keys::prefix_end(k),
                 _ => break queued,

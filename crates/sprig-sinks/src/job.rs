@@ -50,6 +50,8 @@ use crate::target::{Conn, MemSecrets, Opts, TargetCtx};
 pub trait SinkEnv: Send + Sync {
     /// The tenant catalog's pool and schema.
     async fn catalog(&self, tenant: TenantId) -> Result<(Pool, String)>;
+    /// The engine's catalog records (sinks, tasks, dead letters).
+    fn records(&self) -> Arc<dyn sprig_catalog::records::RecordStore>;
     /// A pool (as `sprig_ctl`) on the tenant's cluster, for its shards.
     async fn shard_pool(&self, tenant: TenantId) -> Result<Pool>;
     /// The DC tier.
@@ -372,9 +374,8 @@ pub fn run_settings(o: &Opts, def: &SinkDef) -> Result<RunSettings> {
     })
 }
 
-/// Dead letters into `sink_dead_letters`.
+/// Dead letters into the sink's dead-letter records.
 struct CatalogDead {
-    pool: Pool,
     store: SinksStore,
     sink: SinkId,
     /// `DEAD LETTER TO STREAM d`: the stream, its outbox schema and a
@@ -474,10 +475,7 @@ impl DeadLetters for CatalogDead {
                 metrics::counter!("sprig_sink_dead_letters_total", "to" => "stream").increment(1);
             }
         }
-        let mut c = self.pool.get_conn().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e)
-        })?;
-        self.store.insert_dead(&mut c, self.sink, rec, info).await
+        self.store.insert_dead(self.sink, rec, info).await
     }
 }
 
@@ -608,7 +606,7 @@ impl CatalogControl {
     /// Whether policies now bind the sink's owner on its tables; if
     /// so the sink is paused (state `paused`, reason 39366), as the
     /// gateway's policy statements do.
-    async fn rls_bound(&self, c: &mut mysql_async::Conn) -> Result<bool> {
+    async fn rls_bound(&self, _c: &mut mysql_async::Conn) -> Result<bool> {
         let Some((env, tenant, owner, objects)) = &self.rls else {
             return Ok(false);
         };
@@ -617,7 +615,6 @@ impl CatalogControl {
         }
         self.store
             .set_state(
-                c,
                 self.sink,
                 SinkState::Paused,
                 Some(&format!(
@@ -639,7 +636,7 @@ impl CatalogControl {
     /// running sink whose owner lost access is paused (`Some(Stop)`).
     async fn owner_directive(
         &self,
-        c: &mut mysql_async::Conn,
+        _c: &mut mysql_async::Conn,
         state: Option<&(SinkState, Option<String>, u64)>,
     ) -> Result<Option<Directive>> {
         let Some(check) = &self.owner else {
@@ -657,7 +654,7 @@ impl CatalogControl {
                 return Ok(Some(Directive::Stop));
             }
             self.store
-                .set_state(c, self.sink, SinkState::Running, None)
+                .set_state(self.sink, SinkState::Running, None)
                 .await?;
             metrics::gauge!("sprig_sink_paused", "reason" => "owner_privilege").set(0.0);
             tracing::info!(tenant = %check.tenant, sink = self.sink.0, "sink resumed: its owner can read its source again");
@@ -671,11 +668,10 @@ impl CatalogControl {
         };
         let reason = owner_pause_reason(&why);
         self.store
-            .set_state(c, self.sink, SinkState::Paused, Some(&reason))
+            .set_state(self.sink, SinkState::Paused, Some(&reason))
             .await?;
         self.store
             .report_task(
-                c,
                 self.sink,
                 self.task,
                 self.epoch,
@@ -696,7 +692,7 @@ impl CatalogControl {
 impl Control for CatalogControl {
     async fn poll(&self) -> Result<Directive> {
         let mut c = self.conn().await?;
-        let state = self.store.state_of(&mut c, self.sink).await?;
+        let state = self.store.state_of(self.sink).await?;
         // The owner's access (39229), before anything runs.
         if let Some(d) = self.owner_directive(&mut c, state.as_ref()).await? {
             return Ok(d);
@@ -731,7 +727,6 @@ impl Control for CatalogControl {
     }
 
     async fn report(&self, ev: Event) -> Result<()> {
-        let mut c = self.conn().await?;
         match ev {
             Event::Delivered(n) => {
                 // At most every few seconds (the runtime batches reports).
@@ -739,7 +734,6 @@ impl Control for CatalogControl {
                 let _ = total;
                 self.store
                     .report_task(
-                        &mut c,
                         self.sink,
                         self.task,
                         self.epoch,
@@ -751,11 +745,10 @@ impl Control for CatalogControl {
             }
             Event::Failing(why) => {
                 self.store
-                    .set_state(&mut c, self.sink, SinkState::Failing, Some(&why))
+                    .set_state(self.sink, SinkState::Failing, Some(&why))
                     .await?;
                 self.store
                     .report_task(
-                        &mut c,
                         self.sink,
                         self.task,
                         self.epoch,
@@ -769,7 +762,6 @@ impl Control for CatalogControl {
                 tracing::warn!(sink = self.sink.0, reason = %why, "SprigSinkPaused: paused after failures (39222)");
                 self.store
                     .set_state(
-                        &mut c,
                         self.sink,
                         SinkState::Paused,
                         Some(&format!("failures (39222): {why}")),
@@ -777,7 +769,6 @@ impl Control for CatalogControl {
                     .await?;
                 self.store
                     .report_task(
-                        &mut c,
                         self.sink,
                         self.task,
                         self.epoch,
@@ -789,11 +780,10 @@ impl Control for CatalogControl {
             }
             Event::Recovered => {
                 self.store
-                    .set_state(&mut c, self.sink, SinkState::Running, None)
+                    .set_state(self.sink, SinkState::Running, None)
                     .await?;
                 self.store
                     .report_task(
-                        &mut c,
                         self.sink,
                         self.task,
                         self.epoch,
@@ -805,16 +795,10 @@ impl Control for CatalogControl {
             }
             Event::SourceLost(why) => {
                 self.store
-                    .set_state(
-                        &mut c,
-                        self.sink,
-                        SinkState::Failed,
-                        Some(&format!("39223: {why}")),
-                    )
+                    .set_state(self.sink, SinkState::Failed, Some(&format!("39223: {why}")))
                     .await?;
                 self.store
                     .report_task(
-                        &mut c,
                         self.sink,
                         self.task,
                         self.epoch,
@@ -829,8 +813,7 @@ impl Control for CatalogControl {
     }
 
     async fn check_epoch(&self) -> Result<()> {
-        let mut c = self.conn().await?;
-        match self.store.task_epoch(&mut c, self.sink, self.task).await? {
+        match self.store.task_epoch(self.sink, self.task).await? {
             Some(e) if e == self.epoch => Ok(()),
             _ => Err(err(
                 SprigCode::SinkFenced,
@@ -852,7 +835,6 @@ impl Control for CatalogControl {
 pub async fn open_conn(
     env: &dyn SinkEnv,
     tenant: TenantId,
-    catalog: &mut mysql_async::Conn,
     store: &SinksStore,
     r: &ConnRef,
     opts: &Opts,
@@ -861,7 +843,7 @@ pub async fn open_conn(
     let metadata_allowed = opts.get("platform_identity") == Some("full");
     match r {
         ConnRef::Tenant { id, name } => {
-            let def = store.connection(catalog, *id).await?.ok_or_else(|| {
+            let def = store.connection(*id).await?.ok_or_else(|| {
                 err(
                     SprigCode::SinkNotFound,
                     format!("connection {name} is gone"),
@@ -869,7 +851,7 @@ pub async fn open_conn(
             })?;
             let mut secrets = MemSecrets::default();
             let sealed = store
-                .sealed_secrets(catalog, *id, opts.u64("credential_previous_hours", 24)?)
+                .sealed_secrets(*id, opts.u64("credential_previous_hours", 24)?)
                 .await?;
             if !sealed.is_empty() {
                 let keys = env.keyring().ok_or_else(|| {
@@ -1052,11 +1034,11 @@ pub async fn run_sink_task_of(
     cancel: Cancel,
 ) -> Result<TaskEnd> {
     let (cat_pool, cat_schema) = env.catalog(tenant).await?;
-    let store = SinksStore::new(cat_schema.clone());
+    let store = SinksStore::new(env.records(), tenant);
     let mut c = cat_pool.get_conn().await.map_err(|e| {
         SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e)
     })?;
-    let Some(def) = store.sink(&mut c, sink).await? else {
+    let Some(def) = store.sink(sink).await? else {
         return Ok(TaskEnd::Stopped);
     };
     if matches!(def.state, SinkState::Failed | SinkState::Dropping) {
@@ -1107,11 +1089,10 @@ pub async fn run_sink_task_of(
     let start = instance_start(
         def.start_at,
         0,
-        fan_in_created_ms(sink_created_at(&mut c, &cat_schema, sink).await?, false),
+        fan_in_created_ms(store.created_ms(sink).await?, false),
     );
     let epoch = store
         .claim_task(
-            &mut c,
             sink,
             task_no,
             &json!({"partitions": parts}),
@@ -1120,7 +1101,7 @@ pub async fn run_sink_task_of(
         .await?;
     let mut conns = Vec::new();
     for r in &def.connections {
-        conns.push(open_conn(env.as_ref(), tenant, &mut c, &store, r, &opts).await?);
+        conns.push(open_conn(env.as_ref(), tenant, &store, r, &opts).await?);
     }
     drop(c);
     let info = TaskInfo {
@@ -1176,7 +1157,8 @@ pub async fn run_sink_task_of(
         start,
         sink,
     )
-    .await?;
+    .await?
+    .with_sinks(store.clone());
     // A change topic's records reach a sink whose owner the table's
     // policies bind only as the owner may see them, filtered batch by batch
     // through the topic's SQL read as the owner.
@@ -1218,7 +1200,6 @@ pub async fn run_sink_task_of(
         owner: OwnerCheck::new(&env, tenant, &def),
     });
     let dead = Arc::new(CatalogDead {
-        pool: cat_pool.clone(),
         store: store.clone(),
         sink,
         stream: CatalogDead::target(env.as_ref(), tenant, &cat_pool, &cat_schema, &def).await?,
@@ -1377,7 +1358,10 @@ impl crate::source::FanInOpener for EnvFanIn {
             self.sink,
         )
         .await
-        .map(|s| Box::new(s) as Box<dyn crate::runtime::SourceReader>)
+        .map(|s| {
+            Box::new(s.with_sinks(SinksStore::new(self.env.records(), TenantId(self.tenant))))
+                as Box<dyn crate::runtime::SourceReader>
+        })
     }
 }
 
@@ -1399,25 +1383,6 @@ pub fn queue_ordering(opts: &Opts) -> Result<bool> {
 
 /// When sink `sink` was made (ms since the Unix epoch), from its catalog
 /// row.
-async fn sink_created_at(
-    c: &mut mysql_async::Conn,
-    cat_schema: &str,
-    sink: SinkId,
-) -> Result<Option<i64>> {
-    c.exec_first(
-        format!(
-            "SELECT CAST(UNIX_TIMESTAMP(created_at) * 1000 AS SIGNED) FROM {}.sinks \
-             WHERE sink_id = ?",
-            sprig_common::names::quote(cat_schema)
-        ),
-        (sink.0,),
-    )
-    .await
-    .map_err(|e| {
-        SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e)
-    })
-}
-
 /// A fan-in sink's creation time as its sources compare it: milliseconds
 /// for stream instances, whole seconds for change topics (`changes`).
 #[must_use]
@@ -1529,7 +1494,8 @@ impl crate::source::FanInOpener for EnvChanges {
             start,
             self.sink,
         )
-        .await?;
+        .await?
+        .with_sinks(SinksStore::new(self.env.records(), TenantId(self.tenant)));
         // Each table's change topic is filtered batch by batch for the
         // owner while the table's policies bind it, as `FROM STREAM
         // t.changes` is, instead of the sink being paused.
@@ -1565,20 +1531,20 @@ async fn run_fan_in_task(
     task_no: TaskNo,
     of: u32,
     cancel: Cancel,
-    mut c: mysql_async::Conn,
+    c: mysql_async::Conn,
     store: SinksStore,
     def: Arc<SinkDef>,
     opts: Opts,
 ) -> Result<TaskEnd> {
     let (cat_pool, cat_schema) = env.catalog(tenant).await?;
-    let created = sink_created_at(&mut c, &cat_schema, sink).await?;
+    let created = store.created_ms(sink).await?;
     // A fan-in queue task takes its members' messages under a lease
     // tag, as a queue task does, and gives back a dead
     // predecessor's in each member it opens.
     let me = env.worker_id();
     let (my_lease, release) = if matches!(def.source, SourceSpec::FanInQueue { .. }) {
         let my_lease = worker_lease(env.dc().as_ref(), &me).await;
-        let prev = store.task_claim(&mut c, sink, task_no).await?;
+        let prev = store.task_claim(sink, task_no).await?;
         let prev_reg = match &prev {
             Some((_, Some(w), _)) => Some(worker_lease(env.dc().as_ref(), w).await),
             _ => None,
@@ -1592,7 +1558,6 @@ async fn run_fan_in_task(
     };
     let epoch = store
         .claim_task(
-            &mut c,
             sink,
             task_no,
             &json!({
@@ -1606,7 +1571,7 @@ async fn run_fan_in_task(
         .await?;
     let mut conns = Vec::new();
     for r in &def.connections {
-        conns.push(open_conn(env.as_ref(), tenant, &mut c, &store, r, &opts).await?);
+        conns.push(open_conn(env.as_ref(), tenant, &store, r, &opts).await?);
     }
     drop(c);
     let info = TaskInfo {
@@ -1753,7 +1718,6 @@ async fn run_fan_in_task(
         owner: OwnerCheck::new(&env, tenant, &def),
     });
     let dead = Arc::new(CatalogDead {
-        pool: cat_pool.clone(),
         store: store.clone(),
         sink,
         stream: CatalogDead::target(env.as_ref(), tenant, &cat_pool, &cat_schema, &def).await?,
@@ -1974,7 +1938,7 @@ async fn run_queue_task(
     sink: SinkId,
     task_no: TaskNo,
     cancel: Cancel,
-    mut c: mysql_async::Conn,
+    c: mysql_async::Conn,
     store: SinksStore,
     def: Arc<SinkDef>,
     opts: Opts,
@@ -1995,7 +1959,7 @@ async fn run_queue_task(
     // worker's id): its leased messages are then given back at once.
     let me = env.worker_id();
     let my_lease = worker_lease(env.dc().as_ref(), &me).await;
-    let prev = store.task_claim(&mut c, sink, task_no).await?;
+    let prev = store.task_claim(sink, task_no).await?;
     let prev_reg = match &prev {
         Some((_, Some(w), _)) => Some(worker_lease(env.dc().as_ref(), w).await),
         _ => None,
@@ -2003,7 +1967,6 @@ async fn run_queue_task(
     let release = dead_lease_tag(sink, task_no, prev.as_ref(), prev_reg);
     let epoch = store
         .claim_task(
-            &mut c,
             sink,
             task_no,
             &json!({
@@ -2016,7 +1979,7 @@ async fn run_queue_task(
         .await?;
     let mut conns = Vec::new();
     for r in &def.connections {
-        conns.push(open_conn(env.as_ref(), tenant, &mut c, &store, r, &opts).await?);
+        conns.push(open_conn(env.as_ref(), tenant, &store, r, &opts).await?);
     }
     drop(c);
     let info = TaskInfo {
@@ -2087,7 +2050,6 @@ async fn run_queue_task(
         owner: OwnerCheck::new(&env, tenant, &def),
     });
     let dead = Arc::new(CatalogDead {
-        pool: cat_pool.clone(),
         store: store.clone(),
         sink,
         stream: CatalogDead::target(env.as_ref(), tenant, &cat_pool, &cat_schema, &def).await?,

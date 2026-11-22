@@ -461,6 +461,7 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
                     Arc::clone(&data),
                 )),
                 groups: Arc::new(kafka::catalog::CatalogGroups::new(Arc::clone(t))),
+                engine_gate: Some(Arc::clone(&data)),
                 data: Some(data),
             },
             stop.clone(),
@@ -950,12 +951,12 @@ fn logins(
             tracing::info!("logins from tenant catalogs (login_mode = catalog)");
             // Failure counters and temporary locks in the tenants'
             // catalogs, audit events in the log (target sprig_audit).
-            let state = sprig_auth::policy::CatalogLoginState::new(tenants.catalog.clone());
+            let state = sprig_auth::policy::CatalogLoginState::new(tenants.auth.clone());
             // External tokens: issuers' JWTs over MySQL,
             // Redis, MongoDB and HTTP, with just-in-time accounts written
             // to the tenants' catalogs.
             let tokens =
-                sprig_auth::oidc::ExternalTokens::default().with_catalog(tenants.catalog.clone());
+                sprig_auth::oidc::ExternalTokens::default().with_catalog(tenants.auth.clone());
             let svc = LoginService::new(LoginSource::Catalog(catalogs), fast_cache)
                 .with_clock(clock)
                 .with_login_state(Arc::new(state))

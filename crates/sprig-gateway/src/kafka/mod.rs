@@ -12,7 +12,9 @@
 //!   through `sprig-streams`' store;
 //! - [`data`]: Produce, Fetch, ListOffsets and OffsetForLeaderEpoch over
 //!   `sprig-streams`' publish and log reader, as `sprig-proto-kafka`'s data
-//!   plane.
+//!   plane;
+//! - [`engine`]: topics of engine databases, stored on the node's engine
+//!   (segment files and engine records), in front of the three above.
 
 // Kafka API and config names fill the docs.
 #![allow(clippy::doc_markdown)]
@@ -20,6 +22,7 @@
 pub mod catalog;
 pub mod cluster;
 pub mod data;
+pub mod engine;
 pub mod identity;
 
 use std::borrow::Cow;
@@ -120,6 +123,9 @@ pub struct KafkaDeps {
     pub groups: Arc<dyn sprig_proto_kafka::group::GroupStore>,
     /// Produce, Fetch, ListOffsets, OffsetForLeaderEpoch.
     pub data: Option<Arc<dyn sprig_proto_kafka::broker::data::StreamData>>,
+    /// Topics of engine databases are served from the node's engine, with
+    /// this data plane's catalog and grants (`None`: not at all).
+    pub engine_gate: Option<Arc<data::GatewayData>>,
 }
 
 impl std::fmt::Debug for KafkaDeps {
@@ -143,7 +149,8 @@ impl KafkaFrontend {
     /// Builds the front end and starts the group coordinator's timers,
     /// which stop on `stop`.
     #[must_use]
-    pub fn start(d: KafkaDeps, stop: CancellationToken) -> Self {
+    pub fn start(mut d: KafkaDeps, stop: CancellationToken) -> Self {
+        engine::wrap(&mut d);
         let groups = Arc::new(Coordinator::new(
             Arc::clone(&d.groups),
             Arc::clone(&d.cluster) as Arc<dyn sprig_proto_kafka::group::Leases>,

@@ -1561,6 +1561,163 @@ impl RowSource for Union {
     }
 }
 
+/// `INTERSECT` or `EXCEPT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetKind {
+    /// Rows of the left input that the right one has.
+    Intersect,
+    /// Rows of the left input that the right one hasn't.
+    Except,
+}
+
+/// `left INTERSECT|EXCEPT [ALL|DISTINCT] right`. The columns' types are
+/// merged as for `UNION`; rows are equal when every value compares equal
+/// (`NULL` equals `NULL`, as in `DISTINCT`). The right input is read
+/// whole first, then the left one streams through in its order:
+///
+/// | | `DISTINCT` | `ALL` |
+/// |---|---|---|
+/// | `INTERSECT` | each left row the right has, once | as often as both have it (the smaller count) |
+/// | `EXCEPT` | each left row the right hasn't, once | as often as the left has it beyond the right's count |
+pub struct SetOp {
+    left: Box<dyn RowSource>,
+    right: Option<Box<dyn RowSource>>,
+    kind: SetKind,
+    all: bool,
+    coerce: [Vec<CoerceFn>; 2],
+    types: Vec<ExprType>,
+    /// The right input's rows: how many times each is left to match.
+    counts: HashMap<Vec<u8>, u64>,
+    /// Rows already given (`DISTINCT`).
+    given: HashSet<Vec<u8>>,
+    memory: Arc<Memory>,
+}
+
+impl SetOp {
+    /// `left` `kind` `right`; both must have the same number of columns
+    /// (error 1222 otherwise).
+    pub fn new(
+        left: Box<dyn RowSource>,
+        right: Box<dyn RowSource>,
+        kind: SetKind,
+        all: bool,
+        session: &Session,
+        memory: Arc<Memory>,
+    ) -> Result<Self> {
+        let env = Env {
+            s: session,
+            prep: None,
+            counts: None,
+        };
+        let (lt, rt) = (left.types(), right.types());
+        if lt.len() != rt.len() {
+            return Err(SqlError::new(
+                1222,
+                "21000",
+                "The used SELECT statements have a different number of columns",
+            ));
+        }
+        let op = match kind {
+            SetKind::Intersect => "INTERSECT",
+            SetKind::Except => "EXCEPT",
+        };
+        let mut types = Vec::with_capacity(lt.len());
+        for (a, b) in lt.iter().zip(&rt) {
+            let mut ty = agg_result_type(&[*a, *b], op, env)?;
+            if ty.kind == Kind::Str && ty.deriv == Derivation::None {
+                return Err(SqlError::new(
+                    1271,
+                    "HY000",
+                    format!("Illegal mix of collations for operation '{op}'"),
+                ));
+            }
+            ty.column = false;
+            types.push(ty);
+        }
+        let co = |bt: &[ExprType]| -> Vec<CoerceFn> {
+            bt.iter()
+                .zip(&types)
+                .map(|(from, to)| coerce_fn(from, to, env))
+                .collect()
+        };
+        let coerce = [co(&lt), co(&rt)];
+        Ok(Self {
+            left,
+            right: Some(right),
+            kind,
+            all,
+            coerce,
+            types,
+            counts: HashMap::new(),
+            given: HashSet::new(),
+            memory,
+        })
+    }
+
+    fn key(&self, ctx: &mut Ctx<'_>, side: usize, row: Row) -> Result<(Row, Vec<u8>)> {
+        let mut out = Vec::with_capacity(row.len());
+        for (v, co) in row.into_iter().zip(&self.coerce[side]) {
+            out.push(co(ctx, v)?);
+        }
+        let key = row_hash_key(&out, &self.types);
+        Ok((out, key))
+    }
+}
+
+impl RowSource for SetOp {
+    fn next(&mut self, ctx: &mut Ctx<'_>) -> Result<Option<Row>> {
+        if let Some(mut right) = self.right.take() {
+            while let Some(row) = right.next(ctx)? {
+                let (_, key) = self.key(ctx, 1, row)?;
+                let bytes = key.len();
+                let n = self.counts.entry(key).or_insert(0);
+                if *n == 0 {
+                    self.memory.charge(bytes)?;
+                }
+                *n += 1;
+            }
+        }
+        while let Some(row) = self.left.next(ctx)? {
+            let (row, key) = self.key(ctx, 0, row)?;
+            let n = self.counts.get_mut(&key);
+            let keep = match (self.kind, self.all) {
+                (SetKind::Intersect, true) => match n {
+                    Some(c) if *c > 0 => {
+                        *c -= 1;
+                        true
+                    }
+                    _ => false,
+                },
+                (SetKind::Except, true) => match n {
+                    Some(c) if *c > 0 => {
+                        *c -= 1;
+                        false
+                    }
+                    _ => true,
+                },
+                (SetKind::Intersect, false) => n.is_some(),
+                (SetKind::Except, false) => n.is_none(),
+            };
+            if !keep {
+                continue;
+            }
+            if !self.all {
+                let bytes = key.len();
+                if !self.given.insert(key) {
+                    continue;
+                }
+                self.memory.charge(bytes)?;
+            }
+            return Ok(Some(row));
+        }
+        Ok(None)
+    }
+
+    fn types(&self) -> Vec<ExprType> {
+        self.types.clone()
+    }
+}
+
 /// Reads every row of a source.
 pub fn collect(source: &mut dyn RowSource, ctx: &mut Ctx<'_>) -> Result<Vec<Row>> {
     let mut out = Vec::new();

@@ -15,8 +15,6 @@
 use serde::{Deserialize, Serialize};
 use sprig_auth::oidc::IssuerSpec;
 use sprig_auth::oidc::store as issuers;
-use sprig_auth::store::{AUTH_MODULE, AuthStore};
-use sprig_catalog::Migrator;
 use sprig_common::Result;
 use sprig_common::ids::{TenantId, UserId};
 
@@ -79,18 +77,7 @@ pub struct TokenLoginResponse {
 
 impl TenantUsers {
     async fn migrated(&self, tenant: &str) -> Result<TenantId> {
-        let id = self.active(tenant).await?;
-        let ep = self.locator.writer(id).await?;
-        let mut conn = crate::catalogs::acquire(&ep.pool, "auth tables").await?;
-        crate::catalogs::migrate_catalog(
-            &*self.locator,
-            id,
-            &mut conn,
-            ep.store.schema(),
-            &Migrator::new(&[AUTH_MODULE])?,
-        )
-        .await?;
-        Ok(id)
+        self.active(tenant).await
     }
 
     /// The issuers of the tenant named `tenant`.
@@ -99,9 +86,8 @@ impl TenantUsers {
     /// 39072 for an unknown or inactive tenant; the catalog's errors.
     pub async fn list_issuers(&self, tenant: &str) -> Result<ListIssuersResponse> {
         let id = self.active(tenant).await?;
-        let ep = self.locator.writer(id).await?;
-        let mut conn = crate::catalogs::acquire(&ep.pool, "issuers").await?;
-        let list = issuers::read_issuers(&AuthStore::new(ep.store.schema()), &mut conn).await?;
+        let mut tx = self.catalog.backend().store().begin(id).await?;
+        let list = issuers::read_issuers(&mut *tx).await?;
         Ok(ListIssuersResponse {
             tenant: tenant.to_owned(),
             issuers: list,

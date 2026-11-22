@@ -233,6 +233,9 @@ pub struct ShardingLoop {
     published: Mutex<BTreeSet<TenantId>>,
     /// `sharding.mode = approve` holds jobs for approval.
     pub approvals: std::sync::OnceLock<Arc<crate::approvals::ControllerApprovals>>,
+    /// The tenants' catalog records on the engine node (graphs, table
+    /// groups); unset in tests without one.
+    pub records: std::sync::OnceLock<Arc<dyn sprig_catalog::RecordStore>>,
     /// When each tenant's workload was last read for lookup proposals.
     lookup_runs: Mutex<HashMap<TenantId, Instant>>,
     /// Each table group's largest shard against its split size, for the
@@ -298,6 +301,7 @@ impl ShardingLoop {
             publish: None,
             published: Mutex::new(BTreeSet::new()),
             approvals: std::sync::OnceLock::new(),
+            records: std::sync::OnceLock::new(),
             lookup_runs: Mutex::new(HashMap::new()),
             ai_sizes: crate::ai_health::ShardSizes::default(),
         }
@@ -714,8 +718,16 @@ impl ShardingLoop {
         {
             return Ok(());
         }
-        let mut asm =
-            input::assemble(c, tenant, now, ts.advisor.window, ts.sharding.split_bytes).await?;
+        let mut wl = crate::catalog_records().begin(tenant).await?;
+        let mut asm = input::assemble(
+            c,
+            &mut *wl,
+            tenant,
+            now,
+            ts.advisor.window,
+            ts.sharding.split_bytes,
+        )
+        .await?;
         self.kv_rule_inputs(tenant, ts, home, &mut asm);
         let total: f64 = asm.input.tables.iter().map(|t| t.size_bytes).sum();
         let due = total > ts.sharding.split_bytes || ts.sharding.min_shards > 1;
@@ -1086,8 +1098,10 @@ impl ShardingLoop {
                 members,
             });
         }
+        let mut wl = crate::catalog_records().begin(tenant).await?;
         let asm = input::assemble(
             c,
+            &mut *wl,
             tenant,
             SystemTime::now(),
             ts.advisor.window,

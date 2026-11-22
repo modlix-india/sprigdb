@@ -22,8 +22,11 @@
 pub mod agg;
 pub mod ai;
 pub mod catalog;
+pub mod catalog_records;
 /// Collations.
 pub mod collation;
+/// Collections stored on SprigDB's own storage engine.
+pub mod docstore;
 pub mod engine;
 pub mod filter;
 /// MongoDB's geospatial operators.

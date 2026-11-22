@@ -165,6 +165,7 @@ impl Spec {
                     name: c.name.to_owned(),
                     ty: c.ty,
                     nullable: c.nullable,
+                    invisible: false,
                 })
                 .collect(),
             primary: (!self.pk.is_empty()).then(|| {

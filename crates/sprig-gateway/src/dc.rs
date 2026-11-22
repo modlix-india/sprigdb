@@ -305,8 +305,67 @@ type Counts = HashMap<TenantId, HashMap<String, (u64, u64)>>;
 pub struct DcRouting {
     dc: DcId,
     counts: Mutex<Counts>,
+    /// Sessions' own counters ([`SessionTraffic`]), summed in at each
+    /// report.
+    live: Mutex<Vec<Weak<TrafficCounter>>>,
     /// Each followed tenant's home DC, as the locator last saw it.
     homes: Mutex<HashMap<TenantId, DcId>>,
+    /// Moves whenever a tenant's home changes ([`Self::homes_generation`]).
+    homes_gen: std::sync::atomic::AtomicU64,
+}
+
+/// One session's reads and writes for its tenant from its client DC.
+#[derive(Debug)]
+struct TrafficCounter {
+    tenant: TenantId,
+    client: String,
+    reads: std::sync::atomic::AtomicU64,
+    writes: std::sync::atomic::AtomicU64,
+}
+
+impl TrafficCounter {
+    /// Takes the counts so far.
+    fn take(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.reads.swap(0, Relaxed), self.writes.swap(0, Relaxed))
+    }
+}
+
+/// A session's traffic counts: a statement adds to the session's own
+/// counter (one atomic step, no lock); each report sums every session's
+/// counter in, and a session's last counts move to the shared ones when it
+/// ends. Reports see the same totals as when every statement took the
+/// shared lock.
+#[derive(Debug)]
+pub struct SessionTraffic {
+    routing: Arc<DcRouting>,
+    counter: Arc<TrafficCounter>,
+}
+
+impl SessionTraffic {
+    /// Counts one statement.
+    pub fn count(&self, write: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if write {
+            self.counter.writes.fetch_add(1, Relaxed);
+        } else {
+            self.counter.reads.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Whether this counts `tenant`'s statements from `client`.
+    #[must_use]
+    pub fn is_for(&self, tenant: TenantId, client: Option<&DcId>) -> bool {
+        self.counter.tenant == tenant && self.counter.client == client.map_or("", DcId::as_str)
+    }
+}
+
+impl Drop for SessionTraffic {
+    fn drop(&mut self) {
+        let (r, w) = self.counter.take();
+        self.routing
+            .add(self.counter.tenant, &self.counter.client, r, w);
+    }
 }
 
 impl std::fmt::Debug for DcRouting {
@@ -328,7 +387,9 @@ impl DcRouting {
         Arc::new(Self {
             dc,
             counts: Mutex::new(HashMap::new()),
+            live: Mutex::new(Vec::new()),
             homes: Mutex::new(HashMap::new()),
+            homes_gen: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -342,22 +403,62 @@ impl DcRouting {
     /// DC, or `None`).
     pub fn record(&self, tenant: TenantId, client: Option<&DcId>, write: bool) {
         let client = client.map_or("", DcId::as_str);
+        self.add(tenant, client, u64::from(!write), u64::from(write));
+    }
+
+    /// Adds `reads` and `writes` of `tenant` from `client` (`""`: unknown).
+    fn add(&self, tenant: TenantId, client: &str, reads: u64, writes: u64) {
+        if reads == 0 && writes == 0 {
+            return;
+        }
         let mut c = lock(&self.counts);
         let by_dc = c.entry(tenant).or_default();
         let e = match by_dc.get_mut(client) {
             Some(e) => e,
             None => by_dc.entry(client.to_owned()).or_insert((0, 0)),
         };
-        if write {
-            e.1 += 1;
-        } else {
-            e.0 += 1;
+        e.0 += reads;
+        e.1 += writes;
+    }
+
+    /// A session's own counter for `tenant`'s statements from `client`.
+    #[must_use]
+    pub fn session_counter(
+        self: &Arc<Self>,
+        tenant: TenantId,
+        client: Option<&DcId>,
+    ) -> SessionTraffic {
+        let counter = Arc::new(TrafficCounter {
+            tenant,
+            client: client.map_or("", DcId::as_str).to_owned(),
+            reads: std::sync::atomic::AtomicU64::new(0),
+            writes: std::sync::atomic::AtomicU64::new(0),
+        });
+        let mut live = lock(&self.live);
+        live.retain(|w| w.strong_count() > 0);
+        live.push(Arc::downgrade(&counter));
+        drop(live);
+        SessionTraffic {
+            routing: Arc::clone(self),
+            counter,
         }
     }
 
     /// Notes `tenant`'s home DC (the locator calls it).
     pub fn set_home(&self, tenant: TenantId, home: DcId) {
-        lock(&self.homes).insert(tenant, home);
+        let mut homes = lock(&self.homes);
+        if homes.get(&tenant) != Some(&home) {
+            homes.insert(tenant, home);
+            self.homes_gen
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Moves whenever any tenant's home DC changes: a session may keep what
+    /// it worked out from its tenant's home while this stays the same.
+    #[must_use]
+    pub fn homes_generation(&self) -> u64 {
+        self.homes_gen.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// `tenant`'s home DC as last seen; this DC if unknown.
@@ -371,6 +472,16 @@ impl DcRouting {
 
     /// Takes the counts, grouped by home DC.
     fn take(&self, minute: i64) -> HashMap<DcId, TrafficBatch> {
+        // The sessions' own counters first.
+        let live: Vec<Arc<TrafficCounter>> = {
+            let mut l = lock(&self.live);
+            l.retain(|w| w.strong_count() > 0);
+            l.iter().filter_map(Weak::upgrade).collect()
+        };
+        for c in live {
+            let (r, w) = c.take();
+            self.add(c.tenant, &c.client, r, w);
+        }
         let counts = std::mem::take(&mut *lock(&self.counts));
         let mut out: HashMap<DcId, TrafficBatch> = HashMap::new();
         for (tenant, by_dc) in counts {
@@ -550,5 +661,44 @@ mod tests {
         r.record(TenantId(1), Some(&fra1), true);
         let b = r.take(6).remove(&fra1).unwrap();
         assert_eq!((b.rows[0].reads, b.rows[0].writes), (1, 2));
+    }
+
+    /// Sessions' own counters add up to what shared counting gave, at every
+    /// report and after the session ends.
+    #[test]
+    fn session_counters_report_like_shared_counts() {
+        let r = DcRouting::new(DcId::new("mum1").unwrap());
+        let fra1 = DcId::new("fra1").unwrap();
+        r.set_home(TenantId(1), fra1.clone());
+        let s = r.session_counter(TenantId(1), Some(&fra1));
+        assert!(s.is_for(TenantId(1), Some(&fra1)));
+        assert!(!s.is_for(TenantId(1), None));
+        for i in 0..10 {
+            s.count(i % 3 == 0);
+        }
+        r.record(TenantId(1), Some(&fra1), false);
+        let b = r.take(7).remove(&fra1).unwrap();
+        assert_eq!(b.rows.len(), 1);
+        assert_eq!((b.rows[0].reads, b.rows[0].writes), (7, 4));
+        // Counted after the report, then the session ends: the next report.
+        s.count(true);
+        s.count(false);
+        drop(s);
+        let b = r.take(8).remove(&fra1).unwrap();
+        assert_eq!((b.rows[0].reads, b.rows[0].writes), (1, 1));
+        assert!(r.take(9).is_empty());
+    }
+
+    #[test]
+    fn the_homes_generation_moves_only_with_a_home() {
+        let r = DcRouting::new(DcId::new("mum1").unwrap());
+        let g0 = r.homes_generation();
+        r.set_home(TenantId(1), DcId::new("fra1").unwrap());
+        let g1 = r.homes_generation();
+        assert!(g1 > g0);
+        r.set_home(TenantId(1), DcId::new("fra1").unwrap());
+        assert_eq!(r.homes_generation(), g1);
+        r.set_home(TenantId(1), DcId::new("mum1").unwrap());
+        assert!(r.homes_generation() > g1);
     }
 }

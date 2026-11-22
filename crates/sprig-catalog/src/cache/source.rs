@@ -16,8 +16,12 @@ use sprig_common::{Result, SprigError};
 
 use super::ext::{CatalogExtension, SnapshotTx, module_of};
 use super::snapshot::{Loaded, TenantCatalog};
-use crate::migrate::{FORMAT_KEY, FormatState, Migrator, check_readable};
+use crate::migrate::{
+    CORE, CORE_REC_LOG_FORMAT, FORMAT_KEY, FormatState, Migrator, check_readable,
+};
 use crate::pool_wait::Bounded as _;
+use crate::records::staged::{self, Ops, StagedTx};
+use crate::records::{RecordStore, RecordTx};
 use crate::sql::{map_err, timed};
 use crate::store::CatalogLocator;
 use crate::version::VersionKind;
@@ -78,6 +82,7 @@ pub struct MariaSource {
     extensions: Vec<Arc<dyn CatalogExtension>>,
     supports: BTreeMap<String, u32>,
     timeout: Duration,
+    records: Option<Arc<dyn RecordStore>>,
 }
 
 impl std::fmt::Debug for MariaSource {
@@ -117,7 +122,16 @@ impl MariaSource {
             extensions,
             supports,
             timeout: Self::DEFAULT_TIMEOUT,
+            records: None,
         })
+    }
+
+    /// The same source reading the auth version and the auth modules'
+    /// rows from the engine's catalog records (`records`).
+    #[must_use]
+    pub fn with_records(mut self, records: Arc<dyn RecordStore>) -> Self {
+        self.records = Some(records);
+        self
     }
 
     /// The same source with another deadline per load.
@@ -128,19 +142,44 @@ impl MariaSource {
     }
 }
 
-#[async_trait::async_trait]
-impl CatalogSource for MariaSource {
-    async fn load(
+/// How many times a load starts again when the catalog's record log was
+/// purged past its engine view, before it loads with what it has.
+const LOG_RETRIES: usize = 3;
+
+/// One load's outcome.
+enum Attempt {
+    Done(Loaded),
+    /// Load again (from this node).
+    Again(Node),
+}
+
+impl MariaSource {
+    async fn load_once(
         &self,
         tenant: TenantId,
         prev: Option<&TenantCatalog>,
         node: Node,
-    ) -> Result<Loaded> {
+        last_try: bool,
+    ) -> Result<Attempt> {
         let ep = match node {
             Node::Replica => self.locator.reader(tenant).await?,
             Node::Writer => self.locator.writer(tenant).await?,
         };
         timed(self.timeout, "cache load", async {
+            // The engine's read view first, then the MariaDB snapshot: the
+            // record log rows the view hasn't applied are then all in the
+            // snapshot (the engine applies a row only after MariaDB
+            // committed it).
+            // (A record transaction's view is fixed by its first read, so
+            // the mark is read before the snapshot starts.)
+            let rec = match &self.records {
+                Some(r) => {
+                    let mut rtx = r.begin(tenant).await?;
+                    let mark = staged::applied(&mut *rtx).await?;
+                    Some((rtx, mark))
+                }
+                None => None,
+            };
             let mut tx = ep.store.begin_snapshot(&ep.pool).await?;
             let format: FormatState = match ep.store.internal(&mut tx, FORMAT_KEY).await? {
                 Some(v) => serde_json::from_value(v)
@@ -148,14 +187,64 @@ impl CatalogSource for MariaSource {
                 None => FormatState::new(),
             };
             check_readable(&format, &self.supports)?;
-            let snapshot = ep
+            let rec_log = format
+                .get(CORE)
+                .is_some_and(|f| f.format >= CORE_REC_LOG_FORMAT);
+            let mut snapshot = ep
                 .store
                 .snapshot_in(&mut tx, prev.map(|p| p.version))
                 .await?;
+            // The auth version and the records are the engine's; module
+            // rows on the catalog version get the log rows not yet applied.
+            let mut rec = match rec {
+                Some((rtx, mark)) => {
+                    let mut st = StagedTx::new(rtx);
+                    snapshot.versions.auth =
+                        crate::records::read_version(&mut st, VersionKind::Auth).await?;
+                    if rec_log {
+                        let log = ep.store.rec_log_after(&mut tx, mark, false).await?;
+                        if log.purged > mark && !last_try {
+                            st.finish().await;
+                            let _ = tx.rollback().await;
+                            return Ok(Attempt::Again(node));
+                        }
+                        if log.purged > mark {
+                            tracing::warn!(%tenant, applied = mark, purged = log.purged,
+                                "catalog load without record log rows the engine never applied \
+                                 (a new engine directory?): module rows written before are missing");
+                        }
+                        if mark > log.last.max(log.purged) {
+                            if node == Node::Replica {
+                                // The engine applied rows this replica hasn't
+                                // received: read the writer instead.
+                                st.finish().await;
+                                let _ = tx.rollback().await;
+                                return Ok(Attempt::Again(Node::Writer));
+                            }
+                            // On the writer: the log lost rows the engine
+                            // applied; changes refuse until repaired.
+                            tracing::error!(%tenant, applied = mark, last = log.last,
+                                purged = log.purged,
+                                "the engine's catalog records are ahead of the catalog's record log");
+                        }
+                        for (_, raw) in &log.rows {
+                            st.replay(Ops::decode(raw)?);
+                        }
+                    }
+                    Some(st)
+                }
+                None => None,
+            };
             let full = snapshot.since.is_none();
             let mut ext = Vec::new();
             {
-                let mut stx = SnapshotTx::new(&mut tx, &ep.store, snapshot.versions);
+                let mut stx = SnapshotTx::new(
+                    &mut tx,
+                    &ep.store,
+                    snapshot.versions,
+                    rec.as_mut().map(|r| r as &mut (dyn RecordTx + 'static)),
+                )
+                .with_rec_log(rec_log);
                 for e in &self.extensions {
                     let Some(kind) = e.versioned() else {
                         continue;
@@ -172,9 +261,39 @@ impl CatalogSource for MariaSource {
                 }
             }
             tx.commit().await.map_err(map_err)?;
-            Ok(Loaded { snapshot, ext })
+            if let Some(r) = rec.take() {
+                r.finish().await;
+            }
+            Ok(Attempt::Done(Loaded { snapshot, ext }))
         })
         .await
+    }
+}
+
+#[async_trait::async_trait]
+impl CatalogSource for MariaSource {
+    async fn load(
+        &self,
+        tenant: TenantId,
+        prev: Option<&TenantCatalog>,
+        node: Node,
+    ) -> Result<Loaded> {
+        let mut node = node;
+        let mut attempt = 0;
+        loop {
+            match self
+                .load_once(tenant, prev, node, attempt >= LOG_RETRIES)
+                .await?
+            {
+                Attempt::Done(l) => return Ok(l),
+                // A replica behind the engine: the writer next.
+                Attempt::Again(Node::Writer) if node == Node::Replica => node = Node::Writer,
+                Attempt::Again(n) => {
+                    node = n;
+                    attempt += 1;
+                }
+            }
+        }
     }
 
     async fn committed(&self, tenant: TenantId, node: Node) -> Result<Option<(u64, u64)>> {
@@ -185,7 +304,16 @@ impl CatalogSource for MariaSource {
         timed(self.timeout, "catalog versions", async {
             let mut conn = ep.pool.get_conn_bounded().await.map_err(map_err)?;
             let v = ep.store.versions(&mut conn).await?;
-            Ok(Some((v.catalog, v.auth)))
+            let auth = match &self.records {
+                Some(r) => {
+                    let mut rtx = r.begin(tenant).await?;
+                    let a = crate::records::read_version(&mut *rtx, VersionKind::Auth).await;
+                    let _ = rtx.rollback().await;
+                    a?
+                }
+                None => v.auth,
+            };
+            Ok(Some((v.catalog, auth)))
         })
         .await
     }

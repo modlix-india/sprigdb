@@ -3235,3 +3235,372 @@ pub mod search_seed_server {
         const NAME: &'static str = SERVICE_NAME;
     }
 }
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CatalogOp {
+    #[prost(oneof = "catalog_op::Op", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
+    pub op: ::core::option::Option<catalog_op::Op>,
+}
+/// Nested message and enum types in `CatalogOp`.
+pub mod catalog_op {
+    #[allow(clippy::all)]
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Op {
+        /// Opens the transaction on this tenant's records (answered too).
+        #[prost(uint64, tag = "1")]
+        BeginTenant(u64),
+        /// The record at the read view.
+        #[prost(bytes, tag = "2")]
+        Get(::prost::alloc::vec::Vec<u8>),
+        /// The record, locked exclusively, as it is now.
+        #[prost(bytes, tag = "3")]
+        GetForUpdate(::prost::alloc::vec::Vec<u8>),
+        /// Records of \[lo, hi) at the read view.
+        #[prost(message, tag = "4")]
+        Scan(super::CatalogScan),
+        /// Writes a record.
+        #[prost(message, tag = "5")]
+        Put(super::CatalogEntry),
+        /// Deletes a record.
+        #[prost(bytes, tag = "6")]
+        Delete(::prost::alloc::vec::Vec<u8>),
+        /// Commits (durably) and ends the stream.
+        #[prost(bool, tag = "7")]
+        Commit(bool),
+        /// Rolls back and ends the stream.
+        #[prost(bool, tag = "8")]
+        Rollback(bool),
+    }
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CatalogScan {
+    #[prost(bytes = "vec", tag = "1")]
+    pub lo: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub hi: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint32, tag = "3")]
+    pub limit: u32,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CatalogEntry {
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub value: ::prost::alloc::vec::Vec<u8>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CatalogReply {
+    /// 0 on success, else the SprigDB error code (39071: a record is busy).
+    #[prost(uint32, tag = "1")]
+    pub error_code: u32,
+    #[prost(string, tag = "2")]
+    pub error_message: ::prost::alloc::string::String,
+    /// get / get_for_update: whether the record exists, and its value.
+    #[prost(bool, tag = "3")]
+    pub found: bool,
+    #[prost(bytes = "vec", tag = "4")]
+    pub value: ::prost::alloc::vec::Vec<u8>,
+    /// scan: the records.
+    #[prost(message, repeated, tag = "5")]
+    pub entries: ::prost::alloc::vec::Vec<CatalogEntry>,
+}
+/// Generated client implementations.
+pub mod catalog_peer_client {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
+    #[derive(Debug, Clone)]
+    pub struct CatalogPeerClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+    impl<T> CatalogPeerClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::Body>,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
+    {
+        pub fn new(inner: T) -> Self {
+            let inner = tonic::client::Grpc::new(inner);
+            Self { inner }
+        }
+        pub fn with_origin(inner: T, origin: Uri) -> Self {
+            let inner = tonic::client::Grpc::with_origin(inner, origin);
+            Self { inner }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> CatalogPeerClient<InterceptedService<T, F>>
+        where
+            F: tonic::service::Interceptor,
+            T::ResponseBody: Default,
+            T: tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                >,
+            >,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+        {
+            CatalogPeerClient::new(InterceptedService::new(inner, interceptor))
+        }
+        /// Compress requests with the given encoding.
+        ///
+        /// This requires the server to support it otherwise it might respond with an
+        /// error.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.send_compressed(encoding);
+            self
+        }
+        /// Enable decompressing responses.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.accept_compressed(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_decoding_message_size(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_encoding_message_size(limit);
+            self
+        }
+        /// One transaction on one tenant's catalog records, bound to the stream:
+        /// the first message is `begin`; each later one is answered by one reply,
+        /// in order. The stream ending before `commit` rolls the transaction back.
+        pub async fn txn(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<Message = super::CatalogOp>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::CatalogReply>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sprig.internal.v1.CatalogPeer/Txn",
+            );
+            let mut req = request.into_streaming_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("sprig.internal.v1.CatalogPeer", "Txn"));
+            self.inner.streaming(req, path, codec).await
+        }
+    }
+}
+/// Generated server implementations.
+pub mod catalog_peer_server {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    /// Generated trait containing gRPC methods that should be implemented for use with CatalogPeerServer.
+    #[async_trait]
+    pub trait CatalogPeer: std::marker::Send + std::marker::Sync + 'static {
+        /// Server streaming response type for the Txn method.
+        type TxnStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::CatalogReply, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// One transaction on one tenant's catalog records, bound to the stream:
+        /// the first message is `begin`; each later one is answered by one reply,
+        /// in order. The stream ending before `commit` rolls the transaction back.
+        async fn txn(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::CatalogOp>>,
+        ) -> std::result::Result<tonic::Response<Self::TxnStream>, tonic::Status>;
+    }
+    #[derive(Debug)]
+    pub struct CatalogPeerServer<T> {
+        inner: Arc<T>,
+        accept_compression_encodings: EnabledCompressionEncodings,
+        send_compression_encodings: EnabledCompressionEncodings,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    }
+    impl<T> CatalogPeerServer<T> {
+        pub fn new(inner: T) -> Self {
+            Self::from_arc(Arc::new(inner))
+        }
+        pub fn from_arc(inner: Arc<T>) -> Self {
+            Self {
+                inner,
+                accept_compression_encodings: Default::default(),
+                send_compression_encodings: Default::default(),
+                max_decoding_message_size: None,
+                max_encoding_message_size: None,
+            }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
+        where
+            F: tonic::service::Interceptor,
+        {
+            InterceptedService::new(Self::new(inner), interceptor)
+        }
+        /// Enable decompressing requests with the given encoding.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.accept_compression_encodings.enable(encoding);
+            self
+        }
+        /// Compress responses with the given encoding, if the client supports it.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.send_compression_encodings.enable(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
+    }
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for CatalogPeerServer<T>
+    where
+        T: CatalogPeer,
+        B: Body + std::marker::Send + 'static,
+        B::Error: Into<StdError> + std::marker::Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            match req.uri().path() {
+                "/sprig.internal.v1.CatalogPeer/Txn" => {
+                    #[allow(non_camel_case_types)]
+                    struct TxnSvc<T: CatalogPeer>(pub Arc<T>);
+                    impl<
+                        T: CatalogPeer,
+                    > tonic::server::StreamingService<super::CatalogOp> for TxnSvc<T> {
+                        type Response = super::CatalogReply;
+                        type ResponseStream = T::TxnStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<tonic::Streaming<super::CatalogOp>>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as CatalogPeer>::txn(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = TxnSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => {
+                    Box::pin(async move {
+                        let mut response = http::Response::new(
+                            tonic::body::Body::default(),
+                        );
+                        let headers = response.headers_mut();
+                        headers
+                            .insert(
+                                tonic::Status::GRPC_STATUS,
+                                (tonic::Code::Unimplemented as i32).into(),
+                            );
+                        headers
+                            .insert(
+                                http::header::CONTENT_TYPE,
+                                tonic::metadata::GRPC_CONTENT_TYPE,
+                            );
+                        Ok(response)
+                    })
+                }
+            }
+        }
+    }
+    impl<T> Clone for CatalogPeerServer<T> {
+        fn clone(&self) -> Self {
+            let inner = self.inner.clone();
+            Self {
+                inner,
+                accept_compression_encodings: self.accept_compression_encodings,
+                send_compression_encodings: self.send_compression_encodings,
+                max_decoding_message_size: self.max_decoding_message_size,
+                max_encoding_message_size: self.max_encoding_message_size,
+            }
+        }
+    }
+    /// Generated gRPC service name
+    pub const SERVICE_NAME: &str = "sprig.internal.v1.CatalogPeer";
+    impl<T> tonic::server::NamedService for CatalogPeerServer<T> {
+        const NAME: &'static str = SERVICE_NAME;
+    }
+}

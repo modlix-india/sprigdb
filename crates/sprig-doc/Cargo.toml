@@ -10,6 +10,15 @@ publish.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+# Collections stored on the storage engine: engine transactions, and the
+# engine's errors and byte buffers.
+bytes.workspace = true
+sprig-common.workspace = true
+# The document module's catalog rows are the engine's catalog records
+# (`catalog_records`): sprig-catalog's record API, rows as serde JSON.
+sprig-catalog.workspace = true
+serde.workspace = true
+sprig-engine = { path = "../sprig-engine" }
 base64.workspace = true
 bson = "=2.15.0"
 # $regex matching in the recheck (MIT or Apache-2.0).
@@ -42,6 +51,9 @@ tracing.workspace = true
 unicode-normalization = "0.1.25"
 
 [dev-dependencies]
+# The differential test of the engine store against a reference MongoDB
+# (Apache-2.0; already in the lockfile through the gateway's tests).
+mongodb = { version = "=3.9.1", default-features = false, features = ["compat-3-0-0", "rustls-tls"] }
 # Server-side JavaScript's tests run on SprigDB's QuickJS.
 sprig-logic-js.workspace = true
 # The live test of the generated SQL, straight on MariaDB.

@@ -1120,9 +1120,10 @@ pub(crate) fn convert_using(a: Node, coll: Collation, env: Env<'_>) -> Node {
     } else {
         Derivation::Implicit
     };
+    // (Both servers report the conversion as nullable.)
     let ty = ExprType {
         ascii: to == Charset::Ascii,
-        ..ExprType::string(a.ty.len, coll, deriv).with_null(a.ty.nullable)
+        ..ExprType::string(a.ty.len, coll, deriv).nullable()
     };
     Node::new(ty, "convert", move |ctx, row| {
         let (b, src) = match a.eval(ctx, row)? {

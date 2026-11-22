@@ -1,0 +1,447 @@
+# == Date and time functions report MariaDB's lengths and MySQL's (one more for a sign; HOUR 4, MICROSECOND 21, TO_DAYS 8; YEAR is a YEAR column type on MySQL)
+Q DAY(`dt`)
+M V 15	29	31	1	31	1	29	31	28	4	19	9	NULL	29	9	31	4	31	NULL	15	1	19	1	28
+M T LONG 2 0 - 63
+Y V 15	29	31	1	31	1	29	31	28	4	19	9	NULL	29	9	31	4	31	NULL	15	1	19	1	28
+Y T LONGLONG 3 0 - 63
+Q HOUR(`tm`)
+M V 10	23	0	1	838	838	12	0	100	0	3	1	NULL	0	1	838	838	12	0	100	0	3	1	10
+M T LONG 2 0 - 63
+Y V 10	23	0	1	838	838	12	0	100	0	3	1	NULL	0	1	838	838	12	0	100	0	3	1	10
+Y T LONGLONG 4 0 - 63
+Q MICROSECOND(`dtm`)
+M V 0	999999	0	500000	999999	0	0	500000	0	90000	0	123456	NULL	0	123456	999999	90000	0	500000	NULL	0	0	500000	0
+M T LONG 6 0 - 63
+Y V 0	999999	0	500000	999999	0	0	500000	0	90000	0	123456	NULL	0	123456	999999	90000	0	500000	NULL	0	0	500000	0
+Y T LONGLONG 21 0 - 63
+Q YEAR(`dt`)
+M V 2024	2024	2023	1970	9999	1000	2000	2024	2021	2019	2038	2001	NULL	2000	2001	9999	2019	2023	NULL	2024	1000	2038	1970	2021
+M T LONG 4 0 - 63
+Y V 2024	2024	2023	1970	9999	1000	2000	2024	2021	2019	2038	2001	NULL	2000	2001	9999	2019	2023	NULL	2024	1000	2038	1970	2021
+Y T YEAR 4 0 U 63
+Q QUARTER(`dt`)
+M V 1	1	4	1	4	1	1	4	1	3	1	3	NULL	1	3	4	3	4	NULL	1	1	1	1	1
+M T LONG 1 0 - 63
+Y V 1	1	4	1	4	1	1	4	1	3	1	3	NULL	1	3	4	3	4	NULL	1	1	1	1	1
+Y T LONGLONG 2 0 - 63
+Q WEEK(`dt`)
+M V 2	8	53	0	52	0	9	52	13	26	3	36	NULL	9	36	52	26	53	NULL	2	0	3	0	13
+M T LONG 2 0 - 63
+Y V 2	8	53	0	52	0	9	52	13	26	3	36	NULL	9	36	52	26	53	NULL	2	0	3	0	13
+Y T LONGLONG 3 0 - 63
+Q YEARWEEK(`dt`)
+M V 202402	202408	202353	196952	999952	99952	200009	202452	202113	201926	203803	200136	NULL	200009	200136	999952	201926	202353	NULL	202402	99952	203803	196952	202113
+M T LONG 6 0 - 63
+Y V 202402	202408	202353	196952	999952	99952	200009	202452	202113	201926	203803	200136	NULL	200009	200136	999952	201926	202353	NULL	202402	99952	203803	196952	202113
+Y T LONGLONG 7 0 - 63
+Q TO_DAYS(`dt`)
+M V 739265	739310	739250	719528	3652424	365243	730544	739616	738242	737609	744383	731102	NULL	730544	731102	3652424	737609	739250	NULL	739265	365243	744383	719528	738242
+M T LONG 6 0 - 63
+Y V 739265	739310	739250	719528	3652424	365243	730544	739616	738242	737609	744383	731102	NULL	730544	731102	3652424	737609	739250	NULL	739265	365243	744383	719528	738242
+Y T LONGLONG 8 0 - 63
+Q DATEDIFF(`dt`, `dtm`)
+M V 0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	NULL	NULL	0	0	0	0
+M T LONG 8 0 - 63
+Y V 0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	NULL	NULL	0	0	0	0
+Y T LONGLONG 9 0 - 63
+Q UNIX_TIMESTAMP(`dt`)
+M V 1705257000	1709145000	1703961000	NULL	NULL	NULL	951762600	1735583400	1616869800	1562178600	2147452200	999973800	NULL	951762600	999973800	NULL	1562178600	1703961000	NULL	1705257000	NULL	2147452200	NULL	1616869800
+M T LONGLONG 17 0 - 63
+Y V 1705257000	1709145000	1703961000	0	0	0	951762600	1735583400	1616869800	1562178600	2147452200	999973800	NULL	951762600	999973800	0	1562178600	1703961000	NULL	1705257000	0	2147452200	0	1616869800
+Y T LONGLONG 21 0 - 63
+Q UNIX_TIMESTAMP('2024-01-15')
+M V 1705257000
+M T LONGLONG 17 0 - 63
+Y V 1705257000
+Y T LONGLONG 21 0 N 63
+Q UNIX_TIMESTAMP(`dtm`)
+M V 1705294800.000000	1709231399.999999	1703961000.000000	NULL	NULL	NULL	951805800.000000	1735669799.500000	1616878800.000000	1562200628.090000	2147463847.000000	999980200.123456	NULL	951805800.000000	999980200.123456	NULL	1562200628.090000	1703961000.000000	1735669799.500000	NULL	NULL	2147463847.000000	NULL	1616878800.000000
+M T NEWDECIMAL 24 6 - 63
+Y V 1705294800.000000	1709231399.999999	1703961000.000000	0.000000	0.000000	0.000000	951805800.000000	1735669799.500000	1616878800.000000	1562200628.090000	2147463847.000000	999980200.123456	NULL	951805800.000000	999980200.123456	0.000000	1562200628.090000	1703961000.000000	1735669799.500000	NULL	0.000000	2147463847.000000	0.000000	1616878800.000000
+Y T NEWDECIMAL 19 6 - 63
+Q CURTIME()
+M V 03:43:20
+M T TIME 10 0 N 63
+Y V 03:43:20
+Y T TIME 8 0 N 63
+# == DATE_FORMAT's length comes from its pattern (%M and %W 64, %a and %b 32, %H and %k 7)
+Q DATE_FORMAT(`dt`, '%Y-%m-%d')
+M V 2024-01-15	2024-02-29	2023-12-31	1970-01-01	9999-12-31	1000-01-01	2000-02-29	2024-12-31	2021-03-28	2019-07-04	2038-01-19	2001-09-09	NULL	2000-02-29	2001-09-09	9999-12-31	2019-07-04	2023-12-31	NULL	2024-01-15	1000-01-01	2038-01-19	1970-01-01	2021-03-28
+M T VAR_STRING 40 0 - 224
+Y V 2024-01-15	2024-02-29	2023-12-31	1970-01-01	9999-12-31	1000-01-01	2000-02-29	2024-12-31	2021-03-28	2019-07-04	2038-01-19	2001-09-09	NULL	2000-02-29	2001-09-09	9999-12-31	2019-07-04	2023-12-31	NULL	2024-01-15	1000-01-01	2038-01-19	1970-01-01	2021-03-28
+Y T VAR_STRING 40 31 - 255
+Q DATE_FORMAT(`dt`, '%H:%i:%s')
+M V 00:00:00	00:00:00	00:00:00	00:00:00	00:00:00	00:00:00	00:00:00	00:00:00	00:00:00	00:00:00	00:00:00	00:00:00	NULL	00:00:00	00:00:00	00:00:00	00:00:00	00:00:00	NULL	00:00:00	00:00:00	00:00:00	00:00:00	00:00:00
+M T VAR_STRING 52 0 - 224
+Y V 00:00:00	00:00:00	00:00:00	00:00:00	00:00:00	00:00:00	00:00:00	00:00:00	00:00:00	00:00:00	00:00:00	00:00:00	NULL	00:00:00	00:00:00	00:00:00	00:00:00	00:00:00	NULL	00:00:00	00:00:00	00:00:00	00:00:00	00:00:00
+Y T VAR_STRING 52 31 - 255
+Q DATE_FORMAT(`dt`, '%W %M %e %Y')
+M V Monday January 15 2024	Thursday February 29 2024	Sunday December 31 2023	Thursday January 1 1970	Friday December 31 9999	Wednesday January 1 1000	Tuesday February 29 2000	Tuesday December 31 2024	Sunday March 28 2021	Thursday July 4 2019	Tuesday January 19 2038	Sunday September 9 2001	NULL	Tuesday February 29 2000	Sunday September 9 2001	Friday December 31 9999	Thursday July 4 2019	Sunday December 31 2023	NULL	Monday January 15 2024	Wednesday January 1 1000	Tuesday January 19 2038	Thursday January 1 1970	Sunday March 28 2021
+M T VAR_STRING 548 0 - 224
+Y V Monday January 15 2024	Thursday February 29 2024	Sunday December 31 2023	Thursday January 1 1970	Friday December 31 9999	Wednesday January 1 1000	Tuesday February 29 2000	Tuesday December 31 2024	Sunday March 28 2021	Thursday July 4 2019	Tuesday January 19 2038	Sunday September 9 2001	NULL	Tuesday February 29 2000	Sunday September 9 2001	Friday December 31 9999	Thursday July 4 2019	Sunday December 31 2023	NULL	Monday January 15 2024	Wednesday January 1 1000	Tuesday January 19 2038	Thursday January 1 1970	Sunday March 28 2021
+Y T VAR_STRING 548 31 - 255
+Q DATE_FORMAT(`dt`, '%a %b %c %D')
+M V Mon Jan 1 15th	Thu Feb 2 29th	Sun Dec 12 31st	Thu Jan 1 1st	Fri Dec 12 31st	Wed Jan 1 1st	Tue Feb 2 29th	Tue Dec 12 31st	Sun Mar 3 28th	Thu Jul 7 4th	Tue Jan 1 19th	Sun Sep 9 9th	NULL	Tue Feb 2 29th	Sun Sep 9 9th	Fri Dec 12 31st	Thu Jul 7 4th	Sun Dec 12 31st	NULL	Mon Jan 1 15th	Wed Jan 1 1st	Tue Jan 1 19th	Thu Jan 1 1st	Sun Mar 3 28th
+M T VAR_STRING 292 0 - 224
+Y V Mon Jan 1 15th	Thu Feb 2 29th	Sun Dec 12 31st	Thu Jan 1 1st	Fri Dec 12 31st	Wed Jan 1 1st	Tue Feb 2 29th	Tue Dec 12 31st	Sun Mar 3 28th	Thu Jul 7 4th	Tue Jan 1 19th	Sun Sep 9 9th	NULL	Tue Feb 2 29th	Sun Sep 9 9th	Fri Dec 12 31st	Thu Jul 7 4th	Sun Dec 12 31st	NULL	Mon Jan 1 15th	Wed Jan 1 1st	Tue Jan 1 19th	Thu Jan 1 1st	Sun Mar 3 28th
+Y T VAR_STRING 292 31 - 255
+Q DATE_FORMAT(`dt`, '%T %r %f')
+M V 00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	NULL	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	NULL	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000
+M T VAR_STRING 108 0 - 224
+Y V 00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	NULL	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	NULL	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000	00:00:00 12:00:00 AM 000000
+Y T VAR_STRING 108 31 - 255
+Q DATE_FORMAT(`dt`, '%%Y %q')
+M V %Y q	%Y q	%Y q	%Y q	%Y q	%Y q	%Y q	%Y q	%Y q	%Y q	%Y q	%Y q	NULL	%Y q	%Y q	%Y q	%Y q	%Y q	NULL	%Y q	%Y q	%Y q	%Y q	%Y q
+M T VAR_STRING 16 0 - 224
+Y V %Y q	%Y q	%Y q	%Y q	%Y q	%Y q	%Y q	%Y q	%Y q	%Y q	%Y q	%Y q	NULL	%Y q	%Y q	%Y q	%Y q	%Y q	NULL	%Y q	%Y q	%Y q	%Y q	%Y q
+Y T VAR_STRING 16 31 - 255
+Q DATE_FORMAT(`dt`, `vc`)
+M V NULL	a	A	abc	ABC 	1	12abc	été	b	ab%	1e2	z	NULL	A	abc	ABC 	1	12abc	NULL	b	ab%	1e2	z	NULL
+M T VAR_STRING 3200 0 - 224
+Y V NULL	a	A	abc	ABC 	1	12abc	été	b	ab%	1e2	z	NULL	A	abc	ABC 	1	12abc	NULL	b	ab%	1e2	z	NULL
+Y T VAR_STRING 800 31 - 255
+# == EXTRACT's lengths per unit; MariaDB's day units are wider for what is no date or time type
+Q EXTRACT(DAY FROM `dt`)
+M V 15	29	31	1	31	1	29	31	28	4	19	9	NULL	29	9	31	4	31	NULL	15	1	19	1	28
+M T LONG 3 0 - 63
+Y V 15	29	31	1	31	1	29	31	28	4	19	9	NULL	29	9	31	4	31	NULL	15	1	19	1	28
+Y T LONGLONG 3 0 - 63
+Q EXTRACT(DAY FROM '240115')
+M V 15
+M T LONG 8 0 - 63
+Y V 15
+Y T LONGLONG 3 0 - 63
+Q EXTRACT(DAY_MICROSECOND FROM `dtm`)
+M V 15103000000000	29235959999999	31000000000000	1000001500000	31235959999999	1000000000000	29120000000000	31235959500000	28023000000000	4060708090000	19031407000000	9014640123456	NULL	29120000000000	9014640123456	31235959999999	4060708090000	31000000000000	31235959500000	NULL	1000000000000	19031407000000	1000001500000	28023000000000
+M T LONGLONG 15 0 - 63
+Y V 15103000000000	29235959999999	31000000000000	1000001500000	31235959999999	1000000000000	29120000000000	31235959500000	28023000000000	4060708090000	19031407000000	9014640123456	NULL	29120000000000	9014640123456	31235959999999	4060708090000	31000000000000	31235959500000	NULL	1000000000000	19031407000000	1000001500000	28023000000000
+Y T LONGLONG 20 0 - 63
+Q EXTRACT(DAY_HOUR FROM 240115)
+M V 100
+M T LONG 10 0 - 63
+Y V 24
+Y T LONGLONG 9 0 - 63
+Q EXTRACT(YEAR FROM '2024-01-15')
+M V 2024
+M T LONG 4 0 - 63
+Y V 2024
+Y T LONGLONG 5 0 - 63
+Q EXTRACT(HOUR_MICROSECOND FROM `tm`)
+M V 103000000000	235959999000	0	-10203500000	225959000000	-225959000000	120000000000	1001000	40000000000	-1000	31407000000	14640000000	NULL	0	-10203500000	225959000000	-225959000000	120000000000	1001000	40000000000	-1000	31407000000	14640000000	103000000000
+M T LONGLONG 13 0 - 63
+Y V 103000000000	235959999000	0	-10203500000	8385959000000	-8385959000000	120000000000	1001000	1000000000000	-1000	31407000000	14640000000	NULL	0	-10203500000	8385959000000	-8385959000000	120000000000	1001000	1000000000000	-1000	31407000000	14640000000	103000000000
+Y T LONGLONG 14 0 - 63
+# == A text that reads as no date takes six decimals in CONVERT_TZ and MariaDB's DATE_ADD
+Q CONVERT_TZ('10:30:00', '+00:00', '+13:00')
+M V NULL
+M T DATETIME 26 6 - 63
+M W W 1292 Incorrect datetime value: '10:30:00'
+Y V NULL
+Y T DATETIME 26 6 - 63
+Y W W 1292 Incorrect datetime value: '10:30:00'
+Q DATE_ADD('10:30:00', INTERVAL 8 HOUR)
+M V NULL
+M T STRING 104 6 - 224
+M W W 1292 Incorrect datetime value: '10:30:00'
+Y V NULL
+Y T STRING 116 31 - 255
+Y W W 1292 Incorrect datetime value: '10:30:00'
+# == SUBSTRING's reported length: MySQL counts characters, MariaDB starts from the bytes
+Q SUBSTRING('abc', 2)
+M V bc
+M T VAR_STRING 44 39 - 224
+Y V bc
+Y T VAR_STRING 8 31 - 255
+Q SUBSTRING('abc', -5)
+M V 
+M T VAR_STRING 20 39 - 224
+Y V 
+Y T VAR_STRING 0 31 - 255
+Q SUBSTRING('abc', 2, 5)
+M V bc
+M T VAR_STRING 20 39 - 224
+Y V bc
+Y T VAR_STRING 8 31 - 255
+Q SUBSTRING(`vc`, 3)
+M V 			c	C 		abc	é		%	2		NULL		c	C 		abc	é		%	2		
+M T VAR_STRING 312 39 - 224
+Y V 			c	C 		abc	é		%	2		NULL		c	C 		abc	é		%	2		
+Y T VAR_STRING 72 31 - 255
+Q SUBSTRING(12345, 2)
+M V 2345
+M T VAR_STRING 16 39 - 224
+Y V 2345
+Y T VAR_STRING 20 31 - 255
+Q SUBSTRING('abc', NULL)
+M V NULL
+M T VAR_STRING 0 39 - 224
+Y V NULL
+Y T VAR_STRING 12 31 - 255
+Q LEFT('1', NULL)
+M V NULL
+M T VAR_STRING 0 39 - 224
+Y V NULL
+Y T VAR_STRING 4 31 - 255
+K Y l
+# == MySQL: SIGN and integer CEIL/FLOOR at BIGINT length; REPLACE grows by what a replacement adds; unknown counts make room for max_allowed_packet
+Q SIGN(`i4`)
+M V 0	1	-1	1	-1	1	1	-1	1	1	-1	1	NULL	1	1	-1	1	-1	-1	0	1	-1	1	1
+M T LONG 2 0 - 63
+Y V 0	1	-1	1	-1	1	1	-1	1	1	-1	1	NULL	1	1	-1	1	-1	-1	0	1	-1	1	1
+Y T LONGLONG 21 0 - 63
+Q CEIL(`d2`)
+M V 0	1	-1	100000000	-99999999	3	1	0	124	1	2	4	NULL	1	4	-99999999	1	-1	0	0	3	2	100000000	124
+M T LONG 10 0 - 63
+Y V 0	1	-1	100000000	-99999999	3	1	0	124	1	2	4	NULL	1	4	-99999999	1	-1	0	0	3	2	100000000	124
+Y T LONGLONG 21 0 - 63
+K M t
+Q FLOOR(`i1`)
+M V 0	1	-1	127	-128	2	-7	10	5	100	-50	3	NULL	-1	127	-128	2	-7	10	5	100	-50	3	0
+M T TINY 4 0 - 63
+Y V 0	1	-1	127	-128	2	-7	10	5	100	-50	3	NULL	-1	127	-128	2	-7	10	5	100	-50	3	0
+Y T LONGLONG 21 0 - 63
+K M t
+Q REPLACE('aBc', 'e', 'abc')
+M V aBc
+M T VAR_STRING 36 39 - 224
+Y V aBc
+Y T VAR_STRING 24 31 - 255
+Q REPEAT('a', -2)
+M V 
+M T VAR_STRING 0 39 - 224
+Y V 
+Y T LONG_BLOB 67108864 31 - 255
+Q LPAD('É', -2, '%')
+M V NULL
+M T VAR_STRING 0 39 - 224
+Y V NULL
+Y T LONG_BLOB 67108864 31 - 255
+Q REPEAT('abc', `d0`)
+M V 	abc		NULL		abcabcabc	abcabcabcabcabcabcabcabcabcabc		NULL	abcabc	abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc	abcabcabcabcabcabcabc	NULL	NULL	NULL	NULL	abcabcabc				abcabc		NULL	abcabcabcabcabcabcabcabcabcabc
+M T LONG_BLOB 67108864 39 - 224
+M W W 1916 Got overflow when converting '99999999999999999999' to INT. Value truncated
+M W W 1301 Result of repeat() was larger than max_allowed_packet (16777216) - truncated
+M W W 1916 Got overflow when converting '-99999999999999999999' to INT. Value truncated
+M W W 1916 Got overflow when converting '18446744073709551616' to INT. Value truncated
+M W W 1301 Result of repeat() was larger than max_allowed_packet (16777216) - truncated
+M W W 1916 Got overflow when converting '18446744073709551616' to INT. Value truncated
+M W W 1301 Result of repeat() was larger than max_allowed_packet (16777216) - truncated
+M W W 1916 Got overflow when converting '99999999999999999999' to INT. Value truncated
+M W W 1301 Result of repeat() was larger than max_allowed_packet (16777216) - truncated
+M W W 1916 Got overflow when converting '-99999999999999999999' to INT. Value truncated
+Y V 	abc		NULL		abcabcabc	abcabcabcabcabcabcabcabcabcabc		NULL	abcabc	abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc	abcabcabcabcabcabcabc	NULL	NULL	NULL	NULL	abcabcabc				abcabc		NULL	abcabcabcabcabcabcabcabcabcabc
+Y T LONG_BLOB 268435456 31 - 255
+Y W W 1292 Truncated incorrect DECIMAL value: '99999999999999999999'
+Y W W 1301 Result of repeat() was larger than max_allowed_packet (67108864) - truncated
+Y W W 1292 Truncated incorrect DECIMAL value: '-99999999999999999999'
+Y W W 1292 Truncated incorrect DECIMAL value: '18446744073709551616'
+Y W W 1301 Result of repeat() was larger than max_allowed_packet (67108864) - truncated
+Y W W 1292 Truncated incorrect DECIMAL value: '18446744073709551616'
+Y W W 1301 Result of repeat() was larger than max_allowed_packet (67108864) - truncated
+Y W W 1292 Truncated incorrect DECIMAL value: '99999999999999999999'
+Y W W 1301 Result of repeat() was larger than max_allowed_packet (67108864) - truncated
+Y W W 1292 Truncated incorrect DECIMAL value: '-99999999999999999999'
+K Y l
+Q SPACE(NULL)
+M V NULL
+M T VAR_STRING 0 39 - 224
+Y V NULL
+Y T VAR_STRING 0 31 - 255
+K M t
+Q CAST(`f8` AS BINARY)
+M V 0	1	-1.5	1e15	-0.000000000000001	2.5	0.1	1e300	123456.789	0.5	3.5	-0.0001	NULL	123456.789	1e15	3.5	NULL	0	1e300	-1.5	0.5	-0.000000000000001	-0.0001	NULL
+M T VAR_STRING 22 0 - 63
+Y V 0	1	-1.5	1e15	-0.000000000000001	2.5	0.1	1e300	123456.789	0.5	3.5	-0.0001	NULL	123456.789	1e15	3.5	NULL	0	1e300	-1.5	0.5	-0.000000000000001	-0.0001	NULL
+Y T VAR_STRING 22 31 - 63
+Q CAST(-1.5e0 AS BINARY)
+M V -1.5
+M T VAR_STRING 6 0 - 63
+Y V -1.5
+Y T VAR_STRING 23 31 - 63
+K Y l
+Q IFNULL(-1e0, '  ')
+M V -1
+M T VAR_STRING 16 39 N 224
+Y V -1
+Y T VAR_STRING 88 31 N 255
+# == Both servers compute a cast to CHAR(n) again for every row, with its warning
+Q (`vg` IN (CAST(CAST(-3.14159 AS CHAR(4)) AS CHAR(6)), LEAST('12abc', '-1', `d2`), 'A'))
+M V 0	1	1	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	0	1	0	0	0	0
+M T LONG 1 0 - 63
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+M W W 1292 Truncated incorrect DOUBLE value: ''
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+M W W 1292 Truncated incorrect DOUBLE value: 'a'
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+M W W 1292 Truncated incorrect DOUBLE value: 'A'
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+M W W 1292 Truncated incorrect DOUBLE value: 'abc'
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+M W W 1292 Truncated incorrect DOUBLE value: 'ABC '
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+M W W 1292 Truncated incorrect DOUBLE value: 'ÉTÉ'
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+M W W 1292 Truncated incorrect DOUBLE value: 'ß'
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+M W W 1292 Truncated incorrect DOUBLE value: 'ss'
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+M W W 1292 Truncated incorrect DOUBLE value: 'abd'
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+M W W 1292 Truncated incorrect DOUBLE value: '2024-01-15'
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+M W W 1292 Truncated incorrect DOUBLE value: 'ß'
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+M W W 1292 Truncated incorrect DOUBLE value: 'abc'
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+M W W 1292 Truncated incorrect DOUBLE value: 'abd'
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+M W W 1292 Truncated incorrect DOUBLE value: ''
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+M W W 1292 Truncated incorrect DOUBLE value: 'ÉTÉ'
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+M W W 1292 Truncated incorrect DOUBLE value: 'A'
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+M W W 1292 Truncated incorrect DOUBLE value: 'ss'
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+M W W 1292 Truncated incorrect DOUBLE value: 'ABC '
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+M W W 1292 Truncated incorrect DOUBLE value: '2024-01-15'
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect CHAR(4) value: '-3.14159'
+Y X 1271
+Q ((CAST(-1e308 AS CHAR(5)) COLLATE utf8mb4_bin) LIKE '')
+M V 0
+M T LONG 1 0 - 63
+M W W 1292 Truncated incorrect CHAR(5) value: '-1e308'
+Y V 0
+Y T LONGLONG 1 0 - 63
+Y W W 1292 Truncated incorrect CHAR(5) value: '-1e308'
+# == MariaDB converts a constant compared with a row's value once per statement
+Q ('a_c' = `u8`)
+M V 1	0	0	0	1	0	0	0	0	0	0	0	NULL	0	0	1	0	0	0	0	0	0	0	1
+M T LONG 1 0 - 63
+M W W 1292 Truncated incorrect DECIMAL value: 'a_c'
+Y V 1	0	0	0	1	0	0	0	0	0	0	0	NULL	0	0	1	0	0	0	0	0	0	0	1
+Y T LONGLONG 1 0 - 63
+Y W W 1292 Truncated incorrect DOUBLE value: 'a_c'
+Q ('A' = 2e-3)
+M V 0
+M T LONG 1 0 N 63
+M W W 1292 Truncated incorrect DOUBLE value: 'A'
+Y V 0
+Y T LONGLONG 1 0 N 63
+Y W W 1292 Truncated incorrect DOUBLE value: 'A'
+Q ('1 ' = (`i1` - `d2`))
+M V 0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	0	0	0	0	0	0
+M T LONG 1 0 - 63
+M W N 1292 Truncated incorrect DECIMAL value: '1 '
+Y V 0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	0	0	0	0	0	0
+Y T LONGLONG 1 0 - 63
+# == MySQL reads a column's string whose text after the number is exactly two bytes without a warning
+Q (`bn` + 0)
+M V 0	0	0	0	0	1	12	0	0	0	0	0	NULL	0	0	0	0	0	0	12	1	0	0	0
+M T DOUBLE 23 31 - 63
+M W W 1292 Truncated incorrect DOUBLE value: ''
+M W W 1292 Truncated incorrect DOUBLE value: 'a'
+M W W 1292 Truncated incorrect DOUBLE value: 'A'
+M W W 1292 Truncated incorrect DOUBLE value: 'abc'
+M W W 1292 Truncated incorrect DOUBLE value: 'ABC '
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect DOUBLE value: '\\xC3\\xA9'
+M W W 1292 Truncated incorrect DOUBLE value: '\\x00\\x01'
+M W W 1292 Truncated incorrect DOUBLE value: 'ab%'
+M W W 1292 Truncated incorrect DOUBLE value: '~'
+M W W 1292 Truncated incorrect DOUBLE value: 'z'
+M W W 1292 Truncated incorrect DOUBLE value: ''
+M W W 1292 Truncated incorrect DOUBLE value: 'z'
+M W W 1292 Truncated incorrect DOUBLE value: '~'
+M W W 1292 Truncated incorrect DOUBLE value: 'ab%'
+M W W 1292 Truncated incorrect DOUBLE value: '\\x00\\x01'
+M W W 1292 Truncated incorrect DOUBLE value: '\\xC3\\xA9'
+M W W 1292 Truncated incorrect DOUBLE value: '12abc'
+M W W 1292 Truncated incorrect DOUBLE value: 'ABC '
+M W W 1292 Truncated incorrect DOUBLE value: 'abc'
+M W W 1292 Truncated incorrect DOUBLE value: 'A'
+Y V 0	0	0	0	0	1	12	0	0	0	0	0	NULL	0	0	0	0	0	0	12	1	0	0	0
+Y T DOUBLE 23 31 - 63
+Y W W 1292 Truncated incorrect DOUBLE value: 'a'
+Y W W 1292 Truncated incorrect DOUBLE value: 'A'
+Y W W 1292 Truncated incorrect DOUBLE value: 'abc'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ABC '
+Y W W 1292 Truncated incorrect DOUBLE value: '12abc'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ab%'
+Y W W 1292 Truncated incorrect DOUBLE value: '~'
+Y W W 1292 Truncated incorrect DOUBLE value: 'z'
+Y W W 1292 Truncated incorrect DOUBLE value: 'z'
+Y W W 1292 Truncated incorrect DOUBLE value: '~'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ab%'
+Y W W 1292 Truncated incorrect DOUBLE value: '12abc'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ABC '
+Y W W 1292 Truncated incorrect DOUBLE value: 'abc'
+Y W W 1292 Truncated incorrect DOUBLE value: 'A'
+K M x
+Q (`vc` = 0)
+M V 1	1	1	1	1	0	0	1	1	1	0	1	NULL	1	1	1	0	0	1	1	1	0	1	1
+M T LONG 1 0 - 63
+M W W 1292 Truncated incorrect DECIMAL value: ''
+M W W 1292 Truncated incorrect DECIMAL value: 'a'
+M W W 1292 Truncated incorrect DECIMAL value: 'A'
+M W W 1292 Truncated incorrect DECIMAL value: 'abc'
+M W W 1292 Truncated incorrect DECIMAL value: 'ABC '
+M W W 1292 Truncated incorrect DECIMAL value: '12abc'
+M W W 1292 Truncated incorrect DECIMAL value: 'été'
+M W W 1292 Truncated incorrect DECIMAL value: 'b'
+M W W 1292 Truncated incorrect DECIMAL value: 'ab%'
+M W W 1292 Truncated incorrect DECIMAL value: 'z'
+M W W 1292 Truncated incorrect DECIMAL value: 'A'
+M W W 1292 Truncated incorrect DECIMAL value: 'abc'
+M W W 1292 Truncated incorrect DECIMAL value: 'ABC '
+M W W 1292 Truncated incorrect DECIMAL value: '12abc'
+M W W 1292 Truncated incorrect DECIMAL value: 'été'
+M W W 1292 Truncated incorrect DECIMAL value: 'b'
+M W W 1292 Truncated incorrect DECIMAL value: 'ab%'
+M W W 1292 Truncated incorrect DECIMAL value: 'z'
+M W W 1292 Truncated incorrect DECIMAL value: ''
+Y V 1	1	1	1	1	0	0	1	1	1	0	1	NULL	1	1	1	0	0	1	1	1	0	1	1
+Y T LONGLONG 1 0 - 63
+Y W W 1292 Truncated incorrect DOUBLE value: 'a'
+Y W W 1292 Truncated incorrect DOUBLE value: 'A'
+Y W W 1292 Truncated incorrect DOUBLE value: 'abc'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ABC '
+Y W W 1292 Truncated incorrect DOUBLE value: '12abc'
+Y W W 1292 Truncated incorrect DOUBLE value: 'été'
+Y W W 1292 Truncated incorrect DOUBLE value: 'b'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ab%'
+Y W W 1292 Truncated incorrect DOUBLE value: 'z'
+Y W W 1292 Truncated incorrect DOUBLE value: 'A'
+Y W W 1292 Truncated incorrect DOUBLE value: 'abc'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ABC '
+Y W W 1292 Truncated incorrect DOUBLE value: '12abc'
+Y W W 1292 Truncated incorrect DOUBLE value: 'été'
+Y W W 1292 Truncated incorrect DOUBLE value: 'b'
+Y W W 1292 Truncated incorrect DOUBLE value: 'ab%'
+Y W W 1292 Truncated incorrect DOUBLE value: 'z'

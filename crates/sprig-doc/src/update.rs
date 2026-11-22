@@ -943,6 +943,8 @@ fn bitop(k: &str, a: i64, b: i64) -> i64 {
 pub fn upsert_seed(query: &Pred) -> Result<Document, MongoError> {
     let mut fields = Vec::new();
     query.equality_fields(&mut fields);
+    // MongoDB builds the seed in path order, not the query's order.
+    fields.sort_by(|a, b| field_order(&a.0, &b.0));
     let mut d = Document::new();
     for (p, v) in fields {
         if p.split('.').any(|x| x.starts_with('$')) {

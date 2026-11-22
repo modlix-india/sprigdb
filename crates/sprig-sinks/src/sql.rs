@@ -1741,41 +1741,46 @@ pub fn render_sink(d: &SinkDef) -> String {
     s
 }
 
-/// Applies a change inside the caller's catalog transaction (the gateway
-/// opens a versioned catalog change around it).
+/// Applies a change inside the caller's catalog change: the sink rows go
+/// to its records (`rec`), a dropped or reset sink's consumer-group rows
+/// of the MariaDB stream path to its transaction (`q`, catalog `schema`).
 ///
 /// # Errors
-/// The catalog's; 39216 when sealing fails.
+/// The catalog's; 39211 for a taken name; 39216 when sealing fails.
+#[allow(clippy::too_many_arguments)]
 pub async fn apply<Q: Queryable + Send>(
     q: &mut Q,
     schema: &str,
+    rec: &mut dyn sprig_catalog::records::RecordTx,
     change: &Change,
     keys: Option<&dyn SinkKeyring>,
     tenant: TenantId,
     user: u32,
 ) -> Result<()> {
-    let store = SinksStore::new(schema);
     match change {
         Change::InsertConnection(def, secrets) => {
-            store.insert_connection(q, def).await?;
-            put_secrets(q, &store, keys, tenant, def.id, secrets, user).await?;
+            SinksStore::insert_connection(rec, def).await?;
+            put_secrets(rec, keys, tenant, def.id, secrets, user).await?;
         }
-        Change::UpdateConnection(def) => store.update_connection(q, def).await?,
+        Change::UpdateConnection(def) => SinksStore::update_connection(rec, def).await?,
         Change::Credentials(id, secrets) => {
-            put_secrets(q, &store, keys, tenant, *id, secrets, user).await?;
+            put_secrets(rec, keys, tenant, *id, secrets, user).await?;
         }
-        Change::DropConnection(def) => store.delete_connection(q, def).await?,
-        Change::InsertSink(def) => store.insert_sink(q, def).await?,
-        Change::UpdateSink(def) => store.update_sink(q, def).await?,
+        Change::DropConnection(def) => SinksStore::delete_connection(rec, def).await?,
+        Change::InsertSink(def) => SinksStore::insert_sink(rec, def).await?,
+        Change::UpdateSink(def) => SinksStore::update_sink(rec, def).await?,
         Change::ResetSink(def) => {
-            store.update_sink(q, def).await?;
-            sprig_streams::StreamsStore::new(schema)
-                .delete_group(q, &def.group())
-                .await?;
+            SinksStore::update_sink(rec, def).await?;
+            let streams = sprig_streams::StreamsStore::new(schema);
+            if streams.migrated(q).await.unwrap_or(true) {
+                streams.delete_group(q, &def.group()).await?;
+            }
         }
-        Change::State(id, s, r) => store.set_state(q, *id, *s, r.as_deref()).await?,
+        // The state record is written after the commit (`after_commit`);
+        // the change itself moves the catalog version.
+        Change::State(..) => {}
         Change::DropSink(def) => {
-            store.delete_sink(q, def.id).await?;
+            SinksStore::delete_sink(rec, def.id).await?;
             let streams = sprig_streams::StreamsStore::new(schema);
             // A tenant whose catalog never held a stream (a fan-in sink's
             // declarer whose task never ran) has no group tables.
@@ -1783,14 +1788,33 @@ pub async fn apply<Q: Queryable + Send>(
                 streams.delete_group(q, &def.group()).await?;
             }
         }
-        Change::Usage(u, grant) => store.set_usage(q, u, *grant, user).await?,
+        Change::Usage(u, grant) => SinksStore::set_usage(rec, u, *grant, user).await?,
     }
     Ok(())
 }
 
-async fn put_secrets<Q: Queryable + Send>(
-    q: &mut Q,
-    store: &SinksStore,
+/// What a change does after its catalog change committed: a sink's state
+/// (`PAUSE`, `RESUME`, `ALTER`) and a dropped sink's state and task rows,
+/// which tasks also write outside catalog changes, are written directly so
+/// they land in the order they happened.
+///
+/// # Errors
+/// The record store's.
+pub async fn after_commit(store: &SinksStore, change: &Change) -> Result<()> {
+    match change {
+        Change::State(id, s, r) => store.set_state(*id, *s, r.as_deref()).await,
+        Change::UpdateSink(def) | Change::ResetSink(def) => {
+            store
+                .set_state(def.id, def.state, def.state_reason.as_deref())
+                .await
+        }
+        Change::DropSink(def) => store.forget_sink(def.id).await,
+        _ => Ok(()),
+    }
+}
+
+async fn put_secrets(
+    rec: &mut dyn sprig_catalog::records::RecordTx,
     keys: Option<&dyn SinkKeyring>,
     tenant: TenantId,
     id: ConnectionId,
@@ -1807,11 +1831,9 @@ async fn put_secrets<Q: Queryable + Send>(
         )
     })?;
     for (name, value) in secrets {
-        let version = store.next_secret_version(q, id, name).await?;
+        let version = SinksStore::next_secret_version(rec, id, name).await?;
         let (kv, sealed) = crate::secrets::seal(keys, tenant, id.0, name, version, value)?;
-        store
-            .put_secret(q, id, name, version, kv, &sealed, user)
-            .await?;
+        SinksStore::put_secret(rec, id, name, version, kv, &sealed, user).await?;
     }
     Ok(())
 }

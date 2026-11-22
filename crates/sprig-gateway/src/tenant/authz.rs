@@ -219,7 +219,7 @@ impl AuthzServices {
         if migrated || !lock(&self.migrating).insert(cat.tenant) {
             return;
         }
-        let r = sprig_auth::authz::migrate(&*svc.locator, &svc.catalog, cat.tenant).await;
+        let r = sprig_auth::authz::migrate(&svc.auth, cat.tenant).await;
         match r {
             Ok(0) => {
                 lock(&self.current).insert(cat.tenant);
@@ -891,7 +891,7 @@ pub async fn account_statement(
             tenant_name: tenant_name.as_deref(),
             policy: &policy,
             audit: &audit,
-            catalog: &svc.catalog,
+            catalog: &svc.auth,
             snapshot: cat,
             tenant: ts.tenant,
             user,
@@ -1483,6 +1483,44 @@ pub fn check_session(
     r
 }
 
+/// Whether the session's privileges allow `needs` (what a statement
+/// touches, already known), at its installed snapshot: the statement
+/// pipeline's shortcut for plain statements on one table, which checks
+/// what [`check_session`] would without parsing the text. Counts no
+/// refusal: the caller sends a refused statement the long way, whose check
+/// answers it.
+#[must_use]
+pub fn allows_needs(
+    ts: &TenantSession,
+    persona: Persona,
+    needs: &[Need],
+    current: Option<&str>,
+) -> bool {
+    let Some(cat) = ts.catalog().cloned() else {
+        return true;
+    };
+    let p = privileges(ts, &cat);
+    if p.unrestricted() {
+        return true;
+    }
+    let client_host = ts.principal.client_ip.to_string();
+    let lctn = ts.lower_case_table_names();
+    let temp = |db: Option<&str>, name: &str| ts.is_temp(db, name);
+    let cx = CheckCtx {
+        cat: &cat,
+        p: &*p,
+        persona,
+        user: &ts.principal.user,
+        host: &ts.principal.host,
+        client_host: &client_host,
+        current,
+        lctn,
+        temp: &temp,
+        covered: &ts.rls.covered,
+    };
+    needs.iter().all(|n| cx.need(n).is_ok())
+}
+
 /// What a `DROP` statement removes, with `auth.grants_on_drop` resolved at
 /// each object's database, read from the session's snapshot before the
 /// statement runs. Objects that don't exist (`IF EXISTS`) and temporary
@@ -1557,7 +1595,7 @@ pub async fn objects_dropped(ts: &TenantSession, dropped: &[Dropped]) {
         return;
     };
     let svc = Arc::clone(ts.services());
-    match engine.objects_dropped(&svc.catalog, &cat, dropped).await {
+    match engine.objects_dropped(&svc.auth, &cat, dropped).await {
         Ok(Some(v)) => {
             if let Some(c) = await_auth(&svc, ts.tenant, v).await {
                 let cluster = ts.principal.backend.cluster.clone();
@@ -1678,7 +1716,7 @@ pub async fn objects_renamed(ts: &TenantSession, renamed: &[Renamed]) {
         return;
     };
     let svc = Arc::clone(ts.services());
-    match engine.objects_renamed(&svc.catalog, &cat, renamed).await {
+    match engine.objects_renamed(&svc.auth, &cat, renamed).await {
         Ok(Some(v)) => {
             // This gateway's snapshot has it before the rename commits.
             let _ = await_auth(&svc, ts.tenant, v).await;

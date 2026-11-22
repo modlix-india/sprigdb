@@ -532,9 +532,9 @@ impl Runner for GwRunner<'_, '_, '_> {
             self.migrated = true;
         }
         let mut c = svc.catalog.change(tenant, VersionKind::Catalog).await?;
-        let applied = {
-            let (store, tx) = c.tx().parts();
-            TypesStore::new(store.schema()).apply(tx, change).await
+        let applied = match c.tx().records().await {
+            Ok(rec) => TypesStore::apply(rec, change).await,
+            Err(e) => Err(e),
         };
         if let Err(e) = applied {
             let _ = c.rollback().await;

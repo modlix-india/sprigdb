@@ -4,9 +4,9 @@
 //! `CREATE USER`. `sprigctl tenant user add <tenant> <user> --password ...`
 //! calls it.
 //!
-//! The call migrates the catalog's `auth` module first (idempotent), so
-//! tenants bootstrapped before [`AuthHooks`] registered the module get its
-//! tables too. Bootstrap migrates it with the core module from now on.
+//! Users, verifiers and grants are catalog records in the engine node's
+//! storage engine, written through its peer service: nothing is migrated
+//! first.
 //!
 //! Token issuers and accounts' `token` method: [`issuers`].
 //!
@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use sprig_auth::admin::{self, NewUser};
 use sprig_auth::portable::PortableAccounts;
 use sprig_auth::store::AUTH_MODULE;
-use sprig_catalog::{CatalogLocator, MariaCatalog, Migrator, Module};
+use sprig_catalog::{AuthCatalog, Module};
 use sprig_common::ids::{TenantId, UserId};
 use sprig_common::time::Clock;
 use sprig_common::{Result, SprigCode, SprigError};
@@ -35,10 +35,10 @@ pub use suspend::{MAX_REASON, SuspendTenantRequest, SuspendTenantResponse};
 use crate::tenants::BootstrapHooks;
 use crate::tree::{Directory, TenantState};
 
-/// Bootstrap hooks that migrate the `auth` module (and the `workload`
-/// module) with the core catalog, so a new tenant's
-/// catalog has its `users` and `verifiers` tables (gateways load them into
-/// every snapshot) and its workload tables.
+/// Bootstrap hooks that migrate the `workload` module with the core
+/// catalog (and register the auth modules, whose rows are engine records
+/// and have no migrations), so a new tenant's catalog has its workload
+/// tables.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AuthHooks;
 
@@ -211,8 +211,7 @@ pub struct ImportAccountsResponse {
 /// Creates users in tenant catalogs.
 pub struct TenantUsers {
     directory: Directory,
-    locator: Arc<dyn CatalogLocator>,
-    catalog: MariaCatalog,
+    catalog: AuthCatalog,
     clock: Arc<dyn Clock>,
 }
 
@@ -223,17 +222,12 @@ impl std::fmt::Debug for TenantUsers {
 }
 
 impl TenantUsers {
-    /// Users in the catalogs `locator` finds, changed through `catalog`.
+    /// Users of the directory's tenants, changed through `catalog` (the
+    /// engine node's catalog records).
     #[must_use]
-    pub fn new(
-        directory: Directory,
-        locator: Arc<dyn CatalogLocator>,
-        catalog: MariaCatalog,
-        clock: Arc<dyn Clock>,
-    ) -> Self {
+    pub fn new(directory: Directory, catalog: AuthCatalog, clock: Arc<dyn Clock>) -> Self {
         Self {
             directory,
-            locator,
             catalog,
             clock,
         }
@@ -259,19 +253,6 @@ impl TenantUsers {
             return Err(crate::admin::invalid("a password is required"));
         }
         let id = e.tenant_id;
-        // The auth module's tables, for tenants bootstrapped before the
-        // hook existed. Idempotent.
-        let ep = self.locator.writer(id).await?;
-        let mut conn = crate::catalogs::acquire(&ep.pool, "auth tables").await?;
-        crate::catalogs::migrate_catalog(
-            &*self.locator,
-            id,
-            &mut conn,
-            ep.store.schema(),
-            &Migrator::new(&[AUTH_MODULE, sprig_auth::authz::AUTHZ_MODULE])?,
-        )
-        .await?;
-        drop(conn);
         let mut new = NewUser::new(req.user.clone(), req.password.as_bytes());
         if let Some(h) = &req.host {
             new.host.clone_from(h);
@@ -339,17 +320,6 @@ impl TenantUsers {
     ) -> Result<ImportAccountsResponse> {
         sprig_common::audit::check_available()?;
         let id = self.active(tenant).await?;
-        let ep = self.locator.writer(id).await?;
-        let mut conn = crate::catalogs::acquire(&ep.pool, "auth tables").await?;
-        crate::catalogs::migrate_catalog(
-            &*self.locator,
-            id,
-            &mut conn,
-            ep.store.schema(),
-            &Migrator::new(&[AUTH_MODULE, sprig_auth::authz::AUTHZ_MODULE])?,
-        )
-        .await?;
-        drop(conn);
         let mut out = ImportAccountsResponse::default();
         for a in &accounts.users {
             let account = format!("'{}'@'{}'", a.name, a.host);

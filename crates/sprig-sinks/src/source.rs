@@ -89,6 +89,8 @@ pub struct StreamSource {
     turn: usize,
     sink: SinkId,
     last_replay_check: Option<tokio::time::Instant>,
+    /// The sink's records (its dead letters to replay).
+    sinks: Option<SinksStore>,
 }
 
 impl std::fmt::Debug for StreamSource {
@@ -102,6 +104,13 @@ impl std::fmt::Debug for StreamSource {
 }
 
 impl StreamSource {
+    /// The same source, replaying the sink's dead letters from `store`.
+    #[must_use]
+    pub fn with_sinks(mut self, store: SinksStore) -> Self {
+        self.sinks = Some(store);
+        self
+    }
+
     /// Opens the source at its committed offsets, or at `start` for
     /// partitions without one (committing that position).
     ///
@@ -220,6 +229,7 @@ impl StreamSource {
             turn: 0,
             sink,
             last_replay_check: None,
+            sinks: None,
         })
     }
 
@@ -232,9 +242,10 @@ impl StreamSource {
             return Ok(Vec::new());
         }
         self.last_replay_check = Some(now);
-        let store = SinksStore::new(self.catalog_schema.clone());
-        let mut c = self.catalog.get_conn().await.map_err(backend)?;
-        let mut v = store.take_replays(&mut c, self.sink, 500).await?;
+        let Some(store) = &self.sinks else {
+            return Ok(Vec::new());
+        };
+        let mut v = store.take_replays(self.sink, 500).await?;
         for r in &mut v {
             // Replays settle on their own: they are below the offsets.
             r.pos = Position::Queue {

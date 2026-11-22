@@ -39,6 +39,9 @@ pub(crate) struct EngineCatalog {
     /// The same by (database, lower-case name), for tenants whose names
     /// compare in lower case (`lower_case_table_names`).
     pub by_lower: HashMap<(DbId, String), ObjectId>,
+    /// The foreign keys by the lower-case name of the table they reference:
+    /// each child table and the key's position in its definition.
+    pub refs: HashMap<String, Vec<(ObjectId, usize)>>,
 }
 
 impl ExtState for EngineCatalog {
@@ -138,6 +141,15 @@ impl CatalogExtension for EngineExtension {
             };
             state.by_lower.insert((db, name.to_lowercase()), object);
             state.by_name.insert((db, name), object);
+            if let Ok(def) = &parsed {
+                for (i, f) in def.fks.iter().enumerate() {
+                    state
+                        .refs
+                        .entry(f.ref_table.to_lowercase())
+                        .or_default()
+                        .push((object, i));
+                }
+            }
             state.tables.insert(object, Arc::new(parsed));
         }
         Ok(Arc::new(state))

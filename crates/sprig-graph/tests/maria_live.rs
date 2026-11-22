@@ -25,11 +25,28 @@ use sprig_graph::store::IndexDef;
 use sprig_graph::value::Value;
 use sprig_graph::{Budgets, Output, execute};
 
+/// The graph catalog's records for these tests (in memory: the graph
+/// module's rows live in the engine's catalog records).
+fn catalog_records() -> &'static sprig_catalog::records::mem::MemRecords {
+    static M: std::sync::OnceLock<sprig_catalog::records::mem::MemRecords> =
+        std::sync::OnceLock::new();
+    M.get_or_init(sprig_catalog::records::mem::MemRecords::new)
+}
+
+/// Adds a native label or type to graph `g` in a transaction of its own.
+async fn add_source(g: u64, label: bool, name: &str) -> sprig_common::Result<u32> {
+    use sprig_catalog::records::RecordStore as _;
+    let mut tx = catalog_records()
+        .begin(sprig_common::ids::TenantId(1))
+        .await?;
+    let id = sprig_graph::catalog::GraphCatalog::add_source(&mut *tx, g, label, name).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
 const GRAPH: u64 = 901;
 
 struct Dict {
-    cat: String,
-    pool: mysql_async::Pool,
     labels: Mutex<BTreeMap<u32, String>>,
     types: Mutex<BTreeMap<u32, String>>,
 }
@@ -37,14 +54,7 @@ struct Dict {
 #[async_trait]
 impl Dictionary for Dict {
     async fn create(&self, label: bool, name: &str) -> Result<u32> {
-        let mut c = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(sprig_graph::catalog::backend_error)?;
-        let id = GraphCatalog::new(&self.cat)
-            .add_source(&mut c, GRAPH, label, name)
-            .await?;
+        let id = add_source(GRAPH, label, name).await?;
         let m = if label { &self.labels } else { &self.types };
         m.lock().expect("lock").insert(id, name.to_owned());
         Ok(id)
@@ -167,14 +177,7 @@ async fn setup(prefix: &str, shards: u32) -> Option<Live> {
             .await
             .expect("create");
     }
-    GraphCatalog::new(&cat)
-        .migrate(&mut c)
-        .await
-        .expect("migrate");
-    GraphCatalog::new(&cat)
-        .insert_native(&mut c, GRAPH, 1)
-        .await
-        .expect("graph row");
+    GraphCatalog::migrate(&mut c, &cat).await.expect("migrate");
     let layout = if shards == 1 {
         GraphShards::single(GRAPH, 1, &data[0], "c1")
     } else {
@@ -205,8 +208,6 @@ async fn setup(prefix: &str, shards: u32) -> Option<Live> {
     drop(c);
     Some(Live {
         dict: Arc::new(Dict {
-            cat,
-            pool: pool.clone(),
             labels: Mutex::new(BTreeMap::new()),
             types: Mutex::new(BTreeMap::new()),
         }),

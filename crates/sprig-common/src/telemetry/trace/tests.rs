@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -89,6 +90,40 @@ fn tail_sampling_keeps_failures_and_slow_roots_only() {
         tracer.recent().last().unwrap().kept_because,
         KeptBecause::Slow
     );
+}
+
+/// A root its caller head-sampled already is kept whatever the layer's own
+/// roll would say; a root the caller ran without a span is kept, alone,
+/// when it failed or was slow, and dropped otherwise.
+#[test]
+fn caller_sampled_and_unspanned_roots() {
+    let tracer = Arc::new(Tracer::new(0.0, 10_000));
+    with_tracer(&tracer, || {
+        let root = tracing::info_span!(target: TARGET, "gateway.request", sampled = true);
+        let _g = root.enter();
+    });
+    let t = tracer.recent();
+    assert_eq!(t.len(), 1);
+    assert_eq!(t[0].kept_because, KeptBecause::Sampled);
+    assert!(
+        t[0].root()
+            .unwrap()
+            .attributes
+            .iter()
+            .all(|(k, _)| k != SAMPLED_FIELD),
+        "the hint isn't an attribute"
+    );
+    let attrs = || vec![("protocol".to_owned(), "mysql".to_owned())];
+    tracer.unsampled_root("gateway.request", attrs, Duration::from_millis(1), false);
+    assert_eq!(tracer.recent().len(), 1, "fast and fine: dropped");
+    tracer.unsampled_root("gateway.request", attrs, Duration::from_millis(1), true);
+    let t = tracer.recent();
+    assert_eq!(t.len(), 2);
+    assert_eq!(t[1].kept_because, KeptBecause::Error);
+    assert_eq!(t[1].spans.len(), 1);
+    assert_eq!(t[1].root().unwrap().attributes, attrs());
+    tracer.unsampled_root("gateway.request", attrs, Duration::from_secs(11), false);
+    assert_eq!(tracer.recent()[2].kept_because, KeptBecause::Slow);
 }
 
 /// A light child (`ChildSpan`) is kept with its root as a

@@ -26,6 +26,7 @@ mod engine;
 pub mod keys;
 pub mod locks;
 pub mod log;
+pub mod observe;
 pub mod row;
 pub mod store;
 pub mod txn;
@@ -34,6 +35,7 @@ pub use config::{EngineConfig, StoreKind};
 pub use engine::{Engine, EngineStats, VersionGc};
 pub use keys::Ts;
 pub use log::{Durability, UnitId};
+pub use observe::ApplyObserver;
 pub use store::{Cf, Read};
 
 #[cfg(test)]

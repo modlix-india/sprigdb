@@ -124,6 +124,52 @@ pub struct ExecSummary {
     pub session: u64,
 }
 
+/// Executions of one fingerprint a session gathered before handing them
+/// to the recorder in one step ([`Recorder::record_batch`]): what
+/// [`Recorder::record`] would have counted for each, without a probe's
+/// rows examined (probed executions are recorded one by one).
+#[derive(Debug, Clone, Default)]
+pub struct Batch {
+    stats: Stats,
+    min_us: u64,
+}
+
+impl Batch {
+    /// Adds one execution of `fp`. `ex.examined` is ignored.
+    pub fn add(&mut self, fp: &Fingerprint, ex: &ExecSummary) {
+        let s = &mut self.stats;
+        self.min_us = if s.exec_count == 0 {
+            ex.latency_us
+        } else {
+            self.min_us.min(ex.latency_us)
+        };
+        s.exec_count += 1;
+        s.error_count += u64::from(ex.error);
+        s.total_us = s.total_us.saturating_add(ex.latency_us);
+        s.max_us = s.max_us.max(ex.latency_us);
+        s.latency_hist.record(ex.latency_us);
+        s.rows_returned = s.rows_returned.saturating_add(ex.rows_returned);
+        s.rows_affected = s.rows_affected.saturating_add(ex.rows_affected);
+        s.shards_sum += u64::from(ex.shards);
+        s.shards_max = s.shards_max.max(ex.shards);
+        s.scatter_count += u64::from(ex.scatter);
+        s.cross_cluster += u64::from(ex.clusters > 1);
+        s.in_list_max = s.in_list_max.max(ex.in_list_max.max(fp.in_list_max));
+    }
+
+    /// Executions gathered.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.stats.exec_count
+    }
+
+    /// Whether none were.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.stats.exec_count == 0
+    }
+}
+
 /// What [`Recorder::plan`] asks the gateway to do around one execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ProbePlan {
@@ -383,6 +429,28 @@ pub struct Digest {
 }
 
 impl Digest {
+    /// A [`Batch`]'s executions, all counted at `wall`.
+    fn add_batch(&mut self, b: &Batch, wall: SystemTime) {
+        if b.is_empty() {
+            return;
+        }
+        self.min_us = if self.exec_count == 0 {
+            b.min_us
+        } else {
+            self.min_us.min(b.min_us)
+        };
+        let s = &b.stats;
+        self.exec_count += s.exec_count;
+        self.error_count += s.error_count;
+        self.total_us = self.total_us.saturating_add(s.total_us);
+        self.max_us = self.max_us.max(s.max_us);
+        self.latency_hist.merge(&s.latency_hist);
+        self.rows_returned = self.rows_returned.saturating_add(s.rows_returned);
+        self.rows_affected = self.rows_affected.saturating_add(s.rows_affected);
+        self.first_seen.get_or_insert(wall);
+        self.last_seen = Some(wall);
+    }
+
     fn add(&mut self, ex: &ExecSummary, wall: SystemTime) {
         self.min_us = if self.exec_count == 0 {
             ex.latency_us
@@ -622,7 +690,9 @@ impl Recorder {
 
     /// (bucket start, now) in seconds since the epoch.
     fn now(&self) -> (u64, u64, SystemTime) {
-        let wall = self.clock.wall();
+        // Asked twice per statement: derived from the poll's monotonic
+        // reading, not read from the wall clock each time.
+        let wall = self.clock.wall_at(sprig_common::time::poll::now());
         let secs = wall.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let b = self.bucket_secs();
         (secs - secs % b, secs, wall)
@@ -639,12 +709,18 @@ impl Recorder {
     /// ([`Recorder::watch`]). The caller must not probe statements of
     /// client multi-statement packets.
     pub fn plan(&self, tenant: TenantId, fp: &Fingerprint) -> ProbePlan {
+        self.plan_watched(tenant, fp).unwrap_or_default()
+    }
+
+    /// [`Self::plan`], `None` when `fp` isn't watched now (no probe and no
+    /// capture whatever the roll): a session may keep that answer for a
+    /// while instead of asking at every execution.
+    #[must_use]
+    pub fn plan_watched(&self, tenant: TenantId, fp: &Fingerprint) -> Option<ProbePlan> {
         let key = (tenant, fp.id.0);
         let (bucket, ..) = self.now();
         let mut m = lock(self.shard(&key));
-        let Some(e) = m.get_mut(&key) else {
-            return ProbePlan::default();
-        };
+        let e = m.get_mut(&key)?;
         if e.samples_in_bucket.0 != bucket {
             e.samples_in_bucket = (bucket, 0);
         }
@@ -657,7 +733,7 @@ impl Recorder {
         let p95 = cur.latency_hist.quantile_us(0.95).unwrap_or(0);
         let watched = e.watched || p95 > watch_us || e.prev_p95_us > watch_us;
         if !watched {
-            return ProbePlan::default();
+            return None;
         }
         let roll = mix(fp.id.0 ^ cur.exec_count.rotate_left(17) ^ tenant.0);
         let full = cur.mean_us() >= self.cfg.load().full_probe_ms.saturating_mul(1000)
@@ -679,10 +755,10 @@ impl Recorder {
         if capture_params {
             self.samples_total.fetch_add(1, Ordering::Relaxed);
         }
-        ProbePlan {
+        Some(ProbePlan {
             examined,
             capture_params,
-        }
+        })
     }
 
     /// Marks a fingerprint as watched (automatic indexing asked, or it is
@@ -705,6 +781,33 @@ impl Recorder {
 
     /// Counts one execution.
     pub fn record(&self, tenant: TenantId, fp: &Fingerprint, ex: &ExecSummary) {
+        self.count(tenant, fp, &|r: &Self, e: &mut Entry, secs, wall| {
+            r.add(e, fp, ex, secs);
+            e.digest.add(ex, wall);
+        });
+    }
+
+    /// Counts a session's gathered executions of `fp` in one step, at the
+    /// time of the call (they ran within the session's batch window).
+    pub fn record_batch(&self, tenant: TenantId, fp: &Fingerprint, b: &Batch) {
+        if b.is_empty() {
+            return;
+        }
+        self.count(tenant, fp, &|_: &Self, e: &mut Entry, secs, wall| {
+            e.stats.merge(&b.stats);
+            e.digest.add_batch(b, wall);
+            e.last_seen_secs = secs;
+        });
+    }
+
+    /// Applies `apply` to `fp`'s entry (made at its first sighting), in the
+    /// current bucket.
+    fn count(
+        &self,
+        tenant: TenantId,
+        fp: &Fingerprint,
+        apply: &dyn Fn(&Self, &mut Entry, u64, SystemTime),
+    ) {
         let (bucket, secs, wall) = self.now();
         let key = (tenant, fp.id.0);
         {
@@ -714,8 +817,7 @@ impl Recorder {
                     self.roll(tenant, e, bucket);
                 }
                 let before = e.hist_bytes();
-                self.add(e, fp, ex, secs);
-                e.digest.add(ex, wall);
+                apply(self, e, secs, wall);
                 let grew = e.hist_bytes().saturating_sub(before);
                 if grew > 0 {
                     e.bytes += grew;
@@ -724,7 +826,7 @@ impl Recorder {
                 return;
             }
         }
-        self.first_record(tenant, fp, ex, bucket, secs, wall);
+        self.first_record(tenant, fp, apply, bucket, secs, wall);
     }
 
     fn add(&self, e: &mut Entry, fp: &Fingerprint, ex: &ExecSummary, secs: u64) {
@@ -810,7 +912,7 @@ impl Recorder {
         &self,
         tenant: TenantId,
         fp: &Fingerprint,
-        ex: &ExecSummary,
+        apply: &dyn Fn(&Self, &mut Entry, u64, SystemTime),
         bucket: u64,
         secs: u64,
         wall: SystemTime,
@@ -867,11 +969,9 @@ impl Recorder {
                 if existing.bucket_start != bucket {
                     self.roll(tenant, existing, bucket);
                 }
-                self.add(existing, fp, ex, secs);
-                existing.digest.add(ex, wall);
+                apply(self, existing, secs, wall);
             } else {
-                self.add(&mut e, fp, ex, secs);
-                e.digest.add(ex, wall);
+                apply(self, &mut e, secs, wall);
                 e.bytes = e.heap_bytes();
                 let bytes = e.bytes;
                 m.insert(key, e);

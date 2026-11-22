@@ -39,6 +39,8 @@ use crate::pool_wait::Bounded as _;
 use crate::sql::{bytes_col, col, json_col, map_err, time_col, to_datetime};
 use crate::version::VersionKind;
 
+pub mod reclog;
+
 macro_rules! sql_enum {
     ($(#[$doc:meta])* $name:ident { $($(#[$vdoc:meta])* $variant:ident = $text:literal,)* }) => {
         $(#[$doc])*
@@ -1140,6 +1142,34 @@ impl Store {
             .await
             .map_err(map_err)?;
         rows.into_iter().map(object_row).collect()
+    }
+
+    /// The objects among `ids`, tombstones included, by id (ids with no
+    /// row are left out).
+    ///
+    /// # Errors
+    /// As [`object`](Self::object).
+    pub async fn objects_by_ids<Q: Queryable + Send>(
+        &self,
+        q: &mut Q,
+        ids: &[ObjectId],
+    ) -> Result<Vec<ObjectRow>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(1000) {
+            let list: Vec<String> = chunk.iter().map(|i| i.0.to_string()).collect();
+            let rows: Vec<Row> = q
+                .query(format!(
+                    "SELECT {OBJ_COLS} FROM {} WHERE object_id IN ({}) ORDER BY object_id",
+                    self.objects,
+                    list.join(", ")
+                ))
+                .await
+                .map_err(map_err)?;
+            for r in rows {
+                out.push(object_row(r)?);
+            }
+        }
+        Ok(out)
     }
 
     /// Deletes an object row that was never visible (a `creating` row

@@ -79,23 +79,32 @@ pub async fn after_grants(svc: &Arc<TenantServices>, cat: &TenantCatalog, lctn: 
     let tenant = cat.tenant;
     let r: sprig_common::Result<u64> = async {
         let mut c = svc.catalog.change(tenant, VersionKind::Catalog).await?;
-        let applied = {
-            let (store, tx) = c.tx().parts();
-            let mut r = Ok(());
-            for (id, state, reason) in &todo {
-                let ch = Change::State(*id, *state, reason.clone());
-                r = sprig_sinks::sql::apply(tx, store.schema(), &ch, None, tenant, 0).await;
-                if r.is_err() {
-                    break;
+        let applied = match c.tx().split().await {
+            Err(e) => Err(e),
+            Ok((store, tx, rec)) => {
+                let schema = store.schema().to_owned();
+                let mut r = Ok(());
+                for (id, state, reason) in &todo {
+                    let ch = Change::State(*id, *state, reason.clone());
+                    r = sprig_sinks::sql::apply(tx, &schema, rec, &ch, None, tenant, 0).await;
+                    if r.is_err() {
+                        break;
+                    }
                 }
+                r
             }
-            r
         };
         if let Err(e) = applied {
             let _ = c.rollback().await;
             return Err(e);
         }
-        c.commit().await
+        let v = c.commit().await?;
+        let store = sprig_sinks::store::SinksStore::new(Arc::clone(&svc.records), tenant);
+        for (id, state, reason) in &todo {
+            let ch = Change::State(*id, *state, reason.clone());
+            sprig_sinks::sql::after_commit(&store, &ch).await?;
+        }
+        Ok(v)
     }
     .await;
     match r {

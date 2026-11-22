@@ -4,6 +4,7 @@
 mod datetime;
 mod hash;
 mod numeric;
+mod regexp;
 mod string;
 mod strtail;
 
@@ -135,7 +136,7 @@ pub(crate) fn build(name: &str, args: &[Expr], env: Env<'_>) -> Result<Node> {
         }
         "SIGN" => {
             let [a] = take(name, nodes)?;
-            Ok(numeric::sign(a))
+            Ok(numeric::sign(a, env))
         }
         "CEIL" | "CEILING" | "FLOOR" => {
             let [a] = take(name, nodes)?;
@@ -368,9 +369,19 @@ pub(crate) fn build(name: &str, args: &[Expr], env: Env<'_>) -> Result<Node> {
             match args.iter().find(|a| !matches!(a, Expr::Keyword(_))) {
                 Some(Expr::Str(s)) => Ok(strtail::introducer(s.as_bytes(), text, coll)),
                 Some(Expr::Hex(b)) => Ok(strtail::introducer(b, text, coll)),
-                _ => Err(SqlError::new(1064, "42000", "You have an error in your SQL syntax")),
+                _ => Err(SqlError::new(
+                    1064,
+                    "42000",
+                    "You have an error in your SQL syntax",
+                )),
             }
         }
+        "REGEXP" => regexp::like(nodes, name, env),
+        // MariaDB has no REGEXP_LIKE.
+        "REGEXP_LIKE" if !env.maria() => regexp::like(nodes, name, env),
+        "REGEXP_INSTR" => regexp::instr(nodes, env),
+        "REGEXP_SUBSTR" => regexp::substr(nodes, env),
+        "REGEXP_REPLACE" => regexp::replace(nodes, env),
         _ => Err(SqlError::no_function(name)),
     }
 }
@@ -420,6 +431,14 @@ fn unit_of(args: &[Expr]) -> Result<datetime::Unit> {
 
 /// Writes a function call as SQL text.
 pub(crate) fn write_sql(out: &mut String, name: &str, args: &[Expr]) {
+    if let ("REGEXP", [s, p]) = (name, args) {
+        out.push('(');
+        out.push_str(&s.to_sql());
+        out.push_str(" REGEXP ");
+        out.push_str(&p.to_sql());
+        out.push(')');
+        return;
+    }
     if let ("TRIM_BOTH" | "TRIM_LEADING" | "TRIM_TRAILING", [rem, s]) = (name, args) {
         out.push_str("TRIM(");
         out.push_str(&name[5..]);

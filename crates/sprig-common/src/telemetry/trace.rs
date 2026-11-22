@@ -422,6 +422,8 @@ struct Fields {
     attributes: Vec<(String, String)>,
     traceparent: Option<String>,
     error: Option<bool>,
+    /// The caller already head-sampled the root ([`head_sampled`]).
+    sampled: bool,
 }
 
 impl Fields {
@@ -447,6 +449,10 @@ impl Visit for Fields {
         self.put(field, value.to_owned());
     }
     fn record_bool(&mut self, field: &Field, value: bool) {
+        if field.name() == SAMPLED_FIELD {
+            self.sampled = value;
+            return;
+        }
         if field.name() == "error" {
             self.error = Some(value);
         }
@@ -518,7 +524,8 @@ where
                 || (u128::from(random_u64()) << 64) | u128::from(random_u64()),
                 |r| r.trace_id,
             );
-            let sampled = remote.is_some_and(|r| r.sampled) || self.tracer.head_sample();
+            let sampled =
+                remote.is_some_and(|r| r.sampled) || fields.sampled || self.tracer.head_sample();
             (
                 TraceContext {
                     trace_id,
@@ -600,6 +607,73 @@ where
             }
         }
         dropped(1);
+    }
+}
+
+/// The field a root span carries as `true` when its caller head-sampled it
+/// already ([`head_sampled`]): the trace layer then doesn't roll again.
+pub const SAMPLED_FIELD: &str = "sampled";
+
+/// Head sampling for a root the caller is about to open: `true` with
+/// probability `telemetry.trace_sample_ratio`. A caller that opens a root
+/// span only when this says so marks it with [`SAMPLED_FIELD`], and
+/// reports the roots it didn't open with [`unsampled_root`].
+#[must_use]
+pub fn head_sampled() -> bool {
+    with_installed(Tracer::head_sample)
+}
+
+/// `f` on the tracer of the trace layer in the current subscriber, else on
+/// the process's [`tracer`] (which that layer normally feeds).
+fn with_installed<R>(f: impl FnOnce(&Tracer) -> R) -> R {
+    let installed = tracing::dispatcher::get_default(|d| {
+        d.downcast_ref::<TraceLayer>()
+            .map(|l| Arc::clone(&l.tracer))
+    });
+    match installed {
+        Some(t) => f(&t),
+        None => f(tracer()),
+    }
+}
+
+/// A root that ran without a span (its caller's [`head_sampled`] said no
+/// and no `traceparent` came in) and just ended, `ran` long: kept as a
+/// trace of that one span when it failed or was slower than
+/// `telemetry.trace_slow_ms`, as tail sampling keeps a spanned root (with
+/// no child spans, which weren't recorded).
+pub fn unsampled_root(
+    name: &'static str,
+    attributes: impl FnOnce() -> Vec<(String, String)>,
+    ran: Duration,
+    error: bool,
+) {
+    with_installed(|t| t.unsampled_root(name, attributes, ran, error));
+}
+
+impl Tracer {
+    /// [`unsampled_root`] for this tracer.
+    pub fn unsampled_root(
+        &self,
+        name: &'static str,
+        attributes: impl FnOnce() -> Vec<(String, String)>,
+        ran: Duration,
+        error: bool,
+    ) {
+        if !error && ran < self.slow() {
+            return;
+        }
+        let duration_nanos = u64::try_from(ran.as_nanos()).unwrap_or(u64::MAX);
+        let root = SpanRecord {
+            name: name.to_owned(),
+            span_id: random_u64(),
+            parent_id: None,
+            start_unix_nanos: unix_nanos().saturating_sub(duration_nanos),
+            duration_nanos,
+            attributes: attributes(),
+            error,
+        };
+        let trace_id = (u128::from(random_u64()) << 64) | u128::from(random_u64());
+        self.root_closed(trace_id, root, false, Vec::new());
     }
 }
 

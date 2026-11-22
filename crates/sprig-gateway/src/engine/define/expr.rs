@@ -21,6 +21,7 @@
 //!   bytes, unary minus on a number folded into it.
 
 use super::lex::{T, Tok};
+use std::fmt::Write as _;
 
 /// An expression.
 #[derive(Debug, Clone, PartialEq)]
@@ -135,7 +136,11 @@ impl Reader<'_> {
         }
     }
     fn expect_op(&mut self, o: &str) -> Result<(), Bad> {
-        if self.eat_op(o) { Ok(()) } else { Err(Bad::Syntax(self.i)) }
+        if self.eat_op(o) {
+            Ok(())
+        } else {
+            Err(Bad::Syntax(self.i))
+        }
     }
 
     /// One expression.
@@ -145,8 +150,7 @@ impl Reader<'_> {
 
     fn binary(&mut self, min: u8) -> Result<E, Bad> {
         let mut left = self.prefix()?;
-        loop {
-            let Some(t) = self.peek().cloned() else { break };
+        while let Some(t) = self.peek().cloned() {
             // `NOT LIKE`, `NOT IN`, `NOT BETWEEN`, `NOT REGEXP`
             let negated_postfix = t.is("NOT")
                 && self.t.get(self.i + 1).is_some_and(|n| {
@@ -203,10 +207,9 @@ impl Reader<'_> {
                 _ => {
                     let right = self.binary(prec + 1)?;
                     let op: &'static str = match name {
-                        "!=" => "<>",
+                        "!=" | "<>" => "<>",
                         "=" => "=",
                         "<=>" => "<=>",
-                        "<>" => "<>",
                         "<" => "<",
                         ">" => ">",
                         "<=" => "<=",
@@ -266,7 +269,11 @@ impl Reader<'_> {
         }
         if kw.is("LIKE") {
             let p = self.binary(P_CMP + 1)?;
-            let esc = if self.eat_word("ESCAPE") { Some(Box::new(self.prefix()?)) } else { None };
+            let esc = if self.eat_word("ESCAPE") {
+                Some(Box::new(self.prefix()?))
+            } else {
+                None
+            };
             return Ok(E::Like(Box::new(left), Box::new(p), esc, not));
         }
         if kw.is("REGEXP") || kw.is("RLIKE") {
@@ -305,7 +312,9 @@ impl Reader<'_> {
     }
 
     fn prefix(&mut self) -> Result<E, Bad> {
-        let Some(t) = self.peek().cloned() else { return Err(Bad::Syntax(self.i)) };
+        let Some(t) = self.peek().cloned() else {
+            return Err(Bad::Syntax(self.i));
+        };
         self.i += 1;
         match t.t {
             T::Num(n) => Ok(E::Num(n)),
@@ -345,18 +354,26 @@ impl Reader<'_> {
                     "CAST" | "CONVERT" if self.op("(") => self.cast(&u),
                     "INTERVAL" => Err(Bad::Syntax(self.i - 1)),
                     "EXISTS" if self.op("(") => Err(Bad::Subquery),
-                    _ if u.starts_with('_') && matches!(self.peek().map(|t| &t.t), Some(T::Str(_))) => {
-                        let Some(T::Str(s)) = self.peek().map(|t| t.t.clone()) else { unreachable!() };
+                    _ if u.starts_with('_')
+                        && matches!(self.peek().map(|t| &t.t), Some(T::Str(_))) =>
+                    {
+                        let Some(T::Str(s)) = self.peek().map(|t| t.t.clone()) else {
+                            unreachable!()
+                        };
                         self.i += 1;
                         Ok(E::Str(s, Some(w[1..].to_ascii_lowercase())))
                     }
-                    "CURRENT_TIMESTAMP" | "LOCALTIME" | "LOCALTIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" | "UTC_TIMESTAMP" | "UTC_DATE" | "UTC_TIME" | "CURRENT_USER" if !self.op("(") => {
+                    "CURRENT_TIMESTAMP" | "LOCALTIME" | "LOCALTIMESTAMP" | "CURRENT_DATE"
+                    | "CURRENT_TIME" | "UTC_TIMESTAMP" | "UTC_DATE" | "UTC_TIME"
+                    | "CURRENT_USER"
+                        if !self.op("(") =>
+                    {
                         Ok(E::Func(func_name(&u).to_owned(), Vec::new()))
                     }
                     _ => self.after_name(w, false),
                 }
             }
-            _ => Err(Bad::Syntax(self.i - 1)),
+            T::Op(_) => Err(Bad::Syntax(self.i - 1)),
         }
     }
 
@@ -426,7 +443,11 @@ impl Reader<'_> {
     }
 
     fn case(&mut self) -> Result<E, Bad> {
-        let operand = if self.word("WHEN") { None } else { Some(Box::new(self.expr()?)) };
+        let operand = if self.word("WHEN") {
+            None
+        } else {
+            Some(Box::new(self.expr()?))
+        };
         let mut whens = Vec::new();
         while self.eat_word("WHEN") {
             let w = self.expr()?;
@@ -438,7 +459,11 @@ impl Reader<'_> {
         if whens.is_empty() {
             return Err(Bad::Syntax(self.i));
         }
-        let els = if self.eat_word("ELSE") { Some(Box::new(self.expr()?)) } else { None };
+        let els = if self.eat_word("ELSE") {
+            Some(Box::new(self.expr()?))
+        } else {
+            None
+        };
         if !self.eat_word("END") {
             return Err(Bad::Syntax(self.i));
         }
@@ -451,7 +476,10 @@ impl Reader<'_> {
         if which == "CONVERT" && self.eat_word("USING") {
             let cs = self.name().ok_or(Bad::Syntax(self.i))?;
             self.expect_op(")")?;
-            return Ok(E::Func("convert".into(), vec![e, E::Raw(format!("using {}", cs.to_ascii_lowercase()))]));
+            return Ok(E::Func(
+                "convert".into(),
+                vec![e, E::Raw(format!("using {}", cs.to_ascii_lowercase()))],
+            ));
         }
         if which == "CAST" {
             if !self.eat_word("AS") {
@@ -504,7 +532,9 @@ impl Reader<'_> {
                 format!("char{args} charset {cs}")
             }
             "binary" => format!("char{args} charset binary"),
-            "decimal" | "date" | "datetime" | "time" | "double" | "float" | "json" | "year" => format!("{w}{args}"),
+            "decimal" | "date" | "datetime" | "time" | "double" | "float" | "json" | "year" => {
+                format!("{w}{args}")
+            }
             "integer" | "int" => "signed".into(),
             _ => return Err(Bad::Syntax(self.i - 1)),
         })
@@ -535,7 +565,10 @@ fn leak_lower(u: &str) -> &'static str {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     static NAMES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
-    let mut m = NAMES.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut m = NAMES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(s) = m.get(u) {
         return s;
     }
@@ -590,7 +623,9 @@ pub(crate) fn negate(e: E) -> E {
         E::In(x, l, n) => E::In(x, l, !n),
         E::Between(x, lo, hi, n) => E::Between(x, lo, hi, !n),
         E::Not(x) => *x,
-        e @ (E::Regexp(..) | E::Bang(_) | E::Bin2("<=>", ..) | E::Logic("xor", _)) => E::Bang(Box::new(e)),
+        e @ (E::Regexp(..) | E::Bang(_) | E::Bin2("<=>", ..) | E::Logic("xor", _)) => {
+            E::Bang(Box::new(e))
+        }
         e => E::Bin2("=", Box::new(e), Box::new(E::Num("0".into()))),
     }
 }
@@ -601,9 +636,17 @@ pub(crate) fn normalize(e: E) -> E {
         E::Not(x) => negate(normalize(*x)),
         E::In(x, mut l, n) if l.len() == 1 => {
             let v = normalize(l.remove(0));
-            E::Bin2(if n { "<>" } else { "=" }, Box::new(normalize(*x)), Box::new(v))
+            E::Bin2(
+                if n { "<>" } else { "=" },
+                Box::new(normalize(*x)),
+                Box::new(v),
+            )
         }
-        E::In(x, l, n) => E::In(Box::new(normalize(*x)), l.into_iter().map(normalize).collect(), n),
+        E::In(x, l, n) => E::In(
+            Box::new(normalize(*x)),
+            l.into_iter().map(normalize).collect(),
+            n,
+        ),
         E::Unary(o, x) => match (o, normalize(*x)) {
             ("-", x) => neg(x),
             ("+", x) => x,
@@ -622,12 +665,24 @@ pub(crate) fn normalize(e: E) -> E {
             E::Logic(o, out)
         }
         E::Is(x, n, w) => E::Is(Box::new(normalize(*x)), n, w),
-        E::Like(x, p, esc, n) => E::Like(Box::new(normalize(*x)), Box::new(normalize(*p)), esc.map(|e| Box::new(normalize(*e))), n),
+        E::Like(x, p, esc, n) => E::Like(
+            Box::new(normalize(*x)),
+            Box::new(normalize(*p)),
+            esc.map(|e| Box::new(normalize(*e))),
+            n,
+        ),
         E::Regexp(x, p) => E::Regexp(Box::new(normalize(*x)), Box::new(normalize(*p))),
-        E::Between(x, lo, hi, n) => E::Between(Box::new(normalize(*x)), Box::new(normalize(*lo)), Box::new(normalize(*hi)), n),
+        E::Between(x, lo, hi, n) => E::Between(
+            Box::new(normalize(*x)),
+            Box::new(normalize(*lo)),
+            Box::new(normalize(*hi)),
+            n,
+        ),
         E::Case(o, ws, el) => E::Case(
             o.map(|x| Box::new(normalize(*x))),
-            ws.into_iter().map(|(a, b)| (normalize(a), normalize(b))).collect(),
+            ws.into_iter()
+                .map(|(a, b)| (normalize(a), normalize(b)))
+                .collect(),
             el.map(|x| Box::new(normalize(*x))),
         ),
         E::Func(n, args) => E::Func(n, args.into_iter().map(normalize).collect()),
@@ -693,7 +748,11 @@ fn print_num(n: &str) -> String {
         let neg = n.starts_with('-');
         let digits = n.trim_start_matches('-').trim_start_matches('0');
         let digits = if digits.is_empty() { "0" } else { digits };
-        return if neg && digits != "0" { format!("-{digits}") } else { digits.to_owned() };
+        return if neg && digits != "0" {
+            format!("-{digits}")
+        } else {
+            digits.to_owned()
+        };
     }
     n.to_owned()
 }
@@ -707,7 +766,7 @@ fn bin_hex(b: &str) -> String {
     let bytes = b.len().div_ceil(8).max(1);
     let mut s = String::from("0x");
     for k in (0..bytes).rev() {
-        s.push_str(&format!("{:02x}", (v >> (8 * k)) & 0xff));
+        _ = write!(s, "{:02x}", (v >> (8 * k)) & 0xff);
     }
     s
 }
@@ -730,6 +789,7 @@ fn put_child(e: &E, parent: u8, right: bool, s: &mut String) {
     }
 }
 
+#[allow(clippy::too_many_lines)] // one arm per expression kind
 fn put(e: &E, s: &mut String) {
     match e {
         E::Col(c) => s.push_str(&quote_name(c)),
@@ -756,12 +816,7 @@ fn put(e: &E, s: &mut String) {
             s.push_str(o);
             put_child(x, P_NEG, false, s);
         }
-        E::Not(x) => {
-            s.push_str("!(");
-            put(x, s);
-            s.push(')');
-        }
-        E::Bang(x) => {
+        E::Not(x) | E::Bang(x) => {
             s.push_str("!(");
             put(x, s);
             s.push(')');
@@ -874,7 +929,12 @@ fn put(e: &E, s: &mut String) {
 pub(crate) fn columns(e: &E, out: &mut Vec<String>) {
     match e {
         E::Col(c) => out.push(c.clone()),
-        E::Unary(_, x) | E::Not(x) | E::Bang(x) | E::Cast(x, _) | E::Collate(x, _) | E::Is(x, _, _) => columns(x, out),
+        E::Unary(_, x)
+        | E::Not(x)
+        | E::Bang(x)
+        | E::Cast(x, _)
+        | E::Collate(x, _)
+        | E::Is(x, _, _) => columns(x, out),
         E::Bin2(_, a, b) | E::Regexp(a, b) => {
             columns(a, out);
             columns(b, out);
@@ -889,7 +949,9 @@ pub(crate) fn columns(e: &E, out: &mut Vec<String>) {
         }
         E::In(x, l, _) => {
             columns(x, out);
-            l.iter().for_each(|x| columns(x, out));
+            for x in l {
+                columns(x, out);
+            }
         }
         E::Between(x, a, b, _) => {
             columns(x, out);
@@ -915,8 +977,13 @@ pub(crate) fn columns(e: &E, out: &mut Vec<String>) {
 /// Renames column `from` to `to` in `e` (names compare without case).
 pub(crate) fn rename_column(e: &mut E, from: &str, to: &str) {
     match e {
-        E::Col(c) if c.eq_ignore_ascii_case(from) => *c = to.to_owned(),
-        E::Unary(_, x) | E::Not(x) | E::Bang(x) | E::Cast(x, _) | E::Collate(x, _) | E::Is(x, _, _) => rename_column(x, from, to),
+        E::Col(c) if c.eq_ignore_ascii_case(from) => to.clone_into(c),
+        E::Unary(_, x)
+        | E::Not(x)
+        | E::Bang(x)
+        | E::Cast(x, _)
+        | E::Collate(x, _)
+        | E::Is(x, _, _) => rename_column(x, from, to),
         E::Bin2(_, a, b) | E::Regexp(a, b) => {
             rename_column(a, from, to);
             rename_column(b, from, to);
@@ -931,7 +998,9 @@ pub(crate) fn rename_column(e: &mut E, from: &str, to: &str) {
         }
         E::In(x, l, _) => {
             rename_column(x, from, to);
-            l.iter_mut().for_each(|x| rename_column(x, from, to));
+            for x in l.iter_mut() {
+                rename_column(x, from, to);
+            }
         }
         E::Between(x, a, b, _) => {
             rename_column(x, from, to);
@@ -956,7 +1025,10 @@ pub(crate) fn rename_column(e: &mut E, from: &str, to: &str) {
 
 /// A literal value (a `DEFAULT (...)` that is one is stored as a value).
 pub(crate) fn is_literal(e: &E) -> bool {
-    matches!(e, E::Num(_) | E::Str(..) | E::Hex(_) | E::HexNum(_) | E::Bin(_) | E::Null)
+    matches!(
+        e,
+        E::Num(_) | E::Str(..) | E::Hex(_) | E::HexNum(_) | E::Bin(_) | E::Null
+    )
 }
 
 /// Whether the server prints this `DEFAULT` expression without

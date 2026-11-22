@@ -185,8 +185,7 @@ pub async fn ensure(
     );
     super::migrate(svc, t).await?;
     let ep = svc.locator.writer(t).await?;
-    let schema = ep.store.schema().to_owned();
-    let store = MsgStore::new(&schema);
+    let store = MsgStore::new(Arc::clone(&svc.records), t);
     let deadline = Instant::now() + Duration::from_millis(wait_ms);
     let key = def.key();
     let mut created = false;
@@ -199,7 +198,7 @@ pub async fn ensure(
         let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
-        let row = store.instance(&mut conn, key).await?;
+        let row = store.instance(key).await?;
         match row {
             Some(i) if i.state == InstanceState::Active => {
                 drop(conn);
@@ -227,7 +226,7 @@ pub async fn ensure(
                 }
             }
             Some(i) if i.state == InstanceState::Creating => {
-                let mine = store.take_over(&mut conn, key, 30_000).await?;
+                let mine = store.take_over(key, 30_000).await?;
                 drop(conn);
                 if mine {
                     create(svc, t, def, i.instance_id).await?;
@@ -273,7 +272,7 @@ pub async fn ensure(
                     physical: Some(json!({"db": def.db_name, "name": def.name})),
                     created_at_ms: 0,
                 };
-                let claimed = store.claim(&mut conn, &row).await?;
+                let claimed = store.claim(&row).await?;
                 drop(conn);
                 if claimed {
                     let started = Instant::now();
@@ -651,7 +650,7 @@ async fn create(svc: &Arc<TenantServices>, t: TenantId, def: &Definition, id: u6
         // IF NOT EXISTS found the stream (a retry after a crash): the row
         // goes active now.
         let ep = svc.locator.writer(t).await?;
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
+        let conn = ep.pool.get_conn_bounded().await.map_err(|e| {
             SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
         })?;
         let existing = streams_of(&host.cat)
@@ -665,13 +664,13 @@ async fn create(svc: &Arc<TenantServices>, t: TenantId, def: &Definition, id: u6
             .cloned();
         match existing {
             Some(s) if s.id.0 == id => {
-                MsgStore::new(ep.store.schema())
+                MsgStore::new(Arc::clone(&svc.records), t)
                     .set_instance(
-                        &mut conn,
                         def.key(),
                         InstanceState::Active,
                         def.def_version,
                         &def.definition,
+                        None,
                     )
                     .await?;
                 // The change takes its own connection.
@@ -822,7 +821,6 @@ impl Host for InstanceHost {
         let applied = {
             let (store, tx) = c.tx().parts();
             let streams = sprig_streams::StreamsStore::new(store.schema());
-            let msg = MsgStore::new(store.schema());
             async {
                 match change {
                     StreamsChange::Insert(def, h) => {
@@ -845,14 +843,6 @@ impl Host for InstanceHost {
                                 )
                                 .await?;
                         }
-                        msg.set_instance(
-                            tx,
-                            self.def,
-                            InstanceState::Active,
-                            self.def_version,
-                            &self.definition,
-                        )
-                        .await?;
                     }
                     StreamsChange::Update(def, _) => streams.update(tx, def).await?,
                     StreamsChange::Delete(def) => streams.delete(tx, def.id).await?,
@@ -866,6 +856,20 @@ impl Host for InstanceHost {
             return Err(e);
         }
         let v = c.commit().await?;
+        // The instance is live once its stream row committed (its row is
+        // not versioned: a crash before this leaves it `creating`, which
+        // the next publish takes over).
+        if matches!(change, StreamsChange::Insert(..)) {
+            MsgStore::new(Arc::clone(&self.svc.records), tenant)
+                .set_instance(
+                    self.def,
+                    InstanceState::Active,
+                    self.def_version,
+                    &self.definition,
+                    None,
+                )
+                .await?;
+        }
         self.cat = self
             .svc
             .cache
@@ -933,12 +937,8 @@ pub async fn remove(svc: &Arc<TenantServices>, t: TenantId, def: DefKey) -> Resu
         );
         sprig_streams::sql::handle(&text, &ctx, &mut host).await?;
     }
-    let ep = svc.locator.writer(t).await?;
-    let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-        SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-    })?;
-    MsgStore::new(ep.store.schema())
-        .delete_instance(&mut conn, def)
+    MsgStore::new(Arc::clone(&svc.records), t)
+        .delete_instance(def)
         .await?;
     super::delete_index(svc, t, def).await?;
     forget_applied(t, def);

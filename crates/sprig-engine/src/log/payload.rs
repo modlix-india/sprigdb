@@ -186,6 +186,34 @@ pub fn decode_into(data: &[u8], batch: &mut StoreBatch) -> Result<()> {
     Ok(())
 }
 
+/// The notes of one payload, in order (what [`Payload::note`] added).
+///
+/// # Errors
+/// The payload is malformed.
+pub fn notes(data: &[u8]) -> Result<Vec<&[u8]>> {
+    let mut r = Reader(data);
+    if r.byte()? != FORMAT {
+        return Err(Reader::bad());
+    }
+    let mut out = Vec::new();
+    while !r.0.is_empty() {
+        match r.byte()? {
+            PUT | RANGE => {
+                r.cf()?;
+                r.slice()?;
+                r.slice()?;
+            }
+            DELETE => {
+                r.cf()?;
+                r.slice()?;
+            }
+            NOTE => out.push(r.slice()?),
+            _ => return Err(Reader::bad()),
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +248,13 @@ mod tests {
             ]
         );
         assert!(decode_into(&[1, 9], &mut StoreBatch::new()).is_err());
+        let mut p = Payload::new();
+        p.put(Cf::Data, b"k", b"v");
+        p.note(b"one");
+        p.delete_range(Cf::Data, b"a", b"b");
+        p.note(b"two");
+        let bytes = p.into_bytes();
+        assert_eq!(notes(&bytes).unwrap(), vec![&b"one"[..], &b"two"[..]]);
         assert!(decode_into(&[1, 1, 0, 5, b'x'], &mut StoreBatch::new()).is_err());
     }
 }

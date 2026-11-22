@@ -146,6 +146,12 @@ impl Counters {
 pub trait RowCursor: Send {
     /// The next row, or `None` after the last.
     fn next(&mut self) -> Result<Option<Row>>;
+
+    /// The conditions on the row's own table refused the row just handed
+    /// over: a locking read at READ COMMITTED may give up its lock, as the
+    /// servers do. Conditions spanning two tables never call it. Storage
+    /// that keeps no locks does nothing.
+    fn refused(&mut self) {}
 }
 
 /// The storage under the planner's row sources.

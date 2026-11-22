@@ -610,23 +610,34 @@ pub fn statement(
 /// MariaDB's and the workload store's.
 pub async fn assemble(
     c: &mut Conn,
+    wl: &mut dyn sprig_catalog::RecordTx,
     tenant: TenantId,
     now: SystemTime,
     window: Duration,
     split_bytes: f64,
 ) -> Result<Assembled> {
     let (tables, fks, located) = tables(c, tenant).await?;
-    assemble_from(c, tenant, now, window, split_bytes, (tables, fks, located)).await
+    assemble_from(
+        c,
+        wl,
+        tenant,
+        now,
+        window,
+        split_bytes,
+        (tables, fks, located),
+    )
+    .await
 }
 
 /// [`assemble`] over tables already read ([`tables_in`]): statements and
-/// units from the workload store, pins, key-value units and stored code,
-/// all from the tenant's catalog on `c`.
+/// units from the workload store (the tenant's catalog records in `wl`),
+/// pins, key-value units and stored code from the tenant's catalog on `c`.
 ///
 /// # Errors
 /// MariaDB's.
 pub async fn assemble_from(
     c: &mut Conn,
+    wl: &mut dyn sprig_catalog::RecordTx,
     tenant: TenantId,
     now: SystemTime,
     window: Duration,
@@ -634,16 +645,13 @@ pub async fn assemble_from(
     read: (Vec<Table>, Vec<ForeignKey>, Vec<Located>),
 ) -> Result<Assembled> {
     let (mut tables, fks, mut located) = read;
-    let store = WorkloadTables::for_tenant(tenant);
     let from = now.checked_sub(window).unwrap_or(SystemTime::UNIX_EPOCH);
-    let fps = store
-        .window(c, tenant, from, now + Duration::from_secs(3600))
-        .await?;
+    let fps = WorkloadTables::window(wl, tenant, from, now + Duration::from_secs(3600)).await?;
     let mut stmts = Vec::new();
     let mut units = Vec::new();
     let mut first_seen: Option<SystemTime> = None;
     let ids: Vec<sprig_common::ids::Fingerprint> = fps.iter().map(|f| f.id).collect();
-    for f in store.fingerprints(c, &ids).await? {
+    for f in WorkloadTables::fingerprints(wl, &ids).await? {
         first_seen = Some(first_seen.map_or(f.first_seen, |x| x.min(f.first_seen)));
     }
     for f in &fps {

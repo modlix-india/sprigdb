@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 
 use sprig_common::SprigCode;
 
+use super::MemStore;
 use crate::eval::Params;
 use crate::exec::{Budgets, Output};
-use crate::mem::MemStore;
 use crate::store::GraphStore;
 use crate::value::Value;
 

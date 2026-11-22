@@ -44,38 +44,11 @@ fn times_round_trip_as_micros() {
 }
 
 #[test]
-fn the_module_registers_with_the_migrator() {
+fn the_module_has_no_migrations() {
     let m = Migrator::new(&[AUTH_MODULE]).unwrap();
-    assert_eq!(m.supports().get(MODULE), Some(&7));
-    assert_eq!(AUTH_MODULE.newest(), 7);
-}
-
-#[test]
-fn format_3_enum_holds_every_mechanism() {
-    // Format 1's ENUM, then format 3's: every mechanism the code writes is
-    // a member, in the old order with scram_sha_512 last (a metadata-only
-    // change in MariaDB).
-    for k in VerifierKind::ALL {
-        assert!(
-            ALTER_VERIFIERS_SCRAM_SHA_512.contains(&format!("'{}'", k.as_str())),
-            "{k}"
-        );
-    }
-    assert!(!DDL_VERIFIERS.contains("scram_sha_512"));
-    let members = |sql: &str| -> Vec<String> {
-        let start = sql.find("ENUM(").unwrap() + 5;
-        let end = start + sql[start..].find(')').unwrap();
-        sql[start..end]
-            .split(',')
-            .map(|m| m.trim().trim_matches('\'').to_owned())
-            .collect()
-    };
-    let old = members(DDL_VERIFIERS);
-    let new = members(ALTER_VERIFIERS_SCRAM_SHA_512);
-    assert_eq!(&new[..old.len()], &old[..]);
-    assert_eq!(new.last().map(String::as_str), Some("scram_sha_512"));
-    let m = AUTH_MIGRATIONS.iter().find(|m| m.format == 3).unwrap();
-    assert_eq!(m.phase, Phase::Expand);
+    // Not a format readers check: its rows are engine records.
+    assert_eq!(m.supports().get(MODULE), None);
+    assert_eq!(AUTH_MODULE.newest(), 0);
 }
 
 #[test]
@@ -93,8 +66,23 @@ fn verifier_debug_hides_secrets() {
 }
 
 #[test]
-fn qualified_table_names() {
-    let s = AuthStore::for_tenant(TenantId(42));
-    assert_eq!(s.schema(), "t42_sprig");
-    assert_eq!(s.users, "`t42_sprig`.users");
+fn rows_round_trip_through_their_records() {
+    let mut u = UserRow::new(
+        UserId(7),
+        "zoë",
+        "10.%",
+        UserSource::Sql,
+        UNIX_EPOCH + Duration::from_nanos(1_762_560_000_123_456_789),
+        3,
+    );
+    u.auth_methods = AuthMethods::PASSWORD.union(AuthMethods::API_KEY);
+    u.attributes = Some(serde_json::json!({"team": "a"}));
+    u.require_subject = Some("/CN=x".into());
+    let back: UserRow = serde_json::from_slice(&serde_json::to_vec(&u).unwrap()).unwrap();
+    // Times keep microseconds, as DATETIME(6) did.
+    assert_eq!(back.created_at, UNIX_EPOCH + Duration::from_micros(1_762_560_000_123_456));
+    let mut want = u.clone();
+    want.created_at = back.created_at;
+    assert_eq!(back, want);
+    assert!(serde_json::from_str::<UserKind>("\"robot\"").is_err());
 }

@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use mysql_async::prelude::Queryable;
+use sprig_catalog::Freshness;
 use sprig_catalog::version::VersionKind;
-use sprig_catalog::{CatalogLocator, Freshness};
 use sprig_common::ids::{ClusterId, TenantId};
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_graph::ast::Entity;
@@ -246,11 +246,14 @@ impl GatewayGraphs {
     }
 
     async fn lease(&self, g: &GraphRef) -> Result<bool> {
-        let ep = self.svc.locator.writer(g.tenant).await?;
-        let mut c = ep.pool.get_conn().await.map_err(backend_error)?;
-        GraphCatalog::new(ep.store.schema())
-            .lease_storage(&mut c, g.graph_id, owner(), LEASE_SECS)
-            .await
+        GraphCatalog::lease_storage(
+            &*self.svc.records,
+            g.tenant,
+            g.graph_id,
+            owner(),
+            LEASE_SECS,
+        )
+        .await
     }
 
     async fn move_storage(self: &Arc<Self>, g: &GraphRef) -> Result<bool> {
@@ -282,13 +285,8 @@ impl GatewayGraphs {
         let r = self.move_steps(g, &lost).await;
         stop.store(true, Ordering::Relaxed);
         renew.abort();
-        if let Ok(ep) = self.svc.locator.writer(g.tenant).await
-            && let Ok(mut c) = ep.pool.get_conn().await
-        {
-            let _ = GraphCatalog::new(ep.store.schema())
-                .release_storage(&mut c, g.graph_id, owner())
-                .await;
-        }
+        let _ =
+            GraphCatalog::release_storage(&*self.svc.records, g.tenant, g.graph_id, owner()).await;
         r
     }
 
@@ -477,11 +475,9 @@ impl GatewayGraphs {
             .catalog
             .change(g.tenant, VersionKind::Catalog)
             .await?;
-        let r = {
-            let (store, tx) = ch.tx().parts();
-            GraphCatalog::new(store.schema())
-                .set_storage(tx, g.graph_id, s, phase)
-                .await
+        let r = match ch.tx().records().await {
+            Err(e) => Err(e),
+            Ok(rec) => GraphCatalog::set_storage(rec, g.graph_id, s, phase).await,
         };
         if let Err(e) = r {
             let _ = ch.rollback().await;

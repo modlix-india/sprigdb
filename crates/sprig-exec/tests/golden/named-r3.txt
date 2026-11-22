@@ -91,8 +91,6 @@ Y V é
 Y T VAR_STRING 4 31 - 255
 Y W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
 Y W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
-K M l
-K Y l
 Q SUBSTRING('abcé', 2, '18446744073709551616')
 M V 
 M T VAR_STRING 0 39 - 224
@@ -102,8 +100,6 @@ Y V
 Y T VAR_STRING 0 31 - 255
 Y W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
 Y W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
-K M l
-K Y l
 Q LEFT('abcé', '18446744073709551616')
 M V 
 M T VAR_STRING 0 39 - 224
@@ -122,7 +118,6 @@ Y V NULL
 Y T LONG_BLOB 67108864 31 - 255
 Y W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
 Y W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
-K Y t
 # == MySQL's NULLIF with a BIGINT column: the constant becomes the integer it is stored as
 Q NULLIF('', `u8`)
 M V NULL				NULL											NULL								NULL
@@ -200,7 +195,6 @@ M W W 1292 Truncated incorrect DECIMAL value: 'abc'
 Y V 1	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	1	0	0	0	0	0	0
 Y T LONGLONG 1 0 - 63
 Y W W 1292 Truncated incorrect DOUBLE value: 'abc'
-K M w
 # == NULLIF compares through the first argument's own number (MariaDB's LEAST of strings)
 Q NULLIF(LEAST(' 12 ', 'ss'), `f8`)
 M V NULL	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	 12 	NULL	 12 	 12 	 12 	 12 	 12 	 12 
@@ -247,19 +241,16 @@ M V -1.8446744073709552e19
 M T VAR_STRING 84 39 N 224
 Y V -18446744073709551615
 Y T VAR_STRING 88 31 N 255
-K Y l
 Q CONCAT(COALESCE((CASE WHEN 0 THEN 1e15 WHEN 1.5 THEN -0.10 ELSE 0 END), 'x'))
 M V -0.1
 M T VAR_STRING 20 39 - 224
 Y V -0.10
 Y T VAR_STRING 88 31 - 255
-K Y l
 Q CONCAT(IFNULL((CASE WHEN 0 THEN 1e15 WHEN 1.5 THEN -0.10 ELSE 0 END), 'x'))
 M V -0.1
 M T VAR_STRING 20 39 - 224
 Y V -0.10
 Y T VAR_STRING 88 31 - 255
-K Y l
 Q CONCAT(COALESCE(-0.10, 1e15))
 M V -0.1
 M T VAR_STRING 20 39 - 224
@@ -455,8 +446,8 @@ M W W 1292 Truncated incorrect date value: '2024-01-15 abc'
 Y V 1500
 Y T LONGLONG 9 0 - 63
 Y W W 1292 Truncated incorrect time value: '2024-01-15 abc'
-K M x l
-K Y x l
+K M x
+K Y x
 Q EXTRACT(DAY_MINUTE FROM '2024-01-15 abc')
 M V 150000
 M T LONGLONG 12 0 - 63
@@ -464,16 +455,14 @@ M W W 1292 Truncated incorrect date value: '2024-01-15 abc'
 Y V 150000
 Y T LONGLONG 11 0 - 63
 Y W W 1292 Truncated incorrect time value: '2024-01-15 abc'
-K M x t
-K Y x l
+K M x
+K Y x
 Q EXTRACT(DAY_HOUR FROM '2024-01-15')
 M V 1500
 M T LONG 10 0 - 63
 Y V 0
 Y T LONGLONG 9 0 - 63
 Y W W 1292 Truncated incorrect time value: '2024-01-15'
-K M l
-K Y l
 Q EXTRACT(DAY_HOUR FROM '2024-01-15 1:2 abc')
 M V 1501
 M T LONG 10 0 - 63
@@ -481,8 +470,6 @@ M W W 1292 Truncated incorrect datetime value: '2024-01-15 1:2 abc'
 Y V 0
 Y T LONGLONG 9 0 - 63
 Y W W 1292 Truncated incorrect time value: '2024-01-15 1:2 abc'
-K M l
-K Y l
 Q EXTRACT(DAY_HOUR FROM '2024-02-30 abc')
 M V NULL
 M T LONG 10 0 - 63
@@ -490,21 +477,18 @@ M W W 1292 Incorrect interval value: '2024-02-30 abc'
 Y V NULL
 Y T LONGLONG 9 0 - 63
 Y W W 1292 Truncated incorrect time value: '2024-02-30 abc'
-K M x l
-K Y x l
+K M x
+K Y x
 Q EXTRACT(DAY_MINUTE FROM DATE_ADD('2024-1-5 3:4:5', INTERVAL 1.5 DAY))
 M V 70304
 M T LONGLONG 12 0 - 63
 Y V 70304
 Y T LONGLONG 11 0 - 63
-K M t
-K Y l
 Q EXTRACT(DAY_MICROSECOND FROM DATE_SUB(DATE_ADD('20240115103000', INTERVAL -23 QUARTER), INTERVAL '2' DAY))
 M V 13103000000000
 M T LONGLONG 20 0 - 63
 Y V 13103000000000
 Y T LONGLONG 20 0 - 63
-K M t
 # == MariaDB's EXTRACT of a cast that is no date is NULL
 Q EXTRACT(HOUR_SECOND FROM CAST('2023-02-29' AS DATE))
 M V NULL
@@ -513,7 +497,6 @@ M W W 1292 Incorrect datetime value: '2023-02-29'
 Y V NULL
 Y T LONGLONG 8 0 - 63
 Y W W 1292 Incorrect datetime value: '2023-02-29'
-K Y l
 Q EXTRACT(DAY_SECOND FROM CAST('2023-02-29' AS DATETIME(6)))
 M V NULL
 M T LONG 9 0 - 63
@@ -521,7 +504,6 @@ M W W 1292 Incorrect datetime value: '2023-02-29'
 Y V NULL
 Y T LONGLONG 13 0 - 63
 Y W W 1292 Incorrect datetime value: '2023-02-29'
-K Y l
 # == The all-zero date keeps year 0 when written with two digits
 Q MONTH('00:00:00')
 M V 0
@@ -529,14 +511,12 @@ M T LONG 2 0 - 63
 Y V NULL
 Y T LONGLONG 3 0 - 63
 Y W W 1292 Incorrect datetime value: '00:00:00'
-K Y l
 Q MONTH(DATE_FORMAT('240115', '%H:%i:%s'))
 M V 0
 M T LONG 2 0 - 63
 Y V NULL
 Y T LONGLONG 3 0 - 63
 Y W W 1292 Incorrect datetime value: '00:00:00'
-K Y l
 # == Numbers as dates: thirteen digits are YYYYMMDDhhmmss; MySQL's date parts read seven digits as YYYYMMDD
 Q DATE(EXTRACT(DAY_MICROSECOND FROM `dtm`))
 M V NULL	NULL	3100-00-00	NULL	NULL	0100-00-00	2912-00-00	NULL	NULL	0406-07-08	NULL	NULL	NULL	2912-00-00	NULL	NULL	0406-07-08	3100-00-00	NULL	NULL	0100-00-00	NULL	NULL	NULL
@@ -583,7 +563,6 @@ M T LONG 1 0 - 63
 M W W 1292 Incorrect datetime value: '1000000'
 Y V 0
 Y T LONGLONG 2 0 - 63
-K Y l
 Q DATE_FORMAT((`dtm` / `dt`), '%Y-%m-%d')
 M V NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
 M T VAR_STRING 40 0 - 224
@@ -627,8 +606,7 @@ Y W W 1292 Truncated incorrect date value: '1000000.003006734683446401'
 Y W W 1292 Truncated incorrect date value: '1000000.001541060'
 Y W W 1292 Truncated incorrect date value: '1000000.000000076141741608'
 Y W W 1292 Truncated incorrect date value: '1000000.001138032'
-K M l
-K Y w l
+K Y w
 Q DATE_FORMAT(TIMESTAMPDIFF(MICROSECOND, `dt0`, '2024-02-29'), '%')
 M V %	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	%	NULL	NULL	NULL	NULL	NULL	NULL
 M T VAR_STRING 4 0 - 224
@@ -676,8 +654,6 @@ Y W W 1292 Incorrect datetime value: '146944372000000'
 Y W W 1292 Incorrect datetime value: '-251693135999000000'
 Y W W 1292 Incorrect datetime value: '709164800000000'
 Y W W 1292 Incorrect datetime value: '757339200000000'
-K M l
-K Y l
 Q SECOND(EXTRACT(DAY_MICROSECOND FROM `dt`))
 M V 0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	NULL	0	0	0	0	0
 M T LONG 2 0 - 63
@@ -705,7 +681,6 @@ Y W W 1292 Truncated incorrect time value: '1000000000000'
 Y W W 1292 Truncated incorrect time value: '19000000000000'
 Y W W 1292 Truncated incorrect time value: '1000000000000'
 Y W W 1292 Truncated incorrect time value: '28000000000000'
-K Y l
 # == A date written with colons before a time
 Q HOUR('00:00:00 12:00:00')
 M V 12
@@ -713,7 +688,7 @@ M T LONG 2 0 - 63
 Y V 12
 Y T LONGLONG 4 0 - 63
 Y W W 4095 Delimiter ':' in position 2 in datetime value '00:00:00 12:00:00' at row 1 is deprecated. Prefer the standard '-'.
-K Y w l
+K Y w
 Q HOUR('10:30:00 11:00:00')
 M V NULL
 M T LONG 2 0 - 63
@@ -721,7 +696,7 @@ M W W 1292 Incorrect time value: '10:30:00 11:00:00'
 Y V NULL
 Y T LONGLONG 4 0 - 63
 Y W W 1292 Truncated incorrect time value: '10:30:00 11:00:00'
-K Y x l
+K Y x
 Q EXTRACT(HOUR_MICROSECOND FROM DATE_FORMAT('2024-01-15 abc', '%T %r %f'))
 M V 120000000000
 M T LONGLONG 13 0 - 63
@@ -732,8 +707,8 @@ Y T LONGLONG 14 0 - 63
 Y W W 1292 Truncated incorrect date value: '2024-01-15 abc'
 Y W W 1292 Truncated incorrect time value: '00:00:00 12:00:00 AM 000000'
 Y W W 4095 Delimiter ':' in position 2 in datetime value '00:00:00 12:00:00 AM 000000' at row 1 is deprecated. Prefer the standard '-'.
-K M w t
-K Y w l
+K M w
+K Y w
 # == MySQL compares a TIME column with a constant date as times, and a number beyond a time's range as the largest time
 Q (`tm` = CAST('2024-01-15' AS DATE))
 M V 0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	0	0	0	0	0	0	0	0
@@ -1079,7 +1054,6 @@ M T LONG 2 0 - 63
 M W W 1292 Incorrect time value: '100.9999999'
 Y V 0
 Y T LONGLONG 4 0 - 63
-K Y l
 Q TIME(100.9999999)
 M V NULL
 M T TIME 17 6 - 63
@@ -1105,35 +1079,27 @@ M V 150000
 M T LONGLONG 12 0 - 63
 Y V 2401
 Y T LONGLONG 11 0 - 63
-K M t
-K Y l
 Q EXTRACT(DAY_MINUTE FROM '120000')
 M V 0
 M T LONGLONG 12 0 - 63
 Y V 1200
 Y T LONGLONG 11 0 - 63
-K M t
-K Y l
 Q EXTRACT(HOUR_MINUTE FROM '700101')
 M V 2201
 M T LONG 5 0 - 63
 Y V 7001
 Y T LONGLONG 6 0 - 63
-K Y l
 Q EXTRACT(DAY_HOUR FROM '20240115.5')
 M V 8408
 M T LONG 10 0 - 63
 Y V 838
 Y T LONGLONG 9 0 - 63
 Y W W 1292 Truncated incorrect time value: '20240115.5'
-K M l
-K Y l
 Q EXTRACT(DAY_MICROSECOND FROM '240115')
 M V 1000115000000
 M T LONGLONG 20 0 - 63
 Y V 240115000000
 Y T LONGLONG 20 0 - 63
-K M t
 # == Which error a CASE reports first: MariaDB resolves every WHEN before the THENs, MySQL the operand after the pairs
 Q (CASE (COALESCE('5e-1', `vg`) LIKE CAST(`d0` AS CHAR(3))) WHEN ((`d2` / `d10`) % (`d10` / 127)) THEN ((`bn` COLLATE utf8mb4_general_ci) COLLATE utf8mb4_general_ci) ELSE CAST(('abc' COLLATE utf8mb4_general_ci) AS CHAR(8)) END)
 M X 1253
@@ -1182,7 +1148,6 @@ M V 15103000000000
 M T LONGLONG 20 0 - 63
 Y V 15103000000000
 Y T LONGLONG 20 0 - 63
-K M t
 # == A NULL left side of IN takes part in the collation check
 Q (NOT (NULL NOT IN (NULL, CAST((120 % `d10`) AS CHAR(1)), (CASE WHEN (`bn` LIKE '') THEN '18446744073709551616' WHEN `vg` THEN '1.5' ELSE `vc` END), `vg`)))
 M X 1271
@@ -1227,8 +1192,6 @@ M V 0
 M T LONGLONG 13 0 - 63
 Y V 0
 Y T LONGLONG 14 0 - 63
-K M t
-K Y l
 # == An empty ESCAPE makes the NUL byte the escape; MariaDB keeps the backslash too
 Q ('a\0b' LIKE 'a\0b' ESCAPE '')
 M V 1
@@ -1271,13 +1234,11 @@ M V 	a	A	abc		1	12abc	été	b	ab%	1e2	z	NULL		NULL	ABC	1	12abc	été	b	ab%	NULL	
 M T VAR_STRING 320 39 - 224
 Y V 	a	A	abc		1	12abc	été	b	ab%	1e2	z	NULL		NULL	ABC	1	12abc	été	b	ab%	NULL	z	
 Y T VAR_STRING 80 31 - 255
-K M l
 Q SUBSTRING((CASE WHEN CAST(`i4` AS CHAR) THEN (`vb` COLLATE utf8mb4_bin) ELSE `vc` END), 1, `u4`)
 M V 	a	A	abc		12	 7 	ete	B	a_c	0.5	Z	NULL		NULL	ABC	a_c	NULL	ete	b	12	NULL	abc	B
 M T VAR_STRING 320 39 - 224
 Y V 	a	A	abc		12	 7 	ete	B	a_c	0.5	Z	NULL		NULL	ABC	a_c	NULL	ete	b	12	NULL	abc	B
 Y T VAR_STRING 80 31 - 255
-K M l
 # == MariaDB's DATE_ADD text of a constant CAST(x AS CHAR) has the fraction digits written there
 Q DATE_SUB(CAST('2024-12-31 23:59:59.999999' AS CHAR), INTERVAL 1.5 MINUTE)
 M V 2024-12-31 23:57:59.999999
@@ -1295,8 +1256,6 @@ M V 1705294803.140625
 M T NEWDECIMAL 24 6 - 63
 Y V 1705294803.140625
 Y T NEWDECIMAL 19 6 N 63
-K M l
-K Y l n
 Q CAST(20240115103003.14159e0 AS DATETIME(6))
 M V 2024-01-15 10:30:03.140625
 M T DATETIME 26 6 - 63
@@ -1312,8 +1271,6 @@ M V 1705294803.140625
 M T NEWDECIMAL 24 6 - 63
 Y V 1705294803.140625
 Y T NEWDECIMAL 19 6 - 63
-K M l
-K Y l
 # == MySQL: a constant left operand of <=> that is NULL leaves the right one unevaluated when it cannot be NULL
 Q (((0.05 / CAST('a_c' AS UNSIGNED)) / -9007199254740993) <=> (CAST('10' AS UNSIGNED) * (1e10 - 1e308)))
 M X 1690
@@ -1354,6 +1311,7 @@ M V
 M T VAR_STRING 0 39 - 224
 Y V 
 Y T VAR_STRING 0 31 - 255
+K Y t
 Q REPEAT('a', '18446744073709551616')
 M V 
 M T VAR_STRING 0 39 - 224
@@ -1363,7 +1321,6 @@ Y V
 Y T LONG_BLOB 67108864 31 - 255
 Y W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
 Y W W 1292 Truncated incorrect INTEGER value: '18446744073709551616'
-K Y t
 # == IS NOT NULL of a row expression that cannot be NULL is true, unevaluated
 Q (((2e-3 - `d2`) <=> (`u4` DIV -1)) IS NOT NULL)
 M V 1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1	1
@@ -1376,19 +1333,16 @@ M V 1500	2900	3100	100	3100	100	2900	3100	2800	400	1900	900	NULL	2900	900	3100	4
 M T LONG 5 0 - 63
 Y V 1500	2900	3100	100	3100	100	2900	3100	2800	400	1900	900	NULL	2900	900	3100	400	3100	NULL	1500	100	1900	100	2800
 Y T LONGLONG 9 0 - 63
-K Y l
 Q EXTRACT(DAY_HOUR FROM DATE_SUB(`dt`, INTERVAL 1 DAY))
 M V 1400	2800	3000	3100	3000	3100	2800	3000	2700	300	1800	800	NULL	2800	800	3000	300	3000	NULL	1400	3100	1800	3100	2700
 M T LONG 5 0 - 63
 Y V 1400	2800	3000	3100	3000	3100	2800	3000	2700	300	1800	800	NULL	2800	800	3000	300	3000	NULL	1400	3100	1800	3100	2700
 Y T LONGLONG 9 0 - 63
-K Y l
 Q EXTRACT(DAY_HOUR FROM CAST('2024-01-15' AS DATE))
 M V 1500
 M T LONG 5 0 - 63
 Y V 0
 Y T LONGLONG 9 0 - 63
-K Y l
 # == MySQL's IFNULL and COALESCE with a DOUBLE result read the argument's own double
 Q IFNULL(((2147483648 % `i4`) / `f8`), (CASE ('A' * `i4`) WHEN (128 / `i4`) THEN CAST('1e2' AS DECIMAL(65,30)) WHEN `vb` THEN `i4` WHEN (`d2` * `d0`) THEN (724 / `u4`) END))
 M V 0	0	0	0.000000000000001	0	0.8	480	8e-300	0	967296	0.5714285714285714	-91730000	NULL	0.00038880000353808	0.000000000009173	0	1000000	0.011047363	8e-300	0	4	-1999999999999999.8	-10000	65536
@@ -1605,7 +1559,7 @@ Y W W 1292 Truncated incorrect DOUBLE value: '%'
 Y W W 1292 Truncated incorrect DECIMAL value: '%'
 Y W W 1292 Truncated incorrect DECIMAL value: '%'
 K M w
-K Y w l
+K Y w
 # == MySQL keeps a difference of two unsigned decimals unsigned, and refuses a negative one
 Q ((`u8` / `u4`) - `u4`)
 M V NULL	0.0000	-1.0000	2.0000	NULL	-5.4286	92233720368547658.0800	900719925474089.3000	0.0000	0.0000	-0.6667	7988095.0243	NULL	NULL	NULL	-3.0000	-1000000.0000	140737488289792.0000	900719925474089.3000	42949572.9600	142857142850.1429	NULL	-4294967272.0044	-2.0000
@@ -1812,7 +1766,7 @@ M W W 1292 Truncated incorrect time value: '739265'
 Y V 0	0	0	0	1	0	0	0	1	0	0	0	NULL	0	0	1	0	0	0	1	0	0	0	0
 Y T LONGLONG 1 0 - 63
 Y W W 1292 Incorrect time value: '739265' for column 'tm' at row 1
-K M w
+K M x
 K Y w
 # == MySQL rounds a seventh fraction digit of a double read as a datetime
 Q DATE_ADD(CAST(`dtm` AS DOUBLE), INTERVAL 10 QUARTER)
@@ -1874,8 +1828,6 @@ M V 			bc	C 		bc	té		b%	e2		NULL		bc	C 		\0	té		b%	e2
 M T VAR_STRING 2 39 - 63
 Y V 			bc	C 		bc	é		b%	e2		NULL		bc	C 		\0	é		b%	e2		
 Y T VAR_STRING 2 31 - 63
-K M l
-K Y l
 # == MariaDB reads an unsigned decimal shift count over the unsigned range, 32 bits of it
 Q (`u8` << (18446744073709551615 / `u4`))
 M V NULL	0	2	18446744073709551614	NULL	0	0	0	4294967296	0	0	0	NULL	NULL	NULL	0	0	9223372036854775808	0	0	0	NULL	197530864200	0

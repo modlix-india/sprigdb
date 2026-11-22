@@ -37,7 +37,6 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
-use mysql_async::prelude::Queryable;
 use serde_json::{Value, json};
 use sprig_catalog::CatalogLocator;
 use sprig_catalog::ddl::{database_key, object_key};
@@ -325,25 +324,14 @@ impl PassSession {
                 {
                     return Err(denied(ts, "SELECT and DELETE", &source_db, &src.name));
                 }
-                let id: Option<u64> = catalog_conn()
-                    .await?
-                    .exec_first(
-                        format!(
-                            "SELECT object_id FROM {}.mq_queues WHERE db_id = ? AND name = ? \
-                             AND state = 'active'",
-                            sprig_common::names::quote(ep.store.schema())
-                        ),
-                        (r.db_id.0, src.name.as_bytes()),
-                    )
-                    .await
-                    .map_err(|e| match &e {
-                        mysql_async::Error::Server(s) if s.code == 1146 => SprigError::new(
-                            SprigCode::LogicNotFound,
-                            format!("no queue '{}' in vhost {source_db}", src.name),
-                        ),
-                        _ => SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable")
-                            .with_source(e),
-                    })?;
+                // Durable queues are the catalog's (the snapshot's `mq`
+                // module).
+                let id: Option<u64> = cat
+                    .ext
+                    .get::<sprig_queues::catalog::MqState>(sprig_queues::catalog::MODULE)
+                    .and_then(|m| m.dbs.get(&r.db_id.0))
+                    .and_then(|t| t.queues.get(&src.name))
+                    .map(|q| q.id);
                 let id = id.ok_or_else(|| {
                     SprigError::new(
                         SprigCode::LogicNotFound,

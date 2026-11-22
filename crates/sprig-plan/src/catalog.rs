@@ -15,6 +15,8 @@ pub struct ColumnDef {
     pub ty: ColumnType,
     /// Whether the column can hold `NULL`.
     pub nullable: bool,
+    /// `INVISIBLE`: not part of `*`.
+    pub invisible: bool,
 }
 
 impl ColumnDef {
@@ -25,6 +27,7 @@ impl ColumnDef {
             name: name.to_owned(),
             ty,
             nullable: true,
+            invisible: false,
         }
     }
 

@@ -70,13 +70,11 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use mysql_async::prelude::Queryable;
 use serde_json::{Value, json};
 use sprig_binlog::GtidPos;
 use sprig_binlog::value::Value as BinValue;
 use sprig_catalog::CatalogLocator;
 use sprig_common::ids::{ClusterId, DbId, GroupId, TenantId};
-use sprig_common::names::quote;
 use sprig_common::{CancellationToken, Result, SprigError};
 use sprig_controller::catalogs::{ClusterPools, ShardMapLocator};
 use sprig_controller::dispatch::JobClass;
@@ -273,38 +271,22 @@ async fn look(
 ) -> Result<Refreshed> {
     let ep = env.locator.writer(tenant).await?;
     let catalog = (ep.pool, ep.store.schema().to_owned());
-    let mut c = catalog
-        .0
-        .get_conn()
-        .await
-        .map_err(sprig_graph::catalog::backend_error)?;
-    let served = |cols: &str| {
-        format!(
-            "SELECT {cols} FROM {}.graphs WHERE kind = 'native' \
-             AND group_id IS NOT NULL AND state = 'active' \
-             AND (mirror_mode IN ('starting', 'async') OR mirror_state = 'building')",
-            quote(&catalog.1)
-        )
+    // The graphs served: grouped native graphs whose mirrors the applier
+    // keeps or builds, from the catalog's records on the engine node.
+    let rows: Vec<(u64, u32, u32, u8)> = {
+        let mut rec = crate::sinks::catalog_records().begin(tenant).await?;
+        sprig_graph::catalog::GraphCatalog::rows(&mut *rec)
+            .await?
+            .into_iter()
+            .filter(|r| {
+                r.kind == "native"
+                    && r.state == "active"
+                    && (matches!(r.mirror_mode.as_str(), "starting" | "async")
+                        || r.mirror_state == "building")
+            })
+            .filter_map(|r| r.group_id.map(|g| (r.graph_id, r.db_id, g, r.storage)))
+            .collect()
     };
-    let rows: Vec<(u64, u32, u32, u8)> = match c
-        .query(served("graph_id, db_id, group_id, storage"))
-        .await
-    {
-        Ok(r) => r,
-        // Before the catalog's graph migration 4: JSON graphs only.
-        Err(mysql_async::Error::Server(e)) if e.code == 1054 => match c
-            .query::<(u64, u32, u32), _>(served("graph_id, db_id, group_id"))
-            .await
-        {
-            Ok(r) => r.into_iter().map(|(g, d, gr)| (g, d, gr, 1)).collect(),
-            // Before migration 3: nothing to serve.
-            Err(mysql_async::Error::Server(e)) if e.code == 1054 || e.code == 1146 => Vec::new(),
-            Err(e) => return Err(sprig_graph::catalog::backend_error(e)),
-        },
-        Err(mysql_async::Error::Server(e)) if e.code == 1146 => Vec::new(),
-        Err(e) => return Err(sprig_graph::catalog::backend_error(e)),
-    };
-    drop(c);
     let mut graphs = HashMap::new();
     for (graph, db, group, storage) in rows {
         let typed = storage == sprig_graph::typed::STORAGE_TYPED;
@@ -1006,11 +988,19 @@ impl Applier {
     async fn clear_orphans(&mut self) {
         let r = async {
             let (pool, schema) = self.catalog().await?;
+            let live: Vec<u64> = {
+                let mut rec = crate::sinks::catalog_records().begin(self.tenant).await?;
+                sprig_graph::catalog::GraphCatalog::rows(&mut *rec)
+                    .await?
+                    .iter()
+                    .map(|r| r.graph_id)
+                    .collect()
+            };
             let mut c = pool
                 .get_conn()
                 .await
                 .map_err(sprig_graph::catalog::backend_error)?;
-            mirror::clear_orphan_pos(&mut c, &schema).await
+            mirror::clear_orphan_pos(&mut c, &schema, &live).await
         }
         .await;
         match r {
@@ -1020,7 +1010,7 @@ impl Applier {
                     tracing::info!(tenant = %self.tenant, rows = n, "graph mirror positions of dropped graphs deleted");
                 }
             }
-            // Before the catalog's graph migration 3: nothing to delete.
+            // Before the catalog's graph tables exist: nothing to delete.
             Err(e) if matches!(e.kind, sprig_common::ErrorKind::Backend { errno: 1146, .. }) => {
                 self.orphans_cleared = true;
             }

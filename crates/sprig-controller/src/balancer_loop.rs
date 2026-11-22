@@ -16,7 +16,7 @@
 //!
 //! **Gateway load.** Gateways don't send load reports on port 7400 yet.
 //! What they do send is the workload statistics, flushed every `workload.flush_seconds` into each tenant's
-//! catalog (`workload_stats`: statements, statement microseconds and rows
+//! catalog (its workload stats records: statements, statement microseconds and rows
 //! affected per fingerprint, bucket and gateway). Each run reads one
 //! aggregate of the tenant's recent buckets from the catalog it already
 //! scans (same cluster, same connection): statements per second, busy
@@ -57,7 +57,6 @@ use sprig_balancer::model::{
 use sprig_balancer::recommend::{RecommendationBook, RecommendationStore};
 use sprig_balancer::settings::{BalancerMode, BalancerSettings, ClusterLimits, GB, TenantKnobs};
 use sprig_balancer::{MoveExecutor, PlacementPolicy, PlanReport, Planner, Scheduler};
-use sprig_catalog::CatalogLocator;
 use sprig_catalog::placement::ShardMap;
 use sprig_cluster::health::ClusterHealth;
 use sprig_cluster::record::AdminState;
@@ -152,7 +151,7 @@ impl BalancerLoop {
         registry: ClusterRegistry,
         dc_store: Arc<dyn MetaStore>,
         pools: Arc<dyn ClusterPools>,
-        locator: Arc<dyn CatalogLocator>,
+        records: Arc<dyn sprig_catalog::RecordStore>,
         dir: Directory,
         live: Option<LiveSettings>,
         clock: Arc<dyn Clock>,
@@ -162,7 +161,7 @@ impl BalancerLoop {
         let tier = dc_store.tier().clone();
         Self {
             recs: RecommendationStore::new(Arc::clone(&dc_store), tier),
-            log: Arc::new(CatalogDecisionLog::new(locator)),
+            log: Arc::new(CatalogDecisionLog::new(records)),
             inner: Mutex::new(Inner {
                 planner: Planner::new(BalancerSettings::default()),
                 scheduler: Scheduler::new(dc.to_string(), actor),
@@ -541,7 +540,7 @@ impl BalancerLoop {
                 .await
                 .map_err(scan_err)?;
             let (schemas, tables, pages) = row.unwrap_or((0, 0, 0));
-            let g = gateway_load(&mut conn, *t, since, window, now).await;
+            let g = gateway_load(*t, since, window, now).await;
             #[allow(clippy::cast_precision_loss)]
             out.insert(
                 *t,
@@ -889,31 +888,15 @@ impl GatewayLoad {
     }
 }
 
-/// Reads `tenant`'s gateway load from its catalog's `workload_stats`: the
+/// Reads `tenant`'s gateway load from its catalog's workload records: the
 /// buckets that start within `window` seconds of its newest one, and not
-/// before `since`; no load when the catalog has no workload tables or the
-/// read fails.
-async fn gateway_load(
-    conn: &mut mysql_async::Conn,
-    tenant: TenantId,
-    since: u64,
-    window: u64,
-    now: u64,
-) -> GatewayLoad {
-    let schema = sprig_common::names::SchemaName::catalog(tenant).to_string();
-    let sql = format!(
-        "SELECT CAST(COALESCE(SUM(exec_count), 0) AS UNSIGNED), \
-         CAST(COALESCE(SUM(total_us), 0) AS UNSIGNED), \
-         CAST(COALESCE(SUM(rows_affected), 0) AS UNSIGNED), \
-         CAST(COALESCE(MIN(TIMESTAMPDIFF(SECOND, '1970-01-01', bucket_start)), 0) AS UNSIGNED) \
-         FROM {t} WHERE bucket_start >= TIMESTAMPADD(SECOND, ?, '1970-01-01') \
-         AND bucket_start >= (SELECT TIMESTAMPADD(SECOND, -?, MAX(bucket_start)) FROM {t})",
-        t = format!("{}.workload_stats", sprig_common::names::quote(&schema))
-    );
-    match conn
-        .exec_first::<(u64, u64, u64, u64), _, _>(sql, (since, window))
-        .await
-    {
+/// before `since`; no load when the tenant has none or the read fails.
+async fn gateway_load(tenant: TenantId, since: u64, window: u64, now: u64) -> GatewayLoad {
+    let read = async {
+        let mut rec = crate::catalog_records().begin(tenant).await?;
+        sprig_workload::store::WorkloadTables::recent_sums(&mut *rec, since, window).await
+    };
+    match read.await {
         Ok(Some((n, us, rows, oldest))) if n > 0 => {
             GatewayLoad::from_sums(n, us, rows, oldest, now)
         }

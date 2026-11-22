@@ -10,6 +10,10 @@ publish.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+# Graphs stored in SprigDB's own storage engine (`engine.rs`): its keys,
+# transactions and record locks.
+bytes.workspace = true
+sprig-engine.workspace = true
 # Bookmarks: base64url bodies with an HMAC-SHA256 tag (both already in
 # the workspace).
 base64.workspace = true

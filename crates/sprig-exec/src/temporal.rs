@@ -907,11 +907,14 @@ pub(crate) fn fsp_of_date(n: &Node, env: Env<'_>) -> u8 {
                 .filter(|&&b| b.is_ascii_punctuation() && b != b':' && b != b'.')
                 .count()
                 >= 2;
-            let is_date = match parse_datetime_mode(&scratch, s, DateMode::Loose) {
+            let parsed = parse_datetime_mode(&scratch, s, DateMode::Loose);
+            let is_date = match &parsed {
                 Some((t, _)) => t.month == 0 || t.day <= days_in_month(t.year, t.month),
                 None => false,
             };
-            if dated && !is_date {
+            // (Also a text that reads as no date at all, such as a time.)
+            let no_date = !parsed.is_some_and(|(t, _)| t.has_date);
+            if (dated && !is_date) || no_date {
                 return 6;
             }
         }
@@ -1206,7 +1209,7 @@ pub(crate) fn today(ctx: &Ctx<'_>) -> Tm {
 /// The statement's start time in the session's time zone.
 pub(crate) fn now(ctx: &Ctx<'_>) -> DateTime {
     datetime_from_unix(
-        ctx.session.now_seconds + i64::from(ctx.session.time_zone_offset),
+        ctx.session.now_seconds + ctx.session.zone_offset_at(ctx.session.now_seconds),
         ctx.session.now_micros,
     )
 }

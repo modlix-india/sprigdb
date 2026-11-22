@@ -48,6 +48,9 @@ use sprig_streams::read::{LogReader, ReadLimits};
 use sprig_streams::{PartitionNo, StreamId, StreamState, StreamsStore};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
+/// sprig-queues' durable queues (`m/mq/queues/<id>` catalog records).
+const MQ_QUEUES: sprig_catalog::RowTable = sprig_catalog::RowTable::new("mq", "queues");
+
 use crate::runtime::{JobCtx, JobHandler};
 use crate::settings::LogicScope;
 
@@ -593,17 +596,16 @@ impl MsgEnv {
                 .await?
                 .is_some_and(|d| d.state == StreamState::Active),
             SourceKind::Queue => {
-                let r: std::result::Result<Option<u64>, _> = c
-                    .exec_first(
-                        format!(
-                            "SELECT object_id FROM {}.mq_queues WHERE object_id = ? AND db_id = ? \
-                             AND state = 'active'",
-                            quote(&schema)
-                        ),
-                        (source.object_id, source.db_id),
-                    )
+                // Durable queues are catalog records on the engine node.
+                drop(c);
+                let mut rec = crate::sinks::catalog_records().begin(tenant).await?;
+                let q: Result<Option<Value>> = MQ_QUEUES
+                    .get(&mut *rec, &sprig_catalog::Pk::new().u64(source.object_id))
                     .await;
-                matches!(r, Ok(Some(_)))
+                let _ = rec.rollback().await;
+                q?.is_some_and(|q| {
+                    q["state"] == "active" && q["db_id"].as_u64() == Some(u64::from(source.db_id))
+                })
             }
         };
         if !alive {

@@ -5,6 +5,8 @@
 E0_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 E0_ROOT=$(cd "$E0_DIR/../../.." && pwd)            # the repository
 E0_BENCH=$(cd "$E0_DIR/.." && pwd)                 # deploy/bench
+# The node's dev key, certificates and MariaDB binlog config (the sprig and e0 arms mount them).
+E0_CONF=${E0_CONF:-$E0_ROOT/deploy/compose}
 # Working state (binaries, data, raw logs): never inside the repository's tracked files.
 E0_WORK=${E0_WORK:-$E0_ROOT/target/agent-e0-bench}
 E0_RAW=${E0_RAW:-$E0_WORK/raw}

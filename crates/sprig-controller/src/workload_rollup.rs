@@ -18,7 +18,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use sprig_catalog::CatalogLocator;
 use sprig_common::Result;
 use sprig_common::ids::{DcId, TenantId};
 use sprig_common::time::Clock;
@@ -35,7 +34,7 @@ pub const INTERVAL: Duration = Duration::from_secs(300);
 /// The rollup and retention loop (module docs).
 pub struct WorkloadRollup {
     dir: Directory,
-    locator: Arc<dyn CatalogLocator>,
+    records: Arc<dyn sprig_catalog::RecordStore>,
     dc: DcId,
     live: Option<LiveSettings>,
     clock: Arc<dyn Clock>,
@@ -54,14 +53,14 @@ impl WorkloadRollup {
     #[must_use]
     pub fn new(
         dir: Directory,
-        locator: Arc<dyn CatalogLocator>,
+        records: Arc<dyn sprig_catalog::RecordStore>,
         dc: DcId,
         live: Option<LiveSettings>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             dir,
-            locator,
+            records,
             dc,
             live,
             clock,
@@ -126,14 +125,7 @@ impl Reconciler for WorkloadRollup {
             return Ok(Outcome::Done);
         }
         let started = std::time::Instant::now();
-        let rep = maintain(
-            &*self.locator,
-            *key,
-            self.clock.wall(),
-            &self.retention(),
-            "controller:workload_rollup",
-        )
-        .await?;
+        let rep = maintain(&*self.records, *key, self.clock.wall(), &self.retention()).await?;
         metrics::histogram!("sprig_workload_rollup_duration_seconds")
             .record(started.elapsed().as_secs_f64());
         metrics::counter!("sprig_workload_rollup_merged_total").increment(rep.merged);

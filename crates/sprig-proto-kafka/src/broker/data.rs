@@ -259,6 +259,49 @@ pub trait StreamData: Send + Sync + 'static {
     async fn leader_epoch(&self, p: &Principal, stream_id: u64, partition: i32) -> i32;
     /// Limits for `p`.
     async fn limits(&self, p: &Principal) -> Limits;
+    /// Whether `t` keeps record batches as the producer sent them: produce
+    /// then goes through [`StreamData::append_batch`] and fetch through
+    /// [`StreamData::read_batches`], with no re-encoding.
+    fn stores_batches(&self, p: &Principal, t: &DataTopic) -> bool {
+        let _ = (p, t);
+        false
+    }
+    /// Phase one of a produce for a topic that stores batches: the checked
+    /// batch, whole, and its records as [`check_batch`] read them (for
+    /// size checks the store makes).
+    async fn append_batch(
+        &self,
+        p: &Principal,
+        t: &DataTopic,
+        partition: i32,
+        batch: &[u8],
+        records: &[ProduceRecord],
+        producer: Option<ProducerBatch>,
+    ) -> Result<AppendTicket, TopicError> {
+        let _ = (p, t, partition, batch, records, producer);
+        Err(topic_err(
+            err::UNKNOWN_SERVER_ERROR,
+            "this topic does not store record batches",
+        ))
+    }
+    /// Stored batches from the one holding `offset`, at most `max_bytes`
+    /// (the first whatever its size), and the offset after the last record
+    /// returned. `OFFSET_OUT_OF_RANGE` outside `[log start, high
+    /// watermark]`.
+    async fn read_batches(
+        &self,
+        p: &Principal,
+        t: &DataTopic,
+        partition: i32,
+        offset: i64,
+        max_bytes: usize,
+    ) -> Result<(Bounds, Vec<u8>, i64), TopicError> {
+        let _ = (p, t, partition, offset, max_bytes);
+        Err(topic_err(
+            err::UNKNOWN_SERVER_ERROR,
+            "this topic does not store record batches",
+        ))
+    }
 }
 
 /// The data plane over a [`StreamData`].
@@ -596,6 +639,12 @@ impl DataService {
                     )),
                     Ok(t) => match check_batch(t, pd.records.as_deref()) {
                         Err(e) => Err(e),
+                        Ok((records, producer)) if self.store.stores_batches(p, t) => {
+                            let bytes = pd.records.as_deref().unwrap_or_default();
+                            self.store
+                                .append_batch(p, t, pd.index, bytes, &records, producer)
+                                .await
+                        }
                         Ok((records, producer)) => {
                             self.store.append(p, t, pd.index, records, producer).await
                         }
@@ -734,6 +783,45 @@ impl DataService {
                     // Past the request's byte budget: no records, but the
                     // bounds (one more read would answer them; skip).
                     let budget = if total == 0 { room.max(1) } else { room };
+                    if budget > 0 && self.store.stores_batches(p, t) {
+                        match self
+                            .store
+                            .read_batches(p, t, fp.partition, fp.fetch_offset, budget)
+                            .await
+                        {
+                            Err(e) => {
+                                pr.error_code = e.code;
+                                if e.code == err::OFFSET_OUT_OF_RANGE
+                                    && let Ok(b) = self.store.bounds(p, t, fp.partition).await
+                                {
+                                    pr.high_watermark = b.high_watermark;
+                                    pr.last_stable_offset = b.high_watermark;
+                                    pr.log_start_offset = b.log_start;
+                                }
+                                errors = true;
+                            }
+                            Ok((b, bytes, next)) => {
+                                let code = epoch_check(fp.current_leader_epoch, &b);
+                                pr.high_watermark = b.high_watermark;
+                                pr.last_stable_offset = b.high_watermark;
+                                pr.log_start_offset = b.log_start;
+                                if code == err::NONE {
+                                    total += bytes.len();
+                                    beyond.push((
+                                        t.stream_id,
+                                        fp.partition,
+                                        next.max(fp.fetch_offset),
+                                    ));
+                                    pr.records = Some(bytes);
+                                } else {
+                                    pr.error_code = code;
+                                    errors = true;
+                                }
+                            }
+                        }
+                        out.partitions.push(pr);
+                        continue;
+                    }
                     let r = if budget == 0 {
                         self.store
                             .bounds(p, t, fp.partition)

@@ -19,12 +19,17 @@
 //!   `sprig_gateway_query_duration_seconds`; every other statement has
 //!   `tenant=""`, which `PromQL` treats as no label, so the series count
 //!   stays bounded by the busy tenants.
-//! - **Traces.** Each request runs inside a `gateway.request` span (target
-//!   [`TARGET`]) carrying the tenant id, protocol and request kind, and an
-//!   incoming W3C `traceparent` query attribute; the backend layer's
-//!   `backend.query` spans are its children. The span records `result`
-//!   and `error = true` on failure, so the tracer keeps every failed
-//!   statement (tail sampling).
+//! - **Traces.** A request that is head-sampled
+//!   (`telemetry.trace_sample_ratio`) or carries a W3C `traceparent` query
+//!   attribute runs inside a `gateway.request` span (target [`TARGET`])
+//!   carrying the tenant id, protocol and request kind; the backend
+//!   layer's `backend.query` spans are its children. The span records
+//!   `result` and `error = true` on failure. Building a span for every
+//!   statement cost more than a microsecond each, so the other requests
+//!   run without one: they are timed and counted the same, and one that
+//!   fails or is slower than `telemetry.trace_slow_ms` is still kept as a
+//!   trace (tail sampling), of its root alone. Their log lines carry no
+//!   request span fields.
 //!
 //! No SQL text and no values go into spans or labels.
 
@@ -34,7 +39,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use sprig_common::telemetry::trace::TARGET;
+use sprig_common::telemetry::trace::{self, TARGET};
+use sprig_common::time::poll;
 use sprig_common::{ErrorKind, Result, SprigCode, SprigError};
 use sprig_proto_mysql::packets::OkPacket;
 use sprig_proto_mysql::{ColumnDef, Value};
@@ -260,14 +266,14 @@ impl SessionExec for ObservedSession {
     ) -> Result<crate::pipeline::PointRead> {
         let protocol = cx.session.protocol.as_str();
         let waited = Arc::new(AtomicU64::new(0));
-        let started = Instant::now();
+        let started = poll::start();
         let run = Box::pin(self.inner.point_read(cx, stmt, params));
         let r = BACKEND_NANOS.scope(Arc::clone(&waited), run).await;
         // A fallback is counted by the execute that follows it.
         if matches!(r, Ok(crate::pipeline::PointRead::Fallback)) {
             return r;
         }
-        let total = started.elapsed();
+        let total = poll::end().saturating_duration_since(started);
         let result = match &r {
             Ok(_) => "ok",
             Err(e) => {
@@ -278,7 +284,7 @@ impl SessionExec for ObservedSession {
         let backend = Duration::from_nanos(waited.load(Ordering::Relaxed));
         let busy = self
             .tenant
-            .is_some_and(|t| TenantRates::get().busy(t, Instant::now()));
+            .is_some_and(|t| TenantRates::get().busy(t, poll::now()));
         self.sli.record(
             protocol,
             self.tenant,
@@ -313,11 +319,15 @@ impl SessionExec for ObservedSession {
         }
         let protocol = cx.session.protocol.as_str();
         let request = req.name();
-        // One span per request: an engine statement inside a
-        // traced command (MongoDB's) is part of that command's span.
-        let span = if (self.internal && in_traced_request()) || !request_spans() {
-            None
-        } else {
+        // One span per request that is head-sampled or carries a trace
+        // context; the others are timed and counted as well, and kept as a
+        // one-span trace if they fail or are slow (`unsampled_root`). An
+        // engine statement inside a traced command (MongoDB's) is part of
+        // that command's span.
+        let traced = !((self.internal && in_traced_request()) || !request_spans());
+        let parent = if traced { traceparent(&req) } else { None };
+        let sampled_here = traced && parent.is_none() && trace::head_sampled();
+        let span = if parent.is_some() || sampled_here {
             Some(tracing::info_span!(
                 target: TARGET,
                 "gateway.request",
@@ -325,13 +335,16 @@ impl SessionExec for ObservedSession {
                 request = req.name(),
                 tenant = self.tenant,
                 gateway_session = cx.session.id.0,
-                traceparent = traceparent(&req),
+                traceparent = parent,
+                sampled = sampled_here,
                 result = tracing::field::Empty,
                 error = tracing::field::Empty,
             ))
+        } else {
+            None
         };
         let waited = Arc::new(AtomicU64::new(0));
-        let started = Instant::now();
+        let started = poll::start();
         let mut sink = Watch {
             inner: out,
             result: None,
@@ -346,7 +359,7 @@ impl SessionExec for ObservedSession {
             }
             None => BACKEND_NANOS.scope(Arc::clone(&waited), run).await,
         };
-        let total = started.elapsed();
+        let total = poll::end().saturating_duration_since(started);
         let result = match &r {
             Ok(_) => sink.result.unwrap_or("ok"),
             Err(e) => classify(e),
@@ -362,14 +375,36 @@ impl SessionExec for ObservedSession {
             if result != "ok" {
                 span.record("result", result);
                 span.record("error", true);
-            } else if sprig_common::telemetry::trace::may_keep(span, total) {
+            } else if trace::may_keep(span, total) {
                 span.record("result", result);
             }
+        } else if traced {
+            let (tenant, session) = (self.tenant, cx.session.id.0);
+            trace::unsampled_root(
+                "gateway.request",
+                || {
+                    let mut a = vec![
+                        ("protocol".to_owned(), protocol.to_owned()),
+                        ("request".to_owned(), request.to_owned()),
+                    ];
+                    if let Some(t) = tenant {
+                        a.push(("tenant".to_owned(), t.to_string()));
+                    }
+                    a.push(("gateway_session".to_owned(), session.to_string()));
+                    a.push(("result".to_owned(), result.to_owned()));
+                    if result != "ok" {
+                        a.push(("error".to_owned(), "true".to_owned()));
+                    }
+                    a
+                },
+                total,
+                result != "ok",
+            );
         }
         let backend = Duration::from_nanos(waited.load(Ordering::Relaxed));
         let busy = self
             .tenant
-            .is_some_and(|t| TenantRates::get().busy(t, Instant::now()));
+            .is_some_and(|t| TenantRates::get().busy(t, poll::now()));
         self.sli.record(
             protocol,
             self.tenant,

@@ -172,18 +172,30 @@ pub const INSERT_INTERNAL_KEYS: &str = "INSERT INTO settings
   ON DUPLICATE KEY UPDATE setting_key = setting_key";
 
 /// The core module's migrations.
-pub static CORE_MIGRATIONS: &[Migration] = &[Migration {
-    format: 1,
-    phase: Phase::Expand,
-    name: "databases, objects, settings, schema_versions and the internal keys",
-    statements: &[
-        DDL_DATABASES,
-        DDL_OBJECTS,
-        DDL_SETTINGS,
-        DDL_SCHEMA_VERSIONS,
-        INSERT_INTERNAL_KEYS,
-    ],
-}];
+pub static CORE_MIGRATIONS: &[Migration] = &[
+    Migration {
+        format: 1,
+        phase: Phase::Expand,
+        name: "databases, objects, settings, schema_versions and the internal keys",
+        statements: &[
+            DDL_DATABASES,
+            DDL_OBJECTS,
+            DDL_SETTINGS,
+            DDL_SCHEMA_VERSIONS,
+            INSERT_INTERNAL_KEYS,
+        ],
+    },
+    Migration {
+        format: 2,
+        phase: Phase::Expand,
+        name: "rec_log: module record writes until the engine applies them",
+        statements: &[crate::store::reclog::DDL_REC_LOG],
+    },
+];
+
+/// The core format from which the catalog has its record log, so modules
+/// keep their rows as engine records on the catalog version.
+pub const CORE_REC_LOG_FORMAT: u32 = 2;
 
 /// The core module.
 pub const CORE_MODULE: Module = Module {
@@ -602,8 +614,12 @@ impl Migrator {
     /// The newest format this binary reads, per module.
     #[must_use]
     pub fn supports(&self) -> BTreeMap<String, u32> {
+        // A module with no migrations keeps no tables here (its rows are
+        // engine records): whatever format an older build recorded for it
+        // doesn't concern readers.
         self.modules
             .iter()
+            .filter(|m| !m.migrations.is_empty())
             .map(|m| (m.name.to_owned(), m.newest()))
             .collect()
     }
@@ -1155,7 +1171,7 @@ mod tests {
         };
         let m = Migrator::new(&[good]).unwrap();
         assert_eq!(m.supports().get("auth"), Some(&3));
-        assert_eq!(m.supports().get(CORE), Some(&1));
+        assert_eq!(m.supports().get(CORE), Some(&2));
         for bad in [
             Module {
                 name: "gap",

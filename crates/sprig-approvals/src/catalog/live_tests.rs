@@ -1,7 +1,6 @@
-//! Live: `SPRIG_TEST_MARIADB_SINGLE` (for example
-//! `mysql://root:sprig-dev-root@127.0.0.1:13301`). Works in the schema
-//! `approvals_live_<pid>`, created bare (no catalog tables) so the store
-//! migrates the module on first use, and dropped afterwards.
+//! The catalog store on the in-memory record store: raises, refreshes,
+//! concurrent raises, ignoring and suppression, versions, the due index,
+//! filters and subscriptions.
 
 #![allow(
     clippy::unwrap_used,
@@ -13,8 +12,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use mysql_async::prelude::Queryable;
-use sprig_catalog::{CatalogEndpoint, StaticLocator, Store};
 use sprig_common::ids::{DbId, ObjectId, TenantId};
 
 use super::*;
@@ -44,44 +41,12 @@ fn p(cols: &str, score: f64) -> Proposal {
 }
 
 #[tokio::test]
-async fn live_catalog_store_round_trip() {
-    let Ok(url) = std::env::var("SPRIG_TEST_MARIADB_SINGLE") else {
-        eprintln!("skipped: set SPRIG_TEST_MARIADB_SINGLE to run it");
-        return;
-    };
-    let opts = mysql_async::OptsBuilder::from_opts(mysql_async::Opts::from_url(&url).unwrap())
-        .pool_opts(
-            mysql_async::PoolOpts::default()
-                .with_constraints(mysql_async::PoolConstraints::new(0, 4).unwrap())
-                .with_inactive_connection_ttl(Duration::from_secs(30)),
-        );
-    let pool = mysql_async::Pool::new(opts);
-    let schema = format!("approvals_live_{}", std::process::id());
-    let mut conn = pool.get_conn().await.unwrap();
-    conn.query_drop(format!("DROP DATABASE IF EXISTS {schema}"))
-        .await
-        .unwrap();
-    conn.query_drop(format!("CREATE DATABASE {schema}"))
-        .await
-        .unwrap();
-    // The migrator records formats in the core `settings` table.
-    Migrator::new(&[])
-        .unwrap()
-        .run(&mut conn, &schema, &MigrateOpts::default())
-        .await
-        .unwrap();
-    let locator = StaticLocator::new().with(
-        TenantId(7),
-        CatalogEndpoint {
-            pool: pool.clone(),
-            store: Store::new(schema.clone()),
-        },
-    );
-    let store = Arc::new(CatalogRecStore::new(Arc::new(locator), TenantId(7)));
+async fn catalog_store_round_trip() {
+    let records: Arc<dyn RecordStore> = Arc::new(sprig_catalog::records::mem::MemRecords::new());
+    let store = Arc::new(CatalogRecStore::new(Arc::clone(&records), TenantId(7)));
     let r = async move {
         let mut pol = Policy::fixed(Mode::Approve, Level::Table);
         pol.escalate_after = Some(Duration::from_secs(60));
-        // First raise migrates the module (the table is missing).
         let a = store
             .raise(&p("a", 10.0), &pol, &[TenantId(1)], 1_000)
             .await
@@ -161,27 +126,27 @@ async fn live_catalog_store_round_trip() {
         };
         assert_eq!(store.list(&f).await.unwrap().len(), 3);
         // Subscriptions.
-        let (mut c, recs) = store.open().await.unwrap();
-        recs.set_subscription(
-            &mut c,
-            &Subscription {
-                user: "ana".into(),
-                email: "ana@example.com".into(),
-                delivery: "immediate".into(),
-                kinds: "*".into(),
-                last_digest_us: None,
-            },
-            1,
-        )
-        .await
-        .unwrap();
-        assert_eq!(recs.subscriptions(&mut c).await.unwrap().len(), 1);
+        let sub = Subscription {
+            user: "ana".into(),
+            email: "ana@example.com".into(),
+            delivery: "immediate".into(),
+            kinds: "*".into(),
+            last_digest_us: None,
+            updated_at_us: None,
+        };
+        store.set_subscription(&sub, 1).await.unwrap();
+        store.digest_sent("ana", 9).await.unwrap();
+        store.set_subscription(&sub, 10).await.unwrap();
+        let subs = store.subscriptions().await.unwrap();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(
+            (subs[0].last_digest_us, subs[0].updated_at_us),
+            (Some(9), Some(10))
+        );
+        // Closed items go after their time; a forever-ignored one stays.
+        let n = store.purge(i64::MAX).await.unwrap();
+        assert!(n >= 1, "the ignored item with an end goes");
+        assert!(store.get(1).await.unwrap().is_none());
     };
-    let out = tokio::spawn(r).await;
-    conn.query_drop(format!("DROP DATABASE IF EXISTS {schema}"))
-        .await
-        .unwrap();
-    drop(conn);
-    pool.disconnect().await.unwrap();
-    out.unwrap();
+    tokio::spawn(r).await.unwrap();
 }

@@ -29,6 +29,11 @@ const APPLIED: &[u8] = b"applied";
 /// group, plus the unit's applied index, in one batch with the WAL off.
 struct StoreMachine {
     store: Arc<dyn SortedStore>,
+    /// Apply observers ([`crate::observe`]). Held shared across a whole
+    /// apply, so registering one sees either all of an apply or none.
+    observers: RwLock<Vec<Arc<dyn crate::observe::ApplyObserver>>>,
+    /// The last index applied to the store (set inside the apply).
+    last_applied: AtomicU64,
     /// The highest version timestamp ever applied, kept in the unit's
     /// bookkeeping (`max_ts`) so a restarted clock starts above it even when
     /// the wall clock stepped back.
@@ -68,6 +73,10 @@ impl StateMachine for StoreMachine {
         let Some(last) = entries.last() else {
             return Ok(());
         };
+        let observers = self
+            .observers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         let mut batch = StoreBatch::new();
         for e in entries {
             log::payload::decode_into(&e.data, &mut batch)?;
@@ -95,8 +104,20 @@ impl StateMachine for StoreMachine {
                 top.to_be_bytes(),
             );
         }
-        self.store.write(&batch, WalMode::Off)
+        self.store.write(&batch, WalMode::Off)?;
+        self.last_applied.store(last.index, Ordering::Release);
+        for o in observers.iter() {
+            o.applied(entries);
+        }
+        Ok(())
     }
+}
+
+/// The `local` key holding an observer's log floor.
+fn floor_key(unit: UnitId, name: &str) -> Vec<u8> {
+    let mut f = b"floor/".to_vec();
+    f.extend_from_slice(name.as_bytes());
+    keys::unit_meta_key(unit.0, &f)
 }
 
 /// The transaction layer's rule for dropping old versions in compactions,
@@ -156,6 +177,9 @@ struct Stop {
 
 struct Inner {
     cfg: EngineConfig,
+    sm: Arc<StoreMachine>,
+    /// Observers' log floors, by name ([`crate::observe`]).
+    floors: Mutex<std::collections::BTreeMap<String, u64>>,
     store: Arc<dyn SortedStore>,
     rocks: Option<Arc<RocksStore>>,
     log: Arc<LocalLog>,
@@ -258,10 +282,14 @@ impl Engine {
             StoreKind::Mem => (Arc::new(MemStore::with_gc(Some(rule))), None),
         };
         let max_ts = read_u64(store.as_ref(), &keys::unit_meta_key(UNIT.0, MAX_TS))?;
+        let applied0 = read_u64(store.as_ref(), &keys::unit_meta_key(UNIT.0, APPLIED))?;
         let sm = Arc::new(StoreMachine {
             store: Arc::clone(&store),
+            observers: RwLock::new(Vec::new()),
+            last_applied: AtomicU64::new(applied0),
             max_ts: AtomicU64::new(max_ts),
         });
+        let floors = load_floors(store.as_ref(), UNIT)?;
         let log = Arc::new(LocalLog::open(
             cfg.data_dir.join("raft"),
             cfg.log.clone(),
@@ -279,6 +307,8 @@ impl Engine {
         let txn_gc = Arc::new(TxnGc(Arc::downgrade(&txn_shared)));
         let engine = Engine {
             inner: Arc::new(Inner {
+                sm: Arc::clone(&sm),
+                floors: Mutex::new(floors),
                 txn: txn_shared,
                 store,
                 rocks,
@@ -397,9 +427,128 @@ impl Engine {
             return Ok(0);
         }
         let store = Arc::clone(&self.inner.store);
-        let n = self.inner.log.checkpoint(&move || store.flush_all())?;
+        let floor = self
+            .inner
+            .floors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .min()
+            .copied();
+        let unit = self.inner.unit;
+        let n = self
+            .inner
+            .log
+            .checkpoint_capped(&move || store.flush_all(), &|u| {
+                if u == unit { floor } else { None }
+            })?;
         self.inner.checkpoints.fetch_add(1, Ordering::Relaxed);
         Ok(n)
+    }
+
+    /// An observer's log floor ([`crate::observe`]), if it ever set one.
+    #[must_use]
+    pub fn log_floor(&self, name: &str) -> Option<u64> {
+        self.inner
+            .floors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(name)
+            .copied()
+    }
+
+    /// Records that observer `name` holds every entry up to `index`
+    /// durably in its own files: the checkpoint keeps the log above it.
+    /// Synced before it returns.
+    ///
+    /// # Errors
+    /// The store failed.
+    pub fn set_log_floor(&self, name: &str, index: u64) -> Result<()> {
+        let mut floors = self
+            .inner
+            .floors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut b = StoreBatch::new();
+        b.put(
+            Cf::Local,
+            floor_key(self.inner.unit, name),
+            index.to_be_bytes(),
+        );
+        self.inner.store.write(&b, WalMode::Sync)?;
+        floors.insert(name.to_owned(), index);
+        Ok(())
+    }
+
+    /// Forgets observer `name`'s floor: the log may be trimmed past it.
+    ///
+    /// # Errors
+    /// The store failed.
+    pub fn clear_log_floor(&self, name: &str) -> Result<()> {
+        let mut floors = self
+            .inner
+            .floors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut b = StoreBatch::new();
+        b.delete(Cf::Local, floor_key(self.inner.unit, name));
+        self.inner.store.write(&b, WalMode::Sync)?;
+        floors.remove(name);
+        Ok(())
+    }
+
+    /// The lowest log index the engine's commit log still holds (`None`:
+    /// it holds none). An observer whose floor is below it can't catch up
+    /// from the log: a binary that didn't keep observer floors trimmed it.
+    #[must_use]
+    pub fn log_first_index(&self) -> Option<u64> {
+        self.inner.log.first_index(self.inner.unit)
+    }
+
+    /// The highest index the store has applied (what [`Engine::observe`]
+    /// hands an observer up to).
+    #[must_use]
+    pub fn last_applied(&self) -> u64 {
+        self.inner.sm.last_applied.load(Ordering::Acquire)
+    }
+
+    /// Registers an apply observer. Entries above `from` that the store
+    /// has already applied are handed to it first (from the log), then it
+    /// sees every new one; no entry is missed or seen twice. Returns the
+    /// last index it was given.
+    ///
+    /// # Errors
+    /// The log no longer holds an entry it needs (the observer's floor was
+    /// not kept), or reading the log failed.
+    pub fn observe(&self, o: Arc<dyn crate::observe::ApplyObserver>, from: u64) -> Result<u64> {
+        let sm = &self.inner.sm;
+        let mut obs = sm.observers.write().unwrap_or_else(PoisonError::into_inner);
+        let top = sm.last_applied.load(Ordering::Acquire);
+        let mut next = from + 1;
+        if next <= top
+            && self
+                .inner
+                .log
+                .first_index(self.inner.unit)
+                .is_none_or(|f| f > next)
+        {
+            return Err(SprigError::internal(format!(
+                "engine: the log no longer holds entry {next}, which an observer needs"
+            )));
+        }
+        while next <= top {
+            let end = (next + 512).min(top + 1);
+            let got = self.inner.log.entries(self.inner.unit, next, end)?;
+            if got.first().map(|e| e.index) != Some(next) {
+                return Err(SprigError::internal(format!(
+                    "engine: the log no longer holds entry {next}, which an observer needs"
+                )));
+            }
+            next += got.len() as u64;
+            o.applied(&got);
+        }
+        obs.push(o);
+        Ok(top)
     }
 
     /// Counters.
@@ -423,6 +572,31 @@ impl Engine {
     pub fn data_dir(&self) -> &Path {
         &self.inner.cfg.data_dir
     }
+}
+
+/// Every observer floor stored for `unit`.
+fn load_floors(
+    store: &dyn SortedStore,
+    unit: UnitId,
+) -> Result<std::collections::BTreeMap<String, u64>> {
+    let prefix = floor_key(unit, "");
+    let mut out = std::collections::BTreeMap::new();
+    let mut it = store.iter(
+        Cf::Local,
+        crate::store::IterOpts::range(&keys::KeyRange::prefix(&prefix)),
+    );
+    it.seek(&prefix);
+    while it.valid() {
+        let name = String::from_utf8_lossy(&it.key()[prefix.len()..]).into_owned();
+        let v: [u8; 8] = it
+            .value()
+            .try_into()
+            .map_err(|_| SprigError::internal("storage: an observer floor is corrupt"))?;
+        out.insert(name, u64::from_be_bytes(v));
+        it.next();
+    }
+    it.status()?.expect_ready()?;
+    Ok(out)
 }
 
 fn spawn_checkpointer(engine: &Engine) -> Result<JoinHandle<()>> {

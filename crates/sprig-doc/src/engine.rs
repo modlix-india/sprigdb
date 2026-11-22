@@ -428,6 +428,9 @@ enum PlanKind {
     /// An aggregation's result on disk: read as the cursor goes, its
     /// spill files deleted when the plan is dropped.
     Spilled(SpilledDocs),
+    /// A cursor over a collection stored on the storage engine; its
+    /// batches come from [`crate::docstore`], not from SQL.
+    Store(Box<crate::docstore::read::StoreCursor>),
 }
 
 /// A spilled result and the document read ahead (to tell the last batch).
@@ -510,8 +513,32 @@ impl CursorPlan {
                 .iter()
                 .map(|d| bson::to_vec(d).map_or(0, |v| v.len()))
                 .sum(),
-            PlanKind::Keyset { .. } => 0,
+            PlanKind::Keyset { .. } | PlanKind::Store(_) => 0,
             PlanKind::Spilled(s) => s.ahead.as_ref().map_or(0, crate::spill::doc_bytes),
+        }
+    }
+
+    /// A plan over a cursor of the engine document store.
+    #[must_use]
+    pub fn from_store(ns: Ns, cur: crate::docstore::read::StoreCursor) -> Self {
+        let exhausted = cur.exhausted();
+        Self {
+            ns,
+            table: String::new(),
+            pred: Pred::True,
+            projection: None,
+            remaining: None,
+            exhausted,
+            kind: PlanKind::Store(Box::new(cur)),
+            collation: None,
+        }
+    }
+
+    /// The engine document store's cursor, when this plan is one.
+    pub fn store_mut(&mut self) -> Option<&mut crate::docstore::read::StoreCursor> {
+        match &mut self.kind {
+            PlanKind::Store(c) => Some(c),
+            _ => None,
         }
     }
 }
@@ -1409,6 +1436,12 @@ impl Engine {
         let now = now_date();
         let cx = AggExpr { now };
         match &mut plan.kind {
+            PlanKind::Store(_) => {
+                return Err(MongoError::new(
+                    code::INTERNAL_ERROR,
+                    "a cursor of the engine document store read through SQL",
+                ));
+            }
             PlanKind::Buffer(b) => {
                 while out.len() < want {
                     let Some(d) = b.pop_front() else { break };
@@ -3268,7 +3301,7 @@ impl Engine {
 /// documents whose `foreign` values equal one of its `local` values
 /// (a missing or null local value matches missing or null foreign ones),
 /// in foreign order; every foreign document without fields.
-fn join_chunk(
+pub(crate) fn join_chunk(
     chunk: &[Document],
     foreign_docs: &[Document],
     fields: Option<(&str, &str)>,
@@ -3300,7 +3333,8 @@ fn join_chunk(
             Some((l, _)) => {
                 let lv = filter::values_at(d, l);
                 let mut hits: Vec<usize> = Vec::new();
-                if lv.vals.is_empty() {
+                // A missing field, or only an empty array, matches null.
+                if lv.vals.iter().all(|v| matches!(v, Bson::Array(_))) {
                     if let Some(v) = index.get(&null_key) {
                         hits.extend(v);
                     }

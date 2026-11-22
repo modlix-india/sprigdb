@@ -235,6 +235,20 @@ pub fn mysql_functional_parts(text: &str) -> String {
         .join("\n")
 }
 
+/// The three expressions of the MySQL-shaped `COLUMNS` view that use
+/// regular expressions, as [`show_columns_sql`] and [`mysql_view`] write
+/// them with `lit`: `COLUMN_TYPE` without display widths, and
+/// `COLUMN_DEFAULT` and `EXTRA` as MySQL shows them. A provider that
+/// computes these values itself may put its own columns in their place.
+#[must_use]
+pub fn mysql_column_exprs(lit: Lit<'_>) -> [String; 3] {
+    [
+        column_type("`COLUMN_TYPE`", lit),
+        column_default(lit),
+        extra(lit),
+    ]
+}
+
 /// `COLUMN_TYPE` without integer display widths, as MySQL 8.4 shows it
 /// (`tinyint(1)` and `ZEROFILL` columns keep theirs).
 fn column_type(expr: &str, lit: Lit<'_>) -> String {

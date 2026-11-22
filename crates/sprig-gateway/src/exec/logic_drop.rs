@@ -250,8 +250,10 @@ impl PassSession {
         // What uses a function or procedure.
         let mut also: Vec<ModuleRow> = Vec::new();
         if matches!(d.kind, Kind::Function | Kind::Procedure) {
-            let deps = sprig_logic::drop::dependents(&mut conn, &store, row.db_id.0, &row.name, &m)
-                .await?;
+            let mut deps =
+                sprig_logic::drop::dependents(&mut conn, &store, row.db_id.0, &row.name, &m)
+                    .await?;
+            deps.sinks = sinks_using(ts.catalog(), row.db_id.0, &row.name, &m.name);
             if let Some(e) = deps.refusal(d.kind, &d.name, d.cascade) {
                 return Err(e);
             }
@@ -592,8 +594,9 @@ impl PassSession {
                 format!("no {} {} in {}", d.kind.as_str(), d.name, row.name),
             )
         })?;
-        let deps =
+        let mut deps =
             sprig_logic::drop::dependents(&mut conn, &store, row.db_id.0, &row.name, &m).await?;
+        deps.sinks = sinks_using(ts.catalog(), row.db_id.0, &row.name, &m.name);
         Ok(deps.rows())
     }
 
@@ -824,4 +827,35 @@ async fn message_source(
         ));
     }
     Ok((b, src))
+}
+
+/// Sinks of database `db_id` whose `TRANSFORM` is function `name` (by its
+/// name or `<db_name>.<name>`), from the catalog snapshot's sinks.
+fn sinks_using(
+    cat: Option<&Arc<sprig_catalog::TenantCatalog>>,
+    db_id: u32,
+    db_name: &str,
+    name: &str,
+) -> Vec<String> {
+    let qualified = format!("{db_name}.{name}");
+    let mut v: Vec<String> = cat
+        .and_then(|c| {
+            c.ext
+                .get::<sprig_sinks::store::SinksState>(sprig_sinks::store::MODULE)
+        })
+        .map(|st| {
+            st.sinks
+                .values()
+                .filter(|s| {
+                    s.db_id == db_id
+                        && s.transform
+                            .as_deref()
+                            .is_some_and(|t| t == name || t == qualified)
+                })
+                .map(|s| s.name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
 }

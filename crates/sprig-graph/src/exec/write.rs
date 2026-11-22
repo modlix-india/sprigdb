@@ -372,7 +372,7 @@ impl Exec<'_> {
             }
         }
         for batch in edge_ids.chunks(self.b.batch_nodes.max(1)) {
-            for er in self.store.edges(batch).await? {
+            for er in self.store.lock_edges(batch).await? {
                 let r = self.rel_val(&er);
                 pend.insert(
                     (false, er.id),

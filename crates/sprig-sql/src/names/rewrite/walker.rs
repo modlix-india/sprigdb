@@ -1951,7 +1951,17 @@ impl Walker<'_, '_> {
                     break;
                 } else if self.at(b"REFERENCES") {
                     self.i += 1;
-                    self.object(ObjectKind::Table, false)?;
+                    // A parent in a database that doesn't exist stays as
+                    // written: the storage engine answers it as each
+                    // server does (MariaDB's 1005 errno 150, MySQL's 1824;
+                    // with foreign_key_checks off the key is kept, and
+                    // every child row then fails it).
+                    match self.object(ObjectKind::Table, false) {
+                        Err(NameError::UnknownDatabase(_)) => {}
+                        r => {
+                            r?;
+                        }
+                    }
                 } else if self.at(b"UNION")
                     && (self.op(self.i + 1, b"=") || self.punct(self.i + 1, b'('))
                 {

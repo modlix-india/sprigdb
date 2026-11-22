@@ -57,6 +57,9 @@ use crate::graphs::typed::StoreParts;
 use crate::graphs::{GatewayGraphs, GraphRef, RouteHolds};
 use crate::reads::GtidSet;
 
+mod engine;
+use engine::{EngineRun, EngineTx};
+
 /// What an explicit transaction runs on.
 enum TxConns {
     /// `mode: "r"`: read-only transactions per cluster.
@@ -80,6 +83,9 @@ struct Tx {
     touched: Vec<(GraphRef, Vec<Touched>)>,
     /// Statements run so far.
     ran: u32,
+    /// Its engine transaction, once a statement used a graph stored in the
+    /// storage engine.
+    engine: Option<EngineTx>,
 }
 
 /// The session's causal target and last bookmark.
@@ -1017,6 +1023,19 @@ impl GwSession {
             // Read-only SQL over the user's tables, on its own read-only
             // transaction (also inside an explicit Bolt transaction).
             let def = mapped_def(&g)?;
+            // Over an engine database's tables: read in process.
+            if crate::engine::graphsql::EngineSql::serves(&cat, g.db_id) {
+                let mut run = crate::engine::graphsql::EngineSql::new(
+                    g.tenant,
+                    &cat,
+                    self.graphs.lctn(&cat),
+                    false,
+                );
+                let mut store =
+                    sprig_graph::mapped::MappedStore::new(&mut run, g.graph_id, &g.schema, def);
+                let r = sprig_graph::exec::run(&mut store, &q, &p, &budgets).await;
+                return Ok(StartOrResult::Result(self.result(r?, &g.name, &cat)?));
+            }
             let mut rc = ReadConns::default();
             if let Err(e) = self.open_reads(&mut rc, &g, read_mode, &cat).await {
                 rc.end().await;
@@ -1032,6 +1051,21 @@ impl GwSession {
             };
             rc.end().await;
             return Ok(StartOrResult::Result(self.result(r?, &g.name, &cat)?));
+        }
+        if crate::graphs::engine::on_engine(&g, &cat) {
+            let streams = sprig_graph::streamable(&q).is_some();
+            return self
+                .execute_engine(EngineRun {
+                    q,
+                    p,
+                    g,
+                    cat,
+                    budgets,
+                    visible,
+                    writes,
+                    streams,
+                })
+                .await;
         }
         let g = if writes {
             self.after_holds(g).await?
@@ -1170,6 +1204,9 @@ impl GwSession {
             return Ok(StartOrResult::Result(self.result(out, &g.name, &cat)?));
         }
         // In the explicit transaction.
+        if self.tx.as_ref().is_some_and(|t| t.engine.is_some()) {
+            return Err(engine::mixed_graphs());
+        }
         self.tx_conns().await?;
         let Some(t) = self.tx.as_mut() else {
             return Err(SprigError::internal("no transaction"));
@@ -1372,6 +1409,9 @@ impl GwSession {
     fn abandon(&mut self) {
         let Some(t) = self.tx.take() else { return };
         let fut = async move {
+            if let Some(et) = t.engine {
+                et.abandon().await;
+            }
             let conns = match (t.conns, t.back) {
                 (Some(c), _) => Some(c),
                 (None, Some(b)) => b.await.ok(),
@@ -1568,6 +1608,7 @@ impl BoltSession for GwSession {
                 deleted: Vec::new(),
                 touched: Vec::new(),
                 ran: 0,
+                engine: None,
             })
         }
         .await;
@@ -1578,6 +1619,13 @@ impl BoltSession for GwSession {
     async fn commit(&mut self) -> std::result::Result<Option<String>, BoltFailure> {
         if self.tx.is_none() {
             return Err(BoltFailure::invalid("no open transaction"));
+        }
+        // The engine part first: its deleted-node check may still refuse.
+        if let Some(et) = self.tx.as_mut().and_then(|t| t.engine.take())
+            && let Err(e) = et.commit().await
+        {
+            self.abandon();
+            return Err(failure(&e));
         }
         if let Err(e) = self.tx_conns().await {
             self.abandon();

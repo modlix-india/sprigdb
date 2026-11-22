@@ -619,11 +619,9 @@ impl sprig_inherit::Runner for InhRunner<'_, '_, '_> {
         }
         let mut c = svc.catalog.change(tenant, VersionKind::Catalog).await?;
         let version = c.version();
-        let applied = {
-            let (store, tx) = c.tx().parts();
-            InheritStore::new(store.schema())
-                .apply(tx, change, version)
-                .await
+        let applied = match c.tx().records().await {
+            Ok(rec) => InheritStore::apply(rec, change, version).await,
+            Err(e) => Err(e),
         };
         if let Err(e) = applied {
             let _ = c.rollback().await;

@@ -1,55 +1,21 @@
-//! `oidc_issuers` and `claim_mappings`: the auth module's format 7, rows,
-//! reads for the cache, and the writes the Admin API makes (each one auth
-//! change, so every gateway's `TenantAuth` follows at once).
+//! `oidc_issuers` and `claim_mappings` as catalog records
+//! (`m/auth/oidc_issuers/<issuer>`, `m/auth/claim_mappings/<issuer>/<mapping>`):
+//! rows, reads for the cache, and the writes the Admin API makes (each one
+//! auth change, so every gateway's `TenantAuth` follows at once).
 
 use std::time::SystemTime;
 
-use mysql_async::prelude::Queryable;
-use mysql_async::{Row, Value};
 use serde::{Deserialize, Serialize};
-use sprig_catalog::{ChangeOpts, MariaCatalog, VersionKind};
+use sprig_catalog::records::{self, Pk, RecordTx};
+use sprig_catalog::{AuthCatalog, AuthTx, ChangeOpts, VersionKind};
 use sprig_common::ids::{TenantId, UserId};
-use sprig_common::names::quote;
-use sprig_common::{ErrorKind, Result, SprigCode, SprigError};
+use sprig_common::{Result, SprigCode, SprigError};
 
 use super::jwks::check_url;
 use super::jwt::Alg;
 use crate::admin::{Changed, MAX_NAME};
-use crate::store::{AuthMethods, AuthStore, UserRow, UserSource, map_err};
-
-/// The `oidc_issuers` table: one row per token issuer.
-pub const DDL_OIDC_ISSUERS: &str = "CREATE TABLE IF NOT EXISTS oidc_issuers (
-  issuer_id       INT UNSIGNED    NOT NULL,
-  kind            ENUM('oidc','end_user_layer') NOT NULL DEFAULT 'oidc',
-  issuer          VARCHAR(512)    NOT NULL,
-  jwks_url        VARCHAR(512)    NULL,
-  audiences       JSON            NOT NULL,
-  algorithms      JSON            NOT NULL,
-  protocols       SET('mysql','mongodb','redis','http') NOT NULL,
-  client_id       VARCHAR(255)    NULL,
-  request_scopes  JSON            NULL,
-  jit_users       TINYINT(1)      NOT NULL DEFAULT 0,
-  max_lifetime_s  INT UNSIGNED    NOT NULL DEFAULT 86400,
-  state           ENUM('active','disabled') NOT NULL,
-  changed_version BIGINT UNSIGNED NOT NULL,
-  PRIMARY KEY (issuer_id),
-  UNIQUE KEY uk_issuer (issuer)
-) ENGINE=InnoDB";
-
-/// `claim_mappings`.
-pub const DDL_CLAIM_MAPPINGS: &str = "CREATE TABLE IF NOT EXISTS claim_mappings (
-  mapping_id      INT UNSIGNED    NOT NULL,
-  issuer_id       INT UNSIGNED    NOT NULL,
-  priority        SMALLINT        NOT NULL,
-  kind            ENUM('user','role') NOT NULL,
-  claim           VARCHAR(255)    NOT NULL,
-  match_kind      ENUM('any','equals','regex') NOT NULL,
-  match_value     VARCHAR(512)    NULL,
-  target          VARCHAR(255)    NOT NULL,
-  changed_version BIGINT UNSIGNED NOT NULL,
-  PRIMARY KEY (mapping_id),
-  KEY k_issuer (issuer_id, priority)
-) ENGINE=InnoDB";
+use crate::rec::{CLAIM_MAPPINGS, OIDC_ISSUERS, host_eq, is_duplicate};
+use crate::store::{AuthMethods, AuthStore, UserRow, UserSource};
 
 /// The protocols an issuer's tokens log in over (`oidc_issuers.protocols`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -86,9 +52,6 @@ impl TokenProtocol {
         }
     }
 
-    fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|p| p.as_str() == s)
-    }
 }
 
 /// `oidc_issuers.kind`.
@@ -300,17 +263,61 @@ impl IssuerSpec {
     }
 }
 
-/// A stored issuer row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A stored `oidc_issuers` row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssuerRow {
-    /// The spec (with `issuer_id`; mappings separate).
-    pub spec: IssuerSpec,
+    /// The id.
+    pub issuer_id: u32,
+    /// OIDC provider or end-user layer.
+    pub kind: IssuerKind,
+    /// The exact `iss` value (unique).
+    pub issuer: String,
+    /// The key set's URL.
+    pub jwks_url: Option<String>,
+    /// Accepted `aud` values.
+    pub audiences: Vec<String>,
+    /// Accepted algorithms.
+    pub algorithms: Vec<String>,
+    /// The protocols, each once, in [`TokenProtocol::ALL`]'s order (as the
+    /// `SET` column kept them).
+    pub protocols: Vec<TokenProtocol>,
+    /// `MONGODB-OIDC`'s client id.
+    pub client_id: Option<String>,
+    /// `MONGODB-OIDC`'s scopes.
+    pub request_scopes: Option<Vec<String>>,
+    /// Just-in-time accounts.
+    pub jit_users: bool,
+    /// The longest token lifetime accepted, seconds.
+    pub max_lifetime_s: u32,
+    /// `active` or `disabled`.
+    pub state: String,
     /// The auth version of its last change.
     pub changed_version: u64,
 }
 
-/// A stored mapping row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl IssuerRow {
+    /// The spec it stores (no mappings).
+    fn spec(&self) -> IssuerSpec {
+        IssuerSpec {
+            issuer_id: Some(self.issuer_id),
+            kind: self.kind,
+            issuer: self.issuer.clone(),
+            jwks_url: self.jwks_url.clone(),
+            audiences: self.audiences.clone(),
+            algorithms: self.algorithms.clone(),
+            protocols: self.protocols.clone(),
+            client_id: self.client_id.clone(),
+            request_scopes: self.request_scopes.clone(),
+            jit_users: self.jit_users,
+            max_lifetime_s: self.max_lifetime_s,
+            active: self.state == "active",
+            mappings: Vec::new(),
+        }
+    }
+}
+
+/// A stored `claim_mappings` row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MappingRow {
     /// `mapping_id`.
     pub mapping_id: u32,
@@ -318,142 +325,39 @@ pub struct MappingRow {
     pub issuer_id: u32,
     /// The mapping.
     pub mapping: ClaimMapping,
+    /// The auth version of its last change.
+    pub changed_version: u64,
 }
 
-fn tables(store: &AuthStore) -> (String, String) {
-    let q = quote(store.schema());
-    (format!("{q}.oidc_issuers"), format!("{q}.claim_mappings"))
+/// The id counter of issuers.
+const ISSUER_COUNTER: &str = "oidc_issuers";
+/// The id counter of mappings.
+const MAPPING_COUNTER: &str = "claim_mappings";
+
+fn issuer_pk(id: u32) -> Pk {
+    Pk::new().u32(id)
 }
 
-fn json_list(v: &[String]) -> Value {
-    Value::from(serde_json::json!(v).to_string())
+fn mapping_pk(issuer: u32, id: u32) -> Pk {
+    Pk::new().u32(issuer).u32(id)
 }
 
-fn take_str(r: &mut Row, i: usize) -> Option<String> {
-    match r.take::<Value, _>(i)? {
-        Value::Bytes(b) => Some(String::from_utf8_lossy(&b).into_owned()),
-        Value::NULL => None,
-        v => Some(mysql_async::from_value::<String>(v)),
-    }
+/// Whether two issuer URLs are the same key, as the column's `utf8mb4_bin`
+/// unique key compared them: byte for byte, trailing spaces ignored.
+fn same_issuer(a: &str, b: &str) -> bool {
+    a.trim_end_matches(' ') == b.trim_end_matches(' ')
 }
 
-fn list_of(s: Option<String>) -> Vec<String> {
-    s.and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok())
-        .unwrap_or_default()
-}
-
-const ISSUER_COLS: &str = "issuer_id, kind, issuer, jwks_url, audiences, algorithms, protocols, \
-    client_id, request_scopes, jit_users, max_lifetime_s, state, changed_version";
-
-fn issuer_row(mut r: Row) -> IssuerRow {
-    let n = |r: &mut Row, i: usize| -> u64 { r.take::<Option<u64>, _>(i).flatten().unwrap_or(0) };
-    let issuer_id = u32::try_from(n(&mut r, 0)).unwrap_or(0);
-    let kind = match take_str(&mut r, 1).as_deref() {
-        Some("end_user_layer") => IssuerKind::EndUserLayer,
-        _ => IssuerKind::Oidc,
-    };
-    let issuer = take_str(&mut r, 2).unwrap_or_default();
-    let jwks_url = take_str(&mut r, 3);
-    let audiences = list_of(take_str(&mut r, 4));
-    let algorithms = list_of(take_str(&mut r, 5));
-    let protocols = take_str(&mut r, 6)
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(TokenProtocol::parse)
-        .collect();
-    let client_id = take_str(&mut r, 7);
-    let request_scopes = take_str(&mut r, 8).map(|s| list_of(Some(s)));
-    let jit_users = n(&mut r, 9) != 0;
-    let max_lifetime_s = u32::try_from(n(&mut r, 10)).unwrap_or(u32::MAX);
-    let active = take_str(&mut r, 11).as_deref() == Some("active");
-    let changed_version = n(&mut r, 12);
-    IssuerRow {
-        spec: IssuerSpec {
-            issuer_id: Some(issuer_id),
-            kind,
-            issuer,
-            jwks_url,
-            audiences,
-            algorithms,
-            protocols,
-            client_id,
-            request_scopes,
-            jit_users,
-            max_lifetime_s,
-            active,
-            mappings: Vec::new(),
-        },
-        changed_version,
-    }
-}
-
-const MAPPING_COLS: &str =
-    "mapping_id, issuer_id, priority, kind, claim, match_kind, match_value, target";
-
-fn mapping_row(mut r: Row) -> MappingRow {
-    let mapping_id = r.take::<Option<u32>, _>(0).flatten().unwrap_or(0);
-    let issuer_id = r.take::<Option<u32>, _>(1).flatten().unwrap_or(0);
-    let priority = r.take::<Option<i16>, _>(2).flatten().unwrap_or(0);
-    let kind = match take_str(&mut r, 3).as_deref() {
-        Some("role") => MappingKind::Role,
-        _ => MappingKind::User,
-    };
-    let claim = take_str(&mut r, 4).unwrap_or_default();
-    let match_kind = match take_str(&mut r, 5).as_deref() {
-        Some("equals") => MatchKind::Equals,
-        Some("regex") => MatchKind::Regex,
-        _ => MatchKind::Any,
-    };
-    let match_value = take_str(&mut r, 6);
-    let target = take_str(&mut r, 7).unwrap_or_default();
-    MappingRow {
-        mapping_id,
-        issuer_id,
-        mapping: ClaimMapping {
-            priority,
-            kind,
-            claim,
-            match_kind,
-            match_value,
-            target,
-        },
-    }
-}
-
-fn missing_table(e: &mysql_async::Error) -> bool {
-    matches!(e, mysql_async::Error::Server(s) if s.code == 1146)
-}
-
-/// Every issuer with its mappings (in priority order); empty for a catalog
-/// before format 7.
+/// Every issuer with its mappings (in priority order), by issuer id.
 ///
 /// # Errors
-/// A backend error.
-pub async fn read_issuers<Q: Queryable + Send>(
-    store: &AuthStore,
-    q: &mut Q,
-) -> Result<Vec<IssuerSpec>> {
-    let (it, mt) = tables(store);
-    let rows: Vec<Row> = match q
-        .query(format!("SELECT {ISSUER_COLS} FROM {it} ORDER BY issuer_id"))
-        .await
-    {
-        Ok(r) => r,
-        Err(e) if missing_table(&e) => return Ok(Vec::new()),
-        Err(e) => return Err(map_err(e)),
-    };
-    let mut issuers: Vec<IssuerSpec> = rows.into_iter().map(|r| issuer_row(r).spec).collect();
-    let maps: Vec<Row> = match q
-        .query(format!(
-            "SELECT {MAPPING_COLS} FROM {mt} ORDER BY issuer_id, priority, mapping_id"
-        ))
-        .await
-    {
-        Ok(r) => r,
-        Err(e) if missing_table(&e) => Vec::new(),
-        Err(e) => return Err(map_err(e)),
-    };
-    for m in maps.into_iter().map(mapping_row) {
+/// The store's; `Internal` for a malformed row.
+pub async fn read_issuers(tx: &mut dyn RecordTx) -> Result<Vec<IssuerSpec>> {
+    let rows: Vec<IssuerRow> = OIDC_ISSUERS.rows(tx, &Pk::new()).await?;
+    let mut issuers: Vec<IssuerSpec> = rows.iter().map(IssuerRow::spec).collect();
+    let mut maps: Vec<MappingRow> = CLAIM_MAPPINGS.rows(tx, &Pk::new()).await?;
+    maps.sort_by_key(|m| (m.issuer_id, m.mapping.priority, m.mapping_id));
+    for m in maps {
         if let Some(i) = issuers
             .iter_mut()
             .find(|i| i.issuer_id == Some(m.issuer_id))
@@ -464,43 +368,26 @@ pub async fn read_issuers<Q: Queryable + Send>(
     Ok(issuers)
 }
 
-/// Whether any issuer or mapping changed after `since`; `false` for a
-/// catalog before format 7.
+/// Whether any issuer or mapping changed after `since`.
 ///
 /// # Errors
-/// A backend error.
-pub async fn changed_since<Q: Queryable + Send>(
-    store: &AuthStore,
-    q: &mut Q,
-    since: u64,
-) -> Result<bool> {
-    let (it, mt) = tables(store);
-    let sql = format!(
-        "SELECT (SELECT COUNT(*) FROM {it} WHERE changed_version > ?) + \
-         (SELECT COUNT(*) FROM {mt} WHERE changed_version > ?)"
-    );
-    match q.exec_first::<u64, _, _>(sql, (since, since)).await {
-        Ok(n) => Ok(n.unwrap_or(0) > 0),
-        Err(e) if missing_table(&e) => Ok(false),
-        Err(e) => Err(map_err(e)),
+/// The store's; `Internal` for a malformed row.
+pub async fn changed_since(tx: &mut dyn RecordTx, since: u64) -> Result<bool> {
+    let issuers: Vec<IssuerRow> = OIDC_ISSUERS.rows(tx, &Pk::new()).await?;
+    if issuers.iter().any(|i| i.changed_version > since) {
+        return Ok(true);
     }
+    let maps: Vec<MappingRow> = CLAIM_MAPPINGS.rows(tx, &Pk::new()).await?;
+    Ok(maps.iter().any(|m| m.changed_version > since))
 }
 
-/// Brings `tenant`'s auth module to format 7 (outside any change: the
-/// migration is DDL).
+/// Nothing to do: the issuer tables are catalog records, which need no
+/// migration. Kept for callers that still bring a tenant up to date first.
 ///
 /// # Errors
-/// The migrator's.
-pub async fn migrate(cat: &MariaCatalog, tenant: TenantId) -> Result<()> {
-    let ep = cat.backend().locator().writer(tenant).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(map_err)?;
-    sprig_catalog::Migrator::new(&[crate::store::AUTH_MODULE])?
-        .run(
-            &mut conn,
-            ep.store.schema(),
-            &sprig_catalog::migrate::MigrateOpts::default(),
-        )
-        .await?;
+/// None.
+#[allow(clippy::unused_async)] // callers await it, as when it migrated
+pub async fn migrate(_cat: &AuthCatalog, _tenant: TenantId) -> Result<()> {
     Ok(())
 }
 
@@ -508,10 +395,9 @@ pub async fn migrate(cat: &MariaCatalog, tenant: TenantId) -> Result<()> {
 /// change. Returns the issuer's id and the change's version.
 ///
 /// # Errors
-/// [`IssuerSpec::validate`]'s; 39083 when the catalog has no issuer tables
-/// yet (call [`migrate`] first); the change's.
+/// [`IssuerSpec::validate`]'s; the change's.
 pub async fn put_issuer(
-    cat: &MariaCatalog,
+    cat: &AuthCatalog,
     tenant: TenantId,
     spec: &IssuerSpec,
 ) -> Result<(u32, u64)> {
@@ -521,90 +407,60 @@ pub async fn put_issuer(
         .await?;
     let version = c.version();
     let r = async {
-        let (core, q) = c.tx().parts();
-        let store = AuthStore::of(core);
-        let (it, mt) = tables(&store);
-        let existing: Option<u32> = q
-            .exec_first(
-                format!("SELECT issuer_id FROM {it} WHERE issuer = ? FOR UPDATE"),
-                (spec.issuer.as_str(),),
-            )
-            .await
-            .map_err(map_err)?;
-        let id = match existing {
-            Some(id) => id,
-            None => q
-                .query_first::<u32, _>(format!(
-                    "SELECT COALESCE(MAX(issuer_id), 0) + 1 FROM {it} FOR UPDATE"
-                ))
-                .await
-                .map_err(map_err)?
-                .unwrap_or(1),
+        let tx = c.tx().records();
+        let existing: Vec<IssuerRow> = OIDC_ISSUERS.rows(tx, &Pk::new()).await?;
+        let id = if let Some(i) = existing
+            .iter()
+            .find(|i| same_issuer(&i.issuer, &spec.issuer))
+        {
+            i.issuer_id
+        } else {
+            let next = records::next_ids(tx, ISSUER_COUNTER, 1).await?;
+            u32::try_from(next).map_err(|_| SprigError::internal("issuer ids exhausted"))?
         };
-        let protocols: Vec<&str> = spec.protocols.iter().map(|p| p.as_str()).collect();
-        let params = vec![
-            Value::from(id),
-            Value::from(spec.kind.as_str()),
-            Value::from(spec.issuer.as_str()),
-            spec.jwks_url.as_deref().map_or(Value::NULL, Value::from),
-            json_list(&spec.audiences),
-            json_list(&spec.algorithms),
-            Value::from(protocols.join(",")),
-            spec.client_id.as_deref().map_or(Value::NULL, Value::from),
-            spec.request_scopes
-                .as_deref()
-                .map_or(Value::NULL, json_list),
-            Value::from(u8::from(spec.jit_users)),
-            Value::from(spec.max_lifetime_s),
-            Value::from(if spec.active { "active" } else { "disabled" }),
-            Value::from(version),
-        ];
-        q.exec_drop(
-            format!(
-                "REPLACE INTO {it} ({ISSUER_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-            ),
-            params,
-        )
-        .await
-        .map_err(map_err)?;
-        q.exec_drop(format!("DELETE FROM {mt} WHERE issuer_id = ?"), (id,))
-            .await
-            .map_err(map_err)?;
-        let mut next: u32 = q
-            .query_first::<u32, _>(format!(
-                "SELECT COALESCE(MAX(mapping_id), 0) + 1 FROM {mt} FOR UPDATE"
-            ))
-            .await
-            .map_err(map_err)?
-            .unwrap_or(1);
-        for m in &spec.mappings {
-            q.exec_drop(
-                format!(
-                    "INSERT INTO {mt} ({MAPPING_COLS}, changed_version) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                ),
-                vec![
-                    Value::from(next),
-                    Value::from(id),
-                    Value::from(m.priority),
-                    Value::from(match m.kind {
-                        MappingKind::User => "user",
-                        MappingKind::Role => "role",
-                    }),
-                    Value::from(m.claim.as_str()),
-                    Value::from(match m.match_kind {
-                        MatchKind::Any => "any",
-                        MatchKind::Equals => "equals",
-                        MatchKind::Regex => "regex",
-                    }),
-                    m.match_value.as_deref().map_or(Value::NULL, Value::from),
-                    Value::from(m.target.as_str()),
-                    Value::from(version),
-                ],
-            )
-            .await
-            .map_err(map_err)?;
-            next += 1;
+        let row = IssuerRow {
+            issuer_id: id,
+            kind: spec.kind,
+            issuer: spec.issuer.clone(),
+            jwks_url: spec.jwks_url.clone(),
+            audiences: spec.audiences.clone(),
+            algorithms: spec.algorithms.clone(),
+            protocols: TokenProtocol::ALL
+                .into_iter()
+                .filter(|p| spec.protocols.contains(p))
+                .collect(),
+            client_id: spec.client_id.clone(),
+            request_scopes: spec.request_scopes.clone(),
+            jit_users: spec.jit_users,
+            max_lifetime_s: spec.max_lifetime_s,
+            state: if spec.active { "active" } else { "disabled" }.to_owned(),
+            changed_version: version,
+        };
+        OIDC_ISSUERS.put(tx, &issuer_pk(id), &row).await?;
+        for (k, _) in CLAIM_MAPPINGS
+            .scan::<MappingRow>(tx, &Pk::new().u32(id))
+            .await?
+        {
+            CLAIM_MAPPINGS.delete(tx, &k).await?;
+        }
+        if !spec.mappings.is_empty() {
+            let n = u64::try_from(spec.mappings.len()).unwrap_or(u64::MAX);
+            let first = records::next_ids(tx, MAPPING_COUNTER, n).await?;
+            for (i, m) in spec.mappings.iter().enumerate() {
+                let mapping_id = first
+                    .checked_add(u64::try_from(i).unwrap_or(u64::MAX))
+                    .and_then(|v| u32::try_from(v).ok())
+                    .ok_or_else(|| SprigError::internal("claim mapping ids exhausted"))?;
+                let row = MappingRow {
+                    mapping_id,
+                    issuer_id: id,
+                    mapping: m.clone(),
+                    changed_version: version,
+                };
+                CLAIM_MAPPINGS
+                    .put(tx, &mapping_pk(id, mapping_id), &row)
+                    .await?;
+            }
         }
         Ok(id)
     }
@@ -613,9 +469,9 @@ pub async fn put_issuer(
 }
 
 async fn finish<T>(
-    cat: &MariaCatalog,
+    cat: &AuthCatalog,
     tenant: TenantId,
-    c: sprig_catalog::CatalogTx,
+    c: AuthTx,
     r: Result<T>,
 ) -> Result<(T, u64)> {
     match r {
@@ -623,12 +479,6 @@ async fn finish<T>(
         Err(e) => {
             let _ = c.rollback().await;
             let _ = cat.settle(tenant, VersionKind::Auth).await;
-            if matches!(e.kind, ErrorKind::Backend { errno: 1146, .. }) {
-                return Err(SprigError::new(
-                    SprigCode::TenantNotReady,
-                    "the tenant's catalog has no issuer tables yet: migrate its auth module",
-                ));
-            }
             Err(e)
         }
     }
@@ -643,7 +493,7 @@ async fn finish<T>(
 /// # Errors
 /// 1396 for an unknown account; the change's.
 pub async fn set_token_method(
-    cat: &MariaCatalog,
+    cat: &AuthCatalog,
     tenant: TenantId,
     name: &str,
     host: &str,
@@ -654,12 +504,12 @@ pub async fn set_token_method(
         .await?;
     let version = c.version();
     let r = async {
-        let (core, q) = c.tx().parts();
-        let store = AuthStore::of(core);
-        let users = store.users_since(q, None).await?;
+        let tx = c.tx().records();
+        let store = AuthStore::new();
+        let users = store.users_since(tx, None).await?;
         let Some(mut row) = users
             .into_iter()
-            .find(|u| u.is_live() && u.name == name && u.host.eq_ignore_ascii_case(host))
+            .find(|u| u.is_live() && u.name == name && host_eq(&u.host, host))
         else {
             return Err(SprigError::backend(
                 1396,
@@ -678,7 +528,7 @@ pub async fn set_token_method(
         }
         row.auth_methods = m;
         row.changed_version = version;
-        store.update_user(q, &row).await?;
+        store.update_user(tx, &row).await?;
         Ok(row.user_id)
     }
     .await;
@@ -698,7 +548,7 @@ pub async fn set_token_method(
 /// 39998 for a bad name; 1396 when the account appeared meanwhile; the
 /// change's.
 pub async fn create_jit_user(
-    cat: &MariaCatalog,
+    cat: &AuthCatalog,
     tenant: TenantId,
     name: &str,
     now: SystemTime,
@@ -713,13 +563,13 @@ pub async fn create_jit_user(
         .await?;
     let version = c.version();
     let r = async {
-        let (core, q) = c.tx().parts();
-        let store = AuthStore::of(core);
-        let id: UserId = store.next_user_id(core, q).await?;
+        let tx = c.tx().records();
+        let store = AuthStore::new();
+        let id: UserId = store.next_user_id(tx).await?;
         let mut row = UserRow::new(id, name, "%", UserSource::OidcJit, now, version);
         row.auth_methods = AuthMethods::TOKEN;
-        store.insert_user(q, &row).await.map_err(|e| {
-            if matches!(e.kind, ErrorKind::Backend { errno: 1062, .. }) {
+        store.insert_user(tx, &row).await.map_err(|e| {
+            if is_duplicate(&e) {
                 SprigError::backend(
                     1396,
                     *b"HY000",
@@ -738,3 +588,6 @@ pub async fn create_jit_user(
         auth_version,
     })
 }
+
+#[cfg(test)]
+mod tests;

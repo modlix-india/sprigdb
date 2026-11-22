@@ -39,7 +39,13 @@ pub struct MemCatalog {
     key: Arc<TokenKey>,
     /// What [`MqCatalog::feed_forwarder_runs`] answers.
     feed_runs: std::sync::atomic::AtomicBool,
+    /// Durable stores from elsewhere (the engine), by tenant and database
+    /// id, instead of the in-memory ones.
+    durable: Mutex<Option<StoreFactory>>,
 }
+
+/// Makes the durable store of a database (tenant, database id).
+pub type StoreFactory = Arc<dyn Fn(u64, u32) -> Arc<dyn MsgStore> + Send + Sync>;
 
 impl std::fmt::Debug for MemCatalog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -59,7 +65,14 @@ impl MemCatalog {
             settings: Mutex::new(QueueSettings::default()),
             key: Arc::new(TokenKey::new(b"memory-catalog-token-key")),
             feed_runs: std::sync::atomic::AtomicBool::new(false),
+            durable: Mutex::new(None),
         }
+    }
+
+    /// Serves every database's durable messages from `f` (the engine
+    /// store in tests) instead of memory.
+    pub fn set_store_factory(&self, f: StoreFactory) {
+        *lock(&self.durable) = Some(f);
     }
 
     /// Says whether the feed-driven forwarder runs.
@@ -165,6 +178,9 @@ impl MqCatalog for MemCatalog {
     }
 
     async fn store(&self, v: &VhostRef) -> Result<Arc<dyn MsgStore>, MqError> {
+        if let Some(f) = lock(&self.durable).clone() {
+            return Ok(f(v.tenant, v.db_id));
+        }
         lock(&self.dbs)
             .get(&(v.tenant, v.db.clone()))
             .map(|d| Arc::clone(&d.store) as Arc<dyn MsgStore>)

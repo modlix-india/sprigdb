@@ -31,6 +31,7 @@ use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use sprig_catalog::records::RecordTx;
 use sprig_catalog::{
     CatalogExtension, ExtState, Migration, SnapshotTx, TenantCatalog, VersionKind,
 };
@@ -466,46 +467,56 @@ impl CatalogExtension for AuthExtension {
         since: Option<u64>,
         prev: Option<&Arc<dyn ExtState>>,
     ) -> Result<Arc<dyn ExtState>> {
-        let store = AuthStore::new(tx.schema());
         let prev = prev.and_then(|p| {
             let any: &dyn Any = &**p;
             any.downcast_ref::<TenantAuth>()
         });
-        let conn = tx.conn();
-        let locks = store.temp_locks(conn).await?;
-        let state = if let (Some(since), Some(prev)) = (since, prev) {
-            let users = store.users_since(conn, Some(since)).await?;
-            let ids: Vec<UserId> = users.iter().map(|u| u.user_id).collect();
-            let verifiers = if ids.is_empty() {
-                Vec::new()
-            } else {
-                store.verifiers_of(conn, &ids).await?
-            };
-            let keys = crate::apikey::keys_since(&store, conn, Some(since)).await?;
-            let sessions =
-                crate::token::sessions::sessions_since(&store, conn, Some(since)).await?;
-            let issuers = if crate::oidc::store::changed_since(&store, conn, since).await? {
-                Some(crate::oidc::store::read_issuers(&store, conn).await?)
-            } else {
-                None
-            };
-            prev.apply(users, &verifiers, locks)
-                .with_api_keys(keys, false)
-                .with_sessions(sessions, false)
-                .with_issuers(issuers)
-        } else {
-            let users = store.users_since(conn, None).await?;
-            let verifiers = store.all_verifiers(conn).await?;
-            let keys = crate::apikey::keys_since(&store, conn, None).await?;
-            let sessions = crate::token::sessions::sessions_since(&store, conn, None).await?;
-            let issuers = crate::oidc::store::read_issuers(&store, conn).await?;
-            TenantAuth::build(users, &verifiers, locks)
-                .with_api_keys(keys, true)
-                .with_sessions(sessions, true)
-                .with_issuers(Some(issuers))
-        };
-        Ok(Arc::new(state))
+        Ok(Arc::new(load_auth(tx.records()?, since, prev).await?))
     }
+}
+
+/// [`TenantAuth`] read from the catalog records: from nothing when `since`
+/// or `prev` is `None`, else `prev` with what changed after `since`.
+///
+/// # Errors
+/// The store's; `Internal` for a malformed row.
+pub async fn load_auth(
+    tx: &mut dyn RecordTx,
+    since: Option<u64>,
+    prev: Option<&TenantAuth>,
+) -> Result<TenantAuth> {
+    let store = AuthStore;
+    let locks = store.temp_locks(tx).await?;
+    Ok(if let (Some(since), Some(prev)) = (since, prev) {
+        let users = store.users_since(tx, Some(since)).await?;
+        let ids: Vec<UserId> = users.iter().map(|u| u.user_id).collect();
+        let verifiers = if ids.is_empty() {
+            Vec::new()
+        } else {
+            store.verifiers_of(tx, &ids).await?
+        };
+        let keys = crate::apikey::keys_since(tx, Some(since)).await?;
+        let sessions = crate::token::sessions::sessions_since(tx, Some(since)).await?;
+        let issuers = if crate::oidc::store::changed_since(tx, since).await? {
+            Some(crate::oidc::store::read_issuers(tx).await?)
+        } else {
+            None
+        };
+        prev.apply(users, &verifiers, locks)
+            .with_api_keys(keys, false)
+            .with_sessions(sessions, false)
+            .with_issuers(issuers)
+    } else {
+        let users = store.users_since(tx, None).await?;
+        let verifiers = store.all_verifiers(tx).await?;
+        let keys = crate::apikey::keys_since(tx, None).await?;
+        let sessions = crate::token::sessions::sessions_since(tx, None).await?;
+        let issuers = crate::oidc::store::read_issuers(tx).await?;
+        TenantAuth::build(users, &verifiers, locks)
+            .with_api_keys(keys, true)
+            .with_sessions(sessions, true)
+            .with_issuers(Some(issuers))
+    })
 }
 
 #[cfg(test)]

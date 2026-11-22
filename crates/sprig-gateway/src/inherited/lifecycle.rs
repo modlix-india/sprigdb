@@ -77,15 +77,9 @@ pub async fn remove_all(svc: &Arc<TenantServices>, def: &Definition) -> Result<u
         if done.contains(&t) {
             continue;
         }
-        let ep = svc.locator.writer(t).await?;
         let found = {
-            let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
-            let st = MsgStore::new(ep.store.schema());
-            if st.migrated(&mut conn).await? {
-                st.instance(&mut conn, def.key()).await?
-            } else {
-                None
-            }
+            let st = MsgStore::new(Arc::clone(&svc.records), t);
+            st.instance(def.key()).await?
         };
         // The connection went back first: `remove_one` takes its own from
         // the same pool.
@@ -268,8 +262,8 @@ pub async fn database_dropped(
     // this function's catalog connection is taken.
     let chain = super::chain(svc, &cat).await?;
     let ep = svc.locator.writer(t).await?;
-    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
-    let st = MsgStore::new(ep.store.schema());
+    let conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
+    let st = MsgStore::new(Arc::clone(&svc.records), t);
     for i in &gone {
         let triggers = match chain.def(i.def) {
             Some(d) if d.kind == DefKind::Stream => super::triggers::on_stream(&chain, &d),
@@ -277,7 +271,7 @@ pub async fn database_dropped(
             _ => Vec::new(),
         };
         for g in triggers {
-            if let Some(gi) = st.instance(&mut conn, g.key()).await? {
+            if let Some(gi) = st.instance(g.key()).await? {
                 if let Some(b) = gi
                     .physical
                     .as_ref()
@@ -287,10 +281,10 @@ pub async fn database_dropped(
                     sprig_logic::messages::delete_index(svc.locator.dc_store().as_ref(), t, b)
                         .await?;
                 }
-                st.delete_instance(&mut conn, g.key()).await?;
+                st.delete_instance(g.key()).await?;
             }
         }
-        st.delete_instance(&mut conn, i.def).await?;
+        st.delete_instance(i.def).await?;
         super::delete_index(svc, t, i.def).await?;
         super::streams::forget_applied(t, i.def);
     }
@@ -319,10 +313,9 @@ pub async fn detach(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) ->
         ));
     }
     let ep = svc.locator.writer(t).await?;
-    let st = MsgStore::new(ep.store.schema());
+    let st = MsgStore::new(Arc::clone(&svc.records), t);
     {
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
-        let Some(i) = st.instance(&mut conn, def.key()).await? else {
+        let Some(i) = st.instance(def.key()).await? else {
             return Err(super::target_err(format!(
                 "this tenant has no instance of {} {}.{} to detach",
                 def.kind.as_str(),
@@ -331,11 +324,11 @@ pub async fn detach(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) ->
             )));
         };
         st.set_instance(
-            &mut conn,
             def.key(),
             InstanceState::Detached,
             i.def_version,
             &i.definition,
+            None,
         )
         .await?;
     }
@@ -350,10 +343,10 @@ pub async fn detach(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) ->
         DefKind::Queue => super::triggers::on_queue(&chain, def),
         _ => Vec::new(),
     };
-    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
+    let conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
     let mut stopped = 0;
     for g in triggers {
-        if let Some(gi) = st.instance(&mut conn, g.key()).await? {
+        if let Some(gi) = st.instance(g.key()).await? {
             if let Some(b) = gi
                 .physical
                 .as_ref()
@@ -362,7 +355,7 @@ pub async fn detach(svc: &Arc<TenantServices>, t: TenantId, def: &Definition) ->
             {
                 sprig_logic::messages::delete_index(svc.locator.dc_store().as_ref(), t, b).await?;
             }
-            st.delete_instance(&mut conn, g.key()).await?;
+            st.delete_instance(g.key()).await?;
             stopped += 1;
         }
     }

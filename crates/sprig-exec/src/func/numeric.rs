@@ -57,10 +57,11 @@ pub(crate) fn abs(a: Node, env: Env<'_>) -> Node {
 }
 
 /// `SIGN(x)`.
-pub(crate) fn sign(a: Node) -> Node {
+pub(crate) fn sign(a: Node, env: Env<'_>) -> Node {
+    // (MySQL reports a BIGINT's full length.)
     let ty = ExprType {
         prec: 1,
-        ..ExprType::int(2, false)
+        ..ExprType::int(if env.maria() { 2 } else { 21 }, false)
     }
     .with_null(a.ty.nullable);
     let class = num_ty(&a.ty).class;
@@ -101,6 +102,10 @@ pub(crate) fn ceil_floor(a: Node, ceil: bool, env: Env<'_>) -> Node {
             n.lit = None;
             n.ty.column = false;
             n.ty.width = 0;
+            if !env.maria() {
+                // MySQL reports an integer result at a BIGINT's length.
+                n.ty.len = 21;
+            }
             n
         }
         Class::Dec => {
@@ -109,7 +114,10 @@ pub(crate) fn ceil_floor(a: Node, ceil: bool, env: Env<'_>) -> Node {
             let digits = t.int_part() + 1;
             let mode = if ceil { Round::Ceil } else { Round::Floor };
             if digits <= 18 {
-                let ty = ExprType::int_prec(digits, t.unsigned).with_null(nullable);
+                let mut ty = ExprType::int_prec(digits, t.unsigned).with_null(nullable);
+                if !env.maria() {
+                    ty.len = 21;
+                }
                 Node::new(ty, name, move |ctx, row| {
                     Ok(match a.dec(ctx, row)? {
                         None => Value::Null,

@@ -40,21 +40,33 @@ pub(crate) fn current(name: &str, args: &[Node], env: Env<'_>) -> Result<Node> {
             }
         },
     };
-    let offset = i64::from(env.s.time_zone_offset);
     Ok(match name {
         "CURDATE" | "CURRENT_DATE" => Node::new(ExprType::date(), "curdate", |ctx, _| {
             Ok(Value::Date(temporal::now(ctx).date))
         }),
-        "CURTIME" | "CURRENT_TIME" => Node::new(ExprType::time(fsp), "curtime", move |ctx, _| {
-            let t = Tm {
-                year: 0,
-                month: 0,
-                day: 0,
-                has_date: false,
-                ..Tm::from_datetime(temporal::now(ctx))
-            };
-            Ok(temporal::tm_value(ctx, cut(t, fsp), Kind::Time, fsp))
-        }),
+        "CURTIME" | "CURRENT_TIME" => Node::new(
+            ExprType {
+                // (MySQL's length leaves out the time type's sign and
+                // third hour digit.)
+                len: if env.maria() {
+                    ExprType::time(fsp).len
+                } else {
+                    8 + if fsp > 0 { u32::from(fsp) + 1 } else { 0 }
+                },
+                ..ExprType::time(fsp)
+            },
+            "curtime",
+            move |ctx, _| {
+                let t = Tm {
+                    year: 0,
+                    month: 0,
+                    day: 0,
+                    has_date: false,
+                    ..Tm::from_datetime(temporal::now(ctx))
+                };
+                Ok(temporal::tm_value(ctx, cut(t, fsp), Kind::Time, fsp))
+            },
+        ),
         _ => {
             let utc = name.starts_with("UTC");
             let ty = if env.maria() && !utc {
@@ -66,7 +78,11 @@ pub(crate) fn current(name: &str, args: &[Node], env: Env<'_>) -> Result<Node> {
                 ExprType::datetime(fsp)
             };
             Node::new(ty, "now", move |ctx, _| {
-                let shift = if utc { 0 } else { offset };
+                let shift = if utc {
+                    0
+                } else {
+                    ctx.session.zone_offset_at(ctx.session.now_seconds)
+                };
                 let dt = temporal::datetime_from_unix(
                     ctx.session.now_seconds + shift,
                     ctx.session.now_micros,
@@ -157,7 +173,7 @@ pub(crate) fn week(t: &Tm, mode: i64) -> (i64, u32) {
 /// `YEAR`, `MONTH`, `DAY`, `HOUR`, ... : a field or a day count of the
 /// argument.
 pub(crate) fn part(name: &str, a: Node, env: Env<'_>) -> Result<Node> {
-    let (len, time_arg, f): (u32, bool, PartFn) = match name {
+    let (mut len, time_arg, f): (u32, bool, PartFn) = match name {
         "YEAR" => (4, false, |t| Some(i64::from(t.year))),
         "MONTH" => (2, false, |t| Some(i64::from(t.month))),
         "DAY" | "DAYOFMONTH" => (2, false, |t| Some(i64::from(t.day))),
@@ -180,24 +196,42 @@ pub(crate) fn part(name: &str, a: Node, env: Env<'_>) -> Result<Node> {
     };
     // The functions that take a date apart accept partial dates; those
     // that compute with it want a real one.
+    // MySQL counts a sign in these lengths, and reports wider ones for
+    // the hour (a time's), the microsecond and YEAR (its own type).
+    if !env.maria() {
+        len = match name {
+            "HOUR" => 4,
+            "MICROSECOND" => 21,
+            "YEAR" => 4,
+            "TO_DAYS" => 8,
+            _ => len + 1,
+        };
+    }
     let mode = match name {
         "YEAR" | "MONTH" | "DAY" | "DAYOFMONTH" | "QUARTER" => DateMode::Fuzzy,
         _ => DateMode::Real,
     };
-    Ok(Node::new(
-        int_type(len, env),
-        "datepart",
-        move |ctx, row| {
-            let t = if time_arg {
-                let v = a.time_arg(ctx, row)?;
-                to_time(ctx, &v)
-            } else {
-                let v = a.temporal(ctx, row)?;
-                to_datetime_mode(ctx, &v, mode)
-            };
-            Ok(t.and_then(|t| f(&t)).map_or(Value::Null, Value::Int))
-        },
-    ))
+    let ty = if name == "YEAR" && !env.maria() {
+        ExprType {
+            kind: Kind::Year,
+            unsigned: true,
+            prec: 4,
+            ..ExprType::int(4, true)
+        }
+        .nullable()
+    } else {
+        int_type(len, env)
+    };
+    Ok(Node::new(ty, "datepart", move |ctx, row| {
+        let t = if time_arg {
+            let v = a.time_arg(ctx, row)?;
+            to_time(ctx, &v)
+        } else {
+            let v = a.temporal(ctx, row)?;
+            to_datetime_mode(ctx, &v, mode)
+        };
+        Ok(t.and_then(|t| f(&t)).map_or(Value::Null, Value::Int))
+    }))
 }
 
 /// `DATE(x)`, `TIME(x)`, `LAST_DAY(x)`.
@@ -776,7 +810,8 @@ pub(crate) fn date_add(d: Node, n: Node, unit: Unit, sub: bool, env: Env<'_>) ->
 
 /// `DATEDIFF(a, b)`: whole days from `b` to `a`.
 pub(crate) fn datediff(a: Node, b: Node, env: Env<'_>) -> Node {
-    Node::new(int_type(7, env), "datediff", move |ctx, row| {
+    let len = if env.maria() { 8 } else { 9 };
+    Node::new(int_type(len, env), "datediff", move |ctx, row| {
         let (x, y) = (a.temporal(ctx, row)?, b.temporal(ctx, row)?);
         let (x, y) = (
             to_datetime_mode(ctx, &x, DateMode::Real),
@@ -924,9 +959,52 @@ pub(crate) fn format(t: &Tm, fmt: &[u8], maria: bool) -> Option<Vec<u8>> {
 }
 
 /// `DATE_FORMAT(d, format)`.
+/// The longest text a `DATE_FORMAT` pattern gives, in characters: per
+/// specifier its widest value (`%M` and `%W` are 64, room for any
+/// language's names; `%a` and `%b` 32; `%H` and `%k` 7, as a time's hours
+/// can be), one per other character.
+fn format_chars(p: &[u8]) -> u32 {
+    let text = String::from_utf8_lossy(p);
+    let mut it = text.chars().peekable();
+    let mut n = 0u32;
+    while let Some(c) = it.next() {
+        if c != '%' {
+            n += 1;
+            continue;
+        }
+        n += match it.next() {
+            None => 1,
+            Some('M' | 'W') => 64,
+            Some('a' | 'b') => 32,
+            Some('H' | 'k') => 7,
+            Some('Y' | 'X' | 'x' | 'D') => 4,
+            Some('j') => 3,
+            Some('f') => 6,
+            Some('T') => 8,
+            Some('r') => 11,
+            Some('w') => 1,
+            Some(
+                'y' | 'm' | 'c' | 'd' | 'e' | 'h' | 'I' | 'l' | 'i' | 's' | 'S' | 'p' | 'U' | 'u'
+                | 'V' | 'v',
+            ) => 2,
+            Some(_) => 1,
+        };
+    }
+    n
+}
+
 pub(crate) fn date_format(d: Node, f: Node, env: Env<'_>) -> Node {
     let f = string_node(f, env);
-    let chars = f.ty.len.saturating_mul(10).min(1 << 20);
+    let chars = match &f.lit {
+        Some(Value::Str(p) | Value::Bytes(p)) => format_chars(p),
+        // A pattern known only per row: ten (MySQL) or forty (MariaDB)
+        // characters for each of its own.
+        _ => {
+            f.ty.len
+                .saturating_mul(if env.maria() { 40 } else { 10 })
+                .min(1 << 20)
+        }
+    };
     let mut ty = ExprType::string(chars, env.conn(), Derivation::Coercible).nullable();
     if env.maria() {
         ty.dec = 0;
@@ -971,7 +1049,6 @@ fn max_unix(maria: bool) -> i64 {
 /// `UNIX_TIMESTAMP([d])`: seconds since the epoch of a local date and
 /// time; 0 outside the `TIMESTAMP` range.
 pub(crate) fn unix_timestamp(arg: Option<Node>, env: Env<'_>) -> Node {
-    let offset = i64::from(env.s.time_zone_offset);
     let maria = env.maria();
     let Some(a) = arg else {
         let ty = ExprType {
@@ -1024,15 +1101,23 @@ pub(crate) fn unix_timestamp(arg: Option<Node>, env: Env<'_>) -> Node {
     } else {
         temporal::fsp_of(&a, env)
     };
-    let ty = if fsp == 0 {
-        ExprType {
+    // The servers' lengths: MariaDB 17 digits for whole seconds and
+    // DECIMAL(16 + fsp, fsp) with a fraction; MySQL 21 and
+    // DECIMAL(11 + fsp, fsp), NOT NULL when the argument cannot be NULL
+    // (MySQL answers 0, not NULL, for what is no date).
+    let ty = match (fsp, maria) {
+        (0, true) => ExprType {
             prec: 10,
             ..ExprType::int(17, false)
-        }
-    } else {
-        ExprType::decimal(12 + u32::from(fsp), u32::from(fsp), false)
+        },
+        (0, false) => ExprType {
+            prec: 20,
+            ..ExprType::int(21, false)
+        },
+        (f, true) => ExprType::decimal(16 + u32::from(f), u32::from(f), false),
+        (f, false) => ExprType::decimal(11 + u32::from(f), u32::from(f), false),
     }
-    .nullable();
+    .with_null(maria || a.ty.nullable);
     Node::new(ty, "unix_timestamp", move |ctx, row| {
         let v = a.temporal(ctx, row)?;
         if v.is_null() {
@@ -1043,7 +1128,13 @@ pub(crate) fn unix_timestamp(arg: Option<Node>, env: Env<'_>) -> Node {
         let t = to_datetime_mode(ctx, &v, DateMode::Real);
         let secs = match &t {
             Some(t) if t.month != 0 && t.day != 0 => {
-                t.datetime_micros() / 1_000_000 - 719_528 * 86_400 - offset
+                let local = t.datetime_micros() / 1_000_000 - 719_528 * 86_400;
+                // (MariaDB refuses a time before 1970 in a named zone.)
+                if maria && local < 0 && ctx.session.zone_is_named() {
+                    0
+                } else {
+                    ctx.session.zone_to_unix(local)
+                }
             }
             _ => 0,
         };
@@ -1067,7 +1158,6 @@ pub(crate) fn unix_timestamp(arg: Option<Node>, env: Env<'_>) -> Node {
 /// `FROM_UNIXTIME(n [, format])`: the session-zone date and time of an
 /// epoch second; `NULL` when negative or beyond the `TIMESTAMP` range.
 pub(crate) fn from_unixtime(n: Node, f: Option<Node>, env: Env<'_>) -> Node {
-    let offset = i64::from(env.s.time_zone_offset);
     let maria = env.maria();
     let fsp = match n.ty.kind {
         Kind::Decimal => n.ty.dec.min(6),
@@ -1107,7 +1197,10 @@ pub(crate) fn from_unixtime(n: Node, f: Option<Node>, env: Env<'_>) -> Node {
         if secs > max_unix(maria) || (maria && total == 0) {
             return Ok(Value::Null);
         }
-        let dt = temporal::datetime_from_unix(secs + offset, (total % 1_000_000) as u32);
+        let dt = temporal::datetime_from_unix(
+            secs + ctx.session.zone_offset_at(secs),
+            (total % 1_000_000) as u32,
+        );
         let t = Tm::from_datetime(dt);
         match &f {
             None => Ok(temporal::tm_value(ctx, cut(t, fsp), Kind::DateTime, fsp)),
@@ -1195,7 +1288,12 @@ pub(crate) fn name_of(name: &str, a: Node, env: Env<'_>) -> Node {
 pub(crate) fn week_fn(name: &str, d: Node, mode: Option<Node>, env: Env<'_>) -> Node {
     let yearweek = name == "YEARWEEK";
     let default_mode = i64::from(env.s.default_week_format);
-    let len = if yearweek { 6 } else { 2 };
+    let len = match (yearweek, env.maria()) {
+        (true, true) => 6,
+        (true, false) => 7,
+        (false, true) => 2,
+        (false, false) => 3,
+    };
     Node::new(int_type(len, env), "week", move |ctx, row| {
         let v = d.temporal(ctx, row)?;
         let m = match &mode {
@@ -1235,22 +1333,60 @@ pub(crate) fn extract(unit: Unit, d: Node, env: Env<'_>) -> Node {
         unit,
         Unit::Year | Unit::Month | Unit::Quarter | Unit::Week | Unit::YearMonth
     );
-    let len = match unit {
-        Unit::DayMicrosecond => 20,
-        Unit::HourMicrosecond => 13,
-        Unit::MinuteMicrosecond => 11,
-        Unit::SecondMicrosecond | Unit::DaySecond => 9,
-        Unit::DayMinute | Unit::HourSecond => 7,
-        Unit::Microsecond | Unit::YearMonth => 7,
-        Unit::DayHour | Unit::HourMinute | Unit::MinuteSecond | Unit::Year => 5,
-        _ => 3,
+    // The lengths each server reports (MariaDB's day units are five
+    // characters wider for an argument that is no date or time type,
+    // which it may read as a duration of many days).
+    let durational = !d.ty.kind.is_temporal();
+    let len = if env.maria() {
+        let wide = if durational { 5 } else { 0 };
+        match unit {
+            Unit::Year => 4,
+            Unit::Quarter => 1,
+            Unit::Month | Unit::Week => 2,
+            Unit::Day => 3 + wide,
+            Unit::Hour | Unit::Minute | Unit::Second => 3,
+            Unit::Microsecond => 7,
+            Unit::YearMonth => 6,
+            Unit::DayHour => 5 + wide,
+            Unit::DayMinute => 7 + wide,
+            Unit::DaySecond => 9 + wide,
+            Unit::DayMicrosecond => 15 + wide,
+            Unit::HourMinute | Unit::MinuteSecond => 5,
+            Unit::HourSecond => 7,
+            Unit::HourMicrosecond => 13,
+            Unit::MinuteMicrosecond => 11,
+            Unit::SecondMicrosecond => 9,
+        }
+    } else {
+        match unit {
+            Unit::Year => 5,
+            Unit::Quarter => 2,
+            Unit::Month | Unit::Week | Unit::Day | Unit::Minute | Unit::Second => 3,
+            Unit::Hour => 4,
+            Unit::Microsecond | Unit::YearMonth => 7,
+            Unit::DayHour => 9,
+            Unit::DayMinute => 11,
+            Unit::DaySecond => 13,
+            Unit::DayMicrosecond => 20,
+            Unit::HourMinute => 6,
+            Unit::HourSecond => 8,
+            Unit::HourMicrosecond => 14,
+            Unit::MinuteSecond => 5,
+            Unit::MinuteMicrosecond => 11,
+            Unit::SecondMicrosecond => 9,
+        }
     };
     let maria = env.maria();
+    let ty = ExprType {
+        // (MariaDB's wire type is a 64-bit integer past nine digits.)
+        width: if maria && len <= 10 { 4 } else { 0 },
+        ..int_type(len, env)
+    };
     // MySQL counts the day of a column's date and of DATE_ADD's result.
     let column = d.ty.column || &*d.text == "date_add";
     // A text that stands for a computed date or datetime (DATE_ADD's).
     let dated_alt = d.alt.as_ref().is_some_and(|a| a.temporal.is_some());
-    Node::new(int_type(len, env), "extract", move |ctx, row| {
+    Node::new(ty, "extract", move |ctx, row| {
         let v = if date_unit || unit == Unit::Day {
             d.temporal(ctx, row)?
         } else {
@@ -1609,10 +1745,43 @@ fn zone_offset(s: &[u8], maria: bool) -> Option<i64> {
     ok.then_some(sign * secs)
 }
 
-/// `CONVERT_TZ(dt, from, to)` between zones given as offsets. A value
-/// outside the `TIMESTAMP` range comes back as it is.
+/// A time zone of `CONVERT_TZ`: an offset, or a named zone.
+enum Zone {
+    Fixed(i64),
+    Named(jiff::tz::TimeZone),
+}
+
+/// The zone a `CONVERT_TZ` argument names: an offset (`+05:30`),
+/// `SYSTEM` or `UTC`, or a name of the time zone database (MySQL also
+/// reads `posix/<name>` as `<name>`).
+fn parse_zone(s: &[u8], maria: bool) -> Option<Zone> {
+    if let Some(o) = zone_offset(s, maria) {
+        return Some(Zone::Fixed(o));
+    }
+    let name = std::str::from_utf8(s).ok()?;
+    let name = match name.get(..6) {
+        Some(p) if !maria && p.eq_ignore_ascii_case("posix/") => &name[6..],
+        _ => name,
+    };
+    crate::tz::lookup(name).map(Zone::Named)
+}
+
+/// `CONVERT_TZ(dt, from, to)` between zones given as offsets or names. A
+/// value outside the `TIMESTAMP` range comes back as it is. A local time
+/// the clocks skip in the source zone is the instant of the change; one
+/// they pass twice is its first occurrence.
 pub(crate) fn convert_tz(d: Node, from: Node, to: Node, env: Env<'_>) -> Node {
-    let fsp = temporal::fsp_of_date(&d, env);
+    // A text that reads as no date (a time, say) takes six decimals on
+    // both servers.
+    let timeish = !env.maria()
+        && matches!(&d.lit, Some(Value::Str(s) | Value::Bytes(s))
+            if !temporal::parse_datetime_mode(&Ctx::new(env.s), s, DateMode::Loose)
+                .is_some_and(|(t, _)| t.has_date));
+    let fsp = if timeish {
+        6
+    } else {
+        temporal::fsp_of_date(&d, env)
+    };
     let (from, to) = (string_node(from, env), string_node(to, env));
     let maria = env.maria();
     Node::new(
@@ -1630,15 +1799,27 @@ pub(crate) fn convert_tz(d: Node, from: Node, to: Node, env: Env<'_>) -> Node {
             let (Value::Str(t) | Value::Bytes(t)) = t else {
                 return Ok(Value::Null);
             };
-            let (Some(f), Some(t)) = (zone_offset(&f, maria), zone_offset(&t, maria)) else {
+            let (Some(f), Some(t)) = (parse_zone(&f, maria), parse_zone(&t, maria)) else {
                 return Ok(Value::Null);
             };
-            let secs = tm.datetime_micros() / 1_000_000 - 719_528 * 86_400 - f;
+            let local = tm.datetime_micros() / 1_000_000 - 719_528 * 86_400;
+            // MariaDB leaves a time before 1970 in a named zone as it is.
+            if maria && local < 0 && matches!(f, Zone::Named(_)) {
+                return Ok(temporal::tm_value(ctx, tm, Kind::DateTime, fsp));
+            }
+            let secs = match &f {
+                Zone::Fixed(o) => local - o,
+                Zone::Named(tz) => crate::tz::local_to_unix(tz, local),
+            };
             let last = if maria { 4_294_967_295 } else { 32_536_771_199 };
             if secs <= 0 || secs > last {
                 return Ok(temporal::tm_value(ctx, tm, Kind::DateTime, fsp));
             }
-            let dt = temporal::datetime_from_unix(secs + t, tm.micros);
+            let shift = match &t {
+                Zone::Fixed(o) => *o,
+                Zone::Named(tz) => crate::tz::offset_at(tz, secs),
+            };
+            let dt = temporal::datetime_from_unix(secs + shift, tm.micros);
             Ok(temporal::tm_value(
                 ctx,
                 Tm::from_datetime(dt),

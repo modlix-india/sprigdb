@@ -154,14 +154,25 @@ pub(crate) fn agg_result_type(types: &[ExprType], op: &str, env: Env<'_>) -> Res
         let none_unsigned = live.iter().all(|t| !t.unsigned);
         let prec = live.iter().map(|t| u32::from(t.prec)).max().unwrap_or(1);
         // Column integers of one signedness keep the widest column's
-        // width.
-        let width = if (all_unsigned || none_unsigned) && live.iter().all(|t| t.width > 0) {
-            live.iter().map(|t| t.width).max().unwrap_or(0)
+        // width. On MariaDB a computed integer next to a column counts as
+        // the type it is reported as (`INT` up to nine digits, else
+        // `BIGINT`): `int_col UNION SELECT 7` stays `INT`.
+        let eff = |t: &&ExprType| match t.width {
+            0 if t.len <= 9 => 4,
+            0 => 8,
+            w => w,
+        };
+        let columns_only = live.iter().all(|t| t.width > 0);
+        let width = if (all_unsigned || none_unsigned)
+            && (columns_only || (env.maria() && live.iter().any(|t| t.width > 0)))
+        {
+            live.iter().map(eff).max().unwrap_or(0)
         } else {
             0
         };
+        // The length follows the columns-only rule either way.
         let merged_len = |signed_extra: u32| {
-            if env.maria() && width == 0 {
+            if env.maria() && !((all_unsigned || none_unsigned) && columns_only) {
                 prec + signed_extra
             } else {
                 max_len
@@ -245,12 +256,12 @@ pub(crate) fn agg_result_type(types: &[ExprType], op: &str, env: Env<'_>) -> Res
         }
     } else {
         let _ = any;
-        let tys: Vec<&ExprType> = live.iter().copied().collect();
+        let tys: Vec<&ExprType> = live.clone();
         let dtc = crate::types::aggregate_types(&tys, env.conn(), op, false)?;
         let chars = live
             .iter()
             .map(|t| match t.kind {
-                Kind::Double | Kind::Float if !env.maria() => 22.max(t.len.min(23)),
+                Kind::Double | Kind::Float if !env.maria() => 22,
                 _ => t.len,
             })
             .max()
@@ -477,8 +488,16 @@ pub(crate) fn cast(a: Node, target: CastTarget, env: Env<'_>) -> Result<Node> {
             })
         }
         CastTarget::Binary(n) => {
+            let was_string = a.ty.kind == Kind::Str;
             let a = string_node(a, env);
-            let bytes = n.unwrap_or(a.ty.len.saturating_mul(crate::types::mb_max_len(a.ty.coll)));
+            // The bytes a value can have: a number's characters (ASCII),
+            // a string's characters at their widest.
+            let mb = if was_string {
+                crate::types::mb_max_len(a.ty.coll)
+            } else {
+                1
+            };
+            let bytes = n.unwrap_or(a.ty.len.saturating_mul(mb));
             let ty = ExprType {
                 dec: if maria { 0 } else { NOT_FIXED },
                 ..ExprType::string(bytes, Collation::Binary, Derivation::Implicit)

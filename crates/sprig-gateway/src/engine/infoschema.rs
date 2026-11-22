@@ -71,13 +71,39 @@ const COLS: &[(&str, &str, u16, u32, u8, u16)] = &[
     ("COLUMNS", "COLLATION_NAME", 224, 256, 0xfd, 0x1000),
     ("COLUMNS", "COLUMN_TYPE", 224, 786_420, 0xfc, 0x1011),
     ("COLUMNS", "COLUMN_KEY", 224, 12, 0xfd, 0x1001),
+    // The MySQL port's forms of three columns, computed here instead of by
+    // the name layer's regular expressions (see `simplify`); invisible.
+    ("COLUMNS", "_sprig_my_type", 224, 786_420, 0xfc, 0x1011),
+    ("COLUMNS", "_sprig_my_default", 224, 786_384, 0xfc, 0x1010),
+    ("COLUMNS", "_sprig_my_extra", 224, 320, 0xfd, 0x1001),
     ("COLUMNS", "EXTRA", 224, 320, 0xfd, 0x1001),
     ("COLUMNS", "PRIVILEGES", 224, 320, 0xfd, 0x1001),
     ("COLUMNS", "COLUMN_COMMENT", 224, 4096, 0xfd, 0x1001),
     ("COLUMNS", "IS_GENERATED", 224, 24, 0xfd, 0x1001),
-    ("COLUMNS", "GENERATION_EXPRESSION", 224, 786_384, 0xfc, 0x1010),
-    ("COLUMNS", "IS_SYSTEM_TIME_PERIOD_START", 224, 12, 0xfd, 0x1001),
-    ("COLUMNS", "IS_SYSTEM_TIME_PERIOD_END", 224, 12, 0xfd, 0x1001),
+    (
+        "COLUMNS",
+        "GENERATION_EXPRESSION",
+        224,
+        786_384,
+        0xfc,
+        0x1010,
+    ),
+    (
+        "COLUMNS",
+        "IS_SYSTEM_TIME_PERIOD_START",
+        224,
+        12,
+        0xfd,
+        0x1001,
+    ),
+    (
+        "COLUMNS",
+        "IS_SYSTEM_TIME_PERIOD_END",
+        224,
+        12,
+        0xfd,
+        0x1001,
+    ),
     ("STATISTICS", "TABLE_CATALOG", 224, 2048, 0xfd, 0x1001),
     ("STATISTICS", "TABLE_SCHEMA", 224, 256, 0xfd, 0x1001),
     ("STATISTICS", "TABLE_NAME", 224, 256, 0xfd, 0x1001),
@@ -95,41 +121,223 @@ const COLS: &[(&str, &str, u16, u32, u8, u16)] = &[
     ("STATISTICS", "COMMENT", 224, 64, 0xfd, 0x1001),
     ("STATISTICS", "INDEX_COMMENT", 224, 4096, 0xfd, 0x1001),
     ("STATISTICS", "IGNORED", 224, 12, 0xfd, 0x1001),
-    ("TABLE_CONSTRAINTS", "CONSTRAINT_CATALOG", 224, 2048, 0xfd, 0x1001),
-    ("TABLE_CONSTRAINTS", "CONSTRAINT_SCHEMA", 224, 256, 0xfd, 0x1001),
-    ("TABLE_CONSTRAINTS", "CONSTRAINT_NAME", 224, 256, 0xfd, 0x1001),
+    (
+        "TABLE_CONSTRAINTS",
+        "CONSTRAINT_CATALOG",
+        224,
+        2048,
+        0xfd,
+        0x1001,
+    ),
+    (
+        "TABLE_CONSTRAINTS",
+        "CONSTRAINT_SCHEMA",
+        224,
+        256,
+        0xfd,
+        0x1001,
+    ),
+    (
+        "TABLE_CONSTRAINTS",
+        "CONSTRAINT_NAME",
+        224,
+        256,
+        0xfd,
+        0x1001,
+    ),
     ("TABLE_CONSTRAINTS", "TABLE_SCHEMA", 224, 256, 0xfd, 0x1001),
     ("TABLE_CONSTRAINTS", "TABLE_NAME", 224, 256, 0xfd, 0x1001),
-    ("TABLE_CONSTRAINTS", "CONSTRAINT_TYPE", 224, 256, 0xfd, 0x1001),
-    ("KEY_COLUMN_USAGE", "CONSTRAINT_CATALOG", 224, 2048, 0xfd, 0x1001),
-    ("KEY_COLUMN_USAGE", "CONSTRAINT_SCHEMA", 224, 256, 0xfd, 0x1001),
-    ("KEY_COLUMN_USAGE", "CONSTRAINT_NAME", 224, 256, 0xfd, 0x1001),
+    (
+        "TABLE_CONSTRAINTS",
+        "CONSTRAINT_TYPE",
+        224,
+        256,
+        0xfd,
+        0x1001,
+    ),
+    (
+        "KEY_COLUMN_USAGE",
+        "CONSTRAINT_CATALOG",
+        224,
+        2048,
+        0xfd,
+        0x1001,
+    ),
+    (
+        "KEY_COLUMN_USAGE",
+        "CONSTRAINT_SCHEMA",
+        224,
+        256,
+        0xfd,
+        0x1001,
+    ),
+    (
+        "KEY_COLUMN_USAGE",
+        "CONSTRAINT_NAME",
+        224,
+        256,
+        0xfd,
+        0x1001,
+    ),
     ("KEY_COLUMN_USAGE", "TABLE_CATALOG", 224, 2048, 0xfd, 0x1001),
     ("KEY_COLUMN_USAGE", "TABLE_SCHEMA", 224, 256, 0xfd, 0x1001),
     ("KEY_COLUMN_USAGE", "TABLE_NAME", 224, 256, 0xfd, 0x1001),
     ("KEY_COLUMN_USAGE", "COLUMN_NAME", 224, 256, 0xfd, 0x1001),
     ("KEY_COLUMN_USAGE", "ORDINAL_POSITION", 63, 10, 0x08, 0x1001),
-    ("KEY_COLUMN_USAGE", "POSITION_IN_UNIQUE_CONSTRAINT", 63, 10, 0x08, 0x1000),
-    ("KEY_COLUMN_USAGE", "REFERENCED_TABLE_SCHEMA", 224, 256, 0xfd, 0x1000),
-    ("KEY_COLUMN_USAGE", "REFERENCED_TABLE_NAME", 224, 256, 0xfd, 0x1000),
-    ("KEY_COLUMN_USAGE", "REFERENCED_COLUMN_NAME", 224, 256, 0xfd, 0x1000),
-    ("CHECK_CONSTRAINTS", "CONSTRAINT_CATALOG", 224, 2048, 0xfd, 0x1001),
-    ("CHECK_CONSTRAINTS", "CONSTRAINT_SCHEMA", 224, 256, 0xfd, 0x1001),
+    (
+        "KEY_COLUMN_USAGE",
+        "POSITION_IN_UNIQUE_CONSTRAINT",
+        63,
+        10,
+        0x08,
+        0x1000,
+    ),
+    (
+        "KEY_COLUMN_USAGE",
+        "REFERENCED_TABLE_SCHEMA",
+        224,
+        256,
+        0xfd,
+        0x1000,
+    ),
+    (
+        "KEY_COLUMN_USAGE",
+        "REFERENCED_TABLE_NAME",
+        224,
+        256,
+        0xfd,
+        0x1000,
+    ),
+    (
+        "KEY_COLUMN_USAGE",
+        "REFERENCED_COLUMN_NAME",
+        224,
+        256,
+        0xfd,
+        0x1000,
+    ),
+    (
+        "CHECK_CONSTRAINTS",
+        "CONSTRAINT_CATALOG",
+        224,
+        2048,
+        0xfd,
+        0x1001,
+    ),
+    (
+        "CHECK_CONSTRAINTS",
+        "CONSTRAINT_SCHEMA",
+        224,
+        256,
+        0xfd,
+        0x1001,
+    ),
     ("CHECK_CONSTRAINTS", "TABLE_NAME", 224, 256, 0xfd, 0x1001),
-    ("CHECK_CONSTRAINTS", "CONSTRAINT_NAME", 224, 256, 0xfd, 0x1001),
+    (
+        "CHECK_CONSTRAINTS",
+        "CONSTRAINT_NAME",
+        224,
+        256,
+        0xfd,
+        0x1001,
+    ),
     ("CHECK_CONSTRAINTS", "LEVEL", 224, 24, 0xfd, 0x1001),
-    ("CHECK_CONSTRAINTS", "CHECK_CLAUSE", 224, 786_384, 0xfc, 0x1011),
-    ("REFERENTIAL_CONSTRAINTS", "CONSTRAINT_CATALOG", 224, 2048, 0xfd, 0x1001),
-    ("REFERENTIAL_CONSTRAINTS", "CONSTRAINT_SCHEMA", 224, 256, 0xfd, 0x1001),
-    ("REFERENTIAL_CONSTRAINTS", "CONSTRAINT_NAME", 224, 256, 0xfd, 0x1001),
-    ("REFERENTIAL_CONSTRAINTS", "UNIQUE_CONSTRAINT_CATALOG", 224, 2048, 0xfd, 0x1001),
-    ("REFERENTIAL_CONSTRAINTS", "UNIQUE_CONSTRAINT_SCHEMA", 224, 256, 0xfd, 0x1001),
-    ("REFERENTIAL_CONSTRAINTS", "UNIQUE_CONSTRAINT_NAME", 224, 256, 0xfd, 0x1000),
-    ("REFERENTIAL_CONSTRAINTS", "MATCH_OPTION", 224, 256, 0xfd, 0x1001),
-    ("REFERENTIAL_CONSTRAINTS", "UPDATE_RULE", 224, 256, 0xfd, 0x1001),
-    ("REFERENTIAL_CONSTRAINTS", "DELETE_RULE", 224, 256, 0xfd, 0x1001),
-    ("REFERENTIAL_CONSTRAINTS", "TABLE_NAME", 224, 256, 0xfd, 0x1001),
-    ("REFERENTIAL_CONSTRAINTS", "REFERENCED_TABLE_NAME", 224, 256, 0xfd, 0x1000),
+    (
+        "CHECK_CONSTRAINTS",
+        "CHECK_CLAUSE",
+        224,
+        786_384,
+        0xfc,
+        0x1011,
+    ),
+    (
+        "REFERENTIAL_CONSTRAINTS",
+        "CONSTRAINT_CATALOG",
+        224,
+        2048,
+        0xfd,
+        0x1001,
+    ),
+    (
+        "REFERENTIAL_CONSTRAINTS",
+        "CONSTRAINT_SCHEMA",
+        224,
+        256,
+        0xfd,
+        0x1001,
+    ),
+    (
+        "REFERENTIAL_CONSTRAINTS",
+        "CONSTRAINT_NAME",
+        224,
+        256,
+        0xfd,
+        0x1001,
+    ),
+    (
+        "REFERENTIAL_CONSTRAINTS",
+        "UNIQUE_CONSTRAINT_CATALOG",
+        224,
+        2048,
+        0xfd,
+        0x1001,
+    ),
+    (
+        "REFERENTIAL_CONSTRAINTS",
+        "UNIQUE_CONSTRAINT_SCHEMA",
+        224,
+        256,
+        0xfd,
+        0x1001,
+    ),
+    (
+        "REFERENTIAL_CONSTRAINTS",
+        "UNIQUE_CONSTRAINT_NAME",
+        224,
+        256,
+        0xfd,
+        0x1000,
+    ),
+    (
+        "REFERENTIAL_CONSTRAINTS",
+        "MATCH_OPTION",
+        224,
+        256,
+        0xfd,
+        0x1001,
+    ),
+    (
+        "REFERENTIAL_CONSTRAINTS",
+        "UPDATE_RULE",
+        224,
+        256,
+        0xfd,
+        0x1001,
+    ),
+    (
+        "REFERENTIAL_CONSTRAINTS",
+        "DELETE_RULE",
+        224,
+        256,
+        0xfd,
+        0x1001,
+    ),
+    (
+        "REFERENTIAL_CONSTRAINTS",
+        "TABLE_NAME",
+        224,
+        256,
+        0xfd,
+        0x1001,
+    ),
+    (
+        "REFERENTIAL_CONSTRAINTS",
+        "REFERENCED_TABLE_NAME",
+        224,
+        256,
+        0xfd,
+        0x1000,
+    ),
 ];
 
 /// The tables built here.
@@ -143,7 +351,9 @@ pub(crate) const TABLES: [&str; 7] = [
     "REFERENTIAL_CONSTRAINTS",
 ];
 
-fn cols_of(t: &str) -> impl Iterator<Item = &'static (&'static str, &'static str, u16, u32, u8, u16)> + '_ {
+fn cols_of(
+    t: &str,
+) -> impl Iterator<Item = &'static (&'static str, &'static str, u16, u32, u8, u16)> + '_ {
     COLS.iter().filter(move |c| c.0 == t)
 }
 
@@ -153,19 +363,37 @@ fn plan_def(t: &str) -> TableDef {
     let columns = cols_of(t)
         .map(|&(_, name, _, len, ty, flags)| {
             let cty = match ty {
-                0x08 => ColType::Int { bytes: 8, unsigned: flags & 0x20 != 0 },
-                0x03 => ColType::Int { bytes: 4, unsigned: flags & 0x20 != 0 },
+                0x08 => ColType::Int {
+                    bytes: 8,
+                    unsigned: flags & 0x20 != 0,
+                },
+                0x03 => ColType::Int {
+                    bytes: 4,
+                    unsigned: flags & 0x20 != 0,
+                },
                 0x0c => ColType::DateTime { fsp: 0 },
                 _ => match ci {
-                    Some(collation) => ColType::VarChar { chars: (len / 4).max(1), collation },
-                    None => ColType::VarBinary { bytes: len.min(65_535) },
+                    Some(collation) => ColType::VarChar {
+                        chars: (len / 4).max(1),
+                        collation,
+                    },
+                    None => ColType::VarBinary {
+                        bytes: len.min(65_535),
+                    },
                 },
             };
-            let c = ColumnDef::new(name, cty);
+            let mut c = ColumnDef::new(name, cty);
+            c.invisible = name.starts_with("_sprig_my_");
             if flags & 1 != 0 { c.not_null() } else { c }
         })
         .collect();
-    TableDef { schema: "information_schema".into(), name: t.into(), columns, primary: None, indexes: Vec::new() }
+    TableDef {
+        schema: "information_schema".into(),
+        name: t.into(),
+        columns,
+        primary: None,
+        indexes: Vec::new(),
+    }
 }
 
 /// A value of a row being built.
@@ -183,6 +411,8 @@ fn row_of(t: &str, vals: &HashMap<&str, V>) -> Vec<Datum> {
     cols_of(t)
         .map(|c| match vals.get(c.1) {
             Some(V::S(x)) => Datum::Str(Bytes::from(x.clone().into_bytes())),
+            // A signed column (no UNSIGNED flag) takes a signed value.
+            Some(V::U(n)) if c.5 & 0x20 == 0 => Datum::Int(i64::try_from(*n).unwrap_or(i64::MAX)),
             Some(V::U(n)) => Datum::UInt(*n),
             Some(V::N) | None => Datum::Null,
         })
@@ -199,17 +429,50 @@ fn is_default(c: &define::Col) -> V {
     match &c.default {
         None | Some(Default::Null) if !c.not_null && !c.auto_inc => s("NULL"),
         None | Some(Default::Null) => V::N,
-        Some(Default::Lit(l)) => s(l.clone()),
+        Some(Default::Lit(l)) => s(mariadb_quoted(l)),
         Some(Default::Raw(e) | Default::Expr(e)) => s(define::expr::print(e)),
-        Some(Default::Now(p)) => s(if *p == 0 { "current_timestamp()".to_owned() } else { format!("current_timestamp({p})") }),
+        Some(Default::Now(p)) => s(if *p == 0 {
+            "current_timestamp()".to_owned()
+        } else {
+            format!("current_timestamp({p})")
+        }),
     }
+}
+
+/// A string constant as MariaDB's `COLUMN_DEFAULT` quotes it: a quote
+/// doubled, a backslash, newline, carriage return and NUL escaped with a
+/// backslash. Anything else (a number, a bit or hex literal) as it is.
+fn mariadb_quoted(l: &str) -> String {
+    if !(l.len() >= 2 && l.starts_with('\'') && l.ends_with('\'')) {
+        return l.to_owned();
+    }
+    let v = super::show::unquote(l);
+    let mut o = String::with_capacity(v.len() + 2);
+    o.push('\'');
+    for ch in v.chars() {
+        match ch {
+            '\'' => o.push_str("''"),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\0' => o.push_str("\\0"),
+            c => o.push(c),
+        }
+    }
+    o.push('\'');
+    o
 }
 
 /// Precision, scale and datetime precision of a column type, as `COLUMNS`
 /// shows them.
 fn numeric(c: &define::Col) -> (V, V, V) {
     let b = c.ty.base.as_str();
-    let args: Vec<u64> = c.ty.args.trim_matches(|ch| ch == '(' || ch == ')').split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    let args: Vec<u64> =
+        c.ty.args
+            .trim_matches(|ch| ch == '(' || ch == ')')
+            .split(',')
+            .filter_map(|x| x.trim().parse().ok())
+            .collect();
     let u = c.ty.unsigned;
     match b {
         "tinyint" => (V::U(3), V::U(0), V::N),
@@ -217,7 +480,11 @@ fn numeric(c: &define::Col) -> (V, V, V) {
         "mediumint" => (V::U(if u { 8 } else { 7 }), V::U(0), V::N),
         "int" => (V::U(10), V::U(0), V::N),
         "bigint" => (V::U(if u { 20 } else { 19 }), V::U(0), V::N),
-        "decimal" => (V::U(args.first().copied().unwrap_or(10)), V::U(args.get(1).copied().unwrap_or(0)), V::N),
+        "decimal" => (
+            V::U(args.first().copied().unwrap_or(10)),
+            V::U(args.get(1).copied().unwrap_or(0)),
+            V::N,
+        ),
         "float" => match args.as_slice() {
             [m, d] => (V::U(*m), V::U(*d), V::N),
             _ => (V::U(12), V::N, V::N),
@@ -248,9 +515,18 @@ fn lengths(c: &define::Col) -> (V, V) {
         "mediumblob" => (V::U(16_777_215), V::U(16_777_215)),
         "longblob" => (V::U(4_294_967_295), V::U(4_294_967_295)),
         "enum" | "set" => {
-            let longest = c.ty.members.iter().map(|m| m.chars().count()).max().unwrap_or(0) as u64;
+            let longest =
+                c.ty.members
+                    .iter()
+                    .map(|m| m.chars().count())
+                    .max()
+                    .unwrap_or(0) as u64;
             let n = if c.ty.base == "set" {
-                c.ty.members.iter().map(|m| m.chars().count() as u64).sum::<u64>() + c.ty.members.len().saturating_sub(1) as u64
+                c.ty.members
+                    .iter()
+                    .map(|m| m.chars().count() as u64)
+                    .sum::<u64>()
+                    + c.ty.members.len().saturating_sub(1) as u64
             } else {
                 longest
             };
@@ -261,10 +537,21 @@ fn lengths(c: &define::Col) -> (V, V) {
 }
 
 fn key_of(def: &Def, col: &str) -> &'static str {
-    let first = |k: &define::Key| k.parts.first().is_some_and(|p| p.col.eq_ignore_ascii_case(col));
-    if def.keys.iter().any(|k| k.kind == KeyKind::Primary && k.parts.iter().any(|p| p.col.eq_ignore_ascii_case(col))) {
+    let first = |k: &define::Key| {
+        k.parts
+            .first()
+            .is_some_and(|p| p.col.eq_ignore_ascii_case(col))
+    };
+    if def
+        .primary()
+        .is_some_and(|k| k.parts.iter().any(|p| p.col.eq_ignore_ascii_case(col)))
+    {
         "PRI"
-    } else if def.keys.iter().any(|k| k.kind == KeyKind::Unique && k.parts.len() == 1 && first(k)) {
+    } else if def
+        .keys
+        .iter()
+        .any(|k| k.kind == KeyKind::Unique && k.parts.len() == 1 && first(k))
+    {
         "UNI"
     } else if def.keys.iter().any(first) {
         "MUL"
@@ -279,10 +566,18 @@ fn extra_of(c: &define::Col) -> String {
         parts.push("auto_increment".into());
     }
     if let Some(p) = c.on_update {
-        parts.push(if p == 0 { "on update current_timestamp()".into() } else { format!("on update current_timestamp({p})") });
+        parts.push(if p == 0 {
+            "on update current_timestamp()".into()
+        } else {
+            format!("on update current_timestamp({p})")
+        });
     }
     if let Some((_, stored)) = &c.generated {
-        parts.push(if *stored { "STORED GENERATED".into() } else { "VIRTUAL GENERATED".into() });
+        parts.push(if *stored {
+            "STORED GENERATED".into()
+        } else {
+            "VIRTUAL GENERATED".into()
+        });
     }
     if c.invisible {
         parts.push("INVISIBLE".into());
@@ -290,10 +585,142 @@ fn extra_of(c: &define::Col) -> String {
     parts.join(" ")
 }
 
+/// `COLUMN_TYPE` as MySQL 8.4 shows it: integer types without their
+/// display width, except `tinyint(1)` and `ZEROFILL` columns.
+fn mysql_type(ty: &str) -> String {
+    if ty.starts_with("tinyint(1)") || ty.ends_with("zerofill") {
+        return ty.to_owned();
+    }
+    for base in ["tinyint", "smallint", "mediumint", "int", "bigint", "year"] {
+        if let Some(rest) = ty.strip_prefix(base).and_then(|r| r.strip_prefix('('))
+            && let Some(close) = rest.find(')')
+            && close > 0
+            && rest[..close].bytes().all(|b| b.is_ascii_digit())
+        {
+            return format!("{base}{}", &rest[close + 1..]);
+        }
+    }
+    ty.to_owned()
+}
+
+/// `COLUMN_DEFAULT` as MySQL 8.4 shows it, from the MariaDB-form value
+/// `d`: no default and `NULL` both `NULL`, a literal unquoted with its
+/// escapes undone, `CURRENT_TIMESTAMP` in capitals, `localtimestamp(n)`
+/// (what a `(now(n))` default becomes) as `now(n)`.
+fn mysql_default(d: &str) -> Option<String> {
+    if d == "NULL" {
+        return None;
+    }
+    if d.len() >= 2 && d.starts_with('\'') && d.ends_with('\'') {
+        let body = &d[1..d.len() - 1];
+        return Some(
+            body.replace("\\\\", "\0")
+                .replace("\\n", "\n")
+                .replace("\\r", "\r")
+                .replace("''", "'")
+                .replace('\0', "\\"),
+        );
+    }
+    if d == "current_timestamp()" {
+        return Some("CURRENT_TIMESTAMP".to_owned());
+    }
+    let digit_call = |rest: &str, optional: bool| match rest.as_bytes() {
+        [b'(', b')'] => optional,
+        [b'(', n, b')'] => (b'0'..=b'6').contains(n),
+        _ => false,
+    };
+    if let Some(rest) = d.strip_prefix("current_timestamp")
+        && digit_call(rest, false)
+    {
+        return Some(d.to_ascii_uppercase());
+    }
+    if let Some(rest) = d.strip_prefix("localtimestamp")
+        && digit_call(rest, true)
+    {
+        return Some(format!("now{rest}"));
+    }
+    Some(d.to_owned())
+}
+
+/// Whether `d` is a number as a default shows it: `[-+]digits[.digits][e[-+]digits]`.
+fn plain_number(d: &str) -> bool {
+    let b = d.as_bytes();
+    let mut i = usize::from(matches!(b.first(), Some(b'-' | b'+')));
+    let digits = |i: &mut usize| {
+        let s = *i;
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        *i > s
+    };
+    if !digits(&mut i) {
+        return false;
+    }
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        if !digits(&mut i) {
+            return false;
+        }
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(b.get(i), Some(b'-' | b'+')) {
+            i += 1;
+        }
+        if !digits(&mut i) {
+            return false;
+        }
+    }
+    i == b.len()
+}
+
+/// `EXTRA` as MySQL 8.4 shows it: `DEFAULT_GENERATED` for an expression
+/// default (`d`, the MariaDB-form `COLUMN_DEFAULT`), `CURRENT_TIMESTAMP`
+/// in capitals.
+fn mysql_extra(d: Option<&str>, extra: &str) -> String {
+    let bits = |d: &str| matches!(d.as_bytes(), [b'b' | b'B' | b'x' | b'X', b'\'', ..]);
+    let generated =
+        d.is_some_and(|d| d != "NULL" && !d.starts_with('\'') && !plain_number(d) && !bits(d));
+    let mut e = String::with_capacity(extra.len());
+    let lower = extra.to_ascii_lowercase();
+    let mut i = 0;
+    while let Some(k) = lower[i..].find("current_timestamp(") {
+        let at = i + k;
+        let after = at + "current_timestamp(".len();
+        let rest = &extra[after..];
+        let n = match rest.as_bytes() {
+            [d, b')', ..] if (b'0'..=b'6').contains(d) => Some(&rest[..1]),
+            [b')', ..] => Some(""),
+            _ => None,
+        };
+        e.push_str(&extra[i..at]);
+        if let Some(n) = n {
+            e.push_str("CURRENT_TIMESTAMP(");
+            e.push_str(n);
+            e.push(')');
+            i = after + n.len() + 1;
+        } else {
+            e.push_str(&extra[at..after]);
+            i = after;
+        }
+    }
+    e.push_str(&extra[i..]);
+    let e = e.replace("CURRENT_TIMESTAMP()", "CURRENT_TIMESTAMP");
+    let mut out = String::new();
+    if generated {
+        out.push_str("DEFAULT_GENERATED ");
+    }
+    out.push_str(&e);
+    out.trim_matches(' ').to_owned()
+}
+
 /// Adds every row one table contributes to the in-memory tables.
+#[allow(clippy::too_many_lines)] // one block per table built
 fn add_table(db: &mut MemDb, schema: &str, def: &Def, next: Option<u64>) {
     let mut put = |t: &str, vals: HashMap<&str, V>| {
-        let _ = db.insert(t, row_of(t, &vals));
+        if let Err(e) = db.insert(t, row_of(t, &vals)) {
+            tracing::warn!(table = t, error = %e.message, "information_schema: a row doesn't fit its table");
+        }
     };
     let base = |vals: &mut HashMap<&str, V>| {
         vals.insert("TABLE_CATALOG", s("def"));
@@ -310,7 +737,17 @@ fn add_table(db: &mut MemDb, schema: &str, def: &Def, next: Option<u64>) {
     v.insert("AVG_ROW_LENGTH", V::U(0));
     v.insert("DATA_LENGTH", V::U(16384));
     v.insert("MAX_DATA_LENGTH", V::U(0));
-    v.insert("INDEX_LENGTH", V::U(16384 * def.keys.iter().filter(|k| k.kind != KeyKind::Primary).count() as u64));
+    v.insert(
+        "INDEX_LENGTH",
+        V::U(
+            16384
+                * def
+                    .keys
+                    .iter()
+                    .filter(|k| k.kind != KeyKind::Primary)
+                    .count() as u64,
+        ),
+    );
     v.insert("DATA_FREE", V::U(0));
     v.insert("AUTO_INCREMENT", next.map_or(V::N, V::U));
     v.insert("TABLE_COLLATION", s(def.cs.1.clone()));
@@ -324,7 +761,6 @@ fn add_table(db: &mut MemDb, schema: &str, def: &Def, next: Option<u64>) {
         base(&mut v);
         v.insert("COLUMN_NAME", s(c.name.clone()));
         v.insert("ORDINAL_POSITION", V::U(i as u64 + 1));
-        v.insert("COLUMN_DEFAULT", is_default(c));
         v.insert("IS_NULLABLE", s(if c.not_null { "NO" } else { "YES" }));
         v.insert("DATA_TYPE", s(c.ty.base.clone()));
         let (cl, ol) = lengths(c);
@@ -338,13 +774,47 @@ fn add_table(db: &mut MemDb, schema: &str, def: &Def, next: Option<u64>) {
             v.insert("CHARACTER_SET_NAME", s(cs.clone()));
             v.insert("COLLATION_NAME", s(co.clone()));
         }
-        v.insert("COLUMN_TYPE", s(c.ty.print()));
         v.insert("COLUMN_KEY", s(key_of(def, &c.name)));
-        v.insert("EXTRA", s(extra_of(c)));
+        let default = is_default(c);
+        let extra = extra_of(c);
+        let ty = c.ty.print();
+        v.insert("_sprig_my_type", s(mysql_type(&ty)));
+        v.insert(
+            "_sprig_my_default",
+            match &default {
+                V::S(d) => mysql_default(d).map_or(V::N, s),
+                _ => V::N,
+            },
+        );
+        v.insert(
+            "_sprig_my_extra",
+            s(mysql_extra(
+                match &default {
+                    V::S(d) => Some(d.as_str()),
+                    _ => None,
+                },
+                &extra,
+            )),
+        );
+        v.insert("EXTRA", s(extra));
+        v.insert("COLUMN_TYPE", s(ty));
+        v.insert("COLUMN_DEFAULT", default);
         v.insert("PRIVILEGES", s("select,insert,update,references"));
         v.insert("COLUMN_COMMENT", s(c.comment.clone().unwrap_or_default()));
-        v.insert("IS_GENERATED", s(if c.generated.is_some() { "ALWAYS" } else { "NEVER" }));
-        v.insert("GENERATION_EXPRESSION", c.generated.as_ref().map_or(V::N, |(g, _)| s(define::expr::print(g))));
+        v.insert(
+            "IS_GENERATED",
+            s(if c.generated.is_some() {
+                "ALWAYS"
+            } else {
+                "NEVER"
+            }),
+        );
+        v.insert(
+            "GENERATION_EXPRESSION",
+            c.generated
+                .as_ref()
+                .map_or(V::N, |(g, _)| s(define::expr::print(g))),
+        );
         v.insert("IS_SYSTEM_TIME_PERIOD_START", s("NO"));
         v.insert("IS_SYSTEM_TIME_PERIOD_END", s("NO"));
         put("COLUMNS", v);
@@ -353,7 +823,13 @@ fn add_table(db: &mut MemDb, schema: &str, def: &Def, next: Option<u64>) {
         for (i, p) in k.parts.iter().enumerate() {
             let mut v = HashMap::new();
             base(&mut v);
-            v.insert("NON_UNIQUE", V::U(u64::from(!matches!(k.kind, KeyKind::Primary | KeyKind::Unique))));
+            v.insert(
+                "NON_UNIQUE",
+                V::U(u64::from(!matches!(
+                    k.kind,
+                    KeyKind::Primary | KeyKind::Unique
+                ))),
+            );
             v.insert("INDEX_SCHEMA", s(schema));
             v.insert("INDEX_NAME", s(k.name.clone()));
             v.insert("SEQ_IN_INDEX", V::U(i as u64 + 1));
@@ -363,7 +839,10 @@ fn add_table(db: &mut MemDb, schema: &str, def: &Def, next: Option<u64>) {
             v.insert("SUB_PART", p.len.map_or(V::N, |l| V::U(u64::from(l))));
             let nullable = def.col(&p.col).is_some_and(|ci| !def.cols[ci].not_null);
             v.insert("NULLABLE", s(if nullable { "YES" } else { "" }));
-            v.insert("INDEX_TYPE", s(k.using.clone().unwrap_or_else(|| "BTREE".into())));
+            v.insert(
+                "INDEX_TYPE",
+                s(k.using.clone().unwrap_or_else(|| "BTREE".into())),
+            );
             v.insert("COMMENT", s(""));
             v.insert("INDEX_COMMENT", s(k.comment.clone().unwrap_or_default()));
             v.insert("IGNORED", s(if k.ignored { "YES" } else { "NO" }));
@@ -380,8 +859,22 @@ fn add_table(db: &mut MemDb, schema: &str, def: &Def, next: Option<u64>) {
         v.insert("CONSTRAINT_TYPE", s(ty));
         v
     };
-    for k in def.keys.iter().filter(|k| matches!(k.kind, KeyKind::Primary | KeyKind::Unique)) {
-        put("TABLE_CONSTRAINTS", constraint(&k.name, if k.kind == KeyKind::Primary { "PRIMARY KEY" } else { "UNIQUE" }));
+    for k in def
+        .keys
+        .iter()
+        .filter(|k| matches!(k.kind, KeyKind::Primary | KeyKind::Unique))
+    {
+        put(
+            "TABLE_CONSTRAINTS",
+            constraint(
+                &k.name,
+                if k.kind == KeyKind::Primary {
+                    "PRIMARY KEY"
+                } else {
+                    "UNIQUE"
+                },
+            ),
+        );
         for (i, p) in k.parts.iter().enumerate() {
             let mut v = HashMap::new();
             v.insert("CONSTRAINT_CATALOG", s("def"));
@@ -404,9 +897,15 @@ fn add_table(db: &mut MemDb, schema: &str, def: &Def, next: Option<u64>) {
             v.insert("COLUMN_NAME", s(c.clone()));
             v.insert("ORDINAL_POSITION", V::U(i as u64 + 1));
             v.insert("POSITION_IN_UNIQUE_CONSTRAINT", V::U(i as u64 + 1));
-            v.insert("REFERENCED_TABLE_SCHEMA", s(f.ref_db.clone().unwrap_or_else(|| schema.to_owned())));
+            v.insert(
+                "REFERENCED_TABLE_SCHEMA",
+                s(f.ref_db.clone().unwrap_or_else(|| schema.to_owned())),
+            );
             v.insert("REFERENCED_TABLE_NAME", s(f.ref_table.clone()));
-            v.insert("REFERENCED_COLUMN_NAME", s(f.ref_cols.get(i).cloned().unwrap_or_default()));
+            v.insert(
+                "REFERENCED_COLUMN_NAME",
+                s(f.ref_cols.get(i).cloned().unwrap_or_default()),
+            );
             put("KEY_COLUMN_USAGE", v);
         }
         let mut v = HashMap::new();
@@ -414,11 +913,20 @@ fn add_table(db: &mut MemDb, schema: &str, def: &Def, next: Option<u64>) {
         v.insert("CONSTRAINT_SCHEMA", s(schema));
         v.insert("CONSTRAINT_NAME", s(f.name.clone()));
         v.insert("UNIQUE_CONSTRAINT_CATALOG", s("def"));
-        v.insert("UNIQUE_CONSTRAINT_SCHEMA", s(f.ref_db.clone().unwrap_or_else(|| schema.to_owned())));
+        v.insert(
+            "UNIQUE_CONSTRAINT_SCHEMA",
+            s(f.ref_db.clone().unwrap_or_else(|| schema.to_owned())),
+        );
         v.insert("UNIQUE_CONSTRAINT_NAME", s("PRIMARY"));
         v.insert("MATCH_OPTION", s("NONE"));
-        v.insert("UPDATE_RULE", s(f.on_update.clone().unwrap_or_else(|| "RESTRICT".into())));
-        v.insert("DELETE_RULE", s(f.on_delete.clone().unwrap_or_else(|| "RESTRICT".into())));
+        v.insert(
+            "UPDATE_RULE",
+            s(f.on_update.clone().unwrap_or_else(|| "RESTRICT".into())),
+        );
+        v.insert(
+            "DELETE_RULE",
+            s(f.on_delete.clone().unwrap_or_else(|| "RESTRICT".into())),
+        );
         v.insert("TABLE_NAME", s(def.name.clone()));
         v.insert("REFERENCED_TABLE_NAME", s(f.ref_table.clone()));
         put("REFERENTIAL_CONSTRAINTS", v);
@@ -428,9 +936,17 @@ fn add_table(db: &mut MemDb, schema: &str, def: &Def, next: Option<u64>) {
     let mut checks: Vec<(String, &'static str, String)> = def
         .cols
         .iter()
-        .filter_map(|c| c.check.as_ref().map(|e| (c.name.clone(), "Column", define::expr::print(e))))
+        .filter_map(|c| {
+            c.check
+                .as_ref()
+                .map(|e| (c.name.clone(), "Column", define::expr::print(e)))
+        })
         .collect();
-    checks.extend(def.checks.iter().map(|c| (c.name.clone(), "Table", define::expr::print(&c.expr))));
+    checks.extend(
+        def.checks
+            .iter()
+            .map(|c| (c.name.clone(), "Table", define::expr::print(&c.expr))),
+    );
     for (name, level, clause) in checks {
         put("TABLE_CONSTRAINTS", constraint(&name, "CHECK"));
         let mut v = HashMap::new();
@@ -477,14 +993,34 @@ fn schemas_named(sql: &str, tenant: u64) -> Vec<(String, DbId)> {
 fn simplify(sql: &str) -> String {
     // Functional key parts (the MySQL port's hidden `_sprig_fx_` columns)
     // don't exist on the engine: their join and the columns it feeds go.
-    let mut owned = sql.replace("IF(`_sprig_fc` IS NULL, `COLUMN_NAME`, NULL)", "`COLUMN_NAME`").replace(
-        "REPLACE(REPLACE(`_sprig_fe`, 'lcase(', 'lower('), 'ucase(', 'upper(')",
-        "NULL",
-    );
+    // Automatic indexes (`sprig_auto_`) are MariaDB-side too.
+    let mut owned = sql
+        .replace(" AND LEFT(`INDEX_NAME`, 11) <> 'sprig_auto_'", "")
+        .replace(
+            "IF(`_sprig_fc` IS NULL, `COLUMN_NAME`, NULL)",
+            "`COLUMN_NAME`",
+        )
+        .replace(
+            "REPLACE(REPLACE(`_sprig_fe`, 'lcase(', 'lower('), 'ucase(', 'upper(')",
+            "NULL",
+        );
     if let Some(a) = owned.find(" LEFT JOIN (SELECT `TABLE_NAME` AS `_sprig_ft`") {
         let tail_marker = "AND `_sprig_fc` = `COLUMN_NAME`";
         if let Some(b) = owned[a..].find(tail_marker) {
             owned.replace_range(a..a + b + tail_marker.len(), "");
+        }
+    }
+    // The MySQL port's `COLUMN_TYPE`, `COLUMN_DEFAULT` and `EXTRA` forms
+    // are computed with the rows (the `_sprig_my_` columns): no regular
+    // expression runs for `SHOW COLUMNS` or the MySQL-shaped `COLUMNS`.
+    if owned.contains("REGEXP") {
+        for nbe in [false, true] {
+            let lit = |v: &str| sprig_sql::names::rewrite::sql_string(v, nbe);
+            let [ty, def, extra] = sprig_sql::compat::schema::mysql_column_exprs(&lit);
+            owned = owned
+                .replace(&ty, "`_sprig_my_type`")
+                .replace(&def, "`_sprig_my_default`")
+                .replace(&extra, "`_sprig_my_extra`");
         }
     }
     let sql = owned.as_str();
@@ -518,7 +1054,9 @@ fn simplify(sql: &str) -> String {
                 let mut k = j + 1 + 7 + close + 1;
                 let tail = &sql[k..];
                 if tail.len() > 9 && tail[..9].eq_ignore_ascii_case(" COLLATE ") {
-                    let name_len = tail[9..].find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(tail.len() - 9);
+                    let name_len = tail[9..]
+                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .unwrap_or(tail.len() - 9);
                     k += 9 + name_len;
                 }
                 out.push_str(lit);
@@ -526,7 +1064,9 @@ fn simplify(sql: &str) -> String {
                 continue;
             }
         }
-        if rest.starts_with(" AND (`") && let Some(p) = rest.find(") NOT IN (SELECT ") {
+        if rest.starts_with(" AND (`")
+            && let Some(p) = rest.find(") NOT IN (SELECT ")
+        {
             let head = &rest[6..p];
             if head.starts_with('`') && !head.contains('(') {
                 // Skip to the parenthesis that closes the subquery.
@@ -560,8 +1100,102 @@ pub(crate) fn reads_tables(sql: &str) -> bool {
     l.contains("information_schema")
         && TABLES.iter().any(|t| {
             let t = t.to_ascii_lowercase();
-            l.contains(&format!("information_schema.{t}")) || l.contains(&format!("information_schema`.`{t}`"))
+            l.contains(&format!("information_schema.{t}"))
+                || l.contains(&format!("information_schema`.`{t}`"))
         })
+}
+
+/// The name of a column definition payload made by [`coldef`].
+fn coldef_name(d: &[u8]) -> Option<String> {
+    let mut i = 0;
+    let mut field = || -> Option<&[u8]> {
+        let n = usize::from(*d.get(i)?);
+        if n >= 0xfb {
+            return None;
+        }
+        let v = d.get(i + 1..i + 1 + n)?;
+        i += 1 + n;
+        Some(v)
+    };
+    for _ in 0..4 {
+        field()?;
+    }
+    field().map(|n| String::from_utf8_lossy(n).into_owned())
+}
+
+/// The rows of a `SHOW` answer that `filter` (`WHERE ...` over the
+/// answer's column names, as the server takes it) keeps, run on the
+/// planner over the answer as a table of strings. `None`: the planner
+/// can't run the condition (the backend's answer stands, as before).
+pub(crate) fn filter_answer(answer: Answer, filter: &str) -> Option<Answer> {
+    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::parser::Parser;
+    let names: Vec<String> = answer
+        .defs
+        .iter()
+        .map(|d| coldef_name(d))
+        .collect::<Option<_>>()?;
+    let ci = collation_named("utf8mb4_general_ci")?;
+    let table = "_sprig_show";
+    let columns = names
+        .iter()
+        .map(|n| {
+            ColumnDef::new(
+                n,
+                ColType::VarChar {
+                    chars: 16_383,
+                    collation: ci,
+                },
+            )
+        })
+        .collect();
+    let mut db = MemDb::new("information_schema");
+    db.create_table(TableDef {
+        schema: "information_schema".into(),
+        name: table.into(),
+        columns,
+        primary: None,
+        indexes: Vec::new(),
+    });
+    for row in &answer.rows {
+        let vals = sprig_proto_mysql::resultset::decode_text_row(row, names.len()).ok()?;
+        let datums = vals
+            .iter()
+            .map(|v| match v {
+                Some(b) => Datum::Str(Bytes::copy_from_slice(b)),
+                None => Datum::Null,
+            })
+            .collect();
+        db.insert(table, datums).ok()?;
+    }
+    let sql = format!("SELECT * FROM information_schema.`{table}` {filter}");
+    let stmts = Parser::parse_sql(&MySqlDialect {}, &sql).ok()?;
+    let [stmt] = stmts.as_slice() else {
+        return None;
+    };
+    let session = sprig_exec::Session::new(sprig_exec::Persona::MariaDb);
+    let storage: Arc<dyn sprig_plan::access::Storage> = Arc::new(db.clone());
+    let planner = sprig_plan::Planner::new(&db, storage, &session);
+    let mut plan = planner.plan(stmt, &[]).ok()?;
+    let mut ctx = sprig_exec::Ctx::with_params(&session, &[]);
+    let mut rows = Vec::new();
+    while let Some(r) = plan.source.next(&mut ctx).ok()? {
+        let vals: Vec<Option<Bytes>> = r
+            .iter()
+            .map(|v| match v {
+                Datum::Str(b) | Datum::Bytes(b) => Some(b.clone()),
+                _ => None,
+            })
+            .collect();
+        rows.push(sprig_proto_mysql::resultset::encode_text_row(
+            vals.iter().map(|v| v.as_deref()),
+        ));
+    }
+    Some(Answer {
+        defs: answer.defs,
+        rows,
+        no_index: answer.no_index,
+    })
 }
 
 /// What the engine needs to answer: the tables' definitions per database
@@ -585,13 +1219,16 @@ pub(crate) fn answer(sql: &str, src: &Source<'_>, mysql: bool) -> Option<Answer>
     }
 }
 
+#[allow(clippy::too_many_lines)] // build, plan, run, describe: one pass
 fn try_answer(sql: &str, src: &Source<'_>, mysql: bool) -> Result<Answer, String> {
     use sqlparser::dialect::MySqlDialect;
     use sqlparser::parser::Parser;
     let simplified = simplify(sql);
     let sql = simplified.as_str();
     let stmts = Parser::parse_sql(&MySqlDialect {}, sql).map_err(|e| format!("parse: {e}"))?;
-    let [stmt] = stmts.as_slice() else { return Err("not one statement".into()) };
+    let [stmt] = stmts.as_slice() else {
+        return Err("not one statement".into());
+    };
     let mut db = MemDb::new("information_schema");
     for t in TABLES {
         db.create_table(plan_def(t));
@@ -600,26 +1237,42 @@ fn try_answer(sql: &str, src: &Source<'_>, mysql: bool) -> Result<Answer, String
         if !src.eng.dbs.contains(&dbid) {
             continue;
         }
-        let mut objs: Vec<(&String, &sprig_common::ids::ObjectId)> =
-            src.eng.by_name.iter().filter(|((d, _), _)| *d == dbid).map(|((_, n), o)| (n, o)).collect();
+        let mut objs: Vec<(&String, &sprig_common::ids::ObjectId)> = src
+            .eng
+            .by_name
+            .iter()
+            .filter(|((d, _), _)| *d == dbid)
+            .map(|((_, n), o)| (n, o))
+            .collect();
         objs.sort();
         for (name, o) in objs {
             if name.starts_with("__sprig_") {
                 continue;
             }
-            let Some(text) = src.eng.texts.get(o) else { continue };
-            let Ok(def) = define::parse_stored(text) else { continue };
+            let Some(text) = src.eng.texts.get(o) else {
+                continue;
+            };
+            let Ok(def) = define::parse_stored(text) else {
+                continue;
+            };
             add_table(&mut db, &schema, &def, src.counters.get(&o.0).copied());
         }
     }
-    let persona = if mysql { sprig_exec::Persona::MySql } else { sprig_exec::Persona::MariaDb };
-    let session = sprig_exec::Session::new(persona);
+    // The name layer wrote the statement for MariaDB, whichever port the
+    // client is on: it runs under MariaDB's rules.
+    let session = sprig_exec::Session::new(sprig_exec::Persona::MariaDb);
     let storage: Arc<dyn sprig_plan::access::Storage> = Arc::new(db.clone());
     let planner = sprig_plan::Planner::new(&db, storage, &session);
-    let mut plan = planner.plan(stmt, &[]).map_err(|e| format!("plan: {}", e.message))?;
+    let mut plan = planner
+        .plan(stmt, &[])
+        .map_err(|e| format!("plan: {}", e.message))?;
     let mut ctx = sprig_exec::Ctx::with_params(&session, &[]);
     let mut rows = Vec::new();
-    while let Some(r) = plan.source.next(&mut ctx).map_err(|e| format!("run: {}", e.message))? {
+    while let Some(r) = plan
+        .source
+        .next(&mut ctx)
+        .map_err(|e| format!("run: {}", e.message))?
+    {
         rows.push(r);
     }
     // Every result column must be one of the tables' own columns.
@@ -639,7 +1292,36 @@ fn try_answer(sql: &str, src: &Source<'_>, mysql: bool) -> Result<Answer, String
     for c in &plan.columns {
         match cols_of(table).find(|x| x.1.eq_ignore_ascii_case(&c.name)) {
             Some(&(_, org, cs, len, ty, flags)) => {
-                defs.push(coldef("information_schema", table, &c.name, org, cs, len, ty, flags, 0));
+                defs.push(coldef(
+                    "information_schema",
+                    table,
+                    &c.name,
+                    org,
+                    cs,
+                    len,
+                    ty,
+                    flags,
+                    0,
+                ));
+            }
+            // A number the query computes (`COUNT(*)`, an `ORDINAL_POSITION`
+            // sum): described by its type, as the servers do.
+            None if c.ty.kind != sprig_exec::types::Kind::Str
+                && c.ty.kind != sprig_exec::types::Kind::Null =>
+            {
+                let results = crate::engine::meta::Results { cs: None, mysql };
+                let d = crate::engine::general::results::value_def(&c.name, &c.ty, results);
+                defs.push(coldef(
+                    "",
+                    "",
+                    &c.name,
+                    "",
+                    d.charset,
+                    d.length,
+                    d.col_type,
+                    d.flags & !0x0080,
+                    d.decimals,
+                ));
             }
             // A column the name layer computes (the MySQL port's
             // `IS_VISIBLE`, `EXPRESSION`): a string of the derived table.
@@ -655,12 +1337,21 @@ fn try_answer(sql: &str, src: &Source<'_>, mysql: bool) -> Result<Answer, String
                 Datum::Str(b) | Datum::Bytes(b) => Some(b.clone()),
                 Datum::UInt(n) => Some(Bytes::from(n.to_string())),
                 Datum::Int(n) => Some(Bytes::from(n.to_string())),
+                // A number merged from signed and unsigned branches (an
+                // inherited table's `CASE ... END AS ORDINAL_POSITION`).
+                Datum::Decimal(d) => Some(Bytes::from(d.to_string())),
                 other => Some(Bytes::from(format!("{other:?}"))),
             })
             .collect();
-        out.push(sprig_proto_mysql::resultset::encode_text_row(vals.iter().map(|v| v.as_deref())));
+        out.push(sprig_proto_mysql::resultset::encode_text_row(
+            vals.iter().map(|v| v.as_deref()),
+        ));
     }
-    Ok(Answer { defs, rows: out, no_index: true })
+    Ok(Answer {
+        defs,
+        rows: out,
+        no_index: true,
+    })
 }
 
 #[cfg(test)]
@@ -681,10 +1372,50 @@ mod tests {
         eng.by_name.insert((DbId(3), "k2".into()), ObjectId(20));
         eng.texts.insert(ObjectId(20), Arc::from(text));
         let counters = HashMap::new();
-        let src = Source { eng: &eng, tenant: 7, counters: &counters };
+        let src = Source {
+            eng: &eng,
+            tenant: 7,
+            counters: &counters,
+        };
         let sql = "SELECT CONSTRAINT_NAME, CONSTRAINT_TYPE FROM (SELECT `CONSTRAINT_CATALOG`, 'cc_ddl' AS `CONSTRAINT_SCHEMA`, `CONSTRAINT_NAME`, 'cc_ddl' AS `TABLE_SCHEMA`, `TABLE_NAME`, `CONSTRAINT_TYPE` FROM information_schema.TABLE_CONSTRAINTS WHERE `TABLE_SCHEMA` = 't7_d3_g1_s1' AND `TABLE_NAME` = 'k2' AND LEFT(`TABLE_NAME`, 8) <> '__sprig_') AS `TABLE_CONSTRAINTS` WHERE table_schema = 'cc_ddl' AND table_name = 'k2' ORDER BY CONSTRAINT_NAME";
         let a = answer(sql, &src, false).expect("answered");
         assert_eq!(a.rows.len(), 2);
+    }
+
+    #[test]
+    fn ordinal_positions_are_numbers() {
+        let text = "CREATE TABLE `k2` (\n  `id` int(11) NOT NULL,\n  `a` int(11) DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci";
+        let mut eng = EngineCatalog::default();
+        eng.dbs.insert(DbId(3));
+        eng.by_name.insert((DbId(3), "k2".into()), ObjectId(20));
+        eng.texts.insert(ObjectId(20), Arc::from(text));
+        eng.dbs.insert(DbId(4));
+        eng.by_name.insert((DbId(4), "k2".into()), ObjectId(21));
+        eng.texts.insert(ObjectId(21), Arc::from(text));
+        let counters = HashMap::new();
+        let src = Source {
+            eng: &eng,
+            tenant: 7,
+            counters: &counters,
+        };
+        let branch = |s: &str, d: &str| {
+            format!(
+                "SELECT `TABLE_CATALOG`, '{s}' AS `TABLE_SCHEMA`, `TABLE_NAME`, `COLUMN_NAME`, `ORDINAL_POSITION` FROM information_schema.COLUMNS WHERE `TABLE_SCHEMA` = '{d}' AND LEFT(`TABLE_NAME`, 8) <> '__sprig_' AND NOT (LEFT(`COLUMN_NAME`, 7) = '_sprig_' OR `COLUMN_NAME` = 'my_row_id')"
+            )
+        };
+        let sql = format!(
+            "SELECT COLUMN_NAME, ORDINAL_POSITION FROM (SELECT * FROM ({} UNION ALL {}) AS `COLUMNS`) AS `COLUMNS` WHERE table_schema = 'cc_ddl' AND table_name = 'k2'",
+            branch("cc_ddl", "t7_d3_g1_s1"),
+            branch("other", "t7_d4_g1_s1")
+        );
+        let sql = sql.as_str();
+        let a = answer(sql, &src, false).expect("answered");
+        let rows: Vec<String> = a
+            .rows
+            .iter()
+            .map(|r| String::from_utf8_lossy(r).into_owned())
+            .collect();
+        assert!(rows[0].ends_with("\u{1}1"), "{rows:?}");
     }
 
     #[test]
@@ -695,7 +1426,11 @@ mod tests {
         eng.by_name.insert((DbId(37), "v1".into()), ObjectId(20));
         eng.texts.insert(ObjectId(20), Arc::from(text));
         let counters = HashMap::new();
-        let src = Source { eng: &eng, tenant: 61_306_000_000, counters: &counters };
+        let src = Source {
+            eng: &eng,
+            tenant: 61_306_000_000,
+            counters: &counters,
+        };
         if let Ok(sql) = std::fs::read_to_string("../../target/agent-c-catalog/obs/stat.sql") {
             let a = super::try_answer(&sql, &src, true).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(a.rows.len(), 2);
@@ -708,8 +1443,149 @@ mod tests {
     #[test]
     fn the_name_layers_forms_are_simplified() {
         assert_eq!(
-            super::simplify("SELECT CONVERT('cc_ddl' USING utf8mb3) COLLATE utf8mb3_general_ci AS `TABLE_SCHEMA` FROM x WHERE a = 1 AND (`TABLE_NAME`, `INDEX_NAME`) NOT IN (SELECT `TABLE_NAME`, `INDEX_NAME` FROM y WHERE c IN ('a)', 'b')) ORDER BY 1"),
+            super::simplify(
+                "SELECT CONVERT('cc_ddl' USING utf8mb3) COLLATE utf8mb3_general_ci AS `TABLE_SCHEMA` FROM x WHERE a = 1 AND (`TABLE_NAME`, `INDEX_NAME`) NOT IN (SELECT `TABLE_NAME`, `INDEX_NAME` FROM y WHERE c IN ('a)', 'b')) ORDER BY 1"
+            ),
             "SELECT 'cc_ddl' AS `TABLE_SCHEMA` FROM x WHERE a = 1 ORDER BY 1"
         );
+    }
+
+    /// The MySQL port's `SHOW COLUMNS` query runs without a regular
+    /// expression: the name layer's three expressions become the computed
+    /// columns, for either escape mode.
+    #[test]
+    fn show_columns_needs_no_regular_expression() {
+        for nbe in [false, true] {
+            let lit = |v: &str| sprig_sql::names::rewrite::sql_string(v, nbe);
+            for full in [false, true] {
+                let sql = sprig_sql::compat::schema::show_columns_sql(
+                    "t7_d3_g1_s1",
+                    "k2",
+                    full,
+                    None,
+                    None,
+                    &lit,
+                );
+                let out = super::simplify(std::str::from_utf8(&sql).unwrap());
+                assert!(!out.contains("REGEXP"), "{out}");
+                assert!(out.contains("`_sprig_my_type`"), "{out}");
+            }
+        }
+    }
+
+    #[test]
+    fn mysql_forms_of_three_columns() {
+        use super::{mysql_default, mysql_extra, mysql_type};
+        assert_eq!(mysql_type("int(11) unsigned"), "int unsigned");
+        assert_eq!(mysql_type("tinyint(1)"), "tinyint(1)");
+        assert_eq!(mysql_type("tinyint(4)"), "tinyint");
+        assert_eq!(mysql_type("year(4)"), "year");
+        assert_eq!(
+            mysql_type("smallint(5) unsigned zerofill"),
+            "smallint(5) unsigned zerofill"
+        );
+        assert_eq!(mysql_type("decimal(10,2)"), "decimal(10,2)");
+        assert_eq!(mysql_type("varchar(20)"), "varchar(20)");
+        assert_eq!(mysql_default("NULL"), None);
+        assert_eq!(mysql_default("'it''s\\\\x'").as_deref(), Some("it's\\x"));
+        assert_eq!(mysql_default("'a\\nb'").as_deref(), Some("a\nb"));
+        assert_eq!(
+            mysql_default("current_timestamp()").as_deref(),
+            Some("CURRENT_TIMESTAMP")
+        );
+        assert_eq!(
+            mysql_default("current_timestamp(3)").as_deref(),
+            Some("CURRENT_TIMESTAMP(3)")
+        );
+        assert_eq!(
+            mysql_default("localtimestamp(2)").as_deref(),
+            Some("now(2)")
+        );
+        assert_eq!(mysql_default("-5").as_deref(), Some("-5"));
+        assert_eq!(mysql_extra(Some("-5"), ""), "");
+        assert_eq!(mysql_extra(Some("1.5e3"), ""), "");
+        assert_eq!(mysql_extra(Some("b'101'"), ""), "");
+        assert_eq!(mysql_extra(Some("'x'"), ""), "");
+        assert_eq!(mysql_extra(None, "auto_increment"), "auto_increment");
+        assert_eq!(
+            mysql_extra(
+                Some("current_timestamp(3)"),
+                "on update current_timestamp(3)"
+            ),
+            "DEFAULT_GENERATED on update CURRENT_TIMESTAMP(3)"
+        );
+        assert_eq!(
+            mysql_extra(Some("current_timestamp()"), "on update current_timestamp()"),
+            "DEFAULT_GENERATED on update CURRENT_TIMESTAMP"
+        );
+        assert_eq!(mysql_extra(Some("(`a` + 1)"), ""), "DEFAULT_GENERATED");
+    }
+
+    /// `SHOW ... WHERE`: the condition runs over the answer's columns.
+    #[test]
+    fn a_show_answer_is_filtered_by_its_where() {
+        use super::super::show::{Answer, coldef};
+        use sprig_proto_mysql::resultset::{decode_text_row, encode_text_row};
+        let answer = Answer {
+            defs: vec![
+                coldef(
+                    "information_schema",
+                    "COLUMNS",
+                    "Field",
+                    "COLUMN_NAME",
+                    224,
+                    256,
+                    0xfd,
+                    1,
+                    0,
+                ),
+                coldef(
+                    "information_schema",
+                    "COLUMNS",
+                    "Key",
+                    "COLUMN_KEY",
+                    224,
+                    12,
+                    0xfd,
+                    1,
+                    0,
+                ),
+                coldef(
+                    "information_schema",
+                    "COLUMNS",
+                    "Default",
+                    "COLUMN_DEFAULT",
+                    224,
+                    12,
+                    0xfd,
+                    0,
+                    0,
+                ),
+            ],
+            rows: vec![
+                encode_text_row([Some(&b"id"[..]), Some(&b"PRI"[..]), None]),
+                encode_text_row([Some(&b"a"[..]), Some(&b""[..]), Some(&b"7"[..])]),
+                encode_text_row([Some(&b"b"[..]), Some(&b"MUL"[..]), None]),
+            ],
+            no_index: true,
+        };
+        let out = super::filter_answer(answer, "WHERE `Key` <> '' AND `default` IS NULL").unwrap();
+        let names: Vec<String> = out
+            .rows
+            .iter()
+            .map(|r| {
+                String::from_utf8_lossy(decode_text_row(r, 3).unwrap()[0].unwrap()).into_owned()
+            })
+            .collect();
+        assert_eq!(names, ["id", "b"]);
+        assert_eq!(out.defs.len(), 3);
+    }
+
+    #[test]
+    fn defaults_are_quoted_as_mariadb_quotes_them() {
+        assert_eq!(super::mariadb_quoted("'it\\'s\\\\x'"), "'it''s\\\\x'");
+        assert_eq!(super::mariadb_quoted("'it''s'"), "'it''s'");
+        assert_eq!(super::mariadb_quoted("'a\\nb'"), "'a\\nb'");
+        assert_eq!(super::mariadb_quoted("-5"), "-5");
     }
 }

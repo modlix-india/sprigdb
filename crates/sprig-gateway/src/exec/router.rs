@@ -101,11 +101,13 @@ impl Services {
         &self,
         tenant: sprig_common::ids::TenantId,
         locator: &Arc<crate::tenant::locator::GatewayLocator>,
+        records: &Arc<dyn sprig_catalog::RecordStore>,
     ) -> Arc<ids::TenantIds> {
         let mut m = self.ids.lock().unwrap_or_else(PoisonError::into_inner);
         Arc::clone(m.entry(tenant).or_insert_with(|| {
             Arc::new(ids::TenantIds::new(
                 Arc::clone(locator),
+                Arc::clone(records),
                 tenant,
                 self.coordinator_id.clone(),
             ))
@@ -1642,7 +1644,11 @@ impl PassSession {
             .tenant
             .as_deref()
             .ok_or_else(|| SprigError::internal("no tenant"))?;
-        let tids = services(ts.services()).ids_of(ts.tenant, &ts.services().locator);
+        let tids = services(ts.services()).ids_of(
+            ts.tenant,
+            &ts.services().locator,
+            &ts.services().records,
+        );
         let var = |k: &str| {
             self.bs
                 .as_ref()

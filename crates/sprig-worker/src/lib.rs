@@ -259,6 +259,17 @@ pub async fn run(ctx: RoleContext) -> Result<()> {
         // Set below, once the gateways are known.
         gateways: None,
     };
+    // The auth modules' rows (sinks check row security) and modules'
+    // rows on the catalog version (types, for the copy worker) are
+    // catalog records on the engine node, reached through its peer
+    // service. Set before anything reads them.
+    sinks::set_catalog_records(
+        dc_logic.clone(),
+        cfg.tls
+            .as_ref()
+            .map(sprig_catalog::records::remote::PeerPems::from_config)
+            .transpose()?,
+    );
     // The copy worker: one job per tenant tree, through the shared
     // reader.
     let inherit_env = Arc::new(

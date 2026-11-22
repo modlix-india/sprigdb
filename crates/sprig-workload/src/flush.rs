@@ -33,15 +33,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use sprig_catalog::migrate::MigrateOpts;
-use sprig_catalog::{CatalogLocator, Migrator};
 use sprig_common::ids::TenantId;
 use sprig_common::time::Clock;
 use sprig_common::{CancellationToken, Result, SprigError};
 
 use crate::recorder::{FlushRow, NewFingerprint, Recorder};
 use crate::samples::{SampleOutbox, SealedSample};
-use crate::store::{WORKLOAD_MODULE, WorkloadTables, map_err};
+use crate::store::{BATCH, WorkloadTables};
 
 /// Whether a tenant is gone (deleted): its rows can never be written.
 #[async_trait]
@@ -370,9 +368,7 @@ fn batch_rows(b: &TenantBatch) -> u64 {
 
 /// Writes flushes to each tenant's catalog writer.
 pub struct CatalogTarget {
-    locator: Arc<dyn CatalogLocator>,
-    migrated: Mutex<HashSet<TenantId>>,
-    applied_by: String,
+    records: Arc<dyn sprig_catalog::RecordStore>,
 }
 
 impl std::fmt::Debug for CatalogTarget {
@@ -382,51 +378,33 @@ impl std::fmt::Debug for CatalogTarget {
 }
 
 impl CatalogTarget {
-    /// A target over `locator`; `applied_by` names this process in the
-    /// migration history.
+    /// A target over the tenants' catalog records in `records`.
     #[must_use]
-    pub fn new(locator: Arc<dyn CatalogLocator>, applied_by: impl Into<String>) -> Self {
-        Self {
-            locator,
-            migrated: Mutex::new(HashSet::new()),
-            applied_by: applied_by.into(),
-        }
+    pub fn new(records: Arc<dyn sprig_catalog::RecordStore>) -> Self {
+        Self { records }
     }
-}
-
-/// Migrates the `workload` module on `conn`'s catalog `schema`.
-///
-/// # Errors
-/// The migrator's errors.
-pub async fn migrate(conn: &mut mysql_async::Conn, schema: &str, applied_by: &str) -> Result<()> {
-    Migrator::new(&[WORKLOAD_MODULE])?
-        .run(
-            conn,
-            schema,
-            &MigrateOpts {
-                applied_by: applied_by.to_owned(),
-                ..MigrateOpts::default()
-            },
-        )
-        .await?;
-    Ok(())
 }
 
 #[async_trait]
 impl FlushTarget for CatalogTarget {
     async fn write(&self, tenant: TenantId, gateway_id: u32, batch: &TenantBatch) -> Result<()> {
-        let ep = self.locator.writer(tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(map_err)?;
-        let schema = ep.store.schema().to_owned();
-        if !lock(&self.migrated).contains(&tenant) {
-            migrate(&mut conn, &schema, &self.applied_by).await?;
-            lock(&self.migrated).insert(tenant);
+        // One short engine transaction per chunk of fingerprints, stats and
+        // samples, so a large flush doesn't hold one huge transaction.
+        for chunk in batch.fingerprints.chunks(BATCH) {
+            let mut tx = self.records.begin(tenant).await?;
+            WorkloadTables::insert_fingerprints(&mut *tx, chunk).await?;
+            tx.commit().await?;
         }
-        let t = WorkloadTables::new(schema);
-        t.insert_fingerprints(&mut conn, &batch.fingerprints)
-            .await?;
-        t.replace_stats(&mut conn, gateway_id, &batch.stats).await?;
-        t.replace_samples(&mut conn, &batch.samples).await?;
+        for chunk in batch.stats.chunks(BATCH) {
+            let mut tx = self.records.begin(tenant).await?;
+            WorkloadTables::replace_stats(&mut *tx, gateway_id, chunk).await?;
+            tx.commit().await?;
+        }
+        for chunk in batch.samples.chunks(BATCH / 5) {
+            let mut tx = self.records.begin(tenant).await?;
+            WorkloadTables::replace_samples(&mut *tx, chunk).await?;
+            tx.commit().await?;
+        }
         Ok(())
     }
 }

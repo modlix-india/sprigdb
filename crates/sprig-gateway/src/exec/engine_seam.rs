@@ -73,9 +73,15 @@ use crate::pipeline::{
     EndOfRows, ExecCtx, ExecSummary, PreparedMeta, ResultSink, RowFormat, RowValues, StmtRef, Wire,
 };
 
+// The diagnostics area of statements answered in the gateway.
+pub(super) mod diag;
+// Plain statements that skip the gateway's text passes.
+mod fast;
 // General SELECTs (joins, grouping, subqueries) through the planner.
 mod general;
 mod show;
+// Multi-table and subquery UPDATE and DELETE.
+mod write;
 
 /// What the session's variables say, as the engine path needs it. Worked
 /// out once and kept while only prepared engine statements run (they
@@ -135,6 +141,24 @@ pub(super) struct EngineState {
     /// `lock_wait_timeout` as the session last set it, in seconds
     /// (`None`: the default).
     ddl_wait: Option<u64>,
+    /// Text statements bound to one engine table, by text and context.
+    text_plans: crate::engine::plancache::TextPlans,
+    /// Statement shapes that skip the gateway's text passes (`fast`).
+    fast_shapes: crate::engine::plancache::FastShapes,
+    /// The shape the statement pipeline found for the text it runs next.
+    fast: Option<sprig_sql::compat::fastpath::FastStmt>,
+    /// A shape not known yet, met by the running statement: learnt if the
+    /// statement reaches the engine unchanged (with the catalog version).
+    fast_candidate: Option<(u64, crate::engine::plancache::Shape)>,
+    /// The candidate, once the passes left the statement unchanged.
+    fast_learn: Option<(u64, crate::engine::plancache::Shape)>,
+    /// The diagnostics area's bookkeeping (`SHOW WARNINGS`).
+    pub(super) diag: diag::DiagState,
+    /// The running statement's text as the client sent it, before the
+    /// gateway's text passes.
+    pub(super) entry: Option<Bytes>,
+    /// 3306: the table a 1062 of the running statement names (`'t.key'`).
+    pub(super) dup_table: Option<String>,
 }
 
 impl EngineState {
@@ -155,6 +179,8 @@ enum Bound {
     /// Not the engine's; `tables`: it may read or write tables (of
     /// MariaDB-backed databases).
     Elsewhere { tables: bool },
+    /// An `UPDATE` or `DELETE` through a join or a subquery.
+    Write(Box<crate::engine::multiwrite::MultiWrite>),
 }
 
 /// A prepared statement on an engine table.
@@ -185,6 +211,36 @@ fn opaque(stmt: &Statement) -> bool {
             | Statement::Prepare { .. }
             | Statement::Execute { .. }
     )
+}
+
+/// MySQL 8.4 takes a table value constructor only as `VALUES ROW(...)`:
+/// where a query's `VALUES` is followed by a bare `(`, the 1064 it
+/// answers (near that `(`).
+fn bare_values(text: &str) -> Option<SprigError> {
+    use sprig_sql::lex::{LexOptions, TokenKind, lex};
+    let toks: Vec<_> = lex(text.as_bytes(), &LexOptions::mysql84())
+        .ok()?
+        .into_iter()
+        .filter(|t| !t.kind.is_trivia())
+        .collect();
+    let b = text.as_bytes();
+    let at = toks.windows(2).find(|w| {
+        w[0].kind == TokenKind::Word
+            && w[0].bytes(b).eq_ignore_ascii_case(b"VALUES")
+            && w[1].kind == TokenKind::Punct
+            && w[1].bytes(b) == b"("
+    })?[1]
+        .start as usize;
+    let rest = text[at..].trim_end().trim_end_matches(';').trim_end();
+    let shown: String = rest.chars().take(80).collect();
+    Some(SprigError::standard(
+        1064,
+        *b"42000",
+        format!(
+            "You have an error in your SQL syntax; check the manual that corresponds to your \
+             MySQL server version for the right syntax to use near '{shown}' at line 1"
+        ),
+    ))
 }
 
 /// Statements that read or write rows: one of these that names an engine
@@ -369,11 +425,14 @@ impl PassSession {
                     results_set,
                     sv.login_charset.is_some(),
                 ),
-                env: crate::engine::assign::Env::from_vars(
-                    persona == sprig_proto_mysql::Persona::MySql84,
-                    get("sql_mode"),
-                    get("time_zone"),
-                ),
+                env: crate::engine::assign::Env {
+                    no_fk_checks: off(get("foreign_key_checks")),
+                    ..crate::engine::assign::Env::from_vars(
+                        persona == sprig_proto_mysql::Persona::MySql84,
+                        get("sql_mode"),
+                        get("time_zone"),
+                    )
+                },
                 time_limit: match persona {
                     // Seconds, with a fraction; 0 is no limit.
                     sprig_proto_mysql::Persona::MariaDb => get("max_statement_time")
@@ -443,6 +502,7 @@ impl PassSession {
     }
 
     /// Binds `text`: a plan when it is one engine table's statement.
+    #[allow(clippy::too_many_lines)] // one pass over the binders, in order
     fn engine_bind(
         &self,
         cat: &TenantCatalog,
@@ -470,26 +530,6 @@ impl PassSession {
         let parsed = plain
             .and_then(|t| Parser::parse_sql(&MySqlDialect {}, t).ok())
             .filter(|v| v.len() == 1);
-        let Some(stmt) = parsed.and_then(|mut v| v.pop()) else {
-            // Unparsed: a statement that may touch rows of an engine
-            // database is refused, never sent to its empty MariaDB copy.
-            return if row_statement(text) && mentions() {
-                Err(not_on_engine("a statement the engine can't parse"))
-            } else {
-                Ok(Bound::Elsewhere {
-                    tables: row_statement(text),
-                })
-            };
-        };
-        if opaque(&stmt) {
-            return if mentions() {
-                Err(not_on_engine(
-                    "CALL, LOAD DATA, MERGE, or PREPARE and EXECUTE as statements",
-                ))
-            } else {
-                Ok(Bound::Elsewhere { tables: true })
-            };
-        }
         let names = CatalogNames {
             cat,
             eng,
@@ -504,20 +544,86 @@ impl PassSession {
             current,
             backslash: !self.lex_opts().0.no_backslash_escapes,
         };
+        // A write through joins or subqueries (`UPDATE a, b SET ...`
+        // isn't parsed as one statement).
+        let write = |cx: &BindCtx<'_>| -> Result<Option<Bound>> {
+            let Some(t) = whole else {
+                return Ok(None);
+            };
+            let mysql = self.persona == sprig_proto_mysql::Persona::MySql84;
+            Ok(
+                crate::engine::multiwrite::bind(cx, t, self.lex_opts().0, mysql)?
+                    .map(|w| Bound::Write(Box::new(w))),
+            )
+        };
+        let Some(stmt) = parsed.and_then(|mut v| v.pop()) else {
+            if row_statement(text)
+                && mentions()
+                && let Some(b) = write(&cx)?
+            {
+                return Ok(b);
+            }
+            // Unparsed: a statement that may touch rows of an engine
+            // database is refused, never sent to its empty MariaDB copy.
+            return if row_statement(text) && mentions() {
+                Err(not_on_engine("a statement the engine can't parse"))
+            } else {
+                Ok(Bound::Elsewhere {
+                    tables: row_statement(text),
+                })
+            };
+        };
+        if self.persona == sprig_proto_mysql::Persona::MySql84
+            && matches!(stmt, Statement::Query(_))
+            && let Some(e) = whole.and_then(bare_values)
+        {
+            return Err(e);
+        }
+        if opaque(&stmt) {
+            return if mentions() {
+                Err(not_on_engine(
+                    "CALL, LOAD DATA, MERGE, or PREPARE and EXECUTE as statements",
+                ))
+            } else {
+                Ok(Bound::Elsewhere { tables: true })
+            };
+        }
         match plan::bind(&cx, &stmt) {
-            Ok(Some(mut plan)) => {
+            Ok(Some(mut bound)) => {
                 if let Some(clause) = locking {
-                    plan.lock = Some(self.engine_locking(&plan, &clause, whole.unwrap_or(""))?);
+                    bound.lock = Some(self.engine_locking(&bound, &clause, whole.unwrap_or(""))?);
                 }
-                return Ok(Bound::Engine(Box::new(plan)));
+                return Ok(Bound::Engine(Box::new(bound)));
             }
             Ok(None) => {}
             // A SELECT outside the single-table binder's shapes: the
             // planner's, below.
             Err(e) if crate::engine::general::takes(&stmt, &e) => {}
+            // An UPDATE or DELETE outside them: a join, a subquery, ORDER BY.
+            Err(e)
+                if matches!(stmt, Statement::Update(_) | Statement::Delete(_))
+                    && e.code() == Some(sprig_common::SprigCode::NotOnEngine) =>
+            {
+                return match write(&cx)? {
+                    Some(b) => Ok(b),
+                    None => Err(e),
+                };
+            }
             Err(e) => return Err(e),
         }
-        if let Some(g) = crate::engine::general::bind(&cx, &stmt, plain, locking.is_some())? {
+        let general_lock = match &locking {
+            Some(clause) => Some(self.engine_general_locking(clause, whole.unwrap_or(""))?),
+            None => None,
+        };
+        if let Some(g) = crate::engine::general::bind(&cx, &stmt, plain, general_lock)? {
+            return Ok(Bound::General(Box::new(g)));
+        }
+        // The MySQL port: a set operation or `VALUES` without tables is
+        // planned here (MariaDB, which would run it, types it its way).
+        if self.persona == sprig_proto_mysql::Persona::MySql84
+            && locking.is_none()
+            && let Ok(Some(g)) = crate::engine::general::bind_tableless(&cx, &stmt, plain)
+        {
             return Ok(Bound::General(Box::new(g)));
         }
         // Not one engine table's statement. If it still names an engine
@@ -531,6 +637,39 @@ impl PassSession {
         Ok(Bound::Elsewhere {
             tables: row_kind(&stmt) && names_user_table(&stmt),
         })
+    }
+
+    /// The client's text `l` planned, when it starts with `VALUES` and
+    /// reads no table.
+    fn tableless_values(
+        &self,
+        cat: &TenantCatalog,
+        current: Option<DbId>,
+        l: &[u8],
+    ) -> Option<crate::engine::general::General> {
+        let t = std::str::from_utf8(l).ok()?.trim();
+        let t = t.strip_suffix(';').unwrap_or(t);
+        if !t.get(..6).is_some_and(|w| w.eq_ignore_ascii_case("VALUES")) || bare_values(t).is_some()
+        {
+            return None;
+        }
+        let eng = catalog::of(cat)?;
+        let stmt = Parser::parse_sql(&MySqlDialect {}, t).ok()?.pop()?;
+        let names = CatalogNames {
+            cat,
+            eng,
+            lower_case: self
+                .tenant
+                .as_deref()
+                .is_some_and(crate::tenant::session::TenantSession::lower_case_table_names),
+        };
+        let cx = BindCtx {
+            tenant: cat.tenant,
+            names: &names,
+            current,
+            backslash: !self.lex_opts().0.no_backslash_escapes,
+        };
+        crate::engine::general::bind_tableless(&cx, &stmt, Some(t)).ok()?
     }
 
     /// Row-level security on a write: the condition the new row versions
@@ -667,6 +806,55 @@ impl PassSession {
                     3568,
                     *b"HY000",
                     format!("Unresolved table name `{n}` in locking clause."),
+                ));
+            }
+        } else {
+            if clause.form == locking::Form::ForShare {
+                return Err(near(clause.at.lock_word));
+            }
+            if let Some(at) = clause.at.of {
+                return Err(near(at));
+            }
+        }
+        Ok(plan::RowLock {
+            exclusive: clause.exclusive(),
+            wait: clause.wait,
+        })
+    }
+
+    /// The lock a general `SELECT`'s locking clause asks for, with the
+    /// same syntax errors per port as [`Self::engine_locking`]; `OF` (a
+    /// subset of the tables) isn't served for a general `SELECT`.
+    fn engine_general_locking(
+        &self,
+        clause: &locking::Clause,
+        text: &str,
+    ) -> Result<plan::RowLock> {
+        let mysql = self.persona == sprig_proto_mysql::Persona::MySql84;
+        let near = |at: usize| {
+            let rest = text.get(at..).unwrap_or("").trim_end();
+            let rest = rest.trim_end_matches(';').trim_end();
+            let shown: String = rest.chars().take(80).collect();
+            SprigError::standard(
+                1064,
+                *b"42000",
+                format!(
+                    "You have an error in your SQL syntax; check the manual that corresponds \
+                     to your {} server version for the right syntax to use near '{shown}' at \
+                     line 1",
+                    if mysql { "MySQL" } else { "MariaDB" }
+                ),
+            )
+        };
+        if mysql {
+            if let Some(at) = clause.at.wait
+                && clause.wait_n
+            {
+                return Err(near(at));
+            }
+            if !clause.of.is_empty() {
+                return Err(not_on_engine(
+                    "a locking clause with OF on a join, grouping, an expression or a subquery",
                 ));
             }
         } else {
@@ -992,6 +1180,7 @@ impl PassSession {
         self.eng.lock_wait = None;
         self.eng.ddl_wait = None;
         self.eng.results_set = false;
+        self.eng.diag.restart();
         self.eng.stale();
     }
 
@@ -1471,6 +1660,7 @@ impl PassSession {
         sv: &SessVars,
         out: &mut dyn ResultSink,
     ) -> Result<()> {
+        self.engine_diag(&o.conds);
         if !plan.is_select() {
             // A write that read the whole table says so, as the servers do.
             let mut ok = OkPacket::new(if o.no_index {
@@ -1525,6 +1715,18 @@ impl PassSession {
         .await
     }
 
+    /// The statement's conditions become the session's diagnostics area.
+    fn engine_diag(&mut self, conds: &[crate::engine::assign::Condition]) {
+        let (area, extra) = diag::kept(conds.iter().map(|c| {
+            let level = match c.level {
+                crate::engine::assign::Level::Note => "Note",
+                crate::engine::assign::Level::Warning => "Warning",
+            };
+            diag::warning(level, c.code, c.message.clone())
+        }));
+        self.diag_set(area, extra);
+    }
+
     /// The text-protocol hook: `Some` when the statement was the engine's
     /// (answered, or refused with its error).
     pub(super) async fn engine_text(
@@ -1539,6 +1741,11 @@ impl PassSession {
         let Some((cat, current)) = self.engine_scope() else {
             return Ok(None);
         };
+        // Once per tenant and process: what dropped tables left behind
+        // (a process stopped while it deleted them) goes.
+        if let Ok(e) = engine::engine() {
+            e.sweep_once(&cat);
+        }
         // The session's wait for definition changes of engine tables
         // (MariaDB keeps its own copy of the variable).
         if let Some(w) = control::metadata_wait(sql) {
@@ -1574,14 +1781,65 @@ impl PassSession {
         if let Some(ctl) = control::parse(sql) {
             return Box::pin(self.engine_control(cx, cat, current, ctl, more, out)).await;
         }
-        let plan = match self.engine_bind(cat, current, sql) {
+        // The MySQL port's `SHOW COLUMNS` and `SHOW INDEX`, as queries over
+        // `information_schema` with a probe of the table: the engine's
+        // `information_schema` answers them (`engine_show`), not the binder,
+        // which would refuse the probe next to MariaDB's views.
+        if let Ok(t) = std::str::from_utf8(sql)
+            && let Some(p) = show::strip_probe(t)
+            && crate::engine::infoschema::reads_tables(&p.rest)
+        {
+            return Ok(None);
+        }
+        // The MySQL port: a statement starting with `VALUES ROW` reaches
+        // here as the union of one-row SELECTs MariaDB needs; the client's
+        // text is planned instead (it reads no table), so it is described
+        // as MySQL describes a table value constructor.
+        let entry = self.eng.entry.clone();
+        if self.persona == sprig_proto_mysql::Persona::MySql84
+            && let Some(l) = entry.as_deref()
+            && let Some(g) = self.tableless_values(cat, current, l)
+        {
+            return Box::pin(
+                self.general_text(cx, cat, current, g, sql, logical, more, format, out),
+            )
+            .await
+            .map(Some);
+        }
+        // A text sent before in the same context reuses its plan.
+        let lex = self.lex_opts().0;
+        let bound = if let Some(p) = self.eng.text_plans.get(cat.version, sql, current, lex) {
+            Ok(Bound::Engine(Box::new((*p).clone())))
+        } else {
+            let b = self.engine_bind(cat, current, sql);
+            if let Ok(Bound::Engine(p)) = &b {
+                self.eng.text_plans.put(cat.version, sql, current, lex, p);
+            }
+            b
+        };
+        let plan = match bound {
             Ok(Bound::Engine(p)) => p,
             Ok(Bound::General(g)) => {
+                // A statement without tables that the planner can't plan
+                // (a function it doesn't have) goes to MariaDB as before.
+                if g.tables.is_empty() {
+                    let sv = self.engine_vars(cx);
+                    if let Err(e) = crate::engine::Engine::general_describe(&g, &sv.general)
+                        && e.code() == Some(sprig_common::SprigCode::NotOnEngine)
+                    {
+                        return Ok(None);
+                    }
+                }
                 return Box::pin(
                     self.general_text(cx, cat, current, *g, sql, logical, more, format, out),
                 )
                 .await
                 .map(Some);
+            }
+            Ok(Bound::Write(w)) => {
+                return Box::pin(self.write_text(cx, cat, *w, logical, more, out))
+                    .await
+                    .map(Some);
             }
             Ok(Bound::Elsewhere { tables }) => {
                 if !self.eng.txn.is_open() {
@@ -1652,6 +1910,7 @@ impl PassSession {
             Ok(o) => {
                 self.engine_answer(&plan, &columns, &o, format, status, &sv, out)
                     .await?;
+                self.fast_learnt(cat.version, plan.table.object);
                 if let Some(l) = logical {
                     let oc = outcome_of(&o, &plan, status, &self.target.cluster);
                     let ran = Ran {
@@ -1727,6 +1986,7 @@ impl PassSession {
 
     /// The prepare hook: `Some` (a `PREPARE_OK` summary) when the
     /// statement is the engine's.
+    #[allow(clippy::too_many_lines)] // one arm per kind of bound statement
     pub(super) async fn engine_prepare(
         &mut self,
         cx: &mut ExecCtx<'_>,
@@ -1788,6 +2048,11 @@ impl PassSession {
                 .map(Some);
             }
             Bound::Elsewhere { .. } => return Ok(None),
+            Bound::Write(w) => {
+                let results = self.engine_vars(cx).results;
+                let types = write_param_types(self.persona, &w, rewritten);
+                return Ok(Some(self.write_prepare(client, results, &types)));
+            }
         };
         let mut plan = *plan;
         plan.check = self.engine_row_check(cx, &cat, &plan).await?;
@@ -1840,8 +2105,33 @@ impl PassSession {
     /// The execute hook (the prepared fast path): `Some` when `stmt` is an
     /// engine statement. No planning: the plan from the prepare runs as it
     /// is while the catalog and the table's definition stay the same.
-    #[allow(clippy::too_many_lines)] // the checks, then one plan
+    ///
+    /// The execute's conditions (or its error) become the session's
+    /// diagnostics area; one that isn't the engine's leaves it to the
+    /// backend connection.
     pub(super) async fn engine_execute(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        stmt: StmtRef,
+        raw: &StmtExecute,
+        params: &ExecuteParams,
+        out: &mut dyn ResultSink,
+    ) -> Result<Option<ExecSummary>> {
+        let engine = self.stmts.get_mut(stmt).is_ok_and(|s| s.engine.is_some());
+        if let Some(ts) = self.tenant.as_deref_mut() {
+            ts.warnings = None;
+            self.eng.diag.bypass(!engine);
+        }
+        let r = Box::pin(self.engine_execute_in(cx, stmt, raw, params, out)).await;
+        if engine && let Err(e) = &r {
+            self.diag_set(self.diag_error(e), 0);
+        }
+        r
+    }
+
+    /// [`Self::engine_execute`] without the diagnostics.
+    #[allow(clippy::too_many_lines)] // the checks, then one plan
+    async fn engine_execute_in(
         &mut self,
         cx: &mut ExecCtx<'_>,
         stmt: StmtRef,
@@ -1973,10 +2263,15 @@ impl PassSession {
                 None => Arc::from(Vec::new()),
             }
         };
-        let pending = match &logical {
+        let mut pending = match &logical {
             Some(l) => self.wl_start_stmt_known(stmt, l, sv.current.as_deref(), sv.lex),
             None => None,
         };
+        // The engine's prepared executions are gathered per session for the
+        // recorder.
+        if let Some(p) = pending.as_mut() {
+            p.batch();
+        }
         let found_rows = cx.proto.has(Caps::FOUND_ROWS);
         let r = self
             .engine_run(cat.tenant.0, &plan, &vals, found_rows, &sv)
@@ -2271,6 +2566,7 @@ impl PassSession {
                 env: sv.env,
                 wait: std::time::Duration::from_secs(wait),
                 db,
+                conn: cx.session.id.0,
             },
             creates,
         ))
@@ -2388,4 +2684,37 @@ impl ResultSink for TxnSink<'_> {
     fn finished(&self) -> bool {
         self.inner.finished()
     }
+}
+
+/// The context types of a multi-table write's `?` parameters (see
+/// `engine::paramtype`), over every table the write reads; MySQL's port
+/// only (MariaDB types none).
+fn write_param_types(
+    persona: sprig_proto_mysql::Persona,
+    w: &crate::engine::multiwrite::MultiWrite,
+    rewritten: &Bytes,
+) -> Vec<Option<crate::engine::table::ColType>> {
+    use sqlparser::dialect::MySqlDialect;
+    if persona != sprig_proto_mysql::Persona::MySql84 {
+        return Vec::new();
+    }
+    let Ok(text) = std::str::from_utf8(rewritten) else {
+        return Vec::new();
+    };
+    let Some(stmt) = sqlparser::parser::Parser::parse_sql(&MySqlDialect {}, text)
+        .ok()
+        .and_then(|mut v| v.pop())
+    else {
+        return Vec::new();
+    };
+    let named: Vec<crate::engine::paramtype::Named<'_>> = w
+        .select
+        .tables
+        .iter()
+        .map(|t| crate::engine::paramtype::Named {
+            aliases: &t.aliases,
+            def: &t.def,
+        })
+        .collect();
+    crate::engine::paramtype::infer(&stmt, &named)
 }

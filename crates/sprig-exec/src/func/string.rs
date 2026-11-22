@@ -74,6 +74,18 @@ pub(super) fn too_big(ctx: &mut Ctx<'_>, name: &str) -> Value {
     Value::Null
 }
 
+/// The characters a string function reports when its length is known
+/// only per row: room for `max_allowed_packet` (MariaDB counts its bytes
+/// as characters).
+pub(super) fn unknown_chars(env: Env<'_>, mb: u64) -> u64 {
+    let packet = env.s.max_allowed_packet;
+    if env.maria() {
+        packet
+    } else {
+        packet / mb.max(1)
+    }
+}
+
 /// `CONCAT(s, ...)`.
 pub(crate) fn concat(args: Vec<Node>, env: Env<'_>) -> Result<Node> {
     let args = strings(args, env);
@@ -353,7 +365,9 @@ pub(super) fn char_slice(cs: Charset, b: &[u8], from: usize, count: usize) -> &[
 /// `SUBSTRING(s, pos [, len])`, `LEFT(s, n)`, `RIGHT(s, n)`.
 pub(crate) fn substring(name: &str, args: Vec<Node>, env: Env<'_>) -> Result<Node> {
     let mut it = args.into_iter();
-    let s = string_node(it.next().ok_or_else(|| SqlError::param_count(name))?, env);
+    let first = it.next().ok_or_else(|| SqlError::param_count(name))?;
+    let was_string = first.ty.kind == Kind::Str;
+    let s = string_node(first, env);
     let (p, l) = (it.next(), it.next());
     let Some(p) = p else {
         return Err(SqlError::param_count(name));
@@ -366,12 +380,54 @@ pub(crate) fn substring(name: &str, args: Vec<Node>, env: Env<'_>) -> Result<Nod
         _ => 2,
     };
     // A constant count bounds the length of LEFT and RIGHT.
-    let chars = match (kind, p.const_i64(env)?) {
+    let pos = p.const_i64(env)?;
+    let mut chars = match (kind, pos) {
         (0 | 1, Some(n)) => s.ty.len.min(u32::try_from(n.max(0)).unwrap_or(u32::MAX)),
+        // (A NULL count: no characters.)
+        (0 | 1, None) if p.ty.kind == Kind::Null => 0,
         _ => s.ty.len,
     };
-    if let Some(l) = &l {
-        l.const_i64(env)?;
+    let count = match &l {
+        Some(l) => l.const_i64(env)?,
+        None => None,
+    };
+    if kind == 2 {
+        // SUBSTRING's reported length from a constant position and count:
+        // MySQL counts characters; MariaDB starts from the string's bytes
+        // (four a character of utf8mb4) and does not cap a negative
+        // position or the count by them.
+        let maria = env.maria();
+        let base = if maria {
+            u64::from(s.ty.len)
+                * if was_string && s.ty.coll.charset() == Charset::Utf8mb4 {
+                    4
+                } else {
+                    1
+                }
+        } else {
+            u64::from(s.ty.len)
+        };
+        let null_pos = p.ty.kind == Kind::Null;
+        let mut c: u64 = match pos {
+            _ if null_pos => {
+                if maria {
+                    0
+                } else {
+                    base
+                }
+            }
+            Some(n) if n > 0 => base.saturating_sub((n - 1) as u64),
+            Some(0) => 0,
+            Some(n) => {
+                let back = n.unsigned_abs();
+                if !maria && back > base { 0 } else { back }
+            }
+            None => base,
+        };
+        if let Some(k) = count {
+            c = if k <= 0 { 0 } else { c.min(k as u64) };
+        }
+        chars = c.min(u64::from(u32::MAX / 4)) as u32;
     }
     let ty = ExprType::string(chars, s.ty.coll, loosen(s.ty.deriv)).nullable();
     Ok(Node::new(ty, "substring", move |ctx, row| {
@@ -441,9 +497,10 @@ pub(crate) fn substring(name: &str, args: Vec<Node>, env: Env<'_>) -> Result<Nod
 /// `REPLACE(s, from, to)`: every occurrence, matched byte by byte.
 pub(crate) fn replace(s: Node, from: Node, to: Node, env: Env<'_>) -> Result<Node> {
     let first_null = s.ty.kind == Kind::Null;
-    // MariaDB: with the NULL literal as the replacement, a search string
-    // that is not found gives the string back.
-    let lazy = env.maria() && to.ty.kind == Kind::Null;
+    // MariaDB reads the replacement only when the search string is found:
+    // otherwise the string comes back, even with a NULL replacement
+    // (except the NULL literal in a utf8mb4 result, which is NULL).
+    let null_literal = to.ty.kind == Kind::Null;
     let (s, from, to) = (
         string_node(s, env),
         string_node(from, env),
@@ -453,12 +510,19 @@ pub(crate) fn replace(s: Node, from: Node, to: Node, env: Env<'_>) -> Result<Nod
     let [s, from, to]: [Node; 3] = recode_checked(vec![s, from, to], dtc.coll, "replace", env)?
         .try_into()
         .map_err(|_| SqlError::param_count("replace"))?;
+    let lazy = env.maria() && !(null_literal && dtc.coll.charset() == Charset::Utf8mb4);
     if first_null && !env.maria() {
         dtc.coll = Collation::Binary;
         dtc.deriv = Derivation::Ignorable;
     }
     let binary = dtc.coll == Collation::Binary;
-    let grow = u64::from(to.ty.len.max(1));
+    // MySQL grows the length by what each replacement may add; MariaDB
+    // by the replacement's whole length.
+    let grow = if env.maria() {
+        u64::from(to.ty.len.max(1))
+    } else {
+        u64::from(to.ty.len.saturating_sub(from.ty.len).max(1))
+    };
     let ty = str_type(u64::from(s.ty.len) * grow, dtc, true);
     Ok(Node::new(ty, "replace", move |ctx, row| {
         let Some(b) = text(s.eval(ctx, row)?) else {
@@ -469,9 +533,7 @@ pub(crate) fn replace(s: Node, from: Node, to: Node, env: Env<'_>) -> Result<Nod
         };
         // MariaDB answers the string itself when the search string is
         // empty (or, see above, not in it), whatever the replacement.
-        if ctx.maria()
-            && (f.is_empty() || (lazy && !b.windows(f.len()).any(|w| w == &f[..])))
-        {
+        if ctx.maria() && (f.is_empty() || (lazy && !b.windows(f.len()).any(|w| w == &f[..]))) {
             return Ok(wrap(b, binary));
         }
         let Some(t) = text(to.eval(ctx, row)?) else {
@@ -518,10 +580,17 @@ pub(crate) fn pad(name: &'static str, s: Node, n: Node, p: Node, env: Env<'_>) -
     }
     let charset = dtc.coll.charset();
     let binary = dtc.coll == Collation::Binary;
+    // The reported length: the count; one known only per row (MySQL:
+    // also a negative one) is room for max_allowed_packet.
+    let mb = u64::from(mb_max_len(dtc.coll));
+    let unknown = unknown_chars(env, mb);
+    let null_count = n.ty.kind == Kind::Null;
     let chars = match n.const_i64(env)? {
         Some(v) if v >= 0 => v as u64,
-        Some(_) => 0,
-        None => (1 << 24) / u64::from(mb_max_len(dtc.coll)),
+        Some(_) if env.maria() => 0,
+        Some(_) => unknown,
+        None if null_count && !env.maria() => 0,
+        None => unknown,
     };
     let left = name == "lpad";
     Ok(Node::new(
@@ -700,9 +769,13 @@ pub(crate) fn locate(sub: Node, s: Node, pos: Option<Node>, env: Env<'_>) -> Res
 pub(crate) fn repeat(s: Node, n: Node, name: &'static str, env: Env<'_>) -> Result<Node> {
     let s = string_node(s, env);
     let binary = s.ty.coll == Collation::Binary;
+    let unknown = unknown_chars(env, u64::from(mb_max_len(s.ty.coll)));
+    let null_count = n.ty.kind == Kind::Null;
     let chars = match n.const_i64(env)? {
-        Some(v) => u64::from(s.ty.len).saturating_mul(v.max(0) as u64),
-        None => (1 << 24) / u64::from(mb_max_len(s.ty.coll)),
+        Some(v) if v >= 0 || env.maria() => u64::from(s.ty.len).saturating_mul(v.max(0) as u64),
+        Some(_) => unknown,
+        None if null_count && !env.maria() => 0,
+        None => unknown,
     };
     let ty = str_type(
         chars,

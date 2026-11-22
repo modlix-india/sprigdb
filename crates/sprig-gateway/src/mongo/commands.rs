@@ -332,6 +332,8 @@ async fn run_inner(c: &mut Conn, name: &str, body: &Document) -> Result<Document
         "getLog" => return Ok(doc! {"totalLinesWritten": 0, "log": [], "ok": 1.0}),
         "getCmdLineOpts" => return Ok(doc! {"argv": [], "parsed": {}, "ok": 1.0}),
         "endSessions" | "killSessions" => {
+            // Sessions holding transactions on engine databases end too.
+            super::engine::end_sessions(c, name, body).await;
             if let Ok(a) = body.get_array(name) {
                 for s in a {
                     if let Some(Bson::Binary(b)) = s.as_document().and_then(|d| d.get("id")) {
@@ -371,6 +373,10 @@ async fn run_inner(c: &mut Conn, name: &str, body: &Document) -> Result<Document
             ));
         }
         _ => {}
+    }
+    // Databases stored on the storage engine.
+    if let Some(r) = super::engine::route(c, name, body, &db).await {
+        return r;
     }
     // One-time work on the database (old metadata moving into the
     // catalog), outside any transaction.

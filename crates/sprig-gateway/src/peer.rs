@@ -22,6 +22,8 @@
 //!   ([`crate::http::changes`]).
 //! - `InheritedMembers`: a declarer's `FOR EACH TENANT` change for the
 //!   members this DC indexes ([`crate::inherited::remote`]).
+//! - `CatalogPeer`: tenants' catalog records in this node's engine, for
+//!   the controller and workers ([`crate::tenant::catalog_records`]).
 //! - `TailFeed`: the change feed of a tenant homed in this DC, for a
 //!   MongoDB change stream opened at a gateway of another DC
 //!   ([`crate::mongo::feed_relay`]).
@@ -478,6 +480,9 @@ pub async fn serve(
     }
     // Seeds of search copies on workers.
     routes = routes.add_service(crate::search::seed::SeedService::server());
+    // Tenants' catalog records in this node's engine, for the controller
+    // and workers.
+    routes = routes.add_service(crate::tenant::catalog_records::CatalogService::server());
     let routes = routes.prepare();
     tracing::info!(bind = %local, mtls = acceptor.is_some(), "peer service listening");
     let task = tokio::spawn(async move {

@@ -327,7 +327,39 @@ pub(crate) fn bulk_payload(
 #[derive(Debug, Default)]
 pub(crate) struct Stmts {
     next: u64,
-    map: HashMap<StmtRef, Stmt>,
+    map: HashMap<StmtRef, Stmt, RefHash>,
+}
+
+/// Hashes a [`StmtRef`] (a counter the session hands out) with one
+/// multiply: an execute looks its statement up several times, and the
+/// standard hasher's rounds showed in its profile.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct RefHash;
+
+impl std::hash::BuildHasher for RefHash {
+    type Hasher = RefHasher;
+    fn build_hasher(&self) -> RefHasher {
+        RefHasher(0)
+    }
+}
+
+/// The hasher of [`RefHash`].
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct RefHasher(u64);
+
+impl std::hash::Hasher for RefHasher {
+    fn finish(&self) -> u64 {
+        // Spread a small counter over the high bits the table probes by.
+        self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(*b);
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 ^= n;
+    }
 }
 
 impl Stmts {

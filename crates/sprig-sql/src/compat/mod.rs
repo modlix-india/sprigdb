@@ -24,6 +24,7 @@ pub mod engine;
 pub mod errmap;
 pub mod explain;
 pub mod exprprint;
+pub mod fastpath;
 pub mod funcs;
 pub mod fxindex;
 pub mod geo;

@@ -33,7 +33,8 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use sprig_catalog::{ChangeOpts, MariaCatalog, VersionKind};
+use sprig_catalog::records::RecordTx;
+use sprig_catalog::{AuthCatalog, ChangeOpts, VersionKind};
 use sprig_common::ids::{TenantId, UserId};
 use sprig_common::time::Clock;
 use sprig_common::{ErrorKind, Result, SprigCode, SprigError};
@@ -217,16 +218,15 @@ async fn hash(password: &Zeroizing<Vec<u8>>, h: Hashing, reuse: Vec<ScramSalt>) 
 /// writer outside any change. Empty when there are none or the read fails
 /// (the new password then gets fresh salts).
 async fn scram_salts(
-    cat: &MariaCatalog,
+    cat: &AuthCatalog,
     tenant: TenantId,
     user: UserId,
     slot: Slot,
 ) -> Vec<ScramSalt> {
     let read = async {
-        let ep = cat.backend().locator().writer(tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(crate::store::map_err)?;
-        AuthStore::of(&ep.store)
-            .verifiers_of(&mut conn, &[user])
+        let mut tx = cat.backend().store().begin(tenant).await?;
+        AuthStore
+            .verifiers_of(&mut *tx, &[user])
             .await
     };
     match read.await {
@@ -271,7 +271,7 @@ fn is_duplicate(e: &SprigError) -> bool {
 
 async fn insert_verifiers(
     store: &AuthStore,
-    q: &mut mysql_async::Transaction<'static>,
+    q: &mut dyn RecordTx,
     user: UserId,
     h: &Hashed,
     generation: u64,
@@ -319,7 +319,7 @@ async fn insert_verifiers(
 /// 1396 if the live account `'name'@'host'` exists; 39998 for a bad name
 /// or host; the change's errors (39070, 39071, 39072, 39504).
 pub async fn create_user(
-    cat: &MariaCatalog,
+    cat: &AuthCatalog,
     tenant: TenantId,
     new: &NewUser,
     clock: &dyn Clock,
@@ -332,9 +332,9 @@ pub async fn create_user(
         .await?;
     let version = c.version();
     let result = async {
-        let (core, q) = c.tx().parts();
-        let store = AuthStore::of(core);
-        let id = store.next_user_id(core, q).await?;
+        let q = c.tx().records();
+        let store = AuthStore;
+        let id = store.next_user_id(q).await?;
         let mut row = UserRow::new(id, &new.name, &new.host, new.source, now, version);
         row.kind = new.kind;
         row.require_tls = new.require_tls;
@@ -374,7 +374,7 @@ pub async fn create_user(
 /// Runs `body` on the live user `user` in one auth change; the user's row
 /// is rewritten with the change's version.
 async fn with_user<F>(
-    cat: &MariaCatalog,
+    cat: &AuthCatalog,
     tenant: TenantId,
     user: UserId,
     op: &'static str,
@@ -383,7 +383,7 @@ async fn with_user<F>(
 where
     F: for<'a> FnOnce(
             &'a AuthStore,
-            &'a mut mysql_async::Transaction<'static>,
+            &'a mut dyn RecordTx,
             &'a mut UserRow,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>,
@@ -394,8 +394,8 @@ where
         .await?;
     let version = c.version();
     let result = async {
-        let (core, q) = c.tx().parts();
-        let store = AuthStore::of(core);
+        let q = c.tx().records();
+        let store = AuthStore;
         let mut row = match store.user(q, user).await? {
             Some(r) if r.is_live() => r,
             _ => return Err(cannot_user(op, &format!("#{user}"), "%")),
@@ -427,7 +427,7 @@ where
 /// # Errors
 /// 1396 if the user doesn't exist or is dropped; the change's errors.
 pub async fn set_password(
-    cat: &MariaCatalog,
+    cat: &AuthCatalog,
     tenant: TenantId,
     user: UserId,
     password: &[u8],
@@ -492,7 +492,7 @@ pub async fn set_password(
 /// # Errors
 /// The catalog's errors; 39998 for iterations outside the settings' range.
 pub async fn backfill_scram(
-    cat: &MariaCatalog,
+    cat: &AuthCatalog,
     tenant: TenantId,
     user: UserId,
     verifier_id: u64,
@@ -500,10 +500,9 @@ pub async fn backfill_scram(
     hashing: Hashing,
 ) -> Result<Option<(Changed, Vec<ScramKind>)>> {
     let rows = {
-        let ep = cat.backend().locator().writer(tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(crate::store::map_err)?;
-        AuthStore::of(&ep.store)
-            .verifiers_of(&mut conn, &[user])
+        let mut tx = cat.backend().store().begin(tenant).await?;
+        AuthStore
+            .verifiers_of(&mut *tx, &[user])
             .await?
     };
     let Some((slot, generation)) = rows
@@ -575,7 +574,7 @@ pub async fn backfill_scram(
 /// # Errors
 /// As [`set_password`].
 pub async fn discard_old_password(
-    cat: &MariaCatalog,
+    cat: &AuthCatalog,
     tenant: TenantId,
     user: UserId,
     keep_history: u64,
@@ -598,7 +597,7 @@ pub async fn discard_old_password(
 /// # Errors
 /// As [`set_password`].
 pub async fn set_account_locked(
-    cat: &MariaCatalog,
+    cat: &AuthCatalog,
     tenant: TenantId,
     user: UserId,
     locked: bool,
@@ -625,7 +624,7 @@ pub async fn set_account_locked(
 /// # Errors
 /// As [`set_password`].
 pub async fn set_clauses(
-    cat: &MariaCatalog,
+    cat: &AuthCatalog,
     tenant: TenantId,
     user: UserId,
     clauses: AccountClauses,
@@ -642,7 +641,7 @@ pub async fn set_clauses(
 /// # Errors
 /// As [`set_password`].
 pub async fn set_password_expired(
-    cat: &MariaCatalog,
+    cat: &AuthCatalog,
     tenant: TenantId,
     user: UserId,
     expired: bool,
@@ -659,7 +658,7 @@ pub async fn set_password_expired(
 /// # Errors
 /// As [`set_password`].
 pub async fn set_require_tls(
-    cat: &MariaCatalog,
+    cat: &AuthCatalog,
     tenant: TenantId,
     user: UserId,
     require: RequireTls,
@@ -673,7 +672,7 @@ pub async fn set_require_tls(
 /// # Errors
 /// As [`set_password`]; the migrator's.
 pub async fn set_require(
-    cat: &MariaCatalog,
+    cat: &AuthCatalog,
     tenant: TenantId,
     user: UserId,
     require: RequireTls,
@@ -699,7 +698,7 @@ pub async fn set_require(
 /// # Errors
 /// As [`set_password`].
 pub async fn merge_attributes(
-    cat: &MariaCatalog,
+    cat: &AuthCatalog,
     tenant: TenantId,
     user: UserId,
     patch: serde_json::Value,
@@ -800,15 +799,15 @@ pub fn merge_patch(
     }
 }
 
-/// The auth module at format 6 (`REQUIRE SUBJECT` and `ISSUER`) in
-/// `tenant`'s catalog, before a change writes them.
+/// Formerly brought the auth tables to the shape with `REQUIRE SUBJECT`
+/// and `ISSUER`; engine records always have it, so this does nothing.
 ///
 /// # Errors
-/// 39070 if the catalog is unreachable; the migrator's.
-pub async fn migrate_dn(cat: &MariaCatalog, tenant: TenantId) -> Result<()> {
-    let ep = cat.backend().locator().writer(tenant).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(crate::store::map_err)?;
-    crate::store::migrate_dn(&mut conn, ep.store.schema()).await
+/// None.
+#[allow(clippy::unused_async)] // callers await it, as when it migrated
+pub async fn migrate_dn(_cat: &AuthCatalog, _tenant: TenantId) -> Result<()> {
+    // Engine records always have the columns: nothing to migrate.
+    Ok(())
 }
 
 /// `DROP USER`: the row becomes a tombstone (its name is free, its id
@@ -816,7 +815,7 @@ pub async fn migrate_dn(cat: &MariaCatalog, tenant: TenantId) -> Result<()> {
 ///
 /// # Errors
 /// As [`set_password`].
-pub async fn drop_user(cat: &MariaCatalog, tenant: TenantId, user: UserId) -> Result<Changed> {
+pub async fn drop_user(cat: &AuthCatalog, tenant: TenantId, user: UserId) -> Result<Changed> {
     with_user(cat, tenant, user, "DROP USER", move |store, q, row| {
         row.state = UserState::Dropped;
         Box::pin(async move {
@@ -834,15 +833,14 @@ pub async fn drop_user(cat: &MariaCatalog, tenant: TenantId, user: UserId) -> Re
 /// # Errors
 /// The catalog's errors.
 pub async fn find_user(
-    cat: &MariaCatalog,
+    cat: &AuthCatalog,
     tenant: TenantId,
     name: &str,
     host: &str,
 ) -> Result<Option<UserId>> {
-    let ep = cat.backend().locator().writer(tenant).await?;
-    let mut conn = ep.pool.get_conn().await.map_err(crate::store::map_err)?;
-    Ok(AuthStore::of(&ep.store)
-        .user_by_account(&mut conn, name, host)
+    let mut tx = cat.backend().store().begin(tenant).await?;
+    Ok(AuthStore
+        .user_by_account(&mut *tx, name, host)
         .await?
         .map(|u| u.user_id))
 }
@@ -858,7 +856,7 @@ pub async fn find_user(
 /// USER` after `USE TENANT`) and the Admin API call these.
 pub struct AccountOps<'a> {
     /// The catalog writer path.
-    pub cat: &'a MariaCatalog,
+    pub cat: &'a AuthCatalog,
     /// The target tenant.
     pub tenant: TenantId,
     /// Its name, for the events.

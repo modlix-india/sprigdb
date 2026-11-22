@@ -1248,6 +1248,9 @@ pub(crate) struct Inner {
     /// Acknowledgements inside SQL sessions' open transactions, by
     /// session: told to their owners when the transaction ends.
     pub(crate) txn_holds: Mutex<HashMap<u64, Vec<(i64, crate::token::TokenData)>>>,
+    /// Vhosts (tenant, database) whose engine-stored outbox a session's
+    /// open transaction wrote: their forwarders are woken when it ends.
+    pub(crate) txn_wakes: Mutex<HashMap<u64, Vec<(i64, u64, u32)>>>,
     pub(crate) vhosts: Mutex<HashMap<(u64, u32), Arc<VShared>>>,
     temp_ids: AtomicU64,
     pub(crate) stop: CancellationToken,
@@ -1317,6 +1320,7 @@ impl QueueEngine {
             inner: Arc::new(Inner {
                 deps,
                 txn_holds: Mutex::new(HashMap::new()),
+                txn_wakes: Mutex::new(HashMap::new()),
                 vhosts: Mutex::new(HashMap::new()),
                 temp_ids: AtomicU64::new(1),
                 stop: CancellationToken::new(),

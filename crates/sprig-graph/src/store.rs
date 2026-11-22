@@ -281,9 +281,13 @@ pub fn not_implicit() -> sprig_common::SprigError {
 /// The routing hash of a node's `part` (the shard map's numeric class).
 #[must_use]
 pub fn rk_of(part: u64) -> u64 {
-    // The spec of one numeric part never fails to build.
-    KeySpec::new(vec![KeyClass::Numeric])
-        .and_then(|s| hash_key(&s, &[KeyValue::Int(i128::from(part))]))
+    // The spec of one numeric part never fails to build. It is made once:
+    // building one computes its digest from its JSON text, which cost more
+    // than the hash itself (a hop computes this for every relationship).
+    static SPEC: std::sync::OnceLock<Option<KeySpec>> = std::sync::OnceLock::new();
+    SPEC.get_or_init(|| KeySpec::new(vec![KeyClass::Numeric]).ok())
+        .as_ref()
+        .and_then(|s| hash_key(s, &[KeyValue::Int(i128::from(part))]).ok())
         .map_or(part, |(h, _)| h.0)
 }
 
@@ -546,6 +550,13 @@ pub trait GraphStore: Send {
     /// Locks node rows: shared (`LOCK IN SHARE MODE`) or exclusive (`FOR
     /// UPDATE`), and returns them (fresh).
     async fn lock_nodes(&mut self, ids: &[u64], exclusive: bool) -> Result<Vec<NodeRow>>;
+
+    /// Locks relationship records exclusively and returns them as they
+    /// are now (before `SET` on them). Stores without record locks read
+    /// them as [`GraphStore::edges`] does.
+    async fn lock_edges(&mut self, ids: &[u64]) -> Result<Vec<EdgeRow>> {
+        self.edges(ids).await
+    }
 
     /// `n` new ids.
     async fn alloc_ids(&mut self, kind: IdKind, n: usize) -> Result<Vec<u64>>;

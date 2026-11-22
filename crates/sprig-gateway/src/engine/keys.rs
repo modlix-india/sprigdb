@@ -161,6 +161,33 @@ pub(crate) fn object_prefix(tenant: u64, object: u32) -> Vec<u8> {
     k
 }
 
+/// The index number of the tenant's list of dropped tables, in the
+/// tenant's records object (object 0, kind M; index 0 holds the catalog's
+/// records).
+const DROPS_INDEX: u16 = 1;
+
+/// The prefix of `tenant`'s list of dropped tables whose keys are still
+/// being deleted: one key per table, `prefix | object u32`, empty value.
+pub(crate) fn drops_prefix(tenant: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(24);
+    KeyPrefix {
+        tenant,
+        shard: 0,
+        object: 0,
+        kind: kind::META,
+        index: DROPS_INDEX,
+    }
+    .encode_into(&mut k);
+    k
+}
+
+/// The mark of dropped table `object` in [`drops_prefix`]'s list.
+pub(crate) fn drop_mark(tenant: u64, object: u32) -> Vec<u8> {
+    let mut k = drops_prefix(tenant);
+    k.extend_from_slice(&object.to_be_bytes());
+    k
+}
+
 /// The key of a table's index record.
 pub(crate) fn index_record_key(tenant: u64, object: u32) -> Vec<u8> {
     meta_key(tenant, object, b"indexes")

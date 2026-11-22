@@ -240,7 +240,6 @@ M V 0
 M T LONG 2 0 - 63
 Y V 0
 Y T LONGLONG 21 0 - 63
-K Y l
 Q (-1.5 % .5) | 0
 M V 0
 M T LONGLONG 21 0 U 63
@@ -266,13 +265,11 @@ M V 0
 M T LONG 3 0 N 63
 Y V 0
 Y T LONGLONG 21 0 N 63
-K Y l
 Q FLOOR(-0.0)
 M V 0
 M T LONG 3 0 N 63
 Y V 0
 Y T LONGLONG 21 0 N 63
-K Y l
 Q -0.4 + 0.4
 M V 0.0
 M T NEWDECIMAL 5 1 N 63
@@ -1406,7 +1403,6 @@ Y W W 1292 Truncated incorrect DOUBLE value: 'ÉTÉ'
 Y W W 1292 Truncated incorrect DOUBLE value: 'A'
 Y W W 1292 Truncated incorrect DOUBLE value: 'ABC '
 Y W W 1292 Truncated incorrect DOUBLE value: '2024-01-15'
-K Y w
 Q `f8` = CAST(0.4 AS CHAR)
 M V 0	0	0	0	0	0	0	0	0	0	0	0	NULL	0	0	0	NULL	0	0	0	0	0	0	NULL
 M T LONG 1 0 - 63
@@ -1479,7 +1475,6 @@ Y W W 1292 Truncated incorrect DOUBLE value: 'ÉTÉ'
 Y W W 1292 Truncated incorrect DOUBLE value: 'A'
 Y W W 1292 Truncated incorrect DOUBLE value: 'ABC '
 Y W W 1292 Truncated incorrect DOUBLE value: '2024-01-15'
-K Y w
 # merged integer types
 Q COALESCE(-1, CAST(1 AS UNSIGNED))
 M V -1
@@ -3546,8 +3541,6 @@ Y V bc
 Y T VAR_STRING 8 31 - 255
 Y W W 1292 Truncated incorrect INTEGER value: '2x'
 Y W W 1292 Truncated incorrect INTEGER value: '2x'
-K M l
-K Y l
 Q SUBSTRING('abc', 1, '2x')
 M V ab
 M T VAR_STRING 8 39 - 224
@@ -3557,8 +3550,6 @@ Y V ab
 Y T VAR_STRING 8 31 - 255
 Y W W 1292 Truncated incorrect INTEGER value: '2x'
 Y W W 1292 Truncated incorrect INTEGER value: '2x'
-K M l
-K Y l
 Q LEFT(`vc`, '2x')
 M V 	a	A	ab	AB	1	12	ét	b	ab	1e	z	NULL	A	ab	AB	1	12	ét	b	ab	1e	z	
 M T VAR_STRING 8 39 - 224
@@ -4217,7 +4208,6 @@ M T DOUBLE 23 31 N 63
 M W N 1292 Truncated incorrect DOUBLE value: '1 '
 Y V 9223372036854775808
 Y T VAR_STRING 88 31 N 255
-K Y l
 Q CAST(GREATEST(('a' / 1.00), '1 ', (CASE '9223372036854775808' WHEN '1e30' THEN -1e10 WHEN 255 THEN 1000000.000001 ELSE 9223372036854775808 END)) AS UNSIGNED)
 M V 9223372036854775808
 M T LONGLONG 20 0 U 63
@@ -4384,7 +4374,6 @@ M W W 1292 Incorrect interval value: '99999999999999'
 Y V NULL
 Y T LONGLONG 20 0 - 63
 Y W W 1292 Truncated incorrect time value: '99999999999999'
-K M t
 Q EXTRACT(HOUR_MICROSECOND FROM 4294967295000000)
 M V NULL
 M T LONGLONG 13 0 - 63
@@ -4392,8 +4381,6 @@ M W W 1292 Incorrect interval value: '4294967295000000'
 Y V NULL
 Y T LONGLONG 14 0 - 63
 Y W W 1292 Truncated incorrect time value: '4294967295000000'
-K M t
-K Y l
 # The examples the decisions quote
 Q ((2 / 3) = 0.6667)
 M V 1

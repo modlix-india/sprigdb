@@ -377,3 +377,143 @@ fn mem_store_checkpoint_keeps_the_log() {
         assert_eq!(get(&e, i).as_deref(), Some(&b"x"[..]), "commit {i} lost");
     }
 }
+
+/// Collects the notes it is shown, with their indexes.
+#[derive(Default)]
+struct Notes(std::sync::Mutex<Vec<(u64, Vec<u8>)>>);
+
+impl crate::observe::ApplyObserver for Notes {
+    fn applied(&self, entries: &[LogEntry]) {
+        let mut g = self.0.lock().unwrap();
+        for e in entries {
+            for n in log::payload::notes(&e.data).unwrap() {
+                g.push((e.index, n.to_vec()));
+            }
+        }
+    }
+}
+
+fn note(e: &Engine, text: &str) -> u64 {
+    let mut p = log::Payload::new();
+    p.note(text.as_bytes());
+    let t = e
+        .consensus()
+        .propose(e.unit(), p.into_bytes(), Durability::Local)
+        .unwrap();
+    t.wait_applied().unwrap();
+    t.index()
+}
+
+#[test]
+fn observers_catch_up_and_floors_keep_the_log() {
+    let dir = TempDir::new("observe");
+    let floor;
+    {
+        let e = Engine::open(cfg(dir.path(), StoreKind::Rocks)).unwrap();
+        let first = note(&e, "a");
+        put(&e, 1, "x", Durability::Local).wait().unwrap();
+        let obs = Arc::new(Notes::default());
+        // Registered late: it is handed what was applied after `first - 1`.
+        e.observe(
+            Arc::clone(&obs) as Arc<dyn crate::observe::ApplyObserver>,
+            first - 1,
+        )
+        .unwrap();
+        let second = note(&e, "b");
+        let seen: Vec<_> = obs.0.lock().unwrap().clone();
+        assert_eq!(seen, vec![(first, b"a".to_vec()), (second, b"b".to_vec())]);
+        // The observer holds "a" durably; "b" and later only in the log.
+        e.set_log_floor("notes", first).unwrap();
+        floor = first;
+        note(&e, "c");
+        for i in 0..50 {
+            put(&e, 100 + i, "y", Durability::Local).wait().unwrap();
+        }
+        e.checkpoint().unwrap();
+        assert_eq!(e.log_floor("notes"), Some(first));
+    }
+    let e = Engine::open(cfg(dir.path(), StoreKind::Rocks)).unwrap();
+    assert_eq!(e.log_floor("notes"), Some(floor));
+    let obs = Arc::new(Notes::default());
+    e.observe(
+        Arc::clone(&obs) as Arc<dyn crate::observe::ApplyObserver>,
+        floor,
+    )
+    .unwrap();
+    let texts: Vec<Vec<u8>> = obs
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, n)| n.clone())
+        .collect();
+    assert_eq!(texts, vec![b"b".to_vec(), b"c".to_vec()]);
+    // Without a floor the checkpoint trims, and a late observer from 0 fails.
+    e.clear_log_floor("notes").unwrap();
+    note(&e, "d");
+    e.checkpoint().unwrap();
+    assert!(
+        e.observe(
+            Arc::new(Notes::default()) as Arc<dyn crate::observe::ApplyObserver>,
+            0
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn plain_writes_commit_with_the_transaction_or_not_at_all() {
+    let dir = TempDir::new("plain");
+    let e = Engine::open(cfg(dir.path(), StoreKind::Rocks)).unwrap();
+    let raw = |n: u8| vec![0xF0, 0x51, n];
+    let read = |n: u8| {
+        e.store()
+            .get(Cf::Data, &raw(n), crate::store::ReadTier::All)
+            .unwrap()
+            .expect_ready()
+            .unwrap()
+            .map(|b| b.to_vec())
+    };
+    let wait = |t: &crate::txn::CommitTicket| {
+        t.wait().unwrap();
+        t.log_ticket().unwrap().wait_applied().unwrap();
+    };
+    // Committed with a versioned write: both land.
+    let mut t = e.begin(TxnOptions::default()).unwrap();
+    t.put(row_key(1), b"v".to_vec()).unwrap();
+    t.add_plain_put(Cf::Data, raw(1), b"one".to_vec()).unwrap();
+    t.add_plain_put(Cf::Data, raw(2), b"two".to_vec()).unwrap();
+    assert!(t.has_plain_writes());
+    // Not visible before the commit.
+    assert_eq!(read(1), None);
+    wait(&t.commit().unwrap());
+    assert_eq!(read(1).as_deref(), Some(&b"one"[..]));
+    assert_eq!(get(&e, 1).as_deref(), Some(&b"v"[..]));
+    // Alone (no versioned write), a delete commits too.
+    let mut t = e.begin(TxnOptions::default()).unwrap();
+    t.add_plain_delete(Cf::Data, raw(2)).unwrap();
+    wait(&t.commit().unwrap());
+    assert_eq!(read(2), None);
+    // Rolled back: nothing.
+    let mut t = e.begin(TxnOptions::default()).unwrap();
+    t.add_plain_put(Cf::Data, raw(3), b"x".to_vec()).unwrap();
+    t.rollback();
+    assert_eq!(read(3), None);
+    // A statement rollback and a savepoint rollback drop theirs only.
+    let mut t = e.begin(TxnOptions::default()).unwrap();
+    t.begin_statement();
+    t.add_plain_put(Cf::Data, raw(4), b"kept".to_vec()).unwrap();
+    t.begin_statement();
+    t.add_plain_put(Cf::Data, raw(5), b"undone".to_vec())
+        .unwrap();
+    t.rollback_statement();
+    let sp = t.savepoint();
+    t.add_plain_delete(Cf::Data, raw(1)).unwrap();
+    t.rollback_to(sp);
+    // XA PREPARE refuses a transaction with plain writes.
+    assert!(t.xa_prepare(b"x1").is_err());
+    wait(&t.commit().unwrap());
+    assert_eq!(read(4).as_deref(), Some(&b"kept"[..]));
+    assert_eq!(read(5), None);
+    assert_eq!(read(1).as_deref(), Some(&b"one"[..]));
+}

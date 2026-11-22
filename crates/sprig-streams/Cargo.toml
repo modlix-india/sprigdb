@@ -12,6 +12,7 @@ publish.workspace = true
 async-trait.workspace = true
 # Binary Kafka header values in the outbox's headers JSON.
 base64.workspace = true
+bytes.workspace = true
 metrics.workspace = true
 mysql_async.workspace = true
 serde.workspace = true
@@ -19,9 +20,15 @@ serde_json.workspace = true
 sprig-binlog.workspace = true
 sprig-catalog.workspace = true
 sprig-common.workspace = true
+# Streams stored on the node's engine: segment files fed by the commit log,
+# offsets and groups as engine records.
+sprig-engine.workspace = true
 # The sequencer reads the tenant's feed.
 sprig-feed.workspace = true
 sprig-meta.workspace = true
+# The record-batch codec (CRC-32C, records, compression) for engine-stored
+# batches: compaction and reads of records as rows.
+sprig-proto-kafka = { path = "../sprig-proto-kafka" }
 sprig-settings.workspace = true
 # The SQL lexer for the stream statements; sqlparser-rs for the
 # reads the gateway rewrites.
@@ -34,6 +41,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

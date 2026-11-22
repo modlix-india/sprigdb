@@ -1950,24 +1950,13 @@ impl PassSession {
             ShowInherited::Instances => {
                 // Instance rows aren't versioned: read them, not the
                 // snapshot.
-                let live: std::collections::BTreeMap<DefKey, sprig_inherit::msg::Instance> = {
-                    use sprig_catalog::CatalogLocator;
-                    let ep = svc.locator.writer(me).await?;
-                    let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-                        SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable")
-                            .with_source(e)
-                    })?;
-                    let st = sprig_inherit::msg::MsgStore::new(ep.store.schema());
-                    if st.migrated(&mut conn).await? {
-                        st.instances(&mut conn)
-                            .await?
-                            .into_iter()
-                            .map(|i| (i.def, i))
-                            .collect()
-                    } else {
-                        std::collections::BTreeMap::new()
-                    }
-                };
+                let live: std::collections::BTreeMap<DefKey, sprig_inherit::msg::Instance> =
+                    sprig_inherit::msg::MsgStore::new(Arc::clone(&svc.records), me)
+                        .instances()
+                        .await?
+                        .into_iter()
+                        .map(|i| (i.def, i))
+                        .collect();
                 let _ = own;
                 let mut rows = Vec::new();
                 for kind in [

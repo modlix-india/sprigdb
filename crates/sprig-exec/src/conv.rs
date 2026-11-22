@@ -999,6 +999,16 @@ fn muted<T>(ctx: &mut Ctx<'_>, quiet: bool, f: impl FnOnce(&mut Ctx<'_>) -> T) -
 pub(crate) fn conv_f64(ctx: &mut Ctx<'_>, v: &Value, info: Info) -> Option<f64> {
     match v {
         Value::Bytes(b) | Value::Str(b) if info.hex => Some(hex_uint(b) as f64),
+        // MySQL reads a column's string whose text after the number is
+        // exactly two bytes without complaint (observed: 'ab', '1ab',
+        // 'é' and 0x0001 are silent, 'x', '1a', 'xyz' and 'éé' are not).
+        Value::Bytes(b) | Value::Str(b) if info.column && !ctx.maria() => {
+            let sc = scan_number(b);
+            let end = if sc.digits { sc.end } else { sc.start };
+            let rest = &b[end..];
+            let silent = info.quiet || (rest.len() == 2 && !rest.iter().all(|&c| is_space(c)));
+            muted(ctx, silent, |ctx| to_f64(ctx, v))
+        }
         _ => muted(ctx, info.quiet, |ctx| to_f64(ctx, v)),
     }
 }

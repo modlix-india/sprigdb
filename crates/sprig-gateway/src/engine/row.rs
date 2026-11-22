@@ -42,12 +42,14 @@ pub(crate) fn truth(d: &Datum) -> Option<bool> {
 }
 
 /// Encodes `row` (one value per column of `def`, each already in its
-/// column's stored form) as the table's rows are laid out (`sp`).
+/// column's stored form) as the table's rows are laid out (`sp`). A hidden
+/// row number after the columns lives in the row's key, not here.
 ///
 /// # Errors
 /// A value its column can't hold: a fault of the caller, which converts
 /// values first.
 pub(crate) fn encode(def: &TableDef, sp: &Space, row: &[Datum]) -> Result<Bytes> {
+    let row = row.get(..def.columns.len()).unwrap_or(row);
     let mut cap = 8 + def.columns.len().div_ceil(8);
     for d in row {
         cap += match d {
@@ -62,24 +64,43 @@ pub(crate) fn encode(def: &TableDef, sp: &Space, row: &[Datum]) -> Result<Bytes>
     Ok(Bytes::from(out))
 }
 
-/// Decodes a stored row of `def`, whatever version of the column list it
-/// was written under.
+/// Decodes the stored row at `key` of `def`, whatever version of the column
+/// list it was written under. A table keyed by a hidden row number gets
+/// that number (from the key) as one more value after the columns.
 ///
 /// # Errors
 /// The row doesn't decode.
-pub(crate) fn decode(_def: &TableDef, sp: &Space, raw: &Bytes) -> Result<Vec<Datum>> {
-    sp.layout.decode(raw)
+pub(crate) fn decode(def: &TableDef, sp: &Space, key: &[u8], raw: &Bytes) -> Result<Vec<Datum>> {
+    let mut row = sp.layout.decode(raw)?;
+    if def.hidden {
+        row.push(hidden_of(key)?);
+    }
+    Ok(row)
 }
 
 /// [`decode`] into a reused vector.
 pub(crate) fn decode_into(
-    _def: &TableDef,
+    def: &TableDef,
     sp: &Space,
+    key: &[u8],
     raw: &Bytes,
     out: &mut Vec<Datum>,
 ) -> Result<()> {
-    *out = sp.layout.decode(raw)?;
+    *out = decode(def, sp, key, raw)?;
     Ok(())
 }
 
-
+/// The hidden row number at the end of a row key.
+///
+/// # Errors
+/// The key is too short.
+pub(crate) fn hidden_of(key: &[u8]) -> Result<Datum> {
+    key.len()
+        .checked_sub(8)
+        .and_then(|at| key.get(at..))
+        .and_then(|b| <[u8; 8]>::try_from(b).ok())
+        .map(|b| Datum::UInt(u64::from_be_bytes(b)))
+        .ok_or_else(|| {
+            sprig_common::SprigError::internal("engine: a row key without its row number")
+        })
+}

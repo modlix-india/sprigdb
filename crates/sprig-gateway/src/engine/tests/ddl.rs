@@ -3,6 +3,8 @@
 //! after the statement; the expected errors are what MariaDB 11.8 answered
 //! (MySQL 8.4 where the test says so).
 
+use std::fmt::Write as _;
+
 use sprig_engine::row::record;
 
 use super::*;
@@ -20,6 +22,7 @@ fn sess() -> Session {
         env: Env::STRICT,
         wait: Duration::from_millis(200),
         db: "sbtest".into(),
+        conn: 7,
     }
 }
 
@@ -959,7 +962,7 @@ async fn keyspace_lookups_from_many_threads() {
                 s.spawn(|| {
                     for _ in 0..rounds {
                         let sp = e.cached(TENANT.0, 20, &d).unwrap();
-                        let r = crate::engine::row::decode(&d, &sp, &raw).unwrap();
+                        let r = crate::engine::row::decode(&d, &sp, &key, &raw).unwrap();
                         std::hint::black_box(r);
                     }
                 });
@@ -970,4 +973,176 @@ async fn keyspace_lookups_from_many_threads() {
             start.elapsed().as_secs_f64() * 1e9 / f64::from(rounds)
         );
     }
+}
+
+/// `f`'s output and how many times it was polled: every poll after the
+/// first is one return to the runtime.
+async fn polled<F: std::future::Future>(f: F) -> (F::Output, usize) {
+    let mut f = std::pin::pin!(f);
+    let mut n = 0;
+    let out = std::future::poll_fn(|cx| {
+        n += 1;
+        f.as_mut().poll(cx)
+    })
+    .await;
+    (out, n)
+}
+
+/// Long loops over rows go back to the runtime between batches, whether
+/// or not anything they await has to wait: a loop that ran to its end in
+/// one poll held a runtime worker for minutes on a big table, and the
+/// stall watchdog stopped it (1317). The in-memory store with syncs off
+/// is the worst case: every await in these loops is ready at once.
+#[tokio::test]
+async fn long_loops_over_rows_go_back_to_the_runtime() {
+    const ROWS: usize = 5_000;
+    let (e, d) = mem();
+    let _d = d;
+    let mut f = with(T0);
+    let mut sql = String::from("INSERT INTO t (id, a, s, n) VALUES ");
+    for i in 1..=ROWS {
+        if i > 1 {
+            sql.push(',');
+        }
+        let _ = write!(sql, "({i}, {}, 's{i}', {})", i % 97, i % 7);
+    }
+    // At least one return per 1,024 rows.
+    let least = ROWS / 1024;
+    let (o, n) = polled(q(&e, &f, &sql)).await;
+    assert_eq!(o.unwrap().affected, ROWS as u64);
+    assert!(n > least, "a {ROWS}-row INSERT was polled {n} times");
+
+    let (o, n) = polled(q(&e, &f, "SELECT * FROM t WHERE n > 100")).await;
+    assert!(o.unwrap().rows.is_empty());
+    assert!(n > least, "a {ROWS}-row scan was polled {n} times");
+    let (o, n) = polled(q(&e, &f, "SELECT id FROM t WHERE a >= 0")).await;
+    assert_eq!(o.unwrap().rows.len(), ROWS);
+    assert!(n > least, "a {ROWS}-row index range was polled {n} times");
+    let (o, n) = polled(q(&e, &f, "UPDATE t SET n = n + 1")).await;
+    assert_eq!(o.unwrap().affected, ROWS as u64);
+    assert!(n > 2 * least, "a {ROWS}-row UPDATE was polled {n} times");
+
+    // An index build (rows stay) and a copying change (another primary key).
+    let with_s = T0.replace(
+        "  KEY `ka` (`a`)\n",
+        "  KEY `ka` (`a`),\n  KEY `ks` (`s`)\n",
+    );
+    let (r, n) = polled(change(
+        &e,
+        &mut f,
+        "ALTER TABLE t ADD INDEX ks (s)",
+        &with_s,
+    ))
+    .await;
+    r.unwrap();
+    assert!(
+        n > least,
+        "an index build over {ROWS} rows was polled {n} times"
+    );
+    let rekeyed = with_s.replace("PRIMARY KEY (`id`)", "PRIMARY KEY (`n`,`id`)");
+    let (r, n) = polled(change(
+        &e,
+        &mut f,
+        "ALTER TABLE t DROP PRIMARY KEY, ADD PRIMARY KEY (n, id)",
+        &rekeyed,
+    ))
+    .await;
+    r.unwrap();
+    assert!(n > least, "a {ROWS}-row table copy was polled {n} times");
+    assert_eq!(flat(&e, &f, "SELECT id FROM t WHERE s = 's77'").await, "77");
+
+    let (o, n) = polled(q(&e, &f, "DELETE FROM t")).await;
+    assert_eq!(o.unwrap().affected, ROWS as u64);
+    assert!(n > 2 * least, "a {ROWS}-row DELETE was polled {n} times");
+}
+
+/// The keys of table 20 and the drop marks of the tenant.
+fn left(e: &Engine) -> (usize, usize) {
+    let mut tx = e.begin(TxnOptions::default()).unwrap();
+    let p = keys::object_prefix(TENANT.0, 20);
+    let rows = tx
+        .scan(&p, &keys::prefix_end(&p), false, 100_000)
+        .unwrap()
+        .len();
+    let m = keys::drops_prefix(TENANT.0);
+    let marks = tx
+        .scan(&m, &keys::prefix_end(&m), false, 100)
+        .unwrap()
+        .len();
+    tx.rollback();
+    (rows, marks)
+}
+
+#[tokio::test]
+async fn a_sweep_deletes_what_dropped_tables_left_behind() {
+    let live = |v: &[u32]| {
+        v.iter()
+            .copied()
+            .collect::<std::collections::HashSet<u32>>()
+    };
+    // Marked dropped, the process stopped before the deletion: the next
+    // sweep deletes every key and the mark.
+    let (e, f, _d) = three_rows().await;
+    assert!(left(&e).0 > 3);
+    e.mark_dropped(TENANT.0, &[20]).await.unwrap();
+    assert_eq!(left(&e).1, 1);
+    assert_eq!(e.sweep(TENANT.0, &live(&[]), &[]).await.unwrap(), 1);
+    assert_eq!(left(&e), (0, 0));
+    drop(f);
+    // A mark whose drop the catalog never published: the table stays.
+    let (e, f, _d) = three_rows().await;
+    let before = left(&e).0;
+    e.mark_dropped(TENANT.0, &[20]).await.unwrap();
+    assert_eq!(e.sweep(TENANT.0, &live(&[20]), &[]).await.unwrap(), 0);
+    assert_eq!(left(&e), (before, 1));
+    assert_eq!(flat(&e, &f, "SELECT id FROM t").await, "1 | 2 | 3");
+    // No mark (cut short before marks existed), but the catalog records
+    // the table as dropped: deleted too, and only once.
+    let (e, _f, _d) = three_rows().await;
+    assert_eq!(e.sweep(TENANT.0, &live(&[]), &[20]).await.unwrap(), 1);
+    assert_eq!(left(&e), (0, 0));
+    assert_eq!(e.sweep(TENANT.0, &live(&[]), &[20]).await.unwrap(), 0);
+    // A finished drop leaves no mark.
+    let (e, _f, _d) = three_rows().await;
+    e.mark_dropped(TENANT.0, &[20]).await.unwrap();
+    e.drop_table(TENANT.0, 20).await.unwrap();
+    assert_eq!(left(&e), (0, 0));
+}
+
+/// Not a test: a tool for the live proof that a sweep finishes a drop a
+/// killed process left. With `RF_ENGINE_DIR` (an engine directory no
+/// process has open) and `RF_TENANT` set, prints the number of keys of
+/// each SQL table object of the tenant, and its drop marks.
+#[tokio::test]
+#[ignore = "reads a stopped node's engine directory named by RF_ENGINE_DIR"]
+async fn engine_dir_keys_per_object() {
+    let (Ok(dir), Ok(t)) = (std::env::var("RF_ENGINE_DIR"), std::env::var("RF_TENANT")) else {
+        return;
+    };
+    let tenant: u64 = t.parse().unwrap();
+    let e = open(std::path::Path::new(&dir), StoreKind::Rocks, SyncMode::Off);
+    let mut tx = e.begin(TxnOptions::default()).unwrap();
+    let mut object: u32 = 1;
+    let end = keys::object_prefix(tenant, u32::MAX);
+    while let Some((k, _)) = tx
+        .scan(&keys::object_prefix(tenant, object), &end, false, 1)
+        .unwrap()
+        .into_iter()
+        .next()
+    {
+        let found = u32::from_be_bytes(k[12..16].try_into().unwrap());
+        let p = keys::object_prefix(tenant, found);
+        let n = tx
+            .scan(&p, &keys::prefix_end(&p), false, 50_000_000)
+            .unwrap()
+            .len();
+        println!("object {found}: {n} keys");
+        object = found + 1;
+    }
+    let m = keys::drops_prefix(tenant);
+    for (k, _) in tx.scan(&m, &keys::prefix_end(&m), false, 1000).unwrap() {
+        let o = u32::from_be_bytes(k[m.len()..m.len() + 4].try_into().unwrap());
+        println!("drop mark: object {o}");
+    }
+    tx.rollback();
 }

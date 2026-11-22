@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use sprig_catalog::CatalogLocator;
 use sprig_common::ids::{DcId, TenantId};
 use sprig_common::time::Clock;
 use sprig_common::{Result, SprigCode, SprigError};
@@ -56,7 +55,7 @@ pub trait Stores: Send + Sync {
 
 /// Catalog stores through a locator, and the tiers this process holds.
 pub struct LocatorStores {
-    locator: Arc<dyn CatalogLocator>,
+    records: Arc<dyn sprig_catalog::RecordStore>,
     dcs: BTreeMap<DcId, Arc<dyn RecStore>>,
     global: Option<Arc<dyn RecStore>>,
 }
@@ -68,11 +67,11 @@ impl std::fmt::Debug for LocatorStores {
 }
 
 impl LocatorStores {
-    /// Catalogs through `locator`.
+    /// Tenants' items in their catalog records in `records`.
     #[must_use]
-    pub fn new(locator: Arc<dyn CatalogLocator>) -> Self {
+    pub fn new(records: Arc<dyn sprig_catalog::RecordStore>) -> Self {
         Self {
-            locator,
+            records,
             dcs: BTreeMap::new(),
             global: None,
         }
@@ -96,7 +95,7 @@ impl LocatorStores {
 
 impl Stores for LocatorStores {
     fn tenant(&self, t: TenantId) -> Arc<dyn RecStore> {
-        Arc::new(CatalogRecStore::new(self.locator.clone(), t))
+        Arc::new(CatalogRecStore::new(Arc::clone(&self.records), t))
     }
     fn dc(&self, dc: &DcId) -> Option<Arc<dyn RecStore>> {
         self.dcs.get(dc).cloned()

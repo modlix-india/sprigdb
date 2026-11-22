@@ -15,6 +15,8 @@
 //! After `ALTER TABLE t SPRIG SET (stream.change_topic = ...)` succeeds,
 //! [`PassSession::streams_after_settings`] creates or drops `t.changes`.
 
+mod select;
+
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -501,7 +503,7 @@ impl PassSession {
 
     /// The streams step of [`PassSession::tenant_text`]: `None` when the
     /// statement isn't the stream layer's.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) async fn tenant_streams(
         &mut self,
         cx: &mut ExecCtx<'_>,
@@ -512,6 +514,12 @@ impl PassSession {
         cat: &Arc<TenantCatalog>,
         out: &mut dyn ResultSink,
     ) -> Result<Option<Step>> {
+        if let Some(step) = self
+            .engine_streams(cx, text, more, format, cat, out)
+            .await?
+        {
+            return Ok(Some(step));
+        }
         let Some(ts) = self.tenant.as_deref() else {
             return Ok(None);
         };
@@ -817,5 +825,277 @@ impl ResultSink for CompactSink<'_> {
     }
     fn finished(&self) -> bool {
         self.inner.finished()
+    }
+}
+
+/// What the engine streams' statements ask of the session.
+struct EngineStreamHost<'s> {
+    sess: &'s PassSession,
+    cat: &'s TenantCatalog,
+    tenant: u64,
+}
+
+impl sprig_streams::seg::sql::SqlHost for EngineStreamHost<'_> {
+    fn tenant(&self) -> u64 {
+        self.tenant
+    }
+
+    fn current_db(&self) -> Option<String> {
+        self.sess.current_logical()
+    }
+
+    fn on_engine(&self, db: &str) -> bool {
+        crate::kafka::engine::tenants().has(self.tenant) || self.sess.engine_database_named(db)
+    }
+
+    fn allowed(&self, db: &str, stream: &str, need: sprig_streams::seg::kafka::Need) -> bool {
+        use sprig_streams::seg::kafka::Need;
+        let Some(ts) = self.sess.tenant.as_deref() else {
+            return false;
+        };
+        let grants = crate::tenant::authz::privileges(ts, self.cat);
+        if grants.unrestricted() {
+            return true;
+        }
+        let lctn = ts.lower_case_table_names();
+        let db_key = database_key(db, lctn);
+        let a = match need {
+            Need::Read => Action::Select,
+            Need::Write => Action::Insert,
+            Need::Create => Action::Create,
+            Need::Alter => Action::Alter,
+            Need::Drop => Action::Drop,
+        };
+        if !stream.is_empty() {
+            let name_key = object_key(ObjectKind::Table, stream, lctn);
+            if grants.allows(
+                a,
+                Target::Named {
+                    db_key: &db_key,
+                    name_key: &name_key,
+                },
+            ) {
+                return true;
+            }
+        }
+        grants.allows(a, Target::Database { db_key: &db_key })
+    }
+
+    fn user(&self) -> (String, String) {
+        self.sess
+            .tenant
+            .as_deref()
+            .map_or_else(Default::default, |t| {
+                (t.principal.user.clone(), t.principal.client_ip.to_string())
+            })
+    }
+
+    fn in_transaction(&self) -> bool {
+        self.sess.offsets_in_transaction()
+    }
+
+    fn engine_transaction(&self) -> bool {
+        self.sess.eng.txn.is_open()
+    }
+}
+
+/// Whether `text` can only be a stream statement (`CREATE | ALTER | DROP
+/// STREAM`, `SHOW STREAMS`); an `INSERT`, `DROP DATABASE` or a read may as
+/// well be about tables.
+fn surely_stream_statement(text: &[u8], lex: sprig_sql::lex::LexOptions) -> bool {
+    use sprig_streams::grammar::Stmt;
+    matches!(
+        sprig_streams::grammar::classify(text, &lex),
+        Ok(Stmt::Create(_) | Stmt::Alter(_) | Stmt::Drop { .. } | Stmt::Show { .. })
+    )
+}
+
+impl PassSession {
+    /// The stream statements of engine databases (streams stored on the
+    /// node's engine): `None` when the statement isn't one, or the tenant
+    /// has no engine database.
+    #[allow(clippy::too_many_lines)] // one branch per kind of answer
+    async fn engine_streams(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        text: &Bytes,
+        more: bool,
+        format: RowFormat,
+        cat: &Arc<TenantCatalog>,
+        out: &mut dyn ResultSink,
+    ) -> Result<Option<Step>> {
+        use sprig_streams::seg::sql::SqlHost as _;
+        if self
+            .tenant
+            .as_deref()
+            .is_none_or(|ts| ts.types.internal || ts.principal.must_change_password)
+        {
+            return Ok(None);
+        }
+        let tenant = cat.tenant.0;
+        let any = crate::kafka::engine::tenants().has(tenant)
+            || crate::engine::catalog::of(cat).is_some_and(|e| !e.dbs.is_empty());
+        if !any || !sprig_streams::grammar::maybe_stream(text, true) {
+            return Ok(None);
+        }
+        let Ok(sql) = std::str::from_utf8(text) else {
+            return Ok(None);
+        };
+        let (lex, _) = self.lex_opts();
+        let mut selected: Option<select::Answer> = None;
+        let planned = {
+            let host = EngineStreamHost {
+                sess: self,
+                cat,
+                tenant,
+            };
+            let on_any = |q: &str| host.on_engine(q);
+            // Cheap first: only open the stream log for a statement that
+            // names an engine database (or runs in one).
+            let names_engine = host.current_db().is_some_and(|d| on_any(d.as_str()))
+                || sprig_streams::grammar::identifiers(text, &lex)
+                    .iter()
+                    .any(|w| on_any(w.as_str()));
+            if !names_engine {
+                return Ok(None);
+            }
+            let Some(eng) = crate::kafka::engine::streams() else {
+                // The stream log failed to open: only statements that are
+                // surely about streams fail; the rest (tables, documents,
+                // anything else on the engine database) go on.
+                if !surely_stream_statement(text, lex) {
+                    return Ok(None);
+                }
+                return Ok(Some(
+                    self.fail(
+                        out,
+                        &SprigError::internal(
+                            "streams of engine databases are stored on the SprigDB engine, which \
+                             failed to start on this node; see the node's log",
+                        ),
+                    )
+                    .await?,
+                ));
+            };
+            match sprig_streams::seg::sql::plan(&eng, sql, &lex, &host) {
+                Ok(Some(p)) => Ok(Some((eng, p))),
+                // A query may read streams.
+                Ok(None) => {
+                    let persona = if self.persona == sprig_proto_mysql::Persona::MySql84 {
+                        sprig_exec::Persona::MySql
+                    } else {
+                        sprig_exec::Persona::MariaDb
+                    };
+                    select::run(&eng, &host, sql, lex, persona, cx.proto.collation).map(|a| {
+                        selected = a;
+                        None
+                    })
+                }
+                Err(e) => Err(e),
+            }
+        };
+        if let Some((columns, rows)) = selected.take() {
+            if format == RowFormat::Binary {
+                return Ok(Some(
+                    self.fail(
+                        out,
+                        &SprigError::standard(
+                            1235,
+                            *b"42000",
+                            "This version of SprigDB doesn't yet support 'a prepared SELECT that \
+                             reads a stream of an engine database'",
+                        ),
+                    )
+                    .await?,
+                ));
+            }
+            let status = self.streams_status(more);
+            let rows = sprig_types::Rows { columns, rows };
+            super::types::send_rows(out, &rows, format, status).await?;
+            return Ok(Some(Step {
+                errored: false,
+                status: Some(status),
+            }));
+        }
+        let (eng, plan) = match planned {
+            Ok(None) => return Ok(None),
+            Ok(Some(x)) => x,
+            Err(e) => return Ok(Some(self.fail(out, &e).await?)),
+        };
+        let status = self.streams_status(more);
+        let step = Step {
+            errored: false,
+            status: Some(status),
+        };
+        // A publish inside the session's engine transaction joins it.
+        let in_engine_txn = matches!(plan, sprig_streams::seg::sql::Plan::Publish { .. })
+            && self.offsets_in_transaction();
+        let ran = if in_engine_txn {
+            match self.eng.txn.open_tx() {
+                Some(tx) => {
+                    sprig_streams::seg::sql::publish_in(&eng, tenant, plan, tx.engine_txn()).await
+                }
+                None => Err(SprigError::internal(
+                    "stream publish: the session's engine transaction ended",
+                )),
+            }
+        } else {
+            sprig_streams::seg::sql::run(&eng, tenant, plan).await
+        };
+        match ran {
+            Err(e) => Ok(Some(self.fail(out, &e).await?)),
+            Ok(sprig_streams::seg::sql::Answer::Continue) => Ok(None),
+            Ok(sprig_streams::seg::sql::Answer::Ok(affected)) => {
+                let mut ok = OkPacket::new(status);
+                ok.affected_rows = affected;
+                out.ok(ok).await?;
+                Ok(Some(step))
+            }
+            Ok(sprig_streams::seg::sql::Answer::Rows { columns, rows }) => {
+                let cols: Vec<ColumnDef> = columns
+                    .iter()
+                    .map(|c| crate::pipeline::text_column(c, cx.proto.collation))
+                    .collect();
+                let rows = sprig_types::Rows {
+                    columns: cols,
+                    rows: rows
+                        .into_iter()
+                        .map(|r| r.into_iter().map(|v| v.map(String::into_bytes)).collect())
+                        .collect(),
+                };
+                super::types::send_rows(out, &rows, format, status).await?;
+                Ok(Some(step))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod engine_stream_tests {
+    use super::surely_stream_statement;
+
+    #[test]
+    fn only_stream_statements_fail_when_the_stream_log_is_down() {
+        let lex = sprig_sql::lex::LexOptions::mariadb();
+        for s in [
+            "CREATE STREAM s PARTITIONS 2",
+            "ALTER STREAM db.s PARTITIONS 4",
+            "DROP STREAM IF EXISTS s",
+            "SHOW STREAMS FROM db",
+        ] {
+            assert!(surely_stream_statement(s.as_bytes(), lex), "{s}");
+        }
+        for s in [
+            "SELECT * FROM t",
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 1",
+            "CREATE TABLE t (a INT)",
+            "DROP DATABASE db",
+            "DROP TABLE t",
+            "BEGIN",
+            "CREATE STREAM",
+        ] {
+            assert!(!surely_stream_statement(s.as_bytes(), lex), "{s}");
+        }
     }
 }

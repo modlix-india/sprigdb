@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 
 use sprig_catalog::ddl::{database_key, object_key};
 use sprig_catalog::store::{DbState, Namespace, ObjectKind, ObjectState};
-use sprig_catalog::{ChangeOpts, MariaCatalog, TenantCatalog, VersionKind};
+use sprig_catalog::{AuthCatalog, ChangeOpts, TenantCatalog, VersionKind};
 use sprig_common::ids::{RoleId, TenantId, UserId};
 use sprig_common::time::Clock;
 use sprig_common::{Result, SprigError};
@@ -88,7 +88,7 @@ pub enum Outcome {
 /// The session and the stores a statement runs against.
 pub struct AccountCtx<'a> {
     /// Versioned catalog writes.
-    pub catalog: &'a MariaCatalog,
+    pub catalog: &'a AuthCatalog,
     /// The snapshot the statement reads names in.
     pub snapshot: &'a TenantCatalog,
     /// The tenant.
@@ -1633,8 +1633,8 @@ async fn apply(cx: &AccountCtx<'_>, ops: Vec<Op>) -> Result<Option<u64>> {
         .change_with(cx.tenant, VersionKind::Auth, ChangeOpts::default())
         .await?;
     let result: Result<()> = async {
-        let (core, q) = change.tx().parts();
-        let store = AuthzStore::new(core.schema());
+        let q = change.tx().records();
+        let store = AuthzStore::new();
         let by = Some(cx.user);
         for op in ops {
             match op {
@@ -1838,7 +1838,7 @@ fn show_create_user(cx: &AccountCtx<'_>, account: &UserSpec) -> Result<Outcome> 
 /// # Errors
 /// The catalog's.
 pub async fn grant_tenant_admin(
-    catalog: &MariaCatalog,
+    catalog: &AuthCatalog,
     tenant: TenantId,
     user: UserId,
 ) -> Result<u64> {
@@ -1846,8 +1846,8 @@ pub async fn grant_tenant_admin(
         .change_with(tenant, VersionKind::Auth, ChangeOpts::default())
         .await?;
     let r = {
-        let (core, q) = c.tx().parts();
-        AuthzStore::new(core.schema())
+        let q = c.tx().records();
+        AuthzStore::new()
             .grant(
                 q,
                 Grantee::User(user),

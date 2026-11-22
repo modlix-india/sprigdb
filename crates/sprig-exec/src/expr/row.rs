@@ -149,7 +149,7 @@ fn value_key(v: &Value) -> Option<Key> {
 /// An element's comparison key. A constant element is converted once per
 /// statement, as both servers convert a constant compared with a row's
 /// value once.
-fn element_key(
+pub(crate) fn element_key(
     c: &Comparator,
     n: &Node,
     id: Option<usize>,
@@ -169,9 +169,8 @@ fn element_key(
     Ok(k)
 }
 
-fn const_id(n: &Node) -> Option<usize> {
-    n.konst
-        .then(|| usize::MAX / 2 - NEXT_KEY.fetch_add(1, AtomicOrdering::Relaxed))
+pub(crate) fn const_id(n: &Node) -> Option<usize> {
+    (n.konst && !n.sized).then(|| usize::MAX / 2 - NEXT_KEY.fetch_add(1, AtomicOrdering::Relaxed))
 }
 
 /// MariaDB computes a row's constant elements once while it prepares the

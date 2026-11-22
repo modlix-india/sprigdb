@@ -12,6 +12,16 @@
 //! directory entry moves: another session's change (DDL, `SPRIG SET`)
 //! reaches this one within one load.
 //!
+//! **The short path.** Between full checks a statement keeps the session's
+//! snapshot after one atomic read that says no load of the tenant finished
+//! ([`sprig_catalog::cache::CatalogFollow`]), as long as the session's own
+//! last change is in it and the last full check is younger than
+//! [`FRESH_RECHECK`] (5 ms). A snapshot another session's change loaded is
+//! seen at the next statement, as before; what only the full check looks
+//! at (the gateway's lease, a newer version the directory announced but
+//! nobody loaded yet, the accounts' reconciliation, the shard maps) is
+//! seen at most 5 ms later than before.
+//!
 //! **Live settings.** A resolved-setting watch
 //! ([`Settings::watch_resolved`]) follows `gateway.long_data_max_bytes`
 //! for the tenant: a `SPRIG SET` at tenant scope (or a wider one) applies
@@ -84,6 +94,10 @@ pub struct TenantSession {
     /// What the backend accounts were last found reconciled for, and when
     /// (`refresh`).
     ensured: Option<(EnsureKey, std::time::Instant)>,
+    /// Whether the tenant's cached catalog changed since the last full
+    /// check, and when that check ran (`refresh`'s short path).
+    follow: Option<sprig_catalog::cache::CatalogFollow>,
+    checked_at: Option<std::time::Instant>,
     /// `lower_case_table_names` with the catalog and settings snapshots it
     /// was resolved against.
     lctn_memo: std::sync::Mutex<Option<(Arc<TenantCatalog>, sprig_settings::Snapshot, bool)>>,
@@ -95,6 +109,28 @@ pub struct TenantSession {
 /// How long a session trusts its last check that the tenant's backend
 /// accounts are reconciled, while nothing it can see changed.
 const ENSURE_AGAIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a session keeps its catalog snapshot without the full check
+/// while the cache reports no new load of its tenant (`refresh`): the
+/// lease, the directory's newer versions, the accounts' reconciliation and
+/// the shard maps are looked at again at least this often.
+pub const FRESH_RECHECK: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Whether a session may keep the snapshot of `version` for its next
+/// statement without the full check: nothing new was loaded for its tenant
+/// (`changed` false), its own last change (`last_change`) is in the
+/// snapshot, the last full check reconciled the accounts (`ensured`) and
+/// is younger than [`FRESH_RECHECK`] (`age`).
+#[must_use]
+pub fn keeps_snapshot(
+    version: u64,
+    last_change: u64,
+    changed: bool,
+    ensured: bool,
+    age: Option<std::time::Duration>,
+) -> bool {
+    !changed && ensured && version >= last_change && age.is_some_and(|a| a < FRESH_RECHECK)
+}
 
 /// What a check of the backend accounts depends on that a session can see:
 /// the catalog snapshot, the etcd settings and the tenant's shard maps.
@@ -153,6 +189,8 @@ impl TenantSession {
             long_data_max: Arc::new(AtomicU64::new(LONG_DATA_MAX_BYTES.default)),
             watch: None,
             ensured: None,
+            follow: None,
+            checked_at: None,
             lctn_memo: std::sync::Mutex::new(None),
             aliases_memo: std::sync::OnceLock::new(),
         })
@@ -170,6 +208,40 @@ impl TenantSession {
     /// # Errors
     /// The cache's (39070 catalog unavailable, 39072, 39073).
     pub async fn refresh(&mut self) -> Result<Arc<TenantCatalog>> {
+        // The short path: every statement asks, and nothing changed.
+        if let (Some(cat), Some(f)) = (&self.cat, &self.follow) {
+            let age = self
+                .checked_at
+                .map(|t| sprig_common::time::poll::now().saturating_duration_since(t));
+            if keeps_snapshot(
+                cat.version,
+                self.last_change,
+                f.changed(),
+                self.ensured.is_some(),
+                age,
+            ) {
+                return Ok(Arc::clone(cat));
+            }
+        }
+        // Loads finished from here on count as changes at the next
+        // statement.
+        let mut follow = self
+            .follow
+            .take()
+            .or_else(|| self.svc.cache.follow(self.tenant));
+        if let Some(f) = follow.as_mut() {
+            f.mark_seen();
+        }
+        let r = self.refresh_full().await;
+        if r.is_ok() {
+            self.follow = follow.or_else(|| self.svc.cache.follow(self.tenant));
+            self.checked_at = Some(sprig_common::time::poll::now());
+        }
+        r
+    }
+
+    /// The full check behind [`Self::refresh`].
+    async fn refresh_full(&mut self) -> Result<Arc<TenantCatalog>> {
         let fresh = match &self.cat {
             None => Freshness::Latest,
             Some(_) => Freshness::Cached {
@@ -203,7 +275,7 @@ impl TenantSession {
             Arc::ptr_eq(&k.catalog, &cat)
                 && k.maps == maps
                 && live.with_snapshot(|e| Arc::ptr_eq(&k.etcd, e))
-                && at.elapsed() < ENSURE_AGAIN
+                && sprig_common::time::poll::now().saturating_duration_since(*at) < ENSURE_AGAIN
         }) {
             return Ok(cat);
         }
@@ -473,5 +545,29 @@ impl TenantSession {
             auto_indexes: self.show_auto_indexes,
             ..Visibility::for_persona(persona)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{FRESH_RECHECK, keeps_snapshot};
+
+    #[test]
+    fn a_snapshot_is_kept_only_while_nothing_it_depends_on_moved() {
+        let young = Some(Duration::from_millis(1));
+        assert!(keeps_snapshot(10, 10, false, true, young));
+        // A finished load of the tenant (another session's DDL, a
+        // directory move, an eviction): the full check.
+        assert!(!keeps_snapshot(10, 10, true, true, young));
+        // The session's own change isn't in the snapshot yet: the full
+        // check waits for it.
+        assert!(!keeps_snapshot(10, 11, false, true, young));
+        // The accounts weren't found reconciled: checked every time.
+        assert!(!keeps_snapshot(10, 10, false, false, young));
+        // At most every FRESH_RECHECK, the full check whatever else.
+        assert!(!keeps_snapshot(10, 10, false, true, Some(FRESH_RECHECK)));
+        assert!(!keeps_snapshot(10, 10, false, true, None));
     }
 }

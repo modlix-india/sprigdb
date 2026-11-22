@@ -1199,7 +1199,7 @@ fn dump(dir: &str, seed: u64, cases: usize) {
         ];
         for (feature, queries) in features {
             for q in queries {
-                let sql = q.sql.replace('\n', " ").replace('\t', " ");
+                let sql = q.sql.replace(['\n', '\t'], " ");
                 let _ = writeln!(out, "Q\t{feature}\t{}\t{sql}", u8::from(q.ordered));
             }
         }

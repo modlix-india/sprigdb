@@ -307,14 +307,15 @@ fn pairs(m: &ArgMatches, name: &str) -> Result<BTreeMap<String, String>, Failed>
     Ok(out)
 }
 
-async fn sink_id(c: &mut Conn, sink: &str) -> Result<u64, Failed> {
+/// The sink's id, from the tenant's sink records.
+async fn sink_id(store: &sprig_sinks::store::SinksStore, sink: &str) -> Result<u64, Failed> {
     let name = sink.rsplit('.').next().unwrap_or(sink);
-    let ids: Vec<u64> = c
-        .exec("SELECT sink_id FROM sinks WHERE name = ?", (name,))
+    let ids = store
+        .ids_named(name)
         .await
         .map_err(|e| Failed(e.to_string()))?;
     match ids.as_slice() {
-        [id] => Ok(*id),
+        [id] => Ok(id.0),
         [] => Err(Failed(format!("no sink {sink}"))),
         _ => Err(Failed(format!("several sinks are named {name}"))),
     }
@@ -379,12 +380,24 @@ pub(crate) async fn run(sub: &ArgMatches, out: Output) -> Result<(), Failed> {
                 .query_first("SELECT DATABASE()")
                 .await
                 .map_err(|e| Failed(e.to_string()))?;
-            let store = sprig_sinks::store::SinksStore::new(schema.unwrap_or_default());
-            let id = sprig_sinks::model::SinkId(sink_id(&mut c, &sink(m)).await?);
+            // The catalog schema names the tenant; its sink records are on
+            // the engine node, reached through its peer service
+            // (`SPRIGDB_CATALOG_NODE`).
+            let tenant = schema
+                .as_deref()
+                .and_then(|s| s.strip_prefix('t'))
+                .and_then(|s| s.strip_suffix("_sprig"))
+                .and_then(|s| s.parse().ok())
+                .map(sprig_common::ids::TenantId)
+                .ok_or_else(|| {
+                    Failed("--catalog must name a tenant's catalog schema (t<id>_sprig)".into())
+                })?;
+            let store = sprig_sinks::store::SinksStore::remote(tenant);
+            let id = sprig_sinks::model::SinkId(sink_id(&store, &sink(m)).await?);
             match cmd {
                 "list" => {
                     let v = store
-                        .dead_letters(&mut c, id, 1000)
+                        .dead_letters(id, 1000)
                         .await
                         .map_err(|e| Failed(e.to_string()))?;
                     for r in v {
@@ -424,7 +437,7 @@ pub(crate) async fn run(sub: &ArgMatches, out: Output) -> Result<(), Failed> {
                         "discarded"
                     };
                     let n = store
-                        .mark_dead(&mut c, id, &ids, state)
+                        .mark_dead(id, &ids, state)
                         .await
                         .map_err(|e| Failed(e.to_string()))?;
                     println!("{n} dead letters marked {state}");

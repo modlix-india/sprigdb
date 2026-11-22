@@ -13,7 +13,9 @@
 //! `SPRIG_TEST_M04_TENANTS` gives the tenant ids as `acme,globex` (default:
 //! read from `deploy/compose/.gateway-dev/tenants`), and
 //! `SPRIG_TEST_M04_KEYS` the sample key file (default
-//! `deploy/compose/workload-keys.dev`). The gateway must flush within a
+//! `deploy/compose/workload-keys.dev`); `SPRIGDB_CATALOG_NODE` the
+//! gateway's peer listener (`host:port`), where the tenants' catalog
+//! records live. The gateway must flush within a
 //! minute (`gateway-dev.sh` sets `workload.flush_seconds = 10`).
 
 #![allow(
@@ -30,7 +32,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, OptsBuilder, Pool, SslOpts};
-use sprig_catalog::{CatalogEndpoint, StaticLocator, Store};
+use sprig_catalog::Store;
 use sprig_common::ids::TenantId;
 use sprig_testkit::{skip, unique_ident};
 use sprig_workload::keyring::MasterKeyring;
@@ -131,24 +133,14 @@ async fn slow_statements_reach_the_tenants_workload_tables_and_only_its() {
     }
     eprintln!("{RUNS} runs in {:?}", started.elapsed());
 
-    // Read acme's catalog through the reader API until the flush lands.
+    // Read acme's catalog records through the reader API (the engine
+    // node's peer service, `SPRIGDB_CATALOG_NODE`) until the flush lands.
     let pool = Pool::new(backend.as_str());
-    let locator = StaticLocator::new()
-        .with(
-            acme,
-            CatalogEndpoint {
-                pool: pool.clone(),
-                store: Store::for_tenant(acme),
-            },
-        )
-        .with(
-            globex,
-            CatalogEndpoint {
-                pool: pool.clone(),
-                store: Store::for_tenant(globex),
-            },
-        );
-    let store = CatalogWorkloadStore::new(Arc::new(locator));
+    let _ = (&pool, Store::for_tenant(acme), Store::for_tenant(globex));
+    let records: Arc<dyn sprig_catalog::RecordStore> = Arc::new(
+        sprig_catalog::records::remote::RemoteRecords::new(None, None),
+    );
+    let store = CatalogWorkloadStore::new(records);
     let from = SystemTime::now() - Duration::from_secs(3 * 3600);
     let to = SystemTime::now() + Duration::from_secs(3600);
     let deadline = Instant::now() + Duration::from_secs(90);

@@ -532,7 +532,7 @@ pub(crate) fn extreme(args: Vec<Node>, greatest: bool, env: Env<'_>) -> Result<N
     } else if all_str || (any_str && !env.maria()) {
         let ty = agg_result_type(&types, name, env)?;
         check_branches(&args.iter().collect::<Vec<_>>(), &ty, name, env)?;
-        let tys: Vec<&ExprType> = live.iter().copied().collect();
+        let tys: Vec<&ExprType> = live.clone();
         let d = crate::types::aggregate_types(&tys, env.conn(), name, false)?;
         let coll = if d.deriv == Derivation::None {
             bin_collation(d.coll)

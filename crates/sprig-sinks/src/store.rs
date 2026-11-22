@@ -1,156 +1,80 @@
-//! The `sinks` catalog module: `sink_connections`, `sink_secrets`, `sinks`,
-//! `sink_tasks` and `sink_usage` in `t<tenant>_sprig`, their migration, the
-//! snapshot loader ([`SinksExtension`]) and the writes the statements and tasks
-//! make.
+//! The `sinks` catalog module: connections, their sealed credentials,
+//! sinks, `USAGE` grants, task rows and dead letters, kept as the engine's
+//! catalog records (`m/sinks/<table>/<key>`), the snapshot loader
+//! ([`SinksExtension`]) and the writes the statements and tasks make.
+//!
+//! ```text
+//! m/sinks/connections/<connection_id u64>                       ConnectionDef
+//! m/sinks/secrets/<connection_id u64><name><version u32>        SecretRow (sealed)
+//! m/sinks/sinks/<sink_id u64>                                   SinkDef
+//! m/sinks/state/<sink_id u64>                                   StateRow (not versioned)
+//! m/sinks/usage/<db u32><connection><platform u8><user u32>     UsageRow
+//! m/sinks/tasks/<sink_id u64><task_no u32>                      TaskRec (not versioned)
+//! m/sinks/dead/<sink_id u64><dl_id u64>                         DeadRec (not versioned)
+//! ```
+//!
+//! **Versioned and not.** Statements (`CREATE | ALTER | DROP CONNECTION`,
+//! `CREATE | ALTER | DROP SINK`, `GRANT | REVOKE USAGE`) write through the
+//! records of their catalog change ([`apply`](crate::sql::apply)). Tasks
+//! write their own rows (claims, reports, dead letters) and a sink's state
+//! in short engine transactions of their own, as they wrote MariaDB rows
+//! without a catalog version; such rows are never written by a change's
+//! staged records except when a statement sets a state or drops a sink.
+//! A sink's state is its `state` record when there is one, else its
+//! definition's.
 //!
 //! **Storage notes:**
 //! - Sinks and connections have no `objects` row yet (as streams and
 //!   queues have none): their ids come from the object counter, and
 //!   privileges are checked by name (`SPRIG_SINK_ADMIN` on `*.*`).
-//! - `sinks.source_ids` holds the whole source (`{"kind": "stream", "id":
-//!   41, "name": ..., "partitions": 12}`), `target` the target with its
-//!   script, `connection_ids` the references (tenant or platform), and two
-//!   more columns hold `transform_name` (the logic function by name) and
-//!   `options` (the `WITH (...)` values).
-//! - `sink_usage` holds `GRANT USAGE ON [PLATFORM] CONNECTION c TO u`, by
-//!   connection name and user id (grants have no connection object yet).
+//! - Credentials stay sealed at rest: a secret row holds the sealed bytes
+//!   exactly as the MariaDB column did.
+//! - `USAGE` grants are by connection name and user id (grants have no
+//!   connection object yet).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use mysql_async::Row;
-use mysql_async::prelude::Queryable;
-use serde_json::{Map, Value};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sprig_catalog::cache::{ExtState, SnapshotTx};
-use sprig_catalog::migrate::{MigrateOpts, Migration, Module, Phase};
+use sprig_catalog::migrate::{MigrateOpts, Migration, Module};
+use sprig_catalog::records::{Pk, RecordStore, RecordTx, RowTable, next_ids};
 use sprig_catalog::version::VersionKind;
 use sprig_catalog::{CatalogExtension, Migrator};
-use sprig_common::names::quote;
+use sprig_common::ids::TenantId;
 use sprig_common::{Result, SprigCode, SprigError};
 
 use crate::model::{
-    ConnKind, ConnectionDef, ConnectionId, Guarantee, SecretMeta, SinkDef, SinkId, SinkState,
-    TaskEpoch, TaskNo, TaskRow, TaskState, err,
+    ConnectionDef, ConnectionId, SecretMeta, SinkDef, SinkId, SinkState, TaskEpoch, TaskNo,
+    TaskRow, TaskState, err,
 };
 
 /// The module name.
 pub const MODULE: &str = "sinks";
 
-const DDL_CONNECTIONS: &str = "CREATE TABLE IF NOT EXISTS sink_connections (
-  connection_id   BIGINT UNSIGNED NOT NULL,
-  db_id           INT UNSIGNED NOT NULL,
-  name            VARCHAR(64) NOT NULL,
-  kind            ENUM('webhook','kafka','s3','mysql','postgresql') NOT NULL,
-  options         JSON NOT NULL,
-  hosts           JSON NOT NULL,
-  residency_tags  JSON NULL,
-  owner_user_id   INT UNSIGNED NOT NULL,
-  created_at      DATETIME(3) NOT NULL,
-  updated_at      DATETIME(3) NOT NULL,
-  PRIMARY KEY (connection_id),
-  UNIQUE KEY uk_conn_name (db_id, name)
-) ENGINE=InnoDB";
+/// Connections.
+pub const CONNECTIONS: RowTable = RowTable::new(MODULE, "connections");
+/// Sealed credentials.
+pub const SECRETS: RowTable = RowTable::new(MODULE, "secrets");
+/// Sinks' definitions.
+pub const SINKS: RowTable = RowTable::new(MODULE, "sinks");
+/// Sinks' current states.
+pub const STATES: RowTable = RowTable::new(MODULE, "state");
+/// `USAGE` grants.
+pub const USAGE: RowTable = RowTable::new(MODULE, "usage");
+/// Task rows.
+pub const TASKS: RowTable = RowTable::new(MODULE, "tasks");
+/// Dead letters.
+pub const DEAD: RowTable = RowTable::new(MODULE, "dead");
+/// The dead letters' id counter.
+const DEAD_COUNTER: &str = "sink_dead";
 
-const DDL_SECRETS: &str = "CREATE TABLE IF NOT EXISTS sink_secrets (
-  connection_id   BIGINT UNSIGNED NOT NULL,
-  name            VARCHAR(64) NOT NULL,
-  version         INT UNSIGNED NOT NULL,
-  key_version     INT UNSIGNED NOT NULL,
-  sealed          VARBINARY(16384) NOT NULL,
-  state           ENUM('current','previous','retired') NOT NULL,
-  set_by          INT UNSIGNED NOT NULL,
-  set_at          DATETIME(3) NOT NULL,
-  PRIMARY KEY (connection_id, name, version)
-) ENGINE=InnoDB";
-
-const DDL_SINKS: &str = "CREATE TABLE IF NOT EXISTS sinks (
-  sink_id         BIGINT UNSIGNED NOT NULL,
-  db_id           INT UNSIGNED NOT NULL,
-  name            VARCHAR(64) NOT NULL,
-  source_kind     ENUM('stream','queue','changes') NOT NULL,
-  source_ids      JSON NOT NULL,
-  filter_sql      TEXT NULL,
-  projection      JSON NULL,
-  transform_fn    BIGINT UNSIGNED NULL,
-  transform_name  VARCHAR(64) NULL,
-  target_kind     ENUM('webhook','kafka','s3','database','script') NOT NULL,
-  connection_ids  JSON NOT NULL,
-  target          JSON NOT NULL,
-  guarantee       ENUM('at_least_once','exactly_once') NOT NULL,
-  dead_letter     JSON NULL,
-  start_at        JSON NOT NULL,
-  owner_user_id   INT UNSIGNED NOT NULL,
-  state           ENUM('creating','running','paused','failing','failed','dropping') NOT NULL,
-  state_reason    VARCHAR(1024) NULL,
-  definition_ver  BIGINT UNSIGNED NOT NULL,
-  options         JSON NULL,
-  created_at      DATETIME(3) NOT NULL,
-  updated_at      DATETIME(3) NOT NULL,
-  PRIMARY KEY (sink_id),
-  UNIQUE KEY uk_sink_name (db_id, name)
-) ENGINE=InnoDB";
-
-const DDL_TASKS: &str = "CREATE TABLE IF NOT EXISTS sink_tasks (
-  sink_id         BIGINT UNSIGNED NOT NULL,
-  task_no         INT UNSIGNED NOT NULL,
-  source_part     JSON NOT NULL,
-  epoch           BIGINT UNSIGNED NOT NULL,
-  worker_id       VARCHAR(64) NULL,
-  pending         JSON NULL,
-  state           ENUM('idle','running','retrying','paused','failed') NOT NULL,
-  attempts        INT UNSIGNED NOT NULL DEFAULT 0,
-  last_error      VARCHAR(2048) NULL,
-  last_error_at   DATETIME(3) NULL,
-  delivered       BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  updated_at      DATETIME(3) NOT NULL,
-  PRIMARY KEY (sink_id, task_no)
-) ENGINE=InnoDB";
-
-const DDL_USAGE: &str = "CREATE TABLE IF NOT EXISTS sink_usage (
-  db_id           INT UNSIGNED NOT NULL,
-  connection_name VARCHAR(64) NOT NULL,
-  platform        BOOLEAN NOT NULL,
-  user_id         INT UNSIGNED NOT NULL,
-  granted_by      INT UNSIGNED NOT NULL,
-  granted_at      DATETIME(3) NOT NULL,
-  PRIMARY KEY (db_id, connection_name, platform, user_id)
-) ENGINE=InnoDB";
-
-const DDL_DEAD: &str = "CREATE TABLE IF NOT EXISTS sink_dead_letters (
-  dl_id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  sink_id         BIGINT UNSIGNED NOT NULL,
-  idem_key        VARCHAR(200) NOT NULL,
-  record_key      VARBINARY(4096) NULL,
-  record_value    LONGBLOB NULL,
-  headers         JSON NULL,
-  op              CHAR(1) NULL,
-  before_image    JSON NULL,
-  after_image     JSON NULL,
-  ts_ms           BIGINT NOT NULL,
-  position        VARBINARY(2048) NOT NULL,
-  reason          VARCHAR(2048) NOT NULL,
-  class           VARCHAR(32) NOT NULL,
-  attempts        INT UNSIGNED NOT NULL,
-  state           ENUM('dead','replaying','replayed','discarded') NOT NULL,
-  created_at      DATETIME(3) NOT NULL,
-  PRIMARY KEY (dl_id),
-  KEY k_sink (sink_id, state, dl_id)
-) ENGINE=InnoDB";
-
-/// The module's migrations.
-pub static SINKS_MIGRATIONS: &[Migration] = &[Migration {
-    format: 1,
-    phase: Phase::Expand,
-    name: "sink_connections, sink_secrets, sinks, sink_tasks, sink_usage, sink_dead_letters",
-    statements: &[
-        DDL_CONNECTIONS,
-        DDL_SECRETS,
-        DDL_SINKS,
-        DDL_TASKS,
-        DDL_USAGE,
-        DDL_DEAD,
-    ],
-}];
+/// The module's MariaDB migrations: none, its rows are engine records.
+pub static SINKS_MIGRATIONS: &[Migration] = &[];
 
 /// The module, for [`Migrator::new`].
 pub const SINKS_MODULE: Module = Module {
@@ -158,61 +82,218 @@ pub const SINKS_MODULE: Module = Module {
     migrations: SINKS_MIGRATIONS,
 };
 
-/// Applies the module's migrations to catalog `schema`.
+/// Makes sure catalog `schema` can take the module's records (its core
+/// migrations, which create the record log).
 ///
 /// # Errors
 /// The migrator's.
 pub async fn migrate(c: &mut mysql_async::Conn, schema: &str) -> Result<()> {
-    Migrator::new(&[SINKS_MODULE])?
+    Migrator::new(&[])?
         .run(c, schema, &MigrateOpts::default())
         .await?;
     Ok(())
-}
-
-fn map_err(e: mysql_async::Error) -> SprigError {
-    match &e {
-        mysql_async::Error::Server(s) => match s.code {
-            1205 | 1213 => SprigError::new(SprigCode::CatalogConflict, "catalog row busy; retry"),
-            1062 => err(
-                SprigCode::SinkExists,
-                "a sink or connection with this name exists",
-            ),
-            code => {
-                let mut state = *b"HY000";
-                if s.state.len() == 5 {
-                    state.copy_from_slice(s.state.as_bytes());
-                }
-                SprigError::backend(code, state, format!("catalog statement failed ({code})"))
-            }
-        }
-        .with_source(e),
-        _ => SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e),
-    }
 }
 
 fn bad(what: &str) -> SprigError {
     SprigError::internal(format!("sinks catalog: {what}"))
 }
 
-fn col<T: mysql_async::prelude::FromValue>(row: &Row, i: usize) -> Result<T> {
-    row.get_opt::<T, usize>(i)
-        .and_then(std::result::Result::ok)
-        .ok_or_else(|| bad(&format!("bad column {i}")))
+fn exists() -> SprigError {
+    err(
+        SprigCode::SinkExists,
+        "a sink or connection with this name exists",
+    )
 }
 
-fn json_col<T: serde::de::DeserializeOwned>(row: &Row, i: usize) -> Result<T> {
-    let s: String = col(row, i)?;
-    serde_json::from_str(&s).map_err(|e| bad(&format!("column {i}: {e}")))
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-fn opt_json_col<T: serde::de::DeserializeOwned>(row: &Row, i: usize) -> Result<Option<T>> {
-    let s: Option<String> = col(row, i)?;
-    s.map(|s| serde_json::from_str(&s).map_err(|e| bad(&format!("column {i}: {e}"))))
+/// `YYYY-MM-DD HH:MM:SS.fff` (UTC) of `ms` since the epoch.
+fn utc_text(ms: u64) -> String {
+    let secs = ms / 1000;
+    let days = i64::try_from(secs / 86_400).unwrap_or(0);
+    let rem = secs % 86_400;
+    // Days to a civil date (proleptic Gregorian).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}.{:03}",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60,
+        ms % 1000
+    )
+}
+
+fn b64(v: Option<&Vec<u8>>) -> Option<String> {
+    v.map(|b| STANDARD.encode(b))
+}
+
+fn unb64(v: Option<&String>) -> Result<Option<Vec<u8>>> {
+    v.map(|s| STANDARD.decode(s).map_err(|_| bad("base64")))
         .transpose()
 }
 
-fn to_json<T: serde::Serialize>(v: &T) -> String {
-    serde_json::to_string(v).unwrap_or_else(|_| "null".into())
+/// A sealed credential version: what `sink_secrets` held.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretRow {
+    /// The sealing key's version.
+    pub key_version: u32,
+    /// The sealed value (base64 of the sealed bytes; empty once retired).
+    pub sealed: String,
+    /// `current`, `previous` or `retired`.
+    pub state: String,
+    /// Who set it.
+    pub set_by: u32,
+    /// When (ms since the epoch).
+    pub set_at_ms: u64,
+}
+
+/// A sink's definition as stored, with its creation time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SinkRow {
+    /// The definition.
+    #[serde(flatten)]
+    pub def: SinkDef,
+    /// When it was created (ms since the epoch).
+    pub created_at_ms: u64,
+}
+
+/// A sink's current state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateRow {
+    /// The state.
+    pub state: SinkState,
+    /// Why (failures and pauses).
+    pub reason: Option<String>,
+    /// When (ms since the epoch).
+    pub at_ms: u64,
+}
+
+/// A `USAGE` grant's extra columns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageRow {
+    /// Who granted it.
+    pub granted_by: u32,
+    /// When (ms since the epoch).
+    pub granted_at_ms: u64,
+}
+
+/// A task row: what `sink_tasks` held.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskRec {
+    /// The task's share of the source.
+    pub source_part: Value,
+    /// Bumped on every claim.
+    pub epoch: u64,
+    /// The claiming worker.
+    pub worker_id: Option<String>,
+    /// Pending work (not written by this build).
+    pub pending: Option<Value>,
+    /// The task's state.
+    pub state: TaskState,
+    /// Failed attempts in a row.
+    pub attempts: u32,
+    /// The last error.
+    pub last_error: Option<String>,
+    /// When it happened (ms).
+    pub last_error_at_ms: Option<u64>,
+    /// Records delivered.
+    pub delivered: u64,
+    /// Last change (ms).
+    pub updated_at_ms: u64,
+}
+
+/// A dead letter: what `sink_dead_letters` held.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeadRec {
+    /// The record's idempotency key.
+    pub idem_key: String,
+    /// Its key (base64).
+    pub key: Option<String>,
+    /// Its value (base64).
+    pub value: Option<String>,
+    /// Its headers.
+    pub headers: Value,
+    /// A change's operation letter.
+    pub op: Option<String>,
+    /// A change's before image.
+    pub before: Option<Value>,
+    /// A change's after image.
+    pub after: Option<Value>,
+    /// The record's time.
+    pub ts_ms: i64,
+    /// Its source position (base64 of the encoded position).
+    pub position: String,
+    /// Why it died.
+    pub reason: String,
+    /// The class of failure.
+    pub class: String,
+    /// Attempts made.
+    pub attempts: u32,
+    /// `dead`, `replaying`, `replayed`, `discarded`.
+    pub state: String,
+    /// When (ms).
+    pub created_at_ms: u64,
+}
+
+fn secret_pk(conn: ConnectionId, name: &str, version: u32) -> Pk {
+    Pk::new().u64(conn.0).bytes(name.as_bytes()).u32(version)
+}
+
+fn usage_pk(u: &Usage) -> Pk {
+    Pk::new()
+        .u32(u.db_id)
+        .bytes(u.connection.as_bytes())
+        .u8(u8::from(u.platform))
+        .u32(u.user_id)
+}
+
+/// A usage key's parts back (database, connection, platform, user).
+fn split_usage(k: &[u8]) -> Option<Usage> {
+    let db_id = u32::from_be_bytes(k.get(..4)?.try_into().ok()?);
+    let (name, rest) = unescape(k.get(4..)?)?;
+    let platform = *rest.first()? != 0;
+    let user_id = u32::from_be_bytes(rest.get(1..5)?.try_into().ok()?);
+    Some(Usage {
+        db_id,
+        connection: String::from_utf8_lossy(&name).into_owned(),
+        platform,
+        user_id,
+    })
+}
+
+/// A `Pk::bytes` part and what follows it.
+fn unescape(k: &[u8]) -> Option<(Vec<u8>, &[u8])> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    loop {
+        let b = *k.get(i)?;
+        if b == 0 {
+            match *k.get(i + 1)? {
+                0 => return Some((out, k.get(i + 2..)?)),
+                0xFF => {
+                    out.push(0);
+                    i += 2;
+                    continue;
+                }
+                _ => return None,
+            }
+        }
+        out.push(b);
+        i += 1;
+    }
 }
 
 /// A grant of `USAGE` on a connection.
@@ -278,249 +359,198 @@ impl SinksState {
     }
 }
 
-const CONN_COLUMNS: &str = "connection_id, db_id, name, kind, CAST(options AS CHAR), \
-     CAST(hosts AS CHAR), CAST(residency_tags AS CHAR), owner_user_id";
-
-const SINK_COLUMNS: &str = "sink_id, db_id, name, CAST(source_ids AS CHAR), filter_sql, \
-     CAST(projection AS CHAR), transform_name, CAST(connection_ids AS CHAR), \
-     CAST(target AS CHAR), guarantee, CAST(dead_letter AS CHAR), CAST(start_at AS CHAR), \
-     owner_user_id, state, state_reason, definition_ver, CAST(options AS CHAR)";
-
-/// Reads and writes the module's tables in one catalog schema.
-#[derive(Debug, Clone)]
+/// The module's records: versioned writes inside a catalog change's
+/// records (associated functions taking a [`RecordTx`]), and reads and
+/// task writes in short transactions of their own on a tenant's records
+/// (methods).
+#[derive(Clone)]
 pub struct SinksStore {
-    schema: String,
+    records: Arc<dyn RecordStore>,
+    tenant: TenantId,
+}
+
+impl std::fmt::Debug for SinksStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SinksStore")
+            .field("tenant", &self.tenant)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SinksStore {
-    /// The tables of catalog schema `schema`.
+    /// `tenant`'s sink records in `records`.
     #[must_use]
-    pub fn new(schema: impl Into<String>) -> Self {
-        Self {
-            schema: schema.into(),
-        }
+    pub fn new(records: Arc<dyn RecordStore>, tenant: TenantId) -> Self {
+        Self { records, tenant }
     }
 
-    fn t(&self, table: &str) -> String {
-        format!("{}.{table}", quote(&self.schema))
+    /// `tenant`'s sink records through the engine node's peer service
+    /// (`SPRIGDB_CATALOG_NODE`): operators' tools.
+    #[must_use]
+    pub fn remote(tenant: TenantId) -> Self {
+        Self::new(
+            Arc::new(sprig_catalog::records::remote::RemoteRecords::new(
+                None, None,
+            )),
+            tenant,
+        )
     }
 
-    /// Whether the module's tables exist.
-    pub async fn migrated<Q: Queryable + Send>(&self, q: &mut Q) -> Result<bool> {
-        let n: Option<u64> = q
-            .exec_first(
-                "SELECT COUNT(*) FROM information_schema.TABLES \
-                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'sink_usage'",
-                (self.schema.as_str(),),
-            )
-            .await
-            .map_err(map_err)?;
-        Ok(n.unwrap_or(0) > 0)
+    /// The ids of the sinks named `name` (in any database).
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn ids_named(&self, name: &str) -> Result<Vec<SinkId>> {
+        let name = name.to_owned();
+        self.read(|rec| {
+            Box::pin(async move {
+                Ok(SINKS
+                    .rows::<SinkRow>(rec, &Pk::new())
+                    .await?
+                    .into_iter()
+                    .filter(|r| r.def.name == name)
+                    .map(|r| r.def.id)
+                    .collect())
+            })
+        })
+        .await
     }
+
+    async fn read<T, F>(&self, f: F) -> Result<T>
+    where
+        F: for<'a> FnOnce(
+            &'a mut dyn RecordTx,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>,
+        >,
+    {
+        let mut tx = self.records.begin(self.tenant).await?;
+        let r = f(&mut *tx).await;
+        let _ = tx.rollback().await;
+        r
+    }
+
+    // ---- inside a catalog change, and the snapshot ----
 
     /// Everything a snapshot holds.
-    pub async fn load<Q: Queryable + Send>(&self, q: &mut Q) -> Result<SinksState> {
+    ///
+    /// # Errors
+    /// The record store's; `Internal` for a malformed row.
+    pub async fn load(rec: &mut dyn RecordTx) -> Result<SinksState> {
         let mut st = SinksState {
             migrated: true,
             ..SinksState::default()
         };
-        let rows: Vec<Row> = q
-            .query(format!(
-                "SELECT {CONN_COLUMNS} FROM {}",
-                self.t("sink_connections")
-            ))
-            .await
-            .map_err(map_err)?;
-        let mut conns = Vec::new();
-        for r in &rows {
-            conns.push(conn_of(r)?);
-        }
-        let secrets: Vec<(u64, String, u32, u32, String)> = q
-            .query(format!(
-                "SELECT connection_id, name, version, set_by, \
-                 DATE_FORMAT(set_at, '%Y-%m-%d %H:%i:%s.%f') FROM {} WHERE state = 'current' \
-                 ORDER BY connection_id, name",
-                self.t("sink_secrets")
-            ))
-            .await
-            .map_err(map_err)?;
-        for c in &mut conns {
+        let secrets = SECRETS.scan::<SecretRow>(rec, &Pk::new()).await?;
+        for mut c in CONNECTIONS.rows::<ConnectionDef>(rec, &Pk::new()).await? {
+            let under = Pk::new().u64(c.id.0);
             c.secrets = secrets
                 .iter()
-                .filter(|s| s.0 == c.id.0)
-                .map(|s| SecretMeta {
-                    name: s.1.clone(),
-                    version: s.2,
-                    set_by: s.3,
-                    set_at: s.4.chars().take(23).collect(),
+                .filter(|(pk, r)| pk.0.starts_with(&under.0) && r.state == "current")
+                .filter_map(|(pk, r)| {
+                    let (name, rest) = unescape(pk.0.get(8..)?)?;
+                    let version = u32::from_be_bytes(rest.get(..4)?.try_into().ok()?);
+                    Some(SecretMeta {
+                        name: String::from_utf8_lossy(&name).into_owned(),
+                        version,
+                        set_by: r.set_by,
+                        set_at: utc_text(r.set_at_ms),
+                    })
                 })
                 .collect();
-        }
-        for c in conns {
+            c.secrets.sort_by(|a, b| a.name.cmp(&b.name));
             st.connections
                 .insert((c.db_id, c.name.clone()), Arc::new(c));
         }
-        let rows: Vec<Row> = q
-            .query(format!(
-                "SELECT {SINK_COLUMNS} FROM {} WHERE state <> 'dropping'",
-                self.t("sinks")
-            ))
-            .await
-            .map_err(map_err)?;
-        for r in &rows {
-            let s = sink_of(r)?;
+        let states: BTreeMap<u64, StateRow> = STATES
+            .scan::<StateRow>(rec, &Pk::new())
+            .await?
+            .into_iter()
+            .filter_map(|(pk, r)| Some((u64::from_be_bytes(pk.0.get(..8)?.try_into().ok()?), r)))
+            .collect();
+        for row in SINKS.rows::<SinkRow>(rec, &Pk::new()).await? {
+            let mut s = row.def;
+            if let Some(r) = states.get(&s.id.0) {
+                s.state = r.state;
+                s.state_reason.clone_from(&r.reason);
+            }
+            if s.state == SinkState::Dropping {
+                continue;
+            }
             st.sinks.insert((s.db_id, s.name.clone()), Arc::new(s));
         }
-        let usage: Vec<(u32, String, bool, u32)> = q
-            .query(format!(
-                "SELECT db_id, connection_name, platform, user_id FROM {}",
-                self.t("sink_usage")
-            ))
-            .await
-            .map_err(map_err)?;
-        st.usage = usage
-            .into_iter()
-            .map(|(db_id, connection, platform, user_id)| Usage {
-                db_id,
-                connection,
-                platform,
-                user_id,
-            })
-            .collect();
+        for (pk, _) in USAGE.scan::<UsageRow>(rec, &Pk::new()).await? {
+            st.usage
+                .push(split_usage(&pk.0).ok_or_else(|| bad("usage key"))?);
+        }
         Ok(st)
     }
 
-    /// One sink by id (workers).
-    pub async fn sink<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        id: SinkId,
-    ) -> Result<Option<SinkDef>> {
-        let r: Option<Row> = q
-            .exec_first(
-                format!(
-                    "SELECT {SINK_COLUMNS} FROM {} WHERE sink_id = ?",
-                    self.t("sinks")
-                ),
-                (id.0,),
-            )
-            .await
-            .map_err(map_err)?;
-        r.as_ref().map(sink_of).transpose()
-    }
-
-    /// One connection by id (workers).
-    pub async fn connection<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        id: ConnectionId,
-    ) -> Result<Option<ConnectionDef>> {
-        let r: Option<Row> = q
-            .exec_first(
-                format!(
-                    "SELECT {CONN_COLUMNS} FROM {} WHERE connection_id = ?",
-                    self.t("sink_connections")
-                ),
-                (id.0,),
-            )
-            .await
-            .map_err(map_err)?;
-        r.as_ref().map(conn_of).transpose()
-    }
-
-    /// Inserts a connection.
-    pub async fn insert_connection<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        c: &ConnectionDef,
-    ) -> Result<()> {
-        q.exec_drop(
-            format!(
-                "INSERT INTO {} (connection_id, db_id, name, kind, options, hosts, residency_tags, \
-                 owner_user_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, \
-                 UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))",
-                self.t("sink_connections")
-            ),
-            (
-                c.id.0,
-                c.db_id,
-                c.name.as_str(),
-                c.kind.as_str(),
-                to_json(&c.options),
-                to_json(&c.hosts),
-                c.residency_tags.as_ref().map(to_json),
-                c.owner_user_id,
-            ),
-        )
-        .await
-        .map_err(map_err)
+    /// Inserts a connection (its name must be free in its database).
+    ///
+    /// # Errors
+    /// 39211 when the name is taken; the record store's.
+    pub async fn insert_connection(rec: &mut dyn RecordTx, c: &ConnectionDef) -> Result<()> {
+        let taken = CONNECTIONS
+            .rows::<ConnectionDef>(rec, &Pk::new())
+            .await?
+            .iter()
+            .any(|o| o.db_id == c.db_id && o.name == c.name && o.id != c.id);
+        if taken
+            || CONNECTIONS
+                .get::<Value>(rec, &Pk::new().u64(c.id.0))
+                .await?
+                .is_some()
+        {
+            return Err(exists());
+        }
+        let mut row = c.clone();
+        row.secrets.clear();
+        CONNECTIONS.put(rec, &Pk::new().u64(c.id.0), &row).await
     }
 
     /// Updates a connection's options, hosts and tags.
-    pub async fn update_connection<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        c: &ConnectionDef,
-    ) -> Result<()> {
-        q.exec_drop(
-            format!(
-                "UPDATE {} SET options = ?, hosts = ?, residency_tags = ?, \
-                 updated_at = UTC_TIMESTAMP(3) WHERE connection_id = ?",
-                self.t("sink_connections")
-            ),
-            (
-                to_json(&c.options),
-                to_json(&c.hosts),
-                c.residency_tags.as_ref().map(to_json),
-                c.id.0,
-            ),
-        )
-        .await
-        .map_err(map_err)
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn update_connection(rec: &mut dyn RecordTx, c: &ConnectionDef) -> Result<()> {
+        let pk = Pk::new().u64(c.id.0);
+        if let Some(mut row) = CONNECTIONS.get::<ConnectionDef>(rec, &pk).await? {
+            row.options.clone_from(&c.options);
+            row.hosts.clone_from(&c.hosts);
+            row.residency_tags.clone_from(&c.residency_tags);
+            CONNECTIONS.put(rec, &pk, &row).await?;
+        }
+        Ok(())
     }
 
     /// Deletes a connection, its secrets and its grants.
-    pub async fn delete_connection<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        c: &ConnectionDef,
-    ) -> Result<()> {
-        q.exec_drop(
-            format!(
-                "DELETE FROM {} WHERE connection_id = ?",
-                self.t("sink_secrets")
-            ),
-            (c.id.0,),
-        )
-        .await
-        .map_err(map_err)?;
-        q.exec_drop(
-            format!(
-                "DELETE FROM {} WHERE db_id = ? AND connection_name = ? AND platform = FALSE",
-                self.t("sink_usage")
-            ),
-            (c.db_id, c.name.as_str()),
-        )
-        .await
-        .map_err(map_err)?;
-        q.exec_drop(
-            format!(
-                "DELETE FROM {} WHERE connection_id = ?",
-                self.t("sink_connections")
-            ),
-            (c.id.0,),
-        )
-        .await
-        .map_err(map_err)
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn delete_connection(rec: &mut dyn RecordTx, c: &ConnectionDef) -> Result<()> {
+        for (pk, _) in SECRETS
+            .scan::<SecretRow>(rec, &Pk::new().u64(c.id.0))
+            .await?
+        {
+            SECRETS.delete(rec, &pk).await?;
+        }
+        let under = Pk::new().u32(c.db_id).bytes(c.name.as_bytes()).u8(0);
+        for (pk, _) in USAGE.scan::<UsageRow>(rec, &under).await? {
+            USAGE.delete(rec, &pk).await?;
+        }
+        CONNECTIONS.delete(rec, &Pk::new().u64(c.id.0)).await
     }
 
     /// Writes a new version of credential `name`: the old current becomes
     /// previous, older previous versions are retired (their sealed bytes
-    /// emptied). Returns the new version.
+    /// emptied).
+    ///
+    /// # Errors
+    /// The record store's.
     #[allow(clippy::too_many_arguments)]
-    pub async fn put_secret<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
+    pub async fn put_secret(
+        rec: &mut dyn RecordTx,
         conn: ConnectionId,
         name: &str,
         version: u32,
@@ -528,348 +558,469 @@ impl SinksStore {
         sealed: &[u8],
         set_by: u32,
     ) -> Result<()> {
-        q.exec_drop(
-            format!(
-                "UPDATE {} SET state = 'retired', sealed = '' \
-                 WHERE connection_id = ? AND name = ? AND state = 'previous'",
-                self.t("sink_secrets")
-            ),
-            (conn.0, name),
-        )
-        .await
-        .map_err(map_err)?;
-        q.exec_drop(
-            format!(
-                "UPDATE {} SET state = 'previous' WHERE connection_id = ? AND name = ? \
-                 AND state = 'current'",
-                self.t("sink_secrets")
-            ),
-            (conn.0, name),
-        )
-        .await
-        .map_err(map_err)?;
-        q.exec_drop(
-            format!(
-                "INSERT INTO {} (connection_id, name, version, key_version, sealed, state, set_by, \
-                 set_at) VALUES (?, ?, ?, ?, ?, 'current', ?, UTC_TIMESTAMP(3))",
-                self.t("sink_secrets")
-            ),
-            (conn.0, name, version, key_version, sealed, set_by),
-        )
-        .await
-        .map_err(map_err)
+        let under = Pk::new().u64(conn.0).bytes(name.as_bytes());
+        for (pk, mut r) in SECRETS.scan::<SecretRow>(rec, &under).await? {
+            let next = match r.state.as_str() {
+                "previous" => "retired",
+                "current" => "previous",
+                _ => continue,
+            };
+            r.state = next.to_owned();
+            if next == "retired" {
+                r.sealed.clear();
+            }
+            SECRETS.put(rec, &pk, &r).await?;
+        }
+        SECRETS
+            .put(
+                rec,
+                &secret_pk(conn, name, version),
+                &SecretRow {
+                    key_version,
+                    sealed: STANDARD.encode(sealed),
+                    state: "current".to_owned(),
+                    set_by,
+                    set_at_ms: now_ms(),
+                },
+            )
+            .await
     }
 
     /// The next version of credential `name`.
-    pub async fn next_secret_version<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn next_secret_version(
+        rec: &mut dyn RecordTx,
         conn: ConnectionId,
         name: &str,
     ) -> Result<u32> {
-        let v: Option<Option<u32>> = q
-            .exec_first(
-                format!(
-                    "SELECT MAX(version) FROM {} WHERE connection_id = ? AND name = ?",
-                    self.t("sink_secrets")
-                ),
-                (conn.0, name),
-            )
-            .await
-            .map_err(map_err)?;
-        Ok(v.flatten().unwrap_or(0) + 1)
+        let under = Pk::new().u64(conn.0).bytes(name.as_bytes());
+        let last = SECRETS
+            .scan::<SecretRow>(rec, &under)
+            .await?
+            .last()
+            .and_then(|(pk, _)| {
+                let k = &pk.0;
+                k.len()
+                    .checked_sub(4)
+                    .and_then(|i| k.get(i..))
+                    .and_then(|b| b.try_into().ok())
+                    .map(u32::from_be_bytes)
+            });
+        Ok(last.unwrap_or(0) + 1)
     }
 
-    /// Sealed credentials of a connection: `(name, version, key version,
-    /// sealed, previous)` for current and previous versions; previous ones
-    /// only while younger than `previous_hours`.
-    pub async fn sealed_secrets<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        conn: ConnectionId,
-        previous_hours: u64,
-    ) -> Result<Vec<(String, u32, u32, Vec<u8>, bool)>> {
-        let rows: Vec<(String, u32, u32, Vec<u8>, String)> = q
-            .exec(
-                format!(
-                    "SELECT s.name, s.version, s.key_version, s.sealed, s.state FROM {t} s \
-                     WHERE s.connection_id = ? AND (s.state = 'current' OR (s.state = 'previous' \
-                     AND (SELECT c.set_at FROM {t} c WHERE c.connection_id = s.connection_id \
-                     AND c.name = s.name AND c.state = 'current') > UTC_TIMESTAMP(3) - INTERVAL ? HOUR))",
-                    t = self.t("sink_secrets")
-                ),
-                (conn.0, previous_hours),
-            )
-            .await
-            .map_err(map_err)?;
-        Ok(rows
-            .into_iter()
-            .map(|(n, v, kv, s, st)| (n, v, kv, s, st == "previous"))
-            .collect())
+    /// Inserts a sink (its name must be free in its database).
+    ///
+    /// # Errors
+    /// 39211 when the name is taken; the record store's.
+    pub async fn insert_sink(rec: &mut dyn RecordTx, s: &SinkDef) -> Result<()> {
+        let taken = SINKS
+            .rows::<SinkRow>(rec, &Pk::new())
+            .await?
+            .iter()
+            .any(|o| o.def.db_id == s.db_id && o.def.name == s.name && o.def.id != s.id);
+        if taken
+            || SINKS
+                .get::<Value>(rec, &Pk::new().u64(s.id.0))
+                .await?
+                .is_some()
+        {
+            return Err(exists());
+        }
+        let row = SinkRow {
+            def: s.clone(),
+            created_at_ms: now_ms(),
+        };
+        SINKS.put(rec, &Pk::new().u64(s.id.0), &row).await
     }
 
-    /// Inserts a sink.
-    pub async fn insert_sink<Q: Queryable + Send>(&self, q: &mut Q, s: &SinkDef) -> Result<()> {
-        q.exec_drop(
-            format!(
-                "INSERT INTO {} (sink_id, db_id, name, source_kind, source_ids, filter_sql, \
-                 projection, transform_name, target_kind, connection_ids, target, guarantee, \
-                 dead_letter, start_at, owner_user_id, state, state_reason, definition_ver, \
-                 options, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                 ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))",
-                self.t("sinks")
-            ),
-            mysql_async::Params::Positional(vec![
-                s.id.0.into(),
-                s.db_id.into(),
-                s.name.as_str().into(),
-                s.source.kind().as_str().into(),
-                to_json(&s.source).into(),
-                s.filter_sql.clone().into(),
-                s.projection.as_ref().map(to_json).into(),
-                s.transform.clone().into(),
-                s.target.kind().as_str().into(),
-                to_json(&s.connections).into(),
-                to_json(&s.target).into(),
-                s.guarantee.as_str().into(),
-                s.dead_letter.as_ref().map(to_json).into(),
-                to_json(&s.start_at).into(),
-                s.owner_user_id.into(),
-                s.state.as_str().into(),
-                s.state_reason.clone().into(),
-                s.definition_ver.into(),
-                to_json(&s.options).into(),
-            ]),
-        )
-        .await
-        .map_err(map_err)
+    /// Rewrites a sink's definition (`ALTER SINK`), bumping its version;
+    /// its state is the statement's.
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn update_sink(rec: &mut dyn RecordTx, s: &SinkDef) -> Result<()> {
+        let pk = Pk::new().u64(s.id.0);
+        let Some(mut row) = SINKS.get::<SinkRow>(rec, &pk).await? else {
+            return Ok(());
+        };
+        let d = &mut row.def;
+        d.source = s.source.clone();
+        d.target = s.target.clone();
+        d.start_at = s.start_at;
+        d.owner_user_id = s.owner_user_id;
+        d.state = s.state;
+        d.state_reason.clone_from(&s.state_reason);
+        d.definition_ver += 1;
+        d.options.clone_from(&s.options);
+        SINKS.put(rec, &pk, &row).await
     }
 
-    /// Rewrites a sink's definition (`ALTER SINK`), bumping its version.
-    pub async fn update_sink<Q: Queryable + Send>(&self, q: &mut Q, s: &SinkDef) -> Result<()> {
-        q.exec_drop(
-            format!(
-                "UPDATE {} SET source_ids = ?, target = ?, start_at = ?, owner_user_id = ?, \
-                 state = ?, state_reason = ?, definition_ver = definition_ver + 1, options = ?, \
-                 updated_at = UTC_TIMESTAMP(3) WHERE sink_id = ?",
-                self.t("sinks")
-            ),
-            (
-                to_json(&s.source),
-                to_json(&s.target),
-                to_json(&s.start_at),
-                s.owner_user_id,
-                s.state.as_str(),
-                s.state_reason.clone(),
-                to_json(&s.options),
-                s.id.0,
-            ),
-        )
-        .await
-        .map_err(map_err)
-    }
-
-    /// Sets a sink's state (tasks and statements). Changing only the state
-    /// doesn't bump `definition_ver`.
-    pub async fn set_state<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
+    /// Writes a sink's state record in `rec`.
+    async fn put_state(
+        rec: &mut dyn RecordTx,
         id: SinkId,
         state: SinkState,
         reason: Option<&str>,
     ) -> Result<()> {
-        q.exec_drop(
-            format!(
-                "UPDATE {} SET state = ?, state_reason = ?, updated_at = UTC_TIMESTAMP(3) \
-                 WHERE sink_id = ?",
-                self.t("sinks")
-            ),
-            (
-                state.as_str(),
-                reason.map(|r| r.chars().take(1024).collect::<String>()),
-                id.0,
-            ),
-        )
-        .await
-        .map_err(map_err)
-    }
-
-    /// The state and definition version of a sink (tasks poll it).
-    pub async fn state_of<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        id: SinkId,
-    ) -> Result<Option<(SinkState, Option<String>, u64)>> {
-        let r: Option<(String, Option<String>, u64)> = q
-            .exec_first(
-                format!(
-                    "SELECT state, state_reason, definition_ver FROM {} WHERE sink_id = ?",
-                    self.t("sinks")
-                ),
-                (id.0,),
+        STATES
+            .put(
+                rec,
+                &Pk::new().u64(id.0),
+                &StateRow {
+                    state,
+                    reason: reason.map(|r| r.chars().take(1024).collect()),
+                    at_ms: now_ms(),
+                },
             )
             .await
-            .map_err(map_err)?;
-        Ok(r.and_then(|(s, r, v)| SinkState::parse(&s).map(|s| (s, r, v))))
     }
 
-    /// Every sink's state and reason, read now (workers change them
-    /// without a catalog version, so snapshots lag).
-    pub async fn states<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-    ) -> Result<std::collections::HashMap<u64, (SinkState, Option<String>)>> {
-        let rows: Vec<(u64, String, Option<String>)> = q
-            .query(format!(
-                "SELECT sink_id, state, state_reason FROM {}",
-                self.t("sinks")
-            ))
-            .await
-            .map_err(map_err)?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|(id, s, r)| SinkState::parse(&s).map(|s| (id, (s, r))))
-            .collect())
-    }
-
-    /// Deletes a sink and its tasks.
-    pub async fn delete_sink<Q: Queryable + Send>(&self, q: &mut Q, id: SinkId) -> Result<()> {
-        q.exec_drop(
-            format!("DELETE FROM {} WHERE sink_id = ?", self.t("sink_tasks")),
-            (id.0,),
-        )
-        .await
-        .map_err(map_err)?;
-        q.exec_drop(
-            format!("DELETE FROM {} WHERE sink_id = ?", self.t("sinks")),
-            (id.0,),
-        )
-        .await
-        .map_err(map_err)
+    /// Deletes a sink's definition (its state and task rows go after the
+    /// change commits: [`forget_sink`](Self::forget_sink)).
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn delete_sink(rec: &mut dyn RecordTx, id: SinkId) -> Result<()> {
+        SINKS.delete(rec, &Pk::new().u64(id.0)).await
     }
 
     /// Grants or revokes `USAGE`.
-    pub async fn set_usage<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        u: &Usage,
-        grant: bool,
-        by: u32,
-    ) -> Result<()> {
-        if grant {
-            q.exec_drop(
-                format!(
-                    "INSERT IGNORE INTO {} (db_id, connection_name, platform, user_id, granted_by, \
-                     granted_at) VALUES (?, ?, ?, ?, ?, UTC_TIMESTAMP(3))",
-                    self.t("sink_usage")
-                ),
-                (u.db_id, u.connection.as_str(), u.platform, u.user_id, by),
-            )
-            .await
-        } else {
-            q.exec_drop(
-                format!(
-                    "DELETE FROM {} WHERE db_id = ? AND connection_name = ? AND platform = ? \
-                     AND user_id = ?",
-                    self.t("sink_usage")
-                ),
-                (u.db_id, u.connection.as_str(), u.platform, u.user_id),
-            )
-            .await
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn set_usage(rec: &mut dyn RecordTx, u: &Usage, grant: bool, by: u32) -> Result<()> {
+        let pk = usage_pk(u);
+        if !grant {
+            return USAGE.delete(rec, &pk).await;
         }
-        .map_err(map_err)
+        if USAGE.get::<UsageRow>(rec, &pk).await?.is_some() {
+            return Ok(());
+        }
+        USAGE
+            .put(
+                rec,
+                &pk,
+                &UsageRow {
+                    granted_by: by,
+                    granted_at_ms: now_ms(),
+                },
+            )
+            .await
+    }
+
+    // ---- reads, each in a short transaction ----
+
+    /// One sink by id (workers), with its current state.
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn sink(&self, id: SinkId) -> Result<Option<SinkDef>> {
+        self.read(|rec| {
+            Box::pin(async move {
+                let Some(row) = SINKS.get::<SinkRow>(rec, &Pk::new().u64(id.0)).await? else {
+                    return Ok(None);
+                };
+                let mut s = row.def;
+                if let Some(r) = STATES.get::<StateRow>(rec, &Pk::new().u64(id.0)).await? {
+                    s.state = r.state;
+                    s.state_reason = r.reason;
+                }
+                Ok(Some(s))
+            })
+        })
+        .await
+    }
+
+    /// When sink `id` was created (ms since the epoch).
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn created_ms(&self, id: SinkId) -> Result<Option<i64>> {
+        let r = self
+            .read(|rec| {
+                Box::pin(async move { SINKS.get::<SinkRow>(rec, &Pk::new().u64(id.0)).await })
+            })
+            .await?;
+        Ok(r.map(|r| i64::try_from(r.created_at_ms).unwrap_or(i64::MAX)))
+    }
+
+    /// One connection by id (workers).
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn connection(&self, id: ConnectionId) -> Result<Option<ConnectionDef>> {
+        self.read(|rec| Box::pin(async move { CONNECTIONS.get(rec, &Pk::new().u64(id.0)).await }))
+            .await
+    }
+
+    /// Sealed credentials of a connection: `(name, version, key version,
+    /// sealed, previous)` for current and previous versions; previous ones
+    /// only while their successor is younger than `previous_hours`.
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn sealed_secrets(
+        &self,
+        conn: ConnectionId,
+        previous_hours: u64,
+    ) -> Result<Vec<(String, u32, u32, Vec<u8>, bool)>> {
+        let rows = self
+            .read(|rec| {
+                Box::pin(
+                    async move { SECRETS.scan::<SecretRow>(rec, &Pk::new().u64(conn.0)).await },
+                )
+            })
+            .await?;
+        let mut parsed = Vec::new();
+        for (pk, r) in rows {
+            let Some((name, rest)) = pk.0.get(8..).and_then(unescape) else {
+                return Err(bad("secret key"));
+            };
+            let version = u32::from_be_bytes(
+                rest.get(..4)
+                    .and_then(|b| b.try_into().ok())
+                    .ok_or_else(|| bad("secret key"))?,
+            );
+            parsed.push((String::from_utf8_lossy(&name).into_owned(), version, r));
+        }
+        let horizon = now_ms().saturating_sub(previous_hours.saturating_mul(3_600_000));
+        let mut out = Vec::new();
+        for (name, version, r) in &parsed {
+            let keep = match r.state.as_str() {
+                "current" => true,
+                "previous" => parsed
+                    .iter()
+                    .any(|(n, _, c)| n == name && c.state == "current" && c.set_at_ms > horizon),
+                _ => false,
+            };
+            if keep {
+                let sealed = STANDARD.decode(&r.sealed).map_err(|_| bad("sealed"))?;
+                out.push((
+                    name.clone(),
+                    *version,
+                    r.key_version,
+                    sealed,
+                    r.state == "previous",
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The state, reason and definition version of a sink (tasks poll it).
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn state_of(&self, id: SinkId) -> Result<Option<(SinkState, Option<String>, u64)>> {
+        Ok(self
+            .sink(id)
+            .await?
+            .map(|s| (s.state, s.state_reason, s.definition_ver)))
+    }
+
+    /// Every sink's current state and reason (tasks change them without a
+    /// catalog version, so snapshots lag).
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn states(
+        &self,
+    ) -> Result<std::collections::HashMap<u64, (SinkState, Option<String>)>> {
+        self.read(|rec| {
+            Box::pin(async move {
+                let mut out = std::collections::HashMap::new();
+                for r in SINKS.rows::<SinkRow>(rec, &Pk::new()).await? {
+                    out.insert(r.def.id.0, (r.def.state, r.def.state_reason));
+                }
+                for (pk, r) in STATES.scan::<StateRow>(rec, &Pk::new()).await? {
+                    let id = u64::from_be_bytes(
+                        pk.0.get(..8)
+                            .and_then(|b| b.try_into().ok())
+                            .ok_or_else(|| bad("state key"))?,
+                    );
+                    if let Some(e) = out.get_mut(&id) {
+                        *e = (r.state, r.reason);
+                    }
+                }
+                Ok(out)
+            })
+        })
+        .await
+    }
+
+    /// A sink's tasks (`SHOW SINK STATUS`).
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn tasks(&self, sink: SinkId) -> Result<Vec<TaskRow>> {
+        let rows = self
+            .read(|rec| {
+                Box::pin(async move { TASKS.scan::<TaskRec>(rec, &Pk::new().u64(sink.0)).await })
+            })
+            .await?;
+        rows.into_iter()
+            .map(|(pk, r)| {
+                let n =
+                    pk.0.get(8..12)
+                        .and_then(|b| b.try_into().ok())
+                        .map(u32::from_be_bytes)
+                        .ok_or_else(|| bad("task key"))?;
+                Ok(TaskRow {
+                    sink,
+                    task_no: TaskNo(n),
+                    source_part: r.source_part,
+                    epoch: TaskEpoch(r.epoch),
+                    worker_id: r.worker_id,
+                    pending: r.pending,
+                    state: r.state,
+                    attempts: r.attempts,
+                    last_error: r.last_error,
+                    delivered: r.delivered,
+                })
+            })
+            .collect()
+    }
+
+    /// The task's last claim: its epoch, worker and source part, read
+    /// before a new claim (a queue task's dead predecessor).
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn task_claim(
+        &self,
+        sink: SinkId,
+        task_no: TaskNo,
+    ) -> Result<Option<(TaskEpoch, Option<String>, Value)>> {
+        let r = self
+            .read(|rec| {
+                Box::pin(async move {
+                    TASKS
+                        .get::<TaskRec>(rec, &Pk::new().u64(sink.0).u32(task_no.0))
+                        .await
+                })
+            })
+            .await?;
+        Ok(r.map(|r| (TaskEpoch(r.epoch), r.worker_id, r.source_part)))
+    }
+
+    /// The task's current epoch.
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn task_epoch(&self, sink: SinkId, task_no: TaskNo) -> Result<Option<TaskEpoch>> {
+        Ok(self.task_claim(sink, task_no).await?.map(|(e, _, _)| e))
+    }
+
+    /// Dead letters of a sink, oldest first.
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn dead_letters(&self, sink: SinkId, limit: u32) -> Result<Vec<DeadRow>> {
+        let rows = self
+            .read(|rec| {
+                Box::pin(async move { DEAD.scan::<DeadRec>(rec, &Pk::new().u64(sink.0)).await })
+            })
+            .await?;
+        Ok(rows
+            .into_iter()
+            .take(usize::try_from(limit).unwrap_or(usize::MAX))
+            .map(|(pk, r)| DeadRow {
+                id: dead_id(&pk),
+                idem_key: r.idem_key,
+                reason: r.reason,
+                class: r.class,
+                attempts: r.attempts,
+                state: r.state,
+                created_at: utc_text(r.created_at_ms).chars().take(19).collect(),
+            })
+            .collect())
+    }
+
+    // ---- task writes, each in a short transaction ----
+
+    /// Deletes a dropped sink's state and task rows as they are now (after
+    /// the drop's catalog change committed).
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn forget_sink(&self, id: SinkId) -> Result<()> {
+        let mut tx = self.records.begin(self.tenant).await?;
+        for (pk, _) in TASKS.scan::<Value>(&mut *tx, &Pk::new().u64(id.0)).await? {
+            TASKS.delete(&mut *tx, &pk).await?;
+        }
+        STATES.delete(&mut *tx, &Pk::new().u64(id.0)).await?;
+        tx.commit().await
+    }
+
+    /// Sets a sink's state: tasks, and statements right after their change
+    /// committed ([`crate::sql::after_commit`]). The state record is only
+    /// ever written this way, so the last write wins, as on MariaDB.
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn set_state(
+        &self,
+        id: SinkId,
+        state: SinkState,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let mut tx = self.records.begin(self.tenant).await?;
+        Self::put_state(&mut *tx, id, state, reason).await?;
+        tx.commit().await
     }
 
     /// Claims task `task_no` for `worker`: creates its row or bumps its
     /// epoch, and returns the new epoch (bumped on every claim).
-    pub async fn claim_task<Q: Queryable + Send>(
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn claim_task(
         &self,
-        q: &mut Q,
         sink: SinkId,
         task_no: TaskNo,
         source_part: &Value,
         worker: &str,
     ) -> Result<TaskEpoch> {
-        q.exec_drop(
-            format!(
-                "INSERT INTO {} (sink_id, task_no, source_part, epoch, worker_id, state, updated_at) \
-                 VALUES (?, ?, ?, 1, ?, 'running', UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE \
-                 epoch = epoch + 1, worker_id = VALUES(worker_id), source_part = VALUES(source_part), \
-                 state = 'running', updated_at = VALUES(updated_at)",
-                self.t("sink_tasks")
-            ),
-            (sink.0, task_no.0, source_part.to_string(), worker),
-        )
-        .await
-        .map_err(map_err)?;
-        let e: Option<u64> = q
-            .exec_first(
-                format!(
-                    "SELECT epoch FROM {} WHERE sink_id = ? AND task_no = ?",
-                    self.t("sink_tasks")
-                ),
-                (sink.0, task_no.0),
-            )
-            .await
-            .map_err(map_err)?;
-        e.map(TaskEpoch).ok_or_else(|| bad("task row vanished"))
-    }
-
-    /// The task's last claim: its epoch, worker and source
-    /// part, read before a new claim (a queue task's dead predecessor).
-    pub async fn task_claim<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        sink: SinkId,
-        task_no: TaskNo,
-    ) -> Result<Option<(TaskEpoch, Option<String>, Value)>> {
-        let r: Option<(u64, Option<String>, Option<String>)> = q
-            .exec_first(
-                format!(
-                    "SELECT epoch, worker_id, CAST(source_part AS CHAR) FROM {} \
-                     WHERE sink_id = ? AND task_no = ?",
-                    self.t("sink_tasks")
-                ),
-                (sink.0, task_no.0),
-            )
-            .await
-            .map_err(map_err)?;
-        Ok(r.map(|(e, w, p)| {
-            (
-                TaskEpoch(e),
-                w,
-                p.and_then(|p| serde_json::from_str(&p).ok())
-                    .unwrap_or(Value::Null),
-            )
-        }))
-    }
-
-    /// The task's current epoch.
-    pub async fn task_epoch<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        sink: SinkId,
-        task_no: TaskNo,
-    ) -> Result<Option<TaskEpoch>> {
-        let e: Option<u64> = q
-            .exec_first(
-                format!(
-                    "SELECT epoch FROM {} WHERE sink_id = ? AND task_no = ?",
-                    self.t("sink_tasks")
-                ),
-                (sink.0, task_no.0),
-            )
-            .await
-            .map_err(map_err)?;
-        Ok(e.map(TaskEpoch))
+        let pk = Pk::new().u64(sink.0).u32(task_no.0);
+        let mut tx = self.records.begin(self.tenant).await?;
+        let now = now_ms();
+        let row = match TASKS.get_for_update::<TaskRec>(&mut *tx, &pk).await? {
+            Some(mut r) => {
+                r.epoch += 1;
+                r.worker_id = Some(worker.to_owned());
+                r.source_part = source_part.clone();
+                r.state = TaskState::Running;
+                r.updated_at_ms = now;
+                r
+            }
+            None => TaskRec {
+                source_part: source_part.clone(),
+                epoch: 1,
+                worker_id: Some(worker.to_owned()),
+                pending: None,
+                state: TaskState::Running,
+                attempts: 0,
+                last_error: None,
+                last_error_at_ms: None,
+                delivered: 0,
+                updated_at_ms: now,
+            },
+        };
+        TASKS.put(&mut *tx, &pk, &row).await?;
+        tx.commit().await?;
+        Ok(TaskEpoch(row.epoch))
     }
 
     /// Records a task's state, error and delivered count, under its epoch
-    /// (a stale task writes nothing).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn report_task<Q: Queryable + Send>(
+    /// (a stale task writes nothing: `false`).
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn report_task(
         &self,
-        q: &mut Q,
         sink: SinkId,
         task_no: TaskNo,
         epoch: TaskEpoch,
@@ -877,70 +1028,150 @@ impl SinksStore {
         error: Option<&str>,
         delivered: u64,
     ) -> Result<bool> {
-        let r = q
-            .exec_iter(
-                format!(
-                    "UPDATE {} SET state = ?, delivered = delivered + ?, \
-                 attempts = IF(? IS NULL, 0, attempts + 1), \
-                 last_error = COALESCE(?, last_error), \
-                 last_error_at = IF(? IS NULL, last_error_at, UTC_TIMESTAMP(3)), \
-                 updated_at = UTC_TIMESTAMP(3) WHERE sink_id = ? AND task_no = ? AND epoch = ?",
-                    self.t("sink_tasks")
-                ),
-                (
-                    state.as_str(),
-                    delivered,
-                    error,
-                    error.map(|e| e.chars().take(2048).collect::<String>()),
-                    error,
-                    sink.0,
-                    task_no.0,
-                    epoch.0,
-                ),
-            )
-            .await
-            .map_err(map_err)?;
-        let n = r.affected_rows();
-        r.drop_result().await.map_err(map_err)?;
-        Ok(n > 0)
+        let pk = Pk::new().u64(sink.0).u32(task_no.0);
+        let mut tx = self.records.begin(self.tenant).await?;
+        let Some(mut r) = TASKS
+            .get_for_update::<TaskRec>(&mut *tx, &pk)
+            .await?
+            .filter(|r| r.epoch == epoch.0)
+        else {
+            let _ = tx.rollback().await;
+            return Ok(false);
+        };
+        let now = now_ms();
+        r.state = state;
+        r.delivered = r.delivered.saturating_add(delivered);
+        match error {
+            None => r.attempts = 0,
+            Some(e) => {
+                r.attempts += 1;
+                r.last_error = Some(e.chars().take(2048).collect());
+                r.last_error_at_ms = Some(now);
+            }
+        }
+        r.updated_at_ms = now;
+        TASKS.put(&mut *tx, &pk, &r).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
-    /// A sink's tasks (`SHOW SINK STATUS`).
-    pub async fn tasks<Q: Queryable + Send>(
+    /// Writes one dead letter.
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn insert_dead(
         &self,
-        q: &mut Q,
         sink: SinkId,
-    ) -> Result<Vec<TaskRow>> {
-        let rows: Vec<Row> = q
-            .exec(
-                format!(
-                    "SELECT task_no, CAST(source_part AS CHAR), epoch, worker_id, \
-                     CAST(pending AS CHAR), state, attempts, last_error, delivered FROM {} \
-                     WHERE sink_id = ? ORDER BY task_no",
-                    self.t("sink_tasks")
-                ),
-                (sink.0,),
-            )
-            .await
-            .map_err(map_err)?;
-        rows.iter()
-            .map(|r| {
-                Ok(TaskRow {
-                    sink,
-                    task_no: TaskNo(col(r, 0)?),
-                    source_part: json_col(r, 1)?,
-                    epoch: TaskEpoch(col(r, 2)?),
-                    worker_id: col(r, 3)?,
-                    pending: opt_json_col(r, 4)?,
-                    state: TaskState::parse(&col::<String>(r, 5)?)
-                        .ok_or_else(|| bad("task state"))?,
-                    attempts: col(r, 6)?,
-                    last_error: col(r, 7)?,
-                    delivered: col(r, 8)?,
-                })
-            })
-            .collect()
+        rec: &crate::model::SinkRecord,
+        info: &crate::runtime::DeadInfo,
+    ) -> Result<()> {
+        let mut tx = self.records.begin(self.tenant).await?;
+        let id = next_ids(&mut *tx, DEAD_COUNTER, 1).await?;
+        let row = DeadRec {
+            idem_key: rec.idem_key.clone(),
+            key: b64(rec.key.as_ref()),
+            value: b64(rec.value.as_ref()),
+            headers: rec.headers_json(),
+            op: rec.op.map(|o| o.letter().to_string()),
+            before: rec.before.clone(),
+            after: rec.after.clone(),
+            ts_ms: rec.ts_ms,
+            position: STANDARD.encode(rec.pos.encode()),
+            reason: info.reason.chars().take(2048).collect(),
+            class: info.class.to_owned(),
+            attempts: info.attempts,
+            state: "dead".to_owned(),
+            created_at_ms: now_ms(),
+        };
+        DEAD.put(&mut *tx, &Pk::new().u64(sink.0).u64(id), &row)
+            .await?;
+        tx.commit().await
     }
+
+    /// Marks dead letters `replaying` (the task feeds them back) or
+    /// `discarded`; `ids` empty means every `dead` one. Returns how many.
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn mark_dead(&self, sink: SinkId, ids: &[u64], state: &str) -> Result<u64> {
+        let mut tx = self.records.begin(self.tenant).await?;
+        let mut n = 0;
+        for (pk, mut r) in DEAD
+            .scan::<DeadRec>(&mut *tx, &Pk::new().u64(sink.0))
+            .await?
+        {
+            if r.state != "dead" || (!ids.is_empty() && !ids.contains(&dead_id(&pk))) {
+                continue;
+            }
+            state.clone_into(&mut r.state);
+            DEAD.put(&mut *tx, &pk, &r).await?;
+            n += 1;
+        }
+        tx.commit().await?;
+        Ok(n)
+    }
+
+    /// Takes up to `limit` dead letters marked `replaying`, as records, and
+    /// marks them `replayed`.
+    ///
+    /// # Errors
+    /// The record store's; `Internal` for a malformed row.
+    pub async fn take_replays(
+        &self,
+        sink: SinkId,
+        limit: u32,
+    ) -> Result<Vec<crate::model::SinkRecord>> {
+        let mut tx = self.records.begin(self.tenant).await?;
+        let mut out = Vec::new();
+        for (pk, mut r) in DEAD
+            .scan::<DeadRec>(&mut *tx, &Pk::new().u64(sink.0))
+            .await?
+        {
+            if out.len() >= usize::try_from(limit).unwrap_or(usize::MAX) {
+                break;
+            }
+            if r.state != "replaying" {
+                continue;
+            }
+            let headers = r
+                .headers
+                .as_object()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(k, v)| {
+                    let b = match v {
+                        Value::String(s) => s.into_bytes(),
+                        other => other.to_string().into_bytes(),
+                    };
+                    (k, b)
+                })
+                .collect();
+            let pos = STANDARD.decode(&r.position).map_err(|_| bad("position"))?;
+            out.push(crate::model::SinkRecord {
+                idem_key: r.idem_key.clone(),
+                key: unb64(r.key.as_ref())?,
+                value: unb64(r.value.as_ref())?,
+                headers,
+                op: r.op.as_deref().and_then(crate::model::ChangeOp::parse),
+                before: r.before.clone(),
+                after: r.after.clone(),
+                ts_ms: r.ts_ms,
+                pos: crate::model::Position::decode(&pos)
+                    .ok_or_else(|| bad("dead letter position"))?,
+            });
+            "replayed".clone_into(&mut r.state);
+            DEAD.put(&mut *tx, &pk, &r).await?;
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
+}
+
+fn dead_id(pk: &Pk) -> u64 {
+    pk.0.get(8..16)
+        .and_then(|b| b.try_into().ok())
+        .map_or(0, u64::from_be_bytes)
 }
 
 /// A dead letter as listed.
@@ -960,221 +1191,6 @@ pub struct DeadRow {
     pub state: String,
     /// When (UTC text).
     pub created_at: String,
-}
-
-impl SinksStore {
-    /// Writes one dead letter.
-    pub async fn insert_dead<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        sink: SinkId,
-        rec: &crate::model::SinkRecord,
-        info: &crate::runtime::DeadInfo,
-    ) -> Result<()> {
-        q.exec_drop(
-            format!(
-                "INSERT INTO {} (sink_id, idem_key, record_key, record_value, headers, op, \
-                 before_image, after_image, ts_ms, position, reason, class, attempts, state, \
-                 created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dead', UTC_TIMESTAMP(3))",
-                self.t("sink_dead_letters")
-            ),
-            mysql_async::Params::Positional(vec![
-                sink.0.into(),
-                rec.idem_key.as_str().into(),
-                rec.key.clone().into(),
-                rec.value.clone().into(),
-                rec.headers_json().to_string().into(),
-                rec.op.map(|o| o.letter()).into(),
-                rec.before.as_ref().map(Value::to_string).into(),
-                rec.after.as_ref().map(Value::to_string).into(),
-                rec.ts_ms.into(),
-                rec.pos.encode().into(),
-                info.reason.chars().take(2048).collect::<String>().into(),
-                info.class.into(),
-                info.attempts.into(),
-            ]),
-        )
-        .await
-        .map_err(map_err)
-    }
-
-    /// Dead letters of a sink, newest last.
-    pub async fn dead_letters<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        sink: SinkId,
-        limit: u32,
-    ) -> Result<Vec<DeadRow>> {
-        let rows: Vec<(u64, String, String, String, u32, String, String)> = q
-            .exec(
-                format!(
-                    "SELECT dl_id, idem_key, reason, class, attempts, state, \
-                     DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') FROM {} WHERE sink_id = ? \
-                     ORDER BY dl_id LIMIT ?",
-                    self.t("sink_dead_letters")
-                ),
-                (sink.0, limit),
-            )
-            .await
-            .map_err(map_err)?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(id, idem_key, reason, class, attempts, state, created_at)| DeadRow {
-                    id,
-                    idem_key,
-                    reason,
-                    class,
-                    attempts,
-                    state,
-                    created_at,
-                },
-            )
-            .collect())
-    }
-
-    /// Marks dead letters `replaying` (the task feeds them back) or
-    /// `discarded`; `ids` empty means every `dead` one. Returns how many.
-    pub async fn mark_dead<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        sink: SinkId,
-        ids: &[u64],
-        state: &str,
-    ) -> Result<u64> {
-        let filter = if ids.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " AND dl_id IN ({})",
-                ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",")
-            )
-        };
-        let r = q
-            .exec_iter(
-                format!(
-                    "UPDATE {} SET state = ? WHERE sink_id = ? AND state = 'dead'{filter}",
-                    self.t("sink_dead_letters")
-                ),
-                (state, sink.0),
-            )
-            .await
-            .map_err(map_err)?;
-        let n = r.affected_rows();
-        r.drop_result().await.map_err(map_err)?;
-        Ok(n)
-    }
-
-    /// Takes up to `limit` dead letters marked `replaying`, as records, and
-    /// marks them `replayed`.
-    pub async fn take_replays<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        sink: SinkId,
-        limit: u32,
-    ) -> Result<Vec<crate::model::SinkRecord>> {
-        let rows: Vec<Row> = q
-            .exec(
-                format!(
-                    "SELECT dl_id, idem_key, record_key, record_value, CAST(headers AS CHAR), op, \
-                     CAST(before_image AS CHAR), CAST(after_image AS CHAR), ts_ms, position FROM {} \
-                     WHERE sink_id = ? AND state = 'replaying' ORDER BY dl_id LIMIT ?",
-                    self.t("sink_dead_letters")
-                ),
-                (sink.0, limit),
-            )
-            .await
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        let mut ids = Vec::new();
-        for r in &rows {
-            ids.push(col::<u64>(r, 0)?);
-            let headers: Option<String> = col(r, 4)?;
-            let headers = headers
-                .and_then(|h| serde_json::from_str::<Map<String, Value>>(&h).ok())
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(k, v)| {
-                    let b = match v {
-                        Value::String(s) => s.into_bytes(),
-                        other => other.to_string().into_bytes(),
-                    };
-                    (k, b)
-                })
-                .collect();
-            let pos: Vec<u8> = col(r, 9)?;
-            out.push(crate::model::SinkRecord {
-                idem_key: col(r, 1)?,
-                key: col(r, 2)?,
-                value: col(r, 3)?,
-                headers,
-                op: col::<Option<String>>(r, 5)?.and_then(|o| crate::model::ChangeOp::parse(&o)),
-                before: opt_json_col(r, 6)?,
-                after: opt_json_col(r, 7)?,
-                ts_ms: col(r, 8)?,
-                pos: crate::model::Position::decode(&pos)
-                    .ok_or_else(|| bad("dead letter position"))?,
-            });
-        }
-        if !ids.is_empty() {
-            self.mark_ids(q, &ids, "replayed").await?;
-        }
-        Ok(out)
-    }
-
-    async fn mark_ids<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        ids: &[u64],
-        state: &str,
-    ) -> Result<()> {
-        q.exec_drop(
-            format!(
-                "UPDATE {} SET state = ? WHERE dl_id IN ({})",
-                self.t("sink_dead_letters"),
-                ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",")
-            ),
-            (state,),
-        )
-        .await
-        .map_err(map_err)
-    }
-}
-
-fn conn_of(r: &Row) -> Result<ConnectionDef> {
-    Ok(ConnectionDef {
-        id: ConnectionId(col(r, 0)?),
-        db_id: col(r, 1)?,
-        name: col(r, 2)?,
-        kind: ConnKind::parse(&col::<String>(r, 3)?).ok_or_else(|| bad("connection kind"))?,
-        options: json_col::<Map<String, Value>>(r, 4)?,
-        hosts: json_col(r, 5)?,
-        residency_tags: opt_json_col(r, 6)?,
-        owner_user_id: col(r, 7)?,
-        secrets: Vec::new(),
-    })
-}
-
-fn sink_of(r: &Row) -> Result<SinkDef> {
-    Ok(SinkDef {
-        id: SinkId(col(r, 0)?),
-        db_id: col(r, 1)?,
-        name: col(r, 2)?,
-        source: json_col(r, 3)?,
-        filter_sql: col(r, 4)?,
-        projection: opt_json_col(r, 5)?,
-        transform: col(r, 6)?,
-        connections: json_col(r, 7)?,
-        target: json_col(r, 8)?,
-        guarantee: Guarantee::parse(&col::<String>(r, 9)?).ok_or_else(|| bad("guarantee"))?,
-        dead_letter: opt_json_col(r, 10)?,
-        start_at: json_col(r, 11)?,
-        owner_user_id: col(r, 12)?,
-        state: SinkState::parse(&col::<String>(r, 13)?).ok_or_else(|| bad("state"))?,
-        state_reason: col(r, 14)?,
-        definition_ver: col(r, 15)?,
-        options: opt_json_col(r, 16)?.unwrap_or_default(),
-    })
 }
 
 /// The module in the catalog cache: [`SinksState`] in every snapshot.
@@ -1201,22 +1217,12 @@ impl CatalogExtension for SinksExtension {
         _since: Option<u64>,
         _prev: Option<&Arc<dyn ExtState>>,
     ) -> Result<Arc<dyn ExtState>> {
-        let store = SinksStore::new(tx.schema());
-        let conn = tx.conn();
-        if !store.migrated(conn).await? {
+        if !tx.catalog_records() {
             return Ok(Arc::new(SinksState::default()));
         }
-        Ok(Arc::new(store.load(conn).await?))
+        Ok(Arc::new(SinksStore::load(tx.records()?).await?))
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn module_is_well_formed() {
-        Migrator::new(&[SINKS_MODULE]).unwrap_or_else(|_| unreachable!());
-        assert_eq!(SINKS_MODULE.newest(), 1);
-    }
-}
+mod tests;

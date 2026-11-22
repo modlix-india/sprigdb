@@ -4,7 +4,7 @@
 //! parent's ([`adopt`]).
 //!
 //! ```text
-//! tree sequence  t<root>_sprig.sequences, seq_id = root object | 1<<62,
+//! tree sequence  the root's catalog records (m/sharding/sequences), seq_id = root object | 1<<62,
 //!                global ID blocks (one allocator per root tenant
 //!                in this gateway); created at first use above every
 //!                tenant's MAX(id) and AUTO_INCREMENT in the root's subtree
@@ -34,9 +34,10 @@ use sprig_inherit::ids::{TreeSeq, TreeTable};
 use sprig_inherit::model::InheritableObject;
 use sprig_inherit::{InheritChange, InheritStore, RawRows};
 use sprig_meta::{ListOpts, Record};
+use sprig_shard::ids::records::RecordSequences;
 use sprig_shard::ids::{
-    AutoIncSession, BLOCK_LEASE, BlockAllocator, BlockConfig, CatalogSequences, Explicit,
-    IdAllocator, Ordering, SeqId, SequenceSource,
+    AutoIncSession, BLOCK_LEASE, BlockAllocator, BlockConfig, Explicit, IdAllocator, Ordering,
+    SeqId, SequenceSource,
 };
 use sprig_types::{TypesChange, TypesStore};
 
@@ -212,11 +213,10 @@ struct TreeSource {
 }
 
 impl TreeSource {
-    async fn catalog(&self) -> Result<CatalogSequences> {
-        let cluster = self.svc.locator.cluster(self.root).await?;
-        let pool = self.svc.locator.ctl_pool(&cluster).await?;
+    #[allow(clippy::unused_async)] // as when it looked the catalog's pool up
+    async fn catalog(&self) -> Result<RecordSequences> {
         Ok(
-            CatalogSequences::new(pool, SchemaName::catalog(self.root).to_string())
+            RecordSequences::new(Arc::clone(&self.svc.records), self.root)
                 .held_by(self.holder.clone(), BLOCK_LEASE),
         )
     }
@@ -366,7 +366,6 @@ pub(crate) async fn tree_ids(
         let _one = ids.creating.lock().await;
         if !known(&ids) {
             let cat = ids.alloc.source().catalog().await?;
-            cat.ensure_tables().await?;
             if !cat.exists(SeqId(seq.seq)).await? {
                 let next = first_value(svc, seq, lctn).await?;
                 match cat
@@ -483,16 +482,11 @@ struct Records {
 #[async_trait::async_trait]
 impl PublishWith<MariaTx> for Records {
     async fn write(&self, tx: &mut MariaTx, version: u64) -> Result<()> {
-        let (store, q) = tx.parts();
         if !self.inherit.is_empty() {
-            InheritStore::new(store.schema())
-                .apply(q, &self.inherit, version)
-                .await?;
+            InheritStore::apply(tx.records().await?, &self.inherit, version).await?;
         }
         if !self.types.is_empty() {
-            TypesStore::new(store.schema())
-                .apply(q, &self.types)
-                .await?;
+            TypesStore::apply(tx.records().await?, &self.types).await?;
         }
         Ok(())
     }

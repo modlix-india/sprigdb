@@ -127,6 +127,38 @@ impl ScanSource {
     }
 }
 
+impl ScanSource {
+    /// See [`RowCursor::refused`].
+    pub(crate) fn refused(&mut self) {
+        if let Some(c) = self.cursor.as_mut() {
+            c.refused();
+        }
+    }
+}
+
+/// A stored table's scan under the conditions on that table alone: a row
+/// they refuse is reported to the scan's cursor ([`RowCursor::refused`]).
+pub(crate) struct TableFilter {
+    pub(crate) scan: ScanSource,
+    pub(crate) cond: Compiled,
+}
+
+impl RowSource for TableFilter {
+    fn next(&mut self, ctx: &mut Ctx<'_>) -> Result<Option<Row>> {
+        while let Some(row) = RowSource::next(&mut self.scan, ctx)? {
+            if self.cond.eval_bool(ctx, &row)? {
+                return Ok(Some(row));
+            }
+            self.scan.refused();
+        }
+        Ok(None)
+    }
+
+    fn types(&self) -> Vec<ExprType> {
+        RowSource::types(&self.scan)
+    }
+}
+
 impl RowSource for ScanSource {
     fn next(&mut self, _: &mut Ctx<'_>) -> Result<Option<Row>> {
         self.cursor()?.next()

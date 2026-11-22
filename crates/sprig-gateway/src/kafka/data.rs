@@ -494,6 +494,46 @@ impl GatewayData {
         ) || g.allows(action, Target::Database { db_key: &db_key })
     }
 
+    /// Whether `p` may `action` the stream named `stream` in database
+    /// `db` (by name or on the database): streams stored on the engine,
+    /// which have no catalog object.
+    pub(crate) fn allowed_named(
+        &self,
+        p: &Principal,
+        cat: &TenantCatalog,
+        db: &str,
+        stream: &str,
+        action: Action,
+    ) -> bool {
+        let g = self.grants(p, cat);
+        if g.unrestricted() {
+            return true;
+        }
+        let lctn = self.lctn(cat);
+        let db_key = database_key(db, lctn);
+        let name_key = object_key(ObjectKind::Table, stream, lctn);
+        g.allows(
+            action,
+            Target::Named {
+                db_key: &db_key,
+                name_key: &name_key,
+            },
+        ) || g.allows(action, Target::Database { db_key: &db_key })
+    }
+
+    /// The tenant's catalog (engine-stored streams' privileges).
+    pub(crate) async fn catalog_of(&self, p: &Principal) -> Option<Arc<TenantCatalog>> {
+        self.catalog(p).await.ok()
+    }
+
+    /// Whether `p`'s tenant has a database `db` stored on the engine.
+    pub(crate) fn engine_database(&self, cat: &TenantCatalog, db: &str) -> bool {
+        crate::engine::catalog::of(cat).is_some_and(|eng| {
+            cat.database(&database_key(db, self.lctn(cat)))
+                .is_some_and(|d| eng.dbs.contains(&d.db_id))
+        })
+    }
+
     /// Whether `p` may see stream `def` at all (Metadata, DescribeConfigs):
     /// read or write it.
     pub(crate) fn visible(&self, p: &Principal, cat: &TenantCatalog, def: &StreamDef) -> bool {

@@ -1,14 +1,11 @@
 //! The authorization catalog tables: `roles`, `role_edges` and
-//! `privileges`, as the `authz` migration module, with typed rows and
-//! access.
+//! `privileges`, as catalog records in the storage engine
+//! ([`crate::rec`]), with typed rows and access.
 //!
-//! The module is separate from the `auth` module so each numbers its own
-//! formats. Format 1 creates the three tables, then gives every live user
-//! that existed before (users created through the Admin API or `sprigctl`
-//! before authorization existed, who could do everything in their tenant) `ALL PRIVILEGES` and
-//! `SPRIG_TENANT_ADMIN` on `*.*` `WITH GRANT OPTION`, so nothing they could
-//! do stops working. `row_policies` and `foreign_grants` arrive with the
-//! features that use them.
+//! The `authz` module stays registered under its own name, but has no
+//! migrations: its rows are engine records, which start at the newest
+//! shape ([`AUTHZ_FORMAT`]). `row_policies` and `foreign_grants` arrive
+//! with the features that use them.
 //!
 //! **Rows.** Unused key parts are `0` or `''`, never `NULL`. Grants on a
 //! database keep its *name* in `name_pattern` (`db_id` 0): MySQL keeps
@@ -17,79 +14,32 @@
 //! Object and column grants keep `db_id` and `object_id`: MySQL refuses
 //! them on a missing table (1146), and they go with the object.
 //!
+//! **Keys.** `roles/<role_id>`, `role_edges/<grantee kind>/<grantee
+//! id>/<role_id>` (the kind as its old `ENUM` index, so a scan returns
+//! edges in the old `ORDER BY grantee_kind, grantee_id, role_id`) and
+//! `privileges/<priv_id>`. The unique keys the tables had (a role's kind,
+//! name, host and database; a privilege's full target) are checked by a
+//! scan inside the auth change; ids come from the counters `roles` and
+//! `privileges`.
+//!
 //! **Versioning.** Every change commits with a new auth version
 //! ([`VersionKind::Auth`](sprig_catalog::VersionKind)); the gateway's
 //! [`AuthzExtension`](super::state::AuthzExtension) reloads all three
 //! tables (they are small) at each version.
 
-use mysql_async::prelude::Queryable;
-use mysql_async::{Row, Value};
-use sprig_catalog::{Migration, Module, Phase};
+use std::time::SystemTime;
+
+use serde::{Deserialize, Serialize};
+use sprig_catalog::records::{self, Pk, RecordTx};
+use sprig_catalog::{Migration, Module};
 use sprig_common::ids::{DbId, ObjectId, RoleId, UserId};
-use sprig_common::names::quote;
 use sprig_common::{Result, SprigError};
 
 use super::privilege::{ALL_TENANT, Action, ActionSet, Level};
+use crate::rec::{PRIVILEGES, ROLE_EDGES, ROLES, host_eq};
 
 /// The module name in the catalog's format records.
 pub const MODULE: &str = "authz";
-
-/// `roles`.
-pub const DDL_ROLES: &str = "CREATE TABLE IF NOT EXISTS roles (
-  role_id      INT UNSIGNED NOT NULL AUTO_INCREMENT,
-  kind         ENUM('sql','mongo','builtin','combined','mediated','share') NOT NULL,
-  name         VARCHAR(255) NOT NULL COLLATE utf8mb4_bin,
-  host         VARCHAR(255) NOT NULL COLLATE ascii_general_ci DEFAULT '%',
-  db_id        INT UNSIGNED NOT NULL DEFAULT 0,
-  members_hash BIGINT UNSIGNED NULL,
-  created_by   INT UNSIGNED NULL,
-  created_at   DATETIME(3) NOT NULL,
-  last_used_at DATETIME(3) NULL,
-  PRIMARY KEY (role_id),
-  UNIQUE KEY uk_role_name (kind, name, host, db_id),
-  UNIQUE KEY uk_role_members (members_hash)
-) ENGINE=InnoDB";
-
-/// `role_edges`.
-pub const DDL_ROLE_EDGES: &str = "CREATE TABLE IF NOT EXISTS role_edges (
-  grantee_tenant_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  grantee_kind ENUM('user','role') NOT NULL,
-  grantee_id   INT UNSIGNED NOT NULL,
-  role_id      INT UNSIGNED NOT NULL,
-  admin_option TINYINT(1) NOT NULL DEFAULT 0,
-  is_default   TINYINT(1) NOT NULL DEFAULT 0,
-  granted_by   INT UNSIGNED NULL,
-  granted_by_tenant_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  granted_at   DATETIME(3) NOT NULL,
-  PRIMARY KEY (grantee_tenant_id, grantee_kind, grantee_id, role_id),
-  KEY k_edges_role (role_id)
-) ENGINE=InnoDB";
-
-/// `privileges`.
-pub const DDL_PRIVILEGES: &str = "CREATE TABLE IF NOT EXISTS privileges (
-  priv_id      BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  grantee_tenant_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  grantee_kind ENUM('user','role') NOT NULL,
-  grantee_id   INT UNSIGNED NOT NULL,
-  level        ENUM('tenant','database','object','column','kv_prefix','channel',
-                    'redis_commands','graph_element') NOT NULL,
-  db_id        INT UNSIGNED NOT NULL DEFAULT 0,
-  object_id    BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  column_name  VARCHAR(64) NOT NULL DEFAULT '',
-  kv_prefix    VARBINARY(1024) NOT NULL DEFAULT '',
-  element      INT UNSIGNED NOT NULL DEFAULT 0,
-  name_pattern VARCHAR(255) NOT NULL COLLATE utf8mb4_bin DEFAULT '',
-  actions      BIGINT UNSIGNED NOT NULL,
-  restriction  TINYINT(1) NOT NULL DEFAULT 0,
-  detail       JSON NULL,
-  granted_by   INT UNSIGNED NULL,
-  granted_by_tenant_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  granted_at   DATETIME(3) NOT NULL,
-  PRIMARY KEY (priv_id),
-  UNIQUE KEY uk_priv_target (grantee_tenant_id, grantee_kind, grantee_id, level, db_id,
-                    object_id, column_name, kv_prefix, element, name_pattern, restriction),
-  KEY k_priv_object (db_id, object_id)
-) ENGINE=InnoDB";
 
 /// What every user that existed before this module holds: `ALL` and
 /// `SPRIG_TENANT_ADMIN` on `*.*` `WITH GRANT OPTION`.
@@ -97,47 +47,26 @@ pub const LEGACY_ACTIONS: ActionSet = ALL_TENANT
     .with(Action::TenantAdmin)
     .with(Action::GrantOption);
 
-/// The data step of format 1 (idempotent through `uk_priv_target`).
-const GRANT_EXISTING: &str = "INSERT IGNORE INTO privileges
-  (grantee_tenant_id, grantee_kind, grantee_id, level, actions, granted_at)
-  SELECT 0, 'user', user_id, 'tenant', 4026531839, UTC_TIMESTAMP(3)
-  FROM users WHERE state = 'active'";
-
-/// The data step of format 2: change streams need `WATCH` from now on,
-/// so every grant
-/// that held `SELECT` before gets `WATCH` at the same level, and every
-/// partial revoke that cut `SELECT` cuts `WATCH` too. Nothing that worked
-/// stops working; grants made after it follow the design. Column grants
-/// have no `WATCH`. Idempotent: a row holding it is left alone.
-const WATCH_FROM_SELECT: &str = "UPDATE privileges SET actions = actions | 262144
-  WHERE level IN ('tenant', 'database', 'object') AND (actions & 1) = 1
-    AND (actions & 262144) = 0";
-
-/// The module's latest format.
+/// The module's latest format: the shape every row has.
 pub const AUTHZ_FORMAT: u32 = 2;
 
-/// The module's migrations.
-pub static AUTHZ_MIGRATIONS: &[Migration] = &[
-    Migration {
-        format: 1,
-        phase: Phase::Expand,
-        name: "roles, role_edges and privileges; existing users keep everything",
-        statements: &[DDL_ROLES, DDL_ROLE_EDGES, DDL_PRIVILEGES, GRANT_EXISTING],
-    },
-    Migration {
-        format: 2,
-        phase: Phase::Expand,
-        name: "WATCH wherever SELECT was granted (change streams need WATCH)",
-        statements: &[WATCH_FROM_SELECT],
-    },
-];
+/// The module's migrations: none (its rows are engine records).
+pub static AUTHZ_MIGRATIONS: &[Migration] = &[];
 
 /// The `authz` module, for [`Migrator::new`](sprig_catalog::Migrator::new).
-/// It needs the `auth` module first (format 1 reads `users`).
 pub const AUTHZ_MODULE: Module = Module {
     name: MODULE,
     migrations: AUTHZ_MIGRATIONS,
 };
+
+/// The id counter of roles.
+pub const ROLE_COUNTER: &str = "roles";
+
+/// The id counter of privileges.
+pub const PRIV_COUNTER: &str = "privileges";
+
+/// `roles.kind` of the roles this module creates and loads.
+const SQL_ROLE: &str = "sql";
 
 /// Who holds a privilege or a role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -148,11 +77,29 @@ pub enum Grantee {
     Role(RoleId),
 }
 
-impl Grantee {
-    fn kind(self) -> &'static str {
+/// `grantee_kind` as stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum GranteeKind {
+    User,
+    Role,
+}
+
+impl GranteeKind {
+    /// The key byte: the old `ENUM('user','role')` index.
+    const fn byte(self) -> u8 {
         match self {
-            Grantee::User(_) => "user",
-            Grantee::Role(_) => "role",
+            GranteeKind::User => 1,
+            GranteeKind::Role => 2,
+        }
+    }
+}
+
+impl Grantee {
+    fn kind(self) -> GranteeKind {
+        match self {
+            Grantee::User(_) => GranteeKind::User,
+            Grantee::Role(_) => GranteeKind::Role,
         }
     }
 
@@ -163,13 +110,10 @@ impl Grantee {
         }
     }
 
-    fn from_parts(kind: &str, id: u32) -> Result<Self> {
+    fn from_parts(kind: GranteeKind, id: u32) -> Self {
         match kind {
-            "user" => Ok(Grantee::User(UserId(id))),
-            "role" => Ok(Grantee::Role(RoleId(id))),
-            _ => Err(SprigError::internal(format!(
-                "authz catalog: bad grantee_kind {kind:?}"
-            ))),
+            GranteeKind::User => Grantee::User(UserId(id)),
+            GranteeKind::Role => Grantee::Role(RoleId(id)),
         }
     }
 }
@@ -230,10 +174,6 @@ pub enum PrivTarget {
         name: String,
     },
 }
-
-/// The columns [`AuthzStore::keep_by_name`] copies: grantee tenant, kind
-/// and id, level, column, actions, granted by (user, tenant).
-type KeptRow = (u64, String, u32, String, String, u64, Option<u32>, u64);
 
 /// `name_pattern` of a [`PrivTarget::Named`] row: `` `db`.`t` ``.
 #[must_use]
@@ -376,78 +316,272 @@ pub struct AuthzRows {
     pub privileges: Vec<PrivRow>,
 }
 
-/// The module's tables in one catalog schema.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthzStore {
-    roles: String,
-    edges: String,
-    privileges: String,
-    schema: String,
+/// A `roles` row as stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RoleRec {
+    role_id: u32,
+    /// `sql` (the only kind written so far).
+    kind: String,
+    /// Compared exactly.
+    name: String,
+    /// Compared as MySQL compares hosts (ASCII, without case).
+    host: String,
+    db_id: u32,
+    members_hash: Option<u64>,
+    created_by: Option<u32>,
+    #[serde(with = "crate::rec::micros")]
+    created_at: SystemTime,
+    #[serde(with = "crate::rec::micros_opt")]
+    last_used_at: Option<SystemTime>,
 }
 
-fn map_err(e: mysql_async::Error) -> SprigError {
-    crate::store::map_err(e)
+/// A `role_edges` row as stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct EdgeRec {
+    /// Always 0 (this tenant's grantees); not part of the key.
+    grantee_tenant_id: u64,
+    grantee_kind: GranteeKind,
+    grantee_id: u32,
+    role_id: u32,
+    admin_option: bool,
+    is_default: bool,
+    granted_by: Option<u32>,
+    granted_by_tenant_id: u64,
+    #[serde(with = "crate::rec::micros")]
+    granted_at: SystemTime,
 }
 
-fn get<T: mysql_async::prelude::FromValue>(row: &Row, i: usize) -> Result<T> {
-    row.get_opt::<T, usize>(i)
-        .and_then(std::result::Result::ok)
-        .ok_or_else(|| SprigError::internal(format!("authz catalog: bad column {i}")))
+/// A `privileges` row as stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PrivRec {
+    priv_id: u64,
+    grantee_tenant_id: u64,
+    grantee_kind: GranteeKind,
+    grantee_id: u32,
+    /// The level's text ([`Level::as_str`]; other texts are skipped on
+    /// load).
+    level: String,
+    db_id: u32,
+    object_id: u64,
+    column_name: String,
+    kv_prefix: Vec<u8>,
+    element: u32,
+    name_pattern: String,
+    actions: u64,
+    restriction: u8,
+    detail: Option<serde_json::Value>,
+    granted_by: Option<u32>,
+    granted_by_tenant_id: u64,
+    #[serde(with = "crate::rec::micros")]
+    granted_at: SystemTime,
 }
 
-impl AuthzStore {
-    /// The tables of catalog schema `schema`.
-    #[must_use]
-    pub fn new(schema: impl Into<String>) -> Self {
-        let schema = schema.into();
-        let q = quote(&schema);
+/// A privilege's unique key (the old `uk_priv_target`): grantee tenant,
+/// kind and id, level, database, object, column, key-value prefix,
+/// element, name pattern, restriction. Every text part compares exactly,
+/// as the catalog schema's binary collation did.
+type PrivKey<'a> = (
+    u64,
+    GranteeKind,
+    u32,
+    &'a str,
+    u32,
+    u64,
+    &'a str,
+    &'a [u8],
+    u32,
+    &'a str,
+    u8,
+);
+
+impl PrivRec {
+    /// A new row of `grantee` at `target` (id 0 until allocated).
+    fn new(
+        grantee: Grantee,
+        target: &PrivTarget,
+        actions: ActionSet,
+        granted_by: Option<UserId>,
+    ) -> Self {
+        let (db, object, column, pattern) = target.parts();
         Self {
-            roles: format!("{q}.roles"),
-            edges: format!("{q}.role_edges"),
-            privileges: format!("{q}.privileges"),
-            schema,
+            priv_id: 0,
+            grantee_tenant_id: 0,
+            grantee_kind: grantee.kind(),
+            grantee_id: grantee.id(),
+            level: target.level().as_str().to_owned(),
+            db_id: db,
+            object_id: object,
+            column_name: column,
+            kv_prefix: Vec::new(),
+            element: target.element(),
+            name_pattern: pattern,
+            actions: actions.0,
+            restriction: target.restriction(),
+            detail: None,
+            granted_by: granted_by.map(|u| u.0),
+            granted_by_tenant_id: 0,
+            granted_at: now_ms(),
         }
     }
 
-    /// Whether the module's tables exist (the module is migrated).
-    ///
-    /// # Errors
-    /// 39070 or a backend error.
-    pub async fn migrated<Q: Queryable + Send>(&self, q: &mut Q) -> Result<bool> {
-        let n: Option<u64> = q
-            .exec_first(
-                "SELECT COUNT(*) FROM information_schema.TABLES \
-                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'privileges'",
-                (self.schema.as_str(),),
-            )
-            .await
-            .map_err(map_err)?;
-        Ok(n.unwrap_or(0) > 0)
+    fn key(&self) -> PrivKey<'_> {
+        (
+            self.grantee_tenant_id,
+            self.grantee_kind,
+            self.grantee_id,
+            &self.level,
+            self.db_id,
+            self.object_id,
+            &self.column_name,
+            &self.kv_prefix,
+            self.element,
+            &self.name_pattern,
+            self.restriction,
+        )
     }
 
-    /// The module's format in the catalog's migration record (0 without
-    /// one).
-    ///
-    /// # Errors
-    /// 39070 or a backend error.
-    pub async fn format<Q: Queryable + Send>(&self, q: &mut Q) -> Result<u32> {
-        let v: Option<Vec<u8>> = q
-            .exec_first(
-                format!(
-                    "SELECT value FROM {}.settings WHERE scope_kind = 'tenant' AND scope_id = 0 \
-                     AND setting_key = ?",
-                    quote(&self.schema)
-                ),
-                (sprig_catalog::migrate::migration_key(MODULE),),
-            )
-            .await
-            .map_err(map_err)?;
-        Ok(
-            v.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                .and_then(|j| j.get("format").and_then(serde_json::Value::as_u64))
-                .and_then(|f| u32::try_from(f).ok())
-                .unwrap_or(0),
-        )
+    fn held_by(&self, grantee: Grantee) -> bool {
+        self.grantee_tenant_id == 0
+            && self.grantee_kind == grantee.kind()
+            && self.grantee_id == grantee.id()
+    }
+
+    fn is_object_or_column(&self) -> bool {
+        self.level == Level::Object.as_str() || self.level == Level::Column.as_str()
+    }
+
+    /// The column limits the old table enforced (strict mode: a longer
+    /// value failed the statement).
+    fn check_lengths(&self) -> Result<()> {
+        check_chars("column_name", &self.column_name, 64)?;
+        check_chars("name_pattern", &self.name_pattern, 255)
+    }
+}
+
+/// The levels [`AuthzStore::load`] reads.
+const LOADED_LEVELS: [Level; 5] = [
+    Level::Tenant,
+    Level::Database,
+    Level::Object,
+    Level::Column,
+    Level::GraphElement,
+];
+
+/// The time now, truncated to milliseconds as a `DATETIME(3)` column kept
+/// it.
+fn now_ms() -> SystemTime {
+    let m = crate::store::micros(SystemTime::now());
+    crate::store::from_micros(m - m % 1000)
+}
+
+/// MariaDB's "data too long" (1406) under strict mode, which the old
+/// tables' column limits raised.
+pub(crate) fn too_long(column: &str) -> SprigError {
+    SprigError::backend(
+        1406,
+        *b"22001",
+        format!("catalog statement failed (1406): data too long for column {column}"),
+    )
+}
+
+/// 1406 when `v` has more than `max` characters.
+pub(crate) fn check_chars(column: &str, v: &str, max: usize) -> Result<()> {
+    if v.chars().count() > max {
+        Err(too_long(column))
+    } else {
+        Ok(())
+    }
+}
+
+fn role_pk(id: u32) -> Pk {
+    Pk::new().u32(id)
+}
+
+fn edge_pk(grantee: Grantee, role: RoleId) -> Pk {
+    Pk::new()
+        .u8(grantee.kind().byte())
+        .u32(grantee.id())
+        .u32(role.0)
+}
+
+fn priv_pk(id: u64) -> Pk {
+    Pk::new().u64(id)
+}
+
+/// The module's tables in the tenant's catalog records. Every method takes
+/// the record transaction to run in: an auth change's
+/// ([`AuthTx`](sprig_catalog::AuthTx)`.tx().records()`) for writes, a
+/// snapshot's for loads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AuthzStore;
+
+impl AuthzStore {
+    /// The tables.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Whether the module's tables exist: always (engine records need no
+    /// migration).
+    #[must_use]
+    pub const fn migrated(&self) -> bool {
+        true
+    }
+
+    /// The module's format: the newest, which every row has.
+    #[must_use]
+    pub const fn format(&self) -> u32 {
+        AUTHZ_FORMAT
+    }
+
+    async fn roles(&self, tx: &mut dyn RecordTx) -> Result<Vec<RoleRec>> {
+        ROLES.rows(tx, &Pk::new()).await
+    }
+
+    async fn privileges(&self, tx: &mut dyn RecordTx) -> Result<Vec<PrivRec>> {
+        PRIVILEGES.rows(tx, &Pk::new()).await
+    }
+
+    /// Deletes every privilege row `which` picks.
+    async fn delete_privileges(
+        &self,
+        tx: &mut dyn RecordTx,
+        which: impl Fn(&PrivRec) -> bool + Send,
+    ) -> Result<()> {
+        for p in self.privileges(tx).await? {
+            if which(&p) {
+                PRIVILEGES.delete(tx, &priv_pk(p.priv_id)).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes `row` (by its unique key): an existing row gains its actions
+    /// (and, with `regrant`, its grantor and time); else it is inserted
+    /// with a new id.
+    async fn upsert_privilege(
+        &self,
+        tx: &mut dyn RecordTx,
+        mut row: PrivRec,
+        regrant: bool,
+    ) -> Result<()> {
+        row.check_lengths()?;
+        let existing = self
+            .privileges(tx)
+            .await?
+            .into_iter()
+            .find(|p| p.key() == row.key());
+        if let Some(mut p) = existing {
+            p.actions |= row.actions;
+            if regrant {
+                p.granted_by = row.granted_by;
+                p.granted_at = row.granted_at;
+            }
+            return PRIVILEGES.put(tx, &priv_pk(p.priv_id), &p).await;
+        }
+        row.priv_id = records::next_ids(tx, PRIV_COUNTER, 1).await?;
+        PRIVILEGES.put(tx, &priv_pk(row.priv_id), &row).await
     }
 
     /// Every row the gateway uses: SQL roles, this tenant's role edges and
@@ -455,103 +589,75 @@ impl AuthzStore {
     /// skipped.
     ///
     /// # Errors
-    /// 39070, a backend error, or `Internal` for a malformed row.
-    #[allow(clippy::too_many_lines)] // one arm per level
-    pub async fn load<Q: Queryable + Send>(&self, q: &mut Q) -> Result<AuthzRows> {
-        let roles: Vec<Row> = q
-            .query(format!(
-                "SELECT role_id, name, host FROM {} WHERE kind = 'sql' ORDER BY role_id",
-                self.roles
-            ))
-            .await
-            .map_err(map_err)?;
-        let roles = roles
-            .iter()
-            .map(|r| {
-                Ok(RoleRow {
-                    role_id: RoleId(get(r, 0)?),
-                    name: get(r, 1)?,
-                    host: get(r, 2)?,
-                })
+    /// The store's, or `Internal` for a malformed row.
+    pub async fn load(&self, tx: &mut dyn RecordTx) -> Result<AuthzRows> {
+        let roles = self
+            .roles(tx)
+            .await?
+            .into_iter()
+            .filter(|r| r.kind == SQL_ROLE)
+            .map(|r| RoleRow {
+                role_id: RoleId(r.role_id),
+                name: r.name,
+                host: r.host,
             })
-            .collect::<Result<Vec<_>>>()?;
-        let edges: Vec<Row> = q
-            .query(format!(
-                "SELECT grantee_kind, grantee_id, role_id, admin_option, is_default FROM {} \
-                 WHERE grantee_tenant_id = 0 ORDER BY grantee_kind, grantee_id, role_id",
-                self.edges
-            ))
-            .await
-            .map_err(map_err)?;
-        let edges = edges
-            .iter()
-            .map(|r| {
-                let kind: String = get(r, 0)?;
-                Ok(EdgeRow {
-                    grantee: Grantee::from_parts(&kind, get(r, 1)?)?,
-                    role: RoleId(get(r, 2)?),
-                    admin_option: get::<u8>(r, 3)? != 0,
-                    is_default: get::<u8>(r, 4)? != 0,
-                })
+            .collect();
+        let edges = ROLE_EDGES
+            .rows::<EdgeRec>(tx, &Pk::new())
+            .await?
+            .into_iter()
+            .filter(|e| e.grantee_tenant_id == 0)
+            .map(|e| EdgeRow {
+                grantee: Grantee::from_parts(e.grantee_kind, e.grantee_id),
+                role: RoleId(e.role_id),
+                admin_option: e.admin_option,
+                is_default: e.is_default,
             })
-            .collect::<Result<Vec<_>>>()?;
-        let privs: Vec<Row> = q
-            .query(format!(
-                "SELECT priv_id, grantee_kind, grantee_id, level, db_id, object_id, column_name, \
-                 name_pattern, actions, restriction, element FROM {} \
-                 WHERE grantee_tenant_id = 0 \
-                 AND (restriction = 0 OR level = 'database') \
-                 AND level IN ('tenant','database','object','column','graph_element') \
-                 ORDER BY priv_id",
-                self.privileges
-            ))
-            .await
-            .map_err(map_err)?;
-        let mut privileges = Vec::with_capacity(privs.len());
-        for r in &privs {
-            let kind: String = get(r, 1)?;
-            let level: String = get(r, 3)?;
-            let db = DbId(get(r, 4)?);
-            let object = ObjectId(get(r, 5)?);
-            let pattern: String = get(r, 7)?;
-            let named = if object.0 == 0 && level != "graph_element" {
-                parse_named(&pattern)
+            .collect();
+        let mut privileges = Vec::new();
+        for r in self.privileges(tx).await? {
+            let Some(level) = Level::parse(&r.level).filter(|l| LOADED_LEVELS.contains(l)) else {
+                continue;
+            };
+            if r.grantee_tenant_id != 0 || (r.restriction != 0 && level != Level::Database) {
+                continue;
+            }
+            let db = DbId(r.db_id);
+            let object = ObjectId(r.object_id);
+            let named = if object.0 == 0 && level != Level::GraphElement {
+                parse_named(&r.name_pattern)
             } else {
                 None
             };
-            let target = match (Level::parse(&level), named) {
-                (Some(Level::Tenant), _) => PrivTarget::Tenant,
-                (Some(Level::Database), _) if get::<u8>(r, 9)? != 0 => {
-                    PrivTarget::Restriction(pattern.clone())
+            let target = match (level, named) {
+                (Level::Tenant, _) => PrivTarget::Tenant,
+                (Level::Database, _) if r.restriction != 0 => {
+                    PrivTarget::Restriction(r.name_pattern.clone())
                 }
-                (Some(Level::Database), _) => PrivTarget::Database(pattern.clone()),
-                (Some(Level::Object | Level::Column), Some((db_key, name_key))) => {
-                    let column: String = get(r, 6)?;
-                    PrivTarget::Named {
-                        db_key,
-                        name_key,
-                        column: (!column.is_empty()).then_some(column),
-                    }
-                }
-                (Some(Level::Object), None) => PrivTarget::Object { db, object },
-                (Some(Level::Column), None) => PrivTarget::Column {
+                (Level::Database, _) => PrivTarget::Database(r.name_pattern.clone()),
+                (Level::Object | Level::Column, Some((db_key, name_key))) => PrivTarget::Named {
+                    db_key,
+                    name_key,
+                    column: (!r.column_name.is_empty()).then(|| r.column_name.clone()),
+                },
+                (Level::Object, None) => PrivTarget::Object { db, object },
+                (Level::Column, None) => PrivTarget::Column {
                     db,
                     object,
-                    column: get(r, 6)?,
+                    column: r.column_name.clone(),
                 },
-                (Some(Level::GraphElement), _) => PrivTarget::GraphElement {
+                (Level::GraphElement, _) => PrivTarget::GraphElement {
                     db,
                     graph: object,
-                    rels: get::<u32>(r, 10)? & (1 << 31) != 0,
-                    name: pattern.clone(),
+                    rels: r.element & (1 << 31) != 0,
+                    name: r.name_pattern.clone(),
                 },
-                (None, _) => continue,
             };
             privileges.push(PrivRow {
-                priv_id: get(r, 0)?,
-                grantee: Grantee::from_parts(&kind, get(r, 2)?)?,
+                priv_id: r.priv_id,
+                grantee: Grantee::from_parts(r.grantee_kind, r.grantee_id),
                 target,
-                actions: ActionSet(get(r, 8)?),
+                actions: ActionSet(r.actions),
             });
         }
         Ok(AuthzRows {
@@ -561,45 +667,21 @@ impl AuthzStore {
         })
     }
 
-    /// Adds `actions` to `grantee`'s row at `target` (creating it).
+    /// Adds `actions` to `grantee`'s row at `target` (creating it); an
+    /// existing row also takes the new grantor and time.
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn grant<Q: Queryable + Send>(
+    /// The store's; 1406 for a column or name longer than the table kept.
+    pub async fn grant(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         grantee: Grantee,
         target: &PrivTarget,
         actions: ActionSet,
         granted_by: Option<UserId>,
     ) -> Result<()> {
-        let (db, object, column, pattern) = target.parts();
-        q.exec_drop(
-            format!(
-                "INSERT INTO {} (grantee_tenant_id, grantee_kind, grantee_id, level, db_id, \
-                 object_id, column_name, name_pattern, restriction, actions, granted_by, \
-                 element, granted_at) \
-                 VALUES (0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3)) \
-                 ON DUPLICATE KEY UPDATE actions = actions | VALUES(actions), \
-                 granted_by = VALUES(granted_by), granted_at = VALUES(granted_at)",
-                self.privileges
-            ),
-            vec![
-                Value::from(grantee.kind()),
-                Value::from(grantee.id()),
-                Value::from(target.level().as_str()),
-                Value::from(db),
-                Value::from(object),
-                Value::from(column),
-                Value::from(pattern),
-                Value::from(target.restriction()),
-                Value::from(actions.0),
-                Value::from(granted_by.map(|u| u.0)),
-                Value::from(target.element()),
-            ],
-        )
-        .await
-        .map_err(map_err)
+        let row = PrivRec::new(grantee, target, actions, granted_by);
+        self.upsert_privilege(tx, row, true).await
     }
 
     /// Removes `actions` from `grantee`'s row at `target`, deleting the
@@ -607,98 +689,53 @@ impl AuthzStore {
     /// (empty when there was no row).
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn revoke<Q: Queryable + Send>(
+    /// The store's.
+    pub async fn revoke(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         grantee: Grantee,
         target: &PrivTarget,
         actions: ActionSet,
     ) -> Result<ActionSet> {
-        let (db, object, column, pattern) = target.parts();
-        let key = "grantee_tenant_id = 0 AND grantee_kind = ? AND grantee_id = ? AND level = ? \
-                   AND db_id = ? AND object_id = ? AND column_name = ? AND kv_prefix = '' \
-                   AND element = ? AND name_pattern = ? AND restriction = ?";
-        let params = || {
-            vec![
-                Value::from(grantee.kind()),
-                Value::from(grantee.id()),
-                Value::from(target.level().as_str()),
-                Value::from(db),
-                Value::from(object),
-                Value::from(column.as_str()),
-                Value::from(target.element()),
-                Value::from(pattern.as_str()),
-                Value::from(target.restriction()),
-            ]
-        };
-        let before: Option<u64> = q
-            .exec_first(
-                format!(
-                    "SELECT actions FROM {} WHERE {key} FOR UPDATE",
-                    self.privileges
-                ),
-                params(),
-            )
-            .await
-            .map_err(map_err)?;
-        let Some(before) = before else {
+        let want = PrivRec::new(grantee, target, ActionSet::EMPTY, None);
+        let found = self
+            .privileges(tx)
+            .await?
+            .into_iter()
+            .find(|p| p.key() == want.key());
+        let Some(mut row) = found else {
             return Ok(ActionSet::EMPTY);
         };
-        let left = ActionSet(before).minus(actions);
+        let before = ActionSet(row.actions);
+        let left = before.minus(actions);
         if left.is_empty() {
-            q.exec_drop(
-                format!("DELETE FROM {} WHERE {key}", self.privileges),
-                params(),
-            )
-            .await
-            .map_err(map_err)?;
+            PRIVILEGES.delete(tx, &priv_pk(row.priv_id)).await?;
         } else {
-            let mut p = vec![Value::from(left.0)];
-            p.extend(params());
-            q.exec_drop(
-                format!("UPDATE {} SET actions = ? WHERE {key}", self.privileges),
-                p,
-            )
-            .await
-            .map_err(map_err)?;
+            row.actions = left.0;
+            PRIVILEGES.put(tx, &priv_pk(row.priv_id), &row).await?;
         }
-        Ok(ActionSet(before))
+        Ok(before)
     }
 
     /// Deletes every privilege and role edge `grantee` holds, and, for a
     /// role, every edge granting it.
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn forget<Q: Queryable + Send>(&self, q: &mut Q, grantee: Grantee) -> Result<()> {
-        q.exec_drop(
-            format!(
-                "DELETE FROM {} WHERE grantee_tenant_id = 0 AND grantee_kind = ? \
-                 AND grantee_id = ?",
-                self.privileges
-            ),
-            (grantee.kind(), grantee.id()),
-        )
-        .await
-        .map_err(map_err)?;
-        q.exec_drop(
-            format!(
-                "DELETE FROM {} WHERE grantee_tenant_id = 0 AND grantee_kind = ? \
-                 AND grantee_id = ?",
-                self.edges
-            ),
-            (grantee.kind(), grantee.id()),
-        )
-        .await
-        .map_err(map_err)?;
+    /// The store's.
+    pub async fn forget(&self, tx: &mut dyn RecordTx, grantee: Grantee) -> Result<()> {
+        self.forget_privileges(tx, grantee).await?;
+        let under = Pk::new().u8(grantee.kind().byte()).u32(grantee.id());
+        for (pk, e) in ROLE_EDGES.scan::<EdgeRec>(tx, &under).await? {
+            if e.grantee_tenant_id == 0 {
+                ROLE_EDGES.delete(tx, &pk).await?;
+            }
+        }
         if let Grantee::Role(r) = grantee {
-            q.exec_drop(
-                format!("DELETE FROM {} WHERE role_id = ?", self.edges),
-                (r.0,),
-            )
-            .await
-            .map_err(map_err)?;
+            for (pk, e) in ROLE_EDGES.scan::<EdgeRec>(tx, &Pk::new()).await? {
+                if e.role_id == r.0 {
+                    ROLE_EDGES.delete(tx, &pk).await?;
+                }
+            }
         }
         Ok(())
     }
@@ -707,103 +744,80 @@ impl AuthzStore {
     /// GRANT OPTION`); its roles stay.
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn forget_privileges<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        grantee: Grantee,
-    ) -> Result<()> {
-        q.exec_drop(
-            format!(
-                "DELETE FROM {} WHERE grantee_tenant_id = 0 AND grantee_kind = ? \
-                 AND grantee_id = ?",
-                self.privileges
-            ),
-            (grantee.kind(), grantee.id()),
-        )
-        .await
-        .map_err(map_err)
+    /// The store's.
+    pub async fn forget_privileges(&self, tx: &mut dyn RecordTx, grantee: Grantee) -> Result<()> {
+        self.delete_privileges(tx, |p| p.held_by(grantee)).await
     }
 
     /// Deletes every privilege on `object` (it was dropped).
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn forget_object<Q: Queryable + Send>(
+    /// The store's.
+    pub async fn forget_object(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         db: DbId,
         object: ObjectId,
     ) -> Result<()> {
-        q.exec_drop(
-            format!(
-                "DELETE FROM {} WHERE db_id = ? AND object_id = ?",
-                self.privileges
-            ),
-            (db.0, object.0),
-        )
-        .await
-        .map_err(map_err)
+        self.delete_privileges(tx, |p| p.db_id == db.0 && p.object_id == object.0)
+            .await
     }
 
     /// `auth.grants_on_drop = keep` for a dropped table or view: its object
     /// and column rows become [`PrivTarget::Named`] rows for
-    /// `` `db_key`.`name_key` `` (merged into any already there).
-    /// Returns whether there were rows.
+    /// `` `db_key`.`name_key` `` (merged into any already there: their
+    /// actions are added, their grantor kept). Returns whether there were
+    /// rows.
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn keep_by_name<Q: Queryable + Send>(
+    /// The store's; 1406 for a name pattern longer than the table kept.
+    pub async fn keep_by_name(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         db: DbId,
         object: ObjectId,
         db_key: &str,
         name_key: &str,
     ) -> Result<bool> {
-        let rows: Vec<KeptRow> = q
-            .exec(
-                format!(
-                    "SELECT grantee_tenant_id, grantee_kind, grantee_id, level, column_name, \
-                     actions, granted_by, granted_by_tenant_id FROM {} \
-                     WHERE db_id = ? AND object_id = ? AND level IN ('object','column') \
-                     AND restriction = 0",
-                    self.privileges
-                ),
-                (db.0, object.0),
-            )
-            .await
-            .map_err(map_err)?;
+        let rows: Vec<PrivRec> = self
+            .privileges(tx)
+            .await?
+            .into_iter()
+            .filter(|p| {
+                p.db_id == db.0
+                    && p.object_id == object.0
+                    && p.is_object_or_column()
+                    && p.restriction == 0
+            })
+            .collect();
         if rows.is_empty() {
             return Ok(false);
         }
         let pattern = named_pattern(db_key, name_key);
-        for (gt, kind, id, level, column, actions, by, by_t) in rows {
-            q.exec_drop(
-                format!(
-                    "INSERT INTO {} (grantee_tenant_id, grantee_kind, grantee_id, level, db_id, \
-                     object_id, column_name, name_pattern, actions, granted_by, \
-                     granted_by_tenant_id, granted_at) \
-                     VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3)) \
-                     ON DUPLICATE KEY UPDATE actions = actions | VALUES(actions)",
-                    self.privileges
-                ),
-                vec![
-                    Value::from(gt),
-                    Value::from(kind),
-                    Value::from(id),
-                    Value::from(level),
-                    Value::from(column),
-                    Value::from(pattern.as_str()),
-                    Value::from(actions),
-                    Value::from(by),
-                    Value::from(by_t),
-                ],
-            )
-            .await
-            .map_err(map_err)?;
+        let now = now_ms();
+        for r in rows {
+            let kept = PrivRec {
+                priv_id: 0,
+                grantee_tenant_id: r.grantee_tenant_id,
+                grantee_kind: r.grantee_kind,
+                grantee_id: r.grantee_id,
+                level: r.level,
+                db_id: 0,
+                object_id: 0,
+                column_name: r.column_name,
+                kv_prefix: Vec::new(),
+                element: 0,
+                name_pattern: pattern.clone(),
+                actions: r.actions,
+                restriction: 0,
+                detail: None,
+                granted_by: r.granted_by,
+                granted_by_tenant_id: r.granted_by_tenant_id,
+                granted_at: now,
+            };
+            self.upsert_privilege(tx, kept, false).await?;
         }
-        self.forget_object(q, db, object).await?;
+        self.forget_object(tx, db, object).await?;
         Ok(true)
     }
 
@@ -812,32 +826,25 @@ impl AuthzStore {
     /// `None`.
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn forget_named<Q: Queryable + Send>(
+    /// The store's.
+    pub async fn forget_named(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         db_key: &str,
         name_key: Option<&str>,
     ) -> Result<()> {
-        let base = format!(
-            "DELETE FROM {} WHERE level IN ('object','column') AND object_id = 0 AND ",
-            self.privileges
-        );
+        let held_by_name = |p: &PrivRec| p.is_object_or_column() && p.object_id == 0;
         if let Some(n) = name_key {
-            q.exec_drop(
-                format!("{base}name_pattern = ?"),
-                (named_pattern(db_key, n),),
-            )
-            .await
+            let pattern = named_pattern(db_key, n);
+            self.delete_privileges(tx, move |p| held_by_name(p) && p.name_pattern == pattern)
+                .await
         } else {
             let prefix = format!("`{}`.", db_key.replace('`', "``"));
-            q.exec_drop(
-                format!("{base}LEFT(name_pattern, CHAR_LENGTH(?)) = ?"),
-                (prefix.as_str(), prefix.as_str()),
-            )
+            self.delete_privileges(tx, move |p| {
+                held_by_name(p) && p.name_pattern.starts_with(&prefix)
+            })
             .await
         }
-        .map_err(map_err)
     }
 
     /// `auth.grants_on_drop = drop` for a dropped database: deletes its
@@ -845,230 +852,164 @@ impl AuthzStore {
     /// objects (by id).
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn forget_database<Q: Queryable + Send>(
+    /// The store's.
+    pub async fn forget_database(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         db: DbId,
         db_key: &str,
     ) -> Result<()> {
-        q.exec_drop(
-            format!(
-                "DELETE FROM {} WHERE level = 'database' AND db_id = 0 AND name_pattern = ?",
-                self.privileges
-            ),
-            (db_key,),
-        )
-        .await
-        .map_err(map_err)?;
-        q.exec_drop(
-            format!(
-                "DELETE FROM {} WHERE db_id = ? AND level IN ('object','column')",
-                self.privileges
-            ),
-            (db.0,),
-        )
-        .await
-        .map_err(map_err)
+        self.delete_privileges(tx, |p| {
+            p.level == Level::Database.as_str() && p.db_id == 0 && p.name_pattern == db_key
+        })
+        .await?;
+        self.delete_privileges(tx, |p| p.db_id == db.0 && p.is_object_or_column())
+            .await
     }
 
-    /// Creates the SQL role `'name'@'host'` and returns its id; `None` if
-    /// it exists.
+    /// Creates the SQL role `'name'@'host'` and returns its id (from the
+    /// `roles` counter); `None` if it exists (host compared without case).
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn create_role<Q: Queryable + Send>(
+    /// The store's; 1406 for a name or host over 255 characters.
+    pub async fn create_role(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         name: &str,
         host: &str,
         created_by: Option<UserId>,
     ) -> Result<Option<RoleId>> {
-        let r = q
-            .exec_drop(
-                format!(
-                    "INSERT INTO {} (kind, name, host, created_by, created_at) \
-                     VALUES ('sql', ?, ?, ?, UTC_TIMESTAMP(3))",
-                    self.roles
-                ),
-                (name, host, created_by.map(|u| u.0)),
-            )
-            .await;
-        match r {
-            Ok(()) => {}
-            Err(mysql_async::Error::Server(s)) if s.code == 1062 => return Ok(None),
-            Err(e) => return Err(map_err(e)),
+        check_chars("name", name, 255)?;
+        check_chars("host", host, 255)?;
+        let taken = self.roles(tx).await?.iter().any(|r| {
+            r.kind == SQL_ROLE && r.name == name && host_eq(&r.host, host) && r.db_id == 0
+        });
+        if taken {
+            return Ok(None);
         }
-        let id: Option<u32> = q
-            .query_first("SELECT LAST_INSERT_ID()")
-            .await
-            .map_err(map_err)?;
-        id.map(RoleId)
-            .map(Some)
-            .ok_or_else(|| SprigError::internal("no LAST_INSERT_ID for a new role"))
+        let id = records::next_ids(tx, ROLE_COUNTER, 1).await?;
+        let id = u32::try_from(id).map_err(|_| SprigError::internal("role ids exhausted"))?;
+        let row = RoleRec {
+            role_id: id,
+            kind: SQL_ROLE.to_owned(),
+            name: name.to_owned(),
+            host: host.to_owned(),
+            db_id: 0,
+            members_hash: None,
+            created_by: created_by.map(|u| u.0),
+            created_at: now_ms(),
+            last_used_at: None,
+        };
+        ROLES.put(tx, &role_pk(id), &row).await?;
+        Ok(Some(RoleId(id)))
     }
 
-    /// The SQL role `'name'@'host'`, read in the transaction.
+    /// The SQL role `'name'@'host'` (host compared without case), read in
+    /// the transaction.
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn role<Q: Queryable + Send>(
+    /// The store's.
+    pub async fn role(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         name: &str,
         host: &str,
     ) -> Result<Option<RoleId>> {
-        let id: Option<u32> = q
-            .exec_first(
-                format!(
-                    "SELECT role_id FROM {} WHERE kind = 'sql' AND name = ? AND host = ?",
-                    self.roles
-                ),
-                (name, host),
-            )
-            .await
-            .map_err(map_err)?;
-        Ok(id.map(RoleId))
+        Ok(self
+            .roles(tx)
+            .await?
+            .iter()
+            .find(|r| r.kind == SQL_ROLE && r.name == name && host_eq(&r.host, host))
+            .map(|r| RoleId(r.role_id)))
     }
 
     /// Deletes the role row (its grants with [`Self::forget`]).
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn delete_role<Q: Queryable + Send>(&self, q: &mut Q, role: RoleId) -> Result<()> {
-        q.exec_drop(
-            format!("DELETE FROM {} WHERE role_id = ?", self.roles),
-            (role.0,),
-        )
-        .await
-        .map_err(map_err)
+    /// The store's.
+    pub async fn delete_role(&self, tx: &mut dyn RecordTx, role: RoleId) -> Result<()> {
+        ROLES.delete(tx, &role_pk(role.0)).await
     }
 
     /// `GRANT role TO grantee [WITH ADMIN OPTION]`. An existing edge keeps
-    /// its default flag and gains the admin option if asked.
+    /// its default flag, grantor and time, and gains the admin option if
+    /// asked.
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn grant_role<Q: Queryable + Send>(
+    /// The store's.
+    pub async fn grant_role(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         grantee: Grantee,
         role: RoleId,
         admin_option: bool,
         granted_by: Option<UserId>,
     ) -> Result<()> {
-        q.exec_drop(
-            format!(
-                "INSERT INTO {} (grantee_tenant_id, grantee_kind, grantee_id, role_id, \
-                 admin_option, granted_by, granted_at) VALUES (0, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3)) \
-                 ON DUPLICATE KEY UPDATE admin_option = admin_option OR VALUES(admin_option)",
-                self.edges
-            ),
-            (
-                grantee.kind(),
-                grantee.id(),
-                role.0,
-                u8::from(admin_option),
-                granted_by.map(|u| u.0),
-            ),
-        )
-        .await
-        .map_err(map_err)
+        let pk = edge_pk(grantee, role);
+        let row = match ROLE_EDGES.get::<EdgeRec>(tx, &pk).await? {
+            Some(mut e) => {
+                e.admin_option = e.admin_option || admin_option;
+                e
+            }
+            None => EdgeRec {
+                grantee_tenant_id: 0,
+                grantee_kind: grantee.kind(),
+                grantee_id: grantee.id(),
+                role_id: role.0,
+                admin_option,
+                is_default: false,
+                granted_by: granted_by.map(|u| u.0),
+                granted_by_tenant_id: 0,
+                granted_at: now_ms(),
+            },
+        };
+        ROLE_EDGES.put(tx, &pk, &row).await
     }
 
     /// `REVOKE role FROM grantee`; whether there was an edge.
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn revoke_role<Q: Queryable + Send>(
+    /// The store's.
+    pub async fn revoke_role(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         grantee: Grantee,
         role: RoleId,
     ) -> Result<bool> {
-        let n: Option<u64> = q
-            .exec_first(
-                format!(
-                    "SELECT COUNT(*) FROM {} WHERE grantee_tenant_id = 0 AND grantee_kind = ? \
-                     AND grantee_id = ? AND role_id = ?",
-                    self.edges
-                ),
-                (grantee.kind(), grantee.id(), role.0),
-            )
-            .await
-            .map_err(map_err)?;
-        q.exec_drop(
-            format!(
-                "DELETE FROM {} WHERE grantee_tenant_id = 0 AND grantee_kind = ? \
-                 AND grantee_id = ? AND role_id = ?",
-                self.edges
-            ),
-            (grantee.kind(), grantee.id(), role.0),
-        )
-        .await
-        .map_err(map_err)?;
-        Ok(n.unwrap_or(0) > 0)
+        let pk = edge_pk(grantee, role);
+        let existed = ROLE_EDGES.get::<EdgeRec>(tx, &pk).await?.is_some();
+        if existed {
+            ROLE_EDGES.delete(tx, &pk).await?;
+        }
+        Ok(existed)
     }
 
     /// `SET DEFAULT ROLE`: exactly `roles` (each already granted) become
     /// `user`'s defaults.
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn set_default_roles<Q: Queryable + Send>(
+    /// The store's.
+    pub async fn set_default_roles(
         &self,
-        q: &mut Q,
+        tx: &mut dyn RecordTx,
         user: UserId,
         roles: &[RoleId],
     ) -> Result<()> {
-        q.exec_drop(
-            format!(
-                "UPDATE {} SET is_default = 0 WHERE grantee_tenant_id = 0 \
-                 AND grantee_kind = 'user' AND grantee_id = ?",
-                self.edges
-            ),
-            (user.0,),
-        )
-        .await
-        .map_err(map_err)?;
-        for r in roles {
-            q.exec_drop(
-                format!(
-                    "UPDATE {} SET is_default = 1 WHERE grantee_tenant_id = 0 \
-                     AND grantee_kind = 'user' AND grantee_id = ? AND role_id = ?",
-                    self.edges
-                ),
-                (user.0, r.0),
-            )
-            .await
-            .map_err(map_err)?;
+        let grantee = Grantee::User(user);
+        let under = Pk::new().u8(grantee.kind().byte()).u32(grantee.id());
+        for (pk, mut e) in ROLE_EDGES.scan::<EdgeRec>(tx, &under).await? {
+            if e.grantee_tenant_id != 0 {
+                continue;
+            }
+            let default = roles.contains(&RoleId(e.role_id));
+            if e.is_default != default {
+                e.is_default = default;
+                ROLE_EDGES.put(tx, &pk, &e).await?;
+            }
         }
         Ok(())
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn named_patterns_round_trip() {
-        for (d, t) in [("shop", "orders"), ("a`b", "c.d"), ("x", "``"), ("", "t")] {
-            let p = named_pattern(d, t);
-            assert_eq!(parse_named(&p), Some((d.to_owned(), t.to_owned())), "{p}");
-        }
-        assert_eq!(named_pattern("shop", "orders"), "`shop`.`orders`");
-        assert_eq!(parse_named("shop"), None);
-        assert_eq!(parse_named("`shop`.`t`x"), None);
-        assert_eq!(parse_named(""), None);
-    }
-
-    #[test]
-    fn legacy_bits_match_the_migration() {
-        assert!(GRANT_EXISTING.contains(&LEGACY_ACTIONS.0.to_string()));
-        assert!(LEGACY_ACTIONS.has(Action::TenantAdmin));
-        assert!(LEGACY_ACTIONS.has(Action::GrantOption));
-        assert!(LEGACY_ACTIONS.has(Action::Select));
-        assert!(!LEGACY_ACTIONS.has(Action::BypassRls));
-    }
-}
+mod tests;

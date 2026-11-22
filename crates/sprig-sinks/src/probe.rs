@@ -174,9 +174,8 @@ pub async fn test_connection_with(
     let def = stand_in(db_id, "test_connection", TargetSpec::Webhook { path: None });
     let mut opts = options(env, tenant, &def).await?;
     opts.0.insert("__db_name".into(), db_name.to_owned());
-    let (mut c, schema) = catalog(env, tenant).await?;
-    let store = SinksStore::new(schema);
-    let conn = match open_conn(env, tenant, &mut c, &store, r, &opts).await {
+    let store = SinksStore::new(env.records(), tenant);
+    let conn = match open_conn(env, tenant, &store, r, &opts).await {
         Ok(conn) => {
             push(vec![("credentials", Ok("opened".to_owned()))], &mut out);
             conn
@@ -186,7 +185,6 @@ pub async fn test_connection_with(
             return Ok(out);
         }
     };
-    drop(c);
     let steps = probe(conn.clone(), &opts, db_id).await;
     let passed = steps.iter().all(|(_, r)| r.is_ok());
     push(steps, &mut out);
@@ -586,10 +584,9 @@ async fn preview_ctx(
 ) -> std::result::Result<TargetCtx, String> {
     let conn = match def.connections.first() {
         Some(r) => {
-            let (mut c, schema) = catalog(env, tenant).await.map_err(|e| e.to_string())?;
-            let store = SinksStore::new(schema);
+            let store = SinksStore::new(env.records(), tenant);
             Some(
-                open_conn(env, tenant, &mut c, &store, r, opts)
+                open_conn(env, tenant, &store, r, opts)
                     .await
                     .map_err(|e| format!("the connection: {e}"))?,
             )

@@ -1307,3 +1307,36 @@ async fn live_throughput() {
     );
     delete_topic(&mut admin, &topic).await;
 }
+
+/// Prints `SPRIG_KAFKA_GROUP`'s committed offsets as `offset <topic>
+/// <partition> <offset>` lines (a script commits them with
+/// `CALL sprig.commit_offset` and checks Kafka sees the same).
+#[tokio::test]
+#[ignore = "needs a running gateway with the kafka listener"]
+async fn live_print_group_offsets() {
+    let group = env("SPRIG_KAFKA_GROUP").unwrap();
+    let mut c = login().await;
+    let r: OffsetFetchResponse = c
+        .call(
+            8,
+            &OffsetFetchRequest {
+                groups: vec![offset_fetch_request::OffsetFetchRequestGroup {
+                    group_id: group,
+                    topics: None,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.groups[0].error_code, 0);
+    for t in &r.groups[0].topics {
+        for p in &t.partitions {
+            println!(
+                "offset {} {} {}",
+                t.name, p.partition_index, p.committed_offset
+            );
+        }
+    }
+}

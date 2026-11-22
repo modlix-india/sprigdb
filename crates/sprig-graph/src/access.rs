@@ -427,6 +427,14 @@ impl GraphStore for FilteredStore<'_> {
         self.inner.edges_touching(nodes, limit).await
     }
 
+    async fn lock_edges(&mut self, ids: &[u64]) -> Result<Vec<EdgeRow>> {
+        let rows = self.inner.lock_edges(ids).await?;
+        if self.vis.is_none() {
+            return Ok(rows);
+        }
+        self.visible_edges(rows).await
+    }
+
     async fn lock_nodes(&mut self, ids: &[u64], exclusive: bool) -> Result<Vec<NodeRow>> {
         self.inner.lock_nodes(ids, exclusive).await
     }

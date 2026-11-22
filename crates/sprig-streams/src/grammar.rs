@@ -311,6 +311,69 @@ pub fn maybe_stream(sql: &[u8], has_streams: bool) -> bool {
     head.windows(6).any(|w| w.eq_ignore_ascii_case(b"stream"))
 }
 
+/// The literal rows of `INSERT ... VALUES (...), ...`: each value as
+/// [`measure::literal_value`] reads it. `None` when the statement has no
+/// plain `VALUES` rows or a value isn't a literal.
+#[must_use]
+pub fn insert_values(sql: &[u8], lex_opts: &LexOptions) -> Option<Vec<Vec<Option<Vec<u8>>>>> {
+    let c = Cur::new(sql, *lex_opts)?;
+    let mut depth = 0usize;
+    let mut at = None;
+    for (i, t) in c.toks.iter().enumerate() {
+        if t.kind == TokenKind::Punct {
+            match c.text(t) {
+                b"(" => depth += 1,
+                b")" => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        } else if depth == 0 && (c.is_word(Some(t), "VALUES") || c.is_word(Some(t), "VALUE")) {
+            at = Some(i + 1);
+            break;
+        }
+    }
+    let toks = &c.toks[at?..];
+    let mut rows = Vec::new();
+    let mut i = 0usize;
+    loop {
+        let open = toks.get(i)?;
+        if open.kind != TokenKind::Punct || c.text(open) != b"(" {
+            return None;
+        }
+        let start = i + 1;
+        let mut depth = 1usize;
+        i += 1;
+        while depth > 0 {
+            let t = toks.get(i)?;
+            if t.kind == TokenKind::Punct {
+                match c.text(t) {
+                    b"(" => depth += 1,
+                    b")" => depth -= 1,
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        let inner = &toks[start..i - 1];
+        let row = if inner.is_empty() {
+            Vec::new()
+        } else {
+            measure::split_commas(c.src, inner)
+                .into_iter()
+                .map(|v| measure::literal_value(c.src, v, c.nbe))
+                .collect::<Option<Vec<_>>>()?
+        };
+        rows.push(row);
+        match toks.get(i) {
+            None => return Some(rows),
+            Some(t) if t.kind == TokenKind::Punct && c.text(t) == b"," => i += 1,
+            Some(t) if t.kind == TokenKind::Punct && c.text(t) == b";" && i + 1 == toks.len() => {
+                return Some(rows);
+            }
+            Some(_) => return None,
+        }
+    }
+}
+
 /// Classifies one statement.
 ///
 /// # Errors

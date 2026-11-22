@@ -102,6 +102,7 @@ fn types_regex_mod() {
         Some("ab")
     );
     assert_eq!(Re::new("^abc", "i").unwrap().literal_prefix(), None);
+    assert_eq!(Re::new("^ab|cd", "").unwrap().literal_prefix(), None);
 }
 
 #[test]

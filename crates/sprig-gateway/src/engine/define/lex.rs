@@ -50,6 +50,7 @@ const OPS: [&str; 33] = [
 ];
 
 /// The tokens of `s`; `Err(offset)` where a quote or comment never ends.
+#[allow(clippy::too_many_lines)] // one branch per token kind
 pub(crate) fn lex(s: &str) -> Result<Vec<Tok>, usize> {
     let b = s.as_bytes();
     let mut i = 0;
@@ -62,7 +63,11 @@ pub(crate) fn lex(s: &str) -> Result<Vec<Tok>, usize> {
         }
         // Comments: `-- ` to the end of the line, `#` to the end of the
         // line, `/* ... */` (executable comments were neutralized before).
-        if c == b'#' || (c == b'-' && b.get(i + 1) == Some(&b'-') && b.get(i + 2).is_none_or(|x| x.is_ascii_whitespace())) {
+        if c == b'#'
+            || (c == b'-'
+                && b.get(i + 1) == Some(&b'-')
+                && b.get(i + 2).is_none_or(u8::is_ascii_whitespace))
+        {
             while i < b.len() && b[i] != b'\n' {
                 i += 1;
             }
@@ -101,7 +106,10 @@ pub(crate) fn lex(s: &str) -> Result<Vec<Tok>, usize> {
                 v.push(ch);
                 i += 1;
             }
-            out.push(Tok { t: T::Quoted(String::from_utf8_lossy(&v).into_owned()), at });
+            out.push(Tok {
+                t: T::Quoted(String::from_utf8_lossy(&v).into_owned()),
+                at,
+            });
             continue;
         }
         if c == b'\'' || c == b'"' {
@@ -111,7 +119,9 @@ pub(crate) fn lex(s: &str) -> Result<Vec<Tok>, usize> {
             loop {
                 let Some(&ch) = b.get(i) else { return Err(at) };
                 if ch == b'\\' {
-                    let Some(&n) = b.get(i + 1) else { return Err(at) };
+                    let Some(&n) = b.get(i + 1) else {
+                        return Err(at);
+                    };
                     match n {
                         b'n' => v.push(b'\n'),
                         b't' => v.push(b'\t'),
@@ -138,7 +148,10 @@ pub(crate) fn lex(s: &str) -> Result<Vec<Tok>, usize> {
                 v.push(ch);
                 i += 1;
             }
-            out.push(Tok { t: T::Str(String::from_utf8_lossy(&v).into_owned()), at });
+            out.push(Tok {
+                t: T::Str(String::from_utf8_lossy(&v).into_owned()),
+                at,
+            });
             continue;
         }
         // x'..', X'..', b'..', B'..'
@@ -152,7 +165,10 @@ pub(crate) fn lex(s: &str) -> Result<Vec<Tok>, usize> {
                 return Err(at);
             }
             let digits = String::from_utf8_lossy(&b[i + 2..j]).into_owned();
-            out.push(Tok { t: if hex { T::Hex(digits) } else { T::Bin(digits) }, at });
+            out.push(Tok {
+                t: if hex { T::Hex(digits) } else { T::Bin(digits) },
+                at,
+            });
             i = j + 1;
             continue;
         }
@@ -160,19 +176,34 @@ pub(crate) fn lex(s: &str) -> Result<Vec<Tok>, usize> {
             let hex = b[i + 1] == b'x';
             let mut j = i + 2;
             while j < b.len()
-                && (if hex { b[j].is_ascii_hexdigit() } else { b[j] == b'0' || b[j] == b'1' })
+                && (if hex {
+                    b[j].is_ascii_hexdigit()
+                } else {
+                    b[j] == b'0' || b[j] == b'1'
+                })
             {
                 j += 1;
             }
-            let ends_word = b.get(j).is_none_or(|x| !(x.is_ascii_alphanumeric() || *x == b'_' || *x == b'$'));
+            let ends_word = b
+                .get(j)
+                .is_none_or(|x| !(x.is_ascii_alphanumeric() || *x == b'_' || *x == b'$'));
             if j > i + 2 && ends_word {
                 let digits = String::from_utf8_lossy(&b[i + 2..j]).into_owned();
-                out.push(Tok { t: if hex { T::HexNum(digits) } else { T::Bin(digits) }, at });
+                out.push(Tok {
+                    t: if hex {
+                        T::HexNum(digits)
+                    } else {
+                        T::Bin(digits)
+                    },
+                    at,
+                });
                 i = j;
                 continue;
             }
         }
-        if c.is_ascii_digit() || (c == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit) && !prev_is_name(&out)) {
+        if c.is_ascii_digit()
+            || (c == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit) && !prev_is_name(&out))
+        {
             let mut j = i;
             while j < b.len() && b[j].is_ascii_digit() {
                 j += 1;
@@ -196,16 +227,25 @@ pub(crate) fn lex(s: &str) -> Result<Vec<Tok>, usize> {
                 }
             }
             // `1abc` is a name in MySQL's grammar.
-            if j < b.len() && (b[j].is_ascii_alphabetic() || b[j] == b'_' || b[j] == b'$') && !b[i..j].contains(&b'.') {
+            if j < b.len()
+                && (b[j].is_ascii_alphabetic() || b[j] == b'_' || b[j] == b'$')
+                && !b[i..j].contains(&b'.')
+            {
                 let mut k = j;
                 while k < b.len() && is_name_byte(b[k]) {
                     k += 1;
                 }
-                out.push(Tok { t: T::Word(String::from_utf8_lossy(&b[i..k]).into_owned()), at });
+                out.push(Tok {
+                    t: T::Word(String::from_utf8_lossy(&b[i..k]).into_owned()),
+                    at,
+                });
                 i = k;
                 continue;
             }
-            out.push(Tok { t: T::Num(String::from_utf8_lossy(&b[i..j]).into_owned()), at });
+            out.push(Tok {
+                t: T::Num(String::from_utf8_lossy(&b[i..j]).into_owned()),
+                at,
+            });
             i = j;
             continue;
         }
@@ -214,7 +254,10 @@ pub(crate) fn lex(s: &str) -> Result<Vec<Tok>, usize> {
             while j < b.len() && is_name_byte(b[j]) {
                 j += 1;
             }
-            out.push(Tok { t: T::Word(String::from_utf8_lossy(&b[i..j]).into_owned()), at });
+            out.push(Tok {
+                t: T::Word(String::from_utf8_lossy(&b[i..j]).into_owned()),
+                at,
+            });
             i = j;
             continue;
         }
@@ -226,7 +269,10 @@ pub(crate) fn lex(s: &str) -> Result<Vec<Tok>, usize> {
             while j < b.len() && (is_name_byte(b[j]) || b[j] == b'.') {
                 j += 1;
             }
-            out.push(Tok { t: T::Var(String::from_utf8_lossy(&b[i..j]).into_owned()), at });
+            out.push(Tok {
+                t: T::Var(String::from_utf8_lossy(&b[i..j]).into_owned()),
+                at,
+            });
             i = j;
             continue;
         }

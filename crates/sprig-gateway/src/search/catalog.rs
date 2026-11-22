@@ -1,103 +1,61 @@
 //! Search indexes in the tenant catalog: the `search` catalog module.
 //!
-//! - **Tables.** `search_indexes`, `search_fields` and `search_analyzers`
-//!   in `t<tenant>_sprig`, created by the module's migration the first
-//!   time a gateway needs them for a tenant.
+//! - **Records.** The module's rows are the engine's catalog records:
+//!
+//!   ```text
+//!   m/search/indexes/<index u64>        IndexRow (the definition and its columns)
+//!   m/search/analyzers/<analyzer u32>   AnalyzerRow
+//!   m/search/anames/<name>              analyzer id
+//!   ```
 //! - **Objects.** A search index is an object of kind `search_index`
 //!   whose parent is the indexed table or collection, so its
 //!   id is an `objects.object_id`.
-//! - **Definitions.** `search_indexes.definition` holds the normalized
-//!   definition ([`IndexDef`] as JSON, with what was given); one
-//!   `search_fields` row per field mirrors it for `SHOW SEARCH INDEXES`
-//!   and `information_schema` readers.
+//! - **Definitions.** An index row holds the normalized definition
+//!   ([`IndexDef`] as JSON, with what was given); its fields are read
+//!   from it.
 //! - **Changes.** Creating or dropping an index or analyzer is one
-//!   versioned catalog change, so every gateway's snapshot reloads it.
-//!   Indexes whose object was dropped are left out of the snapshot.
+//!   versioned catalog change (its records written through the change),
+//!   so every gateway's snapshot reloads it. Indexes whose object was
+//!   dropped are left out of the snapshot.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
-use mysql_async::prelude::Queryable;
+use serde::{Deserialize, Serialize};
 use sprig_catalog::cache::{ExtState, SnapshotTx};
 use sprig_catalog::ddl::{LOWER_CASE_TABLE_NAMES, database_key, object_key};
-use sprig_catalog::migrate::{MigrateOpts, Migration, Migrator, Module, Phase};
+use sprig_catalog::migrate::{MigrateOpts, Migration, Migrator, Module};
+use sprig_catalog::records::{Pk, RecordTx, RowTable};
 use sprig_catalog::store::{Namespace, ObjectFlags, ObjectKind, ObjectRow, ObjectState};
 use sprig_catalog::version::VersionKind;
 use sprig_catalog::{CatalogExtension, CatalogLocator as _, Freshness, TenantCatalog};
 use sprig_common::ids::{DbId, ObjectId, TenantId};
-use sprig_common::names::quote;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_search::analyze::CustomAnalyzer;
-use sprig_search::def::{Flavor, IndexDef, Source};
+use sprig_search::def::{Flavor, IndexDef};
 
 use crate::tenant::TenantServices;
 
 /// The module name.
 pub const MODULE: &str = "search";
 
-const DDL_INDEXES: &str = "CREATE TABLE IF NOT EXISTS search_indexes (
-  index_id         BIGINT UNSIGNED NOT NULL,
-  db_id            INT UNSIGNED NOT NULL,
-  name             VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
-  object_id        BIGINT UNSIGNED NOT NULL,
-  model            ENUM('table','collection','kv') NOT NULL,
-  flavor           ENUM('sql','mongo_text','mongo_search','fulltext_compat') NOT NULL,
-  default_analyzer VARCHAR(64) NOT NULL,
-  dynamic          TINYINT(1) NOT NULL DEFAULT 0,
-  definition       JSON NOT NULL,
-  generation       INT UNSIGNED NOT NULL,
-  origin           ENUM('user','migrated','auto') NOT NULL,
-  auto_index_id    BIGINT UNSIGNED NULL,
-  state            ENUM('building','ready','rebuilding','failed','dropping') NOT NULL,
-  created_at       DATETIME(3) NOT NULL,
-  updated_at       DATETIME(3) NOT NULL,
-  PRIMARY KEY (index_id),
-  UNIQUE KEY uk_search_name (db_id, object_id, name),
-  KEY by_object (object_id)
-) ENGINE=InnoDB";
+/// Indexes by id.
+pub const INDEXES: RowTable = RowTable::new(MODULE, "indexes");
+/// Custom analyzers by id.
+pub const ANALYZERS: RowTable = RowTable::new(MODULE, "analyzers");
+/// Analyzer ids by name.
+pub const ANAMES: RowTable = RowTable::new(MODULE, "anames");
 
-const DDL_FIELDS: &str = "CREATE TABLE IF NOT EXISTS search_fields (
-  index_id         BIGINT UNSIGNED NOT NULL,
-  field_no         SMALLINT UNSIGNED NOT NULL,
-  name             VARCHAR(255) NOT NULL,
-  source           ENUM('column','path','kv_value','dynamic') NOT NULL,
-  source_ref       VARCHAR(512) NOT NULL,
-  kind             ENUM('text','keyword','number','date','bool','autocomplete',
-                        'substring','facet') NOT NULL,
-  analyzer         VARCHAR(64) NULL,
-  query_analyzer   VARCHAR(64) NULL,
-  boost            DOUBLE NOT NULL DEFAULT 1,
-  is_filter        TINYINT(1) NOT NULL DEFAULT 0,
-  is_sort          TINYINT(1) NOT NULL DEFAULT 0,
-  is_facet         TINYINT(1) NOT NULL DEFAULT 0,
-  added_generation INT UNSIGNED NOT NULL,
-  PRIMARY KEY (index_id, field_no),
-  UNIQUE KEY uk_field (index_id, name, kind)
-) ENGINE=InnoDB";
+/// The module's MariaDB migrations: none, its rows are engine records.
+pub static SEARCH_MIGRATIONS: &[Migration] = &[];
 
-const DDL_ANALYZERS: &str = "CREATE TABLE IF NOT EXISTS search_analyzers (
-  analyzer_id      INT UNSIGNED NOT NULL,
-  name             VARCHAR(64) NOT NULL,
-  tokenizer        VARCHAR(32) NOT NULL,
-  tokenizer_opts   JSON NOT NULL,
-  filters          JSON NOT NULL,
-  synonyms         JSON NULL,
-  version          INT UNSIGNED NOT NULL,
-  created_at       DATETIME(3) NOT NULL,
-  updated_at       DATETIME(3) NOT NULL,
-  PRIMARY KEY (analyzer_id),
-  UNIQUE KEY uk_analyzer_name (name)
-) ENGINE=InnoDB";
-
-/// The module's migrations.
-pub static SEARCH_MIGRATIONS: &[Migration] = &[Migration {
-    format: 1,
-    phase: Phase::Expand,
-    name: "search_indexes, search_fields, search_analyzers",
-    statements: &[DDL_INDEXES, DDL_FIELDS, DDL_ANALYZERS],
-}];
+/// The `search` module, for [`Migrator::new`].
+pub const SEARCH_MODULE: Module = Module {
+    name: MODULE,
+    migrations: SEARCH_MIGRATIONS,
+};
 
 fn map_err(e: mysql_async::Error) -> SprigError {
     match &e {
@@ -120,8 +78,63 @@ fn map_err(e: mysql_async::Error) -> SprigError {
     .with_source(e)
 }
 
-fn t(schema: &str, table: &str) -> String {
-    format!("{}.{}", quote(schema), quote(table))
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// A search index: what `search_indexes` held (the per-field mirror,
+/// `search_fields`, is the definition's `fields`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IndexRow {
+    /// Its id (its object's id).
+    pub index_id: u64,
+    /// Its database.
+    pub db_id: u32,
+    /// Its name.
+    pub name: String,
+    /// The indexed table or collection.
+    pub object_id: u64,
+    /// `table`, `collection` or `kv`.
+    pub model: String,
+    /// `sql`, `mongo_text`, `mongo_search` or `fulltext_compat`.
+    pub flavor: String,
+    /// The default analyzer.
+    pub default_analyzer: String,
+    /// Dynamic mapping.
+    pub dynamic: bool,
+    /// The normalized definition.
+    pub definition: serde_json::Value,
+    /// The definition's generation.
+    pub generation: u32,
+    /// `user`, `migrated` or `auto`.
+    pub origin: String,
+    /// `building`, `ready`, `rebuilding`, `failed` or `dropping`.
+    pub state: String,
+    /// Ms since the epoch.
+    pub created_ms: u64,
+    /// Ms since the epoch.
+    pub updated_ms: u64,
+}
+
+/// A custom analyzer: what `search_analyzers` held.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnalyzerRow {
+    /// Its name.
+    pub name: String,
+    /// The tokenizer.
+    pub tokenizer: String,
+    /// The tokenizer's options.
+    pub tokenizer_opts: serde_json::Value,
+    /// Token filters.
+    pub filters: serde_json::Value,
+    /// Synonyms.
+    pub synonyms: serde_json::Value,
+    /// Its version.
+    pub version: u32,
+    /// Ms since the epoch.
+    pub created_ms: u64,
 }
 
 /// One tenant's search indexes and analyzers in a snapshot.
@@ -187,183 +200,180 @@ impl SearchState {
     }
 }
 
-/// The module's rows in catalog schema `schema`.
-#[derive(Debug, Clone)]
-pub struct SearchTables {
-    schema: String,
-}
+/// The module's rows, read and written as catalog records.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SearchTables;
 
 impl SearchTables {
-    /// Over `t<tenant>_sprig`.
-    #[must_use]
-    pub fn new(schema: &str) -> Self {
-        Self {
-            schema: schema.to_owned(),
-        }
-    }
-
-    /// Whether the module's tables exist.
+    /// Makes sure catalog `schema` can take the module's records (its core
+    /// migrations, which create the record log).
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn migrated<Q: Queryable + Send>(&self, q: &mut Q) -> Result<bool> {
-        let n: Option<u64> = q
-            .exec_first(
-                "SELECT COUNT(*) FROM information_schema.TABLES \
-                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'search_analyzers'",
-                (self.schema.as_str(),),
-            )
-            .await
-            .map_err(map_err)?;
-        Ok(n.unwrap_or(0) > 0)
-    }
-
-    /// Creates the module's tables (idempotent).
-    ///
-    /// # Errors
-    /// A backend error.
-    pub async fn migrate(&self, q: &mut mysql_async::Conn) -> Result<()> {
-        Migrator::new(&[Module {
-            name: MODULE,
-            migrations: SEARCH_MIGRATIONS,
-        }])?
-        .run(q, &self.schema, &MigrateOpts::existing())
-        .await?;
+    /// The migrator's.
+    pub async fn migrate(q: &mut mysql_async::Conn, schema: &str) -> Result<()> {
+        Migrator::new(&[SEARCH_MODULE])?
+            .run(q, schema, &MigrateOpts::existing())
+            .await?;
         Ok(())
     }
 
-    /// Every live index (its object not dropped) and every analyzer.
+    /// Every index row, by id.
     ///
     /// # Errors
-    /// A backend error.
-    pub async fn load<Q: Queryable + Send>(&self, q: &mut Q) -> Result<SearchState> {
-        let rows: Vec<(u64, u32, String)> = q
-            .query(format!(
-                "SELECT s.index_id, s.db_id, s.definition FROM {} s JOIN {} o \
-                 ON o.object_id = s.object_id \
-                 WHERE s.state <> 'dropping' AND o.state NOT IN ('dropping', 'dropped') \
-                 ORDER BY s.index_id",
-                t(&self.schema, "search_indexes"),
-                t(&self.schema, "objects")
-            ))
-            .await
-            .map_err(map_err)?;
+    /// The record store's.
+    pub async fn indexes(rec: &mut dyn RecordTx) -> Result<Vec<IndexRow>> {
+        INDEXES.rows(rec, &Pk::new()).await
+    }
+
+    /// Every index (but those being dropped) and every analyzer;
+    /// `live` says which indexed objects are still there.
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn load(rec: &mut dyn RecordTx, live: impl Fn(u64) -> bool) -> Result<SearchState> {
         let mut st = SearchState::default();
-        for (id, db, json) in rows {
-            match serde_json::from_str::<IndexDef>(&json) {
+        for r in Self::indexes(rec).await? {
+            if r.state == "dropping" || !live(r.object_id) {
+                continue;
+            }
+            match serde_json::from_value::<IndexDef>(r.definition) {
                 Ok(mut d) => {
-                    d.index_id = id;
-                    st.by_db.entry(db).or_default().push(Arc::new(d));
+                    d.index_id = r.index_id;
+                    st.by_db.entry(r.db_id).or_default().push(Arc::new(d));
                 }
                 Err(e) => {
-                    tracing::warn!(index = id, error = %e, "unreadable search index definition; skipped");
+                    tracing::warn!(index = r.index_id, error = %e, "unreadable search index definition; skipped");
                 }
             }
         }
-        let an: Vec<(String, String, String, String, Option<String>, u32)> = q
-            .query(format!(
-                "SELECT name, tokenizer, tokenizer_opts, filters, synonyms, version FROM {} ORDER BY analyzer_id",
-                t(&self.schema, "search_analyzers")
-            ))
-            .await
-            .map_err(map_err)?;
-        for (name, tokenizer, opts, filters, syn, version) in an {
+        for a in ANALYZERS.rows::<AnalyzerRow>(rec, &Pk::new()).await? {
             st.analyzers.push(CustomAnalyzer {
-                name,
-                tokenizer,
-                tokenizer_opts: serde_json::from_str(&opts).unwrap_or_default(),
-                filters: serde_json::from_str(&filters).unwrap_or_default(),
-                synonyms: syn
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str(s).ok())
-                    .unwrap_or_default(),
-                version,
+                name: a.name,
+                tokenizer: a.tokenizer,
+                tokenizer_opts: a.tokenizer_opts,
+                filters: serde_json::from_value(a.filters).unwrap_or_default(),
+                synonyms: serde_json::from_value(a.synonyms).unwrap_or_default(),
+                version: a.version,
             });
         }
         Ok(st)
     }
 
-    async fn insert_index<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
+    /// Writes index `d` of database `db` (a new one, or a new generation).
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn put_index(
+        rec: &mut dyn RecordTx,
         db: u32,
         d: &IndexDef,
         origin: &str,
     ) -> Result<()> {
-        let json = serde_json::to_string(d).map_err(|e| SprigError::internal(e.to_string()))?;
-        q.exec_drop(
-            format!(
-                "INSERT INTO {} (index_id, db_id, name, object_id, model, flavor, default_analyzer, \
-                 dynamic, definition, generation, origin, state, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))",
-                t(&self.schema, "search_indexes")
-            ),
-            (
-                d.index_id,
-                db,
-                d.name.as_str(),
-                d.object_id,
-                d.model.as_str(),
-                d.flavor.as_str(),
-                d.default_analyzer.as_str(),
-                u8::from(d.dynamic),
-                json,
-                d.generation,
-                origin,
-            ),
-        )
-        .await
-        .map_err(map_err)?;
-        for f in &d.fields {
-            q.exec_drop(
-                format!(
-                    "INSERT INTO {} (index_id, field_no, name, source, source_ref, kind, analyzer, \
-                     query_analyzer, boost, is_filter, is_sort, is_facet, added_generation) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    t(&self.schema, "search_fields")
-                ),
-                mysql_async::Params::Positional(vec![
-                    d.index_id.into(),
-                    f.field_no.into(),
-                    f.name.as_str().into(),
-                    // The mirror's ENUM has no hash-field source: a hash
-                    // field shows as a value field (the definition says which).
-                    match f.source {
-                        Source::KvField => "kv_value".to_owned(),
-                        other => serde_json::to_value(other)
-                            .ok()
-                            .and_then(|v| v.as_str().map(str::to_owned))
-                            .unwrap_or_default(),
-                    }
-                    .into(),
-                    f.source_ref.as_str().into(),
-                    f.kind.as_str().into(),
-                    f.analyzer.clone().into(),
-                    f.query_analyzer.clone().into(),
-                    f.boost.into(),
-                    u8::from(f.filter).into(),
-                    u8::from(f.sort).into(),
-                    u8::from(f.facet).into(),
-                    f.added_generation.max(1).into(),
-                ]),
-            )
-            .await
-            .map_err(map_err)?;
-        }
-        Ok(())
+        let pk = Pk::new().u64(d.index_id);
+        let now = now_ms();
+        let created_ms = INDEXES
+            .get::<IndexRow>(rec, &pk)
+            .await?
+            .map_or(now, |r| r.created_ms);
+        let row = IndexRow {
+            index_id: d.index_id,
+            db_id: db,
+            name: d.name.clone(),
+            object_id: d.object_id,
+            model: d.model.as_str().to_owned(),
+            flavor: d.flavor.as_str().to_owned(),
+            default_analyzer: d.default_analyzer.clone(),
+            dynamic: d.dynamic,
+            definition: serde_json::to_value(d).map_err(|e| SprigError::internal(e.to_string()))?,
+            generation: d.generation,
+            origin: origin.to_owned(),
+            state: "ready".to_owned(),
+            created_ms,
+            updated_ms: now,
+        };
+        INDEXES.put(rec, &pk, &row).await
     }
 
-    async fn delete_index<Q: Queryable + Send>(&self, q: &mut Q, id: u64) -> Result<()> {
-        for tb in ["search_fields", "search_indexes"] {
-            q.exec_drop(
-                format!("DELETE FROM {} WHERE index_id = ?", t(&self.schema, tb)),
-                (id,),
-            )
-            .await
-            .map_err(map_err)?;
-        }
-        Ok(())
+    /// Deletes index `id`.
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn delete_index(rec: &mut dyn RecordTx, id: u64) -> Result<()> {
+        INDEXES.delete(rec, &Pk::new().u64(id)).await
     }
+
+    /// Adds custom analyzer `a`: whether it was added (`false`: the name
+    /// is taken).
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn add_analyzer(rec: &mut dyn RecordTx, a: &CustomAnalyzer) -> Result<bool> {
+        let npk = Pk::new().bytes(a.name.as_bytes());
+        if ANAMES.get::<u32>(rec, &npk).await?.is_some() {
+            return Ok(false);
+        }
+        let next = ANALYZERS
+            .scan::<serde_json::Value>(rec, &Pk::new())
+            .await?
+            .iter()
+            .filter_map(|(pk, _)| <[u8; 4]>::try_from(pk.0.as_slice()).ok())
+            .map(u32::from_be_bytes)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let row = AnalyzerRow {
+            name: a.name.clone(),
+            tokenizer: a.tokenizer.clone(),
+            tokenizer_opts: a.tokenizer_opts.clone(),
+            filters: serde_json::to_value(&a.filters).unwrap_or_default(),
+            synonyms: serde_json::to_value(&a.synonyms).unwrap_or_default(),
+            version: a.version,
+            created_ms: now_ms(),
+        };
+        ANALYZERS.put(rec, &Pk::new().u32(next), &row).await?;
+        ANAMES.put(rec, &npk, &next).await?;
+        Ok(true)
+    }
+
+    /// Removes custom analyzer `name`: whether it existed.
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn remove_analyzer(rec: &mut dyn RecordTx, name: &str) -> Result<bool> {
+        let npk = Pk::new().bytes(name.as_bytes());
+        let Some(id) = ANAMES.get::<u32>(rec, &npk).await? else {
+            return Ok(false);
+        };
+        ANAMES.delete(rec, &npk).await?;
+        ANALYZERS.delete(rec, &Pk::new().u32(id)).await?;
+        Ok(true)
+    }
+
+    /// The name of an index that uses analyzer `name` (as a field's
+    /// analyzer or query analyzer, or as its default).
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn analyzer_user(rec: &mut dyn RecordTx, name: &str) -> Result<Option<String>> {
+        for r in Self::indexes(rec).await? {
+            if r.default_analyzer == name {
+                return Ok(Some(r.name));
+            }
+            if let Ok(d) = serde_json::from_value::<IndexDef>(r.definition)
+                && d.fields.iter().any(|f| {
+                    f.analyzer.as_deref() == Some(name) || f.query_analyzer.as_deref() == Some(name)
+                })
+            {
+                return Ok(Some(r.name));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Objects whose indexes are still served (not dropping or dropped).
+fn serving(state: ObjectState) -> bool {
+    !matches!(state, ObjectState::Dropping | ObjectState::Dropped)
 }
 
 /// The catalog extension (loads [`SearchState`] into every snapshot).
@@ -390,12 +400,27 @@ impl CatalogExtension for SearchExtension {
         _since: Option<u64>,
         _prev: Option<&Arc<dyn ExtState>>,
     ) -> Result<Arc<dyn ExtState>> {
-        let d = SearchTables::new(tx.schema());
-        let conn = tx.conn();
-        if !d.migrated(conn).await? {
+        if !tx.catalog_records() {
             return Ok(Arc::new(SearchState::default()));
         }
-        Ok(Arc::new(d.load(conn).await?))
+        let objects: Vec<ObjectId> = SearchTables::indexes(tx.records()?)
+            .await?
+            .iter()
+            .map(|r| ObjectId(r.object_id))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let store = tx.store().clone();
+        let live: HashSet<u64> = store
+            .objects_by_ids(tx.conn(), &objects)
+            .await?
+            .into_iter()
+            .filter(|o| serving(o.state))
+            .map(|o| o.object_id.0)
+            .collect();
+        Ok(Arc::new(
+            SearchTables::load(tx.records()?, |o| live.contains(&o)).await?,
+        ))
     }
 }
 
@@ -446,9 +471,7 @@ impl SearchCatalog {
         }
         let ep = self.svc.locator.writer(tenant).await?;
         let mut conn = ep.pool.get_conn().await.map_err(map_err)?;
-        SearchTables::new(ep.store.schema())
-            .migrate(&mut conn)
-            .await?;
+        SearchTables::migrate(&mut conn, ep.store.schema()).await?;
         lock(&self.migrated).insert(tenant.0);
         Ok(())
     }
@@ -509,36 +532,36 @@ impl SearchCatalog {
             .await?;
         let version = ch.version();
         let r: Result<bool> = async {
-            let (store, tx) = ch.tx().parts();
-            let tb = SearchTables::new(store.schema());
+            let (store, tx, rec) = ch.tx().split().await?;
             // Indexes whose object was dropped go first (their names can be
             // used again).
-            let orphans: Vec<u64> = tx
-                .exec(
-                    format!(
-                        "SELECT s.index_id FROM {} s LEFT JOIN {} o ON o.object_id = s.object_id \
-                         WHERE s.db_id = ? AND (o.object_id IS NULL OR o.state IN ('dropping', 'dropped'))",
-                        t(store.schema(), "search_indexes"),
-                        t(store.schema(), "objects")
-                    ),
-                    (db_id.0,),
-                )
-                .await
-                .map_err(map_err)?;
-            for id in orphans {
-                tb.delete_index(tx, id).await?;
-                store.delete_object(tx, ObjectId(id)).await?;
+            let mine: Vec<IndexRow> = SearchTables::indexes(rec)
+                .await?
+                .into_iter()
+                .filter(|r| r.db_id == db_id.0)
+                .collect();
+            let parents: Vec<ObjectId> = mine
+                .iter()
+                .map(|r| ObjectId(r.object_id))
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            let live: HashSet<u64> = store
+                .objects_by_ids(tx, &parents)
+                .await?
+                .into_iter()
+                .filter(|o| serving(o.state))
+                .map(|o| o.object_id.0)
+                .collect();
+            let mut existing: Vec<(u64, String, u64)> = Vec::new();
+            for r in mine {
+                if live.contains(&r.object_id) {
+                    existing.push((r.index_id, r.name, r.object_id));
+                } else {
+                    SearchTables::delete_index(rec, r.index_id).await?;
+                    store.delete_object(tx, ObjectId(r.index_id)).await?;
+                }
             }
-            let existing: Vec<(u64, String, u64)> = tx
-                .exec(
-                    format!(
-                        "SELECT index_id, name, object_id FROM {} WHERE db_id = ? FOR UPDATE",
-                        t(store.schema(), "search_indexes")
-                    ),
-                    (db_id.0,),
-                )
-                .await
-                .map_err(map_err)?;
             // SQL names are unique per database; MongoDB's per collection.
             let per_object = matches!(d.flavor, Flavor::MongoText | Flavor::MongoSearch);
             if existing.iter().any(|(_, n, o)| {
@@ -587,7 +610,7 @@ impl SearchCatalog {
                 changed_version: version,
             };
             store.insert_object(tx, &obj).await?;
-            tb.insert_index(tx, db_id.0, d, origin).await?;
+            SearchTables::put_index(rec, db_id.0, d, origin).await?;
             Ok(true)
         }
         .await;
@@ -617,10 +640,8 @@ impl SearchCatalog {
             .change(tenant, VersionKind::Catalog)
             .await?;
         let r: Result<()> = async {
-            let (store, tx) = ch.tx().parts();
-            let tb = SearchTables::new(store.schema());
-            tb.delete_index(tx, d.index_id).await?;
-            tb.insert_index(tx, db_id.0, d, "user").await
+            let rec = ch.tx().records().await?;
+            SearchTables::put_index(rec, db_id.0, d, "user").await
         }
         .await;
         match r {
@@ -644,10 +665,8 @@ impl SearchCatalog {
             .change(tenant, VersionKind::Catalog)
             .await?;
         let r: Result<()> = async {
-            let (store, tx) = ch.tx().parts();
-            SearchTables::new(store.schema())
-                .delete_index(tx, id)
-                .await?;
+            let (store, tx, rec) = ch.tx().split().await?;
+            SearchTables::delete_index(rec, id).await?;
             store.delete_object(tx, ObjectId(id)).await?;
             Ok(())
         }
@@ -680,17 +699,9 @@ impl SearchCatalog {
             .change(tenant, VersionKind::Catalog)
             .await?;
         let r: Result<bool> = async {
-            let (store, tx) = ch.tx().parts();
-            let tbl = t(store.schema(), "search_analyzers");
+            let rec = ch.tx().records().await?;
             if let Some(a) = create {
-                let exists: Option<u32> = tx
-                    .exec_first(
-                        format!("SELECT analyzer_id FROM {tbl} WHERE name = ? FOR UPDATE"),
-                        (a.name.as_str(),),
-                    )
-                    .await
-                    .map_err(map_err)?;
-                if exists.is_some() {
+                if !SearchTables::add_analyzer(rec, a).await? {
                     if lenient {
                         return Ok(false);
                     }
@@ -700,53 +711,16 @@ impl SearchCatalog {
                         format!("search analyzer '{}' already exists", a.name),
                     ));
                 }
-                let next: Option<u32> = tx
-                    .query_first(format!("SELECT COALESCE(MAX(analyzer_id), 0) + 1 FROM {tbl}"))
-                    .await
-                    .map_err(map_err)?;
-                tx.exec_drop(
-                    format!(
-                        "INSERT INTO {tbl} (analyzer_id, name, tokenizer, tokenizer_opts, filters, synonyms, \
-                         version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))"
-                    ),
-                    (
-                        next.unwrap_or(1),
-                        a.name.as_str(),
-                        a.tokenizer.as_str(),
-                        a.tokenizer_opts.to_string(),
-                        serde_json::to_string(&a.filters).unwrap_or_default(),
-                        serde_json::to_string(&a.synonyms).unwrap_or_default(),
-                        a.version,
-                    ),
-                )
-                .await
-                .map_err(map_err)?;
                 return Ok(true);
             }
             if let Some(n) = drop_name {
-                let used: Option<String> = tx
-                    .exec_first(
-                        format!(
-                            "SELECT i.name FROM {} f JOIN {} i ON i.index_id = f.index_id \
-                             WHERE f.analyzer = ? OR f.query_analyzer = ? OR i.default_analyzer = ? LIMIT 1",
-                            t(store.schema(), "search_fields"),
-                            t(store.schema(), "search_indexes")
-                        ),
-                        (n, n, n),
-                    )
-                    .await
-                    .map_err(map_err)?;
-                if let Some(i) = used {
+                if let Some(i) = SearchTables::analyzer_user(rec, n).await? {
                     return Err(SprigError::new(
                         SprigCode::SearchFieldType,
                         format!("search analyzer '{n}' is used by search index '{i}'"),
                     ));
                 }
-                tx.exec_drop(format!("DELETE FROM {tbl} WHERE name = ?"), (n,))
-                    .await
-                    .map_err(map_err)?;
-                let gone: Option<u64> = tx.query_first("SELECT ROW_COUNT()").await.map_err(map_err)?;
-                if gone.unwrap_or(0) == 0 {
+                if !SearchTables::remove_analyzer(rec, n).await? {
                     if lenient {
                         return Ok(false);
                     }
@@ -789,5 +763,133 @@ impl SearchCatalog {
             &object_key(ObjectKind::Table, name, self.lctn(cat)),
         )
         .map(|o| o.object_id.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sprig_catalog::records::RecordStore;
+    use sprig_catalog::records::mem::MemRecords;
+    use sprig_search::def::{FieldDef, FieldKind, Model, Source};
+
+    use super::*;
+
+    const T: TenantId = TenantId(57_406_000_003);
+
+    fn def(id: u64, name: &str, object_id: u64, analyzer: Option<&str>) -> IndexDef {
+        let mut d = IndexDef::new(name, "db", "t", Model::Table, Flavor::Sql);
+        d.index_id = id;
+        d.object_id = object_id;
+        let mut f = FieldDef::new("body", Source::Column, FieldKind::Text);
+        f.analyzer = analyzer.map(str::to_owned);
+        d.push(f).unwrap();
+        d
+    }
+
+    fn analyzer(name: &str) -> CustomAnalyzer {
+        CustomAnalyzer {
+            name: name.into(),
+            tokenizer: "standard".into(),
+            tokenizer_opts: serde_json::json!({"max": 5}),
+            filters: vec!["lowercase".into()],
+            synonyms: vec![vec!["car".into(), "auto".into()]],
+            version: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn indexes_and_analyzers_round_trip() {
+        let store = MemRecords::new();
+        let mut tx = store.begin(T).await.unwrap();
+        SearchTables::put_index(&mut *tx, 1, &def(10, "a", 100, Some("mine")), "user")
+            .await
+            .unwrap();
+        SearchTables::put_index(&mut *tx, 2, &def(11, "b", 101, None), "auto")
+            .await
+            .unwrap();
+        assert!(
+            SearchTables::add_analyzer(&mut *tx, &analyzer("mine"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !SearchTables::add_analyzer(&mut *tx, &analyzer("mine"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            SearchTables::add_analyzer(&mut *tx, &analyzer("other"))
+                .await
+                .unwrap()
+        );
+        tx.commit().await.unwrap();
+
+        let mut tx = store.begin(T).await.unwrap();
+        // Indexes on dropped objects are left out.
+        let st = SearchTables::load(&mut *tx, |o| o != 101).await.unwrap();
+        assert_eq!(st.of_db(1).len(), 1);
+        assert!(st.of_db(2).is_empty());
+        assert_eq!(*st.of_db(1)[0], def(10, "a", 100, Some("mine")));
+        assert_eq!(st.analyzers.len(), 2);
+        assert_eq!(st.analyzers[0], analyzer("mine"));
+        // An analyzer in use can't go; one that isn't can, once.
+        assert_eq!(
+            SearchTables::analyzer_user(&mut *tx, "mine").await.unwrap(),
+            Some("a".into())
+        );
+        assert_eq!(
+            SearchTables::analyzer_user(&mut *tx, "other")
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(
+            SearchTables::remove_analyzer(&mut *tx, "other")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !SearchTables::remove_analyzer(&mut *tx, "other")
+                .await
+                .unwrap()
+        );
+        // A new generation keeps the creation time; a drop removes it.
+        let mut d = def(10, "a", 100, None);
+        d.generation = 2;
+        let before = INDEXES
+            .get::<IndexRow>(&mut *tx, &Pk::new().u64(10))
+            .await
+            .unwrap()
+            .unwrap();
+        SearchTables::put_index(&mut *tx, 1, &d, "user")
+            .await
+            .unwrap();
+        let after = INDEXES
+            .get::<IndexRow>(&mut *tx, &Pk::new().u64(10))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((after.created_ms, after.generation), (before.created_ms, 2));
+        SearchTables::delete_index(&mut *tx, 11).await.unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = store.begin(T).await.unwrap();
+        let st = SearchTables::load(&mut *tx, |_| true).await.unwrap();
+        assert_eq!(st.by_db.values().map(Vec::len).sum::<usize>(), 1);
+        assert_eq!(st.by_id(10).unwrap().generation, 2);
+        assert_eq!(st.analyzers.len(), 1);
+        // Analyzer ids are `MAX + 1`, as the table's were.
+        assert!(
+            SearchTables::add_analyzer(&mut *tx, &analyzer("third"))
+                .await
+                .unwrap()
+        );
+        let ids: Vec<Pk> = ANALYZERS
+            .scan::<AnalyzerRow>(&mut *tx, &Pk::new())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(pk, _)| pk)
+            .collect();
+        assert_eq!(ids, vec![Pk::new().u32(1), Pk::new().u32(2)]);
     }
 }

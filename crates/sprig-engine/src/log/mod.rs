@@ -466,12 +466,27 @@ impl LocalLog {
     /// # Errors
     /// The sync, the flush or the purge failed.
     pub fn checkpoint(&self, flush_store: &dyn Fn() -> Result<()>) -> Result<u64> {
+        self.checkpoint_capped(flush_store, &|_| None)
+    }
+
+    /// [`LocalLog::checkpoint`], keeping every entry of a unit above
+    /// `cap(unit)` when it returns an index (what an apply observer has not
+    /// made durable in its own files yet).
+    ///
+    /// # Errors
+    /// As for [`LocalLog::checkpoint`].
+    pub fn checkpoint_capped(
+        &self,
+        flush_store: &dyn Fn() -> Result<()>,
+        cap: &dyn Fn(UnitId) -> Option<u64>,
+    ) -> Result<u64> {
         let floors = self.applied();
         self.sh.engine.sync().map_err(|e| log_err("sync", e))?;
         flush_store()?;
         let mut trimmed = 0;
         for (u, applied) in floors {
-            trimmed += self.sh.engine.compact_to(u.0, applied + 1);
+            let keep_above = cap(u).map_or(applied, |c| c.min(applied));
+            trimmed += self.sh.engine.compact_to(u.0, keep_above + 1);
         }
         // A purge can read entries back to rewrite them, through the same
         // per-thread cache as replay: on a fresh thread, for the reason
@@ -508,6 +523,39 @@ impl LocalLog {
                 }
                 Err(e) => Err(log_err("read", e)),
             }
+        })
+    }
+
+    /// The lowest index of `unit` the log still holds (`None`: it holds
+    /// none, everything was trimmed or nothing was written).
+    #[must_use]
+    pub fn first_index(&self, unit: UnitId) -> Option<u64> {
+        self.sh.engine.first_index(unit.0)
+    }
+
+    /// The entries `from..to` of `unit` the log still holds, in order
+    /// (fewer when the log ends first). For apply observers catching up.
+    ///
+    /// # Errors
+    /// raft-engine failed to read, or the range starts below what the log
+    /// still holds.
+    pub fn entries(&self, unit: UnitId, from: u64, to: u64) -> Result<Vec<LogEntry>> {
+        if from >= to {
+            return Ok(Vec::new());
+        }
+        // On a fresh thread, for the reason given in `open`.
+        on_fresh_thread(|| {
+            let last = self.sh.engine.last_index(unit.0).unwrap_or(0);
+            let to = to.min(last + 1);
+            let mut buf = Vec::new();
+            if from >= to {
+                return Ok(buf);
+            }
+            self.sh
+                .engine
+                .fetch_entries_to::<EntryExt>(unit.0, from, to, None, &mut buf)
+                .map_err(|e| log_err("read", e))?;
+            Ok(buf)
         })
     }
 

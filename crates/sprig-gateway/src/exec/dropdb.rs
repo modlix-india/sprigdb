@@ -337,22 +337,29 @@ impl DbDrop {
             .catalog
             .change(self.tenant, VersionKind::Catalog)
             .await?;
-        let applied = {
-            let (store, tx) = c.tx().parts();
-            let mut r = Ok(());
-            for ch in &changes {
-                r = sprig_sinks::sql::apply(tx, store.schema(), ch, None, self.tenant, 0).await;
-                if r.is_err() {
-                    break;
+        let applied = match c.tx().split().await {
+            Err(e) => Err(e),
+            Ok((store, tx, rec)) => {
+                let schema = store.schema().to_owned();
+                let mut r = Ok(());
+                for ch in &changes {
+                    r = sprig_sinks::sql::apply(tx, &schema, rec, ch, None, self.tenant, 0).await;
+                    if r.is_err() {
+                        break;
+                    }
                 }
+                r
             }
-            r
         };
         if let Err(e) = applied {
             let _ = c.rollback().await;
             return Err(e);
         }
         let v = c.commit().await?;
+        let store = sprig_sinks::store::SinksStore::new(Arc::clone(&svc.records), self.tenant);
+        for ch in &changes {
+            sprig_sinks::sql::after_commit(&store, ch).await?;
+        }
         tracing::info!(tenant = %self.tenant, db = %self.name, dropped = ?names,
             "DROP DATABASE: the database's sinks and connections dropped");
         Ok(Some(v))

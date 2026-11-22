@@ -884,7 +884,6 @@ mod tests {
     /// `SPRIG_TEST_MARIADB_SINGLE` (skipped without it).
     #[tokio::test]
     async fn an_old_fingerprint_row_gets_a_field_column_once_rewritten() {
-        use mysql_async::prelude::Queryable;
         use sprig_common::ids::{DbId, TenantId};
         use sprig_workload::fingerprint::{FpFlags, FpKind, FrontEnd};
         use sprig_workload::recorder::{FpMeta, NewFingerprint};
@@ -897,24 +896,11 @@ mod tests {
         assert!(old.all_unsargable());
         assert!(field_candidates(&input(old), "db0", KEYS, &key_stats()).is_empty());
 
-        let Some(url) = std::env::var("SPRIG_TEST_MARIADB_SINGLE")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-        else {
-            eprintln!("skipped the store part: set SPRIG_TEST_MARIADB_SINGLE to run it");
-            return;
-        };
-        let opts = mysql_async::Opts::from_url(&url).unwrap();
-        let mut conn = mysql_async::Conn::new(opts).await.unwrap();
-        let schema = format!("__sprig_test_x34_{}", std::process::id());
-        let q = sprig_common::names::quote(&schema);
-        conn.query_drop(format!("CREATE DATABASE {q}"))
+        // The workload store on the in-memory catalog record store.
+        let store = sprig_catalog::records::mem::MemRecords::new();
+        let mut conn = sprig_catalog::RecordStore::begin(&store, TenantId(1))
             .await
             .unwrap();
-        sprig_workload::flush::migrate(&mut conn, &schema, "test")
-            .await
-            .unwrap();
-        let t = WorkloadTables::new(&schema);
         let id = sprig_common::ids::Fingerprint(0x0034);
         let n = NewFingerprint {
             tenant: TenantId(1),
@@ -933,18 +919,25 @@ mod tests {
             }),
             first_seen: std::time::SystemTime::now(),
         };
-        t.insert_fingerprints(&mut conn, std::slice::from_ref(&n))
+        WorkloadTables::insert_fingerprints(&mut *conn, std::slice::from_ref(&n))
             .await
             .unwrap();
-        // The row as an older build (shape version 1) left it.
-        let stored_old = by_field(OLD_EMAIL_EQ).to_json();
-        conn.exec_drop(
-            format!("UPDATE {q}.workload_fingerprints SET shape = ?, shape_version = 1"),
-            (stored_old,),
-        )
-        .await
-        .unwrap();
-        let before = t.fingerprints(&mut conn, &[id]).await.unwrap();
+        // The record as an older build (shape version 1) left it.
+        let pk = sprig_catalog::records::Pk::new().u64(id.0);
+        let mut r = sprig_workload::store::FPS
+            .get::<sprig_workload::store::FpRecord>(&mut *conn, &pk)
+            .await
+            .unwrap()
+            .unwrap();
+        r.shape = by_field(OLD_EMAIL_EQ).to_json();
+        r.shape_version = 1;
+        sprig_workload::store::FPS
+            .put(&mut *conn, &pk, &r)
+            .await
+            .unwrap();
+        let before = WorkloadTables::fingerprints(&mut *conn, &[id])
+            .await
+            .unwrap();
         let none = field_candidates(
             &input((*before[0].shape).clone()),
             "db0",
@@ -953,9 +946,12 @@ mod tests {
         );
         // A gateway records the statement again (its first sighting since
         // it started on this build).
-        let rewritten = t.insert_fingerprints(&mut conn, &[n]).await.unwrap();
-        let after = t.fingerprints(&mut conn, &[id]).await.unwrap();
-        conn.query_drop(format!("DROP DATABASE {q}")).await.unwrap();
+        let rewritten = WorkloadTables::insert_fingerprints(&mut *conn, &[n])
+            .await
+            .unwrap();
+        let after = WorkloadTables::fingerprints(&mut *conn, &[id])
+            .await
+            .unwrap();
         assert!(none.is_empty(), "{none:?}");
         assert_eq!(rewritten, 2);
         let c = field_candidates(&input((*after[0].shape).clone()), "db0", KEYS, &key_stats());

@@ -24,7 +24,10 @@
 //! - [`read`]: reading the log by partition and offset, the high
 //!   watermark, and the long-poll wait, for the Kafka front end;
 //! - [`offsets`]: committing an offset inside the caller's transaction
-//!   (`sprig.commit_offset`, `db.commitOffset`, triggers on streams).
+//!   (`sprig.commit_offset`, `db.commitOffset`, triggers on streams);
+//! - [`seg`]: streams stored on the node's engine instead: segment files
+//!   fed by the engine's commit log, and offsets, groups and the topic
+//!   catalog as engine records (no outbox, sequencer or binlog).
 //!
 //! Not built here: the Kafka codec and broker (`sprig-proto-kafka`), HTTP
 //! and gRPC consumers, consumer-group coordination (only its tables),
@@ -53,6 +56,7 @@ pub mod publish;
 pub mod read;
 pub mod retention;
 pub mod runtime;
+pub mod seg;
 pub mod sequencer;
 pub mod settings;
 pub mod sql;

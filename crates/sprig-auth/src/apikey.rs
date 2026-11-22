@@ -6,10 +6,10 @@
 //! (`api_keys.secret_sha256`); the secret is shown once, when the key is
 //! created ([`create_api_key`]).
 //!
-//! `api_keys` is the auth module's format 2 (an expand migration). Rows are
+//! `api_keys` rows are catalog records (`m/auth/api_keys/<key id>`),
 //! versioned by the auth version (`changed_version`), so creating or
-//! revoking a key is an auth change and every gateway's cache follows it;
-//! a catalog not yet migrated to format 2 simply has no keys.
+//! revoking a key is an auth change and every gateway's cache follows it.
+//! A revoked key's row stays (revoked), never deleted.
 //!
 //! Verification ([`crate::http`]): the key's row in the cached
 //! [`TenantAuth`](crate::cache::TenantAuth), `SHA256(secret)` compared in
@@ -23,38 +23,18 @@ use std::fmt::Write as _;
 use std::net::IpAddr;
 use std::time::SystemTime;
 
-use mysql_async::prelude::Queryable;
-use mysql_async::{Row, Value};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sprig_catalog::{ChangeOpts, MariaCatalog, VersionKind};
+use sprig_catalog::records::{Pk, RecordTx};
+use sprig_catalog::{AuthCatalog, ChangeOpts, VersionKind};
 use sprig_common::ids::{TenantId, UserId};
-use sprig_common::{ErrorKind, Result, SprigCode, SprigError};
+use sprig_common::{Result, SprigCode, SprigError};
 use subtle::ConstantTimeEq as _;
 use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::account::HostPattern;
-use crate::store::{
-    AT, AuthMethods, AuthStore, col, exec, exec_count, map_err, micros, opt_at, opt_micros,
-    opt_time, time,
-};
-
-/// `api_keys`: the auth module's format 2.
-pub const DDL_API_KEYS: &str = "CREATE TABLE IF NOT EXISTS api_keys (
-  key_id          CHAR(12)        NOT NULL,
-  user_id         INT UNSIGNED    NOT NULL,
-  name            VARCHAR(128)    NOT NULL,
-  secret_sha256   BINARY(32)      NOT NULL,
-  scopes          JSON            NOT NULL,
-  allowed_cidrs   JSON            NULL,
-  expires_at      DATETIME(6)     NULL,
-  revoked_at      DATETIME(6)     NULL,
-  created_by      INT UNSIGNED    NULL,
-  created_at      DATETIME(6)     NOT NULL,
-  last_used_at    DATETIME(6)     NULL,
-  changed_version BIGINT UNSIGNED NOT NULL,
-  PRIMARY KEY (key_id),
-  KEY k_user (user_id)
-) ENGINE=InnoDB";
+use crate::rec::{API_KEYS, duplicate, to_micros};
+use crate::store::{AuthMethods, AuthStore};
 
 /// The visible id's length.
 pub const KEY_ID_LEN: usize = 12;
@@ -62,8 +42,8 @@ pub const KEY_ID_LEN: usize = 12;
 pub const SECRET_LEN: usize = 32;
 const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
-/// An `api_keys` row.
-#[derive(Clone, PartialEq, Eq)]
+/// An `api_keys` row. `Debug` hides the secret's hash.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiKeyRow {
     /// The visible id.
     pub key_id: String,
@@ -79,12 +59,15 @@ pub struct ApiKeyRow {
     /// for any.
     pub allowed_cidrs: Option<Vec<String>>,
     /// When it stops working.
+    #[serde(with = "crate::rec::micros_opt")]
     pub expires_at: Option<SystemTime>,
     /// When it was revoked.
+    #[serde(with = "crate::rec::micros_opt")]
     pub revoked_at: Option<SystemTime>,
     /// Who created it.
     pub created_by: Option<UserId>,
     /// When.
+    #[serde(with = "crate::rec::micros")]
     pub created_at: SystemTime,
     /// The auth version of its last change.
     pub changed_version: u64,
@@ -204,99 +187,34 @@ fn generate(tenant: &str) -> Result<(String, Zeroizing<String>, Zeroizing<String
 
 // ---- store ----
 
-const COLS: &str = "key_id, user_id, name, secret_sha256, scopes, allowed_cidrs, \
-    TIMESTAMPDIFF(MICROSECOND, '1970-01-01', expires_at), \
-    TIMESTAMPDIFF(MICROSECOND, '1970-01-01', revoked_at), created_by, \
-    TIMESTAMPDIFF(MICROSECOND, '1970-01-01', created_at), changed_version";
-
-fn table(store: &AuthStore) -> String {
-    format!("{}.api_keys", sprig_common::names::quote(store.schema()))
+/// The primary key of key `key_id`.
+fn key_pk(key_id: &str) -> Pk {
+    Pk::new().bytes(key_id.as_bytes())
 }
 
-fn json_col(r: &mut Row, i: usize, name: &str) -> Result<Option<serde_json::Value>> {
-    let raw: Option<Vec<u8>> = col(r, i, name)?;
-    raw.map(|b| {
-        serde_json::from_slice(&b)
-            .map_err(|e| SprigError::internal(format!("auth catalog column {name}: {e}")))
-    })
-    .transpose()
-}
-
-fn key_row(mut r: Row) -> Result<ApiKeyRow> {
-    let secret: Vec<u8> = col(&mut r, 3, "secret_sha256")?;
-    let allowed = json_col(&mut r, 5, "allowed_cidrs")?
-        .map(serde_json::from_value::<Vec<String>>)
-        .transpose()
-        .map_err(|e| SprigError::internal(format!("auth catalog column allowed_cidrs: {e}")))?;
-    Ok(ApiKeyRow {
-        key_id: col(&mut r, 0, "key_id")?,
-        user_id: UserId(col(&mut r, 1, "user_id")?),
-        name: col(&mut r, 2, "name")?,
-        secret_sha256: secret
-            .try_into()
-            .map_err(|_| SprigError::internal("auth catalog column secret_sha256: not 32 bytes"))?,
-        scopes: json_col(&mut r, 4, "scopes")?.unwrap_or(serde_json::Value::Null),
-        allowed_cidrs: allowed,
-        expires_at: opt_time(&mut r, 6, "expires_at")?,
-        revoked_at: opt_time(&mut r, 7, "revoked_at")?,
-        created_by: col::<Option<u32>>(&mut r, 8, "created_by")?.map(UserId),
-        created_at: time(&mut r, 9, "created_at")?,
-        changed_version: col(&mut r, 10, "changed_version")?,
-    })
-}
-
-/// Keys changed after `since` (every key with `None`). A catalog whose auth
-/// module is below format 2 has no `api_keys` table: no keys.
+/// Keys changed after `since` (every key with `None`), by key id.
 ///
 /// # Errors
-/// 39070 or a backend error; `Internal` for a malformed row.
-pub async fn keys_since<Q: Queryable + Send>(
-    store: &AuthStore,
-    q: &mut Q,
-    since: Option<u64>,
-) -> Result<Vec<ApiKeyRow>> {
-    let sql = match since {
-        Some(_) => format!(
-            "SELECT {COLS} FROM {} WHERE changed_version > ? ORDER BY key_id",
-            table(store)
-        ),
-        None => format!("SELECT {COLS} FROM {} ORDER BY key_id", table(store)),
-    };
-    let rows: std::result::Result<Vec<Row>, _> = match since {
-        Some(v) => q.exec(sql, (v,)).await,
-        None => q.query(sql).await,
-    };
-    match rows {
-        Ok(rows) => rows.into_iter().map(key_row).collect(),
-        Err(mysql_async::Error::Server(s)) if s.code == 1146 => Ok(Vec::new()),
-        Err(e) => Err(map_err(e)),
-    }
+/// The store's; `Internal` for a malformed row.
+pub async fn keys_since(tx: &mut dyn RecordTx, since: Option<u64>) -> Result<Vec<ApiKeyRow>> {
+    let all: Vec<ApiKeyRow> = API_KEYS.rows(tx, &Pk::new()).await?;
+    Ok(match since {
+        Some(v) => all.into_iter().filter(|k| k.changed_version > v).collect(),
+        None => all,
+    })
 }
 
-async fn insert<Q: Queryable + Send>(store: &AuthStore, q: &mut Q, r: &ApiKeyRow) -> Result<()> {
-    let sql = format!(
-        "INSERT INTO {} (key_id, user_id, name, secret_sha256, scopes, allowed_cidrs, \
-         expires_at, revoked_at, created_by, created_at, changed_version) \
-         VALUES (?, ?, ?, ?, ?, ?, {}, NULL, ?, {AT}, ?)",
-        table(store),
-        opt_at(r.expires_at.is_some()),
-    );
-    let json = |v: &serde_json::Value| Value::from(v.to_string());
-    let p = vec![
-        Value::from(r.key_id.as_str()),
-        Value::from(r.user_id.0),
-        Value::from(r.name.as_str()),
-        Value::from(r.secret_sha256.to_vec()),
-        json(&r.scopes),
-        r.allowed_cidrs.as_ref().map_or(Value::NULL, |c| {
-            Value::from(serde_json::json!(c).to_string())
-        }),
-        opt_micros(r.expires_at),
-        r.created_by.map_or(Value::NULL, |u| Value::from(u.0)),
-        Value::from(micros(r.created_at)),
-        Value::from(r.changed_version),
-    ];
-    exec(q, sql, p).await
+/// Inserts a key; a key id in use is a duplicate key (1062).
+async fn insert(tx: &mut dyn RecordTx, r: &ApiKeyRow) -> Result<()> {
+    let pk = key_pk(&r.key_id);
+    if API_KEYS.get::<ApiKeyRow>(tx, &pk).await?.is_some() {
+        return Err(duplicate("api key id"));
+    }
+    let mut row = r.clone();
+    row.expires_at = row.expires_at.map(to_micros);
+    row.revoked_at = None;
+    row.created_at = to_micros(row.created_at);
+    API_KEYS.put(tx, &pk, &row).await
 }
 
 // ---- admin ----
@@ -338,14 +256,12 @@ impl std::fmt::Debug for CreatedKey {
 
 /// Creates an API key for live user `user` of `tenant` (named
 /// `tenant_name`, the key's prefix). The user needs the `api_key` method
-/// (`users.auth_methods`); this call adds it.
+/// (`users.auth_methods`); this call adds it, in the same auth change.
 ///
 /// # Errors
-/// 1396 if the user doesn't exist; 39998 for a bad name; the change's
-/// errors; a backend 1146 if the catalog isn't migrated to the auth
-/// module's format 2.
+/// 1396 if the user doesn't exist; 39998 for a bad name; the change's.
 pub async fn create_api_key(
-    cat: &MariaCatalog,
+    cat: &AuthCatalog,
     tenant: TenantId,
     tenant_name: &str,
     user: UserId,
@@ -359,7 +275,7 @@ pub async fn create_api_key(
         ));
     }
     let (key_id, secret, full) = generate(tenant_name)?;
-    let row = ApiKeyRow {
+    let mut row = ApiKeyRow {
         key_id: key_id.clone(),
         user_id: user,
         name: new.name.clone(),
@@ -372,13 +288,39 @@ pub async fn create_api_key(
         created_at: now,
         changed_version: 0,
     };
-    let version = change(cat, tenant, user, move |store, q, version, urow| {
-        let mut row = row.clone();
+    let mut c = cat
+        .change_with(tenant, VersionKind::Auth, ChangeOpts::default())
+        .await?;
+    let version = c.version();
+    let r = async {
+        let tx = c.tx().records();
+        let store = AuthStore::new();
+        let mut urow = match store.user(tx, user).await? {
+            Some(r) if r.is_live() => r,
+            _ => {
+                return Err(SprigError::backend(
+                    1396,
+                    *b"HY000",
+                    format!("Operation CREATE API KEY failed for '#{user}'@'%'"),
+                ));
+            }
+        };
         row.changed_version = version;
+        insert(tx, &row).await?;
         urow.auth_methods = urow.auth_methods.union(AuthMethods::API_KEY);
-        Box::pin(async move { insert(store, q, &row).await })
-    })
-    .await?;
+        urow.changed_version = version;
+        store.update_user(tx, &urow).await?;
+        Ok(())
+    }
+    .await;
+    let version = match r {
+        Ok(()) => c.commit().await?,
+        Err(e) => {
+            let _ = c.rollback().await;
+            let _ = cat.settle(tenant, VersionKind::Auth).await;
+            return Err(e);
+        }
+    };
     Ok(CreatedKey {
         key_id,
         key: full,
@@ -386,13 +328,13 @@ pub async fn create_api_key(
     })
 }
 
-/// Revokes key `key_id` of `tenant`. Returns `false` if there is no such
-/// live key.
+/// Revokes key `key_id` of `tenant` (the row stays, revoked). Returns
+/// `false` if there is no such live key.
 ///
 /// # Errors
 /// The change's errors.
 pub async fn revoke_api_key(
-    cat: &MariaCatalog,
+    cat: &AuthCatalog,
     tenant: TenantId,
     key_id: &str,
     now: SystemTime,
@@ -401,30 +343,27 @@ pub async fn revoke_api_key(
         .change_with(tenant, VersionKind::Auth, ChangeOpts::default())
         .await?;
     let version = c.version();
-    let r = {
-        let (core, q) = c.tx().parts();
-        let store = AuthStore::of(core);
-        exec_count(
-            q,
-            format!(
-                "UPDATE {} SET revoked_at = {AT}, changed_version = ? \
-                 WHERE key_id = ? AND revoked_at IS NULL",
-                table(&store)
-            ),
-            vec![
-                Value::from(micros(now)),
-                Value::from(version),
-                Value::from(key_id),
-            ],
-        )
-        .await
-    };
+    let r = async {
+        let tx = c.tx().records();
+        let pk = key_pk(key_id);
+        let Some(mut row) = API_KEYS.get_for_update::<ApiKeyRow>(tx, &pk).await? else {
+            return Ok(false);
+        };
+        if row.revoked_at.is_some() {
+            return Ok(false);
+        }
+        row.revoked_at = Some(to_micros(now));
+        row.changed_version = version;
+        API_KEYS.put(tx, &pk, &row).await?;
+        Ok(true)
+    }
+    .await;
     match r {
-        Ok(n) if n > 0 => {
+        Ok(true) => {
             c.commit().await?;
             Ok(true)
         }
-        Ok(_) => {
+        Ok(false) => {
             let _ = c.rollback().await;
             let _ = cat.settle(tenant, VersionKind::Auth).await;
             Ok(false)
@@ -437,63 +376,143 @@ pub async fn revoke_api_key(
     }
 }
 
-type Body<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
-
-/// One auth change on live user `user`, rewriting its row.
-async fn change<F>(cat: &MariaCatalog, tenant: TenantId, user: UserId, body: F) -> Result<u64>
-where
-    F: for<'a> FnOnce(
-            &'a AuthStore,
-            &'a mut mysql_async::Transaction<'static>,
-            u64,
-            &'a mut crate::store::UserRow,
-        ) -> Body<'a>
-        + Send,
-{
-    let mut c = cat
-        .change_with(tenant, VersionKind::Auth, ChangeOpts::default())
-        .await?;
-    let version = c.version();
-    let r = async {
-        let (core, q) = c.tx().parts();
-        let store = AuthStore::of(core);
-        let mut row = match store.user(q, user).await? {
-            Some(r) if r.is_live() => r,
-            _ => {
-                return Err(SprigError::backend(
-                    1396,
-                    *b"HY000",
-                    format!("Operation CREATE API KEY failed for '#{user}'@'%'"),
-                ));
-            }
-        };
-        body(&store, q, version, &mut row).await?;
-        row.changed_version = version;
-        store.update_user(q, &row).await?;
-        Ok(())
-    }
-    .await;
-    match r {
-        Ok(()) => c.commit().await,
-        Err(e) => {
-            let _ = c.rollback().await;
-            let _ = cat.settle(tenant, VersionKind::Auth).await;
-            if matches!(e.kind, ErrorKind::Backend { errno: 1146, .. }) {
-                return Err(SprigError::new(
-                    SprigCode::TenantNotReady,
-                    "the tenant's catalog has no api_keys table yet: migrate its auth module",
-                ));
-            }
-            Err(e)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    use sprig_catalog::records::RecordStore as _;
+
     use super::*;
+    use crate::token::sessions::tests::{T, add_user, at, auth_version, catalog};
+
+    fn new_key(name: &str) -> NewApiKey {
+        NewApiKey {
+            name: name.into(),
+            scopes: vec!["read".into()],
+            allowed_cidrs: vec!["10.0.0.0/8".into()],
+            expires_at: Some(at(3600)),
+            created_by: Some(UserId(1)),
+        }
+    }
+
+    async fn all_keys(
+        recs: &sprig_catalog::records::mem::MemRecords,
+        since: Option<u64>,
+    ) -> Vec<ApiKeyRow> {
+        let mut tx = recs.begin(T).await.unwrap();
+        keys_since(&mut *tx, since).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_key_and_its_users_api_key_method_are_one_auth_change() {
+        let (recs, cat) = catalog().await;
+        add_user(&cat, 3, "ci").await;
+        let created = create_api_key(&cat, T, "acme", UserId(3), &new_key("ci"), at(5))
+            .await
+            .unwrap();
+        assert_eq!(auth_version(&recs).await, created.auth_version);
+        let p = parse_key(&created.key).unwrap();
+        assert_eq!(p.key_id, created.key_id);
+        let keys = all_keys(&recs, None).await;
+        assert_eq!(keys.len(), 1);
+        let k = &keys[0];
+        assert_eq!(k.key_id, created.key_id);
+        assert_eq!(k.changed_version, created.auth_version);
+        assert_eq!(k.created_at, crate::rec::to_micros(at(5)));
+        assert_eq!(k.expires_at, Some(crate::rec::to_micros(at(3600))));
+        assert_eq!(k.scopes, serde_json::json!(["read"]));
+        assert_eq!(k.allowed_cidrs, Some(vec!["10.0.0.0/8".to_owned()]));
+        assert!(ApiKey::new(k.clone()).secret_matches(p.secret.as_bytes()));
+        let mut tx = recs.begin(T).await.unwrap();
+        let u = AuthStore::new()
+            .user(&mut *tx, UserId(3))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(u.auth_methods.contains(AuthMethods::API_KEY));
+        assert!(u.auth_methods.contains(AuthMethods::PASSWORD));
+        assert_eq!(u.changed_version, created.auth_version);
+    }
+
+    #[tokio::test]
+    async fn a_key_for_no_live_user_is_1396_and_leaves_nothing() {
+        let (recs, cat) = catalog().await;
+        let e = create_api_key(&cat, T, "acme", UserId(3), &new_key("ci"), at(5))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            e.kind,
+            sprig_common::ErrorKind::Backend { errno: 1396, .. }
+        ));
+        assert!(all_keys(&recs, None).await.is_empty());
+        // A refused change rolls back and settles the version it was
+        // given (a closed gap): no row moves to it.
+        let e = create_api_key(&cat, T, "acme", UserId(3), &new_key(""), at(5))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Some(SprigCode::ConfigInvalid));
+    }
+
+    #[tokio::test]
+    async fn a_key_id_in_use_is_a_duplicate() {
+        let (recs, _cat) = catalog().await;
+        let row = ApiKeyRow {
+            key_id: "a".repeat(12),
+            user_id: UserId(3),
+            name: "ci".into(),
+            secret_sha256: [0; 32],
+            scopes: serde_json::json!([]),
+            allowed_cidrs: None,
+            expires_at: None,
+            revoked_at: None,
+            created_by: None,
+            created_at: at(0),
+            changed_version: 1,
+        };
+        let mut tx = recs.begin(T).await.unwrap();
+        insert(&mut *tx, &row).await.unwrap();
+        let e = insert(&mut *tx, &row).await.unwrap_err();
+        assert!(crate::rec::is_duplicate(&e));
+    }
+
+    #[tokio::test]
+    async fn a_revoke_is_soft_and_happens_once() {
+        let (recs, cat) = catalog().await;
+        add_user(&cat, 3, "ci").await;
+        let a = create_api_key(&cat, T, "acme", UserId(3), &new_key("a"), at(5))
+            .await
+            .unwrap();
+        let b = create_api_key(&cat, T, "acme", UserId(3), &new_key("b"), at(5))
+            .await
+            .unwrap();
+        assert!(revoke_api_key(&cat, T, &a.key_id, at(9)).await.unwrap());
+        let v = auth_version(&recs).await;
+        assert!(v > b.auth_version);
+        // Again, or an unknown key: false, and no version is used.
+        assert!(!revoke_api_key(&cat, T, &a.key_id, at(10)).await.unwrap());
+        assert!(
+            !revoke_api_key(&cat, T, "zzzzzzzzzzzz", at(10))
+                .await
+                .unwrap()
+        );
+        // A refused change rolls back and settles the version it was
+        // given (a closed gap): no row moves to it.
+        // The row stays, revoked; the incremental load brings it alone.
+        let since = all_keys(&recs, Some(b.auth_version)).await;
+        assert_eq!(since.len(), 1);
+        assert_eq!(since[0].key_id, a.key_id);
+        assert_eq!(since[0].revoked_at, Some(crate::rec::to_micros(at(9))));
+        assert_eq!(since[0].changed_version, v);
+        // The full load: every key, by key id.
+        let all = all_keys(&recs, None).await;
+        let mut ids = vec![a.key_id.clone(), b.key_id.clone()];
+        ids.sort();
+        assert_eq!(
+            all.iter().map(|k| k.key_id.clone()).collect::<Vec<_>>(),
+            ids
+        );
+        assert!(all_keys(&recs, Some(v)).await.is_empty());
+    }
 
     #[test]
     fn generated_keys_parse_back() {

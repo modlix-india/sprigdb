@@ -213,6 +213,7 @@ impl Executor for PassThrough {
             router: router::RouterState::default(),
             packet_limit: None,
             placement_memo: follow::PlacementMemo::default(),
+            traffic: None,
             point_memo: point::PointMemo::default(),
             status: status::SessionStatus::default(),
             globals_applied: false,
@@ -258,6 +259,8 @@ pub struct PassSession {
     status: status::SessionStatus,
     /// Placement checks kept per map generation.
     placement_memo: follow::PlacementMemo,
+    /// The session's own traffic counter (`count_traffic`).
+    traffic: Option<crate::dc::SessionTraffic>,
     /// Point reads: the tenant's statements found unrouted (`point`).
     point_memo: point::PointMemo,
     /// The tenant's `compat.global.*` defaults were given to the session:
@@ -680,24 +683,24 @@ impl PassSession {
             let step = if search_text {
                 // Its rows come as text from MariaDB: binary for the client.
                 let mut bin = search::ToBinary::new(out);
-                self.tenant_text(
+                Box::pin(self.tenant_text(
                     cx,
                     &text,
                     &QueryAttrs::default(),
                     false,
                     RowFormat::Text,
                     &mut bin,
-                )
+                ))
                 .await?
             } else {
-                self.tenant_text(
+                Box::pin(self.tenant_text(
                     cx,
                     &text,
                     &QueryAttrs::default(),
                     false,
                     RowFormat::Binary,
                     out,
-                )
+                ))
                 .await?
             };
             return Ok(ExecSummary {
@@ -714,6 +717,23 @@ impl PassSession {
             }
             return Err(SprigError::internal("an engine statement without its plan"));
         }
+        // MariaDB's statement: its own function, so the engine's fast path
+        // above doesn't carry (and copy) the relay path's state.
+        Box::pin(self.execute_relay(cx, stmt, raw, params, out, backend_caps)).await
+    }
+
+    /// [`Self::execute`] of a statement MariaDB runs.
+    #[allow(clippy::too_many_lines)] // the relay path, routed or not
+    async fn execute_relay(
+        &mut self,
+        cx: &mut ExecCtx<'_>,
+        stmt: StmtRef,
+        raw: &sprig_proto_mysql::command::StmtExecute,
+        params: &sprig_proto_mysql::command::ExecuteParams,
+        out: &mut dyn ResultSink,
+        backend_caps: Caps,
+    ) -> Result<ExecSummary> {
+        let persona = self.persona;
         // A statement MariaDB runs may change what the engine path keeps
         // of the session's variables.
         self.eng.stale();
@@ -1699,25 +1719,30 @@ impl PassSession {
     async fn run_request(
         &mut self,
         cx: &mut ExecCtx<'_>,
-        req: Request,
+        req: &Request,
         out: &mut dyn ResultSink,
     ) -> Result<ExecSummary> {
+        // Borrowed: a fence may make the request run again, and an execute's
+        // parameters are not copied for that.
         match req {
+            // Each kind's work boxed: this future stays small, and the
+            // engine's prepared execute doesn't carry the text path's state.
             Request::Query { sql, attrs } => {
                 if self.tenant.is_some() {
-                    self.tenant_query(cx, sql, &attrs, out).await
+                    Box::pin(self.tenant_query(cx, sql.clone(), attrs, out)).await
                 } else {
-                    self.query(cx, sql, out).await
+                    Box::pin(self.query(cx, sql.clone(), out)).await
                 }
             }
             Request::Prepare { sql } => {
                 if self.tenant.is_some() {
-                    self.tenant_prepare(cx, sql).await
+                    Box::pin(self.tenant_prepare(cx, sql.clone())).await
                 } else {
-                    self.prepare(cx, sql).await
+                    Box::pin(self.prepare(cx, sql.clone())).await
                 }
             }
             Request::Execute { stmt, raw, params } => {
+                let stmt = *stmt;
                 // 3306: MySQL's `'table.key'` in 1062 for prepared
                 // statements too (MySQL Connector/J's suite checks it).
                 let dup_table = if self.persona == Persona::MySql84 {
@@ -1751,7 +1776,7 @@ impl PassSession {
                 match (dup_table.as_deref(), logical) {
                     (Some(table), _) => {
                         let mut wrapped = compat_sink::DupKeySink::new(&mut *out, table);
-                        let r = self.execute(cx, stmt, &raw, &params, &mut wrapped).await;
+                        let r = self.execute(cx, stmt, raw, params, &mut wrapped).await;
                         // A value that doesn't fit a functional index:
                         // MySQL's 3752 or 3751 naming the index.
                         let r = match (wrapped.take_held(), r) {
@@ -1772,12 +1797,12 @@ impl PassSession {
                     (None, Some(l)) => {
                         let lex = self.engine_lex().unwrap_or_else(|| self.lex_opts().0);
                         let mut wrapped = compat_sink::IntMetaSink::new(out, &l, lex);
-                        self.execute(cx, stmt, &raw, &params, &mut wrapped).await
+                        self.execute(cx, stmt, raw, params, &mut wrapped).await
                     }
-                    (None, None) => self.execute(cx, stmt, &raw, &params, out).await,
+                    (None, None) => self.execute(cx, stmt, raw, params, out).await,
                 }
             }
-            Request::Fetch { stmt, rows } => self.fetch(cx, stmt, rows, out).await,
+            Request::Fetch { stmt, rows } => Box::pin(self.fetch(cx, *stmt, *rows, out)).await,
             Request::LongData { stmt, param, data } => {
                 let limit = match self.tenant.as_deref() {
                     // Followed live (a resolved-setting watch).
@@ -1786,22 +1811,22 @@ impl PassSession {
                 };
                 // An unknown statement is reported by nothing: long data
                 // has no response.
-                if let Ok(s) = self.stmts.get_mut(stmt) {
-                    s.add_long_data(param, &data, limit);
+                if let Ok(s) = self.stmts.get_mut(*stmt) {
+                    s.add_long_data(*param, data, limit);
                 }
                 Ok(ExecSummary::default())
             }
-            Request::ResetStmt { stmt } => self.reset_stmt(cx, stmt, out).await,
+            Request::ResetStmt { stmt } => Box::pin(self.reset_stmt(cx, *stmt, out)).await,
             Request::CloseStmt { stmt } => {
-                self.close_cursor(stmt);
-                if self.stmts.remove(stmt).is_some() {
+                self.close_cursor(*stmt);
+                if self.stmts.remove(*stmt).is_some() {
                     metrics::gauge!("sprig_mysql_prepared_statements", "persona" => self.persona.as_str()).decrement(1.0);
                 }
                 Ok(ExecSummary::default())
             }
-            Request::BulkExecute { stmt, raw } => self.bulk(cx, stmt, &raw, out).await,
+            Request::BulkExecute { stmt, raw } => Box::pin(self.bulk(cx, *stmt, raw, out)).await,
             Request::FieldList { table, wildcard } => {
-                self.field_list(cx, &table, &wildcard, out).await
+                Box::pin(self.field_list(cx, table, wildcard, out)).await
             }
         }
     }

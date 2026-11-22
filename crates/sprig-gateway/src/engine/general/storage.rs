@@ -5,6 +5,12 @@
 //!
 //! - **Reads** are plain reads at the transaction's read view, with its
 //!   own writes merged in ([`Tx::get`], [`Tx::scan`]); they take no lock.
+//!   A locking read (a locking clause, or any read of a SERIALIZABLE
+//!   transaction) reads each row as it is now and locks it as the
+//!   single-table path does: a point get locks the row (or, missing, its
+//!   place at REPEATABLE READ), a range of the primary key or of an index
+//!   locks every entry read and the stretch between them, and a row found
+//!   through an index is locked too.
 //! - **Only the bound tables, only the checked columns.** A table the
 //!   statement wasn't bound to is an error; of a row, the columns the
 //!   statement doesn't name are handed over as `NULL` ([`Bound`]).
@@ -29,6 +35,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use sprig_common::SprigError;
 use sprig_engine::keys::typed;
+use sprig_engine::txn::{LockMode, Wait};
 use sprig_exec::SqlError;
 use sprig_exec::ops::Row;
 use sprig_plan::access::{Counters, Fetch, KeyRange, RowCursor, Storage, key_holds};
@@ -63,11 +70,17 @@ pub(super) struct Bound {
     read: Vec<bool>,
     /// Every column is handed over.
     all: bool,
+    /// A locking read of this table (`FOR UPDATE`, `LOCK IN SHARE MODE`,
+    /// any read of a SERIALIZABLE transaction): every row and index entry
+    /// read is locked in this mode, waiting as the clause says, and read as
+    /// it is now.
+    lock: Option<(LockMode, Wait)>,
 }
 
 impl Bound {
-    pub(super) fn new(t: &TableUse, sp: Space) -> Self {
+    pub(super) fn new(t: &TableUse, sp: Space, lock: Option<(LockMode, Wait)>) -> Self {
         Self {
+            lock,
             def: Arc::clone(&t.def),
             plan: Arc::clone(&t.plan),
             sp,
@@ -320,7 +333,7 @@ fn entry_suffices(b: &Bound, ix: usize) -> bool {
 /// The row a key-only read hands over for an entry: the key's and the
 /// primary key's columns, the rest `NULL`.
 fn entry_values(b: &Bound, ix: usize, prefix_len: usize, ik: &[u8], pk: &[u8]) -> Option<Row> {
-    let mut row = vec![Datum::Null; b.def.columns.len()];
+    let mut row = vec![Datum::Null; b.def.columns.len() + usize::from(b.def.hidden)];
     let x = &b.def.indexes[ix];
     let mut rest = ik.get(prefix_len..)?;
     for (&c, kc) in x.cols.iter().zip(&x.parts) {
@@ -589,10 +602,20 @@ impl Storage for TxStorage {
             typed::encode_column(&mut k, kc, v)
                 .map_err(|_| internal("a key value of the wrong type"))?;
         }
-        let Some(Some(raw)) = self.inner.with(|tx| tx.get(&k))? else {
+        let lock = b.lock;
+        let got = self.inner.with(|tx| match lock {
+            Some((mode, wait)) => Ok(tx
+                .lock_read_blocking(&Bytes::from(k.clone()), mode, wait)?
+                .flatten()),
+            None => tx.get(&k),
+        })?;
+        let Some(Some(raw)) = got else {
             return Ok(None);
         };
-        let mut r = row::decode(&b.def, &b.sp, &raw).map_err(|e| self.inner.fail(e))?;
+        let mut r = row::decode(&b.def, &b.sp, &k, &raw).map_err(|e| self.inner.fail(e))?;
+        // The planner's rows are the columns, and a hidden row number (see
+        // `names::plan_table`).
+        r.truncate(b.def.columns.len() + usize::from(b.def.hidden));
         b.mask(&mut r);
         counters.add_row();
         Ok(Some(r))
@@ -616,8 +639,11 @@ impl Storage for TxStorage {
                 bytes.push(r);
             }
         }
+        // A locking read locks each row too: never from the entry alone.
         let key_only = match key {
-            KeyId::Index(ix) => fetch == Fetch::KeyOnly && entry_suffices(b, ix),
+            KeyId::Index(ix) => {
+                b.lock.is_none() && fetch == Fetch::KeyOnly && entry_suffices(b, ix)
+            }
             KeyId::Primary => false,
         };
         Ok(Box::new(Cursor {
@@ -634,6 +660,7 @@ impl Storage for TxStorage {
             key_only,
             counters,
             pulled: 0,
+            last: None,
         }))
     }
 }
@@ -657,6 +684,8 @@ struct Cursor {
     key_only: bool,
     counters: Arc<Counters>,
     pulled: u32,
+    /// The key of the last row handed over, when it was read locked.
+    last: Option<Bytes>,
 }
 
 impl Cursor {
@@ -679,7 +708,13 @@ impl Cursor {
             }
             let want = self.batch;
             let (lo, hi, rev) = (&r.lo, &r.hi, self.reverse);
-            let Some(batch) = self.inner.with(|tx| tx.scan(lo, hi, rev, want))? else {
+            let lock = self.inner.tables[self.table].lock;
+            let rows = self.key == KeyId::Primary;
+            let Some(batch) = self.inner.with(|tx| match lock {
+                Some((mode, how)) => tx.scan_lock_blocking(lo, hi, rev, want, mode, how, rows),
+                None => tx.scan(lo, hi, rev, want),
+            })?
+            else {
                 return Ok(false);
             };
             self.more = batch.len() == want;
@@ -716,7 +751,7 @@ impl RowCursor for Cursor {
             let inner = Arc::clone(&self.inner);
             let b = &inner.tables[self.table];
             let mut r = match self.key {
-                KeyId::Primary => row::decode(&b.def, &b.sp, &v).map_err(|e| inner.fail(e))?,
+                KeyId::Primary => row::decode(&b.def, &b.sp, &k, &v).map_err(|e| inner.fail(e))?,
                 KeyId::Index(ix) => {
                     self.counters.add_entry();
                     let tail = self.ranges.front().and_then(|r| r.tail.as_ref());
@@ -733,17 +768,57 @@ impl RowCursor for Cursor {
                     } else {
                         let mut rk = b.sp.rows();
                         rk.extend_from_slice(pk);
-                        let Some(Some(raw)) = inner.with(|tx| tx.get(&rk))? else {
+                        let lock = b.lock;
+                        let got = inner.with(|tx| match lock {
+                            Some((mode, wait)) => Ok(tx
+                                .lock_read_blocking(&Bytes::from(rk.clone()), mode, wait)?
+                                .flatten()),
+                            None => tx.get(&rk),
+                        })?;
+                        let Some(Some(raw)) = got else {
                             // An entry without its row: not at this view.
                             continue;
                         };
-                        row::decode(&b.def, &b.sp, &raw).map_err(|e| inner.fail(e))?
+                        let r = row::decode(&b.def, &b.sp, &rk, &raw).map_err(|e| inner.fail(e))?;
+                        if lock.is_some() {
+                            self.last = Some(Bytes::from(rk));
+                        }
+                        r
                     }
                 }
             };
+            if b.lock.is_some() && self.key == KeyId::Primary {
+                self.last = Some(k);
+            }
+            r.truncate(b.def.columns.len() + usize::from(b.def.hidden));
             b.mask(&mut r);
             self.counters.add_row();
             return Ok(Some(r));
         }
+    }
+
+    /// READ COMMITTED: the row's own conditions refused it, so its lock
+    /// goes, as on the servers, except where they keep it: a row reached
+    /// through a secondary index keeps it on MariaDB, and on MySQL when
+    /// the index is unique (a locking read by a unique key).
+    fn refused(&mut self) {
+        let Some(k) = self.last.take() else {
+            return;
+        };
+        let b = &self.inner.tables[self.table];
+        let unique = match self.key {
+            KeyId::Primary => None,
+            KeyId::Index(ix) => Some(b.def.indexes.get(ix).is_some_and(|x| x.unique)),
+        };
+        let _ = self.inner.with(|tx| {
+            let keep = match unique {
+                None => false,
+                Some(u) => !tx.mysql() || u,
+            };
+            if !keep {
+                tx.unlock_unmatched(&k);
+            }
+            Ok(())
+        });
     }
 }

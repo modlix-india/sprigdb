@@ -55,9 +55,64 @@ pub(super) struct PlacementMemo {
     followed: Option<(sprig_common::ids::DcId, u64, sprig_common::ids::ClusterId)>,
     /// `maps_token` at (home, generation): its revision sum and held flag.
     token: Option<(sprig_common::ids::DcId, u64, u64, bool)>,
+    /// The token the last statement started under (for a fence it meets).
+    last: Option<super::fence_retry::Token>,
+    /// What says nothing moved since the last statement: the homes
+    /// generation then, and the tenant's followed map copy's changes.
+    quiet: Option<(u64, tokio::sync::watch::Receiver<u64>)>,
 }
 
 impl PlacementMemo {
+    /// Starts a statement: `true` when no tenant's home moved and the
+    /// tenant's followed map copy didn't change since the last statement
+    /// (two atomic reads), so what `follow_tenant` and the maps token
+    /// found then still holds. Otherwise follows the copy again from here
+    /// on and returns `false`.
+    pub(super) fn begin(
+        &mut self,
+        locator: &crate::tenant::locator::GatewayLocator,
+        tenant: sprig_common::ids::TenantId,
+    ) -> bool {
+        let homes = locator.routing().homes_generation();
+        if let Some((h, rx)) = &self.quiet
+            && *h == homes
+            && matches!(rx.has_changed(), Ok(false))
+        {
+            return true;
+        }
+        let mut rx = locator.placement_changes_for(tenant);
+        let _ = rx.borrow_and_update();
+        self.quiet = Some((homes, rx));
+        false
+    }
+
+    /// The cluster `follow_tenant` last routed to at a quiet start
+    /// ([`Self::begin`]), when it found nothing to wait for.
+    pub(super) fn followed_cluster(&self) -> Option<&sprig_common::ids::ClusterId> {
+        self.followed.as_ref().map(|(_, _, c)| c)
+    }
+
+    /// Keeps the maps token for the statement starting now (`quiet`: from
+    /// [`Self::begin`]); [`Self::last_token`] gives it back if a fence
+    /// stops the statement.
+    pub(super) fn keep_token(
+        &mut self,
+        locator: &crate::tenant::locator::GatewayLocator,
+        tenant: sprig_common::ids::TenantId,
+        quiet: bool,
+    ) {
+        if quiet && self.last.is_some() {
+            return;
+        }
+        let t = self.maps_token(locator, tenant);
+        self.last = Some(t);
+    }
+
+    /// The token kept for the running statement.
+    pub(super) fn last_token(&self) -> Option<super::fence_retry::Token> {
+        self.last.clone()
+    }
+
     /// Whether `follow_tenant` would return at once: its last check found
     /// nothing to wait for at this (home, generation) and routed to
     /// `cluster` (MongoDB's point reads, `exec::point`).
@@ -123,10 +178,15 @@ fn promotion_held_too_long() -> SprigError {
 
 impl PassSession {
     /// Waits out a hold and follows a move; see the module docs.
-    pub(super) async fn follow_tenant(&mut self) -> Result<()> {
+    pub(super) async fn follow_tenant(&mut self, quiet: bool) -> Result<()> {
         let Some(ts) = self.tenant.as_deref() else {
             return Ok(());
         };
+        // Nothing moved since the last statement, which found nothing to
+        // wait for (`PlacementMemo::begin`).
+        if quiet && self.placement_memo.followed_cluster() == Some(&self.target.cluster) {
+            return Ok(());
+        }
         let tenant = ts.tenant;
         let locator = ts.services().locator.clone();
         // Nothing changed since the last statement found nothing to

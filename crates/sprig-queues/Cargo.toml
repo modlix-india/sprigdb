@@ -24,6 +24,9 @@ serde.workspace = true
 serde_json.workspace = true
 sprig-catalog.workspace = true
 sprig-common.workspace = true
+# Queue messages stored on the node's engine (an ordered keyspace written
+# through its commit log).
+sprig-engine.workspace = true
 sprig-meta.workspace = true
 sprig-proto-amqp = { path = "../sprig-proto-amqp" }
 sprig-settings.workspace = true

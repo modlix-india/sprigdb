@@ -29,7 +29,6 @@ use sprig_mover::{JobFilter, JobStatus, JobStore, MetaMover, Mover};
 use sprig_shard::{Placement, TenantMaps};
 
 use super::{AdminService, invalid};
-use crate::catalogs::{ClusterPools, RegistryPools, ShardMapLocator, default_naming};
 
 /// `POST /admin/v1/tenants/{name}/pin`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,15 +72,9 @@ impl AdminService {
         if let Some(p) = &self.placement {
             return p.decisions();
         }
-        let pools: Arc<dyn ClusterPools> = Arc::new(RegistryPools::new(
-            self.monitor.registry().clone(),
-            Some(Arc::clone(&self.monitor)),
-        ));
-        Arc::new(CatalogDecisionLog::new(Arc::new(ShardMapLocator::new(
-            self.stores.dc.clone(),
-            pools,
-            default_naming(),
-        ))))
+        Arc::new(CatalogDecisionLog::new(Arc::new(
+            sprig_catalog::records::remote::RemoteRecords::new(Some(self.stores.dc.clone()), None),
+        )))
     }
 
     /// Writes an operator decision; a failure is logged, never returned:

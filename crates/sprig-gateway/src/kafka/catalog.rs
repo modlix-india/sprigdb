@@ -20,27 +20,23 @@
 //! its stream (`SELECT` or `INSERT`, on the stream or its
 //! database; for a change topic, `SELECT` on its table).
 //!
-//! **Groups** ([`CatalogGroups`]) are `stream_groups` and `stream_offsets`
-//! in `t<tenant>_sprig`, through `sprig-streams`' `StreamsStore`.
+//! **Groups** ([`CatalogGroups`]) and their committed offsets are the
+//! engine records of the node's streams (`sprig-streams`' `StreamRecords`).
 
-use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::{Freshness, TenantCatalog};
 use sprig_common::SprigError;
 use sprig_common::ids::{ObjectId, TenantId};
-use sprig_common::names::SchemaName;
 use sprig_proto_kafka::group::{CommittedOffset, GroupState, GroupStore, StoreError, StoredGroup};
 use sprig_proto_kafka::protocol::err;
 use sprig_proto_kafka::topics::{
     Cleanup, NewTopic, Principal, TopicConfigs, TopicDefaults, TopicError, TopicInfo, TopicKind,
     Topics,
 };
-use sprig_streams::store::{GroupRow, GroupRowState};
 use sprig_streams::{StreamDef, StreamsState};
 use uuid::Uuid;
 
@@ -525,10 +521,15 @@ impl Topics for StreamTopics {
     }
 }
 
-/// `stream_groups` and `stream_offsets` in the tenant catalog.
+/// Consumer groups and their committed offsets: engine records of the
+/// node's streams (`sprig-streams`' `StreamRecords`), the same records
+/// engine streams keep their groups and offsets in. In front of it the
+/// engine router handles engine streams' offsets itself, so this store
+/// answers the offsets of other stream ids (older streams kept in
+/// MariaDB, and fan-in readers' positions, whose topic ids map to their
+/// member's instance).
 pub struct CatalogGroups {
     svc: Arc<TenantServices>,
-    migrated: Mutex<HashSet<u64>>,
 }
 
 impl std::fmt::Debug for CatalogGroups {
@@ -542,45 +543,21 @@ fn store_err(e: impl std::fmt::Display) -> StoreError {
 }
 
 impl CatalogGroups {
-    /// Groups in `svc`'s tenant catalogs.
+    /// Groups of `svc`'s tenants.
     #[must_use]
     pub fn new(svc: Arc<TenantServices>) -> Self {
-        Self {
-            svc,
-            migrated: Mutex::new(HashSet::new()),
-        }
+        Self { svc }
     }
 
-    /// A connection to the tenant catalog's writer, with the streams
-    /// module's tables in place, and the catalog schema.
-    ///
-    /// Committed offsets are rows a tenant's own transactions also write
-    /// (`sprig.commit_offset` in a transaction), so for a tenant on Sprig
-    /// 2PC's relay path the connection goes through the relay writer.
-    async fn conn(&self, tenant: u64) -> Result<(mysql_async::Conn, String), StoreError> {
-        let pool = self
-            .svc
-            .locator
-            .tenant_catalog_pool(TenantId(tenant))
-            .await
-            .map_err(store_err)?;
-        let mut conn = pool.get_conn_bounded().await.map_err(store_err)?;
-        let schema = SchemaName::catalog(TenantId(tenant)).to_string();
-        let done = self
-            .migrated
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains(&tenant);
-        if !done {
-            sprig_streams::store::migrate(&mut conn, &schema)
-                .await
-                .map_err(store_err)?;
-            self.migrated
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(tenant);
-        }
-        Ok((conn, schema))
+    /// The node's engine streams, whose records hold groups and offsets.
+    fn eng() -> Result<Arc<sprig_streams::seg::kafka::EngineStreams>, StoreError> {
+        super::engine::streams().ok_or_else(|| {
+            StoreError(
+                "consumer groups are stored on the SprigDB engine, which isn't running on this \
+                 node"
+                    .to_owned(),
+            )
+        })
     }
 }
 
@@ -592,48 +569,30 @@ impl GroupStore for CatalogGroups {
         group: &str,
         offsets: &[CommittedOffset],
     ) -> Result<(), StoreError> {
-        // A fan-in topic's position is on its member's instance: its id is
-        // looked up before the transaction, and before this commit's
-        // catalog connection is taken (the lookup takes one of its own from
-        // the same pool).
-        let mut parts = Vec::with_capacity(offsets.len());
+        let eng = Self::eng()?;
+        // A fan-in topic's position is on its member's instance.
+        let mut on = Vec::with_capacity(offsets.len());
         for o in offsets {
-            parts.push(
-                super::data::fanin_parts(&self.svc, tenant, o.stream_id)
-                    .await
-                    .map_err(store_err)?,
-            );
-        }
-        let (mut conn, schema) = self.conn(tenant).await?;
-        let store = sprig_streams::StreamsStore::new(schema);
-        let mut tx = conn
-            .start_transaction(mysql_async::TxOpts::default())
-            .await
-            .map_err(store_err)?;
-        for (o, part) in offsets.iter().zip(parts) {
+            let part = super::data::fanin_parts(&self.svc, tenant, o.stream_id)
+                .await
+                .map_err(store_err)?;
             if super::data::is_fanin(o.stream_id) && part.is_none() {
                 // An id this reader never had: nothing to commit it to.
                 continue;
             }
-            store
-                .commit_offset(
-                    &mut tx,
-                    &sprig_streams::store::CommittedOffset {
-                        group: group.to_owned(),
-                        instance_tenant: part.map_or(0, |x| x.0),
-                        stream: sprig_streams::StreamId(part.map_or(o.stream_id, |x| x.1)),
-                        partition: sprig_streams::PartitionNo(
-                            u32::try_from(o.partition).unwrap_or(0),
-                        ),
-                        offset: u64::try_from(o.offset).unwrap_or(0),
-                        leader_epoch: o.leader_epoch.and_then(|e| u32::try_from(e).ok()),
-                        metadata: o.metadata.clone(),
-                    },
-                )
-                .await
-                .map_err(store_err)?;
+            let (instance, stream) = part.unwrap_or((0, o.stream_id));
+            on.push((
+                instance,
+                CommittedOffset {
+                    stream_id: stream,
+                    ..o.clone()
+                },
+            ));
         }
-        tx.commit().await.map_err(store_err)
+        eng.records()
+            .commit_offsets_on(tenant, group, &on, sprig_streams::seg::now_ms())
+            .await
+            .map_err(|e| store_err(&e))
     }
 
     async fn fetch(
@@ -642,34 +601,30 @@ impl GroupStore for CatalogGroups {
         group: &str,
         only: Option<&[(u64, i32)]>,
     ) -> Result<Vec<CommittedOffset>, StoreError> {
-        let (mut conn, schema) = self.conn(tenant).await?;
-        let rows = sprig_streams::StreamsStore::new(schema)
-            .group_offsets(&mut conn, group)
-            .await
-            .map_err(store_err)?;
-        drop(conn);
-        let mut ids = Vec::with_capacity(rows.len());
-        for o in &rows {
-            ids.push(if o.instance_tenant == 0 {
-                o.stream.0
+        let eng = Self::eng()?;
+        let rows = eng
+            .records()
+            .offsets_on(tenant, group)
+            .map_err(|e| store_err(&e))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (instance, o) in rows {
+            let stream_id = if instance == 0 {
+                // Engine streams' offsets come from the router in front.
+                if sprig_streams::seg::kafka::is_engine_stream(o.stream_id) {
+                    continue;
+                }
+                o.stream_id
             } else {
-                super::data::fanin_id(&self.svc, tenant, o.instance_tenant, o.stream.0)
+                super::data::fanin_id(&self.svc, tenant, instance, o.stream_id)
                     .await
                     .map_err(store_err)?
-            });
+            };
+            if only.is_some_and(|k| !k.contains(&(stream_id, o.partition))) {
+                continue;
+            }
+            out.push(CommittedOffset { stream_id, ..o });
         }
-        Ok(rows
-            .into_iter()
-            .zip(ids)
-            .map(|(o, stream_id)| CommittedOffset {
-                stream_id,
-                partition: i32::try_from(o.partition.0).unwrap_or(i32::MAX),
-                offset: i64::try_from(o.offset).unwrap_or(i64::MAX),
-                leader_epoch: o.leader_epoch.and_then(|e| i32::try_from(e).ok()),
-                metadata: o.metadata,
-            })
-            .filter(|c| only.is_none_or(|k| k.contains(&(c.stream_id, c.partition))))
-            .collect())
+        Ok(out)
     }
 
     async fn save_group(
@@ -678,19 +633,11 @@ impl GroupStore for CatalogGroups {
         g: &StoredGroup,
         state: GroupState,
     ) -> Result<(), StoreError> {
-        let (mut conn, schema) = self.conn(tenant).await?;
-        sprig_streams::StreamsStore::new(schema)
-            .save_group(
-                &mut conn,
-                &GroupRow {
-                    group: g.group.clone(),
-                    protocol_type: g.protocol_type.clone(),
-                    generation: u32::try_from(g.generation).unwrap_or(0),
-                    state: GroupRowState::parse(state.stored()),
-                },
-            )
+        Self::eng()?
+            .records()
+            .save_group(tenant, g, state)
             .await
-            .map_err(store_err)
+            .map_err(|e| store_err(&e))
     }
 
     async fn load_group(
@@ -698,44 +645,24 @@ impl GroupStore for CatalogGroups {
         tenant: u64,
         group: &str,
     ) -> Result<Option<StoredGroup>, StoreError> {
-        let (mut conn, schema) = self.conn(tenant).await?;
-        let row = sprig_streams::StreamsStore::new(schema)
-            .load_group(&mut conn, group)
-            .await
-            .map_err(store_err)?;
-        Ok(row.map(|r| StoredGroup {
-            group: r.group,
-            protocol_type: r.protocol_type,
-            generation: i32::try_from(r.generation).unwrap_or(i32::MAX),
-        }))
+        Self::eng()?
+            .records()
+            .load_group(tenant, group)
+            .map_err(|e| store_err(&e))
     }
 
     async fn list_groups(&self, tenant: u64) -> Result<Vec<StoredGroup>, StoreError> {
-        let (mut conn, schema) = self.conn(tenant).await?;
-        let rows = sprig_streams::StreamsStore::new(schema)
-            .list_groups(&mut conn)
-            .await
-            .map_err(store_err)?;
-        Ok(rows
-            .into_iter()
-            .map(|r| StoredGroup {
-                group: r.group,
-                protocol_type: r.protocol_type,
-                generation: i32::try_from(r.generation).unwrap_or(i32::MAX),
-            })
-            .collect())
+        Self::eng()?
+            .records()
+            .groups(tenant)
+            .map_err(|e| store_err(&e))
     }
 
     async fn delete_group(&self, tenant: u64, group: &str) -> Result<(), StoreError> {
-        let (mut conn, schema) = self.conn(tenant).await?;
-        let mut tx = conn
-            .start_transaction(mysql_async::TxOpts::default())
+        Self::eng()?
+            .records()
+            .delete_group(tenant, group)
             .await
-            .map_err(store_err)?;
-        sprig_streams::StreamsStore::new(schema)
-            .delete_group(&mut tx, group)
-            .await
-            .map_err(store_err)?;
-        tx.commit().await.map_err(store_err)
+            .map_err(|e| store_err(&e))
     }
 }

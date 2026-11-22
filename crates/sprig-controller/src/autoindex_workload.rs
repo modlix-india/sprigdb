@@ -242,16 +242,15 @@ pub async fn statements(
     if fps.is_empty() {
         return Ok(Vec::new());
     }
-    let ep = locator.reader(tenant).await?;
-    let mut conn = crate::catalogs::acquire(&ep.pool, "workload samples").await?;
-    let t = WorkloadTables::new(ep.store.schema());
+    let _ = locator;
+    let mut rec = crate::catalog_records().begin(tenant).await?;
     let ids: Vec<Fingerprint> = fps.iter().map(|(f, _)| *f).collect();
-    let rows: BTreeMap<Fingerprint, sprig_workload::store::FingerprintRow> = t
-        .fingerprints(&mut conn, &ids)
-        .await?
-        .into_iter()
-        .map(|r| (r.id, r))
-        .collect();
+    let rows: BTreeMap<Fingerprint, sprig_workload::store::FingerprintRow> =
+        WorkloadTables::fingerprints(&mut *rec, &ids)
+            .await?
+            .into_iter()
+            .map(|r| (r.id, r))
+            .collect();
     let mut out = Vec::new();
     for (fp, role) in fps {
         let Some(row) = rows.get(fp) else { continue };
@@ -262,7 +261,7 @@ pub async fn statements(
             let Some(def) = doc.filter(|d| sprig_advisor::autoindex::doc::is_doc(d)) else {
                 continue;
             };
-            let opened = t.open_samples(&mut conn, keyring, tenant, *fp, max).await?;
+            let opened = WorkloadTables::open_samples(&mut *rec, keyring, tenant, *fp, max).await?;
             out.extend(opened.iter().filter_map(|s| {
                 let sql = sprig_advisor::autoindex::doc::replay_sql(
                     &row.shape,
@@ -273,7 +272,7 @@ pub async fn statements(
             }));
             continue;
         }
-        let opened = t.open_samples(&mut conn, keyring, tenant, *fp, max).await?;
+        let opened = WorkloadTables::open_samples(&mut *rec, keyring, tenant, *fp, max).await?;
         out.extend(
             opened
                 .iter()
@@ -474,11 +473,9 @@ impl observe::WorkloadSource for ObserveSource {
         if fps.is_empty() {
             return Ok(Some(BTreeSet::new()));
         }
-        let ep = self.locator.reader(tenant).await?;
-        let mut conn = crate::catalogs::acquire(&ep.pool, "workload fingerprints").await?;
-        let t = WorkloadTables::new(ep.store.schema());
+        let mut rec = crate::catalog_records().begin(tenant).await?;
         Ok(Some(
-            t.fingerprints(&mut conn, fps)
+            WorkloadTables::fingerprints(&mut *rec, fps)
                 .await?
                 .into_iter()
                 .map(|r| r.id)

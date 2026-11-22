@@ -245,7 +245,8 @@ pub const DEPENDENTS_COLUMNS: [&str; 4] = ["Kind", "Name", "Cascade", "Detail"];
 pub struct Dependents {
     /// Schedules that call it: (module id, name).
     pub schedules: Vec<(u64, String)>,
-    /// Sinks whose `TRANSFORM` it is.
+    /// Sinks whose `TRANSFORM` it is (filled by the caller from its
+    /// catalog snapshot: sinks are catalog records).
     pub sinks: Vec<String>,
     /// Computed columns made from it: (binding id, `table.column`).
     pub columns: Vec<(u64, String)>,
@@ -421,20 +422,8 @@ pub async fn dependents(
         Err(e) if absent(&e) => Vec::new(),
         r => r.map_err(map_err)?,
     };
-    let qualified = format!("{db_name}.{}", m.name);
-    let r: std::result::Result<Vec<String>, _> = c
-        .exec(
-            format!(
-                "SELECT name FROM {s}.sinks WHERE db_id = ? AND state <> 'dropping' \
-                 AND (transform_name = ? OR transform_name = ?) ORDER BY name"
-            ),
-            (db_id, &m.name, &qualified),
-        )
-        .await;
-    d.sinks = match r {
-        Err(e) if absent(&e) => Vec::new(),
-        r => r.map_err(map_err)?,
-    };
+    // Sinks naming it as their transform are the catalog's sink records:
+    // the caller fills `sinks` from its catalog snapshot.
     d.columns = computed_columns(c, store, m.module_id).await?;
     // Other live modules of the database whose active code calls it.
     let r: std::result::Result<Vec<(String, String, String)>, _> = c

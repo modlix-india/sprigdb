@@ -43,6 +43,9 @@
 //! - [`rows`]: the settings-row access the three share, over MariaDB and
 //!   the in-memory catalog.
 //!
+//! - [`records`]: catalog rows as records in the storage engine (the auth
+//!   tables today), versioned changes on them ([`AuthCatalog`]), and their
+//!   in-memory and remote stores;
 //! - [`ddl`]: the single-shard DDL write path: prepare with
 //!   unversioned marks and an intent row, the physical statement through a
 //!   [`DdlExecutor`](ddl::DdlExecutor), one versioned change to publish;
@@ -61,6 +64,7 @@ pub mod migrate;
 pub mod placement;
 pub mod pool_wait;
 pub mod readers;
+pub mod records;
 pub mod rows;
 pub mod settings;
 mod sql;
@@ -74,6 +78,7 @@ pub use cache::{
     TenantCatalog, TenantPin, TenantRef,
 };
 pub use migrate::{FormatState, Migration, Migrator, Module, ModuleFormat, Phase};
+pub use records::{AuthCatalog, AuthTx, Pk, RecBackend, RecTx, RecordStore, RecordTx, RowTable};
 pub use rows::{SettingsBackend, SettingsTx, TenantScopeRows};
 pub use settings::{
     AllowAll, DecisionSink, EtcdView, FixedEtcd, LogDecisions, Principal, Privilege, SetOutcome,

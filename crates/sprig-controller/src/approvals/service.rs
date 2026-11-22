@@ -490,14 +490,7 @@ impl RecommendationsService {
     /// 39072 for an unknown tenant; catalog errors.
     pub async fn subscriptions(&self, tenant: &str) -> Result<Vec<Subscription>> {
         let t = self.tenant_id(tenant).await?;
-        let st = self.catalog(t);
-        let (mut c, recs) = st.open().await?;
-        match recs.subscriptions(&mut c).await {
-            Err(e) if matches!(e.kind, sprig_common::ErrorKind::Backend { errno: 1146, .. }) => {
-                Ok(Vec::new())
-            }
-            r => r,
-        }
+        self.catalog(t).subscriptions().await
     }
 
     /// `SetSubscription`.
@@ -512,20 +505,13 @@ impl RecommendationsService {
             return Err(invalid("delivery is immediate, digest or off"));
         }
         let t = self.tenant_id(tenant).await?;
-        let st = self.catalog(t);
-        // Make sure the module is migrated (the first raise does it too).
-        let _ = st
-            .list(&Filter {
-                limit: 1,
-                ..Filter::default()
-            })
-            .await?;
-        let (mut c, recs) = st.open().await?;
-        recs.set_subscription(&mut c, s, self.ctl.hub().now()).await
+        self.catalog(t)
+            .set_subscription(s, self.ctl.hub().now())
+            .await
     }
 
     fn catalog(&self, t: TenantId) -> CatalogRecStore {
-        CatalogRecStore::new(self.ctl.locator(), t)
+        CatalogRecStore::new(self.ctl.records(), t)
     }
 }
 

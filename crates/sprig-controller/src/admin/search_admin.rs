@@ -4,14 +4,13 @@
 //!
 //! `sprigctl search rebuild` does what `ALTER SEARCH INDEX
 //! ... REBUILD` does through a gateway: the index's generation goes up by
-//! one in the tenant catalog (its `search_indexes` row and the definition
-//! in it), and the index's records leave the DC tier, so the copies of
+//! one in the tenant catalog (its catalog record and the definition in
+//! it), and the index's records leave the DC tier, so the copies of
 //! the old generation stop. Every gateway then loads the new definition:
 //! its next query of the index writes the record again, and copies of the
 //! new generation are built from MariaDB (the old one serves nothing
 //! meanwhile: queries wait for a copy, as after `ALTER ... REBUILD`).
 
-use mysql_async::prelude::Queryable;
 use serde_json::{Value, json};
 use sprig_common::ids::TenantId;
 use sprig_common::{Result, SprigCode, SprigError};
@@ -101,35 +100,34 @@ impl AdminService {
             .change(t, sprig_catalog::VersionKind::Catalog)
             .await?;
         let r: Result<(u64, u32)> = async {
-            let (store, tx) = ch.tx().parts();
+            let (store, tx, rec) = ch.tx().split().await?;
             let row = match store.database_by_name(tx, db).await? {
                 Some(r) => Some(r),
                 None => store.database_by_name(tx, &db.to_lowercase()).await?,
             };
             let db_id = row.ok_or_else(not_found)?.db_id.0;
-            let table = format!("`{}`.`search_indexes`", store.schema().replace('`', "``"));
-            let found: Option<(u64, u32)> = tx
-                .exec_first(
-                    format!(
-                        "SELECT index_id, generation FROM {table} WHERE db_id = ? AND name = ?"
-                    ),
-                    (db_id, name),
-                )
-                .await
-                .map_err(|e| SprigError::new(SprigCode::CatalogUnavailable, e.to_string()))?;
-            let (id, generation) = found.ok_or_else(not_found)?;
-            // MariaDB assigns left to right: the definition gets the new
-            // generation.
-            tx.exec_drop(
-                format!(
-                    "UPDATE {table} SET generation = generation + 1, \
-                     definition = JSON_SET(definition, '$.generation', generation), \
-                     updated_at = UTC_TIMESTAMP(3) WHERE index_id = ?"
-                ),
-                (id,),
-            )
-            .await
-            .map_err(|e| SprigError::new(SprigCode::CatalogUnavailable, e.to_string()))?;
+            // The index's catalog record (`m/search/indexes/<id>`), read
+            // and written as JSON: the definition gets the new generation.
+            let indexes = sprig_catalog::records::RowTable::new("search", "indexes");
+            let (pk, mut found) = indexes
+                .scan::<Value>(rec, &sprig_catalog::records::Pk::new())
+                .await?
+                .into_iter()
+                .find(|(_, r)| r["db_id"].as_u64() == Some(u64::from(db_id)) && r["name"] == name)
+                .ok_or_else(not_found)?;
+            let id = found["index_id"].as_u64().ok_or_else(not_found)?;
+            let generation = found["generation"]
+                .as_u64()
+                .and_then(|g| u32::try_from(g).ok())
+                .unwrap_or(0);
+            found["generation"] = json!(generation + 1);
+            found["definition"]["generation"] = json!(generation + 1);
+            found["updated_ms"] = json!(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            );
+            indexes.put(rec, &pk, &found).await?;
             // The old generation's records leave the DC tier before the
             // new definition is published, so no gateway's new record is
             // removed.

@@ -7,9 +7,9 @@
 //! a catalog extension.
 //!
 //! What exists:
-//! - [`store`]: the catalog tables (`users`, `verifiers`
-//!   with dual passwords and history, `login_state`) as the `auth`
-//!   migration module, with typed rows and access;
+//! - [`store`]: the users, their verifiers (dual passwords and
+//!   history) and login state, with typed rows and access, as catalog
+//!   records in the storage engine ([`rec`]);
 //! - [`cache`]: [`AuthExtension`], the catalog extension that loads
 //!   [`TenantAuth`] (accounts in matching order, login verifiers,
 //!   temporary locks) into every tenant snapshot, incrementally by auth
@@ -71,6 +71,7 @@ pub mod operator;
 pub mod policy;
 pub mod portable;
 pub mod ratelimit;
+pub mod rec;
 pub mod revoke;
 pub mod scram;
 pub mod settings;
@@ -100,4 +101,4 @@ pub use verifier::{
 };
 
 #[cfg(test)]
-mod live_tests;
+mod rec_tests;

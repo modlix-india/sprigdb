@@ -115,6 +115,20 @@ impl Names for Fake {
     fn version(&self) -> u64 {
         1
     }
+    fn referencing(&self, _db: DbId, name: &str) -> Vec<(Arc<table::TableDef>, usize)> {
+        let mut out = Vec::new();
+        for p in self.tables.values() {
+            if let Ok(d) = &**p {
+                for (i, f) in d.fks.iter().enumerate() {
+                    if f.ref_table.eq_ignore_ascii_case(name) {
+                        out.push((Arc::clone(d), i));
+                    }
+                }
+            }
+        }
+        out.sort_by_key(|(d, i)| (d.object, *i));
+        out
+    }
 }
 
 fn bind(names: &Fake, sql: &str) -> sprig_common::Result<Option<Plan>> {
@@ -2043,6 +2057,8 @@ async fn a_write_that_read_the_whole_table_says_so() {
 
 /// Column types: definitions, storage, assignment rules, keys.
 mod ddl;
+mod fk;
+mod hidden;
 mod types;
 
 #[tokio::test]

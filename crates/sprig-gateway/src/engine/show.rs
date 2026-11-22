@@ -77,9 +77,22 @@ pub(crate) fn create_table(name: &str, text: &str) -> Answer {
     Answer {
         defs: vec![
             coldef("", "", "Table", "", 224, 256, VARSTR, 0x0001, 0x27),
-            coldef("", "", "Create Table", "", 224, 4 * u32::try_from(text.chars().count().max(1024)).unwrap_or(u32::MAX / 4), VARSTR, 0x0001, 0x27),
+            coldef(
+                "",
+                "",
+                "Create Table",
+                "",
+                224,
+                4 * u32::try_from(text.chars().count().max(1024)).unwrap_or(u32::MAX / 4),
+                VARSTR,
+                0x0001,
+                0x27,
+            ),
         ],
-        rows: vec![encode_text_row([Some(name.as_bytes()), Some(text.as_bytes())])],
+        rows: vec![encode_text_row([
+            Some(name.as_bytes()),
+            Some(text.as_bytes()),
+        ])],
         no_index: false,
     }
 }
@@ -89,16 +102,38 @@ pub(crate) fn create_table(name: &str, text: &str) -> Answer {
 pub(crate) fn with_counter(def: &Def, next: Option<u64>) -> String {
     let mut d = def.clone();
     d.auto_increment = next;
+    // MariaDB prints neither `RESTRICT` (the default) nor `SET DEFAULT`
+    // (which it doesn't keep); the stored definition keeps them as written.
+    for f in &mut d.fks {
+        for a in [&mut f.on_delete, &mut f.on_update] {
+            if a.as_deref()
+                .is_some_and(|x| x == "RESTRICT" || x == "SET DEFAULT")
+            {
+                *a = None;
+            }
+        }
+    }
     define::render(&d)
 }
 
 /// `KEY` of `SHOW COLUMNS`: `PRI`, `UNI`, `MUL` or empty.
 fn key_of(def: &Def, col: &str) -> &'static str {
-    let first = |k: &define::Key| k.parts.first().is_some_and(|p| p.col.eq_ignore_ascii_case(col));
-    if def.keys.iter().any(|k| k.kind == KeyKind::Primary && k.parts.iter().any(|p| p.col.eq_ignore_ascii_case(col))) {
+    let first = |k: &define::Key| {
+        k.parts
+            .first()
+            .is_some_and(|p| p.col.eq_ignore_ascii_case(col))
+    };
+    if def
+        .primary()
+        .is_some_and(|k| k.parts.iter().any(|p| p.col.eq_ignore_ascii_case(col)))
+    {
         return "PRI";
     }
-    if def.keys.iter().any(|k| k.kind == KeyKind::Unique && k.parts.len() == 1 && first(k)) {
+    if def
+        .keys
+        .iter()
+        .any(|k| k.kind == KeyKind::Unique && k.parts.len() == 1 && first(k))
+    {
         return "UNI";
     }
     if def.keys.iter().any(first) {
@@ -114,17 +149,24 @@ fn default_text(c: &define::Col) -> Option<String> {
         None | Some(Default::Null) => None,
         Some(Default::Lit(l)) => Some(unquote(l)),
         Some(Default::Raw(e) | Default::Expr(e)) => Some(define::expr::print(e)),
-        Some(Default::Now(p)) => Some(if *p == 0 { "current_timestamp()".into() } else { format!("current_timestamp({p})") }),
+        Some(Default::Now(p)) => Some(if *p == 0 {
+            "current_timestamp()".into()
+        } else {
+            format!("current_timestamp({p})")
+        }),
     }
 }
 
-fn unquote(l: &str) -> String {
+pub(crate) fn unquote(l: &str) -> String {
     if l.len() >= 2 && l.starts_with('\'') && l.ends_with('\'') {
         let inner = &l[1..l.len() - 1];
         let mut o = String::with_capacity(inner.len());
-        let mut it = inner.chars();
+        let mut it = inner.chars().peekable();
         while let Some(ch) = it.next() {
-            if ch == '\\' {
+            if ch == '\'' && it.peek() == Some(&'\'') {
+                it.next();
+                o.push('\'');
+            } else if ch == '\\' {
                 match it.next() {
                     Some('n') => o.push('\n'),
                     Some('r') => o.push('\r'),
@@ -150,10 +192,18 @@ fn extra_of(c: &define::Col) -> String {
         parts.push("auto_increment".into());
     }
     if let Some(p) = c.on_update {
-        parts.push(if p == 0 { "on update current_timestamp()".into() } else { format!("on update current_timestamp({p})") });
+        parts.push(if p == 0 {
+            "on update current_timestamp()".into()
+        } else {
+            format!("on update current_timestamp({p})")
+        });
     }
     if let Some((_, stored)) = &c.generated {
-        parts.push(if *stored { "STORED GENERATED".into() } else { "VIRTUAL GENERATED".into() });
+        parts.push(if *stored {
+            "STORED GENERATED".into()
+        } else {
+            "VIRTUAL GENERATED".into()
+        });
     }
     if c.invisible {
         parts.push("INVISIBLE".into());
@@ -162,24 +212,75 @@ fn extra_of(c: &define::Col) -> String {
 }
 
 /// `SHOW [FULL] COLUMNS FROM t [LIKE p]`.
+#[allow(clippy::too_many_lines)] // the server's columns, in order
 pub(crate) fn columns(def: &Def, full: bool, like: Option<&dyn Fn(&str) -> bool>) -> Answer {
     let t = "COLUMNS";
     let mut defs = vec![
         coldef(IS, t, "Field", "COLUMN_NAME", 224, 256, VARSTR, 0x1001, 0),
-        coldef(IS, t, "Type", "COLUMN_TYPE", 224, 0x000b_fff4, BLOB, 0x1011, 0),
+        coldef(
+            IS,
+            t,
+            "Type",
+            "COLUMN_TYPE",
+            224,
+            0x000b_fff4,
+            BLOB,
+            0x1011,
+            0,
+        ),
     ];
     if full {
-        defs.push(coldef(IS, t, "Collation", "COLLATION_NAME", 224, 256, VARSTR, 0x0000, 0));
+        defs.push(coldef(
+            IS,
+            t,
+            "Collation",
+            "COLLATION_NAME",
+            224,
+            256,
+            VARSTR,
+            0x1000,
+            0,
+        ));
     }
     defs.extend([
         coldef(IS, t, "Null", "IS_NULLABLE", 224, 12, VARSTR, 0x1001, 0),
         coldef(IS, t, "Key", "COLUMN_KEY", 224, 12, VARSTR, 0x1001, 0),
-        coldef(IS, t, "Default", "COLUMN_DEFAULT", 224, 0x000b_ffd0, BLOB, 0x1010, 0),
+        coldef(
+            IS,
+            t,
+            "Default",
+            "COLUMN_DEFAULT",
+            224,
+            0x000b_ffd0,
+            BLOB,
+            0x1010,
+            0,
+        ),
         coldef(IS, t, "Extra", "EXTRA", 224, 320, VARSTR, 0x1001, 0),
     ]);
     if full {
-        defs.push(coldef(IS, t, "Privileges", "PRIVILEGES", 224, 320, VARSTR, 0x1001, 0));
-        defs.push(coldef(IS, t, "Comment", "COLUMN_COMMENT", 224, 4096, VARSTR, 0x1001, 0));
+        defs.push(coldef(
+            IS,
+            t,
+            "Privileges",
+            "PRIVILEGES",
+            224,
+            320,
+            VARSTR,
+            0x1001,
+            0,
+        ));
+        defs.push(coldef(
+            IS,
+            t,
+            "Comment",
+            "COLUMN_COMMENT",
+            224,
+            4096,
+            VARSTR,
+            0x1001,
+            0,
+        ));
     }
     let mut rows = Vec::new();
     for c in &def.cols {
@@ -197,39 +298,113 @@ pub(crate) fn columns(def: &Def, full: bool, like: Option<&dyn Fn(&str) -> bool>
         if full {
             vals.push(coll.as_deref().map(str::as_bytes));
         }
-        vals.extend([Some(null.as_bytes()), Some(key.as_bytes()), dflt.as_deref().map(str::as_bytes), Some(extra.as_bytes())]);
+        vals.extend([
+            Some(null.as_bytes()),
+            Some(key.as_bytes()),
+            dflt.as_deref().map(str::as_bytes),
+            Some(extra.as_bytes()),
+        ]);
         if full {
             vals.push(Some(b"select,insert,update,references".as_slice()));
             vals.push(Some(comment.as_bytes()));
         }
         rows.push(encode_text_row(vals));
     }
-    Answer { defs, rows, no_index: true }
+    Answer {
+        defs,
+        rows,
+        no_index: true,
+    }
 }
 
 /// `SHOW INDEX FROM t`; `rows` is the table's row count (the
 /// cardinality the engine reports for every key part).
+#[allow(clippy::too_many_lines)] // the server's columns, in order
 pub(crate) fn index(def: &Def, rows_estimate: u64) -> Answer {
     let t = "STATISTICS";
     let defs = vec![
         coldef(IS, t, "Table", "TABLE_NAME", 224, 256, VARSTR, 0x1001, 0),
-        coldef(IS, t, "Non_unique", "NON_UNIQUE", 63, 1, LONGLONG, 0x1001, 0),
+        coldef(
+            IS,
+            t,
+            "Non_unique",
+            "NON_UNIQUE",
+            63,
+            1,
+            LONGLONG,
+            0x1001,
+            0,
+        ),
         coldef(IS, t, "Key_name", "INDEX_NAME", 224, 256, VARSTR, 0x1001, 0),
-        coldef(IS, t, "Seq_in_index", "SEQ_IN_INDEX", 63, 2, LONG, 0x1021, 0),
-        coldef(IS, t, "Column_name", "COLUMN_NAME", 224, 256, VARSTR, 0x1001, 0),
-        coldef(IS, t, "Collation", "COLLATION", 224, 4, VARSTR, 0x0000, 0),
-        coldef(IS, t, "Cardinality", "CARDINALITY", 63, 21, LONGLONG, 0x0000, 0),
-        coldef(IS, t, "Sub_part", "SUB_PART", 63, 3, LONGLONG, 0x0000, 0),
-        coldef(IS, t, "Packed", "PACKED", 224, 40, VARSTR, 0x0000, 0),
+        coldef(
+            IS,
+            t,
+            "Seq_in_index",
+            "SEQ_IN_INDEX",
+            63,
+            2,
+            LONG,
+            0x1021,
+            0,
+        ),
+        coldef(
+            IS,
+            t,
+            "Column_name",
+            "COLUMN_NAME",
+            224,
+            256,
+            VARSTR,
+            0x1001,
+            0,
+        ),
+        coldef(IS, t, "Collation", "COLLATION", 224, 4, VARSTR, 0x1000, 0),
+        coldef(
+            IS,
+            t,
+            "Cardinality",
+            "CARDINALITY",
+            63,
+            21,
+            LONGLONG,
+            0x1000,
+            0,
+        ),
+        coldef(IS, t, "Sub_part", "SUB_PART", 63, 3, LONGLONG, 0x1000, 0),
+        coldef(IS, t, "Packed", "PACKED", 224, 40, VARSTR, 0x1000, 0),
         coldef(IS, t, "Null", "NULLABLE", 224, 12, VARSTR, 0x1001, 0),
-        coldef(IS, t, "Index_type", "INDEX_TYPE", 224, 64, VARSTR, 0x1001, 0),
+        coldef(
+            IS,
+            t,
+            "Index_type",
+            "INDEX_TYPE",
+            224,
+            64,
+            VARSTR,
+            0x1001,
+            0,
+        ),
         coldef(IS, t, "Comment", "COMMENT", 224, 64, VARSTR, 0x1001, 0),
-        coldef(IS, t, "Index_comment", "INDEX_COMMENT", 224, 4096, VARSTR, 0x1001, 0),
+        coldef(
+            IS,
+            t,
+            "Index_comment",
+            "INDEX_COMMENT",
+            224,
+            4096,
+            VARSTR,
+            0x1001,
+            0,
+        ),
         coldef(IS, t, "Ignored", "IGNORED", 224, 12, VARSTR, 0x1001, 0),
     ];
     let mut out = Vec::new();
     for k in &def.keys {
-        let non_unique = if matches!(k.kind, KeyKind::Primary | KeyKind::Unique) { "0" } else { "1" };
+        let non_unique = if matches!(k.kind, KeyKind::Primary | KeyKind::Unique) {
+            "0"
+        } else {
+            "1"
+        };
         for (i, p) in k.parts.iter().enumerate() {
             let seq = (i + 1).to_string();
             let coll = if p.desc { "D" } else { "A" };
@@ -249,7 +424,11 @@ pub(crate) fn index(def: &Def, rows_estimate: u64) -> Answer {
                 Some(card.as_bytes()),
                 sub.as_deref().map(str::as_bytes),
                 None,
-                Some(if nullable { b"YES".as_slice() } else { b"".as_slice() }),
+                Some(if nullable {
+                    b"YES".as_slice()
+                } else {
+                    b"".as_slice()
+                }),
                 Some(itype.as_bytes()),
                 Some(b"".as_slice()),
                 Some(icomment.as_bytes()),
@@ -257,15 +436,43 @@ pub(crate) fn index(def: &Def, rows_estimate: u64) -> Answer {
             ]));
         }
     }
-    Answer { defs, rows: out, no_index: true }
+    Answer {
+        defs,
+        rows: out,
+        no_index: true,
+    }
 }
 
-/// `SHOW [FULL] TABLES` of physical schema `schema`: `names` sorted.
-pub(crate) fn tables(schema: &str, names: &[String], full: bool) -> Answer {
+/// `SHOW [FULL] TABLES [LIKE 'p']` of physical schema `schema`: `names`
+/// sorted. The column is named after the pattern too, as written.
+pub(crate) fn tables(schema: &str, names: &[String], full: bool, like: Option<&str>) -> Answer {
     let t = "TABLE_NAMES";
-    let mut defs = vec![coldef(IS, t, &format!("Tables_in_{schema}"), "TABLE_NAME", 224, 292, VARSTR, 0x1001, 0)];
+    let mut defs = vec![coldef(
+        IS,
+        t,
+        &match like {
+            Some(p) => format!("Tables_in_{schema} ({p})"),
+            None => format!("Tables_in_{schema}"),
+        },
+        "TABLE_NAME",
+        224,
+        292,
+        VARSTR,
+        0x1001,
+        0,
+    )];
     if full {
-        defs.push(coldef(IS, t, "Table_type", "TABLE_TYPE", 224, 256, VARSTR, 0x1001, 0));
+        defs.push(coldef(
+            IS,
+            t,
+            "Table_type",
+            "TABLE_TYPE",
+            224,
+            256,
+            VARSTR,
+            0x1001,
+            0,
+        ));
     }
     let rows = names
         .iter()
@@ -277,5 +484,9 @@ pub(crate) fn tables(schema: &str, names: &[String], full: bool) -> Answer {
             }
         })
         .collect();
-    Answer { defs, rows, no_index: true }
+    Answer {
+        defs,
+        rows,
+        no_index: true,
+    }
 }

@@ -67,9 +67,20 @@ impl PassSession {
                 .is_ok_and(|s| s.info.class == StmtClass::Write),
             _ => return,
         };
-        ts.services()
-            .locator
-            .routing()
-            .record(ts.tenant, cx.session.client_dc.as_ref(), write);
+        // The session's own counter (no shared lock), made again when the
+        // session's client DC changes.
+        let client = cx.session.client_dc.as_ref();
+        match &self.traffic {
+            Some(t) if t.is_for(ts.tenant, client) => t.count(write),
+            _ => {
+                let t = ts
+                    .services()
+                    .locator
+                    .routing()
+                    .session_counter(ts.tenant, client);
+                t.count(write);
+                self.traffic = Some(t);
+            }
+        }
     }
 }

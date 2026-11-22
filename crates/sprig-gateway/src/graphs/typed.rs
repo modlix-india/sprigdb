@@ -198,11 +198,9 @@ impl GatewayGraphs {
                 .catalog
                 .change(g.tenant, VersionKind::Catalog)
                 .await?;
-            let r = {
-                let (store, tx) = ch.tx().parts();
-                GraphCatalog::new(store.schema())
-                    .delete_index(tx, g.graph_id, d.id)
-                    .await
+            let r = match ch.tx().records().await {
+                Err(e) => Err(e),
+                Ok(rec) => GraphCatalog::delete_index(rec, g.graph_id, d.id).await,
             };
             if let Err(e) = r {
                 let _ = ch.rollback().await;
@@ -246,11 +244,9 @@ impl GatewayGraphs {
             .catalog
             .change(g.tenant, VersionKind::Catalog)
             .await?;
-        let r = {
-            let (store, tx) = ch.tx().parts();
-            GraphCatalog::new(store.schema())
-                .insert_index(tx, g.graph_id, &d)
-                .await
+        let r = match ch.tx().records().await {
+            Err(e) => Err(e),
+            Ok(rec) => GraphCatalog::insert_index(rec, g.graph_id, &d).await,
         };
         d.id = match r {
             Ok(id) => id,
@@ -287,13 +283,14 @@ impl GatewayGraphs {
             .catalog
             .change(g.tenant, VersionKind::Catalog)
             .await?;
-        let r = {
-            let (store, tx) = ch.tx().parts();
-            let gc = GraphCatalog::new(store.schema());
-            if built.is_ok() {
-                gc.index_online(tx, g.graph_id, d.id).await
-            } else {
-                gc.delete_index(tx, g.graph_id, d.id).await
+        let r = match ch.tx().records().await {
+            Err(e) => Err(e),
+            Ok(rec) => {
+                if built.is_ok() {
+                    GraphCatalog::index_online(rec, g.graph_id, d.id).await
+                } else {
+                    GraphCatalog::delete_index(rec, g.graph_id, d.id).await
+                }
             }
         };
         if let Err(e) = r {
@@ -611,6 +608,15 @@ impl DdlConns for GwDdlConns {
             .map_err(|e| SprigError::internal(format!("cluster id {cluster}: {e}")))?;
         let pool = self.graphs.tenant_pool(self.tenant, &id).await?;
         pool.get_conn().await.map_err(backend_error)
+    }
+
+    async fn indexes(&self, graph: u64) -> Result<Vec<IndexDef>> {
+        let mut rec = self.graphs.svc.records.begin(self.tenant).await?;
+        Ok(GraphCatalog::indexes(&mut *rec, Some(graph))
+            .await?
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect())
     }
 
     async fn changed(&self) -> Result<()> {

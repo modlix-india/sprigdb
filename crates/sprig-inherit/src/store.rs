@@ -1,31 +1,32 @@
-//! The `inherit` catalog module: `spaces`, `inheritable_objects`, `shares`
-//! and `space_homes` in `t<tenant>_sprig`, their migration, the snapshot
-//! loader ([`InheritExtension`]) and the writes the extension statements make
+//! The `inherit` catalog module: spaces, inheritable objects (with their
+//! extension), shares and users' home spaces, kept as the engine's
+//! catalog records on the catalog version, the snapshot loader
+//! ([`InheritExtension`]) and the writes the extension statements make
 //! ([`InheritChange`]).
 //!
-//! Like the type layer's `types` module, the tables are versioned with the
-//! catalog version and reloaded whole into every snapshot (they are small).
-//! A catalog bootstrapped before the module has no tables; the first
-//! extension statement migrates it ([`migrate`]).
+//! ```text
+//! m/inherit/spaces/<space_id u64>                 SpaceRow
+//! m/inherit/objects/<object_id u64>               ObjectRow (the inheritable object and its extension)
+//! m/inherit/shares/<share_id u64><role u8>        ShareRow (role 1 granted, 2 received)
+//! m/inherit/homes/<user_id u32>                   HomeRow
+//! ```
 //!
-//! Beyond the core columns, all additive: `shares.name`
-//! (shares are named in SQL), `inheritable_objects.columns` (the column
-//! order of the merged view) and `unique_keys` (the user `UNIQUE` keys as
-//! declared, before `_sprig_space` widened them), and `space_homes` for
-//! `users.home_space_id`, which the auth catalog doesn't have
-//! yet.
+//! Like the type layer's records, the rows are versioned with the catalog
+//! version (each keeps the version that last changed it) and reloaded
+//! whole into every snapshot (they are few). Table names come from
+//! `objects` at load time.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use mysql_async::prelude::Queryable;
-use mysql_async::{Conn, Row};
+use mysql_async::Conn;
+use serde::{Deserialize, Serialize};
 use sprig_catalog::cache::{ExtState, SnapshotTx};
-use sprig_catalog::migrate::{MigrateOpts, Migration, Module, Phase};
+use sprig_catalog::migrate::{MigrateOpts, Migration, Module};
+use sprig_catalog::records::{Pk, RecordTx, RowTable};
 use sprig_catalog::version::VersionKind;
 use sprig_catalog::{CatalogExtension, Migrator};
-use sprig_common::ids::{DbId, ObjectId, TenantId};
-use sprig_common::names::quote;
+use sprig_common::ids::{ObjectId, TenantId};
 use sprig_common::{Result, SprigCode, SprigError};
 
 use crate::model::{
@@ -36,106 +37,20 @@ use crate::model::{
 /// The module name.
 pub const MODULE: &str = "inherit";
 
-/// `spaces`.
-pub const DDL_SPACES: &str = "CREATE TABLE IF NOT EXISTS spaces (
-  space_id          BIGINT UNSIGNED NOT NULL,
-  name              VARCHAR(64)     NOT NULL,
-  parent_space_id   BIGINT UNSIGNED NULL,
-  parent_tenant_id  BIGINT UNSIGNED NULL,
-  parent_ext_space  BIGINT UNSIGNED NULL,
-  depth             SMALLINT UNSIGNED NOT NULL,
-  path              VARBINARY(2048) NOT NULL,
-  state             ENUM('creating','active','dropping','dropped') NOT NULL,
-  created_by        INT UNSIGNED    NOT NULL,
-  created_at        DATETIME(6)     NOT NULL,
-  changed_version   BIGINT UNSIGNED NOT NULL,
-  PRIMARY KEY (space_id),
-  UNIQUE KEY uk_name (name),
-  KEY k_parent (parent_space_id),
-  KEY k_path (path)
-) ENGINE=InnoDB";
+/// Spaces.
+pub const SPACES: RowTable = RowTable::new(MODULE, "spaces");
+/// Inheritable objects.
+pub const OBJECTS: RowTable = RowTable::new(MODULE, "objects");
+/// Shares granted and received.
+pub const SHARES: RowTable = RowTable::new(MODULE, "shares");
+/// Users' home spaces.
+pub const HOMES: RowTable = RowTable::new(MODULE, "homes");
 
-/// `inheritable_objects`.
-pub const DDL_OBJECTS: &str = "CREATE TABLE IF NOT EXISTS inheritable_objects (
-  object_id         BIGINT UNSIGNED NOT NULL,
-  model             ENUM('table','collection','kv') NOT NULL,
-  key_fields        JSON            NOT NULL,
-  field_slots       JSON            NOT NULL,
-  columns           JSON            NOT NULL,
-  unique_keys       JSON            NOT NULL,
-  tag_field         VARCHAR(255)    NULL,
-  source_tenant_id  BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  source_object_id  BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  state             ENUM('enabling','active','disabling') NOT NULL,
-  ddl_job_id        BIGINT UNSIGNED NULL,
-  version           BIGINT UNSIGNED NOT NULL DEFAULT 1,
-  created_at        DATETIME(6)     NOT NULL,
-  changed_version   BIGINT UNSIGNED NOT NULL,
-  PRIMARY KEY (object_id)
-) ENGINE=InnoDB";
+const GRANTED: u8 = 1;
+const RECEIVED: u8 = 2;
 
-/// `shares`.
-pub const DDL_SHARES: &str = "CREATE TABLE IF NOT EXISTS shares (
-  share_id          BIGINT UNSIGNED NOT NULL,
-  role              ENUM('granted','received') NOT NULL,
-  name              VARCHAR(64)     NOT NULL,
-  object_id         BIGINT UNSIGNED NOT NULL,
-  from_space_id     BIGINT UNSIGNED NOT NULL,
-  peer_tenant_id    BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  to_space_id       BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  filter_sql        TEXT            NULL,
-  filter_mongo      JSON            NULL,
-  tag               VARCHAR(64)     NULL,
-  columns           JSON            NULL,
-  take_filter_sql   TEXT            NULL,
-  reshare           BOOLEAN         NOT NULL DEFAULT FALSE,
-  merge_mode        ENUM('read_through','materialized','federated') NOT NULL,
-  copy_state        ENUM('none','seeding','following','serving','stale') NOT NULL
-                    DEFAULT 'none',
-  share_role_id     BIGINT UNSIGNED NULL,
-  version           BIGINT UNSIGNED NOT NULL,
-  state             ENUM('creating','active','dropping') NOT NULL,
-  created_by        INT UNSIGNED    NOT NULL,
-  created_at        DATETIME(6)     NOT NULL,
-  changed_version   BIGINT UNSIGNED NOT NULL,
-  PRIMARY KEY (share_id, role),
-  KEY k_from (object_id, from_space_id)
-) ENGINE=InnoDB";
-
-/// `space_homes`: users' home spaces (`home_space_id`).
-pub const DDL_HOMES: &str = "CREATE TABLE IF NOT EXISTS space_homes (
-  user_id           INT UNSIGNED    NOT NULL,
-  space_id          BIGINT UNSIGNED NOT NULL,
-  changed_version   BIGINT UNSIGNED NOT NULL,
-  PRIMARY KEY (user_id)
-) ENGINE=InnoDB";
-
-/// `inherit_ext` (format 2): per
-/// object, the `AUTO_INCREMENT` column, the foreign keys the gateway keeps
-/// and whether SprigDB created the object from its parent tenant's, as
-/// JSON ([`crate::model::ObjectExt`]).
-pub const DDL_EXT: &str = "CREATE TABLE IF NOT EXISTS inherit_ext (
-  object_id         BIGINT UNSIGNED NOT NULL,
-  ext               JSON            NOT NULL,
-  changed_version   BIGINT UNSIGNED NOT NULL,
-  PRIMARY KEY (object_id)
-) ENGINE=InnoDB";
-
-/// The module's migrations.
-pub static INHERIT_MIGRATIONS: &[Migration] = &[
-    Migration {
-        format: 1,
-        phase: Phase::Expand,
-        name: "spaces, inheritable_objects, shares and space_homes",
-        statements: &[DDL_SPACES, DDL_OBJECTS, DDL_SHARES, DDL_HOMES],
-    },
-    Migration {
-        format: 2,
-        phase: Phase::Expand,
-        name: "inherit_ext: AUTO_INCREMENT columns, foreign keys, adopted objects",
-        statements: &[DDL_EXT],
-    },
-];
+/// The module's MariaDB migrations: none, its rows are engine records.
+pub static INHERIT_MIGRATIONS: &[Migration] = &[];
 
 /// The `inherit` module, for [`Migrator::new`].
 pub const INHERIT_MODULE: Module = Module {
@@ -143,47 +58,129 @@ pub const INHERIT_MODULE: Module = Module {
     migrations: INHERIT_MIGRATIONS,
 };
 
-/// Applies the module's migrations to catalog `schema` (idempotent).
+/// Makes sure catalog `schema` can take the module's records (its core
+/// migrations, which create the record log).
 ///
 /// # Errors
 /// The migrator's.
 pub async fn migrate(c: &mut Conn, schema: &str) -> Result<()> {
-    Migrator::new(&[INHERIT_MODULE])?
+    Migrator::new(&[])?
         .run(c, schema, &MigrateOpts::default())
         .await?;
     Ok(())
 }
 
-fn map_err(e: mysql_async::Error) -> SprigError {
-    match &e {
-        mysql_async::Error::Server(s) => match s.code {
-            1205 | 1213 => SprigError::new(SprigCode::CatalogConflict, "catalog row busy; retry"),
-            1062 => SprigError::new(SprigCode::SpaceExists, "the name is taken"),
-            code => {
-                let mut state = *b"HY000";
-                if s.state.len() == 5 {
-                    state.copy_from_slice(s.state.as_bytes());
-                }
-                SprigError::backend(code, state, format!("catalog statement failed ({code})"))
-            }
-        }
-        .with_source(e),
-        _ => SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e),
-    }
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-fn col<T: mysql_async::prelude::FromValue>(row: &Row, i: usize) -> Result<T> {
-    row.get_opt::<T, usize>(i)
-        .and_then(std::result::Result::ok)
-        .ok_or_else(|| SprigError::internal(format!("inherit catalog: bad column {i}")))
+/// A space: what `spaces` held.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceRow {
+    /// Its id.
+    pub space_id: u64,
+    /// Its name (unique in the tenant).
+    pub name: String,
+    /// Its parent (none for the root).
+    pub parent_space_id: Option<u64>,
+    /// 0 for the root.
+    pub depth: u16,
+    /// `/1/<id>/.../`.
+    pub path: String,
+    /// `active` (rows of dropped spaces are removed).
+    pub state: String,
+    /// Who made it.
+    pub created_by: u32,
+    /// When (ms since the epoch).
+    pub created_at_ms: u64,
+    /// The catalog version that last changed it.
+    pub changed_version: u64,
 }
 
-fn bad(what: &str) -> SprigError {
-    SprigError::internal(format!("inherit catalog: {what}"))
+/// An inheritable object: what `inheritable_objects` and `inherit_ext`
+/// held.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectRow {
+    /// The object.
+    pub object_id: u64,
+    /// `table`.
+    pub model: String,
+    /// The key fields.
+    pub key_fields: Vec<String>,
+    /// Field slots.
+    pub field_slots: BTreeMap<String, u8>,
+    /// The merged view's column order.
+    pub columns: Vec<String>,
+    /// The user `UNIQUE` keys as declared.
+    pub unique_keys: Vec<UniqueKey>,
+    /// The tag field.
+    pub tag_field: Option<String>,
+    /// `active`.
+    pub state: String,
+    /// Bumped by every change.
+    pub version: u64,
+    /// The extension (`AUTO_INCREMENT` column, foreign keys, adoption).
+    pub ext: ObjectExt,
+    /// When (ms since the epoch).
+    pub created_at_ms: u64,
+    /// The catalog version that last changed it.
+    pub changed_version: u64,
 }
 
-fn json<T: serde::de::DeserializeOwned>(s: &str, what: &str) -> Result<T> {
-    serde_json::from_str(s).map_err(|_| bad(what))
+/// A share as granted or received: what `shares` held.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareRow {
+    /// Its name (granted shares).
+    pub name: String,
+    /// The shared object.
+    pub object_id: u64,
+    /// The space it is shared from.
+    pub from_space_id: u64,
+    /// The receiving tenant (0: spaces of this tenant).
+    pub peer_tenant_id: u64,
+    /// The receiving space (0: every child).
+    pub to_space_id: u64,
+    /// The row filter.
+    pub filter_sql: Option<String>,
+    /// The shared columns.
+    pub columns: Option<Vec<String>>,
+    /// A received share's narrowing.
+    pub take_filter_sql: Option<String>,
+    /// Receivers may share it on.
+    pub reshare: bool,
+    /// `read_through`, `materialized` or `federated`.
+    pub merge_mode: String,
+    /// The share's version.
+    pub version: u64,
+    /// `active` or `dropping`.
+    pub state: String,
+    /// Who made it.
+    pub created_by: u32,
+    /// When (ms since the epoch).
+    pub created_at_ms: u64,
+    /// The catalog version that last changed it.
+    pub changed_version: u64,
+}
+
+/// A user's home space: what `space_homes` held.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HomeRow {
+    /// The space.
+    pub space_id: u64,
+    /// The catalog version that last changed it.
+    pub changed_version: u64,
+}
+
+fn space_exists(what: &str) -> SprigError {
+    SprigError::new(SprigCode::SpaceExists, what.to_owned())
+}
+
+/// The object id of a share key, and its role.
+fn share_key(pk: &Pk) -> Option<(u64, u8)> {
+    let id = u64::from_be_bytes(pk.0.get(..8)?.try_into().ok()?);
+    Some((id, *pk.0.get(8)?))
 }
 
 /// A space to create.
@@ -232,383 +229,276 @@ impl InheritChange {
     }
 }
 
-/// Reads and writes the module's tables in one catalog schema.
-#[derive(Debug, Clone)]
-pub struct InheritStore {
-    schema: String,
-}
+/// The live objects among `ids` with their database and name (from the
+/// catalog's `objects`).
+pub type ObjectNames = sprig_types::store::ObjectNames;
+
+/// Reads and writes the module's records.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InheritStore;
 
 impl InheritStore {
-    /// The tables of catalog schema `schema`.
-    #[must_use]
-    pub fn new(schema: impl Into<String>) -> Self {
-        Self {
-            schema: schema.into(),
-        }
-    }
-
-    fn t(&self, table: &str) -> String {
-        format!("{}.{table}", quote(&self.schema))
-    }
-
-    /// Whether the module's tables exist.
+    /// Every object id the state needs a name for.
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn migrated<Q: Queryable + Send>(&self, q: &mut Q) -> Result<bool> {
-        let n: Option<u64> = q
-            .exec_first(
-                "SELECT COUNT(*) FROM information_schema.TABLES \
-                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'space_homes'",
-                (self.schema.as_str(),),
-            )
-            .await
-            .map_err(map_err)?;
-        Ok(n.unwrap_or(0) > 0)
+    /// The record store's.
+    pub async fn object_ids(rec: &mut dyn RecordTx) -> Result<Vec<ObjectId>> {
+        Ok(OBJECTS
+            .rows::<ObjectRow>(rec, &Pk::new())
+            .await?
+            .into_iter()
+            .map(|o| ObjectId(o.object_id))
+            .collect())
     }
 
-    /// Whether format 2's `inherit_ext` exists.
+    /// The whole state; objects whose table is gone (not in `names`) are
+    /// left out.
     ///
     /// # Errors
-    /// 39070 or a backend error.
-    pub async fn ext_ready<Q: Queryable + Send>(&self, q: &mut Q) -> Result<bool> {
-        let n: Option<u64> = q
-            .exec_first(
-                "SELECT COUNT(*) FROM information_schema.TABLES \
-                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'inherit_ext'",
-                (self.schema.as_str(),),
-            )
-            .await
-            .map_err(map_err)?;
-        Ok(n.unwrap_or(0) > 0)
-    }
-
-    /// The whole state.
-    ///
-    /// # Errors
-    /// 39070, a backend error, or `Internal` for a malformed row.
-    pub async fn load<Q: Queryable + Send>(&self, q: &mut Q) -> Result<InheritState> {
-        let ext_ready = self.ext_ready(q).await?;
-        let rows: Vec<Row> = q
-            .query(format!(
-                "SELECT space_id, name, parent_space_id, depth FROM {} \
-                 WHERE state = 'active' ORDER BY space_id",
-                self.t("spaces")
-            ))
-            .await
-            .map_err(map_err)?;
-        let mut spaces = Vec::with_capacity(rows.len());
-        for r in &rows {
-            spaces.push(Space {
-                id: SpaceId(col(r, 0)?),
-                name: col(r, 1)?,
-                parent: col::<Option<u64>>(r, 2)?.map(SpaceId),
-                depth: col(r, 3)?,
-            });
-        }
-        let ext_sql = if ext_ready {
-            format!(
-                "(SELECT CAST(e.ext AS CHAR) FROM {} e WHERE e.object_id = i.object_id)",
-                self.t("inherit_ext")
-            )
-        } else {
-            "NULL".to_owned()
-        };
-        let rows: Vec<Row> = q
-            .query(format!(
-                "SELECT i.object_id, o.db_id, o.name, CAST(i.key_fields AS CHAR), \
-                 CAST(i.field_slots AS CHAR), CAST(i.columns AS CHAR), \
-                 CAST(i.unique_keys AS CHAR), i.tag_field, i.version, {ext_sql} \
-                 FROM {} i JOIN {} o ON o.object_id = i.object_id \
-                 WHERE o.state <> 'dropped' ORDER BY i.object_id",
-                self.t("inheritable_objects"),
-                self.t("objects")
-            ))
-            .await
-            .map_err(map_err)?;
-        let mut objects = Vec::with_capacity(rows.len());
-        let mut missing = Vec::new();
-        for r in &rows {
-            let key: String = col(r, 3)?;
-            let slots: String = col(r, 4)?;
-            let columns: String = col(r, 5)?;
-            let uniques: String = col(r, 6)?;
-            let ext: Option<String> = col(r, 9)?;
-            let ext: ObjectExt = if let Some(e) = ext {
-                json(&e, "inherit_ext")?
-            } else {
-                missing.push(ObjectId(col(r, 0)?));
-                ObjectExt::default()
+    /// The record store's; `Internal` for a malformed row.
+    pub async fn load(rec: &mut dyn RecordTx, names: &ObjectNames) -> Result<InheritState> {
+        let spaces = SPACES
+            .rows::<SpaceRow>(rec, &Pk::new())
+            .await?
+            .into_iter()
+            .filter(|r| r.state == "active")
+            .map(|r| Space {
+                id: SpaceId(r.space_id),
+                name: r.name,
+                parent: r.parent_space_id.map(SpaceId),
+                depth: r.depth,
+            })
+            .collect();
+        let mut objects = Vec::new();
+        for r in OBJECTS.rows::<ObjectRow>(rec, &Pk::new()).await? {
+            let Some((db, table)) = names.get(&ObjectId(r.object_id)) else {
+                continue;
             };
             objects.push(InheritableObject {
-                object_id: ObjectId(col(r, 0)?),
-                db: DbId(col(r, 1)?),
-                table: col(r, 2)?,
-                key: json(&key, "key_fields")?,
-                slots: json::<BTreeMap<String, u8>>(&slots, "field_slots")?,
-                columns: json(&columns, "columns")?,
-                uniques: json::<Vec<UniqueKey>>(&uniques, "unique_keys")?,
-                tag_field: col(r, 7)?,
-                version: col(r, 8)?,
-                auto: ext.auto,
-                links: ext.links,
-                adopted: ext.adopted,
-                type_root: ext.type_root,
+                object_id: ObjectId(r.object_id),
+                db: *db,
+                table: table.clone(),
+                key: r.key_fields,
+                slots: r.field_slots,
+                columns: r.columns,
+                uniques: r.unique_keys,
+                tag_field: r.tag_field,
+                version: r.version,
+                auto: r.ext.auto,
+                links: r.ext.links,
+                adopted: r.ext.adopted,
+                type_root: r.ext.type_root,
             });
         }
-        let rows: Vec<Row> = q
-            .query(format!(
-                "SELECT share_id, role, name, object_id, from_space_id, peer_tenant_id, \
-                 to_space_id, filter_sql, CAST(columns AS CHAR), take_filter_sql, reshare, \
-                 version, created_by, CAST(merge_mode AS CHAR), CAST(state AS CHAR) FROM {} \
-                 WHERE state IN ('active', 'dropping') ORDER BY share_id",
-                self.t("shares")
-            ))
-            .await
-            .map_err(map_err)?;
         let mut shares = Vec::new();
         let mut dropping = Vec::new();
         let mut takes = Vec::new();
-        for r in &rows {
-            let role: String = col(r, 1)?;
-            let peer: u64 = col(r, 5)?;
-            let to: u64 = col(r, 6)?;
-            let active = col::<String>(r, 14)? == "active";
-            if !active && role != "granted" {
+        for (pk, r) in SHARES.scan::<ShareRow>(rec, &Pk::new()).await? {
+            let (id, role) = share_key(&pk)
+                .ok_or_else(|| SprigError::internal("inherit catalog: share key".to_owned()))?;
+            let active = r.state == "active";
+            if !active && (role != GRANTED || r.state != "dropping") {
                 continue;
             }
-            if role == "received" {
+            if role == RECEIVED {
                 takes.push(Take {
-                    share_id: col(r, 0)?,
-                    peer_tenant: TenantId(peer),
-                    object_id: ObjectId(col(r, 3)?),
-                    take: col(r, 9)?,
+                    share_id: id,
+                    peer_tenant: TenantId(r.peer_tenant_id),
+                    object_id: ObjectId(r.object_id),
+                    take: r.take_filter_sql,
                 });
                 continue;
             }
-            let columns: Option<String> = col(r, 8)?;
             let to_list = if active { &mut shares } else { &mut dropping };
             to_list.push(Share {
-                id: col(r, 0)?,
-                name: col(r, 2)?,
-                object_id: ObjectId(col(r, 3)?),
-                from: SpaceId(col(r, 4)?),
-                to: match (peer, to) {
+                id,
+                name: r.name,
+                object_id: ObjectId(r.object_id),
+                from: SpaceId(r.from_space_id),
+                to: match (r.peer_tenant_id, r.to_space_id) {
                     (0, 0) => ShareTarget::AllChildren,
                     (0, s) => ShareTarget::Space(SpaceId(s)),
                     (t, _) => ShareTarget::Tenant(TenantId(t)),
                 },
-                filter: col(r, 7)?,
-                columns: match columns {
-                    Some(c) => Some(json(&c, "columns")?),
-                    None => None,
-                },
-                take: col(r, 9)?,
-                reshare: col::<i64>(r, 10)? != 0,
-                version: col(r, 11)?,
-                created_by: col(r, 12)?,
-                mode: MergeMode::parse(&col::<String>(r, 13)?).unwrap_or_default(),
+                filter: r.filter_sql,
+                columns: r.columns,
+                take: r.take_filter_sql,
+                reshare: r.reshare,
+                version: r.version,
+                created_by: r.created_by,
+                mode: MergeMode::parse(&r.merge_mode).unwrap_or_default(),
                 via: None,
             });
         }
-        let homes: Vec<(u32, u64)> = q
-            .query(format!(
-                "SELECT user_id, space_id FROM {}",
-                self.t("space_homes")
-            ))
-            .await
-            .map_err(map_err)?;
-        let mut st = InheritState::new(
-            spaces,
-            objects,
-            shares,
-            takes,
-            homes.into_iter().map(|(u, s)| (u, SpaceId(s))).collect(),
-        );
-        st.ext_ready = ext_ready;
-        st.set_ext_missing(missing);
+        let mut homes = Vec::new();
+        for (pk, r) in HOMES.scan::<HomeRow>(rec, &Pk::new()).await? {
+            let user =
+                pk.0.get(..4)
+                    .and_then(|b| b.try_into().ok())
+                    .map(u32::from_be_bytes)
+                    .ok_or_else(|| SprigError::internal("inherit catalog: home key".to_owned()))?;
+            homes.push((user, SpaceId(r.space_id)));
+        }
+        let mut st = InheritState::new(spaces, objects, shares, takes, homes);
+        st.ext_ready = true;
         st.set_dropping(dropping);
         Ok(st)
     }
 
-    async fn next_id<Q: Queryable + Send>(&self, q: &mut Q, table: &str, id: &str) -> Result<u64> {
-        let n: Option<u64> = q
-            .query_first(format!(
-                "SELECT COALESCE(MAX({id}), 1) + 1 FROM {} FOR UPDATE",
-                self.t(table)
-            ))
-            .await
-            .map_err(map_err)?;
-        n.ok_or_else(|| bad("no id"))
-    }
-
-    /// Applies `change` in `q` (the versioned change's transaction) at
-    /// catalog version `version`.
+    /// The state of the tenant whose catalog schema is `schema`, read the
+    /// way an operator's tool can: object names from the catalog
+    /// connection `c`, the records through the engine node's peer service
+    /// (`SPRIGDB_CATALOG_NODE`).
     ///
     /// # Errors
-    /// 39881 for a name taken; 39070 or a backend error.
+    /// `Internal` when `schema` isn't `t<id>_sprig`; 39070 when the
+    /// engine node can't be reached; the catalog's.
+    pub async fn load_remote(c: &mut Conn, schema: &str) -> Result<InheritState> {
+        let tenant = schema
+            .strip_prefix('t')
+            .and_then(|s| s.strip_suffix("_sprig"))
+            .and_then(|s| s.parse().ok())
+            .map(TenantId)
+            .ok_or_else(|| SprigError::internal(format!("{schema} is not a tenant catalog")))?;
+        let store = sprig_catalog::records::remote::RemoteRecords::new(None, None);
+        let mut tx = sprig_catalog::RecordStore::begin(&store, tenant).await?;
+        let ids = Self::object_ids(&mut *tx).await?;
+        let names = sprig_types::store::object_names(c, schema, &ids).await?;
+        let st = Self::load(&mut *tx, &names).await;
+        let _ = tx.rollback().await;
+        st
+    }
+
+    /// `MAX(id) + 1` of a table keyed by a leading u64 (at least 2: the
+    /// root space is 1), as the SQL handed out ids.
+    async fn next_id(rec: &mut dyn RecordTx, t: RowTable) -> Result<u64> {
+        let max = t
+            .scan::<serde_json::Value>(rec, &Pk::new())
+            .await?
+            .iter()
+            .filter_map(|(pk, _)| pk.0.get(..8)?.try_into().ok().map(u64::from_be_bytes))
+            .max()
+            .unwrap_or(1);
+        Ok(max.max(1) + 1)
+    }
+
+    /// Applies `change` to the records of a catalog change at catalog
+    /// version `version`.
+    ///
+    /// # Errors
+    /// 39881 for a space name taken; the record store's.
     #[allow(clippy::too_many_lines)] // one block per kind of row
-    pub async fn apply<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        change: &InheritChange,
-        version: u64,
-    ) -> Result<()> {
+    pub async fn apply(rec: &mut dyn RecordTx, change: &InheritChange, version: u64) -> Result<()> {
+        let now = now_ms();
         if let Some(name) = &change.root_name {
-            q.exec_drop(
-                format!(
-                    "INSERT IGNORE INTO {} (space_id, name, parent_space_id, depth, path, state, \
-                     created_by, created_at, changed_version) VALUES (1, ?, NULL, 0, '/1/', \
-                     'active', 0, UTC_TIMESTAMP(6), ?)",
-                    self.t("spaces")
-                ),
-                (name.as_str(), version),
-            )
-            .await
-            .map_err(map_err)?;
+            let taken = SPACES
+                .rows::<SpaceRow>(rec, &Pk::new())
+                .await?
+                .iter()
+                .any(|s| s.space_id == ROOT_SPACE.0 || s.name == *name);
+            if !taken {
+                let row = SpaceRow {
+                    space_id: ROOT_SPACE.0,
+                    name: name.clone(),
+                    parent_space_id: None,
+                    depth: 0,
+                    path: "/1/".to_owned(),
+                    state: "active".to_owned(),
+                    created_by: 0,
+                    created_at_ms: now,
+                    changed_version: version,
+                };
+                SPACES.put(rec, &Pk::new().u64(ROOT_SPACE.0), &row).await?;
+            }
         }
         for s in &change.add_spaces {
-            let id = self.next_id(q, "spaces", "space_id").await?;
-            let parent: Option<(u16, Vec<u8>)> = q
-                .exec_first(
-                    format!(
-                        "SELECT depth, path FROM {} WHERE space_id = ? AND state = 'active'",
-                        self.t("spaces")
-                    ),
-                    (s.parent.0,),
-                )
-                .await
-                .map_err(map_err)?;
-            let (depth, path) = parent.unwrap_or((0, b"/1/".to_vec()));
-            let mut path = String::from_utf8_lossy(&path).into_owned();
+            let all = SPACES.rows::<SpaceRow>(rec, &Pk::new()).await?;
+            if all.iter().any(|o| o.name == s.name) {
+                return Err(space_exists("the name is taken"));
+            }
+            let id = Self::next_id(rec, SPACES).await?;
+            let (depth, mut path) = all
+                .iter()
+                .find(|o| o.space_id == s.parent.0 && o.state == "active")
+                .map_or((0, "/1/".to_owned()), |p| (p.depth, p.path.clone()));
             path.push_str(&format!("{id}/"));
-            q.exec_drop(
-                format!(
-                    "INSERT INTO {} (space_id, name, parent_space_id, depth, path, state, \
-                     created_by, created_at, changed_version) VALUES (?, ?, ?, ?, ?, 'active', ?, \
-                     UTC_TIMESTAMP(6), ?)",
-                    self.t("spaces")
-                ),
-                (
-                    id,
-                    s.name.as_str(),
-                    s.parent.0,
-                    depth.saturating_add(1),
-                    path,
-                    s.created_by,
-                    version,
-                ),
-            )
-            .await
-            .map_err(map_err)?;
+            let row = SpaceRow {
+                space_id: id,
+                name: s.name.clone(),
+                parent_space_id: Some(s.parent.0),
+                depth: depth.saturating_add(1),
+                path,
+                state: "active".to_owned(),
+                created_by: s.created_by,
+                created_at_ms: now,
+                changed_version: version,
+            };
+            SPACES.put(rec, &Pk::new().u64(id), &row).await?;
         }
         for s in &change.drop_spaces {
-            for (table, col) in [("spaces", "space_id"), ("space_homes", "space_id")] {
-                q.exec_drop(
-                    format!("DELETE FROM {} WHERE {col} = ?", self.t(table)),
-                    (s.0,),
-                )
-                .await
-                .map_err(map_err)?;
+            SPACES.delete(rec, &Pk::new().u64(s.0)).await?;
+            for (pk, h) in HOMES.scan::<HomeRow>(rec, &Pk::new()).await? {
+                if h.space_id == s.0 {
+                    HOMES.delete(rec, &pk).await?;
+                }
             }
-            q.exec_drop(
-                format!(
-                    "DELETE FROM {} WHERE role = 'granted' AND (from_space_id = ? OR \
-                     (peer_tenant_id = 0 AND to_space_id = ?))",
-                    self.t("shares")
-                ),
-                (s.0, s.0),
-            )
-            .await
-            .map_err(map_err)?;
+            for (pk, r) in SHARES.scan::<ShareRow>(rec, &Pk::new()).await? {
+                let granted = share_key(&pk).is_some_and(|(_, role)| role == GRANTED);
+                if granted
+                    && (r.from_space_id == s.0 || (r.peer_tenant_id == 0 && r.to_space_id == s.0))
+                {
+                    SHARES.delete(rec, &pk).await?;
+                }
+            }
         }
         for id in &change.delete_objects {
-            q.exec_drop(
-                format!(
-                    "DELETE FROM {} WHERE object_id = ?",
-                    self.t("inheritable_objects")
-                ),
-                (id.0,),
-            )
-            .await
-            .map_err(map_err)?;
-            q.exec_drop(
-                format!("DELETE FROM {} WHERE object_id = ?", self.t("inherit_ext")),
-                (id.0,),
-            )
-            .await
-            .map_err(map_err)?;
-            q.exec_drop(
-                format!("DELETE FROM {} WHERE object_id = ?", self.t("shares")),
-                (id.0,),
-            )
-            .await
-            .map_err(map_err)?;
+            OBJECTS.delete(rec, &Pk::new().u64(id.0)).await?;
+            for (pk, r) in SHARES.scan::<ShareRow>(rec, &Pk::new()).await? {
+                if r.object_id == id.0 {
+                    SHARES.delete(rec, &pk).await?;
+                }
+            }
         }
         for o in &change.upsert_objects {
-            let enc = |v: &dyn erased::Ser| v.json();
-            q.exec_drop(
-                format!(
-                    "INSERT INTO {} (object_id, model, key_fields, field_slots, columns, \
-                     unique_keys, tag_field, state, version, created_at, changed_version) \
-                     VALUES (?, 'table', ?, ?, ?, ?, ?, 'active', 1, UTC_TIMESTAMP(6), ?) \
-                     ON DUPLICATE KEY UPDATE key_fields = VALUES(key_fields), \
-                     field_slots = VALUES(field_slots), columns = VALUES(columns), \
-                     unique_keys = VALUES(unique_keys), tag_field = VALUES(tag_field), \
-                     version = version + 1, changed_version = VALUES(changed_version)",
-                    self.t("inheritable_objects")
-                ),
-                (
-                    o.object_id.0,
-                    enc(&o.key),
-                    enc(&o.slots),
-                    enc(&o.columns),
-                    enc(&o.uniques),
-                    o.tag_field.as_deref(),
-                    version,
-                ),
-            )
-            .await
-            .map_err(map_err)?;
-            q.exec_drop(
-                format!(
-                    "INSERT INTO {} (object_id, ext, changed_version) VALUES (?, ?, ?) \
-                     ON DUPLICATE KEY UPDATE ext = VALUES(ext), \
-                     changed_version = VALUES(changed_version)",
-                    self.t("inherit_ext")
-                ),
-                (o.object_id.0, enc(&o.ext()), version),
-            )
-            .await
-            .map_err(map_err)?;
+            let pk = Pk::new().u64(o.object_id.0);
+            let old = OBJECTS.get::<ObjectRow>(rec, &pk).await?;
+            let row = ObjectRow {
+                object_id: o.object_id.0,
+                model: "table".to_owned(),
+                key_fields: o.key.clone(),
+                field_slots: o.slots.clone(),
+                columns: o.columns.clone(),
+                unique_keys: o.uniques.clone(),
+                tag_field: o.tag_field.clone(),
+                state: "active".to_owned(),
+                version: old.as_ref().map_or(1, |r| r.version + 1),
+                ext: o.ext(),
+                created_at_ms: old.as_ref().map_or(now, |r| r.created_at_ms),
+                changed_version: version,
+            };
+            OBJECTS.put(rec, &pk, &row).await?;
         }
         for id in &change.drop_shares {
-            q.exec_drop(
-                format!(
-                    "UPDATE {} SET state = 'dropping', changed_version = ? WHERE share_id = ? \
-                     AND role = 'granted'",
-                    self.t("shares")
-                ),
-                (version, id),
-            )
-            .await
-            .map_err(map_err)?;
+            let pk = Pk::new().u64(*id).u8(GRANTED);
+            if let Some(mut r) = SHARES.get::<ShareRow>(rec, &pk).await? {
+                "dropping".clone_into(&mut r.state);
+                r.changed_version = version;
+                SHARES.put(rec, &pk, &r).await?;
+            }
         }
         for id in &change.purge_shares {
-            q.exec_drop(
-                format!(
-                    "DELETE FROM {} WHERE share_id = ? AND role = 'granted' AND state = \
-                     'dropping'",
-                    self.t("shares")
-                ),
-                (id,),
-            )
-            .await
-            .map_err(map_err)?;
+            let pk = Pk::new().u64(*id).u8(GRANTED);
+            if SHARES
+                .get::<ShareRow>(rec, &pk)
+                .await?
+                .is_some_and(|r| r.state == "dropping")
+            {
+                SHARES.delete(rec, &pk).await?;
+            }
         }
         for s in &change.upsert_shares {
             let id = if s.id == 0 {
-                self.next_id(q, "shares", "share_id").await?
+                Self::next_id(rec, SHARES).await?
             } else {
                 s.id
             };
@@ -617,108 +507,87 @@ impl InheritStore {
                 ShareTarget::Space(c) => (0, c.0),
                 ShareTarget::Tenant(t) => (t.0, 0),
             };
-            let columns = s
-                .columns
-                .as_ref()
-                .map(|c| serde_json::to_string(c).unwrap_or_else(|_| "[]".into()));
-            q.exec_drop(
-                format!(
-                    "INSERT INTO {} (share_id, role, name, object_id, from_space_id, \
-                     peer_tenant_id, to_space_id, filter_sql, columns, take_filter_sql, reshare, \
-                     merge_mode, version, state, created_by, created_at, changed_version) \
-                     VALUES (?, 'granted', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', \
-                     ?, UTC_TIMESTAMP(6), ?) ON DUPLICATE KEY UPDATE \
-                     filter_sql = VALUES(filter_sql), columns = VALUES(columns), \
-                     merge_mode = VALUES(merge_mode), \
-                     take_filter_sql = VALUES(take_filter_sql), reshare = VALUES(reshare), \
-                     version = VALUES(version), changed_version = VALUES(changed_version)",
-                    self.t("shares")
-                ),
-                mysql_async::Params::Positional(vec![
-                    id.into(),
-                    s.name.as_str().into(),
-                    s.object_id.0.into(),
-                    s.from.0.into(),
-                    peer.into(),
-                    to.into(),
-                    s.filter.as_deref().into(),
-                    columns.into(),
-                    s.take.as_deref().into(),
-                    s.reshare.into(),
-                    s.mode.as_str().into(),
-                    s.version.into(),
-                    s.created_by.into(),
-                    version.into(),
-                ]),
-            )
-            .await
-            .map_err(|e| match &e {
-                mysql_async::Error::Server(x) if x.code == 1062 => SprigError::new(
-                    SprigCode::SpaceExists,
-                    format!("a share named '{}' exists", s.name),
-                ),
-                _ => map_err(e),
-            })?;
+            let pk = Pk::new().u64(id).u8(GRANTED);
+            let row = match SHARES.get::<ShareRow>(rec, &pk).await? {
+                // As `ON DUPLICATE KEY UPDATE`: the definition's columns.
+                Some(mut r) => {
+                    r.filter_sql.clone_from(&s.filter);
+                    r.columns.clone_from(&s.columns);
+                    s.mode.as_str().clone_into(&mut r.merge_mode);
+                    r.take_filter_sql.clone_from(&s.take);
+                    r.reshare = s.reshare;
+                    r.version = s.version;
+                    r.changed_version = version;
+                    r
+                }
+                None => ShareRow {
+                    name: s.name.clone(),
+                    object_id: s.object_id.0,
+                    from_space_id: s.from.0,
+                    peer_tenant_id: peer,
+                    to_space_id: to,
+                    filter_sql: s.filter.clone(),
+                    columns: s.columns.clone(),
+                    take_filter_sql: s.take.clone(),
+                    reshare: s.reshare,
+                    merge_mode: s.mode.as_str().to_owned(),
+                    version: s.version,
+                    state: "active".to_owned(),
+                    created_by: s.created_by,
+                    created_at_ms: now,
+                    changed_version: version,
+                },
+            };
+            SHARES.put(rec, &pk, &row).await?;
         }
         for t in &change.upsert_takes {
-            q.exec_drop(
-                format!(
-                    "INSERT INTO {} (share_id, role, name, object_id, from_space_id, \
-                     peer_tenant_id, to_space_id, take_filter_sql, merge_mode, version, state, \
-                     created_by, created_at, changed_version) VALUES (?, 'received', '', ?, 0, ?, \
-                     ?, ?, 'read_through', 1, 'active', 0, UTC_TIMESTAMP(6), ?) \
-                     ON DUPLICATE KEY UPDATE take_filter_sql = VALUES(take_filter_sql), \
-                     version = version + 1, changed_version = VALUES(changed_version)",
-                    self.t("shares")
-                ),
-                (
-                    t.share_id,
-                    t.object_id.0,
-                    t.peer_tenant.0,
-                    ROOT_SPACE.0,
-                    t.take.as_deref(),
-                    version,
-                ),
-            )
-            .await
-            .map_err(map_err)?;
+            let pk = Pk::new().u64(t.share_id).u8(RECEIVED);
+            let row = match SHARES.get::<ShareRow>(rec, &pk).await? {
+                Some(mut r) => {
+                    r.take_filter_sql.clone_from(&t.take);
+                    r.version += 1;
+                    r.changed_version = version;
+                    r
+                }
+                None => ShareRow {
+                    name: String::new(),
+                    object_id: t.object_id.0,
+                    from_space_id: 0,
+                    peer_tenant_id: t.peer_tenant.0,
+                    to_space_id: ROOT_SPACE.0,
+                    filter_sql: None,
+                    columns: None,
+                    take_filter_sql: t.take.clone(),
+                    reshare: false,
+                    merge_mode: MergeMode::default().as_str().to_owned(),
+                    version: 1,
+                    state: "active".to_owned(),
+                    created_by: 0,
+                    created_at_ms: now,
+                    changed_version: version,
+                },
+            };
+            SHARES.put(rec, &pk, &row).await?;
         }
         for (user, space) in &change.homes {
+            let pk = Pk::new().u32(*user);
             match space {
-                Some(s) => q
-                    .exec_drop(
-                        format!(
-                            "INSERT INTO {} (user_id, space_id, changed_version) VALUES (?, ?, ?) \
-                             ON DUPLICATE KEY UPDATE space_id = VALUES(space_id), \
-                             changed_version = VALUES(changed_version)",
-                            self.t("space_homes")
-                        ),
-                        (user, s.0, version),
-                    )
-                    .await
-                    .map_err(map_err)?,
-                None => q
-                    .exec_drop(
-                        format!("DELETE FROM {} WHERE user_id = ?", self.t("space_homes")),
-                        (user,),
-                    )
-                    .await
-                    .map_err(map_err)?,
+                Some(s) => {
+                    HOMES
+                        .put(
+                            rec,
+                            &pk,
+                            &HomeRow {
+                                space_id: s.0,
+                                changed_version: version,
+                            },
+                        )
+                        .await?;
+                }
+                None => HOMES.delete(rec, &pk).await?,
             }
         }
         Ok(())
-    }
-}
-
-mod erased {
-    //! JSON of the few shapes the module stores.
-    pub(super) trait Ser {
-        fn json(&self) -> String;
-    }
-    impl<T: serde::Serialize> Ser for T {
-        fn json(&self) -> String {
-            serde_json::to_string(self).unwrap_or_else(|_| "null".into())
-        }
     }
 }
 
@@ -757,27 +626,15 @@ impl CatalogExtension for InheritExtension {
         _since: Option<u64>,
         _prev: Option<&Arc<dyn ExtState>>,
     ) -> Result<Arc<dyn ExtState>> {
-        let store = InheritStore::new(tx.schema());
-        let conn = tx.conn();
-        if !store.migrated(conn).await? {
+        if !tx.catalog_records() {
             return Ok(Arc::new(InheritState::unmigrated()));
         }
-        Ok(Arc::new(store.load(conn).await?))
+        let ids = InheritStore::object_ids(tx.records()?).await?;
+        let schema = tx.schema().to_owned();
+        let names = sprig_types::store::object_names(tx.conn(), &schema, &ids).await?;
+        Ok(Arc::new(InheritStore::load(tx.records()?, &names).await?))
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn module_is_well_formed() {
-        Migrator::new(&[INHERIT_MODULE]).unwrap();
-        assert_eq!(INHERIT_MODULE.newest(), 2);
-        for m in INHERIT_MIGRATIONS {
-            for ddl in m.statements {
-                assert!(ddl.starts_with("CREATE TABLE IF NOT EXISTS "));
-            }
-        }
-    }
-}
+mod tests;

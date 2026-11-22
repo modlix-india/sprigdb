@@ -33,6 +33,7 @@
 
 mod alter;
 pub(crate) mod expr;
+pub(crate) mod fkcheck;
 mod lex;
 mod types;
 
@@ -40,6 +41,7 @@ mod types;
 mod tests;
 
 use sprig_common::SprigError;
+use std::fmt::Write as _;
 
 use self::expr::{E, quote_name, quote_str};
 use self::lex::{T, Tok};
@@ -93,6 +95,7 @@ pub(crate) enum Default {
 
 /// One column.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // a column definition's independent attributes
 pub(crate) struct Col {
     pub name: String,
     pub ty: Ty,
@@ -187,12 +190,34 @@ pub(crate) struct Def {
 impl Def {
     /// The column named `n` (case-insensitive).
     pub(crate) fn col(&self, n: &str) -> Option<usize> {
-        self.cols.iter().position(|c| c.name.eq_ignore_ascii_case(n))
+        self.cols
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(n))
+    }
+
+    /// The key both servers treat as the primary key: `PRIMARY KEY`, or,
+    /// without one, the first unique key whose parts are whole `NOT NULL`
+    /// columns (its columns report `PRI`).
+    pub(crate) fn primary(&self) -> Option<&Key> {
+        self.keys
+            .iter()
+            .find(|k| k.kind == KeyKind::Primary)
+            .or_else(|| {
+                self.keys.iter().find(|k| {
+                    k.kind == KeyKind::Unique
+                        && k.parts.iter().all(|p| {
+                            p.len.is_none()
+                                && self.col(&p.col).is_some_and(|i| self.cols[i].not_null)
+                        })
+                })
+            })
     }
 
     /// The key named `n` (case-insensitive).
     pub(crate) fn key(&self, n: &str) -> Option<usize> {
-        self.keys.iter().position(|k| k.name.eq_ignore_ascii_case(n))
+        self.keys
+            .iter()
+            .position(|k| k.name.eq_ignore_ascii_case(n))
     }
 }
 
@@ -265,7 +290,11 @@ impl P<'_> {
         }
     }
     pub(crate) fn want(&mut self, w: &str) -> Result<(), Fail> {
-        if self.eat(w) { Ok(()) } else { Err(Fail::Syntax(self.i)) }
+        if self.eat(w) {
+            Ok(())
+        } else {
+            Err(Fail::Syntax(self.i))
+        }
     }
     pub(crate) fn op(&self, o: &str) -> bool {
         self.peek().is_some_and(|t| t.op(o))
@@ -279,7 +308,11 @@ impl P<'_> {
         }
     }
     pub(crate) fn want_op(&mut self, o: &str) -> Result<(), Fail> {
-        if self.eat_op(o) { Ok(()) } else { Err(Fail::Syntax(self.i)) }
+        if self.eat_op(o) {
+            Ok(())
+        } else {
+            Err(Fail::Syntax(self.i))
+        }
     }
     /// An identifier: back-quoted, or a bare word that isn't reserved here.
     pub(crate) fn ident(&mut self) -> Result<String, Fail> {
@@ -330,10 +363,18 @@ impl P<'_> {
     }
     /// An expression (in a definition).
     pub(crate) fn expr(&mut self, charset: &str) -> Result<E, Fail> {
-        let mut r = expr::Reader { t: self.t, i: self.i, charset };
+        let mut r = expr::Reader {
+            t: self.t,
+            i: self.i,
+            charset,
+        };
         let e = r.expr().map_err(|b| match b {
             expr::Bad::Syntax(at) => Fail::Syntax(at),
-            expr::Bad::Subquery => err(1970, "42000", "CHECK does not support subqueries or stored functions"),
+            expr::Bad::Subquery => err(
+                1970,
+                "42000",
+                "CHECK does not support subqueries or stored functions",
+            ),
             expr::Bad::Variable => Fail::Syntax(r.i.saturating_sub(1)),
         })?;
         self.i = r.i;
@@ -351,11 +392,50 @@ impl P<'_> {
 /// Words that can't be a bare name in a definition.
 fn reserved(w: &str) -> bool {
     const R: [&str; 44] = [
-        "ADD", "ALTER", "AND", "AS", "BETWEEN", "BY", "CHECK", "COLLATE", "COLUMN", "CONSTRAINT",
-        "CREATE", "DEFAULT", "DELETE", "DESC", "DROP", "EXISTS", "FOREIGN", "FROM", "FULLTEXT", "IF",
-        "IN", "INDEX", "IS", "KEY", "LIKE", "NOT", "NULL", "ON", "OR", "PRIMARY", "REFERENCES",
-        "RENAME", "SELECT", "SET", "SPATIAL", "TABLE", "TO", "UNIQUE", "UPDATE", "USING", "WHERE",
-        "WITH", "CHANGE", "ORDER",
+        "ADD",
+        "ALTER",
+        "AND",
+        "AS",
+        "BETWEEN",
+        "BY",
+        "CHECK",
+        "COLLATE",
+        "COLUMN",
+        "CONSTRAINT",
+        "CREATE",
+        "DEFAULT",
+        "DELETE",
+        "DESC",
+        "DROP",
+        "EXISTS",
+        "FOREIGN",
+        "FROM",
+        "FULLTEXT",
+        "IF",
+        "IN",
+        "INDEX",
+        "IS",
+        "KEY",
+        "LIKE",
+        "NOT",
+        "NULL",
+        "ON",
+        "OR",
+        "PRIMARY",
+        "REFERENCES",
+        "RENAME",
+        "SELECT",
+        "SET",
+        "SPATIAL",
+        "TABLE",
+        "TO",
+        "UNIQUE",
+        "UPDATE",
+        "USING",
+        "WHERE",
+        "WITH",
+        "CHANGE",
+        "ORDER",
     ];
     R.iter().any(|r| r.eq_ignore_ascii_case(w))
 }
@@ -441,7 +521,11 @@ fn end(p: &P<'_>) -> Result<(), Fail> {
     while p.t.get(i).is_some_and(|t| t.op(";")) {
         i += 1;
     }
-    if i < p.t.len() { Err(Fail::Syntax(i)) } else { Ok(()) }
+    if i < p.t.len() {
+        Err(Fail::Syntax(i))
+    } else {
+        Ok(())
+    }
 }
 
 /// A definition as read, before it is normalized.
@@ -466,6 +550,7 @@ pub(crate) struct RawCol {
     /// `NULL` / `NOT NULL` was written.
     pub null_said: Option<bool>,
     /// `FIRST` / `AFTER x` (ALTER).
+    #[allow(clippy::option_option)] // no place, `FIRST`, or `AFTER x`
     pub place: Option<Option<String>>,
 }
 
@@ -483,12 +568,13 @@ pub(crate) struct Opts {
 }
 
 /// One element of a `CREATE TABLE` list.
+#[allow(clippy::too_many_lines)] // one branch per element kind
 pub(crate) fn element(p: &mut P<'_>, raw: &mut Raw, cs: &str) -> Result<(), Fail> {
     let mut cname: Option<String> = None;
-    if p.eat("CONSTRAINT") {
-        if !(p.is("PRIMARY") || p.is("UNIQUE") || p.is("FOREIGN") || p.is("CHECK")) {
-            cname = Some(p.ident()?);
-        }
+    if p.eat("CONSTRAINT")
+        && !(p.is("PRIMARY") || p.is("UNIQUE") || p.is("FOREIGN") || p.is("CHECK"))
+    {
+        cname = Some(p.ident()?);
     }
     if p.eat("PRIMARY") {
         p.want("KEY")?;
@@ -575,7 +661,11 @@ pub(crate) fn element(p: &mut P<'_>, raw: &mut Raw, cs: &str) -> Result<(), Fail
         return Ok(());
     }
     if p.is("FULLTEXT") || p.is("SPATIAL") {
-        let kind = if p.is("FULLTEXT") { KeyKind::Fulltext } else { KeyKind::Spatial };
+        let kind = if p.is("FULLTEXT") {
+            KeyKind::Fulltext
+        } else {
+            KeyKind::Spatial
+        };
         p.i += 1;
         if !p.eat("KEY") {
             p.eat("INDEX");
@@ -604,7 +694,14 @@ fn name_list(p: &mut P<'_>) -> Result<Vec<String>, Fail> {
 
 /// `[name] [USING x] (parts) [options]`.
 pub(crate) fn key_body(p: &mut P<'_>, kind: KeyKind, named: bool) -> Result<Key, Fail> {
-    let mut k = Key { kind, name: String::new(), parts: Vec::new(), using: None, comment: None, ignored: false };
+    let mut k = Key {
+        kind,
+        name: String::new(),
+        parts: Vec::new(),
+        using: None,
+        comment: None,
+        ignored: false,
+    };
     if named && !p.op("(") && !p.is("USING") {
         k.name = p.ident()?;
     } else if !named && !p.op("(") && !p.is("USING") {
@@ -805,12 +902,18 @@ fn gen_kind(p: &mut P<'_>, c: &mut RawCol) {
 
 fn generated_expr(p: &mut P<'_>, cs: &str) -> Result<E, Fail> {
     p.want_op("(")?;
-    let mut r = expr::Reader { t: p.t, i: p.i, charset: cs };
+    let mut r = expr::Reader {
+        t: p.t,
+        i: p.i,
+        charset: cs,
+    };
     let e = r.expr().map_err(|b| match b {
         expr::Bad::Syntax(at) => Fail::Syntax(at),
-        expr::Bad::Subquery | expr::Bad::Variable => {
-            err(1901, "HY000", "Function or expression 'select ...' cannot be used in the GENERATED ALWAYS AS clause")
-        }
+        expr::Bad::Subquery | expr::Bad::Variable => err(
+            1901,
+            "HY000",
+            "Function or expression 'select ...' cannot be used in the GENERATED ALWAYS AS clause",
+        ),
     })?;
     p.i = r.i;
     p.want_op(")")?;
@@ -916,7 +1019,9 @@ pub(crate) fn table_options(p: &mut P<'_>, o: &mut Opts) -> Result<(), Fail> {
         if p.eat("ENGINE") || p.eat("TYPE") {
             p.eat_op("=");
             o.engine = Some(name_or_string(p)?);
-        } else if p.is("DEFAULT") && (p.is_at(1, "CHARSET") || p.is_at(1, "CHARACTER") || p.is_at(1, "COLLATE")) {
+        } else if p.is("DEFAULT")
+            && (p.is_at(1, "CHARSET") || p.is_at(1, "CHARACTER") || p.is_at(1, "COLLATE"))
+        {
             p.i += 1;
         } else if p.eat("CHARSET") || (p.is("CHARACTER") && p.is_at(1, "SET")) {
             if p.is("CHARACTER") {
@@ -947,7 +1052,26 @@ pub(crate) fn table_options(p: &mut P<'_>, o: &mut Opts) -> Result<(), Fail> {
             };
             p.i += 1;
             o.stats_persistent = Some(v);
-        } else if p.is("DATA") || p.is("INDEX") && p.is_at(1, "DIRECTORY") || p.is("ENCRYPTED") || p.is("PAGE_COMPRESSED") || p.is("MAX_ROWS") || p.is("MIN_ROWS") || p.is("AVG_ROW_LENGTH") || p.is("CHECKSUM") || p.is("PACK_KEYS") || p.is("DELAY_KEY_WRITE") || p.is("STATS_AUTO_RECALC") || p.is("STATS_SAMPLE_PAGES") || p.is("TRANSACTIONAL") || p.is("UNION") || p.is("INSERT_METHOD") || p.is("WITH") || p.is("TABLESPACE") || p.is("COMPRESSION") || p.is("SEQUENCE") {
+        } else if p.is("DATA")
+            || p.is("INDEX") && p.is_at(1, "DIRECTORY")
+            || p.is("ENCRYPTED")
+            || p.is("PAGE_COMPRESSED")
+            || p.is("MAX_ROWS")
+            || p.is("MIN_ROWS")
+            || p.is("AVG_ROW_LENGTH")
+            || p.is("CHECKSUM")
+            || p.is("PACK_KEYS")
+            || p.is("DELAY_KEY_WRITE")
+            || p.is("STATS_AUTO_RECALC")
+            || p.is("STATS_SAMPLE_PAGES")
+            || p.is("TRANSACTIONAL")
+            || p.is("UNION")
+            || p.is("INSERT_METHOD")
+            || p.is("WITH")
+            || p.is("TABLESPACE")
+            || p.is("COMPRESSION")
+            || p.is("SEQUENCE")
+        {
             return Err(refuse("this table option"));
         } else {
             return Ok(());
@@ -957,7 +1081,13 @@ pub(crate) fn table_options(p: &mut P<'_>, o: &mut Opts) -> Result<(), Fail> {
 
 /// Normalizes a definition as read (see the module docs).
 pub(crate) fn finish(name: String, raw: Raw, cx: &Ctx) -> Result<Def, Fail> {
-    let Raw { cols: rcols, keys: rkeys, fks, checks: rchecks, opts } = raw;
+    let Raw {
+        cols: rcols,
+        keys: rkeys,
+        fks,
+        checks: rchecks,
+        opts,
+    } = raw;
     let cs = table_cs(&opts, &cx.db_cs)?;
     if let Some(e) = &opts.engine
         && !e.eq_ignore_ascii_case("InnoDB")
@@ -997,7 +1127,11 @@ pub(crate) fn finish(name: String, raw: Raw, cx: &Ctx) -> Result<Def, Fail> {
 
 /// The table's character set and collation.
 fn table_cs(o: &Opts, db: &(String, String)) -> Result<(String, String), Fail> {
-    let spec = CsSpec { charset: o.charset.clone(), collate: o.collate.clone(), ..CsSpec::default() };
+    let spec = CsSpec {
+        charset: o.charset.clone(),
+        collate: o.collate.clone(),
+        ..CsSpec::default()
+    };
     if spec.charset.is_none() && spec.collate.is_none() {
         return Ok(db.clone());
     }
@@ -1007,10 +1141,27 @@ fn table_cs(o: &Opts, db: &(String, String)) -> Result<(String, String), Fail> {
 
 /// Adds a column read from a definition (at `place` for `ALTER`), with
 /// the keys it declares on itself.
-pub(crate) fn add_column(def: &mut Def, rc: RawCol, keys: &mut Vec<Key>, place: Option<Option<&str>>) -> Result<(), Fail> {
-    let RawCol { mut col, cs, primary, unique, null_said, .. } = rc;
+#[allow(clippy::too_many_lines, clippy::option_option)] // the column rules in order; no place, `FIRST`, or `AFTER x`
+pub(crate) fn add_column(
+    def: &mut Def,
+    rc: RawCol,
+    keys: &mut Vec<Key>,
+    place: Option<Option<&str>>,
+) -> Result<(), Fail> {
+    let RawCol {
+        mut col,
+        cs,
+        primary,
+        unique,
+        null_said,
+        ..
+    } = rc;
     if def.col(&col.name).is_some() {
-        return Err(err(1060, "42S21", format!("Duplicate column name '{}'", col.name)));
+        return Err(err(
+            1060,
+            "42S21",
+            format!("Duplicate column name '{}'", col.name),
+        ));
     }
     if col.name.is_empty() {
         return Err(err(1166, "42000", "Incorrect column name ''"));
@@ -1039,7 +1190,14 @@ pub(crate) fn add_column(def: &mut Def, rc: RawCol, keys: &mut Vec<Key>, place: 
         if col.ty.base == "varchar" {
             let max = 65532 / col.ty.mbmax().max(1);
             if col.ty.len > max {
-                return Err(err(1074, "42000", format!("Column length too big for column '{}' (max = {max}); use BLOB or TEXT instead", col.name)));
+                return Err(err(
+                    1074,
+                    "42000",
+                    format!(
+                        "Column length too big for column '{}' (max = {max}); use BLOB or TEXT instead",
+                        col.name
+                    ),
+                ));
             }
         }
         // Members of an ENUM / SET may not repeat (compared in the
@@ -1047,11 +1205,25 @@ pub(crate) fn add_column(def: &mut Def, rc: RawCol, keys: &mut Vec<Key>, place: 
         if matches!(col.ty.base.as_str(), "enum" | "set") {
             let ci = col.ty.cs.as_ref().is_some_and(|(_, co)| co.contains("_ci"));
             for (k, m) in col.ty.members.iter().enumerate() {
-                let dup = col.ty.members[..k].iter().find(|x| if ci { x.eq_ignore_ascii_case(m) } else { *x == m });
+                let dup = col.ty.members[..k].iter().find(|x| {
+                    if ci {
+                        x.eq_ignore_ascii_case(m)
+                    } else {
+                        *x == m
+                    }
+                });
                 if let Some(m) = dup {
                     let what = if col.ty.base == "enum" { "ENUM" } else { "SET" };
-                    let (code, state) = if col.ty.base == "enum" { (1291, "HY000") } else { (1097, "HY000") };
-                    return Err(err(code, state, format!("Column '{}' has duplicated value '{m}' in {what}", col.name)));
+                    let (code, state) = if col.ty.base == "enum" {
+                        (1291, "HY000")
+                    } else {
+                        (1097, "HY000")
+                    };
+                    return Err(err(
+                        code,
+                        state,
+                        format!("Column '{}' has duplicated value '{m}' in {what}", col.name),
+                    ));
                 }
             }
         }
@@ -1059,7 +1231,18 @@ pub(crate) fn add_column(def: &mut Def, rc: RawCol, keys: &mut Vec<Key>, place: 
     if col.ty.serial {
         col.not_null = true;
         col.auto_inc = true;
-        keys.push(Key { kind: KeyKind::Unique, name: String::new(), parts: vec![Part { col: col.name.clone(), len: None, desc: false }], using: None, comment: None, ignored: false });
+        keys.push(Key {
+            kind: KeyKind::Unique,
+            name: String::new(),
+            parts: vec![Part {
+                col: col.name.clone(),
+                len: None,
+                desc: false,
+            }],
+            using: None,
+            comment: None,
+            ignored: false,
+        });
     }
     match null_said {
         Some(false) => col.not_null = true,
@@ -1076,18 +1259,50 @@ pub(crate) fn add_column(def: &mut Def, rc: RawCol, keys: &mut Vec<Key>, place: 
         });
     }
     if primary && matches!(col.default, Some(Default::Null)) {
-        return Err(err(1067, "42000", format!("Invalid default value for '{}'", col.name)));
+        return Err(err(
+            1067,
+            "42000",
+            format!("Invalid default value for '{}'", col.name),
+        ));
     }
     if primary {
-        keys.push(Key { kind: KeyKind::Primary, name: "PRIMARY".into(), parts: vec![Part { col: col.name.clone(), len: None, desc: false }], using: None, comment: None, ignored: false });
+        keys.push(Key {
+            kind: KeyKind::Primary,
+            name: "PRIMARY".into(),
+            parts: vec![Part {
+                col: col.name.clone(),
+                len: None,
+                desc: false,
+            }],
+            using: None,
+            comment: None,
+            ignored: false,
+        });
     }
     if unique {
-        keys.push(Key { kind: KeyKind::Unique, name: String::new(), parts: vec![Part { col: col.name.clone(), len: None, desc: false }], using: None, comment: None, ignored: false });
+        keys.push(Key {
+            kind: KeyKind::Unique,
+            name: String::new(),
+            parts: vec![Part {
+                col: col.name.clone(),
+                len: None,
+                desc: false,
+            }],
+            using: None,
+            comment: None,
+            ignored: false,
+        });
     }
     let at = match place {
         None => def.cols.len(),
         Some(None) => 0,
-        Some(Some(after)) => def.col(after).map(|k| k + 1).ok_or_else(|| err(1054, "42S22", format!("Unknown column '{after}' in '{}'", def.name)))?,
+        Some(Some(after)) => def.col(after).map(|k| k + 1).ok_or_else(|| {
+            err(
+                1054,
+                "42S22",
+                format!("Unknown column '{after}' in '{}'", def.name),
+            )
+        })?,
     };
     def.cols.insert(at, col);
     Ok(())
@@ -1100,7 +1315,11 @@ pub(crate) fn add_key(def: &mut Def, mut k: Key) -> Result<(), Fail> {
     }
     for part in &mut k.parts {
         let Some(ci) = def.col(&part.col) else {
-            return Err(err(1072, "42000", format!("Key column '{}' doesn't exist in table", part.col)));
+            return Err(err(
+                1072,
+                "42000",
+                format!("Key column '{}' doesn't exist in table", part.col),
+            ));
         };
         part.col.clone_from(&def.cols[ci].name);
     }
@@ -1110,7 +1329,11 @@ pub(crate) fn add_key(def: &mut Def, mut k: Key) -> Result<(), Fail> {
             if let Some(ci) = def.col(&part.col) {
                 let c = &mut def.cols[ci];
                 if c.generated.as_ref().is_some_and(|g| !g.1) {
-                    return Err(err(1903, "HY000", "Primary key cannot be defined upon a generated column"));
+                    return Err(err(
+                        1903,
+                        "HY000",
+                        "Primary key cannot be defined upon a generated column",
+                    ));
                 }
                 c.not_null = true;
                 // A key column's `DEFAULT NULL` goes with its NULLs.
@@ -1129,9 +1352,17 @@ pub(crate) fn add_key(def: &mut Def, mut k: Key) -> Result<(), Fail> {
         }
         k.name = name;
     } else if k.name.eq_ignore_ascii_case("PRIMARY") {
-        return Err(err(1280, "42000", format!("Incorrect index name '{}'", k.name)));
+        return Err(err(
+            1280,
+            "42000",
+            format!("Incorrect index name '{}'", k.name),
+        ));
     } else if def.key(&k.name).is_some() {
-        return Err(err(1061, "42000", format!("Duplicate key name '{}'", k.name)));
+        return Err(err(
+            1061,
+            "42000",
+            format!("Duplicate key name '{}'", k.name),
+        ));
     }
     def.keys.push(k);
     Ok(())
@@ -1141,12 +1372,27 @@ pub(crate) fn add_key(def: &mut Def, mut k: Key) -> Result<(), Fail> {
 pub(crate) fn add_fk(def: &mut Def, mut f: Fk) -> Result<(), Fail> {
     for c in &mut f.cols {
         let Some(ci) = def.col(c) else {
-            return Err(err(1072, "42000", format!("Key column '{c}' doesn't exist in table")));
+            return Err(err(
+                1072,
+                "42000",
+                format!("Key column '{c}' doesn't exist in table"),
+            ));
         };
         c.clone_from(&def.cols[ci].name);
     }
     if f.cols.len() != f.ref_cols.len() {
-        return Err(err(1239, "42000", format!("Incorrect foreign key definition for '{}': Key reference and table reference don't match", if f.name.is_empty() { "foreign key without name" } else { &f.name })));
+        return Err(err(
+            1239,
+            "42000",
+            format!(
+                "Incorrect foreign key definition for '{}': Key reference and table reference don't match",
+                if f.name.is_empty() {
+                    "foreign key without name"
+                } else {
+                    &f.name
+                }
+            ),
+        ));
     }
     let explicit = !f.name.is_empty();
     if !explicit {
@@ -1160,19 +1406,62 @@ pub(crate) fn add_fk(def: &mut Def, mut f: Fk) -> Result<(), Fail> {
             n += 1;
         }
     } else if def.fks.iter().any(|x| x.name.eq_ignore_ascii_case(&f.name)) {
-        return Err(err(1826, "HY000", format!("Duplicate FOREIGN KEY constraint name '{}'", f.name)));
+        return Err(err(
+            1826,
+            "HY000",
+            format!("Duplicate FOREIGN KEY constraint name '{}'", f.name),
+        ));
     }
     // An index whose first columns are the foreign key's.
     let covered = def.keys.iter().any(|k| {
         k.kind != KeyKind::Fulltext
             && k.parts.len() >= f.cols.len()
-            && k.parts.iter().zip(&f.cols).all(|(p, c)| p.col.eq_ignore_ascii_case(c) && p.len.is_none())
+            && k.parts
+                .iter()
+                .zip(&f.cols)
+                .all(|(p, c)| p.col.eq_ignore_ascii_case(c) && p.len.is_none())
     });
+    // An index made for another foreign key on the same columns (named
+    // after it) is made again for the new key, under its name, as both
+    // servers do.
+    if covered && explicit && def.key(&f.name).is_none() {
+        let made_for_fk = def.keys.iter().position(|k| {
+            k.kind == KeyKind::Plain
+                && k.parts.len() == f.cols.len()
+                && k.parts
+                    .iter()
+                    .zip(&f.cols)
+                    .all(|(p, c)| p.col.eq_ignore_ascii_case(c) && p.len.is_none())
+                && def.fks.iter().any(|o| {
+                    o.name.eq_ignore_ascii_case(&k.name)
+                        && o.cols.len() == k.parts.len()
+                        && o.cols
+                            .iter()
+                            .zip(&k.parts)
+                            .all(|(c, p)| c.eq_ignore_ascii_case(&p.col))
+                })
+        });
+        if let Some(i) = made_for_fk {
+            def.keys[i].name.clone_from(&f.name);
+        }
+    }
     if !covered {
         let k = Key {
             kind: KeyKind::Plain,
-            name: if explicit && def.key(&f.name).is_none() { f.name.clone() } else { String::new() },
-            parts: f.cols.iter().map(|c| Part { col: c.clone(), len: None, desc: false }).collect(),
+            name: if explicit && def.key(&f.name).is_none() {
+                f.name.clone()
+            } else {
+                String::new()
+            },
+            parts: f
+                .cols
+                .iter()
+                .map(|c| Part {
+                    col: c.clone(),
+                    len: None,
+                    desc: false,
+                })
+                .collect(),
             using: None,
             comment: None,
             ignored: false,
@@ -1185,29 +1474,38 @@ pub(crate) fn add_fk(def: &mut Def, mut f: Fk) -> Result<(), Fail> {
 
 /// Adds a table check, naming it if unnamed.
 pub(crate) fn add_check(def: &mut Def, name: Option<String>, e: E) -> Result<(), Fail> {
-    let name = match name {
-        Some(n) => {
-            if def.checks.iter().any(|c| c.name.eq_ignore_ascii_case(&n)) {
-                return Err(err(1826, "HY000", format!("Duplicate CHECK constraint name '{n}'")));
-            }
-            n
+    let name = if let Some(n) = name {
+        if def.checks.iter().any(|c| c.name.eq_ignore_ascii_case(&n)) {
+            return Err(err(
+                1826,
+                "HY000",
+                format!("Duplicate CHECK constraint name '{n}'"),
+            ));
         }
-        None => {
-            let mut k = 1;
-            loop {
-                let cand = format!("CONSTRAINT_{k}");
-                if !def.checks.iter().any(|c| c.name.eq_ignore_ascii_case(&cand)) {
-                    break cand;
-                }
-                k += 1;
+        n
+    } else {
+        let mut k = 1;
+        loop {
+            let cand = format!("CONSTRAINT_{k}");
+            if !def
+                .checks
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(&cand))
+            {
+                break cand;
             }
+            k += 1;
         }
     };
     let mut used = Vec::new();
     expr::columns(&e, &mut used);
     for u in &used {
         if def.col(u).is_none() {
-            return Err(err(1054, "42S22", format!("Unknown column '{u}' in 'CHECK'")));
+            return Err(err(
+                1054,
+                "42S22",
+                format!("Unknown column '{u}' in 'CHECK'"),
+            ));
         }
     }
     def.checks.push(Check { name, expr: e });
@@ -1217,35 +1515,70 @@ pub(crate) fn add_check(def: &mut Def, name: Option<String>, e: E) -> Result<(),
 /// The checks every finished definition passes, and the server's
 /// rewrites that depend on the whole table: key prefixes, the order of
 /// keys, `AUTO_INCREMENT` rules, defaults in each column's form.
+#[allow(clippy::too_many_lines)] // the rules in the order the servers apply them
 pub(crate) fn settle(def: &mut Def, cx: &Ctx) -> Result<(), Fail> {
     if def.cols.iter().all(|c| c.invisible) {
-        return Err(err(1113, "42000", "A table must have at least 1 column"));
+        return Err(if cx.mysql {
+            err(
+                4028,
+                "HY000",
+                "A table must have at least one visible column.",
+            )
+        } else {
+            err(1113, "42000", "A table must have at least 1 column")
+        });
     }
     // Keys: prefixes and lengths.
     for k in &mut def.keys {
         for part in &mut k.parts {
-            let Some(ci) = def.cols.iter().position(|c| c.name.eq_ignore_ascii_case(&part.col)) else {
-                return Err(err(1072, "42000", format!("Key column '{}' doesn't exist in table", part.col)));
+            let Some(ci) = def
+                .cols
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(&part.col))
+            else {
+                return Err(err(
+                    1072,
+                    "42000",
+                    format!("Key column '{}' doesn't exist in table", part.col),
+                ));
             };
             let c = &def.cols[ci];
             if let Some(len) = part.len {
                 let full = if c.ty.is_lob() { u32::MAX } else { c.ty.len };
                 if !c.ty.prefixable() || len > full || len == 0 {
-                    return Err(err(1089, "HY000", "Incorrect prefix key; the used key part isn't a string, the used length is longer than the key part, or the storage engine doesn't support unique prefix keys"));
+                    return Err(err(
+                        1089,
+                        "HY000",
+                        "Incorrect prefix key; the used key part isn't a string, the used length is longer than the key part, or the storage engine doesn't support unique prefix keys",
+                    ));
                 }
                 if len == c.ty.len && !c.ty.is_lob() {
                     // A prefix as long as the column is the whole column.
                     part.len = None;
                 }
-            } else if k.kind != KeyKind::Fulltext && (c.ty.is_lob() || c.ty.len.saturating_mul(c.ty.mbmax()) > 3072) && c.ty.prefixable() {
+            } else if k.kind != KeyKind::Fulltext
+                && (c.ty.is_lob() || c.ty.len.saturating_mul(c.ty.mbmax()) > 3072)
+                && c.ty.prefixable()
+            {
                 if k.kind == KeyKind::Plain {
                     part.len = Some(3072 / c.ty.mbmax().max(1));
                 } else if c.ty.is_lob() && k.kind != KeyKind::Primary {
                     return Err(refuse("a unique key on a whole BLOB or TEXT column"));
                 } else if c.ty.is_lob() {
-                    return Err(err(1170, "42000", format!("BLOB/TEXT column '{}' used in key specification without a key length", c.name)));
+                    return Err(err(
+                        1170,
+                        "42000",
+                        format!(
+                            "BLOB/TEXT column '{}' used in key specification without a key length",
+                            c.name
+                        ),
+                    ));
                 } else {
-                    return Err(err(1071, "42000", "Specified key was too long; max key length is 3072 bytes"));
+                    return Err(err(
+                        1071,
+                        "42000",
+                        "Specified key was too long; max key length is 3072 bytes",
+                    ));
                 }
             }
         }
@@ -1254,22 +1587,43 @@ pub(crate) fn settle(def: &mut Def, cx: &Ctx) -> Result<(), Fail> {
         }
     }
     // AUTO_INCREMENT: one column, numeric, first in some key, NOT NULL.
-    let autos: Vec<usize> = (0..def.cols.len()).filter(|&i| def.cols[i].auto_inc).collect();
+    let autos: Vec<usize> = (0..def.cols.len())
+        .filter(|&i| def.cols[i].auto_inc)
+        .collect();
     for &a in &autos {
         let c = &def.cols[a];
         if !c.ty.is_numeric() {
-            return Err(err(1063, "42000", format!("Incorrect column specifier for column '{}'", c.name)));
+            return Err(err(
+                1063,
+                "42000",
+                format!("Incorrect column specifier for column '{}'", c.name),
+            ));
         }
-        if c.default.as_ref().is_some_and(|d| !matches!(d, Default::Null)) {
-            return Err(err(1067, "42000", format!("Invalid default value for '{}'", c.name)));
+        if c.default
+            .as_ref()
+            .is_some_and(|d| !matches!(d, Default::Null))
+        {
+            return Err(err(
+                1067,
+                "42000",
+                format!("Invalid default value for '{}'", c.name),
+            ));
         }
     }
     if autos.len() > 1
         || autos.first().is_some_and(|&a| {
-            !def.keys.iter().any(|k| k.parts.first().is_some_and(|p| p.col.eq_ignore_ascii_case(&def.cols[a].name)))
+            !def.keys.iter().any(|k| {
+                k.parts
+                    .first()
+                    .is_some_and(|p| p.col.eq_ignore_ascii_case(&def.cols[a].name))
+            })
         })
     {
-        return Err(err(1075, "42000", "Incorrect table definition; there can be only one auto column and it must be defined as a key"));
+        return Err(err(
+            1075,
+            "42000",
+            "Incorrect table definition; there can be only one auto column and it must be defined as a key",
+        ));
     }
     for &a in &autos {
         def.cols[a].not_null = true;
@@ -1282,7 +1636,11 @@ pub(crate) fn settle(def: &mut Def, cx: &Ctx) -> Result<(), Fail> {
             expr::columns(g, &mut used);
             for u in used {
                 if def.col(&u).is_none() {
-                    return Err(err(1054, "42S22", format!("Unknown column '{u}' in 'GENERATED ALWAYS AS'")));
+                    return Err(err(
+                        1054,
+                        "42S22",
+                        format!("Unknown column '{u}' in 'GENERATED ALWAYS AS'"),
+                    ));
                 }
             }
         }
@@ -1291,7 +1649,11 @@ pub(crate) fn settle(def: &mut Def, cx: &Ctx) -> Result<(), Fail> {
             expr::columns(ch, &mut used);
             for u in used {
                 if def.col(&u).is_none() {
-                    return Err(err(1054, "42S22", format!("Unknown column '{u}' in 'CHECK'")));
+                    return Err(err(
+                        1054,
+                        "42S22",
+                        format!("Unknown column '{u}' in 'CHECK'"),
+                    ));
                 }
             }
         }
@@ -1300,7 +1662,11 @@ pub(crate) fn settle(def: &mut Def, cx: &Ctx) -> Result<(), Fail> {
             expr::columns(e, &mut used);
             for u in used {
                 if def.col(&u).is_none() {
-                    return Err(err(1054, "42S22", format!("Unknown column '{u}' in 'DEFAULT'")));
+                    return Err(err(
+                        1054,
+                        "42S22",
+                        format!("Unknown column '{u}' in 'DEFAULT'"),
+                    ));
                 }
             }
         }
@@ -1316,7 +1682,9 @@ pub(crate) fn settle(def: &mut Def, cx: &Ctx) -> Result<(), Fail> {
 /// The order the servers list keys in.
 fn sort_keys(def: &mut Def) {
     let nullable = |def: &Def, k: &Key| {
-        k.parts.iter().any(|p| def.col(&p.col).is_some_and(|ci| !def.cols[ci].not_null))
+        k.parts
+            .iter()
+            .any(|p| def.col(&p.col).is_some_and(|ci| !def.cols[ci].not_null))
     };
     let rank = |def: &Def, k: &Key| -> u8 {
         match k.kind {
@@ -1347,7 +1715,13 @@ fn sort_keys(def: &mut Def) {
 /// can't hold it).
 fn normalize_default(def: &mut Def, i: usize, cx: &Ctx) -> Result<(), Fail> {
     let c = &def.cols[i];
-    let invalid = || err(1067, "42000", format!("Invalid default value for '{}'", c.name));
+    let invalid = || {
+        err(
+            1067,
+            "42000",
+            format!("Invalid default value for '{}'", c.name),
+        )
+    };
     match &c.default {
         Some(Default::Null) if c.not_null => return Err(invalid()),
         Some(Default::Null) if c.ty.base == "timestamp" => {}
@@ -1355,14 +1729,25 @@ fn normalize_default(def: &mut Def, i: usize, cx: &Ctx) -> Result<(), Fail> {
             if !matches!(c.ty.base.as_str(), "datetime" | "timestamp") {
                 return Err(invalid());
             }
-            let fsp: u8 = c.ty.args.trim_matches(|ch| ch == '(' || ch == ')').parse().unwrap_or(0);
+            let fsp: u8 =
+                c.ty.args
+                    .trim_matches(|ch| ch == '(' || ch == ')')
+                    .parse()
+                    .unwrap_or(0);
             if *p > fsp {
                 return Err(invalid());
             }
         }
         Some(Default::Raw(e)) => {
             if c.ty.is_lob() && cx.mysql {
-                return Err(err(1101, "42000", format!("BLOB, TEXT, GEOMETRY or JSON column '{}' can't have a default value", c.name)));
+                return Err(err(
+                    1101,
+                    "42000",
+                    format!(
+                        "BLOB, TEXT, GEOMETRY or JSON column '{}' can't have a default value",
+                        c.name
+                    ),
+                ));
             }
             let lit = literal_default(def, i, e).ok_or_else(invalid)?;
             def.cols[i].default = Some(Default::Lit(lit));
@@ -1372,7 +1757,11 @@ fn normalize_default(def: &mut Def, i: usize, cx: &Ctx) -> Result<(), Fail> {
     if let Some(p) = def.cols[i].on_update {
         let c = &def.cols[i];
         if !matches!(c.ty.base.as_str(), "datetime" | "timestamp") {
-            return Err(err(1294, "HY000", format!("Invalid ON UPDATE clause for '{}' column", c.name)));
+            return Err(err(
+                1294,
+                "HY000",
+                format!("Invalid ON UPDATE clause for '{}' column", c.name),
+            ));
         }
         let _ = p;
     }
@@ -1407,7 +1796,11 @@ fn literal_default(def: &Def, i: usize, e: &E) -> Option<String> {
     let mut one = def.clone();
     // The engine serves tables with a primary key: give the probe one.
     let mut key_col = c.clone();
-    key_col.name = if c.name == "k" { "kk".into() } else { "k".into() };
+    key_col.name = if c.name == "k" {
+        "kk".into()
+    } else {
+        "k".into()
+    };
     key_col.ty = types_int();
     key_col.not_null = true;
     key_col.default = None;
@@ -1415,20 +1808,42 @@ fn literal_default(def: &Def, i: usize, e: &E) -> Option<String> {
     key_col.generated = None;
     key_col.comment = None;
     key_col.invisible = false;
-    one.cols = vec![key_col.clone(), Col { default: None, check: None, generated: None, auto_inc: false, not_null: false, ..c.clone() }];
+    one.cols = vec![
+        key_col.clone(),
+        Col {
+            default: None,
+            check: None,
+            generated: None,
+            auto_inc: false,
+            not_null: false,
+            ..c.clone()
+        },
+    ];
     one.keys.clear();
-    one.keys.push(Key { kind: KeyKind::Primary, name: "PRIMARY".into(), parts: vec![Part { col: key_col.name.clone(), len: None, desc: false }], using: None, comment: None, ignored: false });
+    one.keys.push(Key {
+        kind: KeyKind::Primary,
+        name: "PRIMARY".into(),
+        parts: vec![Part {
+            col: key_col.name.clone(),
+            len: None,
+            desc: false,
+        }],
+        using: None,
+        comment: None,
+        ignored: false,
+    });
     one.fks.clear();
     one.checks.clear();
     let text = render(&one);
-    let parsed = super::table::parse(sprig_common::ids::ObjectId(0), 1, sprig_common::ids::DbId(0), &text);
-    let td = match parsed {
-        Ok(td) => td,
-        // A type the engine doesn't serve yet: the constant as written.
-        Err(_) => return Some(match e {
-            E::Str(..) => expr::print(e),
-            _ => expr::print(e),
-        }),
+    let parsed = super::table::parse(
+        sprig_common::ids::ObjectId(0),
+        1,
+        sprig_common::ids::DbId(0),
+        &text,
+    );
+    // A type the engine doesn't serve yet: the constant as written.
+    let Ok(td) = parsed else {
+        return Some(expr::print(e));
     };
     let col = td.columns.get(1)?;
     let v = super::assign::constant(col, d)?;
@@ -1436,8 +1851,15 @@ fn literal_default(def: &Def, i: usize, e: &E) -> Option<String> {
 }
 
 fn hex_bytes(h: &str) -> Option<Vec<u8>> {
-    let h = if h.len() % 2 == 1 { format!("0{h}") } else { h.to_owned() };
-    (0..h.len()).step_by(2).map(|k| u8::from_str_radix(&h[k..k + 2], 16).ok()).collect()
+    let h = if h.len() % 2 == 1 {
+        format!("0{h}")
+    } else {
+        h.to_owned()
+    };
+    (0..h.len())
+        .step_by(2)
+        .map(|k| u8::from_str_radix(&h[k..k + 2], 16).ok())
+        .collect()
 }
 
 fn bin_bytes(b: &str) -> Vec<u8> {
@@ -1446,7 +1868,10 @@ fn bin_bytes(b: &str) -> Vec<u8> {
         v = v.wrapping_mul(2).wrapping_add(u128::from(ch == '1'));
     }
     let n = b.len().div_ceil(8).max(1);
-    (0..n).rev().map(|k| ((v >> (8 * k)) & 0xff) as u8).collect()
+    (0..n)
+        .rev()
+        .map(|k| ((v >> (8 * k)) & 0xff) as u8)
+        .collect()
 }
 
 /// A stored default value as `SHOW CREATE TABLE` prints it.
@@ -1481,21 +1906,36 @@ pub(crate) fn render(def: &Def) -> String {
         let mut l = format!(
             "  CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}{} ({})",
             quote_name(&f.name),
-            f.cols.iter().map(|c| quote_name(c)).collect::<Vec<_>>().join(", "),
-            f.ref_db.as_ref().map(|d| format!("{}.", quote_name(d))).unwrap_or_default(),
+            f.cols
+                .iter()
+                .map(|c| quote_name(c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            f.ref_db
+                .as_ref()
+                .map(|d| format!("{}.", quote_name(d)))
+                .unwrap_or_default(),
             quote_name(&f.ref_table),
-            f.ref_cols.iter().map(|c| quote_name(c)).collect::<Vec<_>>().join(", "),
+            f.ref_cols
+                .iter()
+                .map(|c| quote_name(c))
+                .collect::<Vec<_>>()
+                .join(", "),
         );
         if let Some(d) = &f.on_delete {
-            l.push_str(&format!(" ON DELETE {d}"));
+            _ = write!(l, " ON DELETE {d}");
         }
         if let Some(u) = &f.on_update {
-            l.push_str(&format!(" ON UPDATE {u}"));
+            _ = write!(l, " ON UPDATE {u}");
         }
         lines.push(l);
     }
     for ch in &def.checks {
-        lines.push(format!("  CONSTRAINT {} CHECK ({})", quote_name(&ch.name), expr::print(&ch.expr)));
+        lines.push(format!(
+            "  CONSTRAINT {} CHECK ({})",
+            quote_name(&ch.name),
+            expr::print(&ch.expr)
+        ));
     }
     s.push_str(&lines.join(",\n"));
     s.push_str("\n) ENGINE=InnoDB");
@@ -1503,20 +1943,20 @@ pub(crate) fn render(def: &Def) -> String {
         && a > 1
         && def.cols.iter().any(|c| c.auto_inc)
     {
-        s.push_str(&format!(" AUTO_INCREMENT={a}"));
+        _ = write!(s, " AUTO_INCREMENT={a}");
     }
-    s.push_str(&format!(" DEFAULT CHARSET={} COLLATE={}", def.cs.0, def.cs.1));
+    _ = write!(s, " DEFAULT CHARSET={} COLLATE={}", def.cs.0, def.cs.1);
     if let Some(sp) = &def.stats_persistent {
-        s.push_str(&format!(" STATS_PERSISTENT={sp}"));
+        _ = write!(s, " STATS_PERSISTENT={sp}");
     }
     if let Some(r) = &def.row_format {
-        s.push_str(&format!(" ROW_FORMAT={r}"));
+        _ = write!(s, " ROW_FORMAT={r}");
     }
     if let Some(k) = def.key_block_size {
-        s.push_str(&format!(" KEY_BLOCK_SIZE={k}"));
+        _ = write!(s, " KEY_BLOCK_SIZE={k}");
     }
     if let Some(c) = &def.comment {
-        s.push_str(&format!(" COMMENT={}", quote_str(c).replace("\\'", "''")));
+        _ = write!(s, " COMMENT={}", quote_str(c).replace("\\'", "''"));
     }
     s
 }
@@ -1526,10 +1966,15 @@ fn column_text(def: &Def, c: &Col) -> String {
     if let Some((cs, co)) = &c.ty.cs
         && (cs != &def.cs.0 || co != &def.cs.1)
     {
-        s.push_str(&format!(" CHARACTER SET {cs} COLLATE {co}"));
+        _ = write!(s, " CHARACTER SET {cs} COLLATE {co}");
     }
     if let Some((g, stored)) = &c.generated {
-        s.push_str(&format!(" GENERATED ALWAYS AS ({}) {}", expr::print(g), if *stored { "STORED" } else { "VIRTUAL" }));
+        _ = write!(
+            s,
+            " GENERATED ALWAYS AS ({}) {}",
+            expr::print(g),
+            if *stored { "STORED" } else { "VIRTUAL" }
+        );
     } else {
         if c.not_null {
             s.push_str(" NOT NULL");
@@ -1538,20 +1983,20 @@ fn column_text(def: &Def, c: &Col) -> String {
         }
         match &c.default {
             Some(Default::Null) | None if !c.not_null && !c.auto_inc => s.push_str(" DEFAULT NULL"),
-            Some(Default::Lit(l)) => s.push_str(&format!(" DEFAULT {l}")),
-            Some(Default::Raw(e)) => s.push_str(&format!(" DEFAULT {}", expr::print(e))),
-            Some(Default::Now(p)) => s.push_str(&format!(" DEFAULT {}", now_text(*p))),
+            Some(Default::Lit(l)) => _ = write!(s, " DEFAULT {l}"),
+            Some(Default::Raw(e)) => _ = write!(s, " DEFAULT {}", expr::print(e)),
+            Some(Default::Now(p)) => _ = write!(s, " DEFAULT {}", now_text(*p)),
             Some(Default::Expr(e)) => {
                 if expr::bare_default(e) {
-                    s.push_str(&format!(" DEFAULT {}", expr::print(e)));
+                    _ = write!(s, " DEFAULT {}", expr::print(e));
                 } else {
-                    s.push_str(&format!(" DEFAULT ({})", expr::print(e)));
+                    _ = write!(s, " DEFAULT ({})", expr::print(e));
                 }
             }
             _ => {}
         }
         if let Some(p) = c.on_update {
-            s.push_str(&format!(" ON UPDATE {}", now_text(p)));
+            _ = write!(s, " ON UPDATE {}", now_text(p));
         }
         if c.auto_inc {
             s.push_str(" AUTO_INCREMENT");
@@ -1561,16 +2006,20 @@ fn column_text(def: &Def, c: &Col) -> String {
         s.push_str(" INVISIBLE");
     }
     if let Some(cm) = &c.comment {
-        s.push_str(&format!(" COMMENT {}", quote_str(cm).replace("\\'", "''")));
+        _ = write!(s, " COMMENT {}", quote_str(cm).replace("\\'", "''"));
     }
     if let Some(ch) = &c.check {
-        s.push_str(&format!(" CHECK ({})", expr::print(ch)));
+        _ = write!(s, " CHECK ({})", expr::print(ch));
     }
     s
 }
 
 fn now_text(p: u8) -> String {
-    if p == 0 { "current_timestamp()".into() } else { format!("current_timestamp({p})") }
+    if p == 0 {
+        "current_timestamp()".into()
+    } else {
+        format!("current_timestamp({p})")
+    }
 }
 
 fn key_text(k: &Key) -> String {
@@ -1580,7 +2029,7 @@ fn key_text(k: &Key) -> String {
         .map(|p| {
             let mut s = quote_name(&p.col);
             if let Some(l) = p.len {
-                s.push_str(&format!("({l})"));
+                _ = write!(s, "({l})");
             }
             if p.desc {
                 s.push_str(" DESC");
@@ -1597,10 +2046,10 @@ fn key_text(k: &Key) -> String {
         KeyKind::Spatial => format!("SPATIAL KEY {} ({parts})", quote_name(&k.name)),
     };
     if let Some(u) = &k.using {
-        s.push_str(&format!(" USING {u}"));
+        _ = write!(s, " USING {u}");
     }
     if let Some(c) = &k.comment {
-        s.push_str(&format!(" COMMENT {}", quote_str(c).replace("\\'", "''")));
+        _ = write!(s, " COMMENT {}", quote_str(c).replace("\\'", "''"));
     }
     if k.ignored {
         s.push_str(" IGNORED");
@@ -1613,10 +2062,15 @@ fn key_text(k: &Key) -> String {
 /// # Errors
 /// The text doesn't read (a bug: the engine printed it).
 pub(crate) fn parse_stored(text: &str) -> Result<Def, SprigError> {
-    let cx = Ctx { mysql: false, db_cs: ("utf8mb4".into(), "utf8mb4_uca1400_ai_ci".into()) };
+    let cx = Ctx {
+        mysql: false,
+        db_cs: ("utf8mb4".into(), "utf8mb4_uca1400_ai_ci".into()),
+    };
     match create(text, &cx)? {
         Created::Def(d) => Ok(*d),
-        Created::Like(..) => Err(SprigError::internal("engine: a stored definition reads as LIKE")),
+        Created::Like(..) => Err(SprigError::internal(
+            "engine: a stored definition reads as LIKE",
+        )),
     }
 }
 
@@ -1624,7 +2078,7 @@ pub(crate) fn parse_stored(text: &str) -> Result<Def, SprigError> {
 /// name (foreign keys aren't copied, as on the servers).
 pub(crate) fn like(src: &Def, name: &str) -> Def {
     let mut d = src.clone();
-    d.name = name.to_owned();
+    name.clone_into(&mut d.name);
     d.fks.clear();
     d
 }
@@ -1642,11 +2096,21 @@ pub(crate) fn alter(def: &Def, sql: &str, cx: &Ctx) -> Result<Def, SprigError> {
 /// The definition renamed (`RENAME TABLE`).
 pub(crate) fn renamed(def: &Def, name: &str) -> Def {
     let mut d = def.clone();
-    d.name = name.to_owned();
+    name.clone_into(&mut d.name);
     d
 }
 
 /// `int(11) NOT NULL`, for probe tables.
 fn types_int() -> Ty {
-    Ty { base: "int".into(), args: "(11)".into(), unsigned: false, zerofill: false, cs: None, json: false, serial: false, members: Vec::new(), len: 11 }
+    Ty {
+        base: "int".into(),
+        args: "(11)".into(),
+        unsigned: false,
+        zerofill: false,
+        cs: None,
+        json: false,
+        serial: false,
+        members: Vec::new(),
+        len: 11,
+    }
 }

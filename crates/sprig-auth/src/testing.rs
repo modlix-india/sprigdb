@@ -4,7 +4,7 @@
 
 use mysql_async::Conn;
 use sprig_catalog::migrate::MigrateOpts;
-use sprig_catalog::{MariaCatalog, Migrator};
+use sprig_catalog::{AuthCatalog, Migrator};
 use sprig_common::Result;
 use sprig_common::ids::{TenantId, UserId};
 use sprig_common::time::SystemClock;
@@ -30,7 +30,7 @@ pub async fn migrate(conn: &mut Conn, schema: &str) -> Result<()> {
 /// # Errors
 /// As [`admin::create_user`].
 pub async fn create_user(
-    cat: &MariaCatalog,
+    cat: &AuthCatalog,
     tenant: TenantId,
     name: &str,
     host: &str,

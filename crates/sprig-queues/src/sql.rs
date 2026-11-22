@@ -390,6 +390,20 @@ impl QueueEngine {
     #[must_use]
     pub fn has_txn_holds(&self, session: u64) -> bool {
         crate::engine::lock(&self.inner.txn_holds).contains_key(&session)
+            || crate::engine::lock(&self.inner.txn_wakes).contains_key(&session)
+    }
+
+    /// Session `session`'s open transaction wrote vhost (`tenant`, `db_id`)'s
+    /// outbox on the engine: its forwarder is woken when the transaction
+    /// ends ([`QueueEngine::txn_ended`]) instead of at its next poll.
+    pub fn note_txn_publish(&self, session: u64, tenant: u64, db_id: u32) {
+        let now = self.inner.deps.clock.now_ms();
+        let mut g = crate::engine::lock(&self.inner.txn_wakes);
+        g.retain(|_, v| v.iter().any(|(at, _, _)| now - at < 600_000));
+        let v = g.entry(session).or_default();
+        if !v.iter().any(|(_, t, d)| (*t, *d) == (tenant, db_id)) {
+            v.push((now, tenant, db_id));
+        }
     }
 
     /// The session's transaction ended (the session's commit hook):
@@ -398,6 +412,10 @@ impl QueueEngine {
     /// `COMMIT`): the owner then reads the row now. Either way the owner
     /// learns at once instead of after `hold_check_ms`.
     pub fn txn_ended(&self, session: u64, committed: Option<bool>) {
+        let wakes = crate::engine::lock(&self.inner.txn_wakes).remove(&session);
+        for (_, tenant, db_id) in wakes.unwrap_or_default() {
+            self.wake_forwarder(tenant, db_id);
+        }
         let Some(holds) = crate::engine::lock(&self.inner.txn_holds).remove(&session) else {
             return;
         };

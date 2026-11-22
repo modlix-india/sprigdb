@@ -48,7 +48,7 @@ use super::layout::{Layout, LayoutRecord, Pending};
 use super::meta;
 use super::row::{self, Datum};
 use super::table::{ColDefault, ColType, Column, Family, TableDef};
-use super::{Engine, WALK_BATCH, exec, not_on_engine, object_of, temporal};
+use super::{Engine, Pace, WALK_BATCH, exec, not_on_engine, object_of, temporal};
 
 /// What a change needs from the session that asked for it.
 #[derive(Debug, Clone)]
@@ -60,6 +60,9 @@ pub(crate) struct Session {
     pub wait: Duration,
     /// The logical database name (messages).
     pub db: String,
+    /// The session's connection id (the servers' temporary table names in
+    /// messages carry it).
+    pub conn: u32,
 }
 
 /// A staged change: the engine holds the table until it is applied or
@@ -203,6 +206,7 @@ impl Convert<'_> {
                 params: &[],
                 env: self.sess.env,
                 now: std::sync::OnceLock::from(self.now),
+                conds: crate::engine::expr::Conds::default(),
             };
             // New columns whose DEFAULT is an expression over the row, and
             // the generated columns (all of them: the columns they read
@@ -345,6 +349,8 @@ impl Engine {
                 tx.delete(k).await?;
             }
             tx.finish().await?;
+            // The durability wait may be ready at once (syncs off).
+            tokio::task::yield_now().await;
             if n < WALK_BATCH {
                 return Ok(());
             }
@@ -481,15 +487,17 @@ impl Engine {
     }
 
     /// The table's rows: how many there are.
-    fn count_rows(&self, sp: &Space) -> Result<u64> {
+    async fn count_rows(&self, sp: &Space) -> Result<u64> {
         let p = sp.rows();
         let end = keys::prefix_end(&p);
         let mut lo = p;
         let mut n = 0u64;
         let mut tx = self.begin(TxnOptions::default())?;
+        let mut pace = Pace::default();
         loop {
             let batch = tx.scan(&lo, &end, false, WALK_BATCH)?;
             n += batch.len() as u64;
+            pace.add(batch.len()).await;
             match batch.last() {
                 Some((k, _)) if batch.len() == WALK_BATCH => lo = keys::prefix_end(k),
                 _ => return Ok(n),
@@ -518,11 +526,22 @@ impl Engine {
         let last = loop {
             let mut tx = self.begin(TxnOptions::default())?;
             let batch = tx.scan(&lo, &end, false, WALK_BATCH)?;
-            for (_, v) in &batch {
+            for (k, v) in &batch {
                 n += 1;
-                let old = row::decode(d0, sp0, v)?;
+                let old = row::decode(d0, sp0, k, v)?;
+                // A table keyed by a hidden row number keeps each row's
+                // number; one that loses its primary key numbers its rows
+                // in the old key's order.
+                let hidden = d1.hidden.then(|| match old.get(d0.columns.len()) {
+                    Some(h) if d0.hidden => h.clone(),
+                    _ => Datum::UInt(n),
+                });
                 // A new index over unchanged columns takes the row as it is.
-                let new = if cv.unchanged { old } else { cv.row(&old, n)? };
+                let mut new = if cv.unchanged { old } else { cv.row(&old, n)? };
+                new.truncate(d1.columns.len());
+                if let Some(h) = hidden {
+                    new.push(h);
+                }
                 if copy {
                     let key = keys::row_key_of(sp1, d1, &new).ok_or_else(|| {
                         SprigError::internal("engine: a key value of the wrong type")
@@ -531,7 +550,7 @@ impl Engine {
                         .insert(Bytes::from(key), row::encode(d1, sp1, &new)?, false)
                         .await?
                     {
-                        return Err(duplicate(cv, &d1.pk, &new, "PRIMARY"));
+                        return Err(duplicate(cv, &d1.pk, &new, &d1.pk_name));
                     }
                 }
                 for ix in 0..d1.indexes.len() {
@@ -554,6 +573,9 @@ impl Engine {
                 }
             }
             let queued = tx.commit_queued()?;
+            // Between batches the worker goes back to the runtime (see
+            // `Engine::build`).
+            tokio::task::yield_now().await;
             match batch.last() {
                 Some((k, _)) if batch.len() == WALK_BATCH => lo = keys::prefix_end(k),
                 _ => break queued,
@@ -618,6 +640,7 @@ impl Engine {
                         params: &[],
                         env,
                         now: std::sync::OnceLock::from(now),
+                        conds: crate::engine::expr::Conds::default(),
                     };
                     expr::eval(&d.expr, &[], &a)
                         .ok()
@@ -649,6 +672,11 @@ impl Engine {
                     *s == Src::Added && matches!(c.default, Some(ColDefault::Expr(_)))
                 }))
         {
+            plan.reports_rows = true;
+        }
+        // A table that loses its primary key (the hidden row number takes
+        // over) is copied on both servers: nothing else can key it in place.
+        if d1.hidden && !d0.hidden {
             plan.reports_rows = true;
         }
         if sess.env.mysql {
@@ -812,7 +840,7 @@ impl Engine {
         }
         // Nothing to write but the record.
         let rows = if plan.reports_rows {
-            Some(self.count_rows(&sp0)?)
+            Some(self.count_rows(&sp0).await?)
         } else {
             None
         };
@@ -930,10 +958,132 @@ impl Engine {
         let _guard = lock.lock().await;
         self.forget(tenant, object);
         self.clear(&keys::object_prefix(tenant, object)).await?;
+        let mut tx = self.begin(TxnOptions::default())?;
+        tx.delete(Bytes::from(keys::drop_mark(tenant, object)))
+            .await?;
+        tx.finish().await?;
         self.tables
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&(tenant, object));
         Ok(())
+    }
+
+    /// Marks tables `objects` of `tenant` as dropped, durably, before
+    /// their keys are deleted in the background: a process that stops
+    /// before the deletion ends finds the marks again ([`Self::sweep`]).
+    ///
+    /// # Errors
+    /// The store's.
+    pub(crate) async fn mark_dropped(&self, tenant: u64, objects: &[u32]) -> Result<()> {
+        if objects.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.begin(TxnOptions::default())?;
+        for o in objects {
+            tx.put(Bytes::from(keys::drop_mark(tenant, *o)), Bytes::new())
+                .await?;
+        }
+        tx.finish().await
+    }
+
+    /// Deletes what is left of tables of `tenant` that are no longer in
+    /// its catalog: those marked dropped ([`Self::mark_dropped`]) and
+    /// `tombstones` (tables the catalog records as dropped, or in a
+    /// dropped database, whose
+    /// deletion may have been cut short before the marks existed), except
+    /// any in `live` (the catalog's tables: a mark whose drop was never
+    /// published is left alone). Gives the number of tables whose keys
+    /// were deleted.
+    ///
+    /// # Errors
+    /// The store's.
+    pub(crate) async fn sweep(
+        &self,
+        tenant: u64,
+        live: &std::collections::HashSet<u32>,
+        tombstones: &[u32],
+    ) -> Result<usize> {
+        let prefix = keys::drops_prefix(tenant);
+        let marked: Vec<u32> = {
+            let mut tx = self.begin(TxnOptions::default())?;
+            let rows = tx.scan(&prefix, &keys::prefix_end(&prefix), false, 1 << 20)?;
+            tx.rollback();
+            rows.iter()
+                .filter_map(|(k, _)| {
+                    let b = k.get(prefix.len()..prefix.len() + 4)?;
+                    Some(u32::from_be_bytes(b.try_into().ok()?))
+                })
+                .collect()
+        };
+        let mut swept = 0;
+        for o in marked {
+            if live.contains(&o) {
+                continue;
+            }
+            self.drop_table(tenant, o).await?;
+            swept += 1;
+        }
+        for o in tombstones {
+            if live.contains(o) || !self.has_keys(tenant, *o)? {
+                continue;
+            }
+            self.drop_table(tenant, *o).await?;
+            swept += 1;
+        }
+        Ok(swept)
+    }
+
+    /// Whether table `object` of `tenant` has any key left.
+    fn has_keys(&self, tenant: u64, object: u32) -> Result<bool> {
+        let p = keys::object_prefix(tenant, object);
+        let mut tx = self.begin(TxnOptions::default())?;
+        let any = !tx.scan(&p, &keys::prefix_end(&p), false, 1)?.is_empty();
+        tx.rollback();
+        Ok(any)
+    }
+
+    /// Runs [`Self::sweep`] for `tenant` once per process, in the
+    /// background, with `cat`'s tables as the live ones.
+    pub(crate) fn sweep_once(&'static self, cat: &sprig_catalog::TenantCatalog) {
+        let tenant = cat.tenant.0;
+        if !self
+            .swept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(tenant)
+        {
+            return;
+        }
+        // Live: an object not dropped, in a database not dropped (a
+        // database's drop leaves its tables' rows as they were).
+        let is_live = |o: &sprig_catalog::ObjectRow| {
+            o.state != sprig_catalog::ObjectState::Dropped
+                && cat
+                    .databases
+                    .get(o.db_id)
+                    .is_some_and(|d| d.state != sprig_catalog::DbState::Dropped)
+        };
+        let live: std::collections::HashSet<u32> = cat
+            .objects
+            .iter()
+            .filter(|o| is_live(o))
+            .filter_map(|o| u32::try_from(o.object_id.0).ok())
+            .collect();
+        let tombstones: Vec<u32> = cat
+            .objects
+            .iter()
+            .filter(|o| o.kind == sprig_catalog::ObjectKind::Table && !is_live(o))
+            .filter_map(|o| u32::try_from(o.object_id.0).ok())
+            .collect();
+        tokio::spawn(async move {
+            match self.sweep(tenant, &live, &tombstones).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(tenant, tables = n, "dropped tables' keys deleted"),
+                Err(e) => {
+                    tracing::warn!(tenant, error = %e, "dropped tables' keys not all deleted");
+                }
+            }
+        });
     }
 }

@@ -6,7 +6,8 @@
 //! - [`parser`] and [`ast`]: Cypher into the syntax tree the executor runs.
 //! - [`value`] and [`eval`]: Cypher values and the gateway evaluator.
 //! - [`store`]: what the executor needs from storage; [`mem`] in memory
-//!   with any number of shards, [`maria`] over MariaDB.
+//!   with any number of shards, [`maria`] over MariaDB, [`engine`] on
+//!   SprigDB's own storage engine ([`engine_keys`]: its layout).
 //! - [`exec`]: matching, variable-length and shortest paths, projections and
 //!   writes under the budgets.
 //! - [`catalog`]: the `graph` catalog module and graph DDL.
@@ -33,6 +34,8 @@ pub mod access;
 pub mod ast;
 pub mod bookmark;
 pub mod catalog;
+pub mod engine;
+pub mod engine_keys;
 pub mod eval;
 pub mod exec;
 pub mod gql;

@@ -1,7 +1,7 @@
 //! Second factors: TOTP with
-//! recovery codes, kept in the tenant catalog's `user_factors` (the auth
-//! module's format 5), and the account lookups the second-factor
-//! challenge and impersonation need.
+//! recovery codes, kept in the tenant catalog's `user_factors` (catalog
+//! records, `m/auth/user_factors/<user>/<factor>`), and the account
+//! lookups the second-factor challenge and impersonation need.
 //!
 //! ```text
 //! enrol(user):    a 20-byte seed, sealed (AES-256-GCM under the tenant's
@@ -26,12 +26,11 @@
 use std::net::IpAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use mysql_async::prelude::Queryable as _;
-use mysql_async::{Row, Value};
 use ring::aead;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use sprig_catalog::migrate::MigrateOpts;
-use sprig_catalog::{ChangeOpts, MariaCatalog, Migrator, VersionKind};
+use sprig_catalog::records::{self, Pk, RecordTx};
+use sprig_catalog::{AuthCatalog, ChangeOpts, VersionKind};
 use sprig_common::ids::{TenantId, UserId};
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_proto_mysql::Persona;
@@ -39,25 +38,8 @@ use subtle::ConstantTimeEq as _;
 
 use crate::cache::TenantAuth;
 use crate::mysql::{CatalogLogins, Principal, locked, temp_locked};
-use crate::store::{AT, AuthStore, RequireTls, exec_count, map_err, micros};
-
-/// `user_factors`: the auth module's format 5.
-pub const DDL_USER_FACTORS: &str = "CREATE TABLE IF NOT EXISTS user_factors (
-  factor_id       BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  user_id         INT UNSIGNED    NOT NULL,
-  kind            ENUM('totp','webauthn','recovery') NOT NULL,
-  state           ENUM('pending','active') NOT NULL,
-  secret_enc      VARBINARY(128)  NULL,
-  last_step       BIGINT UNSIGNED NULL,
-  credential_id   VARBINARY(1024) NULL,
-  public_key      VARBINARY(1024) NULL,
-  sign_count      BIGINT UNSIGNED NULL,
-  code_sha256     BINARY(32)      NULL,
-  created_at      DATETIME(6)     NOT NULL,
-  changed_version BIGINT UNSIGNED NOT NULL,
-  PRIMARY KEY (factor_id),
-  KEY k_user (user_id, kind)
-) ENGINE=InnoDB";
+use crate::rec::{USER_FACTORS, to_micros};
+use crate::store::RequireTls;
 
 /// TOTP step.
 pub const STEP: u64 = 30;
@@ -275,10 +257,113 @@ pub struct Factor {
     pub created_ms: u64,
 }
 
+/// `user_factors.kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum FactorKind {
+    Totp,
+    Webauthn,
+    Recovery,
+}
+
+impl FactorKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            FactorKind::Totp => "totp",
+            FactorKind::Webauthn => "webauthn",
+            FactorKind::Recovery => "recovery",
+        }
+    }
+}
+
+/// `user_factors.state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum FactorState {
+    Pending,
+    Active,
+}
+
+impl FactorState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            FactorState::Pending => "pending",
+            FactorState::Active => "active",
+        }
+    }
+}
+
+/// A `user_factors` row (no `Debug`: it holds the sealed seed).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FactorRow {
+    factor_id: u64,
+    user_id: UserId,
+    kind: FactorKind,
+    state: FactorState,
+    secret_enc: Option<Vec<u8>>,
+    last_step: Option<u64>,
+    credential_id: Option<Vec<u8>>,
+    public_key: Option<Vec<u8>>,
+    sign_count: Option<u64>,
+    code_sha256: Option<[u8; 32]>,
+    #[serde(with = "crate::rec::micros")]
+    created_at: SystemTime,
+    /// 0 while pending; the auth version of the change that wrote it.
+    changed_version: u64,
+}
+
+/// The id counter of factors.
+const FACTOR_COUNTER: &str = "user_factors";
+
+fn factor_pk(user: UserId, id: u64) -> Pk {
+    Pk::new().u32(user.0).u64(id)
+}
+
+/// The user's factors, by id.
+async fn factors_of(tx: &mut dyn RecordTx, user: UserId) -> Result<Vec<FactorRow>> {
+    USER_FACTORS.rows(tx, &Pk::new().u32(user.0)).await
+}
+
+impl FactorRow {
+    /// A new factor of `user` (its id comes with the insert).
+    fn new(
+        user: UserId,
+        kind: FactorKind,
+        state: FactorState,
+        now: SystemTime,
+        version: u64,
+    ) -> Self {
+        Self {
+            factor_id: 0,
+            user_id: user,
+            kind,
+            state,
+            secret_enc: None,
+            last_step: None,
+            credential_id: None,
+            public_key: None,
+            sign_count: None,
+            code_sha256: None,
+            created_at: to_micros(now),
+            changed_version: version,
+        }
+    }
+}
+
+/// Inserts `row` with a new id (counter `user_factors`); returns the id.
+async fn insert_factor(tx: &mut dyn RecordTx, mut row: FactorRow) -> Result<u64> {
+    let id = records::next_ids(tx, FACTOR_COUNTER, 1).await?;
+    row.factor_id = id;
+    USER_FACTORS
+        .put(tx, &factor_pk(row.user_id, id), &row)
+        .await?;
+    Ok(id)
+}
+
 /// `user_factors` in the tenant catalogs.
 #[derive(Clone)]
 pub struct FactorStore {
-    cat: MariaCatalog,
+    cat: AuthCatalog,
 }
 
 impl std::fmt::Debug for FactorStore {
@@ -287,25 +372,24 @@ impl std::fmt::Debug for FactorStore {
     }
 }
 
-fn tbl(store: &AuthStore, t: &str) -> String {
-    format!("{}.{t}", sprig_common::names::quote(store.schema()))
-}
-
 impl FactorStore {
     /// Factors written through `cat`.
     #[must_use]
-    pub fn new(cat: MariaCatalog) -> Self {
+    pub fn new(cat: AuthCatalog) -> Self {
         Self { cat }
     }
 
-    async fn conn(&self, tenant: TenantId) -> Result<(mysql_async::Conn, String)> {
-        let ep = self.cat.backend().locator().writer(tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(map_err)?;
-        // Format 5 (`user_factors`) on first use, as format 4 is.
-        Migrator::new(&[crate::store::AUTH_MODULE])?
-            .run(&mut conn, ep.store.schema(), &MigrateOpts::default())
-            .await?;
-        Ok((conn, ep.store.schema().to_owned()))
+    /// A plain (unversioned) record transaction on `tenant`'s records.
+    async fn begin(&self, tenant: TenantId) -> Result<Box<dyn RecordTx>> {
+        self.cat.backend().store().begin(tenant).await
+    }
+
+    /// The user's factor rows as committed, by id.
+    async fn rows(&self, tenant: TenantId, user: UserId) -> Result<Vec<FactorRow>> {
+        let mut tx = self.begin(tenant).await?;
+        let rows = factors_of(&mut *tx, user).await;
+        let _ = tx.rollback().await;
+        rows
     }
 
     /// The user's factors, newest first.
@@ -313,26 +397,16 @@ impl FactorStore {
     /// # Errors
     /// The catalog's.
     pub async fn list(&self, tenant: TenantId, user: UserId) -> Result<Vec<Factor>> {
-        let (mut c, schema) = self.conn(tenant).await?;
-        let rows: Vec<Row> = c
-            .exec(
-                format!(
-                    "SELECT factor_id, kind, state, \
-                     TIMESTAMPDIFF(MICROSECOND, '1970-01-01', created_at) \
-                     FROM {}.user_factors WHERE user_id = ? ORDER BY factor_id DESC",
-                    sprig_common::names::quote(&schema)
-                ),
-                (user.0,),
-            )
-            .await
-            .map_err(map_err)?;
-        Ok(rows
-            .into_iter()
-            .map(|mut r| Factor {
-                id: r.take::<u64, _>(0).unwrap_or(0),
-                kind: r.take::<String, _>(1).unwrap_or_default(),
-                state: r.take::<String, _>(2).unwrap_or_default(),
-                created_ms: r.take::<u64, _>(3).unwrap_or(0) / 1000,
+        Ok(self
+            .rows(tenant, user)
+            .await?
+            .iter()
+            .rev()
+            .map(|r| Factor {
+                id: r.factor_id,
+                kind: r.kind.as_str().to_owned(),
+                state: r.state.as_str().to_owned(),
+                created_ms: u64::try_from(crate::store::micros(r.created_at)).unwrap_or(0) / 1000,
             })
             .collect())
     }
@@ -349,32 +423,31 @@ impl FactorStore {
             .any(|f| f.kind == "totp" && f.state == "active"))
     }
 
-    /// The sealed seed and last step of the user's active (or, with
-    /// `pending`, pending) TOTP factor.
+    /// The id, sealed seed and last step of the user's newest active (or,
+    /// with `pending`, pending) TOTP factor.
     async fn totp(
         &self,
         tenant: TenantId,
         user: UserId,
         pending: bool,
     ) -> Result<Option<(u64, Vec<u8>, Option<u64>)>> {
-        let (mut c, schema) = self.conn(tenant).await?;
-        let r: Option<(u64, Vec<u8>, Option<u64>)> = c
-            .exec_first(
-                format!(
-                    "SELECT factor_id, secret_enc, last_step FROM {}.user_factors \
-                     WHERE user_id = ? AND kind = 'totp' AND state = ? \
-                     ORDER BY factor_id DESC LIMIT 1",
-                    sprig_common::names::quote(&schema)
-                ),
-                (user.0, if pending { "pending" } else { "active" }),
-            )
-            .await
-            .map_err(map_err)?;
-        Ok(r)
+        let want = if pending {
+            FactorState::Pending
+        } else {
+            FactorState::Active
+        };
+        Ok(self
+            .rows(tenant, user)
+            .await?
+            .into_iter()
+            .rev()
+            .find(|r| r.kind == FactorKind::Totp && r.state == want)
+            .map(|r| (r.factor_id, r.secret_enc.unwrap_or_default(), r.last_step)))
     }
 
     /// Starts an enrolment: a new seed, stored sealed and `pending` (an
-    /// earlier pending one is replaced). Returns the seed, to show once.
+    /// earlier pending one is replaced; not an auth change). Returns the
+    /// seed, to show once.
     ///
     /// # Errors
     /// 39301 without a factor key; the catalog's.
@@ -387,23 +460,18 @@ impl FactorStore {
     ) -> Result<Vec<u8>> {
         let seed = random::<SEED_BYTES>()?.to_vec();
         let sealed = seal(keys, tenant, user, &seed)?;
-        let (mut c, schema) = self.conn(tenant).await?;
-        let t = format!("{}.user_factors", sprig_common::names::quote(&schema));
-        c.exec_drop(
-            format!("DELETE FROM {t} WHERE user_id = ? AND kind = 'totp' AND state = 'pending'"),
-            (user.0,),
-        )
-        .await
-        .map_err(map_err)?;
-        c.exec_drop(
-            format!(
-                "INSERT INTO {t} (user_id, kind, state, secret_enc, created_at, changed_version) \
-                 VALUES (?, 'totp', 'pending', ?, {AT}, 0)"
-            ),
-            (user.0, sealed, micros(now)),
-        )
-        .await
-        .map_err(map_err)?;
+        let mut tx = self.begin(tenant).await?;
+        for r in factors_of(&mut *tx, user).await? {
+            if r.kind == FactorKind::Totp && r.state == FactorState::Pending {
+                USER_FACTORS
+                    .delete(&mut *tx, &factor_pk(user, r.factor_id))
+                    .await?;
+            }
+        }
+        let mut row = FactorRow::new(user, FactorKind::Totp, FactorState::Pending, now, 0);
+        row.secret_enc = Some(sealed);
+        insert_factor(&mut *tx, row).await?;
+        tx.commit().await?;
         Ok(seed)
     }
 
@@ -439,42 +507,34 @@ impl FactorStore {
             .await?;
         let version = ch.version();
         let r = async {
-            let (core, q) = ch.tx().parts();
-            let store = AuthStore::of(core);
-            let factors = tbl(&store, "user_factors");
-            exec_count(
-                q,
-                format!(
-                    "DELETE FROM {factors} WHERE user_id = ? AND (kind = 'recovery' \
-                     OR (kind = 'totp' AND factor_id <> ?))"
-                ),
-                vec![Value::from(user.0), Value::from(id)],
-            )
-            .await?;
-            exec_count(
-                q,
-                format!(
-                    "UPDATE {factors} SET state = 'active', last_step = ?, changed_version = ? \
-                     WHERE factor_id = ?"
-                ),
-                vec![Value::from(step), Value::from(version), Value::from(id)],
-            )
-            .await?;
+            let tx = ch.tx().records();
+            for r in factors_of(tx, user).await? {
+                let other_totp = r.kind == FactorKind::Totp && r.factor_id != id;
+                if r.kind == FactorKind::Recovery || other_totp {
+                    USER_FACTORS
+                        .delete(tx, &factor_pk(user, r.factor_id))
+                        .await?;
+                }
+            }
+            // The pending factor, if it is still there (a newer enrolment
+            // may have replaced it meanwhile: then nothing is activated).
+            let pk = factor_pk(user, id);
+            if let Some(mut f) = USER_FACTORS.get_for_update::<FactorRow>(tx, &pk).await? {
+                f.state = FactorState::Active;
+                f.last_step = Some(step);
+                f.changed_version = version;
+                USER_FACTORS.put(tx, &pk, &f).await?;
+            }
             for code in &codes {
-                exec_count(
-                    q,
-                    format!(
-                        "INSERT INTO {factors} (user_id, kind, state, code_sha256, created_at, \
-                         changed_version) VALUES (?, 'recovery', 'active', ?, {AT}, ?)"
-                    ),
-                    vec![
-                        Value::from(user.0),
-                        Value::from(recovery_hash(code).to_vec()),
-                        Value::from(micros(now)),
-                        Value::from(version),
-                    ],
-                )
-                .await?;
+                let mut row = FactorRow::new(
+                    user,
+                    FactorKind::Recovery,
+                    FactorState::Active,
+                    now,
+                    version,
+                );
+                row.code_sha256 = Some(recovery_hash(code));
+                insert_factor(tx, row).await?;
             }
             Ok::<_, SprigError>(())
         }
@@ -494,7 +554,7 @@ impl FactorStore {
 
     /// A second factor at login: a TOTP code (accepted once: the step is
     /// stored with a compare-and-set) or a recovery code (its row is
-    /// deleted). `Some("otp" | "rec")` when it passes.
+    /// deleted). `Some("otp" | "rec")` when it passes. Not an auth change.
     ///
     /// # Errors
     /// 39301; the catalog's.
@@ -515,34 +575,50 @@ impl FactorStore {
             let Some(step) = check(&seed, &digits, now, last) else {
                 return Ok(None);
             };
-            let (mut c, schema) = self.conn(tenant).await?;
-            let n = exec_count(
-                &mut c,
-                format!(
-                    "UPDATE {}.user_factors SET last_step = ? WHERE factor_id = ? \
-                     AND (last_step IS NULL OR last_step < ?)",
-                    sprig_common::names::quote(&schema)
-                ),
-                vec![Value::from(step), Value::from(id), Value::from(step)],
-            )
-            .await?;
-            return Ok((n == 1).then_some("otp"));
+            // Compare-and-set: the step moves only forward, so a code
+            // works once however many logins race with it.
+            let mut tx = self.begin(tenant).await?;
+            let pk = factor_pk(user, id);
+            let found = USER_FACTORS
+                .get_for_update::<FactorRow>(&mut *tx, &pk)
+                .await?;
+            return match found {
+                Some(mut f) if f.last_step.is_none_or(|l| l < step) => {
+                    f.last_step = Some(step);
+                    USER_FACTORS.put(&mut *tx, &pk, &f).await?;
+                    tx.commit().await?;
+                    Ok(Some("otp"))
+                }
+                _ => {
+                    let _ = tx.rollback().await;
+                    Ok(None)
+                }
+            };
         }
-        let (mut c, schema) = self.conn(tenant).await?;
-        let n = exec_count(
-            &mut c,
-            format!(
-                "DELETE FROM {}.user_factors WHERE user_id = ? AND kind = 'recovery' \
-                 AND code_sha256 = ? LIMIT 1",
-                sprig_common::names::quote(&schema)
-            ),
-            vec![
-                Value::from(user.0),
-                Value::from(recovery_hash(code).to_vec()),
-            ],
-        )
-        .await?;
-        Ok((n == 1).then_some("rec"))
+        let want = recovery_hash(code);
+        let mut tx = self.begin(tenant).await?;
+        let found = factors_of(&mut *tx, user).await?.into_iter().find(|r| {
+            r.kind == FactorKind::Recovery
+                && r.code_sha256.is_some_and(|h| bool::from(h.ct_eq(&want)))
+        });
+        let Some(f) = found else {
+            let _ = tx.rollback().await;
+            return Ok(None);
+        };
+        // Single use: only the transaction that still finds the row (its
+        // latest value, locked) deletes it.
+        let pk = factor_pk(user, f.factor_id);
+        if USER_FACTORS
+            .get_for_update::<FactorRow>(&mut *tx, &pk)
+            .await?
+            .is_none()
+        {
+            let _ = tx.rollback().await;
+            return Ok(None);
+        }
+        USER_FACTORS.delete(&mut *tx, &pk).await?;
+        tx.commit().await?;
+        Ok(Some("rec"))
     }
 
     /// Recovery codes left.
@@ -564,38 +640,21 @@ impl FactorStore {
     /// # Errors
     /// The catalog's.
     pub async fn reset(&self, tenant: TenantId, user: UserId, now: SystemTime) -> Result<u64> {
-        let _ = self.conn(tenant).await?;
         let mut ch = self
             .cat
             .change_with(tenant, VersionKind::Auth, ChangeOpts::default())
             .await?;
         let version = ch.version();
         let r = async {
-            let (core, q) = ch.tx().parts();
-            let store = AuthStore::of(core);
-            let n = exec_count(
-                q,
-                format!(
-                    "DELETE FROM {} WHERE user_id = ?",
-                    tbl(&store, "user_factors")
-                ),
-                vec![Value::from(user.0)],
-            )
-            .await?;
-            exec_count(
-                q,
-                format!(
-                    "UPDATE {} SET revoked_at = {AT}, changed_version = ? \
-                     WHERE user_id = ? AND revoked_at IS NULL",
-                    tbl(&store, "token_sessions")
-                ),
-                vec![
-                    Value::from(micros(now)),
-                    Value::from(version),
-                    Value::from(user.0),
-                ],
-            )
-            .await?;
+            let tx = ch.tx().records();
+            let mut n = 0;
+            for r in factors_of(tx, user).await? {
+                USER_FACTORS
+                    .delete(tx, &factor_pk(user, r.factor_id))
+                    .await?;
+                n += 1;
+            }
+            crate::token::sessions::revoke_user_sessions(tx, user, version, now).await?;
             Ok::<_, SprigError>(n)
         }
         .await;
@@ -789,6 +848,165 @@ mod tests {
         fn key(&self, t: TenantId, v: u32) -> Option<[u8; 32]> {
             (v == 2).then(|| [u8::try_from(t.0 % 200).unwrap(); 32])
         }
+    }
+
+    use crate::token::sessions::tests::{T, auth_version, catalog};
+
+    /// The code of `seed` at `now`.
+    fn code_now(seed: &[u8], now: SystemTime) -> String {
+        format!("{:06}", code_at(seed, step_of(now)))
+    }
+
+    fn t(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_800_000_000 + secs)
+    }
+
+    #[tokio::test]
+    async fn an_enrolment_replaces_a_pending_seed_without_a_version() {
+        let (recs, cat) = catalog().await;
+        let f = FactorStore::new(cat);
+        let u = UserId(3);
+        let first = f.enrol(&Fixed, T, u, t(0)).await.unwrap();
+        let second = f.enrol(&Fixed, T, u, t(1)).await.unwrap();
+        assert_ne!(first, second);
+        let list = f.list(T, u).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            (list[0].kind.as_str(), list[0].state.as_str()),
+            ("totp", "pending")
+        );
+        assert_eq!(list[0].created_ms, 1_800_000_001_000);
+        assert!(!f.has_active(T, u).await.unwrap());
+        assert_eq!(auth_version(&recs).await, 0);
+        // Another user's factors are apart.
+        assert!(f.list(T, UserId(4)).await.unwrap().is_empty());
+        // The pending seed is the second one: the first one's code fails.
+        let now = t(60);
+        let wrong = f
+            .confirm(&Fixed, T, u, &code_now(&first, now), now)
+            .await
+            .unwrap();
+        assert!(wrong.is_none() || code_now(&first, now) == code_now(&second, now));
+    }
+
+    #[tokio::test]
+    async fn a_confirmation_activates_and_replaces_recovery_codes_in_one_change() {
+        let (recs, cat) = catalog().await;
+        let f = FactorStore::new(cat);
+        let u = UserId(3);
+        let e = f.confirm(&Fixed, T, u, "000000", t(0)).await.unwrap_err();
+        assert_eq!(e.code(), Some(SprigCode::AdminRequestInvalid));
+        let seed = f.enrol(&Fixed, T, u, t(0)).await.unwrap();
+        let now = t(30);
+        let codes = f
+            .confirm(&Fixed, T, u, &code_now(&seed, now), now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(codes.len(), RECOVERY_CODES);
+        let v = auth_version(&recs).await;
+        assert!(v > 0);
+        assert!(f.has_active(T, u).await.unwrap());
+        assert_eq!(f.recovery_left(T, u).await.unwrap(), RECOVERY_CODES);
+        let list = f.list(T, u).await.unwrap();
+        // Newest first: the recovery codes, then the factor.
+        assert_eq!(list.last().unwrap().kind, "totp");
+        assert!(list.windows(2).all(|w| w[0].id > w[1].id));
+        // The step of the confirming code is used up.
+        let again = f.verify(&Fixed, T, u, &code_now(&seed, now), now).await;
+        assert_eq!(again.unwrap(), None);
+        // A new enrolment and confirmation replace the factor and the codes.
+        let seed2 = f.enrol(&Fixed, T, u, t(100)).await.unwrap();
+        let later = t(200);
+        let codes2 = f
+            .confirm(&Fixed, T, u, &code_now(&seed2, later), later)
+            .await
+            .unwrap()
+            .unwrap();
+        let list = f.list(T, u).await.unwrap();
+        assert_eq!(list.len(), RECOVERY_CODES + 1);
+        assert_eq!(list.iter().filter(|x| x.kind == "totp").count(), 1);
+        assert!(auth_version(&recs).await > v);
+        // The old codes are gone, the new ones work.
+        assert_eq!(
+            f.verify(&Fixed, T, u, &codes[0], later).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            f.verify(&Fixed, T, u, &codes2[0], later).await.unwrap(),
+            Some("rec")
+        );
+    }
+
+    #[tokio::test]
+    async fn totp_codes_and_recovery_codes_work_once() {
+        let (recs, cat) = catalog().await;
+        let f = FactorStore::new(cat);
+        let u = UserId(3);
+        let seed = f.enrol(&Fixed, T, u, t(0)).await.unwrap();
+        let codes = f
+            .confirm(&Fixed, T, u, &code_now(&seed, t(30)), t(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let v = auth_version(&recs).await;
+        let now = t(90);
+        let code = code_now(&seed, now);
+        assert_eq!(
+            f.verify(&Fixed, T, u, &code, now).await.unwrap(),
+            Some("otp")
+        );
+        assert_eq!(f.verify(&Fixed, T, u, &code, now).await.unwrap(), None);
+        // An older step after a newer one: refused.
+        let prev = format!("{:06}", code_at(&seed, step_of(now) - 1));
+        if prev != code {
+            assert_eq!(f.verify(&Fixed, T, u, &prev, now).await.unwrap(), None);
+        }
+        // Recovery codes, in any case and spacing, once.
+        let spaced = codes[3].to_uppercase().replace('-', " ");
+        assert_eq!(
+            f.verify(&Fixed, T, u, &spaced, now).await.unwrap(),
+            Some("rec")
+        );
+        assert_eq!(f.verify(&Fixed, T, u, &codes[3], now).await.unwrap(), None);
+        assert_eq!(f.recovery_left(T, u).await.unwrap(), RECOVERY_CODES - 1);
+        assert_eq!(
+            f.verify(&Fixed, T, u, "nope-nope", now).await.unwrap(),
+            None
+        );
+        // Neither is an auth change.
+        assert_eq!(auth_version(&recs).await, v);
+        // Another user's codes don't work for this one.
+        assert_eq!(
+            f.verify(&Fixed, T, UserId(4), &codes[4], now)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reset_deletes_every_factor_in_one_change() {
+        let (recs, cat) = catalog().await;
+        let f = FactorStore::new(cat);
+        let u = UserId(3);
+        let seed = f.enrol(&Fixed, T, u, t(0)).await.unwrap();
+        f.confirm(&Fixed, T, u, &code_now(&seed, t(30)), t(30))
+            .await
+            .unwrap()
+            .unwrap();
+        f.enrol(&Fixed, T, UserId(4), t(0)).await.unwrap();
+        let v = auth_version(&recs).await;
+        let n = f.reset(T, u, t(60)).await.unwrap();
+        assert_eq!(n, u64::try_from(RECOVERY_CODES).unwrap() + 1);
+        assert!(f.list(T, u).await.unwrap().is_empty());
+        assert_eq!(f.list(T, UserId(4)).await.unwrap().len(), 1);
+        assert!(auth_version(&recs).await > v);
+        // Factor ids are never reused.
+        let again = f.enrol(&Fixed, T, u, t(70)).await.unwrap();
+        let _ = again;
+        let id = f.list(T, u).await.unwrap()[0].id;
+        assert!(id > u64::try_from(RECOVERY_CODES).unwrap() + 2);
     }
 
     #[test]

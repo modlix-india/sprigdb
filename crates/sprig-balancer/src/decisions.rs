@@ -1,73 +1,55 @@
-//! The decision log: the
-//! `decisions` table in each tenant's catalog schema, the [`DecisionLog`]
-//! interface every component writes through, the retention job, and the
-//! reads behind `sprigctl explain decision`.
+//! The decision log: each tenant's decisions as the engine's catalog
+//! records, the [`DecisionLog`] interface every component writes through,
+//! the retention job, and the reads behind `sprigctl explain decision`.
 //!
-//! The table is the `decisions` migration module ([`DECISIONS_MODULE`]),
-//! registered with `sprig-catalog`'s migrator by whoever bootstraps tenant
-//! catalogs, as `sprig-advisor` does for its tables. Decisions are not
-//! versioned catalog state (they are read on demand), so writes are
-//! plain statements.
+//! ```text
+//! m/decisions/rows/<decision id u64>                        DecisionRow
+//! m/decisions/by_time/<decided µs><decision id>             (empty)
+//! m/decisions/by_subject/<type><id><decided µs><decision>   (empty)
+//! ctr/decision                                              the last id handed out
+//! ```
+//!
+//! Decisions are not versioned catalog state (they are read on demand),
+//! so each write is a short engine transaction of its own, outside
+//! catalog versions. The time index serves the retention purge (a key
+//! range) and the newest-first reads; the subject index serves
+//! `by_subject`.
 //!
 //! Implementations:
 //!
-//! - [`CatalogDecisionLog`] writes to the tenant's catalog through a
-//!   [`CatalogLocator`], buffering up to [`BUFFER_LIMIT`] decisions per
-//!   process while a catalog is unreachable;
+//! - [`CatalogDecisionLog`] writes to the tenant's catalog records through
+//!   a [`RecordStore`], buffering up to [`BUFFER_LIMIT`] decisions per
+//!   process while they are unreachable;
 //! - [`MemDecisionLog`] keeps them in memory (tests and the fleet
 //!   simulator).
 //!
 //! **Times** travel as microseconds since the epoch, as in the other
-//! catalog modules, so the session time zone never matters.
+//! catalog modules.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use mysql_async::prelude::Queryable;
-use mysql_async::{Row, Value};
 use serde::{Deserialize, Serialize};
-use sprig_catalog::{CatalogLocator, Migration, Module, Phase};
+use sprig_catalog::records::{Pk, RecordStore, RecordTx, RowTable, next_ids};
+use sprig_catalog::{Migration, Module};
 use sprig_common::ids::TenantId;
-use sprig_common::names::quote;
 use sprig_common::{Result, SprigCode, SprigError};
 
 /// The module name in the catalog's format records.
 pub const MODULE: &str = "decisions";
 
-/// The `decisions` table.
-pub const DDL_DECISIONS: &str = "CREATE TABLE IF NOT EXISTS decisions (
-  decision_id   BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  decided_at    DATETIME(6)     NOT NULL,
-  component     VARCHAR(24)     NOT NULL,
-  kind          VARCHAR(48)     NOT NULL,
-  subject_type  VARCHAR(24)     NOT NULL,
-  subject_id    VARCHAR(64)     NOT NULL,
-  mode          ENUM('applied','recommended','dry_run','operator') NOT NULL,
-  outcome       ENUM('proposed','scheduled','running','succeeded','failed',
-                     'rejected','cancelled','superseded') NOT NULL,
-  reason_code   VARCHAR(64)     NOT NULL,
-  summary       VARCHAR(512)    NOT NULL,
-  evidence      JSON            NOT NULL,
-  alternatives  JSON            NULL,
-  job_id        BINARY(16)      NULL,
-  parent_id     BIGINT UNSIGNED NULL,
-  actor         VARCHAR(128)    NOT NULL,
-  dc_id         VARCHAR(32)     NOT NULL,
-  updated_at    DATETIME(6)     NOT NULL,
-  PRIMARY KEY (decision_id),
-  KEY by_subject (subject_type, subject_id, decided_at),
-  KEY by_kind (component, kind, decided_at),
-  KEY by_time (decided_at)
-) ENGINE=InnoDB";
+/// Decisions by id.
+pub const ROWS: RowTable = RowTable::new(MODULE, "rows");
+/// Decision ids by time.
+pub const BY_TIME: RowTable = RowTable::new(MODULE, "by_time");
+/// Decision ids by subject and time.
+pub const BY_SUBJECT: RowTable = RowTable::new(MODULE, "by_subject");
+/// The id counter.
+pub const COUNTER: &str = "decision";
 
-/// The module's migrations.
-pub static DECISIONS_MIGRATIONS: &[Migration] = &[Migration {
-    format: 1,
-    phase: Phase::Expand,
-    name: "decisions",
-    statements: &[DDL_DECISIONS],
-}];
+/// The module's MariaDB migrations: none, its rows are engine records.
+pub static DECISIONS_MIGRATIONS: &[Migration] = &[];
 
 /// The module, for [`Migrator::new`](sprig_catalog::Migrator::new) and
 /// the catalog's `BootstrapHooks.modules`.
@@ -228,237 +210,228 @@ pub trait DecisionLog: Send + Sync {
     -> Result<()>;
 }
 
-/// SQL access to one catalog's `decisions` table.
-#[derive(Debug, Clone)]
-pub struct DecisionStore {
-    schema: String,
+/// An order-preserving key part for a signed time.
+fn at_key(us: i64) -> [u8; 8] {
+    #[allow(clippy::cast_sign_loss)]
+    let u = (us as u64) ^ (1u64 << 63);
+    u.to_be_bytes()
 }
 
-const COLUMNS: &str = "decision_id, TIMESTAMPDIFF(MICROSECOND, '1970-01-01', decided_at), \
-    component, kind, subject_type, subject_id, mode, outcome, reason_code, summary, \
-    evidence, alternatives, job_id, parent_id, actor, dc_id, \
-    TIMESTAMPDIFF(MICROSECOND, '1970-01-01', updated_at)";
+fn id_of(pk: &Pk) -> Option<u64> {
+    let b = pk.0.get(pk.0.len().checked_sub(8)?..)?;
+    <[u8; 8]>::try_from(b).ok().map(u64::from_be_bytes)
+}
 
-const AT: &str = "TIMESTAMPADD(MICROSECOND, ?, '1970-01-01')";
+fn subject_pk(t: &str, id: &str) -> Pk {
+    Pk::new().bytes(t.as_bytes()).bytes(id.as_bytes())
+}
+
+/// Access to one tenant's decision records, in the caller's transaction.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DecisionStore;
 
 impl DecisionStore {
-    /// The store in catalog schema `schema`.
-    #[must_use]
-    pub fn new(schema: impl Into<String>) -> Self {
-        Self {
-            schema: schema.into(),
-        }
-    }
-
-    /// The store in `tenant`'s catalog, `t<tenant>_sprig`.
-    #[must_use]
-    pub fn for_tenant(tenant: TenantId) -> Self {
-        Self::new(format!("t{tenant}_sprig"))
-    }
-
-    fn table(&self) -> String {
-        format!("{}.decisions", quote(&self.schema))
-    }
-
-    /// Inserts `d`; returns its id.
+    /// Inserts `d` (its texts cut to the columns' old widths); returns its
+    /// id (from the tenant's decision counter, never reused).
     ///
     /// # Errors
-    /// The driver's, mapped.
-    pub async fn insert<Q: Queryable + Send>(&self, q: &mut Q, d: &NewDecision) -> Result<u64> {
-        let sql = format!(
-            "INSERT INTO {} (decided_at, component, kind, subject_type, subject_id, mode, \
-             outcome, reason_code, summary, evidence, alternatives, job_id, parent_id, actor, \
-             dc_id, updated_at) VALUES ({AT}, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {AT})",
-            self.table()
-        );
-        let params: Vec<Value> = vec![
-            d.decided_at_us.into(),
-            cut(&d.component, 24).into(),
-            cut(&d.kind, 48).into(),
-            cut(&d.subject_type, 24).into(),
-            cut(&d.subject_id, 64).into(),
-            d.mode.as_str().into(),
-            d.outcome.as_str().into(),
-            cut(&d.reason_code, 64).into(),
-            cut(&d.summary, 512).into(),
-            json(&d.evidence)?.into(),
-            d.alternatives.as_ref().map(json).transpose()?.into(),
-            d.job_id.map(|j| j.to_vec()).into(),
-            d.parent_id.into(),
-            cut(&d.actor, 128).into(),
-            cut(&d.dc_id, 32).into(),
-            d.decided_at_us.into(),
-        ];
-        q.exec_drop(sql, params).await.map_err(map_err)?;
-        let id: Option<u64> = q
-            .query_first("SELECT LAST_INSERT_ID()")
-            .await
-            .map_err(map_err)?;
-        id.ok_or_else(|| SprigError::internal("LAST_INSERT_ID() returned nothing"))
+    /// The record store's.
+    pub async fn insert(rec: &mut dyn RecordTx, d: &NewDecision) -> Result<u64> {
+        let id = next_ids(rec, COUNTER, 1).await?;
+        let d = NewDecision {
+            component: cut(&d.component, 24),
+            kind: cut(&d.kind, 48),
+            subject_type: cut(&d.subject_type, 24),
+            subject_id: cut(&d.subject_id, 64),
+            reason_code: cut(&d.reason_code, 64),
+            summary: cut(&d.summary, 512),
+            actor: cut(&d.actor, 128),
+            dc_id: cut(&d.dc_id, 32),
+            ..d.clone()
+        };
+        let row = DecisionRow {
+            decision_id: id,
+            updated_at_us: d.decided_at_us,
+            d,
+        };
+        ROWS.put(rec, &Pk::new().u64(id), &row).await?;
+        BY_TIME
+            .put(
+                rec,
+                &Pk::new().raw(&at_key(row.d.decided_at_us)).u64(id),
+                &(),
+            )
+            .await?;
+        BY_SUBJECT
+            .put(
+                rec,
+                &subject_pk(&row.d.subject_type, &row.d.subject_id)
+                    .raw(&at_key(row.d.decided_at_us))
+                    .u64(id),
+                &(),
+            )
+            .await?;
+        Ok(id)
     }
 
     /// Sets a decision's outcome (and its job, when given).
     ///
     /// # Errors
-    /// The driver's, mapped.
-    pub async fn set_outcome<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
+    /// The record store's.
+    pub async fn set_outcome(
+        rec: &mut dyn RecordTx,
         id: u64,
         o: Outcome,
         job_id: Option<[u8; 16]>,
         at_us: i64,
     ) -> Result<()> {
-        let sql = format!(
-            "UPDATE {} SET outcome = ?, job_id = COALESCE(?, job_id), updated_at = {AT} \
-             WHERE decision_id = ?",
-            self.table()
-        );
-        q.exec_drop(sql, (o.as_str(), job_id.map(|j| j.to_vec()), at_us, id))
-            .await
-            .map_err(map_err)
+        let pk = Pk::new().u64(id);
+        if let Some(mut r) = ROWS.get_for_update::<DecisionRow>(rec, &pk).await? {
+            r.d.outcome = o;
+            if job_id.is_some() {
+                r.d.job_id = job_id;
+            }
+            r.updated_at_us = at_us;
+            ROWS.put(rec, &pk, &r).await?;
+        }
+        Ok(())
     }
 
     /// One decision.
     ///
     /// # Errors
-    /// The driver's, mapped.
-    pub async fn get<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        id: u64,
-    ) -> Result<Option<DecisionRow>> {
-        let sql = format!(
-            "SELECT {COLUMNS} FROM {} WHERE decision_id = ?",
-            self.table()
-        );
-        let row: Option<Row> = q.exec_first(sql, (id,)).await.map_err(map_err)?;
-        row.map(decode).transpose()
+    /// The record store's.
+    pub async fn get(rec: &mut dyn RecordTx, id: u64) -> Result<Option<DecisionRow>> {
+        ROWS.get(rec, &Pk::new().u64(id)).await
+    }
+
+    async fn rows_of(rec: &mut dyn RecordTx, ids: Vec<u64>) -> Result<Vec<DecisionRow>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(r) = Self::get(rec, id).await? {
+                out.push(r);
+            }
+        }
+        Ok(out)
     }
 
     /// The newest decisions about one subject, newest first.
     ///
     /// # Errors
-    /// The driver's, mapped.
-    pub async fn by_subject<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
+    /// The record store's.
+    pub async fn by_subject(
+        rec: &mut dyn RecordTx,
         subject_type: &str,
         subject_id: &str,
         limit: u32,
     ) -> Result<Vec<DecisionRow>> {
-        let sql = format!(
-            "SELECT {COLUMNS} FROM {} WHERE subject_type = ? AND subject_id = ? \
-             ORDER BY decided_at DESC, decision_id DESC LIMIT ?",
-            self.table()
-        );
-        let rows: Vec<Row> = q
-            .exec(sql, (subject_type, subject_id, limit))
-            .await
-            .map_err(map_err)?;
-        rows.into_iter().map(decode).collect()
+        let ids: Vec<u64> = BY_SUBJECT
+            .scan::<()>(rec, &subject_pk(subject_type, subject_id))
+            .await?
+            .iter()
+            .rev()
+            .filter_map(|(pk, ())| id_of(pk))
+            .take(limit as usize)
+            .collect();
+        Self::rows_of(rec, ids).await
     }
 
-    /// The newest decisions of a component and kind prefix (`shard.` for
-    /// every shard decision), newest first.
+    /// Decisions decided at or after `since_us`, newest first, passing
+    /// `keep`, at most `limit`.
+    async fn newest(
+        rec: &mut dyn RecordTx,
+        since_us: i64,
+        limit: u32,
+        keep: impl Fn(&DecisionRow) -> bool + Send,
+    ) -> Result<Vec<DecisionRow>> {
+        let lo = BY_TIME.key(&Pk::new().raw(&at_key(since_us)));
+        let hi = sprig_catalog::records::prefix_end(&BY_TIME.prefix());
+        let base = BY_TIME.prefix().len();
+        let entries = sprig_catalog::records::scan_all(rec, &lo, &hi).await?;
+        let mut out = Vec::new();
+        for (k, _) in entries.iter().rev() {
+            if out.len() >= limit as usize {
+                break;
+            }
+            let Some(id) = id_of(&Pk(k[base..].to_vec())) else {
+                continue;
+            };
+            if let Some(r) = Self::get(rec, id).await?
+                && keep(&r)
+            {
+                out.push(r);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The newest decisions of a component, newest first.
     ///
     /// # Errors
-    /// The driver's, mapped.
-    pub async fn recent<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
+    /// The record store's.
+    pub async fn recent(
+        rec: &mut dyn RecordTx,
         component: &str,
         since_us: i64,
         limit: u32,
     ) -> Result<Vec<DecisionRow>> {
-        let sql = format!(
-            "SELECT {COLUMNS} FROM {} WHERE component = ? AND decided_at >= {AT} \
-             ORDER BY decided_at DESC, decision_id DESC LIMIT ?",
-            self.table()
-        );
-        let rows: Vec<Row> = q
-            .exec(sql, (component, since_us, limit))
-            .await
-            .map_err(map_err)?;
-        rows.into_iter().map(decode).collect()
+        Self::newest(rec, since_us, limit, |r| r.d.component == component).await
     }
 
     /// The newest decisions since `since_us` that mention any of `words`
-    /// in their subject, kind, reason or summary (all of them when `words`
-    /// is empty), newest first.
+    /// (at most 8) in their subject, kind, reason or summary, without
+    /// regard to case (all of them when `words` is empty), newest first.
     ///
     /// # Errors
-    /// The driver's, mapped.
-    pub async fn search<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
+    /// The record store's.
+    pub async fn search(
+        rec: &mut dyn RecordTx,
         words: &[String],
         since_us: i64,
         limit: u32,
     ) -> Result<Vec<DecisionRow>> {
-        let mut conds = Vec::new();
-        let mut params: Vec<Value> = vec![Value::from(since_us)];
-        for w in words.iter().take(8) {
-            let like = format!(
-                "%{}%",
-                w.replace('\\', "\\\\")
-                    .replace('%', "\\%")
-                    .replace('_', "\\_")
-            );
-            conds.push(
-                "(subject_id LIKE ? OR kind LIKE ? OR reason_code LIKE ? OR summary LIKE ?)"
-                    .to_owned(),
-            );
-            for _ in 0..4 {
-                params.push(Value::from(like.as_str()));
-            }
-        }
-        let filter = if conds.is_empty() {
-            String::new()
-        } else {
-            format!(" AND ({})", conds.join(" OR "))
-        };
-        params.push(Value::from(limit));
-        let sql = format!(
-            "SELECT {COLUMNS} FROM {} WHERE decided_at >= {AT}{filter} \
-             ORDER BY decided_at DESC, decision_id DESC LIMIT ?",
-            self.table()
-        );
-        let rows: Vec<Row> = q
-            .exec(sql, mysql_async::Params::Positional(params))
-            .await
-            .map_err(map_err)?;
-        rows.into_iter().map(decode).collect()
+        let words: Vec<String> = words.iter().take(8).map(|w| w.to_lowercase()).collect();
+        Self::newest(rec, since_us, limit, |r| {
+            words.is_empty()
+                || words.iter().any(|w| {
+                    [&r.d.subject_id, &r.d.kind, &r.d.reason_code, &r.d.summary]
+                        .iter()
+                        .any(|f| f.to_lowercase().contains(w.as_str()))
+                })
+        })
+        .await
     }
 
-    /// The retention job: deletes rows decided before `before_us`, in
-    /// batches of [`PURGE_BATCH`] (index `by_time`); returns how many.
+    /// The retention job's step: deletes up to [`PURGE_BATCH`] decisions
+    /// decided before `before_us`, oldest first (a key range of the time
+    /// index); returns how many.
     ///
     /// # Errors
-    /// The driver's, mapped.
-    pub async fn purge_before<Q: Queryable + Send>(
-        &self,
-        q: &mut Q,
-        before_us: i64,
-    ) -> Result<u64> {
-        let sql = format!(
-            "DELETE FROM {} WHERE decided_at < {AT} ORDER BY decided_at LIMIT {PURGE_BATCH}",
-            self.table()
-        );
-        let mut total = 0u64;
-        loop {
-            q.exec_drop(&sql, (before_us,)).await.map_err(map_err)?;
-            let n: u64 = q
-                .query_first::<i64, _>("SELECT ROW_COUNT()")
-                .await
-                .map_err(map_err)?
-                .and_then(|n| u64::try_from(n).ok())
-                .unwrap_or(0);
-            total += n;
-            if n < u64::from(PURGE_BATCH) {
-                return Ok(total);
+    /// The record store's.
+    pub async fn purge_batch(rec: &mut dyn RecordTx, before_us: i64) -> Result<u64> {
+        let lo = BY_TIME.prefix();
+        let hi = BY_TIME.key(&Pk::new().raw(&at_key(before_us)));
+        let base = lo.len();
+        let entries = rec.scan(&lo, &hi, PURGE_BATCH as usize).await?;
+        let mut n = 0;
+        for (k, _) in entries {
+            let pk = Pk(k[base..].to_vec());
+            rec.delete(&k).await?;
+            let Some(id) = id_of(&pk) else { continue };
+            if let Some(r) = Self::get(rec, id).await? {
+                BY_SUBJECT
+                    .delete(
+                        rec,
+                        &subject_pk(&r.d.subject_type, &r.d.subject_id)
+                            .raw(&at_key(r.d.decided_at_us))
+                            .u64(id),
+                    )
+                    .await?;
+                ROWS.delete(rec, &Pk::new().u64(id)).await?;
             }
+            n += 1;
         }
+        Ok(n)
     }
 }
 
@@ -467,69 +440,6 @@ fn cut(s: &str, max: usize) -> String {
         return s.to_owned();
     }
     s.chars().take(max).collect()
-}
-
-fn json(v: &serde_json::Value) -> Result<String> {
-    serde_json::to_string(v).map_err(|e| SprigError::internal(format!("JSON encoding: {e}")))
-}
-
-fn map_err(e: mysql_async::Error) -> SprigError {
-    match &e {
-        mysql_async::Error::Server(s) => {
-            let code = s.code;
-            SprigError::backend(
-                code,
-                *b"HY000",
-                format!("decisions: statement failed ({code})"),
-            )
-            .with_source(e)
-        }
-        _ => SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e),
-    }
-}
-
-fn take<T: mysql_async::prelude::FromValue>(row: &mut Row, i: usize, name: &str) -> Result<T> {
-    match row.take_opt::<T, usize>(i) {
-        Some(Ok(v)) => Ok(v),
-        Some(Err(e)) => Err(SprigError::internal(format!("decisions.{name}: {e}"))),
-        None => Err(SprigError::internal(format!("decisions.{name} missing"))),
-    }
-}
-
-fn parse_json(raw: Option<Vec<u8>>, name: &str) -> Result<Option<serde_json::Value>> {
-    raw.map(|b| {
-        serde_json::from_slice(&b)
-            .map_err(|e| SprigError::internal(format!("decisions.{name}: bad JSON: {e}")))
-    })
-    .transpose()
-}
-
-fn decode(mut r: Row) -> Result<DecisionRow> {
-    let job: Option<Vec<u8>> = take(&mut r, 12, "job_id")?;
-    let mode: String = take(&mut r, 6, "mode")?;
-    let outcome: String = take(&mut r, 7, "outcome")?;
-    Ok(DecisionRow {
-        decision_id: take(&mut r, 0, "decision_id")?,
-        d: NewDecision {
-            decided_at_us: take(&mut r, 1, "decided_at")?,
-            component: take(&mut r, 2, "component")?,
-            kind: take(&mut r, 3, "kind")?,
-            subject_type: take(&mut r, 4, "subject_type")?,
-            subject_id: take(&mut r, 5, "subject_id")?,
-            mode: Mode::parse(&mode)?,
-            outcome: Outcome::parse(&outcome)?,
-            reason_code: take(&mut r, 8, "reason_code")?,
-            summary: take(&mut r, 9, "summary")?,
-            evidence: parse_json(take(&mut r, 10, "evidence")?, "evidence")?
-                .unwrap_or(serde_json::Value::Null),
-            alternatives: parse_json(take(&mut r, 11, "alternatives")?, "alternatives")?,
-            job_id: job.and_then(|j| <[u8; 16]>::try_from(j.as_slice()).ok()),
-            parent_id: take(&mut r, 13, "parent_id")?,
-            actor: take(&mut r, 14, "actor")?,
-            dc_id: take(&mut r, 15, "dc_id")?,
-        },
-        updated_at_us: take(&mut r, 16, "updated_at")?,
-    })
 }
 
 /// Decisions in memory, per tenant (tests and the simulator).
@@ -616,11 +526,11 @@ enum Pending {
     Record(TenantId, NewDecision),
 }
 
-/// Writes decisions to the tenant's catalog; while a catalog is
+/// Writes decisions to the tenant's catalog records; while they are
 /// unreachable, keeps up to [`BUFFER_LIMIT`] of them and retries on the
 /// next write or [`flush`](Self::flush).
 pub struct CatalogDecisionLog {
-    locator: Arc<dyn CatalogLocator>,
+    records: Arc<dyn RecordStore>,
     buffer: Mutex<VecDeque<Pending>>,
 }
 
@@ -631,11 +541,11 @@ impl fmt::Debug for CatalogDecisionLog {
 }
 
 impl CatalogDecisionLog {
-    /// A log over `locator`.
+    /// A log over the tenants' catalog records in `records`.
     #[must_use]
-    pub fn new(locator: Arc<dyn CatalogLocator>) -> Self {
+    pub fn new(records: Arc<dyn RecordStore>) -> Self {
         Self {
-            locator,
+            records,
             buffer: Mutex::new(VecDeque::new()),
         }
     }
@@ -650,24 +560,10 @@ impl CatalogDecisionLog {
     }
 
     async fn write(&self, tenant: TenantId, d: &NewDecision) -> Result<u64> {
-        let ep = self.locator.writer(tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(map_err)?;
-        let st = DecisionStore::new(ep.store.schema());
-        match st.insert(&mut conn, d).await {
-            // A catalog bootstrapped before the module existed: migrate it
-            // (idempotent, under the migrator's lock) and retry once.
-            Err(e) if matches!(e.kind, sprig_common::ErrorKind::Backend { errno: 1146, .. }) => {
-                sprig_catalog::Migrator::new(&[DECISIONS_MODULE])?
-                    .run(
-                        &mut conn,
-                        ep.store.schema(),
-                        &sprig_catalog::migrate::MigrateOpts::default(),
-                    )
-                    .await?;
-                st.insert(&mut conn, d).await
-            }
-            r => r,
-        }
+        let mut tx = self.records.begin(tenant).await?;
+        let id = DecisionStore::insert(&mut *tx, d).await?;
+        tx.commit().await?;
+        Ok(id)
     }
 
     /// Retries buffered decisions; returns how many were written.
@@ -703,20 +599,17 @@ impl CatalogDecisionLog {
     /// The decision with `id` in `tenant`'s log.
     ///
     /// # Errors
-    /// The catalog's.
+    /// The record store's.
     pub async fn get(&self, tenant: TenantId, id: u64) -> Result<Option<DecisionRow>> {
-        let ep = self.locator.reader(tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(map_err)?;
-        DecisionStore::new(ep.store.schema())
-            .get(&mut conn, id)
-            .await
+        let mut tx = self.records.begin(tenant).await?;
+        DecisionStore::get(&mut *tx, id).await
     }
 
     /// `tenant`'s newest decisions since `since_us` that mention any of
     /// `words` ([`DecisionStore::search`]).
     ///
     /// # Errors
-    /// The catalog's.
+    /// The record store's.
     pub async fn search(
         &self,
         tenant: TenantId,
@@ -724,25 +617,43 @@ impl CatalogDecisionLog {
         since_us: i64,
         limit: u32,
     ) -> Result<Vec<DecisionRow>> {
-        let ep = self.locator.reader(tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(map_err)?;
-        DecisionStore::new(ep.store.schema())
-            .search(&mut conn, words, since_us, limit)
-            .await
+        let mut tx = self.records.begin(tenant).await?;
+        DecisionStore::search(&mut *tx, words, since_us, limit).await
     }
 
-    /// The retention job for one tenant: deletes rows older than
-    /// `retention_days` before `now_us`.
+    /// The newest decisions about one subject in `tenant`'s log
+    /// ([`DecisionStore::by_subject`]).
     ///
     /// # Errors
-    /// The catalog's.
+    /// The record store's.
+    pub async fn by_subject(
+        &self,
+        tenant: TenantId,
+        subject_type: &str,
+        subject_id: &str,
+        limit: u32,
+    ) -> Result<Vec<DecisionRow>> {
+        let mut tx = self.records.begin(tenant).await?;
+        DecisionStore::by_subject(&mut *tx, subject_type, subject_id, limit).await
+    }
+
+    /// The retention job for one tenant: deletes decisions older than
+    /// `retention_days` before `now_us`, a batch per transaction.
+    ///
+    /// # Errors
+    /// The record store's.
     pub async fn purge(&self, tenant: TenantId, retention_days: u32, now_us: i64) -> Result<u64> {
-        let ep = self.locator.writer(tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(map_err)?;
         let before = now_us - i64::from(retention_days) * 86_400 * 1_000_000;
-        DecisionStore::new(ep.store.schema())
-            .purge_before(&mut conn, before)
-            .await
+        let mut total = 0;
+        loop {
+            let mut tx = self.records.begin(tenant).await?;
+            let n = DecisionStore::purge_batch(&mut *tx, before).await?;
+            tx.commit().await?;
+            total += n;
+            if n < u64::from(PURGE_BATCH) {
+                return Ok(total);
+            }
+        }
     }
 }
 
@@ -778,11 +689,9 @@ impl DecisionLog for CatalogDecisionLog {
         if id == 0 {
             return Ok(());
         }
-        let ep = self.locator.writer(tenant).await?;
-        let mut conn = ep.pool.get_conn().await.map_err(map_err)?;
-        DecisionStore::new(ep.store.schema())
-            .set_outcome(&mut conn, id, o, None, at_us)
-            .await
+        let mut tx = self.records.begin(tenant).await?;
+        DecisionStore::set_outcome(&mut *tx, id, o, None, at_us).await?;
+        tx.commit().await
     }
 }
 

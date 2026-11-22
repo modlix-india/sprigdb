@@ -120,8 +120,55 @@ pub struct GraphPartition {
     pub advice: String,
 }
 
-/// `graphs` joined with `objects` and `databases`: id, database id and
-/// name, graph name, kind, state, group, the database's default group.
+/// A graph's catalog record (`m/graph/graphs/<id>` on the engine node):
+/// the fields read here.
+#[derive(Debug, Clone, Deserialize)]
+struct GraphRecord {
+    graph_id: u64,
+    db_id: u32,
+    kind: String,
+    group_id: Option<u32>,
+    state: String,
+    #[serde(default)]
+    mirror_mode: String,
+    #[serde(default)]
+    mirror_state: String,
+}
+
+/// A native label or relationship type record (`m/graph/nodes|edges/<graph><id>`).
+#[derive(Debug, Clone, Deserialize)]
+struct SourceRecord {
+    name: String,
+}
+
+/// A property index record (`m/graph/indexes/<graph><id>`).
+#[derive(Debug, Clone, Deserialize)]
+struct IndexRecord {
+    name: String,
+    kind: String,
+    unique: bool,
+    entity: String,
+    source_id: u32,
+    properties: Vec<String>,
+    state: String,
+}
+
+/// The source id at the end of a `<graph u64><id u32>` key.
+fn source_id(pk: &sprig_catalog::records::Pk) -> Option<u32> {
+    let b = pk.0.get(pk.0.len().checked_sub(4)?..)?;
+    <[u8; 4]>::try_from(b).ok().map(u32::from_be_bytes)
+}
+
+/// The graph module's graph rows.
+const GRAPH_RECORDS: sprig_catalog::records::RowTable =
+    sprig_catalog::records::RowTable::new("graph", "graphs");
+
+/// A live graph's object and database: graph name, database name, the
+/// database's default group.
+type GraphNames = (u64, String, String, u32);
+
+/// A graph with its names: id, database id and name, graph name, kind,
+/// state, group, the database's default group.
 type GraphCatalogRow = (u64, u32, String, String, String, String, Option<u32>, u32);
 
 /// A graph's catalog row and where its shards are.
@@ -142,28 +189,46 @@ impl ShardingLoop {
         let home = self.graph_home(tenant).await?;
         let mut c = self.conn(&home).await?;
         let cat = SchemaName::catalog(tenant).to_string();
-        let have: Option<String> = c
-            .exec_first(
-                "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? \
-                 AND TABLE_NAME = 'graphs'",
-                (cat.clone(),),
+        let records = self.records.get().ok_or_else(|| {
+            SprigError::new(
+                SprigCode::CatalogUnavailable,
+                "this controller has no catalog records",
             )
-            .await
-            .map_err(|e| db_err("graph catalog", &e))?;
-        if have.is_none() {
+        })?;
+        let graphs: Vec<GraphRecord> = {
+            let mut rec = records.begin(tenant).await?;
+            GRAPH_RECORDS
+                .rows(&mut *rec, &sprig_catalog::records::Pk::new())
+                .await?
+        };
+        if graphs.is_empty() {
             return Ok(Vec::new());
         }
-        let rows: Vec<GraphCatalogRow> = c
+        let ids: Vec<String> = graphs.iter().map(|g| g.graph_id.to_string()).collect();
+        let names: Vec<GraphNames> = c
             .query(format!(
-                "SELECT g.graph_id, g.db_id, d.name, o.name, g.kind, g.state, g.group_id, \
-                 d.default_group_id \
-                 FROM {q}.graphs g JOIN {q}.objects o ON o.object_id = g.graph_id \
-                 JOIN {q}.`databases` d ON d.db_id = g.db_id \
-                 WHERE o.state <> 'dropped' ORDER BY d.name, o.name",
+                "SELECT o.object_id, o.name, d.name, d.default_group_id \
+                 FROM {q}.objects o JOIN {q}.`databases` d ON d.db_id = o.db_id \
+                 WHERE o.state <> 'dropped' AND o.object_id IN ({})",
+                ids.join(", "),
                 q = quote(&cat)
             ))
             .await
             .map_err(|e| db_err("graphs", &e))?;
+        let names: std::collections::HashMap<u64, (String, String, u32)> = names
+            .into_iter()
+            .map(|(id, name, db, dg)| (id, (db, name, dg)))
+            .collect();
+        let mut rows: Vec<GraphCatalogRow> = graphs
+            .into_iter()
+            .filter_map(|g| {
+                let (dbname, name, dg) = names.get(&g.graph_id)?.clone();
+                Some((
+                    g.graph_id, g.db_id, dbname, name, g.kind, g.state, g.group_id, dg,
+                ))
+            })
+            .collect();
+        rows.sort_by(|a, b| (&a.2, &a.3).cmp(&(&b.2, &b.3)));
         let mut out = Vec::new();
         for (id, db, dbname, name, kind, state, group, default_group) in rows {
             let shards = match group {
@@ -258,55 +323,55 @@ impl ShardingLoop {
     /// 39902 for an unknown graph; store and catalog errors.
     pub async fn graph_show(&self, tenant: TenantId, graph: &str) -> Result<GraphView> {
         let g = self.find_graph(tenant, graph).await?;
-        let home = self.graph_home(tenant).await?;
-        let mut c = self.conn(&home).await?;
-        let q = quote(&SchemaName::catalog(tenant).to_string());
         let id = g.row.graph_id;
-        let labels: Vec<String> = c
-            .query(format!(
-                "SELECT label FROM {q}.graph_node_sources WHERE graph_id = {id} ORDER BY label"
-            ))
-            .await
-            .map_err(|e| db_err("labels", &e))?;
-        let types: Vec<String> = c
-            .query(format!(
-                "SELECT type FROM {q}.graph_edge_sources WHERE graph_id = {id} ORDER BY type"
-            ))
-            .await
-            .map_err(|e| db_err("types", &e))?;
-        let idx: Vec<(String, String, bool, String, String, String, String)> = c
-            .query(format!(
-                "SELECT i.name, i.kind, i.is_unique, i.entity, \
-                 COALESCE(IF(i.entity = 'node', n.label, e.type), CAST(i.source_id AS CHAR)), \
-                 CAST(i.properties AS CHAR), i.state \
-                 FROM {q}.graph_indexes i \
-                 LEFT JOIN {q}.graph_node_sources n ON n.graph_id = i.graph_id AND n.source_id = i.source_id \
-                 LEFT JOIN {q}.graph_edge_sources e ON e.graph_id = i.graph_id AND e.source_id = i.source_id \
-                 WHERE i.graph_id = {id} ORDER BY i.name"
-            ))
-            .await
-            .unwrap_or_default();
-        let mirror: Option<String> = c
-            .query_first(format!(
-                "SELECT CONCAT(mirror_mode, '/', mirror_state) FROM {q}.graphs WHERE graph_id = {id}"
-            ))
-            .await
-            .ok()
-            .flatten();
-        drop(c);
+        let records = self.records.get().ok_or_else(|| {
+            SprigError::new(
+                SprigCode::CatalogUnavailable,
+                "this controller has no catalog records",
+            )
+        })?;
+        let mut rec = records.begin(tenant).await?;
+        let under = sprig_catalog::records::Pk::new().u64(id);
+        let table = |t| sprig_catalog::records::RowTable::new("graph", t);
+        let by_id = |rows: Vec<(sprig_catalog::records::Pk, SourceRecord)>| {
+            rows.into_iter()
+                .filter_map(|(pk, r)| source_id(&pk).map(|i| (i, r.name)))
+                .collect::<std::collections::BTreeMap<u32, String>>()
+        };
+        let label_ids = by_id(table("nodes").scan(&mut *rec, &under).await?);
+        let type_ids = by_id(table("edges").scan(&mut *rec, &under).await?);
+        let mut labels: Vec<String> = label_ids.values().cloned().collect();
+        labels.sort();
+        let mut types: Vec<String> = type_ids.values().cloned().collect();
+        types.sort();
+        let mut idx: Vec<IndexRecord> = table("indexes").rows(&mut *rec, &under).await?;
+        idx.sort_by(|a, b| a.name.cmp(&b.name));
+        let mirror = GRAPH_RECORDS
+            .get::<GraphRecord>(&mut *rec, &under)
+            .await?
+            .map(|r| format!("{}/{}", r.mirror_mode, r.mirror_state));
+        drop(rec);
         let indexes = idx
             .into_iter()
-            .map(
-                |(name, kind, unique, entity, token, props, state)| GraphIndexRow {
-                    name,
-                    kind,
-                    unique,
-                    entity,
-                    token,
-                    properties: serde_json::from_str(&props).unwrap_or_default(),
-                    state,
-                },
-            )
+            .map(|i| {
+                let names = if i.entity == "node" {
+                    &label_ids
+                } else {
+                    &type_ids
+                };
+                GraphIndexRow {
+                    token: names
+                        .get(&i.source_id)
+                        .cloned()
+                        .unwrap_or_else(|| i.source_id.to_string()),
+                    name: i.name,
+                    kind: i.kind,
+                    unique: i.unique,
+                    entity: i.entity,
+                    properties: i.properties,
+                    state: i.state,
+                }
+            })
             .collect();
         let mut shards = Vec::new();
         if g.row.kind == "native" {

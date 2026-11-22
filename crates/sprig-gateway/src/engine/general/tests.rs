@@ -136,7 +136,7 @@ fn parse(sql: &str) -> sqlparser::ast::Statement {
 }
 
 fn general(f: &Fake, sql: &str) -> sprig_common::Result<Option<General>> {
-    bind(&cx(f), &parse(sql), Some(sql), false)
+    bind(&cx(f), &parse(sql), Some(sql), None)
 }
 
 fn refused(f: &Fake, sql: &str) -> (u16, String) {
@@ -271,6 +271,7 @@ async fn select(
         params,
         seed: &s,
         deadline: None,
+        stop: None,
     };
     let rows = e
         .general_run(&g, &a, TxnOptions::default(), Env::STRICT)
@@ -610,6 +611,7 @@ async fn columns_a_statement_does_not_name_never_leave_storage() {
         params: &[],
         seed: &s,
         deadline: None,
+        stop: None,
     };
     let rows = e
         .general_run(&g, &a, TxnOptions::default(), Env::STRICT)
@@ -649,10 +651,15 @@ async fn what_the_planner_does_not_run_is_refused() {
         let (code, msg) = refused(&f, sql);
         assert_eq!(code, NOT_ON_ENGINE, "{sql}: {msg}");
     }
-    // A locking clause the seam split off the text.
+    // A locking clause the seam split off the text: the statement locks
+    // what it reads.
     let stmt = parse("SELECT status, COUNT(*) FROM orders GROUP BY status");
-    let e = bind(&cx(&f), &stmt, None, true).unwrap_err();
-    assert_eq!(e.protocol().mysql_errno, NOT_ON_ENGINE);
+    let lock = crate::engine::plan::RowLock {
+        exclusive: true,
+        wait: sprig_engine::txn::Wait::Block,
+    };
+    let g = bind(&cx(&f), &stmt, None, Some(lock)).unwrap().unwrap();
+    assert_eq!(g.lock, Some(lock));
     // A missing table of an engine database is the servers' error.
     assert_eq!(
         refused(&f, "SELECT o.id FROM orders o JOIN nope n ON n.id = o.id").0,
@@ -740,6 +747,7 @@ async fn result_columns_know_their_tables() {
         params: &[],
         seed: &s,
         deadline: None,
+        stop: None,
     };
     let rows = e
         .general_run(&g, &a, TxnOptions::default(), Env::STRICT)
@@ -859,6 +867,7 @@ async fn statements_of_a_transaction_read_its_view_and_its_writes() {
         params: &[],
         seed: &s,
         deadline: None,
+        stop: None,
     };
     let before = select(&e, &f, sql, &[]).await.unwrap();
     let mut txn = SessionTxn::default();
@@ -918,13 +927,14 @@ async fn statements_of_a_transaction_read_its_view_and_its_writes() {
     assert!(show(&g, &rows.columns, &rows.rows).contains(&"zzz|2".to_owned()));
     txn.rollback();
 
-    // SERIALIZABLE inside a transaction locks what it reads: refused here.
+    // SERIALIZABLE inside a transaction locks what it reads, and answers
+    // as a plain read would.
     let mut txn = SessionTxn::default();
     opts.isolation = Isolation::Serializable;
     txn.begin(&e, opts, false, Start::default()).unwrap();
-    let err = e.general_run_in(&g, &a, &mut txn).await.unwrap_err();
+    let locked = e.general_run_in(&g, &a, &mut txn).await.unwrap();
     txn.statement_done();
-    assert_eq!(err.protocol().mysql_errno, NOT_ON_ENGINE);
+    assert_eq!(locked.rows.len(), rows.rows.len());
     assert!(txn.is_open());
     txn.rollback();
 }
@@ -947,6 +957,7 @@ async fn a_statement_past_its_time_limit_ends_with_the_limits_error() {
             Instant::now(),
             sprig_engine::txn::errors::statement_timeout_mariadb,
         )),
+        stop: None,
     };
     let err = e
         .general_run(&g, &a, TxnOptions::default(), Env::STRICT)

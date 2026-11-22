@@ -242,7 +242,8 @@ async fn stuck_jobs_are_finished_or_rolled_back_once_old_enough() {
 async fn missing_and_outside_objects() {
     let env = billing().await;
     let s = env.schema(1);
-    // Dropped outside SprigDB: an alert, the row stays.
+    // A table missing from the schema: no alert (tables live in the
+    // storage engine, not in the schema), and the row stays.
     env.exec.drop_object(&s, ObjectKind::Table, "orders");
     // Created outside SprigDB: adopted, internal objects ignored.
     for name in ["legacy", "__sprig_dtx"] {
@@ -256,7 +257,7 @@ async fn missing_and_outside_objects() {
         );
     }
     let r = env.reconciler(now_cfg()).pass(env.tenant).await.unwrap();
-    assert_eq!(r.objects_missing, ["billing.orders"]);
+    assert!(r.objects_missing.is_empty(), "{:?}", r.objects_missing);
     assert_eq!(r.adopted, 1);
     assert!(env.live("orders").is_some());
     assert_eq!(env.live("legacy").unwrap().state, ObjectState::Active);
@@ -546,7 +547,8 @@ impl GroupMaps for GroupedTables {
 
 /// A table moved into a table group lives in the group's shard schemas
 /// (perhaps on another cluster), not the database's default shard: no
-/// `object_missing` for it; any other table still gets one.
+/// `object_missing` for it. Tables are never compared with the schema any
+/// more (they live in the storage engine), so neither is any other table.
 #[tokio::test]
 async fn grouped_tables_are_not_missing_from_the_default_shard() {
     let env = billing().await;
@@ -558,12 +560,12 @@ async fn grouped_tables_are_not_missing_from_the_default_shard() {
         .with_group_maps(Arc::new(GroupedTables([orders].into())));
     let r = rec.pass(env.tenant).await.unwrap();
     assert!(r.objects_missing.is_empty(), "{:?}", r.objects_missing);
-    // Without the membership, it is reported as before.
+    // Without the membership: still no alert, it is a table.
     let rec = env
         .reconciler(now_cfg())
         .with_group_maps(Arc::new(GroupedTables(BTreeSet::new())));
     let r = rec.pass(env.tenant).await.unwrap();
-    assert_eq!(r.objects_missing, ["billing.orders"]);
+    assert!(r.objects_missing.is_empty(), "{:?}", r.objects_missing);
 }
 
 /// A split's new shard schemas start empty, and a retired

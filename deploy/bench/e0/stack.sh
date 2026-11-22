@@ -101,6 +101,12 @@ up_redis() {
 up_sprig() {
     local bin=${SPRIG_BIN:-$E0_WORK/bin/before}
     [[ -x $bin/sprigdb && -x $bin/sprigctl ]] || { e0_say "no Linux sprigdb/sprigctl in $bin (run e0/build-linux.sh before)"; exit 2; }
+    # Docker creates a missing bind-mount source as an empty root-owned directory, and the node then fails
+    # much later ("workload master key file ... isn't a regular file"): check the sources first.
+    local f
+    for f in "$E0_CONF/workload-keys.dev" "$E0_CONF/mariadb/binlog.cnf" "$E0_CONF/gateway-certs/server.pem" "$E0_CONF/gateway-certs/server-key.pem"; do
+        [[ -f $f ]] || { e0_say "missing $f (E0_CONF=$E0_CONF; on a benchmark VM ship deploy/compose's files there)"; exit 2; }
+    done
     rmc e0bench-sprig e0bench-sprigmaria e0bench-etcd
     $D run -d --name e0bench-etcd $(hn e0bench-etcd) "${SUT[@]}" -m 256m --memory-swap 256m "$IMG_ETCD" etcd --name=e0 \
         --data-dir=/etcd-data --listen-client-urls="http://0.0.0.0:${E0_ETCD_ADDR##*:}" --advertise-client-urls="http://$E0_ETCD_ADDR" \
@@ -108,7 +114,7 @@ up_sprig() {
         --initial-cluster=e0=http://127.0.0.1:2380 --auto-compaction-mode=periodic --auto-compaction-retention=1h >/dev/null
     # shellcheck disable=SC2046
     $D run -d --name e0bench-sprigmaria $(hn e0bench-sprigmaria) "${SUT[@]}" -e MARIADB_ROOT_PASSWORD="$E0_ROOT_PW" \
-        -v "$E0_ROOT/deploy/compose/mariadb/binlog.cnf:/etc/mysql/conf.d/10-binlog.cnf:ro" \
+        -v "$E0_CONF/mariadb/binlog.cnf:/etc/mysql/conf.d/10-binlog.cnf:ro" \
         "$IMG_MARIADB" --port="${E0_CATALOG_ADDR##*:}" $(innodb_args) --innodb-log-file-size=1G --server-id=1 --gtid-domain-id=1 >/dev/null
     wait_sql e0bench-sprigmaria "$(e0_host "${E0_CATALOG_ADDR%:*}")" "${E0_CATALOG_ADDR##*:}"
     for _ in $(seq 1 60); do $D exec e0bench-sprigmaria mariadb --skip-ssl -h127.0.0.1 -P"${E0_CATALOG_ADDR##*:}" -uroot -p"$E0_ROOT_PW" -e 'SELECT 1' >/dev/null 2>&1 && break; sleep 1; done
@@ -117,8 +123,8 @@ up_sprig() {
         -e E0_ENGINE="${E0_ENGINE:-0}" -e E0_CACHE_MB="$E0_CACHE_MB" -e E0_ETCD_ADDR="$E0_ETCD_ADDR" -e E0_CATALOG_ADDR="$E0_CATALOG_ADDR" \
         -e E0_PORT_NODE_SQL="$E0_PORT_NODE_SQL" -e E0_PORT_NODE_MARIADB="$E0_PORT_NODE_MARIADB" -e E0_PORT_NODE_REDIS="$E0_PORT_NODE_REDIS" \
         -v "$bin:/opt/sprig:ro" -v "$E0_DIR:/opt/e0:ro" \
-        -v "$E0_ROOT/deploy/compose/workload-keys.dev:/opt/e0conf-x/workload-keys.dev:ro" \
-        -v "$E0_ROOT/deploy/compose/gateway-certs:/opt/e0conf-x/certs:ro" \
+        -v "$E0_CONF/workload-keys.dev:/opt/e0conf-x/workload-keys.dev:ro" \
+        -v "$E0_CONF/gateway-certs:/opt/e0conf-x/certs:ro" \
         "$IMG_RUN" bash /opt/e0/conf/sprig-up.sh >/dev/null
     wait_node
     e0_say "sprig up ($bin): mysql e0bench-sprig:3306 (sbtest), redis e0bench-sprig:6379, user bench.app"
