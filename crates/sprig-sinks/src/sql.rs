@@ -22,7 +22,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use mysql_async::prelude::Queryable;
 use serde_json::{Map, Value};
 use sprig_common::ids::TenantId;
 use sprig_common::{Result, SprigCode};
@@ -1741,22 +1740,22 @@ pub fn render_sink(d: &SinkDef) -> String {
     s
 }
 
-/// Applies a change inside the caller's catalog change: the sink rows go
-/// to its records (`rec`), a dropped or reset sink's consumer-group rows
-/// of the MariaDB stream path to its transaction (`q`, catalog `schema`).
+/// Applies a change inside the caller's catalog change `tx`: the sink rows
+/// go to its records; a dropped or reset sink's consumer-group rows of the
+/// MariaDB stream path go to the catalog schema ([`MariaTx::sql`]).
+///
+/// [`MariaTx::sql`]: sprig_catalog::version::MariaTx::sql
 ///
 /// # Errors
 /// The catalog's; 39211 for a taken name; 39216 when sealing fails.
-#[allow(clippy::too_many_arguments)]
-pub async fn apply<Q: Queryable + Send>(
-    q: &mut Q,
-    schema: &str,
-    rec: &mut dyn sprig_catalog::records::RecordTx,
+pub async fn apply(
+    tx: &mut sprig_catalog::version::MariaTx,
     change: &Change,
     keys: Option<&dyn SinkKeyring>,
     tenant: TenantId,
     user: u32,
 ) -> Result<()> {
+    let rec = tx.records().await?;
     match change {
         Change::InsertConnection(def, secrets) => {
             SinksStore::insert_connection(rec, def).await?;
@@ -1771,24 +1770,29 @@ pub async fn apply<Q: Queryable + Send>(
         Change::UpdateSink(def) => SinksStore::update_sink(rec, def).await?,
         Change::ResetSink(def) => {
             SinksStore::update_sink(rec, def).await?;
-            let streams = sprig_streams::StreamsStore::new(schema);
-            if streams.migrated(q).await.unwrap_or(true) {
-                streams.delete_group(q, &def.group()).await?;
-            }
+            delete_sql_group(tx, &def.group()).await?;
         }
         // The state record is written after the commit (`after_commit`);
         // the change itself moves the catalog version.
         Change::State(..) => {}
         Change::DropSink(def) => {
             SinksStore::delete_sink(rec, def.id).await?;
-            let streams = sprig_streams::StreamsStore::new(schema);
-            // A tenant whose catalog never held a stream (a fan-in sink's
-            // declarer whose task never ran) has no group tables.
-            if streams.migrated(q).await.unwrap_or(true) {
-                streams.delete_group(q, &def.group()).await?;
-            }
+            delete_sql_group(tx, &def.group()).await?;
         }
         Change::Usage(u, grant) => SinksStore::set_usage(rec, u, *grant, user).await?,
+    }
+    Ok(())
+}
+
+/// Deletes a sink's consumer group from the MariaDB stream path's tables in
+/// the catalog schema (streams on the engine keep their groups as engine
+/// records). A tenant whose catalog never held such a stream (a fan-in
+/// sink's declarer whose task never ran) has no group tables.
+async fn delete_sql_group(tx: &mut sprig_catalog::version::MariaTx, group: &str) -> Result<()> {
+    let (store, q) = tx.sql().await?;
+    let streams = sprig_streams::StreamsStore::new(store.schema());
+    if streams.migrated(q).await.unwrap_or(true) {
+        streams.delete_group(q, group).await?;
     }
     Ok(())
 }

@@ -448,11 +448,13 @@ impl Host for GwHost<'_> {
 
     async fn next_id(&mut self) -> Result<u64> {
         let ts = self.ts().ok_or_else(|| SprigError::internal("no tenant"))?;
-        let ep = ts.services().locator.writer(self.cat.tenant).await?;
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-        })?;
-        Ok(ep.store.next_object_id(&mut conn).await?.0)
+        Ok(ts
+            .services()
+            .catalog
+            .backend()
+            .next_object_id(self.cat.tenant)
+            .await?
+            .0)
     }
 
     async fn commit(&mut self, change: Change) -> Result<()> {
@@ -474,14 +476,7 @@ impl Host for GwHost<'_> {
         }
         let mut c = svc.catalog.change(tenant, VersionKind::Catalog).await?;
         let keys = keyring();
-        let applied = match c.tx().split().await {
-            Err(e) => Err(e),
-            Ok((store, tx, rec)) => {
-                let schema = store.schema().to_owned();
-                sprig_sinks::sql::apply(tx, &schema, rec, &change, keys.as_deref(), tenant, user)
-                    .await
-            }
-        };
+        let applied = sprig_sinks::sql::apply(c.tx(), &change, keys.as_deref(), tenant, user).await;
         if let Err(e) = applied {
             let _ = c.rollback().await;
             return Err(e);

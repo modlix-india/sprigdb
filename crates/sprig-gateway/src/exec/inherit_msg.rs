@@ -1188,12 +1188,7 @@ pub(super) fn check_quota(svc: &TenantServices, cat: &TenantCatalog, own: &MsgSt
 }
 
 pub(super) async fn next_object_id(svc: &TenantServices, t: TenantId) -> Result<u64> {
-    use sprig_catalog::CatalogLocator;
-    let ep = svc.locator.writer(t).await?;
-    let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-        SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-    })?;
-    Ok(ep.store.next_object_id(&mut conn).await?.0)
+    Ok(svc.catalog.backend().next_object_id(t).await?.0)
 }
 
 /// Every member holding an instance of stream definition `def` re-applies

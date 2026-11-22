@@ -68,16 +68,16 @@ use std::time::Duration;
 
 use mysql_async::{Transaction, TxOpts};
 use serde::{Deserialize, Serialize};
-use sprig_common::ids::TenantId;
+use sprig_common::ids::{ObjectId, TenantId};
 use sprig_common::time::{Clock, SystemClock};
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_meta::{Cmp, Consistency, Key, Leadership, MetaStore, Op, Record, Txn, Versioned};
 
 use crate::pool_wait::Bounded as _;
-use crate::records::staged::{self, Ops, StagedTx, Staging};
-use crate::records::{RecordStore, RecordTx};
+use crate::records::{RecBackend, RecTx, RecordStore, RecordTx};
 use crate::sql::{map_err, timed};
-use crate::store::{CatalogLocator, PurgeReport, Snapshot, Store};
+use crate::store::rec::CoreRecords;
+use crate::store::{CatalogLocator, Counter, ObjectRow, ObjectState, PurgeReport, Snapshot, Store};
 
 pub mod mem;
 #[cfg(test)]
@@ -855,7 +855,7 @@ impl<B: VersionBackend> Change<B> {
     }
 }
 
-// ---- MariaDB ----
+// ---- the catalog writer ----
 
 /// Timeouts of the MariaDB backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -875,7 +875,13 @@ impl Default for MariaOpts {
     }
 }
 
-/// The catalog writer in MariaDB.
+/// The catalog writer. With a record store ([`with_records`](Self::with_records),
+/// every server process) the catalog — the core rows, the version and
+/// every module's rows — is the engine's catalog records and a change is
+/// one engine transaction ([`RecBackend`]); MariaDB is reached only for
+/// the tables the MariaDB data paths still keep in the tenant's catalog
+/// schema ([`MariaTx::sql`]). Without one (MariaDB-only tests and tools),
+/// the core rows and the version row are the catalog schema's tables.
 #[derive(Clone)]
 pub struct MariaBackend {
     locator: Arc<dyn CatalogLocator>,
@@ -888,6 +894,7 @@ impl std::fmt::Debug for MariaBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MariaBackend")
             .field("opts", &self.opts)
+            .field("records", &self.records.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -904,8 +911,8 @@ impl MariaBackend {
         }
     }
 
-    /// The same backend with modules' rows on the catalog version kept as
-    /// the engine's catalog records (`records`): [`MariaTx::records`].
+    /// The same backend with the catalog on the engine's catalog records
+    /// (`records`): every change is one engine transaction.
     #[must_use]
     pub fn with_records(mut self, records: Arc<dyn RecordStore>) -> Self {
         self.records = Some(records);
@@ -937,95 +944,109 @@ impl MariaBackend {
     pub fn opts(&self) -> MariaOpts {
         self.opts
     }
+
+    /// The catalog's record store, when the catalog is on records.
+    #[must_use]
+    pub fn records(&self) -> Option<&Arc<dyn RecordStore>> {
+        self.records.as_ref()
+    }
+
+    fn rec(&self) -> Option<RecBackend> {
+        self.records
+            .as_ref()
+            .map(|r| RecBackend::new(Arc::clone(r)).with_clock(Arc::clone(&self.clock)))
+    }
+
+    /// Reserves `n` ids from `counter` outside any change (ids are never
+    /// handed out twice and never reused); the first of them.
+    ///
+    /// # Errors
+    /// 39070 when the catalog can't be reached; 39071 when the counter
+    /// stays locked; 39072 for a MariaDB catalog without the counter.
+    pub async fn next_ids(&self, tenant: TenantId, counter: Counter, n: u64) -> Result<u64> {
+        if let Some(r) = &self.records {
+            let mut tx = r.begin(tenant).await?;
+            let first = CoreRecords::next_ids(&mut *tx, counter, n).await;
+            return match first {
+                Ok(first) => {
+                    tx.commit().await?;
+                    Ok(first)
+                }
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    Err(e)
+                }
+            };
+        }
+        let ep = self.locator.writer(tenant).await?;
+        timed(self.opts.statement_timeout, "next ids", async {
+            let mut c = ep.pool.get_conn_bounded().await.map_err(map_err)?;
+            ep.store.next_ids(&mut c, counter, n).await
+        })
+        .await
+    }
+
+    /// The next object id, outside any change.
+    ///
+    /// # Errors
+    /// As [`next_ids`](Self::next_ids).
+    pub async fn next_object_id(&self, tenant: TenantId) -> Result<ObjectId> {
+        Ok(ObjectId(self.next_ids(tenant, Counter::Object, 1).await?))
+    }
 }
 
-/// An open MariaDB transaction on a tenant's catalog writer.
+/// An open transaction on a tenant's catalog, holding a version row.
 pub struct MariaTx {
-    tx: Transaction<'static>,
-    store: Store,
     tenant: TenantId,
-    records: Option<Arc<dyn RecordStore>>,
-    staged: Option<Staging>,
+    inner: Inner,
+}
+
+enum Inner {
+    /// The core rows and the version row in the catalog schema.
+    Maria {
+        tx: Transaction<'static>,
+        store: Store,
+    },
+    /// The catalog on records; a MariaDB transaction on the catalog schema
+    /// once a MariaDB data path's own tables are written.
+    Engine {
+        rec: RecTx,
+        sql: Option<(Transaction<'static>, Store)>,
+        locator: Arc<dyn CatalogLocator>,
+        timeout: Duration,
+    },
 }
 
 impl std::fmt::Debug for MariaTx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MariaTx")
-            .field("store", &self.store)
             .field("tenant", &self.tenant)
-            .field("staged", &self.staged)
+            .field("records", &self.on_records())
             .finish_non_exhaustive()
     }
 }
 
 impl MariaTx {
-    /// Modules' rows on the catalog version, as engine catalog records
-    /// (`crate::records::staged`): reads see the engine's records with
-    /// this change's writes merged in; the writes commit with the change.
-    /// The first call catches the engine up with the catalog's record log.
+    /// The catalog's records, in this change: the core rows and every
+    /// module's rows on the catalog version.
     ///
     /// # Errors
-    /// 39070 when this process has no record store or the engine can't be
-    /// reached; 39072 when the catalog has no record log yet (its core
-    /// migration to format 2 didn't run).
+    /// 39070 when this process's catalog isn't on records (a MariaDB-only
+    /// test or tool).
+    #[allow(clippy::unused_async)] // callers await it, as when it caught up a log
     pub async fn records(&mut self) -> Result<&mut dyn RecordTx> {
-        if self.staged.is_none() {
-            let store = self.records.clone().ok_or_else(|| {
-                crate::records::unavailable("this process has no engine catalog records")
-            })?;
-            let tenant = self.tenant;
-            let mut probe = store.begin(tenant).await?;
-            let mark = staged::applied(&mut *probe).await;
-            let _ = probe.rollback().await;
-            let mark = mark?;
-            let log = self.store.rec_log_after(&mut self.tx, mark, true).await?;
-            if !log.present {
-                return Err(SprigError::new(
-                    SprigCode::TenantNotReady,
-                    "the catalog has no record log yet; migrate it first",
-                ));
-            }
-            if mark > log.last.max(log.purged) {
-                // The engine applied log rows the catalog no longer has (a
-                // catalog restored or failed over past them, or a recreated
-                // log): new rows would reuse their sequence numbers and the
-                // engine would skip them. Refuse rather than lose writes.
-                return Err(crate::records::unavailable(format!(
-                    "the engine's catalog records (applied up to {mark}) are ahead of the \
-                     catalog's record log (last {}, purged {}); the tenant needs repair",
-                    log.last, log.purged
-                )));
-            }
-            if log.purged > mark {
-                tracing::warn!(%tenant, applied = mark, purged = log.purged,
-                    "the engine's catalog records are behind the catalog's purged record log \
-                     (a new engine directory?): module rows written before are missing");
-            }
-            let mut entries = Vec::with_capacity(log.rows.len());
-            for (seq, raw) in &log.rows {
-                entries.push((*seq, Ops::decode(raw)?));
-            }
-            let seen = if entries.is_empty() {
-                mark.max(log.last)
-            } else {
-                staged::apply_log(&*store, tenant, &entries, None).await?
-            };
-            if seen > 0 {
-                let now = std::time::SystemTime::now();
-                self.store.rec_log_purge(&mut self.tx, seen, 0, now).await?;
-            }
-            let base = store.begin(tenant).await?;
-            self.staged = Some(Staging {
-                store,
-                tenant,
-                tx: StagedTx::new(base),
-                seen,
-            });
+        match &mut self.inner {
+            Inner::Engine { rec, .. } => Ok(rec.records()),
+            Inner::Maria { .. } => Err(crate::records::unavailable(
+                "this process has no engine catalog records",
+            )),
         }
-        match self.staged.as_mut() {
-            Some(s) => Ok(&mut s.tx),
-            None => Err(SprigError::internal("staged records missing")),
-        }
+    }
+
+    /// Whether the catalog is on records.
+    #[must_use]
+    pub fn on_records(&self) -> bool {
+        matches!(self.inner, Inner::Engine { .. })
     }
 
     /// The tenant.
@@ -1034,46 +1055,110 @@ impl MariaTx {
         self.tenant
     }
 
-    /// The store, the transaction and the change's records at once (a
-    /// change writing rows in both).
+    /// The catalog schema's store and a MariaDB transaction on it, for the
+    /// tables the MariaDB data paths keep there (their table groups, stream
+    /// and graph tables). On records, the transaction opens on first use
+    /// and commits just before the change's engine transaction: the two
+    /// are not one commit, which only those MariaDB paths depend on.
     ///
     /// # Errors
-    /// As [`records`](Self::records).
-    pub async fn split(
-        &mut self,
-    ) -> Result<(&Store, &mut Transaction<'static>, &mut dyn RecordTx)> {
-        self.records().await?;
-        match self.staged.as_mut() {
-            Some(st) => Ok((&self.store, &mut self.tx, &mut st.tx)),
-            None => Err(SprigError::internal("staged records missing")),
+    /// 39070 when the catalog's MariaDB writer can't be reached.
+    pub async fn sql(&mut self) -> Result<(&Store, &mut Transaction<'static>)> {
+        let tenant = self.tenant;
+        if let Inner::Engine {
+            sql: sql @ None,
+            locator,
+            timeout,
+            ..
+        } = &mut self.inner
+        {
+            let ep = locator.writer(tenant).await?;
+            let tx = timed(*timeout, "begin", async {
+                ep.pool
+                    .start_transaction_bounded(TxOpts::default())
+                    .await
+                    .map_err(map_err)
+            })
+            .await?;
+            *sql = Some((tx, ep.store));
+        }
+        match &mut self.inner {
+            Inner::Maria { tx, store }
+            | Inner::Engine {
+                sql: Some((tx, store)),
+                ..
+            } => Ok((&*store, tx)),
+            Inner::Engine { sql: None, .. } => Err(SprigError::internal("catalog SQL missing")),
         }
     }
 
-    /// The catalog's store.
-    #[must_use]
-    pub fn store(&self) -> &Store {
-        &self.store
+    /// The objects among `ids`, tombstones included, by id.
+    ///
+    /// # Errors
+    /// The catalog's.
+    pub async fn objects_by_ids(&mut self, ids: &[ObjectId]) -> Result<Vec<ObjectRow>> {
+        match &mut self.inner {
+            Inner::Engine { rec, .. } => CoreRecords::objects_by_ids(rec.records(), ids).await,
+            Inner::Maria { tx, store } => store.objects_by_ids(tx, ids).await,
+        }
     }
 
-    /// The transaction, to run store calls on.
-    pub fn conn(&mut self) -> &mut Transaction<'static> {
-        &mut self.tx
+    /// Moves an object to `state` with `version` (a drop: `Dropped`, which
+    /// frees its name). Returns whether the object exists.
+    ///
+    /// # Errors
+    /// The catalog's.
+    pub async fn set_object_state(
+        &mut self,
+        object: ObjectId,
+        state: ObjectState,
+        version: u64,
+    ) -> Result<bool> {
+        match &mut self.inner {
+            Inner::Engine { rec, .. } => {
+                CoreRecords::set_object_state(rec.records(), object, state, version).await
+            }
+            Inner::Maria { tx, store } => store.set_object_state(tx, object, state, version).await,
+        }
     }
 
-    /// Both at once: `let (s, q) = tx.parts(); s.put_setting(q, &row).await?`.
-    pub fn parts(&mut self) -> (&Store, &mut Transaction<'static>) {
-        (&self.store, &mut self.tx)
+    /// Where this change's core rows are, for the core calls.
+    pub(crate) fn core(&mut self) -> Core<'_> {
+        match &mut self.inner {
+            Inner::Engine { rec, .. } => Core::Rec(rec.records()),
+            Inner::Maria { tx, store } => Core::Sql(store, tx),
+        }
     }
 }
 
-/// Tries of the engine apply after a change's MariaDB commit.
-const APPLY_ATTEMPTS: u32 = 4;
+/// Where a change's core rows are.
+pub(crate) enum Core<'a> {
+    /// Engine records.
+    Rec(&'a mut dyn RecordTx),
+    /// The catalog schema.
+    Sql(&'a Store, &'a mut Transaction<'static>),
+}
 
 #[async_trait::async_trait]
 impl VersionBackend for MariaBackend {
     type Tx = MariaTx;
 
     async fn begin_locked(&self, tenant: TenantId, kind: VersionKind) -> Result<(MariaTx, u64)> {
+        if let Some(rb) = self.rec() {
+            let (rec, v) = rb.begin_locked(tenant, kind).await?;
+            return Ok((
+                MariaTx {
+                    tenant,
+                    inner: Inner::Engine {
+                        rec,
+                        sql: None,
+                        locator: Arc::clone(&self.locator),
+                        timeout: self.opts.statement_timeout,
+                    },
+                },
+                v,
+            ));
+        }
         let ep = self.locator.writer(tenant).await?;
         let mut tx = timed(self.opts.statement_timeout, "begin", async {
             ep.pool
@@ -1091,86 +1176,70 @@ impl VersionBackend for MariaBackend {
         .await?;
         Ok((
             MariaTx {
-                tx,
-                store: ep.store,
                 tenant,
-                records: self.records.clone(),
-                staged: None,
+                inner: Inner::Maria {
+                    tx,
+                    store: ep.store,
+                },
             },
             v,
         ))
     }
 
-    async fn commit(&self, mut tx: MariaTx, kind: VersionKind, version: u64) -> Result<()> {
+    async fn commit(&self, tx: MariaTx, kind: VersionKind, version: u64) -> Result<()> {
         let now = self.clock.wall();
-        let mut staged = tx.staged.take();
-        let ops = staged.as_mut().map(|s| s.tx.take_ops()).unwrap_or_default();
-        let committed = timed(self.opts.statement_timeout, "commit", async {
-            let seq = if ops.is_empty() {
-                None
-            } else {
-                Some(
-                    tx.store
-                        .rec_log_append(&mut tx.tx, version, &ops.encode())
-                        .await?,
-                )
-            };
-            tx.store.set_version(&mut tx.tx, kind, version, now).await?;
-            tx.tx.commit().await.map_err(map_err)?;
-            Ok(seq)
-        })
-        .await;
-        let Some(st) = staged else {
-            return committed.map(|_| ());
-        };
-        let Staging {
-            store,
-            tenant,
-            tx: stx,
-            seen,
-        } = st;
-        stx.finish().await;
-        let seq = committed?;
-        if let Some(seq) = seq {
-            // The engine applies the change's records now, retried a few
-            // times: readers outside snapshots (workers, the controller)
-            // read the engine's records directly. If it still can't, the
-            // log keeps them and the next change (or load) catches up.
-            let mut wait = std::time::Duration::from_millis(20);
-            for attempt in 1..=APPLY_ATTEMPTS {
-                match staged::apply_log(&*store, tenant, &[(seq, ops.clone())], Some(seen)).await {
-                    Ok(_) => break,
-                    Err(e) if attempt == APPLY_ATTEMPTS => {
-                        tracing::warn!(%tenant, seq, error = %e,
-                            "catalog records not applied after commit; the next change applies them");
+        match tx.inner {
+            Inner::Maria { mut tx, store } => {
+                timed(self.opts.statement_timeout, "commit", async {
+                    store.set_version(&mut tx, kind, version, now).await?;
+                    tx.commit().await.map_err(map_err)
+                })
+                .await
+            }
+            Inner::Engine { rec, sql, .. } => {
+                if let Some((sql, _)) = sql {
+                    let committed = timed(self.opts.statement_timeout, "commit", async {
+                        sql.commit().await.map_err(map_err)
+                    })
+                    .await;
+                    if let Err(e) = committed {
+                        let _ = rec.into_records().rollback().await;
+                        return Err(e);
                     }
-                    Err(e) => {
-                        tracing::debug!(%tenant, seq, attempt, error = %e,
-                            "catalog records not applied after commit; retrying");
-                        tokio::time::sleep(wait).await;
-                        wait *= 4;
-                    }
+                }
+                match self.rec() {
+                    Some(rb) => rb.commit(rec, kind, version).await,
+                    None => Err(SprigError::internal("catalog records missing")),
                 }
             }
         }
-        Ok(())
     }
 
-    async fn rollback(&self, mut tx: MariaTx) -> Result<()> {
-        if let Some(st) = tx.staged.take() {
-            st.tx.finish().await;
+    async fn rollback(&self, tx: MariaTx) -> Result<()> {
+        match tx.inner {
+            Inner::Maria { tx, .. } => {
+                timed(self.opts.statement_timeout, "rollback", async {
+                    tx.rollback().await.map_err(map_err)
+                })
+                .await
+            }
+            Inner::Engine { rec, sql, .. } => {
+                if let Some((sql, _)) = sql {
+                    let _ = timed(self.opts.statement_timeout, "rollback", async {
+                        sql.rollback().await.map_err(map_err)
+                    })
+                    .await;
+                }
+                rec.into_records().rollback().await
+            }
         }
-        timed(self.opts.statement_timeout, "rollback", async {
-            tx.tx.rollback().await.map_err(map_err)
-        })
-        .await
     }
 }
 
-/// The catalog over MariaDB.
+/// The catalog.
 pub type MariaCatalog = Versioner<MariaBackend>;
 
-/// An open versioned change on a MariaDB catalog.
+/// An open versioned change on the catalog.
 pub type CatalogTx = Change<MariaBackend>;
 
 /// The catalog store interface: versioned changes and
@@ -1191,6 +1260,12 @@ impl CatalogStore for MariaCatalog {
     }
 
     async fn snapshot(&self, t: TenantId, since: Option<u64>) -> Result<Snapshot> {
+        if let Some(r) = self.backend().records() {
+            let mut tx = r.begin(t).await?;
+            let snap = CoreRecords::snapshot(&mut *tx, since).await;
+            let _ = tx.rollback().await;
+            return snap;
+        }
         let ep = self.backend().locator().reader(t).await?;
         timed(
             self.backend().opts.statement_timeout * 4,
@@ -1205,7 +1280,7 @@ impl MariaCatalog {
     /// Purges tombstones changed at or before `up_to` (clamped to the
     /// committed catalog version), holding the catalog version row so no
     /// change commits meanwhile. Allocates no version: caches at or above
-    /// the new `sprig.purged_version` have already applied every purged
+    /// the new purged version have already applied every purged
     /// tombstone. The reconciler picks `up_to` as the newest version
     /// committed more than `catalog.tombstone_retention_hours` ago.
     ///
@@ -1218,12 +1293,35 @@ impl MariaCatalog {
             .await?;
         let up_to = up_to.min(committed);
         let limit = self.backend.opts.statement_timeout * 4;
-        let r = timed(limit, "purge", async {
-            let report = tx.store.purge(&mut tx.tx, up_to).await?;
-            tx.tx.commit().await.map_err(map_err)?;
+        if tx.on_records() {
+            let r = timed(
+                limit,
+                "purge",
+                CoreRecords::purge(tx.records().await?, up_to),
+            )
+            .await;
+            return match r {
+                Ok(report) => {
+                    // Committing at the same version allocates nothing.
+                    self.backend
+                        .commit(tx, VersionKind::Catalog, committed)
+                        .await?;
+                    Ok(report)
+                }
+                Err(e) => {
+                    let _ = self.backend.rollback(tx).await;
+                    Err(e)
+                }
+            };
+        }
+        let Inner::Maria { tx: mut mtx, store } = tx.inner else {
+            return Err(SprigError::internal("catalog transaction kind"));
+        };
+        timed(limit, "purge", async {
+            let report = store.purge(&mut mtx, up_to).await?;
+            mtx.commit().await.map_err(map_err)?;
             Ok(report)
         })
-        .await?;
-        Ok(r)
+        .await
     }
 }

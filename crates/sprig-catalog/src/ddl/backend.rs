@@ -10,12 +10,14 @@ use sprig_common::{Result, SprigCode, SprigError};
 
 use crate::cache::mem::{MemSource, MemSourceTx};
 use crate::pool_wait::Bounded as _;
+use crate::records::RecordTx;
 use crate::sql::{map_err, timed};
+use crate::store::rec::CoreRecords;
 use crate::store::{
     Counter, DatabaseRow, DbState, Namespace, ObjectRow, ObjectState, PurgeReport,
     SchemaVersionRow, SettingRow, SettingScope, Snapshot,
 };
-use crate::version::{MariaBackend, MariaTx, VersionBackend, VersionKind};
+use crate::version::{Core, MariaBackend, MariaTx, VersionBackend, VersionKind};
 
 /// Rows a DDL reads and writes inside an open change (or a locked
 /// version row). Reads see the transaction's own writes.
@@ -29,6 +31,16 @@ pub trait DdlTx: Send {
     /// # Errors
     /// 39070 or a backend error.
     async fn query_rows(&mut self, _sql: &str) -> Result<Option<Vec<Vec<Option<String>>>>> {
+        Ok(None)
+    }
+
+    /// The catalog's records inside this change (modules' rows on the
+    /// catalog version), when the catalog is on records; `None` elsewhere
+    /// (the in-memory catalog of unit tests, a MariaDB-only catalog).
+    ///
+    /// # Errors
+    /// The store's.
+    async fn catalog_records(&mut self) -> Result<Option<&mut dyn RecordTx>> {
         Ok(None)
     }
 
@@ -179,13 +191,24 @@ where
     async fn purge(&self, tenant: TenantId, up_to: u64) -> Result<PurgeReport>;
 }
 
-// ---- MariaDB ----
+// ---- the catalog writer ----
+
+/// One core call on a change's transaction: on records or on the catalog
+/// schema.
+macro_rules! core_call {
+    ($tx:expr, |$r:ident| $rec:expr, |$s:ident, $q:ident| $sql:expr) => {
+        match $tx.core() {
+            Core::Rec($r) => $rec,
+            Core::Sql($s, $q) => $sql,
+        }
+    };
+}
 
 #[async_trait::async_trait]
 impl DdlTx for MariaTx {
     async fn query_rows(&mut self, sql: &str) -> Result<Option<Vec<Vec<Option<String>>>>> {
         use mysql_async::prelude::Queryable;
-        let (st, q) = self.parts();
+        let (st, q) = self.sql().await?;
         let sql = sql.replace("{catalog}", &sprig_common::names::quote(st.schema()));
         match q.query::<mysql_async::Row, _>(sql).await {
             Ok(rows) => Ok(Some(
@@ -209,24 +232,40 @@ impl DdlTx for MariaTx {
         }
     }
 
+    async fn catalog_records(&mut self) -> Result<Option<&mut dyn RecordTx>> {
+        if self.on_records() {
+            self.records().await.map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn database(&mut self, db: DbId) -> Result<Option<DatabaseRow>> {
-        let (s, q) = self.parts();
-        s.database(q, db).await
+        core_call!(self, |r| CoreRecords::database(r, db).await, |s, q| s
+            .database(q, db)
+            .await)
     }
 
     async fn database_by_name(&mut self, name_key: &str) -> Result<Option<DatabaseRow>> {
-        let (s, q) = self.parts();
-        s.database_by_name(q, name_key).await
+        core_call!(
+            self,
+            |r| CoreRecords::database_by_name(r, name_key).await,
+            |s, q| s.database_by_name(q, name_key).await
+        )
     }
 
     async fn databases(&mut self) -> Result<Vec<DatabaseRow>> {
-        let (s, q) = self.parts();
-        s.databases_since(q, None).await
+        core_call!(
+            self,
+            |r| CoreRecords::databases_since(r, None).await,
+            |s, q| s.databases_since(q, None).await
+        )
     }
 
     async fn object(&mut self, object: ObjectId) -> Result<Option<ObjectRow>> {
-        let (s, q) = self.parts();
-        s.object(q, object).await
+        core_call!(self, |r| CoreRecords::object(r, object).await, |s, q| s
+            .object(q, object)
+            .await)
     }
 
     async fn object_by_name(
@@ -235,53 +274,77 @@ impl DdlTx for MariaTx {
         namespace: Namespace,
         name_key: &str,
     ) -> Result<Option<ObjectRow>> {
-        let (s, q) = self.parts();
-        s.object_by_name(q, db, namespace, name_key).await
+        core_call!(
+            self,
+            |r| CoreRecords::object_by_name(r, db, namespace, name_key).await,
+            |s, q| s.object_by_name(q, db, namespace, name_key).await
+        )
     }
 
     async fn objects_in(&mut self, db: DbId) -> Result<Vec<ObjectRow>> {
-        let (s, q) = self.parts();
-        s.objects_in(q, db).await
+        core_call!(self, |r| CoreRecords::objects_in(r, db).await, |s, q| s
+            .objects_in(q, db)
+            .await)
     }
 
-    async fn insert_database(&mut self, r: &DatabaseRow) -> Result<()> {
-        let (s, q) = self.parts();
-        s.insert_database(q, r).await
+    async fn insert_database(&mut self, row: &DatabaseRow) -> Result<()> {
+        core_call!(
+            self,
+            |r| CoreRecords::insert_database(r, row).await,
+            |s, q| s.insert_database(q, row).await
+        )
     }
 
-    async fn update_database(&mut self, r: &DatabaseRow) -> Result<()> {
-        let (s, q) = self.parts();
-        s.update_database(q, r).await.map(drop)
+    async fn update_database(&mut self, row: &DatabaseRow) -> Result<()> {
+        core_call!(
+            self,
+            |r| CoreRecords::update_database(r, row).await.map(drop),
+            |s, q| s.update_database(q, row).await.map(drop)
+        )
     }
 
     async fn delete_database(&mut self, db: DbId) -> Result<()> {
-        let (s, q) = self.parts();
-        s.delete_database(q, db).await.map(drop)
+        core_call!(
+            self,
+            |r| CoreRecords::delete_database(r, db).await.map(drop),
+            |s, q| s.delete_database(q, db).await.map(drop)
+        )
     }
 
-    async fn insert_object(&mut self, r: &ObjectRow) -> Result<()> {
-        let (s, q) = self.parts();
-        s.insert_object(q, r).await
+    async fn insert_object(&mut self, row: &ObjectRow) -> Result<()> {
+        core_call!(
+            self,
+            |r| CoreRecords::insert_object(r, row).await,
+            |s, q| s.insert_object(q, row).await
+        )
     }
 
-    async fn update_object(&mut self, r: &ObjectRow) -> Result<()> {
-        let (s, q) = self.parts();
-        s.update_object(q, r).await.map(drop)
+    async fn update_object(&mut self, row: &ObjectRow) -> Result<()> {
+        core_call!(
+            self,
+            |r| CoreRecords::update_object(r, row).await.map(drop),
+            |s, q| s.update_object(q, row).await.map(drop)
+        )
     }
 
     async fn delete_object(&mut self, object: ObjectId) -> Result<()> {
-        let (s, q) = self.parts();
-        s.delete_object(q, object).await.map(drop)
+        core_call!(
+            self,
+            |r| CoreRecords::delete_object(r, object).await.map(drop),
+            |s, q| s.delete_object(q, object).await.map(drop)
+        )
     }
 
     async fn next_id(&mut self, counter: Counter) -> Result<u64> {
-        let (s, q) = self.parts();
-        match s.next_ids(q, counter, 1).await {
-            Err(e) if e.code() == Some(SprigCode::TenantNotReady) => {
-                s.ensure_counter(q, counter).await?;
-                s.next_ids(q, counter, 1).await
-            }
-            r => r,
+        match self.core() {
+            Core::Rec(r) => CoreRecords::next_ids(r, counter, 1).await,
+            Core::Sql(s, q) => match s.next_ids(q, counter, 1).await {
+                Err(e) if e.code() == Some(SprigCode::TenantNotReady) => {
+                    s.ensure_counter(q, counter).await?;
+                    s.next_ids(q, counter, 1).await
+                }
+                r => r,
+            },
         }
     }
 
@@ -289,38 +352,57 @@ impl DdlTx for MariaTx {
         &mut self,
         object: ObjectId,
     ) -> Result<Option<SchemaVersionRow>> {
-        let (s, q) = self.parts();
-        s.latest_schema_version(q, object).await
+        core_call!(
+            self,
+            |r| CoreRecords::latest_schema_version(r, object).await,
+            |s, q| s.latest_schema_version(q, object).await
+        )
     }
 
-    async fn insert_schema_version(&mut self, r: &SchemaVersionRow) -> Result<()> {
-        let (s, q) = self.parts();
-        s.insert_schema_version(q, r).await
+    async fn insert_schema_version(&mut self, row: &SchemaVersionRow) -> Result<()> {
+        core_call!(
+            self,
+            |r| CoreRecords::insert_schema_version(r, row).await,
+            |s, q| s.insert_schema_version(q, row).await
+        )
     }
 
     async fn internal_rows(&mut self, prefix: &str) -> Result<Vec<SettingRow>> {
-        let (s, q) = self.parts();
-        Ok(s.settings_of(q, SettingScope::Tenant)
-            .await?
+        let rows = core_call!(
+            self,
+            |r| CoreRecords::settings_of(r, SettingScope::Tenant).await,
+            |s, q| s.settings_of(q, SettingScope::Tenant).await
+        )?;
+        Ok(rows
             .into_iter()
             .filter(|r| r.key.starts_with(prefix))
             .collect())
     }
 
     async fn put_internal(&mut self, row: &SettingRow) -> Result<()> {
-        let (s, q) = self.parts();
-        s.put_setting(q, row).await
+        core_call!(self, |r| CoreRecords::put_setting(r, row).await, |s, q| s
+            .put_setting(q, row)
+            .await)
     }
 
     async fn delete_internal(&mut self, key: &str) -> Result<()> {
-        let (s, q) = self.parts();
-        s.delete_internal(q, key).await.map(drop)
+        core_call!(
+            self,
+            |r| CoreRecords::delete_internal(r, key).await.map(drop),
+            |s, q| s.delete_internal(q, key).await.map(drop)
+        )
     }
 }
 
 #[async_trait::async_trait]
 impl DdlBackend for MariaBackend {
     async fn full_snapshot(&self, tenant: TenantId) -> Result<Snapshot> {
+        if let Some(r) = self.records() {
+            let mut tx = r.begin(tenant).await?;
+            let snap = CoreRecords::snapshot(&mut *tx, None).await;
+            let _ = tx.rollback().await;
+            return snap;
+        }
         let ep = self.locator().writer(tenant).await?;
         timed(
             self.opts().statement_timeout * 4,
@@ -331,6 +413,12 @@ impl DdlBackend for MariaBackend {
     }
 
     async fn version_mark(&self, tenant: TenantId) -> Result<(u64, SystemTime)> {
+        if let Some(r) = self.records() {
+            let mut tx = r.begin(tenant).await?;
+            let mark = CoreRecords::version_mark(&mut *tx).await;
+            let _ = tx.rollback().await;
+            return mark;
+        }
         let ep = self.locator().writer(tenant).await?;
         timed(self.opts().statement_timeout, "version mark", async {
             let mut conn = ep.pool.get_conn_bounded().await.map_err(map_err)?;
@@ -358,8 +446,9 @@ impl DdlBackend for MariaBackend {
         let (mut tx, committed) = self.begin_locked(tenant, VersionKind::Catalog).await?;
         let up_to = up_to.min(committed);
         let report = timed(self.opts().statement_timeout * 4, "purge", async {
-            let (s, q) = tx.parts();
-            s.purge(q, up_to).await
+            core_call!(tx, |r| CoreRecords::purge(r, up_to).await, |s, q| s
+                .purge(q, up_to)
+                .await)
         })
         .await;
         match report {

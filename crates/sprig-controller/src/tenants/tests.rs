@@ -686,7 +686,7 @@ async fn live_bootstrap_tree_settings_and_delete() {
             .unwrap();
         let v = ch.version();
         {
-            let (s, q) = ch.tx().parts();
+            let (s, q) = ch.tx().sql().await.unwrap();
             s.insert_database(q, &database(shop, v)).await.unwrap();
             s.insert_object(q, &table(orders, shop, v)).await.unwrap();
         }

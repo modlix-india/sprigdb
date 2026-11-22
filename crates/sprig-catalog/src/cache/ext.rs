@@ -25,9 +25,12 @@ use std::sync::Arc;
 use mysql_async::Transaction;
 use sprig_common::Result;
 
+use sprig_common::ids::ObjectId;
+
 use crate::migrate::{Migration, Module};
 use crate::records::RecordTx;
-use crate::store::{Store, Versions};
+use crate::store::rec::CoreRecords;
+use crate::store::{DatabaseRow, ObjectRow, SchemaVersionRow, Store, Versions};
 use crate::version::VersionKind;
 
 /// A module's state in a snapshot: immutable, shared through `Arc`.
@@ -39,10 +42,12 @@ pub trait ExtState: Any + Send + Sync + fmt::Debug {
 }
 
 /// The transaction a snapshot reads in: consistent, read-only, at the
-/// versions the core rows were read at. Modules whose rows are engine
-/// records (auth) read them through [`SnapshotTx::records`], a read-only
-/// engine transaction opened in the same load, at the auth version in
-/// [`SnapshotTx::versions`].
+/// versions the core rows were read at. On a catalog on records, every
+/// module reads its rows through [`SnapshotTx::records`], the read-only
+/// engine transaction the core rows were read in, and the core rows
+/// through the typed calls ([`SnapshotTx::objects_by_ids`], ...);
+/// [`SnapshotTx::conn`] is a MariaDB snapshot of the catalog schema, for
+/// the tables the MariaDB data paths keep there.
 pub struct SnapshotTx<'a> {
     tx: &'a mut Transaction<'static>,
     store: &'a Store,
@@ -76,9 +81,8 @@ impl<'a> SnapshotTx<'a> {
         }
     }
 
-    /// The same transaction, noting whether the catalog has its record
-    /// log (core format 2): modules on the catalog version keep their rows
-    /// as records only then.
+    /// The same transaction, noting whether the catalog is on records
+    /// (the core rows and the modules' rows are engine records).
     #[must_use]
     pub(crate) fn with_rec_log(mut self, rec_log: bool) -> Self {
         self.rec_log = rec_log;
@@ -86,9 +90,8 @@ impl<'a> SnapshotTx<'a> {
     }
 
     /// Whether modules on the catalog version read their rows from
-    /// [`records`](Self::records): the catalog has its record log and this
-    /// process has a record store. Until a catalog is migrated, those
-    /// modules load as empty and migrate before their first change.
+    /// [`records`](Self::records): the catalog is on records (this process
+    /// has a record store).
     #[must_use]
     pub fn catalog_records(&self) -> bool {
         self.rec_log && self.records.is_some()
@@ -128,6 +131,68 @@ impl<'a> SnapshotTx<'a> {
     #[must_use]
     pub fn versions(&self) -> Versions {
         self.versions
+    }
+
+    fn core_records(&mut self) -> Option<&mut dyn RecordTx> {
+        if self.rec_log {
+            self.records.as_deref_mut().map(|r| r as &mut dyn RecordTx)
+        } else {
+            None
+        }
+    }
+
+    /// The objects among `ids`, tombstones included, by id, in the
+    /// snapshot (ids with no row are left out).
+    ///
+    /// # Errors
+    /// The catalog's.
+    pub async fn objects_by_ids(&mut self, ids: &[ObjectId]) -> Result<Vec<ObjectRow>> {
+        match self.core_records() {
+            Some(r) => CoreRecords::objects_by_ids(r, ids).await,
+            None => self.store.objects_by_ids(self.tx, ids).await,
+        }
+    }
+
+    /// Every object, tombstones included, by id, in the snapshot.
+    ///
+    /// # Errors
+    /// The catalog's.
+    pub async fn objects(&mut self) -> Result<Vec<ObjectRow>> {
+        match self.core_records() {
+            Some(r) => CoreRecords::objects_since(r, None).await,
+            None => self.store.objects_since(self.tx, None).await,
+        }
+    }
+
+    /// Every database, tombstones included, by id, in the snapshot.
+    ///
+    /// # Errors
+    /// The catalog's.
+    pub async fn databases(&mut self) -> Result<Vec<DatabaseRow>> {
+        match self.core_records() {
+            Some(r) => CoreRecords::databases_since(r, None).await,
+            None => self.store.databases_since(self.tx, None).await,
+        }
+    }
+
+    /// One schema version of an object, in the snapshot.
+    ///
+    /// # Errors
+    /// The catalog's.
+    pub async fn schema_version(
+        &mut self,
+        object: ObjectId,
+        version: u64,
+    ) -> Result<Option<SchemaVersionRow>> {
+        match self.core_records() {
+            Some(r) => CoreRecords::schema_version(r, object, version).await,
+            None => Ok(self
+                .store
+                .schema_versions(self.tx, object)
+                .await?
+                .into_iter()
+                .find(|v| v.version == version)),
+        }
     }
 }
 

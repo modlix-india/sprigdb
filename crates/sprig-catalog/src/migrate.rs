@@ -189,13 +189,21 @@ pub static CORE_MIGRATIONS: &[Migration] = &[
         format: 2,
         phase: Phase::Expand,
         name: "rec_log: module record writes until the engine applies them",
-        statements: &[crate::store::reclog::DDL_REC_LOG],
+        statements: &[DDL_REC_LOG],
     },
 ];
 
-/// The core format from which the catalog has its record log, so modules
-/// keep their rows as engine records on the catalog version.
-pub const CORE_REC_LOG_FORMAT: u32 = 2;
+/// The table of core format 2: module record writes waiting for the engine
+/// to apply them, from when the core rows were still in MariaDB. Nothing
+/// writes or reads it since the catalog moved onto engine records; a
+/// format keeps its statements, so new catalogs still get the empty table.
+const DDL_REC_LOG: &str = "CREATE TABLE IF NOT EXISTS rec_log (
+  seq         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  version     BIGINT UNSIGNED NOT NULL,
+  ops         LONGBLOB        NOT NULL,
+  created_at  DATETIME(6)     NOT NULL,
+  PRIMARY KEY (seq)
+) ENGINE=InnoDB";
 
 /// The core module.
 pub const CORE_MODULE: Module = Module {

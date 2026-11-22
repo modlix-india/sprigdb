@@ -24,6 +24,8 @@ use std::collections::BTreeSet;
 
 use mysql_async::Pool;
 use mysql_async::prelude::Queryable;
+use sprig_catalog::store::DbState;
+use sprig_catalog::store::rec::{CoreReader, CoreRecords};
 use sprig_common::ids::{DbId, JobId, TenantId};
 use sprig_common::names::quote;
 use sprig_common::{Result, SprigCode, SprigError};
@@ -167,12 +169,40 @@ pub(crate) async fn purge_meta(
     Ok(n)
 }
 
-/// Every database id `schema`'s catalog lists, in any state (none if the
-/// table or the schema is gone).
+/// How many of the tenant's databases aren't dropped (its catalog records,
+/// through the engine node).
+///
+/// # Errors
+/// 39070 when the engine node can't be reached.
+pub(crate) async fn live_databases(tenant: TenantId) -> Result<u64> {
+    CoreReader::new(crate::catalog_records(), tenant)
+        .live_databases()
+        .await
+}
+
+/// Every database id the tenant's catalog lists, in any state: its
+/// catalog records, and the MariaDB catalog schema `schema` (from before
+/// the catalog moved onto records; none if the table or the schema is
+/// gone).
 ///
 /// # Errors
 /// A backend error.
-pub(crate) async fn catalog_db_ids(pool: &Pool, schema: &str) -> Result<BTreeSet<DbId>> {
+pub(crate) async fn catalog_db_ids(
+    tenant: TenantId,
+    pool: &Pool,
+    schema: &str,
+) -> Result<BTreeSet<DbId>> {
+    let mut out: BTreeSet<DbId> = CoreReader::new(crate::catalog_records(), tenant)
+        .databases()
+        .await?
+        .into_iter()
+        .map(|d| d.db_id)
+        .collect();
+    out.extend(sql_db_ids(pool, schema).await?);
+    Ok(out)
+}
+
+async fn sql_db_ids(pool: &Pool, schema: &str) -> Result<BTreeSet<DbId>> {
     let mut conn = crate::catalogs::acquire(pool, "tenant cleanup").await?;
     let r: std::result::Result<Vec<u32>, _> = conn
         .query(format!("SELECT db_id FROM {}.`databases`", quote(schema)))
@@ -187,26 +217,75 @@ pub(crate) async fn catalog_db_ids(pool: &Pool, schema: &str) -> Result<BTreeSet
     }
 }
 
-/// Marks every database of the catalog in `schema` dropped (the
-/// last resort for a deleted tenant, whose catalog goes next and whose
-/// schemas are dropped by id). Returns how many rows changed.
+/// Marks every database of the tenant's catalog dropped (the last resort
+/// for a deleted tenant, whose catalog goes next and whose schemas are
+/// dropped by id), in one record transaction and without a version (no
+/// session reads a deleted tenant). Returns how many rows changed.
 ///
 /// # Errors
-/// 39100 when the catalog can't be written.
-pub(crate) async fn mark_databases_dropped(pool: &Pool, schema: &str) -> Result<u64> {
-    let mut conn = crate::catalogs::acquire(pool, "tenant cleanup").await?;
-    conn.query_drop(format!(
-        "UPDATE {}.`databases` SET state = 'dropped' WHERE state <> 'dropped'",
-        quote(schema)
-    ))
-    .await
-    .map_err(|e| {
-        SprigError::new(
-            SprigCode::ClusterUnavailable,
-            format!("tenant cleanup: mark {schema}.databases dropped: {e}"),
-        )
-    })?;
-    Ok(conn.affected_rows())
+/// 39070 when the engine node can't be reached.
+pub(crate) async fn mark_databases_dropped(tenant: TenantId) -> Result<u64> {
+    let records = crate::catalog_records();
+    let mut tx = records.begin(tenant).await?;
+    let r = async {
+        let mut n = 0;
+        for d in CoreRecords::databases_since(&mut *tx, None).await? {
+            if d.state != DbState::Dropped {
+                CoreRecords::set_database_state(
+                    &mut *tx,
+                    d.db_id,
+                    DbState::Dropped,
+                    d.changed_version,
+                )
+                .await?;
+                n += 1;
+            }
+        }
+        Ok::<u64, SprigError>(n)
+    }
+    .await;
+    match r {
+        Ok(n) => {
+            tx.commit().await?;
+            Ok(n)
+        }
+        Err(e) => {
+            let _ = tx.rollback().await;
+            Err(e)
+        }
+    }
+}
+
+/// Deletes every catalog record of a deleted tenant (core rows, auth and
+/// modules) on the engine node, a batch per record transaction.
+///
+/// # Errors
+/// 39070 when the engine node can't be reached.
+pub(crate) async fn delete_catalog_records(tenant: TenantId) -> Result<u64> {
+    let records = crate::catalog_records();
+    let mut n = 0;
+    loop {
+        let mut tx = records.begin(tenant).await?;
+        let batch = match tx.scan(b"", &[0xFF], 1_000).await {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err(e);
+            }
+        };
+        if batch.is_empty() {
+            let _ = tx.rollback().await;
+            return Ok(n);
+        }
+        for (k, _) in &batch {
+            if let Err(e) = tx.delete(k).await {
+                let _ = tx.rollback().await;
+                return Err(e);
+            }
+        }
+        tx.commit().await?;
+        n += batch.len() as u64;
+    }
 }
 
 #[cfg(test)]

@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use async_trait::async_trait;
 use bson::Document;
 use sprig_catalog::cache::{ExtState, SnapshotTx};
-use sprig_catalog::ddl::{LOWER_CASE_TABLE_NAMES, database_key, object_key};
+use sprig_catalog::ddl::{DdlTx, LOWER_CASE_TABLE_NAMES, database_key, object_key};
 use sprig_catalog::migrate::{MigrateOpts, Migration, Migrator, Module};
 use sprig_catalog::records::RecordTx;
 use sprig_catalog::store::{Namespace, ObjectKind, ObjectState};
@@ -164,9 +164,8 @@ impl CatalogExtension for DocExtension {
         // A collection whose table was dropped (also by SQL) is left out:
         // its table's object, from the snapshot's own core rows.
         let ids: Vec<ObjectId> = by_id.keys().copied().map(ObjectId).collect();
-        let store = tx.store().clone();
-        let live: HashSet<u64> = store
-            .objects_by_ids(tx.conn(), &ids)
+        let live: HashSet<u64> = tx
+            .objects_by_ids(&ids)
             .await?
             .into_iter()
             .filter(|o| !matches!(o.state, ObjectState::Dropping | ObjectState::Dropped))
@@ -414,27 +413,26 @@ impl CatalogDocs {
         // collection already registered leaves no gap.
         let mut ch = self.svc.catalog.lock(tenant, VersionKind::Catalog).await?;
         let r: Result<Option<CollMeta>> = async {
-            let (store, tx, rec) = ch.tx().split().await?;
-            let db = store
-                .database_by_name(tx, &database_key(&ns.db, lctn))
+            let tx = ch.tx();
+            let db = DdlTx::database_by_name(tx, &database_key(&ns.db, lctn))
                 .await?
                 .ok_or_else(|| {
                     SprigError::new(SprigCode::Internal, format!("no database {}", ns.db))
                 })?;
-            let obj = store
-                .object_by_name(
-                    tx,
-                    db.db_id,
-                    Namespace::Relation,
-                    &object_key(ObjectKind::Table, &m.table, lctn),
+            let obj = DdlTx::object_by_name(
+                tx,
+                db.db_id,
+                Namespace::Relation,
+                &object_key(ObjectKind::Table, &m.table, lctn),
+            )
+            .await?
+            .ok_or_else(|| {
+                SprigError::new(
+                    SprigCode::Internal,
+                    format!("collection {ns} has no table {}", m.table),
                 )
-                .await?
-                .ok_or_else(|| {
-                    SprigError::new(
-                        SprigCode::Internal,
-                        format!("collection {ns} has no table {}", m.table),
-                    )
-                })?;
+            })?;
+            let rec = tx.records().await?;
             if let Some((cid, old)) = DocTables::find(rec, db.db_id.0, &ns.coll).await? {
                 if cid == obj.object_id.0 && live_table(obj.state) {
                     return Ok(Some(old));
@@ -481,13 +479,11 @@ impl CatalogDocs {
         // Allocate only when `f` changed something.
         let mut ch = self.svc.catalog.lock(tenant, VersionKind::Catalog).await?;
         let r: Result<bool> = async {
-            let (store, tx, rec) = ch.tx().split().await?;
-            let Some(db) = store
-                .database_by_name(tx, &database_key(&ns.db, lctn))
-                .await?
-            else {
+            let tx = ch.tx();
+            let Some(db) = DdlTx::database_by_name(tx, &database_key(&ns.db, lctn)).await? else {
                 return Ok(false);
             };
+            let rec = tx.records().await?;
             let Some((cid, m)) = DocTables::find(rec, db.db_id.0, &ns.coll).await? else {
                 return Ok(false);
             };
@@ -532,8 +528,7 @@ impl CatalogDocs {
                 .cache
                 .get(tenant, Freshness::Cached { min_version: at })
                 .await?;
-            let (store, tx, rec) = ch.tx().split().await?;
-            let missing: Vec<ObjectId> = DocTables::ids(rec)
+            let missing: Vec<ObjectId> = DocTables::ids(ch.tx().records().await?)
                 .await?
                 .into_iter()
                 .map(ObjectId)
@@ -542,12 +537,14 @@ impl CatalogDocs {
             if missing.is_empty() {
                 return Ok(0);
             }
-            let found: HashMap<u64, ObjectState> = store
-                .objects_by_ids(tx, &missing)
+            let found: HashMap<u64, ObjectState> = ch
+                .tx()
+                .objects_by_ids(&missing)
                 .await?
                 .into_iter()
                 .map(|o| (o.object_id.0, o.state))
                 .collect();
+            let rec = ch.tx().records().await?;
             let mut n = 0;
             for id in missing {
                 if matches!(found.get(&id.0), None | Some(ObjectState::Dropped)) {

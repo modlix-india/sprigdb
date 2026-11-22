@@ -1,26 +1,27 @@
-//! kill -9 of a process writing the catalog modules that moved onto
-//! engine records after the first five (graphs, collections, ...), on a
-//! real engine and a real MariaDB catalog, through the record log bridge.
+//! kill -9 of a process writing the catalog on engine records: the core
+//! rows, the catalog version and the modules' rows (graphs, collections,
+//! search), on a real engine (RocksDB), each change one engine transaction.
 //!
 //! A child process (this test binary again) commits catalog changes in a
 //! loop. The change at version `v` writes, in one catalog change, what the
 //! gateway writes for each module (a graph `G+v` with a native label, a
 //! relationship type and an index; a collection `C+v` with its table's
-//! object row and an index; a search index `S+v` on that table and an
-//! analyzer), and every even `v` drops the graph and the
-//! collection of `v - 3`; it prints every acknowledged version. The parent
-//! kills it at a varying moment, reopens the engine, loads a snapshot with
-//! the modules' own catalog extensions, and checks that the snapshot holds
-//! exactly the rows of the catalog's committed version (every
-//! acknowledged change included), and that the next change catches the
-//! engine up with the log. After each change the child also writes the
+//! object row, a setting on it and an index; a search index `S+v` on that
+//! table and an analyzer), and every even `v` drops the graph, the
+//! collection and the table of `v - 3`; it prints every acknowledged
+//! version. The parent kills it at a varying moment, reopens the engine,
+//! loads a snapshot with the modules' own catalog extensions, and checks
+//! that the snapshot holds exactly the rows of the catalog's committed
+//! version (every acknowledged change included, core rows too), and that
+//! the next change commits on top of it. After each change the child also writes the
 //! unversioned records (an ID block, a decision, an approvals item, a
 //! workload flush), each
 //! in a short engine transaction of its own: every acknowledged one must
 //! be there afterwards, and no two ID blocks may ever overlap.
 //!
 //! `SPRIG_TEST_MARIADB_SINGLE` (`mysql://root:...@127.0.0.1:<port>`) names
-//! the MariaDB; without it the test reports what it needs and passes.
+//! the MariaDB the loader reads the catalog format from; without it the
+//! test reports what it needs and passes.
 
 #![allow(
     clippy::unwrap_used,
@@ -40,11 +41,14 @@ use serde_json::json;
 use sprig_approvals::store::RecStore as _;
 use sprig_balancer::decisions::DecisionLog as _;
 use sprig_catalog::cache::{CatalogExtension, CatalogSource, ExtensionStates, MariaSource, Node};
+use sprig_catalog::ddl::DdlTx;
 use sprig_catalog::migrate::MigrateOpts;
 use sprig_catalog::records::RecordStore;
+use sprig_catalog::rows::SettingsTx;
+use sprig_catalog::store::rec::CoreRecords;
 use sprig_catalog::store::{
     CatalogEndpoint, CatalogLocator, Namespace, ObjectFlags, ObjectKind, ObjectRow, ObjectState,
-    StaticLocator, Store,
+    SettingRow, SettingScope, Snapshot, StaticLocator, Store,
 };
 use sprig_catalog::{
     DirectoryAllocator, MariaBackend, MariaCatalog, Migrator, VersionKind, Versioner,
@@ -104,9 +108,9 @@ async fn directory(at: u64) -> Arc<dyn MetaStore> {
     g
 }
 
-async fn catalog_version(pool: &mysql_async::Pool, schema: &str) -> u64 {
-    let mut c = pool.get_conn().await.unwrap();
-    Store::new(schema).versions(&mut c).await.unwrap().catalog
+async fn catalog_version(records: &Arc<dyn RecordStore>) -> u64 {
+    let mut t = records.begin(T).await.unwrap();
+    CoreRecords::versions(&mut *t).await.unwrap().catalog
 }
 
 /// The versions whose rows a snapshot at `at` holds.
@@ -186,7 +190,7 @@ async fn change(cat: &MariaCatalog) -> u64 {
     let mut c = cat.change(T, VersionKind::Catalog).await.unwrap();
     let v = c.version();
     {
-        let (store, tx, rec) = c.tx().split().await.unwrap();
+        let tx = c.tx();
         // The collection's table, as the engine's `CREATE TABLE` makes it.
         let obj = ObjectRow {
             object_id: ObjectId(C + v),
@@ -203,7 +207,29 @@ async fn change(cat: &MariaCatalog) -> u64 {
             created_at: SystemTime::now(),
             changed_version: v,
         };
-        store.insert_object(tx, &obj).await.unwrap();
+        DdlTx::insert_object(tx, &obj).await.unwrap();
+        SettingsTx::put_setting(
+            tx,
+            &SettingRow {
+                scope: SettingScope::Object(ObjectId(C + v)),
+                key: "kill.v".into(),
+                value: Some(json!(v)),
+                bounds: None,
+                set_by: "system".into(),
+                set_at: SystemTime::now(),
+                version: v,
+            },
+        )
+        .await
+        .unwrap();
+        if v > 3 && v % 2 == 0 {
+            assert!(
+                tx.set_object_state(ObjectId(C + v - 3), ObjectState::Dropped, v)
+                    .await
+                    .unwrap()
+            );
+        }
+        let rec = tx.records().await.unwrap();
         DocTables::insert(rec, C + v, 1, &coll(v)).await.unwrap();
         GraphCatalog::insert_native_as(rec, G + v, 1, Some(7), 1)
             .await
@@ -242,9 +268,35 @@ async fn change(cat: &MariaCatalog) -> u64 {
     c.commit().await.unwrap()
 }
 
-/// What a snapshot at `at` holds of both modules, checked row by row.
-fn check(round: u64, at: u64, states: &ExtensionStates) {
+/// What a snapshot at `at` holds of the core rows and the modules,
+/// checked row by row.
+fn check(round: u64, at: u64, snap: &Snapshot, states: &ExtensionStates) {
     let want = expected(at);
+    let live: BTreeSet<u64> = snap
+        .objects
+        .iter()
+        .filter(|o| o.state == ObjectState::Active)
+        .map(|o| o.object_id.0 - C)
+        .collect();
+    assert_eq!(live, want, "round {round}: live tables at v{at}");
+    let all: BTreeSet<u64> = snap.objects.iter().map(|o| o.object_id.0 - C).collect();
+    assert_eq!(
+        all,
+        (1..=at).collect(),
+        "round {round}: table rows at v{at}"
+    );
+    let set: BTreeSet<u64> = snap
+        .settings
+        .iter()
+        .filter(|r| r.key == "kill.v")
+        .map(|r| {
+            r.value
+                .as_ref()
+                .and_then(serde_json::Value::as_u64)
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(set, (1..=at).collect(), "round {round}: settings at v{at}");
     let graphs = states
         .get::<GraphState>(sprig_graph::catalog::MODULE)
         .unwrap();
@@ -304,8 +356,8 @@ fn extensions() -> Vec<Arc<dyn CatalogExtension>> {
 /// The child: changes until killed, printing each acknowledged version.
 async fn child(url: &str, schema: &str, dir: &Path) {
     let pool = mysql_async::Pool::new(url);
-    let at = catalog_version(&pool, schema).await;
     let records: Arc<dyn RecordStore> = Arc::new(EngineRecords::on(open(dir)));
+    let at = catalog_version(&records).await;
     let cat: MariaCatalog = Versioner::new(
         MariaBackend::new(locator(&pool, schema)).with_records(Arc::clone(&records)),
         Arc::new(DirectoryAllocator::new(directory(at).await)),
@@ -508,130 +560,17 @@ async fn live_module_catalogs_survive_kill_9() {
             .with_records(Arc::clone(&records));
         let l = source.load(T, None, Node::Writer).await.unwrap();
         let at = l.snapshot.versions.catalog;
+        assert_eq!(at, catalog_version(&records).await);
         assert!(
             at >= last_acked,
             "round {round}: acknowledged v{last_acked} lost (at v{at})"
         );
         let states = ExtensionStates::default().with(l.ext);
-        let ok =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(round, at, &states)));
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            check(round, at, &l.snapshot, &states);
+        }));
         if let Err(e) = ok {
-            let mark = {
-                let mut t = records.begin(T).await.unwrap();
-                sprig_catalog::records::staged::applied(&mut *t)
-                    .await
-                    .unwrap()
-            };
-            let mut c = pool.get_conn().await.unwrap();
-            let log: Vec<(u64, u64)> = c
-                .query(format!(
-                    "SELECT seq, version FROM `{schema}`.rec_log ORDER BY seq DESC LIMIT 4"
-                ))
-                .await
-                .unwrap();
-            let (graph, coll) = {
-                let mut t = records.begin(T).await.unwrap();
-                (
-                    GraphCatalog::row(&mut *t, G + at).await.unwrap().is_some(),
-                    DocTables::find(&mut *t, 1, &format!("c{at}"))
-                        .await
-                        .unwrap()
-                        .is_some(),
-                )
-            };
-            // The overlay by hand.
-            {
-                use sprig_catalog::records::staged::{Ops, StagedTx};
-                let rows: Vec<(u64, Vec<u8>)> = c
-                    .exec(
-                        format!(
-                            "SELECT seq, ops FROM `{schema}`.rec_log WHERE seq > ? ORDER BY seq"
-                        ),
-                        (mark,),
-                    )
-                    .await
-                    .unwrap();
-                let mut st = StagedTx::new(records.begin(T).await.unwrap());
-                for (seq, raw) in &rows {
-                    let ops = Ops::decode(raw).unwrap();
-                    let gk = sprig_graph::catalog::GRAPHS
-                        .key(&sprig_catalog::records::Pk::new().u64(G + at));
-                    eprintln!(
-                        "  log row {seq}: {} ops, holds graph key: {}; first keys {:?}",
-                        ops.0.len(),
-                        ops.0.contains_key(&gk),
-                        ops.0
-                            .keys()
-                            .take(3)
-                            .map(|k| String::from_utf8_lossy(k).into_owned())
-                            .collect::<Vec<_>>()
-                    );
-                    st.replay(ops);
-                }
-                {
-                    use sprig_catalog::records::RecordTx as _;
-                    let gk = sprig_graph::catalog::GRAPHS
-                        .key(&sprig_catalog::records::Pk::new().u64(G + at));
-                    let p = sprig_graph::catalog::GRAPHS.prefix();
-                    let hi = sprig_catalog::records::prefix_end(&p);
-                    let got = st.get(&gk).await.unwrap().is_some();
-                    let one = st.scan(&p, &hi, 1024).await.unwrap();
-                    let all = sprig_catalog::records::scan_all(&mut st, &p, &hi)
-                        .await
-                        .unwrap();
-                    let mut b = records.begin(T).await.unwrap();
-                    let base = b.scan(&p, &hi, 1024).await.unwrap();
-                    let after_last = base.last().map(|(k, _)| {
-                        let mut f = k.clone();
-                        f.push(0);
-                        f
-                    });
-                    if let Some(f) = after_last {
-                        let again = b.scan(&f, &hi, 1024).await.unwrap();
-                        eprintln!(
-                            "  base scan from just after its last row: {} rows (below the start: {})",
-                            again.len(),
-                            again.iter().filter(|(k, _)| *k < f).count()
-                        );
-                    }
-                    let base_out: Vec<String> = base
-                        .iter()
-                        .filter(|(k, _)| !k.starts_with(&p))
-                        .take(3)
-                        .map(|(k, _)| String::from_utf8_lossy(k).into_owned())
-                        .collect();
-                    eprintln!(
-                        "  overlay get: {got}; overlay scan {} rows (has: {}), scan_all {} (has: {}); base scan {} rows, outside range: {base_out:?}",
-                        one.len(),
-                        one.iter().any(|(k, _)| *k == gk),
-                        all.len(),
-                        all.iter().any(|(k, _)| *k == gk),
-                        base.len()
-                    );
-                }
-                let st_load = GraphCatalog::load(&mut st).await.unwrap();
-                eprintln!(
-                    "  manual overlay load has graph {}: {}",
-                    G + at,
-                    st_load.graphs.contains_key(&(G + at))
-                );
-                st.finish().await;
-                let l2 = source.load(T, None, Node::Writer).await.unwrap();
-                let s2 = ExtensionStates::default().with(l2.ext);
-                eprintln!(
-                    "  second source load at v{}: has graph: {}",
-                    l2.snapshot.versions.catalog,
-                    s2.get::<GraphState>(sprig_graph::catalog::MODULE)
-                        .unwrap()
-                        .graphs
-                        .contains_key(&(G + at))
-                );
-            }
-            eprintln!(
-                "round {round}: reload at v{at} (last acked v{last_acked}); engine mark {mark}; \
-                 engine has graph {}: {graph}, collection: {coll}; log tail (seq, version) {log:?}",
-                G + at
-            );
+            eprintln!("round {round}: reload at v{at} (last acked v{last_acked})");
             std::panic::resume_unwind(e);
         }
         // Acknowledged unversioned records are all there.
@@ -675,7 +614,8 @@ async fn live_module_catalogs_survive_kill_9() {
         for w in sorted.windows(2) {
             assert!(w[0].1 <= w[1].0, "round {round}: blocks {w:?} overlap");
         }
-        // The next change catches the engine up; a load after it agrees.
+        // The next change commits on top; a load after it agrees, and an
+        // incremental load from the crash's version equals a full one.
         let cat: MariaCatalog = Versioner::new(
             MariaBackend::new(Arc::clone(&loc)).with_records(Arc::clone(&records)),
             Arc::new(DirectoryAllocator::new(directory(at).await)),
@@ -684,34 +624,28 @@ async fn live_module_catalogs_survive_kill_9() {
         let l = source.load(T, None, Node::Writer).await.unwrap();
         assert_eq!(l.snapshot.versions.catalog, v);
         let states = ExtensionStates::default().with(l.ext);
-        let ok =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(round, v, &states)));
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            check(round, v, &l.snapshot, &states);
+        }));
         if let Err(e) = ok {
-            // What the engine and the log held, for the report.
-            let mark = {
-                let mut t = records.begin(T).await.unwrap();
-                sprig_catalog::records::staged::applied(&mut *t)
-                    .await
-                    .unwrap()
-            };
-            let mut c = pool.get_conn().await.unwrap();
-            let log: Vec<(u64, u64)> = c
-                .query(format!(
-                    "SELECT seq, version FROM `{schema}`.rec_log ORDER BY seq DESC LIMIT 6"
-                ))
-                .await
-                .unwrap();
-            let graph = {
-                let mut t = records.begin(T).await.unwrap();
-                GraphCatalog::row(&mut *t, G + v).await.unwrap().is_some()
-            };
-            eprintln!(
-                "round {round}: first load at v{at}, change v{v}; engine mark {mark}, \
-                 engine has graph {}: {graph}; log tail (seq, version) {log:?}",
-                G + v
-            );
+            eprintln!("round {round}: first load at v{at}, change v{v}");
             std::panic::resume_unwind(e);
         }
+        let mut t = records.begin(T).await.unwrap();
+        let inc = CoreRecords::snapshot(&mut *t, Some(at)).await.unwrap();
+        drop(t);
+        let mut full: Vec<_> = l
+            .snapshot
+            .objects
+            .iter()
+            .filter(|o| o.changed_version > at)
+            .cloned()
+            .collect();
+        full.sort_by_key(|o| o.object_id);
+        assert_eq!(
+            inc.objects, full,
+            "round {round}: incremental objects since v{at}"
+        );
         report.push(format!(
             "round {round}: killed after {wait} ms, {} acked (last v{last_acked}), committed v{at}",
             acked.len()

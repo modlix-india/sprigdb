@@ -25,7 +25,7 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sprig_catalog::cache::{ExtState, SnapshotTx};
-use sprig_catalog::ddl::{LOWER_CASE_TABLE_NAMES, database_key, object_key};
+use sprig_catalog::ddl::{DdlTx, LOWER_CASE_TABLE_NAMES, database_key, object_key};
 use sprig_catalog::migrate::{MigrateOpts, Migration, Migrator, Module};
 use sprig_catalog::records::{Pk, RecordTx, RowTable};
 use sprig_catalog::store::{Namespace, ObjectFlags, ObjectKind, ObjectRow, ObjectState};
@@ -410,9 +410,8 @@ impl CatalogExtension for SearchExtension {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        let store = tx.store().clone();
-        let live: HashSet<u64> = store
-            .objects_by_ids(tx.conn(), &objects)
+        let live: HashSet<u64> = tx
+            .objects_by_ids(&objects)
             .await?
             .into_iter()
             .filter(|o| serving(o.state))
@@ -520,11 +519,7 @@ impl SearchCatalog {
         self.prepare(tenant).await?;
         let cat = self.snapshot(tenant, 0).await?;
         let lctn = self.lctn(&cat);
-        let ep = self.svc.locator.writer(tenant).await?;
-        let object_id = {
-            let mut c = ep.pool.get_conn().await.map_err(map_err)?;
-            ep.store.next_object_id(&mut c).await?
-        };
+        let object_id = self.svc.catalog.backend().next_object_id(tenant).await?;
         let mut ch = self
             .svc
             .catalog
@@ -532,10 +527,10 @@ impl SearchCatalog {
             .await?;
         let version = ch.version();
         let r: Result<bool> = async {
-            let (store, tx, rec) = ch.tx().split().await?;
+            let tx = ch.tx();
             // Indexes whose object was dropped go first (their names can be
             // used again).
-            let mine: Vec<IndexRow> = SearchTables::indexes(rec)
+            let mine: Vec<IndexRow> = SearchTables::indexes(tx.records().await?)
                 .await?
                 .into_iter()
                 .filter(|r| r.db_id == db_id.0)
@@ -546,8 +541,8 @@ impl SearchCatalog {
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect();
-            let live: HashSet<u64> = store
-                .objects_by_ids(tx, &parents)
+            let live: HashSet<u64> = tx
+                .objects_by_ids(&parents)
                 .await?
                 .into_iter()
                 .filter(|o| serving(o.state))
@@ -558,8 +553,8 @@ impl SearchCatalog {
                 if live.contains(&r.object_id) {
                     existing.push((r.index_id, r.name, r.object_id));
                 } else {
-                    SearchTables::delete_index(rec, r.index_id).await?;
-                    store.delete_object(tx, ObjectId(r.index_id)).await?;
+                    SearchTables::delete_index(tx.records().await?, r.index_id).await?;
+                    DdlTx::delete_object(tx, ObjectId(r.index_id)).await?;
                 }
             }
             // SQL names are unique per database; MongoDB's per collection.
@@ -609,8 +604,8 @@ impl SearchCatalog {
                 created_at: SystemTime::now(),
                 changed_version: version,
             };
-            store.insert_object(tx, &obj).await?;
-            SearchTables::put_index(rec, db_id.0, d, origin).await?;
+            DdlTx::insert_object(tx, &obj).await?;
+            SearchTables::put_index(tx.records().await?, db_id.0, d, origin).await?;
             Ok(true)
         }
         .await;
@@ -665,9 +660,9 @@ impl SearchCatalog {
             .change(tenant, VersionKind::Catalog)
             .await?;
         let r: Result<()> = async {
-            let (store, tx, rec) = ch.tx().split().await?;
-            SearchTables::delete_index(rec, id).await?;
-            store.delete_object(tx, ObjectId(id)).await?;
+            let tx = ch.tx();
+            SearchTables::delete_index(tx.records().await?, id).await?;
+            DdlTx::delete_object(tx, ObjectId(id)).await?;
             Ok(())
         }
         .await;

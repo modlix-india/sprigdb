@@ -604,7 +604,7 @@ impl PassSession {
         let mut c = svc.catalog.change(tenant, VersionKind::Catalog).await?;
         let applied = async {
             use mysql_async::prelude::Queryable as _;
-            let (store, tx) = c.tx().parts();
+            let (store, tx) = c.tx().sql().await?;
             let fks = format!("{}.foreign_keys", q(store.schema()));
             let db = |e: mysql_async::Error| {
                 SprigError::new(sprig_common::SprigCode::CatalogUnavailable, e.to_string())

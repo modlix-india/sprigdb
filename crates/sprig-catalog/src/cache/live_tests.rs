@@ -60,7 +60,7 @@ fn config() -> CacheConfig {
 
 /// Writes `ws` in the open change `c`.
 async fn apply_in(c: &mut crate::version::CatalogTx, ws: Vec<W>) {
-    let (store, tx) = c.tx().parts();
+    let (store, tx) = c.tx().sql().await.unwrap();
     for w in ws {
         match w {
             W::Db(r, true) => store.insert_database(tx, &r).await.unwrap(),
@@ -108,7 +108,7 @@ async fn live_pinned_tenants_follow_etcd_invalidations() {
                 let mut c = cat.change(t, VersionKind::Catalog).await.unwrap();
                 let v = c.version();
                 {
-                    let (store, tx) = c.tx().parts();
+                    let (store, tx) = c.tx().sql().await.unwrap();
                     store
                         .insert_object(tx, &obj(i + 1, 1, &format!("t{i}"), v, ObjectState::Active))
                         .await
@@ -329,7 +329,7 @@ async fn live_extensions_load_in_the_snapshot_and_formats_are_checked() {
                 async move {
                     let mut c = cat.change(t, VersionKind::Catalog).await.unwrap();
                     let v = c.version();
-                    let (store, tx) = c.tx().parts();
+                    let (store, tx) = c.tx().sql().await.unwrap();
                     tx.exec_drop(
                         format!(
                             "INSERT INTO {}.test_items VALUES (?, ?, ?)",

@@ -25,7 +25,6 @@ use sprig_approvals::smtp::{Mail, SmtpConfig, TlsFiles};
 use sprig_approvals::store::Filter;
 use sprig_catalog::CatalogLocator;
 use sprig_common::ids::TenantId;
-use sprig_common::names::quote;
 use sprig_common::{Result, SprigError};
 use sprig_settings::Value;
 
@@ -138,16 +137,12 @@ impl Notifier {
             .get_conn_bounded()
             .await
             .map_err(|e| SprigError::internal("stream: catalog unavailable").with_source(e))?;
-        let db: Option<u32> = c
-            .exec_first(
-                format!(
-                    "SELECT db_id FROM {}.`databases` WHERE name_key = ? AND state = 'active'",
-                    quote(&schema)
-                ),
-                (db_name.to_lowercase(),),
-            )
-            .await
-            .map_err(|e| SprigError::internal("stream: databases").with_source(e))?;
+        let db: Option<u32> =
+            sprig_catalog::store::rec::CoreReader::new(crate::catalog_records(), tenant)
+                .database_by_name(&db_name.to_lowercase())
+                .await?
+                .filter(|d| d.state == sprig_catalog::store::DbState::Active)
+                .map(|d| d.db_id.0);
         let Some(db) = db else {
             return Ok(false);
         };

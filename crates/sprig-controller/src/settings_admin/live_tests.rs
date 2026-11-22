@@ -189,7 +189,7 @@ async fn live_settings_through_the_service() {
         let mut ch = v.change(id, VersionKind::Catalog).await.unwrap();
         let ver = ch.version();
         {
-            let (s, q) = ch.tx().parts();
+            let (s, q) = ch.tx().sql().await.unwrap();
             s.insert_database(
                 q,
                 &DatabaseRow {

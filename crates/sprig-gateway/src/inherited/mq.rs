@@ -257,7 +257,6 @@ pub async fn ensure_vhost(
         .iter()
         .any(|d| d.kind == DefKind::Queue)
         .then(|| tokio::spawn(warm_store(Arc::clone(svc), t, Arc::clone(&row))));
-    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
     let mstore = MsgStore::new(Arc::clone(&svc.records), t);
     let st = super::state_of(&cat);
     let mq = cat
@@ -313,7 +312,7 @@ pub async fn ensure_vhost(
                     ),
                 ));
             }
-            let id = ep.store.next_object_id(&mut conn).await?.0;
+            let id = svc.catalog.backend().next_object_id(t).await?.0;
             let claimed = mstore
                 .claim(&Instance {
                     def: key,
@@ -437,10 +436,6 @@ pub async fn ensure_vhost(
     }
     let mut all: Vec<(TopoChange, u64)> = changes;
     all.extend(binds.into_iter().map(|b| (b, 0)));
-    // The catalog writer connection goes back before the catalog change:
-    // anything it still holds (a migration's lock) would make the change's
-    // begin wait for it.
-    drop(conn);
     if !all.is_empty() || !arg_updates.is_empty() {
         let mut c = svc.catalog.change(t, VersionKind::Catalog).await?;
         let r = async {

@@ -34,14 +34,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use sprig_catalog::store::Store;
-use sprig_common::ids::{DcId, TenantId};
-use sprig_common::{Result, SprigError};
-use sprig_meta::{MetaStore, Tier, TierView};
+use sprig_common::Result;
+use sprig_common::ids::TenantId;
+use sprig_meta::MetaStore;
 use sprig_settings::{
     MemSettings, Registry, Setting, SettingCtx, SettingValue, TenantScope, TenantSettings,
 };
-use sprig_shard::TenantMaps;
 
 use crate::catalogs::ClusterPools;
 use crate::tree::Directory;
@@ -53,8 +51,6 @@ pub const MAX_TENANTS: usize = 10_000;
 
 /// The internal key holding the ancestry.
 const ANCESTRY_KEY: &str = "sprig.ancestry";
-/// The internal key holding the committed catalog version.
-const CATALOG_VERSION_KEY: &str = "sprig.catalog_version";
 
 struct Cached {
     catalog_version: u64,
@@ -66,9 +62,11 @@ struct Cached {
 /// docs).
 pub struct TenantScopes {
     directory: Directory,
-    /// The one etcd's DC tier (single-etcd mode: views of every DC's tier).
-    store: Arc<dyn MetaStore>,
-    pools: Arc<dyn ClusterPools>,
+    /// The one etcd's DC tier and the catalog clusters' pools: no longer
+    /// read (a tenant's settings rows are catalog records, read through
+    /// the engine node), kept for the constructor's callers.
+    _store: Arc<dyn MetaStore>,
+    _pools: Arc<dyn ClusterPools>,
     registry: &'static Registry,
     cache: Mutex<HashMap<TenantId, Cached>>,
     loading: Mutex<HashSet<TenantId>>,
@@ -160,8 +158,8 @@ impl TenantScopes {
     ) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
             directory: Directory::new(global),
-            store,
-            pools,
+            _store: store,
+            _pools: pools,
             registry: Registry::global()?,
             cache: Mutex::new(HashMap::new()),
             loading: Mutex::new(HashSet::new()),
@@ -244,7 +242,7 @@ impl TenantScopes {
                 return Ok(Some(Arc::clone(&c.rows)));
             }
         }
-        let (rows, committed) = self.load(tenant, &b.home_dc, version).await?;
+        let (rows, committed) = self.load(tenant, version).await?;
         let rows = Arc::new(rows);
         let mut cache = lock(&self.cache);
         if cache.len() >= MAX_TENANTS && !cache.contains_key(&tenant) {
@@ -261,34 +259,15 @@ impl TenantScopes {
         Ok(Some(rows))
     }
 
-    /// Reads every settings row of `tenant`'s catalog on the cluster its
-    /// home DC's catalog map names, and the catalog version they are at
-    /// (`sprig.catalog_version`, read in the same statement).
-    async fn load(
-        &self,
-        tenant: TenantId,
-        home: &DcId,
-        version: u64,
-    ) -> Result<(TenantSettings, u64)> {
-        let tier = TierView::over(&self.store, Tier::Dc(home.clone()));
-        let (map, _) = TenantMaps::new(tier).load(tenant).await?;
-        let cluster = map.catalog_cluster().cloned().ok_or_else(|| {
-            SprigError::internal(format!("tenant {tenant}'s catalog map names no cluster"))
-        })?;
-        let pool = self.pools.writer(&cluster).await?;
-        let mut c = crate::catalogs::acquire(&pool, "tenant settings").await?;
-        let rows = Store::for_tenant(tenant)
-            .settings_since(&mut c, None)
-            .await?;
-        drop(c);
-        let committed = rows
-            .iter()
-            .find(|r| {
-                r.key == CATALOG_VERSION_KEY && r.scope == sprig_catalog::SettingScope::Tenant
-            })
-            .and_then(|r| r.value.as_ref())
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
+    /// Reads every settings row of `tenant`'s catalog records, and the
+    /// catalog version they are at (read in the same transaction).
+    async fn load(&self, tenant: TenantId, version: u64) -> Result<(TenantSettings, u64)> {
+        // The catalog's records, through the engine node.
+        let (versions, rows) =
+            sprig_catalog::store::rec::CoreReader::new(crate::catalog_records(), tenant)
+                .settings()
+                .await?;
+        let committed = versions.catalog;
         Ok((
             build_rows(self.registry, tenant, committed.min(version), rows),
             committed,

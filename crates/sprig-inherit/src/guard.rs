@@ -37,7 +37,7 @@ use crate::grammar::Name;
 use crate::model::InheritableObject;
 use crate::plan::{Ctx, Resolved};
 use crate::rewrite::parse_one;
-use crate::store::InheritChange;
+use crate::store::{InheritChange, InheritStore};
 use crate::view::q;
 use crate::{Handled, Runner};
 
@@ -85,6 +85,9 @@ async fn object_of(
 async fn shares_of(tx: &mut dyn DdlTx, objects: &[u64]) -> sprig_common::Result<Vec<String>> {
     if objects.is_empty() {
         return Ok(Vec::new());
+    }
+    if let Some(rec) = tx.catalog_records().await? {
+        return InheritStore::granted_share_names(rec, objects, true).await;
     }
     let list = objects
         .iter()
@@ -134,19 +137,27 @@ impl PrepareCheck for SharedCheck {
                 else {
                     return Ok(());
                 };
-                let rows = tx
-                    .query_rows(&format!(
+                let in_db: Vec<u64> = tx
+                    .objects_in(d.db_id)
+                    .await?
+                    .iter()
+                    .map(|o| o.object_id.0)
+                    .collect();
+                let names: Vec<String> = if let Some(rec) = tx.catalog_records().await? {
+                    InheritStore::granted_share_names(rec, &in_db, false).await?
+                } else {
+                    tx.query_rows(&format!(
                         "SELECT s.name FROM {{catalog}}.shares s JOIN {{catalog}}.objects o ON \
                          o.object_id = s.object_id WHERE o.db_id = {} AND s.role = 'granted' \
                          AND s.state = 'active' ORDER BY s.share_id",
                         d.db_id.0
                     ))
                     .await?
-                    .unwrap_or_default();
-                let names: Vec<String> = rows
+                    .unwrap_or_default()
                     .into_iter()
                     .filter_map(|r| r.into_iter().next().flatten())
-                    .collect();
+                    .collect()
+                };
                 return refusal("DROP DATABASE", name, &names);
             }
             _ => return Ok(()),

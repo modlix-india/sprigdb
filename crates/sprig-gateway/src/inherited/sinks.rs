@@ -700,11 +700,9 @@ async fn record(
     physical: Value,
     state: InstanceState,
 ) -> Result<()> {
-    let ep = svc.locator.writer(t).await?;
-    let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
     let store = MsgStore::new(Arc::clone(&svc.records), t);
     if store.instance(s.key()).await?.is_none() {
-        let id = ep.store.next_object_id(&mut conn).await?.0;
+        let id = svc.catalog.backend().next_object_id(t).await?.0;
         store
             .claim(&Instance {
                 def: s.key(),
@@ -1660,9 +1658,13 @@ impl Host for DeployHost {
     }
 
     async fn next_id(&mut self) -> Result<u64> {
-        let ep = self.svc.locator.writer(self.cat.tenant).await?;
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(cat_err)?;
-        Ok(ep.store.next_object_id(&mut conn).await?.0)
+        Ok(self
+            .svc
+            .catalog
+            .backend()
+            .next_object_id(self.cat.tenant)
+            .await?
+            .0)
     }
 
     async fn commit(&mut self, change: Change) -> Result<()> {
@@ -1678,22 +1680,8 @@ impl Host for DeployHost {
             .change(tenant, VersionKind::Catalog)
             .await?;
         let keys = crate::exec::sinks::keyring();
-        let applied = match c.tx().split().await {
-            Err(e) => Err(e),
-            Ok((store, tx, rec)) => {
-                let schema = store.schema().to_owned();
-                sprig_sinks::sql::apply(
-                    tx,
-                    &schema,
-                    rec,
-                    &change,
-                    keys.as_deref(),
-                    tenant,
-                    self.user.0,
-                )
-                .await
-            }
-        };
+        let applied =
+            sprig_sinks::sql::apply(c.tx(), &change, keys.as_deref(), tenant, self.user.0).await;
         if let Err(e) = applied {
             let _ = c.rollback().await;
             return Err(e);

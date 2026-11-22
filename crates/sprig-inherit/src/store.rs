@@ -238,6 +238,37 @@ pub type ObjectNames = sprig_types::store::ObjectNames;
 pub struct InheritStore;
 
 impl InheritStore {
+    /// The names of the active granted shares of `objects`, in key order;
+    /// with `inheritable`, only of objects that are inheritable.
+    ///
+    /// # Errors
+    /// The record store's.
+    pub async fn granted_share_names(
+        rec: &mut dyn RecordTx,
+        objects: &[u64],
+        inheritable: bool,
+    ) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for (pk, row) in SHARES.scan::<ShareRow>(rec, &Pk::new()).await? {
+            let Some((object, role)) = share_key(&pk) else {
+                continue;
+            };
+            if role != GRANTED || row.state != "active" || !objects.contains(&object) {
+                continue;
+            }
+            if inheritable
+                && OBJECTS
+                    .get::<serde_json::Value>(rec, &Pk::new().u64(object))
+                    .await?
+                    .is_none()
+            {
+                continue;
+            }
+            out.push(row.name);
+        }
+        Ok(out)
+    }
+
     /// Every object id the state needs a name for.
     ///
     /// # Errors
@@ -346,14 +377,14 @@ impl InheritStore {
     }
 
     /// The state of the tenant whose catalog schema is `schema`, read the
-    /// way an operator's tool can: object names from the catalog
-    /// connection `c`, the records through the engine node's peer service
-    /// (`SPRIGDB_CATALOG_NODE`).
+    /// way an operator's tool can: the records (object names included)
+    /// through the engine node's peer service (`SPRIGDB_CATALOG_NODE`).
+    /// `_c` (a catalog connection) is no longer read.
     ///
     /// # Errors
     /// `Internal` when `schema` isn't `t<id>_sprig`; 39070 when the
     /// engine node can't be reached; the catalog's.
-    pub async fn load_remote(c: &mut Conn, schema: &str) -> Result<InheritState> {
+    pub async fn load_remote(_c: &mut Conn, schema: &str) -> Result<InheritState> {
         let tenant = schema
             .strip_prefix('t')
             .and_then(|s| s.strip_suffix("_sprig"))
@@ -362,9 +393,18 @@ impl InheritStore {
             .ok_or_else(|| SprigError::internal(format!("{schema} is not a tenant catalog")))?;
         let store = sprig_catalog::records::remote::RemoteRecords::new(None, None);
         let mut tx = sprig_catalog::RecordStore::begin(&store, tenant).await?;
-        let ids = Self::object_ids(&mut *tx).await?;
-        let names = sprig_types::store::object_names(c, schema, &ids).await?;
-        let st = Self::load(&mut *tx, &names).await;
+        let st = async {
+            let ids = Self::object_ids(&mut *tx).await?;
+            let names: sprig_types::store::ObjectNames =
+                sprig_catalog::store::rec::CoreRecords::objects_by_ids(&mut *tx, &ids)
+                    .await?
+                    .into_iter()
+                    .filter(|o| o.state != sprig_catalog::store::ObjectState::Dropped)
+                    .map(|o| (o.object_id, (o.db_id, o.name)))
+                    .collect();
+            Self::load(&mut *tx, &names).await
+        }
+        .await;
         let _ = tx.rollback().await;
         st
     }
@@ -630,8 +670,7 @@ impl CatalogExtension for InheritExtension {
             return Ok(Arc::new(InheritState::unmigrated()));
         }
         let ids = InheritStore::object_ids(tx.records()?).await?;
-        let schema = tx.schema().to_owned();
-        let names = sprig_types::store::object_names(tx.conn(), &schema, &ids).await?;
+        let names = sprig_types::store::snapshot_object_names(tx, &ids).await?;
         Ok(Arc::new(InheritStore::load(tx.records()?, &names).await?))
     }
 }

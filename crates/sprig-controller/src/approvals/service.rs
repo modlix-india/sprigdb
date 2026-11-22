@@ -10,7 +10,6 @@ use sprig_approvals::model::{Level, RecId, Recommendation, State};
 use sprig_approvals::policy::level_for;
 use sprig_approvals::store::{Filter, RecStore};
 use sprig_approvals::{Act, Caller, Kind, may_act, may_see, settings as keys};
-use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::TenantId;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_settings::ScopeKind;
@@ -794,22 +793,12 @@ impl RecommendationsService {
 
     /// The id of database `name` of `t`, from its catalog.
     async fn db_id(&self, t: TenantId, name: &str) -> Result<sprig_common::ids::DbId> {
-        use mysql_async::prelude::Queryable;
-        let ep = self.ctl.locator().writer(t).await?;
-        let schema = ep.store.schema().to_owned();
-        let mut c = ep.pool.get_conn_bounded().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e)
-        })?;
-        let id: Option<u32> = c
-            .exec_first(
-                format!(
-                    "SELECT db_id FROM {}.`databases` WHERE name_key = ? AND state = 'active'",
-                    sprig_common::names::quote(&schema)
-                ),
-                (name.to_lowercase(),),
-            )
-            .await
-            .map_err(|e| SprigError::internal("databases").with_source(e))?;
+        let id: Option<u32> =
+            sprig_catalog::store::rec::CoreReader::new(crate::catalog_records(), t)
+                .database_by_name(&name.to_lowercase())
+                .await?
+                .filter(|d| d.state == sprig_catalog::store::DbState::Active)
+                .map(|d| d.db_id.0);
         id.map(sprig_common::ids::DbId)
             .ok_or_else(|| invalid(format!("no database {name}")))
     }

@@ -283,7 +283,7 @@ async fn ensure_for(
             }
             i.instance_id
         } else {
-            let id = ep.store.next_object_id(&mut conn).await?.0;
+            let id = svc.catalog.backend().next_object_id(t).await?.0;
             let claimed = mstore
                 .claim(&Instance {
                     def: key,

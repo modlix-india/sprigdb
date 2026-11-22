@@ -35,7 +35,7 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 use mysql_async::prelude::Queryable;
 use sprig_auth::authz::{Action, SessionGrants, Target};
-use sprig_catalog::ddl::{database_key, object_key};
+use sprig_catalog::ddl::{DdlTx, database_key, object_key};
 use sprig_catalog::store::{Namespace, ObjectFlags, ObjectKind, ObjectRow, ObjectState};
 use sprig_catalog::version::VersionKind;
 use sprig_catalog::{CatalogLocator, Freshness, TenantCatalog};
@@ -867,18 +867,127 @@ impl GatewayGraphs {
         } else {
             1
         };
-        let ep = self.svc.locator.writer(tenant).await?;
-        let (object_id, members, group) = {
-            let mut c = ep.pool.get_conn().await.map_err(backend_error)?;
-            let o = ep.store.next_object_id(&mut c).await?;
+        // A graph on the engine keeps its elements in the engine graph's own
+        // keys: no MariaDB tables, table group or shard map are made for it.
+        let on_engine = engine::serves(&cat, row.db_id);
+        let ids = self.svc.catalog.backend();
+        let object_id = ids.next_object_id(tenant).await?;
+        let (members, group) = if on_engine {
+            ([0u64; 4], None)
+        } else {
             let mut m = [0u64; 4];
             for x in &mut m {
-                *x = ep.store.next_object_id(&mut c).await?.0;
+                *x = ids.next_object_id(tenant).await?.0;
             }
+            let ep = self.svc.locator.writer(tenant).await?;
+            let mut c = ep.pool.get_conn().await.map_err(backend_error)?;
             sprig_shard::groups::migrate(&mut c, ep.store.schema()).await?;
             let g = alloc_group_id(&mut c, ep.store.schema()).await?;
-            (o, m, g)
+            (m, Some(g))
         };
+        let spec = KeySpec::new(vec![KeyClass::Numeric])?;
+        let physical = match group {
+            Some(group) => Some(
+                self.create_physical(tenant, &row, &schema, object_id, group, shards, storage)
+                    .await?,
+            ),
+            None => None,
+        };
+        let mut ch = self
+            .svc
+            .catalog
+            .change(tenant, VersionKind::Catalog)
+            .await?;
+        let version = ch.version();
+        let r = async {
+            let tx = ch.tx();
+            let obj = ObjectRow {
+                object_id,
+                db_id: row.db_id,
+                namespace: Namespace::Graph,
+                name: name.to_owned(),
+                name_key: object_key(ObjectKind::Graph, name, lctn),
+                kind: ObjectKind::Graph,
+                parent_id: None,
+                state: ObjectState::Active,
+                schema_version: 1,
+                flags: ObjectFlags::default(),
+                pending_job_id: None,
+                created_at: SystemTime::now(),
+                changed_version: version,
+            };
+            DdlTx::insert_object(tx, &obj).await?;
+            GraphCatalog::insert_native_as(
+                tx.records().await?,
+                object_id.0,
+                row.db_id.0,
+                group,
+                storage,
+            )
+            .await?;
+            // A MariaDB-stored graph's table group, in the catalog schema.
+            if let Some(group) = group {
+                let (store, q) = tx.sql().await?;
+                let cat_schema = store.schema().to_owned();
+                insert_group(
+                    q,
+                    &cat_schema,
+                    group,
+                    shards,
+                    &spec,
+                    row.db_id,
+                    object_id.0,
+                    members,
+                )
+                .await?;
+            }
+            Ok::<(), SprigError>(())
+        }
+        .await;
+        if let Err(e) = r {
+            let _ = ch.rollback().await;
+            if let (Some((cluster, schemas, seq)), Some(group)) = (&physical, group) {
+                self.drop_physical(tenant, cluster, schemas, seq, Some(group))
+                    .await;
+            }
+            return Err(e);
+        }
+        let v = ch.commit().await?;
+        let cat = self
+            .catalog(tenant, Freshness::Cached { min_version: v })
+            .await?;
+        let g = self
+            .resolve(&cat, db, name)
+            .await?
+            .ok_or_else(|| SprigError::internal("graph missing after create"))?;
+        tracing::info!(
+            tenant = tenant.0,
+            db,
+            graph = name,
+            id = object_id.0,
+            group,
+            shards,
+            storage,
+            on_engine,
+            "graph created"
+        );
+        Ok((g, v))
+    }
+
+    /// A MariaDB-stored graph's storage: its group's shard schemas with the
+    /// graph's tables, the id sequence table and the shard map. Undone
+    /// (and the error returned) when any part fails.
+    #[allow(clippy::too_many_arguments)] // the graph's place and shape
+    async fn create_physical(
+        &self,
+        tenant: TenantId,
+        row: &sprig_catalog::store::DatabaseRow,
+        schema: &str,
+        object_id: ObjectId,
+        group: u32,
+        shards: u32,
+        storage: u8,
+    ) -> Result<(ClusterId, Vec<String>, Tables)> {
         let cluster = self.svc.locator.cluster(tenant).await?;
         let spec = KeySpec::new(vec![KeyClass::Numeric])?;
         let map = ShardMap::presplit(
@@ -893,14 +1002,14 @@ impl GatewayGraphs {
             .iter()
             .map(|r| shard_schema(tenant, row.db_id, GroupId(group), r.shard))
             .collect();
-        let seq = Tables::of(&schema, object_id.0);
+        let seq = Tables::of(schema, object_id.0);
         let made = async {
             let pool = self.pool(&cluster).await?;
             let mut c = pool.get_conn().await.map_err(backend_error)?;
             let like: Option<(String, String)> = c
                 .query_first(format!(
                     "SHOW CREATE DATABASE {}",
-                    sprig_common::names::quote(&schema)
+                    sprig_common::names::quote(schema)
                 ))
                 .await
                 .map_err(backend_error)?;
@@ -915,7 +1024,7 @@ impl GatewayGraphs {
                     |(_, x)| {
                         x.replacen("CREATE DATABASE", "CREATE DATABASE IF NOT EXISTS", 1)
                             .replace(
-                                &sprig_common::names::quote(&schema),
+                                &sprig_common::names::quote(schema),
                                 &sprig_common::names::quote(s),
                             )
                     },
@@ -949,85 +1058,7 @@ impl GatewayGraphs {
                 .await;
             return Err(e);
         }
-        let mut ch = self
-            .svc
-            .catalog
-            .change(tenant, VersionKind::Catalog)
-            .await?;
-        let version = ch.version();
-        let r = match ch.tx().split().await {
-            Err(e) => Err(e),
-            Ok((store, tx, rec)) => {
-                let obj = ObjectRow {
-                    object_id,
-                    db_id: row.db_id,
-                    namespace: Namespace::Graph,
-                    name: name.to_owned(),
-                    name_key: object_key(ObjectKind::Graph, name, lctn),
-                    kind: ObjectKind::Graph,
-                    parent_id: None,
-                    state: ObjectState::Active,
-                    schema_version: 1,
-                    flags: ObjectFlags::default(),
-                    pending_job_id: None,
-                    created_at: SystemTime::now(),
-                    changed_version: version,
-                };
-                let cat_schema = store.schema().to_owned();
-                match store.insert_object(tx, &obj).await {
-                    Ok(()) => match GraphCatalog::insert_native_as(
-                        rec,
-                        object_id.0,
-                        row.db_id.0,
-                        Some(group),
-                        storage,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            insert_group(
-                                tx,
-                                &cat_schema,
-                                group,
-                                shards,
-                                &spec,
-                                row.db_id,
-                                object_id.0,
-                                members,
-                            )
-                            .await
-                        }
-                        Err(e) => Err(e),
-                    },
-                    Err(e) => Err(e),
-                }
-            }
-        };
-        if let Err(e) = r {
-            let _ = ch.rollback().await;
-            self.drop_physical(tenant, &cluster, &schemas, &seq, Some(group))
-                .await;
-            return Err(e);
-        }
-        let v = ch.commit().await?;
-        let cat = self
-            .catalog(tenant, Freshness::Cached { min_version: v })
-            .await?;
-        let g = self
-            .resolve(&cat, db, name)
-            .await?
-            .ok_or_else(|| SprigError::internal("graph missing after create"))?;
-        tracing::info!(
-            tenant = tenant.0,
-            db,
-            graph = name,
-            id = object_id.0,
-            group,
-            shards,
-            storage,
-            "graph created"
-        );
-        Ok((g, v))
+        Ok((cluster, schemas, seq))
     }
 
     /// Drops a graph's storage: its group's shard schemas (each on its
@@ -1109,35 +1140,31 @@ impl GatewayGraphs {
             .change(tenant, VersionKind::Catalog)
             .await?;
         let version = ch.version();
-        let r = match ch.tx().split().await {
-            Err(e) => Err(e),
-            Ok((store, tx, rec)) => {
+        let on_engine = engine::on_engine(&g, &cat);
+        let r = async {
+            let tx = ch.tx();
+            tx.set_object_state(ObjectId(g.graph_id), ObjectState::Dropped, version)
+                .await?;
+            GraphCatalog::delete(tx.records().await?, g.graph_id).await?;
+            // A MariaDB-stored graph's own tables and table group, in the
+            // catalog schema.
+            if !on_engine || group.is_some() {
+                let (store, q) = tx.sql().await?;
                 let cat_schema = store.schema().to_owned();
-                match store
-                    .set_object_state(tx, ObjectId(g.graph_id), ObjectState::Dropped, version)
-                    .await
-                {
-                    Ok(_) => match GraphCatalog::delete(rec, g.graph_id).await {
-                        Ok(()) => match GraphCatalog::delete_sql(tx, &cat_schema, g.graph_id).await
-                        {
-                            Ok(()) => match group {
-                                Some(gid) => delete_group(tx, &cat_schema, gid).await,
-                                None => Ok(()),
-                            },
-                            Err(e) => Err(e),
-                        },
-                        Err(e) => Err(e),
-                    },
-                    Err(e) => Err(e),
+                GraphCatalog::delete_sql(q, &cat_schema, g.graph_id).await?;
+                if let Some(gid) = group {
+                    delete_group(q, &cat_schema, gid).await?;
                 }
             }
-        };
+            Ok::<(), SprigError>(())
+        }
+        .await;
         if let Err(e) = r {
             let _ = ch.rollback().await;
             return Err(e);
         }
         let v = ch.commit().await?;
-        if engine::on_engine(&g, &cat) {
+        if on_engine {
             engine::drop_storage(&g).await;
         }
         if group.is_some() {
@@ -1154,7 +1181,7 @@ impl GatewayGraphs {
             self.drop_schemas(&at).await;
             self.drop_physical(tenant, &g.cluster, &[], &g.tables(), group)
                 .await;
-        } else {
+        } else if !on_engine {
             self.drop_sql(&g.cluster, &g.tables().drop_ddl()).await;
         }
         self.counters
@@ -1374,20 +1401,16 @@ impl GatewayGraphs {
         }
         drop(conn);
         let text = serde_json::to_string(&def).map_err(|e| SprigError::internal(e.to_string()))?;
-        let ep = self.svc.locator.writer(tenant).await?;
-        let object_id = {
-            let mut c = ep.pool.get_conn().await.map_err(backend_error)?;
-            ep.store.next_object_id(&mut c).await?
-        };
+        let object_id = self.svc.catalog.backend().next_object_id(tenant).await?;
         let mut ch = self
             .svc
             .catalog
             .change(tenant, VersionKind::Catalog)
             .await?;
         let version = ch.version();
-        let r = match ch.tx().split().await {
-            Err(e) => Err(e),
-            Ok((store, tx, rec)) => {
+        let r = {
+            let tx = ch.tx();
+            {
                 let obj = ObjectRow {
                     object_id,
                     db_id: row.db_id,
@@ -1403,10 +1426,13 @@ impl GatewayGraphs {
                     created_at: SystemTime::now(),
                     changed_version: version,
                 };
-                match store.insert_object(tx, &obj).await {
-                    Ok(()) => {
-                        GraphCatalog::insert_mapped(rec, object_id.0, row.db_id.0, &text).await
-                    }
+                match DdlTx::insert_object(tx, &obj).await {
+                    Ok(()) => match tx.records().await {
+                        Ok(rec) => {
+                            GraphCatalog::insert_mapped(rec, object_id.0, row.db_id.0, &text).await
+                        }
+                        Err(e) => Err(e),
+                    },
                     Err(e) => Err(e),
                 }
             }

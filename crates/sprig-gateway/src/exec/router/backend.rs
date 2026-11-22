@@ -673,7 +673,7 @@ async fn open_orphanage(
         .change(tenant, sprig_catalog::VersionKind::Catalog)
         .await?;
     let done = async {
-        let (store, tx) = c.tx().parts();
+        let (store, tx) = c.tx().sql().await?;
         let q = |s: &str| format!("`{}`", s.replace('`', "``"));
         let schema = q(store.schema());
         let db_err = |e: mysql_async::Error| {

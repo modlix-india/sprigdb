@@ -246,7 +246,9 @@ impl RecordStore for RemoteRecords {
 }
 
 /// The next operation to send, for the request stream.
-async fn next_op(mut r: mpsc::Receiver<CatalogOp>) -> Option<(CatalogOp, mpsc::Receiver<CatalogOp>)> {
+async fn next_op(
+    mut r: mpsc::Receiver<CatalogOp>,
+) -> Option<(CatalogOp, mpsc::Receiver<CatalogOp>)> {
     r.recv().await.map(|op| (op, r))
 }
 
@@ -272,9 +274,7 @@ impl RemoteTx {
         let m = match tokio::time::timeout(OP_TIMEOUT, r.message()).await {
             Ok(Ok(Some(m))) => m,
             Ok(Ok(None)) => {
-                return Err(unavailable(
-                    "the engine node ended the catalog transaction",
-                ));
+                return Err(unavailable("the engine node ended the catalog transaction"));
             }
             Ok(Err(s)) => return Err(unavailable(format!("engine node: {}", s.message()))),
             Err(_) => return Err(unavailable("engine node didn't answer")),

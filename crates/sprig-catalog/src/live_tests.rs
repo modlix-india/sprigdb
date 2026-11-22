@@ -928,7 +928,7 @@ async fn live_changes_are_monotonic_atomic_and_survive_crashes() {
             let v = c.version();
             assert_eq!(v, 1);
             {
-                let (s, q) = c.tx().parts();
+                let (s, q) = c.tx().sql().await.unwrap();
                 s.insert_database(q, &database(1, "shop", v)).await.unwrap();
                 s.put_setting(q, &setting("auto_index.mode", json!("on"), v))
                     .await
@@ -971,7 +971,7 @@ async fn live_changes_are_monotonic_atomic_and_survive_crashes() {
                         let mut c = cat.change(tenant, VersionKind::Catalog).await.unwrap();
                         let v = c.version();
                         {
-                            let (s, q) = c.tx().parts();
+                            let (s, q) = c.tx().sql().await.unwrap();
                             s.put_setting(q, &setting(&format!("test.w{w}.{i}.a"), json!(v), v))
                                 .await
                                 .unwrap();
@@ -1019,7 +1019,7 @@ async fn live_changes_are_monotonic_atomic_and_survive_crashes() {
             let mut c = crashing.change(tenant, VersionKind::Catalog).await.unwrap();
             assert_eq!(c.version(), 43);
             {
-                let (s, q) = c.tx().parts();
+                let (s, q) = c.tx().sql().await.unwrap();
                 s.put_setting(q, &setting("test.half", json!(43), 43))
                     .await
                     .unwrap();
@@ -1049,7 +1049,7 @@ async fn live_changes_are_monotonic_atomic_and_survive_crashes() {
             }));
             let mut c = crashing.change(tenant, VersionKind::Auth).await.unwrap();
             {
-                let (s, q) = c.tx().parts();
+                let (s, q) = c.tx().sql().await.unwrap();
                 s.put_setting(q, &setting("test.auth", json!(1), 1))
                     .await
                     .unwrap();
@@ -1094,7 +1094,7 @@ async fn live_changes_are_monotonic_atomic_and_survive_crashes() {
             let mut c = cat.change(tenant, VersionKind::Catalog).await.unwrap();
             let v = c.version();
             {
-                let (s, q) = c.tx().parts();
+                let (s, q) = c.tx().sql().await.unwrap();
                 s.set_database_state(q, DbId(1), DbState::Dropped, v)
                     .await
                     .unwrap();
@@ -1171,7 +1171,7 @@ async fn live_a_deposed_leader_cannot_allocate_or_commit() {
             );
             let mut open = cat.change(tenant, VersionKind::Catalog).await.unwrap();
             {
-                let (s, q) = open.tx().parts();
+                let (s, q) = open.tx().sql().await.unwrap();
                 s.put_setting(q, &setting("test.deposed", json!(2), 2))
                     .await
                     .unwrap();

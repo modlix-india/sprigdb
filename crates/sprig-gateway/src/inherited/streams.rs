@@ -27,6 +27,7 @@ use mysql_async::prelude::Queryable;
 use serde_json::{Value, json};
 use sprig_catalog::ddl::{DdlRequest, DdlStatement, database_key, object_key, shard_schemas};
 use sprig_catalog::pool_wait::Bounded as _;
+use sprig_catalog::rows::SettingsTx;
 use sprig_catalog::store::{Namespace, ObjectKind, SettingRow, SettingScope};
 use sprig_catalog::version::VersionKind;
 use sprig_catalog::{CatalogLocator, TenantCatalog};
@@ -184,24 +185,14 @@ pub async fn ensure(
         Some(&cat.settings),
     );
     super::migrate(svc, t).await?;
-    let ep = svc.locator.writer(t).await?;
     let store = MsgStore::new(Arc::clone(&svc.records), t);
     let deadline = Instant::now() + Duration::from_millis(wait_ms);
     let key = def.key();
     let mut created = false;
     loop {
-        // A catalog connection for this round's reads and claim only,
-        // dropped before the creation and the triggers, which take their
-        // own from the same pool (4 per cluster). Held across them, one
-        // publish needed 3 at once and failed with 39070 ("catalog begin
-        // timed out") whenever two were busy elsewhere.
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-        })?;
         let row = store.instance(key).await?;
         match row {
             Some(i) if i.state == InstanceState::Active => {
-                drop(conn);
                 // Committed; wait for this gateway's snapshot to have it.
                 loop {
                     cat = catalog(svc, t).await?;
@@ -227,7 +218,6 @@ pub async fn ensure(
             }
             Some(i) if i.state == InstanceState::Creating => {
                 let mine = store.take_over(key, 30_000).await?;
-                drop(conn);
                 if mine {
                     create(svc, t, def, i.instance_id).await?;
                     created = true;
@@ -260,7 +250,7 @@ pub async fn ensure(
                         ),
                     ));
                 }
-                let id = ep.store.next_object_id(&mut conn).await?.0;
+                let id = svc.catalog.backend().next_object_id(t).await?.0;
                 let row = Instance {
                     def: key,
                     instance_id: id,
@@ -273,7 +263,6 @@ pub async fn ensure(
                     created_at_ms: 0,
                 };
                 let claimed = store.claim(&row).await?;
-                drop(conn);
                 if claimed {
                     let started = Instant::now();
                     if let Err(e) = create_retrying(svc, t, def, id).await {
@@ -448,39 +437,37 @@ async fn adopt_settings(
     let mut c = svc.catalog.change(si.tenant, VersionKind::Catalog).await?;
     let version = c.version();
     let r = {
-        let (store, tx) = c.tx().parts();
+        let tx = c.tx();
         async {
             for (k, v) in &changes {
                 match v {
                     Some(v) => {
-                        store
-                            .put_setting(
-                                tx,
-                                &SettingRow {
-                                    scope,
-                                    key: (*k).to_owned(),
-                                    value: Some(json!(v)),
-                                    bounds: None,
-                                    set_by: "system".to_owned(),
-                                    set_at: SystemTime::now(),
-                                    version,
-                                },
-                            )
-                            .await?;
+                        SettingsTx::put_setting(
+                            tx,
+                            &SettingRow {
+                                scope,
+                                key: (*k).to_owned(),
+                                value: Some(json!(v)),
+                                bounds: None,
+                                set_by: "system".to_owned(),
+                                set_at: SystemTime::now(),
+                                version,
+                            },
+                        )
+                        .await?;
                     }
                     None => {
-                        store
-                            .reset_setting(
-                                tx,
-                                scope,
-                                k,
-                                true,
-                                false,
-                                "system",
-                                SystemTime::now(),
-                                version,
-                            )
-                            .await?;
+                        SettingsTx::reset_setting(
+                            tx,
+                            scope,
+                            k,
+                            true,
+                            false,
+                            "system",
+                            SystemTime::now(),
+                            version,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -819,33 +806,33 @@ impl Host for InstanceHost {
             .await?;
         let version = c.version();
         let applied = {
-            let (store, tx) = c.tx().parts();
-            let streams = sprig_streams::StreamsStore::new(store.schema());
+            let tx = c.tx();
             async {
+                // Stream definitions stay in the catalog schema (the
+                // MariaDB stream path's table); their settings are records.
+                let (store, q) = tx.sql().await?;
+                let streams = sprig_streams::StreamsStore::new(store.schema());
                 match change {
                     StreamsChange::Insert(def, h) => {
-                        streams.insert(tx, def).await?;
+                        streams.insert(q, def).await?;
                         if let Some(h) = h {
-                            store
-                                .put_setting(
-                                    tx,
-                                    &SettingRow {
-                                        scope: SettingScope::Object(ObjectId(def.id.0)),
-                                        key: sprig_streams::settings::RETENTION_HOURS
-                                            .key
-                                            .to_owned(),
-                                        value: Some(json!(h)),
-                                        bounds: None,
-                                        set_by: "system".to_owned(),
-                                        set_at: SystemTime::now(),
-                                        version,
-                                    },
-                                )
-                                .await?;
+                            SettingsTx::put_setting(
+                                tx,
+                                &SettingRow {
+                                    scope: SettingScope::Object(ObjectId(def.id.0)),
+                                    key: sprig_streams::settings::RETENTION_HOURS.key.to_owned(),
+                                    value: Some(json!(h)),
+                                    bounds: None,
+                                    set_by: "system".to_owned(),
+                                    set_at: SystemTime::now(),
+                                    version,
+                                },
+                            )
+                            .await?;
                         }
                     }
-                    StreamsChange::Update(def, _) => streams.update(tx, def).await?,
-                    StreamsChange::Delete(def) => streams.delete(tx, def.id).await?,
+                    StreamsChange::Update(def, _) => streams.update(q, def).await?,
+                    StreamsChange::Delete(def) => streams.delete(q, def.id).await?,
                 }
                 Ok::<_, SprigError>(())
             }

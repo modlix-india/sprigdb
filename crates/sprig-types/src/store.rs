@@ -489,6 +489,24 @@ pub async fn object_names<Q: Queryable + Send>(
     Ok(out)
 }
 
+/// The names and databases of the live (not dropped) objects among `ids`,
+/// read from the snapshot's core rows.
+///
+/// # Errors
+/// The catalog's.
+pub async fn snapshot_object_names(
+    tx: &mut sprig_catalog::cache::SnapshotTx<'_>,
+    ids: &[ObjectId],
+) -> Result<ObjectNames> {
+    Ok(tx
+        .objects_by_ids(ids)
+        .await?
+        .into_iter()
+        .filter(|o| o.state != sprig_catalog::store::ObjectState::Dropped)
+        .map(|o| (o.object_id, (o.db_id, o.name)))
+        .collect())
+}
+
 /// What one type DDL statement writes to the module's tables, committed in
 /// one versioned change.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -565,8 +583,7 @@ impl CatalogExtension for TypesExtension {
         let (types, fields, hierarchies) = TypesStore::rows(tx.records()?).await?;
         let mut ids: Vec<ObjectId> = types.iter().map(|t| ObjectId(t.type_id)).collect();
         ids.extend(hierarchies.iter().map(|h| ObjectId(h.object_id)));
-        let schema = tx.schema().to_owned();
-        let names = object_names(tx.conn(), &schema, &ids).await?;
+        let names = snapshot_object_names(tx, &ids).await?;
         Ok(Arc::new(TypesStore::build(
             &types,
             &fields,

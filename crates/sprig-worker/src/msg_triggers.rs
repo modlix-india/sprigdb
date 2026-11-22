@@ -566,19 +566,12 @@ impl MsgEnv {
         };
         // The source's database (a dropped database's streams and queues
         // are gone, even when a new one has its name).
-        let db_state: Option<String> = c
-            .exec_first(
-                format!(
-                    "SELECT state FROM {}.`databases` WHERE db_id = ?",
-                    quote(&schema)
-                ),
-                (source.db_id,),
-            )
-            .await
-            .map_err(|e| {
-                SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-            })?;
-        if db_state.as_deref() != Some("active") {
+        let db_state =
+            sprig_catalog::store::rec::CoreReader::new(crate::sinks::catalog_records(), tenant)
+                .database(sprig_common::ids::DbId(source.db_id))
+                .await?
+                .map(|d| d.state);
+        if db_state != Some(sprig_catalog::store::DbState::Active) {
             return Ok(Err(Unloaded::Gone));
         }
         // The source itself (a fan-in trigger's: its definition).

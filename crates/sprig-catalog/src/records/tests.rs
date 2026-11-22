@@ -165,7 +165,10 @@ async fn a_change_commits_its_rows_with_the_version() {
     assert_eq!(ch.commit().await.unwrap(), v);
     let mut tx = recs.begin(T).await.unwrap();
     assert_eq!(read_version(&mut *tx, VersionKind::Auth).await.unwrap(), v);
-    assert_eq!(read_version(&mut *tx, VersionKind::Catalog).await.unwrap(), 0);
+    assert_eq!(
+        read_version(&mut *tx, VersionKind::Catalog).await.unwrap(),
+        0
+    );
     let got: Option<Row> = ROWS.get(&mut *tx, &Pk::new().u32(1)).await.unwrap();
     assert_eq!(got, Some(r));
 }

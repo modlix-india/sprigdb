@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use sprig_catalog::TenantCatalog;
 use sprig_common::Result;
+use sprig_common::ids::DbId;
 use sprig_graph::engine::{EngineGraph, drop_graph};
 
 use super::GraphRef;
@@ -58,13 +59,17 @@ fn mode() -> Mode {
 /// Whether `g`'s elements live on the storage engine.
 #[must_use]
 pub(crate) fn on_engine(g: &GraphRef, cat: &TenantCatalog) -> bool {
-    if g.def.kind == "mapped" {
-        return false;
-    }
+    g.def.kind != "mapped" && serves(cat, g.db_id)
+}
+
+/// Whether a native graph in database `db` keeps its elements on the
+/// storage engine (so `CREATE GRAPH` makes no MariaDB tables for it).
+#[must_use]
+pub(crate) fn serves(cat: &TenantCatalog, db: DbId) -> bool {
     match mode() {
         Mode::All => true,
         Mode::Off => false,
-        Mode::Database => crate::engine::catalog::of(cat).is_some_and(|e| e.dbs.contains(&g.db_id)),
+        Mode::Database => crate::engine::catalog::of(cat).is_some_and(|e| e.dbs.contains(&db)),
     }
 }
 

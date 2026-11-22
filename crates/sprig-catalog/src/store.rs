@@ -39,7 +39,7 @@ use crate::pool_wait::Bounded as _;
 use crate::sql::{bytes_col, col, json_col, map_err, time_col, to_datetime};
 use crate::version::VersionKind;
 
-pub mod reclog;
+pub mod rec;
 
 macro_rules! sql_enum {
     ($(#[$doc:meta])* $name:ident { $($(#[$vdoc:meta])* $variant:ident = $text:literal,)* }) => {

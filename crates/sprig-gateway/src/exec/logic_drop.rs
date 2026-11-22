@@ -290,18 +290,12 @@ impl PassSession {
             && b.enforcement.as_deref() == Some("check")
             && let Some(obj) = b.object_id
         {
-            let table: Option<String> = {
-                use mysql_async::prelude::Queryable;
-                conn.exec_first(
-                    format!(
-                        "SELECT name FROM {}.objects WHERE object_id = ?",
-                        sprig_common::names::quote(ep.store.schema())
-                    ),
-                    (obj,),
-                )
-                .await
-                .map_err(catalog_err)?
-            };
+            // The table's name, from the session's catalog snapshot.
+            let table: Option<String> = ts.catalog().and_then(|c| {
+                c.objects
+                    .get(sprig_common::ids::ObjectId(obj))
+                    .map(|o| o.name.clone())
+            });
             if let Some(t) = table {
                 let names: Vec<String> = versions
                     .iter()

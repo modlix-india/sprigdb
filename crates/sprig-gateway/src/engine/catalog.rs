@@ -14,11 +14,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use sprig_catalog::store::{DbState, ObjectKind, ObjectState};
 use sprig_catalog::{
     CatalogExtension, ExtState, Migration, SnapshotTx, TenantCatalog, VersionKind,
 };
+use sprig_common::Result;
 use sprig_common::ids::{DbId, ObjectId};
-use sprig_common::{Result, SprigError};
 
 use super::table::{self, Parsed};
 
@@ -75,11 +76,6 @@ pub(crate) fn of(cat: &TenantCatalog) -> Option<&EngineCatalog> {
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct EngineExtension;
 
-#[allow(clippy::needless_pass_by_value)] // used as `map_err(db_err)`
-fn db_err(e: mysql_async::Error) -> SprigError {
-    SprigError::internal(format!("engine catalog module: {e}"))
-}
-
 #[async_trait::async_trait]
 impl CatalogExtension for EngineExtension {
     fn module(&self) -> &'static str {
@@ -100,38 +96,31 @@ impl CatalogExtension for EngineExtension {
         _since: Option<u64>,
         _prev: Option<&Arc<dyn ExtState>>,
     ) -> Result<Arc<dyn ExtState>> {
-        use mysql_async::prelude::Queryable;
-        let schema = tx.schema().replace('`', "``");
-        let conn = tx.conn();
-        let live: Vec<u64> = conn
-            .query(format!(
-                "SELECT db_id FROM `{schema}`.databases WHERE state <> 'dropped'"
-            ))
-            .await
-            .map_err(db_err)?;
+        // The snapshot's core rows (engine catalog records).
         let mut state = EngineCatalog::default();
-        for id in live {
-            if let Ok(id) = u32::try_from(id) {
-                state.dbs.insert(DbId(id));
+        for d in tx.databases().await? {
+            if d.state != DbState::Dropped {
+                state.dbs.insert(d.db_id);
             }
         }
         if state.dbs.is_empty() {
             return Ok(Arc::new(state));
         }
-        let ids: Vec<String> = state.dbs.iter().map(|d| d.0.to_string()).collect();
-        let rows: Vec<(u64, u32, String, u64, Option<String>)> = conn
-            .query(format!(
-                "SELECT o.object_id, o.db_id, o.name, o.schema_version, v.create_sql \
-                 FROM `{schema}`.objects o \
-                 LEFT JOIN `{schema}`.schema_versions v \
-                   ON v.object_id = o.object_id AND v.version = o.schema_version \
-                 WHERE o.kind = 'table' AND o.state = 'active' AND o.db_id IN ({})",
-                ids.join(",")
-            ))
-            .await
-            .map_err(db_err)?;
+        let mut rows: Vec<(ObjectId, DbId, String, u64, Option<String>)> = Vec::new();
+        for o in tx.objects().await? {
+            if o.kind != ObjectKind::Table
+                || o.state != ObjectState::Active
+                || !state.dbs.contains(&o.db_id)
+            {
+                continue;
+            }
+            let create_sql = tx
+                .schema_version(o.object_id, o.schema_version)
+                .await?
+                .and_then(|v| v.create_sql);
+            rows.push((o.object_id, o.db_id, o.name, o.schema_version, create_sql));
+        }
         for (object, db, name, version, create_sql) in rows {
-            let (object, db) = (ObjectId(object), DbId(db));
             if let Some(sql) = &create_sql {
                 state.texts.insert(object, Arc::from(sql.as_str()));
             }

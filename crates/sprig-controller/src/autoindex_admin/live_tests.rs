@@ -271,7 +271,7 @@ async fn live_autoindex_admin() {
         let mut ch = v.change(id, VersionKind::Catalog).await.unwrap();
         let ver = ch.version();
         {
-            let (s, q) = ch.tx().parts();
+            let (s, q) = ch.tx().sql().await.unwrap();
             s.insert_database(
                 q,
                 &DatabaseRow {

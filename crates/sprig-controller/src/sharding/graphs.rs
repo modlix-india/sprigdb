@@ -16,7 +16,7 @@
 use mysql_async::prelude::Queryable as _;
 use serde::{Deserialize, Serialize};
 use sprig_common::ids::{ClusterId, DbId, GroupId, ShardId, TenantId};
-use sprig_common::names::{SchemaName, quote};
+use sprig_common::names::quote;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_shard::shard_schema;
 
@@ -187,8 +187,6 @@ impl ShardingLoop {
 
     async fn graph_rows(&self, tenant: TenantId) -> Result<Vec<Located>> {
         let home = self.graph_home(tenant).await?;
-        let mut c = self.conn(&home).await?;
-        let cat = SchemaName::catalog(tenant).to_string();
         let records = self.records.get().ok_or_else(|| {
             SprigError::new(
                 SprigCode::CatalogUnavailable,
@@ -204,17 +202,29 @@ impl ShardingLoop {
         if graphs.is_empty() {
             return Ok(Vec::new());
         }
-        let ids: Vec<String> = graphs.iter().map(|g| g.graph_id.to_string()).collect();
-        let names: Vec<GraphNames> = c
-            .query(format!(
-                "SELECT o.object_id, o.name, d.name, d.default_group_id \
-                 FROM {q}.objects o JOIN {q}.`databases` d ON d.db_id = o.db_id \
-                 WHERE o.state <> 'dropped' AND o.object_id IN ({})",
-                ids.join(", "),
-                q = quote(&cat)
-            ))
-            .await
-            .map_err(|e| db_err("graphs", &e))?;
+        // Names from the core rows (catalog records).
+        let reader =
+            sprig_catalog::store::rec::CoreReader::new(std::sync::Arc::clone(records), tenant);
+        let ids: Vec<sprig_common::ids::ObjectId> = graphs
+            .iter()
+            .map(|g| sprig_common::ids::ObjectId(g.graph_id))
+            .collect();
+        let dbs: std::collections::HashMap<u32, (String, u32)> = reader
+            .databases()
+            .await?
+            .into_iter()
+            .map(|d| (d.db_id.0, (d.name, d.default_group_id.0)))
+            .collect();
+        let names: Vec<GraphNames> = reader
+            .objects_by_ids(&ids)
+            .await?
+            .into_iter()
+            .filter(|o| o.state != sprig_catalog::store::ObjectState::Dropped)
+            .filter_map(|o| {
+                let (db, dg) = dbs.get(&o.db_id.0)?.clone();
+                Some((o.object_id.0, o.name, db, dg))
+            })
+            .collect();
         let names: std::collections::HashMap<u64, (String, String, u32)> = names
             .into_iter()
             .map(|(id, name, db, dg)| (id, (db, name, dg)))

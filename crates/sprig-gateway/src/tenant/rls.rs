@@ -39,7 +39,7 @@ use sprig_auth::authz::{Action, AuthzState, Grantee, SessionGrants, Target};
 use sprig_catalog::ddl::{database_key, object_key};
 use sprig_catalog::pool_wait::Bounded as _;
 use sprig_catalog::store::{DbState, Namespace, ObjectKind, ObjectState};
-use sprig_catalog::{CatalogLocator, ChangeOpts, Freshness, TenantCatalog, VersionKind};
+use sprig_catalog::{ChangeOpts, Freshness, TenantCatalog, VersionKind};
 use sprig_common::ids::{DbId, ObjectId};
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_sql::lex::LexOptions;
@@ -2295,7 +2295,6 @@ pub async fn tainted(
     cat: &TenantCatalog,
     protected: &[String],
 ) -> Result<Tainted> {
-    use mysql_async::prelude::Queryable;
     let code: Vec<_> = cat
         .objects
         .iter()
@@ -2326,22 +2325,17 @@ pub async fn tainted(
             .collect()
     };
     if !missing.is_empty() {
-        let ep = ts.services().locator.writer(ts.tenant).await?;
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-        })?;
-        let list = missing
-            .iter()
-            .map(u64::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let rows: Vec<(u64, u64, String)> = conn
-            .query(format!(
-                "SELECT object_id, version, ddl FROM {}.schema_versions WHERE object_id IN ({list})",
-                sprig_sql::rls::quote(ep.store.schema())
-            ))
-            .await
-            .map_err(|e| SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e))?;
+        // The objects' schema versions, from the catalog's records.
+        let reader = sprig_catalog::store::rec::CoreReader::new(
+            Arc::clone(&ts.services().records),
+            ts.tenant,
+        );
+        let mut rows: Vec<(u64, u64, String)> = Vec::new();
+        for o in &missing {
+            for v in reader.schema_versions(ObjectId(*o)).await? {
+                rows.push((*o, v.version, v.ddl));
+            }
+        }
         let mut c = ddl_cache()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

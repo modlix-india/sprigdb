@@ -4,8 +4,8 @@
 //! ```text
 //! key   = tenant u64 | shard 0 | object 0 | 'M' | index 0 | relative key
 //! relative keys:
-//!   v/<kind>                     committed version (u64 BE) and commit time (µs, u64 BE)
-//!   ctr/<name>                   an id counter: the last id handed out (u64 BE)
+//!   v/<kind>/                    committed version (u64 BE) and commit time (µs, u64 BE)
+//!   ctr/<name>/                  an id counter: the last id handed out (u64 BE)
 //!   m/<module>/<table>/<pk>      a module's row (JSON), pk order-preserving
 //! ```
 //!
@@ -43,9 +43,6 @@ use crate::version::{VersionBackend, VersionKind, Versioner};
 
 pub mod mem;
 pub mod remote;
-pub mod staged;
-#[cfg(test)]
-mod staged_live;
 #[cfg(test)]
 mod tests;
 
@@ -119,16 +116,40 @@ pub trait RecordStore: Send + Sync + 'static {
 
 // ---- keys ----
 
-/// The relative key of `kind`'s committed version.
+/// The relative key of `kind`'s committed version. Ended by `/`, so no
+/// key is the start of another (`v/a` against `v/ab`).
 #[must_use]
 pub fn version_key(kind: VersionKind) -> Vec<u8> {
-    format!("v/{}", kind.label()).into_bytes()
+    format!("v/{}/", kind.label()).into_bytes()
 }
 
-/// The relative key of counter `name`.
+/// The relative key of counter `name`, ended by `/` like
+/// [`version_key`] (`ctr/id` against `ctr/ids`).
 #[must_use]
 pub fn counter_key(name: &str) -> Vec<u8> {
-    format!("ctr/{name}").into_bytes()
+    format!("ctr/{name}/").into_bytes()
+}
+
+/// The key a version or counter had before keys were ended by `/`: read
+/// when the current key is missing, so records written by an older build
+/// keep their versions and ids (never handed out again). Only the current
+/// key is ever written.
+fn legacy_key(key: &[u8]) -> &[u8] {
+    key.strip_suffix(b"/").unwrap_or(key)
+}
+
+/// `key` locked for update; when it is missing, its value under the
+/// legacy key (read, not locked: every writer locks `key` first).
+async fn get_current(tx: &mut dyn RecordTx, key: &[u8], lock: bool) -> Result<Option<Vec<u8>>> {
+    let found = if lock {
+        tx.get_for_update(key).await?
+    } else {
+        tx.get(key).await?
+    };
+    match found {
+        Some(v) => Ok(Some(v)),
+        None => tx.get(legacy_key(key)).await,
+    }
 }
 
 /// The first key after every key starting with `p` (`p` is never all
@@ -385,7 +406,7 @@ pub async fn scan_all(
 /// overflow.
 pub async fn next_ids(tx: &mut dyn RecordTx, name: &str, n: u64) -> Result<u64> {
     let key = counter_key(name);
-    let last = match tx.get_for_update(&key).await? {
+    let last = match get_current(tx, &key, true).await? {
         Some(raw) => be_u64(&raw).ok_or_else(|| bad_record("counter"))?,
         None => 0,
     };
@@ -406,7 +427,7 @@ pub async fn next_ids(tx: &mut dyn RecordTx, name: &str, n: u64) -> Result<u64> 
 /// As for [`next_ids`].
 pub async fn counter_at_least(tx: &mut dyn RecordTx, name: &str, at: u64) -> Result<()> {
     let key = counter_key(name);
-    let last = match tx.get_for_update(&key).await? {
+    let last = match get_current(tx, &key, true).await? {
         Some(raw) => be_u64(&raw).ok_or_else(|| bad_record("counter"))?,
         None => 0,
     };
@@ -422,7 +443,7 @@ pub async fn counter_at_least(tx: &mut dyn RecordTx, name: &str, at: u64) -> Res
 /// # Errors
 /// The store's; `Internal` for a version record that doesn't decode.
 pub async fn read_version(tx: &mut dyn RecordTx, kind: VersionKind) -> Result<u64> {
-    match tx.get(&version_key(kind)).await? {
+    match get_current(tx, &version_key(kind), false).await? {
         Some(raw) => be_u64(&raw).ok_or_else(|| bad_record("version")),
         None => Ok(0),
     }
@@ -498,6 +519,11 @@ impl RecTx {
     pub fn tenant(&self) -> TenantId {
         self.tenant
     }
+
+    /// The record transaction itself (to end it).
+    pub(crate) fn into_records(self) -> Box<dyn RecordTx> {
+        self.tx
+    }
 }
 
 #[async_trait::async_trait]
@@ -506,7 +532,7 @@ impl VersionBackend for RecBackend {
 
     async fn begin_locked(&self, tenant: TenantId, kind: VersionKind) -> Result<(RecTx, u64)> {
         let mut tx = self.store.begin(tenant).await?;
-        let v = match tx.get_for_update(&version_key(kind)).await? {
+        let v = match get_current(&mut *tx, &version_key(kind), true).await? {
             Some(raw) => be_u64(&raw).ok_or_else(|| bad_record("version"))?,
             None => 0,
         };

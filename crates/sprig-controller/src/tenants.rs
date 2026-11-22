@@ -79,7 +79,7 @@ use std::time::{Duration, Instant};
 
 use sprig_catalog::bootstrap::{
     BootstrapProgress, BootstrapStep, CatalogClaim, catalog_owner, claim_catalog, create_catalog,
-    drop_catalog, live_databases, read_progress, tenant_schema_ids, write_progress,
+    drop_catalog, read_progress, tenant_schema_ids, write_progress,
 };
 use sprig_catalog::migrate::MigrateOpts;
 use sprig_catalog::placement::ShardMap;
@@ -331,8 +331,8 @@ where
     /// interval comes. Databases that still resist after
     /// [`DELETED_DATABASES_GRACE`] are marked dropped in the catalog,
     /// whose schemas step 3 drops by id anyway. Returns how many are left.
-    async fn drop_databases(&self, id: TenantId, ep: &CatalogEndpoint) -> Result<u64> {
-        let mut live = live_databases(&ep.pool, &ep.store).await?;
+    async fn drop_databases(&self, id: TenantId, _ep: &CatalogEndpoint) -> Result<u64> {
+        let mut live = cleanup::live_databases(id).await?;
         if live == 0 {
             self.waiting_dbs
                 .lock()
@@ -351,7 +351,7 @@ where
                     tracing::warn!(tenant = %id, error = %e, "the deleted tenant's databases weren't dropped yet");
                 }
             }
-            live = live_databases(&ep.pool, &ep.store).await?;
+            live = cleanup::live_databases(id).await?;
         }
         if live == 0 {
             self.waiting_dbs
@@ -370,14 +370,14 @@ where
             tracing::info!(tenant = %id, databases = live, "tenant cleanup waits for its databases to be dropped");
             return Ok(live);
         }
-        let n = cleanup::mark_databases_dropped(&ep.pool, ep.store.schema()).await?;
+        let n = cleanup::mark_databases_dropped(id).await?;
         tracing::warn!(alert = "TenantCleanupForcedDatabases", tenant = %id, databases = n,
             "the deleted tenant's databases resisted the DDL path; marked dropped, their schemas go by id");
         self.waiting_dbs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&id);
-        live_databases(&ep.pool, &ep.store).await
+        cleanup::live_databases(id).await
     }
 
     /// Lets cleanup drop a deleted tenant's databases itself (the catalog
@@ -1058,7 +1058,7 @@ where
                         if live > 0 {
                             return Ok(Cleanup::WaitingForDatabases(live));
                         }
-                        db_ids = cleanup::catalog_db_ids(&ep.pool, ep.store.schema()).await?;
+                        db_ids = cleanup::catalog_db_ids(id, &ep.pool, ep.store.schema()).await?;
                         catalog = Some(ep);
                     }
                 }
@@ -1102,6 +1102,7 @@ where
         // 4. The catalog itself.
         if let Some(ep) = &catalog {
             drop_catalog(&ep.pool, &ep.store).await?;
+            cleanup::delete_catalog_records(id).await?;
         }
         // 5. Finished job records, then the tenant's keys in the DC tier
         //    (the catalog's shard map among them).

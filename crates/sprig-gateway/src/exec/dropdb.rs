@@ -337,20 +337,13 @@ impl DbDrop {
             .catalog
             .change(self.tenant, VersionKind::Catalog)
             .await?;
-        let applied = match c.tx().split().await {
-            Err(e) => Err(e),
-            Ok((store, tx, rec)) => {
-                let schema = store.schema().to_owned();
-                let mut r = Ok(());
-                for ch in &changes {
-                    r = sprig_sinks::sql::apply(tx, &schema, rec, ch, None, self.tenant, 0).await;
-                    if r.is_err() {
-                        break;
-                    }
-                }
-                r
+        let mut applied = Ok(());
+        for ch in &changes {
+            applied = sprig_sinks::sql::apply(c.tx(), ch, None, self.tenant, 0).await;
+            if applied.is_err() {
+                break;
             }
-        };
+        }
         if let Err(e) = applied {
             let _ = c.rollback().await;
             return Err(e);

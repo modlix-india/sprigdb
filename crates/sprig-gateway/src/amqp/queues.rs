@@ -371,10 +371,10 @@ impl MqCatalog for GatewayMq {
         let tenant = TenantId(v.tenant);
         let new_id = match &c {
             TopoChange::AddExchange(_) | TopoChange::AddQueue(_) => {
-                let ep = self.svc.locator.writer(tenant).await.map_err(unavailable)?;
-                let mut conn = ep.pool.get_conn_bounded().await.map_err(unavailable)?;
-                ep.store
-                    .next_object_id(&mut conn)
+                self.svc
+                    .catalog
+                    .backend()
+                    .next_object_id(tenant)
                     .await
                     .map_err(unavailable)?
                     .0

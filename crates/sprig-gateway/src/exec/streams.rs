@@ -26,6 +26,7 @@ use mysql_async::prelude::Queryable;
 use sprig_auth::authz::{Action, Target};
 use sprig_catalog::ddl::{database_key, object_key};
 use sprig_catalog::pool_wait::Bounded as _;
+use sprig_catalog::rows::SettingsTx;
 use sprig_catalog::store::{Namespace, ObjectKind, ObjectState, SettingRow, SettingScope};
 use sprig_catalog::version::VersionKind;
 use sprig_catalog::{CatalogLocator, TenantCatalog};
@@ -317,11 +318,13 @@ impl Host for GwHost<'_> {
 
     async fn next_id(&mut self) -> Result<u64> {
         let ts = self.ts().ok_or_else(|| SprigError::internal("no tenant"))?;
-        let ep = ts.services().locator.writer(self.cat.tenant).await?;
-        let mut conn = ep.pool.get_conn_bounded().await.map_err(|e| {
-            SprigError::new(SprigCode::CatalogUnavailable, "catalog unreachable").with_source(e)
-        })?;
-        Ok(ep.store.next_object_id(&mut conn).await?.0)
+        Ok(ts
+            .services()
+            .catalog
+            .backend()
+            .next_object_id(self.cat.tenant)
+            .await?
+            .0)
     }
 
     async fn commit(&mut self, change: &StreamsChange) -> Result<()> {
@@ -346,8 +349,7 @@ impl Host for GwHost<'_> {
         let mut c = svc.catalog.change(tenant, VersionKind::Catalog).await?;
         let version = c.version();
         let applied = {
-            let (store, tx) = c.tx().parts();
-            let streams = sprig_streams::StreamsStore::new(store.schema());
+            let tx = c.tx();
             let retention = |def: &StreamDef, h: u64| SettingRow {
                 scope: SettingScope::Object(ObjectId(def.id.0)),
                 key: sprig_streams::settings::RETENTION_HOURS.key.to_owned(),
@@ -358,15 +360,19 @@ impl Host for GwHost<'_> {
                 version,
             };
             async {
+                // Stream definitions stay in the catalog schema (the MariaDB
+                // stream path's table); their settings are catalog records.
                 match change {
                     StreamsChange::Insert(def, h) => {
-                        streams.insert(tx, def).await?;
+                        let (streams, q) = stream_sql(tx).await?;
+                        streams.insert(q, def).await?;
                         if let Some(h) = h {
-                            store.put_setting(tx, &retention(def, *h)).await?;
+                            SettingsTx::put_setting(tx, &retention(def, *h)).await?;
                         }
                     }
                     StreamsChange::Update(def, changes) => {
-                        streams.update(tx, def).await?;
+                        let (streams, q) = stream_sql(tx).await?;
+                        streams.update(q, def).await?;
                         // A change topic's settings are its table's.
                         let scope = SettingScope::Object(ObjectId(
                             def.source_object.map_or(def.id.0, |o| o.0),
@@ -374,39 +380,40 @@ impl Host for GwHost<'_> {
                         for c in changes {
                             match c.value {
                                 Some(v) => {
-                                    store
-                                        .put_setting(
-                                            tx,
-                                            &SettingRow {
-                                                scope,
-                                                key: c.key.to_owned(),
-                                                value: Some(serde_json::json!(v)),
-                                                bounds: None,
-                                                set_by: set_by.clone(),
-                                                set_at: SystemTime::now(),
-                                                version,
-                                            },
-                                        )
-                                        .await?;
+                                    SettingsTx::put_setting(
+                                        tx,
+                                        &SettingRow {
+                                            scope,
+                                            key: c.key.to_owned(),
+                                            value: Some(serde_json::json!(v)),
+                                            bounds: None,
+                                            set_by: set_by.clone(),
+                                            set_at: SystemTime::now(),
+                                            version,
+                                        },
+                                    )
+                                    .await?;
                                 }
                                 None => {
-                                    store
-                                        .reset_setting(
-                                            tx,
-                                            scope,
-                                            c.key,
-                                            true,
-                                            false,
-                                            &set_by,
-                                            SystemTime::now(),
-                                            version,
-                                        )
-                                        .await?;
+                                    SettingsTx::reset_setting(
+                                        tx,
+                                        scope,
+                                        c.key,
+                                        true,
+                                        false,
+                                        &set_by,
+                                        SystemTime::now(),
+                                        version,
+                                    )
+                                    .await?;
                                 }
                             }
                         }
                     }
-                    StreamsChange::Delete(def) => streams.delete(tx, def.id).await?,
+                    StreamsChange::Delete(def) => {
+                        let (streams, q) = stream_sql(tx).await?;
+                        streams.delete(q, def.id).await?;
+                    }
                 }
                 Ok::<_, SprigError>(())
             }
@@ -1068,6 +1075,18 @@ impl PassSession {
             }
         }
     }
+}
+
+/// The stream definitions' store and the catalog schema's MariaDB
+/// transaction of the change `tx`.
+async fn stream_sql(
+    tx: &mut sprig_catalog::version::MariaTx,
+) -> Result<(
+    sprig_streams::StreamsStore,
+    &mut mysql_async::Transaction<'static>,
+)> {
+    let (store, q) = tx.sql().await?;
+    Ok((sprig_streams::StreamsStore::new(store.schema()), q))
 }
 
 #[cfg(test)]

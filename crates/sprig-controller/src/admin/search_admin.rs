@@ -12,6 +12,7 @@
 //! meanwhile: queries wait for a copy, as after `ALTER ... REBUILD`).
 
 use serde_json::{Value, json};
+use sprig_catalog::ddl::DdlTx;
 use sprig_common::ids::TenantId;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_meta::{ListOpts, Op, Txn};
@@ -100,11 +101,12 @@ impl AdminService {
             .change(t, sprig_catalog::VersionKind::Catalog)
             .await?;
         let r: Result<(u64, u32)> = async {
-            let (store, tx, rec) = ch.tx().split().await?;
-            let row = match store.database_by_name(tx, db).await? {
+            let tx = ch.tx();
+            let row = match DdlTx::database_by_name(tx, db).await? {
                 Some(r) => Some(r),
-                None => store.database_by_name(tx, &db.to_lowercase()).await?,
+                None => DdlTx::database_by_name(tx, &db.to_lowercase()).await?,
             };
+            let rec = tx.records().await?;
             let db_id = row.ok_or_else(not_found)?.db_id.0;
             // The index's catalog record (`m/search/indexes/<id>`), read
             // and written as JSON: the definition gets the new generation.

@@ -29,12 +29,10 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use hyper::body::Bytes;
 use mysql_async::Pool;
-use mysql_async::prelude::Queryable;
 use serde_json::{Map, json};
 use sprig_catalog::CatalogLocator;
 use sprig_catalog::pool_wait::Bounded as _;
 use sprig_common::ids::{DcId, TenantId};
-use sprig_common::names::quote;
 use sprig_common::{Result, SprigCode, SprigError};
 use sprig_meta::MetaStore;
 use sprig_settings::LiveSettings;
@@ -246,16 +244,12 @@ impl Webhooks {
         let store = SinksStore::new(self.records(), tenant);
         let (db_id, r) = match name {
             ConnName::Own { db, name } => {
-                let id: Option<u32> = c
-                    .exec_first(
-                        format!(
-                            "SELECT db_id FROM {}.`databases` WHERE name_key = ? AND state = 'active'",
-                            quote(&schema)
-                        ),
-                        (db.to_lowercase(),),
-                    )
-                    .await
-                    .map_err(|e| SprigError::internal("approvals webhook: databases").with_source(e))?;
+                let id: Option<u32> =
+                    sprig_catalog::store::rec::CoreReader::new(crate::catalog_records(), tenant)
+                        .database_by_name(&db.to_lowercase())
+                        .await?
+                        .filter(|d| d.state == sprig_catalog::store::DbState::Active)
+                        .map(|d| d.db_id.0);
                 let db_id = id.ok_or_else(|| not_found(&format!("database {db}")))?;
                 let st = {
                     let mut rtx = self.records().begin(tenant).await?;

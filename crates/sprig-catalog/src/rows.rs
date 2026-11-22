@@ -14,8 +14,9 @@ use sprig_common::{Result, SprigCode, SprigError};
 
 use crate::cache::mem::{MemSource, MemSourceTx, MemTables};
 use crate::sql::{map_err, timed};
+use crate::store::rec::CoreRecords;
 use crate::store::{DbState, ObjectState, SettingRow, SettingScope};
-use crate::version::{MariaBackend, MariaTx, VersionBackend};
+use crate::version::{Core, MariaBackend, MariaTx, VersionBackend};
 
 /// Reads and writes `settings` rows inside an open change (or a locked
 /// version row). Reads see the transaction's own writes.
@@ -125,28 +126,36 @@ where
     async fn tenant_scope(&self, tenant: TenantId) -> Result<TenantScopeRows>;
 }
 
-// ---- MariaDB ----
+// ---- the catalog writer ----
 
 #[async_trait::async_trait]
 impl SettingsTx for MariaTx {
     async fn setting(&mut self, scope: SettingScope, key: &str) -> Result<Option<SettingRow>> {
-        let (s, q) = self.parts();
-        s.setting(q, scope, key).await
+        match self.core() {
+            Core::Rec(r) => CoreRecords::setting(r, scope, key).await,
+            Core::Sql(s, q) => s.setting(q, scope, key).await,
+        }
     }
 
     async fn scope_rows(&mut self, scope: SettingScope) -> Result<Vec<SettingRow>> {
-        let (s, q) = self.parts();
-        s.settings_of(q, scope).await
+        match self.core() {
+            Core::Rec(r) => CoreRecords::settings_of(r, scope).await,
+            Core::Sql(s, q) => s.settings_of(q, scope).await,
+        }
     }
 
     async fn key_rows(&mut self, key: &str) -> Result<Vec<SettingRow>> {
-        let (s, q) = self.parts();
-        s.settings_for_key(q, key).await
+        match self.core() {
+            Core::Rec(r) => CoreRecords::settings_for_key(r, key).await,
+            Core::Sql(s, q) => s.settings_for_key(q, key).await,
+        }
     }
 
     async fn put_setting(&mut self, row: &SettingRow) -> Result<()> {
-        let (s, q) = self.parts();
-        s.put_setting(q, row).await
+        match self.core() {
+            Core::Rec(r) => CoreRecords::put_setting(r, row).await,
+            Core::Sql(s, q) => s.put_setting(q, row).await,
+        }
     }
 
     async fn reset_setting(
@@ -159,30 +168,54 @@ impl SettingsTx for MariaTx {
         at: SystemTime,
         version: u64,
     ) -> Result<bool> {
-        let (s, q) = self.parts();
-        s.reset_setting(q, scope, key, value, bounds, set_by, at, version)
-            .await
+        match self.core() {
+            Core::Rec(r) => {
+                CoreRecords::reset_setting(r, scope, key, value, bounds, set_by, at, version).await
+            }
+            Core::Sql(s, q) => {
+                s.reset_setting(q, scope, key, value, bounds, set_by, at, version)
+                    .await
+            }
+        }
     }
 
     async fn database_live(&mut self, db: DbId) -> Result<bool> {
-        let (s, q) = self.parts();
-        Ok(s.database(q, db)
-            .await?
-            .is_some_and(|d| matches!(d.state, DbState::Creating | DbState::Active)))
+        let d = match self.core() {
+            Core::Rec(r) => CoreRecords::database(r, db).await?,
+            Core::Sql(s, q) => s.database(q, db).await?,
+        };
+        Ok(d.is_some_and(|d| matches!(d.state, DbState::Creating | DbState::Active)))
     }
 
     async fn object_db(&mut self, object: ObjectId) -> Result<Option<DbId>> {
-        let (s, q) = self.parts();
-        Ok(s.object(q, object)
-            .await?
-            .filter(|o| !matches!(o.state, ObjectState::Dropping | ObjectState::Dropped))
-            .map(|o| o.db_id))
+        let o = match self.core() {
+            Core::Rec(r) => CoreRecords::object(r, object).await?,
+            Core::Sql(s, q) => s.object(q, object).await?,
+        };
+        Ok(
+            o.filter(|o| !matches!(o.state, ObjectState::Dropping | ObjectState::Dropped))
+                .map(|o| o.db_id),
+        )
     }
 }
 
 #[async_trait::async_trait]
 impl SettingsBackend for MariaBackend {
     async fn tenant_scope(&self, tenant: TenantId) -> Result<TenantScopeRows> {
+        if let Some(r) = self.records() {
+            let mut tx = r.begin(tenant).await?;
+            let read = async {
+                let versions = CoreRecords::versions(&mut *tx).await?;
+                let rows = CoreRecords::settings_of(&mut *tx, SettingScope::Tenant).await?;
+                Ok::<_, sprig_common::SprigError>(TenantScopeRows {
+                    version: versions.catalog,
+                    rows,
+                })
+            }
+            .await;
+            let _ = tx.rollback().await;
+            return read;
+        }
         let ep = self.locator().reader(tenant).await?;
         timed(
             self.opts().statement_timeout * 2,

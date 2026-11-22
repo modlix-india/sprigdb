@@ -79,21 +79,14 @@ pub async fn after_grants(svc: &Arc<TenantServices>, cat: &TenantCatalog, lctn: 
     let tenant = cat.tenant;
     let r: sprig_common::Result<u64> = async {
         let mut c = svc.catalog.change(tenant, VersionKind::Catalog).await?;
-        let applied = match c.tx().split().await {
-            Err(e) => Err(e),
-            Ok((store, tx, rec)) => {
-                let schema = store.schema().to_owned();
-                let mut r = Ok(());
-                for (id, state, reason) in &todo {
-                    let ch = Change::State(*id, *state, reason.clone());
-                    r = sprig_sinks::sql::apply(tx, &schema, rec, &ch, None, tenant, 0).await;
-                    if r.is_err() {
-                        break;
-                    }
-                }
-                r
+        let mut applied = Ok(());
+        for (id, state, reason) in &todo {
+            let ch = Change::State(*id, *state, reason.clone());
+            applied = sprig_sinks::sql::apply(c.tx(), &ch, None, tenant, 0).await;
+            if applied.is_err() {
+                break;
             }
-        };
+        }
         if let Err(e) = applied {
             let _ = c.rollback().await;
             return Err(e);

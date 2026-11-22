@@ -166,18 +166,26 @@ impl RecordTx for EngineTx {
         let (lo, hi) = (self.key(lo), self.key(hi));
         let n = self.prefix.len();
         let r = KeyRange::new(lo.to_vec(), hi.to_vec());
-        // The engine's snapshot scan was seen returning a record just
-        // before a start that falls between two records (the merge of
-        // commits not yet in the store): only keys in the range count, so
-        // paging callers (`lo` = last key + 0x00) never see a row twice.
-        Ok(self
+        // Only keys in the range count, so paging callers (`lo` = last key
+        // + 0x00) never see a row twice. The engine once returned the record
+        // just before a start falling between two records; that is fixed,
+        // and this stays as a guard. One row more is asked for, so a row
+        // dropped here never makes a full page look like the last one.
+        let mut rows: Vec<(Vec<u8>, Vec<u8>)> = self
             .t()?
-            .scan(&r, Dir::Forward, limit, ReadMode::Snapshot)
+            .scan(
+                &r,
+                Dir::Forward,
+                limit.saturating_add(1),
+                ReadMode::Snapshot,
+            )
             .map_err(engine_err)?
             .into_iter()
             .map(|(k, v)| (k[n..].to_vec(), v.to_vec()))
             .filter(|(k, _)| *k >= rel_lo)
-            .collect())
+            .collect();
+        rows.truncate(limit);
+        Ok(rows)
     }
 
     async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -369,8 +377,6 @@ impl CatalogPeer for CatalogService {
     }
 }
 
-#[cfg(test)]
-mod staged_kill;
 #[cfg(test)]
 mod modules_kill;
 #[cfg(test)]
