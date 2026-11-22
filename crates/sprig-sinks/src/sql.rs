@@ -1770,25 +1770,51 @@ pub async fn apply(
         Change::UpdateSink(def) => SinksStore::update_sink(rec, def).await?,
         Change::ResetSink(def) => {
             SinksStore::update_sink(rec, def).await?;
-            delete_sql_group(tx, &def.group()).await?;
+            delete_sql_group(tx, def).await?;
         }
         // The state record is written after the commit (`after_commit`);
         // the change itself moves the catalog version.
         Change::State(..) => {}
         Change::DropSink(def) => {
             SinksStore::delete_sink(rec, def.id).await?;
-            delete_sql_group(tx, &def.group()).await?;
+            delete_sql_group(tx, def).await?;
         }
         Change::Usage(u, grant) => SinksStore::set_usage(rec, u, *grant, user).await?,
     }
     Ok(())
 }
 
+/// Whether a sink can have a consumer group in the MariaDB stream path's
+/// tables: a sink reading a stream of that path, its fan-in instances, or
+/// tables' changes (read through the tables' change topics, which are
+/// streams of that path). Streams on the engine keep their groups as engine
+/// records, and queues have none.
+fn has_sql_group(def: &crate::model::SinkDef) -> bool {
+    match &def.source {
+        crate::model::SourceSpec::Stream { id, .. } => {
+            !sprig_streams::seg::kafka::is_engine_stream(*id)
+        }
+        crate::model::SourceSpec::FanIn { .. } | crate::model::SourceSpec::Changes { .. } => true,
+        crate::model::SourceSpec::Queue { .. } | crate::model::SourceSpec::FanInQueue { .. } => {
+            false
+        }
+    }
+}
+
 /// Deletes a sink's consumer group from the MariaDB stream path's tables in
-/// the catalog schema (streams on the engine keep their groups as engine
-/// records). A tenant whose catalog never held such a stream (a fan-in
-/// sink's declarer whose task never ran) has no group tables.
-async fn delete_sql_group(tx: &mut sprig_catalog::version::MariaTx, group: &str) -> Result<()> {
+/// the catalog schema, for a sink that can have one ([`has_sql_group`]); any
+/// other sink's change touches no MariaDB. A tenant whose catalog never held
+/// such a stream (a fan-in sink's declarer whose task never ran) has no
+/// group tables.
+async fn delete_sql_group(
+    tx: &mut sprig_catalog::version::MariaTx,
+    def: &crate::model::SinkDef,
+) -> Result<()> {
+    if !has_sql_group(def) {
+        return Ok(());
+    }
+    let group = def.group();
+    let group = group.as_str();
     let (store, q) = tx.sql().await?;
     let streams = sprig_streams::StreamsStore::new(store.schema());
     if streams.migrated(q).await.unwrap_or(true) {
@@ -1871,5 +1897,37 @@ mod fan_in_guarantee_tests {
             let e = fan_in_guarantee(Guarantee::ExactlyOnce, t).unwrap_err();
             assert_eq!(e.code(), Some(SprigCode::SinkExactlyOnceUnsupported));
         }
+    }
+}
+
+#[cfg(test)]
+mod sql_group_tests {
+    use super::has_sql_group;
+    use crate::model::{SourceSpec, TargetSpec};
+
+    #[test]
+    fn only_mariadb_path_stream_sinks_have_a_sql_group() {
+        let mut d = crate::probe::stand_in(1, "s", TargetSpec::Webhook { path: None });
+        d.source = SourceSpec::Stream {
+            id: 7,
+            name: "old".into(),
+            partitions: 1,
+        };
+        assert!(has_sql_group(&d));
+        d.source = SourceSpec::Stream {
+            id: sprig_streams::seg::kafka::FIRST_STREAM_ID + 3,
+            name: "s".into(),
+            partitions: 1,
+        };
+        assert!(!has_sql_group(&d));
+        d.source = SourceSpec::Queue {
+            id: 9,
+            name: "q".into(),
+        };
+        assert!(!has_sql_group(&d));
+        d.source = SourceSpec::Changes {
+            objects: vec![(5, "t".into())],
+        };
+        assert!(has_sql_group(&d));
     }
 }

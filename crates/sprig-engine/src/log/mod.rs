@@ -21,6 +21,12 @@
 //! are synced by a timer. A failed write or sync is fatal: the process
 //! aborts and recovery replays the log (fsync errors are never retried).
 //!
+//! raft-engine's own `Engine::sync` writes an empty batch, and its `write`
+//! returns at once for an empty batch, so it never reaches the disk. A
+//! sync on its own (the timer's, a checkpoint's) is instead a one-item
+//! batch written with sync on, to a raft-engine group no unit may use
+//! ([`sync_log`]).
+//!
 //! On open, every unit's entries above the state machine's applied index are
 //! replayed into it before the log accepts proposals.
 
@@ -37,14 +43,15 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use raft_engine::{LogBatch, ReadableSize, RecoveryMode};
-use sprig_common::{Result, SprigError};
+use sprig_common::{Result, SprigCode, SprigError};
 
 pub use entry::{EntryExt, LogEntry};
 pub use fs::{LogFs, SimDisk, SyncMode};
 pub use payload::Payload;
 
 /// A unit: an unsharded tenant or one shard, with its own log (one Raft
-/// group once replication is built).
+/// group once replication is built). `u64::MAX` is reserved for the log's
+/// own use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct UnitId(pub u64);
 
@@ -158,6 +165,11 @@ struct UnitState {
     synced: AtomicU64,
     applied: AtomicU64,
     closed: AtomicBool,
+    /// Entries from this index up failed (0: none). Only a replicated log
+    /// sets it, through [`ProposalProgress::fail_from`].
+    failed_from: AtomicU64,
+    /// Whether those entries' outcome is unknown rather than known lost.
+    failed_unknown: AtomicBool,
     mu: Mutex<()>,
     cv: Condvar,
     notify: tokio::sync::Notify,
@@ -234,6 +246,29 @@ impl Ticket {
         w.load(Ordering::Acquire) >= self.index
     }
 
+    fn failed(&self, u: &UnitState) -> bool {
+        let f = u.failed_from.load(Ordering::Acquire);
+        f != 0 && self.index >= f
+    }
+
+    /// `Ok` once `done`, else the failure a replicated log reported.
+    fn outcome(&self, done: bool) -> Result<()> {
+        if done || !self.failed(&self.unit) {
+            return Ok(());
+        }
+        Err(if self.unit.failed_unknown.load(Ordering::Acquire) {
+            SprigError::new(
+                SprigCode::CommitOutcomeUnknown,
+                "the unit's leader changed; the write may or may not have committed",
+            )
+        } else {
+            SprigError::new(
+                SprigCode::ShardMoved,
+                "the unit's leader changed before the write committed; retry it",
+            )
+        })
+    }
+
     /// Whether the entry already meets its durability class.
     #[must_use]
     pub fn is_durable(&self) -> bool {
@@ -244,38 +279,121 @@ impl Ticket {
     /// content depends on this entry wait here.
     ///
     /// # Errors
-    /// The log closed first.
+    /// The log closed first, or (replicated logs) the entry was lost to a
+    /// leadership change: retryable, or an unknown outcome.
     pub fn wait(&self) -> Result<()> {
-        self.unit.wait_until(|u| self.durable(u))
+        self.unit
+            .wait_until(|u| self.durable(u) || self.failed(u))?;
+        self.outcome(self.is_durable())
     }
 
     /// The async form of [`Ticket::wait`].
     ///
     /// # Errors
-    /// The log closed first.
+    /// As for [`Ticket::wait`].
     pub async fn wait_async(&self) -> Result<()> {
-        self.unit.wait_until_async(|u| self.durable(u)).await
+        self.unit
+            .wait_until_async(|u| self.durable(u) || self.failed(u))
+            .await?;
+        self.outcome(self.is_durable())
+    }
+
+    fn is_applied(&self, u: &UnitState) -> bool {
+        u.applied.load(Ordering::Acquire) >= self.index
     }
 
     /// Blocks until the entry is applied to the store.
     ///
     /// # Errors
-    /// The log closed first.
+    /// As for [`Ticket::wait`].
     pub fn wait_applied(&self) -> Result<()> {
-        let i = self.index;
         self.unit
-            .wait_until(|u| u.applied.load(Ordering::Acquire) >= i)
+            .wait_until(|u| self.is_applied(u) || self.failed(u))?;
+        self.outcome(self.is_applied(&self.unit))
     }
 
     /// The async form of [`Ticket::wait_applied`].
     ///
     /// # Errors
-    /// The log closed first.
+    /// As for [`Ticket::wait`].
     pub async fn wait_applied_async(&self) -> Result<()> {
-        let i = self.index;
         self.unit
-            .wait_until_async(|u| u.applied.load(Ordering::Acquire) >= i)
-            .await
+            .wait_until_async(|u| self.is_applied(u) || self.failed(u))
+            .await?;
+        self.outcome(self.is_applied(&self.unit))
+    }
+}
+
+/// Proposal progress as a replicated [`Consensus`] implementation reports
+/// it, so it can hand out [`Ticket`]s. One per run of proposals whose
+/// outcomes move together (a leader's term): indexes count as durable and
+/// applied up to what it sets, and every entry from [`fail_from`]'s index up
+/// fails.
+///
+/// [`fail_from`]: ProposalProgress::fail_from
+#[derive(Debug, Clone, Default)]
+pub struct ProposalProgress {
+    state: Arc<UnitState>,
+}
+
+impl ProposalProgress {
+    /// Progress with nothing durable yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A ticket for the entry at `index` of `unit`.
+    #[must_use]
+    pub fn ticket(&self, unit: UnitId, index: u64, durability: Durability) -> Ticket {
+        Ticket {
+            unit: Arc::clone(&self.state),
+            unit_id: unit,
+            index,
+            sync: durability.needs_sync(),
+        }
+    }
+
+    /// Entries up to `index` meet every durability class (a replicated log:
+    /// committed).
+    pub fn set_durable(&self, index: u64) {
+        self.state.written.fetch_max(index, Ordering::AcqRel);
+        self.state.synced.fetch_max(index, Ordering::AcqRel);
+        self.state.wake();
+    }
+
+    /// Entries up to `index` are applied.
+    pub fn set_applied(&self, index: u64) {
+        self.state.applied.fetch_max(index, Ordering::AcqRel);
+        self.state.wake();
+    }
+
+    /// Entries from `index` up will never become durable here: lost to a
+    /// leadership change (retryable), or with `unknown`, perhaps committed
+    /// after all. The lowest index reported wins.
+    pub fn fail_from(&self, index: u64, unknown: bool) {
+        if unknown {
+            self.state.failed_unknown.store(true, Ordering::Release);
+        }
+        let mut cur = self.state.failed_from.load(Ordering::Acquire);
+        while cur == 0 || index.max(1) < cur {
+            match self.state.failed_from.compare_exchange(
+                cur,
+                index.max(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(c) => cur = c,
+            }
+        }
+        self.state.wake();
+    }
+
+    /// Fails every waiter that is still waiting: the log is closed.
+    pub fn close(&self) {
+        self.state.closed.store(true, Ordering::Release);
+        self.state.wake();
     }
 }
 
@@ -364,6 +482,28 @@ fn log_err(what: &str, e: raft_engine::Error) -> SprigError {
     SprigError::internal(format!("commit log: {what} failed")).with_source(e)
 }
 
+/// The raft-engine group that carries sync markers. No unit may use it
+/// ([`Consensus::propose`] refuses it) and replay skips it. It never holds
+/// entries or values: a marker deletes a key it never wrote, so its memtable
+/// stays empty, references no log file, and never holds back a purge.
+const SYNC_GROUP: u64 = u64::MAX;
+
+/// The key a sync marker deletes.
+const SYNC_KEY: &[u8] = b"sync";
+
+/// Makes everything written to the log so far durable.
+///
+/// raft-engine's `Engine::sync` can't do this: it writes an empty batch,
+/// which `Engine::write` skips before it gets to the sync. A one-item batch
+/// written with sync on takes the normal write path, whose sync covers the
+/// file being written; raft-engine syncs every earlier file when it rotates
+/// away from it.
+fn sync_log(engine: &raft_engine::Engine<LogFs>) -> raft_engine::Result<()> {
+    let mut lb = LogBatch::with_capacity(1);
+    lb.delete(SYNC_GROUP, SYNC_KEY.to_vec());
+    engine.write(&mut lb, true).map(drop)
+}
+
 impl LocalLog {
     /// Opens the log in `dir`, replays every unit's entries above
     /// `sm.applied_index(unit)` into `sm`, and starts the writer.
@@ -412,7 +552,9 @@ impl LocalLog {
         // with an empty slot.
         on_fresh_thread(|| {
             for u in sh.engine.raft_groups() {
-                replay(&sh, UnitId(u))?;
+                if u != SYNC_GROUP {
+                    replay(&sh, UnitId(u))?;
+                }
             }
             Ok(())
         })?;
@@ -481,7 +623,7 @@ impl LocalLog {
         cap: &dyn Fn(UnitId) -> Option<u64>,
     ) -> Result<u64> {
         let floors = self.applied();
-        self.sh.engine.sync().map_err(|e| log_err("sync", e))?;
+        sync_log(&self.sh.engine).map_err(|e| log_err("sync", e))?;
         flush_store()?;
         let mut trimmed = 0;
         for (u, applied) in floors {
@@ -686,6 +828,12 @@ fn replay(sh: &Shared, unit: UnitId) -> Result<()> {
 
 impl Consensus for LocalLog {
     fn propose(&self, unit: UnitId, payload: Vec<u8>, durability: Durability) -> Result<Ticket> {
+        if unit.0 == SYNC_GROUP {
+            return Err(SprigError::internal(format!(
+                "commit log: unit {} is reserved for the log's own sync markers",
+                unit.0
+            )));
+        }
         let state = self.unit(unit);
         let mut q = self.sh.queue.lock().unwrap_or_else(PoisonError::into_inner);
         if q.closed {
@@ -820,7 +968,7 @@ fn run(sh: &Shared) {
 
 fn sync_all(sh: &Shared) {
     let t = Instant::now();
-    if let Err(e) = sh.engine.sync() {
+    if let Err(e) = sync_log(&sh.engine) {
         fatal("sync", &e);
     }
     sh.counters.syncs.fetch_add(1, Ordering::Relaxed);

@@ -1,0 +1,410 @@
+//! Clusters of real driver threads in one process, over `MemNetwork` and
+//! simulated disks, with fast timings.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use raft::prelude::{ConfChangeSingle, ConfChangeType, ConfChangeV2};
+use sprig_common::time::SystemClock;
+use sprig_engine::log::Durability;
+
+use super::*;
+use crate::logstore::MemLogStore;
+use crate::toy::{self, KvMachine};
+use crate::transport::MemNetwork;
+
+pub(crate) fn fast() -> RaftConfig {
+    RaftConfig {
+        tick: Duration::from_millis(10),
+        election_ticks: 10,
+        heartbeat_ticks: 2,
+        lease: Duration::from_millis(90),
+        lease_margin: Duration::from_millis(10),
+        quiesce_ticks: 20,
+        liveness_interval: Duration::from_millis(30),
+        liveness_timeout: Duration::from_millis(150),
+        snapshot_retry_ticks: 30,
+        ..RaftConfig::default()
+    }
+}
+
+struct Member {
+    node: Node,
+    thread: Option<std::thread::JoinHandle<()>>,
+    store: Arc<MemLogStore>,
+}
+
+struct Cluster {
+    net: Arc<MemNetwork>,
+    cfg: RaftConfig,
+    members: BTreeMap<NodeId, Member>,
+}
+
+const WAIT: Duration = Duration::from_secs(10);
+
+fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if let Some(v) = f() {
+            return v;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+impl Cluster {
+    fn new(ids: &[NodeId], cfg: RaftConfig) -> Self {
+        let mut c = Cluster {
+            net: MemNetwork::new(),
+            cfg,
+            members: BTreeMap::new(),
+        };
+        for id in ids {
+            c.start(*id, MemLogStore::new());
+        }
+        c
+    }
+
+    fn start(&mut self, id: NodeId, store: Arc<MemLogStore>) {
+        let node = Node::open(NodeOptions {
+            id,
+            config: self.cfg.clone(),
+            store: Arc::clone(&store) as Arc<dyn LogStore>,
+            transport: self.net.transport(id),
+            clock: Arc::new(SystemClock),
+            machines: Arc::new(KvMachine::factory()),
+            observer: None,
+            seed: id * 7919,
+        })
+        .expect("open");
+        self.net.register(&node);
+        let thread = Some(node.spawn().expect("spawn"));
+        self.members.insert(
+            id,
+            Member {
+                node,
+                thread,
+                store,
+            },
+        );
+    }
+
+    fn stop(&mut self, id: NodeId) -> Arc<MemLogStore> {
+        let mut m = self.members.remove(&id).expect("member");
+        self.net.unregister(id);
+        m.node.close();
+        if let Some(t) = m.thread.take() {
+            t.join().expect("driver thread");
+        }
+        m.store
+    }
+
+    fn crash_restart(&mut self, id: NodeId, seed: u64) {
+        let store = self.stop(id);
+        store.crash(seed);
+        self.start(id, store);
+    }
+
+    fn node(&self, id: NodeId) -> &Node {
+        &self.members[&id].node
+    }
+
+    fn create(&self, group: GroupId, voters: &[NodeId]) {
+        for v in voters {
+            let s = self.node(*v).create_group(group, voters).expect("create");
+            assert_eq!(s.wait_timeout(WAIT), Some(Ok(())));
+        }
+    }
+
+    fn leader(&self, group: GroupId) -> NodeId {
+        until("a leader", || {
+            self.members.iter().find_map(|(id, m)| {
+                m.node
+                    .status(group)
+                    .filter(|s| s.is_leader && s.committed >= s.last_index)
+                    .map(|_| *id)
+            })
+        })
+    }
+
+    fn put(&self, group: GroupId, key: u64, value: u64) -> u64 {
+        until("a committed write", || {
+            let l = self.leader(group);
+            let slot = self
+                .node(l)
+                .propose(group, toy::put(key, value), Durability::Strict)
+                .ok()?;
+            slot.wait_timeout(WAIT).and_then(Result::ok)
+        })
+    }
+
+    fn get(&self, group: GroupId, key: u64) -> Option<u64> {
+        until("a read", || {
+            let l = self.leader(group);
+            let slot = self.node(l).read(group, toy::get(key)).ok()?;
+            slot.wait_timeout(WAIT).and_then(Result::ok)
+        })
+        .as_slice()
+        .try_into()
+        .ok()
+        .map(u64::from_le_bytes)
+    }
+
+    /// Every member holding `group` reaches the same state.
+    fn converged(&self, group: GroupId) -> KvMachine {
+        until("replicas to converge", || {
+            let states: Vec<(u64, Vec<u8>)> = self
+                .members
+                .values()
+                .filter_map(|m| m.node.query_local(group, &toy::dump()))
+                .collect();
+            let first = states.first()?.clone();
+            let same = states
+                .iter()
+                .all(|(a, d)| *a == first.0 && toy_data(d) == toy_data(&first.1));
+            same.then(|| KvMachine::decode(&first.1).expect("dump"))
+        })
+    }
+}
+
+fn toy_data(d: &[u8]) -> BTreeMap<u64, Vec<u64>> {
+    KvMachine::decode(d).expect("dump").data().clone()
+}
+
+impl Drop for Cluster {
+    fn drop(&mut self) {
+        let ids: Vec<NodeId> = self.members.keys().copied().collect();
+        for id in ids {
+            self.stop(id);
+        }
+    }
+}
+
+#[test]
+fn elect_replicate_and_read() {
+    let c = Cluster::new(&[1, 2, 3], fast());
+    for g in 10..14 {
+        c.create(g, &[1, 2, 3]);
+    }
+    for g in 10..14 {
+        for i in 0..20 {
+            c.put(g, i % 3, g * 1000 + i);
+        }
+        assert_eq!(c.get(g, 0), Some(g * 1000 + 18));
+        assert_eq!(c.get(g, 2), Some(g * 1000 + 17));
+        assert_eq!(c.get(g, 9), None);
+        let s = c.converged(g);
+        assert_eq!(s.data()[&1].len(), 7);
+    }
+    // A busy leader answers reads under its lease.
+    let l = c.leader(10);
+    for _ in 0..20 {
+        let _ = c.get(10, 1);
+    }
+    let st = c.node(l).stats();
+    assert!(st.lease_reads > 0, "{st:?}");
+}
+
+#[test]
+fn an_isolated_leaders_proposal_is_dropped_definitely() {
+    let c = Cluster::new(&[1, 2, 3], fast());
+    c.create(1, &[1, 2, 3]);
+    c.put(1, 1, 1);
+    let old = c.leader(1);
+    c.net.isolate(old, true);
+    let slot = c
+        .node(old)
+        .propose(1, toy::put(1, 99), Durability::Strict)
+        .expect("still leads for now");
+    // The others elect a new leader and commit their own entries.
+    let new = until("a new leader", || {
+        c.members
+            .keys()
+            .copied()
+            .find(|id| *id != old && c.node(*id).status(1).is_some_and(|s| s.is_leader))
+    });
+    let s = c
+        .node(new)
+        .propose(1, toy::put(1, 2), Durability::Strict)
+        .expect("propose");
+    assert!(matches!(s.wait_timeout(WAIT), Some(Ok(_))));
+    c.net.isolate(old, false);
+    assert_eq!(slot.wait_timeout(WAIT), Some(Err(RaftError::Dropped)));
+    assert_eq!(c.get(1, 1), Some(2));
+    let st = c.converged(1);
+    assert_eq!(st.data()[&1], vec![1, 2]);
+    // A replica that doesn't lead refuses at once.
+    let follower = c
+        .members
+        .keys()
+        .copied()
+        .find(|id| *id != c.leader(1))
+        .expect("f");
+    assert!(matches!(
+        c.node(follower)
+            .propose(1, toy::put(1, 3), Durability::Strict),
+        Err(RaftError::NotLeader { .. })
+    ));
+}
+
+#[test]
+fn crashes_keep_every_acknowledged_write() {
+    let mut c = Cluster::new(&[1, 2, 3], fast());
+    c.create(1, &[1, 2, 3]);
+    c.create(2, &[1, 2, 3]);
+    for i in 0..30 {
+        c.put(1 + i % 2, i, i);
+    }
+    for (n, id) in [1, 2, 3].into_iter().enumerate() {
+        c.crash_restart(id, 1000 + n as u64);
+    }
+    for i in 0..30 {
+        assert_eq!(c.get(1 + i % 2, i), Some(i));
+    }
+    c.converged(1);
+    c.converged(2);
+}
+
+#[test]
+fn membership_changes_through_learners_and_joint_consensus() {
+    let c = Cluster::new(&[1, 2, 3, 4], fast());
+    c.create(7, &[1, 2, 3]);
+    for i in 0..10 {
+        c.put(7, i, i);
+    }
+    let change = |changes: &[(ConfChangeType, NodeId)]| {
+        until("a membership change", || {
+            let l = c.leader(7);
+            let mut cc = ConfChangeV2::default();
+            for (t, id) in changes {
+                let mut s = ConfChangeSingle::default();
+                s.set_change_type(*t);
+                s.node_id = *id;
+                cc.mut_changes().push(s);
+            }
+            let slot = c.node(l).change_membership(7, cc).ok()?;
+            slot.wait_timeout(WAIT).and_then(Result::ok)
+        })
+    };
+    change(&[(ConfChangeType::AddLearnerNode, 4)]);
+    until("the learner to catch up", || {
+        c.node(4)
+            .query_local(7, &toy::history(9))
+            .filter(|(_, v)| toy::values(v) == vec![9])
+    });
+    // Promote 4 and remove 1 at once: a joint configuration, left
+    // automatically.
+    change(&[
+        (ConfChangeType::AddNode, 4),
+        (ConfChangeType::RemoveNode, 1),
+    ]);
+    until("the joint configuration to be left", || {
+        let l = c.leader(7);
+        c.node(l)
+            .status(7)
+            .filter(|s| s.voters_outgoing.is_empty() && !s.voters.contains(&1))
+    });
+    c.put(7, 100, 100);
+    until("node 1 to drop the group", || {
+        c.node(1).status(7).is_none().then_some(())
+    });
+    let l = c.leader(7);
+    let mut v = c.node(l).status(7).expect("status").voters;
+    v.sort_unstable();
+    assert_eq!(v, vec![2, 3, 4]);
+    assert_eq!(c.get(7, 100), Some(100));
+}
+
+#[test]
+fn a_lagging_follower_catches_up_from_a_snapshot() {
+    let cfg = RaftConfig {
+        compact_after: 10,
+        ..fast()
+    };
+    let c = Cluster::new(&[1, 2, 3], cfg);
+    c.create(3, &[1, 2, 3]);
+    c.put(3, 0, 0);
+    let l = c.leader(3);
+    let lagging = c.members.keys().copied().find(|id| *id != l).expect("f");
+    c.net.isolate(lagging, true);
+    for i in 1..60 {
+        c.put(3, i % 5, i);
+    }
+    c.net.isolate(lagging, false);
+    let s = c.converged(3);
+    assert_eq!(s.data()[&4].last(), Some(&59));
+}
+
+#[test]
+fn idle_groups_quiesce_wake_and_fail_over() {
+    let mut c = Cluster::new(&[1, 2, 3], fast());
+    for g in 1..=20 {
+        c.create(g, &[1, 2, 3]);
+        c.put(g, 1, g);
+    }
+    until("every group to quiesce", || {
+        c.members
+            .values()
+            .all(|m| m.node.stats().active == 0)
+            .then_some(())
+    });
+    // A read of a quiesced group goes through `ReadIndex` (no lease
+    // without heartbeats); a write wakes the group.
+    let before: u64 = c.members.values().map(|m| m.node.stats().index_reads).sum();
+    assert_eq!(c.get(5, 1), Some(5));
+    let after: u64 = c.members.values().map(|m| m.node.stats().index_reads).sum();
+    assert!(after > before);
+    c.put(5, 1, 500);
+    assert_eq!(c.get(5, 1), Some(500));
+    until("quiescing again", || {
+        c.members
+            .values()
+            .all(|m| m.node.stats().active == 0)
+            .then_some(())
+    });
+    // Stop the node leading group 1: store liveness wakes its groups on
+    // the others, which elect new leaders.
+    let dead = c.leader(1);
+    let led: Vec<GroupId> = (1..=20)
+        .filter(|g| c.node(dead).status(*g).is_some_and(|s| s.is_leader))
+        .collect();
+    let _ = c.stop(dead);
+    let t = Instant::now();
+    for g in &led {
+        let l = c.leader(*g);
+        assert_ne!(l, dead);
+        assert_eq!(c.get(*g, 1), Some(if *g == 5 { 500 } else { *g }));
+    }
+    assert!(t.elapsed() < WAIT);
+}
+
+#[test]
+fn leadership_moves_by_transfer() {
+    let c = Cluster::new(&[1, 2, 3], fast());
+    c.create(1, &[1, 2, 3]);
+    c.put(1, 1, 1);
+    let l = c.leader(1);
+    let to = c.members.keys().copied().find(|id| *id != l).expect("f");
+    c.node(l).transfer_leader(1, to).expect("transfer");
+    until("the transfer", || {
+        c.node(to).status(1).filter(|s| s.is_leader).map(|_| ())
+    });
+    c.put(1, 1, 2);
+    assert_eq!(c.get(1, 1), Some(2));
+}
+
+#[test]
+fn proposals_on_a_closed_node_fail_and_waiters_learn() {
+    let mut c = Cluster::new(&[1, 2, 3], fast());
+    c.create(1, &[1, 2, 3]);
+    c.put(1, 1, 1);
+    let l = c.leader(1);
+    let n = c.node(l).clone();
+    let _ = c.stop(l);
+    assert_eq!(
+        n.propose(1, toy::put(1, 2), Durability::Strict).err(),
+        Some(RaftError::Closed)
+    );
+}

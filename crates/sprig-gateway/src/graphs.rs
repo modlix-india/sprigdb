@@ -882,7 +882,7 @@ impl GatewayGraphs {
             let ep = self.svc.locator.writer(tenant).await?;
             let mut c = ep.pool.get_conn().await.map_err(backend_error)?;
             sprig_shard::groups::migrate(&mut c, ep.store.schema()).await?;
-            let g = alloc_group_id(&mut c, ep.store.schema()).await?;
+            let g = alloc_group_id(&mut c, ep.store.schema(), &self.svc.records, tenant).await?;
             (m, Some(g))
         };
         let spec = KeySpec::new(vec![KeyClass::Numeric])?;
@@ -2109,46 +2109,49 @@ impl GwDict {
     }
 }
 
-/// A new group id from the catalog's `sprig.next_group_id`, kept past every
-/// group id in use (as the advisor's apply does).
-async fn alloc_group_id(c: &mut mysql_async::Conn, cat: &str) -> Result<u32> {
+/// A new group id from the catalog's group counter (the engine record
+/// `ctr/core.group/`, the counter `CREATE DATABASE` takes its default group
+/// from), kept past every group id in the MariaDB `table_groups` (as the
+/// advisor's apply does), so a graph's group never shares a database's.
+async fn alloc_group_id(
+    c: &mut mysql_async::Conn,
+    cat: &str,
+    records: &Arc<dyn sprig_catalog::RecordStore>,
+    tenant: TenantId,
+) -> Result<u32> {
     let cat = cat.replace('`', "``");
-    c.exec_drop(
-        format!(
-            "INSERT INTO `{cat}`.settings (scope_kind, scope_id, setting_key, value, bounds, \
-             set_by, set_at, version) VALUES ('tenant', 0, 'sprig.next_group_id', '1', NULL, \
-             'system', UTC_TIMESTAMP(6), 0) ON DUPLICATE KEY UPDATE setting_key = setting_key"
-        ),
-        (),
-    )
-    .await
-    .map_err(backend_error)?;
     let floor: Option<u64> = c
         .query_first(format!(
-            "SELECT GREATEST(COALESCE((SELECT MAX(default_group_id) FROM `{cat}`.`databases`), 0), \
-             COALESCE((SELECT MAX(group_id) FROM `{cat}`.table_groups), 0)) + 1"
+            "SELECT COALESCE(MAX(group_id), 0) FROM `{cat}`.table_groups"
         ))
         .await
         .map_err(backend_error)?;
-    c.exec_drop(
-        format!(
-            "UPDATE `{cat}`.settings SET value = LAST_INSERT_ID(GREATEST(CAST(value AS UNSIGNED), ?) + 1), \
-             set_at = UTC_TIMESTAMP(6) WHERE scope_kind = 'tenant' AND scope_id = 0 \
-             AND setting_key = 'sprig.next_group_id'"
-        ),
-        (floor.unwrap_or(1),),
-    )
-    .await
-    .map_err(backend_error)?;
-    let next: Option<u64> = c
-        .query_first("SELECT LAST_INSERT_ID()")
-        .await
-        .map_err(backend_error)?;
-    next.and_then(|n| n.checked_sub(1))
-        .and_then(|n| u32::try_from(n).ok())
+    let mut rec = records.begin(tenant).await?;
+    let got = async {
+        sprig_catalog::records::counter_at_least(&mut *rec, GROUP_COUNTER, floor.unwrap_or(0))
+            .await?;
+        sprig_catalog::records::next_ids(&mut *rec, GROUP_COUNTER, 1).await
+    }
+    .await;
+    let next = match got {
+        Ok(n) => {
+            rec.commit().await?;
+            n
+        }
+        Err(e) => {
+            let _ = rec.rollback().await;
+            return Err(e);
+        }
+    };
+    u32::try_from(next)
+        .ok()
         .filter(|n| *n > 0)
         .ok_or_else(|| SprigError::internal("group ids exhausted"))
 }
+
+/// The catalog's group-id counter (`Counter::Other("group")` of the core
+/// store).
+const GROUP_COUNTER: &str = "core.group";
 
 /// The graph's `table_groups` row (sharded, keyed by `part`, origin
 /// `structural`) and its four members: nodes on `part`; edges, labels and

@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# raft-proto's vendored copy is a patched dependency, not a workspace crate.
+exclude = ["crates/sprig-raft/vendor"]
 
 [workspace.package]
 version = "0.0.1"
@@ -240,3 +242,9 @@ unwrap_used = "warn"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# raft-proto 0.7.0 with its generated protobuf code checked in: the crates.io
+# release generates it at build time with protoc 3.x and has no bundled protoc
+# for macOS on Apple silicon. Apache-2.0; see crates/sprig-raft/vendor/raft-proto/NOTICE.
+[patch.crates-io]
+raft-proto = { path = "crates/sprig-raft/vendor/raft-proto" }

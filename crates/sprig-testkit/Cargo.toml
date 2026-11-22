@@ -27,6 +27,10 @@ sprig-logic = { path = "../sprig-logic" }
 # The stream sequencer under the mover simulation.
 sprig-streams = { path = "../sprig-streams" }
 sprig-shard.workspace = true
+# The many-node Raft simulator runs the real driver (and its toy state
+# machine) over simulated disks, clocks and networks.
+sprig-raft.workspace = true
+sprig-engine.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # rt + test-util: the simulation runs on a current-thread runtime with paused

@@ -1,0 +1,56 @@
+suite = "raft_gates"
+seed = 1000002
+failure = "group 2's replicas did not converge: n2 at Some(0), leader n3 at Some(282)"
+
+[[plan.faults]]
+at_ms = 3209
+kind = "one_way"
+from = ["n3"]
+to = ["n1", "n2", "n4", "n5"]
+for_ms = 2649
+
+[[plan.faults]]
+at_ms = 9330
+kind = "skew"
+node = "n3"
+offset_ms = 0
+rate_ppm = 1165
+for_ms = 4028
+
+[[plan.faults]]
+at_ms = 10225
+kind = "partition"
+a = ["n3"]
+b = ["n1", "n2", "n4", "n5"]
+for_ms = 893
+
+[[plan.faults]]
+at_ms = 19310
+kind = "partition"
+a = ["n5"]
+b = ["n1", "n2", "n3", "n4"]
+for_ms = 4333
+
+[[plan.faults]]
+at_ms = 20619
+kind = "partition"
+a = ["n4", "n2", "n3"]
+b = ["n5", "n1"]
+for_ms = 5292
+
+[[plan.faults]]
+at_ms = 20865
+kind = "link"
+a = "n3"
+b = "n2"
+latency_ms = 199
+jitter_ms = 29
+loss = 0.0
+for_ms = 5928
+
+[[plan.faults]]
+at_ms = 24091
+kind = "one_way"
+from = ["n3"]
+to = ["n1", "n2", "n4", "n5"]
+for_ms = 5944

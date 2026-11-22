@@ -78,12 +78,21 @@ fn obj_key(object: ObjectId) -> Vec<u8> {
     key(OBJECTS, &Pk::new().u64(object.0))
 }
 
-fn ns_code(ns: Namespace) -> u8 {
-    Namespace::ALL
-        .iter()
-        .position(|n| *n == ns)
-        .and_then(|i| u8::try_from(i).ok())
-        .unwrap_or(u8::MAX)
+/// The namespace's byte in a name record's key. Stored in keys, so each
+/// namespace keeps its byte for good: a new namespace takes a new byte,
+/// whatever its place in the enum.
+const fn ns_code(ns: Namespace) -> u8 {
+    match ns {
+        Namespace::Relation => 0,
+        Namespace::Procedure => 1,
+        Namespace::Function => 2,
+        Namespace::Trigger => 3,
+        Namespace::Event => 4,
+        Namespace::Type => 5,
+        Namespace::SearchIndex => 6,
+        Namespace::Logic => 7,
+        Namespace::Graph => 8,
+    }
 }
 
 fn oname_key(db: DbId, ns: Namespace, name_key: &str) -> Vec<u8> {
@@ -1157,7 +1166,29 @@ impl CoreRecords {
     /// The store's.
     pub async fn purge(tx: &mut dyn RecordTx, up_to: u64) -> Result<PurgeReport> {
         let mut r = PurgeReport::default();
-        for o in Self::objects_since(tx, None).await? {
+        // The change index up to `up_to` names every row written at or
+        // below it since the last purge, so it is the list of candidates:
+        // a tombstone or empty setting at a version at or below `up_to` was
+        // written with an index entry there. Purge deletes these entries
+        // anyway, so it reads nothing beyond them.
+        let hi = chg_key(up_to.saturating_add(1), b"");
+        let entries = scan_all(tx, CHANGES, &hi).await?;
+        let candidates: std::collections::BTreeSet<Vec<u8>> = entries
+            .iter()
+            .filter_map(|(k, _)| k.get(CHANGES.len() + 8..).map(<[u8]>::to_vec))
+            .collect();
+        let under = |prefix: &'static [u8]| {
+            candidates
+                .iter()
+                .filter(move |k| k.starts_with(prefix))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for k in under(OBJECTS) {
+            let Some(raw) = tx.get(&k).await? else {
+                continue;
+            };
+            let o = decode::<ObjRec>("object", &raw)?.row()?;
             if o.state == ObjectState::Dropped && o.changed_version <= up_to {
                 r.settings += Self::delete_scope(tx, SettingScope::Object(o.object_id)).await?;
                 r.schema_versions += Self::delete_schema_versions(tx, o.object_id).await?;
@@ -1165,21 +1196,28 @@ impl CoreRecords {
                 r.objects += 1;
             }
         }
-        for d in Self::databases_since(tx, None).await? {
+        for k in under(DATABASES) {
+            let Some(raw) = tx.get(&k).await? else {
+                continue;
+            };
+            let d = decode::<DbRec>("database", &raw)?.row()?;
             if d.state == DbState::Dropped && d.changed_version <= up_to {
                 r.settings += Self::delete_scope(tx, SettingScope::Database(d.db_id)).await?;
                 tx.delete(&db_key(d.db_id)).await?;
                 r.databases += 1;
             }
         }
-        for s in Self::settings_since(tx, None).await? {
+        for k in under(SETTINGS) {
+            let Some(raw) = tx.get(&k).await? else {
+                continue;
+            };
+            let s = decode::<SetRec>("setting", &raw)?.row()?;
             if s.is_empty() && !s.is_internal() && s.version <= up_to {
                 tx.delete(&setting_key(s.scope, &s.key)).await?;
                 r.settings += 1;
             }
         }
-        let hi = chg_key(up_to.saturating_add(1), b"");
-        for (k, _) in scan_all(tx, CHANGES, &hi).await? {
+        for (k, _) in entries {
             tx.delete(&k).await?;
         }
         let purged = Self::purged(tx).await?;
@@ -1342,6 +1380,16 @@ impl CoreReader {
             .iter()
             .filter(|d| d.state != DbState::Dropped)
             .count() as u64)
+    }
+
+    /// A full snapshot of the core rows (databases, objects, settings, the
+    /// versions), from one read view: what `Store::snapshot` read from the
+    /// MariaDB tables before the catalog moved onto records.
+    ///
+    /// # Errors
+    /// As [`versions`](Self::versions).
+    pub async fn snapshot(&self) -> Result<Snapshot> {
+        read_in!(self, |tx| CoreRecords::snapshot(tx, None).await)
     }
 }
 

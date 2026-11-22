@@ -331,7 +331,7 @@ where
     /// interval comes. Databases that still resist after
     /// [`DELETED_DATABASES_GRACE`] are marked dropped in the catalog,
     /// whose schemas step 3 drops by id anyway. Returns how many are left.
-    async fn drop_databases(&self, id: TenantId, _ep: &CatalogEndpoint) -> Result<u64> {
+    async fn drop_databases(&self, id: TenantId) -> Result<u64> {
         let mut live = cleanup::live_databases(id).await?;
         if live == 0 {
             self.waiting_dbs
@@ -1020,6 +1020,7 @@ where
     /// # Errors
     /// 39072 while the catalog lists live databases; 39504 when `guard`
     /// fails; the store's, catalog's and clusters' errors.
+    #[allow(clippy::too_many_lines)] // the steps in order
     pub async fn cleanup(&self, id: TenantId, guard: &[Cmp]) -> Result<Cleanup> {
         let Some(e) = self.directory.get(id).await? else {
             return Ok(Cleanup::Done);
@@ -1039,31 +1040,36 @@ where
         let catalog_cluster = self.locator.cluster_of(id).await?;
         let mut catalog: Option<CatalogEndpoint> = None;
         let mut db_ids = std::collections::BTreeSet::new();
-        match &catalog_cluster {
-            Some(c) => {
-                let ep = CatalogEndpoint {
-                    pool: self.locator.pools().writer(c).await?,
-                    store: Store::new(self.locator.schema(id)),
-                };
-                self.hooks.dropping(e.body(), Some(&ep)).await?;
-                match catalog_owner(&ep.pool, ep.store.schema()).await? {
-                    // Another tenant's mark: never this tenant's to drop.
-                    Some(found) if !found.is_empty() && found != mark => {
-                        tracing::warn!(tenant = %id, schema = ep.store.schema(), mark = found,
-                            "the catalog schema carries another tenant's mark; left in place");
+        if let Some(c) = &catalog_cluster {
+            let ep = CatalogEndpoint {
+                pool: self.locator.pools().writer(c).await?,
+                store: Store::new(self.locator.schema(id)),
+            };
+            self.hooks.dropping(e.body(), Some(&ep)).await?;
+            match catalog_owner(&ep.pool, ep.store.schema()).await? {
+                // Another tenant's mark: never this tenant's to drop.
+                Some(found) if !found.is_empty() && found != mark => {
+                    tracing::warn!(tenant = %id, schema = ep.store.schema(), mark = found,
+                        "the catalog schema carries another tenant's mark; left in place");
+                }
+                // Ours, unmarked (made before marks existed), or gone.
+                _ => {
+                    let live = self.drop_databases(id).await?;
+                    if live > 0 {
+                        return Ok(Cleanup::WaitingForDatabases(live));
                     }
-                    // Ours, unmarked (made before marks existed), or gone.
-                    _ => {
-                        let live = self.drop_databases(id, &ep).await?;
-                        if live > 0 {
-                            return Ok(Cleanup::WaitingForDatabases(live));
-                        }
-                        db_ids = cleanup::catalog_db_ids(id, &ep.pool, ep.store.schema()).await?;
-                        catalog = Some(ep);
-                    }
+                    db_ids = cleanup::catalog_db_ids(id, &ep.pool, ep.store.schema()).await?;
+                    catalog = Some(ep);
                 }
             }
-            None => self.hooks.dropping(e.body(), None).await?,
+        } else {
+            self.hooks.dropping(e.body(), None).await?;
+            // The databases are engine records: they go through the DDL
+            // path here too, before step 4 deletes the records.
+            let live = self.drop_databases(id).await?;
+            if live > 0 {
+                return Ok(Cleanup::WaitingForDatabases(live));
+            }
         }
         // 3. Every cluster of the DC, by exact names. Only under the real
         //    naming: a test's catalog naming says nothing about who owns
@@ -1100,8 +1106,13 @@ where
             }
         }
         // 4. The catalog itself.
+        //    Its engine records go too, also when the tenant never had a
+        //    catalog cluster; only a catalog schema carrying another
+        //    tenant's mark (left in place above) keeps them.
         if let Some(ep) = &catalog {
             drop_catalog(&ep.pool, &ep.store).await?;
+        }
+        if catalog.is_some() || catalog_cluster.is_none() {
             cleanup::delete_catalog_records(id).await?;
         }
         // 5. Finished job records, then the tenant's keys in the DC tier

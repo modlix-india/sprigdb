@@ -9,6 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+bytes.workspace = true
 protobuf.workspace = true
 raft.workspace = true
 raft-engine.workspace = true
@@ -17,6 +18,7 @@ rustls.workspace = true
 slog.workspace = true
 sprig-common.workspace = true
 sprig-engine.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "io-util"] }
 tokio-rustls.workspace = true
 tracing.workspace = true

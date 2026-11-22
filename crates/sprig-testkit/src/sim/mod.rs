@@ -71,10 +71,12 @@
 
 pub mod clock;
 pub mod faults;
+pub mod linearize;
 pub mod mariadb;
 pub mod meta;
 pub mod mover;
 pub mod net;
+pub mod raft;
 pub mod rng;
 pub mod split;
 pub mod trace;

@@ -1,0 +1,10 @@
+suite = "raft_gates"
+seed = 3
+failure = "group 2's replicas did not converge: n4 at Some(548), leader n3 at Some(548)"
+
+[[plan.faults]]
+at_ms = 26956
+kind = "one_way"
+from = ["n1", "n2", "n3", "n5"]
+to = ["n4"]
+for_ms = 3664

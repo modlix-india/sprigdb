@@ -30,7 +30,7 @@ use std::fmt;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use sprig_common::Result;
+use sprig_common::{Result, SprigError};
 
 pub use compose::ComposeFaults;
 
@@ -110,6 +110,14 @@ impl LinkFault {
 pub trait Faults: Send + Sync {
     /// Cuts every link between a node of `a` and a node of `b`, both ways.
     async fn partition(&self, a: &[Node], b: &[Node]) -> Result<FaultId>;
+    /// Cuts messages from every node of `from` to every node of `to`,
+    /// leaving the other direction up. Injectors that can't do it refuse.
+    async fn cut_one_way(&self, from: &[Node], to: &[Node]) -> Result<FaultId> {
+        let _ = (from, to);
+        Err(SprigError::internal(
+            "one-way cuts are not supported by this fault injector",
+        ))
+    }
     /// Degrades the link between `a` and `b`, both ways.
     async fn link(&self, a: &Node, b: &Node, fault: LinkFault) -> Result<FaultId>;
     /// `SIGKILL`, then a restart.

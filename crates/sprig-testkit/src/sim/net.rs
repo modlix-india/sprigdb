@@ -73,6 +73,8 @@ struct NetState {
     links: BTreeMap<(Node, Node), LinkFault>,
     degraded: BTreeMap<FaultId, ((Node, Node), LinkFault)>,
     partitions: BTreeMap<FaultId, (BTreeSet<Node>, BTreeSet<Node>)>,
+    /// One-way cuts: messages from the first set to the second are lost.
+    oneway: BTreeMap<FaultId, (BTreeSet<Node>, BTreeSet<Node>)>,
     states: BTreeMap<Node, NodeState>,
     incarnations: BTreeMap<Node, u64>,
     mailboxes: BTreeMap<Node, mpsc::Sender<Envelope>>,
@@ -96,6 +98,12 @@ impl NetState {
         self.partitions
             .values()
             .any(|(x, y)| (x.contains(a) && y.contains(b)) || (x.contains(b) && y.contains(a)))
+    }
+
+    fn cut_one_way(&self, from: &Node, to: &Node) -> bool {
+        self.oneway
+            .values()
+            .any(|(f, t)| f.contains(from) && t.contains(to))
     }
 
     fn link(&self, a: &Node, b: &Node) -> LinkFault {
@@ -204,6 +212,23 @@ impl SimNet {
         id
     }
 
+    /// Cuts messages from `from` to `to`, leaving the other direction up
+    /// (an asymmetric partition).
+    #[allow(clippy::must_use_candidate)] // a permanent fault needs no id
+    pub fn cut_one_way(&self, from: &[Node], to: &[Node]) -> FaultId {
+        let mut s = self.lock();
+        let id = s.fault_id();
+        s.oneway.insert(
+            id,
+            (from.iter().cloned().collect(), to.iter().cloned().collect()),
+        );
+        drop(s);
+        self.trace
+            .record(format!("net {id} one-way cut {from:?} -> {to:?}"));
+        self.bump();
+        id
+    }
+
     /// Degrades the link between `a` and `b`.
     #[allow(clippy::must_use_candidate)] // a permanent fault needs no id
     pub fn degrade(&self, a: &Node, b: &Node, fault: LinkFault) -> FaultId {
@@ -223,7 +248,9 @@ impl SimNet {
     #[allow(clippy::must_use_candidate)] // healing twice is fine to ignore
     pub fn heal(&self, id: FaultId) -> bool {
         let mut s = self.lock();
-        let found = s.partitions.remove(&id).is_some() || s.degraded.remove(&id).is_some();
+        let found = s.partitions.remove(&id).is_some()
+            || s.degraded.remove(&id).is_some()
+            || s.oneway.remove(&id).is_some();
         drop(s);
         if found {
             self.trace.record(format!("net {id} healed"));
@@ -237,6 +264,7 @@ impl SimNet {
         let mut s = self.lock();
         s.partitions.clear();
         s.degraded.clear();
+        s.oneway.clear();
         for st in s.states.values_mut() {
             if *st == NodeState::Paused {
                 *st = NodeState::Running;
@@ -345,7 +373,7 @@ impl SimNet {
         let delay = link.latency + self.rng.duration(Duration::ZERO, link.jitter);
         let lost = self.rng.chance(link.loss);
         tokio::time::sleep(delay).await;
-        if !self.reachable(from, to) {
+        if !self.reachable(from, to) || self.lock().cut_one_way(from, to) {
             return Err(NetError::Unreachable);
         }
         if lost {

@@ -252,7 +252,10 @@ impl Reconciler for DigestLoop {
         }
         let ep = self.locator.writer(*key).await?;
         let schema = ep.store.schema().to_owned();
-        let snap = ep.store.snapshot(&ep.pool, None).await?;
+        // The catalog's core rows (settings among them) are engine records.
+        let snap = sprig_catalog::store::rec::CoreReader::new(crate::catalog_records(), *key)
+            .snapshot()
+            .await?;
         let reg = self.registry()?;
         let empty = MemSettings::new(reg);
         let held = self.live.as_ref().map(LiveSettings::snapshot);

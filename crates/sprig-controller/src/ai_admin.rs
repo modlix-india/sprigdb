@@ -506,7 +506,10 @@ impl Reconciler for AiPurgeLoop {
         if have.unwrap_or(0) == 0 {
             return Ok(Outcome::RequeueAfter(PURGE_INTERVAL));
         }
-        let snap = ep.store.snapshot(&ep.pool, None).await?;
+        // The catalog's core rows are engine records.
+        let snap = sprig_catalog::store::rec::CoreReader::new(crate::catalog_records(), *key)
+            .snapshot()
+            .await?;
         let days = self.days(*key, snap);
         let n = sprig_ai::audit::AuditStore::purge_payloads(
             &sprig_ai::CatalogAudit::new(ep.pool.clone(), schema),

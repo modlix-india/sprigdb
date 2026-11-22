@@ -331,7 +331,7 @@ async fn differential(seed: u64) {
 
 #[tokio::test]
 async fn the_core_on_records_answers_like_the_catalog_model() {
-    for seed in [1, 2, 3, 42, 4242, 99_999] {
+    for seed in [1, 2, 3, 7, 42, 123, 2024, 4242, 77_777, 99_999] {
         differential(seed).await;
     }
 }
@@ -451,4 +451,46 @@ async fn a_rolled_back_change_leaves_nothing() {
     let maria = MariaBackend::new(StaticLocator::new().shared());
     assert!(maria.records().is_none());
     let _ = Store::for_tenant(T);
+}
+
+#[tokio::test]
+async fn the_reader_snapshot_is_what_a_change_committed() {
+    let (b, recs) = backend();
+    let (mut tx, _) = b.begin_locked(T, VersionKind::Catalog).await.unwrap();
+    DdlTx::insert_database(&mut tx, &db(1, "x", DbState::Active, 1))
+        .await
+        .unwrap();
+    DdlTx::insert_object(
+        &mut tx,
+        &obj(5, 1, ObjectKind::Table, "t", ObjectState::Active, 1),
+    )
+    .await
+    .unwrap();
+    SettingsTx::put_setting(
+        &mut tx,
+        &setting(SettingScope::Tenant, "ai.digest", Some(1), 1),
+    )
+    .await
+    .unwrap();
+    b.commit(tx, VersionKind::Catalog, 1).await.unwrap();
+    let reader = CoreReader::new(Arc::clone(&recs) as Arc<dyn RecordStore>, T);
+    let snap = reader.snapshot().await.unwrap();
+    assert_eq!(snap.versions.catalog, 1);
+    assert!(snap.since.is_none());
+    assert_eq!(snap.databases.len(), 1);
+    assert_eq!(snap.objects.len(), 1);
+    assert_eq!(snap.settings.len(), 1);
+    assert_eq!(snap.settings[0].key, "ai.digest");
+    // Another tenant's reader sees nothing.
+    let other = CoreReader::new(recs, TenantId(8)).snapshot().await.unwrap();
+    assert_eq!(other.versions.catalog, 0);
+    assert!(other.databases.is_empty() && other.objects.is_empty() && other.settings.is_empty());
+}
+
+#[test]
+fn namespace_bytes_are_fixed_and_distinct() {
+    // The bytes the first build stored (each namespace's place then).
+    for (i, ns) in Namespace::ALL.iter().enumerate() {
+        assert_eq!(usize::from(ns_code(*ns)), i, "{ns:?}");
+    }
 }

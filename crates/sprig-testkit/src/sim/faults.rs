@@ -101,6 +101,12 @@ impl Faults for SimFaults {
         Ok(id)
     }
 
+    async fn cut_one_way(&self, from: &[Node], to: &[Node]) -> Result<FaultId> {
+        let id = self.net.cut_one_way(from, to);
+        self.hold(id, Held::Net);
+        Ok(id)
+    }
+
     async fn link(&self, a: &Node, b: &Node, fault: LinkFault) -> Result<FaultId> {
         let id = self.net.degrade(a, b, fault);
         self.hold(id, Held::Net);
@@ -185,6 +191,16 @@ pub enum FaultKind {
         a: Vec<Node>,
         /// The other side.
         b: Vec<Node>,
+        /// How long.
+        for_ms: u64,
+    },
+    /// Lose every message from `from` to `to` (not the other way) for
+    /// `for_ms`: an asymmetric partition.
+    OneWay {
+        /// The senders whose messages are lost.
+        from: Vec<Node>,
+        /// The receivers.
+        to: Vec<Node>,
         /// How long.
         for_ms: u64,
     },
@@ -325,6 +341,10 @@ impl FaultPlan {
                 FaultKind::Partition { a, b, for_ms } => {
                     faults.partition(a, b).await.map(|id| Some((id, *for_ms)))
                 }
+                FaultKind::OneWay { from, to, for_ms } => faults
+                    .cut_one_way(from, to)
+                    .await
+                    .map(|id| Some((id, *for_ms))),
                 FaultKind::Link {
                     a,
                     b,

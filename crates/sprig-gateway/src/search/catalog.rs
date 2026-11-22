@@ -554,7 +554,10 @@ impl SearchCatalog {
                     existing.push((r.index_id, r.name, r.object_id));
                 } else {
                     SearchTables::delete_index(tx.records().await?, r.index_id).await?;
-                    DdlTx::delete_object(tx, ObjectId(r.index_id)).await?;
+                    // A tombstone, as for any dropped object: caches that
+                    // load incrementally see it, and purge removes it.
+                    tx.set_object_state(ObjectId(r.index_id), ObjectState::Dropped, version)
+                        .await?;
                 }
             }
             // SQL names are unique per database; MongoDB's per collection.
@@ -659,10 +662,14 @@ impl SearchCatalog {
             .catalog
             .change(tenant, VersionKind::Catalog)
             .await?;
+        let version = ch.version();
         let r: Result<()> = async {
             let tx = ch.tx();
             SearchTables::delete_index(tx.records().await?, id).await?;
-            DdlTx::delete_object(tx, ObjectId(id)).await?;
+            // A tombstone, not a delete: the index's object row was visible,
+            // and a cache loading incrementally only sees rows that changed.
+            tx.set_object_state(ObjectId(id), ObjectState::Dropped, version)
+                .await?;
             Ok(())
         }
         .await;

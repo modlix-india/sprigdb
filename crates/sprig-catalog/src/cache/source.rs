@@ -149,17 +149,32 @@ impl MariaSource {
         prev: Option<&TenantCatalog>,
         node: Node,
     ) -> Result<Loaded> {
+        // On records the MariaDB part is read on the writer: the engine has
+        // no replicas, and a lagging MariaDB replica would give a snapshot
+        // stamped with the engine's version but without that version's
+        // MariaDB rows.
         let ep = match node {
-            Node::Replica => self.locator.reader(tenant).await?,
-            Node::Writer => self.locator.writer(tenant).await?,
+            Node::Replica if self.records.is_none() => self.locator.reader(tenant).await?,
+            Node::Replica | Node::Writer => self.locator.writer(tenant).await?,
         };
         timed(self.timeout, "cache load", async {
             // On records, the core rows, the versions and every module's
             // rows come from one engine read view; the MariaDB snapshot
             // serves the catalog format and the MariaDB data paths' own
             // tables.
+            //
+            // The engine's read view opens at its first read, and it must
+            // open before the MariaDB snapshot: a change commits its MariaDB
+            // part first and the engine second, so a MariaDB snapshot taken
+            // after the engine view holds at least that version's rows (a
+            // newer change's rows at worst, which the next load of that
+            // version reads again).
             let mut rec = match &self.records {
-                Some(r) => Some(r.begin(tenant).await?),
+                Some(r) => {
+                    let mut t = r.begin(tenant).await?;
+                    CoreRecords::versions(&mut *t).await?;
+                    Some(t)
+                }
                 None => None,
             };
             let mut tx = ep.store.begin_snapshot(&ep.pool).await?;

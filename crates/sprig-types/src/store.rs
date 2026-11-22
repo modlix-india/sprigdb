@@ -25,7 +25,6 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mysql_async::Conn;
-use mysql_async::prelude::Queryable;
 use serde::{Deserialize, Serialize};
 use sprig_catalog::cache::{ExtState, SnapshotTx};
 use sprig_catalog::migrate::{MigrateOpts, Migration, Module};
@@ -33,8 +32,7 @@ use sprig_catalog::records::{Pk, RecordTx, RowTable};
 use sprig_catalog::version::VersionKind;
 use sprig_catalog::{CatalogExtension, Migrator};
 use sprig_common::ids::{DbId, ObjectId};
-use sprig_common::names::quote;
-use sprig_common::{Result, SprigCode, SprigError};
+use sprig_common::{Result, SprigError};
 
 use crate::model::{
     DiscValue, FieldDef, HierState, HierarchyDef, KeyClass, OnDelete, Storage, TypeDef, TypeState,
@@ -453,40 +451,6 @@ impl TypesStore {
         }
         Ok(())
     }
-}
-
-/// The live objects among `ids`, with their database and name, read from
-/// the catalog's `objects` in `q` (the snapshot's transaction).
-///
-/// # Errors
-/// 39070 or a backend error.
-pub async fn object_names<Q: Queryable + Send>(
-    q: &mut Q,
-    schema: &str,
-    ids: &[ObjectId],
-) -> Result<ObjectNames> {
-    let mut out = ObjectNames::new();
-    for chunk in ids.chunks(500) {
-        let list = chunk
-            .iter()
-            .map(|i| i.0.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let rows: Vec<(u64, u32, String)> = q
-            .query(format!(
-                "SELECT object_id, db_id, name FROM {}.objects \
-                 WHERE state <> 'dropped' AND object_id IN ({list})",
-                quote(schema)
-            ))
-            .await
-            .map_err(|e| {
-                SprigError::new(SprigCode::CatalogUnavailable, "catalog unavailable").with_source(e)
-            })?;
-        for (id, db, name) in rows {
-            out.insert(ObjectId(id), (DbId(db), name));
-        }
-    }
-    Ok(out)
 }
 
 /// The names and databases of the live (not dropped) objects among `ids`,

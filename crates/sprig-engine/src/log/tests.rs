@@ -361,6 +361,177 @@ fn sim_crash_keeps_acknowledged_entries() {
     assert!(lost_total > 0, "the crash simulation lost nothing");
 }
 
+/// Polls until `unit`'s durable index reaches `index` (the sync timer ran).
+fn wait_durable(log: &LocalLog, unit: UnitId, index: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while log.durable_index(unit) < index {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sync timer never reached {index}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// What a fresh state machine gets back from the log after a power cut:
+/// every entry of unit 1, in order, with no gap.
+fn after_power_cut(log: LocalLog, sim: &SimDisk, dir: &std::path::Path, seed: u64) -> Vec<Applied> {
+    log.halt();
+    drop(log);
+    sim.crash(dir, seed).unwrap();
+    let fresh = Arc::new(Recorder::default());
+    let log = LocalLog::open(dir, cfg(), fresh.clone()).unwrap();
+    drop(log);
+    fresh
+        .applied
+        .lock()
+        .unwrap()
+        .get(&UnitId(1))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Entries acknowledged with a relaxed durability class are synced by the
+/// timer: once it has run (the durable index covers them), a power cut
+/// that drops every unsynced byte keeps them all.
+#[test]
+fn relaxed_entries_survive_a_power_cut_after_the_timer() {
+    for d in [Durability::LocalRelaxed, Durability::Replicated] {
+        for seed in 1..=8u64 {
+            let dir = TempDir::new("relaxcut");
+            let sim = SimDisk::new();
+            let c = LogConfig {
+                relaxed_sync: Duration::from_millis(20),
+                replicated_sync: Duration::from_millis(20),
+                sim: Some(sim.clone()),
+                ..cfg()
+            };
+            let log = LocalLog::open(dir.path(), c, Arc::new(Recorder::default())).unwrap();
+            for i in 0..40u64 {
+                log.propose(UnitId(1), noise(i, 512), d)
+                    .unwrap()
+                    .wait()
+                    .unwrap();
+            }
+            wait_durable(&log, UnitId(1), 40);
+            let got = after_power_cut(log, &sim, dir.path(), seed);
+            assert_eq!(
+                got.len(),
+                40,
+                "{d:?} seed {seed}: the timer's sync kept nothing"
+            );
+            for (n, (i, data)) in got.iter().enumerate() {
+                assert_eq!(*i, n as u64 + 1);
+                assert_eq!(data, &noise(n as u64, 512));
+            }
+        }
+    }
+}
+
+/// A checkpoint syncs the log before it flushes the store: entries it
+/// keeps (here an apply observer still needs all of them) survive a power
+/// cut, even when they were written relaxed and the timer hasn't run.
+#[test]
+fn checkpoint_syncs_the_entries_it_keeps() {
+    for seed in 1..=8u64 {
+        let dir = TempDir::new("ckptcut");
+        let sim = SimDisk::new();
+        let c = LogConfig {
+            // The timer must not do the checkpoint's work.
+            relaxed_sync: Duration::from_secs(3600),
+            sim: Some(sim.clone()),
+            ..cfg()
+        };
+        let sm = Arc::new(Recorder::default());
+        let log = LocalLog::open(dir.path(), c, sm.clone()).unwrap();
+        for i in 0..40u64 {
+            log.propose(UnitId(1), noise(i, 512), Durability::LocalRelaxed)
+                .unwrap();
+        }
+        log.wait_applied(UnitId(1), 40).unwrap();
+        let flushed: Mutex<BTreeMap<UnitId, Vec<Applied>>> = Mutex::default();
+        let trimmed = log
+            .checkpoint_capped(
+                &|| {
+                    *flushed.lock().unwrap() = sm.applied.lock().unwrap().clone();
+                    Ok(())
+                },
+                &|_| Some(0),
+            )
+            .unwrap();
+        assert_eq!(trimmed, 0);
+        log.halt();
+        drop(log);
+        sim.crash(dir.path(), seed).unwrap();
+        // The store comes back as the checkpoint flushed it; the log must
+        // still hold every entry the observer needs.
+        let restored = Arc::new(Recorder {
+            applied: Mutex::new(flushed.into_inner().unwrap()),
+        });
+        let log = LocalLog::open(dir.path(), cfg(), restored).unwrap();
+        assert_eq!(log.first_index(UnitId(1)), Some(1), "seed {seed}");
+        let got = log.entries(UnitId(1), 1, 41).unwrap();
+        assert_eq!(
+            got.len(),
+            40,
+            "seed {seed}: the checkpoint's sync kept nothing"
+        );
+        for (n, e) in got.iter().enumerate() {
+            assert_eq!((e.index, &e.data), (n as u64 + 1, &noise(n as u64, 512)));
+        }
+    }
+}
+
+/// The group that carries sync markers is no unit: proposing to it fails,
+/// replay doesn't treat it as one, and many syncs and checkpoints still let
+/// the log delete the files it trimmed.
+#[test]
+fn sync_markers_stay_out_of_units_and_purges() {
+    let dir = TempDir::new("syncgroup");
+    let c = LogConfig {
+        target_file_size: 1 << 20,
+        relaxed_sync: Duration::from_millis(1),
+        ..cfg()
+    };
+    let sm = Arc::new(Recorder::default());
+    let log = LocalLog::open(dir.path(), c.clone(), sm.clone()).unwrap();
+    assert!(
+        log.propose(UnitId(u64::MAX), vec![1], Durability::Local)
+            .is_err()
+    );
+    let mut index = 0;
+    for round in 0..3u64 {
+        for i in 0..40 {
+            log.propose(
+                UnitId(1),
+                noise(round * 100 + i, 128 << 10),
+                Durability::LocalRelaxed,
+            )
+            .unwrap();
+            index += 1;
+            // Let the timer write a marker between most entries.
+            wait_durable(&log, UnitId(1), index);
+        }
+        log.wait_applied(UnitId(1), index).unwrap();
+        assert_eq!(log.checkpoint(&|| Ok(())).unwrap(), 40);
+        assert!(
+            log_files(dir.path()) <= 2,
+            "round {round}: {} files left after the checkpoint",
+            log_files(dir.path())
+        );
+    }
+    assert!(log.stats().syncs >= 100, "{:?}", log.stats());
+    drop(log);
+    let log = LocalLog::open(dir.path(), c, sm.clone()).unwrap();
+    assert_eq!(log.applied(), vec![(UnitId(1), index)]);
+    assert_eq!(log.stats().replayed, 0);
+    let t = log
+        .propose(UnitId(1), b"next".to_vec(), Durability::Local)
+        .unwrap();
+    assert_eq!(t.index(), index + 1);
+    t.wait_applied().unwrap();
+}
+
 /// `entry` reads back what was written, and nothing past the end.
 #[test]
 fn entry_reads_one_index() {
